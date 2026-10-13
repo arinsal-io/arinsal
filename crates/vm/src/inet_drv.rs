@@ -47,6 +47,7 @@ const REQ_ACCEPT: i64 = 26;
 const REQ_LISTEN: i64 = 27;
 const TCP_REQ_RECV: i64 = 42;
 const TCP_REQ_SHUTDOWN: i64 = 44;
+const TCP_REQ_SENDFILE: i64 = 45;
 
 const AF_INET_CODE: u8 = 1;
 const AF_INET6_CODE: u8 = 2;
@@ -309,7 +310,15 @@ pub(crate) fn detach(id: u64) {
     unpin_scheduler(&sock.handle.scheduler());
     let pending = {
         let mut inner = sock.inner.lock().unwrap();
-        flush_send(&mut inner);
+        // Port of erts/emulator/drivers/common/inet_drv.c:12718-12725 (tcp_inet_flush)
+        // and :11906-11918 (tcp_inet_stop), OTP-29.1.1: a port stopped during sendfile
+        // discards its queue and closes the dup'ed file descriptor.
+        if inner.sendfile.is_some() {
+            inner.sendq.clear();
+            inner.sendfile = None;
+        } else {
+            flush_send(&mut inner);
+        }
         inner.fd.take();
         inner.phase = Phase::Closed;
         std::mem::take(&mut inner.pending)
@@ -452,14 +461,17 @@ fn accept_send(inner: &mut Inner, caller: Pid, ids: [u32; 3], payload: &[u8]) ->
     let frame = framed(inner.htype, payload);
     output_count(inner, frame.len());
     let before = inner.sendq.len();
-    if before == 0 && hlen == 0 && payload.is_empty() {
+    // Port of erts/emulator/drivers/common/inet_drv.c:13773 and :13883, OTP-29.1.1: while a
+    // sendfile is in progress (TCP_ADDF_SENDFILE) every send is queued behind the file.
+    let direct = before == 0 && inner.sendfile.is_none();
+    if direct && hlen == 0 && payload.is_empty() {
         return SendOutcome::Reply(None);
     }
-    if before == 0 && inner.delay_send {
+    if direct && inner.delay_send {
         inner.sendq.extend(frame);
         return SendOutcome::Reply(None);
     }
-    if before == 0 {
+    if direct {
         inner.sendq.extend(frame);
         if let Some(err) = flush_send(inner) {
             return send_failed(inner, err);
@@ -526,6 +538,7 @@ fn send_failed(inner: &mut Inner, err: i32) -> SendOutcome {
 
 fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
     let mut accept_now: Option<(OwnedFd, u16)> = None;
+    let mut sendfile_end: Option<SendfileEnd> = None;
     let reply = {
         let mut inner = sock.inner.lock().unwrap();
         match cmd {
@@ -533,7 +546,14 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
             REQ_CLOSE => {
                 // inet_drv.c:11932 (tcp_desc_close) drops the fd. Write bytes
                 // already accepted by tcp_sendv first so FIN cannot overtake them.
-                let _ = flush_send(&mut inner);
+                // Port of erts/emulator/drivers/common/inet_drv.c:12718-12725, OTP-29.1.1:
+                // during a sendfile the queue is discarded, and the dup'ed file
+                // descriptor stays open until the port stops (`detach`).
+                if inner.sendfile.is_some() {
+                    inner.sendq.clear();
+                } else {
+                    let _ = flush_send(&mut inner);
+                }
                 inner.fd.take();
                 inner.phase = Phase::Closed;
                 ok_bytes(&[])
@@ -564,11 +584,15 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
             REQ_GETSTATUS => getstatus(&inner),
             TCP_REQ_RECV => recv_req(&mut inner, caller, data),
             TCP_REQ_SHUTDOWN => shutdown_sock(&inner, data),
+            TCP_REQ_SENDFILE => sendfile_req(&mut inner, data, &mut sendfile_end),
             _ => err_bytes("exbadport"),
         }
     };
     if let Some((fd, aref)) = accept_now {
         install_accepted(sock, fd, caller, aref);
+    }
+    if let Some(end) = sendfile_end {
+        finish_sendfile(sock, end);
     }
     if cmd == TCP_REQ_RECV || cmd == REQ_SETOPTS || cmd == REQ_CONNECT {
         try_io(sock, false);
@@ -1923,6 +1947,12 @@ fn input_count(inner: &mut Inner, len: usize) {
 }
 
 fn flush_send(inner: &mut Inner) -> Option<i32> {
+    // Port of erts/emulator/drivers/common/inet_drv.c:14291-14295, OTP-29.1.1: with
+    // TCP_ADDF_SENDFILE set, output goes through tcp_inet_sendfile, which sends only the
+    // `ioq_skip` bytes queued before the file; the rest waits for the file to finish.
+    if inner.sendfile.is_some() {
+        return None;
+    }
     let fd = inner.fd.as_ref()?;
     let fd = fd.as_raw_fd();
     while !inner.sendq.is_empty() {
@@ -1967,6 +1997,263 @@ fn emit_ready(sock: &Sock) {
                 error: None,
             },
         );
+    }
+}
+
+/// Port of erts/emulator/drivers/common/inet_drv.c:1498-1511 (`tcp_descriptor.sendfile`),
+/// OTP-29.1.1.
+struct Sendfile {
+    /// Bytes queued when sendfile was issued; they go out before the file.
+    ioq_skip: usize,
+    /// The file handle to send from, duplicated when sendfile is issued.
+    dup_file_fd: OwnedFd,
+    bytes_sent: u64,
+    offset: u64,
+    length: u64,
+}
+
+/// How a sendfile ended, reported once the socket lock is released.
+enum SendfileEnd {
+    Completed {
+        bytes_sent: u64,
+    },
+    Aborted {
+        reason: &'static str,
+        error: &'static str,
+        active: bool,
+    },
+}
+
+// Port of erts/emulator/drivers/common/inet_drv.c:12380-12441 (TCP_REQ_SENDFILE with
+// HAVE_SENDFILE), OTP-29.1.1.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sendfile_req(inner: &mut Inner, data: &[u8], end: &mut Option<SendfileEnd>) -> Vec<u8> {
+    const REQUIRED_LEN: usize = std::mem::size_of::<i32>() + std::mem::size_of::<u64>() * 2;
+    if data.len() != REQUIRED_LEN {
+        return err_bytes("einval");
+    } else if inner.phase != Phase::Connected || inner.fd.is_none() {
+        return err_bytes("enotconn");
+    } else if inner.sendfile.is_some() {
+        // prim_inet.erl lets only the controlling process sendfile; erts checks anyway.
+        return err_bytes("einval");
+    }
+    let raw_file_fd = i32::from_ne_bytes(data[0..4].try_into().unwrap());
+    // inet_drv.c:12409 dups the handle; Arinsal's dup also sets FD_CLOEXEC under
+    // `cloexec_publish` so a port child cannot inherit it.
+    let dup_file_fd = match crate::port::duplicate_fd(raw_file_fd) {
+        Ok(fd) => fd,
+        Err(error) => return err_bytes(errno_name(error.raw_os_error().unwrap_or(libc::EINVAL))),
+    };
+    let offset = u64::from_be_bytes(data[4..12].try_into().unwrap());
+    let length = u64::from_be_bytes(data[12..20].try_into().unwrap());
+    inner.sendfile = Some(Sendfile {
+        ioq_skip: inner.sendq.len(),
+        dup_file_fd,
+        bytes_sent: 0,
+        offset,
+        length,
+    });
+    // See if we can finish sending without selecting & rescheduling. An unfinished
+    // file keeps the socket selected for write in `io_loop`.
+    *end = tcp_inet_sendfile(inner);
+    ok_bytes(&[])
+}
+
+// Port of erts/emulator/drivers/common/inet_drv.c:12442-12444 (TCP_REQ_SENDFILE without
+// HAVE_SENDFILE), OTP-29.1.1: configure checks sendfile only on Linux, the BSDs and Darwin.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn sendfile_req(_inner: &mut Inner, _data: &[u8], _end: &mut Option<SendfileEnd>) -> Vec<u8> {
+    err_bytes("enotsup")
+}
+
+/// Send the queue's head and then the file; `None` while the socket would block.
+///
+/// Port of erts/emulator/drivers/common/inet_drv.c:14077-14227 (tcp_inet_sendfile),
+/// OTP-29.1.1.
+fn tcp_inet_sendfile(inner: &mut Inner) -> Option<SendfileEnd> {
+    enum Step {
+        Blocked,
+        Completed,
+        SocketError(i32),
+    }
+    let s = inner.fd.as_ref()?.as_raw_fd();
+    let step = 'done: {
+        let sf = inner.sendfile.as_mut()?;
+        // If there was any data in the queue by the time sendfile was issued, it goes
+        // first. Busy status is not cleared until the file is sent.
+        while sf.ioq_skip > 0 {
+            let head = inner.sendq.as_slices().0;
+            assert!(!head.is_empty(), "ioq empty when sendfile.ioq_skip > 0");
+            let bytes_to_send = sf.ioq_skip.min(head.len());
+            // SAFETY: s is the connected socket this driver owns and head holds at
+            // least bytes_to_send initialized bytes.
+            let n = unsafe { libc::send(s, head.as_ptr().cast(), bytes_to_send, 0) };
+            if n >= 0 {
+                sf.ioq_skip -= n as usize;
+                inner.sendq.drain(..n as usize);
+            } else {
+                let err = last_errno();
+                if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                    break 'done Step::Blocked;
+                } else if err != libc::EINTR {
+                    break 'done Step::SocketError(err);
+                }
+            }
+        }
+        while sf.length > 0 {
+            // For some reason the maximum ssize_t cannot be used as the max size.
+            // 1GB seems to work on all platforms.
+            const SENDFILE_CHUNK_SIZE: u64 = (1 << 30) - 1;
+            let bytes_to_send = SENDFILE_CHUNK_SIZE.min(sf.length);
+            let (n, err) = sendfile_chunk(s, sf.dup_file_fd.as_raw_fd(), sf.offset, bytes_to_send);
+            if n > 0 {
+                sf.bytes_sent += n as u64;
+                sf.offset += n as u64;
+                sf.length -= n as u64;
+            } else if n == 0 {
+                // EOF.
+                sf.length = 0;
+                break;
+            } else if err != libc::EINTR {
+                if err != libc::EAGAIN && err != libc::EWOULDBLOCK {
+                    break 'done Step::SocketError(err);
+                }
+                break;
+            }
+        }
+        if sf.length == 0 {
+            Step::Completed
+        } else {
+            Step::Blocked
+        }
+    };
+    match step {
+        Step::Blocked => None,
+        Step::Completed => Some(tcp_sendfile_completed(inner)),
+        Step::SocketError(err) => {
+            let reason = tcp_sendfile_aborted(err);
+            // tcp_send_error closes the socket; the sendfile state stays until the port
+            // stops, as in erts.
+            let SendOutcome::Failed { error, active } = send_failed(inner, err) else {
+                unreachable!("send_failed always fails");
+            };
+            Some(SendfileEnd::Aborted {
+                reason,
+                error,
+                active,
+            })
+        }
+    }
+}
+
+/// One sendfile(2) call: `(bytes, errno)`, with bytes `-1` on error.
+///
+/// Port of erts/emulator/drivers/common/inet_drv.c:14123-14125 (Linux), OTP-29.1.1.
+#[cfg(target_os = "linux")]
+fn sendfile_chunk(s: RawFd, file: RawFd, offset: u64, bytes_to_send: u64) -> (i64, i32) {
+    let mut offset = offset as libc::off_t;
+    // SAFETY: s is the connected socket, file the dup'ed descriptor this socket owns,
+    // and offset a live local.
+    let n = unsafe { libc::sendfile(s, file, &mut offset, bytes_to_send as usize) };
+    let err = if n < 0 { last_errno() } else { 0 };
+    (n as i64, err)
+}
+
+/// One sendfile(2) call: `(bytes, errno)`, with bytes `-1` on error.
+///
+/// Port of erts/emulator/drivers/common/inet_drv.c:14126-14153 (`__DARWIN__`), OTP-29.1.1.
+#[cfg(target_os = "macos")]
+fn sendfile_chunk(s: RawFd, file: RawFd, offset: u64, bytes_to_send: u64) -> (i64, i32) {
+    let mut bytes_sent = bytes_to_send as libc::off_t;
+    // SAFETY: file is the dup'ed descriptor this socket owns, s the connected socket,
+    // bytes_sent a live local, and no header/trailer vector is passed.
+    let error = unsafe {
+        libc::sendfile(
+            file,
+            s,
+            offset as libc::off_t,
+            &mut bytes_sent,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let err = if error < 0 { last_errno() } else { 0 };
+    let mut n = bytes_sent as i64;
+    // EAGAIN/EINTR report partial success by setting bytes_sent, so error handling is
+    // skipped if nonzero, and EOF handling if zero.
+    if error < 0 && ((err != libc::EAGAIN && err != libc::EINTR) || bytes_sent == 0) {
+        n = -1;
+    }
+    (n, err)
+}
+
+/// Port of erts/emulator/drivers/common/inet_drv.c:13987-14046 (tcp_sendfile_completed),
+/// OTP-29.1.1.
+fn tcp_sendfile_completed(inner: &mut Inner) -> SendfileEnd {
+    // Clears TCP_ADDF_SENDFILE and closes the dup'ed descriptor.
+    let bytes_sent = inner.sendfile.take().map_or(0, |sf| sf.bytes_sent);
+    // Busy status was deferred until now; more data may have been queued meanwhile.
+    release_unbusy(inner);
+    // An empty queue deselects FD_WRITE in `io_loop`. Arinsal sends no empty_out_q
+    // messages and shuts down synchronously, so there is nothing else to do here.
+    SendfileEnd::Completed { bytes_sent }
+}
+
+/// Port of erts/emulator/drivers/common/inet_drv.c:14048-14075 (tcp_sendfile_aborted),
+/// OTP-29.1.1: the reason in `{sendfile, S, {error, Reason}}`.
+fn tcp_sendfile_aborted(socket_error: i32) -> &'static str {
+    match socket_error {
+        libc::ECONNRESET | libc::ENOTCONN | libc::EPIPE => "closed",
+        _ => errno_name(socket_error),
+    }
+}
+
+/// Deliver the end of a sendfile to the port owner (`desc->inet.dport`).
+fn finish_sendfile(sock: &Arc<Sock>, end: SendfileEnd) {
+    let owner = sock.handle.owner_pid();
+    match end {
+        SendfileEnd::Completed { bytes_sent } => {
+            // Port of inet_drv.c:14006-14021, OTP-29.1.1: the busy sender's reply first.
+            emit_ready(sock);
+            emit(
+                sock,
+                Out::Sendfile {
+                    owner,
+                    result: Ok(bytes_sent),
+                },
+            );
+        }
+        SendfileEnd::Aborted {
+            reason,
+            error,
+            active,
+        } => {
+            emit(
+                sock,
+                Out::Sendfile {
+                    owner,
+                    result: Err(reason),
+                },
+            );
+            // Port of erts/emulator/drivers/common/inet_drv.c:13638-13653, OTP-29.1.1
+            // (tcp_send_or_shutdown_error, active): tcp_error/tcp_closed, but no
+            // inet_reply while TCP_ADDF_SENDFILE is set.
+            if active {
+                if error == "econnreset" {
+                    emit(
+                        sock,
+                        Out::TcpError {
+                            owner,
+                            reason: "econnreset",
+                        },
+                    );
+                }
+                emit(sock, Out::TcpClosed { owner });
+                if sock.inner.lock().unwrap().exit_on_close {
+                    crate::port::abandon_port(&sock.runtime, sock.id);
+                }
+            }
+        }
     }
 }
 
@@ -2083,6 +2370,8 @@ struct Inner {
     op_ref: u16,
     rbuf: Vec<u8>,
     sendq: VecDeque<u8>,
+    /// `Some` while TCP_ADDF_SENDFILE is set.
+    sendfile: Option<Sendfile>,
     recv: Option<Recv>,
     accept_q: VecDeque<Waiter>,
     connect: Option<Waiter>,
@@ -2154,6 +2443,7 @@ impl Default for Inner {
             op_ref: 0,
             rbuf: Vec::new(),
             sendq: VecDeque::new(),
+            sendfile: None,
             recv: None,
             accept_q: VecDeque::new(),
             connect: None,
@@ -2481,7 +2771,7 @@ fn put_u64(out: &mut Vec<u8>, val: u64) {
 
 // g_inet_udp
 pub(crate) fn byte_list(process: &mut Process, bytes: &[u8]) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .list_from_iter(bytes.iter().map(|b| Term::small(i64::from(*b)).unwrap()))
         .map_err(|error| VmError::Unsupported(format!("inet control reply: {error:?}")))
@@ -2568,6 +2858,10 @@ pub(crate) fn errno_name(code: i32) -> &'static str {
         libc::ENOPROTOOPT => "enoprotoopt",
         libc::EDESTADDRREQ => "edestaddrreq",
         libc::EMSGSIZE => "emsgsize",
+        libc::EBADF => "ebadf",
+        libc::ENOTSOCK => "enotsock",
+        // erl_errno_id names ENOTSUP only where it differs from EOPNOTSUPP.
+        code if code == libc::ENOTSUP => "enotsup",
         _ => "einval",
     }
 }
@@ -2625,6 +2919,10 @@ enum Out {
     PortData {
         owner: Pid,
         bytes: Vec<u8>,
+    },
+    Sendfile {
+        owner: Pid,
+        result: Result<u64, &'static str>,
     },
 }
 
@@ -2739,6 +3037,27 @@ fn emit(sock: &Sock, out: Out) {
             })
             .and_then(|data| TermBuilder::new(&mut heap).tuple(&[port, data]).ok())
             .map(|term| (*owner, term)),
+        Out::Sendfile { owner, result } => {
+            // Port of inet_drv.c:14032-14043 ({sendfile, S, {ok, SentLow, SentHigh}}) and
+            // :14055-14072 ({sendfile, S, {error, Reason}}), OTP-29.1.1.
+            let status = match result {
+                Ok(bytes_sent) => TermBuilder::new(&mut heap)
+                    .tuple(&[
+                        atom("ok"),
+                        Term::small((bytes_sent & 0xFFFF_FFFF) as i64).unwrap(),
+                        Term::small((bytes_sent >> 32) as i64).unwrap(),
+                    ])
+                    .ok(),
+                Err(reason) => error_tuple(&mut heap, reason),
+            };
+            status
+                .and_then(|status| {
+                    TermBuilder::new(&mut heap)
+                        .tuple(&[atom("sendfile"), port, status])
+                        .ok()
+                })
+                .map(|term| (*owner, term))
+        }
     };
     if let Some((to, term)) = term
         && let Ok(message) = Message::copy_from(term)
@@ -2933,6 +3252,11 @@ fn drop_pending(inner: &mut Inner, caller: Pid, aref: u16) {
 }
 
 fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
+    // Port of erts/emulator/sys/common/erl_check_io.c:2098-2109, OTP-29.1.1: oready
+    // runs before iready for one fd.
+    if writable_ready {
+        tcp_inet_output(sock);
+    }
     satisfy(sock);
     let eof = pull(sock);
     satisfy(sock);
@@ -2978,6 +3302,73 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     emit_ready(sock);
     let busy = sock.inner.lock().unwrap().busy;
     crate::dist::distribution_port_state_changed(&sock.runtime, sock.id, busy);
+}
+
+/// Write queued output once the poll set reports the connected socket writable.
+///
+/// Port of erts/emulator/drivers/common/inet_drv.c:14289-14361, OTP-29.1.1
+/// (`tcp_inet_output`, connected branch): send from the driver queue until it is
+/// empty or the socket would block, and drop the busy state at the low watermark
+/// (`release_unbusy`; the deferred `inet_reply` goes out through `emit_ready`).
+/// The output callback runs whether or not the owner has a receive pending, so a
+/// passive socket whose owner is blocked in `gen_tcp:send/2` still drains. The
+/// write selection follows the queue: `io_loop` selects for write only while
+/// `sendq` is non-empty (inet_drv.c:14302-14303 deselects when it is empty).
+fn tcp_inet_output(sock: &Arc<Sock>) {
+    let failure = {
+        let mut inner = sock.inner.lock().unwrap();
+        // Port of erts/emulator/drivers/common/inet_drv.c:14291-14295, OTP-29.1.1: with
+        // TCP_ADDF_SENDFILE set, output continues the file instead of the queue.
+        if inner.phase == Phase::Connected && inner.sendfile.is_some() {
+            let end = tcp_inet_sendfile(&mut inner);
+            drop(inner);
+            if let Some(end) = end {
+                finish_sendfile(sock, end);
+            }
+            return;
+        }
+        if inner.phase != Phase::Connected || inner.sendq.is_empty() {
+            return;
+        }
+        let Some(err) = flush_send(&mut inner) else {
+            return;
+        };
+        // Port of inet_drv.c:13690-13720 (tcp_send_error) and :13613-13688
+        // (tcp_send_or_shutdown_error), OTP-29.1.1: the blocked senders get the
+        // error reply; an active socket also gets `tcp_closed`.
+        let waits = std::mem::take(&mut inner.send_waits);
+        match send_failed(&mut inner, err) {
+            SendOutcome::Failed { error, active } => (waits, error, active),
+            SendOutcome::Reply(_) | SendOutcome::Deferred => return,
+        }
+    };
+    let (waits, error, active) = failure;
+    for wait in waits {
+        emit(
+            sock,
+            Out::InetReply {
+                caller: wait.caller,
+                ids: wait.ids,
+                error: Some(error),
+            },
+        );
+    }
+    if active {
+        let owner = sock.handle.owner_pid();
+        if error == "econnreset" {
+            emit(
+                sock,
+                Out::TcpError {
+                    owner,
+                    reason: "econnreset",
+                },
+            );
+        }
+        emit(sock, Out::TcpClosed { owner });
+        if sock.inner.lock().unwrap().exit_on_close {
+            crate::port::abandon_port(&sock.runtime, sock.id);
+        }
+    }
 }
 
 fn deliver_pending_close(sock: &Arc<Sock>) {
@@ -3352,6 +3743,26 @@ fn on_eof(sock: &Arc<Sock>) {
         let active = active_is(&inner.active);
         let owner = sock.handle.owner_pid();
         let reason = close_atom(&inner);
+        // Port of erts/emulator/drivers/common/inet_drv.c:12805-12810 (tcp_recv_closed
+        // aborts with ENOTCONN) and :12863-12867 (tcp_recv_error aborts with its err),
+        // OTP-29.1.1, before any other close reporting. `pull` ends the stream on a
+        // zero-byte read (closed) or ECONNRESET, which it records in `inner.reset`.
+        if inner.sendfile.is_some() {
+            let err = if inner.reset {
+                libc::ECONNRESET
+            } else {
+                libc::ENOTCONN
+            };
+            drop(inner);
+            emit(
+                sock,
+                Out::Sendfile {
+                    owner,
+                    result: Err(tcp_sendfile_aborted(err)),
+                },
+            );
+            inner = sock.inner.lock().unwrap();
+        }
         if !active {
             if inner.exit_on_close {
                 inner.fd.take();
@@ -3459,14 +3870,18 @@ fn io_loop(wake_r: OwnedFd) {
                 }
                 _ => false,
             };
-            let writable = inner.phase == Phase::Connecting || !inner.sendq.is_empty();
+            // Port of erts/emulator/drivers/common/inet_drv.c:12436-12440, OTP-29.1.1: an
+            // unfinished sendfile keeps FD_WRITE selected.
+            let writable = inner.phase == Phase::Connecting
+                || !inner.sendq.is_empty()
+                || (inner.phase == Phase::Connected && inner.sendfile.is_some());
             if readable || writable {
                 fds.push((fd, crate::check_io::InterestSet { readable, writable }));
             }
         }
         let timeout = next_timeout()
             .map(|timeout| Duration::new(timeout.tv_sec as u64, timeout.tv_nsec as u32));
-        match crate::check_io::wait_any_timeout(&fds, timeout) {
+        match crate::check_io::wait_any_timeout_wake(&fds, timeout, wake) {
             Ok(Some((fd, _))) if fd == wake => drain(wake),
             Ok(Some((fd, ready))) => {
                 if let Some(sock) = socks.iter().find(|sock| {

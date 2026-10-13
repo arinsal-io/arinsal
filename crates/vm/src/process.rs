@@ -336,7 +336,7 @@ impl MessageQueue {
             }
             let updated = copy_term_preserving_sharing_with_cache(
                 entry.term,
-                &mut arinsal_bifs::FragmentingHeap(heap),
+                &mut arinsal_bifs::ProcessHeapHandle(heap),
                 &mut shared_copy,
             )
             .map_err(|error| VmError::Unsupported(format!("literal message copy {error:?}")))?;
@@ -394,7 +394,7 @@ impl MessageQueue {
 
     /// Return terms copied out of queue-owned storage for `process_info(messages)`.
     pub(crate) fn copied_terms(&self, heap: &mut ProcessHeap) -> Result<Vec<Term>, VmError> {
-        let mut target = arinsal_bifs::FragmentingHeap(heap);
+        let mut target = arinsal_bifs::ProcessHeapHandle(heap);
         self.entries
             .iter()
             .map(|entry| {
@@ -558,7 +558,7 @@ impl Message {
         }
     }
 
-    fn into_receiver(self, process: &mut Process) -> Result<Term, VmError> {
+    pub(crate) fn into_receiver(self, process: &mut Process) -> Result<Term, VmError> {
         if self.fragment.is_none() {
             // Immediate, literal, or already placed on this heap
             // (erl_message.c:657, `attached == NULL`).
@@ -568,7 +568,7 @@ impl Message {
             // Port of erts/emulator/beam/erl_message.c:943 (copy_message), OTP-29.1.1.
             // The receiver owns its process lock while draining, so queued terms
             // can be copied directly into its managed heap.
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let term = if self
                 .fragment
                 .as_ref()
@@ -705,16 +705,6 @@ impl Process {
     }
 }
 
-/// Reply for a suspend whose suspender waits on it (`{Tag, Res}`), with the variant sent
-/// when the target exits first.
-// Port of erts/emulator/beam/erl_proc_sig_queue.c:3192 (erts_proc_sig_send_sync_suspend), OTP-29.1.1.
-pub(crate) struct SuspendWaiter {
-    pub(crate) by: Pid,
-    pub(crate) target: Pid,
-    pub(crate) ready: Message,
-    pub(crate) exited: Message,
-}
-
 /// Port of erts/emulator/beam/erl_vm.h:53 (CONTEXT_REDS), OTP-29.1.1.
 pub(crate) const CONTEXT_REDS: i32 = 4000;
 /// Port of erts/emulator/beam/erl_proc_sig_queue.c:52 (ERTS_SIG_REDS_CNT_FACTOR), OTP-29.1.1.
@@ -848,24 +838,13 @@ pub(crate) struct Runtime {
     pub(crate) ets: std::sync::RwLock<arinsal_ets::Registry>,
     result: mpsc::Sender<Result<ScheduledResult, VmError>>,
     // g_proc_sched: suspend counts and the status other processes can observe.
-    pub(crate) suspend_counts: Mutex<HashMap<(Pid, Pid), u32>>,
     /// Asynchronous suspends of a running process that it has not yet acted on.
     // Port of erts/emulator/beam/erl_process.c:9013 (`erts_internal_suspend_process_2` pending suspend), OTP-29.1.1.
-    suspend_outstanding: Mutex<HashMap<(Pid, Pid), u32>>,
     /// Replies owed to suspenders once their suspend is active (erts sync-suspend signal).
-    suspend_waiters: Mutex<Vec<SuspendWaiter>>,
-    pub(crate) suspend_total: Mutex<HashMap<Pid, u32>>,
-    pub(crate) ever_suspended: AtomicBool,
-    /// Whether `suspend_total` has an entry; readers skip the lock while it is false.
-    pub(crate) suspended_any: AtomicBool,
     /// The code modification permission (`code_ix.c` `code_mod_permission`) of this node.
     pub(crate) code_mod_permission: Mutex<crate::natives::code::CodeModPermission>,
     /// This node's breakpoint tables and active breakpoint index.
     pub(crate) breakpoints: Arc<crate::trace_bp::BpNode>,
-    /// Suspend-monitor pauses of receive and BIF timers (`erts_pause_proc_timer`).
-    pub(crate) pauses: Mutex<HashMap<Pid, TimerPause>>,
-    /// Whether `pauses` has an entry; readers skip the lock while it is false.
-    pub(crate) pauses_any: AtomicBool,
     pub(crate) published: Mutex<HashMap<Pid, Published>>,
     pub(crate) debug_wait_active: AtomicBool,
     /// `erlang:system_flag/2` settings of this runtime.
@@ -964,31 +943,6 @@ impl MultiScheduling {
     }
 }
 
-/// The locked suspend counts; dropping it publishes whether any process is still suspended.
-struct SuspendTotals<'a> {
-    guard: std::sync::MutexGuard<'a, HashMap<Pid, u32>>,
-    any: &'a AtomicBool,
-}
-
-impl std::ops::Deref for SuspendTotals<'_> {
-    type Target = HashMap<Pid, u32>;
-    fn deref(&self) -> &Self::Target {
-        &self.guard
-    }
-}
-
-impl std::ops::DerefMut for SuspendTotals<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
-    }
-}
-
-impl Drop for SuspendTotals<'_> {
-    fn drop(&mut self) {
-        self.any.store(!self.guard.is_empty(), Ordering::Release);
-    }
-}
-
 /// Fibonacci hashing of one `u64` or `u32` key (module atoms); not adversarial input.
 #[derive(Default)]
 pub(crate) struct IdHasher(u64);
@@ -1078,8 +1032,6 @@ impl Runtime {
     pub(crate) fn update_published_link(&self, owner: Pid, peer: Pid, linked: bool) {
         let mut published = self.published.lock().unwrap();
         let slot = published.entry(peer).or_insert(Published {
-            status: "runnable",
-            hibernating: false,
             links: Vec::new(),
             monitors: Vec::new(),
             monitored_by: Vec::new(),
@@ -1103,8 +1055,6 @@ impl Runtime {
     ) {
         let mut published = self.published.lock().unwrap();
         let slot = published.entry(target).or_insert(Published {
-            status: "runnable",
-            hibernating: false,
             links: Vec::new(),
             monitors: Vec::new(),
             monitored_by: Vec::new(),
@@ -1123,10 +1073,13 @@ impl Runtime {
     }
 }
 
-/// Accumulated suspend-monitor pause of one process's timers.
+/// Suspend-monitor pause of one process's receive timeout (erts `ErtsPausedProcTimer`): the
+/// number of active suspends holding it and the time spent paused.
 pub(crate) struct TimerPause {
     count: u32,
     since: std::time::Instant,
+    /// `since` on the virtual clock of a simulated runtime.
+    since_ms: u64,
     shift: std::time::Duration,
 }
 
@@ -1135,10 +1088,6 @@ pub(crate) struct TimerPause {
 /// g_proc_sched
 #[derive(Clone, Debug)]
 pub(crate) struct Published {
-    /// `process_info(P, status)` atom, unless a suspend count overrides it.
-    pub status: &'static str,
-    /// Hibernating processes report `{erlang, hibernate, 3}`.
-    pub hibernating: bool,
     pub links: Vec<Pid>,
     pub monitors: Vec<(u64, Pid, Option<arinsal_etf::OwnedTerm>)>,
     pub monitored_by: Vec<(u64, Pid)>,
@@ -1148,8 +1097,6 @@ impl Published {
     /// The slot of a process that has published nothing yet.
     pub(crate) fn empty() -> Self {
         Self {
-            status: "runnable",
-            hibernating: false,
             links: Vec::new(),
             monitors: Vec::new(),
             monitored_by: Vec::new(),
@@ -1475,7 +1422,12 @@ impl Executor {
                             }
                         }
                     };
-                    let mut result = crate::calls::call_bif(&mut process.heap, bif, &args);
+                    let mut result = crate::calls::call_bif(
+                        &mut process.heap,
+                        &mut process.reductions,
+                        bif,
+                        &args,
+                    );
                     crate::calls::gc_after_bif(process, &mut args, &mut result)?;
                     match result {
                         Ok(value) => break 'execution Ok(RunState::Done(value)),
@@ -2247,7 +2199,7 @@ impl Executor {
                                                         {
                                                             let list = {
                                                                 let mut heap =
-                                                                    arinsal_bifs::FragmentingHeap(
+                                                                    arinsal_bifs::ProcessHeapHandle(
                                                                         &mut process.heap,
                                                                     );
                                                                 TermBuilder::new(&mut heap)
@@ -3418,11 +3370,10 @@ impl Executor {
         // hibernation. Checked before the runtime handle is cloned.
         if let Some(runtime) = process.runtime.as_deref()
             && runtime.suspend_total_of(ctx.pid()) == 0
-            && !runtime.pauses_any.load(Ordering::Acquire)
             && !process
                 .cold
                 .as_ref()
-                .is_some_and(|cold| cold.hibernate_sched)
+                .is_some_and(|cold| cold.hibernate_sched || cold.timer_pause.is_some())
         {
             return Ok(None);
         }
@@ -3442,15 +3393,16 @@ impl Executor {
             if runtime.suspend_total_of(pid) == 0 {
                 return Ok(None);
             }
-            runtime.suspends_activated(pid);
-            runtime.note_status(pid, "suspended");
             process.cold_mut().suspend_parked = true;
             return Ok(Some(RunState::Wait { timeout_ms: None }));
         }
-        if let Some(shift) = runtime.take_pause_shift(pid)
-            && let Some(deadline) = process.receive_deadline.as_mut()
-        {
-            *deadline += shift;
+        if let Some(shift) = runtime.take_pause_shift(process) {
+            if let Some(deadline) = process.receive_deadline.as_mut() {
+                *deadline += shift;
+            }
+            if let Some(deadline) = process.receive_deadline_ms.as_mut() {
+                *deadline += shift.as_millis() as u64;
+            }
         }
         if process
             .cold
@@ -3459,7 +3411,6 @@ impl Executor {
         {
             process.drain(ctx)?;
             if process.inbox.is_empty() {
-                runtime.note_status(pid, "waiting");
                 return Ok(Some(RunState::Wait { timeout_ms: None }));
             }
             // elixir_loop1: unlike hibernate/3, hibernate/0 keeps its stack.
@@ -3767,7 +3718,7 @@ fn exit_reason_from(process: &mut Process, error: &VmError) -> Term {
     } else {
         raised.reason.clone()
     };
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     match arinsal_term::from_owned(&owned, &mut heap) {
         Ok(reason) => reason,
         Err(conversion_error) => {
@@ -3933,7 +3884,7 @@ fn report_max_heap(
     let group_leader = process.group_leader.and_then(Pid::to_term);
     let bool_atom = |on: bool| crate::signals::atom(if on { "true" } else { "false" });
     let built = (|| -> Result<Term, VmError> {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
         let format = builder
             .list_from_iter(
@@ -4116,401 +4067,67 @@ impl Runtime {
         })?
     }
 
-    // g_proc_sched. Port of erts/emulator/beam/erl_process.c:9013
-    // (`erts_internal_suspend_process_2`), OTP-29.1.1.
-    pub(crate) fn suspend_total_of(&self, target: Pid) -> u32 {
-        // No process is suspended in the common case: one load instead of the map lock
-        // (erts tests ERTS_PSFLG_SUSPENDED in the state word).
-        if !self.suspended_any.load(Ordering::Acquire) {
-            return 0;
-        }
-        self.lock_suspend_totals()
-            .get(&target)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// The suspend counts, locked; the guard publishes whether any entry remains.
-    fn lock_suspend_totals(&self) -> SuspendTotals<'_> {
-        SuspendTotals {
-            guard: self.suspend_total.lock().unwrap(),
-            any: &self.suspended_any,
-        }
-    }
-
-    /// Whether `target` is suspended: a suspend signal still queued behind its running (for
-    /// example dirty) execution does not show yet.
-    // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status: a process with
-    // ERTS_PSFLG_RUNNING reports `running` before the suspend signal is handled), OTP-29.1.1.
-    pub(crate) fn suspend_active(&self, target: Pid) -> bool {
-        self.suspend_total_of(target) > 0
-            && !self
-                .suspend_outstanding
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|((_, queued_target), count)| *queued_target == target && *count > 0)
-    }
-
-    /// True while some async suspend of `target` is not yet active; later suspends queue
-    /// behind it, as the suspend signals do in erts.
-    fn has_outstanding_suspends(&self, target: Pid) -> bool {
-        self.suspend_outstanding
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|((_, pending_target), count)| *pending_target == target && *count > 0)
-    }
-
-    /// The target scheduled out with suspends pending: they are all active now.
-    pub(crate) fn suspends_activated(&self, target: Pid) {
-        if self.ever_suspended.load(Ordering::Acquire) {
-            self.suspend_outstanding
-                .lock()
-                .unwrap()
-                .retain(|(_, pending_target), _| *pending_target != target);
-            self.flush_suspend_waiters(target);
-        }
-    }
-
-    /// `{Suspendee, Active, Outstanding}` rows for `process_info(P, suspending)`.
-    pub(crate) fn suspending_of(&self, by: Pid) -> Vec<(Pid, u32, u32)> {
-        if !self.ever_suspended.load(Ordering::Acquire) {
-            return Vec::new();
-        }
-        let counts = self.suspend_counts.lock().unwrap();
-        let outstanding = self.suspend_outstanding.lock().unwrap();
-        let mut rows: Vec<_> = counts
-            .iter()
-            .filter(|((from, _), count)| *from == by && **count > 0)
-            .map(|((_, target), count)| {
-                let outstanding = outstanding
-                    .get(&(by, *target))
-                    .copied()
-                    .unwrap_or(0)
-                    .min(*count);
-                (*target, *count - outstanding, outstanding)
-            })
-            .collect();
-        rows.sort_by_key(|(pid, _, _)| pid_table_index(*pid));
-        rows
-    }
-
-    /// Increase the suspend count. `Ok(false)` is `unless_suspending` with no change.
-    pub(crate) fn suspend(
-        &self,
-        by: Pid,
-        target: Pid,
-        unless_suspending: bool,
-        asynchronous: bool,
-    ) -> Result<bool, ()> {
-        self.ever_suspended.store(true, Ordering::Release);
-        // A running target keeps going until it next schedules out.
-        let pending = asynchronous
-            && by != target
-            && (self.has_outstanding_suspends(target)
-                || (self.suspend_total_of(target) == 0
-                    && self
-                        .scheduler()
-                        .is_ok_and(|scheduler| scheduler.is_running(target))));
-        let mut counts = self.suspend_counts.lock().unwrap();
-        let entry = counts.entry((by, target)).or_insert(0);
-        if unless_suspending && *entry > 0 {
-            return Ok(false);
-        }
-        if *entry == u32::MAX {
-            return Err(());
-        }
-        *entry += 1;
-        drop(counts);
-        if pending {
-            // Decided under the lock that `suspends_activated` clears with: the signal stays
-            // queued only while an older one is still queued or the target is running.
-            let mut outstanding = self.suspend_outstanding.lock().unwrap();
-            let queued = outstanding
-                .iter()
-                .any(|((_, queued_target), count)| *queued_target == target && *count > 0);
-            if queued
-                || self
-                    .scheduler()
-                    .is_ok_and(|scheduler| scheduler.is_running(target))
-            {
-                *outstanding.entry((by, target)).or_insert(0) += 1;
-            }
-        }
-        {
-            let mut totals = self.lock_suspend_totals();
-            *totals.entry(target).or_insert(0) += 1;
-        }
-        if by != target {
-            self.pause_timers(target, 1);
-        }
-        self.note_status(target, "suspended");
-        Ok(true)
-    }
-
-    /// True while the `by` -> `target` suspend monitor is not active yet.
-    pub(crate) fn suspend_pending(&self, by: Pid, target: Pid) -> bool {
-        self.suspend_outstanding
-            .lock()
-            .unwrap()
-            .get(&(by, target))
-            .is_some_and(|count| *count > 0)
-    }
-
-    /// Queue the reply to a suspend and deliver it as soon as the monitor is active.
-    pub(crate) fn add_suspend_waiter(&self, waiter: SuspendWaiter) {
-        let target = waiter.target;
-        self.suspend_waiters.lock().unwrap().push(waiter);
-        self.flush_suspend_waiters(target);
-    }
-
-    /// Deliver the replies of every suspend of `target` that became active.
-    fn flush_suspend_waiters(&self, target: Pid) {
-        let ready: Vec<SuspendWaiter> = {
-            let mut waiters = self.suspend_waiters.lock().unwrap();
-            if waiters.is_empty() {
-                return;
-            }
-            let outstanding = self.suspend_outstanding.lock().unwrap();
-            let (ready, rest): (Vec<_>, Vec<_>) = waiters.drain(..).partition(|waiter| {
-                waiter.target == target
-                    && outstanding
-                        .get(&(waiter.by, waiter.target))
-                        .is_none_or(|count| *count == 0)
+    /// `erts_pause_proc_timer`: one more active suspend holds `process`' receive timeout and the
+    /// BIF timers aimed at it. The count nests like erts' `pptmr->count` and
+    /// `paused_bif_timers->count`.
+    // Port of erts/emulator/beam/erl_hl_timer.c:2849 (erts_pause_proc_timer) and :2864
+    // (erts_pause_bif_timers), OTP-29.1.1.
+    pub(crate) fn erts_pause_proc_timer(&self, process: &mut Process, pid: Pid) {
+        let pause = process
+            .cold_mut()
+            .timer_pause
+            .get_or_insert_with(|| TimerPause {
+                count: 0,
+                since: std::time::Instant::now(),
+                since_ms: 0,
+                shift: std::time::Duration::ZERO,
             });
-            *waiters = rest;
-            ready
-        };
-        if let Ok(scheduler) = self.scheduler() {
-            for waiter in ready {
-                let _ = scheduler.send(waiter.target, waiter.by, waiter.ready);
+        pause.count += 1;
+        if pause.count == 1 {
+            pause.since = std::time::Instant::now();
+            pause.since_ms = self.virtual_ms.load(Ordering::Relaxed);
+            if let Ok(scheduler) = self.scheduler() {
+                scheduler.pause_target_timers(pid);
             }
         }
-    }
-
-    /// A process is gone: its suspenders get the exited reply, its own waits are dropped.
-    fn drop_suspend_waiters(&self, pid: Pid) {
-        let gone: Vec<SuspendWaiter> = {
-            let mut waiters = self.suspend_waiters.lock().unwrap();
-            if waiters.is_empty() {
-                return;
-            }
-            let (gone, rest): (Vec<_>, Vec<_>) = waiters
-                .drain(..)
-                .partition(|waiter| waiter.target == pid || waiter.by == pid);
-            *waiters = rest;
-            gone
-        };
-        if let Ok(scheduler) = self.scheduler() {
-            for waiter in gone {
-                if waiter.target == pid && waiter.by != pid {
-                    let _ = scheduler.send(waiter.target, waiter.by, waiter.exited);
-                }
-            }
-        }
-    }
-
-    /// Runtime-internal suspend without a suspend monitor (`erts_suspend`), used for a
-    /// process waiting on a pending-purge lambda.
-    /// Port of erts/emulator/beam/erl_process.c:9369 (erts_suspend), OTP-29.1.1.
-    pub(crate) fn suspend_internal(&self, target: Pid) {
-        self.ever_suspended.store(true, Ordering::Release);
-        *self.lock_suspend_totals().entry(target).or_insert(0) += 1;
-        self.note_status(target, "suspended");
-    }
-
-    /// Undo [`Runtime::suspend_internal`]; true when the target must be rescheduled.
-    /// Port of erts/emulator/beam/erl_process.c:9402 (erts_resume), OTP-29.1.1.
-    pub(crate) fn resume_internal(&self, target: Pid) -> bool {
-        let wake = {
-            let mut totals = self.lock_suspend_totals();
-            let Some(total) = totals.get_mut(&target) else {
-                return false;
-            };
-            *total = total.saturating_sub(1);
-            let wake = *total == 0;
-            if wake {
-                totals.remove(&target);
-            }
-            wake
-        };
-        if wake {
-            let hibernating = self
-                .published
-                .lock()
-                .unwrap()
-                .get(&target)
-                .is_some_and(|slot| slot.hibernating);
-            self.note_status(target, if hibernating { "waiting" } else { "runnable" });
-        }
-        wake
-    }
-
-    /// Decrease one suspend acquired by `by`. `None` if that caller is not suspending.
-    /// `Some(true)` when the target's total count reaches zero and it must be scheduled.
-    pub(crate) fn resume(&self, by: Pid, target: Pid) -> Option<bool> {
-        if !self.ever_suspended.load(Ordering::Acquire) {
-            return None;
-        }
-        let mut counts = self.suspend_counts.lock().unwrap();
-        let entry = counts.get_mut(&(by, target))?;
-        if *entry == 0 {
-            return None;
-        }
-        *entry -= 1;
-        if *entry == 0 {
-            counts.remove(&(by, target));
-            self.suspend_outstanding
-                .lock()
-                .unwrap()
-                .remove(&(by, target));
-        }
-        drop(counts);
-        self.flush_suspend_waiters(target);
-        if by != target {
-            self.resume_timers(target, 1);
-        }
-        let wake = {
-            let mut totals = self.lock_suspend_totals();
-            let total = totals.entry(target).or_insert(0);
-            *total = total.saturating_sub(1);
-            let wake = *total == 0;
-            if wake {
-                totals.remove(&target);
-            }
-            wake
-        };
-        if wake {
-            let hibernating = self
-                .published
-                .lock()
-                .unwrap()
-                .get(&target)
-                .is_some_and(|slot| slot.hibernating);
-            self.note_status(target, if hibernating { "waiting" } else { "runnable" });
-        }
-        Some(wake)
-    }
-
-    /// Drop every suspend this process acquired. Returns targets whose count hit zero.
-    pub(crate) fn release_suspender(&self, by: Pid) -> Vec<Pid> {
-        if !self.ever_suspended.load(Ordering::Acquire) {
-            return Vec::new();
-        }
-        let held: Vec<(Pid, u32)> = {
-            let mut counts = self.suspend_counts.lock().unwrap();
-            let held = counts
-                .iter()
-                .filter(|((from, _), count)| *from == by && **count > 0)
-                .map(|((_, target), count)| (*target, *count))
-                .collect();
-            counts.retain(|(from, _), _| *from != by);
-            held
-        };
-        if held.is_empty() {
-            return Vec::new();
-        }
-        let mut wake = Vec::new();
-        {
-            let mut totals = self.lock_suspend_totals();
-            for (target, count) in held {
-                if target != by {
-                    self.resume_timers(target, count);
-                }
-                if let Some(total) = totals.get_mut(&target) {
-                    *total = total.saturating_sub(count);
-                    if *total == 0 {
-                        totals.remove(&target);
-                        wake.push(target);
-                    }
-                }
-            }
-        }
-        for target in &wake {
-            let hibernating = self
-                .published
-                .lock()
-                .unwrap()
-                .get(target)
-                .is_some_and(|slot| slot.hibernating);
-            self.note_status(*target, if hibernating { "waiting" } else { "runnable" });
-        }
-        wake
-    }
-
-    /// `erts_pause_proc_timer`: one more suspend holds `target`'s receive timeout and the BIF
-    /// timers aimed at it. The count nests like erts' `paused_bif_timers->count`.
-    // Port of erts/emulator/beam/erl_hl_timer.c:2849 (erts_pause_proc_timer), OTP-29.1.1.
-    #[allow(dead_code)]
-    pub(crate) fn erts_pause_proc_timer(&self, target: Pid) {
-        self.pause_timers(target, 1);
     }
 
     /// `erts_resume_paused_proc_timer`: the last resume re-arms what the pauses held.
-    // Port of erts/emulator/beam/erl_hl_timer.c:2919 (erts_resume_paused_proc_timer), OTP-29.1.1.
-    #[allow(dead_code)]
-    pub(crate) fn erts_resume_proc_timer(&self, target: Pid) {
-        self.resume_timers(target, 1);
-    }
-
-    /// A suspend monitor became active on `target`: its receive timeout and the BIF timers
-    /// aimed at it stop counting down.
-    /// Port of erts/emulator/beam/erl_process.c:9140 (erts_internal_suspend_process_2) and
-    /// erl_hl_timer.c:2849 (erts_pause_proc_timer), OTP-29.1.1.
-    fn pause_timers(&self, target: Pid, count: u32) {
-        let first = {
-            let mut pauses = self.pauses.lock().unwrap();
-            let pause = pauses.entry(target).or_insert_with(|| TimerPause {
-                count: 0,
-                since: std::time::Instant::now(),
-                shift: std::time::Duration::ZERO,
-            });
-            pause.count += count;
-            self.pauses_any.store(true, Ordering::Release);
-            pause.count == count
+    // Port of erts/emulator/beam/erl_hl_timer.c:2919 (erts_resume_paused_proc_timer) and :2949
+    // (erts_resume_paused_bif_timers), OTP-29.1.1.
+    pub(crate) fn erts_resume_proc_timer(&self, process: &mut Process, pid: Pid) {
+        let Some(pause) = process
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.timer_pause.as_mut())
+        else {
+            return;
         };
-        if first && let Ok(scheduler) = self.scheduler() {
-            scheduler.pause_target_timers(target);
-        }
-    }
-
-    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:6617 and erl_hl_timer.c:2919
-    /// (erts_resume_paused_proc_timer), OTP-29.1.1: the last resume re-arms the timers.
-    fn resume_timers(&self, target: Pid, count: u32) {
-        let last = {
-            let mut pauses = self.pauses.lock().unwrap();
-            let Some(pause) = pauses.get_mut(&target) else {
-                return;
-            };
-            pause.count = pause.count.saturating_sub(count);
-            if pause.count == 0 {
-                pause.shift += pause.since.elapsed();
-                true
+        pause.count = pause.count.saturating_sub(1);
+        if pause.count == 0 {
+            pause.shift += if self.simulated {
+                std::time::Duration::from_millis(
+                    self.virtual_ms
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(pause.since_ms),
+                )
             } else {
-                false
+                pause.since.elapsed()
+            };
+            if let Ok(scheduler) = self.scheduler() {
+                scheduler.resume_target_timers(pid);
             }
-        };
-        if last && let Ok(scheduler) = self.scheduler() {
-            scheduler.resume_target_timers(target);
         }
     }
 
     /// Time the process spent suspended since it last asked; shifts its receive deadline.
-    pub(crate) fn take_pause_shift(&self, pid: Pid) -> Option<std::time::Duration> {
-        // Called at every scheduling point: skip the map lock while no pause exists.
-        if !self.pauses_any.load(Ordering::Acquire) {
-            return None;
-        }
-        let mut pauses = self.pauses.lock().unwrap();
-        let pause = pauses.get_mut(&pid)?;
+    pub(crate) fn take_pause_shift(&self, process: &mut Process) -> Option<std::time::Duration> {
+        let cold = process.cold.as_mut()?;
+        let pause = cold.timer_pause.as_ref()?;
         if pause.count != 0 {
             return None;
         }
-        let shift = pause.shift;
-        pauses.remove(&pid);
-        self.pauses_any.store(!pauses.is_empty(), Ordering::Release);
-        Some(shift)
+        cold.timer_pause.take().map(|pause| pause.shift)
     }
 
     /// Live pids in this runtime's process table.
@@ -4542,25 +4159,10 @@ impl Runtime {
     }
 
     pub(crate) fn forget_process(&self, pid: Pid, drop_published: bool) {
-        if self.ever_suspended.load(Ordering::Acquire) {
-            self.drop_suspend_waiters(pid);
-        }
-        if self.pauses_any.load(Ordering::Acquire) {
-            let mut pauses = self.pauses.lock().unwrap();
-            pauses.remove(&pid);
-            self.pauses_any.store(!pauses.is_empty(), Ordering::Release);
-        }
         // `note_status` publishes PUBLISHED only when it inserts a slot. Exit skips the map
         // when this process never had one (erl_process.c keeps status on the process struct).
         if drop_published {
             self.published.lock().unwrap().remove(&pid);
-        }
-        if self.ever_suspended.load(Ordering::Acquire) {
-            self.lock_suspend_totals().remove(&pid);
-            self.suspend_counts
-                .lock()
-                .unwrap()
-                .retain(|(by, target), _| *by != pid && *target != pid);
         }
     }
 
@@ -4578,45 +4180,19 @@ impl Runtime {
             .unwrap_or(false)
     }
 
-    pub(crate) fn note_status(&self, pid: Pid, status: &'static str) {
-        let suspended = self.suspend_active(pid);
-        let mut published = self.published.lock().unwrap();
-        let slot = published.entry(pid).or_insert(Published {
-            status,
-            hibernating: false,
-            links: Vec::new(),
-            monitors: Vec::new(),
-            monitored_by: Vec::new(),
-        });
-        if suspended {
-            slot.status = "suspended";
-        } else if slot.hibernating {
-            slot.status = "waiting";
-        } else {
-            slot.status = status;
-        }
-        if !self.publish_proc_flag(pid, proc_flags::PUBLISHED) {
-            published.remove(&pid);
-        }
-    }
-
+    /// Sets or clears the HIBERNATED state bit: the process reports it on itself, as erts'
+    /// state word does (erl_process.c:9304 erts_process_state2status).
     pub(crate) fn mark_hibernating(&self, pid: Pid, on: bool) {
-        let suspended = self.suspend_total_of(pid) > 0;
-        let mut published = self.published.lock().unwrap();
-        let slot = published.entry(pid).or_insert(Published {
-            status: "waiting",
-            hibernating: on,
-            links: Vec::new(),
-            monitors: Vec::new(),
-            monitored_by: Vec::new(),
+        let Ok(scheduler) = self.scheduler() else {
+            return;
+        };
+        scheduler.with_proc_flags(pid, |flags| {
+            if on {
+                proc_flags::set_state(flags, proc_flags::HIBERNATED);
+            } else {
+                proc_flags::clear_state(flags, proc_flags::HIBERNATED);
+            }
         });
-        slot.hibernating = on;
-        if !suspended {
-            slot.status = "waiting";
-        }
-        if !self.publish_proc_flag(pid, proc_flags::PUBLISHED) {
-            published.remove(&pid);
-        }
     }
 
     /// Status of another process, derived from its scheduling state when asked.
@@ -4626,18 +4202,17 @@ impl Runtime {
         if self.suspend_active(pid) {
             return "suspended";
         }
-        let (exiting, hibernating) = self
-            .published
-            .lock()
-            .unwrap()
-            .get(&pid)
-            .map_or((false, false), |slot| {
-                (slot.status == "exiting", slot.hibernating)
-            });
-        if exiting {
+        let state = self
+            .scheduler()
+            .ok()
+            .and_then(|scheduler| {
+                scheduler.with_proc_flags(pid, |flags| flags.load(Ordering::Acquire))
+            })
+            .unwrap_or(0);
+        if state & proc_flags::EXITING != 0 {
             return "exiting";
         }
-        if hibernating {
+        if state & proc_flags::HIBERNATED != 0 {
             return "waiting";
         }
         match self
@@ -4653,8 +4228,6 @@ impl Runtime {
     fn note_relations(&self, pid: Pid, cold: Option<&crate::proc_create::ProcessCold>) {
         let mut published = self.published.lock().unwrap();
         let slot = published.entry(pid).or_insert(Published {
-            status: "runnable",
-            hibernating: false,
             links: Vec::new(),
             monitors: Vec::new(),
             monitored_by: Vec::new(),
@@ -4664,18 +4237,12 @@ impl Runtime {
             slot.monitors = cold
                 .monitors
                 .iter()
-                .map(|(&reference, &target)| {
-                    (
-                        reference,
-                        target,
-                        cold.monitor_tags.get(&reference).cloned(),
-                    )
-                })
+                .map(|(&reference, half)| (reference, half.target, half.data.tag.clone()))
                 .collect();
             slot.monitored_by = cold
                 .monitored_by
                 .iter()
-                .map(|(&reference, &origin)| (reference, origin))
+                .map(|(&reference, half)| (reference, half.origin))
                 .collect();
         } else {
             slot.links.clear();
@@ -4688,11 +4255,12 @@ impl Runtime {
     }
 
     pub(crate) fn is_hibernating(&self, pid: Pid) -> bool {
-        self.published
-            .lock()
-            .unwrap()
-            .get(&pid)
-            .is_some_and(|slot| slot.hibernating)
+        self.scheduler()
+            .ok()
+            .and_then(|scheduler| {
+                scheduler.with_proc_flags(pid, |flags| flags.load(Ordering::Acquire))
+            })
+            .is_some_and(|state| state & proc_flags::HIBERNATED != 0)
     }
 
     /// Run `body` against the module table shared by scheduler processes.
@@ -4767,7 +4335,7 @@ impl Runtime {
             child.cold_mut().initial_bif = Some((module.to_owned(), function.to_owned(), arity));
         }
         for (index, owned) in args.iter().enumerate() {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut child.heap);
             child.x[index] = arinsal_term::from_owned(owned, &mut heap)
                 .map_err(|_| VmError::Unsupported("spawn argument copy failed".into()))?;
         }
@@ -4806,8 +4374,13 @@ impl Process {
                 },
             };
             match payload {
-                Payload::Signal(Signal::Monitor(reference)) => {
-                    self.cold_mut().monitored_by.insert(reference, from);
+                Payload::Signal(Signal::Monitor { reference, shared }) => {
+                    if let Some(data) = crate::proc_create::monitor_data_of(shared) {
+                        self.cold_mut().monitored_by.insert(
+                            reference,
+                            crate::proc_create::TargetHalf { origin: from, data },
+                        );
+                    }
                 }
                 Payload::Signal(Signal::Demonitor(reference)) => {
                     if let Some(cold) = self.cold.as_mut() {
@@ -4836,13 +4409,29 @@ impl Process {
                         self, ctx, request, requester,
                     );
                 }
+                // Port of erl_proc_sig_queue.c:7347 (erts_proc_exit_handle_signal, monitor
+                // signals): a suspend that arrives at an exiting process is dropped at once.
+                Payload::Signal(Signal::Suspend { shared }) => {
+                    let _ = ctx.signal(from, Signal::SuspendDown { shared });
+                }
+                // Port of erl_proc_sig_queue.c:7408 (erts_proc_exit_handle_signal,
+                // ERTS_SIG_Q_OP_SYNC_SUSPEND), OTP-29.1.1: answered from the exiting state.
+                Payload::Signal(Signal::SyncSuspend {
+                    requester,
+                    tag,
+                    reply,
+                    async_,
+                }) => {
+                    let _ =
+                        crate::suspend::sync_reply(self, ctx, requester, tag, reply, async_, true);
+                }
                 _ => {}
             }
         }
     }
 
-    fn tuple(&mut self, elements: &[Term]) -> Result<Term, VmError> {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut self.heap);
+    pub(crate) fn tuple(&mut self, elements: &[Term]) -> Result<Term, VmError> {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
         TermBuilder::new(&mut heap)
             .tuple(elements)
             .map_err(|error| VmError::Unsupported(format!("signal tuple: {error:?}")))
@@ -4964,10 +4553,9 @@ impl Process {
             if resources & proc_flags::NODE_MON != 0 {
                 crate::node_tables::lock().forget_node_monitors(ctx.pid());
             }
-            let wake = runtime.release_suspender(ctx.pid());
-            for pid in wake {
-                let _ = ctx.signal(pid, arinsal_sched::Signal::UnlinkAck(u64::MAX));
-            }
+            // Every suspend this process holds is released at its target (erl_process.c:13894).
+            crate::suspend::release_on_exit(self, ctx);
+            crate::suspend::down_on_exit(self, ctx);
             if let Ok(scheduler) = runtime.scheduler() {
                 // Ports are links on the process (erl_process.c:14084). No port list, no scan.
                 if resources & proc_flags::PORTS != 0 {
@@ -5157,7 +4745,8 @@ impl Process {
                 let _ = ctx.signal(pid, arinsal_sched::Signal::ExitLinked(message));
             }
         }
-        for (reference, pid) in cold.monitored_by {
+        for (reference, half) in cold.monitored_by {
+            let pid = half.origin;
             if let Some(runtime) = self.runtime.as_ref()
                 && crate::dist::forward_monitor_down_if_proxy(
                     runtime,
@@ -5169,7 +4758,19 @@ impl Process {
             {
                 continue;
             }
-            if let Ok(message) = Message::copy_from(reason) {
+            // Port of erts/emulator/beam/erl_proc_sig_queue.c:2836-2900 (erts_proc_sig_send_monitor_down),
+            // OTP-29.1.1: an immediate reason travels in the signal and the origin builds the DOWN
+            // message; any other reason is copied into a DOWN message built here, on the sender.
+            if reason.is_pointer() {
+                if let Ok(message) =
+                    down_message_on_sender(self, reference, &half.data, ctx.pid(), reason)
+                {
+                    let _ = ctx.signal(
+                        pid,
+                        arinsal_sched::Signal::MonitorDownMsg { reference, message },
+                    );
+                }
+            } else if let Ok(message) = Message::copy_from(reason) {
                 let _ = ctx.signal(
                     pid,
                     arinsal_sched::Signal::MonitorDown {
@@ -5930,8 +5531,42 @@ impl Process {
                 let _ = ctx.signal(from, arinsal_sched::Signal::UnlinkAckSignal(id));
                 if removed { 4 } else { 0 }
             }
-            arinsal_sched::Signal::Monitor(reference) => {
-                self.cold_mut().monitored_by.insert(reference, from);
+            arinsal_sched::Signal::Suspend { shared } => {
+                crate::suspend::activate(self, ctx.pid(), from, shared);
+                2
+            }
+            arinsal_sched::Signal::SuspendRelease { shared } => {
+                crate::suspend::release(self, ctx.pid(), from, shared);
+                2
+            }
+            arinsal_sched::Signal::SuspendDown { shared } => {
+                crate::suspend::suspendee_down(self, from, shared);
+                2
+            }
+            arinsal_sched::Signal::SuspendResume => {
+                crate::suspend::resume_self(self);
+                2
+            }
+            arinsal_sched::Signal::SuspendInternal => {
+                crate::suspend::suspend_self(self);
+                2
+            }
+            arinsal_sched::Signal::SyncSuspend {
+                requester,
+                tag,
+                reply,
+                async_,
+            } => {
+                crate::suspend::sync_reply(self, ctx, requester, tag, reply, async_, false)?;
+                2
+            }
+            arinsal_sched::Signal::Monitor { reference, shared } => {
+                if let Some(data) = crate::proc_create::monitor_data_of(shared) {
+                    self.cold_mut().monitored_by.insert(
+                        reference,
+                        crate::proc_create::TargetHalf { origin: from, data },
+                    );
+                }
                 2
             }
             arinsal_sched::Signal::Demonitor(reference) => {
@@ -6025,6 +5660,14 @@ impl Process {
                 let reason = reason.into_receiver(self)?;
                 let queued = self.inbox.len();
                 self.deliver_monitor_down(from, reference, reason)?;
+                self.trace_new_message(ctx, queued, from);
+                8
+            }
+            arinsal_sched::Signal::MonitorDownMsg { reference, message } => {
+                // The sender built the DOWN message (erl_proc_sig_queue.c:2836-2900). The origin
+                // still drops it when its monitor is gone (erl_proc_sig_queue.c:6355).
+                let queued = self.inbox.len();
+                self.deliver_monitor_down_message(reference, message)?;
                 self.trace_new_message(ctx, queued, from);
                 8
             }
@@ -6743,6 +6386,34 @@ impl Process {
         false
     }
 
+    /// Queues a DOWN message the sender built, if the origin monitor is still active.
+    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:6355 (ERTS_SIG_Q_OP_MONITOR_DOWN).
+    fn deliver_monitor_down_message(
+        &mut self,
+        reference: u64,
+        message: Message,
+    ) -> Result<(), VmError> {
+        let active = self
+            .cold
+            .as_mut()
+            .is_some_and(|cold| cold.monitors.remove(&reference).is_some())
+            || crate::dist::take_monitor(reference).is_some();
+        let priority = self
+            .cold
+            .as_mut()
+            .is_some_and(|cold| cold.prio_monitors.remove(&reference));
+        if !active {
+            return Ok(());
+        }
+        let tuple = message.into_receiver(self)?;
+        if priority {
+            self.push_priority_message(tuple)?;
+        } else {
+            self.inbox.push_back(tuple);
+        }
+        Ok(())
+    }
+
     fn deliver_monitor_down(
         &mut self,
         from: Pid,
@@ -6764,15 +6435,11 @@ impl Process {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:6355 (ERTS_SIG_Q_OP_MONITOR_DOWN),
         // OTP-29.1.1: a DOWN whose origin monitor is no longer in the table (a demonitor
         // raced with the target's exit) is dropped instead of becoming a message.
-        let active = self
+        let half = self
             .cold
             .as_mut()
-            .is_some_and(|cold| cold.monitors.remove(&reference).is_some())
-            || crate::dist::take_monitor(reference).is_some();
-        let tag_owned = self
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.monitor_tags.remove(&reference));
+            .and_then(|cold| cold.monitors.remove(&reference));
+        let active = half.is_some() || crate::dist::take_monitor(reference).is_some();
         let priority = self
             .cold
             .as_mut()
@@ -6780,20 +6447,14 @@ impl Process {
         if !active {
             return Ok(());
         }
-        let tag = if let Some(owned) = tag_owned {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut self.heap);
-            arinsal_term::from_owned(&owned, &mut heap)
+        let tag = if let Some(owned) = half.as_ref().and_then(|half| half.data.tag.as_ref()) {
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
+            arinsal_term::from_owned(owned, &mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?
         } else {
             crate::signals::atom("DOWN")
         };
-        if let Some(cold) = self.cold.as_mut() {
-            cold.monitors.remove(&reference);
-        }
-        let name = self
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.monitor_names.remove(&reference));
+        let name = half.as_ref().and_then(|half| half.data.name.clone());
         let reference = crate::signals::reference(self, reference)?;
         let from = crate::dist::remote_pid_term(self, from)?
             .or_else(|| from.to_term())
@@ -6817,6 +6478,44 @@ impl Process {
 
 // Port of erts/emulator/beam/beam_common.c:685 (terminate_proc) and
 // erts/emulator/beam/utils.c:802 (do_send_logger_message), OTP-29.1.1.
+/// Builds the DOWN message on the sender for a non-immediate reason (erts
+/// erl_proc_sig_queue.c:2880-2900, the `else` branch of erts_proc_sig_send_monitor_down): the tuple
+/// `{Tag, Ref, process, Object, Reason}` is built on the exiting process and copied once.
+fn down_message_on_sender(
+    process: &mut Process,
+    reference: u64,
+    data: &crate::proc_create::MonitorData,
+    target: Pid,
+    reason: Term,
+) -> Result<Message, VmError> {
+    let tag = match data.tag.as_ref() {
+        Some(owned) => {
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            arinsal_term::from_owned(owned, &mut heap)
+                .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?
+        }
+        None => crate::signals::atom("DOWN"),
+    };
+    let reference_term = crate::signals::reference(process, reference)?;
+    let from = target
+        .to_term()
+        .ok_or_else(|| VmError::Unsupported("invalid monitor target pid".into()))?;
+    let object = crate::signals::monitor_object(process, data.name.as_deref(), from)?;
+    let tuple = {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        arinsal_term::TermBuilder::new(&mut heap)
+            .tuple(&[
+                tag,
+                reference_term,
+                crate::signals::atom("process"),
+                object,
+                reason,
+            ])
+            .map_err(|error| VmError::Unsupported(format!("DOWN tuple: {error:?}")))?
+    };
+    Message::copy_from(tuple)
+}
+
 fn report_process_error(process: &mut Process, ctx: &mut RunCtx<'_, Message>, reason: Term) {
     let Some(runtime) = process.runtime.clone() else {
         return;
@@ -6848,7 +6547,7 @@ fn report_process_error(process: &mut Process, ctx: &mut RunCtx<'_, Message>, re
         } else {
             "Error in process ~p with exit value:~n~p~n"
         };
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
         let format = builder
             .list_from_iter(
@@ -7099,7 +6798,7 @@ impl Task for Process {
         let mut literal_replies = Vec::new();
         for event in events {
             match event.payload {
-                Payload::Signal(Signal::Monitor(reference)) => {
+                Payload::Signal(Signal::Monitor { reference, .. }) => {
                     monitors.push((reference, event.from));
                 }
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
@@ -7235,7 +6934,6 @@ impl Process {
         let done = self.exit_ets(ctx, &mut reds);
         ctx.consume((initial - reds).clamp(0, initial) as u32);
         if !done {
-            runtime.note_status(ctx.pid(), "exiting");
             with_executor(data, runtime, |executor| {
                 crate::trace::emit(
                     Some(&mut executor.vm),
@@ -7334,7 +7032,6 @@ impl Process {
         // seize failure is `erts_suspend` plus `ERTS_BIF_YIELD`.
         if matches!(result, Ok(RunState::Yield)) && runtime.suspend_total_of(ctx.pid()) > 0 {
             self.cold_mut().suspend_parked = true;
-            runtime.note_status(ctx.pid(), "suspended");
             result = Ok(RunState::Wait { timeout_ms: None });
         }
         if matches!(result, Ok(RunState::Yield | RunState::Wait { .. }))
@@ -7390,8 +7087,7 @@ impl Process {
             let links = cold.links.take_changed();
             let monitors = cold.monitors.take_changed();
             let monitored_by = cold.monitored_by.take_changed();
-            let tags = cold.monitor_tags.take_changed();
-            links | monitors | monitored_by | tags
+            links | monitors | monitored_by
         });
         if changed {
             runtime.note_relations(ctx.pid(), self.cold.as_deref());
@@ -7483,11 +7179,9 @@ impl Process {
             }
             Err(error) => {
                 if matches!(error, VmError::Yield) {
-                    runtime.note_status(ctx.pid(), "runnable");
                     return RunOutcome::Yield;
                 }
                 if let VmError::Dirty(kind) = error {
-                    runtime.note_status(ctx.pid(), "runnable");
                     return RunOutcome::Dirty(kind);
                 }
                 let reason = exit_reason_from(self, &error);
@@ -7675,16 +7369,8 @@ impl Vm {
             virtual_ms: AtomicU64::new(0),
             ets: std::sync::RwLock::new(arinsal_ets::Registry::new()),
             result: sender,
-            suspend_counts: Mutex::new(HashMap::new()),
-            suspend_outstanding: Mutex::new(HashMap::new()),
-            suspend_waiters: Mutex::new(Vec::new()),
-            suspend_total: Mutex::new(HashMap::new()),
-            ever_suspended: AtomicBool::new(false),
-            suspended_any: AtomicBool::new(false),
             code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
             breakpoints: Arc::new(crate::trace_bp::BpNode::new(self.code_scope)),
-            pauses: Mutex::new(HashMap::new()),
-            pauses_any: AtomicBool::new(false),
             published: Mutex::new(HashMap::new()),
             debug_wait_active: AtomicBool::new(false),
             system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
@@ -7734,7 +7420,7 @@ impl Vm {
         // a collection never meets a term outside its heap and the literal areas.
         let literals = arinsal_term::LiteralAreas::current();
         for (register, &arg) in process.x.iter_mut().zip(args) {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             *register = arinsal_term::copy_term_litopt(arg, &mut heap, &literals)
                 .map_err(|error| VmError::Load(format!("first process arguments: {error:?}")))?;
         }

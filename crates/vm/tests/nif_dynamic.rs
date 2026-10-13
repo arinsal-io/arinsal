@@ -294,6 +294,527 @@ fn tracer_mod_sequential_tracer_matches_erts() {
     tracer_module_case("trace", "nifdyn_tracer_mod_seq_trace");
 }
 
+/// Run `module:run/0` through the CLI with extra environment variables (e.g. the interpreter).
+fn scheduled_cli_env(dir: &Path, module: &str, env: &[(&str, &str)]) -> OwnedTerm {
+    let output = dir.join(format!("{module}.etf"));
+    let arinsal = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arinsal");
+    let eval = format!(
+        "ok=file:write_file(\"{}\",term_to_binary({module}:run())), halt().",
+        output.display()
+    );
+    let result = Command::new("timeout")
+        .arg("120")
+        .arg(arinsal)
+        .args(["-noshell", "-pa"])
+        .arg(dir)
+        .args(["-eval", &eval])
+        .envs(env.iter().copied())
+        .output()
+        .expect("timeout arinsal");
+    assert!(
+        result.status.success(),
+        "{module}:run/0 on Arinsal CLI {env:?} failed: {}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    arinsal_etf::decode(&std::fs::read(&output).expect("Arinsal ETF output")).unwrap()
+}
+
+/// Dirty flags of function `index` of a wide library: normal, dirty CPU, dirty I/O in turn.
+fn wide_flags(index: usize) -> &'static str {
+    match index % 3 {
+        0 => "0",
+        1 => "ERL_NIF_DIRTY_JOB_CPU_BOUND",
+        _ => "ERL_NIF_DIRTY_JOB_IO_BOUND",
+    }
+}
+
+/// A NIF library for `module` with `count` functions `f<N>/0`, each returning
+/// `{Tag, N, enif_thread_type()}` and with the dirty flags `flags(N)`, and `extra` C code and
+/// `ErlNifFunc` entries after them.
+fn wide_nif_source(
+    module: &str,
+    count: usize,
+    tag: i32,
+    flags: fn(usize) -> &'static str,
+    extra: (&str, &str),
+) -> String {
+    let mut source = String::from("#include \"erl_nif.h\"\n");
+    for index in 0..count {
+        source.push_str(&format!(
+            "static ERL_NIF_TERM f{index}(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {{ (void)argc; (void)argv; return enif_make_tuple3(env, enif_make_int(env, {tag}), enif_make_int(env, {index}), enif_make_int(env, enif_thread_type())); }}\n"
+        ));
+    }
+    source.push_str(extra.0);
+    source.push_str("static ErlNifFunc funcs[] = {");
+    for index in 0..count {
+        source.push_str(&format!("{{\"f{index}\", 0, f{index}, {}}},", flags(index)));
+    }
+    source.push_str(extra.1);
+    source.push_str(&format!(
+        "}};\nERL_NIF_INIT({module}, funcs, NULL, NULL, NULL, NULL)\n"
+    ));
+    source
+}
+
+/// An Erlang module whose `f<N>/0` (and `extra_nifs`) are NIFs of `library`, with `load/0`
+/// calling `erlang:load_nif/2` and `local/0` calling every `f<N>/0` locally. `extra` holds
+/// attributes and functions to add.
+fn wide_module_source(
+    module: &str,
+    count: usize,
+    library: &Path,
+    extra_nifs: &[&str],
+    (attributes, body): (&str, &str),
+) -> String {
+    let mut nifs = (0..count)
+        .map(|index| format!("f{index}/0"))
+        .collect::<Vec<_>>();
+    nifs.extend(extra_nifs.iter().map(|nif| (*nif).to_owned()));
+    let nifs = nifs.join(", ");
+    let stubs = (0..count)
+        .map(|index| format!("f{index}() -> erlang:nif_error(undef).\n"))
+        .collect::<String>();
+    // Calls in chunks: one list expression of more than 1024 calls exceeds the X registers.
+    let chunks = (0..count).collect::<Vec<_>>();
+    let chunks = chunks.chunks(200).collect::<Vec<_>>();
+    let calls = (0..chunks.len())
+        .map(|chunk| format!("local{chunk}()"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let calls = format!("lists:append([{calls}])");
+    let stubs = chunks
+        .iter()
+        .enumerate()
+        .map(|(chunk, indexes)| {
+            let calls = indexes
+                .iter()
+                .map(|index| format!("f{index}()"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("local{chunk}() -> [{calls}].\n")
+        })
+        .chain(std::iter::once(stubs))
+        .collect::<String>();
+    format!(
+        "-module({module}).\n-export([load/0, local/0, {nifs}]).\n-nifs([{nifs}]).\n{attributes}\
+         load() -> erlang:load_nif(\"{}\", []).\nlocal() -> {calls}.\n{stubs}{body}",
+        library.display()
+    )
+}
+
+/// Compile a wide library and its module into `dir`.
+fn wide_module(erl: &RefErl, dir: &Path, module: &str, count: usize, tag: i32) {
+    let library = compile_so(
+        dir,
+        module,
+        &wide_nif_source(module, count, tag, wide_flags, ("", "")),
+    );
+    compile_beam(
+        erl,
+        dir,
+        module,
+        &wide_module_source(module, count, &library, &[], ("", "")),
+    );
+}
+
+/// Compare `module:run/0` on erl with Arinsal's BeamAsm and interpreter, each on a booted node.
+fn assert_same_jit_and_interp(dir: &Path, erl: &RefErl, module: &str) {
+    let expected = normalize(&reference(erl, module));
+    similar_asserts::assert_eq!(
+        normalize(&scheduled_cli_env(dir, module, &[("ARINSAL_BEAMASM", "1")])),
+        expected,
+        "{module}:run/0 (BeamAsm)"
+    );
+    similar_asserts::assert_eq!(
+        normalize(&scheduled_cli_env(dir, module, &[("ARINSAL_INTERP", "1")])),
+        expected,
+        "{module}:run/0 (interpreter)"
+    );
+}
+
+/// Erlang code returning `{Loaded, Local, Remote}` for the wide module `module`.
+fn wide_calls(module: &str, count: usize) -> String {
+    format!(
+        "{{{module}:load(), {module}:local(), \
+         [{module}:F() || F <- [list_to_atom(\"f\" ++ integer_to_list(I)) || I <- lists:seq(0, {count} - 1)]]}}"
+    )
+}
+
+#[test]
+fn library_with_more_nifs_than_the_old_table_matches_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dynamic NIF differential test");
+        return;
+    };
+    const COUNT: usize = 300;
+    let dir = work_dir("wide");
+    let mut c_source = String::from("#include \"erl_nif.h\"\n");
+    for index in 0..COUNT {
+        c_source.push_str(&format!(
+            "static ERL_NIF_TERM f{index}(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {{ (void)argc; (void)argv; return enif_make_int(env, {index}); }}\n"
+        ));
+    }
+    c_source.push_str("static ErlNifFunc funcs[] = {");
+    for index in 0..COUNT {
+        c_source.push_str(&format!("{{\"f{index}\", 0, f{index}, 0}},"));
+    }
+    c_source.push_str("};\nERL_NIF_INIT(nifdyn_wide, funcs, NULL, NULL, NULL, NULL)\n");
+    let library = compile_so(&dir, "nifdyn_wide", &c_source);
+    let names = (0..COUNT)
+        .map(|index| format!("f{index}/0"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let stubs = (0..COUNT)
+        .map(|index| format!("f{index}() -> erlang:nif_error(undef).\n"))
+        .collect::<String>();
+    let calls = (0..COUNT)
+        .map(|index| format!("f{index}()"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let module_src = format!(
+        "-module(nifdyn_wide).\n-export([run/0, {names}]).\n-nifs([{names}]).\nrun() ->\n    Loaded = erlang:load_nif(\"{}\", []),\n    Values = [{calls}],\n    {{Loaded, length(Values), lists:sum(Values), hd(Values), lists:last(Values)}}.\n{stubs}",
+        library.display()
+    );
+    compile_beam(&erl, &dir, "nifdyn_wide", &module_src);
+    assert_same_jit_and_interp(&dir, &erl, "nifdyn_wide");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Port of erts/emulator/beam/erl_nif.c:4840-4942 (erts_load_nif allocates one ErtsNifBeamStub
+// per function of the library), OTP-29.1.1: there is no limit on the functions of a library.
+#[test]
+fn library_with_more_nifs_than_the_stopgap_table_matches_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dynamic NIF differential test");
+        return;
+    };
+    const COUNT: usize = 1100;
+    let dir = work_dir("wider");
+    wide_module(&erl, &dir, "nifdyn_wider", COUNT, 7);
+    let runner = format!(
+        "-module(nifdyn_wider_run).\n-export([run/0]).\nrun() -> {}.\n",
+        wide_calls("nifdyn_wider", COUNT)
+    );
+    compile_beam(&erl, &dir, "nifdyn_wider_run", &runner);
+    assert_same_jit_and_interp(&dir, &erl, "nifdyn_wider_run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Port of erts/emulator/beam/erl_nif.c:93-124 and 4825-4842 (each library is its own
+// erl_module_nif with its own stubs), OTP-29.1.1.
+#[test]
+fn several_nif_libraries_loaded_at_once_match_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dynamic NIF differential test");
+        return;
+    };
+    const COUNT: usize = 250;
+    let dir = work_dir("multi");
+    let modules = [
+        "nifdyn_multi_a",
+        "nifdyn_multi_b",
+        "nifdyn_multi_c",
+        "nifdyn_multi_d",
+    ];
+    for (tag, module) in modules.iter().enumerate() {
+        wide_module(&erl, &dir, module, COUNT, tag as i32);
+    }
+    let runner = format!(
+        r#"
+        -module(nifdyn_multi_run).
+        -export([run/0]).
+        run() ->
+            Mods = [{mods}],
+            Loaded = [M:load() || M <- Mods],
+            Interleaved = [M:F() || F <- [f0, f1, f2, f124, f248, f249], M <- Mods],
+            Local = [lists:usort([element(1, T) || T <- M:local()]) || M <- Mods],
+            Counts = [length(M:local()) || M <- Mods],
+            Nifs = [length(M:module_info(nifs)) || M <- Mods],
+            {{Loaded, Interleaved, Local, Counts, Nifs}}.
+        "#,
+        mods = modules.join(", ")
+    );
+    compile_beam(&erl, &dir, "nifdyn_multi_run", &runner);
+    assert_same_jit_and_interp(&dir, &erl, "nifdyn_multi_run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Port of erts/emulator/beam/erl_nif.c:5334-5373 (erts_unload_nif releases the stubs when the
+// module instance is purged) and 4774-4777 (a module instance takes one library), OTP-29.1.1.
+#[test]
+fn nif_module_purge_and_load_again_matches_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dynamic NIF differential test");
+        return;
+    };
+    const COUNT: usize = 300;
+    let dir = work_dir("cycle");
+    let library = compile_so(
+        &dir,
+        "nifdyn_cycle",
+        // Normal NIFs only: purging after dirty calls trips a separate shadow-heap bug.
+        &wide_nif_source("nifdyn_cycle", COUNT, 3, |_| "0", ("", "")),
+    );
+    let on_load = (
+        "-on_load(init/0).\n",
+        "init() -> persistent_term:put(nifdyn_cycle, load()), ok.\n",
+    );
+    compile_beam(
+        &erl,
+        &dir,
+        "nifdyn_cycle",
+        &wide_module_source("nifdyn_cycle", COUNT, &library, &[], on_load),
+    );
+    let runner = format!(
+        r#"
+        -module(nifdyn_cycle_run).
+        -export([run/0]).
+        run() ->
+            Dir = "{}",
+            true = code:add_patha(Dir),
+            Cycles = [cycle() || _ <- lists:seq(1, 12)],
+            Explicit = nifdyn_cycle:load(),
+            purge(),
+            {{lists:usort(Cycles), Explicit}}.
+        cycle() ->
+            purge(),
+            {{module, nifdyn_cycle}} = code:load_file(nifdyn_cycle),
+            Loaded = persistent_term:get(nifdyn_cycle),
+            Local = nifdyn_cycle:local(),
+            Remote = [nifdyn_cycle:f0(), nifdyn_cycle:f150(), nifdyn_cycle:f299()],
+            {{Loaded, length(Local), lists:last(Local), Remote,
+              length(nifdyn_cycle:module_info(nifs))}}.
+        purge() ->
+            code:purge(nifdyn_cycle),
+            code:delete(nifdyn_cycle),
+            code:purge(nifdyn_cycle).
+        "#,
+        dir.display()
+    );
+    compile_beam(&erl, &dir, "nifdyn_cycle_run", &runner);
+    // The reference node loaded nifdyn_cycle while compiling; start from no loaded code.
+    let _ = erl.call("code", "purge", &[OwnedTerm::Atom("nifdyn_cycle".into())]);
+    let _ = erl.call("code", "delete", &[OwnedTerm::Atom("nifdyn_cycle".into())]);
+    let _ = erl.call("code", "purge", &[OwnedTerm::Atom("nifdyn_cycle".into())]);
+    assert_same_jit_and_interp(&dir, &erl, "nifdyn_cycle_run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A library for `nifdyn_upg` whose `who/0` returns `name` and `get/0` the integer its
+/// private data points to (0 without private data).
+fn upgrade_nif_source(name: &str, load: &str, upgrade: &str) -> String {
+    format!(
+        r#"
+        #include "erl_nif.h"
+        static int one = 1, two = 2, seventy = 70, ninety = 90;
+        static ERL_NIF_TERM who(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {{
+            (void)argc; (void)argv;
+            return enif_make_atom(env, "{name}");
+        }}
+        static ERL_NIF_TERM get(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {{
+            int *value = enif_priv_data(env);
+            (void)argc; (void)argv;
+            return enif_make_int(env, value ? *value : 0);
+        }}
+        static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM info) {{
+            (void)env; (void)info; (void)one; (void)two; (void)seventy; (void)ninety;
+            {load}
+        }}
+        static int upgrade(ErlNifEnv* env, void** priv, void** old_priv, ERL_NIF_TERM info) {{
+            (void)env; (void)info; (void)old_priv;
+            {upgrade}
+        }}
+        static ErlNifFunc funcs[] = {{ {{"who", 0, who, 0}}, {{"get", 0, get, 0}} }};
+        ERL_NIF_INIT(nifdyn_upg, funcs, load, NULL, {upgrade_ptr}, NULL)
+        "#,
+        upgrade_ptr = if upgrade.is_empty() {
+            "NULL"
+        } else {
+            "upgrade"
+        },
+        upgrade = if upgrade.is_empty() {
+            "return 0;"
+        } else {
+            upgrade
+        },
+    )
+}
+
+// Port of erts/emulator/beam/erl_nif.c:4758-4772 (`prev_mi`) and 4956-4987 (the upgrade or
+// load callback), OTP-29.1.1: a library loaded while the previous code of the module has one is
+// upgraded from it; the upgrade may replace the old library's private data, a veto restores it.
+#[test]
+fn nif_module_upgrade_matches_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping NIF upgrade differential test");
+        return;
+    };
+    let dir = work_dir("upgrade");
+    let versions = [
+        ("v1", "*priv = &one; return 0;", ""),
+        (
+            "v2",
+            "*priv = &two; return 0;",
+            "*priv = &two; *old_priv = &seventy; return 0;",
+        ),
+        ("v3", "*priv = &two; return 0;", ""),
+        ("v4", "return 0;", "*old_priv = &ninety; return 7;"),
+    ];
+    let mut binaries = Vec::new();
+    for (name, load, upgrade) in versions {
+        let library = compile_so(
+            &dir,
+            &format!("nifdyn_upg_{name}"),
+            &upgrade_nif_source(name, load, upgrade),
+        );
+        let source = format!(
+            r#"
+            -module(nifdyn_upg).
+            -on_load(init/0).
+            -export([who/0, get/0, getter/0]).
+            -nifs([who/0, get/0]).
+            init() ->
+                persistent_term:put({{nifdyn_upg, {name}}}, erlang:load_nif("{}", 0)),
+                ok.
+            getter() -> fun() -> {{who(), get()}} end.
+            who() -> erlang:nif_error(undef).
+            get() -> erlang:nif_error(undef).
+            "#,
+            library.display()
+        );
+        let beam = erl
+            .compile_named("nifdyn_upg", &source, &[])
+            .unwrap_or_else(|error| panic!("compile nifdyn_upg {name}: {error}"));
+        binaries.push(byte_binary(&beam));
+    }
+    let runner = format!(
+        r#"
+        -module(nifdyn_upg_run).
+        -export([run/0]).
+        run() ->
+            purge(),
+            A = step(fun() -> load(v1, {v1}), {{result(v1), now()}} end),
+            %% v2 upgrades from v1, which keeps running with the data v2's upgrade gave it.
+            B = step(fun() ->
+                         Old = nifdyn_upg:getter(),
+                         load(v2, {v2}),
+                         {{result(v2), now(), Old()}}
+                     end),
+            %% v4 vetoes its upgrade from v2: v2 keeps its data.
+            C = step(fun() ->
+                         code:purge(nifdyn_upg),
+                         Old = nifdyn_upg:getter(),
+                         load(v4, {v4}),
+                         {{result(v4), Old(), call(who), call(get)}}
+                     end),
+            %% v1 is loaded fresh (the current v4 code has no library), v3 cannot upgrade.
+            D = step(fun() ->
+                         code:purge(nifdyn_upg),
+                         load(v1, {v1}),
+                         First = {{result(v1), now()}},
+                         code:purge(nifdyn_upg),
+                         Old = nifdyn_upg:getter(),
+                         load(v3, {v3}),
+                         {{First, result(v3), Old(), call(who)}}
+                     end),
+            %% With no previous code v2 loads instead of upgrading.
+            E = step(fun() -> purge(), load(v2, {v2}), {{result(v2), now()}} end),
+            purge(),
+            {{A, B, C, D, E}}.
+        load(Name, Bin) ->
+            {{module, nifdyn_upg}} =
+                code:load_binary(nifdyn_upg, atom_to_list(Name) ++ ".beam", Bin).
+        result(Name) -> persistent_term:get({{nifdyn_upg, Name}}).
+        now() -> {{nifdyn_upg:who(), nifdyn_upg:get()}}.
+        call(F) -> try nifdyn_upg:F() catch Class:Reason -> {{Class, Reason}} end.
+        step(Fun) ->
+            Parent = self(),
+            {{Pid, Ref}} = spawn_monitor(fun() -> Parent ! {{self(), Fun()}} end),
+            receive {{Pid, Result}} -> receive {{'DOWN', Ref, _, _, _}} -> Result end;
+                    {{'DOWN', Ref, _, _, Reason}} -> {{died, Reason}}
+            end.
+        purge() ->
+            code:purge(nifdyn_upg),
+            code:delete(nifdyn_upg),
+            code:purge(nifdyn_upg).
+        "#,
+        v1 = binaries[0],
+        v2 = binaries[1],
+        v3 = binaries[2],
+        v4 = binaries[3],
+    );
+    compile_beam(&erl, &dir, "nifdyn_upg_run", &runner);
+    assert_same_jit_and_interp(&dir, &erl, "nifdyn_upg_run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Port of erts/emulator/beam/erl_nif.c:4903-4940 (call_nif[1] of a dirty NIF is
+// static_schedule_dirty_{io,cpu}_nif, call_nif[3] the NIF) and 3540-3583 (enif_schedule_nif),
+// OTP-29.1.1: dirty flags are part of each function's binding, however many the library has.
+#[test]
+fn dirty_nifs_of_a_wide_library_match_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dirty NIF differential test");
+        return;
+    };
+    const COUNT: usize = 300;
+    let dir = work_dir("wide_dirty");
+    let extra_c = r#"
+        static ERL_NIF_TERM cont(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            (void)argc;
+            return enif_make_tuple3(env, enif_make_atom(env, "cont"), argv[0],
+                                    enif_make_int(env, enif_thread_type()));
+        }
+        static ERL_NIF_TERM resched(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            int flags = 0;
+            enif_get_int(env, argv[0], &flags);
+            return enif_schedule_nif(env, "cont", flags, cont, argc, argv);
+        }
+    "#;
+    let library = compile_so(
+        &dir,
+        "nifdyn_wide_dirty",
+        &wide_nif_source(
+            "nifdyn_wide_dirty",
+            COUNT,
+            5,
+            wide_flags,
+            (
+                extra_c,
+                "{\"resched\", 1, resched, ERL_NIF_DIRTY_JOB_IO_BOUND},",
+            ),
+        ),
+    );
+    compile_beam(
+        &erl,
+        &dir,
+        "nifdyn_wide_dirty",
+        &wide_module_source(
+            "nifdyn_wide_dirty",
+            COUNT,
+            &library,
+            &["resched/1"],
+            ("", "resched(_) -> erlang:nif_error(undef).\n"),
+        ),
+    );
+    let runner = format!(
+        r#"
+        -module(nifdyn_wide_dirty_run).
+        -export([run/0]).
+        run() ->
+            {{Loaded, Local, Remote}} = {calls},
+            Types = lists:usort([{{N rem 3, Type}} || {{_, N, Type}} <- Local ++ Remote]),
+            Resched = [nifdyn_wide_dirty:resched(Flags) || Flags <- [0, 1, 2]],
+            {{Loaded, Local, Types, Resched}}.
+        "#,
+        calls = wide_calls("nifdyn_wide_dirty", COUNT)
+    );
+    compile_beam(&erl, &dir, "nifdyn_wide_dirty_run", &runner);
+    assert_same_jit_and_interp(&dir, &erl, "nifdyn_wide_dirty_run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn load_nif_from_module_loaded_off_the_code_path_matches_erts() {
     let Ok(erl) = RefErl::start() else {

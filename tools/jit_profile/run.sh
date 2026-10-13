@@ -20,7 +20,7 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 echo "=== Locating and compiling kernels.erl ==="
 KERNELS_SRC=""
 for candidate in \
-    "$REPO_ROOT/experiments/perf/pf_exec/kernels.erl"; do
+    "$REPO_ROOT/crates/vm/tests/fixtures/kernels.erl"; do
     if [ -f "$candidate" ]; then
         KERNELS_SRC="$candidate"
         break

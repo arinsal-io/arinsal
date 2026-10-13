@@ -1,4 +1,4 @@
-use arinsal_bifs::{Ctx, FragmentingHeap, lookup};
+use arinsal_bifs::{Ctx, ProcessHeapHandle, lookup};
 use arinsal_term::{ProcessHeap, Term, TermBuilder};
 use std::hint::black_box;
 use std::time::Instant;
@@ -18,7 +18,7 @@ fn one_megabyte_mixed_term() {
     let encode = lookup("erlang", "term_to_binary", 1).unwrap();
     let decode = lookup("erlang", "binary_to_term", 1).unwrap();
     let mut output_heap = ProcessHeap::with_words(256);
-    let mut output_alloc = FragmentingHeap(&mut output_heap);
+    let mut output_alloc = ProcessHeapHandle(&mut output_heap);
     let binary = encode(&mut Ctx::new(&mut output_alloc), &[term]).unwrap();
     // SAFETY: the output heap retains the binary and does not move during the benchmark.
     let size = unsafe { binary.binary_ref() }.unwrap().bit_len() / 8;
@@ -26,25 +26,25 @@ fn one_megabyte_mixed_term() {
     let rounds = 200;
     for _ in 0..10 {
         let mut heap = ProcessHeap::with_words(256);
-        let mut alloc = FragmentingHeap(&mut heap);
+        let mut alloc = ProcessHeapHandle(&mut heap);
         black_box(encode(&mut Ctx::new(&mut alloc), &[term]).unwrap());
     }
     let started = Instant::now();
     for _ in 0..rounds {
         let mut heap = ProcessHeap::with_words(256);
-        let mut alloc = FragmentingHeap(&mut heap);
+        let mut alloc = ProcessHeapHandle(&mut heap);
         black_box(encode(&mut Ctx::new(&mut alloc), &[term]).unwrap());
     }
     let encode_us = started.elapsed().as_micros() as f64 / rounds as f64;
     for _ in 0..10 {
         let mut heap = ProcessHeap::with_words(16_000);
-        let mut alloc = FragmentingHeap(&mut heap);
+        let mut alloc = ProcessHeapHandle(&mut heap);
         black_box(decode(&mut Ctx::new(&mut alloc), &[binary]).unwrap());
     }
     let started = Instant::now();
     for _ in 0..rounds {
         let mut heap = ProcessHeap::with_words(16_000);
-        let mut alloc = FragmentingHeap(&mut heap);
+        let mut alloc = ProcessHeapHandle(&mut heap);
         black_box(decode(&mut Ctx::new(&mut alloc), &[binary]).unwrap());
     }
     let decode_us = started.elapsed().as_micros() as f64 / rounds as f64;

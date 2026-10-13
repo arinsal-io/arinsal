@@ -2,7 +2,7 @@
 
 use crate::process::Message;
 use crate::{EvalResult, ImportOutcome, Process, Vm, VmError, calls, exceptions};
-use arinsal_bifs::{BifError, Ctx, FragmentingHeap};
+use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_loader::{Arg, ImportClass, Instr, Module};
 use arinsal_sched::RunCtx;
 use arinsal_term::{ExportEntry, FunRef, Term, TermBuilder, TermKind, global_atoms};
@@ -414,10 +414,10 @@ impl Vm {
                 .ok_or_else(|| VmError::Unsupported("lambda module atom".into()))?;
             // Port of erts/emulator/beam/beam_bif_load.c:1977
             // (erts_suspend_process_on_pending_purge_lambda), OTP-29.1.1.
-            if let (Some(runtime), Some(pid)) = (p.runtime.clone(), p.self_pid)
+            if let Some(pid) = p.self_pid
                 && self.purge_state.suspend_on_pending_lambda(&name, pid)
             {
-                runtime.suspend_internal(pid);
+                crate::suspend::suspend_self(p);
                 // ERTS_VBUMP_ALL_REDS: leave the scheduler at the next instruction.
                 p.force_yield = true;
             }
@@ -805,8 +805,8 @@ impl Vm {
             .or_else(|| crate::natives::static_nif_lookup(module, function, arity as u8))
         {
             let (result, bif_reductions) = {
-                let mut heap = FragmentingHeap(&mut p.heap);
-                let mut bif_ctx = Ctx::new(&mut heap);
+                let mut heap = ProcessHeapHandle(&mut p.heap);
+                let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     bif(&mut bif_ctx, &p.x[..arity])
                 }))

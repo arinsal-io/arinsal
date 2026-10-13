@@ -649,9 +649,60 @@ pub(crate) type NativeReturnEvents = (Vec<(usize, Vec<crate::trace::NativeTraceA
 /// A relation container that records whether it was mutated since the owner last
 /// published its relations (see `finish_run`).
 #[derive(Default)]
+/// The data of one local process monitor, shared by its origin and target halves (erts
+/// `ErtsMonitorData`, erl_monitor_link.h). It is immutable after creation, so both halves hold
+/// the same `Arc`; the pids live on the halves, as erts keeps `other.item` per half.
+#[derive(Debug)]
+pub(crate) struct MonitorData {
+    /// DOWN tag, owned off-heap so a tuple tag such as `{'ON_LOAD_DOWN', Mod}` survives GC.
+    /// `None` is the default `DOWN` tag and allocates nothing.
+    pub(crate) tag: Option<arinsal_etf::OwnedTerm>,
+    /// Registered name of a monitor created by name; its DOWN object is `{Name, Node}`.
+    pub(crate) name: Option<String>,
+}
+
+/// The data of a new local monitor with the default tag and no name. Each monitor gets its own
+/// object, shared by both halves and by the monitor signal (erts `erts_monitor_create`).
+pub(crate) fn default_monitor_data() -> std::sync::Arc<MonitorData> {
+    std::sync::Arc::new(MonitorData {
+        tag: None,
+        name: None,
+    })
+}
+
+/// The monitor data a monitor signal carries (erts: the target part points at the same object).
+pub(crate) fn monitor_data_of(
+    shared: arinsal_sched::SharedPayload,
+) -> Option<std::sync::Arc<MonitorData>> {
+    shared.0.downcast::<MonitorData>().ok()
+}
+
+/// Origin half of a local monitor (erts `ERTS_P_MONITORS` entry): the monitored target.
+#[derive(Clone, Debug)]
+pub(crate) struct OriginHalf {
+    pub(crate) target: arinsal_sched::Pid,
+    pub(crate) data: std::sync::Arc<MonitorData>,
+}
+
+/// Target half of a local monitor (erts `ERTS_P_LT_MONITORS` entry): the monitoring origin.
+#[derive(Clone, Debug)]
+pub(crate) struct TargetHalf {
+    pub(crate) origin: arinsal_sched::Pid,
+    pub(crate) data: std::sync::Arc<MonitorData>,
+}
+
 pub(crate) struct Tracked<T> {
     value: T,
     changed: bool,
+}
+
+impl<T: Default> Default for Tracked<T> {
+    fn default() -> Self {
+        Self {
+            value: T::default(),
+            changed: false,
+        }
+    }
 }
 
 impl<T> Tracked<T> {
@@ -764,6 +815,8 @@ pub(crate) struct ProcessCold {
     /// The last slice ended because the process is suspended, not because it waits in a
     /// receive: it stays active (runnable once resumed).
     pub(crate) suspend_parked: bool,
+    /// Receive-timeout pause of the active suspends (erts `common.timer` as `ErtsPausedProcTimer`).
+    pub(crate) timer_pause: Option<crate::process::TimerPause>,
     /// Parked by hibernation until a message arrives (erts `F_HIBERNATE_SCHED`).
     pub(crate) hibernate_sched: bool,
     /// `message_queue_data` is `off_heap` (erts `FS_OFF_HEAP_MSGQ` in `sig_qs.flags`).
@@ -841,7 +894,8 @@ pub(crate) struct ProcessCold {
     pub(crate) links: Tracked<std::collections::BTreeSet<arinsal_sched::Pid>>,
     /// Links created with `link/2` `[priority]` — EXIT messages from these are priority.
     pub(crate) prio_links: std::collections::BTreeSet<arinsal_sched::Pid>,
-    pub(crate) monitors: Tracked<std::collections::BTreeMap<u64, arinsal_sched::Pid>>,
+    /// Origin half of each local monitor, keyed by reference (erts `ERTS_P_MONITORS`).
+    pub(crate) monitors: Tracked<std::collections::BTreeMap<u64, OriginHalf>>,
     /// Remote-process monitors. `demonitor` of any other ref does not take the
     /// node-table lock: erts finds `ERTS_MON_TYPE_DIST_PROC` in this process's
     /// own monitor tree (`bif.c` `demonitor`), not in a global scan.
@@ -850,15 +904,24 @@ pub(crate) struct ProcessCold {
     /// The target half lives on the port (`ERTS_P_LT_MONITORS`).
     /// Port of `ERTS_MON_TYPE_PORT` in `ERTS_P_MONITORS` (`bif.c` `monitor`), OTP-29.1.1.
     pub(crate) port_monitors: std::collections::BTreeMap<u64, u64>,
-    /// Monitors created with the `priority` option — DOWN messages are priority.
+    /// Monitors created with the `priority` option; their DOWN messages are priority. Kept for
+    /// every monitor kind, since the origin decides priority when it receives the DOWN.
     pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
-    pub(crate) monitored_by: Tracked<std::collections::BTreeMap<u64, arinsal_sched::Pid>>,
+    /// Target half of each local monitor on this process (erts `ERTS_P_LT_MONITORS`).
+    pub(crate) monitored_by: Tracked<std::collections::BTreeMap<u64, TargetHalf>>,
+    /// Suspends this process holds on others, keyed by target (erts `ERTS_P_MONITORS` SUSPEND).
+    pub(crate) suspend_monitors: std::collections::BTreeMap<
+        arinsal_sched::Pid,
+        std::sync::Arc<crate::suspend::SuspendMonitor>,
+    >,
+    /// Suspend monitors others hold on this process, keyed by suspender (erts `ERTS_P_LT_MONITORS`).
+    pub(crate) suspended_by: std::collections::BTreeMap<
+        arinsal_sched::Pid,
+        std::sync::Arc<crate::suspend::SuspendMonitor>,
+    >,
+    /// Active suspends of this process (erts `p->rcount`); nonzero exactly when `SUSPENDED` is set.
+    pub(crate) suspend_count: u32,
     pub(crate) aliases: std::collections::HashSet<u64>,
-    /// Monitor message tag, owned off-heap. A tuple tag such as
-    /// `{'ON_LOAD_DOWN', Mod}` must survive GC until the monitored process exits.
-    pub(crate) monitor_tags: Tracked<std::collections::BTreeMap<u64, arinsal_etf::OwnedTerm>>,
-    /// Registered name of monitors created by name; their `DOWN` object is `{Name, Node}`.
-    pub(crate) monitor_names: std::collections::BTreeMap<u64, String>,
     /// Arguments of an `eval_scheduled` entry, restored when its `-on_load` prelude returns.
     ///
     /// The heap owns the copied terms so a collection inside `-on_load` cannot move them.

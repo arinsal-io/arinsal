@@ -9,7 +9,7 @@
 
 use crate::process::Message;
 use crate::{Process, Vm, VmError, exceptions};
-use arinsal_bifs::{Ctx, FragmentingHeap};
+use arinsal_bifs::{Ctx, ProcessHeapHandle};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, RunCtx, Scheduler};
 use arinsal_term::{ProcessHeap, Term, TermBuilder, from_owned, global_atoms};
@@ -332,12 +332,13 @@ fn poll_loop(wake_read: RawFd) {
         fds.push((wake_read, interest));
         fds.extend(snapshot.iter().map(|(_, fd)| (*fd, interest)));
         // Port of one-shot `driver_select`/`enif_select` wake delivery.
-        let (ready_fd, ready) = match crate::check_io::wait_any_nif_timeout(&fds, None) {
-            Ok(Some(ready)) => ready,
-            Ok(None) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => continue,
-        };
+        let (ready_fd, ready) =
+            match crate::check_io::wait_any_nif_timeout_wake(&fds, None, wake_read) {
+                Ok(Some(ready)) => ready,
+                Ok(None) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => continue,
+            };
         if ready_fd == wake_read && (ready.readable || ready.closed || ready.error) {
             let mut buf = [0u8; 64];
             loop {
@@ -457,8 +458,8 @@ fn call_values(
     let native = arinsal_nif_tty::lookup(module, function, arity)?;
     note_caller(process, ctx);
     let result = {
-        let mut heap = FragmentingHeap(&mut process.heap);
-        let mut bif_ctx = Ctx::new(&mut heap);
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut process.reductions);
         native(&mut bif_ctx, args)
     };
     Some(result.map_err(|error| exceptions::bif_error(process, module, function, args, error)))

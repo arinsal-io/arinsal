@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary & Measured Facts
 
-On Erlang/OTP 29.1.1 bytecode running on Apple Silicon (macOS arm64), a counting loop (`kernels:tail/1` from `experiments/perf/pf_exec/kernels.erl`) exhibits the following execution speeds:
+On Erlang/OTP 29.1.1 bytecode running on Apple Silicon (macOS arm64), a counting loop (`kernels:tail/1` from `crates/vm/tests/fixtures/kernels.erl`) exhibits the following execution speeds:
 
 | Implementation / Mode | Configuration | Measured Time / Iteration | Relative to Interpreter |
 | :--- | :--- | :---: | :---: |

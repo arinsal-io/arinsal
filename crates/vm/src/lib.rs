@@ -39,6 +39,7 @@ mod port;
 mod receive;
 mod seq_trace;
 mod signals;
+mod suspend;
 mod trace;
 mod trace_bp;
 // ---- vm_maps_bits ----
@@ -64,7 +65,7 @@ use arinsal_beam::BeamFile;
 use arinsal_beamasm::{ExitReason, ProcessHeader, SchedulerRegisters};
 // vm_binparse2
 use arinsal_bifs::Ctx;
-use arinsal_bifs::FragmentingHeap;
+use arinsal_bifs::ProcessHeapHandle;
 use arinsal_bits::MatchOps;
 use arinsal_loader::{
     Arg, FastBif, GenericOp, ImportClass, ImportFastOp, Instr, Module, SelectTable,
@@ -233,7 +234,7 @@ pub struct Vm {
     /// The code tables of `erts_active_code_ix()` this VM reads (see [`Vm::refresh_code`]).
     pub(crate) code: Arc<CodeTables>,
     /// Cache of the node's NIF body slots.
-    native_fns: Arc<Vec<Option<arinsal_bifs::BifFn>>>,
+    native_fns: Arc<Vec<Option<crate::natives::nif::NativeFn>>>,
     purge_state: Arc<crate::natives::code::PurgeState>,
     beamasm_targets: beamasm_integration::NativeTargetCache,
     /// Identity of this node's code (erts' code index state); native registries are per scope.

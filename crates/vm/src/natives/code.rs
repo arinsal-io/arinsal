@@ -3,7 +3,7 @@
 use crate::process::Runtime;
 use crate::{CodeMeta, Process, Vm, VmError, exceptions};
 use arinsal_beam::BeamFile;
-use arinsal_bifs::FragmentingHeap;
+use arinsal_bifs::ProcessHeapHandle;
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::CoverageMode;
 use arinsal_sched::Pid;
@@ -41,7 +41,11 @@ fn lock(runtime: &Runtime) -> std::sync::MutexGuard<'_, CodeModPermission> {
 /// is suspended and queued, and the caller must yield and retry its BIF call once resumed.
 // Port of erts/emulator/beam/code_ix.c:214-290 (try_seize_code_permission) and 378-386
 // (erts_try_seize_code_mod_permission), OTP-29.1.1.
-pub(crate) fn try_seize_code_mod_permission(runtime: &Runtime, pid: Pid) -> bool {
+pub(crate) fn try_seize_code_mod_permission(
+    runtime: &Runtime,
+    process: &mut Process,
+    pid: Pid,
+) -> bool {
     let mut perm = lock(runtime);
     if perm.handover == Some(pid) {
         // Given to us as a waiter.
@@ -63,7 +67,9 @@ pub(crate) fn try_seize_code_mod_permission(runtime: &Runtime, pid: Pid) -> bool
         perm.queue.retain(|waiter| *waiter != pid);
         return false;
     }
-    runtime.suspend_internal(pid);
+    if process.self_pid == Some(pid) {
+        crate::suspend::suspend_self(process);
+    }
     false
 }
 
@@ -394,13 +400,13 @@ fn make_list(
     process: &mut Process,
     values: impl IntoIterator<Item = Term>,
 ) -> Result<Term, VmError> {
-    TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .list_from_iter(values)
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
 
 fn make_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
-    TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .tuple(values)
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
@@ -461,9 +467,21 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                 }
                 info_list(process, functions)
             }
-            // Port of erts/emulator/beam/erl_bif_info.c:5772 (nifs_in_module), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_bif_info.c:5772-5805 (nifs_in_module), OTP-29.1.1.
             "nifs" => {
                 let mut nifs = Vec::new();
+                // `erts_nif_get_funcs(mod->curr.nif)`: the functions of the library entry.
+                if let Some(functions) =
+                    crate::natives::nif::instance_nif_functions(vm.code_scope, id)
+                {
+                    for (function, arity) in functions {
+                        nifs.push(make_tuple(
+                            process,
+                            &[atom(&function), Term::small(i64::from(arity)).unwrap()],
+                        )?);
+                    }
+                    return info_list(process, nifs);
+                }
                 // Natively backed stubs of modules that never ran load_nif are not NIFs in erts.
                 let loaded = vm.code.loaded_nifs.contains(module.name.as_str());
                 for (entry, function, arity) in module.functions.iter().rev() {
@@ -497,13 +515,13 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                     .map(|bytes| arinsal_etf::decode(bytes).map_err(|_| badarg()))
                     .transpose()?
                     .unwrap_or(OwnedTerm::Nil);
-                let mut heap = FragmentingHeap(&mut process.heap);
+                let mut heap = ProcessHeapHandle(&mut process.heap);
                 from_owned(&value, &mut heap).map_err(|_| badarg())
             }
             // Port of erts/emulator/beam/erl_bif_info.c:5913 (md5_of_module), OTP-29.1.1.
             "md5" => {
                 let md5 = meta.md5.ok_or_else(badarg)?;
-                let mut heap = FragmentingHeap(&mut process.heap);
+                let mut heap = ProcessHeapHandle(&mut process.heap);
                 from_owned(&OwnedTerm::Binary(md5.to_vec()), &mut heap).map_err(|_| badarg())
             }
             _ => Err(badarg()),
@@ -538,11 +556,11 @@ pub(crate) fn module_loaded_light(
     let [module] = args else {
         return None;
     };
-    let name = module.as_atom()?;
+    let name = global_atoms().text(module.as_atom()?)?;
     let loaded = process
         .runtime
         .as_ref()?
-        .with_active_code(|_, tables| tables.loaded.contains_key(&name));
+        .with_active_code(|_, tables| tables.loaded.contains_key(name));
     Some(Ok(Term::atom(if loaded {
         atoms::TRUE
     } else {
@@ -561,11 +579,13 @@ pub(crate) fn function_exported_light(
     };
     let module = module.as_atom()?;
     let function = function.as_atom()?;
+    let module_name = global_atoms().text(module)?;
+    let function_name = global_atoms().text(function)?;
     let arity = u8::try_from(arity.as_small().filter(|n| (0..=255).contains(n))?).ok()?;
     let exported = process.runtime.as_ref()?.with_active_code(|_, tables| {
-        tables.loaded.get(&module).is_some_and(|id| {
+        tables.loaded.get(module_name).is_some_and(|id| {
             tables.modules[*id]
-                .export_slot_atom(function, arity)
+                .export_slot(function_name, arity)
                 .is_some()
         })
     });
@@ -643,9 +663,10 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
 // Port of erts/emulator/beam/code_ix.c:407-421 (erts_try_seize_code_load_permission),
 // OTP-29.1.1. Arinsal has only the code modification permission: no operation needs the
 // staging permission alone while another process holds the modification permission.
-fn seize_code_load_permission(process: &Process, pid: Option<Pid>) -> Result<(), VmError> {
-    match (&process.runtime, pid) {
-        (Some(runtime), Some(pid)) if !try_seize_code_mod_permission(runtime, pid) => {
+fn seize_code_load_permission(process: &mut Process, pid: Option<Pid>) -> Result<(), VmError> {
+    let runtime = process.runtime.clone();
+    match (runtime, pid) {
+        (Some(runtime), Some(pid)) if !try_seize_code_mod_permission(&runtime, process, pid) => {
             Err(VmError::Yield)
         }
         _ => Ok(()),
@@ -759,7 +780,7 @@ fn finish_stage(
                 let barrier_passed = Arc::new(AtomicBool::new(false));
                 staged.barrier_passed = Some(Arc::clone(&barrier_passed));
                 process.cold_mut().finish_loading_commit = Some(staged);
-                runtime.suspend_internal(pid);
+                crate::suspend::suspend_self(process);
                 ctx.thread_progress_later(move || {
                     if let Some(ended) = ended {
                         ended.commit();
@@ -982,7 +1003,7 @@ fn beamfile_chunk(process: &mut Process, args: &[Term]) -> Result<Term, VmError>
     let result = arinsal_loader::beamfile_chunk(bytes, id).map_err(|_| badarg())?;
     match result {
         Some(chunk) => {
-            let mut heap = FragmentingHeap(&mut process.heap);
+            let mut heap = ProcessHeapHandle(&mut process.heap);
             from_owned(&OwnedTerm::Binary(chunk), &mut heap).map_err(|_| system_limit())
         }
         None => Ok(atom("undefined")),
@@ -998,7 +1019,7 @@ fn beamfile_module_md5(process: &mut Process, binary: Term) -> Result<Term, VmEr
         return Ok(atom("undefined"));
     }
     let md5 = arinsal_loader::module_uniq(bytes).map_err(|_| badarg())?;
-    let mut heap = FragmentingHeap(&mut process.heap);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
     from_owned(&OwnedTerm::Binary(md5.to_vec()), &mut heap).map_err(|_| system_limit())
 }
 
@@ -1097,7 +1118,7 @@ fn get_debug_info(vm: &Vm, process: &mut Process, module: Term) -> Result<Term, 
             ]),
         ]));
     }
-    let mut heap = FragmentingHeap(&mut process.heap);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
     from_owned(&list(result), &mut heap).map_err(|_| system_limit())
 }
 
@@ -1159,7 +1180,7 @@ fn module_id_referenced(
 // Port of erts/emulator/beam/beam_bif_load.c:2112-2330 (erts_internal_purge_module_2), OTP-29.1.1.
 fn purge(
     vm: &mut Vm,
-    process: &Process,
+    process: &mut Process,
     ctx: &mut RunCtx<'_, crate::process::Message>,
     name: &str,
     phase: &str,
@@ -1682,7 +1703,7 @@ mod tests {
         for bytes in binaries {
             let beam = arinsal_beam::parse(bytes).unwrap();
             let binary = {
-                let mut heap = FragmentingHeap(&mut process.heap);
+                let mut heap = ProcessHeapHandle(&mut process.heap);
                 from_owned(&OwnedTerm::Binary(bytes.to_vec()), &mut heap).unwrap()
             };
             let prepared = prepare(vm, &mut process, &[atom(&beam.module), binary]).unwrap();
@@ -2118,7 +2139,7 @@ mod tests {
                 let terms: Vec<_> = args
                     .iter()
                     .map(|arg| {
-                        let mut heap = FragmentingHeap(&mut process.heap);
+                        let mut heap = ProcessHeapHandle(&mut process.heap);
                         from_owned(arg, &mut heap).unwrap()
                     })
                     .collect();

@@ -1,6 +1,6 @@
 mod support;
 
-use arinsal_bifs::{Ctx, FragmentingHeap, lookup};
+use arinsal_bifs::{Ctx, ProcessHeapHandle, lookup};
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm as O};
 use arinsal_term::{
@@ -315,7 +315,7 @@ fn exact_term_order_matches_otp_for_compound_keys() {
 #[test]
 fn serialization_bif_reports_work_for_scheduler_accounting() {
     let mut heap = ProcessHeap::with_words(4096);
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let input = TermBuilder::new(&mut allocator).binary(&[7; 4096]).unwrap();
     let bif = lookup("erlang", "term_to_binary", 1).unwrap();
     let mut ctx = Ctx::new(&mut allocator);
@@ -607,14 +607,14 @@ fn million_deep_list_and_tuple_use_iterative_codec() {
                 };
             }
         }
-        let mut input_alloc = FragmentingHeap(&mut input_heap);
+        let mut input_alloc = ProcessHeapHandle(&mut input_heap);
         let binary = lookup("erlang", "term_to_binary", 1).unwrap()(
             &mut Ctx::new(&mut input_alloc),
             &[input],
         )
         .unwrap();
         let mut output_heap = ProcessHeap::with_words(2_100_000);
-        let mut output_alloc = FragmentingHeap(&mut output_heap);
+        let mut output_alloc = ProcessHeapHandle(&mut output_heap);
         let decoded = lookup("erlang", "binary_to_term", 1).unwrap()(
             &mut Ctx::new(&mut output_alloc),
             &[binary],
@@ -651,7 +651,7 @@ fn native_record_bytes_match_otp() {
             &[record.clone(), option.clone()],
         );
         let mut heap = ProcessHeap::with_words(1024);
-        let mut allocator = FragmentingHeap(&mut heap);
+        let mut allocator = ProcessHeapHandle(&mut heap);
         let option_term = from_owned(&option, &mut allocator).unwrap();
         let module = global_atoms().intern("test_etf").unwrap();
         let name = global_atoms().intern("sample").unwrap();

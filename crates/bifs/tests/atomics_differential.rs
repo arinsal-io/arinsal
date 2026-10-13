@@ -1,4 +1,4 @@
-use arinsal_bifs::{BifError, Ctx, FragmentingHeap, lookup};
+use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle, lookup};
 use arinsal_difftest::RefErl;
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, Term, from_owned, to_owned};
@@ -68,7 +68,7 @@ fn erl_ops(ops: &[Op], signed: bool) -> String {
 
 fn rust_sequence(ops: &[Op], signed: bool) -> Vec<O> {
     let mut heap = ProcessHeap::with_words(64);
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let new = lookup("erts_internal", "atomics_new", 2).unwrap();
     let args = [
         Term::small(4).unwrap(),
@@ -159,7 +159,7 @@ fn atomics_and_counters_array_length_overflow_matches_otp() {
     ] {
         assert_eq!(erl.eval(expression).unwrap(), O::atom("system_limit"));
         let mut heap = ProcessHeap::with_words(64);
-        let mut allocator = FragmentingHeap(&mut heap);
+        let mut allocator = ProcessHeapHandle(&mut heap);
         let huge = from_owned(&O::BigInt(BigInt::from(1_u8) << 64), &mut allocator).unwrap();
         let args = if arity == 1 {
             vec![huge]

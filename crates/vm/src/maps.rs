@@ -86,7 +86,7 @@ pub(super) fn execute(
             let result = if let [key_arg, value_arg] = args.as_ref() {
                 let (key, value) = (p.read(*key_arg)?, p.read(*value_arg)?);
                 let arg = |i: usize| if i == 0 { key } else { value };
-                let mut heap = crate::FragmentingHeap(&mut p.heap);
+                let mut heap = crate::ProcessHeapHandle(&mut p.heap);
                 if exact {
                     arinsal_maps::gc_update_map_exact(map, n, arg, &mut heap)
                 } else {
@@ -106,7 +106,7 @@ pub(super) fn execute(
                     let (key, value) = pairs[i / 2];
                     if i.is_multiple_of(2) { key } else { value }
                 };
-                let mut heap = crate::FragmentingHeap(&mut p.heap);
+                let mut heap = crate::ProcessHeapHandle(&mut p.heap);
                 if exact {
                     arinsal_maps::gc_update_map_exact(map, n, arg, &mut heap)
                 } else {

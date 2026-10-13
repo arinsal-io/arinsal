@@ -52,6 +52,7 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         // These were `light_dispatch` → `invoke_dispatch_bif` (Native, no process BIF).
         ("erlang", "self", 0) => self_light as *const () as usize,
         ("erlang", "node", 0) => node_light as *const () as usize,
+        ("lists", "member", 2) => crate::native_helpers::list_member_entry as *const () as usize,
         ("persistent_term", "get", 1) => persistent_term_get_1_light as *const () as usize,
         ("persistent_term", "get", 2) => persistent_term_get_2_light as *const () as usize,
         _ => return None,

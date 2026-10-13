@@ -1,4 +1,4 @@
-use arinsal_bifs::{BifError, Ctx, FragmentingHeap};
+use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_difftest::{CallResult, Error as RefError, RefErl};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, from_owned, to_owned};
@@ -8,7 +8,7 @@ fn atom(name: &str) -> O {
 }
 fn call(name: &str, args: &[O]) -> Result<O, BifError> {
     let mut heap = ProcessHeap::with_words(1024);
-    let mut alloc = FragmentingHeap(&mut heap);
+    let mut alloc = ProcessHeapHandle(&mut heap);
     let terms = args
         .iter()
         .map(|a| from_owned(a, &mut alloc).unwrap())

@@ -664,7 +664,7 @@ fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
         if table.is_detached() || !allowed(&table, caller, false) {
             return None;
         }
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         // Port of erts/emulator/beam/erl_db_hash.c:1492 (db_get_hash) and
         // erl_db_tree.c:1046 (db_get_tree), OTP-29.1.1: a set holds at most one object,
         // consed straight onto the process heap.
@@ -793,7 +793,7 @@ fn direct_update_counter_cached(process: &mut Process, args: &[Term]) -> Option<
         };
         // The counters are immediates: only a result list needs the heap, and the process
         // heap grows rather than fail, so the update is never redone.
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         counter_results(&mut heap, &values, single).ok()
     })
 }
@@ -879,7 +879,7 @@ fn lookup_args(
     if member {
         Ok(boolean_term(table.member(key)))
     } else {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let values = table.lookup(key, &mut heap).map_err(err)?;
         output_list(&mut heap, values)
     }
@@ -891,7 +891,7 @@ fn lookup_element_locked(
     key: Term,
     position: usize,
     default: Option<Term>,
-    heap: &mut arinsal_bifs::FragmentingHeap<'_>,
+    heap: &mut arinsal_bifs::ProcessHeapHandle<'_>,
 ) -> Result<Term, VmError> {
     if !allowed(table, caller, false) {
         return Err(badarg_cause("access"));
@@ -1042,7 +1042,7 @@ fn delete_or_clear(
     if function == EtsBif::Delete {
         return Ok(atom("true"));
     }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .int_from_i128(state.nitems as i128)
         .map_err(|_| badarg())
@@ -1074,7 +1074,7 @@ fn call_inner(
         let trace_control_word =
             Term::small(crate::natives::sys::trace_control_word_value(process))
                 .ok_or_else(badarg)?;
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         return arinsal_ets::match_spec::match_spec_test(
             *against,
             *specification,
@@ -1122,7 +1122,7 @@ fn call_inner(
     } else {
         RegistryAccess::Shared(rt.ets.read().unwrap())
     };
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     match (function, args) {
         (EtsBif::New, [name, options]) => {
             // Port of erts/emulator/beam/erl_db.c:2560-2715 (ets_new_2 option state), OTP-29.1.1.

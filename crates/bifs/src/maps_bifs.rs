@@ -92,12 +92,12 @@ fn from_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         }
         pairs.push((tuple.get(0).unwrap(), tuple.get(1).unwrap()));
     }
-    let result = arinsal_maps::from_list(&pairs, ctx.heap);
+    let result = arinsal_maps::from_list(&pairs, &mut ctx.heap);
     mapped(ctx, result)
 }
 fn from_keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let keys = list(args[0])?;
-    let result = arinsal_maps::from_keys(&keys, args[1], ctx.heap);
+    let result = arinsal_maps::from_keys(&keys, args[1], &mut ctx.heap);
     mapped(ctx, result)
 }
 fn keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
@@ -291,11 +291,12 @@ impl MapsBuildWalk {
                             cursor = tail;
                             Self::element_of(fill, head, false).ok()
                         });
-                        let result = arinsal_maps::from_small_pairs(self.size, pairs, ctx.heap);
+                        let result =
+                            arinsal_maps::from_small_pairs(self.size, pairs, &mut ctx.heap);
                         return mapped(ctx, result).map(Some);
                     }
                     self.cursor = self.list;
-                    let build = arinsal_maps::HashmapFromPairs::new(self.size, ctx.heap);
+                    let build = arinsal_maps::HashmapFromPairs::new(self.size, &mut ctx.heap);
                     self.build = Some(mapped(ctx, build)?);
                     self.phase = BuildPhase::Leaves;
                 }
@@ -322,7 +323,7 @@ impl MapsBuildWalk {
                 }
                 BuildPhase::Build => {
                     let build = self.build.as_mut().ok_or(BifError::BADARG)?;
-                    let result = build.step(reds, ctx.heap);
+                    let result = build.step(reds, &mut ctx.heap);
                     return mapped(ctx, result);
                 }
             }
@@ -331,7 +332,7 @@ impl MapsBuildWalk {
 }
 
 fn merge(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let result = arinsal_maps::merge(args[0], args[1], ctx.heap);
+    let result = arinsal_maps::merge(args[0], args[1], &mut ctx.heap);
     mapped(ctx, result)
 }
 /// First, non-yielding part of `maps:merge/2`; a HAMT result continues with
@@ -342,24 +343,24 @@ pub fn maps_merge_start(
     ctx: &mut Ctx<'_>,
     args: &[Term],
 ) -> Result<arinsal_maps::MergeStart, BifError> {
-    let result = arinsal_maps::merge_start(args[0], args[1], ctx.heap);
+    let result = arinsal_maps::merge_start(args[0], args[1], &mut ctx.heap);
     mapped(ctx, result)
 }
 fn put(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let result = arinsal_maps::put(args[2], args[0], args[1], ctx.heap);
+    let result = arinsal_maps::put(args[2], args[0], args[1], &mut ctx.heap);
     mapped(ctx, result)
 }
 fn remove(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let result = arinsal_maps::remove(args[1], args[0], ctx.heap);
+    let result = arinsal_maps::remove(args[1], args[0], &mut ctx.heap);
     mapped(ctx, result)
 }
 fn update(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let result = arinsal_maps::update(args[2], args[0], args[1], ctx.heap);
+    let result = arinsal_maps::update(args[2], args[0], args[1], &mut ctx.heap);
     mapped(ctx, result)
 }
 fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_map.c:1910-1925 (maps_take_2), OTP-29.1.1.
-    let result = arinsal_maps::take(args[1], args[0], ctx.heap);
+    let result = arinsal_maps::take(args[1], args[0], &mut ctx.heap);
     match mapped(ctx, result)? {
         Some((value, map)) => Ok(tuple_build(ctx, &[value, map])),
         None => Ok(Term::atom(atoms::ERROR)),

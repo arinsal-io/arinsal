@@ -1,4 +1,4 @@
-use arinsal_bifs::{BifError, Ctx, FragmentingHeap};
+use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_difftest::RefErl;
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, from_owned, to_owned};
@@ -28,7 +28,7 @@ fn registry_matches_the_otp_nif_entries() {
 
 fn nif(name: &str, args: &[O]) -> Result<O, BifError> {
     let mut heap = ProcessHeap::with_words(4096);
-    let mut alloc = FragmentingHeap(&mut heap);
+    let mut alloc = ProcessHeapHandle(&mut heap);
     let terms = args
         .iter()
         .map(|arg| from_owned(arg, &mut alloc).unwrap())

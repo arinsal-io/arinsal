@@ -284,7 +284,7 @@ fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Te
         return Ok(Term::NIL);
     }
     {
-        let mut heap = crate::FragmentingHeap(&mut process.heap);
+        let mut heap = crate::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
         let mut result = Vec::with_capacity(entries.len());
         for (name, kind, cid) in entries {
@@ -354,7 +354,7 @@ fn monitor_node(
     }
     drop(tables);
     if immediate {
-        let mut heap = crate::FragmentingHeap(&mut process.heap);
+        let mut heap = crate::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
         let node = Term::atom(global_atoms().intern(name).unwrap());
         let down = builder

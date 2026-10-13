@@ -54,7 +54,7 @@ macro_rules! binary {
     ($($name:ident => $op:literal),+ $(,)?) => {$ (
         fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             let charge = arinsal_arith::reduction_charge($op, args);
-            let result = arinsal_arith::$name(args[0], args[1], ctx.heap).map_err(map_error);
+            let result = arinsal_arith::$name(args[0], args[1], &mut ctx.heap).map_err(map_error);
             ctx.charge_reductions(charge as usize);
             result
         }
@@ -66,7 +66,7 @@ macro_rules! unary {
     ($($name:ident => $op:literal),+ $(,)?) => {$ (
         fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             let charge = arinsal_arith::reduction_charge($op, args);
-            let result = arinsal_arith::$name(args[0], ctx.heap).map_err(map_error);
+            let result = arinsal_arith::$name(args[0], &mut ctx.heap).map_err(map_error);
             ctx.charge_reductions(charge as usize);
             result
         }
@@ -76,17 +76,17 @@ unary!(bnot => "bnot", neg => "-", plus => "+", abs => "abs", to_float => "float
 
 fn integer_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     (if args.len() == 1 {
-        arinsal_arith::integer_to_list_decimal(args[0], ctx.heap)
+        arinsal_arith::integer_to_list_decimal(args[0], &mut ctx.heap)
     } else {
-        arinsal_arith::integer_to_list(args[0], args[1], ctx.heap)
+        arinsal_arith::integer_to_list(args[0], args[1], &mut ctx.heap)
     })
     .map_err(map_error)
 }
 fn integer_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     (if args.len() == 1 {
-        arinsal_arith::integer_to_binary_decimal(args[0], ctx.heap)
+        arinsal_arith::integer_to_binary_decimal(args[0], &mut ctx.heap)
     } else {
-        arinsal_arith::integer_to_binary(args[0], args[1], ctx.heap)
+        arinsal_arith::integer_to_binary(args[0], args[1], &mut ctx.heap)
     })
     .map_err(map_error)
 }

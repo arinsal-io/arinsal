@@ -57,7 +57,7 @@ struct Reply {
 
 /// The reference term of a reply on the caller's heap.
 pub(crate) fn reference_term(process: &mut Process, reference: u64) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .local_ref(arinsal_bifs::ordinary_ref_words(reference))
         .map_err(|_| badarg())
@@ -347,7 +347,7 @@ pub(crate) fn control(
                 let Some(reply) = reply else {
                     return Ok(atom("badarg"));
                 };
-                let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+                let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
                 return control_term(&mut heap, reply).map_err(|_| badarg());
             }
             Err(ImmFail::InvalidPort) => return Ok(atom("badarg")),
