@@ -65,8 +65,10 @@ pub extern "C" fn arinsal_beamasm_raise_class(
         return 0;
     };
     let trace = crate::native_hooks::from_raw(trace_raw);
-    let class = crate::exceptions::empty_trace_class(trace)
-        .or_else(|| crate::stacktrace::raw_class(process, trace))
+    let empty_class = crate::exceptions::empty_trace_class(trace);
+    let raw_class = crate::stacktrace::raw_class(process, trace);
+    let class = empty_class
+        .or(raw_class)
         .or(process.exc_class)
         .or_else(|| crate::exceptions::parse_class(process.x[3]));
     // Port of erts/emulator/beam/beam_common.c (erts_sanitize_freason), OTP-29.1.1: a valid
@@ -93,7 +95,7 @@ pub extern "C" fn arinsal_beamasm_build_stacktrace(
         return 0;
     };
     let trace = crate::native_hooks::from_raw(trace_raw);
-    match crate::exceptions::materialize(process, trace) {
+    match crate::exceptions::materialize(None, process, trace) {
         Ok(value) => {
             process.x[0] = value;
             process.sync_native_header();
@@ -120,7 +122,7 @@ pub extern "C" fn arinsal_beamasm_add_stacktrace(
     };
     let reason = crate::native_hooks::from_raw(reason_raw);
     let trace = crate::native_hooks::from_raw(trace_raw);
-    let result = crate::exceptions::materialize(process, trace).and_then(|stacktrace| {
+    let result = crate::exceptions::materialize(None, process, trace).and_then(|stacktrace| {
         arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
             .tuple(&[reason, stacktrace])
             .map_err(|error| crate::VmError::Unsupported(format!("stacktrace tuple {error:?}")))
@@ -3077,7 +3079,7 @@ fn plain_bif_error(
     args: &[Term],
     error: arinsal_bifs::BifError,
 ) -> u64 {
-    set_native_bif_error(process, &export.module, &export.function, args, error);
+    set_native_bif_export_error(process, export, args, error);
     process.sync_native_header();
     0
 }
@@ -3131,6 +3133,8 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (i_bif: the failing BIF and its
             // arguments are the top frame), OTP-29.1.1.
             match export {
+                // `i_bif*` passes each operand explicitly; a literal BIF operand need not
+                // be present in X0..X2 when the scheduler expands the saved error.
                 Some(export) => {
                     set_native_bif_error(process, &export.module, &export.function, args, error)
                 }
@@ -3247,9 +3251,37 @@ pub(crate) fn set_native_bif_error(
     }
     let (freason, fvalue) = (process.header.freason, process.header.fvalue);
     process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
-        module: module.to_owned(),
-        function: function.to_owned(),
-        args: args.to_vec(),
+        call: crate::proc_create::NativeBifCall::Owned {
+            module: module.to_owned(),
+            function: function.to_owned(),
+            args: args.to_vec(),
+        },
+        error,
+        freason,
+        fvalue,
+    });
+}
+
+/// Retains the export entry; its descriptor owns the BIF MFA while X registers own the arguments.
+fn set_native_bif_export_error(
+    process: &mut crate::Process,
+    export: ExportDispatch,
+    args: &[Term],
+    error: arinsal_bifs::BifError,
+) {
+    set_light_bif_error(process, &error);
+    if process.header.catches > 0 {
+        crate::stacktrace::note_caught_bif_frame(
+            process,
+            &export.module,
+            &export.function,
+            args,
+            &error,
+        );
+    }
+    let (freason, fvalue) = (process.header.freason, process.header.fvalue);
+    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
+        call: crate::proc_create::NativeBifCall::Export(export),
         error,
         freason,
         fvalue,
@@ -3339,7 +3371,6 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // Expanded errors (`badmatch`, `function_clause`, `case_clause`, …) use erts'
     // `(index << 10) | EXC_ERROR`.
     let primary = matches!(freason, 1..=3);
-    let function_clause = (freason >> 10) == 6 && freason & 0x3ff == 0x50;
     let expanded = freason > 3 && freason & 0x3ff == 0x50 && freason & 4 == 0;
     if catches == 0 || (!primary && !expanded) {
         return 0;
@@ -3357,21 +3388,13 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         return 0;
     };
     // Port of erts/emulator/beam/beam_common.c:580-648 (`next_catch` reads the stack, and
-    // writes `stop` only at `found_catch`), OTP-29.1.1. `function_clause` is raised at the
-    // function entry, before `allocate`. Saving a trace before a search that misses moves
-    // the stack, and the scheduler then reports `exception_from` for tail-called frames.
-    // Look first, and leave a miss or an exception-trace frame to that unwind. A caught
-    // throw already has its handler, so it saves once and scans once.
-    if function_clause && !crate::native_bridge::native_catch_pending(process) {
+    // writes `stop` only at `found_catch`), OTP-29.1.1. Resolve the catch once before saving
+    // the trace; a miss or a caller catch remains with the scheduler's unwind.
+    let raising_pc = registers.tmp_mem[6] as usize;
+    let Some(found) = crate::native_bridge::current_native_catch(process, raising_pc) else {
         process.sync_native_header();
         return 0;
-    }
-    // A catch in a caller is the scheduler's unwind. Handling it here, then returning
-    // 0 when the handler is interpreted, consumes the tag and the error escapes.
-    if !crate::native_bridge::current_frame_catch(process) {
-        process.sync_native_header();
-        return 0;
-    }
+    };
     let (class, reason) = if primary {
         let class = match freason {
             1 => arinsal_bifs::Class::Error,
@@ -3393,14 +3416,16 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // instruction and names the wrong function while native code is running.
     // The raising pc is stored raw. `build_stacktrace` resolves it; a registry
     // lookup here is not part of erts' `save_stacktrace`.
-    let native_pc = {
-        let pc = registers.tmp_mem[6] as usize;
-        let probe = pc & !arinsal_beamasm::module::RETURN_SITE_TAG;
-        (pc != 0 && arinsal_term::may_be_native_code_pointer(probe)).then_some(pc)
-    };
+    // Port of beam_common.c:880-925 (`save_stacktrace`), OTP-29.1.1: `pc` stays raw
+    // until `build_stacktrace` resolves it against the active native ranges table.
+    let native_pc = (raising_pc != 0).then_some(raising_pc);
     // `erlang:raise/3` already built the list the catch must see (`bif.c:1643`).
     // A native walk would name `eval_external_handler` instead of that list.
     let trace = if let Some(trace) = take_explicit_raise(process) {
+        let Ok(trace) = crate::stacktrace::save_explicit(process, class, trace) else {
+            process.sync_native_header();
+            return 0;
+        };
         trace
     } else {
         let Ok(trace) = crate::stacktrace::save_lazy(process, class, native_pc) else {
@@ -3409,9 +3434,9 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         };
         trace
     };
-    let handler = match crate::native_bridge::next_catch(process, class, reason, trace, true) {
-        Some(crate::native_bridge::CatchHandler::Native(handler)) => handler,
-        Some(crate::native_bridge::CatchHandler::Interpreted) | None => {
+    let handler = match crate::native_bridge::commit_catch(process, found, class, reason, trace) {
+        crate::native_bridge::CatchHandler::Native(handler) => handler,
+        crate::native_bridge::CatchHandler::Interpreted => {
             process.sync_native_header();
             return 0;
         }

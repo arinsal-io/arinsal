@@ -1888,6 +1888,23 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         Ok(Term::from_ptr(p, 2))
     }
 
+    /// Allocate a negative bignum with an exact digit count and store each digit once.
+    ///
+    /// Port of `make_neg_bignum_header` and the `StackTrace` allocation in
+    /// erts/emulator/beam/bif.c:1675-1685, OTP-29.1.1.
+    pub fn neg_bignum_fill(
+        &mut self,
+        digits: usize,
+        digit_at: impl FnMut(usize) -> u64,
+    ) -> Result<Term, TermError> {
+        if digits == 0 || digits > 65_535 {
+            return Err(TermError::SystemLimit);
+        }
+        let p = self.words(1 + digits)?;
+        self.write_bignum(p, digits, Sign::Minus, digit_at);
+        Ok(Term::from_ptr(p, 2))
+    }
+
     /// Allocate a positive bignum header and leave the digits for the caller to fill.
     ///
     /// Port of `HAlloc` of `struct StackTrace` in beam_common.c:889-893, OTP-29.1.1.

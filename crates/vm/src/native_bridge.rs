@@ -82,11 +82,19 @@ pub(crate) struct FunctionRange {
     line: Option<u32>,
     file_term: Option<Term>,
     file: Option<Arc<str>>,
-    lines: Arc<[NativeLine]>,
+    /// `loc_tab` entries retain the literal filename term used by the module.
+    // Port of erts/emulator/beam/beam_ranges.c:353-357, OTP-29.1.1.
+    locs: Arc<[LineLoc]>,
     /// `lines[i].address`, packed so `find_line` does not chase the filename Arc.
     /// Port of beam_ranges.c:331 (`lookup_loc` binary-searches `func_tab` pointers,
     /// then indexes `loc_tab`), OTP-29.1.1.
     line_addrs: Arc<[usize]>,
+}
+
+#[derive(Clone, Copy)]
+struct LineLoc {
+    line: u32,
+    file_term: Option<Term>,
 }
 
 /// One module's native code in the active code index, sorted by `start`.
@@ -116,6 +124,14 @@ pub(crate) fn scope0_code_ranges() -> Arc<Vec<ModuleRange>> {
 
 fn function_range(info: &NativeFunction) -> FunctionRange {
     let line_addrs: Arc<[usize]> = info.line_table.iter().map(|entry| entry.address).collect();
+    let locs: Arc<[LineLoc]> = info
+        .line_table
+        .iter()
+        .map(|entry| LineLoc {
+            line: entry.line,
+            file_term: entry.file_term,
+        })
+        .collect();
     FunctionRange {
         start: info.start,
         end: info.end,
@@ -125,7 +141,7 @@ fn function_range(info: &NativeFunction) -> FunctionRange {
         line: info.line,
         file_term: info.file_term,
         file: info.file.clone(),
-        lines: Arc::from(info.line_table.as_slice()),
+        locs,
         line_addrs,
     }
 }
@@ -289,28 +305,25 @@ fn frame_in(ranges: &[ModuleRange], address: usize) -> Option<NativeStackFrame> 
         return None;
     }
     // Port of beam_ranges.c:331 (`lookup_loc`): binary search the function's pc table,
-    // then read that one location. The filename Arc is not part of the search key.
-    let line = function
+    // then index its parallel location table. Filenames remain module literals.
+    let loc = function
         .line_addrs
         .partition_point(|start| *start <= address)
         .checked_sub(1)
-        .and_then(|index| function.lines.get(index))
+        .and_then(|index| function.locs.get(index).copied())
         .filter(|entry| entry.line != 0);
-    let file_term = line
-        .and_then(|entry| entry.file_term)
-        .or(function.file_term);
+    let file_term = loc.and_then(|entry| entry.file_term).or(function.file_term);
     // `fi->fname_ptr[file]` is a literal. The string is only needed when it is absent.
     let file = if file_term.is_some() {
         None
     } else {
-        line.map(|entry| Arc::clone(&entry.file))
-            .or_else(|| function.file.clone())
+        function.file.clone()
     };
     Some(NativeStackFrame {
         module_atom: function.module_atom,
         function_atom: function.function_atom,
         arity: function.arity,
-        line: line.map(|entry| entry.line).or(function.line),
+        line: loc.map(|entry| entry.line).or(function.line),
         file_term,
         file,
     })
@@ -323,10 +336,10 @@ pub(crate) fn stack_frame_in(
     ranges: Option<&[ModuleRange]>,
     address: usize,
 ) -> Option<NativeStackFrame> {
-    if !arinsal_term::may_be_native_code_pointer(address) {
-        return None;
-    }
     let Some(ranges) = ranges else {
+        if !arinsal_term::may_be_native_code_pointer(address) {
+            return None;
+        }
         return native_stack_frame_at(address);
     };
     frame_in(ranges, address)
@@ -364,21 +377,11 @@ fn catch_indexes(scope: u64) -> std::sync::Arc<crate::code_ix::CodeIndexes> {
     crate::code_ix::for_scope(scope)
 }
 
-/// Catch table of the process node's `erts_active_code_ix()`.
-// Port of erts/emulator/beam/code_ix.h:362 and beam_catches.c:146, OTP-29.1.1.
-fn catch_table(process: &Process) -> Arc<Vec<Option<CatchTarget>>> {
-    process.runtime.as_ref().map_or_else(
-        || crate::code_ix::for_scope(process_code_scope(process)).active_catch_table(),
-        |runtime| runtime.active_catch_table(),
-    )
-}
-
 /// Port of erts/emulator/beam/beam_catches.c:146 (`beam_catches_car`), OTP-29.1.1.
 /// Indexes `bccix[erts_active_code_ix()]`. The active index is the node's atomic.
 fn catch_slot(scope: u64, index: u32) -> Option<CatchTarget> {
-    let table = crate::code_ix::for_scope(scope).active_catch_table();
-    let index = usize::try_from(index).ok()?;
-    table.get(index).copied().flatten()
+    crate::code_ix::for_scope(scope)
+        .with_active_catches(|table| table.get(usize::try_from(index).ok()?).copied().flatten())
 }
 
 /// Publishes `change` into the listed code indexes. Readers keep the previous `Arc`.
@@ -478,7 +481,8 @@ pub(crate) enum CatchHandler {
 }
 
 /// A catch the scan found. The stack is unchanged until [`commit_catch`].
-struct LocatedCatch {
+#[derive(Clone, Copy)]
+pub(crate) struct LocatedCatch {
     /// Stack index of the catch tag.
     index: usize,
     /// Stack index `E` resumes at: the catching frame's first Y slot.
@@ -496,19 +500,30 @@ fn locate_catch(process: &Process, native_only: bool) -> Option<LocatedCatch> {
     if process.header.catches == 0 {
         return None;
     }
-    let table = catch_table(process);
+    let heap = &process.heap;
+    if let Some(runtime) = process.runtime.as_ref() {
+        return runtime.with_active_catches(|table| scan_catch(heap, table, native_only));
+    }
+    crate::code_ix::for_scope(process_code_scope(process))
+        .with_active_catches(|table| scan_catch(heap, table, native_only))
+}
+
+fn scan_catch(
+    heap: &arinsal_term::ProcessHeap,
+    table: &[Option<CatchTarget>],
+    native_only: bool,
+) -> Option<LocatedCatch> {
     let mut index = 0usize;
     let mut previous_cp = 0usize;
     let mut seen_cp = false;
     let mut traced = false;
-    while index < process.heap.stack_words() {
-        let word = process.heap.stack_get(index)?;
+    while index < heap.stack_words() {
+        let word = heap.stack_get(index)?;
         let raw = word.tagged_word();
         let address = raw as usize;
         if address == native_trace_return_address() {
             traced = true;
-            let actions = process
-                .heap
+            let actions = heap
                 .stack_get(index + 3)
                 .and_then(Term::as_small)
                 .and_then(|count| usize::try_from(count).ok())
@@ -520,9 +535,8 @@ fn locate_catch(process: &Process, native_only: bool) -> Option<LocatedCatch> {
             index += words;
             continue;
         }
-        // erts `is_CP`: a return address, not a term. The hull test is lock-free and has no
-        // false negatives; catch tags have low bits `0x1b`, so they are not mistaken for one.
-        if address & 3 == 0 && arinsal_term::may_be_native_code_pointer(address) {
+        // Port of erl_term.h:1378-1379 (`is_CP`), OTP-29.1.1.
+        if arinsal_term::is_cp(raw) {
             previous_cp = index;
             seen_cp = true;
             index += arinsal_term::CP_WORDS;
@@ -565,18 +579,20 @@ fn locate_catch(process: &Process, native_only: bool) -> Option<LocatedCatch> {
     None
 }
 
-/// The innermost catch is in the frame that is running, with no return address above it.
-/// A catch in a caller stays with the scheduler: unwinding that frame in here and then
-/// returning 0 drops the tag, and the error escapes.
-pub(crate) fn current_frame_catch(process: &Process) -> bool {
-    locate_catch(process, true).is_some_and(|found| !found.traced && found.resume == 0)
-}
-
-/// Whether a native catch is on the stack and no exception-trace frame sits above it.
-/// Does not move the stack cursor. A traced catch stays with the scheduler unwind,
-/// which emits `exception_from` the way `next_catch` does in erts.
-pub(crate) fn native_catch_pending(process: &Process) -> bool {
-    locate_catch(process, true).is_some_and(|found| !found.traced)
+/// Find a native catch in the raising frame without moving the stack cursor.
+pub(crate) fn current_native_catch(process: &Process, raising_pc: usize) -> Option<LocatedCatch> {
+    let found = locate_catch(process, true)?;
+    if found.traced {
+        return None;
+    }
+    // `raise_exception_shared` places its raising PC in one fake CP. BIF dispatch already
+    // has the active Erlang frame on the stack and does not need that extra word.
+    let fake_cp = process
+        .heap
+        .stack_get(0)
+        .is_some_and(|word| word.tagged_word() as usize == raising_pc);
+    let resume = if fake_cp { arinsal_term::CP_WORDS } else { 0 };
+    (found.resume == resume).then_some(found)
 }
 
 fn exception_class_atom(class: arinsal_bifs::Class) -> Term {
@@ -597,23 +613,32 @@ pub(crate) fn next_catch(
     trace: Term,
     native_only: bool,
 ) -> Option<CatchHandler> {
-    let LocatedCatch {
-        index,
-        resume,
-        target,
-        traced,
-    } = locate_catch(process, native_only)?;
+    let found = locate_catch(process, native_only)?;
     // An exception-trace frame above the catch is emitted by the scheduler unwind
     // (`exception_from`). erts does that inside `next_catch` before `found_catch`.
     // The native resolver has no trace session, so it leaves the stack unmoved.
-    if native_only && traced {
+    if native_only && found.traced {
         return None;
     }
+    Some(commit_catch(process, found, class, reason, trace))
+}
+
+/// Port of erts/emulator/beam/beam_common.c:650-678 (`found_catch`), OTP-29.1.1.
+/// The stack and catch tag are changed only after the target is known.
+pub(crate) fn commit_catch(
+    process: &mut Process,
+    found: LocatedCatch,
+    class: arinsal_bifs::Class,
+    reason: Term,
+    trace: Term,
+) -> CatchHandler {
     // Port of erts/emulator/beam/beam_common.c:650-678 (`found_catch`): `stop` and the catch
     // word are written only after the handler is known.
-    process.heap.stack_set(index, Term::NIL);
+    process.heap.stack_set(found.index, Term::NIL);
     let base = process.heap.heap_cursor().1;
-    process.heap.set_stack_pointer(base.wrapping_add(resume));
+    process
+        .heap
+        .set_stack_pointer(base.wrapping_add(found.resume));
     if process.x.len() < 4 {
         let mut registers = process.x.to_vec();
         registers.resize(4, Term::NIL);
@@ -627,17 +652,20 @@ pub(crate) fn next_catch(
     process.x[3] = exception_class_atom(class);
     process.exc_class = Some(class);
     process.header.freason = 0;
+    if let Some(cold) = process.cold.as_mut() {
+        cold.native_bif_error = None;
+    }
     process.sync_native_header();
-    match target {
+    match found.target {
         CatchTarget::Native(handler) => {
             process.cold_mut().native_continuation_resume = true;
             process.cold_mut().native_resume_live = 5;
-            Some(CatchHandler::Native(handler))
+            CatchHandler::Native(handler)
         }
         CatchTarget::Interpreted { module, ip } => {
             process.module = module;
             process.ip = ip;
-            Some(CatchHandler::Interpreted)
+            CatchHandler::Interpreted
         }
     }
 }
@@ -1152,13 +1180,21 @@ pub fn run_native(
         && failure.fvalue == process.header.fvalue
     {
         process.header.freason = 0;
-        return Err(exceptions::bif_error(
-            process,
-            &failure.module,
-            &failure.function,
-            &failure.args,
-            failure.error,
-        ));
+        let error = match failure.call {
+            crate::proc_create::NativeBifCall::Export(export) => exceptions::bif_error(
+                process,
+                &export.module,
+                &export.function,
+                &registers.x_reg_array[..usize::from(export.arity)],
+                failure.error,
+            ),
+            crate::proc_create::NativeBifCall::Owned {
+                module,
+                function,
+                args,
+            } => exceptions::bif_error(process, &module, &function, &args, failure.error),
+        };
+        return Err(error);
     } else if process.header.freason != 0 && registers.tmp_mem[7] != 0 {
         // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp (emit_raise_badarg): an inline
         // BIF failure names the BIF, with its arguments from X0.., as the top frame.

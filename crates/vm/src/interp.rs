@@ -1427,8 +1427,6 @@ fn push_trace_frames(
     process: &mut Process,
     module_id: usize,
     entry_ip: usize,
-    return_trace_ip: usize,
-    return_to_ip: usize,
     actions: &[crate::trace::CallActions],
 ) -> Result<(), VmError> {
     let small = |value: usize| {
@@ -1447,7 +1445,7 @@ fn push_trace_frames(
             }
             process
                 .heap
-                .stack_set(0, trace_continuation(module_id, return_to_ip)?);
+                .stack_set(0, crate::stacktrace::return_to_trace_continuation());
             process.heap.stack_set(
                 1,
                 Term::small(
@@ -1476,9 +1474,12 @@ fn push_trace_frames(
         if !reserve_trace_stack(process, 6)? {
             return Err(VmError::Unsupported("call trace stack".into()));
         }
-        process
-            .heap
-            .stack_set(0, trace_continuation(module_id, return_trace_ip)?);
+        let continuation = if action.exception_trace {
+            crate::stacktrace::exception_trace_continuation()
+        } else {
+            crate::stacktrace::return_trace_continuation()
+        };
+        process.heap.stack_set(0, continuation);
         for (index, value) in [
             module,
             entry,
@@ -1505,10 +1506,6 @@ fn reserve_trace_stack(process: &mut Process, words: usize) -> Result<bool, VmEr
         process.ensure(words, process.gc_live)?;
     }
     Ok(process.heap.reserve_stack(words))
-}
-
-fn trace_continuation(module_id: usize, target: usize) -> Result<Term, VmError> {
-    crate::stacktrace::continuation_tag(module_id, target)
 }
 
 #[allow(clippy::too_many_arguments)] // Breakpoint metadata stays explicit at the interpreter boundary.
@@ -1551,14 +1548,7 @@ fn trace_breakpoint_call(
         // Traced calls need the same stack growth opportunity as ordinary BEAM calls.
         process.ensure(trace_words, usize::from(arity))?;
     }
-    push_trace_frames(
-        process,
-        module_id,
-        entry_ip,
-        vm.code.modules[module_id].return_trace_ip,
-        vm.code.modules[module_id].return_to_trace_ip,
-        &actions,
-    )?;
+    push_trace_frames(process, module_id, entry_ip, &actions)?;
     Ok(actions)
 }
 
@@ -4877,7 +4867,7 @@ mod trace_frame_tests {
             return_to: false,
             acc: None,
         }];
-        push_trace_frames(&mut process, 3, 7, 11, 13, &actions).unwrap();
+        push_trace_frames(&mut process, 3, 7, &actions).unwrap();
         assert_eq!(process.heap.stack_get(1).and_then(Term::as_small), Some(3));
         assert_eq!(process.heap.stack_get(2).and_then(Term::as_small), Some(7));
         assert_eq!(

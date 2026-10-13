@@ -129,11 +129,15 @@ impl CodeIndexes {
         self.generations[ix].store(generation, Ordering::Release);
     }
 
-    /// Catch table of `erts_active_code_ix()`. The `Arc` is the published generation;
-    /// indexing it takes no lock.
+    /// Read the active catch table without cloning its `Arc`.
     // Port of erts/emulator/beam/beam_catches.c:146-154 (`beam_catches_car`), OTP-29.1.1.
-    pub(crate) fn active_catch_table(&self) -> Arc<Vec<Option<crate::native_bridge::CatchTarget>>> {
-        self.catches[self.active()].load_full()
+    pub(crate) fn with_active_catches<R>(
+        &self,
+        read: impl FnOnce(&[Option<crate::native_bridge::CatchTarget>]) -> R,
+    ) -> R {
+        let index = self.active();
+        let table = self.catches[index].load();
+        read(table.as_slice())
     }
 
     /// Module ranges of `erts_active_code_ix()`.
@@ -141,6 +145,18 @@ impl CodeIndexes {
     // with no lock), OTP-29.1.1.
     pub(crate) fn code_ranges(&self) -> Arc<Vec<crate::native_bridge::ModuleRange>> {
         self.ranges[self.active()].load_full()
+    }
+
+    /// Read ranges and module tables from one active code index without cloning their `Arc`s.
+    // Port of erts/emulator/beam/beam_ranges.c:307-327 and code_ix.c:51-79, OTP-29.1.1.
+    pub(crate) fn with_active_code<R>(
+        &self,
+        read: impl FnOnce(&[crate::native_bridge::ModuleRange], &CodeTables) -> R,
+    ) -> R {
+        let index = self.active();
+        let ranges = self.ranges[index].load();
+        let tables = self.tables[index].load();
+        read(ranges.as_slice(), tables.as_ref())
     }
 
     /// Publishes `ranges` on every code index. The active index is what readers load;

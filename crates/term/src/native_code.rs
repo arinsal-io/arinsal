@@ -14,6 +14,13 @@ pub fn may_be_native_code_pointer(address: usize) -> bool {
     address >= HULL_START.load(Ordering::Acquire) && address < HULL_END.load(Ordering::Acquire)
 }
 
+/// Tests whether a stack word has the continuation-pointer tag bits.
+// Port of erts/emulator/beam/erl_term.h:1378-1379 (`is_CP`), OTP-29.1.1.
+#[inline]
+pub fn is_cp(word: u64) -> bool {
+    word & 3 == 0
+}
+
 fn ranges() -> &'static RwLock<Vec<(usize, usize)>> {
     static RANGES: OnceLock<RwLock<Vec<(usize, usize)>>> = OnceLock::new();
     RANGES.get_or_init(|| RwLock::new(Vec::new()))
