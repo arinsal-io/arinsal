@@ -528,7 +528,7 @@ fn process_info(
             }
             "current_stacktrace" => current_stacktrace(vm, process)?,
             "garbage_collection" => {
-                let limit = max_heap_term(process, pid)?;
+                let limit = max_heap_term(process)?;
                 // Port of erts/emulator/beam/erl_bif_info.c:2072-2087
                 // (ERTS_PI_IX_GARBAGE_COLLECTION), OTP-29.1.1.
                 let entries = [
@@ -637,7 +637,7 @@ fn process_info(
             "min_bin_vheap_size" => {
                 Term::small(process.heap.min_bin_vheap_size() as i64).ok_or_else(badarg)?
             }
-            "max_heap_size" => max_heap_term(process, pid)?,
+            "max_heap_size" => max_heap_term(process)?,
             "parent" => atom("undefined"),
             // Port of erts/emulator/beam/erl_bif_info.c:2274-2323 (magic_ref, label,
             // priority_messages), OTP-29.1.1. No magic references live on this heap.
@@ -2098,7 +2098,7 @@ fn call_values(
                 }
                 let name = atom_name(*name).ok_or_else(badarg)?;
                 if name == "max_heap_size" {
-                    return max_heap_flag(process, ctx, *value);
+                    return max_heap_flag(process, *value);
                 }
                 if name == "scheduler" {
                     let scheduler = value
@@ -2719,12 +2719,6 @@ fn spawn_request(
             .send(child, ctx.pid(), envelope)
             .map_err(|error| VmError::Unsupported(format!("spawn_reply: {error}")))?;
     }
-    if let Some(limit) = parsed.max_heap {
-        runtime
-            .ever_max_heap
-            .store(true, std::sync::atomic::Ordering::Release);
-        runtime.max_heaps.lock().unwrap().insert(child, limit);
-    }
     Ok(reference)
 }
 
@@ -3069,44 +3063,20 @@ fn spawn_apply(
         .clone()
         .ok_or_else(|| VmError::Unsupported("spawn_request requires a scheduler".into()))?;
     let scheduler = runtime.scheduler()?;
+    // Port of erts/emulator/beam/erl_process.c:12565 (erl_create_process sets `p->max_heap_size`
+    // before the process is linked into the table), OTP-29.1.1.
+    let mut child = child;
+    if !is_default_max_heap(max_heap) {
+        child.cold_mut().max_heap = max_heap;
+    }
     let pid = scheduler
         .spawn_priority(child, options.priority)
         .map_err(|error| VmError::Unsupported(format!("spawn_request: {error}")))?;
-    if !is_default_max_heap(max_heap)
-        || runtime
-            .ever_max_heap
-            .load(std::sync::atomic::Ordering::Acquire)
-    {
-        runtime
-            .ever_max_heap
-            .store(true, std::sync::atomic::Ordering::Release);
-        runtime.max_heaps.lock().unwrap().insert(pid, max_heap);
-    }
     Ok(pid)
 }
 
-/// Record a spawn-time `max_heap_size` unless it is the system default.
-/// Port of erts/emulator/beam/erl_process.c:12222 (`erts_parse_spawn_opts`), OTP-29.1.1.
-pub(crate) fn register_spawn_max_heap(
-    runtime: &crate::process::Runtime,
-    pid: Pid,
-    requested: Option<crate::process::MaxHeap>,
-) {
-    let max_heap =
-        requested.unwrap_or(crate::natives::sys::gc_spawn_defaults(Some(runtime)).max_heap_size);
-    if !is_default_max_heap(max_heap)
-        || runtime
-            .ever_max_heap
-            .load(std::sync::atomic::Ordering::Acquire)
-    {
-        runtime
-            .ever_max_heap
-            .store(true, std::sync::atomic::Ordering::Release);
-        runtime.max_heaps.lock().unwrap().insert(pid, max_heap);
-    }
-}
-
-fn is_default_max_heap(limit: crate::process::MaxHeap) -> bool {
+/// Whether `limit` is the default `max_heap_size` (the process keeps no field for it).
+pub(crate) fn is_default_max_heap(limit: crate::process::MaxHeap) -> bool {
     limit.size == 0 && limit.kill && limit.log && !limit.include_shared_binaries && !limit.reported
 }
 
@@ -3124,11 +3094,7 @@ pub(crate) fn tuple2(term: Term) -> Option<(Term, Term)> {
 
 // Port of erts/emulator/beam/erl_gc.c:3824 (`erts_max_heap_size`) and
 // erl_gc.c:3807 (`erts_max_heap_size_map`), OTP-29.1.1.
-fn max_heap_flag(
-    process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
-    value: Term,
-) -> Result<Term, VmError> {
+fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
     let limit = parse_max_heap(value).map_err(|()| badarg())?;
     let floor = flag_value(process, "min_heap_size")
         .and_then(|term| term.as_small())
@@ -3137,34 +3103,21 @@ fn max_heap_flag(
     if limit.size != 0 && limit.size < floor {
         return Err(badarg());
     }
-    let pid = ctx.pid();
-    let previous = stored_max_heap(process, pid);
-    let runtime = process
-        .runtime
-        .clone()
-        .ok_or_else(|| VmError::Unsupported("max_heap_size requires a scheduler".into()))?;
-    runtime
-        .ever_max_heap
-        .store(true, std::sync::atomic::Ordering::Release);
-    runtime.max_heaps.lock().unwrap().insert(pid, limit);
+    let previous = stored_max_heap(process);
+    process.cold_mut().max_heap = limit;
     max_heap_map(process, previous)
 }
 
-fn stored_max_heap(process: &Process, pid: Pid) -> crate::process::MaxHeap {
+fn stored_max_heap(process: &Process) -> crate::process::MaxHeap {
     process
-        .runtime
+        .cold
         .as_ref()
-        .filter(|runtime| {
-            runtime
-                .ever_max_heap
-                .load(std::sync::atomic::Ordering::Acquire)
-        })
-        .and_then(|runtime| runtime.max_heaps.lock().unwrap().get(&pid).copied())
+        .map(|cold| cold.max_heap)
         .unwrap_or_default()
 }
 
-fn max_heap_term(process: &mut Process, pid: Pid) -> Result<Term, VmError> {
-    max_heap_map(process, stored_max_heap(process, pid))
+fn max_heap_term(process: &mut Process) -> Result<Term, VmError> {
+    max_heap_map(process, stored_max_heap(process))
 }
 
 fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result<Term, VmError> {

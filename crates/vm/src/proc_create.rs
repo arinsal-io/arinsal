@@ -683,6 +683,8 @@ impl<T> std::ops::DerefMut for Tracked<T> {
 
 #[derive(Default)]
 pub(crate) struct ProcessCold {
+    /// `p->max_heap_size` (erts erl_process.h:1034): the limit and its flags.
+    pub(crate) max_heap: crate::process::MaxHeap,
     /// `process_flag(save_calls, N)` buffer (erts `ERTS_PSD_SAVED_CALLS_BUF`).
     pub(crate) saved_calls: Option<crate::trace::SavedCalls>,
     /// Link halves retained until the matching unlink acknowledgement arrives.
