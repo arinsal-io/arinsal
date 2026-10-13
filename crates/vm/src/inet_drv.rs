@@ -3466,7 +3466,7 @@ fn io_loop(wake_r: OwnedFd) {
         }
         let timeout = next_timeout()
             .map(|timeout| Duration::new(timeout.tv_sec as u64, timeout.tv_nsec as u32));
-        match crate::check_io::wait_any_timeout(&fds, timeout) {
+        match crate::check_io::wait_any_timeout_wake(&fds, timeout, wake) {
             Ok(Some((fd, _))) if fd == wake => drain(wake),
             Ok(Some((fd, ready))) => {
                 if let Some(sock) = socks.iter().find(|sock| {

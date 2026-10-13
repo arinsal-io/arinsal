@@ -518,50 +518,12 @@ fn filename_bytes(term: Term) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn declared_nifs(vm: &Vm, module: &str) -> Result<HashSet<(String, u8)>, String> {
-    let file = format!("{module}.beam");
-    let path = vm
-        .paths
-        .iter()
-        .map(|dir| dir.join(&file))
-        .find(|path| path.is_file())
-        .ok_or_else(|| format!("module {module} beam not found"))?;
-    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
-    let beam = arinsal_beam::parse(&bytes).map_err(|error| error.to_string())?;
-    let mut current: Option<(String, u8)> = None;
-    let mut declared = HashSet::new();
-    for instruction in &beam.code.instructions {
-        match instruction.op {
-            arinsal_spec::Opcode::FuncInfo => {
-                let name = instruction
-                    .args
-                    .get(1)
-                    .and_then(|arg| match arg {
-                        arinsal_beam::Operand::Atom(index) if *index > 0 => {
-                            beam.atoms.get(*index as usize - 1).cloned()
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "?".into());
-                let arity = instruction
-                    .args
-                    .get(2)
-                    .and_then(|arg| match arg {
-                        arinsal_beam::Operand::U(value) => u8::try_from(*value).ok(),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                current = Some((name, arity));
-            }
-            arinsal_spec::Opcode::NifStart => {
-                if let Some(function) = &current {
-                    declared.insert(function.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(declared)
+/// The functions `module` declares as NIF stubs: those whose code starts with `nif_start`.
+// Port of erts/emulator/beam/erl_nif.c (erts_load_nif checks `BeamIsOpCode(..., op_nif_start)`
+// of the loaded code), OTP-29.1.1. The loaded module is the source, not a beam file on a path,
+// so a module loaded from a binary works.
+fn declared_nifs(module: &arinsal_loader::Module) -> HashSet<(String, u8)> {
+    module.nif_stubs.iter().cloned().collect()
 }
 
 fn dyn_call<const N: usize>(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
@@ -875,7 +837,7 @@ fn validate_image(
         .modules
         .get(module_id)
         .ok_or_else(|| format!("module {caller} is not loaded"))?;
-    let declared = declared_nifs(vm, caller)?;
+    let declared = declared_nifs(module);
     let mut seen = HashSet::new();
     let mut binds = Vec::new();
     for (index, function) in image.functions().iter().enumerate() {
@@ -1032,7 +994,7 @@ fn load_dynamic(
         Ok(binds) => binds,
         Err(message) => return error_reason(process, "bad_lib", &message),
     };
-    let library = match image.commit(info) {
+    let library = match image.commit_for(info, process.self_pid.and_then(|pid| pid.to_term())) {
         Ok(library) => Arc::new(library),
         Err(error) => return nif_open_error(process, path, error),
     };
