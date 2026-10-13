@@ -6,6 +6,7 @@ use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm, decode, encode};
 use arinsal_term::{Term, TermBuilder, is_native_code_pointer};
 use arinsal_vm::{NativeFunction, Process, Vm, register_native_function, run_native};
+use similar_asserts::assert_eq;
 use std::process::Command;
 use std::sync::Mutex;
 
@@ -1907,7 +1908,12 @@ fn register_native(
         arity,
         line: Some(line),
         file: Some(format!("{module}.erl").into()),
-        line_table: Vec::new(),
+        line_table: vec![arinsal_vm::NativeLine {
+            address: entry,
+            file: format!("{module}.erl").into(),
+            file_term: None,
+            line,
+        }],
         file_term: None,
     })
     .unwrap();

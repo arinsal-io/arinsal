@@ -538,11 +538,11 @@ pub(crate) fn module_loaded_light(
     let [module] = args else {
         return None;
     };
-    let name = module.as_atom()?;
+    let name = global_atoms().text(module.as_atom()?)?;
     let loaded = process
         .runtime
         .as_ref()?
-        .with_active_code(|_, tables| tables.loaded.contains_key(&name));
+        .with_active_code(|_, tables| tables.loaded.contains_key(name));
     Some(Ok(Term::atom(if loaded {
         atoms::TRUE
     } else {
@@ -561,11 +561,13 @@ pub(crate) fn function_exported_light(
     };
     let module = module.as_atom()?;
     let function = function.as_atom()?;
+    let module_name = global_atoms().text(module)?;
+    let function_name = global_atoms().text(function)?;
     let arity = u8::try_from(arity.as_small().filter(|n| (0..=255).contains(n))?).ok()?;
     let exported = process.runtime.as_ref()?.with_active_code(|_, tables| {
-        tables.loaded.get(&module).is_some_and(|id| {
+        tables.loaded.get(module_name).is_some_and(|id| {
             tables.modules[*id]
-                .export_slot_atom(function, arity)
+                .export_slot(function_name, arity)
                 .is_some()
         })
     });

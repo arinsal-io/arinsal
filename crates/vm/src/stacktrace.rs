@@ -88,7 +88,10 @@ impl HeapAlloc for TraceHeap<'_> {
             self.used += words;
             return Some(ptr);
         }
-        HeapAlloc::alloc(self.heap, words).or_else(|| Some(self.heap.gc_fragment(words)))
+        if let Some(ptr) = HeapAlloc::alloc(self.heap, words) {
+            return Some(ptr);
+        }
+        Some(self.heap.gc_fragment(words))
     }
 
     fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
@@ -1533,9 +1536,8 @@ pub(super) fn build(
 }
 
 /// Port of erts/emulator/beam/beam_common.c:1205 (build_stacktrace), OTP-29.1.1.
-/// One looked-up MFA frame. Five term words plus a location flag, the fields
-/// `erts_build_mfa_item` reads off `FunctionInfo`.
-const FRAME_INFO_WORDS: usize = 6;
+/// `FunctionInfo` scratch storage from `global.h`: MFA, needed, loc and filename pointer.
+const FRAME_INFO_WORDS: usize = 4;
 
 struct PreparedFrames {
     block: AllocBlock,
@@ -1642,14 +1644,7 @@ fn prepare_frames(
     };
     if let Some((module, function, arity, location)) = frame {
         let located = location.is_some();
-        write_frame(
-            slots,
-            frames,
-            Term::atom(module),
-            Term::atom(function),
-            Term::small(i64::from(arity)).expect("arity is small"),
-            location,
-        );
+        write_frame(slots, frames, module, function, arity, location);
         words += if located { 17 } else { 7 };
         frames += 1;
     }
@@ -1675,9 +1670,9 @@ fn prepare_frames(
             write_frame(
                 slots,
                 frames,
-                Term::atom(resolved.module_atom),
-                Term::atom(resolved.function_atom),
-                Term::small(i64::from(resolved.arity)).expect("arity is small"),
+                resolved.module_atom,
+                resolved.function_atom,
+                resolved.arity,
                 location,
             );
             words += if located { 17 } else { 7 };
@@ -1696,14 +1691,7 @@ fn prepare_frames(
         };
         let location = module.line_term_at(call_site);
         let located = location.is_some();
-        write_frame(
-            slots,
-            frames,
-            Term::atom(module.name_atom),
-            Term::atom(function),
-            Term::small(i64::from(arity)).expect("arity is small"),
-            location,
-        );
+        write_frame(slots, frames, module.name_atom, function, arity, location);
         words += if located { 17 } else { 7 };
         frames += 1;
     }
@@ -1717,38 +1705,36 @@ fn prepare_frames(
 fn write_frame(
     slots: &mut [u64],
     index: usize,
-    module: Term,
-    function: Term,
-    args: Term,
+    module: Atom,
+    function: Atom,
+    arity: u8,
     location: Option<(Term, u64)>,
 ) {
     let base = index * FRAME_INFO_WORDS;
-    slots[base] = module.tagged_word();
-    slots[base + 1] = function.tagged_word();
-    slots[base + 2] = args.tagged_word();
+    slots[base] = (u64::from(module.0) << 32) | u64::from(function.0);
     if let Some((file, line)) = location {
+        slots[base + 1] = 17;
+        slots[base + 2] = (line << 32) | u64::from(arity);
         slots[base + 3] = file.tagged_word();
-        slots[base + 4] = line;
-        slots[base + 5] = 1;
     } else {
+        slots[base + 1] = 7;
+        slots[base + 2] = u64::from(arity);
         slots[base + 3] = 0;
-        slots[base + 4] = 0;
-        slots[base + 5] = 0;
     }
 }
 
-fn read_frame(slots: &[u64], index: usize) -> (Term, Term, Term, Option<(Term, u64)>) {
+fn read_frame(slots: &[u64], index: usize) -> (Atom, Atom, u8, Option<(Term, u64)>) {
     let base = index * FRAME_INFO_WORDS;
-    let location = (slots[base + 5] & 1 != 0).then(|| {
+    let location = (slots[base + 1] == 17).then(|| {
         (
             crate::native_hooks::from_raw(slots[base + 3]),
-            slots[base + 4],
+            slots[base + 2] >> 32,
         )
     });
     (
-        crate::native_hooks::from_raw(slots[base]),
-        crate::native_hooks::from_raw(slots[base + 1]),
-        crate::native_hooks::from_raw(slots[base + 2]),
+        Atom((slots[base] >> 32) as u32),
+        Atom(slots[base] as u32),
+        slots[base + 2] as u8,
         location,
     )
 }
@@ -1763,7 +1749,7 @@ fn cons_prepared(p: &mut Process, ready: PreparedFrames) -> Result<Term, VmError
     let mut builder = TermBuilder::new(&mut heap);
     let mut list = Term::NIL;
     for index in (0..ready.frames).rev() {
-        let (module, function, args, location) = read_frame(ready.block.as_slice(), index);
+        let (module, function, arity, location) = read_frame(ready.block.as_slice(), index);
         let location = location.map(|(file, number)| arinsal_term::MfaLocation {
             file_atom,
             file,
@@ -1771,7 +1757,13 @@ fn cons_prepared(p: &mut Process, ready: PreparedFrames) -> Result<Term, VmError
             line: Term::small(number as i64).expect("source line is a small"),
         });
         list = builder
-            .cons_mfa_frame(module, function, args, location, list)
+            .cons_mfa_frame(
+                Term::atom(module),
+                Term::atom(function),
+                Term::small(i64::from(arity)).expect("arity is small"),
+                location,
+                list,
+            )
             .map_err(|error| VmError::Unsupported(format!("stacktrace {error:?}")))?;
     }
     Ok(list)
