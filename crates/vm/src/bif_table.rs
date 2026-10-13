@@ -63,6 +63,17 @@ pub(crate) struct Entry {
     pub(crate) plain: usize,
     /// Called as a list BIF that traps on the reduction budget.
     pub(crate) list_slice: usize,
+    /// Called as a list BIF that never allocates (see `native_helpers::list_slice_nonalloc_entry`).
+    pub(crate) list_slice_nonalloc: usize,
+}
+
+/// Whether `lists:function/arity` never allocates on its common path, so its call needs no
+/// native cursor conversion.
+pub(crate) fn never_allocates(module: &str, function: &str, arity: u8) -> bool {
+    matches!(
+        (module, function, arity),
+        ("lists", "keyfind", 3) | ("lists", "member", 2) | ("lists", "keymember", 3)
+    )
 }
 
 /// The entry compiled for `module:function/arity`, if `arinsal_bifs` has that BIF.
@@ -81,6 +92,8 @@ impl arinsal_bifs::BifTableVisitor for Compile {
         Entry {
             plain: crate::native_helpers::plain_bif_entry::<B> as *const () as usize,
             list_slice: crate::native_helpers::list_slice_bif_entry::<B> as *const () as usize,
+            list_slice_nonalloc: crate::native_helpers::list_slice_nonalloc_entry::<B> as *const ()
+                as usize,
         }
     }
 }

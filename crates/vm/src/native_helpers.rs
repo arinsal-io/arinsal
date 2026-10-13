@@ -1117,6 +1117,11 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
     // rather than only in `invoke_dispatch_bif`.
     if export.list_slice {
         let own = crate::bif_table::entry(&export.module, &export.function, export.arity);
+        if crate::bif_table::never_allocates(&export.module, &export.function, export.arity) {
+            return Some(own.map_or(plain_bif_light as *const () as usize, |e| {
+                e.list_slice_nonalloc
+            }));
+        }
         return Some(own.map_or(plain_bif_light as *const () as usize, |e| e.list_slice));
     }
     // The kind is fixed when the export is created (`bif_table[].f`). The call
@@ -1662,6 +1667,69 @@ pub(crate) extern "C" fn plain_bif_entry<B: arinsal_bifs::BifBody>(
 /// (`lists_member_2`, `keyfind`, ...).
 // Port of erts/emulator/beam/erl_bif_lists.c:1108,1302 (the BIF runs with
 // `ERTS_BIF_REDS_LEFT` and `BIF_TRAP`s through its export), OTP-29.1.1.
+/// A list BIF that never allocates (`lists:keyfind/3`, `member/2`, `keymember/3`): the common
+/// call reads the arguments and returns without converting the native heap cursors, as erts
+/// reads HTOP and STOP as pointers. A trap, an error or a deferred scan converts them and
+/// takes the full path.
+// Port of erts/emulator/beam/erl_bif_lists.c:1108,1302 (the BIF runs with ERTS_BIF_REDS_LEFT
+// and returns its value), OTP-29.1.1.
+pub(crate) extern "C" fn list_slice_nonalloc_entry<B: arinsal_bifs::BifBody>(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
+        return 0;
+    };
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+        return 0;
+    };
+    if let Some(raw) = nonalloc_list_fast(process, registers, export, B::call) {
+        return raw;
+    }
+    crate::native_hooks::convert_native_cursors(process);
+    call_list_slice_bif(
+        process,
+        registers,
+        identity as usize,
+        export,
+        B::call,
+        false,
+    )
+    .unwrap_or(0)
+}
+
+/// The value of a non-allocating list BIF, or `None` when it traps or fails (the caller then
+/// converts the cursors and runs the full path).
+#[inline(always)]
+fn nonalloc_list_fast(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> Result<Term, arinsal_bifs::BifError>,
+) -> Option<u64> {
+    process.reductions = process.header.fcalls;
+    let arity = usize::from(export.arity);
+    let (reductions, value) = {
+        let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
+        ctx.set_reduction_budget(process.reductions.max(0) as usize);
+        let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
+        if ctx.take_deferred().is_some() {
+            return None;
+        }
+        (ctx.reductions(), result.ok()?)
+    };
+    charge_bif_reductions(process, reductions);
+    registers.x_reg_array[0] = value;
+    if process.header.fcalls != process.reductions {
+        process.header.fcalls = process.reductions;
+    }
+    Some(crate::native_hooks::raw(value))
+}
+
 pub(crate) extern "C" fn list_slice_bif_entry<B: arinsal_bifs::BifBody>(
     header: *mut ProcessHeader,
     _regs: *mut u64,

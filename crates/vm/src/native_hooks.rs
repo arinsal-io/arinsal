@@ -99,6 +99,25 @@ pub(crate) fn process_and_registers<'a>(
 /// helper reads them.
 // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:460-540 (emit_enter_runtime stores only
 // HTOP/STOP; the runtime gets `reg`, the scheduler's x_reg_array, not a copy), OTP-29.1.1.
+/// [`enter_runtime`] without the cursor conversion: the caller must not touch heap indices
+/// until it converts them. erts keeps HTOP and STOP as pointers in the process, so a BIF that
+/// never allocates needs no conversion.
+pub(crate) fn enter_runtime_no_cursors<'a>(
+    header: *mut ProcessHeader,
+) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
+    let process = process_from_header(header)?;
+    scheduler_registers(process)
+}
+
+/// Converts the native cursors of a process entered with [`enter_runtime_no_cursors`].
+pub(crate) fn convert_native_cursors(process: &mut Process) {
+    process.heap.set_native_cursors_at(
+        process.header.heap,
+        process.header.htop,
+        process.header.stop,
+    );
+}
+
 pub(crate) fn enter_runtime<'a>(
     header: *mut ProcessHeader,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
