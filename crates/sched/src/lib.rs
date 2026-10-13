@@ -6530,6 +6530,9 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             if !inner.port_queues[id].is_empty()
                 || !inner.aux_work[id].is_empty()
                 || inner.work_epochs[id].load(Ordering::SeqCst) != observed
+                // The sleeping flag is published: look at the thread progress value again
+                // (scheduler_wait re-reads its aux work after ERTS_SSI_FLG_SLEEPING is set).
+                || thr_progress::scheduler_later_op_ready()
             {
                 inner.parked[id].store(false, Ordering::SeqCst);
                 continue;
@@ -6574,6 +6577,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
                 || (inner.scheduling_blocked.load(Ordering::Acquire)
                     && id != inner.scheduling_blocker.load(Ordering::Acquire));
             let arrived = inner.work_epochs[id].load(Ordering::SeqCst) != observed
+                || thr_progress::scheduler_later_op_ready()
                 || inner.run_queues[id].iter().any(|queue| !queue.is_empty())
                 || local.queues.iter().any(|queue| !queue.is_empty())
                 || !inner.port_queues[id].is_empty()
@@ -6814,6 +6818,9 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             || !inner.stats_requests[id].is_empty()
             || !inner.aux_work[id].is_empty()
             || inner.work_epochs[id].load(Ordering::SeqCst) != observed
+                // The sleeping flag is published: look at the thread progress value again
+                // (scheduler_wait re-reads its aux work after ERTS_SSI_FLG_SLEEPING is set).
+                || thr_progress::scheduler_later_op_ready()
         {
             inner.parked[id].store(false, Ordering::SeqCst);
             continue;
@@ -6842,6 +6849,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+
         local.set_msacc_state(MsaccState::Sleep);
         local.set_wall_enabled(false);
         inner.waiting_schedulers.fetch_add(1, Ordering::Relaxed);
