@@ -2466,16 +2466,18 @@ pub(crate) fn set_save_end(process: &mut Process, ctx: &mut RunCtx<'_, Message>)
 /// Port of erts/emulator/beam/erl_process.c:9369 (erts_suspend) with a busy port: `false`
 /// when the port stopped being busy, and the operation is to be retried at once.
 fn suspend_on_busy(
-    process: &Process,
+    process: &mut Process,
     handle: &PortHandle,
     drv: &arinsal_drv::DriverPort,
     pid: Pid,
 ) -> bool {
-    let Some(runtime) = process.runtime.as_ref() else {
+    let Some(runtime) = process.runtime.clone() else {
         return false;
     };
     // Suspended before it is queued on the port, so a resume racing with this cannot be lost.
-    runtime.suspend_internal(pid);
+    if process.self_pid == Some(pid) {
+        crate::suspend::suspend_self(process);
+    }
     if !drv.save_suspend_process(packed_pid(pid)) {
         runtime.resume_internal(pid);
         return false;

@@ -39,6 +39,7 @@ mod port;
 mod receive;
 mod seq_trace;
 mod signals;
+mod suspend;
 mod trace;
 mod trace_bp;
 // ---- vm_maps_bits ----

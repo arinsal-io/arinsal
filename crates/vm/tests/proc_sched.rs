@@ -6,7 +6,7 @@ use arinsal_vm::Vm;
 const SOURCE: &str = r#"
 -module(proc_sched).
 -export([
-    hibernate/0, suspend_order/0, suspend_opts/0, suspend_self/0, resume_plain/0,
+    hibernate/0, suspend_order/0, suspend_opts/0, suspend_replies/0, suspend_exit/0, suspend_timer/0, suspend_busy/0, suspend_self/0, resume_plain/0,
     suspend_badopt/0, hibernate_heap_size/0, spawn_ok/0, spawn_missing/0, spawn_badopt/0, spawn_error_only/0,
     spawn_success_only_bad/0, spawn_reply_no/0, spawn_tag/0, spawn_link_order/0,
     spawn_monitor_ref/0, spawn_remote/0, spawn_bad_list/0, spawn_bad_fun/0,
@@ -94,6 +94,76 @@ suspend_opts() ->
     erlang:resume_process(Pid),
     erlang:resume_process(Pid),
     {First, Second, Async, Reply, Shape, Status}.
+
+suspend_replies() ->
+    Dead = spawn(fun() -> ok end),
+    M = monitor(process, Dead),
+    receive {'DOWN', M, _, _, _} -> ok end,
+    Tag = make_ref(),
+    Sync = caught(fun() -> erlang:suspend_process(Dead) end),
+    AsyncPlain = erlang:suspend_process(Dead, [asynchronous]),
+    AsyncTag = erlang:suspend_process(Dead, [{asynchronous, Tag}]),
+    TagReply = receive {Tag, R} -> R after 200 -> timeout end,
+    %% a live target that exits while the tagged request is queued behind a suspend
+    Live = spawn(fun() -> receive stop -> ok end end),
+    Tag2 = make_ref(),
+    true = erlang:suspend_process(Live, [{asynchronous, Tag2}]),
+    Reply2 = receive {Tag2, R2} -> R2 after 2000 -> timeout end,
+    %% a second suspender of a suspended target, then its resume
+    unless_suspending_again(Live),
+    true = erlang:resume_process(Live),
+    {status, St} = process_info(Live, status),
+    true = erlang:resume_process(Live),
+    Live ! stop,
+    {Sync, AsyncPlain, AsyncTag, TagReply, Reply2, St}.
+
+unless_suspending_again(Pid) ->
+    false = erlang:suspend_process(Pid, [unless_suspending]),
+    true = erlang:suspend_process(Pid).
+
+suspend_exit() ->
+    P = spawn(fun() -> receive stop -> ok end end),
+    true = erlang:suspend_process(P),
+    {suspending, S1} = process_info(self(), suspending),
+    exit(P, kill),
+    M = monitor(process, P),
+    receive {'DOWN', M, _, _, _} -> ok end,
+    S2 = process_info(self(), suspending),
+    R = caught(fun() -> erlang:resume_process(P) end),
+    Q = spawn(fun() -> receive stop -> ok end end),
+    true = erlang:suspend_process(Q),
+    exit(Q, kill),
+    receive after 100 -> ok end,
+    S3 = process_info(self(), suspending),
+    {[{A, B} || {_, A, B} <- S1], S2, R, S3}.
+
+suspend_timer() ->
+    Parent = self(),
+    P = spawn(fun() -> receive never -> ok after 400 -> Parent ! timed_out end end),
+    receive after 50 -> ok end,
+    true = erlang:suspend_process(P),
+    Early = receive timed_out -> early after 600 -> held end,
+    true = erlang:resume_process(P),
+    Soon = receive timed_out -> soon after 150 -> notyet end,
+    Late = receive timed_out -> late after 1500 -> never end,
+    {Early, Soon, Late}.
+
+suspend_busy() ->
+    %% suspend and resume a process that is running and sending signals
+    Parent = self(),
+    Pid = spawn(fun() -> busy(Parent, 0) end),
+    Rs = [begin
+        true = erlang:suspend_process(Pid),
+        {status, S} = process_info(Pid, status),
+        true = erlang:resume_process(Pid),
+        S
+    end || _ <- lists:seq(1, 50)],
+    exit(Pid, kill),
+    lists:usort(Rs).
+
+busy(Parent, N) ->
+    receive after 0 -> ok end,
+    busy(Parent, N + 1).
 
 suspend_self() -> caught(fun() -> erlang:suspend_process(self()) end).
 
@@ -281,6 +351,10 @@ fn proc_sched_matches_otp_29() {
         "hibernate_heap_size",
         "suspend_order",
         "suspend_opts",
+        "suspend_replies",
+        "suspend_exit",
+        "suspend_timer",
+        "suspend_busy",
         "suspend_self",
         "resume_plain",
         "suspend_badopt",

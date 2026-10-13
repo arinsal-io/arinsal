@@ -1896,20 +1896,21 @@ fn internal_monitor_list(process: &mut Process) -> Result<Term, VmError> {
     let origins = cold
         .monitors
         .iter()
-        .map(|(&id, &pid)| {
-            let extra = cold
-                .monitor_names
-                .get(&id)
-                .cloned()
+        .map(|(&id, half)| {
+            // The name wins over the tag, as make_monitor_list shows a registered name.
+            let extra = half
+                .data
+                .name
+                .clone()
                 .map(OwnedTerm::Atom)
-                .or_else(|| cold.monitor_tags.get(&id).cloned());
-            (id, pid, extra)
+                .or_else(|| half.data.tag.clone());
+            (id, half.target, extra)
         })
         .collect::<Vec<_>>();
     let targets = cold
         .monitored_by
         .iter()
-        .map(|(&id, &pid)| (id, pid))
+        .map(|(&id, half)| (id, half.origin))
         .collect::<Vec<_>>();
     internal_monitor_list_from(process, &origins, &targets)
 }

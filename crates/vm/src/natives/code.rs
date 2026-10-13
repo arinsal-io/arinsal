@@ -41,7 +41,11 @@ fn lock(runtime: &Runtime) -> std::sync::MutexGuard<'_, CodeModPermission> {
 /// is suspended and queued, and the caller must yield and retry its BIF call once resumed.
 // Port of erts/emulator/beam/code_ix.c:214-290 (try_seize_code_permission) and 378-386
 // (erts_try_seize_code_mod_permission), OTP-29.1.1.
-pub(crate) fn try_seize_code_mod_permission(runtime: &Runtime, pid: Pid) -> bool {
+pub(crate) fn try_seize_code_mod_permission(
+    runtime: &Runtime,
+    process: &mut Process,
+    pid: Pid,
+) -> bool {
     let mut perm = lock(runtime);
     if perm.handover == Some(pid) {
         // Given to us as a waiter.
@@ -63,7 +67,9 @@ pub(crate) fn try_seize_code_mod_permission(runtime: &Runtime, pid: Pid) -> bool
         perm.queue.retain(|waiter| *waiter != pid);
         return false;
     }
-    runtime.suspend_internal(pid);
+    if process.self_pid == Some(pid) {
+        crate::suspend::suspend_self(process);
+    }
     false
 }
 
@@ -645,9 +651,10 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
 // Port of erts/emulator/beam/code_ix.c:407-421 (erts_try_seize_code_load_permission),
 // OTP-29.1.1. Arinsal has only the code modification permission: no operation needs the
 // staging permission alone while another process holds the modification permission.
-fn seize_code_load_permission(process: &Process, pid: Option<Pid>) -> Result<(), VmError> {
-    match (&process.runtime, pid) {
-        (Some(runtime), Some(pid)) if !try_seize_code_mod_permission(runtime, pid) => {
+fn seize_code_load_permission(process: &mut Process, pid: Option<Pid>) -> Result<(), VmError> {
+    let runtime = process.runtime.clone();
+    match (runtime, pid) {
+        (Some(runtime), Some(pid)) if !try_seize_code_mod_permission(&runtime, process, pid) => {
             Err(VmError::Yield)
         }
         _ => Ok(()),
@@ -761,7 +768,7 @@ fn finish_stage(
                 let barrier_passed = Arc::new(AtomicBool::new(false));
                 staged.barrier_passed = Some(Arc::clone(&barrier_passed));
                 process.cold_mut().finish_loading_commit = Some(staged);
-                runtime.suspend_internal(pid);
+                crate::suspend::suspend_self(process);
                 ctx.thread_progress_later(move || {
                     if let Some(ended) = ended {
                         ended.commit();
@@ -1161,7 +1168,7 @@ fn module_id_referenced(
 // Port of erts/emulator/beam/beam_bif_load.c:2112-2330 (erts_internal_purge_module_2), OTP-29.1.1.
 fn purge(
     vm: &mut Vm,
-    process: &Process,
+    process: &mut Process,
     ctx: &mut RunCtx<'_, crate::process::Message>,
     name: &str,
     phase: &str,
