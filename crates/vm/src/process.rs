@@ -1011,9 +1011,12 @@ impl std::hash::Hasher for IdHasher {
 }
 
 impl Runtime {
-    /// Loaded modules of the active code index, for a raw stacktrace's frame lookup.
-    pub(crate) fn active_code_tables(&self) -> std::sync::Arc<crate::load::CodeTables> {
-        self.code.active_tables()
+    /// Read ranges and module tables from one active code index.
+    pub(crate) fn with_active_code<R>(
+        &self,
+        read: impl FnOnce(&[crate::native_bridge::ModuleRange], &crate::load::CodeTables) -> R,
+    ) -> R {
+        self.code.with_active_code(read)
     }
 
     /// Runs a lookup against the BeamAsm version selected by a code index and module slot.
@@ -1039,16 +1042,11 @@ impl Runtime {
     /// Catch table of this node's `erts_active_code_ix()`.
     // Port of erts/emulator/beam/code_ix.h:362 (`erts_active_code_ix` is one atomic, not
     // thread-local) and beam_catches.c:146 (`bccix[erts_active_code_ix()]`), OTP-29.1.1.
-    pub(crate) fn active_catch_table(
+    pub(crate) fn with_active_catches<R>(
         &self,
-    ) -> std::sync::Arc<Vec<Option<crate::native_bridge::CatchTarget>>> {
-        self.code.active_catch_table()
-    }
-
-    /// Module code ranges of this node's active code index.
-    // Port of erts/emulator/beam/beam_ranges.c:310 (`r[erts_active_code_ix()]`), OTP-29.1.1.
-    pub(crate) fn code_ranges(&self) -> std::sync::Arc<Vec<crate::native_bridge::ModuleRange>> {
-        self.code.code_ranges()
+        read: impl FnOnce(&[Option<crate::native_bridge::CatchTarget>]) -> R,
+    ) -> R {
+        self.code.with_active_catches(read)
     }
 
     /// Address of an export in the requested active code index.

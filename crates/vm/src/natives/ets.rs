@@ -145,7 +145,7 @@ fn bif_frame(
             function: intern(function)?,
             args: crate::stacktrace::BifArgs::from_terms(args)?,
             info: match cause {
-                Some(cause) => crate::stacktrace::BifErrorInfo::Cause(intern(cause)?),
+                Some(cause) => crate::stacktrace::BifErrorInfo::Cause(Term::atom(intern(cause)?)),
                 None => crate::stacktrace::BifErrorInfo::Plain,
             },
         });

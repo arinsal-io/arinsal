@@ -863,10 +863,6 @@ pub(crate) struct ProcessCold {
     ///
     /// The heap owns the copied terms so a collection inside `-on_load` cannot move them.
     pub(crate) entry_args_after_on_load: Option<EntryArgsAfterOnLoad>,
-    /// Modules and off-heap pieces referenced by heap-resident raw stacktraces.
-    /// The bignum stores a slot; the `Arc` stays alive for the process, the way
-    /// erts' `ErtsCodeMFA *` stays valid while the module is loaded.
-    pub(crate) trace_keep: Option<Box<crate::stacktrace::TraceKeep>>,
     /// BIF MFA of a caught native failure. `save_stacktrace` keeps it as `s->current`
     /// without the uncaught path's `String` box; cleared once the trace is taken.
     pub(crate) pending_trace_top: Option<crate::stacktrace::PendingTop>,
@@ -1372,11 +1368,21 @@ pub(crate) struct NativeTrap {
     pub(crate) fvalue: u64,
 }
 
+/// The BIF frame whose error remains live across a native exit.
+pub(crate) enum NativeBifCall {
+    /// Native export metadata and the scheduler's register array are the MFA and arguments.
+    Export(crate::beamasm_integration::ExportDispatch),
+    /// NIF and legacy helper calls have no export entry to retain.
+    Owned {
+        module: String,
+        function: String,
+        args: Vec<Term>,
+    },
+}
+
 /// A BIF failure raised from native code, kept until the native exit builds the exception.
 pub(crate) struct NativeBifError {
-    pub(crate) module: String,
-    pub(crate) function: String,
-    pub(crate) args: Vec<Term>,
+    pub(crate) call: NativeBifCall,
     pub(crate) error: arinsal_bifs::BifError,
     /// The `c_p->freason`/`fvalue` pair this error produced; any other exception ignores it.
     pub(crate) freason: u64,

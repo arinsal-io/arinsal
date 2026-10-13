@@ -335,10 +335,7 @@ pub(super) fn bif_error_with_atoms(
             });
         }
         let info = match error {
-            BifError::Badarg { cause: Some(cause) } => cause.as_atom().map_or(
-                stacktrace::BifErrorInfo::Plain,
-                stacktrace::BifErrorInfo::Cause,
-            ),
+            BifError::Badarg { cause: Some(cause) } => stacktrace::BifErrorInfo::Cause(cause),
             _ => stacktrace::BifErrorInfo::Plain,
         };
         let reason = match error {
@@ -500,7 +497,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
                 p.x[0] = match parse_class(p.x[3]) {
                     Some(Class::Throw) => reason,
                     Some(Class::Error) => {
-                        let trace = materialize(p, p.x[2])?;
+                        let trace = materialize(Some(vm), p, p.x[2])?;
                         p.x[2] = trace;
                         let reason_with_trace = tuple(p, &[reason, trace])?;
                         tuple(p, &[atom("EXIT")?, reason_with_trace])?
@@ -591,7 +588,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
         }
         Opcode::BuildStacktrace => {
             // Port of erts/emulator/beam/beam_common.c:1205 (build_stacktrace), OTP-29.1.1.
-            p.x[0] = materialize(p, p.x[0])?;
+            p.x[0] = materialize(Some(vm), p, p.x[0])?;
             p.ip += 1;
         }
         _ => {
@@ -636,10 +633,10 @@ pub(super) fn resume(
             save_explicit(p, trace, trap.class)?
         }
     } else {
-        save_raw(vm, p, vm.backtrace_depth, trap.class, trap.top.as_ref())?
+        save_raw(p, vm.backtrace_depth, trap.class, trap.top.as_ref())?
     };
     let trace = if trap.raw_rethrow && trap.reason == atom("function_clause")? {
-        let cooked = materialize(p, trace)?;
+        let cooked = materialize(Some(vm), p, trace)?;
         let stripped = strip_top_location(p, cooked)?;
         save_explicit(p, stripped, trap.class)?
     } else {
@@ -835,7 +832,7 @@ pub(super) fn resume(
     let reason = to_owned(trap.reason)
         .map_err(|e| VmError::Unsupported(format!("exception reason {e:?}")))?;
     let stack = if trap.class == Class::Error {
-        let trace = materialize(p, trace)?;
+        let trace = materialize(Some(vm), p, trace)?;
         to_owned(trace).map_err(|e| VmError::Unsupported(format!("exception stack {e:?}")))?
     } else {
         OwnedTerm::Nil
@@ -850,7 +847,6 @@ pub(super) fn resume(
 // Port of erts/emulator/beam/beam_common.c:581-680 (next_catch), OTP-29.1.1.
 /// Port of erts/emulator/beam/beam_common.c:880 (save_stacktrace), OTP-29.1.1.
 fn save_raw(
-    vm: &Vm,
     p: &mut Process,
     depth: usize,
     class: Class,
@@ -868,44 +864,51 @@ fn save_raw(
         .cold
         .as_deref_mut()
         .map_or(0, |cold| std::mem::take(&mut cold.native_error_pc));
-    let native_pc = Some(error_pc).filter(|&pc| {
-        let probe = pc & !arinsal_beamasm::module::RETURN_SITE_TAG;
-        pc != 0 && arinsal_term::may_be_native_code_pointer(probe)
-    });
-    let mut raw = stacktrace::RawTrace::default();
-    stacktrace::capture(
-        &mut raw,
-        Some(class),
-        top,
-        &vm.code.modules,
-        stacktrace::Current {
-            module: p.module,
-            ip: p.ip,
+    // `handle_error` passes its `pc` directly to `save_stacktrace`; frame identity is
+    // resolved later by `build_stacktrace` through the active ranges table.
+    let native_pc = (error_pc != 0).then_some(error_pc);
+    let pending_top = stacktrace::take_matching_pending_top(p);
+    let save_top = top
+        .map(stacktrace::SaveTop::Live)
+        .or_else(|| pending_top.as_ref().map(stacktrace::SaveTop::Stored));
+    stacktrace::save_direct(
+        p,
+        stacktrace::StackTraceSave {
+            class,
+            depth,
+            freason: if p.header.freason != 0 {
+                p.header.freason
+            } else {
+                match class {
+                    Class::Error => 1,
+                    Class::Exit => 2,
+                    Class::Throw => 3,
+                }
+            },
             native_pc,
+            top: save_top,
         },
-        &p.heap,
-        depth,
-    )?;
-    stacktrace::take_pending_top(p, &mut raw);
-    stacktrace::store(p, raw)
+    )
 }
 
 fn save_explicit(p: &mut Process, trace: Term, class: Class) -> Result<Term, VmError> {
-    let mut raw = stacktrace::RawTrace::default();
-    stacktrace::save_explicit(&mut raw, class, trace)?;
-    stacktrace::store(p, raw)
+    stacktrace::save_explicit(p, class, trace)
 }
 
-pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError> {
+pub(super) fn materialize(vm: Option<&Vm>, p: &mut Process, trace: Term) -> Result<Term, VmError> {
     if empty_trace_class(trace).is_some() {
         return Ok(Term::NIL);
+    }
+    if let Some(args) = stacktrace::raised_args(trace) {
+        return Ok(args);
     }
     // The saved trace stays behind the term: the same one can be rebuilt by a later raise.
     // A plain raw bignum is built from one temporary frame array and one heap block.
     if let Some(result) = stacktrace::build_direct(p, trace) {
         return result;
     }
-    match stacktrace::with_saved(trace, |raw| stacktrace::build_saved(p, raw)) {
+    let modules = vm.map_or(&[][..], |vm| vm.code.modules.as_slice());
+    match stacktrace::with_saved(trace, |raw| stacktrace::build_saved(p, raw, modules)) {
         Some(result) => result,
         None => Ok(trace),
     }

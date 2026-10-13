@@ -67,7 +67,7 @@ pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_
 pub use literal::{LiteralAreas, set_literal_purge_area};
 pub use magic::MagicRef;
 pub use native_code::{
-    is_native_code_pointer, may_be_native_code_pointer, register_native_code_range,
+    is_cp, is_native_code_pointer, may_be_native_code_pointer, register_native_code_range,
     unregister_native_code_range,
 };
 pub use ops::{
@@ -392,6 +392,11 @@ impl Term {
             POS_BIG | NEG_BIG => Some((header >> 6) as usize),
             _ => None,
         }
+    }
+    /// Whether this boxed integer is a negative bignum.
+    #[inline]
+    pub fn is_negative_bignum(self) -> bool {
+        self.header().is_some_and(|header| header & 63 == NEG_BIG)
     }
     /// Whether a boxed term is an internal magic reference.
     #[inline]

@@ -1010,6 +1010,12 @@ impl ProcessHeap {
         self.words.len() - self.stop
     }
 
+    /// Iterate over live stack words in stack order without an indexed bounds check per word.
+    #[inline]
+    pub fn stack_terms(&self) -> impl ExactSizeIterator<Item = Term> + '_ {
+        self.words.words()[self.stop..].iter().copied().map(Term)
+    }
+
     /// Make the next collection sweep both generations.
     pub fn request_full_sweep(&mut self) {
         self.minor_since_major = self.fullsweep_after;

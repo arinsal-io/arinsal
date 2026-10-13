@@ -539,8 +539,11 @@ pub(crate) fn module_loaded_light(
         return None;
     };
     let name = module.as_atom()?;
-    let tables = process.runtime.as_ref()?.active_code_tables();
-    Some(Ok(Term::atom(if tables.loaded.contains_key(&name) {
+    let loaded = process
+        .runtime
+        .as_ref()?
+        .with_active_code(|_, tables| tables.loaded.contains_key(&name));
+    Some(Ok(Term::atom(if loaded {
         atoms::TRUE
     } else {
         atoms::FALSE
@@ -559,11 +562,12 @@ pub(crate) fn function_exported_light(
     let module = module.as_atom()?;
     let function = function.as_atom()?;
     let arity = u8::try_from(arity.as_small().filter(|n| (0..=255).contains(n))?).ok()?;
-    let tables = process.runtime.as_ref()?.active_code_tables();
-    let exported = tables.loaded.get(&module).is_some_and(|id| {
-        tables.modules[*id]
-            .export_slot_atom(function, arity)
-            .is_some()
+    let exported = process.runtime.as_ref()?.with_active_code(|_, tables| {
+        tables.loaded.get(&module).is_some_and(|id| {
+            tables.modules[*id]
+                .export_slot_atom(function, arity)
+                .is_some()
+        })
     });
     Some(Ok(Term::atom(if exported {
         atoms::TRUE
