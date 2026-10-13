@@ -2345,10 +2345,10 @@ impl Vm {
                             None if to_dirty_io => Err(arinsal_bifs::BifError::Dirty(
                                 arinsal_bifs::SchedulerClass::DirtyIo,
                             )),
-                            None => calls::call_bif(
+                            None => natives::nif::call_native(
                                 &mut p.heap,
                                 &mut p.reductions,
-                                native,
+                                &native,
                                 &p.x[..arity],
                             ),
                         }

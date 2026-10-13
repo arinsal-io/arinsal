@@ -445,6 +445,8 @@ pub enum NifError {
     LoadRejected(i32),
     /// The new library does not provide an upgrade callback.
     UpgradeUnsupported,
+    /// Upgrade callback rejected the load information.
+    UpgradeRejected(i32),
 }
 impl std::fmt::Display for NifError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -460,7 +462,8 @@ pub struct NifFunction {
     pub arity: u32,
     pub fptr: NifFn,
     pub flags: u32,
-    priv_data: *mut c_void,
+    /// The library's `priv_data`, shared so an upgrade of a newer library can replace it.
+    priv_data: Arc<AtomicPtr<c_void>>,
     halt_calls: Arc<HaltCalls>,
 }
 impl NifFunction {
@@ -534,7 +537,7 @@ impl NifFunction {
     ) -> Result<NifCall, BifError> {
         let _call = (self.flags != 0).then(|| self.halt_calls.enter()).flatten();
         let mut env = ErlNifEnv::bound(&mut ctx.heap, pid);
-        env.priv_data = self.priv_data;
+        env.priv_data = self.priv_data.load(Ordering::Acquire);
         // SAFETY: the pointer belongs to a loaded library; arguments remain live.
         let result = unsafe { fptr(&mut env, args.len() as c_int, args.as_ptr()) };
         if let Some(reason) = env.pending {
@@ -669,15 +672,19 @@ mod halt_tests {
         waiter.join().unwrap();
     }
 }
-/// Loaded library and copied function table. Drop calls the unload callback.
+/// Loaded library and copied function table. [`NifLibrary::close`] (or Drop) calls the unload
+/// callback.
 pub struct NifLibrary {
-    _library: Arc<Library>,
+    /// The `dlopen` handle, released by [`NifLibrary::close`].
+    library: Mutex<Option<Arc<Library>>>,
+    closed: AtomicBool,
     module: String,
     functions: Vec<NifFunction>,
     unload: Option<UnloadFn>,
     on_halt: Option<extern "C" fn(*mut c_void)>,
     on_unload_thread: Option<extern "C" fn(*mut c_void)>,
-    priv_data: *mut c_void,
+    /// `erl_module_nif.priv_data`, which an upgrade of a newer library may replace.
+    priv_data: Arc<AtomicPtr<c_void>>,
     halt_calls: Arc<HaltCalls>,
     on_halt_called: AtomicBool,
 }
@@ -709,12 +716,36 @@ impl NifLibrary {
         if !self.on_halt_called.swap(true, Ordering::AcqRel)
             && let Some(callback) = self.on_halt
         {
-            callback(self.priv_data);
+            callback(self.priv_data.load(Ordering::Acquire));
         }
     }
     /// Wait for calls in a library that requested `ERL_NIF_OPT_DELAY_HALT`.
     pub fn wait_for_halt_calls(&self) {
         self.halt_calls.wait();
+    }
+    /// Run the unload callbacks and release the `dlopen` handle, once. No function of the
+    /// library may be called afterwards.
+    // Port of erts/emulator/beam/erl_nif.c:2602-2618 (really_close_dynlib), OTP-29.1.1.
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let priv_data = self.priv_data.load(Ordering::Acquire);
+        if let Some(callback) = self.on_unload_thread {
+            callback(priv_data);
+        }
+        if let Some(unload) = self.unload {
+            let mut env = ErlNifEnv::independent();
+            env.module = Some(self.module.clone());
+            // SAFETY: the library is still open; its handle is released below.
+            unsafe { unload(&mut env, priv_data) };
+        }
+        drop(
+            self.library
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take(),
+        );
     }
 }
 // SAFETY: after `load` returns, OTP invokes NIF entry points from any scheduler.
@@ -727,15 +758,7 @@ unsafe impl Sync for NifLibrary {}
 
 impl Drop for NifLibrary {
     fn drop(&mut self) {
-        if let Some(callback) = self.on_unload_thread {
-            callback(self.priv_data);
-        }
-        if let Some(unload) = self.unload {
-            let mut env = ErlNifEnv::independent();
-            env.module = Some(self.module.clone());
-            // SAFETY: the library stays open until Drop completes.
-            unsafe { unload(&mut env, self.priv_data) };
-        }
+        self.close();
     }
 }
 /// A loaded NIF image whose `load` callback has not run yet.
@@ -763,6 +786,32 @@ impl NifImage {
     pub fn commit_for(self, term: Term, pid: Option<Term>) -> Result<NifLibrary, NifError> {
         self.finish(term, None, pid)
     }
+    /// Run the upgrade callback with the private data of `old`, the library of the previous
+    /// code of the module, and return the callable library.
+    // Port of erts/emulator/beam/erl_nif.c:4956-4979 (erts_load_nif upgrade), OTP-29.1.1:
+    // the callback may replace the old library's `priv_data`; a veto restores it.
+    pub fn upgrade(
+        self,
+        term: Term,
+        old: &NifLibrary,
+        pid: Option<Term>,
+    ) -> Result<NifLibrary, NifError> {
+        if self.upgrade.is_none() {
+            return Err(NifError::UpgradeUnsupported);
+        }
+        let prev_old_data = old.priv_data.load(Ordering::Acquire);
+        let mut old_data = prev_old_data;
+        let result = self.finish(term, Some(&mut old_data), pid);
+        old.priv_data.store(
+            if result.is_ok() {
+                old_data
+            } else {
+                prev_old_data
+            },
+            Ordering::Release,
+        );
+        result
+    }
     fn finish(
         mut self,
         term: Term,
@@ -776,6 +825,7 @@ impl NifImage {
         env.options.loading = true;
         let cell = Arc::new(AtomicPtr::new(ptr::null_mut()));
         env.priv_cell = Some(Arc::clone(&cell));
+        let upgrading = old_priv_data.is_some();
         let code = if let Some(old) = old_priv_data {
             let upgrade = self.upgrade.ok_or(NifError::UpgradeUnsupported)?;
             // SAFETY: this loaded library declares its upgrade ABI and both data pointers are live.
@@ -788,21 +838,27 @@ impl NifImage {
         };
         env.options.loading = false;
         env.priv_cell = None;
-        let priv_data = cell.load(Ordering::Relaxed);
         if code != 0 {
-            return Err(NifError::LoadRejected(code));
+            return Err(if upgrading {
+                NifError::UpgradeRejected(code)
+            } else {
+                NifError::LoadRejected(code)
+            });
         }
+        // The slot the callback wrote stays the library's `priv_data`.
+        let priv_data = cell;
         let halt_calls = Arc::new(HaltCalls {
             enabled: env.options.flags & 1 != 0,
             in_flight: Mutex::new(0),
             idle: Condvar::new(),
         });
         for function in &mut self.functions {
-            function.priv_data = priv_data;
+            function.priv_data = Arc::clone(&priv_data);
             function.halt_calls = Arc::clone(&halt_calls);
         }
         Ok(NifLibrary {
-            _library: self.library,
+            library: Mutex::new(Some(self.library)),
+            closed: AtomicBool::new(false),
             module: self.module,
             functions: self.functions,
             unload: self.unload,
@@ -941,7 +997,7 @@ pub fn open_nif(path: &Path, module: &str) -> Result<NifImage, NifError> {
             arity,
             fptr,
             flags,
-            priv_data: ptr::null_mut(),
+            priv_data: Arc::default(),
             halt_calls: Arc::new(HaltCalls {
                 enabled: false,
                 in_flight: Mutex::new(0),
@@ -966,9 +1022,9 @@ pub fn load_nif(path: &Path, info: LoadInfo<'_>) -> Result<NifLibrary, NifError>
 pub fn upgrade_nif(
     path: &Path,
     info: LoadInfo<'_>,
-    old: &mut NifLibrary,
+    old: &NifLibrary,
 ) -> Result<NifLibrary, NifError> {
-    open_nif(path, info.module)?.finish(info.term, Some(&mut old.priv_data), None)
+    open_nif(path, info.module)?.upgrade(info.term, old, None)
 }
 unsafe extern "C" {
     fn arinsal_nif_shim_anchor();

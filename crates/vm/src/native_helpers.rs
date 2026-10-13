@@ -10,8 +10,7 @@ struct StaticNif {
     module: String,
     function: String,
     arity: u8,
-    // None until `load_nif` binds a reserved call-NIF body.
-    entry: Option<arinsal_bifs::BifFn>,
+    entry: arinsal_bifs::BifFn,
 }
 
 fn native_fun_owners() -> &'static std::sync::Mutex<
@@ -436,42 +435,42 @@ pub(crate) fn register_static_nif(
             module,
             function,
             arity,
-            entry: Some(entry),
+            entry,
         },
     );
     identity
 }
 
-/// Reserves the identity of a native call-NIF body that `load_nif` may bind later.
-pub(crate) fn reserve_nif_slot(module: String, function: String, arity: u8) -> usize {
-    let identity = NEXT_STATIC_NIF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    static_nifs().lock().unwrap().insert(
-        identity,
-        StaticNif {
+/// Identity in `native_dirty_nif` of a call-NIF body bound by `load_nif`: the process's
+/// `nif_pending` carries the library and function. Static NIF identities start at 1.
+pub(crate) const BOUND_NIF: usize = 0;
+
+/// The call-NIF body of a function of native code that `load_nif` may replace. The body is
+/// compiled with the address of its site and calls [`arinsal_beamasm_call_nif`] with it.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:956-992 (emit_call_nif embeds Func, NifMod
+// and DirtyFunc in the function's code) and erl_nif.c:5149-5160 (load_nif_1st_finisher
+// copies them there), OTP-29.1.1: the site of the function holds the operands itself.
+pub(crate) struct NativeNifSite {
+    module: String,
+    function: String,
+    arity: u8,
+    /// The `call_nif` operands, written once by `load_nif` before the body is enabled.
+    call: std::sync::OnceLock<crate::natives::nif::NativeFn>,
+}
+
+impl NativeNifSite {
+    pub(crate) fn new(module: String, function: String, arity: u8) -> Box<Self> {
+        Box::new(Self {
             module,
             function,
             arity,
-            entry: None,
-        },
-    );
-    identity
-}
+            call: std::sync::OnceLock::new(),
+        })
+    }
 
-/// Binds the NIF a reserved call-NIF body runs.
-pub(crate) fn bind_nif_slot(identity: usize, entry: arinsal_bifs::BifFn) -> bool {
-    static_nifs()
-        .lock()
-        .unwrap()
-        .get_mut(&identity)
-        .map(|nif| nif.entry = Some(entry))
-        .is_some()
-}
-
-/// Forgets the call-NIF bodies of a purged native module version.
-pub(crate) fn release_nif_slots(identities: impl IntoIterator<Item = usize>) {
-    let mut nifs = static_nifs().lock().unwrap();
-    for identity in identities {
-        nifs.remove(&identity);
+    /// Writes the operands; a site is bound once, like the code of one module instance.
+    pub(crate) fn bind(&self, native: crate::natives::nif::NativeFn) -> bool {
+        self.call.set(native).is_ok()
     }
 }
 
@@ -485,7 +484,7 @@ pub(crate) fn static_nif_job(
 ) -> Option<arinsal_sched::DirtyJob> {
     let (module, arity, entry) = static_nifs().lock().ok().and_then(|nifs| {
         let nif = nifs.get(&identity)?;
-        Some((nif.module.clone(), nif.arity, nif.entry?))
+        Some((nif.module.clone(), nif.arity, nif.entry))
     })?;
     // The job runs on this thread; NIF services find the process through these.
     crate::natives::nif::refresh_hub_native(process);
@@ -504,18 +503,22 @@ pub(crate) fn static_nif_job(
 }
 
 /// Runs a static NIF with the arguments in `process.x`, for a dirty NIF call the executor
-/// performs on a dirty scheduler, or takes the result of its dirty job.
+/// performs on a dirty scheduler, or takes the result of its dirty job. [`BOUND_NIF`]
+/// resumes the call of a NIF bound by `load_nif` that the process carries.
 pub(crate) fn run_static_nif(
     process: &mut crate::Process,
     identity: usize,
 ) -> Result<Term, crate::VmError> {
+    if identity == BOUND_NIF {
+        return run_bound_nif(process);
+    }
     let nif = static_nifs().lock().ok().and_then(|nifs| {
         let nif = nifs.get(&identity)?;
         Some((
             nif.module.clone(),
             nif.function.clone(),
             nif.arity,
-            nif.entry?,
+            nif.entry,
         ))
     });
     let Some((module, function, arity, entry)) = nif else {
@@ -553,46 +556,118 @@ pub(crate) fn run_static_nif(
     result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
 }
 
-/// Calls a static NIF body through the same BIF function used by NativeBody.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900, OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identity: u64) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
-        return 0;
+/// Resumes the dirty call or continuation of a NIF bound by `load_nif` that native code
+/// handed to the executor.
+// Port of erts/emulator/beam/erl_nif.c:426-520 (erts_call_dirty_nif), OTP-29.1.1.
+fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
+    let Some(pending) = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.nif_pending.take())
+    else {
+        return Err(crate::VmError::Trap(crate::exceptions::Trap::error(
+            crate::signals::atom("undef"),
+        )));
     };
-    let Some((nif, entry)) = static_nifs().lock().ok().and_then(|nifs| {
-        let nif = nifs.get(&(identity as usize))?;
-        Some((
-            StaticNif {
-                module: nif.module.clone(),
-                function: nif.function.clone(),
-                arity: nif.arity,
-                entry: nif.entry,
-            },
-            nif.entry?,
-        ))
-    }) else {
-        crate::native_hooks::set_error(process, "undef");
-        return 0;
+    let (module, function, arity) = {
+        let (module, function, arity) = pending.trace_mfa();
+        (module.to_owned(), function.to_owned(), usize::from(arity))
     };
+    crate::natives::nif::refresh_hub_native(process);
+    let args = process.x.get(..arity).unwrap_or_default().to_vec();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::natives::nif::resume_pending(&mut process.heap, &mut process.reductions, pending)
+    }))
+    .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))));
+    result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
+}
+
+/// Moves the arguments of a native call-NIF body into `process.x`.
+fn enter_native_nif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    arity: u8,
+) {
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
     process.reductions = process.header.fcalls;
     // The arguments live in the native X register array, not in `process.x`, when native code
     // reaches the NIF body directly (local or tail call).
-    if process.x.len() < usize::from(nif.arity) {
+    if process.x.len() < usize::from(arity) {
         let mut x = process.x.to_vec();
-        x.resize(usize::from(nif.arity), Term::NIL);
+        x.resize(usize::from(arity), Term::NIL);
         process.x = x.into();
     }
     for (destination, raw) in process
         .x
         .iter_mut()
         .zip(registers.x_reg_array.iter().copied())
-        .take(usize::from(nif.arity))
+        .take(usize::from(arity))
     {
         *destination = raw;
     }
+}
+
+/// Returns the result of a native call-NIF body to native code: the result term, a trap to
+/// the dirty scheduler executor or an exception.
+fn leave_native_nif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    result: std::thread::Result<Result<Term, arinsal_bifs::BifError>>,
+    (identity, module, function, arity): (usize, &str, &str, u8),
+) -> u64 {
+    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+    match result {
+        Ok(Ok(value)) => {
+            process.x[0] = value;
+            publish_dispatch_x(process, registers);
+            process.sync_native_header();
+            crate::native_hooks::raw(value)
+        }
+        Ok(Err(arinsal_bifs::BifError::Dirty(class))) => {
+            // Port of erts/emulator/beam/erl_nif.c:3460 (static_schedule_dirty_nif) and
+            // erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1: the call traps to a
+            // continuation the executor runs on a scheduler of `class`.
+            if let Some(pending) = crate::natives::nif::take_rescheduled() {
+                process.cold_mut().nif_pending = Some(pending);
+            }
+            trap_to_dirty_nif(process, identity, class)
+        }
+        Ok(Err(error)) => {
+            let args = process.x[..usize::from(arity)].to_vec();
+            set_native_bif_error(process, module, function, &args, error);
+            publish_dispatch_x(process, registers);
+            process.sync_native_header();
+            0
+        }
+        Err(_) => {
+            crate::native_hooks::set_error(process, "error");
+            process.sync_native_header();
+            0
+        }
+    }
+}
+
+/// Calls a static NIF body through the same BIF function used by NativeBody.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900, OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identity: u64) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
+        return 0;
+    };
+    let Some(nif) = static_nifs().lock().ok().and_then(|nifs| {
+        let nif = nifs.get(&(identity as usize))?;
+        Some(StaticNif {
+            module: nif.module.clone(),
+            function: nif.function.clone(),
+            arity: nif.arity,
+            entry: nif.entry,
+        })
+    }) else {
+        crate::native_hooks::set_error(process, "undef");
+        return 0;
+    };
+    enter_native_nif(process, registers, nif.arity);
     // Port of erts/emulator/beam/erl_nif.c (schedule_dirty_nif / erts_call_dirty_nif),
     // OTP-29.1.1: a dirty NIF called on a normal scheduler first moves the process to a
     // dirty scheduler; the executor runs it there and returns to this body's caller.
@@ -612,40 +687,49 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
         crate::calls::call_bif(
             &mut process.heap,
             &mut process.reductions,
-            entry,
+            nif.entry,
             &process.x[..usize::from(nif.arity)],
         )
     }));
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    match result {
-        Ok(Ok(value)) => {
-            process.x[0] = value;
-            publish_dispatch_x(process, registers);
-            process.sync_native_header();
-            crate::native_hooks::raw(value)
-        }
-        Ok(Err(arinsal_bifs::BifError::Dirty(class))) => {
-            // Port of erts/emulator/beam/erl_nif.c:3460 (static_schedule_dirty_nif) and
-            // erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1: the call traps to a
-            // continuation the executor runs on a scheduler of `class`.
-            if let Some(pending) = crate::natives::nif::take_rescheduled() {
-                process.cold_mut().nif_pending = Some(pending);
-            }
-            trap_to_dirty_nif(process, identity as usize, class)
-        }
-        Ok(Err(error)) => {
-            let args = process.x[..usize::from(nif.arity)].to_vec();
-            set_native_bif_error(process, &nif.module, &nif.function, &args, error);
-            publish_dispatch_x(process, registers);
-            process.sync_native_header();
-            0
-        }
-        Err(_) => {
-            crate::native_hooks::set_error(process, "error");
-            process.sync_native_header();
-            0
-        }
-    }
+    leave_native_nif(
+        process,
+        registers,
+        result,
+        (identity as usize, &nif.module, &nif.function, nif.arity),
+    )
+}
+
+/// Calls the NIF that `load_nif` bound to a native call-NIF body.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900 (call_nif_shared loads Func and
+// NifMod from the function's code) and erts/emulator/beam/jit/beam_jit_common.cpp:623-677
+// (beam_jit_call_nif), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
+        return 0;
+    };
+    // SAFETY: `site` is the address this call-NIF body was compiled with: a boxed
+    // `NativeNifSite` owned by the `CompiledVersion` whose code is executing, which keeps the
+    // box until it frees that code.
+    let site = unsafe { &*(site as usize as *const NativeNifSite) };
+    let Some(native) = site.call.get() else {
+        crate::native_hooks::set_error(process, "undef");
+        return 0;
+    };
+    enter_native_nif(process, registers, site.arity);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::natives::nif::call_native(
+            &mut process.heap,
+            &mut process.reductions,
+            native,
+            &process.x[..usize::from(site.arity)],
+        )
+    }));
+    leave_native_nif(
+        process,
+        registers,
+        result,
+        (BOUND_NIF, &site.module, &site.function, site.arity),
+    )
 }
 
 /// Whether static NIF `module:function/arity` is flagged `ERL_NIF_DIRTY_JOB_IO_BOUND` in its

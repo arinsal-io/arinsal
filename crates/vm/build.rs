@@ -14,13 +14,6 @@ fn main() {
         _ => {}
     }
     so_bindtodevice_cfg();
-    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let mut table = String::from("&[");
-    for index in 0..160 {
-        table.push_str(&format!("dyn_call::<{index}>,"));
-    }
-    table.push(']');
-    fs::write(out.join("nif_trampolines.rs"), table).expect("write trampoline table");
 }
 
 /// erts handles `bind_to_device` only `#ifdef SO_BINDTODEVICE` (inet_drv.c:7847, 9598,

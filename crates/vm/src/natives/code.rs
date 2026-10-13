@@ -467,9 +467,21 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                 }
                 info_list(process, functions)
             }
-            // Port of erts/emulator/beam/erl_bif_info.c:5772 (nifs_in_module), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_bif_info.c:5772-5805 (nifs_in_module), OTP-29.1.1.
             "nifs" => {
                 let mut nifs = Vec::new();
+                // `erts_nif_get_funcs(mod->curr.nif)`: the functions of the library entry.
+                if let Some(functions) =
+                    crate::natives::nif::instance_nif_functions(vm.code_scope, id)
+                {
+                    for (function, arity) in functions {
+                        nifs.push(make_tuple(
+                            process,
+                            &[atom(&function), Term::small(i64::from(arity)).unwrap()],
+                        )?);
+                    }
+                    return info_list(process, nifs);
+                }
                 // Natively backed stubs of modules that never ran load_nif are not NIFs in erts.
                 let loaded = vm.code.loaded_nifs.contains(module.name.as_str());
                 for (entry, function, arity) in module.functions.iter().rev() {

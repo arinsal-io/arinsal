@@ -318,12 +318,17 @@ def update_table(name: str, erl: dict[str, tuple[str, str]], arin: dict[str, tup
             if suite_failure:
                 detail = f"{detail}; suite-level: {suite_failure}"
         entries.append(f"| `{name}_SUITE` | {len(cases)} | {eok}/{len(cases)} | {aok}/{len(cases)} | {len(mismatch)} | {arin_rc} | {detail.replace('|', '&#124;')} |")
+    import fcntl
+    # Parallel suite runs update the same table; serialise the read-modify-write.
+    lock = open(str(results_path) + ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
     old = results_path.read_text(encoding="utf-8") if results_path.exists() else "# OTP 29.1.1 suite pilot results\n\n| Suite | Cases | erl pass | Arinsal pass | erl-pass/Arinsal-not | Arinsal exit | First failure line / notes |\n|---|---:|---:|---:|---:|---:|---|\n"
     lines = [line for line in old.splitlines() if not line.startswith(f"| `{name}_SUITE` |")]
     lines.extend(" ".join(entry.split()) for entry in entries)
     header = lines[:3]
     rows = sorted((line for line in lines[3:] if line.count("|") >= 2), key=lambda line: line.split("|", 2)[1].strip())
     results_path.write_text("\n".join(header + rows) + "\n", encoding="utf-8")
+    lock.close()
 
 
 def _acquire_global_slot() -> None:
