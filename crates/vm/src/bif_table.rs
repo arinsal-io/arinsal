@@ -43,13 +43,14 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
 
 /// The light entry of a trapping BIF with its own body, compiled when the export is created.
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
-    use crate::bif_traps::{MapsFromList, MapsKeys, MapsMerge, MapsValues};
+    use crate::bif_traps::{ListsReverse, MapsFromList, MapsKeys, MapsMerge, MapsValues};
     use crate::native_helpers::trap_bif_entry;
     let func = match (module, function, arity) {
         ("maps", "keys", 1) => trap_bif_entry::<MapsKeys> as *const () as usize,
         ("maps", "values", 1) => trap_bif_entry::<MapsValues> as *const () as usize,
         ("maps", "merge", 2) => trap_bif_entry::<MapsMerge> as *const () as usize,
         ("maps", "from_list", 1) => trap_bif_entry::<MapsFromList> as *const () as usize,
+        ("lists", "reverse", 2) => trap_bif_entry::<ListsReverse> as *const () as usize,
         _ => return None,
     };
     Some(func)
