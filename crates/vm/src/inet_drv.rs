@@ -19,7 +19,7 @@ use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // Port of inet_drv.c ERTS_INET_DRV_CONTROL_MAGIC_NUMBER, OTP-29.1.1.
@@ -199,25 +199,45 @@ fn registry() -> &'static Mutex<HashMap<u64, Arc<Sock>>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn wake_writer() -> &'static OwnedFd {
-    static WAKE: OnceLock<OwnedFd> = OnceLock::new();
-    WAKE.get_or_init(|| {
-        let (read, write) = pipe().expect("inet wake pipe");
+/// Port tasks waiting for the inet thread, which runs them for every `tcp_inet`
+/// port: readiness from the poll set (`ready_input`/`ready_output`) and pokes
+/// from control and command calls on a port.
+///
+/// Port of the I/O port task queue of erts/emulator/beam/erl_port_task.c and the
+/// `iready`/`oready` scheduling of erts/emulator/sys/common/erl_check_io.c:1874-1908,
+/// OTP-29.1.1.
+#[derive(Default)]
+struct Tasks {
+    ready: Vec<(u64, RawFd, crate::check_io::Ready)>,
+    poked: Vec<u64>,
+}
+
+fn tasks() -> &'static (Mutex<Tasks>, Condvar) {
+    static TASKS: OnceLock<(Mutex<Tasks>, Condvar)> = OnceLock::new();
+    TASKS.get_or_init(|| {
         std::thread::Builder::new()
             .name("arinsal-inet".into())
-            .spawn(move || io_loop(read))
+            .spawn(io_loop)
             .expect("inet thread");
-        write
+        (Mutex::new(Tasks::default()), Condvar::new())
     })
 }
 
-fn poke() {
-    let fd = wake_writer().as_raw_fd();
-    let byte = [1u8];
-    // SAFETY: wake_writer owns the write end for the process lifetime.
-    unsafe {
-        libc::write(fd, byte.as_ptr().cast(), 1);
+/// Ask the inet thread to run port `id` (and recompute its selection).
+fn poke(id: u64) {
+    let (lock, wake) = tasks();
+    let mut tasks = lock.lock().unwrap();
+    if !tasks.poked.contains(&id) {
+        tasks.poked.push(id);
     }
+    wake.notify_one();
+}
+
+/// `iready`/`oready`: schedule the port's I/O task on the inet thread.
+fn schedule_ready(id: u64, fd: RawFd, ready: crate::check_io::Ready) {
+    let (lock, wake) = tasks();
+    lock.lock().unwrap().ready.push((id, fd, ready));
+    wake.notify_one();
 }
 
 // g_inet_udp
@@ -284,11 +304,11 @@ pub(crate) fn set_nosigpipe(fd: RawFd) {
 
 /// Register a `tcp_inet` port created by `open_port({spawn_driver, …})`.
 pub(crate) fn attach(runtime: Arc<Runtime>, id: u64, handle: Arc<PortHandle>) {
-    let _ = wake_writer();
+    let _ = tasks();
     pin_scheduler(handle.scheduler());
     let sock = Arc::new(Sock::new(id, runtime, handle));
     registry().lock().unwrap().insert(id, sock);
-    poke();
+    poke(id);
 }
 
 /// True when `id` is a live TCP inet socket owned by this driver.
@@ -333,7 +353,7 @@ pub(crate) fn detach(id: u64) {
             },
         );
     }
-    poke();
+    poke(id);
 }
 
 pub(crate) fn control(
@@ -349,19 +369,20 @@ pub(crate) fn control(
     // Port of inet_drv.c:11956 (tcp_inet_ctl subtracts the magic), OTP-29.1.1.
     let cmd = op.wrapping_sub(MAGIC);
     let reply = dispatch(&sock, caller, cmd, data);
-    poke();
+    poke(id);
     byte_list(process, &reply)
 }
 
-pub(crate) fn command(id: u64, caller: Pid, data: &[u8]) -> Result<(), VmError> {
+pub(crate) fn command(id: u64, caller: Pid, data: Vec<u8>) -> Result<(), VmError> {
     let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
         return Err(badarg());
     };
     // Port of inet_drv.c:13736 (tcp_sendv) and :12629 (tcp_inet_command), OTP-29.1.1.
-    let (ids, payload) = split_caller(data).ok_or_else(badarg)?;
+    let (ids, payload) = split_caller(&data).ok_or_else(badarg)?;
+    let start = data.len() - payload.len();
     let outcome = {
         let mut inner = sock.inner.lock().unwrap();
-        accept_send(&mut inner, caller, ids, payload)
+        accept_send(&mut inner, caller, ids, SendData::Owned(data, start))
     };
     match outcome {
         SendOutcome::Reply(error) => emit(&sock, Out::InetReply { caller, ids, error }),
@@ -394,7 +415,7 @@ pub(crate) fn command(id: u64, caller: Pid, data: &[u8]) -> Result<(), VmError> 
         }
     }
     emit_ready(&sock);
-    poke();
+    poke(id);
     Ok(())
 }
 
@@ -409,7 +430,12 @@ pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<bool, VmError> {
     let outcome = {
         let mut inner = sock.inner.lock().unwrap();
         // Dummy caller/ids: dist never waits on inet_reply for these writes.
-        accept_send(&mut inner, Pid::new(0, 0), [0, 0, 0], data)
+        accept_send(
+            &mut inner,
+            Pid::new(0, 0),
+            [0, 0, 0],
+            SendData::Borrowed(data),
+        )
     };
     match outcome {
         SendOutcome::Reply(_) | SendOutcome::Deferred => {}
@@ -433,7 +459,7 @@ pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<bool, VmError> {
         }
     }
     emit_ready(&sock);
-    poke();
+    poke(id);
     Ok(sock.inner.lock().unwrap().busy)
 }
 
@@ -443,73 +469,131 @@ enum SendOutcome {
     Failed { error: &'static str, active: bool },
 }
 
-fn accept_send(inner: &mut Inner, caller: Pid, ids: [u32; 3], payload: &[u8]) -> SendOutcome {
-    // Port of inet_drv.c:13736 (tcp_sendv), OTP-29.1.1.
+/// Bytes handed to `tcp_sendv`: the port command keeps its flattened buffer (the
+/// payload starts at the offset), distribution borrows its packet.
+enum SendData<'a> {
+    Owned(Vec<u8>, usize),
+    Borrowed(&'a [u8]),
+}
+
+impl SendData<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            SendData::Owned(buf, start) => &buf[*start..],
+            SendData::Borrowed(bytes) => bytes,
+        }
+    }
+
+    /// Queue the payload from `skip` on. An owned buffer moves into the queue.
+    fn enqueue(self, q: &mut IoQueue, skip: usize) {
+        match self {
+            SendData::Owned(buf, start) => q.enq_owned(buf, start + skip),
+            SendData::Borrowed(bytes) => q.enq(&bytes[skip..]),
+        }
+    }
+}
+
+fn accept_send(
+    inner: &mut Inner,
+    caller: Pid,
+    ids: [u32; 3],
+    payload: SendData<'_>,
+) -> SendOutcome {
+    // Port of erts/emulator/drivers/common/inet_drv.c:13736-13847 (tcp_sendv), OTP-29.1.1.
     if inner.peer_closed {
         return SendOutcome::Reply(Some(close_atom(inner)));
     }
     if inner.phase != Phase::Connected {
         return SendOutcome::Reply(Some("enotconn"));
     }
-    // Header widths are 1, 2 and 4; htype 3 is TCP_PB_4 (inet_drv.c:13745).
-    let hlen = match inner.htype {
-        1 => 1,
-        2 => 2,
-        3 => 4,
+    let len = payload.bytes().len();
+    // inet_drv.c:13745-13761: TCP_PB_1/2/4 headers; htype 3 is TCP_PB_4.
+    let mut hdr = [0u8; 4];
+    let h_len = match inner.htype {
+        1 => {
+            hdr[0] = len as u8;
+            1
+        }
+        2 => {
+            hdr[..2].copy_from_slice(&(len as u16).to_be_bytes());
+            2
+        }
+        3 => {
+            hdr.copy_from_slice(&(len as u32).to_be_bytes());
+            4
+        }
         _ => 0,
     };
-    let frame = framed(inner.htype, payload);
-    output_count(inner, frame.len());
-    let before = inner.sendq.len();
-    // Port of erts/emulator/drivers/common/inet_drv.c:13773 and :13883, OTP-29.1.1: while a
-    // sendfile is in progress (TCP_ADDF_SENDFILE) every send is queued behind the file.
-    let direct = before == 0 && inner.sendfile.is_none();
-    if direct && hlen == 0 && payload.is_empty() {
+    output_count(inner, len + h_len);
+    let sz = inner.sendq.size();
+    if inner.sendfile.is_some() || sz > 0 {
+        // Port of inet_drv.c:13773-13793, OTP-29.1.1: queue behind pending output, and
+        // behind the file while a sendfile (TCP_ADDF_SENDFILE) is in progress; busy at `high`.
+        inner.sendq.enq(&hdr[..h_len]);
+        payload.enqueue(&mut inner.sendq, 0);
+        if sz + len + h_len >= inner.high.max(0) as usize {
+            if inner.send_timeout == 0 {
+                return SendOutcome::Reply(Some("timeout"));
+            }
+            inner.busy = true;
+            let deadline = if inner.send_timeout < 0 {
+                None
+            } else {
+                Some(Instant::now() + Duration::from_millis(inner.send_timeout as u64))
+            };
+            inner.send_waits.push(SendWait {
+                caller,
+                ids,
+                deadline,
+            });
+            return SendOutcome::Deferred;
+        }
         return SendOutcome::Reply(None);
     }
-    if direct && inner.delay_send {
-        inner.sendq.extend(frame);
+    if h_len == 0 && len == 0 {
         return SendOutcome::Reply(None);
     }
-    if direct {
-        inner.sendq.extend(frame);
-        if let Some(err) = flush_send(inner) {
+    if inner.delay_send {
+        // inet_drv.c:13810-13814: queue; output runs on the next write event.
+        inner.sendq.enq(&hdr[..h_len]);
+        payload.enqueue(&mut inner.sendq, 0);
+        return SendOutcome::Reply(None);
+    }
+    let Some(fd) = inner.fd.as_ref().map(AsRawFd::as_raw_fd) else {
+        return SendOutcome::Reply(Some("enotconn"));
+    };
+    // inet_drv.c:13815-13844: one sock_sendv of header and payload, then queue
+    // whatever was not written (driver_enqv with skip = bytes sent).
+    let iov = [
+        libc::iovec {
+            iov_base: hdr.as_ptr() as *mut libc::c_void,
+            iov_len: h_len,
+        },
+        libc::iovec {
+            iov_base: payload.bytes().as_ptr() as *mut libc::c_void,
+            iov_len: len,
+        },
+    ];
+    let n = sock_sendv(fd, &iov);
+    let n = if n < 0 {
+        let err = last_errno();
+        if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
             return send_failed(inner, err);
         }
+        0
+    } else {
+        n as usize
+    };
+    if n == len + h_len {
         return SendOutcome::Reply(None);
     }
-    inner.sendq.extend(frame);
-    let queued = before + payload.len() + hlen;
-    if queued >= inner.high.max(0) as usize {
-        if inner.send_timeout == 0 {
-            return SendOutcome::Reply(Some("timeout"));
-        }
-        inner.busy = true;
-        let deadline = if inner.send_timeout < 0 {
-            None
-        } else {
-            Some(Instant::now() + Duration::from_millis(inner.send_timeout as u64))
-        };
-        inner.send_waits.push(SendWait {
-            caller,
-            ids,
-            deadline,
-        });
-        return SendOutcome::Deferred;
+    if n < h_len {
+        inner.sendq.enq(&hdr[n..h_len]);
+        payload.enqueue(&mut inner.sendq, 0);
+    } else {
+        payload.enqueue(&mut inner.sendq, n - h_len);
     }
     SendOutcome::Reply(None)
-}
-
-fn framed(htype: i32, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(payload.len() + 4);
-    match htype {
-        1 => buf.push(payload.len() as u8),
-        2 => buf.extend_from_slice(&(payload.len() as u16).to_be_bytes()),
-        3 => buf.extend_from_slice(&(payload.len() as u32).to_be_bytes()),
-        _ => {}
-    }
-    buf.extend_from_slice(payload);
-    buf
 }
 
 fn send_failed(inner: &mut Inner, err: i32) -> SendOutcome {
@@ -670,7 +754,7 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     set_nonblock(fd);
     set_nosigpipe(fd);
     // SAFETY: fd was just created and is moved into OwnedFd.
-    inner.fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+    inner.fd = Some(SockFd::new(unsafe { OwnedFd::from_raw_fd(fd) }, inner.port));
     inner.domain = domain;
     inner.family_code = data[0];
     inner.phase = Phase::Open;
@@ -783,9 +867,8 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
                 deadline: deadline(timeout),
             });
             inner.pending.push((caller, aref));
-            // The inet thread may be blocked in a wait that does not include
-            // this fd yet. Wake it so the next poll set selects FD_CONNECT.
-            poke();
+            // Wake the inet thread so it selects FD_CONNECT for this fd.
+            poke(sock.id);
         }
         return ok_bytes(&aref.to_be_bytes());
     }
@@ -889,7 +972,8 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
     let born = {
         let inner = listen.inner.lock().unwrap();
         Inner {
-            fd: Some(fd),
+            fd: Some(SockFd::new(fd, id)),
+            port: id,
             domain: inner.domain,
             family_code: inner.family_code,
             phase: Phase::Connected,
@@ -929,7 +1013,7 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
             port: id,
         },
     );
-    poke();
+    poke(id);
 }
 
 fn sockname(inner: &Inner) -> Vec<u8> {
@@ -1417,7 +1501,7 @@ fn getstat(inner: &Inner, data: &[u8]) -> Vec<u8> {
             5 => put_u32(&mut out, inner.send_cnt),
             6 => put_u32(&mut out, inner.send_max as u32),
             7 => put_u32(&mut out, trunc_stat(inner.send_avg)),
-            8 => put_u32(&mut out, inner.sendq.len() as u32),
+            8 => put_u32(&mut out, inner.sendq.size() as u32),
             9 => put_u64(&mut out, inner.recv_oct),
             10 => put_u64(&mut out, inner.send_oct),
             _ => return err_bytes("einval"),
@@ -1476,7 +1560,7 @@ fn subscribe(inner: &Inner, data: &[u8]) -> Vec<u8> {
             return err_bytes("einval");
         }
         out.push(1);
-        put_u32(&mut out, inner.sendq.len() as u32);
+        put_u32(&mut out, inner.sendq.size() as u32);
     }
     ok_bytes(&out)
 }
@@ -1946,6 +2030,11 @@ fn input_count(inner: &mut Inner, len: usize) {
     inner.recv_cnt = n;
 }
 
+/// Send queued output until the queue is empty or the socket would block.
+///
+/// Port of erts/emulator/drivers/common/inet_drv.c:14295-14361 (`tcp_inet_output`
+/// send loop), OTP-29.1.1: `driver_peekq`, one `sock_sendv` of at most `MAX_VSIZE`
+/// entries, then `driver_deq` of the bytes written. Queued bytes are not copied.
 fn flush_send(inner: &mut Inner) -> Option<i32> {
     // Port of erts/emulator/drivers/common/inet_drv.c:14291-14295, OTP-29.1.1: with
     // TCP_ADDF_SENDFILE set, output goes through tcp_inet_sendfile, which sends only the
@@ -1956,11 +2045,9 @@ fn flush_send(inner: &mut Inner) -> Option<i32> {
     let fd = inner.fd.as_ref()?;
     let fd = fd.as_raw_fd();
     while !inner.sendq.is_empty() {
-        let buf: Vec<u8> = inner.sendq.iter().copied().collect();
-        // SAFETY: fd is the connected socket this driver owns.
-        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        let n = sock_sendv(fd, &inner.sendq.peekq(max_vsize()));
         if n > 0 {
-            inner.sendq.drain(..n as usize);
+            inner.sendq.deq(n as usize);
         } else if n < 0 {
             let err = last_errno();
             if err == libc::EAGAIN || err == libc::EWOULDBLOCK || err == libc::EINTR {
@@ -1976,8 +2063,109 @@ fn flush_send(inner: &mut Inner) -> Option<i32> {
     None
 }
 
+/// `sock_sendv`: one `writev` of `iov`. Port of erts/emulator/drivers/common/inet_drv.c:649-650, OTP-29.1.1.
+///
+/// Every `iovec` must point into memory that stays alive and unmodified for the call.
+fn sock_sendv(fd: RawFd, iov: &[libc::iovec]) -> isize {
+    // SAFETY: fd is a socket this driver owns; the callers build `iov` from borrowed
+    // slices (the send header and payload, or segments held by `sendq`) that outlive
+    // this call and are only read by `writev`.
+    unsafe { libc::writev(fd, iov.as_ptr(), iov.len() as libc::c_int) }
+}
+
+/// `MAX_VSIZE`: the most entries one `sock_sendv` passes.
+///
+/// Port of erts/emulator/drivers/common/inet_drv.c:1319-1321 and :4532-4537
+/// (`iov_max = sysconf(_SC_IOV_MAX)`, POSIX minimum 16), OTP-29.1.1.
+fn max_vsize() -> usize {
+    static IOV_MAX: OnceLock<usize> = OnceLock::new();
+    *IOV_MAX.get_or_init(|| {
+        // SAFETY: sysconf only reads a system limit.
+        let n = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+        if n > 0 { n as usize } else { 16 }
+    })
+}
+
+/// Driver output queue: segments written with `writev` and released as sent.
+///
+/// Port of erts/emulator/beam/erl_io_queue.c:233-284 (`erts_ioq_enqv`), :349-379
+/// (`erts_ioq_deq`) and :400-410 (`erts_ioq_peekq`), OTP-29.1.1. A queued buffer
+/// is never copied again: `deq` drops whole segments and advances into the first.
+#[derive(Default)]
+struct IoQueue {
+    segs: VecDeque<(Vec<u8>, usize)>,
+    size: usize,
+}
+
+impl IoQueue {
+    /// `driver_sizeq`.
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// `driver_enq`: copy `bytes` into a new segment; zero-length items are dropped.
+    fn enq(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.size += bytes.len();
+            self.segs.push_back((bytes.to_vec(), 0));
+        }
+    }
+
+    /// `driver_enqv` with a skip: queue `buf[start..]` without copying it.
+    fn enq_owned(&mut self, buf: Vec<u8>, start: usize) {
+        if start < buf.len() {
+            self.size += buf.len() - start;
+            self.segs.push_back((buf, start));
+        }
+    }
+
+    /// First entry of `driver_peekq` (`iov[0]`): the unsent bytes of the head segment.
+    fn head(&self) -> Option<&[u8]> {
+        self.segs.front().map(|(buf, start)| &buf[*start..])
+    }
+
+    /// `driver_peekq`, limited to `max` entries.
+    fn peekq(&self, max: usize) -> Vec<libc::iovec> {
+        self.segs
+            .iter()
+            .take(max)
+            .map(|(buf, start)| libc::iovec {
+                iov_base: buf[*start..].as_ptr() as *mut libc::c_void,
+                iov_len: buf.len() - start,
+            })
+            .collect()
+    }
+
+    /// `driver_deq`: drop `n` bytes from the head.
+    fn deq(&mut self, mut n: usize) {
+        self.size -= n.min(self.size);
+        while n > 0 {
+            let Some((buf, start)) = self.segs.front_mut() else {
+                break;
+            };
+            let len = buf.len() - *start;
+            if len <= n {
+                n -= len;
+                self.segs.pop_front();
+            } else {
+                *start += n;
+                n = 0;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.segs.clear();
+        self.size = 0;
+    }
+}
+
 fn release_unbusy(inner: &mut Inner) {
-    if inner.busy && inner.sendq.len() <= inner.low.max(0) as usize {
+    if inner.busy && inner.sendq.size() <= inner.low.max(0) as usize {
         inner.busy = false;
         inner.ready.append(&mut inner.send_waits);
     }
@@ -2047,7 +2235,7 @@ fn sendfile_req(inner: &mut Inner, data: &[u8], end: &mut Option<SendfileEnd>) -
     let offset = u64::from_be_bytes(data[4..12].try_into().unwrap());
     let length = u64::from_be_bytes(data[12..20].try_into().unwrap());
     inner.sendfile = Some(Sendfile {
-        ioq_skip: inner.sendq.len(),
+        ioq_skip: inner.sendq.size(),
         dup_file_fd,
         bytes_sent: 0,
         offset,
@@ -2082,15 +2270,20 @@ fn tcp_inet_sendfile(inner: &mut Inner) -> Option<SendfileEnd> {
         // If there was any data in the queue by the time sendfile was issued, it goes
         // first. Busy status is not cleared until the file is sent.
         while sf.ioq_skip > 0 {
-            let head = inner.sendq.as_slices().0;
-            assert!(!head.is_empty(), "ioq empty when sendfile.ioq_skip > 0");
+            assert!(
+                inner.sendq.size() >= sf.ioq_skip,
+                "ioq smaller than sendfile.ioq_skip"
+            );
+            let Some(head) = inner.sendq.head() else {
+                panic!("ioq empty when sendfile.ioq_skip > 0");
+            };
             let bytes_to_send = sf.ioq_skip.min(head.len());
             // SAFETY: s is the connected socket this driver owns and head holds at
             // least bytes_to_send initialized bytes.
             let n = unsafe { libc::send(s, head.as_ptr().cast(), bytes_to_send, 0) };
             if n >= 0 {
                 sf.ioq_skip -= n as usize;
-                inner.sendq.drain(..n as usize);
+                inner.sendq.deq(n as usize);
             } else {
                 let err = last_errno();
                 if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
@@ -2281,8 +2474,50 @@ impl Sock {
             id,
             runtime,
             handle,
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                port: id,
+                ..Inner::default()
+            }),
             io: Mutex::new(()),
+        }
+    }
+}
+
+/// The socket of a `tcp_inet` port with its poll-set selection.
+///
+/// Dropping it deselects the descriptor before closing it, as `tcp_desc_close`
+/// does with `sock_select(desc, FD_READ|FD_WRITE|FD_CLOSE|ERL_DRV_USE_NO_CALLBACK, 0)`
+/// (erts/emulator/drivers/common/inet_drv.c:11473), OTP-29.1.1.
+struct SockFd {
+    fd: OwnedFd,
+    port: u64,
+    /// Events selected in the shared poll set (`state->events` in erl_check_io.c).
+    selected: crate::check_io::InterestSet,
+}
+
+impl SockFd {
+    fn new(fd: OwnedFd, port: u64) -> Self {
+        Self {
+            fd,
+            port,
+            selected: crate::check_io::InterestSet {
+                readable: false,
+                writable: false,
+            },
+        }
+    }
+}
+
+impl AsRawFd for SockFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl Drop for SockFd {
+    fn drop(&mut self) {
+        if self.selected.readable || self.selected.writable {
+            crate::check_io::driver_deselect(self.fd.as_raw_fd(), self.port);
         }
     }
 }
@@ -2325,7 +2560,9 @@ struct SendWait {
 }
 
 struct Inner {
-    fd: Option<OwnedFd>,
+    fd: Option<SockFd>,
+    /// Port id: the owner of this socket's poll-set selection.
+    port: u64,
     domain: i32,
     family_code: u8,
     phase: Phase,
@@ -2369,7 +2606,7 @@ struct Inner {
     backlog: i32,
     op_ref: u16,
     rbuf: Vec<u8>,
-    sendq: VecDeque<u8>,
+    sendq: IoQueue,
     /// `Some` while TCP_ADDF_SENDFILE is set.
     sendfile: Option<Sendfile>,
     recv: Option<Recv>,
@@ -2401,6 +2638,7 @@ impl Default for Inner {
     fn default() -> Self {
         Self {
             fd: None,
+            port: 0,
             domain: libc::AF_INET,
             family_code: AF_INET_CODE,
             phase: Phase::Closed,
@@ -2442,7 +2680,7 @@ impl Default for Inner {
             backlog: 5,
             op_ref: 0,
             rbuf: Vec::new(),
-            sendq: VecDeque::new(),
+            sendq: IoQueue::default(),
             sendfile: None,
             recv: None,
             accept_q: VecDeque::new(),
@@ -3312,8 +3550,9 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
 /// (`release_unbusy`; the deferred `inet_reply` goes out through `emit_ready`).
 /// The output callback runs whether or not the owner has a receive pending, so a
 /// passive socket whose owner is blocked in `gen_tcp:send/2` still drains. The
-/// write selection follows the queue: `io_loop` selects for write only while
-/// `sendq` is non-empty (inet_drv.c:14302-14303 deselects when it is empty).
+/// write selection follows the queue: `sock_select` selects for write only while
+/// `sendq` is non-empty or a sendfile is unfinished (inet_drv.c:14302-14303 deselects
+/// when the queue is empty).
 fn tcp_inet_output(sock: &Arc<Sock>) {
     let failure = {
         let mut inner = sock.inner.lock().unwrap();
@@ -3843,72 +4082,94 @@ fn poll_connect(inner: &mut Inner) -> Option<Out> {
     })
 }
 
-fn io_loop(wake_r: OwnedFd) {
-    // Port of inet_drv.c driver_select registrations through erl_check_io.c:988, OTP-29.1.1.
-    let wake = wake_r.as_raw_fd();
+/// The inet thread: run the I/O tasks of `tcp_inet` ports and their timers.
+///
+/// Port of the port-task side of erts/emulator/sys/common/erl_check_io.c, OTP-29.1.1:
+/// the poll set holds a persistent selection per socket (`driver_select`), a
+/// readiness event schedules that port's task (`iready`/`oready`), the task runs
+/// (`tcp_inet_input`/`tcp_inet_output` through `try_io`), and then the fired events
+/// are re-armed (`erts_io_notify_port_task_executed`, :546-640). Only ports with an
+/// event or a poke are touched; idle sockets cost nothing per event.
+fn io_loop() {
+    let (lock, wake) = tasks();
     loop {
-        let socks: Vec<Arc<Sock>> = registry().lock().unwrap().values().cloned().collect();
-        let mut fds = vec![(
-            wake,
-            crate::check_io::InterestSet {
-                readable: true,
-                writable: false,
-            },
-        )];
-        for sock in &socks {
-            try_io(sock, false);
-        }
-        for sock in &socks {
-            let inner = sock.inner.lock().unwrap();
-            let Some(fd) = inner.fd.as_ref().map(AsRawFd::as_raw_fd) else {
-                continue;
-            };
-            let readable = match inner.phase {
-                Phase::Listening => !inner.accept_q.is_empty(),
-                Phase::Connected => {
-                    !inner.peer_closed && (active_is(&inner.active) || inner.recv.is_some())
-                }
-                _ => false,
-            };
-            // Port of erts/emulator/drivers/common/inet_drv.c:12436-12440, OTP-29.1.1: an
-            // unfinished sendfile keeps FD_WRITE selected.
-            let writable = inner.phase == Phase::Connecting
-                || !inner.sendq.is_empty()
-                || (inner.phase == Phase::Connected && inner.sendfile.is_some());
-            if readable || writable {
-                fds.push((fd, crate::check_io::InterestSet { readable, writable }));
-            }
-        }
+        // Ports take the task lock (`poke`) while holding their own lock, so the
+        // timers are read before it is taken.
         let timeout = next_timeout()
             .map(|timeout| Duration::new(timeout.tv_sec as u64, timeout.tv_nsec as u32));
-        match crate::check_io::wait_any_timeout_wake(&fds, timeout, wake) {
-            Ok(Some((fd, _))) if fd == wake => drain(wake),
-            Ok(Some((fd, ready))) => {
-                if let Some(sock) = socks.iter().find(|sock| {
-                    sock.inner
-                        .lock()
-                        .unwrap()
-                        .fd
-                        .as_ref()
-                        .is_some_and(|socket| socket.as_raw_fd() == fd)
-                }) {
-                    try_io(sock, ready.writable || ready.error || ready.closed);
-                }
+        let (ready, poked) = {
+            let mut tasks = lock.lock().unwrap();
+            if tasks.ready.is_empty() && tasks.poked.is_empty() {
+                tasks = match timeout {
+                    Some(timeout) => wake.wait_timeout(tasks, timeout).unwrap().0,
+                    None => wake.wait(tasks).unwrap(),
+                };
             }
-            Ok(None) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => continue,
+            (
+                std::mem::take(&mut tasks.ready),
+                std::mem::take(&mut tasks.poked),
+            )
+        };
+        for (id, fd, event) in ready {
+            let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
+                continue;
+            };
+            try_io(&sock, event.writable || event.error || event.closed);
+            sock_select(&sock);
+            crate::check_io::notify_executed(
+                fd,
+                id,
+                crate::check_io::InterestSet {
+                    readable: true,
+                    writable: true,
+                },
+            );
         }
-        // Read before timers: an RST already pending on the socket is
-        // `econnreset` from recv, not the receive deadline (inet_drv.c
-        // tcp_inet_input runs from erts_check_io before timer expiry).
-        // A connect still in progress stays selected for write and finishes
-        // in `poll_connect` when this wait, or the next one, reports it.
-        for sock in &socks {
-            try_io(sock, false);
+        for id in poked {
+            let sock = registry().lock().unwrap().get(&id).cloned();
+            if let Some(sock) = sock {
+                try_io(&sock, false);
+                sock_select(&sock);
+            }
         }
-        fire_timeouts();
+        for sock in fire_timeouts() {
+            sock_select(&sock);
+        }
+    }
+}
+
+/// Bring the poll-set selection of `sock` in line with its state.
+///
+/// Port of the `sock_select` calls of erts/emulator/drivers/common/inet_drv.c,
+/// OTP-29.1.1: FD_ACCEPT while an accept waits (:12224, :12584), FD_CONNECT while
+/// connecting (:12109, :14243), FD_READ while active or a receive is pending
+/// (:12126, :12317, :13110), FD_WRITE while the output queue is non-empty
+/// (:13844, :14303).
+fn sock_select(sock: &Arc<Sock>) {
+    let mut inner = sock.inner.lock().unwrap();
+    let readable = match inner.phase {
+        Phase::Listening => !inner.accept_q.is_empty(),
+        Phase::Connected => {
+            !inner.peer_closed && (active_is(&inner.active) || inner.recv.is_some())
+        }
+        _ => false,
+    };
+    let writable = inner.phase == Phase::Connecting
+        || !inner.sendq.is_empty()
+        || (inner.phase == Phase::Connected && inner.sendfile.is_some());
+    let id = sock.id;
+    let Some(fd) = inner.fd.as_mut() else {
+        return;
+    };
+    let want = crate::check_io::InterestSet { readable, writable };
+    if want.readable == fd.selected.readable && want.writable == fd.selected.writable {
+        return;
+    }
+    let raw = fd.as_raw_fd();
+    let ready: crate::check_io::SelectCallback =
+        Arc::new(move |fd, event| schedule_ready(id, fd, event));
+    if crate::check_io::driver_select(raw, id, want, ready).is_ok() {
+        fd.selected = want;
     }
 }
 
@@ -3941,9 +4202,11 @@ fn next_timeout() -> Option<libc::timespec> {
     })
 }
 
-fn fire_timeouts() {
+/// Expire receive, accept, connect and send timers; returns the ports it changed.
+fn fire_timeouts() -> Vec<Arc<Sock>> {
     let socks: Vec<Arc<Sock>> = registry().lock().unwrap().values().cloned().collect();
     let now = Instant::now();
+    let mut fired = Vec::new();
     for sock in socks {
         let (due, sends, close) = {
             let mut inner = sock.inner.lock().unwrap();
@@ -4002,6 +4265,7 @@ fn fire_timeouts() {
             };
             (due, sends, close)
         };
+        let changed = !due.is_empty() || !sends.is_empty();
         for (caller, aref) in due {
             emit(
                 &sock,
@@ -4030,16 +4294,9 @@ fn fire_timeouts() {
                 crate::port::abandon_port(&sock.runtime, sock.id);
             }
         }
-    }
-}
-
-fn drain(fd: RawFd) {
-    let mut buf = [0u8; 64];
-    loop {
-        // SAFETY: fd is the wake pipe read end owned by the I/O thread.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            break;
+        if changed {
+            fired.push(sock);
         }
     }
+    fired
 }
