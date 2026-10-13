@@ -380,9 +380,10 @@ pub struct Module {
     pub functions: Vec<(usize, String, u8)>,
     /// Function atoms parallel to `functions`.
     pub function_atoms: Vec<Atom>,
-    /// Functions whose code starts with `nif_start`: the stubs `erlang:load_nif/2` may bind
-    /// (erts `ERTS_NIF_START`, beam_load.c).
-    pub nif_stubs: Vec<(String, u8)>,
+    /// Functions whose code starts with `nif_start`: the stubs `erlang:load_nif/2` may bind.
+    /// `None` when the module has no `nif_start` at all, in which case any function may.
+    // Port of erts `BeamCodeHeader.are_nifs` (erts/emulator/beam/beam_code.h:127), OTP-29.1.1.
+    pub nif_stubs: Option<Vec<(String, u8)>>,
     /// Owning function for `JitHook::on_entry`, or `u32::MAX` when none applies.
     ///
     /// Slot `ip` holds the last function whose `func_info` offset is strictly
@@ -1139,7 +1140,7 @@ pub fn load_with_instrumentations(
     let mut unsupported = HashMap::new();
     let mut unsupported_reasons = Vec::new();
     let mut functions: Vec<(usize, String, u8)> = Vec::new();
-    let mut nif_stubs: Vec<(String, u8)> = Vec::new();
+    let mut nif_stubs: Option<Vec<(String, u8)>> = None;
     let mut function_atoms = Vec::new();
     let mut debug_line_points = Vec::new();
     let mut debug_line_items = Vec::new();
@@ -1180,9 +1181,11 @@ pub fn load_with_instrumentations(
             continue;
         }
         // nif_start only marks a NIF stub's entry; it executes nothing.
+        // Port of erts/emulator/beam/jit/asm_load.c:651-661, OTP-29.1.1.
         if instruction.op == Opcode::NifStart {
+            let stubs = nif_stubs.get_or_insert_with(Vec::new);
             if let Some((_, name, arity)) = functions.last() {
-                nif_stubs.push((name.clone(), *arity));
+                stubs.push((name.clone(), *arity));
             }
             continue;
         }
