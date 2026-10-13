@@ -3480,7 +3480,7 @@ fn collect_on_schedule_in(process: &mut Process) -> Result<(), VmError> {
     process.collect_bin_vheap_if_due(switched_out_live(process))
 }
 
-fn switched_out_live(process: &Process) -> usize {
+pub(crate) fn switched_out_live(process: &Process) -> usize {
     let native_live = if process.native_pc.is_some() {
         process
             .cold
@@ -6084,6 +6084,7 @@ impl Process {
                     && cold.nif_pending.is_none()
                     && cold.call_memory.is_empty()
             })
+            && self.dirty_result_roots().is_empty()
             && self.max_heap_peak == 0
             && !self.max_heap_limited()
             && self
@@ -6139,6 +6140,10 @@ impl Process {
                 roots.extend_from_slice(pending.roots_mut());
             }
         }
+        // A finished dirty job's result is in erts' argument registers until the call resumes.
+        let dirty_start = roots.len();
+        roots.extend(self.dirty_result_roots());
+        let dirty_end = roots.len();
         // Port of erts/emulator/beam/erl_gc.c:2616 (setup_rootset walks the message queue and
         // the middle signal queue, ERTS_FOREACH_SIG_PRIVQS), OTP-29.1.1: on-heap messages still
         // waiting in the middle queue are roots too.
@@ -6239,6 +6244,13 @@ impl Process {
                     .roots_mut()
                     .copy_from_slice(&roots[apply_end..apply_end + nif_roots_len]);
             }
+        }
+        for (slot, &term) in self
+            .dirty_result_roots_mut()
+            .into_iter()
+            .zip(&roots[dirty_start..dirty_end])
+        {
+            *slot = term;
         }
         let mut cont_roots = roots[cont_start..].iter();
         for event in &mut self.sig_cont {

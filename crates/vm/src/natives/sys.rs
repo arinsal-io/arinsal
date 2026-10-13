@@ -119,15 +119,17 @@ pub(crate) fn copy_literal_area(
         let has_roots =
             how == arinsal_sched::LiteralCopyHow::NeedGc || has_literal_area_roots(process, &area);
         if has_roots {
-            let live_x = process.gc_live;
+            // erts_garbage_collect_literals roots `c_p->arg_reg` up to `c_p->arity`, the live
+            // X registers of the point where the process switched out (erl_gc.c:1243).
+            let live_x = crate::process::switched_out_live(process);
             let hibernated = process.hibernated;
             let copied = rewrite_roots(process, live_x, std::slice::from_ref(&area))?;
             process.heap.request_full_sweep();
-            process.force_gc_live(process.gc_live)?;
+            process.force_gc_live(live_x)?;
             if hibernated {
                 // Port of erts/emulator/beam/erl_gc.c:1387 (erts_garbage_collect_literals
                 // restores the hibernated heap), OTP-29.1.1.
-                process.garbage_collect_hibernate(process.gc_live)?;
+                process.garbage_collect_hibernate(live_x)?;
             }
             store.acknowledge_copied(&process._persistent_terms, area_id, u64::from(copied));
         } else {
@@ -141,11 +143,15 @@ pub(crate) fn copy_literal_area(
 fn has_literal_area_roots(process: &Process, area: &RetiredArea) -> bool {
     let heap = process.heap.has_heap_reference(|term| area.contains(term));
     // Only the live X registers are roots; dead ones may hold stale pointers.
-    let live = process.gc_live.min(process.x.len());
+    // Port of erts/emulator/beam/beam_bif_load.c:1100-1106 (`c_p->arg_reg` up to
+    // `c_p->arity`), OTP-29.1.1.
+    let live = crate::process::switched_out_live(process);
     let roots = process.x[..live]
         .iter()
         .copied()
-        .chain((0..process.heap.stack_words()).filter_map(|index| process.heap.stack_get(index)));
+        .chain((0..process.heap.stack_words()).filter_map(|index| process.heap.stack_get(index)))
+        // A finished dirty job's result also waits in those registers in erts.
+        .chain(process.dirty_result_roots());
     let mut frag_index = FragmentIndex::default();
     let x_and_stack =
         references_retired_from_roots(process, roots, std::slice::from_ref(area), &mut frag_index);
@@ -182,6 +188,7 @@ fn literal_scan_words(process: &Process) -> usize {
                 .as_ref()
                 .is_some_and(|cold| cold.persistent_get_all.is_some()),
         ))
+        .saturating_add(process.dirty_result_roots().len())
         .saturating_add(
             process
                 .dictionary
@@ -4005,6 +4012,19 @@ fn rewrite_roots(
             .expect("persistent get/0 continuation remains live")
             .result = updated;
         copied += u32::from(did);
+    }
+    // A finished dirty job's result is in erts' argument registers, which
+    // erts_garbage_collect_literals copies out of the area like the other roots.
+    // Port of erts/emulator/beam/erl_gc.c:1243 (`p->arg_reg, p->arity`), OTP-29.1.1.
+    let dirty_results = process.dirty_result_roots();
+    let mut rewritten = Vec::with_capacity(dirty_results.len());
+    for term in dirty_results {
+        let (updated, did) = rewrite_root(process, term, areas, &mut shared_copy, &mut frag_index)?;
+        rewritten.push(updated);
+        copied += u32::from(did);
+    }
+    for (slot, term) in process.dirty_result_roots_mut().into_iter().zip(rewritten) {
+        *slot = term;
     }
     // Off-heap message fragments remain owned by the queue and are not roots.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8460 (off-heap queue GC handling), OTP-29.1.1.
