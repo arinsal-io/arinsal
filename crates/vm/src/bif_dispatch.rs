@@ -158,9 +158,14 @@ impl Vm {
         for i in 0..arity {
             stored[i] = p.read(regs[i])?;
         }
-        if let Some(result) =
-            crate::bif_traps::execute(self, p, index, arity, stored, ctx.as_deref_mut())
-        {
+        if let Some(result) = crate::bif_traps::execute(
+            self,
+            p,
+            index,
+            arity,
+            [stored[0], stored[1], stored[2], Term::NIL],
+            ctx.as_deref_mut(),
+        ) {
             return match result? {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
                     p.write(dst, value)?;

@@ -62,6 +62,7 @@ const MAPS_FROM_LIST_CONTINUATION: &str = "maps:from_list/1";
 const MAPS_FROM_KEYS_CONTINUATION: &str = "maps:from_keys/2";
 const SUBTRACT_CONTINUATION: &str = "erlang:--/2";
 const CONTEXT_REDS: usize = 4000;
+const RE_RUN_CONTINUATION: &str = "erlang:re_run_trap/3";
 
 /// `beam_bif_export_trap`. `BIF_TRAP` points `c_p->i` here; it is not a BEAM function, so a
 /// backtrace names it "unknown function".
@@ -500,6 +501,29 @@ const ENTRIES: &[Entry] = &[
         continuation: IOLIST_CONTINUATION,
         handler: iolist_to_binary,
     },
+    // erl_bif_re.c: re_run_2/3 and re_internal_run_4 all trap to `re_match_trap_export`
+    // (erlang:re_run_trap/3) with the restart state in a magic reference.
+    Entry {
+        module: "re",
+        function: "run",
+        arity: 2,
+        continuation: RE_RUN_CONTINUATION,
+        handler: re_run_trap,
+    },
+    Entry {
+        module: "re",
+        function: "run",
+        arity: 3,
+        continuation: RE_RUN_CONTINUATION,
+        handler: re_run_trap,
+    },
+    Entry {
+        module: "re",
+        function: "internal_run",
+        arity: 4,
+        continuation: RE_RUN_CONTINUATION,
+        handler: re_run_trap,
+    },
     Entry {
         module: "re",
         function: "run",
@@ -739,17 +763,23 @@ fn re_run_trap(
     let (progress, loops) = {
         let mut heap = crate::ProcessHeapHandle(&mut process.heap);
         let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
-        arinsal_re::run_slice(&mut ctx, "run", args, prior, budget)?
+        arinsal_re::run_slice(
+            &mut ctx,
+            if args.len() == 4 {
+                "internal_run"
+            } else {
+                "run"
+            },
+            args,
+            prior,
+            budget,
+        )?
     };
     let reductions = (loops / arinsal_re::LOOP_FACTOR as u64).min(u64::from(u32::MAX)) as u32;
     Ok(match progress {
         arinsal_re::Progress::Done(value) => HandlerResult::Done { value, reductions },
         arinsal_re::Progress::Yield(run) => HandlerResult::Yield {
-            continuation: if args.len() == 2 {
-                "re:run/2"
-            } else {
-                "re:run/3"
-            },
+            continuation: RE_RUN_CONTINUATION,
             state: MagicRef::new(Mutex::new(Some(run))),
             reductions,
         },
@@ -1137,7 +1167,7 @@ pub(crate) fn execute(
     process: &mut Process,
     import: usize,
     arity: usize,
-    args: [Term; 3],
+    args: [Term; 4],
     ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
 ) -> Option<Result<HandlerResult, VmError>> {
     let import_info = vm.code.modules.get(process.module).and_then(|module| {
@@ -1229,6 +1259,7 @@ pub(crate) fn run_trapped_export(
         process.x.first().copied().unwrap_or(Term::NIL),
         process.x.get(1).copied().unwrap_or(Term::NIL),
         process.x.get(2).copied().unwrap_or(Term::NIL),
+        Term::NIL,
     ];
     execute_named(
         process,
@@ -1333,7 +1364,7 @@ pub(crate) fn execute_named(
     function_name: &str,
     import: usize,
     arity: usize,
-    mut args: [Term; 3],
+    mut args: [Term; 4],
     ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
 ) -> Option<Result<HandlerResult, VmError>> {
     let gc_enabled_on_entry = process.heap.gc_enabled;
@@ -1402,7 +1433,7 @@ pub(crate) fn execute_named(
         }
         // Port of erts/emulator/beam/beam_common.c (BIF_TRAP: the trap export carries its own
         // arguments), OTP-29.1.1: a resumed call takes its arguments from the trap state.
-        args = pending.args;
+        args = [pending.args[0], pending.args[1], pending.args[2], Term::NIL];
         (entry.handler, Some(Arc::clone(&pending.state)))
     } else {
         (entry?.handler, None)
@@ -1516,7 +1547,9 @@ pub(crate) fn execute_named(
                             .intern(function_name)
                             .expect("BIF function atom"),
                     ),
-                    arity,
+                    // BIF_TRAP keeps at most three arguments (bif.h:316-326); a four-argument
+                    // BIF such as re:internal_run/4 traps to a three-argument export.
+                    arity.min(3),
                 )
             };
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
@@ -1530,11 +1563,11 @@ pub(crate) fn execute_named(
                 arity: trap_arity,
                 callee,
                 args: if resumed {
-                    args
+                    [args[0], args[1], args[2]]
                 } else {
-                    let live = live_args(process, &args, arity);
+                    let live = live_args(process, &args, arity.min(3));
                     let mut saved = [Term::NIL; 3];
-                    saved[..arity].copy_from_slice(&live);
+                    saved[..live.len()].copy_from_slice(&live);
                     saved
                 },
             });
@@ -1701,7 +1734,8 @@ pub(crate) fn finish_light(
                 process.set_gc_enabled(false);
             }
             let mut saved = [Term::NIL; 3];
-            saved[..args.len()].copy_from_slice(args);
+            let kept = args.len().min(3);
+            saved[..kept].copy_from_slice(&args[..kept]);
             // The scheduler binds the trap to its call site when it context-switches.
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.module,
@@ -1711,7 +1745,7 @@ pub(crate) fn finish_light(
                 continuation,
                 state,
                 gc_was_enabled,
-                arity: args.len(),
+                arity: kept,
                 callee,
                 args: saved,
             });
@@ -1807,7 +1841,7 @@ pub(crate) fn charge_light(process: &mut Process, reductions: u32) {
 
 /// The call's arguments as the X registers hold them now; a collection since the copies
 /// were taken has moved boxed arguments.
-fn live_args(process: &Process, copies: &[Term; 3], arity: usize) -> Vec<Term> {
+fn live_args(process: &Process, copies: &[Term; 4], arity: usize) -> Vec<Term> {
     (0..arity)
         .map(|slot| process.x.get(slot).copied().unwrap_or(copies[slot]))
         .collect()
@@ -1815,9 +1849,9 @@ fn live_args(process: &Process, copies: &[Term; 3], arity: usize) -> Vec<Term> {
 
 /// The arguments for an error report: those held in the trap state on a resumed call, the live
 /// X registers on the first call.
-fn call_args(process: &Process, saved: &[Term; 3], arity: usize, resumed: bool) -> Vec<Term> {
+fn call_args(process: &Process, saved: &[Term; 4], arity: usize, resumed: bool) -> Vec<Term> {
     if resumed {
-        saved[..arity].to_vec()
+        saved[..arity.min(4)].to_vec()
     } else {
         live_args(process, saved, arity)
     }

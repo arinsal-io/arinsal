@@ -895,6 +895,9 @@ pub struct RunState {
     offset: usize,
     matches: Vec<O>,
     phase: Phase,
+    /// The call's options, kept so a resumed run needs none of its arguments, as erts' trap
+    /// export is called with the restart state in place of the options.
+    opts: Options,
 }
 #[derive(Clone, Copy)]
 enum Phase {
@@ -1015,7 +1018,15 @@ enum Step {
 
 /// Port of lib/stdlib/src/re.erl:1823-1906 (do_grun/loopexec), OTP-29.1.1, as a state machine
 /// that can stop in the middle of any match and continue later.
-fn advance(
+fn advance(state: &mut RunState, budget: i32, loops: &mut u64) -> Result<Step, BifError> {
+    // The options live in the state; the matcher borrows the state mutably.
+    let opts = std::mem::take(&mut state.opts);
+    let result = advance_with(state, &opts, budget, loops);
+    state.opts = opts;
+    result
+}
+
+fn advance_with(
     state: &mut RunState,
     opts: &Options,
     budget: i32,
@@ -1168,27 +1179,35 @@ pub fn run_slice(
     state: Option<Box<RunState>>,
     loop_budget: i32,
 ) -> Result<(Progress, u64), BifError> {
-    let mut adapted = args.to_vec();
-    let pattern_index = 1;
-    if let Some(pattern) = args.get(pattern_index)
-        && let Some(owned) = magic_pattern(*pattern)?
-    {
-        adapted[pattern_index] =
-            from_owned(&owned, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)?;
-    }
-    let owned = adapted
-        .iter()
-        .map(|term| to_owned(*term).map_err(|_| BifError::BADARG))
-        .collect::<Result<Vec<_>, _>>()?;
-    let first = match (name, owned.len()) {
-        _ if state.is_some() => false,
-        ("run", 2 | 3) => true,
-        ("internal_run", 4) => match atom_name(&owned[3]) {
-            Some("true") => true,
-            Some("false") => false,
+    let owned = if state.is_some() {
+        // A trapped call continues from its restart state alone.
+        Vec::new()
+    } else {
+        let mut adapted = args.to_vec();
+        let pattern_index = 1;
+        if let Some(pattern) = args.get(pattern_index)
+            && let Some(owned) = magic_pattern(*pattern)?
+        {
+            adapted[pattern_index] =
+                from_owned(&owned, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)?;
+        }
+        adapted
+            .iter()
+            .map(|term| to_owned(*term).map_err(|_| BifError::BADARG))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let first = if state.is_some() {
+        false
+    } else {
+        match (name, owned.len()) {
+            ("run", 2 | 3) => true,
+            ("internal_run", 4) => match atom_name(&owned[3]) {
+                Some("true") => true,
+                Some("false") => false,
+                _ => return Err(BifError::BADARG),
+            },
             _ => return Err(BifError::BADARG),
-        },
-        _ => return Err(BifError::BADARG),
+        }
     };
     let (step, loops) = run_owned_slice(&owned, first, state, loop_budget)?;
     match step {
@@ -1208,10 +1227,10 @@ fn run_owned_slice(
     state: Option<Box<RunState>>,
     loop_budget: i32,
 ) -> Result<((Step, Box<RunState>), u64), BifError> {
-    let opts = options(args.get(2).unwrap_or(&O::Nil))?;
     let mut state = match state {
         Some(state) => state,
         None => {
+            let opts = options(args.get(2).unwrap_or(&O::Nil))?;
             if opts.export {
                 return Err(BifError::BADARG);
             }
@@ -1261,11 +1280,12 @@ fn run_owned_slice(
                 offset: opts.offset,
                 matches: Vec::new(),
                 phase: Phase::Main,
+                opts,
             })
         }
     };
     let mut loops = 0;
-    let step = advance(&mut state, &opts, loop_budget, &mut loops)?;
+    let step = advance(&mut state, loop_budget, &mut loops)?;
     Ok(((step, state), loops))
 }
 impl RunState {
@@ -1280,6 +1300,7 @@ impl RunState {
             offset: 0,
             matches: Vec::new(),
             phase: Phase::Main,
+            opts: Options::default(),
         }
     }
 }

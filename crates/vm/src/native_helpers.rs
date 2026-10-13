@@ -2283,7 +2283,7 @@ fn call_trap_bif(
         }
     }
     let entry_top = process.heap.heap_top_index();
-    let mut args = [Term::NIL; 3];
+    let mut args = [Term::NIL; 4];
     args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
     let callee = (export.module_atom, export.function_atom);
     let outcome = crate::bif_traps::call_light(process, entry, identity, callee, &args[..arity]);

@@ -701,6 +701,7 @@ impl Vm {
             p.x.first().copied().unwrap_or(Term::NIL),
             p.x.get(1).copied().unwrap_or(Term::NIL),
             p.x.get(2).copied().unwrap_or(Term::NIL),
+            p.x.get(3).copied().unwrap_or(Term::NIL),
         ];
         if let Some(result) = crate::bif_traps::execute_named(
             p,

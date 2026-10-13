@@ -2565,6 +2565,7 @@ impl Executor {
                                             process.x.first().copied().unwrap_or(Term::NIL),
                                             process.x.get(1).copied().unwrap_or(Term::NIL),
                                             process.x.get(2).copied().unwrap_or(Term::NIL),
+                                            process.x.get(3).copied().unwrap_or(Term::NIL),
                                         ];
                                         let traps_here = export.trap_entry
                                             || process
