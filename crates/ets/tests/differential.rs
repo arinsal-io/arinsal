@@ -2772,3 +2772,26 @@ fn in_place_counter_update_matches_general_path() {
             .is_none()
     );
 }
+
+/// `erts_internal:ets_raw_next/2` on a tree table is `db_next_tree`: a key that is gone is not
+/// an error (checked against OTP 29.1.1: `ets_raw_next(Tree, 2)` on {1,3} gives 3).
+#[test]
+fn raw_next_on_a_missing_tree_key_returns_the_successor() {
+    let mut registry = Registry::new();
+    let tid = registry.create(options(TableType::OrderedSet)).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
+    let mut input = VecHeap::new();
+    let one = from_owned(&tuple(vec![int(1), atom("a")]), &mut input).unwrap();
+    let three = from_owned(&tuple(vec![int(3), atom("b")]), &mut input).unwrap();
+    table.insert(&[one, three]).unwrap();
+    let mut output = VecHeap::new();
+    let next = table
+        .raw_next(Term::small(2).unwrap(), &mut output)
+        .unwrap()
+        .unwrap();
+    assert_eq!(next, Term::small(3).unwrap());
+    assert_eq!(
+        table.raw_next(Term::small(3).unwrap(), &mut output),
+        Ok(None)
+    );
+}

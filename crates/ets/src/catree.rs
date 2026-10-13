@@ -244,6 +244,29 @@ impl CATree {
         }
     }
 
+    /// Port of erts/emulator/beam/erl_db_catree.c:2401 (db_get_binary_info_catree), OTP-29.1.1.
+    /// Reads the stored term in place so the reference counts are not inflated by a copy.
+    pub(crate) fn binary_info<H: HeapAlloc>(
+        &self,
+        key: Term,
+        dst: &mut H,
+    ) -> Result<Vec<Term>, EtsError> {
+        loop {
+            let routes = self.routes.load();
+            let base = routes.find_base(key);
+            let root = base.write();
+            if !base.is_valid.load(AtomicOrdering::Acquire) {
+                drop(root);
+                drop(routes);
+                std::thread::yield_now();
+                continue;
+            }
+            return Node::get(&root, key, self.keypos)
+                .map(|object| object.refc_binaries(dst))
+                .unwrap_or_else(|| Ok(Vec::new()));
+        }
+    }
+
     /// Port of erts/emulator/beam/erl_db_catree.c:1746 (db_get_catree), OTP-29.1.1.
     pub(crate) fn lookup<H: HeapAlloc>(
         &self,

@@ -67,12 +67,31 @@ pub(super) struct HashIter<'a> {
     next: Option<&'a HashDbTerm>,
 }
 
-impl<'a> Iterator for HashIter<'a> {
+#[derive(Clone, Copy)]
+pub(super) struct RawHashIter<'a> {
+    next: Option<&'a HashDbTerm>,
+}
+
+impl<'a> Iterator for RawHashIter<'a> {
     type Item = &'a HashDbTerm;
+
     fn next(&mut self) -> Option<Self::Item> {
         let node = self.next?;
         self.next = node.next.as_deref();
-        (!node.pseudo_deleted).then_some(node)
+        Some(node)
+    }
+}
+
+impl<'a> Iterator for HashIter<'a> {
+    type Item = &'a HashDbTerm;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let node = self.next?;
+            self.next = node.next.as_deref();
+            if !node.pseudo_deleted {
+                return Some(node);
+            }
+        }
     }
 }
 
@@ -87,26 +106,6 @@ impl<'a> Iterator for HashIterMut<'a> {
         let node = self.next.take()?;
         self.next = node.next.as_deref_mut();
         Some(&mut node.object)
-    }
-}
-
-pub(super) struct RemovedHashTerms {
-    head: Option<Box<HashDbTerm>>,
-}
-
-impl RemovedHashTerms {
-    pub(super) fn take_first(&mut self) -> Option<StoredTerm> {
-        let mut first = self.head.take()?;
-        self.head = first.next.take();
-        Some(first.object)
-    }
-}
-
-impl Drop for RemovedHashTerms {
-    fn drop(&mut self) {
-        while let Some(mut node) = self.head.take() {
-            self.head = node.next.take();
-        }
     }
 }
 
@@ -274,9 +273,7 @@ pub(super) struct HashStorage {
     nlocks: usize,
     pub(super) next_order: AtomicU64,
     pub(super) size: AtomicIsize,
-    pub(super) size_bias: AtomicIsize,
     pub(super) nactive: AtomicUsize,
-    pub(super) deleted: Mutex<Vec<StoredTerm>>,
     szm: AtomicUsize,
     pub(super) nslots: AtomicUsize,
     initial_slots: usize,
@@ -322,9 +319,7 @@ impl HashStorage {
             nlocks: locks,
             next_order: AtomicU64::new(0),
             size: AtomicIsize::new(0),
-            size_bias: AtomicIsize::new(0),
             nactive: AtomicUsize::new(FIRST_SEGMENT),
-            deleted: Mutex::new(Vec::new()),
             szm: AtomicUsize::new(FIRST_SEGMENT - 1),
             nslots: AtomicUsize::new(initial_slots),
             initial_slots,
@@ -431,7 +426,6 @@ impl HashStorage {
     }
 
     /// Insert a prepared object under its hash stripe.
-    // Port of erts/emulator/beam/erl_db_hash.c:1363-1460 (db_put_hash), OTP-29.1.1.
     pub(super) fn insert_shared(
         &self,
         mut object: StoredTerm,
@@ -443,106 +437,76 @@ impl HashStorage {
     ) -> bool {
         let hvalue = hash >> 1;
         object.hvalue = hvalue;
-        let mut inserted = false;
-        let mut accepted = true;
-        self.with_hash_bucket_mut(hvalue, |_slot, bucket| {
-            let key = object.key(keypos);
-            let mut link = &mut bucket.head;
-            while link.as_ref().is_some_and(|node| {
-                node.hvalue != hvalue || !exact_key(node.object.key(keypos), key)
-            }) {
-                link = &mut link.as_mut().unwrap().next;
-            }
-            let group_order = link.as_ref().map(|node| node.object.group_order);
-            if table_type == TableType::Set
-                && let Some(node) = link.as_mut()
-            {
-                if new_only && !node.pseudo_deleted {
-                    accepted = false;
-                    return;
-                }
-                object.order = node.object.order;
-                object.group_order = node.object.group_order;
-                if node.pseudo_deleted {
-                    node.pseudo_deleted = false;
-                    inserted = true;
-                    self.add_items(hash, 1);
-                }
-                node.object = object;
-                return;
-            }
-            if new_only {
-                let mut node = link.as_deref();
-                while let Some(current) = node {
-                    if current.hvalue != hvalue || !exact_key(current.object.key(keypos), key) {
-                        break;
-                    }
-                    if !current.pseudo_deleted {
-                        accepted = false;
-                        return;
-                    }
-                    node = current.next.as_deref();
-                }
-            }
-            if table_type == TableType::Bag {
-                let revived = {
-                    let mut cursor = &mut *link;
-                    let mut at_group_head = true;
-                    let mut revived = None;
-                    while let Some(node) = cursor.as_deref_mut() {
-                        if node.hvalue != hvalue || !exact_key(node.object.key(keypos), key) {
-                            break;
-                        }
-                        if node.object.exact_eq_stored(&object) {
-                            if !node.pseudo_deleted {
-                                return;
-                            }
-                            node.pseudo_deleted = false;
-                            inserted = true;
-                            self.add_items(hash, 1);
-                            if !at_group_head {
-                                let mut node = cursor.take().unwrap();
-                                *cursor = node.next.take();
-                                revived = Some(node);
-                            } else {
-                                return;
-                            }
-                            break;
-                        }
-                        cursor = &mut cursor.as_mut().unwrap().next;
-                        at_group_head = false;
-                    }
-                    revived
-                };
-                if let Some(mut node) = revived {
-                    node.next = link.take();
-                    *link = Some(node);
-                    return;
-                }
-            }
-
-            object.order = self.next_order.fetch_add(1, Ordering::Relaxed);
-            object.group_order = group_order.unwrap_or(object.order);
-            let new = Box::new(HashDbTerm {
-                next: link.take(),
-                hvalue,
-                pseudo_deleted: false,
-                object,
-            });
-            *link = Some(new);
-            inserted = true;
-            self.add_items(hash, 1);
+        let (accepted, added) = self.with_hash_bucket_mut(hvalue, |_slot, bucket| {
+            let next_order = || self.next_order.fetch_add(1, Ordering::Relaxed);
+            put_in_bucket(bucket, object, table_type, keypos, new_only, next_order)
         });
-        if inserted && accepted {
+        if added {
+            self.add_items(hash, 1);
             self.grow_after_insert(hash, fixed);
         }
         accepted
     }
 
+    /// `insert_shared` for a table without fine-grained locks, which the caller owns.
+    pub(super) fn insert_exclusive(
+        &mut self,
+        mut object: StoredTerm,
+        hash: u64,
+        table_type: TableType,
+        keypos: usize,
+        fixed: bool,
+        new_only: bool,
+    ) -> bool {
+        let hvalue = hash >> 1;
+        object.hvalue = hvalue;
+        let slot = self.slot_index(hvalue);
+        // The caller owns the table, so taking the order up front cannot reorder inserts.
+        let order = self.next_order.fetch_add(1, Ordering::Relaxed);
+        let (accepted, added) = put_in_bucket(
+            self.segment_bucket_mut(slot),
+            object,
+            table_type,
+            keypos,
+            new_only,
+            || order,
+        );
+        if added {
+            self.add_items(hash, 1);
+            self.maybe_grow(fixed, keypos);
+        }
+        accepted
+    }
+
     /// Delete all objects at a key while holding its write stripe.
-    // Port of erts/emulator/beam/erl_db_hash.c:1613-1666 (db_erase_hash), OTP-29.1.1.
     pub(super) fn delete_key_shared(&self, key: Term, hash: u64, keypos: usize, fixed: bool) {
-        self.delete_matching_shared(key, hash, keypos, fixed, |_| true);
+        let count = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
+            erase_in_bucket(bucket, hash >> 1, keypos, key, fixed)
+        });
+        if count != 0 {
+            self.add_items(hash, -count);
+            if !fixed {
+                self.shrink_after_delete_shared(self.estimated_items(hash));
+            }
+        }
+    }
+
+    /// `delete_key_shared` for a table without fine-grained locks, which the caller owns.
+    pub(super) fn delete_key_exclusive(
+        &mut self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        fixed: bool,
+    ) {
+        let slot = self.slot_index(hash >> 1);
+        let count = erase_in_bucket(self.segment_bucket_mut(slot), hash >> 1, keypos, key, fixed);
+        if count != 0 {
+            self.add_items(hash, -count);
+            if !fixed {
+                self.shrink_after_delete(keypos);
+            }
+        }
     }
 
     // Port of erts/emulator/beam/erl_db.c:1494-1683 (do_update_counter), OTP-29.1.1.
@@ -658,21 +622,54 @@ impl HashStorage {
         Ok(changed)
     }
 
-    // Port of erts/emulator/beam/erl_db_hash.c:1613-1666 (db_erase_hash), OTP-29.1.1.
     pub(super) fn delete_object_shared(
         &self,
         key: Term,
         hash: u64,
         keypos: usize,
         object: Term,
+        table_type: TableType,
         fixed: bool,
     ) {
-        self.delete_matching_shared(key, hash, keypos, fixed, |stored| {
-            stored.exact_eq_term(object)
+        let count = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
+            erase_object_in_bucket(bucket, hash >> 1, keypos, key, object, table_type, fixed)
         });
+        if count != 0 {
+            self.add_items(hash, -count);
+            if !fixed {
+                self.shrink_after_delete_shared(self.estimated_items(hash));
+            }
+        }
     }
 
-    // Port of erts/emulator/beam/erl_db_hash.c:2949-3005 (db_take_hash), OTP-29.1.1.
+    /// `delete_object_shared` for a table without fine-grained locks, which the caller owns.
+    pub(super) fn delete_object_exclusive(
+        &mut self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        object: Term,
+        table_type: TableType,
+        fixed: bool,
+    ) {
+        let slot = self.slot_index(hash >> 1);
+        let count = erase_object_in_bucket(
+            self.segment_bucket_mut(slot),
+            hash >> 1,
+            keypos,
+            key,
+            object,
+            table_type,
+            fixed,
+        );
+        if count != 0 {
+            self.add_items(hash, -count);
+            if !fixed {
+                self.shrink_after_delete(keypos);
+            }
+        }
+    }
+
     pub(super) fn take_shared<H: HeapAlloc>(
         &self,
         key: Term,
@@ -682,60 +679,43 @@ impl HashStorage {
         fixed: bool,
         dst: &mut H,
     ) -> Result<Vec<Term>, EtsError> {
-        let mut removed_count = 0;
-        let mut values = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
-            let mut values = Vec::new();
-            let mut current = bucket.head.as_deref();
-            let mut found = false;
-            while let Some(node) = current {
-                if !node.pseudo_deleted
-                    && node.hvalue == hash >> 1
-                    && exact_key(node.object.key(keypos), key)
-                {
-                    found = true;
-                    values.push(node.object.copy_out(dst)?);
-                    if !matches!(table_type, TableType::Bag | TableType::DuplicateBag) {
-                        break;
-                    }
-                } else if found {
-                    break;
-                }
-                current = node.next.as_deref();
-            }
-            let mut link = &mut bucket.head;
-            let mut first = true;
-            while let Some(mut node) = link.take() {
-                if !node.pseudo_deleted
-                    && node.hvalue == hash >> 1
-                    && exact_key(node.object.key(keypos), key)
-                {
-                    removed_count += 1;
-                    if fixed && first {
-                        node.pseudo_deleted = true;
-                        *link = Some(node);
-                        link = &mut link.as_mut().unwrap().next;
-                        first = false;
-                    } else {
-                        *link = node.next.take();
-                    }
-                    if !matches!(table_type, TableType::Bag | TableType::DuplicateBag) {
-                        break;
-                    }
-                } else {
-                    *link = Some(node);
-                    link = &mut link.as_mut().unwrap().next;
-                }
-            }
-            if removed_count != 0 {
-                self.add_items(hash, -(removed_count as isize));
-            }
-            Ok::<_, EtsError>(values)
+        let (values, count) = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
+            take_in_bucket(bucket, hash >> 1, keypos, key, table_type, fixed, dst)
         })?;
-        if matches!(table_type, TableType::Bag | TableType::DuplicateBag) {
-            values.reverse();
+        if count != 0 {
+            self.add_items(hash, -count);
+            if !fixed {
+                self.shrink_after_delete_shared(self.estimated_items(hash));
+            }
         }
-        if removed_count != 0 && !fixed {
-            self.shrink_after_delete_shared(self.estimated_items(hash));
+        Ok(values)
+    }
+
+    /// `take_shared` for a table without fine-grained locks, which the caller owns.
+    pub(super) fn take_exclusive<H: HeapAlloc>(
+        &mut self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        table_type: TableType,
+        fixed: bool,
+        dst: &mut H,
+    ) -> Result<Vec<Term>, EtsError> {
+        let slot = self.slot_index(hash >> 1);
+        let (values, count) = take_in_bucket(
+            self.segment_bucket_mut(slot),
+            hash >> 1,
+            keypos,
+            key,
+            table_type,
+            fixed,
+            dst,
+        )?;
+        if count != 0 {
+            self.add_items(hash, -count);
+            if !fixed {
+                self.shrink_after_delete(keypos);
+            }
         }
         Ok(values)
     }
@@ -767,48 +747,6 @@ impl HashStorage {
             }
             Ok(count)
         })
-    }
-
-    fn delete_matching_shared(
-        &self,
-        key: Term,
-        hash: u64,
-        keypos: usize,
-        fixed: bool,
-        mut matches: impl FnMut(&StoredTerm) -> bool,
-    ) {
-        let (mut removed, count) = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
-            let mut link = &mut bucket.head;
-            let mut removed = RemovedHashTerms { head: None };
-            let mut tail = &mut removed.head;
-            let mut count = 0;
-            while let Some(mut node) = link.take() {
-                if !node.pseudo_deleted
-                    && node.hvalue == hash >> 1
-                    && exact_key(node.object.key(keypos), key)
-                    && matches(&node.object)
-                {
-                    *link = node.next.take();
-                    *tail = Some(node);
-                    tail = &mut tail.as_mut().unwrap().next;
-                    count += 1;
-                } else {
-                    *link = Some(node);
-                    link = &mut link.as_mut().unwrap().next;
-                }
-            }
-            if count != 0 {
-                self.add_items(hash, -(count as isize));
-            }
-            (removed, count)
-        });
-        if fixed && let Some(object) = removed.take_first() {
-            self.deleted.lock().unwrap().push(object);
-        }
-        if count != 0 && !fixed {
-            let nitems = self.estimated_items(hash);
-            self.shrink_after_delete_shared(nitems);
-        }
     }
 
     fn shrink_after_delete_shared(&self, nitems: isize) {
@@ -967,6 +905,24 @@ impl HashStorage {
         }
     }
 
+    pub(super) fn with_raw_objects_hash<R>(
+        &self,
+        hval: u64,
+        visit: impl FnOnce(RawHashIter<'_>) -> R,
+    ) -> R {
+        let hvalue = hval >> 1;
+        loop {
+            let slot = self.slot_index(hvalue);
+            let stripe = &self.stripes[self.stripe_index(slot)];
+            let buckets = stripe.buckets.read();
+            if self.slot_index(hvalue) == slot {
+                return visit(RawHashIter {
+                    next: buckets[slot / self.nlocks].head.as_deref(),
+                });
+            }
+        }
+    }
+
     pub(super) fn try_for_each_value<E>(
         &self,
         mut visit: impl FnMut(&StoredTerm) -> Result<(), E>,
@@ -975,6 +931,28 @@ impl HashStorage {
             visit(object)?;
             Ok(true)
         })
+    }
+
+    /// Chain length and number of pseudo-deleted objects of every bucket.
+    // Port of erts/emulator/beam/erl_db_hash.c:4072-4112 (db_calc_stats_hash), OTP-29.1.1.
+    pub(super) fn chain_lengths(&self) -> (Vec<usize>, usize) {
+        let mut kept = 0;
+        let lengths = (0..self.nactive())
+            .map(|slot| {
+                self.with_bucket(slot, |bucket| {
+                    let mut length = 0;
+                    for node in (RawHashIter {
+                        next: bucket.head.as_deref(),
+                    }) {
+                        length += 1;
+                        kept += usize::from(node.pseudo_deleted);
+                    }
+                    length
+                })
+                .unwrap_or(0)
+            })
+            .collect();
+        (lengths, kept)
     }
 
     pub(super) fn for_each_value(&self, mut visit: impl FnMut(&StoredTerm)) {
@@ -1039,7 +1017,7 @@ impl HashStorage {
     pub(super) fn raw_first(&self, keypos: usize) -> Option<Term> {
         for slot in 0..self.nactive() {
             if let Some(Some(key)) = self.with_bucket(slot, |bucket| {
-                HashIter {
+                RawHashIter {
                     next: bucket.head.as_deref(),
                 }
                 .next()
@@ -1058,10 +1036,10 @@ impl HashStorage {
         let hash = ets_hash(key) >> 1;
         loop {
             let slot = self.slot_index(hash);
-            let mut found = false;
-            let Some(in_slot) = self.with_bucket(slot, |bucket| {
+            let Some((found, in_slot)) = self.with_bucket(slot, |bucket| {
                 let mut successor = None;
-                for node in (HashIter {
+                let mut found = false;
+                for node in (RawHashIter {
                     next: bucket.head.as_deref(),
                 }) {
                     if !found {
@@ -1075,7 +1053,7 @@ impl HashStorage {
                         break;
                     }
                 }
-                successor
+                (found, successor)
             }) else {
                 continue;
             };
@@ -1087,7 +1065,7 @@ impl HashStorage {
             }
             for slot in slot + 1..self.nactive() {
                 if let Some(Some(key)) = self.with_bucket(slot, |bucket| {
-                    HashIter {
+                    RawHashIter {
                         next: bucket.head.as_deref(),
                     }
                     .next()
@@ -1100,77 +1078,16 @@ impl HashStorage {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:3883-3885, OTP-29.1.1.
-    pub(super) fn find_object_mut_at(
-        &mut self,
-        slot: usize,
-        predicate: &mut impl FnMut(&StoredTerm) -> bool,
-    ) -> Option<&mut StoredTerm> {
-        let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
-        while let Some(current) = node {
-            if predicate(&current.object) {
-                return Some(&mut current.object);
-            }
-            node = current.next.as_deref_mut();
-        }
-        None
-    }
-
-    /// Port of erts/emulator/beam/erl_db_hash.c:1363-1450 (db_put_hash), OTP-29.1.1.
-    pub(super) fn push_at_key(&mut self, slot: usize, object: StoredTerm, keypos: usize) {
-        let hvalue = object.hvalue;
-        let key = object.key(keypos);
-        let bucket = self.segment_bucket_mut(slot);
-        let mut link = &mut bucket.head;
-        while link
-            .as_ref()
-            .is_some_and(|node| node.hvalue != hvalue || !exact_key(node.object.key(keypos), key))
-        {
-            link = &mut link.as_mut().unwrap().next;
-        }
-        let node = Box::new(HashDbTerm {
-            next: link.take(),
-            hvalue,
-            pseudo_deleted: false,
-            object,
-        });
-        *link = Some(node);
-    }
-
-    /// Restore an object at its former place after a fixed-table deletion.
-    pub(super) fn push_at_order(&mut self, slot: usize, object: StoredTerm) {
-        let hvalue = object.hvalue;
-        let order = (object.group_order, u64::MAX - object.order);
-        let bucket = self.segment_bucket_mut(slot);
-        let mut link = &mut bucket.head;
-        while link
-            .as_ref()
-            .is_some_and(|node| (node.object.group_order, u64::MAX - node.object.order) < order)
-        {
-            link = &mut link.as_mut().unwrap().next;
-        }
-        let node = Box::new(HashDbTerm {
-            next: link.take(),
-            hvalue,
-            pseudo_deleted: false,
-            object,
-        });
-        *link = Some(node);
-    }
-
-    pub(super) fn take_all_buckets(&mut self) -> Vec<StoredTerm> {
-        let mut objects = Vec::with_capacity(self.size());
+    /// Pseudo-delete every object of a fixed table in place.
+    // Port of erts/emulator/beam/erl_db_hash.c:3008-3050 (db_mark_all_deleted_hash), OTP-29.1.1.
+    pub(super) fn mark_all_deleted(&mut self) {
         for slot in 0..self.nactive() {
-            let mut node = self.segment_bucket_mut(slot).head.take();
-            while let Some(mut current) = node {
-                node = current.next.take();
-                objects.push(current.object);
+            let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
+            while let Some(current) = node {
+                current.pseudo_deleted = true;
+                node = current.next.as_deref_mut();
             }
         }
-        for stripe in self.stripes.iter() {
-            stripe.nitems.store(0, Ordering::Relaxed);
-        }
-        objects
     }
 
     /// Free every object and return to the initial single-segment layout.
@@ -1190,10 +1107,20 @@ impl HashStorage {
         self.nslots.store(self.initial_slots, Ordering::Release);
     }
 
+    /// Remove pseudo-deleted nodes once the last table fixation ends.
+    // Port of erts/emulator/beam/erl_db_hash.c:939-1007 (db_unfix_table_hash), OTP-29.1.1.
+    pub(super) fn unfix(&mut self) {
+        for stripe in &mut self.stripes {
+            for bucket in stripe.buckets.get_mut() {
+                bucket.head = purge_pseudo_deleted(bucket.head.take());
+            }
+        }
+    }
+
     /// Detach all buckets (and, for a table being deleted, the pseudo-deleted list) so they can
     /// be released a few segments at a time, leaving the initial single-segment layout.
     // Port of erts/emulator/beam/erl_db_hash.c:3122 (db_free_table_continue_hash), OTP-29.1.1.
-    pub(super) fn take_garbage(&mut self, with_deleted: bool) -> HashGarbage {
+    pub(super) fn take_garbage(&mut self) -> HashGarbage {
         let nslots = self.nslots.load(Ordering::Relaxed);
         let mut segments = Vec::new();
         let mut start = 0;
@@ -1211,13 +1138,13 @@ impl HashStorage {
             end += EXT_SEGMENT;
         }
         self.clear_buckets();
+        HashGarbage { segments }
+    }
+
+    /// Nothing to release: the objects of a fixed table stay in place as pseudo-deleted.
+    pub(super) fn empty_garbage(&self) -> HashGarbage {
         HashGarbage {
-            segments,
-            deleted: if with_deleted {
-                std::mem::take(self.deleted.get_mut().unwrap())
-            } else {
-                Vec::new()
-            },
+            segments: Vec::new(),
         }
     }
 
@@ -1262,32 +1189,6 @@ impl HashStorage {
             }
         }
         Ok(count)
-    }
-
-    /// Unlink live terms into the same intrusive free list used by `db_erase_hash`.
-    // Port of erts/emulator/beam/erl_db_hash.c:1620-1690 (db_erase_hash), OTP-29.1.1.
-    pub(super) fn detach_live_matching(
-        &mut self,
-        hval: u64,
-        mut predicate: impl FnMut(&StoredTerm) -> bool,
-    ) -> (RemovedHashTerms, usize) {
-        let slot = self.slot_index(hval);
-        let mut link = &mut self.segment_bucket_mut(slot).head;
-        let mut removed = RemovedHashTerms { head: None };
-        let mut tail = &mut removed.head;
-        let mut count = 0;
-        while let Some(mut node) = link.take() {
-            if !node.pseudo_deleted && predicate(&node.object) {
-                *link = node.next.take();
-                *tail = Some(node);
-                tail = &mut tail.as_mut().unwrap().next;
-                count += 1;
-            } else {
-                *link = Some(node);
-                link = &mut link.as_mut().unwrap().next;
-            }
-        }
-        (removed, count)
     }
 
     /// Unlink every live object for which `predicate` holds while walking the buckets once.
@@ -1342,16 +1243,6 @@ impl HashStorage {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:3973-3984, OTP-29.1.1.
-    pub(super) fn retain_fixed_delete(&mut self, object: StoredTerm) {
-        self.deleted.get_mut().unwrap().push(object);
-    }
-
-    /// Port of erts/emulator/beam/erl_db_hash.c:1745-1750, OTP-29.1.1.
-    pub(super) fn active_slots(&self) -> usize {
-        self.nactive()
-    }
-
     /// Port of erts/emulator/beam/erl_db_hash.c:1624-1626, OTP-29.1.1.
     pub(super) fn is_valid_slot(&self, slot: usize) -> bool {
         slot <= self.nactive()
@@ -1373,33 +1264,17 @@ impl HashStorage {
         with_deleted: bool,
         mut visit: impl FnMut(&StoredTerm, bool) -> Result<(), E>,
     ) -> Result<(), E> {
-        if let Some(result) = self.with_bucket(slot, |bucket| {
-            let mut objects: Vec<(&StoredTerm, bool)> = HashIter {
+        self.with_bucket(slot, |bucket| {
+            for node in (RawHashIter {
                 next: bucket.head.as_deref(),
-            }
-            .map(|node| (&node.object, false))
-            .collect();
-            let deleted = with_deleted.then(|| self.deleted.lock().unwrap());
-            if let Some(deleted) = deleted.as_ref() {
-                objects.extend(
-                    deleted
-                        .iter()
-                        .filter(|object| self.slot_index(object.hvalue) == slot)
-                        .map(|object| (object, true)),
-                );
-                objects.sort_unstable_by_key(|(object, _)| {
-                    (object.group_order, u64::MAX - object.order)
-                });
-            }
-            for (object, deleted) in objects {
-                visit(object, deleted)?;
+            }) {
+                if with_deleted || !node.pseudo_deleted {
+                    visit(&node.object, node.pseudo_deleted)?;
+                }
             }
             Ok(())
-        }) {
-            result
-        } else {
-            Ok(())
-        }
+        })
+        .unwrap_or(Ok(()))
     }
 
     /// First live object of the first non-empty slot at or after `slot`, in traversal order.
@@ -2028,6 +1903,213 @@ impl ConcurrentHashStorage {
     }
 }
 
+/// The bucket walk of `db_put_hash`: whether the object was accepted and whether it added an
+/// item to the count.
+// Port of erts/emulator/beam/erl_db_hash.c:1363-1460 (db_put_hash), OTP-29.1.1.
+fn put_in_bucket(
+    bucket: &mut HashBucket,
+    mut object: StoredTerm,
+    table_type: TableType,
+    keypos: usize,
+    new_only: bool,
+    next_order: impl FnOnce() -> u64,
+) -> (bool, bool) {
+    let hvalue = object.hvalue;
+    let key = object.key(keypos);
+    let has_key =
+        |node: &HashDbTerm| node.hvalue == hvalue && exact_key(node.object.key(keypos), key);
+    let mut link = &mut bucket.head;
+    while link.as_ref().is_some_and(|node| !has_key(node)) {
+        link = &mut link.as_mut().unwrap().next;
+    }
+    let group_order = link.as_ref().map(|node| node.object.group_order);
+    if table_type == TableType::Set
+        && let Some(node) = link.as_mut()
+    {
+        if new_only && !node.pseudo_deleted {
+            return (false, false);
+        }
+        object.order = node.object.order;
+        object.group_order = node.object.group_order;
+        let revived = node.pseudo_deleted;
+        node.pseudo_deleted = false;
+        node.object = object;
+        return (true, revived);
+    }
+    if new_only {
+        // key_clash_fail: only pseudo-deleted nodes of the key may be present; the new object
+        // never revives one of them.
+        let mut node = link.as_deref();
+        while let Some(current) = node.filter(|node| has_key(node)) {
+            if !current.pseudo_deleted {
+                return (false, false);
+            }
+            node = current.next.as_deref();
+        }
+    } else if table_type == TableType::Bag {
+        let mut cursor = &mut *link;
+        let mut at_group_head = true;
+        let mut revived = None;
+        while let Some(node) = cursor.as_deref_mut().filter(|node| has_key(node)) {
+            if node.object.exact_eq_stored(&object) {
+                if !node.pseudo_deleted {
+                    return (true, false);
+                }
+                node.pseudo_deleted = false;
+                if at_group_head {
+                    return (true, true);
+                }
+                // Move to the head of the key's run to preserve key insertion order.
+                let mut node = cursor.take().unwrap();
+                *cursor = node.next.take();
+                revived = Some(node);
+                break;
+            }
+            cursor = &mut cursor.as_mut().unwrap().next;
+            at_group_head = false;
+        }
+        if let Some(mut node) = revived {
+            node.next = link.take();
+            *link = Some(node);
+            return (true, true);
+        }
+    }
+    object.order = next_order();
+    object.group_order = group_order.unwrap_or(object.order);
+    *link = Some(Box::new(HashDbTerm {
+        next: link.take(),
+        hvalue,
+        pseudo_deleted: false,
+        object,
+    }));
+    (true, true)
+}
+
+/// The bucket walk of `db_erase_hash`; returns the number of items removed from the count.
+// Port of erts/emulator/beam/erl_db_hash.c:1613-1666 (db_erase_hash), OTP-29.1.1.
+fn erase_in_bucket(
+    bucket: &mut HashBucket,
+    hvalue: u64,
+    keypos: usize,
+    key: Term,
+    fixed: bool,
+) -> isize {
+    let mut link = &mut bucket.head;
+    let mut count = 0;
+    while let Some(mut node) = link.take() {
+        if !node.pseudo_deleted && node.hvalue == hvalue && exact_key(node.object.key(keypos), key)
+        {
+            count += 1;
+            if count == 1 && fixed {
+                // Pseudo remove (no need to keep several of the same key).
+                node.pseudo_deleted = true;
+                *link = Some(node);
+                link = &mut link.as_mut().unwrap().next;
+            } else {
+                *link = node.next.take();
+            }
+            continue;
+        }
+        let stop = count != 0 && !node.pseudo_deleted;
+        *link = Some(node);
+        if stop {
+            break;
+        }
+        link = &mut link.as_mut().unwrap().next;
+    }
+    count
+}
+
+/// The bucket walk of `db_erase_object_hash`.
+// Port of erts/emulator/beam/erl_db_hash.c:1669-1730 (db_erase_object_hash), OTP-29.1.1.
+fn erase_object_in_bucket(
+    bucket: &mut HashBucket,
+    hvalue: u64,
+    keypos: usize,
+    key: Term,
+    object: Term,
+    table_type: TableType,
+    fixed: bool,
+) -> isize {
+    let mut link = &mut bucket.head;
+    let (mut count, mut nkeys) = (0, 0);
+    while let Some(mut node) = link.take() {
+        let same_key = node.hvalue == hvalue && exact_key(node.object.key(keypos), key);
+        if same_key && !node.pseudo_deleted {
+            nkeys += 1;
+            if node.object.exact_eq_term(object) {
+                count += 1;
+                if nkeys == 1 && fixed {
+                    node.pseudo_deleted = true;
+                    *link = Some(node);
+                    link = &mut link.as_mut().unwrap().next;
+                } else {
+                    *link = node.next.take();
+                }
+                if table_type == TableType::DuplicateBag {
+                    continue;
+                }
+                break;
+            }
+        } else if count != 0 && !node.pseudo_deleted {
+            *link = Some(node);
+            break;
+        }
+        *link = Some(node);
+        link = &mut link.as_mut().unwrap().next;
+    }
+    count
+}
+
+/// The bucket walk of `db_take_hash`: the objects of the first live key and the number of
+/// nodes removed from the count.
+// Port of erts/emulator/beam/erl_db_hash.c:2949-3005 (db_take_hash), OTP-29.1.1.
+fn take_in_bucket<H: HeapAlloc>(
+    bucket: &mut HashBucket,
+    hvalue: u64,
+    keypos: usize,
+    key: Term,
+    table_type: TableType,
+    fixed: bool,
+    dst: &mut H,
+) -> Result<(Vec<Term>, isize), EtsError> {
+    let multi = matches!(table_type, TableType::Bag | TableType::DuplicateBag);
+    let has_key =
+        |node: &HashDbTerm| node.hvalue == hvalue && exact_key(node.object.key(keypos), key);
+    let mut values = Vec::new();
+    // The first live node, then (bag types) every following node of the same key:
+    // get_term_list's `bend` also spans pseudo-deleted ones, which are counted below.
+    let mut link = &mut bucket.head;
+    while link
+        .as_ref()
+        .is_some_and(|node| node.pseudo_deleted || !has_key(node))
+    {
+        link = &mut link.as_mut().unwrap().next;
+    }
+    let mut count = 0;
+    while let Some(mut node) = link.take() {
+        if !node.pseudo_deleted {
+            values.push(node.object.copy_out(dst)?);
+        }
+        count += 1;
+        // Pseudo remove only the first node (no need to keep several of the same key).
+        if fixed && count == 1 {
+            node.pseudo_deleted = true;
+            *link = Some(node);
+            link = &mut link.as_mut().unwrap().next;
+        } else {
+            *link = node.next.take();
+        }
+        if !multi || !link.as_ref().is_some_and(|next| has_key(next)) {
+            break;
+        }
+    }
+    if multi {
+        values.reverse();
+    }
+    Ok((values, count))
+}
+
 #[inline]
 fn exact_key(left: Term, right: Term) -> bool {
     arinsal_term::exact_eq(left, right)
@@ -2036,26 +2118,13 @@ fn exact_key(left: Term, right: Term) -> bool {
 /// Bucket storage detached from a table, released incrementally.
 pub struct HashGarbage {
     segments: Vec<Vec<HashBucket>>,
-    deleted: Vec<StoredTerm>,
 }
 
 impl HashGarbage {
-    /// Release up to `reds` reductions of work; `keep` receives live objects instead of freeing
-    /// them (a fixed table keeps them as pseudo-deleted). Returns whether everything is done.
+    /// Release up to `reds` reductions of work. Returns whether everything is done.
     ///
     /// Port of erts/emulator/beam/erl_db_hash.c:3122 (db_free_table_continue_hash), OTP-29.1.1.
-    pub(super) fn step(
-        &mut self,
-        reds: &mut isize,
-        mut keep: Option<&mut Vec<StoredTerm>>,
-    ) -> bool {
-        while let Some(object) = self.deleted.pop() {
-            drop(object);
-            *reds -= 1;
-            if *reds < 0 {
-                return false;
-            }
-        }
+    pub(super) fn step(&mut self, reds: &mut isize) -> bool {
         while let Some(mut segment) = self.segments.pop() {
             let mut records = 0isize;
             for bucket in segment.iter_mut() {
@@ -2063,9 +2132,6 @@ impl HashGarbage {
                 while let Some(mut current) = node {
                     node = current.next.take();
                     records += 1;
-                    if let Some(keep) = keep.as_deref_mut() {
-                        keep.push(current.object);
-                    }
                 }
             }
             *reds -= (EXT_SEGMENT / 64) as isize + records;

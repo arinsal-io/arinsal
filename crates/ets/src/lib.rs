@@ -1348,7 +1348,7 @@ impl StoredTerm {
         bytes.div_ceil(8)
     }
 
-    fn refc_binaries<H: HeapAlloc>(&self, dst: &mut H) -> Result<Vec<Term>, EtsError> {
+    pub(crate) fn refc_binaries<H: HeapAlloc>(&self, dst: &mut H) -> Result<Vec<Term>, EtsError> {
         // Port of erts/emulator/beam/erl_bif_info.c:179 (`erts_bld_bin_list`),
         // OTP-29.1.1. `Arc` owners model ProcBin references; the address is a
         // stable per-binary identifier, since allocator addresses cannot match erts.
@@ -1371,23 +1371,6 @@ impl StoredTerm {
             terms.push(builder.tuple(&[address, size, refc])?);
         }
         Ok(terms)
-    }
-
-    fn binary_refs(&self) -> Vec<(usize, usize)> {
-        let Some(off_heap) = self.heap.off_heap.as_ref() else {
-            return Vec::new();
-        };
-        off_heap
-            .binaries
-            .iter()
-            .map(|binary| (Arc::as_ptr(binary) as usize, binary.len()))
-            .chain(
-                off_heap
-                    .writable
-                    .iter()
-                    .map(|binary| (Arc::as_ptr(binary) as usize, binary.len())),
-            )
-            .collect()
     }
 
     fn term_for_match<H: HeapAlloc>(&self, scratch: &mut H) -> Result<Term, EtsError> {
@@ -1893,9 +1876,9 @@ impl Table {
         match &self.storage {
             Storage::Ordered(root) => Node::count(root),
             Storage::CATree(tree) => tree.count(),
-            Storage::Hash(storage) => (storage.size() as isize)
-                .wrapping_add(storage.size_bias.load(AtomicOrdering::Relaxed))
-                as usize,
+            // An unsigned view of the signed counter: erts reads it as Uint, so a counter pushed
+            // below zero by pseudo-deleted siblings (db_take_hash) wraps.
+            Storage::Hash(storage) => storage.size.load(AtomicOrdering::Relaxed) as usize,
         }
     }
 
@@ -2083,13 +2066,6 @@ impl Table {
                         object_words += object.db_size_words;
                     });
                     object_words
-                        + storage
-                            .deleted
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .map(|object| object.db_size_words)
-                            .sum::<usize>()
                 }
             }
         }
@@ -2256,17 +2232,7 @@ impl Table {
                 Ok(TermBuilder::new(dst).tuple(&[routes, bases, depth])?)
             }
             Storage::Hash(storage) => {
-                let mut lengths = vec![0_usize; storage.active_slots()];
-                storage.try_for_each_value(|object| {
-                    let slot = storage.slot_for_key(object.key(self.options.keypos));
-                    lengths[slot] += 1;
-                    Ok::<_, EtsError>(())
-                })?;
-                let deleted = storage.deleted.lock().unwrap();
-                for object in deleted.iter() {
-                    let slot = storage.slot_for_key(object.key(self.options.keypos));
-                    lengths[slot] += 1;
-                }
+                let (lengths, kept_items) = storage.chain_lengths();
                 let sum: usize = lengths.iter().sum();
                 let square_sum: usize = lengths.iter().map(|length| length * length).sum();
                 // db_calc_stats_hash stores these moments as C floats, then
@@ -2301,7 +2267,7 @@ impl Table {
                     expected,
                     Term::small(*lengths.iter().min().unwrap_or(&0) as i64).unwrap(),
                     Term::small(*lengths.iter().max().unwrap_or(&0) as i64).unwrap(),
-                    Term::small(deleted.len() as i64).unwrap(),
+                    Term::small(kept_items as i64).unwrap(),
                     Term::small(locks).unwrap(),
                 ])?)
             }
@@ -2379,6 +2345,7 @@ impl Table {
             ets_hash(key),
             self.options.keypos,
             object,
+            self.options.table_type,
             self.fixed > 0,
         );
         Ok(true)
@@ -2556,118 +2523,15 @@ impl Table {
             Storage::Ordered(root) => *root = Some(Node::insert(root.take(), object, keypos)),
             Storage::CATree(tree) => tree.insert(object),
             Storage::Hash(storage) => {
-                let key = object.key(keypos);
-                let mut object = object;
-                object.hvalue = hash >> 1;
-                let slot = storage.slot_index(hash >> 1);
-                if self.options.table_type == TableType::Set
-                    && let Some(old) = storage.find_object_mut_at(slot, &mut |old| {
-                        old.hvalue == (hash >> 1) && exact_eq(old.key(keypos), key)
-                    })
-                {
-                    object.order = old.order;
-                    object.group_order = old.group_order;
-                    *old = object;
-                    return;
-                }
-                if self.options.table_type == TableType::Set
-                    && storage.deleted.get_mut().unwrap().is_empty()
-                {
-                    object.order = storage.next_order.fetch_add(1, AtomicOrdering::Relaxed);
-                    object.group_order = object.order;
-                    storage.add_items(hash, 1);
-                    storage.push_at_key(slot, object, keypos);
-                    storage.maybe_grow(self.fixed > 0, keypos);
-                    return;
-                }
-                let mut live_order = None;
-                let mut existing_group_order = None;
-                if self.options.table_type != TableType::Set {
-                    storage.with_objects_hash(hash, |objects| {
-                        for old in objects {
-                            if old.hvalue == (hash >> 1) && exact_eq(old.key(keypos), key) {
-                                existing_group_order.get_or_insert(old.group_order);
-                                if self.options.table_type == TableType::Bag
-                                    && old.exact_eq_stored(&object)
-                                {
-                                    live_order = Some(
-                                        live_order
-                                            .map_or(old.order, |order: u64| order.max(old.order)),
-                                    );
-                                }
-                                // Port of erts/emulator/beam/erl_db_hash.c:1363-1451
-                                // (db_put_hash), OTP-29.1.1: duplicate_bag falls through to Lnew
-                                // as soon as its key is found; unlike bag it does not scan siblings.
-                                if self.options.table_type == TableType::DuplicateBag {
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                }
-                if self.options.table_type == TableType::Bag {
-                    // Port of erts/emulator/beam/erl_db_hash.c:1300 (bag insertion), OTP-29.1.1.
-                    let deleted_guard = storage.deleted.get_mut().unwrap();
-                    let deleted_order = deleted_guard
-                        .iter()
-                        .filter(|old| old.exact_eq_stored(&object))
-                        .map(|old| old.order)
-                        .max();
-                    if live_order.is_some_and(|order| deleted_order.is_none_or(|dead| order > dead))
-                    {
-                        return;
-                    }
-                }
-                let deleted_guard = storage.deleted.get_mut().unwrap();
-                let tombstone_order = deleted_guard
-                    .iter()
-                    .find(|old| exact_eq(old.key(keypos), key))
-                    .map(|old| old.group_order);
-                let revived_index = match self.options.table_type {
-                    TableType::Set => deleted_guard
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, old)| exact_eq(old.key(keypos), key))
-                        .max_by_key(|(_, old)| old.order)
-                        .map(|(index, _)| index),
-                    TableType::Bag if !new_only => deleted_guard
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, old)| old.exact_eq_stored(&object))
-                        .max_by_key(|(_, old)| old.order)
-                        .map(|(index, _)| index),
-                    _ => None,
-                };
-                let revived = revived_index.map(|index| deleted_guard.remove(index));
-                if self.options.table_type == TableType::Set
-                    && let Some(old) = &revived
-                {
-                    object.order = old.order;
-                    object.group_order = old.group_order;
-                    storage.push_at_order(slot, object);
-                    storage.add_items(hash, 1);
-                    return;
-                }
-                object.order = storage.next_order.fetch_add(1, AtomicOrdering::Relaxed);
-                object.group_order = if self.options.table_type == TableType::Set {
-                    object.order
-                } else {
-                    existing_group_order.unwrap_or(object.order)
-                };
-                if let Some(order) = revived
-                    .as_ref()
-                    .map(|old| old.group_order)
-                    .or(tombstone_order)
-                {
-                    object.group_order = order;
-                }
-                if existing_group_order.is_none() && tombstone_order.is_some() {
-                    storage.push_at_order(slot, object);
-                } else {
-                    storage.push_at_key(slot, object, keypos);
-                }
-                storage.add_items(hash, 1);
-                storage.maybe_grow(self.fixed > 0, keypos);
+                let accepted = storage.insert_exclusive(
+                    object,
+                    hash,
+                    self.options.table_type,
+                    keypos,
+                    self.fixed > 0,
+                    new_only,
+                );
+                debug_assert!(accepted || new_only);
             }
         }
     }
@@ -2978,17 +2842,7 @@ impl Table {
             Storage::Ordered(root) => *root = Node::remove(root.take(), key, self.options.keypos),
             Storage::CATree(tree) => tree.delete(key),
             Storage::Hash(storage) => {
-                let hash = ets_hash(key);
-                let (mut removed, count) = storage.detach_live_matching(hash >> 1, |object| {
-                    object.hvalue == (hash >> 1) && exact_eq(object.key(self.options.keypos), key)
-                });
-                storage.add_items(ets_hash(key), -(count as isize));
-                if fixed && let Some(object) = removed.take_first() {
-                    storage.retain_fixed_delete(object);
-                }
-                if !fixed {
-                    storage.shrink_after_delete(self.options.keypos);
-                }
+                storage.delete_key_exclusive(key, ets_hash(key), self.options.keypos, fixed);
             }
         }
     }
@@ -3006,27 +2860,14 @@ impl Table {
                 }
             }
             Storage::CATree(tree) => tree.delete_object(key, object),
-            Storage::Hash(storage) => {
-                let hash = ets_hash(key);
-                let (mut removed, count) = storage.detach_live_matching(hash >> 1, |found| {
-                    found.hvalue == (hash >> 1) && found.exact_eq_term(object)
-                });
-                storage.add_items(hash, -(count as isize));
-                let key_remains = storage.with_objects_hash(hash, |objects| {
-                    objects.into_iter().any(|found| {
-                        found.hvalue == (hash >> 1) && exact_eq(found.key(self.options.keypos), key)
-                    })
-                });
-                if fixed
-                    && !key_remains
-                    && let Some(object) = removed.take_first()
-                {
-                    storage.retain_fixed_delete(object);
-                }
-                if !fixed {
-                    storage.shrink_after_delete(self.options.keypos);
-                }
-            }
+            Storage::Hash(storage) => storage.delete_object_exclusive(
+                key,
+                ets_hash(key),
+                self.options.keypos,
+                object,
+                self.options.table_type,
+                fixed,
+            ),
         }
         Ok(())
     }
@@ -3041,32 +2882,24 @@ impl Table {
             Storage::Ordered(root) => Garbage(GarbageKind::Tree(root.take().into_iter().collect())),
             Storage::CATree(tree) => Garbage(GarbageKind::Tree(tree.take_all())),
             Storage::Hash(storage) => {
-                let garbage = storage.take_garbage(whole);
+                // A fixed table keeps its objects pseudo-deleted in place, so there is nothing
+                // to release (db_mark_all_deleted_hash).
+                let garbage = if !whole && self.fixed > 0 {
+                    storage.mark_all_deleted();
+                    storage.empty_garbage()
+                } else {
+                    storage.take_garbage()
+                };
                 storage.size.store(0, AtomicOrdering::Relaxed);
-                storage.size_bias.store(0, AtomicOrdering::Relaxed);
-                Garbage(GarbageKind::Hash {
-                    garbage,
-                    keep: !whole && self.fixed > 0,
-                })
+                Garbage(GarbageKind::Hash(garbage))
             }
         }
     }
 
-    /// Release `garbage` taken from this table within `reds` reductions; a fixed hash table
-    /// keeps its objects pseudo-deleted. Returns whether all of it is released.
+    /// Release `garbage` taken from this table within `reds` reductions. Returns whether all of
+    /// it is released.
     pub fn free_garbage(&mut self, garbage: &mut Garbage, reds: &mut isize) -> bool {
-        // An unfix while the release is in progress turns the remaining objects into garbage.
-        let fixed = self.fixed > 0;
-        match (&mut garbage.0, &mut self.storage) {
-            (
-                GarbageKind::Hash {
-                    garbage,
-                    keep: true,
-                },
-                Storage::Hash(storage),
-            ) if fixed => garbage.step(reds, Some(storage.deleted.get_mut().unwrap())),
-            _ => garbage.step(reds),
-        }
+        garbage.step(reds)
     }
 
     /// Remove every object.
@@ -3076,13 +2909,11 @@ impl Table {
             Storage::CATree(tree) => tree.clear(),
             Storage::Hash(storage) => {
                 if self.fixed > 0 {
-                    let objects = storage.take_all_buckets();
-                    storage.deleted.get_mut().unwrap().extend(objects);
+                    storage.mark_all_deleted();
                 } else {
                     storage.clear_buckets();
                 }
                 storage.size.store(0, AtomicOrdering::Relaxed);
-                storage.size_bias.store(0, AtomicOrdering::Relaxed);
             }
         }
     }
@@ -3121,10 +2952,10 @@ impl Table {
         self.edge(false, dst)
     }
 
-    /// Raw successor key. Unlike `next`, the supplied key must exist.
+    /// Raw successor key. A hash table accepts pseudo-deleted keys; tree tables share `next`.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:4196 and erl_db_tree.c raw-next,
-    /// OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c:4196 (db_raw_next_hash), erl_db_tree.c:540 and
+    /// erl_db_catree.c:242, OTP-29.1.1.
     pub fn raw_next<H: HeapAlloc>(&self, key: Term, dst: &mut H) -> Result<Option<Term>, EtsError> {
         if let Storage::Hash(storage) = &self.storage {
             return storage
@@ -3132,9 +2963,7 @@ impl Table {
                 .map(|key| Ok(copy_term(key, dst)?))
                 .transpose();
         }
-        if !self.member(key) {
-            return Err(EtsError::BadArg);
-        }
+        // The tree methods use db_next_tree/db_next_catree: a deleted key is not an error.
         self.next(key, dst)
     }
 
@@ -3151,9 +2980,11 @@ impl Table {
         match &self.storage {
             Storage::Hash(storage) => {
                 let hash = ets_hash(key);
-                storage.with_objects_hash(hash, |objects| {
+                storage.with_raw_objects_hash(hash, |objects| {
                     for object in objects {
-                        if exact_eq(object.key(self.options.keypos), key) {
+                        if object.hvalue == hash >> 1
+                            && exact_eq(object.key(self.options.keypos), key)
+                        {
                             binaries.extend(object.refc_binaries(dst)?);
                         }
                     }
@@ -3166,105 +2997,27 @@ impl Table {
                 }
             }
             Storage::CATree(tree) => {
-                for object in tree.matching(key)? {
-                    binaries.extend(object.refc_binaries(dst)?);
-                }
+                binaries = tree.binary_info(key, dst)?;
             }
         }
         Ok(binaries)
     }
 
-    /// Return ref-counted binary information for every object in the table.
-    ///
-    /// Port of the `ets_info_binary_iter` traversal in `erts/preloaded/src/erts_internal.erl`
-    /// and `erts/emulator/beam/erl_db.c:4648`, OTP-29.1.1.
-    pub fn all_binary_info<H: HeapAlloc>(&self, dst: &mut H) -> Result<Vec<Term>, EtsError> {
-        let mut records = Vec::new();
-        if let Storage::Hash(storage) = &self.storage {
-            storage.for_each_value(|object| {
-                records.extend(object.binary_refs());
-            });
-            let deleted = storage.deleted.lock().unwrap();
-            for object in deleted.iter() {
-                records.extend(object.binary_refs());
-            }
-        } else {
-            let mut key = self.raw_first(dst)?;
-            while let Some(current) = key {
-                match &self.storage {
-                    Storage::Ordered(root) => {
-                        if let Some(object) = Node::get(root, current, self.options.keypos) {
-                            records.extend(object.binary_refs());
-                        }
-                    }
-                    Storage::CATree(tree) => {
-                        for object in tree.matching(current)? {
-                            records.extend(object.binary_refs());
-                        }
-                    }
-                    Storage::Hash(_) => unreachable!(),
-                }
-                key = self.raw_next(current, dst)?;
-            }
-        }
-        let mut counts = HashMap::new();
-        for (address, _) in &records {
-            *counts.entry(*address).or_insert(0usize) += 1;
-        }
-        let mut result = Vec::with_capacity(records.len());
-        for (address, size) in records {
-            let count = counts[&address] + 1;
-            let mut builder = TermBuilder::new(dst);
-            let address = builder.int_from_i128(address as i128)?;
-            let size = builder.int_from_i128(size as i128)?;
-            let count = builder.int_from_i128(count as i128)?;
-            result.push(builder.tuple(&[address, size, count])?);
-        }
-        Ok(result)
-    }
-
     /// Return and remove all objects at a key.
     pub fn take<H: HeapAlloc>(&mut self, key: Term, dst: &mut H) -> Result<Vec<Term>, EtsError> {
-        let result = self.lookup(key, dst)?;
-        // Port of erl_db_hash.c:2949 (db_take_hash), OTP-29.1.1. Its loop
-        // decrements the item counter for pseudo-deleted records after the
-        // first live record, even though they are absent from the result.
-        let (pseudo_count, first_live_order) = if result.is_empty() {
-            (0, None)
-        } else if let Storage::Hash(storage) = &self.storage {
-            let hash = ets_hash(key);
-            let first_live_order = storage.with_objects_hash(hash, |objects| {
-                objects
-                    .filter(|object| exact_eq(object.key(self.options.keypos), key))
-                    .map(|object| object.order)
-                    .max()
-            });
-            let count = first_live_order.map_or(0, |order| {
-                storage
-                    .deleted
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|deleted| {
-                        exact_eq(deleted.key(self.options.keypos), key) && deleted.order < order
-                    })
-                    .count()
-            });
-            (count, first_live_order)
-        } else {
-            (0, None)
-        };
-        self.delete_key(key);
+        let fixed = self.fixed > 0;
         if let Storage::Hash(storage) = &mut self.storage {
-            storage
-                .size_bias
-                .fetch_sub(pseudo_count as isize, AtomicOrdering::Relaxed);
-            if let Some(order) = first_live_order {
-                storage.deleted.get_mut().unwrap().retain(|deleted| {
-                    !exact_eq(deleted.key(self.options.keypos), key) || deleted.order >= order
-                });
-            }
+            return storage.take_exclusive(
+                key,
+                ets_hash(key),
+                self.options.keypos,
+                self.options.table_type,
+                fixed,
+                dst,
+            );
         }
+        let result = self.lookup(key, dst)?;
+        self.delete_key(key);
         Ok(result)
     }
 
@@ -3567,7 +3320,7 @@ impl Table {
             if self.fixed == 0
                 && let Storage::Hash(storage) = &mut self.storage
             {
-                storage.deleted.get_mut().unwrap().clear();
+                storage.unfix();
             }
             if self.fixed == 0 {
                 self.fixed_system_time = None;
@@ -4608,8 +4361,8 @@ impl Table {
 pub struct Garbage(GarbageKind);
 
 enum GarbageKind {
-    /// Hash buckets; `keep` moves live objects to the table's pseudo-deleted list.
-    Hash { garbage: HashGarbage, keep: bool },
+    /// Hash buckets.
+    Hash(HashGarbage),
     /// Tree nodes still to be freed.
     #[expect(clippy::vec_box, reason = "tree links already own boxed nodes")]
     Tree(Vec<Box<Node>>),
@@ -4623,7 +4376,7 @@ impl Garbage {
     /// erl_db_hash.c:3122 (db_free_table_continue_hash), OTP-29.1.1.
     pub fn step(&mut self, reds: &mut isize) -> bool {
         match &mut self.0 {
-            GarbageKind::Hash { garbage, .. } => garbage.step(reds, None),
+            GarbageKind::Hash(garbage) => garbage.step(reds),
             GarbageKind::Tree(stack) => {
                 while let Some(mut node) = stack.pop() {
                     stack.extend(node.left.take());
