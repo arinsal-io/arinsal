@@ -344,15 +344,16 @@ pub(crate) fn control(
     byte_list(process, &reply)
 }
 
-pub(crate) fn command(id: u64, caller: Pid, data: &[u8]) -> Result<(), VmError> {
+pub(crate) fn command(id: u64, caller: Pid, data: Vec<u8>) -> Result<(), VmError> {
     let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
         return Err(badarg());
     };
     // Port of inet_drv.c:13736 (tcp_sendv) and :12629 (tcp_inet_command), OTP-29.1.1.
-    let (ids, payload) = split_caller(data).ok_or_else(badarg)?;
+    let (ids, payload) = split_caller(&data).ok_or_else(badarg)?;
+    let start = data.len() - payload.len();
     let outcome = {
         let mut inner = sock.inner.lock().unwrap();
-        accept_send(&mut inner, caller, ids, payload)
+        accept_send(&mut inner, caller, ids, SendData::Owned(data, start))
     };
     match outcome {
         SendOutcome::Reply(error) => emit(&sock, Out::InetReply { caller, ids, error }),
@@ -400,7 +401,12 @@ pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<bool, VmError> {
     let outcome = {
         let mut inner = sock.inner.lock().unwrap();
         // Dummy caller/ids: dist never waits on inet_reply for these writes.
-        accept_send(&mut inner, Pid::new(0, 0), [0, 0, 0], data)
+        accept_send(
+            &mut inner,
+            Pid::new(0, 0),
+            [0, 0, 0],
+            SendData::Borrowed(data),
+        )
     };
     match outcome {
         SendOutcome::Reply(_) | SendOutcome::Deferred => {}
@@ -434,70 +440,130 @@ enum SendOutcome {
     Failed { error: &'static str, active: bool },
 }
 
-fn accept_send(inner: &mut Inner, caller: Pid, ids: [u32; 3], payload: &[u8]) -> SendOutcome {
-    // Port of inet_drv.c:13736 (tcp_sendv), OTP-29.1.1.
+/// Bytes handed to `tcp_sendv`: the port command keeps its flattened buffer (the
+/// payload starts at the offset), distribution borrows its packet.
+enum SendData<'a> {
+    Owned(Vec<u8>, usize),
+    Borrowed(&'a [u8]),
+}
+
+impl SendData<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            SendData::Owned(buf, start) => &buf[*start..],
+            SendData::Borrowed(bytes) => bytes,
+        }
+    }
+
+    /// Queue the payload from `skip` on. An owned buffer moves into the queue.
+    fn enqueue(self, q: &mut IoQueue, skip: usize) {
+        match self {
+            SendData::Owned(buf, start) => q.enq_owned(buf, start + skip),
+            SendData::Borrowed(bytes) => q.enq(&bytes[skip..]),
+        }
+    }
+}
+
+fn accept_send(
+    inner: &mut Inner,
+    caller: Pid,
+    ids: [u32; 3],
+    payload: SendData<'_>,
+) -> SendOutcome {
+    // Port of erts/emulator/drivers/common/inet_drv.c:13736-13847 (tcp_sendv), OTP-29.1.1.
     if inner.peer_closed {
         return SendOutcome::Reply(Some(close_atom(inner)));
     }
     if inner.phase != Phase::Connected {
         return SendOutcome::Reply(Some("enotconn"));
     }
-    // Header widths are 1, 2 and 4; htype 3 is TCP_PB_4 (inet_drv.c:13745).
-    let hlen = match inner.htype {
-        1 => 1,
-        2 => 2,
-        3 => 4,
+    let len = payload.bytes().len();
+    // inet_drv.c:13745-13761: TCP_PB_1/2/4 headers; htype 3 is TCP_PB_4.
+    let mut hdr = [0u8; 4];
+    let h_len = match inner.htype {
+        1 => {
+            hdr[0] = len as u8;
+            1
+        }
+        2 => {
+            hdr[..2].copy_from_slice(&(len as u16).to_be_bytes());
+            2
+        }
+        3 => {
+            hdr.copy_from_slice(&(len as u32).to_be_bytes());
+            4
+        }
         _ => 0,
     };
-    let frame = framed(inner.htype, payload);
-    output_count(inner, frame.len());
-    let before = inner.sendq.len();
-    if before == 0 && hlen == 0 && payload.is_empty() {
+    output_count(inner, len + h_len);
+    let sz = inner.sendq.size();
+    if sz > 0 {
+        // inet_drv.c:13773-13793: queue behind pending output; busy at `high`.
+        inner.sendq.enq(&hdr[..h_len]);
+        payload.enqueue(&mut inner.sendq, 0);
+        if sz + len + h_len >= inner.high.max(0) as usize {
+            if inner.send_timeout == 0 {
+                return SendOutcome::Reply(Some("timeout"));
+            }
+            inner.busy = true;
+            let deadline = if inner.send_timeout < 0 {
+                None
+            } else {
+                Some(Instant::now() + Duration::from_millis(inner.send_timeout as u64))
+            };
+            inner.send_waits.push(SendWait {
+                caller,
+                ids,
+                deadline,
+            });
+            return SendOutcome::Deferred;
+        }
         return SendOutcome::Reply(None);
     }
-    if before == 0 && inner.delay_send {
-        inner.sendq.extend(frame);
+    if h_len == 0 && len == 0 {
         return SendOutcome::Reply(None);
     }
-    if before == 0 {
-        inner.sendq.extend(frame);
-        if let Some(err) = flush_send(inner) {
+    if inner.delay_send {
+        // inet_drv.c:13810-13814: queue; output runs on the next write event.
+        inner.sendq.enq(&hdr[..h_len]);
+        payload.enqueue(&mut inner.sendq, 0);
+        return SendOutcome::Reply(None);
+    }
+    let Some(fd) = inner.fd.as_ref().map(AsRawFd::as_raw_fd) else {
+        return SendOutcome::Reply(Some("enotconn"));
+    };
+    // inet_drv.c:13815-13844: one sock_sendv of header and payload, then queue
+    // whatever was not written (driver_enqv with skip = bytes sent).
+    let iov = [
+        libc::iovec {
+            iov_base: hdr.as_ptr() as *mut libc::c_void,
+            iov_len: h_len,
+        },
+        libc::iovec {
+            iov_base: payload.bytes().as_ptr() as *mut libc::c_void,
+            iov_len: len,
+        },
+    ];
+    let n = sock_sendv(fd, &iov);
+    let n = if n < 0 {
+        let err = last_errno();
+        if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
             return send_failed(inner, err);
         }
+        0
+    } else {
+        n as usize
+    };
+    if n == len + h_len {
         return SendOutcome::Reply(None);
     }
-    inner.sendq.extend(frame);
-    let queued = before + payload.len() + hlen;
-    if queued >= inner.high.max(0) as usize {
-        if inner.send_timeout == 0 {
-            return SendOutcome::Reply(Some("timeout"));
-        }
-        inner.busy = true;
-        let deadline = if inner.send_timeout < 0 {
-            None
-        } else {
-            Some(Instant::now() + Duration::from_millis(inner.send_timeout as u64))
-        };
-        inner.send_waits.push(SendWait {
-            caller,
-            ids,
-            deadline,
-        });
-        return SendOutcome::Deferred;
+    if n < h_len {
+        inner.sendq.enq(&hdr[n..h_len]);
+        payload.enqueue(&mut inner.sendq, 0);
+    } else {
+        payload.enqueue(&mut inner.sendq, n - h_len);
     }
     SendOutcome::Reply(None)
-}
-
-fn framed(htype: i32, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(payload.len() + 4);
-    match htype {
-        1 => buf.push(payload.len() as u8),
-        2 => buf.extend_from_slice(&(payload.len() as u16).to_be_bytes()),
-        3 => buf.extend_from_slice(&(payload.len() as u32).to_be_bytes()),
-        _ => {}
-    }
-    buf.extend_from_slice(payload);
-    buf
 }
 
 fn send_failed(inner: &mut Inner, err: i32) -> SendOutcome {
@@ -1393,7 +1459,7 @@ fn getstat(inner: &Inner, data: &[u8]) -> Vec<u8> {
             5 => put_u32(&mut out, inner.send_cnt),
             6 => put_u32(&mut out, inner.send_max as u32),
             7 => put_u32(&mut out, trunc_stat(inner.send_avg)),
-            8 => put_u32(&mut out, inner.sendq.len() as u32),
+            8 => put_u32(&mut out, inner.sendq.size() as u32),
             9 => put_u64(&mut out, inner.recv_oct),
             10 => put_u64(&mut out, inner.send_oct),
             _ => return err_bytes("einval"),
@@ -1452,7 +1518,7 @@ fn subscribe(inner: &Inner, data: &[u8]) -> Vec<u8> {
             return err_bytes("einval");
         }
         out.push(1);
-        put_u32(&mut out, inner.sendq.len() as u32);
+        put_u32(&mut out, inner.sendq.size() as u32);
     }
     ok_bytes(&out)
 }
@@ -1922,15 +1988,18 @@ fn input_count(inner: &mut Inner, len: usize) {
     inner.recv_cnt = n;
 }
 
+/// Send queued output until the queue is empty or the socket would block.
+///
+/// Port of erts/emulator/drivers/common/inet_drv.c:14295-14361 (`tcp_inet_output`
+/// send loop), OTP-29.1.1: `driver_peekq`, one `sock_sendv` of at most `MAX_VSIZE`
+/// entries, then `driver_deq` of the bytes written. Queued bytes are not copied.
 fn flush_send(inner: &mut Inner) -> Option<i32> {
     let fd = inner.fd.as_ref()?;
     let fd = fd.as_raw_fd();
     while !inner.sendq.is_empty() {
-        let buf: Vec<u8> = inner.sendq.iter().copied().collect();
-        // SAFETY: fd is the connected socket this driver owns.
-        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        let n = sock_sendv(fd, &inner.sendq.peekq(max_vsize()));
         if n > 0 {
-            inner.sendq.drain(..n as usize);
+            inner.sendq.deq(n as usize);
         } else if n < 0 {
             let err = last_errno();
             if err == libc::EAGAIN || err == libc::EWOULDBLOCK || err == libc::EINTR {
@@ -1946,8 +2015,104 @@ fn flush_send(inner: &mut Inner) -> Option<i32> {
     None
 }
 
+/// `sock_sendv`: one `writev` of `iov`. Port of erts/emulator/drivers/common/inet_drv.c:649-650, OTP-29.1.1.
+///
+/// Every `iovec` must point into memory that stays alive and unmodified for the call.
+fn sock_sendv(fd: RawFd, iov: &[libc::iovec]) -> isize {
+    // SAFETY: fd is a socket this driver owns; the callers build `iov` from borrowed
+    // slices (the send header and payload, or segments held by `sendq`) that outlive
+    // this call and are only read by `writev`.
+    unsafe { libc::writev(fd, iov.as_ptr(), iov.len() as libc::c_int) }
+}
+
+/// `MAX_VSIZE`: the most entries one `sock_sendv` passes.
+///
+/// Port of erts/emulator/drivers/common/inet_drv.c:1319-1321 and :4532-4537
+/// (`iov_max = sysconf(_SC_IOV_MAX)`, POSIX minimum 16), OTP-29.1.1.
+fn max_vsize() -> usize {
+    static IOV_MAX: OnceLock<usize> = OnceLock::new();
+    *IOV_MAX.get_or_init(|| {
+        // SAFETY: sysconf only reads a system limit.
+        let n = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+        if n > 0 { n as usize } else { 16 }
+    })
+}
+
+/// Driver output queue: segments written with `writev` and released as sent.
+///
+/// Port of erts/emulator/beam/erl_io_queue.c:233-284 (`erts_ioq_enqv`), :349-379
+/// (`erts_ioq_deq`) and :400-410 (`erts_ioq_peekq`), OTP-29.1.1. A queued buffer
+/// is never copied again: `deq` drops whole segments and advances into the first.
+#[derive(Default)]
+struct IoQueue {
+    segs: VecDeque<(Vec<u8>, usize)>,
+    size: usize,
+}
+
+impl IoQueue {
+    /// `driver_sizeq`.
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// `driver_enq`: copy `bytes` into a new segment; zero-length items are dropped.
+    fn enq(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.size += bytes.len();
+            self.segs.push_back((bytes.to_vec(), 0));
+        }
+    }
+
+    /// `driver_enqv` with a skip: queue `buf[start..]` without copying it.
+    fn enq_owned(&mut self, buf: Vec<u8>, start: usize) {
+        if start < buf.len() {
+            self.size += buf.len() - start;
+            self.segs.push_back((buf, start));
+        }
+    }
+
+    /// `driver_peekq`, limited to `max` entries.
+    fn peekq(&self, max: usize) -> Vec<libc::iovec> {
+        self.segs
+            .iter()
+            .take(max)
+            .map(|(buf, start)| libc::iovec {
+                iov_base: buf[*start..].as_ptr() as *mut libc::c_void,
+                iov_len: buf.len() - start,
+            })
+            .collect()
+    }
+
+    /// `driver_deq`: drop `n` bytes from the head.
+    fn deq(&mut self, mut n: usize) {
+        self.size -= n.min(self.size);
+        while n > 0 {
+            let Some((buf, start)) = self.segs.front_mut() else {
+                break;
+            };
+            let len = buf.len() - *start;
+            if len <= n {
+                n -= len;
+                self.segs.pop_front();
+            } else {
+                *start += n;
+                n = 0;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.segs.clear();
+        self.size = 0;
+    }
+}
+
 fn release_unbusy(inner: &mut Inner) {
-    if inner.busy && inner.sendq.len() <= inner.low.max(0) as usize {
+    if inner.busy && inner.sendq.size() <= inner.low.max(0) as usize {
         inner.busy = false;
         inner.ready.append(&mut inner.send_waits);
     }
@@ -2082,7 +2247,7 @@ struct Inner {
     backlog: i32,
     op_ref: u16,
     rbuf: Vec<u8>,
-    sendq: VecDeque<u8>,
+    sendq: IoQueue,
     recv: Option<Recv>,
     accept_q: VecDeque<Waiter>,
     connect: Option<Waiter>,
@@ -2153,7 +2318,7 @@ impl Default for Inner {
             backlog: 5,
             op_ref: 0,
             rbuf: Vec::new(),
-            sendq: VecDeque::new(),
+            sendq: IoQueue::default(),
             recv: None,
             accept_q: VecDeque::new(),
             connect: None,
