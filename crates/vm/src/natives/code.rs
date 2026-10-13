@@ -538,9 +538,9 @@ pub(crate) fn module_loaded_light(
     let [module] = args else {
         return None;
     };
-    let name = global_atoms().text(module.as_atom()?)?;
+    let name = module.as_atom()?;
     let tables = process.runtime.as_ref()?.active_code_tables();
-    Some(Ok(Term::atom(if tables.loaded.contains_key(name) {
+    Some(Ok(Term::atom(if tables.loaded.contains_key(&name) {
         atoms::TRUE
     } else {
         atoms::FALSE
@@ -556,14 +556,15 @@ pub(crate) fn function_exported_light(
     let [module, function, arity] = args else {
         return None;
     };
-    let module = global_atoms().text(module.as_atom()?)?;
-    let function = global_atoms().text(function.as_atom()?)?;
+    let module = module.as_atom()?;
+    let function = function.as_atom()?;
     let arity = u8::try_from(arity.as_small().filter(|n| (0..=255).contains(n))?).ok()?;
     let tables = process.runtime.as_ref()?.active_code_tables();
-    let exported = tables
-        .loaded
-        .get(module)
-        .is_some_and(|id| tables.modules[*id].export_slot(function, arity).is_some());
+    let exported = tables.loaded.get(&module).is_some_and(|id| {
+        tables.modules[*id]
+            .export_slot_atom(function, arity)
+            .is_some()
+    });
     Some(Ok(Term::atom(if exported {
         atoms::TRUE
     } else {
@@ -1476,12 +1477,7 @@ fn call_values(
             }))
         })()),
         ("erlang", "loaded", 0) => Some({
-            let modules = vm
-                .code
-                .loaded
-                .keys()
-                .map(|name| atom(name))
-                .collect::<Vec<_>>();
+            let modules = vm.code.loaded.keys().map(atom).collect::<Vec<_>>();
             make_list(process, modules)
         }),
         ("erlang", "pre_loaded", 0) => Some(make_list(

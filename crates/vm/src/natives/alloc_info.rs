@@ -137,12 +137,9 @@ fn request_allocators(
         // Port of erts/emulator/beam/erl_alloc.c (reply_alloc_info), OTP-29.1.1: the counts
         // are read when this scheduler executes the request, not when it was issued.
         let timer_count = runtime
-            .timers
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|timer| timer.worker_id().saturating_sub(1) == worker)
-            .count() as u64;
+            .scheduler()
+            .map_or(0, |scheduler| scheduler.bif_timer_count(worker))
+            as u64;
         let data =
             allocator_data_owned(&names, values, !memory_internal || worker == 0, timer_count);
         let reply = OwnedTerm::Tuple(vec![

@@ -834,9 +834,6 @@ pub(crate) struct Runtime {
     /// `process_reg` (`regtab_rwmtx`). Names are atom indexes, not strings.
     pub(crate) reg: crate::register::RegisterTable,
     aliases: AliasTable,
-    pub(crate) timers: Mutex<IdMap<arinsal_sched::TimerRef>>,
-    pub(crate) timer_owners: Mutex<IdMap<Pid>>,
-    pub(crate) timer_messages: Mutex<IdMap<arinsal_etf::OwnedTerm>>,
     pub(crate) next_trace_weak_id: AtomicU64,
     pub(crate) ports: Mutex<HashMap<u64, Arc<crate::port::PortHandle>>>,
     pub(crate) system_monitor: Mutex<Option<crate::natives::erts_debug::SystemMonitorState>>,
@@ -992,10 +989,7 @@ impl Drop for SuspendTotals<'_> {
     }
 }
 
-/// A hash map keyed by a counter id (timer ids, reference ids): one multiply, no SipHash.
-pub(crate) type IdMap<V> = HashMap<u64, V, std::hash::BuildHasherDefault<IdHasher>>;
-
-/// Fibonacci hashing of one `u64` key; the counters it hashes are not adversarial.
+/// Fibonacci hashing of one `u64` or `u32` key (module atoms); not adversarial input.
 #[derive(Default)]
 pub(crate) struct IdHasher(u64);
 
@@ -1010,6 +1004,9 @@ impl std::hash::Hasher for IdHasher {
     }
     fn write_u64(&mut self, value: u64) {
         self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
     }
 }
 
@@ -1124,42 +1121,6 @@ impl Runtime {
             }
         } else {
             slot.monitored_by.retain(|(reference, _)| *reference != id);
-        }
-    }
-
-    pub(crate) fn cancel_owned_timers(&self, owner: Pid) {
-        let ids = {
-            let mut owners = self.timer_owners.lock().unwrap();
-            let ids = owners
-                .iter()
-                .filter_map(|(&id, &timer_owner)| (timer_owner == owner).then_some(id))
-                .collect::<Vec<_>>();
-            for id in &ids {
-                owners.remove(id);
-            }
-            ids
-        };
-        if ids.is_empty() {
-            return;
-        }
-        let timers = {
-            let mut timers = self.timers.lock().unwrap();
-            ids.iter()
-                .filter_map(|id| timers.remove(id))
-                .collect::<Vec<_>>()
-        };
-        {
-            let mut messages = self.timer_messages.lock().unwrap();
-            for id in ids {
-                messages.remove(&id);
-            }
-        }
-        if let Ok(scheduler) = self.scheduler() {
-            for timer in timers {
-                // Port of erts/emulator/beam/erl_hl_timer.c (erts_cancel_bif_timers), OTP-29.1.1:
-                // the owning scheduler's wheel is asked asynchronously.
-                scheduler.cancel_timer_async(timer, |_| {});
-            }
         }
     }
 }
@@ -4480,6 +4441,21 @@ impl Runtime {
         wake
     }
 
+    /// `erts_pause_proc_timer`: one more suspend holds `target`'s receive timeout and the BIF
+    /// timers aimed at it. The count nests like erts' `paused_bif_timers->count`.
+    // Port of erts/emulator/beam/erl_hl_timer.c:2849 (erts_pause_proc_timer), OTP-29.1.1.
+    #[allow(dead_code)]
+    pub(crate) fn erts_pause_proc_timer(&self, target: Pid) {
+        self.pause_timers(target, 1);
+    }
+
+    /// `erts_resume_paused_proc_timer`: the last resume re-arms what the pauses held.
+    // Port of erts/emulator/beam/erl_hl_timer.c:2919 (erts_resume_paused_proc_timer), OTP-29.1.1.
+    #[allow(dead_code)]
+    pub(crate) fn erts_resume_proc_timer(&self, target: Pid) {
+        self.resume_timers(target, 1);
+    }
+
     /// A suspend monitor became active on `target`: its receive timeout and the BIF timers
     /// aimed at it stop counting down.
     /// Port of erts/emulator/beam/erl_process.c:9140 (erts_internal_suspend_process_2) and
@@ -4874,20 +4850,6 @@ impl Process {
             .map_err(|error| VmError::Unsupported(format!("signal tuple: {error:?}")))
     }
 
-    fn retire_timer_reference(&self, reference: arinsal_sched::TimerRef) -> Option<u64> {
-        let runtime = self.runtime.as_ref()?;
-        let mut timers = runtime.timers.lock().unwrap();
-        let id = timers
-            .iter()
-            .find_map(|(&id, &timer)| (timer == reference).then_some(id));
-        if let Some(id) = id {
-            timers.remove(&id);
-            runtime.timer_owners.lock().unwrap().remove(&id);
-            runtime.timer_messages.lock().unwrap().remove(&id);
-        }
-        id
-    }
-
     fn notify_exit(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
         self.exit_stage1(vm, ctx, reason);
         self.exit_cont = Some(Box::new(crate::proc_create::ExitCont {
@@ -4999,9 +4961,6 @@ impl Process {
         // g_proc_sched: a terminating suspender releases every suspend it acquired.
         // g_port_fix: close owned ports synchronously on the termination path.
         if let Some(runtime) = self.runtime.clone() {
-            if resources & proc_flags::OWNED_TIMERS != 0 {
-                runtime.cancel_owned_timers(ctx.pid());
-            }
             // Node monitors live in the process monitor tree; the global table is
             // consulted only when this process registered one (dist.c:6732).
             if resources & proc_flags::NODE_MON != 0 {
@@ -5903,8 +5862,7 @@ impl Process {
                     self.priority_item_inserted(old_prio_len, priority_term)?;
                 }
             }
-            Payload::TimerMessage { reference, message } => {
-                self.retire_timer_reference(reference);
+            Payload::TimerMessage { message, .. } => {
                 let priority = message.is_priority();
                 let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                 let before = self.message_words_before();
@@ -5921,8 +5879,7 @@ impl Process {
             Payload::Timer { reference, message } => {
                 let timer_id = message.timer_id;
                 let term = message.into_receiver(self)?;
-                let retired = self.retire_timer_reference(reference);
-                let id = timer_id.or(retired).unwrap_or(reference.id());
+                let id = timer_id.or(reference.ref_key()).unwrap_or(reference.id());
                 let reference = crate::signals::reference(self, id)?;
                 let tuple = self.tuple(&[crate::signals::atom("timeout"), reference, term])?;
                 self.inbox.push_back(tuple);
@@ -7020,6 +6977,16 @@ impl arinsal_sched::SignalMessage for Message {
     fn is_priority(&self) -> bool {
         self.priority
     }
+    fn timer_ref_key(&self) -> Option<u64> {
+        self.timer_id
+    }
+}
+
+impl Message {
+    /// The message term for read-only inspection while it waits in a timer.
+    pub(crate) fn term(&self) -> Term {
+        self.term
+    }
 }
 
 impl Task for Process {
@@ -7699,9 +7666,6 @@ impl Vm {
             scheduler: OnceLock::new(),
             reg: crate::register::RegisterTable::new(),
             aliases: AliasTable::new(),
-            timers: Mutex::new(IdMap::default()),
-            timer_owners: Mutex::new(IdMap::default()),
-            timer_messages: Mutex::new(IdMap::default()),
             next_trace_weak_id: AtomicU64::new(0),
             ports: Mutex::new(HashMap::new()),
             system_monitor: Mutex::new(None),

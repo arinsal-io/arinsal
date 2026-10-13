@@ -27,10 +27,10 @@
     "packet": 0,
     "pterm": 3,
     "re": 19,
-    "sched": 15,
+    "sched": 6,
     "spec": 0,
-    "term": 335,
-    "vm": 533,
+    "term": 331,
+    "vm": 469,
     "drv": 77
   }
 }

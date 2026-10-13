@@ -103,8 +103,8 @@ fn error_handler_module(process: &Process) -> String {
     process
         .cold
         .as_ref()
-        .and_then(|cold| cold.flags.get("error_handler"))
-        .and_then(|term| atom_name(*term))
+        .and_then(|cold| cold.flags.error_handler)
+        .and_then(atom_name)
         .unwrap_or_else(|| "error_handler".to_owned())
 }
 

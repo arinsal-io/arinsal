@@ -23,11 +23,11 @@ fn term_equal(left: Term, right: Term) -> bool {
 }
 
 fn flag_value(process: &Process, name: &str) -> Option<Term> {
-    process.cold.as_ref()?.flags.get(name).copied()
+    process.cold.as_ref()?.flags.get(name)
 }
 
 pub(crate) fn set_flag(process: &mut Process, name: &str, value: Term) -> Option<Term> {
-    process.cold_mut().flags.insert(name.to_owned(), value)
+    process.cold_mut().flags.insert(name, value)
 }
 
 fn list(term: Term) -> Option<Vec<Term>> {
@@ -84,14 +84,43 @@ pub(crate) fn user_priority(process: &Process) -> Priority {
 /// take the executor.
 // Port of erts/emulator/beam/bif.c:1955-2250 (process_flag_2), OTP-29.1.1.
 pub(crate) fn process_flag_ctxfree(process: &mut Process, name: Term, value: Term) -> Option<Term> {
-    let name = atom_name(name)?;
-    if !matches!(
-        name.as_str(),
-        "error_handler" | "async_dist" | "fullsweep_after" | "min_heap_size" | "min_bin_vheap_size"
-    ) {
-        return None;
+    static ATOMS: std::sync::OnceLock<[arinsal_term::Atom; 5]> = std::sync::OnceLock::new();
+    let [
+        error_handler,
+        async_dist,
+        fullsweep_after,
+        min_heap_size,
+        min_bin_vheap_size,
+    ] = *ATOMS.get_or_init(|| {
+        let intern = |text| global_atoms().intern(text).expect("short built-in atom");
+        [
+            intern("error_handler"),
+            intern("async_dist"),
+            intern("fullsweep_after"),
+            intern("min_heap_size"),
+            intern("min_bin_vheap_size"),
+        ]
+    });
+    let name = name.as_atom()?;
+    if name == error_handler {
+        value.as_atom()?;
+        let previous = process.cold_mut().flags.error_handler.replace(value);
+        return Some(previous.unwrap_or_else(|| Term::atom(error_handler)));
     }
-    flag(process, &name, value).ok()
+    if name == async_dist {
+        if value != Term::atom(arinsal_term::atoms::TRUE)
+            && value != Term::atom(arinsal_term::atoms::FALSE)
+        {
+            return None;
+        }
+        let previous = process.cold_mut().flags.async_dist.replace(value);
+        return Some(previous.unwrap_or(Term::atom(arinsal_term::atoms::FALSE)));
+    }
+    if name == fullsweep_after || name == min_heap_size || name == min_bin_vheap_size {
+        // The remaining flags reuse the checked implementation (heap sizing and previous values).
+        return flag(process, global_atoms().text(name)?, value).ok();
+    }
+    None
 }
 
 /// `erts_internal:group_leader/2` with the caller as target: it sets its own leader.
