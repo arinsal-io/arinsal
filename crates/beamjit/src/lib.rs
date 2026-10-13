@@ -50,6 +50,11 @@ pub trait ModuleEnv {
     fn sort_map_keys(&self, _keys: &[u64]) -> Result<Vec<usize>, String> {
         Err("module environment cannot order map keys".into())
     }
+    /// Hash a literal map key while compiling its lookup triplet.
+    // Port of erts/emulator/beam/beam_transform_helpers.c:54-110, OTP-29.1.1.
+    fn map_key_hash(&self, key: ArgVal) -> u64 {
+        arinsal_beamasm::map::literal_key_hash(key)
+    }
     /// Return the retained `FunEntry` pointer for a lambda-table index.
     fn lambda_fun_entry(&self, _beam: &BeamFile, index: u32) -> Result<(usize, u8), String> {
         Err(format!("module environment has no lambda entry {index}"))
@@ -2289,8 +2294,8 @@ fn emit_op(
     let helper = env.arithmetic_helper();
     if op.name() == "get_map_elements" {
         // Port of erts/emulator/beam/generators.tab:230-254 (gen.has_map_fields) followed by
-        // gen.get_map_elements (generators.tab:202-227): `has_map_fields` yields key/scratch
-        // pairs, which become key/destination/hash triples.
+        // gen.get_map_elements (generators.tab:202-227), then beam/ops.tab:1190-1195:
+        // sort the lookup keys and build their load-time internal hashes.
         count_at_least(args, 3, op.name())?;
         let size = usize::try_from(n(2)?)
             .map_err(|_| EmitError::Operand("map element size overflows usize".to_owned()))?;
@@ -2299,11 +2304,30 @@ fn emit_op(
                 "get_map_elements expects key/destination pairs".to_owned(),
             ));
         }
+        let pairs = args[3..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                Ok::<_, EmitError>([
+                    arg(Some(&pair[0]), beam, env).map_err(EmitError::Operand)?,
+                    arg(Some(&pair[1]), beam, env).map_err(EmitError::Operand)?,
+                ])
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let pairs = map_key_sort(pairs, env)?;
+        if size == 2 {
+            return assembler
+                .emit_i_get_map_element(n(0)?, value(1)?, pairs[0], pairs[1], env.map_runtime())
+                .map_err(|error| EmitError::Assembler(format!("{error:?}")));
+        }
         let mut triples = Vec::with_capacity(size / 2 * 3);
-        for pair in args[3..].as_chunks::<2>().0 {
-            triples.push(arg(Some(&pair[0]), beam, env).map_err(EmitError::Operand)?);
-            triples.push(arg(Some(&pair[1]), beam, env).map_err(EmitError::Operand)?);
-            triples.push(ArgVal::Immediate(0));
+        for pair in pairs.as_chunks::<2>().0 {
+            let key = pair[0];
+            triples.extend([key, pair[1], ArgVal::Immediate(env.map_key_hash(key))]);
         }
         let result =
             assembler.emit_i_get_map_elements(n(0)?, value(1)?, &triples, env.map_runtime());
@@ -2318,11 +2342,24 @@ fn emit_op(
                 "i_get_map_elements expects key/destination/hash triples".to_owned(),
             ));
         }
-        // Port of erts/emulator/beam/jit/arm/instr_map.cpp:391-490, OTP-29.1.1.
-        let triples = args[3..]
+        // Port of beam/ops.tab:1190-1195 and erts/emulator/beam/jit/arm/instr_map.cpp:391-490,
+        // OTP-29.1.1. The loader-sorted key triplets carry their internal hashes.
+        let encoded = args[3..]
             .iter()
             .map(|operand| arg(Some(operand), beam, env).map_err(EmitError::Operand))
             .collect::<Result<Vec<_>, _>>()?;
+        let pairs = encoded
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|triplet| [triplet[0], triplet[1]])
+            .collect();
+        let pairs = map_key_sort(pairs, env)?;
+        let mut triples = Vec::with_capacity(encoded.len());
+        for pair in pairs.as_chunks::<2>().0 {
+            let key = pair[0];
+            triples.extend([key, pair[1], ArgVal::Immediate(env.map_key_hash(key))]);
+        }
         let result =
             assembler.emit_i_get_map_elements(n(0)?, value(1)?, &triples, env.map_runtime());
         return result.map_err(|error| EmitError::Assembler(format!("{error:?}")));

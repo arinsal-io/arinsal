@@ -234,6 +234,15 @@ extern "C" fn unused_map_get(
 ) -> u64 {
     0
 }
+extern "C" fn unused_map_elements(
+    _p: *mut arinsal_beamasm::ProcessHeader,
+    _map: u64,
+    _module: u64,
+    _table: u64,
+    _stack: u64,
+) -> u64 {
+    0
+}
 extern "C" fn unused_map_update(
     _p: *mut arinsal_beamasm::ProcessHeader,
     _a: u64,
@@ -252,7 +261,8 @@ fn test_map_runtime() -> arinsal_beamasm::map::MapRuntime {
     ));
     arinsal_beamasm::map::MapRuntime {
         get: unused_map_get,
-        get_elements: unused_map_update,
+        get_elements: unused_map_elements,
+        lookup_module: 0,
         new_map: unused_map_update,
         update_assoc: unused_map_update,
         update_exact: unused_map_update,

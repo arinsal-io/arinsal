@@ -1,4 +1,4 @@
-use std::{cell::Cell, process::Command};
+use std::{cell::Cell, process::Command, sync::atomic::AtomicPtr};
 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
@@ -9,6 +9,7 @@ use arinsal_beamasm::{
 use arinsal_term::{ProcessHeap, Term, TermBuilder};
 
 thread_local! { static RESULT: Cell<u64> = const { Cell::new(0) }; static HASHMAP_VALUE: Cell<u64> = const { Cell::new(0) }; static HASHMAP_STAGE: Cell<u64> = const { Cell::new(0) }; }
+static ACTIVE_REGS: AtomicPtr<SchedulerRegisters> = AtomicPtr::new(std::ptr::null_mut());
 
 extern "C" fn panic_get(_p: *mut ProcessHeader, _map: u64, _key: u64, _stage: u64) -> u64 {
     panic!("flatmap lookup must stay inline")
@@ -18,12 +19,19 @@ extern "C" fn hashmap_get(_p: *mut ProcessHeader, _map: u64, _key: u64, stage: u
     HASHMAP_VALUE.with(Cell::get)
 }
 extern "C" fn get_elements(
-    _p: *mut ProcessHeader,
+    _process: *mut ProcessHeader,
     _map: u64,
-    _registers: u64,
+    _module: u64,
+    _table: u64,
     _stack: u64,
-    _count: u64,
 ) -> u64 {
+    arinsal_beamasm::rt::scheduler_registers_mut(
+        ACTIVE_REGS.load(std::sync::atomic::Ordering::Relaxed),
+        |registers| {
+            registers.x_reg_array[2] = Term::small(42).unwrap();
+            registers.x_reg_array[3] = Term::small(43).unwrap();
+        },
+    );
     1
 }
 extern "C" fn update(_p: *mut ProcessHeader, _a: u64, _b: u64, _c: u64, _d: u64) -> u64 {
@@ -44,6 +52,7 @@ fn runtime_with(get: arinsal_beamasm::map::MapGetHelper) -> MapRuntime {
     MapRuntime {
         get,
         get_elements,
+        lookup_module: 0,
         new_map: update,
         update_assoc: update,
         update_exact: update,
@@ -108,7 +117,9 @@ fn run(
     let mut regs = SchedulerRegisters::default();
     regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(regs0);
     regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(regs1);
+    ACTIVE_REGS.store(&mut regs, std::sync::atomic::Ordering::Relaxed);
     let reason = enter_native(&mut header, &mut regs, &module.entry(1).unwrap());
+    ACTIVE_REGS.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
     assert_eq!(reason, ExitReason::Returned);
     regs.x_reg_array[0].tagged_word()
 }
@@ -129,7 +140,13 @@ fn native_flatmap_get_inline() {
     let runtime = runtime_with(panic_get);
     let result = run(
         |m| {
-            m.emit_i_get_map_element(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), runtime)?;
+            m.emit_i_get_map_element(
+                90,
+                ArgVal::X(0),
+                ArgVal::Immediate(bits(key)),
+                ArgVal::X(2),
+                runtime,
+            )?;
             Ok(())
         },
         bits(map),
@@ -142,15 +159,37 @@ fn native_flatmap_get_inline() {
 fn native_flatmap_miss() {
     let (_heap, map, _) = flatmap();
     let runtime = runtime_with(panic_get);
+    let key = Term::small(99).unwrap();
     let result = run(
         |m| {
-            m.emit_i_get_map_element(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), runtime)?;
+            m.emit_i_get_map_element(
+                90,
+                ArgVal::X(0),
+                ArgVal::Immediate(bits(key)),
+                ArgVal::X(2),
+                runtime,
+            )?;
             Ok(())
         },
         bits(map),
-        bits(Term::small(99).unwrap()),
+        bits(key),
     );
     assert_eq!(result, 0x3f0);
+}
+
+#[test]
+fn native_dynamic_key_uses_runtime_lookup() {
+    let (_heap, map, key) = flatmap();
+    HASHMAP_VALUE.with(|value| value.set(bits(Term::small(42).unwrap())));
+    let result = run(
+        |m| {
+            m.emit_i_get_map_element(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), runtime())?;
+            Ok(())
+        },
+        bits(map),
+        bits(key),
+    );
+    assert_eq!((result >> 4) as i64, erl_int("maps:get(7, #{7 => 42})"));
 }
 
 #[test]
@@ -167,7 +206,13 @@ fn native_hashmap_get() {
     HASHMAP_STAGE.with(|value| value.set(0));
     let result = run(
         |m| {
-            m.emit_i_get_map_element(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), runtime())?;
+            m.emit_i_get_map_element(
+                90,
+                ArgVal::X(0),
+                ArgVal::Immediate(bits(Term::small(39).unwrap())),
+                ArgVal::X(2),
+                runtime(),
+            )?;
             Ok(())
         },
         bits(map),
@@ -201,7 +246,7 @@ fn native_get_elements() {
                     ArgVal::Immediate(bits(Term::small(7).unwrap())),
                     ArgVal::X(2),
                     ArgVal::Immediate(0),
-                    ArgVal::Immediate(bits(Term::small(7).unwrap())),
+                    ArgVal::Immediate(bits(Term::small(8).unwrap())),
                     ArgVal::X(3),
                     ArgVal::Immediate(0),
                 ],

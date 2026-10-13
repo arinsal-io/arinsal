@@ -103,6 +103,7 @@ impl CodeIndexes {
 
     /// Reads the tables visible to a process running `code_ix` without a reader lock.
     // Port of erts/emulator/beam/code_ix.c:51-79 (code-indexed module and export tables), OTP-29.1.1.
+    #[inline(always)]
     pub(crate) fn with_tables_for_code_ix<R>(
         &self,
         code_ix: usize,

@@ -21,9 +21,6 @@ const X: [Gpr; 6] = [
     logical_xreg(16),
 ];
 const E: Gpr = Gpr::x(20);
-/// Staging area top for `get_map_elements`, which does not allocate and has no live count:
-/// the vector sits just below OTP's scratch X register (1023), away from live X registers.
-const GET_ELEMENTS_STAGING_TOP: u32 = 1020;
 const HTOP: Gpr = Gpr::x(23);
 const ATOM_TAG: u16 = 0x0b;
 
@@ -39,6 +36,33 @@ pub type MapGetElementsHelper = extern "C" fn(*mut ProcessHeader, u64, u64, u64,
 /// Runtime implementation for map construction and updates; argument terms are staged at X6.
 pub type MapUpdateHelper = extern "C" fn(*mut ProcessHeader, u64, u64, u64, u64) -> u64;
 
+/// Destination of one lookup in a module-owned multi-key lookup table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MapLookupDestination {
+    /// Cached or memory-backed X register.
+    X(u32),
+    /// Y register at an offset from the current stack pointer.
+    Y(u32),
+}
+
+/// One sorted key, its load-time internal hash, and the register to receive its value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MapLookupEntry {
+    /// Tagged BEAM key word retained by the module's literal area.
+    pub key: u64,
+    /// Internal map hash computed when the module is lowered.
+    pub hash: u64,
+    /// Destination register descriptor.
+    pub destination: MapLookupDestination,
+}
+
+/// Static operand table used by one `i_get_map_elements` instruction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MapLookupTable {
+    /// Sorted lookup operands, in the order used by the flatmap merge walk.
+    pub entries: Box<[MapLookupEntry]>,
+}
+
 /// Runtime helpers for map operations delegated to the OTP-compatible runtime.
 #[derive(Clone, Copy)]
 pub struct MapRuntime {
@@ -46,6 +70,8 @@ pub struct MapRuntime {
     pub get: MapGetHelper,
     /// Runtime multi-key lookup.
     pub get_elements: MapGetElementsHelper,
+    /// Typed identity of the compiled module owning lookup operand tables.
+    pub lookup_module: u32,
     /// Runtime map construction.
     pub new_map: MapUpdateHelper,
     /// Runtime associative update.
@@ -369,12 +395,31 @@ impl BeamModuleAssembler {
         dst: ArgVal,
         runtime: MapRuntime,
     ) -> Result<(), ModuleError> {
+        let key_is_immediate =
+            matches!(key, ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 3 == 3);
         let map = self.source_reg(src)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(0), map))?;
         let key = self.source_reg_into(key, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(1), key))?;
         let fail = self.label(fail);
-        self.emit_get_element_fragment_call(runtime.get_element_shared, fail, dst)
+        if key_is_immediate {
+            return self.emit_get_element_fragment_call(runtime.get_element_shared, fail, dst);
+        }
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(2), Gpr::x(1))?;
+            e.mov_reg(Gpr::x(1), Gpr::x(0))?;
+            e.mov_reg(Gpr::x(3), Gpr::xzr())
+        })?;
+        emit_map_runtime(
+            self,
+            runtime.get as usize,
+            &[Gpr::x(1), Gpr::x(2), Gpr::x(3)],
+            6,
+            Update::NONE,
+        )?;
+        self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
+        self.code.cbz(Gpr::x(0), fail)?;
+        self.store_map_result(dst, Gpr::x(0))
     }
 
     /// Emits lookup using a precomputed key hash, as generated map code does.
@@ -529,33 +574,63 @@ impl BeamModuleAssembler {
                 "map get operands must be triplets",
             ));
         }
-        let base = GET_ELEMENTS_STAGING_TOP - args.len() as u32;
-        // The inline flatmap scan compares key words, which identifies only immediate keys;
-        // a boxed literal key (float, tuple, map, list) is compared by value in the runtime.
-        // Port of erts/emulator/beam/jit/arm/instr_map.cpp (emit_i_get_map_elements), OTP-29.1.1.
-        if args.len() < 24
+        let index = u32::try_from(self.map_lookups.len())
+            .map_err(|_| ModuleError::InvalidOperand("map lookup table index overflow"))?;
+        let entries = args
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|triple| {
+                let key = match triple[0] {
+                    ArgVal::Immediate(word) | ArgVal::Literal(word) => word,
+                    _ => return Err(ModuleError::InvalidOperand("map lookup key is not static")),
+                };
+                let hash = match triple[2] {
+                    ArgVal::Immediate(word) | ArgVal::Literal(word) => word,
+                    _ => return Err(ModuleError::InvalidOperand("map lookup hash is not static")),
+                };
+                let destination = match triple[1] {
+                    ArgVal::X(index) => MapLookupDestination::X(u32::from(index)),
+                    ArgVal::XMemory(index) => MapLookupDestination::X(index),
+                    ArgVal::Y(index) => MapLookupDestination::Y(index),
+                    _ => {
+                        return Err(ModuleError::InvalidOperand(
+                            "map lookup destination must be X or Y register",
+                        ));
+                    }
+                };
+                Ok(MapLookupEntry {
+                    key,
+                    hash,
+                    destination,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.map_lookups.push(MapLookupTable {
+            entries: entries.into_boxed_slice(),
+        });
+        let map = self.source_reg(src)?;
+        // Port of erts/emulator/beam/jit/arm/instr_map.cpp:391-490, OTP-29.1.1.
+        let can_inline = args.len() < 24
             && args.iter().step_by(3).all(
-                |v| matches!(v, ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 3 == 3),
-            )
-        {
-            let map = self.source_reg(src)?;
-            self.code.emit(|e| e.mov_reg(Gpr::x(1), map))?;
+                |arg| matches!(arg, ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 3 == 3),
+            );
+        let generic = self.code.new_label();
+        let done = self.code.new_label();
+        self.code.emit(|e| e.mov_reg(Gpr::x(1), map))?;
+        if can_inline {
             self.code.emit(|e| e.and_imm(Gpr::x(8), map, !7))?;
-            self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(8), 0))?;
+            self.code
+                .emit(|e| e.ldp(Gpr::x(9), Gpr::x(10), Gpr::x(8), 0))?;
             self.code.emit(|e| e.and_imm(Gpr::x(9), Gpr::x(9), 0xc0))?;
             self.code.emit(|e| e.cmp_imm(Gpr::x(9), 0, false))?;
-            let generic = self.code.new_label();
-            let done = self.code.new_label();
             self.code.b_cond(Cond::Ne, generic)?;
-            self.code.emit(|e| e.ldr_uoff(Gpr::x(10), Gpr::x(8), 8))?;
             self.code
                 .emit(|e| e.add_imm(Gpr::x(10), Gpr::x(10), 1, false))?;
-            self.code.emit(|e| e.mov_reg(Gpr::x(14), Gpr::x(10)))?;
             self.code.emit(|e| e.ldr_uoff(Gpr::x(11), Gpr::x(8), 16))?;
             self.code.emit(|e| e.and_imm(Gpr::x(11), Gpr::x(11), !7))?;
-            for triplet in args.as_chunks::<3>().0.iter().rev() {
+            for triple in args.as_chunks::<3>().0.iter().rev() {
                 let loop_label = self.code.new_label();
-                self.code.emit(|e| e.mov_reg(Gpr::x(10), Gpr::x(14)))?;
                 self.code.bind(loop_label)?;
                 self.code
                     .emit(|e| e.subs_imm(Gpr::x(10), Gpr::x(10), 1, false))?;
@@ -563,78 +638,35 @@ impl BeamModuleAssembler {
                 self.code.b_cond(Cond::Eq, fail_label)?;
                 self.code
                     .emit(|e| e.ldr_regoff(Gpr::x(12), Gpr::x(11), Gpr::x(10), 3))?;
-                let key = self.source_reg(triplet[0])?;
+                let key = self.source_reg(triple[0])?;
                 self.code
-                    .emit(|e| e.cmp_reg(Gpr::x(12), key, arinsal_a64::enc::Shift::Lsl, 0))?;
+                    .emit(|e| e.cmp_reg(Gpr::x(12), key, Shift::Lsl, 0))?;
                 self.code.b_cond(Cond::Ne, loop_label)?;
-                let dst = triplet[1];
-                if !is_scratch_x(dst) {
-                    let val = self.destination_register_for(dst)?;
+                if !is_scratch_x(triple[1]) {
                     self.code
                         .emit(|e| e.add_imm(Gpr::x(13), Gpr::x(8), 16, false))?;
-                    self.code
-                        .emit(|e| e.ldr_regoff(val, Gpr::x(13), Gpr::x(10), 3))?;
-                    self.store_map_result(dst, val)?;
+                    self.emit_flatmap_value_to_destination(triple[1], Gpr::x(13), Gpr::x(10))?;
                 }
             }
             self.code.b(done)?;
-            self.code.bind(generic)?;
-            self.stage_map_args(args, base)?;
-            self.code.emit(|e| e.mov_reg(Gpr::x(2), Gpr::x(19)))?;
-            self.code
-                .emit(|e| e.mov_const(Gpr::x(3), u64::from(base)))?;
-            self.code
-                .emit(|e| e.mov_const(Gpr::x(4), (args.len() / 3) as u64))?;
-            emit_map_runtime(
-                self,
-                runtime.get_elements as usize,
-                &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
-                6,
-                Update::X_REGS,
-            )?;
-            self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
-            let fail_label = self.label(fail);
-            self.code.b_cond(Cond::Eq, fail_label)?;
-            self.store_staged_map_elements(args, base)?;
-            self.code.bind(done)?;
-            Ok(())
-        } else {
-            self.stage_map_args(args, base)?;
-            let map = self.source_reg(src)?;
-            self.code.emit(|e| e.mov_reg(Gpr::x(1), map))?;
-            self.code.emit(|e| e.mov_reg(Gpr::x(2), Gpr::x(19)))?;
-            self.code
-                .emit(|e| e.mov_const(Gpr::x(3), u64::from(base)))?;
-            self.code
-                .emit(|e| e.mov_const(Gpr::x(4), (args.len() / 3) as u64))?;
-            emit_map_runtime(
-                self,
-                runtime.get_elements as usize,
-                &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
-                6,
-                Update::X_REGS,
-            )?;
-            let fail_label = self.label(fail);
-            self.code.cbz(Gpr::x(0), fail_label)?;
-            self.store_staged_map_elements(args, base)?;
-            Ok(())
         }
-    }
-
-    /// Moves the values the runtime lookup left in the staging area to their destinations.
-    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:391-490, OTP-29.1.1.
-    fn store_staged_map_elements(&mut self, args: &[ArgVal], base: u32) -> Result<(), ModuleError> {
-        for (index, triplet) in args.as_chunks::<3>().0.iter().enumerate() {
-            let dst = triplet[1];
-            if is_scratch_x(dst) {
-                continue;
-            }
-            let offset = u32::try_from(base as usize + 1 + index * 3)
-                .map_err(|_| ModuleError::InvalidOperand("map argument offset overflow"))?
-                * 8;
-            self.code
-                .emit(|e| e.ldr_uoff(Gpr::x(8), Gpr::x(19), offset))?;
-            self.store_map_result(dst, Gpr::x(8))?;
+        self.code.bind(generic)?;
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(2), u64::from(runtime.lookup_module)))?;
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(3), u64::from(index)))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(4), E))?;
+        emit_map_runtime(
+            self,
+            runtime.get_elements as usize,
+            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
+            6,
+            Update::X_REGS,
+        )?;
+        let fail_label = self.label(fail);
+        self.code.cbz(Gpr::x(0), fail_label)?;
+        if can_inline {
+            self.code.bind(done)?;
         }
         Ok(())
     }
@@ -956,17 +988,6 @@ impl BeamModuleAssembler {
         }
     }
 
-    fn destination_register_for(&self, dst: ArgVal) -> Result<Gpr, ModuleError> {
-        match dst {
-            ArgVal::X(i) if i < 6 => Ok(X[i as usize]),
-            // Y destinations load through a scratch that no fast path uses.
-            ArgVal::Y(_) | ArgVal::XMemory(_) => Ok(Gpr::x(5)),
-            _ => Err(ModuleError::InvalidOperand(
-                "map destination must be an X register below 6 or a Y register",
-            )),
-        }
-    }
-
     // Port of erts/emulator/beam/jit/arm/instr_map.cpp:579-598,686-694, OTP-29.1.1: a
     // single pair goes to `erts_maps_put`/`erts_maps_update` in argument registers; those
     // never collect, and `erts_maps_update` writes its result through `TMP_MEM1`.
@@ -1019,6 +1040,31 @@ impl BeamModuleAssembler {
             self.code.emit(|e| e.str_uoff(value, Gpr::x(19), offset))?;
         }
         Ok(())
+    }
+
+    // Port of `mov_arg(Dst, a64::Mem(TMP1, TMP3, a64::lsl(3)))` in
+    // erts/emulator/beam/jit/arm/instr_map.cpp:459, OTP-29.1.1. A cached X destination can
+    // load straight from the flatmap values; memory-backed destinations need a scratch word.
+    fn emit_flatmap_value_to_destination(
+        &mut self,
+        dst: ArgVal,
+        values: Gpr,
+        index: Gpr,
+    ) -> Result<(), ModuleError> {
+        if let ArgVal::X(register) = dst {
+            let Some(destination) = X.get(register as usize).copied() else {
+                return Err(ModuleError::InvalidOperand(
+                    "map destination must be X or Y register",
+                ));
+            };
+            return self
+                .code
+                .emit(|e| e.ldr_regoff(destination, values, index, 3))
+                .map_err(ModuleError::from);
+        }
+        self.code
+            .emit(|e| e.ldr_regoff(Gpr::x(14), values, index, 3))?;
+        self.store_map_result(dst, Gpr::x(14))
     }
 
     fn store_map_result(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {

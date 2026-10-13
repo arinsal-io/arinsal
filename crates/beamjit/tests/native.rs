@@ -88,6 +88,7 @@ impl ModuleEnv for TestEnv {
         arinsal_beamasm::map::MapRuntime {
             get: map_get_helper,
             get_elements: map_get_elements_helper,
+            lookup_module: 0,
             new_map: map_update_helper,
             update_assoc: map_update_helper,
             update_exact: map_update_helper,
@@ -136,9 +137,9 @@ extern "C" fn map_get_helper(
 extern "C" fn map_get_elements_helper(
     _process: *mut ProcessHeader,
     _map: u64,
-    _registers: u64,
-    _live: u64,
-    _count: u64,
+    _module: u64,
+    _table: u64,
+    _stack: u64,
 ) -> u64 {
     0
 }

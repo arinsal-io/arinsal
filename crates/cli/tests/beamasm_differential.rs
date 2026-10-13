@@ -1,5 +1,6 @@
 //! Differential tests: modules compiled natively with BeamAsm print what `erl` prints.
 
+use similar_asserts::assert_eq;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,6 +13,8 @@ const MODULES: &[&str] = &[
     "beamasm_epp",
     "beamasm_sched",
     "beamasm_eq_exact",
+    "beamasm_map_elements",
+    "beamasm_map_callee",
 ];
 
 /// OTP modules compiled natively alongside a fixture, for fixtures that exercise them.
@@ -21,6 +24,7 @@ fn native_modules(module: &str) -> String {
         "beamasm_epp" => format!("{module},epp"),
         // The group leader handles the io request while multi-scheduling is blocked.
         "beamasm_sched" => format!("{module},group"),
+        "beamasm_map_elements" => format!("{module},beamasm_map_callee"),
         _ => module.to_owned(),
     }
 }
