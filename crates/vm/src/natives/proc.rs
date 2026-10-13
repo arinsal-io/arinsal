@@ -1897,8 +1897,16 @@ fn process_info_light_read(
         )
     }) {
         Ok(result) => result,
-        Err(arinsal_sched::SignalFreeError::NoProcess) => Some(Ok(atom("undefined"))),
-        Err(arinsal_sched::SignalFreeError::Busy) => None,
+        // erl_bif_info.c:1294-1300: the items are validated before the process lookup, so an
+        // unknown item is badarg even for a dead pid; the executor raises it.
+        Err(arinsal_sched::SignalFreeError::NoProcess)
+            if keys.iter().all(|key| remote_readable(*key)) =>
+        {
+            Some(Ok(atom("undefined")))
+        }
+        Err(arinsal_sched::SignalFreeError::NoProcess | arinsal_sched::SignalFreeError::Busy) => {
+            None
+        }
     }
 }
 
