@@ -19,7 +19,7 @@ use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // Port of inet_drv.c ERTS_INET_DRV_CONTROL_MAGIC_NUMBER, OTP-29.1.1.
@@ -198,25 +198,45 @@ fn registry() -> &'static Mutex<HashMap<u64, Arc<Sock>>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn wake_writer() -> &'static OwnedFd {
-    static WAKE: OnceLock<OwnedFd> = OnceLock::new();
-    WAKE.get_or_init(|| {
-        let (read, write) = pipe().expect("inet wake pipe");
+/// Port tasks waiting for the inet thread, which runs them for every `tcp_inet`
+/// port: readiness from the poll set (`ready_input`/`ready_output`) and pokes
+/// from control and command calls on a port.
+///
+/// Port of the I/O port task queue of erts/emulator/beam/erl_port_task.c and the
+/// `iready`/`oready` scheduling of erts/emulator/sys/common/erl_check_io.c:1874-1908,
+/// OTP-29.1.1.
+#[derive(Default)]
+struct Tasks {
+    ready: Vec<(u64, RawFd, crate::check_io::Ready)>,
+    poked: Vec<u64>,
+}
+
+fn tasks() -> &'static (Mutex<Tasks>, Condvar) {
+    static TASKS: OnceLock<(Mutex<Tasks>, Condvar)> = OnceLock::new();
+    TASKS.get_or_init(|| {
         std::thread::Builder::new()
             .name("arinsal-inet".into())
-            .spawn(move || io_loop(read))
+            .spawn(io_loop)
             .expect("inet thread");
-        write
+        (Mutex::new(Tasks::default()), Condvar::new())
     })
 }
 
-fn poke() {
-    let fd = wake_writer().as_raw_fd();
-    let byte = [1u8];
-    // SAFETY: wake_writer owns the write end for the process lifetime.
-    unsafe {
-        libc::write(fd, byte.as_ptr().cast(), 1);
+/// Ask the inet thread to run port `id` (and recompute its selection).
+fn poke(id: u64) {
+    let (lock, wake) = tasks();
+    let mut tasks = lock.lock().unwrap();
+    if !tasks.poked.contains(&id) {
+        tasks.poked.push(id);
     }
+    wake.notify_one();
+}
+
+/// `iready`/`oready`: schedule the port's I/O task on the inet thread.
+fn schedule_ready(id: u64, fd: RawFd, ready: crate::check_io::Ready) {
+    let (lock, wake) = tasks();
+    lock.lock().unwrap().ready.push((id, fd, ready));
+    wake.notify_one();
 }
 
 // g_inet_udp
@@ -283,11 +303,11 @@ pub(crate) fn set_nosigpipe(fd: RawFd) {
 
 /// Register a `tcp_inet` port created by `open_port({spawn_driver, …})`.
 pub(crate) fn attach(runtime: Arc<Runtime>, id: u64, handle: Arc<PortHandle>) {
-    let _ = wake_writer();
+    let _ = tasks();
     pin_scheduler(handle.scheduler());
     let sock = Arc::new(Sock::new(id, runtime, handle));
     registry().lock().unwrap().insert(id, sock);
-    poke();
+    poke(id);
 }
 
 /// True when `id` is a live TCP inet socket owned by this driver.
@@ -324,7 +344,7 @@ pub(crate) fn detach(id: u64) {
             },
         );
     }
-    poke();
+    poke(id);
 }
 
 pub(crate) fn control(
@@ -340,7 +360,7 @@ pub(crate) fn control(
     // Port of inet_drv.c:11956 (tcp_inet_ctl subtracts the magic), OTP-29.1.1.
     let cmd = op.wrapping_sub(MAGIC);
     let reply = dispatch(&sock, caller, cmd, data);
-    poke();
+    poke(id);
     byte_list(process, &reply)
 }
 
@@ -386,7 +406,7 @@ pub(crate) fn command(id: u64, caller: Pid, data: Vec<u8>) -> Result<(), VmError
         }
     }
     emit_ready(&sock);
-    poke();
+    poke(id);
     Ok(())
 }
 
@@ -430,7 +450,7 @@ pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<bool, VmError> {
         }
     }
     emit_ready(&sock);
-    poke();
+    poke(id);
     Ok(sock.inner.lock().unwrap().busy)
 }
 
@@ -712,7 +732,7 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     set_nonblock(fd);
     set_nosigpipe(fd);
     // SAFETY: fd was just created and is moved into OwnedFd.
-    inner.fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+    inner.fd = Some(SockFd::new(unsafe { OwnedFd::from_raw_fd(fd) }, inner.port));
     inner.domain = domain;
     inner.family_code = data[0];
     inner.phase = Phase::Open;
@@ -825,9 +845,8 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
                 deadline: deadline(timeout),
             });
             inner.pending.push((caller, aref));
-            // The inet thread may be blocked in a wait that does not include
-            // this fd yet. Wake it so the next poll set selects FD_CONNECT.
-            poke();
+            // Wake the inet thread so it selects FD_CONNECT for this fd.
+            poke(sock.id);
         }
         return ok_bytes(&aref.to_be_bytes());
     }
@@ -931,7 +950,8 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
     let born = {
         let inner = listen.inner.lock().unwrap();
         Inner {
-            fd: Some(fd),
+            fd: Some(SockFd::new(fd, id)),
+            port: id,
             domain: inner.domain,
             family_code: inner.family_code,
             phase: Phase::Connected,
@@ -971,7 +991,7 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
             port: id,
         },
     );
-    poke();
+    poke(id);
 }
 
 fn sockname(inner: &Inner) -> Vec<u8> {
@@ -2159,8 +2179,50 @@ impl Sock {
             id,
             runtime,
             handle,
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                port: id,
+                ..Inner::default()
+            }),
             io: Mutex::new(()),
+        }
+    }
+}
+
+/// The socket of a `tcp_inet` port with its poll-set selection.
+///
+/// Dropping it deselects the descriptor before closing it, as `tcp_desc_close`
+/// does with `sock_select(desc, FD_READ|FD_WRITE|FD_CLOSE|ERL_DRV_USE_NO_CALLBACK, 0)`
+/// (erts/emulator/drivers/common/inet_drv.c:11473), OTP-29.1.1.
+struct SockFd {
+    fd: OwnedFd,
+    port: u64,
+    /// Events selected in the shared poll set (`state->events` in erl_check_io.c).
+    selected: crate::check_io::InterestSet,
+}
+
+impl SockFd {
+    fn new(fd: OwnedFd, port: u64) -> Self {
+        Self {
+            fd,
+            port,
+            selected: crate::check_io::InterestSet {
+                readable: false,
+                writable: false,
+            },
+        }
+    }
+}
+
+impl AsRawFd for SockFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl Drop for SockFd {
+    fn drop(&mut self) {
+        if self.selected.readable || self.selected.writable {
+            crate::check_io::driver_deselect(self.fd.as_raw_fd(), self.port);
         }
     }
 }
@@ -2203,7 +2265,9 @@ struct SendWait {
 }
 
 struct Inner {
-    fd: Option<OwnedFd>,
+    fd: Option<SockFd>,
+    /// Port id: the owner of this socket's poll-set selection.
+    port: u64,
     domain: i32,
     family_code: u8,
     phase: Phase,
@@ -2277,6 +2341,7 @@ impl Default for Inner {
     fn default() -> Self {
         Self {
             fd: None,
+            port: 0,
             domain: libc::AF_INET,
             family_code: AF_INET_CODE,
             phase: Phase::Closed,
@@ -3659,68 +3724,92 @@ fn poll_connect(inner: &mut Inner) -> Option<Out> {
     })
 }
 
-fn io_loop(wake_r: OwnedFd) {
-    // Port of inet_drv.c driver_select registrations through erl_check_io.c:988, OTP-29.1.1.
-    let wake = wake_r.as_raw_fd();
+/// The inet thread: run the I/O tasks of `tcp_inet` ports and their timers.
+///
+/// Port of the port-task side of erts/emulator/sys/common/erl_check_io.c, OTP-29.1.1:
+/// the poll set holds a persistent selection per socket (`driver_select`), a
+/// readiness event schedules that port's task (`iready`/`oready`), the task runs
+/// (`tcp_inet_input`/`tcp_inet_output` through `try_io`), and then the fired events
+/// are re-armed (`erts_io_notify_port_task_executed`, :546-640). Only ports with an
+/// event or a poke are touched; idle sockets cost nothing per event.
+fn io_loop() {
+    let (lock, wake) = tasks();
     loop {
-        let socks: Vec<Arc<Sock>> = registry().lock().unwrap().values().cloned().collect();
-        let mut fds = vec![(
-            wake,
-            crate::check_io::InterestSet {
-                readable: true,
-                writable: false,
-            },
-        )];
-        for sock in &socks {
-            try_io(sock, false);
-        }
-        for sock in &socks {
-            let inner = sock.inner.lock().unwrap();
-            let Some(fd) = inner.fd.as_ref().map(AsRawFd::as_raw_fd) else {
-                continue;
-            };
-            let readable = match inner.phase {
-                Phase::Listening => !inner.accept_q.is_empty(),
-                Phase::Connected => {
-                    !inner.peer_closed && (active_is(&inner.active) || inner.recv.is_some())
-                }
-                _ => false,
-            };
-            let writable = inner.phase == Phase::Connecting || !inner.sendq.is_empty();
-            if readable || writable {
-                fds.push((fd, crate::check_io::InterestSet { readable, writable }));
-            }
-        }
+        // Ports take the task lock (`poke`) while holding their own lock, so the
+        // timers are read before it is taken.
         let timeout = next_timeout()
             .map(|timeout| Duration::new(timeout.tv_sec as u64, timeout.tv_nsec as u32));
-        match crate::check_io::wait_any_timeout(&fds, timeout) {
-            Ok(Some((fd, _))) if fd == wake => drain(wake),
-            Ok(Some((fd, ready))) => {
-                if let Some(sock) = socks.iter().find(|sock| {
-                    sock.inner
-                        .lock()
-                        .unwrap()
-                        .fd
-                        .as_ref()
-                        .is_some_and(|socket| socket.as_raw_fd() == fd)
-                }) {
-                    try_io(sock, ready.writable || ready.error || ready.closed);
-                }
+        let (ready, poked) = {
+            let mut tasks = lock.lock().unwrap();
+            if tasks.ready.is_empty() && tasks.poked.is_empty() {
+                tasks = match timeout {
+                    Some(timeout) => wake.wait_timeout(tasks, timeout).unwrap().0,
+                    None => wake.wait(tasks).unwrap(),
+                };
             }
-            Ok(None) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => continue,
+            (
+                std::mem::take(&mut tasks.ready),
+                std::mem::take(&mut tasks.poked),
+            )
+        };
+        for (id, fd, event) in ready {
+            let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
+                continue;
+            };
+            try_io(&sock, event.writable || event.error || event.closed);
+            sock_select(&sock);
+            crate::check_io::notify_executed(
+                fd,
+                id,
+                crate::check_io::InterestSet {
+                    readable: true,
+                    writable: true,
+                },
+            );
         }
-        // Read before timers: an RST already pending on the socket is
-        // `econnreset` from recv, not the receive deadline (inet_drv.c
-        // tcp_inet_input runs from erts_check_io before timer expiry).
-        // A connect still in progress stays selected for write and finishes
-        // in `poll_connect` when this wait, or the next one, reports it.
-        for sock in &socks {
-            try_io(sock, false);
+        for id in poked {
+            let sock = registry().lock().unwrap().get(&id).cloned();
+            if let Some(sock) = sock {
+                try_io(&sock, false);
+                sock_select(&sock);
+            }
         }
-        fire_timeouts();
+        for sock in fire_timeouts() {
+            sock_select(&sock);
+        }
+    }
+}
+
+/// Bring the poll-set selection of `sock` in line with its state.
+///
+/// Port of the `sock_select` calls of erts/emulator/drivers/common/inet_drv.c,
+/// OTP-29.1.1: FD_ACCEPT while an accept waits (:12224, :12584), FD_CONNECT while
+/// connecting (:12109, :14243), FD_READ while active or a receive is pending
+/// (:12126, :12317, :13110), FD_WRITE while the output queue is non-empty
+/// (:13844, :14303).
+fn sock_select(sock: &Arc<Sock>) {
+    let mut inner = sock.inner.lock().unwrap();
+    let readable = match inner.phase {
+        Phase::Listening => !inner.accept_q.is_empty(),
+        Phase::Connected => {
+            !inner.peer_closed && (active_is(&inner.active) || inner.recv.is_some())
+        }
+        _ => false,
+    };
+    let writable = inner.phase == Phase::Connecting || !inner.sendq.is_empty();
+    let id = sock.id;
+    let Some(fd) = inner.fd.as_mut() else {
+        return;
+    };
+    let want = crate::check_io::InterestSet { readable, writable };
+    if want.readable == fd.selected.readable && want.writable == fd.selected.writable {
+        return;
+    }
+    let raw = fd.as_raw_fd();
+    let ready: crate::check_io::SelectCallback =
+        Arc::new(move |fd, event| schedule_ready(id, fd, event));
+    if crate::check_io::driver_select(raw, id, want, ready).is_ok() {
+        fd.selected = want;
     }
 }
 
@@ -3753,9 +3842,11 @@ fn next_timeout() -> Option<libc::timespec> {
     })
 }
 
-fn fire_timeouts() {
+/// Expire receive, accept, connect and send timers; returns the ports it changed.
+fn fire_timeouts() -> Vec<Arc<Sock>> {
     let socks: Vec<Arc<Sock>> = registry().lock().unwrap().values().cloned().collect();
     let now = Instant::now();
+    let mut fired = Vec::new();
     for sock in socks {
         let (due, sends, close) = {
             let mut inner = sock.inner.lock().unwrap();
@@ -3814,6 +3905,7 @@ fn fire_timeouts() {
             };
             (due, sends, close)
         };
+        let changed = !due.is_empty() || !sends.is_empty();
         for (caller, aref) in due {
             emit(
                 &sock,
@@ -3842,16 +3934,9 @@ fn fire_timeouts() {
                 crate::port::abandon_port(&sock.runtime, sock.id);
             }
         }
-    }
-}
-
-fn drain(fd: RawFd) {
-    let mut buf = [0u8; 64];
-    loop {
-        // SAFETY: fd is the wake pipe read end owned by the I/O thread.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            break;
+        if changed {
+            fired.push(sock);
         }
     }
+    fired
 }
