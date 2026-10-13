@@ -147,28 +147,25 @@ fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError>
                 ) as i64,
                 _ => n,
             };
-            let previous_min_bin_vheap = process.heap.min_bin_vheap_size();
+            // The previous values are the process's own (erts p->max_gen_gcs, p->min_heap_size,
+            // p->min_vheap_size), not a flag map.
+            let previous_fullsweep = process.heap.fullsweep_after();
             let previous_min_heap = process.heap.min_heap_size_words();
-            if name == "fullsweep_after" {
-                process.heap.set_fullsweep_after(normalized as u16);
+            let previous_min_bin_vheap = process.heap.min_bin_vheap_size();
+            match name {
+                "fullsweep_after" => {
+                    process.heap.set_fullsweep_after(normalized as u16);
+                    Term::small(i64::from(previous_fullsweep)).unwrap()
+                }
+                "min_heap_size" => {
+                    process.heap.set_min_heap_size(normalized as usize);
+                    Term::small(previous_min_heap as i64).unwrap()
+                }
+                _ => {
+                    process.heap.set_min_bin_vheap_size(normalized as u64);
+                    Term::small(previous_min_bin_vheap as i64).unwrap()
+                }
             }
-            if name == "min_heap_size" {
-                process.heap.set_min_heap_size(normalized as usize);
-                set_flag(process, name, Term::small(normalized).unwrap());
-                return Ok(Term::small(previous_min_heap as i64).unwrap());
-            }
-            if name == "min_bin_vheap_size" {
-                process.heap.set_min_bin_vheap_size(normalized as u64);
-            }
-            set_flag(process, name, Term::small(normalized).unwrap()).unwrap_or_else(|| {
-                Term::small(match name {
-                    "fullsweep_after" => 65_535,
-                    "min_heap_size" => 233,
-                    "min_bin_vheap_size" => previous_min_bin_vheap as i64,
-                    _ => 0,
-                })
-                .unwrap()
-            })
         }
         // Handled in `call` so the limit is stored on the scheduler runtime.
         "max_heap_size" => return Err(badarg()),
@@ -390,15 +387,23 @@ fn process_info(
                 vals.extend(crate::port::driver_monitoring_ports(process, pid));
                 make_list(process, vals)?
             }
-            "priority" | "message_queue_data" | "error_handler" | "save_calls" | "sensitive"
-            | "async_dist" => flag_value(process, &name).unwrap_or_else(|| match name.as_str() {
-                "priority" => atom("normal"),
-                "message_queue_data" => atom("on_heap"),
-                "error_handler" => atom("error_handler"),
-                "sensitive" | "async_dist" => atom("false"),
-                "save_calls" => atom("false"),
-                _ => Term::small(0).unwrap(),
-            }),
+            // The queue mode is the process's own (erts p->sig_qs.flags FS_OFF_HEAP_MSGQ).
+            "message_queue_data" => atom(
+                if process.cold.as_ref().is_some_and(|cold| cold.off_heap_msgq) {
+                    "off_heap"
+                } else {
+                    "on_heap"
+                },
+            ),
+            "priority" | "error_handler" | "save_calls" | "sensitive" | "async_dist" => {
+                flag_value(process, &name).unwrap_or_else(|| match name.as_str() {
+                    "priority" => atom("normal"),
+                    "error_handler" => atom("error_handler"),
+                    "sensitive" | "async_dist" => atom("false"),
+                    "save_calls" => atom("false"),
+                    _ => Term::small(0).unwrap(),
+                })
+            }
             "backtrace" => {
                 let running = status == atom("running");
                 let text = backtrace_text(vm, process, running)?;
@@ -622,8 +627,9 @@ fn process_info(
                     None => Term::NIL,
                 }
             }
-            "fullsweep_after" => flag_value(process, "fullsweep_after")
-                .unwrap_or_else(|| Term::small(65_535).unwrap()),
+            "fullsweep_after" => {
+                Term::small(i64::from(process.heap.fullsweep_after())).ok_or_else(badarg)?
+            }
             "min_heap_size" => {
                 // Port of erts/emulator/beam/erl_process.h (`p->min_heap_size`), OTP-29.1.1.
                 Term::small(process.heap.min_heap_size_words() as i64).ok_or_else(badarg)?
@@ -1079,12 +1085,10 @@ pub(crate) fn native_call_site(
 /// `process_info(Pid, initial_call)` from `p->u.initial` (the spawn entry), then the
 /// current MFA. Spawn stores the entry as a module id and instruction.
 fn initial_call_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
-    if let Some((module, function, arity)) = process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.initial_call.clone())
-    {
-        return Ok((module, function, arity));
+    if let Some((module, function, arity)) = process.initial_mfa {
+        let names = arinsal_term::global_atoms();
+        let text = |atom| names.text(atom).unwrap_or_default().to_owned();
+        return Ok((text(module), text(function), arity));
     }
     if let Some((module_id, ip)) = process.initial_call {
         let resolve = |modules: &[std::sync::Arc<crate::Module>]| {
@@ -2108,7 +2112,15 @@ fn call_values(
                     }
                     return Term::small(previous as i64).ok_or_else(badarg);
                 }
-                let previous = flag(process, &name, *value)?;
+                let previous = if name == "message_queue_data" {
+                    // The queue mode is the process's own (erts p->sig_qs.flags FS_OFF_HEAP_MSGQ).
+                    let off_heap = *value == atom("off_heap");
+                    let previous = process.cold.as_ref().is_some_and(|cold| cold.off_heap_msgq);
+                    process.cold_mut().off_heap_msgq = off_heap;
+                    atom(if previous { "off_heap" } else { "on_heap" })
+                } else {
+                    flag(process, &name, *value)?
+                };
                 if name == "message_queue_data" {
                     // Port of erts/emulator/beam/bif.c:process_flag_2, OTP-29.1.1.
                     ctx.set_parallel_signal_buffers(*value == atom("off_heap"));
@@ -2683,26 +2695,8 @@ fn spawn_request(
     if parsed.monitor {
         parsed.monitor_id = Some(id);
     }
-    let child = spawn_apply(vm, process, ctx, module, function, args, &parsed)?;
-    if parsed.link {
-        process.cold_mut().links.insert(child);
-        ctx.signal(child, Signal::Link)
-            .map_err(|error| VmError::Unsupported(format!("spawn_request link: {error}")))?;
-    }
-    if parsed.monitor {
-        process.cold_mut().monitors.insert(id, child);
-        ctx.signal(child, Signal::Monitor(id))
-            .map_err(|error| VmError::Unsupported(format!("spawn_request monitor: {error}")))?;
-    }
-    if parsed.reply_success {
-        let pid_term = child.to_term().ok_or_else(badarg)?;
-        let message = make_tuple(process, &[parsed.tag, reference, atom("ok"), pid_term])?;
-        let envelope = Message::copy_from(message)?;
-        runtime
-            .scheduler()?
-            .send(child, ctx.pid(), envelope)
-            .map_err(|error| VmError::Unsupported(format!("spawn_reply: {error}")))?;
-    }
+    // Links, the monitor, and the reply are all made by erl_create_process (erl_process.c:12960+).
+    spawn_apply(vm, process, ctx, module, function, args, &parsed, reference)?;
     Ok(reference)
 }
 
@@ -2954,109 +2948,44 @@ fn reply_mode(value: Term) -> Option<(bool, bool)> {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // spawn_request arguments stay positional.
 fn spawn_apply(
     vm: &mut Vm,
     parent: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, Message>,
     module: Term,
     function: Term,
     args: Term,
     options: &LocalSpawn,
+    reference: Term,
 ) -> Result<Pid, VmError> {
-    let (module_id, entry) = crate::process::erlang_apply_entry(vm)?;
-    let runtime = parent.runtime.clone();
-    let defaults = crate::natives::sys::gc_spawn_defaults(runtime.as_deref());
-    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
-        runtime.as_deref(),
-        options.min_heap,
-        false,
-    );
-    let min_bin_vheap = if options.min_bin_vheap.is_some()
-        && options.min_heap.is_none()
-        && options.max_heap.is_none()
-    {
-        defaults.min_bin_vheap_size as usize
-    } else {
-        crate::natives::sys::normalize_spawn_heap_minimum(
-            runtime.as_deref(),
-            options.min_bin_vheap,
-            true,
-        )
-    };
-    let fullsweep_after = options.fullsweep.unwrap_or(defaults.fullsweep_after);
-    let max_heap = options.max_heap.unwrap_or(defaults.max_heap_size);
-    let mut child = Process::with_spawn_registers(3, 0);
-    child.set_runtime(parent.runtime.clone());
-    if options.min_heap.is_some() {
-        child.heap = arinsal_term::ProcessHeap::with_words(min_heap.max(64));
-    }
-    child.heap.set_min_heap_size(min_heap);
-    child.heap.set_min_bin_vheap_size(min_bin_vheap as u64);
-    child.heap.set_fullsweep_after(fullsweep_after);
-    child.module = module_id;
-    child.ip = entry;
-    if let (Some(m), Some(f), Some(arguments)) = (module.as_atom(), function.as_atom(), list(args))
-    {
-        let names = arinsal_term::global_atoms();
-        if let (Some(m), Some(f)) = (names.text(m), names.text(f)) {
-            child.cold_mut().initial_call =
-                Some((m.to_string(), f.to_string(), arguments.len() as u8));
-        }
-    } else {
-        child.cold_mut().initial_call = Some(("erlang".to_owned(), "apply".to_owned(), 2));
-    }
-    {
-        let flags = &mut child.cold_mut().flags;
-        flags.insert(
-            "fullsweep_after".to_owned(),
-            Term::small(i64::from(fullsweep_after)).unwrap(),
-        );
-        flags.insert(
-            "min_heap_size".to_owned(),
-            Term::small(min_heap as i64).unwrap(),
-        );
-        flags.insert(
-            "min_bin_vheap_size".to_owned(),
-            Term::small(min_bin_vheap as i64).unwrap(),
-        );
-    }
-    child.group_leader = Some(parent.group_leader_pid(ctx.pid()));
-    child.cold_mut().group_leader = child.group_leader;
-    // The child can exit before it drains the link/monitor signals. Record
-    // them now so `notify_exit` still delivers EXIT and DOWN.
-    if options.link {
-        child.cold_mut().links.insert(ctx.pid());
-    }
-    if let Some(id) = options.monitor_id {
-        child.cold_mut().monitored_by.insert(id, ctx.pid());
-    }
-    {
-        // Port of erts/emulator/beam/erl_process.c:12546,12638 (spawn arguments use
-        // copy_struct_litopt), OTP-29.1.1.
-        let literals = arinsal_term::LiteralAreas::current();
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
-        child.x[0] = arinsal_term::copy_term_litopt(module, &mut heap, &literals)
-            .map_err(|error| VmError::Unsupported(format!("spawn module: {error:?}")))?;
-        child.x[1] = arinsal_term::copy_term_litopt(function, &mut heap, &literals)
-            .map_err(|error| VmError::Unsupported(format!("spawn function: {error:?}")))?;
-        child.x[2] = arinsal_term::copy_term_litopt(args, &mut heap, &literals)
-            .map_err(|error| VmError::Unsupported(format!("spawn args: {error:?}")))?;
-    }
-    let runtime = parent
-        .runtime
-        .clone()
-        .ok_or_else(|| VmError::Unsupported("spawn_request requires a scheduler".into()))?;
-    let scheduler = runtime.scheduler()?;
-    // Port of erts/emulator/beam/erl_process.c:12565 (erl_create_process sets `p->max_heap_size`
-    // before the process is linked into the table), OTP-29.1.1.
-    let mut child = child;
-    if !is_default_max_heap(max_heap) {
-        child.cold_mut().max_heap = max_heap;
-    }
-    let pid = scheduler
-        .spawn_priority(child, options.priority)
-        .map_err(|error| VmError::Unsupported(format!("spawn_request: {error}")))?;
-    Ok(pid)
+    // spawn_request reaches erl_create_process with the reference it already allocated.
+    let created = crate::signals::erl_create_process(
+        vm,
+        parent,
+        ctx,
+        (module, function, args),
+        crate::signals::ErlSpawnOpts {
+            link: options.link,
+            monitor: options.monitor_id.map(|id| crate::signals::SpawnMonitor {
+                id: Some(id),
+                tag: None,
+                alias: false,
+            }),
+            min_heap: options.min_heap,
+            min_bin_vheap: options.min_bin_vheap,
+            fullsweep: options.fullsweep,
+            max_heap: options.max_heap,
+            off_heap_queue: None,
+            scheduler: None,
+            priority: options.priority,
+            reply: options.reply_success.then_some(crate::signals::SpawnReply {
+                tag: options.tag,
+                reference,
+            }),
+        },
+    )?;
+    Ok(created.pid)
 }
 
 /// Whether `limit` is the default `max_heap_size` (the process keeps no field for it).
@@ -3080,10 +3009,8 @@ pub(crate) fn tuple2(term: Term) -> Option<(Term, Term)> {
 // erl_gc.c:3807 (`erts_max_heap_size_map`), OTP-29.1.1.
 fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
     let limit = parse_max_heap(value).map_err(|()| badarg())?;
-    let floor = flag_value(process, "min_heap_size")
-        .and_then(|term| term.as_small())
-        .filter(|n| *n > 0)
-        .unwrap_or(233) as u64;
+    // The floor is the process's own min_heap_size (erts p->min_heap_size).
+    let floor = process.heap.min_heap_size_words() as u64;
     if limit.size != 0 && limit.size < floor {
         return Err(badarg());
     }

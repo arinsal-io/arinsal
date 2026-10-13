@@ -2117,10 +2117,9 @@ fn module_call_enabled(
 
 /// Whether `module:function/arity` is the initial call of the process.
 fn is_initial_call(process: &Process, module: &str, function: &str, arity: u8) -> bool {
-    if process.cold.as_ref().is_some_and(|cold| {
-        cold.initial_call
-            .as_ref()
-            .is_some_and(|(m, f, a)| m == module && f == function && *a == arity)
+    let names = arinsal_term::global_atoms();
+    if process.initial_mfa.is_some_and(|(m, f, a)| {
+        a == arity && names.text(m) == Some(module) && names.text(f) == Some(function)
     }) {
         return true;
     }
