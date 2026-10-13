@@ -4933,6 +4933,18 @@ impl<T: Task> Scheduler<T> {
     pub fn signal(&self, from: Pid, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
         self.inner.deliver(from, to, Payload::Signal(signal), None)
     }
+    /// Consume the held process monitor for `reference` to `to` when it is still unsent, so a
+    /// `demonitor(_, [flush])` need not send the demonitor signal. Returns true when consumed.
+    pub fn cancel_pending_monitor(&self, to: Pid, reference: u64) -> bool {
+        <Runner<'_, T> as ContextOps<T::Message>>::cancel_pending_monitor(
+            &mut Runner {
+                inner: &self.inner,
+                local: None,
+            },
+            to,
+            reference,
+        )
+    }
     /// Send an ordered signal from a process running on this thread, without a turn context.
     /// The erts BIF path (`erts_proc_sig_send_*` from `c_p`) holds a process monitor on the
     /// scheduler, so this shares the turn's delivery rules and needs no `RunCtx`.
