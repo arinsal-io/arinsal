@@ -88,7 +88,68 @@ pub(crate) fn static_nif_job(
     })
 }
 
+/// The terms of a finished dirty job's result: a dirty BIF value, or a static NIF value or
+/// the terms of its exception.
+fn dirty_result_slots<'a>(
+    dirty_bif: Option<&'a mut DirtyBif>,
+    static_nif_done: Option<&'a mut Result<Term, arinsal_bifs::BifError>>,
+) -> Vec<&'a mut Term> {
+    use arinsal_bifs::BifError;
+    let mut slots = Vec::new();
+    if let Some(DirtyBif::Done(Ok(value))) = dirty_bif {
+        slots.push(value);
+    }
+    match static_nif_done {
+        Some(Ok(value)) => slots.push(value),
+        Some(Err(BifError::Badarg { cause: Some(term) } | BifError::Error(term))) => {
+            slots.push(term)
+        }
+        Some(Err(BifError::Raise {
+            reason, stacktrace, ..
+        })) => {
+            slots.push(reason);
+            slots.extend(stacktrace.as_mut());
+        }
+        _ => {}
+    }
+    slots
+}
+
 impl Process {
+    /// The result of a finished dirty job that waits for its call to be executed again.
+    ///
+    /// erts schedules the result (or exception) as the argument of `erts_internal:
+    /// dirty_bif_result/1`, `dirty_nif_finalizer/1` or their exception counterparts, so it
+    /// sits in `c_p->arg_reg` with `c_p->arity` set, where a collection and the literal-area
+    /// check find it. These slots are the same roots.
+    // Port of erts/emulator/beam/bif.c:5814-5843 (erts_call_dirty_bif), erl_nif.c:509-535
+    // (erts_call_dirty_nif) and erl_nfunc_sched.c:126-137 (erts_nfunc_schedule copies the
+    // arguments into the registers), OTP-29.1.1.
+    pub(crate) fn dirty_result_roots(&self) -> Vec<Term> {
+        let Some(cold) = self.cold.as_ref() else {
+            return Vec::new();
+        };
+        let mut dirty_bif = match &cold.dirty_bif {
+            Some(DirtyBif::Done(Ok(value))) => Some(DirtyBif::Done(Ok(*value))),
+            _ => None,
+        };
+        let mut static_nif_done = cold.static_nif_done;
+        dirty_result_slots(dirty_bif.as_mut(), static_nif_done.as_mut())
+            .into_iter()
+            .map(|term| *term)
+            .collect()
+    }
+
+    /// Mutable view of [`Process::dirty_result_roots`], in the same order.
+    pub(crate) fn dirty_result_roots_mut(&mut self) -> Vec<&mut Term> {
+        match self.cold.as_mut() {
+            Some(cold) => {
+                dirty_result_slots(cold.dirty_bif.as_mut(), cold.static_nif_done.as_mut())
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// The dirty job this process executes next on a dirty scheduler of `kind`.
     pub(crate) fn take_dirty_job(&mut self, kind: DirtyKind) -> Option<DirtyJob> {
         let job = self.next_dirty_job(kind)?;
