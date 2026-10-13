@@ -197,7 +197,16 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
                         for i in 0..tuple.len() - 1 {
                             state.push(tuple.get(i).unwrap(), &mut jobs);
                         }
-                        jobs.push(Job::Visit(tuple.get(tuple.len() - 1).unwrap()));
+                        // erts walks the last element next (make_internal_hash, `term =
+                        // elements[arity]; continue`). An immediate is mixed here, which is the
+                        // step the stack pop would take next, so the stack is only for boxed terms.
+                        let last = tuple.get(tuple.len() - 1).unwrap();
+                        if last.bits() & 3 == 3 {
+                            state.alpha(1);
+                            state.beta(last.bits());
+                        } else {
+                            jobs.push(Job::Visit(last));
+                        }
                     }
                 }
                 TermKind::Record => {

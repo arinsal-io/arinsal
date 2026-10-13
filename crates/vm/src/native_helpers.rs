@@ -4420,3 +4420,35 @@ pub extern "C" fn arinsal_beamasm_bs_match(
     process.header.htop = process.heap.heap_cursor().0;
     result.map(crate::native_hooks::raw).unwrap_or(0)
 }
+
+/// `erlang:process_info/2` light entry. The caller's own items are built by
+/// `natives::proc::process_info_light`, the same builder the executor uses. Anything it declines
+/// (a foreign pid, queued signals, a VM-dependent item, an error) takes the executor.
+// Port of erts/emulator/beam/erl_bif_info.c:1274-1330 (process_info_bif, c_p == rp), OTP-29.1.1.
+pub(crate) extern "C" fn process_info_2_light(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    if let Some(raw) = process_info_2_self(header) {
+        return raw;
+    }
+    yield_executor_bif(header, regs, i, descriptor, identity)
+}
+
+fn process_info_2_self(header: *mut ProcessHeader) -> Option<u64> {
+    let (process, _registers) = crate::native_hooks::enter_runtime(header)?;
+    let pid = arinsal_sched::Pid::from_term(crate::native_hooks::x_reg(process, 0)?)?;
+    let item = crate::native_hooks::x_reg(process, 1)?;
+    let result = crate::natives::proc::process_info_light(process, pid, item);
+    // The builder allocates on the process heap. Write the cursor back on every outcome, so an
+    // executor fallback re-enters from the header with the same heap.
+    let top = process.heap.heap_top_index();
+    process.header.htop = native_htop(process, top);
+    match result {
+        Some(Ok(term)) => Some(crate::native_hooks::raw(term)),
+        _ => None,
+    }
+}
