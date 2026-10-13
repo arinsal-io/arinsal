@@ -83,45 +83,77 @@ typedef struct {
     uint64_t loops_consumed;
 } ar_re_match_result;
 
-/* Port of erts/emulator/beam/erl_bif_re.c:1685-1795 (re_run), OTP-29.1.1.
- * The loop budget can later come from the scheduler. Until then, resume in place. */
+/* Port of erts/emulator/beam/erl_bif_re.c:1685-1795 (re_run) and :1841-1900 (re_exec_trap),
+ * OTP-29.1.1. One call runs at most `loop_budget` loops. When the budget runs out the match
+ * state (`*session`, erts' RestartContext) stays allocated and the caller resumes it with the
+ * next call; mode 1 frees an unfinished session. The code and subject must stay alive and
+ * unmoved while a session exists. */
+typedef struct {
+    pcre2_match_data *data;
+    pcre2_match_context *ctx;
+    void *restart;
+} ar_re_session;
+
 ar_re_match_result ar_re_match(const pcre2_code *code, const uint8_t *subject,
                               size_t len, size_t offset, uint32_t options,
                               int match_limit, int depth_limit,
                               size_t *ovector, uint32_t ovec_count,
-                              int loop_budget) {
+                              int loop_budget, void **session_slot, int mode) {
     ar_re_match_result result = {0, 0};
-    pcre2_match_data *data = pcre2_match_data_create(ovec_count, NULL);
-    pcre2_match_context *ctx = NULL;
-    void *restart = NULL;
-    if (!data) { result.rc = PCRE2_ERROR_NOMEMORY; return result; }
-    if (match_limit >= 0 || depth_limit >= 0) {
-        ctx = pcre2_match_context_create(NULL);
-        if (!ctx) { pcre2_match_data_free(data); result.rc = PCRE2_ERROR_NOMEMORY; return result; }
-        if (match_limit >= 0) pcre2_set_match_limit(ctx, (uint32_t)match_limit);
-        if (depth_limit >= 0) pcre2_set_depth_limit(ctx, (uint32_t)depth_limit);
+    ar_re_session *session = (ar_re_session *)*session_slot;
+    if (mode == 1) {
+        if (session) {
+            if (session->restart) pcre2_free_restart_data(session->data);
+            if (session->ctx) pcre2_match_context_free(session->ctx);
+            pcre2_match_data_free(session->data);
+            free(session);
+            *session_slot = NULL;
+        }
+        return result;
     }
-    pcre2_set_restart_data(data, &restart);
-    pcre2_set_restart_flags(data, 0);
-    pcre2_set_loops_left(data, loop_budget);
-    int rc = pcre2_match(code, subject, len, offset, options, data, ctx);
-    result.loops_consumed = (uint64_t)(loop_budget - pcre2_get_loops_left(data));
-    while (rc == PCRE2_ERROR_LOOP_LIMIT) {
-        pcre2_set_loops_left(data, loop_budget);
-        pcre2_set_restart_flags(data, 0);
-        rc = pcre2_match(NULL, NULL, 0, 0, 0, data, NULL);
-        result.loops_consumed += (uint64_t)(loop_budget - pcre2_get_loops_left(data));
+    int rc;
+    if (!session) {
+        session = calloc(1, sizeof(*session));
+        if (!session) { result.rc = PCRE2_ERROR_NOMEMORY; return result; }
+        session->data = pcre2_match_data_create(ovec_count, NULL);
+        if (!session->data) { free(session); result.rc = PCRE2_ERROR_NOMEMORY; return result; }
+        if (match_limit >= 0 || depth_limit >= 0) {
+            session->ctx = pcre2_match_context_create(NULL);
+            if (!session->ctx) {
+                pcre2_match_data_free(session->data);
+                free(session);
+                result.rc = PCRE2_ERROR_NOMEMORY;
+                return result;
+            }
+            if (match_limit >= 0) pcre2_set_match_limit(session->ctx, (uint32_t)match_limit);
+            if (depth_limit >= 0) pcre2_set_depth_limit(session->ctx, (uint32_t)depth_limit);
+        }
+        pcre2_set_restart_data(session->data, &session->restart);
+        pcre2_set_restart_flags(session->data, 0);
+        pcre2_set_loops_left(session->data, loop_budget);
+        rc = pcre2_match(code, subject, len, offset, options, session->data, session->ctx);
+    } else {
+        pcre2_set_loops_left(session->data, loop_budget);
+        pcre2_set_restart_flags(session->data, 0);
+        rc = pcre2_match(NULL, NULL, 0, 0, 0, session->data, NULL);
     }
+    result.loops_consumed = (uint64_t)(loop_budget - pcre2_get_loops_left(session->data));
     result.rc = rc;
+    if (rc == PCRE2_ERROR_LOOP_LIMIT) {
+        *session_slot = session;
+        return result;
+    }
     if (rc > 0) {
-        size_t *src = pcre2_get_ovector_pointer(data);
+        size_t *src = pcre2_get_ovector_pointer(session->data);
         for (int i = 0; i < rc && (uint32_t)i < ovec_count; i++) {
             ovector[2*i] = src[2*i];
             ovector[2*i+1] = src[2*i+1];
         }
     }
-    if (restart) pcre2_free_restart_data(data);
-    if (ctx) pcre2_match_context_free(ctx);
-    pcre2_match_data_free(data);
+    if (session->restart) pcre2_free_restart_data(session->data);
+    if (session->ctx) pcre2_match_context_free(session->ctx);
+    pcre2_match_data_free(session->data);
+    free(session);
+    *session_slot = NULL;
     return result;
 }
