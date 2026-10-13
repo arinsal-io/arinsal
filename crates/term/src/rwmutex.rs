@@ -14,7 +14,28 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
-const READER_GROUPS: usize = 64;
+/// Reader indicator slots a lock allocates. erts sizes its array from the scheduler count, so
+/// the used length is `reader_groups_array_size`; this bounds it at 64 groups.
+const READER_SLOTS: usize = 64;
+/// `reader_groups_array_size` (ethr_mutex.c:145, 168-170). Set once at late init, before any
+/// lock is used; a writer scans this many indicators and readers index modulo it.
+static READER_GROUPS_ARRAY_SIZE: AtomicUsize = AtomicUsize::new(READER_SLOTS);
+
+/// Late init of the reader groups from the scheduler count, as `ethr_mutex_lib_late_init`
+/// (ethr_mutex.c:151-170) sets `reader_groups_array_size`: `1` for at most one group, else one
+/// more than the group count.
+pub fn set_reader_groups(no_reader_groups: usize) {
+    let size = if no_reader_groups <= 1 {
+        1
+    } else {
+        no_reader_groups + 1
+    };
+    READER_GROUPS_ARRAY_SIZE.store(size.min(READER_SLOTS), Ordering::Release);
+}
+
+fn reader_groups_array_size() -> usize {
+    READER_GROUPS_ARRAY_SIZE.load(Ordering::Acquire)
+}
 
 thread_local! {
     static READER_GROUP: Cell<Option<usize>> = const { Cell::new(None) };
@@ -32,11 +53,13 @@ pub fn set_reader_group(id: usize) {
 fn reader_index() -> usize {
     READER_GROUP.with(|group| {
         if let Some(id) = group.get() {
-            return id % READER_GROUPS;
+            return id % reader_groups_array_size();
         }
         FALLBACK_SLOT.with(|slot| {
             if slot.get() == usize::MAX {
-                slot.set(NEXT_FALLBACK.fetch_add(1, Ordering::Relaxed) % READER_GROUPS);
+                slot.set(
+                    NEXT_FALLBACK.fetch_add(1, Ordering::Relaxed) % reader_groups_array_size(),
+                );
             }
             slot.get()
         })
@@ -66,7 +89,7 @@ unsafe impl<T: Send + Sync> Sync for FrequentReadRwLock<T> {}
 impl<T> FrequentReadRwLock<T> {
     /// Create a lock in the unlocked state.
     pub fn new(value: T) -> Self {
-        let readers = (0..READER_GROUPS)
+        let readers = (0..READER_SLOTS)
             .map(|_| ReaderSlot {
                 readers: AtomicI32::new(0),
             })
@@ -131,7 +154,7 @@ impl<T> FrequentReadRwLock<T> {
     }
 
     fn readers_are_zero(&self) -> bool {
-        self.readers
+        self.readers[..reader_groups_array_size()]
             .iter()
             .all(|slot| slot.readers.load(Ordering::Acquire) == 0)
     }

@@ -505,7 +505,19 @@ impl From<DirtyKind> for SchedulerType {
     }
 }
 
+/// A process monitor held on this scheduler until its target gets another signal or the
+/// sending process is scheduled out. Port of erts `esdp->pending_signal`
+/// (erl_proc_sig_queue.c:1102-1125, erts_proc_sig_send_pending), OTP-29.1.1.
+#[derive(Clone, Copy)]
+struct PendingProcMonitor {
+    from: Pid,
+    to: Pid,
+    id: u64,
+}
+
 thread_local! {
+    static PENDING_PROC_MONITOR: std::cell::RefCell<Option<PendingProcMonitor>> =
+        const { std::cell::RefCell::new(None) };
     static SCHEDULER_TYPE: std::cell::Cell<SchedulerType> =
         const { std::cell::Cell::new(SchedulerType::Normal) };
     static NORMAL_SCHEDULER_ID: std::cell::Cell<Option<usize>> =
@@ -521,6 +533,19 @@ pub fn current_normal_scheduler() -> Option<usize> {
 /// Scheduler type of the calling thread, like `erts_get_scheduler_data()->type`.
 pub fn current_scheduler_type() -> SchedulerType {
     SCHEDULER_TYPE.with(std::cell::Cell::get)
+}
+
+/// Take the held process monitor of this scheduler when it is for `to`, so the signal to `to`
+/// is sent after it. Port of erl_proc_sig_queue.c:1141-1150, OTP-29.1.1.
+fn take_held_monitor_for(to: Pid) -> Option<PendingProcMonitor> {
+    PENDING_PROC_MONITOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|held| held.to == to) {
+            slot.take()
+        } else {
+            None
+        }
+    })
 }
 
 /// A VM process or a benchmark dummy task.
@@ -4110,12 +4135,6 @@ fn process_peak_rss_bytes() -> Option<u64> {
 struct Runner<'a, T: Task> {
     inner: &'a Inner<T>,
     local: Option<&'a RefCell<Local<T>>>,
-    /// Process monitor held until the next signal to that pid, or slice end.
-    ///
-    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:1104 (pending process
-    /// monitor), OTP-29.1.1. `gen_server:call` monitors and then sends; one
-    /// publication wakes the server once.
-    deferred_monitor: Option<(Pid, Event<T::Message>)>,
 }
 
 impl<T: Task> Runner<'_, T> {
@@ -4139,21 +4158,31 @@ impl<T: Task> Runner<'_, T> {
         }
     }
 
-    /// Publish a monitor that was accepted while its target was waiting.
-    /// The monitor BIF has already returned, so a dead target must bounce DOWN.
+    /// Publish the held monitor of this scheduler, if any.
     fn publish_deferred_monitor(&mut self) {
-        let Some((to, event)) = self.deferred_monitor.take() else {
-            return;
+        if let Some(held) = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().take()) {
+            self.publish_monitor(held);
+        }
+    }
+
+    /// Publish the held monitor only when it is for `to`, so the signal to `to` goes after it.
+    fn publish_deferred_monitor_for(&mut self, to: Pid) {
+        if let Some(held) = take_held_monitor_for(to) {
+            self.publish_monitor(held);
+        }
+    }
+
+    /// Send a held process monitor now. The monitor BIF has already returned, so a dead
+    /// target must bounce DOWN (erl_proc_sig_queue.c:1131-1135, `noproc`).
+    fn publish_monitor(&mut self, held: PendingProcMonitor) {
+        let PendingProcMonitor { from, to, id } = held;
+        let event: Event<T::Message> = Event {
+            from,
+            payload: Payload::Signal(Signal::Monitor(id)),
         };
         let Event { from, payload } = event;
-        let monitor_id = match payload {
-            Payload::Signal(Signal::Monitor(id)) => Some(id),
-            _ => None,
-        };
         let Some(process) = self.lookup(to) else {
-            if let Some(id) = monitor_id {
-                self.bounce_monitors(to, vec![(from, id)]);
-            }
+            self.bounce_monitors(to, vec![(from, id)]);
             return;
         };
         if self
@@ -4167,7 +4196,6 @@ impl<T: Task> Runner<'_, T> {
                 false,
             )
             .is_err()
-            && let Some(id) = monitor_id
         {
             self.bounce_monitors(to, vec![(from, id)]);
         }
@@ -4270,13 +4298,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         priority: Priority,
     ) -> Result<(), Error> {
         // Keep signal order: a monitor deferred for `to` goes first.
-        if self
-            .deferred_monitor
-            .as_ref()
-            .is_some_and(|(pid, _)| *pid == to)
-        {
-            self.publish_deferred_monitor();
-        }
+        self.publish_deferred_monitor_for(to);
         self.inner.deliver_sys_task(from, to, payload, priority)
     }
     fn start_resolved_timer(
@@ -4360,15 +4382,15 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     }
 
     fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool {
-        if self.deferred_monitor.as_ref().is_some_and(|(pid, event)| {
-            *pid == to
-                && matches!(&event.payload, Payload::Signal(Signal::Monitor(id)) if *id == reference)
+        if PENDING_PROC_MONITOR.with(|slot| {
+            slot.borrow()
+                .is_some_and(|held| held.to == to && held.id == reference)
         }) {
             // Port of erts/emulator/beam/erl_proc_sig_queue.c:1104
             // (pending process monitor), OTP-29.1.1. `demonitor([flush])`
             // consumes any possible DOWN, so this unpublished monitor has no
             // target-visible effect.
-            self.deferred_monitor = None;
+            PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().take());
             true
         } else {
             false
@@ -4396,33 +4418,26 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         Ok(())
     }
     fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<T::Message>) -> Result<(), Error> {
-        if self
-            .deferred_monitor
-            .as_ref()
-            .is_some_and(|(pid, _)| *pid != to)
-        {
-            self.publish_deferred_monitor();
-        }
         let monitor = matches!(payload, Payload::Signal(Signal::Monitor(_)));
-        // A waiting process cannot exit until a waking signal arrives, so its
-        // monitor can ride with the following send. A running process is
-        // published now: it may exit before this slice ends.
-        if monitor && self.deferred_monitor.is_none() {
-            let process = self.lookup(to).ok_or(Error::NoProcess)?;
-            if process.run_state().load(Ordering::Acquire) == WAITING {
-                self.deferred_monitor = Some((to, Event { from, payload }));
-                return Ok(());
-            }
-        }
-        let deferred = if self
-            .deferred_monitor
-            .as_ref()
-            .is_some_and(|(pid, _)| *pid == to)
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:1102-1125 (esdp->pending_signal),
+        // OTP-29.1.1: on a normal scheduler every process monitor is held; a monitor replaces
+        // the held one, which goes out first.
+        if let Payload::Signal(Signal::Monitor(id)) = payload
+            && matches!(current_scheduler_type(), SchedulerType::Normal)
         {
-            self.deferred_monitor.take().map(|(_, event)| event)
-        } else {
-            None
-        };
+            let held = PendingProcMonitor { from, to, id };
+            let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
+            if let Some(previous) = previous {
+                self.publish_monitor(previous);
+            }
+            return Ok(());
+        }
+        // Erts sends the held monitor first when the next signal goes to its target
+        // (erl_proc_sig_queue.c:1141-1150); a signal to another target leaves it held.
+        let deferred = take_held_monitor_for(to).map(|held| Event {
+            from: held.from,
+            payload: Payload::Signal(Signal::Monitor(held.id)),
+        });
         let process = self.lookup(to).ok_or(Error::NoProcess)?;
         let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
         let wakes = payload_wakes(&payload);
@@ -4494,9 +4509,6 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         Ok(())
     }
     fn flush(&mut self) {
-        if self.deferred_monitor.is_none() {
-            return;
-        }
         self.publish_deferred_monitor();
     }
     fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<T::Message>> {
@@ -4637,6 +4649,7 @@ pub struct SchedulerStats {
 impl<T: Task> Scheduler<T> {
     /// Start real worker threads.
     pub fn new(config: Config) -> Self {
+        arinsal_term::set_reader_groups(config.workers);
         Self::build(config, Arc::new(RealClock(Instant::now())), None, None)
     }
 
@@ -4919,6 +4932,26 @@ impl<T: Task> Scheduler<T> {
     /// Queue a signal in the same ordered stream.
     pub fn signal(&self, from: Pid, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
         self.inner.deliver(from, to, Payload::Signal(signal), None)
+    }
+    /// Send an ordered signal from a process running on this thread, without a turn context.
+    /// The erts BIF path (`erts_proc_sig_send_*` from `c_p`) holds a process monitor on the
+    /// scheduler, so this shares the turn's delivery rules and needs no `RunCtx`.
+    pub fn signal_ordered(
+        &self,
+        from: Pid,
+        to: Pid,
+        signal: Signal<T::Message>,
+    ) -> Result<(), Error> {
+        let mut runner = Runner {
+            inner: &self.inner,
+            local: None,
+        };
+        <Runner<'_, T> as ContextOps<T::Message>>::deliver(
+            &mut runner,
+            from,
+            to,
+            Payload::Signal(signal),
+        )
     }
     /// Run one copy of `work` on every scheduler at its next scheduling point.
     pub fn request_aux_work_all(&self, work: impl Fn(usize) + Send + Sync + 'static) {
@@ -5605,7 +5638,6 @@ mod msgq_stage_microbench {
         let mut receive_runner = Runner {
             inner: &scheduler.inner,
             local: None,
-            deferred_monitor: None,
         };
         let backlog = AtomicUsize::new(N);
         let bound_worker = AtomicUsize::new(UNBOUND_WORKER);
@@ -5677,7 +5709,6 @@ mod msgq_stage_microbench {
         let mut runner = Runner {
             inner: &scheduler.inner,
             local: None,
-            deferred_monitor: None,
         };
         let started = Instant::now();
         for message in 0..N {
@@ -5703,7 +5734,6 @@ mod msgq_stage_microbench {
             let mut runner = Runner {
                 inner: &scheduler.inner,
                 local: None,
-                deferred_monitor: None,
             };
             <Runner<'_, Idle> as ContextOps<usize>>::deliver(
                 &mut runner,
@@ -5742,7 +5772,6 @@ mod msgq_stage_microbench {
         let mut runner = Runner {
             inner: &scheduler.inner,
             local: None,
-            deferred_monitor: None,
         };
         for value in 1..=3 {
             <Runner<'_, Idle> as ContextOps<usize>>::deliver(
@@ -6060,7 +6089,6 @@ fn run_slice<'a, T: Task>(
         let mut runner = Runner {
             inner,
             local: local_cell,
-            deferred_monitor: None,
         };
         let result = {
             let TaskCell { task } = &mut *cell;
