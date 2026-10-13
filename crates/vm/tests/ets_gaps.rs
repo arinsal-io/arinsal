@@ -3,7 +3,8 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ets_gaps_diff).
--export([all_tables/0, run_r/0, stats/0, errors/0, select_delete_large/0]).
+-export([all_tables/0, run_r/0, stats/0, errors/0, select_delete_large/0,
+         write_concurrency_lookup_element/0]).
 
 all_tables() ->
     Named = ets:new(gap_named, [named_table, public, set]),
@@ -180,6 +181,18 @@ select_delete_large() ->
     Before = ets:select_count(Table, Spec),
     Deleted = ets:select_delete(Table, Spec),
     {Before, Deleted, lists:sort(ets:tab2list(Table))}.
+
+write_concurrency_lookup_element() ->
+    Table = ets:new(gap_write_concurrency, [set, public, {write_concurrency, true}]),
+    true = ets:insert_new(Table, {inserted_new, 1, a}),
+    InsertedNew = ets:lookup_element(Table, inserted_new, 3),
+    2 = ets:update_counter(Table, counter_default, 1, {counter_default, 1, b}),
+    CounterDefault = ets:lookup_element(Table, counter_default, 3),
+    true = ets:update_element(Table, element_default, {2, z}, {element_default, 0, c}),
+    ElementDefault = ets:lookup_element(Table, element_default, 3),
+    Missing = caught(fun() -> ets:lookup_element(Table, missing, 3) end),
+    PastArity = caught(fun() -> ets:lookup_element(Table, inserted_new, 4) end),
+    {InsertedNew, CounterDefault, ElementDefault, Missing, PastArity}.
 "#;
 
 #[test]
@@ -213,6 +226,11 @@ fn ets_error_cases_match_otp_29() {
 #[test]
 fn select_delete_large_hash_table_matches_otp_29() {
     assert_same("select_delete_large");
+}
+
+#[test]
+fn lookup_element_after_shared_writes_matches_otp_29() {
+    assert_same("write_concurrency_lookup_element");
 }
 
 fn assert_same(function: &str) -> CallResult {
