@@ -4881,6 +4881,14 @@ impl<T: Task> Scheduler<T> {
             .table
             .with_live(pid, |process| f(&process.exit_flags))
     }
+    /// Whether signals wait in the outer signal queue of `pid`. `None` when the process is not
+    /// alive. A light caller reads its own state only while this is false.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1547 (pending signal probe), OTP-29.1.1.
+    pub fn input_has_pending(&self, pid: Pid) -> Option<bool> {
+        self.inner
+            .table
+            .with_live(pid, |process| process.input.has_pending())
+    }
     /// Spawn a normal-priority task.
     pub fn spawn(&self, task: T) -> Result<Pid, Error> {
         self.spawn_priority(task, Priority::Normal)

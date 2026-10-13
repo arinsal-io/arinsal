@@ -37,6 +37,9 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "group_leader", 0) => {
             crate::native_helpers::group_leader_0_light as *const () as usize
         }
+        ("erlang", "process_info", 2) => {
+            crate::native_helpers::process_info_2_light as *const () as usize
+        }
         ("erlang", "put", 2) => put_2_light as *const () as usize,
         ("erlang", "get", 1) => get_1_light as *const () as usize,
         ("erlang", "erase", 1) => erase_1_light as *const () as usize,
