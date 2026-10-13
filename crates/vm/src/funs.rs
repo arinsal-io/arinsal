@@ -414,10 +414,10 @@ impl Vm {
                 .ok_or_else(|| VmError::Unsupported("lambda module atom".into()))?;
             // Port of erts/emulator/beam/beam_bif_load.c:1977
             // (erts_suspend_process_on_pending_purge_lambda), OTP-29.1.1.
-            if let (Some(runtime), Some(pid)) = (p.runtime.clone(), p.self_pid)
+            if let Some(pid) = p.self_pid
                 && self.purge_state.suspend_on_pending_lambda(&name, pid)
             {
-                runtime.suspend_internal(pid);
+                crate::suspend::suspend_self(p);
                 // ERTS_VBUMP_ALL_REDS: leave the scheduler at the next instruction.
                 p.force_yield = true;
             }

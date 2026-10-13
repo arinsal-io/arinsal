@@ -336,6 +336,25 @@ impl Priority {
 /// `sys_priority` value when no system task elevates the process.
 const NO_SYS_PRIORITY: u8 = 4;
 
+/// An object shared by the origin and target halves of one monitor (erts' `ErtsMonitorData`). The
+/// scheduler does not look inside it; the VM downcasts it. Identity, not content, decides equality.
+#[derive(Clone)]
+pub struct SharedPayload(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl fmt::Debug for SharedPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SharedPayload")
+    }
+}
+
+impl PartialEq for SharedPayload {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedPayload {}
+
 /// Control signals delivered in the same stream as messages.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Signal<M> {
@@ -347,8 +366,34 @@ pub enum Signal<M> {
     UnlinkAck(u64),
     /// Acknowledgement for the link protocol's unlink operation.
     UnlinkAckSignal(u64),
-    /// Monitor request carrying a VM reference.
-    Monitor(u64),
+    /// Monitor request carrying a VM reference and the monitor's shared data.
+    Monitor {
+        reference: u64,
+        shared: SharedPayload,
+    },
+    /// Suspend monitor activation: the suspender's `SuspendMonitor` (erl_proc_sig_queue.c
+    /// handle_suspend, erl_process.c:9140). The target applies it and marks the monitor active.
+    Suspend { shared: SharedPayload },
+    /// Suspend monitor release: the suspender dropped its last suspend, or exited (erl_proc_sig_queue.c:6609).
+    SuspendRelease { shared: SharedPayload },
+    /// The suspendee of a suspend monitor exited: the suspender drops its half (erts
+    /// monitor-down of an ERTS_MON_TYPE_SUSPEND monitor, erl_process.c:13809).
+    SuspendDown { shared: SharedPayload },
+    /// Internal resume: undo one suspend the process took on itself (erl_process.c:9402 erts_resume).
+    SuspendResume,
+    /// Internal suspend of the receiving process, taken from another process (erts_suspend on a
+    /// process the caller does not run as). The receiver applies it to itself.
+    SuspendInternal,
+    /// Synchronous or tagged suspend reply request (erl_proc_sig_queue.c:3192
+    /// erts_proc_sig_send_sync_suspend): queued behind the suspend, the target sends `{tag, reply}`
+    /// to `requester` once it handled everything before it, patching the result to its state.
+    SyncSuspend {
+        requester: Pid,
+        tag: M,
+        /// Atom index of the reply when the target is suspended.
+        reply: u32,
+        async_: bool,
+    },
     /// `Monitor` could not be published because the target exited first.
     MonitorNoproc(u64),
     /// Demonitor request carrying a VM reference.
@@ -362,6 +407,8 @@ pub enum Signal<M> {
     PortExit { port: M, reason: M },
     /// Monitor DOWN signal carrying an opaque reason envelope.
     MonitorDown { reference: u64, reason: M },
+    /// Monitor DOWN message the sender already built (a non-immediate reason, erl_proc_sig_queue.c:2836-2900).
+    MonitorDownMsg { reference: u64, message: M },
     /// Alias activation.
     Alias(u64),
     /// Alias deactivation.
@@ -513,11 +560,12 @@ impl From<DirtyKind> for SchedulerType {
 /// A process monitor held on this scheduler until its target gets another signal or the
 /// sending process is scheduled out. Port of erts `esdp->pending_signal`
 /// (erl_proc_sig_queue.c:1102-1125, erts_proc_sig_send_pending), OTP-29.1.1.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PendingProcMonitor {
     from: Pid,
     to: Pid,
     id: u64,
+    shared: SharedPayload,
 }
 
 thread_local! {
@@ -848,6 +896,20 @@ pub mod proc_flags {
     /// `ERTS_PSFLG_EXITING`, outside `ALL` so cleanup does not retire the bit.
     /// Port of erl_nif.c:2323 (`enif_is_process_alive` sees the state flag), OTP-29.1.1.
     pub const EXITING: u32 = 1 << 15;
+    /// The process is parked in `erts_hibernate` (erl_process.c:9304 reads it for `status`).
+    /// It is a state bit the process sets on itself, outside `ALL` like `EXITING`.
+    pub const HIBERNATED: u32 = 1 << 14;
+    /// `ERTS_PSFLG_SUSPENDED`: the process has an active suspend (erl_process.c:7235 suspend_process).
+    /// Set by the suspend path, cleared when the last suspend is released. Outside `ALL`.
+    pub const SUSPENDED: u32 = 1 << 13;
+    /// Sets a state bit of the owning process (no cleanup bookkeeping).
+    pub fn set_state(flags: &AtomicU32, bit: u32) {
+        flags.fetch_or(bit, Ordering::AcqRel);
+    }
+    /// Clears a state bit of the owning process.
+    pub fn clear_state(flags: &AtomicU32, bit: u32) {
+        flags.fetch_and(!bit, Ordering::AcqRel);
+    }
     const DONE_SHIFT: u32 = 16;
 
     /// Bits whose global tables exit must still visit.
@@ -908,6 +970,9 @@ struct Process<T: Task> {
     /// the wheels that hold the receiver's timers, so a process without timers disturbs no
     /// other scheduler.
     bif_timer_wheels: AtomicU64,
+    /// `p->paused_bif_timers != NULL` (erl_hl_timer.c:2864): the process is suspended, so a BIF
+    /// timer aimed at it is created paused (erl_hl_timer.c:1838, setup_bif_timer).
+    bif_timers_paused: AtomicBool,
     /// See [`proc_flags`]. Read on exit without the process cell lock.
     exit_flags: AtomicU32,
     /// `p->common.u.alive.reg->name`, or [`u32::MAX`] when the process has no name.
@@ -1028,6 +1093,7 @@ impl<T: Task> ProcessTable<T> {
             wait_epoch: AtomicU64::new(0),
             timer_epoch_used: AtomicBool::new(false),
             bif_timer_wheels: AtomicU64::new(0),
+            bif_timers_paused: AtomicBool::new(false),
             exit_flags: AtomicU32::new(0),
             reg_atom: AtomicU32::new(u32::MAX),
             wait_timer: AtomicU64::new(0),
@@ -2592,13 +2658,22 @@ impl<T: Task> Inner<T> {
             }
             return;
         }
-        // A paused receiver's new timers are created paused on every wheel (wheel.insert),
-        // so every wheel may now hold timers aimed at it.
-        if pause && let Some(process) = self.table.lookup(pid) {
-            process.bif_timer_wheels.store(u64::MAX, Ordering::Release);
-            proc_flags::publish(&process.exit_flags, proc_flags::BIF_TIMERS);
+        // Port of erts/emulator/beam/erl_hl_timer.c:2864 (erts_pause_bif_timers) and :2949
+        // (erts_resume_paused_bif_timers), OTP-29.1.1: the process remembers that its timers are
+        // paused, and only the wheels that hold its timers are visited.
+        let Some(process) = self.table.lookup(pid) else {
+            return;
+        };
+        if pause {
+            process.bif_timers_paused.store(true, Ordering::SeqCst);
+        } else {
+            process.bif_timers_paused.store(false, Ordering::SeqCst);
         }
+        let wheels = process.bif_timer_wheels.load(Ordering::SeqCst);
         for (worker, queue) in self.timer_commands.iter().enumerate() {
+            if wheels & timer_wheel_bit(worker) == 0 {
+                continue;
+            }
             queue.push(if pause {
                 TimerCommand::PauseTarget { pid }
             } else {
@@ -2606,6 +2681,19 @@ impl<T: Task> Inner<T> {
             });
             self.wake_worker(worker);
         }
+    }
+
+    /// The receiver of a BIF timer about to enter a wheel when its timers are paused.
+    fn paused_receiver(&self, payload: &TimerPayload<T::Message>) -> Option<Pid> {
+        let TimerPayload::Message(target, _, _) = payload else {
+            return None;
+        };
+        self.table
+            .with_live(*target, |process| {
+                process.bif_timers_paused.load(Ordering::SeqCst)
+            })
+            .filter(|paused| *paused)
+            .map(|_| *target)
     }
 
     fn owner_timer_service(&self, worker: usize) -> Option<Rc<RefCell<TimerService<T::Message>>>> {
@@ -2978,6 +3066,9 @@ impl<T: Task> Inner<T> {
                     if !service.wheel.has_timers() {
                         let _ = service.wheel.advance(self.clock.now_ms());
                     }
+                    if let Some(target) = self.paused_receiver(&payload) {
+                        service.wheel.ensure_paused(target);
+                    }
                     service.wheel.insert(id, deadline, payload);
                 }
                 TimerCommand::Read { id, callback } => {
@@ -3199,11 +3290,17 @@ impl<T: Task> Inner<T> {
             if !service.wheel.has_timers() {
                 let _ = service.wheel.advance(now);
             }
+            if let Some(target) = self.paused_receiver(&payload) {
+                service.wheel.ensure_paused(target);
+            }
             service.wheel.insert(id, deadline, payload);
         } else if let Some(service) = self.owner_timer_service(worker) {
             let mut service = service.borrow_mut();
             if !service.wheel.has_timers() {
                 let _ = service.wheel.advance(now);
+            }
+            if let Some(target) = self.paused_receiver(&payload) {
+                service.wheel.ensure_paused(target);
             }
             service.wheel.insert(id, deadline, payload);
         } else if let Some(timers) = self.sim_timers.as_ref() {
@@ -4123,6 +4220,13 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
             | Signal::ExitLinked(_)
             | Signal::PortExit { .. }
             | Signal::MonitorDown { .. }
+            | Signal::MonitorDownMsg { .. }
+            | Signal::Suspend { .. }
+            | Signal::SuspendRelease { .. }
+            | Signal::SuspendDown { .. }
+            | Signal::SuspendResume
+            | Signal::SuspendInternal
+            | Signal::SyncSuspend { .. }
             | Signal::MonitorNoproc(_)
             | Signal::GarbageCollect
             | Signal::LiteralAreaCopy { .. }
@@ -4131,7 +4235,7 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
             Signal::UnlinkAckSignal(_) => true,
             Signal::Link
             | Signal::Unlink(_)
-            | Signal::Monitor(_)
+            | Signal::Monitor { .. }
             | Signal::Demonitor(_)
             | Signal::Alias(_)
             | Signal::Unalias(_) => false,
@@ -4143,7 +4247,7 @@ fn take_lost_monitors<M>(events: &mut Vec<Event<M>>) -> Vec<(Pid, u64)> {
     events
         .drain(..)
         .filter_map(|event| match event.payload {
-            Payload::Signal(Signal::Monitor(id)) => Some((event.from, id)),
+            Payload::Signal(Signal::Monitor { reference, .. }) => Some((event.from, reference)),
             _ => None,
         })
         .collect()
@@ -4210,10 +4314,18 @@ impl<T: Task> Runner<'_, T> {
     /// Send a held process monitor now. The monitor BIF has already returned, so a dead
     /// target must bounce DOWN (erl_proc_sig_queue.c:1131-1135, `noproc`).
     fn publish_monitor(&mut self, held: PendingProcMonitor) {
-        let PendingProcMonitor { from, to, id } = held;
+        let PendingProcMonitor {
+            from,
+            to,
+            id,
+            shared,
+        } = held;
         let event: Event<T::Message> = Event {
             from,
-            payload: Payload::Signal(Signal::Monitor(id)),
+            payload: Payload::Signal(Signal::Monitor {
+                reference: id,
+                shared,
+            }),
         };
         let Event { from, payload } = event;
         let Some(process) = self.lookup(to) else {
@@ -4419,6 +4531,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool {
         if PENDING_PROC_MONITOR.with(|slot| {
             slot.borrow()
+                .as_ref()
                 .is_some_and(|held| held.to == to && held.id == reference)
         }) {
             // Port of erts/emulator/beam/erl_proc_sig_queue.c:1104
@@ -4453,14 +4566,19 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         Ok(())
     }
     fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<T::Message>) -> Result<(), Error> {
-        let monitor = matches!(payload, Payload::Signal(Signal::Monitor(_)));
+        let monitor = matches!(payload, Payload::Signal(Signal::Monitor { .. }));
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1102-1125 (esdp->pending_signal),
         // OTP-29.1.1: on a normal scheduler every process monitor is held; a monitor replaces
         // the held one, which goes out first.
-        if let Payload::Signal(Signal::Monitor(id)) = payload
+        if let Payload::Signal(Signal::Monitor { reference, shared }) = &payload
             && matches!(current_scheduler_type(), SchedulerType::Normal)
         {
-            let held = PendingProcMonitor { from, to, id };
+            let held = PendingProcMonitor {
+                from,
+                to,
+                id: *reference,
+                shared: shared.clone(),
+            };
             let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
             if let Some(previous) = previous {
                 self.publish_monitor(previous);
@@ -4471,7 +4589,10 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         // (erl_proc_sig_queue.c:1141-1150); a signal to another target leaves it held.
         let deferred = take_held_monitor_for(to).map(|held| Event {
             from: held.from,
-            payload: Payload::Signal(Signal::Monitor(held.id)),
+            payload: Payload::Signal(Signal::Monitor {
+                reference: held.id,
+                shared: held.shared,
+            }),
         });
         let process = self.lookup(to).ok_or(Error::NoProcess)?;
         let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
@@ -5176,6 +5297,41 @@ impl<T: Task> Scheduler<T> {
             return Err(SignalFreeError::Busy);
         }
         Ok(inspect(&cell.task))
+    }
+    /// Mutate a task through its main lock while it is not executing and its signal queue is
+    /// empty; otherwise the caller must send a signal.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:14836-14888 (`erts_try_lock_sig_free_proc`)
+    /// as `erts_internal_suspend_process_2` uses it (erl_process.c:9140), OTP-29.1.1.
+    pub fn modify_signal_free<R>(
+        &self,
+        pid: Pid,
+        body: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, SignalFreeError> {
+        let process = self
+            .inner
+            .table
+            .lookup(pid)
+            .ok_or(SignalFreeError::NoProcess)?;
+        let state = process.run_state().load(Ordering::Acquire);
+        if state == EXITED {
+            return Err(SignalFreeError::NoProcess);
+        }
+        if !receiver_heap_stable(&process) || process.input.has_pending() {
+            return Err(SignalFreeError::Busy);
+        }
+        let mut cell = match process.cell.try_lock() {
+            Ok(cell) => cell,
+            Err(_) => return Err(SignalFreeError::Busy),
+        };
+        let state = process.run_state().load(Ordering::Acquire);
+        if state == EXITED {
+            return Err(SignalFreeError::NoProcess);
+        }
+        if !receiver_heap_stable(&process) || process.input.has_pending() {
+            return Err(SignalFreeError::Busy);
+        }
+        Ok(body(&mut cell.task))
     }
     /// Run `body` while holding `pid`'s main lock, when the receiver is not executing.
     ///

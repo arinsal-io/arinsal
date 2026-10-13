@@ -735,6 +735,11 @@ impl<M> Wheel<M> {
             .count()
     }
 
+    /// The next timer aimed at `pid` is created paused (erl_hl_timer.c:1838).
+    pub(crate) fn ensure_paused(&mut self, pid: Pid) {
+        self.paused.entry(pid).or_default();
+    }
+
     // Port of erts/emulator/beam/erl_hl_timer.c:2874 (erts_pause_bif_timers), OTP-29.1.1.
     pub(crate) fn pause_target(&mut self, pid: Pid, now: u64) {
         let ids = self.target_entries.remove(&pid).unwrap_or_default();

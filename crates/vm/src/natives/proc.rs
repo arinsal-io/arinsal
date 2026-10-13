@@ -649,7 +649,7 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
             .map(|cold| {
                 cold.monitors
                     .values()
-                    .filter_map(|p| p.to_term())
+                    .filter_map(|half| half.target.to_term())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -681,7 +681,7 @@ fn process_info_item_monitored_by(process: &mut Process, pid: Pid) -> Result<Ter
             .map(|cold| {
                 cold.monitored_by
                     .values()
-                    .filter_map(|p| p.to_term())
+                    .filter_map(|half| half.origin.to_term())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -2836,69 +2836,55 @@ fn suspend_process(
         None => return Ok(atom("badopt")),
         Some(parsed) => parsed,
     };
-    let runtime = process
-        .runtime
-        .clone()
-        .ok_or_else(|| VmError::Unsupported("suspend requires a scheduler".into()))?;
-    if !runtime.scheduler()?.lookup(target_pid) {
-        if parsed.asynchronous
-            && let Some(tag) = parsed.tag
-        {
-            let message = make_tuple(process, &[tag, atom("badarg")])?;
-            // Port of erts/emulator/beam/erl_proc_sig_queue.c:3215 (suspend reply, queued without
-            // a send trace), OTP-29.1.1: the reply is not a traced `!`.
-            process.inbox.push_back(message);
-            return Ok(atom("true"));
-        }
-        return Ok(atom("badarg"));
-    }
-    let changed = match runtime.suspend(
-        ctx.pid(),
+    let outcome = match crate::suspend::suspend_remote(
+        process,
+        ctx,
         target_pid,
         parsed.unless_suspending,
         parsed.asynchronous,
     ) {
         Err(()) => return Ok(atom("system_limit")),
-        Ok(changed) => changed,
+        Ok(outcome) => outcome,
     };
     // Port of erts/emulator/beam/erl_process.c:9061-9163, OTP-29.1.1: a synchronous suspend on a
     // monitor that is not active yet, and every tagged asynchronous suspend, is answered by a
-    // reply message once the suspend is active.
-    let result = atom(if changed { "true" } else { "false" });
-    let sync = !parsed.asynchronous && runtime.suspend_pending(ctx.pid(), target_pid);
-    if sync || parsed.tag.is_some() {
-        let (tag, ready, exited) = if sync {
-            let id = arinsal_bifs::next_ref_id();
-            let reference = Term::local_ref(
+    // reply message once the target handled the request queued behind the suspend.
+    let result = atom(if outcome.changed { "true" } else { "false" });
+    let reference = if outcome.sync {
+        let id = arinsal_bifs::next_ref_id();
+        Some(
+            Term::local_ref(
                 &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
                 arinsal_bifs::ordinary_ref_words(id),
             )
-            .map_err(|error| VmError::Unsupported(format!("suspend reference: {error:?}")))?;
-            (reference, result, atom("exited"))
+            .map_err(|error| VmError::Unsupported(format!("suspend reference: {error:?}")))?,
+        )
+    } else {
+        None
+    };
+    if let Some(tag) = reference.or(parsed.tag) {
+        let default = if reference.is_some() {
+            result
         } else {
-            (
-                parsed.tag.unwrap_or(Term::NIL),
-                atom("suspended"),
-                atom("badarg"),
-            )
+            atom("suspended")
         };
-        let ready = make_tuple(process, &[tag, ready])?;
-        let exited = make_tuple(process, &[tag, exited])?;
-        runtime.add_suspend_waiter(crate::process::SuspendWaiter {
-            by: ctx.pid(),
-            target: target_pid,
-            ready: crate::process::Message::copy_from(ready)?,
-            exited: crate::process::Message::copy_from(exited)?,
-        });
+        crate::suspend::send_sync_suspend(
+            process,
+            ctx,
+            target_pid,
+            tag,
+            default,
+            reference.is_none(),
+        )?;
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:3192-3233
         // (`erts_proc_sig_send_sync_suspend`), OTP-29.1.1: prioritize the target after queuing
         // the synchronous or tagged suspend reply request.
         crate::signals::elevate_for_signal_request(process, ctx, target_pid)?;
-        if sync {
-            return Ok(tag);
-        }
     }
-    Ok(atom(if changed { "true" } else { "false" }))
+    if outcome.noproc && !parsed.asynchronous {
+        return Ok(atom("badarg"));
+    }
+    Ok(reference.unwrap_or(result))
 }
 
 struct SuspendOptions {
@@ -2958,15 +2944,9 @@ fn resume_process(
     if !runtime.scheduler()?.lookup(target_pid) {
         return Err(badarg());
     }
-    match runtime.resume(ctx.pid(), target_pid) {
+    match crate::suspend::resume_remote(process, ctx, target_pid) {
         None => Err(badarg()),
-        Some(wake) => {
-            if wake {
-                ctx.signal(target_pid, Signal::UnlinkAck(u64::MAX))
-                    .map_err(|error| VmError::Unsupported(format!("resume: {error}")))?;
-            }
-            Ok(atom("true"))
-        }
+        Some(()) => Ok(atom("true")),
     }
 }
 
@@ -3417,11 +3397,11 @@ pub(crate) fn parse_max_heap_from(
     Ok(limit)
 }
 
-fn suspending_term(process: &mut Process, pid: Pid) -> Result<Term, VmError> {
+fn suspending_term(process: &mut Process, _pid: Pid) -> Result<Term, VmError> {
     let rows = process
         .runtime
         .as_ref()
-        .map(|runtime| runtime.suspending_of(pid))
+        .map(|_| crate::suspend::suspending_of(process))
         .unwrap_or_default();
     let mut tuples = Vec::with_capacity(rows.len());
     for (target, active, outstanding) in rows {
@@ -4686,7 +4666,7 @@ fn with_code_mod_permission(
         // bif_trace_info_finish_trap: build the result again, without waiting.
         process.cold_mut().trace_finish = Some(finish);
     } else if let Some(runtime) = &runtime
-        && !crate::natives::code::try_seize_code_mod_permission(runtime, pid)
+        && !crate::natives::code::try_seize_code_mod_permission(runtime, process, pid)
     {
         return Err(VmError::Yield);
     }
@@ -4716,13 +4696,13 @@ fn with_code_mod_permission(
 // Port of erts/emulator/beam/code_ix.c:556 (erts_schedule_code_barrier) with the caller
 // suspended like erl_bif_trace.c:509-516 (trace_pattern) and resumed like :575-581
 // (smp_bp_finisher), OTP-29.1.1.
-fn suspend_for_code_barrier(process: &Process, ctx: &mut RunCtx<'_, Message>) -> bool {
+fn suspend_for_code_barrier(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> bool {
     let Some(runtime) = process.runtime.clone() else {
         ctx.block_thread_progress(std::time::Duration::ZERO);
         return false;
     };
     let pid = ctx.pid();
-    runtime.suspend_internal(pid);
+    crate::suspend::suspend_self(process);
     ctx.thread_progress_later(move || crate::natives::code::resume_suspended(&runtime, pid));
     true
 }
