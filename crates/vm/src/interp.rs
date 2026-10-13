@@ -2318,6 +2318,23 @@ impl Vm {
                     // argument slice is not copied unless the body fails.
                     // A NIF rescheduled to this scheduler resumes its continuation instead.
                     let pending = p.cold.as_mut().and_then(|cold| cold.nif_pending.take());
+                    // Port of erts/emulator/beam/erl_nif.c:3437-3477 (static_schedule_dirty_nif),
+                    // OTP-29.1.1: a static NIF flagged dirty IO first moves the process to a
+                    // dirty IO scheduler, which executes this body again.
+                    let module_name = self.code.modules[module_id].name.as_str();
+                    let to_dirty_io = pending.is_none()
+                        && matches!(module_name, "prim_file" | "prim_tty")
+                        && self.code.modules[module_id]
+                            // SAFETY: `ip` remains within the active module code allocation.
+                            .function_at(unsafe { ip.offset_from(base) } as usize)
+                            .is_some_and(|(function, _)| {
+                                crate::native_helpers::moves_to_dirty_io(
+                                    p,
+                                    module_name,
+                                    function,
+                                    arity as u8,
+                                )
+                            });
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match pending {
                             Some(pending) => natives::nif::resume_pending(
@@ -2325,6 +2342,9 @@ impl Vm {
                                 &mut p.reductions,
                                 pending,
                             ),
+                            None if to_dirty_io => Err(arinsal_bifs::BifError::Dirty(
+                                arinsal_bifs::SchedulerClass::DirtyIo,
+                            )),
                             None => natives::nif::call_native(
                                 &mut p.heap,
                                 &mut p.reductions,

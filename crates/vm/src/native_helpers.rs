@@ -671,10 +671,7 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
     // Port of erts/emulator/beam/erl_nif.c (schedule_dirty_nif / erts_call_dirty_nif),
     // OTP-29.1.1: a dirty NIF called on a normal scheduler first moves the process to a
     // dirty scheduler; the executor runs it there and returns to this body's caller.
-    if nif.module == "prim_tty"
-        && arinsal_nif_tty::dirty_io(&nif.function, nif.arity)
-        && arinsal_sched::current_scheduler_type() != arinsal_sched::SchedulerType::DirtyIo
-    {
+    if moves_to_dirty_io(process, &nif.module, &nif.function, nif.arity) {
         return trap_to_dirty_nif(
             process,
             identity as usize,
@@ -733,6 +730,33 @@ pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64
         result,
         (BOUND_NIF, &site.module, &site.function, site.arity),
     )
+}
+
+/// Whether static NIF `module:function/arity` is flagged `ERL_NIF_DIRTY_JOB_IO_BOUND` in its
+/// library's `nif_funcs` table.
+pub(crate) fn static_nif_dirty_io(module: &str, function: &str, arity: u8) -> bool {
+    match module {
+        "prim_tty" => arinsal_nif_tty::dirty_io(function, arity),
+        "prim_file" => arinsal_nif_file::dirty_io(function, arity),
+        _ => false,
+    }
+}
+
+/// Whether a call of static NIF `module:function/arity` first moves `process` to a dirty IO
+/// scheduler.
+///
+/// Port of erts/emulator/beam/erl_nif.c:3437-3477 (static_schedule_dirty_nif and
+/// static_schedule_dirty_io_nif), OTP-29.1.1. A process outside a scheduler (`Vm::eval`) has no
+/// dirty scheduler to move to and runs the NIF in place.
+pub(crate) fn moves_to_dirty_io(
+    process: &crate::Process,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> bool {
+    static_nif_dirty_io(module, function, arity)
+        && (module == "prim_tty" || process.runtime.is_some())
+        && arinsal_sched::current_scheduler_type() != arinsal_sched::SchedulerType::DirtyIo
 }
 
 /// Leave native code through the dirty NIF dispatch trap; the executor runs NIF

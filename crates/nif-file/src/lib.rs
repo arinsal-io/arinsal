@@ -2,14 +2,17 @@
 //!
 //! The stage 4 resource implementation can replace `FileHandle` and its local
 //! reference encoding. Each handle is a local ref `[0x46494c45, low32(id),
-//! high32(id)]`, backed by a unique, never reused table key. These operations
-//! run synchronously until the VM has dirty IO schedulers. The table does not
-//! yet receive process death notifications; the VM must close orphaned handles.
+//! high32(id)]`, backed by a unique, never reused table key. The VM runs every
+//! operation flagged `ERL_NIF_DIRTY_JOB_IO_BOUND` in [`NIF_FUNCS`] on a dirty IO
+//! scheduler ([`dirty_io`]). The table does not yet receive process death
+//! notifications; the VM must close orphaned handles.
+
+mod iovec;
 
 use std::collections::HashMap;
-use std::ffi::{CString, OsStr};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -62,48 +65,68 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     }
 }
 
-/// Return the native implementation for a `prim_file` NIF entry.
-pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
+/// `prim_file` NIF entries: name, arity, implementation and whether erts flags the entry
+/// `ERL_NIF_DIRTY_JOB_IO_BOUND`.
+// Port of erts/emulator/nifs/common/prim_file_nif.c:177-219 (nif_funcs), OTP-29.1.1.
+const NIF_FUNCS: [(&str, u8, BifFn, bool); 33] = [
+    // File handle ops
+    ("open_nif", 2, open_nif, true),
+    ("close_nif", 1, close_nif, true),
+    ("read_nif", 2, read_nif, true),
+    ("write_nif", 2, write_nif, true),
+    ("pread_nif", 3, pread_nif, true),
+    ("pwrite_nif", 3, pwrite_nif, true),
+    ("seek_nif", 3, seek_nif, true),
+    ("sync_nif", 2, sync_nif, true),
+    ("truncate_nif", 1, truncate_nif, true),
+    ("allocate_nif", 3, allocate_nif, true),
+    ("advise_nif", 4, advise_nif, true),
+    ("read_handle_info_nif", 1, read_handle_info_nif, true),
+    // Filesystem ops
+    ("make_hard_link_nif", 2, make_hard_link_nif, true),
+    ("make_soft_link_nif", 2, make_soft_link_nif, true),
+    ("rename_nif", 2, rename_nif, true),
+    ("read_info_nif", 2, read_info_nif, true),
+    ("set_permissions_nif", 2, set_permissions_nif, true),
+    ("set_owner_nif", 3, set_owner_nif, true),
+    ("set_time_nif", 4, set_time_nif, true),
+    ("read_link_nif", 1, read_link_nif, true),
+    ("list_dir_nif", 1, list_dir_nif, true),
+    ("make_dir_nif", 1, make_dir_nif, true),
+    ("del_file_nif", 1, del_file_nif, true),
+    ("del_dir_nif", 1, del_dir_nif, true),
+    ("get_device_cwd_nif", 1, get_device_cwd_nif, true),
+    ("set_cwd_nif", 1, set_cwd_nif, true),
+    ("get_cwd_nif", 0, get_cwd_nif, true),
+    // These operations are equivalent to chained calls of other operations, but have
+    // been moved down to avoid excessive rescheduling.
+    ("ipread_s32bu_p32bu_nif", 3, ipread_s32bu_p32bu_nif, true),
+    ("read_file_nif", 1, read_file_nif, true),
+    // Internal ops.
+    ("get_handle_nif", 1, get_handle_nif, false),
+    ("delayed_close_nif", 1, delayed_close_nif, true),
+    ("altname_nif", 1, altname_nif, true),
+    ("file_desc_to_ref_nif", 1, file_desc_to_ref_nif, true),
+];
+
+fn entry(module: &str, name: &str, arity: u8) -> Option<&'static (&'static str, u8, BifFn, bool)> {
     if module != "prim_file" {
         return None;
     }
-    let f: BifFn = match (name, arity) {
-        ("open_nif", 2) => open_nif,
-        ("close_nif", 1) => close_nif,
-        ("read_nif", 2) => read_nif,
-        ("write_nif", 2) => write_nif,
-        ("pread_nif", 3) => pread_nif,
-        ("pwrite_nif", 3) => pwrite_nif,
-        ("seek_nif", 3) => seek_nif,
-        ("sync_nif", 2) => sync_nif,
-        ("truncate_nif", 1) => truncate_nif,
-        ("allocate_nif", 3) => allocate_nif,
-        ("advise_nif", 4) => advise_nif,
-        ("read_file_nif", 1) => read_file_nif,
-        ("read_handle_info_nif", 1) => read_handle_info_nif,
-        ("read_info_nif", 2) => read_info_nif,
-        ("list_dir_nif", 1) => list_dir_nif,
-        ("make_dir_nif", 1) => make_dir_nif,
-        ("del_file_nif", 1) => del_file_nif,
-        ("del_dir_nif", 1) => del_dir_nif,
-        ("rename_nif", 2) => rename_nif,
-        ("make_hard_link_nif", 2) => make_hard_link_nif,
-        ("make_soft_link_nif", 2) => make_soft_link_nif,
-        ("read_link_nif", 1) => read_link_nif,
-        ("get_cwd_nif", 0) => get_cwd_nif,
-        ("set_cwd_nif", 1) => set_cwd_nif,
-        ("get_device_cwd_nif", 1) => get_device_cwd_nif,
-        ("altname_nif", 1) => altname_nif,
-        ("set_permissions_nif", 2) => set_permissions_nif,
-        ("set_owner_nif", 3) => set_owner_nif,
-        ("set_time_nif", 4) => set_time_nif,
-        ("ipread_s32bu_p32bu_nif", 3) => ipread_s32bu_p32bu_nif,
-        ("delayed_close_nif", 1) => delayed_close_nif,
-        ("get_handle_nif", 1) => get_handle_nif,
-        ("file_desc_to_ref_nif", 1) => file_desc_to_ref_nif,
-        _ => return None,
-    };
-    Some(f)
+    NIF_FUNCS
+        .iter()
+        .find(|(entry, entry_arity, _, _)| *entry == name && *entry_arity == arity)
+}
+
+/// Return the native implementation for a `prim_file` NIF entry.
+pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
+    entry(module, name, arity).map(|(_, _, f, _)| *f)
+}
+
+/// Whether the `prim_file` NIF `name/arity` runs on a dirty IO scheduler
+/// (`ERL_NIF_DIRTY_JOB_IO_BOUND` in erts' `nif_funcs`).
+pub fn dirty_io(name: &str, arity: u8) -> bool {
+    entry("prim_file", name, arity).is_some_and(|(_, _, _, dirty)| *dirty)
 }
 
 type Outcome = Result<O, BifError>;
@@ -240,23 +263,6 @@ fn path(value: &O) -> Result<PathBuf, O> {
 }
 fn path_result(value: &O) -> Result<PathBuf, O> {
     path(value)
-}
-fn iovec(value: &O) -> Result<(Vec<u8>, Option<O>), BifError> {
-    // Port of erts/emulator/beam/erl_nif.c:4092 (examine_iovec_term), OTP-29.1.1.
-    let elems = match value {
-        O::Nil => return Ok((Vec::new(), None)),
-        O::List { elems, tail } if **tail == O::Nil => elems,
-        _ => return Err(BifError::BADARG),
-    };
-    let mut data = Vec::new();
-    for elem in elems.iter().take(64) {
-        let O::Binary(bytes) = elem else {
-            return Err(BifError::BADARG);
-        };
-        data.extend_from_slice(bytes);
-    }
-    let tail = (elems.len() > 64).then(|| O::list(elems[64..].to_vec()));
-    Ok((data, tail))
 }
 fn handle_id(value: &O) -> Result<u64, BifError> {
     match value {
@@ -469,39 +475,73 @@ fn pread_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
         })
     })
 }
+/// Run `op` on the open file of handle `handle`; a closed handle is `{error, einval}`.
+// Port of erts/emulator/nifs/common/prim_file_nif.c:315-357 (file_handle_wrapper),
+// OTP-29.1.1.
+fn with_file_term(
+    ctx: &mut Ctx<'_>,
+    handle: Term,
+    op: impl FnOnce(&mut Ctx<'_>, &mut File) -> Result<Term, BifError>,
+) -> Result<Term, BifError> {
+    let id = handle_id(&to_owned(handle).map_err(|_| BifError::BADARG)?)?;
+    let handle = { handles().lock().unwrap().get(&id).cloned() };
+    let mut guard = handle.as_ref().map(|handle| handle.file.lock().unwrap());
+    match guard.as_mut().and_then(|guard| guard.as_mut()) {
+        Some(file) => op(ctx, file),
+        None => owned_term(ctx, &invalid()),
+    }
+}
+fn owned_term(ctx: &mut Ctx<'_>, value: &O) -> Result<Term, BifError> {
+    from_owned(value, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
+}
+fn atom_term(name: &str) -> Result<Term, BifError> {
+    arinsal_term::global_atoms()
+        .intern(name)
+        .map(Term::atom)
+        .map_err(|_| BifError::SystemLimit)
+}
+fn tuple_term(ctx: &mut Ctx<'_>, values: &[Term]) -> Result<Term, BifError> {
+    arinsal_term::TermBuilder::new(&mut Heap(&mut ctx.heap))
+        .tuple(values)
+        .map_err(|_| BifError::SystemLimit)
+}
 fn write_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
-    call(ctx, a, |a| {
-        with_file(&a[0], |file| {
-            let (data, tail) = iovec(&a[1])?;
-            Ok(file
-                .write_all(&data)
-                .map(|()| tail.map_or_else(ok, |rest| pair(atom("continue"), rest)))
-                .unwrap_or_else(|e| posix(&e)))
-        })
+    // Port of erts/emulator/nifs/common/prim_file_nif.c:688-710 (write_nif_impl),
+    // OTP-29.1.1: the iovec references the argument binaries; nothing is copied but
+    // on-heap and unaligned binaries.
+    with_file_term(ctx, a[0], |ctx, file| {
+        let mut copy = Vec::new();
+        let mut input = iovec::inspect_iovec(a[1], 64, &mut copy).ok_or(BifError::BADARG)?;
+        match iovec::efile_writev(&*file, &mut input) {
+            Err(code) => owned_term(ctx, &posix_code(code)),
+            Ok(_) if input.tail != Term::NIL => {
+                let tail = input.tail;
+                tuple_term(ctx, &[atom_term("continue")?, tail])
+            }
+            Ok(_) => atom_term("ok"),
+        }
     })
 }
 fn pwrite_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
-    call(ctx, a, |a| {
-        with_file(&a[0], |file| {
-            let (data, tail) = iovec(&a[2])?;
-            let Some(offset) = numeric_i64(&a[1])? else {
-                return Ok(invalid());
-            };
-            if offset < 0 {
-                return Ok(invalid());
+    // Port of erts/emulator/nifs/common/prim_file_nif.c:752-780 (pwrite_nif_impl),
+    // OTP-29.1.1.
+    with_file_term(ctx, a[0], |ctx, file| {
+        let offset = to_owned(a[1]).map_err(|_| BifError::BADARG)?;
+        let offset = numeric_i64(&offset)?;
+        let mut copy = Vec::new();
+        let mut input = iovec::inspect_iovec(a[2], 64, &mut copy).ok_or(BifError::BADARG)?;
+        let Some(offset) = offset.filter(|offset| *offset >= 0) else {
+            return owned_term(ctx, &invalid());
+        };
+        match iovec::efile_pwritev(&*file, offset as u64, &mut input) {
+            Err(code) => owned_term(ctx, &posix_code(code)),
+            Ok(bytes_written) if input.tail != Term::NIL => {
+                let tail = input.tail;
+                let written = owned_term(ctx, &integer(bytes_written))?;
+                tuple_term(ctx, &[atom_term("continue")?, written, tail])
             }
-            let mut done = 0;
-            while done < data.len() {
-                match file.write_at(&data[done..], offset as u64 + done as u64) {
-                    Ok(0) => return Ok(error("eio")),
-                    Ok(n) => done += n,
-                    Err(e) => return Ok(posix(&e)),
-                }
-            }
-            Ok(tail.map_or_else(ok, |rest| {
-                O::Tuple(vec![atom("continue"), integer(done as u64), rest])
-            }))
-        })
+            Ok(_) => atom_term("ok"),
+        }
     })
 }
 fn seek_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
@@ -699,13 +739,8 @@ fn file_info(meta: &fs::Metadata, access: &str) -> O {
     ])
 }
 fn path_access(path: &Path) -> String {
-    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
-        return "none".into();
-    };
-    // SAFETY: cpath is NUL-terminated and remains live for both access calls.
-    let read = unsafe { libc::access(cpath.as_ptr(), libc::R_OK) } == 0;
-    // SAFETY: cpath is NUL-terminated and live.
-    let write = unsafe { libc::access(cpath.as_ptr(), libc::W_OK) } == 0;
+    let read = rustix::fs::access(path, rustix::fs::Access::READ_OK).is_ok();
+    let write = rustix::fs::access(path, rustix::fs::Access::WRITE_OK).is_ok();
     match (read, write) {
         (true, true) => "read_write",
         (true, false) => "read",
@@ -903,14 +938,12 @@ fn set_owner_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
             Ok(p) => p,
             Err(e) => return Ok(e),
         };
-        let cpath = CString::new(path.as_os_str().as_bytes()).map_err(|_| BifError::BADARG)?;
-        // SAFETY: cpath is a valid NUL-terminated path; chown reads it only during the call.
-        let result = unsafe { libc::chown(cpath.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
-        Ok(if result == 0 {
-            ok()
-        } else {
-            posix(&std::io::Error::last_os_error())
-        })
+        // chown(2) with the raw ids; -1 leaves an id unchanged.
+        let owner = (uid != -1).then(|| rustix::fs::Uid::from_raw_unchecked(uid as u32));
+        let group = (gid != -1).then(|| rustix::fs::Gid::from_raw_unchecked(gid as u32));
+        Ok(rustix::fs::chown(&path, owner, group)
+            .map(|()| ok())
+            .unwrap_or_else(|e| posix(&e.into())))
     })
 }
 fn set_time_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
