@@ -5,28 +5,28 @@ stack backtrace:
    0: __rustc::rust_begin_unwind
    1: core::panicking::panic_fmt
    2: arinsal_term::internal_hash::internal_salted_hash
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/term/src/internal_hash.rs:404:26
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/term/src/internal_hash.rs:404:26
    3: arinsal_term::internal_hash::internal_hash
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/term/src/internal_hash.rs:109:5
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/term/src/internal_hash.rs:109:5
    4: arinsal_ets::hash::ets_hash
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/ets/src/hash.rs:31:5
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/ets/src/hash.rs:31:5
    5: <arinsal_ets::Table>::insert
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/ets/src/lib.rs:2514:24
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/ets/src/lib.rs:2514:24
    6: <arinsal_ets::Table>::update_counter_big
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/ets/src/lib.rs:3910:14
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/ets/src/lib.rs:3910:14
    7: arinsal_vm::natives::ets::call_inner
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:2126:18
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:2126:18
    8: arinsal_vm::natives::ets::direct_bif::<38>
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:537:18
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:537:18
    9: arinsal_vm::natives::ets::direct_update_counter::{closure#0}
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:765:21
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:765:21
   10: <core::option::Option<arinsal_term::Term>>::or_else::<arinsal_vm::natives::ets::direct_update_counter::{closure#0}>
   11: arinsal_vm::natives::ets::direct_update_counter
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:765:10
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:765:10
   12: arinsal_vm::native_helpers::call_direct_bif
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/native_helpers.rs:2367:17
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/native_helpers.rs:2367:17
   13: arinsal_vm::native_helpers::direct_bif_light
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/native_helpers.rs:1795:24
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/native_helpers.rs:1795:24
 note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
 
 
@@ -52,5 +52,5 @@ stack backtrace:
   16:        0x1033aaf98 - core[663bb9e1522ba5ef]::panicking::panic_nounwind
   17:        0x1033ab0ec - core[663bb9e1522ba5ef]::panicking::panic_cannot_unwind
   18:        0x1030bcdb8 - arinsal_vm[80b08a9cab2d61f3]::native_helpers::direct_bif_light
-                               at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/native_helpers.rs:1782:1
+                               at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/native_helpers.rs:1782:1
 

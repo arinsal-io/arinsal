@@ -6,21 +6,21 @@ stack backtrace:
    1: core::panicking::panic_fmt
    2: <arinsal_term::heap::ProcessHeap>::has_heap_reference::<arinsal_vm::natives::sys::has_literal_area_roots::{closure#0}>
    3: arinsal_vm::natives::sys::has_literal_area_roots
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/sys.rs:142:29
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/sys.rs:142:29
    4: arinsal_vm::natives::sys::copy_literal_area
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/sys.rs:110:25
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/sys.rs:110:25
    5: <arinsal_vm::proc_create::Process>::handle_signal
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:6056:21
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:6056:21
    6: <arinsal_vm::proc_create::Process>::handle_incoming
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:5721:24
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:5721:24
    7: <arinsal_vm::process::Executor>::run::{closure#9}
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:1526:43
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:1526:43
    8: <arinsal_vm::process::Executor>::run
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:1450:22
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:1450:22
    9: <arinsal_vm::proc_create::Process>::run_executor::{closure#0}
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:7281:75
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:7281:75
   10: arinsal_vm::process::with_executor::<core::result::Result<arinsal_vm::interp::RunState, arinsal_vm::VmError>, <arinsal_vm::proc_create::Process>::run_executor::{closure#0}>
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:6924:5
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:6924:5
   11: <arinsal_vm::proc_create::Process>::run_executor
-             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:7281:26
+             at ~/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/process.rs:7281:26
   12: <arinsal_vm::proc_create::Process>::run_task

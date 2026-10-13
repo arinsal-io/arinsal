@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Summarize the smolquery ingest profiling runs (erts vs Arinsal).
 
-Python 3 standard library only. Run it isolated:
+Python 3 standard library only. $IP is the ingest-profile directory (default:
+an `ingest-profile` directory next to this script). Run it isolated:
 
     python3 -I experiments/perf/smolquery_ingest/analyze.py \
-        [--results /Users/sts/dev/sq/ingest-profile/results] \
-        [--logs /Users/sts/dev/sq/ingest-profile/logs] \
+        [--results $IP/results] \
+        [--logs $IP/logs] \
         [--out experiments/perf/smolquery_ingest/data]
 
 Input (read only): results/<run>/{load.json,cpu_end.json,samples.jsonl,
@@ -363,6 +364,11 @@ def crash_info(results):
             "request_errors": n_err, "excerpt": short}
 
 
+def tilde(lines):
+    home = os.path.expanduser("~")
+    return [l.replace(home + "/", "~/") for l in lines]
+
+
 def boot_panic_excerpt(logs):
     path = os.path.join(logs, "boot-ar13.log")
     if not os.path.exists(path):
@@ -613,11 +619,12 @@ def build_tables(recs, cpu, fl, idle, seals):
 
 
 def main():
-    ip = "/Users/sts/dev/sq/ingest-profile"
+    here = os.path.dirname(os.path.abspath(__file__))
+    ip = os.environ.get("IP") or os.path.join(here, "ingest-profile")
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default=os.path.join(ip, "results"))
     ap.add_argument("--logs", default=os.path.join(ip, "logs"))
-    ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+    ap.add_argument("--out", default=os.path.join(here, "data"))
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
@@ -691,12 +698,12 @@ def main():
     crash = crash_info(a.results)
     with open(os.path.join(a.out, "crash_excerpt.txt"), "w") as f:
         f.write("# crashed-arinsal-fast-2/server.log, panic messages and frames (std/core source lines removed)\n")
-        f.write("\n".join(crash["excerpt"]) + "\n")
+        f.write("\n".join(tilde(crash["excerpt"])) + "\n")
     bp = boot_panic_excerpt(a.logs)
     if bp:
         with open(os.path.join(a.out, "literal_area_panic_excerpt.txt"), "w") as f:
             f.write("# logs/boot-ar13.log, first panic (std/core source lines removed)\n")
-            f.write("\n".join(bp) + "\n")
+            f.write("\n".join(tilde(bp)) + "\n")
     crow = {k: v for k, v in crash.items() if k != "excerpt"}
     write_csv(os.path.join(a.out, "crash_run.csv"), [crow])
 
