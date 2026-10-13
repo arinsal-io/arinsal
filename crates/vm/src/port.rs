@@ -3263,7 +3263,7 @@ fn port_command(
         if crate::inet_udp::owns(id) {
             return crate::inet_udp::command(id, ctx.pid(), &framed).map(|()| atom("true"));
         }
-        return crate::inet_drv::command(id, ctx.pid(), &framed).map(|()| atom("true"));
+        return crate::inet_drv::command(id, ctx.pid(), framed).map(|()| atom("true"));
     }
     if let Some((2, hdr)) = handle.framing {
         match hdr {
