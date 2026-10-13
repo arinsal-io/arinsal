@@ -116,6 +116,10 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         }
         "atom_count" | "process_count" | "port_count" => integer(ctx, 0),
         "machine" => string(ctx, "BEAM"),
+        // Port of erts/emulator/beam/erl_bif_info.c:3019-3024 (system_architecture) and
+        // erts/emulator/utils/make_version:74 (ERLANG_ARCHITECTURE), OTP-29.1.1: the configure
+        // triple, fixed when the runtime is built (crates/bifs/build.rs).
+        "system_architecture" => string(ctx, env!("ARINSAL_SYSTEM_ARCHITECTURE")),
         // Port of erts/emulator/beam/erl_bif_info.c (system_info emu_flavor), OTP-29.1.1.
         "emu_flavor" => Ok(atom(
             if EMU_FLAVOR_JIT.load(std::sync::atomic::Ordering::Relaxed) {
