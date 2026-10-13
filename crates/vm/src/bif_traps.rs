@@ -501,6 +501,20 @@ const ENTRIES: &[Entry] = &[
         handler: iolist_to_binary,
     },
     Entry {
+        module: "re",
+        function: "run",
+        arity: 2,
+        continuation: "re:run/2",
+        handler: re_run_trap,
+    },
+    Entry {
+        module: "re",
+        function: "run",
+        arity: 3,
+        continuation: "re:run/3",
+        handler: re_run_trap,
+    },
+    Entry {
         module: "erlang",
         function: "binary_to_list",
         arity: 1,
@@ -696,6 +710,50 @@ fn binary_split(
         restore_gc,
         arinsal_bifs::BinarySearchKind::Split,
     )
+}
+
+/// `re:run/2,3`: PCRE2 runs for the loops the slice's reductions allow, then the match state
+/// goes into a magic reference and the call traps to itself.
+// Port of erts/emulator/beam/erl_bif_re.c:1495-1795 (re_run) and :1841-1900 (re_exec_trap),
+// OTP-29.1.1.
+fn re_run_trap(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _restore_gc: bool,
+) -> Result<HandlerResult, BifError> {
+    type Resume = Mutex<Option<Box<arinsal_re::RunState>>>;
+    let prior = match state {
+        Some(state) => state
+            .downcast_ref::<Resume>()
+            .ok_or(BifError::BADARG)?
+            .lock()
+            .map_err(|_| BifError::SystemLimit)?
+            .take(),
+        None => None,
+    };
+    // loop_limit = MIN(reds_initial * LOOP_FACTOR, max_loop_limit), max = CONTEXT_REDS * LOOP_FACTOR
+    let reds_left = process.reductions.clamp(1, CONTEXT_REDS as i32);
+    let budget = reds_left * arinsal_re::LOOP_FACTOR;
+    let (progress, loops) = {
+        let mut heap = crate::ProcessHeapHandle(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+        arinsal_re::run_slice(&mut ctx, "run", args, prior, budget)?
+    };
+    let reductions = (loops / arinsal_re::LOOP_FACTOR as u64).min(u64::from(u32::MAX)) as u32;
+    Ok(match progress {
+        arinsal_re::Progress::Done(value) => HandlerResult::Done { value, reductions },
+        arinsal_re::Progress::Yield(run) => HandlerResult::Yield {
+            continuation: if args.len() == 2 {
+                "re:run/2"
+            } else {
+                "re:run/3"
+            },
+            state: MagicRef::new(Mutex::new(Some(run))),
+            reductions,
+        },
+    })
 }
 
 // Port of erts/emulator/beam/binary.c:213-239 (binary_to_list_chunk), OTP-29.1.1.
@@ -1815,7 +1873,7 @@ fn code_permission(
     if !acquire {
         crate::natives::code::release_code_mod_permission(&runtime);
     }
-    if !acquire || crate::natives::code::try_seize_code_mod_permission(&runtime, pid) {
+    if !acquire || crate::natives::code::try_seize_code_mod_permission(&runtime, process, pid) {
         return Ok(HandlerResult::Done {
             value: Term::atom(global_atoms().intern("true").unwrap()),
             reductions: 1,

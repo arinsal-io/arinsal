@@ -367,8 +367,12 @@ fn emit_private(
     asm.code.bind(done)?;
     let segments = segments.to_vec();
     let extra_bits = plan.extra_bits;
+    let bin_src = plan.bin;
     asm.push_bs_cold(Box::new(move |asm| {
         asm.code.bind(grow)?;
+        // The fast call above clobbered the scratch register a Y or memory source was loaded
+        // into, so the source is read again, as erts' single checked call does.
+        let bin = asm.source_reg(bin_src)?;
         asm.code.emit(|e| {
             e.mov_const(Gpr::x(0), ebs)?;
             e.add_reg(Gpr::x(0), SCHEDULER_REGS, Gpr::x(0), Shift::Lsl, 0)?;
