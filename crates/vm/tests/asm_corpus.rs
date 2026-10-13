@@ -201,6 +201,7 @@ impl ModuleEnv for CorpusEnv {
         arinsal_beamasm::map::MapRuntime {
             get: map_get,
             get_elements: map_many,
+            lookup_module: 0,
             new_map: map_many,
             update_assoc: map_many,
             update_exact: map_many,

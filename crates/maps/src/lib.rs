@@ -119,6 +119,13 @@ impl CheckedHashMap {
     pub fn size(self) -> usize {
         self.0.size()
     }
+
+    /// Looks up a key with the hash already computed by the caller.
+    // Port of erts_hashmap_get (erl_map.c:2424-2474), OTP-29.1.1.
+    #[inline]
+    pub fn get_with_hash(self, key: Term, hash: u64) -> Option<Term> {
+        lookup_hash(self.term(), key, hash)
+    }
 }
 
 fn bits(t: Term) -> u64 {
@@ -845,6 +852,95 @@ pub fn get(map: Term, key: Term) -> MapResult<Option<Term>> {
     Ok(lookup(map, key))
 }
 
+/// Fetches BEAM's staged `{key, destination, hash}` map-element triplets.
+// Port of beam_jit_get_map_elements (beam_jit_common.cpp:706-760), OTP-29.1.1.
+pub fn get_map_elements(map: Term, staged: &mut [Term], count: usize) -> MapResult<bool> {
+    let checked = checked_map(map)?;
+    debug_assert!(staged.len() >= count.saturating_mul(3));
+    if count == 0 {
+        return Ok(true);
+    }
+    match checked.kind() {
+        CheckedMapKind::Flatmap(flatmap) => {
+            if flatmap.size() == 0 {
+                return Ok(false);
+            }
+            let (keys, values, _) = merge::flatmap_kv(map);
+            let mut next = 0;
+            for (&key, &value) in keys.iter().zip(values) {
+                if exact_eq(term(key), staged[next * 3]) {
+                    staged[next * 3 + 1] = term(value);
+                    next += 1;
+                    if next == count {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        CheckedMapKind::Hashmap(hashmap) => {
+            for index in 0..count {
+                let key_index = index * 3;
+                let Some(value) =
+                    hashmap.get_with_hash(staged[key_index], staged[key_index + 2].tagged_word())
+                else {
+                    return Ok(false);
+                };
+                staged[key_index + 1] = value;
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Looks up sorted keys and sends each value directly to its compiled destination.
+// Port of beam_jit_get_map_elements (beam_jit_common.cpp:706-760), OTP-29.1.1.
+#[inline(always)]
+pub fn get_map_elements_with(
+    map: Term,
+    count: usize,
+    mut key_at: impl FnMut(usize) -> Term,
+    mut hash_at: impl FnMut(usize) -> u64,
+    mut store: impl FnMut(usize, Term) -> bool,
+) -> MapResult<bool> {
+    let checked = checked_map(map)?;
+    if count == 0 {
+        return Ok(true);
+    }
+    match checked.kind() {
+        CheckedMapKind::Flatmap(_) => {
+            if checked.size() == 0 {
+                return Ok(false);
+            }
+            let (keys, values, _) = merge::flatmap_kv(map);
+            let mut next = 0;
+            for (&key, &value) in keys.iter().zip(values) {
+                if exact_eq(term(key), key_at(next)) {
+                    if !store(next, term(value)) {
+                        return Ok(false);
+                    }
+                    next += 1;
+                    if next == count {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        CheckedMapKind::Hashmap(hashmap) => {
+            for index in 0..count {
+                let Some(value) = hashmap.get_with_hash(key_at(index), hash_at(index)) else {
+                    return Ok(false);
+                };
+                if !store(index, value) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
 /// Looks `key` up in a checked map.
 // Port of erts/emulator/beam/erl_map.c:185-223 (erts_maps_get), OTP-29.1.1.
 fn lookup(map: Term, key: Term) -> Option<Term> {
@@ -859,8 +955,12 @@ fn lookup_header(map: Term, key: Term, h: u64) -> Option<Term> {
     if h & 0xc0 == 0 {
         return flatmap_get(map, key);
     }
-    let mut node = map;
     let hash = internal_hash(key);
+    lookup_hash(map, key, hash)
+}
+
+fn lookup_hash(map: Term, key: Term, hash: u64) -> Option<Term> {
+    let mut node = map;
     // SAFETY: every node reached from the live root is a live HAMT node, collision
     // tuple or leaf cons; the bitmap selects an initialized child.
     unsafe {

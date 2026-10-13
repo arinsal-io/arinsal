@@ -497,6 +497,11 @@ impl CodeTables {
         id
     }
 
+    /// Module slot that the next `alloc` will assign in this staging table.
+    pub(crate) fn next_module_id(&self) -> usize {
+        self.free_ids.last().copied().unwrap_or(self.modules.len())
+    }
+
     /// Makes instance `id` the current code of `name` and returns the instance it replaces.
     pub(crate) fn make_current(&mut self, name: &str, id: usize) -> Option<usize> {
         let previous = self.loaded.insert(name.to_owned(), id);
@@ -754,7 +759,7 @@ impl Vm {
     /// Compiles `module` with BeamAsm into `meta` when `bytes` are known.
     // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1), compile after the module
     // body and its exported entries are resolved.
-    fn compile_native(&self, module: &Module, meta: &mut CodeMeta) {
+    fn compile_native(&self, module: &Module, meta: &mut CodeMeta, module_id: usize) {
         if !meta.has_beam_bytes {
             return;
         }
@@ -763,6 +768,7 @@ impl Vm {
             &meta.beam,
             module,
             self.code_scope,
+            module_id,
             crate::trace_bp::line_breakpoints_instrumented(),
         ) {
             native.publish(module);
@@ -782,14 +788,15 @@ impl Vm {
         let registers = process::register_requirements(&beam);
         let mut meta = CodeMeta::from_beam(&beam, Some(bytes));
         let staging = self.code_ix.start_staging();
-        staging.with(|tables| {
+        let module_id = staging.with(|tables| {
             if let Some(old_id) = tables.old.remove(&name) {
                 tables.release(old_id);
             }
             tables.intern_fun_entries(&mut module);
+            tables.next_module_id()
         });
         let module = Arc::new(module);
-        self.compile_native(&module, &mut meta);
+        self.compile_native(&module, &mut meta, module_id);
         let id = staging.with(|tables| {
             let id = tables.alloc(module, registers, Some(meta));
             if let Some(previous) = tables.make_current(&name, id) {
@@ -854,10 +861,13 @@ impl Vm {
             self.refresh_code();
             return Ok(id);
         }
-        staging.with(|tables| tables.intern_fun_entries(&mut module));
+        let module_id = staging.with(|tables| {
+            tables.intern_fun_entries(&mut module);
+            tables.next_module_id()
+        });
         let module = Arc::new(module);
         if compile_native {
-            self.compile_native(&module, &mut meta);
+            self.compile_native(&module, &mut meta, module_id);
         }
         let name = module.name.clone();
         let id = staging.with(|tables| {
@@ -919,8 +929,11 @@ impl Vm {
         for (mut module, registers, mut meta) in prepared {
             let name = module.name.clone();
             let pending = meta.on_load.is_some();
-            staging.with(|tables| tables.intern_fun_entries(&mut module));
-            self.compile_native(&module, &mut meta);
+            let module_id = staging.with(|tables| {
+                tables.intern_fun_entries(&mut module);
+                tables.next_module_id()
+            });
+            self.compile_native(&module, &mut meta, module_id);
             let module = Arc::new(module);
             ids.push(staging.with(|tables| {
                 let id = tables.alloc(module, registers, Some(meta));

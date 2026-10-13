@@ -60,18 +60,10 @@ extern "C" fn map_get(process: *mut ProcessHeader, _: u64, _: u64, _: u64) -> u6
     VALUE
 }
 
-extern "C" fn map_get_elements(
-    process: *mut ProcessHeader,
-    _: u64,
-    registers: u64,
-    base: u64,
-    _: u64,
-) -> u64 {
+extern "C" fn map_get_elements(process: *mut ProcessHeader, _: u64, _: u64, _: u64, _: u64) -> u64 {
     observe(process);
-    // The lookup leaves each value in its staging slot (key, destination, hash triples start
-    // at X`base`); the emitted code moves it to the destination register.
-    rt::scheduler_registers_mut(registers as *mut SchedulerRegisters, |regs| {
-        regs.x_reg_array[base as usize + 1] = arinsal_beamasm::rt::fixture_term(REG_OUTPUT);
+    rt::scheduler_registers_mut(ACTIVE_REGS.load(Ordering::Relaxed), |regs| {
+        regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(REG_OUTPUT);
     });
     1
 }
@@ -138,6 +130,7 @@ fn map_runtime() -> MapRuntime {
         get_element_hash_shared: fragments.get_element_hash_shared(),
         get: map_get,
         get_elements: map_get_elements,
+        lookup_module: 0,
         new_map: map_update,
         update_assoc: map_update,
         update_exact: map_update,
@@ -316,7 +309,7 @@ fn runtime_calls_in_fun_map_and_records_keep_register_state() {
     assert_seen(seen, initial, &header);
     assert_xregs(after, expected);
 
-    let map_args = [ArgVal::X(1), ArgVal::X(0), ArgVal::Immediate(0)];
+    let map_args = [ArgVal::Literal(0x100), ArgVal::X(0), ArgVal::Immediate(0)];
     let (seen, after, header) = run(
         |asm| asm.emit_i_get_map_elements(90, ArgVal::X(5), &map_args, map_runtime()),
         initial,

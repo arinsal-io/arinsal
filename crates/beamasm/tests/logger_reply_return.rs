@@ -13,9 +13,9 @@ extern "C" fn unused_map_get(_p: *mut ProcessHeader, _map: u64, _key: u64, _hash
 extern "C" fn unused_get_elements(
     _p: *mut ProcessHeader,
     _map: u64,
-    _registers: u64,
+    _module: u64,
+    _table: u64,
     _stack: u64,
-    _count: u64,
 ) -> u64 {
     panic!("reply_return uses the inline flatmap lookup")
 }
@@ -59,6 +59,7 @@ fn reply_return(idle: bool) -> (u64, u64, u64) {
         MapRuntime {
             get: unused_map_get,
             get_elements: unused_get_elements,
+            lookup_module: 0,
             new_map: unused_map_update,
             update_assoc: unused_map_update,
             update_exact: unused_map_update,

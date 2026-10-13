@@ -73,6 +73,8 @@ impl From<ExecError> for ModuleError {
 pub struct FinalizedModule {
     /// Owns the executable mapping; entry addresses remain valid while this is alive.
     pub memory: CodeMemory,
+    /// Static operand tables referenced by emitted `i_get_map_elements` instructions.
+    pub map_lookups: Box<[crate::map::MapLookupTable]>,
     /// Native entry address by BEAM label number.
     pub entries: HashMap<u32, *const u8>,
     entry_offsets: HashMap<u32, usize>,
@@ -135,6 +137,7 @@ impl FinalizedModule {
 /// Builds one module's native code and associates BEAM labels with code offsets.
 pub struct BeamModuleAssembler {
     pub(super) code: CodeBuffer,
+    pub(super) map_lookups: Vec<crate::map::MapLookupTable>,
     /// Failure label of the arithmetic instruction being emitted (0: raise the error).
     pub(super) arith_fail: u32,
     /// Compiler types of the next arithmetic instruction's operands, consumed by its emitter.
@@ -224,6 +227,7 @@ impl BeamModuleAssembler {
         let error_label = code.new_label();
         Self {
             code,
+            map_lookups: Vec::new(),
             labels: HashMap::new(),
             defined: HashMap::new(),
             lambda_labels: HashMap::new(),
@@ -1654,6 +1658,7 @@ impl BeamModuleAssembler {
             .collect();
         Ok(FinalizedModule {
             memory,
+            map_lookups: self.map_lookups.into_boxed_slice(),
             entries,
             entry_offsets,
             lambda_entries,

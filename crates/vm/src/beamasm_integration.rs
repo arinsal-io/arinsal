@@ -1089,6 +1089,7 @@ fn lifetime_trace_enabled() -> bool {
 pub(crate) struct CompiledVersion {
     module: String,
     scope: u64,
+    pub(crate) map_lookups: Box<[arinsal_beamasm::map::MapLookupTable]>,
     memory: std::sync::Mutex<arinsal_a64::exec::CodeMemory>,
     trace_breakpoints: Vec<((String, String, u8), usize, u32)>,
     // Line breakpoint patch sites: source line, branch word offset, original branch.
@@ -1363,6 +1364,7 @@ struct VmModuleEnv<'a> {
     native_bodies: HashMap<(String, u8), (usize, usize)>,
     module_name: String,
     code_index: usize,
+    module_id: u32,
     // Call-NIF bodies reserved for functions a later load_nif may replace.
     dynamic_nifs: std::cell::RefCell<HashMap<(String, u8), usize>>,
     _lifetime: std::marker::PhantomData<&'a BeamFile>,
@@ -1376,6 +1378,7 @@ impl<'a> VmModuleEnv<'a> {
         export_entries: Vec<usize>,
         fragments: &DispatchFragments,
         code_scope: u64,
+        module_id: u32,
     ) -> Result<Self, String> {
         let mut literals = Vec::with_capacity(beam.literals.len());
         for index in 0..beam.literals.len() {
@@ -1455,6 +1458,7 @@ impl<'a> VmModuleEnv<'a> {
             native_bodies,
             module_name: module.name.clone(),
             code_index: crate::code_ix::for_scope(code_scope).staging(),
+            module_id,
             dynamic_nifs: std::cell::RefCell::new(HashMap::new()),
             _lifetime: std::marker::PhantomData,
         })
@@ -1503,6 +1507,16 @@ impl ModuleEnv for VmModuleEnv<'_> {
         let mut order = (0..terms.len()).collect::<Vec<_>>();
         order.sort_by(|&a, &b| arinsal_maps::flatmap_key_cmp(terms[a], terms[b]));
         Ok(order)
+    }
+
+    fn map_key_hash(&self, key: arinsal_beamasm::module::ArgVal) -> u64 {
+        match key {
+            arinsal_beamasm::module::ArgVal::Immediate(word)
+            | arinsal_beamasm::module::ArgVal::Literal(word) => {
+                arinsal_term::internal_hash(crate::native_hooks::from_raw(word))
+            }
+            _ => 0,
+        }
     }
 
     fn atom(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
@@ -1694,6 +1708,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
         arinsal_beamasm::map::MapRuntime {
             get: crate::native_helpers::arinsal_beamasm_map_get,
             get_elements: crate::native_helpers::arinsal_beamasm_map_get_elements,
+            lookup_module: self.module_id,
             new_map: crate::native_helpers::arinsal_beamasm_map_new,
             update_assoc: crate::native_helpers::arinsal_beamasm_map_assoc,
             update_exact: crate::native_helpers::arinsal_beamasm_map_exact,
@@ -1786,6 +1801,7 @@ pub(crate) fn compile(
     beam: &arinsal_beam::BeamFile,
     module: &arinsal_loader::Module,
     scope: u64,
+    module_id: usize,
     line_breakpoints: bool,
 ) -> Option<Arc<CompiledVersion>> {
     if !enabled() {
@@ -1813,6 +1829,7 @@ pub(crate) fn compile(
     let function_allowlist = crate::debug_env::beamasm_funcs();
     let fragments = fragments()?;
     let export_entries = import_entries(scope, module)?;
+    let module_id = u32::try_from(module_id).ok()?;
     // Literals no loaded instruction uses; a literal heap so literal checks see them as such.
     let mut literal_heap = Box::new(VecHeap::new_literal());
     let env = VmModuleEnv::new(
@@ -1822,6 +1839,7 @@ pub(crate) fn compile(
         export_entries,
         fragments,
         scope,
+        module_id,
     )
     .ok()?;
     let trace = crate::calls::trace_boot_enabled();
@@ -2056,6 +2074,7 @@ pub(crate) fn compile(
     let version = Arc::new(CompiledVersion {
         module: compiled.name.clone(),
         scope,
+        map_lookups: compiled.native.map_lookups,
         memory: std::sync::Mutex::new(compiled.native.memory),
         trace_breakpoints,
         line_breakpoints: compiled.native.line_breakpoints.clone(),
