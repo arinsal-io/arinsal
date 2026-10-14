@@ -174,7 +174,7 @@ fn bind_import_targets(module: &mut Module) {
     for import in &mut module.imports {
         if import.bif.is_none()
             && let Some(bif) =
-                natives::static_nif_lookup(&import.module, &import.function, import.arity)
+                natives::plain_static_nif_lookup(&import.module, &import.function, import.arity)
         {
             import.set_extra_bif(bif);
         }
@@ -202,6 +202,7 @@ fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) 
         "prim_file"
             | "prim_buffer"
             | "zlib"
+            | "zstd"
             | "prim_tty"
             | "prim_socket"
             | "prim_net"

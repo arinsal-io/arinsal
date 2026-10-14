@@ -803,7 +803,7 @@ impl Vm {
         }
         // elixir_loop1: dynamic apply must see static NIFs such as re:import/1.
         if let Some(bif) = arinsal_bifs::lookup(module, function, arity as u8)
-            .or_else(|| crate::natives::static_nif_lookup(module, function, arity as u8))
+            .or_else(|| crate::natives::plain_static_nif_lookup(module, function, arity as u8))
         {
             let (result, bif_reductions) = {
                 let mut heap = ProcessHeapHandle(&mut p.heap);
