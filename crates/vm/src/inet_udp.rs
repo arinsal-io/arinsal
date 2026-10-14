@@ -24,7 +24,7 @@ use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const REQ_OPEN: i64 = 1;
@@ -106,35 +106,54 @@ fn lookup(id: u64) -> Option<Arc<Sock>> {
     registry().lock().unwrap().get(&id).cloned()
 }
 
-fn wake_writer() -> &'static OwnedFd {
-    static WAKE: OnceLock<OwnedFd> = OnceLock::new();
-    WAKE.get_or_init(|| {
-        let (read, write) = inet_drv::pipe().expect("udp wake pipe");
+/// Work for the UDP thread: readiness events from the poll set (`iready`) and pokes from
+/// control and command calls on a port.
+///
+/// Port of the I/O port task queue (erl_port_task.c) and the `iready` scheduling of
+/// erl_check_io.c, OTP-29.1.1.
+#[derive(Default)]
+struct Tasks {
+    ready: Vec<(u64, RawFd, crate::check_io::Ready)>,
+    poked: Vec<u64>,
+}
+
+fn tasks() -> &'static (Mutex<Tasks>, Condvar) {
+    static TASKS: OnceLock<(Mutex<Tasks>, Condvar)> = OnceLock::new();
+    TASKS.get_or_init(|| {
         std::thread::Builder::new()
             .name("arinsal-udp".into())
-            .spawn(move || io_loop(read))
+            .spawn(io_loop)
             .expect("udp thread");
-        write
+        (Mutex::new(Tasks::default()), Condvar::new())
     })
 }
 
-fn poke() {
-    let fd = wake_writer().as_raw_fd();
-    let byte = [1u8];
-    // SAFETY: wake_writer owns the write end for the process lifetime.
-    unsafe {
-        libc::write(fd, byte.as_ptr().cast(), 1);
+/// Ask the UDP thread to run port `id` (and recompute its selection).
+fn poke(id: u64) {
+    let (lock, wake) = tasks();
+    let mut tasks = lock.lock().unwrap();
+    if !tasks.poked.contains(&id) {
+        tasks.poked.push(id);
     }
+    drop(tasks);
+    wake.notify_one();
+}
+
+/// `iready`: schedule the port's input task on the UDP thread.
+fn schedule_ready(id: u64, fd: RawFd, ready: crate::check_io::Ready) {
+    let (lock, wake) = tasks();
+    lock.lock().unwrap().ready.push((id, fd, ready));
+    wake.notify_one();
 }
 
 /// Register a `udp_inet` port created by `open_port({spawn_driver, …})`.
 pub(crate) fn attach(runtime: Arc<Runtime>, id: u64, handle: Arc<PortHandle>) {
-    let _ = wake_writer();
+    let _ = tasks();
     registry()
         .lock()
         .unwrap()
         .insert(id, Arc::new(Sock::new(id, runtime, handle)));
-    poke();
+    poke(id);
 }
 
 /// `true` when `id` is a live or just-created `udp_inet` port.
@@ -166,7 +185,7 @@ pub(crate) fn detach(id: u64) {
             },
         );
     }
-    poke();
+    poke(id);
 }
 
 pub(crate) fn control(
@@ -182,7 +201,7 @@ pub(crate) fn control(
     // Port of inet_drv.c:14574 (packet_inet_ctl subtracts the magic), OTP-29.1.1.
     let cmd = op.wrapping_sub(inet_drv::MAGIC);
     let reply = dispatch(&sock, caller, cmd, data);
-    poke();
+    poke(id);
     byte_list(process, &reply)
 }
 
@@ -194,7 +213,7 @@ pub(crate) fn command(id: u64, caller: Pid, data: &[u8]) -> Result<(), VmError> 
     let (ids, payload) = split_caller(data).ok_or_else(badarg)?;
     let error = send_command(&sock, payload);
     emit(&sock, Out::InetReply { caller, ids, error });
-    poke();
+    poke(id);
     Ok(())
 }
 
@@ -299,7 +318,7 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     set_nonblock(fd);
     set_nosigpipe(fd);
     // SAFETY: fd was just created and is moved into OwnedFd.
-    inner.fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+    inner.fd = Some(UdpFd::new(unsafe { OwnedFd::from_raw_fd(fd) }, inner.id));
     inner.domain = domain;
     inner.family_code = data[0];
     inner.open = true;
@@ -345,7 +364,7 @@ fn fdopen_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     }
     set_nonblock(fd.as_raw_fd());
     set_nosigpipe(fd.as_raw_fd());
-    inner.fd = Some(fd);
+    inner.fd = Some(UdpFd::new(fd, inner.id));
     inner.fd_external = Some(raw_fd);
     inner.domain = domain;
     inner.family_code = data[0];
@@ -1833,7 +1852,10 @@ impl Sock {
         Self {
             id,
             handle,
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                id,
+                ..Inner::default()
+            }),
         }
     }
 }
@@ -1854,7 +1876,8 @@ struct Recv {
 }
 
 struct Inner {
-    fd: Option<OwnedFd>,
+    id: u64,
+    fd: Option<UdpFd>,
     fd_external: Option<RawFd>,
     domain: i32,
     family_code: u8,
@@ -1898,6 +1921,7 @@ impl Default for Inner {
     fn default() -> Self {
         // Port of inet_drv.c:10891 (inet_start) and :14508 (read_packets), OTP-29.1.1.
         Self {
+            id: 0,
             fd: None,
             fd_external: None,
             domain: libc::AF_INET,
@@ -1940,55 +1964,118 @@ impl Default for Inner {
     }
 }
 
-fn io_loop(wake_r: OwnedFd) {
-    // Port of inet_drv.c driver_select registrations through erl_check_io.c:988, OTP-29.1.1.
-    let wake = wake_r.as_raw_fd();
+/// The UDP thread: run the input tasks of `udp_inet` ports and their timers.
+///
+/// Port of the port-task side of erl_check_io.c, OTP-29.1.1: the poll set holds a
+/// persistent selection per socket (`driver_select`), a readiness event schedules that
+/// port's task (`iready`), the task runs (`packet_inet_input` through `pump`), and then
+/// the fired events are re-armed (`erts_io_notify_port_task_executed`).
+fn io_loop() {
+    let (lock, wake) = tasks();
     loop {
-        let socks: Vec<Arc<Sock>> = registry().lock().unwrap().values().cloned().collect();
-        let mut fds = vec![(
-            wake,
-            crate::check_io::InterestSet {
-                readable: true,
-                writable: false,
-            },
-        )];
-        for sock in &socks {
-            pump(sock);
-            let inner = sock.inner.lock().unwrap();
-            if let Some(fd) = inner.fd.as_ref()
-                && (inner.recv.is_some() || active_is(&inner.active))
-            {
-                fds.push((
-                    fd.as_raw_fd(),
-                    crate::check_io::InterestSet {
-                        readable: true,
-                        writable: false,
-                    },
-                ));
-            }
-        }
+        // Ports take the task lock (`poke`) while holding their own lock, so the
+        // timers are read before it is taken.
         let timeout = next_timeout()
             .map(|timeout| Duration::new(timeout.tv_sec as u64, timeout.tv_nsec as u32));
-        match crate::check_io::wait_any_timeout_wake(&fds, timeout, wake) {
-            Ok(Some((fd, _))) if fd == wake => drain(wake),
-            Ok(Some((fd, _))) => {
-                if let Some(sock) = socks.iter().find(|sock| {
-                    sock.inner
-                        .lock()
-                        .unwrap()
-                        .fd
-                        .as_ref()
-                        .is_some_and(|socket| socket.as_raw_fd() == fd)
-                }) {
-                    pump(sock);
-                }
+        let (ready, poked) = {
+            let mut tasks = lock.lock().unwrap();
+            if tasks.ready.is_empty() && tasks.poked.is_empty() {
+                tasks = match timeout {
+                    Some(timeout) => wake.wait_timeout(tasks, timeout).unwrap().0,
+                    None => wake.wait(tasks).unwrap(),
+                };
             }
-            Ok(None) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => continue,
+            (
+                std::mem::take(&mut tasks.ready),
+                std::mem::take(&mut tasks.poked),
+            )
+        };
+        for (id, fd, _event) in ready {
+            let Some(sock) = lookup(id) else {
+                continue;
+            };
+            pump(&sock);
+            sock_select(&sock);
+            crate::check_io::notify_executed(
+                fd,
+                id,
+                crate::check_io::InterestSet {
+                    readable: true,
+                    writable: true,
+                },
+            );
         }
-        fire_timeouts();
+        for id in poked {
+            if let Some(sock) = lookup(id) {
+                pump(&sock);
+                sock_select(&sock);
+            }
+        }
+        for sock in fire_timeouts() {
+            sock_select(&sock);
+        }
+    }
+}
+
+/// Bring the poll-set selection of `sock` in line with its state.
+///
+/// Port of the `sock_select` calls of inet_drv.c, OTP-29.1.1: FD_READ while active or a
+/// receive is pending.
+fn sock_select(sock: &Arc<Sock>) {
+    let mut inner = sock.inner.lock().unwrap();
+    let readable = inner.open && (inner.recv.is_some() || active_is(&inner.active));
+    let id = sock.id;
+    let Some(fd) = inner.fd.as_mut() else {
+        return;
+    };
+    if readable == fd.selected {
+        return;
+    }
+    let raw = fd.as_raw_fd();
+    let want = crate::check_io::InterestSet {
+        readable,
+        writable: false,
+    };
+    let ready: crate::check_io::SelectCallback =
+        Arc::new(move |fd, event| schedule_ready(id, fd, event));
+    if crate::check_io::driver_select(raw, id, want, ready).is_ok() {
+        fd.selected = readable;
+    }
+}
+
+/// The socket of a `udp_inet` port.
+///
+/// Dropping it deselects the descriptor before closing it, as `inet_stop_select` is
+/// reached in erts only after `driver_select(..., ERL_DRV_USE, 0)` has taken the
+/// descriptor out of the poll set (inet_drv.c, OTP-29.1.1).
+struct UdpFd {
+    fd: OwnedFd,
+    port: u64,
+    /// FD_READ is selected in the shared poll set (`state->events` in erl_check_io.c).
+    selected: bool,
+}
+
+impl UdpFd {
+    fn new(fd: OwnedFd, port: u64) -> Self {
+        Self {
+            fd,
+            port,
+            selected: false,
+        }
+    }
+}
+
+impl AsRawFd for UdpFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl Drop for UdpFd {
+    fn drop(&mut self) {
+        if self.selected {
+            crate::check_io::driver_deselect(self.fd.as_raw_fd(), self.port);
+        }
     }
 }
 
@@ -2011,9 +2098,10 @@ fn next_timeout() -> Option<libc::timespec> {
     })
 }
 
-fn fire_timeouts() {
+fn fire_timeouts() -> Vec<Arc<Sock>> {
     let socks: Vec<Arc<Sock>> = registry().lock().unwrap().values().cloned().collect();
     let now = Instant::now();
+    let mut fired = Vec::new();
     for sock in socks {
         let due = {
             let mut inner = sock.inner.lock().unwrap();
@@ -2037,17 +2125,8 @@ fn fire_timeouts() {
                     reason: "timeout",
                 },
             );
+            fired.push(sock);
         }
     }
-}
-
-fn drain(fd: RawFd) {
-    let mut buf = [0u8; 32];
-    loop {
-        // SAFETY: fd is the read end of this driver's wake pipe.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            break;
-        }
-    }
+    fired
 }
