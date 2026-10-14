@@ -314,11 +314,17 @@ pub trait HeapAlloc {
     fn retain_fun(&mut self, entry: Arc<FunEntry>);
     /// Retain an export entry.
     fn retain_export(&mut self, entry: Arc<ExportEntry>);
-    /// Keep a magic reference alive until GC examines this heap's owners.
-    fn retain_magic(&mut self, _owner: Arc<crate::MagicRef>) {
-        unreachable!("supports_magic must be checked before retention")
+    /// Link a magic reference thing into this heap's off-heap list. The thing's pointer
+    /// word names `owner`, and the list entry takes over the counted reference.
+    // Port of erts/emulator/beam/erl_bif_unique.h (erts_mk_magic_ref), OTP-29.1.1.
+    fn link_magic_ref(
+        &mut self,
+        _thing: *mut u64,
+        _owner: Arc<crate::MagicRef>,
+    ) -> Result<(), TermError> {
+        Err(TermError::Unsupported("magic reference heap owner"))
     }
-    /// Whether the allocator keeps magic owners across its heap lifetime.
+    /// Whether the allocator keeps an off-heap list for magic references.
     fn supports_magic(&self) -> bool {
         false
     }
@@ -395,8 +401,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
     fn retain_export(&mut self, entry: Arc<ExportEntry>) {
         (**self).retain_export(entry)
     }
-    fn retain_magic(&mut self, owner: Arc<crate::MagicRef>) {
-        (**self).retain_magic(owner)
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        owner: Arc<crate::MagicRef>,
+    ) -> Result<(), TermError> {
+        (**self).link_magic_ref(thing, owner)
     }
     fn supports_magic(&self) -> bool {
         (**self).supports_magic()
@@ -424,6 +434,34 @@ pub(crate) fn store(ptr: *mut u64, value: u64) {
 pub(crate) fn load(ptr: *const u64) -> u64 {
     // SAFETY: callers pass an in-bounds, initialized slot of a live heap block.
     unsafe { *ptr }
+}
+
+/// Whether an off-heap list node is a magic reference thing (the list also holds BinRefs).
+/// A forwarded node keeps its type in the header of its copy.
+#[inline]
+pub(crate) fn off_heap_node_is_magic(node: usize) -> bool {
+    let mut header = load(node as *const u64);
+    if header & 3 == 2 {
+        header = load((header & !3) as *const u64);
+    }
+    header & 63 == crate::REF
+}
+
+/// Link a magic reference thing at the head of an off-heap list, which takes over `owner`'s
+/// counted reference, and charge `mb->orig_size` to the list's overhead.
+// Port of erts/emulator/beam/erl_bif_unique.h (erts_mk_magic_ref: `ohp->first`,
+// `OH_OVERHEAD`), OTP-29.1.1.
+pub(crate) fn link_magic_thing(
+    head: &mut usize,
+    overhead: &mut u64,
+    thing: *mut u64,
+    owner: Arc<crate::MagicRef>,
+) {
+    let words = (owner.orig_size() / 8) as u64;
+    store(thing.wrapping_add(1), Arc::into_raw(owner) as u64);
+    store(thing.wrapping_add(2), *head as u64);
+    *head = thing as usize;
+    *overhead = overhead.saturating_add(words);
 }
 
 /// Head and open tail slot of a chain built by [`TermBuilder::chain3_push`].
@@ -846,12 +884,10 @@ pub(crate) struct HeapOwners {
     pub(crate) nodes: Vec<Arc<Node>>,
     pub(crate) funs: Vec<Arc<FunEntry>>,
     pub(crate) exports: Vec<Arc<ExportEntry>>,
-    pub(crate) magic: Vec<Arc<crate::MagicRef>>,
     pub(crate) old_external: Vec<Arc<ExternalBinary>>,
     pub(crate) old_nodes: Vec<Arc<Node>>,
     pub(crate) old_funs: Vec<Arc<FunEntry>>,
     pub(crate) old_exports: Vec<Arc<ExportEntry>>,
-    pub(crate) old_magic: Vec<Arc<crate::MagicRef>>,
     /// Heap that receives all allocations while the heap is detached.
     pub(crate) detached: Option<Box<VecHeap>>,
 }
@@ -861,8 +897,8 @@ pub(crate) struct LazyOwners(Option<Box<HeapOwners>>);
 impl Drop for LazyOwners {
     fn drop(&mut self) {
         if let Some(owners) = self.0.as_deref() {
-            crate::gc::release_binary_chain(owners.off_heap_first);
-            crate::gc::release_binary_chain(owners.wrt_bins);
+            crate::gc::release_off_heap_chain(owners.off_heap_first);
+            crate::gc::release_off_heap_chain(owners.wrt_bins);
         }
     }
 }
@@ -907,7 +943,6 @@ impl LazyOwners {
             || !owners.old_nodes.is_empty()
             || !owners.old_funs.is_empty()
             || !owners.old_exports.is_empty()
-            || !owners.old_magic.is_empty()
     }
 }
 
@@ -1301,12 +1336,10 @@ impl ProcessHeap {
                 target.nodes.append(&mut owners.nodes);
                 target.funs.append(&mut owners.funs);
                 target.exports.append(&mut owners.exports);
-                target.magic.append(&mut owners.magic);
                 target.old_external.append(&mut owners.old_external);
                 target.old_nodes.append(&mut owners.old_nodes);
                 target.old_funs.append(&mut owners.old_funs);
                 target.old_exports.append(&mut owners.old_exports);
-                target.old_magic.append(&mut owners.old_magic);
             } else {
                 self.owners.0 = Some(owners);
             }
@@ -1339,7 +1372,7 @@ impl ProcessHeap {
     fn bin_ref_chain_count(mut head: usize) -> usize {
         let mut count = 0;
         while head != 0 {
-            count += 1;
+            count += usize::from(!off_heap_node_is_magic(head));
             head = load((head as *const u64).wrapping_add(2)) as usize;
         }
         count
@@ -1350,8 +1383,10 @@ impl ProcessHeap {
         let mut bytes = 0u64;
         let mut head = self.owners.off_heap_first;
         while head != 0 {
-            let header = load((head as *const u64).wrapping_add(1)) as *const u64;
-            bytes = bytes.saturating_add(load(header.wrapping_add(3)));
+            if !off_heap_node_is_magic(head) {
+                let header = load((head as *const u64).wrapping_add(1)) as *const u64;
+                bytes = bytes.saturating_add(load(header.wrapping_add(3)));
+            }
             head = load((head as *const u64).wrapping_add(2)) as usize;
         }
         bytes.saturating_add(
@@ -1374,12 +1409,14 @@ impl ProcessHeap {
         for mut head in [o.off_heap_first, o.wrt_bins] {
             while head != 0 {
                 let bin_ref = head as *const u64;
-                let binary = load(bin_ref.wrapping_add(1)) as *const u64;
-                out.push((
-                    binary as usize,
-                    load(binary.wrapping_add(3)) as usize,
-                    load(binary.wrapping_add(2)) as usize,
-                ));
+                if !off_heap_node_is_magic(head) {
+                    let binary = load(bin_ref.wrapping_add(1)) as *const u64;
+                    out.push((
+                        binary as usize,
+                        load(binary.wrapping_add(3)) as usize,
+                        load(binary.wrapping_add(2)) as usize,
+                    ));
+                }
                 head = load(bin_ref.wrapping_add(2)) as usize;
             }
         }
@@ -1663,13 +1700,24 @@ impl HeapAlloc for ProcessHeap {
         }
         self.owners.exports.push(entry);
     }
-    fn retain_magic(&mut self, owner: Arc<crate::MagicRef>) {
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        owner: Arc<crate::MagicRef>,
+    ) -> Result<(), TermError> {
         if self.detached
             && let Some(heap) = self.owners.detached.as_deref_mut()
         {
-            return heap.retain_magic(owner);
+            return heap.link_magic_ref(thing, owner);
         }
-        self.owners.magic.push(owner);
+        let owners = &mut *self.owners;
+        link_magic_thing(
+            &mut owners.off_heap_first,
+            &mut owners.overhead,
+            thing,
+            owner,
+        );
+        Ok(())
     }
     fn supports_magic(&self) -> bool {
         true
@@ -1727,7 +1775,6 @@ pub struct VecHeap {
     nodes: Vec<Arc<Node>>,
     funs: Vec<Arc<FunEntry>>,
     exports: Vec<Arc<ExportEntry>>,
-    magic: Vec<Arc<crate::MagicRef>>,
     used: usize,
     total_used: usize,
     chunk_words: usize,
@@ -1754,7 +1801,6 @@ impl VecHeap {
             nodes: Vec::new(),
             funs: Vec::new(),
             exports: Vec::new(),
-            magic: Vec::new(),
             used: 0,
             total_used: 0,
             chunk_words: words,
@@ -1769,8 +1815,8 @@ impl VecHeap {
             crate::validate::forget_stable_range(chunk.as_ptr() as usize);
             drop(chunk);
         }
-        crate::gc::release_binary_chain(self.off_heap_first);
-        crate::gc::release_binary_chain(self.wrt_bins);
+        crate::gc::release_off_heap_chain(self.off_heap_first);
+        crate::gc::release_off_heap_chain(self.wrt_bins);
         self.off_heap_first = 0;
         self.wrt_bins = 0;
         self.overhead = 0;
@@ -1778,7 +1824,6 @@ impl VecHeap {
         self.nodes.clear();
         self.funs.clear();
         self.exports.clear();
-        self.magic.clear();
         self.used = 0;
         self.total_used = 0;
         let literal = self.chunk_words & LITERAL_HEAP_BIT;
@@ -1832,8 +1877,8 @@ impl Default for VecHeap {
 }
 impl Drop for VecHeap {
     fn drop(&mut self) {
-        crate::gc::release_binary_chain(self.off_heap_first);
-        crate::gc::release_binary_chain(self.wrt_bins);
+        crate::gc::release_off_heap_chain(self.off_heap_first);
+        crate::gc::release_off_heap_chain(self.wrt_bins);
         #[cfg(any(feature = "validate-terms", debug_assertions, test))]
         for chunk in &self.chunks {
             crate::validate::forget_stable_range(chunk.as_ptr() as usize);
@@ -1917,8 +1962,13 @@ impl HeapAlloc for VecHeap {
     fn retain_export(&mut self, entry: Arc<ExportEntry>) {
         self.exports.push(entry);
     }
-    fn retain_magic(&mut self, owner: Arc<crate::MagicRef>) {
-        self.magic.push(owner);
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        owner: Arc<crate::MagicRef>,
+    ) -> Result<(), TermError> {
+        link_magic_thing(&mut self.off_heap_first, &mut self.overhead, thing, owner);
+        Ok(())
     }
     fn supports_magic(&self) -> bool {
         true
@@ -3146,14 +3196,14 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         let p = self.words(3)?;
         // Port of erts/emulator/beam/erl_term.h:883-890 (write_magic_ref_thing), OTP-29.1.1:
         // an ErtsMRefThing is header, magic binary pointer and the off-heap `next` slot.
-        // The heap's off-heap owner list holds the reference count, so `next` stays null.
-        // SAFETY: three reserved words hold the ErtsMRefThing.
-        unsafe {
-            *p = crate::REF_THING_HEADER;
-            *p.add(1) = Arc::as_ptr(&owner) as u64;
-            *p.add(2) = 0;
-        }
-        self.heap.retain_magic(owner);
+        // erts_mk_magic_ref links the thing at the head of the off-heap list and charges
+        // `mb->orig_size` to the virtual binary heap.
+        store(p, crate::REF_THING_HEADER);
+        store(p.wrapping_add(1), Arc::as_ptr(&owner) as u64);
+        store(p.wrapping_add(2), 0);
+        let words = (owner.orig_size() / 8) as u64;
+        self.heap.link_magic_ref(p, owner)?;
+        self.heap.add_bin_vheap(words);
         Ok(Term::from_ptr(p, 2))
     }
 }

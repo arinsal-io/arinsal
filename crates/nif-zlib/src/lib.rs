@@ -152,8 +152,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn retain_export(&mut self, value: Arc<ExportEntry>) {
         self.0.retain_export(value)
     }
-    fn retain_magic(&mut self, value: Arc<arinsal_term::MagicRef>) {
-        self.0.retain_magic(value)
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        value: Arc<arinsal_term::MagicRef>,
+    ) -> Result<(), arinsal_term::TermError> {
+        self.0.link_magic_ref(thing, value)
     }
     fn supports_magic(&self) -> bool {
         self.0.supports_magic()

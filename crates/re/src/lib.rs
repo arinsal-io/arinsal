@@ -197,8 +197,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn supports_writable_binary(&self) -> bool {
         self.0.supports_writable_binary()
     }
-    fn retain_magic(&mut self, value: Arc<MagicRef>) {
-        self.0.retain_magic(value)
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        value: Arc<MagicRef>,
+    ) -> Result<(), arinsal_term::TermError> {
+        self.0.link_magic_ref(thing, value)
     }
     fn supports_magic(&self) -> bool {
         self.0.supports_magic()

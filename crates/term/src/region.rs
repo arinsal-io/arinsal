@@ -80,15 +80,14 @@ struct Storage {
     nodes: Vec<Arc<Node>>,
     funs: Vec<Arc<FunEntry>>,
     exports: Vec<Arc<ExportEntry>>,
-    magic: Vec<Arc<MagicRef>>,
     dependencies: HashMap<usize, Arc<Region>>,
 }
 
 impl Drop for Storage {
     fn drop(&mut self) {
         // Port of erts/emulator/beam/copy.c:2049 (fragment ownership release), OTP-29.1.1.
-        crate::gc::release_binary_chain(self.off_heap_first);
-        crate::gc::release_binary_chain(self.wrt_bins);
+        crate::gc::release_off_heap_chain(self.off_heap_first);
+        crate::gc::release_off_heap_chain(self.wrt_bins);
     }
 }
 
@@ -104,7 +103,6 @@ impl Storage {
             nodes: Vec::new(),
             funs: Vec::new(),
             exports: Vec::new(),
-            magic: Vec::new(),
             dependencies: HashMap::new(),
         }
     }
@@ -165,8 +163,9 @@ impl HeapAlloc for Storage {
     fn retain_export(&mut self, entry: Arc<ExportEntry>) {
         self.exports.push(entry);
     }
-    fn retain_magic(&mut self, owner: Arc<MagicRef>) {
-        self.magic.push(owner);
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: Arc<MagicRef>) -> Result<(), TermError> {
+        crate::heap::link_magic_thing(&mut self.off_heap_first, &mut self.overhead, thing, owner);
+        Ok(())
     }
     fn supports_magic(&self) -> bool {
         true

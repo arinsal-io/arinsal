@@ -355,10 +355,14 @@ impl HeapAlloc for EnvHeap {
             Self::Bound(h) => Self::bound_mut(*h).retain_export(x),
         }
     }
-    fn retain_magic(&mut self, x: Arc<MagicRef>) {
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        x: Arc<MagicRef>,
+    ) -> Result<(), arinsal_term::TermError> {
         match self {
-            Self::Owned(h) => h.retain_magic(x),
-            Self::Bound(h) => Self::bound_mut(*h).retain_magic(x),
+            Self::Owned(h) => h.link_magic_ref(thing, x),
+            Self::Bound(h) => Self::bound_mut(*h).link_magic_ref(thing, x),
         }
     }
     fn supports_magic(&self) -> bool {

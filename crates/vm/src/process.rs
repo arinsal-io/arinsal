@@ -1431,7 +1431,30 @@ impl Executor {
                 // Native code that exited only for a fetch reenters without a scheduling point.
                 let mut reenter = false;
                 loop {
-                    if !std::mem::take(&mut reenter) {
+                    // Port of erts/emulator/beam/erl_process.c (schedule: the scheduler-type
+                    // switch; check_dirty_enqueue_in_prio_queue), OTP-29.1.1: a process whose dirty NIF has not run yet carries its
+                    // ERTS_PSFLG_DIRTY_*_PROC flag, so it executes only on that dirty scheduler
+                    // class and every other scheduler sends it back to the dirty run queue.
+                    // Yielding or running here would resume the dirty-NIF dispatch stub as if
+                    // it were an unresolved export.
+                    let pending_dirty = process
+                        .cold
+                        .as_ref()
+                        .and_then(|cold| cold.native_dirty_nif)
+                        .map(|(_, _, class)| class);
+                    let dirty_here = pending_dirty
+                        .is_some_and(|class| class == scheduler_class(ctx.scheduler_type()));
+                    match pending_dirty {
+                        Some(arinsal_bifs::SchedulerClass::DirtyCpu) if !dirty_here => {
+                            break Err(VmError::Dirty(arinsal_sched::DirtyKind::Cpu));
+                        }
+                        Some(arinsal_bifs::SchedulerClass::DirtyIo) if !dirty_here => {
+                            break Err(VmError::Dirty(arinsal_sched::DirtyKind::Io));
+                        }
+                        _ => {}
+                    }
+                    let reentered = std::mem::take(&mut reenter);
+                    if !dirty_here && !reentered {
                         // A caught exception re-enters this loop without replenishing its process slice.
                         if ctx.remaining() == 0 {
                             break Ok(RunState::Yield);

@@ -135,8 +135,12 @@ impl HeapAlloc for TraceHeap<'_> {
         HeapAlloc::retain_export(self.heap, entry);
     }
 
-    fn retain_magic(&mut self, owner: Arc<MagicRef>) {
-        HeapAlloc::retain_magic(self.heap, owner);
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        owner: Arc<MagicRef>,
+    ) -> Result<(), arinsal_term::TermError> {
+        HeapAlloc::link_magic_ref(self.heap, thing, owner)
     }
 
     fn supports_magic(&self) -> bool {

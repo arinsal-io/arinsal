@@ -546,8 +546,12 @@ impl HeapAlloc for ProcessHeapHandle<'_> {
     fn retain_export(&mut self, entry: Arc<ExportEntry>) {
         HeapAlloc::retain_export(self.0, entry)
     }
-    fn retain_magic(&mut self, owner: Arc<MagicRef>) {
-        HeapAlloc::retain_magic(self.0, owner)
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        owner: Arc<MagicRef>,
+    ) -> Result<(), arinsal_term::TermError> {
+        HeapAlloc::link_magic_ref(self.0, thing, owner)
     }
     fn supports_magic(&self) -> bool {
         true

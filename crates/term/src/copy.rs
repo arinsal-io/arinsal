@@ -339,10 +339,10 @@ fn copy_struct_into<H: HeapAlloc + ?Sized>(
                             copy_map(objp, hdr, argp, &mut htop);
                         }
                         REF if crate::is_magic_ref_thing_with_hdr(hdr, *objp.add(1)) => {
-                            let ptr = *objp.add(1) as *const crate::MagicRef;
-                            Arc::increment_strong_count(ptr);
-                            dst.retain_magic(Arc::from_raw(ptr));
+                            let owner = crate::MagicRef::thing_owner(*objp.add(1), true);
+                            let thing = htop;
                             copy_off_heap_thing(objp, hdr, argp, &mut htop, dst, true)?;
+                            dst.link_magic_ref(thing, owner)?;
                         }
                         _ => {
                             let words = ((hdr >> 6) as usize) + 1;
@@ -761,14 +761,16 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                         }
                     }
                     // Port of erts/emulator/beam/copy.c:934-939 (copy_struct, magic ref), OTP-29.1.1.
-                    // SAFETY: a REF thing has an initialized word one.
-                    REF if crate::is_magic_ref_thing_with_hdr(header, unsafe { *to.add(1) }) => {
-                        // SAFETY: source heap retains this Arc while the copy is in progress.
-                        unsafe {
-                            let ptr = *to.add(1) as *const crate::MagicRef;
-                            Arc::increment_strong_count(ptr);
-                            dst.retain_magic(Arc::from_raw(ptr));
-                        }
+                    REF if crate::is_magic_ref_thing_with_hdr(
+                        header,
+                        crate::heap::load(to.wrapping_add(1)),
+                    ) =>
+                    {
+                        let owner = crate::MagicRef::thing_owner(
+                            crate::heap::load(to.wrapping_add(1)),
+                            true,
+                        );
+                        dst.link_magic_ref(to, owner)?;
                     }
                     _ => {}
                 }
