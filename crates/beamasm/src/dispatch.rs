@@ -708,6 +708,18 @@ fn emit_apply_fun_fragment(code: &mut CodeBuffer) -> Result<(), BufferError> {
     })
 }
 
+/// `emit_enter_runtime` stored the host frame made by the fragment's prologue into
+/// `tmp_mem[2]`; the light BIF entries and the trap path read that slot as the Erlang frame
+/// pointer, which is the x29 the prologue saved at `[sp]`.
+fn emit_publish_erlang_frame_pointer(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    code.emit(|encoder| {
+        let frame_pointer_slot =
+            std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + 2 * 8;
+        encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 0)?;
+        encoder.str_uoff(Gpr::x(9), Gpr::x(19), frame_pointer_slot)
+    })
+}
+
 // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:164-210, OTP-29.1.1.
 fn emit_export_fragment(
     code: &mut CodeBuffer,
@@ -753,6 +765,7 @@ fn emit_export_fragment(
     // reductions are checked in module code, not in the BIF trampoline.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-601, OTP-29.1.1.
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    emit_publish_erlang_frame_pointer(code)?;
     code.emit(|encoder| {
         // c_p->arity from the export, then (c_p, reg, I, Export.info). x4 stays
         // the Export* the call site loaded. `info` is the descriptor, the same
@@ -768,6 +781,7 @@ fn emit_export_fragment(
     code.b(direct_done)?;
     code.bind(helper_call)?;
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    emit_publish_erlang_frame_pointer(code)?;
     code.emit(|encoder| {
         // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_bif trampolines read the
         // BIF from their own Export), OTP-29.1.1: x2 = the export's descriptor word.

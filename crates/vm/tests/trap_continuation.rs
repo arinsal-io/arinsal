@@ -164,10 +164,6 @@ fn trap_frames_of_each_call_shape_match_erts() {
 
 #[test]
 fn trap_frames_of_a_tail_called_export_fun_match_erts() {
-    if std::env::var_os("ARINSAL_INTERP").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        eprintln!("skipped with the JIT: a tail call of an export fun to a trapping BIF aborts it");
-        return;
-    }
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping export fun trap frame differential test");
         return;
