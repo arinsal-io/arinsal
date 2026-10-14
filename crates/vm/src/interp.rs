@@ -1824,6 +1824,18 @@ impl Vm {
         }
         let mut reds = p.reductions;
         let mut consumed = 0_u32;
+        let quantum = ctx.as_deref().map_or(0, |run| run.remaining());
+        // A call that charged the slice itself (a driver task run in the caller) used up part
+        // of the quantum without moving `consumed`.
+        macro_rules! sync_slice_use {
+            () => {
+                if let Some(run) = ctx.as_deref() {
+                    consumed = consumed
+                        .max(quantum.saturating_sub(run.remaining()))
+                        .min(budget);
+                }
+            };
+        }
         macro_rules! compare_branch {
             ($ok:expr, $fail:expr) => {
                 if !$ok {
@@ -2838,6 +2850,7 @@ impl Vm {
                         }
                         other => other?,
                     };
+                    sync_slice_use!();
                     let native_resume = p
                         .cold
                         .as_mut()
@@ -4410,6 +4423,7 @@ impl Vm {
                                 }
                                 other => other?,
                             };
+                            sync_slice_use!();
                             match outcome {
                                 ImportOutcome::Returned(value) => {
                                     return Ok(RunState::Done(value));
