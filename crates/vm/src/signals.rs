@@ -947,9 +947,15 @@ pub(crate) fn erl_create_process(
         so.min_heap,
         false,
     );
-    if so.min_heap.is_some() {
-        child.heap = arinsal_term::ProcessHeap::with_words(min_heap.max(64));
-    }
+    // Port of erts/emulator/beam/erl_process.c:12550-12591 (erl_create_process), OTP-29.1.1: the
+    // initial heap holds the copied arguments and the reserved words, rounded up to a heap
+    // size, and is never smaller than the process's minimum heap.
+    let literals = arinsal_term::LiteralAreas::current();
+    let heap_need =
+        arinsal_term::size_object_litopt(args, &literals).saturating_add(arinsal_term::S_RESERVED);
+    let heap_words = arinsal_term::spawned_heap_words(heap_need, min_heap)
+        .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))?;
+    child.heap = arinsal_term::ProcessHeap::with_words(heap_words);
     child.heap.set_min_heap_size(min_heap);
     // Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1: an
     // explicit min_bin_vheap_size alone takes the runtime default when no other heap option is set.
@@ -990,7 +996,6 @@ pub(crate) fn erl_create_process(
     child.parent = Some(ctx.pid());
     // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: `args` is copied
     // with copy_struct_litopt and the three arg registers take mod, func and the copy), OTP-29.1.1.
-    let literals = arinsal_term::LiteralAreas::current();
     let copied_args = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut child.heap);
         arinsal_term::copy_term_litopt(args, &mut heap, &literals)
