@@ -2335,8 +2335,29 @@ impl Executor {
                                                 pending.arity,
                                             ))
                                         });
+                                    let credit_reductions =
+                                        crate::bif_traps::continuation_slice_uncounted(process);
                                     let trapped =
                                         crate::bif_traps::run_trapped_export(process, Some(ctx));
+                                    // Port of erts/emulator/beam/erl_process.c
+                                    // (erts_current_reductions), OTP-29.1.1: the reductions a
+                                    // continuation slice burns count toward the process total.
+                                    if credit_reductions
+                                        && let Some(Ok(crate::bif_traps::ResumeResult::Handler(
+                                            crate::bif_traps::HandlerResult::Done {
+                                                reductions,
+                                                ..
+                                            }
+                                            | crate::bif_traps::HandlerResult::Yield {
+                                                reductions,
+                                                ..
+                                            },
+                                        ))) = &trapped
+                                    {
+                                        process.reductions_used = process
+                                            .reductions_used
+                                            .saturating_add(u64::from((*reductions).max(1)));
+                                    }
                                     if let Some((module, function, arity)) = &trapped_callee {
                                         let outcome = match &trapped {
                                             Some(Ok(crate::bif_traps::ResumeResult::Handler(

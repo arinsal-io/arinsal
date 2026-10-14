@@ -145,3 +145,82 @@ fn iolist_to_iovec_segmentation_matches_otp() {
 
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
+
+const REDUCTIONS_SOURCE: &str = r#"
+-module(iolist_to_iovec_reds).
+-export([run/0]).
+
+bin(N, B) -> binary:copy(<<B>>, N).
+
+unaligned(N, B) ->
+    <<_:3, R:(N * 8)/bitstring, _/bitstring>> = <<0:3, (bin(N, B))/bitstring, 0:5>>,
+    R.
+
+cases() ->
+    Small = fun() -> bin(10, 1) end,
+    Large = fun() -> bin(600, 2) end,
+    [
+        {small_10, fun() -> lists:duplicate(10, Small()) end},
+        {small_100, fun() -> lists:duplicate(100, Small()) end},
+        {small_1000, fun() -> lists:duplicate(1000, Small()) end},
+        {small_5000, fun() -> lists:duplicate(5000, Small()) end},
+        {small_20000, fun() -> lists:duplicate(20000, Small()) end},
+        {small_50000, fun() -> lists:duplicate(50000, Small()) end},
+        {tiny_60000, fun() -> lists:duplicate(60000, <<1>>) end},
+        {bytes_20000, fun() -> lists:duplicate(20000, 7) end},
+        {large_segments_3000, fun() -> lists:duplicate(3000, Large()) end},
+        {mixed_6000, fun() -> lists:append(lists:duplicate(3000, [Small(), Large()])) end},
+        {nested_deep, fun() -> lists:foldl(fun(_, Acc) -> [Acc, Small()] end, [], lists:seq(1, 5000)) end},
+        {nested_left, fun() -> lists:foldl(fun(_, Acc) -> [Small() | Acc] end, [], lists:seq(1, 5000)) end},
+        {improper_tail, fun() -> lists:foldl(fun(_, Acc) -> [Small() | Acc] end, Large(), lists:seq(1, 3000)) end},
+        {unaligned_20k, fun() -> [1, unaligned(20000, 3), 2] end},
+        {unaligned_200k, fun() -> [1, unaligned(200000, 3), 2] end},
+        {unaligned_1m, fun() -> [1, unaligned(1000000, 3), 2] end},
+        {unaligned_many, fun() -> lists:duplicate(300, unaligned(2000, 4)) end},
+        {aligned_copied_512, fun() -> lists:duplicate(2000, bin(512, 5)) end}
+    ].
+
+measure(Make) ->
+    Self = self(),
+    {Pid, Ref} = spawn_opt(
+        fun() ->
+            Input = Make(),
+            erlang:yield(),
+            {reductions, R0} = process_info(self(), reductions),
+            Vec = erlang:iolist_to_iovec(Input),
+            {reductions, R1} = process_info(self(), reductions),
+            Self ! {self(), {R1 - R0, iolist_size(Vec), length(Vec)}}
+        end,
+        [monitor, {min_heap_size, 20000000}, {min_bin_vheap_size, 20000000}]
+    ),
+    receive
+        {Pid, Result} ->
+            erlang:demonitor(Ref, [flush]),
+            Result;
+        {'DOWN', Ref, process, Pid, Reason} ->
+            {down, Reason}
+    end.
+
+run() ->
+    [{Name, measure(Make)} || {Name, Make} <- cases()].
+"#;
+
+#[test]
+fn iolist_to_iovec_reductions_and_yields_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping iolist_to_iovec reductions test");
+        return;
+    };
+    let beam = reference
+        .compile_named("iolist_to_iovec_reds", REDUCTIONS_SOURCE, &[])
+        .unwrap();
+    reference.load("iolist_to_iovec_reds", &beam).unwrap();
+    let expected = reference.call("iolist_to_iovec_reds", "run", &[]);
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("iolist_to_iovec_reds", "run", &[], 1, None)
+        .unwrap_or_else(|error| panic!("iolist_to_iovec reductions: {error}"));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+}

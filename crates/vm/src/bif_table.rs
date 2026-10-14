@@ -90,7 +90,8 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
 /// The light entry of a trapping BIF with its own body, compiled when the export is created.
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     use crate::bif_traps::{
-        IolistSize, IolistToBinary, ListToBinary, MapsFromList, MapsKeys, MapsMerge, MapsValues,
+        IolistSize, IolistToBinary, IolistToIovec, ListToBinary, MapsFromList, MapsKeys, MapsMerge,
+        MapsValues,
     };
     use crate::native_helpers::trap_bif_entry;
     if module == "erlang" && function == "binary_to_list" && matches!(arity, 1 | 3) {
@@ -106,6 +107,7 @@ pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usiz
         }
         ("erlang", "iolist_to_binary", 1) => trap_bif_entry::<IolistToBinary> as *const () as usize,
         ("erlang", "iolist_size", 1) => trap_bif_entry::<IolistSize> as *const () as usize,
+        ("erlang", "iolist_to_iovec", 1) => trap_bif_entry::<IolistToIovec> as *const () as usize,
         ("lists", "reverse", 2) => crate::native_helpers::list_reverse_entry as *const () as usize,
         _ => return None,
     };

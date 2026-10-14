@@ -46,10 +46,10 @@ pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk, ProjectionStart};
 pub use maps_bifs::{maps_merge_start, maps_merge_start_on_process_heap};
 pub use pure::{
     BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, IolistSizeWalk,
-    IolistWalk, allocate_iolist_binary, atom_to_list_term, binary_bytes, binary_part_2,
-    bitstring_bit_len, copy_binary_range, copy_bitstring_range, eval_unique_integer,
-    finish_iolist_binary_output, next_ref_id, next_unique_monotonic, singleton_bitstring,
-    with_binary_bytes, with_iolist_binary_output,
+    IolistVecWalk, IolistWalk, allocate_iolist_binary, atom_to_list_term, binary_bytes,
+    binary_part_2, bitstring_bit_len, copy_binary_range, copy_bitstring_range, eval_unique_integer,
+    finish_iolist_binary_output, iolist_to_iovec_shortcut, iolist_yield_reductions, next_ref_id,
+    next_unique_monotonic, singleton_bitstring, with_binary_bytes, with_iolist_binary_output,
 };
 pub use time::{
     monotonic_time_milliseconds, monotonic_time_nanos, next_now_micros, time_offset_nanos_value,
