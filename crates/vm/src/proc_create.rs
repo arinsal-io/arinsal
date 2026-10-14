@@ -1233,7 +1233,7 @@ impl Process {
         words: usize,
         registers: &mut [Term],
         live: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<bool, VmError> {
         if live > registers.len() {
             return Err(VmError::Unsupported("live X register count".into()));
         }
@@ -1247,7 +1247,7 @@ impl Process {
             && !self.heap.bin_vheap_gc_due()
             && !gc_stress_enabled()
         {
-            return Ok(());
+            return Ok(false);
         }
         if self.x.len() < live {
             let mut roots = self.x.to_vec();
@@ -1257,7 +1257,7 @@ impl Process {
         self.x[..live].copy_from_slice(&registers[..live]);
         let result = self.ensure(words, live);
         registers[..live].copy_from_slice(&self.x[..live]);
-        result
+        result.map(|()| true)
     }
     /// Collect with `live` X roots.
     ///

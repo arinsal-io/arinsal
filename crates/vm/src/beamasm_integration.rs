@@ -1789,7 +1789,10 @@ impl ModuleEnv for VmModuleEnv<'_> {
             crate::erl_bits::append_binary as *const () as usize,
         );
         arinsal_beamasm::bs_construct::install_bs_gc(self.gc_hook());
-        arinsal_term::install_private_append_overhead(crate::erl_bits::private_append_overhead);
+        arinsal_beamasm::bs_construct::install_bs_private_append(
+            crate::native_helpers::arinsal_beamasm_bs_private_append_fast as *const () as usize,
+            crate::native_helpers::arinsal_beamasm_bs_private_append_checked as *const () as usize,
+        );
         crate::native_helpers::arinsal_beamasm_bs_create_bin
     }
     fn binary_literal(&self, bytes: &[u8]) -> Result<u64, String> {

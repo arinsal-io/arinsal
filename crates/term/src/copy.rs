@@ -456,6 +456,7 @@ fn copy_sub_bits<H: HeapAlloc + ?Sized>(
     Ok(())
 }
 
+#[inline(always)]
 pub(crate) fn copy_binary_to_buffer(dst: &mut [u8], src: &[u8], src_offset: usize, size: usize) {
     // Port of erts/emulator/beam/erl_bits.h:541 (`copy_binary_to_buffer`), OTP-29.1.1.
     // `src` / `dst` are the live windows the caller already bounded.

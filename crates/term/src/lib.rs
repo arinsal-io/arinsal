@@ -30,9 +30,10 @@ pub use atom::{
     global_atoms, set_atom_table_limit,
 };
 pub use bits::{
-    BinaryOwner, ExternalBinary, RefcBinary, SUB_BITS_MUTABLE, SUB_BITS_VOLATILE, WritableBinary,
-    binary_memory_bytes, binary_offset_adjustment, binary_owner, erts_bs_private_append_checked,
-    erts_bs_private_append_fast, external_binary_magic, install_private_append_overhead,
+    BinaryOwner, ExternalBinary, PrivateAppendUpdate, RefcBinary, SUB_BITS_MUTABLE,
+    SUB_BITS_VOLATILE, WritableBinary, binary_memory_bytes, binary_offset_adjustment, binary_owner,
+    erts_bs_private_append_checked, erts_bs_private_append_checked_with_update,
+    erts_bs_private_append_fast, erts_bs_private_append_fast_with_update, external_binary_magic,
     is_match_context, is_writable_binary, match_position, set_match_position, sub_bits_flags,
     writable_bytes_mut, writable_capacity, writable_extend_private, writable_finalize,
     writable_gc_visit,
