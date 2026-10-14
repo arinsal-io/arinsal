@@ -238,3 +238,26 @@ fn misc_bifs_decode_packet_and_dflag_match_erts() {
         "run",
     );
 }
+
+#[test]
+fn misc_bifs_decode_packet_reads_and_returns_sub_binaries_in_place() {
+    let _ = global_atoms();
+    compare(
+        r#"-module(misc_bifs_packet_ref). -export([run/0]).
+        run() ->
+            Body = binary:copy(<<"x">>, 200),
+            Big = binary:copy(<<200:32, Body/binary>>, 100),
+            {ok, P1, R1} = erlang:decode_packet(4, Big, []),
+            {ok, P2, R2} = erlang:decode_packet(4, R1, [{packet_size, 1000}]),
+            Part = binary:part(Big, 4, byte_size(Big) - 4),
+            {ok, P3, R3} = erlang:decode_packet(raw, Part, []),
+            Small = <<4:32, "abcd", "tail">>,
+            {ok, P4, R4} = erlang:decode_packet(4, Small, []),
+            {byte_size(P1), byte_size(P2), byte_size(R2),
+             binary:referenced_byte_size(P1), binary:referenced_byte_size(R1),
+             binary:referenced_byte_size(R2), binary:referenced_byte_size(P3),
+             binary:referenced_byte_size(R3), P4, R4}."#,
+        "misc_bifs_packet_ref",
+        "run",
+    );
+}

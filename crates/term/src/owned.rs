@@ -336,11 +336,16 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
                     // SAFETY: source heap and backing bytes remain live.
                     let view = unsafe { term.binary_ref().unwrap() };
                     let mut bytes = vec![0_u8; view.bit_len().div_ceil(8)];
-                    for i in 0..view.bit_len() {
-                        let bit = (view.bytes()[(view.start_bit() + i) / 8]
-                            >> (7 - (view.start_bit() + i) % 8))
-                            & 1;
-                        bytes[i / 8] |= bit << (7 - i % 8);
+                    if view.start_bit().is_multiple_of(8) && view.bit_len().is_multiple_of(8) {
+                        let first = view.start_bit() / 8;
+                        bytes.copy_from_slice(&view.bytes()[first..first + view.bit_len() / 8]);
+                    } else {
+                        for i in 0..view.bit_len() {
+                            let bit = (view.bytes()[(view.start_bit() + i) / 8]
+                                >> (7 - (view.start_bit() + i) % 8))
+                                & 1;
+                            bytes[i / 8] |= bit << (7 - i % 8);
+                        }
                     }
                     if view.bit_len() % 8 == 0 {
                         values.push(OwnedTerm::Binary(bytes));

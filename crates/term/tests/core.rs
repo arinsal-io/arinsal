@@ -1125,3 +1125,30 @@ fn magic_reference_uses_erts_ref_thing_header_and_marker() {
     // SAFETY: as above; an ordinary reference has no owner to borrow.
     assert!(unsafe { ordinary.magic_ref() }.is_none());
 }
+
+#[test]
+fn to_owned_copies_aligned_unaligned_and_partial_byte_bitstrings() {
+    let bytes: Vec<u8> = (0..=255).collect();
+    let mut heap = VecHeap::new();
+    let mut builder = TermBuilder::new(&mut heap);
+    let whole = builder.binary(&bytes).unwrap();
+    assert_eq!(to_owned(whole).unwrap(), OwnedTerm::Binary(bytes.clone()));
+    let aligned = builder.sub_binary(whole, 8 * 10, 8 * 100).unwrap();
+    assert_eq!(
+        to_owned(aligned).unwrap(),
+        OwnedTerm::Binary(bytes[10..110].to_vec())
+    );
+    let shifted = builder.sub_binary(whole, 8 * 10 + 4, 8 * 100).unwrap();
+    let expected: Vec<u8> = (10..110)
+        .map(|i| (bytes[i] << 4) | (bytes[i + 1] >> 4))
+        .collect();
+    assert_eq!(to_owned(shifted).unwrap(), OwnedTerm::Binary(expected));
+    let partial = builder.sub_binary(whole, 8 * 10, 8 * 3 + 5).unwrap();
+    assert_eq!(
+        to_owned(partial).unwrap(),
+        OwnedTerm::BitString {
+            bytes: vec![10, 11, 12, 13 & 0xf8],
+            bits: 5
+        }
+    );
+}
