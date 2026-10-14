@@ -1607,6 +1607,7 @@ pub(crate) trait TrapBody {
     fn run(
         process: &mut Process,
         args: &[Term],
+        _instruction: usize,
         pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError>;
@@ -1633,6 +1634,7 @@ impl TrapBody for MapsKeys {
     fn run(
         process: &mut Process,
         args: &[Term],
+        _instruction: usize,
         pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
@@ -1644,6 +1646,7 @@ impl TrapBody for MapsValues {
     fn run(
         process: &mut Process,
         args: &[Term],
+        _instruction: usize,
         pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
@@ -1655,6 +1658,7 @@ impl TrapBody for MapsMerge {
     fn run(
         process: &mut Process,
         args: &[Term],
+        _instruction: usize,
         pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
@@ -1666,6 +1670,7 @@ impl TrapBody for MapsFromList {
     fn run(
         process: &mut Process,
         args: &[Term],
+        _instruction: usize,
         pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
@@ -1677,6 +1682,7 @@ impl<B: arinsal_bifs::BifBody> TrapBody for BinaryToList<B> {
     fn run(
         process: &mut Process,
         args: &[Term],
+        _instruction: usize,
         pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
@@ -1689,6 +1695,7 @@ impl TrapBody for ListToBinary {
     fn run(
         process: &mut Process,
         args: &[Term],
+        _instruction: usize,
         pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
@@ -1701,6 +1708,7 @@ impl TrapBody for IolistToBinary {
     fn run(
         process: &mut Process,
         args: &[Term],
+        _instruction: usize,
         pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
@@ -1713,6 +1721,7 @@ impl TrapBody for IolistSize {
     fn run(
         process: &mut Process,
         args: &[Term],
+        _instruction: usize,
         pid: Option<arinsal_sched::Pid>,
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {

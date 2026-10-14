@@ -2105,7 +2105,7 @@ pub(crate) extern "C" fn plain_bif_light(
 pub(crate) extern "C" fn plain_bif_entry<B: arinsal_bifs::BifBody>(
     header: *mut ProcessHeader,
     _regs: *mut u64,
-    _i: u64,
+    instruction: u64,
     descriptor: u64,
     identity: u64,
 ) -> u64 {
@@ -2120,7 +2120,7 @@ pub(crate) extern "C" fn plain_bif_entry<B: arinsal_bifs::BifBody>(
         registers,
         identity as usize,
         export,
-        B::call,
+        |process, args| B::call_process(process, args, instruction as usize),
         false,
     )
 }
@@ -2643,7 +2643,7 @@ fn arm_light_trap(
 pub(crate) extern "C" fn trap_bif_entry<T: crate::bif_traps::TrapBody>(
     header: *mut ProcessHeader,
     _regs: *mut u64,
-    _i: u64,
+    instruction: u64,
     descriptor: u64,
     identity: u64,
 ) -> u64 {
@@ -2656,7 +2656,14 @@ pub(crate) extern "C" fn trap_bif_entry<T: crate::bif_traps::TrapBody>(
     if export.light_trap_bif.is_none() {
         return park_executor(process, export, identity);
     }
-    trap_body_call::<T>(process, registers, identity as usize, export).unwrap_or(0)
+    trap_body_call::<T>(
+        process,
+        registers,
+        identity as usize,
+        instruction as usize,
+        export,
+    )
+    .unwrap_or(0)
 }
 
 /// `lists:reverse/2` as its own light entry. The common call runs the body directly and
@@ -2733,6 +2740,7 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
     identity: usize,
+    instruction: usize,
     export: ExportDispatch,
 ) -> Option<u64> {
     process.reductions = process.header.fcalls;
@@ -2744,6 +2752,7 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
     match T::run(
         process,
         &registers.x_reg_array[..arity],
+        instruction,
         pid,
         gc_was_enabled,
     ) {
