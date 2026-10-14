@@ -5,7 +5,8 @@
 //! anonymous caller because the frozen `Ctx` contract has no process identity yet.
 //!
 //! The `zstd` NIFs take their arguments as terms. Their resources are magic references
-//! and `enif_self` is [`set_caller`], which the VM calls before it runs a `zstd` NIF.
+//! and `enif_self` is [`set_caller`], which the VM calls when it runs a process and before a
+//! dirty `zstd` job.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -24,11 +25,12 @@ thread_local! {
     static CALLER: Cell<Option<Term>> = const { Cell::new(None) };
 }
 
-/// Record the process that runs the built-in `zstd` NIF about to be called on this thread.
+/// Record the process that runs the built-in `zstd` NIFs on this thread.
 ///
 /// This is `enif_self` for the `zstd` NIFs: `BifFn` has no process identity, so the VM sets the
-/// caller's pid (an immediate local pid term, `None` outside a scheduler) before it enters the
-/// NIF, on the thread that runs it. A dirty job sets it on the dirty scheduler thread.
+/// caller's pid (an immediate local pid term, `None` outside a scheduler) when a scheduler runs
+/// the process, which covers every path that reaches a NIF from it. A dirty job sets it on the
+/// dirty scheduler thread.
 pub fn set_caller(pid: Option<Term>) {
     CALLER.with(|caller| caller.set(pid));
 }

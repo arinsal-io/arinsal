@@ -11,7 +11,7 @@ const MODULE: &str = "zstd_compat_probe";
 
 const SOURCE: &str = r#"
 -module(zstd_compat_probe).
--export([oneshot/0, lifecycle/0, streams/0, corrupt/0, raw/0, reductions/0]).
+-export([oneshot/0, lifecycle/0, streams/0, corrupt/0, raw/0, reductions/0, external/0]).
 
 inputs() ->
     Text = iolist_to_binary(lists:duplicate(2000, <<"the quick brown fox jumps over the lazy dog ">>)),
@@ -313,6 +313,31 @@ loop_decompress(R, Data, Op, Shapes, Outs) ->
         {_, Out} = Res ->
             finished([shape(Res) | Shapes], [Out | Outs])
     end.
+
+external() ->
+    C = zstd:init_compress_nif(),
+    D = zstd:init_decompress_nif(),
+    Calls = [
+        fun() -> zstd:compress_stream_nif(C, <<"abcabcabc">>, 0) end,
+        fun() -> zstd:decompress_stream_nif(D, <<>>, 0) end,
+        fun() -> zstd:set_pledged_src_size_nif(C, 9) end,
+        fun() -> zstd:set_compress_parameter_nif(C, compressionLevel, 5) end,
+        fun() -> zstd:get_compress_parameter_nif(C, compressionLevel) end,
+        fun() -> zstd:set_decompress_parameter_nif(D, windowLogMax, 20) end,
+        fun() -> zstd:get_decompress_parameter_nif(D, windowLogMax) end,
+        fun() -> zstd:load_compress_dictionary_nif(C, <<"abc">>) end,
+        fun() -> zstd:load_decompress_dictionary_nif(D, <<"abc">>) end,
+        fun() -> zstd:ref_compress_dictionary_nif(C, zstd:create_cdict_nif(<<"abc">>, 3)) end,
+        fun() -> zstd:ref_decompress_dictionary_nif(D, zstd:create_ddict_nif(<<"abc">>)) end,
+        fun() -> zstd:compress_reset_nif(C) end,
+        fun() -> zstd:decompress_reset_nif(D) end,
+        fun() -> zstd:compress_close_nif(C) end,
+        fun() -> zstd:decompress_close_nif(D) end
+    ],
+    Foreign = in_other_process(fun() -> [attempt(F) || F <- Calls] end),
+    io:format("~w~n", [Foreign]),
+    Owner = [attempt(F) || F <- Calls],
+    io:format("~w~n", [Owner]).
 
 reductions() ->
     Data = random(1 bsl 20),
@@ -1314,4 +1339,12 @@ fn stream_nifs_match_erl() {
 #[test]
 fn stream_reductions_match_erl() {
     assert_matches_erl(both_nifs("reductions"), &["{5000,continue,"]);
+}
+
+/// A call to a NIF stub from another module (`zstd:compress_stream_nif/3`, ...) sees the calling
+/// process as `enif_self`, as the calls `zstd.erl` makes itself do: a context used this way by a
+/// process other than its creator raises `not_on_controlling_process`.
+#[test]
+fn external_nif_calls_check_the_owner_like_erl() {
+    assert_matches_erl(both_nifs("external"), &["not_on_controlling_process"]);
 }
