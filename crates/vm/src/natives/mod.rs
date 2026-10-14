@@ -54,8 +54,8 @@ pub(crate) fn static_nif_lookup(
 
 /// The static NIF a call of `module:function/arity` from another function reaches directly.
 ///
-/// Port of erts/emulator/beam/erl_nif.c:3437-3477 (static_schedule_dirty_nif and
-/// static_schedule_dirty_io_nif), OTP-29.1.1: the dirty flag of a NIF decides the scheduler of
+/// Port of static_schedule_dirty_nif and static_schedule_dirty_io_nif (erts/emulator/beam/erl_nif.c),
+/// OTP-29.1.1: the dirty flag of a NIF decides the scheduler of
 /// every call to it, so a NIF flagged dirty is reached through its function's native body,
 /// which moves the process to a dirty scheduler first, and never as a plain BIF.
 pub(crate) fn plain_static_nif_lookup(
