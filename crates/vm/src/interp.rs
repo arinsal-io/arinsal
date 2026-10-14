@@ -2071,7 +2071,16 @@ impl Vm {
             p.ip = offset;
             let module = module_handle.as_ref();
             let instr = fetched;
-            p.reductions_used = p.reductions_used.saturating_add(1);
+            // The instructions that scan the message queue and wait are not calls.
+            if !matches!(
+                instr,
+                Instr::LoopRec { .. }
+                    | Instr::LoopRecEnd { .. }
+                    | Instr::Wait { .. }
+                    | Instr::WaitTimeout { .. }
+            ) {
+                p.reductions_used = p.reductions_used.saturating_add(1);
+            }
             #[cfg(feature = "instr-count")]
             {
                 p.stats.instructions += 1;
