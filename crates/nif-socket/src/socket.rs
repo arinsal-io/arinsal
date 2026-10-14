@@ -76,6 +76,8 @@ pub(crate) struct State {
     pub acceptors_q: VecDeque<Requestor>,
     pub writers_q: VecDeque<Requestor>,
     pub readers_q: VecDeque<Requestor>,
+    /// `rNumCnt`: consecutive full buffers read by a `recv` with length 0.
+    pub r_num_cnt: u32,
 }
 
 pub(crate) struct Handle {
@@ -102,6 +104,7 @@ struct Counters {
     read_fails: u64,
     read_waits: u64,
     read_pkg_max: u64,
+    read_pkg_max_cnt: u64,
     write_tries: u64,
     write_pkg: u64,
     write_byte: u64,
@@ -1204,31 +1207,136 @@ fn sendfile(args: &[O]) -> Result<O, BifError> {
     selected(&h, socket.as_raw_fd(), reference, false);
     Ok(pair(atom("select"), O::Int(total as i64)))
 }
+const RECV_BUFFER_SIZE_DEFAULT: usize = 8 * 1024;
+const RECV_BUFFER_SIZE_MAX: usize = 16 * 1024 * 1024;
+const OTP_OPT_RCVBUF: i32 = 1004;
+const OTP_OPT_SELECT_READ: i32 = 1011;
+
+type Early = Result<O, BifError>;
+
+/// `esock_make_error_integer_range`.
+fn integer_range_error(value: &O) -> O {
+    pair(atom("invalid"), pair(atom("integer_range"), value.clone()))
+}
+fn is_integer(value: &O) -> bool {
+    matches!(value, O::Int(_) | O::BigInt(_))
+}
+/// `GET_UINT64` fitting `ssize_t`, else `{invalid, {integer_range, Value}}`.
+fn recv_size(value: &O) -> Result<usize, Early> {
+    match value {
+        O::Int(n) if *n >= 0 => Ok(*n as usize),
+        O::Int(_) | O::BigInt(_) => Err(Ok(integer_range_error(value))),
+        _ => Err(Err(BifError::BADARG)),
+    }
+}
+/// `GET_INT`, else `{invalid, {integer_range, Value}}`.
+fn recv_flags(value: &O) -> Result<i32, Early> {
+    match value {
+        O::Int(n) => i32::try_from(*n).map_err(|_| Ok(integer_range_error(value))),
+        O::BigInt(_) => Err(Ok(integer_range_error(value))),
+        _ => Err(Err(BifError::BADARG)),
+    }
+}
+/// The buffer size, the ctrl size and the flags of `nif_recv`, `nif_recvfrom` and
+/// `nif_recvmsg`, validated in the order of the C code.
+fn recv_args(args: &[O], msg: bool) -> Result<(usize, usize, i32), Early> {
+    if msg {
+        let buf = recv_size(&args[1])?;
+        let ctrl = recv_size(&args[2])?;
+        let flags = recv_flags(&args[3])?;
+        Ok((buf, ctrl, flags))
+    } else {
+        if !is_integer(&args[1]) || !is_integer(&args[2]) {
+            return Err(Err(BifError::BADARG));
+        }
+        let len = recv_size(&args[1])?;
+        let flags = recv_flags(&args[2])?;
+        Ok((len, 0, flags))
+    }
+}
+/// `esock_decode_bufsz`.
+fn decode_bufsz(value: &O) -> Option<usize> {
+    match value {
+        O::Int(n) if *n > 0 => Some(*n as usize),
+        O::Atom(a) if a == "default" => Some(RECV_BUFFER_SIZE_DEFAULT),
+        _ => None,
+    }
+}
+/// `rBufSz`, `rNum` and `selectRead` of the descriptor, kept as `otp` options.
+struct RecvConfig {
+    buf_sz: usize,
+    num: u32,
+    select_read: bool,
+}
+fn recv_config(h: &Handle) -> RecvConfig {
+    let options = h.otp_options.lock().unwrap();
+    let (num, buf_sz) = match options.get(&OTP_OPT_RCVBUF) {
+        Some(O::Tuple(parts)) if parts.len() == 2 => match (&parts[0], decode_bufsz(&parts[1])) {
+            (O::Int(n), Some(size)) if *n > 0 && u32::try_from(*n).is_ok() => (*n as u32, size),
+            _ => (0, RECV_BUFFER_SIZE_DEFAULT),
+        },
+        Some(value) => (0, decode_bufsz(value).unwrap_or(RECV_BUFFER_SIZE_DEFAULT)),
+        None => (0, RECV_BUFFER_SIZE_DEFAULT),
+    };
+    RecvConfig {
+        buf_sz: buf_sz.max(1),
+        num,
+        select_read: options.get(&OTP_OPT_SELECT_READ) == Some(&atom("true")),
+    }
+}
+
+/// What `essio_recv`, `essio_recvfrom` and `essio_recvmsg` share for one call.
+struct Receiver<'a> {
+    h: &'a Handle,
+    fd: i32,
+    reference: &'a O,
+    caller: &'a O,
+    zero: bool,
+    stream: bool,
+    config: RecvConfig,
+}
+
 fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
-    // Port of erts/emulator/nifs/common/prim_socket_nif.c:7056 (nif_recv), OTP-29.1.1.
     let h = handle(&args[0])?;
-    if msg && integer(&args[2])? > 0 {
+    let reference = if msg { &args[4] } else { &args[3] };
+    let zero = name(reference) == Some("zero");
+    if !matches!(reference, O::Ref { .. }) && !zero {
+        return Err(BifError::BADARG);
+    }
+    let (len, ctrl_len, flags) = match recv_args(args, msg) {
+        Ok(decoded) => decoded,
+        Err(early) => return early,
+    };
+    if msg && ctrl_len > 0 {
         return Err(BifError::Unsupported("ancillary receive control messages"));
     }
-    let requested = usize::try_from(integer(&args[1])?).map_err(|_| BifError::BADARG)?;
-    let flags = integer(if msg { &args[3] } else { &args[2] })?;
-    let reference = if msg { &args[4] } else { &args[3] };
-    let mut data = vec![
-        0u8;
-        if requested == 0 {
-            65536
-        } else {
-            requested.min(16 * 1024 * 1024)
-        }
-    ];
+    let Some(caller) = self_pid() else {
+        return Err(BifError::BADARG);
+    };
     let guard = h.socket.lock().unwrap();
+    let mut st = h.state.lock().unwrap();
+    let config = recv_config(&h);
+    let buf_sz = if len != 0 { len } else { config.buf_sz };
     let Some(s) = guard.as_ref() else {
         return Ok(error("closed"));
     };
+    let rx = Receiver {
+        h: &h,
+        fd: s.as_raw_fd(),
+        reference,
+        caller: &caller,
+        zero,
+        stream: h.kind == "stream",
+        config,
+    };
+    if let Some(early) = rx.check_entry(&mut st) {
+        return early;
+    }
+    let mut data = vec![0u8; buf_sz.min(RECV_BUFFER_SIZE_MAX)];
     h.counters.lock().unwrap().read_tries += 1;
     // SAFETY: zeroed storage is valid for a returned sockaddr, and size is initialized.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let mut returned_flags = 0;
     let received = if msg {
         let mut iov = libc::iovec {
@@ -1238,51 +1346,61 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
         // SAFETY: zeroed msghdr is valid after setting all buffers used by recvmsg.
         let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
         header.msg_name = (&mut storage as *mut libc::sockaddr_storage).cast();
-        header.msg_namelen = len;
+        header.msg_namelen = addr_len;
         header.msg_iov = &mut iov;
         header.msg_iovlen = 1;
         // SAFETY: header points to writable data, iov, and address buffers with valid lengths.
-        let value = unsafe { libc::recvmsg(s.as_raw_fd(), &mut header, flags) };
-        len = header.msg_namelen;
+        let value = unsafe { libc::recvmsg(rx.fd, &mut header, flags) };
+        addr_len = header.msg_namelen;
         returned_flags = header.msg_flags;
         value
     } else {
         // SAFETY: data and storage are writable buffers with matching lengths.
         unsafe {
             libc::recvfrom(
-                s.as_raw_fd(),
+                rx.fd,
                 data.as_mut_ptr().cast(),
                 data.len(),
                 flags,
                 (&mut storage as *mut libc::sockaddr_storage).cast(),
-                &mut len,
+                &mut addr_len,
             )
         }
     };
-    if received < 0 {
-        let e = io::Error::last_os_error();
-        return Ok(if e.kind() == io::ErrorKind::WouldBlock {
-            h.counters.lock().unwrap().read_waits += 1;
-            selected(&h, s.as_raw_fd(), reference, true)
-        } else {
-            h.counters.lock().unwrap().read_fails += 1;
-            fail(&e)
-        });
+    let errno = if received < 0 {
+        io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EINVAL)
+    } else {
+        0
+    };
+    if let Some(early) = rx.check_result(&mut st, received, errno) {
+        return early;
     }
+    let buffer_size = data.len();
+    data.truncate(received as usize);
+    if !msg && !from {
+        return if data.len() < buffer_size {
+            rx.check_partial(&mut st, len, data)
+        } else {
+            rx.check_full(&mut st, len, data)
+        };
+    }
+    let size = data.len() as u64;
+    st.r_num_cnt = 0;
     {
         let mut counters = h.counters.lock().unwrap();
         counters.read_pkg += 1;
-        counters.read_byte += received as u64;
-        counters.read_pkg_max = counters.read_pkg_max.max(received as u64);
+        counters.read_byte += size;
+        counters.read_pkg_max = counters.read_pkg_max.max(size);
     }
-    data.truncate(received as usize);
     let binary = O::Binary(data);
-    let address = if len > 0 {
+    let address = if addr_len > 0 {
         sockaddr_storage_to_term(&storage)
     } else {
         None
     };
-    Ok(if msg {
+    let message = if msg {
         let flags = [
             (libc::MSG_OOB, "oob"),
             (libc::MSG_PEEK, "peek"),
@@ -1303,14 +1421,239 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
         if let Some(addr) = address {
             entries.push((atom("addr"), addr));
         }
-        ok(O::Map(entries))
-    } else if from {
-        ok(pair(address.unwrap_or_else(|| atom("undefined")), binary))
-    } else if received == 0 && h.kind == "stream" {
-        error("closed")
+        O::Map(entries)
     } else {
-        ok(binary)
-    })
+        pair(address.unwrap_or_else(|| atom("undefined")), binary)
+    };
+    if rx.config.select_read && !rx.zero {
+        rx.check_select(&mut st, pair(atom("select_read"), message))
+    } else {
+        rx.update_current_reader(&mut st);
+        Ok(ok(message))
+    }
+}
+
+impl Receiver<'_> {
+    /// `recv_check_entry`: `Some(result)` when the call is done without reading.
+    fn check_entry(&self, st: &mut State) -> Option<Early> {
+        if st.current_acceptor.is_some() {
+            return Some(Ok(error_invalid("state")));
+        }
+        if let Some(current) = st.current_reader.as_ref()
+            && &current.pid != self.caller
+        {
+            if st.search4pid(Kind::Reader, self.caller) {
+                return Some(Err(raise_invalid("state")));
+            }
+            if self.zero {
+                return Some(Ok(atom("timeout")));
+            }
+            st.push(self.h, Kind::Reader, self.caller, self.reference);
+            return Some(Ok(atom("select")));
+        }
+        None
+    }
+
+    /// `recv_check_result`: end of stream and receive errors.
+    fn check_result(&self, st: &mut State, received: isize, errno: i32) -> Option<Early> {
+        if received == 0 && self.stream {
+            let reason = atom("closed");
+            self.h.counters.lock().unwrap().read_fails += 1;
+            self.error_current_reader(st, &reason);
+            Some(Ok(pair(atom("error"), reason)))
+        } else if received < 0 {
+            Some(self.check_fail(st, errno))
+        } else {
+            None
+        }
+    }
+
+    /// `recv_check_full`: the buffer was filled.
+    fn check_full(&self, st: &mut State, len: usize, data: Vec<u8>) -> Early {
+        if len == 0 && self.stream {
+            self.check_full_maybe_done(st, data)
+        } else {
+            self.check_full_done(st, data)
+        }
+    }
+
+    /// `recv_check_full_maybe_done`: `{more, Bin}` until `rNum` buffers were read.
+    fn check_full_maybe_done(&self, st: &mut State, data: Vec<u8>) -> Early {
+        let size = data.len() as u64;
+        {
+            let mut counters = self.h.counters.lock().unwrap();
+            counters.read_byte += size;
+            counters.read_pkg_max_cnt += size;
+        }
+        st.r_num_cnt += 1;
+        if st.r_num_cnt >= self.config.num {
+            self.check_full_done(st, data)
+        } else {
+            self.init_current_reader(st);
+            Ok(pair(atom("more"), O::Binary(data)))
+        }
+    }
+
+    /// `recv_check_full_done`: `{ok | select_read, Bin}`.
+    fn check_full_done(&self, st: &mut State, data: Vec<u8>) -> Early {
+        st.r_num_cnt = 0;
+        let size = data.len() as u64;
+        {
+            let mut counters = self.h.counters.lock().unwrap();
+            counters.read_pkg += 1;
+            counters.read_byte += size;
+            counters.read_pkg_max_cnt += size;
+            if counters.read_pkg_max_cnt > counters.read_pkg_max {
+                counters.read_pkg_max = counters.read_pkg_max_cnt;
+            }
+            counters.read_pkg_max_cnt = 0;
+        }
+        let bin = O::Binary(data);
+        if self.config.select_read && !self.zero {
+            self.check_select(st, pair(atom("select_read"), bin))
+        } else {
+            self.update_current_reader(st);
+            Ok(ok(bin))
+        }
+    }
+
+    /// `recv_check_fail`: a receive error, or would block.
+    fn check_fail(&self, st: &mut State, errno: i32) -> Early {
+        st.r_num_cnt = 0;
+        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+            if self.zero {
+                self.update_current_reader(st);
+                Ok(atom("timeout"))
+            } else {
+                self.check_select(st, atom("select"))
+            }
+        } else {
+            self.h.counters.lock().unwrap().read_fails += 1;
+            let reason = errno_reason(&io::Error::from_raw_os_error(errno));
+            self.error_current_reader(st, &reason);
+            Ok(pair(atom("error"), reason))
+        }
+    }
+
+    /// `recv_check_select`: select for more data and return `msg`, or raise.
+    fn check_select(&self, st: &mut State, msg: O) -> Early {
+        let sres = select_read(self.h, self.fd, None, self.reference);
+        if sres < 0 {
+            self.update_current_reader(st);
+            return Err(raise_select("select_read", sres));
+        }
+        self.init_current_reader(st);
+        st.read_state |= state_bits::SELECTED;
+        Ok(msg)
+    }
+
+    /// `recv_check_partial`: the buffer was not filled, `{ok | timeout | select | select_read, Bin}`.
+    fn check_partial(&self, st: &mut State, len: usize, data: Vec<u8>) -> Early {
+        st.r_num_cnt = 0;
+        let size = data.len() as u64;
+        {
+            let mut counters = self.h.counters.lock().unwrap();
+            counters.read_byte += size;
+            counters.read_pkg_max_cnt += size;
+            if counters.read_pkg_max_cnt > counters.read_pkg_max {
+                counters.read_pkg_max = counters.read_pkg_max_cnt;
+            }
+            counters.read_pkg_max_cnt = 0;
+        }
+        let bin = O::Binary(data);
+        if self.stream && len > 0 {
+            if self.zero {
+                self.h.counters.lock().unwrap().read_pkg += 1;
+                self.update_current_reader(st);
+                Ok(pair(atom("timeout"), bin))
+            } else {
+                self.check_select(st, pair(atom("select"), bin))
+            }
+        } else {
+            self.h.counters.lock().unwrap().read_pkg += 1;
+            if self.config.select_read && !self.zero {
+                self.check_select(st, pair(atom("select_read"), bin))
+            } else {
+                self.update_current_reader(st);
+                Ok(ok(bin))
+            }
+        }
+    }
+
+    /// `recv_init_current_reader`: the caller becomes the current reader, or, on a
+    /// retry, the current reader gets the new reference.
+    fn init_current_reader(&self, st: &mut State) {
+        match st.current_reader.as_mut() {
+            None => {
+                let mon = monitor_process(self.h, self.caller);
+                st.current_reader = Some(Requestor {
+                    pid: self.caller.clone(),
+                    reference: self.reference.clone(),
+                    mon,
+                });
+            }
+            Some(current) => current.reference = self.reference.clone(),
+        }
+    }
+
+    /// `recv_update_current_reader`: demonitor the current reader and activate the next one.
+    fn update_current_reader(&self, st: &mut State) {
+        if let Some(current) = st.current_reader.as_ref() {
+            demonitor_process(current.mon);
+            if !activate_next(self.h, st, self.fd, Kind::Reader) {
+                st.current_reader = None;
+            }
+        }
+    }
+
+    /// `recv_error_current_reader`: abort every waiting reader with `reason`.
+    fn error_current_reader(&self, st: &mut State, reason: &O) {
+        if st.current_reader.is_some() {
+            requestor_release(&mut st.current_reader);
+            while st.pop(Kind::Reader) {
+                if let Some(request) = st.current_reader.take() {
+                    send_abort_msg(self.h, &request, reason);
+                    demonitor_process(request.mon);
+                }
+            }
+            st.current_reader = None;
+        }
+    }
+}
+
+/// `essio_cancel_recv`: cancel the current reader, or unqueue a waiting one.
+fn cancel_recv(args: &[O]) -> Result<O, BifError> {
+    let h = handle(&args[0])?;
+    if !matches!(args[2], O::Ref { .. }) {
+        return Err(BifError::BADARG);
+    }
+    let guard = h.socket.lock().unwrap();
+    let mut st = h.state.lock().unwrap();
+    let Some(s) = guard.as_ref() else {
+        return Ok(error("closed"));
+    };
+    let Some(current) = st.current_reader.clone() else {
+        return Ok(atom("not_found"));
+    };
+    let Some(me) = self_pid() else {
+        return Err(BifError::BADARG);
+    };
+    if me == current.pid {
+        if args[2] != current.reference {
+            return Ok(atom("not_found"));
+        }
+        let fd = s.as_raw_fd();
+        demonitor_process(current.mon);
+        let result = cancel_read_select(fd, &current.reference);
+        if !activate_next(&h, &mut st, fd, Kind::Reader) {
+            st.current_reader = None;
+        }
+        Ok(result)
+    } else if st.unqueue(Kind::Reader, Some(&args[2]), &me) {
+        Ok(atom("ok"))
+    } else {
+        Ok(atom("not_found"))
+    }
 }
 fn sockaddr_storage_to_term(storage: &libc::sockaddr_storage) -> Option<O> {
     match i32::from(storage.ss_family) {
@@ -1888,6 +2231,7 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
         ("nif_cancel", 3) => match crate::name(&args[1]) {
             Some("connect") => cancel_connect(args),
             Some("accept") => cancel_accept(args),
+            Some("recv" | "recvfrom" | "recvmmsg" | "recvmsg") => cancel_recv(args),
             _ => {
                 let h = handle(&args[0])?;
                 if let Some(s) = h.socket.lock().unwrap().as_ref() {
@@ -2091,7 +2435,7 @@ mod tests {
                         accepted.clone(),
                         O::Int(4),
                         O::Int(libc::MSG_PEEK.into()),
-                        O::Int(3),
+                        test_ref(3),
                     ],
                 );
                 if value == atom("select") {
@@ -2107,7 +2451,7 @@ mod tests {
         while all.len() < payload.len() {
             let got = invoke(
                 "nif_recv",
-                &[accepted.clone(), O::Int(0), O::Int(0), O::Int(4)],
+                &[accepted.clone(), O::Int(0), O::Int(0), test_ref(4)],
             );
             if got == atom("select") {
                 continue;
@@ -2134,7 +2478,7 @@ mod tests {
             .find_map(|_| {
                 let value = invoke(
                     "nif_recv",
-                    &[accepted.clone(), O::Int(2), O::Int(0), O::Int(6)],
+                    &[accepted.clone(), O::Int(2), O::Int(0), test_ref(6)],
                 );
                 if value == atom("select") {
                     std::thread::sleep(Duration::from_millis(1));
@@ -2365,7 +2709,7 @@ mod tests {
                 .find_map(|_| {
                     let received = invoke(
                         "nif_recvfrom",
-                        &[receiver.clone(), O::Int(128), O::Int(0), O::Int(2)],
+                        &[receiver.clone(), O::Int(128), O::Int(0), test_ref(2)],
                     );
                     if received == atom("select") {
                         std::thread::sleep(Duration::from_millis(1));
@@ -2403,7 +2747,7 @@ mod tests {
                             O::Int(128),
                             O::Int(0),
                             O::Int(0),
-                            O::Int(4),
+                            test_ref(4),
                         ],
                     );
                     if value == atom("select") {
@@ -2439,7 +2783,7 @@ mod tests {
                             O::Int(10),
                             O::Int(0),
                             O::Int(0),
-                            O::Int(6),
+                            test_ref(6),
                         ],
                     );
                     if value == atom("select") {
@@ -2508,7 +2852,7 @@ mod tests {
             .find_map(|_| {
                 let value = invoke(
                     "nif_recv",
-                    &[accepted.clone(), O::Int(5), O::Int(0), O::Int(4)],
+                    &[accepted.clone(), O::Int(5), O::Int(0), test_ref(4)],
                 );
                 if value == atom("select") {
                     std::thread::sleep(Duration::from_millis(1));
@@ -2589,7 +2933,7 @@ mod tests {
             while bytes.len() < expected.len() {
                 let value = invoke(
                     "nif_recv",
-                    &[accepted.clone(), O::Int(0), O::Int(0), O::Int(4)],
+                    &[accepted.clone(), O::Int(0), O::Int(0), test_ref(4)],
                 );
                 if value == atom("select") {
                     std::thread::yield_now();
@@ -2692,7 +3036,7 @@ mod tests {
         while received.len() < bytes.len() {
             let value = invoke(
                 "nif_recv",
-                &[accepted.clone(), O::Int(0), O::Int(0), O::Int(2)],
+                &[accepted.clone(), O::Int(0), O::Int(0), test_ref(2)],
             );
             if value == atom("select") {
                 std::thread::yield_now();
@@ -2786,7 +3130,7 @@ mod tests {
             while received.len() < expected.len() {
                 let value = invoke(
                     "nif_recv",
-                    &[accepted.clone(), O::Int(0), O::Int(0), O::Int(2)],
+                    &[accepted.clone(), O::Int(0), O::Int(0), test_ref(2)],
                 );
                 if value == atom("select") {
                     std::thread::yield_now();
@@ -3317,11 +3661,290 @@ mod tests {
         );
         assert_eq!(
             invoke("nif_cancel", &[socket.clone(), atom("recvfrom"), reference]),
-            atom("ok")
+            atom("select_sent")
         );
         assert_eq!(invoke("nif_close", &[sender]), atom("ok"));
         owner_died(&pid);
         assert!(handle(&socket).is_err());
+        set_reactor(None);
+    }
+
+    fn connected_pair(reactor: &BlockingReactor) -> (O, O) {
+        let listener = open_socket("inet", "stream", 6);
+        assert_eq!(
+            invoke("nif_bind", &[listener.clone(), addr("inet", 0)]),
+            atom("ok")
+        );
+        assert_eq!(
+            invoke("nif_listen", &[listener.clone(), O::Int(4)]),
+            atom("ok")
+        );
+        let bound = result(invoke("nif_sockname", std::slice::from_ref(&listener)));
+        let port = number(field(&bound, "port").unwrap()).unwrap();
+        let client = open_socket("inet", "stream", 6);
+        let connected = invoke(
+            "nif_connect",
+            &[client.clone(), test_ref(900), addr("inet", port)],
+        );
+        if connected == atom("select") {
+            assert!(reactor.wait(Duration::from_secs(2)).is_some());
+            assert_eq!(
+                invoke("nif_connect", std::slice::from_ref(&client)),
+                atom("ok")
+            );
+        }
+        let accepted = (0..200)
+            .find_map(|_| {
+                let value = invoke("nif_accept", &[listener.clone(), test_ref(901)]);
+                if value == atom("select") {
+                    std::thread::sleep(Duration::from_millis(5));
+                    None
+                } else {
+                    Some(result(value))
+                }
+            })
+            .expect("connection was not accepted");
+        assert_eq!(invoke("nif_close", &[listener]), atom("ok"));
+        (client, accepted)
+    }
+    fn send_bytes(socket: &O, data: &[u8]) {
+        assert_eq!(
+            invoke(
+                "nif_send",
+                &[
+                    socket.clone(),
+                    O::Binary(data.to_vec()),
+                    O::Int(0),
+                    test_ref(902)
+                ]
+            ),
+            atom("ok")
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    fn recv_call(socket: &O, len: i64, reference: O) -> O {
+        invoke(
+            "nif_recv",
+            &[socket.clone(), O::Int(len), O::Int(0), reference],
+        )
+    }
+    fn zero() -> O {
+        atom("zero")
+    }
+    fn bin(data: &[u8]) -> O {
+        O::Binary(data.to_vec())
+    }
+
+    #[test]
+    fn short_stream_read_selects_with_the_data_read() {
+        let (_lock, reactor) = caller_reactor();
+        let (client, accepted) = connected_pair(&reactor);
+        assert_eq!(recv_call(&accepted, 4, test_ref(1)), atom("select"));
+        assert_eq!(
+            invoke("nif_cancel", &[accepted.clone(), atom("recv"), test_ref(1)]),
+            atom("ok")
+        );
+        assert_eq!(
+            invoke("nif_cancel", &[accepted.clone(), atom("recv"), test_ref(1)]),
+            atom("not_found")
+        );
+        send_bytes(&client, b"ab");
+        assert_eq!(
+            recv_call(&accepted, 4, test_ref(2)),
+            pair(atom("select"), bin(b"ab"))
+        );
+        assert_eq!(reactor.wait(Duration::from_millis(100)), None);
+        send_bytes(&client, b"cd");
+        assert_eq!(
+            reactor.wait(Duration::from_secs(1)),
+            Some((pid(5), test_ref(2)))
+        );
+        assert_eq!(recv_call(&accepted, 2, test_ref(3)), ok(bin(b"cd")));
+        assert_eq!(recv_call(&accepted, 0, zero()), atom("timeout"));
+        send_bytes(&client, b"xyz");
+        assert_eq!(
+            recv_call(&accepted, 5, zero()),
+            pair(atom("timeout"), bin(b"xyz"))
+        );
+        send_bytes(&client, b"ab");
+        assert_eq!(recv_call(&accepted, 0, test_ref(4)), ok(bin(b"ab")));
+        send_bytes(&client, b"abcd");
+        assert_eq!(recv_call(&accepted, 4, test_ref(5)), ok(bin(b"abcd")));
+        assert_eq!(invoke("nif_close", &[client]), atom("ok"));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(recv_call(&accepted, 4, test_ref(6)), error("closed"));
+        let counters = field(
+            &invoke("nif_info", std::slice::from_ref(&accepted)),
+            "counters",
+        )
+        .unwrap()
+        .clone();
+        assert_eq!(number(field(&counters, "read_waits").unwrap()), Some(0));
+        assert_eq!(number(field(&counters, "read_fails").unwrap()), Some(1));
+        assert_eq!(number(field(&counters, "read_byte").unwrap()), Some(13));
+        assert_eq!(number(field(&counters, "read_pkg").unwrap()), Some(4));
+        assert_eq!(invoke("nif_close", &[accepted]), atom("ok"));
+        set_reactor(None);
+    }
+
+    #[test]
+    fn readers_are_queued_and_activated_in_turn() {
+        let (_lock, reactor) = caller_reactor();
+        let (client, accepted) = connected_pair(&reactor);
+        assert_eq!(recv_call(&accepted, 0, test_ref(1)), atom("select"));
+        reactor.set_caller(pid(6));
+        assert_eq!(recv_call(&accepted, 0, test_ref(2)), atom("select"));
+        assert!(
+            dispatch(
+                "nif_recv",
+                &[accepted.clone(), O::Int(0), O::Int(0), test_ref(3)]
+            )
+            .is_err()
+        );
+        assert!(
+            dispatch(
+                "nif_recv",
+                &[accepted.clone(), O::Int(0), O::Int(0), zero()]
+            )
+            .is_err()
+        );
+        reactor.set_caller(pid(7));
+        assert_eq!(recv_call(&accepted, 0, zero()), atom("timeout"));
+        reactor.set_caller(pid(6));
+        assert_eq!(
+            invoke("nif_cancel", &[accepted.clone(), atom("recv"), test_ref(9)]),
+            atom("not_found")
+        );
+        assert_eq!(
+            invoke("nif_cancel", &[accepted.clone(), atom("recv"), test_ref(2)]),
+            atom("ok")
+        );
+        assert_eq!(recv_call(&accepted, 0, test_ref(4)), atom("select"));
+        reactor.set_caller(pid(8));
+        assert_eq!(recv_call(&accepted, 0, test_ref(5)), atom("select"));
+        send_bytes(&client, b"hello");
+        assert_eq!(
+            reactor.wait(Duration::from_secs(1)),
+            Some((pid(5), test_ref(1)))
+        );
+        reactor.set_caller(pid(5));
+        assert_eq!(recv_call(&accepted, 0, test_ref(10)), ok(bin(b"hello")));
+        assert_eq!(reactor.wait(Duration::from_millis(100)), None);
+        send_bytes(&client, b"x");
+        assert_eq!(
+            reactor.wait(Duration::from_secs(1)),
+            Some((pid(6), test_ref(4)))
+        );
+        reactor.set_caller(pid(6));
+        assert_eq!(recv_call(&accepted, 0, test_ref(11)), ok(bin(b"x")));
+        reactor.set_caller(pid(8));
+        assert_eq!(
+            invoke("nif_cancel", &[accepted.clone(), atom("recv"), test_ref(5)]),
+            atom("ok")
+        );
+        assert_eq!(
+            invoke("nif_cancel", &[accepted.clone(), atom("recv"), test_ref(5)]),
+            atom("not_found")
+        );
+        assert_eq!(invoke("nif_close", &[client]), atom("ok"));
+        assert_eq!(invoke("nif_close", &[accepted]), atom("ok"));
+        set_reactor(None);
+    }
+
+    #[test]
+    fn end_of_stream_aborts_the_waiting_readers() {
+        let (_lock, reactor) = caller_reactor();
+        let (client, accepted) = connected_pair(&reactor);
+        assert_eq!(recv_call(&accepted, 0, test_ref(1)), atom("select"));
+        reactor.set_caller(pid(6));
+        assert_eq!(recv_call(&accepted, 0, test_ref(2)), atom("select"));
+        assert_eq!(invoke("nif_close", &[client]), atom("ok"));
+        assert_eq!(
+            reactor.wait(Duration::from_secs(1)),
+            Some((pid(5), test_ref(1)))
+        );
+        reactor.set_caller(pid(5));
+        assert_eq!(recv_call(&accepted, 0, test_ref(3)), error("closed"));
+        assert_eq!(
+            reactor.sent(),
+            vec![(
+                pid(6),
+                crate::abort_message(&accepted, &test_ref(2), &atom("closed"))
+            )]
+        );
+        assert_eq!(
+            invoke("nif_cancel", &[accepted.clone(), atom("recv"), test_ref(3)]),
+            atom("not_found")
+        );
+        assert_eq!(
+            invoke("nif_close", std::slice::from_ref(&accepted)),
+            atom("ok")
+        );
+        set_reactor(None);
+    }
+
+    #[test]
+    fn receive_buffer_options_shape_the_result() {
+        let (_lock, reactor) = caller_reactor();
+        let (client, accepted) = connected_pair(&reactor);
+        let h = handle(&accepted).unwrap();
+        h.otp_options
+            .lock()
+            .unwrap()
+            .insert(1004, pair(O::Int(2), O::Int(4)));
+        send_bytes(&client, b"abcdefghijkl");
+        assert_eq!(
+            recv_call(&accepted, 0, test_ref(1)),
+            pair(atom("more"), bin(b"abcd"))
+        );
+        assert_eq!(recv_call(&accepted, 0, test_ref(2)), ok(bin(b"efgh")));
+        assert_eq!(
+            recv_call(&accepted, 0, test_ref(3)),
+            pair(atom("more"), bin(b"ijkl"))
+        );
+        assert_eq!(recv_call(&accepted, 0, test_ref(4)), atom("select"));
+        h.otp_options.lock().unwrap().insert(1004, O::Int(3));
+        send_bytes(&client, b"abcdef");
+        assert_eq!(recv_call(&accepted, 0, test_ref(5)), ok(bin(b"abc")));
+        h.otp_options.lock().unwrap().insert(1011, atom("true"));
+        assert_eq!(
+            recv_call(&accepted, 3, test_ref(6)),
+            pair(atom("select_read"), bin(b"def"))
+        );
+        assert_eq!(recv_call(&accepted, 3, zero()), atom("timeout"));
+        assert_eq!(invoke("nif_close", &[client]), atom("ok"));
+        assert_eq!(invoke("nif_close", &[accepted]), atom("ok"));
+        set_reactor(None);
+    }
+
+    #[test]
+    fn receive_arguments_are_validated() {
+        let (_lock, reactor) = caller_reactor();
+        let (client, accepted) = connected_pair(&reactor);
+        let call = |len: O, flags: O, reference: O| {
+            dispatch("nif_recv", &[accepted.clone(), len, flags, reference])
+        };
+        assert!(call(O::Int(0), O::Int(0), O::Int(1)).is_err());
+        assert!(call(atom("x"), O::Int(0), test_ref(1)).is_err());
+        assert!(call(O::Int(0), atom("x"), test_ref(1)).is_err());
+        assert_eq!(
+            call(O::Int(-1), O::Int(0), test_ref(1)).unwrap(),
+            pair(atom("invalid"), pair(atom("integer_range"), O::Int(-1)))
+        );
+        assert_eq!(
+            call(O::Int(0), O::Int(1 << 40), test_ref(1)).unwrap(),
+            pair(
+                atom("invalid"),
+                pair(atom("integer_range"), O::Int(1 << 40))
+            )
+        );
+        assert_eq!(call(O::Int(0), O::Int(0), zero()).unwrap(), atom("timeout"));
+        assert_eq!(invoke("nif_close", &[client]), atom("ok"));
+        assert_eq!(
+            invoke("nif_close", std::slice::from_ref(&accepted)),
+            atom("ok")
+        );
+        assert_eq!(recv_call(&accepted, 0, test_ref(2)), error("closed"));
         set_reactor(None);
     }
 }
