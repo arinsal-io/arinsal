@@ -108,8 +108,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn retain_export(&mut self, value: Arc<ExportEntry>) {
         self.0.retain_export(value)
     }
-    fn retain_magic(&mut self, owner: Arc<MagicRef>) {
-        self.0.retain_magic(owner)
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        owner: Arc<MagicRef>,
+    ) -> Result<(), arinsal_term::TermError> {
+        self.0.link_magic_ref(thing, owner)
     }
     fn supports_magic(&self) -> bool {
         self.0.supports_magic()
@@ -222,8 +226,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for ConsBlock<'_, H> {
     fn retain_export(&mut self, value: Arc<ExportEntry>) {
         self.backing.retain_export(value)
     }
-    fn retain_magic(&mut self, value: Arc<MagicRef>) {
-        self.backing.retain_magic(value)
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        value: Arc<MagicRef>,
+    ) -> Result<(), arinsal_term::TermError> {
+        self.backing.link_magic_ref(thing, value)
     }
     fn supports_magic(&self) -> bool {
         self.backing.supports_magic()

@@ -938,6 +938,28 @@ impl ObjectHeap {
             .get_or_insert_with(|| Box::new(OffHeap::default()))
     }
 
+    /// Link the off-heap object at `address` (three words) at the head of the DbTerm's
+    /// `first_oh` chain.
+    fn chain_first_oh(&mut self, address: usize) -> Result<(), TermError> {
+        let Some((allocation_index, word_index)) =
+            self.words.iter().enumerate().find_map(|(i, allocation)| {
+                let start = allocation.as_ptr() as usize;
+                let end = start.checked_add(allocation.len().checked_mul(8)?)?;
+                (address >= start && address.checked_add(24).is_some_and(|tail| tail <= end))
+                    .then(|| (i, (address - start) / 8))
+            })
+        else {
+            return Err(TermError::BadArg);
+        };
+        let first_oh = self
+            .off_heap
+            .as_ref()
+            .map_or(0, |off_heap| off_heap.first_oh);
+        self.words[allocation_index][word_index + 2] = first_oh as u64;
+        self.off_heap().first_oh = address;
+        Ok(())
+    }
+
     fn magic_owner(&self, term: Term) -> Option<Arc<MagicRef>> {
         if !term.is_magic_ref() {
             return None;
@@ -948,13 +970,7 @@ impl ObjectHeap {
         if ids.len() != 3 || ids[2] != u32::MAX {
             return None;
         }
-        let id = u64::from(ids[0]) | (u64::from(ids[1]) << 32);
-        self.off_heap
-            .as_ref()?
-            .magic
-            .iter()
-            .find(|owner| owner.id() == id)
-            .cloned()
+        MagicRef::live_by_id(u64::from(ids[0]) | (u64::from(ids[1]) << 32))
     }
 }
 
@@ -977,24 +993,8 @@ impl HeapAlloc for ObjectHeap {
         _overhead_words: u64,
         owner: Option<arinsal_term::OwnedBinaryRef>,
     ) -> Result<(), TermError> {
-        let address = bin_ref as usize;
-        let Some((allocation_index, word_index)) =
-            self.words.iter().enumerate().find_map(|(i, allocation)| {
-                let start = allocation.as_ptr() as usize;
-                let end = start.checked_add(allocation.len().checked_mul(8)?)?;
-                (address >= start && address.checked_add(24).is_some_and(|tail| tail <= end))
-                    .then(|| (i, (address - start) / 8))
-            })
-        else {
-            return Err(TermError::BadArg);
-        };
-        let first_oh = self
-            .off_heap
-            .as_ref()
-            .map_or(0, |off_heap| off_heap.first_oh);
-        self.words[allocation_index][word_index + 2] = first_oh as u64;
+        self.chain_first_oh(bin_ref as usize)?;
         let off_heap = self.off_heap();
-        off_heap.first_oh = address;
         if let Some(mut owner) = owner {
             owner.attach_to_bin_ref(bin_ref);
             off_heap.binary_refs.push(owner);
@@ -1024,8 +1024,12 @@ impl HeapAlloc for ObjectHeap {
     fn retain_export(&mut self, entry: Arc<ExportEntry>) {
         self.off_heap().exports.push(entry);
     }
-    fn retain_magic(&mut self, owner: Arc<MagicRef>) {
+    // The DbTerm's first_oh chain links the thing; the token stands in for the counted
+    // reference the thing holds until db_free_term.
+    fn link_magic_ref(&mut self, thing: *mut u64, owner: Arc<MagicRef>) -> Result<(), TermError> {
+        self.chain_first_oh(thing as usize)?;
         self.off_heap().magic.push(owner);
+        Ok(())
     }
     fn supports_magic(&self) -> bool {
         true

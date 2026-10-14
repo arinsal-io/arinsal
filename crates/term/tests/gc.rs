@@ -175,6 +175,38 @@ fn magic_reference_stays_registered_while_any_heap_holds_it() {
     assert!(!MagicRef::is_registered(id));
 }
 
+#[test]
+fn collections_with_many_live_magic_references_stay_linear() {
+    // A mailbox of messages carrying sockets keeps thousands of magic references live; each
+    // collection used to search the owner list once per live reference.
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut heap = ProcessHeap::with_words(1 << 18);
+    let mut list = Term::NIL;
+    let mut ids = Vec::new();
+    for _ in 0..40_000 {
+        let owner = MagicRef::new(DropCounter(count.clone()));
+        ids.push(owner.id());
+        let magic = TermBuilder::new(&mut heap).magic_ref(owner).unwrap();
+        list = TermBuilder::new(&mut heap).cons(magic, list).unwrap();
+    }
+    let started = std::time::Instant::now();
+    let mut roots = [list];
+    for _ in 0..4 {
+        heap.collect(&mut roots, &mut [], 0).unwrap();
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "collecting {} live magic references took {:?}",
+        ids.len(),
+        started.elapsed()
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert!(ids.iter().all(|id| MagicRef::is_registered(*id)));
+    heap.request_full_sweep();
+    heap.collect(&mut [], &mut [], 0).unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 40_000);
+}
+
 struct ExternalPayload {
     bytes: Box<[u8]>,
     _counter: DropCounter,

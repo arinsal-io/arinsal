@@ -12,6 +12,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub struct MagicRef {
     id: u64,
     restored_from_external_term: bool,
+    /// `mb->orig_size`: what the owning heap charges to its virtual binary heap.
+    orig_size: usize,
     payload: Box<dyn Any + Send + Sync>,
 }
 
@@ -35,6 +37,7 @@ impl MagicRef {
         let owner = Arc::new(Self {
             id,
             restored_from_external_term,
+            orig_size: std::mem::size_of::<T>(),
             payload: Box::new(payload),
         });
         registry()
@@ -47,6 +50,27 @@ impl MagicRef {
     /// Whether this identity has no process-local native resource owner.
     pub fn is_external_only(&self) -> bool {
         self.restored_from_external_term
+    }
+
+    /// `mb->orig_size` of the magic binary: the payload's size in bytes.
+    pub fn orig_size(&self) -> usize {
+        self.orig_size
+    }
+
+    /// The owner behind a magic reference thing's pointer word. With `clone` the thing keeps
+    /// its counted reference and the result is a new one; without it the thing's own count
+    /// moves to the result (an `erts_bin_release` when the result is dropped).
+    // Port of erts/emulator/beam/erl_bif_unique.h (ErtsMRefThing `mb`), OTP-29.1.1.
+    pub(crate) fn thing_owner(word: u64, clone: bool) -> Arc<Self> {
+        let ptr = word as *const Self;
+        // SAFETY: the pointer word of a live magic reference thing is an `Arc::into_raw`
+        // reference that the thing's off-heap list entry owns.
+        unsafe {
+            if clone {
+                Arc::increment_strong_count(ptr);
+            }
+            Arc::from_raw(ptr)
+        }
     }
 
     /// Return the reference identity used for term ordering and hashing.
