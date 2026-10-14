@@ -669,17 +669,17 @@ pub(crate) fn activate_next(h: &Handle, st: &mut State, fd: i32, kind: Kind) -> 
         }
     }
 }
-/// A select that registers for the calling process and ignores failures.
-/// Superseded by [`select_read`] and [`select_write`] (and the request queues)
+/// A select that registers for the calling process and ignores failures. The caller holds
+/// the descriptor lock and `st`, so the select is ordered against `close` and the stop
+/// callback. Superseded by [`select_read`] and [`select_write`] (and the request queues)
 /// in the send and receive paths.
-fn selected(h: &Handle, fd: i32, reference: &O, read: bool) -> O {
+fn selected(h: &Handle, st: &mut State, fd: i32, reference: &O, read: bool) -> O {
     let sres = if read {
         select_read(h, fd, None, reference)
     } else {
         select_write(h, fd, None, reference)
     };
     if sres >= 0 {
-        let mut st = h.state.lock().unwrap();
         if read {
             st.read_state |= state_bits::SELECTED;
         } else {
@@ -1724,7 +1724,11 @@ fn sendfile(args: &[O]) -> Result<O, BifError> {
         .and_then(|n| usize::try_from(n).ok())
         .ok_or(BifError::BADARG)?;
     let socket_guard = h.socket.lock().unwrap();
-    let Some(socket) = socket_guard.as_ref() else {
+    let mut st = h.state.lock().unwrap();
+    let Some(socket) = socket_guard
+        .as_ref()
+        .filter(|_| state_bits::is_open(st.write_state))
+    else {
         return Ok(error("closed"));
     };
     let mut file_guard = h.sendfile_fd.lock().unwrap();
@@ -1775,7 +1779,7 @@ fn sendfile(args: &[O]) -> Result<O, BifError> {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
                 h.counters.lock().unwrap().write_waits += 1;
-                selected(&h, socket.as_raw_fd(), reference, false);
+                selected(&h, &mut st, socket.as_raw_fd(), reference, false);
                 return Ok(pair(atom("select"), O::Int(total as i64)));
             }
             file_guard.take();
@@ -1786,7 +1790,7 @@ fn sendfile(args: &[O]) -> Result<O, BifError> {
             return Ok(ok(O::Int(total as i64)));
         }
     }
-    selected(&h, socket.as_raw_fd(), reference, false);
+    selected(&h, &mut st, socket.as_raw_fd(), reference, false);
     Ok(pair(atom("select"), O::Int(total as i64)))
 }
 const RECV_BUFFER_SIZE_MAX: usize = 16 * 1024 * 1024;
@@ -3823,6 +3827,89 @@ mod tests {
         }
         reader.join().unwrap();
         assert_eq!(invoke("nif_close", &[client]), atom("ok"));
+        assert_eq!(invoke("nif_close", &[listener]), atom("ok"));
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn sendfile_on_a_closing_socket_is_refused_without_a_select() {
+        let (_lock, reactor) = caller_reactor();
+        let listener = open_socket("inet", "stream", 6);
+        assert_eq!(
+            invoke("nif_bind", &[listener.clone(), addr("inet", 0)]),
+            atom("ok")
+        );
+        assert_eq!(
+            invoke("nif_listen", &[listener.clone(), O::Int(2)]),
+            atom("ok")
+        );
+        let bound = result(invoke("nif_sockname", std::slice::from_ref(&listener)));
+        let port = number(field(&bound, "port").unwrap()).unwrap();
+        let client = open_socket("inet", "stream", 6);
+        let connected = invoke(
+            "nif_connect",
+            &[client.clone(), test_ref(1), addr("inet", port)],
+        );
+        assert!(connected == atom("ok") || connected == atom("select"));
+        let accepted = (0..100)
+            .find_map(|_| {
+                let value = invoke("nif_accept", &[listener.clone(), O::Int(2)]);
+                if value == atom("select") {
+                    std::thread::sleep(Duration::from_millis(1));
+                    None
+                } else {
+                    Some(result(value))
+                }
+            })
+            .expect("connection was not accepted");
+        assert_eq!(
+            invoke(
+                "nif_setopt",
+                &[
+                    client.clone(),
+                    O::Int(libc::SOL_SOCKET.into()),
+                    O::Int(libc::SO_SNDBUF.into()),
+                    O::Int(4096),
+                    O::Int(0)
+                ]
+            ),
+            atom("ok")
+        );
+        let path =
+            std::env::temp_dir().join(format!("arinsal_sendfile_closing_{}", std::process::id()));
+        let bytes: Vec<u8> = (0..3_000_000).map(|n| (n % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            invoke("nif_close", std::slice::from_ref(&client)),
+            atom("ok")
+        );
+        let reference = O::Ref {
+            node: "nonode@nohost".into(),
+            creation: 0,
+            ids: vec![20],
+        };
+        let selections = reactor.pending.lock().unwrap().len();
+        let sent = invoke(
+            "nif_sendfile",
+            &[
+                client.clone(),
+                reference,
+                O::Int(0),
+                O::Int(bytes.len() as i64),
+                O::Int(file.as_raw_fd().into()),
+            ],
+        );
+        assert_eq!(sent, error("closed"));
+        assert_eq!(
+            reactor.pending.lock().unwrap().len(),
+            selections,
+            "a select was registered on a closing socket"
+        );
+        assert_eq!(
+            invoke("nif_finalize_close", std::slice::from_ref(&client)),
+            atom("ok")
+        );
+        assert_eq!(invoke("nif_close", &[accepted]), atom("ok"));
         assert_eq!(invoke("nif_close", &[listener]), atom("ok"));
         std::fs::remove_file(path).unwrap();
     }
