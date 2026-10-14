@@ -1304,6 +1304,7 @@ fn owned_signed(value: &OwnedTerm) -> Option<i64> {
 }
 
 fn internal_state_tuple_get(
+    vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     selector: Term,
@@ -1460,9 +1461,9 @@ fn internal_state_tuple_get(
                 .runtime
                 .as_ref()
                 .and_then(|runtime| {
-                    (runtime.published.lock().unwrap().contains_key(&pid)
-                        || runtime.process_alive(pid))
-                    .then(|| atom(runtime.remote_status(pid)))
+                    runtime
+                        .process_alive(pid)
+                        .then(|| atom(runtime.remote_status(pid)))
                 })
                 .unwrap_or_else(|| atom("undefined"));
             Ok(Some(status))
@@ -1478,21 +1479,8 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
-                let published = process.runtime.as_ref().and_then(|runtime| {
-                    runtime
-                        .published
-                        .lock()
-                        .unwrap()
-                        .get(&pid)
-                        .cloned()
-                        .or_else(|| {
-                            runtime
-                                .process_alive(pid)
-                                .then(crate::process::Published::empty)
-                        })
-                });
-                return match published {
-                    Some(published) => internal_link_list_from(process, &published.links).map(Some),
+                return match remote_relations(vm, ctx, pid)? {
+                    Some(relations) => internal_link_list_from(process, &relations.links).map(Some),
                     None => Ok(Some(atom("undefined"))),
                 };
             }
@@ -1509,26 +1497,11 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
-                // A live process that never changed its relations has no published slot:
-                // its lists are empty (erts reads the target's own trees).
-                let published = process.runtime.as_ref().and_then(|runtime| {
-                    runtime
-                        .published
-                        .lock()
-                        .unwrap()
-                        .get(&pid)
-                        .cloned()
-                        .or_else(|| {
-                            runtime
-                                .process_alive(pid)
-                                .then(crate::process::Published::empty)
-                        })
-                });
-                return match published {
-                    Some(published) => internal_monitor_list_from(
+                return match remote_relations(vm, ctx, pid)? {
+                    Some(relations) => internal_monitor_list_from(
                         process,
-                        &published.monitors,
-                        &published.monitored_by,
+                        &relations.monitors,
+                        &relations.monitored_by,
                     )
                     .map(Some),
                     None => Ok(Some(atom("undefined"))),
@@ -1893,26 +1866,84 @@ fn internal_monitor_list(process: &mut Process) -> Result<Term, VmError> {
     let Some(cold) = process.cold.as_ref() else {
         return Ok(Term::NIL);
     };
-    let origins = cold
-        .monitors
-        .iter()
-        .map(|(&id, half)| {
-            // The name wins over the tag, as make_monitor_list shows a registered name.
-            let extra = half
-                .data
-                .name
-                .clone()
-                .map(OwnedTerm::Atom)
-                .or_else(|| half.data.tag.clone());
-            (id, half.target, extra)
-        })
-        .collect::<Vec<_>>();
-    let targets = cold
-        .monitored_by
-        .iter()
-        .map(|(&id, half)| (id, half.origin))
-        .collect::<Vec<_>>();
-    internal_monitor_list_from(process, &origins, &targets)
+    let relations = Relations::of(cold);
+    internal_monitor_list_from(process, &relations.monitors, &relations.monitored_by)
+}
+
+/// The links and monitors of one process, copied out under its main lock.
+struct Relations {
+    links: Vec<arinsal_sched::Pid>,
+    monitors: Vec<(u64, arinsal_sched::Pid, Option<OwnedTerm>)>,
+    monitored_by: Vec<(u64, arinsal_sched::Pid)>,
+}
+
+impl Relations {
+    fn empty() -> Self {
+        Self {
+            links: Vec::new(),
+            monitors: Vec::new(),
+            monitored_by: Vec::new(),
+        }
+    }
+
+    fn of(cold: &crate::proc_create::ProcessCold) -> Self {
+        Self {
+            links: cold.links.iter().copied().collect(),
+            monitors: cold
+                .monitors
+                .iter()
+                .map(|(&id, half)| {
+                    // The name wins over the tag, as make_monitor_list shows a registered name.
+                    let extra = half
+                        .data
+                        .name
+                        .clone()
+                        .map(OwnedTerm::Atom)
+                        .or_else(|| half.data.tag.clone());
+                    (id, half.target, extra)
+                })
+                .collect(),
+            monitored_by: cold
+                .monitored_by
+                .iter()
+                .map(|(&id, half)| (id, half.origin))
+                .collect(),
+        }
+    }
+}
+
+/// The relations of another process after its incoming signals were handled by the caller.
+///
+/// Port of erts/emulator/beam/erl_bif_info.c:4626-4700 (`link_list`, `monitor_list`): erts takes
+/// the target's main lock, fetches its signals and runs `erts_proc_sig_handle_incoming` on it
+/// until all are handled or it is exiting, then reads the relations. A running target holds
+/// the lock, so the BIF yields and retries where erts waits for it.
+fn remote_relations(
+    vm: &mut Vm,
+    ctx: &mut RunCtx<'_, Message>,
+    pid: arinsal_sched::Pid,
+) -> Result<Option<Relations>, VmError> {
+    let mut relations = None;
+    let locked = ctx.with_locked_target(pid, &mut |task, target_ctx| {
+        let Some(target) = task.downcast_mut::<Process>() else {
+            return;
+        };
+        let exiting = |target: &Process| target.dirty_exiting() || target.exit_cont.is_some();
+        while !exiting(target) && !target.handle_dirty_signals(vm, target_ctx) {}
+        if !exiting(target) {
+            relations = Some(
+                target
+                    .cold
+                    .as_deref()
+                    .map_or_else(Relations::empty, Relations::of),
+            );
+        }
+    });
+    match locked {
+        Ok(()) => Ok(relations),
+        Err(arinsal_sched::SignalFreeError::NoProcess) => Ok(None),
+        Err(arinsal_sched::SignalFreeError::Busy) => Err(VmError::Yield),
+    }
 }
 
 fn internal_monitor_list_from(
@@ -1968,7 +1999,7 @@ fn internal_monitor_list_from(
 
 /// Port of erts/emulator/beam/erl_bif_info.c:4339-4947, OTP-29.1.1.
 fn internal_state_get(
-    vm: &Vm,
+    vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     selector: Term,
@@ -1976,7 +2007,7 @@ fn internal_state_get(
     if !INTERNAL_STATE.load(Ordering::Relaxed) {
         return Err(undef());
     }
-    if let Some(result) = internal_state_tuple_get(process, ctx, selector)? {
+    if let Some(result) = internal_state_tuple_get(vm, process, ctx, selector)? {
         return Ok(result);
     }
     match arg_name(selector).as_deref() {

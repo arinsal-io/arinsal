@@ -677,6 +677,9 @@ pub trait Task: Send + 'static {
 /// see [`Task::take_dirty_job`].
 pub type DirtyJob = Box<dyn FnOnce() -> Box<dyn std::any::Any>>;
 
+/// Callback run on another process's task with a context acting as it; true when done.
+pub type TargetHandler<'a, M> = dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>) -> bool + 'a;
+
 /// Outcome of [`RunCtx::handle_dirty_signals`], mirroring the results of
 /// `erts_internal:dirty_process_handle_signals/1`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -918,7 +921,6 @@ pub mod proc_flags {
     pub const REG: u32 = 1 << 7;
     pub const TRACE: u32 = 1 << 8;
     pub const TRACER: u32 = 1 << 9;
-    pub const PUBLISHED: u32 = 1 << 10;
     pub const OWNED_TIMERS: u32 = 1 << 11;
     /// A remote `process_info` / sys-task request is queued for this process
     /// (`erl_proc_sig_queue.c` request tables). Exit takes that table only then.
@@ -4009,6 +4011,12 @@ trait ContextOps<M: SignalMessage> {
         remaining: u32,
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>) -> bool,
     ) -> DirtySignals;
+    fn with_locked_target(
+        &mut self,
+        pid: Pid,
+        remaining: u32,
+        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>),
+    ) -> Result<(), SignalFreeError>;
 }
 
 impl<M: SignalMessage> RunCtx<'_, M> {
@@ -4124,6 +4132,19 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>) -> bool,
     ) -> DirtySignals {
         self.inner.handle_dirty_signals(pid, self.remaining, handle)
+    }
+    /// Run `body` with `pid`'s main lock held and a context acting as that process, as
+    /// `erts_pid2proc(.., ERTS_PROC_LOCK_MAIN, ..)` lets the caller handle another process's
+    /// signals. `Busy` means the target executes (erts would wait for the lock).
+    ///
+    /// Port of erts/emulator/beam/erl_bif_info.c:4626-4660 (`link_list` of another process),
+    /// OTP-29.1.1.
+    pub fn with_locked_target(
+        &mut self,
+        pid: Pid,
+        body: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>),
+    ) -> Result<(), SignalFreeError> {
+        self.inner.with_locked_target(pid, self.remaining, body)
     }
     /// Run one copy of `work` on every scheduler at its next scheduling point.
     pub fn request_aux_work_all(&mut self, work: impl Fn(usize) + Send + Sync + 'static) {
@@ -4518,6 +4539,47 @@ impl<T: Task> Runner<'_, T> {
     }
 }
 
+impl<T: Task> Runner<'_, T> {
+    /// Run `handle` on the task of `process`, whose cell the caller has locked, with a
+    /// context acting as that process.
+    fn run_as_target(
+        &mut self,
+        process: &Process<T>,
+        cell: &mut TaskCell<T>,
+        pid: Pid,
+        remaining: u32,
+        handle: &mut TargetHandler<'_, T::Message>,
+    ) -> bool {
+        let workers = self.inner.config.workers;
+        let simulated = self.inner.sim.is_some();
+        let TaskCell { task } = cell;
+        let mut ctx = RunCtx {
+            inner: self,
+            pid,
+            input: &process.input,
+            backlog: &process.input.backlog,
+            bound_worker: &process.bound_worker,
+            worker: None,
+            worker_count: workers,
+            remaining,
+            budget: remaining,
+            msacc_enabled: false,
+            wall_enabled: false,
+            gc_accounted_total: 0,
+            sched_type: SchedulerType::Normal,
+            user_priority: &process.user_priority,
+            active: &process.active,
+            exit_flags: &process.exit_flags,
+            sys_task_run: false,
+            dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
+            dirty_queued: process.dirty.load(Ordering::SeqCst) != 0
+                && process.dirty_runner.load(Ordering::SeqCst) == 0,
+            simulated,
+        };
+        handle(task, &mut ctx)
+    }
+}
+
 impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     fn thread_progress_later(&self, op: LaterOp) {
         thr_progress::schedule_later_op(&self.inner.progress, op);
@@ -4575,36 +4637,40 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         if let Some(result) = state(&process) {
             return result;
         }
-        let TaskCell { task } = &mut *cell;
-        let simulated = self.inner.sim.is_some();
-        let mut ctx = RunCtx {
-            inner: self,
-            pid,
-            input: &process.input,
-            backlog: &process.input.backlog,
-            bound_worker: &process.bound_worker,
-            worker: None,
-            worker_count: inner.config.workers,
-            remaining,
-            budget: remaining,
-            msacc_enabled: false,
-            wall_enabled: false,
-            gc_accounted_total: 0,
-            sched_type: SchedulerType::Normal,
-            user_priority: &process.user_priority,
-            active: &process.active,
-            exit_flags: &process.exit_flags,
-            sys_task_run: false,
-            dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
-            dirty_queued: process.dirty.load(Ordering::SeqCst) != 0
-                && process.dirty_runner.load(Ordering::SeqCst) == 0,
-            simulated,
-        };
-        if handle(task, &mut ctx) {
+        let handled = self.run_as_target(&process, &mut cell, pid, remaining, handle);
+        if handled {
             DirtySignals::Handled
         } else {
             DirtySignals::More
         }
+    }
+    fn with_locked_target(
+        &mut self,
+        pid: Pid,
+        remaining: u32,
+        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, T::Message>),
+    ) -> Result<(), SignalFreeError> {
+        let process = self
+            .inner
+            .table
+            .lookup(pid)
+            .ok_or(SignalFreeError::NoProcess)?;
+        // A dirty job runs without the main lock, so its process can be locked here too.
+        let check = |process: &Process<T>| match process.run_state().load(Ordering::SeqCst) {
+            EXITED => Err(SignalFreeError::NoProcess),
+            RUNNING if process.dirty_runner.load(Ordering::SeqCst) == 0 => {
+                Err(SignalFreeError::Busy)
+            }
+            _ => Ok(()),
+        };
+        check(&process)?;
+        let mut cell = process.cell.try_lock().map_err(|_| SignalFreeError::Busy)?;
+        check(&process)?;
+        self.run_as_target(&process, &mut cell, pid, remaining, &mut |task, ctx| {
+            handle(task, ctx);
+            true
+        });
+        Ok(())
     }
     fn deliver_sys_task(
         &mut self,

@@ -649,9 +649,6 @@ impl ProcDict {
 /// returned value.
 pub(crate) type NativeReturnEvents = (Vec<(usize, Vec<crate::trace::NativeTraceAction>)>, Term);
 
-/// A relation container that records whether it was mutated since the owner last
-/// published its relations (see `finish_run`).
-#[derive(Default)]
 /// The data of one local process monitor, shared by its origin and target halves (erts
 /// `ErtsMonitorData`, erl_monitor_link.h). It is immutable after creation, so both halves hold
 /// the same `Arc`; the pids live on the halves, as erts keeps `other.item` per half.
@@ -692,49 +689,6 @@ pub(crate) struct OriginHalf {
 pub(crate) struct TargetHalf {
     pub(crate) origin: arinsal_sched::Pid,
     pub(crate) data: std::sync::Arc<MonitorData>,
-}
-
-pub(crate) struct Tracked<T> {
-    value: T,
-    changed: bool,
-}
-
-impl<T: Default> Default for Tracked<T> {
-    fn default() -> Self {
-        Self {
-            value: T::default(),
-            changed: false,
-        }
-    }
-}
-
-impl<T> Tracked<T> {
-    /// Whether the value was mutably borrowed since the last call; clears the mark.
-    pub(crate) fn take_changed(&mut self) -> bool {
-        std::mem::take(&mut self.changed)
-    }
-}
-
-impl<T> std::ops::Deref for Tracked<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.value
-    }
-}
-
-impl<T: IntoIterator> IntoIterator for Tracked<T> {
-    type Item = T::Item;
-    type IntoIter = T::IntoIter;
-    fn into_iter(self) -> T::IntoIter {
-        self.value.into_iter()
-    }
-}
-
-impl<T> std::ops::DerefMut for Tracked<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        self.changed = true;
-        &mut self.value
-    }
 }
 
 #[derive(Default)]
@@ -896,11 +850,11 @@ pub(crate) struct ProcessCold {
     pub(crate) parent_external: Option<arinsal_etf::OwnedTerm>,
     pub(crate) receive_markers: Option<Box<receive::ReceiveMarkers>>,
     pub(crate) receive_marker_uniq: i64,
-    pub(crate) links: Tracked<std::collections::BTreeSet<arinsal_sched::Pid>>,
+    pub(crate) links: std::collections::BTreeSet<arinsal_sched::Pid>,
     /// Links created with `link/2` `[priority]` — EXIT messages from these are priority.
     pub(crate) prio_links: std::collections::BTreeSet<arinsal_sched::Pid>,
     /// Origin half of each local monitor, keyed by reference (erts `ERTS_P_MONITORS`).
-    pub(crate) monitors: Tracked<std::collections::BTreeMap<u64, OriginHalf>>,
+    pub(crate) monitors: std::collections::BTreeMap<u64, OriginHalf>,
     /// Remote-process monitors. `demonitor` of any other ref does not take the
     /// node-table lock: erts finds `ERTS_MON_TYPE_DIST_PROC` in this process's
     /// own monitor tree (`bif.c` `demonitor`), not in a global scan.
@@ -913,7 +867,7 @@ pub(crate) struct ProcessCold {
     /// every monitor kind, since the origin decides priority when it receives the DOWN.
     pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
     /// Target half of each local monitor on this process (erts `ERTS_P_LT_MONITORS`).
-    pub(crate) monitored_by: Tracked<std::collections::BTreeMap<u64, TargetHalf>>,
+    pub(crate) monitored_by: std::collections::BTreeMap<u64, TargetHalf>,
     /// Suspends this process holds on others, keyed by target (erts `ERTS_P_MONITORS` SUSPEND).
     pub(crate) suspend_monitors: std::collections::BTreeMap<
         arinsal_sched::Pid,
