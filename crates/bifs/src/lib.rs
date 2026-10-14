@@ -46,10 +46,10 @@ pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk, ProjectionStart};
 pub use maps_bifs::{maps_merge_start, maps_merge_start_on_process_heap};
 pub use pure::{
     BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, IolistSizeWalk,
-    IolistWalk, allocate_iolist_binary, atom_to_list_term, binary_bytes, bitstring_bit_len,
-    copy_binary_range, copy_bitstring_range, eval_unique_integer, finish_iolist_binary_output,
-    next_ref_id, next_unique_monotonic, singleton_bitstring, with_binary_bytes,
-    with_iolist_binary_output,
+    IolistWalk, allocate_iolist_binary, atom_to_list_term, binary_bytes, binary_part_2,
+    bitstring_bit_len, copy_binary_range, copy_bitstring_range, eval_unique_integer,
+    finish_iolist_binary_output, next_ref_id, next_unique_monotonic, singleton_bitstring,
+    with_binary_bytes, with_iolist_binary_output,
 };
 pub use time::{monotonic_time_milliseconds, monotonic_time_nanos};
 pub use unique::{
@@ -433,6 +433,18 @@ impl HeapAlloc for ProcessHeapHandle<'_> {
     }
     fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
         HeapAlloc::retain_binary(self.0, binary)
+    }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_term::OwnedBinaryRef>,
+    ) -> Result<(), arinsal_term::TermError> {
+        HeapAlloc::link_bin_ref(self.0, bin_ref, writable, overhead_words, owner)
+    }
+    fn add_bin_vheap(&mut self, words: u64) {
+        HeapAlloc::add_bin_vheap(self.0, words)
     }
     fn retain_writable_binary(
         &mut self,

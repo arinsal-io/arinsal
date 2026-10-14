@@ -24,6 +24,7 @@ mod views;
 
 mod native_code;
 
+pub use arinsal_alloc::raw::OwnedBinaryRef;
 pub use atom::{
     Atom, AtomEncoding, AtomError, AtomTable, DEFAULT_ATOM_TABLE_LIMIT, HashInfo, IndexInfo, atoms,
     global_atoms, set_atom_table_limit,

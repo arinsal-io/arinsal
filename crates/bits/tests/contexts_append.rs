@@ -7,6 +7,7 @@ use arinsal_term::{
     ProcessHeap, Term, TermBuilder, VecHeap, binary_offset_adjustment, copy_term, is_match_context,
     is_writable_binary, sub_bits_flags, to_owned, writable_capacity, writable_gc_visit,
 };
+use similar_asserts::assert_eq;
 
 fn payload(term: Term) -> (Vec<u8>, usize) {
     let owned = to_owned(term).unwrap();
@@ -151,7 +152,8 @@ fn writable_slices_survive_growth_and_force_copy_on_write() {
 #[test]
 fn gc_visits_preserve_active_writer_and_shrink_inactive_capacity() {
     let mut heap = VecHeap::new();
-    let writer = init_writable(&mut heap).unwrap();
+    let initial = init_writable(&mut heap).unwrap();
+    let writer = private_append(initial, b"x", 8, &mut heap).unwrap();
     assert_eq!(writable_capacity(writer), Some(1024));
     // SAFETY: this stopped single-process test has no live binary view.
     unsafe { writable_gc_visit(writer) };
@@ -159,7 +161,7 @@ fn gc_visits_preserve_active_writer_and_shrink_inactive_capacity() {
     // SAFETY: the writer is inactive and no view is live.
     unsafe { writable_gc_visit(writer) };
     assert!(writable_capacity(writer).unwrap() < 1024);
-    let writer = private_append(writer, b"x", 8, &mut heap).unwrap();
+    let writer = private_append(writer, b"y", 8, &mut heap).unwrap();
     // SAFETY: append finished and no view is live.
     unsafe { writable_gc_visit(writer) };
     assert!(is_writable_binary(writer));

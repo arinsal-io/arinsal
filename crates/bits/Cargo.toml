@@ -20,3 +20,4 @@ num-traits.workspace = true
 arinsal-etf.workspace = true
 arinsal-difftest.workspace = true
 proptest.workspace = true
+similar-asserts = "2"

@@ -1227,6 +1227,40 @@ impl Process {
     pub(crate) fn ensure(&mut self, words: usize, live: usize) -> Result<(), VmError> {
         self.ensure_roots(words, live, true)
     }
+    /// Ensure native code's register slice directly, copying it through `self.x` only if GC runs.
+    ///
+    /// Port of erts/emulator/beam/erl_bits.c:1769-1840 (`erts_bs_append_checked`), OTP-29.1.1.
+    pub(crate) fn ensure_native_roots(
+        &mut self,
+        words: usize,
+        registers: &mut [Term],
+        live: usize,
+    ) -> Result<(), VmError> {
+        if live > registers.len() {
+            return Err(VmError::Unsupported("live X register count".into()));
+        }
+        let allocation_words = words
+            + if self.heap.native_active() {
+                arinsal_term::S_RESERVED
+            } else {
+                0
+            };
+        if self.heap.free_words() >= allocation_words
+            && !self.heap.bin_vheap_gc_due()
+            && !gc_stress_enabled()
+        {
+            return Ok(());
+        }
+        if self.x.len() < live {
+            let mut roots = self.x.to_vec();
+            roots.resize(live, Term::NIL);
+            self.x = roots.into();
+        }
+        self.x[..live].copy_from_slice(&registers[..live]);
+        let result = self.ensure(words, live);
+        registers[..live].copy_from_slice(&self.x[..live]);
+        result
+    }
     /// Collect with `live` X roots.
     ///
     /// `clear_dead` nils registers outside that prefix after a moving

@@ -154,6 +154,15 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn retain_binary(&mut self, value: Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(value)
     }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_term::OwnedBinaryRef>,
+    ) -> Result<(), arinsal_term::TermError> {
+        HeapAlloc::link_bin_ref(self.0, bin_ref, writable, overhead_words, owner)
+    }
     fn retain_writable_binary(
         &mut self,
         value: Arc<arinsal_term::WritableBinary>,

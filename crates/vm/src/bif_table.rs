@@ -5,10 +5,29 @@
 //! branches to it with `(c_p, reg, I)`. `invoke_dispatch_bif` is not that pointer.
 
 use crate::native_helpers::{
-    atom_to_list_light, erase_1_light, get_1_light, integer_to_binary_light, make_ref_light,
-    node_light, persistent_term_get_1_light, persistent_term_get_2_light, process_flag_light,
-    put_2_light, self_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
+    atom_to_list_light, binary_part_2_light, binary_part_3_light, bit_size_light, byte_size_light,
+    erase_1_light, get_1_light, integer_to_binary_light, make_ref_light, node_light,
+    persistent_term_get_1_light, persistent_term_get_2_light, process_flag_light, put_2_light,
+    self_light, setelement_light, unique_integer_0_light, unique_integer_1_light,
 };
+
+/// Binary guards whose erts entries have dedicated BeamAsm BIF functions.
+#[derive(Clone, Copy)]
+pub(crate) enum BinaryGuard {
+    ByteSize,
+    BitSize,
+    BinaryPart,
+}
+
+pub(crate) fn binary_guard(module: &str, function: &str, arity: u8) -> Option<BinaryGuard> {
+    match (module, function, arity) {
+        ("erlang", "byte_size", 1) => Some(BinaryGuard::ByteSize),
+        ("erlang", "bit_size", 1) => Some(BinaryGuard::BitSize),
+        ("erlang", "binary_part", 2) | ("binary", "part", 2) => Some(BinaryGuard::BinaryPart),
+        ("erlang", "binary_part", 3) | ("binary", "part", 3) => Some(BinaryGuard::BinaryPart),
+        _ => None,
+    }
+}
 
 /// `bif_table[i].f` for a BIF whose body is not the shared plain/process/trap adapter.
 ///
@@ -45,6 +64,14 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
         ("erlang", "erase", 1) => erase_1_light as *const () as usize,
         ("erlang", "atom_to_list", 1) => atom_to_list_light as *const () as usize,
         ("erlang", "integer_to_binary", 1) => integer_to_binary_light as *const () as usize,
+        ("erlang", "byte_size", 1) => byte_size_light as *const () as usize,
+        ("erlang", "bit_size", 1) => bit_size_light as *const () as usize,
+        ("erlang", "binary_part", 2) | ("binary", "part", 2) => {
+            binary_part_2_light as *const () as usize
+        }
+        ("erlang", "binary_part", 3) | ("binary", "part", 3) => {
+            binary_part_3_light as *const () as usize
+        }
         ("erlang", "setelement", 3) => setelement_light as *const () as usize,
         ("erlang", "make_ref", 0) => make_ref_light as *const () as usize,
         ("erlang", "unique_integer", 0) => unique_integer_0_light as *const () as usize,
@@ -62,17 +89,38 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
 
 /// The light entry of a trapping BIF with its own body, compiled when the export is created.
 pub(crate) fn trap_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
-    use crate::bif_traps::{MapsFromList, MapsKeys, MapsMerge, MapsValues};
+    use crate::bif_traps::{
+        IolistSize, IolistToBinary, ListToBinary, MapsFromList, MapsKeys, MapsMerge, MapsValues,
+    };
     use crate::native_helpers::trap_bif_entry;
+    if module == "erlang" && function == "binary_to_list" && matches!(arity, 1 | 3) {
+        return arinsal_bifs::visit_bif(module, function, arity, &mut BinaryToListEntry);
+    }
     let func = match (module, function, arity) {
         ("maps", "keys", 1) => trap_bif_entry::<MapsKeys> as *const () as usize,
         ("maps", "values", 1) => trap_bif_entry::<MapsValues> as *const () as usize,
         ("maps", "merge", 2) => trap_bif_entry::<MapsMerge> as *const () as usize,
         ("maps", "from_list", 1) => trap_bif_entry::<MapsFromList> as *const () as usize,
+        ("erlang", "list_to_binary", 1) | ("binary", "list_to_bin", 1) => {
+            trap_bif_entry::<ListToBinary> as *const () as usize
+        }
+        ("erlang", "iolist_to_binary", 1) => trap_bif_entry::<IolistToBinary> as *const () as usize,
+        ("erlang", "iolist_size", 1) => trap_bif_entry::<IolistSize> as *const () as usize,
         ("lists", "reverse", 2) => crate::native_helpers::list_reverse_entry as *const () as usize,
         _ => return None,
     };
     Some(func)
+}
+
+struct BinaryToListEntry;
+
+impl arinsal_bifs::BifTableVisitor for BinaryToListEntry {
+    type Output = usize;
+
+    fn entry<B: arinsal_bifs::BifBody>(&mut self) -> Self::Output {
+        crate::native_helpers::trap_bif_entry::<crate::bif_traps::BinaryToList<B>> as *const ()
+            as usize
+    }
 }
 
 /// The entries compiled for one BIF of `arinsal_bifs`: its body is inlined into
@@ -120,7 +168,7 @@ impl arinsal_bifs::BifTableVisitor for Compile {
 
 #[cfg(test)]
 mod tests {
-    use super::entry;
+    use super::{entry, trap_entry};
 
     #[test]
     fn every_bif_of_arinsal_bifs_has_its_own_entry() {
@@ -131,8 +179,31 @@ mod tests {
         // Arities that share one body share its entry.
         let node0 = entry("erlang", "node", 0).expect("node/0");
         let node1 = entry("erlang", "node", 1).expect("node/1");
-        assert_eq!(node0.plain, node1.plain);
+        similar_asserts::assert_eq!(node0.plain, node1.plain);
         assert!(entry("erlang", "no_such_bif", 1).is_none());
         assert!(entry("lists", "keyfind", 2).is_none());
+    }
+
+    #[test]
+    fn binary_conversions_have_dedicated_trap_entries() {
+        let binary_to_list = trap_entry("erlang", "binary_to_list", 1).unwrap();
+        similar_asserts::assert_eq!(
+            binary_to_list,
+            trap_entry("erlang", "binary_to_list", 3).unwrap()
+        );
+        let list_to_binary = trap_entry("erlang", "list_to_binary", 1).unwrap();
+        similar_asserts::assert_eq!(
+            list_to_binary,
+            trap_entry("binary", "list_to_bin", 1).unwrap()
+        );
+        assert_ne!(
+            list_to_binary,
+            trap_entry("erlang", "iolist_size", 1).unwrap()
+        );
+        assert_ne!(
+            list_to_binary,
+            trap_entry("erlang", "iolist_to_binary", 1).unwrap()
+        );
+        assert!(trap_entry("erlang", "not_a_binary_bif", 1).is_none());
     }
 }

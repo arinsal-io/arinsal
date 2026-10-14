@@ -1609,6 +1609,15 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapAdapter<'_, H> {
     fn retain_binary(&mut self, binary: std::sync::Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(binary);
     }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_term::OwnedBinaryRef>,
+    ) -> Result<(), arinsal_term::TermError> {
+        HeapAlloc::link_bin_ref(self.0, bin_ref, writable, overhead_words, owner)
+    }
     fn retain_node(&mut self, node: std::sync::Arc<arinsal_term::Node>) {
         self.0.retain_node(node);
     }

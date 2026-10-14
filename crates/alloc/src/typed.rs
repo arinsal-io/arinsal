@@ -4,6 +4,7 @@ use crate::alloc_util::AllocError;
 use crate::instances::{InstanceAllocation, ThreadSpecificAllocators};
 use crate::raw::WordView;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 
 /// An ERTS allocation type name from `erl_alloc.types`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -67,6 +68,305 @@ pub struct AllocBlock {
     // None for zero-word blocks: erts never allocates an absent old heap or empty fragment.
     handle: Option<InstanceAllocation>,
     allocators: &'static ThreadSpecificAllocators,
+}
+
+/// One erts `Binary` allocation with its allocator handle stored in a private prefix.
+/// Cloning adjusts the binary header's reference count; no Rust control block is allocated.
+pub struct BinaryBlock {
+    memory: WordView,
+    allocators: &'static ThreadSpecificAllocators,
+    owned: bool,
+}
+
+impl BinaryBlock {
+    const PREFIX_WORDS: usize = 4;
+    const HEADER_WORDS: usize = 4;
+
+    /// Allocate one binary header and byte payload from the `BINARY` allocator.
+    pub fn new(size: usize, flags: u64, apparent_size: usize) -> Result<Self, AllocError> {
+        let payload_words = size.div_ceil(std::mem::size_of::<u64>());
+        let words = Self::PREFIX_WORDS
+            .checked_add(Self::HEADER_WORDS)
+            .and_then(|header| header.checked_add(payload_words))
+            .ok_or(AllocError::OutOfBounds)?;
+        let bytes = words
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(AllocError::OutOfBounds)?;
+        let mut allocation = AllocBlock::new(ErtsAlcType::BINARY, words)?;
+        let handle = allocation.handle.ok_or(AllocError::InvalidAllocation)?;
+        let memory = &mut allocation.memory;
+        for (index, value) in [
+            handle.instance() as u64,
+            handle.allocation_id(),
+            bytes as u64,
+            words as u64,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            memory.write_word(index, value);
+        }
+        for (index, value) in [flags, apparent_size as u64, 1, size as u64]
+            .into_iter()
+            .enumerate()
+        {
+            memory.write_word(Self::PREFIX_WORDS + index, value);
+        }
+        let allocators = allocation.allocators;
+        let memory = WordView::new(allocation.memory.as_mut_ptr(), allocation.memory.len());
+        allocation.handle = None;
+        Ok(Self {
+            memory,
+            allocators,
+            owned: true,
+        })
+    }
+
+    /// Create one owning handle for a live binary view.
+    pub fn clone_from_view(view: crate::raw::BinaryView<'_>) -> Result<Self, AllocError> {
+        let allocators = allocator_for(ErtsAlcType::BINARY)?;
+        let previous = view
+            .fetch_add(2, 1, Ordering::Relaxed)
+            .ok_or(AllocError::Corrupt)?;
+        if previous == 0 || previous == u64::MAX {
+            view.fetch_sub(2, 1, Ordering::Relaxed);
+            return Err(AllocError::Corrupt);
+        }
+        let header = view.header_ptr().wrapping_sub(Self::PREFIX_WORDS);
+        let words = Self::PREFIX_WORDS
+            .checked_add(view.allocation_words())
+            .ok_or(AllocError::OutOfBounds)?;
+        // The source view is bounded by a live Binary allocation.
+        let memory = WordView::new(header.cast_mut(), words);
+        Ok(Self {
+            memory,
+            allocators,
+            owned: true,
+        })
+    }
+
+    /// Borrow a live binary through its header without changing the erts refcount.
+    pub fn borrow_from_view(view: crate::raw::BinaryView<'_>) -> Result<Self, AllocError> {
+        let allocators = allocator_for(ErtsAlcType::BINARY)?;
+        let words = Self::PREFIX_WORDS
+            .checked_add(view.allocation_words())
+            .ok_or(AllocError::OutOfBounds)?;
+        let header = view.header_ptr().wrapping_sub(Self::PREFIX_WORDS);
+        Ok(Self {
+            memory: WordView::new(header.cast_mut(), words),
+            allocators,
+            owned: false,
+        })
+    }
+
+    /// Release one Binary reference after its BinRef is swept.
+    pub fn release_view(view: crate::raw::BinaryView<'_>) -> Result<(), AllocError> {
+        let mut handle = Self::borrow_from_view(view)?;
+        handle.owned = true;
+        drop(handle);
+        Ok(())
+    }
+
+    /// Transfer this reference to a heap BinRef without decrementing its refcount.
+    pub fn into_raw(mut self) -> *const u64 {
+        self.owned = false;
+        self.header_ptr()
+    }
+
+    /// Relinquish this handle to the owning BinRef and return its Binary header.
+    pub fn disarm(&mut self) -> *const u64 {
+        self.owned = false;
+        self.header_ptr()
+    }
+
+    /// A shared view of the binary payload.
+    pub fn bytes(&self) -> &[u8] {
+        let size = self
+            .memory
+            .atomic_load(Self::PREFIX_WORDS + 3, Ordering::Relaxed)
+            .unwrap() as usize;
+        let begin = (Self::PREFIX_WORDS + Self::HEADER_WORDS) * std::mem::size_of::<u64>();
+        &self.memory.bytes()[begin..begin + size]
+    }
+
+    /// Address of the four-word binary header.
+    pub fn as_ptr(&self) -> *const u64 {
+        self.header_ptr()
+    }
+
+    /// Mutable address of the four-word binary header.
+    pub fn as_mut_ptr(&mut self) -> *mut u64 {
+        self.memory.as_mut_ptr().wrapping_add(Self::PREFIX_WORDS)
+    }
+
+    /// Header words followed by the payload capacity.
+    pub fn as_slice(&self) -> &[u64] {
+        &self.memory.as_slice()[Self::PREFIX_WORDS..]
+    }
+
+    /// Mutably borrow header words and payload capacity.
+    pub fn as_mut_slice(&mut self) -> &mut [u64] {
+        &mut self.memory.as_mut_slice()[Self::PREFIX_WORDS..]
+    }
+
+    /// Borrow the erts header and payload view.
+    pub fn view(&self) -> crate::raw::BinaryView<'_> {
+        self.memory
+            .binary_view_at(Self::PREFIX_WORDS)
+            .expect("binary allocation includes its header")
+    }
+
+    /// Transfer this Binary reference from the allocator handle to its BinRef.
+    pub fn into_reference(mut self) -> crate::raw::OwnedBinaryRef {
+        let owner = crate::raw::OwnedBinaryRef::from_owned_view(self.view());
+        self.owned = false;
+        owner
+    }
+
+    /// A shared view of the reserved payload capacity.
+    pub fn capacity_bytes(&self) -> &[u8] {
+        let size = self
+            .memory
+            .atomic_load(Self::PREFIX_WORDS + 3, Ordering::Relaxed)
+            .unwrap() as usize;
+        let begin = (Self::PREFIX_WORDS + Self::HEADER_WORDS) * std::mem::size_of::<u64>();
+        &self.memory.bytes()[begin..begin + size]
+    }
+
+    /// Exclusive payload view when this is the sole owning reference.
+    pub fn bytes_mut_unique(&mut self) -> Option<&mut [u8]> {
+        if self.reference_count() != 1 {
+            return None;
+        }
+        let size = self
+            .memory
+            .atomic_load(Self::PREFIX_WORDS + 3, Ordering::Relaxed)? as usize;
+        let begin = (Self::PREFIX_WORDS + Self::HEADER_WORDS) * std::mem::size_of::<u64>();
+        Some(&mut self.memory.bytes_mut()[begin..begin + size])
+    }
+
+    /// Current payload size recorded in the binary header.
+    pub fn size(&self) -> usize {
+        self.memory
+            .atomic_load(Self::PREFIX_WORDS + 3, Ordering::Relaxed)
+            .unwrap() as usize
+    }
+
+    /// ERTS apparent size recorded in the binary header.
+    pub fn apparent_size(&self) -> usize {
+        self.memory
+            .atomic_load(Self::PREFIX_WORDS + 1, Ordering::Relaxed)
+            .unwrap() as usize
+    }
+
+    /// Set the ERTS apparent size in bytes.
+    pub fn set_apparent_size(&self, size: usize) {
+        self.memory
+            .atomic_store(Self::PREFIX_WORDS + 1, size as u64, Ordering::Relaxed);
+    }
+
+    /// Binary flag word.
+    pub fn flags(&self) -> u64 {
+        self.memory
+            .atomic_load(Self::PREFIX_WORDS, Ordering::Relaxed)
+            .unwrap()
+    }
+
+    /// Replace the binary flag word.
+    pub fn set_flags(&self, flags: u64) {
+        self.memory
+            .atomic_store(Self::PREFIX_WORDS, flags, Ordering::Relaxed);
+    }
+
+    /// Atomically set binary flags.
+    pub fn set_flag_bits(&self, flags: u64) {
+        self.memory
+            .atomic_fetch_or(Self::PREFIX_WORDS, flags, Ordering::Relaxed);
+    }
+
+    /// Atomically clear binary flags.
+    pub fn clear_flag_bits(&self, flags: u64) {
+        self.memory
+            .atomic_fetch_and(Self::PREFIX_WORDS, !flags, Ordering::Relaxed);
+    }
+
+    /// Refcount stored in the binary header.
+    pub fn reference_count(&self) -> u64 {
+        self.memory
+            .atomic_load(Self::PREFIX_WORDS + 2, Ordering::Relaxed)
+            .unwrap()
+    }
+
+    /// Address of the erts `Binary` header.
+    pub fn header_ptr(&self) -> *const u64 {
+        self.memory.as_ptr().wrapping_add(Self::PREFIX_WORDS)
+    }
+
+    /// Resize the single allocation while this is its unique owner.
+    pub fn realloc(&mut self, size: usize) -> Result<(), AllocError> {
+        if self.reference_count() != 1 {
+            return Err(AllocError::Corrupt);
+        }
+        let words = Self::PREFIX_WORDS
+            .checked_add(Self::HEADER_WORDS)
+            .and_then(|header| header.checked_add(size.div_ceil(std::mem::size_of::<u64>())))
+            .ok_or(AllocError::OutOfBounds)?;
+        let bytes = words
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(AllocError::OutOfBounds)?;
+        let old = InstanceAllocation::from_parts(
+            self.memory.read_word(0).ok_or(AllocError::Corrupt)? as usize,
+            self.memory.read_word(1).ok_or(AllocError::Corrupt)?,
+            self.memory.read_word(2).ok_or(AllocError::Corrupt)? as usize,
+        );
+        let (handle, ptr) = self.allocators.realloc_with_ptr(old, bytes)?;
+        self.memory.reset(ptr, words);
+        self.memory.write_word(0, handle.instance() as u64);
+        self.memory.write_word(1, handle.allocation_id());
+        self.memory.write_word(2, bytes as u64);
+        self.memory.write_word(3, words as u64);
+        self.memory
+            .atomic_store(Self::PREFIX_WORDS + 3, size as u64, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl Clone for BinaryBlock {
+    fn clone(&self) -> Self {
+        let old = self
+            .memory
+            .atomic_fetch_add(Self::PREFIX_WORDS + 2, 1, Ordering::Relaxed)
+            .expect("live binary refcount header");
+        assert!(old > 0 && old < u64::MAX, "binary refcount overflow");
+        Self {
+            memory: WordView::new(self.memory.as_ptr().cast_mut(), self.memory.len()),
+            allocators: self.allocators,
+            owned: true,
+        }
+    }
+}
+
+impl Drop for BinaryBlock {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        let Some(previous) =
+            self.memory
+                .atomic_fetch_sub(Self::PREFIX_WORDS + 2, 1, Ordering::Relaxed)
+        else {
+            return;
+        };
+        if previous != 1 {
+            return;
+        }
+        let handle = InstanceAllocation::from_parts(
+            self.memory.read_word(0).unwrap() as usize,
+            self.memory.read_word(1).unwrap(),
+            self.memory.read_word(2).unwrap() as usize,
+        );
+        let _ = self.allocators.free(handle);
+    }
 }
 
 impl AllocBlock {

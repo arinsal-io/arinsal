@@ -792,10 +792,6 @@ fn list_to_bitstring(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (erts_binary_part), OTP-29.1.1.
 fn binary_part(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bits = bitstring_bit_len(args[0])?;
-    if !bits.is_multiple_of(8) {
-        return Err(BADARG);
-    }
     let (mut position, mut length) = if args.len() == 2 {
         if tuple_arity(args[1])? != 2 {
             return Err(BADARG);
@@ -817,13 +813,32 @@ fn binary_part(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         }
         position -= length;
     }
-    let end = position.checked_add(length).ok_or(BADARG)?;
-    if position < 0 || length < 0 || end > (bits / 8) as i64 {
+    if position < 0 || length < 0 || position.checked_add(length).is_none() {
         return Err(BADARG);
     }
+    let start_bits = usize::try_from(position)
+        .ok()
+        .and_then(|value| value.checked_mul(8))
+        .ok_or(BADARG)?;
+    let length_bits = usize::try_from(length)
+        .ok()
+        .and_then(|value| value.checked_mul(8))
+        .ok_or(BADARG)?;
     TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .sub_binary(args[0], position as usize * 8, length as usize * 8)
-        .map_err(|_| BifError::SystemLimit)
+        .sub_binary_bif(args[0], start_bits, length_bits)
+        .map_err(|error| match error {
+            arinsal_term::TermError::BadArg => BADARG,
+            _ => BifError::SystemLimit,
+        })
+}
+
+/// Execute the tuple-range form of `binary:part/2` without resolving the BIF name again.
+// Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (`erts_binary_part`), OTP-29.1.1.
+pub fn binary_part_2(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    if args.len() != 2 {
+        return Err(BADARG);
+    }
+    binary_part(ctx, args)
 }
 
 // Port of erts/emulator/beam/binary.c:476-513 (split_binary_2), OTP-29.1.1.
@@ -837,10 +852,10 @@ fn split_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let mut heap = Heap(&mut ctx.heap);
     let mut builder = TermBuilder::new(&mut heap);
     let left = builder
-        .sub_binary(args[0], 0, split_at)
+        .sub_binary_bif(args[0], 0, split_at)
         .map_err(|_| BifError::SystemLimit)?;
     let right = builder
-        .sub_binary(args[0], split_at, bits - split_at)
+        .sub_binary_bif(args[0], split_at, bits - split_at)
         .map_err(|_| BifError::SystemLimit)?;
     builder
         .tuple(&[left, right])
@@ -899,18 +914,19 @@ fn binary_copy(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if length > (1 << 30) {
         return Err(BifError::SystemLimit);
     }
-    write_binary(ctx, length, |output| {
-        with_binary_input(args[0], |source| {
-            let mut copied = 0;
-            while copied < length {
-                let source_offset = copied % source_len;
-                let stride = (length - copied).min(source_len - source_offset);
-                output[copied..copied + stride]
-                    .copy_from_slice(&source[source_offset..source_offset + stride]);
-                copied += stride;
-            }
-            Ok(())
-        })
+    with_binary_input(args[0], |source| {
+        TermBuilder::new(&mut Heap(&mut ctx.heap))
+            .binary_from_fn(length, |output| {
+                let mut copied = 0;
+                while copied < length {
+                    let source_offset = copied % source_len;
+                    let stride = (length - copied).min(source_len - source_offset);
+                    output[copied..copied + stride]
+                        .copy_from_slice(&source[source_offset..source_offset + stride]);
+                    copied += stride;
+                }
+            })
+            .map_err(|_| BifError::SystemLimit)
     })
 }
 
@@ -1175,7 +1191,7 @@ impl BinarySearchWalk {
                         .into_iter()
                         .map(|(start, length)| {
                             builder
-                                .sub_binary(self.subject, start * 8, length * 8)
+                                .sub_binary_bif(self.subject, start * 8, length * 8)
                                 .map_err(|_| BifError::SystemLimit)
                         })
                         .collect::<Result<Vec<_>, _>>()?

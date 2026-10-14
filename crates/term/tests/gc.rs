@@ -1,7 +1,8 @@
 use arinsal_term::{
     ExportEntry, FunEntry, HeapAlloc, Node, ProcessHeap, S_REDZONE, S_RESERVED, Term, TermBuilder,
-    VecHeap, copy_term, exact_eq, global_atoms, make_hash2, match_position, set_match_position,
-    size_object, to_owned, writable_bytes_mut, writable_capacity, writable_extend_private,
+    VecHeap, binary_memory_bytes, copy_term, exact_eq, global_atoms, make_hash2, match_position,
+    set_match_position, size_object, to_owned, writable_bytes_mut, writable_capacity,
+    writable_extend_private,
 };
 use arinsal_term::{ExternalBinary, MagicRef};
 use similar_asserts::assert_eq;
@@ -74,6 +75,33 @@ fn adopted_message_keeps_term_and_off_heap_owner_through_gc() {
     drop(source);
     assert_eq!(receiver.off_heap_count(), 1);
     let mut roots = [copied];
+    receiver.collect(&mut roots, &mut [], 0).unwrap();
+    assert_eq!(receiver.off_heap_count(), 1);
+    assert_eq!(to_owned(roots[0]).unwrap(), expected);
+}
+
+#[test]
+fn gc_rebases_message_binary_chains_before_releasing_fragments() {
+    let mut message_heap = ProcessHeap::with_words(128);
+    let payload = vec![0x5a; 100];
+    let binary = TermBuilder::new(&mut message_heap)
+        .binary(&payload)
+        .unwrap();
+    let message = TermBuilder::new(&mut message_heap)
+        .tuple(&[binary])
+        .unwrap();
+    let expected = to_owned(message).unwrap();
+
+    let mut receiver = ProcessHeap::with_words(256);
+    let mut messages = [(message, Some(message_heap))];
+    receiver
+        .collect_with_messages(&mut [], &mut [], 0, &mut messages)
+        .unwrap();
+    assert!(messages[0].1.is_none());
+    assert_eq!(receiver.off_heap_count(), 1);
+    assert_eq!(to_owned(messages[0].0).unwrap(), expected);
+
+    let mut roots = [messages[0].0];
     receiver.collect(&mut roots, &mut [], 0).unwrap();
     assert_eq!(receiver.off_heap_count(), 1);
     assert_eq!(to_owned(roots[0]).unwrap(), expected);
@@ -425,17 +453,11 @@ fn owner_arcs_are_released_when_unreachable() {
     let _export = TermBuilder::new(&mut heap)
         .export_fun(export.clone())
         .unwrap();
-    let binary = TermBuilder::new(&mut heap).binary(&[9; 100]).unwrap();
-    // SAFETY: the live SUB_BITS points to a live BinRef with an Arc<Vec<u8>> owner.
-    let owner = unsafe {
-        let bin_ref = (*binary.raw_ptr().add(4) & !7) as *const u64;
-        let ptr = *bin_ref.add(1) as *const Vec<u8>;
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
-    };
-    assert_eq!(Arc::strong_count(&owner), 2);
+    let binary_bytes_before = binary_memory_bytes();
+    let _binary = TermBuilder::new(&mut heap).binary(&[9; 100]).unwrap();
+    assert!(binary_memory_bytes() > binary_bytes_before);
     heap.collect(&mut [], &mut [], 0).unwrap();
-    assert_eq!(Arc::strong_count(&owner), 1);
+    assert_eq!(binary_memory_bytes(), binary_bytes_before);
     assert_eq!(Arc::strong_count(&node), 1);
     assert_eq!(Arc::strong_count(&fun), 1);
     assert_eq!(Arc::strong_count(&export), 1);
@@ -444,27 +466,20 @@ fn owner_arcs_are_released_when_unreachable() {
 #[test]
 fn shared_writable_owner_is_retained_once_and_then_released() {
     let mut heap = ProcessHeap::with_words(256);
+    let binary_bytes_before = binary_memory_bytes();
     let writable = TermBuilder::new(&mut heap)
         .writable_binary(&[5; 100], 800, 1_024)
         .unwrap();
     let sub = TermBuilder::new(&mut heap)
         .sub_binary(writable, 8, 400)
         .unwrap();
-    // SAFETY: a live writable SUB_BITS points to a live BinRef with an
-    // Arc<WritableBinary> owner retained by the process heap.
-    let owner = unsafe {
-        let bin_ref = (*writable.raw_ptr().add(4) & !7) as *const u64;
-        let ptr = *bin_ref.add(1) as *const arinsal_term::WritableBinary;
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
-    };
-    assert_eq!(Arc::strong_count(&owner), 3);
     let mut roots = [writable, sub];
     heap.collect(&mut roots, &mut [], 0).unwrap();
-    assert_eq!(heap.off_heap_count(), 1);
-    assert_eq!(Arc::strong_count(&owner), 2);
+    let binary_info = heap.off_heap_binary_info();
+    assert_eq!(binary_info.len(), 2);
+    assert!(binary_info.iter().all(|entry| entry.2 == 2));
     heap.collect(&mut [], &mut [], 0).unwrap();
-    assert_eq!(Arc::strong_count(&owner), 1);
+    assert_eq!(binary_memory_bytes(), binary_bytes_before);
 }
 
 #[test]

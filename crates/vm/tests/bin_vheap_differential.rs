@@ -3,12 +3,13 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_vm::Vm;
+use similar_asserts::assert_eq;
 
 const MODULE: &str = "bin_vheap_differential";
 const SOURCE: &str = r#"
 -module(bin_vheap_differential).
 -export([minimum/0, flag/0, gc_info/0, spawn_minimum/0, spawn_minimum_only/0,
-         allocation_gc/0, private_append_info/0]).
+         allocation_gc/0, private_append_info/0, message_binary/0]).
 minimum() -> {erlang:system_info(min_bin_vheap_size), process_info(self(), min_bin_vheap_size)}.
 flag() -> Old=process_flag(min_bin_vheap_size, 80000), {Old,process_info(self(), min_bin_vheap_size)}.
 gc_info() ->
@@ -58,6 +59,39 @@ private_append_info() ->
                  [{K,proplists:get_value(K,I)} || K <- Keys]}}
     end,[{min_heap_size,233}]),
     receive {private_append_info,Info} -> Info end.
+message_binary() ->
+    Parent=self(),
+    MessageInfo=fun() ->
+        {binary,Binaries}=process_info(self(),binary),
+        [{BinarySize,RefCount} || {_Address,BinarySize,RefCount} <- Binaries]
+    end,
+    Receiver=spawn_opt(fun() ->
+        process_flag(message_queue_data,on_heap),
+        Parent!ready,
+        receive gc ->
+            QueuedInfo=MessageInfo(),
+            true=erlang:garbage_collect(),
+            CollectedInfo=MessageInfo(),
+            Parent!{collected,QueuedInfo,CollectedInfo}
+        end,
+        receive {payload,Bin} ->
+            Size=byte_size(Bin),
+            Referenced=binary:referenced_byte_size(Bin),
+            ReceivedInfo=MessageInfo(),
+            true=erlang:garbage_collect(),
+            PostGcInfo=MessageInfo(),
+            Parent!{message_binary,Size,Referenced,ReceivedInfo,PostGcInfo}
+        end
+    end,[{min_heap_size,233}]),
+    receive ready -> ok end,
+    Base=binary:copy(<<7>>,4096),
+    Bin=binary:part(Base,10,128),
+    Receiver!{payload,Bin},
+    Receiver!gc,
+    receive {collected,QueuedInfo,CollectedInfo} -> ok end,
+    receive {message_binary,Size,Referenced,ReceivedInfo,PostGcInfo} ->
+        {Size,Referenced,QueuedInfo,CollectedInfo,ReceivedInfo,PostGcInfo}
+    end.
 append_loop(0,Acc) -> Acc;
 append_loop(N,Acc) -> append_loop(N-1,<<Acc/binary,N:8>>).
 "#;
@@ -145,4 +179,13 @@ fn private_append_fragment_and_vheap_counters_match_otp() {
         panic!("expected binary append info tuple: {value:?}");
     };
     assert_eq!(fields.len(), 4);
+}
+
+#[test]
+fn queued_binary_fragment_gc_matches_otp() {
+    let value = assert_equal("message_binary");
+    let OwnedTerm::Tuple(fields) = &value else {
+        panic!("expected queued binary info: {value:?}");
+    };
+    assert_eq!(fields.len(), 6);
 }
