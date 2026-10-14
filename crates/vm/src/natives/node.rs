@@ -166,12 +166,12 @@ pub(crate) fn node(term: Term) -> Result<Term, VmError> {
         | arinsal_term::Identity::Port { node, .. }
         | arinsal_term::Identity::Ref { node, .. } => node,
     };
-    let local_name = node_tables::lock().local_name.clone();
-    if name == arinsal_term::atoms::NONAME && local_name != "nonode@nohost" {
-        Ok(Term::atom(global_atoms().intern(&local_name).unwrap()))
-    } else {
-        Ok(Term::atom(name))
+    if name == arinsal_term::atoms::NONAME {
+        // A local pid carries the placeholder node; the local node name is published as an
+        // atom word by `setnode/2`, so no table lock or name copy is needed.
+        return Ok(local_node_term());
     }
+    Ok(Term::atom(name))
 }
 
 fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Term, VmError> {
@@ -390,9 +390,11 @@ fn monitor_options(options: Option<Term>) -> Result<(), VmError> {
 }
 
 fn local_node_term() -> Term {
-    let tables = node_tables::lock();
-    let (name, _creation) = tables.local_identity();
-    Term::atom(global_atoms().intern(name).unwrap())
+    // Port of erts/emulator/beam/dist.c:6217 and bif.c (node_0, `erts_this_node->sysname`),
+    // OTP-29.1.1: the word `setnode/2` publishes, read without the node table lock.
+    crate::native_hooks::from_raw(
+        node_tables::this_node_sysname().load(std::sync::atomic::Ordering::Acquire),
+    )
 }
 
 /// `erlang:node/0`. The light-BIF pointer calls this; it does not enter the executor.
@@ -618,6 +620,24 @@ port_node() -> P = open_port({spawn, "true"}, []), N = node(P), port_close(P), N
 safe(F) -> try F() catch error:badarg -> badarg end.
 badarg(F) -> try F() of _ -> unexpected catch error:badarg -> badarg end.
 "#;
+
+    #[test]
+    fn node_of_a_local_pid_does_not_wait_for_the_node_table_lock() {
+        let pid = arinsal_term::Term::pid(1, 0).expect("pid in range");
+        let _ = crate::node_tables::this_node_sysname();
+        let held = crate::node_tables::lock();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(super::node(pid).map(|node| node.tagged_word()).ok());
+        });
+        let answer = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        worker.join().unwrap();
+        assert!(
+            matches!(answer, Ok(Some(_))),
+            "node/1 blocked on the node table lock"
+        );
+    }
 
     #[test]
     fn node_distribution_bifs_match_otp_29_on_scheduler() {

@@ -390,6 +390,24 @@ pub fn proper_list_terms(term: Term) -> Option<Vec<Term>> {
     list(term).ok()
 }
 
+/// Visit the elements of a proper list in order without collecting them. A non-list or an
+/// improper list is `badarg`, after the elements before the bad tail were visited.
+pub fn for_each_list_term(
+    term: Term,
+    visit: impl FnMut(Term) -> Result<(), BifError>,
+) -> Result<(), BifError> {
+    for_each_cons(term, visit)
+}
+
+/// The two elements of a 2-tuple, `None` for any other term.
+pub fn tuple_pair(term: Term) -> Option<(Term, Term)> {
+    let view = tuple_view(&term).ok()?;
+    if view.len() != 2 {
+        return None;
+    }
+    Some((view.element(0)?, view.element(1)?))
+}
+
 /// The elements of a tuple, `None` for any other term.
 pub fn tuple_terms(term: Term) -> Option<Vec<Term>> {
     let view = tuple_view(&term).ok()?;

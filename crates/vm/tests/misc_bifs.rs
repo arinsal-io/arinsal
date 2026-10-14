@@ -240,6 +240,40 @@ fn misc_bifs_decode_packet_and_dflag_match_erts() {
 }
 
 #[test]
+fn misc_bifs_decode_packet_errors_options_and_more_match_erts() {
+    let _ = global_atoms();
+    compare(
+        r#"-module(misc_bifs_packet_err). -export([run/0]).
+        run() ->
+            [t(fun() -> erlang:decode_packet(4, <<0,0,0,5,1>>, []) end),
+             t(fun() -> erlang:decode_packet(4, <<0,0>>, []) end),
+             t(fun() -> erlang:decode_packet(4, <<0,0,0,5,"hello">>, [{packet_size, 4}]) end),
+             t(fun() -> erlang:decode_packet(4, <<0,0,0,5,"hello">>, [{packet_size, 5}]) end),
+             t(fun() -> erlang:decode_packet(2, <<0,5,"hello","rest">>, [{packet_size, 0}]) end),
+             t(fun() -> erlang:decode_packet(1, <<5,"hello">>, [{line_length, 3}]) end),
+             t(fun() -> erlang:decode_packet(line, <<"ab\ncd">>, [{line_delimiter, $b}]) end),
+             t(fun() -> erlang:decode_packet(line, <<"abc">>, [{line_delimiter, 300}]) end),
+             t(fun() -> erlang:decode_packet(line, <<"abcdef">>, [{line_length, 3}]) end),
+             t(fun() -> erlang:decode_packet(not_a_type, <<>>, []) end),
+             t(fun() -> erlang:decode_packet(5, <<>>, []) end),
+             t(fun() -> erlang:decode_packet(4, <<>>, [bad]) end),
+             t(fun() -> erlang:decode_packet(4, <<>>, [{packet_size, -1}]) end),
+             t(fun() -> erlang:decode_packet(4, <<>>, [{unknown, 1}]) end),
+             t(fun() -> erlang:decode_packet(4, <<>>, [{packet_size, 1} | tail]) end),
+             t(fun() -> erlang:decode_packet(4, <<>>, not_a_list) end),
+             t(fun() -> erlang:decode_packet(4, <<1:3>>, []) end),
+             t(fun() -> erlang:decode_packet(4, not_a_binary, []) end),
+             t(fun() -> erlang:decode_packet(http, <<"GET / HTTP/1.1\r\nHost: x\r\n\r\n">>, []) end),
+             t(fun() -> erlang:decode_packet(httph_bin, <<"Host: x\r\n\r\n">>, []) end),
+             t(fun() -> erlang:decode_packet(ssl_tls, <<22,3,1,0,2,9,9>>, []) end),
+             t(fun() -> erlang:decode_packet(4, <<7:4, 0:4, 0:24, 3:8, "abc">>, []) end)].
+        t(F) -> try F() catch C:R -> {C, R} end."#,
+        "misc_bifs_packet_err",
+        "run",
+    );
+}
+
+#[test]
 fn misc_bifs_decode_packet_reads_and_returns_sub_binaries_in_place() {
     let _ = global_atoms();
     compare(
