@@ -634,7 +634,7 @@ impl Vm {
     #[inline(always)]
     pub(crate) fn pure_bif(&self, module: usize, index: usize) -> Option<arinsal_bifs::BifFn> {
         let import = self.code.modules.get(module)?.imports.get(index)?;
-        if import.class() != ImportClass::Pure {
+        if import.class() != ImportClass::Pure || import.fast_op == ImportFastOp::Trapping {
             return None;
         }
         import.bif_fn()

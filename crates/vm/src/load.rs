@@ -190,6 +190,12 @@ fn bind_import_targets(module: &mut Module) {
             import.set_native_bits(bits);
         }
         import.set_class(class);
+        if class == arinsal_loader::ImportClass::Pure
+            && import.fast_op == arinsal_loader::ImportFastOp::None
+            && crate::bif_traps::traps(&import.module, &import.function, import.arity)
+        {
+            import.fast_op = arinsal_loader::ImportFastOp::Trapping;
+        }
     }
 }
 
