@@ -243,35 +243,6 @@ fn schedule_ready(id: u64, fd: RawFd, ready: crate::check_io::Ready) {
 }
 
 // g_inet_udp
-pub(crate) fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let fds = crate::port::cloexec_publish(|| {
-        let mut fds = [0; 2];
-        // SAFETY: pipe writes two fresh descriptors; set close-on-exec before publishing either.
-        let rc = unsafe {
-            let rc = libc::pipe(fds.as_mut_ptr());
-            if rc == 0
-                && (libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
-                    || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
-            {
-                let error = std::io::Error::last_os_error();
-                libc::close(fds[0]);
-                libc::close(fds[1]);
-                return Err(error);
-            }
-            rc
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(fds)
-    })?;
-    set_nonblock(fds[0]);
-    set_nonblock(fds[1]);
-    // SAFETY: both descriptors were just created and are not aliased.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
-// g_inet_udp
 pub(crate) fn set_nonblock(fd: RawFd) {
     // SAFETY: fcntl only changes flags on a descriptor this driver owns.
     unsafe {
