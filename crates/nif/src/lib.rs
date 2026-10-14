@@ -1,9 +1,13 @@
 //! OTP 29.1.1 native function ABI hosted in the Arinsal executable.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod binref;
 mod extras;
 mod internal_test;
+mod ioq;
+mod iovec;
 mod iterators;
+mod raw;
 mod res_monitor;
 mod resources;
 mod terms;
@@ -74,12 +78,13 @@ pub const C_SHIM_EXPORTS: &[&str] = &[
     "enif_free_iovec",
 ];
 
+use crate::raw::{cstr, deref, deref_mut};
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle, SchedulerClass};
 use arinsal_term::{
     ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, VecHeap, WritableBinary,
 };
 pub(crate) use libloading::os::unix::Library;
-use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -208,11 +213,11 @@ enum EnvHeap {
 impl EnvHeap {
     fn bound_mut(heap: *mut ProcessHeapHandle<'static>) -> &'static mut ProcessHeapHandle<'static> {
         // SAFETY: `ErlNifEnv::bound` ties this pointer to the synchronous callback lifetime.
-        unsafe { &mut *heap }
+        deref_mut(heap)
     }
     fn bound_ref(heap: *mut ProcessHeapHandle<'static>) -> &'static ProcessHeapHandle<'static> {
         // SAFETY: `ErlNifEnv::bound` ties this pointer to the synchronous callback lifetime.
-        unsafe { &*heap }
+        deref(heap)
     }
 }
 impl HeapAlloc for EnvHeap {
@@ -395,6 +400,10 @@ pub struct ErlNifEnv {
     /// Reductions the process has left at the start of the call, `None` where
     /// `enif_consume_timeslice` is a no-op (dirty schedulers, independent environments).
     reds_left: Option<i64>,
+    /// I/O vectors attached to this environment by `enif_inspect_iovec` (`alloc_tmp_obj`).
+    tmp_iovecs: Vec<Vec<u64>>,
+    /// `Binary*` handles attached to this environment: freed with it.
+    tmp_handles: Vec<usize>,
     /// Reductions `enif_consume_timeslice` took during the call.
     consumed: i64,
 }
@@ -416,6 +425,8 @@ impl ErlNifEnv {
             owned_binary_allocations: Vec::new(),
             opened: Vec::new(),
             reds_left: None,
+            tmp_iovecs: Vec::new(),
+            tmp_handles: Vec::new(),
             consumed: 0,
         }
     }
@@ -439,6 +450,8 @@ impl ErlNifEnv {
             owned_binary_allocations: Vec::new(),
             opened: Vec::new(),
             reds_left: None,
+            tmp_iovecs: Vec::new(),
+            tmp_handles: Vec::new(),
             consumed: 0,
         }
     }
@@ -453,6 +466,9 @@ impl Drop for ErlNifEnv {
                 spare: [ptr::null_mut(); 2],
             };
             terms::enif_release_binary(&mut binary);
+        }
+        for handle in self.tmp_handles.drain(..) {
+            binref::handle_free(handle as *mut c_void);
         }
     }
 }
@@ -976,9 +992,7 @@ pub fn open_nif(path: &Path, module: &str) -> Result<NifImage, NifError> {
             "erts-?".to_owned()
         } else {
             // SAFETY: min_erts is a terminated string in the loaded library.
-            unsafe { CStr::from_ptr(min_erts_ptr) }
-                .to_string_lossy()
-                .into_owned()
+            cstr(min_erts_ptr).to_string_lossy().into_owned()
         };
         return Err(NifError::BadLibrary(format!(
             "That '{module}' NIF library needs {min_erts} or newer. Either try to recompile the NIF lib or use a newer erts runtime."
@@ -1024,9 +1038,9 @@ pub fn open_nif(path: &Path, module: &str) -> Result<NifImage, NifError> {
         return Err(NifError::BadLibrary("invalid entry fields".into()));
     }
     // SAFETY: validated pointers refer to terminated strings in the loaded library.
-    let name = unsafe { CStr::from_ptr(entry.name) }.to_string_lossy();
+    let name = cstr(entry.name).to_string_lossy();
     // SAFETY: validated pointers refer to terminated strings in the loaded library.
-    let variant = unsafe { CStr::from_ptr(entry.vm_variant) }.to_string_lossy();
+    let variant = cstr(entry.vm_variant).to_string_lossy();
     if variant != "beam.vanilla" {
         return Err(NifError::BadLibrary(format!(
             "Library ({variant}) not compiled for this vm variant (beam.vanilla)."
@@ -1052,9 +1066,7 @@ pub fn open_nif(path: &Path, module: &str) -> Result<NifImage, NifError> {
             return Err(NifError::BadLibrary("invalid NIF function".into()));
         }
         // SAFETY: entry function names are terminated strings.
-        let fname = unsafe { CStr::from_ptr(fname_ptr) }
-            .to_string_lossy()
-            .into_owned();
+        let fname = cstr(fname_ptr).to_string_lossy().into_owned();
         let fptr = fptr.ok_or_else(|| NifError::BadLibrary("null NIF function".into()))?;
         // Port of erts/emulator/beam/erl_nif.c:4868 (erts_load_nif flag check), OTP-29.1.1.
         if flags != 0 && flags != ERL_NIF_DIRTY_JOB_IO_BOUND && flags != ERL_NIF_DIRTY_JOB_CPU_BOUND
@@ -1119,6 +1131,8 @@ pub fn ensure_exports() {
     extras::retain_exports();
     iterators::retain_exports();
     internal_test::retain_exports();
+    iovec::retain_exports();
+    ioq::retain_exports();
 }
 /// Write `value` through an out-parameter of the C caller; a NULL pointer is ignored.
 pub(crate) fn put<T>(out: *mut T, value: T) {
