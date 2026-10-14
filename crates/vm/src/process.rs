@@ -845,7 +845,6 @@ pub(crate) struct Runtime {
     pub(crate) code_mod_permission: Mutex<crate::natives::code::CodeModPermission>,
     /// This node's breakpoint tables and active breakpoint index.
     pub(crate) breakpoints: Arc<crate::trace_bp::BpNode>,
-    pub(crate) published: Mutex<HashMap<Pid, Published>>,
     pub(crate) debug_wait_active: AtomicBool,
     /// `erlang:system_flag/2` settings of this runtime.
     pub(crate) system_flags: Mutex<crate::natives::sys::SystemFlags>,
@@ -1027,50 +1026,6 @@ impl Runtime {
             .with_tables_for_code_ix(code_ix, |tables| tables.exports.dispatch(mfa))
             .flatten()
     }
-
-    /// Keep the relation snapshot visible to process introspection in step with local signals.
-    pub(crate) fn update_published_link(&self, owner: Pid, peer: Pid, linked: bool) {
-        let mut published = self.published.lock().unwrap();
-        let slot = published.entry(peer).or_insert(Published {
-            links: Vec::new(),
-            monitors: Vec::new(),
-            monitored_by: Vec::new(),
-        });
-        if linked {
-            if !slot.links.contains(&owner) {
-                slot.links.push(owner);
-            }
-        } else {
-            slot.links.retain(|pid| *pid != owner);
-        }
-    }
-
-    /// Publish a local monitor relation before the target next runs its signal queue.
-    pub(crate) fn update_published_monitored_by(
-        &self,
-        target: Pid,
-        origin: Pid,
-        id: u64,
-        on: bool,
-    ) {
-        let mut published = self.published.lock().unwrap();
-        let slot = published.entry(target).or_insert(Published {
-            links: Vec::new(),
-            monitors: Vec::new(),
-            monitored_by: Vec::new(),
-        });
-        if on {
-            if !slot
-                .monitored_by
-                .iter()
-                .any(|(reference, _)| *reference == id)
-            {
-                slot.monitored_by.push((id, origin));
-            }
-        } else {
-            slot.monitored_by.retain(|(reference, _)| *reference != id);
-        }
-    }
 }
 
 /// Suspend-monitor pause of one process's receive timeout (erts `ErtsPausedProcTimer`): the
@@ -1081,27 +1036,6 @@ pub(crate) struct TimerPause {
     /// `since` on the virtual clock of a simulated runtime.
     since_ms: u64,
     shift: std::time::Duration,
-}
-
-/// Status another process can read while this one is not running.
-///
-/// g_proc_sched
-#[derive(Clone, Debug)]
-pub(crate) struct Published {
-    pub links: Vec<Pid>,
-    pub monitors: Vec<(u64, Pid, Option<arinsal_etf::OwnedTerm>)>,
-    pub monitored_by: Vec<(u64, Pid)>,
-}
-
-impl Published {
-    /// The slot of a process that has published nothing yet.
-    pub(crate) fn empty() -> Self {
-        Self {
-            links: Vec::new(),
-            monitors: Vec::new(),
-            monitored_by: Vec::new(),
-        }
-    }
 }
 
 /// Scheduling state of a hibernating process; `apply(M, F, A)` waits in X0..X2.
@@ -4149,14 +4083,6 @@ impl Runtime {
             .is_ok_and(|scheduler| scheduler.lookup(pid))
     }
 
-    pub(crate) fn forget_process(&self, pid: Pid, drop_published: bool) {
-        // `note_status` publishes PUBLISHED only when it inserts a slot. Exit skips the map
-        // when this process never had one (erl_process.c keeps status on the process struct).
-        if drop_published {
-            self.published.lock().unwrap().remove(&pid);
-        }
-    }
-
     /// Publish that `pid` now owns `bit`. False when that process has already finished
     /// exit cleanup of `bit` (erl_process.c tests the word under the process lock; the
     /// caller rolls the table update back).
@@ -4213,35 +4139,6 @@ impl Runtime {
         {
             Some(false) => "waiting",
             Some(true) | None => "runnable",
-        }
-    }
-
-    fn note_relations(&self, pid: Pid, cold: Option<&crate::proc_create::ProcessCold>) {
-        let mut published = self.published.lock().unwrap();
-        let slot = published.entry(pid).or_insert(Published {
-            links: Vec::new(),
-            monitors: Vec::new(),
-            monitored_by: Vec::new(),
-        });
-        if let Some(cold) = cold {
-            slot.links = cold.links.iter().copied().collect();
-            slot.monitors = cold
-                .monitors
-                .iter()
-                .map(|(&reference, half)| (reference, half.target, half.data.tag.clone()))
-                .collect();
-            slot.monitored_by = cold
-                .monitored_by
-                .iter()
-                .map(|(&reference, half)| (reference, half.origin))
-                .collect();
-        } else {
-            slot.links.clear();
-            slot.monitors.clear();
-            slot.monitored_by.clear();
-        }
-        if !self.publish_proc_flag(pid, proc_flags::PUBLISHED) {
-            published.remove(&pid);
         }
     }
 
@@ -4565,7 +4462,6 @@ impl Process {
                     crate::ddll::proc_dead(&scheduler, ctx.pid());
                 }
             }
-            runtime.forget_process(ctx.pid(), resources & proc_flags::PUBLISHED != 0);
         }
     }
 
@@ -7117,20 +7013,6 @@ impl Process {
                 1,
             );
         }
-        // erts keeps links and monitors on the process (NULL when unused) and does not
-        // publish them on every schedule-out. Copy only when this process has some,
-        // or a previous schedule published a set that must be cleared.
-        // Publish only when a relation changed during this slice (every mutation goes
-        // through `Tracked`), instead of copying them out on every schedule-out.
-        let changed = self.cold.as_mut().is_some_and(|cold| {
-            let links = cold.links.take_changed();
-            let monitors = cold.monitors.take_changed();
-            let monitored_by = cold.monitored_by.take_changed();
-            links | monitors | monitored_by
-        });
-        if changed {
-            runtime.note_relations(ctx.pid(), self.cold.as_deref());
-        }
         // Port of erts/emulator/beam/erl_process.c:6747-6763 (schedule_out_process), OTP-29.1.1:
         // with GC disabled the dirty collection is dropped; the next collection does it.
         if !ctx.scheduler_type().is_dirty()
@@ -7410,7 +7292,6 @@ impl Vm {
             result: sender,
             code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
             breakpoints: Arc::new(crate::trace_bp::BpNode::new(self.code_scope)),
-            published: Mutex::new(HashMap::new()),
             debug_wait_active: AtomicBool::new(false),
             system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
             multi_scheduling: Mutex::new(MultiScheduling::default()),

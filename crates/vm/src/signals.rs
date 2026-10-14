@@ -1991,7 +1991,6 @@ pub(crate) fn monitor_light(
         process.cold_mut().monitors.remove(&id);
         return None;
     }
-    rt.update_published_monitored_by(pid, me, id, true);
     Some(Ok(ref_term))
 }
 
@@ -2029,7 +2028,6 @@ pub(crate) fn demonitor_light(
     let scheduler = rt.scheduler().ok()?;
     let result = if let Some(pid) = active {
         process.cold_mut().monitors.remove(&id);
-        rt.update_published_monitored_by(pid, me, id, false);
         // erts consumes the held process monitor instead of sending the demonitor when it can
         // (erl_proc_sig_queue.c:1104). The executor ignores a dead target here as well.
         if !flush || !scheduler.cancel_pending_monitor(pid, id) {
@@ -2059,7 +2057,6 @@ pub(crate) fn unlink_light(
     let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
     let id = rt.next_ref();
     process.cold_mut().unlinking.insert(id, pid);
-    rt.update_published_link(me, pid, false);
     let _ = rt
         .scheduler()
         .ok()?
@@ -2097,7 +2094,6 @@ pub(crate) fn link_light(
         .ok()?;
     process.cold_mut().links.insert(pid);
     process.cold_mut().prio_links.remove(&pid);
-    rt.update_published_link(me, pid, true);
     Some(Ok(atom("true")))
 }
 
@@ -2498,9 +2494,6 @@ fn call_resolved(
                         &[pid_term],
                     );
                 }
-                if let Some(runtime) = process.runtime.as_ref() {
-                    runtime.update_published_link(ctx.pid(), pid, false);
-                }
                 let _ = ctx.signal(pid, Signal::Unlink(id));
                 wake_for_procs_trace(process, ctx, pid);
                 atom("true")
@@ -2568,8 +2561,6 @@ fn call_resolved(
                     }
                     // The target stopped accepting monitor signals before this request.
                     send_noproc_down(process, ctx, id, name.as_deref(), Some(pid), *target, tag)?;
-                } else {
-                    rt.update_published_monitored_by(pid, ctx.pid(), id, true);
                 }
             } else {
                 send_noproc_down(process, ctx, id, name.as_deref(), pid, *target, tag)?;
@@ -2689,9 +2680,6 @@ fn call_resolved(
                 .and_then(|cold| cold.monitors.remove(&id))
                 .map(|half| half.target)
             {
-                if let Some(runtime) = process.runtime.as_ref() {
-                    runtime.update_published_monitored_by(pid, ctx.pid(), id, false);
-                }
                 if !flush || !ctx.cancel_pending_monitor(pid, id) {
                     let _ = ctx.signal(pid, Signal::Demonitor(id));
                 }
@@ -3819,7 +3807,6 @@ fn link_opt(
         "link",
         &[linked_term],
     );
-    let mut linked = true;
     match ctx.signal(pid, Signal::Link) {
         Ok(()) => {
             if let Some(linker) = ctx.pid().to_term() {
@@ -3837,7 +3824,6 @@ fn link_opt(
             }
         }
         Err(arinsal_sched::Error::NoProcess) => {
-            linked = false;
             // The target exited between the lookup and the signal: like erts, keep the link
             // and let a `noproc` link exit from the target dissolve it.
             // Port of erts/emulator/beam/bif.c:180-183 (link_opt), OTP-29.1.1.
@@ -3849,9 +3835,6 @@ fn link_opt(
         }
         Err(arinsal_sched::Error::Capacity) => return Err(system_limit()),
         Err(_) => return Err(badarg("link")),
-    }
-    if linked {
-        runtime(process)?.update_published_link(ctx.pid(), pid, true);
     }
     wake_for_procs_trace(process, ctx, pid);
     Ok(atom("true"))
