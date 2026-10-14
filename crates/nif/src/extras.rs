@@ -1,5 +1,5 @@
 //! Independent environments, time, ETF, and VM extension hooks.
-use crate::{ErlNifBinary, ErlNifEnv, terms};
+use crate::{ErlNifBinary, ErlNifEnv, put, terms};
 use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned};
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::hint::black_box;
@@ -93,8 +93,7 @@ fn load(p: *const Term) -> Term {
 /// Write a term to caller-provided storage, if any.
 fn store(out: *mut Term, value: Term) {
     if !out.is_null() {
-        // SAFETY: The NIF caller retains this storage for the callback.
-        unsafe { *out = value }
+        put(out, value)
     }
 }
 /// The calling process of a NIF environment.
@@ -382,8 +381,7 @@ pub extern "C" fn enif_binary_to_term(
     let Ok(decoded) = from_owned(&owned, &mut env.heap) else {
         return 0;
     };
-    // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    unsafe { *out = decoded };
+    put(out, decoded);
     consumed
 }
 
@@ -526,8 +524,7 @@ pub extern "C" fn enif_getenv(key: *const c_char, value: *mut c_char, size: *mut
     let data = s.as_bytes();
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
     let cap = unsafe { *size };
-    // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    unsafe { *size = data.len() + 1 };
+    put(size, data.len() + 1);
     if cap < data.len() + 1 || value.is_null() {
         return -2;
     };

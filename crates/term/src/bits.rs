@@ -446,6 +446,50 @@ pub fn writable_finalize(term: Term) {
     }
 }
 
+/// A retained reference to the owner of an off-heap binary (erts `Binary*` with its refc
+/// raised): it keeps the bytes of the binary alive, whatever happens to the term.
+pub enum BinaryOwner {
+    /// An erts `Binary` (reference-counted or writable).
+    Binary(arinsal_alloc::raw::OwnedBinaryRef),
+    /// A NIF resource binary.
+    External(Arc<ExternalBinary>),
+}
+
+impl Clone for BinaryOwner {
+    /// `erts_refc_inc` on the binary.
+    fn clone(&self) -> Self {
+        match self {
+            Self::Binary(binary) => Self::Binary(
+                binary
+                    .try_clone()
+                    .expect("retained Binary has a live count"),
+            ),
+            Self::External(external) => Self::External(Arc::clone(external)),
+        }
+    }
+}
+
+/// The owner of an off-heap binary term, with its reference count raised; `None` for a heap
+/// binary, which has no owner (erts: `br == NULL`).
+// Port of erts/emulator/beam/erl_nif.c:4190-4197 (marshal_iovec_binary: `br->val`).
+pub fn binary_owner(term: Term) -> Option<BinaryOwner> {
+    if term.header()? & 63 != SUB_BITS {
+        return None;
+    }
+    let original = sub_bits_original(term);
+    if original.header()? & 63 != BIN_REF {
+        return None;
+    }
+    // SAFETY: a live BinRef owns the Binary or Arc it names; the clone is handed to the caller.
+    unsafe {
+        let (ptr, _, _, owner) = clone_binary_owner(original).ok()?;
+        Some(match owner {
+            Some(owner) => BinaryOwner::Binary(owner),
+            None => BinaryOwner::External(Arc::from_raw(ptr as *const ExternalBinary)),
+        })
+    }
+}
+
 /// The magic reference that owns the bytes of a resource-backed binary term
 /// (`enif_make_resource_binary`), as `enif_get_resource` finds it through the term's BinRef.
 ///

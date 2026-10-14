@@ -3722,6 +3722,11 @@ pub(crate) fn running_mfa(
         .as_ref()
         .and_then(|cold| cold.nif_pending.as_ref())
         .and_then(crate::natives::nif::PendingNif::finalizer_mfa);
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:944-946 (c_p->current is set when a
+    // process yields): a process that yielded in native code runs the function it resumes in.
+    let native = process
+        .native_pc
+        .and_then(crate::native_bridge::native_function_at);
     let (module, function, arity) = if let Some(finalizer) = dirty_finalizer {
         finalizer
     } else if let Some(trap) = ets_trap {
@@ -3730,6 +3735,8 @@ pub(crate) fn running_mfa(
         bif
     } else if let Some(continuation) = continuation {
         continuation
+    } else if let Some(native) = native.as_ref() {
+        (&*native.module, &*native.function, native.arity)
     } else {
         let Some(module) = vm.code.modules.get(process.module) else {
             return Ok(None);

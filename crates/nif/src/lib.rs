@@ -1120,6 +1120,13 @@ pub fn ensure_exports() {
     iterators::retain_exports();
     internal_test::retain_exports();
 }
+/// Write `value` through an out-parameter of the C caller; a NULL pointer is ignored.
+pub(crate) fn put<T>(out: *mut T, value: T) {
+    if !out.is_null() {
+        // SAFETY: a non-NULL out-parameter of a NIF API call is writable by contract.
+        unsafe { *out = value }
+    }
+}
 pub(crate) fn term(bits: u64) -> Term {
     // SAFETY: callers obtain bits from existing terms or the NIF ABI.
     unsafe { std::mem::transmute::<u64, Term>(bits) }

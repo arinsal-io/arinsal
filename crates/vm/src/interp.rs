@@ -2314,6 +2314,19 @@ impl Vm {
                         .map(|(_, arity)| arity as usize)
                         .ok_or_else(|| VmError::Unsupported("native function entry".into()))?;
                     p.gc_live = arity;
+                    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:924-952
+                    // (emit_call_nif_yield_helper), OTP-29.1.1: `FCALLS--` and a context switch
+                    // when it reaches zero, before the NIF runs. A NIF continuation resumed
+                    // after a reschedule does not pass through the stub again.
+                    if p.cold.as_ref().is_none_or(|cold| cold.nif_pending.is_none()) {
+                        reds -= 1;
+                        if reds <= 0 {
+                            p.module = module_id;
+                            p.ip = offset;
+                            p.reductions = reds;
+                            return Ok(RunState::Yield);
+                        }
+                    }
                     // Local prim_tty NIFs never pass through the tty family, so the
                     // select owner has to be recorded here or input is delivered
                     // to whichever process last touched the thread-local slot.
