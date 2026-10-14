@@ -3,28 +3,10 @@
 //! Port of erts/emulator/beam/erl_bits.c:1725 (`erts_bs_append_checked`) for the
 //! `<<Bin/binary, Bin2/binary>>` shape the compiler lowers to append + one binary.
 
-use crate::native_hooks::{enter_runtime, from_raw, process_from_header, raw, set_error};
+use crate::native_hooks::{enter_runtime, raw, set_error};
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_bits::{BitsError, SegFlags, SegSize, SegType, Segment, SegmentValue};
-use arinsal_term::{HeapAlloc, Term};
-
-/// `erts_bs_private_append` charges the used-size delta on the process vheap.
-/// Port of erts/emulator/beam/erl_bits.c:1961 (`update_wb_overhead`), OTP-29.1.1.
-pub extern "C" fn private_append_overhead(
-    header: *mut core::ffi::c_void,
-    bin: u64,
-    old_bits: u64,
-    new_bits: u64,
-) {
-    let Some(process) = process_from_header(header.cast()) else {
-        return;
-    };
-    process.heap.update_writable_binary_overhead(
-        from_raw(bin),
-        old_bits as usize,
-        new_bits as usize,
-    );
-}
+use arinsal_term::Term;
 
 /// Appends the whole of `X[extra]` onto `X[src]` and returns the new bitstring.
 /// Zero means the construction failed and the process error registers are set.
@@ -59,9 +41,7 @@ pub extern "C" fn append_binary(
     }
     // Port of `erts_bs_append_checked`'s ERL_REFC_BITS_SIZE heap request: BinRef + SubBits.
     // `<<Bin/binary, Bin2/binary>>` fills one destination with the two source ranges.
-    if process
-        .ensure_native_roots(8, &mut registers.x_reg_array, root_live)
-        .is_ok()
+    if let Ok(collected) = process.ensure_native_roots(8, &mut registers.x_reg_array, root_live)
         && let Ok(Some(term)) = arinsal_bits::concat_byte_binary(
             registers.x_reg_array[src_index],
             registers.x_reg_array[extra_index],
@@ -69,7 +49,11 @@ pub extern "C" fn append_binary(
         )
     {
         registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-        process.sync_native_header();
+        if collected {
+            process.sync_native_header();
+        } else {
+            process.sync_native_cursors();
+        }
         return raw(term);
     }
     if process.x.len() < root_live {
@@ -124,7 +108,7 @@ pub extern "C" fn append_binary(
         *slot = *term;
     }
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    process.sync_native_header();
+    process.sync_native_cursors();
     match result {
         Ok(term) => raw(term),
         Err(error) => fail(process, registers, error),

@@ -558,28 +558,20 @@ pub fn concat_byte_binary<H: HeapAlloc>(
     extra: Term,
     heap: &mut H,
 ) -> Result<Option<Term>, BitsError> {
-    let Some(prefix_bits) = bit_size(prefix) else {
-        return Ok(None);
-    };
-    let Some(extra_bits) = bit_size(extra) else {
-        return Ok(None);
-    };
-    if !prefix_bits.is_multiple_of(8) || !extra_bits.is_multiple_of(8) {
-        return Ok(None);
-    }
-    let total = (prefix_bits / 8)
-        .checked_add(extra_bits / 8)
-        .ok_or(BitsError::SystemLimit { segment: 1 })?;
     let Some(result) = with_binary(prefix, |left, left_start, left_bits| {
-        if !left_start.is_multiple_of(8) || left_bits != prefix_bits {
+        if !left_start.is_multiple_of(8) || !left_bits.is_multiple_of(8) {
             return Ok(None);
         }
         let left = &left[left_start / 8..left_start / 8 + left_bits / 8];
         let Some(result) = with_binary(extra, |right, right_start, right_bits| {
-            if !right_start.is_multiple_of(8) || right_bits != extra_bits {
+            if !right_start.is_multiple_of(8) || !right_bits.is_multiple_of(8) {
                 return Ok(None);
             }
             let right = &right[right_start / 8..right_start / 8 + right_bits / 8];
+            let total = left
+                .len()
+                .checked_add(right.len())
+                .ok_or(BitsError::SystemLimit { segment: 1 })?;
             let mut builder = TermBuilder::new(heap);
             let term = if total <= 64 {
                 builder.heap_bitstring_from_parts(left, right, total * 8)

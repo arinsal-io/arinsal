@@ -681,11 +681,26 @@ struct BinaryCopyState {
 enum IolistBinaryPhase {
     Size(arinsal_bifs::IolistSizeWalk),
     Copy {
-        output: Term,
+        output: IolistOutput,
         byte_len: usize,
         walk: arinsal_bifs::IolistCopyWalk,
     },
     Done,
+}
+
+/// Output staging for `erts_new_bitstring`: up to 64 bytes stay on heap after the walk completes.
+// Port of erts/emulator/beam/erl_bits.c:2841-2858 (erts_new_bitstring_refc), OTP-29.1.1.
+enum IolistOutput {
+    Small(Vec<u8>),
+    Writable(Term),
+}
+
+impl IolistOutput {
+    fn finish_writer(&self) {
+        if let Self::Writable(term) = self {
+            arinsal_bifs::finish_iolist_binary_output(*term);
+        }
+    }
 }
 
 fn binary_match(
@@ -2292,16 +2307,24 @@ fn iolist_binary_conversion(
             });
         }
         let byte_len = walk.take_size();
-        let output = arinsal_bifs::allocate_iolist_binary(
-            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-            byte_len,
-        )?;
         if byte_len == 0 {
+            let value = arinsal_bifs::allocate_iolist_binary(
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+                0,
+            )?;
             return Ok(HandlerResult::Done {
-                value: output,
+                value,
                 reductions: size_reductions as u32,
             });
         }
+        let mut output = if byte_len <= 64 {
+            IolistOutput::Small(vec![0; byte_len])
+        } else {
+            IolistOutput::Writable(arinsal_bifs::allocate_iolist_binary(
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+                byte_len,
+            )?)
+        };
         let mut copy = arinsal_bifs::IolistCopyWalk::new(root);
         let available_reductions =
             (process.reductions.max(0) as usize).saturating_sub(size_reductions);
@@ -2317,12 +2340,18 @@ fn iolist_binary_conversion(
             });
         }
         let yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
-        let (done, work) = match arinsal_bifs::with_iolist_binary_output(output, |bytes| {
-            Ok(copy.step(bytes, yield_count))
-        })? {
+        let stepped = match &mut output {
+            IolistOutput::Small(bytes) => copy.step(bytes, yield_count),
+            IolistOutput::Writable(term) => {
+                arinsal_bifs::with_iolist_binary_output(*term, |bytes| {
+                    Ok(copy.step(bytes, yield_count))
+                })?
+            }
+        };
+        let (done, work) = match stepped {
             Ok(progress) => progress,
             Err((error, work)) => {
-                arinsal_bifs::finish_iolist_binary_output(output);
+                output.finish_writer();
                 return Ok(HandlerResult::Failed {
                     error,
                     reductions: (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32,
@@ -2342,17 +2371,24 @@ fn iolist_binary_conversion(
             });
         }
         if copy.written() != byte_len {
-            arinsal_bifs::finish_iolist_binary_output(output);
+            output.finish_writer();
             return Ok(HandlerResult::Failed {
                 error: BifError::SystemLimit,
                 reductions,
             });
         }
-        arinsal_bifs::finish_iolist_binary_output(output);
-        return Ok(HandlerResult::Done {
-            value: output,
-            reductions,
-        });
+        let value = match output {
+            IolistOutput::Small(bytes) => {
+                TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                    .binary(&bytes)
+                    .map_err(|_| BifError::SystemLimit)?
+            }
+            IolistOutput::Writable(term) => {
+                arinsal_bifs::finish_iolist_binary_output(term);
+                term
+            }
+        };
+        return Ok(HandlerResult::Done { value, reductions });
     }
     let state = Arc::clone(state.expect("resumed iolist conversion has state"));
     let phase = state
@@ -2384,17 +2420,25 @@ fn iolist_binary_conversion(
             }
 
             let byte_len = walk.take_size();
-            let output = arinsal_bifs::allocate_iolist_binary(
-                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-                byte_len,
-            )?;
             if byte_len == 0 {
+                let value = arinsal_bifs::allocate_iolist_binary(
+                    &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+                    0,
+                )?;
                 *phase = IolistBinaryPhase::Done;
                 return Ok(HandlerResult::Done {
-                    value: output,
+                    value,
                     reductions: size_reductions as u32,
                 });
             }
+            let output = if byte_len <= 64 {
+                IolistOutput::Small(vec![0; byte_len])
+            } else {
+                IolistOutput::Writable(arinsal_bifs::allocate_iolist_binary(
+                    &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+                    byte_len,
+                )?)
+            };
             *phase = IolistBinaryPhase::Copy {
                 output,
                 byte_len,
@@ -2423,13 +2467,17 @@ fn iolist_binary_conversion(
         unreachable!("the size phase transitions to copy or returns above")
     };
     let yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
-    let (done, work) = match arinsal_bifs::with_iolist_binary_output(*output, |bytes| {
-        Ok(walk.step(bytes, yield_count))
-    })? {
+    let stepped = match output {
+        IolistOutput::Small(bytes) => walk.step(bytes, yield_count),
+        IolistOutput::Writable(term) => arinsal_bifs::with_iolist_binary_output(*term, |bytes| {
+            Ok(walk.step(bytes, yield_count))
+        })?,
+    };
+    let (done, work) = match stepped {
         Ok(progress) => progress,
         Err((error, work)) => {
             let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
-            arinsal_bifs::finish_iolist_binary_output(*output);
+            output.finish_writer();
             return Ok(HandlerResult::Failed { error, reductions });
         }
     };
@@ -2443,14 +2491,23 @@ fn iolist_binary_conversion(
         });
     }
     if walk.written() != *byte_len {
-        arinsal_bifs::finish_iolist_binary_output(*output);
+        output.finish_writer();
         return Ok(HandlerResult::Failed {
             error: BifError::SystemLimit,
             reductions,
         });
     }
-    let result = *output;
-    arinsal_bifs::finish_iolist_binary_output(result);
+    let result = match output {
+        IolistOutput::Small(bytes) => {
+            TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                .binary(bytes)
+                .map_err(|_| BifError::SystemLimit)?
+        }
+        IolistOutput::Writable(term) => {
+            arinsal_bifs::finish_iolist_binary_output(*term);
+            *term
+        }
+    };
     *phase = IolistBinaryPhase::Done;
     Ok(HandlerResult::Done {
         value: result,

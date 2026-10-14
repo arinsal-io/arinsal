@@ -277,12 +277,24 @@ pub trait HeapAlloc {
         self.retain_writable_binary(binary)
     }
     /// Add the overhead change performed by `update_wb_overhead` before a writable append.
+    #[inline(always)]
     fn update_writable_binary_overhead(
         &mut self,
         _source: Term,
         _old_size_bits: usize,
         _new_size_bits: usize,
     ) {
+    }
+    /// Apply a writable-binary overhead change when the bit-syntax parse already has its BinRef.
+    #[inline(always)]
+    fn update_writable_binary_overhead_at(
+        &mut self,
+        source: Term,
+        _bin_ref: usize,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        self.update_writable_binary_overhead(source, old_size_bits, new_size_bits)
     }
     /// Whether this heap can retain a writable owner without losing it at GC.
     fn supports_writable_binary(&self) -> bool {
@@ -355,6 +367,15 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
         new_size_bits: usize,
     ) {
         (**self).update_writable_binary_overhead(source, old_size_bits, new_size_bits)
+    }
+    fn update_writable_binary_overhead_at(
+        &mut self,
+        source: Term,
+        bin_ref: usize,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        (**self).update_writable_binary_overhead_at(source, bin_ref, old_size_bits, new_size_bits)
     }
     fn supports_writable_binary(&self) -> bool {
         (**self).supports_writable_binary()
@@ -1571,6 +1592,17 @@ impl HeapAlloc for ProcessHeap {
         old_size_bits: usize,
         new_size_bits: usize,
     ) {
+        let bin_ref = crate::bits::writable_bin_ref_address(source).unwrap_or(0);
+        self.update_writable_binary_overhead_at(source, bin_ref, old_size_bits, new_size_bits);
+    }
+    #[inline(always)]
+    fn update_writable_binary_overhead_at(
+        &mut self,
+        source: Term,
+        bin_ref: usize,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
         if self.detached {
             if let Some(heap) = self.owners.detached.as_deref_mut() {
                 heap.update_writable_binary_overhead(source, old_size_bits, new_size_bits);
@@ -1578,16 +1610,18 @@ impl HeapAlloc for ProcessHeap {
             return;
         }
         // Port of erl_bits.c:1660-1670 (`update_wb_overhead`), OTP-29.1.1.
-        let overhead = |bits: usize| (bits.div_ceil(8) / 8) as u64;
-        let increase = overhead(new_size_bits).saturating_sub(overhead(old_size_bits));
+        let increase = if new_size_bits > old_size_bits {
+            (new_size_bits.div_ceil(8) / 8 - old_size_bits.div_ceil(8) / 8) as u64
+        } else {
+            0
+        };
         let old_start = self.old_words.as_ptr() as usize;
         let old_end = old_start.saturating_add(self.old_htop.saturating_mul(8));
-        let old_generation = crate::bits::writable_bin_ref_address(source)
-            .is_some_and(|address| address >= old_start && address < old_end);
+        let old_generation = bin_ref >= old_start && bin_ref < old_end;
         if old_generation {
-            self.owners.vheap.old = self.owners.vheap.old.saturating_add(increase);
+            self.owners.vheap.old = self.owners.vheap.old.wrapping_add(increase);
         } else {
-            self.owners.overhead = self.owners.overhead.saturating_add(increase);
+            self.owners.overhead = self.owners.overhead.wrapping_add(increase);
         }
     }
     fn supports_writable_binary(&self) -> bool {
@@ -3163,6 +3197,7 @@ impl Term {
     /// The owning heap and any off-heap binary owner must remain live. No
     /// writable append may run while a view of its owner is retained.
     // Port of erts/emulator/beam/erl_bits.h:376-405 (`ERTS_GET_BITSTRING_REF`), OTP-29.1.1.
+    #[inline(always)]
     pub unsafe fn binary_ref<'a>(self) -> Option<BinaryRef<'a>> {
         let header = self.header()?;
         // SAFETY: The header determines the initialized object layout.
