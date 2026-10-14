@@ -701,6 +701,82 @@ fn sendto_and_sendmsg_on_stream_match_erts() {
     compare("sendto_sendmsg_stream");
 }
 
+const ACTIVE_SOURCE: &str = include_str!("fixtures/sock_active_compat.erl");
+
+fn compare_active(function: &str) {
+    compare_in("sock_active_compat", ACTIVE_SOURCE, function);
+}
+
+#[test]
+fn passive_send_and_recv_match_erts() {
+    compare_active("passive_send_recv");
+}
+
+#[test]
+fn active_once_matches_erts() {
+    compare_active("active_once");
+}
+
+#[test]
+fn active_n_and_tcp_passive_match_erts() {
+    compare_active("active_n");
+}
+
+#[test]
+fn active_true_matches_erts() {
+    compare_active("active_true");
+}
+
+#[test]
+fn packet_modes_passive_match_erts() {
+    compare_active("packet_passive");
+}
+
+#[test]
+fn packet_wire_format_matches_erts() {
+    compare_active("packet_wire_format");
+}
+
+#[test]
+fn packet_modes_active_match_erts() {
+    compare_active("packet_active");
+}
+
+#[test]
+fn packet_split_over_segments_matches_erts() {
+    compare_active("packet_split_segments");
+}
+
+#[test]
+fn packet_too_long_on_receive_matches_erts() {
+    compare_active("packet_too_long");
+}
+
+#[test]
+fn packet_too_long_on_send_matches_erts() {
+    compare_active("packet_send_too_long");
+}
+
+#[test]
+fn gen_tcp_close_errors_passive_match_erts() {
+    compare_active("close_errors_passive");
+}
+
+#[test]
+fn gen_tcp_close_errors_active_match_erts() {
+    compare_active("close_errors_active");
+}
+
+#[test]
+fn gen_tcp_shutdown_errors_match_erts() {
+    compare_active("shutdown_errors");
+}
+
+#[test]
+fn gen_tcp_close_wakes_blocked_recv_like_erts() {
+    compare_active("close_wakes_blocked_recv");
+}
+
 const CLOSE_SOURCE: &str = include_str!("fixtures/sock_close_compat.erl");
 
 fn compare_close(function: &str) {
