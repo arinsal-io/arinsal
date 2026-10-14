@@ -2343,22 +2343,42 @@ impl Vm {
                     // A NIF rescheduled to this scheduler resumes its continuation instead.
                     let pending = p.cold.as_mut().and_then(|cold| cold.nif_pending.take());
                     // Port of erts/emulator/beam/erl_nif.c:3437-3477 (static_schedule_dirty_nif),
-                    // OTP-29.1.1: a static NIF flagged dirty IO first moves the process to a
-                    // dirty IO scheduler, which executes this body again.
+                    // OTP-29.1.1: a static NIF flagged dirty first moves the process to a
+                    // dirty scheduler of its class, which executes this body again.
                     let module_name = self.code.modules[module_id].name.as_str();
-                    let to_dirty_io = pending.is_none()
-                        && matches!(module_name, "prim_file" | "prim_tty" | "prim_socket" | "prim_net")
-                        && self.code.modules[module_id]
+                    if module_name == "zstd" {
+                        crate::native_helpers::note_zstd_caller(p);
+                    }
+                    let to_dirty = if pending.is_none()
+                        && matches!(
+                            module_name,
+                            "prim_file" | "prim_tty" | "prim_socket" | "prim_net" | "zstd"
+                        )
+                    {
+                        self.code.modules[module_id]
                             // SAFETY: `ip` remains within the active module code allocation.
                             .function_at(unsafe { ip.offset_from(base) } as usize)
-                            .is_some_and(|(function, _)| {
-                                crate::native_helpers::moves_to_dirty_io(
+                            .and_then(|(function, _)| {
+                                crate::native_helpers::moves_to_dirty(
                                     p,
                                     module_name,
                                     function,
                                     arity as u8,
                                 )
-                            });
+                            })
+                    } else {
+                        None
+                    };
+                    // Port of erts/emulator/beam/erl_nif.c (enif_consume_timeslice), OTP-29.1.1:
+                    // a NIF's charge counts toward the calling process and is a no-op on a dirty
+                    // scheduler. The body charges the process counter, so it starts from the
+                    // interpreter's cached value.
+                    let charges =
+                        to_dirty.is_none() && !arinsal_sched::current_scheduler_type().is_dirty();
+                    if charges {
+                        p.reductions = reds;
+                    }
+                    let reds_before_nif = p.reductions;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match pending {
                             Some(pending) => natives::nif::resume_pending(
@@ -2366,17 +2386,23 @@ impl Vm {
                                 &mut p.reductions,
                                 pending,
                             ),
-                            None if to_dirty_io => Err(arinsal_bifs::BifError::Dirty(
-                                arinsal_bifs::SchedulerClass::DirtyIo,
-                            )),
-                            None => natives::nif::call_native(
-                                &mut p.heap,
-                                &mut p.reductions,
-                                &native,
-                                &p.x[..arity],
-                            ),
+                            None => match to_dirty {
+                                Some(class) => Err(arinsal_bifs::BifError::Dirty(class)),
+                                None => natives::nif::call_native(
+                                    &mut p.heap,
+                                    &mut p.reductions,
+                                    &native,
+                                    &p.x[..arity],
+                                ),
+                            },
                         }
                     }));
+                    if charges {
+                        charge_bif_work!(
+                            u32::try_from(reds_before_nif.saturating_sub(p.reductions).max(0))
+                                .unwrap_or(0)
+                        );
+                    }
                     let result = match result {
                         Ok(result) => result,
                         Err(_) => Err(arinsal_bifs::BifError::Error(Term::atom(

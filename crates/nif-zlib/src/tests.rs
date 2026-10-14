@@ -3,7 +3,50 @@ use std::process::Command;
 
 use arinsal_etf::{EncodeOptions, OwnedTerm as O, decode, encode};
 
-use super::{atom, zlib, zstd};
+use super::{atom, zlib};
+
+/// The built-in `zstd` NIFs take terms, so this runs them on a per-thread process heap and
+/// converts arguments and results to `OwnedTerm`. A resource is a magic reference: its
+/// `OwnedTerm` form names the live owner, which this heap keeps alive.
+mod zstd {
+    use std::cell::RefCell;
+
+    use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
+    use arinsal_etf::OwnedTerm as O;
+    use arinsal_term::{ProcessHeap, from_owned, to_owned};
+
+    use crate::{Fault, Outcome};
+
+    thread_local! {
+        static HEAP: RefCell<ProcessHeap> = RefCell::new(ProcessHeap::with_words(1 << 20));
+    }
+
+    /// Call `zstd:name/N` as process `caller`.
+    pub(super) fn dispatch(name: &str, args: &[O], caller: &Option<O>) -> Outcome {
+        HEAP.with(|heap| {
+            let mut heap = heap.borrow_mut();
+            let mut alloc = ProcessHeapHandle(&mut heap);
+            let terms = args
+                .iter()
+                .map(|arg| from_owned(arg, &mut alloc).unwrap())
+                .collect::<Vec<_>>();
+            let pid = caller
+                .as_ref()
+                .map(|pid| from_owned(pid, &mut alloc).unwrap());
+            let entry = crate::zstd::lookup(name, args.len() as u8).expect("zstd NIF entry");
+            crate::set_caller(pid);
+            let mut ctx = Ctx::new(&mut alloc);
+            let result = entry(&mut ctx, &terms);
+            crate::set_caller(None);
+            match result {
+                Ok(term) => Ok(to_owned(term).unwrap()),
+                Err(BifError::Error(reason)) => Err(Fault::Reason(to_owned(reason).unwrap())),
+                Err(BifError::Badarg { cause: None }) => Err(Fault::Badarg),
+                Err(other) => panic!("unexpected BIF error {other:?}"),
+            }
+        })
+    }
+}
 
 fn call_zlib(name: &str, args: &[O]) -> O {
     zlib::dispatch(name, args, &None).unwrap_or_else(|_| panic!("{name} failed"))
@@ -1030,4 +1073,311 @@ fn public_dispatch_and_pid_api() {
     assert!(super::lookup("zlib", "open_nif", 0).is_some());
     assert!(super::lookup("zstd", "get_frame_header_nif", 1).is_some());
     assert!(super::lookup("zlib", "open_nif", 1).is_none());
+}
+
+#[test]
+fn zstd_nif_table_matches_zstd_nif_c() {
+    for &(name, arity, dirty) in &super::ZSTD_NIF_FUNCS {
+        assert!(
+            super::lookup("zstd", name, arity).is_some(),
+            "zstd:{name}/{arity} has no Rust entry"
+        );
+        assert_eq!(
+            super::dirty_cpu("zstd", name, arity),
+            dirty,
+            "{name}/{arity}"
+        );
+    }
+    let dirty: Vec<_> = super::ZSTD_NIF_FUNCS
+        .iter()
+        .filter(|entry| entry.2)
+        .map(|entry| entry.0)
+        .collect();
+    assert_eq!(
+        dirty,
+        [
+            "load_compress_dictionary_nif",
+            "load_decompress_dictionary_nif",
+            "create_cdict_nif",
+            "create_ddict_nif"
+        ]
+    );
+    assert!(super::lookup("zstd", "compress_nif", 1).is_none());
+    assert!(!super::dirty_cpu("zlib", "create_cdict_nif", 2));
+}
+
+fn context_id(resource: &O) -> u64 {
+    let O::Ref { ids, .. } = resource else {
+        panic!("a zstd context is a reference")
+    };
+    assert_eq!(ids[2], u32::MAX, "a magic reference");
+    u64::from(ids[0]) | (u64::from(ids[1]) << 32)
+}
+
+#[test]
+fn closed_context_raises_badarg_for_every_context_nif() {
+    let c = call_zstd("init_compress_nif", &[]);
+    assert_eq!(
+        call_zstd("compress_reset_nif", std::slice::from_ref(&c)),
+        atom("ok")
+    );
+    assert_eq!(
+        call_zstd("compress_close_nif", std::slice::from_ref(&c)),
+        atom("ok")
+    );
+    for (name, args) in [
+        ("compress_close_nif", vec![c.clone()]),
+        ("compress_reset_nif", vec![c.clone()]),
+        ("set_pledged_src_size_nif", vec![c.clone(), O::Int(1)]),
+        (
+            "compress_stream_nif",
+            vec![c.clone(), O::Binary(vec![]), O::Int(2)],
+        ),
+        (
+            "get_compress_parameter_nif",
+            vec![c.clone(), atom("windowLog")],
+        ),
+        (
+            "set_compress_parameter_nif",
+            vec![c.clone(), atom("windowLog"), O::Int(20)],
+        ),
+    ] {
+        assert!(
+            matches!(
+                zstd::dispatch(name, &args, &None),
+                Err(super::Fault::Badarg)
+            ),
+            "{name} on a closed context"
+        );
+    }
+    let d = call_zstd("init_decompress_nif", &[]);
+    assert_eq!(
+        call_zstd("decompress_close_nif", std::slice::from_ref(&d)),
+        atom("ok")
+    );
+    for name in ["decompress_close_nif", "decompress_reset_nif"] {
+        assert!(matches!(
+            zstd::dispatch(name, std::slice::from_ref(&d), &None),
+            Err(super::Fault::Badarg)
+        ));
+    }
+}
+
+#[test]
+fn context_resource_types_are_distinct() {
+    let c = call_zstd("init_compress_nif", &[]);
+    let d = call_zstd("init_decompress_nif", &[]);
+    for (name, args) in [
+        ("decompress_close_nif", vec![c.clone()]),
+        ("compress_reset_nif", vec![d.clone()]),
+        ("set_pledged_src_size_nif", vec![d.clone(), O::Int(1)]),
+        ("compress_close_nif", vec![atom("ok")]),
+        ("decompress_reset_nif", vec![O::Binary(vec![1])]),
+    ] {
+        assert!(
+            matches!(
+                zstd::dispatch(name, &args, &None),
+                Err(super::Fault::Badarg)
+            ),
+            "{name}"
+        );
+    }
+    assert_eq!(call_zstd("compress_close_nif", &[c]), atom("ok"));
+    assert_eq!(call_zstd("decompress_close_nif", &[d]), atom("ok"));
+}
+
+#[test]
+fn forged_or_restored_reference_is_not_a_context() {
+    let live = call_zstd("init_compress_nif", &[]);
+    let id = context_id(&live);
+    for forged in [
+        O::Ref {
+            node: "nonode@nohost".into(),
+            creation: 0,
+            ids: vec![id as u32, (id >> 32) as u32, 7],
+        },
+        O::Ref {
+            node: "nonode@nohost".into(),
+            creation: 0,
+            ids: vec![u32::MAX - 1, 0, u32::MAX],
+        },
+    ] {
+        assert!(matches!(
+            zstd::dispatch("compress_close_nif", &[forged], &None),
+            Err(super::Fault::Badarg)
+        ));
+    }
+    assert_eq!(call_zstd("compress_close_nif", &[live]), atom("ok"));
+}
+
+#[test]
+fn owner_is_checked_after_closed_and_applies_to_every_context_nif() {
+    let pid = |id| O::Pid {
+        node: "nonode@nohost".into(),
+        id,
+        serial: 0,
+        creation: 0,
+    };
+    let (p1, p2) = (Some(pid(21)), Some(pid(22)));
+    let c = zstd::dispatch("init_compress_nif", &[], &p1).unwrap();
+    let d = zstd::dispatch("init_decompress_nif", &[], &p1).unwrap();
+    let foreign = atom("not_on_controlling_process");
+    for (name, args) in [
+        ("compress_close_nif", vec![c.clone()]),
+        ("compress_reset_nif", vec![c.clone()]),
+        ("set_pledged_src_size_nif", vec![c.clone(), O::Int(1)]),
+        (
+            "compress_stream_nif",
+            vec![c.clone(), O::Binary(vec![]), O::Int(2)],
+        ),
+        (
+            "get_compress_parameter_nif",
+            vec![c.clone(), atom("windowLog")],
+        ),
+        ("decompress_close_nif", vec![d.clone()]),
+        ("decompress_reset_nif", vec![d.clone()]),
+        (
+            "decompress_stream_nif",
+            vec![d.clone(), O::Binary(vec![]), O::Int(2)],
+        ),
+    ] {
+        assert_eq!(
+            error_reason(zstd::dispatch(name, &args, &p2)),
+            foreign,
+            "{name} from another process"
+        );
+        assert_eq!(
+            error_reason(zstd::dispatch(name, &args, &None)),
+            foreign,
+            "{name} without a caller"
+        );
+    }
+    assert_eq!(
+        zstd::dispatch("compress_close_nif", std::slice::from_ref(&c), &p1).unwrap(),
+        atom("ok")
+    );
+    assert_eq!(
+        error_reason(zstd::dispatch("compress_close_nif", &[c], &p2)),
+        atom("badarg")
+    );
+    assert_eq!(
+        zstd::dispatch("decompress_close_nif", &[d], &p1).unwrap(),
+        atom("ok")
+    );
+}
+
+#[test]
+fn context_is_freed_with_the_heap_that_holds_its_reference() {
+    use arinsal_bifs::{Ctx, ProcessHeapHandle};
+    use arinsal_term::{MagicRef, ProcessHeap, to_owned};
+    let mut heap = ProcessHeap::with_words(1024);
+    let id = {
+        let mut alloc = ProcessHeapHandle(&mut heap);
+        let mut ctx = Ctx::new(&mut alloc);
+        let entry = super::zstd::lookup("init_compress_nif", 0).unwrap();
+        let resource = entry(&mut ctx, &[]).unwrap();
+        context_id(&to_owned(resource).unwrap())
+    };
+    assert!(MagicRef::live_by_id(id).is_some());
+    drop(heap);
+    assert!(MagicRef::live_by_id(id).is_none());
+    assert!(!MagicRef::is_registered(id));
+}
+
+#[test]
+fn contexts_do_not_stay_registered_after_their_heap_is_collected() {
+    use arinsal_bifs::{Ctx, ProcessHeapHandle};
+    use arinsal_term::{MagicRef, ProcessHeap, to_owned};
+    let entry = super::zstd::lookup("init_compress_nif", 0).unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..2_000 {
+        let mut heap = ProcessHeap::with_words(1024);
+        let mut alloc = ProcessHeapHandle(&mut heap);
+        let mut ctx = Ctx::new(&mut alloc);
+        let resource = entry(&mut ctx, &[]).unwrap();
+        ids.push(context_id(&to_owned(resource).unwrap()));
+    }
+    assert!(ids.iter().all(|id| !MagicRef::is_registered(*id)));
+}
+
+/// Any exception out of a stream NIF resets the session, not only a zstd error: a bad end op in
+/// the middle of a frame ends the frame and clears `in_use`, so the `true` shortcut of a fresh
+/// context applies again.
+#[test]
+fn stream_exception_resets_session() {
+    let compressor = call_zstd("init_compress_nif", &[]);
+    let (_, frame, _) = chunks(call_zstd(
+        "compress_stream_nif",
+        &[
+            compressor,
+            O::Binary(b"hello hello hello".to_vec()),
+            O::Int(2),
+        ],
+    ));
+    let half = O::Binary(frame[..frame.len() / 2].to_vec());
+    let done = O::Tuple(vec![atom("done"), O::Binary(Vec::new())]);
+    let dctx = call_zstd("init_decompress_nif", &[]);
+    let empty = || O::Binary(Vec::new());
+
+    assert_eq!(
+        call_zstd(
+            "decompress_stream_nif",
+            &[dctx.clone(), empty(), atom("true")]
+        ),
+        done
+    );
+    call_zstd("decompress_stream_nif", &[dctx.clone(), half, O::Int(0)]);
+    assert!(
+        zstd::dispatch(
+            "decompress_stream_nif",
+            &[dctx.clone(), empty(), atom("true")],
+            &None
+        )
+        .is_err(),
+        "in_use is set: the end op is not an int"
+    );
+    assert!(
+        zstd::dispatch(
+            "decompress_stream_nif",
+            &[dctx.clone(), empty(), atom("foo")],
+            &None
+        )
+        .is_err()
+    );
+    assert_eq!(
+        call_zstd("decompress_stream_nif", &[dctx, empty(), atom("true")]),
+        done
+    );
+}
+
+/// A non-binary data argument or end op raises `badarg`, a bad end op is passed to zstd, which
+/// rejects it with its own error.
+#[test]
+fn stream_argument_errors() {
+    let ctx = call_zstd("init_compress_nif", &[]);
+    for (data, op) in [
+        (O::Atom("abc".into()), O::Int(0)),
+        (
+            O::List {
+                elems: vec![O::Int(1)],
+                tail: Box::new(O::Nil),
+            },
+            O::Int(0),
+        ),
+        (O::Binary(vec![1]), atom("true")),
+        (O::Binary(vec![1]), O::Float(1.5)),
+    ] {
+        assert!(matches!(
+            zstd::dispatch("compress_stream_nif", &[ctx.clone(), data, op], &None),
+            Err(crate::Fault::Badarg)
+        ));
+    }
+    let Err(crate::Fault::Reason(O::Tuple(ref reason))) = zstd::dispatch(
+        "compress_stream_nif",
+        &[ctx, O::Binary(vec![1]), O::Int(5)],
+        &None,
+    ) else {
+        panic!("end op 5 must raise a zstd error")
+    };
+    assert_eq!(reason[0], atom("zstd_error"));
 }

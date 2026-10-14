@@ -8,6 +8,7 @@
 pub(crate) fn load_atoms(module: &str) -> &'static [&'static str] {
     match module {
         "zlib" => ZLIB,
+        "zstd" => ZSTD,
         "erl_tracer" => ERL_TRACER,
         "prim_buffer" => PRIM_BUFFER,
         "prim_file" => PRIM_FILE,
@@ -38,6 +39,21 @@ const ZLIB: &[&str] = &[
     "version_error",
     "unknown_error",
     "gc_zlib",
+];
+const ZSTD: &[&str] = &[
+    "ZstdCompressContext",
+    "ZstdDecompressContext",
+    "ZstdCompressDict",
+    "ZstdCompressDict",
+    "true",
+    "false",
+    "undefined",
+    "badarg",
+    "error",
+    "ok",
+    "continue",
+    "flush",
+    "done",
 ];
 // Port of erts/emulator/nifs/common/erl_tracer_nif.c:89 (load), OTP-29.1.1.
 const ERL_TRACER: &[&str] = &[

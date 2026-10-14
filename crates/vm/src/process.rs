@@ -1144,6 +1144,9 @@ impl Executor {
     ) -> Result<RunState, VmError> {
         process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
         process.self_pid = Some(ctx.pid());
+        // `enif_self` of the built-in zstd NIFs is the process this scheduler runs, whichever
+        // dispatch path reaches them (import, apply, light BIF, static NIF body).
+        crate::native_helpers::note_zstd_caller(process);
         // Port of erts/emulator/beam/erl_process.c:10180 (erts_schedule: esdp->current_process
         // = p), OTP-29.1.1. A simulated scheduler shares its thread with other runtimes, so
         // it binds the thread's hub on every turn.
