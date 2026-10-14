@@ -7,26 +7,167 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::hint::black_box;
 use std::ptr;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::AtomicPtr;
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
-struct ResourceType {
-    callbacks: ErlNifResourceTypeInit,
-    _library: Arc<Library>,
+/// What resource types need of the library that owns them (`struct erl_module_nif`): its
+/// `priv_data`, which callbacks see through `enif_priv_data`, and its module name.
+pub struct ResourceOwner {
+    module: String,
+    priv_data: Arc<AtomicPtr<c_void>>,
 }
-// SAFETY: callbacks are function pointers into a loaded library. NIFs synchronize mutable payload access.
-unsafe impl Send for ResourceType {}
-// SAFETY: callbacks are immutable after registration; NIFs synchronize mutable payload access.
-unsafe impl Sync for ResourceType {}
-struct Resource {
-    kind: *mut ResourceType,
+impl ResourceOwner {
+    pub(crate) fn new(module: String, priv_data: Arc<AtomicPtr<c_void>>) -> Arc<Self> {
+        Arc::new(Self { module, priv_data })
+    }
+}
+/// The `dynlib_refc` of the owning library. A type with callbacks holds one reference, so the
+/// library is not closed (`unload` does not run) while a resource of such a type is alive.
+pub trait LibraryRefs: Send + Sync {
+    /// `erts_refc_inc(&lib->dynlib_refc)`.
+    fn dynlib_inc(&self);
+    /// `erts_refc_dectest(&lib->dynlib_refc)`; the last reference closes the library.
+    fn dynlib_dec(&self);
+}
+struct TypeOwner {
+    owner: Arc<ResourceOwner>,
+    /// `lib->refc`: keeps the library struct alive while it owns the type.
+    refs: Arc<dyn LibraryRefs>,
+}
+/// Port of `struct enif_resource_type_t` (erts/emulator/beam/erl_nif.c), OTP-29.1.1. The
+/// `Arc` count plays `refc`: the type list (while the owner is loaded) and every live
+/// resource hold one reference; the last one released frees the type.
+struct ResourceType {
+    /// `fn_real`; callbacks are copied out before they run, so a takeover never waits for one.
+    callbacks: RwLock<ErlNifResourceTypeInit>,
+    owner: Mutex<Option<TypeOwner>>,
+    _library: Mutex<Arc<Library>>,
+}
+impl Drop for ResourceType {
+    // Port of erts/emulator/beam/erl_nif.c:3022-3029 (nif_resource_dtor), 5359-5363.
+    fn drop(&mut self) {
+        steal_resource_type(self);
+        all_types()
+            .lock()
+            .unwrap()
+            .remove(&(self as *const Self as usize));
+    }
+}
+/// Port of erts/emulator/beam/erl_nif.c:2683 (struct opened_resource_type), OTP-29.1.1: a
+/// create or take-over made by a load callback, applied only if the load succeeds.
+pub(crate) struct OpenedType {
+    op: c_int,
+    ty: Arc<ResourceType>,
+    key: String,
+    callbacks: ErlNifResourceTypeInit,
+    library: Arc<Library>,
+}
+/// Every live type by address, to resolve the `ErlNifResourceType*` a NIF hands back.
+static ALL_TYPES: OnceLock<Mutex<HashMap<usize, Weak<ResourceType>>>> = OnceLock::new();
+fn all_types() -> &'static Mutex<HashMap<usize, Weak<ResourceType>>> {
+    ALL_TYPES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn type_for(address: *mut c_void) -> Option<Arc<ResourceType>> {
+    all_types()
+        .lock()
+        .unwrap()
+        .get(&(address as usize))?
+        .upgrade()
+}
+fn type_address(ty: &Arc<ResourceType>) -> *mut c_void {
+    Arc::as_ptr(ty).cast_mut().cast()
+}
+fn have_callbacks(init: &ErlNifResourceTypeInit) -> bool {
+    init.dtor.is_some()
+}
+unsafe extern "C" fn resource_dtor_nop(_: *mut ErlNifEnv, _: *mut c_void) {}
+impl ResourceType {
+    fn callbacks(&self) -> ErlNifResourceTypeInit {
+        *self.callbacks.read().unwrap()
+    }
+    /// Port of pre_nif_noproc (erl_nif.c): an environment of the owning library.
+    fn env(&self) -> ErlNifEnv {
+        let mut env = ErlNifEnv::independent();
+        if let Some(owner) = self.owner.lock().unwrap().as_ref() {
+            env.module = Some(owner.owner.module.clone());
+            env.priv_cell = Some(Arc::clone(&owner.owner.priv_data));
+        }
+        env
+    }
+}
+/// Port of erts/emulator/beam/erl_nif.c:2620 (steal_resource_type): the type leaves its owner.
+fn steal_resource_type(ty: &ResourceType) {
+    let owner = ty.owner.lock().unwrap().take();
+    if let Some(owner) = owner
+        && have_callbacks(&ty.callbacks())
+    {
+        owner.refs.dynlib_dec();
+    }
+}
+/// Port of erts/emulator/beam/erl_nif.c:2879 (rollback_opened_resource_types).
+pub(crate) fn rollback_opened(opened: Vec<OpenedType>) {
+    // A created type was never published: dropping the entry frees it.
+    drop(opened);
+}
+/// Port of erts/emulator/beam/erl_nif.c:2807-2870 (prepare_opened_rt, commit_opened_rt,
+/// cleanup_opened_rt), OTP-29.1.1.
+pub(crate) fn commit_opened(
+    opened: Vec<OpenedType>,
+    owner: &Arc<ResourceOwner>,
+    refs: &Arc<dyn LibraryRefs>,
+) {
+    for entry in opened.into_iter().rev() {
+        let ty = &entry.ty;
+        if entry.op == 1 {
+            types().lock().unwrap().insert(entry.key, Arc::clone(ty));
+        } else {
+            steal_resource_type(ty);
+        }
+        *ty.owner.lock().unwrap() = Some(TypeOwner {
+            owner: Arc::clone(owner),
+            refs: Arc::clone(refs),
+        });
+        if have_callbacks(&entry.callbacks) {
+            refs.dynlib_inc();
+        }
+        *ty.callbacks.write().unwrap() = entry.callbacks;
+        *ty._library.lock().unwrap() = entry.library;
+    }
+}
+/// Port of erts/emulator/beam/erl_nif.c:5345-5366 (erts_unload_nif): the purged library's
+/// types leave the type list; those without resources are freed.
+pub(crate) fn unload_types(owner: &Arc<ResourceOwner>) {
+    let removed: Vec<Arc<ResourceType>> = {
+        let mut table = types().lock().unwrap();
+        let keys: Vec<String> = table
+            .iter()
+            .filter(|(_, ty)| {
+                ty.owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|t| Arc::ptr_eq(&t.owner, owner))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.iter().filter_map(|key| table.remove(key)).collect()
+    };
+    // The list reference goes away; a type without resources is freed here.
+    drop(removed);
+}
+
+pub(crate) struct Resource {
+    kind: Arc<ResourceType>,
     data: *mut u8,
     size: usize,
     /// Identity shared by every term of this resource while one is alive (erts: all
     /// magic refs point at the same magic binary). Weak: the payload owns the resource.
     magic: Mutex<Weak<MagicRef>>,
+    /// Process monitors this resource holds (`ErtsResourceMonitors`): target pid and monitor.
+    pub(crate) monitors: Mutex<Vec<(Term, u64)>>,
 }
 impl Resource {
-    fn magic_ref(self: &Arc<Self>) -> Arc<MagicRef> {
+    pub(crate) fn magic_ref(self: &Arc<Self>) -> Arc<MagicRef> {
         let mut slot = self.magic.lock().unwrap();
         if let Some(magic) = slot.upgrade() {
             return magic;
@@ -46,11 +187,11 @@ pub fn resource_down(reference: Term, pid: Term, monitor: &[u8; 32]) -> bool {
     let Some(owner) = from_reference(reference) else {
         return false;
     };
-    // SAFETY: the resource owner keeps its registered callback and payload live.
-    let Some(callback) = (unsafe { (*owner.kind).callbacks.down }) else {
+    let kind = &owner.kind;
+    let Some(callback) = kind.callbacks().down else {
         return false;
     };
-    let mut env = ErlNifEnv::independent();
+    let mut env = kind.env();
     let mut pid = pid;
     // SAFETY: the NIF callback sees live environment, resource, pid, and monitor storage.
     unsafe {
@@ -68,11 +209,11 @@ pub fn resource_stop(reference: Term, event: i32, direct: bool) -> bool {
     let Some(owner) = from_reference(reference) else {
         return false;
     };
-    // SAFETY: the resource owner keeps its registered callback and payload live.
-    let Some(callback) = (unsafe { (*owner.kind).callbacks.stop }) else {
+    let kind = &owner.kind;
+    let Some(callback) = kind.callbacks().stop else {
         return false;
     };
-    let mut env = ErlNifEnv::independent();
+    let mut env = kind.env();
     // SAFETY: the NIF callback sees a live environment and resource allocation.
     unsafe { callback(&mut env, owner.data.cast(), event, i32::from(direct)) };
     true
@@ -87,12 +228,11 @@ pub fn resource_type_name(data: usize) -> String {
     let Some(owner) = owner_for(data as *mut c_void) else {
         return String::new();
     };
-    let kind = owner.kind as usize;
     types()
         .lock()
         .unwrap()
         .iter()
-        .find(|(_, candidate)| **candidate == kind)
+        .find(|(_, candidate)| Arc::ptr_eq(candidate, &owner.kind))
         .map(|(name, _)| name.clone())
         .unwrap_or_default()
 }
@@ -102,11 +242,11 @@ pub fn resource_stop_data(data: usize, event: i32, direct: bool) -> bool {
     let Some(owner) = owner_for(data as *mut c_void) else {
         return false;
     };
-    // SAFETY: the resource owner keeps its registered callback and payload live.
-    let Some(callback) = (unsafe { (*owner.kind).callbacks.stop }) else {
+    let kind = &owner.kind;
+    let Some(callback) = kind.callbacks().stop else {
         return false;
     };
-    let mut env = ErlNifEnv::independent();
+    let mut env = kind.env();
     // SAFETY: the NIF callback sees a live environment and resource allocation.
     unsafe { callback(&mut env, owner.data.cast(), event, i32::from(direct)) };
     true
@@ -126,13 +266,17 @@ impl Drop for Resource {
         if literal_trace() {
             eprintln!("resource_drop data={:p}", self.data);
         }
-        // SAFETY: a registered type remains allocated, and data is live until this drop ends.
-        unsafe {
-            if let Some(dtor) = (*self.kind).callbacks.dtor {
-                let mut env = ErlNifEnv::independent();
-                dtor(&mut env, self.data.cast());
-            }
+        // Port of erts/emulator/beam/erl_nif.c:2960-3010 (nif_resource_dtor_prologue): the
+        // monitors the resource holds are removed before its destructor runs.
+        crate::res_monitor::demonitor_all(self);
+        let kind = &self.kind;
+        if let Some(dtor) = kind.callbacks().dtor {
+            let mut env = kind.env();
+            // SAFETY: the data is live until this drop ends.
+            unsafe { dtor(&mut env, self.data.cast()) };
         }
+        // The `kind` reference is released after this body: the last resource of an unlisted
+        // type frees the type (erl_nif.c:3022-3029).
         owners().lock().unwrap().remove(&(self.data as usize));
         // SAFETY: the last owner has gone away and the original layout is unchanged.
         unsafe {
@@ -147,20 +291,22 @@ struct Kept {
     _owner: Arc<Resource>,
     count: usize,
 }
-static TYPES: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+static TYPES: OnceLock<Mutex<HashMap<String, Arc<ResourceType>>>> = OnceLock::new();
 static KEPT: OnceLock<Mutex<HashMap<usize, Kept>>> = OnceLock::new();
-static OWNERS: OnceLock<Mutex<HashMap<usize, Weak<Resource>>>> = OnceLock::new();
-fn types() -> &'static Mutex<HashMap<String, usize>> {
+/// Live resources by data address: the resource and its size (still readable while its dtor runs).
+type OwnerMap = HashMap<usize, (Weak<Resource>, usize)>;
+static OWNERS: OnceLock<Mutex<OwnerMap>> = OnceLock::new();
+fn types() -> &'static Mutex<HashMap<String, Arc<ResourceType>>> {
     TYPES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 fn kept() -> &'static Mutex<HashMap<usize, Kept>> {
     KEPT.get_or_init(|| Mutex::new(HashMap::new()))
 }
-fn owners() -> &'static Mutex<HashMap<usize, Weak<Resource>>> {
+fn owners() -> &'static Mutex<OwnerMap> {
     OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
-fn owner_for(data: *mut c_void) -> Option<Arc<Resource>> {
-    owners().lock().unwrap().get(&(data as usize))?.upgrade()
+pub(crate) fn owner_for(data: *mut c_void) -> Option<Arc<Resource>> {
+    owners().lock().unwrap().get(&(data as usize))?.0.upgrade()
 }
 fn name(p: *const c_char) -> Option<String> {
     if p.is_null() {
@@ -191,9 +337,7 @@ pub extern "C" fn enif_open_resource_type(
     }
     // SAFETY: the NIF load callback receives a live environment.
     let env = unsafe { &*e };
-    let Some(module) = env.module.as_deref() else {
-        return ptr::null_mut();
-    };
+    let module = env.module.as_deref().unwrap_or_default();
     let key = format!("{module}:{kind_name}");
     let init = ErlNifResourceTypeInit {
         dtor,
@@ -221,9 +365,7 @@ pub extern "C" fn enif_open_resource_type_x(
     }
     // SAFETY: the NIF load callback receives a live environment.
     let env = unsafe { &*e };
-    let Some(module) = env.module.as_deref() else {
-        return ptr::null_mut();
-    };
+    let module = env.module.as_deref().unwrap_or_default();
     let init = ErlNifResourceTypeInit {
         dtor: init.dtor,
         stop: init.stop,
@@ -253,9 +395,7 @@ pub extern "C" fn enif_init_resource_type(
     }
     // SAFETY: the NIF load callback receives a live environment.
     let env = unsafe { &*e };
-    let Some(module) = env.module.as_deref() else {
-        return ptr::null_mut();
-    };
+    let module = env.module.as_deref().unwrap_or_default();
     let callbacks = ErlNifResourceTypeInit {
         dtor: if init.members >= 1 { init.dtor } else { None },
         stop: if init.members >= 2 { init.stop } else { None },
@@ -275,6 +415,8 @@ pub extern "C" fn enif_init_resource_type(
         tried,
     )
 }
+/// Port of erts/emulator/beam/erl_nif.c:2697 (open_resource_type), OTP-29.1.1: `tried`
+/// always receives the operation that was attempted (`flags` when nothing matched).
 fn open_type(
     e: *mut ErlNifEnv,
     key: &str,
@@ -283,46 +425,63 @@ fn open_type(
     tried: *mut c_int,
 ) -> *mut c_void {
     // SAFETY: callers checked the load environment pointer.
-    let env = unsafe { &*e };
+    let env = unsafe { &mut *e };
+    let (op, address) = open_type_op(env, key, init, flags);
+    if !tried.is_null() {
+        // SAFETY: the NIF passes a writable ErlNifResourceFlags or NULL.
+        unsafe { *tried = op }
+    }
+    address
+}
+fn open_type_op(
+    env: &mut ErlNifEnv,
+    key: &str,
+    init: &ErlNifResourceTypeInit,
+    flags: c_int,
+) -> (c_int, *mut c_void) {
     if !env.options.loading {
-        return ptr::null_mut();
+        return (flags, ptr::null_mut());
     }
     let Some(library) = env.library.clone() else {
-        return ptr::null_mut();
+        return (flags, ptr::null_mut());
     };
-    let mut table = types().lock().unwrap();
-    if let Some(&address) = table.get(key) {
-        if flags & 2 == 0 {
-            return ptr::null_mut();
-        };
-        // SAFETY: the type is intentionally process-lifetime allocated.
-        unsafe {
-            (*(address as *mut ResourceType)).callbacks = *init;
-            (*(address as *mut ResourceType))._library = library;
-        };
-        if !tried.is_null() {
-            // SAFETY: The resource allocation and callback remain live during this access.
-            unsafe { *tried = 2 }
-        };
-        return address as *mut c_void;
+    let found = types().lock().unwrap().get(key).cloned();
+    let (op, ty) = match found {
+        None if flags & 1 != 0 => {
+            let ty = Arc::new(ResourceType {
+                callbacks: RwLock::new(ErlNifResourceTypeInit::default()),
+                owner: Mutex::new(None),
+                _library: Mutex::new(Arc::clone(&library)),
+            });
+            all_types()
+                .lock()
+                .unwrap()
+                .insert(Arc::as_ptr(&ty) as usize, Arc::downgrade(&ty));
+            (1, ty)
+        }
+        Some(ty) if flags & 2 != 0 => (2, ty),
+        _ => return (flags, ptr::null_mut()),
+    };
+    let mut callbacks = *init;
+    if callbacks.dtor.is_none()
+        && (callbacks.down.is_some() || callbacks.stop.is_some() || callbacks.dyncall.is_some())
+    {
+        // Dummy dtor for fast rt_have_callbacks().
+        callbacks.dtor = Some(resource_dtor_nop);
     }
-    if flags & 1 == 0 {
-        return ptr::null_mut();
-    };
-    let address = Box::into_raw(Box::new(ResourceType {
-        callbacks: *init,
-        _library: library,
-    })) as usize;
-    table.insert(key.to_owned(), address);
-    if !tried.is_null() {
-        // SAFETY: The resource allocation and callback remain live during this access.
-        unsafe { *tried = 1 }
-    };
-    address as *mut c_void
+    let address = type_address(&ty);
+    env.opened.push(OpenedType {
+        op,
+        ty,
+        key: key.to_owned(),
+        callbacks,
+        library,
+    });
+    (op, address)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_alloc_resource(kind: *mut c_void, size: usize) -> *mut c_void {
-    if kind.is_null() {
+    let Some(kind) = type_for(kind) else {
         return ptr::null_mut();
     };
     let Ok(layout) = Layout::from_size_align(size.max(1), 16) else {
@@ -334,15 +493,16 @@ pub extern "C" fn enif_alloc_resource(kind: *mut c_void, size: usize) -> *mut c_
         return ptr::null_mut();
     };
     let owner = Arc::new(Resource {
-        kind: kind.cast(),
+        kind,
         data,
         size,
         magic: Mutex::new(Weak::new()),
+        monitors: Mutex::new(Vec::new()),
     });
     owners()
         .lock()
         .unwrap()
-        .insert(data as usize, Arc::downgrade(&owner));
+        .insert(data as usize, (Arc::downgrade(&owner), size));
     kept().lock().unwrap().insert(
         data as usize,
         Kept {
@@ -386,7 +546,11 @@ pub extern "C" fn enif_release_resource(data: *mut c_void) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_sizeof_resource(data: *mut c_void) -> usize {
-    owner_for(data).map_or(0, |owner| owner.size)
+    owners()
+        .lock()
+        .unwrap()
+        .get(&(data as usize))
+        .map_or(0, |entry| entry.1)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_make_resource(e: *mut ErlNifEnv, data: *mut c_void) -> Term {
@@ -409,13 +573,16 @@ pub extern "C" fn enif_get_resource(
     out: *mut *mut c_void,
 ) -> c_int {
     // SAFETY: the term's heap is live through the callback.
-    let Some(magic) = (unsafe { t.magic_ref() }) else {
+    let Some(magic) = (unsafe {
+        t.magic_ref()
+            .or_else(|| arinsal_term::external_binary_magic(t))
+    }) else {
         return 0;
     };
     let Some(owner) = magic.downcast_ref::<Arc<Resource>>() else {
         return 0;
     };
-    if owner.kind.cast::<c_void>() != kind {
+    if type_address(&owner.kind) != kind {
         return 0;
     };
     if !out.is_null() {
@@ -465,21 +632,21 @@ pub extern "C" fn enif_dynamic_resource_call(
         return 1;
     };
     let key = format!("{module}:{name}");
-    let Some(&kind) = types().lock().unwrap().get(&key) else {
+    let Some(kind) = types().lock().unwrap().get(&key).cloned() else {
         return 1;
     };
+    let kind = type_address(&kind);
     let mut object = ptr::null_mut();
-    if enif_get_resource(e, reference, kind as *mut c_void, &mut object) == 0 {
+    if enif_get_resource(e, reference, kind, &mut object) == 0 {
         return 1;
     };
-    // SAFETY: a registered callback and its resource are live during this invocation.
-    unsafe {
-        if let Some(f) = (*(kind as *const ResourceType)).callbacks.dyncall {
-            f(e, object, call_data);
-            0
-        } else {
-            1
-        }
+    let dyncall = type_for(kind).and_then(|ty| ty.callbacks().dyncall);
+    if let Some(f) = dyncall {
+        // SAFETY: a registered callback and its resource are live during this invocation.
+        unsafe { f(e, object, call_data) };
+        0
+    } else {
+        1
     }
 }
 pub(crate) fn retain_exports() {
@@ -491,4 +658,28 @@ pub(crate) fn retain_exports() {
         enif_get_resource as *const () as usize,
     ];
     black_box(exports);
+}
+
+/// Run the `down` callback of `resource`'s type for the exit of monitored process `pid`.
+// Port of erts/emulator/beam/erl_nif.c:3086-3110 (erts_fire_nif_monitor), OTP-29.1.1.
+pub(crate) fn call_down(resource: &Arc<Resource>, pid: Term, monitor: &[u8; 32]) {
+    let kind = &resource.kind;
+    let Some(callback) = kind.callbacks().down else {
+        return;
+    };
+    let mut env = kind.env();
+    let mut pid = pid;
+    // SAFETY: the NIF callback sees live environment, resource, pid, and monitor storage.
+    unsafe {
+        callback(
+            &mut env,
+            resource.data.cast(),
+            (&mut pid as *mut Term).cast(),
+            monitor.as_ptr().cast_mut().cast(),
+        )
+    };
+}
+/// Whether the type of `resource` has a `down` callback.
+pub(crate) fn has_down(resource: &Resource) -> bool {
+    resource.kind.callbacks().down.is_some()
 }

@@ -1567,7 +1567,7 @@ fn internal_state_tuple_get(
             let Some(index) = global_atoms().get(name).map(|atom| atom.0) else {
                 return Ok(None);
             };
-            int(process, index as usize).map(Some)
+            int(process, index as usize % 2039).map(Some)
         }
         ("binary_info", OwnedTerm::Binary(bytes))
             if selector_value.is_some_and(|term| {

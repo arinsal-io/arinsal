@@ -51,7 +51,9 @@ pub use pure::{
     finish_iolist_binary_output, next_ref_id, next_unique_monotonic, singleton_bitstring,
     with_binary_bytes, with_iolist_binary_output,
 };
-pub use time::{monotonic_time_milliseconds, monotonic_time_nanos};
+pub use time::{
+    monotonic_time_milliseconds, monotonic_time_nanos, next_now_micros, time_offset_nanos_value,
+};
 pub use unique::{
     SchedulerRefState, UniqueInt, bind_scheduler_ref_state, init_unique_scheduler_count,
     next_ref_words, next_unique_integer, next_unique_monotonic_positive, ordinary_ref_key,

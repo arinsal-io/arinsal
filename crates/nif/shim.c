@@ -333,10 +333,27 @@ void enif_rwlock_rwlock(ErlNifRWLock *p) { pthread_rwlock_wrlock(&((NifRWLock *)
 void enif_rwlock_rwunlock(ErlNifRWLock *p) { pthread_rwlock_unlock(&((NifRWLock *)p)->value); }
 char *enif_rwlock_name(ErlNifRWLock *p) { return ((NifRWLock *)p)->name; }
 
-int enif_tsd_key_create(char *name, ErlNifTSDKey *key) { (void)name; pthread_key_t k; int ret = pthread_key_create(&k, NULL); if (!ret) *key = (ErlNifTSDKey)k; return ret; }
-void enif_tsd_key_destroy(ErlNifTSDKey key) { pthread_key_delete((pthread_key_t)key); }
-void enif_tsd_set(ErlNifTSDKey key, void *data) { pthread_setspecific((pthread_key_t)key, data); }
-void *enif_tsd_get(ErlNifTSDKey key) { return pthread_getspecific((pthread_key_t)key); }
+/* Port of erl_nif.c:2423-2426: the TSD functions are erl_drv_tsd_*, whose keys are not
+ * limited by pthread_key_create (the driver thread layer provides them in the full binary;
+ * a binary without it falls back to pthread keys). */
+static void *drv_tsd(const char *sym) { return dlsym(RTLD_DEFAULT, sym); }
+int enif_tsd_key_create(char *name, ErlNifTSDKey *key) {
+    int (*f)(char *, int *) = drv_tsd("erl_drv_tsd_key_create");
+    if (f) { int k; int ret = f(name, &k); if (!ret) *key = (ErlNifTSDKey)(long)k; return ret; }
+    pthread_key_t k; int ret = pthread_key_create(&k, NULL); if (!ret) *key = (ErlNifTSDKey)k; return ret;
+}
+void enif_tsd_key_destroy(ErlNifTSDKey key) {
+    void (*f)(int) = drv_tsd("erl_drv_tsd_key_destroy");
+    if (f) f((int)(long)key); else pthread_key_delete((pthread_key_t)key);
+}
+void enif_tsd_set(ErlNifTSDKey key, void *data) {
+    void (*f)(int, void *) = drv_tsd("erl_drv_tsd_set");
+    if (f) f((int)(long)key, data); else pthread_setspecific((pthread_key_t)key, data);
+}
+void *enif_tsd_get(ErlNifTSDKey key) {
+    void *(*f)(int) = drv_tsd("erl_drv_tsd_get");
+    return f ? f((int)(long)key) : pthread_getspecific((pthread_key_t)key);
+}
 
 ErlNifThreadOpts *enif_thread_opts_create(char *name) { (void)name; ErlDrvThreadOpts *p = calloc(1, sizeof(*p)); return (ErlNifThreadOpts *)p; }
 void enif_thread_opts_destroy(ErlNifThreadOpts *p) { free(p); }
@@ -433,26 +450,27 @@ int enif_ioq_peek_head(ErlNifEnv *env, ErlNifIOQueue *p, size_t *size, ERL_NIF_T
     if (term) { unsigned char *data = enif_make_new_binary(env, q->size, term); if (!data) return 0; memcpy(data, q->bytes, q->size); }
     return 1;
 }
+extern int arinsal_nif_binary_copy(ERL_NIF_TERM, unsigned char **, size_t *);
 int enif_inspect_iovec(ErlNifEnv *env, size_t max_length, ERL_NIF_TERM list,
                        ERL_NIF_TERM *tail, ErlNifIOVec **output) {
     if (!tail || !output) return 0;
     ErlNifIOVec *vec = calloc(1, sizeof(*vec));
     if (!vec) return 0;
-    vec->iov = calloc(max_length ? max_length : 1, sizeof(SysIOVec));
+    /* max_length may be ~0: size the table by the list, not by the limit. */
+    size_t cells = 0;
+    for (ERL_NIF_TERM walk = list, h, t; cells < max_length && enif_get_list_cell(env, walk, &h, &t); walk = t) cells++;
+    vec->iov = calloc(cells ? cells : 1, sizeof(SysIOVec));
     if (!vec->iov) { free(vec); return 0; }
-    while (vec->iovcnt < (int)max_length && enif_is_list(env, list) && !enif_is_empty_list(env, list)) {
+    while ((size_t)vec->iovcnt < max_length && enif_is_list(env, list) && !enif_is_empty_list(env, list)) {
         ERL_NIF_TERM head, next;
-        ErlNifBinary binary;
-        if (!enif_get_list_cell(env, list, &head, &next) || !enif_inspect_binary(env, head, &binary)) { enif_free_iovec(vec); return 0; }
-        if (binary.size) {
-            void *copy = malloc(binary.size);
-            if (!copy) { enif_free_iovec(vec); return 0; }
-            memcpy(copy, binary.data, binary.size);
-            vec->iov[vec->iovcnt].iov_base = copy;
-            vec->iov[vec->iovcnt].iov_len = binary.size;
+        unsigned char *copy; size_t size;
+        if (!enif_get_list_cell(env, list, &head, &next) || !arinsal_nif_binary_copy(head, &copy, &size)) { enif_free_iovec(vec); return 0; }
+        if (size) {
+            vec->iov[vec->iovcnt].iov_base = (char *)copy;
+            vec->iov[vec->iovcnt].iov_len = size;
             vec->iovcnt++;
-            vec->size += binary.size;
-        }
+            vec->size += size;
+        } else free(copy);
         list = next;
     }
     if (!enif_is_list(env, list)) { enif_free_iovec(vec); return 0; }

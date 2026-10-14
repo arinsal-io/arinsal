@@ -402,16 +402,17 @@ pub extern "C" fn enif_get_atom_cache_index(_: *mut ErlNifEnv, t: Term, out: *mu
     if let Some(a) = t.as_atom() {
         if !out.is_null() {
             // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-            unsafe { *out = a.0 }
+            unsafe { *out = a.0 % 2039 }
         };
         1
     } else {
         0
     }
 }
+// Port of erts/emulator/beam/external.c:233 (erts_debug_max_atom_out_cache_index).
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_max_atom_cache_index() -> c_uint {
-    2047
+    2038
 }
 
 #[unsafe(no_mangle)]
@@ -693,12 +694,10 @@ pub extern "C" fn enif_alloc_binary(size: usize, out: *mut ErlNifBinary) -> c_in
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
     unsafe {
-        *out = ErlNifBinary {
-            size,
-            data,
-            ref_bin: data.cast(),
-            spare: [ptr::null_mut(); 2],
-        }
+        // Only the fields erts writes: libraries built for API 2.4 have a smaller struct.
+        (*out).size = size;
+        (*out).data = data;
+        (*out).ref_bin = data.cast();
     };
     1
 }
@@ -735,22 +734,64 @@ pub extern "C" fn enif_release_binary(bin: *mut ErlNifBinary) {
     }
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn enif_inspect_binary(_: *mut ErlNifEnv, t: Term, out: *mut ErlNifBinary) -> c_int {
-    let Some(data) = binary_bytes(t) else {
-        return 0;
+pub extern "C" fn enif_inspect_binary(e: *mut ErlNifEnv, t: Term, out: *mut ErlNifBinary) -> c_int {
+    // Port of erts/emulator/beam/erl_nif.c:1351 (ERTS_PIN_BITSTRING): a writable binary is
+    // shrunk in place and can no longer be reallocated, so the inspected view stays valid
+    // while the term is copied.
+    arinsal_term::writable_finalize(t);
+    let data = match binary_bytes(t) {
+        Some(data) => data,
+        None => {
+            // Port of erts/emulator/beam/erl_nif.c:1357-1371 (enif_inspect_binary): a binary
+            // that does not start on a byte boundary is copied to an aligned buffer owned
+            // by the environment.
+            // SAFETY: the caller owns the term's live heap throughout this ABI call.
+            let Some(view) = (unsafe { t.binary_ref() }) else {
+                return 0;
+            };
+            if view.bit_len() % 8 != 0 || e.is_null() {
+                return 0;
+            }
+            let Ok(bytes) = arinsal_bifs::binary_bytes(t) else {
+                return 0;
+            };
+            let env = env(e);
+            env.scratch.push(bytes);
+            let last = env.scratch.last().unwrap();
+            // SAFETY: the buffer lives as long as the environment's scratch list, which only grows.
+            unsafe { std::slice::from_raw_parts(last.as_ptr(), last.len()) }
+        }
     };
     if out.is_null() {
         return 0;
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
     unsafe {
-        *out = ErlNifBinary {
-            size: data.len(),
-            data: data.as_ptr().cast_mut(),
-            ref_bin: ptr::null_mut(),
-            spare: [ptr::null_mut(); 2],
-        }
+        // Only the fields erts writes: libraries built for API 2.4 have a smaller struct.
+        (*out).size = data.len();
+        (*out).data = data.as_ptr().cast_mut();
+        (*out).ref_bin = ptr::null_mut();
     };
+    1
+}
+/// Copy the bytes of a whole-byte binary, aligned or not, to a `malloc` block (for the
+/// shim's `enif_inspect_iovec`, which owns its parts and needs no environment).
+#[unsafe(no_mangle)]
+pub extern "C" fn arinsal_nif_binary_copy(t: Term, data: *mut *mut u8, size: *mut usize) -> c_int {
+    let Ok(bytes) = arinsal_bifs::binary_bytes(t) else {
+        return 0;
+    };
+    // SAFETY: malloc returns a block of the requested size or NULL.
+    let copy = unsafe { malloc(bytes.len().max(1)) }.cast::<u8>();
+    if copy.is_null() {
+        return 0;
+    }
+    // SAFETY: the block holds `bytes.len()` bytes; the shim passes writable out-parameters.
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), copy, bytes.len());
+        *data = copy;
+        *size = bytes.len();
+    }
     1
 }
 #[unsafe(no_mangle)]
@@ -866,12 +907,10 @@ pub extern "C" fn enif_inspect_iolist_as_binary(
     let b = env.scratch.last().unwrap();
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
     unsafe {
-        *out = ErlNifBinary {
-            size: b.len(),
-            data: b.as_ptr().cast_mut(),
-            ref_bin: ptr::null_mut(),
-            spare: [ptr::null_mut(); 2],
-        }
+        // Only the fields erts writes: libraries built for API 2.4 have a smaller struct.
+        (*out).size = b.len();
+        (*out).data = b.as_ptr().cast_mut();
+        (*out).ref_bin = ptr::null_mut();
     };
     1
 }
@@ -914,14 +953,22 @@ pub extern "C" fn enif_get_local_pid(_: *mut ErlNifEnv, t: Term, out: *mut Term)
 pub extern "C" fn enif_set_pid_undefined(out: *mut Term) {
     if !out.is_null() {
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-        unsafe { *out = term(0) }
+        unsafe { *out = undefined_pid() }
     }
+}
+/// `am_undefined`, the value of an undefined `ErlNifPid` (erl_nif.c:1223).
+fn undefined_pid() -> Term {
+    Term::atom(
+        global_atoms()
+            .get("undefined")
+            .expect("preloaded undefined"),
+    )
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_is_pid_undefined(pid: *const Term) -> c_int {
     i32::from(
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-        pid.is_null() || unsafe { bits(*pid) } == 0,
+        !pid.is_null() && unsafe { bits(*pid) } == bits(undefined_pid()),
     )
 }
 #[unsafe(no_mangle)]
@@ -934,8 +981,18 @@ pub extern "C" fn enif_get_local_port(_: *mut ErlNifEnv, t: Term, out: *mut Term
     1
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn enif_consume_timeslice(_: *mut ErlNifEnv, _: c_int) -> c_int {
-    0
+pub extern "C" fn enif_consume_timeslice(e: *mut ErlNifEnv, percent: c_int) -> c_int {
+    // Port of erts/emulator/beam/erl_nif.c:3341-3360 (enif_consume_timeslice), OTP-29.1.1:
+    // a no-op on a dirty scheduler; otherwise BUMP_REDS of `percent` of CONTEXT_REDS, and 1
+    // when the process has no reductions left.
+    const CONTEXT_REDS: i64 = 4000;
+    let env = env(e);
+    let Some(left) = env.reds_left else {
+        return 0;
+    };
+    let percent = i64::from(percent.clamp(1, 100));
+    env.consumed += ((CONTEXT_REDS + 99) / 100) * percent;
+    c_int::from(left - env.consumed <= 0)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_schedule_nif(
@@ -1066,6 +1123,10 @@ pub extern "C" fn enif_make_map_from_arrays(
     let Ok(m) = arinsal_maps::from_pairs(&pairs, &mut env(e).heap) else {
         return 0;
     };
+    // erl_nif.c (enif_make_map_from_arrays): duplicate keys make the call fail.
+    if arinsal_maps::size(m).ok() != Some(n) {
+        return 0;
+    }
     if !out.is_null() {
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
         unsafe { *out = m }
@@ -1124,6 +1185,62 @@ fn render_term(t: Term, out: &mut String, depth: usize) {
     if let Some(a) = atom_text(t) {
         out.push_str(a);
         return;
+    }
+    // Port of erts/emulator/beam/erl_printf_term.c:146-168, 480-600 (print_term): pids, ports
+    // and floats as erts prints them.
+    if let Some((number, serial)) = t.as_pid() {
+        let _ = write!(out, "<0.{number}.{serial}>");
+        return;
+    }
+    if let Some(number) = t.as_port() {
+        let _ = write!(out, "#Port<0.{number}>");
+        return;
+    }
+    // SAFETY: the NIF callback retains this term's heap while formatting.
+    if let Some(float) = unsafe { t.float_ref() } {
+        let formatted = format!("{:.6e}", float.get());
+        let (mantissa, exponent) = formatted.split_once('e').unwrap_or((&formatted, "0"));
+        let exponent: i32 = exponent.parse().unwrap_or(0);
+        let _ = write!(
+            out,
+            "{mantissa}e{}{:02}",
+            if exponent < 0 { '-' } else { '+' },
+            exponent.abs()
+        );
+        return;
+    }
+    if t.classify() == TermKind::List {
+        // SAFETY: the NIF callback retains this list's heap while formatting.
+        let mut iter = unsafe { ListIter::new(t) };
+        let mut text = String::new();
+        let mut printable = true;
+        for item in iter.by_ref() {
+            match integer(item) {
+                Some(c) if (0..=255).contains(&c) => {
+                    let c = c as u8;
+                    // IS_CNTRL(c) && !IS_SPACE(c) is not printable.
+                    if (c < 32 || c == 127) && !matches!(c, 9..=13) {
+                        printable = false;
+                        break;
+                    }
+                    match c {
+                        b'\n' => text.push_str("\\n"),
+                        b'"' => text.push_str("\\\""),
+                        _ => text.push(c as char),
+                    }
+                }
+                _ => {
+                    printable = false;
+                    break;
+                }
+            }
+        }
+        if printable && iter.tail() == Term::NIL {
+            out.push('"');
+            out.push_str(&text);
+            out.push('"');
+            return;
+        }
     }
     match t.classify() {
         TermKind::Nil => out.push_str("[]"),
