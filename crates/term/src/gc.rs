@@ -1972,6 +1972,18 @@ fn heap_sizes() -> &'static [usize] {
     })
 }
 
+/// Words of the initial heap of a spawned process whose arguments and reserved words need
+/// `heap_need`, with `min_heap` the process's minimum heap size.
+///
+/// Port of erts/emulator/beam/erl_process.c:12587-12591 (erl_create_process), OTP-29.1.1.
+pub fn spawned_heap_words(heap_need: usize, min_heap: usize) -> Result<usize, TermError> {
+    if heap_need < min_heap {
+        Ok(min_heap)
+    } else {
+        next_heap_size(heap_need, 0, 0)
+    }
+}
+
 pub(crate) fn normalize_heap_minimum(minimum: usize) -> usize {
     let minimum = minimum.max(233);
     next_heap_size(minimum, 0, 233).unwrap_or(minimum)

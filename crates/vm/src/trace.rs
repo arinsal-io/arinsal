@@ -3716,6 +3716,23 @@ pub(crate) fn running_mfa(
             None => ("ets", "delete_trap", 1),
             Some(_) => ("ets", "internal_delete_all", 2),
         });
+    // Port of erts/emulator/beam/erl_process.c:12604 (`p->current = &p->u.initial`) and
+    // erl_trace.c:752-760 (trace_sched_session), OTP-29.1.1: a process that has not run yet
+    // is at its initial function.
+    if !process.entry_started
+        && process.module == crate::process::RUN_PROCESS
+        && let Some((module, function, arity)) = process.initial_mfa
+    {
+        let tuple = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+            .tuple(&[
+                Term::atom(module),
+                Term::atom(function),
+                Term::small(i64::from(arity))
+                    .ok_or_else(|| VmError::Unsupported("running arity".into()))?,
+            ])
+            .map_err(|error| VmError::Unsupported(format!("running MFA: {error:?}")))?;
+        return Ok(Some(tuple));
+    }
     let dirty_bif = process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa);
     let dirty_finalizer = process
         .cold
