@@ -1914,7 +1914,8 @@ fn key_continuation(function: &str) -> &'static str {
 pub(crate) fn charge_light(process: &mut Process, reductions: u32) {
     process.reductions = process
         .reductions
-        .saturating_sub(reductions.min(i32::MAX as u32) as i32);
+        .saturating_sub(reductions.min(i32::MAX as u32) as i32)
+        .max(0);
 }
 
 /// The call's arguments as the X registers hold them now; a collection since the copies
@@ -1935,18 +1936,22 @@ fn call_args(process: &Process, saved: &[Term; 4], arity: usize, resumed: bool) 
     }
 }
 
-/// What one interpreted call of a trapping BIF costs the process and its scheduler slice.
+/// What one call of a trapping BIF costs the process and its scheduler slice.
 ///
 /// A handler decrements the process counter itself while it works (`BUMP_REDS` through its
 /// `Ctx`), and some also return that work as the charge for `charge` to take again. The call
-/// is billed for the work once, as erts bills `REDS_IN - FCALLS`.
+/// is billed for the work once, as erts bills `REDS_IN - FCALLS`. A call is billed no more
+/// than the counter held, since `BUMP_REDS` stops at zero, and what the handler gave up
+/// through `ERTS_VBUMP_ALL_REDS` ends the slice without being the process's own work.
 pub(crate) struct TrapMeter {
     fcalls: i32,
     used: u64,
     consumed: u32,
+    call_counted: bool,
 }
 
 impl TrapMeter {
+    /// The call is an instruction that already counted its own reduction.
     pub(crate) fn start(
         process: &Process,
         ctx: Option<&arinsal_sched::RunCtx<'_, process::Message>>,
@@ -1955,6 +1960,19 @@ impl TrapMeter {
             fcalls: process.reductions,
             used: process.reductions_used,
             consumed: ctx.map_or(0, |run| run.consumed()),
+            call_counted: true,
+        }
+    }
+
+    /// The call is the continuation export, run by the scheduler on schedule-in: its call
+    /// costs one reduction of its own.
+    pub(crate) fn start_continuation(
+        process: &Process,
+        ctx: Option<&arinsal_sched::RunCtx<'_, process::Message>>,
+    ) -> Self {
+        Self {
+            call_counted: false,
+            ..Self::start(process, ctx)
         }
     }
 
@@ -1966,15 +1984,20 @@ impl TrapMeter {
         returned: u32,
     ) {
         let inside = u32::try_from(process.trap_work).unwrap_or(0);
-        let work = inside.max(returned.max(1));
+        let held = u32::try_from(self.fcalls.max(1)).unwrap_or(1);
+        let work = inside.max(returned.max(1)).min(held);
+        let virtual_reds = std::mem::take(&mut process.virtual_reds);
         process.reductions = self
             .fcalls
             .saturating_sub(i32::try_from(work).unwrap_or(i32::MAX))
             .max(0);
+        let counted_call = u32::from(self.call_counted);
         let used = process.reductions_used.saturating_sub(self.used);
-        process.reductions_used = process
-            .reductions_used
-            .saturating_add(u64::from(work.saturating_sub(1)).saturating_sub(used));
+        process.reductions_used = process.reductions_used.saturating_add(
+            u64::from(work.saturating_sub(counted_call))
+                .saturating_sub(used)
+                .saturating_sub(u64::from(virtual_reds)),
+        );
         if let Some(run) = ctx {
             let counted = run.consumed().saturating_sub(self.consumed);
             run.consume(work.saturating_sub(counted));
@@ -2603,6 +2626,34 @@ fn decode_trap_error(error: BifError) -> BifError {
     }
 }
 
+/// Bits copied per reduction: a cache line (`ERTS_CACHE_LINE_SIZE * 8`, 64-byte lines).
+const BITSTRING_COPY_LOOP_FACTOR: u64 = 64 * 8;
+
+/// `ERTS_VBUMP_ALL_REDS`: the rest of the slice is given up without being the process's own
+/// work. The scheduler leaves the process at the next reduction check, and `virtual_reds`
+/// keeps the given-up amount out of the process's reduction count.
+fn vbump_all_reds(process: &mut Process) {
+    if process.reductions > 0 {
+        process.virtual_reds = process
+            .virtual_reds
+            .saturating_add(process.reductions as u32);
+    }
+    process.reductions = 0;
+}
+
+/// `get_reds`: the loop budget of one slice, `ERTS_BIF_REDS_LEFT * loop_factor`, capped by
+/// the `binary_loop_limit` debug state and never zero.
+fn binary_loop_budget(process: &Process, loop_factor: u64) -> u64 {
+    let reds = u64::try_from(process.reductions.max(0))
+        .unwrap_or(0)
+        .saturating_mul(loop_factor);
+    let limit = crate::natives::erts_debug::binary_loop_limit();
+    if limit != 0 && limit < reds {
+        return limit;
+    }
+    reds.max(1)
+}
+
 fn binary_copy(
     process: &mut Process,
     args: &[Term],
@@ -2610,9 +2661,6 @@ fn binary_copy(
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
-    // Port of erts/emulator/beam/erl_bif_binary.c:2380-2505, OTP-29.1.1.
-    const COPY_BYTES_PER_REDUCTION: usize = 64;
-    const CHUNK_BYTES: usize = 4000 * COPY_BYTES_PER_REDUCTION;
     let input = args[0];
     let count = if args.len() == 2 {
         args[1]
@@ -2640,30 +2688,38 @@ fn binary_copy(
             reductions: 1,
         });
     }
+    let target_bits = (len as u64).saturating_mul(8);
+    let max_copy_bits = binary_loop_budget(process, BITSTRING_COPY_LOOP_FACTOR);
     if let Some(state) = state {
         let state = Arc::clone(state);
         let copy = state
             .downcast_ref::<Mutex<BinaryCopyState>>()
             .ok_or(BifError::BADARG)?;
         let mut copy = copy.lock().map_err(|_| BifError::SystemLimit)?;
-        let (done, reductions) = copy_binary_chunk(
-            &mut copy,
-            input,
-            input_len,
-            len,
-            CHUNK_BYTES,
-            COPY_BYTES_PER_REDUCTION,
-        )?;
-        if !done {
-            drop(copy);
-            return Ok(HandlerResult::Yield {
-                continuation: BINARY_COPY_CONTINUATION,
-                state,
-                reductions,
+        let initial_target_offset = (copy.copied as u64).saturating_mul(8);
+        let mut trap_offset = target_bits;
+        if (u64::MAX - max_copy_bits) < initial_target_offset
+            && initial_target_offset.saturating_add(max_copy_bits) < trap_offset
+        {
+            trap_offset = initial_target_offset + max_copy_bits;
+        }
+        copy_binary_to(&mut copy, input, input_len, len, trap_offset)?;
+        if copy.copied == len {
+            let bits_copied = target_bits - initial_target_offset;
+            process.set_gc_enabled(restore_gc);
+            let value = finish_binary_copy(process, &copy.bytes)?;
+            return Ok(HandlerResult::Done {
+                value,
+                reductions: reductions_from(bits_copied / BITSTRING_COPY_LOOP_FACTOR),
             });
         }
-        process.set_gc_enabled(restore_gc);
-        return finish_binary_copy(process, &copy.bytes, reductions);
+        drop(copy);
+        vbump_all_reds(process);
+        return Ok(HandlerResult::Yield {
+            continuation: BINARY_COPY_CONTINUATION,
+            state,
+            reductions: 0,
+        });
     }
 
     let mut bytes = Vec::new();
@@ -2672,33 +2728,41 @@ fn binary_copy(
         .map_err(|_| BifError::SystemLimit)?;
     bytes.resize(len, 0);
     let mut copy = BinaryCopyState { bytes, copied: 0 };
-    let (done, reductions) = copy_binary_chunk(
+    copy_binary_to(
         &mut copy,
         input,
         input_len,
         len,
-        CHUNK_BYTES,
-        COPY_BYTES_PER_REDUCTION,
+        max_copy_bits.min(target_bits),
     )?;
-    if !done {
+    if copy.copied < len {
+        vbump_all_reds(process);
         return Ok(HandlerResult::Yield {
             continuation: BINARY_COPY_CONTINUATION,
             state: MagicRef::new(Mutex::new(copy)),
-            reductions,
+            reductions: 0,
         });
     }
-    finish_binary_copy(process, &copy.bytes, reductions)
+    let value = finish_binary_copy(process, &copy.bytes)?;
+    Ok(HandlerResult::Done {
+        value,
+        reductions: reductions_from(target_bits / BITSTRING_COPY_LOOP_FACTOR),
+    })
 }
 
-fn copy_binary_chunk(
+fn reductions_from(reductions: u64) -> u32 {
+    u32::try_from(reductions).unwrap_or(u32::MAX)
+}
+
+/// `binary_copy_loop`: copy the source repeatedly up to `trap_offset` bits of the target.
+fn copy_binary_to(
     copy: &mut BinaryCopyState,
     input: Term,
     input_len: usize,
     len: usize,
-    chunk_bytes: usize,
-    bytes_per_reduction: usize,
-) -> Result<(bool, u32), BifError> {
-    let end = copy.copied.saturating_add(chunk_bytes).min(len);
+    trap_offset: u64,
+) -> Result<(), BifError> {
+    let end = usize::try_from(trap_offset / 8).map_or(len, |end| end.min(len));
     let mut offset = copy.copied;
     while offset < end {
         let source_offset = offset % input_len;
@@ -2710,20 +2774,14 @@ fn copy_binary_chunk(
         )?;
         offset += amount;
     }
-    let reductions = ((end - copy.copied) / bytes_per_reduction) as u32;
-    copy.copied = end;
-    Ok((end == len, reductions))
+    copy.copied = end.max(copy.copied);
+    Ok(())
 }
 
-fn finish_binary_copy(
-    process: &mut Process,
-    bytes: &[u8],
-    reductions: u32,
-) -> Result<HandlerResult, BifError> {
-    let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+fn finish_binary_copy(process: &mut Process, bytes: &[u8]) -> Result<Term, BifError> {
+    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .binary(bytes)
-        .map_err(|_| BifError::SystemLimit)?;
-    Ok(HandlerResult::Done { value, reductions })
+        .map_err(|_| BifError::SystemLimit)
 }
 
 fn term_to_binary(

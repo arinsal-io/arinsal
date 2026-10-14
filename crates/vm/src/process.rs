@@ -1630,9 +1630,14 @@ impl Executor {
                             // Port of erts/emulator/beam/erl_process.c (erts_current_reductions),
                             // OTP-29.1.1: the process's reduction count includes what its
                             // native code consumed from FCALLS.
-                            process.reductions_used = process
-                                .reductions_used
-                                .saturating_add(u64::try_from(consumed).unwrap_or(0));
+                            // Reductions the slice gave up with `ERTS_VBUMP_ALL_REDS` ended
+                            // the slice but are not the process's own.
+                            let virtual_reds = std::mem::take(&mut process.virtual_reds);
+                            process.reductions_used = process.reductions_used.saturating_add(
+                                u64::try_from(consumed)
+                                    .unwrap_or(0)
+                                    .saturating_sub(u64::from(virtual_reds)),
+                            );
                             match native {
                                 Ok(outcome) => outcome,
                                 Err(VmError::Trap(trap)) => {
@@ -2338,8 +2343,18 @@ impl Executor {
                                                 pending.arity,
                                             ))
                                         });
+                                    let meter = crate::bif_traps::TrapMeter::start_continuation(
+                                        process,
+                                        Some(&*ctx),
+                                    );
                                     let trapped =
                                         crate::bif_traps::run_trapped_export(process, Some(ctx));
+                                    if let Some(Ok(crate::bif_traps::ResumeResult::Handler(
+                                        result,
+                                    ))) = &trapped
+                                    {
+                                        meter.finish(process, Some(ctx), result.reductions());
+                                    }
                                     if let Some((module, function, arity)) = &trapped_callee {
                                         let outcome = match &trapped {
                                             Some(Ok(crate::bif_traps::ResumeResult::Handler(
@@ -2598,6 +2613,10 @@ impl Executor {
                                         } else {
                                             None
                                         };
+                                        let meter = crate::bif_traps::TrapMeter::start_continuation(
+                                            process,
+                                            Some(&*ctx),
+                                        );
                                         if traps_here
                                             && let Some(trapped) = crate::bif_traps::execute_named(
                                                 process,
@@ -2609,6 +2628,13 @@ impl Executor {
                                                 Some(ctx),
                                             )
                                         {
+                                            if let Ok(result) = &trapped {
+                                                meter.finish(
+                                                    process,
+                                                    Some(ctx),
+                                                    result.reductions(),
+                                                );
+                                            }
                                             let outcome = match trapped {
                                                 Ok(crate::bif_traps::HandlerResult::Yield {
                                                     ..
