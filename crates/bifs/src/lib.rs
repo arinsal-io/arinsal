@@ -340,11 +340,19 @@ macro_rules! bif_bodies {
 }
 pub(crate) use bif_bodies;
 
-/// One maps BIF body shared by process dispatch and allocator-only callers.
+/// Process-shaped BIF bodies shared by process dispatch and allocator-only callers.
 macro_rules! process_bif_bodies {
     ($($bif:ident),* $(,)?) => {
+        $crate::process_bif_bodies_in!(bodies; $($bif),*);
+    };
+}
+pub(crate) use process_bif_bodies;
+
+/// Process-shaped BIF bodies in a separate table module for mixed families.
+macro_rules! process_bif_bodies_in {
+    ($module:ident; $($bif:ident),* $(,)?) => {
         #[allow(non_camel_case_types)]
-        mod bodies {
+        mod $module {
             $(
                 pub(super) struct $bif;
                 impl $crate::BifBody for $bif {
@@ -366,7 +374,7 @@ macro_rules! process_bif_bodies {
         }
     };
 }
-pub(crate) use process_bif_bodies;
+pub(crate) use process_bif_bodies_in;
 
 /// Find the implementation of `module:name/arity`.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {

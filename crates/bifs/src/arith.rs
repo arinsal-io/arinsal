@@ -32,7 +32,7 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "round", 1) => v.entry::<bodies::round>(),
         ("erlang", "ceil", 1) => v.entry::<bodies::ceil>(),
         ("erlang", "floor", 1) => v.entry::<bodies::floor>(),
-        ("erlang", "integer_to_list", 1 | 2) => v.entry::<bodies::integer_to_list>(),
+        ("erlang", "integer_to_list", 1 | 2) => v.entry::<process_bodies::integer_to_list>(),
         ("erlang", "integer_to_binary", 1 | 2) => v.entry::<bodies::integer_to_binary>(),
         ("erts_internal", "list_to_integer", 2) => v.entry::<bodies::list_to_integer>(),
         ("erts_internal", "binary_to_integer", 2) => v.entry::<bodies::binary_to_integer>(),
@@ -75,6 +75,7 @@ macro_rules! unary {
 unary!(bnot => "bnot", neg => "-", plus => "+", abs => "abs", to_float => "float", trunc => "trunc", round => "round", ceil => "ceil", floor => "floor");
 
 fn integer_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/bif.c:3313-3360 (integer_to_list_1/2), OTP-29.1.1.
     (if args.len() == 1 {
         arinsal_arith::integer_to_list_decimal(args[0], &mut ctx.heap)
     } else {
@@ -225,8 +226,9 @@ crate::bif_bodies!(
     round,
     ceil,
     floor,
-    integer_to_list,
     integer_to_binary,
     list_to_integer,
     binary_to_integer,
 );
+
+crate::process_bif_bodies_in!(process_bodies; integer_to_list);
