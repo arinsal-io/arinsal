@@ -1365,14 +1365,12 @@ fn internal_state_tuple_get(
         let (Some(first), Some(second)) = (owned_uint(first), owned_uint(second)) else {
             return Err(badarg());
         };
-        // The reference host has ten normal, ten dirty CPU, and ten dirty I/O schedulers.
-        let bits = 5_u32;
-        let low = first | second.wrapping_shl(bits);
-        let high = (second >> (64 - bits)) & ((1_u64 << bits) - 1);
-        let result = (BigInt::from(high) << 64) + BigInt::from(low)
-            - BigInt::from(576_460_752_303_423_488_i64);
+        let value = match arinsal_bifs::debug_make_unique_integer(first, second) {
+            arinsal_bifs::UniqueInt::Small(value) => BigInt::from(value),
+            arinsal_bifs::UniqueInt::Big(value) => value,
+        };
         return from_owned(
-            &OwnedTerm::BigInt(result),
+            &OwnedTerm::BigInt(value),
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .map(Some)

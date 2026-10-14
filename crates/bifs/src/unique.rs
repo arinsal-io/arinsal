@@ -324,6 +324,13 @@ fn combine_unique(thr_id: u64, unique: u64, positive: bool, layout: UniqueLayout
     UniqueInt::Big((BigInt::from(high) << 64) + BigInt::from(low))
 }
 
+/// `erts_debug:get_internal_state({make_unique_integer, Val0, Val1})`: the non-positive
+/// unique integer built from the given thread id and counter, with the process-wide layout.
+// Port of `erts_debug_make_unique_integer`, OTP-29.1.1.
+pub fn debug_make_unique_integer(val0: u64, val1: u64) -> UniqueInt {
+    combine_unique(val0, val1, false, unique_layout())
+}
+
 static MONOTONIC: AtomicU64 = AtomicU64::new(0);
 
 /// Next strictly monotonic unique integer, as `erlang:unique_integer([monotonic])`.
@@ -342,6 +349,17 @@ pub fn next_unique_monotonic_positive() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_unique_integer_follows_the_layout_width() {
+        let build = |bits, val0, val1| match combine_unique(val0, val1, false, layout_for(bits)) {
+            UniqueInt::Small(value) => BigInt::from(value),
+            UniqueInt::Big(value) => value,
+        };
+        assert_eq!(build(5, 0, 1), BigInt::from(MIN_SMALL + 32));
+        assert_eq!(build(6, 0, 1), BigInt::from(MIN_SMALL + 64));
+        assert_eq!(build(6, 3, 0), BigInt::from(MIN_SMALL + 3));
+    }
 
     #[test]
     fn ref_words_roundtrip_the_id() {
