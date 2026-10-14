@@ -703,6 +703,7 @@ impl Vm {
             p.x.get(2).copied().unwrap_or(Term::NIL),
             p.x.get(3).copied().unwrap_or(Term::NIL),
         ];
+        let meter = crate::bif_traps::TrapMeter::start(p, ctx.as_deref());
         if let Some(result) = crate::bif_traps::execute_named(
             p,
             module,
@@ -712,7 +713,9 @@ impl Vm {
             trap_args,
             ctx.as_deref_mut(),
         ) {
-            return match result? {
+            let result = result?;
+            meter.finish(p, ctx.as_deref_mut(), result.reductions());
+            return match result {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
                     p.x[0] = value;
                     p.collect_bin_vheap_if_due(1)?;

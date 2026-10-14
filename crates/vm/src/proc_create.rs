@@ -150,6 +150,9 @@ pub struct Process {
     pub(crate) native_reds_in: i32,
     /// FCALLS the last trapping BIF handler spent on its own, before the call's charge.
     pub(crate) trap_work: i32,
+    /// `esdp->virtual_reds`: reductions the slice gave up through `ERTS_VBUMP_ALL_REDS` since
+    /// the scheduler last folded them. They end the slice but are not the process's own work.
+    pub(crate) virtual_reds: u32,
     pub(crate) reductions_used: u64,
     pub(crate) gc_deferred: bool,
     /// erts `F_DELAY_GC`: set from `loop_rec` until `remove_message` or the wait, while x0
@@ -1176,6 +1179,7 @@ impl Process {
             reductions: 4000,
             native_reds_in: 4000,
             trap_work: 0,
+            virtual_reds: 0,
             reductions_used: 0,
             delay_gc: false,
             gc_deferred: false,
