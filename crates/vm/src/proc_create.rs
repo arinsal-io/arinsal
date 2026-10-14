@@ -670,13 +670,6 @@ pub(crate) fn default_monitor_data() -> std::sync::Arc<MonitorData> {
     })
 }
 
-/// The monitor data a monitor signal carries (erts: the target part points at the same object).
-pub(crate) fn monitor_data_of(
-    shared: arinsal_sched::SharedPayload,
-) -> Option<std::sync::Arc<MonitorData>> {
-    shared.0.downcast::<MonitorData>().ok()
-}
-
 /// Origin half of a local monitor (erts `ERTS_P_MONITORS` entry): the monitored target.
 #[derive(Clone, Debug)]
 pub(crate) struct OriginHalf {
@@ -810,6 +803,8 @@ pub(crate) struct ProcessCold {
     /// Storage of a table being released by a trapped `ets:delete/1` or
     /// `ets:internal_delete_all/2`.
     pub(crate) ets_free: Option<EtsFree>,
+    /// Progress of a trapped list `ets:insert/2` or `ets:insert_new/2`.
+    pub(crate) ets_insert: Option<EtsInsert>,
     /// Module and instruction of a `call_ext_last` whose frame was already released when its
     /// BIF yielded, so the re-executed instruction does not release it twice.
     pub(crate) ext_last_released: Option<(usize, usize)>,
@@ -868,6 +863,9 @@ pub(crate) struct ProcessCold {
     pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
     /// Target half of each local monitor on this process (erts `ERTS_P_LT_MONITORS`).
     pub(crate) monitored_by: std::collections::BTreeMap<u64, TargetHalf>,
+    /// Target halves of NIF resource monitors (erts `ERTS_MON_TYPE_RESOURCE` in `ERTS_P_LT_MONITORS`).
+    pub(crate) resource_monitors:
+        std::collections::BTreeMap<u64, std::sync::Arc<arinsal_nif::ResourceMonitor>>,
     /// Suspends this process holds on others, keyed by target (erts `ERTS_P_MONITORS` SUSPEND).
     pub(crate) suspend_monitors: std::collections::BTreeMap<
         arinsal_sched::Pid,
@@ -1235,7 +1233,7 @@ impl Process {
         words: usize,
         registers: &mut [Term],
         live: usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<bool, VmError> {
         if live > registers.len() {
             return Err(VmError::Unsupported("live X register count".into()));
         }
@@ -1249,7 +1247,7 @@ impl Process {
             && !self.heap.bin_vheap_gc_due()
             && !gc_stress_enabled()
         {
-            return Ok(());
+            return Ok(false);
         }
         if self.x.len() < live {
             let mut roots = self.x.to_vec();
@@ -1259,7 +1257,7 @@ impl Process {
         self.x[..live].copy_from_slice(&registers[..live]);
         let result = self.ensure(words, live);
         registers[..live].copy_from_slice(&self.x[..live]);
-        result
+        result.map(|()| true)
     }
     /// Collect with `live` X roots.
     ///
@@ -1478,6 +1476,15 @@ pub(crate) struct EtsFree {
     /// Object count `ets:internal_delete_all/2` returns when done.
     pub(crate) nitems: usize,
     pub(crate) garbage: arinsal_ets::Garbage,
+}
+
+/// Port of erts/emulator/beam/erl_db.c:2161-2330 (ets_insert_2_list_info), OTP-29.1.1: the state a
+/// list insert keeps across traps.
+pub(crate) enum EtsInsert {
+    /// Objects copied into table form so far, before the table is locked.
+    Copy(Vec<arinsal_ets::PreparedObject>),
+    /// The remaining objects were handed to the busy table; the result lands in the slot.
+    Global(arinsal_ets::InsertOutcome),
 }
 
 /// Port of erts/emulator/beam/erl_process.c:14160 (erts_continue_exit_process trap state),

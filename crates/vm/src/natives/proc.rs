@@ -858,6 +858,25 @@ fn process_info_item_monitored_by(process: &mut Process, pid: Pid) -> Result<Ter
             .unwrap_or_default();
         let mut vals = vals;
         vals.extend(crate::port::driver_monitoring_ports(process, pid));
+        // Resource monitors are in the same monitor tree (ERTS_MON_TYPE_RESOURCE).
+        let resources = process
+            .cold
+            .as_ref()
+            .map(|cold| {
+                cold.resource_monitors
+                    .values()
+                    .filter_map(|monitor| monitor.resource_ref())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for magic in resources {
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            vals.push(
+                TermBuilder::new(&mut heap)
+                    .magic_ref(magic)
+                    .map_err(|_| VmError::Unsupported("monitored_by resource".into()))?,
+            );
+        }
         make_list(process, vals)?
     })
 }

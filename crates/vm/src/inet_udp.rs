@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const REQ_OPEN: i64 = 1;
+const REQ_FDOPEN: i64 = 13;
 const REQ_CONNECT: i64 = 3;
 const REQ_PEER: i64 = 4;
 const REQ_NAME: i64 = 5;
@@ -38,6 +39,7 @@ const REQ_GETSTAT: i64 = 11;
 const REQ_GETHOSTNAME: i64 = 12;
 const REQ_GETTYPE: i64 = 15;
 const REQ_GETSTATUS: i64 = 16;
+const REQ_GETFD: i64 = 14;
 const REQ_GETIFLIST: i64 = 21;
 const REQ_IFGET: i64 = 22;
 const REQ_SUBSCRIBE: i64 = 24;
@@ -78,8 +80,10 @@ const OPT_PACKET_SIZE: u8 = 32;
 const OPT_READ_PACKETS: u8 = 33;
 const OPT_TCLASS: u8 = 41;
 const OPT_RECVTOS: u8 = 43;
+const OPT_RECVTCLASS: u8 = 44;
 const OPT_TTL: u8 = 46;
 const OPT_RECVTTL: u8 = 47;
+const OPT_DEBUG: u8 = 99;
 
 const F_OPEN: u32 = 0x0001;
 const F_ACTIVE: u32 = 0x0004;
@@ -199,9 +203,11 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
         let mut inner = sock.inner.lock().unwrap();
         match cmd {
             REQ_OPEN => (open_socket(&mut inner, data), None),
+            REQ_FDOPEN => (fdopen_socket(&mut inner, data), None),
             2 => {
                 // INET_REQ_CLOSE. Port of inet_drv.c:14701 (packet_inet_ctl CLOSE).
                 let fd = inner.fd.take();
+                inner.fd_external = None;
                 inner.open = false;
                 inner.connected = false;
                 (ok_bytes(&[]), Some((fd, inner.recv.take())))
@@ -214,6 +220,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
             REQ_GETOPTS => (getopts(&inner, data), None),
             REQ_GETSTAT => (getstat(&inner, data), None),
             REQ_GETHOSTNAME => (gethostname(data), None),
+            REQ_GETFD => (getfd(&inner), None),
             // Port of inet_drv.c:11067-11086 (common inet_ctl), OTP-29.1.1.
             REQ_GETIFLIST if inner.open => (inet_drv::getiflist(), None),
             REQ_IFGET if inner.open => (inet_drv::ifget(data), None),
@@ -293,6 +300,53 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     set_nosigpipe(fd);
     // SAFETY: fd was just created and is moved into OwnedFd.
     inner.fd = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+    inner.domain = domain;
+    inner.family_code = data[0];
+    inner.open = true;
+    ok_bytes(&[])
+}
+
+fn fdopen_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
+    // Port of inet_drv.c:14639-14678 (packet_inet_ctl INET_REQ_FDOPEN), OTP-29.1.1.
+    if (data.len() != 6 && data.len() != 10) || inner.fd.is_some() {
+        return err_bytes("einval");
+    }
+    let domain = match data[0] {
+        AF_INET_CODE => libc::AF_INET,
+        AF_INET6_CODE => libc::AF_INET6,
+        AF_LOCAL_CODE => libc::AF_UNIX,
+        _ => return err_bytes("eafnosupport"),
+    };
+    if data[1] != TYPE_DGRAM {
+        return err_bytes("einval");
+    }
+    let raw_fd = i32::from_be_bytes(data[2..6].try_into().unwrap());
+    if raw_fd < 0 {
+        return err_bytes("einval");
+    }
+    let bound = if data.len() == 6 {
+        true
+    } else {
+        i32::from_be_bytes(data[6..10].try_into().unwrap()) != 0
+    };
+    let fd = match crate::port::duplicate_fd(raw_fd) {
+        Ok(fd) => fd,
+        Err(error) => return err_bytes(errno_name(error.raw_os_error().unwrap_or(libc::EINVAL))),
+    };
+    if bound {
+        let addr = match rustix::net::getsockname(&fd) {
+            Ok(addr) => addr,
+            Err(error) => return err_bytes(errno_name(error.raw_os_error())),
+        };
+        let family = rustix::net::AddressFamily::from_raw(domain as _);
+        if addr.address_family() != family {
+            return err_bytes("einval");
+        }
+    }
+    set_nonblock(fd.as_raw_fd());
+    set_nosigpipe(fd.as_raw_fd());
+    inner.fd = Some(fd);
+    inner.fd_external = Some(raw_fd);
     inner.domain = domain;
     inner.family_code = data[0];
     inner.open = true;
@@ -462,10 +516,25 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
         OPT_BROADCAST => sock_bool(inner, libc::SOL_SOCKET, libc::SO_BROADCAST, val != 0),
         OPT_REUSEPORT => sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, val != 0),
         OPT_SNDBUF => sock_int(inner, libc::SOL_SOCKET, libc::SO_SNDBUF, val),
-        OPT_RCVBUF => sock_int(inner, libc::SOL_SOCKET, libc::SO_RCVBUF, val),
+        OPT_RCVBUF => {
+            if !inner.buffer_set {
+                // Port of inet_drv.c:7328-7348 (UDP rcvbuf buffer cap), OTP-29.1.1.
+                inner.buffer = if val > (1 << 16) {
+                    1 << 16
+                } else {
+                    inner.buffer.max(val)
+                };
+            }
+            sock_int(inner, libc::SOL_SOCKET, libc::SO_RCVBUF, val)
+        }
         OPT_TOS => {
             inner.tos = val;
             sock_int(inner, libc::IPPROTO_IP, libc::IP_TOS, val)
+        }
+        // Port of inet_drv.c:7428-7438 (INET_OPT_TCLASS), OTP-29.1.1.
+        OPT_TCLASS => {
+            inner.tclass = val;
+            sock_int(inner, libc::IPPROTO_IPV6, libc::IPV6_TCLASS, val)
         }
         OPT_TTL => {
             inner.ttl = val;
@@ -501,6 +570,7 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
                 return false;
             }
             inner.buffer = val;
+            inner.buffer_set = true;
             true
         }
         OPT_HEADER => {
@@ -543,9 +613,18 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
             inner.recvtos = val != 0;
             sock_bool(inner, libc::IPPROTO_IP, libc::IP_RECVTOS, val != 0)
         }
+        // Port of inet_drv.c:7466-7478 (INET_OPT_RECVTCLASS), OTP-29.1.1.
+        OPT_RECVTCLASS => {
+            inner.recvtclass = val != 0;
+            sock_bool(inner, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, val != 0)
+        }
         OPT_RECVTTL => {
             inner.recvttl = val != 0;
             sock_bool(inner, libc::IPPROTO_IP, libc::IP_RECVTTL, val != 0)
+        }
+        OPT_DEBUG => {
+            inner.debug = val != 0;
+            true
         }
         _ => false,
     }
@@ -755,6 +834,10 @@ fn push_opt(inner: &Inner, code: u8, out: &mut Vec<u8>) -> bool {
             out,
             sock_get_int(inner, libc::IPPROTO_IP, libc::IP_TOS, inner.tos),
         ),
+        OPT_TCLASS => put_i32(
+            out,
+            sock_get_int(inner, libc::IPPROTO_IPV6, libc::IPV6_TCLASS, inner.tclass),
+        ),
         OPT_TTL => put_i32(
             out,
             sock_get_int(inner, libc::IPPROTO_IP, libc::IP_TTL, inner.ttl),
@@ -816,7 +899,9 @@ fn push_opt(inner: &Inner, code: u8, out: &mut Vec<u8>) -> bool {
         OPT_PACKET_SIZE => put_i32(out, inner.packet_size as i32),
         OPT_READ_PACKETS => put_i32(out, inner.read_packets),
         OPT_RECVTOS => put_i32(out, i32::from(inner.recvtos)),
+        OPT_RECVTCLASS => put_i32(out, i32::from(inner.recvtclass)),
         OPT_RECVTTL => put_i32(out, i32::from(inner.recvttl)),
+        OPT_DEBUG => put_i32(out, i32::from(inner.debug)),
         _ => return false,
     }
     true
@@ -892,6 +977,15 @@ fn getstatus(inner: &Inner) -> Vec<u8> {
         flags |= F_ACTIVE;
     }
     ok_bytes(&flags.to_be_bytes())
+}
+
+fn getfd(inner: &Inner) -> Vec<u8> {
+    // Port of inet_drv.c:11205-11213 (INET_REQ_GETFD), OTP-29.1.1.
+    let Some(fd) = inner.fd.as_ref() else {
+        return err_bytes("einval");
+    };
+    let raw = inner.fd_external.unwrap_or_else(|| fd.as_raw_fd());
+    ok_bytes(&(raw as u32).to_be_bytes())
 }
 
 fn subscribe(data: &[u8]) -> Vec<u8> {
@@ -1149,7 +1243,7 @@ fn deliver(handle: &PortHandle, inner: &mut Inner, packet: Packet, outs: &mut Ve
             packet,
             binary: inner.binary,
             header: inner.header,
-            with_anc: inner.recvtos || inner.recvttl,
+            with_anc: inner.recvtos || inner.recvtclass || inner.recvttl,
         });
         return;
     }
@@ -1161,7 +1255,7 @@ fn deliver(handle: &PortHandle, inner: &mut Inner, packet: Packet, outs: &mut Ve
         packet,
         binary: inner.binary,
         header: inner.header,
-        with_anc: inner.recvtos || inner.recvttl,
+        with_anc: inner.recvtos || inner.recvtclass || inner.recvttl,
     });
     match inner.active {
         Active::Once => inner.active = Active::Passive,
@@ -1211,7 +1305,7 @@ fn recv_one(inner: &mut Inner) -> RecvOne {
     msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    let want_cmsg = inner.recvtos || inner.recvttl;
+    let want_cmsg = inner.recvtos || inner.recvtclass || inner.recvttl;
     if want_cmsg {
         msg.msg_control = ctrl.0.as_mut_ptr().cast();
         msg.msg_controllen = ctrl.0.len() as _;
@@ -1761,6 +1855,7 @@ struct Recv {
 
 struct Inner {
     fd: Option<OwnedFd>,
+    fd_external: Option<RawFd>,
     domain: i32,
     family_code: u8,
     open: bool,
@@ -1770,18 +1865,22 @@ struct Inner {
     htype: i32,
     header: usize,
     buffer: i32,
+    buffer_set: bool,
     deliver: i32,
     exit_on_close: bool,
     packet_size: u32,
     read_packets: i32,
     tos: i32,
+    tclass: i32,
     ttl: i32,
     multicast_ttl: i32,
     multicast_loop: bool,
     multicast_if: i32,
     v6only: bool,
     recvtos: bool,
+    recvtclass: bool,
     recvttl: bool,
+    debug: bool,
     op_ref: u16,
     recv: Option<Recv>,
     recv_cnt: u32,
@@ -1800,6 +1899,7 @@ impl Default for Inner {
         // Port of inet_drv.c:10891 (inet_start) and :14508 (read_packets), OTP-29.1.1.
         Self {
             fd: None,
+            fd_external: None,
             domain: libc::AF_INET,
             family_code: AF_INET_CODE,
             open: false,
@@ -1809,18 +1909,22 @@ impl Default for Inner {
             htype: 0,
             header: 0,
             buffer: 9216,
+            buffer_set: false,
             deliver: 1,
             exit_on_close: true,
             packet_size: 0,
             read_packets: 5,
             tos: 0,
+            tclass: 0,
             ttl: 0,
             multicast_ttl: 1,
             multicast_loop: true,
             multicast_if: 0,
             v6only: false,
             recvtos: false,
+            recvtclass: false,
             recvttl: false,
+            debug: false,
             op_ref: 0,
             recv: None,
             recv_cnt: 0,

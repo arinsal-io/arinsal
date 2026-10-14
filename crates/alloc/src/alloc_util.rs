@@ -470,22 +470,17 @@ impl CarrierMemory {
             return None;
         }
         self.words()
-            .as_slice()
-            .get(offset / WORD)
-            .map(|&word| word as usize)
+            .read_word(offset / WORD)
+            .map(|word| word as usize)
     }
     #[inline(always)]
     fn write_word(&mut self, offset: usize, value: usize) -> bool {
         if !offset.is_multiple_of(WORD) {
             return false;
         }
-        match self.words().as_mut_slice().get_mut(offset / WORD) {
-            Some(word) => {
-                *word = value as u64;
-                true
-            }
-            None => false,
-        }
+        // Port of the direct block header stores in erts/emulator/beam/erl_alloc_util.c:302-314,
+        // OTP-29.1.1; the bounded raw view avoids constructing a slice per word.
+        self.words().write_word(offset / WORD, value as u64)
     }
     fn bytes(&self) -> Option<&[u8]> {
         match self {

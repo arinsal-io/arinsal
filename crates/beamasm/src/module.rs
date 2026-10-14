@@ -1347,8 +1347,23 @@ impl BeamModuleAssembler {
         &mut self,
         identity: usize,
         helper: usize,
-        _arity: usize,
+        arity: usize,
     ) -> Result<(), ModuleError> {
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:924-952 (emit_call_nif_yield_helper),
+        // OTP-29.1.1: `FCALLS--` and a context switch when it reaches zero, before the NIF
+        // runs; the process resumes here with its arguments in the X registers.
+        let continuation = self.code.new_label();
+        let stub = self.code.new_label();
+        self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
+        self.code.b_cond(Cond::Le, stub)?;
+        self.code.bind(continuation)?;
+        self.yield_stubs.push((
+            stub,
+            continuation,
+            u8::try_from(arity).map_err(|_| {
+                ModuleError::InvalidOperand("native body arity exceeds X register ABI")
+            })?,
+        ));
         let update = crate::Update::HEAP_ALLOC
             .union(crate::Update::REDUCTIONS)
             .union(crate::Update::X_REGS);

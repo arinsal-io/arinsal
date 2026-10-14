@@ -29,11 +29,19 @@ const BSF_LITTLE_OR_NATIVE: u32 = 2;
 const TMP_MEM0: u32 = 16384;
 
 static APPEND_BINARY: AtomicUsize = AtomicUsize::new(0);
+static PRIVATE_APPEND_FAST: AtomicUsize = AtomicUsize::new(0);
+static PRIVATE_APPEND_CHECKED: AtomicUsize = AtomicUsize::new(0);
 static BS_GC: AtomicUsize = AtomicUsize::new(0);
 
 /// Publishes the runtime used for `<<Bin/binary, Bin2/binary>>` (append + one binary).
 pub fn install_bs_append_binary(function: usize) {
     APPEND_BINARY.store(function, Ordering::Relaxed);
+}
+
+/// Publishes VM-owned private append entries used by native bit syntax code.
+pub fn install_bs_private_append(fast: usize, checked: usize) {
+    PRIVATE_APPEND_FAST.store(fast, Ordering::Relaxed);
+    PRIVATE_APPEND_CHECKED.store(checked, Ordering::Relaxed);
 }
 
 /// Publishes the GC hook `emit_gc_test` calls (`garbage_collect` in BeamAsm).
@@ -315,7 +323,7 @@ fn emit_private(
     asm.code.emit(|e| {
         e.mov_const(
             Gpr::x(17),
-            arinsal_term::erts_bs_private_append_fast as *const () as usize as u64,
+            PRIVATE_APPEND_FAST.load(Ordering::Relaxed) as u64,
         )?;
         e.blr(Gpr::x(17))
     })?;
@@ -384,7 +392,7 @@ fn emit_private(
         asm.code.emit(|e| {
             e.mov_const(
                 Gpr::x(17),
-                arinsal_term::erts_bs_private_append_checked as *const () as usize as u64,
+                PRIVATE_APPEND_CHECKED.load(Ordering::Relaxed) as u64,
             )?;
             e.blr(Gpr::x(17))
         })?;
