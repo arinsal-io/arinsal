@@ -1,6 +1,6 @@
 //! C resource headers and magic reference ownership.
 use crate::Library;
-use crate::{ErlNifEnv, ErlNifResourceTypeInit, terms};
+use crate::{ErlNifEnv, ErlNifResourceTypeInit, put, terms};
 use arinsal_term::{ExternalBinary, MagicRef, Term, TermBuilder};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashMap;
@@ -428,8 +428,7 @@ fn open_type(
     let env = unsafe { &mut *e };
     let (op, address) = open_type_op(env, key, init, flags);
     if !tried.is_null() {
-        // SAFETY: the NIF passes a writable ErlNifResourceFlags or NULL.
-        unsafe { *tried = op }
+        put(tried, op)
     }
     address
 }
@@ -586,8 +585,7 @@ pub extern "C" fn enif_get_resource(
         return 0;
     };
     if !out.is_null() {
-        // SAFETY: The resource allocation and callback remain live during this access.
-        unsafe { *out = owner.data.cast() }
+        put(out, owner.data.cast())
     };
     1
 }
