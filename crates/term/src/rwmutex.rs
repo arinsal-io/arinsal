@@ -50,6 +50,12 @@ pub fn set_reader_group(id: usize) {
     READER_GROUP.with(|slot| slot.set(Some(id)));
 }
 
+/// Whether the calling thread is a normal scheduler, which publishes its reader group:
+/// erts' `ETHR_TS_EV_MAIN_THR` thread status (`ethr_set_main_thr_status`).
+pub fn is_scheduler_thread() -> bool {
+    READER_GROUP.with(|group| group.get().is_some())
+}
+
 fn reader_index() -> usize {
     READER_GROUP.with(|group| {
         if let Some(id) = group.get() {

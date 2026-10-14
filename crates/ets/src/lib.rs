@@ -3,6 +3,7 @@
 mod catree;
 mod hash;
 pub mod match_spec;
+pub mod rwmtx;
 mod tree;
 use catree::CATree;
 use tree::Node;
@@ -900,7 +901,9 @@ pub(crate) struct StoredTerm {
 // `copy_term` asks for one allocation after computing `size_object`. An exact
 // allocation avoids VecHeap's 1024-word minimum for each small ETS object.
 struct ObjectHeap {
-    words: Vec<Box<[u64]>>,
+    // One allocation per object in the common case: the inline slot avoids a second malloc for
+    // the vector holding it.
+    words: smallvec::SmallVec<[Box<[u64]>; 1]>,
     off_heap: Option<Box<OffHeap>>,
 }
 
@@ -925,7 +928,7 @@ struct OffHeap {
 impl ObjectHeap {
     fn new() -> Self {
         Self {
-            words: Vec::new(),
+            words: smallvec::SmallVec::new(),
             off_heap: None,
         }
     }
@@ -1062,7 +1065,12 @@ impl StoredTerm {
         prefix_words: usize,
     ) -> Result<Self, EtsError> {
         let object = term;
-        let db_size_words = Self::accounted_words(term, keypos, compressed, prefix_words, 0);
+        // The object is sized once; the same size serves the accounting and the copy.
+        let plain_size = (!compressed).then(|| arinsal_term::size_object(term));
+        let db_size_words = match plain_size {
+            Some(size) => prefix_words + 2 + size,
+            None => Self::accounted_words(term, keypos, compressed, prefix_words, 0),
+        };
         let mut heap = ObjectHeap::new();
         let mut compressed_elements = Vec::new();
         let mut compressed_magic_refs = Vec::new();
@@ -1103,7 +1111,7 @@ impl StoredTerm {
         } else if let Some(pair) = Self::immediate_pair(term) {
             TermBuilder::new(&mut heap).tuple(&pair)?
         } else {
-            copy_term(term, &mut heap)?
+            arinsal_term::copy_struct(term, &mut heap, plain_size.unwrap_or_default())?
         };
         Ok(Self {
             heap,
@@ -4621,13 +4629,13 @@ pub struct TableLock {
 }
 
 enum TableRwLock<T> {
-    Normal(std::sync::RwLock<T>),
+    Normal(rwmtx::RwMtxLock<T>),
     FrequentRead(FrequentReadRwLock<T>),
 }
 
 /// Shared access to a live table.
 pub enum TableReadGuard<'a, T> {
-    Normal(std::sync::RwLockReadGuard<'a, T>),
+    Normal(rwmtx::RwMtxReadGuard<'a, T>),
     FrequentRead(FrequentReadGuard<'a, T>),
 }
 
@@ -4644,7 +4652,7 @@ impl<T> std::ops::Deref for TableReadGuard<'_, T> {
 
 /// Exclusive access to a live table.
 pub enum TableWriteGuard<'a, T> {
-    Normal(std::sync::RwLockWriteGuard<'a, T>),
+    Normal(rwmtx::RwMtxWriteGuard<'a, T>),
     FrequentRead(FrequentWriteGuard<'a, T>),
 }
 
@@ -4687,7 +4695,7 @@ impl TableLock {
             lock: if frequent_read {
                 TableRwLock::FrequentRead(FrequentReadRwLock::new(table))
             } else {
-                TableRwLock::Normal(std::sync::RwLock::new(table))
+                TableRwLock::Normal(rwmtx::RwMtxLock::new(table))
             },
         }
     }
@@ -4695,10 +4703,7 @@ impl TableLock {
     /// Lock the table for reading.
     pub fn read(&self) -> TableReadGuard<'_, Table> {
         match &self.lock {
-            TableRwLock::Normal(lock) => TableReadGuard::Normal(
-                lock.read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ),
+            TableRwLock::Normal(lock) => TableReadGuard::Normal(lock.read()),
             TableRwLock::FrequentRead(lock) => TableReadGuard::FrequentRead(lock.read()),
         }
     }
@@ -4706,10 +4711,7 @@ impl TableLock {
     /// Lock the table for writing.
     pub fn write(&self) -> TableWriteGuard<'_, Table> {
         match &self.lock {
-            TableRwLock::Normal(lock) => TableWriteGuard::Normal(
-                lock.write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ),
+            TableRwLock::Normal(lock) => TableWriteGuard::Normal(lock.write()),
             TableRwLock::FrequentRead(lock) => TableWriteGuard::FrequentRead(lock.write()),
         }
     }

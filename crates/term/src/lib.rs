@@ -39,7 +39,7 @@ pub use bits::{
     writable_gc_visit,
 };
 pub use copy::{
-    SharedCopyCache, copy_shared, copy_struct_litopt, copy_term, copy_term_litopt,
+    SharedCopyCache, copy_shared, copy_struct, copy_struct_litopt, copy_term, copy_term_litopt,
     copy_term_preserving_sharing, copy_term_preserving_sharing_with_cache,
 };
 pub use fun::{
@@ -89,7 +89,8 @@ pub use region::{
     SEND_COPY_LIMIT_WORDS, SharedRoot, is_region_term, region_owner, seal_for_send,
 };
 pub use rwmutex::{
-    FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, set_reader_group, set_reader_groups,
+    FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, is_scheduler_thread,
+    set_reader_group, set_reader_groups,
 };
 pub use views::{BigRef, FlatMapRef, FloatRef, ListIter};
 
