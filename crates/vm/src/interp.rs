@@ -1816,17 +1816,26 @@ impl Vm {
         let (mut htop, mut stop) = p.heap.heap_cursor();
         let mut heap_dirty = false;
         let mut depth = p.heap.stack_words();
-        // The slice quantum is `budget`. A trapping BIF that already spent FCALLS
-        // left `p.reductions` at 0; the continuation would then trap again with an
-        // empty scan. Port of erl_process.c:10435 (`p->fcalls = reds`), OTP-29.1.1.
-        if p.reductions <= 0 {
-            let installed = i32::try_from(budget).unwrap_or(i32::MAX);
-            if installed > 0 {
-                p.reductions = installed;
-            }
+        // The slice quantum is `budget`: a process scheduled in starts with a full counter,
+        // so a BIF's charge is clamped by the quantum, not by what an earlier slice left.
+        let installed = i32::try_from(budget).unwrap_or(i32::MAX);
+        if installed > 0 {
+            p.reductions = installed;
         }
         let mut reds = p.reductions;
         let mut consumed = 0_u32;
+        let quantum = ctx.as_deref().map_or(0, |run| run.remaining());
+        // A call that charged the slice itself (a driver task run in the caller) used up part
+        // of the quantum without moving `consumed`.
+        macro_rules! sync_slice_use {
+            () => {
+                if let Some(run) = ctx.as_deref() {
+                    consumed = consumed
+                        .max(quantum.saturating_sub(run.remaining()))
+                        .min(budget);
+                }
+            };
+        }
         macro_rules! compare_branch {
             ($ok:expr, $fail:expr) => {
                 if !$ok {
@@ -2062,7 +2071,16 @@ impl Vm {
             p.ip = offset;
             let module = module_handle.as_ref();
             let instr = fetched;
-            p.reductions_used = p.reductions_used.saturating_add(1);
+            // The instructions that scan the message queue and wait are not calls.
+            if !matches!(
+                instr,
+                Instr::LoopRec { .. }
+                    | Instr::LoopRecEnd { .. }
+                    | Instr::Wait { .. }
+                    | Instr::WaitTimeout { .. }
+            ) {
+                p.reductions_used = p.reductions_used.saturating_add(1);
+            }
             #[cfg(feature = "instr-count")]
             {
                 p.stats.instructions += 1;
@@ -2857,6 +2875,7 @@ impl Vm {
                         }
                         other => other?,
                     };
+                    sync_slice_use!();
                     let native_resume = p
                         .cold
                         .as_mut()
@@ -2918,8 +2937,6 @@ impl Vm {
                         p.force_yield = false;
                         p.gc_live = 1;
                         sync_cursor(p, htop, &mut heap_dirty);
-                        p.module = module_id;
-                        p.ip = offset.saturating_add(1);
                         p.reductions = reds;
                         return Ok(RunState::Yield);
                     }
@@ -4431,6 +4448,7 @@ impl Vm {
                                 }
                                 other => other?,
                             };
+                            sync_slice_use!();
                             match outcome {
                                 ImportOutcome::Returned(value) => {
                                     return Ok(RunState::Done(value));

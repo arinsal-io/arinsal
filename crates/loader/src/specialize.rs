@@ -369,7 +369,7 @@ pub enum Instr {
 /// Rewrites bound external BIF calls to direct function-pointer instructions.
 ///
 /// The VM calls this after classifying imports, so native overrides retain
-/// their normal call path.
+/// their normal call path, and so do BIFs that may trap to a continuation.
 // Port of erts/emulator/beam/emu/ops.tab:923-925, OTP-29.1.1.
 pub fn specialize_bif_calls(module: &mut Module) {
     for instruction in &mut module.code {
@@ -385,7 +385,7 @@ pub fn specialize_bif_calls(module: &mut Module) {
         let Some(entry) = module.imports.get(import as usize) else {
             continue;
         };
-        if entry.class() != ImportClass::Pure {
+        if entry.class() != ImportClass::Pure || entry.fast_op == ImportFastOp::Trapping {
             continue;
         }
         let Some(bif) = entry.bif_fn() else {

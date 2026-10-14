@@ -158,6 +158,7 @@ impl Vm {
         for i in 0..arity {
             stored[i] = p.read(regs[i])?;
         }
+        let meter = crate::bif_traps::TrapMeter::start(p, ctx.as_deref());
         if let Some(result) = crate::bif_traps::execute(
             self,
             p,
@@ -166,7 +167,9 @@ impl Vm {
             [stored[0], stored[1], stored[2], Term::NIL],
             ctx.as_deref_mut(),
         ) {
-            return match result? {
+            let result = result?;
+            meter.finish(p, ctx.as_deref_mut(), result.reductions());
+            return match result {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
                     p.write(dst, value)?;
                     p.ip += 1;
