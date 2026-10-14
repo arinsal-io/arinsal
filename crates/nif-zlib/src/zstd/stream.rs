@@ -8,7 +8,9 @@ use arinsal_bifs::{BifError, Ctx};
 use arinsal_term::{Term, TermBuilder, TermError};
 use zstd_sys as z;
 
-use super::{CtxState, Kind, atom_term, get_int, get_zstd_context, is_error, zstd_error};
+use super::{
+    CtxState, Kind, atom_term, get_int, get_zstd_context, inspect_binary, is_error, zstd_error,
+};
 use crate::Heap;
 
 /// `ZSTD_CONTENTSIZE_UNKNOWN` and `ZSTD_CONTENTSIZE_ERROR`.
@@ -31,37 +33,6 @@ unsafe extern "C" {
         input: *mut z::ZSTD_inBuffer,
         directive: i32,
     ) -> usize;
-}
-
-/// `enif_inspect_binary`: the bytes of a whole-byte bitstring, `None` for any other term.
-///
-/// A binary that starts on a byte boundary is borrowed in place. One that does not is copied
-/// into `scratch` and the copy is returned.
-pub(crate) fn inspect_binary(term: Term, scratch: &mut Vec<u8>) -> Option<&[u8]> {
-    // SAFETY: `term` is an argument of the running NIF call; its heap and the owner of its
-    // bytes stay live and unmoved until the call returns, and no writable append runs
-    // while the call borrows it.
-    let view = unsafe { term.binary_ref() }?;
-    if view.bit_len() % 8 != 0 {
-        return None;
-    }
-    let start_bit = view.start_bit();
-    let size = view.bit_len() / 8;
-    let first = start_bit / 8;
-    if start_bit % 8 == 0 {
-        return Some(&view.bytes()[first..first + size]);
-    }
-    let shift = start_bit % 8;
-    let source = view.bytes();
-    scratch.clear();
-    scratch.extend((0..size).map(|index| {
-        let high = source[first + index] << shift;
-        let low = source
-            .get(first + index + 1)
-            .map_or(0, |next| next >> (8 - shift));
-        high | low
-    }));
-    Some(scratch.as_slice())
 }
 
 /// `ZSTD_CStreamOutSize()` or `ZSTD_DStreamOutSize()`: the output buffer of one call.
@@ -232,10 +203,7 @@ pub(super) fn decompress_stream_nif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use arinsal_bifs::ProcessHeapHandle;
-    use arinsal_term::{ProcessHeap, Term, TermBuilder};
-
-    use super::{inspect_binary, timeslice_reductions};
+    use super::timeslice_reductions;
 
     #[test]
     fn timeslice_reductions_match_enif_consume_timeslice() {
@@ -244,73 +212,5 @@ mod tests {
         assert_eq!(timeslice_reductions(50), 2000);
         assert_eq!(timeslice_reductions(100), 4000);
         assert_eq!(timeslice_reductions(5000), 4000);
-    }
-
-    fn with_builder<T>(f: impl FnOnce(&mut TermBuilder<'_, ProcessHeapHandle<'_>>) -> T) -> T {
-        let mut heap = ProcessHeap::with_words(1 << 16);
-        let mut handle = ProcessHeapHandle(&mut heap);
-        f(&mut TermBuilder::new(&mut handle))
-    }
-
-    fn pattern(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i * 7 + 3) as u8).collect()
-    }
-
-    #[test]
-    fn inspect_binary_reads_aligned_binaries_in_place() {
-        with_builder(|builder| {
-            for len in [0, 10, 64, 65, 1000] {
-                let bytes = pattern(len);
-                let term = builder.binary(&bytes).unwrap();
-                let mut scratch = Vec::new();
-                let view = inspect_binary(term, &mut scratch).unwrap();
-                assert_eq!(view, bytes.as_slice());
-                assert_eq!(scratch.capacity(), 0, "len {len} was copied");
-            }
-        });
-    }
-
-    #[test]
-    fn inspect_binary_reads_an_aligned_sub_binary_in_place() {
-        with_builder(|builder| {
-            let bytes = pattern(400);
-            let whole = builder.binary(&bytes).unwrap();
-            let part = builder.sub_binary_bif(whole, 100 * 8, 200 * 8).unwrap();
-            let mut scratch = Vec::new();
-            let view = inspect_binary(part, &mut scratch).unwrap();
-            assert_eq!(view, &bytes[100..300]);
-            assert_eq!(scratch.capacity(), 0);
-        });
-    }
-
-    #[test]
-    fn inspect_binary_copies_an_unaligned_sub_binary() {
-        with_builder(|builder| {
-            let bytes = pattern(400);
-            let whole = builder.binary(&bytes).unwrap();
-            for shift in 1..8 {
-                let part = builder.sub_binary_bif(whole, shift, 300 * 8).unwrap();
-                let mut scratch = Vec::new();
-                let view = inspect_binary(part, &mut scratch).unwrap().to_vec();
-                let expected: Vec<u8> = (0..300)
-                    .map(|i| (bytes[i] << shift) | (bytes[i + 1] >> (8 - shift)))
-                    .collect();
-                assert_eq!(view, expected, "shift {shift}");
-                assert_eq!(scratch, expected);
-            }
-        });
-    }
-
-    #[test]
-    fn inspect_binary_rejects_other_terms() {
-        with_builder(|builder| {
-            let bytes = pattern(100);
-            let bits = builder.bitstring(&bytes, 100 * 8 - 3).unwrap();
-            let tuple = builder.tuple(&[Term::NIL]).unwrap();
-            let mut scratch = Vec::new();
-            for term in [bits, tuple, Term::NIL, Term::small(7).unwrap()] {
-                assert!(inspect_binary(term, &mut scratch).is_none());
-            }
-        });
     }
 }

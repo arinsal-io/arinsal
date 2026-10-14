@@ -10,12 +10,12 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use arinsal_bifs::{BifError, Ctx};
-use arinsal_term::{BinaryRef, Term, TermBuilder};
+use arinsal_term::{Term, TermBuilder};
 use zstd_sys as z;
 
 use super::{
-    DictBox, Kind, atom_term, get_int, get_zstd_context, get_zstd_dict, is_error, make_resource,
-    zstd_error,
+    DictBox, Kind, atom_term, bitstring, copy_bits_fwd, get_int, get_zstd_context, get_zstd_dict,
+    inspect_binary, is_error, make_resource, zstd_error,
 };
 use crate::Heap;
 
@@ -24,47 +24,6 @@ fn cell(list: Term) -> Option<(Term, Term)> {
     // SAFETY: `list` is (part of) an argument of the running NIF call, whose heap stays live
     // and unmoved until the call returns.
     unsafe { list.cons_ref() }
-}
-
-/// The view of a bitstring, `None` for any other term.
-fn bitstring<'a>(term: Term) -> Option<BinaryRef<'a>> {
-    // SAFETY: `term` is (part of) an argument of the running NIF call; its heap and owner stay
-    // live and unmoved, and no writable append runs while the call borrows it.
-    unsafe { term.binary_ref() }
-}
-
-/// Copy `out.len()` bytes that start at bit `start_bit` of `src`.
-fn copy_bits_fwd(out: &mut [u8], src: &[u8], start_bit: usize) {
-    let first = start_bit / 8;
-    let shift = start_bit % 8;
-    if shift == 0 {
-        out.copy_from_slice(&src[first..first + out.len()]);
-        return;
-    }
-    for (index, byte) in out.iter_mut().enumerate() {
-        let high = src[first + index] << shift;
-        let low = src
-            .get(first + index + 1)
-            .map_or(0, |next| next >> (8 - shift));
-        *byte = high | low;
-    }
-}
-
-/// `enif_inspect_binary`: the bytes of a whole-byte bitstring, in place when they are byte
-/// aligned and copied into `scratch` otherwise. `None` for any other term.
-pub(super) fn inspect_binary(term: Term, scratch: &mut Vec<u8>) -> Option<&[u8]> {
-    let view = bitstring(term)?;
-    if view.bit_len() % 8 != 0 {
-        return None;
-    }
-    let (start, len) = (view.start_bit(), view.bit_len() / 8);
-    if start % 8 == 0 {
-        return view.bytes().get(start / 8..start / 8 + len);
-    }
-    scratch.clear();
-    scratch.resize(len, 0);
-    copy_bits_fwd(scratch, view.bytes(), start);
-    Some(scratch)
 }
 
 /// Append the bytes of a whole-byte bitstring to `out`; `None` if it is not one.
