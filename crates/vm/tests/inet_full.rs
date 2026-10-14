@@ -34,7 +34,7 @@ run(Case) ->
     end.
 
 listen(Extra) ->
-    gen_tcp:listen(0, [{tcp_module, inet_tcp}, {active, false} | Extra]).
+    gen_tcp:listen(0, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}}, {active, false} | Extra]).
 
 opts() ->
     {ok, S} = listen([]),
@@ -137,7 +137,7 @@ split(Payload, N, M) ->
 
 two(Mode, A, B) ->
     Opts = [binary, {active, false}, {packet, Mode}],
-    {ok, L} = gen_tcp:listen(0, [{tcp_module, inet_tcp} | Opts]),
+    {ok, L} = gen_tcp:listen(0, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}} | Opts]),
     {ok, Port} = inet:port(L),
     Parent = self(),
     spawn(fun() ->
@@ -163,7 +163,7 @@ http() ->
 
 http_mode(Mode) ->
     Opts = [binary, {active, false}, {packet, Mode}],
-    {ok, L} = gen_tcp:listen(0, [{tcp_module, inet_tcp} | Opts]),
+    {ok, L} = gen_tcp:listen(0, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}} | Opts]),
     {ok, Port} = inet:port(L),
     Parent = self(),
     spawn(fun() ->
@@ -186,7 +186,7 @@ http_mode(Mode) ->
 
 partial() ->
     Opts = [binary, {active, false}, {packet, 2}],
-    {ok, L} = gen_tcp:listen(0, [{tcp_module, inet_tcp} | Opts]),
+    {ok, L} = gen_tcp:listen(0, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}} | Opts]),
     {ok, Port} = inet:port(L),
     Peer = spawn(fun() ->
         {ok, S} = gen_tcp:accept(L, 2000),
@@ -330,7 +330,7 @@ send_timeout() ->
     {R1, R2}.
 
 connect_timeout() ->
-    gen_tcp:connect({192,0,2,1}, 1, [{tcp_module, inet_tcp}, {active, false}], 200).
+    gen_tcp:connect({192,0,2,1}, 1, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}}, {active, false}], 200).
 
 refused() ->
     gen_tcp:connect({127,0,0,1}, 1, [{tcp_module, inet_tcp}, {active, false}], 400).

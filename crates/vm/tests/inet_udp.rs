@@ -67,7 +67,7 @@ run(Case) ->
 
 %% `inet` selects inet_udp without inet_db (same reason tcp tests pass tcp_module).
 udp(Extra) ->
-    [inet | Extra].
+    [inet, {ip, {127,0,0,1}} | Extra].
 
 open() ->
     {ok, S} = gen_udp:open(0, udp([binary, {active, false}])),
@@ -167,7 +167,7 @@ options() ->
     {Set, norm_mif(Got), MifSet}.
 
 options6() ->
-    {ok, S} = gen_udp:open(0, [inet6, binary, {active, false}]),
+    {ok, S} = gen_udp:open(0, [inet6, {ip, {0,0,0,0,0,0,0,1}}, binary, {active, false}]),
     Set = inet:setopts(S, [{ipv6_v6only, true}, {buffer, 2048}, {read_packets, 4}]),
     {ok, Got} = inet:getopts(S, [ipv6_v6only, buffer, read_packets, mode]),
     Mif = inet:setopts(S, [{multicast_if, 1}]),
@@ -220,17 +220,17 @@ header() ->
     Data.
 
 mcast() ->
-    case gen_udp:open(0, udp([binary, {active, false}, {reuseaddr, true},
-                          {add_membership, {{224,0,0,1}, {0,0,0,0}}}])) of
+    case gen_udp:open(0, [inet, {ip, {224,0,0,1}}, binary, {active, false}, {reuseaddr, true},
+                          {add_membership, {{224,0,0,1}, {127,0,0,1}}}]) of
         {ok, M} ->
             {ok, Port} = inet:port(M),
-            {ok, N} = gen_udp:open(0, udp([binary, {active, false}, {multicast_ttl, 1}, {multicast_loop, true}])),
+            {ok, N} = gen_udp:open(0, udp([binary, {active, false}, {multicast_if, {127,0,0,1}}, {multicast_ttl, 1}, {multicast_loop, true}])),
             Send = gen_udp:send(N, {224,0,0,1}, Port, <<"mc">>),
             Recv = case gen_udp:recv(M, 0, 800) of
                 {ok, {_IP, _P, Bin}} -> Bin;
                 Other -> Other
             end,
-            Drop = inet:setopts(M, [{drop_membership, {{224,0,0,1}, {0,0,0,0}}}]),
+            Drop = inet:setopts(M, [{drop_membership, {{224,0,0,1}, {127,0,0,1}}}]),
             gen_udp:close(M),
             gen_udp:close(N),
             {Send, Recv, Drop};
@@ -239,11 +239,12 @@ mcast() ->
     end.
 
 mcast6() ->
-    case gen_udp:open(0, [inet6, binary, {active, false}, {ipv6_v6only, true},
-                          {add_membership, {{16#ff02,0,0,0,0,0,0,1}, 0}}]) of
+    %% Loopback only: lo0 (interface index 1 on macOS) for the membership and the sends.
+    case gen_udp:open(0, [inet6, {ip, {0,0,0,0,0,0,0,1}}, binary, {active, false}, {ipv6_v6only, true},
+                          {add_membership, {{16#ff02,0,0,0,0,0,0,1}, 1}}]) of
         {ok, M} ->
             {ok, Port} = inet:port(M),
-            {ok, N} = gen_udp:open(0, [inet6, binary, {active, false}, {multicast_loop, true}]),
+            {ok, N} = gen_udp:open(0, [inet6, {ip, {0,0,0,0,0,0,0,1}}, binary, {active, false}, {multicast_if, 1}, {multicast_loop, true}]),
             Send = gen_udp:send(N, {16#ff02,0,0,0,0,0,0,1}, Port, <<"mc6">>),
             Recv = case gen_udp:recv(M, 0, 800) of
                 {ok, {_IP, _P, Bin}} -> Bin;
@@ -270,9 +271,9 @@ local() ->
     Data.
 
 inet6() ->
-    {ok, A} = gen_udp:open(0, [inet6, binary, {active, false}, {ipv6_v6only, true}]),
+    {ok, A} = gen_udp:open(0, [inet6, {ip, {0,0,0,0,0,0,0,1}}, binary, {active, false}, {ipv6_v6only, true}]),
     {ok, {_, Port}} = inet:sockname(A),
-    {ok, B} = gen_udp:open(0, [inet6, binary, {active, false}]),
+    {ok, B} = gen_udp:open(0, [inet6, {ip, {0,0,0,0,0,0,0,1}}, binary, {active, false}]),
     ok = gen_udp:send(B, {0,0,0,0,0,0,0,1}, Port, <<"v6">>),
     {ok, {IP, _P, Data}} = gen_udp:recv(A, 0, 1000),
     gen_udp:close(A),
@@ -330,7 +331,7 @@ stress_worker(0) -> ok;
 stress_worker(N) ->
     {ok, A} = gen_udp:open(0, [inet, binary, {active, true}, {ip, {127,0,0,1}}]),
     {ok, Port} = inet:port(A),
-    {ok, B} = gen_udp:open(0, [inet, binary, {active, false}]),
+    {ok, B} = gen_udp:open(0, [inet, {ip, {127,0,0,1}}, binary, {active, false}]),
     {Sender, SenderRef} = spawn_monitor(fun() -> gen_udp:send(B, {127,0,0,1}, Port, <<N:32>>) end),
     ok = gen_udp:close(A),
     ok = gen_udp:close(B),

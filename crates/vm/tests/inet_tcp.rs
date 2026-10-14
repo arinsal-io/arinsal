@@ -40,7 +40,7 @@ run(Case) ->
     end.
 
 tcp(Extra) ->
-    [{tcp_module, inet_tcp} | Extra].
+    [{tcp_module, inet_tcp}, {ip, {127,0,0,1}} | Extra].
 
 listen() ->
     {ok, L} = gen_tcp:listen(0, tcp([{active, false}])),
@@ -180,7 +180,7 @@ names() ->
     {PeerIp, LocalIp, PeerPort =:= Port, is_integer(LocalPort), LocalPort =/= Port}.
 
 udp() ->
-    {ok, S} = gen_udp:open(0, [{udp_module, inet_udp}]),
+    {ok, S} = gen_udp:open(0, [{udp_module, inet_udp}, {ip, {127,0,0,1}}]),
     ok = gen_udp:close(S),
     ok.
 
@@ -188,7 +188,7 @@ sctp() ->
     gen_sctp:open([{sctp_module, inet_sctp}]).
 
 inet6() ->
-    {ok, L} = gen_tcp:listen(0, [inet6, {active, false}]),
+    {ok, L} = gen_tcp:listen(0, [inet6, {ip, {0,0,0,0,0,0,0,1}}, {active, false}]),
     {ok, P} = inet:port(L),
     ok = gen_tcp:close(L),
     is_integer(P) andalso P > 0.

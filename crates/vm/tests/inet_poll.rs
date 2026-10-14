@@ -23,7 +23,7 @@ run(Case) ->
     end.
 
 opts(Extra) ->
-    [{tcp_module, inet_tcp}, binary, {active, false} | Extra].
+    [{tcp_module, inet_tcp}, {ip, {127,0,0,1}}, binary, {active, false} | Extra].
 
 pair(L, Port) ->
     Self = self(),
