@@ -56,9 +56,9 @@ pub use time::{
     monotonic_time_milliseconds, monotonic_time_nanos, next_now_micros, time_offset_nanos_value,
 };
 pub use unique::{
-    SchedulerRefState, UniqueInt, bind_scheduler_ref_state, init_unique_scheduler_count,
-    next_ref_words, next_unique_integer, next_unique_monotonic_positive, ordinary_ref_key,
-    ordinary_ref_words, scheduler_thr_id,
+    SchedulerRefState, UniqueInt, bind_scheduler_ref_state, debug_make_unique_integer,
+    init_unique_scheduler_count, next_ref_words, next_unique_integer,
+    next_unique_monotonic_positive, ordinary_ref_key, ordinary_ref_words, scheduler_thr_id,
 };
 
 pub use sys::{set_emu_flavor_jit, sys_perf_counter};
