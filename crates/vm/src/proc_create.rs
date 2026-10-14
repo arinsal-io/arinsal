@@ -812,9 +812,9 @@ pub(crate) struct ProcessCold {
     /// Storage of a table being released by a trapped `ets:delete/1` or
     /// `ets:internal_delete_all/2`.
     pub(crate) ets_free: Option<EtsFree>,
-    /// Module, instruction and frame size of a `call_ext_last` whose frame was already
-    /// released when its BIF yielded, so the re-executed instruction does not release it twice.
-    pub(crate) ext_last_released: Option<(usize, usize, usize)>,
+    /// The frame of a tail call that was already released when its callee yielded, so the
+    /// re-executed instruction does not release it twice. Its words are GC roots.
+    pub(crate) ext_last_released: Option<ReleasedFrame>,
     /// The frames a trapped BIF call holds in erts but the interpreter does not push.
     pub(crate) trap_return: Option<TrapReturn>,
     /// A process-local BIF trap waiting for its private continuation export.
@@ -921,13 +921,33 @@ pub(crate) struct PersistentGetAll {
 /// erts calls a BIF as an ordinary call: the return address into the caller is on the stack
 /// while the process waits in the trap, above the caller's frame, which a tail call keeps
 /// until the BIF returns. The interpreter re-executes the call instruction on resume instead,
-/// so these words are reported to `process_info` and stack traces without being pushed.
+/// so this return address is reported to `process_info` and stack traces without being pushed.
 pub(crate) struct TrapReturn {
     /// Module and instruction the BIF returns to.
     pub(crate) module: usize,
     pub(crate) ip: usize,
-    /// Words of the caller's frame that a `call_ext_last` released before the call.
-    pub(crate) released: usize,
+}
+
+/// A frame the interpreter released before a tail call whose callee then yielded.
+pub(crate) struct ReleasedFrame {
+    pub(crate) module: usize,
+    pub(crate) ip: usize,
+    /// `true` when erts keeps the frame while a BIF runs (`call_ext_last`, `apply_last`);
+    /// a fun call in tail position releases it before the call.
+    pub(crate) kept: bool,
+    /// The frame's words, as they were before the release.
+    pub(crate) words: Vec<Term>,
+}
+
+const SAVED_FRAME_WORDS: usize = 16;
+
+/// What a tail call that releases its frame keeps until it knows whether the callee yields.
+pub(crate) struct FrameRelease {
+    saved: [Term; SAVED_FRAME_WORDS],
+    count: usize,
+    dealloc: usize,
+    collections: u64,
+    again: Option<Vec<Term>>,
 }
 
 /// The resumable part of an interrupted BIF call.
@@ -959,12 +979,91 @@ impl Process {
         }
         self.cold.as_ref()?.trap_return.as_ref()
     }
+    /// The words of the caller's frame that a trapped `call_ext_last` released and erts keeps.
+    pub(crate) fn trap_frame_words(&self) -> &[Term] {
+        let Some(frame) = self.trap_return_frame() else {
+            return &[];
+        };
+        self.cold
+            .as_ref()
+            .and_then(|cold| cold.ext_last_released.as_ref())
+            .filter(|released| {
+                released.kept && released.module == frame.module && released.ip + 1 == frame.ip
+            })
+            .map_or(&[], |released| &released.words)
+    }
     /// Words of the Erlang stack as erts counts them, with the frames of a trapped call.
     pub(crate) fn observed_stack_words(&self) -> usize {
         self.heap.stack_words()
             + self
                 .trap_return_frame()
-                .map_or(0, |frame| 1 + frame.released)
+                .map_or(0, |_| 1 + self.trap_frame_words().len())
+    }
+    /// Release the frame of a tail call at `module`:`ip` before its callee runs.
+    ///
+    /// A callee that yields makes the instruction run again, with the frame already gone:
+    /// `again` then holds the words the first run released.
+    pub(crate) fn release_tail_frame(
+        &mut self,
+        module: usize,
+        ip: usize,
+        dealloc: usize,
+    ) -> Result<FrameRelease, VmError> {
+        let again = self
+            .cold
+            .as_mut()
+            .and_then(|cold| match cold.ext_last_released.take() {
+                Some(released) if released.module == module && released.ip == ip => {
+                    Some(released.words)
+                }
+                other => {
+                    cold.ext_last_released = other;
+                    None
+                }
+            });
+        let mut release = FrameRelease {
+            saved: [Term::NIL; SAVED_FRAME_WORDS],
+            count: 0,
+            dealloc,
+            collections: self.stats.gc.collections,
+            again,
+        };
+        if release.again.is_none() && dealloc > 0 {
+            if dealloc <= SAVED_FRAME_WORDS {
+                for index in 0..dealloc {
+                    release.saved[index] = self.heap.stack_get(index).unwrap_or(Term::NIL);
+                }
+                release.count = dealloc;
+            }
+            if !self.heap.release_stack(dealloc) {
+                return Err(VmError::Unsupported("stack underflow".into()));
+            }
+        }
+        Ok(release)
+    }
+    /// The callee of a tail call yielded and will run the instruction again.
+    pub(crate) fn note_tail_yield(
+        &mut self,
+        module: usize,
+        ip: usize,
+        release: FrameRelease,
+        kept: bool,
+    ) {
+        let words = match release.again {
+            Some(words) => words,
+            None if release.count == release.dealloc
+                && release.collections == self.stats.gc.collections =>
+            {
+                release.saved[..release.count].to_vec()
+            }
+            None => vec![Term::NIL; release.dealloc],
+        };
+        self.cold_mut().ext_last_released = Some(ReleasedFrame {
+            module,
+            ip,
+            kept,
+            words,
+        });
     }
     /// `true` when `-on_load` did not return `ok` and the entry call must not run.
     ///

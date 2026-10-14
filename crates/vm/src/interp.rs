@@ -2834,16 +2834,12 @@ impl Vm {
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     // A BIF that yielded re-executes this instruction after its frame was
                     // released, so the release must not happen twice.
-                    let released = dealloc > 0
-                        && p.cold
-                            .as_mut()
-                            .is_some_and(|cold| {
-                                cold.ext_last_released.take().map(|(m, i, _)| (m, i))
-                                    == Some((module_id, offset))
-                            });
-                    if dealloc > 0 && !released && !p.heap.release_stack(dealloc as usize) {
-                        return Err(VmError::Unsupported("stack underflow".into()));
-                    }
+                    let site_module = module_id;
+                    let mut release = if dealloc > 0 {
+                        Some(p.release_tail_frame(module_id, offset, dealloc as usize)?)
+                    } else {
+                        None
+                    };
                     p.module = module_id;
                     p.ip = offset;
                     p.reductions = reds;
@@ -2856,9 +2852,10 @@ impl Vm {
                     ) {
                         // A BIF yielding with an error (ets:delete/1 releasing a big table):
                         // the instruction runs again, with its frame already released.
-                        Err(VmError::Yield) if dealloc > 0 => {
-                            p.cold_mut().ext_last_released =
-                                Some((module_id, offset, dealloc as usize));
+                        Err(VmError::Yield) if release.is_some() => {
+                            if let Some(release) = release.take() {
+                                p.note_tail_yield(site_module, offset, release, true);
+                            }
                             return Err(VmError::Yield);
                         }
                         other => other?,
@@ -2905,9 +2902,8 @@ impl Vm {
                     ip = match outcome {
                         ImportOutcome::Returned(value) => return Ok(RunState::Done(value)),
                         ImportOutcome::Yield => {
-                            if dealloc > 0 {
-                                p.cold_mut().ext_last_released =
-                                    Some((module_id, offset, dealloc as usize));
+                            if let Some(release) = release.take() {
+                                p.note_tail_yield(site_module, offset, release, true);
                             }
                             sync_cursor(p, htop, &mut heap_dirty);
                             p.reductions = reds;
@@ -3953,9 +3949,12 @@ impl Vm {
                     p.ip = offset;
                     p.reductions = reds;
                     let fun = p.read(src)?;
-                    if dealloc > 0 && !p.heap.release_stack(dealloc as usize) {
-                        return Err(VmError::Load("stack underflow in call_fun".into()));
-                    }
+                    let site_module = module_id;
+                    let mut release = if tail || dealloc > 0 {
+                        Some(p.release_tail_frame(module_id, offset, dealloc as usize)?)
+                    } else {
+                        None
+                    };
                     let outcome =
                         self.call_fun_term(p, fun, arity as usize, tail, ctx.as_deref_mut())?;
                     // call_fun may grow X to hold the closure environment.
@@ -3968,6 +3967,15 @@ impl Vm {
                     ip = match outcome {
                         ImportOutcome::Returned(value) => return Ok(RunState::Done(value)),
                         ImportOutcome::Yield => {
+                            if tail
+                                && p.module == site_module
+                                && p.ip == offset
+                                && let Some(release) = release.take()
+                            {
+                                // erts releases the frame of a fun call in tail position
+                                // before the call, so a BIF trap shows no frame of it.
+                                p.note_tail_yield(site_module, offset, release, false);
+                            }
                             sync_cursor(p, htop, &mut heap_dirty);
                             p.reductions = reds;
                             return Ok(RunState::Yield);
@@ -3991,9 +3999,12 @@ impl Vm {
                     p.module = module_id;
                     p.ip = offset;
                     p.reductions = reds;
-                    if dealloc > 0 && !p.heap.release_stack(dealloc as usize) {
-                        return Err(VmError::Unsupported("stack underflow".into()));
-                    }
+                    let site_module = module_id;
+                    let mut release = if dealloc > 0 {
+                        Some(p.release_tail_frame(module_id, offset, dealloc as usize)?)
+                    } else {
+                        None
+                    };
                     let outcome = self.apply_fixed(
                         p,
                         arity as usize,
@@ -4009,6 +4020,12 @@ impl Vm {
                     ip = match outcome {
                         ImportOutcome::Returned(value) => return Ok(RunState::Done(value)),
                         ImportOutcome::Yield => {
+                            if p.module == site_module
+                                && p.ip == offset
+                                && let Some(release) = release.take()
+                            {
+                                p.note_tail_yield(site_module, offset, release, true);
+                            }
                             sync_cursor(p, htop, &mut heap_dirty);
                             p.reductions = reds;
                             return Ok(RunState::Yield);
@@ -4411,21 +4428,18 @@ impl Vm {
                         }
                         Opcode::CallExt | Opcode::CallExtLast | Opcode::CallExtOnly => {
                             let tail = opcode != Opcode::CallExt;
-                            if opcode == Opcode::CallExtLast {
+                            let (site_module, site_ip) = (p.module, p.ip);
+                            let mut release = if opcode == Opcode::CallExtLast {
                                 // A yielded BIF re-executes this instruction: the frame is
                                 // already gone then.
-                                let site = (p.module, p.ip);
-                                let released = p
-                                    .cold
-                                    .as_mut()
-                                    .is_some_and(|cold| {
-                                        cold.ext_last_released.take().map(|(m, i, _)| (m, i))
-                                            == Some(site)
-                                    });
-                                if !released {
-                                    p.heap.release_stack(c.value() as usize);
-                                }
-                            }
+                                Some(p.release_tail_frame(
+                                    site_module,
+                                    site_ip,
+                                    c.value() as usize,
+                                )?)
+                            } else {
+                                None
+                            };
                             let outcome = match self.call_import(
                                 p,
                                 b.value() as usize,
@@ -4433,9 +4447,10 @@ impl Vm {
                                 tail,
                                 ctx.as_deref_mut(),
                             ) {
-                                Err(VmError::Yield) if opcode == Opcode::CallExtLast => {
-                                    p.cold_mut().ext_last_released =
-                                        Some((p.module, p.ip, c.value() as usize));
+                                Err(VmError::Yield) if release.is_some() => {
+                                    if let Some(release) = release.take() {
+                                        p.note_tail_yield(site_module, site_ip, release, true);
+                                    }
                                     return Err(VmError::Yield);
                                 }
                                 other => other?,
@@ -4446,9 +4461,8 @@ impl Vm {
                                     return Ok(RunState::Done(value));
                                 }
                                 ImportOutcome::Yield => {
-                                    if opcode == Opcode::CallExtLast {
-                                        p.cold_mut().ext_last_released =
-                                            Some((p.module, p.ip, c.value() as usize));
+                                    if let Some(release) = release.take() {
+                                        p.note_tail_yield(site_module, site_ip, release, true);
                                     }
                                     sync_cursor(p, htop, &mut heap_dirty);
                                     p.reductions = reds;

@@ -1728,14 +1728,16 @@ fn backtrace_with(
                 ))
             })
             .unwrap_or_else(|| "unknown function".into());
-        let slot = base.wrapping_sub((1 + frame.released) * 8);
+        let kept = process.trap_frame_words();
+        let slot = base.wrapping_sub((1 + kept.len()) * 8);
         let _ = writeln!(
             text,
             "\n{slot:#018x} Return addr {:#018x} ({description})",
             word.tagged_word() as usize
         );
-        for yreg in 0..frame.released {
-            let _ = writeln!(text, "{:<8} []", format!("y({yreg})"));
+        for (yreg, word) in kept.iter().enumerate() {
+            let _ = write!(text, "{:<8} ", format!("y({yreg})"));
+            let _ = writeln!(text, "{}", print(*word));
         }
     }
     let mut yreg = 0usize;
