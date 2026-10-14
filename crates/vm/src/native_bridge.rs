@@ -681,6 +681,20 @@ pub(crate) fn bridge_return_address() -> usize {
     arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize
 }
 
+/// Push the exit bridge as the only stack word of a process the interpreter runs from its
+/// first call, the way erts starts every process with `beam_normal_exit` as its return
+/// address: `process_info` then counts and prints the terminate frame, and the entry
+/// function's return pops it into the process exit.
+pub(crate) fn push_exit_bridge(process: &mut Process) {
+    if register_bridge_continuation().is_err() || !process.heap.reserve_stack(1) {
+        return;
+    }
+    process.heap.stack_set(
+        0,
+        crate::proc_create::native_continuation_term(bridge_return_address()),
+    );
+}
+
 pub(crate) fn native_trace_return_address() -> usize {
     arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize
 }

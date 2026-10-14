@@ -6074,6 +6074,7 @@ impl Process {
             && self.cold.as_ref().is_none_or(|cold| {
                 cold.persistent_get_all.is_none()
                     && cold.apply_roots.is_empty()
+                    && cold.ext_last_released.is_none()
                     && cold.nif_pending.is_none()
                     && cold.call_memory.is_empty()
             })
@@ -6128,6 +6129,9 @@ impl Process {
         let mut nif_roots_len = 0;
         if let Some(cold) = self.cold.as_mut() {
             roots.extend_from_slice(&cold.apply_roots);
+            if let Some(released) = cold.ext_last_released.as_ref() {
+                roots.extend_from_slice(&released.words);
+            }
             if let Some(pending) = cold.nif_pending.as_mut() {
                 nif_roots_len = pending.roots_mut().len();
                 roots.extend_from_slice(pending.roots_mut());
@@ -6232,10 +6236,20 @@ impl Process {
             let apply_end = apply_start + cold.apply_roots.len();
             cold.apply_roots
                 .copy_from_slice(&roots[apply_start..apply_end]);
+            let released_end = apply_end
+                + cold
+                    .ext_last_released
+                    .as_ref()
+                    .map_or(0, |released| released.words.len());
+            if let Some(released) = cold.ext_last_released.as_mut() {
+                released
+                    .words
+                    .copy_from_slice(&roots[apply_end..released_end]);
+            }
             if let Some(pending) = cold.nif_pending.as_mut() {
                 pending
                     .roots_mut()
-                    .copy_from_slice(&roots[apply_end..apply_end + nif_roots_len]);
+                    .copy_from_slice(&roots[released_end..released_end + nif_roots_len]);
             }
         }
         for (slot, &term) in self
