@@ -89,6 +89,7 @@ const OPT_LINE: u8 = 40;
 const OPT_TCLASS: u8 = 41;
 const OPT_BIND_TO_DEVICE: u8 = 42;
 const OPT_RECVTOS: u8 = 43;
+const OPT_RECVTCLASS: u8 = 44;
 const OPT_TTL: u8 = 46;
 const OPT_RECVTTL: u8 = 47;
 const OPT_NOPUSH: u8 = 48;
@@ -1270,6 +1271,13 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
                 return false;
             }
         }
+        // Port of inet_drv.c:7466-7478 (INET_OPT_RECVTCLASS), OTP-29.1.1.
+        OPT_RECVTCLASS => {
+            inner.recvtclass = val != 0;
+            if !sock_set(inner, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, val, true) {
+                return false;
+            }
+        }
         OPT_TTL => {
             inner.ttl = val;
             if !sock_set(inner, libc::IPPROTO_IP, libc::IP_TTL, val, true) {
@@ -1438,6 +1446,12 @@ fn push_opt(inner: &Inner, code: u8, data: &[u8], i: &mut usize, out: &mut Vec<u
         OPT_LINE => return false,
         OPT_RECVTOS => {
             if let Some(value) = sock_get_int(inner, libc::IPPROTO_IP, libc::IP_RECVTOS) {
+                write_i32(out, i32::from(value != 0));
+            }
+        }
+        // Port of inet_drv.c:9362-9368 (INET_OPT_RECVTCLASS), OTP-29.1.1.
+        OPT_RECVTCLASS => {
+            if let Some(value) = sock_get_int(inner, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS) {
                 write_i32(out, i32::from(value != 0));
             }
         }
@@ -2614,6 +2628,7 @@ struct Inner {
     ttl: i32,
     delay_send: bool,
     recvtos: bool,
+    recvtclass: bool,
     recvttl: bool,
     show_econnreset: bool,
     debug: bool,
@@ -2689,6 +2704,7 @@ impl Default for Inner {
             ttl: 0,
             delay_send: false,
             recvtos: false,
+            recvtclass: false,
             recvttl: false,
             show_econnreset: false,
             debug: false,

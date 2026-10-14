@@ -406,6 +406,7 @@ dependencies = [
  "mio",
  "num-bigint",
  "num-traits",
+ "rustix",
  "similar-asserts",
  "smallvec",
 ]
