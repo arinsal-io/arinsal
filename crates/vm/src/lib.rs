@@ -36,6 +36,7 @@ mod inet_drv;
 mod inet_udp;
 pub(crate) mod node_tables;
 mod port;
+mod ram_file_drv;
 mod receive;
 mod seq_trace;
 mod signals;

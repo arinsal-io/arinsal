@@ -956,16 +956,31 @@ fn try_accept(inner: &Inner) -> Option<Result<OwnedFd, i32>> {
 fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
     let runtime = Arc::clone(&listen.runtime);
     let name = listen.handle.port_name();
-    let Ok((id, handle)) = crate::port::alloc_inet_port(&runtime, caller, name) else {
-        emit(
-            listen,
-            Out::AsyncError {
-                caller,
-                aref,
-                reason: "enomem",
-            },
-        );
-        return;
+    // Port of erts/emulator/drivers/common/inet_drv.c:11829-11839 (tcp_inet_copy), OTP-29.1.1.
+    let (id, handle) = match crate::port::alloc_inet_port(&runtime, caller, name) {
+        Ok(port) => port,
+        Err(crate::port::InetPortAllocError::SystemLimit) => {
+            emit(
+                listen,
+                Out::AsyncError {
+                    caller,
+                    aref,
+                    reason: "system_limit",
+                },
+            );
+            return;
+        }
+        Err(crate::port::InetPortAllocError::NoMemory) => {
+            emit(
+                listen,
+                Out::AsyncError {
+                    caller,
+                    aref,
+                    reason: "enomem",
+                },
+            );
+            return;
+        }
     };
     // Port of inet_drv.c:11795 (tcp_inet_copy), OTP-29.1.1.
     // `active` is not copied here; prim_inet:accept_opts sets it afterwards.
