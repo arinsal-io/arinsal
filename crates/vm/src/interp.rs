@@ -963,8 +963,8 @@ fn exec_hot(cursor: HotCursor, fixed: HotFixed) -> HotCursor {
     let HotCursor {
         mut ip,
         mut htop,
-        mut reds,
-        mut consumed,
+        reds,
+        consumed,
         mut gc_live,
         mut heap_dirty,
     } = cursor;
@@ -981,6 +981,13 @@ fn exec_hot(cursor: HotCursor, fixed: HotFixed) -> HotCursor {
     } = fixed;
     loop {
         if consumed == budget {
+            break;
+        }
+        // A function entry is where erts spends a reduction (`i_test_yield`); the full
+        // interpreter charges it before the entry instruction runs.
+        // SAFETY: `ip` and `base` belong to the same code allocation, and the table has one
+        // slot per code instruction.
+        if unsafe { *entry_arity.add(ip.offset_from(base) as usize) } != 0 {
             break;
         }
         // SAFETY: The caller keeps `ip` inside this module's code, which ends
@@ -1124,10 +1131,6 @@ fn exec_hot(cursor: HotCursor, fixed: HotFixed) -> HotCursor {
                     false
                 } else {
                     gc_live = (packed - 1) as usize;
-                    reds -= 1;
-                    if reds == 0 {
-                        reds = 4000;
-                    }
                     // SAFETY: The loader resolved the local call target.
                     ip = unsafe { base.add(slot) };
                     true
@@ -1191,7 +1194,6 @@ fn exec_hot(cursor: HotCursor, fixed: HotFixed) -> HotCursor {
         if !handled {
             break;
         }
-        consumed += 1;
         #[cfg(feature = "instr-count")]
         {
             // SAFETY: The counter pointer is the running process stats.
@@ -1870,6 +1872,18 @@ impl Vm {
                 }
             }};
         }
+        // The call of a BIF or native function costs a reduction of its own, before its body's.
+        // Port of emit_call_light_bif_shared in erts/emulator/beam/jit/arm/instr_bif.cpp:378-535
+        // (`subs FCALLS, #1`), OTP-29.1.1.
+        macro_rules! charge_bif_call {
+            () => {{
+                p.reductions_used = p.reductions_used.saturating_add(1);
+                consumed = (consumed + 1).min(budget);
+                if let Some(run) = ctx.as_deref_mut() {
+                    run.consume(1);
+                }
+            }};
+        }
         macro_rules! float_bin {
             ($a:expr, $b:expr, $dst:expr, $op:tt) => {{
                 // SAFETY: Specialization validates all FR indices below 1024.
@@ -1883,13 +1897,7 @@ impl Vm {
             }};
         }
         macro_rules! return_from_frame {
-            ($charge:expr) => {{
-                if $charge {
-                    reds -= 1;
-                    if reds == 0 {
-                        reds = 4000;
-                    }
-                }
+            () => {{
                 let mut cp = p.heap.stack_get(0).map_or(0, Term::tagged_word);
                 while cp as usize
                     == arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize
@@ -1997,8 +2005,12 @@ impl Vm {
             // Skip the fast loop when the next opcode is not in it. A cold
             // streak would otherwise pay a call that returns immediately.
             // SAFETY: `ip` addresses this module's code, which ends with CodeEnd.
-            if hot_prefix(unsafe { *ip }) {
-                let before = consumed;
+            if hot_prefix(unsafe { *ip })
+                // A function entry is charged below, before its instruction runs.
+                // SAFETY: `ip` and `base` belong to the same code allocation, and the table has
+                // one slot per code instruction.
+                && unsafe { *arity_ptr.add(ip.offset_from(base) as usize) } == 0
+            {
                 let cursor = exec_hot(
                     HotCursor {
                         ip,
@@ -2022,16 +2034,8 @@ impl Vm {
                 );
                 ip = cursor.ip;
                 htop = cursor.htop;
-                reds = cursor.reds;
-                consumed = cursor.consumed;
                 p.gc_live = cursor.gc_live;
                 heap_dirty = cursor.heap_dirty;
-                let charge = consumed - before;
-                if charge != 0
-                    && let Some(context) = ctx.as_deref_mut()
-                {
-                    context.consume(charge);
-                }
             }
             // ---- processes and messages ----
             let module = &self.code.modules[module_id];
@@ -2063,24 +2067,21 @@ impl Vm {
                 p.reductions = reds;
                 return Ok(RunState::Yield);
             }
-            consumed = (consumed + 1).min(budget);
-            if let Some(ctx) = ctx.as_deref_mut() {
-                ctx.consume(1);
+            // Port of emit_i_test_yield in erts/emulator/beam/jit/arm/instr_common.cpp:3097-3118,
+            // OTP-29.1.1: a reduction is spent at each function entry (`subs FCALLS, #1`), not
+            // per instruction, so a slice lasts as many calls as erts' CONTEXT_REDS.
+            if module.entry_arity.get(offset).copied().unwrap_or(0) != 0 {
+                reds -= 1;
+                consumed = (consumed + 1).min(budget);
+                if let Some(ctx) = ctx.as_deref_mut() {
+                    ctx.consume(1);
+                }
+                p.reductions_used = p.reductions_used.saturating_add(1);
             }
             p.module = module_id;
             p.ip = offset;
             let module = module_handle.as_ref();
             let instr = fetched;
-            // The instructions that scan the message queue and wait are not calls.
-            if !matches!(
-                instr,
-                Instr::LoopRec { .. }
-                    | Instr::LoopRecEnd { .. }
-                    | Instr::Wait { .. }
-                    | Instr::WaitTimeout { .. }
-            ) {
-                p.reductions_used = p.reductions_used.saturating_add(1);
-            }
             #[cfg(feature = "instr-count")]
             {
                 p.stats.instructions += 1;
@@ -2182,7 +2183,7 @@ impl Vm {
                                 match outcome {
                                     ImportOutcome::Returned(value) => {
                                         p.x[0] = value;
-                                        return_from_frame!(true);
+                                        return_from_frame!();
                                     }
                                     ImportOutcome::Yield => {
                                         sync_cursor(p, htop, &mut heap_dirty);
@@ -2202,7 +2203,7 @@ impl Vm {
                                         }
                                         ip = target;
                                     }
-                                    ImportOutcome::Advanced => return_from_frame!(true),
+                                    ImportOutcome::Advanced => return_from_frame!(),
                                 }
                                 continue;
                             }
@@ -2289,7 +2290,7 @@ impl Vm {
                     depth = depth.saturating_sub(5);
                     (htop, stop) = p.heap.heap_cursor();
                     heap_dirty = false;
-                    return_from_frame!(false);
+                    return_from_frame!();
                 }
                 Instr::ReturnToTrace => {
                     // The handler reloads the heap cursor below: publish pending allocations first.
@@ -2308,7 +2309,7 @@ impl Vm {
                     depth = depth.saturating_sub(1);
                     (htop, stop) = p.heap.heap_cursor();
                     heap_dirty = false;
-                    return_from_frame!(false);
+                    return_from_frame!();
                 }
                 Instr::CoverageProbe { index } => {
                     if let (Some(coverage), Some(probe)) = (
@@ -2463,7 +2464,7 @@ impl Vm {
                     (htop, stop) = p.heap.heap_cursor();
                     depth = p.heap.stack_words();
                     heap_dirty = false;
-                    return_from_frame!(true);
+                    return_from_frame!();
                 }
                 Instr::MoveXX { src, dst } => {
                     // SAFETY: Specialization validates both register indices below 1024.
@@ -2497,10 +2498,6 @@ impl Vm {
                     let cp = crate::stacktrace::continuation_tag(module_id, offset + 2)?;
                     // SAFETY: The new stack slot is reserved and contains an immediate.
                     unsafe { *stop = cp.raw_bits() };
-                    reds -= 1;
-                    if reds == 0 {
-                        reds = 4000;
-                    }
                     // SAFETY: The loader resolved the local call target.
                     ip = unsafe { base.add(target as usize) };
                     continue;
@@ -2677,10 +2674,6 @@ impl Vm {
                         .function_at(target as usize)
                         .ok_or_else(|| VmError::Unsupported("local call target".into()))?
                         .1 as usize;
-                    reds -= 1;
-                    if reds == 0 {
-                        reds = 4000;
-                    }
                     // SAFETY: Loader-resolved labels designate instructions in this code allocation.
                     ip = unsafe { base.add(target as usize) };
                     continue;
@@ -2742,12 +2735,15 @@ impl Vm {
                                 }
                                 depth = p.heap.stack_words();
                                 stop = p.heap.heap_cursor().1;
-                                return_from_frame!(true);
+                                return_from_frame!();
                             }
                             // SAFETY: This instruction is followed by another
                             // instruction or CodeEnd in this allocation.
                             ip = unsafe { ip.add(1) };
                             let charge = bif_reductions.saturating_add(1);
+                            // The call itself costs a reduction (`subs FCALLS, #1` in
+                            // emit_call_light_bif_shared); the BIF body's are counted above.
+                            p.reductions_used = p.reductions_used.saturating_add(1);
                             // The BIF body changed the process FCALLS through Ctx. Keep the
                             // interpreter's cached value in step without charging it again.
                             reds = p.reductions;
@@ -2814,6 +2810,9 @@ impl Vm {
                                 // instruction or CodeEnd in this allocation.
                                 ip = unsafe { ip.add(1) };
                                 let charge = bif_reductions.saturating_add(1);
+                                // The call itself costs a reduction (`subs FCALLS, #1` in
+                                // emit_call_light_bif_shared); the BIF body's are counted above.
+                                p.reductions_used = p.reductions_used.saturating_add(1);
                                 // The BIF body changed the process FCALLS through Ctx. Keep the
                                 // interpreter's cached value in step without charging it again.
                                 reds = p.reductions;
@@ -2876,6 +2875,12 @@ impl Vm {
                         other => other?,
                     };
                     sync_slice_use!();
+                    if matches!(
+                        outcome,
+                        ImportOutcome::Advanced | ImportOutcome::Returned(_)
+                    ) {
+                        charge_bif_call!();
+                    }
                     let native_resume = p
                         .cold
                         .as_mut()
@@ -3003,10 +3008,6 @@ impl Vm {
                         p.cold_mut().native_transfer = true;
                         return Ok(RunState::Yield);
                     }
-                    reds -= 1;
-                    if reds == 0 {
-                        reds = 4000;
-                    }
                     // SAFETY: Loader-resolved labels designate instructions in this allocation.
                     ip = unsafe { base.add(target as usize) };
                     continue;
@@ -3041,15 +3042,11 @@ impl Vm {
                         p.cold_mut().native_transfer = true;
                         return Ok(RunState::Yield);
                     }
-                    reds -= 1;
-                    if reds == 0 {
-                        reds = 4000;
-                    }
                     // SAFETY: Loader-resolved labels designate instructions in this allocation.
                     ip = unsafe { base.add(target as usize) };
                     continue;
                 }
-                Instr::ReturnInstr => return_from_frame!(true),
+                Instr::ReturnInstr => return_from_frame!(),
                 Instr::DeallocateReturn { slots } => {
                     if !p.heap.release_stack(slots as usize) {
                         return Err(VmError::Unsupported("stack underflow".into()));
@@ -3058,7 +3055,7 @@ impl Vm {
                     // SAFETY: `release_stack` checked the old live interval.
                     stop = unsafe { stop.add(slots as usize) };
                     count_second!("return");
-                    return_from_frame!(true);
+                    return_from_frame!();
                 }
                 Instr::Allocate { slots, words, live } => {
                     p.gc_live = live as usize;
@@ -3123,7 +3120,7 @@ impl Vm {
                     // SAFETY: Specialization validates the X index.
                     compare_branch!(compare::lt(unsafe { *x.add(a as usize) }, b), fail);
                     count_second!("return");
-                    return_from_frame!(true);
+                    return_from_frame!();
                 }
                 Instr::IsLtCX { a, b, fail } => {
                     // SAFETY: Specialization validates every X index below 1024.
@@ -4449,6 +4446,9 @@ impl Vm {
                                 other => other?,
                             };
                             sync_slice_use!();
+                            if matches!(outcome, ImportOutcome::Advanced) {
+                                charge_bif_call!();
+                            }
                             match outcome {
                                 ImportOutcome::Returned(value) => {
                                     return Ok(RunState::Done(value));

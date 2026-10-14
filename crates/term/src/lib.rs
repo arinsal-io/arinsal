@@ -50,6 +50,7 @@ pub use fun::{
 };
 pub use gc::{
     FragmentAlloc, FragmentIndex, GcStats, set_gc_clock_for_long_gc, set_gc_clock_for_msacc,
+    spawned_heap_words,
 };
 pub use hamt::{
     HxNode, alloc_terms, boxed_object_words, build_hamt_from_unique, flatmap_keys,
