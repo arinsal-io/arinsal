@@ -245,6 +245,8 @@ pub(crate) struct PortHandle {
     /// Set when the port is removed, before its name is erased.
     reg_closing: AtomicBool,
     halt_progress: Mutex<Option<HaltProgress>>,
+    /// `ram_file_drv` port data (`drv_data`), present from `rfile_start` until `rfile_stop`.
+    ram_file: Mutex<Option<Arc<crate::ram_file_drv::RamPort>>>,
 }
 
 /// Inspect or move the next local port id for `erts_debug` table tests.
@@ -1243,7 +1245,7 @@ fn start_driver(
     reservation.commit();
     // g_inet_udp
     if ram_file {
-        crate::ram_file_drv::attach(port_id, Arc::clone(&handle), _binary);
+        *handle.ram_file.lock().unwrap() = Some(crate::ram_file_drv::start(_binary));
     } else if udp {
         crate::inet_udp::attach(Arc::clone(runtime), port_id, Arc::clone(&handle));
     } else {
@@ -2407,6 +2409,7 @@ fn make_handle_with(
         reg_word: Arc::new(AtomicU32::new(crate::register::NO_REG_ATOM)),
         reg_closing: AtomicBool::new(false),
         halt_progress: Mutex::new(None),
+        ram_file: Mutex::new(None),
     });
     Ok(handle)
 }
@@ -3352,14 +3355,15 @@ fn port_command(
         }
         return crate::inet_drv::command(id, ctx.pid(), framed).map(|()| atom("true"));
     }
-    if crate::ram_file_drv::owns(id) {
+    let ram_file = handle.ram_file.lock().unwrap().clone();
+    if let Some(ram_file) = ram_file {
         let state = handle.state.lock().unwrap();
         if state.closed || state.broken {
             return Err(badarg());
         }
         drop(state);
         trace_command_received_data(process, ctx.pid(), id, data, &framed);
-        return crate::ram_file_drv::command(id, &framed)
+        return crate::ram_file_drv::command(&ram_file, &handle, &framed)
             .map(|()| atom("true"))
             .map_err(|()| badarg());
     }
@@ -3559,7 +3563,8 @@ fn trace_port_receive_indexed_rt(
 // Port of erts/emulator/sys/unix/sys_drivers.c:1039 (stop), OTP-29.1.1.
 // Closing a port releases its descriptors; the child may have detached from them.
 fn release_io(handle: &PortHandle) {
-    crate::ram_file_drv::detach(handle.id);
+    // Port of erts/emulator/drivers/common/ram_file_drv.c:189-195 (rfile_stop), OTP-29.1.1.
+    handle.ram_file.lock().unwrap().take();
     // Port of erts/emulator/beam/io.c:3698 (terminate_port) for a dynamic driver.
     if let Some(drv_port) = handle.driver.get()
         && drv_port.terminate()
@@ -4233,8 +4238,9 @@ fn output_command(
             None,
         );
     }
-    if crate::ram_file_drv::owns(id) {
-        if crate::ram_file_drv::command(id, &data).is_err() {
+    let ram_file = handle.ram_file.lock().unwrap().clone();
+    if let Some(ram_file) = ram_file {
+        if crate::ram_file_drv::command(&ram_file, handle, &data).is_err() {
             signal_badsig(handle, id);
         }
         return;

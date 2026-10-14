@@ -1,9 +1,10 @@
 use arinsal_difftest::{CallResult, RefErl};
+use arinsal_etf::OwnedTerm;
 use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ram_file_compat).
--export([driver_open/0, full_ops/0, mode_errors/0, growth/0, large_offsets/0]).
+-export([driver_open/0, full_ops/0, mode_errors/0, growth/0, large_offsets/0, hold/0, churn/0]).
 
 driver_open() ->
     case catch open_port({spawn_driver, "ram_file_drv"}, []) of
@@ -76,6 +77,35 @@ growth() ->
     ok = ram_file:close(File),
     ok.
 
+hold() ->
+    {ok, File} = ram_file:open(<<"held">>, [read, write, binary]),
+    Deadline = erlang:monotonic_time(millisecond) + 1500,
+    ok = hold_loop(File, Deadline),
+    ok = ram_file:close(File),
+    ok.
+
+hold_loop(File, Deadline) ->
+    case erlang:monotonic_time(millisecond) >= Deadline of
+        true ->
+            ok;
+        false ->
+            {ok, <<"held">>} = ram_file:pread(File, 0, 4),
+            ok = ram_file:pwrite(File, 4, <<"!">>),
+            {ok, <<"held!">>} = ram_file:pread(File, 0, 5),
+            receive after 5 -> ok end,
+            hold_loop(File, Deadline)
+    end.
+
+churn() ->
+    churn(40).
+
+churn(0) ->
+    ok;
+churn(Rounds) ->
+    ok = growth(),
+    ok = mode_errors(),
+    churn(Rounds - 1).
+
 large_offsets() ->
     {ok, File} = ram_file:open(<<"abc">>, [read, write, binary]),
     Max = (1 bsl 31) - 1,
@@ -132,4 +162,35 @@ fn growth_matches_erts() {
 #[test]
 fn large_offsets_match_erts() {
     compare("large_offsets");
+}
+
+#[test]
+fn ports_of_concurrent_vms_are_independent() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping ram_file differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named("ram_file_compat", SOURCE, &[])
+        .expect("compile ram_file_compat");
+    let run = |function: &'static str| {
+        let beam = beam.clone();
+        std::thread::spawn(move || {
+            let mut vm = Vm::new([]);
+            vm.load_bytes(&beam).expect("load Arinsal module");
+            vm.eval_scheduled("ram_file_compat", function, &[], 2, None)
+                .map(|result| result.term)
+        })
+    };
+    let holder = run("hold");
+    let churners: Vec<_> = (0..3).map(|_| run("churn")).collect();
+    for (name, thread) in
+        std::iter::once(("hold", holder)).chain(churners.into_iter().map(|t| ("churn", t)))
+    {
+        let term = thread
+            .join()
+            .expect("Vm thread")
+            .unwrap_or_else(|error| panic!("Arinsal {name}: {error}"));
+        similar_asserts::assert_eq!(OwnedTerm::Atom("ok".into()), term, "{name}");
+    }
 }
