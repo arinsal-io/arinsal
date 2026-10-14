@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arinsal_bifs::BifError;
 use arinsal_etf::OwnedTerm as O;
+use arinsal_term::MagicRef;
 use socket2::{Domain, MsgHdr, Protocol, SockAddr, Socket, Type};
 
 use crate::{Reactor, atom, errno, error, field, last_error, list, map, name, number, ok, pair};
@@ -23,8 +24,6 @@ const MAGIC: u32 = 0x534f_434b;
 const ATMARK_REQUEST: u64 = 0x4004_7307;
 #[cfg(target_os = "linux")]
 const ATMARK_REQUEST: u64 = 0x8905;
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static HANDLES: OnceLock<Mutex<HashMap<u64, Arc<Handle>>>> = OnceLock::new();
 static REACTOR: OnceLock<Mutex<Option<Arc<dyn Reactor>>>> = OnceLock::new();
 static DEBUG: AtomicBool = AtomicBool::new(false);
 static SOCKET_DEBUG: AtomicBool = AtomicBool::new(false);
@@ -35,9 +34,6 @@ static TOTALS: Mutex<Totals> = Mutex::new(Totals::new());
 
 pub(super) fn reactor() -> &'static Mutex<Option<Arc<dyn Reactor>>> {
     REACTOR.get_or_init(|| Mutex::new(None))
-}
-fn handles() -> &'static Mutex<HashMap<u64, Arc<Handle>>> {
-    HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 /// Socket state bits, `ESOCK_STATE_*`.
 #[allow(dead_code)]
@@ -107,9 +103,84 @@ pub(crate) struct State {
     pub r_num_cnt: u32,
 }
 
+/// The socket resource, `ESockDescriptor`: the [`Handle`] is the payload of a magic reference,
+/// as the descriptor is the data of a NIF resource. The resource destructor runs when the
+/// last reference to the magic reference is released.
+#[derive(Clone)]
+pub(crate) struct Sock(Arc<MagicRef>);
+
+impl Drop for Handle {
+    /// The resource destructor, `esock_dtor`.
+    fn drop(&mut self) {
+        lifecycle::dtor(self);
+    }
+}
+
+impl Handle {
+    /// `enif_keep_resource` for the select machinery, on the first selection.
+    fn keep_for_select(&self) {
+        let mut selector = self
+            .selector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if selector.is_none() {
+            *selector = handle_id(self.reference())
+                .ok()
+                .and_then(MagicRef::live_by_id);
+        }
+    }
+
+    /// `enif_release_resource` for the select machinery, when the stop callback has run.
+    pub(crate) fn release_for_select(&self) {
+        let selector = self
+            .selector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(selector);
+    }
+
+    /// The socket reference term.
+    pub(crate) fn reference(&self) -> &O {
+        self.reference
+            .get()
+            .expect("the socket reference is set on creation")
+    }
+}
+
+impl std::ops::Deref for Sock {
+    type Target = Handle;
+    fn deref(&self) -> &Handle {
+        self.0
+            .downcast_ref::<Handle>()
+            .expect("a socket resource holds a Handle")
+    }
+}
+
+thread_local! {
+    /// The references `esock_alloc_descriptor` holds while a NIF builds its result. They are
+    /// released with `enif_release_resource` once the result term owns the resource.
+    static CREATED: std::cell::RefCell<Vec<Sock>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many descriptors the running thread holds, taken when a NIF call starts.
+pub(crate) fn created_mark() -> usize {
+    CREATED.with(|created| created.borrow().len())
+}
+
+/// `enif_release_resource` for the descriptors the NIF call that took `mark` allocated.
+pub(crate) fn release_created(mark: usize) {
+    let created = CREATED.with(|created| created.borrow_mut().split_off(mark));
+    drop(created);
+}
+
 pub(crate) struct Handle {
     socket: Mutex<Option<Socket>>,
-    reference: O,
+    /// The socket reference term, set once the magic reference has its identity.
+    reference: OnceLock<O>,
+    /// The reference the select machinery holds from the first selection until the stop
+    /// callback (`enif_select` keeps the resource).
+    selector: Mutex<Option<Arc<MagicRef>>>,
     /// The controlling process, `ctrlPid` of `ESockDescriptor`.
     owner: Mutex<Option<O>>,
     /// Per-socket state shared with the requestors, see [`State`]. Lock order:
@@ -167,25 +238,31 @@ impl Counters {
         ])
     }
 }
+/// The identity of the magic reference `value` stands for.
 fn handle_id(value: &O) -> Result<u64, BifError> {
     match value {
         O::Ref {
             node,
             creation,
             ids,
-        } if node == "nonode@nohost" && *creation == 0 && ids.len() == 3 && ids[0] == MAGIC => {
-            Ok(u64::from(ids[1]) | (u64::from(ids[2]) << 32))
+        } if node == "nonode@nohost" && *creation == 0 && ids.len() == 3 && ids[2] == u32::MAX => {
+            Ok(u64::from(ids[0]) | (u64::from(ids[1]) << 32))
         }
         _ => Err(BifError::BADARG),
     }
 }
-fn handle(value: &O) -> Result<Arc<Handle>, BifError> {
-    handles()
-        .lock()
-        .unwrap()
-        .get(&handle_id(value)?)
-        .cloned()
-        .ok_or(BifError::BADARG)
+/// `enif_get_resource`: the descriptor behind a socket reference.
+fn handle(value: &O) -> Result<Sock, BifError> {
+    let magic = MagicRef::live_by_id(handle_id(value)?).ok_or(BifError::BADARG)?;
+    if magic.downcast_ref::<Handle>().is_none() {
+        return Err(BifError::BADARG);
+    }
+    Ok(Sock(magic))
+}
+/// The magic reference of the socket `handle`, if the socket is still alive.
+pub(super) fn resource(handle: &O) -> Option<Arc<MagicRef>> {
+    let magic = MagicRef::live_by_id(handle_id(handle).ok()?)?;
+    magic.downcast_ref::<Handle>().is_some().then_some(magic)
 }
 const OTP_OPT_DEBUG: i32 = 1001;
 const OTP_OPT_IOW: i32 = 1002;
@@ -279,15 +356,10 @@ fn reference(
     options: HashMap<i32, O>,
     ctype: O,
 ) -> O {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let reference = O::Ref {
-        node: "nonode@nohost".into(),
-        creation: 0,
-        ids: vec![MAGIC, id as u32, (id >> 32) as u32],
-    };
-    let h = Arc::new(Handle {
+    let magic = MagicRef::new(Handle {
         socket: Mutex::new(Some(socket)),
-        reference: reference.clone(),
+        reference: OnceLock::new(),
+        selector: Mutex::new(None),
         owner: Mutex::new(owner.clone()),
         state: Mutex::new(State::default()),
         counters: Mutex::new(Counters::default()),
@@ -298,7 +370,15 @@ fn reference(
         protocol,
         ctype,
     });
-    handles().lock().unwrap().insert(id, Arc::clone(&h));
+    let id = magic.id();
+    let reference = O::Ref {
+        node: "nonode@nohost".into(),
+        creation: 0,
+        ids: vec![id as u32, (id >> 32) as u32, u32::MAX],
+    };
+    let h = Sock(magic);
+    let _ = h.reference.set(reference.clone());
+    CREATED.with(|created| created.borrow_mut().push(h.clone()));
     if let Some(pid) = owner.as_ref() {
         let mon = monitor_process(&h, pid);
         h.state.lock().unwrap().ctrl_mon = mon;
@@ -347,7 +427,7 @@ fn send_reg_msg(tag: &str, h: &Handle) {
         let message = O::tuple(vec![
             atom("$socket"),
             atom(tag),
-            pair(atom("$socket"), h.reference.clone()),
+            pair(atom("$socket"), h.reference().clone()),
         ]);
         reactor.send(&registry, &message);
     }
@@ -383,29 +463,6 @@ pub(super) fn set_owner(value: &O, pid: O) -> Result<(), BifError> {
     }
     Ok(())
 }
-/// A controlling process has exited: its monitor fires for every socket it owns.
-pub(super) fn owner_died(pid: &O) {
-    let owned: Vec<Arc<Handle>> = handles()
-        .lock()
-        .unwrap()
-        .values()
-        .filter(|h| h.owner.lock().unwrap().as_ref() == Some(pid))
-        .cloned()
-        .collect();
-    for h in owned {
-        let monitor = *h.state.lock().unwrap().ctrl_mon.get_or_insert(u64::MAX);
-        lifecycle::down(&h.reference, pid, monitor);
-    }
-}
-/// The resource destructor: the VM dropped its last reference to the socket.
-pub(super) fn release(value: &O) -> Result<(), BifError> {
-    let id = handle_id(value)?;
-    let removed = handles().lock().unwrap().remove(&id);
-    if let Some(h) = removed {
-        lifecycle::dtor(&h);
-    }
-    Ok(())
-}
 pub(super) use lifecycle::{down, stop};
 fn active_reactor() -> Option<Arc<dyn Reactor>> {
     reactor().lock().unwrap().clone()
@@ -426,7 +483,11 @@ pub(crate) fn select_read(h: &Handle, fd: i32, pid: Option<&O>, reference: &O) -
     let Some(pid) = pid.cloned().or_else(|| reactor.self_pid()) else {
         return select_failed();
     };
-    reactor.register_read(fd, &pid, &h.reference, reference)
+    let result = reactor.register_read(fd, &pid, h.reference(), reference);
+    if result >= 0 {
+        h.keep_for_select();
+    }
+    result
 }
 /// `esock_select_write`; see [`select_read`].
 pub(crate) fn select_write(h: &Handle, fd: i32, pid: Option<&O>, reference: &O) -> i32 {
@@ -436,11 +497,19 @@ pub(crate) fn select_write(h: &Handle, fd: i32, pid: Option<&O>, reference: &O) 
     let Some(pid) = pid.cloned().or_else(|| reactor.self_pid()) else {
         return select_failed();
     };
-    reactor.register_write(fd, &pid, &h.reference, reference)
+    let result = reactor.register_write(fd, &pid, h.reference(), reference);
+    if result >= 0 {
+        h.keep_for_select();
+    }
+    result
 }
 /// `esock_select_stop`.
-pub(crate) fn select_stop(fd: i32) -> i32 {
-    active_reactor().map_or(crate::SELECT_STOP_CALLED, |reactor| reactor.stop(fd))
+pub(crate) fn select_stop(h: &Handle, fd: i32) -> i32 {
+    let result = active_reactor().map_or(crate::SELECT_STOP_CALLED, |reactor| reactor.stop(fd));
+    if result >= 0 && result & crate::SELECT_STOP_CALLED != 0 {
+        h.release_for_select();
+    }
+    result
 }
 /// `esock_select_cancel`.
 pub(crate) fn select_cancel(fd: i32, read: bool, reference: &O) -> i32 {
@@ -486,7 +555,7 @@ pub(crate) fn raise_invalid(what: &str) -> BifError {
 /// `esock_send_abort_msg`: `{'$socket', Socket, abort, {Ref, Reason}}` to the requestor.
 pub(crate) fn send_abort_msg(h: &Handle, req: &Requestor, reason: &O) {
     if let Some(reactor) = active_reactor() {
-        let message = crate::abort_message(&h.reference, &req.reference, reason);
+        let message = crate::abort_message(h.reference(), &req.reference, reason);
         reactor.send(&req.pid, &message);
     }
 }
@@ -496,7 +565,7 @@ pub(crate) fn send_simple_abort_msg(h: &Handle, pid: &O, reason: &O) {
     if let Some(reactor) = active_reactor() {
         let message = O::tuple(vec![
             atom("$socket"),
-            pair(atom("$socket"), h.reference.clone()),
+            pair(atom("$socket"), h.reference().clone()),
             atom("abort"),
             reason.clone(),
         ]);
@@ -505,7 +574,7 @@ pub(crate) fn send_simple_abort_msg(h: &Handle, pid: &O, reason: &O) {
 }
 /// `MONP`: monitor `pid` for the socket.
 pub(crate) fn monitor_process(h: &Handle, pid: &O) -> Option<u64> {
-    active_reactor().and_then(|reactor| reactor.monitor(pid, &h.reference))
+    active_reactor().and_then(|reactor| reactor.monitor(pid, h.reference()))
 }
 /// `DEMONP`.
 pub(crate) fn demonitor_process(pid: &O, monitor: Option<u64>) {
@@ -1039,7 +1108,7 @@ fn accept(args: &[O]) -> Result<O, BifError> {
     }
 }
 fn accept_listening_error(
-    h: &Arc<Handle>,
+    h: &Handle,
     st: &mut State,
     s: &Socket,
     reference: &O,
@@ -1059,7 +1128,7 @@ fn accept_listening_error(
     accept_busy_retry(h, st, s.as_raw_fd(), reference, None)
 }
 fn accept_busy_retry(
-    h: &Arc<Handle>,
+    h: &Handle,
     st: &mut State,
     fd: i32,
     reference: &O,
@@ -1080,7 +1149,7 @@ fn accept_busy_retry(
     Ok(atom("select"))
 }
 fn accept_accepting_current(
-    h: &Arc<Handle>,
+    h: &Handle,
     st: &mut State,
     s: &Socket,
     reference: &O,
@@ -1137,7 +1206,7 @@ fn errno_reason(err: &io::Error) -> O {
         other => other.clone(),
     }
 }
-fn accepted(h: &Arc<Handle>, socket: Socket, pid: &O) -> O {
+fn accepted(h: &Handle, socket: Socket, pid: &O) -> O {
     h.counters.lock().unwrap().acc_success += 1;
     if let Err(e) = socket.set_nonblocking(true) {
         return fail(&e);
@@ -3046,7 +3115,7 @@ mod tests {
         }
         let sent = reactor.sent();
         for (who, reference) in [(pid(6), 2), (pid(7), 3)] {
-            let message = crate::abort_message(&h.reference, &test_ref(reference), &reason);
+            let message = crate::abort_message(h.reference(), &test_ref(reference), &reason);
             assert!(sent.contains(&(who, message)), "{sent:?}");
         }
     }
@@ -4198,10 +4267,10 @@ mod tests {
             serial: 0,
             creation: 0,
         };
-        set_owner(&socket, pid.clone()).unwrap();
         let reactor = Arc::new(BlockingReactor::default());
         reactor.set_caller(pid.clone());
         set_reactor(Some(reactor.clone()));
+        set_owner(&socket, pid.clone()).unwrap();
         let reference = O::Ref {
             node: "nonode@nohost".into(),
             creation: 0,
@@ -4255,7 +4324,7 @@ mod tests {
             atom("select_sent")
         );
         assert_eq!(invoke("nif_close", &[sender]), atom("ok"));
-        owner_died(&pid);
+        reactor.exit(&pid);
         assert_eq!(
             invoke("nif_getopt", &[socket, atom("otp"), O::Int(1008)]),
             error("closed")

@@ -869,6 +869,16 @@ fn errno_atoms_match_erts() {
 }
 
 #[test]
+fn unreferenced_socket_is_closed_by_gc_like_erts() {
+    compare_close("unreferenced_socket_is_closed_by_gc");
+}
+
+#[test]
+fn process_info_monitored_by_lists_the_socket_like_erts() {
+    compare_close("monitored_by_lists_the_socket");
+}
+
+#[test]
 fn dirty_io_socket_and_net_nifs_wait_for_dirty_schedulers_like_erts() {
     compare("dirty_io_nifs_wait_for_dirty_schedulers");
 }

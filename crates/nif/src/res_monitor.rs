@@ -25,9 +25,9 @@ pub struct ResourceMonitor {
 enum Target {
     /// A resource of a dynamically loaded NIF library.
     Resource(Weak<Resource>),
-    /// The `down` callback of a resource of a built-in NIF, called with the exiting pid and
-    /// the monitor.
-    Native(NativeDown),
+    /// A resource of a built-in NIF: the resource, which the monitor does not own, and its
+    /// `down` callback, called with the exiting pid and the monitor.
+    Native(Weak<arinsal_term::MagicRef>, NativeDown),
 }
 
 /// The `down` callback of a built-in NIF resource.
@@ -41,9 +41,9 @@ fn handle(id: u64) -> [u8; 32] {
 
 impl ResourceMonitor {
     /// The target half of a monitor held by a built-in NIF resource.
-    pub fn native(id: u64, down: NativeDown) -> Self {
+    pub fn native(id: u64, resource: Weak<arinsal_term::MagicRef>, down: NativeDown) -> Self {
         Self {
-            target: Target::Native(down),
+            target: Target::Native(resource, down),
             id,
         }
     }
@@ -57,7 +57,7 @@ impl ResourceMonitor {
     pub fn resource_ref(&self) -> Option<Arc<arinsal_term::MagicRef>> {
         match &self.target {
             Target::Resource(resource) => Some(resource.upgrade()?.magic_ref()),
-            Target::Native(_) => None,
+            Target::Native(resource, _) => resource.upgrade(),
         }
     }
 
@@ -67,7 +67,7 @@ impl ResourceMonitor {
         // A resource that is being destroyed has no strong reference left: no `down`.
         let resource = match &self.target {
             Target::Resource(resource) => resource,
-            Target::Native(down) => {
+            Target::Native(_, down) => {
                 down(pid, self.id);
                 return;
             }

@@ -673,12 +673,52 @@ fn global_counters_follow_open_and_close() {
 }
 
 #[test]
-fn release_closes_an_open_descriptor_and_drops_the_monitors() {
+fn last_reference_closes_an_open_descriptor_and_drops_the_monitors() {
     let (_lock, reactor) = reactor_for(5);
     let sock = open("inet", "stream", 6);
     assert_eq!(reactor.monitored().len(), 1);
-    crate::release(&sock).unwrap();
+    assert!(handle(&sock).is_ok());
+    crate::socket::release_created(0);
     assert!(reactor.monitored().is_empty());
+    assert!(handle(&sock).is_err());
+    set_reactor(None);
+}
+
+#[test]
+fn a_selected_socket_lives_until_its_stop_callback_releases_it() {
+    let (_lock, reactor) = reactor_for(6);
+    let (sock, _port) = listener();
+    assert_eq!(
+        call("nif_accept", &[sock.clone(), op_ref(1)]),
+        atom("select")
+    );
+    crate::socket::release_created(0);
+    assert!(handle(&sock).is_ok(), "the selection holds the resource");
+    assert_eq!(reactor.monitored().len(), 2);
+    let closed = call("nif_close", std::slice::from_ref(&sock));
+    assert!(matches!(closed, O::Atom(_) | O::Tuple(_)));
+    assert!(handle(&sock).is_err(), "the stop callback released it");
+    assert!(reactor.monitored().is_empty());
+    set_reactor(None);
+}
+
+#[test]
+fn a_selected_socket_with_a_scheduled_stop_lives_until_the_callback_runs() {
+    let (_lock, reactor) = reactor_for(7);
+    reactor.set_scheduled_stop(true);
+    let (sock, _port) = listener();
+    assert_eq!(
+        call("nif_accept", &[sock.clone(), op_ref(1)]),
+        atom("select")
+    );
+    crate::socket::release_created(0);
+    let closed = call("nif_close", std::slice::from_ref(&sock));
+    assert!(
+        matches!(closed, O::Tuple(_)),
+        "a scheduled stop returns a close ref"
+    );
+    assert!(handle(&sock).is_ok());
+    crate::stop(&sock);
     assert!(handle(&sock).is_err());
     set_reactor(None);
 }
