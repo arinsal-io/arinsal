@@ -230,3 +230,341 @@ fn context_owner_and_close_match_erl() {
     assert!(actual.0, "arinsal failed: {}\n{}", actual.2, actual.1);
     similar_asserts::assert_eq!(actual.1, expected.1, "stderr {}", actual.2);
 }
+
+const DICT_MODULE: &str = "zstd_dict_probe";
+
+const DICT_SOURCE: &str = r#"
+-module(zstd_dict_probe).
+-export([roundtrip/1, ids/1, load_ref/1, frames/1, errors/1, lifecycle/1]).
+
+dict(File) ->
+    {ok, Dict} = file:read_file(File),
+    Dict.
+
+texts() ->
+    Text = iolist_to_binary(lists:duplicate(300, <<"the quick brown fox jumps over the lazy dog ">>)),
+    Mixed = iolist_to_binary([<<N:32>> || N <- lists:seq(1, 4000)]),
+    [<<"hello dictionary world">>, Text, Mixed].
+
+attempt(Fun) ->
+    try
+        {ok, Fun()}
+    catch
+        Class:Reason -> {Class, text(Reason)}
+    end.
+
+text({zstd_error, Message}) when is_binary(Message) -> {zstd_error, binary_to_atom(Message)};
+text(Reason) -> Reason.
+
+in_other_process(Fun) ->
+    Parent = self(),
+    {Pid, Ref} = spawn_monitor(fun() -> Parent ! {self(), Fun()} end),
+    receive
+        {Pid, Result} ->
+            erlang:demonitor(Ref, [flush]),
+            Result
+    end.
+
+unaligned(Bin) ->
+    <<_:3, Rest/bitstring>> = <<0:3, Bin/binary>>,
+    Rest.
+
+bin(Iolist) -> iolist_to_binary(Iolist).
+
+roundtrip(File) ->
+    Dict = dict(File),
+    {ok, DDict} = zstd:dict(decompress, Dict),
+    Rows = [row(Dict, DDict, Level, Data) || Level <- [-5, 0, 3, 19], Data <- texts()],
+    io:format("~w~n~w~n", [zstd:get_dict_id(Dict), Rows]).
+
+row(Dict, DDict, Level, Data) ->
+    {ok, CDict} = zstd:dict(compress, Dict, #{compressionLevel => Level}),
+    ByRef = bin(zstd:compress(Data, #{dictionary => CDict})),
+    ByLoad = bin(zstd:compress(Data, #{dictionary => Dict, compressionLevel => Level})),
+    ByUnaligned = bin(zstd:compress(Data, #{dictionary => unaligned(Dict), compressionLevel => Level})),
+    ByList = bin(zstd:compress(Data, #{dictionary => [binary_to_list(binary:part(Dict, 0, 100)), binary:part(Dict, 100, byte_size(Dict) - 100)], compressionLevel => Level})),
+    Back = [bin(zstd:decompress(C, #{dictionary => D})) =:= Data
+            || C <- [ByRef, ByLoad], D <- [DDict, Dict, unaligned(Dict)]],
+    {Level, byte_size(ByRef), erlang:md5(ByRef), erlang:md5(ByLoad), ByLoad =:= ByList,
+     ByLoad =:= ByUnaligned, zstd:get_dict_id(ByRef), Back}.
+
+ids(File) ->
+    Dict = dict(File),
+    {ok, CDict} = zstd:dict(compress, Dict, #{compressionLevel => -5}),
+    {ok, DDict} = zstd:dict(decompress, Dict),
+    {ok, CRaw} = zstd:dict(compress, <<"raw content dictionary, no magic number">>),
+    {ok, DRaw} = zstd:dict(decompress, <<>>),
+    {ok, DShort} = zstd:dict(decompress, <<1, 2, 3>>),
+    {CTag, CRef} = CDict,
+    {DTag, DRef} = DDict,
+    {ok, {compress, CtxRef}} = zstd:context(compress),
+    Frame = bin(zstd:compress(<<"abc">>, #{dictionary => CDict})),
+    Plain = bin(zstd:compress(<<"abc">>)),
+    Garbage = <<255, 254, 253, 252, 251, 250, 249, 248, 247, 246>>,
+    Split = [binary:part(Dict, 0, 10), [binary_to_list(binary:part(Dict, 10, 5)), binary:part(Dict, 15, byte_size(Dict) - 15)]],
+    Ids = [attempt(fun() -> zstd:get_dict_id(X) end)
+           || X <- [CDict, DDict, CRaw, DRaw, DShort, Dict, Split, binary_to_list(Dict), unaligned(Dict),
+                    Frame, [Frame], binary_to_list(Frame), unaligned(Frame), [binary:part(Frame, 0, 3), binary:part(Frame, 3, byte_size(Frame) - 3)],
+                    Plain, <<>>, [], Garbage, <<1, 2, 3>>]],
+    Bad = [attempt(fun() -> zstd:get_dict_id(X) end)
+           || X <- [{CTag, DRef}, {DTag, CRef}, {cdict, make_ref()}, {ddict, make_ref()}, {cdict, CtxRef}, {ddict, CtxRef},
+                    {cdict, 5}, atom, 5, <<1:3>>, <<1, 2, 3, 4, 5, 6:3>>, [a], [256], [-1], [<<1:3>>], {a, b}, [Frame | 5]]],
+    io:format("~w~n~w~n", [Ids, Bad]).
+
+load_ref(File) ->
+    Dict = dict(File),
+    Data = hd(tl(texts())),
+    {ok, CDict} = zstd:dict(compress, Dict, #{compressionLevel => 3}),
+    {ok, CDict9} = zstd:dict(compress, Dict, #{compressionLevel => 9}),
+    {ok, DDict} = zstd:dict(decompress, Dict),
+    {cdict, CRef} = CDict,
+    {ddict, DRef} = DDict,
+    {ok, C} = zstd:context(compress),
+    {ok, D} = zstd:context(decompress),
+    Sets = fun(Ctx, Values) -> [attempt(fun() -> zstd:set_parameter(Ctx, dictionary, V) end) || V <- Values] end,
+    Loads = Sets(C, [Dict, [Dict], <<>>, [], "", Dict, [<<1:3>>], atom, 5, {a, b}, {cdict, 5}, [Dict | <<>>], [[], [[]]]]),
+    Refs = Sets(C, [CDict, {cdict, DRef}, {cdict, make_ref()}, {ddict, CRef}, CDict9, {cdict, CRef}]),
+    Used = bin(zstd:compress(Data, C)),
+    DLoads = Sets(D, [Dict, <<>>, Dict, [], unaligned(Dict), 5]),
+    DRefs = Sets(D, [DDict, {ddict, CRef}, {ddict, make_ref()}, {cdict, DRef}]),
+    Back = bin(zstd:decompress(Used, D)),
+    %% the dictionary is dropped before the load, and a load refused mid-stream keeps the context usable
+    {ok, M} = zstd:context(compress, #{dictionary => CDict}),
+    {continue, Part1} = zstd:stream(M, <<"first part of the stream ">>),
+    MidLoad = Sets(M, [Dict, <<>>, CDict9, {cdict, DRef}]),
+    {continue, Part2} = zstd:stream(M, <<"second part of the stream">>),
+    {done, Tail} = zstd:finish(M, <<>>),
+    Frame = bin([Part1, Part2, Tail]),
+    {ok, MD} = zstd:context(decompress, #{dictionary => DDict}),
+    {continue, DPart} = zstd:stream(MD, binary:part(Frame, 0, 20)),
+    MidDLoad = Sets(MD, [Dict, <<>>, DDict, {ddict, CRef}]),
+    {done, DTail} = zstd:finish(MD, binary:part(Frame, 20, byte_size(Frame) - 20)),
+    Reset = bin(zstd:compress(Data, M)),
+    io:format("~w~n~w~n~w~n~w~n~w~n~w~n~w~n~w~n~w~n~w~n~w~n",
+              [Loads, Refs, {byte_size(Used), erlang:md5(Used)}, DLoads, DRefs, Back =:= Data,
+               MidLoad, {byte_size(Frame), erlang:md5(Frame), bin([DPart, DTail])},
+               MidDLoad, {byte_size(Reset), erlang:md5(Reset)}, zstd:get_dict_id(Frame)]).
+
+frames(File) ->
+    Dict = dict(File),
+    {ok, CDict} = zstd:dict(compress, Dict),
+    Data = bin(lists:duplicate(100, <<"frame header data ">>)),
+    OneShot = bin(zstd:compress(Data)),
+    {ok, S} = zstd:context(compress),
+    {continue, S1} = zstd:stream(S, binary:part(Data, 0, 500)),
+    {done, S2} = zstd:finish(S, binary:part(Data, 500, byte_size(Data) - 500)),
+    Streamed = bin([S1, S2]),
+    Checked = bin(zstd:compress(Data, #{checksumFlag => true})),
+    WithDict = bin(zstd:compress(Data, #{dictionary => CDict, checksumFlag => true})),
+    NoSize = bin(zstd:compress(Data, #{contentSizeFlag => false, dictIDFlag => false})),
+    Skippable = <<16#184D2A50:32/little, 4:32/little, 1, 2, 3, 4>>,
+    Skip2 = <<16#184D2A5F:32/little, 0:32/little>>,
+    {ok, #{headerSize := HeaderSize}} = zstd:get_frame_header(WithDict),
+    Prefixes = [binary:part(WithDict, 0, N) || N <- lists:seq(5, HeaderSize)],
+    Full = [OneShot, Streamed, Checked, WithDict, NoSize, Skippable, Skip2, [OneShot], binary_to_list(OneShot),
+            unaligned(OneShot), [binary:part(OneShot, 0, 3), binary:part(OneShot, 3, 9)],
+            [<<40, 181>> | <<47, 253, 0, 88>>], <<40, 181, 47, 253, 0, 88>>, <<40, 181, 47, 253, 0>>,
+            <<40, 181, 47, 253, 32, 3, 25, 0, 0, 97, 98, 99>>],
+    Garbage = [<<1, 2, 3>>, <<1, 2, 3, 4, 5>>, <<"garbage bytes here">>, <<255, 255, 255, 255, 255, 255, 255, 255, 255, 255>>,
+               <<0, 0, 0, 0, 0, 0>>, [<<1, 2>>, <<3, 4, 5>>], <<"not a frame">>],
+    NotBinary = [atom, 5, {a}, <<1:3>>, <<40, 181, 47, 253, 0, 88, 1:1>>, [a], [256], [-1], [<<1:3>>], [<<40, 181, 47, 253, 0, 88>> | 5], 1.5, make_ref()],
+    Header = fun(X) ->
+        case attempt(fun() -> zstd:get_frame_header(X) end) of
+            {ok, {ok, Map}} -> {ok, maps:to_list(Map)};
+            {ok, {error, Message}} -> {error, binary_to_atom(Message)};
+            Other -> Other
+        end
+    end,
+    io:format("~w~n~w~n~w~n~w~n~w~n",
+              [[Header(X) || X <- Full], [Header(X) || X <- Prefixes], [Header(X) || X <- Garbage], [Header(X) || X <- NotBinary],
+               zstd:get_dict_id(WithDict)]).
+
+errors(File) ->
+    Dict = dict(File),
+    Other = <<"another raw content dictionary, it has no zstd magic number">>,
+    Data = hd(tl(texts())),
+    {ok, CDict} = zstd:dict(compress, Dict, #{compressionLevel => 2}),
+    {ok, DDict} = zstd:dict(decompress, Dict),
+    {ok, DOther} = zstd:dict(decompress, Other),
+    Compressed = bin(zstd:compress(Data, #{dictionary => CDict})),
+    Mismatch = [attempt(fun() -> bin(zstd:decompress(Compressed, Params)) =:= Data end)
+                || Params <- [#{}, #{dictionary => Other}, #{dictionary => DOther}, #{dictionary => <<>>}, #{dictionary => [<<>>]},
+                              #{dictionary => Dict}, #{dictionary => DDict}]],
+    {ok, D} = zstd:context(decompress, #{dictionary => DDict}),
+    ok = zstd:set_parameter(D, dictionary, <<>>),
+    AfterReset = attempt(fun() -> zstd:finish(D, Compressed) end),
+    ok = zstd:set_parameter(D, dictionary, DOther),
+    StreamMismatch = attempt(fun() -> zstd:stream(D, Compressed) end),
+    Created = [attempt(fun() -> case zstd:dict(Mode, X, Opts) of {ok, {Tag, Ref}} when is_reference(Ref) -> Tag; Bad -> Bad end end)
+               || {Mode, X, Opts} <- [{compress, [1, 2, 3], #{}}, {decompress, [1, 2, 3], #{}}, {compress, <<1:3>>, #{}},
+                                      {decompress, <<1:3>>, #{}}, {compress, atom, #{}}, {decompress, 5, #{}},
+                                      {compress, <<>>, #{}}, {decompress, <<>>, #{}}, {compress, <<1, 2, 3>>, #{}},
+                                      {decompress, <<1, 2, 3>>, #{}}, {compress, Dict, #{compressionLevel => foo}},
+                                      {compress, Dict, #{compressionLevel => 1 bsl 40}}, {compress, Dict, #{compressionLevel => 1000}},
+                                      {compress, Dict, #{compressionLevel => -1000}}, {compress, Dict, #{compressionLevel => 1.0}},
+                                      {compress, unaligned(Dict), #{compressionLevel => 3}}, {decompress, unaligned(Dict), #{}},
+                                      {compress, Dict, #{compressionLevel => 22}}, {compress, Dict, #{compressionLevel => -(1 bsl 31)}},
+                                      {compress, Dict, #{compressionLevel => (1 bsl 31) - 1}}, {compress, Dict, #{compressionLevel => 1 bsl 31}}]],
+    {ok, C} = zstd:context(compress),
+    {ok, C2} = zstd:context(decompress),
+    ok = zstd:close(C),
+    ok = zstd:close(C2),
+    Closed = [attempt(fun() -> zstd:set_parameter(Ctx, dictionary, V) end) || Ctx <- [C, C2], V <- [Dict, CDict, DDict, <<>>, atom]],
+    {ok, FC} = zstd:context(compress),
+    {ok, FD} = zstd:context(decompress),
+    Foreign = in_other_process(fun() ->
+        [attempt(fun() -> zstd:set_parameter(Ctx, dictionary, V) end)
+         || Ctx <- [FC, FD], V <- [Dict, CDict, DDict, {cdict, make_ref()}, {ddict, make_ref()}, atom]]
+    end),
+    Wrong = [attempt(fun() -> zstd:set_parameter(Ctx, dictionary, V) end)
+             || Ctx <- [FC, FD], V <- [CDict, DDict, {cdict, element(2, FC)}, {ddict, element(2, FD)}]],
+    io:format("~w~n~w~n~w~n~w~n~w~n~w~n~w~n~w~n", [Mismatch, AfterReset, StreamMismatch, Created, Closed, Foreign, Wrong, zstd:get_dict_id(Compressed)]).
+
+lifecycle(File) ->
+    Dict = dict(File),
+    Data = hd(tl(texts())),
+    Make = fun(Level) ->
+        {ok, CD} = zstd:dict(compress, Dict, #{compressionLevel => Level}),
+        {ok, DD} = zstd:dict(decompress, Dict),
+        {ok, C} = zstd:context(compress, #{dictionary => CD}),
+        {ok, D} = zstd:context(decompress, #{dictionary => DD}),
+        {C, D}
+    end,
+    {C, D} = Make(3),
+    Churn = [Make(L) || L <- lists:seq(1, 50)],
+    erlang:garbage_collect(),
+    [begin {ok, _} = zstd:dict(compress, Dict), {ok, _} = zstd:dict(decompress, Dict) end || _ <- lists:seq(1, 200)],
+    erlang:garbage_collect(),
+    F1 = bin(zstd:compress(Data, C)),
+    B1 = bin(zstd:decompress(F1, D)),
+    ok = zstd:reset(C),
+    F2 = bin(zstd:compress(Data, C)),
+    {ok, NewC} = zstd:dict(compress, Dict, #{compressionLevel => 19}),
+    ok = zstd:set_parameter(C, dictionary, NewC),
+    erlang:garbage_collect(),
+    F3 = bin(zstd:compress(Data, C)),
+    ok = zstd:set_parameter(C, dictionary, Dict),
+    erlang:garbage_collect(),
+    F4 = bin(zstd:compress(Data, C)),
+    {ok, NewD} = zstd:dict(decompress, Dict),
+    ok = zstd:set_parameter(D, dictionary, NewD),
+    erlang:garbage_collect(),
+    B3 = bin(zstd:decompress(F3, D)),
+    ok = zstd:set_parameter(D, dictionary, Dict),
+    erlang:garbage_collect(),
+    B4 = bin(zstd:decompress(F4, D)),
+    Shared = [zstd:get_dict_id(F) || F <- [F1, F2, F3, F4]],
+    ok = zstd:close(C),
+    ok = zstd:close(D),
+    erlang:garbage_collect(),
+    After = [attempt(fun() -> zstd:compress(Data, C) end), attempt(fun() -> zstd:decompress(F1, D) end),
+             attempt(fun() -> zstd:set_parameter(C, dictionary, NewC) end), attempt(fun() -> zstd:close(D) end)],
+    NewBack = bin(zstd:decompress(F3, #{dictionary => NewD})),
+    io:format("~w~n~w~n~w~n~w~n~w~n",
+              [[{byte_size(F), erlang:md5(F)} || F <- [F1, F2, F3, F4]], [X =:= Data || X <- [B1, B3, B4, NewBack]],
+               Shared, After, length(Churn)]).
+"#;
+
+/// Runs `zstd_dict_probe:Function(DictFile)` on erl and on Arinsal and returns both outputs.
+fn both_dict(function: &str) -> Option<(Run, Run)> {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping zstd differential test");
+        return None;
+    };
+    let beam = reference
+        .compile_named(DICT_MODULE, DICT_SOURCE, &[])
+        .expect("compile zstd dictionary probe");
+    drop(reference);
+    let dir = std::env::temp_dir().join(format!(
+        "arinsal-zstd-dict-{}-{function}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(dir.join(format!("{DICT_MODULE}.beam")), &beam).expect("write beam");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/zstd_dict");
+    let arinsal = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arinsal");
+    assert!(arinsal.is_file(), "build target/debug/arinsal first");
+    let eval = format!(
+        "{DICT_MODULE}:{function}(\"{}\"), halt().",
+        fixture.to_str().expect("utf-8 path")
+    );
+    let args = [
+        "-noshell",
+        "-pa",
+        dir.to_str().expect("utf-8 path"),
+        "-eval",
+        &eval,
+    ];
+    let expected = run(Path::new("erl"), &args, &dir);
+    let actual = run(&arinsal, &args, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    Some((expected, actual))
+}
+
+/// Compares the dictionary probe `function` on erl and on Arinsal; `needles` must appear in the
+/// reference output, which proves the probe reached the behavior it names.
+fn dict_probe_matches_erl(function: &str, needles: &[&str]) {
+    let Some((expected, actual)) = both_dict(function) else {
+        return;
+    };
+    assert!(expected.0, "erl failed: {}\n{}", expected.2, expected.1);
+    for needle in needles {
+        assert!(
+            expected.1.contains(needle),
+            "erl output lacks {needle}: {}",
+            expected.1
+        );
+    }
+    assert!(actual.0, "arinsal failed: {}\n{}", actual.2, actual.1);
+    similar_asserts::assert_eq!(actual.1, expected.1, "stderr {}", actual.2);
+}
+
+/// A dictionary by reference (`zstd:dict/2,3`) or by load (a binary, an iolist or an unaligned
+/// binary), used to compress and to decompress, in every combination.
+#[test]
+fn dictionary_by_ref_and_by_load_match_erl() {
+    dict_probe_matches_erl("roundtrip", &["true,true,true,true,true,true]"]);
+}
+
+/// The dictionary id from a compress dictionary, a decompress dictionary, a dictionary binary or
+/// iolist and a frame, and the errors for anything else.
+#[test]
+fn dictionary_ids_match_erl() {
+    dict_probe_matches_erl("ids", &["{ok,", "{error,badarg}"]);
+}
+
+/// `ref_*` and `load_*` argument order, replacement, a load refused mid-stream and the type
+/// checks between the two dictionary resource types.
+#[test]
+fn dictionary_load_and_ref_match_erl() {
+    dict_probe_matches_erl("load_ref", &["{error,badarg}", "Operation not authorized"]);
+}
+
+/// `get_frame_header/1` on a full frame, a truncated header, garbage and non-iolists.
+#[test]
+fn frame_header_matches_erl() {
+    dict_probe_matches_erl(
+        "frames",
+        &[
+            "frameContentSize",
+            "Unknown frame descriptor",
+            "ZSTD_skippableFrame",
+        ],
+    );
+}
+
+/// The dictionary mismatch error and the argument errors of the dictionary NIFs.
+#[test]
+fn dictionary_errors_match_erl() {
+    dict_probe_matches_erl(
+        "errors",
+        &["Dictionary mismatch", "not_on_controlling_process"],
+    );
+}
+
+/// A dictionary referenced by a context outlives every other reference to it and is released by
+/// replacement, close and garbage collection.
+#[test]
+fn dictionary_lifecycle_matches_erl() {
+    dict_probe_matches_erl("lifecycle", &["true,true,true,true", "badarg"]);
+}
