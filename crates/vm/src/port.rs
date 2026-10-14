@@ -3563,7 +3563,7 @@ fn trace_port_receive_indexed_rt(
 // Port of erts/emulator/sys/unix/sys_drivers.c:1039 (stop), OTP-29.1.1.
 // Closing a port releases its descriptors; the child may have detached from them.
 fn release_io(handle: &PortHandle) {
-    // Port of erts/emulator/drivers/common/ram_file_drv.c:189-195 (rfile_stop), OTP-29.1.1.
+    // rfile_stop: release the ram_file_drv port data.
     handle.ram_file.lock().unwrap().take();
     // Port of erts/emulator/beam/io.c:3698 (terminate_port) for a dynamic driver.
     if let Some(drv_port) = handle.driver.get()
