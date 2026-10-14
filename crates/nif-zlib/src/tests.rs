@@ -1282,3 +1282,85 @@ fn context_is_freed_with_the_heap_that_holds_its_reference() {
     drop(heap);
     assert!(MagicRef::live_by_id(id).is_none());
 }
+
+/// Any exception out of a stream NIF resets the session, not only a zstd error: a bad end op in
+/// the middle of a frame ends the frame and clears `in_use`, so the `true` shortcut of a fresh
+/// context applies again.
+#[test]
+fn stream_exception_resets_session() {
+    let compressor = call_zstd("init_compress_nif", &[]);
+    let (_, frame, _) = chunks(call_zstd(
+        "compress_stream_nif",
+        &[
+            compressor,
+            O::Binary(b"hello hello hello".to_vec()),
+            O::Int(2),
+        ],
+    ));
+    let half = O::Binary(frame[..frame.len() / 2].to_vec());
+    let done = O::Tuple(vec![atom("done"), O::Binary(Vec::new())]);
+    let dctx = call_zstd("init_decompress_nif", &[]);
+    let empty = || O::Binary(Vec::new());
+
+    assert_eq!(
+        call_zstd(
+            "decompress_stream_nif",
+            &[dctx.clone(), empty(), atom("true")]
+        ),
+        done
+    );
+    call_zstd("decompress_stream_nif", &[dctx.clone(), half, O::Int(0)]);
+    assert!(
+        zstd::dispatch(
+            "decompress_stream_nif",
+            &[dctx.clone(), empty(), atom("true")],
+            &None
+        )
+        .is_err(),
+        "in_use is set: the end op is not an int"
+    );
+    assert!(
+        zstd::dispatch(
+            "decompress_stream_nif",
+            &[dctx.clone(), empty(), atom("foo")],
+            &None
+        )
+        .is_err()
+    );
+    assert_eq!(
+        call_zstd("decompress_stream_nif", &[dctx, empty(), atom("true")]),
+        done
+    );
+}
+
+/// A non-binary data argument or end op raises `badarg`, a bad end op is passed to zstd, which
+/// rejects it with its own error.
+#[test]
+fn stream_argument_errors() {
+    let ctx = call_zstd("init_compress_nif", &[]);
+    for (data, op) in [
+        (O::Atom("abc".into()), O::Int(0)),
+        (
+            O::List {
+                elems: vec![O::Int(1)],
+                tail: Box::new(O::Nil),
+            },
+            O::Int(0),
+        ),
+        (O::Binary(vec![1]), atom("true")),
+        (O::Binary(vec![1]), O::Float(1.5)),
+    ] {
+        assert!(matches!(
+            zstd::dispatch("compress_stream_nif", &[ctx.clone(), data, op], &None),
+            Err(crate::Fault::Badarg)
+        ));
+    }
+    let Err(crate::Fault::Reason(O::Tuple(ref reason))) = zstd::dispatch(
+        "compress_stream_nif",
+        &[ctx, O::Binary(vec![1]), O::Int(5)],
+        &None,
+    ) else {
+        panic!("end op 5 must raise a zstd error")
+    };
+    assert_eq!(reason[0], atom("zstd_error"));
+}
