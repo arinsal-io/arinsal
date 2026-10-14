@@ -158,6 +158,21 @@ impl ModuleNif {
     }
 }
 
+/// The `dynlib_refc` of a library as seen by its resource types.
+struct ModuleRefs(Arc<ModuleNif>);
+
+impl arinsal_nif::LibraryRefs for ModuleRefs {
+    fn dynlib_inc(&self) {
+        self.0
+            .dynlib_refc
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn dynlib_dec(&self) {
+        self.0.dynlib_deref();
+    }
+}
+
 /// Close a library whose last `dynlib_refc` reference is gone: the unload callbacks run as aux
 /// work of the calling normal scheduler, or of the first one when called elsewhere.
 // Port of erts/emulator/beam/erl_nif.c:2542-2557 (close_dynlib) and 2559-2618
@@ -328,6 +343,7 @@ pub(crate) fn unload_instance(scope: u64, id: usize) {
         released
     };
     for lib in released {
+        lib.library.unload_resource_types();
         lib.dynlib_deref();
     }
 }
@@ -1278,10 +1294,16 @@ fn install_stubs(
     });
     let result = finish_stubs(vm, module_id, &lib, binds);
     match result {
-        Ok(()) => MODULE_NIFS
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .push(lib),
+        Ok(()) => {
+            // Port of erts/emulator/beam/erl_nif.c:4997 (`prepare_opened_rt`): the resource
+            // types the load callback opened become live and reference the library.
+            lib.library
+                .commit_resource_types(&(Arc::new(ModuleRefs(Arc::clone(&lib))) as Arc<_>));
+            MODULE_NIFS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(lib)
+        }
         // Port of erts/emulator/beam/erl_nif.c:5019-5031 (erts_load_nif error path), OTP-29.1.1:
         // a library that did not get bound is released.
         Err(_) => lib.dynlib_deref(),
@@ -1469,7 +1491,24 @@ fn intern_load_atoms(module: &str) -> Result<(), VmError> {
     Ok(())
 }
 
+// Port of erts/emulator/beam/emu/bif_instrs.tab:i_load_nif: the load runs holding the code
+// modification permission; a caller that is not given it yields and retries the call.
 fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+    let runtime = process.runtime.clone();
+    let pid = process.self_pid;
+    if let (Some(runtime), Some(pid)) = (&runtime, pid)
+        && !crate::natives::code::try_seize_code_mod_permission(runtime, process, pid)
+    {
+        return Err(VmError::Yield);
+    }
+    let result = load_nif_locked(vm, process, args);
+    if let (Some(runtime), Some(_)) = (&runtime, pid) {
+        crate::natives::code::release_code_mod_permission(runtime);
+    }
+    result
+}
+
+fn load_nif_locked(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let [path, info] = *args else {
         return Err(badarg());
     };
@@ -1947,8 +1986,44 @@ fn install_hub_for(process: &Process, pid: Pid) {
         is_process_alive: Some(nif_is_process_alive),
         thread_type: Some(nif_thread_type),
         current_process_exiting: Some(crate::dirty::current_process_exiting),
-        ..arinsal_nif::VmHooks::default()
+        resource_monitor: Some(nif_resource_monitor),
+        resource_demonitor: Some(nif_resource_demonitor),
     });
+}
+
+// Port of erts/emulator/beam/erl_nif.c:3150-3180 (enif_monitor_process: erts_monitor_create and
+// erts_proc_sig_send_monitor): the target half goes into the monitored process's monitor tree.
+fn nif_resource_monitor(
+    target: Term,
+    id: u64,
+    monitor: std::sync::Arc<arinsal_nif::ResourceMonitor>,
+) -> bool {
+    let (Some(hub), Some(pid)) = (current_hub(), Pid::from_term(target)) else {
+        return false;
+    };
+    let Some(scheduler) = hub.scheduler.upgrade() else {
+        return false;
+    };
+    scheduler
+        .signal(
+            hub.pid,
+            pid,
+            arinsal_sched::Signal::Monitor {
+                reference: id,
+                shared: arinsal_sched::SharedPayload(monitor),
+            },
+        )
+        .is_ok()
+}
+
+// erl_nif.c: erts_proc_sig_send_demonitor for a resource monitor.
+fn nif_resource_demonitor(target: Term, id: u64) {
+    let (Some(hub), Some(pid)) = (current_hub(), Pid::from_term(target)) else {
+        return;
+    };
+    if let Some(scheduler) = hub.scheduler.upgrade() {
+        let _ = scheduler.signal(hub.pid, pid, arinsal_sched::Signal::Demonitor(id));
+    }
 }
 
 // Port of erts/emulator/beam/erl_nif.c:3593 (enif_thread_type), OTP-29.1.1.

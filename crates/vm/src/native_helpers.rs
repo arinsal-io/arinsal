@@ -2,7 +2,7 @@
 
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bits::MatchOps;
-use arinsal_term::Term;
+use arinsal_term::{HeapAlloc, Term};
 
 use crate::beamasm_integration::ExportDispatch;
 
@@ -4633,6 +4633,58 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
             0
         }
     }
+}
+
+/// Runs the no-growth private append and charges its writable-binary overhead on the process.
+// Port of erts/emulator/beam/erl_bits.c:1961-1983 (`erts_bs_private_append_checked`), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_bs_private_append_fast(
+    ebs: *mut u64,
+    process_header: *mut ProcessHeader,
+    bin: u64,
+    extra_bits: u64,
+) -> u64 {
+    private_append(process_header, ebs, bin, extra_bits, false)
+}
+
+/// Runs the reallocating private append outside the byte-copy loop and updates process accounting.
+// Port of erts/emulator/beam/erl_bits.c:1928-1934 and 1961-1983, OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_bs_private_append_checked(
+    ebs: *mut u64,
+    process_header: *mut ProcessHeader,
+    bin: u64,
+    extra_bits: u64,
+) -> u64 {
+    private_append(process_header, ebs, bin, extra_bits, true)
+}
+
+#[inline(always)]
+fn private_append(
+    process_header: *mut ProcessHeader,
+    ebs: *mut u64,
+    bin: u64,
+    extra_bits: u64,
+    checked: bool,
+) -> u64 {
+    // BeamAsm already committed native cursors before the direct C-style helper call.
+    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1865-1880 and erl_bits.c:1928-1983,
+    // OTP-29.1.1.
+    let Some(process) = crate::native_hooks::process_from_header(process_header) else {
+        return 0;
+    };
+    let update = if checked {
+        arinsal_term::erts_bs_private_append_checked_with_update(ebs, bin, extra_bits)
+    } else {
+        arinsal_term::erts_bs_private_append_fast_with_update(ebs, bin, extra_bits)
+    };
+    if update.result != 0 && update.result != u64::MAX {
+        process.heap.update_writable_binary_overhead_at(
+            crate::native_hooks::from_raw(bin),
+            update.bin_ref,
+            update.old_size_bits,
+            update.new_size_bits,
+        );
+    }
+    update.result
 }
 
 /// Runs one field-decoding `bs_match` command. The context and operands are staged as terms in

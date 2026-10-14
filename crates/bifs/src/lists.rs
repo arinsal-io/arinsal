@@ -1999,6 +1999,6 @@ mod trap_budget_tests {
     }
 }
 
-crate::bif_bodies!(
+crate::process_bif_bodies!(
     length, append, subtract, reverse, member, keyfind, keymember, keysearch,
 );

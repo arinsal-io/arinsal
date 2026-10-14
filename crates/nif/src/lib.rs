@@ -1,18 +1,24 @@
 //! OTP 29.1.1 native function ABI hosted in the Arinsal executable.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod binref;
 mod extras;
 mod internal_test;
+mod ioq;
+mod iovec;
 mod iterators;
+mod raw;
+mod res_monitor;
 mod resources;
 mod terms;
 
 pub use extras::{
     SelectMessage, SelectRequest, SentMessage, VmHooks, set_vm_hooks, take_test_messages,
 };
+pub use res_monitor::ResourceMonitor;
 pub use resources::{
-    enif_keep_resource, enif_release_resource, resource_down, resource_stop, resource_stop_data,
-    resource_type_name,
+    LibraryRefs, enif_keep_resource, enif_release_resource, resource_down, resource_stop,
+    resource_stop_data, resource_type_name,
 };
 
 // C ABI entry points implemented by shim.c and resolved by dynamically loaded NIFs.
@@ -72,12 +78,13 @@ pub const C_SHIM_EXPORTS: &[&str] = &[
     "enif_free_iovec",
 ];
 
+use crate::raw::{cstr, deref, deref_mut};
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle, SchedulerClass};
 use arinsal_term::{
     ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, VecHeap, WritableBinary,
 };
 pub(crate) use libloading::os::unix::Library;
-use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -206,11 +213,11 @@ enum EnvHeap {
 impl EnvHeap {
     fn bound_mut(heap: *mut ProcessHeapHandle<'static>) -> &'static mut ProcessHeapHandle<'static> {
         // SAFETY: `ErlNifEnv::bound` ties this pointer to the synchronous callback lifetime.
-        unsafe { &mut *heap }
+        deref_mut(heap)
     }
     fn bound_ref(heap: *mut ProcessHeapHandle<'static>) -> &'static ProcessHeapHandle<'static> {
         // SAFETY: `ErlNifEnv::bound` ties this pointer to the synchronous callback lifetime.
-        unsafe { &*heap }
+        deref(heap)
     }
 }
 impl HeapAlloc for EnvHeap {
@@ -388,6 +395,17 @@ pub struct ErlNifEnv {
     independent: bool,
     scratch: Vec<Vec<u8>>,
     owned_binary_allocations: Vec<usize>,
+    /// `opened_rt_list`: resource types this load callback created or took over.
+    opened: Vec<resources::OpenedType>,
+    /// Reductions the process has left at the start of the call, `None` where
+    /// `enif_consume_timeslice` is a no-op (dirty schedulers, independent environments).
+    reds_left: Option<i64>,
+    /// I/O vectors attached to this environment by `enif_inspect_iovec` (`alloc_tmp_obj`).
+    tmp_iovecs: Vec<Vec<u64>>,
+    /// `Binary*` handles attached to this environment: freed with it.
+    tmp_handles: Vec<usize>,
+    /// Reductions `enif_consume_timeslice` took during the call.
+    consumed: i64,
 }
 impl ErlNifEnv {
     /// Create a process-independent environment with stable owned allocations.
@@ -405,6 +423,11 @@ impl ErlNifEnv {
             independent: true,
             scratch: Vec::new(),
             owned_binary_allocations: Vec::new(),
+            opened: Vec::new(),
+            reds_left: None,
+            tmp_iovecs: Vec::new(),
+            tmp_handles: Vec::new(),
+            consumed: 0,
         }
     }
     /// Bind a callback to the caller's infallible heap.
@@ -425,6 +448,11 @@ impl ErlNifEnv {
             independent: false,
             scratch: Vec::new(),
             owned_binary_allocations: Vec::new(),
+            opened: Vec::new(),
+            reds_left: None,
+            tmp_iovecs: Vec::new(),
+            tmp_handles: Vec::new(),
+            consumed: 0,
         }
     }
 }
@@ -438,6 +466,9 @@ impl Drop for ErlNifEnv {
                 spare: [ptr::null_mut(); 2],
             };
             terms::enif_release_binary(&mut binary);
+        }
+        for handle in self.tmp_handles.drain(..) {
+            binref::handle_free(handle as *mut c_void);
         }
     }
 }
@@ -505,7 +536,7 @@ impl NifFunction {
         }
         let mut next = (self.fptr, args.to_vec());
         loop {
-            match self.step(ctx, next.0, &next.1, pid)? {
+            match self.step(ctx, next.0, &next.1, pid, SchedulerClass::Normal)? {
                 NifCall::Return(value) => return Ok(value),
                 NifCall::Schedule(trap) => next = (trap.fptr, trap.args),
             }
@@ -531,7 +562,7 @@ impl NifFunction {
         pid: Option<Term>,
         current: SchedulerClass,
     ) -> Result<NifCall, BifError> {
-        let mut result = self.step(ctx, fptr, args, pid)?;
+        let mut result = self.step(ctx, fptr, args, pid, current)?;
         while let NifCall::Schedule(trap) = &result {
             if current != SchedulerClass::Normal || scheduler_class(trap.flags) != current {
                 break;
@@ -539,7 +570,7 @@ impl NifFunction {
             let NifCall::Schedule(trap) = result else {
                 unreachable!()
             };
-            result = self.step(ctx, trap.fptr, &trap.args, pid)?;
+            result = self.step(ctx, trap.fptr, &trap.args, pid, current)?;
         }
         Ok(result)
     }
@@ -549,12 +580,17 @@ impl NifFunction {
         fptr: NifFn,
         args: &[Term],
         pid: Option<Term>,
+        current: SchedulerClass,
     ) -> Result<NifCall, BifError> {
         let _call = (self.flags != 0).then(|| self.halt_calls.enter()).flatten();
         let mut env = ErlNifEnv::bound(&mut ctx.heap, pid);
         env.priv_data = self.priv_data.load(Ordering::Acquire);
+        env.reds_left = (current == SchedulerClass::Normal && ctx.has_fcalls())
+            .then(|| i64::try_from(ctx.reduction_budget()).unwrap_or(i64::MAX));
         // SAFETY: the pointer belongs to a loaded library; arguments remain live.
         let result = unsafe { fptr(&mut env, args.len() as c_int, args.as_ptr()) };
+        // BUMP_REDS of enif_consume_timeslice, applied to the process' FCALLS.
+        ctx.charge_reductions(env.consumed.max(0) as usize);
         if let Some(reason) = env.pending {
             return Err(BifError::Error(reason));
         }
@@ -702,8 +738,36 @@ pub struct NifLibrary {
     priv_data: Arc<AtomicPtr<c_void>>,
     halt_calls: Arc<HaltCalls>,
     on_halt_called: AtomicBool,
+    /// This library as the owner of resource types.
+    owner: Arc<resources::ResourceOwner>,
+    /// Types opened by the load callback, applied by [`NifLibrary::commit_resource_types`].
+    pending_types: Mutex<Vec<resources::OpenedType>>,
 }
 impl NifLibrary {
+    /// Make the resource types the load callback opened live; `refs` is this library's
+    /// `dynlib_refc`.
+    // Port of erts/emulator/beam/erl_nif.c:4997 (prepare_opened_rt, commit_opened_rt and
+    // cleanup_opened_rt in erts_load_nif), OTP-29.1.1.
+    pub fn commit_resource_types(&self, refs: &Arc<dyn resources::LibraryRefs>) {
+        let opened = std::mem::take(&mut *self.pending_types.lock().unwrap());
+        resources::commit_opened(opened, &self.owner, refs);
+    }
+    /// [`NifLibrary::commit_resource_types`] for a library loaded by [`load_nif`] or
+    /// [`upgrade_nif`], which has no module instance holding `dynlib_refc`.
+    pub fn commit_standalone_types(&self) {
+        self.commit_resource_types(&(Arc::new(StandaloneRefs) as Arc<dyn LibraryRefs>));
+    }
+    /// Discard the resource types the load callback opened (a load that fails after the
+    /// callback ran).
+    pub fn rollback_resource_types(&self) {
+        let opened = std::mem::take(&mut *self.pending_types.lock().unwrap());
+        resources::rollback_opened(opened);
+    }
+    /// Remove this library's resource types from the type list (the purge of its module).
+    // Port of erts/emulator/beam/erl_nif.c:5345-5366 (erts_unload_nif), OTP-29.1.1.
+    pub fn unload_resource_types(&self) {
+        resources::unload_types(&self.owner);
+    }
     /// Module name exported by this NIF library.
     pub fn module_name(&self) -> &str {
         &self.module
@@ -773,6 +837,8 @@ unsafe impl Sync for NifLibrary {}
 
 impl Drop for NifLibrary {
     fn drop(&mut self) {
+        self.rollback_resource_types();
+        self.unload_resource_types();
         self.close();
     }
 }
@@ -853,7 +919,9 @@ impl NifImage {
         };
         env.options.loading = false;
         env.priv_cell = None;
+        let opened = std::mem::take(&mut env.opened);
         if code != 0 {
+            resources::rollback_opened(opened);
             return Err(if upgrading {
                 NifError::UpgradeRejected(code)
             } else {
@@ -871,6 +939,8 @@ impl NifImage {
             function.priv_data = Arc::clone(&priv_data);
             function.halt_calls = Arc::clone(&halt_calls);
         }
+        let module_name = self.module.clone();
+        let owner_priv_data = Arc::clone(&priv_data);
         Ok(NifLibrary {
             library: Mutex::new(Some(self.library)),
             closed: AtomicBool::new(false),
@@ -882,6 +952,8 @@ impl NifImage {
             priv_data,
             halt_calls,
             on_halt_called: AtomicBool::new(false),
+            owner: resources::ResourceOwner::new(module_name, owner_priv_data),
+            pending_types: Mutex::new(opened),
         })
     }
 }
@@ -920,9 +992,7 @@ pub fn open_nif(path: &Path, module: &str) -> Result<NifImage, NifError> {
             "erts-?".to_owned()
         } else {
             // SAFETY: min_erts is a terminated string in the loaded library.
-            unsafe { CStr::from_ptr(min_erts_ptr) }
-                .to_string_lossy()
-                .into_owned()
+            cstr(min_erts_ptr).to_string_lossy().into_owned()
         };
         return Err(NifError::BadLibrary(format!(
             "That '{module}' NIF library needs {min_erts} or newer. Either try to recompile the NIF lib or use a newer erts runtime."
@@ -968,9 +1038,9 @@ pub fn open_nif(path: &Path, module: &str) -> Result<NifImage, NifError> {
         return Err(NifError::BadLibrary("invalid entry fields".into()));
     }
     // SAFETY: validated pointers refer to terminated strings in the loaded library.
-    let name = unsafe { CStr::from_ptr(entry.name) }.to_string_lossy();
+    let name = cstr(entry.name).to_string_lossy();
     // SAFETY: validated pointers refer to terminated strings in the loaded library.
-    let variant = unsafe { CStr::from_ptr(entry.vm_variant) }.to_string_lossy();
+    let variant = cstr(entry.vm_variant).to_string_lossy();
     if variant != "beam.vanilla" {
         return Err(NifError::BadLibrary(format!(
             "Library ({variant}) not compiled for this vm variant (beam.vanilla)."
@@ -996,9 +1066,7 @@ pub fn open_nif(path: &Path, module: &str) -> Result<NifImage, NifError> {
             return Err(NifError::BadLibrary("invalid NIF function".into()));
         }
         // SAFETY: entry function names are terminated strings.
-        let fname = unsafe { CStr::from_ptr(fname_ptr) }
-            .to_string_lossy()
-            .into_owned();
+        let fname = cstr(fname_ptr).to_string_lossy().into_owned();
         let fptr = fptr.ok_or_else(|| NifError::BadLibrary("null NIF function".into()))?;
         // Port of erts/emulator/beam/erl_nif.c:4868 (erts_load_nif flag check), OTP-29.1.1.
         if flags != 0 && flags != ERL_NIF_DIRTY_JOB_IO_BOUND && flags != ERL_NIF_DIRTY_JOB_CPU_BOUND
@@ -1031,7 +1099,9 @@ pub fn open_nif(path: &Path, module: &str) -> Result<NifImage, NifError> {
 }
 /// Load a NIF library, validate its entry, and invoke its load callback.
 pub fn load_nif(path: &Path, info: LoadInfo<'_>) -> Result<NifLibrary, NifError> {
-    open_nif(path, info.module)?.commit(info.term)
+    let library = open_nif(path, info.module)?.commit(info.term)?;
+    library.commit_standalone_types();
+    Ok(library)
 }
 /// Load a replacement library and pass the old private data to its upgrade callback.
 pub fn upgrade_nif(
@@ -1039,7 +1109,15 @@ pub fn upgrade_nif(
     info: LoadInfo<'_>,
     old: &NifLibrary,
 ) -> Result<NifLibrary, NifError> {
-    open_nif(path, info.module)?.upgrade(info.term, old, None)
+    let library = open_nif(path, info.module)?.upgrade(info.term, old, None)?;
+    library.commit_standalone_types();
+    Ok(library)
+}
+/// `dynlib_refc` of a library that is not bound to a module instance: nothing to count.
+struct StandaloneRefs;
+impl LibraryRefs for StandaloneRefs {
+    fn dynlib_inc(&self) {}
+    fn dynlib_dec(&self) {}
 }
 unsafe extern "C" {
     fn arinsal_nif_shim_anchor();
@@ -1053,6 +1131,15 @@ pub fn ensure_exports() {
     extras::retain_exports();
     iterators::retain_exports();
     internal_test::retain_exports();
+    iovec::retain_exports();
+    ioq::retain_exports();
+}
+/// Write `value` through an out-parameter of the C caller; a NULL pointer is ignored.
+pub(crate) fn put<T>(out: *mut T, value: T) {
+    if !out.is_null() {
+        // SAFETY: a non-NULL out-parameter of a NIF API call is writable by contract.
+        unsafe { *out = value }
+    }
 }
 pub(crate) fn term(bits: u64) -> Term {
     // SAFETY: callers obtain bits from existing terms or the NIF ABI.

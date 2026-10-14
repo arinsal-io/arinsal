@@ -216,20 +216,27 @@ fn timestamp_tuple(ctx: &mut Ctx<'_>, micros: i128) -> Term {
     )
 }
 fn now(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+    Ok(timestamp_tuple(ctx, next_now_micros()? as i128))
+}
+/// The strictly increasing microsecond clock of `erlang:now/0` (also `enif_now_time`).
+pub fn next_now_micros() -> Result<i64, BifError> {
     let micros = i64::try_from(sys_nanos()? / 1_000).map_err(|_| BifError::SystemLimit)?;
     let value = LAST_NOW.fetch_max(micros, Ordering::Relaxed).max(micros);
     let mut prior = LAST_NOW.load(Ordering::Relaxed);
-    let unique = loop {
+    loop {
         let next = prior
             .max(value)
             .checked_add(1)
             .ok_or(BifError::SystemLimit)?;
         match LAST_NOW.compare_exchange_weak(prior, next, Ordering::SeqCst, Ordering::Relaxed) {
-            Ok(_) => break next,
+            Ok(_) => return Ok(next),
             Err(observed) => prior = observed,
         }
-    };
-    Ok(timestamp_tuple(ctx, unique as i128))
+    }
+}
+/// `erlang:time_offset/0` in nanoseconds (also `enif_time_offset`).
+pub fn time_offset_nanos_value() -> Option<i128> {
+    time_offset_nanos().ok()
 }
 fn time(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     let now = local_calendar(now_seconds()?)?;

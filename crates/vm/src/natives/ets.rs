@@ -1,6 +1,6 @@
 //! ETS BIFs whose storage and access policy belong to the scheduled runtime.
 
-use crate::proc_create::EtsFree;
+use crate::proc_create::{EtsFree, EtsInsert};
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_ets::match_spec::MatchDialect;
@@ -227,6 +227,8 @@ fn err(error: EtsError) -> VmError {
         EtsError::BadArgCause(cause) => badarg_cause(cause),
         EtsError::BadArg | EtsError::NameTaken => badarg(),
         EtsError::Unsupported(_) => badarg(),
+        // Port of erts/emulator/beam/erl_db.c:770-796: the BIF traps and runs again.
+        EtsError::Busy => VmError::Yield,
         // Port of erts/emulator/beam/erl_db.c:1450 (DB_ERROR_SYSRES -> SYSTEM_LIMIT), OTP-29.1.1.
         EtsError::Term(arinsal_term::TermError::SystemLimit) => system_limit(),
         EtsError::Term(_) => badarg(),
@@ -640,7 +642,7 @@ fn with_cached_table<R>(
         if !hit {
             let rt = process.runtime.as_ref()?;
             let shared = rt.ets.read().unwrap().shared(tid).ok()?.clone();
-            let options = shared.read().options;
+            let options = shared.options();
             cache.borrow_mut()[slot] = Some((rt_id, tid, shared, options));
         }
         let cache = cache.borrow();
@@ -681,7 +683,7 @@ fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let key = args[1];
     with_cached_table(process, args[0], |shared, _options, process| {
         let table = shared.read();
-        if table.is_detached() || !allowed(&table, caller, false) {
+        if table.is_detached() || table.is_busy() || !allowed(&table, caller, false) {
             return None;
         }
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -717,7 +719,7 @@ fn direct_member_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let key = args[1];
     with_cached_table(process, args[0], |shared, _options, _| {
         let table = shared.read();
-        if table.is_detached() || !allowed(&table, caller, false) {
+        if table.is_detached() || table.is_busy() || !allowed(&table, caller, false) {
             return None;
         }
         Some(boolean_term(table.member(key)))
@@ -730,7 +732,9 @@ fn direct_insert(process: &mut Process, args: &[Term]) -> Option<Term> {
             process,
             args,
             "insert",
-            |process, caller, target, objects| insert_args(process, caller, false, target, objects),
+            |process, caller, target, objects| {
+                insert_args(process, None, caller, false, target, objects)
+            },
         )
     })
 }
@@ -740,7 +744,9 @@ fn direct_insert_new(process: &mut Process, args: &[Term]) -> Option<Term> {
         process,
         args,
         "insert_new",
-        |process, caller, target, objects| insert_args(process, caller, true, target, objects),
+        |process, caller, target, objects| {
+            insert_args(process, None, caller, true, target, objects)
+        },
     )
 }
 
@@ -758,7 +764,7 @@ fn direct_insert_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
         // Fine-grained hash tables and CA trees take their bucket or route locks.
         let prepared = if options.write_concurrency != WriteConcurrency::Disabled {
             let table = shared.read();
-            if table.is_detached() || !allowed(&table, caller, true) {
+            if table.is_detached() || table.is_busy() || !allowed(&table, caller, true) {
                 return None;
             }
             match table.insert_shared(prepared) {
@@ -769,7 +775,7 @@ fn direct_insert_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
             prepared
         };
         let mut table = shared.write();
-        if table.is_detached() || !allowed(&table, caller, true) {
+        if table.is_detached() || table.is_busy() || !allowed(&table, caller, true) {
             return None;
         }
         table.insert_prepared(prepared);
@@ -800,13 +806,13 @@ fn direct_update_counter_cached(process: &mut Process, args: &[Term]) -> Option<
             && options.table_type == TableType::Set
         {
             let table = shared.read();
-            if table.is_detached() || !allowed(&table, caller, true) {
+            if table.is_detached() || table.is_busy() || !allowed(&table, caller, true) {
                 return None;
             }
             table.update_counter_in_place_shared(key, &operations)?
         } else {
             let mut table = shared.write();
-            if table.is_detached() || !allowed(&table, caller, true) {
+            if table.is_detached() || table.is_busy() || !allowed(&table, caller, true) {
                 return None;
             }
             table.update_counter_in_place(key, &operations)?
@@ -820,23 +826,40 @@ fn direct_update_counter_cached(process: &mut Process, args: &[Term]) -> Option<
 
 fn insert_args(
     process: &mut Process,
+    ctx: Option<&mut RunCtx<'_, Message>>,
     caller: Term,
     insert_new: bool,
     target: Term,
     objects: Term,
 ) -> Result<Term, VmError> {
+    // SAFETY: object terms remain in the caller's live process heap for this BIF.
+    let single = unsafe { objects.tuple_ref() }.is_some();
+    // Port of erts/emulator/beam/erl_db.c:2330-2352 (ets_insert_2: a list of two or more
+    // objects, or a trapped continuation, goes to ets_insert_2_list_driver).
+    if !single
+        && (process
+            .cold
+            .as_ref()
+            .is_some_and(|cold| cold.ets_insert.is_some())
+            || list(objects).is_some_and(|items| items.len() >= 2))
+    {
+        // A list insert traps, which only the scheduler path can do.
+        let ctx = ctx.ok_or(VmError::Yield)?;
+        return insert_list(process, ctx, caller, insert_new, target, objects);
+    }
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
-    // SAFETY: object terms remain in the caller's live process heap for this BIF.
-    let single = unsafe { objects.tuple_ref() }.is_some();
     let shared = registry.shared(tid).map_err(err)?;
-    let options = shared.read().options;
+    let options = shared.options();
     if single
         && options.write_concurrency != WriteConcurrency::Disabled
         && options.table_type != TableType::OrderedSet
     {
         let table = shared.read();
+        if table.is_busy() {
+            return Err(VmError::Yield);
+        }
         if !allowed(&table, caller, true) {
             return Err(badarg_cause("access"));
         }
@@ -880,6 +903,122 @@ fn insert_args(
     } else {
         boolean_term(true)
     })
+}
+
+/// `ets:insert/2` and `ets:insert_new/2` with a list of two or more objects.
+///
+/// Port of erts/emulator/beam/erl_db.c:1960-2330 (ets_insert_2_list, ets_insert_2_list_driver),
+/// OTP-29.1.1. A list that fits the reductions left and is not for a bag goes in directly. Any
+/// other list is first copied into table form without the table lock, then locked in and
+/// inserted a slice at a time; when it does not finish, the rest is installed in the table, which
+/// turns busy so that every other user helps and this process collects the result.
+fn insert_list(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    caller: Term,
+    insert_new: bool,
+    target: Term,
+    objects: Term,
+) -> Result<Term, VmError> {
+    const ITERATIONS_PER_RED: isize = 8;
+    let rt = process.runtime.clone().ok_or_else(badarg)?;
+    let mut state = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.ets_insert.take());
+    let initial = ctx.remaining() as isize;
+    let mut loops = initial * ITERATIONS_PER_RED;
+    let done = |process: &mut Process, ctx: &mut RunCtx<'_, Message>, loops: isize, yes: bool| {
+        let used = (initial * ITERATIONS_PER_RED - loops) / ITERATIONS_PER_RED;
+        bump_reds(process, ctx, used);
+        Ok(boolean_term(yes))
+    };
+    if let Some(EtsInsert::Global(outcome)) = &state {
+        // The table is no longer busy (or gone): the operation completed or was aborted by
+        // someone else.
+        return match outcome.load(std::sync::atomic::Ordering::Acquire) {
+            1 => Ok(boolean_term(true)),
+            2 => Ok(boolean_term(false)),
+            _ => Err(badarg_cause("id")),
+        };
+    }
+    let registry = rt.ets.read().unwrap();
+    let tid = handle(&registry, target)?;
+    let shared = registry.shared(tid).map_err(err)?;
+    let options = shared.options();
+    let items = list(objects).ok_or_else(badarg)?;
+    if state.is_none()
+        && options.table_type != TableType::Bag
+        && options.table_type != TableType::DuplicateBag
+        && items.len() as isize <= loops
+    {
+        // Enough reductions to insert straight from the heap.
+        let mut table = registry.get_mut(tid).map_err(err)?;
+        if !allowed(&table, caller, true) {
+            return Err(badarg_cause("access"));
+        }
+        let yes = if insert_new {
+            table.insert_new(&items).map_err(err)?
+        } else {
+            table.insert(&items).map_err(err)?;
+            true
+        };
+        loops -= items.len() as isize;
+        return done(process, ctx, loops, yes);
+    }
+    // Copy the list into table form so that other processes can help.
+    let mut prepared = match state.take() {
+        Some(EtsInsert::Copy(prepared)) => prepared,
+        _ => Vec::with_capacity(items.len().min(1 << 20)),
+    };
+    while prepared.len() < items.len() {
+        if loops <= 0 {
+            process.cold_mut().ets_insert = Some(EtsInsert::Copy(prepared));
+            bump_reds(process, ctx, isize::MAX);
+            return Err(VmError::Yield);
+        }
+        match Table::prepare_object(&options, items[prepared.len()]) {
+            Ok(object) => prepared.push(object),
+            Err(error) => {
+                // A malformed object: the access failure is reported first, as the list check
+                // of ets_insert_2_list does.
+                if error == EtsError::BadArg {
+                    let table = registry.get_shared(tid).map_err(err)?;
+                    if !allowed(&table, caller, true) {
+                        return Err(badarg_cause("access"));
+                    }
+                }
+                return Err(err(error));
+            }
+        }
+        loops -= 1;
+    }
+    let mut table = match registry.get_mut(tid) {
+        Ok(table) => table,
+        Err(error) => {
+            // A busy table: keep the copies and try again after helping.
+            if error == EtsError::Busy {
+                process.cold_mut().ets_insert = Some(EtsInsert::Copy(prepared));
+            }
+            return Err(err(error));
+        }
+    };
+    if !allowed(&table, caller, true) {
+        return Err(badarg_cause("access"));
+    }
+    if insert_new && table.any_member_prepared(&prepared) {
+        return done(process, ctx, loops, false);
+    }
+    let mut pending: std::collections::VecDeque<_> = prepared.into();
+    table.insert_prepared_batch(&mut pending, &mut loops);
+    if pending.is_empty() {
+        return done(process, ctx, loops, true);
+    }
+    let outcome: arinsal_ets::InsertOutcome = Default::default();
+    table.begin_busy_insert_list(pending, std::sync::Arc::clone(&outcome));
+    process.cold_mut().ets_insert = Some(EtsInsert::Global(outcome));
+    bump_reds(process, ctx, isize::MAX);
+    Err(VmError::Yield)
 }
 
 fn lookup_args(
@@ -993,6 +1132,66 @@ fn bump_reds(process: &mut Process, ctx: &mut RunCtx<'_, Message>, used: isize) 
     ctx.consume(used);
 }
 
+/// Whether the BIF looks its first argument up as a table (`db_get_table`), and so has to wait
+/// for a busy table.
+fn gated_by_busy(function: EtsBif) -> bool {
+    !matches!(
+        function,
+        EtsBif::MatchSpecTest
+            | EtsBif::SuperUser
+            | EtsBif::New
+            | EtsBif::Whereis
+            | EtsBif::MatchSpecCompile
+            | EtsBif::IsCompiledMs
+            | EtsBif::MatchSpecRunR
+    )
+}
+
+/// Help finish the operation a busy table waits for, then trap so that the BIF runs again.
+///
+/// Port of erts/emulator/beam/erl_db.c:770-796 (handle_lacking_permission with DB_BUSY):
+/// a process that finds the table busy runs the delete_all or list-insert continuation with its
+/// own reductions and then retries.
+fn help_busy_table(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    target: Term,
+) -> Result<(), VmError> {
+    let Some(rt) = process.runtime.as_ref() else {
+        return Ok(());
+    };
+    let tid = {
+        let registry = rt.ets.read().unwrap();
+        match resolve(&registry, target) {
+            Ok(tid) if registry.shared(tid).is_ok_and(|shared| shared.is_busy()) => tid,
+            _ => return Ok(()),
+        }
+    };
+    let rt = process.runtime.clone().ok_or_else(badarg)?;
+    let initial = ctx.remaining() as isize;
+    let mut reds = initial;
+    {
+        let registry = rt.ets.read().unwrap();
+        let Ok(shared) = registry.shared(tid) else {
+            return Ok(());
+        };
+        let mut table = shared.write();
+        if !table.continue_busy(&mut reds) {
+            reds = initial + 1;
+        }
+    }
+    bump_reds(
+        process,
+        ctx,
+        if reds > initial {
+            isize::MAX
+        } else {
+            initial - reds
+        },
+    );
+    Err(VmError::Yield)
+}
+
 /// `ets:delete/1` and `ets:internal_delete_all/2`: release the storage a slice of reductions
 /// at a time, trapping to the same BIF until it is all released.
 ///
@@ -1010,14 +1209,11 @@ fn delete_or_clear(
     let mut reds = initial;
     let mut state = process.cold.as_mut().and_then(|cold| cold.ets_free.take());
     let done = if let Some(state) = state.as_mut() {
-        // Trapped before: the table is already unreachable (delete) or empty (delete_all).
         match state.tid {
             None => state.garbage.step(&mut reds),
-            Some(tid) => {
-                let registry = rt.ets.read().unwrap();
-                let mut table = registry.get_mut(tid).map_err(err)?;
-                table.free_garbage(&mut state.garbage, &mut reds)
-            }
+            // Trapped before: the table stopped being busy (whoever finished it), so the
+            // objects are gone and only the count is left to return.
+            Some(_) => true,
         }
     } else if function == EtsBif::Delete {
         let mut registry = rt.ets.write().unwrap();
@@ -1047,13 +1243,18 @@ fn delete_or_clear(
             return Err(badarg());
         }
         let nitems = table.len();
-        let mut fresh = EtsFree {
+        let mut garbage = table.take_garbage(false);
+        let done = table.free_garbage(&mut garbage, &mut reds);
+        if !done {
+            // Port of erts/emulator/beam/erl_db.c:3252-3272 (ets_internal_delete_all_2): the
+            // table turns busy and every process that meets it continues the release.
+            table.begin_busy_delete_all(garbage);
+        }
+        state = Some(EtsFree {
             tid: Some(tid),
             nitems,
-            garbage: table.take_garbage(false),
-        };
-        let done = table.free_garbage(&mut fresh.garbage, &mut reds);
-        state = Some(fresh);
+            garbage: arinsal_ets::Garbage::empty(),
+        });
         done
     };
     let state = state.expect("delete state present");
@@ -1122,6 +1323,12 @@ fn call_inner(
             return Ok(atom("ok"));
         }
         return Err(badarg());
+    }
+    if let Some(ctx) = ctx.as_deref_mut()
+        && gated_by_busy(function)
+        && let Some(&target) = args.first()
+    {
+        help_busy_table(process, ctx, target)?;
     }
     if matches!(
         (function, args.len()),
@@ -1307,6 +1514,9 @@ fn call_inner(
             let tid = handle(&registry, *target)?;
             let named = {
                 let table = registry.get(tid).map_err(err)?;
+                if table.is_busy() {
+                    return Err(VmError::Yield);
+                }
                 if !allowed(&table, caller, true) {
                     return Err(badarg_cause("access"));
                 }
@@ -1352,8 +1562,7 @@ fn call_inner(
             if registry
                 .shared(tid)
                 .map_err(err)?
-                .read()
-                .options
+                .options()
                 .write_concurrency
                 != WriteConcurrency::Disabled
             {
@@ -1504,8 +1713,7 @@ fn call_inner(
             if registry
                 .shared(tid)
                 .map_err(err)?
-                .read()
-                .options
+                .options()
                 .write_concurrency
                 != WriteConcurrency::Disabled
             {
@@ -1644,8 +1852,7 @@ fn call_inner(
             if registry
                 .shared(tid)
                 .map_err(err)?
-                .read()
-                .options
+                .options()
                 .write_concurrency
                 != WriteConcurrency::Disabled
             {
@@ -1924,8 +2131,7 @@ fn call_inner(
                 && registry
                     .shared(tid)
                     .map_err(err)?
-                    .read()
-                    .options
+                    .options()
                     .write_concurrency
                     != WriteConcurrency::Disabled
             {
@@ -2005,8 +2211,7 @@ fn call_inner(
             if registry
                 .shared(tid)
                 .map_err(err)?
-                .read()
-                .options
+                .options()
                 .write_concurrency
                 != WriteConcurrency::Disabled
             {
@@ -2051,8 +2256,7 @@ fn call_inner(
             if registry
                 .shared(tid)
                 .map_err(err)?
-                .read()
-                .options
+                .options()
                 .write_concurrency
                 != WriteConcurrency::Disabled
             {
@@ -2404,7 +2608,13 @@ fn entry_insert(
     let (Some(target), Some(objects)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    let result = insert_args(process, caller_of(ctx), false, target, objects);
+    if let Err(error) = help_busy_table(process, ctx, target) {
+        return Some(Err(error));
+    }
+    let result = {
+        let caller = caller_of(ctx);
+        insert_args(process, Some(ctx), caller, false, target, objects)
+    };
     Some(bif_frame("ets", "insert", &[target, objects], result))
 }
 
@@ -2420,7 +2630,13 @@ fn entry_insert_new(
     let (Some(target), Some(objects)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    let result = insert_args(process, caller_of(ctx), true, target, objects);
+    if let Err(error) = help_busy_table(process, ctx, target) {
+        return Some(Err(error));
+    }
+    let result = {
+        let caller = caller_of(ctx);
+        insert_args(process, Some(ctx), caller, true, target, objects)
+    };
     Some(bif_frame("ets", "insert_new", &[target, objects], result))
 }
 
@@ -2436,6 +2652,9 @@ fn entry_lookup(
     let (Some(target), Some(key)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
+    if let Err(error) = help_busy_table(process, ctx, target) {
+        return Some(Err(error));
+    }
     let result = lookup_args(process, caller_of(ctx), false, target, key);
     Some(bif_frame("ets", "lookup", &[target, key], result))
 }
@@ -2452,6 +2671,9 @@ fn entry_member(
     let (Some(target), Some(key)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
+    if let Err(error) = help_busy_table(process, ctx, target) {
+        return Some(Err(error));
+    }
     let result = lookup_args(process, caller_of(ctx), true, target, key);
     Some(bif_frame("ets", "member", &[target, key], result))
 }

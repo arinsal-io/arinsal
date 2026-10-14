@@ -3,7 +3,6 @@ use crate::{BIN_REF, HEAP_BITS, HeapAlloc, SUB_BITS, Term, TermBuilder, TermErro
 use arinsal_alloc::raw::BinaryView;
 use arinsal_alloc::typed::{BinaryBlock, binary_allocation_bytes};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 /// The context cursor or active writer may modify this `SUB_BITS` object.
@@ -23,30 +22,6 @@ pub(crate) fn bin_ref_is_legacy_external(next: u64) -> bool {
 /// Return live allocated bytes for erts' `BINARY` allocation type.
 pub fn binary_memory_bytes() -> u64 {
     binary_allocation_bytes()
-}
-
-/// `erts_bs_private_append` notifies the process vheap through this hook.
-/// Arguments are the process, the bitstring, the old end, and the new end, in bits.
-pub type PrivateAppendOverhead = extern "C" fn(*mut core::ffi::c_void, u64, u64, u64);
-
-static PRIVATE_APPEND_OVERHEAD: OnceLock<PrivateAppendOverhead> = OnceLock::new();
-
-/// Install the process-vheap update used by private append. The VM owns the counter.
-pub fn install_private_append_overhead(hook: PrivateAppendOverhead) {
-    let _ = PRIVATE_APPEND_OVERHEAD.set(hook);
-}
-
-fn note_private_append_overhead(
-    process: *mut core::ffi::c_void,
-    bin: u64,
-    old_bits: u64,
-    new_bits: u64,
-) {
-    if !process.is_null()
-        && let Some(hook) = PRIVATE_APPEND_OVERHEAD.get()
-    {
-        hook(process, bin, old_bits, new_bits);
-    }
 }
 
 // Port of erts/emulator/beam/erl_bits.c:72 (GROW_PROC_BIN_SIZE), OTP-29.1.1.
@@ -297,13 +272,20 @@ pub(crate) fn writable_bin_ref_address(term: Term) -> Option<usize> {
     owner(term).map(|(bin_ref, _)| bin_ref as usize)
 }
 
+/// The original BinRef term of a `SUB_BITS` (word four).
+#[inline(always)]
+fn sub_bits_original(term: Term) -> Term {
+    // SAFETY: SUB_BITS word four is its original term, retained by a live heap.
+    Term(unsafe { *term.raw_ptr().add(4) })
+}
+
 #[inline(always)]
 fn owner(term: Term) -> Option<(*const u64, BinaryView<'static>)> {
     if term.header()? & 63 != SUB_BITS {
         return None;
     }
     // SAFETY: SUB_BITS word four is its original BinRef, retained by a live heap.
-    let original = Term(unsafe { *term.raw_ptr().add(4) });
+    let original = sub_bits_original(term);
     if original.header()? & 63 != BIN_REF {
         return None;
     }
@@ -329,7 +311,7 @@ fn owner(term: Term) -> Option<(*const u64, BinaryView<'static>)> {
 pub unsafe fn writable_gc_visit(term: Term) {
     let bin_ref = if term.header().is_some_and(|h| h & 63 == SUB_BITS) {
         // SAFETY: a live SUB_BITS keeps its original term in word four.
-        Term(unsafe { *term.raw_ptr().add(4) })
+        sub_bits_original(term)
     } else {
         term
     };
@@ -368,7 +350,7 @@ pub unsafe fn writable_gc_visit(term: Term) {
 pub(crate) fn owner_adjustment(term: Term) -> usize {
     let original = if term.header().is_some_and(|h| h & 63 == SUB_BITS) {
         // SAFETY: SUB_BITS word four is its original term.
-        Term(unsafe { *term.raw_ptr().add(4) })
+        sub_bits_original(term)
     } else {
         term
     };
@@ -436,6 +418,74 @@ pub fn writable_finalize(term: Term) {
             *bin_ref.cast_mut().add(1) = allocation.header_ptr() as u64;
             *term.raw_ptr().add(1).cast_mut() = allocation.header_ptr().wrapping_add(4) as u64;
         }
+    }
+}
+
+/// A retained reference to the owner of an off-heap binary (erts `Binary*` with its refc
+/// raised): it keeps the bytes of the binary alive, whatever happens to the term.
+pub enum BinaryOwner {
+    /// An erts `Binary` (reference-counted or writable).
+    Binary(arinsal_alloc::raw::OwnedBinaryRef),
+    /// A NIF resource binary.
+    External(Arc<ExternalBinary>),
+}
+
+impl Clone for BinaryOwner {
+    /// `erts_refc_inc` on the binary.
+    fn clone(&self) -> Self {
+        match self {
+            Self::Binary(binary) => Self::Binary(
+                binary
+                    .try_clone()
+                    .expect("retained Binary has a live count"),
+            ),
+            Self::External(external) => Self::External(Arc::clone(external)),
+        }
+    }
+}
+
+/// The owner of an off-heap binary term, with its reference count raised; `None` for a heap
+/// binary, which has no owner (erts: `br == NULL`).
+// Port of erts/emulator/beam/erl_nif.c:4190-4197 (marshal_iovec_binary: `br->val`).
+pub fn binary_owner(term: Term) -> Option<BinaryOwner> {
+    if term.header()? & 63 != SUB_BITS {
+        return None;
+    }
+    let original = sub_bits_original(term);
+    if original.header()? & 63 != BIN_REF {
+        return None;
+    }
+    // SAFETY: a live BinRef owns the Binary or Arc it names; the clone is handed to the caller.
+    unsafe {
+        let (ptr, _, _, owner) = clone_binary_owner(original).ok()?;
+        Some(match owner {
+            Some(owner) => BinaryOwner::Binary(owner),
+            None => BinaryOwner::External(Arc::from_raw(ptr as *const ExternalBinary)),
+        })
+    }
+}
+
+/// The magic reference that owns the bytes of a resource-backed binary term
+/// (`enif_make_resource_binary`), as `enif_get_resource` finds it through the term's BinRef.
+///
+/// The term's heap and its off-heap owners must stay live for the borrow.
+pub fn external_binary_magic<'a>(term: Term) -> Option<&'a crate::MagicRef> {
+    if term.header()? & 63 != SUB_BITS {
+        return None;
+    }
+    let original = sub_bits_original(term);
+    if original.header()? & 63 != BIN_REF {
+        return None;
+    }
+    // SAFETY: a BinRef with the external flag holds the Arc-owned ExternalBinary in word one.
+    unsafe {
+        let p = original.raw_ptr();
+        if *p.add(2) & EXTERNAL_OWNER == 0 {
+            return None;
+        }
+        Some(&*Arc::as_ptr(
+            &(*(*p.add(1) as *const ExternalBinary))._owner,
+        ))
     }
 }
 
@@ -534,14 +584,8 @@ pub unsafe fn writable_bytes_mut<'a>(term: Term) -> Option<&'a mut [u8]> {
 
 /// Extend an active private writer's bit length and reserve space geometrically.
 pub fn writable_extend_private(term: Term, new_bits: usize) -> Result<bool, TermError> {
-    match prepare_private_append(
-        term.tagged_word(),
-        new_bits,
-        true,
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
-    ) {
-        Ok(0) => Ok(false),
+    match prepare_private_append(term.tagged_word(), new_bits, true, core::ptr::null_mut()) {
+        Ok(update) if update.result == 0 => Ok(false),
         Ok(_) => Ok(true),
         Err(error) => Err(error),
     }
@@ -553,20 +597,8 @@ pub fn writable_extend_private(term: Term, new_bits: usize) -> Result<bool, Term
 /// (the caller then uses the generic construction path). A system limit also returns zero
 /// after leaving the binary unchanged.
 // Port of erts/emulator/beam/erl_bits.c:1928 (erts_bs_private_append_checked), OTP-29.1.1.
-pub extern "C" fn erts_bs_private_append_checked(
-    ebs: *mut u64,
-    process: *mut core::ffi::c_void,
-    bin: u64,
-    extra_bits: u64,
-) -> u64 {
-    let word = erts_bs_private_append_fast(ebs, process, bin, extra_bits);
-    if word != u64::MAX {
-        return word;
-    }
-    let Ok(extra) = usize::try_from(extra_bits) else {
-        return 0;
-    };
-    prepare_private_append(bin, extra, false, ebs, process).unwrap_or(0)
+pub extern "C" fn erts_bs_private_append_checked(ebs: *mut u64, bin: u64, extra_bits: u64) -> u64 {
+    erts_bs_private_append_checked_with_update(ebs, bin, extra_bits).result
 }
 
 /// No-realloc private append.
@@ -576,66 +608,121 @@ pub extern "C" fn erts_bs_private_append_checked(
 /// caller. Port of the writable branch of erts/emulator/beam/erl_bits.c:1963-2016
 /// (`BEAMASM` drops the overflow and header asserts), OTP-29.1.1.
 #[inline(always)]
-pub extern "C" fn erts_bs_private_append_fast(
+pub extern "C" fn erts_bs_private_append_fast(ebs: *mut u64, bin: u64, extra_bits: u64) -> u64 {
+    erts_bs_private_append_fast_with_update(ebs, bin, extra_bits).result
+}
+
+/// Private append result plus the BinRef accounting values from its existing parse.
+#[derive(Clone, Copy)]
+pub struct PrivateAppendUpdate {
+    /// Returned bitstring word or the fast-path sentinel.
+    pub result: u64,
+    /// BinRef heap address, or zero when no active writer was found.
+    pub bin_ref: usize,
+    /// Position before the append in bits.
+    pub old_size_bits: usize,
+    /// Position after the append in bits.
+    pub new_size_bits: usize,
+}
+
+impl PrivateAppendUpdate {
+    const fn new(result: u64) -> Self {
+        Self {
+            result,
+            bin_ref: 0,
+            old_size_bits: 0,
+            new_size_bits: 0,
+        }
+    }
+}
+
+/// Fast private append with the BinRef accounting values from its existing parse.
+// Port of erts/emulator/beam/erl_bits.c:1963-2016, OTP-29.1.1.
+#[inline(always)]
+pub fn erts_bs_private_append_fast_with_update(
     ebs: *mut u64,
-    process: *mut core::ffi::c_void,
     bin: u64,
     extra_bits: u64,
-) -> u64 {
+) -> PrivateAppendUpdate {
     if ebs.is_null() || extra_bits == 0 {
-        return u64::MAX;
+        return PrivateAppendUpdate::new(u64::MAX);
     }
     // Boxed tag only. Release erts drops the HEADER_SUB_BITS / HEADER_BIN_REF
     // asserts (instr path is BEAMASM); a non-box returns 0 so the generic
     // builder runs.
     if bin & 3 != 2 {
-        return 0;
+        return PrivateAppendUpdate::new(0);
     }
     // SAFETY: exclusive writer, same precondition as `prepare_private_append`.
     unsafe {
         let sb = (bin & !7) as *mut u64;
         if *sb.add(1) & 3 != SUB_BITS_MUTABLE | SUB_BITS_VOLATILE {
-            return 0;
+            return PrivateAppendUpdate::new(0);
         }
         let orig = *sb.add(4);
         if orig & 3 != 2 {
-            return 0;
+            return PrivateAppendUpdate::new(0);
         }
         let br = (orig & !7) as *const u64;
         let header = *br.add(1) as *const u64;
         let capacity = *header.add(3) as usize;
         let view = BinaryView::from_header(header, BINARY_HEADER_WORDS + capacity.div_ceil(8));
         if !view.has_flags(BINARY_FLAG_ACTIVE_WRITER) {
-            return 0;
+            return PrivateAppendUpdate::new(0);
         }
         let adjustment = view.bytes_ptr() as usize & 3;
         let end_word = *sb.add(3) as usize;
         if end_word < adjustment * 8 {
-            return 0;
+            return PrivateAppendUpdate::new(0);
         }
         let current = end_word - adjustment * 8;
         if current & 7 != 0 {
-            return 0;
+            return PrivateAppendUpdate::new(0);
         }
         let Some(new_bits) = current.checked_add(extra_bits as usize) else {
-            return u64::MAX;
+            return PrivateAppendUpdate::new(u64::MAX);
         };
         if new_bits > isize::MAX as usize {
-            return u64::MAX;
+            return PrivateAppendUpdate::new(u64::MAX);
         }
         let new_len = new_bits.div_ceil(8);
         let old_len = view.apparent_size().unwrap_or(0);
         if new_len > capacity || (!ebs.is_null() && new_len > old_len + 1) {
-            return u64::MAX;
+            return PrivateAppendUpdate::new(u64::MAX);
         }
         // Port of erts/emulator/beam/erl_bits.c:1978-1983, OTP-29.1.1.
-        note_private_append_overhead(process, bin, current as u64, new_bits as u64);
         *sb.add(3) = (new_bits + adjustment * 8) as u64;
         view.set_flags(BINARY_FLAG_ACTIVE_WRITER);
         view.set_apparent_size(new_len);
         let ptr = view.bytes_ptr() as u64;
         publish_ebs(ebs, ptr, current as u64);
-        bin
+        PrivateAppendUpdate {
+            result: bin,
+            bin_ref: br as usize,
+            old_size_bits: current,
+            new_size_bits: new_bits,
+        }
+    }
+}
+
+/// Checked private append with the BinRef accounting values from its existing parse.
+// Port of erts/emulator/beam/erl_bits.c:1928-2016, OTP-29.1.1.
+#[cold]
+pub fn erts_bs_private_append_checked_with_update(
+    ebs: *mut u64,
+    bin: u64,
+    extra_bits: u64,
+) -> PrivateAppendUpdate {
+    let fast = erts_bs_private_append_fast_with_update(ebs, bin, extra_bits);
+    if fast.result != u64::MAX {
+        return fast;
+    }
+    let Ok(extra) = usize::try_from(extra_bits) else {
+        return PrivateAppendUpdate::new(0);
+    };
+    match prepare_private_append(bin, extra, false, ebs) {
+        Ok(update) => update,
+        Err(_) => PrivateAppendUpdate::new(0),
     }
 }
 
@@ -659,26 +746,25 @@ fn prepare_private_append(
     bits: usize,
     absolute: bool,
     ebs: *mut u64,
-    process: *mut core::ffi::c_void,
-) -> Result<u64, TermError> {
+) -> Result<PrivateAppendUpdate, TermError> {
     // SAFETY: `bin` is a tagged term from a live register or `Term::tagged_word`. This process
     // is the binary's only writer, which is the precondition of erts_bs_private_append_checked.
     unsafe {
         let term = Term::from_raw_bits(bin);
         let Some((bin_ref, binary)) = owner(term) else {
-            return Ok(0);
+            return Ok(PrivateAppendUpdate::new(0));
         };
         if sub_bits_flags(term) != SUB_BITS_MUTABLE | SUB_BITS_VOLATILE
             || !binary.has_flags(BINARY_FLAG_WRITABLE)
         {
-            return Ok(0);
+            return Ok(PrivateAppendUpdate::new(0));
         }
         let adjustment = binary.bytes_ptr() as usize & 3;
         let current = *term.raw_ptr().add(3) as usize - adjustment * 8;
         // The inline store writes whole bytes. A non-byte cursor stays on the generic path,
         // which has not yet grown the binary.
         if !absolute && !ebs.is_null() && !current.is_multiple_of(8) {
-            return Ok(0);
+            return Ok(PrivateAppendUpdate::new(0));
         }
         let new_bits = if absolute {
             bits
@@ -700,7 +786,6 @@ fn prepare_private_append(
         *term.raw_ptr().add(3).cast_mut() = (new_bits + adjustment * 8) as u64;
         // Port of erl_bits.c:1961 (`update_wb_overhead` before realloc), OTP-29.1.1.
         // Resize does not collect, so the counter moves with the committed size.
-        note_private_append_overhead(process, bin, current as u64, new_bits as u64);
         if !ebs.is_null() {
             let ptr = allocation
                 .header_ptr()
@@ -709,7 +794,12 @@ fn prepare_private_append(
             *ebs = ptr;
             *ebs.add(1) = current as u64;
         }
-        Ok(term.tagged_word())
+        Ok(PrivateAppendUpdate {
+            result: term.tagged_word(),
+            bin_ref: bin_ref as usize,
+            old_size_bits: current,
+            new_size_bits: new_bits,
+        })
     }
 }
 
@@ -1092,12 +1182,7 @@ mod private_append_checked {
             .writable_binary(b"ab", 16, 64)
             .unwrap();
         let mut ebs = [0_u64; 2];
-        let result = erts_bs_private_append_checked(
-            ebs.as_mut_ptr(),
-            core::ptr::null_mut(),
-            bin.tagged_word(),
-            8,
-        );
+        let result = erts_bs_private_append_checked(ebs.as_mut_ptr(), bin.tagged_word(), 8);
         assert_eq!(result, bin.tagged_word());
         assert_eq!(ebs[1], 16);
         assert_ne!(ebs[0], 0);
@@ -1110,12 +1195,7 @@ mod private_append_checked {
             .writable_binary(&[0xf0], 4, 64)
             .unwrap();
         let mut ebs = [7_u64; 2];
-        let result = erts_bs_private_append_checked(
-            ebs.as_mut_ptr(),
-            core::ptr::null_mut(),
-            bin.tagged_word(),
-            8,
-        );
+        let result = erts_bs_private_append_checked(ebs.as_mut_ptr(), bin.tagged_word(), 8);
         assert_eq!(result, 0);
         assert_eq!(ebs, [7, 7]);
     }
