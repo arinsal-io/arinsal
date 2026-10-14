@@ -17,19 +17,19 @@ invalid() ->
 child() ->
     true = os:putenv("ARINSAL_ENV_TEST", "child-value"),
     P = open_port({spawn_executable, "/usr/bin/printenv"}, [{args, ["ARINSAL_ENV_TEST"]}, binary]),
-    receive {P,{data,<<"child-value\n">>}} -> port_close(P), ok after 5000 -> timeout end.
+    receive {P,{data,<<"child-value\n">>}} -> catch port_close(P), ok after 5000 -> timeout end.
 signal() ->
     case whereis(erl_signal_server) of
         undefined ->
             register(erl_signal_server, self()),
             ok = os:set_signal(sigusr1, handle),
             P = open_port({spawn_executable, "/bin/kill"}, [{args, ["-USR1", os:getpid()]}, exit_status]),
-            receive {notify, sigusr1} -> port_close(P), unregister(erl_signal_server), ok
-            after 5000 -> port_close(P), unregister(erl_signal_server), timeout end;
+            receive {notify, sigusr1} -> catch port_close(P), unregister(erl_signal_server), ok
+            after 5000 -> catch port_close(P), unregister(erl_signal_server), timeout end;
         _ ->
             ok = os:set_signal(sigusr1, handle),
             P = open_port({spawn_executable, "/bin/kill"}, [{args, ["-USR1", os:getpid()]}, exit_status]),
-            receive {notify, sigusr1} -> port_close(P), ok after 200 -> port_close(P), ok end
+            receive {notify, sigusr1} -> catch port_close(P), ok after 200 -> catch port_close(P), ok end
     end.
 "#;
 
