@@ -554,7 +554,7 @@ fn process_info_aux(
             Term::small(total_heap_size as i64).ok_or_else(badarg)?
         }
         arinsal_term::atoms::STACK_SIZE => {
-            Term::small(src.read(process).heap.stack_words() as i64).ok_or_else(badarg)?
+            Term::small(src.read(process).observed_stack_words() as i64).ok_or_else(badarg)?
         }
         arinsal_term::atoms::MEMORY => Term::small(
             (std::mem::size_of::<Process>()
@@ -1057,7 +1057,7 @@ fn process_info_item_garbage_collection_info(process: &mut Process) -> Result<Te
             ("heap_block_size", process.heap.heap_size_words()),
             ("mbuf_size", process.heap.fragment_words()),
             ("recent_size", process.heap.recent_words()),
-            ("stack_size", process.heap.stack_words()),
+            ("stack_size", process.observed_stack_words()),
             ("old_heap_size", process.heap.old_used_words()),
             ("heap_size", process.heap.used_words()),
             ("bin_vheap_size", process.heap.bin_vheap_used() as usize),
@@ -1724,6 +1724,41 @@ fn backtrace_with(
         }
     }
     let base = process.heap.frame_pointer();
+    if let Some(frame) = process.trap_return_frame()
+        && let Ok(word) = crate::stacktrace::continuation_tag(frame.module, frame.ip)
+    {
+        // The return address of the trapped BIF call, then the caller's frame that a
+        // `call_ext_last` released before the call; the words are not on the stack.
+        let call_site = frame.ip.saturating_sub(1);
+        let description = modules
+            .get(frame.module)
+            .and_then(|code| {
+                let (start, name, arity) = code
+                    .functions
+                    .iter()
+                    .rev()
+                    .find(|(s, _, _)| *s <= call_site)?;
+                Some(format!(
+                    "{}:{}/{} + {}",
+                    code.name,
+                    name,
+                    arity,
+                    frame.ip - start
+                ))
+            })
+            .unwrap_or_else(|| "unknown function".into());
+        let kept = process.trap_frame_words();
+        let slot = base.wrapping_sub((1 + kept.len()) * 8);
+        let _ = writeln!(
+            text,
+            "\n{slot:#018x} Return addr {:#018x} ({description})",
+            word.tagged_word() as usize
+        );
+        for (yreg, word) in kept.iter().enumerate() {
+            let _ = write!(text, "{:<8} ", format!("y({yreg})"));
+            let _ = writeln!(text, "{}", print(*word));
+        }
+    }
     let mut yreg = 0usize;
     for index in 0..process.heap.stack_words() {
         let Some(word) = process.heap.stack_get(index) else {

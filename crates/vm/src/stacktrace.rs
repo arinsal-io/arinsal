@@ -161,6 +161,8 @@ pub(super) struct RawTrace {
     /// `module_index` and indexed continuations name the active code table.
     /// A raw `save_stacktrace` sets this and does not resolve frames.
     code_table: bool,
+    /// The process waits in a BIF trap: its pc is no function, so no frame stands for it.
+    no_current: bool,
 }
 
 enum Continuation {
@@ -351,6 +353,10 @@ pub(super) struct Current {
     pub(super) ip: usize,
     /// Raising pc inside native code, when the process was executing there.
     pub(super) native_pc: Option<usize>,
+    /// The process is scheduled out in the export trap of a BIF call.
+    pub(super) trapped: bool,
+    /// Return address of that BIF call when it is not on the stack (interpreter calls).
+    pub(super) trap_return: Option<usize>,
 }
 
 /// Port of erts/emulator/beam/beam_common.c:781 (gather_stacktrace), OTP-29.1.1.
@@ -369,6 +375,8 @@ pub(super) fn capture(
         module,
         ip,
         native_pc,
+        trapped,
+        trap_return,
     } = current;
     raw.class = class;
     let captured_top = top
@@ -408,6 +416,7 @@ pub(super) fn capture(
     raw.continuations.clear();
     raw.continuations.reserve(raw.depth.min(16));
     raw.native_top = None;
+    raw.no_current = trapped;
     if matches!(raw.top, Some(StoredTopFrame::Bif { .. })) && native_pc.is_none() {
         // Port of beam_common.c:880-930 (`save_stacktrace`), OTP-29.1.1: the BIF owns
         // `current`; preserve the interpreter caller's CP as the first trace word.
@@ -418,7 +427,7 @@ pub(super) fn capture(
     }
     // OTP starts with the failing instruction as `prev` and compares it with
     // each continuation after moving that continuation back to its call site.
-    let mut previous = Some((module, ip));
+    let mut previous = (!trapped).then_some((module, ip));
     // Native return addresses share erts' single `prev`, so the two trackers reset each other.
     let mut previous_native: Option<usize> = None;
     if let Some(pc) = native_pc {
@@ -435,6 +444,15 @@ pub(super) fn capture(
         } else {
             raw.native_top = Some(pc);
         }
+    }
+    if let Some(return_ip) = trap_return
+        && modules.get(module).is_some()
+        && raw.continuations.len() + 1 < raw.depth
+    {
+        // The trap's pc is no function, so nothing seeds `prev`: the BIF call's own return
+        // address is the first frame.
+        previous = Some((module, return_ip.saturating_sub(1)));
+        push_frame(raw, Continuation::Indexed(module, return_ip));
     }
     let mut index = 0;
     while index < heap.stack_words() {
@@ -1488,8 +1506,11 @@ pub(super) fn build(
     depth: usize,
 ) -> Result<Term, VmError> {
     // A process inside a native BIF call raises at that call's pc, as in `exceptions.rs`.
+    let trapped = p.header.i as usize == crate::bif_traps::bif_export_trap_pc();
     let native_pc = p.cold.as_ref().map_or(0, |cold| cold.native_call_pc);
-    let native_pc = if native_pc != 0 && crate::native_bridge::is_native_function_at(native_pc) {
+    let native_pc = if trapped {
+        None
+    } else if native_pc != 0 && crate::native_bridge::is_native_function_at(native_pc) {
         Some(native_pc)
     } else {
         // A process suspended inside native code: `p.module`/`p.ip` still hold the last
@@ -1508,6 +1529,8 @@ pub(super) fn build(
             module: p.module,
             ip: p.ip,
             native_pc,
+            trapped,
+            trap_return: p.trap_return_frame().map(|frame| frame.ip),
         },
         &p.heap,
         depth,
@@ -1886,7 +1909,9 @@ fn build_saved_active(
     }
     let mut heap = TraceHeap::with_block(&mut p.heap, block_words);
     let current = raw.module.as_deref();
-    let current_frame = if let Some(frame) = native_frame {
+    let current_frame = if raw.no_current {
+        None
+    } else if let Some(frame) = native_frame {
         // Port of erts/emulator/beam/utils.c:3430 (`erts_build_mfa_item`), OTP-29.1.1.
         let location = frame.line.and_then(|line| {
             frame
@@ -1918,7 +1943,7 @@ fn build_saved_active(
             )
         })
     };
-    if current_frame.is_none() && !matches!(top, Some(TopFrame::Bif { .. })) {
+    if current_frame.is_none() && !raw.no_current && !matches!(top, Some(TopFrame::Bif { .. })) {
         return Err(VmError::Unsupported("stacktrace module".into()));
     }
     // Head-first. `erts_build_mfa_item` writes plain frames; a BIF frame or one
@@ -1962,7 +1987,7 @@ fn build_saved_active(
                 location,
             }));
         }
-    } else {
+    } else if !raw.no_current {
         let Some((frame_module, function, arity, location)) = current_frame else {
             return Err(VmError::Unsupported("stacktrace frame".into()));
         };

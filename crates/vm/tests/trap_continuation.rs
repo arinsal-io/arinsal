@@ -7,7 +7,7 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(trap_cont).
--export([run/0, child/3]).
+-export([run/0, run_shapes/0, run_fun_shapes/0, child/3, plain_child/1]).
 run() ->
     %% Each trap has to outlast a few schedule slices so the parent observes it
     %% while the child is still inside the continuation export.
@@ -18,12 +18,47 @@ run() ->
      probe(b2t, {erts_internal, binary_to_term_trap, 1},
             fun() -> binary_to_term(Encoded) end),
      probe(map, {maps, from_list, 1}, fun() -> maps:from_list(Pairs) end)].
+run_shapes() ->
+    L = lists:seq(1, 800000),
+    Want = {lists, reverse, 2},
+    M = lists, F = reverse,
+    [plain(),
+     probe(local_tail, Want, fun() -> tail(L) end),
+     probe(local_call, Want, fun() -> call(L) end),
+     probe(local_tail_frame, Want, fun() -> tail_frame(L) end),
+     probe(frame_words, Want, fun() -> tail_frame_words(L) end),
+     probe(apply_last, Want, fun() -> apply_last(M, F, L) end),
+     probe(fun_call, Want, fun() -> _ = lists:reverse(L, []), ok end)].
+run_fun_shapes() ->
+    L = lists:seq(1, 800000),
+    Want = {lists, reverse, 2},
+    Fn = fun lists:reverse/2,
+    [probe(fun_last, Want, fun() -> fun_last(Fn, L) end),
+     probe(fun_tail, Want, fun() -> fun_tail(Fn, L) end)].
+tail(L) -> lists:reverse(L, []).
+call(L) -> X = lists:reverse(L, []), {X}.
+tail_frame(L) -> _ = id(L), lists:reverse(L, []).
+tail_frame_words(L) -> K = {marker, 1}, _ = id(L), lists:reverse(L, [K]).
+apply_last(M, F, L) -> _ = id(L), M:F(L, []).
+fun_last(Fn, L) -> _ = id(L), Fn(L, []).
+fun_tail(Fn, L) -> Fn(L, []).
+id(X) -> X.
+plain() ->
+    Parent = self(),
+    Pid = spawn(trap_cont, plain_child, [Parent]),
+    receive ready -> ok end,
+    {plain, frames(process_info(Pid, [stack_size, current_function, backtrace, current_stacktrace]))}.
+plain_child(Parent) ->
+    Parent ! ready,
+    receive stop -> ok end.
 probe(Tag, Want, Fun) ->
     Parent = self(),
     Pid = spawn(trap_cont, child, [Parent, Tag, Fun]),
     1 = erlang:trace(Pid, true, [running, {tracer, Parent}]),
     Pid ! go,
-    {Tag, wait(Pid, Want, [])}.
+    Frames = wait(Pid, Want, []),
+    Fin = receive {done, Pid} -> finished after 60000 -> hung end,
+    {Tag, Frames, Fin}.
 child(Parent, _Tag, Fun) ->
     receive go ->
         Fun(),
@@ -32,7 +67,7 @@ child(Parent, _Tag, Fun) ->
 wait(Pid, Want, Seen) ->
     receive
         {trace, Pid, out, _} ->
-            case process_info(Pid, [stack_size, current_function, backtrace]) of
+            case process_info(Pid, [stack_size, current_function, backtrace, current_stacktrace]) of
                 undefined -> wait(Pid, Want, Seen);
                 Info ->
                     case lists:keyfind(current_function, 1, Info) of
@@ -49,7 +84,20 @@ frames(Info) ->
     {value, {stack_size, Stack}} = lists:keysearch(stack_size, 1, Info),
     {value, {current_function, Current}} = lists:keysearch(current_function, 1, Info),
     {value, {backtrace, Bin}} = lists:keysearch(backtrace, 1, Info),
-    {Stack, Current, names(Bin)}.
+    {value, {current_stacktrace, Trace}} = lists:keysearch(current_stacktrace, 1, Info),
+    {Stack, Current, names(Bin), [{M, F, A} || {M, F, A, _} <- Trace], ys(Bin)}.
+ys(Bin) ->
+    [yval(Line) || Line <- binary:split(Bin, <<"\n">>, [global]), is_y(Line)].
+is_y(<<"y(", _/binary>>) -> true;
+is_y(_) -> false.
+yval(Line) ->
+    [_, Rest] = binary:split(Line, <<")">>),
+    Value = string:trim(Rest, leading),
+    case Value of
+        <<"<", _/binary>> -> pid_or_ref;
+        <<"Catch", _/binary>> -> catch_slot;
+        _ -> binary:part(Value, 0, min(60, byte_size(Value)))
+    end.
 names(Bin) ->
     [name(Line) || Line <- binary:split(Bin, <<"\n">>, [global]), name(Line) =/= skip].
 name(Line) ->
@@ -93,6 +141,44 @@ fn trap_continuation_stack_matches_erts() {
     // The frame at that out does not depend on how far the BIF got.
     let actual = vm
         .eval_scheduled_reductions("trap_cont", "run", &[], 1, Some(0x7C0), 4_000)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(expected, CallResult::Ok(actual.term));
+}
+
+#[test]
+fn trap_frames_of_each_call_shape_match_erts() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping trap frame shape differential test");
+        return;
+    };
+    let beam = reference.compile_named("trap_cont", SOURCE, &[]).unwrap();
+    reference.load("trap_cont", &beam).unwrap();
+    let expected = reference.call("trap_cont", "run_shapes", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled_reductions("trap_cont", "run_shapes", &[], 1, Some(0x7C2), 4_000)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(expected, CallResult::Ok(actual.term));
+}
+
+#[test]
+fn trap_frames_of_a_tail_called_export_fun_match_erts() {
+    if std::env::var_os("ARINSAL_INTERP").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        eprintln!("skipped with the JIT: a tail call of an export fun to a trapping BIF aborts it");
+        return;
+    }
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping export fun trap frame differential test");
+        return;
+    };
+    let beam = reference.compile_named("trap_cont", SOURCE, &[]).unwrap();
+    reference.load("trap_cont", &beam).unwrap();
+    let expected = reference.call("trap_cont", "run_fun_shapes", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled_reductions("trap_cont", "run_fun_shapes", &[], 1, Some(0x7C3), 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
