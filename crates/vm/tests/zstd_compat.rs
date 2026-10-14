@@ -11,7 +11,7 @@ const MODULE: &str = "zstd_compat_probe";
 
 const SOURCE: &str = r#"
 -module(zstd_compat_probe).
--export([oneshot/0, lifecycle/0, streams/0, corrupt/0, raw/0, reductions/0, external/0]).
+-export([oneshot/0, lifecycle/0, streams/0, corrupt/0, raw/0, reductions/0, external/0, dirty/0]).
 
 inputs() ->
     Text = iolist_to_binary(lists:duplicate(2000, <<"the quick brown fox jumps over the lazy dog ">>)),
@@ -354,6 +354,45 @@ reductions() ->
     Rows = [{Size, Tag, case Size =< 50000 of true -> Delta - Base; false -> (Delta - Base) div 500 end} || {Size, Tag, Delta} <- Deltas],
     io:format("~w~n", [Rows]).
 
+dirty() ->
+    Parent = self(),
+    Dict = <<"dictionary content shared by the dirty scheduler probes">>,
+    Cpus = erlang:system_info(dirty_cpu_schedulers),
+    [spawn_link(fun() -> erts_debug:dirty_cpu(wait, 1500), Parent ! blocker_done end)
+     || _ <- lists:seq(1, Cpus)],
+    timer:sleep(300),
+    M = zstd,
+    F = create_cdict_nif,
+    Fun = fun zstd:create_cdict_nif/2,
+    Calls = [
+        {external_cdict, fun() -> zstd:create_cdict_nif(Dict, 3) end},
+        {external_ddict, fun() -> zstd:create_ddict_nif(Dict) end},
+        {external_load_compress,
+         fun() -> zstd:load_compress_dictionary_nif(zstd:init_compress_nif(), Dict) end},
+        {external_load_decompress,
+         fun() -> zstd:load_decompress_dictionary_nif(zstd:init_decompress_nif(), Dict) end},
+        {apply_3, fun() -> apply(zstd, create_cdict_nif, [Dict, 3]) end},
+        {apply_variables, fun() -> M:F(Dict, 3) end},
+        {apply_fun, fun() -> apply(Fun, [Dict, 3]) end},
+        {fun_call, fun() -> Fun(Dict, 3) end},
+        {local, fun() -> zstd:nif_create_cdict(Dict, 3) end},
+        {not_dirty, fun() -> zstd:getDictId_fromDict_nif(Dict) end}
+    ],
+    Pids = [{Name, spawn_link(fun() -> Parent ! {self(), dirty_shape(Call())} end)} || {Name, Call} <- Calls],
+    timer:sleep(500),
+    Early = lists:sort([Name || {Name, Pid} <- Pids, finished(Pid)]),
+    Late = lists:sort([{Name, wait(Pid)} || {Name, Pid} <- Pids]),
+    io:format("~w~n~w~n", [Early, Late]).
+
+finished(Pid) ->
+    receive {Pid, _} = Done -> self() ! Done, true after 0 -> false end.
+
+wait(Pid) ->
+    receive {Pid, Result} -> Result after 10000 -> timeout end.
+
+dirty_shape(Resource) when is_reference(Resource) -> resource;
+dirty_shape(Other) -> Other.
+
 row(Level, Data) ->
     Compressed = iolist_to_binary(zstd:compress(Data, #{compressionLevel => Level})),
     Plain = iolist_to_binary(Data),
@@ -420,6 +459,7 @@ nif_decompress_stream(R, D, E) -> decompress_stream_nif(R, D, E).
 nif_compress_close(R) -> compress_close_nif(R).
 nif_decompress_close(R) -> decompress_close_nif(R).
 nif_set_pledged(R, N) -> set_pledged_src_size_nif(R, N).
+nif_create_cdict(D, L) -> create_cdict_nif(D, L).
 "#;
 
 /// The `zstd` module of the reference OTP with every function exported, so a probe can call the
@@ -1347,4 +1387,12 @@ fn stream_reductions_match_erl() {
 #[test]
 fn external_nif_calls_check_the_owner_like_erl() {
     assert_matches_erl(both_nifs("external"), &["not_on_controlling_process"]);
+}
+
+/// With every dirty CPU scheduler busy, a call to a dirty NIF stub (`zstd:create_cdict_nif/2`,
+/// ...) waits for one, whether it is an external call, `apply/3`, a variable-module call or a fun
+/// call; the NIF that is not flagged dirty returns at once.
+#[test]
+fn external_calls_of_dirty_nifs_run_on_dirty_cpu_like_erl() {
+    assert_matches_erl(both_nifs("dirty"), &["[not_dirty]"]);
 }

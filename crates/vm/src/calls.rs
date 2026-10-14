@@ -599,7 +599,7 @@ impl Vm {
         if import.class() == ImportClass::Fresh {
             if import.bif.is_none()
                 && let Some(bif) =
-                    natives::static_nif_lookup(&import.module, &import.function, import.arity)
+                    natives::plain_static_nif_lookup(&import.module, &import.function, import.arity)
             {
                 import.set_extra_bif(bif);
             }
