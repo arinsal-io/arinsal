@@ -107,6 +107,24 @@ pub(crate) fn note_export_trap(process: &mut Process) {
     }
     // `push_native_continuation` republishes the header and clears `i`.
     process.header.i = bif_export_trap as *const u8 as *const _;
+    let frame = if resume.is_none() && process.native_pc.is_none() {
+        let released = process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.ext_last_released)
+            .filter(|&(module, ip, _)| module == process.module && ip == process.ip)
+            .map_or(0, |(_, _, words)| words);
+        Some(crate::proc_create::TrapReturn {
+            module: process.module,
+            ip: process.ip + 1,
+            released,
+        })
+    } else {
+        None
+    };
+    if frame.is_some() || process.cold.is_some() {
+        process.cold_mut().trap_return = frame;
+    }
 }
 
 fn clear_export_trap(process: &mut Process) {

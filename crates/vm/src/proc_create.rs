@@ -812,9 +812,11 @@ pub(crate) struct ProcessCold {
     /// Storage of a table being released by a trapped `ets:delete/1` or
     /// `ets:internal_delete_all/2`.
     pub(crate) ets_free: Option<EtsFree>,
-    /// Module and instruction of a `call_ext_last` whose frame was already released when its
-    /// BIF yielded, so the re-executed instruction does not release it twice.
-    pub(crate) ext_last_released: Option<(usize, usize)>,
+    /// Module, instruction and frame size of a `call_ext_last` whose frame was already
+    /// released when its BIF yielded, so the re-executed instruction does not release it twice.
+    pub(crate) ext_last_released: Option<(usize, usize, usize)>,
+    /// The frames a trapped BIF call holds in erts but the interpreter does not push.
+    pub(crate) trap_return: Option<TrapReturn>,
     /// A process-local BIF trap waiting for its private continuation export.
     pub(crate) bif_trap: Option<BifTrapPending>,
     /// Operand registers of `apply` calls in progress. A callee may collect before it
@@ -914,6 +916,20 @@ pub(crate) struct PersistentGetAll {
     pub(crate) result: Term,
 }
 
+/// The caller frame of a BIF call that trapped out of the interpreter.
+///
+/// erts calls a BIF as an ordinary call: the return address into the caller is on the stack
+/// while the process waits in the trap, above the caller's frame, which a tail call keeps
+/// until the BIF returns. The interpreter re-executes the call instruction on resume instead,
+/// so these words are reported to `process_info` and stack traces without being pushed.
+pub(crate) struct TrapReturn {
+    /// Module and instruction the BIF returns to.
+    pub(crate) module: usize,
+    pub(crate) ip: usize,
+    /// Words of the caller's frame that a `call_ext_last` released before the call.
+    pub(crate) released: usize,
+}
+
 /// The resumable part of an interrupted BIF call.
 pub(crate) struct BifTrapPending {
     pub(crate) caller_module: usize,
@@ -935,6 +951,21 @@ pub(crate) struct BifTrapPending {
     pub(crate) callee: (arinsal_term::Atom, arinsal_term::Atom),
 }
 impl Process {
+    /// The caller frame of the BIF the process waits in, while it is scheduled out in the
+    /// export trap of an interpreter call.
+    pub(crate) fn trap_return_frame(&self) -> Option<&TrapReturn> {
+        if self.header.i as usize != crate::bif_traps::bif_export_trap_pc() {
+            return None;
+        }
+        self.cold.as_ref()?.trap_return.as_ref()
+    }
+    /// Words of the Erlang stack as erts counts them, with the frames of a trapped call.
+    pub(crate) fn observed_stack_words(&self) -> usize {
+        self.heap.stack_words()
+            + self
+                .trap_return_frame()
+                .map_or(0, |frame| 1 + frame.released)
+    }
     /// `true` when `-on_load` did not return `ok` and the entry call must not run.
     ///
     /// A matching continuation that returned `ok` has its saved arguments copied back
@@ -1139,6 +1170,9 @@ impl Process {
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;
+        if !crate::beamasm_integration::enabled() {
+            crate::native_bridge::push_exit_bridge(&mut process);
+        }
         process
     }
     pub(crate) fn with_registers_and_min_heap(

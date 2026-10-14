@@ -2837,7 +2837,10 @@ impl Vm {
                     let released = dealloc > 0
                         && p.cold
                             .as_mut()
-                            .is_some_and(|cold| cold.ext_last_released.take() == Some((module_id, offset)));
+                            .is_some_and(|cold| {
+                                cold.ext_last_released.take().map(|(m, i, _)| (m, i))
+                                    == Some((module_id, offset))
+                            });
                     if dealloc > 0 && !released && !p.heap.release_stack(dealloc as usize) {
                         return Err(VmError::Unsupported("stack underflow".into()));
                     }
@@ -2854,7 +2857,8 @@ impl Vm {
                         // A BIF yielding with an error (ets:delete/1 releasing a big table):
                         // the instruction runs again, with its frame already released.
                         Err(VmError::Yield) if dealloc > 0 => {
-                            p.cold_mut().ext_last_released = Some((module_id, offset));
+                            p.cold_mut().ext_last_released =
+                                Some((module_id, offset, dealloc as usize));
                             return Err(VmError::Yield);
                         }
                         other => other?,
@@ -2902,7 +2906,8 @@ impl Vm {
                         ImportOutcome::Returned(value) => return Ok(RunState::Done(value)),
                         ImportOutcome::Yield => {
                             if dealloc > 0 {
-                                p.cold_mut().ext_last_released = Some((module_id, offset));
+                                p.cold_mut().ext_last_released =
+                                    Some((module_id, offset, dealloc as usize));
                             }
                             sync_cursor(p, htop, &mut heap_dirty);
                             p.reductions = reds;
@@ -4413,7 +4418,10 @@ impl Vm {
                                 let released = p
                                     .cold
                                     .as_mut()
-                                    .is_some_and(|cold| cold.ext_last_released.take() == Some(site));
+                                    .is_some_and(|cold| {
+                                        cold.ext_last_released.take().map(|(m, i, _)| (m, i))
+                                            == Some(site)
+                                    });
                                 if !released {
                                     p.heap.release_stack(c.value() as usize);
                                 }
@@ -4426,8 +4434,8 @@ impl Vm {
                                 ctx.as_deref_mut(),
                             ) {
                                 Err(VmError::Yield) if opcode == Opcode::CallExtLast => {
-                                    let site = (p.module, p.ip);
-                                    p.cold_mut().ext_last_released = Some(site);
+                                    p.cold_mut().ext_last_released =
+                                        Some((p.module, p.ip, c.value() as usize));
                                     return Err(VmError::Yield);
                                 }
                                 other => other?,
@@ -4439,8 +4447,8 @@ impl Vm {
                                 }
                                 ImportOutcome::Yield => {
                                     if opcode == Opcode::CallExtLast {
-                                        let site = (p.module, p.ip);
-                                        p.cold_mut().ext_last_released = Some(site);
+                                        p.cold_mut().ext_last_released =
+                                            Some((p.module, p.ip, c.value() as usize));
                                     }
                                     sync_cursor(p, htop, &mut heap_dirty);
                                     p.reductions = reds;

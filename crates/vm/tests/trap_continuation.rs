@@ -7,7 +7,7 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(trap_cont).
--export([run/0, child/3]).
+-export([run/0, run_shapes/0, child/3, plain_child/1]).
 run() ->
     %% Each trap has to outlast a few schedule slices so the parent observes it
     %% while the child is still inside the continuation export.
@@ -18,6 +18,26 @@ run() ->
      probe(b2t, {erts_internal, binary_to_term_trap, 1},
             fun() -> binary_to_term(Encoded) end),
      probe(map, {maps, from_list, 1}, fun() -> maps:from_list(Pairs) end)].
+run_shapes() ->
+    L = lists:seq(1, 800000),
+    Want = {lists, reverse, 2},
+    [plain(),
+     probe(local_tail, Want, fun() -> tail(L) end),
+     probe(local_call, Want, fun() -> call(L) end),
+     probe(local_tail_frame, Want, fun() -> tail_frame(L) end),
+     probe(fun_call, Want, fun() -> _ = lists:reverse(L, []), ok end)].
+tail(L) -> lists:reverse(L, []).
+call(L) -> X = lists:reverse(L, []), {X}.
+tail_frame(L) -> _ = id(L), lists:reverse(L, []).
+id(X) -> X.
+plain() ->
+    Parent = self(),
+    Pid = spawn(trap_cont, plain_child, [Parent]),
+    receive ready -> ok end,
+    {plain, frames(process_info(Pid, [stack_size, current_function, backtrace]))}.
+plain_child(Parent) ->
+    Parent ! ready,
+    receive stop -> ok end.
 probe(Tag, Want, Fun) ->
     Parent = self(),
     Pid = spawn(trap_cont, child, [Parent, Tag, Fun]),
@@ -93,6 +113,23 @@ fn trap_continuation_stack_matches_erts() {
     // The frame at that out does not depend on how far the BIF got.
     let actual = vm
         .eval_scheduled_reductions("trap_cont", "run", &[], 1, Some(0x7C0), 4_000)
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(expected, CallResult::Ok(actual.term));
+}
+
+#[test]
+fn trap_frames_of_each_call_shape_match_erts() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping trap frame shape differential test");
+        return;
+    };
+    let beam = reference.compile_named("trap_cont", SOURCE, &[]).unwrap();
+    reference.load("trap_cont", &beam).unwrap();
+    let expected = reference.call("trap_cont", "run_shapes", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled_reductions("trap_cont", "run_shapes", &[], 1, Some(0x7C2), 4_000)
         .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(expected, CallResult::Ok(actual.term));
 }
