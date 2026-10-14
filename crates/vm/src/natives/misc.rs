@@ -71,7 +71,7 @@ pub(crate) fn call(
             return Some(
                 crate::calls::call_bif(&mut process.heap, &mut process.reductions, bif, args)
                     .map_err(|error| {
-                        crate::exceptions::direct_bif_error(process, module, function, args, error)
+                        crate::exceptions::bif_error(process, module, function, args, error)
                     }),
             );
         }
