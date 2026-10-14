@@ -384,6 +384,17 @@ pub(super) fn tuple_element(term: Term, index: usize) -> Result<Term, BifError> 
     tuple_view(&term)?.element(index).ok_or(BADARG)
 }
 
+/// The elements of a proper list, `None` for any other term.
+pub fn proper_list_terms(term: Term) -> Option<Vec<Term>> {
+    list(term).ok()
+}
+
+/// The elements of a tuple, `None` for any other term.
+pub fn tuple_terms(term: Term) -> Option<Vec<Term>> {
+    let view = tuple_view(&term).ok()?;
+    Some(view.iter().collect())
+}
+
 pub(super) fn list(term: Term) -> Result<Vec<Term>, BifError> {
     list_with_limit(term, usize::MAX)
 }

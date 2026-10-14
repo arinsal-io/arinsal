@@ -313,7 +313,6 @@ dependencies = [
  "arinsal-difftest",
  "arinsal-etf",
  "arinsal-term",
- "num-traits",
 ]
 
 [[package]]
