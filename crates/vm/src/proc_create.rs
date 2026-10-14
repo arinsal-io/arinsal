@@ -148,6 +148,8 @@ pub struct Process {
     /// `REDS_IN`: FCALLS at the start of the current native slice.
     /// `erts_current_reductions` is this minus the live `c_p->fcalls`.
     pub(crate) native_reds_in: i32,
+    /// FCALLS the last trapping BIF handler spent on its own, before the call's charge.
+    pub(crate) trap_work: i32,
     pub(crate) reductions_used: u64,
     pub(crate) gc_deferred: bool,
     /// erts `F_DELAY_GC`: set from `loop_rec` until `remove_message` or the wait, while x0
@@ -1175,6 +1177,7 @@ impl Process {
             max_heap_peak: 0,
             reductions: 4000,
             native_reds_in: 4000,
+            trap_work: 0,
             reductions_used: 0,
             delay_gc: false,
             gc_deferred: false,

@@ -797,6 +797,7 @@ impl Vm {
                 ),
             );
         }
+        let meter = crate::bif_traps::TrapMeter::start(p, ctx.as_deref());
         if let Some(result) = crate::bif_traps::execute(
             self,
             p,
@@ -810,7 +811,14 @@ impl Vm {
             ],
             ctx.as_deref_mut(),
         ) {
-            return match result? {
+            let result = result?;
+            meter.finish(
+                p,
+                ctx.as_deref_mut(),
+                result.reductions(),
+                result.is_virtual_yield(),
+            );
+            return match result {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
                     self.finish_native_value(p, tail, value)
                 }
