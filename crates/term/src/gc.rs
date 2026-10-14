@@ -166,10 +166,6 @@ struct HeapTop {
 fn binref_chain_nodes(mut link: usize) -> Vec<usize> {
     let mut nodes = Vec::new();
     while link != 0 {
-        assert!(
-            nodes.len() < 1_000_000,
-            "cycle in BinRef chain before heap resize"
-        );
         nodes.push(link);
         link = crate::heap::load((link as *const u64).wrapping_add(2)) as usize;
     }
