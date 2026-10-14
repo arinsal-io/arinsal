@@ -11,10 +11,11 @@ pub use parser::{
 
 use std::sync::Arc;
 
-use arinsal_bifs::{BifError, BifFn, Ctx};
+use arinsal_bifs::{BifError, BifFn, Ctx, proper_list_terms, tuple_terms, with_binary_bytes};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::{ExportEntry, FunEntry, HeapAlloc, Node, Term, from_owned, to_owned};
-use num_traits::ToPrimitive;
+use arinsal_term::{
+    ExportEntry, FunEntry, HeapAlloc, Node, Term, TermBuilder, from_owned, global_atoms,
+};
 
 /// Return the `erlang:decode_packet/3` BIF implementation.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
@@ -71,55 +72,48 @@ fn byte_string(bytes: &[u8], binary: bool) -> O {
         O::list(bytes.iter().map(|b| O::Int(*b as i64)).collect())
     }
 }
-fn integer(value: &O) -> Option<u32> {
-    match value {
-        O::Int(n) => u32::try_from(*n).ok(),
-        O::BigInt(n) => n.to_u32(),
-        _ => None,
-    }
+fn integer(value: Term) -> Option<u32> {
+    u32::try_from(value.as_small()?).ok()
 }
-fn type_of(value: &O) -> Option<PacketType> {
-    Some(match value {
-        O::Int(0) => PacketType::Raw,
-        O::Int(1) => PacketType::Length1,
-        O::Int(2) => PacketType::Length2,
-        O::Int(4) => PacketType::Length4,
-        O::Atom(s) if s == "raw" => PacketType::Raw,
-        O::Atom(s) if s == "asn1" => PacketType::Asn1,
-        O::Atom(s) if s == "sunrm" => PacketType::Sunrm,
-        O::Atom(s) if s == "cdr" => PacketType::Cdr,
-        O::Atom(s) if s == "fcgi" => PacketType::Fcgi,
-        O::Atom(s) if s == "line" => PacketType::Line,
-        O::Atom(s) if s == "tpkt" => PacketType::Tpkt,
-        O::Atom(s) if s == "http" => PacketType::Http,
-        O::Atom(s) if s == "httph" => PacketType::Httph,
-        O::Atom(s) if s == "http_bin" => PacketType::HttpBin,
-        O::Atom(s) if s == "httph_bin" => PacketType::HttphBin,
-        O::Atom(s) if s == "ssl_tls" => PacketType::SslTls,
+fn type_of(value: Term) -> Option<PacketType> {
+    if let Some(number) = value.as_small() {
+        return match number {
+            0 => Some(PacketType::Raw),
+            1 => Some(PacketType::Length1),
+            2 => Some(PacketType::Length2),
+            4 => Some(PacketType::Length4),
+            _ => None,
+        };
+    }
+    Some(match global_atoms().text(value.as_atom()?)? {
+        "raw" => PacketType::Raw,
+        "asn1" => PacketType::Asn1,
+        "sunrm" => PacketType::Sunrm,
+        "cdr" => PacketType::Cdr,
+        "fcgi" => PacketType::Fcgi,
+        "line" => PacketType::Line,
+        "tpkt" => PacketType::Tpkt,
+        "http" => PacketType::Http,
+        "httph" => PacketType::Httph,
+        "http_bin" => PacketType::HttpBin,
+        "httph_bin" => PacketType::HttphBin,
+        "ssl_tls" => PacketType::SslTls,
         _ => return None,
     })
 }
-fn options(value: &O, ty: PacketType) -> Result<PacketOptions, BifError> {
+fn options(value: Term, ty: PacketType) -> Result<PacketOptions, BifError> {
     let mut result = PacketOptions::default();
-    let O::List { elems, tail } = value else {
-        return if *value == O::Nil {
-            Ok(result)
-        } else {
-            Err(BifError::BADARG)
-        };
-    };
-    if **tail != O::Nil {
-        return Err(BifError::BADARG);
-    }
-    for item in elems {
-        let O::Tuple(pair) = item else {
+    for item in proper_list_terms(value).ok_or(BifError::BADARG)? {
+        let pair = tuple_terms(item).ok_or(BifError::BADARG)?;
+        let [name, value] = pair.as_slice() else {
             return Err(BifError::BADARG);
         };
-        let [O::Atom(name), value] = pair.as_slice() else {
-            return Err(BifError::BADARG);
-        };
-        let n = integer(value).ok_or(BifError::BADARG)?;
-        match name.as_str() {
+        let name = name
+            .as_atom()
+            .and_then(|name| global_atoms().text(name))
+            .ok_or(BifError::BADARG)?;
+        let n = integer(*value).ok_or(BifError::BADARG)?;
+        match name {
             "packet_size" => result.packet_size = n,
             "line_length" => result.line_length = n,
             "line_delimiter" if ty == PacketType::Line && n <= 255 => {
@@ -131,53 +125,133 @@ fn options(value: &O, ty: PacketType) -> Result<PacketOptions, BifError> {
     Ok(result)
 }
 
-// Port of erts/emulator/beam/erl_bif_port.c:1476 (decode_packet_3), OTP-29.1.1.
-fn decode_packet(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let [ty, data, opts] = args else {
-        return Err(BifError::BADARG);
-    };
-    let ty = to_owned(*ty).map_err(|_| BifError::BADARG)?;
-    let Some(ty) = type_of(&ty) else {
-        let cause = from_owned(&atom("badopt"), &mut Heap(&mut ctx.heap))
-            .map_err(|_| BifError::SystemLimit)?;
-        return Err(BifError::Badarg { cause: Some(cause) });
-    };
-    let data = to_owned(*data).map_err(|_| BifError::BADARG)?;
-    let opts = to_owned(*opts).map_err(|_| BifError::BADARG)?;
-    let O::Binary(ref data) = data else {
-        return Err(BifError::BADARG);
-    };
-    let opts = options(&opts, ty)?;
-    let value = match parse(ty, data, opts) {
-        PacketResult::Error => tuple(vec![atom("error"), atom("invalid")]),
-        PacketResult::More(length) => tuple(vec![
-            atom("more"),
-            length.map_or_else(|| atom("undefined"), |n| O::Int(n as i64)),
-        ]),
+/// What `decode_packet` found in the binary, with the binary positions of the parts that
+/// erts returns as sub-binaries of its argument.
+enum Decoded {
+    Invalid,
+    More(Option<usize>),
+    Packet {
+        body: Body,
+        rest_start: usize,
+        rest_len: usize,
+    },
+}
+
+enum Body {
+    Sub { start: usize, len: usize },
+    Term(O),
+}
+
+fn offset_of(data: &[u8], part: &[u8]) -> usize {
+    (part.as_ptr() as usize).saturating_sub(data.as_ptr() as usize)
+}
+
+fn decode(data: &[u8], ty: PacketType, opts: PacketOptions) -> Decoded {
+    match parse(ty, data, opts) {
+        PacketResult::Error => Decoded::Invalid,
+        PacketResult::More(length) => Decoded::More(length),
         PacketResult::Ok { packet, rest } => {
-            let packet = match packet {
-                Packet::Bytes(bytes) => O::Binary(bytes.to_vec()),
-                Packet::Http(http) => http_term(
+            let body = match packet {
+                Packet::Bytes(bytes) => Body::Sub {
+                    start: offset_of(data, bytes),
+                    len: bytes.len(),
+                },
+                Packet::Http(http) => Body::Term(http_term(
                     http,
                     matches!(ty, PacketType::HttpBin | PacketType::HttphBin),
-                ),
+                )),
                 Packet::SslTls {
                     content_type,
                     major,
                     minor,
                     data,
-                } => tuple(vec![
+                } => Body::Term(tuple(vec![
                     atom("ssl_tls"),
                     O::Nil,
                     O::Int(content_type as i64),
                     tuple(vec![O::Int(major as i64), O::Int(minor as i64)]),
                     O::Binary(data),
-                ]),
+                ])),
             };
-            tuple(vec![atom("ok"), packet, O::Binary(rest.to_vec())])
+            Decoded::Packet {
+                body,
+                rest_start: offset_of(data, rest),
+                rest_len: rest.len(),
+            }
+        }
+    }
+}
+
+// Port of erts/emulator/beam/erl_bif_port.c:1476 (decode_packet_3), OTP-29.1.1.
+fn decode_packet(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    let [ty, data, opts] = args else {
+        return Err(BifError::BADARG);
+    };
+    let Some(ty) = type_of(*ty) else {
+        let cause = from_owned(&atom("badopt"), &mut Heap(&mut ctx.heap))
+            .map_err(|_| BifError::SystemLimit)?;
+        return Err(BifError::Badarg { cause: Some(cause) });
+    };
+    let opts = options(*opts, ty)?;
+    let decoded = with_binary_bytes(*data, |view| {
+        if view.bit_len() % 8 != 0 {
+            return None;
+        }
+        let (first, length) = (view.start_bit() / 8, view.bit_len() / 8);
+        if view.start_bit() % 8 == 0 {
+            return Some(decode(&view.bytes()[first..first + length], ty, opts));
+        }
+        let mut aligned = vec![0_u8; length];
+        copy_bitstring_bytes(&mut aligned, view.bytes(), view.start_bit());
+        Some(decode(&aligned, ty, opts))
+    })?
+    .ok_or(BifError::BADARG)?;
+    let mut heap = Heap(&mut ctx.heap);
+    let value = match decoded {
+        Decoded::Invalid => from_owned(&tuple(vec![atom("error"), atom("invalid")]), &mut heap),
+        Decoded::More(length) => from_owned(
+            &tuple(vec![
+                atom("more"),
+                length.map_or_else(|| atom("undefined"), |n| O::Int(n as i64)),
+            ]),
+            &mut heap,
+        ),
+        Decoded::Packet {
+            body,
+            rest_start,
+            rest_len,
+        } => {
+            let ok = from_owned(&atom("ok"), &mut heap).map_err(|_| BifError::SystemLimit)?;
+            let body = match body {
+                Body::Sub { start, len } => TermBuilder::new(&mut heap)
+                    .sub_binary_bif(*data, start * 8, len * 8)
+                    .map_err(|_| BifError::SystemLimit)?,
+                Body::Term(term) => {
+                    from_owned(&term, &mut heap).map_err(|_| BifError::SystemLimit)?
+                }
+            };
+            let mut builder = TermBuilder::new(&mut heap);
+            let rest = builder
+                .sub_binary_bif(*data, rest_start * 8, rest_len * 8)
+                .map_err(|_| BifError::SystemLimit)?;
+            return builder
+                .tuple(&[ok, body, rest])
+                .map_err(|_| BifError::SystemLimit);
         }
     };
-    from_owned(&value, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
+    value.map_err(|_| BifError::SystemLimit)
+}
+
+/// Copy `out.len()` whole bytes starting at bit `start_bit` of `source`.
+fn copy_bitstring_bytes(out: &mut [u8], source: &[u8], start_bit: usize) {
+    let (first, shift) = (start_bit / 8, start_bit % 8);
+    for (index, byte) in out.iter_mut().enumerate() {
+        let high = source[first + index] << shift;
+        let low = source
+            .get(first + index + 1)
+            .map_or(0, |next| next >> (8 - shift));
+        *byte = high | low;
+    }
 }
 
 fn http_term(http: HttpPacket, binary: bool) -> O {

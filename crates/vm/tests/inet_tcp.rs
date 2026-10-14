@@ -4,6 +4,7 @@ use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
 use arinsal_vm::Vm;
+use std::sync::Mutex;
 
 fn source() -> &'static str {
     r#"
@@ -37,7 +38,9 @@ run(Case) ->
         sendfile_raw -> sendfile_raw();
         sendfile_reset -> sendfile_reset();
         sendfile_active_true -> sendfile_active_true();
-        sendfile_active_once -> sendfile_active_once()
+        sendfile_active_once -> sendfile_active_once();
+        empty_out_q -> empty_out_q();
+        close_empty_out_q -> close_empty_out_q()
     end.
 
 tcp(Extra) ->
@@ -428,11 +431,111 @@ sf_active(Mode, SenderOpts) ->
 sendfile_active_true() -> sf_active(true, [{active, true}]).
 
 sendfile_active_once() -> sf_active(once, [{active, once}]).
+
+slow_reader_pair(Size) ->
+    {ok, L} = gen_tcp:listen(0, tcp([binary, {active, false}])),
+    {ok, Port} = inet:port(L),
+    Parent = self(),
+    Reader = spawn(fun() ->
+        {ok, S} = gen_tcp:accept(L, 2000),
+        receive go -> ok end,
+        Got = slow_read(S, Size, 0),
+        Eof = gen_tcp:recv(S, 0, 5000),
+        Parent ! {reader, Got, Eof, erlang:monotonic_time(millisecond)},
+        gen_tcp:close(S)
+    end),
+    Opts = tcp([binary, {active, false}, {high_watermark, 16 * 1024 * 1024},
+                {low_watermark, 8 * 1024 * 1024}]),
+    {ok, C} = gen_tcp:connect({127,0,0,1}, Port, Opts, 2000),
+    {L, C, Reader}.
+
+slow_read(_S, Size, Got) when Got >= Size -> Got;
+slow_read(S, Size, Got) ->
+    case gen_tcp:recv(S, 65536, 5000) of
+        {ok, Bin} ->
+            receive after 10 -> ok end,
+            slow_read(S, Size, Got + byte_size(Bin));
+        _ -> Got
+    end.
+
+subscribe_empty_out_q(C) ->
+    case erlang:port_control(C, 16#03f1a300 + 24, <<1>>) of
+        [1, 1, A, B, C2, D] -> {ok, (A bsl 24) bor (B bsl 16) bor (C2 bsl 8) bor D};
+        Other -> Other
+    end.
+
+empty_out_q() ->
+    Size = 2 * 1024 * 1024,
+    {L, C, Reader} = slow_reader_pair(Size),
+    ok = gen_tcp:send(C, binary:copy(<<"x">>, Size)),
+    {ok, Queued} = subscribe_empty_out_q(C),
+    Reader ! go,
+    Msg = receive {empty_out_q, C} -> ok after 3000 -> timeout end,
+    {ok, [{send_pend, Pending}]} = inet:getstat(C, [send_pend]),
+    Again = subscribe_empty_out_q(C),
+    Stray = receive {empty_out_q, _} = M -> M after 100 -> none end,
+    ok = gen_tcp:close(C),
+    receive {reader, _, _, _} -> ok after 5000 -> ok end,
+    ok = gen_tcp:close(L),
+    {Queued > 0, Msg, Pending, Again, Stray}.
+
+close_empty_out_q() ->
+    Size = 2 * 1024 * 1024,
+    {L, C, Reader} = slow_reader_pair(Size),
+    ok = gen_tcp:send(C, binary:copy(<<"x">>, Size)),
+    {ok, [{send_pend, Queued}]} = inet:getstat(C, [send_pend]),
+    Reader ! go,
+    T0 = erlang:monotonic_time(millisecond),
+    ok = gen_tcp:close(C),
+    CloseMs = erlang:monotonic_time(millisecond) - T0,
+    {Received, Eof, EofAt} = receive {reader, G, E, At} -> {G, E, At} after 10000 -> {timeout, timeout, T0} end,
+    ok = gen_tcp:close(L),
+    {Queued > 0, Received =:= Size, Eof, CloseMs < 3000, EofAt - T0 < 3000}.
 "#
+}
+
+/// The inet driver keeps its port table per process, so tests that boot a `Vm` run one at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn run_cases(cases: &[&str]) {
+    let _serial = SERIAL.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping inet_tcp differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named("inet_tcp_diff", source(), &[])
+        .expect("compile inet_tcp_diff");
+    reference
+        .load("inet_tcp_diff", &beam)
+        .expect("load reference module");
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).expect("load arinsal module");
+    for case in cases {
+        let input = OwnedTerm::Atom((*case).into());
+        let expected = reference.call("inet_tcp_diff", "run", std::slice::from_ref(&input));
+        let mut heap = VecHeap::new();
+        let arg = from_owned(&input, &mut heap).unwrap();
+        let actual = vm
+            .eval_scheduled("inet_tcp_diff", "run", &[arg], 2, None)
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert_eq!(expected, CallResult::Ok(actual.term), "{case}");
+    }
+}
+
+#[test]
+fn empty_out_q_matches_erts() {
+    run_cases(&["empty_out_q"]);
+}
+
+#[test]
+fn close_with_queued_output_matches_erts() {
+    run_cases(&["close_empty_out_q"]);
 }
 
 #[test]
 fn gen_tcp_matches_erts() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poison| poison.into_inner());
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping inet_tcp differential test");
         return;
