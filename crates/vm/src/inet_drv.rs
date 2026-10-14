@@ -340,11 +340,13 @@ pub(crate) fn detach(id: u64) {
             inner.sendfile = None;
         } else {
             flush_send(&mut inner);
+            inner.sendq.clear();
         }
         inner.fd.take();
         inner.phase = Phase::Closed;
         std::mem::take(&mut inner.pending)
     };
+    send_empty_out_q_msgs(&sock);
     for (caller, aref) in pending {
         emit(
             &sock,
@@ -414,6 +416,7 @@ pub(crate) fn command(id: u64, caller: Pid, data: Vec<u8>) -> Result<(), VmError
                     crate::port::abandon_port(&sock.runtime, sock.id);
                 }
             }
+            send_empty_out_q_msgs(&sock);
         }
     }
     emit_ready(&sock);
@@ -458,6 +461,7 @@ pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<bool, VmError> {
                     crate::port::abandon_port(&sock.runtime, sock.id);
                 }
             }
+            send_empty_out_q_msgs(&sock);
         }
     }
     emit_ready(&sock);
@@ -639,6 +643,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
                     inner.sendq.clear();
                 } else {
                     let _ = flush_send(&mut inner);
+                    inner.sendq.clear();
                 }
                 inner.fd.take();
                 inner.phase = Phase::Closed;
@@ -665,7 +670,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
                 inner.phase != Phase::Closed && inner.fd.is_some(),
             )
             .unwrap_or_else(|| err_bytes("exbadport")),
-            REQ_SUBSCRIBE => subscribe(&inner, data),
+            REQ_SUBSCRIBE => subscribe(&mut inner, caller, data),
             REQ_GETTYPE => gettype(&inner),
             REQ_GETSTATUS => getstatus(&inner),
             TCP_REQ_RECV => recv_req(&mut inner, caller, data),
@@ -679,6 +684,9 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
     }
     if let Some(end) = sendfile_end {
         finish_sendfile(sock, end);
+    }
+    if cmd == REQ_CLOSE {
+        send_empty_out_q_msgs(sock);
     }
     if cmd == TCP_REQ_RECV || cmd == REQ_SETOPTS || cmd == REQ_CONNECT {
         try_io(sock, false);
@@ -1587,7 +1595,7 @@ fn getstatus(inner: &Inner) -> Vec<u8> {
     ok_bytes(&flags.to_be_bytes())
 }
 
-fn subscribe(inner: &Inner, data: &[u8]) -> Vec<u8> {
+fn subscribe(inner: &mut Inner, caller: Pid, data: &[u8]) -> Vec<u8> {
     // Port of prim_inet.erl subs_empty_out_q / inet_drv INET_REQ_SUBSCRIBE, OTP-29.1.1.
     let mut out = Vec::new();
     for &code in data {
@@ -1595,9 +1603,37 @@ fn subscribe(inner: &Inner, data: &[u8]) -> Vec<u8> {
             return err_bytes("einval");
         }
         out.push(1);
-        put_u32(&mut out, inner.sendq.size() as u32);
+        let queued = inner.sendq.size();
+        if queued > 0 {
+            save_subscriber(&mut inner.empty_out_q_subs, caller);
+        }
+        put_u32(&mut out, queued as u32);
     }
     ok_bytes(&out)
+}
+
+/// `save_subscriber`: the first subscriber stays at the head, later ones go right behind it.
+fn save_subscriber(subs: &mut Vec<Pid>, pid: Pid) {
+    if subs.is_empty() {
+        subs.push(pid);
+    } else {
+        subs.insert(1, pid);
+    }
+}
+
+/// `send_empty_out_q_msgs`: tell every subscriber that the output queue is empty and forget
+/// them. Call it where the queue has just drained or been discarded.
+fn send_empty_out_q_msgs(sock: &Sock) {
+    let subs = {
+        let mut inner = sock.inner.lock().unwrap();
+        if !inner.sendq.is_empty() {
+            return;
+        }
+        std::mem::take(&mut inner.empty_out_q_subs)
+    };
+    for subscriber in subs {
+        emit(sock, Out::EmptyOutQ { subscriber });
+    }
 }
 
 pub(crate) fn getiflist() -> Vec<u8> {
@@ -2422,8 +2458,8 @@ fn tcp_sendfile_completed(inner: &mut Inner) -> SendfileEnd {
     let bytes_sent = inner.sendfile.take().map_or(0, |sf| sf.bytes_sent);
     // Busy status was deferred until now; more data may have been queued meanwhile.
     release_unbusy(inner);
-    // An empty queue deselects FD_WRITE in `io_loop`. Arinsal sends no empty_out_q
-    // messages and shuts down synchronously, so there is nothing else to do here.
+    // An empty queue deselects FD_WRITE in `io_loop`; `finish_sendfile` sends the
+    // empty_out_q messages before the sendfile result.
     SendfileEnd::Completed { bytes_sent }
 }
 
@@ -2443,6 +2479,7 @@ fn finish_sendfile(sock: &Arc<Sock>, end: SendfileEnd) {
         SendfileEnd::Completed { bytes_sent } => {
             // Port of inet_drv.c:14006-14021, OTP-29.1.1: the busy sender's reply first.
             emit_ready(sock);
+            send_empty_out_q_msgs(sock);
             emit(
                 sock,
                 Out::Sendfile {
@@ -2481,6 +2518,7 @@ fn finish_sendfile(sock: &Arc<Sock>, end: SendfileEnd) {
                     crate::port::abandon_port(&sock.runtime, sock.id);
                 }
             }
+            send_empty_out_q_msgs(sock);
         }
     }
 }
@@ -2644,6 +2682,7 @@ struct Inner {
     op_ref: u16,
     rbuf: Vec<u8>,
     sendq: IoQueue,
+    empty_out_q_subs: Vec<Pid>,
     /// `Some` while TCP_ADDF_SENDFILE is set.
     sendfile: Option<Sendfile>,
     recv: Option<Recv>,
@@ -2720,6 +2759,7 @@ impl Default for Inner {
             op_ref: 0,
             rbuf: Vec::new(),
             sendq: IoQueue::default(),
+            empty_out_q_subs: Vec::new(),
             sendfile: None,
             recv: None,
             accept_q: VecDeque::new(),
@@ -3201,6 +3241,9 @@ enum Out {
         owner: Pid,
         result: Result<u64, &'static str>,
     },
+    EmptyOutQ {
+        subscriber: Pid,
+    },
 }
 
 fn output_list_len(sock: &Sock, out: &Out) -> usize {
@@ -3377,6 +3420,10 @@ fn emit(sock: &Sock, out: Out) {
             })
             .and_then(|data| TermBuilder::new(&mut heap).tuple(&[port, data]).ok())
             .map(|term| (*owner, term)),
+        Out::EmptyOutQ { subscriber } => TermBuilder::new(&mut heap)
+            .tuple(&[atom("empty_out_q"), port])
+            .ok()
+            .map(|term| (*subscriber, term)),
         Out::Sendfile { owner, result } => {
             // Port of inet_drv.c:14032-14043 ({sendfile, S, {ok, SentLow, SentHigh}}) and
             // :14055-14072 ({sendfile, S, {error, Reason}}), OTP-29.1.1.
@@ -3599,6 +3646,9 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     }
     satisfy(sock);
     let eof = pull(sock);
+    if sock.inner.lock().unwrap().sendfile.is_none() {
+        send_empty_out_q_msgs(sock);
+    }
     satisfy(sock);
     if eof {
         on_eof(sock);
@@ -3672,6 +3722,8 @@ fn tcp_inet_output(sock: &Arc<Sock>) {
             return;
         }
         let Some(err) = flush_send(&mut inner) else {
+            drop(inner);
+            send_empty_out_q_msgs(sock);
             return;
         };
         // Port of inet_drv.c:13690-13720 (tcp_send_error) and :13613-13688
@@ -3710,6 +3762,7 @@ fn tcp_inet_output(sock: &Arc<Sock>) {
             crate::port::abandon_port(&sock.runtime, sock.id);
         }
     }
+    send_empty_out_q_msgs(sock);
 }
 
 fn deliver_pending_close(sock: &Arc<Sock>) {
