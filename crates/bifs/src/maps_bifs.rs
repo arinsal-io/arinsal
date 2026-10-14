@@ -348,6 +348,27 @@ pub fn maps_merge_start(
     let result = arinsal_maps::merge_start(args[0], args[1], &mut ctx.heap);
     mapped(ctx, result)
 }
+
+/// Start `maps:merge/2` directly on the process heap; map errors need a BIF context only off the
+/// successful path.
+///
+/// Port of `maps_merge_2` calling `flatmap_merge` directly in
+/// erts/emulator/beam/erl_map.c:1257-1284, OTP-29.1.1.
+#[inline(always)]
+pub fn maps_merge_start_on_process_heap(
+    heap: &mut crate::ProcessHeapHandle<'_>,
+    left: Term,
+    right: Term,
+) -> Result<arinsal_maps::MergeStart, BifError> {
+    match arinsal_maps::merge_start(left, right, heap) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let mut ctx = Ctx::new(heap);
+            Err(map_error(&mut ctx, error))
+        }
+    }
+}
+
 fn put(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let result = arinsal_maps::put(args[2], args[0], args[1], &mut ctx.heap);
     mapped(ctx, result)
