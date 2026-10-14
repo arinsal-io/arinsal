@@ -25,7 +25,7 @@ run(Case) ->
 passive_queued_send() ->
     Chunk = binary:copy(<<"0123456789abcdef">>, 1 bsl 17),
     Chunks = 6,
-    {ok, L} = gen_tcp:listen(0, [{tcp_module, inet_tcp}, binary, {active, false}]),
+    {ok, L} = gen_tcp:listen(0, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}}, binary, {active, false}]),
     {ok, Port} = inet:port(L),
     Self = self(),
     spawn(fun() ->
@@ -45,7 +45,7 @@ passive_queued_send() ->
 %% socket: the blocked send returns an error instead of hanging.
 passive_queued_send_closed() ->
     Chunk = binary:copy(<<"0123456789abcdef">>, 1 bsl 17),
-    {ok, L} = gen_tcp:listen(0, [{tcp_module, inet_tcp}, binary, {active, false}]),
+    {ok, L} = gen_tcp:listen(0, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}}, binary, {active, false}]),
     {ok, Port} = inet:port(L),
     Self = self(),
     spawn(fun() ->

@@ -7,7 +7,7 @@ const SOURCE: &str = r#"
 
 primitive_accept() ->
     catch ets:new(ac_tab, [named_table, public, set]),
-    {ok, Listen} = gen_tcp:listen(0, [{tcp_module, inet_tcp}, binary,
+    {ok, Listen} = gen_tcp:listen(0, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}}, binary,
                                       {active, false}, {reuseaddr, true}]),
     {ok, Port} = inet:port(Listen),
     Parent = self(),
