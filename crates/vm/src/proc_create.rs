@@ -803,6 +803,8 @@ pub(crate) struct ProcessCold {
     /// Storage of a table being released by a trapped `ets:delete/1` or
     /// `ets:internal_delete_all/2`.
     pub(crate) ets_free: Option<EtsFree>,
+    /// Progress of a trapped list `ets:insert/2` or `ets:insert_new/2`.
+    pub(crate) ets_insert: Option<EtsInsert>,
     /// Module and instruction of a `call_ext_last` whose frame was already released when its
     /// BIF yielded, so the re-executed instruction does not release it twice.
     pub(crate) ext_last_released: Option<(usize, usize)>,
@@ -1474,6 +1476,15 @@ pub(crate) struct EtsFree {
     /// Object count `ets:internal_delete_all/2` returns when done.
     pub(crate) nitems: usize,
     pub(crate) garbage: arinsal_ets::Garbage,
+}
+
+/// Port of erts/emulator/beam/erl_db.c:2161-2330 (ets_insert_2_list_info), OTP-29.1.1: the state a
+/// list insert keeps across traps.
+pub(crate) enum EtsInsert {
+    /// Objects copied into table form so far, before the table is locked.
+    Copy(Vec<arinsal_ets::PreparedObject>),
+    /// The remaining objects were handed to the busy table; the result lands in the slot.
+    Global(arinsal_ets::InsertOutcome),
 }
 
 /// Port of erts/emulator/beam/erl_process.c:14160 (erts_continue_exit_process trap state),
