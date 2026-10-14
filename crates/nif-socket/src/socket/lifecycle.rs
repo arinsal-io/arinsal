@@ -50,7 +50,7 @@ fn is_selected(st: &State) -> bool {
 /// `esock_stop_handle_current`: the current requestor never gets a select message, so
 /// it is told that the socket is gone.
 fn stop_handle_current(h: &Handle, requestor: &Requestor) {
-    demonitor_process(requestor.mon);
+    demonitor_process(&requestor.pid, requestor.mon);
     send_abort_msg(h, requestor, &atom("closed"));
 }
 
@@ -58,7 +58,7 @@ fn stop_handle_current(h: &Handle, requestor: &Requestor) {
 fn inform_waiting_procs(h: &Handle, queue: &mut VecDeque<Requestor>, reason: &O) {
     for requestor in queue.drain(..) {
         send_abort_msg(h, &requestor, reason);
-        demonitor_process(requestor.mon);
+        demonitor_process(&requestor.pid, requestor.mon);
     }
 }
 
@@ -153,9 +153,10 @@ pub(super) fn finalize_close(value: &O) -> Result<O, BifError> {
         return Err(raise_invalid("state"));
     }
     st.closer = None;
-    demonitor_process(st.closer_mon.take());
-    *h.owner.lock().unwrap() = None;
-    demonitor_process(st.ctrl_mon.take());
+    demonitor_process(&me, st.closer_mon.take());
+    if let Some(owner) = h.owner.lock().unwrap().take() {
+        demonitor_process(&owner, st.ctrl_mon.take());
+    }
     let socket = guard.take();
     if let Some(socket) = socket.as_ref() {
         let _ = socket.set_nonblocking(false);
@@ -290,8 +291,12 @@ pub(super) fn dtor(h: &Handle) {
     let mut st = h.state.lock().unwrap();
     st.read_state |= state_bits::DTOR | state_bits::CLOSED;
     st.write_state |= state_bits::DTOR | state_bits::CLOSED;
-    demonitor_process(st.ctrl_mon.take());
-    demonitor_process(st.closer_mon.take());
+    if let Some(owner) = h.owner.lock().unwrap().clone() {
+        demonitor_process(&owner, st.ctrl_mon.take());
+    }
+    if let Some(closer) = st.closer.clone() {
+        demonitor_process(&closer, st.closer_mon.take());
+    }
     let current = [
         st.connector.take(),
         st.current_reader.take(),
@@ -299,7 +304,7 @@ pub(super) fn dtor(h: &Handle) {
         st.current_acceptor.take(),
     ];
     for requestor in current.into_iter().flatten() {
-        demonitor_process(requestor.mon);
+        demonitor_process(&requestor.pid, requestor.mon);
     }
     let queued = [
         std::mem::take(&mut st.readers_q),
@@ -307,7 +312,7 @@ pub(super) fn dtor(h: &Handle) {
         std::mem::take(&mut st.acceptors_q),
     ];
     for requestor in queued.into_iter().flatten() {
-        demonitor_process(requestor.mon);
+        demonitor_process(&requestor.pid, requestor.mon);
     }
     h.sendfile_fd.lock().unwrap().take();
     guard.take();
@@ -397,7 +402,7 @@ fn cancel_requestor(h: &Arc<Handle>, kind: Kind, op_ref: &O) -> Result<O, BifErr
     let Some(fd) = guard.as_ref().map(AsRawFd::as_raw_fd) else {
         return Ok(atom("not_found"));
     };
-    demonitor_process(current.mon);
+    demonitor_process(&current.pid, current.mon);
     let result = if kind == Kind::Writer {
         cancel_write_select(fd, &current.reference)
     } else {

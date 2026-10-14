@@ -63,8 +63,8 @@ pub trait Reactor: Send + Sync {
     fn monitor(&self, _pid: &O, _handle: &O) -> Option<u64> {
         None
     }
-    /// `enif_demonitor_process(env, obj, &mon)`.
-    fn demonitor(&self, _monitor: u64) {}
+    /// `enif_demonitor_process(env, obj, &mon)`; `pid` is the process it was taken on.
+    fn demonitor(&self, _pid: &O, _monitor: u64) {}
 }
 
 /// A pending selection of the [`BlockingReactor`].
@@ -242,7 +242,7 @@ impl Reactor for BlockingReactor {
             .push((id, pid.clone(), handle.clone()));
         Some(id)
     }
-    fn demonitor(&self, monitor: u64) {
+    fn demonitor(&self, _pid: &O, monitor: u64) {
         self.monitors
             .lock()
             .unwrap()

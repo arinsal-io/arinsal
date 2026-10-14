@@ -376,7 +376,9 @@ pub(super) fn set_owner(value: &O, pid: O) -> Result<(), BifError> {
     let previous = h.owner.lock().unwrap().replace(pid.clone());
     let mut st = h.state.lock().unwrap();
     if previous.as_ref() != Some(&pid) {
-        demonitor_process(st.ctrl_mon.take());
+        if let Some(previous) = previous.as_ref() {
+            demonitor_process(previous, st.ctrl_mon.take());
+        }
         st.ctrl_mon = monitor_process(&h, &pid);
     }
     Ok(())
@@ -506,9 +508,9 @@ pub(crate) fn monitor_process(h: &Handle, pid: &O) -> Option<u64> {
     active_reactor().and_then(|reactor| reactor.monitor(pid, &h.reference))
 }
 /// `DEMONP`.
-pub(crate) fn demonitor_process(monitor: Option<u64>) {
+pub(crate) fn demonitor_process(pid: &O, monitor: Option<u64>) {
     if let (Some(monitor), Some(reactor)) = (monitor, active_reactor()) {
-        reactor.demonitor(monitor);
+        reactor.demonitor(pid, monitor);
     }
 }
 impl State {
@@ -557,14 +559,16 @@ impl State {
             return false;
         }
         let removed = queue.remove(index);
-        demonitor_process(removed.and_then(|req| req.mon));
+        if let Some(req) = removed {
+            demonitor_process(&req.pid, req.mon);
+        }
         true
     }
 }
 /// `esock_requestor_release`.
 pub(crate) fn requestor_release(requestor: &mut Option<Requestor>) {
     if let Some(req) = requestor.take() {
-        demonitor_process(req.mon);
+        demonitor_process(&req.pid, req.mon);
     }
 }
 /// `esock_activate_next_{acceptor,writer,reader}`: pop the queue and select for the
@@ -585,7 +589,7 @@ pub(crate) fn activate_next(h: &Handle, st: &mut State, fd: i32, kind: Kind) -> 
         if sres < 0 {
             let reason = pair(atom("select_failed"), O::Int(sres.into()));
             send_abort_msg(h, &req, &reason);
-            demonitor_process(req.mon);
+            demonitor_process(&req.pid, req.mon);
             *st.current(kind) = None;
         } else {
             match kind {
@@ -861,16 +865,21 @@ fn bind(args: &[O]) -> Result<O, BifError> {
     };
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
-    Ok(match guard.as_ref() {
-        Some(s) => {
-            let result = io_result(s.bind(&addr));
-            if result == atom("ok") {
-                st.read_state |= state_bits::BOUND;
+    Ok(
+        match guard
+            .as_ref()
+            .filter(|_| state_bits::is_open(st.read_state))
+        {
+            Some(s) => {
+                let result = io_result(s.bind(&addr));
+                if result == atom("ok") {
+                    st.read_state |= state_bits::BOUND;
+                }
+                result
             }
-            result
-        }
-        None => error("closed"),
-    })
+            None => error("closed"),
+        },
+    )
 }
 fn connect(args: &[O]) -> Result<O, BifError> {
     let h = handle(&args[0])?;
@@ -975,7 +984,10 @@ fn listen(args: &[O]) -> Result<O, BifError> {
     };
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
+    let Some(s) = guard
+        .as_ref()
+        .filter(|_| state_bits::is_open(st.read_state))
+    else {
         return Ok(error("closed"));
     };
     Ok(match s.listen(backlog) {
@@ -1056,7 +1068,7 @@ fn accept_busy_retry(
     let sres = select_read(h, fd, pid, reference);
     if sres < 0 {
         if let Some(current) = st.current_acceptor.as_ref() {
-            demonitor_process(current.mon);
+            demonitor_process(&current.pid, current.mon);
         }
         if !activate_next(h, st, fd, Kind::Acceptor) {
             st.read_state &= !state_bits::ACCEPTING;
@@ -1081,7 +1093,7 @@ fn accept_accepting_current(
                 return Err(BifError::BADARG);
             };
             let result = accepted(h, socket, &current.pid);
-            demonitor_process(current.mon);
+            demonitor_process(&current.pid, current.mon);
             if !activate_next(h, st, fd, Kind::Acceptor) {
                 st.read_state &= !state_bits::ACCEPTING;
                 st.current_acceptor = None;
@@ -1111,7 +1123,7 @@ fn accept_accepting_current(
             while st.pop(Kind::Acceptor) {
                 if let Some(request) = st.current_acceptor.take() {
                     send_abort_msg(h, &request, &reason);
-                    demonitor_process(request.mon);
+                    demonitor_process(&request.pid, request.mon);
                 }
             }
             st.current_acceptor = None;
@@ -1506,7 +1518,7 @@ fn send_check_ok(h: &Handle, st: &mut State, fd: i32, written: usize) -> O {
         counters.write_pkg_max_cnt = 0;
     }
     if let Some(current) = st.current_writer.as_ref() {
-        demonitor_process(current.mon);
+        demonitor_process(&current.pid, current.mon);
     }
     if !activate_next(h, st, fd, Kind::Writer) {
         st.current_writer = None;
@@ -1529,7 +1541,7 @@ fn send_error_waiting_writers(h: &Handle, st: &mut State, reason: &O) {
     while st.pop(Kind::Writer) {
         if let Some(request) = st.current_writer.take() {
             send_abort_msg(h, &request, reason);
-            demonitor_process(request.mon);
+            demonitor_process(&request.pid, request.mon);
         }
     }
 }
@@ -1554,7 +1566,7 @@ fn send_check_retry(
                 counters.write_byte += written as u64;
             }
             if let Some(current) = st.current_writer.as_ref() {
-                demonitor_process(current.mon);
+                demonitor_process(&current.pid, current.mon);
             }
             if !activate_next(h, st, fd, Kind::Writer) {
                 st.current_writer = None;
@@ -1585,7 +1597,7 @@ fn send_check_retry(
     let sres = select_write(h, fd, None, send_ref);
     if sres < 0 {
         if let Some(current) = st.current_writer.as_ref() {
-            demonitor_process(current.mon);
+            demonitor_process(&current.pid, current.mon);
         }
         let reason = pair(atom("select_write"), O::Int(sres.into()));
         requestor_release(&mut st.current_writer);
@@ -2097,7 +2109,7 @@ impl Receiver<'_> {
     /// `recv_update_current_reader`: demonitor the current reader and activate the next one.
     fn update_current_reader(&self, st: &mut State) {
         if let Some(current) = st.current_reader.as_ref() {
-            demonitor_process(current.mon);
+            demonitor_process(&current.pid, current.mon);
             if !activate_next(self.h, st, self.fd, Kind::Reader) {
                 st.current_reader = None;
             }
@@ -2111,7 +2123,7 @@ impl Receiver<'_> {
             while st.pop(Kind::Reader) {
                 if let Some(request) = st.current_reader.take() {
                     send_abort_msg(self.h, &request, reason);
-                    demonitor_process(request.mon);
+                    demonitor_process(&request.pid, request.mon);
                 }
             }
             st.current_reader = None;
@@ -2184,7 +2196,11 @@ fn ioctl(args: &[O]) -> Result<O, BifError> {
         .and_then(|n| u64::try_from(n).ok())
         .ok_or(BifError::BADARG)?;
     let guard = h.socket.lock().unwrap();
-    let Some(socket) = guard.as_ref() else {
+    let st = h.state.lock().unwrap();
+    let Some(socket) = guard
+        .as_ref()
+        .filter(|_| state_bits::is_open(st.read_state))
+    else {
         return Ok(error("closed"));
     };
     if args.len() == 2 && (request == libc::FIONREAD || request == ATMARK_REQUEST) {
@@ -2361,22 +2377,28 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
         ("nif_sockname" | "nif_peername", 1) => {
             let h = handle(&args[0])?;
             let guard = h.socket.lock().unwrap();
-            Ok(match guard.as_ref() {
-                Some(s) => {
-                    let result = if name == "nif_sockname" {
-                        s.local_addr()
-                    } else {
-                        s.peer_addr()
-                    };
-                    match result {
-                        Ok(a) => from_sock_addr(&a)
-                            .map(ok)
-                            .unwrap_or_else(|| error("eafnosupport")),
-                        Err(e) => fail(&e),
+            let st = h.state.lock().unwrap();
+            Ok(
+                match guard
+                    .as_ref()
+                    .filter(|_| state_bits::is_open(st.read_state))
+                {
+                    Some(s) => {
+                        let result = if name == "nif_sockname" {
+                            s.local_addr()
+                        } else {
+                            s.peer_addr()
+                        };
+                        match result {
+                            Ok(a) => from_sock_addr(&a)
+                                .map(ok)
+                                .unwrap_or_else(|| error("eafnosupport")),
+                            Err(e) => fail(&e),
+                        }
                     }
-                }
-                None => error("closed"),
-            })
+                    None => error("closed"),
+                },
+            )
         }
         ("nif_info", 1) => options::info(&args[0]),
         ("nif_cancel", 3) => lifecycle::cancel(args),
@@ -3141,6 +3163,21 @@ mod tests {
                 error("closed")
             );
         }
+    }
+    #[test]
+    fn bind_listen_names_and_ioctl_report_closed_once_closing() {
+        let (_lock, _reactor) = caller_reactor();
+        let sock = open_socket("inet", "stream", 6);
+        assert_eq!(invoke("nif_close", std::slice::from_ref(&sock)), atom("ok"));
+        let closed = error("closed");
+        assert_eq!(invoke("nif_bind", &[sock.clone(), addr("inet", 0)]), closed);
+        assert_eq!(invoke("nif_listen", &[sock.clone(), O::Int(4)]), closed);
+        assert_eq!(invoke("nif_sockname", std::slice::from_ref(&sock)), closed);
+        assert_eq!(invoke("nif_peername", std::slice::from_ref(&sock)), closed);
+        assert_eq!(
+            invoke("nif_ioctl", &[sock.clone(), O::Int(libc::FIONREAD as i64)]),
+            closed
+        );
     }
     #[test]
     fn tcp_ipv4_ipv6_and_options() {

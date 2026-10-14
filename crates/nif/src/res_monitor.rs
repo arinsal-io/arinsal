@@ -17,9 +17,21 @@ use std::sync::{Arc, Weak};
 /// Target half of a resource monitor (the `ERTS_MON_TYPE_RESOURCE` entry in the monitored
 /// process's monitor tree).
 pub struct ResourceMonitor {
-    resource: Weak<Resource>,
+    target: Target,
     id: u64,
 }
+
+/// What the exit of the monitored process notifies.
+enum Target {
+    /// A resource of a dynamically loaded NIF library.
+    Resource(Weak<Resource>),
+    /// The `down` callback of a resource of a built-in NIF, called with the exiting pid and
+    /// the monitor.
+    Native(NativeDown),
+}
+
+/// The `down` callback of a built-in NIF resource.
+pub type NativeDown = Arc<dyn Fn(Term, u64) + Send + Sync>;
 
 fn handle(id: u64) -> [u8; 32] {
     let mut bytes = [0u8; 32];
@@ -28,6 +40,14 @@ fn handle(id: u64) -> [u8; 32] {
 }
 
 impl ResourceMonitor {
+    /// The target half of a monitor held by a built-in NIF resource.
+    pub fn native(id: u64, down: NativeDown) -> Self {
+        Self {
+            target: Target::Native(down),
+            id,
+        }
+    }
+
     /// The monitor reference.
     pub fn id(&self) -> u64 {
         self.id
@@ -35,14 +55,24 @@ impl ResourceMonitor {
 
     /// The monitoring resource as a magic reference, for `process_info(_, monitored_by)`.
     pub fn resource_ref(&self) -> Option<Arc<arinsal_term::MagicRef>> {
-        Some(self.resource.upgrade()?.magic_ref())
+        match &self.target {
+            Target::Resource(resource) => Some(resource.upgrade()?.magic_ref()),
+            Target::Native(_) => None,
+        }
     }
 
     /// The monitored process `pid` exits: run the `down` callback of a live resource.
     // Port of erts/emulator/beam/erl_nif.c:3086-3110 (erts_fire_nif_monitor), OTP-29.1.1.
     pub fn fire(&self, pid: Term) {
         // A resource that is being destroyed has no strong reference left: no `down`.
-        let Some(resource) = self.resource.upgrade() else {
+        let resource = match &self.target {
+            Target::Resource(resource) => resource,
+            Target::Native(down) => {
+                down(pid, self.id);
+                return;
+            }
+        };
+        let Some(resource) = resource.upgrade() else {
             return;
         };
         {
@@ -88,7 +118,7 @@ pub extern "C" fn enif_monitor_process(
     resource.monitors.lock().unwrap().push((target, id));
     let send = hooks().lock().unwrap().resource_monitor;
     let monitor = Arc::new(ResourceMonitor {
-        resource: Arc::downgrade(&resource),
+        target: Target::Resource(Arc::downgrade(&resource)),
         id,
     });
     // erts_proc_sig_send_monitor: a process that cannot receive the signal is not alive.

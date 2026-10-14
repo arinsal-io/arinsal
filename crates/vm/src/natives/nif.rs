@@ -492,6 +492,16 @@ fn hub_for_pid(pid: Pid) -> Option<Hub> {
     })
 }
 
+fn owned_local_pid(term: &arinsal_etf::OwnedTerm) -> Option<Pid> {
+    let arinsal_etf::OwnedTerm::Pid {
+        node, id, serial, ..
+    } = term
+    else {
+        return None;
+    };
+    (node == "nonode@nohost").then(|| Pid::new(*id, *serial))
+}
+
 struct SelectRegistration {
     id: u64,
     fd: i32,
@@ -519,8 +529,6 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
         arinsal_term::to_owned(pid.to_term()?).ok()
     }
 
-    // Port of enif_select in erl_check_io.c:1228, OTP-29.1.1.
-    // Port of enif_select in erl_check_io.c:1228, OTP-29.1.1.
     fn register_read(
         &self,
         fd: i32,
@@ -569,11 +577,44 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
         pid: &arinsal_etf::OwnedTerm,
         handle: &arinsal_etf::OwnedTerm,
     ) -> Option<u64> {
-        resource_monitor(pid, handle)
+        let target = owned_local_pid(pid)?;
+        let hub = hub_for_pid(target)?;
+        let scheduler = hub.scheduler.upgrade()?;
+        let id = arinsal_bifs::next_ref_id();
+        let handle = handle.clone();
+        let monitor = Arc::new(arinsal_nif::ResourceMonitor::native(
+            id,
+            Arc::new(move |exiting, id| {
+                if let Ok(exiting) = arinsal_term::to_owned(exiting) {
+                    arinsal_nif_socket::down(&handle, &exiting, id);
+                }
+            }),
+        ));
+        let sender = current_hub().map_or(hub.pid, |current| current.current_pid());
+        scheduler
+            .signal(
+                sender,
+                target,
+                arinsal_sched::Signal::Monitor {
+                    reference: id,
+                    shared: arinsal_sched::SharedPayload(monitor),
+                },
+            )
+            .is_ok()
+            .then_some(id)
     }
 
-    fn demonitor(&self, monitor: u64) {
-        resource_demonitor(monitor);
+    fn demonitor(&self, pid: &arinsal_etf::OwnedTerm, monitor: u64) {
+        let Some(target) = owned_local_pid(pid) else {
+            return;
+        };
+        let Some(hub) = hub_for_pid(target) else {
+            return;
+        };
+        if let Some(scheduler) = hub.scheduler.upgrade() {
+            let sender = current_hub().map_or(hub.pid, |current| current.current_pid());
+            let _ = scheduler.signal(sender, target, arinsal_sched::Signal::Demonitor(monitor));
+        }
     }
 
     fn send(&self, pid: &arinsal_etf::OwnedTerm, message: &arinsal_etf::OwnedTerm) -> bool {
@@ -701,110 +742,6 @@ impl NifSelectReactor {
             self.pending.lock().unwrap().retain(|entry| entry.id != id);
             failed
         }
-    }
-}
-
-/// The process monitors of NIF resources (`ERTS_MON_TYPE_RESOURCE`): a monitored process
-/// that exits fires the down callback of the resource with the monitor it was given.
-#[derive(Default)]
-struct ResourceMonitors {
-    next: u64,
-    by_id: HashMap<u64, ResourceMonitor>,
-    by_process: HashMap<(usize, u64), Vec<u64>>,
-}
-
-struct ResourceMonitor {
-    process: (usize, u64),
-    resource: arinsal_etf::OwnedTerm,
-}
-
-fn resource_monitors() -> &'static Mutex<ResourceMonitors> {
-    static MONITORS: OnceLock<Mutex<ResourceMonitors>> = OnceLock::new();
-    MONITORS.get_or_init(|| Mutex::new(ResourceMonitors::default()))
-}
-
-/// `enif_monitor_process`: `None` when the process is not alive. The registration is
-/// published to the process before it returns, so an exit that has already finished the
-/// resource monitors is seen as a dead process.
-fn resource_monitor(
-    pid_term: &arinsal_etf::OwnedTerm,
-    resource: &arinsal_etf::OwnedTerm,
-) -> Option<u64> {
-    let arinsal_etf::OwnedTerm::Pid {
-        node, id, serial, ..
-    } = pid_term
-    else {
-        return None;
-    };
-    if node != "nonode@nohost" {
-        return None;
-    }
-    let pid = Pid::new(*id, *serial);
-    let runtime = hub_for_pid(pid)?.runtime.upgrade()?;
-    let process = (Arc::as_ptr(&runtime) as usize, pid.data());
-    let monitor = {
-        let mut monitors = resource_monitors().lock().unwrap();
-        monitors.next += 1;
-        let monitor = monitors.next;
-        monitors.by_id.insert(
-            monitor,
-            ResourceMonitor {
-                process,
-                resource: resource.clone(),
-            },
-        );
-        monitors
-            .by_process
-            .entry(process)
-            .or_default()
-            .push(monitor);
-        monitor
-    };
-    if runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::RESOURCE_MON) {
-        Some(monitor)
-    } else {
-        resource_demonitor(monitor);
-        None
-    }
-}
-
-/// `enif_demonitor_process`.
-fn resource_demonitor(monitor: u64) {
-    let mut monitors = resource_monitors().lock().unwrap();
-    let Some(removed) = monitors.by_id.remove(&monitor) else {
-        return;
-    };
-    if let Some(ids) = monitors.by_process.get_mut(&removed.process) {
-        ids.retain(|id| *id != monitor);
-        if ids.is_empty() {
-            monitors.by_process.remove(&removed.process);
-        }
-    }
-}
-
-/// `erts_fire_nif_monitor` for every resource monitor of the exiting process `pid`.
-pub(crate) fn fire_resource_monitors(runtime: &Arc<crate::process::Runtime>, pid: Pid) {
-    let process = (Arc::as_ptr(runtime) as usize, pid.data());
-    let fired: Vec<(u64, arinsal_etf::OwnedTerm)> = {
-        let mut monitors = resource_monitors().lock().unwrap();
-        let ids = monitors.by_process.remove(&process).unwrap_or_default();
-        ids.into_iter()
-            .filter_map(|id| {
-                monitors
-                    .by_id
-                    .remove(&id)
-                    .map(|monitor| (id, monitor.resource))
-            })
-            .collect()
-    };
-    let Some(owned) = pid
-        .to_term()
-        .and_then(|term| arinsal_term::to_owned(term).ok())
-    else {
-        return;
-    };
-    for (monitor, resource) in fired {
-        arinsal_nif_socket::down(&resource, &owned, monitor);
     }
 }
 
