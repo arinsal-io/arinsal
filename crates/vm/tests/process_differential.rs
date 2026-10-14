@@ -506,7 +506,9 @@ eof() ->
     P = open_port({spawn_executable, "/usr/bin/true"}, [eof]),
     receive {P, eof} -> port_close(P), ok after 5000 -> timeout end.
 bang_close() ->
-    P = open_port({spawn_executable, "/usr/bin/true"}, []),
+    %% A command that exits races the close message: the port is gone after
+    %% end of input, as in erts. cat stays up until the close.
+    P = open_port({spawn_executable, "/bin/cat"}, []),
     P ! {self(), close},
     receive {P, closed} -> ok after 5000 -> timeout end.
 linked_exit() ->
@@ -535,7 +537,9 @@ invalid_args() ->
     ok.
 nouse_stdio() ->
     P = open_port({spawn, "printf hello >&4"}, [in, binary, nouse_stdio]),
-    receive {P, {data, <<"hello">>}} -> port_close(P), ok after 5000 -> timeout end.
+    receive {P, {data, <<"hello">>}} ->
+        try port_close(P) catch error:badarg -> true end, ok
+    after 5000 -> timeout end.
 line_chunks() ->
     P = open_port({spawn_executable, "/usr/bin/printf"},
                   [binary, {line, 5}, eof,
@@ -648,7 +652,8 @@ count() ->
     Count = receive
         {{Probe, {{data, Data}}}} -> list_to_integer(binary_to_list(Data))
     after 5000 -> timeout end,
-    port_close(Probe), port_close(Port1), port_close(Port2),
+    try port_close(Probe) catch error:badarg -> true end,
+    port_close(Port1), port_close(Port2),
     prim_file:close(File), Count.
 "#,
         helper_path.display()
