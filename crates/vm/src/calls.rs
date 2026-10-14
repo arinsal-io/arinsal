@@ -798,6 +798,19 @@ impl Vm {
             );
         }
         let meter = crate::bif_traps::TrapMeter::start(p, ctx.as_deref());
+        let trapping = self
+            .code
+            .modules
+            .get(p.module)
+            .and_then(|module| module.imports.get(index))
+            .is_some_and(|import| import.fast_op == ImportFastOp::Trapping);
+        let traced = match ctx.as_deref_mut() {
+            Some(run) if trapping => {
+                let (caller, site) = (p.module, p.ip);
+                self.trace_native_call(p, run, caller, site, index, arity)
+            }
+            _ => None,
+        };
         if let Some(result) = crate::bif_traps::execute(
             self,
             p,
@@ -811,15 +824,26 @@ impl Vm {
             ],
             ctx.as_deref_mut(),
         ) {
-            let result = result?;
-            meter.finish(
-                p,
-                ctx.as_deref_mut(),
-                result.reductions(),
-                result.is_virtual_yield(),
-            );
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    let failed: Result<Term, VmError> = Err(error);
+                    if let (Some((module, function, args)), Some(run)) =
+                        (traced, ctx.as_deref_mut())
+                    {
+                        self.trace_native_return(p, run, &module, &function, &args, &failed);
+                    }
+                    return failed.map(|_| ImportOutcome::Advanced);
+                }
+            };
+            meter.finish(p, ctx.as_deref_mut(), result.reductions());
             return match result {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
+                    if let (Some((module, function, args)), Some(run)) =
+                        (traced, ctx.as_deref_mut())
+                    {
+                        self.trace_native_return(p, run, &module, &function, &args, &Ok(value));
+                    }
                     self.finish_native_value(p, tail, value)
                 }
                 crate::bif_traps::HandlerResult::Failed { .. } => {
