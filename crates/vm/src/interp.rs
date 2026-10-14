@@ -2353,6 +2353,16 @@ impl Vm {
                     } else {
                         None
                     };
+                    // Port of erts/emulator/beam/erl_nif.c (enif_consume_timeslice), OTP-29.1.1:
+                    // a NIF's charge counts toward the calling process and is a no-op on a dirty
+                    // scheduler. The body charges the process counter, so it starts from the
+                    // interpreter's cached value.
+                    let charges =
+                        to_dirty.is_none() && !arinsal_sched::current_scheduler_type().is_dirty();
+                    if charges {
+                        p.reductions = reds;
+                    }
+                    let reds_before_nif = p.reductions;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match pending {
                             Some(pending) => natives::nif::resume_pending(
@@ -2371,6 +2381,12 @@ impl Vm {
                             },
                         }
                     }));
+                    if charges {
+                        charge_bif_work!(
+                            u32::try_from(reds_before_nif.saturating_sub(p.reductions).max(0))
+                                .unwrap_or(0)
+                        );
+                    }
                     let result = match result {
                         Ok(result) => result,
                         Err(_) => Err(arinsal_bifs::BifError::Error(Term::atom(
