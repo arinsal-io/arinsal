@@ -11,7 +11,7 @@ const MODULE: &str = "zstd_compat_probe";
 
 const SOURCE: &str = r#"
 -module(zstd_compat_probe).
--export([oneshot/0, lifecycle/0]).
+-export([oneshot/0, lifecycle/0, streams/0, corrupt/0, raw/0, reductions/0]).
 
 inputs() ->
     Text = iolist_to_binary(lists:duplicate(2000, <<"the quick brown fox jumps over the lazy dog ">>)),
@@ -113,6 +113,222 @@ closed() ->
         attempt(fun() -> zstd:decompress(<<"a">>, D) end)
     ].
 
+data(N) ->
+    _ = rand:seed(exsss, {1, 2, 3}),
+    Half = N div 2,
+    Text = binary:part(iolist_to_binary(lists:duplicate(N div 40 + 1, <<"the quick brown fox jumps over the lazy dog ">>)), 0, Half),
+    iolist_to_binary([Text, rand:bytes(N - Half)]).
+
+random(N) ->
+    _ = rand:seed(exsss, {4, 5, 6}),
+    rand:bytes(N).
+
+sum(Bin) when is_binary(Bin) -> {byte_size(Bin), erlang:md5(Bin)}.
+
+shape({continue, Out}) -> {continue, sum(Out)};
+shape({continue, Rem, Out}) -> {continue, byte_size(Rem), binary:referenced_byte_size(Rem), sum(Rem), sum(Out)};
+shape({done, Out}) -> {done, sum(Out)};
+shape({flush, Out}) -> {flush, sum(Out)};
+shape(Other) -> Other.
+
+att(Fun) ->
+    try shape(Fun()) catch Class:Reason -> {Class, Reason} end.
+
+pieces(Data, Size) when byte_size(Data) =< Size -> [Data];
+pieces(Data, Size) ->
+    <<Head:Size/binary, Tail/binary>> = Data,
+    [Head | pieces(Tail, Size)].
+
+with_empty(Pieces) -> [<<>>] ++ lists:flatmap(fun(P) -> [P, <<>>] end, Pieces).
+
+stream_all(Ctx, Data) ->
+    case zstd:stream(Ctx, Data) of
+        {continue, Rem, Out} = R ->
+            {Shapes, Outs} = stream_all(Ctx, Rem),
+            {[shape(R) | Shapes], [Out | Outs]};
+        {continue, Out} = R ->
+            {[shape(R)], [Out]}
+    end.
+
+feed(Ctx, Chunks) ->
+    {Shapes, Outs} = lists:foldl(
+        fun(Chunk, {ShapesAcc, OutsAcc}) ->
+            {S, O} = stream_all(Ctx, Chunk),
+            {lists:reverse(S, ShapesAcc), lists:reverse(O, OutsAcc)}
+        end, {[], []}, Chunks),
+    {lists:reverse(Shapes), lists:reverse(Outs)}.
+
+compress_run(Data, Chunks) ->
+    {ok, Ctx} = zstd:context(compress),
+    {Shapes, Outs} = feed(Ctx, Chunks),
+    Flushed = zstd:flush(Ctx),
+    {done, Tail} = zstd:finish(Ctx, <<>>),
+    TailBins = lists:flatten([Tail]),
+    Compressed = iolist_to_binary(Outs ++ [element(2, Flushed)] ++ TailBins),
+    ok = zstd:close(Ctx),
+    Back = iolist_to_binary(zstd:decompress(Compressed)),
+    {Shapes, shape(Flushed), [byte_size(B) || B <- TailBins], sum(Compressed), Back =:= Data}.
+
+decompress_run(_Compressed, Chunks) ->
+    {ok, Ctx} = zstd:context(decompress),
+    {Shapes, Outs} = feed(Ctx, Chunks),
+    {done, Tail} = zstd:finish(Ctx, <<>>),
+    TailBins = lists:flatten([Tail]),
+    ok = zstd:close(Ctx),
+    {Shapes, [byte_size(B) || B <- TailBins], sum(iolist_to_binary(Outs ++ TailBins))}.
+
+digest(Term) -> erlang:md5(term_to_binary(Term)).
+
+streams() ->
+    Sizes = [0, 1, 100, 1000, 70000, 300000],
+    lists:foreach(
+        fun(Size) ->
+            Data = data(Size),
+            Rand = random(Size),
+            lists:foreach(
+                fun(D) ->
+                    Full = [compress_run(D, P) || P <- [[D], with_empty([D]), pieces(D, 65536)]],
+                    Hashed = [digest(compress_run(D, P)) || P <- [pieces(D, 1000), with_empty(pieces(D, 1000))]],
+                    io:format("c ~w ~w ~w~n", [Size, Full, Hashed])
+                end, [Data, Rand]),
+            Compressed = iolist_to_binary(zstd:compress(Data, #{compressionLevel => 3})),
+            DFull = [decompress_run(Compressed, pieces(Compressed, N)) || N <- [1000, 131072, 1 bsl 30]],
+            DHashed = [digest(decompress_run(Compressed, pieces(Compressed, N))) || N <- [1, 7, 997], Size =< 1000 orelse N >= 997],
+            DEmpties = [decompress_run(Compressed, with_empty(pieces(Compressed, N))) || N <- [1 bsl 30]],
+            io:format("d ~w ~w ~w ~w~n", [Size, DFull, DHashed, DEmpties])
+        end, Sizes).
+
+corrupt() ->
+    Good = iolist_to_binary(zstd:compress(data(1000))),
+    Flip = fun(Pos) ->
+        <<Head:Pos/binary, B, Tail/binary>> = Good,
+        <<Head/binary, (B bxor 255), Tail/binary>>
+    end,
+    Last = byte_size(Good) - 1,
+    Flipped = [{Pos, att(fun() -> sum(iolist_to_binary(zstd:decompress(Flip(Pos)))) end)}
+               || Pos <- [0, 3, 4, 5, 6, 8, 10, 100, 500, Last]],
+    Truncated = [{N, att(fun() -> sum(iolist_to_binary(zstd:decompress(binary:part(Good, 0, N)))) end)}
+                 || N <- [0, 1, 4, 5, 6, 20, Last]],
+    Garbage = [att(fun() -> zstd:decompress(G) end) || G <- [<<1, 2, 3, 4, 5, 6, 7, 8>>, <<"not zstd at all">>]],
+    StreamFlipped = [begin
+        {ok, Ctx} = zstd:context(decompress),
+        R = att(fun() -> {done, Out} = zstd:finish(Ctx, Flip(Pos)), sum(iolist_to_binary(Out)) end),
+        Again = att(fun() -> sum(iolist_to_binary(zstd:decompress(Good, Ctx))) end),
+        {Pos, R, Again}
+    end || Pos <- [0, 5, 6, 100, 500, Last]],
+    Reuse = begin
+        {ok, DCtx} = zstd:context(decompress),
+        First = att(fun() -> zstd:decompress(Flip(100), DCtx) end),
+        Second = att(fun() -> sum(iolist_to_binary(zstd:decompress(Good, DCtx))) end),
+        {First, Second}
+    end,
+    io:format("~w~n~w~n~w~n~w~n~w~n", [Flipped, Truncated, Garbage, StreamFlipped, Reuse]).
+
+raw() ->
+    Data = data(300000),
+    Rand = random(300000),
+    Small = data(100),
+    Compress = fun(Fun) -> R = zstd:nif_init_compress(), X = att(fun() -> Fun(R) end), ok = zstd:nif_compress_close(R), X end,
+    Decompress = fun(Fun) -> R = zstd:nif_init_decompress(), X = att(fun() -> Fun(R) end), ok = zstd:nif_decompress_close(R), X end,
+    EndOps = [0, 1, 2, 3, 5, -1, 16#7fffffff, 1 bsl 31, 1 bsl 40, true, false, ok, 1.5, <<2>>, "2", {2}],
+    CompressOps = [{Op, [Compress(fun(R) -> zstd:nif_compress_stream(R, D, Op) end) || D <- [<<>>, Small, Data, Rand]]} || Op <- EndOps],
+    BadData = [Compress(fun(R) -> zstd:nif_compress_stream(R, D, 0) end) || D <- ["abc", abc, <<1:3>>, <<1, 2, 3, 4:4>>, {1}, [<<1>>], 7]],
+    Mid = binary:part(Data, 5, 200000),
+    Offsets = [{aligned_sub, Mid}, {unaligned, unaligned(Mid)}, {unaligned_rand, unaligned(Rand)}],
+    Unaligned = [{Name, Compress(fun(R) -> loop_compress(R, B, 2) end)} || {Name, B} <- Offsets]
+        ++ [{Name, Compress(fun(R) -> loop_compress(R, B, 0) end)} || {Name, B} <- Offsets],
+    Frame = iolist_to_binary(zstd:compress(Data)),
+    SmallFrame = iolist_to_binary(zstd:compress(Small)),
+    EmptyFrame = iolist_to_binary(zstd:compress(<<>>)),
+    Unknown = begin
+        {ok, C} = zstd:context(compress),
+        {continue, A} = zstd:stream(C, Data),
+        {done, B} = zstd:finish(C, <<>>),
+        iolist_to_binary([A, B])
+    end,
+    DecompressOps = [{Op, [Decompress(fun(R) -> zstd:nif_decompress_stream(R, F, Op) end) || F <- [<<>>, Frame, SmallFrame, EmptyFrame, Unknown, binary:part(Frame, 0, 30)]]}
+                     || Op <- [0, 1, 2, 5, true, false, ok, 1.5]],
+    DecompressBad = [Decompress(fun(R) -> zstd:nif_decompress_stream(R, D, 0) end) || D <- ["abc", abc, <<1:3>>, {1}, [<<1>>]]],
+    DecompressLoop = [{Name, Decompress(fun(R) -> loop_decompress(R, F, 2) end)}
+                      || {Name, F} <- [{frame, Frame}, {small, SmallFrame}, {unknown, Unknown}, {unaligned, unaligned(Frame)}, {sub, binary:part(Frame, 0, byte_size(Frame))}]],
+    Special = begin
+        D1 = zstd:nif_init_decompress(),
+        S1 = [att(fun() -> zstd:nif_decompress_stream(D1, <<>>, true) end) || _ <- [1, 2]],
+        S2 = att(fun() -> zstd:nif_decompress_stream(D1, <<>>, false) end),
+        S3 = att(fun() -> zstd:nif_decompress_stream(D1, <<>>, true) end),
+        S4 = att(fun() -> zstd:nif_decompress_stream(D1, binary:part(Frame, 0, 30), 0) end),
+        S5 = att(fun() -> zstd:nif_decompress_stream(D1, <<>>, true) end),
+        S6 = att(fun() -> zstd:nif_decompress_stream(D1, <<>>, foo) end),
+        S7 = att(fun() -> zstd:nif_decompress_stream(D1, <<>>, true) end),
+        S8 = att(fun() -> zstd:nif_decompress_stream(D1, Frame, 2) end),
+        {S1, S2, S3, S4, S5, S6, S7, S8}
+    end,
+    PledgeReset = begin
+        C1 = zstd:nif_init_compress(),
+        ok = zstd:nif_set_pledged(C1, 5),
+        P1 = att(fun() -> zstd:nif_compress_stream(C1, <<"abcdefghij">>, foo) end),
+        P2 = att(fun() -> zstd:nif_compress_stream(C1, <<"abcdefghij">>, 2) end),
+        ok = zstd:nif_set_pledged(C1, 5),
+        P3 = att(fun() -> zstd:nif_compress_stream(C1, <<"abcdefghij">>, 0) end),
+        P4 = att(fun() -> zstd:nif_compress_stream(C1, <<>>, 2) end),
+        P5 = att(fun() -> zstd:nif_compress_stream(C1, <<"abcdefghij">>, 2) end),
+        {P1, P2, P3, P4, P5}
+    end,
+    io:format("~w~n~w~n~w~n~w~n~w~n~w~n~w~n~w~n", [CompressOps, BadData, Unaligned, DecompressOps, DecompressBad, DecompressLoop, Special, PledgeReset]).
+
+unaligned(Bin) ->
+    Size = byte_size(Bin),
+    <<_:3, B:Size/binary, _:5>> = <<7:3, Bin/binary, 0:5>>,
+    B.
+
+loop_compress(R, Data, Op) ->
+    loop_compress(R, Data, Op, [], []).
+
+loop_compress(R, Data, Op, Shapes, Outs) ->
+    case zstd:nif_compress_stream(R, Data, Op) of
+        {continue, Rem, Out} = Res ->
+            loop_compress(R, Rem, Op, [shape(Res) | Shapes], [Out | Outs]);
+        {continue, Out} = Res when Op =:= 0 ->
+            {done, Tail} = zstd:finish({compress, R}, <<>>),
+            TailBins = lists:flatten([Tail]),
+            finished([shape(Res) | Shapes], lists:reverse(TailBins) ++ [Out | Outs]);
+        {flush, Out} = Res ->
+            loop_compress(R, <<>>, Op, [shape(Res) | Shapes], [Out | Outs]);
+        {_, Out} = Res ->
+            finished([shape(Res) | Shapes], [Out | Outs])
+    end.
+
+finished(Shapes, Outs) ->
+    {lists:reverse(Shapes), sum(iolist_to_binary(lists:reverse(Outs)))}.
+
+loop_decompress(R, Data, Op) ->
+    loop_decompress(R, Data, Op, [], []).
+
+loop_decompress(R, Data, Op, Shapes, Outs) ->
+    case zstd:nif_decompress_stream(R, Data, Op) of
+        {continue, Rem, Out} = Res ->
+            loop_decompress(R, Rem, Op, [shape(Res) | Shapes], [Out | Outs]);
+        {flush, Out} = Res ->
+            loop_decompress(R, <<>>, Op, [shape(Res) | Shapes], [Out | Outs]);
+        {_, Out} = Res ->
+            finished([shape(Res) | Shapes], [Out | Outs])
+    end.
+
+reductions() ->
+    Data = random(1 bsl 20),
+    Sizes = [0, 1000, 5000, 20000, 50000, 120000, 200000, 1 bsl 20],
+    Deltas = [begin
+        {ok, {compress, Ref}} = zstd:context(compress),
+        Chunk = binary:part(Data, 0, Size),
+        {reductions, Before} = process_info(self(), reductions),
+        Res = zstd:nif_compress_stream(Ref, Chunk, 0),
+        {reductions, After} = process_info(self(), reductions),
+        {Size, element(1, Res), After - Before}
+    end || Size <- Sizes],
+    {_, _, Base} = hd(Deltas),
+    Rows = [{Size, Tag, case Size =< 50000 of true -> Delta - Base; false -> (Delta - Base) div 500 end} || {Size, Tag, Delta} <- Deltas],
+    io:format("~w~n", [Rows]).
+
 row(Level, Data) ->
     Compressed = iolist_to_binary(zstd:compress(Data, #{compressionLevel => Level})),
     Plain = iolist_to_binary(Data),
@@ -169,9 +385,68 @@ fn run(program: &Path, args: &[&str], dir: &Path) -> Run {
     }
 }
 
+/// Local wrappers appended to `zstd.erl`: the NIF stubs are local functions of the module, and a
+/// call from another module to one is not the call `zstd.erl` itself makes.
+const NIF_WRAPPERS: &str = r#"
+nif_init_compress() -> init_compress_nif().
+nif_init_decompress() -> init_decompress_nif().
+nif_compress_stream(R, D, E) -> compress_stream_nif(R, D, E).
+nif_decompress_stream(R, D, E) -> decompress_stream_nif(R, D, E).
+nif_compress_close(R) -> compress_close_nif(R).
+nif_decompress_close(R) -> decompress_close_nif(R).
+nif_set_pledged(R, N) -> set_pledged_src_size_nif(R, N).
+"#;
+
+/// The `zstd` module of the reference OTP with every function exported, so a probe can call the
+/// NIFs (`zstd:compress_stream_nif/3`, ...) directly with arguments `zstd.erl` never passes.
+fn zstd_with_nifs_exported(reference: &RefErl) -> Vec<u8> {
+    let root = arinsal_difftest::reference::otp_root().expect("OTP root");
+    let stdlib = std::fs::read_dir(root.join("lib"))
+        .expect("OTP lib dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("stdlib-"))
+        })
+        .expect("stdlib directory");
+    let source = std::fs::read_to_string(stdlib.join("src/zstd.erl"))
+        .expect("zstd.erl source")
+        .lines()
+        .filter(|line| !line.starts_with("-define("))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("?ZSTD_e_continue", "0")
+        .replace("?ZSTD_e_flush", "1")
+        .replace("?ZSTD_e_end", "2");
+    let source = format!("{source}\n{NIF_WRAPPERS}");
+    reference
+        .compile_named(
+            "zstd",
+            &source,
+            &[
+                arinsal_etf::OwnedTerm::atom("export_all"),
+                arinsal_etf::OwnedTerm::atom("nowarn_export_all"),
+            ],
+        )
+        .expect("compile zstd")
+}
+
 /// Compiles `source` with erl, then runs `module:call` on erl and on Arinsal and returns both
 /// outputs. `label` keeps the scratch directories of concurrent tests apart.
 fn probe_both(module: &str, source: &str, label: &str, call: &str) -> Option<(Run, Run)> {
+    probe_both_with(module, source, label, call, false)
+}
+
+/// Like [`probe_both`]; with `nifs` the probe runs against [`zstd_with_nifs_exported`].
+fn probe_both_with(
+    module: &str,
+    source: &str,
+    label: &str,
+    call: &str,
+    nifs: bool,
+) -> Option<(Run, Run)> {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping zstd differential test");
         return None;
@@ -179,6 +454,7 @@ fn probe_both(module: &str, source: &str, label: &str, call: &str) -> Option<(Ru
     let beam = reference
         .compile_named(module, source, &[])
         .expect("compile zstd probe");
+    let exported = nifs.then(|| zstd_with_nifs_exported(&reference));
     drop(reference);
     let dir = std::env::temp_dir().join(format!(
         "arinsal-zstd-{module}-{}-{label}",
@@ -186,6 +462,9 @@ fn probe_both(module: &str, source: &str, label: &str, call: &str) -> Option<(Ru
     ));
     std::fs::create_dir_all(&dir).expect("temp dir");
     std::fs::write(dir.join(format!("{module}.beam")), &beam).expect("write beam");
+    if let Some(zstd_beam) = exported {
+        std::fs::write(dir.join("zstd.beam"), &zstd_beam).expect("write zstd beam");
+    }
     let arinsal = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arinsal");
     assert!(arinsal.is_file(), "build target/debug/arinsal first");
     let eval = format!("{module}:{call}, halt().");
@@ -205,6 +484,11 @@ fn probe_both(module: &str, source: &str, label: &str, call: &str) -> Option<(Ru
 /// Runs `zstd_compat_probe:Function()` on erl and on Arinsal and returns both outputs.
 fn both(function: &str) -> Option<(Run, Run)> {
     probe_both(MODULE, SOURCE, function, &format!("{function}()"))
+}
+
+/// Runs `zstd_compat_probe:Function()` against the `zstd` module with its NIF stubs exported.
+fn both_nifs(function: &str) -> Option<(Run, Run)> {
+    probe_both_with(MODULE, SOURCE, function, &format!("{function}()"), true)
 }
 
 /// Runs `zstd_param_probe:Function()` on erl and on Arinsal and returns both outputs.
@@ -998,4 +1282,36 @@ fn dictionary_errors_match_erl() {
 #[test]
 fn dictionary_lifecycle_matches_erl() {
     assert_matches_erl(both_dict("lifecycle"), &["true,true,true,true", "badarg"]);
+}
+
+/// Streaming compress and decompress through `zstd:stream/2`, `flush/1` and `finish/2` with
+/// chunks of several sizes, empty chunks and inputs larger than the internal output buffer:
+/// the returned tags, the remainder sub-binaries (including the size of the binary they
+/// reference) and every output byte match erl.
+#[test]
+fn streaming_chunks_match_erl() {
+    assert_matches_erl(both("streams"), &["c 300000", "d 300000", "continue"]);
+}
+
+/// A corrupted, truncated or garbage frame raises the same error term as erl, and the context
+/// is usable again afterwards.
+#[test]
+fn stream_corrupted_frames_match_erl() {
+    assert_matches_erl(both("corrupt"), &["zstd_error"]);
+}
+
+/// The stream NIFs called directly: every end op, bad end ops and bad data, sub-binary and
+/// unaligned inputs with their remainders, the `true` shortcut, and the session reset after an
+/// exception.
+#[test]
+fn stream_nifs_match_erl() {
+    assert_matches_erl(both_nifs("raw"), &["zstd_error", "badarg", "unaligned"]);
+}
+
+/// `enif_consume_timeslice` after each stream NIF call: the reductions a call charges grow with
+/// the bytes it consumed, `min(100, max(1, consumed / 1024))` percent of a time slice, 40
+/// reductions per percent.
+#[test]
+fn stream_reductions_match_erl() {
+    assert_matches_erl(both_nifs("reductions"), &["{5000,continue,"]);
 }

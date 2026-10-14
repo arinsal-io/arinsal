@@ -26,11 +26,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::{MagicRef, Term, TermBuilder, from_owned, global_atoms, to_owned};
+use arinsal_term::{MagicRef, Term, TermBuilder, global_atoms, to_owned};
 use num_traits::ToPrimitive;
 use zstd_sys as z;
 
-use crate::{Fault, Heap, Outcome, caller};
+use crate::{Heap, caller};
 
 /// Which of the two context or dictionary resource types a value is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,19 +276,6 @@ pub(crate) fn get_uint64(term: Term) -> Option<u64> {
             _ => None,
         },
         None => None,
-    }
-}
-
-/// Bridge for the argument and result shapes that still go through `OwnedTerm`: raise a
-/// [`Fault`] or build the result term.
-pub(crate) fn outcome(ctx: &mut Ctx<'_>, result: Outcome) -> Result<Term, BifError> {
-    let mut heap = Heap(&mut ctx.heap);
-    match result {
-        Ok(term) => from_owned(&term, &mut heap).map_err(|_| BifError::SystemLimit),
-        Err(Fault::Badarg) => Err(BifError::BADARG),
-        Err(Fault::Reason(reason)) => Err(BifError::Error(
-            from_owned(&reason, &mut heap).map_err(|_| BifError::SystemLimit)?,
-        )),
     }
 }
 
