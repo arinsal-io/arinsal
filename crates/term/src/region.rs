@@ -73,7 +73,9 @@ impl Drop for Chunk {
 struct Storage {
     chunks: Vec<Chunk>,
     words: usize,
-    binaries: Vec<Arc<RefcBinary>>,
+    off_heap_first: usize,
+    wrt_bins: usize,
+    overhead: u64,
     external: Vec<Arc<ExternalBinary>>,
     nodes: Vec<Arc<Node>>,
     funs: Vec<Arc<FunEntry>>,
@@ -82,12 +84,22 @@ struct Storage {
     dependencies: HashMap<usize, Arc<Region>>,
 }
 
+impl Drop for Storage {
+    fn drop(&mut self) {
+        // Port of erts/emulator/beam/copy.c:2049 (fragment ownership release), OTP-29.1.1.
+        crate::gc::release_binary_chain(self.off_heap_first);
+        crate::gc::release_binary_chain(self.wrt_bins);
+    }
+}
+
 impl Storage {
     fn new() -> Self {
         Self {
             chunks: Vec::new(),
             words: 0,
-            binaries: Vec::new(),
+            off_heap_first: 0,
+            wrt_bins: 0,
+            overhead: 0,
             external: Vec::new(),
             nodes: Vec::new(),
             funs: Vec::new(),
@@ -115,7 +127,27 @@ impl HeapAlloc for Storage {
         Some(ptr)
     }
     fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
-        self.binaries.push(binary);
+        drop(binary);
+    }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        let head = if writable {
+            &mut self.wrt_bins
+        } else {
+            &mut self.off_heap_first
+        };
+        crate::heap::store(bin_ref.wrapping_add(2), *head as u64);
+        *head = bin_ref as usize;
+        if let Some(owner) = owner {
+            owner.transfer_to_bin_ref(bin_ref);
+        }
+        self.overhead = self.overhead.saturating_add(overhead_words);
+        Ok(())
     }
     fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {
         self.external.push(binary);

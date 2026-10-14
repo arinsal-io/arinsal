@@ -126,6 +126,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "proptest",
+ "similar-asserts",
 ]
 
 [[package]]

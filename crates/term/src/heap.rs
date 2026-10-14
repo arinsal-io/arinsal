@@ -1,8 +1,5 @@
 //! Stable word allocations. Every pointer remains valid until its heap is dropped.
-use crate::bits::{
-    EXTERNAL_OWNER, ExternalBinary, RefcBinary, WRITABLE_OWNER, WritableBinary, binary_data,
-    owner_adjustment,
-};
+use crate::bits::{ExternalBinary, RefcBinary, WritableBinary, binary_data, owner_adjustment};
 use crate::identity::check_external_ref;
 use crate::record::RecordSnapshot;
 use crate::record_table::RecordLayout;
@@ -133,14 +130,6 @@ impl Drop for WordBlock {
     }
 }
 
-/// A zero-filled typed block: no stale word can pass for a term in a heap scan.
-fn zeroed_block(words: usize, allocation_type: ErtsAlcType) -> AllocBlock {
-    let mut memory =
-        AllocBlock::new(allocation_type, words).expect("ERTS heap block allocation failed");
-    memory.as_mut_slice().fill(0);
-    memory
-}
-
 impl Default for WordBlock {
     fn default() -> Self {
         // An absent old heap: erts leaves OLD_HEAP null and does not allocate.
@@ -260,6 +249,21 @@ pub trait HeapAlloc {
     }
     /// Keep an off-heap binary alive until GC examines this heap's owners.
     fn retain_binary(&mut self, binary: Arc<RefcBinary>);
+    /// Link a BinRef into this heap's ERTS off-heap or writable-binary chain.
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        let _ = (bin_ref, writable, overhead_words, owner);
+        Err(TermError::Unsupported("BinRef heap chain"))
+    }
+    /// Account for one retained Binary reference on the young virtual heap.
+    fn add_bin_vheap(&mut self, words: u64) {
+        let _ = words;
+    }
     /// Retain a growable off-heap binary until collection examines its BinRef.
     fn retain_writable_binary(&mut self, _binary: Arc<WritableBinary>) -> Result<(), TermError> {
         Err(TermError::Unsupported("writable binary heap owner"))
@@ -388,10 +392,17 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
 ///
 /// Private on purpose: every caller passes a pointer it obtained from the allocator for the
 /// block it is filling, which is the one invariant a raw store needs.
-#[inline(always)]
-fn store(ptr: *mut u64, value: u64) {
+#[inline]
+pub(crate) fn store(ptr: *mut u64, value: u64) {
     // SAFETY: callers pass an in-bounds, initialized-or-reserved slot of a live heap block.
     unsafe { *ptr = value }
+}
+
+/// Read one word from a block the caller owns or is tracing.
+#[inline]
+pub(crate) fn load(ptr: *const u64) -> u64 {
+    // SAFETY: callers pass an in-bounds, initialized slot of a live heap block.
+    unsafe { *ptr }
 }
 
 /// Head and open tail slot of a chain built by [`TermBuilder::chain3_push`].
@@ -684,6 +695,19 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
     fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         self.heap.retain_binary(binary)
     }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        self.heap
+            .link_bin_ref(bin_ref, writable, overhead_words, owner)
+    }
+    fn add_bin_vheap(&mut self, words: u64) {
+        self.heap.add_bin_vheap(words)
+    }
     fn retain_writable_binary_with_apparent_size(
         &mut self,
         binary: Arc<WritableBinary>,
@@ -714,6 +738,8 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
 
 /// A process heap with an upward bump pointer and a downward stack pointer.
 pub struct ProcessHeap {
+    // Drop token owners before the heap words referenced by BinRef.val/next.
+    pub(crate) owners: LazyOwners,
     pub(crate) words: WordBlock,
     pub(crate) htop: usize,
     pub(crate) stop: usize,
@@ -739,7 +765,6 @@ pub struct ProcessHeap {
     pub(crate) fragment_words: u32,
     /// `F_DISABLE_GC` inverted: collection may run after a BIF (`Process.gc_enabled`).
     pub gc_enabled: bool,
-    pub(crate) owners: LazyOwners,
 }
 
 /// Word kinds found while walking the live Erlang stack.
@@ -793,29 +818,39 @@ impl Default for VheapCold {
 #[derive(Default)]
 pub(crate) struct HeapOwners {
     pub(crate) vheap: VheapCold,
-    pub(crate) off_heap: Vec<Arc<RefcBinary>>,
-    pub(crate) writable: Vec<Arc<WritableBinary>>,
+    pub(crate) off_heap_first: usize,
+    pub(crate) wrt_bins: usize,
+    pub(crate) overhead: u64,
     pub(crate) external: Vec<Arc<ExternalBinary>>,
     pub(crate) nodes: Vec<Arc<Node>>,
     pub(crate) funs: Vec<Arc<FunEntry>>,
     pub(crate) exports: Vec<Arc<ExportEntry>>,
     pub(crate) magic: Vec<Arc<crate::MagicRef>>,
-    pub(crate) old_off_heap: Vec<Arc<RefcBinary>>,
-    pub(crate) old_writable: Vec<Arc<WritableBinary>>,
     pub(crate) old_external: Vec<Arc<ExternalBinary>>,
     pub(crate) old_nodes: Vec<Arc<Node>>,
     pub(crate) old_funs: Vec<Arc<FunEntry>>,
     pub(crate) old_exports: Vec<Arc<ExportEntry>>,
     pub(crate) old_magic: Vec<Arc<crate::MagicRef>>,
-    pub(crate) old_writable_refs: Vec<Term>,
     /// Heap that receives all allocations while the heap is detached.
     pub(crate) detached: Option<Box<VecHeap>>,
 }
 
 #[derive(Default)]
 pub(crate) struct LazyOwners(Option<Box<HeapOwners>>);
+impl Drop for LazyOwners {
+    fn drop(&mut self) {
+        if let Some(owners) = self.0.as_deref() {
+            crate::gc::release_binary_chain(owners.off_heap_first);
+            crate::gc::release_binary_chain(owners.wrt_bins);
+        }
+    }
+}
 
 impl LazyOwners {
+    pub(crate) fn as_mut(&mut self) -> Option<&mut HeapOwners> {
+        self.0.as_deref_mut()
+    }
+
     /// Whether the off-heap owner box has been created. A minor GC of a process
     /// with no binaries must not allocate one.
     pub(crate) fn is_allocated(&self) -> bool {
@@ -847,14 +882,11 @@ impl LazyOwners {
         owners.vheap.min != 46_422
             || owners.vheap.old != 0
             || owners.vheap.old_size != 46_422
-            || !owners.old_off_heap.is_empty()
-            || !owners.old_writable.is_empty()
             || !owners.old_external.is_empty()
             || !owners.old_nodes.is_empty()
             || !owners.old_funs.is_empty()
             || !owners.old_exports.is_empty()
             || !owners.old_magic.is_empty()
-            || !owners.old_writable_refs.is_empty()
     }
 }
 
@@ -1175,7 +1207,10 @@ impl ProcessHeap {
             return memory.as_mut_slice()[at..].as_mut_ptr();
         }
         let block_words = words.checked_add(extra).unwrap_or(words);
-        let mut memory = zeroed_block(block_words, ErtsAlcType::HEAP_FRAG);
+        // Port of erts/emulator/beam/utils.c:173-186 (`erts_heap_alloc`), OTP-29.1.1.
+        // ERTS initializes only the requested term span; the spare fragment capacity is untouched.
+        let mut memory = AllocBlock::new(ErtsAlcType::HEAP_FRAG, block_words)
+            .expect("heap fragment allocation size is valid");
         let ptr = memory.as_mut_ptr();
         self.fragments.push(Fragment::Block {
             memory,
@@ -1188,10 +1223,7 @@ impl ProcessHeap {
     /// The source must have no live stack or old generation. Terms allocated in
     /// it remain valid until this process next collects its fragments.
     pub fn adopt_message_fragment(&mut self, mut source: ProcessHeap) -> Result<(), AdoptError> {
-        if source.stop != source.words.len()
-            || source.old_htop != 0
-            || !source.old_words.is_empty()
-            || !source.owners.old_writable_refs.is_empty()
+        if source.stop != source.words.len() || source.old_htop != 0 || !source.old_words.is_empty()
         {
             return Err(AdoptError::NotStandalone);
         }
@@ -1241,15 +1273,14 @@ impl ProcessHeap {
             self.bin_vheap = self.bin_vheap.saturating_add(source.bin_vheap);
             self.owners.vheap.old = self.owners.vheap.old.saturating_add(source_old_vheap);
             if let Some(target) = self.owners.0.as_mut() {
-                target.off_heap.append(&mut owners.off_heap);
-                target.writable.append(&mut owners.writable);
+                Self::prepend_bin_ref_chain(&mut target.off_heap_first, owners.off_heap_first);
+                Self::prepend_bin_ref_chain(&mut target.wrt_bins, owners.wrt_bins);
+                target.overhead = target.overhead.saturating_add(owners.overhead);
                 target.external.append(&mut owners.external);
                 target.nodes.append(&mut owners.nodes);
                 target.funs.append(&mut owners.funs);
                 target.exports.append(&mut owners.exports);
                 target.magic.append(&mut owners.magic);
-                target.old_off_heap.append(&mut owners.old_off_heap);
-                target.old_writable.append(&mut owners.old_writable);
                 target.old_external.append(&mut owners.old_external);
                 target.old_nodes.append(&mut owners.old_nodes);
                 target.old_funs.append(&mut owners.old_funs);
@@ -1260,31 +1291,56 @@ impl ProcessHeap {
             }
         }
     }
+
+    fn prepend_bin_ref_chain(head: &mut usize, prefix: usize) {
+        if prefix == 0 {
+            return;
+        }
+        let mut tail = prefix;
+        loop {
+            let next = load((tail as *const u64).wrapping_add(2)) as usize;
+            if next == 0 {
+                break;
+            }
+            tail = next;
+        }
+        store((tail as *mut u64).wrapping_add(2), *head as u64);
+        *head = prefix;
+    }
     /// Number of off-heap binary owners retained by this process.
     pub fn off_heap_count(&self) -> usize {
-        self.owners.off_heap.len()
-            + self.owners.writable.len()
+        Self::bin_ref_chain_count(self.owners.off_heap_first)
+            + Self::bin_ref_chain_count(self.owners.wrt_bins)
             + self.owners.external.len()
-            + self.owners.old_off_heap.len()
-            + self.owners.old_writable.len()
             + self.owners.old_external.len()
+    }
+
+    fn bin_ref_chain_count(mut head: usize) -> usize {
+        let mut count = 0;
+        while head != 0 {
+            count += 1;
+            head = load((head as *const u64).wrapping_add(2)) as usize;
+        }
+        count
     }
 
     /// Number of bytes in the process's retained non-writable binaries.
     pub fn off_heap_binary_bytes(&self) -> u64 {
-        self.owners
-            .off_heap
-            .iter()
-            .chain(&self.owners.old_off_heap)
-            .map(|binary| binary.len() as u64)
-            .chain(
-                self.owners
-                    .external
-                    .iter()
-                    .chain(&self.owners.old_external)
-                    .map(|binary| binary.len() as u64),
-            )
-            .sum()
+        let mut bytes = 0u64;
+        let mut head = self.owners.off_heap_first;
+        while head != 0 {
+            let header = load((head as *const u64).wrapping_add(1)) as *const u64;
+            bytes = bytes.saturating_add(load(header.wrapping_add(3)));
+            head = load((head as *const u64).wrapping_add(2)) as usize;
+        }
+        bytes.saturating_add(
+            self.owners
+                .external
+                .iter()
+                .chain(&self.owners.old_external)
+                .map(|binary| binary.len() as u64)
+                .sum(),
+        )
     }
 
     /// Return one `(identity, byte length, refcount)` per retained refc binary reference.
@@ -1294,19 +1350,17 @@ impl ProcessHeap {
     pub fn off_heap_binary_info(&self) -> Vec<(usize, usize, usize)> {
         let o = &self.owners;
         let mut out = Vec::new();
-        for binary in o.off_heap.iter().chain(&o.old_off_heap) {
-            out.push((
-                Arc::as_ptr(binary) as usize,
-                binary.len(),
-                Arc::strong_count(binary),
-            ));
-        }
-        for binary in o.writable.iter().chain(&o.old_writable) {
-            out.push((
-                Arc::as_ptr(binary) as usize,
-                binary.len(),
-                Arc::strong_count(binary),
-            ));
+        for mut head in [o.off_heap_first, o.wrt_bins] {
+            while head != 0 {
+                let bin_ref = head as *const u64;
+                let binary = load(bin_ref.wrapping_add(1)) as *const u64;
+                out.push((
+                    binary as usize,
+                    load(binary.wrapping_add(3)) as usize,
+                    load(binary.wrapping_add(2)) as usize,
+                ));
+                head = load(bin_ref.wrapping_add(2)) as usize;
+            }
         }
         for binary in o.external.iter().chain(&o.old_external) {
             out.push((
@@ -1315,7 +1369,6 @@ impl ProcessHeap {
                 Arc::strong_count(binary),
             ));
         }
-        out.reverse();
         out
     }
 
@@ -1326,7 +1379,7 @@ impl ProcessHeap {
 
     /// Current young virtual binary heap usage, in machine words.
     pub fn bin_vheap_used(&self) -> u64 {
-        self.bin_vheap
+        self.owners.overhead
     }
 
     /// Current old virtual binary heap usage, in machine words.
@@ -1361,8 +1414,9 @@ impl ProcessHeap {
     }
 
     /// Whether off-heap binary overhead has reached the young virtual heap limit.
+    // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
     pub fn bin_vheap_gc_due(&self) -> bool {
-        self.bin_vheap > self.bin_vheap_size
+        self.owners.overhead > self.bin_vheap_size
     }
 }
 impl Default for ProcessHeap {
@@ -1447,7 +1501,40 @@ impl HeapAlloc for ProcessHeap {
         }
         // Port of erts/emulator/beam/erl_message.h:85 (OH_OVERHEAD), OTP-29.1.1.
         self.bin_vheap = self.bin_vheap.saturating_add((binary.len() / 8) as u64);
-        self.owners.off_heap.push(binary);
+        drop(binary);
+    }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        if self.detached
+            && let Some(heap) = self.owners.detached.as_deref_mut()
+        {
+            return heap.link_bin_ref(bin_ref, writable, overhead_words, owner);
+        }
+        let head = if writable {
+            &mut self.owners.wrt_bins
+        } else {
+            &mut self.owners.off_heap_first
+        };
+        store(bin_ref.wrapping_add(2), *head as u64);
+        *head = bin_ref as usize;
+        if let Some(owner) = owner {
+            owner.transfer_to_bin_ref(bin_ref);
+        }
+        self.owners.overhead = self.owners.overhead.saturating_add(overhead_words);
+        Ok(())
+    }
+    fn add_bin_vheap(&mut self, words: u64) {
+        if self.detached
+            && let Some(heap) = self.owners.detached.as_deref_mut()
+        {
+            return heap.add_bin_vheap(words);
+        }
+        self.bin_vheap = self.bin_vheap.saturating_add(words);
     }
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
         if self.detached
@@ -1458,7 +1545,7 @@ impl HeapAlloc for ProcessHeap {
         self.bin_vheap = self
             .bin_vheap
             .saturating_add((binary.capacity() / 8) as u64);
-        self.owners.writable.push(binary);
+        drop(binary);
         Ok(())
     }
     fn retain_writable_binary_with_apparent_size(
@@ -1475,7 +1562,7 @@ impl HeapAlloc for ProcessHeap {
         self.bin_vheap = self
             .bin_vheap
             .saturating_add((apparent_size_bits.div_ceil(8) / 8) as u64);
-        self.owners.writable.push(binary);
+        drop(binary);
         Ok(())
     }
     fn update_writable_binary_overhead(
@@ -1497,7 +1584,11 @@ impl HeapAlloc for ProcessHeap {
         let old_end = old_start.saturating_add(self.old_htop.saturating_mul(8));
         let old_generation = crate::bits::writable_bin_ref_address(source)
             .is_some_and(|address| address >= old_start && address < old_end);
-        self.add_vheap(old_generation, increase);
+        if old_generation {
+            self.owners.vheap.old = self.owners.vheap.old.saturating_add(increase);
+        } else {
+            self.owners.overhead = self.owners.overhead.saturating_add(increase);
+        }
     }
     fn supports_writable_binary(&self) -> bool {
         true
@@ -1595,8 +1686,9 @@ pub struct VecHeap {
     // Each chunk reserves its full capacity up front and never grows past it, so words
     // handed out stay put; only words actually allocated are initialized.
     chunks: Vec<HeapChunk>,
-    off_heap: Vec<Arc<RefcBinary>>,
-    writable: Vec<Arc<WritableBinary>>,
+    off_heap_first: usize,
+    wrt_bins: usize,
+    overhead: u64,
     external: Vec<Arc<ExternalBinary>>,
     nodes: Vec<Arc<Node>>,
     funs: Vec<Arc<FunEntry>>,
@@ -1621,8 +1713,9 @@ impl VecHeap {
         let words = words.max(1);
         Self {
             chunks: Vec::new(),
-            off_heap: Vec::new(),
-            writable: Vec::new(),
+            off_heap_first: 0,
+            wrt_bins: 0,
+            overhead: 0,
             external: Vec::new(),
             nodes: Vec::new(),
             funs: Vec::new(),
@@ -1642,8 +1735,11 @@ impl VecHeap {
             crate::validate::forget_stable_range(chunk.as_ptr() as usize);
             drop(chunk);
         }
-        self.off_heap.clear();
-        self.writable.clear();
+        crate::gc::release_binary_chain(self.off_heap_first);
+        crate::gc::release_binary_chain(self.wrt_bins);
+        self.off_heap_first = 0;
+        self.wrt_bins = 0;
+        self.overhead = 0;
         self.external.clear();
         self.nodes.clear();
         self.funs.clear();
@@ -1694,6 +1790,7 @@ impl VecHeap {
             .collect()
     }
 }
+
 impl Default for VecHeap {
     fn default() -> Self {
         Self::new()
@@ -1701,8 +1798,10 @@ impl Default for VecHeap {
 }
 impl Drop for VecHeap {
     fn drop(&mut self) {
+        crate::gc::release_binary_chain(self.off_heap_first);
+        crate::gc::release_binary_chain(self.wrt_bins);
+        #[cfg(any(feature = "validate-terms", debug_assertions, test))]
         for chunk in &self.chunks {
-            #[cfg(any(feature = "validate-terms", debug_assertions, test))]
             crate::validate::forget_stable_range(chunk.as_ptr() as usize);
         }
     }
@@ -1738,10 +1837,31 @@ impl HeapAlloc for VecHeap {
         Some(ptr)
     }
     fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
-        self.off_heap.push(binary);
+        drop(binary);
     }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        let head = if writable {
+            &mut self.wrt_bins
+        } else {
+            &mut self.off_heap_first
+        };
+        store(bin_ref.wrapping_add(2), *head as u64);
+        *head = bin_ref as usize;
+        if let Some(owner) = owner {
+            owner.transfer_to_bin_ref(bin_ref);
+        }
+        self.overhead = self.overhead.saturating_add(overhead_words);
+        Ok(())
+    }
+    fn add_bin_vheap(&mut self, _words: u64) {}
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
-        self.writable.push(binary);
+        drop(binary);
         Ok(())
     }
     fn supports_writable_binary(&self) -> bool {
@@ -2234,8 +2354,34 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
     }
     /// Build a byte-aligned binary.
+    // Port of erts/emulator/beam/erl_bits.c:2874-2878 (`erts_new_binary_from_data`), OTP-29.1.1.
     pub fn binary(&mut self, bytes: &[u8]) -> Result<Term, TermError> {
-        self.bitstring(bytes, bytes.len() * 8)
+        let bit_len = bytes.len().checked_mul(8).ok_or(TermError::SystemLimit)?;
+        if bytes.len() <= 64 {
+            return self.heap_bitstring_with_data(bit_len, false, |destination| {
+                destination.copy_from_slice(bytes);
+            });
+        }
+        self.binary_from_fn(bytes.len(), |destination| {
+            destination.copy_from_slice(bytes);
+        })
+    }
+
+    /// Allocate a binary in its final heap or Binary storage before filling it.
+    // Port of erts/emulator/beam/erl_bits.c:2841-2860 (erts_new_bitstring), OTP-29.1.1.
+    pub fn binary_from_fn(
+        &mut self,
+        size: usize,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<Term, TermError> {
+        if size <= 64 {
+            let mut bytes = vec![0; size];
+            fill(&mut bytes);
+            return self.binary(&bytes);
+        }
+        let mut binary = RefcBinary::new_zeroed(size)?;
+        fill(binary.bytes_mut_unique().ok_or(TermError::BadArg)?);
+        self.install_refc_binary(binary, size * 8)
     }
     /// Build a bitstring with high bits significant in its final byte.
     pub fn bitstring(&mut self, bytes: &[u8], bit_len: usize) -> Result<Term, TermError> {
@@ -2244,19 +2390,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
         let count = bit_len.div_ceil(8);
         if count <= 64 {
-            let words = 2 + count.div_ceil(8);
-            let p = self.words(words)?;
-            // SAFETY: allocation includes count rounded to whole words.
-            unsafe {
-                *p = (((words - 1) as u64) << 6) | HEAP_BITS;
-                *p.add(1) = bit_len as u64;
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(2).cast::<u8>(), count);
-                if !bit_len.is_multiple_of(8) && count > 0 {
-                    let last = p.add(2).cast::<u8>().add(count - 1);
-                    *last &= 0xff << (8 - (bit_len % 8));
-                }
-            }
-            return Ok(Term::from_ptr(p, 2));
+            return self.heap_bitstring_from_parts(bytes, &[], bit_len);
         }
         let mut data = bytes[..count].to_vec();
         if !bit_len.is_multiple_of(8)
@@ -2264,24 +2398,139 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         {
             *last &= 0xff << (8 - bit_len % 8);
         }
-        let binary = Arc::new(RefcBinary::new(data)?);
+        let binary = RefcBinary::new(data)?;
+        self.install_refc_binary(binary, bit_len)
+    }
+
+    fn install_refc_binary(
+        &mut self,
+        binary: RefcBinary,
+        bit_len: usize,
+    ) -> Result<Term, TermError> {
         let adjustment = binary.as_ptr() as usize & 3;
+        let size_words = (binary.len() / 8) as u64;
+        let binary_owner = binary.into_reference();
+        let binary_header = binary_owner.header_ptr();
         let ref_ptr = self.words(8)?;
         // SAFETY: the same allocation reserves three BinRef and five SubBits words.
         let sub_ptr = unsafe { ref_ptr.add(3) };
-        // SAFETY: both word ranges are reserved; Arc owns stable vector data.
+        // SAFETY: both word ranges are reserved; the BinRef token owns the Binary.
         unsafe {
             *ref_ptr = (2 << 6) | BIN_REF;
-            *ref_ptr.add(1) = Arc::as_ptr(&binary) as u64;
-            *ref_ptr.add(2) = (adjustment as u64) << 1;
+            *ref_ptr.add(1) = binary_header as u64;
             *sub_ptr = (4 << 6) | SUB_BITS;
-            *sub_ptr.add(1) = binary.as_ptr() as u64 & !3;
+            *sub_ptr.add(1) = binary_header.wrapping_add(4) as u64 & !3;
             *sub_ptr.add(2) = (adjustment * 8) as u64;
             *sub_ptr.add(3) = (bit_len + adjustment * 8) as u64;
             *sub_ptr.add(4) = Term::from_ptr(ref_ptr, 2).bits();
         }
-        self.heap.retain_binary(binary);
+        self.heap
+            .link_bin_ref(ref_ptr, false, size_words, Some(binary_owner))?;
         Ok(Term::from_ptr(sub_ptr, 2))
+    }
+
+    /// Build an on-heap bitstring by copying two byte ranges directly into its payload.
+    ///
+    /// The 64-byte bound matches `ERL_ONHEAP_BINARY_LIMIT`; larger bitstrings use the
+    /// reference-counted path. Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1882 and
+    /// erts/emulator/beam/jit/beam_jit_common.cpp:816-849, OTP-29.1.1.
+    pub fn heap_bitstring_from_parts(
+        &mut self,
+        prefix: &[u8],
+        suffix: &[u8],
+        bit_len: usize,
+    ) -> Result<Term, TermError> {
+        let available = prefix.len().saturating_add(suffix.len());
+        if bit_len > available.saturating_mul(8) {
+            return Err(TermError::BadArg);
+        }
+        let count = bit_len.div_ceil(8);
+        if count > 64 {
+            return Err(TermError::SystemLimit);
+        }
+        let prefix_count = prefix.len().min(count);
+        let suffix_count = count - prefix_count;
+        self.heap_bitstring_with_data(bit_len, false, |destination| {
+            destination[..prefix_count].copy_from_slice(&prefix[..prefix_count]);
+            destination[prefix_count..count].copy_from_slice(&suffix[..suffix_count]);
+        })
+    }
+
+    /// Copy a bit range directly into an on-heap bitstring.
+    ///
+    /// Port of erts/emulator/beam/erl_bits.c:2641-2673 (`erts_build_sub_bitstring`) and
+    /// erts/emulator/beam/erl_bits.h:541 (`copy_binary_to_buffer`), OTP-29.1.1.
+    pub fn heap_bitstring_from_range(
+        &mut self,
+        source: &[u8],
+        source_offset: usize,
+        bit_len: usize,
+    ) -> Result<Term, TermError> {
+        self.heap_bitstring_from_range_with_fragment(source, source_offset, bit_len, false)
+    }
+
+    fn heap_bitstring_from_range_with_fragment(
+        &mut self,
+        source: &[u8],
+        source_offset: usize,
+        bit_len: usize,
+        fragment_only: bool,
+    ) -> Result<Term, TermError> {
+        if source_offset
+            .checked_add(bit_len)
+            .is_none_or(|end| end > source.len().saturating_mul(8))
+        {
+            return Err(TermError::BadArg);
+        }
+        if bit_len.div_ceil(8) > 64 {
+            return Err(TermError::SystemLimit);
+        }
+        self.heap_bitstring_with_data(bit_len, fragment_only, |destination| {
+            if !source_offset.is_multiple_of(8) || !bit_len.is_multiple_of(8) {
+                destination.fill(0);
+            }
+            crate::copy::copy_binary_to_buffer(destination, source, source_offset, bit_len);
+        })
+    }
+
+    /// Build a BIF sub-bitstring, copying results within the on-heap limit.
+    ///
+    /// Port of erts/emulator/beam/erl_bits.c:2620-2654
+    /// (`erts_build_sub_bitstring`), OTP-29.1.1.
+    pub fn sub_binary_bif(
+        &mut self,
+        original: Term,
+        start: usize,
+        bit_len: usize,
+    ) -> Result<Term, TermError> {
+        self.sub_binary_inner(original, start, bit_len, true, true)
+    }
+
+    fn heap_bitstring_with_data(
+        &mut self,
+        bit_len: usize,
+        fragment_only: bool,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<Term, TermError> {
+        let count = bit_len.div_ceil(8);
+        let words = 2 + count.div_ceil(8);
+        let p = if fragment_only {
+            self.heap.alloc_fragment_only(words)
+        } else {
+            self.heap.alloc(words)
+        }
+        .ok_or(TermError::HeapFull)?;
+        // SAFETY: the allocation covers the complete heap-bitstring header and rounded payload.
+        unsafe {
+            *p = (((words - 1) as u64) << 6) | HEAP_BITS;
+            *p.add(1) = bit_len as u64;
+            let destination = std::slice::from_raw_parts_mut(p.add(2).cast::<u8>(), count);
+            fill(destination);
+            if !bit_len.is_multiple_of(8) && count > 0 {
+                destination[count - 1] &= 0xff << (8 - (bit_len % 8));
+            }
+        }
+        Ok(Term::from_ptr(p, 2))
     }
     /// Create a slice of a bitstring, retaining the original owner.
     pub fn sub_binary(
@@ -2290,27 +2539,65 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         start: usize,
         bit_len: usize,
     ) -> Result<Term, TermError> {
-        crate::bits::writable_finalize(original);
+        self.sub_binary_inner(original, start, bit_len, false, false)
+    }
+
+    fn sub_binary_inner(
+        &mut self,
+        original: Term,
+        start: usize,
+        bit_len: usize,
+        copy_bif_small: bool,
+        fragment_only: bool,
+    ) -> Result<Term, TermError> {
+        if !copy_bif_small {
+            crate::bits::writable_finalize(original);
+        }
         // SAFETY: The original binary and heap remain live during construction.
         let view = unsafe { original.binary_ref() }.ok_or(TermError::BadArg)?;
+        if copy_bif_small && !view.bit_len().is_multiple_of(8) {
+            return Err(TermError::BadArg);
+        }
         if start
             .checked_add(bit_len)
             .is_none_or(|end| end > view.bit_len())
         {
             return Err(TermError::BadArg);
         }
+        if copy_bif_small && bit_len.div_ceil(8) <= 64 {
+            let source_offset = view
+                .start_bit()
+                .checked_add(start)
+                .ok_or(TermError::BadArg)?;
+            return self.heap_bitstring_with_data(bit_len, fragment_only, |destination| {
+                if !source_offset.is_multiple_of(8) || !bit_len.is_multiple_of(8) {
+                    destination.fill(0);
+                }
+                crate::copy::copy_binary_to_buffer(
+                    destination,
+                    view.bytes(),
+                    source_offset,
+                    bit_len,
+                );
+            });
+        }
         let mut owner = original;
         while owner.header().is_some_and(|h| h & 63 == SUB_BITS) {
             // SAFETY: a live SubBits has its original term in word four.
             owner = Term(unsafe { *owner.raw_ptr().add(4) });
         }
-        if owner.header().is_some_and(|h| h & 63 == HEAP_BITS) {
-            let mut bytes = vec![0; bit_len.div_ceil(8)];
-            for i in 0..bit_len {
-                let src = view.start_bit() + start + i;
-                bytes[i / 8] |= ((view.bytes()[src / 8] >> (7 - src % 8)) & 1) << (7 - i % 8);
-            }
-            return self.bitstring(&bytes, bit_len);
+        let small_heap_source = owner.header().is_none_or(|h| h & 63 != BIN_REF);
+        if small_heap_source && bit_len.div_ceil(8) <= 64 {
+            let source_offset = view
+                .start_bit()
+                .checked_add(start)
+                .ok_or(TermError::BadArg)?;
+            return self.heap_bitstring_from_range_with_fragment(
+                view.bytes(),
+                source_offset,
+                bit_len,
+                fragment_only,
+            );
         }
         if owner.header().is_none_or(|h| h & 63 != BIN_REF) {
             return Err(TermError::BadArg);
@@ -2318,27 +2605,55 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         if !self.heap.supports_writable_binary() && crate::bits::binary_owner_is_writable(owner) {
             return Err(TermError::Unsupported("writable binary heap owner"));
         }
-        let p = self.words(8)?;
-        // SAFETY: the BinRef pointer is held by the original heap.
-        let (binary, flags) = unsafe { crate::bits::clone_binary_owner(owner) };
-        // SAFETY: eight reserved words hold a BinRef followed by a SubBits.
-        let sub = unsafe { p.add(3) };
+        let words = if copy_bif_small { 5 } else { 8 };
+        let p = if fragment_only {
+            self.heap.alloc_fragment_only(words)
+        } else {
+            self.heap.alloc(words)
+        }
+        .ok_or(TermError::HeapFull)?;
         let absolute = view.start_bit() + start;
         let adjustment = owner_adjustment(owner);
-        // SAFETY: the new BinRef owns the Arc data and both objects are initialized.
+        // SAFETY: `words` reserves either one five-word SUB_BITS or a BinRef plus SUB_BITS;
+        // the source heap retains its original BinRef while the destination is initialized.
         unsafe {
+            if copy_bif_small {
+                // Port of erts/emulator/beam/erl_bits.c:2635-2669 (erts_build_sub_bitstring),
+                // OTP-29.1.1: a large BIF sub-bitstring points at the existing BinRef.
+                let volatile = if crate::bits::binary_owner_is_writable(owner) {
+                    crate::bits::SUB_BITS_VOLATILE
+                } else {
+                    0
+                };
+                *p = (4 << 6) | SUB_BITS;
+                *p.add(1) = (binary_data(owner.raw_ptr()) as u64 & !3) | volatile;
+                *p.add(2) = (absolute + adjustment * 8) as u64;
+                *p.add(3) = (absolute + bit_len + adjustment * 8) as u64;
+                *p.add(4) = owner.bits();
+                return Ok(Term::from_ptr(p, 2));
+            }
+
+            // The non-BIF builder copies across heap owners and retains its own BinRef.
+            let (binary, flags, overhead, binary_owner) = crate::bits::clone_binary_owner(owner)?;
+            let sub = p.add(3);
             *p = (2 << 6) | BIN_REF;
             *p.add(1) = binary;
-            *p.add(2) = flags;
+            *p.add(2) = 0;
             *sub = (4 << 6) | SUB_BITS;
             *sub.add(1) = binary_data(p) as u64 & !3;
             *sub.add(2) = (absolute + adjustment * 8) as u64;
             *sub.add(3) = (absolute + bit_len + adjustment * 8) as u64;
             *sub.add(4) = Term::from_ptr(p, 2).bits();
+            crate::bits::retain_cloned_binary_owner(
+                self.heap,
+                p,
+                binary,
+                flags,
+                overhead,
+                binary_owner,
+            )?;
+            Ok(Term::from_ptr(sub, 2))
         }
-        // SAFETY: clone_binary_owner returned an owned Arc raw pointer.
-        unsafe { crate::bits::retain_cloned_binary_owner(self.heap, binary, flags)? };
-        Ok(Term::from_ptr(sub, 2))
     }
     /// Construct a sorted flatmap; last duplicate key wins.
     pub fn flatmap_from_pairs(&mut self, pairs: &[(Term, Term)]) -> Result<Term, TermError> {
@@ -2847,6 +3162,7 @@ impl Term {
     /// # Safety
     /// The owning heap and any off-heap binary owner must remain live. No
     /// writable append may run while a view of its owner is retained.
+    // Port of erts/emulator/beam/erl_bits.h:376-405 (`ERTS_GET_BITSTRING_REF`), OTP-29.1.1.
     pub unsafe fn binary_ref<'a>(self) -> Option<BinaryRef<'a>> {
         let header = self.header()?;
         // SAFETY: The header determines the initialized object layout.
@@ -2877,13 +3193,11 @@ impl Term {
                 unsafe {
                     let bin_ref = original.raw_ptr();
                     let owner = *bin_ref.add(1);
-                    let flags = *bin_ref.add(2);
-                    let size = if flags & EXTERNAL_OWNER != 0 {
+                    let next = *bin_ref.add(2);
+                    let size = if crate::bits::bin_ref_is_legacy_external(next) {
                         (&*(owner as *const ExternalBinary)).len()
-                    } else if flags & WRITABLE_OWNER != 0 {
-                        (&*(owner as *const WritableBinary)).capacity()
                     } else {
-                        (&*(owner as *const RefcBinary)).len()
+                        *(owner as *const u64).add(3) as usize
                     };
                     (binary_data(bin_ref), size)
                 }

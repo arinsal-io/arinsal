@@ -1,8 +1,11 @@
 //! Audited OS memory operations and bounded access to mapped memory.
 
 use std::fmt;
+use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const WORD_BYTES: usize = std::mem::size_of::<usize>();
+const BIN_FLAG_WRITABLE: u64 = 1 << 2;
 
 /// Pointer and extent for a typed allocator block.
 pub(crate) struct WordView {
@@ -38,12 +41,385 @@ impl WordView {
         self.ptr as *mut u64
     }
 
+    pub(crate) fn read_word(&self, index: usize) -> Option<u64> {
+        if index >= self.len {
+            return None;
+        }
+        // SAFETY: callers read only initialized words within the live typed block.
+        Some(unsafe { (self.ptr as *const u64).add(index).read() })
+    }
+
+    pub(crate) fn write_word(&mut self, index: usize, value: u64) -> bool {
+        if index >= self.len {
+            return false;
+        }
+        // SAFETY: callers write an initialized word within the exclusively borrowed block.
+        unsafe { (self.ptr as *mut u64).add(index).write(value) };
+        true
+    }
+
+    pub(crate) fn binary_view_at(&self, header_word: usize) -> Option<BinaryView<'_>> {
+        if header_word >= self.len || self.len - header_word < 4 {
+            return None;
+        }
+        Some(BinaryView {
+            ptr: (self.ptr as *const u64).wrapping_add(header_word) as usize,
+            words: self.len - header_word,
+            _owner: PhantomData,
+        })
+    }
+
     pub(crate) fn as_slice(&self) -> &[u64] {
         words_at(self.ptr as *const u64, self.len)
     }
 
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u64] {
         words_at_mut(self.ptr as *mut u64, self.len)
+    }
+    pub(crate) fn atomic_load(&self, index: usize, order: Ordering) -> Option<u64> {
+        Some(self.atomic(index)?.load(order))
+    }
+
+    /// Atomically stores one aligned header word.
+    pub(crate) fn atomic_store(&self, index: usize, value: u64, order: Ordering) -> bool {
+        let Some(word) = self.atomic(index) else {
+            return false;
+        };
+        word.store(value, order);
+        true
+    }
+
+    /// Atomically adds to one aligned header word and returns its previous value.
+    pub(crate) fn atomic_fetch_add(
+        &self,
+        index: usize,
+        value: u64,
+        order: Ordering,
+    ) -> Option<u64> {
+        Some(self.atomic(index)?.fetch_add(value, order))
+    }
+
+    /// Atomically subtracts from one aligned header word and returns its previous value.
+    pub(crate) fn atomic_fetch_sub(
+        &self,
+        index: usize,
+        value: u64,
+        order: Ordering,
+    ) -> Option<u64> {
+        Some(self.atomic(index)?.fetch_sub(value, order))
+    }
+
+    /// Atomically sets bits in one aligned header word and returns its previous value.
+    pub(crate) fn atomic_fetch_or(&self, index: usize, value: u64, order: Ordering) -> Option<u64> {
+        Some(self.atomic(index)?.fetch_or(value, order))
+    }
+
+    /// Atomically clears bits in one aligned header word and returns its previous value.
+    pub(crate) fn atomic_fetch_and(
+        &self,
+        index: usize,
+        value: u64,
+        order: Ordering,
+    ) -> Option<u64> {
+        Some(self.atomic(index)?.fetch_and(value, order))
+    }
+
+    fn atomic(&self, index: usize) -> Option<&AtomicU64> {
+        if index >= self.len {
+            return None;
+        }
+        let ptr = (self.ptr as *const u64).wrapping_add(index);
+        // SAFETY: the view is word-aligned and bounded; header words were initialized as atomics.
+        Some(unsafe { &*ptr.cast::<AtomicU64>() })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: the typed block owns this live, word-aligned payload; every u64 is initialized.
+        unsafe {
+            std::slice::from_raw_parts(self.ptr as *const u8, self.len * std::mem::size_of::<u64>())
+        }
+    }
+
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the typed block owns this live payload exclusively; every u64 is initialized.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.ptr as *mut u8,
+                self.len * std::mem::size_of::<u64>(),
+            )
+        }
+    }
+}
+
+/// Borrowed view of an erts `Binary` allocation.
+#[derive(Clone, Copy)]
+pub struct BinaryView<'a> {
+    ptr: usize,
+    words: usize,
+    _owner: PhantomData<&'a [u64]>,
+}
+
+impl<'a> BinaryView<'a> {
+    /// Rebuild a view from a live `Binary` header address.
+    ///
+    /// # Safety
+    /// `header` must point at a live, word-aligned `BinaryBlock` header that remains valid for
+    /// `'a`; the four allocator metadata words immediately precede it, and `words` must cover the
+    /// header and its payload.
+    pub unsafe fn from_header(header: *const u64, words: usize) -> Self {
+        Self {
+            ptr: header as usize,
+            words,
+            _owner: PhantomData,
+        }
+    }
+
+    /// Binary header address stored in a heap `BinRef`.
+    pub fn header_ptr(&self) -> *const u64 {
+        self.ptr as *const u64
+    }
+
+    /// Number of words from the binary header through its payload allocation.
+    pub fn allocation_words(&self) -> usize {
+        self.words
+    }
+
+    /// Address of the first binary payload byte.
+    pub fn bytes_ptr(&self) -> *const u8 {
+        self.header_ptr().wrapping_add(4).cast()
+    }
+
+    /// Current allocated payload capacity in bytes (`Binary.orig_size`).
+    pub fn capacity(&self) -> Option<usize> {
+        Some(self.load(3, Ordering::Relaxed)? as usize)
+    }
+
+    /// Apparent payload size in bytes (`Binary.intern.apparent_size`).
+    pub fn apparent_size(&self) -> Option<usize> {
+        Some(self.load(1, Ordering::Relaxed)? as usize)
+    }
+
+    /// Current logical size in bytes.
+    pub fn len(&self) -> Option<usize> {
+        self.apparent_size()
+    }
+
+    /// Whether the apparent payload size is zero.
+    pub fn is_empty(&self) -> bool {
+        self.len() == Some(0)
+    }
+
+    /// Binary flags from `Binary.intern.flags`.
+    pub fn flags(&self) -> Option<u64> {
+        self.load(0, Ordering::Relaxed)
+    }
+
+    /// Whether all bits in `flags` are set in the binary header.
+    pub fn has_flags(&self, flags: u64) -> bool {
+        self.flags().is_some_and(|current| current & flags == flags)
+    }
+
+    /// Clear binary flags atomically.
+    pub fn clear_flags(&self, flags: u64) -> bool {
+        self.fetch_and(0, !flags, Ordering::Relaxed).is_some()
+    }
+
+    /// Set binary flags atomically.
+    pub fn set_flags(&self, flags: u64) -> bool {
+        self.fetch_or(0, flags, Ordering::Relaxed).is_some()
+    }
+
+    /// Replace the apparent binary size.
+    pub fn set_apparent_size(&self, size: usize) -> bool {
+        self.store(1, size as u64, Ordering::Relaxed)
+    }
+
+    /// Mutably borrow the payload when this is its only erts reference.
+    pub fn bytes_mut_unique(&self, len: usize) -> Option<&'a mut [u8]> {
+        if self.load(2, Ordering::Relaxed)? != 1
+            || len > self.capacity()?
+            || len
+                > self
+                    .words
+                    .checked_mul(WORD_BYTES)?
+                    .saturating_sub(4 * WORD_BYTES)
+        {
+            return None;
+        }
+        // SAFETY: a refcount of one grants the caller exclusive access to this binary payload.
+        Some(unsafe { std::slice::from_raw_parts_mut(self.bytes_ptr().cast_mut(), len) })
+    }
+
+    /// Read one atomic binary-header word.
+    pub fn load(&self, index: usize, order: Ordering) -> Option<u64> {
+        Some(self.atomic(index)?.load(order))
+    }
+
+    /// Store one atomic binary-header word.
+    pub fn store(&self, index: usize, value: u64, order: Ordering) -> bool {
+        let Some(word) = self.atomic(index) else {
+            return false;
+        };
+        word.store(value, order);
+        true
+    }
+
+    /// Add to one atomic binary-header word.
+    pub fn fetch_add(&self, index: usize, value: u64, order: Ordering) -> Option<u64> {
+        Some(self.atomic(index)?.fetch_add(value, order))
+    }
+
+    /// Subtract from one atomic binary-header word.
+    pub fn fetch_sub(&self, index: usize, value: u64, order: Ordering) -> Option<u64> {
+        Some(self.atomic(index)?.fetch_sub(value, order))
+    }
+
+    /// Set bits in one atomic binary-header word.
+    pub fn fetch_or(&self, index: usize, value: u64, order: Ordering) -> Option<u64> {
+        Some(self.atomic(index)?.fetch_or(value, order))
+    }
+
+    /// Clear bits in one atomic binary-header word.
+    pub fn fetch_and(&self, index: usize, value: u64, order: Ordering) -> Option<u64> {
+        Some(self.atomic(index)?.fetch_and(value, order))
+    }
+
+    /// Shared view of initialized binary payload bytes.
+    pub fn bytes(&self, len: usize) -> Option<&'a [u8]> {
+        if len
+            > self
+                .words
+                .checked_mul(WORD_BYTES)?
+                .saturating_sub(4 * WORD_BYTES)
+        {
+            return None;
+        }
+        // SAFETY: the constructor's contract keeps the header and `len` payload bytes live.
+        Some(unsafe { std::slice::from_raw_parts(self.bytes_ptr(), len) })
+    }
+
+    fn atomic(&self, index: usize) -> Option<&AtomicU64> {
+        if index >= 4 || self.words < 4 {
+            return None;
+        }
+        let ptr = self.header_ptr().wrapping_add(index);
+        // SAFETY: the constructor guarantees an aligned live header; fields are initialized atomics.
+        Some(unsafe { &*ptr.cast::<AtomicU64>() })
+    }
+}
+
+/// One retained reference to an erts `Binary`, owned by a BinRef chain.
+pub struct OwnedBinaryRef {
+    view: BinaryView<'static>,
+    bin_ref: usize,
+    may_reallocate: bool,
+}
+
+impl OwnedBinaryRef {
+    pub(crate) fn from_owned_view(view: BinaryView<'_>) -> Self {
+        let may_reallocate = view
+            .flags()
+            .is_some_and(|flags| flags & BIN_FLAG_WRITABLE != 0);
+        Self {
+            view: BinaryView {
+                ptr: view.ptr,
+                words: view.words,
+                _owner: PhantomData,
+            },
+            bin_ref: 0,
+            may_reallocate,
+        }
+    }
+
+    /// Retain one reference to a binary view and own its eventual release.
+    pub fn clone_from_view(view: BinaryView<'_>) -> Option<Self> {
+        let previous = view.fetch_add(2, 1, Ordering::Relaxed)?;
+        if previous == 0 || previous == u64::MAX {
+            view.fetch_sub(2, 1, Ordering::Relaxed);
+            return None;
+        }
+        let may_reallocate = view
+            .flags()
+            .is_some_and(|flags| flags & BIN_FLAG_WRITABLE != 0);
+        Some(Self {
+            view: BinaryView {
+                ptr: view.ptr,
+                words: view.words,
+                _owner: PhantomData,
+            },
+            bin_ref: 0,
+            may_reallocate,
+        })
+    }
+
+    /// Associate this reference with its BinRef so reallocations are followed at release.
+    pub fn attach_to_bin_ref(&mut self, bin_ref: *mut u64) {
+        self.bin_ref = bin_ref as usize;
+    }
+
+    /// Transfer this refcount to the linked erts BinRef, whose sweep releases it.
+    // Port of erts/emulator/beam/erl_bits.h:390 (`erts_bin_release`), OTP-29.1.1.
+    pub fn transfer_to_bin_ref(mut self, bin_ref: *mut u64) {
+        self.attach_to_bin_ref(bin_ref);
+        std::mem::forget(self);
+    }
+
+    /// Header address stored in the associated BinRef.
+    pub fn header_ptr(&self) -> *const u64 {
+        self.view.header_ptr()
+    }
+
+    /// Binary header flags.
+    pub fn flags(&self) -> Option<u64> {
+        self.view.flags()
+    }
+
+    /// Binary's allocated payload capacity.
+    pub fn capacity(&self) -> Option<usize> {
+        self.view.capacity()
+    }
+
+    /// Current erts reference count for this Binary.
+    pub fn ref_count(&self) -> Option<usize> {
+        self.view
+            .load(2, Ordering::Relaxed)
+            .map(|count| count as usize)
+    }
+}
+
+impl Drop for OwnedBinaryRef {
+    fn drop(&mut self) {
+        // Port of erts/emulator/beam/erl_binary.h:390 (erts_bin_release), OTP-29.1.1.
+        // Only writable Binaries can be reallocated, so immutable references release
+        // their stored Binary even when the source BinRef has already been forwarded.
+        let view = if self.may_reallocate {
+            self.current_view().unwrap_or(self.view)
+        } else {
+            self.view
+        };
+        crate::typed::BinaryBlock::release_view(view)
+            .expect("owned Binary reference has allocator metadata");
+    }
+}
+
+impl OwnedBinaryRef {
+    fn current_view(&self) -> Option<BinaryView<'static>> {
+        if self.bin_ref == 0 {
+            return None;
+        }
+        let bin_ref = WordView::new(self.bin_ref as *mut u64, 3);
+        let header = bin_ref.read_word(1)? as usize;
+        let prefix = BinaryView {
+            ptr: header,
+            words: 4,
+            _owner: PhantomData,
+        };
+        let words = 4usize.checked_add(prefix.capacity()?.div_ceil(WORD_BYTES))?;
+        Some(BinaryView {
+            ptr: header,
+            words,
+            _owner: PhantomData,
+        })
     }
 }
 

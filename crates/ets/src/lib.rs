@@ -902,12 +902,17 @@ struct ObjectHeap {
     off_heap: Option<Box<OffHeap>>,
 }
 
+impl Drop for ObjectHeap {
+    fn drop(&mut self) {
+        self.off_heap = None;
+    }
+}
+
 #[derive(Default)]
 struct OffHeap {
-    binaries: Vec<Arc<arinsal_term::RefcBinary>>,
-    // mix_loop1: Elixir AST binaries are writable proc bins. ETS must retain
-    // them after `ets:insert` copies the object off the process heap.
-    writable: Vec<Arc<WritableBinary>>,
+    // Per-object DbTerm.first_oh; dropping its tokens ports db_free_term cleanup.
+    first_oh: usize,
+    binary_refs: Vec<arinsal_term::OwnedBinaryRef>,
     external: Vec<Arc<ExternalBinary>>,
     nodes: Vec<Arc<TermNode>>,
     funs: Vec<Arc<FunEntry>>,
@@ -957,12 +962,42 @@ impl HeapAlloc for ObjectHeap {
     }
 
     fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
-        self.off_heap().binaries.push(binary);
+        drop(binary);
     }
-    // mix_loop1: `copy_term` refuses writable owners unless the destination
-    // heap retains the Arc. OTP pins the proc bin and shares it into the table.
+    // Port of erts/emulator/beam/erl_db_util.c:3559 (db_store_term), OTP-29.1.1.
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        _writable: bool,
+        _overhead_words: u64,
+        owner: Option<arinsal_term::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        let address = bin_ref as usize;
+        let Some((allocation_index, word_index)) =
+            self.words.iter().enumerate().find_map(|(i, allocation)| {
+                let start = allocation.as_ptr() as usize;
+                let end = start.checked_add(allocation.len().checked_mul(8)?)?;
+                (address >= start && address.checked_add(24).is_some_and(|tail| tail <= end))
+                    .then(|| (i, (address - start) / 8))
+            })
+        else {
+            return Err(TermError::BadArg);
+        };
+        let first_oh = self
+            .off_heap
+            .as_ref()
+            .map_or(0, |off_heap| off_heap.first_oh);
+        self.words[allocation_index][word_index + 2] = first_oh as u64;
+        let off_heap = self.off_heap();
+        off_heap.first_oh = address;
+        if let Some(mut owner) = owner {
+            owner.attach_to_bin_ref(bin_ref);
+            off_heap.binary_refs.push(owner);
+        }
+        Ok(())
+    }
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
-        self.off_heap().writable.push(binary);
+        drop(binary);
         Ok(())
     }
     fn supports_writable_binary(&self) -> bool {
@@ -1350,24 +1385,16 @@ impl StoredTerm {
 
     pub(crate) fn refc_binaries<H: HeapAlloc>(&self, dst: &mut H) -> Result<Vec<Term>, EtsError> {
         // Port of erts/emulator/beam/erl_bif_info.c:179 (`erts_bld_bin_list`),
-        // OTP-29.1.1. `Arc` owners model ProcBin references; the address is a
-        // stable per-binary identifier, since allocator addresses cannot match erts.
+        // OTP-29.1.1: report each BinRef from this DbTerm's first_oh chain.
         let Some(off_heap) = self.heap.off_heap.as_ref() else {
             return Ok(Vec::new());
         };
-        let mut terms = Vec::with_capacity(off_heap.binaries.len() + off_heap.writable.len());
-        for binary in &off_heap.binaries {
+        let mut terms = Vec::with_capacity(off_heap.binary_refs.len());
+        for binary in off_heap.binary_refs.iter().rev() {
             let mut builder = TermBuilder::new(dst);
-            let address = builder.int_from_i128(Arc::as_ptr(binary) as usize as i128)?;
-            let size = builder.int_from_i128(binary.len() as i128)?;
-            let refc = builder.int_from_i128(Arc::strong_count(binary) as i128)?;
-            terms.push(builder.tuple(&[address, size, refc])?);
-        }
-        for binary in &off_heap.writable {
-            let mut builder = TermBuilder::new(dst);
-            let address = builder.int_from_i128(Arc::as_ptr(binary) as usize as i128)?;
-            let size = builder.int_from_i128(binary.len() as i128)?;
-            let refc = builder.int_from_i128(Arc::strong_count(binary) as i128)?;
+            let address = builder.int_from_i128(binary.header_ptr() as usize as i128)?;
+            let size = builder.int_from_i128(binary.capacity().ok_or(EtsError::BadArg)? as i128)?;
+            let refc = builder.int_from_i128(binary.ref_count().ok_or(EtsError::BadArg)? as i128)?;
             terms.push(builder.tuple(&[address, size, refc])?);
         }
         Ok(terms)

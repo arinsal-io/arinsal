@@ -128,8 +128,65 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
+    fn alloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        self.0.alloc_with_extra(words, extra)
+    }
+    fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
+        self.0.alloc_fragment_only(words)
+    }
+    fn words_left(&self) -> Option<usize> {
+        self.0.words_left()
+    }
     fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(binary)
+    }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_term::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        self.0
+            .link_bin_ref(bin_ref, writable, overhead_words, owner)
+    }
+    fn add_bin_vheap(&mut self, words: u64) {
+        self.0.add_bin_vheap(words)
+    }
+    fn retain_writable_binary(
+        &mut self,
+        binary: Arc<arinsal_term::WritableBinary>,
+    ) -> Result<(), TermError> {
+        self.0.retain_writable_binary(binary)
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        binary: Arc<arinsal_term::WritableBinary>,
+        apparent_size_bits: usize,
+    ) -> Result<(), TermError> {
+        self.0
+            .retain_writable_binary_with_apparent_size(binary, apparent_size_bits)
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        self.0
+            .update_writable_binary_overhead(source, old_size_bits, new_size_bits)
+    }
+    fn supports_writable_binary(&self) -> bool {
+        self.0.supports_writable_binary()
+    }
+    fn retain_external_binary(
+        &mut self,
+        binary: Arc<arinsal_term::ExternalBinary>,
+    ) -> Result<(), TermError> {
+        self.0.retain_external_binary(binary)
+    }
+    fn supports_external_binary(&self) -> bool {
+        self.0.supports_external_binary()
     }
     fn retain_node(&mut self, node: Arc<arinsal_term::Node>) {
         self.0.retain_node(node)
@@ -139,6 +196,15 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
     }
     fn retain_export(&mut self, entry: Arc<arinsal_term::ExportEntry>) {
         self.0.retain_export(entry)
+    }
+    fn retain_magic(&mut self, owner: Arc<arinsal_term::MagicRef>) {
+        self.0.retain_magic(owner)
+    }
+    fn supports_magic(&self) -> bool {
+        self.0.supports_magic()
+    }
+    fn release(&mut self, end: *mut u64, start: *mut u64) {
+        self.0.release(end, start)
     }
 }
 
@@ -583,7 +649,7 @@ pub fn integer_to_binary<H: HeapAlloc + ?Sized>(
     // `erts_new_binary_from_data`. A bignum still goes through a digit string.
     let radix = base_value(base)?;
     if let Some(value) = int.as_small() {
-        let mut buf = [0_u8; 72];
+        let mut buf = [0_u8; 128];
         let digits = format_small(value, radix, &mut buf);
         let need = 2 + digits.len().div_ceil(8);
         return TermBuilder::new(&mut HeapProxy(heap))
@@ -599,20 +665,26 @@ pub fn integer_to_binary<H: HeapAlloc + ?Sized>(
 }
 
 /// Decimal or other-base digits of a small, written into `buf` from the end.
-// Port of erts/emulator/beam/big.c (`Sint_to_buf`), OTP-29.1.1.
-fn format_small(value: i64, base: u32, buf: &mut [u8; 72]) -> &[u8] {
+// Port of erts/emulator/beam/utils.c:2994-3035 (`Sint_to_buf`), OTP-29.1.1.
+fn format_small(value: i64, base: u32, buf: &mut [u8; 128]) -> &[u8] {
     const DIGITS: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    let mut magnitude = value.unsigned_abs();
     let mut index = buf.len();
-    loop {
+    let mut magnitude = value;
+    let mut negative = false;
+    if magnitude == 0 {
         index -= 1;
-        buf[index] = DIGITS[(magnitude % u64::from(base)) as usize];
-        magnitude /= u64::from(base);
-        if magnitude == 0 {
-            break;
-        }
+        buf[index] = b'0';
+    } else if magnitude < 0 {
+        negative = true;
+        magnitude = -magnitude;
     }
-    if value < 0 {
+    while magnitude != 0 {
+        index -= 1;
+        let digit = (magnitude % i64::from(base)) as usize;
+        buf[index] = DIGITS[digit];
+        magnitude /= i64::from(base);
+    }
+    if negative {
         index -= 1;
         buf[index] = b'-';
     }
@@ -690,6 +762,16 @@ pub fn integer_to_list_decimal<H: HeapAlloc + ?Sized>(int: Term, heap: &mut H) -
 }
 /// `integer_to_binary(Int)` in decimal.
 pub fn integer_to_binary_decimal<H: HeapAlloc + ?Sized>(int: Term, heap: &mut H) -> ArithResult {
+    // Port of erts/emulator/beam/binary.c:80-99 (`integer_to_binary`'s small decimal path),
+    // OTP-29.1.1. The /1 BIF supplies base 10 directly rather than decoding a base argument.
+    if let Some(value) = int.as_small() {
+        let mut buf = [0_u8; 128];
+        let digits = format_small(value, 10, &mut buf);
+        let need = 2 + digits.len().div_ceil(8);
+        return TermBuilder::new(&mut HeapProxy(heap))
+            .binary(digits)
+            .map_err(|error| construction_error(error, need));
+    }
     integer_to_binary(int, Term::small(10).unwrap(), heap)
 }
 /// `list_to_integer(List)` in decimal.

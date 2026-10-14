@@ -216,6 +216,20 @@ fn term_error(error: TermError, segment: usize, words: usize) -> BitsError {
     }
 }
 
+// Port of erts/emulator/beam/erl_bits.c:72 (`GROW_PROC_BIN_SIZE`), OTP-29.1.1.
+fn grow_proc_binary_size(size: usize) -> Result<usize, BitsError> {
+    if size <= 1 << 24 {
+        size.checked_mul(2)
+            .ok_or(BitsError::SystemLimit { segment: 1 })
+    } else {
+        let grown = (1.2 * size as f64) as usize;
+        if grown < size {
+            return Err(BitsError::SystemLimit { segment: 1 });
+        }
+        Ok(grown)
+    }
+}
+
 /// Borrow a bitstring's backing bytes for `f`.
 ///
 /// `start` is the first significant bit and `bits` is its length. The slice
@@ -536,45 +550,103 @@ pub fn create_utf_segment<H: HeapAlloc>(
         .map_err(|error| term_error(error, 1, 3))
 }
 
-/// Construct a bitstring after the caller has reserved `create_bin_size` words.
-/// An initial append segment grows a unique writer in place when possible.
-/// Two byte-aligned payloads in one buffer, sized with `GROW_PROC_BIN_SIZE`.
-///
-/// Port of erts/emulator/beam/erl_bits.c:72 and the append + `erts_bs_put_binary`
-/// copy in `erts_bs_append_checked`, OTP-29.1.1.
-pub fn concat_byte_buffers(prefix: Term, extra: Term) -> Option<Vec<u8>> {
-    let prefix_bits = bit_size(prefix)?;
-    let extra_bits = bit_size(extra)?;
-    if !prefix_bits.is_multiple_of(8) || !extra_bits.is_multiple_of(8) {
-        return None;
-    }
-    let total = prefix_bits / 8 + extra_bits / 8;
-    let cap = if total > (1 << 24) {
-        total + total / 5
-    } else {
-        total.saturating_mul(2)
+/// Concatenate byte-aligned payloads directly into their final heap or Binary allocation.
+// Port of erts/emulator/beam/erl_bits.c:72,1812-1917 (`GROW_PROC_BIN_SIZE` and
+// `erts_bs_append_checked`), OTP-29.1.1.
+pub fn concat_byte_binary<H: HeapAlloc>(
+    prefix: Term,
+    extra: Term,
+    heap: &mut H,
+) -> Result<Option<Term>, BitsError> {
+    let Some(prefix_bits) = bit_size(prefix) else {
+        return Ok(None);
     };
-    let mut out = Vec::with_capacity(cap);
-    let copied = with_binary(prefix, |payload, start, bits| {
-        if !start.is_multiple_of(8) || bits != prefix_bits {
-            return false;
-        }
-        let begin = start / 8;
-        out.extend_from_slice(&payload[begin..begin + bits / 8]);
-        true
-    })?;
-    if !copied {
-        return None;
+    let Some(extra_bits) = bit_size(extra) else {
+        return Ok(None);
+    };
+    if !prefix_bits.is_multiple_of(8) || !extra_bits.is_multiple_of(8) {
+        return Ok(None);
     }
-    let copied = with_binary(extra, |payload, start, bits| {
-        if !start.is_multiple_of(8) || bits != extra_bits {
-            return false;
+    let total = (prefix_bits / 8)
+        .checked_add(extra_bits / 8)
+        .ok_or(BitsError::SystemLimit { segment: 1 })?;
+    let Some(result) = with_binary(prefix, |left, left_start, left_bits| {
+        if !left_start.is_multiple_of(8) || left_bits != prefix_bits {
+            return Ok(None);
         }
-        let begin = start / 8;
-        out.extend_from_slice(&payload[begin..begin + bits / 8]);
-        true
-    })?;
-    copied.then_some(out)
+        let left = &left[left_start / 8..left_start / 8 + left_bits / 8];
+        let Some(result) = with_binary(extra, |right, right_start, right_bits| {
+            if !right_start.is_multiple_of(8) || right_bits != extra_bits {
+                return Ok(None);
+            }
+            let right = &right[right_start / 8..right_start / 8 + right_bits / 8];
+            let mut builder = TermBuilder::new(heap);
+            let term = if total <= 64 {
+                builder.heap_bitstring_from_parts(left, right, total * 8)
+            } else {
+                let capacity = grow_proc_binary_size(total)?.max(256);
+                builder.writable_binary_from_parts(left, right, capacity)
+            }
+            .map_err(|error| term_error(error, 1, 8))?;
+            Ok(Some(term))
+        }) else {
+            return Ok(None);
+        };
+        result
+    }) else {
+        return Ok(None);
+    };
+    result
+}
+
+/// Concatenate two whole byte binaries into the storage that will hold the result.
+// Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1442-1845 (`bs_create_bin`), OTP-29.1.1.
+fn concat_regular_byte_binaries<H: HeapAlloc>(
+    prefix: Term,
+    extra: Term,
+    heap: &mut H,
+) -> Result<Option<Term>, BitsError> {
+    let Some(prefix_bits) = bit_size(prefix) else {
+        return Ok(None);
+    };
+    let Some(extra_bits) = bit_size(extra) else {
+        return Ok(None);
+    };
+    if !prefix_bits.is_multiple_of(8) || !extra_bits.is_multiple_of(8) {
+        return Ok(None);
+    }
+    let total = prefix_bits
+        .checked_add(extra_bits)
+        .ok_or(BitsError::SystemLimit { segment: 1 })?;
+    let Some(result) = with_binary(prefix, |left, left_start, left_bits| {
+        if !left_start.is_multiple_of(8) || left_bits != prefix_bits {
+            return Ok(None);
+        }
+        let left = &left[left_start / 8..left_start / 8 + left_bits / 8];
+        let Some(result) = with_binary(extra, |right, right_start, right_bits| {
+            if !right_start.is_multiple_of(8) || right_bits != extra_bits {
+                return Ok(None);
+            }
+            let right = &right[right_start / 8..right_start / 8 + right_bits / 8];
+            let mut builder = TermBuilder::new(heap);
+            let term = if total / 8 <= 64 {
+                builder.heap_bitstring_from_parts(left, right, total)
+            } else {
+                builder.binary_from_fn(total / 8, |output| {
+                    output[..left.len()].copy_from_slice(left);
+                    output[left.len()..].copy_from_slice(right);
+                })
+            }
+            .map_err(|error| term_error(error, 1, 8))?;
+            Ok(Some(term))
+        }) else {
+            return Ok(None);
+        };
+        result
+    }) else {
+        return Ok(None);
+    };
+    result
 }
 
 pub fn create_bin<H: HeapAlloc>(segments: &[Segment<'_>], heap: &mut H) -> Result<Term, BitsError> {
@@ -648,6 +720,19 @@ pub fn create_bin<H: HeapAlloc>(segments: &[Segment<'_>], heap: &mut H) -> Resul
             .map_err(|e| term_error(e, segment.index, 2 + count.div_ceil(8)));
     }
     let size = create_bin_size(segments)?;
+    if let [prefix, extra] = segments
+        && prefix.ty == SegType::Binary
+        && extra.ty == SegType::Binary
+        && prefix.unit == 8
+        && extra.unit == 8
+        && matches!(prefix.size, SegSize::All)
+        && matches!(extra.size, SegSize::All)
+        && let SegmentValue::Term(prefix) = prefix.value
+        && let SegmentValue::Term(extra) = extra.value
+        && let Some(result) = concat_regular_byte_binaries(prefix, extra, heap)?
+    {
+        return Ok(result);
+    }
     if let Some(first) = segments.first()
         && matches!(first.ty, SegType::Append | SegType::PrivateAppend)
     {
@@ -671,11 +756,9 @@ pub fn create_bin<H: HeapAlloc>(segments: &[Segment<'_>], heap: &mut H) -> Resul
                 && suffix.ty == SegType::Binary
                 && matches!(suffix.size, SegSize::All)
                 && let Ok(extra) = source(suffix)
-                && let Some(built) = concat_byte_buffers(prefix, extra)
+                && let Some(built) = concat_byte_binary(prefix, extra, heap)?
             {
-                return TermBuilder::new(heap)
-                    .writable_from_vec(built, size.bits)
-                    .map_err(|e| term_error(e, first.index, 8));
+                return Ok(built);
             }
             let total_bytes = size.bits.div_ceil(8);
             let mut bytes = Vec::with_capacity(total_bytes.max(256));

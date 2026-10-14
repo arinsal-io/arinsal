@@ -33,5 +33,47 @@ run() ->
         .eval_scheduled("binary_iolist_differential", "run", &[], 1, None)
         .unwrap_or_else(|error| panic!("large iolist conversion: {error}"));
 
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+}
+
+#[test]
+fn binary_substring_and_conversion_entries_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping binary substring differential test");
+        return;
+    };
+    let source = r#"
+-module(binary_iolist_differential).
+-export([substrings/0]).
+
+substrings() ->
+    Small = <<0:512>>,
+    SmallPart = binary:part(Small, 1, 20),
+    SmallRangePart = erlang:binary_part(Small, {3, 20}),
+    Large = binary:copy(<<173>>, 1024),
+    LargePart = binary:part(Large, 11, 100),
+    LargeRangePart = erlang:binary_part(Large, {13, 100}),
+    HugeInteger = (1 bsl 1024) - 1,
+    Iolist = [[1, 2], [<<3, 4>>, [5, 6]]],
+    {binary:referenced_byte_size(SmallPart),
+     binary:referenced_byte_size(SmallRangePart),
+     binary:referenced_byte_size(LargePart),
+     binary:referenced_byte_size(LargeRangePart),
+     binary_to_list(LargePart, 2, 4),
+     iolist_size(Iolist), list_to_binary(Iolist),
+     integer_to_binary(-1234567890123), integer_to_binary(HugeInteger)}.
+"#;
+    let beam = reference
+        .compile_named("binary_iolist_differential", source, &[])
+        .unwrap();
+    reference.load("binary_iolist_differential", &beam).unwrap();
+    let expected = reference.call("binary_iolist_differential", "substrings", &[]);
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("binary_iolist_differential", "substrings", &[], 1, None)
+        .unwrap_or_else(|error| panic!("binary substring/conversion differential: {error}"));
+
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

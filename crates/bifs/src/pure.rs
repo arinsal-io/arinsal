@@ -20,7 +20,7 @@ use crate::{BifError, Class, Ctx};
 mod binary_bifs;
 pub use binary_bifs::{
     BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, allocate_iolist_binary,
-    finish_iolist_binary_output, with_iolist_binary_output,
+    binary_part_2, finish_iolist_binary_output, with_iolist_binary_output,
 };
 
 const BADARG: BifError = BifError::BADARG;
@@ -50,6 +50,18 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     }
     fn retain_binary(&mut self, value: Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(value)
+    }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_term::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        HeapAlloc::link_bin_ref(self.0, bin_ref, writable, overhead_words, owner)
+    }
+    fn add_bin_vheap(&mut self, words: u64) {
+        HeapAlloc::add_bin_vheap(self.0, words)
     }
     fn retain_writable_binary(
         &mut self,
@@ -155,6 +167,18 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for ConsBlock<'_, H> {
     }
     fn retain_binary(&mut self, value: Arc<arinsal_term::RefcBinary>) {
         self.backing.retain_binary(value)
+    }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_term::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        HeapAlloc::link_bin_ref(self.backing, bin_ref, writable, overhead_words, owner)
+    }
+    fn add_bin_vheap(&mut self, words: u64) {
+        HeapAlloc::add_bin_vheap(self.backing, words)
     }
     fn retain_writable_binary(
         &mut self,

@@ -427,9 +427,9 @@ fn copy_sub_bits<H: HeapAlloc + ?Sized>(
             std::ptr::copy_nonoverlapping(objp, to_sb, 5);
             *to_sb.add(4) = Term::from_ptr(to_br, 2).0;
             *argp = Term::from_ptr(to_sb, 2).0;
-            let (ptr, flags) =
-                crate::bits::clone_binary_owner(Term::from_ptr(underlying.cast_mut(), 2));
-            crate::bits::retain_cloned_binary_owner(dst, ptr, flags)?;
+            let (ptr, flags, overhead, owner) =
+                crate::bits::clone_binary_owner(Term::from_ptr(underlying.cast_mut(), 2))?;
+            crate::bits::retain_cloned_binary_owner(dst, to_br, ptr, flags, overhead, owner)?;
             return Ok(());
         }
         let start = *objp.add(2) as usize;
@@ -456,7 +456,7 @@ fn copy_sub_bits<H: HeapAlloc + ?Sized>(
     Ok(())
 }
 
-fn copy_binary_to_buffer(dst: &mut [u8], src: &[u8], src_offset: usize, size: usize) {
+pub(crate) fn copy_binary_to_buffer(dst: &mut [u8], src: &[u8], src_offset: usize, size: usize) {
     // Port of erts/emulator/beam/erl_bits.h:541 (`copy_binary_to_buffer`), OTP-29.1.1.
     // `src` / `dst` are the live windows the caller already bounded.
     if size == 0 {
@@ -738,8 +738,11 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                     BIN_REF => {
                         // SAFETY: a BinRef stores an Arc pointer selected by word two.
                         unsafe {
-                            let (ptr, flags) = crate::bits::clone_binary_owner(source);
-                            crate::bits::retain_cloned_binary_owner(dst, ptr, flags)?;
+                            let (ptr, flags, overhead, owner) =
+                                crate::bits::clone_binary_owner(source)?;
+                            crate::bits::retain_cloned_binary_owner(
+                                dst, to, ptr, flags, overhead, owner,
+                            )?;
                         }
                     }
                     // Port of erts/emulator/beam/copy.c:934-939 (copy_struct, magic ref), OTP-29.1.1.

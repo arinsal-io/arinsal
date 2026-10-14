@@ -797,24 +797,7 @@ fn binary_to_list_trap(
     if state.is_none() {
         let bif = arinsal_bifs::lookup("erlang", "binary_to_list", args.len() as u8)
             .ok_or(BifError::BADARG)?;
-        let reds_left = process.reductions.max(0) as usize;
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
-        ctx.set_reduction_budget(reds_left);
-        let value = bif(&mut ctx, args);
-        let value = value?;
-        return match ctx.take_deferred().map(|trap| *trap) {
-            Some(arinsal_bifs::DeferredTrap::BinaryToList(walk)) => Ok(HandlerResult::Yield {
-                continuation: BINARY_TO_LIST_CONTINUATION,
-                state: MagicRef::new(Mutex::new(walk)),
-                reductions: 0,
-            }),
-            Some(_) => Err(BifError::BADARG),
-            None => Ok(HandlerResult::Done {
-                value,
-                reductions: 0,
-            }),
-        };
+        return binary_to_list_start(process, args, bif, _pid, restore_gc);
     }
     let state = Arc::clone(state.ok_or(BifError::BADARG)?);
     let walk = state
@@ -836,6 +819,29 @@ fn binary_to_list_trap(
             state,
             reductions,
         })
+    }
+}
+
+fn binary_to_list_start(
+    process: &mut Process,
+    args: &[Term],
+    bif: arinsal_bifs::BifFn,
+    _pid: Option<arinsal_sched::Pid>,
+    _restore_gc: bool,
+) -> Result<HandlerResult, BifError> {
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+    ctx.set_reduction_budget(process.reductions.max(0) as usize);
+    let value = bif(&mut ctx, args)?;
+    let reductions = ctx.reductions();
+    match ctx.take_deferred().map(|trap| *trap) {
+        Some(arinsal_bifs::DeferredTrap::BinaryToList(walk)) => Ok(HandlerResult::Yield {
+            continuation: BINARY_TO_LIST_CONTINUATION,
+            state: MagicRef::new(Mutex::new(walk)),
+            reductions,
+        }),
+        Some(_) => Err(BifError::BADARG),
+        None => Ok(HandlerResult::Done { value, reductions }),
     }
 }
 
@@ -1614,6 +1620,14 @@ pub(crate) struct MapsValues;
 pub(crate) struct MapsMerge;
 /// `maps:from_list/1`.
 pub(crate) struct MapsFromList;
+/// `binary_to_list/1,3`.
+pub(crate) struct BinaryToList<B>(std::marker::PhantomData<fn() -> B>);
+/// `list_to_binary/1` and `binary:list_to_bin/1`.
+pub(crate) struct ListToBinary;
+/// `iolist_to_binary/1`.
+pub(crate) struct IolistToBinary;
+/// `iolist_size/1`.
+pub(crate) struct IolistSize;
 
 impl TrapBody for MapsKeys {
     fn run(
@@ -1656,6 +1670,54 @@ impl TrapBody for MapsFromList {
         restore_gc: bool,
     ) -> Result<HandlerResult, BifError> {
         maps_from_list(process, args, None, pid, restore_gc)
+    }
+}
+
+impl<B: arinsal_bifs::BifBody> TrapBody for BinaryToList<B> {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        // Port of erts/emulator/beam/binary.c:202-239 (`binary_to_list_1/3`), OTP-29.1.1.
+        binary_to_list_start(process, args, B::call, pid, restore_gc)
+    }
+}
+
+impl TrapBody for ListToBinary {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        // Port of erts/emulator/beam/erl_iolist.c:857-935 (`list_to_bitstring_bif`), OTP-29.1.1.
+        list_to_binary(process, args, None, pid, restore_gc)
+    }
+}
+
+impl TrapBody for IolistToBinary {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        // Port of erts/emulator/beam/erl_iolist.c:916-927 (iolist_to_binary_1), OTP-29.1.1.
+        iolist_to_binary(process, args, None, pid, restore_gc)
+    }
+}
+
+impl TrapBody for IolistSize {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        // Port of erts/emulator/beam/erl_iolist.c:938-1093 (`iolist_size_1`), OTP-29.1.1.
+        iolist_size(process, args, None, pid, restore_gc)
     }
 }
 
@@ -2199,11 +2261,91 @@ fn iolist_binary_conversion(
     _restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
     const SIZE_YIELDS_PER_RED: usize = 8;
-    let state = state.map(Arc::clone).unwrap_or_else(|| {
-        MagicRef::new(Mutex::new(IolistBinaryPhase::Size(
-            arinsal_bifs::IolistSizeWalk::new(root),
-        )))
-    });
+    if state.is_none() {
+        let mut walk = arinsal_bifs::IolistSizeWalk::new(root);
+        let initial_yield_count =
+            (process.reductions.max(0) as usize).saturating_mul(SIZE_YIELDS_PER_RED);
+        let (done, work) = match walk.step(initial_yield_count) {
+            Ok(progress) => progress,
+            Err((error, work)) => {
+                return Ok(HandlerResult::Failed {
+                    error,
+                    reductions: work.div_ceil(SIZE_YIELDS_PER_RED) as u32,
+                });
+            }
+        };
+        let size_reductions = work.div_ceil(SIZE_YIELDS_PER_RED);
+        if !done {
+            return Ok(HandlerResult::Yield {
+                continuation: IOLIST_CONTINUATION,
+                state: MagicRef::new(Mutex::new(IolistBinaryPhase::Size(walk))),
+                reductions: size_reductions as u32,
+            });
+        }
+        let byte_len = walk.take_size();
+        let output = arinsal_bifs::allocate_iolist_binary(
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            byte_len,
+        )?;
+        if byte_len == 0 {
+            return Ok(HandlerResult::Done {
+                value: output,
+                reductions: size_reductions as u32,
+            });
+        }
+        let mut copy = arinsal_bifs::IolistCopyWalk::new(root);
+        let available_reductions =
+            (process.reductions.max(0) as usize).saturating_sub(size_reductions);
+        if available_reductions == 0 {
+            return Ok(HandlerResult::Yield {
+                continuation: IOLIST_CONTINUATION,
+                state: MagicRef::new(Mutex::new(IolistBinaryPhase::Copy {
+                    output,
+                    byte_len,
+                    walk: copy,
+                })),
+                reductions: size_reductions as u32,
+            });
+        }
+        let yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
+        let (done, work) = match arinsal_bifs::with_iolist_binary_output(output, |bytes| {
+            Ok(copy.step(bytes, yield_count))
+        })? {
+            Ok(progress) => progress,
+            Err((error, work)) => {
+                arinsal_bifs::finish_iolist_binary_output(output);
+                return Ok(HandlerResult::Failed {
+                    error,
+                    reductions: (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32,
+                });
+            }
+        };
+        let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
+        if !done {
+            return Ok(HandlerResult::Yield {
+                continuation: IOLIST_CONTINUATION,
+                state: MagicRef::new(Mutex::new(IolistBinaryPhase::Copy {
+                    output,
+                    byte_len,
+                    walk: copy,
+                })),
+                reductions,
+            });
+        }
+        if copy.written() != byte_len {
+            arinsal_bifs::finish_iolist_binary_output(output);
+            return Ok(HandlerResult::Failed {
+                error: BifError::SystemLimit,
+                reductions,
+            });
+        }
+        arinsal_bifs::finish_iolist_binary_output(output);
+        return Ok(HandlerResult::Done {
+            value: output,
+            reductions,
+        });
+    }
+    let state = Arc::clone(state.expect("resumed iolist conversion has state"));
     let phase = state
         .downcast_ref::<Mutex<IolistBinaryPhase>>()
         .ok_or(BifError::BADARG)?;

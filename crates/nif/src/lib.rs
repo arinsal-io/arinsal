@@ -256,6 +256,21 @@ impl HeapAlloc for EnvHeap {
             Self::Bound(h) => Self::bound_mut(*h).retain_binary(x),
         }
     }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_term::OwnedBinaryRef>,
+    ) -> Result<(), arinsal_term::TermError> {
+        match self {
+            Self::Owned(h) => h.link_bin_ref(bin_ref, writable, overhead_words, owner),
+            Self::Bound(h) => {
+                // SAFETY: The bound heap remains live and exclusive for this callback.
+                unsafe { (&mut **h).link_bin_ref(bin_ref, writable, overhead_words, owner) }
+            }
+        }
+    }
     fn retain_writable_binary(
         &mut self,
         x: Arc<WritableBinary>,

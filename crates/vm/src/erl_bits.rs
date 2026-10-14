@@ -3,10 +3,10 @@
 //! Port of erts/emulator/beam/erl_bits.c:1725 (`erts_bs_append_checked`) for the
 //! `<<Bin/binary, Bin2/binary>>` shape the compiler lowers to append + one binary.
 
-use crate::native_hooks::{from_raw, process_from_header, raw, set_error};
+use crate::native_hooks::{enter_runtime, from_raw, process_from_header, raw, set_error};
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_bits::{BitsError, SegFlags, SegSize, SegType, Segment, SegmentValue};
-use arinsal_term::{HeapAlloc, Term, TermBuilder, TermError};
+use arinsal_term::{HeapAlloc, Term};
 
 /// `erts_bs_private_append` charges the used-size delta on the process vheap.
 /// Port of erts/emulator/beam/erl_bits.c:1961 (`update_wb_overhead`), OTP-29.1.1.
@@ -36,7 +36,7 @@ pub extern "C" fn append_binary(
     extra_index: u64,
     live: u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
+    let Some((process, registers)) = enter_runtime(header) else {
         return 0;
     };
     process
@@ -57,46 +57,27 @@ pub extern "C" fn append_binary(
         set_error(process, "system_limit");
         return 0;
     }
+    // Port of `erts_bs_append_checked`'s ERL_REFC_BITS_SIZE heap request: BinRef + SubBits.
+    // `<<Bin/binary, Bin2/binary>>` fills one destination with the two source ranges.
+    if process
+        .ensure_native_roots(8, &mut registers.x_reg_array, root_live)
+        .is_ok()
+        && let Ok(Some(term)) = arinsal_bits::concat_byte_binary(
+            registers.x_reg_array[src_index],
+            registers.x_reg_array[extra_index],
+            &mut process.heap,
+        )
+    {
+        registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+        process.sync_native_header();
+        return raw(term);
+    }
     if process.x.len() < root_live {
         let mut x = process.x.to_vec();
         x.resize(root_live, Term::NIL);
         process.x = x.into();
     }
-    for (index, slot) in registers.x_reg_array[..root_live].iter().enumerate() {
-        process.x[index] = *slot;
-    }
-    // `<<Bin/binary, Bin2/binary>>`: one buffer and two copies, then the
-    // generic builder if the pieces are not whole bytes or the heap is short.
-    if process.ensure(8, root_live).is_ok()
-        && let Some(bytes) =
-            arinsal_bits::concat_byte_buffers(process.x[src_index], process.x[extra_index])
-    {
-        let bits = bytes.len() * 8;
-        match TermBuilder::new(&mut process.heap).writable_from_vec(bytes, bits) {
-            Ok(term) => {
-                for (slot, term) in registers.x_reg_array[..root_live]
-                    .iter_mut()
-                    .zip(process.x.iter())
-                {
-                    *slot = *term;
-                }
-                registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-                process.sync_native_header();
-                return raw(term);
-            }
-            Err(TermError::HeapFull) => {}
-            Err(TermError::SystemLimit) => {
-                set_error(process, "system_limit");
-                registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-                return 0;
-            }
-            Err(TermError::BadArg | TermError::Unsupported(_)) => {
-                set_error(process, "badarg");
-                registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-                return 0;
-            }
-        }
-    }
+    process.x[..root_live].copy_from_slice(&registers.x_reg_array[..root_live]);
     let build = |src: Term, extra: Term| {
         [
             Segment {

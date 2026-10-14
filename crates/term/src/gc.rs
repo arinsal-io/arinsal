@@ -7,7 +7,9 @@
 //! current stack block are rebased; code pointers and CATCH words remain intact.
 
 use crate::VecHeap;
-use crate::bits::{binary_data, writable_gc_visit};
+use crate::bits::{
+    BINARY_FLAG_WRITABLE, bin_ref_is_legacy_external, binary_data, writable_gc_visit,
+};
 use crate::hamt::{boxed_object_words, boxed_term_range};
 use crate::{
     ARITY, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, ExternalBinary, FUN,
@@ -85,6 +87,15 @@ impl HeapAlloc for FragmentAlloc<'_> {
     fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         HeapAlloc::retain_binary(self.0, binary);
     }
+    fn link_bin_ref(
+        &mut self,
+        bin_ref: *mut u64,
+        writable: bool,
+        overhead_words: u64,
+        owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
+    ) -> Result<(), TermError> {
+        HeapAlloc::link_bin_ref(self.0, bin_ref, writable, overhead_words, owner)
+    }
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
         HeapAlloc::retain_writable_binary(self.0, binary)
     }
@@ -152,6 +163,65 @@ struct HeapTop {
     end: usize,
 }
 
+fn binref_chain_nodes(mut link: usize) -> Vec<usize> {
+    let mut nodes = Vec::new();
+    while link != 0 {
+        assert!(
+            nodes.len() < 1_000_000,
+            "cycle in BinRef chain before heap resize"
+        );
+        nodes.push(link);
+        link = crate::heap::load((link as *const u64).wrapping_add(2)) as usize;
+    }
+    nodes
+}
+
+fn rebase_binref_chains(
+    heap: &mut ProcessHeap,
+    nodes: &[usize],
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+) {
+    let rebase = |address: usize| {
+        if address >= old_start && address < old_end {
+            new_start + (address - old_start)
+        } else {
+            address
+        }
+    };
+    heap.owners.off_heap_first = rebase(heap.owners.off_heap_first);
+    heap.owners.wrt_bins = rebase(heap.owners.wrt_bins);
+    for &old_node in nodes {
+        let node = rebase(old_node) as *mut u64;
+        let next = crate::heap::load(node.wrapping_add(2)) as usize;
+        crate::heap::store(node.wrapping_add(2), rebase(next) as u64);
+    }
+}
+
+/// Release one refc Binary reference represented by a live BinRef chain.
+// Port of erts/emulator/beam/erl_binary.h:390 (`erts_bin_release`), OTP-29.1.1.
+pub(crate) fn release_binary_chain(mut head: usize) {
+    while head != 0 {
+        let ptr = head as *const u64;
+        let next = crate::heap::load(ptr.wrapping_add(2)) as usize;
+        release_binary_ref(head);
+        head = next;
+    }
+}
+
+fn release_binary_ref(bin_ref: usize) {
+    let ptr = bin_ref as *const u64;
+    let header = crate::heap::load(ptr.wrapping_add(1)) as *const u64;
+    let capacity = crate::heap::load(header.wrapping_add(3)) as usize;
+    // SAFETY: callers own the live heap or fragment containing this BinRef; its val field
+    // names the refcounted Binary kept by that BinRef.
+    let view =
+        unsafe { arinsal_alloc::raw::BinaryView::from_header(header, 4 + capacity.div_ceil(8)) };
+    arinsal_alloc::typed::BinaryBlock::release_view(view)
+        .expect("live BinRef has allocator metadata");
+}
+
 struct Copier<'a> {
     from: &'a mut ProcessHeap,
     to: &'a mut ProcessHeap,
@@ -168,7 +238,6 @@ struct Copier<'a> {
     #[cfg(debug_assertions)]
     fragment_ranges: Vec<(usize, usize)>,
     sub_bits: Vec<Term>,
-    writable_refs: Vec<Term>,
     error: Option<TermError>,
 }
 
@@ -366,12 +435,12 @@ impl Copier<'_> {
 
     fn retain_owner(&mut self, header: u64, ptr: *mut u64, term: Term, promote: bool) {
         // SAFETY: `ptr` is a complete copied object with the owner field in word one.
-        let key = unsafe { *ptr.add(1) } as usize;
+        let key = crate::heap::load(ptr.wrapping_add(1)) as usize;
         match header & 63 {
             BIN_REF => {
-                // SAFETY: BinRef word two contains its writable flag.
-                let flags = unsafe { *ptr.add(2) };
-                if flags & 0x100 != 0 {
+                // SAFETY: BinRef word two is either the legacy external tag or an intrusive next.
+                let next_or_flags = unsafe { *ptr.add(2) };
+                if bin_ref_is_legacy_external(next_or_flags) {
                     let target = if promote {
                         &mut self.to.owners.old_external
                     } else {
@@ -394,60 +463,40 @@ impl Copier<'_> {
                             self.error = Some(TermError::BadArg);
                         }
                     }
-                } else if flags & 1 != 0 {
-                    let target = if promote {
-                        &mut self.to.owners.old_writable
-                    } else {
-                        &mut self.to.owners.writable
-                    };
-                    if !target.iter().any(|arc| Arc::as_ptr(arc) as usize == key) {
-                        let owner = self
-                            .from
-                            .owners
-                            .writable
-                            .iter()
-                            .chain(&self.from.owners.old_writable)
-                            .find(|arc| Arc::as_ptr(arc) as usize == key)
-                            .cloned();
-                        if let Some(owner) = owner {
-                            let capacity = owner.capacity();
-                            target.push(owner);
-                            let vheap_words = (capacity / 8) as u64;
-                            self.to.add_vheap(promote, vheap_words);
-                            if promote {
-                                self.to.owners.old_writable_refs.push(term);
-                            } else {
-                                self.writable_refs.push(term);
-                            }
-                        } else {
-                            self.error = Some(TermError::BadArg);
-                        }
-                    }
                 } else {
-                    let target = if promote {
-                        &mut self.to.owners.old_off_heap
-                    } else {
-                        &mut self.to.owners.off_heap
+                    // BinRef.val points directly at the erts Binary header.
+                    // SAFETY: the copied BinRef retains the source Binary allocation.
+                    let binary_flags = unsafe { *(key as *const u64) };
+                    let writable = binary_flags & BINARY_FLAG_WRITABLE != 0;
+                    // SAFETY: the same live Binary header contains `orig_size` in word three.
+                    let orig_size = unsafe { *((key as *const u64).add(3)) } as usize;
+                    // Port of erts/emulator/beam/erl_gc.c:3155-3178 (writable BinRef sweep),
+                    // OTP-29.1.1: the vheap charges allocated Binary.orig_size, not apparent size.
+                    let overhead_words = (orig_size / 8) as u64;
+                    // SAFETY: the source BinRef owns this Binary through the collection.
+                    let view = unsafe {
+                        arinsal_alloc::raw::BinaryView::from_header(
+                            key as *const u64,
+                            4 + orig_size.div_ceil(8),
+                        )
                     };
-                    // erts keeps one ProcBin per reference in the MSO list (sweep_off_heap),
-                    // so refc binaries are not deduplicated per Binary.
+                    let Some(owner) = arinsal_alloc::raw::OwnedBinaryRef::clone_from_view(view)
+                    else {
+                        self.error = Some(TermError::BadArg);
+                        return;
+                    };
+                    if self
+                        .to
+                        .link_bin_ref(ptr, writable, overhead_words, Some(owner))
+                        .is_err()
                     {
-                        let owner = self
-                            .from
-                            .owners
-                            .off_heap
-                            .iter()
-                            .chain(&self.from.owners.old_off_heap)
-                            .find(|arc| Arc::as_ptr(arc) as usize == key)
-                            .cloned();
-                        if let Some(owner) = owner {
-                            let vheap_words = (owner.len() / 8) as u64;
-                            target.push(owner);
-                            self.to.add_vheap(promote, vheap_words);
-                        } else {
-                            self.error = Some(TermError::BadArg);
-                        }
+                        self.error = Some(TermError::BadArg);
                     }
+                    if writable {
+                        self.to.add_vheap(promote, overhead_words);
+                        return;
+                    }
+                    self.to.add_vheap(promote, overhead_words);
                 }
             }
             EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
@@ -541,17 +590,21 @@ impl Copier<'_> {
     }
 
     fn finish_bits(&mut self) {
-        // OTP visits writable owners even when their BinRefs are already old.
-        // A volatile SUB_BITS resolves the current byte pointer through BinRef;
-        // match contexts pin their owner before becoming mutable.
-        for &bin_ref in self
-            .writable_refs
-            .iter()
-            .chain(&self.to.owners.old_writable_refs)
-        {
-            // SAFETY: The process is stopped and each referenced owner is retained.
-            unsafe { writable_gc_visit(bin_ref) };
+        // Port of erts/emulator/beam/erl_gc.c:3149-3157 (wrt_bins traversal), OTP-29.1.1.
+        // Visit every live writable BinRef, including entries that stayed in the old heap.
+        if self.to.owners.is_allocated() {
+            let mut writable = self.to.owners.wrt_bins as *mut u64;
+            while !writable.is_null() {
+                // SAFETY: sweep_off_heap linked only retained, complete BinRef objects here.
+                unsafe {
+                    let next = *writable.add(2) as *mut u64;
+                    writable_gc_visit(Term::from_ptr(writable, 2));
+                    writable = next;
+                }
+            }
         }
+        // Match contexts pin their owner before becoming mutable; a volatile SUB_BITS
+        // resolves the current byte pointer through its BinRef after any realloc.
         for &sub in &self.sub_bits {
             // SAFETY: Its orig field has been rewritten by the scan; the owner is live.
             unsafe {
@@ -564,6 +617,90 @@ impl Copier<'_> {
                 };
                 *ptr.add(1) = (base as u64 & !3) | (*ptr.add(1) & 3);
             }
+        }
+    }
+
+    /// Keep moved and old BinRefs, and release unreachable young BinRefs.
+    // Port of erts/emulator/beam/erl_gc.c:2996-3150 (sweep_off_heap), OTP-29.1.1.
+    fn sweep_binary_chain(&mut self, writable: bool) {
+        let source_head = if writable {
+            self.from.owners.wrt_bins
+        } else {
+            self.from.owners.off_heap_first
+        };
+        if source_head == 0 && !self.to.owners.is_allocated() {
+            return;
+        }
+        let mut old_head = 0usize;
+        let mut old_tail = 0usize;
+        let mut source = source_head;
+        while source != 0 {
+            let ptr = source as *mut u64;
+            // SAFETY: the source chain contains live three-word BinRef objects in heap or
+            // fragment storage; the collector has exclusive access while forwarding them.
+            let thing = crate::heap::load(ptr);
+            let next = crate::heap::load(ptr.wrapping_add(2)) as usize;
+            let moved = thing & 3 == 2;
+            if moved {
+                self.release_swept_bin_ref(source);
+            } else if !self.major && self.old.contains(source) {
+                // Minor GC leaves old-generation BinRefs in place. Build the retained old
+                // suffix in source-list order, matching `insert_old_here` in erts.
+                if old_head == 0 {
+                    old_head = source;
+                } else {
+                    crate::heap::store((old_tail as *mut u64).wrapping_add(2), source as u64);
+                }
+                old_tail = source;
+            } else {
+                self.release_swept_bin_ref(source);
+            }
+            source = next;
+        }
+
+        // The retained suffix was spliced into the destination chain above; all other
+        // source references were released while sweeping.
+        if writable {
+            self.from.owners.wrt_bins = 0;
+        } else {
+            self.from.owners.off_heap_first = 0;
+        }
+
+        let destination_head = if writable {
+            &mut self.to.owners.wrt_bins
+        } else {
+            &mut self.to.owners.off_heap_first
+        };
+        if old_head != 0 {
+            if *destination_head == 0 {
+                *destination_head = old_head;
+            } else {
+                let mut tail = *destination_head;
+                loop {
+                    // SAFETY: destination_head and every next link point to live BinRefs.
+                    let next = crate::heap::load((tail as *const u64).wrapping_add(2)) as usize;
+                    if next == 0 {
+                        break;
+                    }
+                    tail = next;
+                }
+                crate::heap::store((tail as *mut u64).wrapping_add(2), old_head as u64);
+            }
+            crate::heap::store((old_tail as *mut u64).wrapping_add(2), 0);
+        }
+    }
+
+    fn release_swept_bin_ref(&mut self, source: usize) {
+        release_binary_ref(source);
+    }
+
+    /// Sweep the refc list, then the separate writable list, before releasing from-space.
+    // Port of erts/emulator/beam/erl_gc.c:2996-3289 (sweep_off_heap), OTP-29.1.1.
+    fn sweep_off_heap(&mut self) {
+        self.sweep_binary_chain(false);
+        self.sweep_binary_chain(true);
+        if self.to.owners.is_allocated() {
+            self.to.owners.overhead = self.to.bin_vheap;
         }
     }
 }
@@ -1108,8 +1245,8 @@ impl ProcessHeap {
             ranges.sort_unstable_by_key(|&(start, _)| start);
             ranges
         };
-        // `MSO(p).overhead` before the sweep; erl_gc.c:3285 sizes the old virtual heap from it.
-        let young_overhead = self.bin_vheap;
+        // `erl_gc.c:3285` sizes the old virtual heap from MSO(p).overhead before sweep_off_heap.
+        let off_heap_overhead = self.owners.overhead;
         let major = self.collection_is_major() || self.minor_falls_back_to_major();
         let stack = self.stack_words();
         let source_words = self
@@ -1174,14 +1311,11 @@ impl ProcessHeap {
             }
             next.old_htop = self.old_htop;
             if copy_old_owner_state {
-                next.owners.old_off_heap = std::mem::take(&mut self.owners.old_off_heap);
-                next.owners.old_writable = std::mem::take(&mut self.owners.old_writable);
                 next.owners.old_external = std::mem::take(&mut self.owners.old_external);
                 next.owners.old_nodes = std::mem::take(&mut self.owners.old_nodes);
                 next.owners.old_funs = std::mem::take(&mut self.owners.old_funs);
                 next.owners.old_exports = std::mem::take(&mut self.owners.old_exports);
                 next.owners.old_magic = std::mem::take(&mut self.owners.old_magic);
-                next.owners.old_writable_refs = std::mem::take(&mut self.owners.old_writable_refs);
             }
         }
         let mut from = std::mem::replace(self, next);
@@ -1243,7 +1377,6 @@ impl ProcessHeap {
             #[cfg(debug_assertions)]
             fragment_ranges,
             sub_bits: Vec::new(),
-            writable_refs: Vec::new(),
             error: None,
         };
         for root in roots.iter_mut().chain(extra.iter_mut()) {
@@ -1281,6 +1414,7 @@ impl ProcessHeap {
         copier.sweep::<true>(tenured_from);
         copier.to.htop = (copier.n_htop.at - n_heap) / 8;
         copier.to.old_htop = (copier.old_htop.at - old_heap) / 8;
+        copier.sweep_off_heap();
         copier.finish_bits();
         copier.to.high_water = copier.to.htop;
         let error = copier.error.take();
@@ -1330,7 +1464,7 @@ impl ProcessHeap {
         if major && self.owners.is_allocated() {
             self.owners.vheap.old = 0;
             self.owners.vheap.old_size = next_vheap_size(
-                young_overhead,
+                off_heap_overhead,
                 self.owners.vheap_old_size(),
                 self.owners.vheap_min(),
             );
@@ -1476,6 +1610,9 @@ impl ProcessHeap {
                 offset_young_objects(base, words, range.old_start, range.old_end, range.new_start);
                 term.0 = offset_word(term.0, *range);
             }
+            // The message heap is released after this loop. Its BinRef nodes live in
+            // the copied blocks too, so move both intrusive lists before adopting them.
+            rebase_binref_chains_to_ranges(&mut fragment, &ranges);
             self.absorb_fragment_owners(&mut fragment);
         }
         // Port of erts/emulator/beam/erl_gc.c:203-217 (move_msgs_to_heap), OTP-29.1.1.
@@ -1498,6 +1635,8 @@ impl ProcessHeap {
             return;
         }
         let prev_heap = self.words.as_ptr() as usize;
+        let mut binref_nodes = binref_chain_nodes(self.owners.off_heap_first);
+        binref_nodes.extend(binref_chain_nodes(self.owners.wrt_bins));
         let prev_stop = self.stop;
         let prev_stack = prev_heap + prev_stop * 8;
         let prev_stack_end = prev_heap + prev_len * 8;
@@ -1511,6 +1650,15 @@ impl ProcessHeap {
         }
         self.words.realloc(new_words);
         let new_heap = self.words.as_ptr() as usize;
+        if new_heap != prev_heap {
+            rebase_binref_chains(
+                self,
+                &binref_nodes,
+                prev_heap,
+                prev_heap.saturating_add(prev_len.saturating_mul(8)),
+                new_heap,
+            );
+        }
         let new_stop = new_words - stack;
         if new_words > prev_len {
             // Realloc leaves the stack at its old index (or copies it there). Slide it to the end.
@@ -1647,6 +1795,37 @@ struct MoveRange {
     old_start: usize,
     old_end: usize,
     new_start: usize,
+}
+
+// Port of erts/emulator/beam/erl_gc.c:2514-2611 (erts_copy_one_frag off-heap links),
+// OTP-29.1.1. The source fragment is freed after its terms and off-heap ownership are adopted.
+fn rebase_binref_chains_to_ranges(heap: &mut ProcessHeap, ranges: &[MoveRange]) {
+    let Some(owners) = heap.owners.as_mut() else {
+        return;
+    };
+    let nodes = binref_chain_nodes(owners.off_heap_first)
+        .into_iter()
+        .chain(binref_chain_nodes(owners.wrt_bins))
+        .collect::<Vec<_>>();
+    let rebase = |address: usize| {
+        if address == 0 {
+            return 0;
+        }
+        ranges
+            .iter()
+            .find_map(|range| {
+                (address >= range.old_start && address < range.old_end)
+                    .then_some(range.new_start + address - range.old_start)
+            })
+            .expect("message BinRef chain points outside copied heap fragments")
+    };
+    owners.off_heap_first = rebase(owners.off_heap_first);
+    owners.wrt_bins = rebase(owners.wrt_bins);
+    for source in nodes {
+        let destination = rebase(source) as *mut u64;
+        let next = crate::heap::load((source as *const u64).wrapping_add(2)) as usize;
+        crate::heap::store(destination.wrapping_add(2), rebase(next) as u64);
+    }
 }
 
 fn offset_word(word: u64, range: MoveRange) -> u64 {
