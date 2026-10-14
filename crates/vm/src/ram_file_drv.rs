@@ -2,8 +2,7 @@
 //!
 //! Port of `erts/emulator/drivers/common/ram_file_drv.c`, OTP-29.1.1.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use crate::port::PortHandle;
 
@@ -42,49 +41,30 @@ struct RamFile {
     end: i64,
 }
 
-struct RamPort {
+/// Per-port driver data, stored in the owning [`PortHandle`].
+// erts keeps this in the `RamFile` that `rfile_start` allocates as the port's `drv_data`.
+pub(crate) struct RamPort {
     file: Mutex<RamFile>,
-    handle: Arc<PortHandle>,
     binary: bool,
 }
 
-fn ports() -> &'static Mutex<HashMap<u64, Arc<RamPort>>> {
-    static PORTS: OnceLock<Mutex<HashMap<u64, Arc<RamPort>>>> = OnceLock::new();
-    PORTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Register state created by `rfile_start`.
+/// Create the state allocated by `rfile_start`.
 // Port of erts/emulator/drivers/common/ram_file_drv.c:173-187 (rfile_start), OTP-29.1.1.
-pub(crate) fn attach(id: u64, handle: Arc<PortHandle>, binary: bool) {
-    ports().lock().unwrap().insert(
-        id,
-        Arc::new(RamPort {
-            file: Mutex::new(RamFile {
-                flags: 0,
-                buffer: Vec::new(),
-                position: 0,
-                end: 0,
-            }),
-            handle,
-            binary,
+pub(crate) fn start(binary: bool) -> Arc<RamPort> {
+    Arc::new(RamPort {
+        file: Mutex::new(RamFile {
+            flags: 0,
+            buffer: Vec::new(),
+            position: 0,
+            end: 0,
         }),
-    );
-}
-
-/// Release the state freed by `rfile_stop`.
-// Port of erts/emulator/drivers/common/ram_file_drv.c:189-195 (rfile_stop), OTP-29.1.1.
-pub(crate) fn detach(id: u64) {
-    ports().lock().unwrap().remove(&id);
-}
-
-pub(crate) fn owns(id: u64) -> bool {
-    ports().lock().unwrap().contains_key(&id)
+        binary,
+    })
 }
 
 /// Run one `rfile_command` and deliver its encoded driver reply to the connected process.
 // Port of erts/emulator/drivers/common/ram_file_drv.c:397-531 (rfile_command), OTP-29.1.1.
-pub(crate) fn command(id: u64, bytes: &[u8]) -> Result<(), ()> {
-    let port = ports().lock().unwrap().get(&id).cloned().ok_or(())?;
+pub(crate) fn command(port: &RamPort, handle: &PortHandle, bytes: &[u8]) -> Result<(), ()> {
     let Some((&op, args)) = bytes.split_first() else {
         return Ok(());
     };
@@ -93,14 +73,9 @@ pub(crate) fn command(id: u64, bytes: &[u8]) -> Result<(), ()> {
         if matches!(op, RAM_FILE_READ | RAM_FILE_PREAD | RAM_FILE_GET)
             && reply.first() == Some(&RAM_FILE_RESP_DATA)
         {
-            crate::port::static_driver_output_binary(
-                &port.handle,
-                &reply[..5],
-                &reply[5..],
-                port.binary,
-            );
+            crate::port::static_driver_output_binary(handle, &reply[..5], &reply[5..], port.binary);
         } else {
-            crate::port::static_driver_output(&port.handle, &reply);
+            crate::port::static_driver_output(handle, &reply);
         }
     }
     Ok(())
