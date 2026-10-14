@@ -63,7 +63,7 @@ force() ->
 
 fd_close() ->
     P = open_port({fd, 0, 2}, []),
-    port_close(P).
+    try port_close(P) catch error:badarg -> true end.
 
 fd_hold(ReadFd, WriteFd) ->
     P = open_port({fd, ReadFd, WriteFd}, [eof]),
