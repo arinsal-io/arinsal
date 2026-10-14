@@ -1816,14 +1816,11 @@ impl Vm {
         let (mut htop, mut stop) = p.heap.heap_cursor();
         let mut heap_dirty = false;
         let mut depth = p.heap.stack_words();
-        // The slice quantum is `budget`. A trapping BIF that already spent FCALLS
-        // left `p.reductions` at 0; the continuation would then trap again with an
-        // empty scan. Port of erl_process.c:10435 (`p->fcalls = reds`), OTP-29.1.1.
-        if p.reductions <= 0 {
-            let installed = i32::try_from(budget).unwrap_or(i32::MAX);
-            if installed > 0 {
-                p.reductions = installed;
-            }
+        // The slice quantum is `budget`: a process scheduled in starts with a full counter,
+        // so a BIF's charge is clamped by the quantum, not by what an earlier slice left.
+        let installed = i32::try_from(budget).unwrap_or(i32::MAX);
+        if installed > 0 {
+            p.reductions = installed;
         }
         let mut reds = p.reductions;
         let mut consumed = 0_u32;
