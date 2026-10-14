@@ -301,64 +301,154 @@ fn iolist_to_binary_result(ctx: &mut Ctx<'_>, root: Term) -> Result<Term, BifErr
     Ok(result)
 }
 
-// Port of erts/emulator/beam/erl_iolist.c:1116-1180 (iolist_to_iovec_engine), OTP-29.1.1.
+/// Bits at or below which `iolist_to_iovec/1` copies a binary into the shared run.
+// Port of erts/emulator/beam/erl_iolist.c:37 (IOL2V_COPY_THRESHOLD), OTP-29.1.1.
+const IOL2V_COPY_THRESHOLD_BITS: usize = 64 * 8 * 8;
+
+/// Whether `iolist_to_iovec/1` copies a bitstring instead of keeping it as a segment.
+// Port of erts/emulator/beam/erl_iolist.c:39-40 (IOL_SHOULD_COPY), OTP-29.1.1.
+fn iol2v_should_copy(start_bit: usize, bit_len: usize) -> bool {
+    bit_len <= IOL2V_COPY_THRESHOLD_BITS || !start_bit.is_multiple_of(8)
+}
+
+fn bitstring_geometry(term: Term) -> Result<(usize, usize), BifError> {
+    with_binary_bytes(term, |view| (view.start_bit(), view.bit_len()))
+}
+
+// Port of erts/emulator/beam/erl_iolist.c:1265-1310 (iolist_to_iovec_1), OTP-29.1.1.
 fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    const COPY_THRESHOLD: usize = 64;
-    let mut work: SmallVec<[(Term, bool); 8]> = smallvec![(args[0], false)];
-    let mut copied = Vec::new();
-    let mut segments = Vec::new();
+    let single = match args[0].classify() {
+        TermKind::Nil => return Ok(Term::NIL),
+        TermKind::Bitstring => Some(args[0]),
+        TermKind::List => {
+            let (head, tail) = iolist_cons(args[0])?;
+            (head.classify() == TermKind::Bitstring && tail.classify() == TermKind::Nil)
+                .then_some(head)
+        }
+        _ => return Err(BADARG),
+    };
+    if let Some(bitstring) = single {
+        let (_, bit_len) = bitstring_geometry(bitstring)?;
+        if !bit_len.is_multiple_of(8) {
+            return Err(BADARG);
+        }
+        if bit_len == 0 {
+            return Ok(Term::NIL);
+        }
+        if args[0].classify() == TermKind::List {
+            return Ok(args[0]);
+        }
+        return TermBuilder::new(&mut Heap(&mut ctx.heap))
+            .list_from_iter([bitstring])
+            .map_err(|_| BifError::SystemLimit);
+    }
+
+    // Port of erts/emulator/beam/erl_iolist.c:114-282 (generic_iolist_size), OTP-29.1.1.
+    let mut copy_size: usize = 0;
     let mut total: usize = 0;
-    while let Some((term, byte_allowed)) = work.pop() {
+    walk_iolist(args[0], |term, byte_allowed| {
         match term.classify() {
             TermKind::Nil => {}
-            TermKind::List => {
-                let (head, tail) = iolist_cons(term)?;
-                work.push((tail, false));
-                work.push((head, true));
-            }
             TermKind::Bitstring => {
-                with_binary_input(term, |bytes| {
-                    total = total
-                        .checked_add(bytes.len())
+                let (start_bit, bit_len) = bitstring_geometry(term)?;
+                if !bit_len.is_multiple_of(8) {
+                    return Err(BADARG);
+                }
+                total = total.saturating_add(bit_len / 8);
+                if iol2v_should_copy(start_bit, bit_len) {
+                    copy_size = copy_size
+                        .checked_add(bit_len / 8)
                         .ok_or(BifError::SystemLimit)?;
-                    if bytes.len() > COPY_THRESHOLD {
-                        if !copied.is_empty() {
-                            segments.push(
-                                TermBuilder::new(&mut Heap(&mut ctx.heap))
-                                    .binary(&copied)
-                                    .expect("infallible BIF heap"),
-                            );
-                            copied.clear();
-                        }
-                        segments.push(term);
-                    } else {
-                        copied.extend_from_slice(bytes);
-                    }
-                    Ok(())
-                })?;
+                }
             }
             TermKind::Number if byte_allowed => {
+                term.as_small()
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or(BADARG)?;
+                total = total.saturating_add(1);
+                copy_size = copy_size.checked_add(1).ok_or(BifError::SystemLimit)?;
+            }
+            _ => return Err(BADARG),
+        }
+        Ok(())
+    })?;
+
+    // Port of erts/emulator/beam/erl_iolist.c:425-600 (generic_iolist_copy), OTP-29.1.1.
+    enum Segment {
+        Run(usize, usize),
+        Large(Term),
+    }
+    let mut copied: Vec<u8> = Vec::new();
+    copied
+        .try_reserve_exact(copy_size)
+        .map_err(|_| BifError::SystemLimit)?;
+    let mut segments = Vec::new();
+    let mut run_start = 0_usize;
+    walk_iolist(args[0], |term, _| {
+        match term.classify() {
+            TermKind::Nil => {}
+            TermKind::Bitstring => {
+                let (start_bit, bit_len) = bitstring_geometry(term)?;
+                if iol2v_should_copy(start_bit, bit_len) {
+                    with_binary_input(term, |bytes| {
+                        copied.extend_from_slice(bytes);
+                        Ok(())
+                    })?;
+                } else {
+                    if run_start < copied.len() {
+                        segments.push(Segment::Run(run_start, copied.len() - run_start));
+                        run_start = copied.len();
+                    }
+                    segments.push(Segment::Large(term));
+                }
+            }
+            TermKind::Number => {
                 let byte = term
                     .as_small()
                     .and_then(|n| u8::try_from(n).ok())
                     .ok_or(BADARG)?;
                 copied.push(byte);
-                total = total.checked_add(1).ok_or(BifError::SystemLimit)?;
             }
             _ => return Err(BADARG),
         }
+        Ok(())
+    })?;
+    if run_start < copied.len() {
+        segments.push(Segment::Run(run_start, copied.len() - run_start));
     }
     ctx.charge_reductions(total);
-    if !copied.is_empty() {
-        segments.push(
-            TermBuilder::new(&mut Heap(&mut ctx.heap))
-                .binary(&copied)
-                .expect("infallible BIF heap"),
-        );
+
+    // ERTS allocates one off-heap binary for every copied run and hands out
+    // sub-binaries of it.
+    let shared = if copied.is_empty() || !ctx.heap.supports_writable_binary() {
+        None
+    } else {
+        let shared = allocate_iolist_binary(&mut ctx.heap, copied.len())?;
+        with_iolist_binary_output(shared, |output| {
+            output.copy_from_slice(&copied);
+            Ok(())
+        })?;
+        finish_iolist_binary_output(shared);
+        Some(shared)
+    };
+    let mut terms = Vec::with_capacity(segments.len());
+    for segment in segments {
+        terms.push(match segment {
+            Segment::Large(term) => term,
+            Segment::Run(start, len) => {
+                let mut heap = Heap(&mut ctx.heap);
+                let mut builder = TermBuilder::new(&mut heap);
+                match shared {
+                    Some(shared) => builder.sub_binary(shared, start * 8, len * 8),
+                    None => builder.binary(&copied[start..start + len]),
+                }
+                .map_err(|_| BifError::SystemLimit)?
+            }
+        });
     }
-    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .list_from_iter(segments)
-        .expect("infallible BIF heap"))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
+        .list_from_iter(terms)
+        .map_err(|_| BifError::SystemLimit)
 }
 
 /// Flatten an iolist into its byte-aligned contents.
