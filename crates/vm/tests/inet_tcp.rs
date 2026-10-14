@@ -26,6 +26,7 @@ run(Case) ->
         connect_timeout -> connect_timeout();
         names -> names();
         udp -> udp();
+        subbin -> subbin();
         sctp -> sctp();
         inet6 -> inet6();
         sendfile -> sendfile();
@@ -178,6 +179,32 @@ names() ->
     gen_tcp:close(C),
     gen_tcp:close(L),
     {PeerIp, LocalIp, PeerPort =:= Port, is_integer(LocalPort), LocalPort =/= Port}.
+
+subbin() ->
+    Block = list_to_binary([<<N:32>> || N <- lists:seq(1, 65)]),
+    <<_:100/binary, Tail/binary>> = Block,
+    <<_:3, Unaligned/binary>> = <<0:3, Block/binary>>,
+    <<_:8/binary, Mid:20/binary, _/binary>> = Block,
+    Inputs = [Tail, [Tail], [<<"x">>, Tail, <<"y">>, [Mid]], Unaligned, [7, Unaligned], Mid],
+    [subbin_send(Input) || Input <- Inputs].
+
+subbin_send(Data) ->
+    Size = iolist_size(Data),
+    {ok, L} = gen_tcp:listen(0, tcp([binary, {active, false}])),
+    {ok, Port} = inet:port(L),
+    Parent = self(),
+    spawn(fun() ->
+        {ok, S} = gen_tcp:accept(L, 2000),
+        Parent ! {sent, gen_tcp:send(S, Data)},
+        receive after 500 -> ok end
+    end),
+    {ok, C} = gen_tcp:connect({127,0,0,1}, Port, tcp([binary, {active, false}]), 2000),
+    Got = gen_tcp:recv(C, Size, 2000),
+    Extra = gen_tcp:recv(C, 0, 100),
+    Sent = receive {sent, R} -> R after 2000 -> timeout end,
+    gen_tcp:close(C),
+    gen_tcp:close(L),
+    {Size, Sent, Got =:= {ok, iolist_to_binary(Data)}, Extra}.
 
 udp() ->
     {ok, S} = gen_udp:open(0, [{udp_module, inet_udp}, {ip, {127,0,0,1}}]),
@@ -433,6 +460,7 @@ fn gen_tcp_matches_erts() {
         "names",
         "inet6",
         "udp",
+        "subbin",
         "sendfile",
         "sendfile_large",
         "sendfile_ranges",

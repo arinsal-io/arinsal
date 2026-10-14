@@ -738,6 +738,7 @@ pub(crate) fn static_nif_dirty_io(module: &str, function: &str, arity: u8) -> bo
     match module {
         "prim_tty" => arinsal_nif_tty::dirty_io(function, arity),
         "prim_file" => arinsal_nif_file::dirty_io(function, arity),
+        "prim_socket" | "prim_net" => arinsal_nif_socket::dirty_io(module, function, arity),
         _ => false,
     }
 }

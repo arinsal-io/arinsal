@@ -4,8 +4,8 @@
 //! and calls [`owner_died`] when a controlling process exits. No socket call
 //! waits for readiness on a scheduler thread.
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
@@ -15,32 +15,139 @@ use arinsal_term::{ExportEntry, FunEntry, HeapAlloc, Node, Term, from_owned, to_
 mod net;
 mod socket;
 
-/// A scheduler reactor receives one-shot readiness registrations.
+/// Serializes the tests that install a process-wide [`Reactor`].
+#[cfg(test)]
+pub(crate) static TEST_REACTOR_LOCK: Mutex<()> = Mutex::new(());
+
+/// `ERL_NIF_SELECT_STOP_CALLED`: the stop callback ran directly.
+pub const SELECT_STOP_CALLED: i32 = 1 << 0;
+/// `ERL_NIF_SELECT_STOP_SCHEDULED`: the stop callback runs later.
+pub const SELECT_STOP_SCHEDULED: i32 = 1 << 1;
+/// `ERL_NIF_SELECT_INVALID_EVENT`.
+pub const SELECT_INVALID_EVENT: i32 = 1 << 2;
+/// `ERL_NIF_SELECT_FAILED`.
+pub const SELECT_FAILED: i32 = 1 << 3;
+/// `ERL_NIF_SELECT_READ_CANCELLED`: a pending read selection was cancelled.
+pub const SELECT_READ_CANCELLED: i32 = 1 << 4;
+/// `ERL_NIF_SELECT_WRITE_CANCELLED`: a pending write selection was cancelled.
+pub const SELECT_WRITE_CANCELLED: i32 = 1 << 5;
+
+/// The scheduler services the socket NIFs use: `enif_self`, `enif_select`,
+/// `enif_send` and `enif_monitor_process`.
+///
+/// Every `enif_select` style method returns the erts result: a negative value
+/// is a failure (`INT_MIN | ERL_NIF_SELECT_*`), otherwise the flag bits.
 pub trait Reactor: Send + Sync {
-    /// Register an input selection for the controlling process.
-    fn register_read(&self, fd: i32, pid: &O, handle: &O, reference: &O);
-    /// Register an output selection for the controlling process.
-    fn register_write(&self, fd: i32, pid: &O, handle: &O, reference: &O);
-    /// Remove a pending selection.
-    fn cancel(&self, fd: i32, reference: &O);
+    /// The process executing the current NIF call, `enif_self`.
+    fn self_pid(&self) -> Option<O>;
+    /// `enif_select(env, fd, ERL_NIF_SELECT_READ, obj, pid, msg)`: a one-shot
+    /// input selection. The select message goes to `pid`. A selection that is
+    /// still pending for the same fd and mode is replaced.
+    fn register_read(&self, fd: i32, pid: &O, handle: &O, reference: &O) -> i32;
+    /// `enif_select(env, fd, ERL_NIF_SELECT_WRITE, obj, pid, msg)`; see
+    /// [`Reactor::register_read`].
+    fn register_write(&self, fd: i32, pid: &O, handle: &O, reference: &O) -> i32;
+    /// `enif_select(env, fd, ERL_NIF_SELECT_CANCEL | mode, obj, NULL, undefined)`.
+    /// Returns `SELECT_READ_CANCELLED` or `SELECT_WRITE_CANCELLED` when a
+    /// selection was still pending (its message not yet sent), else 0. erts
+    /// cancels by fd and mode, so `reference` is not used to match.
+    fn cancel(&self, fd: i32, read: bool, reference: &O) -> i32;
+    /// `enif_select(env, fd, ERL_NIF_SELECT_STOP, obj, NULL, undefined)`: drop
+    /// every selection of `fd`. Returns `SELECT_STOP_CALLED` or `SELECT_STOP_SCHEDULED`.
+    fn stop(&self, fd: i32) -> i32;
+    /// `enif_send(env, pid, NULL, msg)`. Returns whether the message was sent.
+    fn send(&self, pid: &O, message: &O) -> bool;
+    /// `enif_monitor_process(env, obj, pid, &mon)`. Returns a monitor handle, or
+    /// `None` when `pid` is not a live local process. When the process exits the
+    /// runtime calls [`down`] with the handle, the pid and the monitor handle.
+    fn monitor(&self, _pid: &O, _handle: &O) -> Option<u64> {
+        None
+    }
+    /// `enif_demonitor_process(env, obj, &mon)`; `pid` is the process it was taken on.
+    fn demonitor(&self, _pid: &O, _monitor: u64) {}
+}
+
+/// A pending selection of the [`BlockingReactor`].
+struct BlockingSelection {
+    fd: i32,
+    pid: O,
+    reference: O,
+    events: i16,
 }
 
 /// A poll-based reactor for tests and a single-threaded bootstrap VM.
 #[derive(Default)]
 pub struct BlockingReactor {
-    pending: Mutex<Vec<(i32, O, O, i16)>>,
+    pending: Mutex<Vec<BlockingSelection>>,
+    caller: Mutex<Option<O>>,
+    sent: Mutex<Vec<(O, O)>>,
+    monitors: Mutex<Vec<(u64, O, O)>>,
+    next_monitor: AtomicU64,
+    dead: Mutex<Vec<O>>,
+    scheduled_stop: AtomicBool,
 }
 
 impl BlockingReactor {
+    /// Set the process reported by [`Reactor::self_pid`].
+    pub fn set_caller(&self, pid: O) {
+        *self.caller.lock().unwrap() = Some(pid);
+    }
+
+    /// Make [`Reactor::stop`] report a scheduled stop, which the test completes with [`stop`].
+    pub fn set_scheduled_stop(&self, scheduled: bool) {
+        self.scheduled_stop.store(scheduled, Ordering::Relaxed);
+    }
+
+    /// Processes that [`Reactor::monitor`] reports as not alive.
+    pub fn set_dead(&self, pid: O) {
+        self.dead.lock().unwrap().push(pid);
+    }
+
+    /// The processes with an active monitor, with the monitor handles.
+    pub fn monitored(&self) -> Vec<(O, u64)> {
+        self.monitors
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, pid, _)| (pid.clone(), *id))
+            .collect()
+    }
+
+    /// The process `pid` exits: every monitor of it fires [`down`].
+    pub fn exit(&self, pid: &O) {
+        self.dead.lock().unwrap().push(pid.clone());
+        let fired: Vec<(u64, O)> = {
+            let mut monitors = self.monitors.lock().unwrap();
+            let mut fired = Vec::new();
+            monitors.retain(|(id, monitored, handle)| {
+                if monitored == pid {
+                    fired.push((*id, handle.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            fired
+        };
+        for (id, handle) in fired {
+            down(&handle, pid, id);
+        }
+    }
+
+    /// Messages sent through [`Reactor::send`], with their destination.
+    pub fn sent(&self) -> Vec<(O, O)> {
+        self.sent.lock().unwrap().clone()
+    }
+
     /// Wait until one registered fd is ready, returning its pid and select reference.
     pub fn wait(&self, timeout: Duration) -> Option<(O, O)> {
         let mut fds: Vec<libc::pollfd> = {
             let pending = self.pending.lock().unwrap();
             pending
                 .iter()
-                .map(|(fd, _, _, events)| libc::pollfd {
-                    fd: *fd,
-                    events: *events,
+                .map(|selection| libc::pollfd {
+                    fd: selection.fd,
+                    events: selection.events,
                     revents: 0,
                 })
                 .collect()
@@ -59,30 +166,87 @@ impl BlockingReactor {
         let mut pending = self.pending.lock().unwrap();
         let index = pending
             .iter()
-            .position(|(fd, _, _, _)| *fd == fds[index].fd)?;
-        let (_, pid, reference, _) = pending.remove(index);
-        Some((pid, reference))
+            .position(|selection| selection.fd == fds[index].fd)?;
+        let selection = pending.remove(index);
+        Some((selection.pid, selection.reference))
+    }
+
+    fn select(&self, fd: i32, pid: &O, reference: &O, events: i16) -> i32 {
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|selection| selection.fd != fd || selection.events != events);
+        pending.push(BlockingSelection {
+            fd,
+            pid: pid.clone(),
+            reference: reference.clone(),
+            events,
+        });
+        0
     }
 }
 
 impl Reactor for BlockingReactor {
-    fn register_read(&self, fd: i32, pid: &O, _handle: &O, reference: &O) {
-        self.pending
-            .lock()
-            .unwrap()
-            .push((fd, pid.clone(), reference.clone(), libc::POLLIN));
+    fn self_pid(&self) -> Option<O> {
+        self.caller.lock().unwrap().clone()
     }
-    fn register_write(&self, fd: i32, pid: &O, _handle: &O, reference: &O) {
-        self.pending
-            .lock()
-            .unwrap()
-            .push((fd, pid.clone(), reference.clone(), libc::POLLOUT));
+    fn register_read(&self, fd: i32, pid: &O, _handle: &O, reference: &O) -> i32 {
+        self.select(fd, pid, reference, libc::POLLIN)
     }
-    fn cancel(&self, fd: i32, reference: &O) {
-        self.pending
+    fn register_write(&self, fd: i32, pid: &O, _handle: &O, reference: &O) -> i32 {
+        self.select(fd, pid, reference, libc::POLLOUT)
+    }
+    fn cancel(&self, fd: i32, read: bool, _reference: &O) -> i32 {
+        let events = if read { libc::POLLIN } else { libc::POLLOUT };
+        let mut pending = self.pending.lock().unwrap();
+        let before = pending.len();
+        pending.retain(|selection| selection.fd != fd || selection.events != events);
+        match (pending.len() != before, read) {
+            (false, _) => 0,
+            (true, true) => SELECT_READ_CANCELLED,
+            (true, false) => SELECT_WRITE_CANCELLED,
+        }
+    }
+    fn stop(&self, fd: i32) -> i32 {
+        let mut result = if self.scheduled_stop.load(Ordering::Relaxed) {
+            SELECT_STOP_SCHEDULED
+        } else {
+            SELECT_STOP_CALLED
+        };
+        self.pending.lock().unwrap().retain(|selection| {
+            if selection.fd != fd {
+                return true;
+            }
+            result |= if selection.events == libc::POLLIN {
+                SELECT_READ_CANCELLED
+            } else {
+                SELECT_WRITE_CANCELLED
+            };
+            false
+        });
+        result
+    }
+    fn send(&self, pid: &O, message: &O) -> bool {
+        self.sent
             .lock()
             .unwrap()
-            .retain(|(item, _, r, _)| *item != fd || r != reference);
+            .push((pid.clone(), message.clone()));
+        true
+    }
+    fn monitor(&self, pid: &O, handle: &O) -> Option<u64> {
+        if self.dead.lock().unwrap().contains(pid) {
+            return None;
+        }
+        let id = self.next_monitor.fetch_add(1, Ordering::Relaxed) + 1;
+        self.monitors
+            .lock()
+            .unwrap()
+            .push((id, pid.clone(), handle.clone()));
+        Some(id)
+    }
+    fn demonitor(&self, _pid: &O, monitor: u64) {
+        self.monitors
+            .lock()
+            .unwrap()
+            .retain(|(id, _, _)| *id != monitor);
     }
 }
 
@@ -96,9 +260,26 @@ pub fn set_owner(handle: &O, pid: O) -> Result<(), BifError> {
     socket::set_owner(handle, pid)
 }
 
-/// Close every socket owned by a process that has exited.
+/// Close every socket owned by a process that has exited. The runtime reports an exit
+/// through [`down`] for each monitor; this is the same for the controlling process only.
 pub fn owner_died(pid: &O) {
     socket::owner_died(pid);
+}
+
+/// The resource down callback: the process `pid`, monitored through
+/// [`Reactor::monitor`] with the handle `monitor` for the socket `handle`, has exited.
+pub fn down(handle: &O, pid: &O, monitor: u64) {
+    socket::down(handle, pid, monitor);
+}
+
+/// The resource stop callback for a stop that the select machinery had to schedule.
+pub fn stop(handle: &O) {
+    socket::stop(handle);
+}
+
+/// The `load_nif` info map: the socket registry process and the global defaults.
+pub fn load_info(info: &O) {
+    socket::load_info(info);
 }
 
 /// Release a ref-shaped socket resource when the VM drops its last reference.
@@ -129,6 +310,16 @@ pub fn abort_message(handle: &O, reference: &O, reason: &O) -> O {
 /// Resolve a NIF entry in `prim_socket` or `prim_net`.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     lookup_entry(module, name, arity)
+}
+
+/// Whether the `prim_socket` or `prim_net` NIF `name/arity` is flagged
+/// `ERL_NIF_DIRTY_JOB_IO_BOUND`, so the VM runs it on a dirty IO scheduler.
+pub fn dirty_io(module: &str, name: &str, arity: u8) -> bool {
+    match module {
+        "prim_socket" => socket::dirty_io(name, arity),
+        "prim_net" => net::dirty_io(name, arity),
+        _ => false,
+    }
 }
 
 struct Heap<'a, H: HeapAlloc + ?Sized>(&'a mut H);
@@ -168,6 +359,17 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     }
 }
 
+thread_local! {
+    static RAISED: std::cell::RefCell<Option<O>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Raise `error:Reason` from the NIF currently running on this thread, like
+/// `enif_raise_exception`. Return the result from the NIF body.
+pub(crate) fn raise(reason: O) -> BifError {
+    RAISED.with(|raised| *raised.borrow_mut() = Some(reason));
+    BifError::Unsupported("enif_raise_exception")
+}
+
 fn call(
     ctx: &mut Ctx<'_>,
     args: &[Term],
@@ -177,7 +379,18 @@ fn call(
         .iter()
         .map(|a| to_owned(*a).map_err(|_| BifError::BADARG))
         .collect::<Result<Vec<_>, _>>()?;
-    let result = f(&args)?;
+    RAISED.with(|raised| raised.borrow_mut().take());
+    let result = match f(&args) {
+        Ok(result) => result,
+        Err(error) => {
+            return match RAISED.with(|raised| raised.borrow_mut().take()) {
+                Some(reason) => from_owned(&reason, &mut Heap(&mut ctx.heap))
+                    .map_err(|_| BifError::SystemLimit)
+                    .and_then(|reason| Err(BifError::Error(reason))),
+                None => Err(error),
+            };
+        }
+    };
     from_owned(&result, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
 }
 
@@ -351,36 +564,7 @@ pub(crate) fn string(value: &O) -> Option<String> {
     }
 }
 pub(crate) fn errno(code: i32) -> O {
-    let reason = match code {
-        libc::EAGAIN => "eagain",
-        libc::EINPROGRESS => "einprogress",
-        libc::EALREADY => "ealready",
-        libc::EINTR => "eintr",
-        libc::EBADF => "ebadf",
-        libc::EINVAL => "einval",
-        libc::ENOTCONN => "enotconn",
-        libc::EADDRINUSE => "eaddrinuse",
-        libc::EADDRNOTAVAIL => "eaddrnotavail",
-        libc::ECONNREFUSED => "econnrefused",
-        libc::ECONNRESET => "econnreset",
-        libc::ETIMEDOUT => "etimedout",
-        libc::EPIPE => "epipe",
-        libc::EACCES => "eacces",
-        libc::EPERM => "eperm",
-        libc::ENOMEM => "enomem",
-        libc::ENOBUFS => "enobufs",
-        libc::EAFNOSUPPORT => "eafnosupport",
-        libc::EPROTONOSUPPORT => "eprotonosupport",
-        libc::EISCONN => "eisconn",
-        libc::EDESTADDRREQ => "edestaddrreq",
-        libc::EMSGSIZE => "emsgsize",
-        libc::ENOPROTOOPT => "enoprotoopt",
-        libc::ENOTSOCK => "enotsock",
-        libc::ENETUNREACH => "enetunreach",
-        libc::EHOSTUNREACH => "ehostunreach",
-        _ => return error(&format!("errno_{code}")),
-    };
-    error(reason)
+    error(&arinsal_drv::errno_id(code))
 }
 pub(crate) fn last_error() -> O {
     errno(
@@ -394,4 +578,70 @@ pub(crate) fn notsup() -> BifError {
     BifError::Error(arinsal_term::Term::atom(
         arinsal_term::global_atoms().intern("notsup").unwrap(),
     ))
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+
+    #[test]
+    fn nif_tables_list_every_entry_the_lookup_resolves() {
+        for (module, table) in [
+            ("prim_socket", &socket::NIF_FUNCS[..]),
+            ("prim_net", &net::NIF_FUNCS[..]),
+        ] {
+            for (name, arity, _) in table {
+                assert!(
+                    lookup_entry(module, name, *arity).is_some(),
+                    "{module}:{name}/{arity}"
+                );
+            }
+        }
+        assert_eq!(socket::NIF_FUNCS.len(), 40);
+        assert_eq!(net::NIF_FUNCS.len(), 15);
+    }
+
+    #[test]
+    fn dirty_io_entries_are_the_flagged_ones() {
+        let socket_dirty: Vec<_> = socket::NIF_FUNCS
+            .iter()
+            .filter(|(_, _, dirty)| *dirty)
+            .map(|(name, arity, _)| (*name, *arity))
+            .collect();
+        assert_eq!(
+            socket_dirty,
+            [
+                ("nif_sendfile", 5),
+                ("nif_sendfile", 4),
+                ("nif_sendfile", 1),
+                ("nif_ioctl", 2),
+                ("nif_ioctl", 3),
+                ("nif_ioctl", 4),
+                ("nif_finalize_close", 1),
+            ]
+        );
+        let net_dirty: Vec<_> = net::NIF_FUNCS
+            .iter()
+            .filter(|(_, _, dirty)| *dirty)
+            .map(|(name, arity, _)| (*name, *arity))
+            .collect();
+        assert_eq!(
+            net_dirty,
+            [
+                ("nif_getifaddrs", 1),
+                ("nif_get_adapters_addresses", 1),
+                ("nif_get_if_entry", 1),
+                ("nif_get_interface_info", 1),
+                ("nif_get_ip_address_table", 1),
+                ("nif_getservbyname", 2),
+                ("nif_getservbyport", 2),
+            ]
+        );
+        assert!(dirty_io("prim_net", "nif_getifaddrs", 1));
+        assert!(dirty_io("prim_socket", "nif_ioctl", 3));
+        assert!(!dirty_io("prim_socket", "nif_ioctl", 1));
+        assert!(!dirty_io("prim_net", "nif_getaddrinfo", 3));
+        assert!(!dirty_io("prim_socket", "nif_sendmmsg", 4));
+        assert!(!dirty_io("prim_file", "nif_ioctl", 3));
+    }
 }
