@@ -921,6 +921,8 @@ pub mod proc_flags {
     pub const REG: u32 = 1 << 7;
     pub const TRACE: u32 = 1 << 8;
     pub const TRACER: u32 = 1 << 9;
+    /// The process is the target of a NIF resource monitor (`ERTS_MON_TYPE_RESOURCE`).
+    pub const RESOURCE_MON: u32 = 1 << 10;
     pub const OWNED_TIMERS: u32 = 1 << 11;
     /// A remote `process_info` / sys-task request is queued for this process
     /// (`erl_proc_sig_queue.c` request tables). Exit takes that table only then.

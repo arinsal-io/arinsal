@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -11,6 +11,12 @@ use arinsal_etf::OwnedTerm as O;
 use socket2::{Domain, MsgHdr, Protocol, SockAddr, Socket, Type};
 
 use crate::{Reactor, atom, errno, error, field, last_error, list, map, name, number, ok, pair};
+
+mod lifecycle;
+#[cfg(test)]
+mod lifecycle_tests;
+mod options;
+use options::bool_atom;
 
 const MAGIC: u32 = 0x534f_434b;
 #[cfg(target_os = "macos")]
@@ -23,6 +29,9 @@ static REACTOR: OnceLock<Mutex<Option<Arc<dyn Reactor>>>> = OnceLock::new();
 static DEBUG: AtomicBool = AtomicBool::new(false);
 static SOCKET_DEBUG: AtomicBool = AtomicBool::new(false);
 static USE_REGISTRY: AtomicBool = AtomicBool::new(true);
+static REGISTRY_PID: Mutex<Option<O>> = Mutex::new(None);
+static NEXT_CLOSE_REF: AtomicU64 = AtomicU64::new(1);
+static TOTALS: Mutex<Totals> = Mutex::new(Totals::new());
 
 pub(super) fn reactor() -> &'static Mutex<Option<Arc<dyn Reactor>>> {
     REACTOR.get_or_init(|| Mutex::new(None))
@@ -42,6 +51,19 @@ pub(crate) mod state_bits {
     pub const CLOSING: u32 = 0x0200;
     pub const CLOSED: u32 = 0x0400;
     pub const DTOR: u32 = 0x8000;
+
+    /// `IS_OPEN`: neither closing nor closed.
+    pub fn is_open(state: u32) -> bool {
+        state & (CLOSED | CLOSING) == 0
+    }
+    /// `IS_CLOSING`.
+    pub fn is_closing(state: u32) -> bool {
+        state & CLOSING != 0
+    }
+    /// `IS_CLOSED`.
+    pub fn is_closed(state: u32) -> bool {
+        state & CLOSED != 0
+    }
 }
 
 /// A process waiting for an operation on the socket, `ESockRequestor`.
@@ -69,6 +91,11 @@ pub(crate) struct State {
     pub read_state: u32,
     pub write_state: u32,
     pub ctrl_mon: Option<u64>,
+    /// The process that called `close`, `closerPid`.
+    pub closer: Option<O>,
+    pub closer_mon: Option<u64>,
+    /// `closeRef` while a scheduled stop has not run yet (`closeEnv != NULL`).
+    pub close_ref: Option<O>,
     pub connector: Option<Requestor>,
     pub current_acceptor: Option<Requestor>,
     pub current_writer: Option<Requestor>,
@@ -88,13 +115,14 @@ pub(crate) struct Handle {
     /// Per-socket state shared with the requestors, see [`State`]. Lock order:
     /// `socket` first, then `state`.
     state: Mutex<State>,
-    monitors: Mutex<Vec<O>>,
     counters: Mutex<Counters>,
     otp_options: Mutex<HashMap<i32, O>>,
     sendfile_fd: Mutex<Option<OwnedFd>>,
     domain: &'static str,
     kind: &'static str,
     protocol: i32,
+    /// How the socket was created, `ctype` of the socket info: `normal` or `{fromfd, Fd}`.
+    ctype: O,
 }
 #[derive(Default)]
 struct Counters {
@@ -159,12 +187,97 @@ fn handle(value: &O) -> Result<Arc<Handle>, BifError> {
         .cloned()
         .ok_or(BifError::BADARG)
 }
+const OTP_OPT_DEBUG: i32 = 1001;
+const OTP_OPT_IOW: i32 = 1002;
+const OTP_OPT_CTRL_PROC: i32 = 1003;
+const OTP_OPT_RCVBUF: i32 = 1004;
+const OTP_OPT_RCVCTRLBUF: i32 = 1006;
+const OTP_OPT_SNDCTRLBUF: i32 = 1007;
+const OTP_OPT_FD: i32 = 1008;
+const OTP_OPT_META: i32 = 1009;
+const OTP_OPT_USE_REGISTRY: i32 = 1010;
+const OTP_OPT_SELECT_READ: i32 = 1011;
+const OTP_OPT_DOMAIN: i32 = 1999;
+const RECV_BUFFER_SIZE_DEFAULT: i64 = 8 * 1024;
+const RECV_CTRL_BUFFER_SIZE_DEFAULT: i64 = 1024;
+const SEND_CTRL_BUFFER_SIZE_DEFAULT: i64 = 1024;
+
+/// The global socket counters of `ESockData`.
+struct Totals {
+    sockets: u64,
+    dgrams: u64,
+    streams: u64,
+    seqpkgs: u64,
+    dom_local: u64,
+    dom_inet: u64,
+    dom_inet6: u64,
+    proto_ip: u64,
+    proto_tcp: u64,
+    proto_udp: u64,
+    proto_sctp: u64,
+}
+impl Totals {
+    const fn new() -> Self {
+        Self {
+            sockets: 0,
+            dgrams: 0,
+            streams: 0,
+            seqpkgs: 0,
+            dom_local: 0,
+            dom_inet: 0,
+            dom_inet6: 0,
+            proto_ip: 0,
+            proto_tcp: 0,
+            proto_udp: 0,
+            proto_sctp: 0,
+        }
+    }
+    /// `esock_inc_socket` and `esock_dec_socket`: erts counts `local` sockets in the
+    /// `inet6` domain counter, and so does this.
+    fn update(&mut self, domain: &str, kind: &str, protocol: i32, add: bool) {
+        let step = |counter: &mut u64| {
+            *counter = if add {
+                *counter + 1
+            } else {
+                counter.saturating_sub(1)
+            }
+        };
+        step(&mut self.sockets);
+        match domain {
+            "inet" => step(&mut self.dom_inet),
+            "inet6" | "local" => step(&mut self.dom_inet6),
+            _ => {}
+        }
+        match kind {
+            "stream" => step(&mut self.streams),
+            "dgram" => step(&mut self.dgrams),
+            "seqpacket" => step(&mut self.seqpkgs),
+            _ => {}
+        }
+        match protocol {
+            libc::IPPROTO_IP => step(&mut self.proto_ip),
+            libc::IPPROTO_TCP => step(&mut self.proto_tcp),
+            libc::IPPROTO_UDP => step(&mut self.proto_udp),
+            _ => {}
+        }
+    }
+}
+fn totals() -> std::sync::MutexGuard<'static, Totals> {
+    TOTALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+/// `esock_alloc_descriptor` plus the bookkeeping `essio_open4` and
+/// `essio_accept_accepted` do for a new descriptor: the controlling process is
+/// monitored, the global counters count it and the registry hears about it.
 fn reference(
     socket: Socket,
     domain: &'static str,
     kind: &'static str,
     protocol: i32,
     owner: Option<O>,
+    options: HashMap<i32, O>,
+    ctype: O,
 ) -> O {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let reference = O::Ref {
@@ -172,48 +285,126 @@ fn reference(
         creation: 0,
         ids: vec![MAGIC, id as u32, (id >> 32) as u32],
     };
-    handles().lock().unwrap().insert(
-        id,
-        Arc::new(Handle {
-            socket: Mutex::new(Some(socket)),
-            reference: reference.clone(),
-            owner: Mutex::new(owner),
-            state: Mutex::new(State::default()),
-            monitors: Mutex::new(Vec::new()),
-            counters: Mutex::new(Counters::default()),
-            otp_options: Mutex::new(HashMap::new()),
-            sendfile_fd: Mutex::new(None),
-            domain,
-            kind,
-            protocol,
-        }),
-    );
+    let h = Arc::new(Handle {
+        socket: Mutex::new(Some(socket)),
+        reference: reference.clone(),
+        owner: Mutex::new(owner.clone()),
+        state: Mutex::new(State::default()),
+        counters: Mutex::new(Counters::default()),
+        otp_options: Mutex::new(options),
+        sendfile_fd: Mutex::new(None),
+        domain,
+        kind,
+        protocol,
+        ctype,
+    });
+    handles().lock().unwrap().insert(id, Arc::clone(&h));
+    if let Some(pid) = owner.as_ref() {
+        let mon = monitor_process(&h, pid);
+        h.state.lock().unwrap().ctrl_mon = mon;
+    }
+    totals().update(domain, kind, protocol, true);
+    if use_reg(&h) {
+        send_reg_msg("add", &h);
+    }
     reference
+}
+/// `esock_get_bool_from_map`.
+fn bool_from_map(map: &O, key: &str, default: bool) -> bool {
+    match field(map, key).and_then(name) {
+        Some("true") => true,
+        Some("false") => false,
+        _ => default,
+    }
+}
+/// The `debug` and `use_registry` defaults a new descriptor takes from the open options
+/// and the global settings.
+fn initial_options(opts: Option<&O>) -> HashMap<i32, O> {
+    let mut options = HashMap::new();
+    let debug = SOCKET_DEBUG.load(Ordering::Relaxed);
+    let registry = USE_REGISTRY.load(Ordering::Relaxed);
+    let (debug, registry) = match opts {
+        Some(opts) => (
+            bool_from_map(opts, "debug", debug),
+            bool_from_map(opts, "use_registry", registry),
+        ),
+        None => (debug, registry),
+    };
+    options.insert(OTP_OPT_DEBUG, bool_atom(debug));
+    options.insert(OTP_OPT_USE_REGISTRY, bool_atom(registry));
+    options
+}
+/// `descP->useReg`.
+fn use_reg(h: &Handle) -> bool {
+    h.otp_options.lock().unwrap().get(&OTP_OPT_USE_REGISTRY) == Some(&atom("true"))
+}
+/// `esock_send_reg_add_msg` and `esock_send_reg_del_msg`: `{'$socket', add | del, Socket}`.
+fn send_reg_msg(tag: &str, h: &Handle) {
+    let Some(registry) = REGISTRY_PID.lock().unwrap().clone() else {
+        return;
+    };
+    if let Some(reactor) = active_reactor() {
+        let message = O::tuple(vec![
+            atom("$socket"),
+            atom(tag),
+            pair(atom("$socket"), h.reference.clone()),
+        ]);
+        reactor.send(&registry, &message);
+    }
+}
+/// The part of the `load_nif` info map that the socket NIF reads on load: the registry
+/// process and the global defaults.
+pub(super) fn load_info(info: &O) {
+    if let Some(pid @ O::Pid { .. }) = field(info, "registry") {
+        *REGISTRY_PID.lock().unwrap() = Some(pid.clone());
+    }
+    USE_REGISTRY.store(
+        bool_from_map(info, "use_registry", USE_REGISTRY.load(Ordering::Relaxed)),
+        Ordering::Relaxed,
+    );
+    DEBUG.store(bool_from_map(info, "debug", false), Ordering::Relaxed);
+    SOCKET_DEBUG.store(
+        bool_from_map(info, "socket_debug", false),
+        Ordering::Relaxed,
+    );
 }
 pub(super) fn set_owner(value: &O, pid: O) -> Result<(), BifError> {
     if !matches!(pid, O::Pid { .. }) {
         return Err(BifError::BADARG);
     }
-    *handle(value)?.owner.lock().unwrap() = Some(pid);
-    Ok(())
-}
-pub(super) fn owner_died(pid: &O) {
-    let mut table = handles().lock().unwrap();
-    table.retain(|_, h| {
-        let owned = h.owner.lock().unwrap().as_ref() == Some(pid);
-        if owned {
-            close_handle(h);
-        }
-        !owned
-    });
-}
-pub(super) fn release(value: &O) -> Result<(), BifError> {
-    let id = handle_id(value)?;
-    if let Some(h) = handles().lock().unwrap().remove(&id) {
-        close_handle(&h);
+    let h = handle(value)?;
+    let previous = h.owner.lock().unwrap().replace(pid.clone());
+    let mut st = h.state.lock().unwrap();
+    if previous.as_ref() != Some(&pid) {
+        demonitor_process(st.ctrl_mon.take());
+        st.ctrl_mon = monitor_process(&h, &pid);
     }
     Ok(())
 }
+/// A controlling process has exited: its monitor fires for every socket it owns.
+pub(super) fn owner_died(pid: &O) {
+    let owned: Vec<Arc<Handle>> = handles()
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|h| h.owner.lock().unwrap().as_ref() == Some(pid))
+        .cloned()
+        .collect();
+    for h in owned {
+        let monitor = *h.state.lock().unwrap().ctrl_mon.get_or_insert(u64::MAX);
+        lifecycle::down(&h.reference, pid, monitor);
+    }
+}
+/// The resource destructor: the VM dropped its last reference to the socket.
+pub(super) fn release(value: &O) -> Result<(), BifError> {
+    let id = handle_id(value)?;
+    let removed = handles().lock().unwrap().remove(&id);
+    if let Some(h) = removed {
+        lifecycle::dtor(&h);
+    }
+    Ok(())
+}
+pub(super) use lifecycle::{down, stop};
 fn active_reactor() -> Option<Arc<dyn Reactor>> {
     reactor().lock().unwrap().clone()
 }
@@ -409,10 +600,18 @@ pub(crate) fn activate_next(h: &Handle, st: &mut State, fd: i32, kind: Kind) -> 
 /// Superseded by [`select_read`] and [`select_write`] (and the request queues)
 /// in the send and receive paths.
 fn selected(h: &Handle, fd: i32, reference: &O, read: bool) -> O {
-    if read {
-        select_read(h, fd, None, reference);
+    let sres = if read {
+        select_read(h, fd, None, reference)
     } else {
-        select_write(h, fd, None, reference);
+        select_write(h, fd, None, reference)
+    };
+    if sres >= 0 {
+        let mut st = h.state.lock().unwrap();
+        if read {
+            st.read_state |= state_bits::SELECTED;
+        } else {
+            st.write_state |= state_bits::SELECTED;
+        }
     }
     atom("select")
 }
@@ -606,7 +805,15 @@ fn open(args: &[O]) -> Result<O, BifError> {
                 ("inet" | "inet6", "dgram") => libc::IPPROTO_UDP,
                 _ => 0,
             });
-        return Ok(ok(reference(socket, domain, kind, protocol, owner)));
+        return Ok(ok(reference(
+            socket,
+            domain,
+            kind,
+            protocol,
+            owner,
+            initial_options(Some(&args[1])),
+            pair(atom("fromfd"), O::Int(fd.into())),
+        )));
     };
     let proto = (protocol != 0).then_some(Protocol::from(protocol));
     match Socket::new(domain, kind, proto) {
@@ -630,7 +837,15 @@ fn open(args: &[O]) -> Result<O, BifError> {
             } else {
                 "raw"
             };
-            Ok(ok(reference(socket, d, k, protocol, owner)))
+            Ok(ok(reference(
+                socket,
+                d,
+                k,
+                protocol,
+                owner,
+                initial_options(Some(&args[3])),
+                atom("normal"),
+            )))
         }
         Err(e) => Ok(fail(&e)),
     }
@@ -645,8 +860,15 @@ fn bind(args: &[O]) -> Result<O, BifError> {
         return Ok(invalid("sockaddr"));
     };
     let guard = h.socket.lock().unwrap();
+    let mut st = h.state.lock().unwrap();
     Ok(match guard.as_ref() {
-        Some(s) => io_result(s.bind(&addr)),
+        Some(s) => {
+            let result = io_result(s.bind(&addr));
+            if result == atom("ok") {
+                st.read_state |= state_bits::BOUND;
+            }
+            result
+        }
         None => error("closed"),
     })
 }
@@ -662,7 +884,10 @@ fn connect(args: &[O]) -> Result<O, BifError> {
         None
     };
     let mut st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
+    let Some(s) = guard
+        .as_ref()
+        .filter(|_| state_bits::is_open(st.write_state))
+    else {
         return Ok(error("closed"));
     };
     let Some(me) = self_pid() else {
@@ -768,7 +993,10 @@ fn accept(args: &[O]) -> Result<O, BifError> {
     let h = handle(&args[0])?;
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
+    let Some(s) = guard
+        .as_ref()
+        .filter(|_| state_bits::is_open(st.read_state))
+    else {
         return Ok(error("closed"));
     };
     let Some(caller) = self_pid() else {
@@ -902,75 +1130,37 @@ fn accepted(h: &Arc<Handle>, socket: Socket, pid: &O) -> O {
     if let Err(e) = socket.set_nonblocking(true) {
         return fail(&e);
     }
-    let accepted = reference(socket, h.domain, h.kind, h.protocol, Some(pid.clone()));
+    let inherited = h
+        .otp_options
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(opt, _)| {
+            matches!(
+                **opt,
+                OTP_OPT_RCVBUF
+                    | OTP_OPT_RCVCTRLBUF
+                    | OTP_OPT_SNDCTRLBUF
+                    | OTP_OPT_IOW
+                    | OTP_OPT_DEBUG
+                    | OTP_OPT_USE_REGISTRY
+            )
+        })
+        .map(|(opt, value)| (*opt, value.clone()))
+        .collect();
+    let accepted = reference(
+        socket,
+        h.domain,
+        h.kind,
+        h.protocol,
+        Some(pid.clone()),
+        inherited,
+        atom("normal"),
+    );
     if let Ok(new) = handle(&accepted) {
-        *new.otp_options.lock().unwrap() = h.otp_options.lock().unwrap().clone();
-        let mut new_state = new.state.lock().unwrap();
-        new_state.ctrl_mon = monitor_process(&new, pid);
-        new_state.write_state |= state_bits::CONNECTED;
+        new.state.lock().unwrap().write_state |= state_bits::CONNECTED;
     }
     ok(accepted)
-}
-fn cancel_connect(args: &[O]) -> Result<O, BifError> {
-    let h = handle(&args[0])?;
-    if !matches!(args[2], O::Ref { .. }) {
-        return Err(BifError::BADARG);
-    }
-    let guard = h.socket.lock().unwrap();
-    let mut st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
-        return Ok(error("closed"));
-    };
-    let Some(me) = self_pid() else {
-        return Err(BifError::BADARG);
-    };
-    match st.connector.as_ref() {
-        Some(connector) if connector.pid == me && connector.reference == args[2] => {
-            let result = cancel_write_select(s.as_raw_fd(), &args[2]);
-            requestor_release(&mut st.connector);
-            st.write_state &= !state_bits::CONNECTING;
-            Ok(result)
-        }
-        _ => Ok(error("not_found")),
-    }
-}
-fn cancel_accept(args: &[O]) -> Result<O, BifError> {
-    let h = handle(&args[0])?;
-    if !matches!(args[2], O::Ref { .. }) {
-        return Err(BifError::BADARG);
-    }
-    let guard = h.socket.lock().unwrap();
-    let mut st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
-        return Ok(error("closed"));
-    };
-    let Some(current) = st.current_acceptor.clone() else {
-        return Ok(atom("not_found"));
-    };
-    let Some(me) = self_pid() else {
-        return Err(BifError::BADARG);
-    };
-    if me == current.pid {
-        if args[2] != current.reference {
-            return Ok(atom("not_found"));
-        }
-        let fd = s.as_raw_fd();
-        demonitor_process(current.mon);
-        let result = cancel_read_select(fd, &current.reference);
-        if !activate_next(&h, &mut st, fd, Kind::Acceptor) {
-            st.read_state &= !state_bits::ACCEPTING;
-            st.current_acceptor = None;
-        }
-        Ok(result)
-    } else if st.unqueue(Kind::Acceptor, Some(&args[2]), &me) {
-        Ok(atom("ok"))
-    } else {
-        Ok(atom("not_found"))
-    }
-}
-/// `IS_OPEN`: neither closing nor closed.
-pub(crate) fn is_open(state: u32) -> bool {
-    state & (state_bits::CLOSING | state_bits::CLOSED) == 0
 }
 /// `IOV_MAX`: the most elements `enif_inspect_iovec` takes per call.
 const IOV_MAX: usize = 1024;
@@ -1024,7 +1214,10 @@ fn essio_send(
 ) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref().filter(|_| is_open(st.write_state)) else {
+    let Some(s) = guard
+        .as_ref()
+        .filter(|_| state_bits::is_open(st.write_state))
+    else {
         return Ok(error("closed"));
     };
     if st.connector.is_some() {
@@ -1136,7 +1329,10 @@ fn nif_sendv(args: &[O]) -> Result<O, BifError> {
 fn essio_sendv(h: &Handle, send_ref: &O, iov: &O) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref().filter(|_| is_open(st.write_state)) else {
+    let Some(s) = guard
+        .as_ref()
+        .filter(|_| state_bits::is_open(st.write_state))
+    else {
         return Ok(error("closed"));
     };
     if st.connector.is_some() {
@@ -1192,7 +1388,10 @@ fn essio_sendmsg(
 ) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref().filter(|_| is_open(st.write_state)) else {
+    let Some(s) = guard
+        .as_ref()
+        .filter(|_| state_bits::is_open(st.write_state))
+    else {
         return Ok(error("closed"));
     };
     if st.connector.is_some() {
@@ -1401,40 +1600,6 @@ fn send_check_retry(
         None => atom("select"),
     })
 }
-/// `essio_cancel_send`.
-fn cancel_send(args: &[O]) -> Result<O, BifError> {
-    let h = handle(&args[0])?;
-    if !matches!(args[2], O::Ref { .. }) {
-        return Err(BifError::BADARG);
-    }
-    let guard = h.socket.lock().unwrap();
-    let mut st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref().filter(|_| is_open(st.write_state)) else {
-        return Ok(error("closed"));
-    };
-    let Some(current) = st.current_writer.clone() else {
-        return Ok(atom("not_found"));
-    };
-    let Some(me) = self_pid() else {
-        return Err(BifError::BADARG);
-    };
-    if me == current.pid {
-        if args[2] != current.reference {
-            return Ok(atom("not_found"));
-        }
-        let fd = s.as_raw_fd();
-        demonitor_process(current.mon);
-        let result = cancel_write_select(fd, &current.reference);
-        if !activate_next(&h, &mut st, fd, Kind::Writer) {
-            st.current_writer = None;
-        }
-        Ok(result)
-    } else if st.unqueue(Kind::Writer, Some(&args[2]), &me) {
-        Ok(atom("ok"))
-    } else {
-        Ok(atom("not_found"))
-    }
-}
 #[cfg(target_os = "macos")]
 fn sendfile_once(file: i32, socket: i32, offset: i64, count: usize) -> (i32, usize) {
     let mut sent = count as libc::off_t;
@@ -1543,10 +1708,7 @@ fn sendfile(args: &[O]) -> Result<O, BifError> {
     selected(&h, socket.as_raw_fd(), reference, false);
     Ok(pair(atom("select"), O::Int(total as i64)))
 }
-const RECV_BUFFER_SIZE_DEFAULT: usize = 8 * 1024;
 const RECV_BUFFER_SIZE_MAX: usize = 16 * 1024 * 1024;
-const OTP_OPT_RCVBUF: i32 = 1004;
-const OTP_OPT_SELECT_READ: i32 = 1011;
 
 type Early = Result<O, BifError>;
 
@@ -1590,13 +1752,9 @@ fn recv_args(args: &[O], msg: bool) -> Result<(usize, usize, i32), Early> {
         Ok((len, 0, flags))
     }
 }
-/// `esock_decode_bufsz`.
 fn decode_bufsz(value: &O) -> Option<usize> {
-    match value {
-        O::Int(n) if *n > 0 => Some(*n as usize),
-        O::Atom(a) if a == "default" => Some(RECV_BUFFER_SIZE_DEFAULT),
-        _ => None,
-    }
+    options::decode_bufsz(value, RECV_BUFFER_SIZE_DEFAULT)
+        .and_then(|size| usize::try_from(size).ok())
 }
 /// `rBufSz`, `rNum` and `selectRead` of the descriptor, kept as `otp` options.
 struct RecvConfig {
@@ -1606,13 +1764,14 @@ struct RecvConfig {
 }
 fn recv_config(h: &Handle) -> RecvConfig {
     let options = h.otp_options.lock().unwrap();
+    let default = RECV_BUFFER_SIZE_DEFAULT as usize;
     let (num, buf_sz) = match options.get(&OTP_OPT_RCVBUF) {
         Some(O::Tuple(parts)) if parts.len() == 2 => match (&parts[0], decode_bufsz(&parts[1])) {
             (O::Int(n), Some(size)) if *n > 0 && u32::try_from(*n).is_ok() => (*n as u32, size),
-            _ => (0, RECV_BUFFER_SIZE_DEFAULT),
+            _ => (0, default),
         },
-        Some(value) => (0, decode_bufsz(value).unwrap_or(RECV_BUFFER_SIZE_DEFAULT)),
-        None => (0, RECV_BUFFER_SIZE_DEFAULT),
+        Some(value) => (0, decode_bufsz(value).unwrap_or(default)),
+        None => (0, default),
     };
     RecvConfig {
         buf_sz: buf_sz.max(1),
@@ -1653,7 +1812,10 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
     let mut st = h.state.lock().unwrap();
     let config = recv_config(&h);
     let buf_sz = if len != 0 { len } else { config.buf_sz };
-    let Some(s) = guard.as_ref() else {
+    let Some(s) = guard
+        .as_ref()
+        .filter(|_| state_bits::is_open(st.read_state))
+    else {
         return Ok(error("closed"));
     };
     let rx = Receiver {
@@ -1957,40 +2119,6 @@ impl Receiver<'_> {
     }
 }
 
-/// `essio_cancel_recv`: cancel the current reader, or unqueue a waiting one.
-fn cancel_recv(args: &[O]) -> Result<O, BifError> {
-    let h = handle(&args[0])?;
-    if !matches!(args[2], O::Ref { .. }) {
-        return Err(BifError::BADARG);
-    }
-    let guard = h.socket.lock().unwrap();
-    let mut st = h.state.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
-        return Ok(error("closed"));
-    };
-    let Some(current) = st.current_reader.clone() else {
-        return Ok(atom("not_found"));
-    };
-    let Some(me) = self_pid() else {
-        return Err(BifError::BADARG);
-    };
-    if me == current.pid {
-        if args[2] != current.reference {
-            return Ok(atom("not_found"));
-        }
-        let fd = s.as_raw_fd();
-        demonitor_process(current.mon);
-        let result = cancel_read_select(fd, &current.reference);
-        if !activate_next(&h, &mut st, fd, Kind::Reader) {
-            st.current_reader = None;
-        }
-        Ok(result)
-    } else if st.unqueue(Kind::Reader, Some(&args[2]), &me) {
-        Ok(atom("ok"))
-    } else {
-        Ok(atom("not_found"))
-    }
-}
 fn sockaddr_storage_to_term(storage: &libc::sockaddr_storage) -> Option<O> {
     match i32::from(storage.ss_family) {
         libc::AF_INET => {
@@ -2025,20 +2153,6 @@ fn sockaddr_storage_to_term(storage: &libc::sockaddr_storage) -> Option<O> {
         _ => None,
     }
 }
-fn close(value: &O) -> Result<O, BifError> {
-    let h = handle(value)?;
-    close_handle(&h);
-    Ok(atom("ok"))
-}
-fn close_handle(h: &Handle) {
-    let fd = h.socket.lock().unwrap().as_ref().map(AsRawFd::as_raw_fd);
-    if let Some(fd) = fd {
-        select_stop(fd);
-    }
-    h.monitors.lock().unwrap().clear();
-    h.sendfile_fd.lock().unwrap().take();
-    h.socket.lock().unwrap().take();
-}
 fn shutdown(args: &[O]) -> Result<O, BifError> {
     let h = handle(&args[0])?;
     let how = match name(&args[1]) {
@@ -2054,321 +2168,15 @@ fn shutdown(args: &[O]) -> Result<O, BifError> {
     };
     let guard = h.socket.lock().unwrap();
     let st = h.state.lock().unwrap();
-    Ok(match guard.as_ref().filter(|_| is_open(st.read_state)) {
-        Some(s) => io_result(s.shutdown(how)),
-        None => error("closed"),
-    })
-}
-fn option(args: &[O], set: bool) -> Result<O, BifError> {
-    // Port of erts/emulator/nifs/common/prim_socket_nif.c:7802 (nif_setopt), OTP-29.1.1.
-    let h = handle(&args[0])?;
-    let level = match name(&args[1]) {
-        Some("socket") => libc::SOL_SOCKET,
-        Some("otp") => -1,
-        _ => integer(&args[1])?,
-    };
-    let opt = integer(&args[2])?;
-    let guard = h.socket.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
-        return Ok(error("closed"));
-    };
-    if level == -1 {
-        return if set {
-            if number(&args[4]) != Some(0) {
-                return Ok(invalid("socket_option"));
-            }
-            match opt {
-                1003 => {
-                    if matches!(args[3], O::Pid { .. }) {
-                        *h.owner.lock().unwrap() = Some(args[3].clone());
-                        Ok(atom("ok"))
-                    } else {
-                        Ok(invalid("value"))
-                    }
-                }
-                1001 | 1002 | 1010 | 1011 if matches!(name(&args[3]), Some("true" | "false")) => {
-                    h.otp_options.lock().unwrap().insert(opt, args[3].clone());
-                    Ok(atom("ok"))
-                }
-                1004 | 1006 | 1007 if number(&args[3]).is_some_and(|n| n > 0) => {
-                    h.otp_options.lock().unwrap().insert(opt, args[3].clone());
-                    Ok(atom("ok"))
-                }
-                1009 => {
-                    h.otp_options.lock().unwrap().insert(opt, args[3].clone());
-                    Ok(atom("ok"))
-                }
-                1001 | 1002 | 1004 | 1006 | 1007 | 1008 | 1010 | 1011 | 1999 => {
-                    Ok(invalid("value"))
-                }
-                _ => Ok(invalid("socket_option")),
-            }
-        } else {
-            let value = match opt {
-                1003 => h
-                    .owner
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or_else(|| atom("undefined")),
-                1008 => O::Int(s.as_raw_fd().into()),
-                1999 => atom(h.domain),
-                1001 | 1002 => h
-                    .otp_options
-                    .lock()
-                    .unwrap()
-                    .get(&opt)
-                    .cloned()
-                    .unwrap_or_else(|| atom("false")),
-                1010 | 1011 => h
-                    .otp_options
-                    .lock()
-                    .unwrap()
-                    .get(&opt)
-                    .cloned()
-                    .unwrap_or_else(|| atom("true")),
-                1004 => h
-                    .otp_options
-                    .lock()
-                    .unwrap()
-                    .get(&opt)
-                    .cloned()
-                    .unwrap_or(O::Int(8192)),
-                1006 | 1007 => h
-                    .otp_options
-                    .lock()
-                    .unwrap()
-                    .get(&opt)
-                    .cloned()
-                    .unwrap_or(O::Int(1024)),
-                1009 => h
-                    .otp_options
-                    .lock()
-                    .unwrap()
-                    .get(&opt)
-                    .cloned()
-                    .unwrap_or_else(|| atom("undefined")),
-                _ => return Ok(invalid("socket_option")),
-            };
-            Ok(ok(value))
-        };
-    }
-    if set {
-        let native = number(&args[4]) == Some(1);
-        if native {
-            let O::Binary(bytes) = &args[3] else {
-                return Ok(invalid("value"));
-            };
-            // SAFETY: bytes is live and its length matches the supplied buffer.
-            let status = unsafe {
-                libc::setsockopt(
-                    s.as_raw_fd(),
-                    level,
-                    opt,
-                    bytes.as_ptr().cast(),
-                    bytes.len() as libc::socklen_t,
-                )
-            };
-            return Ok(if status < 0 { last_error() } else { atom("ok") });
-        }
-        let mut linger = libc::linger {
-            l_onoff: 0,
-            l_linger: 0,
-        };
-        let mut value = match &args[3] {
-            O::Atom(v) if v == "true" => 1,
-            O::Atom(v) if v == "false" => 0,
-            O::Int(n) => i32::try_from(*n).map_err(|_| BifError::BADARG)?,
-            O::Map(_) if opt == libc::SO_LINGER => {
-                linger.l_onoff =
-                    if name(field(&args[3], "onoff").unwrap_or(&atom("false"))) == Some("true") {
-                        1
-                    } else {
-                        0
-                    };
-                linger.l_linger = field(&args[3], "linger")
-                    .and_then(number)
-                    .and_then(|n| i32::try_from(n).ok())
-                    .ok_or(BifError::BADARG)?;
-                0
-            }
-            _ => return Ok(invalid("value")),
-        };
-        let (ptr, len) = if opt == libc::SO_LINGER {
-            (
-                std::ptr::addr_of_mut!(linger).cast::<libc::c_void>(),
-                std::mem::size_of_val(&linger),
-            )
-        } else {
-            (
-                std::ptr::addr_of_mut!(value).cast(),
-                std::mem::size_of_val(&value),
-            )
-        };
-        // SAFETY: ptr points to initialized value or linger and len matches its size.
-        let status =
-            unsafe { libc::setsockopt(s.as_raw_fd(), level, opt, ptr, len as libc::socklen_t) };
-        Ok(if status < 0 { last_error() } else { atom("ok") })
-    } else {
-        if args.len() == 5 && name(&args[3]) == Some("native") {
-            let mut bytes = match &args[4] {
-                O::Int(n) if *n > 0 && *n <= 65536 => vec![0; *n as usize],
-                O::Binary(value) if !value.is_empty() && value.len() <= 65536 => value.clone(),
-                _ => return Ok(invalid("value")),
-            };
-            let mut len = bytes.len() as libc::socklen_t;
-            // SAFETY: bytes is a writable buffer and len starts at its capacity.
-            let status = unsafe {
-                libc::getsockopt(
-                    s.as_raw_fd(),
-                    level,
-                    opt,
-                    bytes.as_mut_ptr().cast(),
-                    &mut len,
-                )
-            };
-            bytes.truncate(len as usize);
-            return Ok(if status < 0 {
-                last_error()
-            } else {
-                ok(O::Binary(bytes))
-            });
-        }
-        if args.len() == 5 && name(&args[3]) != Some("value") {
-            return Ok(invalid("value"));
-        }
-        if opt == libc::SO_LINGER {
-            // SAFETY: zeroed linger has a valid representation for getsockopt output.
-            let mut linger: libc::linger = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of_val(&linger) as libc::socklen_t;
-            // SAFETY: linger and len are writable and sized correctly.
-            let status = unsafe {
-                libc::getsockopt(
-                    s.as_raw_fd(),
-                    level,
-                    opt,
-                    (&mut linger as *mut libc::linger).cast(),
-                    &mut len,
-                )
-            };
-            return Ok(if status < 0 {
-                last_error()
-            } else {
-                ok(map(&[
-                    (
-                        "onoff",
-                        atom(if linger.l_onoff == 0 { "false" } else { "true" }),
-                    ),
-                    ("linger", O::Int(linger.l_linger.into())),
-                ]))
-            });
-        }
-        let mut value = 0i32;
-        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
-        // SAFETY: value and len are writable and sized correctly.
-        let status = unsafe {
-            libc::getsockopt(
-                s.as_raw_fd(),
-                level,
-                opt,
-                (&mut value as *mut i32).cast(),
-                &mut len,
-            )
-        };
-        let is_bool = matches!(
-            opt,
-            libc::SO_REUSEADDR | libc::SO_KEEPALIVE | libc::SO_REUSEPORT | libc::TCP_NODELAY
-        );
-        Ok(if status < 0 {
-            last_error()
-        } else if is_bool {
-            ok(atom(if value == 0 { "false" } else { "true" }))
-        } else {
-            ok(O::Int(value.into()))
-        })
-    }
-}
-fn info(value: &O) -> Result<O, BifError> {
-    let h = handle(value)?;
-    let owner = h
-        .owner
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap_or_else(|| atom("undefined"));
-    Ok(map(&[
-        ("domain", atom(h.domain)),
-        ("type", atom(h.kind)),
-        ("protocol", O::Int(h.protocol.into())),
-        ("owner", owner),
-        ("counters", h.counters.lock().unwrap().term()),
-        ("ctype", atom("normal")),
-        ("rstates", O::Nil),
-        ("wstates", O::Nil),
-        ("num_readers", O::Int(0)),
-        ("num_writers", O::Int(0)),
-        ("num_acceptors", O::Int(0)),
-    ]))
-}
-fn global_info() -> O {
-    let table = handles().lock().unwrap();
-    let live: Vec<_> = table
-        .values()
-        .filter(|h| h.socket.lock().unwrap().is_some())
-        .collect();
-    let count = |test: fn(&Handle) -> bool| O::Int(live.iter().filter(|h| test(h)).count() as i64);
-    let counters = map(&[
-        ("num_cnt_bits", O::Int(64)),
-        ("num_sockets", O::Int(live.len() as i64)),
-        ("num_dinet", count(|h| h.domain == "inet")),
-        ("num_dinet6", count(|h| h.domain == "inet6")),
-        ("num_dlocal", count(|h| h.domain == "local")),
-        ("num_tstreams", count(|h| h.kind == "stream")),
-        ("num_tdgrams", count(|h| h.kind == "dgram")),
-        ("num_tseqpkgs", O::Int(0)),
-        ("num_ptcp", count(|h| h.protocol == 6)),
-        ("num_pudp", count(|h| h.protocol == 17)),
-        ("num_pip", count(|h| h.protocol == 0)),
-        ("num_psctp", O::Int(0)),
-    ]);
-    map(&[
-        ("counters", counters),
-        ("debug", bool_atom(DEBUG.load(Ordering::Relaxed))),
-        (
-            "socket_debug",
-            bool_atom(SOCKET_DEBUG.load(Ordering::Relaxed)),
-        ),
-        (
-            "use_registry",
-            bool_atom(USE_REGISTRY.load(Ordering::Relaxed)),
-        ),
-        ("iow", atom("false")),
-        ("eei", atom("true")),
-        ("iov_max", O::Int(1024)),
-        (
-            "io_backend",
-            map(&[("name", atom("unix_essio")), ("sctp", atom("undefined"))]),
-        ),
-    ])
-}
-fn bool_atom(value: bool) -> O {
-    atom(if value { "true" } else { "false" })
-}
-fn command(value: &O) -> Result<O, BifError> {
-    let cmd = name(field(value, "command").ok_or(BifError::BADARG)?).ok_or(BifError::BADARG)?;
-    let data = field(value, "data").ok_or(BifError::BADARG)?;
-    let flag = match name(data) {
-        Some("true") => true,
-        Some("false") => false,
-        _ => return Ok(invalid("value")),
-    };
-    match cmd {
-        "debug" => DEBUG.store(flag, Ordering::Relaxed),
-        "socket_debug" => SOCKET_DEBUG.store(flag, Ordering::Relaxed),
-        "use_registry" => USE_REGISTRY.store(flag, Ordering::Relaxed),
-        _ => return Ok(invalid("command")),
-    }
-    Ok(atom("ok"))
+    Ok(
+        match guard
+            .as_ref()
+            .filter(|_| state_bits::is_open(st.read_state))
+        {
+            Some(s) => io_result(s.shutdown(how)),
+            None => error("closed"),
+        },
+    )
 }
 fn ioctl(args: &[O]) -> Result<O, BifError> {
     let h = handle(&args[0])?;
@@ -2545,10 +2353,11 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
         ("nif_recv", 4) => recv(args, false, false),
         ("nif_recvfrom", 4) => recv(args, true, false),
         ("nif_recvmsg", 5) => recv(args, false, true),
-        ("nif_close" | "nif_finalize_close", 1) => close(&args[0]),
+        ("nif_close", 1) => lifecycle::close(&args[0]),
+        ("nif_finalize_close", 1) => lifecycle::finalize_close(&args[0]),
         ("nif_shutdown", 2) => shutdown(args),
-        ("nif_setopt", 5) => option(args, true),
-        ("nif_getopt", 3 | 5) => option(args, false),
+        ("nif_setopt", 5) => options::option(args, true),
+        ("nif_getopt", 3 | 5) => options::option(args, false),
         ("nif_sockname" | "nif_peername", 1) => {
             let h = handle(&args[0])?;
             let guard = h.socket.lock().unwrap();
@@ -2569,26 +2378,12 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
                 None => error("closed"),
             })
         }
-        ("nif_info", 1) => info(&args[0]),
-        ("nif_cancel", 3) => match crate::name(&args[1]) {
-            Some("connect") => cancel_connect(args),
-            Some("accept") => cancel_accept(args),
-            Some("recv" | "recvfrom" | "recvmmsg" | "recvmsg") => cancel_recv(args),
-            Some("send" | "sendto" | "sendmsg" | "sendv") => cancel_send(args),
-            _ => {
-                let h = handle(&args[0])?;
-                if let Some(s) = h.socket.lock().unwrap().as_ref() {
-                    let write = crate::name(&args[1]).is_some_and(|op| op.starts_with("send"));
-                    select_cancel(s.as_raw_fd(), !write, &args[2]);
-                }
-                h.monitors.lock().unwrap().retain(|r| r != &args[2]);
-                Ok(atom("ok"))
-            }
-        },
+        ("nif_info", 1) => options::info(&args[0]),
+        ("nif_cancel", 3) => lifecycle::cancel(args),
         ("nif_supports", 0) => Ok(supports(None)),
         ("nif_supports", 1) => Ok(supports(Some(&args[0]))),
-        ("nif_info", 0) => Ok(global_info()),
-        ("nif_command", 1) => command(&args[0]),
+        ("nif_info", 0) => Ok(options::global_info()),
+        ("nif_command", 1) => options::command(&args[0]),
         (
             "nif_sendmmsg" | "nif_recvmmsg" | "nif_peeloff" | "nif_socknames" | "nif_peernames",
             _,
@@ -2609,7 +2404,7 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
-    static REACTOR_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::TEST_REACTOR_LOCK as REACTOR_TEST_LOCK;
 
     fn test_ref(id: u32) -> O {
         O::Ref {
@@ -2648,7 +2443,17 @@ mod tests {
         parts[1].clone()
     }
     fn invoke(op: &str, args: &[O]) -> O {
-        dispatch(op, args).unwrap()
+        dispatch(op, args).unwrap_or_else(|error| panic!("{op} {args:?}: {error:?}"))
+    }
+    fn close_socket(socket: &O) {
+        assert_eq!(
+            invoke("nif_close", std::slice::from_ref(socket)),
+            atom("ok")
+        );
+        assert_eq!(
+            invoke("nif_finalize_close", std::slice::from_ref(socket)),
+            atom("ok")
+        );
     }
     fn invoke_bif(module: &str, op: &str, args: &[O]) -> O {
         let mut heap = ProcessHeap::with_words(2048);
@@ -2957,10 +2762,7 @@ mod tests {
         assert!(ready.contains(&(pid(5), test_ref(1))), "{ready:?}");
         assert!(ready.contains(&(pid(5), test_ref(4))), "{ready:?}");
         let accepted = result(invoke("nif_accept", &[listener.clone(), test_ref(5)]));
-        let info = invoke(
-            "nif_getopt",
-            &[accepted, atom("otp"), O::Int(1003), O::Int(0), O::Int(0)],
-        );
+        let info = invoke("nif_getopt", &[accepted, atom("otp"), O::Int(1003)]);
         assert_eq!(info, pair(atom("ok"), pid(5)));
         assert_eq!(
             reactor.wait(Duration::from_secs(1)).map(|(who, _)| who),
@@ -3129,7 +2931,7 @@ mod tests {
                 .set_linger(Some(Duration::ZERO))
                 .unwrap();
         }
-        assert_eq!(invoke("nif_close", &[accepted]), atom("ok"));
+        close_socket(&accepted);
         reactor.set_caller(pid(5));
         let failed = (0..100)
             .find_map(|_| {
@@ -3281,9 +3083,10 @@ mod tests {
     }
     #[test]
     fn tcp_ipv4_ipv6_and_options() {
-        let _lock = REACTOR_TEST_LOCK.lock().unwrap();
+        let (_lock, reactor) = caller_reactor();
         io_round_trip("inet");
         io_round_trip("inet6");
+        set_reactor(Some(reactor));
         let sock = open_socket("inet", "stream", 6);
         for (level, opt, value) in [
             (libc::SOL_SOCKET, libc::SO_REUSEADDR, atom("true")),
@@ -4351,7 +4154,10 @@ mod tests {
         );
         assert_eq!(invoke("nif_close", &[sender]), atom("ok"));
         owner_died(&pid);
-        assert!(handle(&socket).is_err());
+        assert_eq!(
+            invoke("nif_getopt", &[socket, atom("otp"), O::Int(1008)]),
+            error("closed")
+        );
         set_reactor(None);
     }
 
@@ -4456,7 +4262,7 @@ mod tests {
         assert_eq!(recv_call(&accepted, 0, test_ref(4)), ok(bin(b"ab")));
         send_bytes(&client, b"abcd");
         assert_eq!(recv_call(&accepted, 4, test_ref(5)), ok(bin(b"abcd")));
-        assert_eq!(invoke("nif_close", &[client]), atom("ok"));
+        close_socket(&client);
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(recv_call(&accepted, 4, test_ref(6)), error("closed"));
         let counters = field(
@@ -4544,7 +4350,7 @@ mod tests {
         assert_eq!(recv_call(&accepted, 0, test_ref(1)), atom("select"));
         reactor.set_caller(pid(6));
         assert_eq!(recv_call(&accepted, 0, test_ref(2)), atom("select"));
-        assert_eq!(invoke("nif_close", &[client]), atom("ok"));
+        close_socket(&client);
         assert_eq!(
             reactor.wait(Duration::from_secs(1)),
             Some((pid(5), test_ref(1)))

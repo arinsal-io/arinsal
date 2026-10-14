@@ -526,7 +526,9 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
     }
 
     fn cancel(&self, fd: i32, read: bool, _reference: &arinsal_etf::OwnedTerm) -> i32 {
-        let cancelled = self.remove(|entry| entry.fd == fd && entry.readable == read);
+        let cancelled = !self
+            .remove(|entry| entry.fd == fd && entry.readable == read)
+            .is_empty();
         match (cancelled, read) {
             (false, _) => 0,
             (true, true) => arinsal_nif_socket::SELECT_READ_CANCELLED,
@@ -535,8 +537,27 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
     }
 
     fn stop(&self, fd: i32) -> i32 {
-        self.remove(|entry| entry.fd == fd);
-        arinsal_nif_socket::SELECT_STOP_CALLED
+        let removed = self.remove(|entry| entry.fd == fd);
+        let mut result = arinsal_nif_socket::SELECT_STOP_CALLED;
+        if removed.contains(&true) {
+            result |= arinsal_nif_socket::SELECT_READ_CANCELLED;
+        }
+        if removed.contains(&false) {
+            result |= arinsal_nif_socket::SELECT_WRITE_CANCELLED;
+        }
+        result
+    }
+
+    fn monitor(
+        &self,
+        pid: &arinsal_etf::OwnedTerm,
+        handle: &arinsal_etf::OwnedTerm,
+    ) -> Option<u64> {
+        resource_monitor(pid, handle)
+    }
+
+    fn demonitor(&self, monitor: u64) {
+        resource_demonitor(monitor);
     }
 
     fn send(&self, pid: &arinsal_etf::OwnedTerm, message: &arinsal_etf::OwnedTerm) -> bool {
@@ -569,20 +590,22 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
 }
 
 impl NifSelectReactor {
-    fn remove(&self, matches: impl Fn(&SelectRegistration) -> bool) -> bool {
-        let registrations = {
+    /// Drop the selections `matches` accepts; the result is the `readable` flag of each.
+    fn remove(&self, matches: impl Fn(&SelectRegistration) -> bool) -> Vec<bool> {
+        let (registrations, removed) = {
             let mut pending = self.pending.lock().unwrap();
             let mut registrations = Vec::new();
+            let mut removed = Vec::new();
             pending.retain(|entry| {
                 let keep = !matches(entry);
                 if !keep {
                     registrations.push(entry.registration);
+                    removed.push(entry.readable);
                 }
                 keep
             });
-            registrations
+            (registrations, removed)
         };
-        let removed = !registrations.is_empty();
         for registration in registrations.into_iter().flatten() {
             crate::check_io::deregister(registration);
         }
@@ -662,6 +685,110 @@ impl NifSelectReactor {
             self.pending.lock().unwrap().retain(|entry| entry.id != id);
             failed
         }
+    }
+}
+
+/// The process monitors of NIF resources (`ERTS_MON_TYPE_RESOURCE`): a monitored process
+/// that exits fires the down callback of the resource with the monitor it was given.
+#[derive(Default)]
+struct ResourceMonitors {
+    next: u64,
+    by_id: HashMap<u64, ResourceMonitor>,
+    by_process: HashMap<(usize, u64), Vec<u64>>,
+}
+
+struct ResourceMonitor {
+    process: (usize, u64),
+    resource: arinsal_etf::OwnedTerm,
+}
+
+fn resource_monitors() -> &'static Mutex<ResourceMonitors> {
+    static MONITORS: OnceLock<Mutex<ResourceMonitors>> = OnceLock::new();
+    MONITORS.get_or_init(|| Mutex::new(ResourceMonitors::default()))
+}
+
+/// `enif_monitor_process`: `None` when the process is not alive. The registration is
+/// published to the process before it returns, so an exit that has already finished the
+/// resource monitors is seen as a dead process.
+fn resource_monitor(
+    pid_term: &arinsal_etf::OwnedTerm,
+    resource: &arinsal_etf::OwnedTerm,
+) -> Option<u64> {
+    let arinsal_etf::OwnedTerm::Pid {
+        node, id, serial, ..
+    } = pid_term
+    else {
+        return None;
+    };
+    if node != "nonode@nohost" {
+        return None;
+    }
+    let pid = Pid::new(*id, *serial);
+    let runtime = hub_for_pid(pid)?.runtime.upgrade()?;
+    let process = (Arc::as_ptr(&runtime) as usize, pid.data());
+    let monitor = {
+        let mut monitors = resource_monitors().lock().unwrap();
+        monitors.next += 1;
+        let monitor = monitors.next;
+        monitors.by_id.insert(
+            monitor,
+            ResourceMonitor {
+                process,
+                resource: resource.clone(),
+            },
+        );
+        monitors
+            .by_process
+            .entry(process)
+            .or_default()
+            .push(monitor);
+        monitor
+    };
+    if runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::RESOURCE_MON) {
+        Some(monitor)
+    } else {
+        resource_demonitor(monitor);
+        None
+    }
+}
+
+/// `enif_demonitor_process`.
+fn resource_demonitor(monitor: u64) {
+    let mut monitors = resource_monitors().lock().unwrap();
+    let Some(removed) = monitors.by_id.remove(&monitor) else {
+        return;
+    };
+    if let Some(ids) = monitors.by_process.get_mut(&removed.process) {
+        ids.retain(|id| *id != monitor);
+        if ids.is_empty() {
+            monitors.by_process.remove(&removed.process);
+        }
+    }
+}
+
+/// `erts_fire_nif_monitor` for every resource monitor of the exiting process `pid`.
+pub(crate) fn fire_resource_monitors(runtime: &Arc<crate::process::Runtime>, pid: Pid) {
+    let process = (Arc::as_ptr(runtime) as usize, pid.data());
+    let fired: Vec<(u64, arinsal_etf::OwnedTerm)> = {
+        let mut monitors = resource_monitors().lock().unwrap();
+        let ids = monitors.by_process.remove(&process).unwrap_or_default();
+        ids.into_iter()
+            .filter_map(|id| {
+                monitors
+                    .by_id
+                    .remove(&id)
+                    .map(|monitor| (id, monitor.resource))
+            })
+            .collect()
+    };
+    let Some(owned) = pid
+        .to_term()
+        .and_then(|term| arinsal_term::to_owned(term).ok())
+    else {
+        return;
+    };
+    for (monitor, resource) in fired {
+        arinsal_nif_socket::down(&resource, &owned, monitor);
     }
 }
 
@@ -1432,6 +1559,11 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
     let loaded = match caller.as_str() {
         "prim_file" | "prim_buffer" | "zlib" | "prim_tty" | "prim_socket" | "prim_net" => {
             intern_load_atoms(&caller)?;
+            if caller == "prim_socket"
+                && let Ok(info) = arinsal_term::to_owned(info)
+            {
+                arinsal_nif_socket::load_info(&info);
+            }
             atom("ok")
         }
         "erl_tracer" => {
