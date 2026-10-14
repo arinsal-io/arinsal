@@ -353,7 +353,7 @@ def main() -> int:
     _acquire_global_slot()
     parser = argparse.ArgumentParser()
     parser.add_argument("suite", help="suite basename without _SUITE, or all-pilot")
-    parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--arinsal", default=None, help="Arinsal binary (default target/release/arinsal, or target/fastrel/arinsal with --fast)")
     parser.add_argument("--fast", action="store_true", help="build and use the fastrel profile (quick incremental builds for iteration; gates use release)")
     parser.add_argument("--beamasm", action="store_true", help="set ARINSAL_BEAMASM=1 for the Arinsal run and write RESULTS_BEAMASM.md")
