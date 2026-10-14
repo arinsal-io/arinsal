@@ -292,7 +292,8 @@ impl Drop for PortIdReservation<'_> {
 
 fn reserve_port_id(runtime: &crate::process::Runtime) -> Result<PortIdReservation<'_>, VmError> {
     let _ports = runtime.ports.lock().unwrap();
-    // erts open_port fails with system_limit once the port table is full (erl_port.c, OTP-29.1.1).
+    // Port exhaustion is the `driver_create_port` failure mapped to `system_limit` in
+    // erts/emulator/drivers/common/inet_drv.c:11834-11837, OTP-29.1.1.
     let id = runtime
         .port_ids
         .reserve()
@@ -693,6 +694,58 @@ fn output_message(
     trace_port_send(scheduler, trace_scope, port_id, owner, msg);
     publish(scheduler, owner, port, msg);
 }
+
+// Port of erts/emulator/drivers/common/ram_file_drv.c:217-229 (driver_output2 replies).
+pub(crate) fn static_driver_output(handle: &PortHandle, bytes: &[u8]) {
+    output_message(
+        &handle.scheduler,
+        handle.owner_pid(),
+        handle.id,
+        bytes,
+        false,
+        handle.trace_scope,
+    );
+}
+
+// Port of erts/emulator/drivers/common/ram_file_drv.c:465-470, :479-484 and :506-510.
+pub(crate) fn static_driver_output_binary(
+    handle: &PortHandle,
+    header: &[u8],
+    bytes: &[u8],
+    binary: bool,
+) {
+    if !binary {
+        let mut reply = Vec::with_capacity(header.len() + bytes.len());
+        reply.extend_from_slice(header);
+        reply.extend_from_slice(bytes);
+        static_driver_output(handle, &reply);
+        return;
+    }
+    let Some(port) = Term::port(handle.id) else {
+        return;
+    };
+    let mut heap =
+        ProcessHeap::with_words(output_heap_words(header.len() + bytes.len(), false, 32));
+    let build = |heap: &mut ProcessHeap| -> Result<Term, arinsal_term::TermError> {
+        let mut data = TermBuilder::new(heap).binary(bytes)?;
+        for byte in header.iter().rev() {
+            data = TermBuilder::new(heap).cons(Term::small(i64::from(*byte)).unwrap(), data)?;
+        }
+        let message = TermBuilder::new(heap).tuple(&[atom("data"), data])?;
+        TermBuilder::new(heap).tuple(&[port, message])
+    };
+    if let Ok(message) = build(&mut heap) {
+        trace_port_send(
+            &handle.scheduler,
+            handle.trace_scope,
+            handle.id,
+            handle.owner_pid(),
+            message,
+        );
+        publish(&handle.scheduler, handle.owner_pid(), port, message);
+    }
+}
+
 fn line_message(
     scheduler: &Scheduler<Process>,
     owner: Pid,
@@ -857,8 +910,8 @@ fn start(
         // the command names the driver; `spawn` falls back to the spawn driver.
         let first = name.split(' ').next().unwrap_or_default();
         match crate::ddll::find_driver(first) {
-            Some(crate::ddll::Found::Static) if *kind == atom("spawn_driver") => {
-                return start_driver(process, ctx, name);
+            Some(crate::ddll::Found::Static) => {
+                return start_driver(process, ctx, name, binary);
             }
             None if *kind == atom("spawn_driver") => return Err(badarg()),
             Some(found) => {
@@ -1136,9 +1189,11 @@ fn start_driver(
     process: &Process,
     ctx: &RunCtx<'_, Message>,
     name: String,
+    _binary: bool,
 ) -> Result<Term, VmError> {
     let udp = name == "udp_inet";
-    if name != "tcp_inet" && name != "tcp_inet6" && !udp {
+    let ram_file = name == "ram_file_drv";
+    if name != "tcp_inet" && name != "tcp_inet6" && !udp && !ram_file {
         return Err(badarg());
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
@@ -1146,19 +1201,30 @@ fn start_driver(
     let reservation = reserve_port_id(runtime)?;
     let port_id = reservation.id();
     let port = Term::port(port_id).ok_or_else(badarg)?;
-    let handle = make_handle(
-        port_id,
-        None,
-        None,
-        ctx.pid(),
-        0,
-        name,
-        false,
-        default_limits(),
-        scheduler,
-        Arc::as_ptr(runtime) as usize,
-        true,
-    )?;
+    let handle = if ram_file {
+        make_driver_handle(
+            port_id,
+            ctx.pid(),
+            name,
+            false,
+            scheduler,
+            Arc::as_ptr(runtime) as usize,
+        )?
+    } else {
+        make_handle(
+            port_id,
+            None,
+            None,
+            ctx.pid(),
+            0,
+            name,
+            false,
+            default_limits(),
+            scheduler,
+            Arc::as_ptr(runtime) as usize,
+            true,
+        )?
+    };
     runtime
         .ports
         .lock()
@@ -1168,7 +1234,9 @@ fn start_driver(
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     // g_inet_udp
-    if udp {
+    if ram_file {
+        crate::ram_file_drv::attach(port_id, Arc::clone(&handle), _binary);
+    } else if udp {
         crate::inet_udp::attach(Arc::clone(runtime), port_id, Arc::clone(&handle));
     } else {
         crate::inet_drv::attach(Arc::clone(runtime), port_id, Arc::clone(&handle));
@@ -1976,14 +2044,24 @@ fn port_exec_helper() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Failure while creating the accepted TCP port.
+pub(crate) enum InetPortAllocError {
+    /// The runtime port table has no free identifiers.
+    SystemLimit,
+    /// Creating the scheduler or OS port resources failed.
+    NoMemory,
+}
+
 /// Allocate a connected `tcp_inet` port for an accepted socket.
 pub(crate) fn alloc_inet_port(
     runtime: &crate::process::Runtime,
     owner: Pid,
     name: String,
-) -> Result<(u64, Arc<PortHandle>), VmError> {
-    let scheduler = runtime.scheduler()?;
-    let reservation = reserve_port_id(runtime)?;
+) -> Result<(u64, Arc<PortHandle>), InetPortAllocError> {
+    let scheduler = runtime
+        .scheduler()
+        .map_err(|_| InetPortAllocError::NoMemory)?;
+    let reservation = reserve_port_id(runtime).map_err(|_| InetPortAllocError::SystemLimit)?;
     let port_id = reservation.id();
     let handle = make_handle(
         port_id,
@@ -1997,7 +2075,8 @@ pub(crate) fn alloc_inet_port(
         scheduler,
         runtime as *const crate::process::Runtime as usize,
         true,
-    )?;
+    )
+    .map_err(|_| InetPortAllocError::NoMemory)?;
     runtime
         .ports
         .lock()
@@ -3265,6 +3344,17 @@ fn port_command(
         }
         return crate::inet_drv::command(id, ctx.pid(), framed).map(|()| atom("true"));
     }
+    if crate::ram_file_drv::owns(id) {
+        let state = handle.state.lock().unwrap();
+        if state.closed || state.broken {
+            return Err(badarg());
+        }
+        drop(state);
+        trace_command_received_data(process, ctx.pid(), id, data, &framed);
+        return crate::ram_file_drv::command(id, &framed)
+            .map(|()| atom("true"))
+            .map_err(|()| badarg());
+    }
     if let Some((2, hdr)) = handle.framing {
         match hdr {
             1 => {
@@ -3461,6 +3551,7 @@ fn trace_port_receive_indexed_rt(
 // Port of erts/emulator/sys/unix/sys_drivers.c:1039 (stop), OTP-29.1.1.
 // Closing a port releases its descriptors; the child may have detached from them.
 fn release_io(handle: &PortHandle) {
+    crate::ram_file_drv::detach(handle.id);
     // Port of erts/emulator/beam/io.c:3698 (terminate_port) for a dynamic driver.
     if let Some(drv_port) = handle.driver.get()
         && drv_port.terminate()
@@ -4133,6 +4224,12 @@ fn output_command(
             &[arinsal_drv::IoPiece::Copied(&data)],
             None,
         );
+    }
+    if crate::ram_file_drv::owns(id) {
+        if crate::ram_file_drv::command(id, &data).is_err() {
+            signal_badsig(handle, id);
+        }
+        return;
     }
     if let Some((2, hdr)) = handle.framing {
         match hdr {
