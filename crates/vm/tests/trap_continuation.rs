@@ -7,7 +7,7 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(trap_cont).
--export([run/0, run_shapes/0, run_fun_shapes/0, child/3, plain_child/1]).
+-export([run/0, run_shapes/0, run_fun_shapes/0, run_apply_traps/0, child/3, plain_child/1, out_child/2]).
 run() ->
     %% Each trap has to outlast a few schedule slices so the parent observes it
     %% while the child is still inside the continuation export.
@@ -29,6 +29,29 @@ run_shapes() ->
      probe(frame_words, Want, fun() -> tail_frame_words(L) end),
      probe(apply_last, Want, fun() -> apply_last(M, F, L) end),
      probe(fun_call, Want, fun() -> _ = lists:reverse(L, []), ok end)].
+run_apply_traps() ->
+    L = lists:seq(1, 800000),
+    M = lists, F = reverse,
+    [{direct, traps(fun() -> X = lists:reverse(L, []), {X} end)},
+     {apply_call, traps(fun() -> X = M:F(L, []), {X} end)},
+     {apply_tail, traps(fun() -> apply_tail(M, F, L) end)},
+     {apply_frame, traps(fun() -> X = apply_last(M, F, L), {X} end)},
+     {apply_three, traps(fun() -> X = apply(M, F, [L, []]), {X} end)}].
+traps(Fun) ->
+    Parent = self(),
+    Pid = spawn(trap_cont, out_child, [Parent, Fun]),
+    1 = erlang:trace(Pid, true, [running, {tracer, Parent}]),
+    Pid ! go,
+    outs(Pid, 0).
+outs(Pid, Traps) ->
+    receive
+        {trace, Pid, out, {lists, reverse, 2}} -> outs(Pid, Traps + 1);
+        {trace, Pid, _, _} -> outs(Pid, Traps);
+        {done, Pid} -> {finished, Traps >= 2}
+    after 60000 -> hung
+    end.
+out_child(Parent, Fun) ->
+    receive go -> Fun(), Parent ! {done, self()} end.
 run_fun_shapes() ->
     L = lists:seq(1, 800000),
     Want = {lists, reverse, 2},
@@ -40,6 +63,7 @@ call(L) -> X = lists:reverse(L, []), {X}.
 tail_frame(L) -> _ = id(L), lists:reverse(L, []).
 tail_frame_words(L) -> K = {marker, 1}, _ = id(L), lists:reverse(L, [K]).
 apply_last(M, F, L) -> _ = id(L), M:F(L, []).
+apply_tail(M, F, L) -> M:F(L, []).
 fun_last(Fn, L) -> _ = id(L), Fn(L, []).
 fun_tail(Fn, L) -> Fn(L, []).
 id(X) -> X.
@@ -163,11 +187,26 @@ fn trap_frames_of_each_call_shape_match_erts() {
 }
 
 #[test]
-fn trap_frames_of_a_tail_called_export_fun_match_erts() {
-    if std::env::var_os("ARINSAL_INTERP").as_deref() != Some(std::ffi::OsStr::new("1")) {
-        eprintln!("skipped with the JIT: a tail call of an export fun to a trapping BIF aborts it");
+fn apply_of_a_trapping_bif_traps_like_a_direct_call_match_erts() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping apply trap differential test");
         return;
+    };
+    let beam = reference.compile_named("trap_cont", SOURCE, &[]).unwrap();
+    reference.load("trap_cont", &beam).unwrap();
+    let expected = reference.call("trap_cont", "run_apply_traps", &[]);
+    for seed in [0x7C4, 1, 6, 10] {
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled_reductions("trap_cont", "run_apply_traps", &[], 1, Some(seed), 4_000)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(expected, CallResult::Ok(actual.term), "seed {seed:#x}");
     }
+}
+
+#[test]
+fn trap_frames_of_a_tail_called_export_fun_match_erts() {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping export fun trap frame differential test");
         return;
