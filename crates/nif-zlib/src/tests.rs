@@ -1031,3 +1031,34 @@ fn public_dispatch_and_pid_api() {
     assert!(super::lookup("zstd", "get_frame_header_nif", 1).is_some());
     assert!(super::lookup("zlib", "open_nif", 1).is_none());
 }
+
+#[test]
+fn zstd_nif_table_matches_zstd_nif_c() {
+    for &(name, arity, dirty) in &super::ZSTD_NIF_FUNCS {
+        assert!(
+            super::lookup("zstd", name, arity).is_some(),
+            "zstd:{name}/{arity} has no Rust entry"
+        );
+        assert_eq!(
+            super::dirty_cpu("zstd", name, arity),
+            dirty,
+            "{name}/{arity}"
+        );
+    }
+    let dirty: Vec<_> = super::ZSTD_NIF_FUNCS
+        .iter()
+        .filter(|entry| entry.2)
+        .map(|entry| entry.0)
+        .collect();
+    assert_eq!(
+        dirty,
+        [
+            "load_compress_dictionary_nif",
+            "load_decompress_dictionary_nif",
+            "create_cdict_nif",
+            "create_ddict_nif"
+        ]
+    );
+    assert!(super::lookup("zstd", "compress_nif", 1).is_none());
+    assert!(!super::dirty_cpu("zlib", "create_cdict_nif", 2));
+}

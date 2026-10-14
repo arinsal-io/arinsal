@@ -1376,7 +1376,7 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
         );
     }
     let loaded = match caller.as_str() {
-        "prim_file" | "prim_buffer" | "zlib" | "prim_tty" | "prim_socket" | "prim_net" => {
+        "prim_file" | "prim_buffer" | "zlib" | "zstd" | "prim_tty" | "prim_socket" | "prim_net" => {
             intern_load_atoms(&caller)?;
             atom("ok")
         }
@@ -2048,7 +2048,7 @@ pub(crate) fn lookup(module: &str, function: &str, arity: u8) -> Option<BifFn> {
     match module {
         "prim_file" => arinsal_nif_file::lookup(module, function, arity),
         "prim_buffer" => arinsal_nif_buffer::lookup(module, function, arity),
-        "zlib" => arinsal_nif_zlib::lookup(module, function, arity),
+        "zlib" | "zstd" => arinsal_nif_zlib::lookup(module, function, arity),
         "prim_tty" => arinsal_nif_tty::lookup(module, function, arity),
         "prim_socket" | "prim_net" => arinsal_nif_socket::lookup(module, function, arity),
         _ => None,

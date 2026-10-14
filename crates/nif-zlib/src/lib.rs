@@ -273,5 +273,43 @@ pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     })
 }
 
+/// `zstd` NIF entries in `nif_funcs` order: name, arity and whether erts flags the entry
+/// `ERL_NIF_DIRTY_JOB_CPU_BOUND`.
+pub(crate) const ZSTD_NIF_FUNCS: [(&str, u8, bool); 24] = [
+    ("init_compress_nif", 0, false),
+    ("init_decompress_nif", 0, false),
+    ("load_compress_dictionary_nif", 2, true),
+    ("ref_compress_dictionary_nif", 2, false),
+    ("set_compress_parameter_nif", 3, false),
+    ("get_compress_parameter_nif", 2, false),
+    ("set_pledged_src_size_nif", 2, false),
+    ("load_decompress_dictionary_nif", 2, true),
+    ("ref_decompress_dictionary_nif", 2, false),
+    ("set_decompress_parameter_nif", 3, false),
+    ("get_decompress_parameter_nif", 2, false),
+    ("compress_stream_nif", 3, false),
+    ("decompress_stream_nif", 3, false),
+    ("compress_reset_nif", 1, false),
+    ("decompress_reset_nif", 1, false),
+    ("compress_close_nif", 1, false),
+    ("decompress_close_nif", 1, false),
+    ("create_cdict_nif", 2, true),
+    ("create_ddict_nif", 1, true),
+    ("getDictId_fromCDict_nif", 1, false),
+    ("getDictId_fromDDict_nif", 1, false),
+    ("getDictId_fromDict_nif", 1, false),
+    ("getDictId_fromFrame_nif", 1, false),
+    ("get_frame_header_nif", 1, false),
+];
+
+/// Whether the built-in `zstd` NIF `name/arity` runs on a dirty CPU scheduler
+/// (`ERL_NIF_DIRTY_JOB_CPU_BOUND` in erts' `nif_funcs`).
+pub fn dirty_cpu(module: &str, name: &str, arity: u8) -> bool {
+    module == "zstd"
+        && ZSTD_NIF_FUNCS
+            .iter()
+            .any(|&(entry, entry_arity, dirty)| dirty && entry == name && entry_arity == arity)
+}
+
 #[cfg(test)]
 mod tests;

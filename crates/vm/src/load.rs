@@ -202,6 +202,7 @@ fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) 
         "prim_file"
             | "prim_buffer"
             | "zlib"
+            | "zstd"
             | "prim_tty"
             | "prim_socket"
             | "prim_net"

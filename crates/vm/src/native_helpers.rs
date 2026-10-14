@@ -671,12 +671,8 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
     // Port of erts/emulator/beam/erl_nif.c (schedule_dirty_nif / erts_call_dirty_nif),
     // OTP-29.1.1: a dirty NIF called on a normal scheduler first moves the process to a
     // dirty scheduler; the executor runs it there and returns to this body's caller.
-    if moves_to_dirty_io(process, &nif.module, &nif.function, nif.arity) {
-        return trap_to_dirty_nif(
-            process,
-            identity as usize,
-            arinsal_bifs::SchedulerClass::DirtyIo,
-        );
+    if let Some(class) = moves_to_dirty(process, &nif.module, &nif.function, nif.arity) {
+        return trap_to_dirty_nif(process, identity as usize, class);
     }
     // Like the interpreter's NativeBody, the body reads the scheduler hub, which run_native
     // installed when the process was scheduled in.
@@ -732,31 +728,47 @@ pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64
     )
 }
 
-/// Whether static NIF `module:function/arity` is flagged `ERL_NIF_DIRTY_JOB_IO_BOUND` in its
-/// library's `nif_funcs` table.
-pub(crate) fn static_nif_dirty_io(module: &str, function: &str, arity: u8) -> bool {
+/// The dirty scheduler class static NIF `module:function/arity` is flagged with in its library's
+/// `nif_funcs` table (`ERL_NIF_DIRTY_JOB_IO_BOUND` or `ERL_NIF_DIRTY_JOB_CPU_BOUND`).
+pub(crate) fn static_nif_dirty_class(
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> Option<arinsal_bifs::SchedulerClass> {
+    use arinsal_bifs::SchedulerClass;
     match module {
-        "prim_tty" => arinsal_nif_tty::dirty_io(function, arity),
-        "prim_file" => arinsal_nif_file::dirty_io(function, arity),
-        _ => false,
+        "prim_tty" => arinsal_nif_tty::dirty_io(function, arity).then_some(SchedulerClass::DirtyIo),
+        "prim_file" => {
+            arinsal_nif_file::dirty_io(function, arity).then_some(SchedulerClass::DirtyIo)
+        }
+        "zstd" => {
+            arinsal_nif_zlib::dirty_cpu(module, function, arity).then_some(SchedulerClass::DirtyCpu)
+        }
+        _ => None,
     }
 }
 
-/// Whether a call of static NIF `module:function/arity` first moves `process` to a dirty IO
-/// scheduler.
+/// The dirty scheduler class a call of static NIF `module:function/arity` first moves `process`
+/// to, if any.
 ///
 /// Port of erts/emulator/beam/erl_nif.c:3437-3477 (static_schedule_dirty_nif and
 /// static_schedule_dirty_io_nif), OTP-29.1.1. A process outside a scheduler (`Vm::eval`) has no
 /// dirty scheduler to move to and runs the NIF in place.
-pub(crate) fn moves_to_dirty_io(
+pub(crate) fn moves_to_dirty(
     process: &crate::Process,
     module: &str,
     function: &str,
     arity: u8,
-) -> bool {
-    static_nif_dirty_io(module, function, arity)
-        && (module == "prim_tty" || process.runtime.is_some())
-        && arinsal_sched::current_scheduler_type() != arinsal_sched::SchedulerType::DirtyIo
+) -> Option<arinsal_bifs::SchedulerClass> {
+    use arinsal_bifs::SchedulerClass;
+    let class = static_nif_dirty_class(module, function, arity)?;
+    let current = arinsal_sched::current_scheduler_type();
+    let already = match class {
+        SchedulerClass::DirtyIo => current == arinsal_sched::SchedulerType::DirtyIo,
+        SchedulerClass::DirtyCpu => current == arinsal_sched::SchedulerType::DirtyCpu,
+        SchedulerClass::Normal => true,
+    };
+    (!already && (module == "prim_tty" || process.runtime.is_some())).then_some(class)
 }
 
 /// Leave native code through the dirty NIF dispatch trap; the executor runs NIF
