@@ -4,7 +4,8 @@
          owner_exit_closes/0, otp_options/0, cancel_ops/0, info_and_registry/0,
          closer_not_owner/0, errnos/0, socket_options/0,
          reader_death_activates_next/0, closer_dies_before_finalize/0, accept_inherits/0,
-         controlling_process_to_dead/0, owner_dies_with_waiting_reader/0, reader_queue_order/0]).
+         controlling_process_to_dead/0, owner_dies_with_waiting_reader/0, reader_queue_order/0,
+         unreferenced_socket_is_closed_by_gc/0, monitored_by_lists_the_socket/0]).
 
 addr(Port) -> #{family => inet, addr => loopback, port => Port}.
 
@@ -368,3 +369,54 @@ reader_queue_order() ->
     _ = {P1, P2},
     ok = socket:close(C), ok = socket:close(A),
     {P2Queued, First, P1Data, Second, Third}.
+
+monitored_count() ->
+    timer:sleep(50),
+    {monitored_by, L} = process_info(self(), monitored_by),
+    length(L).
+
+open_bound_dropped() ->
+    {ok, C} = socket:open(inet, stream, tcp, #{use_registry => false}),
+    ok = socket:bind(C, addr(0)),
+    {ok, #{port := Port}} = socket:sockname(C),
+    {ok, Fd} = socket:getopt(C, {otp, fd}),
+    {Fd, Port}.
+
+open_registered_dropped() ->
+    {ok, C} = socket:open(inet, stream, tcp),
+    ok = socket:bind(C, addr(0)),
+    ok.
+
+unreferenced_socket_is_closed_by_gc() ->
+    Mon0 = monitored_count(),
+    {Fd, Port} = open_bound_dropped(),
+    Mon1 = monitored_count(),
+    erlang:garbage_collect(),
+    Mon2 = monitored_count(),
+    {ok, S2} = socket:open(inet, stream, tcp, #{use_registry => false}),
+    {ok, Fd2} = socket:getopt(S2, {otp, fd}),
+    Rebind = socket:bind(S2, addr(Port)),
+    ok = socket:close(S2),
+    Registered0 = socket:which_sockets(),
+    ok = open_registered_dropped(),
+    erlang:garbage_collect(),
+    timer:sleep(100),
+    Pinned = socket:which_sockets() -- Registered0,
+    [ok = socket:close(S) || S <- Pinned],
+    {Fd =:= Fd2, Rebind, Mon1 - Mon0, Mon2 - Mon0, length(Pinned)}.
+
+monitored_by_lists_the_socket() ->
+    {ok, S} = socket:open(inet, stream, tcp),
+    {'$socket', Ref} = S,
+    timer:sleep(50),
+    {monitored_by, M0} = process_info(self(), monitored_by),
+    Listed = lists:member(Ref, M0),
+    Other = spawn(fun() -> receive stop -> ok end end),
+    ok = socket:setopt(S, {otp, controlling_process}, Other),
+    timer:sleep(100),
+    {monitored_by, M1} = process_info(self(), monitored_by),
+    {monitored_by, M2} = process_info(Other, monitored_by),
+    Moved = {lists:member(Ref, M1), lists:member(Ref, M2)},
+    Other ! stop,
+    timer:sleep(100),
+    {Listed, Moved, socket:getopt(S, {otp, fd}) =:= {error, closed}}.

@@ -239,7 +239,7 @@ pub(super) fn option(args: &[O], set: bool) -> Result<O, BifError> {
     }
 }
 
-fn setopt_otp(h: &Arc<Handle>, opt: i32, value: &O) -> Result<O, BifError> {
+fn setopt_otp(h: &Handle, opt: i32, value: &O) -> Result<O, BifError> {
     let mut st = h.state.lock().unwrap();
     let flag_option = |st: &State, open_state: u32, opt: i32| -> Option<O> {
         let _ = st;
@@ -317,7 +317,7 @@ fn setopt_otp(h: &Arc<Handle>, opt: i32, value: &O) -> Result<O, BifError> {
 
 /// `esock_setopt_otp_ctrl_proc`: the owner hands the socket to a new controlling
 /// process and the controlling process monitor moves with it.
-fn setopt_otp_ctrl_proc(h: &Arc<Handle>, st: &mut State, value: &O) -> O {
+fn setopt_otp_ctrl_proc(h: &Handle, st: &mut State, value: &O) -> O {
     if !state_bits::is_open(st.write_state) {
         return error("closed");
     }
@@ -380,7 +380,7 @@ fn setopt_otp_rcvbuf(h: &Handle, st: &State, value: &O) -> O {
     atom("ok")
 }
 
-fn getopt_otp(h: &Arc<Handle>, opt: i32) -> Result<O, BifError> {
+fn getopt_otp(h: &Handle, opt: i32) -> Result<O, BifError> {
     let st = h.state.lock().unwrap();
     let options = h.otp_options.lock().unwrap();
     let flag = |opt: i32| options.get(&opt).cloned().unwrap_or_else(|| atom("false"));
@@ -455,7 +455,7 @@ fn getsockopt_bytes(fd: i32, level: i32, opt: i32, size: usize) -> Result<Vec<u8
     Ok(bytes)
 }
 
-fn setopt(h: &Arc<Handle>, level: i32, opt: i32, value: &O, native: bool) -> Result<O, BifError> {
+fn setopt(h: &Handle, level: i32, opt: i32, value: &O, native: bool) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let st = h.state.lock().unwrap();
     let Some(s) = guard.as_ref() else {
@@ -526,7 +526,7 @@ fn encode_linger(onoff: i32, linger: i32) -> Vec<u8> {
 }
 
 /// `args` is the rest of the getopt arguments: nothing, or the kind and its value.
-fn getopt(h: &Arc<Handle>, level: i32, opt: i32, args: &[O]) -> Result<O, BifError> {
+fn getopt(h: &Handle, level: i32, opt: i32, args: &[O]) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let st = h.state.lock().unwrap();
     let Some(s) = guard.as_ref() else {

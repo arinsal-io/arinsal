@@ -69,7 +69,7 @@ fn do_stop(h: &Handle, fd: Option<i32>, st: &mut State) -> bool {
     if is_selected(st)
         && let Some(fd) = fd
     {
-        sres = select_stop(fd).max(0);
+        sres = select_stop(h, fd).max(0);
         scheduled = sres & crate::SELECT_STOP_CALLED == 0;
     }
     let closed = atom("closed");
@@ -177,7 +177,7 @@ fn send_close_msg(h: &Handle, closer: &O, close_ref: O) {
     if let Some(reactor) = active_reactor() {
         let message = O::tuple(vec![
             atom("$socket"),
-            pair(atom("$socket"), h.reference.clone()),
+            pair(atom("$socket"), h.reference().clone()),
             atom("close"),
             close_ref,
         ]);
@@ -192,17 +192,22 @@ pub(crate) fn stop(value: &O) {
     let Ok(h) = handle(value) else {
         return;
     };
+    stop_callback(&h);
+    h.release_for_select();
+}
+
+fn stop_callback(h: &Handle) {
     let mut guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
     if let Some(closer) = st.closer.clone() {
         let close_ref = st.close_ref.take().unwrap_or_else(|| atom("undefined"));
-        send_close_msg(&h, &closer, close_ref);
+        send_close_msg(h, &closer, close_ref);
     } else {
-        mark_closed(&h, &mut st);
+        mark_closed(h, &mut st);
         let socket = guard.take();
         drop(st);
         drop(guard);
-        close_socket_fd(&h, socket);
+        close_socket_fd(h, socket);
     }
 }
 
@@ -223,7 +228,7 @@ pub(crate) fn down(value: &O, pid: &O, monitor: u64) {
     essio_down(&h, pid, monitor);
 }
 
-fn essio_down(h: &Arc<Handle>, pid: &O, monitor: u64) {
+fn essio_down(h: &Handle, pid: &O, monitor: u64) {
     let mut guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
     if st.closer.as_ref() == Some(pid) {
@@ -287,11 +292,22 @@ fn down_requestor(h: &Handle, st: &mut State, fd: Option<i32>, kind: Kind, pid: 
 /// `essio_dtor`: the resource is gone. A descriptor that is still open is closed
 /// without blocking, and the monitors of the resource are dropped.
 pub(super) fn dtor(h: &Handle) {
-    let mut guard = h.socket.lock().unwrap();
-    let mut st = h.state.lock().unwrap();
+    let mut guard = h
+        .socket
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut st = h
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     st.read_state |= state_bits::DTOR | state_bits::CLOSED;
     st.write_state |= state_bits::DTOR | state_bits::CLOSED;
-    if let Some(owner) = h.owner.lock().unwrap().clone() {
+    if let Some(owner) = h
+        .owner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
         demonitor_process(&owner, st.ctrl_mon.take());
     }
     if let Some(closer) = st.closer.clone() {
@@ -314,7 +330,10 @@ pub(super) fn dtor(h: &Handle) {
     for requestor in queued.into_iter().flatten() {
         demonitor_process(&requestor.pid, requestor.mon);
     }
-    h.sendfile_fd.lock().unwrap().take();
+    h.sendfile_fd
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     guard.take();
 }
 
@@ -348,7 +367,7 @@ pub(super) fn cancel(args: &[O]) -> Result<O, BifError> {
 }
 
 /// `essio_cancel_connect`.
-fn cancel_connect(h: &Arc<Handle>, op_ref: &O) -> Result<O, BifError> {
+fn cancel_connect(h: &Handle, op_ref: &O) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
     let Some(me) = self_pid() else {
@@ -372,7 +391,7 @@ fn cancel_connect(h: &Arc<Handle>, op_ref: &O) -> Result<O, BifError> {
 }
 
 /// `essio_cancel_accept`, `essio_cancel_recv` and `essio_cancel_send`.
-fn cancel_requestor(h: &Arc<Handle>, kind: Kind, op_ref: &O) -> Result<O, BifError> {
+fn cancel_requestor(h: &Handle, kind: Kind, op_ref: &O) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
     let mut st = h.state.lock().unwrap();
     let state = if kind == Kind::Writer {
