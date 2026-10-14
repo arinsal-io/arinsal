@@ -7395,6 +7395,14 @@ impl Vm {
             config.dirty_cpu_schedulers as u32,
             config.dirty_io_schedulers as u32,
         );
+        // Port of erts/emulator/beam/erl_cpu_topology.c:1705-1708 (max_main_threads) and
+        // ethr_mutex.c:151-166 (ethr_mutex_lib_late_init): the table locks' spin count grows with
+        // the number of main threads, the schedulers on configured CPUs.
+        arinsal_ets::rwmtx::set_main_threads(
+            config
+                .workers
+                .min(std::thread::available_parallelism().map_or(1, usize::from)),
+        );
         let scheduler = Arc::new(match simulation_seed {
             Some(seed) => Scheduler::simulation(config, seed),
             None => Scheduler::new(config),
