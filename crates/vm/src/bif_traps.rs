@@ -1126,9 +1126,8 @@ fn maps_merge(
         });
     }
 
-    let mut merge = {
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
-        match arinsal_bifs::maps_merge_start(&mut ctx, args)? {
+    let mut merge =
+        match arinsal_bifs::maps_merge_start_on_process_heap(&mut heap, args[0], args[1])? {
             MergeStart::Done(value) => {
                 return Ok(HandlerResult::Done {
                     value,
@@ -1136,8 +1135,7 @@ fn maps_merge(
                 });
             }
             MergeStart::Hashmap(merge) => merge,
-        }
-    };
+        };
     let merged = arinsal_maps::hashmap_merge(&mut merge, &mut reds, &mut heap)
         .map_err(|_| BifError::SystemLimit)?;
     let Some(value) = merged else {

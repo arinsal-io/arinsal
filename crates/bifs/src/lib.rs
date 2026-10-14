@@ -42,8 +42,8 @@ pub use lists::{
     MemberStep, REVERSE_CELLS_PER_RED, REVERSE_ONHEAP_CELLS_PER_RED, ReverseCont, ReverseStep,
     SubtractWalk, lists_append, lists_key, lists_member, lists_member_bif, lists_reverse,
 };
-pub use maps_bifs::maps_merge_start;
 pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk, ProjectionStart};
+pub use maps_bifs::{maps_merge_start, maps_merge_start_on_process_heap};
 pub use pure::{
     BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, IolistSizeWalk,
     IolistWalk, allocate_iolist_binary, atom_to_list_term, binary_bytes, bitstring_bit_len,
