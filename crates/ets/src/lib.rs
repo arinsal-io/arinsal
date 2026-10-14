@@ -157,6 +157,8 @@ pub enum EtsError {
     Unsupported(&'static str),
     /// Term copy or allocation failed.
     Term(TermError),
+    /// The table is busy with a trapped operation; the caller retries after helping it.
+    Busy,
 }
 
 /// One `update_counter` operation, with an optional threshold reset.
@@ -1852,7 +1854,33 @@ pub struct Table {
     /// Set once the registry has detached the table (`ets:delete/1`); cached handles to it
     /// must then fail like a deleted table.
     detached: bool,
+    /// The operation other processes must help finish before they may use the table
+    /// (erts `DB_BUSY` with `continuation_ctx`, or a trapping `delete_all_objects`).
+    busy: Option<BusyOp>,
+    /// Mirror of `busy.is_some()` that can be read without the table lock.
+    busy_flag: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// The work a busy table is waiting for helpers to complete.
+// Port of erts/emulator/beam/erl_db.c:3258-3266 (DB_BUSY in ets_internal_delete_all_2) and
+// :2315 (DB_BUSY with the insert_2_list continuation), OTP-29.1.1.
+enum BusyOp {
+    /// `ets:delete_all_objects/1` released the objects a slice at a time.
+    DeleteAll(Garbage),
+    /// A list insert whose remaining objects are already copied into table form.
+    InsertList(InsertListCtx),
+}
+
+/// The remaining objects of a trapping `ets:insert/2` list insert, shared with the process
+/// that started it so that it can collect the result whoever finishes the work.
+// Port of erts/emulator/beam/erl_db.c:1850-2330 (ets_insert_2_list_info), OTP-29.1.1.
+pub struct InsertListCtx {
+    pending: std::collections::VecDeque<PreparedObject>,
+    outcome: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// Result slot of a trapped list insert: 0 not yet known, 1 `true`, 2 `false`.
+pub type InsertOutcome = Arc<std::sync::atomic::AtomicU8>;
 
 impl Table {
     /// Whether the table was deleted while a cached handle to it was still in use.
@@ -1895,6 +1923,8 @@ impl Table {
             _heir_data: heir_data,
             counter_results: None,
             detached: false,
+            busy: None,
+            busy_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -2560,6 +2590,104 @@ impl Table {
                 );
                 debug_assert!(accepted || new_only);
             }
+        }
+    }
+
+    /// Whether another operation must be helped to completion before this table may be used.
+    pub fn is_busy(&self) -> bool {
+        self.busy.is_some()
+    }
+
+    /// The lock-free mirror of [`Table::is_busy`], for readers that do not hold the table lock.
+    pub fn busy_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.busy_flag)
+    }
+
+    fn set_busy(&mut self, busy: Option<BusyOp>) {
+        self.busy_flag
+            .store(busy.is_some(), AtomicOrdering::Release);
+        self.busy = busy;
+    }
+
+    /// Mark the table busy while `garbage` is released by whoever uses it next.
+    // Port of erts/emulator/beam/erl_db.c:3258-3266 (ets_internal_delete_all_2), OTP-29.1.1.
+    pub fn begin_busy_delete_all(&mut self, garbage: Garbage) {
+        self.set_busy(Some(BusyOp::DeleteAll(garbage)));
+    }
+
+    /// Install the remaining objects of a trapping list insert, which other processes then help
+    /// insert. Returns the slot the result is published in.
+    // Port of erts/emulator/beam/erl_db.c:2306-2318 (ets_insert_2_list_driver installs
+    // `continuation_ctx`), OTP-29.1.1.
+    pub fn begin_busy_insert_list(
+        &mut self,
+        pending: std::collections::VecDeque<PreparedObject>,
+        outcome: InsertOutcome,
+    ) {
+        self.set_busy(Some(BusyOp::InsertList(InsertListCtx { pending, outcome })));
+    }
+
+    /// Do a slice of the busy operation. `reds` counts down by the work done (a negative value
+    /// on return means the slice ran out). Returns whether the table is usable again.
+    // Port of erts/emulator/beam/erl_db.c:3301-3322 (delete_all_objects_continue) and
+    // :2161-2200 (ets_insert_2_list_continuation), OTP-29.1.1.
+    pub fn continue_busy(&mut self, reds: &mut isize) -> bool {
+        let Some(op) = self.busy.take() else {
+            return true;
+        };
+        match op {
+            BusyOp::DeleteAll(mut garbage) => {
+                if self.free_garbage(&mut garbage, reds) {
+                    self.set_busy(None);
+                    true
+                } else {
+                    self.busy = Some(BusyOp::DeleteAll(garbage));
+                    false
+                }
+            }
+            BusyOp::InsertList(mut ctx) => {
+                const ITERATIONS_PER_RED: isize = 8;
+                let mut loops = (*reds).max(0) * ITERATIONS_PER_RED;
+                while loops > 0
+                    && let Some(prepared) = ctx.pending.pop_front()
+                {
+                    self.put_hashed(prepared.stored, prepared.hash, false);
+                    loops -= 1;
+                }
+                *reds = loops / ITERATIONS_PER_RED;
+                if ctx.pending.is_empty() {
+                    ctx.outcome.store(1, AtomicOrdering::Release);
+                    self.set_busy(None);
+                    true
+                } else {
+                    *reds = -1;
+                    self.busy = Some(BusyOp::InsertList(ctx));
+                    false
+                }
+            }
+        }
+    }
+
+    /// Whether any of the prepared objects has a key already in the table.
+    // Port of erts/emulator/beam/erl_db.c:1924-1940 (ets_insert_new_2_dbterm_list_has_member),
+    // OTP-29.1.1.
+    pub fn any_member_prepared(&self, prepared: &[PreparedObject]) -> bool {
+        prepared
+            .iter()
+            .any(|object| self.member_hashed(object.stored.key(self.options.keypos), object.hash))
+    }
+
+    /// Insert prepared objects in order while `loops` lasts.
+    pub fn insert_prepared_batch(
+        &mut self,
+        pending: &mut std::collections::VecDeque<PreparedObject>,
+        loops: &mut isize,
+    ) {
+        while *loops > 0
+            && let Some(prepared) = pending.pop_front()
+        {
+            self.put_hashed(prepared.stored, prepared.hash, false);
+            *loops -= 1;
         }
     }
 
@@ -4424,6 +4552,11 @@ enum GarbageKind {
 }
 
 impl Garbage {
+    /// Nothing left to release.
+    pub fn empty() -> Self {
+        Self(GarbageKind::Tree(Vec::new()))
+    }
+
     /// Release up to `reds` reductions of work, counting down below zero when it ran out.
     /// Returns whether everything is released.
     ///
@@ -4480,6 +4613,11 @@ pub type SharedTable = Arc<TableLock>;
 /// OTP-29.1.1.
 pub struct TableLock {
     lock: TableRwLock<Table>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    /// The options the table was created with, readable without taking the table lock. The
+    /// type, key position, compression and write concurrency never change; the name and the
+    /// protection do, so callers needing those read the table itself.
+    creation: TableOptions,
 }
 
 enum TableRwLock<T> {
@@ -4531,8 +4669,21 @@ impl<T> std::ops::DerefMut for TableWriteGuard<'_, T> {
 }
 
 impl TableLock {
+    /// The creation options (see the field note for which of them may be stale).
+    pub fn options(&self) -> TableOptions {
+        self.creation
+    }
+
+    /// Whether the table is waiting for its users to finish a trapped operation; readable
+    /// without taking the table lock.
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(AtomicOrdering::Acquire)
+    }
+
     fn new(table: Table, frequent_read: bool) -> Self {
         Self {
+            busy: table.busy_flag(),
+            creation: table.options,
             lock: if frequent_read {
                 TableRwLock::FrequentRead(FrequentReadRwLock::new(table))
             } else {
@@ -4676,12 +4827,21 @@ impl Registry {
     /// Lock a table for a fine-grained key read.
     // Port of erts/emulator/beam/erl_db.c:446-500 (db_lock read mode), OTP-29.1.1.
     pub fn get_shared(&self, tid: Tid) -> Result<TableReadGuard<'_, Table>, EtsError> {
-        Ok(self.shared(tid)?.read())
+        let table = self.shared(tid)?.read();
+        // Port of erts/emulator/beam/erl_db.c:770-796 (handle_lacking_permission, DB_BUSY).
+        if table.is_busy() {
+            return Err(EtsError::Busy);
+        }
+        Ok(table)
     }
 
     /// Lock a table for writing.
     pub fn get_mut(&self, tid: Tid) -> Result<TableWriteGuard<'_, Table>, EtsError> {
-        Ok(self.shared(tid)?.write())
+        let table = self.shared(tid)?.write();
+        if table.is_busy() {
+            return Err(EtsError::Busy);
+        }
+        Ok(table)
     }
 
     /// Set CA-tree internal state for a table identity.
@@ -4828,7 +4988,7 @@ impl Registry {
             self.names.remove(&old);
             self.names.insert(name, tid);
         }
-        self.get_mut(tid)?.options.name = name;
+        self.shared(tid)?.write().options.name = name;
         Ok(())
     }
 
@@ -4850,7 +5010,8 @@ impl Registry {
             return;
         };
         for tid in tables {
-            if let Ok(mut table) = self.get_mut(tid) {
+            // Not `get_mut`: erts frees the fixations without the busy check (free_fixations_op).
+            if let Ok(mut table) = self.get(tid) {
                 table.release_fixations(pid);
             }
         }
