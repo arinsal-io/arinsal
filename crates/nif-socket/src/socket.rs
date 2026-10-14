@@ -2394,6 +2394,58 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
     }
 }
 
+/// The `prim_socket` NIF table: name, arity and whether the entry is flagged
+/// `ERL_NIF_DIRTY_JOB_IO_BOUND`, in the order erts declares them.
+pub(crate) const NIF_FUNCS: [(&str, u8, bool); 40] = [
+    ("nif_info", 0, false),
+    ("nif_info", 1, false),
+    ("nif_supports", 0, false),
+    ("nif_supports", 1, false),
+    ("nif_command", 1, false),
+    ("nif_open", 2, false),
+    ("nif_open", 4, false),
+    ("nif_bind", 2, false),
+    ("nif_bind", 3, false),
+    ("nif_connect", 1, false),
+    ("nif_connect", 3, false),
+    ("nif_listen", 2, false),
+    ("nif_accept", 2, false),
+    ("nif_peeloff", 2, false),
+    ("nif_send", 4, false),
+    ("nif_sendto", 5, false),
+    ("nif_sendmsg", 5, false),
+    ("nif_sendmmsg", 4, false),
+    ("nif_sendv", 3, false),
+    ("nif_sendfile", 5, true),
+    ("nif_sendfile", 4, true),
+    ("nif_sendfile", 1, true),
+    ("nif_recv", 4, false),
+    ("nif_recvfrom", 4, false),
+    ("nif_recvmsg", 5, false),
+    ("nif_recvmmsg", 6, false),
+    ("nif_close", 1, false),
+    ("nif_shutdown", 2, false),
+    ("nif_setopt", 5, false),
+    ("nif_getopt", 3, false),
+    ("nif_getopt", 5, false),
+    ("nif_sockname", 1, false),
+    ("nif_socknames", 2, false),
+    ("nif_peername", 1, false),
+    ("nif_peernames", 2, false),
+    ("nif_ioctl", 2, true),
+    ("nif_ioctl", 3, true),
+    ("nif_ioctl", 4, true),
+    ("nif_cancel", 3, false),
+    ("nif_finalize_close", 1, true),
+];
+
+/// Whether the `prim_socket` NIF `name/arity` runs on a dirty IO scheduler.
+pub(crate) fn dirty_io(name: &str, arity: u8) -> bool {
+    NIF_FUNCS
+        .iter()
+        .any(|(entry, entry_arity, dirty)| *dirty && *entry == name && *entry_arity == arity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

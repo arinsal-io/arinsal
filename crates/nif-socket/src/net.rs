@@ -407,6 +407,33 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
     }
 }
 
+/// The `prim_net` NIF table: name, arity and whether the entry is flagged
+/// `ERL_NIF_DIRTY_JOB_IO_BOUND`, in the order erts declares them.
+pub(crate) const NIF_FUNCS: [(&str, u8, bool); 15] = [
+    ("nif_info", 0, false),
+    ("nif_command", 1, false),
+    ("nif_gethostname", 0, false),
+    ("nif_getnameinfo", 2, false),
+    ("nif_getaddrinfo", 3, false),
+    ("nif_getifaddrs", 1, true),
+    ("nif_get_adapters_addresses", 1, true),
+    ("nif_get_if_entry", 1, true),
+    ("nif_get_interface_info", 1, true),
+    ("nif_get_ip_address_table", 1, true),
+    ("nif_getservbyname", 2, true),
+    ("nif_getservbyport", 2, true),
+    ("nif_if_name2index", 1, false),
+    ("nif_if_index2name", 1, false),
+    ("nif_if_names", 0, false),
+];
+
+/// Whether the `prim_net` NIF `name/arity` runs on a dirty IO scheduler.
+pub(crate) fn dirty_io(name: &str, arity: u8) -> bool {
+    NIF_FUNCS
+        .iter()
+        .any(|(entry, entry_arity, dirty)| *dirty && *entry == name && *entry_arity == arity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
