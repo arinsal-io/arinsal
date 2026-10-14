@@ -1,10 +1,10 @@
+use arinsal_term::{BinaryOwner, ExternalBinary, MagicRef};
 use arinsal_term::{
     ExportEntry, FunEntry, HeapAlloc, Node, ProcessHeap, S_REDZONE, S_RESERVED, Term, TermBuilder,
-    VecHeap, binary_memory_bytes, copy_term, exact_eq, global_atoms, make_hash2, match_position,
+    VecHeap, binary_owner, copy_term, exact_eq, global_atoms, make_hash2, match_position,
     set_match_position, size_object, to_owned, writable_bytes_mut, writable_capacity,
     writable_extend_private,
 };
-use arinsal_term::{ExternalBinary, MagicRef};
 use similar_asserts::assert_eq;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -453,11 +453,14 @@ fn owner_arcs_are_released_when_unreachable() {
     let _export = TermBuilder::new(&mut heap)
         .export_fun(export.clone())
         .unwrap();
-    let binary_bytes_before = binary_memory_bytes();
-    let _binary = TermBuilder::new(&mut heap).binary(&[9; 100]).unwrap();
-    assert!(binary_memory_bytes() > binary_bytes_before);
+    let binary = TermBuilder::new(&mut heap).binary(&[9; 100]).unwrap();
+    let Some(BinaryOwner::Binary(binary_owner)) = binary_owner(binary) else {
+        panic!("a 100 byte binary is reference counted");
+    };
+    assert_eq!(binary_owner.ref_count(), Some(2));
     heap.collect(&mut [], &mut [], 0).unwrap();
-    assert_eq!(binary_memory_bytes(), binary_bytes_before);
+    assert_eq!(binary_owner.ref_count(), Some(1));
+    assert_eq!(heap.off_heap_count(), 0);
     assert_eq!(Arc::strong_count(&node), 1);
     assert_eq!(Arc::strong_count(&fun), 1);
     assert_eq!(Arc::strong_count(&export), 1);
@@ -466,10 +469,12 @@ fn owner_arcs_are_released_when_unreachable() {
 #[test]
 fn shared_writable_owner_is_retained_once_and_then_released() {
     let mut heap = ProcessHeap::with_words(256);
-    let binary_bytes_before = binary_memory_bytes();
     let writable = TermBuilder::new(&mut heap)
         .writable_binary(&[5; 100], 800, 1_024)
         .unwrap();
+    let Some(BinaryOwner::Binary(witness)) = binary_owner(writable) else {
+        panic!("a writable binary is owned by an erts Binary");
+    };
     let sub = TermBuilder::new(&mut heap)
         .sub_binary(writable, 8, 400)
         .unwrap();
@@ -477,9 +482,11 @@ fn shared_writable_owner_is_retained_once_and_then_released() {
     heap.collect(&mut roots, &mut [], 0).unwrap();
     let binary_info = heap.off_heap_binary_info();
     assert_eq!(binary_info.len(), 2);
-    assert!(binary_info.iter().all(|entry| entry.2 == 2));
+    assert!(binary_info.iter().all(|entry| entry.2 == 3));
+    assert_eq!(witness.ref_count(), Some(3));
     heap.collect(&mut [], &mut [], 0).unwrap();
-    assert_eq!(binary_memory_bytes(), binary_bytes_before);
+    assert_eq!(witness.ref_count(), Some(1));
+    assert_eq!(heap.off_heap_count(), 0);
 }
 
 #[test]
