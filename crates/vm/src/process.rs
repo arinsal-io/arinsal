@@ -7393,8 +7393,10 @@ impl Vm {
             scheduler_bind_type: scheduler_options.bind_type,
             max_processes: arinsal_term::ptab::process_table_layout().max(),
         };
+        // `erts_no_schedulers` is what `system_info(schedulers)` reports; a run with fewer
+        // worker threads than that keeps the layout of the reported scheduler count.
         arinsal_bifs::init_unique_scheduler_count(
-            config.workers as u32,
+            config.workers.max(crate::natives::sys::schedulers_total()) as u32,
             config.dirty_cpu_schedulers as u32,
             config.dirty_io_schedulers as u32,
         );
