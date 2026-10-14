@@ -581,9 +581,11 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
         let hub = hub_for_pid(target)?;
         let scheduler = hub.scheduler.upgrade()?;
         let id = arinsal_bifs::next_ref_id();
+        let resource = Arc::downgrade(&arinsal_nif_socket::resource(handle)?);
         let handle = handle.clone();
         let monitor = Arc::new(arinsal_nif::ResourceMonitor::native(
             id,
+            resource,
             Arc::new(move |exiting, id| {
                 if let Ok(exiting) = arinsal_term::to_owned(exiting) {
                     arinsal_nif_socket::down(&handle, &exiting, id);

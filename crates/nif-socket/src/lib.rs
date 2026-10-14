@@ -1,8 +1,9 @@
 //! Unix implementations of the OTP 29.1.1 `prim_socket` and `prim_net` NIFs.
 //!
-//! Socket resources use local references. The scheduler supplies a [`Reactor`]
-//! and calls [`owner_died`] when a controlling process exits. No socket call
-//! waits for readiness on a scheduler thread.
+//! A socket is a resource: a magic reference whose payload is the descriptor, and whose
+//! destructor runs when the last reference to it is released. The scheduler supplies a
+//! [`Reactor`] and calls [`down`] when a monitored process exits. No socket call waits for
+//! readiness on a scheduler thread.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::{ExportEntry, FunEntry, HeapAlloc, Node, Term, from_owned, to_owned};
+use arinsal_term::{ExportEntry, FunEntry, HeapAlloc, MagicRef, Node, Term, from_owned, to_owned};
 
 mod net;
 mod socket;
@@ -260,12 +261,6 @@ pub fn set_owner(handle: &O, pid: O) -> Result<(), BifError> {
     socket::set_owner(handle, pid)
 }
 
-/// Close every socket owned by a process that has exited. The runtime reports an exit
-/// through [`down`] for each monitor; this is the same for the controlling process only.
-pub fn owner_died(pid: &O) {
-    socket::owner_died(pid);
-}
-
 /// The resource down callback: the process `pid`, monitored through
 /// [`Reactor::monitor`] with the handle `monitor` for the socket `handle`, has exited.
 pub fn down(handle: &O, pid: &O, monitor: u64) {
@@ -282,9 +277,11 @@ pub fn load_info(info: &O) {
     socket::load_info(info);
 }
 
-/// Release a ref-shaped socket resource when the VM drops its last reference.
-pub fn release(handle: &O) -> Result<(), BifError> {
-    socket::release(handle)
+/// The magic reference behind a socket handle term, when the socket is still alive. The
+/// runtime holds it while a selection of the socket is pending (`enif_select` keeps the
+/// resource) and keeps a weak reference for each monitor of the socket.
+pub fn resource(handle: &O) -> Option<Arc<MagicRef>> {
+    socket::resource(handle)
 }
 
 /// Build the OTP readiness message for a reactor notification.
@@ -348,6 +345,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn supports_writable_binary(&self) -> bool {
         self.0.supports_writable_binary()
     }
+    fn retain_magic(&mut self, owner: Arc<MagicRef>) {
+        self.0.retain_magic(owner)
+    }
+    fn supports_magic(&self) -> bool {
+        self.0.supports_magic()
+    }
     fn retain_node(&mut self, value: Arc<Node>) {
         self.0.retain_node(value)
     }
@@ -380,18 +383,24 @@ fn call(
         .map(|a| to_owned(*a).map_err(|_| BifError::BADARG))
         .collect::<Result<Vec<_>, _>>()?;
     RAISED.with(|raised| raised.borrow_mut().take());
-    let result = match f(&args) {
+    let mark = socket::created_mark();
+    let outcome = f(&args);
+    let result = match outcome {
         Ok(result) => result,
         Err(error) => {
-            return match RAISED.with(|raised| raised.borrow_mut().take()) {
+            let raised = match RAISED.with(|raised| raised.borrow_mut().take()) {
                 Some(reason) => from_owned(&reason, &mut Heap(&mut ctx.heap))
                     .map_err(|_| BifError::SystemLimit)
                     .and_then(|reason| Err(BifError::Error(reason))),
                 None => Err(error),
             };
+            socket::release_created(mark);
+            return raised;
         }
     };
-    from_owned(&result, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
+    let term = from_owned(&result, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit);
+    socket::release_created(mark);
+    term
 }
 
 macro_rules! entries {
