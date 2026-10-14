@@ -909,13 +909,17 @@ fn lookup_element_locked(
     table: &arinsal_ets::Table,
     caller: Term,
     key: Term,
-    position: usize,
+    position: Term,
     default: Option<Term>,
     heap: &mut arinsal_bifs::ProcessHeapHandle<'_>,
 ) -> Result<Term, VmError> {
     if !allowed(table, caller, false) {
         return Err(badarg_cause("access"));
     }
+    // Port of erts/emulator/beam/erl_db.c ets_lookup_element_3: the table is looked up and its
+    // access checked before the position is validated.
+    let position =
+        usize::try_from(position.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
     if default.is_none()
         && !matches!(
             table.options.table_type,
@@ -1985,10 +1989,15 @@ fn call_inner(
         (EtsBif::LookupElement, [target, key, position])
         | (EtsBif::LookupElement, [target, key, position, _]) => {
             let tid = handle(&registry, *target)?;
-            let pos =
-                usize::try_from(position.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
             let table = registry.get_shared(tid).map_err(err)?;
-            lookup_element_locked(&table, caller, *key, pos, args.get(3).copied(), &mut heap)
+            lookup_element_locked(
+                &table,
+                caller,
+                *key,
+                *position,
+                args.get(3).copied(),
+                &mut heap,
+            )
         }
         (EtsBif::UpdateElement, [target, key, updates])
         | (EtsBif::UpdateElement, [target, key, updates, _]) => {

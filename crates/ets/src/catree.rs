@@ -438,36 +438,52 @@ impl CATree {
         drop(self.take_all());
     }
 
+    /// Read-lock every base node of a consistent route snapshot. A split or join invalidates its
+    /// bases under their write locks before publishing new routes, so when all bases are valid
+    /// the held guards cover the table exactly once.
+    // Port of erts/emulator/beam/erl_db_catree.c:2449-2470 (lock_all_bases for
+    // db_calc_stats_catree / db_select_catree), OTP-29.1.1.
+    fn with_all_bases<R>(
+        &self,
+        visit: impl FnOnce(&[std::sync::RwLockReadGuard<'_, Option<Box<Node>>>]) -> R,
+    ) -> R {
+        loop {
+            let routes = self.routes.load_full();
+            let guards: Vec<_> = routes.iter().map(|route| route.base.read()).collect();
+            if routes
+                .iter()
+                .all(|route| route.base.is_valid.load(AtomicOrdering::Acquire))
+            {
+                return visit(&guards);
+            }
+            drop(guards);
+            std::thread::yield_now();
+        }
+    }
+
     /// Port of erts/emulator/beam/erl_db_catree.c:2471 (db_calc_stats_catree), OTP-29.1.1.
     pub(crate) fn count(&self) -> usize {
-        let routes = self.routes.load();
-        routes
-            .iter()
-            .map(|route| Node::count(&route.base.read()))
-            .sum()
+        self.with_all_bases(|bases| bases.iter().map(|root| Node::count(root)).sum())
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c:2471 (db_calc_stats_catree), OTP-29.1.1.
     pub(crate) fn validate(&self) -> bool {
-        let routes = self.routes.load();
-        routes
-            .iter()
-            .all(|route| Node::validate(&route.base.read()))
+        self.with_all_bases(|bases| bases.iter().all(|root| Node::validate(root)))
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c:2350 (erts_db_foreach_thr_prgr_offheap_catree), OTP-29.1.1.
     pub(crate) fn objects(&self) -> Result<Vec<StoredTerm>, EtsError> {
-        let routes = self.routes.load();
-        let mut objects = Vec::new();
-        for route in routes.iter() {
-            let root = route.base.read();
-            let mut refs = Vec::new();
-            Node::walk(&root, &mut refs);
-            for object in refs {
-                objects.push(object.copy_stored()?);
+        self.with_all_bases(|bases| {
+            let mut objects = Vec::new();
+            for root in bases {
+                let mut refs = Vec::new();
+                Node::walk(root, &mut refs);
+                for object in refs {
+                    objects.push(object.copy_stored()?);
+                }
             }
-        }
-        Ok(objects)
+            Ok(objects)
+        })
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c:1633 (db_next_catree), OTP-29.1.1.

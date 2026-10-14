@@ -1078,8 +1078,25 @@ impl HashStorage {
         }
     }
 
-    /// Pseudo-delete every object of a fixed table in place.
+    /// Pseudo-delete the objects of the buckets from `slot` on, until `loops` runs out. Returns
+    /// the first slot not yet marked (`nactive` when done).
     // Port of erts/emulator/beam/erl_db_hash.c:3008-3050 (db_mark_all_deleted_hash), OTP-29.1.1.
+    pub(super) fn mark_deleted_from(&mut self, mut slot: usize, loops: &mut isize) -> usize {
+        loop {
+            let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
+            while let Some(current) = node {
+                current.pseudo_deleted = true;
+                node = current.next.as_deref_mut();
+            }
+            slot += 1;
+            *loops -= 1;
+            if slot >= self.nactive() || *loops <= 0 {
+                return slot;
+            }
+        }
+    }
+
+    /// Pseudo-delete every object at once, for callers that hold the table exclusively.
     pub(super) fn mark_all_deleted(&mut self) {
         for slot in 0..self.nactive() {
             let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
@@ -1139,13 +1156,6 @@ impl HashStorage {
         }
         self.clear_buckets();
         HashGarbage { segments }
-    }
-
-    /// Nothing to release: the objects of a fixed table stay in place as pseudo-deleted.
-    pub(super) fn empty_garbage(&self) -> HashGarbage {
-        HashGarbage {
-            segments: Vec::new(),
-        }
     }
 
     pub(super) fn key_count(&self, keypos: usize) -> usize {

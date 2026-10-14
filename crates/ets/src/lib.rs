@@ -2909,14 +2909,12 @@ impl Table {
             Storage::Ordered(root) => Garbage(GarbageKind::Tree(root.take().into_iter().collect())),
             Storage::CATree(tree) => Garbage(GarbageKind::Tree(tree.take_all())),
             Storage::Hash(storage) => {
-                // A fixed table keeps its objects pseudo-deleted in place, so there is nothing
-                // to release (db_mark_all_deleted_hash).
-                let garbage = if !whole && self.fixed > 0 {
-                    storage.mark_all_deleted();
-                    storage.empty_garbage()
-                } else {
-                    storage.take_garbage()
-                };
+                // A fixed table keeps its objects pseudo-deleted in place: `free_garbage` marks
+                // them a slice at a time (db_mark_all_deleted_hash).
+                if !whole && self.fixed > 0 {
+                    return Garbage(GarbageKind::Mark { slot: 0 });
+                }
+                let garbage = storage.take_garbage();
                 storage.size.store(0, AtomicOrdering::Relaxed);
                 Garbage(GarbageKind::Hash(garbage))
             }
@@ -2926,6 +2924,28 @@ impl Table {
     /// Release `garbage` taken from this table within `reds` reductions. Returns whether all of
     /// it is released.
     pub fn free_garbage(&mut self, garbage: &mut Garbage, reds: &mut isize) -> bool {
+        // Port of erts/emulator/beam/erl_db_hash.c:4017-4033 (db_delete_all_objects_hash): the
+        // mark-or-free decision is retaken on every continuation, so an unfix in between turns
+        // the rest into a plain release.
+        if let GarbageKind::Mark { slot } = &mut garbage.0
+            && let Storage::Hash(storage) = &mut self.storage
+        {
+            if self.fixed > 0 {
+                const LOOPS_PER_REDUCTION: isize = 8;
+                let mut loops = (*reds).max(0) * LOOPS_PER_REDUCTION;
+                *slot = storage.mark_deleted_from(*slot, &mut loops);
+                if *slot < storage.nactive() {
+                    *reds = -1;
+                    return false;
+                }
+                storage.size.store(0, AtomicOrdering::Relaxed);
+                *reds = loops.max(0) / LOOPS_PER_REDUCTION;
+                return true;
+            }
+            let released = storage.take_garbage();
+            storage.size.store(0, AtomicOrdering::Relaxed);
+            garbage.0 = GarbageKind::Hash(released);
+        }
         garbage.step(reds)
     }
 
@@ -3622,7 +3642,13 @@ impl Table {
             let current = found.term_for_match(&mut heap)?;
             // SAFETY: current is owned by the local heap until the replacement is inserted.
             let values = unsafe { current.tuple_ref() }.ok_or(EtsError::BadArg)?;
-            stored_values = Some(values.iter().collect::<Vec<_>>());
+            // A CA tree hands out a copy that dies with this call, so the elements move to `heap`.
+            stored_values = Some(
+                values
+                    .iter()
+                    .map(|value| copy_term(value, &mut heap))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
             Ok(())
         })?;
         let mut values = if let Some(values) = stored_values {
@@ -4390,6 +4416,8 @@ pub struct Garbage(GarbageKind);
 enum GarbageKind {
     /// Hash buckets.
     Hash(HashGarbage),
+    /// A fixed hash table whose objects are being pseudo-deleted, from `slot` on.
+    Mark { slot: usize },
     /// Tree nodes still to be freed.
     #[expect(clippy::vec_box, reason = "tree links already own boxed nodes")]
     Tree(Vec<Box<Node>>),
@@ -4404,6 +4432,8 @@ impl Garbage {
     pub fn step(&mut self, reds: &mut isize) -> bool {
         match &mut self.0 {
             GarbageKind::Hash(garbage) => garbage.step(reds),
+            // Marked by `Table::free_garbage`, which owns the table.
+            GarbageKind::Mark { .. } => true,
             GarbageKind::Tree(stack) => {
                 while let Some(mut node) = stack.pop() {
                     stack.extend(node.left.take());
