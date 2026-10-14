@@ -2481,6 +2481,27 @@ mod tests {
         (lock, reactor)
     }
 
+    fn eventually<T>(mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(value) = attempt() {
+                return Some(value);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn await_socket_error(socket: &O) {
+        let h = handle(socket).unwrap();
+        let guard = h.socket.lock().unwrap();
+        let socket = guard.as_ref().unwrap();
+        let failed = eventually(|| socket.take_error().unwrap());
+        assert!(failed.is_some(), "the peer reset was not delivered");
+    }
+
     fn reactor_state(client: &O) -> bool {
         let h = handle(client).unwrap();
         let st = h.state.lock().unwrap();
@@ -2599,17 +2620,11 @@ mod tests {
         } else {
             assert_eq!(connected, atom("ok"));
         }
-        let accepted = (0..100)
-            .find_map(|_| {
-                let value = invoke("nif_accept", &[listener.clone(), O::Int(1)]);
-                if value == atom("select") {
-                    std::thread::sleep(Duration::from_millis(1));
-                    None
-                } else {
-                    Some(result(value))
-                }
-            })
-            .expect("TCP connection was not accepted");
+        let accepted = eventually(|| {
+            let value = invoke("nif_accept", &[listener.clone(), O::Int(1)]);
+            (value != atom("select")).then(|| result(value))
+        })
+        .expect("TCP connection was not accepted");
         assert_eq!(
             name(
                 field(
@@ -2621,37 +2636,40 @@ mod tests {
             Some(family)
         );
         let payload = vec![b'X'; 131072];
-        assert_eq!(
-            invoke(
+        let mut unsent = payload.clone();
+        while !unsent.is_empty() {
+            match invoke(
                 "nif_send",
                 &[
                     client.clone(),
-                    O::Binary(payload.clone()),
+                    O::Binary(unsent.clone()),
                     O::Int(0),
-                    test_ref(2)
-                ]
-            ),
-            atom("ok")
-        );
-        let peek = (0..100)
-            .find_map(|_| {
-                let value = invoke(
-                    "nif_recv",
-                    &[
-                        accepted.clone(),
-                        O::Int(4),
-                        O::Int(libc::MSG_PEEK.into()),
-                        test_ref(3),
-                    ],
-                );
-                if value == atom("select") {
+                    test_ref(2),
+                ],
+            ) {
+                O::Tuple(ref parts) if parts[0] == atom("select") => {
+                    unsent.drain(..number(&parts[1]).unwrap() as usize);
                     std::thread::sleep(Duration::from_millis(1));
-                    None
-                } else {
-                    Some(result(value))
                 }
-            })
-            .expect("TCP payload was not readable");
+                value => {
+                    assert_eq!(value, atom("ok"));
+                    unsent.clear();
+                }
+            }
+        }
+        let peek = eventually(|| {
+            let value = invoke(
+                "nif_recv",
+                &[
+                    accepted.clone(),
+                    O::Int(4),
+                    O::Int(libc::MSG_PEEK.into()),
+                    test_ref(3),
+                ],
+            );
+            (value != atom("select")).then(|| result(value))
+        })
+        .expect("TCP payload was not readable");
         assert_eq!(peek, O::Binary(vec![b'X'; 4]));
         let mut all = Vec::new();
         while all.len() < payload.len() {
@@ -2680,20 +2698,14 @@ mod tests {
             ),
             atom("ok")
         );
-        let vector_payload = (0..100)
-            .find_map(|_| {
-                let value = invoke(
-                    "nif_recv",
-                    &[accepted.clone(), O::Int(2), O::Int(0), test_ref(6)],
-                );
-                if value == atom("select") {
-                    std::thread::sleep(Duration::from_millis(1));
-                    None
-                } else {
-                    Some(result(value))
-                }
-            })
-            .expect("vector payload was not readable");
+        let vector_payload = eventually(|| {
+            let value = invoke(
+                "nif_recv",
+                &[accepted.clone(), O::Int(2), O::Int(0), test_ref(6)],
+            );
+            (value != atom("select")).then(|| result(value))
+        })
+        .expect("vector payload was not readable");
         assert_eq!(vector_payload, O::Binary(b"ab".to_vec()));
         for sock in [accepted, client, listener] {
             assert_eq!(invoke("nif_close", &[sock]), atom("ok"));
@@ -2984,24 +2996,21 @@ mod tests {
                 .unwrap();
         }
         close_socket(&accepted);
+        await_socket_error(&client);
         reactor.set_caller(pid(5));
-        let failed = (0..100)
-            .find_map(|_| {
-                let value = invoke(
-                    "nif_send",
-                    &[
-                        client.clone(),
-                        O::Binary(vec![1; 1024]),
-                        O::Int(0),
-                        test_ref(4),
-                    ],
-                );
-                matches!(&value, O::Tuple(parts) if parts[0] == atom("error")).then_some(value)
-            })
-            .expect("send did not fail after the peer reset");
+        let failed = invoke(
+            "nif_send",
+            &[
+                client.clone(),
+                O::Binary(vec![1; 1024]),
+                O::Int(0),
+                test_ref(4),
+            ],
+        );
         let O::Tuple(parts) = &failed else {
-            unreachable!()
+            panic!("expected an error tuple: {failed:?}")
         };
+        assert_eq!(parts[0], atom("error"), "{failed:?}");
         let reason = parts[1].clone();
         assert!(
             reason == atom("epipe") || reason == atom("econnreset"),
@@ -3713,6 +3722,7 @@ mod tests {
     }
     #[test]
     fn support_snapshot_and_invalid_address() {
+        let (_lock, _reactor) = caller_reactor();
         assert_eq!(
             invoke("nif_supports", &[]),
             arinsal_etf::decode(include_bytes!("../tests/fixtures/mac_otp29_supports.etf"))
@@ -4057,6 +4067,7 @@ mod tests {
     }
     #[test]
     fn invalid_options_and_values_match_otp_704_cases() {
+        let (_lock, _reactor) = caller_reactor();
         let path = std::env::temp_dir().join(format!("arinsal_options_{}.etf", std::process::id()));
         let expression = format!(
             "{{ok,S}}=socket:open(inet,stream,tcp),Opts=[{{socket,reuseaddr}},{{tcp,nodelay}},{{socket,keepalive}},{{socket,rcvbuf}},{{socket,sndbuf}},{{socket,linger}}],Names=[list_to_atom(\"bad_\"++integer_to_list(I)) || I <- lists:seq(0,99)],R1=[socket:setopt(S,{{socket,N}},true) || N <- Names],R2=[socket:setopt(S,{{N,reuseaddr}},true) || N <- Names],R3=[socket:setopt(S,Opt,list_to_atom(\"bad_\"++integer_to_list(I))) || Opt <- Opts, I <- lists:seq(0,83)],ok=file:write_file(\"{}\",term_to_binary(R1++R2++R3)),socket:close(S),halt().",
@@ -4134,7 +4145,9 @@ mod tests {
     }
     #[test]
     fn selection_and_owner_death() {
-        let _lock = REACTOR_TEST_LOCK.lock().unwrap();
+        let _lock = REACTOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let socket = open_socket("inet", "dgram", 17);
         assert_eq!(
             invoke("nif_bind", &[socket.clone(), addr("inet", 0)]),
