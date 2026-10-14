@@ -9,16 +9,16 @@
     "beamasm": 18,
     "beamjit": 2,
     "beamops": 0,
-    "bifs": 82,
+    "bifs": 66,
     "bits": 5,
     "cli": 0,
     "difftest": 0,
     "etf": 0,
-    "ets": 34,
+    "ets": 27,
     "float": 0,
     "loader": 10,
     "maps": 39,
-    "nif": 301,
+    "nif": 271,
     "nif-buffer": 0,
     "nif-file": 9,
     "nif-socket": 54,
@@ -31,6 +31,6 @@
     "spec": 0,
     "term": 326,
     "vm": 470,
-    "drv": 77
+    "drv": 55
   }
 }
