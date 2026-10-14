@@ -301,12 +301,10 @@ fn iolist_to_binary_result(ctx: &mut Ctx<'_>, root: Term) -> Result<Term, BifErr
     Ok(result)
 }
 
-/// Bits at or below which `iolist_to_iovec/1` copies a binary into the shared run.
-// Port of erts/emulator/beam/erl_iolist.c:37 (IOL2V_COPY_THRESHOLD), OTP-29.1.1.
+/// Bits at or below which `iolist_to_iovec/1` copies a binary into the shared run (OTP-29.1.1).
 const IOL2V_COPY_THRESHOLD_BITS: usize = 64 * 8 * 8;
 
 /// Whether `iolist_to_iovec/1` copies a bitstring instead of keeping it as a segment.
-// Port of erts/emulator/beam/erl_iolist.c:39-40 (IOL_SHOULD_COPY), OTP-29.1.1.
 fn iol2v_should_copy(start_bit: usize, bit_len: usize) -> bool {
     bit_len <= IOL2V_COPY_THRESHOLD_BITS || !start_bit.is_multiple_of(8)
 }
@@ -315,7 +313,7 @@ fn bitstring_geometry(term: Term) -> Result<(usize, usize), BifError> {
     with_binary_bytes(term, |view| (view.start_bit(), view.bit_len()))
 }
 
-// Port of erts/emulator/beam/erl_iolist.c:1265-1310 (iolist_to_iovec_1), OTP-29.1.1.
+// Port of OTP-29.1.1 iolist_to_iovec_1: shortcuts, size pass, copy pass.
 fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let single = match args[0].classify() {
         TermKind::Nil => return Ok(Term::NIL),
@@ -343,7 +341,6 @@ fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             .map_err(|_| BifError::SystemLimit);
     }
 
-    // Port of erts/emulator/beam/erl_iolist.c:114-282 (generic_iolist_size), OTP-29.1.1.
     let mut copy_size: usize = 0;
     let mut total: usize = 0;
     walk_iolist(args[0], |term, byte_allowed| {
@@ -373,7 +370,6 @@ fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         Ok(())
     })?;
 
-    // Port of erts/emulator/beam/erl_iolist.c:425-600 (generic_iolist_copy), OTP-29.1.1.
     enum Segment {
         Run(usize, usize),
         Large(Term),
