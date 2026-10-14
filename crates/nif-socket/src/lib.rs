@@ -4,8 +4,8 @@
 //! and calls [`owner_died`] when a controlling process exits. No socket call
 //! waits for readiness on a scheduler thread.
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
@@ -14,6 +14,10 @@ use arinsal_term::{ExportEntry, FunEntry, HeapAlloc, Node, Term, from_owned, to_
 
 mod net;
 mod socket;
+
+/// Serializes the tests that install a process-wide [`Reactor`].
+#[cfg(test)]
+pub(crate) static TEST_REACTOR_LOCK: Mutex<()> = Mutex::new(());
 
 /// `ERL_NIF_SELECT_STOP_CALLED`: the stop callback ran directly.
 pub const SELECT_STOP_CALLED: i32 = 1 << 0;
@@ -53,8 +57,9 @@ pub trait Reactor: Send + Sync {
     fn stop(&self, fd: i32) -> i32;
     /// `enif_send(env, pid, NULL, msg)`. Returns whether the message was sent.
     fn send(&self, pid: &O, message: &O) -> bool;
-    /// `enif_monitor_process(env, obj, pid, &mon)`. Returns a monitor handle,
-    /// or `None` when the runtime has no monitor facility for resources.
+    /// `enif_monitor_process(env, obj, pid, &mon)`. Returns a monitor handle, or
+    /// `None` when `pid` is not a live local process. When the process exits the
+    /// runtime calls [`down`] with the handle, the pid and the monitor handle.
     fn monitor(&self, _pid: &O, _handle: &O) -> Option<u64> {
         None
     }
@@ -76,12 +81,57 @@ pub struct BlockingReactor {
     pending: Mutex<Vec<BlockingSelection>>,
     caller: Mutex<Option<O>>,
     sent: Mutex<Vec<(O, O)>>,
+    monitors: Mutex<Vec<(u64, O, O)>>,
+    next_monitor: AtomicU64,
+    dead: Mutex<Vec<O>>,
+    scheduled_stop: AtomicBool,
 }
 
 impl BlockingReactor {
     /// Set the process reported by [`Reactor::self_pid`].
     pub fn set_caller(&self, pid: O) {
         *self.caller.lock().unwrap() = Some(pid);
+    }
+
+    /// Make [`Reactor::stop`] report a scheduled stop, which the test completes with [`stop`].
+    pub fn set_scheduled_stop(&self, scheduled: bool) {
+        self.scheduled_stop.store(scheduled, Ordering::Relaxed);
+    }
+
+    /// Processes that [`Reactor::monitor`] reports as not alive.
+    pub fn set_dead(&self, pid: O) {
+        self.dead.lock().unwrap().push(pid);
+    }
+
+    /// The processes with an active monitor, with the monitor handles.
+    pub fn monitored(&self) -> Vec<(O, u64)> {
+        self.monitors
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, pid, _)| (pid.clone(), *id))
+            .collect()
+    }
+
+    /// The process `pid` exits: every monitor of it fires [`down`].
+    pub fn exit(&self, pid: &O) {
+        self.dead.lock().unwrap().push(pid.clone());
+        let fired: Vec<(u64, O)> = {
+            let mut monitors = self.monitors.lock().unwrap();
+            let mut fired = Vec::new();
+            monitors.retain(|(id, monitored, handle)| {
+                if monitored == pid {
+                    fired.push((*id, handle.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            fired
+        };
+        for (id, handle) in fired {
+            down(&handle, pid, id);
+        }
     }
 
     /// Messages sent through [`Reactor::send`], with their destination.
@@ -156,11 +206,23 @@ impl Reactor for BlockingReactor {
         }
     }
     fn stop(&self, fd: i32) -> i32 {
-        self.pending
-            .lock()
-            .unwrap()
-            .retain(|selection| selection.fd != fd);
-        SELECT_STOP_CALLED
+        let mut result = if self.scheduled_stop.load(Ordering::Relaxed) {
+            SELECT_STOP_SCHEDULED
+        } else {
+            SELECT_STOP_CALLED
+        };
+        self.pending.lock().unwrap().retain(|selection| {
+            if selection.fd != fd {
+                return true;
+            }
+            result |= if selection.events == libc::POLLIN {
+                SELECT_READ_CANCELLED
+            } else {
+                SELECT_WRITE_CANCELLED
+            };
+            false
+        });
+        result
     }
     fn send(&self, pid: &O, message: &O) -> bool {
         self.sent
@@ -168,6 +230,23 @@ impl Reactor for BlockingReactor {
             .unwrap()
             .push((pid.clone(), message.clone()));
         true
+    }
+    fn monitor(&self, pid: &O, handle: &O) -> Option<u64> {
+        if self.dead.lock().unwrap().contains(pid) {
+            return None;
+        }
+        let id = self.next_monitor.fetch_add(1, Ordering::Relaxed) + 1;
+        self.monitors
+            .lock()
+            .unwrap()
+            .push((id, pid.clone(), handle.clone()));
+        Some(id)
+    }
+    fn demonitor(&self, monitor: u64) {
+        self.monitors
+            .lock()
+            .unwrap()
+            .retain(|(id, _, _)| *id != monitor);
     }
 }
 
@@ -181,9 +260,26 @@ pub fn set_owner(handle: &O, pid: O) -> Result<(), BifError> {
     socket::set_owner(handle, pid)
 }
 
-/// Close every socket owned by a process that has exited.
+/// Close every socket owned by a process that has exited. The runtime reports an exit
+/// through [`down`] for each monitor; this is the same for the controlling process only.
 pub fn owner_died(pid: &O) {
     socket::owner_died(pid);
+}
+
+/// The resource down callback: the process `pid`, monitored through
+/// [`Reactor::monitor`] with the handle `monitor` for the socket `handle`, has exited.
+pub fn down(handle: &O, pid: &O, monitor: u64) {
+    socket::down(handle, pid, monitor);
+}
+
+/// The resource stop callback for a stop that the select machinery had to schedule.
+pub fn stop(handle: &O) {
+    socket::stop(handle);
+}
+
+/// The `load_nif` info map: the socket registry process and the global defaults.
+pub fn load_info(info: &O) {
+    socket::load_info(info);
 }
 
 /// Release a ref-shaped socket resource when the VM drops its last reference.
@@ -458,36 +554,7 @@ pub(crate) fn string(value: &O) -> Option<String> {
     }
 }
 pub(crate) fn errno(code: i32) -> O {
-    let reason = match code {
-        libc::EAGAIN => "eagain",
-        libc::EINPROGRESS => "einprogress",
-        libc::EALREADY => "ealready",
-        libc::EINTR => "eintr",
-        libc::EBADF => "ebadf",
-        libc::EINVAL => "einval",
-        libc::ENOTCONN => "enotconn",
-        libc::EADDRINUSE => "eaddrinuse",
-        libc::EADDRNOTAVAIL => "eaddrnotavail",
-        libc::ECONNREFUSED => "econnrefused",
-        libc::ECONNRESET => "econnreset",
-        libc::ETIMEDOUT => "etimedout",
-        libc::EPIPE => "epipe",
-        libc::EACCES => "eacces",
-        libc::EPERM => "eperm",
-        libc::ENOMEM => "enomem",
-        libc::ENOBUFS => "enobufs",
-        libc::EAFNOSUPPORT => "eafnosupport",
-        libc::EPROTONOSUPPORT => "eprotonosupport",
-        libc::EISCONN => "eisconn",
-        libc::EDESTADDRREQ => "edestaddrreq",
-        libc::EMSGSIZE => "emsgsize",
-        libc::ENOPROTOOPT => "enoprotoopt",
-        libc::ENOTSOCK => "enotsock",
-        libc::ENETUNREACH => "enetunreach",
-        libc::EHOSTUNREACH => "ehostunreach",
-        _ => return error(&format!("errno_{code}")),
-    };
-    error(reason)
+    error(&arinsal_drv::errno_id(code))
 }
 pub(crate) fn last_error() -> O {
     errno(

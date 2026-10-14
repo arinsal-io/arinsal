@@ -62,8 +62,8 @@ connect_after_listener_close() ->
     Accepted.
 "#;
 
-fn run(program: &Path, dir: &Path, function: &str) -> (bool, String) {
-    let eval = format!("io:format(\"~p~n\", [gen_tcp_socket_compat:{function}()]), halt().");
+fn run(program: &Path, dir: &Path, module: &str, function: &str) -> (bool, String) {
+    let eval = format!("io:format(\"~p~n\", [{module}:{function}()]), halt().");
     let root = arinsal_difftest::reference::otp_root();
     let mut command = if program == Path::new("erl") {
         match &root {
@@ -110,6 +110,10 @@ fn run(program: &Path, dir: &Path, function: &str) -> (bool, String) {
 }
 
 fn compare(function: &str) {
+    compare_in("gen_tcp_socket_compat", SOURCE, function);
+}
+
+fn compare_in(module: &str, source: &str, function: &str) {
     let arinsal = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arinsal");
     assert!(arinsal.is_file(), "build target/debug/arinsal first");
     let Ok(reference) = RefErl::start() else {
@@ -117,16 +121,13 @@ fn compare(function: &str) {
         return;
     };
     let beam = reference
-        .compile_named("gen_tcp_socket_compat", SOURCE, &[])
-        .expect("compile gen_tcp_socket_compat");
-    let dir = std::env::temp_dir().join(format!(
-        "gen_tcp_socket_compat_{}_{function}",
-        std::process::id()
-    ));
+        .compile_named(module, source, &[])
+        .unwrap_or_else(|error| panic!("compile {module}: {error:?}"));
+    let dir = std::env::temp_dir().join(format!("{module}_{}_{function}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("gen_tcp_socket_compat.beam"), beam).unwrap();
-    let (erl_ok, expected) = run(Path::new("erl"), &dir, function);
-    let (ok, actual) = run(&arinsal, &dir, function);
+    std::fs::write(dir.join(format!("{module}.beam")), beam).unwrap();
+    let (erl_ok, expected) = run(Path::new("erl"), &dir, module, function);
+    let (ok, actual) = run(&arinsal, &dir, module, function);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(erl_ok, "erl failed in {function}: {expected}");
     assert!(ok, "arinsal failed in {function}: {actual}");
@@ -151,4 +152,95 @@ fn accept_timeout_matches_erts() {
 #[test]
 fn connect_with_acceptor_matches_erts() {
     compare("connect_after_listener_close");
+}
+
+const CLOSE_SOURCE: &str = include_str!("fixtures/sock_close_compat.erl");
+
+fn compare_close(function: &str) {
+    compare_in("sock_close_compat", CLOSE_SOURCE, function);
+}
+
+#[test]
+fn close_aborts_blocked_recv_matches_erts() {
+    compare_close("close_aborts_blocked_recv");
+}
+
+#[test]
+fn close_aborts_blocked_accept_matches_erts() {
+    compare_close("close_aborts_blocked_accept");
+}
+
+#[test]
+fn close_aborts_nowait_requestors_matches_erts() {
+    compare_close("close_aborts_nowait_requestors");
+}
+
+#[test]
+fn controlling_process_transfer_keeps_the_socket_open() {
+    compare_close("controlling_process_transfer");
+}
+
+#[test]
+fn controlling_process_to_a_dead_process_closes_the_socket() {
+    compare_close("controlling_process_to_dead");
+}
+
+#[test]
+fn owner_exit_closes_the_socket() {
+    compare_close("owner_exit_closes");
+}
+
+#[test]
+fn owner_exit_aborts_waiting_readers() {
+    compare_close("owner_dies_with_waiting_reader");
+}
+
+#[test]
+fn closer_exit_before_finalize_closes_the_socket() {
+    compare_close("closer_dies_before_finalize");
+}
+
+#[test]
+fn closing_from_a_process_that_is_not_the_owner() {
+    compare_close("closer_not_owner");
+}
+
+#[test]
+fn reader_exit_activates_the_next_reader() {
+    compare_close("reader_death_activates_next");
+}
+
+#[test]
+fn readers_are_served_in_queue_order() {
+    compare_close("reader_queue_order");
+}
+
+#[test]
+fn otp_options_round_trip_like_erts() {
+    compare_close("otp_options");
+}
+
+#[test]
+fn accepted_sockets_inherit_the_otp_options() {
+    compare_close("accept_inherits");
+}
+
+#[test]
+fn socket_options_round_trip_like_erts() {
+    compare_close("socket_options");
+}
+
+#[test]
+fn cancel_results_match_erts() {
+    compare_close("cancel_ops");
+}
+
+#[test]
+fn info_counters_and_registry_match_erts() {
+    compare_close("info_and_registry");
+}
+
+#[test]
+fn errno_atoms_match_erts() {
+    compare_close("errnos");
 }

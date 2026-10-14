@@ -4664,6 +4664,11 @@ impl Process {
         // Further publishes fail with `NoProcess` and the watcher synthesizes DOWN.
         // Signals already queued are installed before we notify.
         self.absorb_exit_signals(ctx);
+        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::RESOURCE_MON != 0
+            && let Some(runtime) = self.runtime.as_ref()
+        {
+            crate::natives::nif::fire_resource_monitors(runtime, ctx.pid());
+        }
         let Some(cold) = self.cold.take() else {
             return;
         };

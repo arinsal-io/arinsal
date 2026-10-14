@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 arinsal-bifs.workspace = true
+arinsal-drv.workspace = true
 arinsal-etf.workspace = true
 arinsal-nif-file.workspace = true
 arinsal-term.workspace = true
