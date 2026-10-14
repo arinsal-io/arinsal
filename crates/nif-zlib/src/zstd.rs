@@ -265,15 +265,17 @@ pub(crate) fn get_int(term: Term) -> Option<i32> {
     term.as_small().and_then(|value| i32::try_from(value).ok())
 }
 
-/// `enif_get_uint64`: a non-negative integer below 2^64.
+/// `enif_get_uint64`: a non-negative integer below 2^64. Only a one-digit bignum is copied out;
+/// any other boxed term, a binary included, is rejected without being read.
 pub(crate) fn get_uint64(term: Term) -> Option<u64> {
     match term.as_small() {
         Some(value) => u64::try_from(value).ok(),
-        None if term.is_immed() => None,
-        None => match to_owned(term) {
+        None if term.is_negative_bignum() => None,
+        None if term.bignum_digit_count() == Some(1) => match to_owned(term) {
             Ok(O::BigInt(ref value)) => value.to_u64(),
             _ => None,
         },
+        None => None,
     }
 }
 
