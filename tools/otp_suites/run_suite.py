@@ -144,11 +144,16 @@ def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limi
         if sources:
             include_dirs = {directory, HELPERS, *(pathlib.Path(source).parent for source in helper_suites)}
             include_args = [arg for include in sorted(include_dirs) for arg in ("-I", str(include))]
-            cp = run(["erlc", "-W0", "+debug_info", *include_args, "-pa", str(build), "-o", str(directory), *sources], 600)
-            if cp.returncode:
-                if helper_suites:
-                    raise RuntimeError(f"suite/helper compile failed ({cp.returncode}):\n{cp.stdout[-4000:]}")
-                print(f"erlc warning for {name}: {cp.stdout[-800:]}", file=sys.stderr, flush=True)
+            required = {str(directory / f"{name}_SUITE.erl"), *(str(path) for path in helper_suites)}
+            for source in sources:
+                cp = run(
+                    ["erlc", "-W0", "+debug_info", *include_args, "-pa", str(build), "-o", str(directory), source],
+                    600,
+                )
+                if cp.returncode:
+                    if source in required:
+                        raise RuntimeError(f"suite/helper compile failed ({cp.returncode}) for {source}:\n{cp.stdout[-4000:]}")
+                    print(f"erlc warning for {name} ({pathlib.Path(source).name}): {cp.stdout[-800:]}", file=sys.stderr, flush=True)
             for helper in helper_suites:
                 if not (directory / f"{helper.stem}.beam").is_file():
                     raise RuntimeError(f"helper suite did not compile: {helper.name}")
@@ -259,7 +264,13 @@ def erl_cache_key(name: str) -> str:
     return h.hexdigest()[:16]
 
 
-def erl_reference(name: str, build: pathlib.Path, limit: int, use_cache: bool) -> tuple[int, dict[str, tuple[str, str]], str, dict[str, float]]:
+def erl_reference(
+    name: str,
+    build: pathlib.Path,
+    limit: int,
+    use_cache: bool,
+    partial_filter: str = "",
+) -> tuple[int, dict[str, tuple[str, str]], str, dict[str, float]]:
     path = ERL_CACHE / f"{name}-{erl_cache_key(name)}.json"
     if use_cache and path.is_file():
         d = json.loads(path.read_text())
@@ -268,12 +279,12 @@ def erl_reference(name: str, build: pathlib.Path, limit: int, use_cache: bool) -
         return d["rc"], cases, d["meta"], elapsed
     with tempfile.TemporaryDirectory(prefix=f"otp-{name}-erl-") as ed:
         erl_dir = pathlib.Path(ed)
-        erc, eout = run_one("erl", name, erl_dir, build, limit)
+        erc, eout = run_one("erl", name, erl_dir, build, limit, extra=partial_filter)
         ecases, emeta = parse_results(erl_dir, name)
         if not ecases:
             emeta = emeta or eout[-600:].replace("\n", " ")
         elapsed = parse_elapsed(erl_dir, name)
-    if ecases and erc == 0:
+    if ecases and erc == 0 and not partial_filter:
         ERL_CACHE.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"rc": erc, "cases": ecases, "meta": emeta, "elapsed": elapsed}))
     return erc, ecases, emeta, elapsed
@@ -357,8 +368,8 @@ def main() -> int:
     parser.add_argument("--arinsal", default=None, help="Arinsal binary (default target/release/arinsal, or target/fastrel/arinsal with --fast)")
     parser.add_argument("--fast", action="store_true", help="build and use the fastrel profile (quick incremental builds for iteration; gates use release)")
     parser.add_argument("--beamasm", action="store_true", help="set ARINSAL_BEAMASM=1 for the Arinsal run and write RESULTS_BEAMASM.md")
-    parser.add_argument("--case", default="", help="comma-separated test cases: run only these on Arinsal, compare with cached erl, do not touch RESULTS.md")
-    parser.add_argument("--group", default="", help="run only this group on Arinsal (same reporting as --case)")
+    parser.add_argument("--case", default="", help="comma-separated test cases: compare these cases, using cached erl results when available; do not touch RESULTS.md")
+    parser.add_argument("--group", default="", help="compare only this group, using cached erl results when available")
     parser.add_argument("--no-erl-cache", action="store_true", help="rerun the erl reference instead of using the cache")
     parser.add_argument("--case-floor", type=float, default=20.0, help="minimum per-case limit in seconds")
     parser.add_argument("--case-factor", type=float, default=10.0, help="per-case limit = max(floor, factor * erl case time)")
@@ -388,14 +399,24 @@ def main() -> int:
         compile_helpers(build)
         for name in suites:
             try:
-                erc, ecases, emeta, elapsed = erl_reference(name, build, args.timeout, not args.no_erl_cache)
+                partial_filter = ""
+                if args.case:
+                    partial_filter += ",{testcase,[" + ",".join(
+                        f"'{case.strip()}'" for case in args.case.split(",") if case.strip()
+                    ) + "]}"
+                if args.group:
+                    partial_filter += ",{group,'" + args.group + "'}"
+                erc, ecases, emeta, elapsed = erl_reference(
+                    name,
+                    build,
+                    args.timeout,
+                    not args.no_erl_cache,
+                    partial_filter,
+                )
                 # Cases erl does not pass need no generous limit (e.g. erl itself hits a 9-minute timetrap).
                 passing = {c: t for c, t in elapsed.items() if ecases.get(c, ("",))[0] == "ok"}
                 extra = timeout_hook(passing, args.case_floor, args.case_factor)
-                if args.case:
-                    extra += ",{testcase,[" + ",".join(f"'{c.strip()}'" for c in args.case.split(",") if c.strip()) + "]}"
-                if args.group:
-                    extra += ",{group,'" + args.group + "'}"
+                extra += partial_filter
                 with tempfile.TemporaryDirectory(prefix=f"otp-{name}-arinsal-") as ad:
                     arin_dir = pathlib.Path(ad)
                     arc, aout = run_one(arinsal, name, arin_dir, build, args.timeout, args.beamasm, extra)
