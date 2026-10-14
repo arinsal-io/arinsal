@@ -57,6 +57,27 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("string", "list_to_float", 1),
 ];
 
+/// `erlang:decode_packet/3` called directly from native code, as erts calls `decode_packet_3`
+/// with `c_p` and the argument registers. A bad argument is left to the executor path, which
+/// re-runs the pure BIF and raises its exception with the BIF as the top frame.
+// Port of erts/emulator/beam/erl_bif_port.c:1476 (decode_packet_3), OTP-29.1.1.
+pub(crate) fn decode_packet_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    if args.len() != 3 {
+        return None;
+    }
+    crate::calls::call_bif(
+        &mut process.heap,
+        &mut process.reductions,
+        arinsal_packet::DECODE_PACKET_3,
+        args,
+    )
+    .ok()
+    .map(Ok)
+}
+
 pub(crate) fn call(
     _vm: &mut Vm,
     process: &mut Process,

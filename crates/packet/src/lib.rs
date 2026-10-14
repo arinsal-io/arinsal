@@ -11,11 +11,12 @@ pub use parser::{
 
 use std::sync::Arc;
 
-use arinsal_bifs::{BifError, BifFn, Ctx, proper_list_terms, tuple_terms, with_binary_bytes};
+use arinsal_bifs::{BifError, BifFn, Ctx, for_each_list_term, tuple_pair, with_binary_bytes};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::{
-    ExportEntry, FunEntry, HeapAlloc, Node, Term, TermBuilder, from_owned, global_atoms,
-};
+use arinsal_term::{ExportEntry, FunEntry, HeapAlloc, Node, Term, TermBuilder, atoms, from_owned};
+
+/// `erlang:decode_packet/3`, callable without a name lookup.
+pub const DECODE_PACKET_3: BifFn = decode_packet;
 
 /// Return the `erlang:decode_packet/3` BIF implementation.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
@@ -85,43 +86,38 @@ fn type_of(value: Term) -> Option<PacketType> {
             _ => None,
         };
     }
-    Some(match global_atoms().text(value.as_atom()?)? {
-        "raw" => PacketType::Raw,
-        "asn1" => PacketType::Asn1,
-        "sunrm" => PacketType::Sunrm,
-        "cdr" => PacketType::Cdr,
-        "fcgi" => PacketType::Fcgi,
-        "line" => PacketType::Line,
-        "tpkt" => PacketType::Tpkt,
-        "http" => PacketType::Http,
-        "httph" => PacketType::Httph,
-        "http_bin" => PacketType::HttpBin,
-        "httph_bin" => PacketType::HttphBin,
-        "ssl_tls" => PacketType::SslTls,
+    Some(match value.as_atom()? {
+        atoms::RAW => PacketType::Raw,
+        atoms::ASN1 => PacketType::Asn1,
+        atoms::SUNRM => PacketType::Sunrm,
+        atoms::CDR => PacketType::Cdr,
+        atoms::FCGI => PacketType::Fcgi,
+        atoms::LINE => PacketType::Line,
+        atoms::TPKT => PacketType::Tpkt,
+        atoms::HTTP => PacketType::Http,
+        atoms::HTTPH => PacketType::Httph,
+        atoms::HTTP_BIN => PacketType::HttpBin,
+        atoms::HTTPH_BIN => PacketType::HttphBin,
+        atoms::SSL_TLS => PacketType::SslTls,
         _ => return None,
     })
 }
 fn options(value: Term, ty: PacketType) -> Result<PacketOptions, BifError> {
     let mut result = PacketOptions::default();
-    for item in proper_list_terms(value).ok_or(BifError::BADARG)? {
-        let pair = tuple_terms(item).ok_or(BifError::BADARG)?;
-        let [name, value] = pair.as_slice() else {
-            return Err(BifError::BADARG);
-        };
-        let name = name
-            .as_atom()
-            .and_then(|name| global_atoms().text(name))
-            .ok_or(BifError::BADARG)?;
-        let n = integer(*value).ok_or(BifError::BADARG)?;
+    for_each_list_term(value, |item| {
+        let (name, value) = tuple_pair(item).ok_or(BifError::BADARG)?;
+        let name = name.as_atom().ok_or(BifError::BADARG)?;
+        let n = integer(value).ok_or(BifError::BADARG)?;
         match name {
-            "packet_size" => result.packet_size = n,
-            "line_length" => result.line_length = n,
-            "line_delimiter" if ty == PacketType::Line && n <= 255 => {
+            atoms::PACKET_SIZE => result.packet_size = n,
+            atoms::LINE_LENGTH => result.line_length = n,
+            atoms::LINE_DELIMITER if ty == PacketType::Line && n <= 255 => {
                 result.line_delimiter = n as u8
             }
             _ => return Err(BifError::BADARG),
         }
-    }
+        Ok(())
+    })?;
     Ok(result)
 }
 
@@ -188,9 +184,9 @@ fn decode_packet(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         return Err(BifError::BADARG);
     };
     let Some(ty) = type_of(*ty) else {
-        let cause = from_owned(&atom("badopt"), &mut Heap(&mut ctx.heap))
-            .map_err(|_| BifError::SystemLimit)?;
-        return Err(BifError::Badarg { cause: Some(cause) });
+        return Err(BifError::Badarg {
+            cause: Some(Term::atom(atoms::BADOPT)),
+        });
     };
     let opts = options(*opts, ty)?;
     let decoded = with_binary_bytes(*data, |view| {
@@ -208,20 +204,22 @@ fn decode_packet(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     .ok_or(BifError::BADARG)?;
     let mut heap = Heap(&mut ctx.heap);
     let value = match decoded {
-        Decoded::Invalid => from_owned(&tuple(vec![atom("error"), atom("invalid")]), &mut heap),
-        Decoded::More(length) => from_owned(
-            &tuple(vec![
-                atom("more"),
-                length.map_or_else(|| atom("undefined"), |n| O::Int(n as i64)),
-            ]),
-            &mut heap,
-        ),
+        Decoded::Invalid => TermBuilder::new(&mut heap)
+            .tuple(&[Term::atom(atoms::ERROR), Term::atom(atoms::INVALID)]),
+        Decoded::More(length) => match length {
+            None => TermBuilder::new(&mut heap)
+                .tuple(&[Term::atom(atoms::MORE), Term::atom(atoms::UNDEFINED)]),
+            Some(n) => match Term::small(n as i64) {
+                Some(small) => TermBuilder::new(&mut heap).tuple(&[Term::atom(atoms::MORE), small]),
+                None => from_owned(&tuple(vec![atom("more"), O::Int(n as i64)]), &mut heap),
+            },
+        },
         Decoded::Packet {
             body,
             rest_start,
             rest_len,
         } => {
-            let ok = from_owned(&atom("ok"), &mut heap).map_err(|_| BifError::SystemLimit)?;
+            let ok = Term::atom(atoms::OK);
             let body = match body {
                 Body::Sub { start, len } => TermBuilder::new(&mut heap)
                     .sub_binary_bif(*data, start * 8, len * 8)

@@ -377,6 +377,9 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "resume_process" && arity == 1 {
         return Some(proc::resume_process_light);
     }
+    if module == "erlang" && function == "decode_packet" && arity == 3 {
+        return Some(misc::decode_packet_light);
+    }
     if module == "erlang" && function == "monitor" && arity == 2 {
         return Some(crate::signals::monitor_light);
     }
@@ -685,6 +688,12 @@ mod tests {
         ] {
             assert!(implemented_natives().contains(&("erts_internal", function, arity)));
         }
+    }
+
+    #[test]
+    fn decode_packet_is_called_from_native_code_like_a_plain_bif() {
+        assert!(process_bif("erlang", "decode_packet", 3).is_some());
+        assert!(process_bif("erlang", "decode_packet", 2).is_none());
     }
 
     #[test]
