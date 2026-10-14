@@ -492,10 +492,20 @@ fn hub_for_pid(pid: Pid) -> Option<Hub> {
     })
 }
 
+fn owned_local_pid(term: &arinsal_etf::OwnedTerm) -> Option<Pid> {
+    let arinsal_etf::OwnedTerm::Pid {
+        node, id, serial, ..
+    } = term
+    else {
+        return None;
+    };
+    (node == "nonode@nohost").then(|| Pid::new(*id, *serial))
+}
+
 struct SelectRegistration {
     id: u64,
     fd: i32,
-    reference: arinsal_etf::OwnedTerm,
+    readable: bool,
     registration: Option<crate::check_io::Registration>,
 }
 
@@ -514,15 +524,19 @@ impl Default for NifSelectReactor {
 }
 
 impl arinsal_nif_socket::Reactor for NifSelectReactor {
-    // Port of enif_select in erl_check_io.c:1228, OTP-29.1.1.
+    fn self_pid(&self) -> Option<arinsal_etf::OwnedTerm> {
+        let pid = current_hub()?.current_pid();
+        arinsal_term::to_owned(pid.to_term()?).ok()
+    }
+
     fn register_read(
         &self,
         fd: i32,
         pid: &arinsal_etf::OwnedTerm,
         handle: &arinsal_etf::OwnedTerm,
         reference: &arinsal_etf::OwnedTerm,
-    ) {
-        self.register(fd, pid, handle, reference, true);
+    ) -> i32 {
+        self.register(fd, pid, handle, reference, true)
     }
 
     fn register_write(
@@ -531,30 +545,130 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
         pid: &arinsal_etf::OwnedTerm,
         handle: &arinsal_etf::OwnedTerm,
         reference: &arinsal_etf::OwnedTerm,
-    ) {
-        self.register(fd, pid, handle, reference, false);
+    ) -> i32 {
+        self.register(fd, pid, handle, reference, false)
     }
 
-    fn cancel(&self, fd: i32, reference: &arinsal_etf::OwnedTerm) {
-        let registrations = {
-            let mut pending = self.pending.lock().unwrap();
-            let mut registrations = Vec::new();
-            pending.retain(|entry| {
-                let keep = entry.fd != fd || &entry.reference != reference;
-                if !keep && let Some(registration) = entry.registration {
-                    registrations.push(registration);
-                }
-                keep
-            });
-            registrations
-        };
-        for registration in registrations {
-            crate::check_io::deregister(registration);
+    fn cancel(&self, fd: i32, read: bool, _reference: &arinsal_etf::OwnedTerm) -> i32 {
+        let cancelled = !self
+            .remove(|entry| entry.fd == fd && entry.readable == read)
+            .is_empty();
+        match (cancelled, read) {
+            (false, _) => 0,
+            (true, true) => arinsal_nif_socket::SELECT_READ_CANCELLED,
+            (true, false) => arinsal_nif_socket::SELECT_WRITE_CANCELLED,
         }
+    }
+
+    fn stop(&self, fd: i32) -> i32 {
+        let removed = self.remove(|entry| entry.fd == fd);
+        let mut result = arinsal_nif_socket::SELECT_STOP_CALLED;
+        if removed.contains(&true) {
+            result |= arinsal_nif_socket::SELECT_READ_CANCELLED;
+        }
+        if removed.contains(&false) {
+            result |= arinsal_nif_socket::SELECT_WRITE_CANCELLED;
+        }
+        result
+    }
+
+    fn monitor(
+        &self,
+        pid: &arinsal_etf::OwnedTerm,
+        handle: &arinsal_etf::OwnedTerm,
+    ) -> Option<u64> {
+        let target = owned_local_pid(pid)?;
+        let hub = hub_for_pid(target)?;
+        let scheduler = hub.scheduler.upgrade()?;
+        let id = arinsal_bifs::next_ref_id();
+        let handle = handle.clone();
+        let monitor = Arc::new(arinsal_nif::ResourceMonitor::native(
+            id,
+            Arc::new(move |exiting, id| {
+                if let Ok(exiting) = arinsal_term::to_owned(exiting) {
+                    arinsal_nif_socket::down(&handle, &exiting, id);
+                }
+            }),
+        ));
+        let sender = current_hub().map_or(hub.pid, |current| current.current_pid());
+        scheduler
+            .signal(
+                sender,
+                target,
+                arinsal_sched::Signal::Monitor {
+                    reference: id,
+                    shared: arinsal_sched::SharedPayload(monitor),
+                },
+            )
+            .is_ok()
+            .then_some(id)
+    }
+
+    fn demonitor(&self, pid: &arinsal_etf::OwnedTerm, monitor: u64) {
+        let Some(target) = owned_local_pid(pid) else {
+            return;
+        };
+        let Some(hub) = hub_for_pid(target) else {
+            return;
+        };
+        if let Some(scheduler) = hub.scheduler.upgrade() {
+            let sender = current_hub().map_or(hub.pid, |current| current.current_pid());
+            let _ = scheduler.signal(sender, target, arinsal_sched::Signal::Demonitor(monitor));
+        }
+    }
+
+    fn send(&self, pid: &arinsal_etf::OwnedTerm, message: &arinsal_etf::OwnedTerm) -> bool {
+        let arinsal_etf::OwnedTerm::Pid {
+            node, id, serial, ..
+        } = pid
+        else {
+            return false;
+        };
+        if node != "nonode@nohost" {
+            return false;
+        }
+        let pid = Pid::new(*id, *serial);
+        let Some(hub) = hub_for_pid(pid) else {
+            return false;
+        };
+        let Some(scheduler) = hub.scheduler.upgrade() else {
+            return false;
+        };
+        let mut heap = VecHeap::new();
+        let Ok(term) = from_owned(message, &mut heap) else {
+            return false;
+        };
+        let Ok(envelope) = Message::copy_from(term) else {
+            return false;
+        };
+        let sender = current_hub().map_or(hub.pid, |current| current.current_pid());
+        scheduler.send(sender, pid, envelope).is_ok()
     }
 }
 
 impl NifSelectReactor {
+    /// Drop the selections `matches` accepts; the result is the `readable` flag of each.
+    fn remove(&self, matches: impl Fn(&SelectRegistration) -> bool) -> Vec<bool> {
+        let (registrations, removed) = {
+            let mut pending = self.pending.lock().unwrap();
+            let mut registrations = Vec::new();
+            let mut removed = Vec::new();
+            pending.retain(|entry| {
+                let keep = !matches(entry);
+                if !keep {
+                    registrations.push(entry.registration);
+                    removed.push(entry.readable);
+                }
+                keep
+            });
+            (registrations, removed)
+        };
+        for registration in registrations.into_iter().flatten() {
+            crate::check_io::deregister(registration);
+        }
+        removed
+    }
+
     fn register(
         &self,
         fd: i32,
@@ -562,27 +676,29 @@ impl NifSelectReactor {
         handle: &arinsal_etf::OwnedTerm,
         reference: &arinsal_etf::OwnedTerm,
         readable: bool,
-    ) {
+    ) -> i32 {
+        let failed = i32::MIN | arinsal_nif_socket::SELECT_FAILED;
         let arinsal_etf::OwnedTerm::Pid {
             node, id, serial, ..
         } = pid_term
         else {
-            return;
+            return failed;
         };
         if node != "nonode@nohost" {
-            return;
+            return failed;
         }
         let pid = Pid::new(*id, *serial);
         let Some(hub) = hub_for_pid(pid) else {
-            return;
+            return failed;
         };
+        self.remove(|entry| entry.fd == fd && entry.readable == readable);
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pending.lock().unwrap().push(SelectRegistration {
             id,
             fd,
-            reference: reference.clone(),
+            readable,
             registration: None,
         });
         let pending = Arc::clone(&self.pending);
@@ -621,8 +737,10 @@ impl NifSelectReactor {
             {
                 entry.registration = Some(registration);
             }
+            0
         } else {
             self.pending.lock().unwrap().retain(|entry| entry.id != id);
+            failed
         }
     }
 }
@@ -1417,6 +1535,11 @@ fn load_nif_locked(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<
     let loaded = match caller.as_str() {
         "prim_file" | "prim_buffer" | "zlib" | "prim_tty" | "prim_socket" | "prim_net" => {
             intern_load_atoms(&caller)?;
+            if caller == "prim_socket"
+                && let Ok(info) = arinsal_term::to_owned(info)
+            {
+                arinsal_nif_socket::load_info(&info);
+            }
             atom("ok")
         }
         "erl_tracer" => {

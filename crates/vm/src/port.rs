@@ -437,12 +437,22 @@ fn bytes(t: Term) -> Option<Vec<u8>> {
             pending.push(head);
         } else if term == Term::NIL {
         } else {
-            // SAFETY: This view is consumed before the caller's process heap can move.
-            let binary = unsafe { term.binary_ref() }?;
-            out.extend_from_slice(binary.bytes());
+            append_binary(term, &mut out)?;
         }
     }
     Some(out)
+}
+/// Append a binary's significant bytes: the window `[start_bit, start_bit + bit_len)`
+/// of its owner, which is not the owner's whole backing data for a sub-binary.
+/// A bitstring whose size is not a multiple of 8 is not iodata.
+fn append_binary(term: Term, out: &mut Vec<u8>) -> Option<()> {
+    let bits = arinsal_bifs::bitstring_bit_len(term).ok()?;
+    if !bits.is_multiple_of(8) {
+        return None;
+    }
+    let start = out.len();
+    out.resize(start + bits / 8, 0);
+    arinsal_bifs::copy_binary_range(term, 0, &mut out[start..]).ok()
 }
 fn string_bytes(t: Term) -> Option<Vec<u8>> {
     // `args` entries are strings or binaries; a byte integer is not a string.
@@ -465,10 +475,8 @@ fn iodata(t: Term) -> Option<Vec<u8>> {
         }
         if term == Term::NIL {
             Some(())
-        // SAFETY: This view is consumed before the caller's process heap can move.
-        } else if let Some(binary) = unsafe { term.binary_ref() } {
-            out.extend_from_slice(binary.bytes());
-            Some(())
+        } else if term.classify() == TermKind::Bitstring {
+            append_binary(term, out)
         } else if !tail {
             let value = term.as_small()?;
             if !(0..=255).contains(&value) {

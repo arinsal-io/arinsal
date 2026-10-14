@@ -2347,7 +2347,7 @@ impl Vm {
                     // dirty IO scheduler, which executes this body again.
                     let module_name = self.code.modules[module_id].name.as_str();
                     let to_dirty_io = pending.is_none()
-                        && matches!(module_name, "prim_file" | "prim_tty")
+                        && matches!(module_name, "prim_file" | "prim_tty" | "prim_socket" | "prim_net")
                         && self.code.modules[module_id]
                             // SAFETY: `ip` remains within the active module code allocation.
                             .function_at(unsafe { ip.offset_from(base) } as usize)

@@ -11,8 +11,10 @@ workspace = true
 
 [dependencies]
 arinsal-bifs.workspace = true
+arinsal-drv.workspace = true
 arinsal-etf.workspace = true
 arinsal-nif-file.workspace = true
 arinsal-term.workspace = true
 libc = "0.2.175"
+rustix = "1.1.5"
 socket2 = { version = "0.6.0", features = ["all"] }

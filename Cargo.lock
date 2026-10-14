@@ -271,10 +271,12 @@ name = "arinsal-nif-socket"
 version = "0.0.1"
 dependencies = [
  "arinsal-bifs",
+ "arinsal-drv",
  "arinsal-etf",
  "arinsal-nif-file",
  "arinsal-term",
  "libc",
+ "rustix",
  "socket2",
 ]
 
