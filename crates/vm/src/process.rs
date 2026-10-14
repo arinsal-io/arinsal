@@ -4299,6 +4299,30 @@ impl Runtime {
 }
 
 impl Process {
+    /// Insert the target half a monitor signal carries into this process's monitor tree
+    /// (erl_proc_sig_queue.c handle_monitor): a process monitor, or the `ERTS_MON_TYPE_RESOURCE`
+    /// monitor of a NIF resource.
+    pub(crate) fn insert_target_monitor(
+        &mut self,
+        reference: u64,
+        from: Pid,
+        shared: arinsal_sched::SharedPayload,
+    ) {
+        match shared.0.downcast::<crate::proc_create::MonitorData>() {
+            Ok(data) => {
+                self.cold_mut().monitored_by.insert(
+                    reference,
+                    crate::proc_create::TargetHalf { origin: from, data },
+                );
+            }
+            Err(other) => {
+                if let Ok(monitor) = other.downcast::<arinsal_nif::ResourceMonitor>() {
+                    self.cold_mut().resource_monitors.insert(reference, monitor);
+                }
+            }
+        }
+    }
+
     fn absorb_exit_signals(&mut self, ctx: &mut RunCtx<'_, Message>) {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
         // OTP-29.1.1: the signals left in the inner queue come before the outer queue's.
@@ -4316,16 +4340,12 @@ impl Process {
             };
             match payload {
                 Payload::Signal(Signal::Monitor { reference, shared }) => {
-                    if let Some(data) = crate::proc_create::monitor_data_of(shared) {
-                        self.cold_mut().monitored_by.insert(
-                            reference,
-                            crate::proc_create::TargetHalf { origin: from, data },
-                        );
-                    }
+                    self.insert_target_monitor(reference, from, shared);
                 }
                 Payload::Signal(Signal::Demonitor(reference)) => {
                     if let Some(cold) = self.cold.as_mut() {
                         cold.monitored_by.remove(&reference);
+                        cold.resource_monitors.remove(&reference);
                     }
                 }
                 Payload::Signal(Signal::Link) => {
@@ -4683,6 +4703,15 @@ impl Process {
             }
             if let Ok(message) = Message::copy_from(reason) {
                 let _ = ctx.signal(pid, arinsal_sched::Signal::ExitLinked(message));
+            }
+        }
+        // Port of erts/emulator/beam/erl_process.c:13829 (erts_proc_exit_handle_monitor,
+        // ERTS_MON_TYPE_RESOURCE): erts_fire_nif_monitor.
+        if !cold.resource_monitors.is_empty()
+            && let Some(exiting) = ctx.pid().to_term()
+        {
+            for monitor in cold.resource_monitors.values() {
+                monitor.fire(exiting);
             }
         }
         for (reference, half) in cold.monitored_by {
@@ -5501,17 +5530,13 @@ impl Process {
                 2
             }
             arinsal_sched::Signal::Monitor { reference, shared } => {
-                if let Some(data) = crate::proc_create::monitor_data_of(shared) {
-                    self.cold_mut().monitored_by.insert(
-                        reference,
-                        crate::proc_create::TargetHalf { origin: from, data },
-                    );
-                }
+                self.insert_target_monitor(reference, from, shared);
                 2
             }
             arinsal_sched::Signal::Demonitor(reference) => {
                 if let Some(cold) = self.cold.as_mut() {
                     cold.monitored_by.remove(&reference);
+                    cold.resource_monitors.remove(&reference);
                 }
                 2
             }
@@ -6779,8 +6804,15 @@ impl Task for Process {
         let mut literal_replies = Vec::new();
         for event in events {
             match event.payload {
-                Payload::Signal(Signal::Monitor { reference, .. }) => {
-                    monitors.push((reference, event.from));
+                Payload::Signal(Signal::Monitor { reference, shared }) => {
+                    // A resource monitor has no origin process to answer with `noproc`.
+                    if shared
+                        .0
+                        .downcast_ref::<arinsal_nif::ResourceMonitor>()
+                        .is_none()
+                    {
+                        monitors.push((reference, event.from));
+                    }
                 }
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
                 // OTP-29.1.1: a link that reaches a process after its exit handling gets `noproc`.

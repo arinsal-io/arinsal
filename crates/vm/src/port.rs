@@ -4282,6 +4282,11 @@ pub(crate) fn nif_port_command(
     if handle.state.lock().unwrap().exit_complete {
         return false;
     }
+    // Port of erts/emulator/beam/io.c:1603-1605 (erts_port_output_async): data that is not
+    // iodata is refused (`bad_value`, result 0) without signalling the port.
+    if io_pieces(data, &mut Vec::new()).is_none() {
+        return false;
+    }
     output_command(runtime, &handle, id, from, data, None);
     true
 }

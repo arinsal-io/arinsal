@@ -297,13 +297,20 @@ pub(crate) fn writable_bin_ref_address(term: Term) -> Option<usize> {
     owner(term).map(|(bin_ref, _)| bin_ref as usize)
 }
 
+/// The original BinRef term of a `SUB_BITS` (word four).
+#[inline(always)]
+fn sub_bits_original(term: Term) -> Term {
+    // SAFETY: SUB_BITS word four is its original term, retained by a live heap.
+    Term(unsafe { *term.raw_ptr().add(4) })
+}
+
 #[inline(always)]
 fn owner(term: Term) -> Option<(*const u64, BinaryView<'static>)> {
     if term.header()? & 63 != SUB_BITS {
         return None;
     }
     // SAFETY: SUB_BITS word four is its original BinRef, retained by a live heap.
-    let original = Term(unsafe { *term.raw_ptr().add(4) });
+    let original = sub_bits_original(term);
     if original.header()? & 63 != BIN_REF {
         return None;
     }
@@ -329,7 +336,7 @@ fn owner(term: Term) -> Option<(*const u64, BinaryView<'static>)> {
 pub unsafe fn writable_gc_visit(term: Term) {
     let bin_ref = if term.header().is_some_and(|h| h & 63 == SUB_BITS) {
         // SAFETY: a live SUB_BITS keeps its original term in word four.
-        Term(unsafe { *term.raw_ptr().add(4) })
+        sub_bits_original(term)
     } else {
         term
     };
@@ -368,7 +375,7 @@ pub unsafe fn writable_gc_visit(term: Term) {
 pub(crate) fn owner_adjustment(term: Term) -> usize {
     let original = if term.header().is_some_and(|h| h & 63 == SUB_BITS) {
         // SAFETY: SUB_BITS word four is its original term.
-        Term(unsafe { *term.raw_ptr().add(4) })
+        sub_bits_original(term)
     } else {
         term
     };
@@ -436,6 +443,30 @@ pub fn writable_finalize(term: Term) {
             *bin_ref.cast_mut().add(1) = allocation.header_ptr() as u64;
             *term.raw_ptr().add(1).cast_mut() = allocation.header_ptr().wrapping_add(4) as u64;
         }
+    }
+}
+
+/// The magic reference that owns the bytes of a resource-backed binary term
+/// (`enif_make_resource_binary`), as `enif_get_resource` finds it through the term's BinRef.
+///
+/// The term's heap and its off-heap owners must stay live for the borrow.
+pub fn external_binary_magic<'a>(term: Term) -> Option<&'a crate::MagicRef> {
+    if term.header()? & 63 != SUB_BITS {
+        return None;
+    }
+    let original = sub_bits_original(term);
+    if original.header()? & 63 != BIN_REF {
+        return None;
+    }
+    // SAFETY: a BinRef with the external flag holds the Arc-owned ExternalBinary in word one.
+    unsafe {
+        let p = original.raw_ptr();
+        if *p.add(2) & EXTERNAL_OWNER == 0 {
+            return None;
+        }
+        Some(&*Arc::as_ptr(
+            &(*(*p.add(1) as *const ExternalBinary))._owner,
+        ))
     }
 }
 

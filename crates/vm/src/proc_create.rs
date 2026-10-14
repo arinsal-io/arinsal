@@ -670,13 +670,6 @@ pub(crate) fn default_monitor_data() -> std::sync::Arc<MonitorData> {
     })
 }
 
-/// The monitor data a monitor signal carries (erts: the target part points at the same object).
-pub(crate) fn monitor_data_of(
-    shared: arinsal_sched::SharedPayload,
-) -> Option<std::sync::Arc<MonitorData>> {
-    shared.0.downcast::<MonitorData>().ok()
-}
-
 /// Origin half of a local monitor (erts `ERTS_P_MONITORS` entry): the monitored target.
 #[derive(Clone, Debug)]
 pub(crate) struct OriginHalf {
@@ -868,6 +861,9 @@ pub(crate) struct ProcessCold {
     pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
     /// Target half of each local monitor on this process (erts `ERTS_P_LT_MONITORS`).
     pub(crate) monitored_by: std::collections::BTreeMap<u64, TargetHalf>,
+    /// Target halves of NIF resource monitors (erts `ERTS_MON_TYPE_RESOURCE` in `ERTS_P_LT_MONITORS`).
+    pub(crate) resource_monitors:
+        std::collections::BTreeMap<u64, std::sync::Arc<arinsal_nif::ResourceMonitor>>,
     /// Suspends this process holds on others, keyed by target (erts `ERTS_P_MONITORS` SUSPEND).
     pub(crate) suspend_monitors: std::collections::BTreeMap<
         arinsal_sched::Pid,
