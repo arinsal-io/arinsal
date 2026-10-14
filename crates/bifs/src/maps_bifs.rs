@@ -390,7 +390,7 @@ fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     }
 }
 
-crate::bif_bodies!(
+crate::process_bif_bodies!(
     map_size, map_get, is_map_key, find, get, is_key, from_list, from_keys, keys, values, merge,
     put, remove, update, take,
 );

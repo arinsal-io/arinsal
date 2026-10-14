@@ -113,11 +113,11 @@ impl BifError {
     pub const BADARG: BifError = BifError::Badarg { cause: None };
 }
 
-/// Execution context handed to every BIF.
+/// Process-shaped execution handle handed to native BIF bodies.
 ///
 /// More fields (the calling process, scheduler services) are added by later
 /// stages; construct it only through [`Ctx::new`].
-pub struct Ctx<'a, H: HeapAlloc = ProcessHeapHandle<'a>> {
+pub struct ProcessBif<'a, H: HeapAlloc = ProcessHeapHandle<'a>> {
     /// Concrete process heap handle; its HAlloc path is monomorphized.
     pub heap: H,
     /// The process' live FCALLS value (`BUMP_REDS` mutates this directly).
@@ -130,7 +130,7 @@ pub struct Ctx<'a, H: HeapAlloc = ProcessHeapHandle<'a>> {
     deferred: Option<Box<lists::DeferredTrap>>,
 }
 
-impl<'a, H: HeapAlloc> Ctx<'a, H> {
+impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
     pub fn with_allocator(heap: H) -> Self {
         Ctx {
             heap,
@@ -203,7 +203,7 @@ impl<'a, H: HeapAlloc> Ctx<'a, H> {
     }
 }
 
-impl<'heap> Ctx<'_, ProcessHeapHandle<'heap>> {
+impl<'heap> ProcessBif<'_, ProcessHeapHandle<'heap>> {
     /// Construct a process BIF context by reborrowing the process heap handle.
     #[inline]
     pub fn new<'a>(heap: &'a mut ProcessHeapHandle<'heap>) -> Ctx<'a> {
@@ -232,8 +232,17 @@ impl<'heap> Ctx<'_, ProcessHeapHandle<'heap>> {
     }
 }
 
+/// Process-independent adapter retained for callers without a VM process.
+///
+/// Generic allocator callers use the same body through this alias and the
+/// body-table adapter; process dispatch uses [`ProcessBif`] directly.
+pub type Ctx<'a, H = ProcessHeapHandle<'a>> = ProcessBif<'a, H>;
+
 /// Signature shared by all BIFs.
 pub type BifFn = fn(&mut Ctx<'_>, &[Term]) -> Result<Term, BifError>;
+
+/// Native process-shaped BIF entry, including the incoming Beam instruction.
+pub type ProcessBifFn = fn(&mut ProcessBif<'_>, &[Term], usize) -> Result<Term, BifError>;
 
 /// A BIF body known when its table entry is compiled.
 ///
@@ -241,6 +250,16 @@ pub type BifFn = fn(&mut Ctx<'_>, &[Term]) -> Result<Term, BifError>;
 /// BIF is its own function, so the VM entry that calls it is compiled per BIF.
 pub trait BifBody {
     fn call(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>;
+
+    /// Process entry used by the VM's `bif_table` dispatch.
+    #[inline(always)]
+    fn call_process(
+        process: &mut ProcessBif<'_>,
+        args: &[Term],
+        _instruction: usize,
+    ) -> Result<Term, BifError> {
+        Self::call(process, args)
+    }
 }
 
 /// Receives the body of one BIF from [`visit_bif`].
@@ -320,6 +339,34 @@ macro_rules! bif_bodies {
     };
 }
 pub(crate) use bif_bodies;
+
+/// One maps BIF body shared by process dispatch and allocator-only callers.
+macro_rules! process_bif_bodies {
+    ($($bif:ident),* $(,)?) => {
+        #[allow(non_camel_case_types)]
+        mod bodies {
+            $(
+                pub(super) struct $bif;
+                impl $crate::BifBody for $bif {
+                    #[inline(always)]
+                    fn call(ctx: &mut $crate::Ctx<'_>, args: &[arinsal_term::Term])
+                        -> Result<arinsal_term::Term, $crate::BifError>
+                    {
+                        <Self as $crate::BifBody>::call_process(ctx, args, 0)
+                    }
+                    #[inline(always)]
+                    fn call_process(process: &mut $crate::ProcessBif<'_>, args: &[arinsal_term::Term], instruction: usize)
+                        -> Result<arinsal_term::Term, $crate::BifError>
+                    {
+                        let _ = instruction;
+                        super::$bif(process, args)
+                    }
+                }
+            )*
+        }
+    };
+}
+pub(crate) use process_bif_bodies;
 
 /// Find the implementation of `module:name/arity`.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
