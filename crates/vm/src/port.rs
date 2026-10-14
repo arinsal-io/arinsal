@@ -3058,14 +3058,7 @@ fn worker(
     }
     let woken = flush_output(&handle);
     wake_suspended(&scheduler, woken);
-    if wake_r >= 0 {
-        // SAFETY: this thread owns the wake read end taken from the handle.
-        unsafe { libc::close(wake_r) };
-    }
-    if let Some(fd) = read_fd {
-        // SAFETY: the worker owns the duplicated input descriptor.
-        unsafe { libc::close(fd) };
-    }
+    close_worker_fds(wake_r, read_fd);
     let closed = handle.state.lock().unwrap().closed;
     // Port of erts/emulator/sys/unix/sys_drivers.c:1039 (stop), OTP-29.1.1.
     // Close the child's input first; a detached child may keep running after
@@ -3091,6 +3084,18 @@ fn worker(
     if !closed {
         // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
         notify_closed(&handle, id, &scheduler, owner, false);
+    }
+}
+
+/// Close the wake read end and the duplicated input descriptor this worker thread owns.
+fn close_worker_fds(wake_r: RawFd, read_fd: Option<RawFd>) {
+    if wake_r >= 0 {
+        // SAFETY: this thread owns the wake read end taken from the handle.
+        unsafe { libc::close(wake_r) };
+    }
+    if let Some(fd) = read_fd {
+        // SAFETY: the worker owns the duplicated input descriptor.
+        unsafe { libc::close(fd) };
     }
 }
 
@@ -3131,14 +3136,7 @@ fn eof_exit(
         std::mem::take(&mut st.suspended)
     };
     wake_suspended(scheduler, woken);
-    if wake_r >= 0 {
-        // SAFETY: this thread owns the wake read end taken from the handle.
-        unsafe { libc::close(wake_r) };
-    }
-    if let Some(fd) = read_fd {
-        // SAFETY: the worker owns the duplicated input descriptor.
-        unsafe { libc::close(fd) };
-    }
+    close_worker_fds(wake_r, read_fd);
     handle.out.lock().unwrap().take();
     handle.state.lock().unwrap().exit_complete = true;
     handle.finish_halt();

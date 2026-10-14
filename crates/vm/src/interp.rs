@@ -941,14 +941,20 @@ struct HotCursor {
     heap_dirty: bool,
 }
 
+/// Instruction index of `ip` in the code that starts at `base`, from the addresses alone.
+#[inline(always)]
+fn code_index(ip: *const Instr, base: *const Instr) -> usize {
+    (ip as usize - base as usize) / std::mem::size_of::<Instr>()
+}
+
 /// Pointers that stay fixed for one fast streak. Bundled so `exec_hot` stays
 /// under clippy's argument limit; the body copies them into locals.
-struct HotFixed {
+struct HotFixed<'a> {
     base: *const Instr,
     x: *mut Term,
     stop: *mut u64,
     budget: u32,
-    entry_arity: *const u16,
+    entry_arity: &'a [u16],
     #[cfg(feature = "instr-count")]
     count_stats: *mut ProcessStats,
     #[cfg(any(feature = "validate-terms", debug_assertions))]
@@ -959,7 +965,7 @@ struct HotFixed {
 /// the full interpreter. Kept out of line so the giant match does not force
 /// spills on this loop.
 #[inline(never)]
-fn exec_hot(cursor: HotCursor, fixed: HotFixed) -> HotCursor {
+fn exec_hot(cursor: HotCursor, fixed: HotFixed<'_>) -> HotCursor {
     let HotCursor {
         mut ip,
         mut htop,
@@ -985,9 +991,7 @@ fn exec_hot(cursor: HotCursor, fixed: HotFixed) -> HotCursor {
         }
         // A function entry is where erts spends a reduction (`i_test_yield`); the full
         // interpreter charges it before the entry instruction runs.
-        // SAFETY: `ip` and `base` belong to the same code allocation, and the table has one
-        // slot per code instruction.
-        if unsafe { *entry_arity.add(ip.offset_from(base) as usize) } != 0 {
+        if entry_arity[code_index(ip, base)] != 0 {
             break;
         }
         // SAFETY: The caller keeps `ip` inside this module's code, which ends
@@ -1124,9 +1128,7 @@ fn exec_hot(cursor: HotCursor, fixed: HotFixed) -> HotCursor {
             }
             Instr::CallOnly { target } => {
                 let slot = *target as usize;
-                // SAFETY: The loader resolves call targets inside the code,
-                // and the table has one slot per code instruction.
-                let packed = unsafe { *entry_arity.add(slot) };
+                let packed = entry_arity[slot];
                 if packed == 0 {
                     false
                 } else {
@@ -2001,15 +2003,13 @@ impl Vm {
                 (x, fr) = ensure_register_file(self.code.registers[module_id], p);
                 regs_module = module_id;
             }
-            let arity_ptr = self.code.modules[module_id].entry_arity.as_ptr();
+            let entry_arity = &self.code.modules[module_id].entry_arity[..];
             // Skip the fast loop when the next opcode is not in it. A cold
             // streak would otherwise pay a call that returns immediately.
             // SAFETY: `ip` addresses this module's code, which ends with CodeEnd.
             if hot_prefix(unsafe { *ip })
                 // A function entry is charged below, before its instruction runs.
-                // SAFETY: `ip` and `base` belong to the same code allocation, and the table has
-                // one slot per code instruction.
-                && unsafe { *arity_ptr.add(ip.offset_from(base) as usize) } == 0
+                && entry_arity[code_index(ip, base)] == 0
             {
                 let cursor = exec_hot(
                     HotCursor {
@@ -2025,7 +2025,7 @@ impl Vm {
                         x,
                         stop,
                         budget,
-                        entry_arity: arity_ptr,
+                        entry_arity,
                         #[cfg(feature = "instr-count")]
                         count_stats: std::ptr::addr_of_mut!(p.stats),
                         #[cfg(any(feature = "validate-terms", debug_assertions))]
