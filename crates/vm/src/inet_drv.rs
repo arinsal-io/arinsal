@@ -92,6 +92,7 @@ const OPT_RECVTOS: u8 = 43;
 const OPT_TTL: u8 = 46;
 const OPT_RECVTTL: u8 = 47;
 const OPT_NOPUSH: u8 = 48;
+const OPT_READ_AHEAD: u8 = 49;
 const OPT_DEBUG: u8 = 99;
 
 const IFOPT_ADDR: u8 = 1;
@@ -1000,6 +1001,7 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
             deliver: inner.deliver,
             exit_on_close: inner.exit_on_close,
             packet_size: inner.packet_size,
+            read_ahead: inner.read_ahead,
             high: inner.high,
             low: inner.low,
             msgq_high: inner.msgq_high,
@@ -1258,6 +1260,8 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
         OPT_SEND_TIMEOUT_CLOSE => inner.send_timeout_close = val != 0,
         OPT_DELAY_SEND => inner.delay_send = val != 0,
         OPT_PACKET_SIZE => inner.packet_size = val as u32,
+        // Port of inet_drv.c:7184 (INET_LOPT_TCP_READ_AHEAD), OTP-29.1.1.
+        OPT_READ_AHEAD => inner.read_ahead = val != 0,
         OPT_SHOW_ECONNRESET => inner.show_econnreset = val != 0,
         OPT_LINE => inner.delimiter = val as u8,
         OPT_RECVTOS => {
@@ -1427,6 +1431,8 @@ fn push_opt(inner: &Inner, code: u8, data: &[u8], i: &mut usize, out: &mut Vec<u
         OPT_SEND_TIMEOUT_CLOSE => write_i32(out, i32::from(inner.send_timeout_close)),
         OPT_DELAY_SEND => write_i32(out, i32::from(inner.delay_send)),
         OPT_PACKET_SIZE => write_i32(out, inner.packet_size as i32),
+        // Port of inet_drv.c:9305 (INET_LOPT_TCP_READ_AHEAD), OTP-29.1.1.
+        OPT_READ_AHEAD => write_i32(out, i32::from(inner.read_ahead)),
         OPT_SHOW_ECONNRESET => write_i32(out, i32::from(inner.show_econnreset)),
         // inet_fill_opts has no LINE_DELIM case, so getopts returns einval.
         OPT_LINE => return false,
@@ -2595,6 +2601,7 @@ struct Inner {
     exit_on_close: bool,
     delimiter: u8,
     packet_size: u32,
+    read_ahead: bool,
     reuseaddr: bool,
     reuseport: bool,
     nodelay: bool,
@@ -2669,6 +2676,7 @@ impl Default for Inner {
             exit_on_close: true,
             delimiter: b'\n',
             packet_size: 0,
+            read_ahead: true,
             reuseaddr: false,
             reuseport: false,
             nodelay: false,
@@ -3179,6 +3187,66 @@ enum Out {
     },
 }
 
+fn output_list_len(sock: &Sock, out: &Out) -> usize {
+    match out {
+        Out::AsyncData { bytes, .. } | Out::Tcp { bytes, .. } | Out::PortData { bytes, .. } => {
+            let inner = sock.inner.lock().unwrap();
+            let header = if inner.header < 0 {
+                bytes.len()
+            } else {
+                inner.header as usize
+            };
+            if !inner.binary || header > bytes.len() {
+                bytes.len()
+            } else {
+                header
+            }
+        }
+        Out::Http { packet, binary, .. } | Out::AsyncHttp { packet, binary, .. } => {
+            http_list_len(packet, *binary)
+        }
+        _ => 0,
+    }
+}
+
+fn http_list_len(packet: &HttpPacket, binary: bool) -> usize {
+    if binary {
+        return 0;
+    }
+    match packet {
+        HttpPacket::Request {
+            method,
+            known_method,
+            uri,
+            ..
+        } => {
+            let method_len = if *known_method { 0 } else { method.len() };
+            method_len + http_uri_list_len(uri)
+        }
+        HttpPacket::Response { phrase, .. } => phrase.len(),
+        HttpPacket::Header {
+            known_name,
+            name,
+            original_name,
+            value,
+            ..
+        } => {
+            (if known_name.is_none() { name.len() } else { 0 }) + original_name.len() + value.len()
+        }
+        HttpPacket::Error(line) => line.len(),
+        HttpPacket::Eoh => 0,
+    }
+}
+
+fn http_uri_list_len(uri: &HttpUri) -> usize {
+    match uri {
+        HttpUri::Star => 0,
+        HttpUri::String(bytes) | HttpUri::AbsPath(bytes) => bytes.len(),
+        HttpUri::Scheme { scheme, rest } => scheme.len() + rest.len(),
+        HttpUri::Absolute { host, path, .. } => host.len() + path.len(),
+    }
+}
+
 fn emit(sock: &Sock, out: Out) {
     // Distribution ports feed the emulator decoder, not the port owner.
     // Port of inet_drv.c + dist.c:2017 (erts_net_message), OTP-29.1.1.
@@ -3196,7 +3264,10 @@ fn emit(sock: &Sock, out: Out) {
     }
     let sched = sock.handle.scheduler();
     let port = Term::port(sock.id).unwrap();
-    let mut heap = ProcessHeap::with_words(128);
+    // Port of inet_drv.c:3987-4005 (tcp_message uses LOAD_STRING sized to the
+    // complete packet), OTP-29.1.1. List-mode packets need two heap words per byte.
+    let words = 128usize.saturating_add(output_list_len(sock, &out).saturating_mul(2));
+    let mut heap = ProcessHeap::with_words(words);
     let term = match &out {
         Out::AsyncError {
             caller,
@@ -3891,6 +3962,68 @@ fn get_bind_device(inner: &Inner) -> Option<Vec<u8>> {
     Some(bytes[..end].to_vec())
 }
 
+fn tcp_read_size(inner: &Inner) -> usize {
+    // Port of inet_drv.c:12896-12949 (packet_header_length and tcp_remain), OTP-29.1.1.
+    let buffer = inner.buffer.max(1) as usize;
+    if inner.read_ahead || inner.htype == 0 {
+        return buffer;
+    }
+    let Some(ty) = packet_type(inner.htype) else {
+        return 1;
+    };
+    let mut http = inner.http;
+    match parse_with_state(
+        ty,
+        &inner.rbuf,
+        PacketOptions {
+            packet_size: inner.packet_size,
+            line_length: 0,
+            line_delimiter: inner.delimiter,
+        },
+        &mut http,
+    ) {
+        PacketResult::More(Some(packet_len)) => {
+            return packet_len.saturating_sub(inner.rbuf.len()).max(1);
+        }
+        PacketResult::More(None) => {}
+        PacketResult::Ok { .. } | PacketResult::Error => return 1,
+    }
+    let header_len: usize = match ty {
+        PacketType::Length1 => 1,
+        PacketType::Length2 => 2,
+        PacketType::Length4 | PacketType::Sunrm | PacketType::Tpkt => 4,
+        PacketType::Asn1 => 2,
+        PacketType::Cdr => 12,
+        PacketType::Fcgi => 8,
+        PacketType::SslTls => 5,
+        _ => 1,
+    };
+    header_len
+        .saturating_sub(inner.rbuf.len())
+        .max(1)
+        .min(buffer)
+}
+
+fn tcp_packet_complete(inner: &Inner) -> bool {
+    let Some(ty) = packet_type(inner.htype) else {
+        return false;
+    };
+    let mut http = inner.http;
+    matches!(
+        parse_with_state(
+            ty,
+            &inner.rbuf,
+            PacketOptions {
+                packet_size: inner.packet_size,
+                line_length: 0,
+                line_delimiter: inner.delimiter,
+            },
+            &mut http,
+        ),
+        PacketResult::Ok { .. } | PacketResult::Error
+    )
+}
+
 fn pull(sock: &Arc<Sock>) -> bool {
     let phase = sock.inner.lock().unwrap().phase;
     if phase == Phase::Listening {
@@ -3910,15 +4043,24 @@ fn pull(sock: &Arc<Sock>) -> bool {
             return false;
         }
         let fd = inner.fd.as_ref().unwrap().as_raw_fd();
-        let mut buf = vec![0u8; inner.buffer.max(1) as usize];
+        let read_ahead = inner.read_ahead || inner.htype == 0;
         let mut eof = false;
         let mut bytes_read = 0;
         for _ in 0..32 {
+            let read_size = if read_ahead {
+                inner.buffer.max(1) as usize
+            } else {
+                tcp_read_size(&inner)
+            };
+            let mut buf = vec![0u8; read_size];
             // SAFETY: fd is the connected socket this driver owns.
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 bytes_read += n as usize;
                 inner.rbuf.extend_from_slice(&buf[..n as usize]);
+                if !read_ahead && tcp_packet_complete(&inner) {
+                    break;
+                }
             } else if n == 0 {
                 eof = true;
                 break;
