@@ -2868,80 +2868,78 @@ fn owned_uint(value: &OwnedTerm) -> Option<u64> {
     }
 }
 
-fn parse_monitor_options(term: Term) -> Option<HashMap<&'static str, MonitorOption>> {
-    let owned = to_owned(term).ok()?;
-    let entries = match &owned {
-        OwnedTerm::Nil => Vec::new(),
-        OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.clone(),
+/// Apply one `system_monitor` option to `options`.
+// Port of erts/emulator/beam/erl_bif_trace.c:3587-3668 (system_monitor option switch,
+// term_to_limit, term_to_boolean), OTP-29.1.1.
+fn apply_monitor_option(
+    options: &mut HashMap<&'static str, MonitorOption>,
+    entry: &OwnedTerm,
+) -> Option<()> {
+    let (name, value) = match entry {
+        OwnedTerm::Atom(name) => (name.as_str(), OwnedTerm::Atom("true".into())),
+        OwnedTerm::Tuple(pair) if pair.len() == 2 => {
+            let OwnedTerm::Atom(name) = &pair[0] else {
+                return None;
+            };
+            (name.as_str(), pair[1].clone())
+        }
         _ => return None,
     };
-    let mut options = HashMap::new();
-    for entry in &entries {
-        let (name, value) = match entry {
-            OwnedTerm::Atom(name) => (name.as_str(), OwnedTerm::Atom("true".into())),
-            OwnedTerm::Tuple(pair) if pair.len() == 2 => {
-                let OwnedTerm::Atom(name) = &pair[0] else {
-                    return None;
-                };
-                (name.as_str(), pair[1].clone())
-            }
-            _ => return None,
-        };
-        let (key, parsed) = match name {
-            "busy_port" | "busy_dist_port" => {
-                let OwnedTerm::Atom(value) = &value else {
-                    return None;
-                };
-                let enabled = match value.as_str() {
-                    "true" => true,
-                    "false" => false,
-                    _ => return None,
-                };
-                (
-                    if name == "busy_port" {
-                        "busy_port"
-                    } else {
-                        "busy_dist_port"
-                    },
-                    MonitorOption::Bool(enabled),
-                )
-            }
-            "long_gc" | "long_schedule" | "large_heap" => {
-                let minimum = if name == "large_heap" { 16_384 } else { 1 };
-                match &value {
-                    OwnedTerm::Atom(value) if value == "false" => continue,
-                    value => {
-                        let value = owned_uint(value)?;
-                        let key = match name {
-                            "long_gc" => "long_gc",
-                            "long_schedule" => "long_schedule",
-                            _ => "large_heap",
-                        };
-                        (key, MonitorOption::Limit(value.max(minimum)))
-                    }
-                }
-            }
-            "long_message_queue" => match &value {
-                OwnedTerm::Atom(value) if value == "false" => continue,
-                OwnedTerm::Tuple(pair) if pair.len() == 2 => {
-                    let (Some(off), Some(on)) = (owned_uint(&pair[0]), owned_uint(&pair[1])) else {
-                        return None;
-                    };
-                    if off >= on || on == 0 {
-                        return None;
-                    }
-                    ("long_message_queue", MonitorOption::Queue(off, on))
-                }
+    let is_false = matches!(&value, OwnedTerm::Atom(value) if value == "false");
+    match name {
+        "busy_port" | "busy_dist_port" => {
+            let enabled = match &value {
+                OwnedTerm::Atom(value) if value == "true" => true,
+                OwnedTerm::Atom(value) if value == "false" => false,
                 _ => return None,
-            },
-            _ => return None,
-        };
-        options.insert(key, parsed);
+            };
+            let key = if name == "busy_port" {
+                "busy_port"
+            } else {
+                "busy_dist_port"
+            };
+            options.insert(key, MonitorOption::Bool(enabled));
+        }
+        "long_gc" | "long_schedule" | "large_heap" => {
+            let key = match name {
+                "long_gc" => "long_gc",
+                "long_schedule" => "long_schedule",
+                _ => "large_heap",
+            };
+            if is_false {
+                options.remove(key);
+            } else {
+                // 16 Kword is not an unnatural heap size.
+                let minimum = if name == "large_heap" { 16_384 } else { 1 };
+                options.insert(key, MonitorOption::Limit(owned_uint(&value)?.max(minimum)));
+            }
+        }
+        "long_message_queue" => {
+            if is_false {
+                options.remove("long_message_queue");
+            } else if let OwnedTerm::Tuple(pair) = &value
+                && pair.len() == 2
+            {
+                let off = owned_uint(&pair[0])?;
+                let on = if matches!(&pair[1], OwnedTerm::Atom(value) if value == "false") {
+                    0
+                } else {
+                    owned_uint(&pair[1])?
+                };
+                if on == 0 || off >= on {
+                    return None;
+                }
+                options.insert("long_message_queue", MonitorOption::Queue(off, on));
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
     }
-    Some(options)
+    Some(())
 }
 
-/// Port of erts/emulator/beam/erl_bif_trace.c:3560-3715, OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_bif_trace.c:3560-3715 (system_monitor), OTP-29.1.1.
 fn system_monitor_set(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -2954,15 +2952,17 @@ fn system_monitor_set(
     } else {
         Some(crate::natives::proc::trace_session_id(process, args[0]).ok_or_else(badarg)?)
     };
-    let session_tracer = if args[1] == atom("session") {
-        let session =
-            crate::natives::proc::trace_session_id(process, args[0]).ok_or_else(badarg)?;
-        match crate::trace::session_tracer(process, session).ok_or_else(badarg)? {
-            crate::trace::Tracer::Pid(pid) => Some(pid.to_term().ok_or_else(badarg)?),
-            _ => return Err(badarg()),
-        }
-    } else {
-        None
+    // `ERTS_TRACER_IS_NIL(session->tracer)` selects the old erlang:system_monitor API.
+    let session_tracer = match key {
+        None => crate::trace::Tracer::Default,
+        Some(key) => crate::trace::session_tracer(process, key).ok_or_else(badarg)?,
+    };
+    // erl_bif_trace.c:3584: a list that is neither a list nor nil.
+    let list = to_owned(args[2]).map_err(|_| badarg())?;
+    let entries = match &list {
+        OwnedTerm::Nil => Vec::new(),
+        OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.clone(),
+        _ => return Err(badarg()),
     };
     let store = |state: Option<SystemMonitorState>| {
         match &key {
@@ -2978,7 +2978,7 @@ fn system_monitor_set(
         runtime.long_message_queues.lock().unwrap().clear();
         refresh_system_monitor_flags(&runtime);
     };
-    let old = match &key {
+    let prev = match &key {
         None => runtime.system_monitor.lock().unwrap().clone(),
         Some(key) => runtime
             .session_monitors
@@ -2988,62 +2988,48 @@ fn system_monitor_set(
             .find(|(owner, _)| owner == key)
             .map(|(_, state)| state.clone()),
     };
-    let old_term = if let Some(state) = old.clone() {
-        from_owned(
-            &OwnedTerm::Tuple(vec![
-                state.receiver,
-                OwnedTerm::list(monitor_options_for_trace_info(&state.options)),
-            ]),
-            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-        )
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?
-    } else {
-        atom("undefined")
-    };
-    let mut options = parse_monitor_options(args[2]).ok_or_else(badarg)?;
-    if key.is_none() && (args[1] == atom("undefined") || args[2] == Term::NIL) {
-        store(None);
-        return Ok(old_term);
-    }
-    let receiver = if let Some(receiver) = session_tracer {
-        let mut updated = old.map(|state| state.options).unwrap_or_default();
-        for (name, value) in options {
-            updated.insert(name, value);
-        }
-        let input = to_owned(args[2]).map_err(|_| badarg())?;
-        let entries = match &input {
-            OwnedTerm::Nil => Vec::new(),
-            OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.clone(),
-            _ => return Err(badarg()),
-        };
-        for entry in entries {
-            let (name, value) = match &entry {
-                OwnedTerm::Atom(name) => (name.clone(), OwnedTerm::Atom("true".into())),
-                OwnedTerm::Tuple(pair) if pair.len() == 2 => {
-                    let OwnedTerm::Atom(name) = &pair[0] else {
-                        return Err(badarg());
-                    };
-                    (name.clone(), pair[1].clone())
-                }
-                _ => return Err(badarg()),
+    let (receiver, mut options, return_term) = match session_tracer {
+        crate::trace::Tracer::Default => {
+            // Old API: `args[1]` is the monitor and the list is the whole new state.
+            let return_term = match prev.clone() {
+                Some(state) => from_owned(
+                    &OwnedTerm::Tuple(vec![
+                        state.receiver,
+                        OwnedTerm::list(monitor_options_for_trace_info(&state.options)),
+                    ]),
+                    &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+                )
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?,
+                None => atom("undefined"),
             };
-            if matches!(value, OwnedTerm::Atom(ref atom) if atom == "false") {
-                updated.remove(match name.as_str() {
-                    "busy_port" => "busy_port",
-                    "busy_dist_port" => "busy_dist_port",
-                    "large_heap" => "large_heap",
-                    "long_gc" => "long_gc",
-                    "long_schedule" => "long_schedule",
-                    "long_message_queue" => "long_message_queue",
-                    _ => return Err(badarg()),
-                });
+            if args[1] == atom("undefined") || entries.is_empty() {
+                store(None);
+                return Ok(return_term);
             }
+            (
+                to_owned(args[1]).map_err(|_| badarg())?,
+                HashMap::new(),
+                return_term,
+            )
         }
-        options = updated;
-        to_owned(receiver).map_err(|_| badarg())?
-    } else {
-        to_owned(args[1]).map_err(|_| badarg())?
+        crate::trace::Tracer::Pid(pid) => {
+            // New API: the session tracer receives, `args[1]` must be `session` and the
+            // list is a diff.
+            if args[1] != atom("session") {
+                return Err(badarg());
+            }
+            (
+                to_owned(pid.to_term().ok_or_else(badarg)?).map_err(|_| badarg())?,
+                prev.map(|state| state.options).unwrap_or_default(),
+                atom("ok"),
+            )
+        }
+        // ToDo in erts: ports and NIFs are not supported for system_monitor.
+        _ => return Err(badarg()),
     };
+    for entry in &entries {
+        apply_monitor_option(&mut options, entry).ok_or_else(badarg)?;
+    }
     let OwnedTerm::Pid {
         node, creation: 0, ..
     } = &receiver
@@ -3073,17 +3059,16 @@ fn system_monitor_set(
         OwnedTerm::Pid { id, serial, .. } => Some(Pid::new(*id, *serial)),
         _ => None,
     };
-    let state = SystemMonitorState {
+    store(Some(SystemMonitorState {
         receiver,
         options,
         key,
-    };
-    store(Some(state));
+    }));
     // erl_process.c:14200 (erts_trace_check_exiting) only matters for the receiver.
     if let Some(pid) = monitor_pid {
         let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::SYS_MON);
     }
-    Ok(if key.is_some() { atom("ok") } else { old_term })
+    Ok(return_term)
 }
 
 /// Native-family dispatcher.
