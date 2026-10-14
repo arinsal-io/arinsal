@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arinsal_bifs::BifError;
 use arinsal_etf::OwnedTerm as O;
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::{Domain, MsgHdr, Protocol, SockAddr, Socket, Type};
 
 use crate::{Reactor, atom, errno, error, field, last_error, list, map, name, number, ok, pair};
 
@@ -111,6 +111,7 @@ struct Counters {
     write_fails: u64,
     write_waits: u64,
     write_pkg_max: u64,
+    write_pkg_max_cnt: u64,
     acc_tries: u64,
     acc_success: u64,
     acc_fails: u64,
@@ -967,137 +968,472 @@ fn cancel_accept(args: &[O]) -> Result<O, BifError> {
         Ok(atom("not_found"))
     }
 }
-fn send(args: &[O], destination: Option<&O>) -> Result<O, BifError> {
-    // Port of erts/emulator/nifs/common/prim_socket_nif.c:6440 (nif_send), OTP-29.1.1.
+/// `IS_OPEN`: neither closing nor closed.
+pub(crate) fn is_open(state: u32) -> bool {
+    state & (state_bits::CLOSING | state_bits::CLOSED) == 0
+}
+/// `IOV_MAX`: the most elements `enif_inspect_iovec` takes per call.
+const IOV_MAX: usize = 1024;
+/// `esock_make_error_integer_range`.
+fn integer_range(value: &O) -> O {
+    pair(atom("invalid"), pair(atom("integer_range"), value.clone()))
+}
+/// `GET_INT` with the `integer_range` / `badarg` fallbacks of the send NIFs.
+fn int_arg(value: &O) -> Result<i32, Result<O, BifError>> {
+    match integer(value) {
+        Ok(number) => Ok(number),
+        Err(error) => match value {
+            O::Int(_) | O::BigInt(_) => Err(Ok(integer_range(value))),
+            _ => Err(Err(error)),
+        },
+    }
+}
+fn nif_send(args: &[O], destination: Option<&O>) -> Result<O, BifError> {
     let h = handle(&args[0])?;
+    let (flags, reference) = if destination.is_some() {
+        (&args[3], &args[4])
+    } else {
+        (&args[2], &args[3])
+    };
     let O::Binary(data) = &args[1] else {
         return Err(BifError::BADARG);
     };
-    let (flags, reference) = if destination.is_some() {
-        (integer(&args[3])?, &args[4])
-    } else {
-        (integer(&args[2])?, &args[3])
+    if !matches!(reference, O::Ref { .. }) {
+        return Err(BifError::BADARG);
+    }
+    let flags = match int_arg(flags) {
+        Ok(flags) => flags,
+        Err(result) => return result,
     };
+    let address = match destination {
+        Some(address) => match to_sock_addr(address) {
+            Some(address) => Some(address),
+            None => return Ok(invalid("sockaddr")),
+        },
+        None => None,
+    };
+    essio_send(&h, reference, data, flags, address.as_ref())
+}
+/// `essio_send` and `essio_sendto`.
+fn essio_send(
+    h: &Handle,
+    send_ref: &O,
+    data: &[u8],
+    flags: i32,
+    to: Option<&SockAddr>,
+) -> Result<O, BifError> {
     let guard = h.socket.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
+    let mut st = h.state.lock().unwrap();
+    let Some(s) = guard.as_ref().filter(|_| is_open(st.write_state)) else {
         return Ok(error("closed"));
     };
+    if st.connector.is_some() {
+        return Ok(error_invalid("state"));
+    }
+    if let Some(result) = send_check_writer(h, &mut st, send_ref)? {
+        return Ok(result);
+    }
     h.counters.lock().unwrap().write_tries += 1;
-    let written = if let Some(address) = destination {
-        let Some(sock_addr) = to_sock_addr(address) else {
-            return Ok(invalid("sockaddr"));
-        };
-        // SAFETY: sock_addr and data are live for the call; lengths match their buffers.
-        unsafe {
-            libc::sendto(
-                s.as_raw_fd(),
-                data.as_ptr().cast(),
-                data.len(),
-                flags,
-                sock_addr.as_ptr().cast(),
-                sock_addr.len(),
-            )
-        }
-    } else {
-        // SAFETY: data is live for the duration of send and its length is correct.
-        unsafe { libc::send(s.as_raw_fd(), data.as_ptr().cast(), data.len(), flags) }
+    let result = match to {
+        Some(address) => s.send_to_with_flags(data, address, flags),
+        None => s.send_with_flags(data, flags),
     };
-    Ok(if written < 0 {
-        let e = io::Error::last_os_error();
-        if e.kind() == io::ErrorKind::WouldBlock {
-            h.counters.lock().unwrap().write_waits += 1;
-            selected(&h, s.as_raw_fd(), reference, false)
-        } else {
-            h.counters.lock().unwrap().write_fails += 1;
-            fail(&e)
-        }
-    } else {
-        let mut counters = h.counters.lock().unwrap();
-        counters.write_pkg += 1;
-        counters.write_byte += written as u64;
-        counters.write_pkg_max = counters.write_pkg_max.max(written as u64);
-        if written as usize == data.len() {
-            atom("ok")
-        } else {
-            ok(O::Int(written as i64))
-        }
-    })
+    send_check_result(
+        h,
+        &mut st,
+        s.as_raw_fd(),
+        result,
+        data.len(),
+        false,
+        send_ref,
+    )
 }
-fn vectors(value: &O) -> Option<Vec<libc::iovec>> {
-    let items = list(value)?;
-    items
-        .iter()
-        .take(1024)
-        .map(|item| {
-            let O::Binary(data) = item else { return None };
-            Some(libc::iovec {
-                iov_base: data.as_ptr().cast_mut().cast(),
-                iov_len: data.len(),
-            })
-        })
-        .collect()
+/// The binaries `enif_inspect_iovec` took, and what is left of the list.
+struct IoVec<'a> {
+    slices: Vec<&'a [u8]>,
+    tail: Tail<'a>,
 }
-fn send_vectors(args: &[O], message: bool) -> Result<O, BifError> {
+/// The rest of the list after the first `IOV_MAX` elements.
+struct Tail<'a> {
+    elems: &'a [O],
+    term: &'a O,
+}
+impl Tail<'_> {
+    /// `enif_is_empty_list(tail)`.
+    fn is_empty(&self) -> bool {
+        self.elems.is_empty() && *self.term == O::Nil
+    }
+    /// The loop skipping empty binaries at the head of the tail.
+    fn skip_empty_binaries(&mut self) {
+        while let Some(O::Binary(binary)) = self.elems.first() {
+            if !binary.is_empty() {
+                break;
+            }
+            self.elems = &self.elems[1..];
+        }
+    }
+}
+/// `enif_inspect_iovec(NULL, IOV_MAX, list, &tail, &iovec)`: at most `IOV_MAX`
+/// elements, every one a whole-byte binary, empty ones add no entry.
+fn inspect_iovec(value: &O) -> Option<IoVec<'_>> {
+    let (elems, term): (&[O], &O) = match value {
+        O::Nil => (&[], value),
+        O::List { elems, tail } => (elems, tail),
+        _ => return None,
+    };
+    let taken = elems.len().min(IOV_MAX);
+    let mut slices = Vec::new();
+    for element in &elems[..taken] {
+        let O::Binary(binary) = element else {
+            return None;
+        };
+        if !binary.is_empty() {
+            slices.push(binary.as_slice());
+        }
+    }
+    let tail = Tail {
+        elems: &elems[taken..],
+        term,
+    };
+    if tail.elems.is_empty() && *tail.term != O::Nil {
+        return None;
+    }
+    Some(IoVec { slices, tail })
+}
+/// The part of `essio_sendv` and `essio_sendmsg` after the iovec is inspected:
+/// the iovec limits and the data size.
+fn iovec_data_size(h: &Handle, iovec: &mut IoVec<'_>, data_in_tail: bool) -> Result<usize, O> {
+    if iovec.slices.len() > IOV_MAX {
+        if h.kind == "stream" {
+            iovec.slices.truncate(IOV_MAX);
+        } else {
+            return Err(invalid("iov"));
+        }
+    }
+    if data_in_tail && h.kind != "stream" {
+        return Err(invalid("iov"));
+    }
+    let mut size = 0usize;
+    for slice in &iovec.slices {
+        size = match size
+            .checked_add(slice.len())
+            .filter(|size| isize::try_from(*size).is_ok())
+        {
+            Some(size) => size,
+            None => return Err(invalid("iov")),
+        };
+    }
+    Ok(size)
+}
+fn nif_sendv(args: &[O]) -> Result<O, BifError> {
     let h = handle(&args[0])?;
-    let value = if message { &args[4] } else { &args[1] };
-    let Some(mut iov) = vectors(value) else {
+    if !matches!(args[2], O::Ref { .. }) {
+        return Err(BifError::BADARG);
+    }
+    essio_sendv(&h, &args[2], &args[1])
+}
+/// `essio_sendv`.
+fn essio_sendv(h: &Handle, send_ref: &O, iov: &O) -> Result<O, BifError> {
+    let guard = h.socket.lock().unwrap();
+    let mut st = h.state.lock().unwrap();
+    let Some(s) = guard.as_ref().filter(|_| is_open(st.write_state)) else {
+        return Ok(error("closed"));
+    };
+    if st.connector.is_some() {
+        return Ok(error_invalid("state"));
+    }
+    if let Some(result) = send_check_writer(h, &mut st, send_ref)? {
+        return Ok(result);
+    }
+    let Some(mut iovec) = inspect_iovec(iov) else {
         return Ok(invalid("iov"));
     };
-    let reference = if message { &args[3] } else { &args[2] };
-    let mut address = None;
-    let mut flags = 0;
-    if message {
-        flags = integer(&args[2])?;
-        if let Some(addr) = field(&args[1], "addr") {
-            let Some(a) = to_sock_addr(addr) else {
-                return Ok(invalid("addr"));
-            };
-            address = Some(a);
-        }
-        if let Some(ctrl) = field(&args[1], "ctrl")
-            && !list(ctrl).is_some_and(|c| c.is_empty())
-        {
-            return Err(BifError::Unsupported("ancillary send control messages"));
-        }
-    }
-    let guard = h.socket.lock().unwrap();
-    let Some(s) = guard.as_ref() else {
-        return Ok(error("closed"));
+    let data_in_tail = !iovec.tail.is_empty();
+    let size = match iovec_data_size(h, &mut iovec, data_in_tail) {
+        Ok(size) => size,
+        Err(result) => return Ok(result),
     };
     h.counters.lock().unwrap().write_tries += 1;
-    // SAFETY: zeroed msghdr is valid once its pointer and length fields are set.
-    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
-    header.msg_iov = iov.as_mut_ptr();
-    header.msg_iovlen = iov.len() as _;
-    if let Some(addr) = address.as_ref() {
-        header.msg_name = addr.as_ptr().cast_mut().cast();
-        header.msg_namelen = addr.len();
+    let buffers: Vec<IoSlice<'_>> = iovec
+        .slices
+        .iter()
+        .map(|slice| IoSlice::new(slice))
+        .collect();
+    let result = rustix::io::writev(s, &buffers).map_err(io::Error::from);
+    send_check_result(
+        h,
+        &mut st,
+        s.as_raw_fd(),
+        result,
+        size,
+        data_in_tail,
+        send_ref,
+    )
+}
+fn nif_sendmsg(args: &[O]) -> Result<O, BifError> {
+    let h = handle(&args[0])?;
+    let (message, reference, iov) = (&args[1], &args[3], &args[4]);
+    if !matches!(reference, O::Ref { .. }) || !matches!(message, O::Map(_)) {
+        return Err(BifError::BADARG);
     }
-    // SAFETY: iov points into live binary terms and address, if any, stays live through sendmsg.
-    let written = unsafe { libc::sendmsg(s.as_raw_fd(), &header, flags) };
-    Ok(if written < 0 {
-        let e = io::Error::last_os_error();
-        if e.kind() == io::ErrorKind::WouldBlock {
-            h.counters.lock().unwrap().write_waits += 1;
-            selected(&h, s.as_raw_fd(), reference, false)
-        } else {
-            h.counters.lock().unwrap().write_fails += 1;
-            fail(&e)
+    let flags = match int_arg(&args[2]) {
+        Ok(flags) => flags,
+        Err(result) => return result,
+    };
+    essio_sendmsg(&h, reference, message, flags, iov)
+}
+/// `essio_sendmsg`.
+fn essio_sendmsg(
+    h: &Handle,
+    send_ref: &O,
+    message: &O,
+    flags: i32,
+    iov: &O,
+) -> Result<O, BifError> {
+    let guard = h.socket.lock().unwrap();
+    let mut st = h.state.lock().unwrap();
+    let Some(s) = guard.as_ref().filter(|_| is_open(st.write_state)) else {
+        return Ok(error("closed"));
+    };
+    if st.connector.is_some() {
+        return Ok(error_invalid("state"));
+    }
+    if let Some(result) = send_check_writer(h, &mut st, send_ref)? {
+        return Ok(result);
+    }
+    let address = match field(message, "addr") {
+        None => None,
+        Some(address) => match to_sock_addr(address) {
+            Some(address) => Some(address),
+            None => return Ok(invalid("addr")),
+        },
+    };
+    let Some(mut iovec) = inspect_iovec(iov) else {
+        return Ok(invalid("iov"));
+    };
+    iovec.tail.skip_empty_binaries();
+    let data_in_tail = !iovec.tail.is_empty();
+    let size = match iovec_data_size(h, &mut iovec, data_in_tail) {
+        Ok(size) => size,
+        Err(result) => return Ok(result),
+    };
+    if let Some(ctrl) = field(message, "ctrl") {
+        match list(ctrl) {
+            Some([]) => {}
+            Some(_) => return Err(BifError::Unsupported("ancillary send control messages")),
+            None => return Ok(invalid("ctrl")),
         }
-    } else {
+    }
+    h.counters.lock().unwrap().write_tries += 1;
+    let buffers: Vec<IoSlice<'_>> = iovec
+        .slices
+        .iter()
+        .map(|slice| IoSlice::new(slice))
+        .collect();
+    let mut header = MsgHdr::new().with_buffers(&buffers);
+    if let Some(address) = address.as_ref() {
+        header = header.with_addr(address);
+    }
+    let result = s.sendmsg(&header, flags);
+    send_check_result(
+        h,
+        &mut st,
+        s.as_raw_fd(),
+        result,
+        size,
+        data_in_tail,
+        send_ref,
+    )
+}
+/// `send_check_writer`: `Some` is the result to return, `None` means this
+/// process is the current writer or there is none.
+fn send_check_writer(h: &Handle, st: &mut State, reference: &O) -> Result<Option<O>, BifError> {
+    let Some(current) = st.current_writer.as_ref() else {
+        return Ok(None);
+    };
+    let Some(caller) = self_pid() else {
+        return Err(BifError::BADARG);
+    };
+    if current.pid == caller {
+        return Ok(None);
+    }
+    if st.search4pid(Kind::Writer, &caller) {
+        return Err(raise_invalid("state"));
+    }
+    st.push(h, Kind::Writer, &caller, reference);
+    Ok(Some(atom("select")))
+}
+/// `send_check_result`.
+fn send_check_result(
+    h: &Handle,
+    st: &mut State,
+    fd: i32,
+    result: io::Result<usize>,
+    data_size: usize,
+    data_in_tail: bool,
+    send_ref: &O,
+) -> Result<O, BifError> {
+    match result {
+        Err(e) => {
+            let err = e.raw_os_error().unwrap_or(libc::EINVAL);
+            if err != libc::EAGAIN && err != libc::EINTR {
+                Ok(send_check_fail(h, st, &e))
+            } else {
+                send_check_retry(h, st, fd, None, send_ref)
+            }
+        }
+        Ok(written) => {
+            debug_assert!(data_size >= written);
+            if written < data_size {
+                send_check_retry(h, st, fd, Some(written), send_ref)
+            } else if data_in_tail {
+                send_check_retry(h, st, fd, Some(written), &atom("iov"))
+            } else {
+                Ok(send_check_ok(h, st, fd, written))
+            }
+        }
+    }
+}
+/// `send_check_ok`.
+fn send_check_ok(h: &Handle, st: &mut State, fd: i32, written: usize) -> O {
+    {
         let mut counters = h.counters.lock().unwrap();
         counters.write_pkg += 1;
         counters.write_byte += written as u64;
-        counters.write_pkg_max = counters.write_pkg_max.max(written as u64);
-        let covered: usize = iov.iter().map(|i| i.iov_len).sum();
-        if (written as usize) < covered {
-            ok(O::Int(written as i64))
-        } else if list(value).is_some_and(|v| v.len() > iov.len()) {
-            pair(atom("iov"), O::Int(written as i64))
-        } else {
-            atom("ok")
+        counters.write_pkg_max_cnt += written as u64;
+        if counters.write_pkg_max_cnt > counters.write_pkg_max {
+            counters.write_pkg_max = counters.write_pkg_max_cnt;
         }
+        counters.write_pkg_max_cnt = 0;
+    }
+    if let Some(current) = st.current_writer.as_ref() {
+        demonitor_process(current.mon);
+    }
+    if !activate_next(h, st, fd, Kind::Writer) {
+        st.current_writer = None;
+    }
+    atom("ok")
+}
+/// `send_check_fail`.
+fn send_check_fail(h: &Handle, st: &mut State, e: &io::Error) -> O {
+    h.counters.lock().unwrap().write_fails += 1;
+    let reason = errno_reason(e);
+    if e.raw_os_error() != Some(libc::EINVAL) && st.current_writer.is_some() {
+        requestor_release(&mut st.current_writer);
+        send_error_waiting_writers(h, st, &reason);
+        st.current_writer = None;
+    }
+    pair(atom("error"), reason)
+}
+/// `send_error_waiting_writers`: abort every queued writer.
+fn send_error_waiting_writers(h: &Handle, st: &mut State, reason: &O) {
+    while st.pop(Kind::Writer) {
+        if let Some(request) = st.current_writer.take() {
+            send_abort_msg(h, &request, reason);
+            demonitor_process(request.mon);
+        }
+    }
+}
+/// `send_check_retry`: `written` is `None` when the send would have blocked.
+fn send_check_retry(
+    h: &Handle,
+    st: &mut State,
+    fd: i32,
+    written: Option<usize>,
+    send_ref: &O,
+) -> Result<O, BifError> {
+    if let Some(written) = written {
+        h.counters.lock().unwrap().write_pkg_max_cnt += written as u64;
+        if h.kind != "stream" {
+            {
+                let mut counters = h.counters.lock().unwrap();
+                if counters.write_pkg_max_cnt > counters.write_pkg_max {
+                    counters.write_pkg_max = counters.write_pkg_max_cnt;
+                }
+                counters.write_pkg_max_cnt = 0;
+                counters.write_pkg += 1;
+                counters.write_byte += written as u64;
+            }
+            if let Some(current) = st.current_writer.as_ref() {
+                demonitor_process(current.mon);
+            }
+            if !activate_next(h, st, fd, Kind::Writer) {
+                st.current_writer = None;
+            }
+            return Ok(ok(O::Int(written as i64)));
+        }
+    }
+    match st.current_writer.as_mut() {
+        None => {
+            let Some(pid) = self_pid() else {
+                return Err(BifError::BADARG);
+            };
+            let mon = monitor_process(h, &pid);
+            st.current_writer = Some(Requestor {
+                pid,
+                reference: send_ref.clone(),
+                mon,
+            });
+        }
+        Some(current) => current.reference = send_ref.clone(),
+    }
+    if *send_ref == atom("iov") {
+        return Ok(pair(
+            atom("iov"),
+            O::Int(written.unwrap_or_default() as i64),
+        ));
+    }
+    let sres = select_write(h, fd, None, send_ref);
+    if sres < 0 {
+        if let Some(current) = st.current_writer.as_ref() {
+            demonitor_process(current.mon);
+        }
+        let reason = pair(atom("select_write"), O::Int(sres.into()));
+        requestor_release(&mut st.current_writer);
+        send_error_waiting_writers(h, st, &reason);
+        st.current_writer = None;
+        return Err(raise_select("select_write", sres));
+    }
+    h.counters.lock().unwrap().write_waits += 1;
+    st.write_state |= state_bits::SELECTED;
+    Ok(match written {
+        Some(written) => pair(atom("select"), O::Int(written as i64)),
+        None => atom("select"),
     })
+}
+/// `essio_cancel_send`.
+fn cancel_send(args: &[O]) -> Result<O, BifError> {
+    let h = handle(&args[0])?;
+    if !matches!(args[2], O::Ref { .. }) {
+        return Err(BifError::BADARG);
+    }
+    let guard = h.socket.lock().unwrap();
+    let mut st = h.state.lock().unwrap();
+    let Some(s) = guard.as_ref().filter(|_| is_open(st.write_state)) else {
+        return Ok(error("closed"));
+    };
+    let Some(current) = st.current_writer.clone() else {
+        return Ok(atom("not_found"));
+    };
+    let Some(me) = self_pid() else {
+        return Err(BifError::BADARG);
+    };
+    if me == current.pid {
+        if args[2] != current.reference {
+            return Ok(atom("not_found"));
+        }
+        let fd = s.as_raw_fd();
+        demonitor_process(current.mon);
+        let result = cancel_write_select(fd, &current.reference);
+        if !activate_next(&h, &mut st, fd, Kind::Writer) {
+            st.current_writer = None;
+        }
+        Ok(result)
+    } else if st.unqueue(Kind::Writer, Some(&args[2]), &me) {
+        Ok(atom("ok"))
+    } else {
+        Ok(atom("not_found"))
+    }
 }
 #[cfg(target_os = "macos")]
 fn sendfile_once(file: i32, socket: i32, offset: i64, count: usize) -> (i32, usize) {
@@ -1709,10 +2045,16 @@ fn shutdown(args: &[O]) -> Result<O, BifError> {
         Some("read") => std::net::Shutdown::Read,
         Some("write") => std::net::Shutdown::Write,
         Some("read_write") => std::net::Shutdown::Both,
-        _ => return Err(BifError::BADARG),
+        _ => {
+            return Err(crate::raise(pair(
+                atom("invalid"),
+                pair(atom("how"), args[1].clone()),
+            )));
+        }
     };
     let guard = h.socket.lock().unwrap();
-    Ok(match guard.as_ref() {
+    let st = h.state.lock().unwrap();
+    Ok(match guard.as_ref().filter(|_| is_open(st.read_state)) {
         Some(s) => io_result(s.shutdown(how)),
         None => error("closed"),
     })
@@ -2196,10 +2538,10 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
         ("nif_connect", 1 | 3) => connect(args),
         ("nif_listen", 2) => listen(args),
         ("nif_accept", 2) => accept(args),
-        ("nif_send", 4) => send(args, None),
-        ("nif_sendto", 5) => send(args, Some(&args[2])),
-        ("nif_sendmsg", 5) => send_vectors(args, true),
-        ("nif_sendv", 3) => send_vectors(args, false),
+        ("nif_send", 4) => nif_send(args, None),
+        ("nif_sendto", 5) => nif_send(args, Some(&args[2])),
+        ("nif_sendmsg", 5) => nif_sendmsg(args),
+        ("nif_sendv", 3) => nif_sendv(args),
         ("nif_recv", 4) => recv(args, false, false),
         ("nif_recvfrom", 4) => recv(args, true, false),
         ("nif_recvmsg", 5) => recv(args, false, true),
@@ -2232,6 +2574,7 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
             Some("connect") => cancel_connect(args),
             Some("accept") => cancel_accept(args),
             Some("recv" | "recvfrom" | "recvmmsg" | "recvmsg") => cancel_recv(args),
+            Some("send" | "sendto" | "sendmsg" | "sendv") => cancel_send(args),
             _ => {
                 let h = handle(&args[0])?;
                 if let Some(s) = h.socket.lock().unwrap().as_ref() {
@@ -2289,6 +2632,12 @@ mod tests {
         });
         set_reactor(Some(reactor.clone()));
         (lock, reactor)
+    }
+
+    fn reactor_state(client: &O) -> bool {
+        let h = handle(client).unwrap();
+        let st = h.state.lock().unwrap();
+        st.current_writer.is_none() && st.writers_q.is_empty()
     }
 
     fn result(value: O) -> O {
@@ -2422,7 +2771,7 @@ mod tests {
                     client.clone(),
                     O::Binary(payload.clone()),
                     O::Int(0),
-                    O::Int(2)
+                    test_ref(2)
                 ]
             ),
             atom("ok")
@@ -2469,7 +2818,7 @@ mod tests {
                 &[
                     client.clone(),
                     O::list(vec![O::Binary(b"a".to_vec()), O::Binary(b"b".to_vec())]),
-                    O::Int(5)
+                    test_ref(5)
                 ]
             ),
             atom("ok")
@@ -2622,6 +2971,314 @@ mod tests {
             atom("not_found")
         );
     }
+    fn stream_pair(reactor: &BlockingReactor) -> (O, O) {
+        let listener = open_socket("inet", "stream", 6);
+        assert_eq!(
+            invoke("nif_bind", &[listener.clone(), addr("inet", 0)]),
+            atom("ok")
+        );
+        assert_eq!(
+            invoke("nif_listen", &[listener.clone(), O::Int(4)]),
+            atom("ok")
+        );
+        let bound = result(invoke("nif_sockname", std::slice::from_ref(&listener)));
+        let port = number(field(&bound, "port").unwrap()).unwrap();
+        let client = open_socket("inet", "stream", 6);
+        let connected = invoke(
+            "nif_connect",
+            &[client.clone(), test_ref(900), addr("inet", port)],
+        );
+        if connected == atom("select") {
+            loop {
+                let (_, reference) = reactor
+                    .wait(Duration::from_secs(2))
+                    .expect("connect select");
+                if reference == test_ref(900) {
+                    break;
+                }
+            }
+            assert_eq!(
+                invoke("nif_connect", std::slice::from_ref(&client)),
+                atom("ok")
+            );
+        }
+        let accepted = (0..200)
+            .find_map(|_| {
+                let value = invoke("nif_accept", &[listener.clone(), test_ref(901)]);
+                if value == atom("select") {
+                    std::thread::sleep(Duration::from_millis(5));
+                    None
+                } else {
+                    Some(result(value))
+                }
+            })
+            .expect("connection was not accepted");
+        for (socket, option) in [(&client, libc::SO_SNDBUF), (&accepted, libc::SO_RCVBUF)] {
+            assert_eq!(
+                invoke(
+                    "nif_setopt",
+                    &[
+                        socket.clone(),
+                        O::Int(libc::SOL_SOCKET.into()),
+                        O::Int(option.into()),
+                        O::Int(8192),
+                        O::Int(0)
+                    ]
+                ),
+                atom("ok")
+            );
+        }
+        (client, accepted)
+    }
+    fn fill_send_buffer(client: &O, reference: u32) -> usize {
+        let first = invoke(
+            "nif_send",
+            &[
+                client.clone(),
+                O::Binary(vec![7u8; 8 * 1024 * 1024]),
+                O::Int(0),
+                test_ref(reference),
+            ],
+        );
+        let O::Tuple(parts) = &first else {
+            panic!("expected a partial write, got {first:?}")
+        };
+        assert_eq!(parts[0], atom("select"), "{first:?}");
+        number(&parts[1]).unwrap() as usize
+    }
+    fn small_send(client: &O, reference: u32) -> Result<O, BifError> {
+        dispatch(
+            "nif_send",
+            &[
+                client.clone(),
+                O::Binary(b"b".to_vec()),
+                O::Int(0),
+                test_ref(reference),
+            ],
+        )
+    }
+    #[test]
+    fn send_writers_queue_and_cancel() {
+        let (_lock, reactor) = caller_reactor();
+        let (client, _accepted) = stream_pair(&reactor);
+        let written = fill_send_buffer(&client, 1);
+        assert!(written > 0 && written < 8 * 1024 * 1024);
+        let h = handle(&client).unwrap();
+        {
+            let st = h.state.lock().unwrap();
+            let current = st.current_writer.as_ref().unwrap();
+            assert_eq!(current.pid, pid(5));
+            assert_eq!(current.reference, test_ref(1));
+            let counters = h.counters.lock().unwrap();
+            assert_eq!(counters.write_tries, 1);
+            assert_eq!(counters.write_waits, 1);
+            assert_eq!(counters.write_pkg, 0);
+        }
+        reactor.set_caller(pid(6));
+        assert_eq!(small_send(&client, 2).unwrap(), atom("select"));
+        assert!(small_send(&client, 3).is_err());
+        assert_eq!(
+            crate::RAISED.with(|raised| raised.borrow().clone()),
+            Some(pair(atom("invalid"), atom("state")))
+        );
+        assert_eq!(h.state.lock().unwrap().writers_q.len(), 1);
+        let cancel = |op: &str, reference: u32| {
+            invoke(
+                "nif_cancel",
+                &[client.clone(), atom(op), test_ref(reference)],
+            )
+        };
+        assert_eq!(cancel("send", 9), atom("not_found"));
+        assert_eq!(cancel("sendto", 2), atom("ok"));
+        assert!(h.state.lock().unwrap().writers_q.is_empty());
+        assert_eq!(small_send(&client, 7).unwrap(), atom("select"));
+        reactor.set_caller(pid(5));
+        assert_eq!(cancel("send", 8), atom("not_found"));
+        assert_eq!(cancel("sendmsg", 1), atom("ok"));
+        {
+            let st = h.state.lock().unwrap();
+            let current = st.current_writer.as_ref().unwrap();
+            assert_eq!((&current.pid, &current.reference), (&pid(6), &test_ref(7)));
+            assert!(st.writers_q.is_empty());
+        }
+        reactor.set_caller(pid(6));
+        assert_eq!(cancel("sendv", 7), atom("ok"));
+        assert!(h.state.lock().unwrap().current_writer.is_none());
+        assert_eq!(cancel("send", 7), atom("not_found"));
+        assert_eq!(
+            invoke("nif_close", std::slice::from_ref(&client)),
+            atom("ok")
+        );
+        assert_eq!(cancel("send", 7), error("closed"));
+    }
+    #[test]
+    fn send_failure_aborts_waiting_writers() {
+        let (_lock, reactor) = caller_reactor();
+        let (client, accepted) = stream_pair(&reactor);
+        fill_send_buffer(&client, 1);
+        reactor.set_caller(pid(6));
+        assert_eq!(small_send(&client, 2).unwrap(), atom("select"));
+        reactor.set_caller(pid(7));
+        assert_eq!(small_send(&client, 3).unwrap(), atom("select"));
+        {
+            let peer = handle(&accepted).unwrap();
+            let guard = peer.socket.lock().unwrap();
+            guard
+                .as_ref()
+                .unwrap()
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+        }
+        assert_eq!(invoke("nif_close", &[accepted]), atom("ok"));
+        reactor.set_caller(pid(5));
+        let failed = (0..100)
+            .find_map(|_| {
+                let value = invoke(
+                    "nif_send",
+                    &[
+                        client.clone(),
+                        O::Binary(vec![1; 1024]),
+                        O::Int(0),
+                        test_ref(4),
+                    ],
+                );
+                matches!(&value, O::Tuple(parts) if parts[0] == atom("error")).then_some(value)
+            })
+            .expect("send did not fail after the peer reset");
+        let O::Tuple(parts) = &failed else {
+            unreachable!()
+        };
+        let reason = parts[1].clone();
+        assert!(
+            reason == atom("epipe") || reason == atom("econnreset"),
+            "{failed:?}"
+        );
+        let h = handle(&client).unwrap();
+        {
+            let st = h.state.lock().unwrap();
+            assert!(st.current_writer.is_none() && st.writers_q.is_empty());
+            assert_eq!(h.counters.lock().unwrap().write_fails, 1);
+        }
+        let sent = reactor.sent();
+        for (who, reference) in [(pid(6), 2), (pid(7), 3)] {
+            let message = crate::abort_message(&h.reference, &test_ref(reference), &reason);
+            assert!(sent.contains(&(who, message)), "{sent:?}");
+        }
+    }
+    #[test]
+    fn sendv_returns_iov_until_the_tail_is_sent() {
+        let (_lock, reactor) = caller_reactor();
+        let (client, accepted) = stream_pair(&reactor);
+        let items: Vec<O> = (0..1030).map(|_| O::Binary(b"x".to_vec())).collect();
+        let first = invoke(
+            "nif_sendv",
+            &[client.clone(), O::list(items.clone()), test_ref(1)],
+        );
+        assert_eq!(first, pair(atom("iov"), O::Int(1024)));
+        let h = handle(&client).unwrap();
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.current_writer.as_ref().unwrap().reference, atom("iov"));
+            assert_eq!(h.counters.lock().unwrap().write_waits, 0);
+        }
+        let rest = invoke(
+            "nif_sendv",
+            &[client.clone(), O::list(items[1024..].to_vec()), test_ref(1)],
+        );
+        assert_eq!(rest, atom("ok"));
+        assert!(h.state.lock().unwrap().current_writer.is_none());
+        {
+            let counters = h.counters.lock().unwrap();
+            assert_eq!(counters.write_pkg, 1);
+            assert_eq!(counters.write_byte, 6);
+        }
+        for bad in [
+            O::list(vec![O::Binary(b"a".to_vec()), O::Int(1)]),
+            O::List {
+                elems: vec![O::Binary(b"a".to_vec())],
+                tail: Box::new(atom("tail")),
+            },
+            O::list(vec![O::BitString {
+                bytes: vec![1],
+                bits: 3,
+            }]),
+            atom("nolist"),
+        ] {
+            assert_eq!(
+                invoke("nif_sendv", &[client.clone(), bad, test_ref(2)]),
+                invalid("iov")
+            );
+        }
+        assert_eq!(
+            invoke(
+                "nif_sendv",
+                &[
+                    client.clone(),
+                    O::list(vec![
+                        O::Binary(vec![]),
+                        O::Binary(b"ab".to_vec()),
+                        O::Binary(vec![]),
+                        O::Binary(b"c".to_vec())
+                    ]),
+                    test_ref(3)
+                ]
+            ),
+            atom("ok")
+        );
+        let mut got = Vec::new();
+        while got.len() < 1030 + 3 {
+            let value = invoke(
+                "nif_recv",
+                &[accepted.clone(), O::Int(0), O::Int(0), test_ref(4)],
+            );
+            match &value {
+                O::Tuple(parts) if parts[0] == atom("ok") => {
+                    let O::Binary(bytes) = &parts[1] else {
+                        panic!("{parts:?}")
+                    };
+                    got.extend_from_slice(bytes);
+                }
+                _ => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(&got[1030..], b"abc");
+    }
+    #[test]
+    fn shutdown_reports_how_and_closed_socket() {
+        let (_lock, reactor) = caller_reactor();
+        let (client, _accepted) = stream_pair(&reactor);
+        assert!(dispatch("nif_shutdown", &[client.clone(), atom("bad")]).is_err());
+        assert_eq!(
+            crate::RAISED.with(|raised| raised.borrow().clone()),
+            Some(pair(atom("invalid"), pair(atom("how"), atom("bad"))))
+        );
+        assert_eq!(
+            invoke("nif_shutdown", &[client.clone(), atom("write")]),
+            atom("ok")
+        );
+        assert_eq!(
+            invoke(
+                "nif_send",
+                &[
+                    client.clone(),
+                    O::Binary(b"x".to_vec()),
+                    O::Int(0),
+                    test_ref(1)
+                ]
+            ),
+            error("epipe")
+        );
+        assert_eq!(
+            invoke("nif_close", std::slice::from_ref(&client)),
+            atom("ok")
+        );
+        for how in ["read", "write", "read_write"] {
+            assert_eq!(
+                invoke("nif_shutdown", &[client.clone(), atom(how)]),
+                error("closed")
+            );
+        }
+    }
     #[test]
     fn tcp_ipv4_ipv6_and_options() {
         let _lock = REACTOR_TEST_LOCK.lock().unwrap();
@@ -2700,7 +3357,7 @@ mod tests {
                         data.clone(),
                         addr(family, port),
                         O::Int(0),
-                        O::Int(1)
+                        test_ref(1)
                     ]
                 ),
                 atom("ok")
@@ -2732,7 +3389,7 @@ mod tests {
                         sender.clone(),
                         msg,
                         O::Int(0),
-                        O::Int(3),
+                        test_ref(3),
                         O::list(vec![O::Binary(b"xyz".to_vec())])
                     ]
                 ),
@@ -2769,7 +3426,7 @@ mod tests {
                         O::Binary(vec![0; 100]),
                         addr(family, port),
                         O::Int(0),
-                        O::Int(5)
+                        test_ref(5)
                     ]
                 ),
                 atom("ok")
@@ -2843,7 +3500,7 @@ mod tests {
                     client.clone(),
                     O::Binary(b"local".to_vec()),
                     O::Int(0),
-                    O::Int(3)
+                    test_ref(3)
                 ]
             ),
             atom("ok")
@@ -2870,7 +3527,7 @@ mod tests {
     }
     #[test]
     fn partial_send_and_large_receive() {
-        let (_lock, _reactor) = caller_reactor();
+        let (_lock, reactor) = caller_reactor();
         let listener = open_socket("inet", "stream", 6);
         assert_eq!(
             invoke("nif_bind", &[listener.clone(), addr("inet", 0)]),
@@ -2887,7 +3544,18 @@ mod tests {
             "nif_connect",
             &[client.clone(), test_ref(1), addr("inet", port)],
         );
-        assert!(connected == atom("ok") || connected == atom("select"));
+        if connected == atom("select") {
+            assert_eq!(
+                reactor.wait(Duration::from_secs(2)),
+                Some((reactor.self_pid().unwrap(), test_ref(1)))
+            );
+            assert_eq!(
+                invoke("nif_connect", std::slice::from_ref(&client)),
+                atom("ok")
+            );
+        } else {
+            assert_eq!(connected, atom("ok"));
+        }
         let accepted = (0..100)
             .find_map(|_| {
                 let value = invoke("nif_accept", &[listener.clone(), O::Int(2)]);
@@ -2919,11 +3587,11 @@ mod tests {
                 client.clone(),
                 O::Binary(payload.clone()),
                 O::Int(0),
-                O::Int(3),
+                test_ref(3),
             ],
         );
         let mut written = match &first {
-            O::Tuple(parts) if parts[0] == atom("ok") => number(&parts[1]).unwrap() as usize,
+            O::Tuple(parts) if parts[0] == atom("select") => number(&parts[1]).unwrap() as usize,
             _ => panic!("expected partial send, got {first:?}"),
         };
         assert!(written > 0 && written < payload.len());
@@ -2948,25 +3616,43 @@ mod tests {
             assert_eq!(bytes, expected);
             assert_eq!(invoke("nif_close", &[accepted]), atom("ok"));
         });
+        let mut round = 3;
+        let mut pending = Some(test_ref(3));
         while written < payload.len() {
+            if let Some(expected) = pending.take() {
+                loop {
+                    let (_, reference) = reactor
+                        .wait(Duration::from_secs(5))
+                        .expect("write select message");
+                    if reference == expected {
+                        break;
+                    }
+                }
+            }
+            round += 1;
             let value = invoke(
                 "nif_send",
                 &[
                     client.clone(),
                     O::Binary(payload[written..].to_vec()),
                     O::Int(0),
-                    O::Int(5),
+                    test_ref(round),
                 ],
             );
             match &value {
                 O::Atom(s) if s == "ok" => written = payload.len(),
-                O::Atom(s) if s == "select" => std::thread::yield_now(),
-                O::Tuple(parts) if parts[0] == atom("ok") => {
-                    written += number(&parts[1]).unwrap() as usize
+                O::Atom(s) if s == "select" => pending = Some(test_ref(round)),
+                O::Tuple(parts) if parts[0] == atom("select") => {
+                    written += number(&parts[1]).unwrap() as usize;
+                    pending = Some(test_ref(round));
                 }
                 _ => panic!("send failed: {value:?}"),
             }
         }
+        assert!(
+            reactor_state(&client),
+            "writer must be released after completion"
+        );
         reader.join().unwrap();
         assert_eq!(invoke("nif_close", &[client]), atom("ok"));
         assert_eq!(invoke("nif_close", &[listener]), atom("ok"));
@@ -3632,7 +4318,7 @@ mod tests {
                     O::Binary(b"ready".to_vec()),
                     addr("inet", port),
                     O::Int(0),
-                    O::Int(1)
+                    test_ref(1)
                 ]
             ),
             atom("ok")

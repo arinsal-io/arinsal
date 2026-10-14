@@ -12,7 +12,11 @@ const SOURCE: &str = r#"
 -export([connect_accept_send_recv/0, connect_refused/0, accept_timeout/0,
          connect_after_listener_close/0, recv_partial_nowait/0, recv_partial_blocking/0,
          recv_timeouts/0, recv_nowait_select_message/0, two_readers/0,
-         eof_aborts_queued_reader/0, gen_tcp_recv_n_partial/0]).
+         eof_aborts_queued_reader/0, gen_tcp_recv_n_partial/0,
+         large_send_slow_reader/0,
+         sendv_several_binaries/0, send_after_shutdown_write/0,
+         shutdown_on_closed_socket/0, cancel_send/0, writer_queue_order/0,
+         writer_abort_on_error/0, packet_send_sendv/0, sendto_sendmsg_stream/0]).
 
 listen() ->
     {ok, Listen} = gen_tcp:listen(0, [{inet_backend, socket}, {ip, {127,0,0,1}},
@@ -204,6 +208,287 @@ gen_tcp_recv_n_partial() ->
     ok = gen_tcp:close(C),
     ok = gen_tcp:close(Listen),
     {R1, R2, R3}.
+
+cancelled(ok) -> cancelled_or_sent;
+cancelled(select_sent) -> cancelled_or_sent;
+cancelled(Other) -> Other.
+
+raised(Fun) ->
+    try Fun() catch Class:Reason -> {Class, Reason} end.
+
+loopback() -> #{family => inet, addr => loopback, port => 0}.
+
+pair() ->
+    {ok, L} = socket:open(inet, stream, tcp),
+    ok = socket:bind(L, loopback()),
+    ok = socket:listen(L),
+    {ok, #{port := Port}} = socket:sockname(L),
+    {ok, C} = socket:open(inet, stream, tcp),
+    ok = socket:connect(C, #{family => inet, addr => loopback, port => Port}),
+    {ok, S} = socket:accept(L),
+    {L, C, S}.
+
+small_buffers(C, S) -> buffers(C, S, 8192).
+
+buffers(C, S, Size) ->
+    ok = socket:setopt(C, {socket, sndbuf}, Size),
+    ok = socket:setopt(S, {socket, rcvbuf}, Size).
+
+tag(Res) when is_tuple(Res) -> {element(1, Res), tuple_size(Res)};
+tag(Res) -> Res.
+
+await(Sock, SendRef) ->
+    receive {'$socket', Sock, select, SendRef} -> ok
+    after 5000 -> timeout end.
+
+send_all({'$socket', Ref} = Sock, Data) ->
+    send_all(Sock, Ref, Data, [], 0, first).
+
+send_all(Sock, Ref, Data, Flags, Partials, First) ->
+    SendRef = make_ref(),
+    Res = prim_socket:send(Ref, Data, Flags, SendRef),
+    First1 = case First of first -> tag(Res); _ -> First end,
+    case Res of
+        ok -> {First1, Partials > 0};
+        {select, Rest, EFlags} ->
+            await(Sock, SendRef),
+            send_all(Sock, Ref, Rest, EFlags, Partials + 1, First1);
+        {select, EFlags} ->
+            await(Sock, SendRef),
+            send_all(Sock, Ref, Data, EFlags, Partials, First1);
+        Other -> {error, Other}
+    end.
+
+slow_read(_S, Total, Got, Ctx) when Got >= Total ->
+    {Got, erlang:md5_final(Ctx)};
+slow_read(S, Total, Got, Ctx) ->
+    case socket:recv(S, 0, 5000) of
+        {ok, Bin} ->
+            timer:sleep(1),
+            slow_read(S, Total, Got + byte_size(Bin), erlang:md5_update(Ctx, Bin));
+        {error, Reason} -> {error, Reason, Got}
+    end.
+
+read_all(S, Acc) ->
+    case socket:recv(S, 0, 2000) of
+        {ok, Bin} -> read_all(S, [Acc, Bin]);
+        {error, Reason} -> {iolist_to_binary(Acc), Reason}
+    end.
+
+large_send_slow_reader() ->
+    {_L, C, S} = pair(),
+    small_buffers(C, S),
+    Total = 256 * 1024,
+    Data = binary:copy(<<"0123456789abcdef">>, Total div 16),
+    Parent = self(),
+    spawn_link(fun() ->
+        Parent ! {read, slow_read(S, Total, 0, erlang:md5_init())}
+    end),
+    {First, Partials} = send_all(C, Data),
+    {Bytes, Md5} = receive {read, R} -> R after 30000 -> {timeout, timeout} end,
+    {First, Partials, Bytes, Md5 =:= erlang:md5(Data)}.
+
+sendv_several_binaries() ->
+    {_L, C, S} = pair(),
+    R1 = socket:sendv(C, [<<"a">>, <<"bc">>, <<>>, <<"def">>]),
+    R2 = socket:sendv(C, [binary:part(<<"xxHELLOyy">>, 2, 5), <<"-">>, <<"w">>]),
+    R3 = socket:sendv(C, lists:duplicate(2500, <<"z">>)),
+    R4 = socket:sendv(C, []),
+    R5 = socket:sendv(C, [<<>>, <<>>]),
+    ok = socket:shutdown(C, write),
+    {Received, End} = read_all(S, []),
+    <<Head:14/binary, Zs/binary>> = Received,
+    {R1, R2, R3, R4, R5, Head, byte_size(Zs), Zs =:= binary:copy(<<"z">>, 2500), End}.
+
+send_after_shutdown_write() ->
+    {_L, C, S} = pair(),
+    Shutdown = socket:shutdown(C, write),
+    R1 = socket:send(C, <<"x">>),
+    R2 = socket:sendv(C, [<<"x">>, <<"y">>]),
+    R3 = socket:sendto(C, <<"x">>, #{family => inet, addr => loopback, port => 1}),
+    R4 = socket:sendmsg(C, #{iov => [<<"x">>]}),
+    Eof = socket:recv(S, 0, 1000),
+    ok = socket:send(S, <<"back">>),
+    Back = socket:recv(C, 4, 1000),
+    Gen = gen_tcp_shutdown_send(),
+    {Shutdown, R1, R2, R3, R4, Eof, Back, Gen}.
+
+gen_tcp_shutdown_send() ->
+    {ok, Listen} = gen_tcp:listen(0, [{inet_backend, socket}, {ip, {127,0,0,1}},
+                                      {active, false}]),
+    {ok, Port} = inet:port(Listen),
+    Parent = self(),
+    spawn(fun() ->
+        {ok, A} = gen_tcp:accept(Listen, 2000),
+        Parent ! {accepted, gen_tcp:recv(A, 0, 2000)}
+    end),
+    {ok, Client} = gen_tcp:connect({127,0,0,1}, Port,
+                                   [{inet_backend, socket}, {active, false}], 2000),
+    ok = gen_tcp:send(Client, <<"before">>),
+    Shut = gen_tcp:shutdown(Client, write),
+    Send = gen_tcp:send(Client, <<"after">>),
+    Recv = receive {accepted, X} -> X after 3000 -> timeout end,
+    {Shut, Send, Recv}.
+
+shutdown_on_closed_socket() ->
+    {_L, C, S} = pair(),
+    {'$socket', Ref} = C,
+    BadHowOpen = raised(fun() -> prim_socket:shutdown(Ref, bad) end),
+    ok = socket:close(C),
+    BadHowClosed = raised(fun() -> prim_socket:shutdown(Ref, bad) end),
+    Closed = [socket:shutdown(C, How) || How <- [read, write, read_write]],
+    {ok, U} = socket:open(inet, stream, tcp),
+    Unconnected = [socket:shutdown(U, How) || How <- [read, write, read_write]],
+    Twice = [socket:shutdown(S, write), socket:shutdown(S, write),
+             socket:shutdown(S, read), socket:shutdown(S, read_write)],
+    ok = socket:close(S),
+    AfterClose = socket:shutdown(S, write),
+    Gen = gen_tcp_shutdown_closed(),
+    {BadHowOpen, BadHowClosed, Closed, Unconnected, Twice, AfterClose, Gen}.
+
+gen_tcp_shutdown_closed() ->
+    {ok, Listen} = gen_tcp:listen(0, [{inet_backend, socket}, {ip, {127,0,0,1}},
+                                      {active, false}]),
+    {ok, Port} = inet:port(Listen),
+    {ok, Client} = gen_tcp:connect({127,0,0,1}, Port,
+                                   [{inet_backend, socket}, {active, false}], 2000),
+    ok = gen_tcp:close(Client),
+    {gen_tcp:shutdown(Client, write), gen_tcp:send(Client, <<"x">>)}.
+
+cancel_send() ->
+    {_L, C, S} = pair(),
+    small_buffers(C, S),
+    {'$socket', Ref} = C,
+    Big = binary:copy(<<0>>, 1 bsl 22),
+    NoWriter = prim_socket:cancel(Ref, send, make_ref()),
+    Ref1 = make_ref(),
+    First = tag(prim_socket:send(Ref, Big, [], Ref1)),
+    Parent = self(),
+    RefB = make_ref(),
+    B = spawn(fun() ->
+        Parent ! {b_send, prim_socket:send(Ref, <<"x">>, [], RefB)},
+        receive {'$socket', C, select, RefB} -> Parent ! b_selected
+        after 3000 -> Parent ! b_timeout end,
+        receive stop -> ok end
+    end),
+    BSend = receive {b_send, X} -> X after 2000 -> timeout end,
+    WrongRef = prim_socket:cancel(Ref, send, make_ref()),
+    WrongOp = [prim_socket:cancel(Ref, Op, make_ref()) || Op <- [sendto, sendmsg, sendv]],
+    CancelA = cancelled(prim_socket:cancel(Ref, sendv, Ref1)),
+    {Drained, _} = read_all(S, []),
+    BResult = receive b_selected -> ok; b_timeout -> timeout after 5000 -> none end,
+    CancelAgain = prim_socket:cancel(Ref, send, Ref1),
+    B ! stop,
+    {NoWriter, First, BSend, WrongRef, WrongOp, CancelA, byte_size(Drained) > 0,
+     BResult, CancelAgain}.
+
+writer_queue_order() ->
+    {_L, C, S} = pair(),
+    buffers(C, S, 65536),
+    Parent = self(),
+    {'$socket', Ref} = C,
+    Big = binary:copy(<<"a">>, 1024 * 1024),
+    Sender = fun(Tag, Payload) ->
+        spawn(fun() ->
+            SendRef = make_ref(),
+            First = prim_socket:send(Ref, Payload, [], SendRef),
+            Parent ! {Tag, first, tag(First)},
+            Result = case First of
+                {select, EFlags} ->
+                    await(C, SendRef),
+                    {_, _} = send_all(C, Ref, Payload, EFlags, 0, first),
+                    sent;
+                ok -> sent
+            end,
+            Parent ! {Tag, done, Result}
+        end)
+    end,
+    A = spawn(fun() ->
+        {_, _} = send_all(C, Big),
+        Parent ! {a, done, sent}
+    end),
+    timer:sleep(200),
+    _ = A,
+    Sender(b, <<"B">>),
+    BFirst = receive {b, first, F1} -> F1 after 2000 -> timeout end,
+    Sender(c, <<"C">>),
+    CFirst = receive {c, first, F2} -> F2 after 2000 -> timeout end,
+    ABlocked = receive {a, done, _} = Early -> Early after 100 -> a_blocked end,
+    {Received, _} = read_all_until(S, byte_size(Big) + 2),
+    AResult = case ABlocked of
+        a_blocked -> receive {a, done, AR} -> AR after 5000 -> timeout end;
+        {a, done, Early1} -> Early1
+    end,
+    BDone = receive {b, done, BR} -> BR after 5000 -> timeout end,
+    CDone = receive {c, done, CR} -> CR after 5000 -> timeout end,
+    Tail = binary:part(Received, byte_size(Received) - 2, 2),
+    {BFirst, CFirst, ABlocked, AResult, BDone, CDone, byte_size(Received), Tail}.
+
+read_all_until(S, Total) -> read_all_until(S, Total, 0, []).
+read_all_until(_S, Total, Got, Acc) when Got >= Total ->
+    {iolist_to_binary(Acc), done};
+read_all_until(S, Total, Got, Acc) ->
+    case socket:recv(S, 0, 5000) of
+        {ok, Bin} -> read_all_until(S, Total, Got + byte_size(Bin), [Acc, Bin]);
+        {error, Reason} -> {iolist_to_binary(Acc), Reason}
+    end.
+
+writer_abort_on_error() ->
+    {_L, C, S} = pair(),
+    small_buffers(C, S),
+    {'$socket', Ref} = C,
+    Big = binary:copy(<<0>>, 1 bsl 22),
+    Ref1 = make_ref(),
+    First = tag(prim_socket:send(Ref, Big, [], Ref1)),
+    Parent = self(),
+    RefB = make_ref(),
+    spawn(fun() ->
+        Parent ! {b_send, prim_socket:send(Ref, <<"x">>, [], RefB)},
+        receive Msg -> Parent ! {b_msg, Msg} after 5000 -> Parent ! {b_msg, timeout} end
+    end),
+    BSend = receive {b_send, X} -> X after 2000 -> timeout end,
+    ok = socket:setopt(S, {socket, linger}, #{onoff => true, linger => 0}),
+    ok = socket:close(S),
+    ASelect = await(C, Ref1),
+    AError = prim_socket:send(Ref, Big, [], make_ref()),
+    BMsg = receive
+        {b_msg, {'$socket', Sock, abort, {AbortRef, Reason}}} ->
+            {abort, Sock =:= C, AbortRef =:= RefB, Reason};
+        {b_msg, M} -> M
+    after 5000 -> timeout end,
+    {First, BSend, ASelect, AError, BMsg}.
+
+packet_send_sendv() ->
+    {ok, Listen} = gen_tcp:listen(0, [{inet_backend, socket}, {ip, {127,0,0,1}},
+                                      {active, false}, {packet, 4}, binary]),
+    {ok, Port} = inet:port(Listen),
+    Parent = self(),
+    N = 300,
+    spawn(fun() ->
+        {ok, A} = gen_tcp:accept(Listen, 2000),
+        Parent ! {frames, [gen_tcp:recv(A, 0, 2000) || _ <- lists:seq(1, N)]}
+    end),
+    {ok, Client} = gen_tcp:connect({127,0,0,1}, Port,
+                                   [{inet_backend, socket}, {active, false},
+                                    {packet, 4}, binary], 2000),
+    Sent = [gen_tcp:send(Client, binary:copy(<<"p">>, I)) || I <- lists:seq(1, N)],
+    Frames = receive {frames, Fs} -> Fs after 10000 -> timeout end,
+    Ok = Frames =:= [{ok, binary:copy(<<"p">>, I)} || I <- lists:seq(1, N)],
+    {lists:usort(Sent), Ok}.
+
+sendto_sendmsg_stream() ->
+    {_L, C, S} = pair(),
+    Addr = #{family => inet, addr => loopback, port => 1},
+    R1 = socket:sendto(C, <<"to">>, Addr),
+    R2 = socket:sendmsg(C, #{iov => [<<"m">>, <<"sg">>]}),
+    R3 = socket:sendmsg(C, #{iov => [<<"x">>], addr => #{family => inet, addr => nope}}),
+    R4 = raised(fun() ->
+        prim_socket:sendmsg(element(2, C), #{iov => []}, [], make_ref(), [<<"ok">>])
+    end),
+    R5 = socket:sendmsg(C, #{iov => [<<"y">>], ctrl => []}),
+    ok = socket:shutdown(C, write),
+    {Received, End} = read_all(S, []),
+    {R1, R2, R3, R4, R5, Received, End}.
 "#;
 
 fn run(program: &Path, dir: &Path, function: &str) -> (bool, String) {
@@ -330,4 +615,49 @@ fn eof_aborts_queued_reader_matches_erts() {
 #[test]
 fn gen_tcp_recv_n_partial_matches_erts() {
     compare("gen_tcp_recv_n_partial");
+}
+
+#[test]
+fn large_send_with_slow_reader_matches_erts() {
+    compare("large_send_slow_reader");
+}
+
+#[test]
+fn sendv_with_several_binaries_matches_erts() {
+    compare("sendv_several_binaries");
+}
+
+#[test]
+fn send_after_shutdown_write_matches_erts() {
+    compare("send_after_shutdown_write");
+}
+
+#[test]
+fn shutdown_on_closed_socket_matches_erts() {
+    compare("shutdown_on_closed_socket");
+}
+
+#[test]
+fn cancel_send_matches_erts() {
+    compare("cancel_send");
+}
+
+#[test]
+fn writer_queue_order_matches_erts() {
+    compare("writer_queue_order");
+}
+
+#[test]
+fn writer_abort_on_error_matches_erts() {
+    compare("writer_abort_on_error");
+}
+
+#[test]
+fn packet_send_through_sendv_matches_erts() {
+    compare("packet_send_sendv");
+}
+
+#[test]
+fn sendto_and_sendmsg_on_stream_match_erts() {
+    compare("sendto_sendmsg_stream");
 }
