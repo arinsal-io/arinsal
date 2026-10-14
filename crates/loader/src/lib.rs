@@ -183,6 +183,9 @@ pub enum ImportFastOp {
     NotEqual,
     ExactEqual,
     ExactNotEqual,
+    /// A BIF that may trap to a continuation. It runs through the trap machinery, not
+    /// through the direct function-pointer call of a pure BIF.
+    Trapping,
 }
 impl Import {
     /// Call classification. [`ImportClass::Fresh`] until the VM binds the slot.

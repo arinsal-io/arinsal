@@ -22,6 +22,17 @@ pub(crate) enum HandlerResult {
     },
 }
 
+impl HandlerResult {
+    /// The charge the handler reported for its run.
+    pub(crate) fn reductions(&self) -> u32 {
+        match self {
+            Self::Done { reductions, .. }
+            | Self::Failed { reductions, .. }
+            | Self::Yield { reductions, .. } => *reductions,
+        }
+    }
+}
+
 /// What resuming a trapped call produces: a handler's result, or the Erlang export the trap
 /// calls (erts BIF_TRAP*: `c_p->i` is the export, the arguments are its X registers).
 pub(crate) enum ResumeResult {
@@ -1485,6 +1496,7 @@ pub(crate) fn execute_named(
     } else {
         arity
     };
+    let fcalls_in = process.reductions;
     let result = handler(
         process,
         &args[..call_arity.min(args.len())],
@@ -1492,6 +1504,7 @@ pub(crate) fn execute_named(
         pid,
         gc_was_enabled,
     );
+    process.trap_work = fcalls_in.saturating_sub(process.reductions).max(0);
     // Captured before the match drops the trap state. A continuation failure is still
     // the original BIF's error (erl_iolist.c ERTS_BIF_ERROR_TRAPPED1(c_p, reason, sp->bif, sp->arg)).
     let report = original_trap_report(
@@ -1934,6 +1947,53 @@ fn call_args(process: &Process, saved: &[Term; 4], arity: usize, resumed: bool) 
         saved[..arity.min(4)].to_vec()
     } else {
         live_args(process, saved, arity)
+    }
+}
+
+/// What one interpreted call of a trapping BIF costs the process and its scheduler slice.
+///
+/// A handler decrements the process counter itself while it works (`BUMP_REDS` through its
+/// `Ctx`), and some also return that work as the charge for `charge` to take again. The call
+/// is billed for the work once, as erts bills `REDS_IN - FCALLS`.
+pub(crate) struct TrapMeter {
+    fcalls: i32,
+    used: u64,
+    consumed: u32,
+}
+
+impl TrapMeter {
+    pub(crate) fn start(
+        process: &Process,
+        ctx: Option<&arinsal_sched::RunCtx<'_, process::Message>>,
+    ) -> Self {
+        Self {
+            fcalls: process.reductions,
+            used: process.reductions_used,
+            consumed: ctx.map_or(0, |run| run.consumed()),
+        }
+    }
+
+    /// Settle the call's cost. `returned` is the charge the handler reported.
+    pub(crate) fn finish(
+        self,
+        process: &mut Process,
+        ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
+        returned: u32,
+    ) {
+        let inside = u32::try_from(process.trap_work).unwrap_or(0);
+        let work = inside.max(returned.max(1));
+        process.reductions = self
+            .fcalls
+            .saturating_sub(i32::try_from(work).unwrap_or(i32::MAX))
+            .max(0);
+        let used = process.reductions_used.saturating_sub(self.used);
+        process.reductions_used = process
+            .reductions_used
+            .saturating_add(u64::from(work.saturating_sub(1)).saturating_sub(used));
+        if let Some(run) = ctx {
+            let counted = run.consumed().saturating_sub(self.consumed);
+            run.consume(work.saturating_sub(counted));
+        }
     }
 }
 

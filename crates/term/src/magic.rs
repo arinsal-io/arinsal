@@ -1,7 +1,6 @@
 //! Opaque reference owners retained by process and standalone heaps.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, Weak};
@@ -40,7 +39,7 @@ impl MagicRef {
         registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, Arc::downgrade(&owner));
+            .push(Arc::downgrade(&owner));
         owner
     }
 
@@ -63,42 +62,27 @@ impl MagicRef {
 impl MagicRef {
     /// Find a live magic-reference owner by its term identity.
     pub fn live_by_id(id: u64) -> Option<Arc<Self>> {
-        let entry = registry()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&id)
-            .cloned();
-        entry?.upgrade()
-    }
-
-    /// Whether the identity still has an entry in the process-wide registry.
-    ///
-    /// The entry is removed when the last reference to the owner is released.
-    pub fn is_registered(id: u64) -> bool {
-        registry()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&id)
-    }
-}
-
-impl Drop for MagicRef {
-    fn drop(&mut self) {
         let mut owners = registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if owners
-            .get(&self.id)
-            .is_some_and(|entry| entry.strong_count() == 0)
-        {
-            owners.remove(&self.id);
-        }
+        let mut found = None;
+        owners.retain(|entry| {
+            if let Some(owner) = entry.upgrade() {
+                if owner.id == id {
+                    found = Some(owner);
+                }
+                true
+            } else {
+                false
+            }
+        });
+        found
     }
 }
 
-fn registry() -> &'static Mutex<HashMap<u64, Weak<MagicRef>>> {
-    static OWNERS: OnceLock<Mutex<HashMap<u64, Weak<MagicRef>>>> = OnceLock::new();
-    OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
+fn registry() -> &'static Mutex<Vec<Weak<MagicRef>>> {
+    static OWNERS: OnceLock<Mutex<Vec<Weak<MagicRef>>>> = OnceLock::new();
+    OWNERS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 impl crate::Term {

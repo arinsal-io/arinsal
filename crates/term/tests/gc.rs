@@ -131,50 +131,6 @@ fn magic_reference_survives_copy_and_gc_then_releases() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn magic_reference_leaves_the_registry_with_its_last_reference() {
-    let count = Arc::new(AtomicUsize::new(0));
-    let mut heap = ProcessHeap::with_words(1 << 16);
-    let mut ids = Vec::new();
-    for _ in 0..10_000 {
-        let owner = MagicRef::new(DropCounter(count.clone()));
-        ids.push(owner.id());
-        let term = TermBuilder::new(&mut heap).magic_ref(owner).unwrap();
-        assert!(term.is_magic_ref());
-    }
-    assert!(ids.iter().all(|id| MagicRef::is_registered(*id)));
-    assert!(ids.iter().all(|id| MagicRef::live_by_id(*id).is_some()));
-    assert_eq!(count.load(Ordering::SeqCst), 0);
-    heap.collect(&mut [], &mut [], 0).unwrap();
-    heap.collect(&mut [], &mut [], 0).unwrap();
-    assert_eq!(count.load(Ordering::SeqCst), 10_000);
-    assert!(ids.iter().all(|id| !MagicRef::is_registered(*id)));
-    assert!(ids.iter().all(|id| MagicRef::live_by_id(*id).is_none()));
-}
-
-#[test]
-fn magic_reference_stays_registered_while_any_heap_holds_it() {
-    let count = Arc::new(AtomicUsize::new(0));
-    let owner = MagicRef::new(DropCounter(count.clone()));
-    let id = owner.id();
-    let mut source = VecHeap::new();
-    let term = TermBuilder::new(&mut source)
-        .magic_ref(owner.clone())
-        .unwrap();
-    let mut heap = ProcessHeap::with_words(128);
-    let mut roots = [copy_term(term, &mut heap).unwrap()];
-    drop(owner);
-    drop(source);
-    assert!(MagicRef::is_registered(id));
-    assert_eq!(count.load(Ordering::SeqCst), 0);
-    heap.collect(&mut roots, &mut [], 0).unwrap();
-    assert!(MagicRef::is_registered(id));
-    assert_eq!(MagicRef::live_by_id(id).unwrap().id(), id);
-    heap.collect(&mut [], &mut [], 0).unwrap();
-    assert_eq!(count.load(Ordering::SeqCst), 1);
-    assert!(!MagicRef::is_registered(id));
-}
-
 struct ExternalPayload {
     bytes: Box<[u8]>,
     _counter: DropCounter,

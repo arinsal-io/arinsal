@@ -25,8 +25,11 @@ const TRACE_EXCEPTION_CONTINUATION: Term =
 const TRACE_RETURN_TO_CONTINUATION: Term =
     Term::catch(CONTINUATION_BIT | TRACE_RETURN_TO_MODULE << 32);
 
-fn interpreted_catch_ids() -> &'static Mutex<std::collections::HashMap<(usize, usize), u32>> {
-    static IDS: OnceLock<Mutex<std::collections::HashMap<(usize, usize), u32>>> = OnceLock::new();
+/// A catch handler: the code scope of its runtime, its module index and its code index.
+type CatchKey = (u64, usize, usize);
+
+fn interpreted_catch_ids() -> &'static Mutex<std::collections::HashMap<CatchKey, u32>> {
+    static IDS: OnceLock<Mutex<std::collections::HashMap<CatchKey, u32>>> = OnceLock::new();
     IDS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -1222,10 +1225,10 @@ pub(super) fn handler_tag(module: usize, ip: usize) -> Result<Term, VmError> {
     // Per-thread cache in front of the shared table: erts keeps the handler's code pointer in
     // the stack slot, so `catch` must not take a lock or hash with SipHash.
     thread_local! {
-        static CACHE: std::cell::RefCell<std::collections::HashMap<(usize, usize), u32, CodeKeyHasher>> =
+        static CACHE: std::cell::RefCell<std::collections::HashMap<CatchKey, u32, CodeKeyHasher>> =
             std::cell::RefCell::new(std::collections::HashMap::default());
     }
-    let key = (module, ip);
+    let key = (crate::fun_dispatch::code_scope(), module, ip);
     if let Some(index) = CACHE.with(|cache| cache.borrow().get(&key).copied()) {
         return Ok(Term::catch(u64::from(index)));
     }
@@ -1262,8 +1265,8 @@ impl std::hash::BuildHasher for CodeKeyHasher {
     }
 }
 
-fn handler_tag_shared(key: (usize, usize)) -> Result<u32, VmError> {
-    let (module, ip) = key;
+fn handler_tag_shared(key: CatchKey) -> Result<u32, VmError> {
+    let (scope, module, ip) = key;
     let mut ids = interpreted_catch_ids()
         .lock()
         .map_err(|_| VmError::Unsupported("catch table lock".into()))?;
@@ -1272,12 +1275,7 @@ fn handler_tag_shared(key: (usize, usize)) -> Result<u32, VmError> {
     } else {
         let base = arinsal_beamasm::catch::reserve_catch_indices(1)
             .map_err(|_| VmError::Unsupported("catch table exhausted".into()))?;
-        crate::native_bridge::register_interpreted_catch(
-            crate::fun_dispatch::code_scope(),
-            base,
-            module,
-            ip,
-        );
+        crate::native_bridge::register_interpreted_catch(scope, base, module, ip);
         ids.insert(key, base);
         base
     };

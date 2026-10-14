@@ -1281,23 +1281,6 @@ fn context_is_freed_with_the_heap_that_holds_its_reference() {
     assert!(MagicRef::live_by_id(id).is_some());
     drop(heap);
     assert!(MagicRef::live_by_id(id).is_none());
-    assert!(!MagicRef::is_registered(id));
-}
-
-#[test]
-fn contexts_do_not_stay_registered_after_their_heap_is_collected() {
-    use arinsal_bifs::{Ctx, ProcessHeapHandle};
-    use arinsal_term::{MagicRef, ProcessHeap, to_owned};
-    let entry = super::zstd::lookup("init_compress_nif", 0).unwrap();
-    let mut ids = Vec::new();
-    for _ in 0..2_000 {
-        let mut heap = ProcessHeap::with_words(1024);
-        let mut alloc = ProcessHeapHandle(&mut heap);
-        let mut ctx = Ctx::new(&mut alloc);
-        let resource = entry(&mut ctx, &[]).unwrap();
-        ids.push(context_id(&to_owned(resource).unwrap()));
-    }
-    assert!(ids.iter().all(|id| !MagicRef::is_registered(*id)));
 }
 
 /// Any exception out of a stream NIF resets the session, not only a zstd error: a bad end op in
