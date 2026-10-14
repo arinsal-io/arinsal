@@ -15,32 +15,89 @@ use arinsal_term::{ExportEntry, FunEntry, HeapAlloc, Node, Term, from_owned, to_
 mod net;
 mod socket;
 
-/// A scheduler reactor receives one-shot readiness registrations.
+/// `ERL_NIF_SELECT_STOP_CALLED`: the stop callback ran directly.
+pub const SELECT_STOP_CALLED: i32 = 1 << 0;
+/// `ERL_NIF_SELECT_STOP_SCHEDULED`: the stop callback runs later.
+pub const SELECT_STOP_SCHEDULED: i32 = 1 << 1;
+/// `ERL_NIF_SELECT_INVALID_EVENT`.
+pub const SELECT_INVALID_EVENT: i32 = 1 << 2;
+/// `ERL_NIF_SELECT_FAILED`.
+pub const SELECT_FAILED: i32 = 1 << 3;
+/// `ERL_NIF_SELECT_READ_CANCELLED`: a pending read selection was cancelled.
+pub const SELECT_READ_CANCELLED: i32 = 1 << 4;
+/// `ERL_NIF_SELECT_WRITE_CANCELLED`: a pending write selection was cancelled.
+pub const SELECT_WRITE_CANCELLED: i32 = 1 << 5;
+
+/// The scheduler services the socket NIFs use: `enif_self`, `enif_select`,
+/// `enif_send` and `enif_monitor_process`.
+///
+/// Every `enif_select` style method returns the erts result: a negative value
+/// is a failure (`INT_MIN | ERL_NIF_SELECT_*`), otherwise the flag bits.
 pub trait Reactor: Send + Sync {
-    /// Register an input selection for the controlling process.
-    fn register_read(&self, fd: i32, pid: &O, handle: &O, reference: &O);
-    /// Register an output selection for the controlling process.
-    fn register_write(&self, fd: i32, pid: &O, handle: &O, reference: &O);
-    /// Remove a pending selection.
-    fn cancel(&self, fd: i32, reference: &O);
+    /// The process executing the current NIF call, `enif_self`.
+    fn self_pid(&self) -> Option<O>;
+    /// `enif_select(env, fd, ERL_NIF_SELECT_READ, obj, pid, msg)`: a one-shot
+    /// input selection. The select message goes to `pid`. A selection that is
+    /// still pending for the same fd and mode is replaced.
+    fn register_read(&self, fd: i32, pid: &O, handle: &O, reference: &O) -> i32;
+    /// `enif_select(env, fd, ERL_NIF_SELECT_WRITE, obj, pid, msg)`; see
+    /// [`Reactor::register_read`].
+    fn register_write(&self, fd: i32, pid: &O, handle: &O, reference: &O) -> i32;
+    /// `enif_select(env, fd, ERL_NIF_SELECT_CANCEL | mode, obj, NULL, undefined)`.
+    /// Returns `SELECT_READ_CANCELLED` or `SELECT_WRITE_CANCELLED` when a
+    /// selection was still pending (its message not yet sent), else 0. erts
+    /// cancels by fd and mode, so `reference` is not used to match.
+    fn cancel(&self, fd: i32, read: bool, reference: &O) -> i32;
+    /// `enif_select(env, fd, ERL_NIF_SELECT_STOP, obj, NULL, undefined)`: drop
+    /// every selection of `fd`. Returns `SELECT_STOP_CALLED` or `SELECT_STOP_SCHEDULED`.
+    fn stop(&self, fd: i32) -> i32;
+    /// `enif_send(env, pid, NULL, msg)`. Returns whether the message was sent.
+    fn send(&self, pid: &O, message: &O) -> bool;
+    /// `enif_monitor_process(env, obj, pid, &mon)`. Returns a monitor handle,
+    /// or `None` when the runtime has no monitor facility for resources.
+    fn monitor(&self, _pid: &O, _handle: &O) -> Option<u64> {
+        None
+    }
+    /// `enif_demonitor_process(env, obj, &mon)`.
+    fn demonitor(&self, _monitor: u64) {}
+}
+
+/// A pending selection of the [`BlockingReactor`].
+struct BlockingSelection {
+    fd: i32,
+    pid: O,
+    reference: O,
+    events: i16,
 }
 
 /// A poll-based reactor for tests and a single-threaded bootstrap VM.
 #[derive(Default)]
 pub struct BlockingReactor {
-    pending: Mutex<Vec<(i32, O, O, i16)>>,
+    pending: Mutex<Vec<BlockingSelection>>,
+    caller: Mutex<Option<O>>,
+    sent: Mutex<Vec<(O, O)>>,
 }
 
 impl BlockingReactor {
+    /// Set the process reported by [`Reactor::self_pid`].
+    pub fn set_caller(&self, pid: O) {
+        *self.caller.lock().unwrap() = Some(pid);
+    }
+
+    /// Messages sent through [`Reactor::send`], with their destination.
+    pub fn sent(&self) -> Vec<(O, O)> {
+        self.sent.lock().unwrap().clone()
+    }
+
     /// Wait until one registered fd is ready, returning its pid and select reference.
     pub fn wait(&self, timeout: Duration) -> Option<(O, O)> {
         let mut fds: Vec<libc::pollfd> = {
             let pending = self.pending.lock().unwrap();
             pending
                 .iter()
-                .map(|(fd, _, _, events)| libc::pollfd {
-                    fd: *fd,
-                    events: *events,
+                .map(|selection| libc::pollfd {
+                    fd: selection.fd,
+                    events: selection.events,
                     revents: 0,
                 })
                 .collect()
@@ -59,30 +116,58 @@ impl BlockingReactor {
         let mut pending = self.pending.lock().unwrap();
         let index = pending
             .iter()
-            .position(|(fd, _, _, _)| *fd == fds[index].fd)?;
-        let (_, pid, reference, _) = pending.remove(index);
-        Some((pid, reference))
+            .position(|selection| selection.fd == fds[index].fd)?;
+        let selection = pending.remove(index);
+        Some((selection.pid, selection.reference))
+    }
+
+    fn select(&self, fd: i32, pid: &O, reference: &O, events: i16) -> i32 {
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|selection| selection.fd != fd || selection.events != events);
+        pending.push(BlockingSelection {
+            fd,
+            pid: pid.clone(),
+            reference: reference.clone(),
+            events,
+        });
+        0
     }
 }
 
 impl Reactor for BlockingReactor {
-    fn register_read(&self, fd: i32, pid: &O, _handle: &O, reference: &O) {
-        self.pending
-            .lock()
-            .unwrap()
-            .push((fd, pid.clone(), reference.clone(), libc::POLLIN));
+    fn self_pid(&self) -> Option<O> {
+        self.caller.lock().unwrap().clone()
     }
-    fn register_write(&self, fd: i32, pid: &O, _handle: &O, reference: &O) {
-        self.pending
-            .lock()
-            .unwrap()
-            .push((fd, pid.clone(), reference.clone(), libc::POLLOUT));
+    fn register_read(&self, fd: i32, pid: &O, _handle: &O, reference: &O) -> i32 {
+        self.select(fd, pid, reference, libc::POLLIN)
     }
-    fn cancel(&self, fd: i32, reference: &O) {
+    fn register_write(&self, fd: i32, pid: &O, _handle: &O, reference: &O) -> i32 {
+        self.select(fd, pid, reference, libc::POLLOUT)
+    }
+    fn cancel(&self, fd: i32, read: bool, _reference: &O) -> i32 {
+        let events = if read { libc::POLLIN } else { libc::POLLOUT };
+        let mut pending = self.pending.lock().unwrap();
+        let before = pending.len();
+        pending.retain(|selection| selection.fd != fd || selection.events != events);
+        match (pending.len() != before, read) {
+            (false, _) => 0,
+            (true, true) => SELECT_READ_CANCELLED,
+            (true, false) => SELECT_WRITE_CANCELLED,
+        }
+    }
+    fn stop(&self, fd: i32) -> i32 {
         self.pending
             .lock()
             .unwrap()
-            .retain(|(item, _, r, _)| *item != fd || r != reference);
+            .retain(|selection| selection.fd != fd);
+        SELECT_STOP_CALLED
+    }
+    fn send(&self, pid: &O, message: &O) -> bool {
+        self.sent
+            .lock()
+            .unwrap()
+            .push((pid.clone(), message.clone()));
+        true
     }
 }
 
@@ -168,6 +253,17 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     }
 }
 
+thread_local! {
+    static RAISED: std::cell::RefCell<Option<O>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Raise `error:Reason` from the NIF currently running on this thread, like
+/// `enif_raise_exception`. Return the result from the NIF body.
+pub(crate) fn raise(reason: O) -> BifError {
+    RAISED.with(|raised| *raised.borrow_mut() = Some(reason));
+    BifError::Unsupported("enif_raise_exception")
+}
+
 fn call(
     ctx: &mut Ctx<'_>,
     args: &[Term],
@@ -177,7 +273,18 @@ fn call(
         .iter()
         .map(|a| to_owned(*a).map_err(|_| BifError::BADARG))
         .collect::<Result<Vec<_>, _>>()?;
-    let result = f(&args)?;
+    RAISED.with(|raised| raised.borrow_mut().take());
+    let result = match f(&args) {
+        Ok(result) => result,
+        Err(error) => {
+            return match RAISED.with(|raised| raised.borrow_mut().take()) {
+                Some(reason) => from_owned(&reason, &mut Heap(&mut ctx.heap))
+                    .map_err(|_| BifError::SystemLimit)
+                    .and_then(|reason| Err(BifError::Error(reason))),
+                None => Err(error),
+            };
+        }
+    };
     from_owned(&result, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
 }
 
