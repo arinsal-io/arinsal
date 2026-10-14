@@ -1482,7 +1482,6 @@ struct MsbExec {
 /// `ERTS_DIRTY_IO_RUNQ`), OTP-29.1.1.
 struct DirtyPool<T: Task> {
     queue: Mutex<DirtyQueue<T>>,
-    ready: Condvar,
     online: AtomicUsize,
     threads: Vec<DirtyThread>,
     /// Global dirty slot of this pool's first thread.
@@ -1490,6 +1489,9 @@ struct DirtyPool<T: Task> {
 }
 
 struct DirtyQueue<T: Task> {
+    /// Sleeping dirty schedulers of this pool, the most recent last.
+    /// Port of erts/emulator/beam/erl_process.c (`ErtsRunQueue.sleepers`), OTP-29.1.1.
+    sleepers: VecDeque<usize>,
     /// Queued processes with their `schedule_count`; low priority shares the normal queue.
     by_priority: [VecDeque<(Arc<Process<T>>, u8)>; 4],
     len: usize,
@@ -1533,6 +1535,9 @@ type DirtyStatsSnapshot = ([Vec<u64>; 2], [Vec<[u64; MSACC_STATE_COUNT]>; 2], [u
 
 struct DirtyThread {
     handle: OnceLock<thread::Thread>,
+    /// Set by whoever wakes this scheduler; the spinning wait polls it.
+    /// Port of erts/emulator/beam/erl_process.h (`ERTS_SSI_FLG_WAITING`), OTP-29.1.1.
+    wake: AtomicBool,
     stats: Mutex<DirtyStats>,
 }
 
@@ -1599,17 +1604,50 @@ impl DirtyStats {
 }
 
 impl<T: Task> DirtyPool<T> {
+    /// Wake the scheduler that went to sleep last, which is the one most likely still
+    /// spinning; nothing when all are busy.
+    // Port of erts/emulator/beam/erl_process.c (wake_dirty_scheduler: `sleepers.list->next`
+    // is the most recently inserted sleeper), OTP-29.1.1.
+    fn wake_one(&self, queue: &mut DirtyQueue<T>) {
+        let online = self.online.load(Ordering::Acquire);
+        let Some(position) = queue.sleepers.iter().rposition(|&index| index < online) else {
+            return;
+        };
+        if let Some(index) = queue.sleepers.remove(position) {
+            self.wake_thread(index);
+        }
+    }
+
+    /// Wake every dirty scheduler of the pool so it re-checks its conditions.
+    fn wake_all(&self) {
+        let mut queue = self.queue.lock().unwrap();
+        queue.sleepers.clear();
+        drop(queue);
+        for index in 0..self.threads.len() {
+            self.wake_thread(index);
+        }
+    }
+
+    fn wake_thread(&self, index: usize) {
+        let thread = &self.threads[index];
+        thread.wake.store(true, Ordering::SeqCst);
+        if let Some(handle) = thread.handle.get() {
+            handle.unpark();
+        }
+    }
+
     fn new(threads: usize, first_slot: usize) -> Self {
         Self {
             queue: Mutex::new(DirtyQueue {
+                sleepers: VecDeque::new(),
                 by_priority: std::array::from_fn(|_| VecDeque::new()),
                 len: 0,
             }),
-            ready: Condvar::new(),
             online: AtomicUsize::new(threads),
             threads: (0..threads)
                 .map(|_| DirtyThread {
                     handle: OnceLock::new(),
+                    wake: AtomicBool::new(false),
                     stats: Mutex::new(DirtyStats::new()),
                 })
                 .collect(),
@@ -1650,10 +1688,16 @@ impl<T: Task> Inner<T> {
             return;
         }
         {
-            pool.queue.lock().unwrap().push(process);
+            let mut queue = pool.queue.lock().unwrap();
+            queue.push(process);
+            // While multi-scheduling is blocked a wake-up is a state change for everyone.
+            if self.scheduling_blocked.load(Ordering::Acquire) {
+                drop(queue);
+                pool.wake_all();
+            } else {
+                pool.wake_one(&mut queue);
+            }
         }
-        // Offline dirty CPU threads also wait on this condvar, so wake them all.
-        pool.ready.notify_all();
         // While multi-scheduling is blocked the blocking scheduler hands execution over.
         if self.scheduling_blocked.load(Ordering::Acquire) {
             let blocker = self.scheduling_blocker.load(Ordering::Acquire);
@@ -1718,11 +1762,7 @@ impl<T: Task> Inner<T> {
         } else {
             DirtyKind::Io
         };
-        {
-            // Take the pool lock so the dirty thread cannot miss the notification.
-            let _queue = self.dirty[kind.index()].queue.lock().unwrap();
-            self.dirty[kind.index()].ready.notify_all();
-        }
+        self.dirty[kind.index()].wake_all();
         let mut state = self.msb_exec.lock().unwrap();
         while state.current != SchedulerType::Normal
             && self.scheduling_blocked.load(Ordering::Acquire)
@@ -1860,7 +1900,7 @@ impl<T: Task> Inner<T> {
         self.halt_requested.store(true, Ordering::Release);
         start();
         for pool in &self.dirty {
-            pool.ready.notify_all();
+            pool.wake_all();
         }
         let halting = Arc::clone(&self.runq_halting);
         self.request_aux_work_all(Arc::new(move |worker| {
@@ -5471,7 +5511,7 @@ impl<T: Task> Scheduler<T> {
             return false;
         }
         pool.online.store(online, Ordering::Release);
-        pool.ready.notify_all();
+        pool.wake_all();
         true
     }
     /// Whether a pid currently identifies a live task.
@@ -5793,8 +5833,7 @@ impl<T: Task> Scheduler<T> {
             self.wake_all_workers();
             self.inner.msb_switch.notify_all();
             for pool in &self.inner.dirty {
-                let _queue = pool.queue.lock().unwrap();
-                pool.ready.notify_all();
+                pool.wake_all();
             }
         }
     }
@@ -6434,6 +6473,28 @@ mod dirty_state_tests {
     }
 
     #[test]
+    fn dirty_wake_takes_the_most_recent_eligible_sleeper() {
+        let pool = DirtyPool::<Idle>::new(4, 0);
+        pool.online.store(3, Ordering::Release);
+        let mut queue = pool.queue.lock().unwrap();
+        queue.sleepers.extend([0, 1, 2, 3]);
+        // Thread 3 is offline, so thread 2 slept last among those that may run.
+        pool.wake_one(&mut queue);
+        assert_eq!(Vec::from(queue.sleepers.clone()), vec![0, 1, 3]);
+        pool.wake_one(&mut queue);
+        pool.wake_one(&mut queue);
+        pool.wake_one(&mut queue);
+        assert_eq!(Vec::from(queue.sleepers.clone()), vec![3]);
+        drop(queue);
+        let woken: Vec<bool> = pool
+            .threads
+            .iter()
+            .map(|thread| thread.wake.load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(woken, vec![true, true, true, false]);
+    }
+
+    #[test]
     fn executing_dirty_excludes_queued_dirty_work() {
         let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
         let pid = scheduler.spawn(Idle).unwrap();
@@ -6525,7 +6586,7 @@ impl<T: Task> Drop for Scheduler<T> {
     fn drop(&mut self) {
         self.inner.stopped.store(true, Ordering::Release);
         for pool in &self.inner.dirty {
-            pool.ready.notify_all();
+            pool.wake_all();
         }
         for (id, handle) in self.threads.iter().enumerate() {
             if let Some(flag) = self.inner.parked.get(id) {
@@ -7701,11 +7762,32 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                 {
                     break process;
                 }
-                queue = pool
-                    .ready
-                    .wait_timeout(queue, Duration::from_millis(100))
-                    .unwrap()
-                    .0;
+                // Port of erts/emulator/beam/erl_process.c (scheduler_wait for a dirty
+                // scheduler): join the sleepers, spin for a wake-up (`sched_spin_wait`,
+                // the "short" busy-wait threshold), then sleep.
+                thread.wake.store(false, Ordering::SeqCst);
+                if !queue.sleepers.contains(&index) {
+                    queue.sleepers.push_back(index);
+                }
+                drop(queue);
+                let mut spins = SCHED_TSE_SLEEP_SPINCOUNT;
+                let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
+                while spins > 0 && !thread.wake.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                    until_yield -= 1;
+                    if until_yield == 0 {
+                        until_yield = SCHED_SPIN_UNTIL_YIELD;
+                        thread::yield_now();
+                    }
+                    spins -= 1;
+                }
+                if !thread.wake.load(Ordering::SeqCst) {
+                    thread::park_timeout(Duration::from_millis(100));
+                }
+                queue = pool.queue.lock().unwrap();
+                if let Some(position) = queue.sleepers.iter().position(|&slot| slot == index) {
+                    queue.sleepers.remove(position);
+                }
             }
         };
         thread

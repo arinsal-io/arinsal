@@ -6,17 +6,16 @@
 //! safe APIs.
 
 use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Token, Waker};
+use mio::{Events, Interest, Poll, Registry, Token};
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
 
-const WAKE_TOKEN: Token = Token(0);
 const EVENT_CAPACITY: usize = 1024;
 
 #[derive(Clone, Copy)]
@@ -124,12 +123,6 @@ struct Request {
     interests: InterestSet,
     kind: RegistrationKind,
     ready: Box<dyn FnOnce(RawFd, Ready) + Send>,
-    ack: SyncSender<io::Result<()>>,
-}
-
-enum Command {
-    Register(Request),
-    Deregister(Registration, SyncSender<()>),
 }
 
 type Callback = Box<dyn FnOnce(RawFd, Ready) + Send>;
@@ -140,12 +133,19 @@ struct ActiveRegistration {
     watchers: HashMap<Token, (InterestSet, Callback)>,
 }
 
+/// The one-shot selections of the NIF and internal wake-up descriptors, shared by the
+/// selecting threads and the poll thread.
+#[derive(Default)]
+struct NifSelects {
+    active: HashMap<Token, ActiveRegistration>,
+    fd_tokens: HashMap<RawFd, Token>,
+}
+
 struct Poller {
-    tx: Sender<Command>,
-    waker: Arc<Waker>,
     next_token: AtomicUsize,
     registrations: Arc<Mutex<HashMap<usize, (RawFd, RegistrationKind)>>>,
-    /// Shared with the poll thread; `driver_select` changes the kernel poll set
+    nif: Arc<Mutex<NifSelects>>,
+    /// Shared with the poll thread; `driver_select` and the NIF selections change the kernel poll set
     /// directly through it, as erts_io_control does from the selecting thread.
     registry: mio::Registry,
     selects: Arc<Mutex<DriverSelects>>,
@@ -156,22 +156,21 @@ static POLLER: OnceLock<Poller> = OnceLock::new();
 fn poller() -> &'static Poller {
     POLLER.get_or_init(|| {
         let poll = Poll::new().expect("create shared kqueue poller");
-        let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN).expect("create poller waker"));
-        let (tx, rx) = mpsc::channel();
         let registrations = Arc::new(Mutex::new(HashMap::new()));
         let worker_registrations = Arc::clone(&registrations);
         let registry = poll.registry().try_clone().expect("clone poller registry");
         let selects = Arc::new(Mutex::new(DriverSelects::default()));
         let worker_selects = Arc::clone(&selects);
+        let nif = Arc::new(Mutex::new(NifSelects::default()));
+        let worker_nif = Arc::clone(&nif);
         thread::Builder::new()
             .name("arinsal-check-io".into())
-            .spawn(move || poll_loop(poll, rx, worker_registrations, worker_selects))
+            .spawn(move || poll_loop(poll, worker_registrations, worker_selects, worker_nif))
             .expect("start shared kqueue poller");
         Poller {
-            tx,
-            waker,
             next_token: AtomicUsize::new(1),
             registrations,
+            nif,
             registry,
             selects,
         }
@@ -230,10 +229,10 @@ fn wait_any_timeout_kind(
     for (fd, interests) in fds {
         let id = Token(poller.next_token.fetch_add(1, Ordering::Relaxed));
         let registration = Registration { fd: *fd, id };
-        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-        poller
-            .tx
-            .send(Command::Register(Request {
+        tokens.push(registration);
+        if let Err(error) = register_request(
+            poller,
+            Request {
                 id,
                 fd: *fd,
                 interests: *interests,
@@ -248,15 +247,8 @@ fn wait_any_timeout_kind(
                         let _ = ready_tx.send((fd, ready));
                     }
                 }),
-                ack: ack_tx,
-            }))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "poller stopped"))?;
-        poller.waker.wake()?;
-        tokens.push(registration);
-        if let Err(error) = ack_rx
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "poller stopped"))?
-        {
+            },
+        ) {
             cancel(poller, &tokens);
             return Err(error);
         }
@@ -308,22 +300,16 @@ fn register_kind(
 ) -> io::Result<Registration> {
     let poller = poller();
     let id = Token(poller.next_token.fetch_add(1, Ordering::Relaxed));
-    let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-    poller
-        .tx
-        .send(Command::Register(Request {
+    register_request(
+        poller,
+        Request {
             id,
             fd,
             interests,
             kind,
             ready: Box::new(ready),
-            ack: ack_tx,
-        }))
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "poller stopped"))?;
-    poller.waker.wake()?;
-    ack_rx
-        .recv()
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "poller stopped"))??;
+        },
+    )?;
     Ok(Registration { fd, id })
 }
 
@@ -332,57 +318,37 @@ pub(crate) fn deregister(registration: Registration) {
     cancel(poller(), &[registration]);
 }
 
-fn cancel(poller: &Poller, tokens: &[Registration]) {
-    let mut acknowledgements = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-        if poller.tx.send(Command::Deregister(*token, ack_tx)).is_ok() {
-            acknowledgements.push(ack_rx);
-        }
+/// Change the kernel poll set from the calling thread, as `erts_io_control` does; the poll
+/// thread is not woken.
+// Port of erts/emulator/sys/common/erl_check_io.c (erts_io_control), OTP-29.1.1.
+fn register_request(poller: &Poller, request: Request) -> io::Result<()> {
+    let ready_now = {
+        let mut nif = poller.nif.lock().unwrap();
+        add_registration(&poller.registry, &mut nif, &poller.registrations, request)?
+    };
+    if let Some(request) = ready_now {
+        deliver_always_ready(request);
     }
-    let _ = poller.waker.wake();
-    for ack in acknowledgements {
-        let _ = ack.recv();
+    Ok(())
+}
+
+fn cancel(poller: &Poller, tokens: &[Registration]) {
+    let mut nif = poller.nif.lock().unwrap();
+    for token in tokens {
+        remove_registration(&poller.registry, &mut nif, &poller.registrations, *token);
     }
 }
 
 fn poll_loop(
     mut poll: Poll,
-    rx: Receiver<Command>,
     registrations: Arc<Mutex<HashMap<usize, (RawFd, RegistrationKind)>>>,
     selects: Arc<Mutex<DriverSelects>>,
+    nif: Arc<Mutex<NifSelects>>,
 ) {
     // Port of erts/emulator/beam/erl_check_io.c:1933 (erts_check_io), OTP-29.1.1.
     let mut events = Events::with_capacity(EVENT_CAPACITY);
-    let mut active = HashMap::<Token, ActiveRegistration>::new();
-    let mut fd_tokens = HashMap::<RawFd, Token>::new();
     loop {
         set_poll_state(PollState::CheckIo);
-        while let Ok(command) = rx.try_recv() {
-            match command {
-                Command::Register(request) => {
-                    let ack = request.ack.clone();
-                    let result = add_registration(
-                        &mut poll,
-                        &mut active,
-                        &mut fd_tokens,
-                        &registrations,
-                        request,
-                    );
-                    let _ = ack.send(result);
-                }
-                Command::Deregister(registration, ack) => {
-                    remove_registration(
-                        &mut poll,
-                        &mut active,
-                        &mut fd_tokens,
-                        &registrations,
-                        registration,
-                    );
-                    let _ = ack.send(());
-                }
-            }
-        }
         set_poll_state(PollState::Sleep);
         if poll.poll(&mut events, None).is_err() {
             thread::sleep(std::time::Duration::from_millis(2));
@@ -391,9 +357,6 @@ fn poll_loop(
         }
         set_poll_state(PollState::CheckIo);
         for event in &events {
-            if event.token() == WAKE_TOKEN {
-                continue;
-            }
             let token = event.token();
             let delivery = selects
                 .lock()
@@ -403,62 +366,68 @@ fn poll_loop(
                 delivery();
                 continue;
             }
-            let Some(active_registration) = active.get_mut(&token) else {
-                continue;
-            };
             let ready = Ready {
                 readable: event.is_readable(),
                 writable: event.is_writable(),
                 closed: event.is_read_closed() || event.is_write_closed(),
                 error: event.is_error(),
             };
-            let fd = active_registration.fd;
             let mut callbacks = Vec::new();
-            let mut fired_ids = Vec::new();
-            active_registration
-                .watchers
-                .retain(|id, (interest, callback)| {
-                    let fired = (interest.readable
-                        && (ready.readable || ready.closed || ready.error))
-                        || (interest.writable && (ready.writable || ready.closed || ready.error));
-                    if fired {
-                        fired_ids.push(*id);
-                        callbacks.push(std::mem::replace(callback, Box::new(|_, _| {})));
+            let fd = {
+                let mut guard = nif.lock().unwrap();
+                let NifSelects { active, fd_tokens } = &mut *guard;
+                let Some(active_registration) = active.get_mut(&token) else {
+                    continue;
+                };
+                let fd = active_registration.fd;
+                let mut fired_ids = Vec::new();
+                active_registration
+                    .watchers
+                    .retain(|id, (interest, callback)| {
+                        let fired = (interest.readable
+                            && (ready.readable || ready.closed || ready.error))
+                            || (interest.writable
+                                && (ready.writable || ready.closed || ready.error));
+                        if fired {
+                            fired_ids.push(*id);
+                            callbacks.push(std::mem::replace(callback, Box::new(|_, _| {})));
+                        }
+                        !fired
+                    });
+                {
+                    let mut registrations = registrations.lock().unwrap();
+                    for id in fired_ids {
+                        registrations.remove(&id.0);
                     }
-                    !fired
-                });
-            {
-                let mut registrations = registrations.lock().unwrap();
-                for id in fired_ids {
-                    registrations.remove(&id.0);
                 }
-            }
-            // As `erts_check_io`: the poll set is brought to its state after the event
-            // (`ERTS_POLL_OP_MOD`) before any callback runs. A callback may hand the
-            // descriptor to a thread that closes it at once, so the poll thread must not
-            // touch the descriptor in the kernel poll set after a callback ran.
-            if active_registration.watchers.is_empty() {
-                let source = SourceFd(&fd);
-                let _ = poll.registry().deregister(&mut { source });
-                active.remove(&token);
-                fd_tokens.remove(&fd);
-            } else {
-                active_registration.interests = active_registration.watchers.values().fold(
-                    InterestSet {
-                        readable: false,
-                        writable: false,
-                    },
-                    |mut union, (interest, _)| {
-                        union.readable |= interest.readable;
-                        union.writable |= interest.writable;
-                        union
-                    },
-                );
-                if let Some(interest) = poll_interest(active_registration.interests) {
+                // As `erts_check_io`: the poll set is brought to its state after the event
+                // (`ERTS_POLL_OP_MOD`) before any callback runs. A callback may hand the
+                // descriptor to a thread that closes it at once, so the poll thread must not
+                // touch the descriptor in the kernel poll set after a callback ran.
+                if active_registration.watchers.is_empty() {
                     let source = SourceFd(&fd);
-                    let _ = poll.registry().reregister(&mut { source }, token, interest);
+                    let _ = poll.registry().deregister(&mut { source });
+                    active.remove(&token);
+                    fd_tokens.remove(&fd);
+                } else {
+                    active_registration.interests = active_registration.watchers.values().fold(
+                        InterestSet {
+                            readable: false,
+                            writable: false,
+                        },
+                        |mut union, (interest, _)| {
+                            union.readable |= interest.readable;
+                            union.writable |= interest.writable;
+                            union
+                        },
+                    );
+                    if let Some(interest) = poll_interest(active_registration.interests) {
+                        let source = SourceFd(&fd);
+                        let _ = poll.registry().reregister(&mut { source }, token, interest);
+                    }
                 }
-            }
+                fd
+            };
             for callback in callbacks {
                 callback(fd, ready);
             }
@@ -466,13 +435,15 @@ fn poll_loop(
     }
 }
 
+/// Add one selection. A descriptor that is always ready (a regular file, `/dev/null`)
+/// is handed back to the caller, which delivers its event outside the lock.
 fn add_registration(
-    poll: &mut Poll,
-    active: &mut HashMap<Token, ActiveRegistration>,
-    fd_tokens: &mut HashMap<RawFd, Token>,
+    registry: &Registry,
+    nif: &mut NifSelects,
     registrations: &Mutex<HashMap<usize, (RawFd, RegistrationKind)>>,
     request: Request,
-) -> io::Result<()> {
+) -> io::Result<Option<Request>> {
+    let NifSelects { active, fd_tokens } = nif;
     let interest = poll_interest(request.interests)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty poll interest"))?;
     if let Some(token) = fd_tokens.get(&request.fd).copied() {
@@ -482,7 +453,7 @@ fn add_registration(
             writable: registration.interests.writable || request.interests.writable,
         };
         let source = SourceFd(&request.fd);
-        poll.registry().reregister(
+        registry.reregister(
             &mut { source },
             token,
             poll_interest(next).expect("non-empty registration interest"),
@@ -493,14 +464,10 @@ fn add_registration(
             .insert(request.id, (request.interests, request.ready));
     } else {
         if regular_file_fd(request.fd) {
-            deliver_always_ready(request);
-            return Ok(());
+            return Ok(Some(request));
         }
         let source = SourceFd(&request.fd);
-        if let Err(error) = poll
-            .registry()
-            .register(&mut { source }, request.id, interest)
-        {
+        if let Err(error) = registry.register(&mut { source }, request.id, interest) {
             // kqueue cannot watch regular files and some character devices such as
             // /dev/null. They are always ready, so deliver the one-shot event now.
             if matches!(
@@ -508,8 +475,7 @@ fn add_registration(
                 io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
             ) && always_ready_fd(request.fd)
             {
-                deliver_always_ready(request);
-                return Ok(());
+                return Ok(Some(request));
             }
             return Err(error);
         }
@@ -527,7 +493,7 @@ fn add_registration(
         .lock()
         .unwrap()
         .insert(request.id.0, (request.fd, request.kind));
-    Ok(())
+    Ok(None)
 }
 
 fn always_ready_fd(fd: RawFd) -> bool {
@@ -575,12 +541,12 @@ fn poll_interest(interests: InterestSet) -> Option<Interest> {
 }
 
 fn remove_registration(
-    poll: &mut Poll,
-    active: &mut HashMap<Token, ActiveRegistration>,
-    fd_tokens: &mut HashMap<RawFd, Token>,
+    registry: &Registry,
+    nif: &mut NifSelects,
     registrations: &Mutex<HashMap<usize, (RawFd, RegistrationKind)>>,
     registration: Registration,
 ) {
+    let NifSelects { active, fd_tokens } = nif;
     let Some(token) = fd_tokens.get(&registration.fd).copied() else {
         registrations.lock().unwrap().remove(&registration.id.0);
         return;
@@ -593,7 +559,7 @@ fn remove_registration(
     if current.watchers.is_empty() {
         let fd = current.fd;
         let source = SourceFd(&fd);
-        let _ = poll.registry().deregister(&mut { source });
+        let _ = registry.deregister(&mut { source });
         active.remove(&token);
         fd_tokens.remove(&fd);
     } else {
@@ -612,7 +578,7 @@ fn remove_registration(
         let fd = current.fd;
         let source = SourceFd(&fd);
         if let Some(interest) = poll_interest(interests) {
-            let _ = poll.registry().reregister(&mut { source }, token, interest);
+            let _ = registry.reregister(&mut { source }, token, interest);
         }
     }
 }
