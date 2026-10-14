@@ -1167,6 +1167,7 @@ fn start(
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     let owner = ctx.pid();
+    let runtime_weak = Arc::downgrade(runtime);
     std::thread::Builder::new()
         .name(format!("arinsal-port-{port_id}"))
         .spawn(move || {
@@ -1175,6 +1176,7 @@ fn start(
                 Some(child),
                 read_fd,
                 scheduler,
+                runtime_weak,
                 owner,
                 port_id,
                 binary,
@@ -2449,6 +2451,7 @@ fn start_fd(
     reservation.commit();
     let owner = ctx.pid();
     let read_fd = reader.into_raw_fd();
+    let runtime_weak = Arc::downgrade(runtime);
     let binary = opts.binary;
     let framing = opts.framing;
     let want_eof = opts.eof;
@@ -2460,6 +2463,7 @@ fn start_fd(
                 None,
                 Some(read_fd),
                 scheduler,
+                runtime_weak,
                 owner,
                 id,
                 binary,
@@ -2751,12 +2755,84 @@ fn command_bytes(handle: &PortHandle, data: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
+/// Exit status of a child as a driver reports it: the exit code, or 128 plus the signal number.
+fn child_exit_code(status: std::process::ExitStatus) -> i64 {
+    use std::os::unix::process::ExitStatusExt;
+    match status.signal() {
+        Some(signal) => 128 + i64::from(signal),
+        None => i64::from(status.code().unwrap_or(0)),
+    }
+}
+
+fn exit_status_message(
+    scheduler: &Scheduler<Process>,
+    owner: Pid,
+    id: u64,
+    trace_scope: usize,
+    code: i64,
+) {
+    let mut heap = ProcessHeap::with_words(16);
+    if let Ok(event) =
+        TermBuilder::new(&mut heap).tuple(&[atom("exit_status"), Term::small(code).unwrap()])
+    {
+        event_message(scheduler, owner, id, trace_scope, event);
+    }
+}
+
+/// What the port does once its input side ended.
+enum InputEnd {
+    /// `exit_status` is wanted and the child still runs: report when it exits.
+    WaitForExit,
+    /// `{Port, eof}` was sent and the port stays open (`eof` option).
+    Reported,
+    /// The port exits with reason `normal`.
+    Terminate,
+}
+
+/// End of input on a spawn or fd port, as the stdio drivers handle it: the exit status comes
+/// first when it is wanted and known, then a partial line, then `{Port, eof}` for a port
+/// opened with `eof` or the port exit otherwise.
+#[allow(clippy::too_many_arguments)]
+fn end_of_input(
+    handle: &PortHandle,
+    scheduler: &Scheduler<Process>,
+    owner: Pid,
+    id: u64,
+    binary: bool,
+    framing: Option<(u8, usize)>,
+    want_eof: bool,
+    exit_code: Option<i64>,
+    child_running: bool,
+    data: &mut Vec<u8>,
+) -> InputEnd {
+    if handle.state.lock().unwrap().closed {
+        return InputEnd::Terminate;
+    }
+    if child_running {
+        return InputEnd::WaitForExit;
+    }
+    if let Some(code) = exit_code {
+        exit_status_message(scheduler, owner, id, handle.trace_scope, code);
+    }
+    if framing.is_some_and(|(mode, _)| mode == 1) && !data.is_empty() {
+        line_message(scheduler, owner, id, data, binary, false);
+        data.clear();
+    }
+    if want_eof {
+        event_message(scheduler, owner, id, handle.trace_scope, atom("eof"));
+        InputEnd::Reported
+    } else {
+        InputEnd::Terminate
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker(
     handle: Arc<PortHandle>,
     mut child: Option<Child>,
-    mut read_fd: Option<RawFd>,
+    read_fd: Option<RawFd>,
     scheduler: Arc<Scheduler<Process>>,
+    runtime: Weak<crate::process::Runtime>,
     owner: Pid,
     id: u64,
     binary: bool,
@@ -2773,18 +2849,44 @@ fn worker(
         .unwrap_or(-1);
     let mut data = Vec::new();
     let mut buf = [0u8; 4096];
-    let mut saw_eof = false;
+    // The input descriptor stays open until the port terminates; at end of input it only
+    // leaves the poll set.
+    let mut input_live = read_fd.is_some();
+    let mut exit_code: Option<i64> = None;
+    let mut status_reported = false;
+    let mut eof_waiting = false;
+    let mut eof_terminate = false;
     let mut input_closed = false;
     loop {
         let closed = handle.state.lock().unwrap().closed;
         if closed {
             break;
         }
+        if eof_waiting
+            && let Some(status) = child
+                .as_mut()
+                .and_then(|child| child.try_wait().ok().flatten())
+        {
+            exit_code = Some(child_exit_code(status));
+            eof_waiting = false;
+            match end_of_input(
+                &handle, &scheduler, owner, id, binary, framing, want_eof, exit_code, false,
+                &mut data,
+            ) {
+                InputEnd::WaitForExit => eof_waiting = true,
+                InputEnd::Reported => status_reported = true,
+                InputEnd::Terminate => {
+                    status_reported = true;
+                    eof_terminate = true;
+                    break;
+                }
+            }
+        }
         let wants_out = !handle.state.lock().unwrap().outq.is_empty()
             || !handle.state.lock().unwrap().pending.is_empty();
         handle.wake_needed.store(true, Ordering::Release);
         let mut fds = Vec::with_capacity(3);
-        if let Some(fd) = read_fd {
+        if input_live && let Some(fd) = read_fd {
             fds.push((
                 fd,
                 crate::check_io::InterestSet {
@@ -2822,14 +2924,23 @@ fn worker(
         if !handle.state.lock().unwrap().closed {
             // Port of `erts_check_io` one-shot readiness delivery; every
             // operation is re-registered after this worker handles the event.
-            let result = crate::check_io::wait_any_timeout_wake(&fds, None, wake_r);
+            let timeout = eof_waiting.then(|| std::time::Duration::from_millis(5));
+            let result = crate::check_io::wait_any_timeout_wake(&fds, timeout, wake_r);
             match result {
                 Ok(Some((ready_fd, ready))) => {
-                    input_ready = Some(ready_fd) == read_fd
+                    input_ready = input_live
+                        && Some(ready_fd) == read_fd
                         && (ready.readable || ready.closed || ready.error);
                 }
                 Ok(None) => continue,
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
                 Err(_) => break,
             }
         }
@@ -2872,11 +2983,46 @@ fn worker(
                 {
                     continue;
                 }
-                saw_eof = true;
-                read_fd = None;
+                // A read error deselects the input and drops a partial packet; the port
+                // itself stays open.
+                input_live = false;
+                if framing.is_some_and(|(mode, _)| mode == 2) {
+                    data.clear();
+                }
             } else if n == 0 {
-                saw_eof = true;
-                read_fd = None;
+                input_live = false;
+                if framing.is_some_and(|(mode, _)| mode == 2) {
+                    data.clear();
+                }
+                if want_status
+                    && exit_code.is_none()
+                    && let Some(status) = child
+                        .as_mut()
+                        .and_then(|child| child.try_wait().ok().flatten())
+                {
+                    exit_code = Some(child_exit_code(status));
+                }
+                let child_running = want_status && exit_code.is_none() && child.is_some();
+                match end_of_input(
+                    &handle,
+                    &scheduler,
+                    owner,
+                    id,
+                    binary,
+                    framing,
+                    want_eof,
+                    exit_code,
+                    child_running,
+                    &mut data,
+                ) {
+                    InputEnd::WaitForExit => eof_waiting = true,
+                    InputEnd::Reported => status_reported = exit_code.is_some(),
+                    InputEnd::Terminate => {
+                        status_reported = exit_code.is_some();
+                        eof_terminate = true;
+                        break;
+                    }
+                }
             } else {
                 let n = n as usize;
                 if framing.is_none() {
@@ -2896,13 +3042,16 @@ fn worker(
             }
         }
         let st = handle.state.lock().unwrap();
-        if saw_eof && st.outq.is_empty() && st.pending.is_empty() {
-            break;
-        }
-        if input_closed && read_fd.is_none() && st.outq.is_empty() && st.pending.is_empty() {
+        if input_closed && !input_live && st.outq.is_empty() && st.pending.is_empty() {
             break;
         }
         drop(st);
+    }
+    if eof_terminate && !handle.state.lock().unwrap().closed {
+        eof_exit(
+            &handle, &scheduler, &runtime, owner, id, wake_r, read_fd, child,
+        );
+        return;
     }
     let woken = flush_output(&handle);
     wake_suspended(&scheduler, woken);
@@ -2915,13 +3064,6 @@ fn worker(
         unsafe { libc::close(fd) };
     }
     let closed = handle.state.lock().unwrap().closed;
-    if !closed && saw_eof && !data.is_empty() {
-        if framing.is_some_and(|(mode, _)| mode == 1) {
-            line_message(&scheduler, owner, id, &data, binary, false);
-        } else {
-            output_message(&scheduler, owner, id, &data, binary, handle.trace_scope);
-        }
-    }
     // Port of erts/emulator/sys/unix/sys_drivers.c:1039 (stop), OTP-29.1.1.
     // Close the child's input first; a detached child may keep running after
     // the port descriptors close, so reap it only after its own exit.
@@ -2933,27 +3075,76 @@ fn worker(
             handle.finish_halt();
         }
         let status = child.wait().ok();
-        if !closed && want_status {
-            let code = status.and_then(|status| status.code()).unwrap_or(1);
-            let mut heap = ProcessHeap::with_words(16);
-            if let Ok(event) = TermBuilder::new(&mut heap)
-                .tuple(&[atom("exit_status"), Term::small(code as i64).unwrap()])
-            {
-                event_message(&scheduler, owner, id, handle.trace_scope, event);
-            }
+        if !closed && want_status && !status_reported {
+            let code = status.map(child_exit_code).unwrap_or(1);
+            exit_status_message(&scheduler, owner, id, handle.trace_scope, code);
         }
     }
     handle.state.lock().unwrap().exit_complete = true;
     handle.finish_halt();
-    if !closed && saw_eof && want_eof {
-        event_message(&scheduler, owner, id, handle.trace_scope, atom("eof"));
-    }
     if !closed && handle.state.lock().unwrap().send_closed {
         event_message(&scheduler, owner, id, handle.trace_scope, atom("closed"));
     }
     if !closed {
         // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
         notify_closed(&handle, id, &scheduler, owner, false);
+    }
+}
+
+/// The port exits at end of input (no `eof` option): the descriptors close, the port leaves the
+/// port table, links and monitors get reason `normal`, and only then is the child reaped.
+#[allow(clippy::too_many_arguments)]
+fn eof_exit(
+    handle: &PortHandle,
+    scheduler: &Scheduler<Process>,
+    runtime: &Weak<crate::process::Runtime>,
+    owner: Pid,
+    id: u64,
+    wake_r: RawFd,
+    read_fd: Option<RawFd>,
+    mut child: Option<Child>,
+) {
+    if let Some(runtime) = runtime.upgrade() {
+        let listed = runtime.ports.lock().unwrap().contains_key(&id);
+        if listed {
+            crate::trace::emit_port_event(
+                &runtime,
+                id,
+                crate::trace::PORTS,
+                "closed",
+                &[atom("normal")],
+            );
+            remove_port(&runtime, id);
+        }
+    }
+    let woken = {
+        let mut st = handle.state.lock().unwrap();
+        st.closed = true;
+        st.broken = true;
+        st.busy_port = false;
+        st.busy_msgq = false;
+        st.outq.clear();
+        st.pending.clear();
+        std::mem::take(&mut st.suspended)
+    };
+    wake_suspended(scheduler, woken);
+    if wake_r >= 0 {
+        // SAFETY: this thread owns the wake read end taken from the handle.
+        unsafe { libc::close(wake_r) };
+    }
+    if let Some(fd) = read_fd {
+        // SAFETY: the worker owns the duplicated input descriptor.
+        unsafe { libc::close(fd) };
+    }
+    handle.out.lock().unwrap().take();
+    handle.state.lock().unwrap().exit_complete = true;
+    handle.finish_halt();
+    if handle.state.lock().unwrap().send_closed {
+        event_message(scheduler, owner, id, handle.trace_scope, atom("closed"));
+    }
+    notify_closed(handle, id, scheduler, owner, false);
+    if let Some(mut child) = child.take() {
+        let _ = child.wait();
     }
 }
 
