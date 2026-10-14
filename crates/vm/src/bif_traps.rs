@@ -60,6 +60,7 @@ pub(crate) struct Entry {
 const CODE_PERMISSION_CONTINUATION: &str = "erts_debug:set_internal_state/2";
 const IOLIST_CONTINUATION: &str = "erts_internal:list_to_bitstring_continue/1";
 const IOLIST_SIZE_CONTINUATION: &str = "erts_internal:iolist_size_continue/1";
+const IOLIST_TO_IOVEC_CONTINUATION: &str = "erts_internal:iolist_to_iovec_continue/1";
 const BINARY_TO_TERM_CONTINUATION: &str = "erts_internal:binary_to_term_trap/1";
 const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
 const BINARY_TO_LIST_CONTINUATION: &str = "erlang:binary_to_list/1";
@@ -601,6 +602,13 @@ const ENTRIES: &[Entry] = &[
         arity: 1,
         continuation: IOLIST_SIZE_CONTINUATION,
         handler: iolist_size,
+    },
+    Entry {
+        module: "erlang",
+        function: "iolist_to_iovec",
+        arity: 1,
+        continuation: IOLIST_TO_IOVEC_CONTINUATION,
+        handler: iolist_to_iovec,
     },
     Entry {
         module: "erlang",
@@ -1675,6 +1683,8 @@ pub(crate) struct ListToBinary;
 pub(crate) struct IolistToBinary;
 /// `iolist_size/1`.
 pub(crate) struct IolistSize;
+/// `iolist_to_iovec/1`.
+pub(crate) struct IolistToIovec;
 
 impl TrapBody for MapsKeys {
     fn run(
@@ -1760,6 +1770,18 @@ impl TrapBody for IolistToBinary {
     ) -> Result<HandlerResult, BifError> {
         // Port of erts/emulator/beam/erl_iolist.c:916-927 (iolist_to_binary_1), OTP-29.1.1.
         iolist_to_binary(process, args, None, pid, restore_gc)
+    }
+}
+
+impl TrapBody for IolistToIovec {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        _instruction: usize,
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        iolist_to_iovec(process, args, None, pid, restore_gc)
     }
 }
 
@@ -2304,6 +2326,92 @@ fn iolist_size(
         value,
         reductions: reductions as u32,
     })
+}
+
+const SIZE_YIELDS_PER_RED: usize = 8;
+
+fn iolist_to_iovec(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _restore_gc: bool,
+) -> Result<HandlerResult, BifError> {
+    let state = match state {
+        Some(state) => Arc::clone(state),
+        None => {
+            if let Some(value) = arinsal_bifs::iolist_to_iovec_shortcut(
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+                args[0],
+            )? {
+                return Ok(HandlerResult::Done {
+                    value,
+                    reductions: 0,
+                });
+            }
+            MagicRef::new(Mutex::new(arinsal_bifs::IolistVecWalk::new(args[0])))
+        }
+    };
+    let walk = state
+        .downcast_ref::<Mutex<arinsal_bifs::IolistVecWalk>>()
+        .ok_or(BifError::BADARG)?;
+    let mut walk = walk.lock().map_err(|_| BifError::SystemLimit)?;
+    let entry_reds = process.reductions.max(0) as usize;
+    let mut spent = 0_usize;
+    let mut reds_left = entry_reds;
+    let yielded = |state: Arc<MagicRef>, reductions: usize| {
+        Ok(HandlerResult::Yield {
+            continuation: IOLIST_TO_IOVEC_CONTINUATION,
+            state,
+            reductions: reductions as u32,
+        })
+    };
+    if !walk.sized() {
+        if reds_left == 0 {
+            drop(walk);
+            return yielded(state, 0);
+        }
+        match walk.size_step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED)) {
+            Err((error, used)) => {
+                return Ok(HandlerResult::Failed {
+                    error,
+                    reductions: arinsal_bifs::iolist_yield_reductions(used) as u32,
+                });
+            }
+            Ok((false, _)) => {
+                drop(walk);
+                return yielded(state, entry_reds);
+            }
+            Ok((true, used)) => {
+                let reds = arinsal_bifs::iolist_yield_reductions(used);
+                spent += reds;
+                reds_left = reds_left.saturating_sub(reds);
+            }
+        }
+        if reds_left == 0 {
+            drop(walk);
+            return yielded(state, entry_reds);
+        }
+    }
+    if reds_left == 0 {
+        drop(walk);
+        return yielded(state, 0);
+    }
+    match walk.copy_step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED)) {
+        Err((error, used)) => Ok(HandlerResult::Failed {
+            error,
+            reductions: (spent + arinsal_bifs::iolist_yield_reductions(used)) as u32,
+        }),
+        Ok((false, _)) => {
+            drop(walk);
+            yielded(state, entry_reds)
+        }
+        Ok((true, used)) => {
+            let reductions = (spent + arinsal_bifs::iolist_yield_reductions(used)) as u32;
+            let value = walk.finish(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))?;
+            Ok(HandlerResult::Done { value, reductions })
+        }
+    }
 }
 
 fn iolist_conversion(
