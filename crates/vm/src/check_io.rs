@@ -433,9 +433,10 @@ fn poll_loop(
                     registrations.remove(&id.0);
                 }
             }
-            for callback in callbacks {
-                callback(fd, ready);
-            }
+            // As `erts_check_io`: the poll set is brought to its state after the event
+            // (`ERTS_POLL_OP_MOD`) before any callback runs. A callback may hand the
+            // descriptor to a thread that closes it at once, so the poll thread must not
+            // touch the descriptor in the kernel poll set after a callback ran.
             if active_registration.watchers.is_empty() {
                 let source = SourceFd(&fd);
                 let _ = poll.registry().deregister(&mut { source });
@@ -457,6 +458,9 @@ fn poll_loop(
                     let source = SourceFd(&fd);
                     let _ = poll.registry().reregister(&mut { source }, token, interest);
                 }
+            }
+            for callback in callbacks {
+                callback(fd, ready);
             }
         }
     }
@@ -1108,5 +1112,44 @@ pub(crate) mod tests {
         assert_eq!(debug_info().driver_selects, 1);
         driver_deselect(fd, 2);
         assert_eq!(debug_info().used_fds, 0);
+    }
+
+    /// The poll thread must be done with the descriptor in the kernel poll set when it runs
+    /// a one-shot callback: the callback may select the descriptor again or hand it to a
+    /// thread that closes it. A late `kevent` of the poll thread on the descriptor removed
+    /// the selection made from the callback, and raced the close, which never returned on
+    /// macOS.
+    #[test]
+    fn check_io_one_shot_callback_runs_after_the_poll_set_update() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"x").unwrap();
+        let fd = reader.as_raw_fd();
+        let readable = InterestSet {
+            readable: true,
+            writable: false,
+        };
+        let (tx, rx) = mpsc::channel();
+        let _registration = register(fd, readable, move |fd, _| {
+            let tx = tx.clone();
+            driver_select(
+                fd,
+                7,
+                readable,
+                Arc::new(move |_, _| {
+                    let _ = tx.send(());
+                }),
+            )
+            .unwrap();
+        })
+        .unwrap();
+        let fired = rx.recv_timeout(Duration::from_secs(5));
+        driver_deselect(fd, 7);
+        assert!(
+            fired.is_ok(),
+            "the selection made from the one-shot callback was removed by the poll thread"
+        );
     }
 }
