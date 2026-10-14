@@ -63,8 +63,8 @@ pub trait Reactor: Send + Sync {
     fn monitor(&self, _pid: &O, _handle: &O) -> Option<u64> {
         None
     }
-    /// `enif_demonitor_process(env, obj, &mon)`.
-    fn demonitor(&self, _monitor: u64) {}
+    /// `enif_demonitor_process(env, obj, &mon)`; `pid` is the process it was taken on.
+    fn demonitor(&self, _pid: &O, _monitor: u64) {}
 }
 
 /// A pending selection of the [`BlockingReactor`].
@@ -242,7 +242,7 @@ impl Reactor for BlockingReactor {
             .push((id, pid.clone(), handle.clone()));
         Some(id)
     }
-    fn demonitor(&self, monitor: u64) {
+    fn demonitor(&self, _pid: &O, monitor: u64) {
         self.monitors
             .lock()
             .unwrap()
@@ -310,6 +310,16 @@ pub fn abort_message(handle: &O, reference: &O, reason: &O) -> O {
 /// Resolve a NIF entry in `prim_socket` or `prim_net`.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     lookup_entry(module, name, arity)
+}
+
+/// Whether the `prim_socket` or `prim_net` NIF `name/arity` is flagged
+/// `ERL_NIF_DIRTY_JOB_IO_BOUND`, so the VM runs it on a dirty IO scheduler.
+pub fn dirty_io(module: &str, name: &str, arity: u8) -> bool {
+    match module {
+        "prim_socket" => socket::dirty_io(name, arity),
+        "prim_net" => net::dirty_io(name, arity),
+        _ => false,
+    }
 }
 
 struct Heap<'a, H: HeapAlloc + ?Sized>(&'a mut H);
@@ -568,4 +578,70 @@ pub(crate) fn notsup() -> BifError {
     BifError::Error(arinsal_term::Term::atom(
         arinsal_term::global_atoms().intern("notsup").unwrap(),
     ))
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+
+    #[test]
+    fn nif_tables_list_every_entry_the_lookup_resolves() {
+        for (module, table) in [
+            ("prim_socket", &socket::NIF_FUNCS[..]),
+            ("prim_net", &net::NIF_FUNCS[..]),
+        ] {
+            for (name, arity, _) in table {
+                assert!(
+                    lookup_entry(module, name, *arity).is_some(),
+                    "{module}:{name}/{arity}"
+                );
+            }
+        }
+        assert_eq!(socket::NIF_FUNCS.len(), 40);
+        assert_eq!(net::NIF_FUNCS.len(), 15);
+    }
+
+    #[test]
+    fn dirty_io_entries_are_the_flagged_ones() {
+        let socket_dirty: Vec<_> = socket::NIF_FUNCS
+            .iter()
+            .filter(|(_, _, dirty)| *dirty)
+            .map(|(name, arity, _)| (*name, *arity))
+            .collect();
+        assert_eq!(
+            socket_dirty,
+            [
+                ("nif_sendfile", 5),
+                ("nif_sendfile", 4),
+                ("nif_sendfile", 1),
+                ("nif_ioctl", 2),
+                ("nif_ioctl", 3),
+                ("nif_ioctl", 4),
+                ("nif_finalize_close", 1),
+            ]
+        );
+        let net_dirty: Vec<_> = net::NIF_FUNCS
+            .iter()
+            .filter(|(_, _, dirty)| *dirty)
+            .map(|(name, arity, _)| (*name, *arity))
+            .collect();
+        assert_eq!(
+            net_dirty,
+            [
+                ("nif_getifaddrs", 1),
+                ("nif_get_adapters_addresses", 1),
+                ("nif_get_if_entry", 1),
+                ("nif_get_interface_info", 1),
+                ("nif_get_ip_address_table", 1),
+                ("nif_getservbyname", 2),
+                ("nif_getservbyport", 2),
+            ]
+        );
+        assert!(dirty_io("prim_net", "nif_getifaddrs", 1));
+        assert!(dirty_io("prim_socket", "nif_ioctl", 3));
+        assert!(!dirty_io("prim_socket", "nif_ioctl", 1));
+        assert!(!dirty_io("prim_net", "nif_getaddrinfo", 3));
+        assert!(!dirty_io("prim_socket", "nif_sendmmsg", 4));
+        assert!(!dirty_io("prim_file", "nif_ioctl", 3));
+    }
 }

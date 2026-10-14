@@ -16,7 +16,8 @@ const SOURCE: &str = r#"
          large_send_slow_reader/0,
          sendv_several_binaries/0, send_after_shutdown_write/0,
          shutdown_on_closed_socket/0, cancel_send/0, writer_queue_order/0,
-         writer_abort_on_error/0, packet_send_sendv/0, sendto_sendmsg_stream/0]).
+         writer_abort_on_error/0, packet_send_sendv/0, sendto_sendmsg_stream/0,
+         dirty_io_nifs_wait_for_dirty_schedulers/0]).
 
 listen() ->
     {ok, Listen} = gen_tcp:listen(0, [{inet_backend, socket}, {ip, {127,0,0,1}},
@@ -489,6 +490,43 @@ sendto_sendmsg_stream() ->
     ok = socket:shutdown(C, write),
     {Received, End} = read_all(S, []),
     {R1, R2, R3, R4, R5, Received, End}.
+
+dirty_tag(R) when is_tuple(R) -> element(1, R);
+dirty_tag(R) -> R.
+
+dirty_io_nifs_wait_for_dirty_schedulers() ->
+    Parent = self(),
+    {_C, A} = sock_pair(),
+    Count = erlang:system_info(dirty_io_schedulers),
+    Calls = [
+        {dirty_getifaddrs, fun() -> dirty_tag(prim_net:getifaddrs(#{})) end},
+        {dirty_getservbyname, fun() -> dirty_tag(prim_net:getservbyname("http", "tcp")) end},
+        {dirty_getservbyport, fun() -> dirty_tag(prim_net:getservbyport(80, "tcp")) end},
+        {dirty_ioctl_nread, fun() -> dirty_tag(socket:ioctl(A, nread)) end},
+        {dirty_ioctl_atmark, fun() -> dirty_tag(socket:ioctl(A, atmark)) end},
+        {plain_gethostname, fun() -> dirty_tag(prim_net:gethostname()) end},
+        {plain_if_names, fun() -> dirty_tag(prim_net:if_names()) end},
+        {plain_getaddrinfo, fun() -> dirty_tag(net:getaddrinfo("localhost")) end},
+        {plain_sockname, fun() -> dirty_tag(socket:sockname(A)) end}
+    ],
+    [Call() || {_, Call} <- Calls],
+    erts_debug:dirty_io(wait, 1),
+    timer:sleep(1),
+    [spawn_link(fun() -> erts_debug:dirty_io(wait, 1500), Parent ! blocker_done end)
+     || _ <- lists:seq(1, Count)],
+    timer:sleep(300),
+    Pids = [{Name, spawn_link(fun() -> Parent ! {self(), Call()} end)}
+            || {Name, Call} <- Calls],
+    timer:sleep(500),
+    Early = lists:sort([Name || {Name, Pid} <- Pids, dirty_finished(Pid)]),
+    Late = lists:sort([{Name, dirty_wait(Pid)} || {Name, Pid} <- Pids]),
+    {Early, Late}.
+
+dirty_finished(Pid) ->
+    receive {Pid, _} = Done -> self() ! Done, true after 0 -> false end.
+
+dirty_wait(Pid) ->
+    receive {Pid, Result} -> Result after 10000 -> timeout end.
 "#;
 
 fn run(program: &Path, dir: &Path, module: &str, function: &str) -> (bool, String) {
@@ -752,4 +790,9 @@ fn info_counters_and_registry_match_erts() {
 #[test]
 fn errno_atoms_match_erts() {
     compare_close("errnos");
+}
+
+#[test]
+fn dirty_io_socket_and_net_nifs_wait_for_dirty_schedulers_like_erts() {
+    compare("dirty_io_nifs_wait_for_dirty_schedulers");
 }

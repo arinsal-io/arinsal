@@ -706,6 +706,15 @@ pub(crate) fn write_binary(
             .expect("infallible BIF heap"));
     }
     byte_len.checked_mul(8).ok_or(BifError::SystemLimit)?;
+    // Port of erts/emulator/beam/erl_bits.c:2841-2858 (erts_new_bitstring_refc), OTP-29.1.1.
+    const ONHEAP_BYTES: usize = 64;
+    if byte_len <= ONHEAP_BYTES {
+        let mut bytes = [0_u8; ONHEAP_BYTES];
+        fill(&mut bytes[..byte_len])?;
+        return TermBuilder::new(&mut Heap(&mut ctx.heap))
+            .binary(&bytes[..byte_len])
+            .map_err(|_| BifError::SystemLimit);
+    }
     if !ctx.heap.supports_writable_binary() {
         let mut bytes = vec![0; byte_len];
         fill(&mut bytes)?;

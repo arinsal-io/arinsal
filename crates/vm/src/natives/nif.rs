@@ -158,6 +158,21 @@ impl ModuleNif {
     }
 }
 
+/// The `dynlib_refc` of a library as seen by its resource types.
+struct ModuleRefs(Arc<ModuleNif>);
+
+impl arinsal_nif::LibraryRefs for ModuleRefs {
+    fn dynlib_inc(&self) {
+        self.0
+            .dynlib_refc
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn dynlib_dec(&self) {
+        self.0.dynlib_deref();
+    }
+}
+
 /// Close a library whose last `dynlib_refc` reference is gone: the unload callbacks run as aux
 /// work of the calling normal scheduler, or of the first one when called elsewhere.
 // Port of erts/emulator/beam/erl_nif.c:2542-2557 (close_dynlib) and 2559-2618
@@ -328,6 +343,7 @@ pub(crate) fn unload_instance(scope: u64, id: usize) {
         released
     };
     for lib in released {
+        lib.library.unload_resource_types();
         lib.dynlib_deref();
     }
 }
@@ -476,6 +492,16 @@ fn hub_for_pid(pid: Pid) -> Option<Hub> {
     })
 }
 
+fn owned_local_pid(term: &arinsal_etf::OwnedTerm) -> Option<Pid> {
+    let arinsal_etf::OwnedTerm::Pid {
+        node, id, serial, ..
+    } = term
+    else {
+        return None;
+    };
+    (node == "nonode@nohost").then(|| Pid::new(*id, *serial))
+}
+
 struct SelectRegistration {
     id: u64,
     fd: i32,
@@ -503,8 +529,6 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
         arinsal_term::to_owned(pid.to_term()?).ok()
     }
 
-    // Port of enif_select in erl_check_io.c:1228, OTP-29.1.1.
-    // Port of enif_select in erl_check_io.c:1228, OTP-29.1.1.
     fn register_read(
         &self,
         fd: i32,
@@ -553,11 +577,44 @@ impl arinsal_nif_socket::Reactor for NifSelectReactor {
         pid: &arinsal_etf::OwnedTerm,
         handle: &arinsal_etf::OwnedTerm,
     ) -> Option<u64> {
-        resource_monitor(pid, handle)
+        let target = owned_local_pid(pid)?;
+        let hub = hub_for_pid(target)?;
+        let scheduler = hub.scheduler.upgrade()?;
+        let id = arinsal_bifs::next_ref_id();
+        let handle = handle.clone();
+        let monitor = Arc::new(arinsal_nif::ResourceMonitor::native(
+            id,
+            Arc::new(move |exiting, id| {
+                if let Ok(exiting) = arinsal_term::to_owned(exiting) {
+                    arinsal_nif_socket::down(&handle, &exiting, id);
+                }
+            }),
+        ));
+        let sender = current_hub().map_or(hub.pid, |current| current.current_pid());
+        scheduler
+            .signal(
+                sender,
+                target,
+                arinsal_sched::Signal::Monitor {
+                    reference: id,
+                    shared: arinsal_sched::SharedPayload(monitor),
+                },
+            )
+            .is_ok()
+            .then_some(id)
     }
 
-    fn demonitor(&self, monitor: u64) {
-        resource_demonitor(monitor);
+    fn demonitor(&self, pid: &arinsal_etf::OwnedTerm, monitor: u64) {
+        let Some(target) = owned_local_pid(pid) else {
+            return;
+        };
+        let Some(hub) = hub_for_pid(target) else {
+            return;
+        };
+        if let Some(scheduler) = hub.scheduler.upgrade() {
+            let sender = current_hub().map_or(hub.pid, |current| current.current_pid());
+            let _ = scheduler.signal(sender, target, arinsal_sched::Signal::Demonitor(monitor));
+        }
     }
 
     fn send(&self, pid: &arinsal_etf::OwnedTerm, message: &arinsal_etf::OwnedTerm) -> bool {
@@ -685,110 +742,6 @@ impl NifSelectReactor {
             self.pending.lock().unwrap().retain(|entry| entry.id != id);
             failed
         }
-    }
-}
-
-/// The process monitors of NIF resources (`ERTS_MON_TYPE_RESOURCE`): a monitored process
-/// that exits fires the down callback of the resource with the monitor it was given.
-#[derive(Default)]
-struct ResourceMonitors {
-    next: u64,
-    by_id: HashMap<u64, ResourceMonitor>,
-    by_process: HashMap<(usize, u64), Vec<u64>>,
-}
-
-struct ResourceMonitor {
-    process: (usize, u64),
-    resource: arinsal_etf::OwnedTerm,
-}
-
-fn resource_monitors() -> &'static Mutex<ResourceMonitors> {
-    static MONITORS: OnceLock<Mutex<ResourceMonitors>> = OnceLock::new();
-    MONITORS.get_or_init(|| Mutex::new(ResourceMonitors::default()))
-}
-
-/// `enif_monitor_process`: `None` when the process is not alive. The registration is
-/// published to the process before it returns, so an exit that has already finished the
-/// resource monitors is seen as a dead process.
-fn resource_monitor(
-    pid_term: &arinsal_etf::OwnedTerm,
-    resource: &arinsal_etf::OwnedTerm,
-) -> Option<u64> {
-    let arinsal_etf::OwnedTerm::Pid {
-        node, id, serial, ..
-    } = pid_term
-    else {
-        return None;
-    };
-    if node != "nonode@nohost" {
-        return None;
-    }
-    let pid = Pid::new(*id, *serial);
-    let runtime = hub_for_pid(pid)?.runtime.upgrade()?;
-    let process = (Arc::as_ptr(&runtime) as usize, pid.data());
-    let monitor = {
-        let mut monitors = resource_monitors().lock().unwrap();
-        monitors.next += 1;
-        let monitor = monitors.next;
-        monitors.by_id.insert(
-            monitor,
-            ResourceMonitor {
-                process,
-                resource: resource.clone(),
-            },
-        );
-        monitors
-            .by_process
-            .entry(process)
-            .or_default()
-            .push(monitor);
-        monitor
-    };
-    if runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::RESOURCE_MON) {
-        Some(monitor)
-    } else {
-        resource_demonitor(monitor);
-        None
-    }
-}
-
-/// `enif_demonitor_process`.
-fn resource_demonitor(monitor: u64) {
-    let mut monitors = resource_monitors().lock().unwrap();
-    let Some(removed) = monitors.by_id.remove(&monitor) else {
-        return;
-    };
-    if let Some(ids) = monitors.by_process.get_mut(&removed.process) {
-        ids.retain(|id| *id != monitor);
-        if ids.is_empty() {
-            monitors.by_process.remove(&removed.process);
-        }
-    }
-}
-
-/// `erts_fire_nif_monitor` for every resource monitor of the exiting process `pid`.
-pub(crate) fn fire_resource_monitors(runtime: &Arc<crate::process::Runtime>, pid: Pid) {
-    let process = (Arc::as_ptr(runtime) as usize, pid.data());
-    let fired: Vec<(u64, arinsal_etf::OwnedTerm)> = {
-        let mut monitors = resource_monitors().lock().unwrap();
-        let ids = monitors.by_process.remove(&process).unwrap_or_default();
-        ids.into_iter()
-            .filter_map(|id| {
-                monitors
-                    .by_id
-                    .remove(&id)
-                    .map(|monitor| (id, monitor.resource))
-            })
-            .collect()
-    };
-    let Some(owned) = pid
-        .to_term()
-        .and_then(|term| arinsal_term::to_owned(term).ok())
-    else {
-        return;
-    };
-    for (monitor, resource) in fired {
-        arinsal_nif_socket::down(&resource, &owned, monitor);
     }
 }
 
@@ -1278,10 +1231,16 @@ fn install_stubs(
     });
     let result = finish_stubs(vm, module_id, &lib, binds);
     match result {
-        Ok(()) => MODULE_NIFS
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .push(lib),
+        Ok(()) => {
+            // Port of erts/emulator/beam/erl_nif.c:4997 (`prepare_opened_rt`): the resource
+            // types the load callback opened become live and reference the library.
+            lib.library
+                .commit_resource_types(&(Arc::new(ModuleRefs(Arc::clone(&lib))) as Arc<_>));
+            MODULE_NIFS
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(lib)
+        }
         // Port of erts/emulator/beam/erl_nif.c:5019-5031 (erts_load_nif error path), OTP-29.1.1:
         // a library that did not get bound is released.
         Err(_) => lib.dynlib_deref(),
@@ -1469,7 +1428,24 @@ fn intern_load_atoms(module: &str) -> Result<(), VmError> {
     Ok(())
 }
 
+// Port of erts/emulator/beam/emu/bif_instrs.tab:i_load_nif: the load runs holding the code
+// modification permission; a caller that is not given it yields and retries the call.
 fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+    let runtime = process.runtime.clone();
+    let pid = process.self_pid;
+    if let (Some(runtime), Some(pid)) = (&runtime, pid)
+        && !crate::natives::code::try_seize_code_mod_permission(runtime, process, pid)
+    {
+        return Err(VmError::Yield);
+    }
+    let result = load_nif_locked(vm, process, args);
+    if let (Some(runtime), Some(_)) = (&runtime, pid) {
+        crate::natives::code::release_code_mod_permission(runtime);
+    }
+    result
+}
+
+fn load_nif_locked(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let [path, info] = *args else {
         return Err(badarg());
     };
@@ -1947,8 +1923,44 @@ fn install_hub_for(process: &Process, pid: Pid) {
         is_process_alive: Some(nif_is_process_alive),
         thread_type: Some(nif_thread_type),
         current_process_exiting: Some(crate::dirty::current_process_exiting),
-        ..arinsal_nif::VmHooks::default()
+        resource_monitor: Some(nif_resource_monitor),
+        resource_demonitor: Some(nif_resource_demonitor),
     });
+}
+
+// Port of erts/emulator/beam/erl_nif.c:3150-3180 (enif_monitor_process: erts_monitor_create and
+// erts_proc_sig_send_monitor): the target half goes into the monitored process's monitor tree.
+fn nif_resource_monitor(
+    target: Term,
+    id: u64,
+    monitor: std::sync::Arc<arinsal_nif::ResourceMonitor>,
+) -> bool {
+    let (Some(hub), Some(pid)) = (current_hub(), Pid::from_term(target)) else {
+        return false;
+    };
+    let Some(scheduler) = hub.scheduler.upgrade() else {
+        return false;
+    };
+    scheduler
+        .signal(
+            hub.pid,
+            pid,
+            arinsal_sched::Signal::Monitor {
+                reference: id,
+                shared: arinsal_sched::SharedPayload(monitor),
+            },
+        )
+        .is_ok()
+}
+
+// erl_nif.c: erts_proc_sig_send_demonitor for a resource monitor.
+fn nif_resource_demonitor(target: Term, id: u64) {
+    let (Some(hub), Some(pid)) = (current_hub(), Pid::from_term(target)) else {
+        return;
+    };
+    if let Some(scheduler) = hub.scheduler.upgrade() {
+        let _ = scheduler.signal(hub.pid, pid, arinsal_sched::Signal::Demonitor(id));
+    }
 }
 
 // Port of erts/emulator/beam/erl_nif.c:3593 (enif_thread_type), OTP-29.1.1.

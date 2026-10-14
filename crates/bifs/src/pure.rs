@@ -245,11 +245,11 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "round", 1) => v.entry::<bodies::round>(),
         ("erlang", "ceil", 1) => v.entry::<bodies::ceil>(),
         ("erlang", "floor", 1) => v.entry::<bodies::floor>(),
-        ("erlang", "hd", 1) => v.entry::<bodies::hd>(),
-        ("erlang", "tl", 1) => v.entry::<bodies::tl>(),
-        ("erlang", "element", 2) => v.entry::<bodies::element>(),
-        ("erlang", "setelement", 3) => v.entry::<bodies::setelement>(),
-        ("erlang", "tuple_size", 1) => v.entry::<bodies::tuple_size>(),
+        ("erlang", "hd", 1) => v.entry::<process_bodies::hd>(),
+        ("erlang", "tl", 1) => v.entry::<process_bodies::tl>(),
+        ("erlang", "element", 2) => v.entry::<process_bodies::element>(),
+        ("erlang", "setelement", 3) => v.entry::<process_bodies::setelement>(),
+        ("erlang", "tuple_size", 1) => v.entry::<process_bodies::tuple_size>(),
         ("erlang", "size", 1) => v.entry::<bodies::size>(),
         ("erlang", "node", 0 | 1) => v.entry::<bodies::node>(),
         ("erlang", "self", 0) => v.entry::<bodies::self_bif>(),
@@ -273,15 +273,17 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "unique_integer", 0 | 1) => v.entry::<bodies::unique_integer>(),
         ("erlang" | "os", "system_time", 0 | 1) => v.entry::<bodies::system_time>(),
         ("erts_internal", "time_unit" | "perf_counter_unit", 0) => v.entry::<bodies::time_unit>(),
-        ("erlang", "tuple_to_list", 1) => v.entry::<bodies::tuple_to_list>(),
-        ("erlang", "list_to_tuple", 1) => v.entry::<bodies::list_to_tuple>(),
-        ("erlang", "make_tuple", 2 | 3) => v.entry::<bodies::make_tuple>(),
-        ("erlang", "append_element", 2) => v.entry::<bodies::append_element>(),
-        ("erlang", "delete_element", 2) => v.entry::<bodies::delete_element>(),
-        ("erlang", "insert_element", 3) => v.entry::<bodies::insert_element>(),
-        ("erlang", "atom_to_list", 1) => v.entry::<bodies::atom_to_list>(),
-        ("erlang", "list_to_atom", 1) => v.entry::<bodies::list_to_atom>(),
-        ("erlang", "list_to_existing_atom", 1) => v.entry::<bodies::list_to_existing_atom>(),
+        ("erlang", "tuple_to_list", 1) => v.entry::<process_bodies::tuple_to_list>(),
+        ("erlang", "list_to_tuple", 1) => v.entry::<process_bodies::list_to_tuple>(),
+        ("erlang", "make_tuple", 2 | 3) => v.entry::<process_bodies::make_tuple>(),
+        ("erlang", "append_element", 2) => v.entry::<process_bodies::append_element>(),
+        ("erlang", "delete_element", 2) => v.entry::<process_bodies::delete_element>(),
+        ("erlang", "insert_element", 3) => v.entry::<process_bodies::insert_element>(),
+        ("erlang", "atom_to_list", 1) => v.entry::<process_bodies::atom_to_list>(),
+        ("erlang", "list_to_atom", 1) => v.entry::<process_bodies::list_to_atom>(),
+        ("erlang", "list_to_existing_atom", 1) => {
+            v.entry::<process_bodies::list_to_existing_atom>()
+        }
         ("erlang", "atom_to_binary", 2) => v.entry::<bodies::atom_to_binary>(),
         ("erlang", "binary_to_atom", 2) => v.entry::<bodies::binary_to_atom>(),
         ("erlang", "binary_to_existing_atom", 2) => v.entry::<bodies::binary_to_existing_atom>(),
@@ -289,7 +291,6 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "float_to_binary", 1 | 2) => v.entry::<bodies::float_to_binary>(),
         ("erlang", "list_to_float", 1) => v.entry::<bodies::list_to_float>(),
         ("erlang", "binary_to_float", 1) => v.entry::<bodies::binary_to_float>(),
-        ("erlang", "integer_to_list", 1 | 2) => v.entry::<bodies::integer_to_list>(),
         ("erlang", "integer_to_binary", 1 | 2) => v.entry::<bodies::integer_to_binary>(),
         ("erlang", "is_atom", 1) => v.entry::<bodies::is_atom>(),
         ("erlang", "is_list", 1) => v.entry::<bodies::is_list>(),
@@ -483,12 +484,14 @@ pub(super) fn tuple_build(ctx: &mut Ctx<'_>, values: &[Term]) -> Term {
 }
 
 fn hd(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/bif.c:2918-2930 (hd_1), OTP-29.1.1.
     // SAFETY: The input heap is live and stable.
     unsafe { args[0].cons_ref() }
         .map(|(head, _)| head)
         .ok_or(BADARG)
 }
 fn tl(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/bif.c:2931-2943 (tl_1), OTP-29.1.1.
     // SAFETY: The input heap is live and stable.
     unsafe { args[0].cons_ref() }
         .map(|(_, tail)| tail)
@@ -879,6 +882,7 @@ pub(super) fn atom_name(term: Term) -> Option<&'static str> {
     global_atoms().text(term.as_atom()?)
 }
 fn atom_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/bif.c:3186-3210 (atom_to_list_1), OTP-29.1.1.
     atom_to_list_term(&mut ctx.heap, args[0])
 }
 
@@ -920,7 +924,8 @@ fn cons_units<H: HeapAlloc + ?Sized>(
     Ok(result)
 }
 fn list_to_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of bif.c:3217 (list_to_atom_1) and utils.c:2862 (erts_unicode_list_to_buf),
+    // Port of erts/emulator/beam/bif.c:3217 (list_to_atom_1) and
+    // erts/emulator/beam/utils.c:2862 (erts_unicode_list_to_buf),
     // OTP-29.1.1. The bytes land in a fixed buffer, then erts_atom_put.
     let mut buf = [0u8; MAX_ATOM_SZ_LIMIT];
     let written = unicode_list_to_buf(args[0], &mut buf)?;
@@ -1214,107 +1219,6 @@ fn integer_text(args: &[Term]) -> Result<String, BifError> {
         return Err(BADARG);
     }
     Ok(bigint(args[0])?.to_str_radix(base as u32).to_uppercase())
-}
-fn integer_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/bif.c:3266-3329 (integer_to_list), OTP-29.1.1.
-    let base = if args.len() == 2 {
-        args[1].as_small().ok_or(BADARG)?
-    } else {
-        10
-    };
-    if !(2..=36).contains(&base) {
-        return Err(BADARG);
-    }
-    if let Some(value) = args[0].as_small() {
-        // Port of `Sint_to_buf` in erts/emulator/beam/utils.c:2994-3038, OTP-29.1.1.
-        let mut bytes = [0u8; 128];
-        let mut start = bytes.len();
-        let mut magnitude = value.unsigned_abs();
-        loop {
-            start -= 1;
-            let digit = (magnitude % base as u64) as u8;
-            bytes[start] = if digit < 10 {
-                b'0' + digit
-            } else {
-                b'A' + digit - 10
-            };
-            magnitude /= base as u64;
-            if magnitude == 0 {
-                break;
-            }
-        }
-        if value < 0 {
-            start -= 1;
-            bytes[start] = b'-';
-        }
-        return Ok(make_list(
-            ctx,
-            bytes[start..]
-                .iter()
-                .copied()
-                .map(|byte| Term::small(byte as i64).unwrap()),
-            Term::NIL,
-        ));
-    }
-    let value = bigint(args[0])?;
-    let (sign, mut digits) = value.to_u64_digits();
-    let base = base as u64;
-    let mut largest_power = 1_u64;
-    let mut digits_per_word = 0;
-    while let Some(next) = largest_power.checked_mul(base) {
-        largest_power = next;
-        digits_per_word += 1;
-    }
-    let mut builder = TermBuilder::new(&mut ctx.heap);
-    let mut result = Term::NIL;
-    // Port of `write_big_simple` / `erts_big_to_list` in erts/emulator/beam/big.c:2613-2670
-    // and :3301-3310, OTP-29.1.1. The source divides by the largest base power per limb pass.
-    while digits.last().is_some_and(|digit| *digit != 0) {
-        let mut remainder = 0u128;
-        for digit in digits.iter_mut().rev() {
-            let value = (remainder << 64) | *digit as u128;
-            *digit = (value / largest_power as u128) as u64;
-            remainder = value % largest_power as u128;
-        }
-        while digits.last() == Some(&0) {
-            digits.pop();
-        }
-        let chunk_digits = if digits.is_empty() {
-            let mut count = 0;
-            while remainder != 0 {
-                let digit = (remainder % base as u128) as u8;
-                remainder /= base as u128;
-                push_integer_digit(&mut builder, &mut result, digit);
-                count += 1;
-            }
-            count
-        } else {
-            for _ in 0..digits_per_word {
-                let digit = (remainder % base as u128) as u8;
-                remainder /= base as u128;
-                push_integer_digit(&mut builder, &mut result, digit);
-            }
-            digits_per_word
-        };
-        debug_assert!(chunk_digits > 0);
-    }
-    if sign == Sign::Minus {
-        result = builder
-            .cons(Term::small(b'-' as i64).unwrap(), result)
-            .expect("infallible BIF heap");
-    }
-    Ok(result)
-}
-
-fn push_integer_digit(builder: &mut TermBuilder<'_, impl HeapAlloc>, result: &mut Term, digit: u8) {
-    let byte = if digit < 10 {
-        b'0' + digit
-    } else {
-        b'A' + digit - 10
-    };
-    *result = builder
-        .cons(Term::small(byte as i64).unwrap(), *result)
-        .expect("infallible BIF heap");
 }
 fn integer_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let text = integer_text(args)?;
@@ -1956,11 +1860,6 @@ crate::bif_bodies!(
     round,
     ceil,
     floor,
-    hd,
-    tl,
-    element,
-    setelement,
-    tuple_size,
     size,
     node,
     self_bif,
@@ -1984,15 +1883,6 @@ crate::bif_bodies!(
     unique_integer,
     system_time,
     time_unit,
-    tuple_to_list,
-    list_to_tuple,
-    make_tuple,
-    append_element,
-    delete_element,
-    insert_element,
-    atom_to_list,
-    list_to_atom,
-    list_to_existing_atom,
     atom_to_binary,
     binary_to_atom,
     binary_to_existing_atom,
@@ -2000,7 +1890,6 @@ crate::bif_bodies!(
     float_to_binary,
     list_to_float,
     binary_to_float,
-    integer_to_list,
     integer_to_binary,
     is_atom,
     is_list,
@@ -2055,4 +1944,10 @@ crate::bif_bodies!(
     math_atan2,
     math_pow,
     math_fmod,
+);
+
+crate::process_bif_bodies_in!(process_bodies;
+    hd, tl, element, setelement, tuple_size, tuple_to_list, list_to_tuple, make_tuple,
+    append_element, delete_element, insert_element, atom_to_list, list_to_atom,
+    list_to_existing_atom,
 );

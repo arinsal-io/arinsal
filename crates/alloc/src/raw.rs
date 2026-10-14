@@ -352,6 +352,11 @@ impl OwnedBinaryRef {
         })
     }
 
+    /// Another retained reference to the same Binary (`erts_refc_inc`).
+    pub fn try_clone(&self) -> Option<Self> {
+        Self::clone_from_view(self.view)
+    }
+
     /// Associate this reference with its BinRef so reallocations are followed at release.
     pub fn attach_to_bin_ref(&mut self, bin_ref: *mut u64) {
         self.bin_ref = bin_ref as usize;

@@ -51,7 +51,9 @@ pub use pure::{
     finish_iolist_binary_output, next_ref_id, next_unique_monotonic, proper_list_terms,
     singleton_bitstring, tuple_terms, with_binary_bytes, with_iolist_binary_output,
 };
-pub use time::{monotonic_time_milliseconds, monotonic_time_nanos};
+pub use time::{
+    monotonic_time_milliseconds, monotonic_time_nanos, next_now_micros, time_offset_nanos_value,
+};
 pub use unique::{
     SchedulerRefState, UniqueInt, bind_scheduler_ref_state, init_unique_scheduler_count,
     next_ref_words, next_unique_integer, next_unique_monotonic_positive, ordinary_ref_key,
@@ -340,11 +342,19 @@ macro_rules! bif_bodies {
 }
 pub(crate) use bif_bodies;
 
-/// One maps BIF body shared by process dispatch and allocator-only callers.
+/// Process-shaped BIF bodies shared by process dispatch and allocator-only callers.
 macro_rules! process_bif_bodies {
     ($($bif:ident),* $(,)?) => {
+        $crate::process_bif_bodies_in!(bodies; $($bif),*);
+    };
+}
+pub(crate) use process_bif_bodies;
+
+/// Process-shaped BIF bodies in a separate table module for mixed families.
+macro_rules! process_bif_bodies_in {
+    ($module:ident; $($bif:ident),* $(,)?) => {
         #[allow(non_camel_case_types)]
-        mod bodies {
+        mod $module {
             $(
                 pub(super) struct $bif;
                 impl $crate::BifBody for $bif {
@@ -366,7 +376,7 @@ macro_rules! process_bif_bodies {
         }
     };
 }
-pub(crate) use process_bif_bodies;
+pub(crate) use process_bif_bodies_in;
 
 /// Find the implementation of `module:name/arity`.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {

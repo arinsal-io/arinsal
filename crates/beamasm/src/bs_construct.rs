@@ -1,6 +1,6 @@
 //! AArch64 emitters for BEAM bit syntax construction.
 
-pub use crate::bs_fast::{install_bs_append_binary, install_bs_gc};
+pub use crate::bs_fast::{install_bs_append_binary, install_bs_gc, install_bs_private_append};
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use arinsal_a64::enc::Gpr;

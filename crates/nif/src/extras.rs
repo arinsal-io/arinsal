@@ -1,12 +1,11 @@
 //! Independent environments, time, ETF, and VM extension hooks.
-use crate::{ErlNifBinary, ErlNifEnv, terms};
+use crate::raw::{cstr, deref, deref_mut, slice};
+use crate::{ErlNifBinary, ErlNifEnv, put, terms};
 use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned};
-use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::hint::black_box;
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The VM may register services once processes and the reactor are connected.
 /// A message `enif_select` prepared for one direction: it owns its heap.
@@ -28,6 +27,8 @@ pub struct SelectRequest {
     /// READ and WRITE messages, prepared when the call selects (not cancel or stop).
     pub messages: [Option<SelectMessage>; 2],
 }
+/// Insert a resource monitor into a process: target pid, monitor reference, target half.
+pub type ResourceMonitorHook = fn(Term, u64, Arc<crate::ResourceMonitor>) -> bool;
 /// `enif_select_x` implementation (erl_check_io.c:1236).
 pub type SelectHook = fn(SelectRequest) -> i32;
 /// Local port lookup by registered name.
@@ -36,8 +37,6 @@ pub type WhereisPortHook = fn(Term) -> Option<Term>;
 pub type PortAliveHook = fn(Term) -> bool;
 /// `enif_port_command`: sender pid, port, data.
 pub type PortCommandHook = fn(Option<Term>, Term, Term) -> bool;
-/// Resource process monitor registration callback.
-pub type MonitorHook = fn(usize, Term, &mut [u8; 32]) -> i32;
 #[derive(Default, Clone, Copy)]
 pub struct VmHooks {
     /// Deliver a term to a local process.
@@ -54,14 +53,15 @@ pub struct VmHooks {
     pub port_alive: Option<PortAliveHook>,
     /// Send a command to a port.
     pub port_command: Option<PortCommandHook>,
-    /// Register a process monitor for a native resource.
-    pub monitor: Option<MonitorHook>,
-    /// Remove a process monitor.
-    pub demonitor: Option<fn(usize, &[u8; 32]) -> i32>,
     /// `enif_thread_type` value of the calling thread.
     pub thread_type: Option<fn() -> c_int>,
     /// Whether the process the calling thread executes a NIF for is exiting.
     pub current_process_exiting: Option<fn() -> bool>,
+    /// Send a resource monitor to a process (`erts_proc_sig_send_monitor`); false when the
+    /// process cannot receive it.
+    pub resource_monitor: Option<ResourceMonitorHook>,
+    /// Send a demonitor signal for a resource monitor (`erts_proc_sig_send_demonitor`).
+    pub resource_demonitor: Option<fn(Term, u64)>,
 }
 static HOOKS: OnceLock<Mutex<VmHooks>> = OnceLock::new();
 pub(crate) fn hooks() -> &'static Mutex<VmHooks> {
@@ -94,8 +94,7 @@ fn load(p: *const Term) -> Term {
 /// Write a term to caller-provided storage, if any.
 fn store(out: *mut Term, value: Term) {
     if !out.is_null() {
-        // SAFETY: The NIF caller retains this storage for the callback.
-        unsafe { *out = value }
+        put(out, value)
     }
 }
 /// The calling process of a NIF environment.
@@ -121,7 +120,7 @@ pub extern "C" fn enif_clear_env(e: *mut ErlNifEnv) {
         return;
     };
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let env = unsafe { &mut *e };
+    let env = deref_mut(e);
     if env.independent {
         *env = ErlNifEnv::independent()
     }
@@ -317,44 +316,6 @@ pub extern "C" fn enif_select_x(
     })
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn enif_monitor_process(
-    _: *mut ErlNifEnv,
-    obj: *mut c_void,
-    pid: *const Term,
-    monitor: *mut [u8; 32],
-) -> c_int {
-    if pid.is_null() || monitor.is_null() {
-        return -1;
-    };
-    let Some(hook) = hooks().lock().unwrap().monitor else {
-        return 1;
-    };
-    hook(
-        obj as usize,
-        load(pid),
-        // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-        unsafe { &mut *monitor },
-    )
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn enif_demonitor_process(
-    _: *mut ErlNifEnv,
-    obj: *mut c_void,
-    monitor: *const [u8; 32],
-) -> c_int {
-    if monitor.is_null() {
-        return -1;
-    };
-    let Some(hook) = hooks().lock().unwrap().demonitor else {
-        return 1;
-    };
-    hook(
-        obj as usize,
-        // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-        unsafe { &*monitor },
-    )
-}
-#[unsafe(no_mangle)]
 pub extern "C" fn enif_compare_monitors(a: *const [u8; 32], b: *const [u8; 32]) -> c_int {
     if a.is_null() || b.is_null() {
         return 0;
@@ -368,10 +329,10 @@ pub extern "C" fn enif_make_monitor_term(e: *mut ErlNifEnv, m: *const [u8; 32]) 
         return terms::enif_make_badarg(e);
     };
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let bytes = unsafe { &*m };
+    let bytes = deref(m);
     let id = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let env = unsafe { &mut *e };
+    let env = deref_mut(e);
     TermBuilder::new(&mut env.heap)
         .local_ref(arinsal_bifs::ordinary_ref_words(id))
         .unwrap_or_else(|_| terms::enif_make_badarg(e))
@@ -408,18 +369,58 @@ pub extern "C" fn enif_binary_to_term(
         return 0;
     };
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let bytes = slice(data, len);
     let Ok((owned, consumed)) = arinsal_etf::decode_prefix(bytes) else {
         return 0;
     };
+    // ERL_NIF_BIN2TERM_SAFE: a term that would create an atom fails (binary_to_term/2 [safe]).
+    if opts == 0x2000_0000 && has_new_atom(&owned) {
+        return 0;
+    }
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let env = unsafe { &mut *e };
+    let env = deref_mut(e);
     let Ok(decoded) = from_owned(&owned, &mut env.heap) else {
         return 0;
     };
-    // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    unsafe { *out = decoded };
+    put(out, decoded);
     consumed
+}
+
+/// Whether decoding `term` would create an atom (or a node name).
+fn has_new_atom(term: &arinsal_etf::OwnedTerm) -> bool {
+    use arinsal_etf::OwnedTerm as T;
+    let new = |name: &str| arinsal_term::global_atoms().get(name).is_none();
+    match term {
+        T::Atom(name) => new(name),
+        T::List { elems, tail } => elems.iter().any(has_new_atom) || has_new_atom(tail),
+        T::Tuple(items) => items.iter().any(has_new_atom),
+        T::Map(pairs) => pairs
+            .iter()
+            .any(|(k, v)| has_new_atom(k) || has_new_atom(v)),
+        T::Pid { node, .. } | T::Port { node, .. } | T::Ref { node, .. } => new(node),
+        T::Export {
+            module, function, ..
+        } => new(module) || new(function),
+        T::Fun {
+            module,
+            pid,
+            free_vars,
+            ..
+        } => new(module) || has_new_atom(pid) || free_vars.iter().any(has_new_atom),
+        T::Record {
+            module,
+            name,
+            fields,
+            ..
+        } => {
+            new(module)
+                || new(name)
+                || fields
+                    .iter()
+                    .any(|(field, value)| new(field) || has_new_atom(value))
+        }
+        _ => false,
+    }
 }
 
 fn freq(unit: c_int) -> Option<i128> {
@@ -438,32 +439,32 @@ pub extern "C" fn enif_convert_time_unit(n: i64, from: c_int, to: c_int) -> i64 
     };
     i64::try_from((n as i128 * t).div_euclid(f)).unwrap_or(i64::MIN)
 }
-static START: OnceLock<Instant> = OnceLock::new();
+/// Port of erts/emulator/beam/erl_nif.c (enif_monotonic_time, enif_time_offset,
+/// enif_now_time), OTP-29.1.1: the clocks are the ones of `erlang:monotonic_time/0`,
+/// `erlang:time_offset/0` and `erlang:now/0`.
+fn convert_nanos(nanos: i128, unit: c_int) -> i64 {
+    let Some(f) = freq(unit) else { return i64::MIN };
+    i64::try_from((nanos * f).div_euclid(1_000_000_000)).unwrap_or(i64::MIN)
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_monotonic_time(unit: c_int) -> i64 {
-    let Some(f) = freq(unit) else { return i64::MIN };
-    let nanos = START.get_or_init(Instant::now).elapsed().as_nanos() as i128;
-    i64::try_from(nanos * f / 1_000_000_000).unwrap_or(i64::MIN)
+    convert_nanos(arinsal_bifs::monotonic_time_nanos(), unit)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_time_offset(unit: c_int) -> i64 {
-    let Some(f) = freq(unit) else { return i64::MIN };
-    let wall = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i128;
-    let mono = START.get_or_init(Instant::now).elapsed().as_nanos() as i128;
-    i64::try_from((wall - mono) * f / 1_000_000_000).unwrap_or(i64::MIN)
+    match arinsal_bifs::time_offset_nanos_value() {
+        Some(offset) => convert_nanos(offset, unit),
+        None => i64::MIN,
+    }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_now_time(e: *mut ErlNifEnv) -> Term {
-    let micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64;
+    let Ok(micros) = arinsal_bifs::next_now_micros() else {
+        return terms::enif_make_badarg(e);
+    };
     let parts = [
-        Term::small(micros / 1_000_000_000).unwrap(),
-        Term::small((micros / 1_000_000) % 1000).unwrap(),
+        Term::small(micros / 1_000_000_000_000).unwrap(),
+        Term::small((micros / 1_000_000) % 1_000_000).unwrap(),
         Term::small(micros % 1_000_000).unwrap(),
     ];
     terms::enif_make_tuple_from_array(e, parts.as_ptr(), 3)
@@ -485,16 +486,31 @@ pub extern "C" fn enif_cpu_time(e: *mut ErlNifEnv) -> Term {
     ];
     terms::enif_make_tuple_from_array(e, parts.as_ptr(), 3)
 }
-static UNIQUE: AtomicU64 = AtomicU64::new(0);
+// Port of erts/emulator/beam/erl_bif_unique.c (enif_make_unique_integer via
+// erts_make_unique_integer): ERL_NIF_UNIQUE_POSITIVE is 1, ERL_NIF_UNIQUE_MONOTONIC is 2.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_make_unique_integer(e: *mut ErlNifEnv, properties: c_int) -> Term {
-    let n = UNIQUE.fetch_add(1, Ordering::Relaxed);
-    let value = if properties & 1 != 0 {
-        n as i64
-    } else {
-        -(n as i64) - 1
-    };
-    terms::enif_make_long(e, value)
+    let positive = properties & 1 != 0;
+    if properties & 2 != 0 {
+        if positive {
+            let value = arinsal_bifs::next_unique_monotonic_positive();
+            return match i64::try_from(value) {
+                Ok(small) => terms::enif_make_long(e, small),
+                Err(_) => terms::enif_make_ulong(e, value),
+            };
+        }
+        return terms::enif_make_long(e, arinsal_bifs::next_unique_monotonic());
+    }
+    match arinsal_bifs::next_unique_integer(positive) {
+        arinsal_bifs::UniqueInt::Small(value) => terms::enif_make_long(e, value),
+        arinsal_bifs::UniqueInt::Big(value) => {
+            // SAFETY: the NIF passes its live environment.
+            let env = deref_mut(e);
+            TermBuilder::new(&mut env.heap)
+                .int_from_bigint(&value)
+                .unwrap_or_else(|_| terms::enif_make_badarg(e))
+        }
+    }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_getenv(key: *const c_char, value: *mut c_char, size: *mut usize) -> c_int {
@@ -502,15 +518,14 @@ pub extern "C" fn enif_getenv(key: *const c_char, value: *mut c_char, size: *mut
         return -1;
     };
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let key = unsafe { CStr::from_ptr(key) }.to_string_lossy();
+    let key = cstr(key).to_string_lossy();
     let Ok(s) = std::env::var(key.as_ref()) else {
         return 1;
     };
     let data = s.as_bytes();
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
     let cap = unsafe { *size };
-    // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    unsafe { *size = data.len() + 1 };
+    put(size, data.len() + 1);
     if cap < data.len() + 1 || value.is_null() {
         return -2;
     };

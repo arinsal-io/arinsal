@@ -28,6 +28,20 @@ pub fn copy_term<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Term,
     copy_struct_x(root, size, dst, None)
 }
 
+/// `copy_struct` into `dst` using a size already returned by [`crate::size_object`] for `root`.
+/// Port of erts/emulator/beam/copy.c:647 (`copy_struct_x`), OTP-29.1.1.
+pub fn copy_struct<H: HeapAlloc + ?Sized>(
+    root: Term,
+    dst: &mut H,
+    size: usize,
+) -> Result<Term, TermError> {
+    if root.is_immed() || size == 0 {
+        return Ok(root);
+    }
+    validate_destination(root, dst)?;
+    copy_struct_x(root, size, dst, None)
+}
+
 /// Copy a term, keeping references to literals outside the collector's purge area.
 /// `literals` must be the snapshot used to size the destination.
 /// Port of erts/emulator/beam/copy.c:647 (copy_struct_x with a litopt), OTP-29.1.1.
@@ -456,6 +470,7 @@ fn copy_sub_bits<H: HeapAlloc + ?Sized>(
     Ok(())
 }
 
+#[inline(always)]
 pub(crate) fn copy_binary_to_buffer(dst: &mut [u8], src: &[u8], src_offset: usize, size: usize) {
     // Port of erts/emulator/beam/erl_bits.h:541 (`copy_binary_to_buffer`), OTP-29.1.1.
     // `src` / `dst` are the live windows the caller already bounded.

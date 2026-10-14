@@ -30,14 +30,16 @@ pub use atom::{
     global_atoms, set_atom_table_limit,
 };
 pub use bits::{
-    ExternalBinary, RefcBinary, SUB_BITS_MUTABLE, SUB_BITS_VOLATILE, WritableBinary,
-    binary_memory_bytes, binary_offset_adjustment, erts_bs_private_append_checked,
-    erts_bs_private_append_fast, install_private_append_overhead, is_match_context,
-    is_writable_binary, match_position, set_match_position, sub_bits_flags, writable_bytes_mut,
-    writable_capacity, writable_extend_private, writable_finalize, writable_gc_visit,
+    BinaryOwner, ExternalBinary, PrivateAppendUpdate, RefcBinary, SUB_BITS_MUTABLE,
+    SUB_BITS_VOLATILE, WritableBinary, binary_memory_bytes, binary_offset_adjustment, binary_owner,
+    erts_bs_private_append_checked, erts_bs_private_append_checked_with_update,
+    erts_bs_private_append_fast, erts_bs_private_append_fast_with_update, external_binary_magic,
+    is_match_context, is_writable_binary, match_position, set_match_position, sub_bits_flags,
+    writable_bytes_mut, writable_capacity, writable_extend_private, writable_finalize,
+    writable_gc_visit,
 };
 pub use copy::{
-    SharedCopyCache, copy_shared, copy_struct_litopt, copy_term, copy_term_litopt,
+    SharedCopyCache, copy_shared, copy_struct, copy_struct_litopt, copy_term, copy_term_litopt,
     copy_term_preserving_sharing, copy_term_preserving_sharing_with_cache,
 };
 pub use fun::{
@@ -87,7 +89,8 @@ pub use region::{
     SEND_COPY_LIMIT_WORDS, SharedRoot, is_region_term, region_owner, seal_for_send,
 };
 pub use rwmutex::{
-    FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, set_reader_group, set_reader_groups,
+    FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, is_scheduler_thread,
+    set_reader_group, set_reader_groups,
 };
 pub use views::{BigRef, FlatMapRef, FloatRef, ListIter};
 
