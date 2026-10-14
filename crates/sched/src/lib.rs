@@ -5215,13 +5215,9 @@ impl<T: Task> Scheduler<T> {
         if !simulated {
             for (id, local) in locals.into_iter().enumerate() {
                 let inner = inner.clone();
-                // Port of erts/emulator/beam/erl_process.c:8944 (erts_start_schedulers, thread name), OTP-29.1.1.
-                threads.push(
-                    thread::Builder::new()
-                        .name(format!("erts_sched_{}", id + 1))
-                        .spawn(move || worker_loop(inner, id, local.into_local()))
-                        .expect("spawn scheduler thread"),
-                );
+                threads.push(thread::spawn(move || {
+                    worker_loop(inner, id, local.into_local())
+                }));
             }
             // Port of erts/emulator/beam/erl_process.c:8890 (erts_start_schedulers, dirty
             // scheduler threads), OTP-29.1.1.
