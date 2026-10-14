@@ -44,6 +44,7 @@ const ZSTD: &[&str] = &[
     "ZstdCompressContext",
     "ZstdDecompressContext",
     "ZstdCompressDict",
+    "ZstdCompressDict",
     "true",
     "false",
     "undefined",

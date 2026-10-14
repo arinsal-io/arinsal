@@ -2333,6 +2333,9 @@ impl Vm {
                     // OTP-29.1.1: a static NIF flagged dirty first moves the process to a
                     // dirty scheduler of its class, which executes this body again.
                     let module_name = self.code.modules[module_id].name.as_str();
+                    if module_name == "zstd" {
+                        crate::native_helpers::note_zstd_caller(p);
+                    }
                     let to_dirty = if pending.is_none()
                         && matches!(module_name, "prim_file" | "prim_tty" | "zstd")
                     {

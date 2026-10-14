@@ -1,9 +1,13 @@
 //! OTP 29.1.1 `zlib` and `zstd` NIFs backed by stock zlib and zstd 1.5.7.
 //!
-//! Resource handles are local refs until stage 4 adds VM resource terms. The
-//! `call_with_pid` entry point checks the owner; `lookup` uses an anonymous
-//! caller because the frozen `Ctx` contract has no process identity yet.
+//! `zlib` resource handles are local refs until stage 4 adds VM resource terms. The
+//! `call_with_pid` entry point checks the owner; the `zlib` entries of `lookup` use an
+//! anonymous caller because the frozen `Ctx` contract has no process identity yet.
+//!
+//! The `zstd` NIFs take their arguments as terms. Their resources are magic references
+//! and `enif_self` is [`set_caller`], which the VM calls before it runs a `zstd` NIF.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
@@ -15,6 +19,24 @@ mod zlib;
 mod zstd;
 
 pub(crate) type Outcome = Result<O, Fault>;
+
+thread_local! {
+    static CALLER: Cell<Option<Term>> = const { Cell::new(None) };
+}
+
+/// Record the process that runs the built-in `zstd` NIF about to be called on this thread.
+///
+/// This is `enif_self` for the `zstd` NIFs: `BifFn` has no process identity, so the VM sets the
+/// caller's pid (an immediate local pid term, `None` outside a scheduler) before it enters the
+/// NIF, on the thread that runs it. A dirty job sets it on the dirty scheduler thread.
+pub fn set_caller(pid: Option<Term>) {
+    CALLER.with(|caller| caller.set(pid));
+}
+
+/// The caller recorded by [`set_caller`] on this thread.
+pub(crate) fn caller() -> Option<Term> {
+    CALLER.with(Cell::get)
+}
 
 #[derive(Debug)]
 pub(crate) enum Fault {
@@ -35,13 +57,6 @@ pub(crate) fn number(n: &O) -> Result<i32, Fault> {
     match n {
         O::Int(x) => (*x).try_into().map_err(|_| Fault::Badarg),
         O::BigInt(x) => x.to_i32().ok_or(Fault::Badarg),
-        _ => Err(Fault::Badarg),
-    }
-}
-pub(crate) fn unsigned(n: &O) -> Result<u64, Fault> {
-    match n {
-        O::Int(x) => (*x).try_into().map_err(|_| Fault::Badarg),
-        O::BigInt(x) => x.to_u64().ok_or(Fault::Badarg),
         _ => Err(Fault::Badarg),
     }
 }
@@ -135,11 +150,17 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn retain_export(&mut self, value: Arc<ExportEntry>) {
         self.0.retain_export(value)
     }
+    fn retain_magic(&mut self, value: Arc<arinsal_term::MagicRef>) {
+        self.0.retain_magic(value)
+    }
+    fn supports_magic(&self) -> bool {
+        self.0.supports_magic()
+    }
 }
 
 /// Invoke a registered NIF with the VM caller PID for resource ownership checks.
-/// `caller` must be a local PID term, supplied by the VM when it gains pid-aware
-/// NIF dispatch. `None` is reserved for the frozen `BifFn` compatibility path.
+/// `caller` must be a local PID term. `None` is reserved for the frozen `BifFn`
+/// compatibility path. A `zstd` NIF runs with `caller` as its [`set_caller`] process.
 pub fn call_with_pid(
     ctx: &mut Ctx<'_>,
     module: &str,
@@ -147,6 +168,17 @@ pub fn call_with_pid(
     args: &[Term],
     caller: Option<Term>,
 ) -> Result<Term, BifError> {
+    if module == "zstd" {
+        let function = u8::try_from(args.len())
+            .ok()
+            .and_then(|arity| zstd::lookup(name, arity))
+            .ok_or(BifError::Unsupported("unknown NIF"))?;
+        let previous = self::caller();
+        set_caller(caller);
+        let result = function(ctx, args);
+        set_caller(previous);
+        return result;
+    }
     let owned = args
         .iter()
         .map(|t| to_owned(*t).map_err(|_| BifError::BADARG))
@@ -159,7 +191,6 @@ pub fn call_with_pid(
     }
     let result = match module {
         "zlib" => zlib::dispatch(name, &owned, &pid),
-        "zstd" => zstd::dispatch(name, &owned, &pid),
         _ => return Err(BifError::Unsupported("unknown NIF module")),
     };
     let mut heap = Heap(&mut ctx.heap);
@@ -198,30 +229,6 @@ entry!(z_cs, "zlib", "clearStash_nif");
 entry!(z_ss, "zlib", "setStash_nif");
 entry!(z_gs, "zlib", "getStash_nif");
 entry!(z_enq, "zlib", "enqueue_nif");
-entry!(s_ic, "zstd", "init_compress_nif");
-entry!(s_id, "zstd", "init_decompress_nif");
-entry!(s_lcd, "zstd", "load_compress_dictionary_nif");
-entry!(s_l2d, "zstd", "load_decompress_dictionary_nif");
-entry!(s_rcd, "zstd", "ref_compress_dictionary_nif");
-entry!(s_rdd, "zstd", "ref_decompress_dictionary_nif");
-entry!(s_scp, "zstd", "set_compress_parameter_nif");
-entry!(s_gcp, "zstd", "get_compress_parameter_nif");
-entry!(s_sdp, "zstd", "set_decompress_parameter_nif");
-entry!(s_gdp, "zstd", "get_decompress_parameter_nif");
-entry!(s_ps, "zstd", "set_pledged_src_size_nif");
-entry!(s_c, "zstd", "compress_stream_nif");
-entry!(s_d, "zstd", "decompress_stream_nif");
-entry!(s_cr, "zstd", "compress_reset_nif");
-entry!(s_dr, "zstd", "decompress_reset_nif");
-entry!(s_cc, "zstd", "compress_close_nif");
-entry!(s_dc, "zstd", "decompress_close_nif");
-entry!(s_cd, "zstd", "create_cdict_nif");
-entry!(s_dd, "zstd", "create_ddict_nif");
-entry!(s_gcid, "zstd", "getDictId_fromCDict_nif");
-entry!(s_gdid, "zstd", "getDictId_fromDDict_nif");
-entry!(s_gid, "zstd", "getDictId_fromDict_nif");
-entry!(s_gfid, "zstd", "getDictId_fromFrame_nif");
-entry!(s_fh, "zstd", "get_frame_header_nif");
 
 /// Return the implementation of a `zlib` or `zstd` NIF entry.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
@@ -245,30 +252,7 @@ pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
         ("zlib", "setStash_nif", 2) => z_ss,
         ("zlib", "getStash_nif", 1) => z_gs,
         ("zlib", "enqueue_nif", 2) => z_enq,
-        ("zstd", "init_compress_nif", 0) => s_ic,
-        ("zstd", "init_decompress_nif", 0) => s_id,
-        ("zstd", "load_compress_dictionary_nif", 2) => s_lcd,
-        ("zstd", "load_decompress_dictionary_nif", 2) => s_l2d,
-        ("zstd", "ref_compress_dictionary_nif", 2) => s_rcd,
-        ("zstd", "ref_decompress_dictionary_nif", 2) => s_rdd,
-        ("zstd", "set_compress_parameter_nif", 3) => s_scp,
-        ("zstd", "get_compress_parameter_nif", 2) => s_gcp,
-        ("zstd", "set_decompress_parameter_nif", 3) => s_sdp,
-        ("zstd", "get_decompress_parameter_nif", 2) => s_gdp,
-        ("zstd", "set_pledged_src_size_nif", 2) => s_ps,
-        ("zstd", "compress_stream_nif", 3) => s_c,
-        ("zstd", "decompress_stream_nif", 3) => s_d,
-        ("zstd", "compress_reset_nif", 1) => s_cr,
-        ("zstd", "decompress_reset_nif", 1) => s_dr,
-        ("zstd", "compress_close_nif", 1) => s_cc,
-        ("zstd", "decompress_close_nif", 1) => s_dc,
-        ("zstd", "create_cdict_nif", 2) => s_cd,
-        ("zstd", "create_ddict_nif", 1) => s_dd,
-        ("zstd", "getDictId_fromCDict_nif", 1) => s_gcid,
-        ("zstd", "getDictId_fromDDict_nif", 1) => s_gdid,
-        ("zstd", "getDictId_fromDict_nif", 1) => s_gid,
-        ("zstd", "getDictId_fromFrame_nif", 1) => s_gfid,
-        ("zstd", "get_frame_header_nif", 1) => s_fh,
+        ("zstd", name, arity) => return zstd::lookup(name, arity),
         _ => return None,
     })
 }

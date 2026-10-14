@@ -493,7 +493,11 @@ pub(crate) fn static_nif_job(
     }
     let args = process.x.get(..usize::from(arity))?.to_vec();
     let fcalls = process.reductions;
+    let zstd_caller = (module == "zstd").then(|| process.self_pid.and_then(|pid| pid.to_term()));
     Some(crate::dirty::static_nif_job(move |heap| {
+        if let Some(caller) = zstd_caller {
+            arinsal_nif_zlib::set_caller(caller);
+        }
         let mut fcalls = fcalls;
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::calls::call_bif(heap, &mut fcalls, entry, &args)
@@ -529,6 +533,9 @@ pub(crate) fn run_static_nif(
     crate::natives::nif::refresh_hub_native(process);
     if module == "prim_tty" {
         crate::natives::tty::note_caller_native(process);
+    }
+    if module == "zstd" {
+        note_zstd_caller(process);
     }
     let args = process.x[..usize::from(arity)].to_vec();
     let pending = process
@@ -679,6 +686,9 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
     if nif.module == "prim_tty" {
         crate::natives::tty::note_caller_native(process);
     }
+    if nif.module == "zstd" {
+        note_zstd_caller(process);
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::calls::call_bif(
             &mut process.heap,
@@ -726,6 +736,12 @@ pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64
         result,
         (BOUND_NIF, &site.module, &site.function, site.arity),
     )
+}
+
+/// `enif_self` for the built-in `zstd` NIFs: record the calling process, which owns the
+/// contexts they create, on the thread that runs the NIF.
+pub(crate) fn note_zstd_caller(process: &crate::Process) {
+    arinsal_nif_zlib::set_caller(process.self_pid.and_then(|pid| pid.to_term()));
 }
 
 /// The dirty scheduler class static NIF `module:function/arity` is flagged with in its library's
