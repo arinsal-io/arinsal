@@ -1,17 +1,18 @@
 //! Term-oriented NIF entry points.
+use crate::raw::{binary_view, cons, cstr, deref_mut, float_view, list_iter, slice, tuple_view};
 use crate::{ErlNifBinary, ErlNifEnv, bits, put, term};
 use arinsal_term::{
-    ListIter, Term, TermBuilder, TermKind, cmp, copy_term, exact_eq, global_atoms,
-    internal_salted_hash, make_hash2, size_object, writable_bytes_mut,
+    Term, TermBuilder, TermKind, cmp, copy_term, exact_eq, global_atoms, internal_salted_hash,
+    make_hash2, size_object, writable_bytes_mut,
 };
 use num_traits::ToPrimitive;
-use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ulong, c_void};
+use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::hint::black_box;
 use std::ptr;
 
 fn env<'a>(p: *mut ErlNifEnv) -> &'a mut ErlNifEnv {
     // SAFETY: all NIF callbacks are passed a live host environment.
-    unsafe { &mut *p }
+    deref_mut(p)
 }
 fn integer(t: Term) -> Option<i128> {
     if let Some(n) = t.as_small() {
@@ -39,7 +40,7 @@ fn encode(text: &str, encoding: c_int) -> Option<Vec<u8>> {
 }
 fn binary_bytes(t: Term) -> Option<&'static [u8]> {
     // SAFETY: the caller owns the term's live heap throughout this ABI call.
-    let view = unsafe { t.binary_ref() }?;
+    let view = binary_view(t)?;
     if view.start_bit() % 8 != 0 || view.bit_len() % 8 != 0 {
         return None;
     }
@@ -139,7 +140,7 @@ pub extern "C" fn enif_term_type(_: *mut ErlNifEnv, t: Term) -> c_int {
         TermKind::Atom => 1,
         TermKind::Bitstring => 2,
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-        TermKind::Number if t.as_small().is_none() && unsafe { t.float_ref() }.is_some() => 3,
+        TermKind::Number if t.as_small().is_none() && float_view(t).is_some() => 3,
         TermKind::Number => 5,
         TermKind::Fun => 4,
         TermKind::List | TermKind::Nil => 6,
@@ -200,7 +201,7 @@ pub extern "C" fn enif_get_uint(_: *mut ErlNifEnv, t: Term, out: *mut c_uint) ->
 pub extern "C" fn enif_get_double(_: *mut ErlNifEnv, t: Term, out: *mut f64) -> c_int {
     if let Some(n) =
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-        unsafe { t.float_ref() }
+        float_view(t)
     {
         if !out.is_null() {
             put(out, n.get())
@@ -257,7 +258,7 @@ pub extern "C" fn enif_make_atom(e: *mut ErlNifEnv, name: *const c_char) -> Term
         return enif_make_badarg(e);
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
+    let bytes = cstr(name).to_bytes();
     enif_make_atom_len(e, bytes.as_ptr().cast(), bytes.len())
 }
 #[unsafe(no_mangle)]
@@ -266,7 +267,7 @@ pub extern "C" fn enif_make_atom_len(e: *mut ErlNifEnv, name: *const c_char, len
         return enif_make_badarg(e);
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let bytes = unsafe { std::slice::from_raw_parts(name.cast::<u8>(), len) };
+    let bytes = slice(name.cast::<u8>(), len);
     let Some(s) = decode(bytes, 1) else {
         return enif_make_badarg(e);
     };
@@ -286,7 +287,7 @@ pub extern "C" fn enif_make_existing_atom(
         return 0;
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
+    let bytes = cstr(name).to_bytes();
     enif_make_existing_atom_len(e, bytes.as_ptr().cast(), bytes.len(), out, enc)
 }
 #[unsafe(no_mangle)]
@@ -301,7 +302,7 @@ pub extern "C" fn enif_make_existing_atom_len(
         return 0;
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let bytes = unsafe { std::slice::from_raw_parts(name.cast::<u8>(), len) };
+    let bytes = slice(name.cast::<u8>(), len);
     let Some(s) = decode(bytes, enc) else {
         return 0;
     };
@@ -325,7 +326,7 @@ pub extern "C" fn enif_make_new_atom(
         return 0;
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
+    let bytes = cstr(name).to_bytes();
     enif_make_new_atom_len(e, bytes.as_ptr().cast(), bytes.len(), out, enc)
 }
 #[unsafe(no_mangle)]
@@ -340,7 +341,7 @@ pub extern "C" fn enif_make_new_atom_len(
         return 0;
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let bytes = unsafe { std::slice::from_raw_parts(name.cast::<u8>(), len) };
+    let bytes = slice(name.cast::<u8>(), len);
     let Some(s) = decode(bytes, enc) else {
         return 0;
     };
@@ -415,7 +416,7 @@ pub extern "C" fn enif_get_list_cell(
 ) -> c_int {
     if let Some((h, tl)) =
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-        unsafe { t.cons_ref() }
+        cons(t)
     {
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
         unsafe {
@@ -437,7 +438,7 @@ pub extern "C" fn enif_get_list_length(_: *mut ErlNifEnv, t: Term, out: *mut c_u
     let mut n = 0u32;
     while let Some((_, tail)) =
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-        unsafe { next.cons_ref() }
+        cons(next)
     {
         let Some(x) = n.checked_add(1) else { return 0 };
         n = x;
@@ -459,7 +460,7 @@ pub extern "C" fn enif_get_tuple(
     array: *mut *const Term,
 ) -> c_int {
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let Some(v) = (unsafe { t.tuple_ref() }) else {
+    let Some(v) = tuple_view(t) else {
         return 0;
     };
     if !arity.is_null() {
@@ -485,7 +486,7 @@ pub extern "C" fn enif_make_list_from_array(
         return enif_make_badarg(e);
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let items = unsafe { std::slice::from_raw_parts(arr, n as usize) };
+    let items = slice(arr, n as usize);
     built(env(e), |b| b.list_from_iter(items.iter().copied()))
 }
 #[unsafe(no_mangle)]
@@ -498,7 +499,7 @@ pub extern "C" fn enif_make_tuple_from_array(
         return enif_make_badarg(e);
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let items = unsafe { std::slice::from_raw_parts(arr, n as usize) };
+    let items = slice(arr, n as usize);
     built(env(e), |b| b.tuple(items))
 }
 #[unsafe(no_mangle)]
@@ -514,7 +515,7 @@ pub extern "C" fn enif_make_reverse_list(e: *mut ErlNifEnv, mut t: Term, out: *m
     let mut result = Term::NIL;
     while let Some((h, tail)) =
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-        unsafe { t.cons_ref() }
+        cons(t)
     {
         result = enif_make_list_cell(e, h, result);
         t = tail
@@ -533,7 +534,7 @@ pub extern "C" fn enif_make_string(e: *mut ErlNifEnv, s: *const c_char, enc: c_i
         return enif_make_badarg(e);
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let b = unsafe { CStr::from_ptr(s) }.to_bytes();
+    let b = cstr(s).to_bytes();
     enif_make_string_len(e, b.as_ptr().cast(), b.len(), enc)
 }
 #[unsafe(no_mangle)]
@@ -547,7 +548,7 @@ pub extern "C" fn enif_make_string_len(
         return enif_make_badarg(e);
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let b = unsafe { std::slice::from_raw_parts(s.cast::<u8>(), n) };
+    let b = slice(s.cast::<u8>(), n);
     let Some(text) = decode(b, enc) else {
         return enif_make_badarg(e);
     };
@@ -562,7 +563,7 @@ pub extern "C" fn enif_get_string_length(
 ) -> c_int {
     let mut count = 0u32;
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let mut iter = unsafe { ListIter::new(t) };
+    let mut iter = list_iter(t);
     for item in iter.by_ref() {
         let Some(n) = item.as_small() else { return 0 };
         if (enc == 1 && !(0..=255).contains(&n)) || (enc == 2 && char::from_u32(n as u32).is_none())
@@ -602,7 +603,7 @@ pub extern "C" fn enif_get_string(
     let mut data = Vec::new();
     for item in
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-        unsafe { ListIter::new(t) }
+        list_iter(t)
     {
         let n = item.as_small().unwrap() as u32;
         if enc == 1 {
@@ -731,7 +732,7 @@ pub extern "C" fn enif_inspect_binary(e: *mut ErlNifEnv, t: Term, out: *mut ErlN
             // that does not start on a byte boundary is copied to an aligned buffer owned
             // by the environment.
             // SAFETY: the caller owns the term's live heap throughout this ABI call.
-            let Some(view) = (unsafe { t.binary_ref() }) else {
+            let Some(view) = binary_view(t) else {
                 return 0;
             };
             if view.bit_len() % 8 != 0 || e.is_null() {
@@ -744,7 +745,7 @@ pub extern "C" fn enif_inspect_binary(e: *mut ErlNifEnv, t: Term, out: *mut ErlN
             env.scratch.push(bytes);
             let last = env.scratch.last().unwrap();
             // SAFETY: the buffer lives as long as the environment's scratch list, which only grows.
-            unsafe { std::slice::from_raw_parts(last.as_ptr(), last.len()) }
+            slice(last.as_ptr(), last.len())
         }
     };
     if out.is_null() {
@@ -759,33 +760,13 @@ pub extern "C" fn enif_inspect_binary(e: *mut ErlNifEnv, t: Term, out: *mut ErlN
     };
     1
 }
-/// Copy the bytes of a whole-byte binary, aligned or not, to a `malloc` block (for the
-/// shim's `enif_inspect_iovec`, which owns its parts and needs no environment).
-#[unsafe(no_mangle)]
-pub extern "C" fn arinsal_nif_binary_copy(t: Term, data: *mut *mut u8, size: *mut usize) -> c_int {
-    let Ok(bytes) = arinsal_bifs::binary_bytes(t) else {
-        return 0;
-    };
-    // SAFETY: malloc returns a block of the requested size or NULL.
-    let copy = unsafe { malloc(bytes.len().max(1)) }.cast::<u8>();
-    if copy.is_null() {
-        return 0;
-    }
-    // SAFETY: the block holds `bytes.len()` bytes; the shim passes writable out-parameters.
-    unsafe {
-        ptr::copy_nonoverlapping(bytes.as_ptr(), copy, bytes.len());
-        *data = copy;
-        *size = bytes.len();
-    }
-    1
-}
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_make_binary(e: *mut ErlNifEnv, bin: *mut ErlNifBinary) -> Term {
     if bin.is_null() {
         return enif_make_badarg(e);
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let b = unsafe { &mut *bin };
+    let b = deref_mut(bin);
     if b.data.is_null() && b.size > 0 {
         return enif_make_badarg(e);
     };
@@ -797,7 +778,7 @@ pub extern "C" fn enif_make_binary(e: *mut ErlNifEnv, bin: *mut ErlNifBinary) ->
         b.data
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let bytes = unsafe { std::slice::from_raw_parts(data, b.size) };
+    let bytes = slice(data, b.size);
     let result = built(env(e), |builder| builder.binary(bytes));
     if !b.ref_bin.is_null() {
         let allocations = &mut env(e).owned_binary_allocations;
@@ -857,7 +838,7 @@ fn append_iolist(t: Term, out: &mut Vec<u8>) -> bool {
     let mut next = t;
     while let Some((head, tail)) =
         // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-        unsafe { next.cons_ref() }
+        cons(next)
     {
         if !append_iolist(head, out) {
             return false;
@@ -997,7 +978,7 @@ pub extern "C" fn enif_schedule_nif(
         Vec::new()
     } else {
         // SAFETY: a positive arity requires a live argument array.
-        unsafe { std::slice::from_raw_parts(argv, argc as usize) }.to_vec()
+        slice(argv, argc as usize).to_vec()
     };
     env(e).scheduled = Some((f, flags, args));
     term(0)
@@ -1091,9 +1072,9 @@ pub extern "C" fn enif_make_map_from_arrays(
         return 0;
     };
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let k = unsafe { std::slice::from_raw_parts(keys, n) };
+    let k = slice(keys, n);
     // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    let v = unsafe { std::slice::from_raw_parts(vals, n) };
+    let v = slice(vals, n);
     let pairs: Vec<_> = k.iter().copied().zip(v.iter().copied()).collect();
     let Ok(m) = arinsal_maps::from_pairs(&pairs, &mut env(e).heap) else {
         return 0;
@@ -1171,7 +1152,7 @@ fn render_term(t: Term, out: &mut String, depth: usize) {
         return;
     }
     // SAFETY: the NIF callback retains this term's heap while formatting.
-    if let Some(float) = unsafe { t.float_ref() } {
+    if let Some(float) = float_view(t) {
         let formatted = format!("{:.6e}", float.get());
         let (mantissa, exponent) = formatted.split_once('e').unwrap_or((&formatted, "0"));
         let exponent: i32 = exponent.parse().unwrap_or(0);
@@ -1185,7 +1166,7 @@ fn render_term(t: Term, out: &mut String, depth: usize) {
     }
     if t.classify() == TermKind::List {
         // SAFETY: the NIF callback retains this list's heap while formatting.
-        let mut iter = unsafe { ListIter::new(t) };
+        let mut iter = list_iter(t);
         let mut text = String::new();
         let mut printable = true;
         for item in iter.by_ref() {
@@ -1221,7 +1202,7 @@ fn render_term(t: Term, out: &mut String, depth: usize) {
         TermKind::Tuple => {
             out.push('{');
             // SAFETY: the NIF callback retains this tuple's heap while formatting.
-            if let Some(v) = unsafe { t.tuple_ref() } {
+            if let Some(v) = tuple_view(t) {
                 for (i, item) in v.iter().enumerate() {
                     if i > 0 {
                         out.push(',')
@@ -1234,7 +1215,7 @@ fn render_term(t: Term, out: &mut String, depth: usize) {
         TermKind::List => {
             out.push('[');
             // SAFETY: the NIF callback retains this list's heap while formatting.
-            let mut iter = unsafe { ListIter::new(t) };
+            let mut iter = list_iter(t);
             let mut i = 0;
             for item in iter.by_ref() {
                 if i > 0 {

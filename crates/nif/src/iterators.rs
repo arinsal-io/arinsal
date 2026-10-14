@@ -1,5 +1,6 @@
 //! ErlNifMapIterator ABI over native map order.
 use crate::ErlNifEnv;
+use crate::raw::{deref, deref_mut};
 use arinsal_term::Term;
 use std::hint::black_box;
 
@@ -89,7 +90,7 @@ pub extern "C" fn enif_map_iterator_next(_: *mut ErlNifEnv, iter: *mut ErlNifMap
         return 0;
     };
     // SAFETY: The iterator remains live until its destroy call.
-    let it = unsafe { &mut *iter };
+    let it = deref_mut(iter);
     if it.idx <= it.size {
         it.idx += 1
     };
@@ -101,7 +102,7 @@ pub extern "C" fn enif_map_iterator_prev(_: *mut ErlNifEnv, iter: *mut ErlNifMap
         return 0;
     };
     // SAFETY: The iterator remains live until its destroy call.
-    let it = unsafe { &mut *iter };
+    let it = deref_mut(iter);
     if it.idx > 0 {
         it.idx -= 1
     };
@@ -118,7 +119,7 @@ pub extern "C" fn enif_map_iterator_get_pair(
         return 0;
     };
     // SAFETY: The iterator remains live until its destroy call.
-    let it = unsafe { &*iter };
+    let it = deref(iter);
     if it.idx == 0 || it.idx > it.size {
         return 0;
     };

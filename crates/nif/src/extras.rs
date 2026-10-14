@@ -1,7 +1,8 @@
 //! Independent environments, time, ETF, and VM extension hooks.
+use crate::raw::{cstr, deref, deref_mut, slice};
 use crate::{ErlNifBinary, ErlNifEnv, put, terms};
 use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned};
-use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::hint::black_box;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -119,7 +120,7 @@ pub extern "C" fn enif_clear_env(e: *mut ErlNifEnv) {
         return;
     };
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let env = unsafe { &mut *e };
+    let env = deref_mut(e);
     if env.independent {
         *env = ErlNifEnv::independent()
     }
@@ -328,10 +329,10 @@ pub extern "C" fn enif_make_monitor_term(e: *mut ErlNifEnv, m: *const [u8; 32]) 
         return terms::enif_make_badarg(e);
     };
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let bytes = unsafe { &*m };
+    let bytes = deref(m);
     let id = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let env = unsafe { &mut *e };
+    let env = deref_mut(e);
     TermBuilder::new(&mut env.heap)
         .local_ref(arinsal_bifs::ordinary_ref_words(id))
         .unwrap_or_else(|_| terms::enif_make_badarg(e))
@@ -368,7 +369,7 @@ pub extern "C" fn enif_binary_to_term(
         return 0;
     };
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let bytes = slice(data, len);
     let Ok((owned, consumed)) = arinsal_etf::decode_prefix(bytes) else {
         return 0;
     };
@@ -377,7 +378,7 @@ pub extern "C" fn enif_binary_to_term(
         return 0;
     }
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let env = unsafe { &mut *e };
+    let env = deref_mut(e);
     let Ok(decoded) = from_owned(&owned, &mut env.heap) else {
         return 0;
     };
@@ -504,7 +505,7 @@ pub extern "C" fn enif_make_unique_integer(e: *mut ErlNifEnv, properties: c_int)
         arinsal_bifs::UniqueInt::Small(value) => terms::enif_make_long(e, value),
         arinsal_bifs::UniqueInt::Big(value) => {
             // SAFETY: the NIF passes its live environment.
-            let env = unsafe { &mut *e };
+            let env = deref_mut(e);
             TermBuilder::new(&mut env.heap)
                 .int_from_bigint(&value)
                 .unwrap_or_else(|_| terms::enif_make_badarg(e))
@@ -517,7 +518,7 @@ pub extern "C" fn enif_getenv(key: *const c_char, value: *mut c_char, size: *mut
         return -1;
     };
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let key = unsafe { CStr::from_ptr(key) }.to_string_lossy();
+    let key = cstr(key).to_string_lossy();
     let Ok(s) = std::env::var(key.as_ref()) else {
         return 1;
     };

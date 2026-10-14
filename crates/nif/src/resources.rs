@@ -1,10 +1,11 @@
 //! C resource headers and magic reference ownership.
 use crate::Library;
+use crate::raw::{cstr, deref, deref_mut};
 use crate::{ErlNifEnv, ErlNifResourceTypeInit, put, terms};
 use arinsal_term::{ExternalBinary, MagicRef, Term, TermBuilder};
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::HashMap;
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::hint::black_box;
 use std::ptr;
 use std::sync::atomic::AtomicPtr;
@@ -314,7 +315,7 @@ fn name(p: *const c_char) -> Option<String> {
     } else {
         Some(
             // SAFETY: The resource allocation and callback remain live during this access.
-            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned(),
+            cstr(p).to_string_lossy().into_owned(),
         )
     }
 }
@@ -336,7 +337,7 @@ pub extern "C" fn enif_open_resource_type(
         return ptr::null_mut();
     }
     // SAFETY: the NIF load callback receives a live environment.
-    let env = unsafe { &*e };
+    let env = deref(e);
     let module = env.module.as_deref().unwrap_or_default();
     let key = format!("{module}:{kind_name}");
     let init = ErlNifResourceTypeInit {
@@ -364,7 +365,7 @@ pub extern "C" fn enif_open_resource_type_x(
         return ptr::null_mut();
     }
     // SAFETY: the NIF load callback receives a live environment.
-    let env = unsafe { &*e };
+    let env = deref(e);
     let module = env.module.as_deref().unwrap_or_default();
     let init = ErlNifResourceTypeInit {
         dtor: init.dtor,
@@ -394,7 +395,7 @@ pub extern "C" fn enif_init_resource_type(
         return ptr::null_mut();
     }
     // SAFETY: the NIF load callback receives a live environment.
-    let env = unsafe { &*e };
+    let env = deref(e);
     let module = env.module.as_deref().unwrap_or_default();
     let callbacks = ErlNifResourceTypeInit {
         dtor: if init.members >= 1 { init.dtor } else { None },
@@ -425,7 +426,7 @@ fn open_type(
     tried: *mut c_int,
 ) -> *mut c_void {
     // SAFETY: callers checked the load environment pointer.
-    let env = unsafe { &mut *e };
+    let env = deref_mut(e);
     let (op, address) = open_type_op(env, key, init, flags);
     if !tried.is_null() {
         put(tried, op)
@@ -559,7 +560,7 @@ pub extern "C" fn enif_make_resource(e: *mut ErlNifEnv, data: *mut c_void) -> Te
     };
     let magic = owner.magic_ref();
     // SAFETY: the host passes a live environment to this callback.
-    let env = unsafe { &mut *e };
+    let env = deref_mut(e);
     TermBuilder::new(&mut env.heap)
         .magic_ref(magic)
         .unwrap_or_else(|_| terms::enif_make_badarg(e))
@@ -606,7 +607,7 @@ pub extern "C" fn enif_make_resource_binary(
     // SAFETY: the magic owner retains the native resource containing these bytes.
     let external = unsafe { ExternalBinary::new(bytes.cast::<u8>(), size, owner.magic_ref()) };
     // SAFETY: The resource allocation and callback remain live during this access.
-    let env = unsafe { &mut *e };
+    let env = deref_mut(e);
     TermBuilder::new(&mut env.heap)
         .external_binary(external)
         .unwrap_or_else(|_| terms::enif_make_badarg(e))
