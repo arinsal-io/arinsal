@@ -2902,8 +2902,6 @@ impl Vm {
                         p.force_yield = false;
                         p.gc_live = 1;
                         sync_cursor(p, htop, &mut heap_dirty);
-                        p.module = module_id;
-                        p.ip = offset.saturating_add(1);
                         p.reductions = reds;
                         return Ok(RunState::Yield);
                     }
