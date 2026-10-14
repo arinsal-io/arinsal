@@ -62,12 +62,32 @@ run(Case) ->
         host -> host();
         sctp -> sctp();
         udp6drv -> udp6drv();
+        subbin -> subbin();
         stress -> stress()
     end.
 
 %% `inet` selects inet_udp without inet_db (same reason tcp tests pass tcp_module).
 udp(Extra) ->
     [inet, {ip, {127,0,0,1}} | Extra].
+
+subbin() ->
+    Block = list_to_binary([<<N:32>> || N <- lists:seq(1, 65)]),
+    <<_:100/binary, Tail/binary>> = Block,
+    <<_:3, Unaligned/binary>> = <<0:3, Block/binary>>,
+    <<_:8/binary, Mid:20/binary, _/binary>> = Block,
+    Inputs = [Tail, [Tail], [<<"x">>, Tail, <<"y">>, [Mid]], Unaligned, [7, Unaligned], Mid],
+    [subbin_send(Input) || Input <- Inputs].
+
+subbin_send(Data) ->
+    {ok, R} = gen_udp:open(0, udp([binary, {active, false}])),
+    {ok, Port} = inet:port(R),
+    {ok, S} = gen_udp:open(0, udp([binary])),
+    Sent = gen_udp:send(S, {127,0,0,1}, Port, Data),
+    Got = gen_udp:recv(R, 0, 2000),
+    gen_udp:close(S),
+    gen_udp:close(R),
+    Packet = case Got of {ok, {_, _, Bin}} -> Bin; Other -> Other end,
+    {iolist_size(Data), Sent, Packet =:= iolist_to_binary(Data)}.
 
 open() ->
     {ok, S} = gen_udp:open(0, udp([binary, {active, false}])),
@@ -390,6 +410,7 @@ fn gen_udp_matches_erts() {
         "host",
         "sctp",
         "udp6drv",
+        "subbin",
         "stress",
     ] {
         if case == "mcast" && !multicast_available {
