@@ -985,24 +985,6 @@ fn trace_continuation_advance(word: Term) -> Option<usize> {
     }
 }
 
-/// Interpreter equivalent of erts' `beam_return_trace` CP.
-// Port of erts/emulator/beam/beam_common.h:291-293 and beam_bp.c:1244-1246, OTP-29.1.1.
-pub(crate) fn return_trace_continuation() -> Term {
-    TRACE_RETURN_CONTINUATION
-}
-
-/// Interpreter equivalent of erts' `beam_exception_trace` CP.
-// Port of erts/emulator/beam/beam_common.h:291-293 and beam_bp.c:1244-1246, OTP-29.1.1.
-pub(crate) fn exception_trace_continuation() -> Term {
-    TRACE_EXCEPTION_CONTINUATION
-}
-
-/// Interpreter equivalent of erts' `beam_return_to_trace` CP.
-// Port of erts/emulator/beam/beam_common.h:291-293 and beam_bp.c:1228-1230, OTP-29.1.1.
-pub(crate) fn return_to_trace_continuation() -> Term {
-    TRACE_RETURN_TO_CONTINUATION
-}
-
 fn pack_indexed(module: usize, ip: usize) -> Option<u64> {
     let module = u64::try_from(module).ok()?;
     let ip = u64::try_from(ip).ok()?;

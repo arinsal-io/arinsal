@@ -2317,7 +2317,52 @@ impl Executor {
                                         process.native_pc = Some(code_ptr);
                                         break Ok(RunState::Yield);
                                     }
-                                    match crate::bif_traps::run_trapped_export(process, Some(ctx)) {
+                                    // Port of erts/emulator/beam/beam_bp.c:321-330 and
+                                    // erl_bif_trace.c (the bif return trap frame stays on the
+                                    // stack across BIF_TRAP), OTP-29.1.1: the call event of a
+                                    // traced BIF that trapped was emitted at the first call; the
+                                    // return or exception event belongs to the last slice.
+                                    let trapped_callee = process
+                                        .cold
+                                        .as_ref()
+                                        .filter(|cold| cold.traced_native_call.is_some())
+                                        .and_then(|cold| cold.bif_trap.as_ref())
+                                        .and_then(|pending| {
+                                            let atoms = global_atoms();
+                                            Some((
+                                                atoms.text(pending.callee.0)?.to_owned(),
+                                                atoms.text(pending.callee.1)?.to_owned(),
+                                                pending.arity,
+                                            ))
+                                        });
+                                    let trapped =
+                                        crate::bif_traps::run_trapped_export(process, Some(ctx));
+                                    if let Some((module, function, arity)) = &trapped_callee {
+                                        let outcome = match &trapped {
+                                            Some(Ok(crate::bif_traps::ResumeResult::Handler(
+                                                crate::bif_traps::HandlerResult::Done {
+                                                    value, ..
+                                                },
+                                            ))) => Some(Ok(*value)),
+                                            Some(Err(VmError::Trap(trap))) => {
+                                                crate::exceptions::trace_class_reason(
+                                                    process,
+                                                    trap.class,
+                                                    trap.reason,
+                                                )
+                                                .ok()
+                                                .map(Err)
+                                            }
+                                            _ => None,
+                                        };
+                                        if let Some(outcome) = outcome {
+                                            let args = vec![Term::NIL; *arity];
+                                            self.vm.trace_native_return_outcome(
+                                                process, ctx, module, function, &args, outcome,
+                                            );
+                                        }
+                                    }
+                                    match trapped {
                                         Some(Ok(crate::bif_traps::ResumeResult::Handler(
                                             crate::bif_traps::HandlerResult::Yield { .. },
                                         ))) => {

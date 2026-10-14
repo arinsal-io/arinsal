@@ -816,20 +816,38 @@ pub(crate) fn port_closed(runtime: &crate::process::Runtime, port: u64) {
     );
 }
 
+/// The tracer entry of `port` in `session`, dropped first when its tracer is gone.
+// Port of erts/emulator/beam/erl_trace.c:3322-3376 (is_tracer_ref_enabled: an enabled-check
+// that finds the tracer dead deletes the tracer ref of a port), OTP-29.1.1.
+fn live_port_entry(process: &Process, session: u64, port: u64) -> Option<Entry> {
+    let key = (scope(process), session, port);
+    let mut table = port_table().lock().unwrap();
+    let entry = table.get(&key)?;
+    let alive = match &entry.tracer {
+        Tracer::Pid(pid) => process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.scheduler().ok())
+            .is_some_and(|scheduler| scheduler.lookup(*pid)),
+        Tracer::Port(id) => process
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.ports.lock().unwrap().contains_key(id)),
+        Tracer::Default | Tracer::Module { .. } => true,
+    };
+    if alive {
+        return Some(entry.clone());
+    }
+    table.remove(&key);
+    None
+}
+
 pub(crate) fn port_flags(process: &Process, session: u64, port: u64) -> u64 {
-    port_table()
-        .lock()
-        .unwrap()
-        .get(&(scope(process), session, port))
-        .map_or(0, |entry| entry.flags)
+    live_port_entry(process, session, port).map_or(0, |entry| entry.flags)
 }
 
 pub(crate) fn port_tracer(process: &Process, session: u64, port: u64) -> Option<Tracer> {
-    port_table()
-        .lock()
-        .unwrap()
-        .get(&(scope(process), session, port))
-        .map(|entry| entry.tracer.clone())
+    live_port_entry(process, session, port).map(|entry| entry.tracer)
 }
 
 /// Emit a port event to its configured trace-session destinations.
@@ -872,7 +890,18 @@ pub(crate) fn emit_port_event_scoped(
         .filter(|((scope, _, id), entry)| {
             *scope == owner && *id == port && entry.flags & class != 0
         })
-        .map(|(_, entry)| entry.clone())
+        .map(|((_, session, _), entry)| (*session, entry.clone()))
+        // Port of erts/emulator/beam/erl_trace.c:2230-2290 (trace_port_send): a session whose
+        // send trace is off (`trace:send(Session, false, [])`) gets no send events.
+        .filter(|(session, _)| {
+            class & SEND == 0
+                || event_patterns()
+                    .lock()
+                    .unwrap()
+                    .get(&(owner, *session, "send"))
+                    .is_none_or(|pattern| pattern.enabled)
+        })
+        .map(|(_, entry)| entry)
         .collect::<Vec<_>>();
     if entries.is_empty() {
         return;
@@ -3565,7 +3594,22 @@ fn emit_filtered_without_ctx(
                 && entry.flags & class != 0
                 && session.is_none_or(|wanted| *sid == wanted)
         })
-        .map(|(_, entry)| entry.clone())
+        .map(|((_, sid, _), entry)| (*sid, entry.clone()))
+        // Port of erts/emulator/beam/erl_trace.c:795-800 (trace_send_session, `if (!te->on)`):
+        // a session whose send or receive trace is off gets no such event.
+        .filter(|(sid, _)| {
+            let event = match name {
+                "send" | "send_to_non_existing_process" => "send",
+                "receive" => "receive",
+                _ => return true,
+            };
+            event_patterns()
+                .lock()
+                .unwrap()
+                .get(&(scope(process), *sid, event))
+                .is_none_or(|pattern| pattern.enabled)
+        })
+        .map(|(_, entry)| entry)
         .collect::<Vec<_>>();
     let Some(subject_term) = subject.to_term() else {
         return;
