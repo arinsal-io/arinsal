@@ -13,13 +13,12 @@ use super::Message;
 use crate::{Process, VmError};
 use arinsal_sched::{RunCtx, Signal};
 
-/// Modules whose natives are all root only.
+/// Modules whose natives are all root only, except `module_info/0,1`.
 const ROOT_MODULES: &[&str] = &[
     "erts_debug",
     "erl_debugger",
     "erts_trace_cleaner",
     "erts_literal_area_collector",
-    "erl_ddll",
 ];
 
 /// Single natives that are root only.
@@ -73,6 +72,11 @@ pub(crate) const ROOT_ONLY: &[(&str, &str, u8)] = &[
     ("erts_internal", "create_dist_channel", 3),
     ("erts_internal", "dist_spawn_request", 4),
     ("erts_internal", "new_connection", 1),
+    // Driver loading. `erl_ddll:info/2`, `loaded_drivers/0` and `format_error_int/1` only read.
+    ("erl_ddll", "try_load", 3),
+    ("erl_ddll", "try_unload", 2),
+    ("erl_ddll", "monitor", 2),
+    ("erl_ddll", "demonitor", 1),
     // OS level.
     ("os", "set_signal", 2),
 ];
@@ -80,6 +84,10 @@ pub(crate) const ROOT_ONLY: &[(&str, &str, u8)] = &[
 /// Whether `module:function/arity` may only be called by root. Public for the isolation tests.
 #[doc(hidden)]
 pub fn root_only(module: &str, function: &str, arity: u8) -> bool {
+    // Introspection that every module answers; code loading and `code_server` call it.
+    if function == "module_info" && arity <= 1 {
+        return false;
+    }
     ROOT_MODULES.contains(&module) || super::listed(ROOT_ONLY, module, function, arity)
 }
 
@@ -137,7 +145,19 @@ pub(crate) fn destroy_namespace(process: &Process, ctx: &mut RunCtx<'_, Message>
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
-    runtime.namespaces.close(ns);
+    let closed = runtime.namespaces.close(ns);
+    // The namespace's code names become unreachable now; its instances are freed once its
+    // processes are gone.
+    if closed && let Some(entry) = runtime.namespaces.get(ns) {
+        crate::code_domains::drop_ns_code(
+            runtime,
+            ns,
+            &crate::code_domains::NsCode {
+                chain: entry.code_chain.clone(),
+                owns_first: entry.owns_code_domain,
+            },
+        );
+    }
     let Ok(scheduler) = runtime.scheduler() else {
         return;
     };

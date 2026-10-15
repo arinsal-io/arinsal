@@ -947,6 +947,11 @@ pub(crate) extern "C" fn persistent_term_get_1_light(
         return 0;
     };
     let found = process._persistent_terms.store().get(key);
+    // arl: a namespace reads OTP system keys through to the node store
+    let found = match found {
+        None if process.ns != 0 => crate::natives::sys::arl_root_system_term(process, key),
+        found => found,
+    };
     match found {
         Some(value) => crate::native_hooks::raw(value),
         None => {
@@ -974,11 +979,13 @@ pub(crate) extern "C" fn persistent_term_get_2_light(
     let Some(default) = crate::native_hooks::x_reg(process, 1) else {
         return 0;
     };
-    let value = process
-        ._persistent_terms
-        .store()
-        .get(key)
-        .unwrap_or(default);
+    let value = process._persistent_terms.store().get(key);
+    // arl: a namespace reads OTP system keys through to the node store
+    let value = match value {
+        None if process.ns != 0 => crate::natives::sys::arl_root_system_term(process, key),
+        value => value,
+    }
+    .unwrap_or(default);
     crate::native_hooks::raw(value)
 }
 

@@ -92,3 +92,36 @@ Fails before, passes after.
 Verified: fresh copy of bench/rest (deps from stock OTP, `_build` cleared, fresh MIX_HOME) builds
 mime, jason, plug_crypto, hpax, telemetry, telemetry_poller, thousand_island, plug, websock, bandit and rt
 with `mix compile` on Arinsal through a shim holding only the `erl` symlink.
+
+## Follow-up: build path on Arinsal
+
+`MIX_ENV=prod mix release --overwrite` now runs on Arinsal (shim with only the `erl` symlink) for
+bench/rest and bench/phxn, with deps fetched on stock OTP. The rest release (built with
+`include_erts: false`, `RELEASE_DISTRIBUTION=none`, `RT_PORT=...`) boots on Arinsal and answers curl.
+The phxn release boots and `eval` reports `[arinsal 0.0.1]` with phoenix 1.8.15 loaded.
+
+One blocker beyond the two above: `File.cp_r!` of `erts-*/bin` (Mix release copying ERTS) failed with
+`bad argument`. `file:copy/2` runs in `file_server`, after which every `file:write_file_info/2,3` call
+(Elixir's `File.chmod!`, `File.cp` mode copy) returned `badarg`.
+
+Root cause: all `prim_file` NIFs are dirty IO. Calling one from native code traps to the dirty scheduler
+(`trap_to_dirty_nif`, `crates/vm/src/native_helpers.rs`), and at switch-out the process keeps only as many X
+registers as the register count of the module it last interpreted (`process.module`), or `gc_live`. After a
+call to a small module such as `prim_buffer` (interpreted when `open` creates its buffer) that count was 3,
+so `set_time_nif/4` lost its fourth argument (`nil`), and the `try` in `write_file_info` turned the failure
+into `badarg`.
+
+Fix: `trap_to_dirty_nif` records the NIF arity as live (`gc_live`), the equivalent of the arity ERTS saves
+for a scheduled NIF.
+
+Test: `crates/cli/tests/dirty_nif_args.rs` (`ns_dirty_nif_keeps_all_arguments`) runs `file:copy/2` then
+`file:change_mode/2` on the real binary and compares with reference `erl`. It needs the booted system and a
+dirty scheduler, which `Vm::eval` does not have, so it is a CLI test. Fails before, passes after.
+
+`poc/multitenancy/tests/cloud_fake_e2e.sh` now runs `mix arinsal.deploy` on Arinsal; only
+`mix deps.get` stays on stock OTP, and Arinsal's Hex uses its own `HEX_HOME` under the work dir. It passes
+with `ARINSAL_SHIM=<target>/shim` pointing at a build containing these fixes (about 65 s). The default
+`mt-shim` is an older build.
+
+Not done: the release scripts of an `include_erts: true` release still start the stock ERTS copied into the
+release; the manager runs only `lib/` and `releases/` on its own runtime, so deploy does not need it.

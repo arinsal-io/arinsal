@@ -109,6 +109,52 @@
 - Tests: ns_port_tcp_listen_accept_in_ns, ns_port_cross_ns_refused, ns_ports_filtered,
   ns_port_spawn_driver_refused, ns_spawn_opt_group_leader_foreign.
 
+## Chunk 6: narrower RootOnly
+- `root_only()` is false for `module_info/0,1` of every module, so code loading, `code_server` and the module
+  table can introspect a module even when the rest of its natives are root only.
+- `erl_ddll` is no longer a whole-module entry: only `try_load/3`, `try_unload/2`, `monitor/2`, `demonitor/1` are
+  root only; `info/2`, `loaded_drivers/0` and `format_error_int/1` read and stay open (kernel code calls `info`).
+- Whole modules left: `erts_debug`, `erl_debugger`, `erts_trace_cleaner`, `erts_literal_area_collector`.
+  `erts_internal` is an explicit list only (system_monitor, spawn_system_process, system_check,
+  scheduler_wall_time, gather_*, trace*, suspend_process, process_flag/3, dirty_process_handle_signals,
+  notify_breakpoint_hit, the dist entries). I grepped kernel and stdlib for `erts_internal:` calls
+  (dynamic_node_name, get_dflags, get_creation, map_next, map_hashmap_children, map_to_tuple_keys, term_type,
+  cmp_term, list_to_integer, beamfile_chunk): none of them is on the list; the listed ones are tracing, dist
+  connection setup and statistics that a project does not run inside a namespace.
+- Tests: `ns_rootonly_module_info_allowed` (module_info/0,1 of the covered modules, `erl_ddll` readers) and
+  `poc/multitenancy/tests/ns_rootonly_e2e.sh`, which boots a node with the `arinsal` binary and, from a ns
+  process (root's code_server, application_controller and friends exposed, root's persistent terms copied the way
+  the boot does), calls `code:ensure_loaded/1` for a stdlib module that was not loaded yet, `application:load(sasl)`
+  and `module_info(module)` of `erl_ddll`, `erts_debug`, `erts_internal`, `erl_debugger`. The in-process VM tests
+  have no code_server, so this one needs the binary (`ARINSAL_BIN`, default `target-mt-ns/debug/arinsal`).
+- Without root's persistent terms in the ns, `code:ensure_loaded` and a module autoload fail with `badarg` in
+  `code_server:get_mode/0` (the per-namespace persistent_term store is empty). The boot copies them.
+
+## Chunk 7: holes found by the isolation gate
+- Refused link (`pid_guess_link`): the caller keeps its half (as for a dead target), so its exit sent an
+  `ExitLinked` to the guessed process. The receiver now ignores a link exit that has no recorded link
+  (erts does the same; the VM did not), `process.rs` hook `// arl:`. A refused link therefore leaves nothing
+  that can reach the other side, and an unlink that crosses an in-flight link exit no longer produces a stray
+  `EXIT`. `ns_link_refused_leaves_no_exit` covers it.
+- Held monitor (`pid_guess_monitor`): two causes.
+  1. The monitor slot stored no namespace, and a monitor flushed at process exit looked its (already gone)
+     watcher up, got "not found" and counted as root. `PendingProcMonitor.from_ns` now keeps the watcher's
+     namespace from the time it is held; publish and the deferred path use it.
+  2. The held monitor that a following signal to the same target releases (`deferred`) is gated on its own.
+     A monitor that passes but whose releasing signal is refused still goes out first.
+  `ns_monitor_refused_never_attaches` checks seven orderings (monitor then exit, receive, message, another
+  monitor, process exit) leave `monitored_by` at the root's own monitor only.
+  A sender that is not in the table counts as root only for senders that are not processes (ports); a process
+  that can be gone when its signal goes out must carry its namespace.
+- SHARED (`shared_service`): a shared receiver now accepts only messages (including alias replies) and monitors
+  from other namespaces. Links, exit signals, suspend, garbage_collect and every request
+  (`ns_may_signal`, so `process_info`, `is_process_alive`, `garbage_collect` on a shared service) are refused:
+  link gives `noproc`, exit is dropped. `Scheduler::ns_allows(.., open_to_shared)` carries the distinction.
+  `ns_shared_messages_and_monitor_only` covers it. Root to ns is unchanged.
+- Gate: `ns_attack` 20/20 and `ns_core` 29/29 with the JIT and with `ARINSAL_INTERP=1`.
+  Run these with erl on PATH: the harness skips (and "passes") when `erl` is missing, which hid the red row
+  for a while here.
+
 ## Microbench at ns 0
 `cargo run -r -p arinsal-sched --example bench -- <name>` (4 workers), 3 runs each on a busy machine, base is
 8ee3755 (before this work), new is the branch head. ns/op, best of 3:

@@ -76,6 +76,50 @@ ns_pterm_isolated() ->
          [root, none], [root_only, shared_key], r} -> ok;
         Other -> {bad, Other}
     end.
+
+ns_pterm_system_key_fallback() ->
+    Ns = mk(<<"acme">>),
+    ok = persistent_term:put(erl_prim_loader, root_loader),
+    ok = persistent_term:put({prim_socket, protocols}, root_protocols),
+    ok = persistent_term:put({erl_features, enabled_features}, root_features),
+    Res = in_ns(Ns, fun() ->
+        Read = [persistent_term:get(erl_prim_loader), persistent_term:get({prim_socket, protocols}),
+                persistent_term:get({erl_features, enabled_features}, none),
+                persistent_term:get({prim_socket, missing}, dflt)],
+        ErasedRoot = persistent_term:erase(erl_prim_loader),
+        StillRead = persistent_term:get(erl_prim_loader),
+        ok = persistent_term:put({prim_socket, protocols}, own),
+        Shadow = persistent_term:get({prim_socket, protocols}),
+        Keys = lists:sort([K || {K, _} <- persistent_term:get()]),
+        {Read, ErasedRoot, StillRead, Shadow, Keys}
+    end),
+    ok = persistent_term:put(erl_prim_loader, root_loader2),
+    Again = in_ns(Ns, fun() -> persistent_term:get(erl_prim_loader) end),
+    case {Res, persistent_term:get({prim_socket, protocols}), Again} of
+        {{[root_loader, root_protocols, root_features, dflt], false, root_loader, own,
+          [{prim_socket, protocols}]}, root_protocols, root_loader2} -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_pterm_root_secret_invisible() ->
+    Ns = mk(<<"acme">>),
+    Secrets = [root_secret, {my_app, secret}, {logger_config, x}, {socketx, 1}, {code_server_clone, 1},
+               {1, root}, [code_server], {{code_server}, 1}, {code_server}],
+    [ok = persistent_term:put(K, root) || K <- Secrets],
+    Res = in_ns(Ns, fun() ->
+        Leaks = [K || K <- Secrets,
+                      persistent_term:get(K, none) =/= none orelse
+                          not is_exit(catch persistent_term:get(K))],
+        {Leaks, [K || {K, _} <- persistent_term:get(), lists:member(K, Secrets)]}
+    end),
+    [true = persistent_term:erase(K) || K <- Secrets],
+    case Res of
+        {[], []} -> ok;
+        Other -> {bad, Other}
+    end.
+
+is_exit({'EXIT', _}) -> true;
+is_exit(_) -> false.
 "#;
 
 fn run(entry: &str) {
@@ -100,4 +144,14 @@ fn run(entry: &str) {
 #[test]
 fn ns_pterm_isolated() {
     run("ns_pterm_isolated");
+}
+
+#[test]
+fn ns_pterm_system_key_fallback() {
+    run("ns_pterm_system_key_fallback");
+}
+
+#[test]
+fn ns_pterm_root_secret_invisible() {
+    run("ns_pterm_root_secret_invisible");
 }
