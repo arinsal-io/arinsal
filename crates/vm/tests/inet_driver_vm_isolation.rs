@@ -91,6 +91,10 @@ fn tcp_and_udp_ports_with_colliding_ids_are_isolated_between_vms() {
         while clients.len() < 2 {
             match listener.accept() {
                 Ok((mut client, _)) => {
+                    // On BSD an accepted socket inherits the listener's non-blocking mode.
+                    client
+                        .set_nonblocking(false)
+                        .map_err(|error| format!("block gate connection: {error}"))?;
                     let mut ready = [0; 1];
                     client
                         .read_exact(&mut ready)
