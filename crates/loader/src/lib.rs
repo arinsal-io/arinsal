@@ -335,6 +335,110 @@ impl ExportSlot {
     }
 }
 
+/// Source location of each instruction, stored as runs of equal locations.
+#[derive(Clone, Default)]
+pub struct LineTable {
+    files: Vec<Arc<str>>,
+    runs: Vec<LineRun>,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct LineRun {
+    start: u32,
+    file: u32,
+    line: u32,
+}
+
+const NO_FILE: u32 = u32::MAX;
+
+impl LineTable {
+    /// File and line of the instruction at `ip`, when it has a location.
+    pub fn get(&self, ip: usize) -> Option<(&str, u64)> {
+        if ip >= self.len {
+            return None;
+        }
+        let index = self
+            .runs
+            .partition_point(|run| run.start as usize <= ip)
+            .checked_sub(1)?;
+        let run = self.runs[index];
+        let file = self.files.get(run.file as usize)?;
+        Some((file, u64::from(run.line)))
+    }
+
+    /// Every location in code order, one entry per run of instructions.
+    pub fn locations(&self) -> impl Iterator<Item = (&str, u64)> + '_ {
+        self.runs.iter().filter_map(|run| {
+            let file = self.files.get(run.file as usize)?;
+            Some((&**file, u64::from(run.line)))
+        })
+    }
+
+    /// Distinct source file names.
+    pub fn files(&self) -> &[Arc<str>] {
+        &self.files
+    }
+
+    /// Number of instructions covered.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the table covers no instruction.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+#[derive(Default)]
+struct LineTableBuilder {
+    table: LineTable,
+    last: Option<(Arc<str>, u32)>,
+}
+
+impl LineTableBuilder {
+    fn push(&mut self, location: &Option<(Arc<str>, u64)>) {
+        let same = match (&self.last, location) {
+            (None, None) => true,
+            (Some((file, line)), Some((other, number))) => {
+                u64::from(*line) == *number && (Arc::ptr_eq(file, other) || **file == **other)
+            }
+            _ => false,
+        };
+        if !same || self.table.runs.is_empty() {
+            let start = self.table.len as u32;
+            let (file, line) = match location {
+                Some((file, number)) => {
+                    let index = match self.table.files.iter().position(|known| **known == **file) {
+                        Some(index) => index,
+                        None => {
+                            self.table.files.push(Arc::clone(file));
+                            self.table.files.len() - 1
+                        }
+                    };
+                    (index as u32, *number as u32)
+                }
+                None => (NO_FILE, 0),
+            };
+            self.table.runs.push(LineRun { start, file, line });
+            self.last = location
+                .as_ref()
+                .map(|(file, number)| (Arc::clone(file), *number as u32));
+        }
+        self.table.len += 1;
+    }
+
+    fn finish(mut self, len: usize) -> LineTable {
+        while self.table.len < len {
+            self.push(&None);
+        }
+        self.table.runs.shrink_to_fit();
+        self.table.files.shrink_to_fit();
+        self.table
+    }
+}
+
 /// Executable module and its out-of-line data.
 pub struct Module {
     /// Module atom text.
@@ -368,7 +472,7 @@ pub struct Module {
     /// Module string table used by bit syntax string segments.
     pub strings: Box<[u8]>,
     /// Source line for each instruction.
-    pub lines: Vec<Option<(Arc<str>, u64)>>,
+    pub lines: LineTable,
     /// Literal file-name lists indexed by source filename.
     pub line_file_terms: HashMap<String, Term>,
     /// Opcodes not yet executable, with occurrence counts.
@@ -650,11 +754,11 @@ impl Module {
     }
     /// Cached literal filename list and line for a code offset.
     pub fn line_term_at(&self, ip: usize) -> Option<(Term, u64)> {
-        let (file, number) = self.lines.get(ip)?.as_ref()?;
+        let (file, number) = self.lines.get(ip)?;
         self.line_file_terms
-            .get(&**file)
+            .get(file)
             .copied()
-            .map(|term| (term, *number))
+            .map(|term| (term, number))
     }
 }
 
@@ -1127,7 +1231,7 @@ pub fn load_with_instrumentations(
     let mut selects = Vec::new();
     let mut tails = Vec::new();
     let mut lists = Vec::new();
-    let mut lines = Vec::new();
+    let mut lines = LineTableBuilder::default();
     let mut current_line: Option<(Arc<str>, u64)> = None;
     let mut unsupported = HashMap::new();
     let mut unsupported_reasons = Vec::new();
@@ -1235,7 +1339,7 @@ pub fn load_with_instrumentations(
                 counter_ids.push(*cover_id);
                 function_owners.push(*owner);
                 code.push(Instr::CoverageProbe { index: probe });
-                lines.push(current_line.clone());
+                lines.push(&current_line);
             }
         }
         if !executable(instruction.op) {
@@ -1245,7 +1349,7 @@ pub fn load_with_instrumentations(
             let reason = u32::try_from(unsupported_reasons.len()).map_err(|_| LoadError::Limit)?;
             unsupported_reasons.push(format!("opcode {}", instruction.op.name()));
             code.push(Instr::Unsupported(reason));
-            lines.push(current_line.clone());
+            lines.push(&current_line);
             source_ip += 1;
             continue;
         }
@@ -1374,7 +1478,7 @@ pub fn load_with_instrumentations(
                 Instr::Generic(index)
             });
         }
-        lines.push(current_line.clone());
+        lines.push(&current_line);
         source_ip += if instruction.op == Opcode::DebugLine {
             2
         } else {
@@ -1537,10 +1641,9 @@ pub fn load_with_instrumentations(
     selects.shrink_to_fit();
     tails.shrink_to_fit();
     lists.shrink_to_fit();
-    lines.resize(code.len(), None);
-    lines.shrink_to_fit();
+    let lines = lines.finish(code.len());
     let mut line_file_terms = HashMap::new();
-    for (file, _) in lines.iter().flatten() {
+    for file in lines.files() {
         if !line_file_terms.contains_key(&**file) {
             let term = TermBuilder::new(&mut literals)
                 .string_to_list(file)
@@ -1771,5 +1874,41 @@ mod line_location_tests {
         assert!(!valid_source_location(255, 1));
         assert!(!valid_source_location(0, (1 << 24) - 1));
         assert!(!valid_source_location(0, 100_000_003));
+    }
+}
+
+#[cfg(test)]
+mod line_table_tests {
+    use super::*;
+
+    #[test]
+    fn runs_answer_every_instruction() {
+        let a: Arc<str> = Arc::from("a.erl");
+        let b: Arc<str> = Arc::from("b.erl");
+        let sequence = [
+            None,
+            Some((Arc::clone(&a), 3)),
+            Some((Arc::clone(&a), 3)),
+            Some((Arc::clone(&a), 4)),
+            Some((Arc::clone(&b), 4)),
+            None,
+            Some((Arc::clone(&a), 3)),
+        ];
+        let mut builder = LineTableBuilder::default();
+        for location in &sequence {
+            builder.push(location);
+        }
+        let table = builder.finish(sequence.len() + 2);
+        assert_eq!(table.len(), sequence.len() + 2);
+        for (ip, expected) in sequence.iter().enumerate() {
+            let got = table.get(ip).map(|(file, line)| (file.to_owned(), line));
+            let want = expected
+                .as_ref()
+                .map(|(file, line)| (file.to_string(), *line));
+            assert_eq!(got, want, "ip {ip}");
+        }
+        assert_eq!(table.get(sequence.len()), None);
+        assert_eq!(table.get(sequence.len() + 5), None);
+        assert_eq!(table.files().len(), 2);
     }
 }
