@@ -4823,11 +4823,13 @@ impl Process {
             // The registered name is the last Erlang resource released, and only when
             // p->common.u.alive.reg != NULL.
             let name = Atom(index);
-            let mut table = runtime.reg.write();
-            if matches!(table.fetch(name), Some(crate::register::RegId::Proc(pid)) if pid == ctx.pid())
-            {
-                table.erase(name);
-                scheduler.clear_registered_atom_index(ctx.pid(), index);
+            if let Some(reg) = runtime.reg_for(self.ns) {
+                let mut table = reg.write();
+                if matches!(table.fetch(name), Some(crate::register::RegId::Proc(pid)) if pid == ctx.pid())
+                {
+                    table.erase(name);
+                    scheduler.clear_registered_atom_index(ctx.pid(), index);
+                }
             }
         }
         // Port of erts/emulator/beam/erl_process.c:14438-14456
@@ -5148,7 +5150,7 @@ impl Process {
                 .ok_or_else(|| VmError::Unsupported("send requires a scheduler".into()))?;
             // Port of erts/emulator/beam/bif.c (`ebif_bang_2` -> `erts_whereis_name`), OTP-29.1.1:
             // one atom-index lookup yields the process or the port.
-            let pid = match runtime.reg.whereis(name) {
+            let pid = match runtime.whereis_in(self.ns, name) {
                 // Port of erts/emulator/beam/bif.c:2506-2519 (do_send): one
                 // whereis, then one raw process-table lookup. An exiting
                 // process is not a destination (erts_whereis_name's alive test).

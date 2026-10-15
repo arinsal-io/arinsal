@@ -307,6 +307,69 @@ impl Kind {
     }
 }
 
+/// A name table chosen by namespace: root's own, or the one on a namespace entry.
+pub(crate) enum RegRef<'a> {
+    Root(&'a RegisterTable),
+    Ns(Arc<crate::namespace::NsEntry>),
+}
+
+impl std::ops::Deref for RegRef<'_> {
+    type Target = RegisterTable;
+
+    fn deref(&self) -> &RegisterTable {
+        match self {
+            RegRef::Root(table) => table,
+            RegRef::Ns(entry) => entry.names(),
+        }
+    }
+}
+
+impl crate::process::Runtime {
+    /// The table `register/2` and `unregister/1` of a process in `ns` write to. `None` for a
+    /// namespace that does not exist.
+    pub(crate) fn reg_for(&self, ns: u32) -> Option<RegRef<'_>> {
+        if ns == 0 {
+            return Some(RegRef::Root(&self.reg));
+        }
+        self.namespaces.get(ns).map(RegRef::Ns)
+    }
+
+    /// Resolve `name` for a process in `ns`. A namespace sees its own names first, then the
+    /// root processes marked shared. Ports are visible from root only.
+    pub(crate) fn whereis_in(&self, ns: u32, name: Atom) -> Option<RegId> {
+        if ns == 0 {
+            return self.reg.whereis(name);
+        }
+        self.whereis_ns(ns, name)
+    }
+
+    pub(crate) fn whereis_proc_in(&self, ns: u32, name: Atom) -> Option<Pid> {
+        match self.whereis_in(ns, name) {
+            Some(RegId::Proc(pid)) => Some(pid),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn whereis_proc_str_in(&self, ns: u32, name: &str) -> Option<Pid> {
+        self.whereis_proc_in(ns, global_atoms().get(name)?)
+    }
+
+    fn whereis_ns(&self, ns: u32, name: Atom) -> Option<RegId> {
+        let entry = self.namespaces.get(ns)?;
+        if let Some(id) = entry
+            .names_if_created()
+            .and_then(|table| table.whereis(name))
+        {
+            return Some(id);
+        }
+        let RegId::Proc(pid) = self.reg.whereis(name)? else {
+            return None;
+        };
+        let word = self.scheduler().ok()?.ns_word(pid)?;
+        (word & arinsal_sched::NS_SHARED != 0).then_some(RegId::Proc(pid))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

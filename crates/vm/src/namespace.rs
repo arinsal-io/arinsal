@@ -3,9 +3,10 @@
 //! Namespace 0 is root and has no entry. Ids are handed out in order and never reused on a
 //! node, so a stale id cannot name a later namespace.
 
+use crate::register::RegisterTable;
 use arinsal_sched::{NsCounters, Scheduler, Task};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// No cap.
 pub(crate) const UNLIMITED: u64 = u64::MAX;
@@ -23,6 +24,20 @@ pub(crate) struct NsEntry {
     /// Process and reduction counters and the process cap, shared with the scheduler.
     pub(crate) counters: Arc<NsCounters>,
     alive: AtomicBool,
+    /// Registered names of this namespace, created on the first `register/2`.
+    names: OnceLock<RegisterTable>,
+}
+
+impl NsEntry {
+    /// The name table, created on first use.
+    pub(crate) fn names(&self) -> &RegisterTable {
+        self.names.get_or_init(RegisterTable::new)
+    }
+
+    /// The name table when something was ever registered in this namespace.
+    pub(crate) fn names_if_created(&self) -> Option<&RegisterTable> {
+        self.names.get()
+    }
 }
 
 impl NsEntry {
@@ -57,6 +72,7 @@ impl NsTable {
             heap_words: AtomicI64::new(0),
             counters: scheduler.ns_register(id, max_processes),
             alive: AtomicBool::new(true),
+            names: OnceLock::new(),
         });
         entries.push(entry.clone());
         entry
