@@ -1924,10 +1924,10 @@ impl Vm {
                     sync_cursor(p, htop, &mut heap_dirty);
                     p.reductions = reds;
                     p.heap.release_stack(1);
-                    p.cold_mut().native_continuation_resume = true;
-                    p.cold_mut().native_resume_live = 2;
+                    p.native_continuation_resume = true;
+                    p.native_resume_live = 2;
                     p.native_pc = Some(cp as usize);
-                    p.cold_mut().native_transfer = true;
+                    p.native_transfer = true;
                     return Ok(RunState::Yield);
                 }
                 if depth == 0 {
@@ -2195,7 +2195,7 @@ impl Vm {
                                         ) {
                                             sync_cursor(p, htop, &mut heap_dirty);
                                             p.native_pc = Some(native.start);
-                                            p.cold_mut().native_transfer = true;
+                                            p.native_transfer = true;
                                             return Ok(RunState::Yield);
                                         }
                                         ip = target;
@@ -2643,7 +2643,7 @@ impl Vm {
                             ) {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.native_pc = Some(native.start);
-                                p.cold_mut().native_transfer = true;
+                                p.native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
                             ip = target;
@@ -2715,15 +2715,12 @@ impl Vm {
                             p.x[0] = value;
                             (htop, stop) = p.heap.heap_cursor();
                             heap_dirty = false;
-                            if let Some(resume) = p
-                                .cold
-                                .as_mut()
-                                .and_then(|cold| cold.native_resume_after_call.take())
+                            if let Some(resume) = p.native_resume_after_call.take()
                             {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.native_pc = Some(resume);
                                 p.reductions = reds;
-                                p.cold_mut().native_transfer = true;
+                                p.native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
                             if tail {
@@ -2817,15 +2814,12 @@ impl Vm {
                                 if let Some(run) = ctx.as_deref_mut() {
                                     run.consume(charge);
                                 }
-                                if let Some(resume) = p
-                                    .cold
-                                    .as_mut()
-                                    .and_then(|cold| cold.native_resume_after_call.take())
+                                if let Some(resume) = p.native_resume_after_call.take()
                                 {
                                     sync_cursor(p, htop, &mut heap_dirty);
                                     p.native_pc = Some(resume);
                                     p.reductions = reds;
-                                    p.cold_mut().native_transfer = true;
+                                    p.native_transfer = true;
                                     return Ok(RunState::Yield);
                                 }
                                 continue;
@@ -2879,10 +2873,7 @@ impl Vm {
                     ) {
                         charge_bif_call!();
                     }
-                    let native_resume = p
-                        .cold
-                        .as_mut()
-                        .and_then(|cold| cold.native_resume_after_call.take());
+                    let native_resume = p.native_resume_after_call.take();
                     if let Some(resume) = native_resume {
                         match outcome {
                             ImportOutcome::Jump(_) => {
@@ -2894,7 +2885,7 @@ impl Vm {
                                 p.native_pc = Some(resume);
                                 p.reductions = reds;
                                 if matches!(outcome, ImportOutcome::Advanced) {
-                                    p.cold_mut().native_transfer = true;
+                                    p.native_transfer = true;
                                 }
                                 return Ok(RunState::Yield);
                             }
@@ -2904,7 +2895,7 @@ impl Vm {
                                 p.x[0] = value;
                                 p.native_pc = Some(resume);
                                 p.reductions = reds;
-                                p.cold_mut().native_transfer = true;
+                                p.native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
                         }
@@ -2959,7 +2950,7 @@ impl Vm {
                             p.ip = target_ip;
                             p.reductions = reds;
                             p.native_pc = Some(native.start);
-                            p.cold_mut().native_transfer = true;
+                            p.native_transfer = true;
                             return Ok(RunState::Yield);
                         }
                     }
@@ -3003,7 +2994,7 @@ impl Vm {
                         p.ip = target as usize;
                         p.reductions = reds;
                         p.native_pc = Some(native.start);
-                        p.cold_mut().native_transfer = true;
+                        p.native_transfer = true;
                         return Ok(RunState::Yield);
                     }
                     // SAFETY: Loader-resolved labels designate instructions in this allocation.
@@ -3037,7 +3028,7 @@ impl Vm {
                         p.ip = target as usize;
                         p.reductions = reds;
                         p.native_pc = Some(native.start);
-                        p.cold_mut().native_transfer = true;
+                        p.native_transfer = true;
                         return Ok(RunState::Yield);
                     }
                     // SAFETY: Loader-resolved labels designate instructions in this allocation.
@@ -4946,7 +4937,7 @@ impl Vm {
                             p.ip = target_ip;
                             p.reductions = reds;
                             p.native_pc = Some(native.start);
-                            p.cold_mut().native_transfer = true;
+                            p.native_transfer = true;
                             return Ok(RunState::Yield);
                         }
                     }

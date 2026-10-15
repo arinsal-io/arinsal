@@ -637,9 +637,11 @@ fn light_demonitor_miss(
     let reference = *args.first()?;
     let ids = reference.local_ref_numbers()?;
     let id = arinsal_bifs::ordinary_ref_key(ids);
+    if process.monitors.contains_key(&id) {
+        return None;
+    }
     if let Some(cold) = process.cold.as_ref()
-        && (cold.monitors.contains_key(&id)
-            || cold.aliases.contains(&id)
+        && (cold.aliases.contains(&id)
             || cold.dist_monitors.contains(&id)
             || cold.port_monitors.contains_key(&id))
     {
@@ -1031,7 +1033,7 @@ pub(crate) fn erl_create_process(
     // (spawn_opt monitor before schedule), OTP-29.1.1.
     let parent_pid = ctx.pid();
     if so.link {
-        child.cold_mut().links.insert(parent_pid);
+        child.links.insert(parent_pid);
     }
     let monitor_id = so
         .monitor
@@ -1049,7 +1051,7 @@ pub(crate) fn erl_create_process(
             None => crate::proc_create::default_monitor_data(),
         });
     if let (Some(id), Some(data)) = (monitor_id, monitor_data.as_ref()) {
-        child.cold_mut().monitored_by.insert(
+        child.monitored_by.insert(
             id,
             crate::proc_create::TargetHalf {
                 origin: parent_pid,
@@ -1073,7 +1075,7 @@ pub(crate) fn erl_create_process(
             error => VmError::Unsupported(format!("spawn: {error}")),
         })?;
     if so.link {
-        parent.cold_mut().links.insert(pid);
+        parent.links.insert(pid);
     }
     if crate::trace::spawn_interested(parent, parent_pid) {
         let arg_list = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut parent.heap))
@@ -1130,7 +1132,6 @@ pub(crate) fn erl_create_process(
     }
     if let (Some(id), Some(data), Some(monitor)) = (monitor_id, monitor_data, so.monitor.as_ref()) {
         parent
-            .cold_mut()
             .monitors
             .insert(id, crate::proc_create::OriginHalf { target: pid, data });
         if monitor.alias {
@@ -2093,7 +2094,7 @@ pub(crate) fn monitor_light(
     let id = rt.next_ref();
     let ref_term = reference(process, id).ok()?;
     let data = crate::proc_create::default_monitor_data();
-    process.cold_mut().monitors.insert(
+    process.monitors.insert(
         id,
         crate::proc_create::OriginHalf {
             target: pid,
@@ -2113,7 +2114,7 @@ pub(crate) fn monitor_light(
         )
         .is_err()
     {
-        process.cold_mut().monitors.remove(&id);
+        process.monitors.remove(&id);
         return None;
     }
     Some(Ok(ref_term))
@@ -2137,14 +2138,18 @@ pub(crate) fn demonitor_light(
     }
     let (flush, info) = demonitor_flags(options)?;
     let id = ref_id(reference)?;
-    let cold = process.cold.as_ref()?;
-    if cold.aliases.contains(&id)
-        || cold.dist_monitors.contains(&id)
-        || cold.port_monitors.contains_key(&id)
+    let cold = process.cold.as_ref();
+    if cold.is_none() && process.monitors.is_empty() {
+        return None;
+    }
+    if let Some(cold) = cold
+        && (cold.aliases.contains(&id)
+            || cold.dist_monitors.contains(&id)
+            || cold.port_monitors.contains_key(&id))
     {
         return None;
     }
-    let active = cold.monitors.get(&id).map(|half| half.target);
+    let active = process.monitors.get(&id).map(|half| half.target);
     if active.is_none() && flush {
         return None;
     }
@@ -2152,7 +2157,7 @@ pub(crate) fn demonitor_light(
     let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
     let scheduler = rt.scheduler().ok()?;
     let result = if let Some(pid) = active {
-        process.cold_mut().monitors.remove(&id);
+        process.monitors.remove(&id);
         // erts consumes the held process monitor instead of sending the demonitor when it can
         // (erl_proc_sig_queue.c:1104). The executor ignores a dead target here as well.
         if !flush || !scheduler.cancel_pending_monitor(pid, id) {
@@ -2181,7 +2186,7 @@ pub(crate) fn unlink_light(
     let me = process.self_pid?;
     let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
     let id = rt.next_ref();
-    process.cold_mut().unlinking.insert(id, pid);
+    process.unlinking.insert(id, pid);
     let _ = rt
         .scheduler()
         .ok()?
@@ -2217,8 +2222,8 @@ pub(crate) fn link_light(
         .ok()?
         .signal_ordered(me, pid, arinsal_sched::Signal::Link)
         .ok()?;
-    process.cold_mut().links.insert(pid);
-    process.cold_mut().prio_links.remove(&pid);
+    process.links.insert(pid);
+    process.prio_links.remove(&pid);
     Some(Ok(atom("true")))
 }
 
@@ -2618,7 +2623,7 @@ fn call_resolved(
                     .runtime
                     .as_ref()
                     .map_or(1, |runtime| runtime.next_ref());
-                process.cold_mut().unlinking.insert(id, pid);
+                process.unlinking.insert(id, pid);
                 if let Some(pid_term) = pid.to_term() {
                     crate::trace::emit(
                         Some(vm),
@@ -2675,10 +2680,10 @@ fn call_resolved(
                 rt.alias_bind_prio(id, Some(ctx.pid()), priority);
             }
             if priority {
-                process.cold_mut().prio_monitors.insert(id);
+                process.prio_monitors.insert(id);
             }
             if let Some(pid) = pid.filter(|pid| rt.scheduler().is_ok_and(|s| s.lookup(*pid))) {
-                process.cold_mut().monitors.insert(
+                process.monitors.insert(
                     id,
                     crate::proc_create::OriginHalf {
                         target: pid,
@@ -2691,7 +2696,7 @@ fn call_resolved(
                     shared: arinsal_sched::SharedPayload(data.clone()),
                 };
                 if let Err(error) = ctx.signal(pid, signal) {
-                    process.cold_mut().monitors.remove(&id);
+                    process.monitors.remove(&id);
                     if error != arinsal_sched::Error::NoProcess {
                         return Err(VmError::Unsupported(format!("monitor: {error}")));
                     }
@@ -2814,19 +2819,15 @@ fn call_resolved(
                 return Err(badarg("demonitor/2"));
             }
             let flush = options.contains(&atom("flush"));
-            let mut was_active = if let Some(pid) = process
-                .cold
-                .as_mut()
-                .and_then(|cold| cold.monitors.remove(&id))
-                .map(|half| half.target)
-            {
-                if !flush || !ctx.cancel_pending_monitor(pid, id) {
-                    let _ = ctx.signal(pid, Signal::Demonitor(id));
-                }
-                true
-            } else {
-                false
-            };
+            let mut was_active =
+                if let Some(pid) = process.monitors.remove(&id).map(|half| half.target) {
+                    if !flush || !ctx.cancel_pending_monitor(pid, id) {
+                        let _ = ctx.signal(pid, Signal::Demonitor(id));
+                    }
+                    true
+                } else {
+                    false
+                };
             let alias_active = process
                 .cold
                 .as_mut()
@@ -3270,12 +3271,12 @@ pub(crate) fn poll(process: &mut Process) -> Result<Option<Term>, VmError> {
     else {
         return Err(await_reply());
     };
-    let old_prio_len = process.cold.as_ref().map_or(0, |cold| cold.prio_len);
+    let old_prio_len = process.prio_len;
     let (removed, new_prio_len) =
         process
             .inbox
             .remove_to_heap(index, &mut process.heap, old_prio_len)?;
-    process.cold_mut().prio_len = new_prio_len;
+    process.prio_len = new_prio_len;
     let term = removed.expect("reply index");
     process.message_removed(index);
     process.pending_signal_waiter = None;
@@ -3843,7 +3844,6 @@ fn send_noproc_down(
     {
         let data = monitor_data_for(tag, name)?;
         process
-            .cold_mut()
             .monitors
             .insert(id, crate::proc_create::OriginHalf { target: from, data });
         let reason = Message::copy_from(atom("noproc"))?;
@@ -3934,11 +3934,11 @@ fn link_opt(
         return link_noproc(process, pid, priority);
     }
     crate::trace::linked(process, ctx.pid(), pid);
-    process.cold_mut().links.insert(pid);
+    process.links.insert(pid);
     if priority {
-        process.cold_mut().prio_links.insert(pid);
+        process.prio_links.insert(pid);
     } else {
-        process.cold_mut().prio_links.remove(&pid);
+        process.prio_links.remove(&pid);
     }
     let linked_term = pid.to_term().ok_or_else(|| badarg("link"))?;
     crate::trace::emit(

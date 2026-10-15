@@ -91,9 +91,7 @@ fn bif_export_trap() {}
 /// address on the stack, the way `emit_enter_erlang_frame` leaves it for the export call.
 pub(crate) fn note_export_trap(process: &mut Process) {
     let resume = process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.native_retry_site)
+        .native_retry_site
         .map(|(pc, _)| pc)
         .filter(|pc| crate::native_bridge::is_native_function_at(*pc));
     if let Some(resume) = resume {

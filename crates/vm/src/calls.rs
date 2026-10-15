@@ -572,8 +572,8 @@ impl Vm {
                     // A native return address, or the stub of a traced native function's
                     // return frame, which finishes the frame when entered.
                     p.heap.release_stack(1);
-                    p.cold_mut().native_continuation_resume = true;
-                    p.cold_mut().native_resume_live = 2;
+                    p.native_continuation_resume = true;
+                    p.native_resume_live = 2;
                     p.native_pc = Some(word);
                     return None;
                 }
@@ -721,7 +721,7 @@ impl Vm {
                 None => {
                     if p.native_pc.is_some() {
                         // Returning into a native continuation is not a scheduling point.
-                        p.cold_mut().native_transfer = true;
+                        p.native_transfer = true;
                         ImportOutcome::Yield
                     } else {
                         ImportOutcome::Advanced

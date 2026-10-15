@@ -2103,7 +2103,7 @@ pub(crate) fn native_signal(
             let id = arinsal_bifs::next_ref_id();
             let reference = crate::signals::reference(process, id)?;
             if priority {
-                process.cold_mut().prio_monitors.insert(id);
+                process.prio_monitors.insert(id);
             }
             if alias {
                 process.cold_mut().aliases.insert(id);

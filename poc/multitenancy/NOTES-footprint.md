@@ -105,6 +105,55 @@ do, so it is not in this branch. I did not find which allocation site makes the 
 Freed transient memory also shows up at 0 tenants: about 90 MB of the 174 MB is "reclaimable" in
 `footprint` (freed by Rust, not returned) after the parse and prepare steps of 394 module loads.
 
+## Chunk 2: ProcessCold (process side of the per-tenant gap)
+
+Cause: `ProcessCold` (2840 B, `crates/vm/src/proc_create.rs`) was allocated by nearly every process.
+Found by tagging `cold_mut` / `allocate_cold` with `#[track_caller]` and printing the caller of each
+allocation (temporary, not committed), running bench/rest with 100 tenants and a 30000-process spawn
+loop:
+
+| trigger (before) | count in 100 tenants |
+|---|---|
+| `signals.rs` spawn with link: `links.insert(parent)` | 1072 of 1136 |
+| `signals.rs` spawn with monitor: `monitored_by.insert` | 47 |
+| first run of every process: `signal_probe` (`process.rs`) | 11 more, every process after the links are gone |
+| native receive exit: `native_error_pc`, `native_wait`, `native_wait_timeout`, `native_wait_self` | every process that blocks |
+| native resume/call state: `native_retry_site`, `native_continuation_resume`, `native_resume_live`, ... | every native trap |
+| each received message: `prio_len` | every process that receives |
+
+Fix: those small always-used fields moved from `ProcessCold` to `Process` (about 330 B, empty trees
+do not allocate), same names and types, so behavior is unchanged:
+
+- supervision: `links`, `prio_links`, `monitors`, `prio_monitors`, `monitored_by`, `unlinking`
+- receive: `signal_probe`, `prio_len`, `priority_resume_cursor`, `native_wait`, `native_wait_timeout`,
+  `native_wait_self`, `native_signal_fetch`, `native_reserve_fetch`
+- native call state: `native_error_pc`, `native_call_pc`, `native_apply`, `native_retry`,
+  `native_retry_site`, `native_resume_after_call`, `native_continuation_resume`, `native_resume_live`,
+  `native_transfer`
+
+`Process::exit` used to return when `cold` was `None`; it now always runs the link and monitor
+notification from the process fields and only skips the port and NIF monitors when there is no cold part.
+Remaining cold triggers in the same runs: trace and dirty NIF state, `max_heap`, `initial_bif`,
+`process_flag` paths, about 1% of processes.
+
+Measured (idle process blocked in `receive`, linked to its parent, 30000 of them, `spawn_link` from the
+node's repl process, footprint delta per process, three runs for the new build):
+
+| | bytes per process |
+|---|---|
+| ERTS | 2649 |
+| Arinsal before | 7291 |
+| Arinsal after | 4145 to 4247 |
+
+That is 3.1 KB per process, about 6 processes per tenant in bench/rest: about 19 KB of the 230 KB
+per tenant. The whole-node numbers (1000 tenants) varied by 25 MB between identical runs on this shared
+host (380 to 424 MB), so they cannot show a 19 MB change. `malloc_history`, the method used for the live
+byte tables above, hung host-wide after the `lldb` attempt and could not be repeated.
+
+Tests: `process_differential` (17, includes monitor and link scenarios against OTP), `link_exit_race`,
+`demonitor_flush_trap`, `process_info_self_light` (3) and the vm lib tests for `receive`, `signals`,
+`proc_create`.
+
 ## Staged plan (not done)
 
 1. Free-memory return (after-load gap, and the freed transient of boot, about 90 MB reclaimable at 0
@@ -122,9 +171,8 @@ Freed transient memory also shows up at 0 tenants: about 90 MB of the 174 MB is 
    `Option<Box<_>>` (35 uses in `ets/src/lib.rs`), and replace `HashMap<u64, Vec<StoredTerm>>` with
    ERTS-style chained buckets (`Box<node>` with `next`, `hvalue`, object words in the same
    allocation). Target about 60 B per entry instead of 183 B: 25 KB per tenant here.
-4. `ProcessCold`: split into a small always-present part (native wait/resume flags, group leader,
-   links) and a boxed rare part (trace, dirty, hibernate, save_calls). Target 300 B per process:
-   about 15 KB per tenant here.
+4. Per-process remainder (4.2 KB vs ERTS 2.6 KB): 1.6 KB per process is still to find (initial heap
+   carriers, `Process` struct size, registers).
 5. `Module.code` plus `lines` still dominate module memory. Dropping the interpreter copy for modules
    the JIT compiled needs the interpreter fallbacks audited first (`interp.rs`, `funs.rs`, NIF stubs).
 

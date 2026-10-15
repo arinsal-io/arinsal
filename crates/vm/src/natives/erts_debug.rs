@@ -1832,11 +1832,7 @@ fn count_owned_external_identities(
 
 /// Port of erl_bif_info.c:make_link_list for the current process, OTP-29.1.1.
 fn internal_link_list(process: &mut Process) -> Result<Term, VmError> {
-    let links = process
-        .cold
-        .as_ref()
-        .map(|cold| cold.links.iter().copied().collect::<Vec<_>>())
-        .unwrap_or_default();
+    let links = process.links.iter().copied().collect::<Vec<_>>();
     internal_link_list_from(process, &links)
 }
 
@@ -1866,10 +1862,7 @@ fn internal_link_list_from(
 
 /// Port of erl_bif_info.c:make_monitor_list for the current process, OTP-29.1.1.
 fn internal_monitor_list(process: &mut Process) -> Result<Term, VmError> {
-    let Some(cold) = process.cold.as_ref() else {
-        return Ok(Term::NIL);
-    };
-    let relations = Relations::of(cold);
+    let relations = Relations::of(process);
     internal_monitor_list_from(process, &relations.monitors, &relations.monitored_by)
 }
 
@@ -1881,18 +1874,10 @@ struct Relations {
 }
 
 impl Relations {
-    fn empty() -> Self {
+    fn of(process: &Process) -> Self {
         Self {
-            links: Vec::new(),
-            monitors: Vec::new(),
-            monitored_by: Vec::new(),
-        }
-    }
-
-    fn of(cold: &crate::proc_create::ProcessCold) -> Self {
-        Self {
-            links: cold.links.iter().copied().collect(),
-            monitors: cold
+            links: process.links.iter().copied().collect(),
+            monitors: process
                 .monitors
                 .iter()
                 .map(|(&id, half)| {
@@ -1906,7 +1891,7 @@ impl Relations {
                     (id, half.target, extra)
                 })
                 .collect(),
-            monitored_by: cold
+            monitored_by: process
                 .monitored_by
                 .iter()
                 .map(|(&id, half)| (id, half.origin))
@@ -1934,12 +1919,7 @@ fn remote_relations(
         let exiting = |target: &Process| target.dirty_exiting() || target.exit_cont.is_some();
         while !exiting(target) && !target.handle_dirty_signals(vm, target_ctx) {}
         if !exiting(target) {
-            relations = Some(
-                target
-                    .cold
-                    .as_deref()
-                    .map_or_else(Relations::empty, Relations::of),
-            );
+            relations = Some(Relations::of(target));
         }
     });
     match locked {
