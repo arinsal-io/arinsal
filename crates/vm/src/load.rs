@@ -168,6 +168,7 @@ pub(crate) struct CodeTables {
     pub(crate) condemned: SharedTable<Vec<usize>>,
     // g_code_fix: a module entry survives purge, so later delete_module stays true.
     pub(crate) known_modules: SharedTable<HashSet<String>>,
+    // arl: code domains.
     /// Module overlays of the non-base code domains.
     pub(crate) domains: SharedTable<crate::code_domains::Domains>,
 }
@@ -517,6 +518,7 @@ impl CodeTables {
             module_files: SharedTable::new(HashMap::new()),
             condemned: SharedTable::new(Vec::new()),
             known_modules: SharedTable::new(HashSet::new()),
+            // arl: code domains.
             domains: SharedTable::new(crate::code_domains::Domains::default()),
         }
     }
@@ -571,6 +573,7 @@ impl CodeTables {
         id
     }
 
+    // arl: code domains.
     /// Adds a module instance of a non-base code domain and returns its id. Unlike
     /// [`CodeTables::alloc`] it leaves the node's export index alone: domain modules are not
     /// exports of the node.

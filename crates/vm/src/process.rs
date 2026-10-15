@@ -1340,6 +1340,7 @@ impl Executor {
                     })
                     .filter(|&address| version.contains_code(address))
                     .or_else(|| version.native_function_start(function, arity)),
+                // arl: a domain instance never starts in native code.
                 None if module.domain == crate::code_domains::BASE => {
                     crate::native_function_for(self.vm.code_scope, &module.name, function, arity)
                         .map(|native| native.start)
@@ -3702,6 +3703,7 @@ impl Vm {
         let args = crate::signals::list(process.x[2])
             .ok_or_else(|| VmError::Unsupported("run_process arguments".into()))?;
         let arity = args.len() as u8;
+        // arl: the spawned MFA resolves through the process's code chain.
         let in_domain = self.process_domain_module(process, module).and_then(|id| {
             let slot = self.code.modules[id].export_slot_atom(function, arity)?;
             Some((id, slot.target()))

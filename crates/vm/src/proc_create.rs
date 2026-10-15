@@ -201,6 +201,7 @@ pub struct Process {
     /// `p->parent` (erl_process.c:12756): the spawning process, `None` (`undefined`) for the
     /// first process; a remote parent's external pid is `ProcessCold::parent_external`.
     pub(crate) parent: Option<arinsal_sched::Pid>,
+    // arl: code domains.
     /// Code lookup chain of dynamic calls; `None` is root, which resolves in the base only.
     /// A spawned process inherits it.
     pub(crate) code_chain: Option<crate::code_domains::DomainChain>,
@@ -1376,6 +1377,7 @@ impl Process {
             cold: None,
             group_leader: None,
             parent: None,
+            // arl: code domains.
             code_chain: None,
             ns: 0,
             exit_cont: None,

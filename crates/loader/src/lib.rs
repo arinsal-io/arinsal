@@ -423,6 +423,7 @@ pub struct Module {
     /// Module literals by BEAM literal index, in this module's literal area. Native code
     /// of the module refers to these same terms, like erts' single literal area per module.
     literal_terms: Arc<HashMap<u32, Term>>,
+    // arl: code domains.
     /// Code domain of this instance; 0 is the node's base table. Set before the instance is
     /// shared and fixed for its lifetime: its static imports resolve through that domain.
     pub domain: u32,

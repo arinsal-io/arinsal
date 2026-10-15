@@ -9,6 +9,7 @@ mod bif_table;
 pub mod boot;
 mod calls;
 mod check_io;
+// arl: code domains.
 mod code_domains;
 mod code_ix;
 mod compare;
