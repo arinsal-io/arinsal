@@ -104,6 +104,18 @@ pub struct Message {
     timer_id: Option<u64>,
     /// The port connected handshake traces receipt before unblocking the recipient.
     receive_traced: bool,
+    /// Sent by a process without a seq_trace token (`ERL_MESSAGE_TOKEN == NIL`).
+    seq_nil: bool,
+    /// The alias the message was sent through, 0 for none (checked when it is handled).
+    alias: u64,
+}
+
+/// What the sender knows about a message beyond its term: the sequential trace token state
+/// and the alias it was sent through.
+#[derive(Default)]
+struct SendMeta {
+    seq: crate::seq_trace::SeqState,
+    alias: u64,
 }
 
 struct MessageFragment {
@@ -111,7 +123,7 @@ struct MessageFragment {
     seq_token: Option<Box<crate::seq_trace::Token>>,
 }
 
-type RemovedMessage = (Term, Option<Box<crate::seq_trace::Token>>);
+type RemovedMessage = (Term, crate::seq_trace::SeqState);
 
 /// Private message queue whose detached fragments remain owned by each entry.
 ///
@@ -125,6 +137,7 @@ pub(crate) struct MessageQueue {
 struct QueuedMessage {
     term: Term,
     fragment: Option<Box<MessageFragment>>,
+    seq_nil: bool,
 }
 
 impl MessageQueue {
@@ -141,6 +154,28 @@ impl MessageQueue {
         self.entries.push_back(QueuedMessage {
             term,
             fragment: None,
+            seq_nil: false,
+        });
+    }
+
+    /// Append a message that carries a seq_trace token.
+    pub(crate) fn push_back_token(&mut self, term: Term, token: Box<crate::seq_trace::Token>) {
+        self.entries.push_back(QueuedMessage {
+            term,
+            fragment: Some(Box::new(MessageFragment {
+                heap: None,
+                seq_token: Some(token),
+            })),
+            seq_nil: false,
+        });
+    }
+
+    /// Append a message from a process without a token (`ERL_MESSAGE_TOKEN == NIL`).
+    pub(crate) fn push_back_nil(&mut self, term: Term) {
+        self.entries.push_back(QueuedMessage {
+            term,
+            fragment: None,
+            seq_nil: true,
         });
     }
 
@@ -152,6 +187,7 @@ impl MessageQueue {
             QueuedMessage {
                 term,
                 fragment: None,
+                seq_nil: false,
             },
         );
         prio_len + 1
@@ -180,6 +216,7 @@ impl MessageQueue {
                 QueuedMessage {
                     term: message.term,
                     fragment: None,
+                    seq_nil: message.seq_nil,
                 },
             );
             return Ok(new_prio_len);
@@ -194,6 +231,7 @@ impl MessageQueue {
             QueuedMessage {
                 term: message.term,
                 fragment: message.fragment,
+                seq_nil: message.seq_nil,
             },
         );
         Ok(new_prio_len)
@@ -245,12 +283,17 @@ impl MessageQueue {
         heap: &mut ProcessHeap,
         prio_len: usize,
     ) -> Result<(Option<RemovedMessage>, usize), VmError> {
-        let mut token = None;
+        let mut state = crate::seq_trace::SeqState::Undefined;
+        if let Some(entry) = self.entries.get_mut(index)
+            && entry.seq_nil
+        {
+            state = crate::seq_trace::SeqState::Nil;
+        }
         if let Some(entry) = self.entries.get_mut(index)
             && let Some(fragment) = entry.fragment.as_mut()
         {
-            if fragment.seq_token.is_some() {
-                token = fragment.seq_token.take();
+            if let Some(token) = fragment.seq_token.take() {
+                state = crate::seq_trace::SeqState::Token(token);
             }
             if let Some(heap_fragment) = fragment.heap.take() {
                 heap.adopt_message_fragment(heap_fragment)
@@ -259,7 +302,7 @@ impl MessageQueue {
                     })?;
             }
         }
-        let removed = self.entries.remove(index).map(|entry| (entry.term, token));
+        let removed = self.entries.remove(index).map(|entry| (entry.term, state));
         let prio_len = prio_len - usize::from(removed.is_some() && index < prio_len);
         Ok((removed, prio_len))
     }
@@ -462,6 +505,8 @@ impl Message {
             priority: false,
             timer_id: None,
             receive_traced: false,
+            seq_nil: false,
+            alias: 0,
         })
     }
 
@@ -472,6 +517,8 @@ impl Message {
             priority: false,
             timer_id: None,
             receive_traced: false,
+            seq_nil: false,
+            alias: 0,
         }
     }
 
@@ -508,6 +555,8 @@ impl Message {
             priority: false,
             timer_id: None,
             receive_traced: false,
+            seq_nil: false,
+            alias: 0,
         })
     }
 
@@ -545,6 +594,22 @@ impl Message {
 
     pub(crate) fn is_priority(&self) -> bool {
         self.priority
+    }
+
+    /// The seq_trace token the sender attached, if any.
+    pub(crate) fn take_seq_token(&mut self) -> Option<Box<crate::seq_trace::Token>> {
+        self.fragment
+            .as_mut()
+            .and_then(|fragment| fragment.seq_token.take())
+    }
+
+    /// Record what the sender's token state was.
+    pub(crate) fn apply_seq_state(&mut self, state: crate::seq_trace::SeqState) {
+        match state {
+            crate::seq_trace::SeqState::Undefined => {}
+            crate::seq_trace::SeqState::Nil => self.seq_nil = true,
+            crate::seq_trace::SeqState::Token(token) => self.attach_seq_token(token),
+        }
     }
 
     pub(crate) fn attach_seq_token(&mut self, token: Box<crate::seq_trace::Token>) {
@@ -619,7 +684,7 @@ fn message_on_receiver_heap(
     receiver: &mut Process,
     counted: CountedSend<'_>,
     priority: bool,
-    seq_token: &mut Option<Box<crate::seq_trace::Token>>,
+    seq_token: &mut SendMeta,
 ) -> Result<Option<Message>, VmError> {
     let CountedSend {
         value,
@@ -654,13 +719,14 @@ fn message_on_receiver_heap(
         priority: false,
         timer_id: None,
         receive_traced: false,
+        seq_nil: false,
+        alias: 0,
     };
     if priority {
         envelope = envelope.with_priority();
     }
-    if let Some(token) = seq_token.take() {
-        envelope.attach_seq_token(token);
-    }
+    envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
+    envelope.alias = seq_token.alias;
     Ok(Some(envelope))
 }
 
@@ -2027,6 +2093,13 @@ impl Executor {
                                         process, resume_pc, &actions, arity,
                                     )?;
                                     process.cold_mut().native_continuation_resume = true;
+                                    // Port of erts/emulator/beam/jit/arm/instr_trace.cpp (the
+                                    // breakpoint stub saves the function's arguments in
+                                    // `c_p->arity`), OTP-29.1.1: a collection while the process
+                                    // is switched out, such as a delayed dirty one, roots them.
+                                    process.cold_mut().native_resume_live =
+                                        function.arity.saturating_add(1);
+                                    process.gc_live = usize::from(function.arity);
                                     process.native_pc = Some(resume_pc);
                                     // A loop of traced calls leaves native code on every call and
                                     // would never reach the end-of-slice check: preempt here once
@@ -4753,7 +4826,15 @@ impl Process {
             }) {
                 continue;
             }
-            if let Ok(message) = Message::copy_from(reason) {
+            if let Ok(mut message) = Message::copy_from(reason) {
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c:1700-1703 and :1827
+                // (send_gen_exit_signal), OTP-29.1.1: the exit signal carries the exiting
+                // process's token and counts as a send.
+                if crate::seq_trace::has_token(self)
+                    && let Some(token) = crate::seq_trace::on_exit_signal(self, ctx, pid, reason)
+                {
+                    message.attach_seq_token(token);
+                }
                 let _ = ctx.signal(pid, arinsal_sched::Signal::ExitLinked(message));
             }
         }
@@ -4815,7 +4896,7 @@ impl Process {
         to: Pid,
         counted: CountedSend<'_>,
         priority: bool,
-        seq_token: &mut Option<Box<crate::seq_trace::Token>>,
+        seq_token: &mut SendMeta,
     ) -> Result<bool, VmError> {
         if counted.words == 0 {
             return Ok(false);
@@ -5011,6 +5092,7 @@ impl Process {
             target
         };
         let mut via_prio_alias = false;
+        let mut via_alias = 0u64;
         let pid = if let Some(pid) = Pid::from_term(target) {
             Some(pid)
         } else if let Some(id) = crate::signals::ref_id(target) {
@@ -5021,6 +5103,7 @@ impl Process {
             match known {
                 Some((Some(pid), alias_prio)) => {
                     via_prio_alias = alias_prio && want_priority;
+                    via_alias = id;
                     Some(pid)
                 }
                 Some((None, _)) => return Ok(value),
@@ -5125,10 +5208,34 @@ impl Process {
             value,
             target,
         );
-        let mut seq_token = if crate::seq_trace::has_token(self) {
-            crate::seq_trace::on_send(vm, self, ctx.as_deref_mut(), sender, target, value)
-        } else {
-            None
+        let mut seq_token = SendMeta {
+            alias: via_alias,
+            seq: if crate::seq_trace::has_token(self) {
+                let state = {
+                    // Port of erts/emulator/beam/erl_message.c:753-755, OTP-29.1.1: the event names the
+                    // receiving process by pid, whatever name the sender used; an alias stays the alias.
+                    let seq_receiver = if target.as_atom().is_some()
+                        || target.classify() == arinsal_term::TermKind::Tuple
+                    {
+                        pid.to_term().unwrap_or(target)
+                    } else {
+                        target
+                    };
+                    crate::seq_trace::on_send(
+                        vm,
+                        self,
+                        ctx.as_deref_mut(),
+                        sender,
+                        seq_receiver,
+                        value,
+                    )
+                };
+                state.map_or(crate::seq_trace::SeqState::Nil, |token| {
+                    crate::seq_trace::SeqState::Token(token)
+                })
+            } else {
+                crate::seq_trace::SeqState::Nil
+            },
         };
         // Size once. The on-heap attempt and the fragment fallback both consume it
         // (erts_send_message: size_object_litopt, then alloc, then copy_struct_litopt).
@@ -5156,9 +5263,8 @@ impl Process {
         if via_prio_alias {
             envelope = envelope.with_priority();
         }
-        if let Some(token) = seq_token.take() {
-            envelope.attach_seq_token(token);
-        }
+        envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
+        envelope.alias = seq_token.alias;
         let delivered = match ctx {
             Some(ctx) => ctx.send(pid, envelope),
             // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message from a BIF called
@@ -5447,6 +5553,30 @@ impl Process {
         Ok((consumed_reds, ReceiveHelper::Yield))
     }
 
+    /// A message sent through an alias is handled only while the alias is active, and a
+    /// `reply` alias is deactivated by the first one.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_alias_message, ERTS_ALIAS_ONCE),
+    // OTP-29.1.1.
+    fn alias_message_accepted(&mut self, alias: u64) -> bool {
+        if alias == 0 {
+            return true;
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return true;
+        };
+        if !matches!(runtime.alias_lookup(alias), Some(Some(_))) {
+            return false;
+        }
+        if self
+            .cold
+            .as_mut()
+            .is_some_and(|cold| cold.once_aliases.remove(&alias))
+        {
+            runtime.alias_bind(alias, None);
+        }
+        true
+    }
+
     /// Move a message signal into the message queue.
     fn move_message(
         &mut self,
@@ -5456,6 +5586,9 @@ impl Process {
     ) -> Result<(), VmError> {
         match payload {
             Payload::Message(message) => {
+                if !self.alias_message_accepted(message.alias) {
+                    return Ok(());
+                }
                 let receive_traced = message.receive_traced;
                 let priority = message.is_priority();
                 let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
@@ -5532,7 +5665,11 @@ impl Process {
         };
         let cost = match signal {
             arinsal_sched::Signal::Link => {
-                self.cold_mut().links.insert(from);
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c:6636-6646 (ERTS_SIG_Q_OP_LINK):
+                // the receiver reports getting_linked in signal order, for a new link only.
+                if self.cold_mut().links.insert(from) {
+                    self.trace_getting_linked(ctx, from);
+                }
                 0
             }
             // Port of erl_bif_info.c:4998-5022 (proc_sig_block), OTP-29.1.1.
@@ -5611,6 +5748,8 @@ impl Process {
                         cold.prio_links.remove(&from);
                         cold.links.remove(&from)
                     });
+                let mut message = message;
+                let seq_token = message.take_seq_token();
                 let reason = message.into_receiver(self)?;
                 if reason == crate::signals::atom("kill") && !linked_exit {
                     // Port of erts/emulator/beam/erl_proc_sig_queue.c:4782
@@ -5628,8 +5767,11 @@ impl Process {
                     let tuple = self.tuple(&[crate::signals::atom("EXIT"), from, reason])?;
                     if priority {
                         self.push_priority_message(tuple)?;
+                    } else if let Some(token) = seq_token {
+                        self.inbox.push_back_token(tuple, token);
                     } else {
-                        self.inbox.push_back(tuple);
+                        // A process exit without a token converts to a message with NIL.
+                        self.inbox.push_back_nil(tuple);
                     }
                     self.trace_converted_signal(ctx, tuple, sender);
                     if was_linked {
@@ -5755,6 +5897,21 @@ impl Process {
 }
 
 impl Process {
+    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8585 (getting_linked), OTP-29.1.1.
+    fn trace_getting_linked(&mut self, ctx: &mut RunCtx<'_, Message>, linker: Pid) {
+        if let Some(linker) = linker.to_term() {
+            crate::trace::emit(
+                None,
+                self,
+                ctx,
+                ctx.pid(),
+                crate::trace::PROCS,
+                "getting_linked",
+                &[linker],
+            );
+        }
+    }
+
     /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8578 (getting_unlinked), OTP-29.1.1.
     fn trace_getting_unlinked(&mut self, ctx: &mut RunCtx<'_, Message>, unlinker: Pid) {
         if let Some(unlinker) = unlinker.to_term() {

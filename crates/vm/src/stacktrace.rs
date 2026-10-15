@@ -14,16 +14,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 // The final continuation module index identifies an empty-trace catch immediate.
 const EMPTY_TRACE_PREFIX: u64 = (1 << 26) - 1;
 const CONTINUATION_BIT: u64 = 1 << 57;
-const TRACE_RETURN_MODULE: u64 = (1 << 25) - 1;
-const TRACE_EXCEPTION_MODULE: u64 = (1 << 25) - 2;
-const TRACE_RETURN_TO_MODULE: u64 = (1 << 25) - 3;
-// Port of erts/emulator/beam/beam_common.h:291-293 and beam_bp.c:1228-1246,
-// OTP-29.1.1: interpreter trace CPs use reserved module-index values as special addresses.
-const TRACE_RETURN_CONTINUATION: Term = Term::catch(CONTINUATION_BIT | TRACE_RETURN_MODULE << 32);
-const TRACE_EXCEPTION_CONTINUATION: Term =
-    Term::catch(CONTINUATION_BIT | TRACE_EXCEPTION_MODULE << 32);
-const TRACE_RETURN_TO_CONTINUATION: Term =
-    Term::catch(CONTINUATION_BIT | TRACE_RETURN_TO_MODULE << 32);
+/// Module indexes from here up are not encodable in a continuation.
+const MAX_CONTINUATION_MODULE: u64 = 1 << 21;
+/// Module-field flags of the interpreter's trace frame continuations. A stack walk skips such a
+/// frame without a function lookup: their instruction pointers lie past the module's functions.
+const RETURN_TRACE_FLAG: u64 = 1 << 22;
+const RETURN_TO_TRACE_FLAG: u64 = 1 << 21;
+const TRACE_FLAGS: u64 = RETURN_TRACE_FLAG | RETURN_TO_TRACE_FLAG;
 
 /// A catch handler: the code scope of its runtime, its module index and its code index.
 type CatchKey = (u64, usize, usize);
@@ -945,10 +942,6 @@ fn gather_continuations_in(
         if raw_address == bridge {
             continue;
         }
-        if let Some(advance) = trace_continuation_advance(word) {
-            stack.nth(advance.saturating_sub(2));
-            continue;
-        }
         // Port of erts/emulator/beam/erl_term.h:1378-1379 (`is_CP`) and
         // beam_common.c:805 (`gather_stacktrace`), OTP-29.1.1. A continuation is
         // classified from its tag bits; code-range membership is deferred to the builder.
@@ -962,6 +955,16 @@ fn gather_continuations_in(
             continue;
         }
         if let Some((module, ip)) = continuation_word(word) {
+            // Port of erts/emulator/beam/beam_common.c:803-815 (gather_stacktrace), OTP-29.1.1:
+            // trace stack frames are skipped.
+            if module as u64 & RETURN_TRACE_FLAG != 0 {
+                stack.nth(4);
+                continue;
+            }
+            if module as u64 & RETURN_TO_TRACE_FLAG != 0 {
+                stack.next();
+                continue;
+            }
             let call_site = ip.saturating_sub(1);
             if previous == Some((module, call_site)) {
                 continue;
@@ -982,9 +985,6 @@ fn gather_continuations_in(
 /// Catch handlers are not frames. No catch-table lookup: a handler index has
 /// no continuation bit, and `build_stacktrace` is what resolves a real CP.
 fn continuation_word(word: Term) -> Option<(usize, usize)> {
-    if trace_continuation_advance(word).is_some() {
-        return None;
-    }
     if word.tagged_word() & 63 != 0x1b || word.classify() != TermKind::Catch {
         return None;
     }
@@ -998,22 +998,10 @@ fn continuation_word(word: Term) -> Option<(usize, usize)> {
     ))
 }
 
-/// Stack span associated with an interpreter equivalent of an erts trace CP.
-// Port of erts/emulator/beam/beam_common.c:805-809 (`gather_stacktrace`), OTP-29.1.1.
-fn trace_continuation_advance(word: Term) -> Option<usize> {
-    if word == TRACE_RETURN_CONTINUATION || word == TRACE_EXCEPTION_CONTINUATION {
-        Some(6)
-    } else if word == TRACE_RETURN_TO_CONTINUATION {
-        Some(2)
-    } else {
-        None
-    }
-}
-
 fn pack_indexed(module: usize, ip: usize) -> Option<u64> {
     let module = u64::try_from(module).ok()?;
     let ip = u64::try_from(ip).ok()?;
-    if module >= TRACE_RETURN_TO_MODULE || ip >= 1 << 32 {
+    if module >= MAX_CONTINUATION_MODULE || ip >= 1 << 32 {
         return None;
     }
     Some((1 << 63) | (module << 32) | ip)
@@ -1306,12 +1294,28 @@ fn handler_tag_shared(key: CatchKey) -> Result<u32, VmError> {
 
 /// Encodes an interpreter continuation without colliding with catch-table indices.
 pub(crate) fn continuation_tag(module: usize, ip: usize) -> Result<Term, VmError> {
+    continuation_tag_flagged(module, ip, 0)
+}
+
+/// The continuation of an interpreter `return_trace` frame (six words).
+pub(crate) fn return_trace_tag(module: usize, ip: usize) -> Result<Term, VmError> {
+    continuation_tag_flagged(module, ip, RETURN_TRACE_FLAG)
+}
+
+/// The continuation of an interpreter `return_to` frame (two words).
+pub(crate) fn return_to_trace_tag(module: usize, ip: usize) -> Result<Term, VmError> {
+    continuation_tag_flagged(module, ip, RETURN_TO_TRACE_FLAG)
+}
+
+fn continuation_tag_flagged(module: usize, ip: usize, flags: u64) -> Result<Term, VmError> {
     let module = u64::try_from(module).map_err(|_| VmError::Unsupported("module index".into()))?;
     let ip = u32::try_from(ip).map_err(|_| VmError::Unsupported("code index".into()))?;
-    if module >= TRACE_RETURN_TO_MODULE {
+    if module >= MAX_CONTINUATION_MODULE {
         return Err(VmError::Unsupported("module index".into()));
     }
-    Ok(Term::catch(CONTINUATION_BIT | module << 32 | u64::from(ip)))
+    Ok(Term::catch(
+        CONTINUATION_BIT | (module | flags) << 32 | u64::from(ip),
+    ))
 }
 
 /// Handler address of a stack word that is a catch tag of native code.
@@ -1331,9 +1335,6 @@ pub(crate) fn native_catch_address(term: Term) -> Option<usize> {
 }
 
 pub(super) fn decode_tag(term: Term) -> Option<(bool, usize, usize)> {
-    if trace_continuation_advance(term).is_some() {
-        return None;
-    }
     if term.tagged_word() & 63 != 0x1b || term.classify() != TermKind::Catch {
         return None;
     }
@@ -1348,7 +1349,7 @@ pub(super) fn decode_tag(term: Term) -> Option<(bool, usize, usize)> {
     if payload & CONTINUATION_BIT != 0 {
         return Some((
             false,
-            ((payload & !CONTINUATION_BIT) >> 32) as usize,
+            (((payload & !CONTINUATION_BIT) >> 32) & !TRACE_FLAGS) as usize,
             payload as u32 as usize,
         ));
     }

@@ -195,6 +195,12 @@ struct CallMatchContext {
     caller_line: Option<Term>,
     current_stacktraces: Vec<(VecHeap, Term)>,
     trace_actions: RefCell<Vec<(String, VecHeap, Vec<Term>)>>,
+    /// The tracee's sequential trace state, edited by `set_seq_token` and written back after
+    /// the match; `get_seq_token` terms live in `seq_heaps`.
+    seq: RefCell<Option<(crate::seq_trace::Local, Pid)>>,
+    seq_heaps: RefCell<Vec<VecHeap>>,
+    /// `{self}`: the tracee's pid.
+    self_pid: Option<Term>,
 }
 
 impl CallMatchContext {
@@ -215,6 +221,9 @@ impl CallMatchContext {
             caller_line,
             current_stacktraces,
             trace_actions: RefCell::new(Vec::new()),
+            seq: RefCell::new(None),
+            seq_heaps: RefCell::new(Vec::new()),
+            self_pid: None,
             dump,
             dump_heaps: RefCell::new(Vec::new()),
         }
@@ -232,12 +241,43 @@ impl CallMatchContext {
         .ok()
     }
 
+    fn with_self_pid(mut self, pid: Option<Term>) -> Self {
+        self.self_pid = pid;
+        self
+    }
+
+    fn with_seq(self, local: crate::seq_trace::Local, pid: Pid) -> Self {
+        *self.seq.borrow_mut() = Some((local, pid));
+        self
+    }
+
+    /// The edited sequential trace state, if the match changed it.
+    fn take_seq(&self) -> Option<crate::seq_trace::Local> {
+        self.seq
+            .borrow_mut()
+            .take()
+            .map(|(local, _)| local)
+            .filter(|local| local.changed)
+    }
+
+    /// An owned term as a term of this match.
+    fn seq_term(&self, owned: &OwnedTerm) -> Result<Term, arinsal_ets::EtsError> {
+        let mut heap = VecHeap::new();
+        let term = from_owned(owned, &mut heap).map_err(|_| arinsal_ets::EtsError::BadArg)?;
+        self.seq_heaps.borrow_mut().push(heap);
+        Ok(term)
+    }
+
     fn take_trace_actions(&self) -> Vec<(String, VecHeap, Vec<Term>)> {
         std::mem::take(&mut *self.trace_actions.borrow_mut())
     }
 }
 
 impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
+    fn self_pid(&self) -> Option<Term> {
+        self.self_pid
+    }
+
     fn trace_control_word(&self) -> Option<Term> {
         Term::small(self.trace_control_word.get())
     }
@@ -301,6 +341,49 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
                     .borrow_mut()
                     .push((name.to_owned(), heap, copied));
                 Ok(crate::signals::atom("true"))
+            }
+            // Port of erts/emulator/beam/erl_db_util.c (matchIsSeqTrace, matchGetSeqToken),
+            // OTP-29.1.1.
+            "is_seq_trace" => Ok(crate::signals::atom(
+                if self
+                    .seq
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(local, _)| local.has_token())
+                {
+                    "true"
+                } else {
+                    "false"
+                },
+            )),
+            "get_seq_token" => {
+                let owned = self
+                    .seq
+                    .borrow()
+                    .as_ref()
+                    .map_or(OwnedTerm::Nil, |(local, _)| local.token_owned());
+                self.seq_term(&owned)
+            }
+            // Port of erts/emulator/beam/erl_db_util.c (matchSetSeqToken): `{set_seq_token,
+            // Item, Value}` returns the previous value of the component.
+            "set_seq_token" => {
+                let [item, value] = arguments else {
+                    return Err(arinsal_ets::EtsError::BadArg);
+                };
+                let name = item
+                    .as_atom()
+                    .and_then(|atom| global_atoms().text(atom))
+                    .ok_or(arinsal_ets::EtsError::BadArg)?
+                    .to_owned();
+                let value = to_owned(*value).map_err(|_| arinsal_ets::EtsError::BadArg)?;
+                let old = {
+                    let mut seq = self.seq.borrow_mut();
+                    let (local, pid) = seq.as_mut().ok_or(arinsal_ets::EtsError::BadArg)?;
+                    local
+                        .set_component(*pid, &name, &value)
+                        .ok_or(arinsal_ets::EtsError::BadArg)?
+                };
+                self.seq_term(&old)
             }
             "caller" => Ok(self
                 .caller
@@ -745,6 +828,9 @@ pub(crate) fn configure_new_ports(
     tracer: Tracer,
 ) {
     let key = (scope(process), session);
+    if how_on {
+        publish_tracer_flag(process, &tracer);
+    }
     let mut tracing = new_port_tracing().lock().unwrap();
     let (current, current_tracer) = tracing.entry(key).or_default();
     if how_on {
@@ -1238,7 +1324,12 @@ fn note_trace_owner(process: &Process, pid: Pid, tracer: &Tracer) {
         return;
     };
     let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::TRACE);
-    if let Tracer::Pid(tracer) = tracer {
+    publish_tracer_flag(process, tracer);
+}
+
+/// A process that is the tracer of `new` processes or ports clears that tracing when it exits.
+fn publish_tracer_flag(process: &Process, tracer: &Tracer) {
+    if let (Some(runtime), Tracer::Pid(tracer)) = (process.runtime.as_ref(), tracer) {
         let _ = runtime.publish_proc_flag(*tracer, arinsal_sched::proc_flags::TRACER);
     }
 }
@@ -1622,6 +1713,9 @@ pub(crate) fn configure_new_processes(
     tracer: Tracer,
 ) {
     let key = (scope(process), session);
+    if how_on {
+        publish_tracer_flag(process, &tracer);
+    }
     let mut tracing = new_process_tracing().lock().unwrap();
     let (current, current_tracer) = tracing.entry(key).or_default();
     if how_on {
@@ -1841,7 +1935,9 @@ fn run_call_match(
         current_stacktraces,
         dump,
         crate::natives::sys::trace_control_word_value(process),
-    );
+    )
+    .with_seq(crate::seq_trace::Local::of(process), ctx.pid())
+    .with_self_pid(ctx.pid().to_term());
     let result = program
         .run_with_context(
             against,
@@ -1850,6 +1946,9 @@ fn run_call_match(
         )
         .map_err(|error| VmError::Unsupported(format!("trace match spec execution: {error:?}")))?;
     crate::natives::sys::set_trace_control_word_value(process, context.trace_control_word.get());
+    if let Some(local) = context.take_seq() {
+        local.commit(process);
+    }
     if let Some(silent) = context.silent.get() {
         set_session_silent(process, session, ctx.pid(), silent);
     }
@@ -3855,7 +3954,8 @@ fn emit_filtered(
                     Vec::new(),
                     dump,
                     crate::natives::sys::trace_control_word_value(process),
-                );
+                )
+                .with_self_pid(Some(subject_term));
                 let result = program.run_with_context(
                     against,
                     &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
@@ -3952,21 +4052,29 @@ fn deliver(
     // Port of erts/emulator/nifs/common/erl_tracer_nif.c:237-253 (enif_make_tuple_from_array
     // in the tracee env, then enif_send copies it), OTP-29.1.1. A full heap must not drop
     // the event, so the tuple may land in a heap fragment.
-    let Ok(event) =
-        TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap)).tuple(&values)
-    else {
-        return;
-    };
-    let Ok(message) = Message::copy_from(event) else {
-        return;
-    };
     match &entry.tracer {
         Tracer::Default => {}
         Tracer::Pid(pid) if *pid == subject => {}
         Tracer::Pid(pid) => {
+            // Port of erts/emulator/beam/erl_trace.c (send_to_tracer_nif: the message is built
+            // in temporary storage and copied into the tracer's message), OTP-29.1.1: the
+            // tracee's heap, possibly mid-unwind, is not touched.
+            let mut scratch = VecHeap::new();
+            let Ok(event) = TermBuilder::new(&mut scratch).tuple(&values) else {
+                return;
+            };
+            let Ok(message) = Message::copy_from(event) else {
+                return;
+            };
             let _ = ctx.send(*pid, message);
         }
         Tracer::Port(id) => {
+            let Ok(event) =
+                TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                    .tuple(&values)
+            else {
+                return;
+            };
             if let Some(port) = Term::port(*id) {
                 let _ = crate::port::trace_command(process, port, event);
             }

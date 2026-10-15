@@ -1451,9 +1451,10 @@ fn push_trace_frames(
             if !reserve_trace_stack(process, 2)? {
                 return Err(VmError::Unsupported("return_to trace stack".into()));
             }
-            process
-                .heap
-                .stack_set(0, trace_continuation(module_id, return_to_ip)?);
+            process.heap.stack_set(
+                0,
+                crate::stacktrace::return_to_trace_tag(module_id, return_to_ip)?,
+            );
             process.heap.stack_set(
                 1,
                 Term::small(
@@ -1482,9 +1483,10 @@ fn push_trace_frames(
         if !reserve_trace_stack(process, 6)? {
             return Err(VmError::Unsupported("call trace stack".into()));
         }
-        process
-            .heap
-            .stack_set(0, trace_continuation(module_id, return_trace_ip)?);
+        process.heap.stack_set(
+            0,
+            crate::stacktrace::return_trace_tag(module_id, return_trace_ip)?,
+        );
         for (index, value) in [
             module,
             entry,
@@ -1502,11 +1504,6 @@ fn push_trace_frames(
         }
     }
     Ok(())
-}
-
-/// A trace frame returns through its module's handler instruction, like any interpreter CP.
-fn trace_continuation(module_id: usize, target: usize) -> Result<Term, VmError> {
-    crate::stacktrace::continuation_tag(module_id, target)
 }
 
 fn reserve_trace_stack(process: &mut Process, words: usize) -> Result<bool, VmError> {
