@@ -720,6 +720,15 @@ fn parse(
                     }
                     ids.push(id);
                 }
+                let magic = ids.len() == 3 && ids[2] == u32::MAX;
+                if tag == 90
+                    && node == "nonode@nohost"
+                    && creation == 0
+                    && !magic
+                    && ids[0] >= (1 << 18)
+                {
+                    return Err(invalid(at, "invalid local reference id"));
+                }
                 Some(OwnedTerm::Ref {
                     node,
                     creation,
