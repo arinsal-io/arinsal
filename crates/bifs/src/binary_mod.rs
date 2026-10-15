@@ -589,17 +589,20 @@ impl SearchWalk {
                         result_node = pattern.nodes[result_node].failure;
                     }
                     let result_start = *position - pattern.nodes[result_node].depth as usize;
-                    let saved_len = found.len();
-                    while let Some(&(last_position, last_len)) = found.last()
-                        && (last_position > result_start
-                            || (last_position == result_start
-                                && last_len < pattern.nodes[result_node].depth as usize))
+                    let mut retained = found.len();
+                    while retained > 0
+                        && (found[retained - 1].0 > result_start
+                            || (found[retained - 1].0 == result_start
+                                && found[retained - 1].1
+                                    < pattern.nodes[result_node].depth as usize))
                     {
-                        found.pop();
+                        retained -= 1;
                     }
-                    if found.last().is_none_or(|&(last_position, last_len)| {
+                    if retained == 0 || {
+                        let (last_position, last_len) = found[retained - 1];
                         last_position + last_len <= result_start
-                    }) {
+                    } {
+                        found.truncate(retained);
                         if found.len() == found.capacity() {
                             let additional = if found.capacity() == 0 {
                                 10
@@ -609,8 +612,6 @@ impl SearchWalk {
                             found.reserve_exact(additional);
                         }
                         found.push((result_start, pattern.nodes[result_node].depth as usize));
-                    } else {
-                        found.truncate(saved_len);
                     }
                     result_node = pattern.nodes[result_node].failure;
                 }

@@ -4588,6 +4588,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
+    process.reductions = process.header.fcalls;
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
@@ -4680,6 +4681,17 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
             return 0;
         }
     };
+    let copy_reductions = match arinsal_bits::create_bin_reductions(&initial) {
+        Ok(reductions) => reductions,
+        Err(error) => {
+            let (reason, info) = crate::bits::native_error(error);
+            if !has_fail_label {
+                process.cold_mut().native_error_info = info;
+            }
+            crate::native_hooks::set_error(process, &reason);
+            return 0;
+        }
+    };
     drop(initial);
     let result = loop {
         if request != 0 && process.ensure(request, root_live).is_err() {
@@ -4706,6 +4718,11 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         *slot = *term;
     }
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+    if result.is_ok() {
+        process.reductions = process
+            .reductions
+            .saturating_sub(copy_reductions.min(i32::MAX as usize) as i32);
+    }
     process.sync_native_header();
     match result {
         Ok(term) => crate::native_hooks::raw(term),

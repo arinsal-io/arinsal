@@ -467,6 +467,46 @@ pub fn create_bin_size(segments: &[Segment<'_>]) -> Result<BinSize, BitsError> {
     Ok(BinSize { bits, heap_words })
 }
 
+/// Return the reductions spent copying binary segments while creating this bitstring.
+// Port of erts/emulator/beam/erl_bits.c:1285-1330 and 1725-2016
+// (`erts_bs_put_binary*`, `erts_bs_append_checked`, and `erts_bs_private_append_checked`),
+// OTP-29.1.1.
+pub fn create_bin_reductions(segments: &[Segment<'_>]) -> Result<usize, BitsError> {
+    const BITS_PER_REDUCTION: usize = 8 * 1024;
+    let mut reductions = 0usize;
+    for segment in segments {
+        if segment.ty == SegType::Binary {
+            reductions = reductions.saturating_add(size_of(segment)? / BITS_PER_REDUCTION);
+        }
+    }
+    if let Some(first) = segments.first()
+        && matches!(first.ty, SegType::Append | SegType::PrivateAppend)
+        && let SegmentValue::Term(source) = first.value
+    {
+        let source_bits = bit_size(source).ok_or(BitsError::BadArg {
+            segment: first.index,
+        })?;
+        let suffix_bits = create_bin_size(segments)?
+            .bits
+            .saturating_sub(size_of(first)?);
+        if suffix_bits != 0 {
+            let needs_copy = if is_writable_binary(source) {
+                let capacity =
+                    arinsal_term::writable_capacity(source).ok_or(BitsError::BadArg {
+                        segment: first.index,
+                    })?;
+                source_bits.saturating_add(suffix_bits).div_ceil(8) > capacity
+            } else {
+                true
+            };
+            if needs_copy {
+                reductions = reductions.saturating_add(source_bits / BITS_PER_REDUCTION);
+            }
+        }
+    }
+    Ok(reductions)
+}
+
 #[inline]
 fn bit(bytes: &[u8], position: usize) -> u8 {
     (bytes[position / 8] >> (7 - position % 8)) & 1
