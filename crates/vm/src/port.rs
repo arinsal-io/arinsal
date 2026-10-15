@@ -247,6 +247,9 @@ pub(crate) struct PortHandle {
     halt_progress: Mutex<Option<HaltProgress>>,
     /// `ram_file_drv` port data (`drv_data`), present from `rfile_start` until `rfile_stop`.
     ram_file: Mutex<Option<Arc<crate::ram_file_drv::RamPort>>>,
+    /// Driver-owned state returned by the inet driver's start callback.
+    inet_tcp: Mutex<Option<Arc<crate::inet_drv::Sock>>>,
+    inet_udp: Mutex<Option<Arc<crate::inet_udp::Sock>>>,
 }
 
 /// Inspect or move the next local port id for `erts_debug` table tests.
@@ -347,6 +350,30 @@ impl PortHandle {
     }
     pub(crate) fn port_name(&self) -> String {
         self.name.clone()
+    }
+
+    pub(crate) fn tcp_driver_data(&self) -> Option<Arc<crate::inet_drv::Sock>> {
+        self.inet_tcp.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_tcp_driver_data(&self, data: Arc<crate::inet_drv::Sock>) {
+        *self.inet_tcp.lock().unwrap() = Some(data);
+    }
+
+    pub(crate) fn take_tcp_driver_data(&self) -> Option<Arc<crate::inet_drv::Sock>> {
+        self.inet_tcp.lock().unwrap().take()
+    }
+
+    pub(crate) fn udp_driver_data(&self) -> Option<Arc<crate::inet_udp::Sock>> {
+        self.inet_udp.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_udp_driver_data(&self, data: Arc<crate::inet_udp::Sock>) {
+        *self.inet_udp.lock().unwrap() = Some(data);
+    }
+
+    pub(crate) fn take_udp_driver_data(&self) -> Option<Arc<crate::inet_udp::Sock>> {
+        self.inet_udp.lock().unwrap().take()
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -1249,7 +1276,7 @@ fn start_driver(
     if ram_file {
         *handle.ram_file.lock().unwrap() = Some(crate::ram_file_drv::start(_binary));
     } else if udp {
-        crate::inet_udp::attach(Arc::clone(runtime), port_id, Arc::clone(&handle));
+        crate::inet_udp::attach(port_id, Arc::clone(&handle));
     } else {
         crate::inet_drv::attach(Arc::clone(runtime), port_id, Arc::clone(&handle));
     }
@@ -2105,9 +2132,9 @@ pub(crate) fn abandon_port(runtime: &crate::process::Runtime, id: u64) {
     let Some(handle) = remove_port(runtime, id) else {
         return;
     };
-    crate::inet_drv::detach(id);
+    crate::inet_drv::detach(&handle);
     // g_inet_udp
-    crate::inet_udp::detach(id);
+    crate::inet_udp::detach(&handle);
     let owner = *handle.owner.lock().unwrap();
     let scheduler = Arc::clone(&handle.scheduler);
     release_io(&handle);
@@ -2412,6 +2439,8 @@ fn make_handle_with(
         reg_closing: AtomicBool::new(false),
         halt_progress: Mutex::new(None),
         ram_file: Mutex::new(None),
+        inet_tcp: Mutex::new(None),
+        inet_udp: Mutex::new(None),
     });
     Ok(handle)
 }
@@ -3331,11 +3360,13 @@ fn port_control(
     let Some(data) = bytes(data) else {
         return Ok(atom("badarg"));
     };
-    // g_inet_udp
-    if crate::inet_udp::owns(id) {
-        return crate::inet_udp::control(process, id, caller, op, &data);
+    if let Some(sock) = handle.udp_driver_data() {
+        return crate::inet_udp::control(process, &sock, caller, op, &data);
     }
-    crate::inet_drv::control(process, id, caller, op, &data)
+    let Some(sock) = handle.tcp_driver_data() else {
+        return Ok(atom("badarg"));
+    };
+    crate::inet_drv::control(process, &sock, caller, op, &data)
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:263 (erts_internal_port_call_3), OTP-29.1.1.
@@ -3539,10 +3570,13 @@ fn port_command(
         drop(st);
         // Port of erts/emulator/drivers/common/inet_drv.c:12629 (tcp_inet_command), OTP-29.1.1.
         // g_inet_udp: datagram sends use packet_inet_command, not tcp_sendv.
-        if crate::inet_udp::owns(id) {
-            return crate::inet_udp::command(id, ctx.pid(), &framed).map(|()| atom("true"));
+        if let Some(sock) = handle.udp_driver_data() {
+            return crate::inet_udp::command(&sock, ctx.pid(), &framed).map(|()| atom("true"));
         }
-        return crate::inet_drv::command(id, ctx.pid(), framed).map(|()| atom("true"));
+        let Some(sock) = handle.tcp_driver_data() else {
+            return Err(badarg());
+        };
+        return crate::inet_drv::command(&sock, ctx.pid(), framed).map(|()| atom("true"));
     }
     let ram_file = handle.ram_file.lock().unwrap().clone();
     if let Some(ram_file) = ram_file {
@@ -3824,9 +3858,8 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
     if let Some(handle) = removed {
         crate::trace::port_closed(runtime, id);
         if handle.inet {
-            crate::inet_drv::detach(id);
-            // g_inet_udp
-            crate::inet_udp::detach(id);
+            crate::inet_drv::detach(&handle);
+            crate::inet_udp::detach(&handle);
         }
         release_io(&handle);
         Ok(atom("true"))
@@ -3926,7 +3959,8 @@ pub(crate) fn exit_port(
     };
     crate::trace::port_closed(runtime, id);
     if removed.inet {
-        crate::inet_drv::detach(id);
+        crate::inet_drv::detach(&removed);
+        crate::inet_udp::detach(&removed);
     }
     release_io(&removed);
     Ok(())
@@ -3969,8 +4003,8 @@ pub(crate) fn halt_reap_ports(runtime: &Arc<crate::process::Runtime>, progress: 
         ) {
             crate::trace::port_closed(runtime, handle.id);
             if removed.inet {
-                crate::inet_drv::detach(handle.id);
-                crate::inet_udp::detach(handle.id);
+                crate::inet_drv::detach(&removed);
+                crate::inet_udp::detach(&removed);
             }
             release_io(&removed);
         }
@@ -4114,9 +4148,8 @@ pub(crate) fn owner_exit(
         release_port_name(runtime, &handle);
         crate::trace::port_closed(runtime, port_id);
         if handle.inet {
-            crate::inet_drv::detach(port_id);
-            // g_inet_udp
-            crate::inet_udp::detach(port_id);
+            crate::inet_drv::detach(&handle);
+            crate::inet_udp::detach(&handle);
         }
         release_io(&handle);
         let Some(port) = Term::port(port_id) else {

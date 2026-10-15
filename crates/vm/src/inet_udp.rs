@@ -18,13 +18,12 @@ use crate::inet_drv::{
     split_caller, zeroed,
 };
 use crate::port::PortHandle;
-use crate::process::{Message, Runtime};
+use crate::process::Message;
 use crate::{Process, VmError};
 use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
-use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 const REQ_OPEN: i64 = 1;
@@ -97,15 +96,6 @@ fn badarg() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
 }
 
-fn registry() -> &'static Mutex<HashMap<u64, Arc<Sock>>> {
-    static REG: OnceLock<Mutex<HashMap<u64, Arc<Sock>>>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn lookup(id: u64) -> Option<Arc<Sock>> {
-    registry().lock().unwrap().get(&id).cloned()
-}
-
 /// Work for the UDP thread: readiness events from the poll set (`iready`) and pokes from
 /// control and command calls on a port.
 ///
@@ -113,8 +103,9 @@ fn lookup(id: u64) -> Option<Arc<Sock>> {
 /// erl_check_io.c, OTP-29.1.1.
 #[derive(Default)]
 struct Tasks {
-    ready: Vec<(u64, RawFd, crate::check_io::Ready)>,
-    poked: Vec<u64>,
+    ready: Vec<(Arc<Sock>, RawFd, crate::check_io::Ready)>,
+    poked: Vec<Arc<Sock>>,
+    sockets: Vec<Weak<Sock>>,
 }
 
 fn tasks() -> &'static (Mutex<Tasks>, Condvar) {
@@ -129,42 +120,49 @@ fn tasks() -> &'static (Mutex<Tasks>, Condvar) {
 }
 
 /// Ask the UDP thread to run port `id` (and recompute its selection).
-fn poke(id: u64) {
+fn register_sock(sock: &Arc<Sock>) {
+    let (lock, _) = tasks();
+    let mut tasks = lock.lock().unwrap();
+    tasks.sockets.retain(|entry| entry.strong_count() > 0);
+    tasks.sockets.push(Arc::downgrade(sock));
+}
+
+fn live_socks() -> Vec<Arc<Sock>> {
+    let (lock, _) = tasks();
+    let mut tasks = lock.lock().unwrap();
+    tasks.sockets.retain(|entry| entry.strong_count() > 0);
+    tasks.sockets.iter().filter_map(Weak::upgrade).collect()
+}
+
+fn poke(sock: &Arc<Sock>) {
     let (lock, wake) = tasks();
     let mut tasks = lock.lock().unwrap();
-    if !tasks.poked.contains(&id) {
-        tasks.poked.push(id);
+    if !tasks.poked.iter().any(|poked| Arc::ptr_eq(poked, sock)) {
+        tasks.poked.push(Arc::clone(sock));
     }
     drop(tasks);
     wake.notify_one();
 }
 
 /// `iready`: schedule the port's input task on the UDP thread.
-fn schedule_ready(id: u64, fd: RawFd, ready: crate::check_io::Ready) {
+fn schedule_ready(sock: Arc<Sock>, fd: RawFd, ready: crate::check_io::Ready) {
     let (lock, wake) = tasks();
-    lock.lock().unwrap().ready.push((id, fd, ready));
+    lock.lock().unwrap().ready.push((sock, fd, ready));
     wake.notify_one();
 }
 
 /// Register a `udp_inet` port created by `open_port({spawn_driver, …})`.
-pub(crate) fn attach(runtime: Arc<Runtime>, id: u64, handle: Arc<PortHandle>) {
+pub(crate) fn attach(id: u64, handle: Arc<PortHandle>) {
     let _ = tasks();
-    registry()
-        .lock()
-        .unwrap()
-        .insert(id, Arc::new(Sock::new(id, runtime, handle)));
-    poke(id);
-}
-
-/// `true` when `id` is a live or just-created `udp_inet` port.
-pub(crate) fn owns(id: u64) -> bool {
-    registry().lock().unwrap().contains_key(&id)
+    let sock = Arc::new(Sock::new(id, &handle));
+    handle.set_udp_driver_data(Arc::clone(&sock));
+    register_sock(&sock);
+    poke(&sock);
 }
 
 /// Drop the datagram socket. A waiting `recv` sees `{error, closed}`.
-pub(crate) fn detach(id: u64) {
-    let sock = { registry().lock().unwrap().remove(&id) };
-    let Some(sock) = sock else {
+pub(crate) fn detach(handle: &Arc<PortHandle>) {
+    let Some(sock) = handle.take_udp_driver_data() else {
         return;
     };
     let (fd, pending) = {
@@ -185,35 +183,29 @@ pub(crate) fn detach(id: u64) {
             },
         );
     }
-    poke(id);
+    poke(&sock);
 }
 
 pub(crate) fn control(
     process: &mut Process,
-    id: u64,
+    sock: &Arc<Sock>,
     caller: Pid,
     op: i64,
     data: &[u8],
 ) -> Result<Term, VmError> {
-    let Some(sock) = lookup(id) else {
-        return byte_list(process, &err_bytes("exbadport"));
-    };
     // Port of inet_drv.c:14574 (packet_inet_ctl subtracts the magic), OTP-29.1.1.
     let cmd = op.wrapping_sub(inet_drv::MAGIC);
-    let reply = dispatch(&sock, caller, cmd, data);
-    poke(id);
+    let reply = dispatch(sock, caller, cmd, data);
+    poke(sock);
     byte_list(process, &reply)
 }
 
-pub(crate) fn command(id: u64, caller: Pid, data: &[u8]) -> Result<(), VmError> {
-    let Some(sock) = lookup(id) else {
-        return Err(badarg());
-    };
+pub(crate) fn command(sock: &Arc<Sock>, caller: Pid, data: &[u8]) -> Result<(), VmError> {
     // Port of inet_drv.c:15037 (packet_inet_command), OTP-29.1.1.
     let (ids, payload) = split_caller(data).ok_or_else(badarg)?;
-    let error = send_command(&sock, payload);
-    emit(&sock, Out::InetReply { caller, ids, error });
-    poke(id);
+    let error = send_command(sock, payload);
+    emit(sock, Out::InetReply { caller, ids, error });
+    poke(sock);
     Ok(())
 }
 
@@ -318,7 +310,10 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     set_nonblock(fd);
     set_nosigpipe(fd);
     // SAFETY: fd was just created and is moved into OwnedFd.
-    inner.fd = Some(UdpFd::new(unsafe { OwnedFd::from_raw_fd(fd) }, inner.id));
+    inner.fd = Some(UdpFd::new(
+        unsafe { OwnedFd::from_raw_fd(fd) },
+        inner.selection_owner,
+    ));
     inner.domain = domain;
     inner.family_code = data[0];
     inner.open = true;
@@ -364,7 +359,7 @@ fn fdopen_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     }
     set_nonblock(fd.as_raw_fd());
     set_nosigpipe(fd.as_raw_fd());
-    inner.fd = Some(UdpFd::new(fd, inner.id));
+    inner.fd = Some(UdpFd::new(fd, inner.selection_owner));
     inner.fd_external = Some(raw_fd);
     inner.domain = domain;
     inner.family_code = data[0];
@@ -1179,7 +1174,7 @@ fn pump(sock: &Arc<Sock>) {
     let outs = {
         let mut inner = sock.inner.lock().unwrap();
         let mut outs = Vec::new();
-        pull(&sock.handle, &mut inner, &mut outs);
+        pull(&sock.handle(), &mut inner, &mut outs);
         timeout_if_empty(&mut inner, &mut outs);
         outs
     };
@@ -1635,7 +1630,7 @@ enum Out {
 }
 
 fn emit(sock: &Sock, out: Out) {
-    let sched = sock.handle.scheduler();
+    let sched = sock.handle().scheduler();
     let port = Term::port(sock.id).unwrap();
     let words = 256
         + match &out {
@@ -1841,22 +1836,29 @@ fn anc_term(heap: &mut ProcessHeap, anc: &[Anc]) -> Option<Term> {
     TermBuilder::new(heap).list_from_iter(items).ok()
 }
 
-struct Sock {
+pub(crate) struct Sock {
     id: u64,
-    handle: Arc<PortHandle>,
+    selection_owner: usize,
+    handle: Weak<PortHandle>,
     inner: Mutex<Inner>,
 }
 
 impl Sock {
-    fn new(id: u64, _runtime: Arc<Runtime>, handle: Arc<PortHandle>) -> Self {
+    fn new(id: u64, handle: &Arc<PortHandle>) -> Self {
+        let selection_owner = Arc::as_ptr(handle) as usize;
         Self {
             id,
-            handle,
+            selection_owner,
+            handle: Arc::downgrade(handle),
             inner: Mutex::new(Inner {
-                id,
+                selection_owner,
                 ..Inner::default()
             }),
         }
+    }
+
+    fn handle(&self) -> Arc<PortHandle> {
+        self.handle.upgrade().expect("live udp inet port handle")
     }
 }
 
@@ -1876,7 +1878,7 @@ struct Recv {
 }
 
 struct Inner {
-    id: u64,
+    selection_owner: usize,
     fd: Option<UdpFd>,
     fd_external: Option<RawFd>,
     domain: i32,
@@ -1921,7 +1923,7 @@ impl Default for Inner {
     fn default() -> Self {
         // Port of inet_drv.c:10891 (inet_start) and :14508 (read_packets), OTP-29.1.1.
         Self {
-            id: 0,
+            selection_owner: 0,
             fd: None,
             fd_external: None,
             domain: libc::AF_INET,
@@ -1990,26 +1992,27 @@ fn io_loop() {
                 std::mem::take(&mut tasks.poked),
             )
         };
-        for (id, fd, _event) in ready {
-            let Some(sock) = lookup(id) else {
+        for (sock, fd, _event) in ready {
+            let Some(_handle) = sock.handle.upgrade() else {
                 continue;
             };
             pump(&sock);
             sock_select(&sock);
             crate::check_io::notify_executed(
                 fd,
-                id,
+                sock.selection_owner,
                 crate::check_io::InterestSet {
                     readable: true,
                     writable: true,
                 },
             );
         }
-        for id in poked {
-            if let Some(sock) = lookup(id) {
-                pump(&sock);
-                sock_select(&sock);
-            }
+        for sock in poked {
+            let Some(_handle) = sock.handle.upgrade() else {
+                continue;
+            };
+            pump(&sock);
+            sock_select(&sock);
         }
         for sock in fire_timeouts() {
             sock_select(&sock);
@@ -2024,7 +2027,6 @@ fn io_loop() {
 fn sock_select(sock: &Arc<Sock>) {
     let mut inner = sock.inner.lock().unwrap();
     let readable = inner.open && (inner.recv.is_some() || active_is(&inner.active));
-    let id = sock.id;
     let Some(fd) = inner.fd.as_mut() else {
         return;
     };
@@ -2036,9 +2038,13 @@ fn sock_select(sock: &Arc<Sock>) {
         readable,
         writable: false,
     };
-    let ready: crate::check_io::SelectCallback =
-        Arc::new(move |fd, event| schedule_ready(id, fd, event));
-    if crate::check_io::driver_select(raw, id, want, ready).is_ok() {
+    let weak = Arc::downgrade(sock);
+    let ready: crate::check_io::SelectCallback = Arc::new(move |fd, event| {
+        if let Some(sock) = weak.upgrade() {
+            schedule_ready(sock, fd, event);
+        }
+    });
+    if crate::check_io::driver_select(raw, sock.selection_owner, want, ready).is_ok() {
         fd.selected = readable;
     }
 }
@@ -2050,16 +2056,16 @@ fn sock_select(sock: &Arc<Sock>) {
 /// descriptor out of the poll set (inet_drv.c, OTP-29.1.1).
 struct UdpFd {
     fd: OwnedFd,
-    port: u64,
+    owner: usize,
     /// FD_READ is selected in the shared poll set (`state->events` in erl_check_io.c).
     selected: bool,
 }
 
 impl UdpFd {
-    fn new(fd: OwnedFd, port: u64) -> Self {
+    fn new(fd: OwnedFd, owner: usize) -> Self {
         Self {
             fd,
-            port,
+            owner,
             selected: false,
         }
     }
@@ -2074,13 +2080,13 @@ impl AsRawFd for UdpFd {
 impl Drop for UdpFd {
     fn drop(&mut self) {
         if self.selected {
-            crate::check_io::driver_deselect(self.fd.as_raw_fd(), self.port);
+            crate::check_io::driver_deselect(self.fd.as_raw_fd(), self.owner);
         }
     }
 }
 
 fn next_timeout() -> Option<libc::timespec> {
-    let socks: Vec<Arc<Sock>> = registry().lock().unwrap().values().cloned().collect();
+    let socks = live_socks();
     let mut soon: Option<Instant> = None;
     for sock in socks {
         let inner = sock.inner.lock().unwrap();
@@ -2099,10 +2105,13 @@ fn next_timeout() -> Option<libc::timespec> {
 }
 
 fn fire_timeouts() -> Vec<Arc<Sock>> {
-    let socks: Vec<Arc<Sock>> = registry().lock().unwrap().values().cloned().collect();
+    let socks = live_socks();
     let now = Instant::now();
     let mut fired = Vec::new();
     for sock in socks {
+        let Some(_handle) = sock.handle.upgrade() else {
+            continue;
+        };
         let due = {
             let mut inner = sock.inner.lock().unwrap();
             if inner

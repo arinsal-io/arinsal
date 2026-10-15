@@ -410,6 +410,7 @@ dependencies = [
  "rustix",
  "similar-asserts",
  "smallvec",
+ "socket2",
 ]
 
 [[package]]

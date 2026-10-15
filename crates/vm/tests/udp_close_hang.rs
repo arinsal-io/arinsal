@@ -24,7 +24,7 @@ fn arinsal() -> std::path::PathBuf {
 #[test]
 fn concurrent_gen_udp_open_close_loops_finish() {
     let eval = format!(
-        "lists:foreach(fun(_) -> {{ok, S}} = gen_udp:open(0, []), ok = gen_udp:close(S) end, \
+        "lists:foreach(fun(_) -> {{ok, S}} = gen_udp:open(0, [inet, {{ip, {{127,0,0,1}}}}]), ok = gen_udp:close(S) end, \
                        lists:seq(1, {CYCLES})), \
          halt()."
     );

@@ -213,7 +213,15 @@ fn create_channel(
     let handle = match port_controller {
         Some(port_id) => {
             // Port DistCtrlr: the real inet port is the channel.
-            if !crate::inet_drv::owns(port_id) {
+            let owns_tcp_port = process.runtime.as_ref().is_some_and(|runtime| {
+                runtime
+                    .ports
+                    .lock()
+                    .unwrap()
+                    .get(&port_id)
+                    .is_some_and(|handle| handle.tcp_driver_data().is_some())
+            });
+            if !owns_tcp_port {
                 return Err(badarg());
             }
             port_id
@@ -2711,7 +2719,17 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
         // The port is gone (closed between the queue push and this flush): erts drops the
         // data and the port exit tears the connection down
         // (erts/emulator/beam/dist.c, dist_port_exit / erts_do_net_exits), OTP-29.1.1.
-        let port_busy = crate::inet_drv::dist_output(port_id, &packet).unwrap_or_default();
+        let sock = {
+            runtime
+                .ports
+                .lock()
+                .unwrap()
+                .get(&port_id)
+                .and_then(|handle| handle.tcp_driver_data())
+        };
+        let port_busy = sock
+            .and_then(|sock| crate::inet_drv::dist_output(&sock, &packet).ok())
+            .unwrap_or_default();
         let resumed = {
             let mut tables = node_tables::lock();
             let Some(state) = tables.entries.values_mut().find_map(|entry| {
