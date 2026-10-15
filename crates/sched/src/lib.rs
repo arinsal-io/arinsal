@@ -7768,7 +7768,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             let mut spins = SCHED_TSE_SLEEP_SPINCOUNT;
             let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
             while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
-                std::hint::spin_loop();
+                spin_body();
                 until_yield -= 1;
                 if until_yield == 0 {
                     until_yield = SCHED_SPIN_UNTIL_YIELD;
@@ -8031,7 +8031,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         let mut spins = SCHED_TSE_SLEEP_SPINCOUNT;
         let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
         while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
-            std::hint::spin_loop();
+            spin_body();
             until_yield -= 1;
             if until_yield == 0 {
                 until_yield = SCHED_SPIN_UNTIL_YIELD;
@@ -8103,6 +8103,16 @@ const AUX_WORK_STATS: u32 = 1 << 1;
 const PINNED_FLAGS_SHIFT: u32 = 8;
 
 // Port of erts/emulator/beam/erl_process.c:69,75,84 (medium busy-wait threshold), OTP-29.1.1.
+/// One iteration of a busy wait. A pause instruction on x86; elsewhere only a compiler
+/// barrier, since a hardware hint such as `isb` makes the sleep spin far more expensive.
+#[inline(always)]
+fn spin_body() {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    std::hint::spin_loop();
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
 const SCHED_SPIN_UNTIL_YIELD: u32 = 100;
 const SCHED_TSE_SLEEP_SPINCOUNT: u32 = 10 * 1000;
 
@@ -8177,7 +8187,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                 let mut spins = SCHED_TSE_SLEEP_SPINCOUNT;
                 let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
                 while spins > 0 && !thread.wake.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
+                    spin_body();
                     until_yield -= 1;
                     if until_yield == 0 {
                         until_yield = SCHED_SPIN_UNTIL_YIELD;
