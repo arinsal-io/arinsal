@@ -2624,6 +2624,15 @@ fn iolist_binary_conversion(
         };
         return Ok(HandlerResult::Done { value, reductions });
     }
+    // list_to_bitstring traps to the same continuation export as list_to_binary
+    // (erl_iolist.c list_to_bitstring_continue), so the state decides which walk resumes.
+    if state.is_some_and(|state| {
+        state
+            .downcast_ref::<Mutex<arinsal_bifs::IolistWalk>>()
+            .is_some()
+    }) {
+        return iolist_conversion(process, root, state, true, _restore_gc);
+    }
     let state = Arc::clone(state.expect("resumed iolist conversion has state"));
     let phase = state
         .downcast_ref::<Mutex<IolistBinaryPhase>>()

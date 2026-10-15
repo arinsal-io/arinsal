@@ -3,7 +3,8 @@
 use crate::{Process, VmError};
 use arinsal_bits::{
     BitsError, MatchOps, SegFlags, SegSize, SegType, Segment, SegmentValue, create_bin,
-    create_bin_size, get_position, init_writable, set_position_term, start_match,
+    create_bin_reductions, create_bin_size, get_position, init_writable, set_position_term,
+    start_match,
 };
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::{Arg, BitCommandKind, GenericOp, Instr, Module};
@@ -606,33 +607,8 @@ pub(super) fn execute(
                 }
                 Err(err) => return Err(error(err, frame)),
             };
-            let bit_copy_cost = initial
-                .iter()
-                .map(|segment| {
-                    let source_bits = match segment.value {
-                        SegmentValue::Term(value) => arinsal_bits::bit_size(value).unwrap_or(0),
-                        SegmentValue::String(_) => 0,
-                    };
-                    let segment_bits = match segment.size {
-                        SegSize::All => source_bits,
-                        SegSize::Units(units) => usize::try_from(units)
-                            .ok()
-                            .and_then(|units| units.checked_mul(usize::from(segment.unit)))
-                            .unwrap_or(0),
-                        SegSize::Term(term) => term
-                            .as_small()
-                            .and_then(|units| usize::try_from(units).ok())
-                            .and_then(|units| units.checked_mul(usize::from(segment.unit)))
-                            .unwrap_or(0),
-                    };
-                    match segment.ty {
-                        SegType::Binary => segment_bits,
-                        SegType::Append | SegType::PrivateAppend => source_bits,
-                        _ => 0,
-                    }
-                })
-                .sum::<usize>()
-                / (8 * 1024);
+            let bit_copy_cost =
+                create_bin_reductions(&initial).map_err(|bits_error| error(bits_error, frame))?;
             p.ensure(need.heap_words + b.value() as usize, live)?;
             let value = allocated(
                 p,

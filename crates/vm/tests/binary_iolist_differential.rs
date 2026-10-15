@@ -77,3 +77,83 @@ substrings() ->
 
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
+
+#[test]
+fn overlapping_multi_pattern_search_matches_otp_after_backtracking() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping binary search differential test");
+        return;
+    };
+    let source = r#"
+-module(binary_iolist_differential).
+-export([search/0]).
+
+search() ->
+    Subject = <<"abcdef">>,
+    Patterns = [<<"ab">>, <<"de">>, <<"bcdef">>],
+    {binary:matches(Subject, Patterns), binary:split(Subject, Patterns)}.
+"#;
+    let beam = reference
+        .compile_named("binary_iolist_differential", source, &[])
+        .unwrap();
+    reference.load("binary_iolist_differential", &beam).unwrap();
+    let expected = reference.call("binary_iolist_differential", "search", &[]);
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("binary_iolist_differential", "search", &[], 1, None)
+        .unwrap_or_else(|error| panic!("overlapping binary search: {error}"));
+
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+}
+
+#[test]
+fn large_flat_list_to_bitstring_matches_otp_across_traps() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping list_to_bitstring differential test");
+        return;
+    };
+    let source = r#"
+-module(binary_iolist_differential).
+-export([flat_bitstring/0, after_list_to_binary/0,
+         after_iolist_to_binary/0, after_both_binary_conversions/0]).
+
+list() -> lists:duplicate(50000, $@).
+result(List) ->
+    Bitstring = list_to_bitstring(List),
+    {bit_size(Bitstring), erlang:crc32(Bitstring)}.
+flat_bitstring() -> result(list()).
+after_list_to_binary() ->
+    List = list(),
+    _ = list_to_binary(List),
+    result(List).
+after_iolist_to_binary() ->
+    List = list(),
+    _ = iolist_to_binary(List),
+    result(List).
+after_both_binary_conversions() ->
+    List = lists:duplicate(50000, $@),
+    _ = list_to_binary(List),
+    _ = iolist_to_binary(List),
+    result(List).
+"#;
+    let beam = reference
+        .compile_named("binary_iolist_differential", source, &[])
+        .unwrap();
+    reference.load("binary_iolist_differential", &beam).unwrap();
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    for function in [
+        "flat_bitstring",
+        "after_list_to_binary",
+        "after_iolist_to_binary",
+        "after_both_binary_conversions",
+    ] {
+        let expected = reference.call("binary_iolist_differential", function, &[]);
+        let actual = vm
+            .eval_scheduled("binary_iolist_differential", function, &[], 1, None)
+            .unwrap_or_else(|error| panic!("large list_to_bitstring after {function}: {error}"));
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+    }
+}
