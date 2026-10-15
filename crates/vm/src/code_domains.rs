@@ -595,7 +595,14 @@ pub(crate) fn call(
                 let bytes = binary_arg(binary)?;
                 beams.push((name, bytes));
             }
-            match vm.load_into_domain(domain, &beams) {
+            let pid = ctx.pid();
+            let loaded = crate::natives::code::arl_with_domain_load_permission(
+                vm,
+                process,
+                pid,
+                |vm, _| vm.load_into_domain(domain, &beams),
+            )?;
+            match loaded {
                 Ok(()) => Ok(atom("ok")),
                 Err(("badarg", _)) => Err(badarg()),
                 Err((reason, names)) => {

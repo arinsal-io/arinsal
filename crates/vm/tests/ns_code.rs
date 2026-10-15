@@ -521,3 +521,198 @@ fn ns_code_root_unchanged() {
         best_static as f64 / 1e6
     );
 }
+
+/// Compiles `count` small modules `<prefix>_<i>` with one `erlc` run.
+fn compile_many(prefix: &str, count: usize) -> Option<Vec<(String, Vec<u8>)>> {
+    let dir = std::env::temp_dir().join(format!("arinsal-ns-code-{}-{prefix}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut files = Vec::new();
+    for i in 0..count {
+        let name = format!("{prefix}_{i}");
+        let file = dir.join(format!("{name}.erl"));
+        std::fs::write(
+            &file,
+            format!(
+                "-module({name}).\n-export([f/0, g/1]).\nf() -> {i}.\ng(X) -> lists:map(fun(Y) -> Y + {i} end, X).\n"
+            ),
+        )
+        .ok()?;
+        files.push(file);
+    }
+    let status = Command::new("erlc")
+        .arg("-o")
+        .arg(&dir)
+        .args(&files)
+        .status()
+        .ok()?;
+    let beams = status
+        .success()
+        .then(|| {
+            (0..count)
+                .map(|i| {
+                    let name = format!("{prefix}_{i}");
+                    let bytes = std::fs::read(dir.join(format!("{name}.beam"))).ok()?;
+                    Some((name, bytes))
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten();
+    let _ = std::fs::remove_dir_all(&dir);
+    beams
+}
+
+const LOAD_STRESS: &str = r#"
+-module(ns_code_stress).
+-export([run/1, poller/2, loader/2, purge_race/1]).
+run(Iterations) ->
+    ok = arinsal_ns:expose(self()),
+    run(Iterations, []).
+run(0, Acc) -> lists:reverse(Acc);
+run(N, Acc) ->
+    {ok, Ns} = arinsal_ns:create(<<"acme">>, integer_to_binary(N), #{}),
+    Self = self(),
+    Poller = spawn(?MODULE, poller, [Self, Ns]),
+    arinsal_ns:spawn(Ns, ?MODULE, loader, [Self, beams()]),
+    Loaded = receive {loaded, L} -> L after 30000 -> load_timeout end,
+    Poller ! stop,
+    Polls = receive {polls, P} -> P after 5000 -> poller_stuck end,
+    ok = arinsal_ns:destroy(Ns),
+    run(N - 1, [{Loaded, is_integer(Polls)} | Acc]).
+poller(Parent, Ns) -> poller(Parent, Ns, 0).
+poller(Parent, Ns, Count) ->
+    receive
+        stop -> Parent ! {polls, Count}
+    after 1 ->
+        _ = erlang:memory(),
+        _ = arinsal_ns:info(Ns),
+        poller(Parent, Ns, Count + 1)
+    end.
+purge_race(Path) ->
+    ok = arinsal_ns:expose(self()),
+    {module, pm} = erlang:load_module(pm, pm_v1()),
+    {module, pm} = erlang:load_module(pm, pm_v2()),
+    {[a], [b]} = lists:split(1, [a, b]),
+    true = register(erts_code_purger, self()),
+    true = erts_internal:purge_module(pm, prepare),
+    {ok, Ns} = arinsal_ns:create(<<"acme">>, <<"race">>, #{}),
+    Self = self(),
+    Poller = spawn(?MODULE, poller, [Self, Ns]),
+    arinsal_ns:spawn(Ns, ?MODULE, loader, [Self, beams()]),
+    Early = receive {loaded, E} -> {early, E} after 300 -> waiting end,
+    Complete = erts_internal:purge_module(pm, complete),
+    Loaded = case Early of
+        {early, Count} -> Count;
+        waiting -> receive {loaded, L} -> L after 10000 -> load_timeout end
+    end,
+    Poller ! stop,
+    Polls = receive {polls, P} -> is_integer(P) after 5000 -> poller_stuck end,
+    Result = {Early, Complete, Loaded, Polls},
+    ok = prim_file:write_file(Path, iolist_to_binary(io_lib:format("~0p", [Result]))),
+    Result.
+loader(Parent, Beams) ->
+    Parent ! {loaded, load(Beams, 0)}.
+load([], Count) -> Count;
+load(Beams, Count) ->
+    {Batch, Rest} = lists:split(min(64, length(Beams)), Beams),
+    Prepared = [erlang:prepare_loading(M, B) || {M, B} <- Batch],
+    ok = erlang:finish_loading(Prepared),
+    load(Rest, Count + length(Batch)).
+"#;
+
+fn stress_vm(beams: &[(String, Vec<u8>)]) -> Vm {
+    let list: Vec<String> = beams
+        .iter()
+        .map(|(name, bytes)| format!("{{{name}, {}}}", binary_literal(bytes)))
+        .collect();
+    let pm_v1 = compile(
+        "pm",
+        "-module(pm).\n-export([f/1]).\nf(X) -> fun() -> {v1, X} end.\n",
+    )
+    .expect("compile pm v1");
+    let pm_v2 = compile(
+        "pm",
+        "-module(pm).\n-export([f/1]).\nf(X) -> fun() -> {v2, X} end.\n",
+    )
+    .expect("compile pm v2");
+    let source = format!(
+        "{LOAD_STRESS}\nbeams() -> [{}].\npm_v1() -> {}.\npm_v2() -> {}.\n",
+        list.join(",\n"),
+        binary_literal(&pm_v1),
+        binary_literal(&pm_v2)
+    );
+    let driver = compile("ns_code_stress", &source).expect("compile the stress driver");
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&driver).unwrap();
+    vm
+}
+
+/// The e2e stall: a root purge was prepared (it holds the staging permission until its
+/// `complete`) when a namespace process finished a load into its domain. That load blocked its
+/// scheduler thread waiting for the staging permission while holding the code permission the
+/// purge's `complete` needs. Now the domain load yields until the purge completes, and root
+/// keeps running meanwhile.
+#[test]
+fn ns_code_domain_load_waits_for_prepared_purge() {
+    let Some(beams) = compile_many("race", 100) else {
+        eprintln!("erlc unavailable; skipping ns_code_domain_load_waits_for_prepared_purge");
+        return;
+    };
+    // Before the fix this deadlocked; fail instead of hanging the test run. The result comes
+    // through a file: after a `purge_module(complete)` the end of the run can wait on the
+    // literal area collector (a root issue that also shows without namespaces), which says
+    // nothing about this deadlock.
+    let path = std::env::temp_dir().join(format!("arinsal-ns-code-race-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let arg = path.to_string_lossy().into_owned();
+    std::thread::spawn(move || {
+        let mut vm = stress_vm(&beams);
+        let mut heap = arinsal_term::VecHeap::new();
+        let path = arinsal_term::TermBuilder::new(&mut heap)
+            .binary(arg.as_bytes())
+            .expect("path binary");
+        let _ = vm.eval_scheduled("ns_code_stress", "purge_race", &[path], 4, None);
+        drop(heap);
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let result = loop {
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && !text.is_empty()
+        {
+            break text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the domain load and the purge deadlocked"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let _ = std::fs::remove_file(&path);
+    // Without BeamAsm the old code has no native range, the purge holds no staging
+    // permission, and the load does not wait.
+    let expected = if std::env::var_os("ARINSAL_INTERP").is_some_and(|value| value == "1") {
+        "{{early,100},true,100,true}"
+    } else {
+        "{waiting,true,100,true}"
+    };
+    assert_eq!(result, expected);
+}
+
+/// A namespace loading 300 modules in batches of 64 (as the release boot does) while a root
+/// process polls `erlang:memory/0` and `arinsal_ns:info/1` every millisecond: 20 namespaces in
+/// a row, every load completes and the poller keeps answering.
+#[test]
+fn ns_code_load_while_root_polls() {
+    let Some(beams) = compile_many("stress", 300) else {
+        eprintln!("erlc unavailable; skipping ns_code_load_while_root_polls");
+        return;
+    };
+    let mut vm = stress_vm(&beams);
+    let iterations = Term::small(20).unwrap();
+    let result = vm
+        .eval_scheduled("ns_code_stress", "run", &[iterations], 4, None)
+        .unwrap();
+    assert_eq!(
+        result.text,
+        format!("[{}]", vec!["{300,true}"; 20].join(","))
+    );
+}
