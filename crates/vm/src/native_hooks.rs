@@ -151,9 +151,12 @@ pub(crate) fn scheduler_registers(
 // Update::eHeapAlloc publishes HTOP and E), OTP-29.1.1.
 pub(crate) fn enter_heap_runtime<'a>(header: *mut ProcessHeader) -> Option<&'a mut Process> {
     let process = process_from_header(header)?;
-    process
-        .heap
-        .set_native_cursors(process.header.htop, process.header.stop);
+    // `c_p->heap` is the base; converting through the block pointer is the slow path.
+    process.heap.set_native_cursors_at(
+        process.header.heap,
+        process.header.htop,
+        process.header.stop,
+    );
     Some(process)
 }
 

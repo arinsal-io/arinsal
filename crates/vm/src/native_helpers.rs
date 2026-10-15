@@ -4307,7 +4307,7 @@ pub extern "C" fn arinsal_beamasm_map_put_single(
     map: u64,
     _unused: u64,
 ) -> u64 {
-    map_single(header, key, value, map, false, 0)
+    map_single::<false>(header, key, value, map, 0)
 }
 
 /// `Map#{Key := Value}` with a single pair and no failure label: `erts_maps_update`; returns
@@ -4321,17 +4321,18 @@ pub extern "C" fn arinsal_beamasm_map_update_single(
     map: u64,
     result_pointer: u64,
 ) -> u64 {
-    map_single(header, key, value, map, true, result_pointer)
+    map_single::<true>(header, key, value, map, result_pointer)
 }
 
-fn map_single(
+fn map_single<const EXACT: bool>(
     header: *mut ProcessHeader,
     key: u64,
     value: u64,
     map: u64,
-    exact: bool,
     result_pointer: u64,
 ) -> u64 {
+    // Two monomorphic helpers: the put entry carries no exact-update state.
+    let exact = EXACT;
     // erts_maps_put/erts_maps_update consume their operands from arguments and
     // do not read the X register array.
     // Port of erts/emulator/beam/jit/arm/instr_map.cpp:579-598,686-694,
