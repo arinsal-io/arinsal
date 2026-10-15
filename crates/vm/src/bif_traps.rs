@@ -1442,8 +1442,20 @@ pub(crate) fn execute_named(
     import: usize,
     arity: usize,
     mut args: [Term; 4],
-    ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
+    mut ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
 ) -> Option<Result<HandlerResult, VmError>> {
+    // arl: a root-only native is refused for a process inside a namespace.
+    if process.ns != 0
+        && let Some(error) = crate::natives::root_only::refuse(
+            process,
+            ctx.as_deref_mut(),
+            module_name,
+            function_name,
+            arity,
+        )
+    {
+        return Some(Err(error));
+    }
     let gc_enabled_on_entry = process.heap.gc_enabled;
     let pending_site = process
         .cold

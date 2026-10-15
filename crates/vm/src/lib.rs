@@ -60,6 +60,8 @@ pub use native_hooks::{
 };
 pub use natives::implemented_natives;
 #[doc(hidden)]
+pub use natives::root_only::root_only as arl_native_is_root_only;
+#[doc(hidden)]
 pub use natives::tty::registered_callers as tty_registered_callers;
 mod stacktrace;
 mod tuples;

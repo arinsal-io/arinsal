@@ -758,6 +758,12 @@ impl Vm {
             let entry = crate::signals::handler_atoms(module_atom, function_atom, arity as u8);
             if let Some(entry) = entry {
                 resolved_entry = true;
+                // arl: a root-only native is refused on the apply path as well.
+                if let Some(error) =
+                    crate::natives::root_only::refuse(p, Some(run), module, function, arity)
+                {
+                    return Err(error);
+                }
                 if let Some(result) = self.dispatch_resolved_entry(
                     p,
                     run,

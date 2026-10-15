@@ -294,6 +294,13 @@ impl DispatchRegistry {
     ) -> &'static DispatchTarget {
         self.by_identity.entry(identity).or_insert_with(|| {
             let mut leaked = DispatchTarget::clone(entry);
+            // arl: a root-only native runs in the executor, whose dispatcher holds the namespace
+            // check; no BIF body may be called straight from native code.
+            if crate::natives::root_only::root_only(&leaked.module, &leaked.function, leaked.arity)
+            {
+                leaked.bif = None;
+                leaked.direct_ets = None;
+            }
             leaked.list_slice = matches!(
                 (
                     leaked.module.as_str(),
@@ -330,8 +337,14 @@ impl DispatchRegistry {
             };
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-540 (call_light_bif_shared),
             // OTP-29.1.1: a trapping BIF is a BIF like any other at its call site.
+            // arl: a root-only trapping BIF takes the executor path too.
             leaked.light_trap_bif = if leaked.trap_entry
                 && leaked.direct_ets.is_none()
+                && !crate::natives::root_only::root_only(
+                    &leaked.module,
+                    &leaked.function,
+                    leaked.arity,
+                )
                 && !matches!(
                     leaked.class,
                     arinsal_loader::ImportClass::Dynamic | arinsal_loader::ImportClass::Fun

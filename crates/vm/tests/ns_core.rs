@@ -315,7 +315,102 @@ ns_processes_filtered() ->
         {{2, true}, 1, true, true} -> ok;
         Bad -> {bad, Bad}
     end.
+
+ns_rootonly_natives_refused() ->
+    Ns = mk(<<"acme">>),
+    Table = in_ns(Ns, fun() ->
+        [{{M, F, A}, catch apply(M, F, lists:duplicate(A, 0))} || {M, F, A} <- root_only_list()]
+    end),
+    Wrappers = in_ns(Ns, fun() ->
+        W = spawn(fun waiter/0),
+        R = [catch erlang:system_flag(multi_scheduling, block),
+             catch erlang:load_nif("/nonexistent", 0),
+             catch erlang:open_port({spawn, "echo"}, []),
+             catch erlang:suspend_process(W),
+             catch erlang:resume_process(W),
+             catch erlang:trace(self(), true, [call]),
+             catch erlang:trace_pattern({erlang, self, 0}, true, [local]),
+             catch erlang:trace_info(self(), flags),
+             catch erlang:system_monitor(self(), [busy_port]),
+             catch erlang:system_profile(self(), [runnable_procs]),
+             try_call(erlang, ports, []),
+             catch erlang:seq_trace(send, true),
+             catch erlang:monitor_node(node(), true),
+             catch erts_debug:get_internal_state(available_internal_state),
+             catch erl_debugger:supported()],
+        W ! stop,
+        R
+    end),
+    OsCmd = in_ns(Ns, fun() -> case catch os:cmd("echo hi") of {'EXIT', _} -> refused; Out -> {ran, Out} end end),
+    BadTable = [Entry || {_, Res} = Entry <- Table, not is_notsup(Res)],
+    BadWrappers = [summ(R) || R <- Wrappers, not is_notsup(R)],
+    case {BadTable, BadWrappers, OsCmd, length(Table) > 40} of
+        {[], [], refused, true} -> ok;
+        Other -> {bad, Other}
+    end.
+
+summ({'EXIT', {E, _}}) -> E;
+summ({error, {E, _}}) -> {error, E};
+summ(T) when is_tuple(T) -> element(1, T);
+summ(A) -> A.
+
+try_call(M, F, A) -> catch apply(M, F, A).
+
+is_notsup({'EXIT', {notsup, _}}) -> true;
+is_notsup(_) -> false.
+
+ns_halt_destroys_ns_not_node() ->
+    N1 = mk(<<"acme">>),
+    N2 = mk(<<"globex">>),
+    {W1, R1} = start_in(N1, fun waiter/0),
+    {H1, RH1} = start_in(N1, fun() -> erlang:halt(), survived end),
+    {H2, RH2} = start_in(N2, fun() -> erlang:halt(1, [{flush, false}]), survived end),
+    {O2, RO2} = start_in(N2, fun() -> receive stop -> other_ok end end),
+    W1 ! go, H1 ! go, O2 ! go,
+    Res1 = await(H1, RH1),
+    W1Res = await(W1, R1),
+    H2 ! go,
+    Res2 = await(H2, RH2),
+    O2Res = await(O2, RO2),
+    Live = arinsal_ns:list(),
+    #{processes := P1} = wait_info(N1, fun(#{processes := N}) -> N =:= 0 end),
+    case {Res1, W1Res, Res2, O2Res, Live, P1} of
+        {{crashed, killed}, {crashed, killed}, {crashed, killed}, {crashed, killed}, [], 0} -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_group_leader_foreign_refused() ->
+    Ns = mk(<<"acme">>),
+    Unshared = spawn(fun waiter/0),
+    Shared = spawn(fun waiter/0),
+    ok = arinsal_ns:expose(Shared),
+    Res = in_ns(Ns, fun() ->
+        Own = spawn(fun waiter/0),
+        R = [catch group_leader(Unshared, self()),
+             catch group_leader(Shared, self()),
+             catch group_leader(Own, self())],
+        Own ! stop,
+        R
+    end),
+    Unshared ! stop, Shared ! stop,
+    case Res of
+        [{'EXIT', {badarg, _}}, true, true] -> ok;
+        Other -> {bad, Other}
+    end.
 "#;
+
+/// The test module plus the list of root-only natives, taken from the VM's own table.
+fn source() -> String {
+    let items = arinsal_vm::implemented_natives()
+        .iter()
+        .filter(|(m, f, a)| {
+            arinsal_vm::arl_native_is_root_only(m, f, *a) && (*m, *f) != ("erlang", "halt")
+        })
+        .map(|(m, f, a)| format!("{{'{m}', '{f}', {a}}}"))
+        .collect::<Vec<_>>()
+        .join(",\n    ");
+    format!("{SOURCE}\nroot_only_list() ->\n    [{items}].\n")
+}
 
 fn run(entry: &str) {
     let _serial = TEST_LOCK
@@ -326,7 +421,7 @@ fn run(entry: &str) {
         return;
     };
     let beam = reference
-        .compile_named("ns_core_t", SOURCE, &[])
+        .compile_named("ns_core_t", &source(), &[])
         .expect("compile ns_core_t");
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).expect("load ns_core_t");
@@ -419,4 +514,19 @@ fn ns_list() {
 #[test]
 fn ns_processes_filtered() {
     run("ns_processes_filtered");
+}
+
+#[test]
+fn ns_rootonly_natives_refused() {
+    run("ns_rootonly_natives_refused");
+}
+
+#[test]
+fn ns_halt_destroys_ns_not_node() {
+    run("ns_halt_destroys_ns_not_node");
+}
+
+#[test]
+fn ns_group_leader_foreign_refused() {
+    run("ns_group_leader_foreign_refused");
 }
