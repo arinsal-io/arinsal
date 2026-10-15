@@ -154,6 +154,48 @@ Tests: `process_differential` (17, includes monitor and link scenarios against O
 `demonitor_flush_trap`, `process_info_self_light` (3) and the vm lib tests for `receive`, `signals`,
 `proc_create`.
 
+## Chunk 3: the remaining 4.2 KB per idle process
+
+Method: temporary counting `#[global_allocator]` (size-bucket counters, dumped on request) and a
+sampling backtrace table (`backtrace(3)` into a static table, resolved with `atos`) around the
+30000-process spawn_link loop. Neither is committed. Per-process cost after chunk 2, fun-argument spawn:
+
+| item | bytes | where |
+|---|---|---|
+| process heap (233 words) in `arinsal-alloc` carriers | about 1750 | same as ERTS |
+| scheduler `Arc<sched::Process<vm::Process>>`, one allocation | 1536 | `crates/sched/src/lib.rs:1152` (`Process` 1312 B in `crates/vm/src/proc_create.rs:122`, scheduler fields 264 B) |
+| `HeapOwners` box, created when the spawn arguments hold a fun (`retain_fun`) | 248 | `crates/term/src/heap.rs:878` |
+| scheduler input queue `Arc` | 152 | `sched/src/lib.rs:1168` (`input: Arc::default()`) |
+| link node of `links: BTreeSet<Pid>` | 104 | `signals.rs:1040` |
+| persistent-term accounting `Arc<ProcessAccount>` | 64 | `pterm/src/lib.rs:410` |
+| fun reference vectors (`retain_fun`, argument list) | 32 + 32 | `heap.rs:1698`, `signals.rs:562` |
+| `exit_flags` Arc, slot box, misc | 24 + 8 + 8 | `sched/src/lib.rs:1168,1180` |
+
+ERTS spends about 780 B outside the heap (PCB, 2649 B total); Arinsal about 2.3 KB. The gap is the
+size of `Process` (1312 B) plus the scheduler wrapper (264 B): ERTS keeps its x registers, most of the
+JIT header and the trace state elsewhere or not at all.
+
+Fixed: `ProcessHeap::set_min_bin_vheap_size` created the 248 B owner box on every spawn just to store
+the default value. It now leaves the box absent for the default (absent reports the same values).
+That saves the box for every spawn whose arguments hold no fun, funs still create it through
+`retain_fun`. Measured with `spawn_link(:timer, :sleep, [:infinity])` (no fun): 4009 to 4117 B per
+process, against 4145 to 4247 B in chunk 2 with a fun, ERTS 2698 B. The difference is within
+the noise of this host, so treat it as a small, not a measured, win.
+
+Staged (not done, ordered by size):
+1. Shrink `Process` (1312 B). Candidates by size: `dictionary` 80 B inline (box it, but OTP processes
+   nearly all have one), `stats` 72, `x` 72 (`ArgRegs` inline 6 + boxed tail), 6 supervision trees 144,
+   the native resume and wait state I moved in chunk 2 (about 190 B, pack into one small struct and
+   narrow `usize` to `u32`), `seq_trace_*` 45 B, `apply_inline` 24 B. Realistic: 300 to 400 B.
+2. `HeapOwners` 248 B -> about 160 B by moving the four `old_*` vectors (96 B) behind an
+   `Option<Box<_>>` (27 sites in `term/src/gc.rs` and `heap.rs`). Needed for every fun spawn, and
+   OTP's `proc_lib` spawns always pass a fun.
+3. Scheduler side (`sched/src/lib.rs:1152-1180`): `input` 152 B, `exit_flags` 24 B and the slot box 8 B
+   are three more allocations per process; one `Arc` with the queue inline would save about 100 B.
+   Not touched because the idle-CPU stream works in `crates/sched`.
+4. `links: BTreeSet<Pid>` allocates a 104 B leaf for the first link. A one-element inline form
+   (enum `One(Pid) | Many(BTreeSet)`) saves 104 B for the common single link of a supervised process.
+
 ## Staged plan (not done)
 
 1. Free-memory return (after-load gap, and the freed transient of boot, about 90 MB reclaimable at 0
