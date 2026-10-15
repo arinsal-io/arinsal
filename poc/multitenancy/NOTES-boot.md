@@ -82,8 +82,10 @@ e2e run; the e2e manager had already loaded more of the shared modules. Not inve
 - `inet_gethost_native` is exposed with the other root services.
 - e2e on the merged build: PASS, 398 processes per namespace, second project +3.3 MB total
   (code +2.9 MB, ets +0.17 MB; process heaps sampled early). One earlier run had the probe stop
-  updating after the first deploy (no crash report); not reproduced, the probe now writes
-  errors to `probe.txt.err`.
+  updating while the first namespace was loading its modules (3 processes in the ns), with no
+  error caught; the deploys and curls still worked, and the node then did not stop on SIGTERM.
+  Seen in 2 of 4 runs. Suspect: a root `erlang:memory/0` or `arinsal_ns:info/1` blocked against
+  the namespace's synchronous domain `finish_loading`. Not isolated yet.
 
 ## Gaps
 
