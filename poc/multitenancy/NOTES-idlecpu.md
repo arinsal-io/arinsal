@@ -76,3 +76,48 @@ Measured under load average 90 to 150, so absolute numbers are inflated; shares 
 - ERTS: the spin count is the same (10000 for the medium busy-wait setting), but the spin body
   (`ETHR_SPIN_BODY`) is `rep;nop` on x86 and only a compiler barrier on every other architecture
   including aarch64, so one spin window costs microseconds there.
+
+## Step 3: what is left after the dirty fix (0 tenants: 330-400 ms/min vs ERTS 80)
+
+Measured with `idle_cpu.sh` back to back, same load (18 to 68):
+
+| runtime | 0 tenants | 1000 tenants |
+|---|---|---|
+| ERTS (Homebrew OTP 29, `mix run`) | 80 | 120 |
+| Arinsal, dirty fix only | 400 | 370 |
+
+Findings:
+
+- The sleep spin is not the cost. Instrumented spin windows take 50 to 150 us of CPU each
+  and only a few happen per second. `spin_body` now matches the ERTS spin body (pause on x86,
+  compiler barrier elsewhere); it is a small change, not the fix.
+- A scheduler wake that finds work costs 0.1 to 4 ms of CPU, but only ~1 wake/s on the timer
+  owner. Dirty, check-io, udp, tty and signal-dispatch threads stay at 0.
+- The remaining burst is periodic (every ~1.9 s, 10 ms ticks of sys time on a scheduler thread)
+  and comes from `persistent_term:put/2` of a heap term. Bandit's `Bandit.Clock` does one such
+  put per second to refresh the date header. Reproduced without the app:
+  `persistent_term:put(k, {I, "text"})` once per second costs 230-260 ms/min on Arinsal and 90
+  ms/min on ERTS; the same loop with an immediate term costs 10 ms/min, and a plain
+  `erlang:garbage_collect()` per second costs 10 ms/min.
+- So the cost is the literal area release that follows a replaced heap-term entry: the old area
+  is retired and the literal collector sends `copy_literals` to every process
+  (`crates/vm/src/natives/sys.rs` `wake_literal_collector`), which wakes all 12 schedulers once
+  per put (per-worker wake counts over 20 s: 6 to 33 on every scheduler). ERTS touches the
+  same processes but only a few schedulers show CPU.
+- Tried and dropped: replacing the stop-the-world `block_thread_progress(ZERO)` in
+  `PersistentTermUpdate::finish` with a suspended updater plus `thread_progress_later` (the
+  ERTS shape, as `suspend_for_code_barrier` does). It is closer to ERTS but did not change the
+  numbers (230 vs 240-260 ms/min), so it was not kept.
+
+## Staged plan for the rest
+
+1. Find why the literal collector round touches every scheduler on Arinsal but few on ERTS:
+   check how many processes receive `Signal::LiteralAreaCopy` per retired area and whether a
+   process that does not reference the area still gets scheduled (ERTS answers the request as
+   a system task without a full run). Count wakes per scheduler with the pt.exs-style loop
+   above.
+2. If processes are spread over all run queues at boot while ERTS keeps them on a few, compare
+   the migration paths after startup (`check_emigration_need`), since every idle process
+   wakes its own scheduler.
+3. Keep the `persistent_term:put` once-per-second loop as the regression benchmark (target
+   within 1.5x of 90 ms/min).
