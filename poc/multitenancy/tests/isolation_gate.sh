@@ -14,6 +14,8 @@ ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT"
 export PATH="${ARINSAL_GATE_PATH:-/Users/sts/dev/sq/arinsal-prs/bin:/opt/homebrew/opt/erlang@29/bin:/opt/homebrew/opt/elixir/bin}:$PATH"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/../target-gate}"
+# The ns test harnesses skip (and report a pass) when erl is missing, so refuse to run without it.
+command -v erl >/dev/null && command -v erlc >/dev/null || { echo "GATE FAIL: erl/erlc not on PATH"; exit 1; }
 PROFILE_FLAG=""
 [ "${PROFILE:-debug}" = "release" ] && PROFILE_FLAG="--release"
 
