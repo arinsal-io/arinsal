@@ -129,13 +129,37 @@ impl ThreadSpecificAllocators {
         options: AllocUtilOptions,
         allocation_type: &'static str,
     ) -> Self {
+        Self::new_with_global(
+            instance_count,
+            thread_specific,
+            strategy,
+            strategy,
+            options,
+            allocation_type,
+        )
+    }
+
+    /// Like [`ThreadSpecificAllocators::new_for_type`], with a separate strategy for the shared
+    /// instance 0 (`temp_alloc` uses afit on scheduler instances and goodfit on instance 0).
+    pub fn new_with_global(
+        instance_count: usize,
+        thread_specific: bool,
+        strategy: Strategy,
+        global_strategy: Strategy,
+        options: AllocUtilOptions,
+        allocation_type: &'static str,
+    ) -> Self {
         let count = instance_count.max(1);
         Self {
             instances: (0..count)
                 .map(|instance| {
                     parking_lot::Mutex::new(Instance {
                         allocator: AllocUtil::new_for_instance(
-                            strategy,
+                            if thread_specific && instance == 0 {
+                                global_strategy
+                            } else {
+                                strategy
+                            },
                             options,
                             allocation_type,
                             instance,
@@ -270,6 +294,19 @@ impl ThreadSpecificAllocators {
         self.lock_instance(instance)
             .allocator
             .allocation_ptr(allocation)
+    }
+
+    /// Applies a dynamic `sbct` to every instance; true if any instance accepted it.
+    // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_set_dyn_param), OTP-29.1.1.
+    pub fn try_set_dyn_sbct(&self, value: usize) -> bool {
+        let mut ok = false;
+        for instance in 0..self.instances.len() {
+            ok |= self
+                .lock_instance(instance)
+                .allocator
+                .try_set_dyn_sbct(value);
+        }
+        ok
     }
 
     /// Processes delayed frees for every instance.

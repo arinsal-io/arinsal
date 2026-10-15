@@ -15,6 +15,9 @@ pub struct AllocatorSpec {
     pub thread_specific: bool,
     /// Strategy used by allocator operations.
     pub strategy: Strategy,
+    /// Strategy of the shared instance 0 (used by dirty and auxiliary threads); erts gives
+    /// `temp_alloc` goodfit there and the scheduler instances afit.
+    pub global_strategy: Strategy,
     /// Strategy atom exposed through the `as` option.
     pub strategy_name: &'static str,
     /// Whether allocation origin tags are enabled.
@@ -56,6 +59,7 @@ pub fn defaults(schedulers: usize) -> Vec<AllocatorSpec> {
             enabled: true,
             thread_specific: true,
             strategy,
+            global_strategy: strategy,
             strategy_name,
             atags,
             options,
@@ -70,26 +74,21 @@ pub fn defaults(schedulers: usize) -> Vec<AllocatorSpec> {
         false,
         128 * 1024,
     );
+    // Port of erts/emulator/beam/erl_alloc.c (temp_alloc init): afit per scheduler, goodfit global.
+    temp.global_strategy = Strategy::GoodFit;
     temp.options.rsbcst = 90;
     temp.options.rmbcmt = 100;
     temp.options.lmbcs = 10 * 1024 * 1024;
     temp.options.smbcs = 1024 * 1024;
 
-    let mut sl = make(
-        "sl_alloc",
-        "sl_",
-        Strategy::AddressOrderBestFit,
-        "aoffcbf",
-        false,
-        mbc,
-    );
+    let mut sl = make("sl_alloc", "sl_", Strategy::AoffCbf, "aoffcbf", false, mbc);
     sl.options.rsbcst = 80;
     sl.options.rmbcmt = 50;
 
     let mut std = make(
         "std_alloc",
         "std_",
-        Strategy::BestFit,
+        Strategy::AoffCbf,
         "aoffcbf",
         false,
         mbc,
@@ -99,7 +98,7 @@ pub fn defaults(schedulers: usize) -> Vec<AllocatorSpec> {
     let mut ll = make(
         "ll_alloc",
         "ll_",
-        Strategy::BestFit,
+        Strategy::AoffCbf,
         "aoffcbf",
         false,
         2 * 1024 * 1024 / schedulers.min(4),
@@ -114,7 +113,7 @@ pub fn defaults(schedulers: usize) -> Vec<AllocatorSpec> {
     let mut eheap = make(
         "eheap_alloc",
         "eheap_",
-        Strategy::GoodFit,
+        Strategy::AoffCbf,
         "aoffcbf",
         false,
         512 * 1024 / schedulers.min(4),
@@ -124,7 +123,7 @@ pub fn defaults(schedulers: usize) -> Vec<AllocatorSpec> {
     let mut ets = make(
         "ets_alloc",
         "ets_",
-        Strategy::BestFit,
+        Strategy::AoffCbf,
         "aoffcbf",
         false,
         mbc,
@@ -134,7 +133,7 @@ pub fn defaults(schedulers: usize) -> Vec<AllocatorSpec> {
     let mut fix = make(
         "fix_alloc",
         "fix_",
-        Strategy::BestFit,
+        Strategy::AoffCbf,
         "aoffcbf",
         false,
         mbc,
@@ -162,7 +161,7 @@ pub fn defaults(schedulers: usize) -> Vec<AllocatorSpec> {
     let mut binary = make(
         "binary_alloc",
         "binary_",
-        Strategy::BestFit,
+        Strategy::AoffCbf,
         "aoffcbf",
         true,
         mbc,
@@ -173,7 +172,7 @@ pub fn defaults(schedulers: usize) -> Vec<AllocatorSpec> {
     let mut driver = make(
         "driver_alloc",
         "driver_",
-        Strategy::BestFit,
+        Strategy::AoffCbf,
         "aoffcbf",
         true,
         mbc,
@@ -245,5 +244,63 @@ mod tests {
                 .map(|spec| spec.name)
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn strategy_atom(strategy: crate::alloc_util::Strategy) -> &'static str {
+        use crate::alloc_util::Strategy::*;
+        match strategy {
+            BestFit => "bf",
+            AddressOrderBestFit => "aobf",
+            Aoff => "aoff",
+            AoffCbf => "aoffcbf",
+            AoffCaobf => "aoffcaobf",
+            GoodFit => "gf",
+            Afit => "af",
+        }
+    }
+
+    /// Every instance runs the strategy erts reports in its `as` option.
+    #[test]
+    fn instance_strategies_match_erl() {
+        let Ok(output) = Command::new("erl")
+            .args([
+                "-noshell",
+                "-eval",
+                "As=erlang:system_info(alloc_util_allocators), lists:foreach(fun(A) -> io:format(\"~p:~s~n\", [A, string:join([atom_to_list(proplists:get_value(as, proplists:get_value(options, I))) || {instance,_,I} <- erlang:system_info({allocator,A})], \",\")]) end, As), halt().",
+            ])
+            .output()
+        else {
+            eprintln!("skipping instance_strategies_match_erl: erl is unavailable");
+            return;
+        };
+        assert!(output.status.success());
+        let reference = String::from_utf8(output.stdout).unwrap();
+        let schedulers = Command::new("erl")
+            .args([
+                "-noshell",
+                "-eval",
+                "io:format(\"~p\",[erlang:system_info(schedulers)]),halt().",
+            ])
+            .output()
+            .unwrap();
+        let schedulers: usize = String::from_utf8(schedulers.stdout)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut expected = String::new();
+        for spec in defaults(schedulers) {
+            let names = (0..instance_count(&spec, schedulers, 0))
+                .map(|instance| {
+                    if spec.thread_specific && instance == 0 {
+                        strategy_atom(spec.global_strategy)
+                    } else {
+                        strategy_atom(spec.strategy)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            expected.push_str(&format!("{}:{}\n", spec.name, names));
+        }
+        assert_eq!(reference, expected);
     }
 }

@@ -7,6 +7,52 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const WORD_BYTES: usize = std::mem::size_of::<usize>();
 const BIN_FLAG_WRITABLE: u64 = 1 << 2;
 
+/// A free-block or carrier tree node: a few consecutive machine words at a known address.
+///
+/// Port of the intrusive `AOFF_RBTree_t`/`RBTree_t` node access of erl_ao_firstfit_alloc.c and
+/// erl_bestfit_alloc.c: once the node's address has been checked against its carrier's range,
+/// its fields are read and written through plain pointers, like the C code does.
+#[derive(Clone, Copy)]
+pub(crate) struct NodeRef {
+    ptr: usize,
+    words: usize,
+}
+
+impl NodeRef {
+    /// A node of `words` words at `key`, if all of them lie inside `[span_start, span_end)`.
+    ///
+    /// The range must belong to a live carrier of the calling allocator; the allocator indexes
+    /// carriers by exactly this range and drops the index before the memory is released.
+    #[inline(always)]
+    pub(crate) fn new(
+        span_start: usize,
+        span_end: usize,
+        key: usize,
+        words: usize,
+    ) -> Option<Self> {
+        let end = key.checked_add(words.checked_mul(WORD_BYTES)?)?;
+        (key >= span_start && key.is_multiple_of(WORD_BYTES) && end <= span_end)
+            .then_some(Self { ptr: key, words })
+    }
+
+    /// Word `index` of the node.
+    #[inline(always)]
+    pub(crate) fn word(self, index: usize) -> usize {
+        assert!(index < self.words);
+        // SAFETY: `new` checked that `words` aligned words from `ptr` lie inside a live carrier,
+        // and `index < words`.
+        unsafe { (self.ptr as *const usize).add(index).read() }
+    }
+
+    /// Stores `value` into word `index` of the node.
+    #[inline(always)]
+    pub(crate) fn set_word(self, index: usize, value: usize) {
+        assert!(index < self.words);
+        // SAFETY: as in `word`; the allocator owns its carriers exclusively while it is borrowed.
+        unsafe { (self.ptr as *mut usize).add(index).write(value) }
+    }
+}
+
 /// Pointer and extent for a typed allocator block.
 pub(crate) struct WordView {
     ptr: usize,

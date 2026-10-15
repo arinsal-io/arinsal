@@ -1,7 +1,7 @@
 //! Safe alloc_util core with OTP block headers and bestfit policies.
 
 use crate::mseg::{CacheConfig, CallCount, MsegAllocator, MsegOptions, Segment, SegmentFlags};
-use crate::raw::{MapError, RawRegion, WordView, page_size};
+use crate::raw::{MapError, NodeRef, RawRegion, WordView, page_size};
 use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -319,6 +319,116 @@ struct Block {
     allocated: bool,
     prev_free: bool,
     last: bool,
+}
+
+/// A free-block tree node (aoff red-black tree or bestfit tree) with the strategy's field layout.
+#[derive(Clone, Copy)]
+struct TNode {
+    raw: NodeRef,
+    aoff: bool,
+}
+
+impl TNode {
+    #[inline(always)]
+    fn parent(self) -> usize {
+        self.raw.word(if self.aoff {
+            AOFF_PARENT_WORD
+        } else {
+            TREE_PARENT_WORD
+        })
+    }
+    #[inline(always)]
+    fn left(self) -> usize {
+        self.raw.word(if self.aoff {
+            AOFF_LEFT_WORD
+        } else {
+            TREE_LEFT_WORD
+        })
+    }
+    #[inline(always)]
+    fn right(self) -> usize {
+        self.raw.word(if self.aoff {
+            AOFF_RIGHT_WORD
+        } else {
+            TREE_RIGHT_WORD
+        })
+    }
+    #[inline(always)]
+    fn set_parent(self, value: usize) {
+        self.raw.set_word(
+            if self.aoff {
+                AOFF_PARENT_WORD
+            } else {
+                TREE_PARENT_WORD
+            },
+            value,
+        )
+    }
+    #[inline(always)]
+    fn set_left(self, value: usize) {
+        self.raw.set_word(
+            if self.aoff {
+                AOFF_LEFT_WORD
+            } else {
+                TREE_LEFT_WORD
+            },
+            value,
+        )
+    }
+    #[inline(always)]
+    fn set_right(self, value: usize) {
+        self.raw.set_word(
+            if self.aoff {
+                AOFF_RIGHT_WORD
+            } else {
+                TREE_RIGHT_WORD
+            },
+            value,
+        )
+    }
+    #[inline(always)]
+    fn flags_word(self) -> usize {
+        if self.aoff {
+            AOFF_FLAGS_WORD
+        } else {
+            TREE_FLAGS_WORD
+        }
+    }
+    #[inline(always)]
+    fn flags(self) -> usize {
+        self.raw.word(self.flags_word())
+    }
+    /// Sets the color/node bits; the aoff `max_sz` in the upper half is kept.
+    #[inline(always)]
+    fn set_flags(self, value: usize) {
+        let word = self.flags_word();
+        let value = if self.aoff {
+            (self.raw.word(word) & !(u32::MAX as usize)) | (value & u32::MAX as usize)
+        } else {
+            value
+        };
+        self.raw.set_word(word, value);
+    }
+    #[inline(always)]
+    fn is_red(self) -> bool {
+        self.flags() & RED != 0
+    }
+    #[inline(always)]
+    fn size(self) -> usize {
+        self.raw.word(0) & !BLOCK_FLAGS
+    }
+    #[inline(always)]
+    fn max(self) -> usize {
+        self.raw.word(AOFF_FLAGS_WORD) >> 32
+    }
+    #[inline(always)]
+    fn set_max(self, max_size: usize) {
+        let word = self.raw.word(AOFF_FLAGS_WORD);
+        self.raw.set_word(
+            AOFF_FLAGS_WORD,
+            (word & u32::MAX as usize) | (((max_size as u32) as usize) << 32),
+        );
+    }
 }
 
 /// One indexed carrier's address range: the cached answer to "which carrier holds this
@@ -680,6 +790,18 @@ impl AllocUtil {
             Self::new_for_type(Strategy::AddressOrderBestFit, options, "literal_alloc");
         allocator.carrier_arena = Some(CarrierArena::new(region));
         allocator
+    }
+
+    /// Dynamic `sbct` update.
+    // Port of erts/emulator/beam/erl_alloc_util.c (erts_alcu_try_set_dyn_param, adjust_sbct) and
+    // erl_goodfit_alloc.c (gfalc_try_set_dyn_param, which cannot rearrange its buckets), OTP-29.1.1.
+    pub fn try_set_dyn_sbct(&mut self, value: usize) -> bool {
+        const MIN_DYN_SBCT: usize = 4000;
+        if self.strategy == Strategy::GoodFit || value < MIN_DYN_SBCT {
+            return false;
+        }
+        self.options.sbct = value;
+        true
     }
 
     /// Allocates a payload of `size` bytes.
@@ -2157,28 +2279,34 @@ impl AllocUtil {
         }
     }
 
+    /// The tree node at `key`, checked once against its carrier; its fields are then plain loads.
+    #[inline(always)]
+    fn tn(&self, key: usize) -> Result<TNode, AllocError> {
+        let span = self.span_of(key).ok_or(AllocError::Corrupt)?;
+        let words = if self.strategy == Strategy::BestFit {
+            BF_NODE_SIZE / WORD
+        } else {
+            RB_NODE_SIZE / WORD
+        };
+        let raw = NodeRef::new(span.start, span.end, key, words).ok_or(AllocError::Corrupt)?;
+        Ok(TNode {
+            raw,
+            aoff: is_aoff(self.strategy),
+        })
+    }
+
+    #[inline(always)]
     fn node_word(&self, node: usize, word: usize) -> Result<usize, AllocError> {
         self.word_at(node, self.tree_word(word))
     }
 
-    fn set_node_word(&mut self, node: usize, word: usize, value: usize) -> Result<(), AllocError> {
-        let word = self.tree_word(word);
-        let value = if is_aoff(self.strategy) && word == AOFF_FLAGS_WORD {
-            let old = self.word_at(node, word)?;
-            (old & !(u32::MAX as usize)) | (value & u32::MAX as usize)
-        } else {
-            value
-        };
-        self.set_word_at(node, word, value)
-    }
-
     /// Carrier whose free-block tree holds `node`, or `None` for an aoff carrier-tree node.
     fn node_carrier(&self, node: usize) -> Result<Option<usize>, AllocError> {
-        let index = self.carrier_of(node).ok_or(AllocError::Corrupt)?;
-        if self.aoff_carrier_index(node).is_some() {
+        let span = self.span_of(node).ok_or(AllocError::Corrupt)?;
+        if is_aoff(self.strategy) && !span.sbc && node == span.start + MBC_HEADER {
             Ok(None)
         } else {
-            Ok(Some(index))
+            Ok(Some(span.index))
         }
     }
 
@@ -2189,6 +2317,7 @@ impl AllocUtil {
         }
     }
 
+    #[inline(always)]
     fn root_for_carrier(&self, carrier: usize) -> Result<usize, AllocError> {
         if is_aoff(self.strategy) {
             self.aoff_roots
@@ -2220,36 +2349,30 @@ impl AllocUtil {
         if !is_aoff(self.strategy) {
             return None;
         }
-        let index = self.carrier_of(node)?;
-        let carrier = self.carriers[index].as_ref()?;
-        (!carrier.sbc && node == carrier.key_base + MBC_HEADER).then_some(index)
+        // A span starts at its carrier's key_base.
+        let span = self.span_of(node)?;
+        (!span.sbc && node == span.start + MBC_HEADER).then_some(span.index)
     }
 
+    #[inline(always)]
     fn tree_node_size(&self, node: usize) -> Result<usize, AllocError> {
-        let word = self.word_at(node, 0)?;
-        if self.aoff_carrier_index(node).is_some() {
-            Ok(word)
-        } else {
-            Ok(word & !BLOCK_FLAGS)
-        }
+        // A carrier node's word 0 is the carrier's largest free block size, which is aligned and
+        // carries no flag bits, so masking is a no-op for it; no carrier lookup is needed.
+        Ok(self.tn(node)?.size())
     }
 
-    fn set_tree_node_max_size(&mut self, node: usize, max_size: usize) -> Result<(), AllocError> {
-        let word = self.word_at(node, AOFF_FLAGS_WORD)?;
-        let value = (word & u32::MAX as usize) | (((max_size as u32) as usize) << 32);
-        self.set_word_at(node, AOFF_FLAGS_WORD, value)
-    }
-
+    #[inline(always)]
     /// Port of rbt_search, erl_ao_firstfit_alloc.c:863-881, OTP-29.1.1.
     fn aoff_search(&self, mut root: usize, need: usize) -> Result<Option<usize>, AllocError> {
         while root != 0 {
-            let left = self.node_word(root, TREE_LEFT_WORD)?;
-            if left != 0 && self.node_word(left, TREE_FLAGS_WORD)? >> 32 >= need {
+            let node = self.tn(root)?;
+            let left = node.left();
+            if left != 0 && self.tn(left)?.max() >= need {
                 root = left;
-            } else if self.tree_node_size(root)? >= need {
+            } else if node.size() >= need {
                 return Ok(Some(root));
             } else {
-                root = self.node_word(root, TREE_RIGHT_WORD)?;
+                root = node.right();
             }
         }
         Ok(None)
@@ -2271,7 +2394,7 @@ impl AllocUtil {
         let largest_size = if largest == 0 {
             0
         } else {
-            self.node_word(largest, TREE_FLAGS_WORD)? >> 32
+            self.tn(largest)?.max()
         };
         let in_tree = self.carriers[carrier_index]
             .as_ref()
@@ -2291,18 +2414,7 @@ impl AllocUtil {
         if largest_size == 0 {
             return Ok(());
         }
-        let base = self.carriers[carrier_index]
-            .as_ref()
-            .ok_or(AllocError::Corrupt)?
-            .key_base;
-        if !self.carriers[carrier_index]
-            .as_mut()
-            .ok_or(AllocError::Corrupt)?
-            .memory
-            .write_word(node - base, largest_size)
-        {
-            return Err(AllocError::Corrupt);
-        }
+        self.tn(node)?.raw.set_word(0, largest_size);
         self.insert_tree_node(node, largest_size)?;
         self.carriers[carrier_index]
             .as_mut()
@@ -2423,58 +2535,58 @@ impl AllocUtil {
 
     /// Port of rbt_insert and tree_insert_fixup, erl_ao_firstfit_alloc.c:793-861, OTP-29.1.1.
     fn insert_tree_node(&mut self, node: usize, size: usize) -> Result<(), AllocError> {
-        self.set_node_word(node, TREE_FLAGS_WORD, 0)?;
-        self.set_node_word(node, TREE_PARENT_WORD, 0)?;
-        self.set_node_word(node, TREE_LEFT_WORD, 0)?;
-        self.set_node_word(node, TREE_RIGHT_WORD, 0)?;
-        let block_node = self.aoff_carrier_index(node).is_none();
-        if self.strategy == Strategy::BestFit && block_node {
-            self.set_node_word(node, BF_NEXT_WORD, 0)?;
+        let n = self.tn(node)?;
+        n.set_flags(0);
+        n.set_parent(0);
+        n.set_left(0);
+        n.set_right(0);
+        let span = self.span_of(node).ok_or(AllocError::Corrupt)?;
+        let block_node = !(is_aoff(self.strategy) && !span.sbc && node == span.start + MBC_HEADER);
+        let bestfit = self.strategy == Strategy::BestFit && block_node;
+        if bestfit {
+            n.raw.set_word(BF_NEXT_WORD, 0);
         }
         let mut parent = 0;
-        let mut current = self.tree_root(node)?;
+        let mut parent_node = None;
+        let mut go_left = false;
+        let mut current = if block_node {
+            self.root_for_carrier(span.index)?
+        } else {
+            self.aoff_carrier_root
+        };
         while current != 0 {
             parent = current;
-            let current_size = self.tree_node_size(current)?;
-            if self.strategy == Strategy::BestFit && block_node && size == current_size {
-                let head_next = self.node_word(current, BF_NEXT_WORD)?;
-                self.set_node_word(node, TREE_PARENT_WORD, current)?;
-                self.set_node_word(node, BF_NEXT_WORD, head_next)?;
+            let cn = self.tn(current)?;
+            parent_node = Some(cn);
+            let current_size = cn.size();
+            if bestfit && size == current_size {
+                let head_next = cn.raw.word(BF_NEXT_WORD);
+                n.set_parent(current);
+                n.raw.set_word(BF_NEXT_WORD, head_next);
                 if head_next != 0 {
-                    self.set_node_word(head_next, TREE_PARENT_WORD, node)?;
+                    self.tn(head_next)?.set_parent(node);
                 }
-                self.set_node_word(current, BF_NEXT_WORD, node)?;
+                cn.raw.set_word(BF_NEXT_WORD, node);
                 return Ok(());
             }
-            let go_left = self.free_tree_goes_left(node, current, size, current_size);
-            let child_word = if go_left {
-                TREE_LEFT_WORD
-            } else {
-                TREE_RIGHT_WORD
-            };
-            current = self.node_word(current, child_word)?;
+            go_left = self.free_tree_goes_left(!block_node, node, current, size, current_size);
+            current = if go_left { cn.left() } else { cn.right() };
         }
-        self.set_node_word(node, TREE_FLAGS_WORD, TREE_NODE | RED)?;
-        self.set_node_word(node, TREE_PARENT_WORD, parent)?;
-        if parent == 0 {
+        n.set_flags(TREE_NODE | RED);
+        n.set_parent(parent);
+        let Some(pn) = parent_node else {
             self.set_tree_root(node, node)?;
-            self.set_node_word(node, TREE_FLAGS_WORD, TREE_NODE)?;
+            n.set_flags(TREE_NODE);
             if is_aoff(self.strategy) {
                 self.update_node_max(node)?;
             }
             return Ok(());
+        };
+        if go_left {
+            pn.set_left(node);
+        } else {
+            pn.set_right(node);
         }
-        let parent_size = self.tree_node_size(parent)?;
-        let go_left = self.free_tree_goes_left(node, parent, size, parent_size);
-        self.set_node_word(
-            parent,
-            if go_left {
-                TREE_LEFT_WORD
-            } else {
-                TREE_RIGHT_WORD
-            },
-            node,
-        )?;
         self.insert_fixup(node)?;
         if is_aoff(self.strategy) {
             self.update_max_to_root(node)?;
@@ -2484,12 +2596,14 @@ impl AllocUtil {
 
     fn free_tree_goes_left(
         &self,
+        carrier_tree: bool,
         lhs: usize,
         rhs: usize,
         lhs_size: usize,
         rhs_size: usize,
     ) -> bool {
-        if self.aoff_carrier_index(lhs).is_some() && self.aoff_carrier_index(rhs).is_some() {
+        // Both nodes live in the same tree, so lhs decides whether this is the carrier tree.
+        if carrier_tree {
             if self.strategy == Strategy::AoffCbf {
                 (lhs_size, lhs) < (rhs_size, rhs)
             } else {
@@ -2608,21 +2722,21 @@ impl AllocUtil {
         if matches!(self.strategy, Strategy::GoodFit | Strategy::Afit) {
             return Ok(());
         }
-        let flags = self.node_word(node, TREE_FLAGS_WORD)?;
-        if self.strategy == Strategy::BestFit && flags & TREE_NODE == 0 {
-            let prev = self.node_word(node, TREE_PARENT_WORD)?;
-            let next = self.node_word(node, BF_NEXT_WORD)?;
+        let nn = self.tn(node)?;
+        if self.strategy == Strategy::BestFit && nn.flags() & TREE_NODE == 0 {
+            let prev = nn.parent();
+            let next = nn.raw.word(BF_NEXT_WORD);
             if prev == 0 {
                 return Err(AllocError::Corrupt);
             }
-            self.set_node_word(prev, BF_NEXT_WORD, next)?;
+            self.tn(prev)?.raw.set_word(BF_NEXT_WORD, next);
             if next != 0 {
-                self.set_node_word(next, TREE_PARENT_WORD, prev)?;
+                self.tn(next)?.set_parent(prev);
             }
             return Ok(());
         }
         if self.strategy == Strategy::BestFit {
-            let next = self.node_word(node, BF_NEXT_WORD)?;
+            let next = nn.raw.word(BF_NEXT_WORD);
             if next != 0 {
                 self.replace_tree_node(node, next)?;
                 return Ok(());
@@ -2637,67 +2751,81 @@ impl AllocUtil {
         Ok(())
     }
 
+    #[inline(always)]
     fn is_red(&self, node: usize) -> Result<bool, AllocError> {
-        Ok(node != 0 && self.node_word(node, TREE_FLAGS_WORD)? & RED != 0)
+        if node == 0 {
+            return Ok(false);
+        }
+        Ok(self.tn(node)?.is_red())
     }
 
+    #[inline(always)]
     fn set_red(&mut self, node: usize, red: bool) -> Result<(), AllocError> {
         if node == 0 {
             return Ok(());
         }
-        let flags = self.node_word(node, TREE_FLAGS_WORD)?;
-        self.set_node_word(
-            node,
-            TREE_FLAGS_WORD,
-            (flags | TREE_NODE) & !RED | if red { RED } else { 0 },
-        )
+        let n = self.tn(node)?;
+        n.set_flags((n.flags() | TREE_NODE) & !RED | if red { RED } else { 0 });
+        Ok(())
     }
 
+    #[inline(always)]
     fn rotate_left(&mut self, x: usize) -> Result<(), AllocError> {
-        let y = self.node_word(x, TREE_RIGHT_WORD)?;
+        let xn = self.tn(x)?;
+        let y = xn.right();
         if y == 0 {
             return Err(AllocError::Corrupt);
         }
-        let beta = self.node_word(y, TREE_LEFT_WORD)?;
-        let parent = self.node_word(x, TREE_PARENT_WORD)?;
-        self.set_node_word(x, TREE_RIGHT_WORD, beta)?;
+        let yn = self.tn(y)?;
+        let beta = yn.left();
+        let parent = xn.parent();
+        xn.set_right(beta);
         if beta != 0 {
-            self.set_node_word(beta, TREE_PARENT_WORD, x)?;
+            self.tn(beta)?.set_parent(x);
         }
-        self.set_node_word(y, TREE_PARENT_WORD, parent)?;
+        yn.set_parent(parent);
         if parent == 0 {
             self.set_tree_root(x, y)?;
-        } else if self.node_word(parent, TREE_LEFT_WORD)? == x {
-            self.set_node_word(parent, TREE_LEFT_WORD, y)?;
         } else {
-            self.set_node_word(parent, TREE_RIGHT_WORD, y)?;
+            let pn = self.tn(parent)?;
+            if pn.left() == x {
+                pn.set_left(y);
+            } else {
+                pn.set_right(y);
+            }
         }
-        self.set_node_word(y, TREE_LEFT_WORD, x)?;
-        self.set_node_word(x, TREE_PARENT_WORD, y)?;
+        yn.set_left(x);
+        xn.set_parent(y);
         self.rotated_max(x, y)
     }
 
+    #[inline(always)]
     fn rotate_right(&mut self, x: usize) -> Result<(), AllocError> {
-        let y = self.node_word(x, TREE_LEFT_WORD)?;
+        let xn = self.tn(x)?;
+        let y = xn.left();
         if y == 0 {
             return Err(AllocError::Corrupt);
         }
-        let beta = self.node_word(y, TREE_RIGHT_WORD)?;
-        let parent = self.node_word(x, TREE_PARENT_WORD)?;
-        self.set_node_word(x, TREE_LEFT_WORD, beta)?;
+        let yn = self.tn(y)?;
+        let beta = yn.right();
+        let parent = xn.parent();
+        xn.set_left(beta);
         if beta != 0 {
-            self.set_node_word(beta, TREE_PARENT_WORD, x)?;
+            self.tn(beta)?.set_parent(x);
         }
-        self.set_node_word(y, TREE_PARENT_WORD, parent)?;
+        yn.set_parent(parent);
         if parent == 0 {
             self.set_tree_root(x, y)?;
-        } else if self.node_word(parent, TREE_RIGHT_WORD)? == x {
-            self.set_node_word(parent, TREE_RIGHT_WORD, y)?;
         } else {
-            self.set_node_word(parent, TREE_LEFT_WORD, y)?;
+            let pn = self.tn(parent)?;
+            if pn.right() == x {
+                pn.set_right(y);
+            } else {
+                pn.set_left(y);
+            }
         }
-        self.set_node_word(y, TREE_RIGHT_WORD, x)?;
-        self.set_node_word(x, TREE_PARENT_WORD, y)?;
+        yn.set_right(x);
+        xn.set_parent(y);
         self.rotated_max(x, y)
     }
 
@@ -2713,67 +2841,74 @@ impl AllocUtil {
     }
 
     /// `max(own size, children's max)` of one aoff tree node.
-    #[inline]
+    #[inline(always)]
     fn update_node_max(&mut self, node: usize) -> Result<(), AllocError> {
-        let mut largest = self.tree_node_size(node)?;
-        for child_word in [TREE_LEFT_WORD, TREE_RIGHT_WORD] {
-            let child = self.node_word(node, child_word)?;
+        let n = self.tn(node)?;
+        self.set_max_of(n)
+    }
+
+    #[inline(always)]
+    fn set_max_of(&self, n: TNode) -> Result<(), AllocError> {
+        let mut largest = n.size();
+        for child in [n.left(), n.right()] {
             if child != 0 {
-                largest = largest.max(self.node_word(child, TREE_FLAGS_WORD)? >> 32);
+                largest = largest.max(self.tn(child)?.max());
             }
         }
-        self.set_tree_node_max_size(node, largest)
+        n.set_max(largest);
+        Ok(())
     }
 
     /// Refreshes `max_sz` on `node` and every ancestor (the `update_max` walk of rbt_insert and
     /// rbt_delete in erl_ao_firstfit_alloc.c, OTP-29.1.1).
     fn update_max_to_root(&mut self, mut node: usize) -> Result<(), AllocError> {
         while node != 0 {
-            self.update_node_max(node)?;
-            node = self.node_word(node, TREE_PARENT_WORD)?;
+            let n = self.tn(node)?;
+            self.set_max_of(n)?;
+            node = n.parent();
         }
         Ok(())
     }
 
     fn insert_fixup(&mut self, mut node: usize) -> Result<(), AllocError> {
-        while self.is_red(self.node_word(node, TREE_PARENT_WORD)?)? {
-            let parent = self.node_word(node, TREE_PARENT_WORD)?;
-            let grand = self.node_word(parent, TREE_PARENT_WORD)?;
+        while self.is_red(self.tn(node)?.parent())? {
+            let parent = self.tn(node)?.parent();
+            let grand = self.tn(parent)?.parent();
             if grand == 0 {
                 return Err(AllocError::Corrupt);
             }
-            if parent == self.node_word(grand, TREE_LEFT_WORD)? {
-                let uncle = self.node_word(grand, TREE_RIGHT_WORD)?;
+            if parent == self.tn(grand)?.left() {
+                let uncle = self.tn(grand)?.right();
                 if self.is_red(uncle)? {
                     self.set_red(parent, false)?;
                     self.set_red(uncle, false)?;
                     self.set_red(grand, true)?;
                     node = grand;
                 } else {
-                    if node == self.node_word(parent, TREE_RIGHT_WORD)? {
+                    if node == self.tn(parent)?.right() {
                         node = parent;
                         self.rotate_left(node)?;
                     }
-                    let parent = self.node_word(node, TREE_PARENT_WORD)?;
-                    let grand = self.node_word(parent, TREE_PARENT_WORD)?;
+                    let parent = self.tn(node)?.parent();
+                    let grand = self.tn(parent)?.parent();
                     self.set_red(parent, false)?;
                     self.set_red(grand, true)?;
                     self.rotate_right(grand)?;
                 }
             } else {
-                let uncle = self.node_word(grand, TREE_LEFT_WORD)?;
+                let uncle = self.tn(grand)?.left();
                 if self.is_red(uncle)? {
                     self.set_red(parent, false)?;
                     self.set_red(uncle, false)?;
                     self.set_red(grand, true)?;
                     node = grand;
                 } else {
-                    if node == self.node_word(parent, TREE_LEFT_WORD)? {
+                    if node == self.tn(parent)?.left() {
                         node = parent;
                         self.rotate_right(node)?;
                     }
-                    let parent = self.node_word(node, TREE_PARENT_WORD)?;
-                    let grand = self.node_word(parent, TREE_PARENT_WORD)?;
+                    let parent = self.tn(node)?.parent();
+                    let grand = self.tn(parent)?.parent();
                     self.set_red(parent, false)?;
                     self.set_red(grand, true)?;
                     self.rotate_left(grand)?;
@@ -2785,108 +2920,112 @@ impl AllocUtil {
     }
 
     fn replace_tree_node(&mut self, old: usize, new: usize) -> Result<(), AllocError> {
-        let parent = self.node_word(old, TREE_PARENT_WORD)?;
-        let left = self.node_word(old, TREE_LEFT_WORD)?;
-        let right = self.node_word(old, TREE_RIGHT_WORD)?;
-        let flags = self.node_word(old, TREE_FLAGS_WORD)?;
+        let parent = self.tn(old)?.parent();
+        let left = self.tn(old)?.left();
+        let right = self.tn(old)?.right();
+        let flags = self.tn(old)?.flags();
         if parent == 0 {
             self.set_tree_root(old, new)?;
-        } else if self.node_word(parent, TREE_LEFT_WORD)? == old {
-            self.set_node_word(parent, TREE_LEFT_WORD, new)?;
+        } else if self.tn(parent)?.left() == old {
+            self.tn(parent)?.set_left(new);
         } else {
-            self.set_node_word(parent, TREE_RIGHT_WORD, new)?;
+            self.tn(parent)?.set_right(new);
         }
-        self.set_node_word(new, TREE_FLAGS_WORD, flags)?;
-        self.set_node_word(new, TREE_PARENT_WORD, parent)?;
-        self.set_node_word(new, TREE_LEFT_WORD, left)?;
-        self.set_node_word(new, TREE_RIGHT_WORD, right)?;
+        self.tn(new)?.set_flags(flags);
+        self.tn(new)?.set_parent(parent);
+        self.tn(new)?.set_left(left);
+        self.tn(new)?.set_right(right);
         if left != 0 {
-            self.set_node_word(left, TREE_PARENT_WORD, new)?;
+            self.tn(left)?.set_parent(new);
         }
         if right != 0 {
-            self.set_node_word(right, TREE_PARENT_WORD, new)?;
+            self.tn(right)?.set_parent(new);
         }
         let next = self.node_word(new, BF_NEXT_WORD)?;
         if next != 0 {
-            self.set_node_word(next, TREE_PARENT_WORD, new)?;
+            self.tn(next)?.set_parent(new);
         }
         Ok(())
     }
 
+    #[inline(always)]
     fn transplant(&mut self, old: usize, new: usize) -> Result<(), AllocError> {
-        let parent = self.node_word(old, TREE_PARENT_WORD)?;
+        let parent = self.tn(old)?.parent();
         if parent == 0 {
             self.set_tree_root(old, new)?;
-        } else if self.node_word(parent, TREE_LEFT_WORD)? == old {
-            self.set_node_word(parent, TREE_LEFT_WORD, new)?;
         } else {
-            self.set_node_word(parent, TREE_RIGHT_WORD, new)?;
+            let pn = self.tn(parent)?;
+            if pn.left() == old {
+                pn.set_left(new);
+            } else {
+                pn.set_right(new);
+            }
         }
         if new != 0 {
-            self.set_node_word(new, TREE_PARENT_WORD, parent)?;
+            self.tn(new)?.set_parent(parent);
         }
         Ok(())
     }
 
     fn minimum_node(&self, mut node: usize) -> Result<usize, AllocError> {
-        while self.node_word(node, TREE_LEFT_WORD)? != 0 {
-            node = self.node_word(node, TREE_LEFT_WORD)?;
+        loop {
+            let left = self.tn(node)?.left();
+            if left == 0 {
+                return Ok(node);
+            }
+            node = left;
         }
-        Ok(node)
     }
 
     fn delete_tree_node(&mut self, node: usize) -> Result<(), AllocError> {
         let block_carrier = self.node_carrier(node)?;
         let carrier_node = block_carrier.is_none();
         let carrier = block_carrier.unwrap_or(0);
-        let mut replacement = node;
-        let mut replacement_was_red = self.is_red(replacement)?;
-        let left = self.node_word(node, TREE_LEFT_WORD)?;
-        let right = self.node_word(node, TREE_RIGHT_WORD)?;
+        let nn = self.tn(node)?;
+        let mut replacement_was_red = nn.is_red();
+        let left = nn.left();
+        let right = nn.right();
         let (child, child_parent);
         if left == 0 {
             child = right;
-            child_parent = self.node_word(node, TREE_PARENT_WORD)?;
+            child_parent = nn.parent();
             self.transplant(node, right)?;
         } else if right == 0 {
             child = left;
-            child_parent = self.node_word(node, TREE_PARENT_WORD)?;
+            child_parent = nn.parent();
             self.transplant(node, left)?;
         } else {
-            replacement = self.minimum_node(right)?;
-            replacement_was_red = self.is_red(replacement)?;
-            let successor_right = self.node_word(replacement, TREE_RIGHT_WORD)?;
-            let successor_parent = self.node_word(replacement, TREE_PARENT_WORD)?;
+            let replacement = self.minimum_node(right)?;
+            let rn = self.tn(replacement)?;
+            replacement_was_red = rn.is_red();
+            let successor_right = rn.right();
+            let successor_parent = rn.parent();
             if successor_parent == node {
                 child = successor_right;
                 child_parent = replacement;
                 if child != 0 {
-                    self.set_node_word(child, TREE_PARENT_WORD, replacement)?;
+                    self.tn(child)?.set_parent(replacement);
                 }
             } else {
                 child = successor_right;
                 child_parent = successor_parent;
                 self.transplant(replacement, successor_right)?;
-                self.set_node_word(replacement, TREE_RIGHT_WORD, right)?;
-                self.set_node_word(right, TREE_PARENT_WORD, replacement)?;
+                rn.set_right(right);
+                self.tn(right)?.set_parent(replacement);
             }
             self.transplant(node, replacement)?;
-            self.set_node_word(replacement, TREE_LEFT_WORD, left)?;
-            self.set_node_word(left, TREE_PARENT_WORD, replacement)?;
-            let flags = self.node_word(node, TREE_FLAGS_WORD)?;
-            self.set_node_word(
-                replacement,
-                TREE_FLAGS_WORD,
-                (flags | TREE_NODE) & !RED | if self.is_red(node)? { RED } else { 0 },
-            )?;
+            rn.set_left(left);
+            self.tn(left)?.set_parent(replacement);
+            let red = nn.is_red();
+            rn.set_flags((nn.flags() | TREE_NODE) & !RED | if red { RED } else { 0 });
         }
         if !replacement_was_red {
             self.delete_fixup(child, child_parent, carrier, carrier_node)?;
         }
-        self.set_node_word(node, TREE_FLAGS_WORD, 0)?;
-        self.set_node_word(node, TREE_PARENT_WORD, 0)?;
-        self.set_node_word(node, TREE_LEFT_WORD, 0)?;
-        self.set_node_word(node, TREE_RIGHT_WORD, 0)?;
+        nn.set_flags(0);
+        nn.set_parent(0);
+        nn.set_left(0);
+        nn.set_right(0);
         if is_aoff(self.strategy) {
             // Rotations keep their own nodes exact; every node whose subtree lost the block is an
             // ancestor of the spot it left, which stays an ancestor through the rebalancing.
@@ -2913,75 +3052,75 @@ impl AllocUtil {
             if parent == 0 {
                 break;
             }
-            if node == self.node_word(parent, TREE_LEFT_WORD)? {
-                let mut sibling = self.node_word(parent, TREE_RIGHT_WORD)?;
+            if node == self.tn(parent)?.left() {
+                let mut sibling = self.tn(parent)?.right();
                 if self.is_red(sibling)? {
                     self.set_red(sibling, false)?;
                     self.set_red(parent, true)?;
                     self.rotate_left(parent)?;
-                    sibling = self.node_word(parent, TREE_RIGHT_WORD)?;
+                    sibling = self.tn(parent)?.right();
                 }
                 let sl = if sibling == 0 {
                     0
                 } else {
-                    self.node_word(sibling, TREE_LEFT_WORD)?
+                    self.tn(sibling)?.left()
                 };
                 let sr = if sibling == 0 {
                     0
                 } else {
-                    self.node_word(sibling, TREE_RIGHT_WORD)?
+                    self.tn(sibling)?.right()
                 };
                 if !self.is_red(sl)? && !self.is_red(sr)? {
                     self.set_red(sibling, true)?;
                     node = parent;
-                    parent = self.node_word(node, TREE_PARENT_WORD)?;
+                    parent = self.tn(node)?.parent();
                 } else {
                     if !self.is_red(sr)? {
                         self.set_red(sl, false)?;
                         self.set_red(sibling, true)?;
                         self.rotate_right(sibling)?;
-                        sibling = self.node_word(parent, TREE_RIGHT_WORD)?;
+                        sibling = self.tn(parent)?.right();
                     }
                     self.set_red(sibling, self.is_red(parent)?)?;
                     self.set_red(parent, false)?;
-                    let sr = self.node_word(sibling, TREE_RIGHT_WORD)?;
+                    let sr = self.tn(sibling)?.right();
                     self.set_red(sr, false)?;
                     self.rotate_left(parent)?;
                     node = root(self)?;
                     parent = 0;
                 }
             } else {
-                let mut sibling = self.node_word(parent, TREE_LEFT_WORD)?;
+                let mut sibling = self.tn(parent)?.left();
                 if self.is_red(sibling)? {
                     self.set_red(sibling, false)?;
                     self.set_red(parent, true)?;
                     self.rotate_right(parent)?;
-                    sibling = self.node_word(parent, TREE_LEFT_WORD)?;
+                    sibling = self.tn(parent)?.left();
                 }
                 let sr = if sibling == 0 {
                     0
                 } else {
-                    self.node_word(sibling, TREE_RIGHT_WORD)?
+                    self.tn(sibling)?.right()
                 };
                 let sl = if sibling == 0 {
                     0
                 } else {
-                    self.node_word(sibling, TREE_LEFT_WORD)?
+                    self.tn(sibling)?.left()
                 };
                 if !self.is_red(sr)? && !self.is_red(sl)? {
                     self.set_red(sibling, true)?;
                     node = parent;
-                    parent = self.node_word(node, TREE_PARENT_WORD)?;
+                    parent = self.tn(node)?.parent();
                 } else {
                     if !self.is_red(sl)? {
                         self.set_red(sr, false)?;
                         self.set_red(sibling, true)?;
                         self.rotate_left(sibling)?;
-                        sibling = self.node_word(parent, TREE_LEFT_WORD)?;
+                        sibling = self.tn(parent)?.left();
                     }
                     self.set_red(sibling, self.is_red(parent)?)?;
                     self.set_red(parent, false)?;
-                    let sl = self.node_word(sibling, TREE_LEFT_WORD)?;
+                    let sl = self.tn(sibling)?.left();
                     self.set_red(sl, false)?;
                     self.rotate_right(parent)?;
                     node = root(self)?;
@@ -3763,6 +3902,58 @@ mod tests {
                     prop_assert_eq!(allocator.stats().blocks, live.iter().filter(|a| a.is_some()).count());
                 }
             }
+        }
+    }
+
+    /// Deep trees: thousands of live blocks force rotations and recolors in the aoff and
+    /// bestfit trees, which the short proptest sequences rarely reach.
+    #[test]
+    fn many_blocks_keep_tree_invariants_for_tree_strategies() {
+        for strategy in [
+            Strategy::BestFit,
+            Strategy::AddressOrderBestFit,
+            Strategy::Aoff,
+            Strategy::AoffCbf,
+            Strategy::AoffCaobf,
+        ] {
+            let mut allocator = AllocUtil::new(
+                strategy,
+                AllocUtilOptions {
+                    sbct: 64 * 1024,
+                    smbcs: 256 * 1024,
+                    mmbcs: 256 * 1024,
+                    lmbcs: 1024 * 1024,
+                    ..Default::default()
+                },
+            );
+            let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut live: Vec<Allocation> = Vec::new();
+            for step in 0..3000 {
+                let roll = next() % 100;
+                if roll < 55 || live.is_empty() {
+                    let size = 8 + (next() % 700) as usize;
+                    live.push(allocator.alloc(size).unwrap());
+                } else {
+                    let index = (next() % live.len() as u64) as usize;
+                    allocator.free(live.swap_remove(index)).unwrap();
+                }
+                if step % 25 == 0 {
+                    assert!(
+                        allocator.validate().is_ok(),
+                        "{strategy:?} invalid after step {step}"
+                    );
+                }
+            }
+            for allocation in live {
+                allocator.free(allocation).unwrap();
+            }
+            assert!(allocator.validate().is_ok(), "{strategy:?} invalid at end");
         }
     }
 

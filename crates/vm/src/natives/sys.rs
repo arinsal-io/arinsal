@@ -1417,6 +1417,13 @@ fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmEr
         return Err(badarg());
     };
     apply_allocator_overrides(&mut spec, name, &configured.flags, schedulers);
+    if let Some(sbct) = DYN_SBCT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(name)
+    {
+        spec.sbct = *sbct;
+    }
     if !spec.enabled {
         alloc_atoms::note_disabled_allocator(name);
         return owned_system_info(process, O::Atom("false".into()));
@@ -3183,9 +3190,33 @@ fn erts_alloc_flag(process: &mut Process, value: Term) -> Result<Term, VmError> 
             "badarg",
         ));
     }
-    let _ = (parameter, amount);
-    Ok(atom("notsup"))
+    // Only alloc_util allocators accept dynamic parameters, and only `sbct`.
+    // Port of erts/emulator/beam/erl_alloc.c:3445 (`erts_alloc_set_dyn_param`), OTP-29.1.1.
+    let schedulers = std::thread::available_parallelism().map_or(1, usize::from);
+    let configured = arinsal_args::active_allocator_options();
+    let enabled = default_allocator(allocator, schedulers).is_some_and(|mut spec| {
+        apply_allocator_overrides(&mut spec, allocator, &configured.flags, schedulers);
+        spec.enabled
+    });
+    if !enabled || parameter != "sbct" {
+        return Ok(atom("notsup"));
+    }
+    let accepted = usize::try_from(amount)
+        .ok()
+        .and_then(|amount| arinsal_alloc::typed::try_set_dyn_sbct(allocator, amount));
+    if accepted != Some(true) {
+        return Ok(atom("notsup"));
+    }
+    DYN_SBCT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(allocator.clone(), amount);
+    Ok(atom("ok"))
 }
+
+/// Dynamic `sbct` values set through `system_flag(erts_alloc, ...)`, by allocator name.
+static DYN_SBCT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(Default::default);
 
 pub(crate) fn set_system_logger(process: &Process, value: Term) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_trace.c:2486, OTP-29.1.1.

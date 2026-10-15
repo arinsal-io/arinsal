@@ -162,6 +162,13 @@ fn key_cmp(a: Term, b: Term) -> Ordering {
     if let (Some(a), Some(b)) = (a.as_small(), b.as_small()) {
         return a.cmp(&b);
     }
+    // erts_cmp_compound resolves immediates of different types by the term order
+    // number < atom without touching the heap; do the same for the common small/atom mix.
+    match (a.as_small().is_some(), b.as_small().is_some()) {
+        (true, false) if b.as_atom().is_some() => return Ordering::Less,
+        (false, true) if a.as_atom().is_some() => return Ordering::Greater,
+        _ => {}
+    }
     exact_cmp(a, b, true)
 }
 
@@ -2121,4 +2128,18 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
         }
     }
     Ok(boxed(p))
+}
+
+#[cfg(test)]
+mod key_order_tests {
+    use super::*;
+
+    #[test]
+    fn small_sorts_before_atom_like_erts_term_order() {
+        let small = Term::small(7).unwrap();
+        let atom = Term::atom(arinsal_term::atoms::OK);
+        assert_eq!(key_cmp(small, atom), Ordering::Less);
+        assert_eq!(key_cmp(atom, small), Ordering::Greater);
+        assert_eq!(key_cmp(small, Term::small(9).unwrap()), Ordering::Less);
+    }
 }
