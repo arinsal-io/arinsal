@@ -44,6 +44,10 @@ pub(crate) struct MatchRunner<'a> {
     state: pam::PamState,
 }
 
+/// First reference word of a compiled match program handle. Stays below 2^18
+/// so that the handle decodes on any node.
+const PROGRAM_REF_TAG: u32 = 0x1_534d;
+
 static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Process and tracing values supplied by the VM when a match program runs.
@@ -963,14 +967,14 @@ impl MatchProgram {
     /// Opaque reference for the compiled program in a continuation term.
     pub fn reference<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
         Ok(TermBuilder::new(dst).local_ref([
-            0x4554_534d,
+            PROGRAM_REF_TAG,
             self.id as u32,
             (self.id >> 32) as u32,
         ])?)
     }
 
     pub(crate) fn matches_reference(&self, term: Term) -> bool {
-        matches!(term.identity(), Some(arinsal_term::Identity::Ref { ids, .. }) if ids == [0x4554_534d, self.id as u32, (self.id >> 32) as u32])
+        matches!(term.identity(), Some(arinsal_term::Identity::Ref { ids, .. }) if ids == [PROGRAM_REF_TAG, self.id as u32, (self.id >> 32) as u32])
     }
 
     /// Return the stable identifier carried by this compiled program's reference.
@@ -981,7 +985,9 @@ impl MatchProgram {
     /// Decode a reference created by `reference`.
     pub fn reference_id(term: Term) -> Option<u64> {
         match term.identity()? {
-            arinsal_term::Identity::Ref { ids, .. } if ids.len() == 3 && ids[0] == 0x4554_534d => {
+            arinsal_term::Identity::Ref { ids, .. }
+                if ids.len() == 3 && ids[0] == PROGRAM_REF_TAG =>
+            {
                 Some(ids[1] as u64 | ((ids[2] as u64) << 32))
             }
             _ => None,
