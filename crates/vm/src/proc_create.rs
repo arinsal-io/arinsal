@@ -759,6 +759,9 @@ pub(crate) struct ProcessCold {
     // OTP-29.1.1.
     pub(crate) call_time: Vec<crate::trace_bp::ProcBpTrace>,
     pub(crate) call_memory: Vec<crate::trace_bp::ProcBpTrace>,
+    /// The trace flags of the process per session as of trace epoch `.0` (erts reaches them
+    /// through the process's tracer reference list, `get_tracer_ref`).
+    pub(crate) trace_flags: (u64, Vec<(u64, u64)>),
     /// Meta tracers named by return frames on the stack, one entry per frame.
     pub(crate) meta_frames: Vec<std::sync::Arc<crate::trace_bp::MetaTracer>>,
     /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
@@ -1230,11 +1233,31 @@ impl Process {
         self.header.fcalls = self.reductions;
     }
 
+    /// Satisfy `need` words in a fresh heap fragment without collecting, keeping the call_memory
+    /// accounting of the abandoned heap.
+    // Port of erts/emulator/beam/erl_gc.c:500-582 (delay_garbage_collection), OTP-29.1.1.
+    pub(crate) fn delay_heap_collection(&mut self, need: usize) {
+        if need == 0 {
+            return;
+        }
+        let first_abandon = !self.heap.has_abandoned_heap();
+        let used = self.heap.words_since_high_water() as i64;
+        self.heap.delay_collection(need);
+        if first_abandon
+            && self
+                .cold
+                .as_ref()
+                .is_some_and(|cold| !cold.call_memory.is_empty())
+        {
+            crate::trace_bp::adjust_memory_break(self, used);
+        }
+    }
+
     /// Words allocated by the process since its last collection, plus `adjustment`.
     // Port of erts/emulator/beam/beam_bp.c:989-992 (get_allocated_words), OTP-29.1.1.
     pub(crate) fn allocated_words(&self, adjustment: i64) -> i64 {
         let info = self.heap.gc_info_words();
-        adjustment + info.heap_size as i64 - info.recent_size as i64 + info.mbuf_size as i64
+        adjustment + self.heap.words_since_high_water() as i64 + info.mbuf_size as i64
     }
 
     #[inline]
@@ -1445,9 +1468,10 @@ impl Process {
             return Ok(());
         }
         if !self.heap.gc_enabled {
-            return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
-                arinsal_term::atoms::SYSTEM_LIMIT,
-            ))));
+            // Port of erts/emulator/beam/erl_gc.c:780-783 (garbage_collect with F_DISABLE_GC):
+            // the need is satisfied in a fresh heap fragment and the collection is delayed.
+            self.delay_heap_collection(words);
+            return Ok(());
         }
         // Port of erts/emulator/beam/jit/arm/instr_common.cpp:94-99, OTP-29.1.1:
         // the native heap check uses S_RESERVED, but GC receives the raw `need`.

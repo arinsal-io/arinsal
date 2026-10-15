@@ -885,6 +885,16 @@ impl ProcessHeap {
         self.heap_size_words() + self.old_words.len() + self.fragment_words as usize
     }
 
+    /// Words allocated on the active heap since the high-water mark (`p->htop - p->high_water`).
+    pub fn words_since_high_water(&self) -> usize {
+        self.htop.saturating_sub(self.high_water)
+    }
+
+    /// Whether a delayed collection left a young heap behind (erts `p->abandoned_heap != NULL`).
+    pub fn has_abandoned_heap(&self) -> bool {
+        self.abandoned
+    }
+
     /// The young heap a delayed collection abandoned, if any (erts `p->abandoned_heap`).
     pub(crate) fn abandoned_heap(&self) -> Option<AbandonedHeap> {
         if !self.abandoned {

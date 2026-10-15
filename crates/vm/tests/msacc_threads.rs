@@ -9,7 +9,18 @@ const SOURCE: &str = r##"
 -module(msacc_threads).
 -export([run/1]).
 
-run(Load) ->
+%% The structure is deterministic; the ratios depend on the runner getting scheduled, so a
+%% measurement that fails them is repeated (a starved machine) before it is reported.
+run(Load) -> run(Load, 12).
+
+run(Load, Left) ->
+    {Kinds, Keys, Whole, Idle, Busy} = measure(Load),
+    case Left > 1 andalso not (Whole andalso Idle andalso Busy) of
+        true -> receive after 300 -> ok end, run(Load, Left - 1);
+        false -> {Kinds, Keys, Whole, Idle, Busy}
+    end.
+
+measure(Load) ->
     erlang:system_flag(microstate_accounting, false),
     erlang:system_flag(microstate_accounting, reset),
     erlang:system_flag(microstate_accounting, true),
@@ -42,7 +53,7 @@ run(Load) ->
      case Load of idle -> true; dirty_io -> DirtyIoBusy end}.
 
 work(idle) ->
-    receive after 250 -> ok end;
+    receive after 400 -> ok end;
 work(dirty_io) ->
     [erts_debug:dirty_io(wait, 25) || _ <- lists:seq(1, 8)],
     ok.

@@ -2891,6 +2891,8 @@ fn native_breakpoint_accounted(
         crate::native_hooks::set_error(process, "system_limit");
     }
     publish_dispatch_x(process, registers);
+    // A delayed collection moves the stack and its frame pointer chain.
+    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     true
 }
 

@@ -6488,7 +6488,7 @@ impl Process {
         // erts_schedule_dirty_sys_execution: the process moves to a dirty CPU scheduler
         // when it leaves this one.
         cold.dirty_sys_gc = true;
-        self.heap.delay_collection(need);
+        self.delay_heap_collection(need);
         // erl_gc.c:588-597 (force_reschedule): the remaining reductions are spent.
         self.force_yield = true;
         true
