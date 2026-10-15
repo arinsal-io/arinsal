@@ -3,9 +3,9 @@
 # Uses the `mix arinsal.*` tasks: deploys poc/multitenancy/bench/rest as two tenants, curls both
 # projects, lists, reads logs, stops, starts, redeploys and deletes.
 #
-# The manager, the projects and the client tasks list/stop/start/logs/delete run on Arinsal.
-# `mix arinsal.deploy` (which compiles bench/rest and its deps and builds the release) runs on
-# stock OTP, because compiling hpax fails on Arinsal (NOTES-cloud.md, "Arinsal gaps").
+# The manager, the projects, the client tasks and `mix arinsal.deploy` (which compiles bench/rest
+# and its deps and builds the release) all run on Arinsal. Only `mix deps.get` runs on stock OTP:
+# Hex on Arinsal would write a cache stock OTP cannot read.
 # The manager is started with packages/arinsal_cloud/bin/arinsal-cloud.
 #
 #   poc/multitenancy/tests/cloud_fake_e2e.sh
@@ -42,11 +42,13 @@ json_field() { sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p" | head -1; }
 step "compile the manager"
 (cd "$ROOT/packages/arinsal_cloud" && mix compile >"$WORK/compile.log" 2>&1) || { cat "$WORK/compile.log"; exit 1; }
 
-# Stock OTP for compiling and releasing: bench/rest deps do not compile on Arinsal yet.
+# Stock OTP only fetches dependencies; everything else runs on Arinsal.
 STOCK_PATH="${STOCK_PATH:-/opt/homebrew/opt/erlang@29/bin:/opt/homebrew/opt/elixir/bin:/usr/bin:/bin}"
-stock() { env -u ERL_ROOTDIR PATH="$STOCK_PATH" "$@"; }
+stock() { env -u ERL_ROOTDIR -u HEX_HOME PATH="$STOCK_PATH" "$@"; }
 # Client tasks run on Arinsal from packages/arinsal (it has no deps to compile).
 arinsal_task() { (cd "$ROOT/packages/arinsal" && mix "$@"); }
+# Arinsal's Hex gets its own state dir so it never touches the cache stock OTP uses.
+export HEX_HOME="$WORK/hex_arinsal"
 
 step "prepare a copy of bench/rest"
 cp -R "$ROOT/poc/multitenancy/bench/rest" "$WORK/rest"
@@ -69,8 +71,8 @@ OUT="$(arinsal_task arinsal.list --url "$ADMIN")"
 case "$OUT" in *"No projects"*) ;; *) fail "mix arinsal.list on an empty manager: $OUT" ;; esac
 
 step "mix arinsal.deploy acme/shop and globex/shop"
-(cd "$WORK/rest" && stock mix arinsal.deploy --tenant acme --project shop --url "$ADMIN" >"$WORK/deploy_acme.log" 2>&1) || { cat "$WORK/deploy_acme.log"; fail "deploy acme"; }
-(cd "$WORK/rest" && stock mix arinsal.deploy --tenant globex --project shop --url "$ADMIN" >"$WORK/deploy_globex.log" 2>&1) || { cat "$WORK/deploy_globex.log"; fail "deploy globex"; }
+(cd "$WORK/rest" && mix arinsal.deploy --tenant acme --project shop --url "$ADMIN" >"$WORK/deploy_acme.log" 2>&1) || { cat "$WORK/deploy_acme.log"; fail "deploy acme"; }
+(cd "$WORK/rest" && mix arinsal.deploy --tenant globex --project shop --url "$ADMIN" >"$WORK/deploy_globex.log" 2>&1) || { cat "$WORK/deploy_globex.log"; fail "deploy globex"; }
 tail -1 "$WORK/deploy_acme.log"
 tail -1 "$WORK/deploy_globex.log"
 PA="$(curl -sf "$ADMIN/projects/acme/shop" | json_field port)"
@@ -111,7 +113,7 @@ OUT="$(arinsal_task arinsal.logs --tenant acme --project shop --url "$ADMIN")"
 case "$OUT" in *"[manager] stopping"*) ;; *) fail "stop line missing from logs: $OUT" ;; esac
 
 step "redeploy acme with mix arinsal.deploy: port kept, globex untouched"
-(cd "$WORK/rest" && stock mix arinsal.deploy --tenant acme --project shop --url "$ADMIN" >"$WORK/deploy_acme2.log" 2>&1) || { cat "$WORK/deploy_acme2.log"; fail "redeploy acme"; }
+(cd "$WORK/rest" && mix arinsal.deploy --tenant acme --project shop --url "$ADMIN" >"$WORK/deploy_acme2.log" 2>&1) || { cat "$WORK/deploy_acme2.log"; fail "redeploy acme"; }
 [ "$(curl -sf "$ADMIN/projects/acme/shop" | json_field port)" = "$PA" ] || fail "port changed on redeploy"
 curl -sf "http://127.0.0.1:$PA/t/1/items/1" >/dev/null || fail "acme does not answer after redeploy"
 curl -sf "http://127.0.0.1:$PG/t/1/items/1" >/dev/null || fail "globex stopped by the acme redeploy"
