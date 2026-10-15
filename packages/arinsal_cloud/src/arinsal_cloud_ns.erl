@@ -65,9 +65,14 @@ start(#{tenant := Tenant, project := Project, release_dir := Dir, log := Log, en
 boot(Ns, Plan, Log, Env, Key, Notify) ->
     try
         guarded(fun() -> arinsal_ns:expose(Log) end),
-        Pid = (boot_module()):start(Ns, Plan, #{group_leader => Log, os_env => Env}),
-        Watcher = spawn(fun() -> watch(Key, Notify, Ns, Pid) end),
-        {ok, #{id => Ns, ns => Ns, pid => Pid, watcher => Watcher}, Ns}
+        case (boot_module()):start(Ns, Plan, #{group_leader => Log, os_env => Env}) of
+            {ok, Pid} ->
+                Watcher = spawn(fun() -> watch(Key, Notify, Ns, Pid) end),
+                {ok, #{id => Ns, ns => Ns, pid => Pid, watcher => Watcher}, Ns};
+            {error, Failure} ->
+                destroy(Ns, undefined),
+                {error, {boot_failed, Failure}}
+        end
     catch
         Class:Reason ->
             destroy(Ns, undefined),

@@ -5,7 +5,8 @@
 -export([start/3, implemented/0, run/2]).
 
 start(Ns, #{release := {Name, _}}, #{group_leader := Log, os_env := Env}) ->
-    arinsal_ns:spawn(Ns, ?MODULE, run, [Name, proplists:get_value("PORT", Env)], [{group_leader, Log}]).
+    {ok, arinsal_ns:spawn(Ns, ?MODULE, run, [Name, proplists:get_value("PORT", Env)],
+                          [{group_leader, Log}])}.
 
 implemented() ->
     true.
