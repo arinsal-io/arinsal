@@ -974,15 +974,13 @@ fn process_info_item_current_location(
                         module
                             .lines
                             .get(process.ip)
-                            .and_then(Option::as_ref)
                             .or_else(|| {
                                 process
                                     .ip
                                     .checked_sub(1)
                                     .and_then(|ip| module.lines.get(ip))
-                                    .and_then(Option::as_ref)
                             })
-                            .cloned()
+                            .map(|(file, line)| (file.to_string(), line))
                     })
                 })
             })

@@ -1,6 +1,6 @@
 //! Resolution of OTP 29 generic BEAM instructions into compact interpreter code.
 
-use arinsal_beam::{BeamFile, BeamType, Instr as BeamInstr, Operand};
+use arinsal_beam::{BeamFile, Instr as BeamInstr, Operand};
 use arinsal_bifs::BifFn;
 use arinsal_spec::Opcode;
 use arinsal_term::{Atom, Term, TermBuilder, VecHeap, from_owned, global_atoms};
@@ -335,6 +335,110 @@ impl ExportSlot {
     }
 }
 
+/// Source location of each instruction, stored as runs of equal locations.
+#[derive(Clone, Default)]
+pub struct LineTable {
+    files: Vec<Arc<str>>,
+    runs: Vec<LineRun>,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct LineRun {
+    start: u32,
+    file: u32,
+    line: u32,
+}
+
+const NO_FILE: u32 = u32::MAX;
+
+impl LineTable {
+    /// File and line of the instruction at `ip`, when it has a location.
+    pub fn get(&self, ip: usize) -> Option<(&str, u64)> {
+        if ip >= self.len {
+            return None;
+        }
+        let index = self
+            .runs
+            .partition_point(|run| run.start as usize <= ip)
+            .checked_sub(1)?;
+        let run = self.runs[index];
+        let file = self.files.get(run.file as usize)?;
+        Some((file, u64::from(run.line)))
+    }
+
+    /// Every location in code order, one entry per run of instructions.
+    pub fn locations(&self) -> impl Iterator<Item = (&str, u64)> + '_ {
+        self.runs.iter().filter_map(|run| {
+            let file = self.files.get(run.file as usize)?;
+            Some((&**file, u64::from(run.line)))
+        })
+    }
+
+    /// Distinct source file names.
+    pub fn files(&self) -> &[Arc<str>] {
+        &self.files
+    }
+
+    /// Number of instructions covered.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the table covers no instruction.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+#[derive(Default)]
+struct LineTableBuilder {
+    table: LineTable,
+    last: Option<(Arc<str>, u32)>,
+}
+
+impl LineTableBuilder {
+    fn push(&mut self, location: &Option<(Arc<str>, u64)>) {
+        let same = match (&self.last, location) {
+            (None, None) => true,
+            (Some((file, line)), Some((other, number))) => {
+                u64::from(*line) == *number && (Arc::ptr_eq(file, other) || **file == **other)
+            }
+            _ => false,
+        };
+        if !same || self.table.runs.is_empty() {
+            let start = self.table.len as u32;
+            let (file, line) = match location {
+                Some((file, number)) => {
+                    let index = match self.table.files.iter().position(|known| **known == **file) {
+                        Some(index) => index,
+                        None => {
+                            self.table.files.push(Arc::clone(file));
+                            self.table.files.len() - 1
+                        }
+                    };
+                    (index as u32, *number as u32)
+                }
+                None => (NO_FILE, 0),
+            };
+            self.table.runs.push(LineRun { start, file, line });
+            self.last = location
+                .as_ref()
+                .map(|(file, number)| (Arc::clone(file), *number as u32));
+        }
+        self.table.len += 1;
+    }
+
+    fn finish(mut self, len: usize) -> LineTable {
+        while self.table.len < len {
+            self.push(&None);
+        }
+        self.table.runs.shrink_to_fit();
+        self.table.files.shrink_to_fit();
+        self.table
+    }
+}
+
 /// Executable module and its out-of-line data.
 pub struct Module {
     /// Module atom text.
@@ -367,14 +471,10 @@ pub struct Module {
     // ---- vm_maps_bits ----
     /// Module string table used by bit syntax string segments.
     pub strings: Box<[u8]>,
-    /// Type metadata, indexed by code index and operand position.
-    pub types: Vec<Vec<(usize, BeamType)>>,
     /// Source line for each instruction.
-    pub lines: Vec<Option<(String, u64)>>,
+    pub lines: LineTable,
     /// Literal file-name lists indexed by source filename.
     pub line_file_terms: HashMap<String, Term>,
-    /// Per-instruction cached filename terms for exception stack traces.
-    pub line_terms: Vec<Option<(Term, u64)>>,
     /// Opcodes not yet executable, with occurrence counts.
     pub unsupported: HashMap<String, usize>,
     /// Reason for each explicit unsupported opcode.
@@ -445,10 +545,8 @@ impl Clone for Module {
             lists: self.lists.clone(),
             bit_commands: self.bit_commands.clone(),
             strings: self.strings.clone(),
-            types: self.types.clone(),
             lines: self.lines.clone(),
             line_file_terms: self.line_file_terms.clone(),
-            line_terms: self.line_terms.clone(),
             unsupported: self.unsupported.clone(),
             unsupported_reasons: self.unsupported_reasons.clone(),
             functions: self.functions.clone(),
@@ -661,7 +759,11 @@ impl Module {
     }
     /// Cached literal filename list and line for a code offset.
     pub fn line_term_at(&self, ip: usize) -> Option<(Term, u64)> {
-        self.line_terms.get(ip).copied().flatten()
+        let (file, number) = self.lines.get(ip)?;
+        self.line_file_terms
+            .get(file)
+            .copied()
+            .map(|term| (term, number))
     }
 }
 
@@ -691,7 +793,6 @@ struct Decoder<'a> {
     literals: &'a mut VecHeap,
     literal_terms: &'a mut HashMap<u32, Term>,
     lists: &'a mut Vec<Box<[Arg]>>,
-    types: &'a mut Vec<(usize, BeamType)>,
 }
 impl Decoder<'_> {
     fn bigint_arg(&mut self, value: &BigInt) -> Result<Arg, LoadError> {
@@ -769,14 +870,7 @@ impl Decoder<'_> {
                     .sum();
                 Arg::new(Arg::U, words)
             }
-            Operand::TypedReg { reg, type_index } => {
-                if let Some(table) = &self.file.types
-                    && let Some(ty) = table.entries.get(*type_index as usize)
-                {
-                    self.types.push((position, ty.clone()));
-                }
-                self.arg(reg, position)?
-            }
+            Operand::TypedReg { reg, .. } => self.arg(reg, position)?,
         })
     }
 
@@ -1142,9 +1236,8 @@ pub fn load_with_instrumentations(
     let mut selects = Vec::new();
     let mut tails = Vec::new();
     let mut lists = Vec::new();
-    let mut types = Vec::new();
-    let mut lines = Vec::new();
-    let mut current_line = None;
+    let mut lines = LineTableBuilder::default();
+    let mut current_line: Option<(Arc<str>, u64)> = None;
     let mut unsupported = HashMap::new();
     let mut unsupported_reasons = Vec::new();
     let mut functions: Vec<(usize, String, u8)> = Vec::new();
@@ -1173,7 +1266,7 @@ pub fn load_with_instrumentations(
                 // ---- vm_exc ---- OTP keeps an implicit undefined item at index zero.
                 && let Some(item) = n.checked_sub(1).and_then(|i| table.items.get(i as usize))
             {
-                let name = if item.name_index == 0 {
+                let name: String = if item.name_index == 0 {
                     format!("{}.erl", file.module)
                 } else {
                     table
@@ -1183,8 +1276,13 @@ pub fn load_with_instrumentations(
                         .filter(|name| !name.is_empty())
                         .unwrap_or_else(|| format!("{}.erl", file.module))
                 };
-                current_line =
-                    valid_source_location(item.name_index, item.line).then_some((name, item.line));
+                current_line = valid_source_location(item.name_index, item.line).then(|| {
+                    let name = match &current_line {
+                        Some((previous, _)) if **previous == *name => Arc::clone(previous),
+                        _ => Arc::from(name),
+                    };
+                    (name, item.line)
+                });
             }
             continue;
         }
@@ -1246,8 +1344,7 @@ pub fn load_with_instrumentations(
                 counter_ids.push(*cover_id);
                 function_owners.push(*owner);
                 code.push(Instr::CoverageProbe { index: probe });
-                types.push(Vec::new());
-                lines.push(current_line.clone());
+                lines.push(&current_line);
             }
         }
         if !executable(instruction.op) {
@@ -1257,19 +1354,16 @@ pub fn load_with_instrumentations(
             let reason = u32::try_from(unsupported_reasons.len()).map_err(|_| LoadError::Limit)?;
             unsupported_reasons.push(format!("opcode {}", instruction.op.name()));
             code.push(Instr::Unsupported(reason));
-            types.push(Vec::new());
-            lines.push(current_line.clone());
+            lines.push(&current_line);
             source_ip += 1;
             continue;
         }
-        let mut type_meta = Vec::new();
         let mut decoder = Decoder {
             file,
             labels: &labels,
             literals: &mut literals,
             literal_terms: &mut literal_terms,
             lists: &mut lists,
-            types: &mut type_meta,
         };
         let mut args = [Arg::NONE; 3];
         let mut tail = Vec::new();
@@ -1389,8 +1483,7 @@ pub fn load_with_instrumentations(
                 Instr::Generic(index)
             });
         }
-        types.push(type_meta);
-        lines.push(current_line.clone());
+        lines.push(&current_line);
         source_ip += if instruction.op == Opcode::DebugLine {
             2
         } else {
@@ -1553,31 +1646,16 @@ pub fn load_with_instrumentations(
     selects.shrink_to_fit();
     tails.shrink_to_fit();
     lists.shrink_to_fit();
-    types.iter_mut().for_each(Vec::shrink_to_fit);
-    types.resize_with(code.len(), Vec::new);
-    types.shrink_to_fit();
-    lines.resize(code.len(), None);
-    lines.shrink_to_fit();
+    let lines = lines.finish(code.len());
     let mut line_file_terms = HashMap::new();
-    for (file, _) in lines.iter().flatten() {
-        if !line_file_terms.contains_key(file) {
+    for file in lines.files() {
+        if !line_file_terms.contains_key(&**file) {
             let term = TermBuilder::new(&mut literals)
                 .string_to_list(file)
                 .map_err(|_| LoadError::Limit)?;
-            line_file_terms.insert(file.clone(), term);
+            line_file_terms.insert(file.to_string(), term);
         }
     }
-    let line_terms = lines
-        .iter()
-        .map(|line| {
-            line.as_ref().and_then(|(file, number)| {
-                line_file_terms
-                    .get(file)
-                    .copied()
-                    .map(|term| (term, *number))
-            })
-        })
-        .collect();
     functions.shrink_to_fit();
     unsupported_reasons.shrink_to_fit();
     bit_commands.shrink_to_fit();
@@ -1642,10 +1720,8 @@ pub fn load_with_instrumentations(
         bit_commands,
         // ---- vm_maps_bits ----
         strings: file.strings.clone().into_boxed_slice(),
-        types,
         lines,
         line_file_terms,
-        line_terms,
         unsupported,
         unsupported_reasons,
         functions,
@@ -1804,5 +1880,41 @@ mod line_location_tests {
         assert!(!valid_source_location(255, 1));
         assert!(!valid_source_location(0, (1 << 24) - 1));
         assert!(!valid_source_location(0, 100_000_003));
+    }
+}
+
+#[cfg(test)]
+mod line_table_tests {
+    use super::*;
+
+    #[test]
+    fn runs_answer_every_instruction() {
+        let a: Arc<str> = Arc::from("a.erl");
+        let b: Arc<str> = Arc::from("b.erl");
+        let sequence = [
+            None,
+            Some((Arc::clone(&a), 3)),
+            Some((Arc::clone(&a), 3)),
+            Some((Arc::clone(&a), 4)),
+            Some((Arc::clone(&b), 4)),
+            None,
+            Some((Arc::clone(&a), 3)),
+        ];
+        let mut builder = LineTableBuilder::default();
+        for location in &sequence {
+            builder.push(location);
+        }
+        let table = builder.finish(sequence.len() + 2);
+        assert_eq!(table.len(), sequence.len() + 2);
+        for (ip, expected) in sequence.iter().enumerate() {
+            let got = table.get(ip).map(|(file, line)| (file.to_owned(), line));
+            let want = expected
+                .as_ref()
+                .map(|(file, line)| (file.to_string(), *line));
+            assert_eq!(got, want, "ip {ip}");
+        }
+        assert_eq!(table.get(sequence.len()), None);
+        assert_eq!(table.get(sequence.len() + 5), None);
+        assert_eq!(table.files().len(), 2);
     }
 }

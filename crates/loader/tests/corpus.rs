@@ -59,10 +59,10 @@ fn otp_and_elixir_corpus_loads() {
                 path.display()
             );
         }
-        for (ip, line) in module.lines.iter().enumerate() {
+        for ip in 0..module.lines.len() {
             assert_eq!(
                 module.line_term_at(ip).is_some(),
-                line.is_some(),
+                module.lines.get(ip).is_some(),
                 "cached line filename term for {} at {ip}",
                 path.display()
             );
