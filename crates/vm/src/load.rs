@@ -168,6 +168,8 @@ pub(crate) struct CodeTables {
     pub(crate) condemned: SharedTable<Vec<usize>>,
     // g_code_fix: a module entry survives purge, so later delete_module stays true.
     pub(crate) known_modules: SharedTable<HashSet<String>>,
+    /// Module overlays of the non-base code domains.
+    pub(crate) domains: SharedTable<crate::code_domains::Domains>,
 }
 
 fn bind_import_targets(module: &mut Module) {
@@ -515,6 +517,7 @@ impl CodeTables {
             module_files: SharedTable::new(HashMap::new()),
             condemned: SharedTable::new(Vec::new()),
             known_modules: SharedTable::new(HashSet::new()),
+            domains: SharedTable::new(crate::code_domains::Domains::default()),
         }
     }
 
@@ -552,6 +555,31 @@ impl CodeTables {
         meta: Option<CodeMeta>,
     ) -> usize {
         self.exports.note_module(&module);
+        let id = alloc_slot(
+            &mut SlotTable {
+                modules: &mut self.modules,
+                registers: &mut self.registers,
+                code_meta: &mut self.code_meta,
+                live: &mut self.module_live,
+                free_ids: &mut self.free_ids,
+            },
+            module,
+            registers,
+            meta,
+        );
+        crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
+        id
+    }
+
+    /// Adds a module instance of a non-base code domain and returns its id. Unlike
+    /// [`CodeTables::alloc`] it leaves the node's export index alone: domain modules are not
+    /// exports of the node.
+    pub(crate) fn alloc_in_domain(
+        &mut self,
+        module: Arc<Module>,
+        registers: (usize, usize),
+        meta: Option<CodeMeta>,
+    ) -> usize {
         let id = alloc_slot(
             &mut SlotTable {
                 modules: &mut self.modules,

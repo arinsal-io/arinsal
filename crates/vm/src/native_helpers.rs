@@ -4108,6 +4108,7 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
             });
             let target = export.map(|export| export.address(code_ix));
             if code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX
+                && process.code_chain.is_none()
                 && let Some(target) = target
                 && target != crate::beamasm_integration::export_trampoline()
             {
@@ -4164,7 +4165,10 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
             return apply3;
         }
     }
-    if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
+    // A process with a code chain resolves the module in the interpreter, through its chain.
+    if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
+        || process.code_chain.is_some()
+    {
         process.header.arity = arity.min(u8::MAX as usize) as u8;
         process.sync_native_header();
         return fragment;
@@ -4197,8 +4201,11 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(header: *mut ProcessHeader) ->
         return 0;
     };
     let fallback = crate::beamasm_integration::apply3_unported_entry();
-    // A process saving calls records the call through the export, which the interpreter does.
-    if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
+    // A process saving calls records the call through the export, which the interpreter does;
+    // a process with a code chain resolves the module there, through its chain.
+    if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
+        || process.code_chain.is_some()
+    {
         return fallback;
     }
     let (mut module, mut function, mut args) = (

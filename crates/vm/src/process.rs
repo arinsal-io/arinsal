@@ -3698,7 +3698,16 @@ impl Vm {
             .ok_or_else(|| VmError::Unsupported("run_process function".into()))?;
         let args = crate::signals::list(process.x[2])
             .ok_or_else(|| VmError::Unsupported("run_process arguments".into()))?;
-        let (module_id, ip) = match self.spawn_export(module, function, args.len() as u8) {
+        let arity = args.len() as u8;
+        let in_domain = self.process_domain_module(process, module).and_then(|id| {
+            let slot = self.code.modules[id].export_slot_atom(function, arity)?;
+            Some((id, slot.target()))
+        });
+        let resolved = match in_domain {
+            Some(found) => Ok(found),
+            None => self.spawn_export(module, function, arity),
+        };
+        let (module_id, ip) = match resolved {
             Ok((module_id, ip)) => {
                 for (index, term) in args.iter().enumerate() {
                     process.x[index] = *term;
