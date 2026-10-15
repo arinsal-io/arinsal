@@ -1692,10 +1692,6 @@ fn is_builtin(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let module = atom_name(args[0]).ok_or(BADARG)?;
     let name = atom_name(args[1]).ok_or(BADARG)?;
     let arity = args[2].as_small().ok_or(BADARG)?;
-    if arity < 0 {
-        return Err(BADARG);
-    }
-    // Port of erts/emulator/beam/beam_common.c:2359-2380 (erts_is_builtin), OTP-29.1.1.
     let instruction_bif = module == "erlang"
         && ((name == "apply" && matches!(arity, 2 | 3)) || (name == "yield" && arity == 0));
     Ok(bool_term(
