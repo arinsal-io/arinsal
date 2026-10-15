@@ -3602,6 +3602,8 @@ fn spawn_apply(
                 tag: options.tag,
                 reference,
             }),
+            ns: None,
+            group_leader: None,
         },
     )?;
     Ok(created.pid)

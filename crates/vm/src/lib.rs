@@ -23,6 +23,7 @@ mod exceptions;
 mod floats;
 mod interp;
 mod load;
+mod namespace;
 mod native_bridge;
 mod proc_create;
 // ---- vm_funs ----

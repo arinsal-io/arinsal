@@ -895,6 +895,10 @@ pub(crate) struct ErlSpawnOpts {
     pub opts: Term,
     /// The spawn_request reply the parent gets (erl_process.c:13146), if one is asked for.
     pub reply: Option<SpawnReply>,
+    /// Namespace of the child; the parent's when `None`.
+    pub ns: Option<u32>,
+    /// Group leader of the child; the parent's when `None`.
+    pub group_leader: Option<Pid>,
 }
 
 /// The spawn_request reply: `{Tag, Ref, ok, Pid}` sent to the parent before the child runs.
@@ -994,9 +998,13 @@ pub(crate) fn erl_create_process(
     {
         child.cold_mut().initial_bif = Some((m_name, f_name, arity));
     }
-    child.group_leader = Some(parent.group_leader_pid(ctx.pid()));
+    child.group_leader = Some(
+        so.group_leader
+            .unwrap_or_else(|| parent.group_leader_pid(ctx.pid())),
+    );
     child.parent = Some(ctx.pid());
     child.code_chain = parent.code_chain.clone();
+    child.ns = so.ns.unwrap_or(parent.ns);
     // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: `args` is copied
     // with copy_struct_litopt and the three arg registers take mod, func and the copy), OTP-29.1.1.
     let copied_args = {
@@ -1044,12 +1052,10 @@ pub(crate) fn erl_create_process(
     } else {
         None
     };
-    let pid = if let Some(scheduler_id) = so.scheduler {
-        scheduler.spawn_unscheduled_on_with_priority(child, scheduler_id, so.priority)
-    } else {
-        scheduler.spawn_unscheduled_with_priority(child, so.priority)
-    }
-    .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
+    let child_ns = child.ns;
+    let pid = scheduler
+        .spawn_unscheduled_in_ns(child, so.priority, so.scheduler, child_ns)
+        .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
     if so.link {
         parent.cold_mut().links.insert(pid);
     }
@@ -1191,6 +1197,8 @@ fn spawn_mfa_with_priority(
             priority,
             opts: tuning.options.unwrap_or(Term::NIL),
             reply: None,
+            ns: None,
+            group_leader: None,
         },
     )?;
     let pid_term = created

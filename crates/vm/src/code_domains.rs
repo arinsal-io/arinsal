@@ -273,6 +273,8 @@ pub(crate) fn call(
                     priority: arinsal_sched::Priority::Normal,
                     opts: Term::NIL,
                     reply: None,
+                    group_leader: None,
+                    ns: None,
                 },
             );
             process.code_chain = saved;

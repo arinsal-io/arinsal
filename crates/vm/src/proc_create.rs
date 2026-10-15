@@ -204,6 +204,8 @@ pub struct Process {
     /// Code lookup chain of dynamic calls; `None` is root, which resolves in the base only.
     /// A spawned process inherits it.
     pub(crate) code_chain: Option<crate::code_domains::DomainChain>,
+    /// Namespace id (0 is root), mirrored from the scheduler process. A spawn inherits it.
+    pub(crate) ns: u32,
     /// `p->u.terminate`. erts reuses the initial-call union; a side `ProcessCold` would
     /// allocate on every exit.
     pub(crate) exit_cont: Option<Box<ExitCont>>,
@@ -1375,6 +1377,7 @@ impl Process {
             group_leader: None,
             parent: None,
             code_chain: None,
+            ns: 0,
             exit_cont: None,
             apply_inline: [Term::NIL; 3],
             apply_inline_len: 0,

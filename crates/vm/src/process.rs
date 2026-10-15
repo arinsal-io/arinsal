@@ -916,6 +916,8 @@ pub(crate) struct Runtime {
     pub(crate) system_flags: Mutex<crate::natives::sys::SystemFlags>,
     /// Multi-scheduling block state of this runtime.
     pub(crate) multi_scheduling: Mutex<MultiScheduling>,
+    /// Namespaces of a multi-tenant node; root (0) has no entry.
+    pub(crate) namespaces: crate::namespace::NsTable,
 }
 
 /// A `system_flag(multi_scheduling, _)` request.
@@ -7604,6 +7606,7 @@ impl Vm {
             debug_wait_active: AtomicBool::new(false),
             system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
             multi_scheduling: Mutex::new(MultiScheduling::default()),
+            namespaces: crate::namespace::NsTable::default(),
         });
         let (dirty_cpu_schedulers, dirty_cpu_online, dirty_io_schedulers) =
             crate::natives::sys::dirty_scheduler_defaults(&runtime);
