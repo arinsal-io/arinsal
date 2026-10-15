@@ -1,16 +1,15 @@
 # Stream cloud: manager (`packages/arinsal_cloud`)
 
-## State of this chunk
+## State
 
-Done: app/supervisor, `arinsal_cloud_backend` behaviour, the fake backend, the project registry
-(deploy and list only), the admin HTTP server (`PUT /projects/:t/:p`, `GET /projects`), port
-allocation and the e2e script. Everything is tested on Arinsal.
+Done (chunks 1 and 2): app/supervisor, `arinsal_cloud_backend` behaviour, the fake backend, the
+project registry (deploy, start, stop, delete, list, get, logs), the per-project log collector,
+the admin HTTP API, port allocation, the Mix tasks and the e2e script. Everything is tested on
+Arinsal (the e2e builds with stock OTP, see gaps).
 
-Not yet (follow-up chunks): log collector / group leader, stop, start, delete, details and logs
-endpoints, idle stop, `arinsal_cloud_boot:boot_plan/1`, the `arinsal_ns` backend and the
-`arinsal_ns_boot:start/3` stub, the same-node fake mode, the Mix tasks, `arinsal cloud` wiring.
-A draft of most of these exists in the author's scratchpad (`arinsal_cloud_full`, tested on stock
-ERTS only) and gets re-landed one piece at a time.
+Not yet: idle stop, `arinsal_cloud_boot:boot_plan/1`, the `arinsal_ns` backend and
+`arinsal_ns_boot:start/3` stub, the same-node fake mode, `arinsal cloud` wiring. A draft of the
+boot plan and ns backend exists in the author's scratchpad (`arinsal_cloud_full`, stock ERTS only).
 
 ## Layout
 
@@ -24,10 +23,23 @@ ERTS only) and gets re-landed one piece at a time.
   `[A-Za-z0-9][A-Za-z0-9_-]{0,62}`; tar entries with `..` or absolute paths are rejected.
 - `arinsal_cloud_fake`: every project is an OS process, `erl -boot releases/<vsn>/start
   -boot_var RELEASE_LIB <dir>/lib -config sys` with the host's `erl` (so Arinsal when Arinsal's
-  `erl` is first on PATH). Env passed: `PORT` and `RT_PORT`. No isolation beyond the OS process;
-  stdout is dropped for now.
+  `erl` is first on PATH). Env passed: `PORT`, `RT_PORT` and `project_env`. No isolation beyond
+  the OS process. Its stdout and stderr go to the project's log collector.
+- `arinsal_cloud_log`: one process per project, started under `arinsal_cloud_log_sup` when the
+  project is first seen and kept until delete (stop/start/redeploy keep appending). It is a group
+  leader (io protocol: put_chars in all variants, input answers `eof`), keeps the last
+  `log_lines` (default 1000) complete lines in a ring buffer with sequence numbers and appends
+  everything to `<data_dir>/<tenant>/<project>/out.log` (no rotation). `write/2` takes raw bytes
+  (the fake backend uses it for stdout). The manager adds `[manager] ...` lines for start and
+  stop. Group leader use is `{group_leader, Log}` on spawn; the ns backend will call
+  `arinsal_ns:expose(Log)`.
 - `arinsal_cloud_http`: `gen_tcp` with `{packet, http_bin}`, loopback only, no auth. Handles
-  `Expect: 100-continue`, body limit 512 MiB (`max_body_bytes`).
+  `Expect: 100-continue`, body limit 512 MiB (`max_body_bytes`). Endpoints:
+  `GET /projects`, `GET|PUT|DELETE /projects/:t/:p`, `POST /projects/:t/:p/stop|start`,
+  `GET /projects/:t/:p/logs?n=100[&since=Seq][&format=text]` (JSON `{lines, next}`; pass `next` as
+  `since` to follow). States: stopped, starting, running, stopping, failed. A failed deploy keeps
+  its record (state `failed`, `error`) until deleted. Operations on a project that is starting or
+  stopping answer 409.
 - Release shape: `mix release` output with only `lib/` and `releases/` tarred
   (`tar -C <release> -czf x.tar.gz lib releases`). The boot script's `$ROOT` entries (kernel,
   stdlib, ...) resolve to the host runtime, `$RELEASE_LIB` entries to the release.
@@ -48,15 +60,32 @@ App env (also settable with `-arinsal_cloud Key Value`): `admin_port` (7000; 0 =
 `data_dir`, `ready_timeout_ms` (30000; 0 skips waiting for the project's port), `project_env`,
 `erl` (path of the executable the fake backend runs), `backend` (`auto` or a module).
 
+## Mix tasks (`packages/arinsal`)
+
+`mix arinsal.deploy|list|stop|start|delete|logs`, all with `--url` (default
+`http://127.0.0.1:7000`) and, except `list`, `--tenant` (required) and `--project` (default: the
+Mix app name). `deploy` runs `MIX_ENV=prod mix release --overwrite --path <tmp>` with whatever
+`mix`/`erl` come first on PATH, drops `releases/COOKIE`, tars `lib/` and `releases/` and PUTs it
+(`--release NAME` for projects with several releases). `logs` takes `-n` and `--tail`. The client
+is `Arinsal.Cloud` (`:httpc`, `JSON`); `:inets`, `:ssl` and `:public_key` were added to the
+package's `extra_applications`. `bench/rest` and `bench/phxn` got `{:arinsal, path: ..., only: :dev,
+runtime: false}` so `mix arinsal.deploy` works from them. The existing `mix arinsal` task is
+unchanged.
+
 ## Tests
 
-- `poc/multitenancy/tests/cloud_fake_e2e.sh`: builds `bench/rest` (in a temp copy, with stock OTP),
-  starts the manager on Arinsal, deploys it as `acme/shop` and `globex/shop`, curls
-  `/t/1/items/1` on both ports, lists, redeploys acme (port kept, globex untouched), sends a
-  garbage tarball and a bad name (400). `KEEP=1` keeps the temp dir, `ADMIN_PORT` changes the port.
-- `cd packages/arinsal_cloud && mix test` (with Arinsal first on PATH): 16 EUnit tests through an
-  ExUnit wrapper: router, JSON conversion, name validation, and deploy/list/redeploy/error
-  paths over a real socket with a stub backend.
+- `poc/multitenancy/tests/cloud_fake_e2e.sh` (about 1.5 minutes): builds the manager, copies
+  `bench/rest` to a temp dir, starts the manager on Arinsal (projects print a marker through
+  `ERL_AFLAGS`), then through the Mix tasks: deploys acme/shop and globex/shop, curls both
+  `/t/1/items/1`, lists, reads logs (manager line, project stdout, `out.log`), stops acme (globex
+  untouched), starts it (same port), redeploys it, checks 400/404 paths, deletes everything and
+  checks that no process or file is left. `list/stop/start/logs/delete` run on Arinsal from
+  `packages/arinsal`; `deploy` (compiles bench/rest) runs on stock OTP. `KEEP=1` keeps the temp
+  dir, `ADMIN_PORT` changes the port.
+- `cd packages/arinsal_cloud && mix test` (Arinsal first on PATH): 22 EUnit tests through an
+  ExUnit wrapper: router, JSON conversion, name validation, the io protocol of the log collector
+  (through `group_leader`), and deploy/list/details/logs/stop/start/delete/redeploy/error paths
+  over a real socket with a stub backend.
 
 ## Arinsal gaps found (not fixed here)
 
@@ -85,10 +114,15 @@ App env (also settable with `-arinsal_cloud Key Value`): `admin_port` (7000; 0 =
    (`:ets.file2tab` -> `binary_to_term` "invalid external representation of a term").
    The file was moved to `~/.hex/cache.ets.written-by-arinsal-corrupt`; stock Hex rebuilt it.
    Do not run `mix deps.get` on Arinsal against the real `~/.hex`.
+4. `xref` cannot start on Arinsal: `xref_base` -> `sofs:specification` -> `erlang:is_builtin/3`
+   raises `badarg` for `'$M_EXPR'`/`'$F_EXPR'`/`-1`. No cross-reference check was possible, so
+   undefined calls are only caught by the tests.
+5. Works on Arinsal and worth knowing: `ERL_AFLAGS` is honored by the shim (`-s erlang display x`
+   printed `[x]` on the project's stdout), port stdout capture, `kill`-based stop of the child.
 
 ## Known limits
 
-- Idle detection and traffic-based cold start need a proxy or probe; the manager does not see
+- Idle stop is not implemented. Idle detection and traffic-based cold start need a proxy or probe; the manager does not see
   requests to the project's port.
 - The manager does not restore projects after a restart of the manager.
 - Release modules' atoms come from tenant uploads (relevant once `boot_plan` lands).

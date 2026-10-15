@@ -13,6 +13,7 @@
     version := binary(),
     port := inet:port_number(),
     env := [{string(), string()}],
+    log := pid(),
     notify := pid()
 }.
 -type handle() :: map().

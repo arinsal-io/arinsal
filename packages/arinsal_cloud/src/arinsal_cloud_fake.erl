@@ -3,15 +3,15 @@
 %% projects of the same release can run side by side.
 %%
 %% Limits: isolation is the OS process, not a namespace; the release has to be built with
-%% `include_erts: false` against the same OTP as the manager; the project's stdout is dropped
-%% until log collection lands; there is no same-node mode yet (it needs the boot plan).
+%% `include_erts: false` against the same OTP as the manager; the project's stdout and stderr go
+%% to the project's log collector; there is no same-node mode yet (it needs the boot plan).
 -module(arinsal_cloud_fake).
 -behaviour(arinsal_cloud_backend).
 
 -export([start/1, stop/1, info/1]).
--export([os_owner/5]).
+-export([os_owner/6]).
 
-start(#{release_dir := Dir, env := Env, key := Key, notify := Notify}) ->
+start(#{release_dir := Dir, env := Env, key := Key, log := Log, notify := Notify}) ->
     case arinsal_cloud_projects:release_version(Dir) of
         {ok, Vsn} ->
             case erl_executable() of
@@ -24,7 +24,7 @@ start(#{release_dir := Dir, env := Env, key := Key, notify := Notify}) ->
                             "-boot_var", "RELEASE_LIB", filename:join(Dir, "lib"),
                             "-config", filename:join(VsnDir, "sys")],
                     Ref = make_ref(),
-                    Owner = spawn(?MODULE, os_owner, [self(), Ref, {Erl, Args, Env}, Key, Notify]),
+                    Owner = spawn(?MODULE, os_owner, [self(), Ref, {Erl, Args, Env}, Log, Key, Notify]),
                     receive
                         {Ref, {ok, OsPid}} ->
                             {ok, #{id => Owner, owner => Owner, os_pid => OsPid}, undefined};
@@ -61,34 +61,36 @@ erl_executable() ->
     end.
 
 %% Owns the port and reports an unexpected exit of the OS process.
-os_owner(Parent, Ref, {Erl, Args, Env}, Key, Notify) ->
+os_owner(Parent, Ref, {Erl, Args, Env}, Log, Key, Notify) ->
     try open_port({spawn_executable, Erl},
                   [{args, Args}, {env, Env}, binary, exit_status, stderr_to_stdout, use_stdio]) of
         Port ->
             {os_pid, OsPid} = erlang:port_info(Port, os_pid),
             Parent ! {Ref, {ok, OsPid}},
-            os_loop(Port, OsPid, Key, Notify)
+            os_loop(Port, OsPid, Log, Key, Notify)
     catch
         Class:Reason ->
             Parent ! {Ref, {error, {open_port, {Class, Reason}}}}
     end.
 
-os_loop(Port, OsPid, Key, Notify) ->
+os_loop(Port, OsPid, Log, Key, Notify) ->
     receive
-        {Port, {data, _}} ->
-            os_loop(Port, OsPid, Key, Notify);
+        {Port, {data, Data}} ->
+            arinsal_cloud_log:write(Log, Data),
+            os_loop(Port, OsPid, Log, Key, Notify);
         {Port, {exit_status, Status}} ->
             Notify ! {project_exit, Key, self(), {exit_status, Status}};
         {stop, From, Ref} ->
             os:cmd("kill " ++ integer_to_list(OsPid)),
-            drain(Port, OsPid, 5000),
+            drain(Port, OsPid, Log, 5000),
             From ! {Ref, stopped}
     end.
 
-drain(Port, OsPid, Timeout) ->
+drain(Port, OsPid, Log, Timeout) ->
     receive
-        {Port, {data, _}} ->
-            drain(Port, OsPid, Timeout);
+        {Port, {data, Data}} ->
+            arinsal_cloud_log:write(Log, Data),
+            drain(Port, OsPid, Log, Timeout);
         {Port, {exit_status, _}} ->
             ok
     after Timeout ->
