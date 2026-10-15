@@ -6,7 +6,7 @@ use crate::process::Message;
 use crate::signals::{ErlSpawnOpts, atom, erl_create_process};
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_sched::{NS_ID_MASK, Pid, Priority, RunCtx};
+use arinsal_sched::{NS_ID_MASK, Pid, Priority, RunCtx, Signal};
 use arinsal_term::{Term, from_owned, to_owned};
 
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
@@ -14,6 +14,8 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("arinsal_ns", "create", 3),
     ("arinsal_ns", "spawn", 4),
     ("arinsal_ns", "spawn", 5),
+    ("arinsal_ns", "destroy", 1),
+    ("arinsal_ns", "expose", 1),
     ("arinsal_ns", "of", 1),
 ];
 
@@ -67,6 +69,8 @@ fn call_impl(
         ("create", [tenant, project, opts]) => create(process, *tenant, *project, *opts),
         ("spawn", [ns, m, f, a]) => spawn(vm, process, ctx, *ns, (*m, *f, *a), Term::NIL),
         ("spawn", [ns, m, f, a, opts]) => spawn(vm, process, ctx, *ns, (*m, *f, *a), *opts),
+        ("destroy", [ns]) => destroy(process, ctx, *ns),
+        ("expose", [pid]) => expose(process, *pid),
         _ => Err(badarg()),
     }
 }
@@ -141,7 +145,7 @@ fn spawn(
 ) -> Result<Term, VmError> {
     let ns = ns_arg(ns)?;
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
-    runtime.namespaces.get(ns).ok_or_else(badarg)?;
+    runtime.namespaces.live(ns).ok_or_else(badarg)?;
     let mut group_leader = None;
     for option in crate::signals::list(opts).ok_or_else(badarg)? {
         match &to_owned(option).map_err(|_| badarg())? {
@@ -177,6 +181,42 @@ fn spawn(
         .pid
         .to_term()
         .ok_or_else(|| VmError::Unsupported("pid limit".into()))
+}
+
+/// Mark `ns` destroyed and send `kill` to every process of it. The processes exit shortly
+/// after. Spawning into the namespace fails from the moment it is marked, so a second scan
+/// finds the children that were created while the first signals were in flight.
+fn destroy(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    ns: Term,
+) -> Result<Term, VmError> {
+    let ns = ns_arg(ns)?;
+    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    runtime.namespaces.get(ns).ok_or_else(badarg)?;
+    runtime.namespaces.close(ns);
+    let scheduler = runtime.scheduler()?;
+    for _ in 0..2 {
+        for pid in scheduler.pids_in_ns(ns) {
+            let reason = Message::copy_from(atom("kill"))?;
+            let _ = ctx.signal(pid, Signal::Exit(reason));
+        }
+    }
+    Ok(atom("ok"))
+}
+
+/// Make a root process reachable from every namespace.
+fn expose(process: &mut Process, pid: Term) -> Result<Term, VmError> {
+    let pid = Pid::from_term(pid).ok_or_else(badarg)?;
+    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let scheduler = runtime.scheduler()?;
+    match scheduler.ns_word(pid) {
+        Some(word) if word & NS_ID_MASK == 0 => {
+            scheduler.set_ns_shared(pid, true);
+            Ok(atom("ok"))
+        }
+        _ => Err(badarg()),
+    }
 }
 
 /// The namespace of a local process: 0 for root, `undefined` when the process is gone.

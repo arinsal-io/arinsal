@@ -499,6 +499,11 @@ pub trait SignalMessage: Send + 'static {
     fn timer_ref_key(&self) -> Option<u64> {
         None
     }
+    /// The message was sent to an alias. An alias is a capability its owner handed out, so
+    /// the namespace check lets such a message through.
+    fn via_alias(&self) -> bool {
+        false
+    }
 }
 
 impl SignalMessage for () {}
@@ -1236,6 +1241,30 @@ impl<T: Task> ProcessTable<T> {
             pix += 1;
         }
         (pids, pix)
+    }
+
+    /// Live pids of namespace `ns`.
+    fn pids_in_ns(&self, ns: u32) -> Vec<Pid> {
+        let limit = self.ids.layout().max();
+        let mut pids = Vec::new();
+        let mut pix = 0;
+        while pix < limit {
+            if self.page(pix).is_none() {
+                pix =
+                    ((pix as usize / PID_PAGE_SIZE + 1) * PID_PAGE_SIZE).min(limit as usize) as u32;
+                continue;
+            }
+            if let Some(pid) = self
+                .with_slot(pix, |process| {
+                    (process.ns_id() == ns).then_some(process.pid)
+                })
+                .flatten()
+            {
+                pids.push(pid);
+            }
+            pix += 1;
+        }
+        pids
     }
 
     fn scheduler_shutdown(&self) {
@@ -3048,6 +3077,7 @@ impl<T: Task> Inner<T> {
         payload: &Payload<T::Message>,
     ) -> NsGate {
         let refused = match payload {
+            Payload::Message(message) if message.via_alias() => return NsGate::Allow,
             Payload::Message(_) | Payload::Signal(Signal::Exit(_)) => NsGate::Drop,
             Payload::Signal(
                 Signal::Link
@@ -4509,6 +4539,13 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         self.inner
             .deliver_sys_task(self.pid, to, Payload::Signal(signal), priority)
     }
+    /// Send a message the runtime produces on behalf of an admitted request (a reply to
+    /// `process_info`, `garbage_collect` and the like). It is not tenant traffic, so the
+    /// namespace check does not apply.
+    pub fn send_runtime(&mut self, to: Pid, msg: M) -> Result<(), Error> {
+        self.inner
+            .deliver(self.pid, Some(0), to, Payload::Message(msg))
+    }
     /// Send an ordered control signal.
     pub fn signal(&mut self, to: Pid, signal: Signal<M>) -> Result<(), Error> {
         let ns = self.ns.load(Ordering::Relaxed);
@@ -5558,6 +5595,21 @@ impl<T: Task> Scheduler<T> {
         self.inner
             .deliver_gated(from, None, to, Payload::Message(msg), None)
     }
+    /// [`RunCtx::send_runtime`] for code that has no turn context.
+    pub fn send_runtime(&self, from: Pid, to: Pid, msg: T::Message) -> Result<(), Error> {
+        self.inner
+            .deliver_gated(from, Some(0), to, Payload::Message(msg), None)
+    }
+    /// Whether a request from `from` may reach `to` under the namespace rules. A missing
+    /// `to` answers true; the request then fails as it would for a dead process.
+    pub fn ns_may_signal(&self, from: Pid, to: Pid) -> bool {
+        !self.inner.any_ns.load(Ordering::Relaxed)
+            || self
+                .inner
+                .table
+                .with_live(to, |receiver| self.inner.ns_allows(receiver, from, None))
+                .unwrap_or(true)
+    }
     /// Queue a signal in the same ordered stream.
     pub fn signal(&self, from: Pid, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
         self.inner
@@ -5848,6 +5900,11 @@ impl<T: Task> Scheduler<T> {
         let Some(process) = self.inner.table.lookup(to) else {
             return Ok(OnHeapSend::Unavailable);
         };
+        // A refused send takes the ordinary path, which sees the message and drops it.
+        if self.inner.any_ns.load(Ordering::Relaxed) && !self.inner.ns_allows(&process, from, None)
+        {
+            return Ok(OnHeapSend::Unavailable);
+        }
         if !receiver_heap_stable(&process) {
             return Ok(OnHeapSend::Unavailable);
         }
@@ -5870,11 +5927,27 @@ impl<T: Task> Scheduler<T> {
     pub fn process_count(&self) -> usize {
         self.inner.table.ids.count()
     }
-    /// Number of live tasks; this scan is for diagnostics.
     /// Declare that namespaces exist: from now on delivery checks the namespace of sender
     /// and receiver. Call before the first process is spawned into one.
     pub fn ns_enable(&self) {
         self.inner.any_ns.store(true, Ordering::Release);
+    }
+    /// Mark a live process as reachable from every namespace, or clear the mark.
+    pub fn set_ns_shared(&self, pid: Pid, shared: bool) -> bool {
+        self.inner
+            .table
+            .with_live(pid, |process| {
+                if shared {
+                    process.ns.fetch_or(NS_SHARED, Ordering::AcqRel);
+                } else {
+                    process.ns.fetch_and(NS_ID_MASK, Ordering::AcqRel);
+                }
+            })
+            .is_some()
+    }
+    /// Live processes of namespace `ns`.
+    pub fn pids_in_ns(&self, ns: u32) -> Vec<Pid> {
+        self.inner.table.pids_in_ns(ns)
     }
     /// Namespace word of a live process (id in the low 31 bits, [`NS_SHARED`] on top).
     pub fn ns_word(&self, pid: Pid) -> Option<u32> {
@@ -5882,6 +5955,7 @@ impl<T: Task> Scheduler<T> {
             .table
             .with_live(pid, |process| process.ns.load(Ordering::Acquire))
     }
+    /// Number of live tasks; this scan is for diagnostics.
     pub fn live_count(&self) -> usize {
         self.inner.table.live_count()
     }

@@ -229,7 +229,7 @@ fn reply_literal_area_copy(
     result: Term,
 ) -> Result<(), VmError> {
     // A reply to an exited requester is dropped, like any message to a dead process.
-    match ctx.send(requester, request.literal_copy_reply(result)?) {
+    match ctx.send_runtime(requester, request.literal_copy_reply(result)?) {
         Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(()),
         Err(error) => Err(VmError::Unsupported(format!(
             "literal-copy response: {error}"
@@ -625,7 +625,7 @@ pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, Mes
         return;
     };
     if let Ok(message) = Message::copy_from(atom("copy_literals")) {
-        let _ = ctx.send(pid, message);
+        let _ = ctx.send_runtime(pid, message);
     }
 }
 
