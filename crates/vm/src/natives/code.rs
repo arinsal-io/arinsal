@@ -232,6 +232,17 @@ impl PurgeState {
         true
     }
 
+    /// arl: queues `pid` to be resumed when the prepared purge gives up the staging
+    /// permission, as erts suspends a stager on it. False when no purge holds it.
+    pub(crate) fn arl_suspend_until_stage_released(&self, pid: Pid) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.holds_stage_permission {
+            return false;
+        }
+        inner.sprocs.push(pid);
+        true
+    }
+
     fn is_prepared(&self) -> bool {
         self.inner.lock().unwrap().module.is_some()
     }
@@ -754,6 +765,26 @@ fn finish(
     result
 }
 
+/// arl: runs `load` (a load into a code domain) under the code permission, never blocking
+/// the scheduler thread on a prepared purge's staging permission: the caller is suspended
+/// until the purge finishes and the BIF is retried.
+pub(crate) fn arl_with_domain_load_permission<R>(
+    vm: &mut Vm,
+    process: &mut Process,
+    pid: Pid,
+    load: impl FnOnce(&mut Vm, &mut Process) -> R,
+) -> Result<R, VmError> {
+    seize_code_load_permission(process, Some(pid))?;
+    if vm.purge_state.arl_suspend_until_stage_released(pid) {
+        crate::suspend::suspend_self(process);
+        release_code_load_permission(process, Some(pid));
+        return Err(VmError::Yield);
+    }
+    let result = load(vm, process);
+    release_code_load_permission(process, Some(pid));
+    Ok(result)
+}
+
 /// The staging half of `finish_loading/1`; yields when the load is staged and waits for its
 /// commit.
 fn finish_stage(
@@ -806,6 +837,21 @@ fn finish_stage(
             .any(|prepared| prepared.domain != domain)
         {
             return Err(badarg());
+        }
+        // arl: a domain load stages on this scheduler thread. While a prepared purge holds the
+        // staging permission, staging would block the thread, and the purge cannot complete
+        // while this process holds the code permission: give both back and wait, suspended,
+        // for the purge to finish; the call is then retried.
+        if let Some(pid) = pid
+            && vm.purge_state.arl_suspend_until_stage_released(pid)
+        {
+            for (prepared, (module, _, _)) in prepared_refs.iter().zip(prepared_modules) {
+                *prepared.module.lock().unwrap() = Some(module);
+            }
+            // Suspend before the purge can take the permission and resume this process.
+            crate::suspend::suspend_self(process);
+            release_code_load_permission(process, Some(pid));
+            return Err(VmError::Yield);
         }
         return match vm.install_in_domain(domain, prepared_modules) {
             Ok(()) => {

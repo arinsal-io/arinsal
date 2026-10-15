@@ -188,6 +188,48 @@ the module in at run time to exercise the dynamic path.
   - `ns_code_root_unchanged`: 2.88-2.97 ms / 2.00 ms (baseline 2.78 / 2.15).
 - `md-5` is now a dependency of `arinsal-vm` (already in the lockfile through the loader).
 
+## Chunk 6 (partial): the root stall during namespace loading
+
+Found and fixed (deadlock between a domain load and a prepared purge):
+- A purge `prepare` (`erts_internal:purge_module/2`, driven by `code_server` through
+  `erts_code_purger`) holds the staging permission until its `complete`, when the old code had
+  native funs. A namespace process then called `finish_loading` for its domain: it seized the
+  process-level code permission and staged, and `start_staging` blocked its scheduler thread in
+  `PurgeState::wait_for_stage_permission` (a plain condvar, not thread-progress aware). The
+  purge's `complete` needs the code permission that blocked process holds, so neither moves,
+  and the blocked thread also holds back thread progress for the whole node.
+- Fix (`natives/code.rs`): before a domain load stages, if a prepared purge holds the staging
+  permission, the loader registers with the purge (`PurgeState::arl_suspend_until_stage_released`,
+  the same list the pending-lambda callers use), suspends itself, gives back the code
+  permission and yields. The purge's `complete`/`abort` resumes it and the BIF is retried.
+  `arinsal_code:load/2` runs under the same rule (`arl_with_domain_load_permission`). Holding the
+  code permission while staging also stops a purge from preparing in between, so the base loads
+  `install_in_domain` may do are safe too. Root loads are unchanged; a root process calling
+  `finish_loading` itself while a purge is prepared can still block its thread (pre-existing;
+  `code_server` serializes its own loads and purges, so it does not hit this).
+- Test `ns_code_domain_load_waits_for_prepared_purge`: root prepares a purge of `pm` (old code
+  with a fun), a namespace process loads 100 modules into its domain, root's poller keeps
+  answering, the load waits (`waiting`) until root completes the purge, then finishes. Before the
+  fix it hung (root never got past `purge_module(complete)`). Without BeamAsm the purge holds no
+  staging permission and the load goes straight through (`{early, 100}`).
+- Test `ns_code_load_while_root_polls`: 20 namespaces in a row each load 300 modules in batches
+  of 64 while a root process polls `erlang:memory/0` and `arinsal_ns:info/1` every ms.
+
+Found, not fixed (root issue, also without namespaces):
+- After `erts_internal:purge_module(M, complete)` under CPU load, the literal area collector
+  sometimes waits forever in `erts_literal_area_collector:msg_loop/4` for a copy reply: the end
+  of `Vm::eval_scheduled` then waits on `store.has_retired()` and never returns. It reproduces
+  in a pure root run (no namespace created, no domain load): 4 of 30 runs with 8 busy CPU
+  hogs; 0 of 15 alone without load. The reply paths (`send_runtime`, exit-time replies) bypass the
+  namespace check, so this is not the delivery gate. Likely a request that reaches a process
+  around its exit without a reply. The race test reads its result from a file so this does not
+  make it flaky. A stuck collector plausibly explains part of the e2e symptoms (later purges
+  and literal releases queue behind it), but I did not prove that.
+- Probe of the boot stream's hypothesis: root looping `erlang:memory/0` and
+  `garbage_collect(P)` over 20 idle namespace processes (200 rounds) did not stall.
+- `ns_boot_e2e.sh` with this branch's build: 4 of 4 PASS before the fix (did not reproduce
+  the stall here).
+
 ## What I learned for the next chunks
 
 ### Static imports (implemented in chunk 2)
