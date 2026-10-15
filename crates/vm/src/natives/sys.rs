@@ -31,7 +31,7 @@ const RECORD: u64 = 0x1c;
 const SUB_BITS: u64 = 0x24;
 const MAP: u64 = 0x2c;
 
-type MicrostateBaseline = (Instant, Vec<[u64; 7]>, [u64; 2]);
+type MicrostateBaseline = (Instant, Vec<[u64; 7]>, [u64; 3]);
 
 #[derive(Clone)]
 struct SchedBase {
@@ -4399,13 +4399,8 @@ fn microstate(
         .lock()
         .expect("microstate baseline")
         .clone();
-    let Some((started, baseline, poll_baseline)) = baseline else {
+    let Some((_, baseline, poll_baseline)) = baseline else {
         return Ok(atom("undefined"));
-    };
-    let elapsed = if runtime_state(process).microstate.load(Ordering::Relaxed) {
-        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
-    } else {
-        0
     };
     if let Some(ctx) = ctx.as_deref_mut() {
         ctx.account_gc_total(process.stats.gc.nanoseconds);
@@ -4463,8 +4458,10 @@ fn microstate(
             counters,
         )?);
     }
-    entries.push(msacc_entry(process, 1, "aux", [0, 0, 0, 0, 0, 0, elapsed])?);
     let poll_ns = crate::check_io::msacc_snapshot();
+    // The aux and async threads only sleep here: they accrue the time accounting was on.
+    let elapsed = poll_ns[2].saturating_sub(poll_baseline[2]);
+    entries.push(msacc_entry(process, 1, "aux", [0, 0, 0, 0, 0, 0, elapsed])?);
     let poll_check_io_ns = poll_ns[0].saturating_sub(poll_baseline[0]);
     let poll_sleep_ns = poll_ns[1].saturating_sub(poll_baseline[1]);
     entries.push(msacc_entry(

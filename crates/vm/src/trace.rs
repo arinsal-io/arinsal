@@ -2155,7 +2155,7 @@ fn module_call_enabled(
 }
 
 /// Whether `module:function/arity` is the initial call of the process.
-fn is_initial_call(process: &Process, module: &str, function: &str, arity: u8) -> bool {
+pub(crate) fn is_initial_call(process: &Process, module: &str, function: &str, arity: u8) -> bool {
     let names = arinsal_term::global_atoms();
     if process.initial_mfa.is_some_and(|(m, f, a)| {
         a == arity && names.text(m) == Some(module) && names.text(f) == Some(function)
@@ -2720,17 +2720,6 @@ fn current_stacktraces(vm: &Vm, process: &mut Process) -> Result<Vec<(VecHeap, T
     Ok(traces)
 }
 
-/// Runs the breakpoint of the native function that contains `site` when it needs no trace
-/// event or frame for this process: counts the call and returns true. Otherwise nothing has
-/// changed and the executor must run the breakpoint.
-// Port of erts/emulator/beam/beam_bp.c:994-1015 (erts_generic_breakpoint, the GenericBp loop
-// as the trampoline fragment calls it without leaving the scheduler loop), OTP-29.1.1.
-pub(crate) fn native_breakpoint_is_noop(process: &Process, site: usize) -> bool {
-    process
-        .self_pid
-        .is_some_and(|pid| crate::trace_bp::native_breakpoint_noop(process, pid, site))
-}
-
 /// Runs a native entry breakpoint with the scheduler context that owns its trace callbacks.
 // Port of erts/emulator/beam/beam_bp.c (erts_generic_breakpoint), OTP-29.1.1.
 pub(crate) fn executor_native_call_event(
@@ -2782,7 +2771,7 @@ pub(crate) fn pop_native_trace_frames(
     loop {
         let saved_caller = process.heap.stack_get(0)?;
         let (function_pc, actions, _) = native_frame_actions(process, 1);
-        if crate::native_function_at(function_pc).is_none() {
+        if !crate::native_bridge::is_native_function_at(function_pc) {
             return if frames.is_empty() {
                 None
             } else {
