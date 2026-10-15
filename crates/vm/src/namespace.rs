@@ -3,7 +3,8 @@
 //! Namespace 0 is root and has no entry. Ids are handed out in order and never reused on a
 //! node, so a stale id cannot name a later namespace.
 
-use std::sync::{Arc, RwLock};
+use crate::register::RegisterTable;
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// No cap.
 pub(crate) const UNLIMITED: u64 = u64::MAX;
@@ -17,6 +18,20 @@ pub(crate) struct NsEntry {
     /// Caps from `create/3`; enforcement comes with the accounting step.
     pub(crate) max_processes: u64,
     pub(crate) max_bytes: u64,
+    /// Registered names of this namespace, created on the first `register/2`.
+    names: OnceLock<RegisterTable>,
+}
+
+impl NsEntry {
+    /// The name table, created on first use.
+    pub(crate) fn names(&self) -> &RegisterTable {
+        self.names.get_or_init(RegisterTable::new)
+    }
+
+    /// The name table when something was ever registered in this namespace.
+    pub(crate) fn names_if_created(&self) -> Option<&RegisterTable> {
+        self.names.get()
+    }
 }
 
 /// The namespaces of a node.
@@ -41,6 +56,7 @@ impl NsTable {
             project,
             max_processes,
             max_bytes,
+            names: OnceLock::new(),
         });
         entries.push(entry.clone());
         entry

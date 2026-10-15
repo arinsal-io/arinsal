@@ -123,7 +123,7 @@ pub(crate) extern "C" fn whereis_light(
     let Some(rt) = process.runtime.as_deref() else {
         return whereis_no_runtime(process, arg);
     };
-    let term = match rt.reg.whereis(name) {
+    let term = match rt.whereis_in(process.ns, name) {
         Some(crate::register::RegId::Proc(pid)) => pid.to_term().unwrap_or_else(undefined_term),
         Some(crate::register::RegId::Port(id)) => Term::port(id).unwrap_or_else(undefined_term),
         None => undefined_term(),
@@ -236,7 +236,7 @@ fn alive_trap(process: &mut Process, identity: u64) -> u64 {
 fn whereis_1(process: &Process, name: Term) -> Result<Term, VmError> {
     let name = name.as_atom().ok_or_else(|| badarg("whereis/1"))?;
     let rt = runtime(process)?;
-    Ok(match rt.reg.whereis(name) {
+    Ok(match rt.whereis_in(process.ns, name) {
         Some(crate::register::RegId::Proc(pid)) => pid.to_term().unwrap_or_else(undefined_term),
         Some(crate::register::RegId::Port(id)) => Term::port(id).unwrap_or_else(undefined_term),
         None => undefined_term(),
@@ -785,12 +785,13 @@ pub(crate) fn start_timer_bif(
         sink.schedule_timer(pid, ms, message, wrapped)
     } else {
         let runtime = rt.clone();
+        let ns = process.ns;
         let name = registered_name.expect("resolved timer name");
         sink.schedule_resolved_timer(
             ms,
             message,
             wrapped,
-            std::sync::Arc::new(move || runtime.reg.whereis_proc(name)),
+            std::sync::Arc::new(move || runtime.whereis_proc_in(ns, name)),
         )
     }
     .map_err(|error| VmError::Unsupported(format!("timer: {error}")))?;
@@ -1979,10 +1980,13 @@ pub(crate) fn register_light(
         return None;
     }
     let pid = Pid::from_term(*id)?;
+    let ns = process.ns;
     let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
     let scheduler = rt.scheduler().ok()?;
-    let mut table = rt.reg.write();
+    let reg = rt.reg_for(ns)?;
+    let mut table = reg.write();
     if !scheduler.lookup(pid)
+        || (ns != 0 && !same_ns(&scheduler, pid, ns))
         || scheduler.registered_atom_index(pid).is_some()
         || table.contains(name)
         || !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::REG)
@@ -1993,6 +1997,13 @@ pub(crate) fn register_light(
     scheduler.set_registered_atom_index(pid, name.0);
     drop(table);
     Some(Ok(atom("true")))
+}
+
+/// True when `pid` lives in namespace `ns`.
+fn same_ns(scheduler: &arinsal_sched::Scheduler<Process>, pid: Pid, ns: u32) -> bool {
+    scheduler
+        .ns_word(pid)
+        .is_some_and(|word| word & arinsal_sched::NS_ID_MASK == ns)
 }
 
 /// `unregister(Name)` called directly from native code: a registered process name, with
@@ -2009,8 +2020,10 @@ pub(crate) fn unregister_light(
         return None;
     }
     let name = name.as_atom()?;
+    let ns = process.ns;
     let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
-    let mut table = rt.reg.write();
+    let reg = rt.reg_for(ns)?;
+    let mut table = reg.write();
     let Some(crate::register::RegId::Proc(pid)) = table.fetch(name) else {
         return None;
     };
@@ -2428,9 +2441,12 @@ fn call_resolved(
                     .ok_or_else(|| badarg("register/2"))?,
             );
             let scheduler = rt.scheduler()?;
+            let ns = process.ns;
+            let reg = rt.reg_for(ns).ok_or_else(|| badarg("register/2"))?;
             if let Some(pid) = Pid::from_term(*id) {
-                let mut table = rt.reg.write();
+                let mut table = reg.write();
                 if !scheduler.lookup(pid)
+                    || (ns != 0 && !same_ns(&scheduler, pid, ns))
                     || scheduler.registered_atom_index(pid).is_some()
                     || table.contains(name)
                     || !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::REG)
@@ -2453,6 +2469,9 @@ fn call_resolved(
                 );
                 Ok(atom("true"))
             } else if let Some(port_id) = id.as_port() {
+                if ns != 0 {
+                    return Err(badarg("register/2"));
+                }
                 let handle = {
                     let ports = rt.ports.lock().unwrap();
                     let handle = ports
@@ -2464,7 +2483,7 @@ fn call_resolved(
                     }
                     handle
                 };
-                let mut table = rt.reg.write();
+                let mut table = reg.write();
                 if handle.reg_closing()
                     || handle.registered_atom().is_some()
                     || table.contains(name)
@@ -2494,7 +2513,10 @@ fn call_resolved(
                     .as_ref()
                     .ok_or_else(|| badarg("unregister/1"))?,
             );
-            let mut table = rt.reg.write();
+            let reg = rt
+                .reg_for(process.ns)
+                .ok_or_else(|| badarg("unregister/1"))?;
+            let mut table = reg.write();
             match table.erase(name) {
                 Some(crate::register::RegId::Proc(pid)) => {
                     if let Ok(scheduler) = rt.scheduler() {
@@ -2532,8 +2554,10 @@ fn call_resolved(
             let rt = runtime(process)?;
             // Snapshot under the read lock, then build the list. Order is the
             // reverse bucket walk from register.c:567.
-            let names: Vec<Term> = rt
-                .reg
+            let reg = rt
+                .reg_for(process.ns)
+                .ok_or_else(|| badarg("registered/0"))?;
+            let names: Vec<Term> = reg
                 .read()
                 .registered_atoms()
                 .into_iter()
@@ -2598,7 +2622,7 @@ fn call_resolved(
             let pid = if let Some(pid) = Pid::from_term(*target) {
                 Some(pid)
             } else if let Some(name) = name.as_ref() {
-                rt.reg.whereis_proc_str(name)
+                rt.whereis_proc_str_in(process.ns, name)
             } else if matches!(to_owned(*target), Ok(arinsal_etf::OwnedTerm::Pid { .. })) {
                 // A pid of another incarnation of this node never matches a live process.
                 None
@@ -2681,7 +2705,11 @@ fn call_resolved(
                     .flatten()
                     .map(|(name, _node)| name)
             }) {
-                let id = runtime.reg.whereis_port_str(&name);
+                let id = if process.ns == 0 {
+                    runtime.reg.whereis_port_str(&name)
+                } else {
+                    None
+                };
                 let node = crate::node_tables::lock().local_name.clone();
                 (
                     id,
