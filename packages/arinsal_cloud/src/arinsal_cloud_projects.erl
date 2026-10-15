@@ -12,7 +12,7 @@
 -behaviour(gen_server).
 
 -export([start_link/0, deploy/3, start/2, stop/2, delete/2, list/0, get/2, logs/3]).
--export([valid_name/1, project_dir/2, unpack/3, release_version/1]).
+-export([valid_name/1, project_dir/2, unpack/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -type key() :: {binary(), binary()}.
@@ -85,24 +85,6 @@ valid_name(_) ->
 
 project_dir(DataDir, {Tenant, Project}) ->
     filename:join([DataDir, binary_to_list(Tenant), binary_to_list(Project)]).
-
-%% The version comes from `releases/start_erl.data` ("<erts> <vsn>"), else from the only
-%% directory under `releases/` that holds a `start.boot`.
--spec release_version(file:filename()) -> {ok, string()} | {error, term()}.
-release_version(ReleaseDir) ->
-    case file:read_file(filename:join([ReleaseDir, "releases", "start_erl.data"])) of
-        {ok, Data} ->
-            case string:lexemes(binary_to_list(Data), " \r\n") of
-                [_Erts, Vsn | _] -> {ok, Vsn};
-                _ -> {error, bad_start_erl_data}
-            end;
-        {error, _} ->
-            case filelib:wildcard(filename:join([ReleaseDir, "releases", "*", "start.boot"])) of
-                [Boot] -> {ok, filename:basename(filename:dirname(Boot))};
-                [] -> {error, no_release};
-                _ -> {error, ambiguous_release}
-            end
-    end.
 
 %% init
 
@@ -380,7 +362,7 @@ unpack(ProjDir, Tar, BeforeSwap) ->
     try
         ok = check_tar(Tar),
         ok = erl_tar:extract({binary, Tar}, [compressed, {cwd, Incoming}]),
-        {ok, Vsn} = release_version(Incoming),
+        {ok, Vsn} = arinsal_cloud_boot:release_version(Incoming),
         true = re:run(Vsn, "^[A-Za-z0-9][A-Za-z0-9._+-]{0,62}$", [{capture, none}]) =:= match,
         Dest = filename:join(ProjDir, Vsn),
         ok = BeforeSwap(),
