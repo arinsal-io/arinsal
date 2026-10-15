@@ -16,6 +16,7 @@ validate-terms = ["arinsal-term/validate-terms"]
 pf-mem-counters = []
 
 [dependencies]
+md-5 = "0.10.6"
 arinsal-alloc = { path = "../alloc" }
 arinsal-spec.workspace = true
 arinsal-beam.workspace = true

@@ -63,7 +63,8 @@ fn worker_module(result: &str) -> String {
 
 const DRIVER: &str = r#"
 -module(ns_code_drv).
--export([two_domains/0, worker/2, lookups/0, lookup_worker/2, dedup/0, load_worker/2, shadow/0, shadow_worker/2, ns_spawn/0, ns_worker/3, unloaded_base/0]).
+-export([two_domains/0, worker/2, lookups/0, lookup_worker/2, dedup/0, load_worker/2, shadow/0, shadow_worker/2, ns_spawn/0, ns_worker/3, unloaded_base/0,
+         dep_shared/0, drop_on_destroy/0, ns_call_worker/2]).
 two_domains() ->
     A = arinsal_code:new_domain(0),
     B = arinsal_code:new_domain([0]),
@@ -155,6 +156,54 @@ unloaded_base() ->
     Again = erlang:memory(code),
     Second = load_in([B, 0], {nocall, [{orddict, beam_real_orddict()}]}),
     {Fake, Real, erlang:module_loaded(orddict), Grown, Second, erlang:memory(code) - Again}.
+ns_call(Ns, M) ->
+    arinsal_ns:spawn(Ns, ns_code_drv, ns_call_worker, [self(), M]),
+    receive {ns_call, R} -> R after 5000 -> timeout end.
+ns_call_worker(Parent, M) ->
+    Parent ! {ns_call, try {M:f(), tl(arinsal_code:chain(self()))} catch C:R -> {C, R} end}.
+wait_drained(Ns) ->
+    case arinsal_ns:info(Ns) of
+        #{processes := 0} -> ok;
+        _ -> receive after 10 -> wait_drained(Ns) end
+    end.
+dep_shared() ->
+    ok = arinsal_ns:expose(self()),
+    Hash = arinsal_code:deployment_hash([{dep, erlang:md5(beam_dep())}]),
+    none = arinsal_code:dep_domain(Hash),
+    D = arinsal_code:new_dep_domain(Hash),
+    {ok, D} = arinsal_code:dep_domain(Hash),
+    D = arinsal_code:new_dep_domain(Hash),
+    Before = erlang:memory(code),
+    ok = arinsal_code:load(D, [{dep, beam_dep()}]),
+    Grown = erlang:memory(code) - Before,
+    {ok, N1} = arinsal_ns:create(<<"acme">>, <<"one">>, #{dep_domain => D}),
+    {ok, N2} = arinsal_ns:create(<<"globex">>, <<"two">>, #{dep_domain => D}),
+    R1 = ns_call(N1, dep),
+    R2 = ns_call(N2, dep),
+    Shared = erlang:memory(code) - Before,
+    ok = arinsal_ns:destroy(N1),
+    wait_drained(N1),
+    AfterOne = arinsal_code:dep_domain(Hash),
+    R2Again = ns_call(N2, dep),
+    ok = arinsal_ns:destroy(N2),
+    wait_drained(N2),
+    {Grown > 0, Shared =:= Grown, R1 =:= {dep, [D, 0]}, R2 =:= R1,
+     AfterOne =:= {ok, D}, R2Again =:= R1, arinsal_code:dep_domain(Hash)}.
+drop_on_destroy() ->
+    ok = arinsal_ns:expose(self()),
+    {ok, N1} = arinsal_ns:create(<<"acme">>, <<"shop">>, #{}),
+    #{code_chain := [Own1 | _]} = arinsal_ns:info(N1),
+    ok = arinsal_code:load(Own1, [{w, beam_a()}]),
+    First = ns_call(N1, w),
+    ok = arinsal_ns:destroy(N1),
+    Load = try arinsal_code:load(Own1, [{w, beam_b()}]) catch error:badarg -> badarg end,
+    Spawn = try arinsal_code:spawn([Own1, 0], erlang, self, []) catch error:badarg -> badarg end,
+    wait_drained(N1),
+    {ok, N2} = arinsal_ns:create(<<"acme">>, <<"shop">>, #{}),
+    #{code_chain := [Own2 | _]} = arinsal_ns:info(N2),
+    Fresh = arinsal_code:load(Own2, [{w, beam_b()}]),
+    Second = ns_call(N2, w),
+    {element(1, First), Load, Spawn, Own1 =/= Own2, Fresh, element(1, Second)}.
 lookup(M) ->
     {erlang:module_loaded(M),
      erlang:function_exported(M, f, 0),
@@ -349,6 +398,43 @@ fn ns_code_unloaded_base_name_not_allowed() {
         result.text,
         "{[{error,not_allowed}],[{module,orddict}],true,true,[{module,orddict}],0}"
     );
+}
+
+/// Two namespaces over the same dep domain (registered by deployment hash) share its one `dep`
+/// instance: code memory grows once. The dep domain lives while a namespace uses it and is
+/// dropped, hash and all, with the last one.
+#[test]
+fn ns_code_dep_domain_shared() {
+    let (Some(beam_a), Some(beam_b)) = (
+        compile("w", &worker_module("a")),
+        compile("w", &worker_module("b")),
+    ) else {
+        eprintln!("erlc unavailable; skipping ns_code_dep_domain_shared");
+        return;
+    };
+    let mut vm = driver_vm(&beam_a, &beam_b);
+    let result = vm
+        .eval_scheduled("ns_code_drv", "dep_shared", &[], 2, None)
+        .unwrap();
+    assert_eq!(result.text, "{true,true,true,true,true,true,none}");
+}
+
+/// Destroying a namespace drops its domain at once: the domain takes no more loads and no chain
+/// can name it. A new namespace with the same module name loads fresh code.
+#[test]
+fn ns_code_drop_domain_on_destroy() {
+    let (Some(beam_a), Some(beam_b)) = (
+        compile("w", &worker_module("a")),
+        compile("w", &worker_module("b")),
+    ) else {
+        eprintln!("erlc unavailable; skipping ns_code_drop_domain_on_destroy");
+        return;
+    };
+    let mut vm = driver_vm(&beam_a, &beam_b);
+    let result = vm
+        .eval_scheduled("ns_code_drv", "drop_on_destroy", &[], 2, None)
+        .unwrap();
+    assert_eq!(result.text, "{a,badarg,badarg,true,ok,b}");
 }
 
 const CLI_PROBE: &str = r#"
