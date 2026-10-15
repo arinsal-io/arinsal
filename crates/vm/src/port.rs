@@ -2755,6 +2755,18 @@ fn command_bytes(handle: &PortHandle, data: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
+/// Close the descriptors the port worker owns: its wake pipe read end and the input descriptor.
+fn close_worker_fds(wake_r: RawFd, read_fd: Option<RawFd>) {
+    for fd in [Some(wake_r).filter(|fd| *fd >= 0), read_fd]
+        .into_iter()
+        .flatten()
+    {
+        // SAFETY: the worker thread owns both descriptors (the wake read end taken from the
+        // handle and the duplicated input descriptor) and does not use them afterwards.
+        unsafe { libc::close(fd) };
+    }
+}
+
 /// Exit status of a child as a driver reports it: the exit code, or 128 plus the signal number.
 fn child_exit_code(status: std::process::ExitStatus) -> i64 {
     use std::os::unix::process::ExitStatusExt;
@@ -3055,14 +3067,7 @@ fn worker(
     }
     let woken = flush_output(&handle);
     wake_suspended(&scheduler, woken);
-    if wake_r >= 0 {
-        // SAFETY: this thread owns the wake read end taken from the handle.
-        unsafe { libc::close(wake_r) };
-    }
-    if let Some(fd) = read_fd {
-        // SAFETY: the worker owns the duplicated input descriptor.
-        unsafe { libc::close(fd) };
-    }
+    close_worker_fds(wake_r, read_fd);
     let closed = handle.state.lock().unwrap().closed;
     // Port of erts/emulator/sys/unix/sys_drivers.c:1039 (stop), OTP-29.1.1.
     // Close the child's input first; a detached child may keep running after
@@ -3128,14 +3133,7 @@ fn eof_exit(
         std::mem::take(&mut st.suspended)
     };
     wake_suspended(scheduler, woken);
-    if wake_r >= 0 {
-        // SAFETY: this thread owns the wake read end taken from the handle.
-        unsafe { libc::close(wake_r) };
-    }
-    if let Some(fd) = read_fd {
-        // SAFETY: the worker owns the duplicated input descriptor.
-        unsafe { libc::close(fd) };
-    }
+    close_worker_fds(wake_r, read_fd);
     handle.out.lock().unwrap().take();
     handle.state.lock().unwrap().exit_complete = true;
     handle.finish_halt();
