@@ -13,6 +13,7 @@
 
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
+use arinsal_loader::Module;
 use arinsal_sched::RunCtx;
 use arinsal_term::{Atom, Term, TermBuilder, global_atoms};
 use std::collections::HashMap;
@@ -144,18 +145,12 @@ impl Vm {
         id
     }
 
-    /// Loads `beams` into `domain`, each as `(module, bytes)`. The modules are interpreted
-    /// only. A module the domain already has is replaced; the replaced instance is condemned
-    /// and freed by a later purge once no process runs it.
+    /// Loads `beams` into `domain`, each as `(module, bytes)`; see [`Vm::install_in_domain`].
     pub(crate) fn load_into_domain(
         &mut self,
         domain: DomainId,
         beams: &[(Atom, Vec<u8>)],
     ) -> Result<(), (&'static str, Vec<Atom>)> {
-        self.refresh_code();
-        if domain == BASE || self.code.domains.chain(domain).is_none() {
-            return Err(("badarg", Vec::new()));
-        }
         let mut prepared = Vec::with_capacity(beams.len());
         for (name, bytes) in beams {
             let Ok(beam) = arinsal_beam::parse(bytes) else {
@@ -167,19 +162,77 @@ impl Vm {
             let Ok(module) = self.prepare_module(&beam, Some(bytes)) else {
                 return Err(("badfile", vec![*name]));
             };
-            let meta = crate::load::CodeMeta::from_beam(&beam, Some(bytes));
-            if meta.on_load.is_some() {
-                return Err(("on_load", vec![*name]));
-            }
             prepared.push((
-                *name,
                 module,
                 crate::process::register_requirements(&beam),
-                meta,
+                crate::load::CodeMeta::from_beam(&beam, Some(bytes)),
             ));
         }
+        self.install_in_domain(domain, prepared)
+    }
+
+    /// Makes the prepared modules current in `domain`, all or none. The modules are
+    /// interpreted only.
+    ///
+    /// - A module whose name the domain's chain already resolves to an instance with the same
+    ///   md5 (in this domain, an outer domain or the base) is skipped: the load is a no-op.
+    /// - A module whose name the chain resolves to a base instance with a different md5 is
+    ///   `not_allowed`: a domain does not shadow the base, except a consolidated Elixir
+    ///   protocol over another one (both export `__protocol__/1`).
+    /// - A module the domain already has is replaced; the replaced instance is condemned and
+    ///   freed by a later purge once no process runs it. A name an outer non-base domain
+    ///   defines is shadowed by this domain.
+    /// - `-on_load` modules are refused (`on_load`).
+    pub(crate) fn install_in_domain(
+        &mut self,
+        domain: DomainId,
+        prepared: Vec<(Module, (usize, usize), crate::load::CodeMeta)>,
+    ) -> Result<(), (&'static str, Vec<Atom>)> {
+        self.refresh_code();
+        let Some(chain) = self.code.domains.chain(domain).cloned() else {
+            return Err(("badarg", Vec::new()));
+        };
+        if domain == BASE {
+            return Err(("badarg", Vec::new()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let duplicates: Vec<Atom> = prepared
+            .iter()
+            .map(|(module, _, _)| module.name_atom)
+            .filter(|name| !seen.insert(*name))
+            .collect();
+        if !duplicates.is_empty() {
+            return Err(("duplicated", duplicates));
+        }
+        let mut install = Vec::with_capacity(prepared.len());
+        for (module, registers, meta) in prepared {
+            let name = module.name_atom;
+            if let Some(id) = self.code.module_in_chain(Some(&chain), name) {
+                let visible_md5 = self
+                    .code
+                    .code_meta
+                    .get(id)
+                    .and_then(Option::as_ref)
+                    .and_then(|visible| visible.md5);
+                if meta.md5.is_some() && meta.md5 == visible_md5 {
+                    continue;
+                }
+                let visible = &self.code.modules[id];
+                if visible.domain == BASE && !shadows_protocol(&module, visible) {
+                    return Err(("not_allowed", vec![name]));
+                }
+            }
+            if meta.on_load.is_some() {
+                return Err(("on_load", vec![name]));
+            }
+            install.push((module, registers, meta));
+        }
+        if install.is_empty() {
+            return Ok(());
+        }
         let staging = self.code_ix.start_staging();
-        for (name, mut module, registers, meta) in prepared {
+        for (mut module, registers, meta) in install {
+            let name = module.name_atom;
             module.domain = domain;
             staging.with(|tables| {
                 tables.intern_fun_entries(&mut module);
@@ -193,6 +246,12 @@ impl Vm {
         self.refresh_code();
         Ok(())
     }
+}
+
+/// A consolidated Elixir protocol may shadow the base one: each project consolidates its
+/// protocols over its own implementations.
+fn shadows_protocol(module: &Module, base: &Module) -> bool {
+    module.export_slot("__protocol__", 1).is_some() && base.export_slot("__protocol__", 1).is_some()
 }
 
 /// `arinsal_code` test and boot natives. All but `chain/1` are root only.

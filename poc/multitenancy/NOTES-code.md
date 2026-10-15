@@ -72,6 +72,55 @@ the module in at run time to exercise the dynamic path.
     root does not (`false`, `false`, `badarg`);
   - `ns_code_root_unchanged`: 2.90-3.05 ms / 1.96-2.01 ms over four runs (baseline 2.78 / 2.15).
 
+## Chunk 3 (done): loading into the caller's domain
+
+- `erlang:prepare_loading/2` records the preparing process's domain (first element of its chain,
+  0 for root) on the prepared code. `erlang:finish_loading/1` loads prepared code of a non-zero
+  domain into that domain (`Vm::install_in_domain`), synchronously, without the staging/barrier
+  protocol of base loads (domain code is never native, so no code barrier is owed). Mixing
+  domains in one `finish_loading` is `badarg`. Because the domain travels with the prepared
+  code, `code:load_binary/3` works too: the caller prepares, `code_server` (root) finishes, and
+  the module lands in the caller's domain. `erlang:load_module/2` is prepare + finish in the
+  caller.
+- `install_in_domain` (also behind `arinsal_code:load/2`), all or nothing:
+  - md5 dedup: a module whose name the domain's chain already resolves to an instance with the
+    same md5 (this domain, an outer domain, or the base) is skipped; when every module is
+    skipped nothing is staged, so code memory and the code generation do not change;
+  - base shadowing: a name the chain resolves to a base instance with a different md5 is
+    `{not_allowed, [M]}` from `finish_loading`, i.e. `{error, not_allowed}` from
+    `erlang:load_module/2` and `code:load_binary/3`;
+  - allowlist: a consolidated Elixir protocol over a base protocol (both export
+    `__protocol__/1`). Each project consolidates its protocols over its own implementations,
+    so its domain needs its own copy; base code keeps calling the base protocol;
+  - a name only an outer non-base domain defines is shadowed by this domain; a name this
+    domain already has is replaced (old instance to `condemned`); `-on_load` modules are
+    refused (`on_load`); duplicates in one batch are `duplicated`.
+- `code:is_loaded/1` and `code:which/1` are answered by `code_server` from its own ETS table
+  (`code_server:is_loaded/1`), not by a native. The code server records every module it
+  finished loading, whatever the domain, so after a domain's `code:load_binary/3` root's
+  `code:is_loaded(w)` says `{file, "w.beam"}` while `erlang:module_loaded(w)` says `false`.
+  Fixing that needs a per-ns code server or a chain-aware `is_loaded`; left as is.
+- From `code_server.erl` (read, not tested here): its `load_binary` also calls `erlang:module_loaded/1` and `do_purge/1` in root
+  for the module name, and refuses modules in sticky directories (`sticky_directory`) before
+  `finish_loading` runs. So `code:load_binary(lists, ...)` from a domain gets
+  `{error, sticky_directory}`, and a base module of the same name gets its old code purged.
+- Gap: the not_allowed check only sees base modules that are loaded. A domain that loads an
+  OTP module root has not loaded yet (for example `lists` on a fresh VM) gets its own copy.
+  Proposed fix with the dep-domain chunk: before installing a name the base lacks, compare with
+  the beam on root's code path: load it into the base when the md5 matches, refuse it as
+  `not_allowed` when it differs.
+- Tests (with BeamAsm and `ARINSAL_INTERP=1`):
+  - `ns_code_load_into_caller_domain`: on a booted CLI node (needs `cargo build --release -p
+    arinsal-cli`), a chained process loads `w` with `code:load_binary/3` and calls it; root
+    sees `module_loaded(w) = false` and `w:f()` is `undef`;
+  - `ns_code_md5_dedup`: a domain process loads `dd` (identical to base) and `dep` (identical to
+    an outer domain): `{module, _}` for both, `erlang:memory(code)` grows by 0; loading a new
+    module grows it;
+  - `ns_code_base_not_shadowable`: `erlang:load_module(lists, Fake)` from a domain is
+    `{error, not_allowed}` and both the domain and root keep the base `lists`; a protocol
+    module `pp` shadows the base one in the domain only.
+  - `ns_code_root_unchanged`: 2.88 ms / 2.21 ms (baseline 2.78 / 2.15).
+
 ## What I learned for the next chunks
 
 ### Static imports (implemented in chunk 2)
@@ -106,11 +155,6 @@ the module in at run time to exercise the dynamic path.
 
 ### Open items for follow-up chunks
 - `code:is_loaded/1`, `code:which/1` and the rest of `code_server` answer from root's view.
-- `prepare_loading`/`finish_loading` into the caller's domain (branch in `finish_stage` before
-  `stage_prepared`), md5 dedup against the visible chain (`CodeMeta.md5`), `{error, not_allowed}`
-  for shadowing a base module. Proposed allowlist: consolidated Elixir protocols (both modules
-  export `__protocol__/1`). Also dedup into the base when the root code path has a beam with the
-  same md5.
 - Dep domains: hash registry (`dep_domain/1`), reverse map dep -> dependents, drop of a domain
   (remove overlay entries, push ids to `condemned`; the next purge frees unreferenced slots).
 - `arinsal_code:chain/1` for other processes needs a process_info-style request.
