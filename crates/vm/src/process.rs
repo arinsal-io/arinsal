@@ -4240,6 +4240,22 @@ impl Runtime {
     ///
     /// Port of erts/emulator/beam/erl_ptab.c:1515 (`erts_ptab_processes_next`), OTP-29.1.1.
     /// The process table is the set; spawn and exit do not maintain a second one.
+    /// The processes a process of namespace `ns` can see: all of them for root, its own
+    /// namespace for any other.
+    pub(crate) fn process_pids_visible(&self, ns: u32) -> Vec<Pid> {
+        let mut pids = self.process_pids();
+        if ns != 0
+            && let Ok(scheduler) = self.scheduler()
+        {
+            pids.retain(|pid| {
+                scheduler
+                    .ns_word(*pid)
+                    .is_some_and(|word| word & arinsal_sched::NS_ID_MASK == ns)
+            });
+        }
+        pids
+    }
+
     pub(crate) fn process_pids(&self) -> Vec<Pid> {
         let Ok(scheduler) = self.scheduler() else {
             return Vec::new();

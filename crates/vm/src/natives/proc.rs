@@ -2306,8 +2306,8 @@ pub(crate) fn failure_reply(
 fn processes(process: &mut Process) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:4097 (processes_0), OTP-29.1.1.
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let pids = runtime
-        .process_pids()
+    let pids = runtime.process_pids_visible(process.ns);
+    let pids = pids
         .into_iter()
         .filter_map(Pid::to_term)
         .collect::<Vec<_>>();
@@ -5405,7 +5405,14 @@ fn processes_next(
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
-    let (pids, scan_end) = scheduler.pids_in_table_range(index, limit, max_pids as usize);
+    let (mut pids, scan_end) = scheduler.pids_in_table_range(index, limit, max_pids as usize);
+    if process.ns != 0 {
+        pids.retain(|pid| {
+            scheduler
+                .ns_word(*pid)
+                .is_some_and(|word| word & arinsal_sched::NS_ID_MASK == process.ns)
+        });
+    }
     let pid_terms = pids
         .iter()
         .map(|pid| pid.to_term().ok_or_else(badarg))

@@ -3144,7 +3144,8 @@ fn processes(
 
     let mut list = {
         let runtime = process.runtime.as_ref().ok_or(BifError::BADARG)?;
-        let mut pids = SmallVec::<[arinsal_sched::Pid; 16]>::from(runtime.process_pids());
+        let mut pids =
+            SmallVec::<[arinsal_sched::Pid; 16]>::from(runtime.process_pids_visible(process.ns));
         pids.sort_by_key(|pid| crate::process::pid_table_index(*pid));
         PtabListState {
             pids,

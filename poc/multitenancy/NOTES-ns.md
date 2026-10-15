@@ -38,8 +38,39 @@
 - `arinsal_ns:expose/1` (root pid only, `badarg` otherwise) sets SHARED. `arinsal_ns:destroy/1` marks the entry
   dead, sends `kill` to every process of the ns (two scans) and returns `ok`; the processes exit asynchronously.
   Spawning into a dead ns raises `badarg` from `arinsal_ns:spawn`, `system_limit` for a child of a dying ns process.
-  Destroy is idempotent. A spawn racing the second scan could in theory leave a child; the counters/cap step
-  closes that at the scheduler.
+  Destroy is idempotent. A racing spawn is refused by the scheduler-level close (see chunk 3).
+
+## Chunk 3: cap, close, counters, info, list, processes/0, microbench
+- `sched::NsCounters` (processes, reductions, `max_processes`, `closed`) is registered per ns with
+  `Scheduler::ns_register(id, max_processes)`. `Inner::insert_process` takes one slot (`try_acquire`) before the
+  table insert: a ns at its cap, or closed, gets `Error::SystemLimit`, which `erl_create_process` raises as
+  `system_limit`. The slot is released once per process (`Process::release_ns`) from `mark_exited` and from the
+  forced-exit path, so the count cannot leak or go negative. `try_acquire` re-checks `closed` after the
+  increment, so a spawn racing `destroy` fails or is counted and then killed by destroy's scan.
+- `destroy` closes the counters (via `NsTable::close`) before its scans.
+- Reductions: `counters.add_reductions(consumed)` at slice accounting when the process has counters (one
+  `Option` test at ns 0).
+- `arinsal_ns:info/1` returns `#{tenant, project, processes, reductions, heap_words, max_processes, max_bytes}`;
+  an unset cap is `infinity`, `heap_words` stays 0 until the heap accounting step. It also answers for a
+  destroyed ns so its process count can be watched draining. `arinsal_ns:list/0` lists live ns ids.
+- `erlang:processes/0` and `erts_internal:processes_next/1` show a ns process only the processes of its own
+  ns (`Runtime::process_pids_visible`). `registered/0` is left to the names stream.
+- Tests: ns_process_cap_system_limit, ns_destroy_closes_spawns, ns_info_counts, ns_list, ns_processes_filtered.
+
+## Microbench at ns 0
+`cargo run -r -p arinsal-sched --example bench -- <name>` (4 workers), 3 runs each on a busy machine, base is
+8ee3755 (before this work), new is the branch head. ns/op, best of 3:
+
+| bench | base | new |
+|---|---|---|
+| pingpong | 150.9 | 152.7 |
+| ring | 81.5 | 82.4 |
+| fanin 1000->1 | 76.1 | 71.2 |
+| fanout 1->1000 | 108.5 (409.8, 419.6) | 301.3 (435.7, 459.0) |
+
+pingpong, ring and fanin are within 1% to 7% noise. fanout is bimodal on this machine (about 110 or about 420
+ns on either build), so its best-of-3 is not a comparison; the typical runs match (410 to 420 vs 436 to 459, a
+few percent). No measurable cost at ns 0 from the `any_ns` load and the `Option` tests.
 
 ## Gaps
 - Logger events from ns processes go to the root `logger` process by plain message and are dropped unless it is
@@ -49,7 +80,7 @@
 - `group_leader(Leader, Pid)` accepts a root `Leader`; only the request to the target is checked.
 
 ## Not in this chunk
-info, list, process caps, counters, `processes/0` filter, microbench at ns 0.
+Heap accounting (`heap_words`, `max_bytes`) and the RootOnly natives.
 
 ## Run
 ```
