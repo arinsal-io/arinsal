@@ -468,6 +468,23 @@ ns_spawn_opt_group_leader_foreign() ->
         Other -> {bad, Other}
     end.
 
+ns_rootonly_module_info_allowed() ->
+    Ns = mk(<<"acme">>),
+    Mods = [erts_debug, erl_debugger, erl_ddll, erts_internal, erts_trace_cleaner,
+            erts_literal_area_collector, erlang],
+    Res = in_ns(Ns, fun() ->
+        [{M, catch is_list(M:module_info()), catch is_list(M:module_info(exports)),
+          catch M:module_info(module)} || M <- Mods]
+    end),
+    Ddll = in_ns(Ns, fun() ->
+        {catch element(1, erl_ddll:loaded_drivers()), catch erl_ddll:format_error_int(foo)}
+    end),
+    Expected = [{M, true, true, M} || M <- Mods],
+    case {Res, Ddll} of
+        {Expected, {ok, _}} -> ok;
+        Other -> {bad, Other}
+    end.
+
 ns_rootonly_natives_refused() ->
     Ns = mk(<<"acme">>),
     Table = in_ns(Ns, fun() ->
@@ -495,7 +512,7 @@ ns_rootonly_natives_refused() ->
     OsCmd = in_ns(Ns, fun() -> case catch os:cmd("echo hi") of {'EXIT', _} -> refused; Out -> {ran, Out} end end),
     BadTable = [Entry || {_, Res} = Entry <- Table, not is_notsup(Res)],
     BadWrappers = [summ(R) || R <- Wrappers, not is_notsup(R)],
-    case {BadTable, BadWrappers, OsCmd, length(Table) > 40} of
+    case {BadTable, BadWrappers, OsCmd, length(Table) > 30} of
         {[], [], refused, true} -> ok;
         Other -> {bad, Other}
     end.
@@ -705,4 +722,9 @@ fn ns_port_spawn_driver_refused() {
 #[test]
 fn ns_spawn_opt_group_leader_foreign() {
     run("ns_spawn_opt_group_leader_foreign");
+}
+
+#[test]
+fn ns_rootonly_module_info_allowed() {
+    run("ns_rootonly_module_info_allowed");
 }
