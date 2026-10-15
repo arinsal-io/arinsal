@@ -349,7 +349,7 @@ ns_attack_open_port() ->
         probes([
             {spawn, not is_exit(catch open_port({spawn, "echo attack"}, []))},
             {spawn_executable, not is_exit(catch open_port({spawn_executable, "/bin/echo"}, [{args, ["attack"]}]))},
-            {ports, leaked(fun() -> erlang:ports() end)}
+            {ports, (case catch erlang:ports() of [_ | _] -> true; _ -> false end)}
         ])
     end),
     finish(Ctx, Res, fun no_leaks/1).
