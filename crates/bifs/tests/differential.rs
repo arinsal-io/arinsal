@@ -915,6 +915,40 @@ fn is_builtin_out_of_range_arity_matches_otp() {
 }
 
 #[test]
+fn binary_to_term_local_ref_first_word_limit_matches_otp() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let encode = |node: &str, creation: u32, first: u32| {
+        let mut bytes = vec![131, 90, 0, 3, 119, node.len() as u8];
+        bytes.extend_from_slice(node.as_bytes());
+        bytes.extend_from_slice(&creation.to_be_bytes());
+        for word in [first, 1, 2] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        O::Binary(bytes)
+    };
+    for (node, creation) in [
+        ("nonode@nohost", 0),
+        ("nonode@nohost", 1),
+        ("other@host", 0),
+    ] {
+        for first in [0, 1, (1 << 18) - 1, 1 << 18, (1 << 18) + 5, u32::MAX] {
+            let input = [encode(node, creation, first)];
+            let expected = reference.call("erlang", "binary_to_term", &input);
+            let actual = call("erlang", "binary_to_term", &input);
+            assert!(
+                equivalent(&actual, &expected),
+                "{node}/{creation} first word {first}: {actual:?} != {expected:?}"
+            );
+        }
+    }
+    let rejected = [encode("nonode@nohost", 0, 1 << 18)];
+    assert!(matches!(
+        call("erlang", "binary_to_term", &rejected),
+        CallResult::Exception { .. }
+    ));
+}
+
+#[test]
 fn iolist_to_iovec_preserves_large_binary_segments() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     let input = O::List {

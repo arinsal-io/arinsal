@@ -232,11 +232,7 @@ fn breakpoint(
         .iter()
         .any(|(_, candidate, _)| *candidate == line)
     {
-        let appears_in_source = code
-            .lines
-            .iter()
-            .flatten()
-            .any(|(_, n)| *n == u64::from(line));
+        let appears_in_source = code.lines.locations().any(|(_, n)| n == u64::from(line));
         return result_error(
             process,
             O::Tuple(vec![
@@ -817,10 +813,7 @@ fn debugger_frame_line(module: &arinsal_loader::Module, function: &str, arity: u
             module
                 .lines
                 .get(ip)
-                .and_then(Option::as_ref)
-                .map_or(O::Atom("undefined".into()), |(_, line)| {
-                    O::Int(*line as i64)
-                })
+                .map_or(O::Atom("undefined".into()), |(_, line)| O::Int(line as i64))
         },
         |line| O::Int(i64::from(line)),
     )

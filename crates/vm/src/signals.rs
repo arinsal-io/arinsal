@@ -1192,6 +1192,12 @@ fn spawn_mfa_with_priority(
     // Spawn options reach the child set-up through the thread-local tuning, as erts passes
     // `ErlSpawnOpts` down; `take` clears it on every path.
     let tuning = SpawnTuning::take();
+    // arl: a group leader outside the spawner's namespace is refused.
+    if let Some(leader) = tuning.arl_group_leader
+        && !crate::natives::proc::arl_leader_allowed(parent, leader)
+    {
+        return Err(badarg("erlang:spawn_opt"));
+    }
     let created = erl_create_process(
         vm,
         parent,
@@ -1214,7 +1220,7 @@ fn spawn_mfa_with_priority(
             opts: tuning.options.unwrap_or(Term::NIL),
             reply: None,
             ns: None,
-            group_leader: None,
+            group_leader: tuning.arl_group_leader,
         },
     )?;
     let pid_term = created
@@ -1242,6 +1248,8 @@ pub(crate) struct SpawnTuning {
     fullsweep: Option<u16>,
     min_bin_vheap: Option<usize>,
     off_heap_queue: Option<bool>,
+    /// arl: the `{group_leader, Pid}` option.
+    arl_group_leader: Option<Pid>,
 }
 
 thread_local! {
@@ -1303,6 +1311,14 @@ fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmE
                     .filter(|&words| words >= 0)
                     .ok_or_else(|| badarg("erlang:spawn_opt"))?;
                 opts.min_heap_size = Some(words as usize);
+            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("group_leader")) {
+                // arl: `{group_leader, Pid}`, checked against the spawner's namespace when it spawns.
+                opts.tuning.arl_group_leader = Some(
+                    tuple
+                        .get(1)
+                        .and_then(Pid::from_term)
+                        .ok_or_else(|| badarg("erlang:spawn_opt"))?,
+                );
             } else if tuple.len() == 2 && tuple.get(0) == Some(atom("monitor")) {
                 // code_server:spawn_opt(Fun, [{monitor, [{tag, {'ON_LOAD_DOWN', Mod}}]}]).
                 // Port of erl_process.c spawn option `{monitor, MonitorOpts}`, OTP-29.1.1.

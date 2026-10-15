@@ -17,7 +17,7 @@ use arinsal_term::{
 };
 use num_traits::ToPrimitive;
 
-const MAGIC: u32 = 0x4255_4646;
+const MAGIC: u32 = 0x1_4646;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static HANDLES: OnceLock<Mutex<HashMap<u64, Arc<BufferHandle>>>> = OnceLock::new();
 

@@ -157,25 +157,29 @@ fn create(
         }
         _ => return Err(badarg()),
     }
-    let code_chain = match (code_chain, dep_domain) {
-        (Some(chain), None) => vm.code_chain_of(chain).ok_or_else(badarg)?,
+    let code = match (code_chain, dep_domain) {
+        (Some(chain), None) => crate::code_domains::NsCode {
+            chain: vm.code_chain_of(chain).ok_or_else(badarg)?,
+            owns_first: false,
+        },
         (None, parents) => {
             let parents = parents.unwrap_or_default();
             let domain = vm.new_code_domain(&parents).ok_or_else(badarg)?;
-            vm.code_chain_of(vec![domain]).ok_or_else(badarg)?
+            crate::code_domains::NsCode {
+                chain: vm.code_chain_of(vec![domain]).ok_or_else(badarg)?,
+                owns_first: true,
+            }
         }
         (Some(_), Some(_)) => return Err(badarg()),
     };
+    vm.retain_ns_code(&code);
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    crate::code_domains::reap_retired_code(&runtime);
     let scheduler = runtime.scheduler()?;
-    let entry = runtime.namespaces.create(
-        &scheduler,
-        tenant,
-        project,
-        max_processes,
-        max_bytes,
-        code_chain,
-    );
+    let entry =
+        runtime
+            .namespaces
+            .create(&scheduler, tenant, project, max_processes, max_bytes, code);
     for (name, value) in os_env {
         entry.env_put(name.into(), value.into());
     }

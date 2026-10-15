@@ -1320,6 +1320,15 @@ fn parse_step(
                         }
                         ids.push(id);
                     }
+                    let magic = ids.len() == 3 && ids[2] == u32::MAX;
+                    if tag == 90
+                        && node == arinsal_term::atoms::NONAME
+                        && creation == 0
+                        && !magic
+                        && ids[0] >= (1 << 18)
+                    {
+                        return Err(BifError::BADARG);
+                    }
                     (0, 0, creation, ids)
                 };
                 let (id, serial, creation, ids) = identity;

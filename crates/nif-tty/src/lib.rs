@@ -21,7 +21,7 @@ use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ExportEntry, FunEntry, HeapAlloc, Node, Term, from_owned, to_owned};
 use num_traits::ToPrimitive;
 
-const MAGIC: u32 = 0x5454_5921;
+const MAGIC: u32 = 0x1_5921;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static HANDLES: OnceLock<Mutex<HashMap<u64, Arc<Tty>>>> = OnceLock::new();
 static TERMINFO: Mutex<()> = Mutex::new(());

@@ -282,6 +282,21 @@ pub(crate) fn native_code_contains(
     })
 }
 impl CodeMeta {
+    /// Drops the parts of the parsed file that only code generation reads. What
+    /// `module_info/1` and `erlang:get_debug_info/1` need stays: atoms, raw
+    /// literals, attributes, compile info and the unknown chunks.
+    pub(crate) fn release_code(&mut self) {
+        let beam = &mut self.beam;
+        beam.code.instructions = Vec::new();
+        beam.imports = Vec::new();
+        beam.exports = Vec::new();
+        beam.locals = Vec::new();
+        beam.lambdas = Vec::new();
+        beam.strings = Vec::new();
+        beam.lines = None;
+        beam.types = None;
+    }
+
     pub(crate) fn from_beam(beam: &BeamFile, bytes: Option<&[u8]>) -> Self {
         // OTP encodes -on_load as a Code instruction following that function's label.
         let mut function = None;
@@ -878,6 +893,7 @@ impl Vm {
     // body and its exported entries are resolved.
     fn compile_native(&self, module: &Module, meta: &mut CodeMeta, module_id: usize) {
         if !meta.has_beam_bytes {
+            meta.release_code();
             return;
         }
         // The BEAM was parsed in prepare_loading. erts does not parse it again here.
@@ -891,6 +907,7 @@ impl Vm {
             native.publish(module);
             meta.beamasm = Some(native);
         }
+        meta.release_code();
     }
 
     /// Install the next version of a module, reclaiming a purged predecessor.
@@ -990,6 +1007,8 @@ impl Vm {
         let module = Arc::new(module);
         if compile_native {
             self.compile_native(&module, &mut meta, module_id);
+        } else {
+            meta.release_code();
         }
         let name = module.name.clone();
         let id = staging.with(|tables| {

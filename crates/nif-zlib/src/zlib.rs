@@ -12,7 +12,7 @@ use crate::{
     Fault, Outcome, atom, bytes, int, number, owner_check, pair, reference, reference_id, tuple,
 };
 
-const MAGIC: u32 = 0x5a4c_4942;
+const MAGIC: u32 = 0x1_4942;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static HANDLES: OnceLock<Mutex<HashMap<u64, Arc<Mutex<Handle>>>>> = OnceLock::new();
 fn handles() -> &'static Mutex<HashMap<u64, Arc<Mutex<Handle>>>> {

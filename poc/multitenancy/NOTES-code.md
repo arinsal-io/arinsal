@@ -151,6 +151,43 @@ the module in at run time to exercise the dynamic path.
     (`module_loaded` true for root, code grows); a second domain loading it adds 0 bytes.
   - `ns_code_root_unchanged`: 2.93 ms / 2.28 ms (baseline 2.78 / 2.15).
 
+## Chunk 5 (done): dep domains and dropping domains
+
+- Registry (in `Domains`, staged with the code tables):
+  - `arinsal_code:new_dep_domain(Hash) -> Id` (root only) creates a domain over the base and
+    registers it under `Hash`; called again with the same hash it returns the same id.
+  - `arinsal_code:dep_domain(Hash) -> {ok, Id} | none`.
+  - `arinsal_code:deployment_hash([{Mod, Md5}]) -> binary()`: md5 over the pairs sorted by
+    module name, each as `<<(byte_size(Name)):16, Name/binary, Md5/binary>>`. The same in
+    Erlang: `erlang:md5([<<(byte_size(N)):16, N/binary, M/binary>> || {N, M} <-
+    lists:sort([{atom_to_binary(Mod), Md5} || {Mod, Md5} <- Mods])])`. The boot step passes
+    the release's non-app modules with their module md5 (`beam_lib:md5/1` or
+    `Mod:module_info(md5)`), then `dep_domain/1`, else `new_dep_domain/1` + `load/2`, then
+    `arinsal_ns:create(T, P, #{dep_domain => Id})`.
+- Refcount: `arinsal_ns:create/3` takes a reference on every registered dep domain its chain
+  uses (all but its own first domain, or the whole chain for an explicit `code_chain`).
+  Domains made with `arinsal_code:new_domain/1` are not refcounted and never dropped.
+- Dropping, on the first `close` of a namespace (`root_only::destroy_namespace`, so both
+  `arinsal_ns:destroy/1` and a `halt` inside the namespace):
+  - the namespace's own domain (when `create` made it) and every dep domain whose refcount
+    reaches 0 are dropped at once: chain, names and hash leave the overlay, so no chain can
+    name them and no later load or `arinsal_code:spawn` accepts them (`badarg`);
+  - their instances go to `Domains.retired` under the namespace id, and are moved to
+    `condemned` once that namespace has no process left (`reap_retired_code`, run on
+    destroy, `arinsal_ns:create` and every `arinsal_code` call). The next purge `complete`
+    frees condemned slots that the purging process does not reference. So memory release is
+    deferred to the next purge in root; I did not test the release end to end.
+- Tests (with BeamAsm and `ARINSAL_INTERP=1`; `ns_core`, `ns_env`, `ns_ets`, `ns_heap`,
+  `ns_names`, `ns_pterm` still green):
+  - `ns_code_dep_domain_shared`: hash registry round trip; `dep` loaded once into the dep
+    domain; two namespaces with `dep_domain => D` both call `dep:f()` through `[Own, D, 0]`;
+    code memory grows only by the one load; after destroying one namespace D is still
+    registered and used by the other; after the second, `dep_domain(Hash)` is `none`;
+  - `ns_code_drop_domain_on_destroy`: after `destroy`, `load/2` and `arinsal_code:spawn/4` on
+    the old domain are `badarg`; a new namespace gets a new domain and loads a different `w`.
+  - `ns_code_root_unchanged`: 2.88-2.97 ms / 2.00 ms (baseline 2.78 / 2.15).
+- `md-5` is now a dependency of `arinsal-vm` (already in the lockfile through the loader).
+
 ## What I learned for the next chunks
 
 ### Static imports (implemented in chunk 2)
@@ -185,8 +222,7 @@ the module in at run time to exercise the dynamic path.
 
 ### Open items for follow-up chunks
 - `code:is_loaded/1`, `code:which/1` and the rest of `code_server` answer from root's view.
-- Dep domains: hash registry (`dep_domain/1`), reverse map dep -> dependents, drop of a domain
-  (remove overlay entries, push ids to `condemned`; the next purge frees unreferenced slots).
+- Stage 2 sharing (closure classes across dep versions) is not started.
 - `arinsal_code:chain/1` for other processes needs a process_info-style request.
 - NIFs (`load_nif` finds the caller module in the base), native records and `-on_load` in
   domains are not handled.

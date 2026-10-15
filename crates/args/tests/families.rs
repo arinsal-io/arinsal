@@ -197,6 +197,13 @@ fn flag_families_match_erl_boot_arguments() {
             ],
             &env,
         ),
+        (
+            "emulator flags with the value attached",
+            &[
+                "-noshell", "+A0", "+a128", "+e1000", "+i16", "+n", "+T3", "+Ktrue", "+Wi", "+R25",
+            ],
+            &env,
+        ),
         ("-emu_type opt", &["-noshell", "-emu_type", "opt"], &env),
         (
             "-mode interactive and embedded",
@@ -238,6 +245,12 @@ fn flag_family_rejections_match_erl() {
         &["-emu_flavor", "jit"],
         &["+A", "1025"],
         &["+A"],
+        &["+A1025"],
+        &["+A-1"],
+        &["+Ax"],
+        &["+a1"],
+        &["+a", "8193"],
+        &["+a16"],
         &["+sbwt", "no"],
         &["+hms", "0"],
         &["+hms", "foo"],

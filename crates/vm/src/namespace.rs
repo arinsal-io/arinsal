@@ -33,6 +33,8 @@ pub(crate) struct NsEntry {
     env: RwLock<BTreeMap<OsString, Option<OsString>>>,
     /// Code lookup chain of every process of this namespace; `None` resolves in the base only.
     pub(crate) code_chain: Option<crate::code_domains::DomainChain>,
+    /// The chain's first domain was created for this namespace and is dropped with it.
+    pub(crate) owns_code_domain: bool,
 }
 
 /// Variables a namespace still reads from the process-wide environment. Everything else of
@@ -93,7 +95,7 @@ impl NsTable {
         project: Vec<u8>,
         max_processes: u64,
         max_bytes: u64,
-        code_chain: Option<crate::code_domains::DomainChain>,
+        code: crate::code_domains::NsCode,
     ) -> Arc<NsEntry> {
         let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let id = entries.len() as u32 + 1;
@@ -107,7 +109,8 @@ impl NsTable {
             alive: AtomicBool::new(true),
             names: OnceLock::new(),
             env: RwLock::new(BTreeMap::new()),
-            code_chain,
+            code_chain: code.chain,
+            owns_code_domain: code.owns_first,
         });
         entries.push(entry.clone());
         entry

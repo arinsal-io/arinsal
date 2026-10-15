@@ -35,6 +35,13 @@ pub(crate) struct Domains {
     last: DomainId,
     chains: HashMap<DomainId, DomainChain>,
     modules: HashMap<(DomainId, Atom), usize>,
+    /// Dep domains by deployment hash.
+    dep_hashes: HashMap<Vec<u8>, DomainId>,
+    /// Namespaces whose chain uses each dep domain.
+    dep_refs: HashMap<DomainId, u32>,
+    /// Instances of dropped domains, by the namespace whose processes may still run them;
+    /// condemned once that namespace has no process left.
+    retired: Vec<(u32, Vec<usize>)>,
 }
 
 impl Domains {
@@ -82,6 +89,33 @@ impl Domains {
             .iter()
             .filter(move |((_, name), _)| *name == module)
             .map(|(_, id)| *id)
+    }
+
+    /// The dep domain registered for `hash`, created over the base on first use.
+    fn dep_domain(&mut self, hash: &[u8]) -> Option<DomainId> {
+        if let Some(id) = self.dep_hashes.get(hash) {
+            return Some(*id);
+        }
+        let id = self.create(&[])?;
+        self.dep_hashes.insert(hash.to_vec(), id);
+        self.dep_refs.insert(id, 0);
+        Some(id)
+    }
+
+    /// Forgets `domain`: its chain, its names and its hash. Returns its instances.
+    fn drop_domain(&mut self, domain: DomainId) -> Vec<usize> {
+        self.chains.remove(&domain);
+        self.dep_hashes.retain(|_, id| *id != domain);
+        self.dep_refs.remove(&domain);
+        let mut ids = Vec::new();
+        self.modules.retain(|(owner, _), id| {
+            let keep = *owner != domain;
+            if !keep {
+                ids.push(*id);
+            }
+            keep
+        });
+        ids
     }
 
     /// Whether `chain` names only existing domains and ends with the base.
@@ -290,6 +324,109 @@ impl Vm {
     }
 }
 
+/// The code of a namespace: the chain its processes use, and whether its first domain was
+/// created for it (and is dropped with it).
+pub(crate) struct NsCode {
+    pub(crate) chain: Option<DomainChain>,
+    pub(crate) owns_first: bool,
+}
+
+impl NsCode {
+    /// The dep domains the chain uses, which the namespace holds a reference on.
+    fn shared(&self) -> &[DomainId] {
+        let chain = self.chain.as_deref().unwrap_or(&[]);
+        let start = usize::from(self.owns_first).min(chain.len());
+        &chain[start..]
+    }
+}
+
+impl Vm {
+    /// Takes a reference on every dep domain `code` uses, for a namespace being created.
+    pub(crate) fn retain_ns_code(&mut self, code: &NsCode) {
+        self.code_ix.update_active(|tables| {
+            for domain in code.shared() {
+                if let Some(refs) = tables.domains.dep_refs.get_mut(domain) {
+                    *refs += 1;
+                }
+            }
+        });
+        self.refresh_code();
+    }
+}
+
+/// Drops the code of destroyed namespace `ns`: its own domain, and each dep domain it was the
+/// last user of. Their names are unreachable from now on; their instances are retired until no
+/// process of `ns` is left (see [`reap_retired_code`]).
+pub(crate) fn drop_ns_code(runtime: &crate::process::Runtime, ns: u32, code: &NsCode) {
+    crate::code_ix::for_scope(runtime.code_scope).update_active(|tables| {
+        let domains = &mut *tables.domains;
+        let mut ids = Vec::new();
+        if code.owns_first
+            && let Some(own) = code.chain.as_deref().and_then(<[_]>::first)
+        {
+            ids.extend(domains.drop_domain(*own));
+        }
+        for domain in code.shared() {
+            if let Some(refs) = domains.dep_refs.get_mut(domain) {
+                *refs = refs.saturating_sub(1);
+                if *refs == 0 {
+                    ids.extend(domains.drop_domain(*domain));
+                }
+            }
+        }
+        if !ids.is_empty() {
+            domains.retired.push((ns, ids));
+        }
+    });
+    reap_retired_code(runtime);
+}
+
+/// Condemns the retired instances of every namespace that has no process left, so the next
+/// purge frees their slots.
+pub(crate) fn reap_retired_code(runtime: &crate::process::Runtime) {
+    let code = crate::code_ix::for_scope(runtime.code_scope);
+    let drained = |ns: u32| {
+        runtime
+            .namespaces
+            .get(ns)
+            .is_none_or(|entry| entry.counters.processes() == 0)
+    };
+    if !code
+        .active_tables()
+        .domains
+        .retired
+        .iter()
+        .any(|(ns, _)| drained(*ns))
+    {
+        return;
+    }
+    code.update_active(|tables| {
+        let retired = std::mem::take(&mut tables.domains.retired);
+        for (ns, ids) in retired {
+            if drained(ns) {
+                tables.condemned.extend(ids);
+            } else {
+                tables.domains.retired.push((ns, ids));
+            }
+        }
+    });
+}
+
+/// The deployment hash of a set of `(module, md5)` pairs: md5 over each pair, sorted by module
+/// name, as `<<(byte_size(Name)):16, Name/binary, Md5/binary>>`. In Erlang:
+/// `erlang:md5([<<(byte_size(N)):16, N/binary, M/binary>> || {N, M} <- lists:sort([{atom_to_binary(Mod), Md5} || {Mod, Md5} <- Mods])])`.
+pub(crate) fn deployment_hash(mut modules: Vec<(String, Vec<u8>)>) -> [u8; 16] {
+    use md5::Digest;
+    modules.sort();
+    let mut hasher = md5::Md5::new();
+    for (name, md5) in modules {
+        hasher.update(u16::try_from(name.len()).unwrap_or(u16::MAX).to_be_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&md5);
+    }
+    hasher.finalize().into()
+}
+
 /// A consolidated Elixir protocol may shadow the base one: each project consolidates its
 /// protocols over its own implementations.
 fn shadows_protocol(module: &Module, base: &Module) -> bool {
@@ -344,6 +481,9 @@ impl Vm {
 /// `arinsal_code` test and boot natives. All but `chain/1` are root only.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("arinsal_code", "chain", 1),
+    ("arinsal_code", "dep_domain", 1),
+    ("arinsal_code", "deployment_hash", 1),
+    ("arinsal_code", "new_dep_domain", 1),
     ("arinsal_code", "load", 2),
     ("arinsal_code", "new_domain", 1),
     ("arinsal_code", "spawn", 4),
@@ -372,6 +512,14 @@ fn domain_list(term: Term) -> Option<Vec<DomainId>> {
         .collect()
 }
 
+fn binary_arg(term: Term) -> Result<Vec<u8>, VmError> {
+    let mut owned = arinsal_term::to_owned(term).map_err(|_| badarg())?;
+    let arinsal_etf::OwnedTerm::Binary(ref mut bytes) = owned else {
+        return Err(badarg());
+    };
+    Ok(std::mem::take(bytes))
+}
+
 fn require_root(process: &Process) -> Result<(), VmError> {
     if process.code_chain.is_some() || process.ns != 0 {
         return Err(badarg());
@@ -387,7 +535,50 @@ pub(crate) fn call(
     function: &str,
     args: &[Term],
 ) -> Result<Term, VmError> {
+    if let Some(runtime) = process.runtime.as_ref() {
+        reap_retired_code(runtime);
+    }
     match (function, args) {
+        ("dep_domain", [hash]) => {
+            let hash = binary_arg(*hash)?;
+            vm.refresh_code();
+            match vm.code.domains.dep_hashes.get(&hash) {
+                Some(id) => {
+                    let id = Term::small(i64::from(*id)).ok_or_else(badarg)?;
+                    process.ensure(3, 1)?;
+                    TermBuilder::new(&mut process.heap)
+                        .tuple(&[atom("ok"), id])
+                        .map_err(|_| badarg())
+                }
+                None => Ok(atom("none")),
+            }
+        }
+        ("new_dep_domain", [hash]) => {
+            require_root(process)?;
+            let hash = binary_arg(*hash)?;
+            let id = vm
+                .code_ix
+                .update_active(|tables| tables.domains.dep_domain(&hash))
+                .ok_or_else(badarg)?;
+            vm.refresh_code();
+            Term::small(i64::from(id)).ok_or_else(badarg)
+        }
+        ("deployment_hash", [modules]) => {
+            let mut pairs = Vec::new();
+            for entry in crate::signals::list(*modules).ok_or_else(badarg)? {
+                let (name, md5) = crate::natives::proc::tuple2(entry).ok_or_else(badarg)?;
+                let name = global_atoms()
+                    .text(name.as_atom().ok_or_else(badarg)?)
+                    .ok_or_else(badarg)?
+                    .to_owned();
+                pairs.push((name, binary_arg(md5)?));
+            }
+            let hash = deployment_hash(pairs);
+            process.ensure(8, 0)?;
+            TermBuilder::new(&mut process.heap)
+                .binary(&hash)
+                .map_err(|_| badarg())
+        }
         ("new_domain", [parents]) => {
             require_root(process)?;
             let parents = domain_list(*parents).ok_or_else(badarg)?;
@@ -401,11 +592,7 @@ pub(crate) fn call(
             for entry in crate::signals::list(*modules).ok_or_else(badarg)? {
                 let (name, binary) = crate::natives::proc::tuple2(entry).ok_or_else(badarg)?;
                 let name = name.as_atom().ok_or_else(badarg)?;
-                let mut owned = arinsal_term::to_owned(binary).map_err(|_| badarg())?;
-                let arinsal_etf::OwnedTerm::Binary(ref mut bytes) = owned else {
-                    return Err(badarg());
-                };
-                let bytes = std::mem::take(bytes);
+                let bytes = binary_arg(binary)?;
                 beams.push((name, bytes));
             }
             match vm.load_into_domain(domain, &beams) {

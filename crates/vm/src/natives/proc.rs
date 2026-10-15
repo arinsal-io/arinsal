@@ -974,15 +974,13 @@ fn process_info_item_current_location(
                         module
                             .lines
                             .get(process.ip)
-                            .and_then(Option::as_ref)
                             .or_else(|| {
                                 process
                                     .ip
                                     .checked_sub(1)
                                     .and_then(|ip| module.lines.get(ip))
-                                    .and_then(Option::as_ref)
                             })
-                            .cloned()
+                            .map(|(file, line)| (file.to_string(), line))
                     })
                 })
             })
@@ -2154,7 +2152,7 @@ fn gc_message(process: &mut Process, request_id: Term, ok: bool) -> Result<Term,
 }
 
 /// arl: a namespace process may only pick a leader of its own namespace or a shared one.
-fn arl_leader_allowed(process: &Process, leader: Pid) -> bool {
+pub(crate) fn arl_leader_allowed(process: &Process, leader: Pid) -> bool {
     process.ns == 0
         || process
             .runtime

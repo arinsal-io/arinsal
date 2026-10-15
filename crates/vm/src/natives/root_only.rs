@@ -38,16 +38,7 @@ pub(crate) const ROOT_ONLY: &[(&str, &str, u8)] = &[
     ("erts_internal", "gather_carrier_info", 1),
     // Native code and drivers.
     ("erlang", "load_nif", 2),
-    // Ports and sockets of the node.
-    ("erts_internal", "open_port", 2),
-    ("erts_internal", "port_call", 3),
-    ("erts_internal", "port_close", 1),
-    ("erts_internal", "port_command", 3),
-    ("erts_internal", "port_connect", 2),
-    ("erts_internal", "port_control", 3),
-    ("erts_internal", "port_info", 1),
-    ("erts_internal", "port_info", 2),
-    ("erlang", "ports", 0),
+    // Ports: `port.rs` limits a namespace to the inet drivers and to its own ports.
     // Tracing.
     ("erlang", "trace_info", 2),
     ("erts_internal", "trace", 3),
@@ -146,7 +137,19 @@ pub(crate) fn destroy_namespace(process: &Process, ctx: &mut RunCtx<'_, Message>
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
-    runtime.namespaces.close(ns);
+    let closed = runtime.namespaces.close(ns);
+    // The namespace's code names become unreachable now; its instances are freed once its
+    // processes are gone.
+    if closed && let Some(entry) = runtime.namespaces.get(ns) {
+        crate::code_domains::drop_ns_code(
+            runtime,
+            ns,
+            &crate::code_domains::NsCode {
+                chain: entry.code_chain.clone(),
+                owns_first: entry.owns_code_domain,
+            },
+        );
+    }
     let Ok(scheduler) = runtime.scheduler() else {
         return;
     };
