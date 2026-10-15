@@ -597,6 +597,8 @@ struct PendingProcMonitor {
     to: Pid,
     id: u64,
     shared: SharedPayload,
+    /// Namespace of the watcher, kept because it may be gone when the monitor goes out.
+    from_ns: u32,
 }
 
 thread_local! {
@@ -3099,10 +3101,18 @@ impl<T: Task> Inner<T> {
             .inspect_err(|_| counters.release())
     }
 
-    /// Whether `from` may reach `receiver`: same namespace, a root sender, or a shared receiver.
-    fn ns_allows(&self, receiver: &Process<T>, from: Pid, from_ns: Option<u32>) -> bool {
+    /// Whether `from` may reach `receiver`: same namespace or a root sender, and for
+    /// `open_to_shared` (a message or a monitor) also a shared receiver. Links, exit signals
+    /// and requests never reach a shared service from another namespace.
+    fn ns_allows(
+        &self,
+        receiver: &Process<T>,
+        from: Pid,
+        from_ns: Option<u32>,
+        open_to_shared: bool,
+    ) -> bool {
         let word = receiver.ns.load(Ordering::Relaxed);
-        if word & NS_SHARED != 0 {
+        if open_to_shared && word & NS_SHARED != 0 {
             return true;
         }
         let sender = from_ns.map_or_else(
@@ -3123,20 +3133,21 @@ impl<T: Task> Inner<T> {
         from_ns: Option<u32>,
         payload: &Payload<T::Message>,
     ) -> NsGate {
-        let refused = match payload {
+        let (refused, open_to_shared) = match payload {
             Payload::Message(message) if message.via_alias() => return NsGate::Allow,
-            Payload::Message(_) | Payload::Signal(Signal::Exit(_)) => NsGate::Drop,
+            Payload::Message(_) => (NsGate::Drop, true),
+            Payload::Signal(Signal::Exit(_)) => (NsGate::Drop, false),
+            Payload::Signal(Signal::Monitor { .. }) => (NsGate::NoProcess, true),
             Payload::Signal(
                 Signal::Link
-                | Signal::Monitor { .. }
                 | Signal::Suspend { .. }
                 | Signal::SuspendInternal
                 | Signal::SyncSuspend { .. }
                 | Signal::GarbageCollect,
-            ) => NsGate::NoProcess,
+            ) => (NsGate::NoProcess, false),
             _ => return NsGate::Allow,
         };
-        if self.ns_allows(receiver, from, from_ns) {
+        if self.ns_allows(receiver, from, from_ns, open_to_shared) {
             NsGate::Allow
         } else {
             refused
@@ -3616,7 +3627,7 @@ impl<T: Task> Inner<T> {
             && let TimerPayload::Message(target, _, _) = &payload
             && *target != pid
             && let Some(receiver) = self.table.lookup(*target)
-            && !self.ns_allows(&receiver, pid, Some(process.ns_id()))
+            && !self.ns_allows(&receiver, pid, Some(process.ns_id()), true)
         {
             // The timer is never armed, like a send to a dead pid.
             let worker = pid.number() as usize % self.timer_commands.len();
@@ -4756,6 +4767,7 @@ impl<T: Task> Runner<'_, T> {
             to,
             id,
             shared,
+            from_ns,
         } = held;
         let event: Event<T::Message> = Event {
             from,
@@ -4770,7 +4782,7 @@ impl<T: Task> Runner<'_, T> {
             return;
         };
         if self.inner.any_ns.load(Ordering::Relaxed)
-            && self.inner.ns_gate(&process, from, None, &payload) != NsGate::Allow
+            && self.inner.ns_gate(&process, from, Some(from_ns), &payload) != NsGate::Allow
         {
             self.bounce_monitors(to, vec![(from, id)]);
             return;
@@ -5079,11 +5091,22 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         if let Payload::Signal(Signal::Monitor { reference, shared }) = &payload
             && matches!(current_scheduler_type(), SchedulerType::Normal)
         {
+            let from_ns = from_ns.map_or_else(
+                || {
+                    if self.inner.any_ns.load(Ordering::Relaxed) {
+                        self.inner.table.with_live(from, |p| p.ns_id()).unwrap_or(0)
+                    } else {
+                        0
+                    }
+                },
+                |ns| ns & NS_ID_MASK,
+            );
             let held = PendingProcMonitor {
                 from,
                 to,
                 id: *reference,
                 shared: shared.clone(),
+                from_ns,
             };
             let previous = PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().replace(held));
             if let Some(previous) = previous {
@@ -5093,7 +5116,9 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         }
         // Erts sends the held monitor first when the next signal goes to its target
         // (erl_proc_sig_queue.c:1141-1150); a signal to another target leaves it held.
-        let deferred = take_held_monitor_for(to).map(|held| Event {
+        let held = take_held_monitor_for(to);
+        let deferred_ns = held.as_ref().map(|held| held.from_ns);
+        let deferred = held.map(|held| Event {
             from: held.from,
             payload: Payload::Signal(Signal::Monitor {
                 reference: held.id,
@@ -5101,16 +5126,46 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             }),
         });
         let process = self.lookup(to).ok_or(Error::NoProcess)?;
-        if self.inner.any_ns.load(Ordering::Relaxed) {
+        let deferred = if self.inner.any_ns.load(Ordering::Relaxed) {
+            // The held monitor is gated on its own: the signal that releases it may be one that
+            // passes, and a refused monitor must not ride along.
+            let deferred = match deferred {
+                Some(event)
+                    if self
+                        .inner
+                        .ns_gate(&process, event.from, deferred_ns, &event.payload)
+                        != NsGate::Allow =>
+                {
+                    if let Payload::Signal(Signal::Monitor { reference, .. }) = event.payload {
+                        self.bounce_monitors(to, vec![(event.from, reference)]);
+                    }
+                    None
+                }
+                other => other,
+            };
             let gate = self.inner.ns_gate(&process, from, from_ns, &payload);
             if gate != NsGate::Allow {
-                // The held monitor comes from the same process, so it is refused too.
-                if let Some(Event {
-                    from: watcher,
-                    payload: Payload::Signal(Signal::Monitor { reference, .. }),
-                }) = deferred
-                {
-                    self.bounce_monitors(to, vec![(watcher, reference)]);
+                // A held monitor that passed still goes out, ahead of the refused signal.
+                if let Some(event) = deferred {
+                    let (watcher, reference) = match &event.payload {
+                        Payload::Signal(Signal::Monitor { reference, .. }) => {
+                            (event.from, Some(*reference))
+                        }
+                        _ => (event.from, None),
+                    };
+                    let sent = self.inner.deliver_process(
+                        &process,
+                        watcher,
+                        event.payload,
+                        self.local.map(RefCell::borrow_mut).as_deref_mut(),
+                        true,
+                        false,
+                    );
+                    if sent.is_err()
+                        && let Some(reference) = reference
+                    {
+                        self.bounce_monitors(to, vec![(watcher, reference)]);
+                    }
                 }
                 return if gate == NsGate::Drop {
                     Ok(())
@@ -5118,7 +5173,10 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                     Err(Error::NoProcess)
                 };
             }
-        }
+            deferred
+        } else {
+            deferred
+        };
         let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
         let wakes = payload_wakes(&payload);
         let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy { .. }));
@@ -5655,7 +5713,9 @@ impl<T: Task> Scheduler<T> {
             || self
                 .inner
                 .table
-                .with_live(to, |receiver| self.inner.ns_allows(receiver, from, None))
+                .with_live(to, |receiver| {
+                    self.inner.ns_allows(receiver, from, None, false)
+                })
                 .unwrap_or(true)
     }
     /// Queue a signal in the same ordered stream.
@@ -5949,7 +6009,8 @@ impl<T: Task> Scheduler<T> {
             return Ok(OnHeapSend::Unavailable);
         };
         // A refused send takes the ordinary path, which sees the message and drops it.
-        if self.inner.any_ns.load(Ordering::Relaxed) && !self.inner.ns_allows(&process, from, None)
+        if self.inner.any_ns.load(Ordering::Relaxed)
+            && !self.inner.ns_allows(&process, from, None, true)
         {
             return Ok(OnHeapSend::Unavailable);
         }

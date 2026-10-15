@@ -5780,6 +5780,12 @@ impl Process {
                         cold.prio_links.remove(&from);
                         cold.links.remove(&from)
                     });
+                // arl: a link exit acts only on a recorded link, as in erts. A refused
+                // cross-namespace link leaves the caller's half behind, and its exit must not
+                // reach the process that refused it.
+                if linked_exit && !was_linked {
+                    return Ok(2);
+                }
                 let mut message = message;
                 let seq_token = message.take_seq_token();
                 let reason = message.into_receiver(self)?;
