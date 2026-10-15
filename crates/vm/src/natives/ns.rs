@@ -16,6 +16,8 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("arinsal_ns", "spawn", 5),
     ("arinsal_ns", "destroy", 1),
     ("arinsal_ns", "expose", 1),
+    ("arinsal_ns", "info", 1),
+    ("arinsal_ns", "list", 0),
     ("arinsal_ns", "of", 1),
 ];
 
@@ -71,6 +73,8 @@ fn call_impl(
         ("spawn", [ns, m, f, a, opts]) => spawn(vm, process, ctx, *ns, (*m, *f, *a), *opts),
         ("destroy", [ns]) => destroy(process, ctx, *ns),
         ("expose", [pid]) => expose(process, *pid),
+        ("info", [ns]) => info(process, *ns),
+        ("list", []) => list(process),
         _ => Err(badarg()),
     }
 }
@@ -125,10 +129,10 @@ fn create(process: &mut Process, tenant: Term, project: Term, opts: Term) -> Res
         _ => return Err(badarg()),
     }
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
-    runtime.scheduler()?.ns_enable();
+    let scheduler = runtime.scheduler()?;
     let entry = runtime
         .namespaces
-        .create(tenant, project, max_processes, max_bytes);
+        .create(&scheduler, tenant, project, max_processes, max_bytes);
     heap_term(
         process,
         &O::Tuple(vec![O::Atom("ok".into()), O::Int(i64::from(entry.id))]),
@@ -181,6 +185,56 @@ fn spawn(
         .pid
         .to_term()
         .ok_or_else(|| VmError::Unsupported("pid limit".into()))
+}
+
+fn limit_term(value: u64) -> O {
+    if value == crate::namespace::UNLIMITED {
+        O::Atom("infinity".into())
+    } else {
+        O::Int(i64::try_from(value).unwrap_or(i64::MAX))
+    }
+}
+
+/// `#{tenant, project, processes, reductions, heap_words, max_processes, max_bytes}` of `ns`.
+/// An unset cap is `infinity`. A destroyed namespace still answers, so its process count
+/// can be watched draining.
+fn info(process: &mut Process, ns: Term) -> Result<Term, VmError> {
+    let ns = ns_arg(ns)?;
+    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let entry = runtime.namespaces.get(ns).ok_or_else(badarg)?;
+    let key = |name: &str| O::Atom(name.into());
+    let int = |value: u64| O::Int(i64::try_from(value).unwrap_or(i64::MAX));
+    let map = O::Map(vec![
+        (key("tenant"), O::Binary(entry.tenant.clone())),
+        (key("project"), O::Binary(entry.project.clone())),
+        (key("processes"), int(entry.counters.processes())),
+        (key("reductions"), int(entry.counters.reductions())),
+        (
+            key("heap_words"),
+            O::Int(entry.heap_words.load(std::sync::atomic::Ordering::Relaxed)),
+        ),
+        (
+            key("max_processes"),
+            limit_term(entry.counters.max_processes()),
+        ),
+        (key("max_bytes"), limit_term(entry.max_bytes)),
+    ]);
+    heap_term(process, &map)
+}
+
+/// Ids of the namespaces that are alive, in creation order.
+fn list(process: &mut Process) -> Result<Term, VmError> {
+    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let ids = runtime.namespaces.list();
+    let value = if ids.is_empty() {
+        O::Nil
+    } else {
+        O::List {
+            elems: ids.into_iter().map(|id| O::Int(i64::from(id))).collect(),
+            tail: Box::new(O::Nil),
+        }
+    };
+    heap_term(process, &value)
 }
 
 /// Mark `ns` destroyed and send `kill` to every process of it. The processes exit shortly

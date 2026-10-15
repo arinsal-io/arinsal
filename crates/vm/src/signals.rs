@@ -1058,7 +1058,10 @@ pub(crate) fn erl_create_process(
     }
     let pid = scheduler
         .spawn_unscheduled_in_ns(child, so.priority, so.scheduler, child_ns)
-        .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
+        .map_err(|error| match error {
+            arinsal_sched::Error::SystemLimit => system_limit(),
+            error => VmError::Unsupported(format!("spawn: {error}")),
+        })?;
     if so.link {
         parent.cold_mut().links.insert(pid);
     }

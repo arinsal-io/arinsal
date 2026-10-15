@@ -67,7 +67,7 @@ mod timer;
 
 pub use mailbox::{InSignal, Incoming, psflg};
 use ns::NsGate;
-pub use ns::{NS_ID_MASK, NS_SHARED};
+pub use ns::{NS_ID_MASK, NS_SHARED, NsCounters};
 pub use ports::{PortExecution, PortRunQueue, RunPort};
 pub use timer::TimerRef;
 
@@ -760,6 +760,8 @@ pub enum Error {
     Capacity,
     NoProcess,
     WrongMode,
+    /// The namespace of the new process is at its process cap or closed.
+    SystemLimit,
 }
 
 /// Outcome of [`Scheduler::try_send_on_heap`].
@@ -1036,12 +1038,25 @@ struct Process<T: Task> {
     queued_prio: AtomicU8,
     /// Namespace word: id in the low 31 bits (0 is root), [`NS_SHARED`] in the top bit.
     ns: AtomicU32,
+    /// Counters of the namespace the process was spawned into; `None` in root.
+    ns_counters: Option<Arc<NsCounters>>,
+    /// The process still counts against `ns_counters`.
+    ns_counted: AtomicBool,
     cell: Mutex<TaskCell<T>>,
 }
 
 impl<T: Task> Process<T> {
     fn ns_id(&self) -> u32 {
         self.ns.load(Ordering::Relaxed) & NS_ID_MASK
+    }
+
+    /// Stop counting the process against its namespace; once per process.
+    fn release_ns(&self) {
+        if let Some(counters) = &self.ns_counters
+            && self.ns_counted.swap(false, Ordering::AcqRel)
+        {
+            counters.release();
+        }
     }
 
     /// The scheduling bits of the process state word (`p->state`).
@@ -1122,6 +1137,7 @@ impl<T: Task> ProcessTable<T> {
         priority: Priority,
         bound_worker: Option<usize>,
         ns: u32,
+        ns_counters: Option<Arc<NsCounters>>,
     ) -> Result<Arc<Process<T>>, Error> {
         // Port of erts/emulator/beam/erl_ptab.c:500 (erts_ptab_new_element), OTP-29.1.1.
         let _shared = self.lock.read().unwrap();
@@ -1156,6 +1172,8 @@ impl<T: Task> ProcessTable<T> {
             dirty_runner: AtomicUsize::new(0),
             queued_prio: AtomicU8::new(0),
             ns: AtomicU32::new(ns),
+            ns_counted: AtomicBool::new(ns_counters.is_some()),
+            ns_counters,
             cell: Mutex::new(TaskCell { task }),
         });
         // Publication needs only the release store. Flushing the epoch bag on
@@ -1489,6 +1507,8 @@ struct Inner<T: Task> {
     /// Set when the first namespace is registered. Delivery skips the namespace check while
     /// it is false.
     any_ns: AtomicBool,
+    /// Counters by namespace id.
+    ns_counters: RwLock<Vec<Option<Arc<NsCounters>>>>,
 }
 
 /// What an idle scheduler stole from a victim run queue.
@@ -3050,6 +3070,33 @@ impl<T: Task> Inner<T> {
                 self.deliver_live(process, from, payload, local)
             })
             .ok_or(Error::NoProcess)?
+    }
+
+    /// Insert a process into namespace `ns`, counting it against the namespace's cap.
+    fn insert_process(
+        &self,
+        task: T,
+        priority: Priority,
+        bound_worker: Option<usize>,
+        ns: u32,
+    ) -> Result<Arc<Process<T>>, Error> {
+        if ns == 0 {
+            return self.table.insert(task, priority, bound_worker, 0, None);
+        }
+        let counters = self
+            .ns_counters
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(ns as usize)
+            .cloned()
+            .flatten()
+            .ok_or(Error::SystemLimit)?;
+        if !counters.try_acquire() {
+            return Err(Error::SystemLimit);
+        }
+        self.table
+            .insert(task, priority, bound_worker, ns, Some(counters.clone()))
+            .inspect_err(|_| counters.release())
     }
 
     /// Whether `from` may reach `receiver`: same namespace, a root sender, or a shared receiver.
@@ -5195,6 +5242,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         // One delete: the free-id ring hands the slot to the next spawn, and a second
         // delete of the same pix would destroy that process.
         if let Some(process) = self.inner.table.lookup(pid) {
+            process.release_ns();
             process.run_state().store(EXITED, Ordering::SeqCst);
             self.inner.table.remove(pid);
         }
@@ -5442,6 +5490,7 @@ impl<T: Task> Scheduler<T> {
             balance,
             port_queues: (0..workers).map(|_| ports::PortQueue::default()).collect(),
             any_ns: AtomicBool::new(false),
+            ns_counters: RwLock::new(Vec::new()),
         });
         let mut threads = Vec::new();
         if !simulated {
@@ -5531,8 +5580,7 @@ impl<T: Task> Scheduler<T> {
         };
         let process = self
             .inner
-            .table
-            .insert(task, priority, worker, ns & NS_ID_MASK)?;
+            .insert_process(task, priority, worker, ns & NS_ID_MASK)?;
         process.run_state().store(UNSCHEDULED, Ordering::Release);
         Ok(process.pid)
     }
@@ -5573,7 +5621,7 @@ impl<T: Task> Scheduler<T> {
         if worker >= self.inner.parked.len() {
             return Err(Error::Capacity);
         }
-        let process = self.inner.table.insert(task, priority, None, 0)?;
+        let process = self.inner.insert_process(task, priority, None, 0)?;
         let pid = process.pid;
         process.run_state().store(QUEUED, Ordering::Release);
         process.scheduler_id.store(worker, Ordering::Relaxed);
@@ -5584,7 +5632,7 @@ impl<T: Task> Scheduler<T> {
     }
     /// Spawn a task at a chosen scheduler priority.
     pub fn spawn_priority(&self, task: T, priority: Priority) -> Result<Pid, Error> {
-        let process = self.inner.table.insert(task, priority, None, 0)?;
+        let process = self.inner.insert_process(task, priority, None, 0)?;
         let pid = process.pid;
         process.run_state().store(QUEUED, Ordering::Release);
         self.inner.enqueue_new(Scheduled::new(process));
@@ -5927,10 +5975,22 @@ impl<T: Task> Scheduler<T> {
     pub fn process_count(&self) -> usize {
         self.inner.table.ids.count()
     }
-    /// Declare that namespaces exist: from now on delivery checks the namespace of sender
-    /// and receiver. Call before the first process is spawned into one.
-    pub fn ns_enable(&self) {
+    /// Register namespace `id` (never 0) with a process cap and return its counters. From the
+    /// first registration on, delivery checks the namespace of sender and receiver.
+    pub fn ns_register(&self, id: u32, max_processes: u64) -> Arc<NsCounters> {
+        assert!(id != 0 && id & NS_SHARED == 0, "namespace id out of range");
+        let counters = Arc::new(NsCounters::new(max_processes));
+        let mut registry = self
+            .inner
+            .ns_counters
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if registry.len() <= id as usize {
+            registry.resize(id as usize + 1, None);
+        }
+        registry[id as usize] = Some(counters.clone());
         self.inner.any_ns.store(true, Ordering::Release);
+        counters
     }
     /// Mark a live process as reachable from every namespace, or clear the mark.
     pub fn set_ns_shared(&self, pid: Pid, shared: bool) -> bool {
@@ -6446,7 +6506,7 @@ mod msgq_stage_microbench {
     fn stages() {
         const N: usize = 200_000;
         let table = ProcessTable::<Idle>::new(1);
-        let process = table.insert(Idle, Priority::Normal, None, 0).unwrap();
+        let process = table.insert(Idle, Priority::Normal, None, 0, None).unwrap();
         let pid = process.pid;
         let started = Instant::now();
         for _ in 0..N {
@@ -7055,6 +7115,11 @@ fn run_slice<'a, T: Task>(
             consumed as i64,
         );
     }
+    if consumed != 0
+        && let Some(counters) = &process.ns_counters
+    {
+        counters.add_reductions(consumed);
+    }
     if dirty.is_some() {
         // Dirty schedulers keep no reduction or normal run queue counters.
     } else if let Some(local) = local.as_deref_mut() {
@@ -7242,6 +7307,7 @@ fn run_slice<'a, T: Task>(
             // ERTS_CONTINUE_EXIT_FREE). The identifier may have been reused; deleting
             // this pix again would free the new occupant. A forced exit that never
             // reached `begin_exit` still owns the slot.
+            process.release_ns();
             if inner.table.lookup(process.pid).is_some() {
                 inner.table.remove(process.pid);
             }

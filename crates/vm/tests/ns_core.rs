@@ -220,6 +220,101 @@ ns_destroy_kills_all() ->
     end.
 
 run_fun(Fun) -> Fun().
+
+waiter() -> receive stop -> ok end.
+
+%% Wait until fun Pred(Info) holds for the info map of Ns, at most ~3s.
+wait_info(Ns, Pred) -> wait_info(Ns, Pred, 300).
+wait_info(Ns, Pred, 0) -> arinsal_ns:info(Ns);
+wait_info(Ns, Pred, N) ->
+    Info = arinsal_ns:info(Ns),
+    case Pred(Info) of
+        true -> Info;
+        false -> receive after 10 -> ok end, wait_info(Ns, Pred, N - 1)
+    end.
+
+ns_process_cap_system_limit() ->
+    {ok, Ns} = arinsal_ns:create(<<"acme">>, <<"shop">>, #{max_processes => 3}),
+    Ws = [arinsal_ns:spawn(Ns, ns_core_t, run_fun, [fun waiter/0]) || _ <- [1, 2, 3]],
+    Root = (catch arinsal_ns:spawn(Ns, ns_core_t, run_fun, [fun waiter/0])),
+    Refs = [erlang:monitor(process, W) || W <- Ws],
+    [W ! stop || W <- Ws],
+    [receive {'DOWN', R, process, _, _} -> ok after 3000 -> timeout end || R <- Refs],
+    #{processes := Left} = wait_info(Ns, fun(#{processes := N}) -> N =:= 0 end),
+    Again = in_ns(Ns, fun() ->
+        A = spawn(fun waiter/0), B = spawn(fun waiter/0),
+        Over = (catch spawn(fun waiter/0)),
+        A ! stop, B ! stop,
+        Over
+    end),
+    case {Root, Left, Again} of
+        {{'EXIT', {system_limit, _}}, 0, {'EXIT', {system_limit, _}}} -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_destroy_closes_spawns() ->
+    Ns = mk(<<"acme">>),
+    Spawner = fun() ->
+        Loop = fun L() -> spawn(fun waiter/0), receive after 1 -> ok end, L() end,
+        Loop()
+    end,
+    _ = arinsal_ns:spawn(Ns, ns_core_t, run_fun, [Spawner]),
+    Pids0 = wait_count(Ns, 20, 300),
+    ok = arinsal_ns:destroy(Ns),
+    Refs = [erlang:monitor(process, P) || P <- Pids0],
+    [receive {'DOWN', R, process, _, _} -> ok after 5000 -> timeout end || R <- Refs],
+    #{processes := Left} = wait_info(Ns, fun(#{processes := N}) -> N =:= 0 end),
+    Pids = ns_pids(Ns),
+    case {length(Pids0) >= 20, Left, Pids} of
+        {true, 0, []} -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_info_counts() ->
+    {ok, Ns} = arinsal_ns:create(<<"acme">>, <<"shop">>, #{max_processes => 10}),
+    Before = arinsal_ns:info(Ns),
+    {PB, RefB} = start_in(Ns, fun() -> receive stop -> stopped end end),
+    #{processes := One} = wait_info(Ns, fun(#{processes := N}) -> N =:= 1 end),
+    PB ! go, PB ! stop,
+    stopped = await(PB, RefB),
+    sum = in_ns(Ns, fun() -> _ = lists:sum(lists:seq(1, 200000)), sum end),
+    After = wait_info(Ns, fun(#{processes := N}) -> N =:= 0 end),
+    case {Before, One, After} of
+        {#{tenant := <<"acme">>, project := <<"shop">>, processes := 0, max_processes := 10,
+           max_bytes := infinity, heap_words := H0}, 1,
+         #{processes := 0, reductions := R, max_processes := 10}}
+          when is_integer(H0), R > 1000 -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_list() ->
+    Empty = arinsal_ns:list(),
+    N1 = mk(<<"a">>),
+    N2 = mk(<<"b">>),
+    Both = arinsal_ns:list(),
+    ok = arinsal_ns:destroy(N1),
+    Rest = arinsal_ns:list(),
+    #{tenant := T} = arinsal_ns:info(N1),
+    case {Empty, Both, Rest, T, N1, N2} of
+        {[], [N1, N2], [N2], <<"a">>, 1, 2} -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_processes_filtered() ->
+    N1 = mk(<<"a">>),
+    N2 = mk(<<"b">>),
+    Inner = in_ns(N1, fun() ->
+        C = spawn(fun waiter/0),
+        Ps = processes(),
+        C ! stop,
+        {length(Ps), lists:all(fun(P) -> arinsal_ns:'of'(P) =:= arinsal_ns:'of'(self()) end, Ps)}
+    end),
+    Other = in_ns(N2, fun() -> length(processes()) end),
+    RootSees = processes(),
+    case {Inner, Other, lists:member(self(), RootSees), length(RootSees) > 2} of
+        {{2, true}, 1, true, true} -> ok;
+        Bad -> {bad, Bad}
+    end.
 "#;
 
 fn run(entry: &str) {
@@ -299,4 +394,29 @@ fn ns_natives_root_only() {
 #[test]
 fn ns_destroy_kills_all() {
     run("ns_destroy_kills_all");
+}
+
+#[test]
+fn ns_process_cap_system_limit() {
+    run("ns_process_cap_system_limit");
+}
+
+#[test]
+fn ns_destroy_closes_spawns() {
+    run("ns_destroy_closes_spawns");
+}
+
+#[test]
+fn ns_info_counts() {
+    run("ns_info_counts");
+}
+
+#[test]
+fn ns_list() {
+    run("ns_list");
+}
+
+#[test]
+fn ns_processes_filtered() {
+    run("ns_processes_filtered");
 }
