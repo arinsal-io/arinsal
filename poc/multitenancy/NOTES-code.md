@@ -104,11 +104,7 @@ the module in at run time to exercise the dynamic path.
   for the module name, and refuses modules in sticky directories (`sticky_directory`) before
   `finish_loading` runs. So `code:load_binary(lists, ...)` from a domain gets
   `{error, sticky_directory}`, and a base module of the same name gets its old code purged.
-- Gap: the not_allowed check only sees base modules that are loaded. A domain that loads an
-  OTP module root has not loaded yet (for example `lists` on a fresh VM) gets its own copy.
-  Proposed fix with the dep-domain chunk: before installing a name the base lacks, compare with
-  the beam on root's code path: load it into the base when the md5 matches, refuse it as
-  `not_allowed` when it differs.
+- (Closed in chunk 4: names the base has not loaded are compared with root's code path.)
 - Tests (with BeamAsm and `ARINSAL_INTERP=1`):
   - `ns_code_load_into_caller_domain`: on a booted CLI node (needs `cargo build --release -p
     arinsal-cli`), a chained process loads `w` with `code:load_binary/3` and calls it; root
@@ -120,6 +116,40 @@ the module in at run time to exercise the dynamic path.
     `{error, not_allowed}` and both the domain and root keep the base `lists`; a protocol
     module `pp` shadows the base one in the domain only.
   - `ns_code_root_unchanged`: 2.88 ms / 2.21 ms (baseline 2.78 / 2.15).
+
+## Chunk 4 (done): domains wired to namespaces
+
+- `NsEntry.code_chain: Option<DomainChain>` is fixed at `arinsal_ns:create/3`:
+  - default: a fresh domain over the base, chain `[NsDomain, 0]`;
+  - `dep_domain => D` (or a list): a fresh domain over `D`, chain `[NsDomain, D, 0]`;
+  - `code_chain => [..]`: that chain as given (trailing 0 added; one domain id stands for its
+    own chain; `[0]` is the base only). Both options together are `badarg`.
+  - `arinsal_ns:info/1` reports it as `code_chain => [DomainId]`, so the boot step can load
+    the release into `hd(code_chain)` with `arinsal_code:load/2` (or by loading from inside the
+    namespace, which goes to the same domain).
+- `erl_create_process`: with `so.ns` set (`arinsal_ns:spawn/4,5`) the child takes the ns entry's
+  chain; otherwise it inherits the parent's. So a process in ns N always has N's chain.
+  `arinsal_code:spawn/4` and the other `arinsal_code` writers stay root-only test helpers: they
+  now refuse a caller with `ns != 0` as well as one with a chain.
+- Root code path check in `install_in_domain`: for a name the chain does not see, the first
+  `<name>.beam` on the VM's code path (`Vm.paths`: the explicit paths, `.` and OTP's
+  `lib/*/ebin`, not paths `code_server` adds later) is compared by module md5. The md5 and
+  whether the beam is a protocol are cached per file path, process wide; the path search is one
+  `stat` per directory per module, uncached. Same md5: the base loads that file (once, shared
+  by every domain) and the domain load is a no-op. Different md5: `not_allowed`, unless both
+  are protocols.
+- New rule from MT_BRIEF: hook points in ERTS-ported files now carry `// arl: <what>`. I marked
+  every hook of the code stream. The names I added before the rule (`code_chain`, `domain`,
+  `domains`, `alloc_in_domain`, the `Prepared.domain` field) are left for the final rename pass.
+- Tests (with BeamAsm and `ARINSAL_INTERP=1`, plus `ns_core` and `ns_names` still green):
+  - `ns_code_ns_spawn_gets_chain`: ns created with `dep_domain => D`; its chain is
+    `[Own, D, 0]`; a process from `arinsal_ns:spawn/4` reaches the ns's `w` and `a` (dynamic,
+    spawn MFA, fun, static) and `dep` from `D`, and its spawned child has the same chain;
+    `code_chain => [0]` gives `[0]`;
+  - `ns_code_unloaded_base_name_not_allowed`: on a fresh VM (`orddict` not loaded), a domain
+    load of a fake `orddict` is `not_allowed`; the real OTP `orddict` loads into the base
+    (`module_loaded` true for root, code grows); a second domain loading it adds 0 bytes.
+  - `ns_code_root_unchanged`: 2.93 ms / 2.28 ms (baseline 2.78 / 2.15).
 
 ## What I learned for the next chunks
 
