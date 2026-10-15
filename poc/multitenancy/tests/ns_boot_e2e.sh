@@ -28,7 +28,12 @@ ADMIN_PORT="${ADMIN_PORT:-7021}"
 ADMIN="http://127.0.0.1:$ADMIN_PORT"
 MGR_PID=""
 cleanup() {
-  if [ -n "$MGR_PID" ]; then kill "$MGR_PID" 2>/dev/null || true; wait "$MGR_PID" 2>/dev/null || true; fi
+  if [ -n "$MGR_PID" ]; then
+    kill "$MGR_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$MGR_PID" 2>/dev/null || break; sleep 0.5; done
+    kill -9 "$MGR_PID" 2>/dev/null || true
+    wait "$MGR_PID" 2>/dev/null || true
+  fi
   [ -n "${KEEP:-}" ] || rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -42,24 +47,47 @@ step "compile the manager and the probe"
 cat >"$WORK/ns_boot_probe.erl" <<'EOF'
 -module(ns_boot_probe).
 -export([start/1]).
-%% Writes the root view of the namespaces to a file every 200 ms.
+%% Writes the root view of the namespaces to a file every 200 ms, with prim_file (no file
+%% server). A side process writes through root's file_server_2 as well; fs_stuck_ms reports how
+%% long its current write has been pending.
 start([File]) ->
-    spawn(fun() -> loop(atom_to_list(File)) end).
-loop(File) ->
-    try sample(File)
-    catch C:E:S -> file:write_file(File ++ ".err", io_lib:format("~p~n", [{C, E, S}]))
+    spawn(fun() -> loop(atom_to_list(File), undefined) end).
+loop(File, Fs0) ->
+    Fs = fs_writer(File, Fs0),
+    try sample(File, Fs)
+    catch C:E:S -> prim_file:write_file(File ++ ".err", io_lib:format("~p~n", [{C, E, S}]))
     end,
-    receive after 200 -> loop(File) end.
-sample(File) ->
+    receive after 200 -> loop(File, Fs) end.
+fs_writer(File, {Pid, T0}) ->
+    case is_process_alive(Pid) of
+        true -> {Pid, T0};
+        false -> fs_writer(File, undefined)
+    end;
+fs_writer(File, undefined) ->
+    {spawn(fun() -> ok = file:write_file(File ++ ".fs", <<"x">>) end),
+     erlang:monotonic_time(millisecond)}.
+%% erlang:memory/0 has been seen to block in root while a namespace boots (NOTES-boot.md), so it
+%% runs in a helper; after 1 s the last value is reused and mem_stuck counts the stalls.
+memory() ->
+    Self = self(),
+    Pid = spawn(fun() -> Self ! {mem, self(), erlang:memory()} end),
+    receive
+        {mem, Pid, Mem} -> put(mem, Mem), Mem
+    after 1000 ->
+        put(mem_stuck, (case get(mem_stuck) of undefined -> 0; N -> N end) + 1),
+        case get(mem) of undefined -> []; Last -> Last end
+    end.
+sample(File, {_, FsT0}) ->
     AC = whereis(application_controller),
-    Mem = erlang:memory(),
+    Mem = memory(),
     Ns = [{N, maps:with([processes, tenant, project], arinsal_ns:info(N))} || N <- arinsal_ns:list()],
-    Line = io_lib:format("ac_ns=~p total=~p processes=~p code=~p ets=~p ns=~0p~n",
+    Line = io_lib:format("ac_ns=~p total=~p processes=~p code=~p ets=~p fs_stuck_ms=~p mem_stuck=~p ns=~0p~n",
                          [arinsal_ns:'of'(AC), proplists:get_value(total, Mem),
                           proplists:get_value(processes, Mem), proplists:get_value(code, Mem),
-                          proplists:get_value(ets, Mem), Ns]),
-    ok = file:write_file(File ++ ".tmp", Line),
-    ok = file:rename(File ++ ".tmp", File).
+                          proplists:get_value(ets, Mem), erlang:monotonic_time(millisecond) - FsT0,
+                          get(mem_stuck), Ns]),
+    ok = prim_file:write_file(File ++ ".tmp", iolist_to_binary(Line)),
+    ok = prim_file:rename(File ++ ".tmp", File).
 EOF
 (cd "$WORK" && stock erlc ns_boot_probe.erl) || fail "probe does not compile"
 
@@ -144,4 +172,5 @@ step "memory (bytes): first project includes the shared base modules it loaded i
 for k in total processes code ets; do
   echo "$k: first $(( $(field "$AFTER1" $k) - $(field "$BASE" $k) )) second $(( $(field "$AFTER2" $k) - $(field "$AFTER1" $k) ))"
 done
+echo "root file_server_2 write pending at the end: $(probe | sed -n 's/.*fs_stuck_ms=\([0-9-]*\).*/\1/p') ms; erlang:memory stalls: $(probe | sed -n 's/.*mem_stuck=\([a-z0-9]*\).*/\1/p')"
 echo "PASS"

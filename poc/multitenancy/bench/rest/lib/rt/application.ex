@@ -6,11 +6,16 @@ defmodule RT.Application do
     port = String.to_integer(System.get_env("RT_PORT", "4000"))
     tenants = String.to_integer(System.get_env("RT_TENANTS", "1"))
     items = String.to_integer(System.get_env("RT_ITEMS", "200"))
+    acceptors = String.to_integer(System.get_env("ACCEPTORS", "1"))
 
     children = [
       {Registry, keys: :unique, name: RT.Registry},
       {DynamicSupervisor, name: RT.Tenants, strategy: :one_for_one},
-      {Bandit, plug: RT.Host, ip: {127, 0, 0, 1}, port: port}
+      {Bandit,
+       plug: RT.Host,
+       ip: {127, 0, 0, 1},
+       port: port,
+       thousand_island_options: [num_acceptors: acceptors]}
     ]
 
     {:ok, sup} = Supervisor.start_link(children, strategy: :one_for_one, name: RT.Sup)

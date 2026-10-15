@@ -1,7 +1,8 @@
 %% Boots a Mix release inside a namespace without a second kernel.
 %%
-%% `start/3` runs in root (the manager). It loads into the base every module of the plan that is
-%% identical to the module root's code path would load, so the namespace shares it, then spawns
+%% `prepare/1` and `start/3` run in root (the manager). `prepare/1` loads into the base every
+%% module of the plan that is identical to the module root's code path would load, and the
+%% release's dependencies into a shared dep domain (see there). `start/3` spawns
 %% the namespace's `init` (`ns_init/4`) with the project's group leader and waits until the
 %% project's applications are started.
 %%
@@ -23,7 +24,7 @@
 %% server in root could not answer a namespace process.
 -module(arinsal_ns_boot).
 
--export([start/3, expose_root_services/0]).
+-export([prepare/1, start/3, expose_root_services/0]).
 -export([ns_init/4, ns_main/4]).
 
 -define(BOOT_TIMEOUT, 60000).
@@ -40,13 +41,53 @@ expose_root_services() ->
     [ok = arinsal_ns:expose(Pid) || Pid <- [whereis(Name) || Name <- ?ROOT_SERVICES], is_pid(Pid)],
     ok.
 
+%% Runs in root before the namespace is created. The release's dependency modules (everything
+%% but the project's own app and its consolidated protocols) are loaded once into a dep domain
+%% registered under the hash of their (module, md5) set, so every deployment with the same
+%% dependencies shares them. Returns the options for `arinsal_ns:create/3` (`dep_domain`) and
+%% the plan for `start/3`, which then loads only the project's own modules.
+-spec prepare(map()) -> {ok, map(), map()} | {error, term()}.
+prepare(#{modules := Modules0, release := {Name, _}} = Plan) ->
+    Modules = without_preloaded(Modules0),
+    _ = preload_base(Modules),
+    {Own, Deps} = lists:partition(fun({_, Path}) -> own_module(Path, Name) end, Modules),
+    Hash = arinsal_code:deployment_hash([{M, md5(Path)} || {M, Path} <- Deps]),
+    case global:trans({?MODULE, Hash}, fun() -> dep_domain(Hash, Deps) end) of
+        {ok, Domain} -> {ok, #{dep_domain => Domain}, Plan#{modules := Own}};
+        {error, Reason} -> {error, {dep_domain, Reason}}
+    end.
+
+dep_domain(Hash, Deps) ->
+    case arinsal_code:dep_domain(Hash) of
+        {ok, Domain} ->
+            {ok, Domain};
+        none ->
+            Beams = [{M, Bin} || {M, Path} <- Deps, not erlang:module_loaded(M),
+                                 {ok, Bin} <- [file:read_file(Path)]],
+            Domain = arinsal_code:new_dep_domain(Hash),
+            case arinsal_code:load(Domain, Beams) of
+                ok -> {ok, Domain};
+                {error, Reason} -> {error, Reason}
+            end
+    end.
+
+%% A module of the project itself: its beam is in `lib/<Name>-<Vsn>/ebin`, or it is a
+%% consolidated protocol (`releases/<Vsn>/consolidated`), which depends on the project's impls.
+own_module(Path0, Name) ->
+    Path = to_list(Path0),
+    Dir = filename:dirname(Path),
+    filename:basename(Dir) =:= "consolidated" orelse
+        lists:prefix(to_list(Name) ++ "-", filename:basename(filename:dirname(Dir))).
+
+%% Preloaded modules (erlang, erts_internal, prim_*) are always in the base.
+without_preloaded(Modules) ->
+    Preloaded = erlang:pre_loaded(),
+    [{M, P} || {M, P} <- Modules, not lists:member(M, Preloaded)].
+
 -spec start(pos_integer(), map(), map()) -> {ok, pid()} | {error, term()}.
 start(Ns, #{modules := Modules0} = Plan0, #{group_leader := Leader} = Opts) ->
     expose_root_services(),
-    %% Preloaded modules (erlang, erts_internal, prim_*) are always in the base; some of them
-    %% are root only, even their module_info.
-    Preloaded = erlang:pre_loaded(),
-    Modules = [{M, P} || {M, P} <- Modules0, not lists:member(M, Preloaded)],
+    Modules = without_preloaded(Modules0),
     Plan = Plan0#{modules := Modules},
     _ = preload_base(Modules),
     {module, _} = code:ensure_loaded(arinsal_ns_kernel),
@@ -240,14 +281,8 @@ load_batches([{M, Path} | Rest], Acc) ->
 %% A module the chain already resolves to an identical instance is skipped before it is parsed;
 %% finish_loading would dedup it anyway.
 already_here(M, Bin) ->
-    try
-        erlang:module_loaded(M) andalso
-            {ok, {M, M:module_info(md5)}} =:= beam_lib:md5(Bin)
-    catch
-        %% A module whose natives are root only (erl_ddll) answers even module_info with
-        %% notsup; it is loaded in the base and the namespace cannot use it anyway.
-        error:notsup -> true
-    end.
+    erlang:module_loaded(M) andalso
+        {ok, {M, M:module_info(md5)}} =:= beam_lib:md5(Bin).
 
 finish(Acc) ->
     {Mods, Prepared} = lists:unzip(lists:reverse(Acc)),
@@ -269,7 +304,8 @@ loop(#{args := Args, status := Status, boot := Boot} = S) ->
         {From, {ensure_loaded, _}} -> From ! {init, not_allowed}, loop(S);
         {From, {get_configfd, _}} -> From ! {init, none}, loop(S);
         {From, get_script_name} -> From ! {init, none}, loop(S);
-        {stop, Reason} -> exit({stop, Reason});
+        %% `init:stop/0,1` and `halt` inside a namespace destroy the namespace.
+        {stop, _} -> erlang:halt();
         {'EXIT', _, _} -> loop(S);
         _ -> loop(S)
     end.
