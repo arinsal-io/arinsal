@@ -152,6 +152,12 @@ fn process_send_inner(
     port: Term,
     message: Term,
 ) -> Result<(), VmError> {
+    // arl: a send to a port of another namespace is dropped, like one to a dead port.
+    if let Some(id) = port.as_port()
+        && !arl_port_ns_ok(process, id)
+    {
+        return Ok(());
+    }
     let nosuspend = SEND_NOSUSPEND.with(Cell::get);
     match send_from_process(process, port, message, nosuspend, ctx)? {
         PortSend::Sent => Ok(()),
@@ -220,6 +226,8 @@ pub(crate) struct PortHandle {
     wake_w: Option<OwnedFd>,
     wake_needed: AtomicBool,
     framing: Option<(u8, usize)>,
+    /// arl: namespace of the process that opened the port (0 is root).
+    arl_ns: u32,
     owner: Mutex<Pid>,
     links: Mutex<HashSet<Pid>>,
     monitors: Mutex<HashMap<u64, PortMonitor>>,
@@ -908,6 +916,12 @@ fn start(
 ) -> Result<Term, VmError> {
     let parsed_opts = options(opts).ok_or_else(badarg)?;
     let spec = tuple(spec).ok_or_else(badarg)?;
+    // arl: a namespace may open only the inet socket drivers.
+    if process.ns != 0 && !arl_ns_may_open(&spec) {
+        return Err(VmError::Trap(crate::exceptions::Trap::error(atom(
+            "notsup",
+        ))));
+    }
     if let [kind, input, output] = spec.as_slice() {
         if *kind != atom("fd") {
             return Err(badarg());
@@ -2408,6 +2422,9 @@ fn make_handle_with(
         wake_w,
         wake_needed: AtomicBool::new(true),
         framing,
+        arl_ns: scheduler
+            .ns_word(owner)
+            .map_or(0, |word| word & arinsal_sched::NS_ID_MASK),
         owner: Mutex::new(owner),
         links: Mutex::new(HashSet::from([owner])),
         monitors: Mutex::new(HashMap::new()),
@@ -3288,6 +3305,12 @@ pub(crate) fn family(
     if module != "erts_internal" && module != "erlang" {
         return None;
     }
+    // arl: a process of a namespace reaches only the ports of its own namespace.
+    if process.ns != 0
+        && let Some(refused) = arl_port_guard(process, module, function, args)
+    {
+        return Some(refused);
+    }
     let result = match (function, args) {
         ("open_port", [spec, opts]) if module == "erts_internal" => {
             start(vm, process, ctx, *spec, *opts)
@@ -3925,6 +3948,10 @@ pub(crate) fn exit_port(
     reason: Term,
 ) -> Result<(), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
+    // arl: an exit signal to a port of another namespace is dropped.
+    if !arl_port_ns_ok(process, id) {
+        return Ok(());
+    }
     // Port of erts/emulator/beam/io.c:3854 (deliver_port_exit): `kill` reaches links as `killed`.
     let reason = if reason == atom("kill") {
         atom("killed")
@@ -4207,6 +4234,10 @@ pub(crate) fn owner_exit(
 pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Result<bool, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    // arl: a link across namespaces is refused as for a dead port.
+    if linked && !arl_port_ns_ok(process, id) {
+        return Ok(false);
+    }
     let Some(handle) = runtime.ports.lock().unwrap().get(&id).cloned() else {
         return Ok(!linked);
     };
@@ -4270,6 +4301,10 @@ pub(crate) fn monitor(
     monitored: bool,
 ) -> Result<bool, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
+    // arl: a monitor across namespaces is refused as for a dead port.
+    if monitored && !arl_port_ns_ok(process, id) {
+        return Ok(false);
+    }
     let handle = process
         .runtime
         .as_ref()
@@ -4774,16 +4809,23 @@ pub(crate) fn trace_command(process: &mut Process, port: Term, event: Term) -> R
 fn ports(_vm: &mut Vm, process: &mut Process) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:4125 (ports/0), OTP-29.1.1.
     // The forker is port zero and exists even when no user port is open.
-    let mut values = vec![Term::port(0).expect("standard I/O port tag")];
+    // arl: port zero (the forker) is root's; a namespace sees only its own ports.
+    let mut values = if process.ns == 0 {
+        vec![Term::port(0).expect("standard I/O port tag")]
+    } else {
+        Vec::new()
+    };
     if let Some(runtime) = &process.runtime {
         values.extend(
             runtime
                 .ports
                 .lock()
                 .unwrap()
-                .keys()
-                .filter(|id| **id != 0)
-                .filter_map(|id| Term::port(*id)),
+                .iter()
+                .filter(|(id, handle)| {
+                    **id != 0 && (process.ns == 0 || handle.arl_ns == process.ns)
+                })
+                .filter_map(|(id, _)| Term::port(*id)),
         );
     }
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -4954,4 +4996,92 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     TermBuilder::new(&mut heap)
         .list_from_iter(tuples)
         .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")))
+}
+
+/// arl: whether `process` may act on port `id`: root always, a namespace only on its own
+/// ports. A port that does not exist is left to the ordinary path; port zero is root's.
+fn arl_port_ns_ok(process: &Process, id: u64) -> bool {
+    if process.ns == 0 {
+        return true;
+    }
+    if id == 0 {
+        return false;
+    }
+    process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).map(|h| h.arl_ns))
+        .is_none_or(|ns| ns == process.ns)
+}
+
+/// arl: the inet socket drivers `gen_tcp`, `gen_udp` and `gen_sctp` open.
+const ARL_NS_DRIVERS: &[&str] = &["tcp_inet", "udp_inet", "sctp_inet"];
+
+/// arl: whether a process of a namespace may open the port described by `spec`.
+fn arl_ns_may_open(spec: &[Term]) -> bool {
+    let [kind, cmd] = spec else {
+        return false;
+    };
+    if *kind != atom("spawn_driver") {
+        return false;
+    }
+    let name = match cmd.as_atom() {
+        Some(name) => global_atoms().text(name).map(|text| text.to_string()),
+        None => bytes(*cmd).and_then(|raw| String::from_utf8(raw).ok()),
+    };
+    name.is_some_and(|name| ARL_NS_DRIVERS.contains(&name.as_str()))
+}
+
+/// arl: the port natives of a namespace process. `None` lets the call through. A call on a
+/// port of another namespace answers like a missing port (`badarg`), and `port_connect`
+/// refuses a new owner of another namespace.
+fn arl_port_guard(
+    process: &Process,
+    module: &str,
+    function: &str,
+    args: &[Term],
+) -> Option<Result<Term, VmError>> {
+    let port_arg = matches!(
+        function,
+        "port_command"
+            | "port_close"
+            | "port_connect"
+            | "port_control"
+            | "port_call"
+            | "port_info"
+            | "port_get_data"
+            | "port_set_data"
+    );
+    if !port_arg {
+        return None;
+    }
+    let refuse = || {
+        if module == "erlang" {
+            Err(badarg())
+        } else {
+            Ok(atom("badarg"))
+        }
+    };
+    let id = args.first().and_then(|port| port.as_port())?;
+    if !arl_port_ns_ok(process, id) {
+        return Some(if function == "port_info" {
+            Ok(atom("undefined"))
+        } else {
+            refuse()
+        });
+    }
+    if function == "port_connect"
+        && let Some(pid) = args.get(1).and_then(|pid| Pid::from_term(*pid))
+    {
+        let foreign = process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.scheduler().ok())
+            .and_then(|scheduler| scheduler.ns_word(pid))
+            .is_some_and(|word| word & arinsal_sched::NS_ID_MASK != process.ns);
+        if foreign {
+            return Some(refuse());
+        }
+    }
+    None
 }
