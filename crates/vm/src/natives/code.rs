@@ -353,6 +353,7 @@ struct Prepared {
     has_on_load: bool,
     /// Loaded code from `prepare_loading`; taken by the first `finish_loading`.
     module: Mutex<Option<arinsal_loader::Module>>,
+    // arl: code domains.
     /// Code domain of the preparing process (the first domain of its chain). `finish_loading`
     /// loads there even when another process finishes, as `code_server` does for
     /// `code:load_binary/3`.
@@ -431,6 +432,7 @@ fn info_list(
 
 fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let name = args[0].as_atom().ok_or_else(badarg)?;
+    // arl: the module the process's code chain sees.
     let id = vm.module_for_process(process, name).ok_or_else(badarg)?;
     let module = &vm.code.modules[id];
     let meta = vm.code.code_meta[id].as_ref().ok_or_else(badarg)?;
@@ -451,7 +453,7 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                     return Err(badarg());
                 };
                 let mut exports = Vec::new();
-                // A domain instance is not in the node's export index: its own export table,
+                // arl: a domain instance is not in the node's export index: its own export table,
                 // in the same reverse insertion order.
                 if module.domain != crate::code_domains::BASE {
                     for export in module.exports.iter().rev() {
@@ -582,6 +584,7 @@ pub(crate) fn module_loaded_light(
         return None;
     };
     let name = module.as_atom()?;
+    // arl: the module the process's code chain sees.
     let chain = process.code_chain.as_deref();
     let loaded = process
         .runtime
@@ -607,6 +610,7 @@ pub(crate) fn function_exported_light(
     let function = function.as_atom()?;
     let function_name = global_atoms().text(function)?;
     let arity = u8::try_from(arity.as_small().filter(|n| (0..=255).contains(n))?).ok()?;
+    // arl: the module the process's code chain sees.
     let chain = process.code_chain.as_deref();
     let exported = process.runtime.as_ref()?.with_active_code(|_, tables| {
         tables.module_in_chain(chain, module).is_some_and(|id| {
@@ -673,6 +677,7 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         beam: Mutex::new(Some(beam)),
         bytes: Mutex::new(bytes),
         module: Mutex::new(Some(module)),
+        // arl: the preparing process's domain.
         domain: process
             .code_chain
             .as_deref()
@@ -790,6 +795,7 @@ fn finish_stage(
         prepared_refs.push(prepared);
         prepared_modules.push((module, registers, meta));
     }
+    // arl: code prepared in a domain loads into that domain.
     if prepared_refs
         .iter()
         .any(|prepared| prepared.domain != crate::code_domains::BASE)
@@ -1394,6 +1400,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
 
 pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
     super::listed(IMPLEMENTED, module, function, arity)
+        // arl: arinsal_code natives.
         || super::listed(crate::code_domains::IMPLEMENTED, module, function, arity)
 }
 
@@ -1528,6 +1535,7 @@ fn call_values(
     if !recognizes(module, function, arity) {
         return None;
     }
+    // arl: arinsal_code natives.
     if module == "arinsal_code" {
         return Some(crate::code_domains::call(vm, process, ctx, function, args));
     }
@@ -1564,6 +1572,7 @@ fn call_values(
         }
         ("erlang", "module_loaded", 1) => Some((|| {
             let name = args[0].as_atom().ok_or_else(badarg)?;
+            // arl: the module the process's code chain sees.
             Ok(Term::atom(
                 if vm.module_for_process(process, name).is_some() {
                     atoms::TRUE
@@ -1612,6 +1621,7 @@ fn call_values(
                 .as_small()
                 .filter(|n| (0..=255).contains(n))
                 .ok_or_else(badarg)? as u8;
+            // arl: the module the process's code chain sees.
             let result = global_atoms()
                 .get(&name)
                 .and_then(|name| vm.module_for_process(process, name))

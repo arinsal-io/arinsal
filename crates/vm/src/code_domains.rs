@@ -17,7 +17,8 @@ use arinsal_loader::Module;
 use arinsal_sched::RunCtx;
 use arinsal_term::{Atom, Term, TermBuilder, global_atoms};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A code domain; [`BASE`] is the node's ordinary module table.
 pub(crate) type DomainId = u32;
@@ -136,6 +137,28 @@ impl Vm {
         self.code.module_in_chain(p.code_chain.as_deref(), module)
     }
 
+    /// The chain of `domains`: one domain alone stands for its own chain, a list is taken as
+    /// given; a trailing base is added when missing. `Some(None)` is the base-only chain;
+    /// `None` when the chain names an unknown domain.
+    pub(crate) fn code_chain_of(
+        &mut self,
+        mut domains: Vec<DomainId>,
+    ) -> Option<Option<DomainChain>> {
+        self.refresh_code();
+        if let [domain] = domains[..]
+            && domain != BASE
+        {
+            return self.code.domains.chain(domain).cloned().map(Some);
+        }
+        if domains.last() != Some(&BASE) {
+            domains.push(BASE);
+        }
+        if !self.code.domains.valid_chain(&domains) {
+            return None;
+        }
+        Some((domains.len() > 1).then(|| domains.into()))
+    }
+
     /// Creates a domain under `parents`.
     pub(crate) fn new_code_domain(&mut self, parents: &[DomainId]) -> Option<DomainId> {
         let id = self
@@ -205,9 +228,22 @@ impl Vm {
             return Err(("duplicated", duplicates));
         }
         let mut install = Vec::with_capacity(prepared.len());
+        let mut base_loads = Vec::new();
         for (module, registers, meta) in prepared {
             let name = module.name_atom;
-            if let Some(id) = self.code.module_in_chain(Some(&chain), name) {
+            let visible = self.code.module_in_chain(Some(&chain), name);
+            if visible.is_none()
+                && let Some(root) = self.root_path_beam(name)
+            {
+                if meta.md5.is_some() && meta.md5 == Some(root.md5) {
+                    base_loads.push(name);
+                    continue;
+                }
+                if !(root.protocol && is_protocol(&module)) {
+                    return Err(("not_allowed", vec![name]));
+                }
+            }
+            if let Some(id) = visible {
                 let visible_md5 = self
                     .code
                     .code_meta
@@ -226,6 +262,12 @@ impl Vm {
                 return Err(("on_load", vec![name]));
             }
             install.push((module, registers, meta));
+        }
+        for name in base_loads {
+            let text = global_atoms().text(name).unwrap_or_default().to_owned();
+            if self.load_named(&text).is_err() {
+                return Err(("badfile", vec![name]));
+            }
         }
         if install.is_empty() {
             return Ok(());
@@ -251,7 +293,52 @@ impl Vm {
 /// A consolidated Elixir protocol may shadow the base one: each project consolidates its
 /// protocols over its own implementations.
 fn shadows_protocol(module: &Module, base: &Module) -> bool {
-    module.export_slot("__protocol__", 1).is_some() && base.export_slot("__protocol__", 1).is_some()
+    is_protocol(module) && is_protocol(base)
+}
+
+fn is_protocol(module: &Module) -> bool {
+    module.export_slot("__protocol__", 1).is_some()
+}
+
+/// What a domain load compares with for a module of the base's code path that is not loaded.
+#[derive(Clone, Copy)]
+pub(crate) struct RootBeam {
+    md5: [u8; 16],
+    protocol: bool,
+}
+
+/// md5 and protocol flag of each beam file read from a root code path, by file path. OTP and
+/// Elixir library files do not change while a node runs.
+fn root_beams() -> &'static Mutex<HashMap<PathBuf, Option<RootBeam>>> {
+    static BEAMS: OnceLock<Mutex<HashMap<PathBuf, Option<RootBeam>>>> = OnceLock::new();
+    BEAMS.get_or_init(Default::default)
+}
+
+impl Vm {
+    /// The beam the base would load for `module` from the node's code path, when the base has
+    /// not loaded it: the load of a domain compares with it instead of making a private copy.
+    fn root_path_beam(&self, module: Atom) -> Option<RootBeam> {
+        if self.code.loaded.contains_key(&module) {
+            return None;
+        }
+        let file = format!("{}.beam", global_atoms().text(module)?);
+        let path = self
+            .paths
+            .iter()
+            .map(|dir| dir.join(&file))
+            .find(|path| path.is_file())?;
+        let mut cache = root_beams().lock().unwrap_or_else(|e| e.into_inner());
+        *cache.entry(path).or_insert_with_key(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            let md5 = arinsal_loader::module_uniq(&bytes).ok()?;
+            let protocol = arinsal_beam::parse(&bytes).ok().is_some_and(|beam| {
+                beam.exports.iter().any(|export| {
+                    export.arity == 1 && beam.atom(export.function_atom) == Some("__protocol__")
+                })
+            });
+            Some(RootBeam { md5, protocol })
+        })
+    }
 }
 
 /// `arinsal_code` test and boot natives. All but `chain/1` are root only.
@@ -286,7 +373,7 @@ fn domain_list(term: Term) -> Option<Vec<DomainId>> {
 }
 
 fn require_root(process: &Process) -> Result<(), VmError> {
-    if process.code_chain.is_some() {
+    if process.code_chain.is_some() || process.ns != 0 {
         return Err(badarg());
     }
     Ok(())
@@ -345,11 +432,7 @@ pub(crate) fn call(
             if chain.last() != Some(&BASE) {
                 chain.push(BASE);
             }
-            vm.refresh_code();
-            if !vm.code.domains.valid_chain(&chain) {
-                return Err(badarg());
-            }
-            let chain: Option<DomainChain> = (chain.len() > 1).then(|| chain.into());
+            let chain = vm.code_chain_of(chain).ok_or_else(badarg)?;
             let saved = std::mem::replace(&mut process.code_chain, chain);
             let created = crate::signals::erl_create_process(
                 vm,

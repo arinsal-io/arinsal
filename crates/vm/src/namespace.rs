@@ -31,6 +31,8 @@ pub(crate) struct NsEntry {
     /// OS environment of the namespace: a set value, or `None` for a variable that was
     /// unset. Variables not listed here fall back to [`ENV_ALLOWLIST`] of the node.
     env: RwLock<BTreeMap<OsString, Option<OsString>>>,
+    /// Code lookup chain of every process of this namespace; `None` resolves in the base only.
+    pub(crate) code_chain: Option<crate::code_domains::DomainChain>,
 }
 
 /// Variables a namespace still reads from the process-wide environment. Everything else of
@@ -91,6 +93,7 @@ impl NsTable {
         project: Vec<u8>,
         max_processes: u64,
         max_bytes: u64,
+        code_chain: Option<crate::code_domains::DomainChain>,
     ) -> Arc<NsEntry> {
         let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let id = entries.len() as u32 + 1;
@@ -104,6 +107,7 @@ impl NsTable {
             alive: AtomicBool::new(true),
             names: OnceLock::new(),
             env: RwLock::new(BTreeMap::new()),
+            code_chain,
         });
         entries.push(entry.clone());
         entry
