@@ -517,7 +517,8 @@ impl Vm {
                             && slot.entry.arity == entry.arity
                     })
                     .map(|slot| (id, slot.target))
-            });
+            })
+            .or_else(|| self.domain_local_fun(entry));
         let Some((module_id, target)) = found else {
             // Port of erts/emulator/beam/beam_common.c:1702-1712 (call_fun), OTP-29.1.1:
             // current code without this fun is `badfun`; no current code goes to
@@ -915,28 +916,40 @@ impl Vm {
                 "BIF {module}:{function}/{arity}"
             )));
         }
-        // Same as `call_import`: a not-yet-loaded `-on_load` module has to go
-        // through `code_server` or its NIF stubs run.
-        if self.unloaded_on_load(p, module) {
-            return self.call_undefined_function_with_ctx(p, module, function, arity, tail, ctx);
-        }
-        let module_id = match self.load_named_traced(p, module) {
-            Ok(id) => id,
-            Err(_) if self.should_autoload(p, module) => {
-                // mix_loop1: OTP calls error_handler:undefined_function/3, which
-                // code:ensure_loaded's from the code server path. Vm paths do
-                // not include Mix archives added with code:add_pathz/1.
-                if crate::calls::trace_boot_enabled() {
-                    eprintln!("arinsal boot: autoload {module}:{function}/{arity}");
-                }
+        // A process with a code chain reaches the instances of its own domains first.
+        let domain_module = p.code_chain.as_ref().and_then(|_| {
+            let atom = atoms
+                .map(|(module, _)| module)
+                .or_else(|| global_atoms().get(module))?;
+            self.process_domain_module(p, atom)
+        });
+        let module_id = if let Some(id) = domain_module {
+            id
+        } else {
+            // Same as `call_import`: a not-yet-loaded `-on_load` module has to go
+            // through `code_server` or its NIF stubs run.
+            if self.unloaded_on_load(p, module) {
                 return self
                     .call_undefined_function_with_ctx(p, module, function, arity, tail, ctx);
             }
-            Err(_) => {
-                return Err(VmError::Exception {
-                    reason: "undef".into(),
-                    frame: format!("{module}:{function}/{arity}"),
-                });
+            match self.load_named_traced(p, module) {
+                Ok(id) => id,
+                Err(_) if self.should_autoload(p, module) => {
+                    // mix_loop1: OTP calls error_handler:undefined_function/3, which
+                    // code:ensure_loaded's from the code server path. Vm paths do
+                    // not include Mix archives added with code:add_pathz/1.
+                    if crate::calls::trace_boot_enabled() {
+                        eprintln!("arinsal boot: autoload {module}:{function}/{arity}");
+                    }
+                    return self
+                        .call_undefined_function_with_ctx(p, module, function, arity, tail, ctx);
+                }
+                Err(_) => {
+                    return Err(VmError::Exception {
+                        reason: "undef".into(),
+                        frame: format!("{module}:{function}/{arity}"),
+                    });
+                }
             }
         };
         let Some(target) = self.code.modules[module_id].export(function, arity as u8) else {

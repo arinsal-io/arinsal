@@ -1344,6 +1344,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
 
 pub(crate) fn recognizes(module: &str, function: &str, arity: u8) -> bool {
     super::listed(IMPLEMENTED, module, function, arity)
+        || super::listed(crate::code_domains::IMPLEMENTED, module, function, arity)
 }
 
 fn notsup() -> VmError {
@@ -1476,6 +1477,9 @@ fn call_values(
     let arity = args.len() as u8;
     if !recognizes(module, function, arity) {
         return None;
+    }
+    if module == "arinsal_code" {
+        return Some(crate::code_domains::call(vm, process, ctx, function, args));
     }
     match (module, function, args.len()) {
         // Port of erts/emulator/beam/erl_bif_coverage.c:39-45, OTP-29.1.1.

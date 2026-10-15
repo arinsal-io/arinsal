@@ -224,6 +224,7 @@ pub fn implemented_natives() -> &'static [(&'static str, &'static str, u8)] {
         let mut entries = Vec::new();
         for table in [
             code::IMPLEMENTED,
+            crate::code_domains::IMPLEMENTED,
             erl_debugger::IMPLEMENTED,
             erts_debug::IMPLEMENTED,
             dist::IMPLEMENTED,
