@@ -404,6 +404,7 @@ dependencies = [
  "arinsal-spec",
  "arinsal-term",
  "libc",
+ "md-5",
  "mio",
  "num-bigint",
  "num-traits",

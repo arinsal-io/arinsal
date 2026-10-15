@@ -146,7 +146,19 @@ pub(crate) fn destroy_namespace(process: &Process, ctx: &mut RunCtx<'_, Message>
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
-    runtime.namespaces.close(ns);
+    let closed = runtime.namespaces.close(ns);
+    // The namespace's code names become unreachable now; its instances are freed once its
+    // processes are gone.
+    if closed && let Some(entry) = runtime.namespaces.get(ns) {
+        crate::code_domains::drop_ns_code(
+            runtime,
+            ns,
+            &crate::code_domains::NsCode {
+                chain: entry.code_chain.clone(),
+                owns_first: entry.owns_code_domain,
+            },
+        );
+    }
     let Ok(scheduler) = runtime.scheduler() else {
         return;
     };
