@@ -8061,8 +8061,15 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                 if !thread.wake.load(Ordering::SeqCst) {
                     // Port of erts/emulator/beam/erl_process.c (scheduler_wait): `sleep`
                     // wraps only the blocking wait; the spin above counts as `other`.
+                    // A dirty scheduler has no timers, so it sleeps until woken. A spurious
+                    // `park` return must not re-enter the spin.
                     thread.stats.lock().unwrap().set_state(MsaccState::Sleep);
-                    thread::park_timeout(Duration::from_millis(100));
+                    while !thread.wake.load(Ordering::SeqCst)
+                        && !inner.stopped.load(Ordering::Acquire)
+                        && !inner.halt_requested.load(Ordering::Acquire)
+                    {
+                        thread::park();
+                    }
                     thread.stats.lock().unwrap().set_state(MsaccState::Other);
                 }
                 queue = pool.queue.lock().unwrap();
