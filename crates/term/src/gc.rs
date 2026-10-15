@@ -1418,6 +1418,13 @@ impl ProcessHeap {
         let error = copier.error.take();
         let promoted = ((copier.old_htop.at - tenured_from) / 8) as u64;
         drop(copier);
+        // ErlHeapFragment headers live inside the fragment block in erts; here the fragment
+        // list is a Vec, so keep its buffer for the next cycle instead of a malloc/free per GC.
+        let mut spare = std::mem::take(&mut from.fragments);
+        spare.clear();
+        if self.fragments.is_empty() {
+            self.fragments = spare;
+        }
         drop(from);
         self.frame_pointer = new_frame_pointer;
         if let Some(error) = error {
