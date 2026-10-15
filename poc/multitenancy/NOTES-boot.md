@@ -192,6 +192,11 @@ All 100 answered `/t/1/items/1` with 200; `init:stop()` in ns 1 destroyed only n
   the code deltas after ns 15 are missing. RSS grows by about 4.3 MB per namespace between 10
   and 100, which is far above the ~0.7 MB of heap, ETS and code the namespace accounts for;
   not investigated (allocator retention, interpreted-code metadata or per-process overhead).
+- ns_boot_e2e after this chunk: the deploys and both curls pass, but the root probe stopped
+  updating during the second deploy although its `erlang:memory/0` runs in a helper with a
+  timeout. So the stall also reaches `arinsal_ns:info/1`, `arinsal_ns:list/0` or `prim_file` in
+  root, not only `erlang:memory/0`. The e2e fails at the "two namespaces" check until the code
+  stream fixes the stall.
 
 ## Gaps
 
