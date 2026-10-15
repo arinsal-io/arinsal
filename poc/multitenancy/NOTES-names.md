@@ -37,11 +37,31 @@
   - Writes (and anything with `write == true` in `allowed`) to a table of another ns are refused.
   - The per-scheduler table cache (`with_cached_table`, the BeamAsm direct path) declines tables of
     another ns, so those calls take the registry path and the checks above.
-  - `ets:all/0` lists only the caller's ns (root sees only its own tables too).
+  - `ets:all/0` lists only the caller's ns; root lists every table and may access any table by tid
+    (root is trusted). Named lookup from root still resolves root names only.
   - `give_away/3` and the `heir` option of `new/2` and `setopts/2` need a live pid of the same ns, else badarg.
 - Gaps: a table survives only as long as its owner (no ns-level free on destroy besides owner exit);
   `erlang:system_info(ets_count)` and the ETS memory statistic are node-wide; heir hand-over at owner
   exit is not rechecked (the heir was checked when set).
+
+## Chunk 3: persistent_term, OS env (done)
+- persistent_term: a ns process registers with its own store, `store_for(arl_ns_scope(code_scope, ns))`
+  (crates/pterm/src/lib.rs; `Process::arl_bind_ns_store`, called in `erl_create_process` after the
+  ns is set). Every put/get/erase/get-0/info path already goes through `process._persistent_terms.store()`,
+  so nothing else changed. Root keeps the node store.
+  - Literal safety: namespace stores have no area collector, and a ns process may hold references
+    into areas of another store. Once any ns store exists, `arl_keep_alive` leaks every area retired
+    by a put/erase or a module purge, in any store. Cost: memory of replaced or purged persistent
+    terms and purged module literals is never returned after the first namespace is created.
+  - Stores of destroyed namespaces are never freed (same leak as before).
+- OS env (crates/vm/src/natives/env.rs): `NsEntry.env` is an overlay (`Some` set, `None` unset).
+  `os:getenv/1`, `os:env/0` (so `getenv/0,2` too), `putenv/2`, `unsetenv/1` from a ns use it.
+  A name that is not in the overlay falls back to the node environment only for the allowlist
+  `PATH`, `HOME`, `LANG`, `TZ` (`namespace::ENV_ALLOWLIST`); nothing else of the node env is visible.
+  `arinsal_ns:create/3` takes `os_env => [{K, V}]` (strings or binaries) and seeds the overlay.
+  Port programs and drivers still use the node environment (root only).
+- Destroy: owner exit deletes the ETS tables of a destroyed ns and releases its registered names
+  (`ns_ets_destroy_frees`); the empty name table and pterm store stay.
 
 ## Run
 ```
@@ -49,6 +69,7 @@ export CARGO_TARGET_DIR=/Users/sts/dev/sq/arinsal-prs/target-mt-names
 export PATH=/Users/sts/dev/sq/arinsal-prs/bin:/opt/homebrew/opt/erlang@29/bin:/opt/homebrew/opt/elixir/bin:$PATH
 cargo test -p arinsal-vm --test ns_names
 cargo test -p arinsal-vm --test ns_ets
+cargo test -p arinsal-vm --test ns_pterm --test ns_env
 cargo test -p arinsal-vm --test ns_core
 cargo test -p arinsal-vm --lib register
 ```

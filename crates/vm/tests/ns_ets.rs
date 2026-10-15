@@ -113,8 +113,8 @@ ns_ets_tid_cross_ns_badarg() ->
     end)),
     T = recv_tab(),
     settle(),
-    FromRoot = [catch ets:lookup(T, k), catch ets:insert(T, {k2, x}), ets:info(T),
-                ets:info(T, size), ets:whereis(named1), ets:info(named1), catch ets:lookup(named1, k)],
+    FromRoot = [catch ets:lookup(T, k), catch ets:insert(T, {k2, x}), ets:info(T, size),
+                ets:whereis(named1), ets:info(named1), catch ets:lookup(named1, k)],
     FromN2 = in_ns(N2, fun() ->
         [catch ets:lookup(T, k), catch ets:insert(T, {k2, x}), catch ets:delete(T),
          ets:info(T), catch ets:lookup(named1, k), ets:whereis(named1)]
@@ -124,8 +124,7 @@ ns_ets_tid_cross_ns_badarg() ->
     Own = await(H1),
     ok = await(N1Named),
     case {FromRoot, FromN2, Own} of
-        {[{'EXIT', {badarg, _}}, {'EXIT', {badarg, _}}, undefined, undefined, undefined, undefined,
-          {'EXIT', {badarg, _}}],
+        {[[{k, own}], true, 2, undefined, undefined, {'EXIT', {badarg, _}}],
          [{'EXIT', {badarg, _}}, {'EXIT', {badarg, _}}, {'EXIT', {badarg, _}}, undefined,
           {'EXIT', {badarg, _}}, undefined],
          {[{k, own}], true, true}} -> ok;
@@ -188,9 +187,27 @@ ns_ets_all_filtered() ->
     check(H2),
     R1 = await(H1),
     R2 = await(H2),
-    Leaked = [N || N <- [a1, b1], lists:member(N, RootAll)],
-    case {R1, R2, Leaked, lists:member(r_named, RootAll)} of
-        {{2, true, false, false}, {1, false, true, false}, [], true} -> ok;
+    case {R1, R2, lists:member(r_named, RootAll)} of
+        {{2, true, false, false}, {1, false, true, false}, true} -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_ets_all_root_sees_all() ->
+    N1 = mk(<<"acme">>),
+    N2 = mk(<<"globex">>),
+    H1 = holder(N1, fun() -> a1 = ets:new(a1, [named_table]), _ = ets:new(unnamed, []), ok end,
+                fun(_) -> ok end),
+    H2 = holder(N2, fun() -> b1 = ets:new(b1, [named_table]), ok end, fun(_) -> ok end),
+    r_named = ets:new(r_named, [named_table]),
+    RootOwn = ets:new(root_unnamed, []),
+    settle(),
+    All = ets:all(),
+    check(H1),
+    check(H2),
+    ok = await(H1),
+    ok = await(H2),
+    case {[lists:member(N, All) || N <- [a1, b1, r_named]], lists:member(RootOwn, All), length(All) >= 5} of
+        {[true, true, true], true, true} -> ok;
         Other -> {bad, Other}
     end.
 
@@ -227,6 +244,25 @@ ns_ets_give_away_cross_ns_badarg() ->
         {{'EXIT', {badarg, _}}, {'EXIT', {badarg, _}}, {'EXIT', {badarg, _}},
          {{'EXIT', {badarg, _}}, {'EXIT', {badarg, _}}, {'EXIT', {badarg, _}}, true}, true} -> ok;
         Other -> {bad, Other}
+    end.
+
+ns_ets_destroy_frees() ->
+    Ns = mk(<<"acme">>),
+    H = holder(Ns, fun() ->
+        dt = ets:new(dt, [named_table, public]),
+        _ = ets:new(unnamed, []),
+        register(dreg, self()),
+        ok
+    end, fun(_) -> ok end),
+    settle(),
+    Before = length(ets:all()),
+    ok = arinsal_ns:destroy(Ns),
+    _ = await(H),
+    settle(),
+    After = length(ets:all()),
+    case {Before - After, lists:member(dt, ets:all())} of
+        {2, false} -> ok;
+        Other -> {bad, Other, Before, After}
     end.
 
 ns_ets_root_unchanged() ->
@@ -293,8 +329,18 @@ fn ns_ets_all_filtered() {
 }
 
 #[test]
+fn ns_ets_all_root_sees_all() {
+    run("ns_ets_all_root_sees_all");
+}
+
+#[test]
 fn ns_ets_give_away_cross_ns_badarg() {
     run("ns_ets_give_away_cross_ns_badarg");
+}
+
+#[test]
+fn ns_ets_destroy_frees() {
+    run("ns_ets_destroy_frees");
 }
 
 #[test]

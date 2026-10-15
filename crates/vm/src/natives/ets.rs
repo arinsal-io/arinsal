@@ -310,18 +310,18 @@ fn table_guard<'a>(
 /// The calling process as the namespace checks see it: its namespace and the runtime that
 /// can tell whether a root process is shared.
 #[derive(Clone, Copy)]
-struct Who<'a> {
+struct ArlWho<'a> {
     ns: u32,
     rt: Option<&'a crate::process::Runtime>,
 }
 
-impl<'a> Who<'a> {
+impl<'a> ArlWho<'a> {
     /// The caller is known to be in the namespace of the table it touches.
-    fn local(ns: u32) -> Self {
+    fn arl_local(ns: u32) -> Self {
         Self { ns, rt: None }
     }
 
-    fn new(ns: u32, rt: &'a crate::process::Runtime) -> Self {
+    fn arl_new(ns: u32, rt: &'a crate::process::Runtime) -> Self {
         Self { ns, rt: Some(rt) }
     }
 
@@ -329,7 +329,7 @@ impl<'a> Who<'a> {
     /// is a shared root process.
     #[cold]
     #[inline(never)]
-    fn reads_foreign(&self, table_ns: u32, owner: Term) -> bool {
+    fn arl_reads_foreign(&self, table_ns: u32, owner: Term) -> bool {
         table_ns == 0
             && self.rt.is_some_and(|rt| {
                 Pid::from_term(owner)
@@ -340,23 +340,28 @@ impl<'a> Who<'a> {
 }
 
 /// True when `pid` is a live process of namespace `ns`, or is not alive at all.
-fn pid_in_ns(rt: &crate::process::Runtime, pid: Pid, ns: u32) -> bool {
+fn arl_pid_in_ns(rt: &crate::process::Runtime, pid: Pid, ns: u32) -> bool {
     rt.scheduler()
         .ok()
         .and_then(|scheduler| scheduler.ns_word(pid))
         .is_none_or(|word| word & arinsal_sched::NS_ID_MASK == ns)
 }
 
-fn resolve(who: Who<'_>, registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, ResolveFail> {
+fn resolve(
+    who: ArlWho<'_>,
+    registry: &arinsal_ets::Registry,
+    term: Term,
+) -> Result<Tid, ResolveFail> {
     if let Some(tid) = Tid::from_term(term) {
         let shared = registry.shared(tid).map_err(|_| ResolveFail::Missing)?;
-        if shared.options().ns != who.ns && !visible_foreign(who, shared) {
+        // arl: a table of another namespace is invisible unless root and shared; root sees all
+        if shared.options().arl_ns != who.ns && who.ns != 0 && !arl_visible_foreign(who, shared) {
             return Err(ResolveFail::Missing);
         }
         return Ok(tid);
     }
     if let Some(name) = term.as_atom() {
-        return whereis_named(who, registry, name).ok_or(ResolveFail::Missing);
+        return arl_whereis_named(who, registry, name).ok_or(ResolveFail::Missing);
     }
     Err(ResolveFail::BadType)
 }
@@ -364,29 +369,30 @@ fn resolve(who: Who<'_>, registry: &arinsal_ets::Registry, term: Term) -> Result
 /// A table of another namespace as `who` may see it: root tables of shared owners.
 #[cold]
 #[inline(never)]
-fn visible_foreign(who: Who<'_>, shared: &arinsal_ets::SharedTable) -> bool {
+fn arl_visible_foreign(who: ArlWho<'_>, shared: &arinsal_ets::SharedTable) -> bool {
     let table = shared.read();
-    who.reads_foreign(table.options.ns, table.options.owner)
+    who.arl_reads_foreign(table.options.arl_ns, table.options.owner)
 }
 
 /// A named table: the caller's namespace first, then root tables of shared owners.
-fn whereis_named(
-    who: Who<'_>,
+// arl: named lookup is scoped by namespace
+fn arl_whereis_named(
+    who: ArlWho<'_>,
     registry: &arinsal_ets::Registry,
     name: arinsal_term::Atom,
 ) -> Option<Tid> {
     if who.ns == 0 {
         return registry.whereis(name);
     }
-    registry.whereis_in(who.ns, name).or_else(|| {
+    registry.arl_whereis_in(who.ns, name).or_else(|| {
         let tid = registry.whereis(name)?;
-        visible_foreign(who, registry.shared(tid).ok()?).then_some(tid)
+        arl_visible_foreign(who, registry.shared(tid).ok()?).then_some(tid)
     })
 }
 
 // Port of erts/emulator/beam/erl_db.c:280-306 (tid2tab) and :805-910
 // (db_get_table_aux), OTP-29.1.1.
-fn handle(who: Who<'_>, registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, VmError> {
+fn handle(who: ArlWho<'_>, registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, VmError> {
     resolve(who, registry, term).map_err(|fail| match fail {
         ResolveFail::BadType => badarg_cause("type"),
         ResolveFail::Missing => badarg_cause("id"),
@@ -400,13 +406,17 @@ fn scheduler_count() -> usize {
 
 /// Live tables as `ets:all/0` prints them: names for named tables, ids otherwise.
 fn live_table_terms<H: HeapAlloc>(
-    who: Who<'_>,
+    who: ArlWho<'_>,
     registry: &arinsal_ets::Registry,
     heap: &mut H,
 ) -> Result<Vec<Term>, VmError> {
-    registry
-        .all_in(who.ns)
-        .into_iter()
+    // arl: a namespace lists its own tables; root lists all of them
+    let tids = if who.ns == 0 {
+        registry.all()
+    } else {
+        registry.arl_all_in(who.ns)
+    };
+    tids.into_iter()
         .map(|tid| {
             let table = registry.get(tid).map_err(err)?;
             if table.options.named_table {
@@ -417,9 +427,12 @@ fn live_table_terms<H: HeapAlloc>(
         })
         .collect()
 }
-fn allowed(table: &arinsal_ets::Table, caller: Term, who: Who<'_>, write: bool) -> bool {
-    if table.options.ns != who.ns
-        && (write || !who.reads_foreign(table.options.ns, table.options.owner))
+fn allowed(table: &arinsal_ets::Table, caller: Term, who: ArlWho<'_>, write: bool) -> bool {
+    // arl: a table of another namespace is refused for writes and for reads of unshared owners;
+    // root is trusted
+    if table.options.arl_ns != who.ns
+        && who.ns != 0
+        && (write || !who.arl_reads_foreign(table.options.arl_ns, table.options.owner))
     {
         return false;
     }
@@ -716,7 +729,8 @@ fn with_cached_table<R>(
         }
         let cache = cache.borrow();
         let (_, _, shared, options) = cache[slot].as_ref()?;
-        if options.ns != process.ns {
+        // arl: tables of another namespace take the registry path and its checks
+        if options.arl_ns != process.ns {
             return None;
         }
         body(shared, options, process)
@@ -754,7 +768,7 @@ fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let caller = direct_caller(process)?;
     let key = args[1];
     with_cached_table(process, args[0], |shared, options, process| {
-        let who = Who::local(options.ns);
+        let who = ArlWho::arl_local(options.arl_ns);
         let table = shared.read();
         if table.is_detached() || table.is_busy() || !allowed(&table, caller, who, false) {
             return None;
@@ -791,7 +805,7 @@ fn direct_member_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let caller = direct_caller(process)?;
     let key = args[1];
     with_cached_table(process, args[0], |shared, options, _| {
-        let who = Who::local(options.ns);
+        let who = ArlWho::arl_local(options.arl_ns);
         let table = shared.read();
         if table.is_detached() || table.is_busy() || !allowed(&table, caller, who, false) {
             return None;
@@ -832,7 +846,7 @@ fn direct_insert_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let caller = direct_caller(process)?;
     let object = args[1];
     with_cached_table(process, args[0], |shared, options, _| {
-        let who = Who::local(options.ns);
+        let who = ArlWho::arl_local(options.arl_ns);
         // The copy into table storage is the long part of an insert: do it before the
         // exclusive lock so readers are not held up behind it.
         let prepared = Table::prepare_object(options, object).ok()?;
@@ -870,7 +884,7 @@ fn direct_update_counter_cached(process: &mut Process, args: &[Term]) -> Option<
     let caller = direct_caller(process)?;
     let (key, operation, default) = (args[1], args[2], args.get(3).copied());
     with_cached_table(process, args[0], |shared, options, process| {
-        let who = Who::local(options.ns);
+        let who = ArlWho::arl_local(options.arl_ns);
         let (operations, single) = small_counter_ops(options.keypos, operation)?;
         // erl_db.c:1718-1726: a malformed default fails even when the key exists.
         if let Some(default) = default
@@ -924,7 +938,7 @@ fn insert_args(
         return insert_list(process, ctx, caller, insert_new, target, objects);
     }
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
-    let who = Who::new(process.ns, rt);
+    let who = ArlWho::arl_new(process.ns, rt);
     let registry = rt.ets.read().unwrap();
     let tid = handle(who, &registry, target)?;
     let shared = registry.shared(tid).map_err(err)?;
@@ -999,7 +1013,7 @@ fn insert_list(
 ) -> Result<Term, VmError> {
     const ITERATIONS_PER_RED: isize = 8;
     let rt = process.runtime.clone().ok_or_else(badarg)?;
-    let who = Who::new(process.ns, &rt);
+    let who = ArlWho::arl_new(process.ns, &rt);
     let mut state = process
         .cold
         .as_mut()
@@ -1107,7 +1121,7 @@ fn lookup_args(
     key: Term,
 ) -> Result<Term, VmError> {
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
-    let who = Who::new(process.ns, rt);
+    let who = ArlWho::arl_new(process.ns, rt);
     let registry = rt.ets.read().unwrap();
     let tid = handle(who, &registry, target)?;
     let table = registry.get_shared(tid).map_err(err)?;
@@ -1126,7 +1140,7 @@ fn lookup_args(
 fn lookup_element_locked(
     table: &arinsal_ets::Table,
     caller: Term,
-    who: Who<'_>,
+    who: ArlWho<'_>,
     key: Term,
     position: Term,
     default: Option<Term>,
@@ -1245,7 +1259,7 @@ fn help_busy_table(
     let Some(rt) = process.runtime.as_ref() else {
         return Ok(());
     };
-    let who = Who::new(process.ns, rt);
+    let who = ArlWho::arl_new(process.ns, rt);
     let tid = {
         let registry = rt.ets.read().unwrap();
         match resolve(who, &registry, target) {
@@ -1291,7 +1305,7 @@ fn delete_or_clear(
     caller: Term,
 ) -> Result<Term, VmError> {
     let rt = process.runtime.clone().ok_or_else(badarg)?;
-    let who = Who::new(process.ns, &rt);
+    let who = ArlWho::arl_new(process.ns, &rt);
     let initial = ctx.remaining() as isize;
     let mut reds = initial;
     let mut state = process.cold.as_mut().and_then(|cold| cold.ets_free.take());
@@ -1425,7 +1439,7 @@ fn call_inner(
         return delete_or_clear(process, ctx, function, args, caller);
     }
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
-    let who = Who::new(process.ns, rt);
+    let who = ArlWho::arl_new(process.ns, rt);
     // Port of erts/emulator/beam/erl_db.c:446-500 (db_lock), OTP-29.1.1: table operations
     // lock only their table; the registry is exclusive only while its maps change.
     let exclusive = matches!(
@@ -1452,7 +1466,8 @@ fn call_inner(
                 keypos: 1,
                 protection: Protection::Protected,
                 owner: caller,
-                ns: who.ns,
+                // arl: the table records the creator's namespace
+                arl_ns: who.ns,
                 heir: None,
                 read_concurrency: false,
                 write_concurrency: WriteConcurrency::Disabled,
@@ -1536,7 +1551,8 @@ fn call_inner(
                         let pid = value;
                         if pid != atom("none") {
                             let heir_pid = Pid::from_term(pid).ok_or_else(badarg)?;
-                            if !pid_in_ns(rt, heir_pid, who.ns) {
+                            // arl: heir and new owner stay in the namespace of the table
+                            if !arl_pid_in_ns(rt, heir_pid, who.ns) {
                                 return Err(badarg());
                             }
                             // Port of erts/emulator/beam/erl_db.c:5319-5337 (set_heir),
@@ -1594,7 +1610,7 @@ fn call_inner(
                 tid.to_term(&mut heap).map_err(|_| badarg())
             }
         }
-        (EtsBif::Whereis, [name]) => Ok(whereis_named(who, &registry, name.as_atom().ok_or_else(badarg)?)
+        (EtsBif::Whereis, [name]) => Ok(arl_whereis_named(who, &registry, name.as_atom().ok_or_else(badarg)?)
             .map(|tid| tid.to_term(&mut heap))
             .transpose()
             .map_err(|_| badarg())?
@@ -1742,7 +1758,8 @@ fn call_inner(
                         let pid_term = arinsal_term::from_owned(&fields[1], &mut heap)
                             .map_err(|_| badarg())?;
                         let pid = Pid::from_term(pid_term).ok_or_else(badarg)?;
-                        if !pid_in_ns(rt, pid, who.ns) {
+                        // arl: heir and new owner stay in the namespace of the table
+                        if !arl_pid_in_ns(rt, pid, who.ns) {
                             return Err(badarg());
                         }
                         let data = if fields.len() == 2 {
@@ -1979,7 +1996,8 @@ fn call_inner(
             if *new_owner != caller && !rt.scheduler().map_err(|_| badarg())?.lookup(pid) {
                 return Err(badarg());
             }
-            if !pid_in_ns(rt, pid, who.ns) {
+            // arl: heir and new owner stay in the namespace of the table
+            if !arl_pid_in_ns(rt, pid, who.ns) {
                 return Err(badarg());
             }
             let options = registry.get(tid).map_err(err)?.options;

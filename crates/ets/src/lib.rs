@@ -134,9 +134,10 @@ pub struct TableOptions {
     pub protection: Protection,
     /// Owner process identifier.
     pub owner: Term,
+    // arl: names are scoped by namespace
     /// Namespace of the owner at creation (0 is root). Names are scoped by it and a table
     /// is reachable by identity from its own namespace only.
-    pub ns: u32,
+    pub arl_ns: u32,
     /// Heir, if present.
     pub heir: Option<Heir>,
     /// Read concurrency hint.
@@ -4606,6 +4607,7 @@ impl Garbage {
 pub struct Registry {
     tables: Vec<TableSlot>,
     free_slots: Vec<usize>,
+    // arl: keyed by (namespace, name)
     names: HashMap<(u32, Atom), Tid>,
     owned_tables: HashMap<Term, HashSet<Tid>>,
     /// Tables each process has fixed (erts `ERTS_P_FIXED_TABLES`).
@@ -4783,7 +4785,7 @@ impl Registry {
 
     /// Create a table and reserve its name if requested.
     pub fn create(&mut self, options: TableOptions) -> Result<Tid, EtsError> {
-        if options.named_table && self.names.contains_key(&(options.ns, options.name)) {
+        if options.named_table && self.names.contains_key(&(options.arl_ns, options.name)) {
             return Err(EtsError::NameTaken);
         }
         let index = if let Some(&index) = self.free_slots.last() {
@@ -4802,7 +4804,7 @@ impl Registry {
             self.free_slots.pop();
         }
         if options.named_table {
-            self.names.insert((options.ns, options.name), tid);
+            self.names.insert((options.arl_ns, options.name), tid);
         }
         if index == self.tables.len() {
             self.tables.push(TableSlot {
@@ -4874,7 +4876,7 @@ impl Registry {
     }
 
     /// Resolve a registered table name inside namespace `ns`.
-    pub fn whereis_in(&self, ns: u32, name: Atom) -> Option<Tid> {
+    pub fn arl_whereis_in(&self, ns: u32, name: Atom) -> Option<Tid> {
         self.names.get(&(ns, name)).copied()
     }
 
@@ -4887,11 +4889,11 @@ impl Registry {
     }
 
     /// Enumerate the live tables of namespace `ns`.
-    pub fn all_in(&self, ns: u32) -> Vec<Tid> {
+    pub fn arl_all_in(&self, ns: u32) -> Vec<Tid> {
         self.tables
             .iter()
             .filter_map(|slot| slot.table.as_ref())
-            .filter(|table| table.options().ns == ns)
+            .filter(|table| table.options().arl_ns == ns)
             .map(|table| table.read().tid)
             .collect()
     }
@@ -4943,7 +4945,8 @@ impl Registry {
         table.detached = true;
         self.remove_owned_table(table.options.owner, tid);
         if table.options.named_table {
-            self.names.remove(&(table.options.ns, table.options.name));
+            self.names
+                .remove(&(table.options.arl_ns, table.options.name));
         }
         let mut fixations = 0;
         for (pid, count) in &table.fixed_processes {
@@ -5001,7 +5004,7 @@ impl Registry {
             .ok_or(EtsError::NoTable)?;
         let (named, ns) = {
             let table = slot.table.as_ref().ok_or(EtsError::NoTable)?.read();
-            (table.options.named_table, table.options.ns)
+            (table.options.named_table, table.options.arl_ns)
         };
         if named {
             // Port of erts/emulator/beam/erl_db.c:2516 (insert_named_tab), OTP-29.1.1:
@@ -5613,7 +5616,7 @@ mod registry_tests {
             keypos: 1,
             protection: Protection::Protected,
             owner: Term::NIL,
-            ns: 0,
+            arl_ns: 0,
             heir: None,
             read_concurrency: false,
             write_concurrency: WriteConcurrency::Disabled,

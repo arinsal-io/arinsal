@@ -196,9 +196,62 @@ fn string(process: &mut Process, value: &str) -> Result<Term, VmError> {
     Ok(tail)
 }
 
+/// The namespace entry of a process that is not in root.
+// arl: processes of a namespace see an environment overlay, not the node environment
+fn arl_ns_entry(process: &Process) -> Option<Arc<crate::namespace::NsEntry>> {
+    if process.ns == 0 {
+        return None;
+    }
+    process.runtime.as_ref()?.namespaces.get(process.ns)
+}
+
+/// Variable `name` as a namespace sees it: its overlay, then the node value of an allowlisted name.
+fn arl_ns_getenv(entry: &crate::namespace::NsEntry, name: &std::ffi::OsStr) -> Option<OsString> {
+    match entry.env().read().unwrap().get(name) {
+        Some(value) => value.clone(),
+        None if crate::namespace::ENV_ALLOWLIST
+            .iter()
+            .any(|allowed| name == *allowed) =>
+        {
+            environment()
+                .read()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+        None => None,
+    }
+}
+
+/// The environment of a namespace: visible allowlisted node variables, then its overlay.
+fn arl_ns_env_all(entry: &crate::namespace::NsEntry) -> Environment {
+    let overlay = entry.env().read().unwrap();
+    let node = environment().read().unwrap();
+    let mut all: Environment = node
+        .iter()
+        .filter(|(key, _)| {
+            crate::namespace::ENV_ALLOWLIST
+                .iter()
+                .any(|allowed| key == *allowed)
+                && !overlay.contains_key(key)
+        })
+        .cloned()
+        .collect();
+    all.extend(
+        overlay
+            .iter()
+            .filter_map(|(key, value)| Some((key.clone(), value.clone()?))),
+    );
+    all
+}
+
 fn env_all(process: &mut Process) -> Result<Term, VmError> {
     // Port of lib/kernel/src/os.erl (env/0), OTP-29.1.1: [{Name, Value}].
-    let entries = environment().read().unwrap().clone();
+    let entries = match arl_ns_entry(process) {
+        Some(entry) => arl_ns_env_all(&entry),
+        None => environment().read().unwrap().clone(),
+    };
     let mut result = Term::NIL;
     for (key, value) in entries.into_iter().rev() {
         let key = string(process, &key.to_string_lossy())?;
@@ -216,6 +269,12 @@ fn env_all(process: &mut Process) -> Result<Term, VmError> {
 
 fn getenv_one(process: &mut Process, name: Term) -> Result<Term, VmError> {
     let name = valid_name(name)?;
+    if let Some(entry) = arl_ns_entry(process) {
+        return match arl_ns_getenv(&entry, &name) {
+            Some(value) => string(process, &value.to_string_lossy()),
+            None => Ok(atom("false")),
+        };
+    }
     match environment()
         .read()
         .unwrap()
@@ -233,18 +292,25 @@ fn putenv(process: &mut Process, name: Term, value: Term) -> Result<Term, VmErro
     if value.to_string_lossy().contains('\0') {
         return Err(badarg());
     }
+    if let Some(entry) = arl_ns_entry(process) {
+        entry.env_put(name, value);
+        return Ok(atom("true"));
+    }
     let mut env = environment().write().unwrap();
     if let Some((_, existing)) = env.iter_mut().find(|(key, _)| *key == name) {
         *existing = value;
     } else {
         env.push((name, value));
     }
-    let _ = process;
     Ok(atom("true"))
 }
 
-fn unsetenv(_process: &mut Process, name: Term) -> Result<Term, VmError> {
+fn unsetenv(process: &mut Process, name: Term) -> Result<Term, VmError> {
     let name = valid_name(name)?;
+    if let Some(entry) = arl_ns_entry(process) {
+        entry.env_unset(name);
+        return Ok(atom("true"));
+    }
     environment()
         .write()
         .unwrap()

@@ -24,7 +24,7 @@ fn main() {
             keypos: 1,
             protection: Protection::Public,
             owner: Term::pid(1, 0).unwrap(),
-            ns: 0,
+            arl_ns: 0,
             heir: None,
             read_concurrency: false,
             write_concurrency: WriteConcurrency::Disabled,
