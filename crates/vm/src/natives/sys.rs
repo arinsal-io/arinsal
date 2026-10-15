@@ -4551,9 +4551,43 @@ fn small(value: i64) -> Term {
     Term::small(value).unwrap_or(Term::NIL)
 }
 
+/// Capture `_SC_OPEN_MAX` at VM startup, as `erts_poll_init` does in OTP 29.1.1.
+pub(crate) fn poll_max_fds() -> u64 {
+    static MAX_FDS: OnceLock<u64> = OnceLock::new();
+    *MAX_FDS.get_or_init(|| {
+        // Port of erts/emulator/sys/common/erl_poll.c:2084-2117, OTP-29.1.1.
+        // Clear errno to distinguish an unlimited result from a failed query.
+        #[cfg(target_os = "macos")]
+        // SAFETY: __error returns this thread's valid errno slot.
+        let errno = unsafe { libc::__error() };
+        #[cfg(target_os = "linux")]
+        // SAFETY: __errno_location returns this thread's valid errno slot.
+        let errno = unsafe { libc::__errno_location() };
+        // SAFETY: errno points to this thread's errno slot.
+        unsafe { *errno = 0 };
+        // SAFETY: _SC_OPEN_MAX is a valid sysconf selector.
+        let value = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } as libc::c_int;
+        // SAFETY: errno remains this thread's errno slot after sysconf.
+        let error = unsafe { *errno };
+        if value < 0 {
+            if error == 0 {
+                24_576
+            } else {
+                panic!(
+                    "sysconf(_SC_OPEN_MAX) failed: {}",
+                    std::io::Error::from_raw_os_error(error)
+                );
+            }
+        } else {
+            value as u64
+        }
+    })
+}
+
 fn check_io_info(process: &mut Process) -> Result<Term, VmError> {
     // Port of erts_check_io_info in erts/emulator/sys/common/erl_check_io.c:2675,
     // OTP-29.1.1. The fallback and scheduler sets are part of OTP's Mac layout.
+    let max_fds = poll_max_fds();
     let entries = [
         (
             "select", "false", 13_536, "true", "false", "false", "true", 0, 2,
@@ -4580,7 +4614,7 @@ fn check_io_info(process: &mut Process) -> Result<Term, VmError> {
             ("batch_updates", atom(batch)),
             ("concurrent_updates", atom(concurrent)),
             ("fallback", atom(fallback)),
-            ("max_fds", non_neg(process, 1_048_576)?),
+            ("max_fds", non_neg(process, max_fds)?),
             ("active_fds", small(0)),
             ("poll_threads", small(poll_threads)),
         ];
@@ -4932,6 +4966,81 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_io_max_fds_is_cached_from_vm_startup() {
+        const CHILD: &str = "ARINSAL_CHECK_IO_MAX_FDS_CHILD";
+        const TEST_NAME: &str = "natives::sys::tests::check_io_max_fds_is_cached_from_vm_startup";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "max_fds child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        fn lower_soft_limit(limit: libc::rlim_t) -> libc::rlim_t {
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit writes to the initialized, stack-owned struct.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+                0
+            );
+            current.rlim_cur = current.rlim_cur.min(limit);
+            // SAFETY: current is valid, and only the soft limit is reduced.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &current) }, 0);
+            current.rlim_cur
+        }
+
+        let startup_limit = lower_soft_limit(512);
+        let vm = Vm::new([]);
+        lower_soft_limit(startup_limit / 2);
+
+        let selector = Term::atom(global_atoms().intern("check_io").unwrap());
+        let actual = system_info(&vm, &mut Process::new(), None, selector)
+            .unwrap()
+            .unwrap();
+        let owned = to_owned(actual).unwrap();
+        let mut max_fds = Vec::new();
+        fn collect(term: &OwnedTerm, values: &mut Vec<i64>) {
+            match term {
+                OwnedTerm::List { elems, tail } => {
+                    for elem in elems {
+                        collect(elem, values);
+                    }
+                    collect(tail, values);
+                }
+                OwnedTerm::Tuple(elems) if elems.len() == 2 => {
+                    if matches!(&elems[0], OwnedTerm::Atom(key) if key == "max_fds") {
+                        if let OwnedTerm::Int(value) = &elems[1] {
+                            values.push(*value);
+                        }
+                    }
+                    for elem in elems {
+                        collect(elem, values);
+                    }
+                }
+                OwnedTerm::Tuple(elems) => {
+                    for elem in elems {
+                        collect(elem, values);
+                    }
+                }
+                _ => {}
+            }
+        }
+        collect(&owned, &mut max_fds);
+        assert_eq!(max_fds, vec![startup_limit as i64; 3]);
     }
 
     #[test]
