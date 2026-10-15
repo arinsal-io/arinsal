@@ -19,7 +19,7 @@ mod lifecycle_tests;
 mod options;
 use options::bool_atom;
 
-const MAGIC: u32 = 0x534f_434b;
+const MAGIC: u32 = 0x1_434b;
 #[cfg(target_os = "macos")]
 const ATMARK_REQUEST: u64 = 0x4004_7307;
 #[cfg(target_os = "linux")]

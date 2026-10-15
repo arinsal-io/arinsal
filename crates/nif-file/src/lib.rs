@@ -1,7 +1,7 @@
 //! OTP 29.1.1 `prim_file` native operations.
 //!
 //! The stage 4 resource implementation can replace `FileHandle` and its local
-//! reference encoding. Each handle is a local ref `[0x46494c45, low32(id),
+//! reference encoding. Each handle is a local ref `[0x14c45, low32(id),
 //! high32(id)]`, backed by a unique, never reused table key. The VM runs every
 //! operation flagged `ERL_NIF_DIRTY_JOB_IO_BOUND` in [`NIF_FUNCS`] on a dirty IO
 //! scheduler ([`dirty_io`]). The table does not yet receive process death
@@ -25,7 +25,7 @@ use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ExportEntry, FunEntry, HeapAlloc, Node, Term, from_owned, to_owned};
 use num_traits::ToPrimitive;
 
-const MAGIC: u32 = 0x4649_4c45;
+const MAGIC: u32 = 0x1_4c45;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static HANDLES: OnceLock<Mutex<HashMap<u64, Arc<FileHandle>>>> = OnceLock::new();
 
