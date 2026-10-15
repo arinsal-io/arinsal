@@ -1443,6 +1443,13 @@ fn parse_emulator_flag(
                     )));
                 }
                 out.async_threads = Some(threads as u32);
+            } else if name == "+a" {
+                let arg = v.as_deref().unwrap_or("");
+                if !(16..=8192).contains(&c_atoi(arg)) {
+                    return Err(ArgsError::ErlDiagnostic(format!(
+                        "bad stack size for async threads {arg}"
+                    )));
+                }
             } else if name == "+sbwt" {
                 // Port of erts/emulator/beam/erl_process.c:5852
                 // (erts_sched_set_busy_wait_threshold), OTP-29.1.1.
@@ -1531,6 +1538,7 @@ fn split_emulator_flag(token: &str) -> (&str, Option<&str>) {
     const PREFIXES: &[&str] = &[
         "+SDPcpu", "+SDcpu", "+SDio", "+Spool", "+Zsim", "+zdbbl", "+hmbs", "+hms", "+Dibpl", "+D",
         "+s", "+h", "+M", "+JP", "+fn", "+pc", "+pa", "+SP", "+S", "+P", "+Q", "+t", "+C", "+c",
+        "+A", "+a", "+e", "+i", "+n", "+T", "+R", "+W", "+K",
     ];
     for prefix in PREFIXES {
         if let Some(rest) = token.strip_prefix(prefix) {
