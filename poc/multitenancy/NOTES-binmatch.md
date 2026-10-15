@@ -68,6 +68,27 @@ the test does not assert the exact `29.1.1` patch version that other differentia
 ## Gaps
 
 - `i_bs_get_binary_all2` is still not JIT-compiled; functions using it run in the interpreter.
-- Separate bug seen while testing: `mix compile` on Arinsal cannot build rebar3 deps (telemetry,
-  telemetry_poller). `:erlang.open_port({:spawn_executable, ".../rebar3"}, ...)` raises `badarg`
-  for the rebar3 escript. The deps were precompiled with stock OTP for the verification above.
+- None open for the rebar3 issue, see below.
+
+## Follow-up: open_port badarg for rebar3 deps
+
+Symptom: `:erlang.open_port({:spawn_executable, ".../rebar3"}, [..., {:cd, dir}, ...])` raised `badarg`
+when Mix compiled telemetry and telemetry_poller.
+
+Reduction: the rebar3 escript itself runs fine. Any `{cd, Dir}` option failed, even with `/bin/echo`;
+`args`, `env`, `use_stdio`, `stderr_to_stdout`, `hide`, `binary`, `exit_status` were all fine.
+
+Root cause: a port with `cd` is started through the `--port-exec-config` helper, which is the `arinsal`
+binary located by `port_exec_helper` in `crates/vm/src/port.rs`. It used `std::env::current_exe()`, which on
+macOS is the invoked path and not the symlink target. When the VM runs as a symlink named `erl` (the shim
+setup) in a directory with no sibling `arinsal`, the lookup found nothing and `open_port` returned `badarg`.
+
+Fix: canonicalize the executable path before looking for the helper.
+
+Test: `crates/cli/tests/port_cd_symlink.rs` (`ns_port_cd_works_through_symlinked_binary`) runs a symlink
+named `erl` pointing at the built binary and compares `open_port` with `{cd, "/"}` against reference `erl`.
+Fails before, passes after.
+
+Verified: fresh copy of bench/rest (deps from stock OTP, `_build` cleared, fresh MIX_HOME) builds
+mime, jason, plug_crypto, hpax, telemetry, telemetry_poller, thousand_island, plug, websock, bandit and rt
+with `mix compile` on Arinsal through a shim holding only the `erl` symlink.

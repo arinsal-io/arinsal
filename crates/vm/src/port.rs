@@ -2069,6 +2069,8 @@ fn erl_launcher(name: &str, executable: bool) -> bool {
 
 fn port_exec_helper() -> Option<std::path::PathBuf> {
     let executable = std::env::current_exe().ok()?;
+    // The VM may run through a symlink such as `erl`; the helper is the real binary.
+    let executable = std::fs::canonicalize(&executable).unwrap_or(executable);
     if executable.file_stem().is_some_and(|name| name == "arinsal") {
         return Some(executable);
     }
