@@ -84,8 +84,8 @@ e2e run; the e2e manager had already loaded more of the shared modules. Not inve
   (code +2.9 MB, ets +0.17 MB; process heaps sampled early). One earlier run had the probe stop
   updating while the first namespace was loading its modules (3 processes in the ns), with no
   error caught; the deploys and curls still worked, and the node then did not stop on SIGTERM.
-  Seen in 2 of 4 runs; localized in chunk 2 (below) to `erlang:memory/0` in root, blocked against
-  the namespace's synchronous domain `finish_loading`. Not isolated yet.
+  Seen in 2 of 4 runs; localized in chunk 2 (below) to `erlang:memory/0` in root not returning
+  while a namespace boots. Cause not isolated.
 
 ## Chunk 2: dep domains, acceptors, init:stop, density
 
