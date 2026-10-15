@@ -24,7 +24,7 @@
 %% server in root could not answer a namespace process.
 -module(arinsal_ns_boot).
 
--export([prepare/1, start/3, expose_root_services/0]).
+-export([prepare/1, trim/1, start/3, expose_root_services/0]).
 -export([ns_init/4, ns_main/4]).
 
 -define(BOOT_TIMEOUT, 60000).
@@ -47,7 +47,8 @@ expose_root_services() ->
 %% dependencies shares them. Returns the options for `arinsal_ns:create/3` (`dep_domain`) and
 %% the plan for `start/3`, which then loads only the project's own modules.
 -spec prepare(map()) -> {ok, map(), map()} | {error, term()}.
-prepare(#{modules := Modules0, release := {Name, _}} = Plan) ->
+prepare(Plan0) ->
+    #{modules := Modules0, release := {Name, _}} = Plan = trim(Plan0),
     Modules = without_preloaded(Modules0),
     _ = preload_base(Modules),
     {Own, Deps} = lists:partition(fun({_, Path}) -> own_module(Path, Name) end, Modules),
@@ -84,9 +85,61 @@ without_preloaded(Modules) ->
     Preloaded = erlang:pre_loaded(),
     [{M, P} || {M, P} <- Modules, not lists:member(M, Preloaded)].
 
+%% Keeps only the apps the project needs at run time: the closure of `applications` and
+%% `included_applications` from the release's own app plus kernel and stdlib (a release also
+%% lists sasl, iex, ...). Modules of dropped apps are dropped too; consolidated protocols stay.
+-spec trim(map()) -> map().
+trim(#{apps := Apps, modules := Modules, ebins := Ebins, release := {Name, _}} = Plan) ->
+    Needed = closure([binary_to_atom(to_bin(Name)), kernel, stdlib], Ebins, #{}),
+    Plan#{apps := [A || #{name := N} = A <- Apps, maps:is_key(N, Needed)],
+          modules := [{M, P} || {M, P} <- Modules, module_needed(P, Needed)]}.
+
+closure([], _Ebins, Seen) ->
+    Seen;
+closure([App | Rest], Ebins, Seen) when is_map_key(App, Seen) ->
+    closure(Rest, Ebins, Seen);
+closure([App | Rest], Ebins, Seen) ->
+    case app_props(App, Ebins) of
+        {ok, Props} ->
+            Deps = proplists:get_value(applications, Props, []) ++
+                proplists:get_value(included_applications, Props, []),
+            closure(Deps ++ Rest, Ebins, Seen#{App => true});
+        error ->
+            %% An optional application that is not in the release.
+            closure(Rest, Ebins, Seen)
+    end.
+
+app_props(App, Ebins) ->
+    File = atom_to_list(App) ++ ".app",
+    Candidates = [filename:join(to_list(E), File) || E <- Ebins] ++
+        [filename:join([Dir, "ebin", File]) || Dir <- [code:lib_dir(App)], is_list(Dir)],
+    case [P || P <- Candidates, filelib:is_regular(P)] of
+        [Path | _] ->
+            {ok, [{application, App, Props}]} = file:consult(Path),
+            {ok, Props};
+        [] ->
+            error
+    end.
+
+module_needed(Path0, Needed) ->
+    Path = to_list(Path0),
+    Dir = filename:dirname(Path),
+    case filename:basename(Dir) of
+        "consolidated" ->
+            true;
+        _ ->
+            AppDir = filename:basename(filename:dirname(Dir)),
+            App = lists:sublist(AppDir, max(0, string:rchr(AppDir, $-) - 1)),
+            App =:= "" orelse
+                (try maps:is_key(list_to_existing_atom(App), Needed)
+                 catch error:badarg -> false
+                 end)
+    end.
+
 -spec start(pos_integer(), map(), map()) -> {ok, pid()} | {error, term()}.
-start(Ns, #{modules := Modules0} = Plan0, #{group_leader := Leader} = Opts) ->
+start(Ns, Plan1, #{group_leader := Leader} = Opts) ->
     expose_root_services(),
+    #{modules := Modules0} = Plan0 = trim(Plan1),
     Modules = without_preloaded(Modules0),
     Plan = Plan0#{modules := Modules},
     _ = preload_base(Modules),
@@ -109,8 +162,9 @@ wait_booted(Ref, Mon, Pid, Step) ->
     receive
         {Ref, step, Next} ->
             wait_booted(Ref, Mon, Pid, Next);
-        {Ref, booted, Init} ->
+        {Ref, booted, Init, Timing} ->
             erlang:demonitor(Mon, [flush]),
+            put({?MODULE, last_timing}, Timing),
             {ok, Init};
         {Ref, failed, Reason} ->
             erlang:demonitor(Mon, [flush]),
@@ -191,10 +245,14 @@ ns_main(Parent, Ref, Plan, Cfg) ->
 boot_process(Init, Parent, Ref, Plan, Cfg) ->
     put(boot_report, Parent),
     put(boot_ref, Ref),
+    put(boot_steps, []),
+    T0 = erlang:monotonic_time(microsecond),
     try boot(Plan, Cfg) of
         ok ->
+            Timing = timing(T0),
+            io:format("[ns_boot] ~ts~n", [format_timing(Timing)]),
             Init ! {self(), booted},
-            Parent ! {Ref, booted, Init},
+            Parent ! {Ref, booted, Init, Timing},
             receive after infinity -> ok end
     catch
         Class:Reason:Stack ->
@@ -219,10 +277,34 @@ boot(#{modules := Modules, apps := Apps, env := Env, ebins := Ebins}, Cfg) ->
     [ok = start_app(App) || #{type := Type} = App <- Apps, Type =/= load, Type =/= none],
     ok.
 
-%% Tells `start/3` how far the boot got, for the error on a timeout or an exit.
+%% Tells `start/3` how far the boot got, for the error on a timeout or an exit, and records
+%% when each step began for the timing of the boot.
 step(Step) ->
+    put(boot_steps, [{Step, erlang:monotonic_time(microsecond)} | get(boot_steps)]),
     get(boot_report) ! {get(boot_ref), step, Step},
     ok.
+
+%% Milliseconds per phase: `load` (the plan's modules into the namespace domain), `kernel`
+%% (logger_server, application_controller, the kernel app), `apps` (loading and starting the
+%% other apps), `other` (file server and env), `total`. `start/3` keeps the last one in the
+%% caller's dictionary under `{arinsal_ns_boot, last_timing}`.
+timing(T0) ->
+    End = erlang:monotonic_time(microsecond),
+    Steps = lists:reverse(get(boot_steps)),
+    Spans = lists:zipwith(fun({Step, T}, {_, Next}) -> {Step, Next - T} end,
+                          Steps, tl(Steps) ++ [{done, End}]),
+    Sum = fun(Pred) -> lists:sum([D || {Step, D} <- Spans, Pred(Step)]) div 1000 end,
+    Load = Sum(fun(St) -> St =:= load_modules end),
+    Kernel = Sum(fun(St) -> lists:member(St, [logger_server, application_controller,
+                                              {start, kernel}]) end),
+    Apps = Sum(fun(St) -> St =:= load_apps orelse
+                              (is_tuple(St) andalso St =/= {start, kernel}) end),
+    Total = (End - T0) div 1000,
+    #{load => Load, kernel => Kernel, apps => Apps, other => Total - Load - Kernel - Apps,
+      total => Total}.
+
+format_timing(#{load := L, kernel := K, apps := A, other := O, total := T}) ->
+    io_lib:format("booted in ~b ms: load ~b, kernel ~b, apps ~b, other ~b", [T, L, K, A, O]).
 
 start_ac(KernelApp) ->
     case application_controller:start(KernelApp) of
@@ -318,3 +400,7 @@ argument(Arg, Args) ->
 
 to_list(B) when is_binary(B) -> binary_to_list(B);
 to_list(L) -> L.
+
+to_bin(B) when is_binary(B) -> B;
+to_bin(L) when is_list(L) -> list_to_binary(L);
+to_bin(A) when is_atom(A) -> atom_to_binary(A).
