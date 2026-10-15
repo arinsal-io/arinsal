@@ -51,7 +51,6 @@ start(Ns, #{modules := Modules0} = Plan0, #{group_leader := Leader} = Opts) ->
     _ = preload_base(Modules),
     {module, _} = code:ensure_loaded(arinsal_ns_kernel),
     Cfg = #{kernel_app => kernel_app(),
-            root_terms => root_terms(),
             arguments => root_arguments(),
             os_env => maps:get(os_env, Opts, [])},
     %% A namespace process cannot send to a root pid that is not exposed; a message to an
@@ -107,16 +106,8 @@ md5(Path) ->
         _ -> undefined
     end.
 
-%% persistent_term is per namespace, but the shared root services publish state there that
-%% their client modules read in the caller (code_server's mode, erl_prim_loader, prim_socket
-%% tables, erl_features). The namespace gets a copy; Logger's keys are its own.
-root_terms() ->
-    [{K, V} || {K, V} <- persistent_term:get(), not namespace_term(K)].
-
-namespace_term(K) ->
-    lists:member(K, [logger_proxy]) orelse
-        (is_tuple(K) andalso tuple_size(K) =:= 2 andalso
-         lists:member(element(1, K), [logger_config, logger_olp])).
+%% persistent_term is per namespace. The runtime reads OTP system keys (code_server, erl_prim_loader,
+%% prim_socket, ...) through to the root store, so nothing is copied here.
 
 kernel_app() ->
     File = filename:join(code:lib_dir(kernel), "ebin/kernel.app"),
@@ -171,7 +162,6 @@ boot_process(Init, Parent, Ref, Plan, Cfg) ->
     end.
 
 boot(#{modules := Modules, apps := Apps, env := Env, ebins := Ebins}, Cfg) ->
-    [persistent_term:put(K, V) || {K, V} <- maps:get(root_terms, Cfg)],
     step(file_server),
     {ok, _} = file_server:start_link(),
     step(load_modules),
