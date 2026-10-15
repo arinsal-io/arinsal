@@ -194,6 +194,61 @@ pub(crate) fn release_meta_frame(process: &mut Process, id: u64) {
     }
 }
 
+/// Keeps the call time and call memory counters of one call together for a reader.
+// Port of the idea of erts/emulator/beam/erl_bif_trace.c (trace_info_finisher): erts reads the
+// counters after a code barrier, when no call is half way through its accounting. Here an
+// accounting section counts itself on its scheduler's cell and a reader waits for all cells to
+// drain.
+#[repr(align(64))]
+struct GateCell(std::sync::atomic::AtomicU32);
+
+const GATE_CELLS: usize = 16;
+static GATE: [GateCell; GATE_CELLS] =
+    [const { GateCell(std::sync::atomic::AtomicU32::new(0)) }; GATE_CELLS];
+static GATE_CLOSED: AtomicBool = AtomicBool::new(false);
+static GATE_READER: Mutex<()> = Mutex::new(());
+
+/// An accounting section of a traced call.
+pub(crate) struct AccSection(&'static GateCell);
+
+impl AccSection {
+    pub(crate) fn enter() -> Self {
+        let ix = arinsal_sched::current_normal_scheduler()
+            .map_or(GATE_CELLS - 1, |id| id % (GATE_CELLS - 1));
+        let cell = &GATE[ix];
+        loop {
+            cell.0.fetch_add(1, Ordering::SeqCst);
+            if !GATE_CLOSED.load(Ordering::SeqCst) {
+                return Self(cell);
+            }
+            cell.0.fetch_sub(1, Ordering::SeqCst);
+            while GATE_CLOSED.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+impl Drop for AccSection {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Runs `read` while no traced call is half way through its accounting.
+fn quiesced<R>(read: impl FnOnce() -> R) -> R {
+    let _reader = GATE_READER.lock().unwrap();
+    GATE_CLOSED.store(true, Ordering::SeqCst);
+    for cell in &GATE {
+        while cell.0.load(Ordering::SeqCst) != 0 {
+            std::hint::spin_loop();
+        }
+    }
+    let result = read();
+    GATE_CLOSED.store(false, Ordering::SeqCst);
+    result
+}
+
 /// Port of erts/emulator/beam/beam_bp.h:30-40 (bp_pid_timem_bucket_t, BpTimemTrace),
 /// OTP-29.1.1: per-process call count and accumulated time (nanoseconds) or memory (words)
 /// of one function. erts keeps one hash per scheduler to avoid contention; one lock suffices
@@ -223,15 +278,21 @@ impl Default for TimemTrace {
 }
 
 impl TimemTrace {
-    fn shard(&self, pid: Pid) -> &Mutex<TimemInner> {
-        &self.shards[crate::process::pid_table_index(pid) as usize % TIMEM_SHARDS]
+    /// The bucket map of the calling scheduler: only that scheduler writes it, so its lock is
+    /// never contended; readers merge all maps.
+    // Port of erts/emulator/beam/beam_bp.c:2392-2408 (acquire_bp_sched_ix: one hash per
+    // scheduler, the dirty schedulers share the last one), OTP-29.1.1.
+    fn shard(&self) -> &Mutex<TimemInner> {
+        let ix = arinsal_sched::current_normal_scheduler()
+            .map_or(TIMEM_SHARDS - 1, |id| id % (TIMEM_SHARDS - 1));
+        &self.shards[ix]
     }
 
     // Port of erts/emulator/beam/beam_bp.c:1990-2008 (bp_hash_accum). Pausing only clears the
     // ACTIVE flag of the breakpoint data; the trace_pattern code barrier guarantees no call
     // that saw the flag set is still being counted.
     fn accum(&self, pid: Pid, count: i64, accumulator: i64) {
-        let mut inner = self.shard(pid).lock().unwrap();
+        let mut inner = self.shard().lock().unwrap();
         let bucket = inner.buckets.entry(pid).or_default();
         bucket.0 += count;
         bucket.1 += accumulator;
@@ -244,19 +305,22 @@ impl TimemTrace {
         }
     }
 
-    /// `(pid, count, accumulator)` of every process that called the function.
+    /// `(pid, count, accumulator)` of every process that called the function, the per-scheduler
+    /// maps merged.
+    // Port of erts/emulator/beam/beam_bp.c:2306-2378 (bp_hash_merge in the trace_info path),
+    // OTP-29.1.1.
     pub(crate) fn snapshot(&self) -> Vec<(Pid, i64, i64)> {
-        self.shards
-            .iter()
-            .flat_map(|shard| {
-                shard
-                    .lock()
-                    .unwrap()
-                    .buckets
-                    .iter()
-                    .map(|(pid, (count, accumulator))| (*pid, *count, *accumulator))
-                    .collect::<Vec<_>>()
-            })
+        let mut merged: HashMap<Pid, (i64, i64), FastHash> = HashMap::default();
+        for shard in &self.shards {
+            for (pid, (count, accumulator)) in shard.lock().unwrap().buckets.iter() {
+                let total = merged.entry(*pid).or_default();
+                total.0 += count;
+                total.1 += accumulator;
+            }
+        }
+        merged
+            .into_iter()
+            .map(|(pid, (count, accumulator))| (pid, count, accumulator))
             .collect()
     }
 }
@@ -1159,8 +1223,9 @@ pub(crate) fn native_breakpoint_accounting(
             return None;
         }
         if bp.flags & (BPF_LOCAL_TRACE | acc) != 0 {
-            traced[index] =
-                crate::trace::session_flags(process, bp.session, pid) & crate::trace::CALL != 0;
+            traced[index] = crate::trace::session_flags_cached(process, bp.session, pid)
+                & crate::trace::CALL
+                != 0;
             if traced[index] && bp.flags & BPF_LOCAL_TRACE != 0 {
                 return None;
             }
@@ -1180,6 +1245,7 @@ pub(crate) fn native_breakpoint_accounting(
             return None;
         }
     }
+    let _section = AccSection::enter();
     let mut actions = Vec::new();
     for (index, bp) in entry.bps.iter().enumerate() {
         let bp_flags = if traced[index] || bp.flags & (BPF_LOCAL_TRACE | acc) == 0 {
@@ -1368,6 +1434,17 @@ pub(crate) fn function_info(
         got = BPF_GLOBAL_TRACE;
     }
     let source = |spec: &Option<Arc<MatchSpec>>| spec.as_deref().map(|spec| spec.source.clone());
+    // Time and memory are read together, between the calls' accounting sections.
+    let (time, memory) = quiesced(|| {
+        (
+            (got & BPF_TIME_TRACE != 0)
+                .then(|| bp.time.as_ref().map(|bdt| bdt.snapshot()))
+                .flatten(),
+            (got & BPF_MEM_TRACE != 0)
+                .then(|| bp.memory.as_ref().map(|bdt| bdt.snapshot()))
+                .flatten(),
+        )
+    });
     FunctionInfo {
         got,
         counters_active: bp.flags
@@ -1385,12 +1462,8 @@ pub(crate) fn function_info(
             .count
             .as_ref()
             .map_or(0, |count| count.load(Ordering::Relaxed)),
-        time: (got & BPF_TIME_TRACE != 0)
-            .then(|| bp.time.as_ref().map(|bdt| bdt.snapshot()))
-            .flatten(),
-        memory: (got & BPF_MEM_TRACE != 0)
-            .then(|| bp.memory.as_ref().map(|bdt| bdt.snapshot()))
-            .flatten(),
+        time,
+        memory,
     }
 }
 
@@ -1980,6 +2053,7 @@ pub(crate) fn call_trace_return(
     bp_flags: u32,
     prev: Option<u32>,
 ) {
+    let _section = AccSection::enter();
     if bp_flags & BPF_TIME_TRACE_ACTIVE != 0 {
         let found = pbt_list(process, false)
             .iter()
