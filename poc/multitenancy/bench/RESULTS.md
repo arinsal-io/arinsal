@@ -116,6 +116,8 @@ makes same-version deps 100% shared and raises the numbers above.
 | | procs / project | state / project | tree start p50 / max | unique code / project |
 |---|---|---|---|---|
 | own Bandit listener | 315 (100 acceptors + 100 acceptor sups + 100 DynamicSupervisors) | 1459 KB | 1.26 / 11.2 ms | 97 KB |
+| own Bandit listener, 2 acceptors | 21 | 482 KB | 0.15 / 10.1 ms | 97 KB |
+| own Bandit listener, 1 acceptor | 18 | 470 KB | 0.13 / 11.5 ms | 97 KB |
 | no listener (host ingress) | 11 | 444 KB (processes 17 KB, ETS 70 KB, rest system) | 0.08 / 5.6 ms | 97 KB |
 
 # Comparison with public numbers of other platforms (vendor claims, not our measurements)

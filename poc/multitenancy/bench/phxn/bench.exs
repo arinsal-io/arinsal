@@ -6,7 +6,7 @@ gen = fn i ->
   m = fn s -> Module.concat(["P#{i}", s]) end
   {ep, router, ctrl, pubsub} = {m.("Endpoint"), m.("Router"), m.("HealthController"), m.("PubSub")}
   Application.put_env(:phxn, ep,
-    adapter: Bandit.PhoenixAdapter, http: [ip: {127, 0, 0, 1}, port: 6000 + i], server: server,
+    adapter: Bandit.PhoenixAdapter, http: [ip: {127, 0, 0, 1}, port: 6000 + i, thousand_island_options: [num_acceptors: String.to_integer(System.get_env("ACCEPTORS", "100"))]], server: server,
     secret_key_base: String.duplicate("a", 64), pubsub_server: pubsub)
   Code.compile_quoted(quote do
     defmodule unquote(ctrl) do
