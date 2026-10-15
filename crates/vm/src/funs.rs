@@ -136,6 +136,47 @@ fn argument_list(mut list: Term) -> Result<Vec<Term>, ArgumentError> {
 }
 
 // Port of erts/emulator/beam/beam_common.c:1462-1495 (nested apply loop), OTP-29.1.1.
+/// The plain BIF or static NIF that `{module, function, arity}` names, found once per export.
+///
+/// A name is plain when the load-time import classifier calls it `Pure` and it is not a
+/// trapping BIF: a static call of it runs the function directly, and so does `apply`.
+// Port of erts/emulator/beam/beam_common.c (apply: `erts_find_export_entry` then the BIF),
+// OTP-29.1.1.
+fn apply_plain_bif(
+    module_atom: arinsal_term::Atom,
+    function_atom: arinsal_term::Atom,
+    module: &str,
+    function: &str,
+    arity: usize,
+) -> Option<arinsal_bifs::BifFn> {
+    use std::collections::HashMap;
+    use std::sync::{OnceLock, RwLock};
+    type Key = (arinsal_term::Atom, arinsal_term::Atom, u8);
+    static PLAIN: OnceLock<RwLock<HashMap<Key, arinsal_bifs::BifFn>>> = OnceLock::new();
+    let arity = u8::try_from(arity).ok()?;
+    let key = (module_atom, function_atom, arity);
+    let table = PLAIN.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(bif) = table
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Some(*bif);
+    }
+    let bif = arinsal_bifs::lookup(module, function, arity)
+        .or_else(|| crate::natives::plain_static_nif_lookup(module, function, arity))?;
+    if crate::natives::classify(module, function, arity, true).0 != ImportClass::Pure
+        || crate::bif_traps::traps(module, function, arity)
+    {
+        return None;
+    }
+    table
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, bif);
+    Some(bif)
+}
+
 fn unwrap_nested_apply(
     mut module: Term,
     mut function: Term,
@@ -641,6 +682,56 @@ impl Vm {
         }
     }
 
+    /// Run a plain BIF or static NIF reached through `apply`, as a static call of the same
+    /// export would.
+    #[allow(clippy::too_many_arguments)] // The call site's own context, passed through.
+    fn run_apply_bif(
+        &mut self,
+        p: &mut Process,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+        module: &str,
+        function: &str,
+        arity: usize,
+        tail: bool,
+        bif: arinsal_bifs::BifFn,
+    ) -> Result<ImportOutcome, VmError> {
+        let (result, bif_reductions) = {
+            let mut heap = ProcessHeapHandle(&mut p.heap);
+            let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bif(&mut bif_ctx, &p.x[..arity])
+            }))
+            .map_err(|_| {
+                VmError::Unsupported(format!("BIF {module}:{function}/{arity} panicked"))
+            })?;
+            (result, bif_ctx.reductions())
+        };
+        let bif_args = p.x[..arity].to_vec();
+        let result = result.map_err(|error| match error {
+            BifError::Unsupported(reason) => VmError::Unsupported(reason.into()),
+            error => exceptions::bif_error(p, module, function, &bif_args, error),
+        })?;
+        p.x[0] = result;
+        let charge = bif_reductions.saturating_add(1);
+        p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
+        p.reductions = p
+            .reductions
+            .saturating_sub(charge.min(i32::MAX as u32) as i32);
+        let exhausted = ctx.is_some_and(|run| !run.consume(charge));
+        if tail {
+            return Ok(match Self::ret(p) {
+                Some(value) => ImportOutcome::Returned(value),
+                None => ImportOutcome::Advanced,
+            });
+        }
+        p.ip += 1;
+        if exhausted {
+            p.reductions = 4000;
+            return Ok(ImportOutcome::Yield);
+        }
+        Ok(ImportOutcome::Advanced)
+    }
+
     #[allow(clippy::too_many_arguments)] // Same signature as `call_named_resolved`, which it backs.
     fn call_named_untraced(
         &mut self,
@@ -686,6 +777,15 @@ impl Vm {
         }
         // Trapping BIFs must be intercepted before native dispatch: dynamic
         // apply may otherwise enter a synchronous fast path for the same MFA.
+        // The export of a plain BIF is found by its atoms and run as a static call of it
+        // would, without matching names against every family of natives. An interrupted
+        // trapping BIF keeps its state for `execute_named` to settle first.
+        if let Some((module_atom, function_atom)) = atoms
+            && p.cold.as_ref().is_none_or(|cold| cold.bif_trap.is_none())
+            && let Some(bif) = apply_plain_bif(module_atom, function_atom, module, function, arity)
+        {
+            return self.run_apply_bif(p, ctx, module, function, arity, tail, bif);
+        }
         // A trap through `apply` is keyed by the caller's import when it has one, so a
         // static call and its apply re-execution resume the same continuation.
         let trap_key = self.code.modules[p.module]
@@ -808,41 +908,7 @@ impl Vm {
         if let Some(bif) = arinsal_bifs::lookup(module, function, arity as u8)
             .or_else(|| crate::natives::plain_static_nif_lookup(module, function, arity as u8))
         {
-            let (result, bif_reductions) = {
-                let mut heap = ProcessHeapHandle(&mut p.heap);
-                let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    bif(&mut bif_ctx, &p.x[..arity])
-                }))
-                .map_err(|_| {
-                    VmError::Unsupported(format!("BIF {module}:{function}/{arity} panicked"))
-                })?;
-                (result, bif_ctx.reductions())
-            };
-            let bif_args = p.x[..arity].to_vec();
-            let result = result.map_err(|error| match error {
-                BifError::Unsupported(reason) => VmError::Unsupported(reason.into()),
-                error => exceptions::bif_error(p, module, function, &bif_args, error),
-            })?;
-            p.x[0] = result;
-            let charge = bif_reductions.saturating_add(1);
-            p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
-            p.reductions = p
-                .reductions
-                .saturating_sub(charge.min(i32::MAX as u32) as i32);
-            let exhausted = ctx.as_deref_mut().is_some_and(|run| !run.consume(charge));
-            if tail {
-                return Ok(match Self::ret(p) {
-                    Some(value) => ImportOutcome::Returned(value),
-                    None => ImportOutcome::Advanced,
-                });
-            }
-            p.ip += 1;
-            if exhausted {
-                p.reductions = 4000;
-                return Ok(ImportOutcome::Yield);
-            }
-            return Ok(ImportOutcome::Advanced);
+            return self.run_apply_bif(p, ctx, module, function, arity, tail, bif);
         }
         if arinsal_spec::bif_lookup(module, function, arity as u8).is_some() {
             return Err(VmError::Unsupported(format!(
