@@ -26,6 +26,8 @@ pub(crate) struct NsEntry {
     alive: AtomicBool,
     /// Registered names of this namespace, created on the first `register/2`.
     names: OnceLock<RegisterTable>,
+    /// Code lookup chain of every process of this namespace; `None` resolves in the base only.
+    pub(crate) code_chain: Option<crate::code_domains::DomainChain>,
 }
 
 impl NsEntry {
@@ -61,6 +63,7 @@ impl NsTable {
         project: Vec<u8>,
         max_processes: u64,
         max_bytes: u64,
+        code_chain: Option<crate::code_domains::DomainChain>,
     ) -> Arc<NsEntry> {
         let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let id = entries.len() as u32 + 1;
@@ -73,6 +76,7 @@ impl NsTable {
             counters: scheduler.ns_register(id, max_processes),
             alive: AtomicBool::new(true),
             names: OnceLock::new(),
+            code_chain,
         });
         entries.push(entry.clone());
         entry
