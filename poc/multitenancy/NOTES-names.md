@@ -26,11 +26,29 @@
 - A destroyed ns keeps its (empty after process exit) table; nothing frees it.
 - Named ETS, `persistent_term` scope, env overlay, RootOnly natives and halt are later chunks.
 
+## Chunk 2: ETS (done)
+- `TableOptions.ns` (crates/ets/src/lib.rs) records the creator's namespace next to `owner`.
+  `Registry.names` is keyed by `(ns, Atom)`; `whereis` stays the ns 0 lookup, `whereis_in(ns, name)`
+  and `all_in(ns)` are new. `rename`, `detach` and `create` use the table's ns.
+- VM (crates/vm/src/natives/ets.rs): `Who { ns, rt }` is passed to `resolve`, `handle`, `allowed`.
+  - By tid: a table of another ns is `Missing` (badarg, `ets:info` gives `undefined`), unless it
+    is a root table whose owner has the SHARED bit; then reads work.
+  - By name: own ns first, then root names of SHARED owners (`whereis_named`). `ets:whereis/1` the same.
+  - Writes (and anything with `write == true` in `allowed`) to a table of another ns are refused.
+  - The per-scheduler table cache (`with_cached_table`, the BeamAsm direct path) declines tables of
+    another ns, so those calls take the registry path and the checks above.
+  - `ets:all/0` lists only the caller's ns (root sees only its own tables too).
+  - `give_away/3` and the `heir` option of `new/2` and `setopts/2` need a live pid of the same ns, else badarg.
+- Gaps: a table survives only as long as its owner (no ns-level free on destroy besides owner exit);
+  `erlang:system_info(ets_count)` and the ETS memory statistic are node-wide; heir hand-over at owner
+  exit is not rechecked (the heir was checked when set).
+
 ## Run
 ```
 export CARGO_TARGET_DIR=/Users/sts/dev/sq/arinsal-prs/target-mt-names
 export PATH=/Users/sts/dev/sq/arinsal-prs/bin:/opt/homebrew/opt/erlang@29/bin:/opt/homebrew/opt/elixir/bin:$PATH
 cargo test -p arinsal-vm --test ns_names
+cargo test -p arinsal-vm --test ns_ets
 cargo test -p arinsal-vm --test ns_core
 cargo test -p arinsal-vm --lib register
 ```
