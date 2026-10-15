@@ -78,6 +78,30 @@
   burst between collections can overshoot. ETS memory is reported but not part of the cap.
 - Tests: `ns_heap_accounting_grows_and_shrinks`, `ns_max_bytes_destroys_ns_only` (`--test ns_heap`).
 
+## Chunk 5: isolation gate and attack suite
+- `poc/multitenancy/tests/isolation_gate.sh`: builds every `crates/vm/tests/ns_*.rs` target (glob) and
+  the arinsal CLI once, runs each target with BeamAsm and with `ARINSAL_INTERP=1`, prints one
+  pass/fail row per test and exits non-zero on any failure. `PROFILE=release` and `ONLY=<substr>` select
+  profile and targets; `CARGO_TARGET_DIR` defaults to `<repo>/../target-gate`. Takes about 3 minutes.
+- `crates/vm/tests/ns_attack.rs`: tenants A and B and root; B has a victim (name, ETS tables, pterm,
+  a module only in its domain), root has a canary; A attacks and `clean/1` asserts that victim,
+  canary, the root test process mailbox, scheduler count and a root env var are untouched.
+  One test per attack: pid guessing (send, link, monitor, exit die, exit kill), real-pid ops,
+  registry/ETS, persistent_term, os env, foreign module, system_flag, open_port, trace, load_nif,
+  halt, init:stop, spawn bomb, memory bomb, group_leader, shared service.
+- Open findings (red rows, belong to the delivery check in crates/sched):
+  1. `ns_attack_pid_guess_link`: a refused link leaves the caller's half, so when A exits, an
+     `ExitLinked` (not gated) reaches the guessed process and arrives as `{'EXIT', APid, Reason}`
+     (kills it unless it traps exits). A controls Reason. Fix: drop the half on refusal, or gate ExitLinked.
+  2. `ns_attack_pid_guess_monitor`: a refused monitor can stay in the held-monitor slot and is flushed
+     with the next ungated signal to that target (the `deferred` event in the send path has no
+     `ns_allows` check), leaving `monitored_by` on the victim. Fix: gate the deferred monitor itself.
+  3. `ns_attack_shared_service`: a tenant can `exit(Pid, kill)` and link to a SHARED root service
+     (`ns_gate` allows every signal to SHARED receivers). Fix: for a SHARED receiver allow only
+     messages, link and monitor from other namespaces, drop their exit signals.
+- Under `ARINSAL_INTERP=1` a static call to a missing module in the caller's own module raises a VM
+  error instead of `undef` (also in root), so the attack suite calls foreign modules dynamically.
+
 ## Run
 ```
 export CARGO_TARGET_DIR=/Users/sts/dev/sq/arinsal-prs/target-mt-names
@@ -85,6 +109,7 @@ export PATH=/Users/sts/dev/sq/arinsal-prs/bin:/opt/homebrew/opt/erlang@29/bin:/o
 cargo test -p arinsal-vm --test ns_names
 cargo test -p arinsal-vm --test ns_ets
 cargo test -p arinsal-vm --test ns_pterm --test ns_env --test ns_heap
+poc/multitenancy/tests/isolation_gate.sh
 cargo test -p arinsal-vm --test ns_core
 cargo test -p arinsal-vm --lib register
 ```
