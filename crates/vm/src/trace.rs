@@ -434,16 +434,49 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
 /// The trace table: calls only read it, trace flag changes write it.
 struct TraceTableLock(std::sync::RwLock<TraceTable>);
 
+/// Write access to the trace table; leaving it publishes the change to the cached flags.
+struct TraceTableWrite<'a>(std::sync::RwLockWriteGuard<'a, TraceTable>);
+
+impl std::ops::Deref for TraceTableWrite<'_> {
+    type Target = TraceTable;
+    fn deref(&self) -> &TraceTable {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TraceTableWrite<'_> {
+    fn deref_mut(&mut self) -> &mut TraceTable {
+        &mut self.0
+    }
+}
+
+impl Drop for TraceTableWrite<'_> {
+    fn drop(&mut self) {
+        // Every writer may have changed some process's flags: cached copies are stale from
+        // here on. The lock is still held, so no reader caches the old flags under the new epoch.
+        TRACE_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 impl TraceTableLock {
     /// Exclusive access (the name keeps the call sites of the former mutex).
-    fn lock(&self) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'_, TraceTable>> {
-        self.0.write()
+    fn lock(&self) -> std::sync::LockResult<TraceTableWrite<'_>> {
+        match self.0.write() {
+            Ok(guard) => Ok(TraceTableWrite(guard)),
+            Err(poisoned) => Err(std::sync::PoisonError::new(TraceTableWrite(
+                poisoned.into_inner(),
+            ))),
+        }
     }
 
     fn read(&self) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, TraceTable>> {
         self.0.read()
     }
 }
+
+/// Incremented whenever the trace table is opened for writing; invalidates
+/// `ColdProcess::trace_flags`.
+static TRACE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 fn table() -> &'static TraceTableLock {
     static TABLE: OnceLock<TraceTableLock> = OnceLock::new();
@@ -1482,6 +1515,27 @@ pub(crate) fn session_flags(process: &Process, session: u64, pid: Pid) -> u64 {
         .map_or(0, |entry| entry.flags)
 }
 
+/// `session_flags` read through the process: the flags are cached on it until the trace table
+/// next changes.
+// Port of erts/emulator/beam/beam_bp.c:1022 (get_tracer_ref: the session's tracer reference is
+// found on the process, not in a global map), OTP-29.1.1.
+pub(crate) fn session_flags_cached(process: &mut Process, session: u64, pid: Pid) -> u64 {
+    let epoch = TRACE_EPOCH.load(Ordering::Acquire);
+    if let Some(cold) = process.cold.as_deref()
+        && cold.trace_flags.0 == epoch
+        && let Some((_, flags)) = cold.trace_flags.1.iter().find(|(id, _)| *id == session)
+    {
+        return *flags;
+    }
+    let flags = session_flags(process, session, pid);
+    let cold = process.cold_mut();
+    if cold.trace_flags.0 != epoch {
+        cold.trace_flags = (epoch, Vec::new());
+    }
+    cold.trace_flags.1.push((session, flags));
+    flags
+}
+
 fn set_session_flags(
     process: &Process,
     session: u64,
@@ -2126,6 +2180,7 @@ fn call_event_scope(
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if bp_flags & acc_flags != 0 {
+            let _section = crate::trace_bp::AccSection::enter();
             let ci = crate::trace_bp::func_id(module, function, arity);
             let mut prev = None;
             if bp_flags & BPF_TIME_TRACE_ACTIVE != 0
@@ -2531,7 +2586,7 @@ pub(crate) fn call_acc_return(
     // Port of erts/emulator/beam/beam_bp.c:1352-1365 (erts_call_trace_return): a session that
     // no longer traces the process has no state to update.
     if !table()
-        .lock()
+        .read()
         .unwrap()
         .contains_key(&(scope(process), session, pid))
     {
@@ -2905,7 +2960,19 @@ pub(crate) fn push_native_trace_frame(
     let frame_words = 4usize.saturating_add(actions.len().saturating_mul(2));
     // Port of erts/emulator/beam/beam_bp.c:1206-1219 (erts_generic_breakpoint), OTP-29.1.1:
     // collect with the function's arguments as roots when the trace frames do not fit.
-    process.ensure(frame_words, live)?;
+    let needed = frame_words
+        + if process.heap.native_active() {
+            arinsal_term::S_RESERVED
+        } else {
+            0
+        };
+    if !process.heap.gc_enabled && process.heap.free_words() < needed {
+        // Port of erts/emulator/beam/erl_gc.c:780-783 (garbage_collect with F_DISABLE_GC):
+        // the need is satisfied in a fresh heap fragment and the collection is left for later.
+        process.delay_heap_collection(frame_words);
+    } else {
+        process.ensure(frame_words, live)?;
+    }
     let Some(old_cp) = process.heap.stack_get(0) else {
         return Err(VmError::Unsupported(
             "native trace continuation missing".into(),
