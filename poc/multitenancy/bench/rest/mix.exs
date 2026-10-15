@@ -9,6 +9,7 @@ defmodule RT.MixProject do
   def application, do: [extra_applications: [:logger], mod: {RT.Application, []}]
 
   defp deps do
-    [{:bandit, "~> 1.6"}, {:plug, "~> 1.16"}, {:jason, "~> 1.4"}, {:telemetry_poller, "~> 1.1"}]
+    [{:bandit, "~> 1.6"}, {:plug, "~> 1.16"}, {:jason, "~> 1.4"}, {:telemetry_poller, "~> 1.1"},
+     {:arinsal, path: "../../../../packages/arinsal", only: :dev, runtime: false}]
   end
 end

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # End-to-end test of the manager (arinsal_cloud) with the fake backend, on the Arinsal runtime.
-# Deploys poc/multitenancy/bench/rest as two tenants, curls both projects, lists, redeploys.
+# Uses the `mix arinsal.*` tasks: deploys poc/multitenancy/bench/rest as two tenants, curls both
+# projects, lists, reads logs, stops, starts, redeploys and deletes.
+#
+# The manager, the projects and the client tasks list/stop/start/logs/delete run on Arinsal.
+# `mix arinsal.deploy` (which compiles bench/rest and its deps and builds the release) runs on
+# stock OTP, because compiling hpax fails on Arinsal (NOTES-cloud.md, "Arinsal gaps").
 #
 #   poc/multitenancy/tests/cloud_fake_e2e.sh
 #
@@ -38,20 +43,23 @@ step "compile the manager"
 EBIN="$ROOT/packages/arinsal_cloud/_build/dev/lib/arinsal_cloud/ebin"
 ELIXIR_LIB="$(elixir -e 'IO.puts(:code.lib_dir(:elixir))')"
 
-step "build the bench/rest release (include_erts false: only lib/ and releases/ are shipped)"
+# Stock OTP for compiling and releasing: bench/rest deps do not compile on Arinsal yet.
+STOCK_PATH="${STOCK_PATH:-/opt/homebrew/opt/erlang@29/bin:/opt/homebrew/opt/elixir/bin:/usr/bin:/bin}"
+stock() { env -u ERL_ROOTDIR PATH="$STOCK_PATH" "$@"; }
+# Client tasks run on Arinsal from packages/arinsal (it has no deps to compile).
+arinsal_task() { (cd "$ROOT/packages/arinsal" && mix "$@"); }
+
+step "prepare a copy of bench/rest"
 cp -R "$ROOT/poc/multitenancy/bench/rest" "$WORK/rest"
 rm -rf "$WORK/rest/_build" "$WORK/rest/deps"
-# Build tooling runs on stock OTP: compiling hpax on Arinsal fails (NOTES-cloud.md, "Arinsal gaps").
-STOCK_PATH="${STOCK_PATH:-/opt/homebrew/opt/erlang@29/bin:/opt/homebrew/opt/elixir/bin:/usr/bin:/bin}"
-(cd "$WORK/rest" && env -u ERL_ROOTDIR PATH="$STOCK_PATH" sh -c \
-  'mix deps.get && MIX_ENV=prod mix release --overwrite --path "$1"' _ "$WORK/rel" >"$WORK/build.log" 2>&1) \
-  || { cat "$WORK/build.log"; exit 1; }
-tar -C "$WORK/rel" -czf "$WORK/rest.tar.gz" lib releases
+sed -i.bak "s#\"../../../../packages/arinsal\"#\"$ROOT/packages/arinsal\"#" "$WORK/rest/mix.exs"
+(cd "$WORK/rest" && stock mix deps.get >"$WORK/deps.log" 2>&1) || { cat "$WORK/deps.log"; exit 1; }
 
-step "start the manager on $ADMIN (fake backend)"
+step "start the manager on $ADMIN (fake backend); projects print a marker via ERL_AFLAGS"
 erl -noshell -pa "$EBIN" -pa "$ELIXIR_LIB/ebin" -s arinsal_cloud \
   -arinsal_cloud admin_port "$ADMIN_PORT" \
   -arinsal_cloud data_dir "\"$WORK/data\"" \
+  -arinsal_cloud project_env '[{"ERL_AFLAGS","-s erlang display project_says_hello"}]' \
   >"$WORK/manager.log" 2>&1 &
 MGR_PID=$!
 for _ in $(seq 1 50); do
@@ -60,15 +68,18 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 [ "$(curl -s "$ADMIN/projects")" = "[]" ] || fail "expected an empty project list"
+OUT="$(arinsal_task arinsal.list --url "$ADMIN")"
+case "$OUT" in *"No projects"*) ;; *) fail "mix arinsal.list on an empty manager: $OUT" ;; esac
 
-step "deploy acme/shop and globex/shop"
-A="$(curl -sf -X PUT --data-binary @"$WORK/rest.tar.gz" "$ADMIN/projects/acme/shop")" || fail "deploy acme"
-G="$(curl -sf -X PUT --data-binary @"$WORK/rest.tar.gz" "$ADMIN/projects/globex/shop")" || fail "deploy globex"
-PA="$(echo "$A" | json_field port)"
-PG="$(echo "$G" | json_field port)"
+step "mix arinsal.deploy acme/shop and globex/shop"
+(cd "$WORK/rest" && stock mix arinsal.deploy --tenant acme --project shop --url "$ADMIN" >"$WORK/deploy_acme.log" 2>&1) || { cat "$WORK/deploy_acme.log"; fail "deploy acme"; }
+(cd "$WORK/rest" && stock mix arinsal.deploy --tenant globex --project shop --url "$ADMIN" >"$WORK/deploy_globex.log" 2>&1) || { cat "$WORK/deploy_globex.log"; fail "deploy globex"; }
+tail -1 "$WORK/deploy_acme.log"
+tail -1 "$WORK/deploy_globex.log"
+PA="$(curl -sf "$ADMIN/projects/acme/shop" | json_field port)"
+PG="$(curl -sf "$ADMIN/projects/globex/shop" | json_field port)"
 echo "acme on $PA, globex on $PG"
 { [ -n "$PA" ] && [ -n "$PG" ] && [ "$PA" != "$PG" ]; } || fail "ports not distinct"
-echo "$A" | grep -q '"state":"running"' || fail "acme not running: $A"
 
 step "curl both projects"
 for P in "$PA" "$PG"; do
@@ -77,19 +88,52 @@ for P in "$PA" "$PG"; do
   echo "port $P: $OUT"
 done
 
-step "list"
-LIST="$(curl -sf "$ADMIN/projects")"
+step "mix arinsal.list"
+LIST="$(arinsal_task arinsal.list --url "$ADMIN")"
 echo "$LIST"
-[ "$(echo "$LIST" | grep -o '"state":"running"' | wc -l | tr -d ' ')" = "2" ] || fail "expected two running projects"
+[ "$(echo "$LIST" | grep -c ' running ')" = "2" ] || fail "expected two running projects"
 
-step "redeploy acme (same release): port is kept"
-A2="$(curl -sf -X PUT --data-binary @"$WORK/rest.tar.gz" "$ADMIN/projects/acme/shop")" || fail "redeploy acme"
-[ "$(echo "$A2" | json_field port)" = "$PA" ] || fail "port changed on redeploy"
+step "mix arinsal.logs (manager lines and the project's own stdout)"
+LOGS="$(arinsal_task arinsal.logs --tenant acme --project shop --url "$ADMIN")"
+echo "$LOGS"
+echo "$LOGS" | grep -q "\[manager\] starting version 0.1.0 on 127.0.0.1:$PA" || fail "manager line missing from logs"
+echo "$LOGS" | grep -q "project_says_hello" || fail "project stdout not captured"
+grep -q "project_says_hello" "$WORK/data/acme/shop/out.log" || fail "out.log missing the project's stdout"
+
+step "mix arinsal.stop acme/shop: acme is down, globex untouched"
+arinsal_task arinsal.stop --tenant acme --project shop --url "$ADMIN"
+curl -sf -m 2 "http://127.0.0.1:$PA/t/1/items/1" >/dev/null 2>&1 && fail "acme still answers after stop"
+curl -sf "http://127.0.0.1:$PG/t/1/items/1" >/dev/null || fail "globex stopped by the acme stop"
+OUT="$(arinsal_task arinsal.list --url "$ADMIN")"
+case "$OUT" in *"acme/shop  stopped"*) ;; *) fail "acme not listed as stopped: $OUT" ;; esac
+
+step "mix arinsal.start acme/shop: same port, answers again"
+arinsal_task arinsal.start --tenant acme --project shop --url "$ADMIN"
+curl -sf "http://127.0.0.1:$PA/t/1/items/1" >/dev/null || fail "acme does not answer after start"
+OUT="$(arinsal_task arinsal.logs --tenant acme --project shop --url "$ADMIN")"
+case "$OUT" in *"[manager] stopping"*) ;; *) fail "stop line missing from logs: $OUT" ;; esac
+
+step "redeploy acme with mix arinsal.deploy: port kept, globex untouched"
+(cd "$WORK/rest" && stock mix arinsal.deploy --tenant acme --project shop --url "$ADMIN" >"$WORK/deploy_acme2.log" 2>&1) || { cat "$WORK/deploy_acme2.log"; fail "redeploy acme"; }
+[ "$(curl -sf "$ADMIN/projects/acme/shop" | json_field port)" = "$PA" ] || fail "port changed on redeploy"
 curl -sf "http://127.0.0.1:$PA/t/1/items/1" >/dev/null || fail "acme does not answer after redeploy"
 curl -sf "http://127.0.0.1:$PG/t/1/items/1" >/dev/null || fail "globex stopped by the acme redeploy"
 
 step "bad input"
 [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary garbage "$ADMIN/projects/acme/bad")" = "400" ] || fail "garbage tarball should be 400"
-[ "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is -X PUT --data-binary @"$WORK/rest.tar.gz" "$ADMIN/projects/acme/..")" = "400" ] || fail "bad name should be 400"
+[ "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is -X PUT --data-binary garbage "$ADMIN/projects/acme/..")" = "400" ] || fail "bad name should be 400"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "$ADMIN/projects/nobody/none")" = "404" ] || fail "unknown project should be 404"
+
+step "a failed deploy stays listed as failed; mix arinsal.delete removes it too"
+OUT="$(arinsal_task arinsal.list --url "$ADMIN")"
+case "$OUT" in *"acme/bad  failed"*) ;; *) fail "acme/bad not listed as failed: $OUT" ;; esac
+arinsal_task arinsal.delete --tenant acme --project bad --url "$ADMIN"
+
+step "mix arinsal.delete the rest: processes gone, files gone"
+arinsal_task arinsal.delete --tenant acme --project shop --url "$ADMIN"
+arinsal_task arinsal.delete --tenant globex --project shop --url "$ADMIN"
+curl -sf -m 2 "http://127.0.0.1:$PG/t/1/items/1" >/dev/null 2>&1 && fail "globex still answers after delete"
+[ "$(curl -s "$ADMIN/projects")" = "[]" ] || fail "projects remain after delete"
+[ -z "$(ls -A "$WORK/data")" ] || fail "data dir not empty after delete: $(ls -A "$WORK/data")"
 
 echo "PASS"
