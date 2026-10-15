@@ -8,6 +8,7 @@ start_link() ->
 
 init([]) ->
     Children = [
+        #{id => arinsal_cloud_log_sup, start => {arinsal_cloud_log_sup, start_link, []}, type => supervisor},
         #{id => arinsal_cloud_projects, start => {arinsal_cloud_projects, start_link, []}},
         #{id => arinsal_cloud_http, start => {arinsal_cloud_http, start_link, []}}
     ],

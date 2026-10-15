@@ -7,8 +7,18 @@ route_test_() ->
         ?_assertEqual(method_not_allowed, arinsal_cloud_http:route(<<"POST">>, [<<"projects">>])),
         ?_assertEqual({deploy, <<"a">>, <<"b">>},
                       arinsal_cloud_http:route(<<"PUT">>, [<<"projects">>, <<"a">>, <<"b">>])),
-        ?_assertEqual(method_not_allowed,
+        ?_assertEqual({get, <<"a">>, <<"b">>},
                       arinsal_cloud_http:route(<<"GET">>, [<<"projects">>, <<"a">>, <<"b">>])),
+        ?_assertEqual({delete, <<"a">>, <<"b">>},
+                      arinsal_cloud_http:route(<<"DELETE">>, [<<"projects">>, <<"a">>, <<"b">>])),
+        ?_assertEqual({stop, <<"a">>, <<"b">>},
+                      arinsal_cloud_http:route(<<"POST">>, [<<"projects">>, <<"a">>, <<"b">>, <<"stop">>])),
+        ?_assertEqual({start, <<"a">>, <<"b">>},
+                      arinsal_cloud_http:route(<<"POST">>, [<<"projects">>, <<"a">>, <<"b">>, <<"start">>])),
+        ?_assertEqual(method_not_allowed,
+                      arinsal_cloud_http:route(<<"GET">>, [<<"projects">>, <<"a">>, <<"b">>, <<"start">>])),
+        ?_assertEqual({logs, <<"a">>, <<"b">>},
+                      arinsal_cloud_http:route(<<"GET">>, [<<"projects">>, <<"a">>, <<"b">>, <<"logs">>])),
         ?_assertEqual(not_found, arinsal_cloud_http:route(<<"GET">>, [])),
         ?_assertEqual(not_found, arinsal_cloud_http:route(<<"GET">>, [<<"other">>])),
         ?_assertEqual(not_found, arinsal_cloud_http:route(<<"GET">>, [<<"projects">>, <<"a">>])),
@@ -38,7 +48,7 @@ valid_name_test_() ->
         ?_assertNot(arinsal_cloud_projects:valid_name("acme"))
     ].
 
-%% Deploy and list through the socket, with a stub backend.
+%% Operations through the socket, with a stub backend.
 
 http_flow_test_() ->
     {setup, fun setup/0, fun cleanup/1, fun(Ctx) -> {timeout, 60, fun() -> flow(Ctx) end} end}.
@@ -82,7 +92,31 @@ flow(#{port := Port, dir := Dir}) ->
     ?assertEqual(PortA, maps:get(<<"port">>, Again)),
     ?assertEqual(<<"2.1.0">>, maps:get(<<"version">>, Again)),
     ?assertNot(filelib:is_dir(filename:join([Dir, "acme", "shop", "2.0.0"]))),
+    %% details, logs, stop, start
+    ?assertMatch({200, #{<<"state">> := <<"running">>, <<"info">> := #{<<"backend">> := <<"stub">>}}},
+                 req(Port, "GET", "/projects/globex/shop", <<>>)),
+    {200, #{<<"lines">> := Lines, <<"next">> := Next}} = req(Port, "GET", "/projects/globex/shop/logs", <<>>),
+    ?assertEqual([<<"[manager] starting version 2.0.0 on 127.0.0.1:", (integer_to_binary(PortG))/binary>>,
+                  <<"stub output">>], Lines),
+    ?assertEqual(2, Next),
+    ?assertMatch({200, #{<<"lines">> := []}}, req(Port, "GET", "/projects/globex/shop/logs?since=2", <<>>)),
+    ?assertMatch({200, #{<<"ok">> := true}}, req(Port, "POST", "/projects/globex/shop/stop", <<>>)),
+    ?assertMatch({200, #{<<"state">> := <<"stopped">>, <<"ns">> := null}}, req(Port, "GET", "/projects/globex/shop", <<>>)),
+    ?assertMatch({200, #{<<"ok">> := true}}, req(Port, "POST", "/projects/globex/shop/stop", <<>>)),
+    ?assertMatch({200, #{<<"state">> := <<"running">>, <<"port">> := PortG}},
+                 req(Port, "POST", "/projects/globex/shop/start", <<>>)),
+    ?assertMatch({200, #{<<"state">> := <<"running">>}}, req(Port, "POST", "/projects/globex/shop/start", <<>>)),
+    {200, Text} = req_raw(Port, "GET", "/projects/globex/shop/logs?format=text&n=2", <<>>),
+    ?assertMatch([_, _, <<>>], binary:split(Text, <<"\n">>, [global])),
+    ?assert(filelib:is_regular(filename:join([Dir, "globex", "shop", "out.log"]))),
+    ?assertMatch({200, #{<<"ok">> := true}}, req(Port, "DELETE", "/projects/globex/shop", <<>>)),
+    ?assertMatch({404, _}, req(Port, "GET", "/projects/globex/shop", <<>>)),
+    ?assertNot(filelib:is_dir(filename:join(Dir, "globex"))),
     %% errors
+    ?assertMatch({404, #{<<"error">> := <<"not_found">>}}, req(Port, "POST", "/projects/nobody/none/stop", <<>>)),
+    ?assertMatch({404, _}, req(Port, "POST", "/projects/nobody/none/start", <<>>)),
+    ?assertMatch({404, _}, req(Port, "DELETE", "/projects/nobody/none", <<>>)),
+    ?assertMatch({404, _}, req(Port, "GET", "/projects/nobody/none/logs", <<>>)),
     ?assertMatch({400, #{<<"error">> := [<<"bad_release">>, _]}}, req(Port, "PUT", "/projects/acme/bad", <<"not a tarball">>)),
     Evil = tar([{"../evil", <<"x">>}]),
     ?assertMatch({400, #{<<"error">> := [<<"bad_release">>, [<<"unsafe_path">>, _]]}},
@@ -105,6 +139,10 @@ tar(Entries) ->
     Bin.
 
 req(Port, Method, Path, Body) ->
+    {Status, Payload} = req_raw(Port, Method, Path, Body),
+    {Status, json:decode(Payload)}.
+
+req_raw(Port, Method, Path, Body) ->
     {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}, {packet, raw}]),
     ok = gen_tcp:send(Sock, [Method, " ", Path, " HTTP/1.1\r\nHost: x\r\nContent-Length: ",
                              integer_to_list(byte_size(Body)), "\r\n\r\n", Body]),
@@ -112,7 +150,7 @@ req(Port, Method, Path, Body) ->
     gen_tcp:close(Sock),
     [Head, Payload] = binary:split(Resp, <<"\r\n\r\n">>),
     [<<"HTTP/1.1 ", Status:3/binary, _/binary>> | _] = binary:split(Head, <<"\r\n">>),
-    {binary_to_integer(Status), json:decode(Payload)}.
+    {binary_to_integer(Status), Payload}.
 
 recv_all(Sock, Acc) ->
     case gen_tcp:recv(Sock, 0, 30000) of

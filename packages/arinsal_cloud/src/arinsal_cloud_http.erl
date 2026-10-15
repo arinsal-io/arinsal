@@ -1,9 +1,12 @@
 %% Admin HTTP API on 127.0.0.1, plain gen_tcp with `{packet, http_bin}`.
 %%
 %%   GET    /projects                          list
+%%   GET    /projects/:tenant/:project         details with the backend info map
 %%   PUT    /projects/:tenant/:project         body: release tar.gz, unpack and (re)start
-%%
-%% More endpoints (details, stop, start, logs, delete) follow with the operations behind them.
+%%   POST   /projects/:tenant/:project/stop
+%%   POST   /projects/:tenant/:project/start
+%%   GET    /projects/:tenant/:project/logs?n=100[&since=Seq][&format=text]
+%%   DELETE /projects/:tenant/:project
 %%
 %% App env: admin_port (default 7000, 0 picks a free one), max_body_bytes (default 512 MiB).
 %% There is no authentication: it listens on loopback only.
@@ -14,7 +17,16 @@
 -export([route/2, handle/3, json_safe/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--type route() :: list | {deploy, binary(), binary()} | not_found | method_not_allowed.
+-type route() ::
+    list
+    | {get, binary(), binary()}
+    | {deploy, binary(), binary()}
+    | {start, binary(), binary()}
+    | {stop, binary(), binary()}
+    | {logs, binary(), binary()}
+    | {delete, binary(), binary()}
+    | not_found
+    | method_not_allowed.
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -28,7 +40,13 @@ port() ->
 route(Method, [<<"projects">>]) ->
     one_of(Method, [{<<"GET">>, list}]);
 route(Method, [<<"projects">>, T, P]) ->
-    one_of(Method, [{<<"PUT">>, {deploy, T, P}}]);
+    one_of(Method, [{<<"GET">>, {get, T, P}}, {<<"PUT">>, {deploy, T, P}}, {<<"DELETE">>, {delete, T, P}}]);
+route(Method, [<<"projects">>, T, P, <<"stop">>]) ->
+    one_of(Method, [{<<"POST">>, {stop, T, P}}]);
+route(Method, [<<"projects">>, T, P, <<"start">>]) ->
+    one_of(Method, [{<<"POST">>, {start, T, P}}]);
+route(Method, [<<"projects">>, T, P, <<"logs">>]) ->
+    one_of(Method, [{<<"GET">>, {logs, T, P}}]);
 route(_, _) ->
     not_found.
 
@@ -46,23 +64,62 @@ handle(Method, Target, Body) ->
             json(400, #{error => bad_request});
         Uri ->
             Segments = binary:split(maps:get(path, Uri, <<>>), <<"/">>, [global, trim_all]),
-            dispatch(route(Method, Segments), Body)
+            Query = case uri_string:dissect_query(maps:get(query, Uri, <<>>)) of
+                {error, _, _} -> [];
+                Pairs -> Pairs
+            end,
+            dispatch(route(Method, Segments), Query, Body)
     end.
 
-dispatch(not_found, _) ->
+dispatch(not_found, _, _) ->
     json(404, #{error => not_found});
-dispatch(method_not_allowed, _) ->
+dispatch(method_not_allowed, _, _) ->
     json(405, #{error => method_not_allowed});
-dispatch(list, _) ->
+dispatch(list, _, _) ->
     json(200, arinsal_cloud_projects:list());
-dispatch({deploy, T, P}, Body) ->
-    case arinsal_cloud_projects:deploy(T, P, Body) of
-        {ok, Project} -> json(200, Project);
-        {error, Reason} -> json(error_status(Reason), #{error => Reason})
+dispatch({get, T, P}, _, _) ->
+    reply(arinsal_cloud_projects:get(T, P));
+dispatch({deploy, T, P}, _, Body) ->
+    reply(arinsal_cloud_projects:deploy(T, P, Body));
+dispatch({start, T, P}, _, _) ->
+    reply(arinsal_cloud_projects:start(T, P));
+dispatch({stop, T, P}, _, _) ->
+    reply(arinsal_cloud_projects:stop(T, P));
+dispatch({delete, T, P}, _, _) ->
+    reply(arinsal_cloud_projects:delete(T, P));
+dispatch({logs, T, P}, Query, _) ->
+    N = int_param(<<"n">>, Query, 100),
+    Since = int_param(<<"since">>, Query, 0),
+    case arinsal_cloud_projects:logs(T, P, #{n => N, since => Since}) of
+        {ok, Lines, Next} ->
+            case proplists:get_value(<<"format">>, Query) of
+                <<"text">> ->
+                    {200, <<"text/plain; charset=utf-8">>, [[L, $\n] || L <- Lines]};
+                _ ->
+                    json(200, #{lines => Lines, next => Next})
+            end;
+        {error, _} = Error ->
+            reply(Error)
     end.
 
+int_param(Name, Query, Default) ->
+    case proplists:get_value(Name, Query) of
+        undefined -> Default;
+        Value ->
+            case string:to_integer(Value) of
+                {Int, <<>>} when Int >= 0 -> Int;
+                _ -> Default
+            end
+    end.
+
+reply({ok, Value}) -> json(200, Value);
+reply(ok) -> json(200, #{ok => true});
+reply({error, Reason}) -> json(error_status(Reason), #{error => Reason}).
+
+error_status(not_found) -> 404;
 error_status(bad_name) -> 400;
 error_status({bad_release, _}) -> 400;
+error_status(no_release) -> 409;
 error_status(busy) -> 409;
 error_status(_) -> 500.
 
