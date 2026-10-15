@@ -96,6 +96,13 @@ impl Vm {
         args: natives::NativeArgs<'_>,
     ) -> Option<Result<Term, VmError>> {
         let (class, bits) = resolved;
+        // arl: a root-only native is refused for a process inside a namespace.
+        if p.ns != 0
+            && let Some(error) =
+                natives::root_only::refuse(p, Some(ctx), module, function, args.len())
+        {
+            return Some(Err(error));
+        }
         if class == ImportClass::Dynamic
             && let Some(result) = args.with_values(p, |p, values| {
                 signals::call(self, p, ctx, module, function, values)

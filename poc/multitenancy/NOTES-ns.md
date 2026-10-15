@@ -57,6 +57,37 @@
   ns (`Runtime::process_pids_visible`). `registered/0` is left to the names stream.
 - Tests: ns_process_cap_system_limit, ns_destroy_closes_spawns, ns_info_counts, ns_list, ns_processes_filtered.
 
+## Chunk 4: RootOnly natives, halt, group_leader
+- List: `crates/vm/src/natives/root_only.rs` (`ROOT_ONLY` plus whole modules `erts_debug`, `erl_debugger`,
+  `erts_trace_cleaner`, `erts_literal_area_collector`, `erl_ddll`). It names the lowest-level native of each
+  feature, so the `erlang` wrappers (`halt/1`, `trace/3`, `open_port/2`, `suspend_process/1`, `system_monitor/2`,
+  `os:cmd` through open_port, ...) end in it. Kept out on purpose: code loading natives (code-domain stream),
+  `os:getenv/putenv` (env overlay, names stream), `erlang:statistics`/`system_info` (known gap), `display`.
+- Error: `notsup`, the error OTP gives for a feature the node lacks. The check is one `p.ns != 0` test at
+  each entry, so root pays nothing.
+- Entries that must carry the check, all marked `// arl:`:
+  1. `Vm::dispatch_native_source` (every native: static calls, apply fallback, JIT export dispatch).
+  2. `bif_traps::execute_named` (trapping BIFs, e.g. `erts_debug:set_internal_state`, `erlang:halt/2`).
+  3. `call_named_untraced` resolved-handler branch (apply of a signal handler such as
+     `erts_internal:dirty_process_handle_signals`).
+  4. JIT: `natives::process_bif` returns `None` for a root-only native, and `intern_identity` drops `bif` and
+     `direct_ets` and the trap light entry for it, so native code never calls a root-only body directly.
+  `natives::tests::root_only_natives_reach_the_dispatcher` checks every `ROOT_ONLY` entry is a listed native
+  and not a light process BIF or ETS handler. Both the JIT and `ARINSAL_INTERP=1` pass the ns_core tests.
+- `open_port` is refused as the brief says. A project that listens on a socket (Bandit) needs ports, so the
+  boot or manager step will have to relax this, for example by allowing the inet drivers
+  (`tcp_inet`, `udp_inet`, `sctp_inet`) and gating `erts_internal:port_*` by port owner. The port natives
+  (`port_command` and friends) are root only for now for the same reason.
+- `erlang:halt/0,1,2` from a namespace destroys that namespace (`destroy_namespace`: close, kill both scans) and
+  ends the caller with `killed`; the node keeps running. `init:stop/0` from a ns sends to root `init`, which
+  drops it; a ns-local init comes with the boot step.
+- `group_leader(Leader, Pid)` from a ns: `badarg` when `Leader` is in another ns and not SHARED. Checked in
+  `group_leader_call`, in the light self path (`group_leader_self_light` declines, the executor path refuses)
+  and in the target's request handler (replies `{Ref, badarg}`). `spawn_opt(..., {group_leader, _})` is not
+  checked yet.
+- `catch erlang:ports()` and other calls the compiler knows cannot fail lose their `catch`; tests call them
+  through `apply` with variables.
+
 ## Microbench at ns 0
 `cargo run -r -p arinsal-sched --example bench -- <name>` (4 workers), 3 runs each on a busy machine, base is
 8ee3755 (before this work), new is the branch head. ns/op, best of 3:

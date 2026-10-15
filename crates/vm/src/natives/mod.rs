@@ -11,6 +11,7 @@ pub(crate) mod erts_debug;
 pub(crate) use erts_debug::internal_state_enabled;
 pub(crate) mod misc;
 pub(crate) mod ns;
+pub mod root_only;
 pub(crate) mod sys;
 
 /// `table` contains `module:function/arity`.
@@ -368,6 +369,10 @@ pub(crate) type ProcessBif =
 
 /// The process BIF native code calls for `module:function/arity`, if it has one.
 pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<ProcessBif> {
+    // arl: a root-only native must reach the dispatcher, which holds the namespace check.
+    if root_only::root_only(module, function, arity) {
+        return None;
+    }
     // Port of bif.tab `hbif erts_internal:garbage_collect/1`: a plain BIF called
     // through the export entry (`call_light_bif`), not an executor native.
     if module == "erts_internal" && function == "garbage_collect" && arity == 1 {
@@ -742,6 +747,36 @@ mod tests {
             let (class, bits) = classify("erlang", function, arity, true);
             assert_eq!(class, ImportClass::Pure, "erlang:{function}/{arity}");
             assert_eq!(bits, 0);
+        }
+    }
+
+    #[test]
+    fn root_only_natives_reach_the_dispatcher() {
+        for &(module, function, arity) in root_only::ROOT_ONLY {
+            assert!(
+                implemented_natives().contains(&(module, function, arity)),
+                "{module}:{function}/{arity} is root only but not a listed native"
+            );
+        }
+        for &(module, function, arity) in implemented_natives() {
+            if !root_only::root_only(module, function, arity) {
+                continue;
+            }
+            let name = format!("{module}:{function}/{arity}");
+            assert!(
+                process_bif(module, function, arity).is_none(),
+                "{name} is a light process BIF"
+            );
+            assert!(
+                ets::handler(module, function, arity).is_none(),
+                "{name} is an ETS handler"
+            );
+        }
+        for module in root_only::root_modules() {
+            assert!(
+                implemented_natives().iter().any(|(m, _, _)| m == module),
+                "{module} has no native"
+            );
         }
     }
 

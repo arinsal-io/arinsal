@@ -6,7 +6,7 @@ use crate::process::Message;
 use crate::signals::{ErlSpawnOpts, atom, erl_create_process};
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_sched::{NS_ID_MASK, Pid, Priority, RunCtx, Signal};
+use arinsal_sched::{NS_ID_MASK, Pid, Priority, RunCtx};
 use arinsal_term::{Term, from_owned, to_owned};
 
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
@@ -238,8 +238,7 @@ fn list(process: &mut Process) -> Result<Term, VmError> {
 }
 
 /// Mark `ns` destroyed and send `kill` to every process of it. The processes exit shortly
-/// after. Spawning into the namespace fails from the moment it is marked, so a second scan
-/// finds the children that were created while the first signals were in flight.
+/// after; see [`super::root_only::destroy_namespace`].
 fn destroy(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -248,14 +247,7 @@ fn destroy(
     let ns = ns_arg(ns)?;
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     runtime.namespaces.get(ns).ok_or_else(badarg)?;
-    runtime.namespaces.close(ns);
-    let scheduler = runtime.scheduler()?;
-    for _ in 0..2 {
-        for pid in scheduler.pids_in_ns(ns) {
-            let reason = Message::copy_from(atom("kill"))?;
-            let _ = ctx.signal(pid, Signal::Exit(reason));
-        }
-    }
+    super::root_only::destroy_namespace(process, ctx, ns);
     Ok(atom("ok"))
 }
 
