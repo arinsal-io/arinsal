@@ -30,6 +30,8 @@ struct PollMsacc {
     started: Instant,
     check_io_ns: u64,
     sleep_ns: u64,
+    /// Total time accounting was on: what a thread that only sleeps (aux, async) accrues.
+    window_ns: u64,
 }
 
 impl PollMsacc {
@@ -42,6 +44,7 @@ impl PollMsacc {
                 PollState::Sleep => &mut self.sleep_ns,
             };
             *counter = counter.saturating_add(elapsed);
+            self.window_ns = self.window_ns.saturating_add(elapsed);
         }
         self.started = now;
     }
@@ -57,6 +60,7 @@ fn poll_msacc() -> &'static Mutex<PollMsacc> {
             started: Instant::now(),
             check_io_ns: 0,
             sleep_ns: 0,
+            window_ns: 0,
         })
     })
 }
@@ -72,12 +76,13 @@ pub(crate) fn set_msacc_enabled(enabled: bool) {
     msacc.started = now;
 }
 
-/// Snapshot the poll thread's check-I/O and sleep counters in nanoseconds.
+/// Snapshot the poll thread's check-I/O and sleep counters and the accounted-time total, in
+/// nanoseconds.
 // Port of erts/emulator/sys/common/erl_check_io.c:558-649, OTP-29.1.1.
-pub(crate) fn msacc_snapshot() -> [u64; 2] {
+pub(crate) fn msacc_snapshot() -> [u64; 3] {
     let mut msacc = poll_msacc().lock().expect("poll microstate");
     msacc.update(Instant::now());
-    [msacc.check_io_ns, msacc.sleep_ns]
+    [msacc.check_io_ns, msacc.sleep_ns, msacc.window_ns]
 }
 
 fn set_poll_state(state: PollState) {

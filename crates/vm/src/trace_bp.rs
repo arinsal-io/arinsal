@@ -1027,6 +1027,11 @@ struct SiteBreakpoints {
     epoch: u64,
     generation: u64,
     bps: Vec<SiteBp>,
+    /// The traced function: arity, `func_id` and names (the initial-call test of call_memory).
+    arity: u8,
+    ci: u32,
+    module: String,
+    function: String,
 }
 
 struct SiteBp {
@@ -1034,6 +1039,8 @@ struct SiteBp {
     /// Active flags without the export entry's global trace, which a code entry never runs.
     flags: u32,
     count: Option<Arc<AtomicU64>>,
+    time: Option<Arc<TimemTrace>>,
+    memory: Option<Arc<TimemTrace>>,
 }
 
 const SITE_CACHE_SIZE: usize = 64;
@@ -1066,22 +1073,31 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
     }
     let ix = bp_node(process).active_bp_ix();
     let table = bp_node(process).tables.current.read().unwrap();
-    let bps = crate::native_bridge::with_native_function_at(site, |function| {
-        function_bps(
-            &table,
-            runtime,
-            code,
-            &function.module,
-            &function.function,
-            function.arity,
-        )
-        .map(|g| SiteBp {
-            session: g.session,
-            flags: g.data[ix].flags & !BPF_GLOBAL_TRACE,
-            count: g.data[ix].count.clone(),
-        })
-        .collect::<Vec<_>>()
-    })?;
+    let (bps, arity, module, function_name) =
+        crate::native_bridge::with_native_function_at(site, |function| {
+            let bps = function_bps(
+                &table,
+                runtime,
+                code,
+                &function.module,
+                &function.function,
+                function.arity,
+            )
+            .map(|g| SiteBp {
+                session: g.session,
+                flags: g.data[ix].flags & !BPF_GLOBAL_TRACE,
+                count: g.data[ix].count.clone(),
+                time: g.data[ix].time.clone(),
+                memory: g.data[ix].memory.clone(),
+            })
+            .collect::<Vec<_>>();
+            (
+                bps,
+                function.arity,
+                function.module.clone(),
+                function.function.clone(),
+            )
+        })?;
     drop(table);
     let entry = Arc::new(SiteBreakpoints {
         site,
@@ -1090,54 +1106,139 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
         epoch,
         generation,
         bps,
+        arity,
+        ci: func_id(&module, &function_name, arity),
+        module,
+        function: function_name,
     });
     SITE_CACHE.with(|cache| cache.borrow_mut()[slot] = Some(entry.clone()));
     Some(entry)
 }
 
-/// Native-code `erts_generic_breakpoint` of the trampoline at `site`: whether every breakpoint
-/// on the function only counts calls for this process. When so, the counters are incremented
-/// and the call proceeds without a trace event; otherwise nothing is touched.
-// Port of erts/emulator/beam/beam_bp.c:994-1060 (erts_generic_breakpoint, do_session_breakpoint),
-// OTP-29.1.1.
-pub(crate) fn native_breakpoint_noop(process: &Process, pid: Pid, site: usize) -> bool {
+/// What a native trampoline hit did when it needs no trace event: the counters are
+/// incremented and the call time or memory accounted. `actions` are the return frames to push.
+pub(crate) struct NativeBreakpointHit {
+    pub(crate) actions: Vec<crate::trace::NativeTraceAction>,
+    pub(crate) arity: u8,
+}
+
+/// Native-code `erts_generic_breakpoint` of the trampoline at `site` for a function whose
+/// breakpoints for this process only count and account call time or memory. `None` means a
+/// trace event, a debug breakpoint or a frame the native code cannot judge is involved, and
+/// nothing has been touched: the executor must run the breakpoint.
+// Port of erts/emulator/beam/beam_bp.c:994-1160 (erts_generic_breakpoint, do_session_breakpoint
+// for ERTS_BPF_COUNT_ACTIVE, ERTS_BPF_TIME_TRACE_ACTIVE and ERTS_BPF_MEM_TRACE_ACTIVE),
+// OTP-29.1.1, as the JIT trampoline fragment calls it without leaving native code.
+pub(crate) fn native_breakpoint_accounting(
+    process: &mut Process,
+    pid: Pid,
+    site: usize,
+) -> Option<NativeBreakpointHit> {
     if crate::trace::is_sensitive(process, pid) {
-        return true;
+        return Some(NativeBreakpointHit {
+            actions: Vec::new(),
+            arity: 0,
+        });
     }
-    let Some(entry) = site_breakpoints(process, site) else {
-        return false;
-    };
+    let entry = site_breakpoints(process, site)?;
     let acc = BPF_TIME_TRACE_ACTIVE | BPF_MEM_TRACE_ACTIVE;
-    // The debug and return_to checks need the function name, but only when one is in use.
     if DEBUG_BREAKPOINTS_USED.load(Ordering::Relaxed)
-        && crate::native_bridge::with_native_function_at(site, |function| {
-            debug_breakpoint_enabled(
-                process,
-                &function.module,
-                &function.function,
-                function.arity,
-            )
-        })
-        .unwrap_or(true)
+        && debug_breakpoint_enabled(process, &entry.module, &entry.function, entry.arity)
         || crate::trace::return_to_enabled(process)
     {
-        return false;
+        return None;
     }
-    if !entry.bps.iter().all(|bp| {
-        bp.flags & BPF_META_TRACE == 0
-            && (bp.flags & (BPF_LOCAL_TRACE | acc) == 0
-                || crate::trace::session_flags(process, bp.session, pid) & crate::trace::CALL == 0)
-    }) {
-        return false;
+    // A session that does not trace calls of this process runs nothing but the counters.
+    let mut traced = [false; 4];
+    let mut any_acc = false;
+    if entry.bps.len() > traced.len() {
+        return None;
     }
-    for bp in &entry.bps {
-        if bp.flags & BPF_COUNT_ACTIVE != 0
+    for (index, bp) in entry.bps.iter().enumerate() {
+        if bp.flags & BPF_META_TRACE != 0 {
+            return None;
+        }
+        if bp.flags & (BPF_LOCAL_TRACE | acc) != 0 {
+            traced[index] =
+                crate::trace::session_flags(process, bp.session, pid) & crate::trace::CALL != 0;
+            if traced[index] && bp.flags & BPF_LOCAL_TRACE != 0 {
+                return None;
+            }
+            any_acc |= traced[index] && bp.flags & acc != 0;
+        }
+    }
+    // The call acc frame is not pushed on top of another trace frame (tail recursion).
+    let mut frame_on_top = false;
+    if any_acc {
+        let top = process.heap.stack_get(0)?.tagged_word() as usize;
+        if top == crate::native_bridge::native_trace_return_address() {
+            frame_on_top = true;
+        } else if !crate::native_bridge::is_native_function_at(top) {
+            return None;
+        }
+        if entry.arity > 6 {
+            return None;
+        }
+    }
+    let mut actions = Vec::new();
+    for (index, bp) in entry.bps.iter().enumerate() {
+        let bp_flags = if traced[index] || bp.flags & (BPF_LOCAL_TRACE | acc) == 0 {
+            bp.flags
+        } else {
+            bp.flags & !(BPF_LOCAL_TRACE | acc)
+        };
+        if bp_flags & BPF_COUNT_ACTIVE != 0
             && let Some(count) = &bp.count
         {
             count.fetch_add(1, Ordering::Relaxed);
         }
+        if bp_flags & acc == 0 {
+            continue;
+        }
+        let mut prev = None;
+        if bp_flags & BPF_TIME_TRACE_ACTIVE != 0
+            && let Some(bdt) = bp.time.as_ref()
+        {
+            let time = arinsal_bifs::monotonic_time_nanos() as i64;
+            prev = trace_call_acc(process, pid, bp.session, false, entry.ci, time, bdt);
+        }
+        if bp_flags & BPF_MEM_TRACE_ACTIVE != 0
+            && let Some(bdt) = bp.memory.as_ref()
+        {
+            let adjustment = call_memory_adjustment(process, bp.session);
+            // The initial call of a process starts counting from zero.
+            let allocated = if adjustment.is_none()
+                && crate::trace::is_initial_call(
+                    process,
+                    &entry.module,
+                    &entry.function,
+                    entry.arity,
+                ) {
+                0
+            } else {
+                process.allocated_words(adjustment.unwrap_or(0))
+            };
+            prev = trace_call_acc(process, pid, bp.session, true, entry.ci, allocated, bdt);
+        }
+        if !frame_on_top {
+            actions.push(crate::trace::NativeTraceAction {
+                session: bp.session,
+                return_trace: false,
+                exception_trace: false,
+                return_to: false,
+                acc: Some(crate::trace::CallAcc {
+                    flags: bp_flags & acc,
+                    prev,
+                }),
+            });
+        }
     }
-    true
+    // dedupe_return_frames: after the first acc frame the others would sit on a trace frame.
+    actions.truncate(1);
+    Some(NativeBreakpointHit {
+        actions,
+        arity: entry.arity,
+    })
 }
 
 /// The functions among `functions` that have a breakpoint of any session: clearing, pausing or
@@ -1808,6 +1909,7 @@ pub(crate) fn trace_call_acc(
         .iter()
         .find(|pbt| pbt.session == session)
         .map(|pbt| (pbt.ci, pbt.accumulator));
+    let mut counted = false;
     match known {
         None => {
             // First call of the process to an instrumented function.
@@ -1822,13 +1924,21 @@ pub(crate) fn trace_call_acc(
         Some((Some(previous), accumulator)) => {
             // Add time/allocation to the previous code; none if its breakpoint was removed.
             if let Some(previous_bdt) = cached_timem_break(process, session, previous, memory) {
-                previous_bdt.accum(pid, 0, accum - accumulator);
+                if std::ptr::eq(&*previous_bdt, bdt) {
+                    // Recursion: one bucket update takes the call and the time.
+                    previous_bdt.accum(pid, 1, accum - accumulator);
+                    counted = true;
+                } else {
+                    previous_bdt.accum(pid, 0, accum - accumulator);
+                }
             }
         }
         // The caller is not call_time traced.
         Some((None, _)) => {}
     }
-    bdt.accum(pid, 1, 0);
+    if !counted {
+        bdt.accum(pid, 1, 0);
+    }
     let pbt = pbt_list(process, memory)
         .iter_mut()
         .find(|pbt| pbt.session == session)

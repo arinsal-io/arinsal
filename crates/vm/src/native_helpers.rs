@@ -1021,6 +1021,29 @@ pub extern "C" fn arinsal_beamasm_native_trace_return(header: *mut ProcessHeader
             .map_or(0, |word| word.tagged_word());
     };
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+    if frames
+        .iter()
+        .all(|(_, actions)| actions.iter().all(|action| action.acc.is_some()))
+        && let Some(pid) = process.self_pid
+    {
+        // Port of erts/emulator/beam/emu/trace_instrs.tab:54-70 (i_call_trace_return calls
+        // erts_call_trace_return), OTP-29.1.1: call time and memory accounting needs no tracer
+        // context, so the return stays in native code.
+        for (_, actions) in &frames {
+            for action in actions.iter().rev() {
+                if let Some(acc) = action.acc {
+                    crate::trace::call_acc_return(
+                        process,
+                        pid,
+                        action.session,
+                        acc.flags,
+                        acc.prev,
+                    );
+                }
+            }
+        }
+        return saved_caller.tagged_word();
+    }
     if frames.iter().any(|(_, actions)| !actions.is_empty()) {
         // The return events need the scheduler's tracer context (and the return_to event the
         // caller), so the return leaves native code like a trapped call and resumes at the
@@ -2839,6 +2862,38 @@ pub(crate) fn debug_assert_native_heap(_process: &crate::Process) {
     }
 }
 
+/// Runs the breakpoint of the traced function at `site` in native code when it only counts
+/// calls and accounts call time or memory: the return frame is pushed and the call goes on.
+// Port of erts/emulator/beam/jit/arm/instr_trace.cpp:62-95 (the trampoline fragment calls
+// erts_generic_breakpoint and resumes), OTP-29.1.1.
+fn native_breakpoint_accounted(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    site: usize,
+) -> bool {
+    let Some(pid) = process.self_pid else {
+        return false;
+    };
+    let Some(hit) = crate::trace_bp::native_breakpoint_accounting(process, pid, site) else {
+        return false;
+    };
+    if hit.actions.is_empty() {
+        return true;
+    }
+    // The header holds the live reduction counter of the native code; publishing the header
+    // below must not rewind it.
+    process.reductions = process.header.fcalls;
+    // The frame may need a collection, whose roots are the function's arguments.
+    load_dispatch_x(process, registers);
+    if crate::trace::push_native_trace_frame(process, site, &hit.actions, usize::from(hit.arity))
+        .is_err()
+    {
+        crate::native_hooks::set_error(process, "system_limit");
+    }
+    publish_dispatch_x(process, registers);
+    true
+}
+
 #[cold]
 #[inline(never)]
 fn invoke_dispatch_bif_slow(
@@ -2854,7 +2909,7 @@ fn invoke_dispatch_bif_slow(
         .set_frame_pointer(registers.tmp_mem[2] as usize);
     if identity == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY
         && !export_call
-        && crate::trace::native_breakpoint_is_noop(process, site)
+        && native_breakpoint_accounted(process, registers, site)
     {
         // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:62-95 (call erts_generic_breakpoint
         // from the trampoline fragment), OTP-29.1.1: nothing to report, so the call goes on in

@@ -1548,6 +1548,8 @@ struct DirtyStats {
     msacc_ns: [u64; MSACC_STATE_COUNT],
     msacc_state: MsaccState,
     msacc_started: Instant,
+    /// Counters advance only while microstate accounting is on (`erts_msacc_enabled`).
+    msacc_enabled: bool,
 }
 
 impl DirtyStats {
@@ -1558,14 +1560,33 @@ impl DirtyStats {
             msacc_ns: [0; MSACC_STATE_COUNT],
             msacc_state: MsaccState::Other,
             msacc_started: Instant::now(),
+            msacc_enabled: false,
         }
+    }
+
+    /// Switch accounting on or off, closing the open segment when it goes off.
+    // Port of erts/emulator/beam/erl_msacc.c (reply_msacc and the unmanaged-thread
+    // ERTS_MSACC_DISABLE branch of erts_msacc_request), OTP-29.1.1: a thread that slept
+    // through the window still has its sleep time counted.
+    fn set_msacc_enabled(&mut self, enabled: bool) {
+        if self.msacc_enabled == enabled {
+            return;
+        }
+        let now = Instant::now();
+        if self.msacc_enabled {
+            let elapsed = now.duration_since(self.msacc_started).as_nanos();
+            let counter = &mut self.msacc_ns[self.msacc_state as usize];
+            *counter = counter.saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX));
+        }
+        self.msacc_started = now;
+        self.msacc_enabled = enabled;
     }
 
     // Port of erts/emulator/beam/erl_msacc.h:300 (erts_msacc_set_state_m), OTP-29.1.1.
     // Counters only advance while microstate accounting is enabled.
-    fn set_state(&mut self, state: MsaccState, msacc: bool) {
+    fn set_state(&mut self, state: MsaccState) {
         let now = Instant::now();
-        if msacc {
+        if self.msacc_enabled {
             let elapsed = now.duration_since(self.msacc_started).as_nanos();
             let counter = &mut self.msacc_ns[self.msacc_state as usize];
             *counter = counter.saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX));
@@ -1574,26 +1595,26 @@ impl DirtyStats {
         self.msacc_started = now;
     }
 
-    fn begin_active(&mut self, msacc: bool) {
-        self.set_state(MsaccState::Emulator, msacc);
+    fn begin_active(&mut self) {
+        self.set_state(MsaccState::Emulator);
         self.active_started = Some(Instant::now());
     }
 
-    fn end_active(&mut self, msacc: bool) {
+    fn end_active(&mut self) {
         if let Some(started) = self.active_started.take() {
             let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             self.active_ns = self.active_ns.saturating_add(elapsed);
         }
-        self.set_state(MsaccState::Other, msacc);
+        self.set_state(MsaccState::Other);
     }
 
-    fn snapshot(&self, msacc_enabled: bool) -> (u64, [u64; MSACC_STATE_COUNT]) {
+    fn snapshot(&self) -> (u64, [u64; MSACC_STATE_COUNT]) {
         let active = self.active_started.map_or(self.active_ns, |started| {
             self.active_ns
                 .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
         });
         let mut msacc = self.msacc_ns;
-        if msacc_enabled {
+        if self.msacc_enabled {
             let current =
                 u64::try_from(self.msacc_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             msacc[self.msacc_state as usize] =
@@ -1823,19 +1844,13 @@ impl<T: Task> Inner<T> {
         }
     }
 
-    fn msacc_accounting(&self) -> bool {
-        self.accounting_flags.load(Ordering::Relaxed) & ACCOUNTING_MSACC != 0
-    }
-
     fn dirty_stats(&self) -> DirtyStatsSnapshot {
         let mut active = [Vec::new(), Vec::new()];
         let mut msacc = [Vec::new(), Vec::new()];
         let mut lengths = [0; 2];
-        let msacc_enabled = self.msacc_accounting();
         for (index, pool) in self.dirty.iter().enumerate() {
             for thread in &pool.threads {
-                let (thread_active, thread_msacc) =
-                    thread.stats.lock().unwrap().snapshot(msacc_enabled);
+                let (thread_active, thread_msacc) = thread.stats.lock().unwrap().snapshot();
                 active[index].push(thread_active);
                 msacc[index].push(thread_msacc);
             }
@@ -5750,6 +5765,11 @@ impl<T: Task> Scheduler<T> {
         // Port of erl_msacc.h:240 (`ERTS_MSACC_IS_ENABLED`): the collector reads the
         // clock only while accounting is on.
         arinsal_term::set_gc_clock_for_msacc(enabled);
+        for pool in &self.inner.dirty {
+            for thread in &pool.threads {
+                thread.stats.lock().unwrap().set_msacc_enabled(enabled);
+            }
+        }
         self.wake_all_workers();
     }
 
@@ -7311,14 +7331,17 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
                 .wheel
                 .next_timeout()
                 .map(|next| next.saturating_sub(inner.clock.now_ms()));
-            local.set_msacc_state(MsaccState::Sleep);
             local.set_wall_enabled(false);
             thr_progress::scheduler_prepare_wait();
+            // Port of erts/emulator/beam/erl_process.c (scheduler_wait): the sleep state
+            // covers only the blocking wait.
+            local.set_msacc_state(MsaccState::Sleep);
             if let Some(ms) = timer_ms {
                 thread::park_timeout(Duration::from_millis(ms.max(1)));
             } else {
                 thread::park();
             }
+            local.set_msacc_state(MsaccState::Other);
             thr_progress::scheduler_finalize_wait();
             inner.parked[id].store(false, Ordering::SeqCst);
             continue;
@@ -7333,7 +7356,6 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             inner.poll_pending_waits(&mut *local, true);
             inner.evacuate_offline_local(&mut *local);
             local.set_wall_enabled(false);
-            local.set_msacc_state(MsaccState::Sleep);
             // Port of erts/emulator/beam/erl_process.c:3404 (scheduler_wait), OTP-29.1.1.
             // Publish the sleeping flag, then look again. An enqueue that does not
             // see the flag advances work_epochs; one that does calls ssi_wake.
@@ -7377,6 +7399,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
                 spins -= 1;
             }
             if inner.parked[id].load(Ordering::SeqCst) {
+                local.set_msacc_state(MsaccState::Sleep);
                 if has_local_timers {
                     thread::park_timeout(Duration::from_millis(10));
                 } else {
@@ -7387,6 +7410,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
                         thread::park();
                     }
                 }
+                local.set_msacc_state(MsaccState::Other);
             }
             thr_progress::scheduler_finalize_wait();
             inner.parked[id].store(false, Ordering::SeqCst);
@@ -7618,7 +7642,6 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             (a, b) => a.or(b),
         };
 
-        local.set_msacc_state(MsaccState::Sleep);
         local.set_wall_enabled(false);
         inner.waiting_schedulers.fetch_add(1, Ordering::Relaxed);
         inner.balance.set_waiting(id, true);
@@ -7640,16 +7663,23 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         }
         if !inner.parked[id].load(Ordering::SeqCst) {
             // Woken while spinning.
-        } else if let Some(ms) = wait_ms {
-            thread::park_timeout(Duration::from_millis(ms.max(1)));
         } else {
-            // `Thread::park` can return spuriously. A real wake clears `parked`
-            // before `unpark` (ssi_wake). Stay asleep until that happens so a
-            // spurious return does not fall into `try_steal_task`.
-            while inner.parked[id].load(Ordering::SeqCst) && !inner.stopped.load(Ordering::Acquire)
-            {
-                thread::park();
+            // Port of erts/emulator/beam/erl_process.c (scheduler_wait): the sleep state
+            // wraps only the blocking wait, the spin above counts as `other`.
+            local.set_msacc_state(MsaccState::Sleep);
+            if let Some(ms) = wait_ms {
+                thread::park_timeout(Duration::from_millis(ms.max(1)));
+            } else {
+                // `Thread::park` can return spuriously. A real wake clears `parked`
+                // before `unpark` (ssi_wake). Stay asleep until that happens so a
+                // spurious return does not fall into `try_steal_task`.
+                while inner.parked[id].load(Ordering::SeqCst)
+                    && !inner.stopped.load(Ordering::Acquire)
+                {
+                    thread::park();
+                }
             }
+            local.set_msacc_state(MsaccState::Other);
         }
         steal_armed = true;
         thr_progress::scheduler_finalize_wait();
@@ -7741,11 +7771,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
     let thread = &pool.threads[index];
     let slot = pool.first_slot + index;
     let _ = thread.handle.set(thread::current());
-    thread
-        .stats
-        .lock()
-        .unwrap()
-        .set_state(MsaccState::Sleep, inner.msacc_accounting());
+    thread.stats.lock().unwrap().set_state(MsaccState::Other);
     loop {
         let process = {
             let mut queue = pool.queue.lock().unwrap();
@@ -7782,7 +7808,11 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                     spins -= 1;
                 }
                 if !thread.wake.load(Ordering::SeqCst) {
+                    // Port of erts/emulator/beam/erl_process.c (scheduler_wait): `sleep`
+                    // wraps only the blocking wait; the spin above counts as `other`.
+                    thread.stats.lock().unwrap().set_state(MsaccState::Sleep);
                     thread::park_timeout(Duration::from_millis(100));
+                    thread.stats.lock().unwrap().set_state(MsaccState::Other);
                 }
                 queue = pool.queue.lock().unwrap();
                 if let Some(position) = queue.sleepers.iter().position(|&slot| slot == index) {
@@ -7790,11 +7820,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                 }
             }
         };
-        thread
-            .stats
-            .lock()
-            .unwrap()
-            .begin_active(inner.msacc_accounting());
+        thread.stats.lock().unwrap().begin_active();
         process.dirty_runner.store(slot + 1, Ordering::SeqCst);
         run_one(
             &inner,
@@ -7804,11 +7830,9 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
             Some(kind),
         );
         process.dirty_runner.store(0, Ordering::SeqCst);
-        let msacc = inner.msacc_accounting();
         {
             let mut stats = thread.stats.lock().unwrap();
-            stats.end_active(msacc);
-            stats.set_state(MsaccState::Sleep, msacc);
+            stats.end_active();
         }
         // Port of erts/emulator/beam/erl_process.c:7600, OTP-29.1.1: under blocked
         // multi-scheduling a dirty scheduler executes one job, then switches back.
