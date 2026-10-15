@@ -1135,7 +1135,7 @@ impl AllocUtil {
                         discard_end - discard_start,
                         libc::MADV_FREE,
                     )
-                    .map_err(AllocError::Map)?;
+                    .map_err(AllocError::mapped)?;
             }
         }
         Ok(())
@@ -1851,7 +1851,7 @@ impl AllocUtil {
                             ..MsegOptions::default()
                         },
                     )
-                    .map_err(AllocError::Map)
+                    .map_err(AllocError::mapped)
             } else {
                 self.stats.sys_realloc_calls += 1;
                 let CarrierMemory::Mapped(region) = &mut carrier.memory else {
@@ -1859,7 +1859,7 @@ impl AllocUtil {
                 };
                 region
                     .resize_preserving(requested_size, page_size())
-                    .map_err(AllocError::Map)
+                    .map_err(AllocError::mapped)
             }
         };
         self.index_carrier(old.carrier);
@@ -2085,9 +2085,9 @@ impl AllocUtil {
                 self.mseg
                     .alloc(size, mseg_flags)
                     .map(|segment| (CarrierMemory::Segmented(segment), true))
-                    .map_err(|_| AllocError::Map(sys_error))
+                    .map_err(|_| AllocError::mapped(sys_error))
             }
-            Err(error) => Err(AllocError::Map(error)),
+            Err(error) => Err(AllocError::mapped(error)),
         }
     }
     /// Writes a block header, plus the carrier word and size footer of a free MBC block.
@@ -3243,12 +3243,19 @@ impl AllocUtil {
 /// Allocation failure with no unsafe or unchecked pointer API.
 #[derive(Debug)]
 pub enum AllocError {
-    Map(MapError),
+    Map(std::io::ErrorKind),
     NoSpace,
     InvalidAllocation,
     OutOfBounds,
     Corrupt,
     Overflow,
+}
+impl AllocError {
+    /// Keeps the error `Copy`-like: a payload with drop glue (`io::Error`) makes every eagerly
+    /// built `ok_or(AllocError::..)` on the hot success path call a destructor.
+    fn mapped(error: MapError) -> Self {
+        Self::Map(error.0.kind())
+    }
 }
 impl std::fmt::Display for AllocError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
