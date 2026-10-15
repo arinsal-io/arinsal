@@ -30,7 +30,7 @@ bad_busy() -> try open_port({spawn,"true"},[{busy_limits_port,{0,10}}]) catch er
 bad_iodata() -> P=open_port({spawn_executable,"/bin/cat"},[]), try port_command(P,[300]) catch error:R -> port_close(P), R end.
 accepted() ->
     P=open_port({spawn,"printf ok >&4"},[binary,stream,hide,overlapped_io,nouse_stdio,{parallelism,false},{busy_limits_port,disabled},{busy_limits_msgq,disabled}]),
-    receive {P,{data,D}} -> port_close(P), D after 5000 -> timeout end.
+    receive {P,{data,D}} -> catch port_close(P), D after 5000 -> timeout end.
 "#;
     let beam = reference
         .compile_named("port_opts_diff", source, &[])
