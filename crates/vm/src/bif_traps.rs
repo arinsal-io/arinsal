@@ -4,7 +4,8 @@ use super::*;
 use arinsal_bifs::BifError;
 use arinsal_term::{MagicRef, global_atoms};
 use smallvec::SmallVec;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) enum HandlerResult {
     Done {
@@ -1258,19 +1259,43 @@ pub(crate) fn traps(module: &str, function: &str, arity: u8) -> bool {
     lookup_entry(module, function, usize::from(arity)).is_some()
 }
 
+/// Index of [`ENTRIES`] by export name, the way erts finds an export by `{M, F, A}`: the
+/// first entry with that name, else the first whose continuation export has it.
+struct EntryIndex {
+    direct: HashMap<(&'static str, &'static str, usize), usize>,
+    continuation: HashMap<(&'static str, &'static str, usize), usize>,
+}
+
+fn entry_index() -> &'static EntryIndex {
+    static INDEX: OnceLock<EntryIndex> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut index = EntryIndex {
+            direct: HashMap::new(),
+            continuation: HashMap::new(),
+        };
+        for (position, entry) in ENTRIES.iter().enumerate() {
+            index
+                .direct
+                .entry((entry.module, entry.function, usize::from(entry.arity)))
+                .or_insert(position);
+            if let Some((module, function, arity)) = continuation_parts(entry.continuation) {
+                index
+                    .continuation
+                    .entry((module, function, arity))
+                    .or_insert(position);
+            }
+        }
+        index
+    })
+}
+
 fn lookup_entry(module: &str, function: &str, arity: usize) -> Option<&'static Entry> {
-    ENTRIES
-        .iter()
-        .find(|entry| {
-            entry.module == module
-                && entry.function == function
-                && usize::from(entry.arity) == arity
-        })
-        .or_else(|| {
-            ENTRIES
-                .iter()
-                .find(|entry| continuation_is(entry.continuation, module, function, arity))
-        })
+    let index = entry_index();
+    index
+        .direct
+        .get(&(module, function, arity))
+        .or_else(|| index.continuation.get(&(module, function, arity)))
+        .map(|&position| &ENTRIES[position])
 }
 
 fn continuation_is(continuation: &str, module: &str, function: &str, arity: usize) -> bool {
