@@ -60,11 +60,14 @@
 
 mod balance;
 mod mailbox;
+mod ns;
 mod ports;
 mod thr_progress;
 mod timer;
 
 pub use mailbox::{InSignal, Incoming, psflg};
+use ns::NsGate;
+pub use ns::{NS_ID_MASK, NS_SHARED};
 pub use ports::{PortExecution, PortRunQueue, RunPort};
 pub use timer::TimerRef;
 
@@ -1026,10 +1029,16 @@ struct Process<T: Task> {
     dirty_runner: AtomicUsize,
     /// Priority level whose run queue length counts this queued process.
     queued_prio: AtomicU8,
+    /// Namespace word: id in the low 31 bits (0 is root), [`NS_SHARED`] in the top bit.
+    ns: AtomicU32,
     cell: Mutex<TaskCell<T>>,
 }
 
 impl<T: Task> Process<T> {
+    fn ns_id(&self) -> u32 {
+        self.ns.load(Ordering::Relaxed) & NS_ID_MASK
+    }
+
     /// The scheduling bits of the process state word (`p->state`).
     fn run_state(&self) -> RunStateWord<'_> {
         RunStateWord(self.input.state())
@@ -1107,6 +1116,7 @@ impl<T: Task> ProcessTable<T> {
         task: T,
         priority: Priority,
         bound_worker: Option<usize>,
+        ns: u32,
     ) -> Result<Arc<Process<T>>, Error> {
         // Port of erts/emulator/beam/erl_ptab.c:500 (erts_ptab_new_element), OTP-29.1.1.
         let _shared = self.lock.read().unwrap();
@@ -1140,6 +1150,7 @@ impl<T: Task> ProcessTable<T> {
             dirty: AtomicU8::new(0),
             dirty_runner: AtomicUsize::new(0),
             queued_prio: AtomicU8::new(0),
+            ns: AtomicU32::new(ns),
             cell: Mutex::new(TaskCell { task }),
         });
         // Publication needs only the release store. Flushing the epoch bag on
@@ -1446,6 +1457,9 @@ struct Inner<T: Task> {
     balance: Arc<balance::Balance>,
     /// `rq->ports` of each normal run queue.
     port_queues: Vec<ports::PortQueue>,
+    /// Set when the first namespace is registered. Delivery skips the namespace check while
+    /// it is false.
+    any_ns: AtomicBool,
 }
 
 /// What an idle scheduler stole from a victim run queue.
@@ -2968,6 +2982,8 @@ impl<T: Task> Inner<T> {
         Ok(())
     }
 
+    /// Deliver without the namespace check: for the scheduler's own traffic (self sends,
+    /// timers, dirty handler requests, noproc bounces).
     fn deliver(
         &self,
         from: Pid,
@@ -2980,6 +2996,74 @@ impl<T: Task> Inner<T> {
                 self.deliver_live(process, from, payload, local)
             })
             .ok_or(Error::NoProcess)?
+    }
+
+    /// [`Self::deliver`] for a sender that is not the scheduler: a message or signal that
+    /// crosses namespaces is refused by [`Self::ns_gate`]. `from_ns` is the sender's
+    /// namespace when the caller knows it.
+    fn deliver_gated(
+        &self,
+        from: Pid,
+        from_ns: Option<u32>,
+        to: Pid,
+        payload: Payload<T::Message>,
+        local: Option<&mut Local<T>>,
+    ) -> Result<(), Error> {
+        self.table
+            .with_live(to, |process| {
+                if self.any_ns.load(Ordering::Relaxed) {
+                    match self.ns_gate(process, from, from_ns, &payload) {
+                        NsGate::Allow => {}
+                        NsGate::Drop => return Ok(()),
+                        NsGate::NoProcess => return Err(Error::NoProcess),
+                    }
+                }
+                self.deliver_live(process, from, payload, local)
+            })
+            .ok_or(Error::NoProcess)?
+    }
+
+    /// Whether `from` may reach `receiver`: same namespace, a root sender, or a shared receiver.
+    fn ns_allows(&self, receiver: &Process<T>, from: Pid, from_ns: Option<u32>) -> bool {
+        let word = receiver.ns.load(Ordering::Relaxed);
+        if word & NS_SHARED != 0 {
+            return true;
+        }
+        let sender = from_ns.map_or_else(
+            || self.table.with_live(from, |p| p.ns_id()).unwrap_or(0),
+            |ns| ns & NS_ID_MASK,
+        );
+        sender == 0 || sender == word & NS_ID_MASK
+    }
+
+    /// What delivery does with `payload` from `from` to `receiver`. Only requests are
+    /// gated. Signals that answer or undo an existing link or monitor, literal copies and
+    /// timers pass: a tenant cannot create a cross-namespace relationship, so these only
+    /// ever travel on one root created.
+    fn ns_gate(
+        &self,
+        receiver: &Process<T>,
+        from: Pid,
+        from_ns: Option<u32>,
+        payload: &Payload<T::Message>,
+    ) -> NsGate {
+        let refused = match payload {
+            Payload::Message(_) | Payload::Signal(Signal::Exit(_)) => NsGate::Drop,
+            Payload::Signal(
+                Signal::Link
+                | Signal::Monitor { .. }
+                | Signal::Suspend { .. }
+                | Signal::SuspendInternal
+                | Signal::SyncSuspend { .. }
+                | Signal::GarbageCollect,
+            ) => NsGate::NoProcess,
+            _ => return NsGate::Allow,
+        };
+        if self.ns_allows(receiver, from, from_ns) {
+            NsGate::Allow
+        } else {
+            refused
+        }
     }
 
     fn deliver_live(
@@ -3451,6 +3535,17 @@ impl<T: Task> Inner<T> {
         let Some(process) = self.table.lookup(pid) else {
             return Err(Error::NoProcess);
         };
+        if self.any_ns.load(Ordering::Relaxed)
+            && let TimerPayload::Message(target, _, _) = &payload
+            && *target != pid
+            && let Some(receiver) = self.table.lookup(*target)
+            && !self.ns_allows(&receiver, pid, Some(process.ns_id()))
+        {
+            // The timer is never armed, like a send to a dead pid.
+            let worker = pid.number() as usize % self.timer_commands.len();
+            let id = self.next_timer.fetch_add(1, Ordering::Relaxed);
+            return Ok(TimerRef { worker, id });
+        }
         let fallback = pid.number() as usize % self.timer_commands.len();
         let forced = match &payload {
             TimerPayload::Message(_, message, _) | TimerPayload::ResolvedMessage(_, message, _) => {
@@ -3997,11 +4092,20 @@ pub struct RunCtx<'a, M: SignalMessage> {
     dirty_queued: bool,
     /// The turn runs on a simulated scheduler, whose thread steps other runtimes too.
     simulated: bool,
+    /// Namespace word of the running process: the sender namespace of its sends.
+    ns: &'a AtomicU32,
 }
 
 trait ContextOps<M: SignalMessage> {
     fn process_priority(&self, pid: Pid) -> Option<Priority>;
-    fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<M>) -> Result<(), Error>;
+    /// `from_ns` is the sender's namespace when the caller knows it, `None` to look it up.
+    fn deliver(
+        &mut self,
+        from: Pid,
+        from_ns: Option<u32>,
+        to: Pid,
+        payload: Payload<M>,
+    ) -> Result<(), Error>;
     fn flush(&mut self);
     fn thread_progress_later(&self, op: LaterOp);
     fn block_thread_progress(&self, duration: Duration);
@@ -4371,7 +4475,9 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Send an opaque envelope to another process.
     pub fn send(&mut self, to: Pid, msg: M) -> Result<(), Error> {
-        self.inner.deliver(self.pid, to, Payload::Message(msg))
+        let ns = self.ns.load(Ordering::Relaxed);
+        self.inner
+            .deliver(self.pid, Some(ns), to, Payload::Message(msg))
     }
     /// Set this process's user priority; it takes effect when the process is next queued.
     ///
@@ -4405,7 +4511,9 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
     /// Send an ordered control signal.
     pub fn signal(&mut self, to: Pid, signal: Signal<M>) -> Result<(), Error> {
-        self.inner.deliver(self.pid, to, Payload::Signal(signal))
+        let ns = self.ns.load(Ordering::Relaxed);
+        self.inner
+            .deliver(self.pid, Some(ns), to, Payload::Signal(signal))
     }
     /// Start an Erlang-style timer. The VM may wrap the received envelope as `{timeout, Ref, Msg}`.
     pub fn start_timer(&mut self, ms: u64, msg: M) -> Result<TimerRef, Error> {
@@ -4577,6 +4685,12 @@ impl<T: Task> Runner<'_, T> {
             self.bounce_monitors(to, vec![(from, id)]);
             return;
         };
+        if self.inner.any_ns.load(Ordering::Relaxed)
+            && self.inner.ns_gate(&process, from, None, &payload) != NsGate::Allow
+        {
+            self.bounce_monitors(to, vec![(from, id)]);
+            return;
+        }
         if self
             .inner
             .deliver_process(
@@ -4630,6 +4744,7 @@ impl<T: Task> Runner<'_, T> {
             dirty_queued: process.dirty.load(Ordering::SeqCst) != 0
                 && process.dirty_runner.load(Ordering::SeqCst) == 0,
             simulated,
+            ns: &process.ns,
         };
         handle(task, &mut ctx)
     }
@@ -4866,7 +4981,13 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         }
         Ok(())
     }
-    fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<T::Message>) -> Result<(), Error> {
+    fn deliver(
+        &mut self,
+        from: Pid,
+        from_ns: Option<u32>,
+        to: Pid,
+        payload: Payload<T::Message>,
+    ) -> Result<(), Error> {
         let monitor = matches!(payload, Payload::Signal(Signal::Monitor { .. }));
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1102-1125 (esdp->pending_signal),
         // OTP-29.1.1: on a normal scheduler every process monitor is held; a monitor replaces
@@ -4896,6 +5017,24 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             }),
         });
         let process = self.lookup(to).ok_or(Error::NoProcess)?;
+        if self.inner.any_ns.load(Ordering::Relaxed) {
+            let gate = self.inner.ns_gate(&process, from, from_ns, &payload);
+            if gate != NsGate::Allow {
+                // The held monitor comes from the same process, so it is refused too.
+                if let Some(Event {
+                    from: watcher,
+                    payload: Payload::Signal(Signal::Monitor { reference, .. }),
+                }) = deferred
+                {
+                    self.bounce_monitors(to, vec![(watcher, reference)]);
+                }
+                return if gate == NsGate::Drop {
+                    Ok(())
+                } else {
+                    Err(Error::NoProcess)
+                };
+            }
+        }
         let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
         let wakes = payload_wakes(&payload);
         let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy { .. }));
@@ -5265,6 +5404,7 @@ impl<T: Task> Scheduler<T> {
             dirty_signal_handlers: OnceLock::new(),
             balance,
             port_queues: (0..workers).map(|_| ports::PortQueue::default()).collect(),
+            any_ns: AtomicBool::new(false),
         });
         let mut threads = Vec::new();
         if !simulated {
@@ -5332,7 +5472,30 @@ impl<T: Task> Scheduler<T> {
         task: T,
         priority: Priority,
     ) -> Result<Pid, Error> {
-        let process = self.inner.table.insert(task, priority, None)?;
+        self.spawn_unscheduled_in_ns(task, priority, None, 0)
+    }
+    /// Insert an unscheduled task into namespace `ns` (0 is root).
+    pub fn spawn_unscheduled_in_ns(
+        &self,
+        task: T,
+        priority: Priority,
+        scheduler_id: Option<usize>,
+        ns: u32,
+    ) -> Result<Pid, Error> {
+        let worker = match scheduler_id {
+            Some(id) => {
+                let worker = id.checked_sub(1).ok_or(Error::Capacity)?;
+                if worker >= self.inner.config.workers {
+                    return Err(Error::Capacity);
+                }
+                Some(worker)
+            }
+            None => None,
+        };
+        let process = self
+            .inner
+            .table
+            .insert(task, priority, worker, ns & NS_ID_MASK)?;
         process.run_state().store(UNSCHEDULED, Ordering::Release);
         Ok(process.pid)
     }
@@ -5347,13 +5510,7 @@ impl<T: Task> Scheduler<T> {
         scheduler_id: usize,
         priority: Priority,
     ) -> Result<Pid, Error> {
-        let worker = scheduler_id.checked_sub(1).ok_or(Error::Capacity)?;
-        if worker >= self.inner.config.workers {
-            return Err(Error::Capacity);
-        }
-        let process = self.inner.table.insert(task, priority, Some(worker))?;
-        process.run_state().store(UNSCHEDULED, Ordering::Release);
-        Ok(process.pid)
+        self.spawn_unscheduled_in_ns(task, priority, Some(scheduler_id), 0)
     }
     /// Make an inserted child runnable after its caller publishes it.
     pub fn schedule_unscheduled(&self, pid: Pid) -> Result<(), Error> {
@@ -5379,7 +5536,7 @@ impl<T: Task> Scheduler<T> {
         if worker >= self.inner.parked.len() {
             return Err(Error::Capacity);
         }
-        let process = self.inner.table.insert(task, priority, None)?;
+        let process = self.inner.table.insert(task, priority, None, 0)?;
         let pid = process.pid;
         process.run_state().store(QUEUED, Ordering::Release);
         process.scheduler_id.store(worker, Ordering::Relaxed);
@@ -5390,7 +5547,7 @@ impl<T: Task> Scheduler<T> {
     }
     /// Spawn a task at a chosen scheduler priority.
     pub fn spawn_priority(&self, task: T, priority: Priority) -> Result<Pid, Error> {
-        let process = self.inner.table.insert(task, priority, None)?;
+        let process = self.inner.table.insert(task, priority, None, 0)?;
         let pid = process.pid;
         process.run_state().store(QUEUED, Ordering::Release);
         self.inner.enqueue_new(Scheduled::new(process));
@@ -5398,11 +5555,13 @@ impl<T: Task> Scheduler<T> {
     }
     /// Queue a message from one logical sender.
     pub fn send(&self, from: Pid, to: Pid, msg: T::Message) -> Result<(), Error> {
-        self.inner.deliver(from, to, Payload::Message(msg), None)
+        self.inner
+            .deliver_gated(from, None, to, Payload::Message(msg), None)
     }
     /// Queue a signal in the same ordered stream.
     pub fn signal(&self, from: Pid, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
-        self.inner.deliver(from, to, Payload::Signal(signal), None)
+        self.inner
+            .deliver_gated(from, None, to, Payload::Signal(signal), None)
     }
     /// Consume the held process monitor for `reference` to `to` when it is still unsent, so a
     /// `demonitor(_, [flush])` need not send the demonitor signal. Returns true when consumed.
@@ -5438,6 +5597,7 @@ impl<T: Task> Scheduler<T> {
         <Runner<'_, T> as ContextOps<T::Message>>::deliver(
             &mut runner,
             from,
+            None,
             to,
             Payload::Signal(signal),
         )
@@ -5711,6 +5871,17 @@ impl<T: Task> Scheduler<T> {
         self.inner.table.ids.count()
     }
     /// Number of live tasks; this scan is for diagnostics.
+    /// Declare that namespaces exist: from now on delivery checks the namespace of sender
+    /// and receiver. Call before the first process is spawned into one.
+    pub fn ns_enable(&self) {
+        self.inner.any_ns.store(true, Ordering::Release);
+    }
+    /// Namespace word of a live process (id in the low 31 bits, [`NS_SHARED`] on top).
+    pub fn ns_word(&self, pid: Pid) -> Option<u32> {
+        self.inner
+            .table
+            .with_live(pid, |process| process.ns.load(Ordering::Acquire))
+    }
     pub fn live_count(&self) -> usize {
         self.inner.table.live_count()
     }
@@ -6201,7 +6372,7 @@ mod msgq_stage_microbench {
     fn stages() {
         const N: usize = 200_000;
         let table = ProcessTable::<Idle>::new(1);
-        let process = table.insert(Idle, Priority::Normal, None).unwrap();
+        let process = table.insert(Idle, Priority::Normal, None, 0).unwrap();
         let pid = process.pid;
         let started = Instant::now();
         for _ in 0..N {
@@ -6272,6 +6443,7 @@ mod msgq_stage_microbench {
         let user_priority = AtomicU8::new(Priority::Normal.index() as u8);
         let active = AtomicBool::new(true);
         let exit_flags = AtomicU32::new(0);
+        let ns = AtomicU32::new(0);
         let mut context = RunCtx {
             inner: &mut receive_runner,
             pid: process,
@@ -6293,6 +6465,7 @@ mod msgq_stage_microbench {
             dirty_running: false,
             dirty_queued: false,
             simulated: scheduler.inner.sim.is_some(),
+            ns: &ns,
         };
         let started = Instant::now();
         let mut fetched = VecDeque::new();
@@ -6343,6 +6516,7 @@ mod msgq_stage_microbench {
             <Runner<'_, Idle> as ContextOps<usize>>::deliver(
                 &mut runner,
                 from,
+                None,
                 to,
                 Payload::Message(message),
             )
@@ -6366,6 +6540,7 @@ mod msgq_stage_microbench {
             <Runner<'_, Idle> as ContextOps<usize>>::deliver(
                 &mut runner,
                 from,
+                None,
                 to,
                 Payload::Message(message),
             )
@@ -6405,6 +6580,7 @@ mod msgq_stage_microbench {
             <Runner<'_, Idle> as ContextOps<usize>>::deliver(
                 &mut runner,
                 from,
+                None,
                 to,
                 Payload::Message(value),
             )
@@ -6767,6 +6943,7 @@ fn run_slice<'a, T: Task>(
                 dirty_running: false,
                 dirty_queued: false,
                 simulated: inner.sim.is_some(),
+                ns: &process.ns,
             };
             if msacc_enabled {
                 ctx.set_msacc_state(MsaccState::Emulator);
@@ -7053,7 +7230,7 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         // scheduler it runs on when that is the receiver's run queue.
         Ok(self
             .inner
-            .deliver(from, to, Payload::Message(msg), Some(&mut local)))
+            .deliver_gated(from, None, to, Payload::Message(msg), Some(&mut local)))
     }
 
     fn start_timer(
