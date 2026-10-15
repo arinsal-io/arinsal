@@ -102,6 +102,21 @@
 - Under `ARINSAL_INTERP=1` a static call to a missing module in the caller's own module raises a VM
   error instead of `undef` (also in root), so the attack suite calls foreign modules dynamically.
 
+## Chunk 6: persistent_term read-through for OTP system keys
+- `persistent_term:get/1,2` from a ns process that misses in its own store reads the node store
+  (`store_for(code_scope)`) when the key is an atom or a 2-tuple whose first element is in
+  `arinsal_pterm::ARL_SYSTEM_KEY_MODULES`: erl_prim_loader, code_server, kernel_os_cmd_shell,
+  global_group, rex_nodes_observer, prim_socket, prim_net, prim_file, socket, inet_db, erl_features
+  (the keys of a booted OTP 29 node, minus Logger's). Logger keys (`logger_config`, `logger_olp`,
+  `logger_proxy`) stay per namespace on purpose. Writes, erase, `get/0` and `info/0` stay own-store only;
+  a ns `put` of such a key shadows root's value.
+- Hooks: `natives/sys.rs` (interpreter and trap path for get/1,2) and the two JIT light functions in
+  `native_helpers.rs`, all through `arl_root_system_term`. Values come from root's literal areas, which
+  are never freed once a namespace exists (`arl_keep_alive`), so the references are safe.
+- `arinsal_ns_boot` no longer copies root's terms into the namespace (only the copy step was removed).
+- Tests: `ns_pterm_system_key_fallback`, `ns_pterm_root_secret_invisible` (any other key, 1-tuples, nested
+  or look-alike module names stay invisible).
+
 ## Run
 ```
 export CARGO_TARGET_DIR=/Users/sts/dev/sq/arinsal-prs/target-mt-names

@@ -113,6 +113,36 @@ fn arl_account_ns_heap(process: &mut Process) {
     }
 }
 
+/// Whether `key` is an atom, or a two-tuple that starts with an atom, naming one of the OTP
+/// system modules of `ARL_SYSTEM_KEY_MODULES`.
+// arl: read-through of OTP system keys for namespaces
+fn arl_is_system_key(key: Term) -> bool {
+    use arinsal_etf::OwnedTerm as O;
+    let Ok(owned) = arinsal_term::to_owned(key) else {
+        return false;
+    };
+    let head = match &owned {
+        O::Atom(name) => name,
+        O::Tuple(items) if items.len() == 2 => match &items[0] {
+            O::Atom(name) => name,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    arinsal_pterm::ARL_SYSTEM_KEY_MODULES.contains(&head.as_str())
+}
+
+/// The node store's value of an OTP system key, for a namespace process that has no value of
+/// its own.
+// arl: read-through of OTP system keys for namespaces
+pub(crate) fn arl_root_system_term(process: &Process, key: Term) -> Option<Term> {
+    if !arl_is_system_key(key) {
+        return None;
+    }
+    let base = process.runtime.as_ref()?.code_scope;
+    arinsal_pterm::store_for(base).get(key)
+}
+
 /// Take the memory of an exiting namespace process out of the namespace total.
 // arl: heap accounting of a namespace
 pub(crate) fn arl_release_ns_heap(process: &mut Process) {
@@ -530,6 +560,26 @@ fn call_values(
     let arity = args.len() as u8;
     if module == "persistent_term" && function == "get" && arity == 0 {
         return Some(get_all_step(process, ctx));
+    }
+    if process.ns != 0 && module == "persistent_term" && function == "get" && matches!(arity, 1 | 2)
+    {
+        // arl: a namespace reads OTP system keys through to the node store
+        let found = process
+            ._persistent_terms
+            .store()
+            .get(args[0])
+            .or_else(|| arl_root_system_term(process, args[0]));
+        return Some(match (found, arity) {
+            (Some(value), _) => Ok(value),
+            (None, 2) => Ok(args[1]),
+            (None, _) => Err(crate::exceptions::bif_error(
+                process,
+                module,
+                function,
+                args,
+                arinsal_bifs::BifError::BADARG,
+            )),
+        });
     }
     if let Some(bif) = arinsal_pterm::lookup_in(module, function, arity) {
         debug_assert!(
