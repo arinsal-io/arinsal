@@ -3268,11 +3268,22 @@ fn parse_suspend_options(options: Term) -> Option<SuspendOptions> {
 
 // Port of erts/emulator/beam/erl_process.c:9181 (`resume_process_1`), OTP-29.1.1.
 fn resume_process(process: &mut Process, target: Term) -> Result<Term, VmError> {
-    match resume_process_light(process, &[target]) {
-        Some(Ok(value)) => Ok(value),
-        Some(Err(trap)) => Err(VmError::Trap(trap)),
-        None => Err(badarg()),
+    match resume_core(process, target) {
+        Ok(()) => Ok(Term::atom(arinsal_term::atoms::TRUE)),
+        Err(trap) => Err(VmError::Trap(trap)),
     }
+}
+
+/// The body of `resume_process_1` for the running process, with or without tracing active.
+fn resume_core(process: &mut Process, target: Term) -> Result<(), crate::exceptions::Trap> {
+    let badarg = || crate::exceptions::Trap::error(Term::atom(arinsal_term::atoms::BADARG));
+    let Some(me) = process.self_pid else {
+        return Err(badarg());
+    };
+    let Some(target_pid) = Pid::from_term(target).filter(|pid| *pid != me) else {
+        return Err(badarg());
+    };
+    crate::suspend::resume_remote(process, me, target_pid).ok_or_else(badarg)
 }
 
 /// `erlang:resume_process/1` called directly from native code (`c_p` only).
@@ -3287,19 +3298,7 @@ pub(crate) fn resume_process_light(
     if crate::trace::active() {
         return None;
     }
-    let me = process.self_pid?;
-    let badarg = || {
-        Some(Err(crate::exceptions::Trap::error(Term::atom(
-            arinsal_term::atoms::BADARG,
-        ))))
-    };
-    let Some(target_pid) = Pid::from_term(*target).filter(|pid| *pid != me) else {
-        return badarg();
-    };
-    match crate::suspend::resume_remote(process, me, target_pid) {
-        None => badarg(),
-        Some(()) => Some(Ok(Term::atom(arinsal_term::atoms::TRUE))),
-    }
+    Some(resume_core(process, *target).map(|()| Term::atom(arinsal_term::atoms::TRUE)))
 }
 
 // Port of erts/emulator/beam/bif.c:1078 (`erts_internal_spawn_request_4`),

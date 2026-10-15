@@ -75,6 +75,22 @@ beyond the two fixes.
   before the fix (`{ok,{error,badarg},ok}`), passes after.
 - Verified: `File.cp`, `File.exists?`, `File.cp_r` on Arinsal return `:ok` and `{:ok, [...]}`.
 
+## 6. `dbg` tracing hangs the traced process
+- Cause: `dbg`'s tracer suspends the traced process asynchronously on every `call` trace and
+  resumes it after printing. With any trace active, `erlang:resume_process/1` took the slow path,
+  which called `resume_process_light`; that function declines (`None`) while tracing is active,
+  and the slow path turned the `None` into `badarg`. `dbg` catches it, so the suspend was never
+  released and the traced process stayed `suspended` forever (here: the shell process, inside a
+  `code_server:call`, with its reply already queued).
+- Fix: `crates/vm/src/natives/proc.rs`, the slow path now runs the real body (`resume_core`) and
+  the light variant only adds the "not while tracing" bail-out. `suspend_process` already did this.
+- Test: `crates/vm/tests/resume_process_traced.rs` (`resume_process_while_tracing_matches_otp_29`,
+  differential: suspend/resume status, `badarg` on a second resume, nested suspend counts). Failed
+  before the fix (`badarg`).
+- Verified with the one-liners from the report (`dbg:tpl` with `x`, `dbg:tp` with a match spec,
+  `dbg:stop`, `dbg:stop_clear`, `dbg:ctp`): all finish and the output equals stock OTP. The
+  `dbg:p(all, c)` variant also hangs on stock OTP (the tracer traces itself); not an Arinsal bug.
+
 ## Gaps and side findings
 - `cargo clippy -p arinsal-ets -p arinsal-bifs -- -D warnings` fails in `crates/alloc/src/raw.rs`
   (multiple unsafe operations per block, unrelated and pre-existing), so clippy could not be

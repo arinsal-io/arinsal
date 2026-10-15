@@ -75,6 +75,23 @@ const ARL_NS_SHIFT: u32 = 40;
 // arl: set once any namespace store exists
 static ARL_ANY_NS: AtomicBool = AtomicBool::new(false);
 
+/// Modules whose keys root publishes for their client code, which runs in the caller. A
+/// namespace process that misses in its own store reads these from the node store.
+// arl: read-through of OTP system keys for namespaces
+pub const ARL_SYSTEM_KEY_MODULES: &[&str] = &[
+    "erl_prim_loader",
+    "code_server",
+    "kernel_os_cmd_shell",
+    "global_group",
+    "rex_nodes_observer",
+    "prim_socket",
+    "prim_net",
+    "prim_file",
+    "socket",
+    "inet_db",
+    "erl_features",
+];
+
 /// The store scope of namespace `ns` on the node with code scope `base`; `ns == 0` is the node.
 pub fn arl_ns_scope(base: u64, ns: u32) -> u64 {
     debug_assert!(
