@@ -91,6 +91,24 @@ impl Domains {
     }
 }
 
+impl crate::load::CodeTables {
+    /// The current instance of `module` seen through `chain`: its non-base domains first,
+    /// then the base table. No chain is root, which reads the base table only.
+    #[inline]
+    pub(crate) fn module_in_chain(
+        &self,
+        chain: Option<&[DomainId]>,
+        module: Atom,
+    ) -> Option<usize> {
+        if let Some(chain) = chain
+            && let Some(id) = self.domains.lookup(chain, module)
+        {
+            return Some(id);
+        }
+        self.loaded.get(&module).copied()
+    }
+}
+
 impl Vm {
     /// The domain instance a dynamic call of `module` from process `p` reaches, when the
     /// process has a chain and one of its non-base domains defines the module.
@@ -98,6 +116,23 @@ impl Vm {
     pub(crate) fn process_domain_module(&self, p: &Process, module: Atom) -> Option<usize> {
         let chain = p.code_chain.as_deref()?;
         self.code.domains.lookup(chain, module)
+    }
+
+    /// The domain instance a static call of `module` from an instance of `domain` reaches,
+    /// through that domain's chain; `None` sends the call to the base table.
+    #[inline]
+    pub(crate) fn caller_domain_module(&self, domain: DomainId, module: Atom) -> Option<usize> {
+        if domain == BASE {
+            return None;
+        }
+        let chain = self.code.domains.chain(domain)?;
+        self.code.domains.lookup(chain, module)
+    }
+
+    /// The current instance of `module` that process `p` sees: its chain's domains first,
+    /// then the base table.
+    pub(crate) fn module_for_process(&self, p: &Process, module: Atom) -> Option<usize> {
+        self.code.module_in_chain(p.code_chain.as_deref(), module)
     }
 
     /// Creates a domain under `parents`.
@@ -145,6 +180,7 @@ impl Vm {
         }
         let staging = self.code_ix.start_staging();
         for (name, mut module, registers, meta) in prepared {
+            module.domain = domain;
             staging.with(|tables| {
                 tables.intern_fun_entries(&mut module);
                 let id = tables.alloc_in_domain(Arc::new(module), registers, Some(meta));

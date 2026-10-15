@@ -1338,10 +1338,11 @@ impl Executor {
                     })
                     .filter(|&address| version.contains_code(address))
                     .or_else(|| version.native_function_start(function, arity)),
-                None => {
+                None if module.domain == crate::code_domains::BASE => {
                     crate::native_function_for(self.vm.code_scope, &module.name, function, arity)
                         .map(|native| native.start)
                 }
+                None => None,
             }
         {
             process.native_pc = Some(start);

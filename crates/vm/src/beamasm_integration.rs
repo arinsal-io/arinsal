@@ -91,6 +91,11 @@ impl NativeTargetCache {
     ) -> Option<crate::NativeFunction> {
         // Only a function entry enters native code at the function's start; any other
         // target (an export breakpoint stub, a label inside a function) stays interpreted.
+        // Instances of a non-base domain are never compiled: native code registered under
+        // their name belongs to a base instance.
+        if module.domain != crate::code_domains::BASE {
+            return None;
+        }
         if module.entry_arity.get(target).copied().unwrap_or(0) == 0 {
             return None;
         }
