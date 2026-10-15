@@ -79,8 +79,7 @@ own_module(Path0, Name) ->
     filename:basename(Dir) =:= "consolidated" orelse
         lists:prefix(to_list(Name) ++ "-", filename:basename(filename:dirname(Dir))).
 
-%% Preloaded modules (erlang, erts_internal, prim_*) are always in the base; some of them are
-%% root only, even their module_info.
+%% Preloaded modules (erlang, erts_internal, prim_*) are always in the base.
 without_preloaded(Modules) ->
     Preloaded = erlang:pre_loaded(),
     [{M, P} || {M, P} <- Modules, not lists:member(M, Preloaded)].
@@ -282,14 +281,8 @@ load_batches([{M, Path} | Rest], Acc) ->
 %% A module the chain already resolves to an identical instance is skipped before it is parsed;
 %% finish_loading would dedup it anyway.
 already_here(M, Bin) ->
-    try
-        erlang:module_loaded(M) andalso
-            {ok, {M, M:module_info(md5)}} =:= beam_lib:md5(Bin)
-    catch
-        %% A module whose natives are root only (erl_ddll) answers even module_info with
-        %% notsup; it is loaded in the base and the namespace cannot use it anyway.
-        error:notsup -> true
-    end.
+    erlang:module_loaded(M) andalso
+        {ok, {M, M:module_info(md5)}} =:= beam_lib:md5(Bin).
 
 finish(Acc) ->
     {Mods, Prepared} = lists:unzip(lists:reverse(Acc)),

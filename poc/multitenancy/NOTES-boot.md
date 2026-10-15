@@ -84,8 +84,64 @@ e2e run; the e2e manager had already loaded more of the shared modules. Not inve
   (code +2.9 MB, ets +0.17 MB; process heaps sampled early). One earlier run had the probe stop
   updating while the first namespace was loading its modules (3 processes in the ns), with no
   error caught; the deploys and curls still worked, and the node then did not stop on SIGTERM.
-  Seen in 2 of 4 runs. Suspect: a root `erlang:memory/0` or `arinsal_ns:info/1` blocked against
+  Seen in 2 of 4 runs; localized in chunk 2 (below) to `erlang:memory/0` in root, blocked against
   the namespace's synchronous domain `finish_loading`. Not isolated yet.
+
+## Chunk 2: dep domains, acceptors, init:stop, density
+
+- `arinsal_ns_boot:prepare/1` (root, before `arinsal_ns:create/3`; the backend calls it when the
+  boot module exports it): drops preloaded modules, preloads base-identical modules, splits the
+  plan into the project's own modules (`lib/<release name>-*/ebin` and
+  `releases/<vsn>/consolidated`) and dependencies, hashes the dependencies' `(module, md5)` set
+  with `arinsal_code:deployment_hash/1`, reuses `arinsal_code:dep_domain(Hash)` or creates it with
+  `new_dep_domain/1` and loads the dependencies not already in the base with
+  `arinsal_code:load/2` (under `global:trans` on the hash, so two deploys of one release do not
+  race). Returns `#{dep_domain => D}` for `create/3` and the plan with only the own modules, which
+  `start/3` loads into the namespace domain (chain `[Ns, D, 0]`).
+  Gap: when the dep load fails, the registered (empty) dep domain stays until a namespace that
+  references it is destroyed.
+- bench/rest reads `ACCEPTORS` (default 1) into Bandit's `thousand_island_options:
+  [num_acceptors: N]`; Bandit's default was 100. Benchmarks that need the old pool set
+  `ACCEPTORS=100`.
+- The namespace's `init` answers `{stop, _}` (`init:stop/0,1`) with `erlang:halt()`, which the
+  runtime turns into destroying that namespace. The density script checks it.
+- The root-terms copy is gone (names stream: root fallback for OTP system persistent_term keys);
+  the `notsup` skip for `module_info` is gone (ns stream). Preloaded modules are still skipped
+  since they are always in the base.
+
+### What remains in a namespace (101 processes with ACCEPTORS=1)
+
+38 supervisors, 11 application masters (x2 processes), 12 `Plug.Upload` partitions (one per
+scheduler), ssl (manager, pem cache, ticket store), sasl `release_handler`, telemetry_poller (2),
+logger (server, handler watcher, olp for the default handler), elixir config/code server, file
+server, application controller, RT store/limiter, Bandit clock, ThousandIsland listener, 1 acceptor.
+
+### 10 namespaces of bench/rest (`ns_boot_density.sh 10`, release build at the head of this branch)
+
+| ns | boot ms | processes | erlang:memory total KB | code KB | ns heap KB | ns ets KB |
+|---|---|---|---|---|---|---|
+| 1 | 4431 | 101 | 28635 | 25031 | 290 | 167 |
+| 2 to 10, median | 150 | 101 | 2295 | 92 | 290 | 167 |
+| 2 to 10, range | 137 to 168 | 101 | 133 to 2694 | 92 | 290 | 167 |
+
+- The first project pays for loading OTP, Elixir and the dependencies into the shared base and
+  dep domain (25 MB of code). Every later project adds 92 KB of code (its own modules and its
+  consolidated protocols).
+- ns heap/ets are `arinsal_ns:info/1` `heap_words`/`ets_words` after a GC of the namespace's
+  processes: about 460 KB per project. The `erlang:memory` total delta is noisy (root's own
+  heaps); its median is 2.3 MB.
+- RSS deltas per project are too noisy on macOS to use (-97 MB to +12 MB; median +8 MB).
+- All 10 answer `/t/1/items/1` with 200. `init:stop()` inside ns 1 destroyed ns 1 only
+  (0 processes left, 9 namespaces alive, root's application_controller in ns 0).
+
+### Root stall during a boot (handed to the code stream)
+
+The e2e probe localized it: in about 1 of 3 runs, `erlang:memory/0` called by a root process
+does not return while a second namespace boots; in the same runs a root `file:write_file/2`
+through `file_server_2` stays pending, and the node ignores SIGTERM afterwards. The e2e probe now
+calls `erlang:memory/0` from a helper with a 1 s timeout and prints the stall count and the
+pending file-server write at the end (`erlang:memory stalls: N`); 4 of 4 runs passed with it,
+one of them reporting 3 stalls and a 1 s pending write.
 
 ## Gaps
 
@@ -105,4 +161,5 @@ export PATH=/Users/sts/dev/sq/arinsal-prs/bin:/opt/homebrew/opt/erlang@29/bin:/o
 CARGO_TARGET_DIR=/Users/sts/dev/sq/arinsal-prs/target-mt-boot cargo build --release -p arinsal-cli
 ln -sf /Users/sts/dev/sq/arinsal-prs/target-mt-boot/release/arinsal /Users/sts/dev/sq/arinsal-prs/mt-shim-boot/erl
 poc/multitenancy/tests/ns_boot_e2e.sh            # REST_RELEASE=<built release> skips the stock build
+REST_RELEASE=<built release> poc/multitenancy/tests/ns_boot_density.sh 10
 ```

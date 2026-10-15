@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Boots N namespaces of the bench/rest release in one Arinsal node through arinsal_ns_boot
 # (prepare/1 with the shared dep domain, arinsal_ns:create/3, start/3), curls each, and prints
-# per-project boot time, processes, erlang:memory and RSS deltas. Then checks that init:stop()
+# per-project boot time, processes, erlang:memory deltas (total, code), the namespace's own heap
+# and ETS words from arinsal_ns:info/1 (after a GC of its processes), and the RSS delta. Then checks that init:stop()
 # inside one namespace destroys only that namespace.
 #
 #   REST_RELEASE=<built bench/rest release> poc/multitenancy/tests/ns_boot_density.sh [N]
@@ -30,12 +31,12 @@ run([Rel, NA, PortA]) ->
     Port0 = list_to_integer(atom_to_list(PortA)),
     {ok, Plan0} = arinsal_cloud_boot:boot_plan(atom_to_list(Rel)),
     Rows = [one(Plan0, I, Port0 + I) || I <- lists:seq(1, N)],
-    io:format("~nns | boot ms | processes | memory total KB | code KB | processes KB | ets KB | rss KB | curl~n"),
+    io:format("~nns | boot ms | processes | memory total KB | code KB | ns heap KB | ns ets KB | rss KB | curl~n"),
     [io:format("~p | ~p | ~p | ~p | ~p | ~p | ~p | ~p | ~s~n", tuple_to_list(R)) || R <- Rows],
     Later = tl(Rows),
     Med = fun(Pos) -> lists:nth((length(Later) + 1) div 2, lists:sort([element(Pos, R) || R <- Later])) end,
     io:format("median of projects 2..N: boot ~p ms, processes ~p, total ~p KB, code ~p KB, "
-              "processes ~p KB, ets ~p KB, rss ~p KB~n",
+              "ns heap ~p KB, ns ets ~p KB, rss ~p KB~n",
               [Med(2), Med(3), Med(4), Med(5), Med(6), Med(7), Med(8)]),
     Ns = element(1, hd(Rows)),
     arinsal_ns:spawn(Ns, init, stop, []),
@@ -65,8 +66,12 @@ one(Plan0, I, Port) ->
     timer:sleep(300),
     M1 = erlang:memory(),
     D = fun(K) -> (proplists:get_value(K, M1) - proplists:get_value(K, M0)) div 1024 end,
-    #{processes := Procs} = arinsal_ns:info(Ns),
-    {Ns, (T1 - T0) div 1000, Procs, D(total), D(code), D(processes), D(ets), rss() - R0, Curl}.
+    [erlang:garbage_collect(P) || P <- processes(), arinsal_ns:'of'(P) =:= Ns],
+    timer:sleep(100),
+    Info = #{processes := Procs} = arinsal_ns:info(Ns),
+    Words = fun(K) -> maps:get(K, Info, 0) * erlang:system_info(wordsize) div 1024 end,
+    {Ns, (T1 - T0) div 1000, Procs, D(total), D(code), Words(heap_words), Words(ets_words),
+     rss() - R0, Curl}.
 
 rss() ->
     list_to_integer(string:trim(os:cmd("ps -o rss= -p " ++ os:getpid()))).
