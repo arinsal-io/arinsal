@@ -722,3 +722,23 @@ fn cwd_descriptor_and_delayed_close() {
         atom("ok")
     );
 }
+
+#[test]
+fn handle_reference_decodes_on_any_node() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("handle");
+    fs::write(&file, b"x").unwrap();
+    let opened = call("open_nif", &[path(&file), O::list(vec![atom("read")])]).unwrap();
+    let O::Tuple(ref parts) = opened else {
+        panic!("open result")
+    };
+    let O::Ref { ref ids, .. } = parts[1] else {
+        panic!("handle is a reference")
+    };
+    assert_eq!(ids.len(), 3);
+    assert!(ids[0] < (1 << 18), "first reference word {:#x}", ids[0]);
+    assert_eq!(
+        call("close_nif", std::slice::from_ref(&parts[1])).unwrap(),
+        atom("ok")
+    );
+}
