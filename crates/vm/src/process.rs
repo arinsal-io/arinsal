@@ -7000,7 +7000,14 @@ impl Task for Process {
             data.scopes_selected = scope != 0;
         }
         let outcome = abort_on_worker_panic(|| self.run_task(ctx, data, budget));
+        // arl: the namespace went over max_bytes during this slice
+        if self.arl_ns_destroy {
+            self.arl_ns_destroy = false;
+            crate::natives::root_only::destroy_namespace(self, ctx, self.ns);
+        }
         if matches!(outcome, RunOutcome::Exit(_)) {
+            // arl: the exiting process leaves the namespace total
+            crate::natives::sys::arl_release_ns_heap(self);
             self._persistent_terms
                 .store()
                 .process_exited(&self._persistent_terms);

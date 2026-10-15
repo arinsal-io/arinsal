@@ -207,6 +207,10 @@ pub struct Process {
     pub(crate) code_chain: Option<crate::code_domains::DomainChain>,
     /// Namespace id (0 is root), mirrored from the scheduler process. A spawn inherits it.
     pub(crate) ns: u32,
+    // arl: words of this process last added to its namespace's `heap_words`
+    pub(crate) arl_ns_words: i64,
+    // arl: the namespace went over `max_bytes`; the scheduler step destroys it
+    pub(crate) arl_ns_destroy: bool,
     /// `p->u.terminate`. erts reuses the initial-call union; a side `ProcessCold` would
     /// allocate on every exit.
     pub(crate) exit_cont: Option<Box<ExitCont>>,
@@ -1396,6 +1400,8 @@ impl Process {
             // arl: code domains.
             code_chain: None,
             ns: 0,
+            arl_ns_words: 0,
+            arl_ns_destroy: false,
             exit_cont: None,
             apply_inline: [Term::NIL; 3],
             apply_inline_len: 0,

@@ -298,6 +298,11 @@ fn info(process: &mut Process, ns: Term) -> Result<Term, VmError> {
             key("heap_words"),
             O::Int(entry.heap_words.load(std::sync::atomic::Ordering::Relaxed)),
         ),
+        // arl: words of the ETS tables owned in the namespace
+        (
+            key("ets_words"),
+            int(super::ets::arl_ns_ets_words(&runtime, ns)),
+        ),
         (
             key("max_processes"),
             limit_term(entry.counters.max_processes()),
