@@ -423,6 +423,9 @@ pub struct Module {
     /// Module literals by BEAM literal index, in this module's literal area. Native code
     /// of the module refers to these same terms, like erts' single literal area per module.
     literal_terms: Arc<HashMap<u32, Term>>,
+    /// Code domain of this instance; 0 is the node's base table. Set before the instance is
+    /// shared and fixed for its lifetime: its static imports resolve through that domain.
+    pub domain: u32,
 }
 impl Clone for Module {
     fn clone(&self) -> Self {
@@ -466,6 +469,7 @@ impl Clone for Module {
             funs: self.funs.iter().map(FunSlot::clone).collect(),
             _literals: self._literals.clone(),
             literal_terms: Arc::clone(&self.literal_terms),
+            domain: self.domain,
         }
     }
 }
@@ -1663,6 +1667,7 @@ pub fn load_with_instrumentations(
         funs,
         _literals: LiteralArea::new(literals),
         literal_terms: Arc::new(literal_terms),
+        domain: 0,
     })
 }
 

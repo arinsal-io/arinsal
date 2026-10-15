@@ -426,8 +426,8 @@ fn info_list(
 }
 
 fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    let name = module_name(args[0]).ok_or_else(badarg)?;
-    let id = vm.code.loaded.get(&name).copied().ok_or_else(badarg)?;
+    let name = args[0].as_atom().ok_or_else(badarg)?;
+    let id = vm.module_for_process(process, name).ok_or_else(badarg)?;
     let module = &vm.code.modules[id];
     let meta = vm.code.code_meta[id].as_ref().ok_or_else(badarg)?;
     let value = |field: &str, process: &mut Process| -> Result<Term, VmError> {
@@ -447,6 +447,20 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                     return Err(badarg());
                 };
                 let mut exports = Vec::new();
+                // A domain instance is not in the node's export index: its own export table,
+                // in the same reverse insertion order.
+                if module.domain != crate::code_domains::BASE {
+                    for export in module.exports.iter().rev() {
+                        exports.push(make_tuple(
+                            process,
+                            &[
+                                Term::atom(export.function_atom),
+                                Term::small(i64::from(export.arity)).unwrap(),
+                            ],
+                        )?);
+                    }
+                    return info_list(process, exports);
+                }
                 for &(module_atom, function_atom, arity) in vm.code.exports.order.iter().rev() {
                     if module_atom != name_atom || !exported.contains(&(function_atom, arity)) {
                         continue;
@@ -563,11 +577,12 @@ pub(crate) fn module_loaded_light(
     let [module] = args else {
         return None;
     };
-    let name = global_atoms().text(module.as_atom()?)?;
+    let name = module.as_atom()?;
+    let chain = process.code_chain.as_deref();
     let loaded = process
         .runtime
         .as_ref()?
-        .with_active_code(|_, tables| tables.loaded.contains_key(name));
+        .with_active_code(|_, tables| tables.module_in_chain(chain, name).is_some());
     Some(Ok(Term::atom(if loaded {
         atoms::TRUE
     } else {
@@ -586,12 +601,12 @@ pub(crate) fn function_exported_light(
     };
     let module = module.as_atom()?;
     let function = function.as_atom()?;
-    let module_name = global_atoms().text(module)?;
     let function_name = global_atoms().text(function)?;
     let arity = u8::try_from(arity.as_small().filter(|n| (0..=255).contains(n))?).ok()?;
+    let chain = process.code_chain.as_deref();
     let exported = process.runtime.as_ref()?.with_active_code(|_, tables| {
-        tables.loaded.get(module_name).is_some_and(|id| {
-            tables.modules[*id]
+        tables.module_in_chain(chain, module).is_some_and(|id| {
+            tables.modules[id]
                 .export_slot(function_name, arity)
                 .is_some()
         })
@@ -1513,12 +1528,14 @@ fn call_values(
             Some(finish(vm, process, Some(ctx), Some(pid), args))
         }
         ("erlang", "module_loaded", 1) => Some((|| {
-            let name = module_name(args[0]).ok_or_else(badarg)?;
-            Ok(Term::atom(if vm.code.loaded.contains_key(&name) {
-                atoms::TRUE
-            } else {
-                atoms::FALSE
-            }))
+            let name = args[0].as_atom().ok_or_else(badarg)?;
+            Ok(Term::atom(
+                if vm.module_for_process(process, name).is_some() {
+                    atoms::TRUE
+                } else {
+                    atoms::FALSE
+                },
+            ))
         })()),
         ("erlang", "loaded", 0) => Some({
             let modules = vm.code.loaded.keys().map(atom).collect::<Vec<_>>();
@@ -1560,11 +1577,10 @@ fn call_values(
                 .as_small()
                 .filter(|n| (0..=255).contains(n))
                 .ok_or_else(badarg)? as u8;
-            let result = vm
-                .code
-                .loaded
+            let result = global_atoms()
                 .get(&name)
-                .is_some_and(|id| vm.code.modules[*id].export_slot(&function, arity).is_some());
+                .and_then(|name| vm.module_for_process(process, name))
+                .is_some_and(|id| vm.code.modules[id].export_slot(&function, arity).is_some());
             Ok(Term::atom(if result { atoms::TRUE } else { atoms::FALSE }))
         })()),
         ("erlang", "get_module_info", 1) => Some(module_info(vm, process, args)),

@@ -47,9 +47,34 @@ Test: `cargo test --release -p arinsal-vm --test ns_code` (needs OTP 29 `erlc` o
 Note for the test author: `M = w, M:f()` is constant-folded by erlc into a static `w:f()`; pass
 the module in at run time to exercise the dynamic path.
 
+## Chunk 2 (done): static imports and lookup natives
+
+- `arinsal_loader::Module.domain: u32` (0 = base) records the instance's domain. `load_into_domain`
+  sets it before the instance is shared, so it never changes.
+- Static calls: `call_import_general` probes the caller instance's domain chain
+  (`Vm::caller_domain_module`) right before the base `loaded.get`. A hit is cached in the import
+  slot by `remember_export`, like a base hit; the cache stays valid because the instance's chain
+  is fixed, and a staging commit (new generation) invalidates it as before. A miss falls through
+  to the unchanged base path. Base instances (`domain == 0`) skip the probe, so root pays one
+  compare on an import cache miss and nothing on a hit.
+- Native code guard: `NativeTargetCache::function_for_target` and the first-run native start in
+  `process.rs` return no native entry for a domain instance, so it never enters native code
+  registered under a base module of the same name.
+- Lookup natives through the process chain (`CodeTables::module_in_chain`, `Vm::module_for_process`):
+  `erlang:module_loaded/1`, `function_exported/3` (both the executor and the light native
+  versions) and `erlang:get_module_info/1,2`. `get_module_info(M, exports)` of a domain instance
+  lists the instance's own export table (domain modules are not in the node's export index).
+- Tests (both with BeamAsm and `ARINSAL_INTERP=1`):
+  - `ns_code_two_domains_same_module_name` now also loads module `a` into each domain, whose
+    `run/0` calls `w:f()` and `lists:reverse/1` statically: each domain gets its own `w`, the base
+    call works;
+  - `ns_code_lookup_natives_follow_chain`: a domain process sees `w` through the three natives,
+    root does not (`false`, `false`, `badarg`);
+  - `ns_code_root_unchanged`: 2.90-3.05 ms / 1.96-2.01 ms over four runs (baseline 2.78 / 2.15).
+
 ## What I learned for the next chunks
 
-### Static imports
+### Static imports (implemented in chunk 2)
 - Interpreter: `call_import` -> `call_import_general` (calls.rs). The cache check is
   `cached_import_jump(p.module, index)`, keyed by the caller instance and the code generation.
   On a miss the module is looked up with `self.code.loaded.get(module_name)` (~calls.rs 1006),
@@ -80,9 +105,7 @@ the module in at run time to exercise the dynamic path.
   against ~3 ms native. OTP/Elixir base code stays native.
 
 ### Open items for follow-up chunks
-- Static imports through the instance chain (above), then `erlang:module_loaded/1`,
-  `function_exported/3` (+ their `_light` native versions in natives/code.rs ~559/~580) and
-  `get_module_info` (natives/code.rs ~430) through the process chain.
+- `code:is_loaded/1`, `code:which/1` and the rest of `code_server` answer from root's view.
 - `prepare_loading`/`finish_loading` into the caller's domain (branch in `finish_stage` before
   `stage_prepared`), md5 dedup against the visible chain (`CodeMeta.md5`), `{error, not_allowed}`
   for shadowing a base module. Proposed allowlist: consolidated Elixir protocols (both modules

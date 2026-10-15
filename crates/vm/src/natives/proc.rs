@@ -1931,6 +1931,9 @@ fn process_info_light_read(
     }
     // erts_try_lock_sig_free_proc: a plain table lookup and one lock attempt.
     let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
+    if !scheduler.ns_may_signal(own, pid) {
+        return Some(Ok(atom("undefined")));
+    }
     match scheduler.inspect_signal_free(pid, |target| {
         // One pass: an item erts reads only through a request, or one that needs the module
         // table, waits for the executor.
@@ -2074,6 +2077,9 @@ fn process_info_call(
     if readable {
         let runtime = process.runtime.as_ref().cloned().ok_or_else(badarg)?;
         let scheduler = runtime.scheduler()?;
+        if !scheduler.ns_may_signal(ctx.pid(), pid) {
+            return Ok(atom("undefined"));
+        }
         let read = scheduler.inspect_signal_free(pid, |target| {
             // An item that needs the module table of the target waits for its request.
             let item = item.filter(|item| remote_target_answers(target, *item))?;

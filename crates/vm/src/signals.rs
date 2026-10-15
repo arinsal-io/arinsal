@@ -1054,6 +1054,9 @@ pub(crate) fn erl_create_process(
         None
     };
     let child_ns = child.ns;
+    if child_ns != 0 && rt.namespaces.live(child_ns).is_none() {
+        return Err(system_limit());
+    }
     let pid = scheduler
         .spawn_unscheduled_in_ns(child, so.priority, so.scheduler, child_ns)
         .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
@@ -1677,7 +1680,7 @@ fn deliver(
     if !crate::natives::proc::live(process, to)? {
         return Ok(());
     }
-    ctx.send(to, Message::copy_from(message)?)
+    ctx.send_runtime(to, Message::copy_from(message)?)
         .map_err(|error| VmError::Unsupported(format!("system task reply: {error}")))?;
     Ok(())
 }
@@ -3328,6 +3331,9 @@ fn submit_from(
     wait: Option<WaitKind>,
     priority: Option<Priority>,
 ) -> Result<Submit, VmError> {
+    if !runtime(process)?.scheduler()?.ns_may_signal(from, target) {
+        return Ok(Submit::Dead);
+    }
     let id = if id == 0 {
         runtime(process)?.next_ref()
     } else {
@@ -3664,7 +3670,7 @@ pub(crate) fn reply_request(
         process.heap.end_detached();
     }
     let message = message?;
-    match ctx.send(pending.from, message) {
+    match ctx.send_runtime(pending.from, message) {
         Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(()),
         Err(error) => Err(VmError::Unsupported(format!("request reply: {error}"))),
     }
@@ -3727,7 +3733,7 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
         let Ok(message) = Message::copy_from(reply) else {
             continue;
         };
-        let _ = ctx.send(pending.from, message);
+        let _ = ctx.send_runtime(pending.from, message);
     }
 }
 

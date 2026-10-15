@@ -1340,10 +1340,11 @@ impl Executor {
                     })
                     .filter(|&address| version.contains_code(address))
                     .or_else(|| version.native_function_start(function, arity)),
-                None => {
+                None if module.domain == crate::code_domains::BASE => {
                     crate::native_function_for(self.vm.code_scope, &module.name, function, arity)
                         .map(|native| native.start)
                 }
+                None => None,
             }
         {
             process.native_pc = Some(start);
@@ -6890,6 +6891,9 @@ impl arinsal_sched::SignalMessage for Message {
     fn timer_ref_key(&self) -> Option<u64> {
         self.timer_id
     }
+    fn via_alias(&self) -> bool {
+        self.alias != 0
+    }
 }
 
 impl Message {
@@ -7091,7 +7095,7 @@ impl Task for Process {
             return;
         };
         for (requester, reply) in literal_replies {
-            let _ = scheduler.send(pid, requester, reply);
+            let _ = scheduler.send_runtime(pid, requester, reply);
         }
         for (requester, id) in unlink_acks {
             let _ = scheduler.signal(pid, requester, Signal::UnlinkAckSignal(id));

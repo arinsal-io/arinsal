@@ -242,7 +242,7 @@ pub(crate) fn sync_reply(
     let tag = tag.into_receiver(process)?;
     let tuple = process.tuple(&[tag, result])?;
     let message = Message::copy_from(tuple)?;
-    let _ = ctx.send(requester, message);
+    let _ = ctx.send_runtime(requester, message);
     Ok(())
 }
 
