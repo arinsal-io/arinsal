@@ -123,7 +123,8 @@ fn domains_arg(value: &O) -> Result<Vec<crate::code_domains::DomainId>, VmError>
     }
 }
 
-/// `create/2,3`. Opts: `max_processes`, `max_bytes`, and the code chain: `code_chain => [D]`
+/// `create/2,3`. Opts: `max_processes`, `max_bytes`, `schedulers` (what `system_info(schedulers)`
+/// and `system_info(schedulers_online)` answer inside the namespace, default 1), and the code chain: `code_chain => [D]`
 /// uses that chain (`[0]` is the base only), `dep_domain => D` creates a fresh domain over `D`,
 /// and without either a fresh domain over the base is created.
 fn create(
@@ -138,6 +139,7 @@ fn create(
     let mut max_processes = crate::namespace::UNLIMITED;
     let mut max_bytes = crate::namespace::UNLIMITED;
     let mut os_env: Vec<(String, String)> = Vec::new();
+    let mut schedulers = 1;
     let mut code_chain = None;
     let mut dep_domain = None;
     match &to_owned(opts).map_err(|_| badarg())? {
@@ -149,6 +151,7 @@ fn create(
                     O::Atom(name) if name == "max_bytes" => max_bytes = limit_arg(value)?,
                     // arl: `os_env => [{Key, Value}]` seeds the environment overlay
                     O::Atom(name) if name == "os_env" => os_env = env_arg(value)?,
+                    O::Atom(name) if name == "schedulers" => schedulers = schedulers_arg(value)?,
                     O::Atom(name) if name == "code_chain" => code_chain = Some(domains_arg(value)?),
                     O::Atom(name) if name == "dep_domain" => dep_domain = Some(domains_arg(value)?),
                     _ => {}
@@ -180,6 +183,9 @@ fn create(
         runtime
             .namespaces
             .create(&scheduler, tenant, project, max_processes, max_bytes, code);
+    entry
+        .schedulers
+        .store(schedulers, std::sync::atomic::Ordering::Relaxed);
     for (name, value) in os_env {
         entry.env_put(name.into(), value.into());
     }
@@ -187,6 +193,14 @@ fn create(
         process,
         &O::Tuple(vec![O::Atom("ok".into()), O::Int(i64::from(entry.id))]),
     )
+}
+
+/// `schedulers` option: the virtual scheduler count, 1 to 1024.
+fn schedulers_arg(value: &O) -> Result<u32, VmError> {
+    match value {
+        O::Int(n) if (1..=1024).contains(n) => Ok(*n as u32),
+        _ => Err(badarg()),
+    }
 }
 
 /// `os_env` option: a list of `{Key, Value}` strings (lists of code points or binaries).
@@ -312,6 +326,12 @@ fn info(process: &mut Process, ns: Term) -> Result<Term, VmError> {
             limit_term(entry.counters.max_processes()),
         ),
         (key("max_bytes"), limit_term(entry.max_bytes)),
+        (
+            key("schedulers"),
+            O::Int(i64::from(
+                entry.schedulers.load(std::sync::atomic::Ordering::Relaxed),
+            )),
+        ),
         (
             key("code_chain"),
             O::List {

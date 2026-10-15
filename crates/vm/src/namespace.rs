@@ -7,7 +7,7 @@ use crate::register::RegisterTable;
 use arinsal_sched::{NsCounters, Scheduler, Task};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 /// No cap.
@@ -23,6 +23,10 @@ pub(crate) struct NsEntry {
     /// Live heap of the namespace's processes, in words. Updated after collections once the
     /// heap accounting step lands; 0 until then.
     pub(crate) heap_words: AtomicI64,
+    /// What `erlang:system_info(schedulers | schedulers_online)` answers inside this namespace
+    /// (`schedulers` option of `create/3`, default 1), so partitioned libraries start one
+    /// partition per namespace instead of one per scheduler of the node.
+    pub(crate) schedulers: AtomicU32,
     /// Process and reduction counters and the process cap, shared with the scheduler.
     pub(crate) counters: Arc<NsCounters>,
     alive: AtomicBool,
@@ -105,6 +109,7 @@ impl NsTable {
             project,
             max_bytes,
             heap_words: AtomicI64::new(0),
+            schedulers: AtomicU32::new(1),
             counters: scheduler.ns_register(id, max_processes),
             alive: AtomicBool::new(true),
             names: OnceLock::new(),

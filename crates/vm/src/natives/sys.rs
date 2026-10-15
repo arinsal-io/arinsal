@@ -1179,6 +1179,11 @@ fn system_info(
             u64::from(crate::node_tables::lock().local_creation),
         )),
         // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
+        // arl: a namespace process sees its namespace's virtual scheduler count
+        Some("schedulers_online" | "schedulers") if process.ns != 0 => {
+            let count = arl_ns_schedulers(process);
+            Some(non_neg(process, u64::from(count)))
+        }
         Some("schedulers_online") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.schedulers_online as u64)
         })),
@@ -3570,6 +3575,17 @@ fn with_flags<T>(process: &Process, body: impl FnOnce(&mut SystemFlags) -> T) ->
 }
 
 /// A snapshot of the flags for code that allocates on `process` while reading them.
+/// The `schedulers` option of the caller's namespace (1 when the entry is gone).
+fn arl_ns_schedulers(process: &Process) -> u32 {
+    process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.namespaces.get(process.ns))
+        .map_or(1, |entry| {
+            entry.schedulers.load(std::sync::atomic::Ordering::Relaxed)
+        })
+}
+
 fn read_flags<T>(process: &mut Process, body: impl FnOnce(&mut Process, &SystemFlags) -> T) -> T {
     let flags = with_flags(process, |flags| flags.clone());
     body(process, &flags)
