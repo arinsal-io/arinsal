@@ -339,6 +339,22 @@ impl<'a> ArlWho<'a> {
     }
 }
 
+/// Words held by the ETS tables of namespace `ns`.
+// arl: ETS memory of a namespace
+pub(crate) fn arl_ns_ets_words(runtime: &crate::process::Runtime, ns: u32) -> u64 {
+    let registry = runtime.ets.read().unwrap();
+    registry
+        .arl_all_in(ns)
+        .into_iter()
+        .filter_map(|tid| {
+            registry
+                .get(tid)
+                .ok()
+                .map(|table| table.memory_words() as u64)
+        })
+        .sum()
+}
+
 /// True when `pid` is a live process of namespace `ns`, or is not alive at all.
 fn arl_pid_in_ns(rt: &crate::process::Runtime, pid: Pid, ns: u32) -> bool {
     rt.scheduler()

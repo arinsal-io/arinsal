@@ -63,13 +63,28 @@
 - Destroy: owner exit deletes the ETS tables of a destroyed ns and releases its registered names
   (`ns_ets_destroy_frees`); the empty name table and pterm store stay.
 
+## Chunk 4: heap accounting and `max_bytes` (done)
+- `NsEntry.heap_words` is the sum of what each namespace process last reported. After every
+  collection `after_collection` (natives/sys.rs) calls `arl_account_ns_heap` for `ns != 0`:
+  `total_heap_size_words()` (young and old heap, fragments) plus off-heap binary bytes as words.
+  The process keeps its last report in `Process.arl_ns_words`; the delta goes into the namespace and
+  `arl_release_ns_heap` subtracts it when the process exits (scheduler step in process.rs).
+- A process that never collects is not counted until its first GC (a fresh process reports 0).
+- `arinsal_ns:info/1` returns `heap_words` and `ets_words` (sum of `memory_words()` of the tables
+  of that ns, computed at call time).
+- Cap: when `heap_words * 8 > max_bytes` after a collection, the namespace is closed (no more
+  spawns), a line goes to stderr, and `arl_ns_destroy` makes the scheduler step of that process run
+  `destroy_namespace` (kill every process of the ns). The check runs only at collections, so a
+  burst between collections can overshoot. ETS memory is reported but not part of the cap.
+- Tests: `ns_heap_accounting_grows_and_shrinks`, `ns_max_bytes_destroys_ns_only` (`--test ns_heap`).
+
 ## Run
 ```
 export CARGO_TARGET_DIR=/Users/sts/dev/sq/arinsal-prs/target-mt-names
 export PATH=/Users/sts/dev/sq/arinsal-prs/bin:/opt/homebrew/opt/erlang@29/bin:/opt/homebrew/opt/elixir/bin:$PATH
 cargo test -p arinsal-vm --test ns_names
 cargo test -p arinsal-vm --test ns_ets
-cargo test -p arinsal-vm --test ns_pterm --test ns_env
+cargo test -p arinsal-vm --test ns_pterm --test ns_env --test ns_heap
 cargo test -p arinsal-vm --test ns_core
 cargo test -p arinsal-vm --lib register
 ```
