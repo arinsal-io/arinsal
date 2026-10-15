@@ -148,7 +148,8 @@ pub(crate) fn group_leader_self_light(
         return None;
     };
     let leader = Pid::from_term(*leader)?;
-    if Pid::from_term(*target)? != process.self_pid? {
+    // arl: a leader outside the caller's namespace falls back to the checked path.
+    if Pid::from_term(*target)? != process.self_pid? || !arl_leader_allowed(process, leader) {
         return None;
     }
     set_group_leader(process, leader).ok()?;
@@ -2152,6 +2153,20 @@ fn gc_message(process: &mut Process, request_id: Term, ok: bool) -> Result<Term,
     )
 }
 
+/// arl: a namespace process may only pick a leader of its own namespace or a shared one.
+fn arl_leader_allowed(process: &Process, leader: Pid) -> bool {
+    process.ns == 0
+        || process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.scheduler().ok())
+            .and_then(|scheduler| scheduler.ns_word(leader))
+            .is_none_or(|word| {
+                word & arinsal_sched::NS_SHARED != 0
+                    || word & arinsal_sched::NS_ID_MASK == process.ns
+            })
+}
+
 fn set_group_leader(process: &mut Process, leader: Pid) -> Result<(), VmError> {
     let term = leader.to_term().ok_or_else(badarg)?;
     set_flag(process, "group_leader", term);
@@ -2206,6 +2221,10 @@ pub(crate) fn fulfill_request(
             make_tuple(process, &[reference, info])
         }
         crate::signals::RemoteOp::GroupLeader { leader } => {
+            // arl: the target refuses a leader outside its namespace.
+            if !arl_leader_allowed(process, leader) {
+                return make_tuple(process, &[reference, atom("badarg")]);
+            }
             set_group_leader(process, leader)?;
             make_tuple(process, &[reference, atom("true")])
         }
@@ -2342,6 +2361,14 @@ fn group_leader_call(
             Err(badarg())
         };
     };
+    // arl: the caller may not pick a leader outside its namespace.
+    if !arl_leader_allowed(process, leader) {
+        return if internal {
+            Ok(atom("badarg"))
+        } else {
+            Err(badarg())
+        };
+    }
     if pid == ctx.pid() {
         set_group_leader(process, leader)?;
         return Ok(atom("true"));

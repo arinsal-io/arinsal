@@ -201,11 +201,16 @@ pub struct Process {
     /// `p->parent` (erl_process.c:12756): the spawning process, `None` (`undefined`) for the
     /// first process; a remote parent's external pid is `ProcessCold::parent_external`.
     pub(crate) parent: Option<arinsal_sched::Pid>,
+    // arl: code domains.
     /// Code lookup chain of dynamic calls; `None` is root, which resolves in the base only.
     /// A spawned process inherits it.
     pub(crate) code_chain: Option<crate::code_domains::DomainChain>,
     /// Namespace id (0 is root), mirrored from the scheduler process. A spawn inherits it.
     pub(crate) ns: u32,
+    // arl: words of this process last added to its namespace's `heap_words`
+    pub(crate) arl_ns_words: i64,
+    // arl: the namespace went over `max_bytes`; the scheduler step destroys it
+    pub(crate) arl_ns_destroy: bool,
     /// `p->u.terminate`. erts reuses the initial-call union; a side `ProcessCold` would
     /// allocate on every exit.
     pub(crate) exit_cont: Option<Box<ExitCont>>,
@@ -1188,6 +1193,22 @@ impl Process {
         }
     }
 
+    /// Move the process onto the persistent-term store of its namespace. Called once the
+    /// namespace is known; a process of root keeps the node store.
+    pub(crate) fn arl_bind_ns_store(&mut self) {
+        if self.ns == 0 {
+            return;
+        }
+        let base = self
+            .runtime
+            .as_ref()
+            .map_or(0, |runtime| runtime.code_scope);
+        let store = arinsal_pterm::store_for(arinsal_pterm::arl_ns_scope(base, self.ns));
+        if !std::ptr::eq(self._persistent_terms.store(), store) {
+            self._persistent_terms = store.register_process();
+        }
+    }
+
     /// Select a registered native function as the process's next entry point.
     pub fn set_native_entry(&mut self, address: usize) -> Result<(), &'static str> {
         if native_function_at(address).is_none() {
@@ -1376,8 +1397,11 @@ impl Process {
             cold: None,
             group_leader: None,
             parent: None,
+            // arl: code domains.
             code_chain: None,
             ns: 0,
+            arl_ns_words: 0,
+            arl_ns_destroy: false,
             exit_cont: None,
             apply_inline: [Term::NIL; 3],
             apply_inline_len: 0,

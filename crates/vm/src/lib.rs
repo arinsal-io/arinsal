@@ -9,6 +9,7 @@ mod bif_table;
 pub mod boot;
 mod calls;
 mod check_io;
+// arl: code domains.
 mod code_domains;
 mod code_ix;
 mod compare;
@@ -59,6 +60,8 @@ pub use native_hooks::{
     arinsal_beamasm_guard3, arinsal_beamasm_map_lookup,
 };
 pub use natives::implemented_natives;
+#[doc(hidden)]
+pub use natives::root_only::root_only as arl_native_is_root_only;
 #[doc(hidden)]
 pub use natives::tty::registered_callers as tty_registered_callers;
 mod stacktrace;

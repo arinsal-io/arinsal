@@ -71,6 +71,64 @@ pub(crate) fn after_collection(
     flags.gc_count.fetch_add(collections, Ordering::Relaxed);
     flags.gc_words.fetch_add(words_reclaimed, Ordering::Relaxed);
     snapshot_process(process, live_x);
+    // arl: a namespace process reports its memory to the namespace
+    if process.ns != 0 {
+        arl_account_ns_heap(process);
+    }
+}
+
+/// Add the change of this process's memory since its last report to the namespace total, and
+/// destroy the namespace once the total passes `max_bytes`. Memory is heap, old heap and
+/// fragments plus off-heap binaries, in words; ETS tables are not part of the cap.
+// arl: heap accounting of a namespace
+#[cold]
+#[inline(never)]
+fn arl_account_ns_heap(process: &mut Process) {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
+    };
+    let Some(entry) = runtime.namespaces.get(process.ns) else {
+        return;
+    };
+    let word = std::mem::size_of::<usize>() as u64;
+    let words =
+        process.heap.total_heap_size_words() as u64 + process.heap.off_heap_binary_bytes() / word;
+    let words = i64::try_from(words).unwrap_or(i64::MAX);
+    let delta = words - process.arl_ns_words;
+    process.arl_ns_words = words;
+    let total = entry.heap_words.fetch_add(delta, Ordering::Relaxed) + delta;
+    if entry.max_bytes != crate::namespace::UNLIMITED
+        && u64::try_from(total).unwrap_or(0).saturating_mul(word) > entry.max_bytes
+        && runtime.namespaces.close(process.ns)
+    {
+        eprintln!(
+            "arinsal: namespace {} ({}/{}) uses {} bytes, over max_bytes {}; destroying it",
+            entry.id,
+            String::from_utf8_lossy(&entry.tenant),
+            String::from_utf8_lossy(&entry.project),
+            u64::try_from(total).unwrap_or(0).saturating_mul(word),
+            entry.max_bytes
+        );
+        process.arl_ns_destroy = true;
+    }
+}
+
+/// Take the memory of an exiting namespace process out of the namespace total.
+// arl: heap accounting of a namespace
+pub(crate) fn arl_release_ns_heap(process: &mut Process) {
+    if process.ns == 0 || process.arl_ns_words == 0 {
+        return;
+    }
+    if let Some(entry) = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.namespaces.get(process.ns))
+    {
+        entry
+            .heap_words
+            .fetch_sub(process.arl_ns_words, Ordering::Relaxed);
+    }
+    process.arl_ns_words = 0;
 }
 
 /// Handle one phase of a literal-copy request after earlier signals have drained.

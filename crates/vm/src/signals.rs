@@ -1004,8 +1004,17 @@ pub(crate) fn erl_create_process(
             .unwrap_or_else(|| parent.group_leader_pid(ctx.pid())),
     );
     child.parent = Some(ctx.pid());
-    child.code_chain = parent.code_chain.clone();
+    // arl: code chain of the child; a process in a namespace always has its namespace's.
+    child.code_chain = match so.ns {
+        Some(ns) => rt
+            .namespaces
+            .get(ns)
+            .and_then(|entry| entry.code_chain.clone()),
+        None => parent.code_chain.clone(),
+    };
     child.ns = so.ns.unwrap_or(parent.ns);
+    // arl: a namespace process has its own persistent-term store
+    child.arl_bind_ns_store();
     // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: `args` is copied
     // with copy_struct_litopt and the three arg registers take mod, func and the copy), OTP-29.1.1.
     let copied_args = {

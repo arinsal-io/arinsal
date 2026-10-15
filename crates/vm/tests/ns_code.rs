@@ -63,7 +63,7 @@ fn worker_module(result: &str) -> String {
 
 const DRIVER: &str = r#"
 -module(ns_code_drv).
--export([two_domains/0, worker/2, lookups/0, lookup_worker/2, dedup/0, load_worker/2, shadow/0, shadow_worker/2]).
+-export([two_domains/0, worker/2, lookups/0, lookup_worker/2, dedup/0, load_worker/2, shadow/0, shadow_worker/2, ns_spawn/0, ns_worker/3, unloaded_base/0]).
 two_domains() ->
     A = arinsal_code:new_domain(0),
     B = arinsal_code:new_domain([0]),
@@ -109,6 +109,8 @@ dedup() ->
 load_in(Chain, Modules) ->
     arinsal_code:spawn(Chain, ns_code_drv, load_worker, [self(), Modules]),
     receive {loaded, R} -> R after 5000 -> timeout end.
+load_worker(Parent, {nocall, Modules}) ->
+    Parent ! {loaded, [erlang:load_module(M, B) || {M, B} <- Modules]};
 load_worker(Parent, Modules) ->
     Loaded = [erlang:load_module(M, B) || {M, B} <- Modules],
     Calls = [M:f() || {M, _} <- Modules],
@@ -123,6 +125,36 @@ shadow_worker(Parent, P) ->
     Lists = erlang:load_module(lists, beam_fake_lists()),
     Protocol = erlang:load_module(P, beam_pp_domain()),
     Parent ! {shadow, {Lists, lists:reverse([1, 2]), Protocol, P:'__protocol__'(x)}}.
+ns_spawn() ->
+    true = arinsal_ns:expose(self()) =:= ok,
+    D = arinsal_code:new_domain(0),
+    ok = arinsal_code:load(D, [{dep, beam_dep()}]),
+    {ok, Ns} = arinsal_ns:create(<<"acme">>, <<"shop">>, #{dep_domain => D}),
+    #{code_chain := [Own | _] = Chain} = arinsal_ns:info(Ns),
+    ok = arinsal_code:load(Own, [{w, beam_a()}, {a, beam_caller()}]),
+    arinsal_ns:spawn(Ns, ns_code_drv, ns_worker, [self(), {w, a}, dep]),
+    Result = receive {ns_worker, R} -> R after 5000 -> timeout end,
+    {ok, Plain} = arinsal_ns:create(<<"acme">>, <<"plain">>, #{code_chain => [0]}),
+    #{code_chain := PlainChain} = arinsal_ns:info(Plain),
+    {Chain =:= [Own, D, 0], Result, PlainChain}.
+ns_worker(Parent, Modules, Dep) ->
+    Parent ! {ns_worker, try ns_work(Modules, Dep) catch Class:Reason:Stack -> {Class, Reason, Stack} end}.
+ns_work(Modules, Dep) ->
+    Self = self(),
+    Child = spawn(fun() -> Self ! {child, arinsal_code:chain(self())} end),
+    ChildChain = receive {child, C} -> C after 5000 -> Child end,
+    {work(Modules), Dep:f(), ChildChain =:= arinsal_code:chain(self())}.
+unloaded_base() ->
+    false = erlang:module_loaded(orddict),
+    A = arinsal_code:new_domain(0),
+    Fake = load_in([A, 0], {nocall, [{orddict, beam_fake_orddict()}]}),
+    Before = erlang:memory(code),
+    Real = load_in([A, 0], {nocall, [{orddict, beam_real_orddict()}]}),
+    Grown = erlang:memory(code) > Before,
+    B = arinsal_code:new_domain(0),
+    Again = erlang:memory(code),
+    Second = load_in([B, 0], {nocall, [{orddict, beam_real_orddict()}]}),
+    {Fake, Real, erlang:module_loaded(orddict), Grown, Second, erlang:memory(code) - Again}.
 lookup(M) ->
     {erlang:module_loaded(M),
      erlang:function_exported(M, f, 0),
@@ -138,6 +170,18 @@ fn protocol(result: &str) -> String {
     format!("-module(pp).\n-export(['__protocol__'/1]).\n'__protocol__'(_) -> {result}.\n")
 }
 
+/// The bytes of OTP's own `module.beam`, as the reference `erl` on PATH finds it.
+fn otp_beam(module: &str) -> Vec<u8> {
+    let output = Command::new("erl")
+        .args(["-noshell", "-eval"])
+        .arg(format!(
+            "io:format(\"~s\", [code:which({module})]), halt()."
+        ))
+        .output()
+        .expect("run erl");
+    std::fs::read(String::from_utf8_lossy(&output.stdout).trim()).expect("read the OTP beam")
+}
+
 /// Beams the driver embeds and the base ones loaded before it runs: `dd` and the base `pp`.
 fn driver_vm(beam_a: &[u8], beam_b: &[u8]) -> Vm {
     let caller = compile("a", CALLER).expect("compile the caller module");
@@ -146,16 +190,25 @@ fn driver_vm(beam_a: &[u8], beam_b: &[u8]) -> Vm {
     let fake_lists = compile("lists", FAKE_LISTS).expect("compile the fake lists");
     let pp_base = compile("pp", &protocol("base")).expect("compile pp");
     let pp_domain = compile("pp", &protocol("domain")).expect("compile pp");
+    let fake_orddict = compile(
+        "orddict",
+        "-module(orddict).\n-export([f/0]).\nf() -> fake.\n",
+    )
+    .expect("compile the fake orddict");
+    let real_orddict = otp_beam("orddict");
     let driver = format!(
         "{DRIVER}\nbeam_a() -> {}.\nbeam_b() -> {}.\nbeam_caller() -> {}.\nbeam_dep() -> {}.\n\
-         beam_dd() -> {}.\nbeam_fake_lists() -> {}.\nbeam_pp_domain() -> {}.\n",
+         beam_dd() -> {}.\nbeam_fake_lists() -> {}.\nbeam_pp_domain() -> {}.\n\
+         beam_fake_orddict() -> {}.\nbeam_real_orddict() -> {}.\n",
         binary_literal(beam_a),
         binary_literal(beam_b),
         binary_literal(&caller),
         binary_literal(&dep),
         binary_literal(&dd),
         binary_literal(&fake_lists),
-        binary_literal(&pp_domain)
+        binary_literal(&pp_domain),
+        binary_literal(&fake_orddict),
+        binary_literal(&real_orddict)
     );
     let driver = compile("ns_code_drv", &driver).expect("compile the driver");
     let mut vm = Vm::new([]);
@@ -251,6 +304,50 @@ fn ns_code_base_not_shadowable() {
     assert_eq!(
         result.text,
         "{{{error,not_allowed},[2,1],{module,pp},domain},[2,1],base}"
+    );
+}
+
+/// `arinsal_ns:create/3` gives the namespace a fresh domain over its `dep_domain`; a process
+/// spawned with `arinsal_ns:spawn/4` (and its own children) has that chain, reaching the
+/// namespace's `w` and `a` and the dep domain's `dep`. `code_chain => [0]` is the base only.
+#[test]
+fn ns_code_ns_spawn_gets_chain() {
+    let (Some(beam_a), Some(beam_b)) = (
+        compile("w", &worker_module("a")),
+        compile("w", &worker_module("b")),
+    ) else {
+        eprintln!("erlc unavailable; skipping ns_code_ns_spawn_gets_chain");
+        return;
+    };
+    let mut vm = driver_vm(&beam_a, &beam_b);
+    let result = vm
+        .eval_scheduled("ns_code_drv", "ns_spawn", &[], 2, None)
+        .unwrap();
+    assert_eq!(
+        result.text,
+        "{true,{{a,a,a,a,{fun_result,a},{static,a,[2,1]},[2,1,0]},dep,true},[0]}"
+    );
+}
+
+/// A domain load of a name the base has not loaded but finds on the node's code path compares
+/// with that beam: different code is `not_allowed`; the same code loads into the base, once,
+/// and a second domain loading it again adds no code.
+#[test]
+fn ns_code_unloaded_base_name_not_allowed() {
+    let (Some(beam_a), Some(beam_b)) = (
+        compile("w", &worker_module("a")),
+        compile("w", &worker_module("b")),
+    ) else {
+        eprintln!("erlc unavailable; skipping ns_code_unloaded_base_name_not_allowed");
+        return;
+    };
+    let mut vm = driver_vm(&beam_a, &beam_b);
+    let result = vm
+        .eval_scheduled("ns_code_drv", "unloaded_base", &[], 2, None)
+        .unwrap();
+    assert_eq!(
+        result.text,
+        "{[{error,not_allowed}],[{module,orddict}],true,true,[{module,orddict}],0}"
     );
 }
 

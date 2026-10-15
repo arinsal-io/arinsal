@@ -1003,7 +1003,7 @@ impl Vm {
                 module_name, function_name, import_arity
             )));
         }
-        // An instance of a non-base domain resolves through that domain's chain first.
+        // arl: an instance of a non-base domain resolves through that domain's chain first.
         if caller_module.domain != crate::code_domains::BASE
             && let Some(target_module) =
                 self.caller_domain_module(caller_module.domain, import.module_atom)

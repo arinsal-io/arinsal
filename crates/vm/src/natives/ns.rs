@@ -6,7 +6,7 @@ use crate::process::Message;
 use crate::signals::{ErlSpawnOpts, atom, erl_create_process};
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_sched::{NS_ID_MASK, Pid, Priority, RunCtx, Signal};
+use arinsal_sched::{NS_ID_MASK, Pid, Priority, RunCtx};
 use arinsal_term::{Term, from_owned, to_owned};
 
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
@@ -67,8 +67,8 @@ fn call_impl(
         return Err(notsup());
     }
     match (function, args) {
-        ("create", [tenant, project]) => create(process, *tenant, *project, Term::NIL),
-        ("create", [tenant, project, opts]) => create(process, *tenant, *project, *opts),
+        ("create", [tenant, project]) => create(vm, process, *tenant, *project, Term::NIL),
+        ("create", [tenant, project, opts]) => create(vm, process, *tenant, *project, *opts),
         ("spawn", [ns, m, f, a]) => spawn(vm, process, ctx, *ns, (*m, *f, *a), Term::NIL),
         ("spawn", [ns, m, f, a, opts]) => spawn(vm, process, ctx, *ns, (*m, *f, *a), *opts),
         ("destroy", [ns]) => destroy(process, ctx, *ns),
@@ -110,11 +110,36 @@ fn limit_arg(value: &O) -> Result<u64, VmError> {
     }
 }
 
-fn create(process: &mut Process, tenant: Term, project: Term, opts: Term) -> Result<Term, VmError> {
+/// A domain id or a list of them, from a `create/3` option.
+fn domains_arg(value: &O) -> Result<Vec<crate::code_domains::DomainId>, VmError> {
+    let domain = |value: &O| match value {
+        O::Int(n) => crate::code_domains::DomainId::try_from(*n).map_err(|_| badarg()),
+        _ => Err(badarg()),
+    };
+    match value {
+        O::List { elems, tail } if **tail == O::Nil => elems.iter().map(domain).collect(),
+        O::Nil => Ok(Vec::new()),
+        other => Ok(vec![domain(other)?]),
+    }
+}
+
+/// `create/2,3`. Opts: `max_processes`, `max_bytes`, and the code chain: `code_chain => [D]`
+/// uses that chain (`[0]` is the base only), `dep_domain => D` creates a fresh domain over `D`,
+/// and without either a fresh domain over the base is created.
+fn create(
+    vm: &mut Vm,
+    process: &mut Process,
+    tenant: Term,
+    project: Term,
+    opts: Term,
+) -> Result<Term, VmError> {
     let tenant = binary_arg(tenant)?;
     let project = binary_arg(project)?;
     let mut max_processes = crate::namespace::UNLIMITED;
     let mut max_bytes = crate::namespace::UNLIMITED;
+    let mut os_env: Vec<(String, String)> = Vec::new();
+    let mut code_chain = None;
+    let mut dep_domain = None;
     match &to_owned(opts).map_err(|_| badarg())? {
         O::Nil => {}
         O::Map(entries) => {
@@ -122,21 +147,81 @@ fn create(process: &mut Process, tenant: Term, project: Term, opts: Term) -> Res
                 match key {
                     O::Atom(name) if name == "max_processes" => max_processes = limit_arg(value)?,
                     O::Atom(name) if name == "max_bytes" => max_bytes = limit_arg(value)?,
+                    // arl: `os_env => [{Key, Value}]` seeds the environment overlay
+                    O::Atom(name) if name == "os_env" => os_env = env_arg(value)?,
+                    O::Atom(name) if name == "code_chain" => code_chain = Some(domains_arg(value)?),
+                    O::Atom(name) if name == "dep_domain" => dep_domain = Some(domains_arg(value)?),
                     _ => {}
                 }
             }
         }
         _ => return Err(badarg()),
     }
+    let code_chain = match (code_chain, dep_domain) {
+        (Some(chain), None) => vm.code_chain_of(chain).ok_or_else(badarg)?,
+        (None, parents) => {
+            let parents = parents.unwrap_or_default();
+            let domain = vm.new_code_domain(&parents).ok_or_else(badarg)?;
+            vm.code_chain_of(vec![domain]).ok_or_else(badarg)?
+        }
+        (Some(_), Some(_)) => return Err(badarg()),
+    };
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
-    let entry = runtime
-        .namespaces
-        .create(&scheduler, tenant, project, max_processes, max_bytes);
+    let entry = runtime.namespaces.create(
+        &scheduler,
+        tenant,
+        project,
+        max_processes,
+        max_bytes,
+        code_chain,
+    );
+    for (name, value) in os_env {
+        entry.env_put(name.into(), value.into());
+    }
     heap_term(
         process,
         &O::Tuple(vec![O::Atom("ok".into()), O::Int(i64::from(entry.id))]),
     )
+}
+
+/// `os_env` option: a list of `{Key, Value}` strings (lists of code points or binaries).
+fn env_arg(value: &O) -> Result<Vec<(String, String)>, VmError> {
+    fn text(value: &O) -> Result<String, VmError> {
+        match value {
+            O::Binary(bytes) => String::from_utf8(bytes.clone()).map_err(|_| badarg()),
+            O::Nil => Ok(String::new()),
+            O::List { elems, tail } if **tail == O::Nil => elems
+                .iter()
+                .map(|item| match item {
+                    O::Int(code) => u32::try_from(*code)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(badarg),
+                    _ => Err(badarg()),
+                })
+                .collect(),
+            _ => Err(badarg()),
+        }
+    }
+    let entries = match value {
+        O::Nil => return Ok(Vec::new()),
+        O::List { elems, tail } if **tail == O::Nil => elems,
+        _ => return Err(badarg()),
+    };
+    entries
+        .iter()
+        .map(|entry| match entry {
+            O::Tuple(pair) if pair.len() == 2 => {
+                let (name, value) = (text(&pair[0])?, text(&pair[1])?);
+                if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+                    return Err(badarg());
+                }
+                Ok((name, value))
+            }
+            _ => Err(badarg()),
+        })
+        .collect()
 }
 
 fn spawn(
@@ -213,11 +298,29 @@ fn info(process: &mut Process, ns: Term) -> Result<Term, VmError> {
             key("heap_words"),
             O::Int(entry.heap_words.load(std::sync::atomic::Ordering::Relaxed)),
         ),
+        // arl: words of the ETS tables owned in the namespace
+        (
+            key("ets_words"),
+            int(super::ets::arl_ns_ets_words(&runtime, ns)),
+        ),
         (
             key("max_processes"),
             limit_term(entry.counters.max_processes()),
         ),
         (key("max_bytes"), limit_term(entry.max_bytes)),
+        (
+            key("code_chain"),
+            O::List {
+                elems: entry
+                    .code_chain
+                    .as_deref()
+                    .unwrap_or(&[crate::code_domains::BASE])
+                    .iter()
+                    .map(|domain| O::Int(i64::from(*domain)))
+                    .collect(),
+                tail: Box::new(O::Nil),
+            },
+        ),
     ]);
     heap_term(process, &map)
 }
@@ -238,8 +341,7 @@ fn list(process: &mut Process) -> Result<Term, VmError> {
 }
 
 /// Mark `ns` destroyed and send `kill` to every process of it. The processes exit shortly
-/// after. Spawning into the namespace fails from the moment it is marked, so a second scan
-/// finds the children that were created while the first signals were in flight.
+/// after; see [`super::root_only::destroy_namespace`].
 fn destroy(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -248,14 +350,7 @@ fn destroy(
     let ns = ns_arg(ns)?;
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     runtime.namespaces.get(ns).ok_or_else(badarg)?;
-    runtime.namespaces.close(ns);
-    let scheduler = runtime.scheduler()?;
-    for _ in 0..2 {
-        for pid in scheduler.pids_in_ns(ns) {
-            let reason = Message::copy_from(atom("kill"))?;
-            let _ = ctx.signal(pid, Signal::Exit(reason));
-        }
-    }
+    super::root_only::destroy_namespace(process, ctx, ns);
     Ok(atom("ok"))
 }
 

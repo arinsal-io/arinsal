@@ -5,6 +5,8 @@
 
 use crate::register::RegisterTable;
 use arinsal_sched::{NsCounters, Scheduler, Task};
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -26,9 +28,39 @@ pub(crate) struct NsEntry {
     alive: AtomicBool,
     /// Registered names of this namespace, created on the first `register/2`.
     names: OnceLock<RegisterTable>,
+    /// OS environment of the namespace: a set value, or `None` for a variable that was
+    /// unset. Variables not listed here fall back to [`ENV_ALLOWLIST`] of the node.
+    env: RwLock<BTreeMap<OsString, Option<OsString>>>,
+    /// Code lookup chain of every process of this namespace; `None` resolves in the base only.
+    pub(crate) code_chain: Option<crate::code_domains::DomainChain>,
 }
 
+/// Variables a namespace still reads from the process-wide environment. Everything else of
+/// the node environment (tokens, credentials) is invisible to tenants.
+pub(crate) const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "TZ"];
+
 impl NsEntry {
+    /// Set a variable of the namespace environment.
+    pub(crate) fn env_put(&self, name: OsString, value: OsString) {
+        self.env
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name, Some(value));
+    }
+
+    /// Unset a variable; an allowlisted one stays hidden from then on.
+    pub(crate) fn env_unset(&self, name: OsString) {
+        self.env
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name, None);
+    }
+
+    /// The environment overlay, read by the `os` environment BIFs.
+    pub(crate) fn env(&self) -> &RwLock<BTreeMap<OsString, Option<OsString>>> {
+        &self.env
+    }
+
     /// The name table, created on first use.
     pub(crate) fn names(&self) -> &RegisterTable {
         self.names.get_or_init(RegisterTable::new)
@@ -61,6 +93,7 @@ impl NsTable {
         project: Vec<u8>,
         max_processes: u64,
         max_bytes: u64,
+        code_chain: Option<crate::code_domains::DomainChain>,
     ) -> Arc<NsEntry> {
         let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let id = entries.len() as u32 + 1;
@@ -73,6 +106,8 @@ impl NsTable {
             counters: scheduler.ns_register(id, max_processes),
             alive: AtomicBool::new(true),
             names: OnceLock::new(),
+            env: RwLock::new(BTreeMap::new()),
+            code_chain,
         });
         entries.push(entry.clone());
         entry

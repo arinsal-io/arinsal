@@ -518,6 +518,7 @@ impl Vm {
                     })
                     .map(|slot| (id, slot.target))
             })
+            // arl: local funs of domain instances.
             .or_else(|| self.domain_local_fun(entry));
         let Some((module_id, target)) = found else {
             // Port of erts/emulator/beam/beam_common.c:1702-1712 (call_fun), OTP-29.1.1:
@@ -758,6 +759,12 @@ impl Vm {
             let entry = crate::signals::handler_atoms(module_atom, function_atom, arity as u8);
             if let Some(entry) = entry {
                 resolved_entry = true;
+                // arl: a root-only native is refused on the apply path as well.
+                if let Some(error) =
+                    crate::natives::root_only::refuse(p, Some(run), module, function, arity)
+                {
+                    return Err(error);
+                }
                 if let Some(result) = self.dispatch_resolved_entry(
                     p,
                     run,
@@ -916,7 +923,7 @@ impl Vm {
                 "BIF {module}:{function}/{arity}"
             )));
         }
-        // A process with a code chain reaches the instances of its own domains first.
+        // arl: a process with a code chain reaches the instances of its own domains first.
         let domain_module = p.code_chain.as_ref().and_then(|_| {
             let atom = atoms
                 .map(|(module, _)| module)

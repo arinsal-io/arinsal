@@ -1340,6 +1340,7 @@ impl Executor {
                     })
                     .filter(|&address| version.contains_code(address))
                     .or_else(|| version.native_function_start(function, arity)),
+                // arl: a domain instance never starts in native code.
                 None if module.domain == crate::code_domains::BASE => {
                     crate::native_function_for(self.vm.code_scope, &module.name, function, arity)
                         .map(|native| native.start)
@@ -3702,6 +3703,7 @@ impl Vm {
         let args = crate::signals::list(process.x[2])
             .ok_or_else(|| VmError::Unsupported("run_process arguments".into()))?;
         let arity = args.len() as u8;
+        // arl: the spawned MFA resolves through the process's code chain.
         let in_domain = self.process_domain_module(process, module).and_then(|id| {
             let slot = self.code.modules[id].export_slot_atom(function, arity)?;
             Some((id, slot.target()))
@@ -6998,7 +7000,14 @@ impl Task for Process {
             data.scopes_selected = scope != 0;
         }
         let outcome = abort_on_worker_panic(|| self.run_task(ctx, data, budget));
+        // arl: the namespace went over max_bytes during this slice
+        if self.arl_ns_destroy {
+            self.arl_ns_destroy = false;
+            crate::natives::root_only::destroy_namespace(self, ctx, self.ns);
+        }
         if matches!(outcome, RunOutcome::Exit(_)) {
+            // arl: the exiting process leaves the namespace total
+            crate::natives::sys::arl_release_ns_heap(self);
             self._persistent_terms
                 .store()
                 .process_exited(&self._persistent_terms);
