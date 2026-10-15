@@ -353,6 +353,10 @@ struct Prepared {
     has_on_load: bool,
     /// Loaded code from `prepare_loading`; taken by the first `finish_loading`.
     module: Mutex<Option<arinsal_loader::Module>>,
+    /// Code domain of the preparing process (the first domain of its chain). `finish_loading`
+    /// loads there even when another process finishes, as `code_server` does for
+    /// `code:load_binary/3`.
+    domain: crate::code_domains::DomainId,
 }
 
 impl Prepared {
@@ -669,6 +673,12 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         beam: Mutex::new(Some(beam)),
         bytes: Mutex::new(bytes),
         module: Mutex::new(Some(module)),
+        domain: process
+            .code_chain
+            .as_deref()
+            .and_then(<[_]>::first)
+            .copied()
+            .unwrap_or(crate::code_domains::BASE),
     };
     // The code server heap is often full when Mix loads the next test beam.
     // `magic_ref` does not grow by itself; a 3-word miss became `system_limit`
@@ -779,6 +789,31 @@ fn finish_stage(
         drop(beam_slot);
         prepared_refs.push(prepared);
         prepared_modules.push((module, registers, meta));
+    }
+    if prepared_refs
+        .iter()
+        .any(|prepared| prepared.domain != crate::code_domains::BASE)
+    {
+        let domain = prepared_refs[0].domain;
+        if prepared_refs
+            .iter()
+            .any(|prepared| prepared.domain != domain)
+        {
+            return Err(badarg());
+        }
+        return match vm.install_in_domain(domain, prepared_modules) {
+            Ok(()) => {
+                for prepared in prepared_refs {
+                    prepared.release();
+                }
+                Ok(atom("ok"))
+            }
+            Err(("badarg", _)) => Err(badarg()),
+            Err((reason, modules)) => {
+                let names = make_list(process, modules.into_iter().map(Term::atom))?;
+                make_tuple(process, &[atom(reason), names])
+            }
+        };
     }
     if prepared_modules.len() > 1
         && prepared_modules

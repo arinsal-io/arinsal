@@ -2549,7 +2549,7 @@ fn internal_state_set(
             let Some(&[tag, low, high]) = ids.get(..3) else {
                 return Err(badarg());
             };
-            if tag != 0x4554_5329 {
+            if tag != arinsal_ets::TID_REF_TAG {
                 return Err(badarg());
             }
             let tid = arinsal_ets::Tid(u64::from(low) | (u64::from(high) << 32));

@@ -12,7 +12,7 @@
 -export([os_owner/6]).
 
 start(#{release_dir := Dir, env := Env, key := Key, log := Log, notify := Notify}) ->
-    case arinsal_cloud_projects:release_version(Dir) of
+    case arinsal_cloud_boot:release_version(Dir) of
         {ok, Vsn} ->
             case erl_executable() of
                 false ->

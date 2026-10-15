@@ -1,6 +1,7 @@
 %% Backend behaviour of the manager: how a project is actually run.
-%% `arinsal_cloud_fake` is the stock-ERTS implementation. The `arinsal_ns` backend is a
-%% follow-up; `select/0` will pick it when the natives exist.
+%%
+%%   arinsal_cloud_ns    namespaces of this node, needs the `arinsal_ns` natives
+%%   arinsal_cloud_fake  one OS process per project, works on any runtime
 -module(arinsal_cloud_backend).
 
 -export([select/0]).
@@ -27,10 +28,21 @@
 -callback stop(handle()) -> ok.
 -callback info(handle()) -> map().
 
-%% App env `backend`: `auto` (default) or a module implementing this behaviour.
+%% App env `backend`:
+%%   fake  always the OS-process backend
+%%   ns    always the namespace backend (projects fail to start without the natives)
+%%   auto  (default) the namespace backend when it is usable, else fake; usable means the natives
+%%         exist and `arinsal_ns_boot` is not the placeholder
+%%   Mod   any module implementing this behaviour
 -spec select() -> module().
 select() ->
     case application:get_env(arinsal_cloud, backend, auto) of
-        auto -> arinsal_cloud_fake;
+        auto ->
+            case arinsal_cloud_ns:usable() of
+                true -> arinsal_cloud_ns;
+                false -> arinsal_cloud_fake
+            end;
+        fake -> arinsal_cloud_fake;
+        ns -> arinsal_cloud_ns;
         Mod when is_atom(Mod) -> Mod
     end.

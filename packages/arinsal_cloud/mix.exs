@@ -21,9 +21,7 @@ defmodule ArinsalCloud.MixProject do
       env: [
         admin_port: 7000,
         data_dir: ~c"arinsal-cloud-data",
-        idle_timeout_ms: :infinity,
         backend: :auto,
-        fake_mode: :same_node,
         log_lines: 1000
       ]
     ]
