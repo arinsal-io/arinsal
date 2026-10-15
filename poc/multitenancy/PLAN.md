@@ -36,7 +36,7 @@ Each phase ends with tests and a short note in `poc/multitenancy/NOTES.md`.
 
 ### Phase 1: namespace core
 - Namespace table on the node: ids, quotas, counters.
-- A process carries a namespace id, inherited on spawn. Root id 0 means today's behaviour.
+- A process carries a namespace id, inherited on spawn. Root id 0 means today's behavior.
 - Isolated by namespace:
   - send, link, monitor, and exit signals (dropped across tenants, allowed across projects of one tenant);
   - register, whereis, and registered;
