@@ -53,7 +53,7 @@ start(#{tenant := Tenant, project := Project, release_dir := Dir, log := Log, en
             case arinsal_cloud_boot:boot_plan(Dir) of
                 {ok, Plan} ->
                     Limits = application:get_env(arinsal_cloud, ns_limits, #{}),
-                    case arinsal_ns:create(Tenant, Project, Limits) of
+                    case arinsal_ns:create(Tenant, Project, Limits#{os_env => Env}) of
                         {ok, Ns} -> boot(Ns, Plan, Log, Env, Key, Notify);
                         {error, Reason} -> {error, {ns_create, Reason}}
                     end;

@@ -6,10 +6,11 @@
 %% project's applications are started.
 %%
 %% Inside the namespace, `ns_init` registers as `init` (the namespace's own name table) and:
-%%   0. starts its own file_server_2;
+%%   0. copies root's persistent terms of the shared services, starts its own file_server_2;
 %%   1. loads every module of the plan into the namespace's code domain (`prepare_loading` in
 %%      batches, then `finish_loading`; base and dependency modules dedup to no-ops);
-%%   2. sets the OS environment of the project (node-wide until the env overlay lands);
+%%   2. sets the project's OS environment in the namespace's env overlay (the backend also
+%%      passes it to `arinsal_ns:create/3`);
 %%   3. starts `logger` (logger_server) and `application_controller` with the kernel app spec
 %%      whose `mod` is `arinsal_ns_kernel`, so starting `kernel` brings up only Logger;
 %%   4. loads every app of the plan from its own `.app` file, sets the plan's env (persistent),
@@ -29,6 +30,7 @@
 -define(LOAD_BATCH, 64).
 -define(ROOT_SERVICES, [code_server, inet_db, erl_prim_loader, user,
                         standard_error, erl_signal_server, timer_server, kernel_refc,
+                        inet_gethost_native,
                         global_name_server]).
 
 %% Sets the SHARED bit on the root services a namespace kernel reaches by name. Called once by
@@ -39,10 +41,17 @@ expose_root_services() ->
     ok.
 
 -spec start(pos_integer(), map(), map()) -> {ok, pid()} | {error, term()}.
-start(Ns, #{modules := Modules} = Plan, #{group_leader := Leader} = Opts) ->
+start(Ns, #{modules := Modules0} = Plan0, #{group_leader := Leader} = Opts) ->
     expose_root_services(),
+    %% Preloaded modules (erlang, erts_internal, prim_*) are always in the base; some of them
+    %% are root only, even their module_info.
+    Preloaded = erlang:pre_loaded(),
+    Modules = [{M, P} || {M, P} <- Modules0, not lists:member(M, Preloaded)],
+    Plan = Plan0#{modules := Modules},
     _ = preload_base(Modules),
+    {module, _} = code:ensure_loaded(arinsal_ns_kernel),
     Cfg = #{kernel_app => kernel_app(),
+            root_terms => root_terms(),
             arguments => root_arguments(),
             os_env => maps:get(os_env, Opts, [])},
     %% A namespace process cannot send to a root pid that is not exposed; a message to an
@@ -98,6 +107,17 @@ md5(Path) ->
         _ -> undefined
     end.
 
+%% persistent_term is per namespace, but the shared root services publish state there that
+%% their client modules read in the caller (code_server's mode, erl_prim_loader, prim_socket
+%% tables, erl_features). The namespace gets a copy; Logger's keys are its own.
+root_terms() ->
+    [{K, V} || {K, V} <- persistent_term:get(), not namespace_term(K)].
+
+namespace_term(K) ->
+    lists:member(K, [logger_proxy]) orelse
+        (is_tuple(K) andalso tuple_size(K) =:= 2 andalso
+         lists:member(element(1, K), [logger_config, logger_olp])).
+
 kernel_app() ->
     File = filename:join(code:lib_dir(kernel), "ebin/kernel.app"),
     {ok, [{application, kernel, Props}]} = file:consult(File),
@@ -151,6 +171,7 @@ boot_process(Init, Parent, Ref, Plan, Cfg) ->
     end.
 
 boot(#{modules := Modules, apps := Apps, env := Env, ebins := Ebins}, Cfg) ->
+    [persistent_term:put(K, V) || {K, V} <- maps:get(root_terms, Cfg)],
     step(file_server),
     {ok, _} = file_server:start_link(),
     step(load_modules),
@@ -229,8 +250,14 @@ load_batches([{M, Path} | Rest], Acc) ->
 %% A module the chain already resolves to an identical instance is skipped before it is parsed;
 %% finish_loading would dedup it anyway.
 already_here(M, Bin) ->
-    erlang:module_loaded(M) andalso
-        {ok, {M, M:module_info(md5)}} =:= beam_lib:md5(Bin).
+    try
+        erlang:module_loaded(M) andalso
+            {ok, {M, M:module_info(md5)}} =:= beam_lib:md5(Bin)
+    catch
+        %% A module whose natives are root only (erl_ddll) answers even module_info with
+        %% notsup; it is loaded in the base and the namespace cannot use it anyway.
+        error:notsup -> true
+    end.
 
 finish(Acc) ->
     {Mods, Prepared} = lists:unzip(lists:reverse(Acc)),

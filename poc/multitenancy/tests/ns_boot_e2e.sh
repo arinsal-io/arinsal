@@ -46,6 +46,11 @@ cat >"$WORK/ns_boot_probe.erl" <<'EOF'
 start([File]) ->
     spawn(fun() -> loop(atom_to_list(File)) end).
 loop(File) ->
+    try sample(File)
+    catch C:E:S -> file:write_file(File ++ ".err", io_lib:format("~p~n", [{C, E, S}]))
+    end,
+    receive after 200 -> loop(File) end.
+sample(File) ->
     AC = whereis(application_controller),
     Mem = erlang:memory(),
     Ns = [{N, maps:with([processes, tenant, project], arinsal_ns:info(N))} || N <- arinsal_ns:list()],
@@ -54,8 +59,7 @@ loop(File) ->
                           proplists:get_value(processes, Mem), proplists:get_value(code, Mem),
                           proplists:get_value(ets, Mem), Ns]),
     ok = file:write_file(File ++ ".tmp", Line),
-    ok = file:rename(File ++ ".tmp", File),
-    receive after 200 -> loop(File) end.
+    ok = file:rename(File ++ ".tmp", File).
 EOF
 (cd "$WORK" && stock erlc ns_boot_probe.erl) || fail "probe does not compile"
 
