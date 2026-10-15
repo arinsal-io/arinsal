@@ -1398,8 +1398,12 @@ pub fn put<H: HeapAlloc + ?Sized>(
         *vp = bits(value);
         kp = kp.add(1);
         vp = vp.add(1);
-        std::ptr::copy_nonoverlapping(ks.add(i), kp, n - i);
-        std::ptr::copy_nonoverlapping(vs.add(i), vp, n - i);
+        // erts copies the tail with one interleaved key/value loop (`while(n--)`); two
+        // memcpy calls cost more than the few words they move.
+        for j in 0..n - i {
+            *kp.add(j) = *ks.add(i + j);
+            *vp.add(j) = *vs.add(i + j);
+        }
         // One word of the first allocation remains.
         *kp.add(n - i) = POS_BIG_SUBTAG;
         Ok(boxed(hp))

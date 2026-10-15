@@ -2165,7 +2165,7 @@ impl AllocUtil {
         let word = self.tree_word(word);
         let value = if is_aoff(self.strategy) && word == AOFF_FLAGS_WORD {
             let old = self.word_at(node, word)?;
-            (old & !u32::MAX as usize) | (value & u32::MAX as usize)
+            (old & !(u32::MAX as usize)) | (value & u32::MAX as usize)
         } else {
             value
         };
@@ -2240,20 +2240,6 @@ impl AllocUtil {
         self.set_word_at(node, AOFF_FLAGS_WORD, value)
     }
 
-    fn recompute_tree_max(&mut self, node: usize) -> Result<usize, AllocError> {
-        if node == 0 {
-            return Ok(0);
-        }
-        let left = self.node_word(node, TREE_LEFT_WORD)?;
-        let right = self.node_word(node, TREE_RIGHT_WORD)?;
-        let largest = self
-            .tree_node_size(node)?
-            .max(self.recompute_tree_max(left)?)
-            .max(self.recompute_tree_max(right)?);
-        self.set_tree_node_max_size(node, largest)?;
-        Ok(largest)
-    }
-
     /// Port of rbt_search, erl_ao_firstfit_alloc.c:863-881, OTP-29.1.1.
     fn aoff_search(&self, mut root: usize, need: usize) -> Result<Option<usize>, AllocError> {
         while root != 0 {
@@ -2280,35 +2266,28 @@ impl AllocUtil {
             }
             carrier.key_base + MBC_HEADER
         };
-        if self.carriers[carrier_index]
+        // The root's max_sz is the largest free block of the carrier.
+        let largest = self.aoff_roots[carrier_index];
+        let largest_size = if largest == 0 {
+            0
+        } else {
+            self.node_word(largest, TREE_FLAGS_WORD)? >> 32
+        };
+        let in_tree = self.carriers[carrier_index]
             .as_ref()
-            .is_some_and(|carrier| carrier.in_aoff_tree)
-        {
+            .is_some_and(|carrier| carrier.in_aoff_tree);
+        // Port of aoff_link_free_block/aoff_unlink_free_block: the carrier tree is touched only
+        // when the carrier's largest free block changed.
+        if in_tree && largest_size != 0 && self.tree_node_size(node)? == largest_size {
+            return Ok(());
+        }
+        if in_tree {
             self.delete_tree_node(node)?;
             self.carriers[carrier_index]
                 .as_mut()
                 .ok_or(AllocError::Corrupt)?
                 .in_aoff_tree = false;
         }
-        let largest = self.aoff_roots[carrier_index];
-        let largest_size = if largest == 0 {
-            0
-        } else {
-            let mut max = 0;
-            let mut stack = vec![largest];
-            while let Some(block) = stack.pop() {
-                max = max.max(self.tree_node_size(block)?);
-                let left = self.node_word(block, TREE_LEFT_WORD)?;
-                let right = self.node_word(block, TREE_RIGHT_WORD)?;
-                if left != 0 {
-                    stack.push(left);
-                }
-                if right != 0 {
-                    stack.push(right);
-                }
-            }
-            max
-        };
         if largest_size == 0 {
             return Ok(());
         }
@@ -2481,7 +2460,7 @@ impl AllocUtil {
             self.set_tree_root(node, node)?;
             self.set_node_word(node, TREE_FLAGS_WORD, TREE_NODE)?;
             if is_aoff(self.strategy) {
-                self.recompute_tree_max(node)?;
+                self.update_node_max(node)?;
             }
             return Ok(());
         }
@@ -2498,8 +2477,7 @@ impl AllocUtil {
         )?;
         self.insert_fixup(node)?;
         if is_aoff(self.strategy) {
-            let root = self.tree_root(node)?;
-            self.recompute_tree_max(root)?;
+            self.update_max_to_root(node)?;
         }
         Ok(())
     }
@@ -2695,7 +2673,8 @@ impl AllocUtil {
             self.set_node_word(parent, TREE_RIGHT_WORD, y)?;
         }
         self.set_node_word(y, TREE_LEFT_WORD, x)?;
-        self.set_node_word(x, TREE_PARENT_WORD, y)
+        self.set_node_word(x, TREE_PARENT_WORD, y)?;
+        self.rotated_max(x, y)
     }
 
     fn rotate_right(&mut self, x: usize) -> Result<(), AllocError> {
@@ -2718,7 +2697,42 @@ impl AllocUtil {
             self.set_node_word(parent, TREE_LEFT_WORD, y)?;
         }
         self.set_node_word(y, TREE_RIGHT_WORD, x)?;
-        self.set_node_word(x, TREE_PARENT_WORD, y)
+        self.set_node_word(x, TREE_PARENT_WORD, y)?;
+        self.rotated_max(x, y)
+    }
+
+    /// Port of the max_sz upkeep in lrotate/rrotate, erl_ao_firstfit_alloc.c:700-760, OTP-29.1.1:
+    /// after a rotation the lower node is recomputed first, then the one above it.
+    #[inline]
+    fn rotated_max(&mut self, lower: usize, upper: usize) -> Result<(), AllocError> {
+        if is_aoff(self.strategy) {
+            self.update_node_max(lower)?;
+            self.update_node_max(upper)?;
+        }
+        Ok(())
+    }
+
+    /// `max(own size, children's max)` of one aoff tree node.
+    #[inline]
+    fn update_node_max(&mut self, node: usize) -> Result<(), AllocError> {
+        let mut largest = self.tree_node_size(node)?;
+        for child_word in [TREE_LEFT_WORD, TREE_RIGHT_WORD] {
+            let child = self.node_word(node, child_word)?;
+            if child != 0 {
+                largest = largest.max(self.node_word(child, TREE_FLAGS_WORD)? >> 32);
+            }
+        }
+        self.set_tree_node_max_size(node, largest)
+    }
+
+    /// Refreshes `max_sz` on `node` and every ancestor (the `update_max` walk of rbt_insert and
+    /// rbt_delete in erl_ao_firstfit_alloc.c, OTP-29.1.1).
+    fn update_max_to_root(&mut self, mut node: usize) -> Result<(), AllocError> {
+        while node != 0 {
+            self.update_node_max(node)?;
+            node = self.node_word(node, TREE_PARENT_WORD)?;
+        }
+        Ok(())
     }
 
     fn insert_fixup(&mut self, mut node: usize) -> Result<(), AllocError> {
@@ -2874,8 +2888,9 @@ impl AllocUtil {
         self.set_node_word(node, TREE_LEFT_WORD, 0)?;
         self.set_node_word(node, TREE_RIGHT_WORD, 0)?;
         if is_aoff(self.strategy) {
-            let root = self.tree_root(node)?;
-            self.recompute_tree_max(root)?;
+            // Rotations keep their own nodes exact; every node whose subtree lost the block is an
+            // ancestor of the spot it left, which stays an ancestor through the rebalancing.
+            self.update_max_to_root(child_parent)?;
         }
         Ok(())
     }
