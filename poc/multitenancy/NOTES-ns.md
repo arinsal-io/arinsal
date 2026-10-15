@@ -74,10 +74,8 @@
      `direct_ets` and the trap light entry for it, so native code never calls a root-only body directly.
   `natives::tests::root_only_natives_reach_the_dispatcher` checks every `ROOT_ONLY` entry is a listed native
   and not a light process BIF or ETS handler. Both the JIT and `ARINSAL_INTERP=1` pass the ns_core tests.
-- `open_port` is refused as the brief says. A project that listens on a socket (Bandit) needs ports, so the
-  boot or manager step will have to relax this, for example by allowing the inet drivers
-  (`tcp_inet`, `udp_inet`, `sctp_inet`) and gating `erts_internal:port_*` by port owner. The port natives
-  (`port_command` and friends) are root only for now for the same reason.
+- `open_port` and the port natives were root only in this chunk; chunk 5 relaxed them to the inet drivers and
+  own-namespace ports.
 - `erlang:halt/0,1,2` from a namespace destroys that namespace (`destroy_namespace`: close, kill both scans) and
   ends the caller with `killed`; the node keeps running. `init:stop/0` from a ns sends to root `init`, which
   drops it; a ns-local init comes with the boot step.
@@ -87,6 +85,29 @@
   checked yet.
 - `catch erlang:ports()` and other calls the compiler knows cannot fail lose their `catch`; tests call them
   through `apply` with variables.
+
+## Chunk 5: ports in a namespace, spawn_opt group_leader
+- `PortHandle.arl_ns` is the namespace of the opener (taken from the owner pid in `make_handle`), so accepted
+  sockets and other ports of a ns process carry it too.
+- Open: from a ns, `open_port`/`erts_internal:open_port` accepts only `{spawn_driver, "tcp_inet" | "udp_inet" |
+  "sctp_inet"}` (what `prim_inet:open` uses for gen_tcp, gen_udp, gen_sctp); everything else (`spawn`,
+  `spawn_executable`, `fd`, other drivers, `os:cmd`) raises `notsup`. The port natives and `ports/0` left the
+  root-only list; `port.rs` holds the policy (`arl_ns_may_open`, `arl_port_guard`, `arl_port_ns_ok`).
+- Use: `port_command/control/call/close/connect/info/get_data/set_data` on a port of another namespace (and on
+  port 0) answer like a missing port: `badarg`, `undefined` for `port_info`. `port_connect` to a pid of another
+  ns is `badarg`. `Port ! Msg`, `exit(Port, _)` to a foreign port are dropped, `link(Port)` gives `noproc`,
+  `monitor(port, P)` gives DOWN `noproc`. `erlang:ports/0` lists only the caller's ns (port 0 is root's).
+  Root is unchanged.
+- Port to owner messages are sent as the owner itself, so they pass the delivery check unchanged.
+- gen_tcp on OTP 29 uses the inet driver (`inet_backend` default); the socket NIF (`prim_socket`) is a static NIF
+  outside the native list, so it is not root-only, but its resources are not ns-tagged (they are unguessable
+  refs, not ids). Revisit if a project selects `{inet_backend, socket}`.
+- The kernel apps do not run in the test VM, so the echo test drives `prim_inet` directly (`inet_db` needs the
+  application controller). A real project boot gets the usual `gen_tcp`.
+- `spawn_opt(..., [{group_leader, L}])` is now parsed (it was `badarg` before) and refused with `badarg` for a
+  foreign non-shared `L` from a ns. `spawn_request/5` options are not parsed for it.
+- Tests: ns_port_tcp_listen_accept_in_ns, ns_port_cross_ns_refused, ns_ports_filtered,
+  ns_port_spawn_driver_refused, ns_spawn_opt_group_leader_foreign.
 
 ## Microbench at ns 0
 `cargo run -r -p arinsal-sched --example bench -- <name>` (4 workers), 3 runs each on a busy machine, base is

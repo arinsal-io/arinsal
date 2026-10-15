@@ -2154,7 +2154,7 @@ fn gc_message(process: &mut Process, request_id: Term, ok: bool) -> Result<Term,
 }
 
 /// arl: a namespace process may only pick a leader of its own namespace or a shared one.
-fn arl_leader_allowed(process: &Process, leader: Pid) -> bool {
+pub(crate) fn arl_leader_allowed(process: &Process, leader: Pid) -> bool {
     process.ns == 0
         || process
             .runtime

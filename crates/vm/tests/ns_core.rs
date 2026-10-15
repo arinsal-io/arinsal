@@ -316,6 +316,158 @@ ns_processes_filtered() ->
         Bad -> {bad, Bad}
     end.
 
+%% A TCP echo through the inet driver, with prim_inet because the kernel applications are not running.
+tcp_listen() ->
+    {ok, L} = prim_inet:open(tcp, inet, stream),
+    ok = prim_inet:setopts(L, [{reuseaddr, true}, {active, false}, binary]),
+    {ok, _} = prim_inet:bind(L, {127, 0, 0, 1}, 0),
+    ok = prim_inet:listen(L, 5),
+    {ok, {_, Port}} = prim_inet:sockname(L),
+    {L, Port}.
+
+tcp_echo_client(Server, Port) ->
+    {ok, C} = prim_inet:open(tcp, inet, stream),
+    ok = prim_inet:setopts(C, [{active, false}, binary]),
+    {ok, _} = prim_inet:bind(C, {127, 0, 0, 1}, 0),
+    {ok, C, R1} = prim_inet:async_connect(C, {127, 0, 0, 1}, Port, 3000),
+    receive {inet_async, C, R1, ok} -> ok after 3000 -> exit(connect_timeout) end,
+    ok = prim_inet:send(C, <<"hello">>),
+    {ok, R2} = prim_inet:async_recv(C, 0, 3000),
+    receive {inet_async, C, R2, {ok, Data}} -> Server ! {echo, Data} after 3000 -> exit(recv_timeout) end.
+
+ns_port_tcp_listen_accept_in_ns() ->
+    Ns = mk(<<"acme">>),
+    Res = in_ns(Ns, fun() ->
+        {L, Port} = tcp_listen(),
+        Me = self(),
+        spawn(fun() -> case catch tcp_echo_client(Me, Port) of {'EXIT', E} -> Me ! {client_error, E}; _ -> ok end end),
+        {ok, R0} = prim_inet:async_accept(L, 3000),
+        S = receive {inet_async, L, R0, {ok, S0}} -> S0 after 3000 -> exit(accept_timeout) end,
+        {ok, R1} = prim_inet:async_recv(S, 0, 3000),
+        Data = receive {inet_async, S, R1, {ok, D}} -> D; {client_error, CE} -> exit({client_error, CE}) after 3000 -> exit(server_recv_timeout) end,
+        ok = prim_inet:send(S, Data),
+        receive {echo, Echoed} -> {echoed, Echoed, erlang:port_info(L, name)} after 3000 -> timeout end
+    end),
+    case Res of
+        {echoed, <<"hello">>, {name, "tcp_inet"}} -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_port_cross_ns_refused() ->
+    N1 = mk(<<"acme">>),
+    N2 = mk(<<"globex">>),
+    {Owner, ORef} = start_in(N1, fun() ->
+        {L, _} = tcp_listen(),
+        receive stop -> L end
+    end),
+    Owner ! go,
+    L = wait_port(),
+    Res = in_ns(N2, fun() ->
+        Ref = erlang:monitor(port, L),
+        Down = receive {'DOWN', Ref, port, L, Why} -> Why after 2000 -> timeout end,
+        [catch erlang:port_command(L, <<"x">>),
+         catch erlang:port_control(L, 0, []),
+         catch erlang:port_close(L),
+         catch erlang:port_connect(L, self()),
+         catch erlang:port_info(L, name),
+         catch erlang:port_get_data(L),
+         catch (L ! {self(), close}),
+         catch link(L),
+         catch exit(L, kill),
+         Down]
+    end),
+    Still = erlang:port_info(L, name),
+    Owner ! stop,
+    L = await(Owner, ORef),
+    Summary = [psumm(R) || R <- Res],
+    case {Summary, Still} of
+        {[badarg, badarg, badarg, badarg, undefined, badarg, tuple, noproc, true, noproc], {name, "tcp_inet"}} -> ok;
+        Other -> {bad, Other, Res}
+    end.
+
+psumm({'EXIT', {E, _}}) -> E;
+psumm(T) when is_tuple(T) -> tuple;
+psumm(A) -> A.
+
+%% The listening port of the namespace-1 process appears in the root's port list.
+wait_port() -> wait_port(300).
+wait_port(0) -> timeout;
+wait_port(N) ->
+    case [P || P <- erlang:ports(), erlang:port_info(P, name) =:= {name, "tcp_inet"}] of
+        [P | _] -> P;
+        [] -> receive after 10 -> ok end, wait_port(N - 1)
+    end.
+
+ns_ports_filtered() ->
+    N1 = mk(<<"acme">>),
+    N2 = mk(<<"globex">>),
+    Open = fun(Count) -> fun() ->
+        _ = [prim_inet:open(tcp, inet, stream) || _ <- lists:seq(1, Count)],
+        receive probe -> length(erlang:ports()) end
+    end end,
+    {A, RA} = start_in(N1, Open(2)),
+    {B, RB} = start_in(N2, Open(1)),
+    A ! go, B ! go,
+    wait_ports(4, 300),
+    RootCount = length(erlang:ports()),
+    A ! probe, B ! probe,
+    CA = await(A, RA),
+    CB = await(B, RB),
+    case {CA, CB, RootCount >= 4} of
+        {2, 1, true} -> ok;
+        Other -> {bad, Other}
+    end.
+
+wait_ports(_, 0) -> ok;
+wait_ports(N, T) ->
+    case length(erlang:ports()) >= N of
+        true -> ok;
+        false -> receive after 10 -> ok end, wait_ports(N, T - 1)
+    end.
+
+ns_port_spawn_driver_refused() ->
+    Ns = mk(<<"acme">>),
+    Res = in_ns(Ns, fun() ->
+        Refused = [catch erlang:open_port({spawn, "echo hi"}, []),
+                   catch erlang:open_port({spawn_executable, "/bin/echo"}, []),
+                   catch erlang:open_port({fd, 0, 1}, []),
+                   catch erlang:open_port({spawn_driver, "ram_file_drv"}, [binary]),
+                   catch erlang:open_port({spawn_driver, "udp_inet tcp_inet"}, [binary])],
+        Allowed = [catch erlang:open_port({spawn_driver, "tcp_inet"}, [binary]),
+                   catch erlang:open_port({spawn_driver, "udp_inet"}, [binary])],
+        {Refused, [is_port(P) || P <- Allowed]}
+    end),
+    case Res of
+        {Refused, [true, true]} ->
+            case lists:all(fun is_notsup/1, Refused) of
+                true -> ok;
+                false -> {bad, Refused}
+            end;
+        Other -> {bad, Other}
+    end.
+
+ns_spawn_opt_group_leader_foreign() ->
+    Ns = mk(<<"acme">>),
+    Unshared = spawn(fun waiter/0),
+    Shared = spawn(fun waiter/0),
+    ok = arinsal_ns:expose(Shared),
+    Res = in_ns(Ns, fun() ->
+        Own = spawn(fun waiter/0),
+        Opt = fun(L) -> catch spawn_opt(ns_core_t, waiter, [], [{group_leader, L}]) end,
+        [R1, R2, R3] = [Opt(Unshared), Opt(Shared), Opt(Own)],
+        Leaders = [process_info(P, group_leader) || P <- [R2, R3], is_pid(P)],
+        [P ! stop || P <- [R2, R3], is_pid(P)],
+        Own ! stop,
+        {psumm(R1), is_pid(R2), is_pid(R3), Leaders =:= [{group_leader, Shared}, {group_leader, Own}]}
+    end),
+    RootOpt = spawn_opt(ns_core_t, waiter, [], [{group_leader, Unshared}]),
+    RootOpt ! stop,
+    Unshared ! stop, Shared ! stop,
+    case {Res, is_pid(RootOpt)} of
+        {{badarg, true, true, true}, true} -> ok;
+        Other -> {bad, Other}
+    end.
+
 ns_rootonly_natives_refused() ->
     Ns = mk(<<"acme">>),
     Table = in_ns(Ns, fun() ->
@@ -333,7 +485,6 @@ ns_rootonly_natives_refused() ->
              catch erlang:trace_info(self(), flags),
              catch erlang:system_monitor(self(), [busy_port]),
              catch erlang:system_profile(self(), [runnable_procs]),
-             try_call(erlang, ports, []),
              catch erlang:seq_trace(send, true),
              catch erlang:monitor_node(node(), true),
              catch erts_debug:get_internal_state(available_internal_state),
@@ -529,4 +680,29 @@ fn ns_halt_destroys_ns_not_node() {
 #[test]
 fn ns_group_leader_foreign_refused() {
     run("ns_group_leader_foreign_refused");
+}
+
+#[test]
+fn ns_port_tcp_listen_accept_in_ns() {
+    run("ns_port_tcp_listen_accept_in_ns");
+}
+
+#[test]
+fn ns_port_cross_ns_refused() {
+    run("ns_port_cross_ns_refused");
+}
+
+#[test]
+fn ns_ports_filtered() {
+    run("ns_ports_filtered");
+}
+
+#[test]
+fn ns_port_spawn_driver_refused() {
+    run("ns_port_spawn_driver_refused");
+}
+
+#[test]
+fn ns_spawn_opt_group_leader_foreign() {
+    run("ns_spawn_opt_group_leader_foreign");
 }
