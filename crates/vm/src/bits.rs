@@ -145,6 +145,12 @@ fn number(p: &Process, arg: Arg) -> Result<Option<usize>, VmError> {
     Ok(value.as_small().and_then(|n| usize::try_from(n).ok()))
 }
 
+/// True when a segment size operand is the atom `all` (rest of the binary).
+#[inline]
+fn is_all(p: &Process, arg: Arg) -> bool {
+    arg.kind() != Arg::U && p.read(arg).ok().and_then(atom) == Some("all")
+}
+
 #[inline]
 fn flags(p: &Process, arg: Arg) -> SegFlags {
     if arg.kind() != Arg::U {
@@ -750,6 +756,26 @@ pub(super) fn execute(
                 return branch(p, a, frame);
             };
             if p.read(b)?.skip(bits) {
+                p.ip += 1;
+                Ok(())
+            } else {
+                branch(p, a, frame)
+            }
+        }
+        Opcode::BsGetBinary2 if is_all(p, module.arg(op, 3)) => {
+            let unit = module.arg(op, 4).value() as usize;
+            let live = c.value() as usize;
+            let result = allocated(
+                p,
+                live,
+                |p| {
+                    let ctx = p.read(b).map_err(|_| BitsError::BadArg { segment: 0 })?;
+                    ctx.get_tail_unit(unit, &mut p.heap)
+                },
+                frame,
+            )?;
+            if let Some(value) = result {
+                p.write(module.arg(op, 6), value)?;
                 p.ip += 1;
                 Ok(())
             } else {
