@@ -4,16 +4,20 @@ use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
 use arinsal_vm::Vm;
+use socket2::SockRef;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::Duration;
 
 fn multicast_probe() -> Result<(), String> {
     let group = Ipv4Addr::new(224, 0, 0, 1);
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| format!("could not bind probe socket: {error}"))?;
     socket
-        .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
+        .join_multicast_v4(&group, &Ipv4Addr::LOCALHOST)
         .map_err(|error| format!("could not join 224.0.0.1: {error}"))?;
+    SockRef::from(&socket)
+        .set_multicast_if_v4(&Ipv4Addr::LOCALHOST)
+        .map_err(|error| format!("could not select loopback multicast interface: {error}"))?;
     socket
         .set_read_timeout(Some(Duration::from_millis(800)))
         .map_err(|error| format!("could not set probe timeout: {error}"))?;
@@ -423,6 +427,6 @@ fn gen_udp_matches_erts() {
         let actual = vm
             .eval_scheduled("inet_udp_diff", "run", &[arg], 2, None)
             .unwrap_or_else(|error| panic!("{case}: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "{case}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{case}");
     }
 }

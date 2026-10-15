@@ -600,7 +600,7 @@ pub(crate) type SelectCallback = Arc<dyn Fn(RawFd, Ready) + Send + Sync>;
 /// one-shot poll set does.
 struct DriverSelect {
     fd: RawFd,
-    owner: u64,
+    owner: usize,
     events: InterestSet,
     active: InterestSet,
     ready: SelectCallback,
@@ -692,7 +692,7 @@ impl DriverSelects {
 /// woken.
 pub(crate) fn driver_select(
     fd: RawFd,
-    owner: u64,
+    owner: usize,
     events: InterestSet,
     ready: SelectCallback,
 ) -> io::Result<()> {
@@ -755,7 +755,7 @@ pub(crate) fn driver_select(
 /// Port of erts/emulator/sys/common/erl_check_io.c:546-640
 /// (`erts_io_notify_port_task_executed`), OTP-29.1.1: an event that is still
 /// selected but no longer active goes back into the poll set.
-pub(crate) fn notify_executed(fd: RawFd, owner: u64, executed: InterestSet) {
+pub(crate) fn notify_executed(fd: RawFd, owner: usize, executed: InterestSet) {
     let poller = poller();
     let mut selects = poller.selects.lock().unwrap();
     let Some(token) = selects.by_fd.get(&fd).copied() else {
@@ -780,7 +780,7 @@ pub(crate) fn notify_executed(fd: RawFd, owner: u64, executed: InterestSet) {
 
 /// Drop every selection `owner` holds on `fd` (`driver_select(..., ERL_DRV_USE, 0)`)
 /// before the descriptor is closed or replaced.
-pub(crate) fn driver_deselect(fd: RawFd, owner: u64) {
+pub(crate) fn driver_deselect(fd: RawFd, owner: usize) {
     let poller = poller();
     let mut selects = poller.selects.lock().unwrap();
     let Some(token) = selects.by_fd.get(&fd).copied() else {
@@ -1055,8 +1055,8 @@ pub(crate) mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let fd = reader.as_raw_fd();
-        let (tx, rx) = mpsc::channel::<u64>();
-        let callback = |owner: u64| -> SelectCallback {
+        let (tx, rx) = mpsc::channel::<usize>();
+        let callback = |owner: usize| -> SelectCallback {
             let tx = Mutex::new(tx.clone());
             Arc::new(move |_, _| {
                 let _ = tx.lock().unwrap().send(owner);

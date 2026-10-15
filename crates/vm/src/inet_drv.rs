@@ -17,9 +17,9 @@ use arinsal_packet::{
 };
 use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 // Port of inet_drv.c ERTS_INET_DRV_CONTROL_MAGIC_NUMBER, OTP-29.1.1.
@@ -196,11 +196,6 @@ fn unpin_scheduler(sched: &Arc<arinsal_sched::Scheduler<Process>>) {
         .expect("inet unpin");
 }
 
-fn registry() -> &'static Mutex<HashMap<u64, Arc<Sock>>> {
-    static REG: OnceLock<Mutex<HashMap<u64, Arc<Sock>>>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// Port tasks waiting for the inet thread, which runs them for every `tcp_inet`
 /// port: readiness from the poll set (`ready_input`/`ready_output`) and pokes
 /// from control and command calls on a port.
@@ -210,8 +205,9 @@ fn registry() -> &'static Mutex<HashMap<u64, Arc<Sock>>> {
 /// OTP-29.1.1.
 #[derive(Default)]
 struct Tasks {
-    ready: Vec<(u64, RawFd, crate::check_io::Ready)>,
-    poked: Vec<u64>,
+    ready: Vec<(Arc<Sock>, RawFd, crate::check_io::Ready)>,
+    poked: Vec<Arc<Sock>>,
+    sockets: Vec<Weak<Sock>>,
 }
 
 fn tasks() -> &'static (Mutex<Tasks>, Condvar) {
@@ -226,19 +222,33 @@ fn tasks() -> &'static (Mutex<Tasks>, Condvar) {
 }
 
 /// Ask the inet thread to run port `id` (and recompute its selection).
-fn poke(id: u64) {
+fn register_sock(sock: &Arc<Sock>) {
+    let (lock, _) = tasks();
+    let mut tasks = lock.lock().unwrap();
+    tasks.sockets.retain(|entry| entry.strong_count() > 0);
+    tasks.sockets.push(Arc::downgrade(sock));
+}
+
+fn live_socks() -> Vec<Arc<Sock>> {
+    let (lock, _) = tasks();
+    let mut tasks = lock.lock().unwrap();
+    tasks.sockets.retain(|entry| entry.strong_count() > 0);
+    tasks.sockets.iter().filter_map(Weak::upgrade).collect()
+}
+
+fn poke(sock: &Arc<Sock>) {
     let (lock, wake) = tasks();
     let mut tasks = lock.lock().unwrap();
-    if !tasks.poked.contains(&id) {
-        tasks.poked.push(id);
+    if !tasks.poked.iter().any(|poked| Arc::ptr_eq(poked, sock)) {
+        tasks.poked.push(Arc::clone(sock));
     }
     wake.notify_one();
 }
 
 /// `iready`/`oready`: schedule the port's I/O task on the inet thread.
-fn schedule_ready(id: u64, fd: RawFd, ready: crate::check_io::Ready) {
+fn schedule_ready(sock: Arc<Sock>, fd: RawFd, ready: crate::check_io::Ready) {
     let (lock, wake) = tasks();
-    lock.lock().unwrap().ready.push((id, fd, ready));
+    lock.lock().unwrap().ready.push((sock, fd, ready));
     wake.notify_one();
 }
 
@@ -279,28 +289,25 @@ pub(crate) fn set_nosigpipe(fd: RawFd) {
 pub(crate) fn attach(runtime: Arc<Runtime>, id: u64, handle: Arc<PortHandle>) {
     let _ = tasks();
     pin_scheduler(handle.scheduler());
-    let sock = Arc::new(Sock::new(id, runtime, handle));
-    registry().lock().unwrap().insert(id, sock);
-    poke(id);
-}
-
-/// True when `id` is a live TCP inet socket owned by this driver.
-pub(crate) fn owns(id: u64) -> bool {
-    registry().lock().unwrap().contains_key(&id)
+    let sock = Arc::new(Sock::new(id, &runtime, &handle));
+    handle.set_tcp_driver_data(Arc::clone(&sock));
+    register_sock(&sock);
+    poke(&sock);
 }
 
 /// Drop the socket behind a port. Waiters receive `{error, closed}`.
-pub(crate) fn detach(id: u64) {
-    let Some(sock) = registry().lock().unwrap().remove(&id) else {
+pub(crate) fn detach(handle: &Arc<PortHandle>) {
+    let Some(sock) = handle.take_tcp_driver_data() else {
         return;
     };
+    let id = sock.id;
     // The port closed while owning a dist connection (its controller exited, e.g. through
     // `net_kernel:disconnect/1`): tear the connection down and deliver nodedown.
     // Port of erts/emulator/beam/dist.c (erts_do_net_exits via the dist port's exit), OTP-29.1.1.
     if crate::node_tables::is_dist_port(id) {
-        let _ = crate::dist::port_connection_closed(&sock.runtime, id);
+        let _ = crate::dist::port_connection_closed(&sock.runtime(), id);
     }
-    unpin_scheduler(&sock.handle.scheduler());
+    unpin_scheduler(&sock.handle().scheduler());
     let pending = {
         let mut inner = sock.inner.lock().unwrap();
         // Port of erts/emulator/drivers/common/inet_drv.c:12718-12725 (tcp_inet_flush)
@@ -328,30 +335,24 @@ pub(crate) fn detach(id: u64) {
             },
         );
     }
-    poke(id);
+    poke(&sock);
 }
 
 pub(crate) fn control(
     process: &mut Process,
-    id: u64,
+    sock: &Arc<Sock>,
     caller: Pid,
     op: i64,
     data: &[u8],
 ) -> Result<Term, VmError> {
-    let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
-        return byte_list(process, &err_bytes("exbadport"));
-    };
     // Port of inet_drv.c:11956 (tcp_inet_ctl subtracts the magic), OTP-29.1.1.
     let cmd = op.wrapping_sub(MAGIC);
-    let reply = dispatch(&sock, caller, cmd, data);
-    poke(id);
+    let reply = dispatch(sock, caller, cmd, data);
+    poke(sock);
     byte_list(process, &reply)
 }
 
-pub(crate) fn command(id: u64, caller: Pid, data: Vec<u8>) -> Result<(), VmError> {
-    let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
-        return Err(badarg());
-    };
+pub(crate) fn command(sock: &Arc<Sock>, caller: Pid, data: Vec<u8>) -> Result<(), VmError> {
     // Port of inet_drv.c:13736 (tcp_sendv) and :12629 (tcp_inet_command), OTP-29.1.1.
     let (ids, payload) = split_caller(&data).ok_or_else(badarg)?;
     let start = data.len() - payload.len();
@@ -360,11 +361,11 @@ pub(crate) fn command(id: u64, caller: Pid, data: Vec<u8>) -> Result<(), VmError
         accept_send(&mut inner, caller, ids, SendData::Owned(data, start))
     };
     match outcome {
-        SendOutcome::Reply(error) => emit(&sock, Out::InetReply { caller, ids, error }),
+        SendOutcome::Reply(error) => emit(sock, Out::InetReply { caller, ids, error }),
         SendOutcome::Deferred => {}
         SendOutcome::Failed { error, active } => {
             emit(
-                &sock,
+                sock,
                 Out::InetReply {
                     caller,
                     ids,
@@ -372,26 +373,26 @@ pub(crate) fn command(id: u64, caller: Pid, data: Vec<u8>) -> Result<(), VmError
                 },
             );
             if active {
-                let owner = sock.handle.owner_pid();
+                let owner = sock.handle().owner_pid();
                 if error == "econnreset" {
                     emit(
-                        &sock,
+                        sock,
                         Out::TcpError {
                             owner,
                             reason: "econnreset",
                         },
                     );
                 }
-                emit(&sock, Out::TcpClosed { owner });
+                emit(sock, Out::TcpClosed { owner });
                 if sock.inner.lock().unwrap().exit_on_close {
-                    crate::port::abandon_port(&sock.runtime, sock.id);
+                    crate::port::abandon_port(&sock.runtime(), sock.id);
                 }
             }
-            send_empty_out_q_msgs(&sock);
+            send_empty_out_q_msgs(sock);
         }
     }
-    emit_ready(&sock);
-    poke(id);
+    emit_ready(sock);
+    poke(sock);
     Ok(())
 }
 
@@ -399,10 +400,7 @@ pub(crate) fn command(id: u64, caller: Pid, data: Vec<u8>) -> Result<(), VmError
 ///
 /// Port of dist.c:3794 (`dist_port_command`) calling `tcp_inet_command` with
 /// `prt->caller = NIL`, so `init_caller` skips the ref header, OTP-29.1.1.
-pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<bool, VmError> {
-    let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
-        return Err(badarg());
-    };
+pub(crate) fn dist_output(sock: &Arc<Sock>, data: &[u8]) -> Result<bool, VmError> {
     let outcome = {
         let mut inner = sock.inner.lock().unwrap();
         // Dummy caller/ids: dist never waits on inet_reply for these writes.
@@ -417,26 +415,26 @@ pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<bool, VmError> {
         SendOutcome::Reply(_) | SendOutcome::Deferred => {}
         SendOutcome::Failed { error, active } => {
             if active {
-                let owner = sock.handle.owner_pid();
+                let owner = sock.handle().owner_pid();
                 if error == "econnreset" {
                     emit(
-                        &sock,
+                        sock,
                         Out::TcpError {
                             owner,
                             reason: "econnreset",
                         },
                     );
                 }
-                emit(&sock, Out::TcpClosed { owner });
+                emit(sock, Out::TcpClosed { owner });
                 if sock.inner.lock().unwrap().exit_on_close {
-                    crate::port::abandon_port(&sock.runtime, sock.id);
+                    crate::port::abandon_port(&sock.runtime(), sock.id);
                 }
             }
-            send_empty_out_q_msgs(&sock);
+            send_empty_out_q_msgs(sock);
         }
     }
-    emit_ready(&sock);
-    poke(id);
+    emit_ready(sock);
+    poke(sock);
     Ok(sock.inner.lock().unwrap().busy)
 }
 
@@ -675,7 +673,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
         emit(
             sock,
             Out::TcpPassive {
-                owner: sock.handle.owner_pid(),
+                owner: sock.handle().owner_pid(),
             },
         );
     }
@@ -735,7 +733,10 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     set_nonblock(fd);
     set_nosigpipe(fd);
     // SAFETY: fd was just created and is moved into OwnedFd.
-    inner.fd = Some(SockFd::new(unsafe { OwnedFd::from_raw_fd(fd) }, inner.port));
+    inner.fd = Some(SockFd::new(
+        unsafe { OwnedFd::from_raw_fd(fd) },
+        inner.selection_owner,
+    ));
     inner.domain = domain;
     inner.family_code = data[0];
     inner.phase = Phase::Open;
@@ -849,7 +850,7 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
             });
             inner.pending.push((caller, aref));
             // Wake the inet thread so it selects FD_CONNECT for this fd.
-            poke(sock.id);
+            poke(sock);
         }
         return ok_bytes(&aref.to_be_bytes());
     }
@@ -935,8 +936,8 @@ fn try_accept(inner: &Inner) -> Option<Result<OwnedFd, i32>> {
 }
 
 fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
-    let runtime = Arc::clone(&listen.runtime);
-    let name = listen.handle.port_name();
+    let runtime = listen.runtime();
+    let name = listen.handle().port_name();
     // Port of erts/emulator/drivers/common/inet_drv.c:11829-11839 (tcp_inet_copy), OTP-29.1.1.
     let (id, handle) = match crate::port::alloc_inet_port(&runtime, caller, name) {
         Ok(port) => port,
@@ -963,13 +964,14 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
             return;
         }
     };
+    let selection_owner = Arc::as_ptr(&handle) as usize;
     // Port of inet_drv.c:11795 (tcp_inet_copy), OTP-29.1.1.
     // `active` is not copied here; prim_inet:accept_opts sets it afterwards.
     let born = {
         let inner = listen.inner.lock().unwrap();
         Inner {
-            fd: Some(SockFd::new(fd, id)),
-            port: id,
+            fd: Some(SockFd::new(fd, selection_owner)),
+            selection_owner,
             domain: inner.domain,
             family_code: inner.family_code,
             phase: Phase::Connected,
@@ -995,12 +997,14 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
     pin_scheduler(handle.scheduler());
     let sock = Arc::new(Sock {
         id,
-        runtime,
-        handle,
+        selection_owner,
+        runtime: Arc::downgrade(&runtime),
+        handle: Arc::downgrade(&handle),
         inner: Mutex::new(born),
         io: Mutex::new(()),
     });
-    registry().lock().unwrap().insert(id, sock);
+    handle.set_tcp_driver_data(Arc::clone(&sock));
+    register_sock(&sock);
     // Port of inet_drv.c:2514 (send_async_ok_port), OTP-29.1.1.
     emit(
         listen,
@@ -1010,7 +1014,7 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
             port: id,
         },
     );
-    poke(id);
+    poke(&sock);
 }
 
 fn sockname(inner: &Inner) -> Vec<u8> {
@@ -2445,7 +2449,7 @@ fn tcp_sendfile_aborted(socket_error: i32) -> &'static str {
 
 /// Deliver the end of a sendfile to the port owner (`desc->inet.dport`).
 fn finish_sendfile(sock: &Arc<Sock>, end: SendfileEnd) {
-    let owner = sock.handle.owner_pid();
+    let owner = sock.handle().owner_pid();
     match end {
         SendfileEnd::Completed { bytes_sent } => {
             // Port of inet_drv.c:14006-14021, OTP-29.1.1: the busy sender's reply first.
@@ -2486,7 +2490,7 @@ fn finish_sendfile(sock: &Arc<Sock>, end: SendfileEnd) {
                 }
                 emit(sock, Out::TcpClosed { owner });
                 if sock.inner.lock().unwrap().exit_on_close {
-                    crate::port::abandon_port(&sock.runtime, sock.id);
+                    crate::port::abandon_port(&sock.runtime(), sock.id);
                 }
             }
             send_empty_out_q_msgs(sock);
@@ -2498,10 +2502,11 @@ fn close_atom(inner: &Inner) -> &'static str {
     if inner.reset { "econnreset" } else { "closed" }
 }
 
-struct Sock {
+pub(crate) struct Sock {
     id: u64,
-    runtime: Arc<Runtime>,
-    handle: Arc<PortHandle>,
+    selection_owner: usize,
+    runtime: Weak<Runtime>,
+    handle: Weak<PortHandle>,
     inner: Mutex<Inner>,
     /// Serializes taking packets from the receive buffer with emitting them, which happens
     /// after `inner` is released.
@@ -2513,17 +2518,27 @@ struct Sock {
 }
 
 impl Sock {
-    fn new(id: u64, runtime: Arc<Runtime>, handle: Arc<PortHandle>) -> Self {
+    fn new(id: u64, runtime: &Arc<Runtime>, handle: &Arc<PortHandle>) -> Self {
+        let selection_owner = Arc::as_ptr(handle) as usize;
         Self {
             id,
-            runtime,
-            handle,
+            selection_owner,
+            runtime: Arc::downgrade(runtime),
+            handle: Arc::downgrade(handle),
             inner: Mutex::new(Inner {
-                port: id,
+                selection_owner,
                 ..Inner::default()
             }),
             io: Mutex::new(()),
         }
+    }
+
+    fn runtime(&self) -> Arc<Runtime> {
+        self.runtime.upgrade().expect("live inet port runtime")
+    }
+
+    fn handle(&self) -> Arc<PortHandle> {
+        self.handle.upgrade().expect("live inet port handle")
     }
 }
 
@@ -2534,16 +2549,16 @@ impl Sock {
 /// (erts/emulator/drivers/common/inet_drv.c:11473), OTP-29.1.1.
 struct SockFd {
     fd: OwnedFd,
-    port: u64,
+    owner: usize,
     /// Events selected in the shared poll set (`state->events` in erl_check_io.c).
     selected: crate::check_io::InterestSet,
 }
 
 impl SockFd {
-    fn new(fd: OwnedFd, port: u64) -> Self {
+    fn new(fd: OwnedFd, owner: usize) -> Self {
         Self {
             fd,
-            port,
+            owner,
             selected: crate::check_io::InterestSet {
                 readable: false,
                 writable: false,
@@ -2561,7 +2576,7 @@ impl AsRawFd for SockFd {
 impl Drop for SockFd {
     fn drop(&mut self) {
         if self.selected.readable || self.selected.writable {
-            crate::check_io::driver_deselect(self.fd.as_raw_fd(), self.port);
+            crate::check_io::driver_deselect(self.fd.as_raw_fd(), self.owner);
         }
     }
 }
@@ -2605,8 +2620,7 @@ struct SendWait {
 
 struct Inner {
     fd: Option<SockFd>,
-    /// Port id: the owner of this socket's poll-set selection.
-    port: u64,
+    selection_owner: usize,
     domain: i32,
     family_code: u8,
     phase: Phase,
@@ -2685,7 +2699,7 @@ impl Default for Inner {
     fn default() -> Self {
         Self {
             fd: None,
-            port: 0,
+            selection_owner: 0,
             domain: libc::AF_INET,
             family_code: AF_INET_CODE,
             phase: Phase::Closed,
@@ -3283,16 +3297,16 @@ fn emit(sock: &Sock, out: Out) {
     if let Out::PortData { bytes, .. } = &out
         && crate::node_tables::is_dist_port(sock.id)
     {
-        let _ = crate::dist::ingest_port_data(&sock.runtime, sock.id, bytes);
+        let _ = crate::dist::ingest_port_data(&sock.runtime(), sock.id, bytes);
         return;
     }
     if let Out::TcpClosed { .. } = &out
         && crate::node_tables::is_dist_port(sock.id)
     {
-        let _ = crate::dist::port_connection_closed(&sock.runtime, sock.id);
+        let _ = crate::dist::port_connection_closed(&sock.runtime(), sock.id);
         // Still deliver tcp_closed to the connection ticker so it shuts down.
     }
-    let sched = sock.handle.scheduler();
+    let sched = sock.handle().scheduler();
     let port = Term::port(sock.id).unwrap();
     // Port of inet_drv.c:3987-4005 (tcp_message uses LOAD_STRING sized to the
     // complete packet), OTP-29.1.1. List-mode packets need two heap words per byte.
@@ -3662,7 +3676,7 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     deliver_pending_close(sock);
     emit_ready(sock);
     let busy = sock.inner.lock().unwrap().busy;
-    crate::dist::distribution_port_state_changed(&sock.runtime, sock.id, busy);
+    crate::dist::distribution_port_state_changed(&sock.runtime(), sock.id, busy);
 }
 
 /// Write queued output once the poll set reports the connected socket writable.
@@ -3718,7 +3732,7 @@ fn tcp_inet_output(sock: &Arc<Sock>) {
         );
     }
     if active {
-        let owner = sock.handle.owner_pid();
+        let owner = sock.handle().owner_pid();
         if error == "econnreset" {
             emit(
                 sock,
@@ -3730,7 +3744,7 @@ fn tcp_inet_output(sock: &Arc<Sock>) {
         }
         emit(sock, Out::TcpClosed { owner });
         if sock.inner.lock().unwrap().exit_on_close {
-            crate::port::abandon_port(&sock.runtime, sock.id);
+            crate::port::abandon_port(&sock.runtime(), sock.id);
         }
     }
     send_empty_out_q_msgs(sock);
@@ -3744,11 +3758,11 @@ fn deliver_pending_close(sock: &Arc<Sock>) {
             return;
         }
         inner.closed_sent = true;
-        (sock.handle.owner_pid(), inner.exit_on_close)
+        (sock.handle().owner_pid(), inner.exit_on_close)
     };
     emit(sock, Out::TcpClosed { owner });
     if exit_on_close {
-        crate::port::abandon_port(&sock.runtime, sock.id);
+        crate::port::abandon_port(&sock.runtime(), sock.id);
     }
 }
 
@@ -3757,14 +3771,14 @@ fn satisfy(sock: &Arc<Sock>) {
     let (outs, abandon) = {
         let mut inner = sock.inner.lock().unwrap();
         let mut outs = Vec::new();
-        let abandon = take_packets(&sock.handle, &mut inner, &mut outs);
+        let abandon = take_packets(&sock.handle(), &mut inner, &mut outs);
         (outs, abandon)
     };
     for out in outs {
         emit(sock, out);
     }
     if abandon {
-        crate::port::abandon_port(&sock.runtime, sock.id);
+        crate::port::abandon_port(&sock.runtime(), sock.id);
     }
 }
 
@@ -4177,7 +4191,7 @@ fn on_eof(sock: &Arc<Sock>) {
         inner.peer_closed = true;
         inner.rbuf.clear();
         let active = active_is(&inner.active);
-        let owner = sock.handle.owner_pid();
+        let owner = sock.handle().owner_pid();
         let reason = close_atom(&inner);
         // Port of erts/emulator/drivers/common/inet_drv.c:12805-12810 (tcp_recv_closed
         // aborts with ENOTCONN) and :12863-12867 (tcp_recv_error aborts with its err),
@@ -4230,7 +4244,7 @@ fn on_eof(sock: &Arc<Sock>) {
         }
         emit(sock, Out::TcpClosed { owner });
         if exit_on_close {
-            crate::port::abandon_port(&sock.runtime, sock.id);
+            crate::port::abandon_port(&sock.runtime(), sock.id);
         }
     }
 }
@@ -4307,27 +4321,33 @@ fn io_loop() {
                 std::mem::take(&mut tasks.poked),
             )
         };
-        for (id, fd, event) in ready {
-            let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
+        for (sock, fd, event) in ready {
+            let Some(_runtime) = sock.runtime.upgrade() else {
+                continue;
+            };
+            let Some(_handle) = sock.handle.upgrade() else {
                 continue;
             };
             try_io(&sock, event.writable || event.error || event.closed);
             sock_select(&sock);
             crate::check_io::notify_executed(
                 fd,
-                id,
+                sock.selection_owner,
                 crate::check_io::InterestSet {
                     readable: true,
                     writable: true,
                 },
             );
         }
-        for id in poked {
-            let sock = registry().lock().unwrap().get(&id).cloned();
-            if let Some(sock) = sock {
-                try_io(&sock, false);
-                sock_select(&sock);
-            }
+        for sock in poked {
+            let Some(_runtime) = sock.runtime.upgrade() else {
+                continue;
+            };
+            let Some(_handle) = sock.handle.upgrade() else {
+                continue;
+            };
+            try_io(&sock, false);
+            sock_select(&sock);
         }
         for sock in fire_timeouts() {
             sock_select(&sock);
@@ -4354,7 +4374,6 @@ fn sock_select(sock: &Arc<Sock>) {
     let writable = inner.phase == Phase::Connecting
         || !inner.sendq.is_empty()
         || (inner.phase == Phase::Connected && inner.sendfile.is_some());
-    let id = sock.id;
     let Some(fd) = inner.fd.as_mut() else {
         return;
     };
@@ -4363,15 +4382,19 @@ fn sock_select(sock: &Arc<Sock>) {
         return;
     }
     let raw = fd.as_raw_fd();
-    let ready: crate::check_io::SelectCallback =
-        Arc::new(move |fd, event| schedule_ready(id, fd, event));
-    if crate::check_io::driver_select(raw, id, want, ready).is_ok() {
+    let weak = Arc::downgrade(sock);
+    let ready: crate::check_io::SelectCallback = Arc::new(move |fd, event| {
+        if let Some(sock) = weak.upgrade() {
+            schedule_ready(sock, fd, event);
+        }
+    });
+    if crate::check_io::driver_select(raw, sock.selection_owner, want, ready).is_ok() {
         fd.selected = want;
     }
 }
 
 fn next_timeout() -> Option<libc::timespec> {
-    let socks: Vec<Arc<Sock>> = registry().lock().unwrap().values().cloned().collect();
+    let socks = live_socks();
     let mut soon: Option<Instant> = None;
     for sock in socks {
         let inner = sock.inner.lock().unwrap();
@@ -4401,10 +4424,16 @@ fn next_timeout() -> Option<libc::timespec> {
 
 /// Expire receive, accept, connect and send timers; returns the ports it changed.
 fn fire_timeouts() -> Vec<Arc<Sock>> {
-    let socks: Vec<Arc<Sock>> = registry().lock().unwrap().values().cloned().collect();
+    let socks = live_socks();
     let now = Instant::now();
     let mut fired = Vec::new();
     for sock in socks {
+        let Some(_runtime) = sock.runtime.upgrade() else {
+            continue;
+        };
+        let Some(_handle) = sock.handle.upgrade() else {
+            continue;
+        };
         let (due, sends, close) = {
             let mut inner = sock.inner.lock().unwrap();
             let mut due = Vec::new();
@@ -4451,7 +4480,7 @@ fn fire_timeouts() -> Vec<Arc<Sock>> {
             let close = if !sends.is_empty() && inner.send_timeout_close {
                 inner.fd.take();
                 inner.peer_closed = true;
-                let owner = sock.handle.owner_pid();
+                let owner = sock.handle().owner_pid();
                 let active = active_is(&inner.active) && !inner.closed_sent;
                 if active {
                     inner.closed_sent = true;
@@ -4488,7 +4517,7 @@ fn fire_timeouts() -> Vec<Arc<Sock>> {
         {
             emit(&sock, Out::TcpClosed { owner });
             if exit_on_close {
-                crate::port::abandon_port(&sock.runtime, sock.id);
+                crate::port::abandon_port(&sock.runtime(), sock.id);
             }
         }
         if changed {
