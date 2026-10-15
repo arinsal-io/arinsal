@@ -2,14 +2,15 @@
 
 ## State
 
-Done (chunks 1 and 2): app/supervisor, `arinsal_cloud_backend` behaviour, the fake backend, the
-project registry (deploy, start, stop, delete, list, get, logs), the per-project log collector,
-the admin HTTP API, port allocation, the Mix tasks and the e2e script. Everything is tested on
-Arinsal (the e2e builds with stock OTP, see gaps).
+Done (chunks 1 to 3): app/supervisor, `arinsal_cloud_backend` behaviour with selection, the fake
+backend, the namespace backend (against the merged natives; `arinsal_ns_boot` is still the
+placeholder), the boot plan, the project registry (deploy, start, stop, delete, list, get, logs),
+the per-project log collector, the admin HTTP API, port allocation, the Mix tasks, the
+`arinsal-cloud` launcher and the e2e script.
 
-Not yet: idle stop, `arinsal_cloud_boot:boot_plan/1`, the `arinsal_ns` backend and
-`arinsal_ns_boot:start/3` stub, the same-node fake mode, `arinsal cloud` wiring. A draft of the
-boot plan and ns backend exists in the author's scratchpad (`arinsal_cloud_full`, stock ERTS only).
+Not yet: idle stop, the same-node fake mode, a real `arinsal_ns_boot:start/3` (other stream).
+When it lands, replace `src/arinsal_ns_boot.erl` and drop `implemented/0` (or return `true`):
+`backend => auto` then selects the namespace backend by itself.
 
 ## Layout
 
@@ -49,16 +50,55 @@ boot plan and ns backend exists in the author's scratchpad (`arinsal_cloud_full`
 ```sh
 export PATH=/Users/sts/dev/sq/arinsal-prs/mt-shim:/opt/homebrew/opt/elixir/bin:$PATH
 export ERL_ROOTDIR=/opt/homebrew/opt/erlang@29/lib/erlang    # needed, see gaps
-cd packages/arinsal_cloud && mix compile
-erl -noshell -pa _build/dev/lib/arinsal_cloud/ebin -pa "$(elixir -e 'IO.puts(:code.lib_dir(:elixir))')/ebin" \
-  -s arinsal_cloud -arinsal_cloud admin_port 7000 -arinsal_cloud data_dir '"/tmp/cloud-data"'
-curl -X PUT --data-binary @release.tar.gz 127.0.0.1:7000/projects/acme/shop
-curl 127.0.0.1:7000/projects
+packages/arinsal_cloud/bin/arinsal-cloud --admin 127.0.0.1:7000 --data-dir /tmp/cloud-data
+cd poc/multitenancy/bench/rest && mix arinsal.deploy --tenant acme --project shop   # stock OTP, see gaps
+mix arinsal.list
 ```
 
 App env (also settable with `-arinsal_cloud Key Value`): `admin_port` (7000; 0 = any),
 `data_dir`, `ready_timeout_ms` (30000; 0 skips waiting for the project's port), `project_env`,
 `erl` (path of the executable the fake backend runs), `backend` (`auto` or a module).
+
+## Boot plan, namespace backend, backend selection
+
+- `arinsal_cloud_boot:boot_plan(ReleaseDir)` returns `{ok, #{release, modules, apps, env, ebins}}`
+  from `releases/<vsn>/start.boot` (falls back to `start.script`). `modules` are the
+  `{Module, BeamPath}` pairs the script would `primLoad`, resolved the way the script resolves
+  them: `$ROOT` entries (kernel, stdlib, compiler, sasl, crypto, ...) come from the host runtime's
+  OTP root, `$RELEASE_LIB` entries from the release, the consolidated-protocol directory first.
+  Base apps are included (the runtime dedups). `apps` is the `start_boot` order with name, vsn and
+  type; `env` is `releases/<vsn>/sys.config`; `ebins` the ordered existing code path. Out of scope:
+  `runtime.exs` and other config providers, `vm.args`. Module atoms are created from tenant-supplied
+  beam names (atom table DoS, a known PoC gap).
+- `arinsal_cloud_ns` (backend): `boot_plan`, `arinsal_ns:create/3` (opts from app env `ns_limits`),
+  `arinsal_ns:expose(Log)`, then `arinsal_ns_boot:start(Ns, Plan, #{group_leader => Log, os_env => Env})`.
+  A watcher process monitors the returned pid and reports `{project_exit, ...}`. `stop` calls
+  `arinsal_ns:destroy/1`. `expose/1`, `destroy/1` and `info/1` were not merged yet when this
+  was written; each is called under `try ... catch error:undef`, so the backend works before they
+  land (destroy falls back to killing the boot process; the log collector is unreachable from the
+  namespace until `expose` exists, so namespace output is not captured yet). If the boot module raises,
+  the namespace is destroyed again and the error is `{boot_failed, {Class, Reason}}`.
+  `PORT`/`RT_PORT` reach the boot as `os_env`; the OS environment is node-wide, so the real boot
+  must serve it per namespace.
+- `arinsal_ns_boot` is a stub: `start/3` raises `not_implemented`, `implemented/0` returns `false`.
+- Selection (`arinsal_cloud_backend:select/0`, app env `backend`): `fake`, `ns`, `auto` (default)
+  or a module. `auto` picks the namespace backend only when the natives exist and the boot module is
+  not the stub (`arinsal_cloud_ns:usable/0`); today that means fake. `ns` with a stub boot fails
+  each deploy with `boot_failed ... not_implemented` and leaves the project `failed` (checked on a
+  build with the natives: `arinsal-cloud --backend ns`).
+- Natives probe: `erlang:function_exported(arinsal_ns, create, 3)` is `false` on Arinsal even
+  though the calls work (the module `arinsal_ns` has no code, `code:ensure_loaded` returns
+  `{error, nofile}`), so `arinsal_cloud_ns:natives_available/0` calls `arinsal_ns:'of'(self())` and
+  treats `undef` as "absent".
+
+## Launcher
+
+`packages/arinsal_cloud/bin/arinsal-cloud [--admin [127.0.0.1:]PORT] [--data-dir DIR]
+[--backend fake|ns|auto] [-- ERL_ARGS...]` compiles the package if needed and `exec`s the first
+`erl` on PATH with the manager (`-s arinsal_cloud`); with Arinsal's shim and `ERL_ROOTDIR` first it
+is `arinsal cloud --admin 127.0.0.1:7000`. A `cloud` subcommand in `crates/cli` was not added: it
+would need the package's ebin and Elixir's ebin paths, which the launcher already finds. Extra
+settings go after `--`, e.g. `-- -arinsal_cloud project_env '[{"K","v"}]'`.
 
 ## Mix tasks (`packages/arinsal`)
 
@@ -82,10 +122,15 @@ unchanged.
   checks that no process or file is left. `list/stop/start/logs/delete` run on Arinsal from
   `packages/arinsal`; `deploy` (compiles bench/rest) runs on stock OTP. `KEEP=1` keeps the temp
   dir, `ADMIN_PORT` changes the port.
-- `cd packages/arinsal_cloud && mix test` (Arinsal first on PATH): 22 EUnit tests through an
-  ExUnit wrapper: router, JSON conversion, name validation, the io protocol of the log collector
-  (through `group_leader`), and deploy/list/details/logs/stop/start/delete/redeploy/error paths
-  over a real socket with a stub backend.
+- `cd packages/arinsal_cloud && mix test` (Arinsal first on PATH): 34 EUnit tests through an
+  ExUnit wrapper (32 on a runtime without the natives, where the namespace tests skip): router,
+  JSON conversion, name validation, the io protocol of the log collector (through `group_leader`),
+  deploy/list/details/logs/stop/start/delete/redeploy/error paths over a real socket with a stub
+  backend, boot plan against synthetic releases and against a real `bench/rest` release (the
+  wrapper builds it once with stock OTP into `_build/rest_release`; delete it to rebuild), and
+  the namespace backend and registry with `arinsal_cloud_test_boot` standing in for the boot (needs
+  a build with `arinsal_ns`; `mt-shim-cloud` was built from this branch after merging
+  `poc/multitenancy`).
 
 ## Arinsal gaps found (not fixed here)
 
@@ -114,10 +159,14 @@ unchanged.
    (`:ets.file2tab` -> `binary_to_term` "invalid external representation of a term").
    The file was moved to `~/.hex/cache.ets.written-by-arinsal-corrupt`; stock Hex rebuilt it.
    Do not run `mix deps.get` on Arinsal against the real `~/.hex`.
-4. `xref` cannot start on Arinsal: `xref_base` -> `sofs:specification` -> `erlang:is_builtin/3`
+4. `File.cp/2`, `File.cp_r/2` return `{:error, :badarg}` after copying the file's data (the copy
+   exists), so `File.cp_r!` raises `File.CopyError ... bad argument`. `:file.copy/2`,
+   `:file.change_mode/2` and `:file.read_file_info/1` work alone; the failing call inside Elixir's
+   `File.cp` was not isolated (tracing with `:dbg` hung the node). The test wrapper uses `cp -R`.
+5. `xref` cannot start on Arinsal: `xref_base` -> `sofs:specification` -> `erlang:is_builtin/3`
    raises `badarg` for `'$M_EXPR'`/`'$F_EXPR'`/`-1`. No cross-reference check was possible, so
    undefined calls are only caught by the tests.
-5. Works on Arinsal and worth knowing: `ERL_AFLAGS` is honored by the shim (`-s erlang display x`
+6. Works on Arinsal and worth knowing: `ERL_AFLAGS` is honored by the shim (`-s erlang display x`
    printed `[x]` on the project's stdout), port stdout capture, `kill`-based stop of the child.
 
 ## Known limits

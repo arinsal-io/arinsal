@@ -6,6 +6,7 @@
 # The manager, the projects and the client tasks list/stop/start/logs/delete run on Arinsal.
 # `mix arinsal.deploy` (which compiles bench/rest and its deps and builds the release) runs on
 # stock OTP, because compiling hpax fails on Arinsal (NOTES-cloud.md, "Arinsal gaps").
+# The manager is started with packages/arinsal_cloud/bin/arinsal-cloud.
 #
 #   poc/multitenancy/tests/cloud_fake_e2e.sh
 #
@@ -40,8 +41,6 @@ json_field() { sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p" | head -1; }
 
 step "compile the manager"
 (cd "$ROOT/packages/arinsal_cloud" && mix compile >"$WORK/compile.log" 2>&1) || { cat "$WORK/compile.log"; exit 1; }
-EBIN="$ROOT/packages/arinsal_cloud/_build/dev/lib/arinsal_cloud/ebin"
-ELIXIR_LIB="$(elixir -e 'IO.puts(:code.lib_dir(:elixir))')"
 
 # Stock OTP for compiling and releasing: bench/rest deps do not compile on Arinsal yet.
 STOCK_PATH="${STOCK_PATH:-/opt/homebrew/opt/erlang@29/bin:/opt/homebrew/opt/elixir/bin:/usr/bin:/bin}"
@@ -56,10 +55,8 @@ sed -i.bak "s#\"../../../../packages/arinsal\"#\"$ROOT/packages/arinsal\"#" "$WO
 (cd "$WORK/rest" && stock mix deps.get >"$WORK/deps.log" 2>&1) || { cat "$WORK/deps.log"; exit 1; }
 
 step "start the manager on $ADMIN (fake backend); projects print a marker via ERL_AFLAGS"
-erl -noshell -pa "$EBIN" -pa "$ELIXIR_LIB/ebin" -s arinsal_cloud \
-  -arinsal_cloud admin_port "$ADMIN_PORT" \
-  -arinsal_cloud data_dir "\"$WORK/data\"" \
-  -arinsal_cloud project_env '[{"ERL_AFLAGS","-s erlang display project_says_hello"}]' \
+"$ROOT/packages/arinsal_cloud/bin/arinsal-cloud" --admin "$ADMIN_PORT" --data-dir "$WORK/data" --backend fake \
+  -- -arinsal_cloud project_env '[{"ERL_AFLAGS","-s erlang display project_says_hello"}]' \
   >"$WORK/manager.log" 2>&1 &
 MGR_PID=$!
 for _ in $(seq 1 50); do

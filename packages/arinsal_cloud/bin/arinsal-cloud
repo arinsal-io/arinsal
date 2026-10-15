@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Boots a node with the arinsal_cloud manager (the `arinsal cloud` of the demo).
+#
+#   arinsal-cloud [--admin [127.0.0.1:]PORT] [--data-dir DIR] [--backend fake|ns|auto] [-- ERL_ARGS...]
+#
+# Runs whatever `erl` is first on PATH, so put Arinsal's `erl` shim (and ERL_ROOTDIR) first to run
+# the manager on Arinsal. Compiles the package on first use. Defaults: admin port 7000,
+# data dir ./arinsal-cloud-data, backend auto. Extra arguments after `--` go to `erl`, for example
+# `-- -arinsal_cloud project_env '[{"KEY","value"}]'`. The admin API listens on loopback only.
+set -euo pipefail
+
+PKG="$(cd "$(dirname "$0")/.." && pwd)"
+EBIN="$PKG/_build/dev/lib/arinsal_cloud/ebin"
+port=""; data_dir=""; backend=""
+
+usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --admin)
+      [ $# -ge 2 ] || usage 2
+      addr="$2"; shift 2
+      case "$addr" in
+        *:*) host="${addr%:*}"; port="${addr##*:}"
+             [ "$host" = "127.0.0.1" ] || { echo "arinsal-cloud: the admin API listens on 127.0.0.1 only" >&2; exit 2; } ;;
+        *) port="$addr" ;;
+      esac ;;
+    --data-dir) [ $# -ge 2 ] || usage 2; data_dir="$2"; shift 2 ;;
+    --backend)
+      [ $# -ge 2 ] || usage 2
+      case "$2" in fake|ns|auto) backend="$2" ;; *) echo "arinsal-cloud: backend must be fake, ns or auto" >&2; exit 2 ;; esac
+      shift 2 ;;
+    -h|--help) usage 0 ;;
+    --) shift; break ;;
+    *) echo "arinsal-cloud: unknown argument $1" >&2; usage 2 ;;
+  esac
+done
+
+if [ ! -f "$EBIN/arinsal_cloud.app" ]; then
+  (cd "$PKG" && mix compile >&2)
+fi
+ELIXIR_LIB="$(elixir -e 'IO.puts(:code.lib_dir(:elixir))')"
+
+args=(-noshell -pa "$EBIN" -pa "$ELIXIR_LIB/ebin" -s arinsal_cloud)
+[ -z "$port" ] || args+=(-arinsal_cloud admin_port "$port")
+[ -z "$data_dir" ] || args+=(-arinsal_cloud data_dir "\"$(cd "$(dirname "$data_dir")" 2>/dev/null && pwd || echo .)/$(basename "$data_dir")\"")
+[ -z "$backend" ] || args+=(-arinsal_cloud backend "$backend")
+exec erl "${args[@]}" "$@"
