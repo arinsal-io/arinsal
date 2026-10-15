@@ -10,6 +10,7 @@ pub(crate) mod erl_debugger;
 pub(crate) mod erts_debug;
 pub(crate) use erts_debug::internal_state_enabled;
 pub(crate) mod misc;
+pub(crate) mod ns;
 pub(crate) mod sys;
 
 /// `table` contains `module:function/arity`.
@@ -143,6 +144,7 @@ pub(crate) const FAMILIES: &[NativeFamily] = &[
     code::call,
     erl_debugger::call,
     erts_debug::call,
+    ns::call,
     dist::call,
     misc::call,
     // The ETS family also owns erlang:match_spec_test/3 and erts_internal ETS BIFs.
@@ -226,6 +228,7 @@ pub fn implemented_natives() -> &'static [(&'static str, &'static str, u8)] {
             code::IMPLEMENTED,
             erl_debugger::IMPLEMENTED,
             erts_debug::IMPLEMENTED,
+            ns::IMPLEMENTED,
             dist::IMPLEMENTED,
             ets::IMPLEMENTED,
             nif::IMPLEMENTED,
@@ -260,6 +263,7 @@ pub fn implemented_natives() -> &'static [(&'static str, &'static str, u8)] {
 fn family_dispatches(module: &str, function: &str, arity: u8) -> bool {
     listed(erl_debugger::IMPLEMENTED, module, function, arity)
         || listed(erts_debug::IMPLEMENTED, module, function, arity)
+        || ns::recognizes(module, function, arity)
         || code::recognizes(module, function, arity)
         || dist::recognizes(module, function, arity)
         || listed(misc::IMPLEMENTED, module, function, arity)
@@ -312,6 +316,7 @@ fn handler_agrees(module: &str, function: &str, arity: u8) -> bool {
     }
     if code::recognizes(module, function, arity)
         || listed(erts_debug::IMPLEMENTED, module, function, arity)
+        || ns::recognizes(module, function, arity)
         || dist::recognizes(module, function, arity)
         || ets::recognizes(module, function, arity)
         || proc::recognizes(module, function, arity)
@@ -574,6 +579,9 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     }
     if listed(erts_debug::IMPLEMENTED, module, function, arity) {
         return Some(NativeEntry::DirectFamily(erts_debug::call));
+    }
+    if ns::recognizes(module, function, arity) {
+        return Some(NativeEntry::DirectFamily(ns::call));
     }
     if listed(records::IMPLEMENTED, module, function, arity) {
         return Some(NativeEntry::DirectFamily(records::call));

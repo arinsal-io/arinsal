@@ -201,6 +201,8 @@ pub struct Process {
     /// `p->parent` (erl_process.c:12756): the spawning process, `None` (`undefined`) for the
     /// first process; a remote parent's external pid is `ProcessCold::parent_external`.
     pub(crate) parent: Option<arinsal_sched::Pid>,
+    /// Namespace id (0 is root), mirrored from the scheduler process. A spawn inherits it.
+    pub(crate) ns: u32,
     /// `p->u.terminate`. erts reuses the initial-call union; a side `ProcessCold` would
     /// allocate on every exit.
     pub(crate) exit_cont: Option<Box<ExitCont>>,
@@ -1371,6 +1373,7 @@ impl Process {
             cold: None,
             group_leader: None,
             parent: None,
+            ns: 0,
             exit_cont: None,
             apply_inline: [Term::NIL; 3],
             apply_inline_len: 0,
