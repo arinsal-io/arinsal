@@ -3,6 +3,8 @@
 //! Erlang sources are compiled at test time with the reference `erlc` on PATH; a test that
 //! cannot compile is skipped with a message.
 
+mod common;
+
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
 use arinsal_vm::Vm;
@@ -61,7 +63,7 @@ fn worker_module(result: &str) -> String {
 
 const DRIVER: &str = r#"
 -module(ns_code_drv).
--export([two_domains/0, worker/2, lookups/0, lookup_worker/2]).
+-export([two_domains/0, worker/2, lookups/0, lookup_worker/2, dedup/0, load_worker/2, shadow/0, shadow_worker/2]).
 two_domains() ->
     A = arinsal_code:new_domain(0),
     B = arinsal_code:new_domain([0]),
@@ -93,6 +95,34 @@ lookups() ->
     {Domain, lookup(w)}.
 lookup_worker(Parent, M) ->
     Parent ! {lookups, try lookup(M) catch Class:Reason:Stack -> {Class, Reason, Stack} end}.
+dedup() ->
+    D = arinsal_code:new_domain(0),
+    ok = arinsal_code:load(D, [{dep, beam_dep()}]),
+    A = arinsal_code:new_domain(D),
+    Same = [{dd, beam_dd()}, {dep, beam_dep()}],
+    Before = erlang:memory(code),
+    SameResult = load_in([A, D, 0], Same),
+    SameGrowth = erlang:memory(code) - Before,
+    FreshResult = load_in([A, D, 0], [{w, beam_a()}]),
+    FreshGrowth = erlang:memory(code) - Before,
+    {SameResult, SameGrowth, FreshResult, FreshGrowth > 0}.
+load_in(Chain, Modules) ->
+    arinsal_code:spawn(Chain, ns_code_drv, load_worker, [self(), Modules]),
+    receive {loaded, R} -> R after 5000 -> timeout end.
+load_worker(Parent, Modules) ->
+    Loaded = [erlang:load_module(M, B) || {M, B} <- Modules],
+    Calls = [M:f() || {M, _} <- Modules],
+    Parent ! {loaded, {Loaded, Calls}}.
+shadow() ->
+    [2, 1] = lists:reverse([1, 2]),
+    A = arinsal_code:new_domain(0),
+    arinsal_code:spawn([A, 0], ns_code_drv, shadow_worker, [self(), pp]),
+    Domain = receive {shadow, R} -> R after 5000 -> timeout end,
+    {Domain, lists:reverse([1, 2]), pp:'__protocol__'(x)}.
+shadow_worker(Parent, P) ->
+    Lists = erlang:load_module(lists, beam_fake_lists()),
+    Protocol = erlang:load_module(P, beam_pp_domain()),
+    Parent ! {shadow, {Lists, lists:reverse([1, 2]), Protocol, P:'__protocol__'(x)}}.
 lookup(M) ->
     {erlang:module_loaded(M),
      erlang:function_exported(M, f, 0),
@@ -100,17 +130,38 @@ lookup(M) ->
      try lists:sort(erlang:get_module_info(M, exports)) catch error:badarg -> badarg end}.
 "#;
 
+const DEP: &str = "-module(dep).\n-export([f/0]).\nf() -> dep.\n";
+const DD: &str = "-module(dd).\n-export([f/0]).\nf() -> dd.\n";
+const FAKE_LISTS: &str = "-module(lists).\n-export([reverse/1]).\nreverse(_) -> fake.\n";
+
+fn protocol(result: &str) -> String {
+    format!("-module(pp).\n-export(['__protocol__'/1]).\n'__protocol__'(_) -> {result}.\n")
+}
+
+/// Beams the driver embeds and the base ones loaded before it runs: `dd` and the base `pp`.
 fn driver_vm(beam_a: &[u8], beam_b: &[u8]) -> Vm {
     let caller = compile("a", CALLER).expect("compile the caller module");
+    let dep = compile("dep", DEP).expect("compile dep");
+    let dd = compile("dd", DD).expect("compile dd");
+    let fake_lists = compile("lists", FAKE_LISTS).expect("compile the fake lists");
+    let pp_base = compile("pp", &protocol("base")).expect("compile pp");
+    let pp_domain = compile("pp", &protocol("domain")).expect("compile pp");
     let driver = format!(
-        "{DRIVER}\nbeam_a() -> {}.\nbeam_b() -> {}.\nbeam_caller() -> {}.\n",
+        "{DRIVER}\nbeam_a() -> {}.\nbeam_b() -> {}.\nbeam_caller() -> {}.\nbeam_dep() -> {}.\n\
+         beam_dd() -> {}.\nbeam_fake_lists() -> {}.\nbeam_pp_domain() -> {}.\n",
         binary_literal(beam_a),
         binary_literal(beam_b),
-        binary_literal(&caller)
+        binary_literal(&caller),
+        binary_literal(&dep),
+        binary_literal(&dd),
+        binary_literal(&fake_lists),
+        binary_literal(&pp_domain)
     );
     let driver = compile("ns_code_drv", &driver).expect("compile the driver");
     let mut vm = Vm::new([]);
     vm.load_bytes(&driver).unwrap();
+    vm.load_bytes(&dd).unwrap();
+    vm.load_bytes(&pp_base).unwrap();
     vm
 }
 
@@ -156,6 +207,88 @@ fn ns_code_lookup_natives_follow_chain() {
         result.text,
         "{{true,true,false,[{f,0},{g,1},{h,0},{module_info,0},{module_info,1}]},\
           {false,false,false,badarg}}"
+    );
+}
+
+/// A domain process loading a module identical (same md5) to the one its chain already sees,
+/// in the base (`dd`) or an outer domain (`dep`), gets success and code memory does not grow;
+/// a new module does grow it.
+#[test]
+fn ns_code_md5_dedup() {
+    let (Some(beam_a), Some(beam_b)) = (
+        compile("w", &worker_module("a")),
+        compile("w", &worker_module("b")),
+    ) else {
+        eprintln!("erlc unavailable; skipping ns_code_md5_dedup");
+        return;
+    };
+    let mut vm = driver_vm(&beam_a, &beam_b);
+    let result = vm
+        .eval_scheduled("ns_code_drv", "dedup", &[], 2, None)
+        .unwrap();
+    assert_eq!(
+        result.text,
+        "{{[{module,dd},{module,dep}],[dd,dep]},0,{[{module,w}],[a]},true}"
+    );
+}
+
+/// A domain cannot replace a base module with different code (`not_allowed`), and both the
+/// domain and root keep the base `lists`; a consolidated protocol may shadow the base one in
+/// the domain only.
+#[test]
+fn ns_code_base_not_shadowable() {
+    let (Some(beam_a), Some(beam_b)) = (
+        compile("w", &worker_module("a")),
+        compile("w", &worker_module("b")),
+    ) else {
+        eprintln!("erlc unavailable; skipping ns_code_base_not_shadowable");
+        return;
+    };
+    let mut vm = driver_vm(&beam_a, &beam_b);
+    let result = vm
+        .eval_scheduled("ns_code_drv", "shadow", &[], 2, None)
+        .unwrap();
+    assert_eq!(
+        result.text,
+        "{{{error,not_allowed},[2,1],{module,pp},domain},[2,1],base}"
+    );
+}
+
+const CLI_PROBE: &str = r#"
+-module(ns_code_cli).
+-export([run/0, child/2]).
+run() ->
+    D = arinsal_code:new_domain(0),
+    arinsal_code:spawn([D], ?MODULE, child, [self(), w]),
+    Child = receive {child, R} -> R after 10000 -> timeout end,
+    {Child, erlang:module_loaded(w), code:is_loaded(w), try w:f() catch error:undef -> undef end}.
+child(Parent, M) ->
+    Result = try
+        {code:load_binary(M, "w.beam", beam_w()), M:f(), erlang:module_loaded(M)}
+    catch
+        Class:Reason:Stack -> {Class, Reason, Stack}
+    end,
+    Parent ! {child, Result}.
+"#;
+
+/// On a booted node, a process with a chain loads `w` with `code:load_binary/3` (the code
+/// server finishes the load) into its own domain and calls it; root does not see the module.
+#[test]
+fn ns_code_load_into_caller_domain() {
+    let Some(beam_w) = compile("w", &worker_module("a")) else {
+        eprintln!("erlc unavailable; skipping ns_code_load_into_caller_domain");
+        return;
+    };
+    let source = format!("{CLI_PROBE}\nbeam_w() -> {}.\n", binary_literal(&beam_w));
+    let probe = compile("ns_code_cli", &source).expect("compile the probe");
+    let result = common::arinsal_once("ns_code_cli", &probe, "ns_code_cli:run()");
+    // `code:is_loaded/1` answers from the code server's table, which records every module it
+    // finished loading, whatever the domain.
+    assert_eq!(
+        format!("{result:?}"),
+        "Tuple([Tuple([Tuple([Atom(\"module\"), Atom(\"w\")]), Atom(\"a\"), Atom(\"true\")]), \
+         Atom(\"false\"), Tuple([Atom(\"file\"), List { elems: [Int(119), Int(46), Int(98), \
+         Int(101), Int(97), Int(109)], tail: Nil }]), Atom(\"undef\")])"
     );
 }
 
