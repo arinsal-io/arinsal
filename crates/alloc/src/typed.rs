@@ -652,12 +652,9 @@ const ALLOCATOR_NAMES: [&str; 10] = [
     "driver_alloc",
 ];
 
-#[inline]
-fn allocator_for(
-    allocation_type: ErtsAlcType,
-) -> Result<&'static ThreadSpecificAllocators, AllocError> {
+fn registry() -> &'static Vec<Option<ThreadSpecificAllocators>> {
     static ALLOCATORS: OnceLock<Vec<Option<ThreadSpecificAllocators>>> = OnceLock::new();
-    let registry = ALLOCATORS.get_or_init(|| {
+    ALLOCATORS.get_or_init(|| {
         let schedulers = std::thread::available_parallelism().map_or(1, usize::from);
         let mut registry: Vec<Option<ThreadSpecificAllocators>> =
             ALLOCATOR_NAMES.iter().map(|_| None).collect();
@@ -666,17 +663,34 @@ fn allocator_for(
                 continue;
             };
             let count = crate::allocator::instance_count(&spec, schedulers, 0);
-            registry[index] = Some(ThreadSpecificAllocators::new_for_type(
+            registry[index] = Some(ThreadSpecificAllocators::new_with_global(
                 count,
                 spec.thread_specific,
                 spec.strategy,
+                spec.global_strategy,
                 spec.options,
                 spec.name,
             ));
         }
         registry
-    });
-    registry
+    })
+}
+
+/// `system_flag(erts_alloc, {Allocator, sbct, Value})` for the alloc_util allocator `name`;
+/// `None` when no such allocator exists.
+pub fn try_set_dyn_sbct(name: &str, value: usize) -> Option<bool> {
+    let index = ALLOCATOR_NAMES.iter().position(|known| *known == name)?;
+    registry()
+        .get(index)
+        .and_then(Option::as_ref)
+        .map(|allocators| allocators.try_set_dyn_sbct(value))
+}
+
+#[inline]
+fn allocator_for(
+    allocation_type: ErtsAlcType,
+) -> Result<&'static ThreadSpecificAllocators, AllocError> {
+    registry()
         .get(allocation_type.allocator())
         .and_then(Option::as_ref)
         .ok_or(AllocError::InvalidAllocation)
