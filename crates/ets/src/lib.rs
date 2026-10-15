@@ -48,16 +48,20 @@ impl Tid {
     }
 }
 
+/// First reference word of a table handle. Stays below 2^18 so that a
+/// handle written by `term_to_binary/1` decodes on any node.
+pub const TID_REF_TAG: u32 = 0x1_5329;
+
 impl Tid {
     /// Build a local reference shaped table handle in the caller's heap.
     pub fn to_term<H: HeapAlloc>(self, dst: &mut H) -> Result<Term, TermError> {
-        TermBuilder::new(dst).local_ref([0x4554_5329, self.0 as u32, (self.0 >> 32) as u32])
+        TermBuilder::new(dst).local_ref([TID_REF_TAG, self.0 as u32, (self.0 >> 32) as u32])
     }
 
     /// Decode a handle produced by `to_term`.
     pub fn from_term(term: Term) -> Option<Self> {
         match term.local_ref_numbers()? {
-            [0x4554_5329, low, high] => Some(Self(low as u64 | ((high as u64) << 32))),
+            [TID_REF_TAG, low, high] => Some(Self(low as u64 | ((high as u64) << 32))),
             _ => None,
         }
     }

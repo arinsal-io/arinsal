@@ -894,6 +894,27 @@ fn is_builtin_includes_instruction_implemented_exports() {
 }
 
 #[test]
+fn is_builtin_out_of_range_arity_matches_otp() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    for arity in [-1, -100, 0, 255, 256, 100_000] {
+        for (module, name) in [("erlang", "length"), ("lists", "map"), ("a", "b")] {
+            let input = [atom(module), atom(name), O::Int(arity)];
+            let expected = reference.call("erlang", "is_builtin", &input);
+            let actual = call("erlang", "is_builtin", &input);
+            assert!(
+                equivalent(&actual, &expected),
+                "{module}:{name}/{arity}: {actual:?} != {expected:?}"
+            );
+        }
+    }
+    let negative = [atom("erlang"), atom("length"), O::Int(-1)];
+    assert_eq!(
+        call("erlang", "is_builtin", &negative),
+        CallResult::Ok(atom("false"))
+    );
+}
+
+#[test]
 fn iolist_to_iovec_preserves_large_binary_segments() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     let input = O::List {
