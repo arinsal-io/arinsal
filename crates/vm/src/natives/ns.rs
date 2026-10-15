@@ -115,6 +115,7 @@ fn create(process: &mut Process, tenant: Term, project: Term, opts: Term) -> Res
     let project = binary_arg(project)?;
     let mut max_processes = crate::namespace::UNLIMITED;
     let mut max_bytes = crate::namespace::UNLIMITED;
+    let mut os_env: Vec<(String, String)> = Vec::new();
     match &to_owned(opts).map_err(|_| badarg())? {
         O::Nil => {}
         O::Map(entries) => {
@@ -122,6 +123,8 @@ fn create(process: &mut Process, tenant: Term, project: Term, opts: Term) -> Res
                 match key {
                     O::Atom(name) if name == "max_processes" => max_processes = limit_arg(value)?,
                     O::Atom(name) if name == "max_bytes" => max_bytes = limit_arg(value)?,
+                    // arl: `os_env => [{Key, Value}]` seeds the environment overlay
+                    O::Atom(name) if name == "os_env" => os_env = env_arg(value)?,
                     _ => {}
                 }
             }
@@ -133,10 +136,52 @@ fn create(process: &mut Process, tenant: Term, project: Term, opts: Term) -> Res
     let entry = runtime
         .namespaces
         .create(&scheduler, tenant, project, max_processes, max_bytes);
+    for (name, value) in os_env {
+        entry.env_put(name.into(), value.into());
+    }
     heap_term(
         process,
         &O::Tuple(vec![O::Atom("ok".into()), O::Int(i64::from(entry.id))]),
     )
+}
+
+/// `os_env` option: a list of `{Key, Value}` strings (lists of code points or binaries).
+fn env_arg(value: &O) -> Result<Vec<(String, String)>, VmError> {
+    fn text(value: &O) -> Result<String, VmError> {
+        match value {
+            O::Binary(bytes) => String::from_utf8(bytes.clone()).map_err(|_| badarg()),
+            O::Nil => Ok(String::new()),
+            O::List { elems, tail } if **tail == O::Nil => elems
+                .iter()
+                .map(|item| match item {
+                    O::Int(code) => u32::try_from(*code)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or_else(badarg),
+                    _ => Err(badarg()),
+                })
+                .collect(),
+            _ => Err(badarg()),
+        }
+    }
+    let entries = match value {
+        O::Nil => return Ok(Vec::new()),
+        O::List { elems, tail } if **tail == O::Nil => elems,
+        _ => return Err(badarg()),
+    };
+    entries
+        .iter()
+        .map(|entry| match entry {
+            O::Tuple(pair) if pair.len() == 2 => {
+                let (name, value) = (text(&pair[0])?, text(&pair[1])?);
+                if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+                    return Err(badarg());
+                }
+                Ok((name, value))
+            }
+            _ => Err(badarg()),
+        })
+        .collect()
 }
 
 fn spawn(

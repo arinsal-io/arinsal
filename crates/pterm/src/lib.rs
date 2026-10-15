@@ -53,6 +53,10 @@ pub fn last_retirement_of_any_store() -> RetirementTrace {
 // A node's store lives for the rest of the OS process: processes and native code hold
 // `'static` references into it.
 pub fn store_for(scope: u64) -> &'static Store {
+    // arl: a namespace scope turns on the leak-instead-of-free rule of `arl_keep_alive`
+    if scope >> ARL_NS_SHIFT != 0 {
+        ARL_ANY_NS.store(true, Ordering::Release);
+    }
     static STORES: LazyLock<Mutex<HashMap<u64, &'static Store>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     if scope == 0 {
@@ -62,6 +66,34 @@ pub fn store_for(scope: u64) -> &'static Store {
     stores
         .entry(scope)
         .or_insert_with(|| Box::leak(Box::new(Store::new())))
+}
+
+// arl: namespaces keep their persistent terms in a store of their own, named by a scope that
+// carries the namespace id above the node's code scope.
+const ARL_NS_SHIFT: u32 = 40;
+
+// arl: set once any namespace store exists
+static ARL_ANY_NS: AtomicBool = AtomicBool::new(false);
+
+/// The store scope of namespace `ns` on the node with code scope `base`; `ns == 0` is the node.
+pub fn arl_ns_scope(base: u64, ns: u32) -> u64 {
+    debug_assert!(
+        base >> ARL_NS_SHIFT == 0,
+        "code scope overflows the namespace bits"
+    );
+    base | (u64::from(ns) << ARL_NS_SHIFT)
+}
+
+/// Keep `value` alive for the rest of the OS process once namespaces exist.
+///
+/// A namespace process can hold a reference into an area of another store (a literal or a
+/// term sent from root) that no collector of its own store tracks, so the areas of the node
+/// store are never released after the first namespace store appears. Namespace stores have no
+/// collector at all, so their areas are kept too.
+fn arl_keep_alive<T>(value: &Arc<T>) {
+    if ARL_ANY_NS.load(Ordering::Acquire) {
+        std::mem::forget(Arc::clone(value));
+    }
 }
 
 /// A stable table view held across a yielding `persistent_term:get/0` call.
@@ -552,6 +584,8 @@ impl Store {
         self.publish(Table::new(), current);
     }
     fn retire(&self, writer: &mut Writer, old: Arc<Stored>) {
+        // arl: see arl_keep_alive
+        arl_keep_alive(&old);
         // Port of erts/emulator/beam/erl_bif_persistent.c:1229 (delete_tuple), OTP-29.1.1
         if old.value.is_pointer() {
             // Port of erts/emulator/beam/beam_bif_load.c:1794-1946
@@ -566,6 +600,8 @@ impl Store {
 
     /// Retain a purged module's literal heap until every existing process has copied its roots.
     pub fn retire_module_area(&self, area: Arc<VecHeap>) {
+        // arl: see arl_keep_alive
+        arl_keep_alive(&area);
         let mut writer = self.lock_writer();
         let generation = self.start_retirement();
         self.finish_retirement(&mut writer, RetiredStorage::Module(area), generation);

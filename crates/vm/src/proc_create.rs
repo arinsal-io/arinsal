@@ -1188,6 +1188,22 @@ impl Process {
         }
     }
 
+    /// Move the process onto the persistent-term store of its namespace. Called once the
+    /// namespace is known; a process of root keeps the node store.
+    pub(crate) fn arl_bind_ns_store(&mut self) {
+        if self.ns == 0 {
+            return;
+        }
+        let base = self
+            .runtime
+            .as_ref()
+            .map_or(0, |runtime| runtime.code_scope);
+        let store = arinsal_pterm::store_for(arinsal_pterm::arl_ns_scope(base, self.ns));
+        if !std::ptr::eq(self._persistent_terms.store(), store) {
+            self._persistent_terms = store.register_process();
+        }
+    }
+
     /// Select a registered native function as the process's next entry point.
     pub fn set_native_entry(&mut self, address: usize) -> Result<(), &'static str> {
         if native_function_at(address).is_none() {

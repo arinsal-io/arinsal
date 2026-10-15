@@ -246,6 +246,25 @@ ns_ets_give_away_cross_ns_badarg() ->
         Other -> {bad, Other}
     end.
 
+ns_ets_destroy_frees() ->
+    Ns = mk(<<"acme">>),
+    H = holder(Ns, fun() ->
+        dt = ets:new(dt, [named_table, public]),
+        _ = ets:new(unnamed, []),
+        register(dreg, self()),
+        ok
+    end, fun(_) -> ok end),
+    settle(),
+    Before = length(ets:all()),
+    ok = arinsal_ns:destroy(Ns),
+    _ = await(H),
+    settle(),
+    After = length(ets:all()),
+    case {Before - After, lists:member(dt, ets:all())} of
+        {2, false} -> ok;
+        Other -> {bad, Other, Before, After}
+    end.
+
 ns_ets_root_unchanged() ->
     Ns = mk(<<"acme">>),
     H = holder(Ns, fun() -> t = ets:new(t, [named_table, public]), ok end, fun(_) -> ets:info(t, size) end),
@@ -317,6 +336,11 @@ fn ns_ets_all_root_sees_all() {
 #[test]
 fn ns_ets_give_away_cross_ns_badarg() {
     run("ns_ets_give_away_cross_ns_badarg");
+}
+
+#[test]
+fn ns_ets_destroy_frees() {
+    run("ns_ets_destroy_frees");
 }
 
 #[test]

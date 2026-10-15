@@ -1006,6 +1006,8 @@ pub(crate) fn erl_create_process(
     child.parent = Some(ctx.pid());
     child.code_chain = parent.code_chain.clone();
     child.ns = so.ns.unwrap_or(parent.ns);
+    // arl: a namespace process has its own persistent-term store
+    child.arl_bind_ns_store();
     // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: `args` is copied
     // with copy_struct_litopt and the three arg registers take mod, func and the copy), OTP-29.1.1.
     let copied_args = {
