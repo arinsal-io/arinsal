@@ -307,41 +307,6 @@ impl Kind {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hash_put_get_erase_grow_and_shrink() {
-        let mut table = ProcessReg::new();
-        let mut names = Vec::new();
-        for index in 0..40 {
-            let atom = global_atoms()
-                .intern(&format!("reg_hash_{index}"))
-                .expect("atom");
-            assert!(table.insert_proc(atom, Pid::from_data((index + 1) as u64)));
-            assert!(!table.insert_proc(atom, Pid::from_data((index + 100) as u64)));
-            names.push(atom);
-        }
-        for (index, atom) in names.iter().copied().enumerate() {
-            assert_eq!(
-                table.fetch(atom),
-                Some(RegId::Proc(Pid::from_data(index as u64 + 1)))
-            );
-        }
-        assert_eq!(table.registered_atoms().len(), names.len());
-        for atom in names.iter().take(30) {
-            assert!(table.erase(*atom).is_some());
-            assert!(table.fetch(*atom).is_none());
-        }
-        assert_eq!(table.registered_atoms().len(), 10);
-        for atom in names.iter().take(30) {
-            assert!(table.insert_proc(*atom, Pid::from_data(7)));
-            assert_eq!(table.fetch(*atom), Some(RegId::Proc(Pid::from_data(7))));
-        }
-    }
-}
-
 /// A name table chosen by namespace: root's own, or the one on a namespace entry.
 pub(crate) enum RegRef<'a> {
     Root(&'a RegisterTable),
@@ -402,5 +367,40 @@ impl crate::process::Runtime {
         };
         let word = self.scheduler().ok()?.ns_word(pid)?;
         (word & arinsal_sched::NS_SHARED != 0).then_some(RegId::Proc(pid))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_put_get_erase_grow_and_shrink() {
+        let mut table = ProcessReg::new();
+        let mut names = Vec::new();
+        for index in 0..40 {
+            let atom = global_atoms()
+                .intern(&format!("reg_hash_{index}"))
+                .expect("atom");
+            assert!(table.insert_proc(atom, Pid::from_data((index + 1) as u64)));
+            assert!(!table.insert_proc(atom, Pid::from_data((index + 100) as u64)));
+            names.push(atom);
+        }
+        for (index, atom) in names.iter().copied().enumerate() {
+            assert_eq!(
+                table.fetch(atom),
+                Some(RegId::Proc(Pid::from_data(index as u64 + 1)))
+            );
+        }
+        assert_eq!(table.registered_atoms().len(), names.len());
+        for atom in names.iter().take(30) {
+            assert!(table.erase(*atom).is_some());
+            assert!(table.fetch(*atom).is_none());
+        }
+        assert_eq!(table.registered_atoms().len(), 10);
+        for atom in names.iter().take(30) {
+            assert!(table.insert_proc(*atom, Pid::from_data(7)));
+            assert_eq!(table.fetch(*atom), Some(RegId::Proc(Pid::from_data(7))));
+        }
     }
 }
