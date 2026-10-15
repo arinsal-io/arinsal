@@ -958,6 +958,7 @@ pub(crate) fn set_global_breakpoint(
     arity: u8,
     target: usize,
     enabled: bool,
+    bif_traced: bool,
 ) {
     let Some(mfa) = interned_mfa(module, function, arity) else {
         return;
@@ -988,8 +989,9 @@ pub(crate) fn set_global_breakpoint(
             exports.global_breakpoints.remove(&mfa);
         }
         if let Some(target) = exports.dispatch.get(&mfa) {
-            // Port of erts/emulator/beam/beam_bp.c:374 (ep->is_bif_traced), OTP-29.1.1.
-            target.slot.set_bif_traced(enabled);
+            // Port of erts/emulator/beam/beam_bp.c:374 (ep->is_bif_traced), OTP-29.1.1: any
+            // session's local or global trace of a BIF sends its callers through the trace path.
+            target.slot.set_bif_traced(bif_traced);
         }
         set_target(exports);
         vec![mfa]

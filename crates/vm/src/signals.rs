@@ -891,6 +891,8 @@ pub(crate) struct ErlSpawnOpts {
     pub off_heap_queue: Option<bool>,
     pub scheduler: Option<usize>,
     pub priority: Priority,
+    /// The option list as the caller gave it (`so->opts`), reported by the seq_trace spawn request.
+    pub opts: Term,
     /// The spawn_request reply the parent gets (erl_process.c:13146), if one is asked for.
     pub reply: Option<SpawnReply>,
 }
@@ -1036,6 +1038,11 @@ pub(crate) fn erl_create_process(
             },
         );
     }
+    let seq_spawn = if crate::seq_trace::has_token(parent) {
+        crate::seq_trace::spawn_prepare(parent, parent_pid, &mut child)
+    } else {
+        None
+    };
     let pid = if let Some(scheduler_id) = so.scheduler {
         scheduler.spawn_unscheduled_on_with_priority(child, scheduler_id, so.priority)
     } else {
@@ -1053,6 +1060,50 @@ pub(crate) fn erl_create_process(
             .tuple(&[module, function, arg_list])
             .map_err(|error| VmError::Unsupported(format!("spawn trace MFA: {error:?}")))?;
         crate::trace::spawned(vm, parent, ctx, pid, mfa, so.link);
+    }
+    let mut seq_reply_token = None;
+    if let Some(request) = seq_spawn.as_ref()
+        && let Some(child_term) = pid.to_term()
+        && let Some(parent_term) = parent_pid.to_term()
+    {
+        let owned = |term: Term| {
+            arinsal_term::to_owned(term)
+                .unwrap_or_else(|_| arinsal_etf::OwnedTerm::atom("undefined"))
+        };
+        let (tag, reference) = match so.reply.as_ref() {
+            Some(reply) => (reply.tag, reply.reference),
+            None => (
+                atom("spawn_reply"),
+                crate::signals::reference(parent, arinsal_bifs::next_ref_id())?,
+            ),
+        };
+        let arity = Term::small(args_list.len() as i64).unwrap_or(Term::NIL);
+        let group_leader = child_group_leader_term(parent, ctx.pid());
+        let request_message = arinsal_etf::OwnedTerm::tuple(vec![
+            arinsal_etf::OwnedTerm::atom("spawn_request"),
+            owned(reference),
+            owned(parent_term),
+            owned(group_leader),
+            arinsal_etf::OwnedTerm::tuple(vec![owned(module), owned(function), owned(arity)]),
+            owned(so.opts),
+            owned(tag),
+            owned(args),
+        ]);
+        let reply_message = arinsal_etf::OwnedTerm::tuple(vec![
+            owned(tag),
+            owned(reference),
+            arinsal_etf::OwnedTerm::atom("ok"),
+            owned(child_term),
+        ]);
+        seq_reply_token = Some(crate::seq_trace::spawn_events(
+            vm,
+            parent,
+            ctx,
+            request,
+            pid,
+            (request_message, reply_message),
+            so.reply.is_none(),
+        ));
     }
     if let (Some(id), Some(data), Some(monitor)) = (monitor_id, monitor_data, so.monitor.as_ref()) {
         parent
@@ -1077,7 +1128,10 @@ pub(crate) fn erl_create_process(
                 .tuple(&[reply.tag, reply.reference, atom("ok"), pid_term])
                 .map_err(|error| VmError::Unsupported(format!("spawn reply: {error:?}")))?
         };
-        let envelope = Message::copy_from(message)?;
+        let mut envelope = Message::copy_from(message)?;
+        if let Some(token) = seq_reply_token.take() {
+            envelope.attach_seq_token(Box::new(token));
+        }
         scheduler
             .send(pid, parent_pid, envelope)
             .map_err(|error| VmError::Unsupported(format!("spawn_reply: {error}")))?;
@@ -1088,6 +1142,14 @@ pub(crate) fn erl_create_process(
         pid,
         monitor: monitor_id,
     })
+}
+
+/// The group leader the child inherits, as a term.
+fn child_group_leader_term(parent: &Process, fallback: Pid) -> Term {
+    parent
+        .group_leader_pid(fallback)
+        .to_term()
+        .unwrap_or(Term::NIL)
 }
 
 #[allow(clippy::too_many_arguments)] // spawn_opt flags stay positional; the BIF callers pass them so.
@@ -1126,6 +1188,7 @@ fn spawn_mfa_with_priority(
             off_heap_queue: tuning.off_heap_queue,
             scheduler: scheduler_id,
             priority,
+            opts: tuning.options.unwrap_or(Term::NIL),
             reply: None,
         },
     )?;
@@ -1149,6 +1212,7 @@ fn spawn_mfa_with_priority(
 /// The spawn helpers take it through a thread-local so their positional flag lists stay frozen.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SpawnTuning {
+    options: Option<Term>,
     max_heap: Option<crate::process::MaxHeap>,
     fullsweep: Option<u16>,
     min_bin_vheap: Option<usize>,
@@ -1187,7 +1251,10 @@ struct SpawnOpts {
 // Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1.
 fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmError> {
     let mut opts = SpawnOpts {
-        tuning: SpawnTuning::default(),
+        tuning: SpawnTuning {
+            options: Some(term),
+            ..SpawnTuning::default()
+        },
         link: false,
         monitor: false,
         monitor_tag: None,
@@ -3813,21 +3880,8 @@ fn link_opt(
         &[linked_term],
     );
     match ctx.signal(pid, Signal::Link) {
-        Ok(()) => {
-            if let Some(linker) = ctx.pid().to_term() {
-                // Port of erts/emulator/beam/erl_process.c:12899-12901, OTP-29.1.1.
-                // Preserve the link-time trace flags across a later trace BIF.
-                crate::trace::emit(
-                    Some(vm),
-                    process,
-                    ctx,
-                    pid,
-                    crate::trace::PROCS,
-                    "getting_linked",
-                    &[linker],
-                );
-            }
-        }
+        // The linked process reports getting_linked when it handles the signal.
+        Ok(()) => {}
         Err(arinsal_sched::Error::NoProcess) => {
             // The target exited between the lookup and the signal: like erts, keep the link
             // and let a `noproc` link exit from the target dissolve it.

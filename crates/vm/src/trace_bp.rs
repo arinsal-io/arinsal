@@ -1452,6 +1452,28 @@ pub(crate) fn breakpoint_kinds(
     (local, global)
 }
 
+/// Whether some session has any breakpoint flag on the function, as `breakpoint_kinds` sees it.
+// Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
+pub(crate) fn any_breakpoint(process: &Process, module: &str, function: &str, arity: u8) -> bool {
+    let table = bp_node(process).tables.read().unwrap();
+    let ix = bp_node(process).active_bp_ix();
+    function_bps(
+        &table,
+        scope(process),
+        code_scope(process),
+        module,
+        function,
+        arity,
+    )
+    .any(|g| {
+        let mut flags = g.data[ix].flags;
+        if INSTALL_VIEW.with(std::cell::Cell::get) {
+            flags |= g.data[bp_node(process).staging_bp_ix()].flags;
+        }
+        flags != 0
+    })
+}
+
 fn scope(process: &Process) -> usize {
     process
         .runtime

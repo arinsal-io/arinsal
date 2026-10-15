@@ -132,6 +132,14 @@ pub struct Process {
     pub(crate) dictionary: Option<ProcDict>,
     /// Per-process sequential trace token; `None` is the no-token fast path.
     pub(crate) seq_trace_token: Option<Box<crate::seq_trace::Token>>,
+    /// `p->seq_trace_clock` and `p->seq_trace_lastcnt` (erl_process.h:1112); the epoch of the
+    /// last `seq_trace:reset_trace/0` this process has applied.
+    pub(crate) seq_trace_clock: u64,
+    pub(crate) seq_trace_lastcnt: u64,
+    pub(crate) seq_trace_epoch: u64,
+    /// A spawned child whose first action is the spawn reply: the token update of
+    /// erl_process.c:12960-12965 happens when it first runs.
+    pub(crate) seq_trace_spawn_pending: bool,
     pub(crate) module: usize,
     pub(crate) ip: usize,
     pub(crate) initial_call: Option<(usize, usize)>,
@@ -886,6 +894,8 @@ pub(crate) struct ProcessCold {
     /// Active suspends of this process (erts `p->rcount`); nonzero exactly when `SUSPENDED` is set.
     pub(crate) suspend_count: u32,
     pub(crate) aliases: std::collections::HashSet<u64>,
+    /// Aliases created with `reply`: deactivated by the first message handled through them.
+    pub(crate) once_aliases: std::collections::HashSet<u64>,
     /// Arguments of an `eval_scheduled` entry, restored when its `-on_load` prelude returns.
     ///
     /// The heap owns the copied terms so a collection inside `-on_load` cannot move them.
@@ -1301,6 +1311,10 @@ impl Process {
             heap,
             dictionary: None,
             seq_trace_token: None,
+            seq_trace_clock: 0,
+            seq_trace_lastcnt: 0,
+            seq_trace_epoch: crate::seq_trace::current_epoch(),
+            seq_trace_spawn_pending: false,
             module: 0,
             ip: 0,
             initial_call: None,

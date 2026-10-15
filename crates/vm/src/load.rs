@@ -1153,7 +1153,12 @@ impl Vm {
             if module.breakpoint_originals.contains_key(entry) != local {
                 local_patches.push((*entry, local));
             }
-            global_patches.push((function.as_str(), *arity, global));
+            global_patches.push((
+                function.as_str(),
+                *arity,
+                global,
+                global || crate::trace_bp::any_breakpoint(process, &module.name, function, *arity),
+            ));
         }
         crate::beamasm_integration::patch_native_breakpoints(
             self.code_scope,
@@ -1163,10 +1168,12 @@ impl Vm {
         let mut exports_retargeted = false;
         let global_patches = global_patches
             .into_iter()
-            .map(|(function, arity, global)| ((function, arity), global))
+            .map(|(function, arity, global, traced)| ((function, arity), (global, traced)))
             .collect::<HashMap<_, _>>();
         for (index, export) in module.exports.iter().enumerate() {
-            if let Some(&global) = global_patches.get(&(export.function.as_str(), export.arity)) {
+            if let Some(&(global, bif_traced)) =
+                global_patches.get(&(export.function.as_str(), export.arity))
+            {
                 module.set_global_trace_breakpoint(index, global);
                 exports_retargeted = true;
                 crate::beamasm_integration::set_global_breakpoint(
@@ -1176,6 +1183,7 @@ impl Vm {
                     export.arity,
                     export.target(),
                     global,
+                    bif_traced,
                 );
             }
         }

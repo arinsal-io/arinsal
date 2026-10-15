@@ -624,11 +624,11 @@ impl Process {
             crate::trace_bp::adjust_memory_break(self, on_heap_words as i64);
         }
         self.cold_mut().prio_len = new_prio_len;
-        let (term, token) = removed_message
+        let (term, state) = removed_message
             .ok_or_else(|| VmError::Unsupported("remove_message without current message".into()))?;
 
         // Native code removes messages without the run context; the process knows its pid.
-        if token.is_some()
+        if crate::seq_trace::needs_receive(&state, self)
             && let Some(pid) = ctx
                 .as_deref()
                 .map(|run_ctx| run_ctx.pid())
@@ -636,7 +636,7 @@ impl Process {
         {
             let message =
                 arinsal_term::to_owned(term).unwrap_or(arinsal_etf::OwnedTerm::atom("undefined"));
-            crate::seq_trace::on_receive(vm, self, ctx, pid, token, message);
+            crate::seq_trace::on_receive(vm, self, ctx, pid, state, message);
         }
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2367
         // (erts_msgq_unlink_msg_set_save_first), OTP-29.1.1.

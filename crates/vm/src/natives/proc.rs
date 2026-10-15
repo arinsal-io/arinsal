@@ -3440,6 +3440,8 @@ struct LocalSpawn {
     reply_error: bool,
     bad: bool,
     monitor_id: Option<u64>,
+    /// The option list as the caller gave it (`so->opts`).
+    opts: Term,
 }
 
 fn parse_spawn_options(
@@ -3448,6 +3450,7 @@ fn parse_spawn_options(
 ) -> Option<LocalSpawn> {
     let items = list(options)?;
     let mut parsed = LocalSpawn {
+        opts: options,
         link: false,
         monitor: false,
         min_heap: None,
@@ -3594,6 +3597,7 @@ fn spawn_apply(
             off_heap_queue: None,
             scheduler: None,
             priority: options.priority,
+            opts: options.opts,
             reply: options.reply_success.then_some(crate::signals::SpawnReply {
                 tag: options.tag,
                 reference,
@@ -3751,6 +3755,9 @@ fn create_alias(
         .as_ref()
         .ok_or_else(badarg)?
         .alias_bind_prio(id, Some(pid), priority);
+    if options.iter().any(|option| *option == atom("reply")) {
+        process.cold_mut().once_aliases.insert(id);
+    }
     process.cold_mut().aliases.insert(id);
     Ok(reference)
 }
