@@ -1003,6 +1003,26 @@ impl Vm {
                 module_name, function_name, import_arity
             )));
         }
+        // An instance of a non-base domain resolves through that domain's chain first.
+        if caller_module.domain != crate::code_domains::BASE
+            && let Some(target_module) =
+                self.caller_domain_module(caller_module.domain, import.module_atom)
+            && self.code.modules[target_module]
+                .export_slot(function_name, import_arity)
+                .is_some()
+        {
+            self.remember_export(p.module, index, target_module, function_name, import_arity);
+            let (ip, code) = {
+                let slot = self.code.modules[target_module]
+                    .export_slot(function_name, import_arity)
+                    .ok_or_else(|| VmError::Exception {
+                        reason: "undef".into(),
+                        frame: format!("{module_name}:{function_name}/{import_arity}"),
+                    })?;
+                (slot.target(), slot.code_ptr())
+            };
+            return self.jump_import(p, target_module, ip, code, arity, tail);
+        }
         if let Some(&target_module) = self.code.loaded.get(module_name)
             && self.code.modules[target_module]
                 .export_slot(function_name, import_arity)
