@@ -1,6 +1,6 @@
 //! Resolution of OTP 29 generic BEAM instructions into compact interpreter code.
 
-use arinsal_beam::{BeamFile, BeamType, Instr as BeamInstr, Operand};
+use arinsal_beam::{BeamFile, Instr as BeamInstr, Operand};
 use arinsal_bifs::BifFn;
 use arinsal_spec::Opcode;
 use arinsal_term::{Atom, Term, TermBuilder, VecHeap, from_owned, global_atoms};
@@ -367,14 +367,10 @@ pub struct Module {
     // ---- vm_maps_bits ----
     /// Module string table used by bit syntax string segments.
     pub strings: Box<[u8]>,
-    /// Type metadata, indexed by code index and operand position.
-    pub types: Vec<Vec<(usize, BeamType)>>,
     /// Source line for each instruction.
-    pub lines: Vec<Option<(String, u64)>>,
+    pub lines: Vec<Option<(Arc<str>, u64)>>,
     /// Literal file-name lists indexed by source filename.
     pub line_file_terms: HashMap<String, Term>,
-    /// Per-instruction cached filename terms for exception stack traces.
-    pub line_terms: Vec<Option<(Term, u64)>>,
     /// Opcodes not yet executable, with occurrence counts.
     pub unsupported: HashMap<String, usize>,
     /// Reason for each explicit unsupported opcode.
@@ -441,10 +437,8 @@ impl Clone for Module {
             lists: self.lists.clone(),
             bit_commands: self.bit_commands.clone(),
             strings: self.strings.clone(),
-            types: self.types.clone(),
             lines: self.lines.clone(),
             line_file_terms: self.line_file_terms.clone(),
-            line_terms: self.line_terms.clone(),
             unsupported: self.unsupported.clone(),
             unsupported_reasons: self.unsupported_reasons.clone(),
             functions: self.functions.clone(),
@@ -656,7 +650,11 @@ impl Module {
     }
     /// Cached literal filename list and line for a code offset.
     pub fn line_term_at(&self, ip: usize) -> Option<(Term, u64)> {
-        self.line_terms.get(ip).copied().flatten()
+        let (file, number) = self.lines.get(ip)?.as_ref()?;
+        self.line_file_terms
+            .get(&**file)
+            .copied()
+            .map(|term| (term, *number))
     }
 }
 
@@ -686,7 +684,6 @@ struct Decoder<'a> {
     literals: &'a mut VecHeap,
     literal_terms: &'a mut HashMap<u32, Term>,
     lists: &'a mut Vec<Box<[Arg]>>,
-    types: &'a mut Vec<(usize, BeamType)>,
 }
 impl Decoder<'_> {
     fn bigint_arg(&mut self, value: &BigInt) -> Result<Arg, LoadError> {
@@ -764,14 +761,7 @@ impl Decoder<'_> {
                     .sum();
                 Arg::new(Arg::U, words)
             }
-            Operand::TypedReg { reg, type_index } => {
-                if let Some(table) = &self.file.types
-                    && let Some(ty) = table.entries.get(*type_index as usize)
-                {
-                    self.types.push((position, ty.clone()));
-                }
-                self.arg(reg, position)?
-            }
+            Operand::TypedReg { reg, .. } => self.arg(reg, position)?,
         })
     }
 
@@ -1137,9 +1127,8 @@ pub fn load_with_instrumentations(
     let mut selects = Vec::new();
     let mut tails = Vec::new();
     let mut lists = Vec::new();
-    let mut types = Vec::new();
     let mut lines = Vec::new();
-    let mut current_line = None;
+    let mut current_line: Option<(Arc<str>, u64)> = None;
     let mut unsupported = HashMap::new();
     let mut unsupported_reasons = Vec::new();
     let mut functions: Vec<(usize, String, u8)> = Vec::new();
@@ -1168,7 +1157,7 @@ pub fn load_with_instrumentations(
                 // ---- vm_exc ---- OTP keeps an implicit undefined item at index zero.
                 && let Some(item) = n.checked_sub(1).and_then(|i| table.items.get(i as usize))
             {
-                let name = if item.name_index == 0 {
+                let name: String = if item.name_index == 0 {
                     format!("{}.erl", file.module)
                 } else {
                     table
@@ -1178,8 +1167,13 @@ pub fn load_with_instrumentations(
                         .filter(|name| !name.is_empty())
                         .unwrap_or_else(|| format!("{}.erl", file.module))
                 };
-                current_line =
-                    valid_source_location(item.name_index, item.line).then_some((name, item.line));
+                current_line = valid_source_location(item.name_index, item.line).then(|| {
+                    let name = match &current_line {
+                        Some((previous, _)) if **previous == *name => Arc::clone(previous),
+                        _ => Arc::from(name),
+                    };
+                    (name, item.line)
+                });
             }
             continue;
         }
@@ -1241,7 +1235,6 @@ pub fn load_with_instrumentations(
                 counter_ids.push(*cover_id);
                 function_owners.push(*owner);
                 code.push(Instr::CoverageProbe { index: probe });
-                types.push(Vec::new());
                 lines.push(current_line.clone());
             }
         }
@@ -1252,19 +1245,16 @@ pub fn load_with_instrumentations(
             let reason = u32::try_from(unsupported_reasons.len()).map_err(|_| LoadError::Limit)?;
             unsupported_reasons.push(format!("opcode {}", instruction.op.name()));
             code.push(Instr::Unsupported(reason));
-            types.push(Vec::new());
             lines.push(current_line.clone());
             source_ip += 1;
             continue;
         }
-        let mut type_meta = Vec::new();
         let mut decoder = Decoder {
             file,
             labels: &labels,
             literals: &mut literals,
             literal_terms: &mut literal_terms,
             lists: &mut lists,
-            types: &mut type_meta,
         };
         let mut args = [Arg::NONE; 3];
         let mut tail = Vec::new();
@@ -1384,7 +1374,6 @@ pub fn load_with_instrumentations(
                 Instr::Generic(index)
             });
         }
-        types.push(type_meta);
         lines.push(current_line.clone());
         source_ip += if instruction.op == Opcode::DebugLine {
             2
@@ -1548,31 +1537,17 @@ pub fn load_with_instrumentations(
     selects.shrink_to_fit();
     tails.shrink_to_fit();
     lists.shrink_to_fit();
-    types.iter_mut().for_each(Vec::shrink_to_fit);
-    types.resize_with(code.len(), Vec::new);
-    types.shrink_to_fit();
     lines.resize(code.len(), None);
     lines.shrink_to_fit();
     let mut line_file_terms = HashMap::new();
     for (file, _) in lines.iter().flatten() {
-        if !line_file_terms.contains_key(file) {
+        if !line_file_terms.contains_key(&**file) {
             let term = TermBuilder::new(&mut literals)
                 .string_to_list(file)
                 .map_err(|_| LoadError::Limit)?;
-            line_file_terms.insert(file.clone(), term);
+            line_file_terms.insert(file.to_string(), term);
         }
     }
-    let line_terms = lines
-        .iter()
-        .map(|line| {
-            line.as_ref().and_then(|(file, number)| {
-                line_file_terms
-                    .get(file)
-                    .copied()
-                    .map(|term| (term, *number))
-            })
-        })
-        .collect();
     functions.shrink_to_fit();
     unsupported_reasons.shrink_to_fit();
     bit_commands.shrink_to_fit();
@@ -1637,10 +1612,8 @@ pub fn load_with_instrumentations(
         bit_commands,
         // ---- vm_maps_bits ----
         strings: file.strings.clone().into_boxed_slice(),
-        types,
         lines,
         line_file_terms,
-        line_terms,
         unsupported,
         unsupported_reasons,
         functions,

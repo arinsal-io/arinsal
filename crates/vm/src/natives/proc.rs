@@ -981,7 +981,7 @@ fn process_info_item_current_location(
                                     .and_then(|ip| module.lines.get(ip))
                                     .and_then(Option::as_ref)
                             })
-                            .cloned()
+                            .map(|(file, line)| (file.to_string(), *line))
                     })
                 })
             })
