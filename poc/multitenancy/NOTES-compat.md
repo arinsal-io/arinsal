@@ -37,12 +37,45 @@ beyond the two fixes.
   `[]`, `compressed`, `{compressed,9}`, `{minor_version,0|1}`, `deterministic`: all identical.
   Only the stack traces of the expected badarg for the invalid `{atom_utf8,false}` option differ.
 
+## 3. `+A0` and other attached emulator flag values
+- Cause: erlexec passes `+A0` to the emulator as `-A0`; the emulator reads the value from the same
+  token. Arinsal's parser only split attached values for some flags, so `erlc` (which runs
+  `erl +A0`) failed with `unknown emulator flag +A0`.
+- Fix: `crates/args/src/lib.rs` splits attached values for `+A +a +e +i +n +T +R +W +K` (the
+  letters erlexec forwards). `+a` now validates its range like the emulator (16..8192).
+- Tests: `flag_families_match_erl_boot_arguments` (new family with attached values) and
+  `flag_family_rejections_match_erl` (`+A1025`, `+A-1`, `+Ax`, `+a1`, `+a 8193`, `+a16`) in
+  `crates/args/tests/families.rs`; both differential against erlexec. Failed before the fix.
+- Verified: `erlc m.erl` through the shim produces `m.beam` and the module loads.
+
+## 4. Local references with a first id word of 2^18 or more
+- ERTS rejects a NEWER_REFERENCE_EXT of its own node whose first word is `>= 2^18`; Arinsal
+  decoded it. Both decoders (`crates/bifs/src/etf.rs`, `crates/etf/src/lib.rs`) now reject it for
+  `nonode@nohost` creation 0, except the Arinsal magic reference shape `[lo, hi, 0xffffffff]`.
+- Handle tags of the native NIFs (file, buffer, tty, zlib, socket lifecycle) were all above 2^18
+  and are now below it, so they round-trip through the strict decoder and stock OTP.
+- Tests: `binary_to_term_local_ref_first_word_limit_matches_otp` (differential, crates/bifs),
+  `handle_reference_decodes_on_any_node` (crates/nif-file). The first failed before the fix.
+- Open: magic references (`[lo, hi, 0xffffffff]`, ids from a counter) can exceed 2^18 after 262k
+  allocations and stock OTP would reject them. Changing that wire shape touches the term,
+  etf, ets, socket and binary crates, so it is left alone.
+
+## 5. `File.cp/2` and `File.cp_r/2` returning `{:error, :badarg}`
+- Cause: `file:write_file_info/2` raised badarg after the data was copied. The process had
+  left a smaller live register count in `gc_live`; when the four-argument dirty NIF
+  `set_time_nif` moved the process to a dirty scheduler, the switch-out saved only that many
+  X registers, so the last argument (ctime) became `[]`. It needed a heap fragment adopted
+  from an earlier dirty call (a successful `prim_file:open/2`), which forces a collection and
+  makes the stale count matter.
+- Fix: `trap_to_dirty_nif` in `crates/vm/src/native_helpers.rs` sets `gc_live` to the NIF
+  arity before the trap.
+- Test: `dirty_nif_arity_keeps_all_arguments` in `crates/vm/tests/dirty_nif_arity.rs` (runs the
+  debug `arinsal` binary through a shim and compares with `erl`). Needs
+  `ln -sfn $CARGO_TARGET_DIR <worktree>/target` and a built `target/debug/arinsal`. Failed
+  before the fix (`{ok,{error,badarg},ok}`), passes after.
+- Verified: `File.cp`, `File.exists?`, `File.cp_r` on Arinsal return `:ok` and `{:ok, [...]}`.
+
 ## Gaps and side findings
-- Arinsal's decoder still accepts a local reference with a first id word `>= 2^18` in
-  NEWER_REFERENCE_EXT; ERTS rejects it for refs of its own node. Not changed (lenient, not the
-  cause of the bug).
-- `erlc` from a shim dir fails with `arinsal: unknown emulator flag +A0` (erlc passes `+A0`).
-  Not fixed here.
 - `cargo clippy -p arinsal-ets -p arinsal-bifs -- -D warnings` fails in `crates/alloc/src/raw.rs`
   (multiple unsafe operations per block, unrelated and pre-existing), so clippy could not be
   used on these crates.
