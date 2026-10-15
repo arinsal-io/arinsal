@@ -22,17 +22,34 @@
   `of/1` (`undefined` for a dead pid). Root only, `notsup` inside a namespace. Erlang needs `arinsal_ns:'of'(Pid)`.
   `create/3` stores `max_processes`/`max_bytes` but nothing enforces them yet.
 
-## Findings for the other streams
-- A request/reply from root to a namespace process hangs: the reply is a message from ns to root, which is
-  refused unless the root caller is SHARED. Seen with `process_info(NsPid, links)` and
-  `is_process_alive(NsPid)` from root. The manager must `expose` itself, and root code that queries ns
-  processes must run in an exposed process (or the reply path needs an exemption).
-- After a refused link the caller keeps its half of the link (as for a dead target). When the caller exits,
-  an ExitLinked reaches the other namespace; the target has no matching link and ignores it (checked by
-  `ns_link_cross_ns_noproc`, which sees the target survive).
+## Chunk 2: replies, aliases, expose, destroy
+- Runtime replies are not tenant traffic. `RunCtx::send_runtime` / `Scheduler::send_runtime` send a message that
+  skips the check. Used for: replies to process_info, group_leader, garbage_collect, check_process_code and
+  system-task requests (`reply_request`, `process_exiting`, system task `deliver`), the sync-suspend reply,
+  literal-area copy replies and the wake of the literal collector.
+- Requests are admitted at submit time instead: `submit_from` asks `Scheduler::ns_may_signal(requester, target)`
+  and a refused request answers like a dead target. The direct process_info reads
+  (`inspect_signal_free` paths in natives/proc.rs) ask the same. So root can query any ns process, a ns process
+  can query only its own ns or SHARED processes, and the reply needs no sender rule.
+- Aliases: `SignalMessage::via_alias()` (VM: `Message.alias != 0`); a message sent to an alias passes the check.
+  `gen_server:call` from root to a ns gen_server works. Raw-pid sends ns to root are still refused.
+- `try_send_on_heap` skips the receiver-heap fast path when the check refuses, so a refused sender never
+  allocates on the receiver's heap.
+- `arinsal_ns:expose/1` (root pid only, `badarg` otherwise) sets SHARED. `arinsal_ns:destroy/1` marks the entry
+  dead, sends `kill` to every process of the ns (two scans) and returns `ok`; the processes exit asynchronously.
+  Spawning into a dead ns raises `badarg` from `arinsal_ns:spawn`, `system_limit` for a child of a dying ns process.
+  Destroy is idempotent. A spawn racing the second scan could in theory leave a child; the counters/cap step
+  closes that at the scheduler.
+
+## Gaps
+- Logger events from ns processes go to the root `logger` process by plain message and are dropped unless it is
+  exposed (process.rs, sys.rs `ctx.send(logger, ..)`). Expose `logger`, or route them with `send_runtime`.
+- Direct-state BIFs outside process_info (erl_debugger, erts_debug, trace) are not gated; they belong to the
+  RootOnly step.
+- `group_leader(Leader, Pid)` accepts a root `Leader`; only the request to the target is checked.
 
 ## Not in this chunk
-destroy, expose, info, list, process caps, counters, `processes/0` filter, microbench at ns 0.
+info, list, process caps, counters, `processes/0` filter, microbench at ns 0.
 
 ## Run
 ```

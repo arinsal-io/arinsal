@@ -111,6 +111,115 @@ ns_link_cross_ns_noproc() ->
         {noproc, stopped} -> ok;
         Other -> {bad, Other}
     end.
+
+%% gen_server callbacks, for the alias test
+init(_) -> {ok, s}.
+handle_call(ping, _From, S) -> {reply, pong, S}.
+
+ns_pids(Ns) -> [P || P <- erlang:processes(), arinsal_ns:'of'(P) =:= Ns].
+
+wait_count(Ns, _N, 0) -> ns_pids(Ns);
+wait_count(Ns, N, Tries) ->
+    case ns_pids(Ns) of
+        L when length(L) >= N -> L;
+        _ ->
+            receive after 10 -> ok end,
+            wait_count(Ns, N, Tries - 1)
+    end.
+
+ns_root_requests_reply() ->
+    Ns = mk(<<"acme">>),
+    {PB, RefB} = start_in(Ns, fun() -> receive stop -> stopped end end),
+    PB ! go,
+    Links = process_info(PB, links),
+    Alive = is_process_alive(PB),
+    Gc = erlang:garbage_collect(PB),
+    PB ! stop,
+    Stopped = await(PB, RefB),
+    case {Links, Alive, Gc, Stopped} of
+        {{links, []}, true, true, stopped} -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_request_to_root_refused() ->
+    Ns = mk(<<"acme">>),
+    Root = self(),
+    case in_ns(Ns, fun() -> {process_info(Root, status), is_process_alive(Root)} end) of
+        {undefined, false} -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_alias_gen_server() ->
+    Ns = mk(<<"acme">>),
+    P = in_ns(Ns, fun() -> {ok, Pid} = gen_server:start(ns_core_t, [], []), Pid end),
+    case gen_server:call(P, ping, 3000) of
+        pong -> ok;
+        Other -> {bad, Other}
+    end.
+
+%% A root process that reports the first message it gets to the caller.
+root_receiver() ->
+    Me = self(),
+    spawn(fun() -> receive M -> Me ! {root_got, M} end end).
+
+root_probe(Pid) ->
+    receive {root_got, M} -> M after 3000 -> timeout end.
+
+ns_shared_root_reachable() ->
+    Ns = mk(<<"acme">>),
+    R = root_receiver(),
+    ok = arinsal_ns:expose(R),
+    hello = in_ns(Ns, fun() -> R ! hello end),
+    case root_probe(R) of
+        hello -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_unshared_root_unreachable() ->
+    Ns = mk(<<"acme">>),
+    R = root_receiver(),
+    hello = in_ns(Ns, fun() -> R ! hello end),
+    R ! release,
+    case root_probe(R) of
+        release -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_natives_root_only() ->
+    Ns = mk(<<"acme">>),
+    Self = self(),
+    Res = in_ns(Ns, fun() ->
+        [catch arinsal_ns:create(<<"a">>, <<"b">>, #{}),
+         catch arinsal_ns:spawn(1, erlang, self, []),
+         catch arinsal_ns:destroy(1),
+         catch arinsal_ns:expose(self())]
+    end),
+    case Res of
+        [{'EXIT', {notsup, _}}, {'EXIT', {notsup, _}}, {'EXIT', {notsup, _}}, {'EXIT', {notsup, _}}] -> ok;
+        Other -> {bad, Other, Self}
+    end.
+
+ns_destroy_kills_all() ->
+    Ns = mk(<<"acme">>),
+    Spawner = fun() ->
+        spawn(fun() -> receive stop -> ok end end),
+        receive stop -> ok end
+    end,
+    Waiter = fun() -> receive stop -> ok end end,
+    _ = arinsal_ns:spawn(Ns, ns_core_t, run_fun, [Spawner]),
+    _ = arinsal_ns:spawn(Ns, ns_core_t, run_fun, [Waiter]),
+    Pids = wait_count(Ns, 3, 300),
+    Refs = [erlang:monitor(process, P) || P <- Pids],
+    ok = arinsal_ns:destroy(Ns),
+    ok = arinsal_ns:destroy(Ns),
+    Reasons = [receive {'DOWN', R, process, _, Why} -> Why after 3000 -> timeout end || R <- Refs],
+    After = (catch arinsal_ns:spawn(Ns, erlang, self, [])),
+    case {length(Pids), lists:usort(Reasons), ns_pids(Ns), After} of
+        {3, [killed], [], {'EXIT', {badarg, _}}} -> ok;
+        Other -> {bad, Other}
+    end.
+
+run_fun(Fun) -> Fun().
 "#;
 
 fn run(entry: &str) {
@@ -155,4 +264,39 @@ fn ns_root_can_send_into_ns() {
 #[test]
 fn ns_link_cross_ns_noproc() {
     run("ns_link_cross_ns_noproc");
+}
+
+#[test]
+fn ns_root_requests_reply() {
+    run("ns_root_requests_reply");
+}
+
+#[test]
+fn ns_request_to_root_refused() {
+    run("ns_request_to_root_refused");
+}
+
+#[test]
+fn ns_alias_gen_server() {
+    run("ns_alias_gen_server");
+}
+
+#[test]
+fn ns_shared_root_reachable() {
+    run("ns_shared_root_reachable");
+}
+
+#[test]
+fn ns_unshared_root_unreachable() {
+    run("ns_unshared_root_unreachable");
+}
+
+#[test]
+fn ns_natives_root_only() {
+    run("ns_natives_root_only");
+}
+
+#[test]
+fn ns_destroy_kills_all() {
+    run("ns_destroy_kills_all");
 }

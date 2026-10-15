@@ -6888,6 +6888,9 @@ impl arinsal_sched::SignalMessage for Message {
     fn timer_ref_key(&self) -> Option<u64> {
         self.timer_id
     }
+    fn via_alias(&self) -> bool {
+        self.alias != 0
+    }
 }
 
 impl Message {
@@ -7089,7 +7092,7 @@ impl Task for Process {
             return;
         };
         for (requester, reply) in literal_replies {
-            let _ = scheduler.send(pid, requester, reply);
+            let _ = scheduler.send_runtime(pid, requester, reply);
         }
         for (requester, id) in unlink_acks {
             let _ = scheduler.signal(pid, requester, Signal::UnlinkAckSignal(id));

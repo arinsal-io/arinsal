@@ -3,6 +3,7 @@
 //! Namespace 0 is root and has no entry. Ids are handed out in order and never reused on a
 //! node, so a stale id cannot name a later namespace.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// No cap.
@@ -17,6 +18,7 @@ pub(crate) struct NsEntry {
     /// Caps from `create/3`; enforcement comes with the accounting step.
     pub(crate) max_processes: u64,
     pub(crate) max_bytes: u64,
+    alive: AtomicBool,
 }
 
 /// The namespaces of a node.
@@ -41,6 +43,7 @@ impl NsTable {
             project,
             max_processes,
             max_bytes,
+            alive: AtomicBool::new(true),
         });
         entries.push(entry.clone());
         entry
@@ -54,5 +57,19 @@ impl NsTable {
             .unwrap_or_else(|e| e.into_inner())
             .get(index)
             .cloned()
+    }
+}
+
+impl NsTable {
+    /// The entry of `id` while it is alive.
+    pub(crate) fn live(&self, id: u32) -> Option<Arc<NsEntry>> {
+        self.get(id)
+            .filter(|entry| entry.alive.load(Ordering::Acquire))
+    }
+
+    /// Mark `id` destroyed. False when it was unknown or already destroyed.
+    pub(crate) fn close(&self, id: u32) -> bool {
+        self.get(id)
+            .is_some_and(|entry| entry.alive.swap(false, Ordering::AcqRel))
     }
 }
