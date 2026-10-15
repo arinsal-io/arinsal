@@ -196,6 +196,57 @@ pub struct Process {
     pub(crate) receive_deadline: Option<std::time::Instant>,
     pub(crate) receive_deadline_ms: Option<u64>,
     pub(crate) cold: Option<Box<ProcessCold>>,
+    // Supervision state and the signal probe stay on the process: nearly every process links,
+    // monitors or receives, and empty trees do not allocate, so `ProcessCold` is only
+    // allocated for the rare states.
+    /// Link halves retained until the matching unlink acknowledgement arrives.
+    pub(crate) unlinking: std::collections::BTreeMap<u64, arinsal_sched::Pid>,
+    pub(crate) links: std::collections::BTreeSet<arinsal_sched::Pid>,
+    /// Links created with `link/2` `[priority]` — EXIT messages from these are priority.
+    pub(crate) prio_links: std::collections::BTreeSet<arinsal_sched::Pid>,
+    /// Origin half of each local monitor, keyed by reference (erts `ERTS_P_MONITORS`).
+    pub(crate) monitors: std::collections::BTreeMap<u64, OriginHalf>,
+    /// Monitors created with the `priority` option; their DOWN messages are priority. Kept for
+    /// every monitor kind, since the origin decides priority when it receives the DOWN.
+    pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
+    /// Target half of each local monitor on this process (erts `ERTS_P_LT_MONITORS`).
+    pub(crate) monitored_by: std::collections::BTreeMap<u64, TargetHalf>,
+    /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
+    pub(crate) signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
+    /// Number of priority messages at the front of the private mailbox.
+    pub(crate) prio_len: usize,
+    /// Saved ordinary-message cursor while a newly arrived priority section is scanned.
+    pub(crate) priority_resume_cursor: Option<usize>,
+    /// A native `wait`/`wait_timeout` asked the scheduler to sleep (timeout in ms, `None` for
+    /// `infinity`); the process resumes at the native `loop_rec` label.
+    pub(crate) native_wait: Option<Option<u64>>,
+    /// Pc of the native instruction that raised the exception being dispatched (0 if none).
+    pub(crate) native_error_pc: usize,
+    /// Remaining time computed by a native `wait_timeout`, consumed by the following wait.
+    pub(crate) native_wait_timeout: Option<u64>,
+    /// The pending native wait belongs to a receive without clauses.
+    pub(crate) native_wait_self: bool,
+    /// Native `loop_rec` scheduled out so the scheduler fetches the outer signal queue.
+    pub(crate) native_signal_fetch: bool,
+    /// Native `recv_marker_reserve` exited for the scheduler to fetch the outer signal queue.
+    pub(crate) native_reserve_fetch: bool,
+    /// The next native entry resumes a raw continuation already on the stack.
+    pub(crate) native_continuation_resume: bool,
+    /// Live X registers of the resumed native continuation plus one; 0 means the function
+    /// arity (yield resume).
+    pub(crate) native_resume_live: u8,
+    /// Export dispatch to redo after the process wakes from a parked native BIF call.
+    pub(crate) native_retry: Option<usize>,
+    /// The current apply comes from native code, whose call site names the caller frame.
+    pub(crate) native_apply: bool,
+    /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
+    pub(crate) native_call_pc: usize,
+    /// Return address and call site of the native call that `native_retry` redoes.
+    pub(crate) native_retry_site: Option<(usize, usize)>,
+    /// The interpreter returned only to hand control to `native_pc`; the slice continues.
+    pub(crate) native_transfer: bool,
+    /// Native continuation to install after an interpreted external call returns.
+    pub(crate) native_resume_after_call: Option<usize>,
     /// `p->group_leader`. Kept on the process so a spawn does not allocate `ProcessCold`.
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
     /// `p->parent` (erl_process.c:12756): the spawning process, `None` (`undefined`) for the
@@ -715,8 +766,6 @@ pub(crate) struct ProcessCold {
     pub(crate) max_heap: crate::process::MaxHeap,
     /// `process_flag(save_calls, N)` buffer (erts `ERTS_PSD_SAVED_CALLS_BUF`).
     pub(crate) saved_calls: Option<crate::trace::SavedCalls>,
-    /// Link halves retained until the matching unlink acknowledgement arrives.
-    pub(crate) unlinking: std::collections::BTreeMap<u64, arinsal_sched::Pid>,
     /// The process already exited while its dirty job keeps running.
     /// Port of erl_process.c:10096 (`need_forced_exit`), OTP-29.1.1.
     pub(crate) dirty_exited: bool,
@@ -735,30 +784,12 @@ pub(crate) struct ProcessCold {
     /// One-based id of the scheduler running this process, like `erts_get_scheduler_id()`
     /// for events raised outside a scheduler context (GC trace).
     pub(crate) scheduler_id: usize,
-    /// Number of priority messages at the front of the private mailbox.
-    pub(crate) prio_len: usize,
-    /// Saved ordinary-message cursor while a newly arrived priority section is scanned.
-    pub(crate) priority_resume_cursor: Option<usize>,
-    /// The next native entry resumes a raw continuation already on the stack.
-    pub(crate) native_continuation_resume: bool,
-    /// Live X registers of the resumed native continuation plus one; 0 means the function
-    /// arity (yield resume).
-    pub(crate) native_resume_live: u8,
-    /// A native `wait`/`wait_timeout` asked the scheduler to sleep (timeout in ms, `None` for
-    /// `infinity`); the process resumes at the native `loop_rec` label.
-    pub(crate) native_wait: Option<Option<u64>>,
-    /// Export dispatch to redo after the process wakes from a parked native BIF call.
-    pub(crate) native_retry: Option<usize>,
     /// The traced function (by pc), actions and return value of a native trace frame whose
     /// return events the executor emits.
     pub(crate) native_return_events: Option<NativeReturnEvents>,
     /// Sessions whose return_to frame a traced BIF raised through; the exception's catch
     /// reports their return_to events.
     pub(crate) bif_return_to: Vec<u64>,
-    /// Pc of the native instruction that raised the exception being dispatched (0 if none).
-    pub(crate) native_error_pc: usize,
-    /// The current apply comes from native code, whose call site names the caller frame.
-    pub(crate) native_apply: bool,
     /// Call site (module, ip) of a traced native BIF whose call event was emitted and which
     /// yielded before finishing, with the trace actions its return events still need.
     /// Native code ran `timeout` while tracing is active; the executor emits the receive event.
@@ -774,20 +805,8 @@ pub(crate) struct ProcessCold {
     pub(crate) trace_flags: (u64, Vec<(u64, u64)>),
     /// Meta tracers named by return frames on the stack, one entry per frame.
     pub(crate) meta_frames: Vec<std::sync::Arc<crate::trace_bp::MetaTracer>>,
-    /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
-    pub(crate) native_call_pc: usize,
     /// `error_info` of the current native exception (erts keeps it with the stack trace).
     pub(crate) native_error_info: Option<Box<arinsal_etf::OwnedTerm>>,
-    /// Remaining time computed by a native `wait_timeout`, consumed by the following wait.
-    pub(crate) native_wait_timeout: Option<u64>,
-    /// The pending native wait belongs to a receive without clauses.
-    pub(crate) native_wait_self: bool,
-    /// Native `loop_rec` scheduled out so the scheduler fetches the outer signal queue.
-    pub(crate) native_signal_fetch: bool,
-    /// Native `recv_marker_reserve` exited for the scheduler to fetch the outer signal queue.
-    pub(crate) native_reserve_fetch: bool,
-    /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
-    pub(crate) signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
     /// The last slice ended because the process is suspended, not because it waits in a
     /// receive: it stays active (runnable once resumed).
     pub(crate) suspend_parked: bool,
@@ -800,15 +819,9 @@ pub(crate) struct ProcessCold {
     /// Static NIF identity, native return point and target scheduler class of a NIF call
     /// (or `enif_schedule_nif` continuation) waiting for a scheduler of that class.
     pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,
-    /// Return address and call site of the native call that `native_retry` redoes.
-    pub(crate) native_retry_site: Option<(usize, usize)>,
-    /// The interpreter returned only to hand control to `native_pc`; the slice continues.
-    pub(crate) native_transfer: bool,
     /// A system task woke the process while it was executing; it runs at the next scheduling
     /// point instead.
     pub(crate) sys_tasks_deferred: bool,
-    /// Native continuation to install after an interpreted external call returns.
-    pub(crate) native_resume_after_call: Option<usize>,
     /// The BIF failure behind the current native exception, so the scheduler can name the BIF
     /// and its arguments as the top frame (erts passes the MFA to `raise_exception`).
     pub(crate) native_bif_error: Option<NativeBifError>,
@@ -873,11 +886,6 @@ pub(crate) struct ProcessCold {
     pub(crate) parent_external: Option<arinsal_etf::OwnedTerm>,
     pub(crate) receive_markers: Option<Box<receive::ReceiveMarkers>>,
     pub(crate) receive_marker_uniq: i64,
-    pub(crate) links: std::collections::BTreeSet<arinsal_sched::Pid>,
-    /// Links created with `link/2` `[priority]` — EXIT messages from these are priority.
-    pub(crate) prio_links: std::collections::BTreeSet<arinsal_sched::Pid>,
-    /// Origin half of each local monitor, keyed by reference (erts `ERTS_P_MONITORS`).
-    pub(crate) monitors: std::collections::BTreeMap<u64, OriginHalf>,
     /// Remote-process monitors. `demonitor` of any other ref does not take the
     /// node-table lock: erts finds `ERTS_MON_TYPE_DIST_PROC` in this process's
     /// own monitor tree (`bif.c` `demonitor`), not in a global scan.
@@ -886,11 +894,6 @@ pub(crate) struct ProcessCold {
     /// The target half lives on the port (`ERTS_P_LT_MONITORS`).
     /// Port of `ERTS_MON_TYPE_PORT` in `ERTS_P_MONITORS` (`bif.c` `monitor`), OTP-29.1.1.
     pub(crate) port_monitors: std::collections::BTreeMap<u64, u64>,
-    /// Monitors created with the `priority` option; their DOWN messages are priority. Kept for
-    /// every monitor kind, since the origin decides priority when it receives the DOWN.
-    pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
-    /// Target half of each local monitor on this process (erts `ERTS_P_LT_MONITORS`).
-    pub(crate) monitored_by: std::collections::BTreeMap<u64, TargetHalf>,
     /// Target halves of NIF resource monitors (erts `ERTS_MON_TYPE_RESOURCE` in `ERTS_P_LT_MONITORS`).
     pub(crate) resource_monitors:
         std::collections::BTreeMap<u64, std::sync::Arc<arinsal_nif::ResourceMonitor>>,
@@ -1395,6 +1398,29 @@ impl Process {
             receive_deadline: None,
             receive_deadline_ms: None,
             cold: None,
+            unlinking: Default::default(),
+            links: Default::default(),
+            prio_links: Default::default(),
+            monitors: Default::default(),
+            prio_monitors: Default::default(),
+            monitored_by: Default::default(),
+            signal_probe: None,
+            prio_len: 0,
+            priority_resume_cursor: None,
+            native_wait: None,
+            native_error_pc: 0,
+            native_wait_timeout: None,
+            native_wait_self: false,
+            native_signal_fetch: false,
+            native_reserve_fetch: false,
+            native_continuation_resume: false,
+            native_resume_live: 0,
+            native_retry: None,
+            native_apply: false,
+            native_call_pc: 0,
+            native_retry_site: None,
+            native_transfer: false,
+            native_resume_after_call: None,
             group_leader: None,
             parent: None,
             // arl: code domains.

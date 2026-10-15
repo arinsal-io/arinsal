@@ -652,8 +652,8 @@ pub(crate) fn commit_catch(
     process.sync_native_header();
     match found.target {
         CatchTarget::Native(handler) => {
-            process.cold_mut().native_continuation_resume = true;
-            process.cold_mut().native_resume_live = 5;
+            process.native_continuation_resume = true;
+            process.native_resume_live = 5;
             CatchHandler::Native(handler)
         }
         CatchTarget::Interpreted { module, ip } => {
@@ -976,23 +976,15 @@ pub fn run_native(
             process.heap.frame_pointer()
         );
     }
-    if let Some(cold) = process.cold.as_mut() {
-        cold.native_error_pc = 0;
-    }
+    process.native_error_pc = 0;
     registers.tmp_mem[6] = 0;
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     registers.tmp_mem[5] =
         crate::native_helpers::arinsal_beamasm_native_trace_return as *const () as usize as u64;
-    let resuming_continuation = process
-        .cold
-        .as_mut()
-        .is_some_and(|cold| std::mem::take(&mut cold.native_continuation_resume));
+    let resuming_continuation = std::mem::take(&mut process.native_continuation_resume);
     // A resumed call return has only x0 live and an exception handler x0..x3, whatever
     // the arity of the function the native code belongs to.
-    let resume_live = process
-        .cold
-        .as_mut()
-        .map_or(0, |cold| std::mem::take(&mut cold.native_resume_live));
+    let resume_live = std::mem::take(&mut process.native_resume_live);
     // Port of erts/emulator/beam/erl_process.c:10550 and jit/arm/process_main.cpp (a process
     // resumes with the `c_p->arity` live registers its yield site saved), OTP-29.1.1: only a
     // call entry needs the function's arity from the code registry.
@@ -1120,7 +1112,7 @@ pub fn run_native(
     // A VM-backed light BIF leaves TRAP for the scheduler when it exits native code.
     // A call handed to the scheduler keeps its call site too, for a BIF that raises there.
     if process.header.freason != 0 || matches!(exit, ExitReason::CallUnported { .. }) {
-        process.cold_mut().native_error_pc = registers.tmp_mem[6] as usize;
+        process.native_error_pc = registers.tmp_mem[6] as usize;
     }
     if process.header.freason != 0 && process.header.freason != 1 << 10 && exception_trace {
         eprintln!(
@@ -1313,9 +1305,9 @@ pub fn run_native(
                 // be shorter than `c_p->arity` when `process.module` is not the
                 // yielding function's module; copying them here is what the save keeps.
                 publish_yield_xregs(process, registers);
-                process.cold_mut().native_continuation_resume = true;
+                process.native_continuation_resume = true;
                 // The yield site stored its live X register count in `c_p->arity`.
-                process.cold_mut().native_resume_live = process.header.arity.saturating_add(1);
+                process.native_resume_live = process.header.arity.saturating_add(1);
                 // Signal-time GC while switched out roots exactly these registers.
                 process.gc_live = usize::from(process.header.arity);
                 process.native_pc = Some(if resume == 0 {

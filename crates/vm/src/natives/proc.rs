@@ -796,16 +796,13 @@ fn process_info_item_dictionary(process: &mut Process) -> Result<Term, VmError> 
 #[inline(never)]
 fn process_info_item_links(process: &mut Process, pid: Pid) -> Result<Term, VmError> {
     Ok({
-        let links = process
-            .cold
-            .as_ref()
-            .map(|cold| {
-                cold.links
-                    .iter()
-                    .filter_map(|p| p.to_term())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let links = {
+            process
+                .links
+                .iter()
+                .filter_map(|p| p.to_term())
+                .collect::<Vec<_>>()
+        };
         let mut links = links;
         links.extend(crate::port::linked_ports(process, pid));
         make_list(process, links)?
@@ -815,16 +812,13 @@ fn process_info_item_links(process: &mut Process, pid: Pid) -> Result<Term, VmEr
 #[inline(never)]
 fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, VmError> {
     Ok({
-        let raw = process
-            .cold
-            .as_ref()
-            .map(|cold| {
-                cold.monitors
-                    .values()
-                    .filter_map(|half| half.target.to_term())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let raw = {
+            process
+                .monitors
+                .values()
+                .filter_map(|half| half.target.to_term())
+                .collect::<Vec<_>>()
+        };
         let vals = raw
             .into_iter()
             .map(|p| make_tuple(process, &[atom("process"), p]))
@@ -847,16 +841,13 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
 #[inline(never)]
 fn process_info_item_monitored_by(process: &mut Process, pid: Pid) -> Result<Term, VmError> {
     Ok({
-        let vals = process
-            .cold
-            .as_ref()
-            .map(|cold| {
-                cold.monitored_by
-                    .values()
-                    .filter_map(|half| half.origin.to_term())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let vals = {
+            process
+                .monitored_by
+                .values()
+                .filter_map(|half| half.origin.to_term())
+                .collect::<Vec<_>>()
+        };
         let mut vals = vals;
         vals.extend(crate::port::driver_monitoring_ports(process, pid));
         // Resource monitors are in the same monitor tree (ERTS_MON_TYPE_RESOURCE).
@@ -1503,7 +1494,7 @@ fn dictionary_lookup(selector: Term) -> Option<(Term, Term)> {
 pub(crate) fn native_call_site(
     process: &Process,
 ) -> Option<(crate::native_bridge::NativeFunction, usize)> {
-    let pc = process.cold.as_ref()?.native_call_pc;
+    let pc = process.native_call_pc;
     if pc == 0 {
         return None;
     }
@@ -1559,9 +1550,7 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         return Ok((module.to_owned(), function.to_owned(), arity));
     }
     // A send suspended on a busy port yields to the send/2 export (bif.c:2581 SEND_YIELD).
-    if process.cold.as_ref().and_then(|cold| cold.native_retry)
-        == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY)
-    {
+    if process.native_retry == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY) {
         return Ok(("erlang".to_owned(), "send".to_owned(), 2));
     }
     if crate::signals::is_waiting_for_process_info(process) {
@@ -1660,7 +1649,7 @@ fn backtrace_with(
         .native_pc
         .filter(|pc| crate::native_bridge::is_native_function_at(*pc))
         .or_else(|| {
-            let pc = process.cold.as_ref()?.native_call_pc;
+            let pc = process.native_call_pc;
             let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
             let pc = if pc & tag != 0 { (pc & !tag) - 1 } else { pc };
             (pc != 0 && crate::native_bridge::is_native_function_at(pc)).then_some(pc)
@@ -1855,11 +1844,7 @@ pub(crate) fn process_info_light(
     // The process's own signal probe answers without the table lookup: erts reads the
     // `ERTS_PSFLG_SIG_IN_Q` and `ERTS_PSFLG_SUSPENDED` bits of the caller's state word. The
     // table is the fallback.
-    let busy = match process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.signal_probe.as_ref())
-    {
+    let busy = match process.signal_probe.as_ref() {
         Some(probe) => {
             probe.has_pending()
                 || probe

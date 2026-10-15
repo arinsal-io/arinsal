@@ -204,12 +204,11 @@ pub extern "C" fn arinsal_beamasm_recv_marker_reserve(header: *mut ProcessHeader
     // there (or a process without a probe yet) send the instruction to the scheduler, which
     // fetches and reruns it.
     let pending = process
-        .cold
+        .signal_probe
         .as_ref()
-        .and_then(|cold| cold.signal_probe.as_ref())
         .is_none_or(arinsal_sched::SignalProbe::has_pending);
     if pending {
-        process.cold_mut().native_reserve_fetch = true;
+        process.native_reserve_fetch = true;
         return u64::from(arinsal_beamasm::receive::RECV_MARKER_FETCH);
     }
     match process.reserve_receive_marker() {
@@ -271,13 +270,12 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     // installs it.
     if !process.sig_cont_empty() {
         process.delay_gc = false;
-        process.cold_mut().native_signal_fetch = true;
+        process.native_signal_fetch = true;
         return u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH);
     }
     let pending = process
-        .cold
+        .signal_probe
         .as_ref()
-        .and_then(|cold| cold.signal_probe.as_ref())
         .is_none_or(arinsal_sched::SignalProbe::has_pending);
     if !pending {
         process.delay_gc = false;
@@ -301,14 +299,13 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     // outer queue is handled by the scheduler.
     if fetched.is_ok()
         && process
-            .cold
+            .signal_probe
             .as_ref()
-            .and_then(|cold| cold.signal_probe.as_ref())
             .is_some_and(|probe| !probe.has_pending())
     {
         return 0;
     }
-    process.cold_mut().native_signal_fetch = true;
+    process.native_signal_fetch = true;
     u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH)
 }
 
@@ -353,10 +350,9 @@ pub extern "C" fn arinsal_beamasm_wait(header: *mut ProcessHeader, resume: usize
     if let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) {
         // Port of erts/emulator/beam/emu/msg_instrs.tab:110 (wait clears F_DELAY_GC), OTP-29.1.1.
         process.delay_gc = false;
-        let cold = process.cold_mut();
-        let timeout = cold.native_wait_timeout.take();
-        cold.native_wait = Some(timeout);
-        cold.native_wait_self = resume & 1 != 0;
+        let timeout = process.native_wait_timeout.take();
+        process.native_wait = Some(timeout);
+        process.native_wait_self = resume & 1 != 0;
     }
 }
 
@@ -375,7 +371,7 @@ pub extern "C" fn arinsal_beamasm_wait_timeout(
     match process.wait_timeout(crate::native_hooks::from_raw(timeout)) {
         Ok(Some(0)) => 0,
         Ok(remaining) => {
-            process.cold_mut().native_wait_timeout = remaining;
+            process.native_wait_timeout = remaining;
             1
         }
         Err(_) => {
@@ -3997,11 +3993,9 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         }
     };
     crate::stacktrace::clear_pending_top(process);
-    if let Some(cold) = process.cold.as_mut() {
-        // The branch below resumes the handler. The scheduler must not treat
-        // the next native exit as a continuation resume.
-        cold.native_continuation_resume = false;
-    }
+    // The branch below resumes the handler. The scheduler must not treat
+    // the next native exit as a continuation resume.
+    process.native_continuation_resume = false;
     let live = process.x.len().min(4);
     registers.x_reg_array[..live].copy_from_slice(&process.x[..live]);
     handler

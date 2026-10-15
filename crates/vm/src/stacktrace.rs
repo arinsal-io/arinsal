@@ -1512,7 +1512,7 @@ pub(super) fn build(
 ) -> Result<Term, VmError> {
     // A process inside a native BIF call raises at that call's pc, as in `exceptions.rs`.
     let trapped = p.header.i as usize == crate::bif_traps::bif_export_trap_pc();
-    let native_pc = p.cold.as_ref().map_or(0, |cold| cold.native_call_pc);
+    let native_pc = p.native_call_pc;
     let native_pc = if trapped {
         None
     } else if native_pc != 0 && crate::native_bridge::is_native_function_at(native_pc) {
