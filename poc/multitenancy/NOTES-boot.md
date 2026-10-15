@@ -143,6 +143,56 @@ calls `erlang:memory/0` from a helper with a 1 s timeout and prints the stall co
 pending file-server write at the end (`erlang:memory stalls: N`); 4 of 4 runs passed with it,
 one of them reporting 3 stalls and a 1 s pending write.
 
+## Chunk 3: virtual schedulers, app trimming, boot breakdown, 100 namespaces
+
+- Runtime: `arinsal_ns:create/3` takes `schedulers => N` (1 to 1024, default 1); for a process of
+  the namespace `erlang:system_info(schedulers)` and `system_info(schedulers_online)` answer N
+  (hook `// arl:` in natives/sys.rs, `arl_ns_schedulers`). `info/1` reports `schedulers`. Root is
+  unchanged. Test: `cargo test -p arinsal-vm --test ns_system_info`
+  (`ns_system_info_virtual_schedulers`). With the default, Plug.Upload starts one partition and a
+  bench/rest namespace has 84 processes (101 before).
+- `arinsal_ns_boot:trim/1` (applied by `prepare/1` and `start/3`) keeps the closure of
+  `applications` and `included_applications` from the release's own app plus kernel and stdlib;
+  apps outside it and their modules are dropped. For bench/rest that drops sasl
+  (`release_handler`, 47 modules); ssl, public_key, asn1 and crypto stay because
+  thousand_island lists ssl.
+- Each boot logs `[ns_boot] booted in T ms: load L, kernel K, apps A, other O` to the project's
+  group leader; `start/3` leaves the map in the caller's dictionary
+  (`{arinsal_ns_boot, last_timing}`).
+
+### 100 namespaces of bench/rest (`ns_boot_density.sh 100`)
+
+All 100 answered `/t/1/items/1` with 200; `init:stop()` in ns 1 destroyed only ns 1.
+
+| | p50 | p99 |
+|---|---|---|
+| boot, root call to ready (projects 2..100) | 339 ms | 624 ms |
+| `prepare/1` in root (trim, md5 of the dependency beams, hash, dep domain lookup) | 243 ms | |
+| load of the project's own modules in the namespace | 8 ms | |
+| kernel subset (logger_server, application_controller, kernel app) | 1 ms | |
+| apps load and start | 47 ms | |
+| processes per namespace | 84 | |
+| code per namespace (projects 2..15, see below) | 92 KB | |
+| namespace heap (`heap_words`, as of each process's last GC) | 435 KB | |
+| namespace ETS (`ets_words`) | 166 KB | |
+
+| namespaces | erlang:memory(total) | RSS |
+|---|---|---|
+| 0 | 9.4 MB | 154 MB |
+| 1 | 36.1 MB | 388 MB |
+| 10 | 38.2 MB | 454 MB |
+| 100 | stalled | 838 MB |
+
+- Boot time is dominated by `prepare/1` in root: it reads every dependency beam to compute the
+  md5 set even when the dep domain already exists. Caching the plan's hash per release
+  directory (or per tarball digest) would bring a repeat boot to about 60 ms. The in-namespace
+  module load is already small (8 ms) because dependencies are md5 no-ops in the dep domain.
+- `erlang:memory/1` stalled from the 16th namespace on (and the per-namespace GC requests the
+  first version of the script sent stalled the driver after one boot), so the total at 100 and
+  the code deltas after ns 15 are missing. RSS grows by about 4.3 MB per namespace between 10
+  and 100, which is far above the ~0.7 MB of heap, ETS and code the namespace accounts for;
+  not investigated (allocator retention, interpreted-code metadata or per-process overhead).
+
 ## Gaps
 
 - `code:priv_dir/1`, `code:lib_dir/1` answer with root's view; release `priv` dirs are unknown
@@ -161,5 +211,5 @@ export PATH=/Users/sts/dev/sq/arinsal-prs/bin:/opt/homebrew/opt/erlang@29/bin:/o
 CARGO_TARGET_DIR=/Users/sts/dev/sq/arinsal-prs/target-mt-boot cargo build --release -p arinsal-cli
 ln -sf /Users/sts/dev/sq/arinsal-prs/target-mt-boot/release/arinsal /Users/sts/dev/sq/arinsal-prs/mt-shim-boot/erl
 poc/multitenancy/tests/ns_boot_e2e.sh            # REST_RELEASE=<built release> skips the stock build
-REST_RELEASE=<built release> poc/multitenancy/tests/ns_boot_density.sh 10
+REST_RELEASE=<built release> poc/multitenancy/tests/ns_boot_density.sh 100   # TIMEOUT_S, BASE_PORT, KEEP
 ```
