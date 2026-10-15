@@ -121,3 +121,57 @@ Findings:
    wakes its own scheduler.
 3. Keep the `persistent_term:put` once-per-second loop as the regression benchmark (target
    within 1.5x of 90 ms/min).
+
+## Step 4: persistent_term puts in namespaces
+
+Repro: `poc/multitenancy/bench/ptloop.erl` (`ptloop:root/0`, `ptloop:ns/1`): a loop (`persistent_term:put(clock, {I, "..."})` once per second, via
+`receive after 1000` since `timer:sleep` needs a root process); N namespaces from
+`arinsal_ns:create/3` + `arinsal_ns:spawn/4`, one looping process each. Idle CPU over 60 s windows,
+load average 6 to 15, alternating A/B runs.
+
+Premise check: a namespace store has no collector. `crates/pterm/src/lib.rs` (`arl_keep_alive`)
+keeps every retired area and old table alive, and the collector process only ever runs
+`release_area_switch` on the node store. So a namespace put never starts a literal round over
+all processes; there is nothing to scope with a namespace filter. Measured: root put 1/s costs
+~150 ms/min, 100 namespaces at 1 put/s each cost ~300 ms/min before this change, i.e. ~3 ms/min per
+put per second (about 50x cheaper than a root put). ERTS root reference: 90 ms/min.
+
+What the namespace put still paid for: it sent `copy_literals` to the node collector for an area
+the collector never looks at (the collector wakes, runs `release_area_switch` on the node store,
+and blocks thread progress for nothing).
+
+Change (`crates/vm/src/natives/sys.rs`, `PersistentTermUpdate::finish`): a namespace process
+(`process.ns != 0`) no longer wakes the collector. Root behavior is unchanged.
+
+| setup | before | after |
+|---|---|---|
+| 100 namespaces, 1 put/s each | 306 ms/min (280, 310, 330) | 83 ms/min (80, 70, 100) |
+| root, 1 put/s | ~145 | unchanged (not touched) |
+
+Root's cost is the literal round (collector -> signal to every process -> every scheduler
+wakes), which ERTS also does, so it is not a local fix.
+
+Tried and dropped: replacing the stop-the-world `block_thread_progress(ZERO)` in `finish` with
+a suspended updater plus `thread_progress_later` (the shape `suspend_for_code_barrier` uses).
+It gave no gain over the skip alone (103 vs 83 ms/min for 100 namespaces, no change at root)
+so it was not kept.
+
+Test note: `literal_gc::literals_stay_shared_across_spawn_send_and_copy_shared` (one scheduler) does
+not finish on this branch. It also hangs with the sleep spin change and the dirty-scheduler
+change both reverted and without the update-path change, so it is not caused by this stream;
+`literal_gc` `applied_get_all...` and `dirty_bif_results...` pass.
+
+Open findings:
+- Leak: each namespace put retains ~750 bytes for the life of the node (RSS +8.9 MB for 12000 puts
+  across 200 namespaces over 60 s). A clock refreshed once per second leaks ~65 MB/day per
+  namespace. Releasing namespace areas needs a collection scoped to the namespace's processes
+  (the filter asked for in step 1 belongs there, not on the node collector): when a namespace
+  store retires an area, visit only that namespace's processes with `LiteralAreaCopy`, then
+  free it. That is a feature, not a tweak; plan: per-store active area for namespace stores,
+  a Rust-side round over `process_pids_visible(ns)`, acknowledgement through the existing
+  `acknowledge_copied`.
+- ERTS does not skip the schedule of a process that does not reference the area: the copy
+  request is a signal that the process handles on its own scheduler (`proc_queue_signal` with
+  the adjust-message-queue op), so a process that does not reference the area still gets
+  scheduled. That part is the same as here.
+- Not investigated: why the root round wakes 12 schedulers here and about 4 under ERTS.

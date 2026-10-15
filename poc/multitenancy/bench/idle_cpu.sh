@@ -16,7 +16,7 @@ cpu_ms() { ps -o time= -p "$1" | tr -d ' ' | to_ms; }
 cd "$HERE/rest"
 PATH="$SHIM:$PATH" MIX_ENV=prod RT_PORT=$PORT RT_TENANTS=$TENANTS mix run --no-halt >"${TMPDIR:-/tmp}/idle_cpu_app.log" 2>&1 &
 MIX=$!
-trap 'kill $MIX 2>/dev/null || true; pkill -P $MIX 2>/dev/null || true; lsof -ti tcp:$PORT -sTCP:LISTEN | xargs kill 2>/dev/null || true' EXIT
+trap 'kill -9 $MIX 2>/dev/null || true; pkill -9 -P $MIX 2>/dev/null || true; lsof -ti tcp:$PORT -sTCP:LISTEN | xargs kill -9 2>/dev/null || true' EXIT
 
 for _ in $(seq 1 300); do
   curl -fs "http://127.0.0.1:$PORT/ready" >/dev/null 2>&1 && break

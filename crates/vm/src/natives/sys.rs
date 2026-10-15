@@ -711,7 +711,8 @@ impl PersistentTermUpdate {
             // erl_bif_persistent.c:1175 (`table_updater`), OTP-29.1.1.
             store.reclaim_old_tables();
         }
-        if store.retired_generation() != self.retired {
+        // arl: a namespace store has no collector, so its retired areas wake nobody.
+        if process.ns == 0 && store.retired_generation() != self.retired {
             // Port of erts/emulator/beam/beam_bif_load.c:2341 (erts_queue_release_literals),
             // OTP-29.1.1: every queued area sends `copy_literals` to the collector.
             wake_literal_collector(process, ctx);
