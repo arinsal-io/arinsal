@@ -485,6 +485,82 @@ ns_rootonly_module_info_allowed() ->
         Other -> {bad, Other}
     end.
 
+ns_shared_messages_and_monitor_only() ->
+    Ns = mk(<<"acme">>),
+    Me = self(),
+    Shared = spawn(fun() -> process_flag(trap_exit, false), shared_loop(Me) end),
+    ok = arinsal_ns:expose(Shared),
+    Res = in_ns(Ns, fun() ->
+        process_flag(trap_exit, true),
+        Shared ! hello,
+        Ref = erlang:monitor(process, Shared),
+        _ = catch link(Shared),
+        Linked = receive {'EXIT', Shared, LinkWhy} -> LinkWhy after 1000 -> established end,
+        exit(Shared, kill),
+        exit(Shared, die),
+        receive after 200 -> ok end,
+        Down = receive {'DOWN', Ref, process, Shared, Why} -> Why after 0 -> alive end,
+        {Linked, Down}
+    end),
+    receive {shared_got, hello} -> ok after 2000 -> exit(no_hello) end,
+    Alive = is_process_alive(Shared),
+    Shared ! stop,
+    case {Res, Alive} of
+        {{noproc, alive}, true} -> ok;
+        Other -> {bad, Other}
+    end.
+
+shared_loop(Root) ->
+    receive
+        stop -> ok;
+        {stop, _} -> ok;
+        M -> Root ! {shared_got, M}, shared_loop(Root)
+    end.
+
+ns_link_refused_leaves_no_exit() ->
+    N1 = mk(<<"acme">>),
+    N2 = mk(<<"globex">>),
+    {V, RV} = start_in(N2, fun() ->
+        process_flag(trap_exit, true),
+        receive stop -> receive {'EXIT', P, R} -> {exit_seen, P, R} after 0 -> clean end end
+    end),
+    V ! go,
+    _ = in_ns(N1, fun() ->
+        process_flag(trap_exit, true),
+        catch link(V),
+        receive after 100 -> ok end,
+        exit(boom)
+    end),
+    receive after 300 -> ok end,
+    V ! stop,
+    case await(V, RV) of
+        clean -> ok;
+        Other -> {bad, Other}
+    end.
+
+ns_monitor_refused_never_attaches() ->
+    N1 = mk(<<"acme">>),
+    N2 = mk(<<"globex">>),
+    Case = fun(Fun) ->
+        {V, RV} = start_in(N2, fun() -> receive stop -> process_info(self(), monitored_by) end end),
+        V ! go,
+        in_ns(N1, fun() -> Fun(V) end),
+        V ! stop,
+        {monitored_by, L} = await(V, RV),
+        length(L)
+    end,
+    Counts = [Case(fun(V) -> erlang:monitor(process, V) end),
+     Case(fun(V) -> [erlang:monitor(process, V) || _ <- [1, 2, 3]] end),
+     Case(fun(V) -> erlang:monitor(process, list_to_pid("<0.1.0>")), erlang:monitor(process, V) end),
+     Case(fun(V) -> erlang:monitor(process, V), erlang:monitor(process, list_to_pid("<0.1.0>")) end),
+     Case(fun(V) -> erlang:monitor(process, V), receive after 50 -> ok end end),
+     Case(fun(V) -> erlang:monitor(process, V), V ! x end),
+     Case(fun(V) -> erlang:monitor(process, V), exit(V, foo) end)],
+    case Counts of
+        [1, 1, 1, 1, 1, 1, 1] -> ok;
+        Other -> {bad, Other}
+    end.
+
 ns_rootonly_natives_refused() ->
     Ns = mk(<<"acme">>),
     Table = in_ns(Ns, fun() ->
@@ -727,4 +803,19 @@ fn ns_spawn_opt_group_leader_foreign() {
 #[test]
 fn ns_rootonly_module_info_allowed() {
     run("ns_rootonly_module_info_allowed");
+}
+
+#[test]
+fn ns_shared_messages_and_monitor_only() {
+    run("ns_shared_messages_and_monitor_only");
+}
+
+#[test]
+fn ns_link_refused_leaves_no_exit() {
+    run("ns_link_refused_leaves_no_exit");
+}
+
+#[test]
+fn ns_monitor_refused_never_attaches() {
+    run("ns_monitor_refused_never_attaches");
 }
