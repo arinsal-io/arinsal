@@ -633,11 +633,7 @@ pub(crate) fn commit_catch(
     process
         .heap
         .set_stack_pointer(base.wrapping_add(found.resume));
-    if process.x.len() < 4 {
-        let mut registers = process.x.to_vec();
-        registers.resize(4, Term::NIL);
-        process.x = registers.into();
-    }
+    process.x.ensure_x(4);
     // Port of erts/emulator/beam/beam_common.c:541-544 (handle_error), OTP-29.1.1:
     // x0 = non-value marker, x1 = reason, x2 = raw stacktrace, x3 = class.
     process.x[0] = Term::catch(0);
@@ -1166,7 +1162,8 @@ pub fn run_native(
         process.header.freason = 0;
         let arity = native_function_at(registers.tmp_mem[6] as usize)
             .map_or(0, |function| usize::from(function.arity));
-        let args = process.x[..arity.min(process.x.len())].to_vec();
+        process.x.ensure_x(arity);
+        let args = process.x[..arity].to_vec();
         if exception_trace {
             eprintln!(
                 "native function_clause in {:?} args={:?}",
@@ -1372,11 +1369,7 @@ pub fn run_native(
 // roots `p->arity` X registers), OTP-29.1.1.
 fn publish_yield_xregs(process: &mut Process, registers: &SchedulerRegisters) {
     let live = usize::from(process.header.arity).min(registers.x_reg_array.len());
-    if process.x.len() < live {
-        let mut extended = process.x.to_vec();
-        extended.resize(live, Term::NIL);
-        process.x = extended.into();
-    }
+    process.x.ensure_x(live);
     for (destination, raw) in process
         .x
         .iter_mut()
