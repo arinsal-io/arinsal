@@ -1636,6 +1636,15 @@ impl ProcessHeap {
     pub fn bin_vheap_gc_due(&self) -> bool {
         self.owners.overhead > self.bin_vheap_size
     }
+
+    /// Whether the epilogue of a BIF call collects: collection is enabled and heap fragments
+    /// outgrew the free young area or the off-heap binary overhead passed its limit.
+    // Port of erts/emulator/beam/erl_gc.h (ERTS_IS_GC_DESIRED) and erl_gc.c
+    // (erts_gc_after_bif_call_lhf), OTP-29.1.1: one decision for both conditions, so a BIF
+    // that trips both is collected once.
+    pub fn gc_after_bif_desired(&self) -> bool {
+        self.gc_enabled && (self.gc_desired() || self.bin_vheap_gc_due())
+    }
 }
 impl Default for ProcessHeap {
     fn default() -> Self {

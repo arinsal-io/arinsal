@@ -3441,7 +3441,7 @@ fn process_bif_result(
     arity: usize,
     mut result: Result<Term, crate::exceptions::Trap>,
 ) -> u64 {
-    let collected = process.heap.gc_enabled && process.heap.gc_desired();
+    let collected = process.heap.gc_after_bif_desired();
     if collected {
         process
             .heap
@@ -3465,9 +3465,6 @@ fn process_bif_result(
     match result {
         Ok(value) => {
             let value = crate::native_hooks::raw(value);
-            if process.heap.gc_desired() || process.heap.bin_vheap_gc_due() {
-                return collect_after_plain_bif(process, registers, value);
-            }
             registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
             if collected {
                 process.sync_native_header();
@@ -3529,18 +3526,15 @@ fn plain_bif_result(
     arity: usize,
     mut result: Result<Term, arinsal_bifs::BifError>,
 ) -> u64 {
-    let collected = process.heap.gc_enabled && process.heap.gc_desired();
+    let collected = process.heap.gc_after_bif_desired();
     if collected && !gc_after_plain_bif(process, registers, arity, &mut result) {
         return 0;
     }
     match result {
         Ok(value) => {
             let value = crate::native_hooks::raw(value);
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif,
-            // ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: collect with the result as only root.
-            if process.heap.gc_desired() || process.heap.bin_vheap_gc_due() {
-                return collect_after_plain_bif(process, registers, value);
-            }
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif,
+            // ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: one test, so at most one collection.
             registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
             if collected {
                 process.sync_native_header();
@@ -3618,30 +3612,6 @@ fn gc_after_plain_bif(
         return false;
     }
     true
-}
-
-#[cold]
-#[inline(never)]
-fn collect_after_plain_bif(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    value: u64,
-) -> u64 {
-    process
-        .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
-    process.x[0] = value_term(value);
-    if process.collect_bin_vheap_if_due(1).is_err() {
-        crate::native_hooks::set_error(process, "system_limit");
-        registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
-        process.sync_native_header();
-        return 0;
-    }
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    let value = crate::native_hooks::raw(process.x[0]);
-    registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
-    process.sync_native_header();
-    value
 }
 
 #[cold]
@@ -3803,10 +3773,6 @@ fn publish_dispatch_x(
     {
         *destination = *term;
     }
-}
-
-fn value_term(value: u64) -> Term {
-    crate::native_hooks::from_raw(value)
 }
 
 /// Records a native BIF failure so the scheduler raises it with the BIF as the top frame.
