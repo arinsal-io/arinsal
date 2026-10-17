@@ -3617,16 +3617,20 @@ pub(crate) fn reply_request(
     if matches!(pending.op, RemoteOp::PrioSig) {
         return Ok(());
     }
-    let detached = matches!(pending.op, RemoteOp::Info { .. });
-    if detached {
-        process.heap.begin_detached();
-    }
-    let message = crate::natives::proc::fulfill_request(process, ctx, pending.id, pending.op)
-        .and_then(Message::copy_from);
-    if detached {
-        process.heap.end_detached();
-    }
-    let message = message?;
+    let message = if let RemoteOp::Collect { request_id, major } = pending.op {
+        crate::natives::proc::fulfill_collect(process, ctx, request_id, major)?
+    } else {
+        let detached = matches!(pending.op, RemoteOp::Info { .. });
+        if detached {
+            process.heap.begin_detached();
+        }
+        let message = crate::natives::proc::fulfill_request(process, ctx, pending.id, pending.op)
+            .and_then(Message::copy_from);
+        if detached {
+            process.heap.end_detached();
+        }
+        message?
+    };
     match ctx.send(pending.from, message) {
         Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(()),
         Err(error) => Err(VmError::Unsupported(format!("request reply: {error}"))),

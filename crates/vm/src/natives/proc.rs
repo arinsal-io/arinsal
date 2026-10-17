@@ -1181,14 +1181,18 @@ fn process_info_item_garbage_collection_info(
     process: &mut Process,
     reserve: usize,
 ) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/erl_gc.c (erts_process_gc_info): the rows are read while the
+    // result factory is open, so the heap top reads as the factory leaves it.
+    const RESULT_WORDS: usize = 11 * (3 + 2);
+    let words = process.heap.gc_info_words_with_result(RESULT_WORDS);
     let entries = [
-        ("old_heap_block_size", process.heap.old_heap_block_size()),
-        ("heap_block_size", process.heap.heap_size_words()),
-        ("mbuf_size", process.heap.fragment_words()),
-        ("recent_size", process.heap.recent_words()),
+        ("old_heap_block_size", words.old_heap_block_size),
+        ("heap_block_size", words.heap_block_size),
+        ("mbuf_size", words.mbuf_size),
+        ("recent_size", words.recent_size),
         ("stack_size", process.observed_stack_words()),
-        ("old_heap_size", process.heap.old_used_words()),
-        ("heap_size", process.heap.used_words()),
+        ("old_heap_size", words.old_heap_size),
+        ("heap_size", words.heap_size),
         ("bin_vheap_size", process.heap.bin_vheap_used() as usize),
         (
             "bin_vheap_block_size",
@@ -2285,6 +2289,31 @@ fn set_group_leader(process: &mut Process, leader: Pid) -> Result<(), VmError> {
     Ok(())
 }
 
+/// Run a `garbage_collect` system task on the target and build its reply.
+///
+/// Port of erts/emulator/beam/erl_process.c (`notify_sys_task_executed`), OTP-29.1.1: the
+/// reply is built in the reply message's own heap fragment after the collection, so the
+/// target's young heap holds only the survivors of the collection and no request reference
+/// before it.
+pub(crate) fn fulfill_collect(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    request_id: Message,
+    major: bool,
+) -> Result<Message, VmError> {
+    crate::natives::code::code_mod_permission_before_gc(process, ctx.pid());
+    let collected = collect_heap(process, major, &mut []);
+    crate::natives::code::code_mod_permission_after_gc(process, ctx.pid());
+    collected?;
+    process.heap.begin_detached();
+    let reply = request_id
+        .decode_into(process)
+        .and_then(|request_id| gc_message(process, request_id, true))
+        .and_then(Message::copy_from);
+    process.heap.end_detached();
+    reply
+}
+
 /// Answer a request signal on the target process.
 ///
 /// Port of erts/emulator/beam/erl_proc_sig_queue.c:6794 (handle_process_info)
@@ -2334,16 +2363,9 @@ pub(crate) fn fulfill_request(
             set_group_leader(process, leader)?;
             make_tuple(process, &[reference, atom("true")])
         }
-        crate::signals::RemoteOp::Collect { request_id, major } => {
-            // The id lives in the signal envelope, not in a GC root. Collect
-            // first, then install it on the heap the reply is built in.
-            crate::natives::code::code_mod_permission_before_gc(process, ctx.pid());
-            let collected = collect_heap(process, major, &mut []);
-            crate::natives::code::code_mod_permission_after_gc(process, ctx.pid());
-            collected?;
-            let request_id = request_id.decode_into(process)?;
-            gc_message(process, request_id, true)
-        }
+        crate::signals::RemoteOp::Collect { .. } => Err(VmError::Unsupported(
+            "garbage_collect system task is answered by fulfill_collect".into(),
+        )),
         crate::signals::RemoteOp::SystemTaskTest { request_id } => {
             let request_id = request_id.decode_into(process)?;
             make_tuple(
