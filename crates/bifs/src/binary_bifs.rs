@@ -790,6 +790,8 @@ pub struct IolistCopyWalk {
     source: Option<CopySource>,
     offset: usize,
     done_after_source: bool,
+    bit_mode: bool,
+    to_bit: usize,
 }
 
 struct CopySource {
@@ -807,6 +809,16 @@ impl IolistCopyWalk {
             source: None,
             offset: 0,
             done_after_source: false,
+            bit_mode: false,
+            to_bit: 0,
+        }
+    }
+
+    /// Start copying into a bit-addressed output, for `list_to_bitstring/1` (Unit 1).
+    pub fn new_bits(root: Term) -> Self {
+        Self {
+            bit_mode: true,
+            ..Self::new(root)
         }
     }
 
@@ -822,24 +834,34 @@ impl IolistCopyWalk {
                 let copy_limit = remaining.saturating_add(1).saturating_mul(32 * 8);
                 let copy_bits = source.remaining_bits.min(copy_limit);
                 let copy_bytes = copy_bits / 8;
-                let end = self
-                    .offset
-                    .checked_add(copy_bytes)
-                    .filter(|end| *end <= output.len())
-                    .ok_or((BifError::SystemLimit, yield_count))?;
-                copy_bitstring_range(
-                    source.term,
-                    source.bit_offset,
-                    &mut output[self.offset..end],
-                    copy_bits,
-                )
-                .map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
+                if self.bit_mode {
+                    let mut staged = SmallVec::<[u8; 64]>::new();
+                    staged.resize(copy_bits.div_ceil(8), 0);
+                    copy_bitstring_range(source.term, source.bit_offset, &mut staged, copy_bits)
+                        .map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
+                    or_bits_at(output, self.to_bit, &staged, copy_bits)
+                        .map_err(|error| (error, yield_count))?;
+                    self.to_bit += copy_bits;
+                } else {
+                    let end = self
+                        .offset
+                        .checked_add(copy_bytes)
+                        .filter(|end| *end <= output.len())
+                        .ok_or((BifError::SystemLimit, yield_count))?;
+                    copy_bitstring_range(
+                        source.term,
+                        source.bit_offset,
+                        &mut output[self.offset..end],
+                        copy_bits,
+                    )
+                    .map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
+                    self.offset = end;
+                }
                 source.bit_offset = source
                     .bit_offset
                     .checked_add(copy_bits)
                     .ok_or((BifError::SystemLimit, yield_count))?;
                 source.remaining_bits -= copy_bits;
-                self.offset = end;
                 if source.remaining_bits != 0 {
                     self.source = Some(source);
                     return Ok((false, yield_count));
@@ -869,7 +891,7 @@ impl IolistCopyWalk {
                     TermKind::Bitstring => {
                         let bits = bitstring_bit_len(head)
                             .map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
-                        if !bits.is_multiple_of(8) {
+                        if !self.bit_mode && !bits.is_multiple_of(8) {
                             return Err((BifError::BADARG, yield_count - remaining));
                         }
                         self.source = Some(CopySource {
@@ -884,11 +906,17 @@ impl IolistCopyWalk {
                             .as_small()
                             .and_then(|number| u8::try_from(number).ok())
                             .ok_or((BifError::BADARG, yield_count - remaining))?;
-                        let slot = output
-                            .get_mut(self.offset)
-                            .ok_or((BifError::SystemLimit, yield_count - remaining))?;
-                        *slot = byte;
-                        self.offset += 1;
+                        if self.bit_mode {
+                            or_bits_at(output, self.to_bit, &[byte], 8)
+                                .map_err(|error| (error, yield_count - remaining))?;
+                            self.to_bit += 8;
+                        } else {
+                            let slot = output
+                                .get_mut(self.offset)
+                                .ok_or((BifError::SystemLimit, yield_count - remaining))?;
+                            *slot = byte;
+                            self.offset += 1;
+                        }
                     }
                     _ => return Err((BifError::BADARG, yield_count - remaining)),
                 }
@@ -909,7 +937,7 @@ impl IolistCopyWalk {
                 TermKind::Bitstring => {
                     let bits = bitstring_bit_len(self.current)
                         .map_err(|error| (error, yield_count - remaining))?;
-                    if !bits.is_multiple_of(8) {
+                    if !self.bit_mode && !bits.is_multiple_of(8) {
                         return Err((BifError::BADARG, yield_count - remaining));
                     }
                     self.source = Some(CopySource {
@@ -931,10 +959,40 @@ impl IolistCopyWalk {
         }
     }
 
-    /// Return bytes written after the walk has completed.
-    pub fn written(&self) -> usize {
-        self.offset
+    /// Return bits written after the walk has completed.
+    pub fn written_bits(&self) -> usize {
+        if self.bit_mode {
+            self.to_bit
+        } else {
+            self.offset * 8
+        }
     }
+}
+
+/// OR the first `bits` bits of `source` into zeroed `output` starting at bit `to_bit`.
+fn or_bits_at(
+    output: &mut [u8],
+    to_bit: usize,
+    source: &[u8],
+    bits: usize,
+) -> Result<(), BifError> {
+    if to_bit
+        .checked_add(bits)
+        .is_none_or(|end| end > output.len().saturating_mul(8))
+    {
+        return Err(BifError::SystemLimit);
+    }
+    let shift = to_bit % 8;
+    for (position, byte) in source.iter().enumerate() {
+        let index = to_bit / 8 + position;
+        let used = (bits - position * 8).min(8);
+        let byte = *byte & (0xFF_u8 << (8 - used));
+        output[index] |= byte >> shift;
+        if shift + used > 8 {
+            output[index + 1] |= byte << (8 - shift);
+        }
+    }
+    Ok(())
 }
 
 /// Allocate the final writable binary before the iolist copy pass.
