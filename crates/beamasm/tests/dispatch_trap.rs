@@ -80,9 +80,9 @@ fn run(
     assembler
         .emit_raw(|encoder| {
             // ARG4 = export, ARG3 = entry. The fragment calls `helper(c_p, ...)`.
-            encoder.mov_const(Gpr::x(4), export_addr)?;
-            encoder.mov_reg(Gpr::x(3), Gpr::xzr())?;
-            encoder.mov_const(Gpr::x(17), fragments.call_light_bif() as u64)?;
+            encoder.mov_const(Gpr::x(3), export_addr)?;
+            encoder.mov_reg(Gpr::x(2), Gpr::xzr())?;
+            encoder.mov_const(Gpr::x(17), fragments.call_light_bif_helper() as u64)?;
             encoder.blr(Gpr::x(17))?;
             // `bl`/`blr` leaves x30 at this instruction. A real function saved the
             // scheduler bridge on E in the breakpoint trampoline; this caller did not,
