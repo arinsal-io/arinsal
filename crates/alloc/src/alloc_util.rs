@@ -235,10 +235,6 @@ impl Allocation {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct AllocStats {
-    pub blocks: usize,
-    pub blocks_size: usize,
-    pub max_blocks: usize,
-    pub max_blocks_size: usize,
     pub alloc_calls: u64,
     pub free_calls: u64,
     pub realloc_calls: u64,
@@ -260,8 +256,6 @@ pub struct AllocStats {
     pub sys_free_calls: u64,
     pub mseg_realloc_calls: u64,
     pub sys_realloc_calls: u64,
-    pub max_ever_blocks: usize,
-    pub max_ever_blocks_size: usize,
     pub max_ever_carriers: usize,
     pub max_ever_carriers_size: usize,
     pub max_ever_mseg_carriers: usize,
@@ -492,6 +486,38 @@ impl CarrierSpan {
     #[inline(always)]
     fn words(self) -> WordView {
         WordView::new(self.start as *mut u64, (self.end - self.start) / WORD)
+    }
+
+    /// Whether the word at address `addr` lies inside the carrier and is word aligned.
+    #[inline(always)]
+    fn holds(self, addr: usize) -> bool {
+        addr.is_multiple_of(WORD) && addr >= self.start && addr + WORD <= self.end
+    }
+
+    /// The word at address `addr` of the carrier, a block header word, size footer or free
+    /// block field, as one plain load like the pointer dereference of the C code.
+    ///
+    /// The allocator derives `addr` from the header words and footers it wrote itself (block
+    /// address, plus block size, or minus the size in a footer) and from addresses it took out
+    /// of its free index, so every `addr` lies inside the carrier; debug builds check it.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn load(self, addr: usize) -> usize {
+        debug_assert!(self.holds(addr), "word {addr:#x} outside {:#x}", self.start);
+        // SAFETY: `addr` is word aligned and inside a carrier that is indexed, and so mapped
+        // read-write, while this span exists: a carrier is unindexed, dropping its spans,
+        // before its memory moves or is released.
+        unsafe { (addr as *const usize).read() }
+    }
+
+    /// Stores the word `value` at address `addr` of the carrier; see `load`.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn store(self, addr: usize, value: usize) {
+        debug_assert!(self.holds(addr), "word {addr:#x} outside {:#x}", self.start);
+        // SAFETY: as in `load`; the allocator owns its carriers exclusively while it is
+        // borrowed mutably, and every caller of `store` holds `&mut AllocUtil`.
+        unsafe { (addr as *mut usize).write(value) }
     }
 
     #[inline(always)]
@@ -872,139 +898,191 @@ impl AllocUtil {
     /// Bytes in allocated blocks, for the registry's lock-free mirror.
     #[inline(always)]
     pub(crate) fn blocks_size(&self) -> usize {
-        self.stats.blocks_size
+        self.class_stats[0].blocks_size.current + self.class_stats[1].blocks_size.current
+    }
+
+    /// Number of allocated blocks, multiblock and single-block carriers together.
+    pub fn block_count(&self) -> usize {
+        self.class_stats[0].blocks.current + self.class_stats[1].blocks.current
     }
 
     /// Allocates a payload of `size` bytes.
     /// Port of `erts_alcu_alloc`, `erl_alloc_util.c:2377`, OTP-29.1.1.
+    #[inline]
     pub fn alloc(&mut self, size: usize) -> Result<Allocation, AllocError> {
         self.stats.alloc_calls += 1;
         let block_size = block_size(size, self.strategy)?;
         if block_size >= self.sbct() {
-            let start = self.add_sbc(block_size)?;
-            self.stats.blocks += 1;
-            self.stats.blocks_size += block_size;
-            self.block_added(true, block_size);
-            self.update_block_peak();
-            return Ok(Allocation {
-                id: start as u64,
-                size,
-            });
+            return self.alloc_sbc(size, block_size);
         }
-        // Port of mbc_alloc_finalize, erl_alloc_util.c:1913, OTP-29.1.1: the carrier is resolved
-        // once and the header decoded once; the unlink and the header writes reuse both.
-        let (offset, span) = if let Some(chosen) = self.choose_free_span(block_size)? {
-            chosen
+        let chosen = if is_aoff(self.strategy) {
+            self.choose_aoff_span(block_size)
         } else {
-            let ci = self.add_mbc(block_size)?;
-            let start = self.carriers[ci].as_ref().ok_or(AllocError::Corrupt)?.start;
-            (start, self.span_of(start).ok_or(AllocError::Corrupt)?)
+            self.choose_free_span(block_size)?
         };
-        let old = Self::decode_block(span, offset)?;
-        self.unlink_free_in(span, offset, old.size)?;
-        let actual = old.size;
-        let split = actual.saturating_sub(block_size) >= min_block_size(self.strategy);
-        let used = if split { block_size } else { actual };
-        Self::write_block_in(
-            span,
-            &Block {
-                size: used,
-                allocated: true,
-                last: old.last && !split,
-                ..old
-            },
-        )?;
-        if split {
-            let tail = Block {
-                carrier: old.carrier,
-                offset: offset + block_size,
-                size: actual - block_size,
-                allocated: false,
-                prev_free: false,
-                last: old.last,
-            };
-            Self::write_block_in(span, &tail)?;
-            debug_assert!(
-                tail.last
-                    || span
-                        .read(tail.offset + tail.size, 0)
-                        .is_some_and(|header| header & PREV_FREE != 0)
-            );
-            self.link_free_in(span, tail.offset, tail.size)?;
-        } else {
-            Self::set_next_prev_free_in(span, &Block { size: used, ..old }, false)?;
-        }
-        self.stats.blocks += 1;
-        self.stats.blocks_size += used;
+        let (offset, span) = match chosen {
+            Some(chosen) => chosen,
+            None => self.new_mbc_block(block_size)?,
+        };
+        let used = self.mbc_alloc(span, offset, block_size)?;
         self.block_added(false, used);
-        self.update_block_peak();
         Ok(Allocation {
             id: offset as u64,
             size,
         })
     }
 
+    /// Port of mbc_alloc_finalize, erl_alloc_util.c, OTP-29.1.1: the free block at `offset`, of
+    /// the indexed carrier `span`, is taken off the free index and its header word is rewritten
+    /// in place with masks. The block is split when the remainder can hold a free block, else it
+    /// is used whole and the PREV_FREE flag of its successor is cleared. Returns the block size.
+    #[inline(always)]
+    fn mbc_alloc(
+        &mut self,
+        span: CarrierSpan,
+        offset: usize,
+        block_size: usize,
+    ) -> Result<usize, AllocError> {
+        let header = span.load(offset);
+        let actual = header & !BLOCK_FLAGS;
+        debug_assert!(header & FREE != 0 && actual >= block_size);
+        self.unlink_free_in(span, offset, actual)?;
+        let last = header & LAST;
+        let prev_free = header & PREV_FREE;
+        let remainder = actual - block_size;
+        if remainder >= min_block_size(self.strategy) {
+            let tail = offset + block_size;
+            span.store(offset, block_size | prev_free);
+            span.store(tail, remainder | FREE | last);
+            span.store(tail + WORD, span.start);
+            if last == 0 {
+                span.store(tail + remainder - WORD, remainder);
+            }
+            debug_assert!(last != 0 || span.load(tail + remainder) & PREV_FREE != 0);
+            self.link_free_in(span, tail, remainder)?;
+            Ok(block_size)
+        } else {
+            span.store(offset, actual | prev_free | last);
+            if last == 0 {
+                let next = offset + actual;
+                span.store(next, span.load(next) & !PREV_FREE);
+            }
+            Ok(actual)
+        }
+    }
+
+    /// A single-block carrier for one allocation of `block_size`.
+    #[cold]
+    #[inline(never)]
+    fn alloc_sbc(&mut self, size: usize, block_size: usize) -> Result<Allocation, AllocError> {
+        let start = self.add_sbc(block_size)?;
+        self.block_added(true, block_size);
+        Ok(Allocation {
+            id: start as u64,
+            size,
+        })
+    }
+
+    /// A new multiblock carrier whose one free block serves a request no free block could.
+    #[cold]
+    #[inline(never)]
+    fn new_mbc_block(&mut self, block_size: usize) -> Result<(usize, CarrierSpan), AllocError> {
+        let ci = self.add_mbc(block_size)?;
+        let start = self.carriers[ci].as_ref().ok_or(AllocError::Corrupt)?.start;
+        Ok((start, self.span_of(start).ok_or(AllocError::Corrupt)?))
+    }
+
     /// Frees a live allocation and merges adjacent free MBC blocks.
     /// Port of `erts_alcu_free`, `erl_alloc_util.c:2820`, OTP-29.1.1.
+    #[inline]
     pub fn free(&mut self, allocation: Allocation) -> Result<(), AllocError> {
         self.stats.free_calls += 1;
-        let (span, b) = self.live_block_in_span(allocation.id as usize)?;
-        let offset = b.offset;
-        self.stats.blocks -= 1;
-        self.stats.blocks_size -= b.size;
-        let sbc = span.sbc;
-        self.block_removed(sbc, b.size);
-        if sbc {
-            self.remove_carrier(b.carrier)?;
-            return Ok(());
+        let key = allocation.id as usize;
+        let span = self.span_of(key).ok_or(AllocError::InvalidAllocation)?;
+        if span.sbc {
+            return self.free_sbc(span, key);
         }
-        // Port of mbc_free, erl_alloc_util.c:2045, OTP-29.1.1.
-        let mut merged = Block {
-            allocated: false,
-            ..b
-        };
-        if b.prev_free {
-            let prev = self.previous_block_in(span, offset)?;
-            let p = Self::decode_block(span, prev)?;
-            if !p.allocated {
-                self.unlink_free_in(span, prev, p.size)?;
-                merged = Block {
-                    offset: prev,
-                    size: p.size + b.size,
-                    prev_free: p.prev_free,
-                    ..merged
-                };
+        if key < span.start + self.mbc_header_size() || !span.holds(key) {
+            return Err(AllocError::InvalidAllocation);
+        }
+        let header = span.load(key);
+        let size = header & !BLOCK_FLAGS;
+        if header & FREE != 0 || size == 0 {
+            return Err(AllocError::InvalidAllocation);
+        }
+        self.block_removed(false, size);
+        self.mbc_free(span, key, header)
+    }
+
+    /// Port of mbc_free, erl_alloc_util.c, OTP-29.1.1: the block at `key` with header word
+    /// `header` merges with a free predecessor (found through its size footer) and a free
+    /// successor, all on header words, and the result is linked into the free index, or its
+    /// carrier is destroyed when it became the one empty block of a non-main carrier.
+    #[inline(always)]
+    fn mbc_free(&mut self, span: CarrierSpan, key: usize, header: usize) -> Result<(), AllocError> {
+        let mut start = key;
+        let mut size = header & !BLOCK_FLAGS;
+        let mut prev_free = header & PREV_FREE;
+        let mut last = header & LAST;
+        if prev_free != 0 {
+            let footer = span.load(key - WORD);
+            debug_assert!(footer != 0 && footer <= key - span.start - self.mbc_header_size());
+            let prev = key - footer;
+            let prev_header = span.load(prev);
+            if prev_header & FREE != 0 {
+                self.unlink_free_in(span, prev, footer)?;
+                start = prev;
+                size += footer;
+                prev_free = prev_header & PREV_FREE;
             }
         }
         let mut next_free = false;
-        if !merged.last {
-            let next = merged.offset + merged.size;
-            let n = Self::decode_block(span, next)?;
-            if !n.allocated {
-                self.unlink_free_in(span, next, n.size)?;
-                merged.size += n.size;
-                merged.last = n.last;
+        if last == 0 {
+            let next = start + size;
+            let next_header = span.load(next);
+            if next_header & FREE != 0 {
+                let next_size = next_header & !BLOCK_FLAGS;
+                self.unlink_free_in(span, next, next_size)?;
+                size += next_size;
+                last = next_header & LAST;
                 next_free = true;
             }
         }
-        Self::write_block_in(span, &merged)?;
-        if !next_free {
-            Self::set_next_prev_free_in(span, &merged, true)?;
-        }
-        // Port of erl_alloc_util.c:2791 (dealloc_block), OTP-29.1.1: the main carrier is never destroyed.
-        if merged.offset == span.start + self.mbc_header_size()
-            && merged.last
-            && !self.carriers[merged.carrier]
+        if last != 0
+            && start == span.start + self.mbc_header_size()
+            && !self.carriers[span.index]
                 .as_ref()
                 .ok_or(AllocError::Corrupt)?
                 .main
         {
-            self.remove_carrier(merged.carrier)?;
-        } else {
-            self.link_free_in(span, merged.offset, merged.size)?;
-            self.check_abandon_carrier(merged.carrier)?;
+            return self.remove_carrier(span.index);
         }
-        Ok(())
+        span.store(start, size | FREE | prev_free | last);
+        span.store(start + WORD, span.start);
+        if last == 0 {
+            span.store(start + size - WORD, size);
+            if !next_free {
+                let next = start + size;
+                span.store(next, span.load(next) | PREV_FREE);
+            }
+        }
+        self.link_free_in(span, start, size)?;
+        self.check_abandon_carrier(span.index)
+    }
+
+    /// Frees the block of a single-block carrier, which destroys the carrier.
+    #[cold]
+    #[inline(never)]
+    fn free_sbc(&mut self, span: CarrierSpan, key: usize) -> Result<(), AllocError> {
+        if key != span.start + SBC_HEADER || !span.holds(key) {
+            return Err(AllocError::InvalidAllocation);
+        }
+        let size = span.load(key) & !BLOCK_FLAGS;
+        if size == 0 {
+            return Err(AllocError::InvalidAllocation);
+        }
+        self.block_removed(true, size);
+        self.remove_carrier(span.index)
     }
 
     /// Returns the stable payload address while `allocation` remains allocated.
@@ -1200,27 +1278,6 @@ impl AllocUtil {
         Ok(block)
     }
 
-    /// `live_block` for the free path: the carrier span is resolved once and the block header is
-    /// decoded once, so `free` needs no second carrier lookup.
-    #[inline(always)]
-    fn live_block_in_span(&self, key: usize) -> Result<(CarrierSpan, Block), AllocError> {
-        let span = self.span_of(key).ok_or(AllocError::InvalidAllocation)?;
-        let first = span.start
-            + if span.sbc {
-                SBC_HEADER
-            } else {
-                self.mbc_header_size()
-            };
-        if key < first || (span.sbc && key != first) {
-            return Err(AllocError::InvalidAllocation);
-        }
-        let block = Self::decode_block(span, key)?;
-        if !block.allocated || block.size == 0 {
-            return Err(AllocError::InvalidAllocation);
-        }
-        Ok((span, block))
-    }
-
     /// Blocks of one carrier in address order, walked through their headers.
     fn carrier_blocks(&self, index: usize) -> Result<Vec<Block>, AllocError> {
         let carrier = self.carriers[index].as_ref().ok_or(AllocError::Corrupt)?;
@@ -1292,6 +1349,11 @@ impl AllocUtil {
         {
             return Ok(());
         }
+        self.consider_abandoning_carrier(carrier_index)
+    }
+
+    #[inline(never)]
+    fn consider_abandoning_carrier(&mut self, carrier_index: usize) -> Result<(), AllocError> {
         let Some(carrier) = self.carriers.get(carrier_index).and_then(Option::as_ref) else {
             return Ok(());
         };
@@ -1321,7 +1383,7 @@ impl AllocUtil {
         let below = |used: usize, total: usize| {
             (used as u128) * 100 <= (total as u128) * (self.options.acul as u128)
         };
-        if !below(self.stats.blocks_size, total_carrier_size)
+        if !below(self.blocks_size(), total_carrier_size)
             || !below(allocated_size, carrier_size)
             || largest_free < self.options.acfml
         {
@@ -1398,8 +1460,6 @@ impl AllocUtil {
         }
         self.aoff_remove_carrier_node(carrier_index)?;
         for block in transfer_blocks.iter().filter(|block| block.allocated) {
-            self.stats.blocks -= 1;
-            self.stats.blocks_size -= block.size;
             self.block_removed(false, block.size);
         }
         let carrier = self
@@ -1478,8 +1538,6 @@ impl AllocUtil {
         let mut remapped = Vec::with_capacity(transfer.allocations.len());
         for (old, offset) in transfer.allocations {
             let size = self.blk(offset)?.size;
-            self.stats.blocks += 1;
-            self.stats.blocks_size += size;
             self.block_added(false, size);
             remapped.push((old, old));
         }
@@ -1508,7 +1566,6 @@ impl AllocUtil {
             self.stats.sys_alloc_carriers += 1;
             self.stats.sys_alloc_carriers_size += carrier_size;
         }
-        self.update_block_peak();
         self.update_carrier_peak();
         Ok(remapped)
     }
@@ -1641,7 +1698,6 @@ impl AllocUtil {
                 self.set_next_prev_free(&tail, true)?;
             }
             self.link_free(tail.offset)?;
-            self.stats.blocks_size -= old.size - needed;
             self.block_resized(false, old.size, needed);
             return Ok(same);
         }
@@ -1685,7 +1741,6 @@ impl AllocUtil {
                 }
                 grown
             };
-            self.stats.blocks_size = self.stats.blocks_size - old.size + grown.size;
             self.block_resized(false, old.size, grown.size);
             return Ok(same);
         }
@@ -1740,7 +1795,6 @@ impl AllocUtil {
                     } else if !last {
                         self.set_next_prev_free(&moved, false)?;
                     }
-                    self.stats.blocks_size = self.stats.blocks_size - old.size + used;
                     self.block_resized(false, old.size, used);
                     return Ok(Allocation {
                         id: previous as u64,
@@ -1773,16 +1827,6 @@ impl AllocUtil {
     pub fn info(&self) -> AllocatorInfo {
         let mut mbcs = AllocatorClassInfo::default();
         let mut sbcs = AllocatorClassInfo::default();
-        for (index, carrier) in self.carriers.iter().enumerate() {
-            let Some(carrier) = carrier else { continue };
-            let class = if carrier.sbc { &mut sbcs } else { &mut mbcs };
-            for block in self.carrier_blocks(index).unwrap_or_default() {
-                if block.allocated {
-                    class.blocks += 1;
-                    class.blocks_size += block.size;
-                }
-            }
-        }
         for carrier in self.carriers.iter().flatten() {
             let class = if carrier.sbc { &mut sbcs } else { &mut mbcs };
             class.carriers += 1;
@@ -1799,6 +1843,8 @@ impl AllocUtil {
             (&mut mbcs, self.class_stats[0]),
             (&mut sbcs, self.class_stats[1]),
         ] {
+            info.blocks = stats.blocks.current;
+            info.blocks_size = stats.blocks_size.current;
             info.blocks_max = stats.blocks.max;
             info.blocks_size_max = stats.blocks_size.max;
             info.blocks_max_ever = stats.blocks.max_ever;
@@ -1897,8 +1943,8 @@ impl AllocUtil {
     /// Checks block chains, footer/header agreement, allocation ownership, and free index.
     pub fn validate(&self) -> Result<(), AllocError> {
         let mut free = HashSet::default();
-        let mut count = 0;
-        let mut bytes = 0;
+        let mut count = [0usize; 2];
+        let mut bytes = [0usize; 2];
         for (ci, c) in self
             .carriers
             .iter()
@@ -1946,8 +1992,8 @@ impl AllocUtil {
                         return Err(AllocError::Corrupt);
                     }
                 } else {
-                    count += 1;
-                    bytes += b.size;
+                    count[usize::from(c.sbc)] += 1;
+                    bytes[usize::from(c.sbc)] += b.size;
                 }
                 pos += b.size;
                 if b.last {
@@ -1962,8 +2008,10 @@ impl AllocUtil {
             }
         }
         if free != self.tree_free_blocks()?
-            || count != self.stats.blocks
-            || bytes != self.stats.blocks_size
+            || (0..2).any(|class| {
+                count[class] != self.class_stats[class].blocks.current
+                    || bytes[class] != self.class_stats[class].blocks_size.current
+            })
         {
             return Err(AllocError::Corrupt);
         }
@@ -2119,7 +2167,6 @@ impl AllocUtil {
         }
         self.unindex_carrier(old.carrier);
         self.index_carrier(old.carrier);
-        self.stats.blocks_size = self.stats.blocks_size - old.size + new_block_size;
         self.block_resized(true, old.size, new_block_size);
         self.stats.carriers_size = self.stats.carriers_size - old_carrier_size + new_carrier_size;
         self.carrier_resized(true, is_mseg, old_carrier_size, new_carrier_size);
@@ -2139,7 +2186,6 @@ impl AllocUtil {
             prev_free: true,
             last: true,
         })?;
-        self.update_block_peak();
         self.update_carrier_peak();
         Ok(new_offset)
     }
@@ -2356,45 +2402,6 @@ impl AllocUtil {
             return Err(AllocError::Corrupt);
         }
         Ok(())
-    }
-
-    /// `write_block` for a block of the indexed carrier `span`, through plain header stores.
-    #[inline(always)]
-    fn write_block_in(span: CarrierSpan, b: &Block) -> Result<(), AllocError> {
-        let flags = if span.sbc {
-            FREE | PREV_FREE | LAST
-        } else {
-            (if !b.allocated { FREE } else { 0 })
-                | (if b.prev_free { PREV_FREE } else { 0 })
-                | (if b.last { LAST } else { 0 })
-        };
-        span.write(b.offset, 0, b.size | flags)
-            .ok_or(AllocError::Corrupt)?;
-        if !span.sbc && !b.allocated {
-            span.write(b.offset, 1, span.start)
-                .ok_or(AllocError::Corrupt)?;
-        }
-        if !b.allocated && !b.last {
-            span.write(b.offset + b.size - WORD, 0, b.size)
-                .ok_or(AllocError::Corrupt)?;
-        }
-        Ok(())
-    }
-
-    /// `set_next_prev_free` for a block of the indexed carrier `span`.
-    #[inline(always)]
-    fn set_next_prev_free_in(span: CarrierSpan, b: &Block, value: bool) -> Result<(), AllocError> {
-        if b.last {
-            return Ok(());
-        }
-        let next = b.offset + b.size;
-        let header = span.read(next, 0).ok_or(AllocError::Corrupt)?;
-        let header = if value {
-            header | PREV_FREE
-        } else {
-            header & !PREV_FREE
-        };
-        span.write(next, 0, header).ok_or(AllocError::Corrupt)
     }
 
     /// Sets or clears PREV_FREE on the block following `b`.
@@ -2629,7 +2636,8 @@ impl AllocUtil {
             (index << AOFF_INDEX_SHIFT | blk_order) as usize,
         )
         .ok_or(AllocError::Corrupt)?;
-        self.insert_tree_node::<true>(node, 0, span)
+        self.insert_tree_node::<true>(node, 0, span);
+        Ok(())
     }
 
     fn aoff_remove_carrier_node(&mut self, carrier_index: usize) -> Result<(), AllocError> {
@@ -2643,7 +2651,8 @@ impl AllocUtil {
             carrier.in_aoff_tree = false;
             carrier.key_base + MBC_HEADER
         };
-        self.delete_tree_node::<true>(TreeId::Carriers, node)
+        self.delete_tree_node::<true>(TreeId::Carriers, node);
+        Ok(())
     }
 
     /// Inserts the free block into the OTP intrusive bestfit tree/list.
@@ -2760,11 +2769,12 @@ impl AllocUtil {
             return Ok(());
         }
         if is_aoff(self.strategy) {
-            self.insert_tree_node::<true>(node, size, span)?;
+            self.insert_tree_node::<true>(node, size, span);
             self.aoff_raise_carrier_max(span, size);
             Ok(())
         } else {
-            self.insert_tree_node::<false>(node, size, span)
+            self.insert_tree_node::<false>(node, size, span);
+            Ok(())
         }
     }
 
@@ -2772,12 +2782,7 @@ impl AllocUtil {
     /// runs when the new red node's parent is red. The aoff `max_sz` is raised on the way down,
     /// so no walk to the root follows.
     #[inline(never)]
-    fn insert_tree_node<const A: bool>(
-        &mut self,
-        node: usize,
-        size: usize,
-        span: CarrierSpan,
-    ) -> Result<(), AllocError> {
+    fn insert_tree_node<const A: bool>(&mut self, node: usize, size: usize, span: CarrierSpan) {
         let block_node = !(A && !span.sbc && node == span.start + MBC_HEADER);
         let tree = if block_node {
             self.tree_span.set(span);
@@ -2801,7 +2806,7 @@ impl AllocUtil {
                 blk.set_next(0);
             }
             self.set_root_of::<A>(tree, node);
-            return Ok(());
+            return;
         }
         let mut x = self.tn::<A>(root);
         let go_left = loop {
@@ -2818,7 +2823,7 @@ impl AllocUtil {
                     self.tn::<A>(head_next).set_parent(node);
                 }
                 x.set_next(node);
-                return Ok(());
+                return;
             }
             let go_left = if by_address {
                 node < x.key()
@@ -2844,7 +2849,6 @@ impl AllocUtil {
         if bestfit {
             blk.set_next(0);
         }
-        Ok(())
     }
 
     /// First non-empty goodfit bucket at or above `from`, via `bucket_mask` like erl_goodfit_alloc.c.
@@ -3027,47 +3031,41 @@ impl AllocUtil {
         }
         self.tree_span.set(span);
         if is_aoff(self.strategy) {
-            self.unlink_tree_node::<true>(span, node)
+            self.unlink_tree_node::<true>(span, node);
         } else {
-            self.unlink_tree_node::<false>(span, node)
+            self.unlink_tree_node::<false>(span, node);
         }
+        Ok(())
     }
 
     /// Port of aoff_unlink_free_block, erl_ao_firstfit_alloc.c, OTP-29.1.1, and of the tree part of
     /// bf_unlink_free_block, erl_bestfit_alloc.c, OTP-29.1.1.
     #[inline(always)]
-    fn unlink_tree_node<const A: bool>(
-        &mut self,
-        span: CarrierSpan,
-        node: usize,
-    ) -> Result<(), AllocError> {
+    fn unlink_tree_node<const A: bool>(&mut self, span: CarrierSpan, node: usize) {
         let tree = TreeId::Blocks;
         let del = self.tn::<A>(node);
         if matches!(self.strategy, Strategy::BestFit | Strategy::AoffCbf) {
             if del.flags() & TREE_NODE == 0 {
                 let prev = del.parent();
                 let next = del.next();
-                if prev == 0 {
-                    return Err(AllocError::Corrupt);
-                }
+                debug_assert_ne!(prev, 0, "list member {node:#x} without a head");
                 self.tn::<A>(prev).set_next(next);
                 if next != 0 {
                     self.tn::<A>(next).set_parent(prev);
                 }
-                return Ok(());
+                return;
             }
             let next = del.next();
             if next != 0 {
                 let new = self.tn::<A>(next);
                 self.replace_tree_node(tree, del, new);
-                return Ok(());
+                return;
             }
         }
-        self.delete_tree_node::<A>(tree, node)?;
+        self.delete_tree_node::<A>(tree, node);
         if A {
             self.aoff_lower_carrier_max(span);
         }
-        Ok(())
     }
 
     /// `red` for the validator, which follows links that may be corrupt: the node address is
@@ -3270,11 +3268,7 @@ impl AllocUtil {
     /// is the pair (`x`, `x_parent`) here. The aoff `max_sz` is lowered right after the splice,
     /// where each walk stops as soon as an ancestor keeps its value.
     #[inline(never)]
-    fn delete_tree_node<const A: bool>(
-        &mut self,
-        tree: TreeId,
-        node: usize,
-    ) -> Result<(), AllocError> {
+    fn delete_tree_node<const A: bool>(&mut self, tree: TreeId, node: usize) {
         let z = self.tn::<A>(node);
         let z_right = z.right();
         let y = if z.left() == 0 || z_right == 0 {
@@ -3322,7 +3316,6 @@ impl AllocUtil {
         if spliced_is_black {
             self.delete_fixup::<A>(tree, x, x_parent);
         }
-        Ok(())
     }
 
     /// The fixup loop of rbt_delete, erl_ao_firstfit_alloc.c, OTP-29.1.1.
@@ -3500,18 +3493,6 @@ impl AllocUtil {
         }
         Ok(seen)
     }
-    /// Start of the free block preceding `offset`, from its size footer.
-    /// Port of PREV_BLK_SZ, erl_alloc_util.c:223, OTP-29.1.1.
-    #[inline(always)]
-    fn previous_block_in(&self, span: CarrierSpan, offset: usize) -> Result<usize, AllocError> {
-        let size = span.read(offset - WORD, 0).ok_or(AllocError::Corrupt)?;
-        let previous = offset.checked_sub(size).ok_or(AllocError::Corrupt)?;
-        if size == 0 || previous < span.start + self.mbc_header_size() {
-            return Err(AllocError::Corrupt);
-        }
-        Ok(previous)
-    }
-
     #[inline(always)]
     fn previous_block(&self, offset: usize) -> Result<usize, AllocError> {
         let size = self.word_at(offset - WORD, 0)?;
@@ -3555,22 +3536,6 @@ impl AllocUtil {
             }
         }
         Ok(())
-    }
-    #[inline(always)]
-    fn update_block_peak(&mut self) {
-        // Maxima can only move when a current value passes them (erl_alloc_util.c:726 STAT_MBC_BLK_ALLOC).
-        if self.stats.blocks <= self.stats.max_blocks
-            && self.stats.blocks_size <= self.stats.max_blocks_size
-        {
-            return;
-        }
-        self.stats.max_blocks = self.stats.max_blocks.max(self.stats.blocks);
-        self.stats.max_blocks_size = self.stats.max_blocks_size.max(self.stats.blocks_size);
-        self.stats.max_ever_blocks = self.stats.max_ever_blocks.max(self.stats.max_blocks);
-        self.stats.max_ever_blocks_size = self
-            .stats
-            .max_ever_blocks_size
-            .max(self.stats.max_blocks_size);
     }
     fn update_carrier_peak(&mut self) {
         self.stats.max_carriers = self.stats.max_carriers.max(self.stats.carriers);
@@ -3850,7 +3815,7 @@ mod tests {
             a.free(x).unwrap();
             a.free(y).unwrap();
             a.validate().unwrap();
-            assert_eq!(a.stats().blocks, 0);
+            assert_eq!(a.block_count(), 0);
         }
     }
     #[test]
@@ -4364,7 +4329,7 @@ mod tests {
                         allocator.free_root,
                         allocator.tree_free_blocks(),
                     );
-                    prop_assert_eq!(allocator.stats().blocks, live.iter().filter(|a| a.is_some()).count());
+                    prop_assert_eq!(allocator.block_count(), live.iter().filter(|a| a.is_some()).count());
                 }
             }
         }
