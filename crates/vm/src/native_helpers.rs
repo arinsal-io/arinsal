@@ -4310,6 +4310,27 @@ fn map_single<const EXACT: bool>(
     // do not read the X register array.
     // Port of erts/emulator/beam/jit/arm/instr_map.cpp:579-598,686-694,
     // OTP-29.1.1.
+    if !exact {
+        let Some(process) = crate::native_hooks::process_from_header(header) else {
+            return 0;
+        };
+        // HAllocX on `c_p->htop`: the word-index cursors are only brought up to date when the
+        // put leaves the fast path.
+        if let Some(mut top) = crate::native_top_heap::NativeTopHeap::new(process) {
+            let (key, value, map) = (
+                crate::native_hooks::from_raw(key),
+                crate::native_hooks::from_raw(value),
+                crate::native_hooks::from_raw(map),
+            );
+            return match arinsal_maps::put(map, key, value, &mut top) {
+                Ok(term) => crate::native_hooks::raw(term),
+                Err(error) => {
+                    top.commit();
+                    map_result(process, Err(error), false, false)
+                }
+            };
+        }
+    }
     let (process, registers) = if exact {
         let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
             return 0;
