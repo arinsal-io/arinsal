@@ -93,11 +93,7 @@ pub extern "C" fn append_binary(
         }
         return raw(term);
     }
-    if process.x.len() < root_live {
-        let mut x = process.x.to_vec();
-        x.resize(root_live, Term::NIL);
-        process.x = x.into();
-    }
+    process.x.ensure_x(root_live);
     process.x[..root_live].copy_from_slice(&registers.x_reg_array[..root_live]);
     let initial = build(process.x[src_index], process.x[extra_index]);
     let mut request = match arinsal_bits::create_bin_size(&initial) {
