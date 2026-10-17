@@ -2575,14 +2575,13 @@ fn emit_op(
         }
         EmitterKind::LengthSetup => {
             count(3)?;
-            let live = x_register(n(1)?).map_err(EmitError::Operand)?;
-            assembler.move_(value(2)?, live)
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:198-228, OTP-29.1.1.
+            assembler.emit_i_length_setup(n(0)?, n(1)?, value(2)?)
         }
         EmitterKind::Length => {
             count(3)?;
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:320-339, OTP-29.1.1.
-            let source = x_register(n(1)?).map_err(EmitError::Operand)?;
-            assembler.emit_bif_length(n(0)?, source, value(2)?, env.guard_helper())
+            assembler.emit_bif_length(n(0)?, n(1)?, value(2)?, env.guard_helper())
         }
         EmitterKind::Allocate => {
             count(2)?;
@@ -3978,7 +3977,7 @@ fn emit_op(
                             runtime,
                         ),
                         "bif_length" => {
-                            assembler.emit_bif_length(n(0)?, source, destination, runtime)
+                            assembler.emit_bif_length_helper(n(0)?, source, destination, runtime)
                         }
                         _ => assembler.emit_bif_abs(n(0)?, source, destination, runtime),
                     }

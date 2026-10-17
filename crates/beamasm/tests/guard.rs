@@ -1207,7 +1207,10 @@ fn native_bif_node() {
 fn native_bif_length() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_length(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| {
+            a.emit_i_length_setup(0, 2, ArgVal::X(0))?;
+            a.emit_bif_length(0, 2, ArgVal::X(0), guard_helper)
+        },
         f.list,
         small(0),
         bits(small(1)),

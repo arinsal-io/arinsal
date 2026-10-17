@@ -64,23 +64,78 @@ pub(crate) fn cons_cell(term: Term) -> Option<(Term, Term)> {
     unsafe { term.cons_ref() }
 }
 
-fn proper_len(mut list: Term) -> Result<usize, BifError> {
-    let mut count = 0usize;
-    while let Some((_, tail)) = cons_cell(list) {
-        count += 1;
+/// Elements of `length/1` walked per reduction left.
+// Port of `ERTS_BIF_REDS_LEFT(p) * 16` in `erts_trapping_length_1`,
+// erts/emulator/beam/erl_bif_guard.c, OTP-29.1.1.
+pub const LENGTH_PER_RED: usize = 16;
+
+/// Resume arguments of `erlang:length/3`, the hidden trap target of `length/1`.
+pub struct LengthCont {
+    list: Term,
+    acc: usize,
+}
+
+impl LengthCont {
+    /// The cons not yet counted.
+    pub fn list(&self) -> Term {
+        self.list
+    }
+
+    /// The length counted so far.
+    pub fn acc(&self) -> usize {
+        self.acc
+    }
+}
+
+/// One slice of `length/1`.
+pub enum LengthStep {
+    /// The length.
+    Done(Term),
+    /// `BIF_TRAP3` with the rest of the list and the length so far.
+    More(LengthCont),
+}
+
+/// Count `list` for the reductions left, starting from `acc`.
+// Port of erts/emulator/beam/erl_bif_guard.c:270-320 (erts_trapping_length_1), OTP-29.1.1.
+pub fn length_slice(ctx: &mut Ctx<'_>, mut list: Term, acc: usize) -> Result<LengthStep, BifError> {
+    let budget = ctx.reduction_budget();
+    let saved_max_iter = if budget == usize::MAX {
+        usize::MAX
+    } else {
+        budget.saturating_mul(LENGTH_PER_RED)
+    };
+    let mut max_iter = saved_max_iter;
+    let mut count = acc;
+    while max_iter != 0 {
+        let Some((_, tail)) = cons_cell(list) else {
+            break;
+        };
         list = tail;
+        count += 1;
+        max_iter -= 1;
+    }
+    if cons_cell(list).is_some() {
+        ctx.bump_all_reds();
+        return Ok(LengthStep::More(LengthCont { list, acc: count }));
     }
     if list != Term::NIL {
         return Err(BADARG);
     }
-    Ok(count)
+    if saved_max_iter != usize::MAX {
+        ctx.charge_reductions((saved_max_iter - max_iter) / LENGTH_PER_RED);
+    }
+    Ok(LengthStep::Done(integer(ctx, count)?))
 }
 
 fn length(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/erl_bif_guard.c:270 (erts_trapping_length_1), OTP-29.1.1.
-    // The reduction trap is a later task; this counts the whole proper list.
-    // `gc_bif length` in native code uses the inlined walk in `emit_bif_length`.
-    integer(ctx, proper_len(args[0])?)
+    // Port of erts/emulator/beam/erl_bif_guard.c:210-224 (length_1), OTP-29.1.1.
+    match length_slice(ctx, args[0], 0)? {
+        LengthStep::Done(value) => Ok(value),
+        LengthStep::More(cont) => {
+            ctx.defer_trap(DeferredTrap::Length(cont));
+            Ok(Term::NIL)
+        }
+    }
 }
 
 /// Cells of `erlang:'++'/2` per reduction on the alloc path.
@@ -228,6 +283,8 @@ pub enum DeferredTrap {
     Subtract(SubtractWalk),
     /// `erlang:crc32/1,2`, `adler32/1,2` or `md5/1`.
     Chksum(crate::checksum::ChksumCont),
+    /// `erlang:length/1`.
+    Length(LengthCont),
     /// `erlang:phash2/1,2`.
     Phash2(Box<crate::pure::Phash2Cont>),
 }
