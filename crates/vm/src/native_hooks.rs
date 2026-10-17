@@ -106,6 +106,11 @@ pub(crate) fn enter_runtime_no_cursors<'a>(
     header: *mut ProcessHeader,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
     let process = process_from_header(header)?;
+    // BeamAsm's emit_enter_runtime stores FCALLS into `c_p->fcalls` and erts has no second
+    // counter, so a helper that publishes the header again starts from the stored value. A
+    // stale `reductions` written back by `sync_native_header` would drop every reduction
+    // charged since the process was last entered.
+    process.reductions = process.header.fcalls;
     scheduler_registers(process)
 }
 
@@ -130,6 +135,11 @@ pub(crate) fn enter_runtime<'a>(
         process.header.htop,
         process.header.stop,
     );
+    // BeamAsm's emit_enter_runtime stores FCALLS into `c_p->fcalls` and erts has no second
+    // counter, so a helper that publishes the header again starts from the stored value. A
+    // stale `reductions` written back by `sync_native_header` would drop every reduction
+    // charged since the process was last entered.
+    process.reductions = process.header.fcalls;
     scheduler_registers(process)
 }
 
@@ -157,6 +167,11 @@ pub(crate) fn enter_heap_runtime<'a>(header: *mut ProcessHeader) -> Option<&'a m
         process.header.htop,
         process.header.stop,
     );
+    // BeamAsm's emit_enter_runtime stores FCALLS into `c_p->fcalls` and erts has no second
+    // counter, so a helper that publishes the header again starts from the stored value. A
+    // stale `reductions` written back by `sync_native_header` would drop every reduction
+    // charged since the process was last entered.
+    process.reductions = process.header.fcalls;
     Some(process)
 }
 
