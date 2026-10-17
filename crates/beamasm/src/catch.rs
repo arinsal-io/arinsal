@@ -297,6 +297,16 @@ impl BeamModuleAssembler {
         if class_helper == 0 {
             return Err(ModuleError::InvalidOperand("raise class helper is missing"));
         }
+        if let Some((raise_shared, _)) = self.raise_fragments {
+            // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3032-3044 (emit_raise),
+            // OTP-29.1.1: the value and the trace go to ARG1 and ARG2 and the shared fragment
+            // raises. The fragment never returns here.
+            let value = self.source_reg_into(value, Gpr::x(0))?;
+            self.code.emit(|e| e.mov_reg(Gpr::x(0), value))?;
+            let trace = self.source_reg_into(trace, Gpr::x(1))?;
+            self.code.emit(|e| e.mov_reg(Gpr::x(1), trace))?;
+            return self.fragment_call(raise_shared);
+        }
         let value = self.source_reg(value)?;
         self.code.emit(|e| e.mov_reg(TMP2, value))?;
         let trace = self.source_reg(trace)?;
@@ -348,7 +358,18 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.mov_const(XREGS[0], badarg))?;
         self.code.b(next)?;
         self.code.bind(raise)?;
-        self.emit_exception_transfer(TMP, XREGS[1], XREGS[2], resolver)?;
+        if let Some((_, raise_exception)) = self.raise_fragments {
+            // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3061-3076
+            // (emit_raw_raise), OTP-29.1.1: `fragment_call(raise_exception)`.
+            self.code.emit(|e| {
+                e.mov_reg(Gpr::x(0), TMP)?;
+                e.mov_reg(Gpr::x(1), XREGS[1])?;
+                e.mov_reg(Gpr::x(2), XREGS[2])
+            })?;
+            self.fragment_call(raise_exception)?;
+        } else {
+            self.emit_exception_transfer(TMP, XREGS[1], XREGS[2], resolver)?;
+        }
         self.code.bind(next)?;
         Ok(())
     }

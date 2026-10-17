@@ -198,6 +198,9 @@ pub struct BeamModuleAssembler {
     /// Process-wide yield fragments: `dispatch_return`, `i_test_yield_shared` and
     /// `context_switch_simplified`. Unset in assemblers that run without a VM.
     yield_fragments: Option<(usize, usize, usize)>,
+    /// Process-wide exception fragments: `raise_shared` and `raise_exception`. Unset in
+    /// assemblers that run without a VM.
+    pub(super) raise_fragments: Option<(usize, usize)>,
     /// Offset right after the current function's entry label (its `i_breakpoint_trampoline`).
     entry_offset: Option<usize>,
     entry_label: Option<Label>,
@@ -284,6 +287,7 @@ impl BeamModuleAssembler {
             arith_compare_shared: 0,
             element_guard_shared: 0,
             element_error: None,
+            raise_fragments: None,
             entry_offset: None,
             entry_label: None,
             bs_cold: Vec::new(),
@@ -481,6 +485,12 @@ impl BeamModuleAssembler {
     /// its constant-position fast path inline.
     pub fn set_element_guard_shared(&mut self, fragment: usize) {
         self.element_guard_shared = fragment;
+    }
+
+    /// Installs the process-wide `raise_shared` and `raise_exception` fragments so `raise`
+    /// and `raw_raise` call them instead of carrying the exception transfer inline.
+    pub fn set_raise_fragments(&mut self, raise_shared: usize, raise_exception: usize) {
+        self.raise_fragments = Some((raise_shared, raise_exception));
     }
 
     /// Installs the process-wide yield fragments (`dispatch_return`, `i_test_yield_shared`,
