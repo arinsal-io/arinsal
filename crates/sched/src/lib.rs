@@ -5110,6 +5110,10 @@ impl<T: Task> Scheduler<T> {
     /// Start real worker threads.
     pub fn new(config: Config) -> Self {
         arinsal_term::set_reader_groups(config.workers);
+        // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_init sizes the instances from
+        // erts_no_schedulers), OTP-29.1.1. A launcher that already configured the allocators
+        // (with `+Mdai`) or an earlier runtime in this process keeps its counts.
+        let _ = arinsal_alloc::typed::configure(config.workers.max(1), 0);
         Self::build(config, Arc::new(RealClock(Instant::now())), None, None)
     }
 
@@ -7252,6 +7256,10 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         .set(thread::current())
         .expect("worker registers once");
     NORMAL_SCHEDULER_ID.with(|current| current.set(Some(id)));
+    // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_register_scheduler), OTP-29.1.1:
+    // scheduler `no` owns allocator instance `no`. A refused registration leaves the thread on
+    // instance 0, which is correct for a second runtime in the same process.
+    let _ = arinsal_alloc::register_thread(arinsal_alloc::ThreadKind::Scheduler(id + 1));
     arinsal_term::set_reader_group(id);
     // Port of erts/emulator/beam/erl_process.c:8861 (sched_thread_func registers the
     // scheduler as a managed thread), OTP-29.1.1.
@@ -7763,6 +7771,12 @@ fn wakeup_other_check<T: Task>(inner: &Inner<T>, local: &mut Local<T>) {
 /// erl_process.c:3404 (scheduler_wait on a dirty run queue), OTP-29.1.1.
 fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: usize) {
     SCHEDULER_TYPE.with(|current| current.set(kind.into()));
+    // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_register_scheduler), OTP-29.1.1: a dirty
+    // scheduler uses instance 0 unless dirty allocator instances are configured.
+    let _ = arinsal_alloc::register_thread(match kind {
+        DirtyKind::Cpu => arinsal_alloc::ThreadKind::DirtyCpu(index + 1),
+        DirtyKind::Io => arinsal_alloc::ThreadKind::DirtyIo(index + 1),
+    });
     // Port of erts/emulator/beam/erl_process.c:5994 (init_scheduler_data for a dirty
     // scheduler), OTP-29.1.1.
     let mut scheduler_data = T::SchedulerData::default();

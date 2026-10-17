@@ -652,17 +652,65 @@ const ALLOCATOR_NAMES: [&str; 10] = [
     "driver_alloc",
 ];
 
+/// The configured scheduler and dirty allocator instance counts.
+#[derive(Clone, Copy)]
+struct InstanceConfig {
+    schedulers: usize,
+    dirty_instances: usize,
+}
+
+static CONFIG: OnceLock<InstanceConfig> = OnceLock::new();
+
+/// The instance configuration was already fixed, by `configure` or by the first allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AlreadyConfigured;
+
+/// Fixes how many scheduler and dirty allocator instances every thread specific allocator has.
+///
+/// Port of the instance sizing in `erts_alloc_init` (erl_alloc.c), OTP-29.1.1: `schedulers` is the
+/// configured `+S` total and `dirty_instances` the `+Mdai` count. Must run before the first
+/// allocation; afterwards the counts are fixed and the call fails. Without a call the first
+/// allocation sizes the instances from the available parallelism and no dirty instances.
+pub fn configure(schedulers: usize, dirty_instances: usize) -> Result<(), AlreadyConfigured> {
+    CONFIG
+        .set(InstanceConfig {
+            schedulers: schedulers.max(1),
+            dirty_instances,
+        })
+        .map_err(|_| AlreadyConfigured)
+}
+
+/// Scheduler and dirty instance counts, if `configure` ran or the allocators exist.
+pub(crate) fn configured() -> Option<(usize, usize)> {
+    CONFIG
+        .get()
+        .map(|config| (config.schedulers, config.dirty_instances))
+}
+
+/// Number of instances of the allocator `name`, `None` for an unknown or absent allocator.
+pub fn instance_count(name: &str) -> Option<usize> {
+    let index = ALLOCATOR_NAMES.iter().position(|known| *known == name)?;
+    registry()
+        .get(index)
+        .and_then(Option::as_ref)
+        .map(ThreadSpecificAllocators::instance_count)
+}
+
 fn registry() -> &'static Vec<Option<ThreadSpecificAllocators>> {
     static ALLOCATORS: OnceLock<Vec<Option<ThreadSpecificAllocators>>> = OnceLock::new();
     ALLOCATORS.get_or_init(|| {
-        let schedulers = std::thread::available_parallelism().map_or(1, usize::from);
+        let config = *CONFIG.get_or_init(|| InstanceConfig {
+            schedulers: std::thread::available_parallelism().map_or(1, usize::from),
+            dirty_instances: 0,
+        });
+        let schedulers = config.schedulers;
         let mut registry: Vec<Option<ThreadSpecificAllocators>> =
             ALLOCATOR_NAMES.iter().map(|_| None).collect();
         for spec in crate::allocator::defaults(schedulers) {
             let Some(index) = ALLOCATOR_NAMES.iter().position(|name| *name == spec.name) else {
                 continue;
             };
-            let count = crate::allocator::instance_count(&spec, schedulers, 0);
+            let count = crate::allocator::instance_count(&spec, schedulers, config.dirty_instances);
             registry[index] = Some(ThreadSpecificAllocators::new_with_global(
                 count,
                 spec.thread_specific,
