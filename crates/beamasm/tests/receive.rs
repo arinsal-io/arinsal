@@ -1,12 +1,26 @@
 use core::ffi::c_void;
+use std::sync::OnceLock;
 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     receive::ReceiveHooks,
+    receive_frag::ReceiveFragments,
     rt::process_header_mut,
+    yield_frag::YieldFragments,
 };
+
+fn fragments() -> &'static ReceiveFragments {
+    static FRAGMENTS: OnceLock<(YieldFragments, ReceiveFragments)> = OnceLock::new();
+    &FRAGMENTS
+        .get_or_init(|| {
+            let yields = YieldFragments::new().unwrap();
+            let receive = ReceiveFragments::new(peek, wait, wait, yields.context_switch()).unwrap();
+            (yields, receive)
+        })
+        .1
+}
 
 fn hooks() -> ReceiveHooks {
     ReceiveHooks {
@@ -14,11 +28,11 @@ fn hooks() -> ReceiveHooks {
         recv_marker_bind: bind,
         recv_marker_clear: clear,
         recv_marker_use: use_marker,
-        loop_rec: peek,
+        loop_rec_shared: fragments().loop_rec_shared(),
         remove_message: remove,
         set_save_next: save_next,
-        wait_unlocked: wait,
-        wait_locked: wait,
+        wait_unlocked_shared: fragments().wait_unlocked_shared(),
+        wait_locked_shared: fragments().wait_locked_shared(),
         take_receive_lock: no_op,
         wait_timeout,
         timeout_locked: no_op,
@@ -88,8 +102,10 @@ extern "C" fn timeout(process: *mut ProcessHeader) {
 
 fn run(module: &FinalizedModule, label: u32, header: &mut ProcessHeader) -> ExitReason {
     let mut regs = SchedulerRegisters::default();
-    let mut stack = [0u64; 64];
-    header.stop = stack.as_mut_ptr().wrapping_add(stack.len());
+    if header.stop.is_null() {
+        let stack = Box::leak(vec![0u64; 64].into_boxed_slice());
+        header.stop = stack.as_mut_ptr().wrapping_add(stack.len());
+    }
     enter_native(
         header,
         &mut regs,

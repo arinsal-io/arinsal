@@ -223,11 +223,11 @@ pub trait ModuleEnv {
             recv_marker_bind: unused_recv_bind,
             recv_marker_clear: unused_recv_one,
             recv_marker_use: unused_recv_one,
-            loop_rec: unused_loop_rec,
+            loop_rec_shared: 0,
             remove_message: unused_remove_message,
             set_save_next: unused_recv_header,
-            wait_unlocked: unused_wait,
-            wait_locked: unused_wait,
+            wait_unlocked_shared: 0,
+            wait_locked_shared: 0,
             take_receive_lock: unused_recv_header,
             wait_timeout: unused_wait_timeout,
             timeout_locked: unused_recv_header,
@@ -279,10 +279,6 @@ extern "C" fn unused_recv_bind(_process: *mut ProcessHeader, _marker: u64, _refe
 
 extern "C" fn unused_recv_one(_process: *mut ProcessHeader, _reference: u64) {}
 
-extern "C" fn unused_loop_rec(_process: *mut ProcessHeader) -> u64 {
-    0
-}
-
 extern "C" fn unused_remove_message(
     _process: *mut ProcessHeader,
     fcalls: i32,
@@ -292,8 +288,6 @@ extern "C" fn unused_remove_message(
 }
 
 extern "C" fn unused_recv_header(_process: *mut ProcessHeader) {}
-
-extern "C" fn unused_wait(_process: *mut ProcessHeader, _resume: usize) {}
 
 extern "C" fn unused_wait_timeout(
     _process: *mut ProcessHeader,

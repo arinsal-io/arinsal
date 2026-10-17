@@ -21,6 +21,7 @@ pub mod misc;
 pub mod module;
 pub mod raise_frag;
 pub mod receive;
+pub mod receive_frag;
 pub mod records;
 mod regcache;
 #[allow(unsafe_code)]
