@@ -1014,7 +1014,8 @@ enum IolistBinaryPhase {
     Size(arinsal_bifs::IolistSizeWalk),
     Copy {
         output: IolistOutput,
-        byte_len: usize,
+        bit_len: usize,
+        bitstring: bool,
         walk: arinsal_bifs::IolistCopyWalk,
     },
     Done,
@@ -2546,7 +2547,7 @@ fn list_to_binary(
             reductions: 1,
         });
     }
-    iolist_binary_conversion(process, root, state, gc_changed)
+    iolist_binary_conversion(process, root, state, false, gc_changed)
 }
 
 fn iolist_to_binary(
@@ -2566,7 +2567,7 @@ fn iolist_to_binary(
             reductions: 1,
         });
     }
-    iolist_binary_conversion(process, root, state, gc_changed)
+    iolist_binary_conversion(process, root, state, false, gc_changed)
 }
 
 fn list_to_bitstring(
@@ -2585,7 +2586,7 @@ fn list_to_bitstring(
             reductions: 1,
         });
     }
-    iolist_conversion(process, args[0], state, true, gc_changed)
+    iolist_binary_conversion(process, args[0], state, true, gc_changed)
 }
 
 fn iolist_size(
@@ -2595,68 +2596,52 @@ fn iolist_size(
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
-    const CHUNK: usize = 4096;
+    // Port of erts/emulator/beam/erl_iolist.c (`iolist_size_dispatch`, `iolist_size_1`,
+    // `iolist_size_continue`), OTP-29.1.1: the walk gets `reds_left * 8` yield counts and
+    // charges one reduction per eight of them.
     let root = args[0];
-    if let Some(state) = state {
-        let state = Arc::clone(state);
-        let walker = state
-            .downcast_ref::<Mutex<arinsal_bifs::IolistSizeWalk>>()
-            .ok_or(BifError::BADARG)?;
-        let mut walker = walker.lock().map_err(|_| BifError::SystemLimit)?;
-        let (done, reductions) = match walker.step(CHUNK) {
-            Ok(progress) => progress,
-            Err((error, reductions)) => {
-                return Ok(HandlerResult::Failed {
-                    error,
-                    reductions: reductions as u32,
-                });
-            }
-        };
-        if !done {
-            drop(walker);
-            return Ok(HandlerResult::Yield {
-                continuation: IOLIST_SIZE_CONTINUATION,
-                state,
-                reductions: reductions as u32,
-            });
-        }
-        let size = walker.take_size();
+    let reds_left = process.reductions.max(0) as usize;
+    let state = match state {
+        Some(state) => Arc::clone(state),
+        None => MagicRef::new(Mutex::new(arinsal_bifs::IolistSizeWalk::new(root))),
+    };
+    let walker = state
+        .downcast_ref::<Mutex<arinsal_bifs::IolistSizeWalk>>()
+        .ok_or(BifError::BADARG)?;
+    let mut walker = walker.lock().map_err(|_| BifError::SystemLimit)?;
+    if reds_left == 0 {
         drop(walker);
-        process.set_gc_enabled(restore_gc);
-        let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-            .int_from_u64(u64::try_from(size).map_err(|_| BifError::SystemLimit)?)
-            .map_err(|_| BifError::SystemLimit)?;
-        return Ok(HandlerResult::Done {
-            value,
-            reductions: reductions as u32,
+        return Ok(HandlerResult::Yield {
+            continuation: IOLIST_SIZE_CONTINUATION,
+            state,
+            reductions: 0,
         });
     }
-
-    let mut walker = arinsal_bifs::IolistSizeWalk::new(root);
-    let (done, reductions) = match walker.step(CHUNK) {
+    let (done, work) = match walker.step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED)) {
         Ok(progress) => progress,
-        Err((error, reductions)) => {
+        Err((error, work)) => {
             return Ok(HandlerResult::Failed {
                 error,
-                reductions: reductions as u32,
+                reductions: arinsal_bifs::iolist_yield_reductions(work) as u32,
             });
         }
     };
+    let reductions = arinsal_bifs::iolist_yield_reductions(work) as u32;
     if !done {
+        drop(walker);
         return Ok(HandlerResult::Yield {
             continuation: IOLIST_SIZE_CONTINUATION,
-            state: MagicRef::new(Mutex::new(walker)),
-            reductions: reductions as u32,
+            state,
+            reductions,
         });
     }
     let size = walker.take_size();
+    drop(walker);
+    process.set_gc_enabled(restore_gc);
     let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .int_from_u64(u64::try_from(size).map_err(|_| BifError::SystemLimit)?)
         .map_err(|_| BifError::SystemLimit)?;
-    Ok(HandlerResult::Done {
-        value,
-        reductions: reductions as u32,
-    })
+    Ok(HandlerResult::Done { value, reductions })
 }
 
 const SIZE_YIELDS_PER_RED: usize = 8;
@@ -2745,76 +2730,57 @@ fn iolist_to_iovec(
     }
 }
 
-fn iolist_conversion(
-    process: &mut Process,
-    root: Term,
-    state: Option<&Arc<MagicRef>>,
-    bitstring: bool,
-    restore_gc: bool,
-) -> Result<HandlerResult, BifError> {
-    const CHUNK: usize = 4096;
-    if !matches!(root.classify(), TermKind::List | TermKind::Nil) {
-        return Err(BifError::BADARG);
-    }
-    if let Some(state) = state {
-        let state = Arc::clone(state);
-        let walker = state
-            .downcast_ref::<Mutex<arinsal_bifs::IolistWalk>>()
-            .ok_or(BifError::BADARG)?;
-        let mut walker = walker.lock().map_err(|_| BifError::SystemLimit)?;
-        let (done, reductions) = match walker.step(CHUNK) {
-            Ok(progress) => progress,
-            Err((error, reductions)) => {
-                return Ok(HandlerResult::Failed {
-                    error,
-                    reductions: reductions as u32,
-                });
-            }
-        };
-        if !done {
-            drop(walker);
-            return Ok(HandlerResult::Yield {
-                continuation: IOLIST_CONTINUATION,
-                state,
-                reductions: reductions as u32,
-            });
-        }
-        let (bytes, bits) = walker.take_parts();
-        drop(walker);
-        process.set_gc_enabled(restore_gc);
-        let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-            .bitstring(&bytes, bits)
-            .map_err(|_| BifError::SystemLimit)?;
-        return Ok(HandlerResult::Done {
-            value,
-            reductions: reductions as u32,
-        });
-    }
+enum IolistCopySetup {
+    Empty(Term),
+    Ready {
+        output: IolistOutput,
+        bit_len: usize,
+        walk: arinsal_bifs::IolistCopyWalk,
+    },
+}
 
-    let mut walker = arinsal_bifs::IolistWalk::new(root, bitstring);
-    let (done, reductions) = match walker.step(CHUNK) {
-        Ok(progress) => progress,
-        Err((error, reductions)) => {
-            return Ok(HandlerResult::Failed {
-                error,
-                reductions: reductions as u32,
-            });
+/// Allocate the result after the size pass of `list_to_binary/1` and friends (`bitstring` false)
+/// or `list_to_bitstring/1`.
+// Port of erts/emulator/beam/erl_iolist.c (`list_to_bitstring_dispatch`), OTP-29.1.1.
+fn iolist_copy_setup(
+    process: &mut Process,
+    size: &mut arinsal_bifs::IolistSizeWalk,
+    root: Term,
+) -> Result<IolistCopySetup, BifError> {
+    if size.is_bits() {
+        let bit_len = size.take_bits();
+        if bit_len == 0 {
+            let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                .bitstring(&[], 0)
+                .map_err(|_| BifError::SystemLimit)?;
+            return Ok(IolistCopySetup::Empty(value));
         }
-    };
-    if !done {
-        return Ok(HandlerResult::Yield {
-            continuation: IOLIST_CONTINUATION,
-            state: MagicRef::new(Mutex::new(walker)),
-            reductions: reductions as u32,
+        return Ok(IolistCopySetup::Ready {
+            output: IolistOutput::Small(vec![0; bit_len.div_ceil(8)]),
+            bit_len,
+            walk: arinsal_bifs::IolistCopyWalk::new_bits(root),
         });
     }
-    let (bytes, bits) = walker.take_parts();
-    let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-        .bitstring(&bytes, bits)
-        .map_err(|_| BifError::SystemLimit)?;
-    Ok(HandlerResult::Done {
-        value,
-        reductions: reductions as u32,
+    let byte_len = size.take_size();
+    if byte_len == 0 {
+        let value = arinsal_bifs::allocate_iolist_binary(
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            0,
+        )?;
+        return Ok(IolistCopySetup::Empty(value));
+    }
+    let output = if byte_len <= 64 {
+        IolistOutput::Small(vec![0; byte_len])
+    } else {
+        IolistOutput::Writable(arinsal_bifs::allocate_iolist_binary(
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            byte_len,
+        )?)
+    };
+    Ok(IolistCopySetup::Ready {
+        output,
+        bit_len: byte_len * 8,
+        walk: arinsal_bifs::IolistCopyWalk::new(root),
     })
 }
 
@@ -2822,185 +2788,95 @@ fn iolist_binary_conversion(
     process: &mut Process,
     root: Term,
     state: Option<&Arc<MagicRef>>,
+    bitstring: bool,
     _restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
-    const SIZE_YIELDS_PER_RED: usize = 8;
-    if state.is_none() {
-        let mut walk = arinsal_bifs::IolistSizeWalk::new(root);
-        let initial_yield_count =
-            (process.reductions.max(0) as usize).saturating_mul(SIZE_YIELDS_PER_RED);
-        let (done, work) = match walk.step(initial_yield_count) {
-            Ok(progress) => progress,
-            Err((error, work)) => {
-                return Ok(HandlerResult::Failed {
-                    error,
-                    reductions: work.div_ceil(SIZE_YIELDS_PER_RED) as u32,
-                });
-            }
-        };
-        let size_reductions = work.div_ceil(SIZE_YIELDS_PER_RED);
-        if !done {
-            return Ok(HandlerResult::Yield {
-                continuation: IOLIST_CONTINUATION,
-                state: MagicRef::new(Mutex::new(IolistBinaryPhase::Size(walk))),
-                reductions: size_reductions as u32,
-            });
-        }
-        let byte_len = walk.take_size();
-        if byte_len == 0 {
-            let value = arinsal_bifs::allocate_iolist_binary(
-                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-                0,
-            )?;
-            return Ok(HandlerResult::Done {
-                value,
-                reductions: size_reductions as u32,
-            });
-        }
-        let mut output = if byte_len <= 64 {
-            IolistOutput::Small(vec![0; byte_len])
+    let Some(state) = state else {
+        let mut phase = IolistBinaryPhase::Size(if bitstring {
+            arinsal_bifs::IolistSizeWalk::new_bits(root)
         } else {
-            IolistOutput::Writable(arinsal_bifs::allocate_iolist_binary(
-                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-                byte_len,
-            )?)
-        };
-        let mut copy = arinsal_bifs::IolistCopyWalk::new(root);
-        let available_reductions =
-            (process.reductions.max(0) as usize).saturating_sub(size_reductions);
-        if available_reductions == 0 {
-            return Ok(HandlerResult::Yield {
+            arinsal_bifs::IolistSizeWalk::new(root)
+        });
+        return Ok(match iolist_binary_step(process, root, &mut phase)? {
+            IolistStep::Finished(result) => result,
+            IolistStep::Yield(reductions) => HandlerResult::Yield {
                 continuation: IOLIST_CONTINUATION,
-                state: MagicRef::new(Mutex::new(IolistBinaryPhase::Copy {
-                    output,
-                    byte_len,
-                    walk: copy,
-                })),
-                reductions: size_reductions as u32,
-            });
-        }
-        let yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
-        let stepped = match &mut output {
-            IolistOutput::Small(bytes) => copy.step(bytes, yield_count),
-            IolistOutput::Writable(term) => {
-                arinsal_bifs::with_iolist_binary_output(*term, |bytes| {
-                    Ok(copy.step(bytes, yield_count))
-                })?
-            }
-        };
-        let (done, work) = match stepped {
-            Ok(progress) => progress,
-            Err((error, work)) => {
-                output.finish_writer();
-                return Ok(HandlerResult::Failed {
-                    error,
-                    reductions: (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32,
-                });
-            }
-        };
-        let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
-        if !done {
-            return Ok(HandlerResult::Yield {
-                continuation: IOLIST_CONTINUATION,
-                state: MagicRef::new(Mutex::new(IolistBinaryPhase::Copy {
-                    output,
-                    byte_len,
-                    walk: copy,
-                })),
+                state: MagicRef::new(Mutex::new(phase)),
                 reductions,
-            });
-        }
-        if copy.written() != byte_len {
-            output.finish_writer();
-            return Ok(HandlerResult::Failed {
-                error: BifError::SystemLimit,
-                reductions,
-            });
-        }
-        let value = match output {
-            IolistOutput::Small(bytes) => {
-                TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-                    .binary(&bytes)
-                    .map_err(|_| BifError::SystemLimit)?
-            }
-            IolistOutput::Writable(term) => {
-                arinsal_bifs::finish_iolist_binary_output(term);
-                term
-            }
-        };
-        return Ok(HandlerResult::Done { value, reductions });
-    }
-    // list_to_bitstring traps to the same continuation export as list_to_binary
-    // (erl_iolist.c list_to_bitstring_continue), so the state decides which walk resumes.
-    if state.is_some_and(|state| {
-        state
-            .downcast_ref::<Mutex<arinsal_bifs::IolistWalk>>()
-            .is_some()
-    }) {
-        return iolist_conversion(process, root, state, true, _restore_gc);
-    }
-    let state = Arc::clone(state.expect("resumed iolist conversion has state"));
+            },
+        });
+    };
+    let state = Arc::clone(state);
     let phase = state
         .downcast_ref::<Mutex<IolistBinaryPhase>>()
         .ok_or(BifError::BADARG)?;
     let mut phase = phase.lock().map_err(|_| BifError::SystemLimit)?;
+    let step = iolist_binary_step(process, root, &mut phase)?;
+    drop(phase);
+    Ok(match step {
+        IolistStep::Finished(result) => result,
+        IolistStep::Yield(reductions) => HandlerResult::Yield {
+            continuation: IOLIST_CONTINUATION,
+            state,
+            reductions,
+        },
+    })
+}
+
+enum IolistStep {
+    Finished(HandlerResult),
+    Yield(u32),
+}
+
+fn iolist_binary_step(
+    process: &mut Process,
+    root: Term,
+    phase: &mut IolistBinaryPhase,
+) -> Result<IolistStep, BifError> {
+    const SIZE_YIELDS_PER_RED: usize = 8;
+    let finished = |result| Ok(IolistStep::Finished(result));
     let mut available_reductions = process.reductions.max(0) as usize;
     let mut size_reductions = 0_usize;
 
-    match &mut *phase {
+    match phase {
         IolistBinaryPhase::Size(walk) => {
-            let initial_yield_count =
-                (process.reductions.max(0) as usize).saturating_mul(SIZE_YIELDS_PER_RED);
+            let initial_yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
             let (done, work) = match walk.step(initial_yield_count) {
                 Ok(progress) => progress,
                 Err((error, work)) => {
                     let reductions = work.div_ceil(SIZE_YIELDS_PER_RED) as u32;
-                    return Ok(HandlerResult::Failed { error, reductions });
+                    return finished(HandlerResult::Failed { error, reductions });
                 }
             };
             size_reductions = work.div_ceil(SIZE_YIELDS_PER_RED);
             if !done {
-                drop(phase);
-                return Ok(HandlerResult::Yield {
-                    continuation: IOLIST_CONTINUATION,
-                    state,
-                    reductions: size_reductions as u32,
-                });
+                return Ok(IolistStep::Yield(size_reductions as u32));
             }
-
-            let byte_len = walk.take_size();
-            if byte_len == 0 {
-                let value = arinsal_bifs::allocate_iolist_binary(
-                    &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-                    0,
-                )?;
-                *phase = IolistBinaryPhase::Done;
-                return Ok(HandlerResult::Done {
-                    value,
-                    reductions: size_reductions as u32,
-                });
+            let bitstring = walk.is_bits();
+            match iolist_copy_setup(process, walk, root)? {
+                IolistCopySetup::Empty(value) => {
+                    *phase = IolistBinaryPhase::Done;
+                    return finished(HandlerResult::Done {
+                        value,
+                        reductions: size_reductions as u32,
+                    });
+                }
+                IolistCopySetup::Ready {
+                    output,
+                    bit_len,
+                    walk,
+                } => {
+                    *phase = IolistBinaryPhase::Copy {
+                        output,
+                        bit_len,
+                        bitstring,
+                        walk,
+                    };
+                }
             }
-            let output = if byte_len <= 64 {
-                IolistOutput::Small(vec![0; byte_len])
-            } else {
-                IolistOutput::Writable(arinsal_bifs::allocate_iolist_binary(
-                    &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-                    byte_len,
-                )?)
-            };
-            *phase = IolistBinaryPhase::Copy {
-                output,
-                byte_len,
-                walk: arinsal_bifs::IolistCopyWalk::new(root),
-            };
             available_reductions = available_reductions.saturating_sub(size_reductions);
             if available_reductions == 0 {
-                drop(phase);
-                return Ok(HandlerResult::Yield {
-                    continuation: IOLIST_CONTINUATION,
-                    state,
-                    reductions: size_reductions as u32,
-                });
+                return Ok(IolistStep::Yield(size_reductions as u32));
             }
         }
         IolistBinaryPhase::Copy { .. } => {}
@@ -3009,7 +2885,8 @@ fn iolist_binary_conversion(
 
     let IolistBinaryPhase::Copy {
         output,
-        byte_len,
+        bit_len,
+        bitstring,
         walk,
     } = &mut *phase
     else {
@@ -3027,30 +2904,31 @@ fn iolist_binary_conversion(
         Err((error, work)) => {
             let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
             output.finish_writer();
-            return Ok(HandlerResult::Failed { error, reductions });
+            return finished(HandlerResult::Failed { error, reductions });
         }
     };
     let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
     if !done {
-        drop(phase);
-        return Ok(HandlerResult::Yield {
-            continuation: IOLIST_CONTINUATION,
-            state,
-            reductions,
-        });
+        return Ok(IolistStep::Yield(reductions));
     }
-    if walk.written() != *byte_len {
+    if walk.written_bits() != *bit_len {
         output.finish_writer();
-        return Ok(HandlerResult::Failed {
+        return finished(HandlerResult::Failed {
             error: BifError::SystemLimit,
             reductions,
         });
     }
-    let result = match output {
+    let (bit_len, bitstring) = (*bit_len, *bitstring);
+    let value = match output {
         IolistOutput::Small(bytes) => {
-            TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-                .binary(bytes)
-                .map_err(|_| BifError::SystemLimit)?
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            let mut builder = TermBuilder::new(&mut heap);
+            if bitstring {
+                builder.bitstring(bytes, bit_len)
+            } else {
+                builder.binary(bytes)
+            }
+            .map_err(|_| BifError::SystemLimit)?
         }
         IolistOutput::Writable(term) => {
             arinsal_bifs::finish_iolist_binary_output(*term);
@@ -3058,10 +2936,7 @@ fn iolist_binary_conversion(
         }
     };
     *phase = IolistBinaryPhase::Done;
-    Ok(HandlerResult::Done {
-        value: result,
-        reductions,
-    })
+    finished(HandlerResult::Done { value, reductions })
 }
 
 fn binary_to_term(

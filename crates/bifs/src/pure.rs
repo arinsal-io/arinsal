@@ -1364,21 +1364,13 @@ pub fn bitstring_bit_len(term: Term) -> Result<usize, BifError> {
     with_binary_bytes(term, |view| view.bit_len())
 }
 
-/// Stateful iolist conversion used by VM continuation exports.
-// Port of erts/emulator/beam/erl_iolist.c:842-935, OTP-29.1.1.
-pub struct IolistWalk {
-    work: SmallVec<[(Term, bool); 8]>,
-    bytes: SmallVec<[u8; 64]>,
-    bit_len: usize,
-    bitstring: bool,
-}
-
 /// Stateful iolist size calculation used by the VM continuation export.
 // Port of erts/emulator/beam/erl_iolist.c:1013-1070, OTP-29.1.1.
 pub struct IolistSizeWalk {
     current: Term,
     tails: SmallVec<[Term; 8]>,
     size: usize,
+    unit: usize,
 }
 
 impl IolistSizeWalk {
@@ -1388,16 +1380,39 @@ impl IolistSizeWalk {
             current: root,
             tails: SmallVec::new(),
             size: 0,
+            unit: 8,
         }
     }
 
-    /// Process at most `budget` list nodes and leaves.
+    /// Start a walk that accepts bitstrings of any size, for `list_to_bitstring/1`.
+    pub fn new_bits(root: Term) -> Self {
+        Self {
+            unit: 1,
+            ..Self::new(root)
+        }
+    }
+
+    /// Whether this walk was started by `new_bits`.
+    pub fn is_bits(&self) -> bool {
+        self.unit == 1
+    }
+
+    /// Return the accumulated bit count after a complete traversal.
+    pub fn take_bits(&mut self) -> usize {
+        std::mem::take(&mut self.size)
+    }
+
+    /// Count at most `budget - 1` yield counts of list cells and leaves like `generic_iolist_size`.
+    ///
+    /// Returns whether the walk finished and the yield counts used; a walk that ran out of
+    /// budget reports all of it.
+    // Port of erts/emulator/beam/erl_iolist.c (generic_iolist_size), OTP-29.1.1.
     pub fn step(&mut self, budget: usize) -> Result<(bool, usize), (BifError, usize)> {
         let mut consumed = 0;
         loop {
             while self.current.classify() == TermKind::List {
-                if consumed == budget {
-                    return Ok((false, consumed));
+                if consumed + 1 >= budget {
+                    return Ok((false, budget));
                 }
                 consumed += 1;
                 let (head, tail) = iolist_cons(self.current).map_err(|error| (error, consumed))?;
@@ -1410,8 +1425,8 @@ impl IolistSizeWalk {
                 self.current = tail;
             }
 
-            if consumed == budget {
-                return Ok((false, consumed));
+            if consumed + 1 >= budget {
+                return Ok((false, budget));
             }
             consumed += 1;
             self.add(self.current, false)
@@ -1433,7 +1448,7 @@ impl IolistSizeWalk {
             TermKind::Nil => Ok(()),
             TermKind::Bitstring => {
                 let bits = bitstring_bit_len(term)?;
-                if !bits.is_multiple_of(8) {
+                if !bits.is_multiple_of(self.unit) {
                     return Err(BADARG);
                 }
                 // Port of erts/emulator/beam/erl_iolist.c:139-191
@@ -1456,99 +1471,7 @@ impl IolistSizeWalk {
     }
 }
 
-impl IolistWalk {
-    /// Start traversing an input already rooted in a stable heap.
-    pub fn new(root: Term, bitstring: bool) -> Self {
-        Self {
-            work: smallvec![(root, false)],
-            bytes: SmallVec::new(),
-            bit_len: 0,
-            bitstring,
-        }
-    }
-
-    /// Process at most `budget` list and leaf elements; return whether traversal finished.
-    pub fn step(&mut self, budget: usize) -> Result<(bool, usize), (BifError, usize)> {
-        let mut remaining = budget;
-        let mut consumed = 0;
-        while remaining > 0 {
-            let Some((term, byte_allowed)) = self.work.pop() else {
-                return Ok((true, consumed));
-            };
-            remaining -= 1;
-            consumed += 1;
-            match term.classify() {
-                TermKind::Nil => {}
-                TermKind::List => {
-                    let (head, tail) = iolist_cons(term).map_err(|error| (error, consumed))?;
-                    self.work.push((tail, false));
-                    self.work.push((head, true));
-                }
-                TermKind::Bitstring => {
-                    if self.bitstring {
-                        append_term_bitstring(&mut self.bytes, &mut self.bit_len, term)
-                            .map_err(|error| (error, consumed))?;
-                    } else {
-                        self.append_binary(term)
-                            .map_err(|error| (error, consumed))?;
-                    }
-                }
-                TermKind::Number if byte_allowed => {
-                    let byte = term
-                        .as_small()
-                        .and_then(|number| u8::try_from(number).ok())
-                        .ok_or((BADARG, consumed))?;
-                    if self.bitstring {
-                        for bit in 0..8 {
-                            append_bit(&mut self.bytes, &mut self.bit_len, (byte >> (7 - bit)) & 1);
-                        }
-                    } else {
-                        self.append_bytes(&[byte])
-                            .map_err(|error| (error, consumed))?;
-                    }
-                }
-                _ => return Err((BADARG, consumed)),
-            }
-        }
-        Ok((self.work.is_empty(), consumed))
-    }
-
-    /// Return accumulated data and significant bit count after completion.
-    pub fn take_parts(&mut self) -> (SmallVec<[u8; 64]>, usize) {
-        (std::mem::take(&mut self.bytes), self.bit_len)
-    }
-
-    fn append_bytes(&mut self, bytes: &[u8]) -> Result<(), BifError> {
-        let len = self
-            .bytes
-            .len()
-            .checked_add(bytes.len())
-            .filter(|length| *length <= (1 << 30))
-            .ok_or(BifError::SystemLimit)?;
-        self.bytes.reserve(len - self.bytes.len());
-        self.bytes.extend_from_slice(bytes);
-        self.bit_len = len.checked_mul(8).ok_or(BifError::SystemLimit)?;
-        Ok(())
-    }
-
-    fn append_binary(&mut self, term: Term) -> Result<(), BifError> {
-        let bits = bitstring_bit_len(term)?;
-        if !bits.is_multiple_of(8) {
-            return Err(BADARG);
-        }
-        let additional = bits / 8;
-        let previous = self.bytes.len();
-        let len = previous
-            .checked_add(additional)
-            .filter(|length| *length <= (1 << 30))
-            .ok_or(BifError::SystemLimit)?;
-        self.bytes.resize(len, 0);
-        copy_binary_range(term, 0, &mut self.bytes[previous..len])?;
-        self.bit_len = len.checked_mul(8).ok_or(BifError::SystemLimit)?;
-        Ok(())
-    }
-}
-fn iolist_cons(term: Term) -> Result<(Term, Term), BifError> {
+pub(crate) fn iolist_cons(term: Term) -> Result<(Term, Term), BifError> {
     // SAFETY: The source heap remains live throughout the BIF call.
     unsafe { term.cons_ref() }.ok_or(BADARG)
 }
