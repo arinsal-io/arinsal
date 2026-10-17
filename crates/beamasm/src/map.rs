@@ -1014,9 +1014,9 @@ impl BeamModuleAssembler {
         }
         let args = [Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)];
         if result_in_tmp_mem {
-            emit_map_runtime_status(self, helper as usize, &args, 0, Update::HEAP_ALLOC)?;
+            emit_map_runtime_status(self, helper as usize, &args, 6, Update::HEAP_ALLOC)?;
         } else {
-            emit_map_runtime_framed(self, helper as usize, &args, 0, Update::HEAP_ALLOC)?;
+            emit_map_runtime_framed(self, helper as usize, &args, 6, Update::HEAP_ALLOC)?;
         }
         if result_in_tmp_mem {
             let tmp_mem = std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32;
@@ -1166,14 +1166,14 @@ fn emit_update_map_single_exact_body_shared(
         e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
         e.mov_reg(Gpr::x(29), Gpr::sp())
     })?;
-    emit_enter_runtime(code, 0, Update::HEAP_ALLOC)?;
+    emit_enter_runtime(code, 6, Update::HEAP_ALLOC)?;
     code.emit(|e| {
         e.mov_reg(Gpr::x(0), Gpr::x(21))?;
         e.add_imm(Gpr::x(4), Gpr::x(19), (tmp_mem1 >> 12) as u16, true)?;
         e.mov_const(Gpr::x(17), helper as usize as u64)?;
         e.blr(Gpr::x(17))
     })?;
-    emit_leave_runtime(code, 0, Update::HEAP_ALLOC)?;
+    emit_leave_runtime(code, 6, Update::HEAP_ALLOC)?;
     code.emit(|e| e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
     code.cbz(Gpr::w(0), error)?;
     code.emit(|e| e.ldr_uoff(Gpr::x(0), Gpr::x(19), tmp_mem1))?;
