@@ -1585,6 +1585,20 @@ mod tests {
         let out = crate::lookup("erlang", "++", 2).unwrap()(&mut ctx, &[list, Term::NIL]).unwrap();
         assert_eq!(out, list);
     }
+
+    #[test]
+    fn integer_to_list_is_one_allocation_even_when_the_heap_is_nearly_full() {
+        let mut heap = ProcessHeap::with_words(64);
+        let left = heap.halloc_words_left().unwrap();
+        assert!(heap.alloc_halloc(left - 3).is_some());
+        let used = heap.used_words();
+        let mut alloc = ProcessHeapHandle(&mut heap);
+        let mut ctx = Ctx::new(&mut alloc);
+        let bif = crate::lookup("erlang", "integer_to_list", 1).unwrap();
+        bif(&mut ctx, &[Term::small(5555).unwrap()]).unwrap();
+        assert_eq!(heap.used_words(), used);
+        assert_eq!(heap.fragment_words(), 8);
+    }
 }
 
 #[cfg(test)]

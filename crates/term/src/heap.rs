@@ -2347,23 +2347,31 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         store(p.wrapping_add(1), tail.bits());
         Ok(Term::from_ptr(p, 1))
     }
-    /// Build a list in iteration order.
+    /// Build a list in iteration order from one reservation of `2 * n` words.
+    /// Port of the single `HAlloc(c_p, 2*n)` followed by `buf_to_intlist`
+    /// (erts/emulator/beam/utils.c) that `integer_to_list` in
+    /// erts/emulator/beam/bif.c issues: the whole run lands on the heap or in
+    /// one heap fragment, never split across both.
     pub fn list_from_iter(
         &mut self,
         values: impl IntoIterator<Item = Term>,
     ) -> Result<Term, TermError> {
         let values: Vec<Term> = values.into_iter().collect();
-        let mut tail = Term::NIL;
-        for value in values.into_iter().rev() {
-            tail = self.cons(value, tail)?;
-        }
-        Ok(tail)
+        self.list_from_slice(&values)
     }
-    /// Build a list from a slice without staging the elements.
+    /// Build a list from a slice with one reservation of `2 * n` words.
     pub fn list_from_slice(&mut self, values: &[Term]) -> Result<Term, TermError> {
+        if values.is_empty() {
+            return Ok(Term::NIL);
+        }
+        let words = values.len().checked_mul(2).ok_or(TermError::SystemLimit)?;
+        let run = self.words(words)?;
         let mut tail = Term::NIL;
-        for value in values.iter().rev() {
-            tail = self.cons(*value, tail)?;
+        for (index, value) in values.iter().enumerate().rev() {
+            let cell = run.wrapping_add(2 * index);
+            store(cell, value.bits());
+            store(cell.wrapping_add(1), tail.bits());
+            tail = Term::from_ptr(cell, 1);
         }
         Ok(tail)
     }
