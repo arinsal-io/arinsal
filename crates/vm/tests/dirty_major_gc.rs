@@ -121,7 +121,6 @@ body(Parent, N, K, live) ->
     L = lists:seq(1, N),
     erlang:garbage_collect(),
     receive go -> ok end,
-    {reductions, _} = process_info(self(), reductions),
     spin(K),
     {reductions, R0} = process_info(self(), reductions),
     erlang:garbage_collect(),
@@ -131,7 +130,6 @@ body(Parent, N, K, dead) ->
     L = lists:seq(1, N),
     Len = length(L),
     receive go -> ok end,
-    {reductions, _} = process_info(self(), reductions),
     spin(K),
     {reductions, R0} = process_info(self(), reductions),
     erlang:garbage_collect(),
@@ -288,4 +286,91 @@ fn explicit_dirty_gc_reductions_match_otp_formula() {
     );
     check_all("erl", &expected);
     check_all("arinsal", &actual);
+}
+
+const SIZES_SOURCE: &str = r#"
+-module(dirty_gc_sizes).
+-export([run/0]).
+
+run() -> [case_(N, Kind) || Kind <- [self_gc, other_gc, other_gc_minor], N <- [100000, 400000, 800000]].
+
+grow(0, Acc) -> Acc;
+grow(N, Acc) -> grow(N - 1, [N | Acc]).
+
+sizes() ->
+    {garbage_collection_info, Info} = process_info(self(), garbage_collection_info),
+    {total_heap_size, Total} = process_info(self(), total_heap_size),
+    {heap_size, Heap} = process_info(self(), heap_size),
+    {Total, Heap, [proplists:get_value(K, Info) ||
+        K <- [heap_block_size, old_heap_block_size, old_heap_size, recent_size, mbuf_size]]}.
+
+body(Parent, N, Kind) ->
+    L = grow(N, []),
+    Parent ! ready,
+    receive go -> ok end,
+    case Kind of
+        self_gc -> erlang:garbage_collect();
+        _ -> ok
+    end,
+    Parent ! collected,
+    receive go2 -> ok end,
+    First = sizes(),
+    Second = sizes(),
+    Parent ! {done, {First, Second, length(L)}}.
+
+case_(N, Kind) ->
+    Parent = self(),
+    P = spawn(fun() -> body(Parent, N, Kind) end),
+    receive ready -> ok end,
+    erlang:trace(P, true, [garbage_collection]),
+    P ! go,
+    case Kind of
+        self_gc -> ok;
+        other_gc ->
+            receive collected -> ok end,
+            true = erlang:garbage_collect(P);
+        other_gc_minor ->
+            receive collected -> ok end,
+            true = erlang:garbage_collect(P, [{type, minor}])
+    end,
+    case Kind of
+        self_gc -> receive collected -> ok end;
+        _ -> ok
+    end,
+    P ! go2,
+    receive {done, Sizes} ->
+        receive after 50 -> ok end,
+        {N, Kind, Sizes, [{Event, [proplists:get_value(K, Info) ||
+            K <- [heap_block_size, old_heap_block_size, old_heap_size, recent_size]]}
+            || {Event, Info} <- flush([])]}
+    end.
+
+flush(Acc) ->
+    receive
+        {trace, _, Event, Info} -> flush([{Event, Info} | Acc])
+    after 0 -> lists:reverse(Acc)
+    end.
+"#;
+
+#[test]
+fn explicit_gc_heap_sizes_and_events_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dirty GC heap sizing differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named("dirty_gc_sizes", SIZES_SOURCE, &[])
+        .expect("compile dirty_gc_sizes");
+    reference
+        .load("dirty_gc_sizes", &beam)
+        .expect("load into erl");
+    let CallResult::Ok(expected) = reference.call("dirty_gc_sizes", "run", &[]) else {
+        panic!("erl run failed");
+    };
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).expect("load into arinsal");
+    let actual = vm
+        .eval_scheduled("dirty_gc_sizes", "run", &[], 2, None)
+        .expect("scheduled dirty GC sizes run");
+    assert_eq!(expected, actual.term);
 }
