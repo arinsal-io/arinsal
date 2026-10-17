@@ -11,7 +11,15 @@ const BIN_FLAG_WRITABLE: u64 = 1 << 2;
 thread_local! {
     /// Count of `NodeRef::set_word` calls on this thread, for the tree upkeep tests.
     pub(crate) static NODE_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Count of `NodeRef::word` calls on this thread, for the tree upkeep tests.
+    pub(crate) static NODE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Count of node address checks (`NodeRef::new`) on this thread, for the tree upkeep tests.
+    pub(crate) static NODE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+/// Words of a free-block tree node, header included: the bestfit and aoff layout of
+/// erl_bestfit_alloc.c and erl_ao_firstfit_alloc.c.
+pub(crate) const NODE_WORDS: usize = 7;
 
 /// A free-block or carrier tree node: a few consecutive machine words at a known address.
 ///
@@ -21,24 +29,20 @@ thread_local! {
 #[derive(Clone, Copy)]
 pub(crate) struct NodeRef {
     ptr: usize,
-    words: usize,
 }
 
 impl NodeRef {
-    /// A node of `words` words at `key`, if all of them lie inside `[span_start, span_end)`.
+    /// The node at `key`, if all `NODE_WORDS` of it lie inside the carrier starting at
+    /// `span_start`. `node_limit` is the carrier's length minus `NODE_WORDS` words, plus one, so
+    /// one unsigned compare of the offset covers both ends.
     ///
     /// The range must belong to a live carrier of the calling allocator; the allocator indexes
     /// carriers by exactly this range and drops the index before the memory is released.
     #[inline(always)]
-    pub(crate) fn new(
-        span_start: usize,
-        span_end: usize,
-        key: usize,
-        words: usize,
-    ) -> Option<Self> {
-        let end = key.checked_add(words.checked_mul(WORD_BYTES)?)?;
-        (key >= span_start && key.is_multiple_of(WORD_BYTES) && end <= span_end)
-            .then_some(Self { ptr: key, words })
+    pub(crate) fn new(span_start: usize, node_limit: usize, key: usize) -> Option<Self> {
+        #[cfg(test)]
+        NODE_CHECKS.with(|checks| checks.set(checks.get() + 1));
+        (key.wrapping_sub(span_start) < node_limit).then_some(Self { ptr: key })
     }
 
     /// The address of the node.
@@ -47,23 +51,48 @@ impl NodeRef {
         self.ptr
     }
 
+    /// The `T` at byte offset `byte` of the node.
+    #[inline(always)]
+    pub(crate) fn load<T: Copy>(self, byte: usize) -> T {
+        assert!(byte + std::mem::size_of::<T>() <= NODE_WORDS * WORD_BYTES);
+        #[cfg(test)]
+        NODE_READS.with(|reads| reads.set(reads.get() + 1));
+        // SAFETY: `new` checked that `NODE_WORDS` words from `ptr` lie inside a live carrier, and
+        // the access stays inside them. The read is unaligned so that a corrupt link cannot make
+        // it undefined behavior.
+        unsafe {
+            (self.ptr as *const u8)
+                .add(byte)
+                .cast::<T>()
+                .read_unaligned()
+        }
+    }
+
+    /// Stores `value` at byte offset `byte` of the node.
+    #[inline(always)]
+    pub(crate) fn store<T: Copy>(self, byte: usize, value: T) {
+        assert!(byte + std::mem::size_of::<T>() <= NODE_WORDS * WORD_BYTES);
+        #[cfg(test)]
+        NODE_WRITES.with(|writes| writes.set(writes.get() + 1));
+        // SAFETY: as in `load`; the allocator owns its carriers exclusively while it is borrowed.
+        unsafe {
+            (self.ptr as *mut u8)
+                .add(byte)
+                .cast::<T>()
+                .write_unaligned(value)
+        }
+    }
+
     /// Word `index` of the node.
     #[inline(always)]
     pub(crate) fn word(self, index: usize) -> usize {
-        assert!(index < self.words);
-        // SAFETY: `new` checked that `words` aligned words from `ptr` lie inside a live carrier,
-        // and `index < words`.
-        unsafe { (self.ptr as *const usize).add(index).read() }
+        self.load::<usize>(index * WORD_BYTES)
     }
 
     /// Stores `value` into word `index` of the node.
     #[inline(always)]
     pub(crate) fn set_word(self, index: usize, value: usize) {
-        assert!(index < self.words);
-        #[cfg(test)]
-        NODE_WRITES.with(|writes| writes.set(writes.get() + 1));
-        // SAFETY: as in `word`; the allocator owns its carriers exclusively while it is borrowed.
-        unsafe { (self.ptr as *mut usize).add(index).write(value) }
+        self.store::<usize>(index * WORD_BYTES, value)
     }
 }
 
