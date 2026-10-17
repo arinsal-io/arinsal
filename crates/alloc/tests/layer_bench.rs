@@ -1,0 +1,159 @@
+//! Timing of each allocator layer on one workload, through the public API only so the library is
+//! built without its test-only counters: `cargo test --release -p arinsal-alloc --test layer_bench
+//! -- --ignored --nocapture`.
+
+use arinsal_alloc::alloc_util::{AllocUtil, AllocUtilOptions, Strategy};
+use arinsal_alloc::instances::ThreadSpecificAllocators;
+use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
+use arinsal_alloc::{ThreadKind, register_thread};
+use std::time::Instant;
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+fn cycles() -> usize {
+    std::env::var("FRAG_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000)
+}
+
+fn best_of<F: FnMut(usize) -> f64>(mut run: F) -> f64 {
+    let cycles = cycles();
+    (0..5).map(|_| run(cycles)).fold(f64::MAX, f64::min)
+}
+
+fn per_pair(started: Instant, cycles: usize) -> f64 {
+    started.elapsed().as_nanos() as f64 / (cycles as f64 * 26.0)
+}
+
+fn alloc_util_alone(background: bool) -> f64 {
+    best_of(|cycles| {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut allocator = AllocUtil::new(Strategy::AoffCbf, AllocUtilOptions::default());
+        if background {
+            let bg: Vec<_> = (0..2000)
+                .map(|_| {
+                    allocator
+                        .alloc(16 + (rng.next() % 20) as usize * 16)
+                        .unwrap()
+                })
+                .collect();
+            for allocation in bg.iter().step_by(2) {
+                allocator.free(*allocation).unwrap();
+            }
+        }
+        let mut live = Vec::with_capacity(32);
+        let started = Instant::now();
+        for _ in 0..cycles {
+            for _ in 0..26 {
+                live.push(allocator.alloc(8 + (rng.next() % 12) as usize * 8).unwrap());
+            }
+            for allocation in live.drain(..) {
+                allocator.free(allocation).unwrap();
+            }
+        }
+        per_pair(started, cycles)
+    })
+}
+
+fn instance_layer(background: bool) -> f64 {
+    best_of(|cycles| {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let allocators =
+            ThreadSpecificAllocators::new(4, true, Strategy::AoffCbf, AllocUtilOptions::default());
+        if background {
+            let bg: Vec<_> = (0..2000)
+                .map(|_| {
+                    allocators
+                        .alloc(16 + (rng.next() % 20) as usize * 16)
+                        .unwrap()
+                })
+                .collect();
+            for allocation in bg.iter().step_by(2) {
+                allocators.free(*allocation).unwrap();
+            }
+        }
+        let mut live = Vec::with_capacity(32);
+        let started = Instant::now();
+        for _ in 0..cycles {
+            for _ in 0..26 {
+                live.push(
+                    allocators
+                        .alloc(8 + (rng.next() % 12) as usize * 8)
+                        .unwrap(),
+                );
+            }
+            for handle in live.drain(..) {
+                allocators.free(handle).unwrap();
+            }
+        }
+        per_pair(started, cycles)
+    })
+}
+
+fn alloc_block(background: bool) -> f64 {
+    best_of(|cycles| {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        if background {
+            let bg: Vec<_> = (0..2000)
+                .map(|_| {
+                    AllocBlock::new(ErtsAlcType::HEAP_FRAG, 2 + (rng.next() % 20) as usize * 2)
+                        .unwrap()
+                })
+                .collect();
+            for (index, block) in bg.into_iter().enumerate() {
+                if index % 2 == 0 {
+                    drop(block);
+                } else {
+                    std::mem::forget(block);
+                }
+            }
+        }
+        let mut live = Vec::with_capacity(32);
+        let started = Instant::now();
+        for _ in 0..cycles {
+            for _ in 0..26 {
+                live.push(
+                    AllocBlock::new(ErtsAlcType::HEAP_FRAG, 1 + (rng.next() % 12) as usize)
+                        .unwrap(),
+                );
+            }
+            live.clear();
+        }
+        per_pair(started, cycles)
+    })
+}
+
+#[test]
+#[ignore = "timing: cargo test --release -p arinsal-alloc --test layer_bench -- --ignored --nocapture"]
+fn layer_bench() {
+    std::thread::spawn(|| {
+        assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+        for background in [false, true] {
+            eprintln!("background fragmentation: {background}");
+            eprintln!(
+                "  AllocUtil alone          {:6.2} ns per pair",
+                alloc_util_alone(background)
+            );
+            eprintln!(
+                "  ThreadSpecificAllocators {:6.2} ns per pair",
+                instance_layer(background)
+            );
+            eprintln!(
+                "  AllocBlock new+drop      {:6.2} ns per pair",
+                alloc_block(background)
+            );
+        }
+    })
+    .join()
+    .unwrap();
+}

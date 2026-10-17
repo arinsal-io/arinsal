@@ -147,12 +147,11 @@ struct Shared {
     work_scheduled: AtomicBool,
 }
 
-/// An instance with its lock and size counter mirror in one cache line pair: the counters
-/// and the lock word precede the first words of the allocator that every alloc and free touches.
+/// An instance with its lock and block size mirror in one cache line pair: the counter and the
+/// lock word precede the first words of the allocator that every alloc and free touches.
 #[repr(C, align(128))]
 struct Slot {
     blocks_size: AtomicUsize,
-    carriers_size: AtomicUsize,
     lock: parking_lot::Mutex<Instance>,
 }
 
@@ -181,11 +180,9 @@ impl std::ops::DerefMut for InstanceGuard<'_> {
 impl Drop for InstanceGuard<'_> {
     #[inline(always)]
     fn drop(&mut self) {
-        let (blocks_size, carriers_size) = self.guard.allocator.size_counters();
-        self.slot.blocks_size.store(blocks_size, Ordering::Relaxed);
         self.slot
-            .carriers_size
-            .store(carriers_size, Ordering::Relaxed);
+            .blocks_size
+            .store(self.guard.allocator.blocks_size(), Ordering::Relaxed);
     }
 }
 
@@ -372,7 +369,6 @@ impl ThreadSpecificAllocators {
                 .into_iter()
                 .map(|allocator| Slot {
                     blocks_size: AtomicUsize::new(0),
-                    carriers_size: AtomicUsize::new(0),
                     lock: parking_lot::Mutex::new(Instance { allocator }),
                 })
                 .collect(),
@@ -406,12 +402,15 @@ impl ThreadSpecificAllocators {
     ) -> Result<(InstanceAllocation, *mut u64), AllocError> {
         let instance = self.current_instance();
         let mut state = self.lock_instance(instance);
-        self.drain_and_publish(instance, &mut state)?;
+        if !self.delayed[instance].is_empty() {
+            self.drain_and_publish(instance, &mut state)?;
+        }
+        debug_assert!(!state.allocator.has_pending_carriers());
         if self.pooled.load(Ordering::Acquire) != 0 && state.allocator.needs_carrier(size)? {
             self.fetch_for_size(instance, &mut state, size)?;
         }
         let allocation = state.allocator.alloc(size)?;
-        let ptr = state.allocator.payload_ptr(allocation)?;
+        let ptr = state.allocator.payload_address(allocation);
         Ok((
             InstanceAllocation {
                 instance,
@@ -454,7 +453,7 @@ impl ThreadSpecificAllocators {
                 Resolved::Elsewhere(..) => continue,
             };
             let resized = state.allocator.realloc(allocation, size)?;
-            let ptr = state.allocator.payload_ptr(resized)?;
+            let ptr = state.allocator.payload_address(resized);
             self.publish_transfers(instance, &mut state)?;
             // The new handle names the owning instance directly, so any route entry is stale.
             self.forget_route(allocation.id());
@@ -495,9 +494,11 @@ impl ThreadSpecificAllocators {
         if self.routed.load(Ordering::Acquire) == 0 && self.current_instance() == handle.instance {
             let instance = handle.instance;
             let mut state = self.lock_instance(instance);
-            if self.delayed[instance].is_empty() && !state.allocator.has_pending_carriers() {
-                state.allocator.free(handle.allocation)?;
-                return self.publish_transfers(instance, &mut state);
+            if self.delayed[instance].is_empty() {
+                debug_assert!(!state.allocator.has_pending_carriers());
+                let freed = state.allocator.free(handle.allocation);
+                self.publish_transfers(instance, &mut state)?;
+                return freed;
             }
         }
         self.free_routed(handle)
@@ -1294,6 +1295,259 @@ mod tests {
                 "instance layer: {:.2} ns per alloc+free pair",
                 nanos / (cycles as f64 * 26.0)
             );
+        })
+        .join()
+        .unwrap();
+    }
+
+    const P_LOCK: u32 = 1;
+    const P_TLS: u32 = 2;
+    const P_DDQ: u32 = 4;
+    const P_PEND: u32 = 128;
+    const P_PUB: u32 = 8;
+    const P_PTR: u32 = 16;
+    const P_ROUTE: u32 = 32;
+    const P_POOLED: u32 = 64;
+
+    impl ThreadSpecificAllocators {
+        #[inline(always)]
+        fn probe_alloc<const F: u32>(
+            &self,
+            ix: usize,
+            state: &mut Instance,
+            size: usize,
+        ) -> Allocation {
+            if F & P_DDQ != 0 && !self.delayed[ix].is_empty() {
+                panic!("delayed");
+            }
+            if F & P_POOLED != 0 && self.pooled.load(Ordering::Acquire) != 0 {
+                panic!("pooled");
+            }
+            let allocation = state.allocator.alloc(size).unwrap();
+            if F & P_PTR != 0 {
+                std::hint::black_box(state.allocator.payload_address(allocation));
+            }
+            allocation
+        }
+
+        #[inline(always)]
+        fn probe_free<const F: u32>(
+            &self,
+            ix: usize,
+            state: &mut Instance,
+            allocation: Allocation,
+        ) {
+            if F & P_ROUTE != 0 && self.routed.load(Ordering::Acquire) != 0 {
+                panic!("routed");
+            }
+            if F & P_DDQ != 0 && !self.delayed[ix].is_empty() {
+                panic!("delayed");
+            }
+            state.allocator.free(allocation).unwrap();
+            if F & P_PEND != 0 && state.allocator.has_pending_carriers() {
+                panic!("pending");
+            }
+        }
+
+        #[inline(always)]
+        fn probe_publish<const F: u32>(&self, ix: usize, state: &Instance) {
+            if F & P_PUB != 0 {
+                self.instances[ix]
+                    .blocks_size
+                    .store(state.allocator.blocks_size(), Ordering::Relaxed);
+            }
+        }
+
+        #[inline(never)]
+        fn probe_loop<const F: u32>(&self, cycles: usize, background: bool) -> f64 {
+            let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+            let mut next = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let mut held = if F & P_LOCK == 0 {
+                Some(self.instances[1].lock.lock())
+            } else {
+                None
+            };
+            let mut live: Vec<Allocation> = Vec::with_capacity(32);
+            let op_alloc = |this: &Self,
+                            held: &mut Option<parking_lot::MutexGuard<'_, Instance>>,
+                            size: usize|
+             -> Allocation {
+                let ix = if F & P_TLS != 0 {
+                    this.current_instance()
+                } else {
+                    1
+                };
+                if F & P_LOCK != 0 {
+                    let mut g = this.instances[ix].lock.lock();
+                    let a = this.probe_alloc::<F>(ix, &mut g, size);
+                    this.probe_publish::<F>(ix, &g);
+                    a
+                } else {
+                    this.probe_alloc::<F>(ix, held.as_mut().unwrap(), size)
+                }
+            };
+            let op_free = |this: &Self,
+                           held: &mut Option<parking_lot::MutexGuard<'_, Instance>>,
+                           a: Allocation| {
+                let ix = if F & P_TLS != 0 {
+                    this.current_instance()
+                } else {
+                    1
+                };
+                if F & P_LOCK != 0 {
+                    let mut g = this.instances[ix].lock.lock();
+                    this.probe_free::<F>(ix, &mut g, a);
+                    this.probe_publish::<F>(ix, &g);
+                } else {
+                    this.probe_free::<F>(ix, held.as_mut().unwrap(), a);
+                }
+            };
+            if background {
+                let bg: Vec<Allocation> = (0..2000)
+                    .map(|_| op_alloc(self, &mut held, 16 + (next() % 20) as usize * 16))
+                    .collect();
+                for a in bg.iter().step_by(2) {
+                    op_free(self, &mut held, *a);
+                }
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..cycles {
+                for _ in 0..26 {
+                    let size = 8 + (next() % 12) as usize * 8;
+                    live.push(op_alloc(self, &mut held, size));
+                }
+                for a in live.drain(..) {
+                    op_free(self, &mut held, a);
+                }
+            }
+            started.elapsed().as_nanos() as f64 / (cycles as f64 * 26.0)
+        }
+    }
+
+    fn probe_set(background: bool, cycles: usize) -> Vec<(&'static str, f64)> {
+        let mut out = Vec::new();
+        macro_rules! step {
+            ($label:expr, $f:expr) => {{
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let allocators = four_instances();
+                    best = best.min(allocators.probe_loop::<{ $f }>(cycles, background));
+                }
+                out.push(($label, best));
+            }};
+        }
+        step!("S0 AllocUtil only (lock held outside)", 0);
+        step!("S1 + lock/unlock per op", P_LOCK);
+        step!("S2 + TLS current_instance", P_LOCK | P_TLS);
+        step!("S3 + delayed queue check (2/pair)", P_LOCK | P_TLS | P_DDQ);
+        step!(
+            "S4 + pending-carrier check (1/pair)",
+            P_LOCK | P_TLS | P_DDQ | P_PEND
+        );
+        step!(
+            "S5 + block size publish at unlock",
+            P_LOCK | P_TLS | P_DDQ | P_PEND | P_PUB
+        );
+        step!(
+            "S6 + payload address",
+            P_LOCK | P_TLS | P_DDQ | P_PEND | P_PUB | P_PTR
+        );
+        step!(
+            "S7 + routed/pooled loads",
+            P_LOCK | P_TLS | P_DDQ | P_PEND | P_PUB | P_PTR | P_ROUTE | P_POOLED
+        );
+        out
+    }
+
+    fn full_layer(background: bool, cycles: usize) -> f64 {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let allocators = four_instances();
+            if background {
+                let bg: Vec<_> = (0..2000)
+                    .map(|_| allocators.alloc(16 + (next() % 20) as usize * 16).unwrap())
+                    .collect();
+                for a in bg.iter().step_by(2) {
+                    allocators.free(*a).unwrap();
+                }
+            }
+            let mut live = Vec::with_capacity(32);
+            let started = std::time::Instant::now();
+            for _ in 0..cycles {
+                for _ in 0..26 {
+                    live.push(allocators.alloc(8 + (next() % 12) as usize * 8).unwrap());
+                }
+                for handle in live.drain(..) {
+                    allocators.free(handle).unwrap();
+                }
+            }
+            best = best.min(started.elapsed().as_nanos() as f64 / (cycles as f64 * 26.0));
+        }
+        best
+    }
+
+    #[test]
+    #[ignore = "timing: cargo test --release -p arinsal-alloc layer_cost_steps -- --ignored --nocapture"]
+    fn layer_cost_steps() {
+        let _serial = registration();
+        let cycles: usize = std::env::var("FRAG_CYCLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60_000);
+        thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+            {
+                use crate::typed::{AllocBlock, ErtsAlcType};
+                let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+                let mut next = move || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng
+                };
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let mut live = Vec::with_capacity(32);
+                    let started = std::time::Instant::now();
+                    for _ in 0..cycles {
+                        for _ in 0..26 {
+                            live.push(
+                                AllocBlock::new(ErtsAlcType::HEAP_FRAG, 1 + (next() % 12) as usize)
+                                    .unwrap(),
+                            );
+                        }
+                        live.clear();
+                    }
+                    best = best.min(started.elapsed().as_nanos() as f64 / (cycles as f64 * 26.0));
+                }
+                eprintln!(
+                    "  {:<44} {best:6.2} ns per pair",
+                    "AllocBlock::new + drop (HEAP_FRAG, registry)"
+                );
+            }
+            for background in [false, true] {
+                eprintln!("background fragmentation: {background}");
+                for (label, ns) in probe_set(background, cycles) {
+                    eprintln!("  {label:<44} {ns:6.2} ns per pair");
+                }
+                eprintln!(
+                    "  {:<44} {:6.2} ns per pair",
+                    "FULL ThreadSpecificAllocators alloc/free",
+                    full_layer(background, cycles)
+                );
+            }
         })
         .join()
         .unwrap();

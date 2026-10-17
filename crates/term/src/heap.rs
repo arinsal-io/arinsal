@@ -3482,6 +3482,44 @@ mod heap_block_tests {
     use super::{HeapAlloc, ProcessHeap, VecHeap};
 
     #[test]
+    #[ignore = "timing: cargo test --release -p arinsal-term heap_fragment_cycle_bench -- --ignored --nocapture"]
+    fn heap_fragment_cycle_bench() {
+        std::thread::spawn(|| {
+            assert_eq!(
+                arinsal_alloc::register_thread(arinsal_alloc::ThreadKind::Scheduler(1)),
+                Ok(1)
+            );
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let cycles: usize = std::env::var("FRAG_CYCLES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200_000);
+            let mut heap = ProcessHeap::with_words(64);
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                for _ in 0..cycles {
+                    for _ in 0..26 {
+                        std::hint::black_box(heap.heap_fragment(1 + (next() % 12) as usize));
+                    }
+                    heap.fragments.clear();
+                    heap.fragment_words = 0;
+                }
+                best = best.min(started.elapsed().as_nanos() as f64 / (cycles as f64 * 26.0));
+            }
+            eprintln!("heap fragment path: {best:.2} ns per alloc+free pair");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
     fn vec_heap_reset_reuses_the_first_chunk_and_discards_overflow() {
         let mut heap = VecHeap::with_initial_chunk_words(8);
         let first = heap.alloc(8).unwrap();
