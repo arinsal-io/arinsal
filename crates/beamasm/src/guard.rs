@@ -70,7 +70,7 @@ const NIL_WORD: u64 = 0x3b;
 /// BIFs whose inline guard code raises `badarg` with the BIF itself as the top stack frame.
 /// `SchedulerRegisters::tmp_mem[7]` holds `index + 1` of the raising BIF; its arguments are in
 /// X0.. (erts passes the `ErtsCodeMFA` to `raise_exception` the same way).
-pub const BADARG_MFAS: [(&str, &str, u8); 7] = [
+pub const BADARG_MFAS: [(&str, &str, u8); 8] = [
     ("erlang", "element", 2),
     ("erlang", "hd", 1),
     ("erlang", "tl", 1),
@@ -78,7 +78,12 @@ pub const BADARG_MFAS: [(&str, &str, u8); 7] = [
     ("erlang", "byte_size", 1),
     ("erlang", "map_size", 1),
     ("erlang", "tuple_size", 1),
+    ("erlang", "map_get", 2),
 ];
+/// Index of `erlang:map_size/1` in [`BADARG_MFAS`].
+pub const MAP_SIZE_MFA_INDEX: u8 = 5;
+/// Index of `erlang:map_get/2` in [`BADARG_MFAS`].
+pub const MAP_GET_MFA_INDEX: u8 = 7;
 /// `freason` of an inline `map_size/1` failure: `{badmap, Value}` (erts `EXC_BADMAP`).
 pub const EXC_BADMAP: u64 = (18 << 10) | 0x50;
 /// `freason` of a missing key in exact map update: `{badkey, Key}` (erts `EXC_BADKEY`).
@@ -2172,6 +2177,51 @@ impl BeamModuleAssembler {
         let map_reg = self.source_reg(map.val)?;
         let needs_map_check = map.masked_types(type_id::MAYBE_BOXED) != type_id::MAP;
         let needs_box_check = !map.always_one_of(type_id::ALWAYS_BOXED);
+        if (needs_map_check || needs_box_check)
+            && let Some((_, _, size_error)) = self.map_error_fragments
+        {
+            // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp (emit_bif_map_size), OTP-29.1.1: a
+            // failing guard branches to its label from the tests, the error path is a call of
+            // `handle_map_size_error` with the argument in XREG0.
+            let good = self.code.new_label();
+            let bad = if fail != 0 {
+                self.label(fail)
+            } else {
+                self.code.new_label()
+            };
+            if needs_box_check {
+                if !needs_map_check && fail == 0 {
+                    self.code.tbz(map_reg, 0, good)?;
+                } else {
+                    self.code.tbnz(map_reg, 0, bad)?;
+                }
+            }
+            if needs_map_check {
+                self.code.emit(|e| {
+                    e.ldur(Gpr::x(12), map_reg, -2)?;
+                    e.and_imm(Gpr::x(12), Gpr::x(12), 0x3f)?;
+                    e.cmp_imm(Gpr::x(12), 0x2c, false)
+                })?;
+                self.code.b_cond(
+                    if fail == 0 { Cond::Eq } else { Cond::Ne },
+                    if fail == 0 { good } else { bad },
+                )?;
+            }
+            if fail == 0 {
+                self.code.bind(bad)?;
+                if map_reg != Gpr::x(25) {
+                    self.code.emit(|e| e.mov_reg(Gpr::x(25), map_reg))?;
+                }
+                self.fragment_call(size_error)?;
+            }
+            self.code.bind(good)?;
+            self.code.emit(|e| {
+                e.ldur(Gpr::x(12), map_reg, 6)?;
+                e.mov_const(output, 15)?;
+                e.bfi(output, Gpr::x(12), 4, 60)
+            })?;
+            return self.store_guard_result(destination, output);
+        }
         let bad = (needs_map_check || needs_box_check).then(|| self.code.new_label());
         if needs_box_check {
             self.code.tbnz(map_reg, 0, bad.expect("check label"))?;
@@ -2333,6 +2383,15 @@ impl BeamModuleAssembler {
         key_maybe_immediate: bool,
         map_runtime: crate::map::MapRuntime,
     ) -> Result<(), ModuleError> {
+        if let Some((badmap, badkey, _)) = self.map_error_fragments {
+            return self.emit_bif_map_get_fragments(
+                fail,
+                (key, map, destination),
+                (exact_map, key_maybe_immediate),
+                map_runtime,
+                (badmap, badkey),
+            );
+        }
         let slow = self.code.new_label();
         let done = self.code.new_label();
         self.emit_map_get_fast(
@@ -2349,6 +2408,75 @@ impl BeamModuleAssembler {
         self.emit_guard_value_helper_fail(fail, false, 31, key, map, destination, helper)?;
         self.code.bind(done)?;
         Ok(())
+    }
+
+    /// `map_get/2` with the process-wide `handle_map_get_badmap` and `handle_map_get_badkey`
+    /// fragments: a failing guard branches to its label, a failing body call raises through
+    /// the fragments.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp (emit_bif_map_get), OTP-29.1.1.
+    fn emit_bif_map_get_fragments(
+        &mut self,
+        fail: u32,
+        (key, map, destination): (ArgVal, ArgVal, ArgVal),
+        (exact_map, key_maybe_immediate): (bool, bool),
+        runtime: crate::map::MapRuntime,
+        (badmap, badkey): (usize, usize),
+    ) -> Result<(), ModuleError> {
+        let map_reg = self.source_reg_into(map, Gpr::x(0))?;
+        if map_reg != Gpr::x(0) {
+            self.code.emit(|e| e.mov_reg(Gpr::x(0), map_reg))?;
+        }
+        let key_reg = self.source_reg_into(key, Gpr::x(1))?;
+        if key_reg != Gpr::x(1) {
+            self.code.emit(|e| e.mov_reg(Gpr::x(1), key_reg))?;
+        }
+        let good_key = self.code.new_label();
+        let fail_label = (fail != 0).then(|| self.label(fail));
+        if !exact_map {
+            let good_map = self.code.new_label();
+            let bad_map = fail_label.unwrap_or_else(|| self.code.new_label());
+            self.code.tbnz(Gpr::x(0), 0, bad_map)?;
+            self.code.emit(|e| {
+                e.ldur(Gpr::x(8), Gpr::x(0), -2)?;
+                e.and_imm(Gpr::x(8), Gpr::x(8), 0x3f)?;
+                e.cmp_imm(Gpr::x(8), 0x2c, false)
+            })?;
+            match fail_label {
+                Some(label) => self.code.b_cond(Cond::Ne, label)?,
+                None => {
+                    self.code.b_cond(Cond::Eq, good_map)?;
+                    self.code.bind(bad_map)?;
+                    self.fragment_call(badmap)?;
+                }
+            }
+            self.code.bind(good_map)?;
+        }
+        if key_maybe_immediate {
+            self.fragment_call(runtime.get_element_shared)?;
+            match fail_label {
+                Some(label) => self.code.b_cond(Cond::Ne, label)?,
+                None => self.code.b_cond(Cond::Eq, good_key)?,
+            }
+        } else {
+            self.emit_map_get_runtime(Gpr::x(1), Gpr::x(0), runtime)?;
+            match fail_label {
+                Some(label) => self.code.cbz(Gpr::x(0), label)?,
+                None => self.code.cbnz(Gpr::x(0), good_key)?,
+            }
+        }
+        if fail == 0 {
+            let map_reg = self.source_reg_into(map, Gpr::x(0))?;
+            if map_reg != Gpr::x(0) {
+                self.code.emit(|e| e.mov_reg(Gpr::x(0), map_reg))?;
+            }
+            let key_reg = self.source_reg_into(key, Gpr::x(1))?;
+            if key_reg != Gpr::x(1) {
+                self.code.emit(|e| e.mov_reg(Gpr::x(1), key_reg))?;
+            }
+            self.fragment_call(badkey)?;
+        }
+        self.code.bind(good_key)?;
+        self.store_map_result(destination, Gpr::x(0))
     }
 
     /// Emits `byte_size/1`.

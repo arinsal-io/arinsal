@@ -600,7 +600,7 @@ impl BeamModuleAssembler {
     /// Emits the generic runtime lookup for a boxed-only key.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:813-822,891-913,
     // OTP-29.1.1 (`runtime_call<get_map_element>`).
-    fn emit_map_get_runtime(
+    pub(crate) fn emit_map_get_runtime(
         &mut self,
         key: Gpr,
         map: Gpr,
@@ -687,7 +687,9 @@ impl BeamModuleAssembler {
             self.code.b_cond(Cond::Ne, generic)?;
             self.code
                 .emit(|e| e.add_imm(Gpr::x(10), Gpr::x(10), 1, false))?;
-            self.code.emit(|e| e.ldr_uoff(Gpr::x(11), Gpr::x(8), 16))?;
+            // The pre-index load leaves x8 at the `keys` field, which the value loads then
+            // index with the bumped size.
+            self.code.emit(|e| e.ldr_pre(Gpr::x(11), Gpr::x(8), 16))?;
             self.code.emit(|e| e.and_imm(Gpr::x(11), Gpr::x(11), !7))?;
             for triple in args.as_chunks::<3>().0.iter().rev() {
                 let loop_label = self.code.new_label();
@@ -703,9 +705,7 @@ impl BeamModuleAssembler {
                     .emit(|e| e.cmp_reg(Gpr::x(12), key, Shift::Lsl, 0))?;
                 self.code.b_cond(Cond::Ne, loop_label)?;
                 if !is_scratch_x(triple[1]) {
-                    self.code
-                        .emit(|e| e.add_imm(Gpr::x(13), Gpr::x(8), 16, false))?;
-                    self.emit_flatmap_value_to_destination(triple[1], Gpr::x(13), Gpr::x(10))?;
+                    self.emit_flatmap_value_to_destination(triple[1], Gpr::x(8), Gpr::x(10))?;
                 }
             }
             self.code.b(done)?;
@@ -1078,7 +1078,7 @@ impl BeamModuleAssembler {
         self.store_map_result(dst, Gpr::x(14))
     }
 
-    fn store_map_result(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
+    pub(crate) fn store_map_result(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
         match dst {
             ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(X[i as usize], src))?,
             ArgVal::Y(i) => self.code.emit(|e| e.str_uoff(src, E, i * 8))?,

@@ -1790,6 +1790,15 @@ impl ModuleEnv for VmModuleEnv<'_> {
     fn raise_fragments(&self) -> Option<(usize, usize)> {
         raise_fragments().map(|fragments| (fragments.raise_shared(), fragments.raise_exception()))
     }
+    fn map_error_fragments(&self) -> Option<(usize, usize, usize)> {
+        raise_fragments().map(|fragments| {
+            (
+                fragments.map_get_badmap(),
+                fragments.map_get_badkey(),
+                fragments.map_size_error(),
+            )
+        })
+    }
     fn send_fragment(&self) -> usize {
         self.send_fragment
     }

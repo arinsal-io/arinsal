@@ -204,6 +204,9 @@ pub struct BeamModuleAssembler {
     /// Process-wide exception fragments: `raise_shared` and `raise_exception`. Unset in
     /// assemblers that run without a VM.
     pub(super) raise_fragments: Option<(usize, usize)>,
+    /// Process-wide `handle_map_get_badmap`, `handle_map_get_badkey` and
+    /// `handle_map_size_error` fragments. Unset in assemblers that run without a VM.
+    pub(super) map_error_fragments: Option<(usize, usize, usize)>,
     /// Offset right after the current function's entry label (its `i_breakpoint_trampoline`).
     entry_offset: Option<usize>,
     entry_label: Option<Label>,
@@ -293,6 +296,7 @@ impl BeamModuleAssembler {
             element_guard_shared: 0,
             element_error: None,
             raise_fragments: None,
+            map_error_fragments: None,
             entry_offset: None,
             entry_label: None,
             bs_cold: Vec::new(),
@@ -496,6 +500,13 @@ impl BeamModuleAssembler {
     /// and `raw_raise` call them instead of carrying the exception transfer inline.
     pub fn set_raise_fragments(&mut self, raise_shared: usize, raise_exception: usize) {
         self.raise_fragments = Some((raise_shared, raise_exception));
+    }
+
+    /// Installs the process-wide `handle_map_get_badmap`, `handle_map_get_badkey` and
+    /// `handle_map_size_error` fragments so a failing `map_get/2` or `map_size/1` calls them
+    /// instead of carrying the runtime call inline.
+    pub fn set_map_error_fragments(&mut self, badmap: usize, badkey: usize, size_error: usize) {
+        self.map_error_fragments = Some((badmap, badkey, size_error));
     }
 
     /// Installs the process-wide yield fragments (`dispatch_return`, `i_test_yield_shared`,

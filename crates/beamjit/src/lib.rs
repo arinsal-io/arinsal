@@ -124,6 +124,12 @@ pub trait ModuleEnv {
     fn raise_fragments(&self) -> Option<(usize, usize)> {
         None
     }
+    /// Process-wide `(handle_map_get_badmap, handle_map_get_badkey, handle_map_size_error)`
+    /// fragments, or `None` when the environment has none (each failing `map_get/2` and
+    /// `map_size/1` then carries its error path inline).
+    fn map_error_fragments(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
     /// Fragment called by `i_line_breakpoint_trampoline` when line instrumentation is enabled.
     fn line_breakpoint_fragment(&self) -> usize {
         0
@@ -1669,6 +1675,9 @@ pub fn compile_parsed_module_with_options(
         }
         if let Some((raise_shared, raise_exception)) = env.raise_fragments() {
             assembler.set_raise_fragments(raise_shared, raise_exception);
+        }
+        if let Some((badmap, badkey, size_error)) = env.map_error_fragments() {
+            assembler.set_map_error_fragments(badmap, badkey, size_error);
         }
         assembler.enable_dump(&beam.module);
         for lambda in &beam.lambdas {
