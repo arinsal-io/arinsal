@@ -109,8 +109,12 @@ struct CarrierLayout {
     allocator: usize,
     cpool: CarrierPoolLayout,
     aoff_tree_node: AoffNodeLayout,
+    root: usize,
+    blk_order: u32,
 }
 
+const AOFF_ROOT_WORD: usize = (std::mem::offset_of!(CarrierLayout, root)) / WORD;
+const AOFF_BLK_ORDER_WORD: usize = (std::mem::offset_of!(CarrierLayout, blk_order)) / WORD;
 const MBC_HEADER: usize = std::mem::offset_of!(CarrierLayout, aoff_tree_node);
 const AOFF_MBC_HEADER: usize = std::mem::size_of::<CarrierLayout>();
 const SBC_HEADER: usize =
@@ -338,7 +342,7 @@ struct Block {
 #[derive(Clone, Copy)]
 enum TreeId {
     Carriers,
-    Blocks(usize),
+    Blocks,
 }
 
 const _: () = assert!(cfg!(target_endian = "little"));
@@ -745,7 +749,6 @@ pub struct AllocUtil {
     /// with one compare, instead of looking the node's carrier up again.
     tree_span: std::cell::Cell<CarrierSpan>,
     free_root: usize,
-    aoff_roots: Vec<usize>,
     aoff_carrier_root: usize,
     /// Bucket list heads (`buckets` in erl_goodfit_alloc.c); 0 is an empty bucket.
     goodfit_heads: Vec<usize>,
@@ -809,7 +812,6 @@ impl AllocUtil {
             last_carrier: std::cell::Cell::new(CarrierSpan::EMPTY),
             tree_span: std::cell::Cell::new(CarrierSpan::EMPTY),
             free_root: 0,
-            aoff_roots: Vec::new(),
             aoff_carrier_root: 0,
             goodfit_heads: vec![0; 256],
             goodfit_mask: [0; 4],
@@ -913,7 +915,12 @@ impl AllocUtil {
                 last: old.last,
             };
             Self::write_block_in(span, &tail)?;
-            Self::set_next_prev_free_in(span, &tail, true)?;
+            debug_assert!(
+                tail.last
+                    || span
+                        .read(tail.offset + tail.size, 0)
+                        .is_some_and(|header| header & PREV_FREE != 0)
+            );
             self.link_free_in(span, tail.offset, tail.size)?;
         } else {
             Self::set_next_prev_free_in(span, &Block { size: used, ..old }, false)?;
@@ -960,6 +967,7 @@ impl AllocUtil {
                 };
             }
         }
+        let mut next_free = false;
         if !merged.last {
             let next = merged.offset + merged.size;
             let n = Self::decode_block(span, next)?;
@@ -967,10 +975,13 @@ impl AllocUtil {
                 self.unlink_free_in(span, next, n.size)?;
                 merged.size += n.size;
                 merged.last = n.last;
+                next_free = true;
             }
         }
         Self::write_block_in(span, &merged)?;
-        Self::set_next_prev_free_in(span, &merged, true)?;
+        if !next_free {
+            Self::set_next_prev_free_in(span, &merged, true)?;
+        }
         // Port of erl_alloc_util.c:2791 (dealloc_block), OTP-29.1.1: the main carrier is never destroyed.
         if merged.offset == span.start + self.mbc_header_size()
             && merged.last
@@ -1023,12 +1034,8 @@ impl AllocUtil {
     #[inline]
     pub(crate) fn payload_ptr(&self, allocation: Allocation) -> Result<*mut u64, AllocError> {
         let key = allocation.id as usize;
-        let carrier = self
-            .carrier_of(key)
-            .and_then(|index| self.carriers[index].as_ref())
-            .ok_or(AllocError::Corrupt)?;
-        let byte_offset = key - carrier.key_base + BLOCK_HEADER;
-        Ok(carrier.memory.as_ptr().wrapping_add(byte_offset).cast())
+        self.span_of(key).ok_or(AllocError::Corrupt)?;
+        Ok((key + BLOCK_HEADER) as *mut u64)
     }
 
     /// Carrier index containing the address `key`.
@@ -1400,7 +1407,6 @@ impl AllocUtil {
             self.stats.sys_alloc_carriers -= 1;
             self.stats.sys_alloc_carriers_size -= carrier.size;
         }
-        self.aoff_roots[carrier_index] = 0;
         self.pending_carriers.push(CarrierTransfer {
             origin_instance: carrier.origin_instance,
             carrier,
@@ -1925,7 +1931,7 @@ impl AllocUtil {
                 previous_free = !b.allocated;
                 if !b.allocated && !c.sbc {
                     free.insert(pos);
-                    if c.memory.read_word(rel + b.size - WORD) != Some(b.size) {
+                    if !b.last && c.memory.read_word(rel + b.size - WORD) != Some(b.size) {
                         return Err(AllocError::Corrupt);
                     }
                 } else {
@@ -1951,14 +1957,16 @@ impl AllocUtil {
             return Err(AllocError::Corrupt);
         }
         if is_aoff(self.strategy) {
-            for (carrier, root) in self.aoff_roots.iter().copied().enumerate() {
-                self.validate_aoff_tree(root, 0, None, None, false)?;
-                if self.carriers[carrier].is_none() {
-                    if root != 0 {
-                        return Err(AllocError::Corrupt);
-                    }
+            for carrier in 0..self.carriers.len() {
+                let Some(entry) = self.carriers[carrier].as_ref() else {
                     continue;
-                }
+                };
+                let root = if entry.sbc {
+                    0
+                } else {
+                    self.aoff_root(self.carrier_span(carrier)?)
+                };
+                self.validate_aoff_tree(root, 0, None, None, false)?;
                 let carrier_node = self.carrier_tree_node(carrier)?;
                 let largest = if root == 0 {
                     0
@@ -2173,12 +2181,10 @@ impl AllocUtil {
             self.mbc_count += 1;
         }
         let index = if let Some(index) = self.free_carrier_slots.pop() {
-            self.aoff_roots[index] = 0;
             self.carriers[index] = Some(carrier);
             index
         } else {
             self.carriers.push(Some(carrier));
-            self.aoff_roots.push(0);
             self.carriers.len() - 1
         };
         self.index_carrier(index);
@@ -2335,7 +2341,7 @@ impl AllocUtil {
         if !c.sbc && !b.allocated && !c.memory.write_word(rel + WORD, c.memory.as_ptr() as usize) {
             return Err(AllocError::Corrupt);
         }
-        if !b.allocated && !c.memory.write_word(rel + b.size - WORD, b.size) {
+        if !b.allocated && !b.last && !c.memory.write_word(rel + b.size - WORD, b.size) {
             return Err(AllocError::Corrupt);
         }
         Ok(())
@@ -2357,7 +2363,7 @@ impl AllocUtil {
             span.write(b.offset, 1, span.start)
                 .ok_or(AllocError::Corrupt)?;
         }
-        if !b.allocated {
+        if !b.allocated && !b.last {
             span.write(b.offset + b.size - WORD, 0, b.size)
                 .ok_or(AllocError::Corrupt)?;
         }
@@ -2447,13 +2453,40 @@ impl AllocUtil {
             .ok_or(AllocError::Corrupt)
     }
 
+    /// The root of the free-block tree of the carrier `span`, kept in the carrier header like
+    /// `root` of `AOFF_Carrier_t` in erl_ao_firstfit_alloc.c.
+    #[inline(always)]
+    fn aoff_root(&self, span: CarrierSpan) -> usize {
+        span.read(span.start, AOFF_ROOT_WORD).unwrap_or(0)
+    }
+
+    #[inline(always)]
+    fn set_aoff_root(&mut self, span: CarrierSpan, root: usize) {
+        let _ = span.write(span.start, AOFF_ROOT_WORD, root);
+    }
+
+    /// The span of the indexed or about-to-be-indexed carrier `index`.
+    fn carrier_span(&self, index: usize) -> Result<CarrierSpan, AllocError> {
+        let carrier = self
+            .carriers
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(AllocError::Corrupt)?;
+        Ok(CarrierSpan::new(
+            carrier.key_base,
+            carrier.key_base + carrier.memory.len(),
+            index,
+            carrier.sbc,
+        ))
+    }
+
     /// Root of `tree`.
     #[inline(always)]
     fn root_of<const A: bool>(&self, tree: TreeId) -> usize {
         match tree {
             TreeId::Carriers => self.aoff_carrier_root,
-            TreeId::Blocks(carrier) if A => self.aoff_roots[carrier],
-            TreeId::Blocks(_) => self.free_root,
+            TreeId::Blocks if A => self.aoff_root(self.tree_span.get()),
+            TreeId::Blocks => self.free_root,
         }
     }
 
@@ -2462,8 +2495,8 @@ impl AllocUtil {
     fn set_root_of<const A: bool>(&mut self, tree: TreeId, root: usize) {
         match tree {
             TreeId::Carriers => self.aoff_carrier_root = root,
-            TreeId::Blocks(carrier) if A => self.aoff_roots[carrier] = root,
-            TreeId::Blocks(_) => self.free_root = root,
+            TreeId::Blocks if A => self.set_aoff_root(self.tree_span.get(), root),
+            TreeId::Blocks => self.free_root = root,
         }
     }
 
@@ -2544,7 +2577,7 @@ impl AllocUtil {
     #[inline(never)]
     fn aoff_lower_carrier_max(&mut self, span: CarrierSpan) -> Result<(), AllocError> {
         let crr = self.tn::<true>(span.start + MBC_HEADER)?;
-        let root = self.aoff_roots[span.index];
+        let root = self.aoff_root(span);
         if root != 0 {
             let root_max = self.tn::<true>(root)?.max();
             if crr.size() == root_max {
@@ -2570,6 +2603,14 @@ impl AllocUtil {
         };
         self.tn::<true>(node)?.raw.set_word(0, 0);
         let span = self.span_of(node).ok_or(AllocError::Corrupt)?;
+        // Port of aoff_creating_mbc (erl_ao_firstfit_alloc.c): the block order is stored in the header.
+        let blk_order = match self.strategy {
+            Strategy::AoffCaobf => 2,
+            Strategy::AoffCbf => 3,
+            _ => 1,
+        };
+        span.write(span.start, AOFF_BLK_ORDER_WORD, blk_order)
+            .ok_or(AllocError::Corrupt)?;
         self.insert_tree_node::<true>(node, 0, span)
     }
 
@@ -2721,7 +2762,7 @@ impl AllocUtil {
         let block_node = !(A && !span.sbc && node == span.start + MBC_HEADER);
         let tree = if block_node {
             self.tree_span.set(span);
-            TreeId::Blocks(span.index)
+            TreeId::Blocks
         } else {
             TreeId::Carriers
         };
@@ -2852,7 +2893,7 @@ impl AllocUtil {
                 .filter(|span| !span.sbc && carrier_node == span.start + MBC_HEADER)
                 .ok_or(AllocError::Corrupt)?;
             self.tree_span.set(span);
-            return self.aoff_search(self.aoff_roots[span.index], need);
+            return self.aoff_search(self.aoff_root(span), need);
         }
         let mut current = self.free_root;
         let mut best = 0;
@@ -2920,7 +2961,7 @@ impl AllocUtil {
         span: CarrierSpan,
         node: usize,
     ) -> Result<(), AllocError> {
-        let tree = TreeId::Blocks(span.index);
+        let tree = TreeId::Blocks;
         let del = self.tn::<A>(node)?;
         if matches!(self.strategy, Strategy::BestFit | Strategy::AoffCbf) {
             if del.flags() & TREE_NODE == 0 {
@@ -3377,7 +3418,15 @@ impl AllocUtil {
             _ => {}
         }
         let roots: Vec<usize> = if is_aoff(self.strategy) {
-            self.aoff_roots.clone()
+            let mut roots = Vec::new();
+            for index in 0..self.carriers.len() {
+                if let Some(entry) = self.carriers[index].as_ref()
+                    && !entry.sbc
+                {
+                    roots.push(self.aoff_root(self.carrier_span(index)?));
+                }
+            }
+            roots
         } else {
             vec![self.free_root]
         };
@@ -3395,10 +3444,7 @@ impl AllocUtil {
     fn previous_block_in(&self, span: CarrierSpan, offset: usize) -> Result<usize, AllocError> {
         let size = span.read(offset - WORD, 0).ok_or(AllocError::Corrupt)?;
         let previous = offset.checked_sub(size).ok_or(AllocError::Corrupt)?;
-        let carrier = self.carriers[span.index]
-            .as_ref()
-            .ok_or(AllocError::Corrupt)?;
-        if size == 0 || previous < carrier.start {
+        if size == 0 || previous < span.start + self.mbc_header_size() {
             return Err(AllocError::Corrupt);
         }
         Ok(previous)
@@ -3692,7 +3738,27 @@ mod tests {
         assert_eq!(ALIGN, 8);
         assert_eq!(SBC_HEADER, 32);
         assert_eq!(MBC_HEADER, 352);
-        assert_eq!(AOFF_MBC_HEADER, 408);
+        assert_eq!(AOFF_MBC_HEADER, 424);
+        assert_eq!(AOFF_ROOT_WORD * WORD, 408);
+    }
+    #[test]
+    fn aoff_carrier_header_holds_block_root_and_order() {
+        for (strategy, order) in [
+            (Strategy::Aoff, 1),
+            (Strategy::AoffCaobf, 2),
+            (Strategy::AoffCbf, 3),
+        ] {
+            let mut a = AllocUtil::new(strategy, AllocUtilOptions::default());
+            let first = a.alloc(64).unwrap();
+            let second = a.alloc(64).unwrap();
+            let carrier = a.carriers.iter().flatten().find(|c| !c.sbc).unwrap();
+            let read = |word: usize| carrier.memory.read_word(word * WORD).unwrap();
+            assert_eq!(read(AOFF_BLK_ORDER_WORD), order);
+            assert_ne!(read(AOFF_ROOT_WORD), 0);
+            a.free(first).unwrap();
+            a.free(second).unwrap();
+            a.validate().unwrap();
+        }
     }
     #[test]
     fn bf_and_aobf_allocate_and_coalesce() {
