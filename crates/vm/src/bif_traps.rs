@@ -397,6 +397,77 @@ fn erlang_append_bif(
     erlang_append(process, args, state, "erlang:append/2")
 }
 
+fn chksum_trap(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    kind: arinsal_bifs::ChksumKind,
+) -> Result<HandlerResult, BifError> {
+    let resumed = match state {
+        Some(state) => Some(
+            state
+                .downcast_ref::<Mutex<arinsal_bifs::ChksumCont>>()
+                .ok_or(BifError::BADARG)?
+                .lock()
+                .map_err(|_| BifError::SystemLimit)?
+                .clone(),
+        ),
+        None => None,
+    };
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
+    let step = match &resumed {
+        Some(cont) => arinsal_bifs::chksum_resume(&mut ctx, cont),
+        None => arinsal_bifs::chksum_start(&mut ctx, kind, args),
+    };
+    drop(ctx);
+    Ok(match step {
+        Ok(arinsal_bifs::ChksumStep::Done(value)) => HandlerResult::Done {
+            value,
+            reductions: 0,
+        },
+        Ok(arinsal_bifs::ChksumStep::More(cont)) => HandlerResult::Yield {
+            continuation: cont.continuation(),
+            state: MagicRef::new(Mutex::new(cont)),
+            reductions: 0,
+        },
+        Err(error) => HandlerResult::Failed {
+            error,
+            reductions: 0,
+        },
+    })
+}
+
+fn erlang_crc32(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<HandlerResult, BifError> {
+    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Crc32)
+}
+
+fn erlang_adler32(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<HandlerResult, BifError> {
+    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Adler32)
+}
+
+fn erlang_md5_trap(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<HandlerResult, BifError> {
+    chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Md5)
+}
+
 fn bool_atom(value: bool) -> Term {
     Term::atom(
         global_atoms()
@@ -406,6 +477,27 @@ fn bool_atom(value: bool) -> Term {
 }
 
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "erlang",
+        function: "crc32",
+        arity: 2,
+        continuation: "erlang:crc32/2",
+        handler: erlang_crc32,
+    },
+    Entry {
+        module: "erlang",
+        function: "adler32",
+        arity: 2,
+        continuation: "erlang:adler32/2",
+        handler: erlang_adler32,
+    },
+    Entry {
+        module: "erlang",
+        function: "md5_trap",
+        arity: 2,
+        continuation: "erlang:md5_trap/2",
+        handler: erlang_md5_trap,
+    },
     Entry {
         module: "lists",
         function: "reverse",
@@ -1952,6 +2044,9 @@ pub(crate) fn install_deferred_trap(
             },
             MagicRef::new(Mutex::new(cont)),
         ),
+        arinsal_bifs::DeferredTrap::Chksum(cont) => {
+            (cont.continuation(), MagicRef::new(Mutex::new(cont)))
+        }
         arinsal_bifs::DeferredTrap::Subtract(walk) => (
             if function == "subtract" {
                 "erlang:subtract/2"
