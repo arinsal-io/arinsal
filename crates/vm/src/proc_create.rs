@@ -852,6 +852,9 @@ pub(crate) struct ProcessCold {
     pub(crate) sys_task_point: bool,
     /// A potentially long GC request waits in `delayed_gc` for a dirty CPU scheduler.
     pub(crate) dirty_sys_gc: bool,
+    /// When the dirty CPU scheduler picked the process (`start_time` of
+    /// erts_dirty_process_main); the time until it schedules again is the charge.
+    pub(crate) dirty_pickup: Option<std::time::Instant>,
     /// erts `F_DIRTY_MAJOR_GC` / `F_DIRTY_MINOR_GC`: a potentially long collection the
     /// process started itself waits for a dirty CPU scheduler.
     pub(crate) dirty_gc: Option<DirtyGc>,

@@ -773,6 +773,19 @@ impl Process {
 
 /// Port of erts/emulator/beam/erl_vm.h:53 (CONTEXT_REDS), OTP-29.1.1.
 pub(crate) const CONTEXT_REDS: i32 = 4000;
+/// Port of erts/emulator/beam/erl_gc.c (ERTS_ABANDON_HEAP_COST), OTP-29.1.1.
+const ABANDON_HEAP_COST: i32 = 10;
+
+/// Port of erts/emulator/beam/erl_process.h (erts_time2reds), OTP-29.1.1: the reductions
+/// charged for `elapsed` on a dirty CPU scheduler. At least one, else four per whole
+/// microsecond (`(CONTEXT_REDS - 1) / 1000 + 1`).
+pub(crate) fn erts_time2reds(elapsed: std::time::Duration) -> u64 {
+    let microseconds = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+    if microseconds == 0 {
+        return 1;
+    }
+    microseconds.saturating_mul(((CONTEXT_REDS - 1) / 1000 + 1) as u64)
+}
 /// Port of erts/emulator/beam/erl_proc_sig_queue.c:52 (ERTS_SIG_REDS_CNT_FACTOR), OTP-29.1.1.
 const SIG_REDS_CNT_FACTOR: i32 = 4;
 /// Port of erts/emulator/beam/erl_proc_sig_queue.h:284 (ERTS_SIG_HANDLE_REDS_MAX_PREFERED),
@@ -6527,7 +6540,15 @@ impl Process {
         // when it leaves this one.
         cold.dirty_sys_gc = true;
         self.delay_heap_collection(need);
-        // erl_gc.c:588-597 (force_reschedule): the remaining reductions are spent.
+        // erl_gc.c, delay_garbage_collection (force_reschedule): the remaining reductions
+        // are spent, and all but ERTS_ABANDON_HEAP_COST of them are not the process's own
+        // work. The interpreter keeps its slice in the scheduler and never charges the rest
+        // of it.
+        if self.heap.native_active() && self.reductions > ABANDON_HEAP_COST {
+            self.virtual_reds = self
+                .virtual_reds
+                .saturating_add((self.reductions - ABANDON_HEAP_COST) as u32);
+        }
         self.force_yield = true;
         true
     }
@@ -7060,6 +7081,9 @@ impl Task for Process {
         &mut self,
         kind: arinsal_sched::DirtyKind,
     ) -> Option<arinsal_sched::DirtyJob> {
+        if kind == arinsal_sched::DirtyKind::Cpu {
+            self.cold_mut().dirty_pickup = Some(std::time::Instant::now());
+        }
         Process::take_dirty_job(self, kind)
     }
 
@@ -7299,7 +7323,24 @@ impl Process {
         data: &mut SchedulerData,
         budget: u32,
     ) -> Result<RunState, VmError> {
+        // Port of erts/emulator/beam/beam_common.c (erts_dirty_process_main), OTP-29.1.1: a
+        // dirty CPU scheduler charges the time between picking the process and scheduling
+        // again, not what the executed code consumed from FCALLS. This covers the dirty GC
+        // system task and dirty CPU NIFs.
+        let dirty_cpu = ctx.scheduler_type() == arinsal_sched::SchedulerType::DirtyCpu;
+        let dirty_start = dirty_cpu.then(|| {
+            self.cold
+                .as_mut()
+                .and_then(|cold| cold.dirty_pickup.take())
+                .unwrap_or_else(std::time::Instant::now)
+        });
+        let used_before = self.reductions_used;
         let mut result = with_executor(data, runtime, |executor| executor.run(self, ctx, budget));
+        if let Some(start) = dirty_start {
+            let charged = erts_time2reds(start.elapsed());
+            self.reductions_used = used_before.saturating_add(charged);
+            ctx.consume(u32::try_from(charged).unwrap_or(u32::MAX));
+        }
         // BIF_TRAP context-switches to beam_bif_export_trap. The continuation is an export
         // call, so the caller's CP stays on the stack and the backtrace PC is that trap.
         if matches!(result, Ok(RunState::Yield))

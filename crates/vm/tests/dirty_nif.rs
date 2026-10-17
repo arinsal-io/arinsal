@@ -75,6 +75,46 @@ static ErlNifFunc funcs[] = {
 ERL_NIF_INIT(dirty_nif, funcs, NULL, NULL, NULL, NULL)
 "#;
 
+const REDS_NIF_SOURCE: &str = r#"
+#include <unistd.h>
+#include "erl_nif.h"
+static ERL_NIF_TERM sleep_ms(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    int ms;
+    (void)argc;
+    if (!enif_get_int(env, argv[0], &ms))
+        return enif_make_badarg(env);
+    usleep(ms * 1000);
+    return enif_make_atom(env, "ok");
+}
+static ErlNifFunc funcs[] = {
+    {"cpu_sleep", 1, sleep_ms, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"io_sleep", 1, sleep_ms, ERL_NIF_DIRTY_JOB_IO_BOUND},
+};
+ERL_NIF_INIT(dirty_nif_reds, funcs, NULL, NULL, NULL, NULL)
+"#;
+
+const REDS_ERL_SOURCE: &str = r#"
+-module(dirty_nif_reds).
+-export([run/0, run/1, cpu_sleep/1, io_sleep/1]).
+-nifs([cpu_sleep/1, io_sleep/1]).
+
+run(Path) ->
+    ok = erlang:load_nif(Path, []),
+    Cpu = [delta(fun() -> cpu_sleep(20) end) || _ <- lists:seq(1, 3)],
+    Io = [delta(fun() -> io_sleep(20) end) || _ <- lists:seq(1, 3)],
+    {lists:all(fun(D) -> D >= 80000 andalso D =< 280000 end, Cpu),
+     lists:all(fun(D) -> D =< 100 end, Io)}.
+
+delta(Fun) ->
+    {reductions, R0} = process_info(self(), reductions),
+    _ = Fun(),
+    {reductions, R1} = process_info(self(), reductions),
+    R1 - R0.
+
+cpu_sleep(_) -> erlang:nif_error(undef).
+io_sleep(_) -> erlang:nif_error(undef).
+"#;
+
 const BAD_SOURCE: &str = r#"
 #include "erl_nif.h"
 static ERL_NIF_TERM f(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
@@ -250,6 +290,11 @@ fn check(module: &str, c_source: &str, erl_source: &str) {
 #[test]
 fn dirty_nifs_and_scheduled_continuations_match_erts() {
     check("dirty_nif", NIF_SOURCE, ERL_SOURCE);
+}
+
+#[test]
+fn dirty_cpu_nif_is_charged_by_time_like_erts() {
+    check("dirty_nif_reds", REDS_NIF_SOURCE, REDS_ERL_SOURCE);
 }
 
 #[test]
