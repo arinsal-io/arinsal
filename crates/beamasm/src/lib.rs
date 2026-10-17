@@ -189,6 +189,9 @@ impl Update {
     pub const REDUCTIONS: Self = Self(1 << 2);
     /// Synchronize the six register-backed X values.
     pub const X_REGS: Self = Self(1 << 4);
+    /// X registers at or above the live count are dead, as in every erts runtime call: the
+    /// fragile X4/X5 are saved only when below `live`. Without it they are kept across every call.
+    pub const X_REGS_BY_LIVE: Self = Self(1 << 5);
     /// Synchronize stack and heap pointers together.
     pub const HEAP_ALLOC: Self = Self(Self::HEAP.0 | Self::STACK.0);
 
@@ -217,7 +220,11 @@ fn cached_x_regs(live: usize, update: Update) -> Vec<(usize, Option<usize>)> {
     if update.contains(Update::X_REGS) {
         indexes.extend(0..live.min(4));
     }
-    indexes.extend([4, 5]);
+    if update.contains(Update::X_REGS_BY_LIVE) {
+        indexes.extend(4..live.min(6));
+    } else {
+        indexes.extend([4, 5]);
+    }
     let mut pairs = Vec::with_capacity(3);
     let mut iter = indexes.into_iter().peekable();
     while let Some(first) = iter.next() {
