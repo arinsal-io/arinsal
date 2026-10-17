@@ -3279,10 +3279,8 @@ impl Executor {
                         continue;
                     }
                     if matches!(&result, Ok(RunState::Yield))
-                        && process
-                            .runtime
-                            .as_ref()
-                            .is_some_and(|runtime| runtime.suspend_total_of(ctx.pid()) > 0)
+                        && process.runtime.is_some()
+                        && crate::suspend::ctx_suspended(ctx)
                     {
                         break park_suspended(process, ctx);
                     }
@@ -3503,8 +3501,8 @@ impl Executor {
     ) -> Result<Option<RunState>, VmError> {
         // Nothing to do at most scheduling points: no suspend, no timer pause and no
         // hibernation. Checked before the runtime handle is cloned.
-        if let Some(runtime) = process.runtime.as_deref()
-            && runtime.suspend_total_of(ctx.pid()) == 0
+        if process.runtime.is_some()
+            && !crate::suspend::ctx_suspended(ctx)
             && !process
                 .cold
                 .as_ref()
@@ -7304,7 +7302,7 @@ impl Process {
         // A native BIF yield returns before the interpreter's suspend check. erts leaves
         // a suspended process out of the run queue (ERTS_PSFLG_SUSPENDED): the code-permission
         // seize failure is `erts_suspend` plus `ERTS_BIF_YIELD`.
-        if matches!(result, Ok(RunState::Yield)) && runtime.suspend_total_of(ctx.pid()) > 0 {
+        if matches!(result, Ok(RunState::Yield)) && crate::suspend::ctx_suspended(ctx) {
             result = park_suspended(self, ctx);
         }
         if matches!(result, Ok(RunState::Yield | RunState::Wait { .. }))
