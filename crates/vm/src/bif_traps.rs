@@ -1216,10 +1216,12 @@ fn binary_search(
         let reductions = (work / SEARCH_LOOP_FACTOR) as u32;
         if !done {
             drop(search);
+            // Port of erts/emulator/beam/erl_bif_binary.c (binary_find_trap),
+            // OTP-29.1.1: only the first call bumps all reductions before trapping.
             return Ok(HandlerResult::Yield {
                 continuation: BINARY_SEARCH_CONTINUATION,
                 state,
-                reductions,
+                reductions: 0,
             });
         }
         process.set_gc_enabled(restore_gc);
