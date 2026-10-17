@@ -302,7 +302,8 @@ sizes() ->
     {total_heap_size, Total} = process_info(self(), total_heap_size),
     {heap_size, Heap} = process_info(self(), heap_size),
     {Total, Heap, [proplists:get_value(K, Info) ||
-        K <- [heap_block_size, old_heap_block_size, old_heap_size, recent_size, mbuf_size]]}.
+        K <- [heap_block_size, old_heap_block_size, old_heap_size, recent_size, mbuf_size,
+              heap_size]]}.
 
 body(Parent, N, Kind) ->
     L = grow(N, []),
@@ -341,7 +342,8 @@ case_(N, Kind) ->
     receive {done, Sizes} ->
         receive after 50 -> ok end,
         {N, Kind, Sizes, [{Event, [proplists:get_value(K, Info) ||
-            K <- [heap_block_size, old_heap_block_size, old_heap_size, recent_size]]}
+            K <- [heap_block_size, old_heap_block_size, old_heap_size, recent_size,
+                  heap_size, mbuf_size]]}
             || {Event, Info} <- flush([])]}
     end.
 

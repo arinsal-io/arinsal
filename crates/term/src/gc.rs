@@ -1052,6 +1052,31 @@ impl ProcessHeap {
         }
     }
 
+    /// [`gc_info_words`](Self::gc_info_words) as `process_info(self(), garbage_collection_info)`
+    /// reports it from the running process.
+    ///
+    /// Port of erts/emulator/beam/erl_bif_info.c (`ERTS_PI_IX_GARBAGE_COLLECTION_INFO`) with
+    /// erl_message.c (`erts_factory_proc_init`, `erts_reserve_heap__`), OTP-29.1.1: the result
+    /// factory of a process asking about itself sets `HEAP_TOP` to `HEAP_LIMIT` for as long as
+    /// it is open, and the result list of `result_words` is produced before the values are
+    /// read. When the list fits below the limit the young heap therefore reads as full up to
+    /// `HEAP_LIMIT`; when it does not, the factory releases the reservation back to the real
+    /// top and the list goes to a heap fragment that `mbuf_size` already counts.
+    pub fn gc_info_words_with_result(&self, result_words: usize) -> GcInfoWords {
+        let mut words = self.gc_info_words();
+        let Some(left) = self.halloc_words_left() else {
+            return words;
+        };
+        if result_words <= left {
+            if !self.abandoned {
+                words.heap_size = self.heap_limit_words();
+            }
+        } else {
+            words.mbuf_size += result_words;
+        }
+        words
+    }
+
     /// Number of allocated words in the old generation.
     pub fn old_used_words(&self) -> usize {
         self.old_htop
