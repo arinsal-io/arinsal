@@ -1480,7 +1480,10 @@ impl Executor {
                 if ctx.sys_task_run()
                     || !process.sig_cont_empty()
                     || process.delayed_gc_due()
-                    || ctx.has_pending_input()
+                    || ctx.has_pending_nmsg()
+                    // A cross-process BIF's reply arrives as a message that only this fetch
+                    // moves into the message queue.
+                    || process.pending_signal_waiter.is_some()
                 {
                     let reds = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
                     let mut sig_reds =
@@ -1495,6 +1498,13 @@ impl Executor {
                     let max_reds = sig_reds;
                     let handled = process.handle_incoming(ctx, &mut sig_reds, max_reds, false);
                     ctx.consume(u32::try_from(sig_reds).unwrap_or(0));
+                    // Port of erts/emulator/beam/erl_process.c (schedule: `reds -= sig_reds`,
+                    // then `p->fcalls = reds`; the process's reductions are what the slice
+                    // used), OTP-29.1.1: the signal handling is the process's own work.
+                    process.reductions = process.reductions.saturating_sub(sig_reds.max(0));
+                    process.reductions_used = process
+                        .reductions_used
+                        .saturating_add(u64::try_from(sig_reds).unwrap_or(0));
                     let executed = handled.and_then(|_| {
                         if ctx.sys_task_run() {
                             crate::signals::execute_sys_tasks(process, ctx)

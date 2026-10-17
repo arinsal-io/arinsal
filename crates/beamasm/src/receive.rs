@@ -172,16 +172,25 @@ impl BeamModuleAssembler {
         self.code.b_cond(Cond::Le, schedule_out)?;
         // erts enters the runtime with eHeapAlloc for the receive helper, which may copy
         // fetched messages onto the heap (instr_msg.cpp:139-153).
-        self.emit_runtime_hook_with(hooks.loop_rec as usize, &[], 6, crate::Update::HEAP_ALLOC)?;
+        self.emit_runtime_hook_with(
+            hooks.loop_rec as usize,
+            &[],
+            6,
+            crate::Update::HEAP_ALLOC.union(crate::Update::REDUCTIONS),
+        )?;
         // Any word above the sentinel is a message.
         self.code
             .emit(|e| e.cmp_imm(Gpr::x(0), LOOP_REC_FETCH, false))?;
         self.code.b_cond(Cond::Hi, done)?;
         // The inner queue is empty: erts calls erts_proc_sig_receive_helper, which charges
-        // four reductions per fetch (erl_proc_sig_queue.c:7770).
-        self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 4, false))?;
+        // four reductions per fetch. A fetch the hook did not finish in place runs the
+        // helper on the scheduler side, which charges its own.
         let wait = self.label(wait);
-        self.code.cbz(Gpr::x(0), wait)?;
+        let fetch_outside = self.code.new_label();
+        self.code.cbnz(Gpr::x(0), fetch_outside)?;
+        self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 4, false))?;
+        self.code.b(wait)?;
+        self.code.bind(fetch_outside)?;
         // Signals wait in the outer queue. Their handling needs the scheduler context, which
         // this runtime keeps on the scheduler side, so the fetch runs there and the process
         // re-enters at `entry` within the same slice (`emit_i_loop_rec_shared` restarts too).
