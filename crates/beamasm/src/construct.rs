@@ -194,6 +194,37 @@ impl BeamModuleAssembler {
         self.emit_tuple_element_load(Gpr::x(0), element, dst)
     }
 
+    /// Loads a tuple word into `other_dst` after moving `other_dst` into `dst`: the fused form of
+    /// an element load followed by a swap.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:390-405 (emit_get_tuple_element_swap),
+    // OTP-29.1.1.
+    pub fn emit_get_tuple_element_swap(
+        &mut self,
+        _src: ArgVal,
+        element: u32,
+        dst: ArgVal,
+        other_dst: ArgVal,
+    ) -> Result<(), ModuleError> {
+        self.move_(other_dst, dst)?;
+        self.emit_tuple_element_load(Gpr::x(0), element, other_dst)
+    }
+
+    /// Loads two consecutive tuple words from the untagged tuple pointer in ARG1 with one `ldp`.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:408-421 (emit_get_two_tuple_elements),
+    // OTP-29.1.1.
+    pub fn emit_get_two_tuple_elements(
+        &mut self,
+        _src: ArgVal,
+        element: u32,
+        dst1: ArgVal,
+        dst2: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let first = self.pair_destination(dst1, Gpr::x(9))?;
+        let second = self.pair_destination(dst2, Gpr::x(10))?;
+        self.safe_ldp(first.reg, second.reg, Gpr::x(0), element)?;
+        self.flush_vars(first, second)
+    }
+
     /// Loads a tuple word at its byte offset from an untagged tuple pointer.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:378-389, OTP-29.1.1
     pub fn emit_i_get_tuple_element2(

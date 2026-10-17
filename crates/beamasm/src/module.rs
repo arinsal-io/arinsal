@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::rt::{arinsal_enter_native_return, arinsal_enter_native_yield};
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer, Label},
-    enc::{Cond, Emitter, Gpr},
+    enc::{Cond, Emitter, Gpr, Shift},
     exec::{CodeMemory, ExecError},
 };
 
@@ -23,6 +23,25 @@ const XREGS: [Gpr; 6] = [
     Gpr::x(16),
 ];
 const TMP: Gpr = Gpr::x(9);
+
+/// A destination of a paired load or store: a register-backed X register, or a temporary that
+/// is written back to the memory slot of `slot`.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1472-1493 (Variable, init_destination),
+// OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub(super) struct PairVar {
+    pub(super) reg: Gpr,
+    slot: Option<ArgVal>,
+}
+
+/// Byte offset of a word from its base register for the operands that live in memory.
+fn memory_slot(arg: ArgVal) -> Option<(Gpr, u32)> {
+    match arg {
+        ArgVal::Y(i) => i.checked_mul(8).map(|offset| (E, offset)),
+        ArgVal::XMemory(i) => i.checked_mul(8).map(|offset| (SCHEDULER_REGS, offset)),
+        _ => None,
+    }
+}
 
 /// Typed operand accepted by the first BeamAsm emitter slice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -601,7 +620,7 @@ impl BeamModuleAssembler {
     }
 
     /// Moves a value, deallocates the frame, and performs a local tail call.
-    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:77-115, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:83-115 (emit_move_call_last), OTP-29.1.1
     pub fn move_call_last(
         &mut self,
         src: ArgVal,
@@ -609,8 +628,41 @@ impl BeamModuleAssembler {
         target: u32,
         deallocate: u32,
     ) -> Result<(), ModuleError> {
+        if let ArgVal::Y(src_index) = src
+            && matches!(dst, ArgVal::X(_) | ArgVal::XMemory(_))
+        {
+            let bytes = u64::from(deallocate) * 8;
+            if src_index == 0 && deallocate == 1 {
+                let var = self.pair_destination(dst, TMP)?;
+                self.code.emit(|e| e.ldp_post(var.reg, Gpr::x(30), E, 16))?;
+                self.flush_var(var)?;
+                return self.branch_to_label(target);
+            } else if src_index == 0 && bytes < 256 {
+                let var = self.pair_destination(dst, TMP)?;
+                self.code.emit(|e| e.ldr_post(var.reg, E, bytes as i16))?;
+                self.flush_var(var)?;
+                return self.call_only(target);
+            } else if src_index + 1 == deallocate {
+                let var = self.pair_destination(dst, TMP)?;
+                self.safe_ldp(var.reg, Gpr::x(30), E, src_index * 8)?;
+                self.flush_var(var)?;
+                let frame = (deallocate + 1) * 8;
+                let imm = u16::try_from(frame).map_err(|_| {
+                    ModuleError::InvalidOperand("stack deallocation exceeds immediate range")
+                })?;
+                self.code.emit(|e| e.add_imm(E, E, imm, false))?;
+                return self.branch_to_label(target);
+            }
+        }
         self.move_(src, dst)?;
         self.call_last(target, deallocate)
+    }
+
+    fn branch_to_label(&mut self, target: u32) -> Result<(), ModuleError> {
+        crate::emit_validate_native_cursor(&mut self.code)?;
+        let target = self.label(target);
+        self.code.b(target)?;
+        Ok(())
     }
 
     /// Records this pc as the call site that names the calling function if the callee is a
@@ -1094,6 +1146,141 @@ impl BeamModuleAssembler {
         self.store_operand(dst2, Gpr::x(10))
     }
 
+    /// Picks the register a destination is computed in: the register itself for a
+    /// register-backed X register, `tmp` for one that lives in memory.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1482-1493 (init_destination), OTP-29.1.1.
+    pub(super) fn pair_destination(&self, dst: ArgVal, tmp: Gpr) -> Result<PairVar, ModuleError> {
+        match dst {
+            ArgVal::X(i) if i < 6 => Ok(PairVar {
+                reg: XREGS[i as usize],
+                slot: None,
+            }),
+            ArgVal::Y(_) | ArgVal::XMemory(_) => Ok(PairVar {
+                reg: tmp,
+                slot: Some(dst),
+            }),
+            _ => Err(ModuleError::InvalidOperand(
+                "destination must be an X or Y register",
+            )),
+        }
+    }
+
+    /// Writes a destination back to memory when it does not live in a register.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1667-1673 (flush_var), OTP-29.1.1.
+    pub(super) fn flush_var(&mut self, var: PairVar) -> Result<(), ModuleError> {
+        if let Some(slot) = var.slot {
+            self.store_operand(slot, var.reg)?;
+        }
+        Ok(())
+    }
+
+    /// Writes two destinations back to memory, as one `stp` when their slots are adjacent.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1696-1714 (flush_vars), OTP-29.1.1.
+    pub(super) fn flush_vars(
+        &mut self,
+        first: PairVar,
+        second: PairVar,
+    ) -> Result<(), ModuleError> {
+        if let (Some(slot1), Some(slot2)) = (first.slot, second.slot)
+            && let (Some((base1, offset1)), Some((base2, offset2))) =
+                (memory_slot(slot1), memory_slot(slot2))
+            && base1 == base2
+        {
+            if offset1 + 8 == offset2 {
+                return self.safe_stp(first.reg, second.reg, base1, offset1);
+            } else if offset1 == offset2 + 8 {
+                return self.safe_stp(second.reg, first.reg, base1, offset2);
+            }
+        }
+        self.flush_var(first)?;
+        self.flush_var(second)
+    }
+
+    /// Adds a byte offset that no load or store immediate reaches into x17.
+    fn far_address(&mut self, base: Gpr, offset: u32) -> Result<Gpr, ModuleError> {
+        let scratch = Gpr::x(17);
+        self.code.emit(|e| {
+            e.mov_const(scratch, u64::from(offset))?;
+            e.add_reg(scratch, base, scratch, Shift::Lsl, 0)
+        })?;
+        Ok(scratch)
+    }
+
+    /// Loads two consecutive words, as one `ldp` when the offset is in its range.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1872-1896 (safe_ldp), OTP-29.1.1.
+    pub(super) fn safe_ldp(
+        &mut self,
+        first: Gpr,
+        second: Gpr,
+        base: Gpr,
+        offset: u32,
+    ) -> Result<(), ModuleError> {
+        if offset <= 8 * 0x3F {
+            self.code
+                .emit(|e| e.ldp(first, second, base, offset as i16))?;
+        } else if offset < 8 * 0xFFF {
+            self.code.emit(|e| {
+                e.ldr_uoff(first, base, offset)?;
+                e.ldr_uoff(second, base, offset + 8)
+            })?;
+        } else {
+            let address = self.far_address(base, offset)?;
+            self.code.emit(|e| e.ldp(first, second, address, 0))?;
+        }
+        Ok(())
+    }
+
+    /// Stores two consecutive words, as one `stp` when the offset is in its range.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1809-1826 (safe_stp), OTP-29.1.1.
+    pub(super) fn safe_stp(
+        &mut self,
+        first: Gpr,
+        second: Gpr,
+        base: Gpr,
+        offset: u32,
+    ) -> Result<(), ModuleError> {
+        if offset <= 8 * 0x3F {
+            self.code
+                .emit(|e| e.stp(first, second, base, offset as i16))?;
+        } else if offset < 8 * 0xFFF {
+            self.code.emit(|e| {
+                e.str_uoff(first, base, offset)?;
+                e.str_uoff(second, base, offset + 8)
+            })?;
+        } else {
+            let address = self.far_address(base, offset)?;
+            self.code.emit(|e| e.stp(first, second, address, 0))?;
+        }
+        Ok(())
+    }
+
+    /// Loads two consecutive memory words into two distinct X registers with one `ldp`.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:616-630 (emit_load_two_xregs),
+    // OTP-29.1.1.
+    pub fn emit_load_two_xregs(
+        &mut self,
+        src1: ArgVal,
+        dst1: ArgVal,
+        src2: ArgVal,
+        dst2: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let (Some((base, offset)), Some((base2, offset2))) = (memory_slot(src1), memory_slot(src2))
+        else {
+            return Err(ModuleError::InvalidOperand(
+                "load_two_xregs sources must be memory words",
+            ));
+        };
+        if base != base2 || offset + 8 != offset2 {
+            return Err(ModuleError::InvalidOperand(
+                "load_two_xregs sources must be consecutive",
+            ));
+        }
+        let first = self.pair_destination(dst1, TMP)?;
+        let second = self.pair_destination(dst2, Gpr::x(10))?;
+        self.safe_ldp(first.reg, second.reg, base, offset)?;
+        self.flush_vars(first, second)
+    }
+
     pub(super) fn source_reg(&mut self, src: ArgVal) -> Result<Gpr, ModuleError> {
         self.source_reg_into(src, TMP)
     }
@@ -1432,14 +1619,46 @@ impl BeamModuleAssembler {
     }
 
     /// Swaps two X/Y register values, including mixed register pairs.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:790-825, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:632-648 (emit_swap), OTP-29.1.1
     pub fn swap(&mut self, left: ArgVal, right: ArgVal) -> Result<(), ModuleError> {
-        let left_value = self.register_value(left)?;
-        let right_value = self.register_value(right)?;
-        self.load_register(left_value, TMP)?;
-        self.load_register(right_value, Gpr::x(10))?;
-        self.store_register(left_value, Gpr::x(10))?;
-        self.store_register(right_value, TMP)
+        let left = self.register_value(left)?;
+        let right = self.register_value(right)?;
+        if let ArgVal::X(index) = left {
+            let register = XREGS[index as usize];
+            self.load_register(right, TMP)?;
+            self.store_register(right, register)?;
+            self.code.emit(|e| e.mov_reg(register, TMP))?;
+            return Ok(());
+        }
+        if matches!(right, ArgVal::X(_)) {
+            return self.swap(right, left);
+        }
+        let second_tmp = Gpr::x(10);
+        match (memory_slot(left), memory_slot(right)) {
+            (Some((base1, offset1)), Some((base2, offset2))) if base1 == base2 => {
+                if offset1 + 8 == offset2 {
+                    self.safe_ldp(TMP, second_tmp, base1, offset1)?;
+                } else if offset1 == offset2 + 8 {
+                    self.safe_ldp(second_tmp, TMP, base1, offset2)?;
+                } else {
+                    self.load_register(left, TMP)?;
+                    self.load_register(right, second_tmp)?;
+                }
+            }
+            _ => {
+                self.load_register(left, TMP)?;
+                self.load_register(right, second_tmp)?;
+            }
+        }
+        let into_right = PairVar {
+            reg: TMP,
+            slot: Some(right),
+        };
+        let into_left = PairVar {
+            reg: second_tmp,
+            slot: Some(left),
+        };
+        self.flush_vars(into_right, into_left)
     }
 
     fn register_value(&self, arg: ArgVal) -> Result<ArgVal, ModuleError> {
