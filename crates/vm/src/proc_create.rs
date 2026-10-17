@@ -1402,6 +1402,29 @@ impl Process {
     pub(crate) fn ensure(&mut self, words: usize, live: usize) -> Result<(), VmError> {
         self.ensure_roots(words, live, true)
     }
+    /// [`Process::ensure`] that returns the collection's reduction cost instead of charging it,
+    /// for `arinsal_beamasm_gc_sync`, whose generated code subtracts the cost from FCALLS.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn ensure_uncharged(&mut self, words: usize, live: usize) -> Result<u32, VmError> {
+        self.ensure_roots_cost(words, live, true)
+    }
+    /// Charge `cost` reductions for a collection.
+    ///
+    /// A process running native code spends its FCALLS counter, which stops at zero. The
+    /// interpreter keeps its slice in the scheduler and counts the work as used reductions.
+    // Port of erts/emulator/beam/bif.h (BUMP_REDS) as used by erl_gc.c
+    // (`erts_gc_after_bif_call_lhf`, `erts_garbage_collect`), OTP-29.1.1.
+    pub(crate) fn bump_gc_reds(&mut self, cost: u32) {
+        if self.heap.native_active() {
+            self.reductions = self
+                .reductions
+                .saturating_sub(cost.min(i32::MAX as u32) as i32)
+                .max(0);
+        } else {
+            self.reductions_used = self.reductions_used.saturating_add(u64::from(cost));
+        }
+    }
     /// Ensure native code's register slice directly, copying it through `self.x` only if GC runs.
     ///
     /// Port of erts/emulator/beam/erl_bits.c:1769-1840 (`erts_bs_append_checked`), OTP-29.1.1.
@@ -1450,6 +1473,20 @@ impl Process {
         live: usize,
         clear_dead: bool,
     ) -> Result<(), VmError> {
+        let cost = self.ensure_roots_cost(words, live, clear_dead)?;
+        if cost != 0 {
+            self.bump_gc_reds(cost);
+        }
+        Ok(())
+    }
+    #[cold]
+    #[inline(never)]
+    fn ensure_roots_cost(
+        &mut self,
+        words: usize,
+        live: usize,
+        clear_dead: bool,
+    ) -> Result<u32, VmError> {
         if live > self.x.len() {
             return Err(VmError::Unsupported("live X register count".into()));
         }
@@ -1465,13 +1502,13 @@ impl Process {
             && !self.heap.bin_vheap_gc_due()
             && !gc_stress_enabled()
         {
-            return Ok(());
+            return Ok(0);
         }
         if !self.heap.gc_enabled {
             // Port of erts/emulator/beam/erl_gc.c:780-783 (garbage_collect with F_DISABLE_GC):
             // the need is satisfied in a fresh heap fragment and the collection is delayed.
             self.delay_heap_collection(words);
-            return Ok(());
+            return Ok(0);
         }
         // Port of erts/emulator/beam/jit/arm/instr_common.cpp:94-99, OTP-29.1.1:
         // the native heap check uses S_RESERVED, but GC receives the raw `need`.
@@ -1479,7 +1516,7 @@ impl Process {
         // Port of erl_gc.c:501-513 (`delay_garbage_collection`): a zero-need
         // delayed collection forces rescheduling without manufacturing heap space.
         if words == 0 && gc.collections == 0 {
-            return Ok(());
+            return Ok(0);
         }
         // Port of erts/emulator/beam/erl_gc.c:2639 (setup_rootset nobj), OTP-29.1.1.
         // The collector rewrites only the live prefix. Nilling the rest is an
@@ -1491,7 +1528,7 @@ impl Process {
         if self.heap.free_words() < allocation_words {
             return Err(VmError::Unsupported("heap exhausted after GC".into()));
         }
-        Ok(())
+        Ok(gc.reductions)
     }
     pub(crate) fn read(&self, arg: Arg) -> Result<Term, VmError> {
         let term = match arg.kind() {

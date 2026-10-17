@@ -68,6 +68,16 @@ pub struct GcStats {
     pub words_reclaimed: u64,
     /// Time spent in collection, in nanoseconds.
     pub nanoseconds: u64,
+    /// Reductions erts charges the process for the collection (`gc_cost`).
+    pub reductions: u32,
+}
+
+/// Reductions charged for a collection that moved `moved_live_words` live words and, when the
+/// young heap was resized, `resize_moved_words` more.
+// Port of erts/emulator/beam/erl_gc.c, gc_cost, OTP-29.1.1.
+pub fn gc_cost(moved_live_words: usize, resize_moved_words: usize) -> u32 {
+    let reds = moved_live_words / 10 + resize_moved_words / 100;
+    u32::try_from(reds.clamp(1, i32::MAX as usize)).unwrap_or(i32::MAX as u32)
 }
 
 /// Heap allocator that places every object in the process's message-buffer fragments.
@@ -1440,19 +1450,20 @@ impl ProcessHeap {
         if let Some(error) = error {
             return Err(error);
         }
-        if messages.is_empty() {
-            self.adjust_young_heap(major, min_free, roots, extra)?;
+        let adjusted = if messages.is_empty() {
+            self.adjust_young_heap(major, min_free, roots, extra)?
         } else {
             self.move_msgs_to_heap(messages)?;
             // erts resize_new_heap offsets the on-heap queue with the rest of the root set.
             let mut moved = extra.to_vec();
             moved.extend(messages.iter().map(|(term, _)| *term));
-            self.adjust_young_heap(major, min_free, roots, &mut moved)?;
+            let adjusted = self.adjust_young_heap(major, min_free, roots, &mut moved)?;
             extra.copy_from_slice(&moved[..extra.len()]);
             for ((term, _), &updated) in messages.iter_mut().zip(&moved[extra.len()..]) {
                 *term = updated;
             }
-        }
+            adjusted
+        };
         // erl_gc.c:1506/1952: `size_after` includes the moved message data.
         let copied = self.htop as u64;
         #[cfg(debug_assertions)]
@@ -1474,6 +1485,13 @@ impl ProcessHeap {
             words_promoted: promoted,
             words_reclaimed: size_before.saturating_sub((copied + promoted) as usize) as u64,
             nanoseconds: start.map_or(0, |start| start.elapsed().as_nanos() as u64),
+            // Port of erl_gc.c (`minor_collection`, `major_collection`) `gc_cost(size_after,
+            // adjust_size)`, OTP-29.1.1: a minor collection counts what it tenured as well,
+            // and a resized heap adds its used words.
+            reductions: gc_cost(
+                copied as usize + if major { 0 } else { promoted as usize },
+                if adjusted { copied as usize } else { 0 },
+            ),
         };
         // Port of erts/emulator/beam/erl_gc.c:3284-3289 (sweep_off_heap), OTP-29.1.1.
         if major && self.owners.is_allocated() {
@@ -1520,7 +1538,7 @@ impl ProcessHeap {
         min_free: usize,
         roots: &mut [Term],
         extra: &mut [Term],
-    ) -> Result<(), TermError> {
+    ) -> Result<bool, TermError> {
         let stack = self.stack_words();
         let need_after = self
             .htop
@@ -1573,8 +1591,9 @@ impl ProcessHeap {
             && wanted != capacity
         {
             self.relocate_young(wanted, roots, extra);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Move queued message fragments onto the heap top, rebasing their pointers, and free

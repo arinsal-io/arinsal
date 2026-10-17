@@ -6000,6 +6000,7 @@ impl Process {
         let mut roots = [result];
         let gc = self.collect_heap_roots(0, &mut roots, 0)?;
         crate::natives::sys::after_collection(self, 0, gc.collections, gc.words_reclaimed);
+        self.bump_gc_reds(gc.reductions);
         // Only X0 survives a call; the dead registers now point into the freed heap and
         // must not be scanned by later literal-area or root walks.
         self.x[1..].fill(Term::NIL);
@@ -6527,6 +6528,7 @@ impl Process {
             stats.collections,
             stats.words_reclaimed,
         );
+        self.bump_gc_reds(stats.reductions);
         Ok(())
     }
 
