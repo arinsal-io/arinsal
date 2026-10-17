@@ -1110,6 +1110,7 @@ impl ProcessHeap {
 
     /// Whether heap fragments exceed the free young-generation area.
     /// Port of erl_gc.h:132-139 (`ERTS_IS_GC_DESIRED`), OTP-29.1.1.
+    #[inline(always)]
     pub fn gc_desired(&self) -> bool {
         self.free_words() < self.fragment_words as usize
     }

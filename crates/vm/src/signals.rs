@@ -3571,17 +3571,26 @@ pub(crate) fn execute_sys_tasks(
 
 /// Wakes the process again for system tasks deferred during this slice, so that it reaches a
 /// scheduling point that runs them (erts keeps ERTS_PSFLG_ACTIVE_SYS set).
+#[inline(always)]
 pub(crate) fn reschedule_deferred_sys_tasks(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
 ) -> Result<(), VmError> {
-    if !process
+    if process
         .cold
         .as_ref()
         .is_some_and(|cold| cold.sys_tasks_deferred)
     {
-        return Ok(());
+        return wake_for_deferred_sys_tasks(process, ctx);
     }
+    Ok(())
+}
+
+#[inline(never)]
+fn wake_for_deferred_sys_tasks(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) -> Result<(), VmError> {
     let priority = {
         let tables = tables().lock().unwrap();
         let Some(queues) = tables.requests.get(&(scope(process), ctx.pid())) else {
