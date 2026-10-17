@@ -493,6 +493,14 @@ pub(crate) fn export_trampoline() -> usize {
     fragments().map_or(0, DispatchFragments::export_trampoline)
 }
 
+fn yield_fragments() -> Option<&'static arinsal_beamasm::yield_frag::YieldFragments> {
+    static FRAGMENTS: OnceLock<Option<arinsal_beamasm::yield_frag::YieldFragments>> =
+        OnceLock::new();
+    FRAGMENTS
+        .get_or_init(|| arinsal_beamasm::yield_frag::YieldFragments::new().ok())
+        .as_ref()
+}
+
 fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
     static FRAGMENTS: OnceLock<Option<arinsal_beamasm::map::MapFragments>> = OnceLock::new();
     FRAGMENTS
@@ -1721,6 +1729,15 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
     fn line_breakpoint_fragment(&self) -> usize {
         self.line_breakpoint_fragment
+    }
+    fn yield_fragments(&self) -> Option<(usize, usize, usize)> {
+        yield_fragments().map(|fragments| {
+            (
+                fragments.dispatch_return(),
+                fragments.i_test_yield_shared(),
+                fragments.context_switch(),
+            )
+        })
     }
     fn send_fragment(&self) -> usize {
         self.send_fragment
