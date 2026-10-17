@@ -252,7 +252,7 @@ fn leader_update(tpd: &mut ThrPrgrData) -> bool {
         block_thread(tpd);
         return tpd.leader;
     }
-    let progress = Arc::clone(&tpd.progress);
+    let progress = &*tpd.progress;
     let my_ix = tpd.id;
     if tpd.leader_current == VAL_WAITING {
         // Took over as leader from another thread.

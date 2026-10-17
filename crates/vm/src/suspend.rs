@@ -76,6 +76,12 @@ fn mirror_bit(runtime: &Runtime, pid: Pid, on: bool) {
     }
 }
 
+/// Whether the process running on `ctx` is suspended: one load of its own state word, as erts
+/// tests `ERTS_PSFLG_SUSPENDED` in `p->state` without a process table lookup.
+pub(crate) fn ctx_suspended(ctx: &arinsal_sched::RunCtx<'_, Message>) -> bool {
+    ctx.exit_flags().load(Ordering::Acquire) & proc_flags::SUSPENDED != 0
+}
+
 /// Whether `pid` is suspended, read from its state bit (cross-thread safe).
 pub(crate) fn suspended_bit(runtime: &Runtime, pid: Pid) -> bool {
     runtime
