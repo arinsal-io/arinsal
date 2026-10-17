@@ -23,6 +23,19 @@ impl MagicRef {
         Self::allocate(NEXT_ID.fetch_add(1, Ordering::Relaxed), payload, false)
     }
 
+    /// Allocate an opaque reference whose `mb->orig_size` is `orig_size` bytes instead of
+    /// the payload's own size, for payloads that stand in for a fixed erts structure.
+    // Port of erts/emulator/beam/erl_binary.h (erts_create_magic_binary_x), OTP-29.1.1:
+    // `orig_size` is `ERTS_MAGIC_BIN_ORIG_SIZE(size)`, the data offset plus the payload size.
+    pub fn with_orig_size<T: Any + Send + Sync>(payload: T, orig_size: usize) -> Arc<Self> {
+        Self::allocate_sized(
+            NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            payload,
+            false,
+            orig_size,
+        )
+    }
+
     /// Recreate an opaque reference using an identity retained in an external term.
     pub fn new_with_id<T: Any + Send + Sync>(id: u64, payload: T) -> Arc<Self> {
         NEXT_ID.fetch_max(id.saturating_add(1), Ordering::Relaxed);
@@ -34,10 +47,24 @@ impl MagicRef {
         payload: T,
         restored_from_external_term: bool,
     ) -> Arc<Self> {
+        Self::allocate_sized(
+            id,
+            payload,
+            restored_from_external_term,
+            std::mem::size_of::<T>(),
+        )
+    }
+
+    fn allocate_sized<T: Any + Send + Sync>(
+        id: u64,
+        payload: T,
+        restored_from_external_term: bool,
+        orig_size: usize,
+    ) -> Arc<Self> {
         let owner = Arc::new(Self {
             id,
             restored_from_external_term,
-            orig_size: std::mem::size_of::<T>(),
+            orig_size,
             payload: Box::new(payload),
         });
         registry()
