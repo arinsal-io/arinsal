@@ -59,6 +59,9 @@ pub(crate) struct Entry {
 }
 
 const CODE_PERMISSION_CONTINUATION: &str = "erts_debug:set_internal_state/2";
+/// The continuation of `lists:reverse/2`: the BIF traps to its own export with the cells
+/// still to walk and the reversed prefix as arguments.
+pub(crate) const REVERSE_CONTINUATION: &str = "lists:reverse/2";
 const IOLIST_CONTINUATION: &str = "erts_internal:list_to_bitstring_continue/1";
 const IOLIST_SIZE_CONTINUATION: &str = "erts_internal:iolist_size_continue/1";
 const IOLIST_TO_IOVEC_CONTINUATION: &str = "erts_internal:iolist_to_iovec_continue/1";
@@ -137,11 +140,12 @@ fn clear_export_trap(process: &mut Process) {
 
 // Port of erts/emulator/beam/erl_bif_lists.c:1246 (lists_reverse_2), OTP-29.1.1.
 // The fill lives in `arinsal_bifs::lists_reverse` (on-heap, then alloc). This
-// handler only supplies the reduction budget and the trap state.
+// handler only supplies the reduction budget; the trap's arguments are the cells still
+// to walk and the reversed prefix, which a resumed call reads like a first call does.
 fn lists_reverse(
     process: &mut Process,
     args: &[Term],
-    state: Option<&Arc<MagicRef>>,
+    _state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
@@ -149,19 +153,9 @@ fn lists_reverse(
     let max_cells = reds
         .saturating_mul(arinsal_bifs::REVERSE_ONHEAP_CELLS_PER_RED)
         .max(1);
-    let (list, tail) = if let Some(state) = state {
-        let saved = state
-            .downcast_ref::<Mutex<arinsal_bifs::ReverseCont>>()
-            .ok_or(BifError::BADARG)?
-            .lock()
-            .map_err(|_| BifError::SystemLimit)?;
-        (saved.list(), saved.tail())
-    } else {
-        (args[0], args[1])
-    };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
-    let step = arinsal_bifs::lists_reverse(&mut ctx, list, tail, max_cells);
+    let step = arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells);
     drop(ctx);
     let step = step?;
     Ok(match step {
@@ -170,11 +164,22 @@ fn lists_reverse(
             reductions: 0,
         },
         arinsal_bifs::ReverseStep::Trap(cont) => HandlerResult::Yield {
-            continuation: "lists:reverse/2",
+            continuation: REVERSE_CONTINUATION,
             state: MagicRef::new(Mutex::new(cont)),
             reductions: 0,
         },
     })
+}
+
+/// The arguments `BIF_TRAP2(lists:reverse/2, list, tail)` leaves for the next slice.
+// Port of erts/emulator/beam/erl_bif_lists.c (lists_reverse_alloc and lists_reverse_onheap: BIF_TRAP2 with the remaining
+// list and the reversed prefix), OTP-29.1.1.
+fn reverse_trap_args(state: &Arc<MagicRef>) -> Option<[Term; 2]> {
+    let cont = state
+        .downcast_ref::<Mutex<arinsal_bifs::ReverseCont>>()?
+        .lock()
+        .ok()?;
+    Some([cont.list(), cont.tail()])
 }
 
 fn lists_member_trap(
@@ -704,7 +709,7 @@ const ENTRIES: &[Entry] = &[
         module: "lists",
         function: "reverse",
         arity: 2,
-        continuation: "lists:reverse/2",
+        continuation: REVERSE_CONTINUATION,
         handler: lists_reverse,
     },
     Entry {
@@ -1903,6 +1908,7 @@ pub(crate) fn execute_named(
             // erts_reject_code_permissions).
             if continuation != PTAB_LIST_CONTINUATION
                 && continuation != CODE_PERMISSION_CONTINUATION
+                && continuation != REVERSE_CONTINUATION
             {
                 process.set_gc_enabled(false);
             }
@@ -1928,6 +1934,9 @@ pub(crate) fn execute_named(
                     arity.min(3),
                 )
             };
+            let reverse_args = (continuation == REVERSE_CONTINUATION)
+                .then(|| reverse_trap_args(&state))
+                .flatten();
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.module,
                 caller_ip: process.ip,
@@ -1938,7 +1947,9 @@ pub(crate) fn execute_named(
                 gc_was_enabled,
                 arity: trap_arity,
                 callee,
-                args: if resumed {
+                args: if let Some(trap_args) = reverse_args {
+                    [trap_args[0], trap_args[1], Term::NIL]
+                } else if resumed {
                     [args[0], args[1], args[2]]
                 } else {
                     let live = live_args(process, &args, arity.min(3));
@@ -1948,6 +1959,13 @@ pub(crate) fn execute_named(
                 },
             });
             charge(process, ctx, reductions);
+            // Port of erts/emulator/beam/erl_gc.c (erts_gc_after_bif_call_lhf with a
+            // TRAP result collects with the trap's arguments as roots), OTP-29.1.1.
+            if continuation == REVERSE_CONTINUATION
+                && let Err(error) = process.collect_bin_vheap_if_due(0)
+            {
+                return Some(Err(error));
+            }
             Ok(HandlerResult::Yield {
                 continuation,
                 state: process
@@ -2184,6 +2202,7 @@ pub(crate) fn finish_light(
                     .is_some_and(|walk| walk.needs_initial_allocation());
             if continuation != PTAB_LIST_CONTINUATION
                 && continuation != CODE_PERMISSION_CONTINUATION
+                && continuation != REVERSE_CONTINUATION
                 && !binary_to_list_retry
             {
                 process.set_gc_enabled(false);
@@ -2191,6 +2210,11 @@ pub(crate) fn finish_light(
             let mut saved = [Term::NIL; 3];
             let kept = args.len().min(3);
             saved[..kept].copy_from_slice(&args[..kept]);
+            if continuation == REVERSE_CONTINUATION
+                && let Some(trap_args) = reverse_trap_args(&state)
+            {
+                saved[..2].copy_from_slice(&trap_args);
+            }
             // The scheduler binds the trap to its call site when it context-switches.
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.module,
@@ -2239,7 +2263,7 @@ pub(crate) fn install_deferred_trap(
             ("lists:member/2", MagicRef::new(Mutex::new(cont)))
         }
         arinsal_bifs::DeferredTrap::Reverse(cont) => {
-            ("lists:reverse/2", MagicRef::new(Mutex::new(cont)))
+            (REVERSE_CONTINUATION, MagicRef::new(Mutex::new(cont)))
         }
         arinsal_bifs::DeferredTrap::Append(cont) => (
             if function == "append" {
@@ -2270,12 +2294,17 @@ pub(crate) fn install_deferred_trap(
             MagicRef::new(Mutex::new(walk)),
         ),
     };
-    if disable_gc {
+    if disable_gc && continuation != REVERSE_CONTINUATION {
         process.set_gc_enabled(false);
     }
     let mut saved = [Term::NIL; 3];
     let arity = args.len().min(3);
     saved[..arity].copy_from_slice(&args[..arity]);
+    if continuation == REVERSE_CONTINUATION
+        && let Some(trap_args) = reverse_trap_args(&state)
+    {
+        saved[..2].copy_from_slice(&trap_args);
+    }
     process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
         caller_module: process.module,
         caller_ip: process.ip,

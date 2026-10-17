@@ -2869,6 +2869,18 @@ pub(crate) extern "C" fn list_reverse_entry(
             light_trap_result(process, registers, export, 2, entry_top, false, result)
         }
         crate::bif_traps::LightTrap::Trapped => {
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared) and erl_gc.c
+            // (erts_gc_after_bif_call_lhf runs before the trap is taken, with the trap's
+            // arguments as the live registers), OTP-29.1.1.
+            process
+                .heap
+                .set_frame_pointer(registers.tmp_mem[2] as usize);
+            if process.collect_bin_vheap_if_due(0).is_err() {
+                crate::native_hooks::set_error(process, "system_limit");
+                process.sync_native_header();
+                return 0;
+            }
+            registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
             arm_light_trap(process, registers, export).unwrap_or(0)
         }
     }
