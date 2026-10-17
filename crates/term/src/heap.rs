@@ -2698,7 +2698,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         if !self.heap.supports_writable_binary() && crate::bits::binary_owner_is_writable(owner) {
             return Err(TermError::Unsupported("writable binary heap owner"));
         }
-        let words = if copy_bif_small { 5 } else { 8 };
+        let words = 5;
         let p = if fragment_only {
             self.heap.alloc_fragment_only(words)
         } else {
@@ -2707,45 +2707,24 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         .ok_or(TermError::HeapFull)?;
         let absolute = view.start_bit() + start;
         let adjustment = owner_adjustment(owner);
-        // SAFETY: `words` reserves either one five-word SUB_BITS or a BinRef plus SUB_BITS;
-        // the source heap retains its original BinRef while the destination is initialized.
+        // SAFETY: `words` reserves one five-word SUB_BITS; its original term is the
+        // existing BinRef, which the source heap keeps live.
         unsafe {
-            if copy_bif_small {
-                // Port of erts/emulator/beam/erl_bits.c:2635-2669 (erts_build_sub_bitstring),
-                // OTP-29.1.1: a large BIF sub-bitstring points at the existing BinRef.
-                let volatile = if crate::bits::binary_owner_is_writable(owner) {
-                    crate::bits::SUB_BITS_VOLATILE
-                } else {
-                    0
-                };
-                *p = (4 << 6) | SUB_BITS;
-                *p.add(1) = (binary_data(owner.raw_ptr()) as u64 & !3) | volatile;
-                *p.add(2) = (absolute + adjustment * 8) as u64;
-                *p.add(3) = (absolute + bit_len + adjustment * 8) as u64;
-                *p.add(4) = owner.bits();
-                return Ok(Term::from_ptr(p, 2));
-            }
-
-            // The non-BIF builder copies across heap owners and retains its own BinRef.
-            let (binary, flags, overhead, binary_owner) = crate::bits::clone_binary_owner(owner)?;
-            let sub = p.add(3);
-            *p = (2 << 6) | BIN_REF;
-            *p.add(1) = binary;
-            *p.add(2) = 0;
-            *sub = (4 << 6) | SUB_BITS;
-            *sub.add(1) = binary_data(p) as u64 & !3;
-            *sub.add(2) = (absolute + adjustment * 8) as u64;
-            *sub.add(3) = (absolute + bit_len + adjustment * 8) as u64;
-            *sub.add(4) = Term::from_ptr(p, 2).bits();
-            crate::bits::retain_cloned_binary_owner(
-                self.heap,
-                p,
-                binary,
-                flags,
-                overhead,
-                binary_owner,
-            )?;
-            Ok(Term::from_ptr(sub, 2))
+            // Port of erts/emulator/beam/erl_bits.c (erts_build_sub_bitstring) and
+            // erts_bs_get_binary_2, OTP-29.1.1: a sub-bitstring points at the existing
+            // BinRef and neither adds a ProcBin to the off-heap list nor charges the
+            // binary to the virtual heap again.
+            let volatile = if crate::bits::binary_owner_is_writable(owner) {
+                crate::bits::SUB_BITS_VOLATILE
+            } else {
+                0
+            };
+            *p = (4 << 6) | SUB_BITS;
+            *p.add(1) = (binary_data(owner.raw_ptr()) as u64 & !3) | volatile;
+            *p.add(2) = (absolute + adjustment * 8) as u64;
+            *p.add(3) = (absolute + bit_len + adjustment * 8) as u64;
+            *p.add(4) = owner.bits();
+            Ok(Term::from_ptr(p, 2))
         }
     }
     /// Construct a sorted flatmap; last duplicate key wins.

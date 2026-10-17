@@ -6,15 +6,14 @@ use arinsal_term::{ProcessHeap, Term, TermBuilder};
 
 #[test]
 fn live_off_heap_chain_longer_than_one_million_survives_heap_resize() {
-    const SUB_BINARIES: usize = 1_200_000;
+    const BINARIES: usize = 1_200_000;
     let mut heap = ProcessHeap::with_words(1024);
-    let parent = TermBuilder::new(&mut heap).binary(&[1; 256]).unwrap();
-    let mut roots = [parent, Term::NIL];
-    for _ in 0..SUB_BINARIES {
+    let mut roots = [Term::NIL, Term::NIL];
+    for _ in 0..BINARIES {
         loop {
             let mut builder = TermBuilder::new(&mut heap);
-            let sub = builder.sub_binary(roots[0], 64, 64 * 8);
-            let cell = sub.and_then(|sub| builder.cons(sub, roots[1]));
+            let bin = builder.binary(&[1; 256]);
+            let cell = bin.and_then(|bin| builder.cons(bin, roots[1]));
             match cell {
                 Ok(list) => {
                     roots[1] = list;
@@ -27,5 +26,5 @@ fn live_off_heap_chain_longer_than_one_million_survives_heap_resize() {
         }
     }
     heap.collect(&mut roots, &mut [], 0).unwrap();
-    assert_eq!(heap.off_heap_count(), SUB_BINARIES + 1);
+    assert_eq!(heap.off_heap_count(), BINARIES);
 }
