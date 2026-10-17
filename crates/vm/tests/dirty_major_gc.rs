@@ -102,3 +102,190 @@ fn self_initiated_long_gc_matches_otp_and_uses_dirty_cpu() {
         ])
     );
 }
+
+const REDS_SOURCE: &str = r#"
+-module(dirty_gc_reds).
+-export([run/0]).
+
+run() ->
+    Small = [case_(N, 0, live) || N <- [0, 1000, 10000]],
+    Large = [case_(N, 0, live) || N <- [100000, 800000], _ <- [1, 2, 3]],
+    Spin = [case_(100000, K, live) || K <- [0, 1500, 3000], _ <- [1, 2, 3]],
+    Dead = [case_(100000, 0, dead) || _ <- [1, 2, 3]],
+    {Small, Large, Spin, Dead}.
+
+spin(0) -> ok;
+spin(N) -> spin(N - 1).
+
+body(Parent, N, K, live) ->
+    L = lists:seq(1, N),
+    erlang:garbage_collect(),
+    receive go -> ok end,
+    {reductions, _} = process_info(self(), reductions),
+    spin(K),
+    {reductions, R0} = process_info(self(), reductions),
+    erlang:garbage_collect(),
+    {reductions, R1} = process_info(self(), reductions),
+    Parent ! {done, R1 - R0, length(L)};
+body(Parent, N, K, dead) ->
+    L = lists:seq(1, N),
+    Len = length(L),
+    receive go -> ok end,
+    {reductions, _} = process_info(self(), reductions),
+    spin(K),
+    {reductions, R0} = process_info(self(), reductions),
+    erlang:garbage_collect(),
+    {reductions, R1} = process_info(self(), reductions),
+    Parent ! {done, R1 - R0, Len}.
+
+case_(N, K, Kind) ->
+    Parent = self(),
+    P = spawn(fun() -> body(Parent, N, K, Kind) end),
+    receive after 50 -> ok end,
+    erlang:trace(P, true, [garbage_collection, monotonic_timestamp]),
+    P ! go,
+    receive {done, Delta, _} ->
+        receive after 50 -> ok end,
+        Events = flush([]),
+        Starts = [T || {gc_major_start, T} <- Events],
+        Ends = [T || {gc_major_end, T} <- Events],
+        Dur = case {Starts, Ends} of
+            {[_ | _], [_ | _]} -> (lists:last(Ends) - lists:last(Starts)) div 1000;
+            _ -> -1
+        end,
+        {N, K, Delta, length(Starts), length(Ends), Dur}
+    end.
+
+flush(Acc) ->
+    receive
+        {trace_ts, _, Event, _, T} -> flush([{Event, T} | Acc]);
+        {trace_ts, _, Event, T} -> flush([{Event, T} | Acc])
+    after 0 -> lists:reverse(Acc)
+    end.
+"#;
+
+#[derive(Debug, Clone, Copy)]
+struct GcCase {
+    n: i64,
+    k: i64,
+    delta: i64,
+    starts: i64,
+    ends: i64,
+    dur_us: i64,
+}
+
+fn int(term: &OwnedTerm) -> i64 {
+    match term {
+        OwnedTerm::Int(value) => *value,
+        other => panic!("integer expected, got {other:?}"),
+    }
+}
+
+fn cases(term: &OwnedTerm) -> Vec<GcCase> {
+    let OwnedTerm::List { elems, .. } = term else {
+        panic!("list expected, got {term:?}");
+    };
+    elems
+        .iter()
+        .map(|elem| {
+            let OwnedTerm::Tuple(fields) = elem else {
+                panic!("tuple expected, got {elem:?}");
+            };
+            GcCase {
+                n: int(&fields[0]),
+                k: int(&fields[1]),
+                delta: int(&fields[2]),
+                starts: int(&fields[3]),
+                ends: int(&fields[4]),
+                dur_us: int(&fields[5]),
+            }
+        })
+        .collect()
+}
+
+fn groups(term: &OwnedTerm) -> [Vec<GcCase>; 4] {
+    let OwnedTerm::Tuple(parts) = term else {
+        panic!("tuple expected, got {term:?}");
+    };
+    [
+        cases(&parts[0]),
+        cases(&parts[1]),
+        cases(&parts[2]),
+        cases(&parts[3]),
+    ]
+}
+
+/// The reductions of a dirty explicit collection: the call and `min(reds_left, 10)` on the normal
+/// scheduler, then four per whole microsecond on the dirty CPU scheduler.
+const DIRTY_BASE: i64 = 13;
+const SLACK_US: i64 = 100;
+
+fn check_dirty(runtime: &str, label: &str, group: &[GcCase]) {
+    for case in group {
+        assert!(
+            case.starts >= 1 && case.starts == case.ends,
+            "{runtime} {label} {case:?}"
+        );
+        let extra = case.delta - DIRTY_BASE;
+        assert!(
+            extra % 4 == 0 || case.delta == DIRTY_BASE + 1,
+            "{runtime} {label} residue {case:?}"
+        );
+        assert!(
+            extra >= 4 * case.dur_us,
+            "{runtime} {label} below trace {case:?}"
+        );
+    }
+    assert!(
+        group
+            .iter()
+            .any(|case| case.delta - DIRTY_BASE <= 4 * (case.dur_us + SLACK_US)),
+        "{runtime} {label} above trace in every run {group:?}"
+    );
+}
+
+fn check_all(runtime: &str, [_, large, spin, dead]: &[Vec<GcCase>; 4]) {
+    for n in [100_000, 800_000] {
+        let group: Vec<GcCase> = large.iter().copied().filter(|case| case.n == n).collect();
+        check_dirty(runtime, &format!("live n={n}"), &group);
+    }
+    for k in [0, 1500, 3000] {
+        let group: Vec<GcCase> = spin.iter().copied().filter(|case| case.k == k).collect();
+        check_dirty(runtime, &format!("spin k={k}"), &group);
+    }
+    check_dirty(runtime, "dead", dead);
+}
+
+#[test]
+fn explicit_dirty_gc_reductions_match_otp_formula() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dirty GC reductions differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named("dirty_gc_reds", REDS_SOURCE, &[])
+        .expect("compile dirty_gc_reds");
+    reference
+        .load("dirty_gc_reds", &beam)
+        .expect("load into erl");
+    let CallResult::Ok(expected) = reference.call("dirty_gc_reds", "run", &[]) else {
+        panic!("erl run failed");
+    };
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).expect("load into arinsal");
+    let actual = vm
+        .eval_scheduled("dirty_gc_reds", "run", &[], 2, None)
+        .expect("scheduled dirty GC reductions run");
+    let expected = groups(&expected);
+    let actual = groups(&actual.term);
+    let small = |groups: &[Vec<GcCase>; 4]| -> Vec<(i64, i64)> {
+        groups[0].iter().map(|case| (case.n, case.delta)).collect()
+    };
+    assert_eq!(
+        small(&expected),
+        small(&actual),
+        "small heaps match exactly"
+    );
+    check_all("erl", &expected);
+    check_all("arinsal", &actual);
+}
