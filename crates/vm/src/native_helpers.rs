@@ -3966,6 +3966,7 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         process.header.htop,
         process.header.stop,
     );
+    process.reductions = process.header.fcalls;
     let Some((process, registers)) = crate::native_hooks::scheduler_registers(process) else {
         return 0;
     };
