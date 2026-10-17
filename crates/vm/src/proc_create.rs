@@ -1737,6 +1737,23 @@ pub(crate) struct EtsSelect {
     /// Results of the earlier cycles.
     pub(crate) saved: arinsal_ets::SavedMatches,
     pub(crate) safety: arinsal_ets::IterSafety,
+    /// The chunk size of `select/3` and its relatives; zero for the calls that return every
+    /// result.
+    pub(crate) chunk: usize,
+    /// The program is registered for a continuation the caller handed in.
+    pub(crate) retained: bool,
+    pub(crate) stage: SelectStage,
+    /// The end of the key range an ordered table's continuation names.
+    pub(crate) end: Option<arinsal_ets::SavedKey>,
+}
+
+/// Where a trapped chunked traversal of an ordered table is.
+pub(crate) enum SelectStage {
+    /// The traversal runs on.
+    Scan,
+    /// The results wait in `ets:reverse/3`, which has `done` of them behind it; `eot` when no
+    /// continuation follows.
+    Reverse { done: usize, eot: bool },
 }
 
 /// Port of erts/emulator/beam/erl_db.c:2161-2330 (ets_insert_2_list_info), OTP-29.1.1: the state a
