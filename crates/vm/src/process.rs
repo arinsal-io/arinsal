@@ -1408,13 +1408,6 @@ impl Executor {
             process.fr = registers.into_boxed_slice();
         }
         process.fr[..self.fr.len()].copy_from_slice(&self.fr);
-        // Port of erts/emulator/beam/jit/arm/process_main.cpp:224-226 (copy_in_registers),
-        // OTP-29.1.1: only the `c_p->arity` registers the process saved when it switched out
-        // are live; the register array above them is garbage that no code reads.
-        let native_x = self.x.len().min(self.native_registers.x_reg_array.len());
-        self.native_registers.x_reg_array[..native_x].copy_from_slice(&self.x[..native_x]);
-        self.native_registers.f_reg_array[..self.fr.len().min(1024)]
-            .copy_from_slice(&process.fr[..self.fr.len().min(1024)]);
         let result = (|| -> Result<RunState, VmError> {
             'execution: {
                 // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1.
@@ -3483,8 +3476,12 @@ impl Executor {
             if process.fr.len() != live_fr {
                 process.fr = vec![0.0; live_fr].into_boxed_slice();
             }
-            let copy_fr = self.fr.len().min(live_fr);
-            process.fr[..copy_fr].copy_from_slice(&self.fr[..copy_fr]);
+            // Float registers are never live across a scheduling point (erts saves none), so a
+            // native continuation keeps no copy.
+            if process.native_pc.is_none() {
+                let copy_fr = self.fr.len().min(live_fr);
+                process.fr[..copy_fr].copy_from_slice(&self.fr[..copy_fr]);
+            }
         } else {
             process.x = crate::proc_create::ArgRegs::empty();
             process.fr = Box::new([]);
