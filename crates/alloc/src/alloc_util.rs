@@ -891,18 +891,14 @@ impl AllocUtil {
                 size,
             });
         }
-        let (offset, found) = if let Some(chosen) = self.choose_free_in(block_size)? {
+        // Port of mbc_alloc_finalize, erl_alloc_util.c:1913, OTP-29.1.1: the carrier is resolved
+        // once and the header decoded once; the unlink and the header writes reuse both.
+        let (offset, span) = if let Some(chosen) = self.choose_free_span(block_size)? {
             chosen
         } else {
             let ci = self.add_mbc(block_size)?;
             let start = self.carriers[ci].as_ref().ok_or(AllocError::Corrupt)?.start;
-            (start, None)
-        };
-        // Port of mbc_alloc_finalize, erl_alloc_util.c:1913, OTP-29.1.1: the carrier is resolved
-        // once and the header decoded once; the unlink and the header writes reuse both.
-        let span = match found {
-            Some(span) => span,
-            None => self.span_of(offset).ok_or(AllocError::Corrupt)?,
+            (start, self.span_of(start).ok_or(AllocError::Corrupt)?)
         };
         let old = Self::decode_block(span, offset)?;
         self.unlink_free_in(span, offset, old.size)?;
@@ -2905,6 +2901,33 @@ impl AllocUtil {
         (span, root)
     }
 
+    /// `aoff_get_free_block`, erl_ao_firstfit_alloc.c:895, OTP-29.1.1: the carrier tree picks the
+    /// carrier and its own block tree the block. The span of the carrier comes back by value so
+    /// that an inlined caller keeps it in registers.
+    #[inline(always)]
+    fn choose_aoff_span(&self, need: usize) -> Option<(usize, CarrierSpan)> {
+        let carrier_node = self.aoff_search(self.aoff_carrier_root, need)?;
+        let (span, root) = self.carrier_of_tree_node(carrier_node);
+        self.tree_span.set(span);
+        self.aoff_search(root, need).map(|block| (block, span))
+    }
+
+    /// `choose_free` with the span of the carrier holding the block, for `alloc`.
+    #[inline(always)]
+    fn choose_free_span(&self, need: usize) -> Result<Option<(usize, CarrierSpan)>, AllocError> {
+        if is_aoff(self.strategy) {
+            return Ok(self.choose_aoff_span(need));
+        }
+        match self.choose_free_in(need)? {
+            Some((block, Some(span))) => Ok(Some((block, span))),
+            Some((block, None)) => Ok(Some((
+                block,
+                self.span_of(block).ok_or(AllocError::Corrupt)?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// `choose_free` that also returns the span of the aoff carrier holding the block, which the
     /// search had to resolve anyway.
     #[inline]
@@ -2948,14 +2971,9 @@ impl AllocUtil {
             return Ok(None);
         }
         if is_aoff(self.strategy) {
-            let Some(carrier_node) = self.aoff_search(self.aoff_carrier_root, need) else {
-                return Ok(None);
-            };
-            let (span, root) = self.carrier_of_tree_node(carrier_node);
-            self.tree_span.set(span);
             return Ok(self
-                .aoff_search(root, need)
-                .map(|block| (block, Some(span))));
+                .choose_aoff_span(need)
+                .map(|(block, span)| (block, Some(span))));
         }
         let mut current = self.free_root;
         let mut best = 0;
