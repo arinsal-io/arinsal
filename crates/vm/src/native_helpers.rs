@@ -1309,7 +1309,10 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
         return Some(own.map_or(plain_bif_light as *const () as usize, |e| e.plain));
     }
     if export.light_process_bif.is_some() {
-        return Some(process_bif_light as *const () as usize);
+        return Some(
+            crate::natives::thin_entry(&export.module, &export.function, export.arity)
+                .unwrap_or(process_bif_light as *const () as usize),
+        );
     }
     if export.direct_ets.is_some() {
         return Some(direct_bif_light as *const () as usize);
@@ -2351,6 +2354,60 @@ pub(crate) extern "C" fn process_bif_light(
     }
 }
 
+/// A process BIF whose success path returns in registers: no `Result<Term, Trap>` is moved
+/// unless the BIF fails, and the export is not read unless it does.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1:
+// the BIF is called with `c_p` and the X registers, a value returns in x0 and `THE_NON_VALUE`
+// is the error path.
+pub(crate) extern "C" fn thin_bif_light<B: crate::natives::ThinProcessBif>(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    descriptor: u64,
+    _identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    process.reductions = process.header.fcalls;
+    let entry_top = process.heap.heap_top_index();
+    match B::call(process, &registers.x_reg_array[..B::ARITY]) {
+        Ok(value) => {
+            registers.x_reg_array[0] = value;
+            let top = process.heap.heap_top_index();
+            if top != entry_top {
+                process.header.htop = native_htop(process, top);
+            }
+            if process.header.fcalls != process.reductions {
+                process.header.fcalls = process.reductions;
+            }
+            crate::native_hooks::raw(value)
+        }
+        Err(trap) => thin_bif_failed(process, registers, descriptor, *trap),
+    }
+}
+
+/// A thin process BIF's exception, run through the same path as a [`ProcessBif`]'s.
+#[cold]
+#[inline(never)]
+fn thin_bif_failed(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    descriptor: u64,
+    trap: crate::exceptions::Trap,
+) -> u64 {
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+        return 0;
+    };
+    process_bif_result(
+        process,
+        registers,
+        export,
+        usize::from(export.arity),
+        Err(trap),
+    )
+}
+
 /// An ETS or process-dictionary BIF whose body is `direct_ets`.
 pub(crate) extern "C" fn direct_bif_light(
     header: *mut ProcessHeader,
@@ -3366,7 +3423,7 @@ fn call_process_bif(
             .heap
             .set_frame_pointer(registers.tmp_mem[2] as usize);
     }
-    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
+    let entry_top = process.heap.heap_top_index();
     let result = bif(process, &registers.x_reg_array[..arity])?;
     if collects {
         // The heap block moved. Heap indices from before the call belong to the
@@ -3393,7 +3450,8 @@ fn call_process_bif(
     // The light fragment tests the collection after its call (instr_bif.cpp:488-523).
     if let Ok(value) = &result
         && (!export_call
-            || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
+            || (process.heap.stack_index() - top >= process.heap.mbuf_size()
+                && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         registers.x_reg_array[0] = value;

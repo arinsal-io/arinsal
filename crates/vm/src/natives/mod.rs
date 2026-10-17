@@ -360,6 +360,25 @@ pub(crate) type DirectNative = fn(
 pub(crate) type ProcessBif =
     fn(&mut Process, &[Term]) -> Option<Result<Term, crate::exceptions::Trap>>;
 
+/// A process BIF that cannot decline and returns its value in registers: the exception is
+/// boxed, so a call that succeeds moves no `Trap`. erts returns the term and `THE_NON_VALUE`
+/// for an error, and the light-BIF call site tests it the same way. The call site entry is
+/// monomorphized per BIF, so the body is inlined into it.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1.
+pub(crate) trait ThinProcessBif {
+    /// Number of arguments in the X registers.
+    const ARITY: usize;
+
+    /// Runs the BIF on `args`, the first `ARITY` X registers.
+    fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<crate::exceptions::Trap>>;
+}
+
+/// The light-BIF call site entry for `module:function/arity` when it is a [`ThinProcessBif`].
+/// The export still has its [`process_bif`] for the export-entry call and the executor.
+pub(crate) fn thin_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
+    maps::thin_entry(module, function, arity)
+}
+
 /// The process BIF native code calls for `module:function/arity`, if it has one.
 pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<ProcessBif> {
     // Port of bif.tab `hbif erts_internal:garbage_collect/1`: a plain BIF called
