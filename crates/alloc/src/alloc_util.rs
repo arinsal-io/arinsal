@@ -147,7 +147,14 @@ pub enum Strategy {
 
 /// Carrier thresholds and growth options (byte quantities unless noted).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
 pub struct AllocUtilOptions {
+    /// Abandon carriers below this utilization, as a percent (`acul`).
+    pub acul: usize,
+    /// Maximum carriers kept in the shared pool (`acnl`).
+    pub acnl: usize,
+    /// Shared carrier pool group (`cp`).
+    pub cpool: Option<char>,
     pub sbct: usize,
     pub asbcst: usize,
     pub rsbcst: usize,
@@ -161,16 +168,10 @@ pub struct AllocUtilOptions {
     pub mbcgs: usize,
     /// Maximum free blocks inspected in a GoodFit bucket (`mbsd`).
     pub max_bucket_search: usize,
-    /// Abandon carriers below this utilization, as a percent (`acul`).
-    pub acul: usize,
     /// Discard free blocks below this utilization, as a percent (`acful`).
     pub acful: usize,
-    /// Maximum carriers kept in the shared pool (`acnl`).
-    pub acnl: usize,
     /// Minimum free block size retained in the pool (`acfml`).
     pub acfml: usize,
-    /// Shared carrier pool group (`cp`).
-    pub cpool: Option<char>,
 }
 
 impl Default for AllocUtilOptions {
@@ -226,11 +227,15 @@ impl Allocation {
 
 /// Current and peak allocated block and carrier counters.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
 pub struct AllocStats {
     pub blocks: usize,
     pub blocks_size: usize,
     pub max_blocks: usize,
     pub max_blocks_size: usize,
+    pub alloc_calls: u64,
+    pub free_calls: u64,
+    pub realloc_calls: u64,
     pub carriers: usize,
     pub carriers_size: usize,
     pub max_carriers: usize,
@@ -243,9 +248,6 @@ pub struct AllocStats {
     pub max_sys_alloc_carriers: usize,
     pub max_mseg_carriers_size: usize,
     pub max_sys_alloc_carriers_size: usize,
-    pub alloc_calls: u64,
-    pub free_calls: u64,
-    pub realloc_calls: u64,
     pub mseg_alloc_calls: u64,
     pub mseg_dealloc_calls: u64,
     pub sys_alloc_calls: u64,
@@ -728,20 +730,16 @@ pub(crate) fn set_dyn_sbct(strategy: Strategy, cell: &AtomicUsize, value: usize)
 /// One safe, single-threaded alloc_util instance.
 ///
 /// Port of `erts/emulator/beam/erl_alloc_util.c` allocator state, OTP-29.1.1.
+#[repr(C)]
 pub struct AllocUtil {
     strategy: Strategy,
-    options: AllocUtilOptions,
-    allocation_type: &'static str,
-    instance_index: usize,
     pool_managed: bool,
-    carriers: Vec<Option<Carrier>>,
-    /// Vacated `carriers` slots, reused so churn does not grow the table.
-    free_carrier_slots: Vec<usize>,
+    instance_index: usize,
     /// Number of live multiblock carriers.
     mbc_count: usize,
-    /// `(start, end, index)` of every live carrier sorted by address: block address to carrier,
-    /// standing in for erts' carrier pointer arithmetic (erl_alloc_util.h:430 FBLK_TO_MBC/ABLK_TO_MBC).
-    carrier_ranges: Vec<(usize, usize, usize)>,
+    /// Dynamic `sbct`, shared with the instance registry so another thread can set it without
+    /// reaching into the allocator (`sbc_threshold` word of erl_alloc_util.c, OTP-29.1.1).
+    dyn_sbct: Arc<AtomicUsize>,
     /// Last `carrier_ranges` hit; consecutive header accesses nearly always stay in one carrier.
     last_carrier: std::cell::Cell<CarrierSpan>,
     /// Carrier of the block tree being walked. Every node of a block tree lives in the carrier
@@ -750,6 +748,17 @@ pub struct AllocUtil {
     tree_span: std::cell::Cell<CarrierSpan>,
     free_root: usize,
     aoff_carrier_root: usize,
+    carriers: Vec<Option<Carrier>>,
+    /// `(start, end, index)` of every live carrier sorted by address: block address to carrier,
+    /// standing in for erts' carrier pointer arithmetic (erl_alloc_util.h:430 FBLK_TO_MBC/ABLK_TO_MBC).
+    carrier_ranges: Vec<(usize, usize, usize)>,
+    pending_carriers: Vec<CarrierTransfer>,
+    options: AllocUtilOptions,
+    stats: AllocStats,
+    class_stats: [ClassStats; 2],
+    allocation_type: &'static str,
+    /// Vacated `carriers` slots, reused so churn does not grow the table.
+    free_carrier_slots: Vec<usize>,
     /// Bucket list heads (`buckets` in erl_goodfit_alloc.c); 0 is an empty bucket.
     goodfit_heads: Vec<usize>,
     /// Bit per non-empty goodfit bucket, like `bucket_mask` in erl_goodfit_alloc.c.
@@ -758,13 +767,7 @@ pub struct AllocUtil {
     goodfit_interval_d: usize,
     /// `free_list` head of erl_afit_alloc.c; 0 is empty.
     afit_head: usize,
-    /// Dynamic `sbct`, shared with the instance registry so another thread can set it without
-    /// reaching into the allocator (`sbc_threshold` word of erl_alloc_util.c, OTP-29.1.1).
-    dyn_sbct: Arc<AtomicUsize>,
-    stats: AllocStats,
-    class_stats: [ClassStats; 2],
     mseg: MsegAllocator,
-    pending_carriers: Vec<CarrierTransfer>,
     carrier_arena: Option<CarrierArena>,
 }
 

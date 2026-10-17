@@ -141,18 +141,25 @@ const OWNER_WAIT_SLICE: Duration = Duration::from_micros(200);
 /// like the size words erts reads in `erts_alcu_foreign_size` (erl_alloc_util.c, OTP-29.1.1); the
 /// threshold is the `sbc_threshold` word `erts_alloc_set_dyn_param` writes.
 struct Shared {
-    blocks_size: AtomicUsize,
-    carriers_size: AtomicUsize,
     sbct: Arc<AtomicUsize>,
     strategy: Strategy,
     requests: SegQueue<OwnerRequest>,
     work_scheduled: AtomicBool,
 }
 
+/// An instance with its lock and size counter mirror in one cache line pair: the counters
+/// and the lock word precede the first words of the allocator that every alloc and free touches.
+#[repr(C, align(128))]
+struct Slot {
+    blocks_size: AtomicUsize,
+    carriers_size: AtomicUsize,
+    lock: parking_lot::Mutex<Instance>,
+}
+
 /// The lock on an instance; releasing it publishes the counter mirror.
 struct InstanceGuard<'a> {
     guard: parking_lot::MutexGuard<'a, Instance>,
-    shared: &'a Shared,
+    slot: &'a Slot,
 }
 
 impl std::ops::Deref for InstanceGuard<'_> {
@@ -175,10 +182,8 @@ impl Drop for InstanceGuard<'_> {
     #[inline(always)]
     fn drop(&mut self) {
         let (blocks_size, carriers_size) = self.guard.allocator.size_counters();
-        self.shared
-            .blocks_size
-            .store(blocks_size, Ordering::Relaxed);
-        self.shared
+        self.slot.blocks_size.store(blocks_size, Ordering::Relaxed);
+        self.slot
             .carriers_size
             .store(carriers_size, Ordering::Relaxed);
     }
@@ -269,7 +274,7 @@ struct HomecomingCarrier {
 /// in `erl_alloc_util.c:2260-2299,3968-4030,4180-4200`, OTP-29.1.1.
 pub struct ThreadSpecificAllocators {
     // parking_lot: the uncontended lock is one CAS, on every alloc and free.
-    instances: Vec<parking_lot::Mutex<Instance>>,
+    instances: Vec<Slot>,
     /// Cross-thread frees and carriers sent home. Lock-free so no foreign thread takes the owner's mutex.
     /// Port of erl_alloc_util.c:2225 (`enqueue_dealloc_other_instance` / `ddq_enqueue`), OTP-29.1.1.
     delayed: Vec<SegQueue<Delayed>>,
@@ -352,8 +357,6 @@ impl ThreadSpecificAllocators {
             .iter()
             .enumerate()
             .map(|(instance, allocator)| Shared {
-                blocks_size: AtomicUsize::new(0),
-                carriers_size: AtomicUsize::new(0),
                 sbct: allocator.sbct_cell(),
                 strategy: if thread_specific && instance == 0 {
                     global_strategy
@@ -367,7 +370,11 @@ impl ThreadSpecificAllocators {
         Self {
             instances: allocators
                 .into_iter()
-                .map(|allocator| parking_lot::Mutex::new(Instance { allocator }))
+                .map(|allocator| Slot {
+                    blocks_size: AtomicUsize::new(0),
+                    carriers_size: AtomicUsize::new(0),
+                    lock: parking_lot::Mutex::new(Instance { allocator }),
+                })
                 .collect(),
             shared,
             delayed: (0..count).map(|_| SegQueue::new()).collect(),
@@ -716,9 +723,9 @@ impl ThreadSpecificAllocators {
     /// releases its instance.
     // Port of erts/emulator/beam/erl_alloc_util.c:5952 (erts_alcu_current_size), OTP-29.1.1.
     pub(crate) fn current_blocks_size(&self) -> usize {
-        self.shared
+        self.instances
             .iter()
-            .map(|shared| shared.blocks_size.load(Ordering::Relaxed))
+            .map(|slot| slot.blocks_size.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -758,8 +765,8 @@ impl ThreadSpecificAllocators {
     #[inline]
     fn lock_instance(&self, instance: usize) -> InstanceGuard<'_> {
         InstanceGuard {
-            guard: self.instances[instance].lock(),
-            shared: &self.shared[instance],
+            guard: self.instances[instance].lock.lock(),
+            slot: &self.instances[instance],
         }
     }
 
