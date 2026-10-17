@@ -1,6 +1,6 @@
 //! Inline list, tuple, and heap allocation emitters.
 
-use arinsal_a64::enc::{Cond, Gpr};
+use arinsal_a64::enc::{Cond, Gpr, VecReg};
 
 use crate::{
     ProcessHeader, SchedulerRegisters,
@@ -28,6 +28,7 @@ const SCRATCH: [Gpr; 6] = [
     Gpr::x(12),
     Gpr::x(13),
 ];
+const SUPER_TMP: Gpr = Gpr::x(17);
 const NIL: u64 = 0x3b;
 const TAG_BOXED: u64 = 2;
 const RESERVED_WORDS: u32 = arinsal_term::S_RESERVED as u32;
@@ -328,44 +329,164 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Copies a tuple and applies one-based field updates inline.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:893-999, OTP-29.1.1
+    /// Copies `count` words from `from` to `to`, advancing both: 32 bytes per `ldp`/`stp` of
+    /// `q30`/`q31`, a counted loop above 16 words, then a 16 byte move and a single word.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_copy_words_increment),
+    // OTP-29.1.1.
+    fn emit_copy_words_increment(
+        &mut self,
+        from: Gpr,
+        to: Gpr,
+        mut count: usize,
+    ) -> Result<(), ModuleError> {
+        self.check_pending_stubs()?;
+        let q30 = VecReg(30);
+        let q31 = VecReg(31);
+        if count <= 16 {
+            while count >= 4 {
+                self.code.emit(|e| {
+                    e.ldp_q_post(q30, q31, from, 32)?;
+                    e.stp_q_post(q30, q31, to, 32)
+                })?;
+                count -= 4;
+            }
+        } else {
+            let iterations = u64::try_from(count / 4)
+                .ok()
+                .filter(|iterations| *iterations <= 0xffff)
+                .ok_or(ModuleError::InvalidOperand("tuple copy too large"))?;
+            let copy_next = self.code.new_label();
+            self.code.emit(|e| e.mov_const(SUPER_TMP, iterations))?;
+            self.code.bind(copy_next)?;
+            self.code.emit(|e| {
+                e.ldp_q_post(q30, q31, from, 32)?;
+                e.stp_q_post(q30, q31, to, 32)?;
+                e.subs_imm(SUPER_TMP, SUPER_TMP, 1, false)
+            })?;
+            self.code.b_cond(Cond::Ne, copy_next)?;
+            count %= 4;
+        }
+        if count >= 2 {
+            self.code.emit(|e| {
+                e.ldr_q_post(q30, from, 16)?;
+                e.str_q_post(q30, to, 16)
+            })?;
+            count -= 2;
+        }
+        if count == 1 {
+            self.code.emit(|e| {
+                e.ldr_post(SUPER_TMP, from, 8)?;
+                e.str_post(SUPER_TMP, to, 8)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Copies a tuple and applies one-based field updates inline. With the `reuse` hint and a
+    /// single update that stores the value already in the field, the source tuple is the result
+    /// and nothing is allocated.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_update_record), OTP-29.1.1.
     pub fn emit_update_record(
         &mut self,
+        reuse: bool,
         src: ArgVal,
         dst: ArgVal,
         arity: u32,
         updates: &[(u32, ArgVal)],
     ) -> Result<(), ModuleError> {
-        let tuple = self.source_reg(src)?;
-        self.code.emit(|e| e.and_imm(SCRATCH[0], tuple, !7))?;
-        self.code.emit(|e| e.ldr_post(SCRATCH[1], SCRATCH[0], 8))?;
-        self.code.emit(|e| e.str_post(SCRATCH[1], HTOP, 8))?;
-        for index in 0..arity {
-            let field = index
-                .checked_add(1)
-                .ok_or(ModuleError::InvalidOperand("tuple offset overflow"))?;
-            let update = updates
-                .iter()
-                .find(|(update_index, _)| *update_index == field);
-            if let Some((_, value)) = update {
-                let val = self.source_reg(*value)?;
-                self.code.emit(|e| e.mov_reg(SCRATCH[2], val))?;
-            } else {
-                let offset = index
-                    .checked_mul(8)
-                    .ok_or(ModuleError::InvalidOperand("tuple offset overflow"))?;
-                self.code
-                    .emit(|e| e.ldr_uoff(SCRATCH[2], SCRATCH[0], offset))?;
-            }
-            self.code.emit(|e| e.str_post(SCRATCH[2], HTOP, 8))?;
-        }
-        let tuple_words = arity
+        let size_on_heap = arity
             .checked_add(1)
-            .ok_or(ModuleError::InvalidOperand("tuple allocation overflow"))?;
-        let bytes = u64::from(tuple_words) * 8;
-        self.emit_pointer_offset(SCRATCH[4], HTOP, bytes - TAG_BOXED, true)?;
-        self.store_arg(dst, SCRATCH[4])
+            .ok_or(ModuleError::InvalidOperand("tuple allocation overflow"))?
+            as usize;
+        if size_on_heap <= 2 {
+            return Err(ModuleError::InvalidOperand(
+                "tuple update requires arity above one",
+            ));
+        }
+        let mut previous = 0;
+        for (index, _) in updates {
+            if *index <= previous || *index > arity {
+                return Err(ModuleError::InvalidOperand(
+                    "tuple update indices must be ordered and in range",
+                ));
+            }
+            previous = *index;
+        }
+        let tmp1 = SCRATCH[2];
+        let tmp2 = SCRATCH[3];
+        let tmp3 = SCRATCH[4];
+        let next = self.code.new_label();
+
+        let destination = self.pair_destination(dst, SCRATCH[5])?;
+        let source = self.source_reg_into(src, SCRATCH[1])?;
+        let untagged_src = SCRATCH[0];
+        self.code.emit(|e| e.and_imm(untagged_src, source, !7))?;
+
+        if reuse && updates.len() == 1 {
+            let (index, value) = updates[0];
+            let offset = index
+                .checked_mul(8)
+                .ok_or(ModuleError::InvalidOperand("tuple offset overflow"))?;
+            self.code.emit(|e| e.ldr_uoff(tmp1, untagged_src, offset))?;
+            self.cmp_arg(tmp1, value)?;
+            if destination.reg != source {
+                self.code
+                    .emit(|e| e.csel(destination.reg, destination.reg, source, Cond::Ne))?;
+            }
+            self.code.b_cond(Cond::Eq, next)?;
+        }
+
+        let mut copy_index = 0usize;
+        let mut i = 0;
+        while i < updates.len() {
+            let (next_index, next_value) = updates[i];
+            let next_index = next_index as usize;
+            let odd_copy = (next_index - copy_index) & 1 == 1;
+            self.emit_copy_words_increment(untagged_src, HTOP, (next_index - copy_index) & !1)?;
+
+            if let Some(&(adjacent_index, adjacent_value)) = updates.get(i + 1)
+                && adjacent_index as usize == next_index + 1
+            {
+                let (first, second) =
+                    self.load_two_sources(next_value, tmp1, adjacent_value, tmp2)?;
+                if odd_copy {
+                    self.code.emit(|e| {
+                        e.ldr_post(tmp3, untagged_src, 24)?;
+                        e.stp_post(tmp3, first, HTOP, 16)?;
+                        e.str_post(second, HTOP, 8)
+                    })?;
+                } else {
+                    self.code.emit(|e| {
+                        e.add_imm(untagged_src, untagged_src, 16, false)?;
+                        e.stp_post(first, second, HTOP, 16)
+                    })?;
+                }
+                copy_index = next_index + 2;
+                i += 2;
+                continue;
+            }
+
+            let value = self.source_reg_into(next_value, tmp1)?;
+            if odd_copy {
+                self.code.emit(|e| {
+                    e.ldr_post(tmp2, untagged_src, 16)?;
+                    e.stp_post(tmp2, value, HTOP, 16)
+                })?;
+            } else {
+                self.code.emit(|e| {
+                    e.add_imm(untagged_src, untagged_src, 8, false)?;
+                    e.str_post(value, HTOP, 8)
+                })?;
+            }
+            copy_index = next_index + 1;
+            i += 1;
+        }
+
+        self.emit_copy_words_increment(untagged_src, HTOP, size_on_heap - copy_index)?;
+        let bytes = size_on_heap as u64 * 8;
+        self.emit_pointer_offset(destination.reg, HTOP, bytes - TAG_BOXED, true)?;
+        self.code.bind(next)?;
+        self.flush_var(destination)
     }
 
     /// Updates tuple fields in place when the heap boundary makes mutation safe.
@@ -425,16 +546,7 @@ impl BeamModuleAssembler {
                 .emit(|e| e.cmp_reg(SCRATCH[0], SCRATCH[4], arinsal_a64::enc::Shift::Lsl, 0))?;
             self.code.b_cond(Cond::Cs, update)?;
             self.code.bind(copy)?;
-            self.code
-                .emit(|e| e.mov_const(SCRATCH[5], u64::from(words)))?;
-            let copy_loop = self.code.new_label();
-            self.code.bind(copy_loop)?;
-            self.code.emit(|e| {
-                e.ldr_post(SCRATCH[2], SCRATCH[0], 8)?;
-                e.str_post(SCRATCH[2], HTOP, 8)?;
-                e.subs_imm(SCRATCH[5], SCRATCH[5], 1, false)
-            })?;
-            self.code.b_cond(Cond::Ne, copy_loop)?;
+            self.emit_copy_words_increment(SCRATCH[0], HTOP, words as usize)?;
             self.emit_pointer_offset(SCRATCH[0], HTOP, bytes, true)?;
             self.code.bind(update)?;
         }

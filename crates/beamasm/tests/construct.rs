@@ -430,6 +430,7 @@ fn native_update_record() {
     let (_, regs, heap, base) = run_native(
         |m, _| {
             m.emit_update_record(
+                false,
                 ArgVal::X(0),
                 ArgVal::X(1),
                 2,
@@ -444,6 +445,82 @@ fn native_update_record() {
     );
     assert_eq!(regs[1], (base + 24) as u64 | 2);
     assert_eq!(&heap[3..6], &[(2 << 6) | 2, tagged_small(5), 0x3b]);
+}
+
+fn native_update_record_reuse(value: u64) -> (u64, u64, usize, Vec<u64>) {
+    let (header, regs, heap, base) = run_native(
+        |m, _| m.emit_update_record(true, ArgVal::X(0), ArgVal::X(1), 2, &[(2, ArgVal::X(2))]),
+        |heap, header, regs| {
+            heap[..3].copy_from_slice(&[(2 << 6) | 2, tagged_small(5), tagged_small(6)]);
+            header.htop = word_ptr(heap, 3);
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
+            regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(0x1234);
+            regs.x_reg_array[2] = arinsal_beamasm::rt::fixture_term(value);
+        },
+    );
+    (
+        regs[1],
+        base as u64,
+        header.htop as usize - base,
+        heap[..6].to_vec(),
+    )
+}
+
+fn native_update_record_reuse_same_value_returns_source() {
+    let (result, base, used, heap) = native_update_record_reuse(tagged_small(6));
+    assert_eq!(result, base | 2);
+    assert_eq!(used, 24);
+    assert_eq!(&heap[3..6], &[0; 3]);
+}
+
+fn native_update_record_reuse_other_value_copies() {
+    let (result, base, used, heap) = native_update_record_reuse(tagged_small(7));
+    assert_eq!(result, (base + 24) | 2);
+    assert_eq!(used, 48);
+    assert_eq!(
+        &heap[3..6],
+        &[(2 << 6) | 2, tagged_small(5), tagged_small(7)]
+    );
+}
+
+fn native_update_record_large_copies_every_word() {
+    const ARITY: usize = 25;
+    let updates = [
+        (3, ArgVal::X(2)),
+        (4, ArgVal::X(3)),
+        (20, ArgVal::Immediate(0x3b)),
+        (25, ArgVal::X(2)),
+    ];
+    let (header, regs, heap, base) = run_native(
+        |m, _| m.emit_update_record(false, ArgVal::X(0), ArgVal::X(1), ARITY as u32, &updates),
+        |heap, header, regs| {
+            heap[0] = ((ARITY as u64) << 6) | 2;
+            for (index, word) in heap.iter_mut().enumerate().take(ARITY + 1).skip(1) {
+                *word = tagged_small(index as i64);
+            }
+            header.htop = word_ptr(heap, ARITY + 1);
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
+            regs.x_reg_array[2] = arinsal_beamasm::rt::fixture_term(tagged_small(300));
+            regs.x_reg_array[3] = arinsal_beamasm::rt::fixture_term(tagged_small(400));
+        },
+    );
+    let copy = base + (ARITY + 1) * 8;
+    assert_eq!(regs[1], copy as u64 | 2);
+    assert_eq!(header.htop as usize, copy + (ARITY + 1) * 8);
+    assert_eq!(
+        &heap[..=ARITY],
+        &{
+            let mut original = vec![((ARITY as u64) << 6) | 2];
+            original.extend((1..=ARITY).map(|index| tagged_small(index as i64)));
+            original
+        }[..]
+    );
+    let mut expected = heap[..=ARITY].to_vec();
+    expected[3] = tagged_small(300);
+    expected[4] = tagged_small(400);
+    expected[20] = 0x3b;
+    expected[25] = tagged_small(300);
+    assert_eq!(&heap[ARITY + 1..2 * (ARITY + 1)], &expected[..]);
 }
 
 fn native_update_record_in_place_reuses_young_tuple() {
@@ -568,6 +645,9 @@ fn native_construction_and_access_ops() {
     native_load_tuple_ptr();
     native_set_tuple_element();
     native_update_record();
+    native_update_record_reuse_same_value_returns_source();
+    native_update_record_reuse_other_value_copies();
+    native_update_record_large_copies_every_word();
     native_update_record_in_place_reuses_young_tuple();
     native_update_record_in_place_copies_old_tuple();
 }
