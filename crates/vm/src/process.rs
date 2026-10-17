@@ -786,6 +786,11 @@ pub(crate) fn erts_time2reds(elapsed: std::time::Duration) -> u64 {
     }
     microseconds.saturating_mul(((CONTEXT_REDS - 1) / 1000 + 1) as u64)
 }
+
+/// Words of a sent message that cost one reduction of the sender.
+///
+/// Port of erts/emulator/beam/erl_message.h:33-35 (ERTS_MSG_COPY_WORDS_PER_REDUCTION), OTP-29.1.1.
+pub(crate) const ERTS_MSG_COPY_WORDS_PER_REDUCTION: usize = 64;
 /// Port of erts/emulator/beam/erl_proc_sig_queue.c:52 (ERTS_SIG_REDS_CNT_FACTOR), OTP-29.1.1.
 const SIG_REDS_CNT_FACTOR: i32 = 4;
 /// Port of erts/emulator/beam/erl_proc_sig_queue.h:284 (ERTS_SIG_HANDLE_REDS_MAX_PREFERED),
@@ -5270,6 +5275,7 @@ impl Process {
             via_prio_alias,
             &mut seq_token,
         )? {
+            self.bump_send_reds(ctx.as_deref_mut(), pid == sender, words);
             return Ok(value);
         }
         let mut envelope = Message::copy_counted(value, words, &literals)?;
@@ -5278,7 +5284,7 @@ impl Process {
         }
         envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
         envelope.alias = seq_token.alias;
-        let delivered = match ctx {
+        let delivered = match ctx.as_deref_mut() {
             Some(ctx) => ctx.send(pid, envelope),
             // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message from a BIF called
             // by JIT code, with the scheduler data of the calling scheduler), OTP-29.1.1. A
@@ -5299,8 +5305,42 @@ impl Process {
             },
         };
         match delivered {
-            Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(value),
+            Ok(()) | Err(arinsal_sched::Error::NoProcess) => {
+                self.bump_send_reds(ctx, pid == sender, words);
+                Ok(value)
+            }
             Err(error) => Err(VmError::Unsupported(format!("send: {error}"))),
+        }
+    }
+
+    /// Charge the sender one reduction per `ERTS_MSG_COPY_WORDS_PER_REDUCTION` words copied,
+    /// at most one slice. A process sending to itself with an on-heap queue copies nothing.
+    // Port of erts/emulator/beam/erl_message.c (erts_send_message, the `BUMP_REDS` after
+    // `erts_queue_proc_message`), OTP-29.1.1.
+    fn bump_send_reds(
+        &mut self,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+        to_self: bool,
+        words: usize,
+    ) {
+        if to_self
+            && self.message_queue_data() != MessageQueueData::OffHeap
+            && !crate::seq_trace::has_token(self)
+        {
+            return;
+        }
+        if words <= ERTS_MSG_COPY_WORDS_PER_REDUCTION {
+            return;
+        }
+        let reds = (words / ERTS_MSG_COPY_WORDS_PER_REDUCTION).min(CONTEXT_REDS as usize) as i32;
+        let applied = reds.min(self.reductions.max(0));
+        self.reductions -= applied;
+        if self.heap.native_active() {
+            return;
+        }
+        self.reductions_used = self.reductions_used.saturating_add(applied as u64);
+        if let Some(ctx) = ctx {
+            ctx.consume(applied as u32);
         }
     }
 
