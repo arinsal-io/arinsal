@@ -60,7 +60,7 @@ fn maps_iterator_operations_match_otp_for_flatmaps_and_hamts() {
         -export([to_list/1,to_list_iter/1,to_list_ordered/1,to_list_reversed/1,\n\
                  next/1,next_unordered/1,iterator/1,iterator_unordered/1,\n\
                  iterator_reversed/1,iterator_custom/1,raw/1,raw_at/2,raw_iter/1,raw_iter_at/2,fold/1,\n\
-                 invalid/0,bad_mode/1,bad_path/1,bounds/0]).\n\
+                 invalid/0,bad_mode/1,bad_path/1,bounds/0,churn/1]).\n\
         to_list(M) -> maps:to_list(M).\n\
         to_list_iter(M) -> maps:to_list(maps:iterator(M)).\n\
         to_list_ordered(M) -> maps:to_list(maps:iterator(M, ordered)).\n\
@@ -79,6 +79,11 @@ fn maps_iterator_operations_match_otp_for_flatmaps_and_hamts() {
         invalid() -> try erts_internal:map_next(0, not_a_map, iterator) catch error:badarg -> badarg end.\n\
         bad_mode(M) -> try erts_internal:map_next(0, M, bad) catch error:badarg -> badarg end.\n\
         bad_path(M) -> try erts_internal:map_next(not_a_path, M, []) catch error:badarg -> badarg end.\n\
+        churn(M) -> churn(M, 300, [], 0).\n\
+        churn(_, 0, Acc, S) -> {length(Acc), S};\n\
+        churn(M, N, Acc, S) ->\n\
+            S1 = case erts_internal:map_next(0, M, iterator) of none -> S; {_,_,_} -> S + 1 end,\n\
+            churn(M, N-1, erts_internal:map_next(0, M, Acc), S1).\n\
         bounds() ->\n\
             M = maps:from_list([{0,{0,v}},{1,{1,v}},{2,{2,v}}]),\n\
             Empty = maps:from_list([]),\n\
@@ -124,7 +129,9 @@ fn maps_iterator_operations_match_otp_for_flatmaps_and_hamts() {
                 "fold",
             ]
         };
-        for function in functions.iter().copied() {
+        let churn: &[&str] = if size <= 32 { &["churn"] } else { &[] };
+        let functions = functions.iter().chain(churn);
+        for function in functions.copied() {
             let expected =
                 reference.call("vm_map_iter_diff", function, std::slice::from_ref(&input));
             let mut heap = VecHeap::new();
