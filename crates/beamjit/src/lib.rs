@@ -3735,7 +3735,11 @@ fn emit_op(
                         ));
                     }
                 };
-                assembler.emit_update_record(value(2)?, value(3)?, arity, &updates)
+                let reuse = matches!(
+                    args.first(),
+                    Some(SpecificOperand::Atom(index)) if beam.atom(*index) == Some("reuse")
+                );
+                assembler.emit_update_record(reuse, value(2)?, value(3)?, arity, &updates)
             }
             "update_record_in_place" => {
                 if args.len() < 4 || !(args.len() - 4).is_multiple_of(2) {
