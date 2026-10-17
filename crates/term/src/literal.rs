@@ -168,6 +168,14 @@ fn snapshot() -> Arc<[LiteralRange]> {
     })
 }
 
+/// The reserved literal range as `(start, end)`, or `(0, 0)` before any literal exists.
+// Mirrors `erts_literals_start` and `erts_literals_size` in erl_alloc.h (OTP-29.1.1): a
+// collection reads the globals once and tests every pointer against them.
+#[inline]
+pub(crate) fn literal_area() -> (usize, usize) {
+    literal_bounds().get().copied().unwrap_or((0, 0))
+}
+
 fn precise(address: usize) -> bool {
     // Port of erts/emulator/beam/erl_alloc.h:337-348 (`ErtsInArea`), OTP-29.1.1.
     literal_bounds()

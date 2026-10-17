@@ -116,6 +116,15 @@ fn dirty_result_slots<'a>(
 }
 
 impl Process {
+    /// Whether [`Process::dirty_result_roots`] would return any term, without building them.
+    #[inline]
+    pub(crate) fn has_dirty_result_roots(&self) -> bool {
+        let Some(cold) = self.cold.as_ref() else {
+            return false;
+        };
+        matches!(&cold.dirty_bif, Some(DirtyBif::Done(Ok(_)))) || cold.static_nif_done.is_some()
+    }
+
     /// The result of a finished dirty job that waits for its call to be executed again.
     ///
     /// erts schedules the result (or exception) as the argument of `erts_internal:

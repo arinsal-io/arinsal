@@ -931,6 +931,17 @@ impl LazyOwners {
         self.0.is_some()
     }
 
+    /// The refc and writable off-heap list heads, both zero without an owner box.
+    pub(crate) fn chain_heads(&self) -> (usize, usize) {
+        self.0
+            .as_ref()
+            .map_or((0, 0), |owners| (owners.off_heap_first, owners.wrt_bins))
+    }
+
+    pub(crate) fn overhead(&self) -> u64 {
+        self.0.as_ref().map_or(0, |owners| owners.overhead)
+    }
+
     pub(crate) fn vheap_min(&self) -> u64 {
         self.0
             .as_ref()
