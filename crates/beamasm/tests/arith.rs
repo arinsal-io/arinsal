@@ -321,7 +321,7 @@ fn guard_arithmetic_emits_fail_label_handling() {
                 .unwrap();
         }
         asm.return_().unwrap();
-        asm.emit_i_func_label(2).unwrap();
+        asm.emit_label(2).unwrap();
         asm.return_().unwrap();
         let module = asm.finalize().unwrap();
         module.entries[&2] as usize - module.entries[&1] as usize

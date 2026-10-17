@@ -2393,9 +2393,13 @@ fn emit_op(
                 count(0)?;
                 assembler.flush_yield_stubs()
             }
-            "i_func_label" | "label" => {
+            "i_func_label" => {
                 count(1)?;
                 assembler.emit_i_func_label(n(0)?)
+            }
+            "label" => {
+                count(1)?;
+                assembler.emit_label(n(0)?)
             }
             "func_prologue" => {
                 count(2)?;
@@ -2408,7 +2412,15 @@ fn emit_op(
             }
             "i_func_info" => {
                 count(4)?;
-                assembler.emit_i_func_info(n(0)?, n(1)?, n(2)?, n(3)?.min(255) as u8)
+                let atom = |index: usize| match args.get(index) {
+                    Some(SpecificOperand::Atom(value)) => {
+                        env.atom(beam, *value).map_err(EmitError::Operand)
+                    }
+                    _ => Err(EmitError::Operand(
+                        "i_func_info expects atom operands".to_owned(),
+                    )),
+                };
+                assembler.emit_i_func_info(n(0)?, atom(1)?, atom(2)?, n(3)?.min(255) as u8)
             }
             "line" | "func_line" => {
                 // Port of erts/emulator/beam/jit/asm_load.c:642-690 (op_func_line_I adds a line
