@@ -5,7 +5,7 @@ mod hash;
 mod hash_select;
 pub mod match_spec;
 pub use hash_select::{
-    HASH_SELECT_ITERATIONS, HashScanEnd, HashScanPlan, IterSafety, SavedMatches,
+    Chunk, HASH_SELECT_ITERATIONS, HashScanEnd, HashScanPlan, IterSafety, SavedMatches,
 };
 pub mod rwmtx;
 mod tree;
@@ -4888,6 +4888,14 @@ impl Registry {
             .write()
             .unwrap()
             .insert(program.id(), Arc::new(program));
+    }
+
+    /// Keep a compiled program that a continuation returned to the caller refers to.
+    pub fn retain_shared_match_program(&self, program: Arc<match_spec::MatchProgram>) {
+        self.match_programs
+            .write()
+            .unwrap()
+            .insert(program.id(), program);
     }
 
     /// Resolve a compiled program from an ETS continuation reference.
