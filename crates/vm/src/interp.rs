@@ -3792,10 +3792,13 @@ impl Vm {
                     // SAFETY: The current instruction is within this module.
                     p.ip = unsafe { ip.offset_from(base) } as usize;
                     p.module = module_id;
+                    p.reductions = reds;
                     let value = match ctx.as_deref_mut() {
                         Some(ctx) => p.send_message_in(self, ctx, p.x[0], p.x[1])?,
                         None => p.send_message_with_vm(self, p.x[0], p.x[1])?,
                     };
+                    reds = p.reductions;
+                    sync_slice_use!();
                     // Port of erts/emulator/beam/bif.c:2451-2452 (erl_send), OTP-29.1.1.
                     if crate::trace::saves_calls(p) {
                         crate::trace::save_call(p, crate::trace::SavedCall::Send);
