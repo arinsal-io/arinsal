@@ -162,6 +162,8 @@ pub struct BeamModuleAssembler {
     call_fun_error_stub: Option<(Label, usize)>,
     /// Shared arithmetic slow-path fragments keyed by hook address and operation code.
     arith_fragments: Vec<((usize, u32), Label)>,
+    /// Shared garbage-collection fragments of heap and stack checks, keyed by hook address.
+    gc_fragments: Vec<(usize, Label)>,
     /// Module-local dispatch stubs for process-wide executable fragments.
     dispatch_fragments: HashMap<usize, Label>,
     /// Out-of-line `i_test_yield` continuations (stub, continuation, live X registers).
@@ -242,6 +244,7 @@ impl BeamModuleAssembler {
             call_fun_error_stub: None,
             arith_fragments: Vec::new(),
             dispatch_fragments: HashMap::new(),
+            gc_fragments: Vec::new(),
             yield_stubs: Vec::new(),
             bs_cold: Vec::new(),
             line_table: Vec::new(),
@@ -1074,6 +1077,24 @@ impl BeamModuleAssembler {
         self.source_reg_into(src, TMP)
     }
 
+    /// Emits a `bl` to the module's shared garbage-collection fragment for `hook`.
+    ///
+    /// ARG3 (x8) holds `HTOP` plus the bytes the check needed, ARG4 (x3) the live X count.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:90-122 (`fragment_call` of
+    // `ga->get_garbage_collect()`), OTP-29.1.1.
+    pub(super) fn gc_fragment_call(&mut self, hook: usize) -> Result<(), ModuleError> {
+        let label = match self.gc_fragments.iter().find(|(target, _)| *target == hook) {
+            Some(&(_, label)) => label,
+            None => {
+                let label = self.code.new_label();
+                self.gc_fragments.push((hook, label));
+                label
+            }
+        };
+        self.code.bl(label)?;
+        Ok(())
+    }
+
     /// Emits a direct call to a module-local stub for a process-wide executable fragment.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1440-1454 and
     // beam_asm_module.cpp:596-603,724-732 (fragment_call / resolve_fragment), OTP-29.1.1.
@@ -1516,6 +1537,11 @@ impl BeamModuleAssembler {
         if let Some((label, helper)) = self.call_fun_error_stub.take() {
             self.code.bind(label)?;
             crate::fun::emit_call_fun_error(&mut self, helper)?;
+        }
+        let gc_fragments = std::mem::take(&mut self.gc_fragments);
+        for (hook, label) in gc_fragments {
+            self.code.bind(label)?;
+            self.emit_garbage_collect_fragment(hook)?;
         }
         let fragments = std::mem::take(&mut self.arith_fragments);
         for ((helper, op), label) in fragments {
