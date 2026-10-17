@@ -766,6 +766,10 @@ pub(crate) fn set_dyn_sbct(strategy: Strategy, cell: &AtomicUsize, value: usize)
 pub struct AllocUtil {
     strategy: Strategy,
     pool_managed: bool,
+    /// Whether `check_abandon_carrier` can ever act: abandoning is enabled by the options, the
+    /// instance is pool managed and the strategy is an aoff one. Fixed at creation, so a free
+    /// on an instance without a carrier pool tests one byte next to the strategy.
+    abandon: bool,
     instance_index: usize,
     /// Number of live multiblock carriers.
     mbc_count: usize,
@@ -840,6 +844,11 @@ impl AllocUtil {
             allocation_type,
             instance_index,
             pool_managed,
+            abandon: options.acul != 0
+                && options.acnl != 0
+                && options.cpool.is_some()
+                && pool_managed
+                && is_aoff(strategy),
             carriers: Vec::new(),
             free_carrier_slots: Vec::new(),
             mbc_count: 0,
@@ -1340,13 +1349,7 @@ impl AllocUtil {
 
     #[inline(always)]
     fn check_abandon_carrier(&mut self, carrier_index: usize) -> Result<(), AllocError> {
-        if self.options.acul == 0
-            || self.options.acnl == 0
-            || self.options.cpool.is_none()
-            || !self.pool_managed
-            || !is_aoff(self.strategy)
-            || self.pending_carriers.len() >= self.options.acnl
-        {
+        if !self.abandon || self.pending_carriers.len() >= self.options.acnl {
             return Ok(());
         }
         self.consider_abandoning_carrier(carrier_index)
@@ -2752,30 +2755,28 @@ impl AllocUtil {
         node: usize,
         size: usize,
     ) -> Result<(), AllocError> {
+        if is_aoff(self.strategy) {
+            self.insert_tree_node::<true>(node, size, span);
+            self.aoff_raise_carrier_max(span, size);
+            return Ok(());
+        }
         if self.strategy == Strategy::GoodFit {
             let bucket = goodfit_bucket(size, self.goodfit_interval_d);
             self.list_push_front(FreeListId::Bucket(bucket), node)?;
             self.goodfit_mask[bucket / 64] |= 1 << (bucket % 64);
-        } else if self.strategy == Strategy::Afit {
+            return Ok(());
+        }
+        if self.strategy == Strategy::Afit {
             let head = self.afit_head;
             if head != 0 && self.blk(head)?.size > size {
                 self.list_insert_after_head(FreeListId::Afit, node)?;
             } else {
                 self.list_push_front(FreeListId::Afit, node)?;
             }
-        }
-        if matches!(self.strategy, Strategy::GoodFit | Strategy::Afit) {
-            // erl_goodfit_alloc.c and erl_afit_alloc.c index free blocks by lists only, no tree.
             return Ok(());
         }
-        if is_aoff(self.strategy) {
-            self.insert_tree_node::<true>(node, size, span);
-            self.aoff_raise_carrier_max(span, size);
-            Ok(())
-        } else {
-            self.insert_tree_node::<false>(node, size, span);
-            Ok(())
-        }
+        self.insert_tree_node::<false>(node, size, span);
+        Ok(())
     }
 
     /// Port of rbt_insert, erl_ao_firstfit_alloc.c, OTP-29.1.1, and tree_insert_fixup, which only
@@ -3017,24 +3018,25 @@ impl AllocUtil {
         node: usize,
         size: usize,
     ) -> Result<(), AllocError> {
+        if is_aoff(self.strategy) {
+            self.tree_span.set(span);
+            self.unlink_tree_node::<true>(span, node);
+            return Ok(());
+        }
         if self.strategy == Strategy::GoodFit {
             let index = goodfit_bucket(size, self.goodfit_interval_d);
             self.list_remove(FreeListId::Bucket(index), node)?;
             if self.goodfit_heads[index] == 0 {
                 self.goodfit_mask[index / 64] &= !(1 << (index % 64));
             }
-        } else if self.strategy == Strategy::Afit {
-            self.list_remove(FreeListId::Afit, node)?;
+            return Ok(());
         }
-        if matches!(self.strategy, Strategy::GoodFit | Strategy::Afit) {
+        if self.strategy == Strategy::Afit {
+            self.list_remove(FreeListId::Afit, node)?;
             return Ok(());
         }
         self.tree_span.set(span);
-        if is_aoff(self.strategy) {
-            self.unlink_tree_node::<true>(span, node);
-        } else {
-            self.unlink_tree_node::<false>(span, node);
-        }
+        self.unlink_tree_node::<false>(span, node);
         Ok(())
     }
 
