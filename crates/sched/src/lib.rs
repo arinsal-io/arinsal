@@ -6712,6 +6712,7 @@ fn run_slice<'a, T: Task>(
     // falls back to the user priority. A task queued later elevates it again.
     // Dirty schedulers never execute system tasks (erl_process.c:10255).
     let sys_task_run = dirty.is_none()
+        && process.sys_priority.load(Ordering::Acquire) != NO_SYS_PRIORITY
         && process.sys_priority.swap(NO_SYS_PRIORITY, Ordering::AcqRel) != NO_SYS_PRIORITY;
     let worker_id = worker.unwrap_or(0);
     // A process on a dirty run queue left the normal run queue accounting when it migrated.
@@ -7574,8 +7575,14 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         // FIFO within a priority), OTP-29.1.1: bound processes share their scheduler with
         // other work, so a yielding bound process alternates with equal-priority work and
         // never runs ahead of higher-priority work.
-        let other = local.best_priority();
-        for priority in 0..PROC_QUEUES {
+        let has_pinned =
+            inner.run_queue_flags[id].load(Ordering::Acquire) >> PINNED_FLAGS_SHIFT != 0;
+        let other = if has_pinned {
+            local.best_priority()
+        } else {
+            None
+        };
+        for priority in 0..if has_pinned { PROC_QUEUES } else { 0 } {
             if let Some(other) = other
                 && (other < priority || (other == priority && local.pinned_turn))
             {
