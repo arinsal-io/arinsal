@@ -2,7 +2,7 @@
 //! which turns a tree link into a node pointer like the C code does.
 
 use crate::mseg::{CacheConfig, CallCount, MsegAllocator, MsegOptions, Segment, SegmentFlags};
-use crate::raw::{MapError, NODE_WORDS, NodeRef, RawRegion, WordView, page_size};
+use crate::raw::{CarrierHeaderRef, MapError, NODE_WORDS, NodeRef, RawRegion, WordView, page_size};
 use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
@@ -112,10 +112,15 @@ struct CarrierLayout {
     aoff_tree_node: AoffNodeLayout,
     root: usize,
     blk_order: u32,
+    index: u32,
 }
 
 const AOFF_ROOT_WORD: usize = (std::mem::offset_of!(CarrierLayout, root)) / WORD;
 const AOFF_BLK_ORDER_WORD: usize = (std::mem::offset_of!(CarrierLayout, blk_order)) / WORD;
+const AOFF_INDEX_SHIFT: u32 = 8
+    * (std::mem::offset_of!(CarrierLayout, index) - std::mem::offset_of!(CarrierLayout, blk_order))
+        as u32;
+const AOFF_ROOT_BYTE: usize = std::mem::offset_of!(CarrierLayout, root);
 const MBC_HEADER: usize = std::mem::offset_of!(CarrierLayout, aoff_tree_node);
 const AOFF_MBC_HEADER: usize = std::mem::size_of::<CarrierLayout>();
 const SBC_HEADER: usize =
@@ -2619,8 +2624,13 @@ impl AllocUtil {
             Strategy::AoffCbf => 3,
             _ => 1,
         };
-        span.write(span.start, AOFF_BLK_ORDER_WORD, blk_order)
-            .ok_or(AllocError::Corrupt)?;
+        let index = u64::from(u32::try_from(carrier_index).map_err(|_| AllocError::Overflow)?);
+        span.write(
+            span.start,
+            AOFF_BLK_ORDER_WORD,
+            (index << AOFF_INDEX_SHIFT | blk_order) as usize,
+        )
+        .ok_or(AllocError::Corrupt)?;
         self.insert_tree_node::<true>(node, 0, span)
     }
 
@@ -2863,6 +2873,36 @@ impl AllocUtil {
         Ok(self.choose_free_in(need)?.map(|(block, _)| block))
     }
 
+    /// The span and the block tree root of the aoff carrier whose carrier tree node is
+    /// `carrier_node`, read from the carrier header like `AOFF_Carrier_t` in
+    /// erl_ao_firstfit_alloc.c: the node is embedded in the header, so no address search runs.
+    #[inline(always)]
+    #[allow(unsafe_code)]
+    fn carrier_of_tree_node(&self, carrier_node: usize) -> (CarrierSpan, usize) {
+        let start = carrier_node - MBC_HEADER;
+        debug_assert!(
+            self.aoff_carrier_index(carrier_node).is_some(),
+            "carrier tree link {carrier_node:#x}"
+        );
+        // SAFETY: `carrier_node` is a link of the carrier tree, so it is the carrier tree node in
+        // the header of an indexed aoff main block carrier (`aoff_add_carrier_node` links only
+        // those and `aoff_remove_carrier_node` unlinks it before the carrier is unindexed). That
+        // carrier starts at `start`, word aligned, and its header of `AOFF_MBC_HEADER` bytes lies
+        // inside it.
+        let header = unsafe { CarrierHeaderRef::at(start) };
+        let size = header.word(0) & !CARRIER_FLAGS;
+        let ids = header.word(AOFF_BLK_ORDER_WORD * WORD);
+        let index = ids >> AOFF_INDEX_SHIFT;
+        let span = CarrierSpan::new(start, start + size, index, false);
+        let root = header.word(AOFF_ROOT_BYTE);
+        debug_assert!(
+            self.carrier_span(index)
+                .is_ok_and(|expected| expected.start == span.start && expected.end == span.end),
+            "carrier header of {start:#x}"
+        );
+        (span, root)
+    }
+
     /// `choose_free` that also returns the span of the aoff carrier holding the block, which the
     /// search had to resolve anyway.
     #[inline]
@@ -2909,13 +2949,10 @@ impl AllocUtil {
             let Some(carrier_node) = self.aoff_search(self.aoff_carrier_root, need) else {
                 return Ok(None);
             };
-            let span = self
-                .span_of(carrier_node)
-                .filter(|span| !span.sbc && carrier_node == span.start + MBC_HEADER)
-                .ok_or(AllocError::Corrupt)?;
+            let (span, root) = self.carrier_of_tree_node(carrier_node);
             self.tree_span.set(span);
             return Ok(self
-                .aoff_search(self.aoff_root(span), need)
+                .aoff_search(root, need)
                 .map(|block| (block, Some(span))));
         }
         let mut current = self.free_root;
@@ -3758,7 +3795,9 @@ mod tests {
             let second = a.alloc(64).unwrap();
             let carrier = a.carriers.iter().flatten().find(|c| !c.sbc).unwrap();
             let read = |word: usize| carrier.memory.read_word(word * WORD).unwrap();
-            assert_eq!(read(AOFF_BLK_ORDER_WORD), order);
+            assert_eq!(read(AOFF_BLK_ORDER_WORD) & 0xffff_ffff, order);
+            let index = a.carrier_of(carrier.key_base).unwrap();
+            assert_eq!(read(AOFF_BLK_ORDER_WORD) >> AOFF_INDEX_SHIFT, index);
             assert_ne!(read(AOFF_ROOT_WORD), 0);
             a.free(first).unwrap();
             a.free(second).unwrap();
