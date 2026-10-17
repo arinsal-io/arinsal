@@ -20,6 +20,7 @@ pub mod misc;
 pub mod module;
 pub mod receive;
 pub mod records;
+mod regcache;
 #[allow(unsafe_code)]
 pub mod rt;
 pub mod select;

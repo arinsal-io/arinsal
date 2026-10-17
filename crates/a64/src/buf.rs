@@ -96,6 +96,7 @@ pub struct CodeBuffer {
     literal_sites: HashMap<u64, Vec<usize>>,
     unreachable: bool,
     last_check: usize,
+    binds: u64,
 }
 
 impl CodeBuffer {
@@ -106,6 +107,10 @@ impl CodeBuffer {
     /// Returns the current byte offset.
     pub fn offset(&self) -> usize {
         self.emitter.len() * 4
+    }
+    /// Number of labels bound so far: a join point changes it without emitting code.
+    pub fn bind_count(&self) -> u64 {
+        self.binds
     }
     /// Allocates a new unbound label.
     pub fn new_label(&mut self) -> Label {
@@ -132,6 +137,7 @@ impl CodeBuffer {
             return Err(BufferError::InvalidLabel(label));
         }
         let offset = self.offset();
+        self.binds += 1;
         self.labels.insert(label, offset);
         let mut i = 0;
         while i < self.fixups.len() {
