@@ -196,8 +196,10 @@ fn transform_with_options(
                     .iter()
                     .zip(&produced)
                     .all(|(old, new)| node_equal(old, new));
-            let same_opcode =
-                consumed == 1 && produced.len() == 1 && stream[at].name == produced[0].name;
+            let same_opcode = consumed == 1
+                && produced.len() == 1
+                && stream[at].name == produced[0].name
+                && stream[at].args.len() == produced[0].args.len();
             changed |= !is_unchanged;
             let from_front = consumed.min(front.len());
             front.drain(..from_front);
@@ -1929,6 +1931,30 @@ mod tests {
             matches!(&result[0], SpecificOp::OpMoveTrim(args) if args == &[
                 SpecificOperand::X(2), SpecificOperand::Y(1), SpecificOperand::SmallInt(3),
             ])
+        );
+    }
+
+    #[test]
+    fn three_tuple_element_loads_fetch_the_tuple_pointer_once() {
+        let element = |position: u64, destination: Operand| Instr {
+            op: Opcode::GetTupleElement,
+            args: vec![Operand::X(2), Operand::U(position), destination],
+            offset: 0,
+        };
+        let input = [
+            element(0, Operand::X(0)),
+            element(1, Operand::X(3)),
+            element(2, Operand::Y(0)),
+        ];
+        let result = transform_function(&input);
+        let names = result.iter().map(SpecificOp::name).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "load_tuple_ptr",
+                "get_two_tuple_elements",
+                "i_get_tuple_element"
+            ]
         );
     }
 
