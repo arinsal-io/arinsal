@@ -460,7 +460,24 @@ struct CarrierSpan {
     sbc: bool,
 }
 
+/// The carrier range a tree walk checks node addresses against, copied out of the allocator once
+/// per tree operation so the checks stay in registers instead of reloading `tree_span` after every
+/// node store.
+#[derive(Clone, Copy)]
+struct TreeWindow {
+    start: usize,
+    limit: usize,
+}
+
 impl CarrierSpan {
+    #[inline(always)]
+    const fn window(self) -> TreeWindow {
+        TreeWindow {
+            start: self.start,
+            limit: self.node_limit,
+        }
+    }
+
     const EMPTY: Self = Self::new(0, 0, usize::MAX, false);
 
     /// The number of byte offsets of `[start, end)` at which a whole tree node still fits.
@@ -2433,8 +2450,13 @@ impl AllocUtil {
     /// its fields are plain loads, like the pointer dereference of the C code.
     #[inline(always)]
     fn tn<const A: bool>(&self, key: usize) -> Result<TNode<A>, AllocError> {
-        let span = self.tree_span.get();
-        match NodeRef::new(span.start, span.node_limit, key) {
+        self.tn_in(self.tree_span.get().window(), key)
+    }
+
+    /// `tn` against a window taken once by the caller.
+    #[inline(always)]
+    fn tn_in<const A: bool>(&self, window: TreeWindow, key: usize) -> Result<TNode<A>, AllocError> {
+        match NodeRef::new(window.start, window.limit, key) {
             Some(raw) => Ok(TNode { raw }),
             None => self.tn_slow(key),
         }
@@ -2535,15 +2557,20 @@ impl AllocUtil {
 
     #[inline(always)]
     /// Port of rbt_search, erl_ao_firstfit_alloc.c, OTP-29.1.1.
-    fn aoff_search(&self, root: usize, need: usize) -> Result<Option<usize>, AllocError> {
+    fn aoff_search(
+        &self,
+        window: TreeWindow,
+        root: usize,
+        need: usize,
+    ) -> Result<Option<usize>, AllocError> {
         if root == 0 {
             return Ok(None);
         }
-        let mut node = self.tn::<true>(root)?;
+        let mut node = self.tn_in::<true>(window, root)?;
         loop {
             let left = node.left();
             if left != 0 {
-                let left_node = self.tn::<true>(left)?;
+                let left_node = self.tn_in::<true>(window, left)?;
                 if left_node.max() >= need {
                     node = left_node;
                     continue;
@@ -2556,13 +2583,14 @@ impl AllocUtil {
             if right == 0 {
                 return Ok(None);
             }
-            node = self.tn::<true>(right)?;
+            node = self.tn_in::<true>(window, right)?;
         }
     }
 
     #[inline]
     fn aoff_raise_carrier_max(&mut self, span: CarrierSpan, size: usize) -> Result<(), AllocError> {
-        let mut crr = self.tn::<true>(span.start + MBC_HEADER)?;
+        let window = span.window();
+        let mut crr = self.tn_in::<true>(window, span.start + MBC_HEADER)?;
         if size > crr.size() {
             crr.raw.set_word(0, size);
             while size > crr.max() {
@@ -2571,7 +2599,7 @@ impl AllocUtil {
                 if parent == 0 {
                     break;
                 }
-                crr = self.tn::<true>(parent)?;
+                crr = self.tn_in::<true>(window, parent)?;
             }
         }
         Ok(())
@@ -2579,10 +2607,11 @@ impl AllocUtil {
 
     #[inline(never)]
     fn aoff_lower_carrier_max(&mut self, span: CarrierSpan) -> Result<(), AllocError> {
-        let crr = self.tn::<true>(span.start + MBC_HEADER)?;
+        let window = span.window();
+        let crr = self.tn_in::<true>(window, span.start + MBC_HEADER)?;
         let root = self.aoff_root(span);
         if root != 0 {
-            let root_max = self.tn::<true>(root)?.max();
+            let root_max = self.tn_in::<true>(window, root)?.max();
             if crr.size() == root_max {
                 return Ok(());
             }
@@ -2590,7 +2619,7 @@ impl AllocUtil {
         } else {
             crr.raw.set_word(0, 0);
         }
-        self.lower_max_size(crr, 0)
+        self.lower_max_size(window, crr, 0)
     }
 
     fn aoff_add_carrier_node(&mut self, carrier_index: usize) -> Result<(), AllocError> {
@@ -2763,15 +2792,15 @@ impl AllocUtil {
         span: CarrierSpan,
     ) -> Result<(), AllocError> {
         let block_node = !(A && !span.sbc && node == span.start + MBC_HEADER);
-        let tree = if block_node {
+        let (tree, window) = if block_node {
             self.tree_span.set(span);
-            TreeId::Blocks
+            (TreeId::Blocks, span.window())
         } else {
-            TreeId::Carriers
+            (TreeId::Carriers, self.tree_span.get().window())
         };
         let by_address = !block_node || self.strategy == Strategy::Aoff;
         let bestfit = block_node && matches!(self.strategy, Strategy::BestFit | Strategy::AoffCbf);
-        let blk = self.tn::<A>(node)?;
+        let blk = self.tn_in::<A>(window, node)?;
         blk.set_left(0);
         blk.set_right(0);
         if A {
@@ -2787,7 +2816,7 @@ impl AllocUtil {
             self.set_root_of::<A>(tree, node);
             return Ok(());
         }
-        let mut x = self.tn::<A>(root)?;
+        let mut x = self.tn_in::<A>(window, root)?;
         let go_left = loop {
             let x_size = x.size();
             if A && x.max() < size {
@@ -2799,7 +2828,7 @@ impl AllocUtil {
                 blk.set_parent(x.key());
                 blk.set_next(head_next);
                 if head_next != 0 {
-                    self.tn::<A>(head_next)?.set_parent(node);
+                    self.tn_in::<A>(window, head_next)?.set_parent(node);
                 }
                 x.set_next(node);
                 return Ok(());
@@ -2813,7 +2842,7 @@ impl AllocUtil {
             if child == 0 {
                 break go_left;
             }
-            x = self.tn::<A>(child)?;
+            x = self.tn_in::<A>(window, child)?;
         };
         blk.set_parent(x.key());
         if go_left {
@@ -2888,7 +2917,9 @@ impl AllocUtil {
             return Ok(None);
         }
         if is_aoff(self.strategy) {
-            let Some(carrier_node) = self.aoff_search(self.aoff_carrier_root, need)? else {
+            let Some(carrier_node) =
+                self.aoff_search(self.tree_span.get().window(), self.aoff_carrier_root, need)?
+            else {
                 return Ok(None);
             };
             let span = self
@@ -2896,7 +2927,7 @@ impl AllocUtil {
                 .filter(|span| !span.sbc && carrier_node == span.start + MBC_HEADER)
                 .ok_or(AllocError::Corrupt)?;
             self.tree_span.set(span);
-            return self.aoff_search(self.aoff_root(span), need);
+            return self.aoff_search(span.window(), self.aoff_root(span), need);
         }
         let mut current = self.free_root;
         let mut best = 0;
@@ -3026,7 +3057,7 @@ impl AllocUtil {
         x.set_parent(y_key);
         if A {
             y.set_max(x.max());
-            let max = self.node_max_size(x)?;
+            let max = self.node_max_size(self.tree_span.get().window(), x)?;
             x.set_max(max);
         }
         Ok(())
@@ -3058,22 +3089,26 @@ impl AllocUtil {
         x.set_parent(y_key);
         if A {
             y.set_max(x.max());
-            let max = self.node_max_size(x)?;
+            let max = self.node_max_size(self.tree_span.get().window(), x)?;
             x.set_max(max);
         }
         Ok(())
     }
 
     #[inline(always)]
-    fn node_max_size<const A: bool>(&self, x: TNode<A>) -> Result<usize, AllocError> {
+    fn node_max_size<const A: bool>(
+        &self,
+        window: TreeWindow,
+        x: TNode<A>,
+    ) -> Result<usize, AllocError> {
         let mut sz = x.size();
         let left = x.left();
         if left != 0 {
-            sz = sz.max(self.tn::<A>(left)?.max());
+            sz = sz.max(self.tn_in::<A>(window, left)?.max());
         }
         let right = x.right();
         if right != 0 {
-            sz = sz.max(self.tn::<A>(right)?.max());
+            sz = sz.max(self.tn_in::<A>(window, right)?.max());
         }
         Ok(sz)
     }
@@ -3081,11 +3116,12 @@ impl AllocUtil {
     #[inline(never)]
     fn lower_max_size<const A: bool>(
         &self,
+        window: TreeWindow,
         node: TNode<A>,
         stop_at: usize,
     ) -> Result<(), AllocError> {
         let old_max = node.max();
-        let new_max = self.node_max_size(node)?;
+        let new_max = self.node_max_size(window, node)?;
         if new_max < old_max {
             node.set_max(new_max);
             let mut x = node;
@@ -3094,11 +3130,11 @@ impl AllocUtil {
                 if parent == stop_at {
                     break;
                 }
-                x = self.tn::<A>(parent)?;
+                x = self.tn_in::<A>(window, parent)?;
                 if x.max() != old_max {
                     break;
                 }
-                let max = self.node_max_size(x)?;
+                let max = self.node_max_size(window, x)?;
                 x.set_max(max);
             }
         }
@@ -3210,18 +3246,19 @@ impl AllocUtil {
         tree: TreeId,
         node: usize,
     ) -> Result<(), AllocError> {
-        let z = self.tn::<A>(node)?;
+        let window = self.tree_span.get().window();
+        let z = self.tn_in::<A>(window, node)?;
         let z_right = z.right();
         let y = if z.left() == 0 || z_right == 0 {
             z
         } else {
-            let mut y = self.tn::<A>(z_right)?;
+            let mut y = self.tn_in::<A>(window, z_right)?;
             loop {
                 let left = y.left();
                 if left == 0 {
                     break y;
                 }
-                y = self.tn::<A>(left)?;
+                y = self.tn_in::<A>(window, left)?;
             }
         };
         let y_left = y.left();
@@ -3230,25 +3267,25 @@ impl AllocUtil {
         let y_parent = y.parent();
         let mut x_parent = y_parent;
         if x != 0 {
-            self.tn::<A>(x)?.set_parent(y_parent);
+            self.tn_in::<A>(window, x)?.set_parent(y_parent);
         }
         if y_parent == 0 {
             self.set_root_of::<A>(tree, x);
         } else {
-            let p = self.tn::<A>(y_parent)?;
+            let p = self.tn_in::<A>(window, y_parent)?;
             if y.key() == p.left() {
                 p.set_left(x);
             } else {
                 p.set_right(x);
             }
             if A && y_parent != node {
-                self.lower_max_size(p, if y.key() == node { 0 } else { node })?;
+                self.lower_max_size(window, p, if y.key() == node { 0 } else { node })?;
             }
         }
         if y.key() != node {
             self.replace_tree_node(tree, z, y)?;
             if A {
-                self.lower_max_size(y, 0)?;
+                self.lower_max_size(window, y, 0)?;
             }
             if x_parent == node {
                 x_parent = y.key();
