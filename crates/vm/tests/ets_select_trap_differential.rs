@@ -49,6 +49,22 @@ const CALLS: &[(&str, &str, &str)] = &[
     ),
     ("match_key", "ets:match(In, {1, '$1'})", "length"),
     (
+        "select_range",
+        "ets:select(In, [{{{3, '_'}, '_'}, [], ['$_']}])",
+        "length",
+    ),
+    (
+        "select_range_reverse",
+        "ets:select_reverse(In, [{{{3, '_'}, '_'}, [], ['$_']}])",
+        "length",
+    ),
+    (
+        "select_count_range",
+        "ets:select_count(In, [{{{3, '_'}, '_'}, [], [true]}])",
+        "id",
+    ),
+    ("match_range", "ets:match(In, {{3, '$1'}, '_'})", "length"),
+    (
         "match_object_key",
         "ets:match_object(In, {1, '_'})",
         "length",
@@ -62,6 +78,66 @@ const CALLS: &[(&str, &str, &str)] = &[
         "select_missing_key",
         "ets:select(In, [{{-5, '_'}, [], ['$_']}])",
         "length",
+    ),
+];
+
+/// Calls that run on ordered_set tables of both kinds.
+const ORDERED_CALLS: &[&str] = &[
+    "select",
+    "select_reverse",
+    "match",
+    "match_object",
+    "match_object_all",
+    "tab2list",
+    "select_count",
+    "select_count_some",
+    "select_key",
+    "select_missing_key",
+    "match_key",
+    "select_range",
+    "select_range_reverse",
+    "select_count_range",
+    "match_range",
+];
+
+/// Chunked calls (`select/3`, `match/3`, `match_object/3` and the continuations) on every table
+/// kind: the call, the limit and how the chunks are folded.
+const CHUNK_CALLS: &[(&str, &str)] = &[
+    (
+        "select3_1",
+        "chunks(fun() -> ets:select(In, SELECT_ALL, 1) end, 0)",
+    ),
+    (
+        "select3_100",
+        "chunks(fun() -> ets:select(In, SELECT_ALL, 100) end, 0)",
+    ),
+    (
+        "select3_1000",
+        "chunks(fun() -> ets:select(In, SELECT_ALL, 1000) end, 0)",
+    ),
+    (
+        "select3_big",
+        "chunks(fun() -> ets:select(In, SELECT_ALL, 1000000) end, 0)",
+    ),
+    (
+        "select3_rev_100",
+        "chunks(fun() -> ets:select_reverse(In, SELECT_ALL, 100) end, 0)",
+    ),
+    (
+        "select3_some_100",
+        "chunks(fun() -> ets:select(In, [{{'$1', '_'}, [{'<', '$1', 77}], ['$1']}], 100) end, 0)",
+    ),
+    (
+        "match3_100",
+        "chunks(fun() -> ets:match(In, {'$1', '_'}, 100) end, 0)",
+    ),
+    (
+        "match_object3_1000",
+        "chunks(fun() -> ets:match_object(In, '_', 1000) end, 0)",
+    ),
+    (
+        "select3_range_100",
+        "chunks(fun() -> ets:select(In, [{{{3, '_'}, '_'}, [], ['$_']}], 100) end, 0)",
     ),
 ];
 
@@ -82,19 +158,46 @@ const TABLES: &[(&str, &str)] = &[
         "set_wc",
         "ets_fill(ets:new(t, [set, public, {write_concurrency, true}]), N, fun(I) -> {I, I} end)",
     ),
+    (
+        "ordered",
+        "ets_fill(ets:new(t, [ordered_set, public]), N, fun(I) -> {I, I} end)",
+    ),
+    (
+        "ordered_wc",
+        "ets_fill(ets:new(t, [ordered_set, public, {write_concurrency, true}]), N, fun(I) -> {I, I} end)",
+    ),
+    (
+        "tuples",
+        "ets_fill(ets:new(t, [ordered_set, public]), N, fun(I) -> {{I rem 10, I}, I} end)",
+    ),
+    (
+        "tuples_wc",
+        "ets_fill(ets:new(t, [ordered_set, public, {write_concurrency, true}]), N, fun(I) -> {{I rem 10, I}, I} end)",
+    ),
 ];
 
-fn functions() -> Vec<(String, String, String, String)> {
+fn is_ordered(table: &str) -> bool {
+    matches!(table, "ordered" | "ordered_wc" | "tuples" | "tuples_wc")
+}
+
+fn functions(chunked: bool) -> Vec<(String, String, String, String)> {
     let mut all = Vec::new();
     for (table, build) in TABLES {
-        for (call_name, call, post) in CALLS {
+        let ordered = is_ordered(table);
+        for (call_name, call, post) in CALLS.iter().filter(|_| !chunked) {
             for (label, size) in SIZES {
-                if *table != "set"
-                    && !matches!(
-                        *call_name,
-                        "select" | "match_object_all" | "select_count" | "select_key"
-                    )
-                {
+                let hash_ok = matches!(
+                    *call_name,
+                    "select" | "match_object_all" | "select_count" | "select_key"
+                );
+                if ordered {
+                    let tuple_keys = matches!(*table, "tuples" | "tuples_wc");
+                    if !ORDERED_CALLS.contains(call_name)
+                        || tuple_keys != call_name.contains("range")
+                    {
+                        continue;
+                    }
+                } else if call_name.contains("range") || (*table != "set" && !hash_ok) {
                     continue;
                 }
                 if *table == "set_wc" && size > 1000 {
@@ -110,6 +213,25 @@ fn functions() -> Vec<(String, String, String, String)> {
                 all.push((name, body, String::new(), String::new()));
             }
         }
+        for (call_name, call) in CHUNK_CALLS.iter().filter(|_| chunked) {
+            if call_name.contains("range") != matches!(*table, "tuples" | "tuples_wc") {
+                continue;
+            }
+            for (label, size) in SIZES {
+                if *call_name == "select3_1" && size > 1000 {
+                    continue;
+                }
+                if matches!(*table, "set_wc") && size > 1000 {
+                    continue;
+                }
+                let name = format!("{table}_{call_name}_{label}");
+                let call = call.replace("SELECT_ALL", SELECT_ALL);
+                let body = format!(
+                    "{name}() ->\n    measure({size}, fun(N) -> {build} end, fun(In) -> {call} end, fun post_id/1).\n\n"
+                );
+                all.push((name, body, String::new(), String::new()));
+            }
+        }
     }
     all
 }
@@ -120,6 +242,12 @@ ets_fill(T, N, F) ->
     T.
 
 post_length(R) -> length(R).
+
+chunks(First, Acc) -> chunk(First(), Acc).
+
+chunk('$end_of_table', Acc) -> Acc;
+chunk({L, '$end_of_table'}, Acc) -> Acc + length(L);
+chunk({L, C}, Acc) -> chunk(ets:select(C), Acc + length(L)).
 post_id(R) -> R.
 
 measure(N, Build, Run, Post) ->
@@ -169,6 +297,51 @@ orders() ->
           lists:sublist([K || [K] <- ets:match(T, {'$1', '_'})], 6)]
      end || Opts <- [[set, public], [set, public, {write_concurrency, true}],
                      [bag, public, {write_concurrency, true}]]].
+
+%% Ordered tables return the objects in key order and a trapped traversal resumes from its
+%% last key, also where the clause heads name a range, several ranges or no key at all.
+ordered_results() ->
+    [begin
+         T = ets:new(t, Opts),
+         ets_fill(T, 2500, fun(I) -> {{I rem 7, I}, I} end),
+         Spec = fun(Head) -> [{Head, [], ['$_']}] end,
+         All = [{{'$1', '$2'}, '$3'}],
+         Count = [{{'$1', '_'}, [], [true]}],
+         [ets:select(T, Spec({{3, '_'}, '_'})), ets:select_reverse(T, Spec({{3, '_'}, '_'})),
+          ets:select(T, [{{{2, '_'}, '_'}, [], ['$_']}, {{{5, '_'}, '_'}, [], ['$_']}]),
+          ets:select(T, [{{{2, '_'}, '_'}, [], ['$_']}, {'_', [], [1]}]),
+          ets:select(T, [{{{3, 4}, '_'}, [], ['$_']}, {{{4, 5}, '_'}, [], ['$_']}]),
+          ets:select(T, [{{{'_', 3}, '_'}, [], ['$_']}]),
+          ets:match(T, {{4, '$1'}, '_'}), ets:match_object(T, {{4, '_'}, '_'}), ets:match_object(T, '_'),
+          ets:select_count(T, Count), ets:select_count(T, [{{{3, '_'}, '_'}, [], [true]}]),
+          ets:select(T, [{{'_', '_'}, [], ['$_']}]), ets:select(T, [{All, [], ['$_']}]),
+          ets:select(T, [{{{3, '_'}, '_'}, [], ['$_']}, {{{3, 5}, '_'}, [], [x]}]), ets:tab2list(T)]
+     end || Opts <- [[ordered_set, public], [ordered_set, public, {write_concurrency, true}]]].
+
+%% A writer inserts and deletes while an ordered select is trapped; the reader never sees a key twice.
+ordered_writers() ->
+    N = 30000,
+    T = ets:new(t, [ordered_set, public]),
+    ets_fill(T, N, fun(I) -> {I, I} end),
+    Me = self(),
+    Reader = spawn(fun() ->
+        receive go -> ok end,
+        R1 = ets:select(T, [{{'$1', '_'}, [], ['$1']}]),
+        R2 = ets:select_reverse(T, [{{'$1', '_'}, [], ['$1']}]),
+        R3 = ets:select_count(T, [{{'$1', '_'}, [], [true]}]),
+        Me ! {reader, R1, R2, R3}
+    end),
+    Reader ! go,
+    spawn(fun() ->
+        [ets:delete(T, K) || K <- lists:seq(2, N, 2)],
+        [ets:insert(T, {K, K}) || K <- lists:seq(N + 1, N + 5000)],
+        Me ! modded
+    end),
+    receive modded -> ok after 60000 -> exit(no_modded) end,
+    {R1, R2, R3} = receive {reader, A, B, C} -> {A, B, C} after 60000 -> exit(no_reader) end,
+    Odd = lists:seq(1, N, 2),
+    {R1 =:= lists:sort(R1), R2 =:= lists:reverse(lists:sort(R2)), unique(R1), unique(R2),
+     Odd -- R1 =:= [], Odd -- R2 =:= [], R3 >= N div 2, R3 =< N + 5000, ets:info(T, safe_fixed)}.
 
 %% Slot counts decide where a traversal traps.
 shapes() ->
@@ -308,7 +481,8 @@ deleted_while_trapped() ->
 "#;
 
 fn source() -> String {
-    let all = functions();
+    let mut all = functions(false);
+    all.extend(functions(true));
     let exports = all
         .iter()
         .map(|(name, ..)| format!("{name}/0"))
@@ -319,7 +493,7 @@ fn source() -> String {
         .map(|(_, body, ..)| body.as_str())
         .collect::<String>();
     format!(
-        "-module({MODULE}).\n-export([{exports}, trap_mfa/0, gc_after_trap/0, shapes/0, orders/0, writers_set/0, writers_bag/0, owner_unfixed/0, deleted_while_trapped/0]).\n\nwriters_set() -> writers(set, public).\nwriters_bag() -> writers(bag, public).\n\n{bodies}{COMMON}"
+        "-module({MODULE}).\n-export([{exports}, trap_mfa/0, ordered_results/0, ordered_writers/0, gc_after_trap/0, shapes/0, orders/0, writers_set/0, writers_bag/0, owner_unfixed/0, deleted_while_trapped/0]).\n\nwriters_set() -> writers(set, public).\nwriters_bag() -> writers(bag, public).\n\n{bodies}{COMMON}"
     )
 }
 
@@ -336,7 +510,16 @@ fn measured(term: &OwnedTerm) -> (i64, i64, i64, &OwnedTerm) {
 }
 
 #[test]
-fn hash_select_family_charges_and_traps_like_otp() {
+fn select_family_charges_and_traps_like_otp() {
+    family(false);
+}
+
+#[test]
+fn chunked_selects_charge_and_trap_like_otp() {
+    family(true);
+}
+
+fn family(chunked: bool) {
     let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
     let source = source();
     let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
@@ -346,7 +529,15 @@ fn hash_select_family_charges_and_traps_like_otp() {
 
     let mut failures = Vec::new();
     let filter = std::env::var("REDS_FILTER").unwrap_or_default();
-    for (index, (function, ..)) in functions().iter().enumerate() {
+    let names: Vec<String> = functions(false)
+        .into_iter()
+        .chain(functions(true))
+        .map(|(name, ..)| name)
+        .collect();
+    for (index, function) in names.iter().enumerate() {
+        if functions(chunked).iter().all(|(name, ..)| name != function) {
+            continue;
+        }
         if !function.contains(&filter) {
             continue;
         }
@@ -401,6 +592,18 @@ fn result_order_matches_otp() {
     if std::env::var("SHOW").is_ok() {
         eprintln!("erl: {expected:?}\narinsal: {actual:?}");
     }
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn ordered_results_match_otp() {
+    let (expected, actual) = both("ordered_results", 1, Some(0xE7F6));
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn writers_during_a_trapped_ordered_select_behave_like_otp() {
+    let (expected, actual) = both("ordered_writers", 2, None);
     assert_eq!(expected, actual);
 }
 

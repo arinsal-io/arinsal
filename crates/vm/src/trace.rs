@@ -3878,9 +3878,10 @@ pub(crate) fn running_mfa(
                 .cold
                 .as_ref()
                 .and_then(|cold| cold.ets_select.as_ref())
-                .map(|state| match state.count {
-                    false => ("ets", "select_trap", 1),
-                    true => ("ets", "count_trap", 1),
+                .map(|state| match (state.count, &state.position) {
+                    (false, arinsal_ets::ScanPosition::Slot(_)) => ("ets", "select_trap", 1),
+                    (false, arinsal_ets::ScanPosition::After(_)) => ("ets", "select", 1),
+                    (true, _) => ("ets", "count_trap", 1),
                 })
         });
     // Port of erts/emulator/beam/erl_process.c:12604 (`p->current = &p->u.initial`) and
