@@ -1004,7 +1004,7 @@ pub fn run_native(
         resume_live - 1
     };
     let live = usize::from(arity);
-    process.ensure(1 + arinsal_term::S_RESERVED, live)?;
+    process.ensure_entry(1 + arinsal_term::S_RESERVED, live)?;
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-261 (emit_i_apply_only),
     // OTP-29.1.1: a call the scheduler performs for native code (fun/apply, BIF traps,
@@ -1042,15 +1042,14 @@ pub fn run_native(
     process.native_reds_in = process.header.fcalls;
     process.header.i = code_ptr;
     process.header.arity = arity;
+    // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_in_registers), OTP-29.1.1:
+    // only the `c_p->arity` registers the process saved are live. The floor of eight keeps
+    // the x0..x3 an exception handler entry reads and the six registers the native helpers
+    // publish; the file above that is dead and is not copied. The float registers are never
+    // live across a call or a scheduling point, so erts saves none.
     let count = process.x.len().min(registers.x_reg_array.len());
-    for (destination, term) in registers.x_reg_array[..count]
-        .iter_mut()
-        .zip(&process.x[..count])
-    {
-        *destination = *term;
-    }
-    let float_count = process.fr.len().min(registers.f_reg_array.len());
-    registers.f_reg_array[..float_count].copy_from_slice(&process.fr[..float_count]);
+    let live_in = live.max(8).min(count);
+    registers.x_reg_array[..live_in].copy_from_slice(&process.x[..live_in]);
     if let Some(cold) = process.cold.as_mut() {
         cold.native_bif_error = None;
         cold.native_trap = None;
@@ -1095,13 +1094,26 @@ pub fn run_native(
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
     process.reductions = process.header.fcalls;
-    for (destination, raw) in process
-        .x
-        .iter_mut()
-        .take(count)
-        .zip(&registers.x_reg_array[..count])
-    {
-        *destination = *raw;
+    // Port of erts/emulator/beam/erl_process.c (schedule: `copy_out_registers` saves the
+    // `c_p->arity` registers), OTP-29.1.1: a plain yield saves only the registers its site
+    // declared live, which `publish_yield_xregs` copies. Every other exit hands the
+    // scheduler the whole file.
+    let bridge_return = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
+    let plain_yield = matches!(exit, ExitReason::Yield)
+        && process.header.freason == 0
+        && process.header.i as usize != bridge_return
+        && process.cold.as_ref().is_none_or(|cold| {
+            !cold.native_reserve_fetch && !cold.native_signal_fetch && cold.native_wait.is_none()
+        });
+    if !plain_yield {
+        for (destination, raw) in process
+            .x
+            .iter_mut()
+            .take(count)
+            .zip(&registers.x_reg_array[..count])
+        {
+            *destination = *raw;
+        }
     }
     if return_trace && let Some(function) = native_function_at(code_address) {
         eprintln!(
@@ -1115,7 +1127,6 @@ pub fn run_native(
             process.header.stop
         );
     }
-    process.fr[..float_count].copy_from_slice(&registers.f_reg_array[..float_count]);
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:533-540, OTP-29.1.1.
     // A VM-backed light BIF leaves TRAP for the scheduler when it exits native code.
     // A call handed to the scheduler keeps its call site too, for a BIF that raises there.
