@@ -792,6 +792,9 @@ pub(crate) struct ProcessCold {
     pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,
     /// Return address and call site of the native call that `native_retry` redoes.
     pub(crate) native_retry_site: Option<(usize, usize)>,
+    /// The BIF the scheduler runs for native code was called through `call_light_bif_shared`,
+    /// not through its export entry, so no return address is on the stack in erts.
+    pub(crate) native_light_bif_call: bool,
     /// The interpreter returned only to hand control to `native_pc`; the slice continues.
     pub(crate) native_transfer: bool,
     /// A system task woke the process while it was executing; it runs at the next scheduling

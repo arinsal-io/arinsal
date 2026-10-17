@@ -2822,6 +2822,33 @@ impl Executor {
                                                 (usize::MAX, call_site_pc),
                                                 crate::trace::StackScan::None,
                                             );
+                                            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp
+                                            // (call_light_bif_shared), OTP-29.1.1: a light BIF
+                                            // runs with E at the caller's frame; the return
+                                            // address is pushed only when it traps. A heavy BIF
+                                            // is entered through its export entry, whose frame
+                                            // holds the return address.
+                                            let light = process
+                                                .cold
+                                                .as_ref()
+                                                .is_some_and(|cold| cold.native_light_bif_call)
+                                                && arinsal_spec::bif_lookup(
+                                                    &export.module,
+                                                    &export.function,
+                                                    export.arity,
+                                                )
+                                                .is_some_and(|bif| {
+                                                    bif.kind != arinsal_spec::BifKind::Hbif
+                                                });
+                                            let hidden = usize::from(
+                                                light
+                                                    && process.heap.stack_get(0).is_some_and(
+                                                        |word| {
+                                                            word.tagged_word() as usize == resume_pc
+                                                        },
+                                                    ),
+                                            );
+                                            process.heap.set_bif_hidden_words(hidden);
                                             let result = self.vm.dispatch_native(
                                                 process,
                                                 ctx,
@@ -2830,6 +2857,7 @@ impl Executor {
                                                 usize::from(export.arity),
                                                 (export.class, export.native_bits),
                                             );
+                                            process.heap.set_bif_hidden_words(0);
                                             process.cold_mut().native_call_pc = 0;
                                             // A BIF that traps to an Erlang export (erts BIF_TRAP*)
                                             // context-switches to beam_bif_export_trap, which runs

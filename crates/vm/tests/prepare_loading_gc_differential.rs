@@ -3,9 +3,8 @@
 //! BIF) and the magic binary charges the size of erts' loader state to the virtual binary
 //! heap.
 //!
-//! Event sizes are `heap_size + mbuf_size`: whether the 3-word ref lands on the heap or in a
-//! fragment right at the free-word boundary also depends on the Erlang frame words at the BIF
-//! call, which this change does not touch.
+//! Event sizes are `heap_size + mbuf_size`; `light_bif_boundary_differential` checks the
+//! split between the heap and a fragment at the free-word boundary.
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
