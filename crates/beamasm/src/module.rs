@@ -412,12 +412,12 @@ impl BeamModuleAssembler {
     }
 
     /// Emits the patchable native entry trampoline used by local call tracing.
-    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250, OTP-29.1.1.
-    pub fn emit_i_breakpoint_trampoline(
-        &mut self,
-        fragment: usize,
-        identity: usize,
-    ) -> Result<(), ModuleError> {
+    ///
+    /// Disabled, `b next` skips the call of the shared breakpoint fragment. Enabled, the
+    /// branch becomes a NOP and the fragment runs the breakpoint, then returns to `next`.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250
+    // (emit_i_breakpoint_trampoline), OTP-29.1.1.
+    pub fn emit_i_breakpoint_trampoline(&mut self, fragment: usize) -> Result<(), ModuleError> {
         self.emit_enter_frame()?;
         let Some(function) = self.current_function_label else {
             return Err(ModuleError::InvalidOperand(
@@ -427,20 +427,7 @@ impl BeamModuleAssembler {
         let patch = self.code.offset();
         let next = self.code.new_label();
         self.code.b(next)?;
-        // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:62-95, OTP-29.1.1: erts calls
-        // erts_generic_breakpoint from the fragment. The helper behind the light-BIF fragment
-        // does the same for a breakpoint that needs no trace event (it counts and returns);
-        // any other traps so the executor, which owns the VM and run context, delivers the
-        // events and resumes after this call with every argument register intact.
-        // The helper identifies the traced function by the trampoline's continuation address
-        // (x2), so a breakpoint with nothing to do for this process resumes natively.
-        // The executor resumes behind this call itself: no trap return.
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(13), identity as u64)?;
-            e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, TRAP_RETURN_SLOT)
-        })?;
-        self.code.adr(Gpr::x(14), next)?;
-        self.emit_runtime_fragment(fragment, &[Gpr::x(13), Gpr::x(14)])?;
+        self.fragment_call(fragment)?;
         self.code.bind(next)?;
         if self
             .trace_breakpoints
@@ -1271,21 +1258,6 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         self.emit_runtime_fragment_with(helper, args, live, update)
             .map(|_| ())
-    }
-
-    pub(super) fn emit_runtime_fragment(
-        &mut self,
-        fragment: usize,
-        args: &[Gpr],
-    ) -> Result<usize, ModuleError> {
-        self.emit_runtime_fragment_with(
-            fragment,
-            args,
-            6,
-            crate::Update::HEAP_ALLOC
-                .union(crate::Update::REDUCTIONS)
-                .union(crate::Update::X_REGS),
-        )
     }
 
     /// Returns the code offset of the fragment call's return address.
