@@ -624,7 +624,7 @@ fn leave_native_nif(
             if let Some(pending) = crate::natives::nif::take_rescheduled() {
                 process.cold_mut().nif_pending = Some(pending);
             }
-            trap_to_dirty_nif(process, identity, class)
+            trap_to_dirty_nif(process, identity, class, arity)
         }
         Ok(Err(error)) => {
             let args = process.x[..usize::from(arity)].to_vec();
@@ -663,7 +663,7 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
     // OTP-29.1.1: a dirty NIF called on a normal scheduler first moves the process to a
     // dirty scheduler; the executor runs it there and returns to this body's caller.
     if let Some(class) = moves_to_dirty(process, &nif.module, &nif.function, nif.arity) {
-        return trap_to_dirty_nif(process, identity as usize, class);
+        return trap_to_dirty_nif(process, identity as usize, class, nif.arity);
     }
     // Like the interpreter's NativeBody, the body reads the scheduler hub, which run_native
     // installed when the process was scheduled in.
@@ -781,8 +781,11 @@ fn trap_to_dirty_nif(
     process: &mut crate::Process,
     identity: usize,
     class: arinsal_bifs::SchedulerClass,
+    arity: u8,
 ) -> u64 {
     process.cold_mut().native_dirty_nif = Some((identity, 0, class));
+    process.header.arity = arity;
+    process.gc_live = usize::from(arity);
     process.header.i =
         arinsal_beamasm::dispatch::DIRTY_NIF_DISPATCH_IDENTITY as *const u8 as *const _;
     process.header.freason = 1 << 10;

@@ -940,7 +940,7 @@ pub(crate) fn erl_create_process(
         .ok_or_else(|| VmError::Unsupported("spawn requires a scheduler".into()))?;
     let scheduler = rt.scheduler()?;
     let defaults = crate::natives::sys::gc_spawn_defaults(Some(&rt));
-    let mut child = Process::with_spawn_registers(args_list.len().max(3), 0);
+    let mut child = Process::with_spawn_registers(3, 0);
     child.set_runtime(parent.runtime.clone());
     // Port of erts/emulator/beam/erl_process.c:12594 (min_heap_size rounded up by
     // erts_next_heap_size), OTP-29.1.1.

@@ -878,6 +878,9 @@ pub(crate) struct ProcessCold {
     pub(crate) native_wait: Option<Option<u64>>,
     /// Export dispatch to redo after the process wakes from a parked native BIF call.
     pub(crate) native_retry: Option<usize>,
+    /// The arity a redone fun call or apply (`native_retry`) takes from `header.arity`, which
+    /// holds the saved register count while the process is switched out.
+    pub(crate) native_retry_arity: Option<u8>,
     /// The traced function (by pc), actions and return value of a native trace frame whose
     /// return events the executor emits.
     pub(crate) native_return_events: Option<NativeReturnEvents>,
