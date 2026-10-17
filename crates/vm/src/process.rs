@@ -6521,14 +6521,29 @@ impl Process {
         if size.saturating_add(self.heap.old_used_words()) < POTENTIALLY_LONG_GC_HSIZE {
             return false;
         }
-        // A minor collection that cannot tenure continues as a major one
-        // (erl_gc.c:840-848), so the size check uses the collection that will run.
-        let major = self.heap.collection_is_major() || self.heap.minor_falls_back_to_major();
+        // A collection that starts as minor is checked on its young generation alone. If
+        // that is already long, the dirty scheduler runs the minor attempt and any major
+        // collection it falls back to. Otherwise the minor attempt runs here, and a minor
+        // that cannot tenure is checked again as a major collection.
+        let counted_major = self.heap.collection_is_major();
+        let minor_is_long = !counted_major && size >= POTENTIALLY_LONG_GC_HSIZE;
+        let failed_minor =
+            !counted_major && !minor_is_long && self.heap.minor_falls_back_to_major();
+        let major = counted_major || failed_minor;
         if major {
             size = size.saturating_add(self.heap.old_used_words());
         }
         if size < POTENTIALLY_LONG_GC_HSIZE {
             return false;
+        }
+        if failed_minor {
+            let traced = self
+                .self_pid
+                .filter(|&pid| crate::trace::flags(self, pid) & crate::trace::GC != 0);
+            if let Some(pid) = traced {
+                self.trace_gc(pid, "gc_minor_start", need);
+                self.trace_gc(pid, "gc_minor_end", 0);
+            }
         }
         let cold = self.cold_mut();
         cold.dirty_gc = Some(if major {
