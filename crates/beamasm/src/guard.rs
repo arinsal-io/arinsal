@@ -2397,7 +2397,21 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.cmp_imm(Gpr::x(11), 0x3b, false))?;
         self.code.b_cond(Cond::Ne, slow)?;
         self.code.bind(done)?;
+        // Port of erts/emulator/beam/erl_bif_guard.c (erts_trapping_length_1): the walk charges
+        // one reduction per 16 elements, and BUMP_REDS clamps FCALLS at zero. The `i_length`
+        // fragment enters the runtime with `Update::eReductions`, so FCALLS carries the charge
+        // back to the caller.
         self.code.emit(|e| {
+            e.lsr_imm(Gpr::x(9), Gpr::x(12), 4)?;
+            e.sub_reg(
+                Gpr::w(22),
+                Gpr::w(22),
+                Gpr::w(9),
+                arinsal_a64::enc::Shift::Lsl,
+                0,
+            )?;
+            e.cmp_imm(Gpr::w(22), 0, false)?;
+            e.csel(Gpr::x(22), Gpr::xzr(), Gpr::x(22), Cond::Lt)?;
             e.lsl_imm(output, Gpr::x(12), 4)?;
             e.orr_imm(output, output, 15)
         })?;
