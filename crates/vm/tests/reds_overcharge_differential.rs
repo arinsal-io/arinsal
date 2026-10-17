@@ -149,6 +149,44 @@ const T2B_CASES: &[Case] = &[
     ),
 ];
 
+const MATCHING_CASES: &[Case] = &[
+    case(
+        "binary_match_1",
+        STD,
+        1,
+        "bytes(N)",
+        "binary:match(In, <<250>>)",
+    ),
+    case(
+        "binary_match_multi",
+        STD,
+        1,
+        "bytes(N)",
+        "binary:match(In, <<250, 251, 252>>)",
+    ),
+    case(
+        "binary_match_list",
+        STD,
+        1,
+        "bytes(N)",
+        "binary:match(In, [<<250, 251>>, <<249>>])",
+    ),
+    case(
+        "binary_matches_1",
+        STD,
+        12,
+        "bytes(N)",
+        "binary:matches(In, <<7>>)",
+    ),
+    case(
+        "binary_split_all",
+        STD,
+        12,
+        "bytes(N)",
+        "binary:split(In, <<7>>, [global])",
+    ),
+];
+
 fn function_name(case: &Case, size: usize) -> String {
     format!("{}_{size}", case.name)
 }
@@ -305,6 +343,11 @@ fn iolist_bifs_charge_like_otp() {
 #[test]
 fn t2b_bifs_charge_like_otp() {
     check(T2B_CASES, 0xC200);
+}
+
+#[test]
+fn matching_bifs_charge_like_otp() {
+    check(MATCHING_CASES, 0xC300);
 }
 
 #[test]

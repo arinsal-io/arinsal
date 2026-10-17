@@ -1442,13 +1442,15 @@ pub struct BinarySearchWalk {
     kind: BinarySearchKind,
     split_trim: bool,
     split_trim_all: bool,
+    global: bool,
+    result_left: Option<usize>,
 }
 
 impl BinarySearchWalk {
     /// Parse BIF options and prepare a Boyer–Moore or Aho–Corasick walk.
     pub fn new(kind: BinarySearchKind, args: &[Term]) -> Result<Self, BifError> {
         let compiled = pattern(args[1])?;
-        let (walk, split_trim, split_trim_all) = with_binary_input(args[0], |bytes| {
+        let (walk, split_trim, split_trim_all, first_only) = with_binary_input(args[0], |bytes| {
             let (scope, first_only, split_trim, split_trim_all) = match kind {
                 BinarySearchKind::Match => (
                     if args.len() == 3 {
@@ -1483,21 +1485,53 @@ impl BinarySearchWalk {
                 SearchWalk::new(bytes.len(), compiled, scope, first_only),
                 split_trim,
                 split_trim_all,
+                first_only,
             ))
         })?;
+        let global = !first_only;
         Ok(Self {
             subject: args[0],
             walk,
             kind,
             split_trim,
             split_trim_all,
+            global,
+            result_left: None,
         })
     }
 
-    /// Run at most `budget` ERTS search reductions.
+    /// Run at most `budget` ERTS search units, then the units of building a global result.
+    // Port of erts/emulator/beam/erl_bif_binary.c (do_binary_find) and
+    // 1671-1735, 1809-1915 (do_match_global_result, do_split_global_result), OTP-29.1.1.
     pub fn step(&mut self, budget: usize) -> (bool, usize) {
-        with_binary_input(self.subject, |bytes| Ok(self.walk.step(bytes, budget)))
-            .expect("search subject remains a live binary")
+        let mut work = 0;
+        if !self.walk.is_done() {
+            let (done, used) =
+                with_binary_input(self.subject, |bytes| Ok(self.walk.step(bytes, budget)))
+                    .expect("search subject remains a live binary");
+            if !done {
+                return (false, used);
+            }
+            work = used;
+        }
+        let mut left = *self.result_left.get_or_insert_with(|| {
+            let found = self.walk.match_count();
+            match (self.kind, self.global) {
+                (BinarySearchKind::Matches, _) => found * 2,
+                (BinarySearchKind::Split, true) => found,
+                _ => 0,
+            }
+        });
+        while left > 0 {
+            if work + 1 >= budget {
+                self.result_left = Some(left);
+                return (false, budget.max(work));
+            }
+            work += 1;
+            left -= 1;
+        }
+        self.result_left = Some(0);
+        (true, work)
     }
 
     /// Build the BIF result after searching completes.

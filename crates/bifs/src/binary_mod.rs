@@ -355,7 +355,17 @@ impl SearchWalk {
         self.len
     }
 
-    fn is_done(&self) -> bool {
+    /// Number of matches recorded so far.
+    pub(super) fn match_count(&self) -> usize {
+        match &self.state {
+            SearchState::BoyerMooreFirst { found, .. } => usize::from(found.is_some()),
+            SearchState::BoyerMooreAll { found, .. }
+            | SearchState::AhoCorasickAll { found, .. } => found.len(),
+            SearchState::AhoCorasickFirst { candidate, .. } => usize::from(candidate.is_some()),
+        }
+    }
+
+    pub(super) fn is_done(&self) -> bool {
         match &self.state {
             SearchState::BoyerMooreFirst { done, .. }
             | SearchState::BoyerMooreAll { done, .. }
