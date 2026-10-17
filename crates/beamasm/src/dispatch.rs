@@ -6,10 +6,7 @@ use arinsal_a64::{
     exec::{CodeMemory, ExecError},
 };
 
-use crate::{
-    Update, emit_enter_runtime, emit_leave_runtime,
-    rt::{arinsal_enter_native_return, arinsal_enter_native_yield},
-};
+use crate::{Update, emit_enter_runtime, emit_leave_runtime, rt::arinsal_enter_native_return};
 
 const RUNTIME_UPDATE: Update = Update::HEAP_ALLOC
     .union(Update::STACK)
@@ -1267,7 +1264,9 @@ fn emit_call_light_bif_shared(
     })?;
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
-        encoder.mov_const(Gpr::x(30), arinsal_enter_native_yield as *const () as u64)?;
+        encoder.mov_const(Gpr::x(0), 1)?;
+        encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
+        encoder.mov_const(Gpr::x(30), arinsal_enter_native_return as *const () as u64)?;
         encoder.ret(Gpr::x(30))
     })?;
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:578-581 and

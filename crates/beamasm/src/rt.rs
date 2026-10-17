@@ -142,7 +142,7 @@ pub unsafe fn enter_native_raw(
                 resume_pc: exit.resume,
             },
             // A return into the bridge is a return even when it used the last reduction;
-            // yields leave through `arinsal_enter_native_yield` (kind 1) with `c_p->i` set.
+            // yields leave through the same fragment with kind 1 in the marker slot and `c_p->i` set.
             0 => ExitReason::Returned,
             _ => ExitReason::Yield,
         }
@@ -157,7 +157,6 @@ pub unsafe fn enter_native_raw(
 #[cfg(target_arch = "aarch64")]
 unsafe extern "C" {
     pub fn arinsal_enter_native_return();
-    pub fn arinsal_enter_native_yield();
     pub fn arinsal_enter_native_trace_return();
     fn arinsal_enter_native(
         header: *mut ProcessHeader,
@@ -278,11 +277,6 @@ core::arch::global_asm!(
     "1:",
     "mov x0, x9",
     "2:",
-    "b 3f",
-    ".global _arinsal_enter_native_yield",
-    "_arinsal_enter_native_yield:",
-    "mov x0, #1",
-    "3:",
     // Spill native process state and all six register-backed X registers.
     "str x29, [x19, #16400]",
     "str x23, [x21, #0]",
