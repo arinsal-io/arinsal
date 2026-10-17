@@ -100,6 +100,55 @@ const IOLIST_CASES: &[Case] = &[
     ),
 ];
 
+const TO_100K: &[usize] = &[1, 1_000, 100_000];
+const BIG_BIN: &[usize] = &[4_000_000];
+const T2B_CASES: &[Case] = &[
+    case("t2b_bin", STD, 1, "bytes(N)", "erlang:term_to_binary(In)"),
+    case("t2b_ints", STD, 4, "seq(N)", "erlang:term_to_binary(In)"),
+    case(
+        "t2b_tuples",
+        TO_100K,
+        12,
+        "tuples(N)",
+        "erlang:term_to_binary(In)",
+    ),
+    case(
+        "t2b_iovec_ints",
+        TO_100K,
+        4,
+        "seq(N)",
+        "erlang:term_to_iovec(In)",
+    ),
+    case(
+        "t2b_bin_big",
+        BIG_BIN,
+        1,
+        "bytes(N)",
+        "erlang:term_to_binary(In)",
+    ),
+    case(
+        "t2b_iovec_bin_big",
+        BIG_BIN,
+        1,
+        "bytes(N)",
+        "erlang:term_to_iovec(In)",
+    ),
+    case(
+        "external_size_bin",
+        STD,
+        1,
+        "bytes(N)",
+        "erlang:external_size(In)",
+    ),
+    case(
+        "external_size_ints",
+        STD,
+        4,
+        "seq(N)",
+        "erlang:external_size(In)",
+    ),
+];
+
 fn function_name(case: &Case, size: usize) -> String {
     format!("{}_{size}", case.name)
 }
@@ -251,6 +300,11 @@ fn arith_bifs_charge_like_otp() {
 #[test]
 fn iolist_bifs_charge_like_otp() {
     check(IOLIST_CASES, 0xC100);
+}
+
+#[test]
+fn t2b_bifs_charge_like_otp() {
+    check(T2B_CASES, 0xC200);
 }
 
 #[test]
