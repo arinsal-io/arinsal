@@ -1209,12 +1209,17 @@ pub fn run_native(
         let slot = std::mem::take(&mut registers.tmp_mem[7]) as usize;
         let (module, function, arity) = arinsal_beamasm::guard::BADARG_MFAS[slot - 1];
         let args = process.x[..usize::from(arity)].to_vec();
-        let error = if process.header.freason == arinsal_beamasm::guard::EXC_BADMAP {
+        let tag = match process.header.freason {
+            arinsal_beamasm::guard::EXC_BADMAP => Some("badmap"),
+            arinsal_beamasm::guard::EXC_BADKEY => Some("badkey"),
+            _ => None,
+        };
+        let error = if let Some(tag) = tag {
             let value = crate::native_hooks::from_raw(process.header.fvalue);
             let reason =
                 arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
-                    .tuple(&[crate::signals::atom("badmap"), value])
-                    .map_err(|error| VmError::Unsupported(format!("badmap {error:?}")))?;
+                    .tuple(&[crate::signals::atom(tag), value])
+                    .map_err(|error| VmError::Unsupported(format!("{tag} {error:?}")))?;
             arinsal_bifs::BifError::Error(reason)
         } else {
             arinsal_bifs::BifError::BADARG
