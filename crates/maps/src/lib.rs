@@ -152,12 +152,20 @@ fn check(map: Term) -> MapResult<()> {
     }
 }
 
+const ATOM_TAG: u64 = 0x0b;
+
+// Port of erts/emulator/beam/erl_term.h (is_atom): the primary and immediate tag of an atom.
+#[inline(always)]
+fn is_atom_bits(word: u64) -> bool {
+    word & 0x3f == ATOM_TAG
+}
+
 // Port of erts/emulator/beam/erl_utils.h:267-271 (erts_cmp_flatmap_keys), OTP-29.1.1:
 // two atoms compare by index; every other pair is `erts_cmp(..., exact=1)`, whose
 // small-integer path is a register compare.
 fn key_cmp(a: Term, b: Term) -> Ordering {
-    if let (Some(a), Some(b)) = (a.as_atom(), b.as_atom()) {
-        return a.0.cmp(&b.0);
+    if is_atom_bits(bits(a)) && is_atom_bits(bits(b)) {
+        return bits(a).cmp(&bits(b));
     }
     if let (Some(a), Some(b)) = (a.as_small(), b.as_small()) {
         return a.cmp(&b);
@@ -1394,12 +1402,33 @@ pub fn put<H: HeapAlloc + ?Sized>(
         let mut kp = shp.add(1);
         let mut vp = hp.add(FLATMAP_HEADER_WORDS);
         let mut i = 0;
-        while i < n && key_cmp(term(*ks.add(i)), key) == Ordering::Less {
-            *kp = *ks.add(i);
-            *vp = *vs.add(i);
-            kp = kp.add(1);
-            vp = vp.add(1);
-            i += 1;
+        if is_atom_bits(raw_key) {
+            // `erts_cmp_flatmap_keys` compares two atoms as the difference of the tagged
+            // words; with the new key known to be an atom, the test is hoisted out of the loop.
+            while i < n {
+                let ck = *ks.add(i);
+                let less = if is_atom_bits(ck) {
+                    ck < raw_key
+                } else {
+                    key_cmp(term(ck), key) == Ordering::Less
+                };
+                if !less {
+                    break;
+                }
+                *kp = ck;
+                *vp = *vs.add(i);
+                kp = kp.add(1);
+                vp = vp.add(1);
+                i += 1;
+            }
+        } else {
+            while i < n && key_cmp(term(*ks.add(i)), key) == Ordering::Less {
+                *kp = *ks.add(i);
+                *vp = *vs.add(i);
+                kp = kp.add(1);
+                vp = vp.add(1);
+                i += 1;
+            }
         }
         *kp = raw_key;
         *vp = bits(value);
