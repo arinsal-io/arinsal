@@ -7,6 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const WORD_BYTES: usize = std::mem::size_of::<usize>();
 const BIN_FLAG_WRITABLE: u64 = 1 << 2;
 
+#[cfg(test)]
+thread_local! {
+    /// Count of `NodeRef::set_word` calls on this thread, for the tree upkeep tests.
+    pub(crate) static NODE_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A free-block or carrier tree node: a few consecutive machine words at a known address.
 ///
 /// Port of the intrusive `AOFF_RBTree_t`/`RBTree_t` node access of erl_ao_firstfit_alloc.c and
@@ -35,6 +41,12 @@ impl NodeRef {
             .then_some(Self { ptr: key, words })
     }
 
+    /// The address of the node.
+    #[inline(always)]
+    pub(crate) fn key(self) -> usize {
+        self.ptr
+    }
+
     /// Word `index` of the node.
     #[inline(always)]
     pub(crate) fn word(self, index: usize) -> usize {
@@ -48,6 +60,8 @@ impl NodeRef {
     #[inline(always)]
     pub(crate) fn set_word(self, index: usize, value: usize) {
         assert!(index < self.words);
+        #[cfg(test)]
+        NODE_WRITES.with(|writes| writes.set(writes.get() + 1));
         // SAFETY: as in `word`; the allocator owns its carriers exclusively while it is borrowed.
         unsafe { (self.ptr as *mut usize).add(index).write(value) }
     }

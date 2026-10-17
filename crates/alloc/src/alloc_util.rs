@@ -422,6 +422,14 @@ impl TNode {
         self.raw.word(AOFF_FLAGS_WORD) >> 32
     }
     #[inline(always)]
+    fn next(self) -> usize {
+        self.raw.word(BF_NEXT_WORD)
+    }
+    #[inline(always)]
+    fn set_next(self, value: usize) {
+        self.raw.set_word(BF_NEXT_WORD, value)
+    }
+    #[inline(always)]
     fn set_max(self, max_size: usize) {
         let word = self.raw.word(AOFF_FLAGS_WORD);
         self.raw.set_word(
@@ -1287,6 +1295,7 @@ impl AllocUtil {
         for block in transfer_blocks.iter().filter(|block| !block.allocated) {
             self.unlink_free(block.offset)?;
         }
+        self.aoff_remove_carrier_node(carrier_index)?;
         for block in transfer_blocks.iter().filter(|block| block.allocated) {
             self.stats.blocks -= 1;
             self.stats.blocks_size -= block.size;
@@ -1364,6 +1373,7 @@ impl AllocUtil {
         transfer.carrier.main = false;
         let carrier_index = self.insert_carrier(transfer.carrier);
         self.write_carrier(carrier_index)?;
+        self.aoff_add_carrier_node(carrier_index)?;
         // Blocks keep their addresses with the carrier memory, so allocations keep their identity.
         let mut remapped = Vec::with_capacity(transfer.allocations.len());
         for (old, offset) in transfer.allocations {
@@ -1872,8 +1882,11 @@ impl AllocUtil {
                 let in_tree = self.carriers[carrier]
                     .as_ref()
                     .is_some_and(|entry| entry.in_aoff_tree);
-                if (largest != 0) != in_tree
-                    || (largest != 0 && self.tree_node_size(carrier_node)? != largest)
+                if in_tree
+                    == self.carriers[carrier]
+                        .as_ref()
+                        .is_some_and(|entry| entry.sbc)
+                    || (in_tree && self.tree_node_size(carrier_node)? != largest)
                 {
                     return Err(AllocError::Corrupt);
                 }
@@ -1911,12 +1924,12 @@ impl AllocUtil {
             return Err(AllocError::Corrupt);
         }
         let size = self.tree_node_size(node)?;
-        let key = if (carrier_tree && self.strategy == Strategy::AoffCbf)
-            || (!carrier_tree && self.strategy == Strategy::AoffCaobf)
-        {
-            (size, node)
-        } else {
+        let key = if carrier_tree || self.strategy == Strategy::Aoff {
             (0, node)
+        } else if self.strategy == Strategy::AoffCbf {
+            (size, 0)
+        } else {
+            (size, node)
         };
         if lower.is_some_and(|bound| key <= bound) || upper.is_some_and(|bound| key >= bound) {
             return Err(AllocError::Corrupt);
@@ -2139,6 +2152,9 @@ impl AllocUtil {
             size,
         });
         self.write_carrier(ci)?;
+        if is_aoff(self.strategy) {
+            self.aoff_add_carrier_node(ci)?;
+        }
         self.write_block(&Block {
             carrier: ci,
             offset: start,
@@ -2283,7 +2299,7 @@ impl AllocUtil {
     #[inline(always)]
     fn tn(&self, key: usize) -> Result<TNode, AllocError> {
         let span = self.span_of(key).ok_or(AllocError::Corrupt)?;
-        let words = if self.strategy == Strategy::BestFit {
+        let words = if self.strategy == Strategy::BestFit || is_aoff(self.strategy) {
             BF_NODE_SIZE / WORD
         } else {
             RB_NODE_SIZE / WORD
@@ -2363,64 +2379,101 @@ impl AllocUtil {
 
     #[inline(always)]
     /// Port of rbt_search, erl_ao_firstfit_alloc.c:863-881, OTP-29.1.1.
-    fn aoff_search(&self, mut root: usize, need: usize) -> Result<Option<usize>, AllocError> {
-        while root != 0 {
-            let node = self.tn(root)?;
-            let left = node.left();
-            if left != 0 && self.tn(left)?.max() >= need {
-                root = left;
-            } else if node.size() >= need {
-                return Ok(Some(root));
-            } else {
-                root = node.right();
-            }
+    fn aoff_search(&self, root: usize, need: usize) -> Result<Option<usize>, AllocError> {
+        if root == 0 {
+            return Ok(None);
         }
-        Ok(None)
+        let mut node = self.tn(root)?;
+        loop {
+            let left = node.left();
+            if left != 0 {
+                let left_node = self.tn(left)?;
+                if left_node.max() >= need {
+                    node = left_node;
+                    continue;
+                }
+            }
+            if node.size() >= need {
+                return Ok(Some(node.raw.key()));
+            }
+            let right = node.right();
+            if right == 0 {
+                return Ok(None);
+            }
+            node = self.tn(right)?;
+        }
     }
 
-    /// Port of aoff_link_free_block/aoff_add_mbc, erl_ao_firstfit_alloc.c:761-779,991-1017, OTP-29.1.1.
-    fn update_aoff_carrier_node(&mut self, carrier_index: usize) -> Result<(), AllocError> {
+    /// Port of the carrier-tree part of aoff_link_free_block, erl_ao_firstfit_alloc.c, OTP-29.1.1:
+    /// a block larger than the carrier's largest free block raises the carrier node's size and the
+    /// `max_sz` of the carrier nodes above it, stopping at the first one that is already as large.
+    #[inline]
+    fn aoff_raise_carrier_max(&mut self, block: usize, size: usize) -> Result<(), AllocError> {
+        let carrier = self.carrier_of(block).ok_or(AllocError::Corrupt)?;
+        let mut crr = self.tn(self.carrier_tree_node(carrier)?)?;
+        if size > crr.size() {
+            crr.raw.set_word(0, size);
+            while size > crr.max() {
+                crr.set_max(size);
+                let parent = crr.parent();
+                if parent == 0 {
+                    break;
+                }
+                crr = self.tn(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Port of the carrier-tree part of aoff_unlink_free_block, erl_ao_firstfit_alloc.c, OTP-29.1.1:
+    /// the carrier node follows the root of its block tree and is left alone when that is unchanged.
+    #[inline]
+    fn aoff_lower_carrier_max(&mut self, carrier: usize) -> Result<(), AllocError> {
+        let node = self.carrier_tree_node(carrier)?;
+        let crr = self.tn(node)?;
+        let root = self.aoff_roots[carrier];
+        if root != 0 {
+            let root_max = self.tn(root)?.max();
+            if crr.size() == root_max {
+                return Ok(());
+            }
+            crr.raw.set_word(0, root_max);
+        } else {
+            crr.raw.set_word(0, 0);
+        }
+        self.lower_max_size(node, 0)
+    }
+
+    /// Port of aoff_creating_mbc and aoff_add_mbc, erl_ao_firstfit_alloc.c, OTP-29.1.1: a new carrier
+    /// joins the address ordered carrier tree at once with a largest free size of zero.
+    fn aoff_add_carrier_node(&mut self, carrier_index: usize) -> Result<(), AllocError> {
         let node = {
             let carrier = self.carriers[carrier_index]
-                .as_ref()
+                .as_mut()
                 .ok_or(AllocError::Corrupt)?;
             if carrier.sbc {
                 return Ok(());
             }
+            carrier.in_aoff_tree = true;
             carrier.key_base + MBC_HEADER
         };
-        // The root's max_sz is the largest free block of the carrier.
-        let largest = self.aoff_roots[carrier_index];
-        let largest_size = if largest == 0 {
-            0
-        } else {
-            self.tn(largest)?.max()
-        };
-        let in_tree = self.carriers[carrier_index]
-            .as_ref()
-            .is_some_and(|carrier| carrier.in_aoff_tree);
-        // Port of aoff_link_free_block/aoff_unlink_free_block: the carrier tree is touched only
-        // when the carrier's largest free block changed.
-        if in_tree && largest_size != 0 && self.tree_node_size(node)? == largest_size {
-            return Ok(());
-        }
-        if in_tree {
-            self.delete_tree_node(node)?;
-            self.carriers[carrier_index]
+        self.tn(node)?.raw.set_word(0, 0);
+        self.insert_tree_node(node, 0)
+    }
+
+    /// Port of aoff_remove_mbc, erl_ao_firstfit_alloc.c, OTP-29.1.1.
+    fn aoff_remove_carrier_node(&mut self, carrier_index: usize) -> Result<(), AllocError> {
+        let node = {
+            let carrier = self.carriers[carrier_index]
                 .as_mut()
-                .ok_or(AllocError::Corrupt)?
-                .in_aoff_tree = false;
-        }
-        if largest_size == 0 {
-            return Ok(());
-        }
-        self.tn(node)?.raw.set_word(0, largest_size);
-        self.insert_tree_node(node, largest_size)?;
-        self.carriers[carrier_index]
-            .as_mut()
-            .ok_or(AllocError::Corrupt)?
-            .in_aoff_tree = true;
-        Ok(())
+                .ok_or(AllocError::Corrupt)?;
+            if carrier.sbc || !carrier.in_aoff_tree {
+                return Ok(());
+            }
+            carrier.in_aoff_tree = false;
+            carrier.key_base + MBC_HEADER
+        };
+        self.delete_tree_node(node)
     }
 
     /// Inserts the free block into the OTP intrusive bestfit tree/list.
@@ -2527,24 +2580,28 @@ impl AllocUtil {
         }
         self.insert_tree_node(node, size)?;
         if is_aoff(self.strategy) {
-            let carrier = self.carrier_of(node).ok_or(AllocError::Corrupt)?;
-            self.update_aoff_carrier_node(carrier)?;
+            self.aoff_raise_carrier_max(node, size)?;
         }
         Ok(())
     }
 
-    /// Port of rbt_insert and tree_insert_fixup, erl_ao_firstfit_alloc.c:793-861, OTP-29.1.1.
+    /// Port of rbt_insert and tree_insert_fixup, erl_ao_firstfit_alloc.c, OTP-29.1.1.
+    /// The aoff `max_sz` is raised on the way down, so no walk to the root follows.
     fn insert_tree_node(&mut self, node: usize, size: usize) -> Result<(), AllocError> {
+        let aoff = is_aoff(self.strategy);
         let n = self.tn(node)?;
         n.set_flags(0);
         n.set_parent(0);
         n.set_left(0);
         n.set_right(0);
+        if aoff {
+            n.set_max(size);
+        }
         let span = self.span_of(node).ok_or(AllocError::Corrupt)?;
-        let block_node = !(is_aoff(self.strategy) && !span.sbc && node == span.start + MBC_HEADER);
-        let bestfit = self.strategy == Strategy::BestFit && block_node;
+        let block_node = !(aoff && !span.sbc && node == span.start + MBC_HEADER);
+        let bestfit = block_node && matches!(self.strategy, Strategy::BestFit | Strategy::AoffCbf);
         if bestfit {
-            n.raw.set_word(BF_NEXT_WORD, 0);
+            n.set_next(0);
         }
         let mut parent = 0;
         let mut parent_node = None;
@@ -2559,14 +2616,17 @@ impl AllocUtil {
             let cn = self.tn(current)?;
             parent_node = Some(cn);
             let current_size = cn.size();
+            if aoff && cn.max() < size {
+                cn.set_max(size);
+            }
             if bestfit && size == current_size {
-                let head_next = cn.raw.word(BF_NEXT_WORD);
+                let head_next = cn.next();
                 n.set_parent(current);
-                n.raw.set_word(BF_NEXT_WORD, head_next);
+                n.set_next(head_next);
                 if head_next != 0 {
                     self.tn(head_next)?.set_parent(node);
                 }
-                cn.raw.set_word(BF_NEXT_WORD, node);
+                cn.set_next(node);
                 return Ok(());
             }
             go_left = self.free_tree_goes_left(!block_node, node, current, size, current_size);
@@ -2577,9 +2637,6 @@ impl AllocUtil {
         let Some(pn) = parent_node else {
             self.set_tree_root(node, node)?;
             n.set_flags(TREE_NODE);
-            if is_aoff(self.strategy) {
-                self.update_node_max(node)?;
-            }
             return Ok(());
         };
         if go_left {
@@ -2587,11 +2644,7 @@ impl AllocUtil {
         } else {
             pn.set_right(node);
         }
-        self.insert_fixup(node)?;
-        if is_aoff(self.strategy) {
-            self.update_max_to_root(node)?;
-        }
-        Ok(())
+        self.insert_fixup(node)
     }
 
     fn free_tree_goes_left(
@@ -2602,16 +2655,11 @@ impl AllocUtil {
         lhs_size: usize,
         rhs_size: usize,
     ) -> bool {
-        // Both nodes live in the same tree, so lhs decides whether this is the carrier tree.
-        if carrier_tree {
-            if self.strategy == Strategy::AoffCbf {
-                (lhs_size, lhs) < (rhs_size, rhs)
-            } else {
-                lhs < rhs
-            }
-        } else if self.strategy == Strategy::AoffCaobf {
-            (lhs_size, lhs) < (rhs_size, rhs)
-        } else if is_aoff(self.strategy) {
+        // Port of cmp_blocks, erl_ao_firstfit_alloc.c, OTP-29.1.1. Both nodes live in the same tree,
+        // so lhs decides whether this is the carrier tree. Carriers sort by address; block trees
+        // sort by address (aoff), by size then address (aoffcaobf), or by size alone (aoffcbf,
+        // equal sizes share a list, so a tie never gets here).
+        if carrier_tree || self.strategy == Strategy::Aoff {
             lhs < rhs
         } else {
             (lhs_size, lhs) < (rhs_size, rhs)
@@ -2723,30 +2771,31 @@ impl AllocUtil {
             return Ok(());
         }
         let nn = self.tn(node)?;
-        if self.strategy == Strategy::BestFit && nn.flags() & TREE_NODE == 0 {
-            let prev = nn.parent();
-            let next = nn.raw.word(BF_NEXT_WORD);
-            if prev == 0 {
-                return Err(AllocError::Corrupt);
+        if matches!(self.strategy, Strategy::BestFit | Strategy::AoffCbf) {
+            if nn.flags() & TREE_NODE == 0 {
+                let prev = nn.parent();
+                let next = nn.raw.word(BF_NEXT_WORD);
+                if prev == 0 {
+                    return Err(AllocError::Corrupt);
+                }
+                self.tn(prev)?.raw.set_word(BF_NEXT_WORD, next);
+                if next != 0 {
+                    self.tn(next)?.set_parent(prev);
+                }
+                return Ok(());
             }
-            self.tn(prev)?.raw.set_word(BF_NEXT_WORD, next);
-            if next != 0 {
-                self.tn(next)?.set_parent(prev);
-            }
-            return Ok(());
-        }
-        if self.strategy == Strategy::BestFit {
             let next = nn.raw.word(BF_NEXT_WORD);
             if next != 0 {
                 self.replace_tree_node(node, next)?;
                 return Ok(());
             }
         }
+        let carrier = self.node_carrier(node)?;
         self.delete_tree_node(node)?;
         if is_aoff(self.strategy)
-            && let Some(carrier) = self.node_carrier(node)?
+            && let Some(carrier) = carrier
         {
-            self.update_aoff_carrier_node(carrier)?;
+            self.aoff_lower_carrier_max(carrier)?;
         }
         Ok(())
     }
@@ -2829,43 +2878,57 @@ impl AllocUtil {
         self.rotated_max(x, y)
     }
 
-    /// Port of the max_sz upkeep in lrotate/rrotate, erl_ao_firstfit_alloc.c:700-760, OTP-29.1.1:
-    /// after a rotation the lower node is recomputed first, then the one above it.
+    /// Port of the max_sz upkeep in left_rotate/right_rotate, erl_ao_firstfit_alloc.c, OTP-29.1.1:
+    /// the upper node takes the old max of the lower one, only the lower node is recomputed.
     #[inline]
     fn rotated_max(&mut self, lower: usize, upper: usize) -> Result<(), AllocError> {
         if is_aoff(self.strategy) {
-            self.update_node_max(lower)?;
-            self.update_node_max(upper)?;
+            let ln = self.tn(lower)?;
+            self.tn(upper)?.set_max(ln.max());
+            self.set_max_of(ln)?;
         }
         Ok(())
     }
 
-    /// `max(own size, children's max)` of one aoff tree node.
+    /// Port of node_max_size, erl_ao_firstfit_alloc.c, OTP-29.1.1.
     #[inline(always)]
-    fn update_node_max(&mut self, node: usize) -> Result<(), AllocError> {
-        let n = self.tn(node)?;
-        self.set_max_of(n)
-    }
-
-    #[inline(always)]
-    fn set_max_of(&self, n: TNode) -> Result<(), AllocError> {
+    fn node_max_size(&self, n: TNode) -> Result<usize, AllocError> {
         let mut largest = n.size();
         for child in [n.left(), n.right()] {
             if child != 0 {
                 largest = largest.max(self.tn(child)?.max());
             }
         }
-        n.set_max(largest);
+        Ok(largest)
+    }
+
+    #[inline(always)]
+    fn set_max_of(&self, n: TNode) -> Result<(), AllocError> {
+        n.set_max(self.node_max_size(n)?);
         Ok(())
     }
 
-    /// Refreshes `max_sz` on `node` and every ancestor (the `update_max` walk of rbt_insert and
-    /// rbt_delete in erl_ao_firstfit_alloc.c, OTP-29.1.1).
-    fn update_max_to_root(&mut self, mut node: usize) -> Result<(), AllocError> {
-        while node != 0 {
-            let n = self.tn(node)?;
-            self.set_max_of(n)?;
-            node = n.parent();
+    /// Port of lower_max_size, erl_ao_firstfit_alloc.c, OTP-29.1.1: recomputes the possibly lower
+    /// `max_sz` of `node` and propagates toward the root until an ancestor no longer carried the
+    /// old value, or `stop_at` is reached (0 for the root).
+    fn lower_max_size(&mut self, node: usize, stop_at: usize) -> Result<(), AllocError> {
+        let mut x = self.tn(node)?;
+        let old_max = x.max();
+        let new_max = self.node_max_size(x)?;
+        if new_max < old_max {
+            x.set_max(new_max);
+            loop {
+                let parent = x.parent();
+                if parent == stop_at {
+                    break;
+                }
+                x = self.tn(parent)?;
+                if x.max() != old_max {
+                    break;
+                }
+                let value = self.node_max_size(x)?;
+                x.set_max(value);
+            }
         }
         Ok(())
     }
@@ -2919,29 +2982,38 @@ impl AllocUtil {
         self.set_red(root, false)
     }
 
+    /// Port of replace, erl_ao_firstfit_alloc.c, and the BF list-head replacement of
+    /// erl_bestfit_alloc.c, OTP-29.1.1: `new` takes over every link, the color and the max of `old`.
     fn replace_tree_node(&mut self, old: usize, new: usize) -> Result<(), AllocError> {
-        let parent = self.tn(old)?.parent();
-        let left = self.tn(old)?.left();
-        let right = self.tn(old)?.right();
-        let flags = self.tn(old)?.flags();
+        let on = self.tn(old)?;
+        let nn = self.tn(new)?;
+        let parent = on.parent();
+        let left = on.left();
+        let right = on.right();
         if parent == 0 {
             self.set_tree_root(old, new)?;
-        } else if self.tn(parent)?.left() == old {
-            self.tn(parent)?.set_left(new);
         } else {
-            self.tn(parent)?.set_right(new);
+            let pn = self.tn(parent)?;
+            if pn.left() == old {
+                pn.set_left(new);
+            } else {
+                pn.set_right(new);
+            }
         }
-        self.tn(new)?.set_flags(flags);
-        self.tn(new)?.set_parent(parent);
-        self.tn(new)?.set_left(left);
-        self.tn(new)?.set_right(right);
+        nn.set_flags(on.flags());
+        if nn.aoff {
+            nn.set_max(on.max());
+        }
+        nn.set_parent(parent);
+        nn.set_left(left);
+        nn.set_right(right);
         if left != 0 {
             self.tn(left)?.set_parent(new);
         }
         if right != 0 {
             self.tn(right)?.set_parent(new);
         }
-        let next = self.node_word(new, BF_NEXT_WORD)?;
+        let next = nn.next();
         if next != 0 {
             self.tn(next)?.set_parent(new);
         }
@@ -2977,7 +3049,10 @@ impl AllocUtil {
         }
     }
 
+    /// Port of rbt_delete, erl_ao_firstfit_alloc.c, OTP-29.1.1. The aoff `max_sz` is lowered right
+    /// after the splice, where each walk stops as soon as an ancestor keeps its value.
     fn delete_tree_node(&mut self, node: usize) -> Result<(), AllocError> {
+        let aoff = is_aoff(self.strategy);
         let block_carrier = self.node_carrier(node)?;
         let carrier_node = block_carrier.is_none();
         let carrier = block_carrier.unwrap_or(0);
@@ -2990,10 +3065,16 @@ impl AllocUtil {
             child = right;
             child_parent = nn.parent();
             self.transplant(node, right)?;
+            if aoff && child_parent != 0 {
+                self.lower_max_size(child_parent, 0)?;
+            }
         } else if right == 0 {
             child = left;
             child_parent = nn.parent();
             self.transplant(node, left)?;
+            if aoff && child_parent != 0 {
+                self.lower_max_size(child_parent, 0)?;
+            }
         } else {
             let replacement = self.minimum_node(right)?;
             let rn = self.tn(replacement)?;
@@ -3010,6 +3091,9 @@ impl AllocUtil {
                 child = successor_right;
                 child_parent = successor_parent;
                 self.transplant(replacement, successor_right)?;
+                if aoff {
+                    self.lower_max_size(successor_parent, node)?;
+                }
                 rn.set_right(right);
                 self.tn(right)?.set_parent(replacement);
             }
@@ -3018,6 +3102,10 @@ impl AllocUtil {
             self.tn(left)?.set_parent(replacement);
             let red = nn.is_red();
             rn.set_flags((nn.flags() | TREE_NODE) & !RED | if red { RED } else { 0 });
+            if aoff {
+                rn.set_max(nn.max());
+                self.lower_max_size(replacement, 0)?;
+            }
         }
         if !replacement_was_red {
             self.delete_fixup(child, child_parent, carrier, carrier_node)?;
@@ -3026,11 +3114,6 @@ impl AllocUtil {
         nn.set_parent(0);
         nn.set_left(0);
         nn.set_right(0);
-        if is_aoff(self.strategy) {
-            // Rotations keep their own nodes exact; every node whose subtree lost the block is an
-            // ancestor of the spot it left, which stays an ancestor through the rebalancing.
-            self.update_max_to_root(child_parent)?;
-        }
         Ok(())
     }
 
@@ -3153,12 +3236,10 @@ impl AllocUtil {
             {
                 return Err(AllocError::Corrupt);
             }
-            let key = if allocator.strategy == Strategy::AoffCaobf {
-                (block.size, node)
-            } else if is_aoff(allocator.strategy) {
-                (0, node)
-            } else {
-                (block.size, node)
+            let key = match allocator.strategy {
+                Strategy::Aoff => (0, node),
+                Strategy::AoffCbf => (block.size, 0),
+                _ => (block.size, node),
             };
             if lower.is_some_and(|bound| key <= bound) || upper.is_some_and(|bound| key >= bound) {
                 return Err(AllocError::Corrupt);
@@ -3169,7 +3250,7 @@ impl AllocUtil {
             if red && (allocator.is_red(left)? || allocator.is_red(right)?) {
                 return Err(AllocError::Corrupt);
             }
-            if allocator.strategy == Strategy::BestFit {
+            if matches!(allocator.strategy, Strategy::BestFit | Strategy::AoffCbf) {
                 let mut list = allocator.node_word(node, BF_NEXT_WORD)?;
                 let mut previous = node;
                 while list != 0 {
@@ -3247,6 +3328,9 @@ impl AllocUtil {
 
     /// Destroys a carrier whose only block was just freed and never linked into a free index.
     fn remove_carrier(&mut self, ci: usize) -> Result<(), AllocError> {
+        if is_aoff(self.strategy) {
+            self.aoff_remove_carrier_node(ci)?;
+        }
         if let Some(c) = self.vacate_carrier(ci) {
             self.carrier_removed(c.sbc, c.mseg, c.size);
             self.stats.carriers -= 1;
@@ -3418,8 +3502,10 @@ impl std::fmt::Display for AllocError {
 }
 impl std::error::Error for AllocError {}
 
+/// Port of the `min_block_size` setup in erts_alcu_start, erl_alloc_util.c, OTP-29.1.1: the node
+/// struct plus the free block footer, rounded to the unit. The aoff node carries the list word.
 fn min_block_size(strategy: Strategy) -> usize {
-    let node_size = if strategy == Strategy::BestFit {
+    let node_size = if strategy == Strategy::BestFit || is_aoff(strategy) {
         BF_NODE_SIZE
     } else {
         RB_NODE_SIZE
@@ -3844,6 +3930,114 @@ mod tests {
             (d.acful, d.acul, d.acnl, d.acfml, d.cpool),
             (0, 0, 0, 0, None)
         );
+    }
+
+    fn tree_writes_per_equal_size_pair(
+        strategy: Strategy,
+        free_blocks: usize,
+        pairs: usize,
+    ) -> f64 {
+        let mut allocator = AllocUtil::new(
+            strategy,
+            AllocUtilOptions {
+                sbct: 1 << 20,
+                smbcs: 8 << 20,
+                mmbcs: 8 << 20,
+                lmbcs: 8 << 20,
+                ..Default::default()
+            },
+        );
+        let mut live = Vec::new();
+        for index in 0..free_blocks * 2 {
+            let size = 64 + (index % 7) * 16;
+            live.push(allocator.alloc(size).unwrap());
+        }
+        for (index, allocation) in live.iter().enumerate() {
+            if index % 2 == 1 {
+                allocator.free(*allocation).unwrap();
+            }
+        }
+        let size = 64 + 16;
+        let warm = allocator.alloc(size).unwrap();
+        allocator.free(warm).unwrap();
+        allocator.validate().unwrap();
+        let before = crate::raw::NODE_WRITES.with(|writes| writes.get());
+        for _ in 0..pairs {
+            let allocation = allocator.alloc(size).unwrap();
+            allocator.free(allocation).unwrap();
+        }
+        let after = crate::raw::NODE_WRITES.with(|writes| writes.get());
+        allocator.validate().unwrap();
+        (after - before) as f64 / pairs as f64
+    }
+
+    #[test]
+    fn equal_size_pairs_cost_constant_tree_writes() {
+        let small = tree_writes_per_equal_size_pair(Strategy::AoffCbf, 64, 1000);
+        let large = tree_writes_per_equal_size_pair(Strategy::AoffCbf, 4096, 1000);
+        assert!(small <= 24.0, "{small}");
+        assert!(large <= small, "{small} vs {large}");
+    }
+
+    #[test]
+    fn aoff_block_orders_follow_the_strategy() {
+        for (strategy, best_fit_block) in [
+            (Strategy::Aoff, false),
+            (Strategy::AoffCbf, true),
+            (Strategy::AoffCaobf, true),
+        ] {
+            let mut allocator = AllocUtil::new(strategy, AllocUtilOptions::default());
+            let large = allocator.alloc(200).unwrap();
+            let _fence_a = allocator.alloc(32).unwrap();
+            let small = allocator.alloc(100).unwrap();
+            let _fence_b = allocator.alloc(32).unwrap();
+            allocator.free(large).unwrap();
+            allocator.free(small).unwrap();
+            let picked = allocator.alloc(90).unwrap();
+            let expected = if best_fit_block { small } else { large };
+            assert_eq!(picked.id, expected.id, "{strategy:?}");
+            allocator.validate().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "timing: cargo test --release -p arinsal-alloc fragment_cycle_bench -- --ignored --nocapture"]
+    fn fragment_cycle_bench() {
+        for strategy in [Strategy::AoffCbf, Strategy::Aoff] {
+            let mut allocator = AllocUtil::new(strategy, AllocUtilOptions::default());
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let background: Vec<Allocation> = (0..2000)
+                .map(|_| allocator.alloc(16 + (next() % 20) as usize * 16).unwrap())
+                .collect();
+            for allocation in background.iter().step_by(2) {
+                allocator.free(*allocation).unwrap();
+            }
+            let cycles: usize = std::env::var("FRAG_CYCLES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20_000);
+            let mut fragments = Vec::with_capacity(32);
+            let started = std::time::Instant::now();
+            for _ in 0..cycles {
+                for _ in 0..26 {
+                    fragments.push(allocator.alloc(8 + (next() % 12) as usize * 8).unwrap());
+                }
+                for allocation in fragments.drain(..) {
+                    allocator.free(allocation).unwrap();
+                }
+            }
+            let nanos = started.elapsed().as_nanos() as f64;
+            eprintln!(
+                "{strategy:?}: {:.1} ns per alloc+free pair",
+                nanos / (cycles as f64 * 26.0)
+            );
+        }
     }
 
     proptest! {
