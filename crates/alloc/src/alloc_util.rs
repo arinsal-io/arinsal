@@ -869,10 +869,10 @@ impl AllocUtil {
         self.dyn_sbct.load(Ordering::Relaxed)
     }
 
-    /// Bytes in allocated blocks and in carriers, for the registry's lock-free mirror.
+    /// Bytes in allocated blocks, for the registry's lock-free mirror.
     #[inline(always)]
-    pub(crate) fn size_counters(&self) -> (usize, usize) {
-        (self.stats.blocks_size, self.stats.carriers_size)
+    pub(crate) fn blocks_size(&self) -> usize {
+        self.stats.blocks_size
     }
 
     /// Allocates a payload of `size` bytes.
@@ -1014,7 +1014,7 @@ impl AllocUtil {
     /// Returns the stable payload address while `allocation` remains allocated.
     pub fn allocation_ptr(&self, allocation: Allocation) -> Result<*mut u64, AllocError> {
         self.live_block(allocation.id as usize)?;
-        self.payload_ptr(allocation)
+        Ok(self.payload_address(allocation))
     }
 
     /// Returns an exclusive byte view of the requested payload while this allocator is borrowed.
@@ -1043,12 +1043,14 @@ impl AllocUtil {
             .ok_or(AllocError::Corrupt)
     }
 
-    /// Payload address of an allocation this instance just returned (no liveness check).
-    #[inline]
-    pub(crate) fn payload_ptr(&self, allocation: Allocation) -> Result<*mut u64, AllocError> {
+    /// Payload address of an allocation this instance returned and has not freed.
+    ///
+    /// Port of `BLK2UMEM`, erl_alloc_util.h, OTP-29.1.1: the payload follows the block header.
+    #[inline(always)]
+    pub(crate) fn payload_address(&self, allocation: Allocation) -> *mut u64 {
         let key = allocation.id as usize;
-        self.span_of(key).ok_or(AllocError::Corrupt)?;
-        Ok((key + BLOCK_HEADER) as *mut u64)
+        debug_assert!(self.span_of(key).is_some());
+        (key + BLOCK_HEADER) as *mut u64
     }
 
     /// Carrier index containing the address `key`.

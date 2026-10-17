@@ -7,57 +7,90 @@ use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 /// An ERTS allocation type name from `erl_alloc.types`.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ErtsAlcType(&'static str, u8);
+///
+/// One byte indexing the name and allocator tables below, like the `ERTS_ALC_T_*` numbers of erts,
+/// so a block that records its type stays one word.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct ErtsAlcType(u8);
+
+impl std::fmt::Debug for ErtsAlcType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ErtsAlcType").field(&self.name()).finish()
+    }
+}
+
+/// Name and serving allocator (index in `ALLOCATOR_NAMES`, mapped like erl_alloc.types) of each
+/// type, indexed by the type number.
+const ALC_TYPES: [(&str, u8); 19] = [
+    ("HEAP", 4),
+    ("OLD_HEAP", 4),
+    ("HEAP_FRAG", 4),
+    ("BINARY", 8),
+    ("DB_TABLE", 5),
+    ("DB_TERM", 5),
+    ("DB_SEG", 5),
+    ("DB_STK", 5),
+    ("MSG_REF", 6),
+    ("MSG", 4),
+    ("PORT", 9),
+    ("DRV", 9),
+    ("DRIVER", 9),
+    ("DRV_BINARY", 8),
+    ("MODULE", 3),
+    ("ATOM", 3),
+    ("ATOM_TXT", 3),
+    ("FUN_ENTRY", 3),
+    ("TMP", 0),
+];
 
 impl ErtsAlcType {
     /// Process young heap (`ERTS_ALC_T_HEAP`).
-    pub const HEAP: Self = Self("HEAP", 4);
+    pub const HEAP: Self = Self(0);
     /// Process old heap (`ERTS_ALC_T_OLD_HEAP`).
-    pub const OLD_HEAP: Self = Self("OLD_HEAP", 4);
+    pub const OLD_HEAP: Self = Self(1);
     /// Heap fragments (`ERTS_ALC_T_HEAP_FRAG`).
-    pub const HEAP_FRAG: Self = Self("HEAP_FRAG", 4);
+    pub const HEAP_FRAG: Self = Self(2);
     /// Reference counted binaries (`ERTS_ALC_T_BINARY`).
-    pub const BINARY: Self = Self("BINARY", 8);
+    pub const BINARY: Self = Self(3);
     /// ETS table descriptors (`ERTS_ALC_T_DB_TABLE`).
-    pub const DB_TABLE: Self = Self("DB_TABLE", 5);
+    pub const DB_TABLE: Self = Self(4);
     /// ETS stored terms (`ERTS_ALC_T_DB_TERM`).
-    pub const DB_TERM: Self = Self("DB_TERM", 5);
+    pub const DB_TERM: Self = Self(5);
     /// ETS segments (`ERTS_ALC_T_DB_SEG`).
-    pub const DB_SEG: Self = Self("DB_SEG", 5);
+    pub const DB_SEG: Self = Self(6);
     /// ETS stacks (`ERTS_ALC_T_DB_STK`).
-    pub const DB_STK: Self = Self("DB_STK", 5);
+    pub const DB_STK: Self = Self(7);
     /// Message queue references (`ERTS_ALC_T_MSG_REF`).
-    pub const MSG_REF: Self = Self("MSG_REF", 6);
+    pub const MSG_REF: Self = Self(8);
     /// Message payloads (`ERTS_ALC_T_MSG`).
-    pub const MSG: Self = Self("MSG", 4);
+    pub const MSG: Self = Self(9);
     /// Port records (`ERTS_ALC_T_PORT`).
-    pub const PORT: Self = Self("PORT", 9);
+    pub const PORT: Self = Self(10);
     /// Driver-owned allocations (`ERTS_ALC_T_DRV`).
-    pub const DRV: Self = Self("DRV", 9);
+    pub const DRV: Self = Self(11);
     /// Driver instances (`ERTS_ALC_T_DRIVER`).
-    pub const DRIVER: Self = Self("DRIVER", 9);
+    pub const DRIVER: Self = Self(12);
     /// Driver binary payloads (`ERTS_ALC_T_DRV_BINARY`).
-    pub const DRV_BINARY: Self = Self("DRV_BINARY", 8);
+    pub const DRV_BINARY: Self = Self(13);
     /// Loaded module entries (`ERTS_ALC_T_MODULE`).
-    pub const MODULE: Self = Self("MODULE", 3);
+    pub const MODULE: Self = Self(14);
     /// Atom entries (`ERTS_ALC_T_ATOM`).
-    pub const ATOM: Self = Self("ATOM", 3);
+    pub const ATOM: Self = Self(15);
     /// Atom text (`ERTS_ALC_T_ATOM_TXT`).
-    pub const ATOM_TXT: Self = Self("ATOM_TXT", 3);
+    pub const ATOM_TXT: Self = Self(16);
     /// Function entries (`ERTS_ALC_T_FUN_ENTRY`).
-    pub const FUN_ENTRY: Self = Self("FUN_ENTRY", 3);
+    pub const FUN_ENTRY: Self = Self(17);
     /// Short-lived scratch (`ERTS_ALC_T_TMP`), the temporary allocator.
-    pub const TMP: Self = Self("TMP", 0);
+    pub const TMP: Self = Self(18);
 
     /// Name generated from `erl_alloc.types`.
     pub const fn name(self) -> &'static str {
-        self.0
+        ALC_TYPES[self.0 as usize].0
     }
 
     /// Index of the allocator serving this type in `ALLOCATOR_NAMES`, mapped like erl_alloc.types.
     const fn allocator(self) -> usize {
-        self.1 as usize
+        ALC_TYPES[self.0 as usize].1 as usize
     }
 }
 
