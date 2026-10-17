@@ -49,8 +49,7 @@ impl BeamModuleAssembler {
         tail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), ModuleError> {
-        let head_reg = self.source_reg_into(head, SCRATCH[0])?;
-        let tail_reg = self.source_reg_into(tail, SCRATCH[1])?;
+        let (head_reg, tail_reg) = self.load_two_sources(head, SCRATCH[0], tail, SCRATCH[1])?;
         let dst = self.pair_destination(dst, SCRATCH[2])?;
         self.preserve_cache(&[], |this| {
             this.code.emit(|e| {
@@ -62,49 +61,124 @@ impl BeamModuleAssembler {
         self.flush_var(dst)
     }
 
+    /// `put_list` fused with a deallocation: the Y0 operand is read with a post-index `ldr` that
+    /// also pops the frame.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:723-773 (emit_put_list_deallocate),
+    // OTP-29.1.1.
+    pub fn emit_put_list_deallocate(
+        &mut self,
+        head: ArgVal,
+        tail: ArgVal,
+        dst: ArgVal,
+        words: u32,
+    ) -> Result<(), ModuleError> {
+        let mut dealloc = i64::from(words) * 8;
+        let dst = self.pair_destination(dst, SCRATCH[2])?;
+        let fits = dealloc > 0 && dealloc < 256;
+        let mut regs = None;
+        if fits && let (ArgVal::Y(0), false) = (head, matches!(tail, ArgVal::Y(_))) {
+            self.code
+                .emit(|e| e.ldr_post(SCRATCH[0], E, dealloc as i16))?;
+            let tail_reg = self.source_reg_into(tail, SCRATCH[1])?;
+            regs = Some((SCRATCH[0], tail_reg));
+            dealloc = 0;
+        } else if fits && let (false, ArgVal::Y(0)) = (matches!(head, ArgVal::Y(_)), tail) {
+            self.code
+                .emit(|e| e.ldr_post(SCRATCH[1], E, dealloc as i16))?;
+            let head_reg = self.source_reg_into(head, SCRATCH[0])?;
+            regs = Some((head_reg, SCRATCH[1]));
+            dealloc = 0;
+        }
+        let (head_reg, tail_reg) = match regs {
+            Some(regs) => regs,
+            None => self.load_two_sources(head, SCRATCH[0], tail, SCRATCH[1])?,
+        };
+        self.code.emit(|e| {
+            e.stp_post(head_reg, tail_reg, HTOP, 16)?;
+            e.sub_imm(dst.reg, HTOP, 15, false)
+        })?;
+        self.flush_var(dst)?;
+        if dealloc > 0 {
+            self.deallocate(words)?;
+        }
+        Ok(())
+    }
+
+    /// Builds two cons cells at once, the second one with the first as its tail.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:775-792 (emit_put_list2), OTP-29.1.1.
+    pub fn emit_put_list2(
+        &mut self,
+        head1: ArgVal,
+        head2: ArgVal,
+        tail: ArgVal,
+        dst: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let (hd1, hd2) = self.load_two_sources(head1, SCRATCH[0], head2, SCRATCH[1])?;
+        let tl = self.source_reg_into(tail, SCRATCH[2])?;
+        let dst = self.pair_destination(dst, SCRATCH[3])?;
+        self.code.emit(|e| {
+            e.stp_post(hd1, tl, HTOP, 16)?;
+            e.sub_imm(dst.reg, HTOP, 15, false)?;
+            e.stp_post(hd2, dst.reg, HTOP, 16)?;
+            e.sub_imm(dst.reg, HTOP, 15, false)
+        })?;
+        self.flush_var(dst)
+    }
+
     /// Builds a tuple whose elements are supplied in source order.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:794-872, OTP-29.1.1
     pub fn emit_put_tuple2(&mut self, dst: ArgVal, elements: &[ArgVal]) -> Result<(), ModuleError> {
         let arity = u64::try_from(elements.len())
             .map_err(|_| ModuleError::InvalidOperand("tuple arity overflow"))?;
-        // The arity header is the first word of the object and is paired with the
-        // following element, as erts does (instr_common.cpp:794-842).
-        let mut words = Vec::with_capacity(elements.len() + 1);
-        words.push(ArgVal::Immediate(arity << 6));
-        words.extend_from_slice(elements);
+        let mut data = Vec::with_capacity(elements.len() + 1);
+        data.push(ArgVal::Immediate(arity << 6));
+        data.extend_from_slice(elements);
+        let size = data.len();
+        let mut value: Option<ArgVal> = None;
         let mut index = 0;
-        while index + 1 < words.len() {
-            let first = self.source_reg(words[index])?;
-            let second_scratch = if first == Gpr::x(17) {
-                SCRATCH[3]
+        while index + 1 < size {
+            if index % 128 == 0 {
+                self.check_pending_stubs()?;
+            }
+            let (first, second) = (data[index], data[index + 1]);
+            let is_register =
+                |arg: ArgVal| matches!(arg, ArgVal::X(_) | ArgVal::XMemory(_) | ArgVal::Y(_));
+            let (left, right) = if !is_register(first) && first == second {
+                if value != Some(first) {
+                    value = Some(first);
+                    self.mov_arg_to_reg(SCRATCH[0], first)?;
+                }
+                (SCRATCH[0], SCRATCH[0])
+            } else if value == Some(first) {
+                let second = self.source_reg_into(second, SCRATCH[2])?;
+                (SCRATCH[0], second)
+            } else if value == Some(second) {
+                let first = self.source_reg_into(first, SCRATCH[1])?;
+                (first, SCRATCH[0])
             } else {
-                Gpr::x(17)
+                self.load_two_sources(first, SCRATCH[1], second, SCRATCH[2])?
             };
-            let second = self.source_reg_into(words[index + 1], second_scratch)?;
-            self.code.emit(|e| e.stp_post(first, second, HTOP, 16))?;
+            self.code.emit(|e| e.stp_post(left, right, HTOP, 16))?;
             index += 2;
         }
-        if index < words.len() {
-            let last = self.source_reg(words[index])?;
-            self.code.emit(|e| e.str_post(last, HTOP, 8))?;
+        if index < size {
+            if value == Some(data[index]) {
+                self.code.emit(|e| e.str_post(SCRATCH[0], HTOP, 8))?;
+            } else {
+                let last = self.source_reg_into(data[index], Gpr::x(17))?;
+                self.code.emit(|e| e.str_post(last, HTOP, 8))?;
+            }
         }
-        let bytes = words
-            .len()
+        let bytes = size
             .checked_mul(8)
             .ok_or(ModuleError::InvalidOperand("tuple allocation overflow"))?;
         let tag_offset = u64::try_from(bytes)
             .ok()
             .and_then(|bytes| bytes.checked_sub(TAG_BOXED))
             .ok_or(ModuleError::InvalidOperand("tuple allocation overflow"))?;
-        let (dst_reg, store) = match dst {
-            ArgVal::X(index) if index < 6 => (XREGS[index as usize], false),
-            _ => (SCRATCH[4], true),
-        };
-        self.emit_pointer_offset(dst_reg, HTOP, tag_offset, true)?;
-        if store {
-            self.store_arg(dst, dst_reg)?;
-        }
-        Ok(())
+        let ptr = self.pair_destination(dst, SCRATCH[0])?;
+        self.emit_pointer_offset(ptr.reg, HTOP, tag_offset, true)?;
+        self.flush_var(ptr)
     }
 
     /// Loads a list head and tail, matching OTP's identical-destination rule.
@@ -153,21 +227,23 @@ impl BeamModuleAssembler {
         dst: ArgVal,
         offset: i16,
     ) -> Result<(), ModuleError> {
-        let list = self.source_reg(src)?;
-        let out = self.destination_reg(dst)?;
-        self.code.emit(|e| e.ldur(out, list, offset))?;
-        self.store_arg(dst, out)
+        let list = self.load_source_any(src, SCRATCH[0], &[])?;
+        let out = self.pair_destination(dst, SCRATCH[1])?;
+        self.code.emit(|e| e.ldur(out.reg, list, offset))?;
+        self.flush_var(out)
     }
 
     /// Loads an untagged tuple data pointer into ARG1 without clobbering `src`.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:351-355, OTP-29.1.1
     pub fn emit_load_tuple_ptr(&mut self, src: ArgVal, _dst: ArgVal) -> Result<(), ModuleError> {
-        let tuple = self.source_reg(src)?;
+        let tuple = self.load_source_any(src, SCRATCH[0], &[])?;
         // OTP stores the untagged pointer in ARG1 (x0) and keeps the tagged term
         // in the source register. Overwriting X with an untagged pointer corrupts
         // later term uses (e.g. returning State after `inet_exit_port/3`).
-        self.code.emit(|e| e.and_imm(Gpr::x(0), tuple, !7))?;
-        Ok(())
+        self.preserve_cache(&[Gpr::x(0)], |this| {
+            this.code.emit(|e| e.and_imm(Gpr::x(0), tuple, !7))?;
+            Ok(())
+        })
     }
 
     /// Loads a tuple word at its byte offset from the tuple header.

@@ -257,3 +257,100 @@ fn move_call_last_from_y0_loads_with_post_index() {
 fn move_call_last_in_the_general_case_moves_then_deallocates() {
     tail_call_through_frame(4, 1, 16);
 }
+
+#[test]
+fn move_trim_from_y0_is_one_post_index_load() {
+    let size = Cell::new(0);
+    let (regs, _, _) = run(
+        |m| {
+            m.move_(ArgVal::X(0), ArgVal::Y(0)).unwrap();
+            m.move_(ArgVal::X(1), ArgVal::Y(1)).unwrap();
+            size.set(emitted_bytes(m, |m| {
+                m.move_trim(ArgVal::Y(0), ArgVal::X(2), 1).unwrap();
+            }));
+            m.move_(ArgVal::Y(0), ArgVal::X(3)).unwrap();
+        },
+        |_, regs| {
+            regs.x_reg_array[0] = rt::fixture_term(fixture(0x31));
+            regs.x_reg_array[1] = rt::fixture_term(fixture(0x32));
+        },
+    );
+    assert_eq!(size.get(), 4);
+    assert_eq!((regs[2], regs[3]), (0x31, 0x32));
+}
+
+#[test]
+fn move_two_trim_from_y0_is_one_post_index_pair_load() {
+    let size = Cell::new(0);
+    let (regs, _, _) = run(
+        |m| {
+            m.move_(ArgVal::X(0), ArgVal::Y(0)).unwrap();
+            m.move_(ArgVal::X(1), ArgVal::Y(1)).unwrap();
+            size.set(emitted_bytes(m, |m| {
+                m.move_two_trim(0, ArgVal::X(2), 1, ArgVal::X(3), 2)
+                    .unwrap();
+            }));
+        },
+        |_, regs| {
+            regs.x_reg_array[0] = rt::fixture_term(fixture(0x41));
+            regs.x_reg_array[1] = rt::fixture_term(fixture(0x42));
+        },
+    );
+    assert_eq!(size.get(), 4);
+    assert_eq!((regs[2], regs[3]), (0x41, 0x42));
+}
+
+#[test]
+fn move_trim_into_the_first_surviving_slot_is_one_pre_index_store() {
+    let size = Cell::new(0);
+    let (regs, _, _) = run(
+        |m| {
+            m.move_(ArgVal::X(0), ArgVal::Y(1)).unwrap();
+            size.set(emitted_bytes(m, |m| {
+                m.move_trim(ArgVal::X(1), ArgVal::Y(1), 1).unwrap();
+            }));
+            m.move_(ArgVal::Y(0), ArgVal::X(2)).unwrap();
+        },
+        |_, regs| {
+            regs.x_reg_array[0] = rt::fixture_term(fixture(0x51));
+            regs.x_reg_array[1] = rt::fixture_term(fixture(0x52));
+        },
+    );
+    assert_eq!(size.get(), 4);
+    assert_eq!(regs[2], 0x52);
+}
+
+#[test]
+fn init_yregs_of_four_slots_is_one_vector_pair_store() {
+    let size = Cell::new(0);
+    let (_, area, _) = run(
+        |m| {
+            size.set(emitted_bytes(m, |m| {
+                m.init_yregs(0, 4).unwrap();
+            }));
+        },
+        |area, _| area[32..36].fill(0x77),
+    );
+    assert_eq!(size.get(), 8);
+    assert_eq!(&area[32..36], &[u64::MAX; 4]);
+}
+
+#[test]
+fn put_list_deallocate_reads_y0_with_a_post_index_load() {
+    let size = Cell::new(0);
+    let (_, area, _) = run(
+        |m| {
+            m.move_(ArgVal::X(0), ArgVal::Y(0)).unwrap();
+            size.set(emitted_bytes(m, |m| {
+                m.emit_put_list_deallocate(ArgVal::Y(0), ArgVal::X(1), ArgVal::X(2), 1)
+                    .unwrap();
+            }));
+        },
+        |_, regs| {
+            regs.x_reg_array[0] = rt::fixture_term(fixture(0x61));
+            regs.x_reg_array[1] = rt::fixture_term(fixture(0x62));
+        },
+    );
+    assert_eq!(size.get(), 12);
+    assert_eq!((area[0], area[1]), (0x61, 0x62));
+}

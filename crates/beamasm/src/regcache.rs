@@ -50,6 +50,21 @@ impl RegCache {
         }
     }
 
+    fn trim_yregs(&mut self, bytes: u32) {
+        self.entries.retain_mut(|(slot, _)| {
+            if slot.base != E {
+                return true;
+            }
+            match slot.offset.checked_sub(bytes) {
+                Some(offset) => {
+                    slot.offset = offset;
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
     fn put(&mut self, slot: Slot, reg: Gpr) {
         if slot.base != SCHEDULER_REGS && slot.base != E {
             return;
@@ -87,6 +102,23 @@ impl BeamModuleAssembler {
     // Port of beam_jit_register_cache.hpp:218-220 (update), OTP-29.1.1.
     pub(crate) fn cache_update(&mut self) {
         self.reg_cache.position = Some(self.cache_here());
+    }
+
+    /// Removes `words` from the top of the frame and renumbers the cached Y slots, keeping the
+    /// cache valid if it was valid before.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1052-1063 (trim_preserve_cache) and
+    // beam_jit_register_cache.hpp (trim_yregs), OTP-29.1.1.
+    pub(crate) fn trim_preserve_cache(&mut self, words: u32) -> Result<(), ModuleError> {
+        if words == 0 {
+            return Ok(());
+        }
+        let valid = self.cache_valid();
+        self.deallocate(words)?;
+        if valid {
+            self.reg_cache.trim_yregs(words * 8);
+            self.cache_update();
+        }
+        Ok(())
     }
 
     /// Forgets the entries that live in `reg`.
