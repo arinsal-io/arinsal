@@ -210,6 +210,7 @@ pub extern "C" fn arinsal_beamasm_recv_marker_reserve(header: *mut ProcessHeader
         .is_none_or(arinsal_sched::SignalProbe::has_pending);
     if pending {
         process.cold_mut().native_reserve_fetch = true;
+        process.native_exit_pending = true;
         return u64::from(arinsal_beamasm::receive::RECV_MARKER_FETCH);
     }
     match process.reserve_receive_marker() {
@@ -272,6 +273,7 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     if !process.sig_cont_empty() {
         process.delay_gc = false;
         process.cold_mut().native_signal_fetch = true;
+        process.native_exit_pending = true;
         return u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH);
     }
     let pending = process
@@ -313,6 +315,7 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
         return 0;
     }
     process.cold_mut().native_signal_fetch = true;
+    process.native_exit_pending = true;
     u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH)
 }
 
@@ -361,6 +364,7 @@ pub extern "C" fn arinsal_beamasm_wait(header: *mut ProcessHeader, resume: usize
         let timeout = cold.native_wait_timeout.take();
         cold.native_wait = Some(timeout);
         cold.native_wait_self = resume & 1 != 0;
+        process.native_exit_pending = true;
     }
 }
 
@@ -400,6 +404,7 @@ pub extern "C" fn arinsal_beamasm_timeout(header: *mut ProcessHeader) {
         }
         if crate::trace::active() {
             process.cold_mut().native_timeout_trace = true;
+            process.native_exit_pending = true;
         }
     }
 }

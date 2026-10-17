@@ -1721,10 +1721,10 @@ impl Executor {
                             let consumed = fcalls_before.saturating_sub(process.reductions);
                             ctx.consume(u32::try_from(consumed).unwrap_or(0));
                             // Native `timeout` has no scheduler context to send its trace event.
-                            if process
-                                .cold
-                                .as_mut()
-                                .is_some_and(|cold| std::mem::take(&mut cold.native_timeout_trace))
+                            if process.native_exit_pending
+                                && process.cold.as_mut().is_some_and(|cold| {
+                                    std::mem::take(&mut cold.native_timeout_trace)
+                                })
                             {
                                 crate::trace::timeout_event(Some(&mut self.vm), process, ctx);
                             }
@@ -1775,75 +1775,80 @@ impl Executor {
                         match outcome {
                             arinsal_beamasm::ExitReason::Yield => {
                                 crate::beamasm_integration::count_native_yield();
-                                if process.cold.as_mut().is_some_and(|cold| {
-                                    std::mem::take(&mut cold.native_reserve_fetch)
-                                }) {
-                                    // Native `recv_marker_reserve` needs the outer queue
-                                    // fetched first. Port of erts/emulator/beam/
-                                    // erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert),
-                                    // OTP-29.1.1: fetch (no handling), then rerun the
-                                    // instruction in place: erts does not schedule out there.
-                                    if process
-                                        .cold
-                                        .as_ref()
-                                        .is_some_and(|cold| cold.signal_probe.is_none())
-                                    {
-                                        process.cold_mut().signal_probe = ctx.signal_probe();
-                                    }
-                                    process.fetch_signals(ctx)?;
-                                    reenter = true;
-                                    continue;
-                                }
-                                if process.cold.as_mut().is_some_and(|cold| {
-                                    std::mem::take(&mut cold.native_signal_fetch)
-                                }) {
-                                    // Native `loop_rec` reached the end of the message queue
-                                    // with signals to fetch or handle. Port of
-                                    // erts/emulator/beam/jit/arm/instr_msg.cpp:84-104
-                                    // (i_loop_rec_shared calls erts_proc_sig_receive_helper),
-                                    // OTP-29.1.1: the helper runs here, then the `loop_rec`
-                                    // reruns; a yield schedules out there.
-                                    if process
-                                        .cold
-                                        .as_ref()
-                                        .is_some_and(|cold| cold.signal_probe.is_none())
-                                    {
-                                        process.cold_mut().signal_probe = ctx.signal_probe();
-                                    }
-                                    let fcalls = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
-                                    let (used, _) = process.receive_helper(ctx, fcalls)?;
-                                    let used = u32::try_from(used).unwrap_or(0);
-                                    ctx.consume(used);
-                                    process.reductions_used =
-                                        process.reductions_used.saturating_add(u64::from(used));
-                                    continue;
-                                }
-                                if let Some(timeout_ms) = process
-                                    .cold
-                                    .as_mut()
-                                    .and_then(|cold| cold.native_wait.take())
-                                {
-                                    // A native receive found no matching message. Like the
-                                    // interpreter's `wait`, sleep only if nothing arrived since the
-                                    // slice began; the process resumes at the `loop_rec` label with
-                                    // no live X registers.
-                                    process.gc_live = 0;
-                                    process.set_native_resume_arity(0);
-                                    // A receive without clauses blocks even with messages queued,
-                                    // like the interpreter's self-targeting `wait`.
-                                    let self_wait =
-                                        std::mem::take(&mut process.cold_mut().native_wait_self);
-                                    if self_wait {
-                                        // Queued messages never match; fetch them so the outer
-                                        // queue does not keep waking the process.
+                                if process.native_exit_pending {
+                                    if process.cold.as_mut().is_some_and(|cold| {
+                                        std::mem::take(&mut cold.native_reserve_fetch)
+                                    }) {
+                                        // Native `recv_marker_reserve` needs the outer queue
+                                        // fetched first. Port of erts/emulator/beam/
+                                        // erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert),
+                                        // OTP-29.1.1: fetch (no handling), then rerun the
+                                        // instruction in place: erts does not schedule out there.
+                                        if process
+                                            .cold
+                                            .as_ref()
+                                            .is_some_and(|cold| cold.signal_probe.is_none())
+                                        {
+                                            process.cold_mut().signal_probe = ctx.signal_probe();
+                                        }
                                         process.fetch_signals(ctx)?;
-                                    } else if !Vm::mailbox_ready_to_wait(
-                                        process,
-                                        &mut Some(&mut *ctx),
-                                    )? {
+                                        reenter = true;
                                         continue;
                                     }
-                                    break Ok(RunState::Wait { timeout_ms });
+                                    if process.cold.as_mut().is_some_and(|cold| {
+                                        std::mem::take(&mut cold.native_signal_fetch)
+                                    }) {
+                                        // Native `loop_rec` reached the end of the message queue
+                                        // with signals to fetch or handle. Port of
+                                        // erts/emulator/beam/jit/arm/instr_msg.cpp:84-104
+                                        // (i_loop_rec_shared calls erts_proc_sig_receive_helper),
+                                        // OTP-29.1.1: the helper runs here, then the `loop_rec`
+                                        // reruns; a yield schedules out there.
+                                        if process
+                                            .cold
+                                            .as_ref()
+                                            .is_some_and(|cold| cold.signal_probe.is_none())
+                                        {
+                                            process.cold_mut().signal_probe = ctx.signal_probe();
+                                        }
+                                        let fcalls =
+                                            i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
+                                        let (used, _) = process.receive_helper(ctx, fcalls)?;
+                                        let used = u32::try_from(used).unwrap_or(0);
+                                        ctx.consume(used);
+                                        process.reductions_used =
+                                            process.reductions_used.saturating_add(u64::from(used));
+                                        continue;
+                                    }
+                                    if let Some(timeout_ms) = process
+                                        .cold
+                                        .as_mut()
+                                        .and_then(|cold| cold.native_wait.take())
+                                    {
+                                        // A native receive found no matching message. Like the
+                                        // interpreter's `wait`, sleep only if nothing arrived since the
+                                        // slice began; the process resumes at the `loop_rec` label with
+                                        // no live X registers.
+                                        process.gc_live = 0;
+                                        process.set_native_resume_arity(0);
+                                        // A receive without clauses blocks even with messages queued,
+                                        // like the interpreter's self-targeting `wait`.
+                                        let self_wait = std::mem::take(
+                                            &mut process.cold_mut().native_wait_self,
+                                        );
+                                        if self_wait {
+                                            // Queued messages never match; fetch them so the outer
+                                            // queue does not keep waking the process.
+                                            process.fetch_signals(ctx)?;
+                                        } else if !Vm::mailbox_ready_to_wait(
+                                            process,
+                                            &mut Some(&mut *ctx),
+                                        )? {
+                                            continue;
+                                        }
+                                        break Ok(RunState::Wait { timeout_ms });
+                                    }
+                                    process.native_exit_pending = false;
                                 }
                                 // A native `i_yield` is a scheduler boundary even when the
                                 // interpreter left a deferred yield request in the process.
@@ -3877,7 +3882,20 @@ impl Process {
 
 // g_proc_sched. Port of erl_gc.c:3730 (`has_reached_max_heap_size`) and
 // erl_gc.c:3741 (`reached_max_heap_size`), OTP-29.1.1.
+#[inline(always)]
 fn heap_limit_kills(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> bool {
+    if process
+        .cold
+        .as_ref()
+        .is_none_or(|cold| cold.max_heap.size == 0)
+    {
+        return false;
+    }
+    heap_limit_check(process, ctx)
+}
+
+#[inline(never)]
+fn heap_limit_check(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> bool {
     let snapshot = {
         // Port of erts/emulator/beam/erl_process.h (`p->max_heap_size`), OTP-29.1.1: the limit
         // is a field of the process itself, so only the process reads or writes it.
@@ -6646,11 +6664,18 @@ impl Process {
     /// Collect after a BIF left heap fragments larger than the free area or pushed the
     /// virtual binary heap over its limit. Exactly `x[..live_x]` are roots; a BIF result
     /// in X0 needs `live_x >= 1`.
-    // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1: the test
+    // is three compares inline, the collection itself is out of line.
+    #[inline(always)]
     pub(crate) fn collect_bin_vheap_if_due(&mut self, live_x: usize) -> Result<(), VmError> {
-        if !(self.heap.gc_desired() || self.heap.bin_vheap_gc_due()) || !self.heap.gc_enabled {
-            return Ok(());
+        if self.heap.gc_after_bif_desired() {
+            return self.collect_bin_vheap_now(live_x);
         }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn collect_bin_vheap_now(&mut self, live_x: usize) -> Result<(), VmError> {
         let live_x = live_x.min(self.x.len());
         let stats = self.collect_heap_roots(live_x, &mut [], 0)?;
         crate::natives::sys::after_collection(
@@ -7353,9 +7378,9 @@ impl Process {
         data: &mut SchedulerData,
         budget: u32,
     ) -> RunOutcome {
-        let Some(runtime) = self.runtime.clone() else {
+        if self.runtime.is_none() {
             return RunOutcome::Exit(1);
-        };
+        }
         // erts stores the scheduler id on the process. Profiling allocates no side
         // record unless runnable-proc profiling is actually on.
         self.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
@@ -7376,21 +7401,31 @@ impl Process {
         if self.exit_cont.is_some() {
             // Port of erts/emulator/beam/erl_process.c:10528 (in_exiting), OTP-29.1.1: an
             // exiting process only continues its exit when scheduled in.
+            let runtime = self.runtime_handle();
             return self.continue_exit(&runtime, ctx, data, true);
         }
-        let result = self.run_executor(&runtime, ctx, data, budget);
+        let result = self.run_executor(ctx, data, budget);
         if self.dirty_exiting() {
             // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
             // the process already terminated while the job ran; whatever the job returned,
             // only the process structure remains to be released.
             return RunOutcome::Exit(1);
         }
-        self.finish_run(runtime, ctx, data, result)
+        self.finish_run(ctx, data, result)
+    }
+
+    /// The node runtime this process belongs to. A slice only needs a counted reference on
+    /// the exit paths, so the scheduler takes it there, not on every turn.
+    fn runtime_handle(&self) -> Arc<Runtime> {
+        Arc::clone(
+            self.runtime
+                .as_ref()
+                .expect("a scheduled process has a runtime"),
+        )
     }
 
     fn run_executor(
         &mut self,
-        runtime: &Arc<Runtime>,
         ctx: &mut RunCtx<'_, Message>,
         data: &mut SchedulerData,
         budget: u32,
@@ -7407,7 +7442,14 @@ impl Process {
                 .unwrap_or_else(std::time::Instant::now)
         });
         let used_before = self.reductions_used;
-        let mut result = with_executor(data, runtime, |executor| executor.run(self, ctx, budget));
+        let executor = match data.executor {
+            Some(ref mut executor) => executor,
+            None => {
+                let runtime = self.runtime_handle();
+                data.executor.insert(new_executor(&runtime))
+            }
+        };
+        let mut result = executor.run(self, ctx, budget);
         if let Some(start) = dirty_start {
             let charged = erts_time2reds(start.elapsed());
             self.reductions_used = used_before.saturating_add(charged);
@@ -7448,7 +7490,6 @@ impl Process {
 
     fn finish_run(
         &mut self,
-        runtime: Arc<Runtime>,
         ctx: &mut RunCtx<'_, Message>,
         data: &mut SchedulerData,
         result: Result<RunState, VmError>,
@@ -7464,6 +7505,7 @@ impl Process {
             let entry_result = self
                 .entry
                 .then(|| Err(VmError::Unsupported("max_heap_size".into())));
+            let runtime = self.runtime_handle();
             return self.exit_with(
                 &runtime,
                 ctx,
@@ -7549,6 +7591,7 @@ impl Process {
                         stats: self.stats.snapshot(),
                     })
                 });
+                let runtime = self.runtime_handle();
                 self.exit_with(
                     &runtime,
                     ctx,
@@ -7575,6 +7618,7 @@ impl Process {
                     eprintln!("arinsal boot: process {:?} exited: {error}", ctx.pid());
                 }
                 let entry_result = self.entry.then_some(Err(error));
+                let runtime = self.runtime_handle();
                 self.exit_with(&runtime, ctx, data, reason, entry_result, 1)
             }
         }

@@ -1176,6 +1176,7 @@ impl ProcessHeap {
         limit.saturating_sub(self.htop)
     }
     /// Number of words between the heap and stack pointers.
+    #[inline(always)]
     pub fn free_words(&self) -> usize {
         self.stop - self.htop
     }
@@ -1745,6 +1746,7 @@ impl ProcessHeap {
 
     /// Whether off-heap binary overhead has reached the young virtual heap limit.
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
+    #[inline(always)]
     pub fn bin_vheap_gc_due(&self) -> bool {
         self.owners.overhead > self.bin_vheap_size
     }
@@ -1754,8 +1756,9 @@ impl ProcessHeap {
     // Port of erts/emulator/beam/erl_gc.h (ERTS_IS_GC_DESIRED) and erl_gc.c
     // (erts_gc_after_bif_call_lhf), OTP-29.1.1: one decision for both conditions, so a BIF
     // that trips both is collected once.
+    #[inline(always)]
     pub fn gc_after_bif_desired(&self) -> bool {
-        self.gc_enabled && (self.gc_desired() || self.bin_vheap_gc_due())
+        self.gc_enabled & (self.gc_desired() | self.bin_vheap_gc_due())
     }
 }
 impl Default for ProcessHeap {
