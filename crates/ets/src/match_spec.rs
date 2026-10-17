@@ -23,6 +23,18 @@ struct Clause {
     body: Vec<Term>,
 }
 
+/// The key a clause head gives, for choosing the buckets of a hash table traversal.
+pub(crate) enum HeadKey {
+    /// The head is a variable: every object can match.
+    Variable,
+    /// The head has a key that is not fully bound.
+    Unbound,
+    /// The head has no key (not a tuple, or too small).
+    Missing,
+    /// The head has a fully bound key.
+    Bound(Term),
+}
+
 /// An immutable match program reusable by ETS and tracing.
 pub struct MatchProgram {
     // Clauses point into this stable, private heap.
@@ -1080,6 +1092,28 @@ impl MatchProgram {
             || bounds.least.is_some()
             || bounds.most.is_some())
         .then_some(bounds)
+    }
+
+    /// How each clause head names the key, as `analyze_pattern` classifies it for a hash table.
+    // Port of erts/emulator/beam/erl_db_hash.c, analyze_pattern, OTP-29.1.1.
+    pub(crate) fn head_keys(&self, keypos: usize) -> Vec<HeadKey> {
+        self.clauses
+            .iter()
+            .map(|clause| {
+                let head = clause.head;
+                if is_match_variable(head) {
+                    return HeadKey::Variable;
+                }
+                let key = keypos
+                    .checked_sub(1)
+                    .and_then(|index| tuple_view(head)?.get(index));
+                match key {
+                    None => HeadKey::Missing,
+                    Some(key) if is_fully_bound(key) => HeadKey::Bound(key),
+                    Some(_) => HeadKey::Unbound,
+                }
+            })
+            .collect()
     }
 
     /// Return the key pattern when the sole clause binds it completely.
