@@ -39,29 +39,6 @@ pub extern "C" fn append_binary(
         set_error(process, "system_limit");
         return 0;
     }
-    // Port of `erts_bs_append_checked`'s ERL_REFC_BITS_SIZE heap request: BinRef + SubBits.
-    // `<<Bin/binary, Bin2/binary>>` fills one destination with the two source ranges.
-    if let Ok(collected) = process.ensure_native_roots(8, &mut registers.x_reg_array, root_live)
-        && let Ok(Some(term)) = arinsal_bits::concat_byte_binary(
-            registers.x_reg_array[src_index],
-            registers.x_reg_array[extra_index],
-            &mut process.heap,
-        )
-    {
-        registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-        if collected {
-            process.sync_native_header();
-        } else {
-            process.sync_native_cursors();
-        }
-        return raw(term);
-    }
-    if process.x.len() < root_live {
-        let mut x = process.x.to_vec();
-        x.resize(root_live, Term::NIL);
-        process.x = x.into();
-    }
-    process.x[..root_live].copy_from_slice(&registers.x_reg_array[..root_live]);
     let build = |src: Term, extra: Term| {
         [
             Segment {
@@ -82,6 +59,46 @@ pub extern "C" fn append_binary(
             },
         ]
     };
+    // Port of erts/emulator/beam/erl_bits.c (`erts_bs_put_binary_all` and
+    // `erts_bs_append_checked` call BUMP_REDS with the bits they copy per ERL_BITS_PER_REDUCTION).
+    // The call site stores FCALLS and reloads it (`Update::eReductions`), so the charge goes
+    // through `process.reductions`, which `enter_runtime` started from the stored FCALLS. BUMP_REDS
+    // clamps FCALLS at zero.
+    let copy_reductions = arinsal_bits::create_bin_reductions(&build(
+        registers.x_reg_array[src_index],
+        registers.x_reg_array[extra_index],
+    ))
+    .unwrap_or(0);
+    let charge = |process: &mut crate::Process| {
+        process.reductions = process
+            .reductions
+            .saturating_sub(copy_reductions.min(i32::MAX as usize) as i32)
+            .max(0);
+    };
+    // Port of `erts_bs_append_checked`'s ERL_REFC_BITS_SIZE heap request: BinRef + SubBits.
+    // `<<Bin/binary, Bin2/binary>>` fills one destination with the two source ranges.
+    if let Ok(collected) = process.ensure_native_roots(8, &mut registers.x_reg_array, root_live)
+        && let Ok(Some(term)) = arinsal_bits::concat_byte_binary(
+            registers.x_reg_array[src_index],
+            registers.x_reg_array[extra_index],
+            &mut process.heap,
+        )
+    {
+        registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+        charge(process);
+        if collected {
+            process.sync_native_header();
+        } else {
+            process.sync_native_cursors();
+        }
+        return raw(term);
+    }
+    if process.x.len() < root_live {
+        let mut x = process.x.to_vec();
+        x.resize(root_live, Term::NIL);
+        process.x = x.into();
+    }
+    process.x[..root_live].copy_from_slice(&registers.x_reg_array[..root_live]);
     let initial = build(process.x[src_index], process.x[extra_index]);
     let mut request = match arinsal_bits::create_bin_size(&initial) {
         Ok(size) => size.heap_words,
@@ -108,6 +125,9 @@ pub extern "C" fn append_binary(
         *slot = *term;
     }
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+    if result.is_ok() {
+        charge(process);
+    }
     process.sync_native_cursors();
     match result {
         Ok(term) => raw(term),
