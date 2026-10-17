@@ -2235,17 +2235,22 @@ fn internal_state_get(
 /// OTP-29.1.1. erts flushes later-ops on every scheduler, waits for thread progress, sets up
 /// the wait flags on every scheduler and finally lets each scheduler run the flagged work (which
 /// drains its delayed deallocations and canceled timers first); the last scheduler resumes the
-/// waiter. Each phase needs every scheduler to reach its aux-work point, so a phase is one round.
+/// waiter. For `deallocations` every scheduler drains the delayed frees of its own allocator
+/// instance in each round, and the waiter drains the instances no scheduler owns. Each phase needs every scheduler to reach its aux-work point, so a phase is one round.
 fn debug_wait_round(
     owner: std::sync::Weak<crate::process::Runtime>,
     schedulers: usize,
     pid: arinsal_sched::Pid,
     completion: std::sync::Arc<std::sync::atomic::AtomicBool>,
     rounds_left: u32,
+    drain_owned: bool,
     request: &mut dyn FnMut(Box<dyn Fn(usize) + Send + Sync>),
 ) {
     let remaining = std::sync::atomic::AtomicUsize::new(schedulers);
-    request(Box::new(move |_worker| {
+    request(Box::new(move |worker| {
+        if drain_owned {
+            arinsal_alloc::typed::drain_owned_deallocations(worker + 1);
+        }
         if remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
@@ -2263,6 +2268,7 @@ fn debug_wait_round(
                 pid,
                 completion.clone(),
                 rounds_left - 1,
+                drain_owned,
                 &mut |work| next.request_aux_work_all(work),
             );
             return;
@@ -2321,8 +2327,9 @@ fn internal_state_set(
         // Port of erts/emulator/beam/erl_process.c:2103 (handle_delayed_dealloc), OTP-29.1.1.
         // Refc binaries released with a literal area are queued on the allocating
         // scheduler; this wait is what code_SUITE uses before erlang:memory(binary).
-        if kind == "deallocations" {
-            arinsal_alloc::typed::drain_delayed_deallocations();
+        let drain_owned = kind == "deallocations";
+        if drain_owned {
+            arinsal_alloc::typed::drain_shared_deallocations();
         }
         let runtime = process.runtime.as_ref().ok_or_else(badarg)?.clone();
         if let Some(completion) = process.cold_mut().debug_wait_completion.clone() {
@@ -2352,6 +2359,7 @@ fn internal_state_set(
             ctx.pid(),
             completion,
             rounds,
+            drain_owned,
             &mut |work| ctx.request_aux_work_all(work),
         );
         process.force_yield = true;

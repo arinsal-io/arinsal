@@ -744,37 +744,64 @@ fn allocator_for(
         .ok_or(AllocError::InvalidAllocation)
 }
 
-/// Apply every queued cross-thread free.
-///
-/// Port of erts/emulator/beam/erl_process.c:2103 (`handle_delayed_dealloc`) and
-/// erl_alloc.c (`erts_alloc_handle_delayed_dealloc`), OTP-29.1.1. A literal area
-/// released on the collector thread queues its refc binaries on the allocating
-/// scheduler; `wait, deallocations` does not return until those frees land.
-pub fn drain_delayed_deallocations() -> usize {
-    let mut total = 0;
-    let mut seen = [false; 10];
-    for kind in [
-        ErtsAlcType::HEAP,
-        ErtsAlcType::BINARY,
-        ErtsAlcType::DB_TABLE,
-        ErtsAlcType::MSG_REF,
-        ErtsAlcType::DRV,
-        ErtsAlcType::MODULE,
-        ErtsAlcType::ATOM,
-        ErtsAlcType::FUN_ENTRY,
-        ErtsAlcType::DRV_BINARY,
-        ErtsAlcType::PORT,
-    ] {
-        let index = kind.allocator();
-        if seen[index] {
-            continue;
-        }
-        seen[index] = true;
-        if let Ok(allocators) = allocator_for(kind) {
-            total += allocators.drain_all_deallocations().unwrap_or(0);
-        }
+fn for_each_allocator(mut visit: impl FnMut(&ThreadSpecificAllocators)) {
+    for allocators in registry().iter().flatten() {
+        visit(allocators);
     }
+}
+
+/// Apply the queued cross-thread frees of the instances no scheduler owns.
+///
+/// Port of `handle_delayed_dealloc` (erl_process.c) and
+/// erl_alloc.c (`erts_alloc_handle_delayed_dealloc`), OTP-29.1.1, for instance 0 and the dirty
+/// instances, whose frees the aux and dirty threads handle. Scheduler instances drain on their
+/// owners through [`drain_owned_deallocations`]. A literal area released on the collector thread
+/// queues its refc binaries on the allocating scheduler; `wait, deallocations` does not return
+/// until those frees land.
+pub fn drain_shared_deallocations() -> usize {
+    let mut total = 0;
+    for_each_allocator(|allocators| {
+        total += allocators.drain_shared_deallocations().unwrap_or(0);
+    });
     total
+}
+
+/// Apply the queued cross-thread frees of scheduler instance `instance`, on its owner.
+///
+/// Port of the `ERTS_SSI_AUX_WORK_DD` aux-work handler (erl_process.c, `handle_delayed_dealloc`),
+/// OTP-29.1.1. The owning scheduler calls this from its aux work; any other thread waits for it.
+pub fn drain_owned_deallocations(instance: usize) -> usize {
+    let mut total = 0;
+    for_each_allocator(|allocators| {
+        if instance < allocators.instance_count() {
+            total += allocators.drain_deallocations(instance).unwrap_or(0);
+        }
+    });
+    total
+}
+
+/// Runs the owner work of scheduler instance `instance` for every allocator: queued requests and
+/// a bounded number of delayed frees. True while any allocator still has frees queued.
+///
+/// Port of `erts_alloc_handle_delayed_dealloc`, OTP-29.1.1, as run by the owner's aux work after
+/// [`notify_owner`](crate::notify_owner).
+pub fn handle_owner_work(instance: usize) -> bool {
+    let mut more = false;
+    for_each_allocator(|allocators| {
+        if instance < allocators.instance_count() {
+            more |= allocators.handle_owner_work(instance).unwrap_or(false);
+        }
+    });
+    more
+}
+
+/// Runs only the queued requests of scheduler instance `instance` for every allocator.
+pub fn run_owner_requests(instance: usize) {
+    for_each_allocator(|allocators| {
+        if instance < allocators.instance_count() {
+            allocators.run_owner_requests(instance);
+        }
+    });
 }
 
 /// Current allocated bytes belonging to the erts `BINARY` allocation type.

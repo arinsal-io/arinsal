@@ -4,6 +4,8 @@ use crate::mseg::{CacheConfig, CallCount, MsegAllocator, MsegOptions, Segment, S
 use crate::raw::{MapError, NODE_WORDS, NodeRef, RawRegion, WordView, page_size};
 use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Multiplicative hasher for the integer keys of the allocator model; SipHash dominated the hot path.
 #[derive(Default)]
@@ -695,6 +697,20 @@ enum FreeListId {
     Afit,
 }
 
+/// Applies a dynamic `sbct` to the cell of an allocator of `strategy`; false when refused.
+///
+/// Port of `erts_alcu_try_set_dyn_param` (erl_alloc_util.c, `adjust_sbct`) and
+/// `gfalc_try_set_dyn_param` (erl_goodfit_alloc.c), OTP-29.1.1: the threshold is one word that any
+/// thread may write. Goodfit cannot rearrange its buckets and refuses.
+pub(crate) fn set_dyn_sbct(strategy: Strategy, cell: &AtomicUsize, value: usize) -> bool {
+    const MIN_DYN_SBCT: usize = 4000;
+    if strategy == Strategy::GoodFit || value < MIN_DYN_SBCT {
+        return false;
+    }
+    cell.store(value, Ordering::Relaxed);
+    true
+}
+
 /// One safe, single-threaded alloc_util instance.
 ///
 /// Port of `erts/emulator/beam/erl_alloc_util.c` allocator state, OTP-29.1.1.
@@ -729,6 +745,9 @@ pub struct AllocUtil {
     goodfit_interval_d: usize,
     /// `free_list` head of erl_afit_alloc.c; 0 is empty.
     afit_head: usize,
+    /// Dynamic `sbct`, shared with the instance registry so another thread can set it without
+    /// reaching into the allocator (`sbc_threshold` word of erl_alloc_util.c, OTP-29.1.1).
+    dyn_sbct: Arc<AtomicUsize>,
     stats: AllocStats,
     class_stats: [ClassStats; 2],
     mseg: MsegAllocator,
@@ -786,6 +805,7 @@ impl AllocUtil {
             goodfit_mask: [0; 4],
             goodfit_interval_d: goodfit_interval_d(options.sbct),
             afit_head: 0,
+            dyn_sbct: Arc::new(AtomicUsize::new(options.sbct)),
             stats: AllocStats::default(),
             class_stats: [ClassStats::default(); 2],
             mseg: MsegAllocator::new(0, CacheConfig::default()),
@@ -815,12 +835,23 @@ impl AllocUtil {
     // Port of erts/emulator/beam/erl_alloc_util.c (erts_alcu_try_set_dyn_param, adjust_sbct) and
     // erl_goodfit_alloc.c (gfalc_try_set_dyn_param, which cannot rearrange its buckets), OTP-29.1.1.
     pub fn try_set_dyn_sbct(&mut self, value: usize) -> bool {
-        const MIN_DYN_SBCT: usize = 4000;
-        if self.strategy == Strategy::GoodFit || value < MIN_DYN_SBCT {
-            return false;
-        }
-        self.options.sbct = value;
-        true
+        set_dyn_sbct(self.strategy, &self.dyn_sbct, value)
+    }
+
+    /// The cell holding the current `sbct`, writable from any thread through [`set_dyn_sbct`].
+    pub(crate) fn sbct_cell(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.dyn_sbct)
+    }
+
+    #[inline(always)]
+    fn sbct(&self) -> usize {
+        self.dyn_sbct.load(Ordering::Relaxed)
+    }
+
+    /// Bytes in allocated blocks and in carriers, for the registry's lock-free mirror.
+    #[inline(always)]
+    pub(crate) fn size_counters(&self) -> (usize, usize) {
+        (self.stats.blocks_size, self.stats.carriers_size)
     }
 
     /// Allocates a payload of `size` bytes.
@@ -828,7 +859,7 @@ impl AllocUtil {
     pub fn alloc(&mut self, size: usize) -> Result<Allocation, AllocError> {
         self.stats.alloc_calls += 1;
         let block_size = block_size(size, self.strategy)?;
-        if block_size >= self.options.sbct {
+        if block_size >= self.sbct() {
             let start = self.add_sbc(block_size)?;
             self.stats.blocks += 1;
             self.stats.blocks_size += block_size;
@@ -1387,7 +1418,7 @@ impl AllocUtil {
 
     pub(crate) fn required_block_size(&self, size: usize) -> Result<Option<usize>, AllocError> {
         let need = block_size(size, self.strategy)?;
-        Ok((need < self.options.sbct).then_some(need))
+        Ok((need < self.sbct()).then_some(need))
     }
 
     pub(crate) fn transfer_largest_free(&self, transfer: &CarrierTransfer) -> usize {
@@ -1474,7 +1505,7 @@ impl AllocUtil {
             .as_ref()
             .ok_or(AllocError::Corrupt)?
             .sbc;
-        if old_sbc && needed >= self.options.sbct {
+        if old_sbc && needed >= self.sbct() {
             match self.resize_sbc(old_offset, needed) {
                 Ok(moved) => {
                     return Ok(Allocation {
@@ -1486,7 +1517,7 @@ impl AllocUtil {
                 Err(error) => return Err(error),
             }
         }
-        if old_sbc && needed < self.options.sbct {
+        if old_sbc && needed < self.sbct() {
             let carrier = self.carriers[old.carrier]
                 .as_ref()
                 .ok_or(AllocError::Corrupt)?;
@@ -1763,7 +1794,10 @@ impl AllocUtil {
             version: ("0.9", "3.0"),
             allocation_type: self.allocation_type,
             strategy: self.strategy,
-            options: self.options,
+            options: AllocUtilOptions {
+                sbct: self.sbct(),
+                ..self.options
+            },
             mbcs,
             sbcs,
             calls: self.stats,
