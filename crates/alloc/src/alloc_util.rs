@@ -708,6 +708,10 @@ pub struct AllocUtil {
     carrier_ranges: Vec<(usize, usize, usize)>,
     /// Last `carrier_ranges` hit; consecutive header accesses nearly always stay in one carrier.
     last_carrier: std::cell::Cell<CarrierSpan>,
+    /// Carrier of the block tree being walked. Every node of a block tree lives in the carrier
+    /// of its root, so a walk resolves the carrier once (`enter_block_tree`) and `tn` then checks
+    /// each node against it, instead of looking the node's carrier up again.
+    tree_span: std::cell::Cell<CarrierSpan>,
     free_root: usize,
     aoff_roots: Vec<usize>,
     aoff_carrier_root: usize,
@@ -768,6 +772,7 @@ impl AllocUtil {
             mbc_count: 0,
             carrier_ranges: Vec::new(),
             last_carrier: std::cell::Cell::new(CarrierSpan::EMPTY),
+            tree_span: std::cell::Cell::new(CarrierSpan::EMPTY),
             free_root: 0,
             aoff_roots: Vec::new(),
             aoff_carrier_root: 0,
@@ -996,23 +1001,37 @@ impl AllocUtil {
 
     #[cold]
     fn span_of_slow(&self, key: usize) -> Option<CarrierSpan> {
+        let span = self.find_span(key)?;
+        self.last_carrier.set(span);
+        Some(span)
+    }
+
+    /// Looks `key` up in the carrier address index without touching the carrier caches.
+    #[inline(never)]
+    fn find_span(&self, key: usize) -> Option<CarrierSpan> {
         let index = self
             .carrier_ranges
             .partition_point(|&(start, _, _)| start <= key)
             .checked_sub(1)?;
         let (start, end, carrier) = self.carrier_ranges[index];
         if key >= start && key < end {
-            let span = CarrierSpan {
+            Some(CarrierSpan {
                 start,
                 end,
                 index: carrier,
                 sbc: self.carriers[carrier].as_ref()?.sbc,
-            };
-            self.last_carrier.set(span);
-            Some(span)
+            })
         } else {
             None
         }
+    }
+
+    /// Starts a walk of the block tree holding `key`: its carrier is resolved here, once.
+    #[inline(always)]
+    fn enter_block_tree(&self, key: usize) -> Result<CarrierSpan, AllocError> {
+        let span = self.span_of(key).ok_or(AllocError::Corrupt)?;
+        self.tree_span.set(span);
+        Ok(span)
     }
 
     fn index_carrier(&mut self, index: usize) {
@@ -1035,6 +1054,9 @@ impl AllocUtil {
             .retain(|&(_, _, carrier)| carrier != index);
         if self.last_carrier.get().index == index {
             self.last_carrier.set(CarrierSpan::EMPTY);
+        }
+        if self.tree_span.get().index == index {
+            self.tree_span.set(CarrierSpan::EMPTY);
         }
     }
 
@@ -2298,7 +2320,12 @@ impl AllocUtil {
     /// The tree node at `key`, checked once against its carrier; its fields are then plain loads.
     #[inline(always)]
     fn tn(&self, key: usize) -> Result<TNode, AllocError> {
-        let span = self.span_of(key).ok_or(AllocError::Corrupt)?;
+        let span = self.tree_span.get();
+        let span = if key >= span.start && key < span.end {
+            span
+        } else {
+            self.find_span(key).ok_or(AllocError::Corrupt)?
+        };
         let words = if self.strategy == Strategy::BestFit || is_aoff(self.strategy) {
             BF_NODE_SIZE / WORD
         } else {
@@ -2379,9 +2406,17 @@ impl AllocUtil {
 
     #[inline(always)]
     /// Port of rbt_search, erl_ao_firstfit_alloc.c:863-881, OTP-29.1.1.
-    fn aoff_search(&self, root: usize, need: usize) -> Result<Option<usize>, AllocError> {
+    fn aoff_search(
+        &self,
+        root: usize,
+        need: usize,
+        block_tree: bool,
+    ) -> Result<Option<usize>, AllocError> {
         if root == 0 {
             return Ok(None);
+        }
+        if block_tree {
+            self.enter_block_tree(root)?;
         }
         let mut node = self.tn(root)?;
         loop {
@@ -2589,6 +2624,11 @@ impl AllocUtil {
     /// The aoff `max_sz` is raised on the way down, so no walk to the root follows.
     fn insert_tree_node(&mut self, node: usize, size: usize) -> Result<(), AllocError> {
         let aoff = is_aoff(self.strategy);
+        let span = self.span_of(node).ok_or(AllocError::Corrupt)?;
+        let block_node = !(aoff && !span.sbc && node == span.start + MBC_HEADER);
+        if block_node {
+            self.tree_span.set(span);
+        }
         let n = self.tn(node)?;
         n.set_flags(0);
         n.set_parent(0);
@@ -2597,8 +2637,6 @@ impl AllocUtil {
         if aoff {
             n.set_max(size);
         }
-        let span = self.span_of(node).ok_or(AllocError::Corrupt)?;
-        let block_node = !(aoff && !span.sbc && node == span.start + MBC_HEADER);
         let bestfit = block_node && matches!(self.strategy, Strategy::BestFit | Strategy::AoffCbf);
         if bestfit {
             n.set_next(0);
@@ -2723,13 +2761,13 @@ impl AllocUtil {
             return Ok(None);
         }
         if is_aoff(self.strategy) {
-            let Some(carrier_node) = self.aoff_search(self.aoff_carrier_root, need)? else {
+            let Some(carrier_node) = self.aoff_search(self.aoff_carrier_root, need, false)? else {
                 return Ok(None);
             };
             let carrier_index = self
                 .aoff_carrier_index(carrier_node)
                 .ok_or(AllocError::Corrupt)?;
-            return self.aoff_search(self.aoff_roots[carrier_index], need);
+            return self.aoff_search(self.aoff_roots[carrier_index], need, true);
         }
         let mut current = self.free_root;
         let mut best = 0;
@@ -2770,6 +2808,7 @@ impl AllocUtil {
         if matches!(self.strategy, Strategy::GoodFit | Strategy::Afit) {
             return Ok(());
         }
+        self.enter_block_tree(node)?;
         let nn = self.tn(node)?;
         if matches!(self.strategy, Strategy::BestFit | Strategy::AoffCbf) {
             if nn.flags() & TREE_NODE == 0 {
