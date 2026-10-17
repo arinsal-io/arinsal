@@ -3,6 +3,24 @@ use arinsal_etf::OwnedTerm;
 use arinsal_vm::Vm;
 use similar_asserts::assert_eq;
 
+const SEMANTICS: &str = r#"semantics() ->
+    Long = lists:seq(1, 300000),
+    Bad = Long ++ improper,
+    T = fun(F) -> try F() catch error:R -> {err, R} end end,
+    G = fun(L) when length(L) > 250000 -> big; (_) -> small end,
+    Err = fun(L) -> try length(L) catch error:E:St -> {E, [{M, F, is_list(A)} || {M, F, A, _} <- [hd(St)]]} end end,
+    Keep = fun(A, B, C, D) -> {A, length(B), C, D, length(B) + length(A)} end,
+    [G(Long), G(lists:seq(1, 10)), G(Bad), Err(Bad), Err(improper),
+     Keep(Long, Long, 3, 4), erlang:crc32([lists:duplicate(100000, 5), <<1, 2, 3>>, [255 | <<4>>]]),
+          erlang:md5([<<1>>, lists:duplicate(70000, 7), <<2>>])]
+    ++ [T(fun() -> erlang:crc32([Long, a]) end), T(fun() -> erlang:phash2(Long, 0) end),
+        erlang:phash2({Long, <<1:3>>, #{a => Long}, fun() -> ok end}),
+        erlang:phash2(lists:duplicate(100000, 300)),
+        erlang:phash2(<<1:5, (list_to_binary(lists:duplicate(50000, 9)))/bits>>),
+        erlang:phash2(Long, 4294967296)].
+
+"#;
+
 const MODULE: &str = "reds_size_bifs_test";
 
 /// The interpreter counts a few more instructions around the call than BEAMASM and erts do.
@@ -18,6 +36,12 @@ const SIZES: [(&str, usize); 4] = [
 
 /// One BIF under test: its name, how the input of size `N` is built and the call.
 const CASES: &[(&str, &str, &str)] = &[
+    ("length", "lists:seq(1, N)", "erlang:length(In)"),
+    (
+        "length_apply",
+        "lists:seq(1, N)",
+        "apply(erlang, length, [In])",
+    ),
     ("crc32", "bin(N)", "erlang:crc32(In)"),
     ("crc32_2", "bin(N)", "erlang:crc32(7, In)"),
     ("adler32", "bin(N)", "erlang:adler32(In)"),
@@ -57,8 +81,9 @@ fn source() -> String {
     }
     format!(
         r#"-module({MODULE}).
--export([{exports}]).
+-export([{exports}, semantics/0]).
 
+{semantics}
 bin(N) -> binary:copy(<<0, 1, 2, 3, 255, 17, 9, 200>>, (N + 7) div 8).
 
 binl(N) -> [I rem 256 || I <- lists:seq(1, N)].
@@ -101,7 +126,8 @@ schedule_ins(Pid, Count) ->
     after 300 -> Count
     end.
 "#,
-        exports = exports.join(", ")
+        exports = exports.join(", "),
+        semantics = SEMANTICS
     )
 }
 
@@ -128,6 +154,23 @@ fn functions() -> Vec<String> {
         }
     }
     names
+}
+
+#[test]
+fn trapped_calls_return_what_otp_returns() {
+    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    let source = source();
+    let beam = reference.compile_named(MODULE, &source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let CallResult::Ok(expected) = reference.call(MODULE, "semantics", &[]) else {
+        panic!("OTP semantics failed");
+    };
+    let actual = vm
+        .eval_scheduled_reductions(MODULE, "semantics", &[], 1, Some(0xB5FF), 4_000)
+        .unwrap();
+    assert_eq!(expected, actual.term);
 }
 
 #[test]
