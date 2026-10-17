@@ -171,6 +171,9 @@ pub struct BeamModuleAssembler {
     /// Arity of the function being emitted: the live X registers at its `i_test_yield`.
     function_arity: u8,
     pub(super) error_label: Label,
+    /// Module-local stub that turns the `bl` return address of a raise site into the raising pc
+    /// and continues at `error_label`.
+    error_pc_label: Label,
     /// Address of `raise_exception_shared`'s resolver. `error_label` returns to the
     /// scheduler instead; the light-BIF fragment calls this when a catch is active.
     #[allow(dead_code)]
@@ -263,6 +266,7 @@ impl BeamModuleAssembler {
         let mut code = CodeBuffer::new();
         let yield_label = code.new_label();
         let error_label = code.new_label();
+        let error_pc_label = code.new_label();
         Self {
             code,
             reg_cache: crate::regcache::RegCache::default(),
@@ -275,6 +279,7 @@ impl BeamModuleAssembler {
             yield_label,
             function_arity: 0,
             error_label,
+            error_pc_label,
             exception_resolver: 0,
             catch_patches: Vec::new(),
             func_clause_stub: None,
@@ -1756,14 +1761,11 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Branches to the shared error exit, recording the address of this instruction in LR so
-    /// the raised exception can name its source line.
+    /// Calls the module's raise stub, which never returns: the return address of this `bl` is
+    /// the pc the raised exception names its source line by.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (emit_raise_exception ARG2 = pc), OTP-29.1.1.
     pub(super) fn branch_error(&mut self) -> Result<(), ModuleError> {
-        let here = self.code.new_label();
-        self.code.bind(here)?;
-        self.code.adr(Gpr::x(30), here)?;
-        self.code.b(self.error_label)?;
+        self.code.bl(self.error_pc_label)?;
         Ok(())
     }
 
@@ -1813,20 +1815,12 @@ impl BeamModuleAssembler {
             for (index, arg) in args.iter().copied().enumerate() {
                 e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
             }
-            // Fragments reading a descriptor in x3 see none from a call that passes fewer.
-            for index in args.len()..3 {
-                e.mov_reg(Gpr::x(index as u8 + 1), Gpr::xzr())?;
-            }
-            e.mov_const(Gpr::x(17), fragment as u64)?;
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
-            e.blr(Gpr::x(17))
+            Ok(())
         })?;
+        self.fragment_call(fragment)?;
         let return_address = self.code.offset();
         crate::emit_leave_runtime(&mut self.code, live, update)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
-            e.ldr_uoff(Gpr::x(9), C_P, 40)
-        })?;
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
         self.error_if_nonzero(Gpr::x(9))?;
         Ok(return_address)
     }
@@ -2159,6 +2153,9 @@ impl BeamModuleAssembler {
                 e.ret(Gpr::x(30))
             })?;
         }
+        self.code.bind(self.error_pc_label)?;
+        self.code
+            .emit(|e| e.sub_imm(Gpr::x(30), Gpr::x(30), 4, false))?;
         self.code.bind(self.error_label)?;
         // The scheduler runs `handle_error`. Resolving the catch in this fragment
         // drops the BIF frame and `function_clause` argument list the scheduler records.
