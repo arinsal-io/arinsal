@@ -1159,6 +1159,15 @@ fn dispatch_native_send(
                 crate::trace::save_call(process, crate::trace::SavedCall::Send);
             }
             let raw = crate::native_hooks::raw(value);
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 (emit_send jumps into
+            // call_light_bif_shared) and 488-523 (ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1:
+            // a send that left heap fragments or virtual binary heap over its limit collects
+            // with the result as the only root.
+            if process.heap.gc_enabled
+                && (process.heap.gc_desired() || process.heap.bin_vheap_gc_due())
+            {
+                return Some(collect_after_plain_bif(process, registers, raw));
+            }
             process.x[0] = value;
             publish_dispatch_x(process, registers);
             process.sync_native_header();
