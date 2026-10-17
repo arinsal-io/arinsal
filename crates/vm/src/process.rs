@@ -2038,8 +2038,7 @@ impl Executor {
                                     }
                                     // The trace callbacks read every argument from the scheduler
                                     // array, which is the process's X file.
-                                    let arity = usize::from(function.arity)
-                                        .min(self.native_registers.x_reg_array.len());
+                                    let arity = usize::from(function.arity).min(process.x.len());
                                     let actions = crate::trace::executor_native_call_event(
                                         &mut self.vm,
                                         process,

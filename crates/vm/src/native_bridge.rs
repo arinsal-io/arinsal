@@ -1146,7 +1146,6 @@ fn run_native_attached(
         process.header.freason = 0;
         let arity = native_function_at(registers.tmp_mem[6] as usize)
             .map_or(0, |function| usize::from(function.arity));
-        process.x.ensure_x(arity);
         let args = process.x[..arity].to_vec();
         if exception_trace {
             eprintln!(
@@ -1184,13 +1183,16 @@ fn run_native_attached(
     {
         process.header.freason = 0;
         let error = match failure.call {
-            crate::proc_create::NativeBifCall::Export(export) => exceptions::bif_error(
-                process,
-                &export.module,
-                &export.function,
-                &registers.x_reg_array[..usize::from(export.arity)],
-                failure.error,
-            ),
+            crate::proc_create::NativeBifCall::Export(export) => {
+                let args = process.x[..usize::from(export.arity)].to_vec();
+                exceptions::bif_error(
+                    process,
+                    &export.module,
+                    &export.function,
+                    &args,
+                    failure.error,
+                )
+            }
             crate::proc_create::NativeBifCall::Owned {
                 module,
                 function,
