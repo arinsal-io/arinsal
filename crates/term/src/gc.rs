@@ -196,8 +196,11 @@ fn rebase_binref_chains(
             address
         }
     };
-    heap.owners.off_heap_first = rebase(heap.owners.off_heap_first);
-    heap.owners.wrt_bins = rebase(heap.owners.wrt_bins);
+    let Some(owners) = heap.owners.as_mut() else {
+        return;
+    };
+    owners.off_heap_first = rebase(owners.off_heap_first);
+    owners.wrt_bins = rebase(owners.wrt_bins);
     for &old_node in nodes {
         let node = rebase(old_node) as *mut u64;
         let next = crate::heap::load(node.wrapping_add(2)) as usize;
@@ -251,6 +254,8 @@ struct Copier<'a> {
     mature: Area,
     /// do_minor's `oh`/`oh_size`: the old heap a minor collection leaves in place.
     old: Area,
+    /// `erts_literals_start`/`erts_literals_size`, read once for the collection.
+    literals: Area,
     n_htop: HeapTop,
     old_htop: HeapTop,
     /// Sorted owned fragment ranges, kept only to check the erts rule in debug builds.
@@ -262,14 +267,18 @@ struct Copier<'a> {
 
 impl Copier<'_> {
     /// `ErtsInYoungGen` for a pointer outside the young heap block: heap fragments and
-    /// the abandoned heap are young; literals and, in a minor collection, the old heap are not.
+    /// the abandoned heap are young; literals (`erts_is_literal`: the literal area and the
+    /// global empty tuple) and, in a minor collection, the old heap are not.
     // Port of erts/emulator/beam/erl_gc.h:97 (ErtsInYoungGen), OTP-29.1.1.
     #[inline]
     fn in_young_gen(&self, address: usize) -> bool {
         if self.young.contains(address) {
             return true;
         }
-        if self.old.contains(address) || self.is_literal(address) {
+        if self.old.contains(address)
+            || self.literals.contains(address)
+            || address == std::ptr::from_ref(&crate::EMPTY_TUPLE) as usize
+        {
             return false;
         }
         #[cfg(debug_assertions)]
@@ -424,13 +433,6 @@ impl Copier<'_> {
                 n_hp += words * 8;
             }
         }
-    }
-
-    /// `erts_is_literal`: literal areas and the global empty tuple.
-    // Port of erts/emulator/beam/global.h:1568 (erts_is_literal), OTP-29.1.1.
-    #[inline]
-    fn is_literal(&self, address: usize) -> bool {
-        crate::literal::is_literal_address(address)
     }
 
     /// Debug check of the erts invariant behind the ownership rule: a moved pointer that is
@@ -706,6 +708,10 @@ impl Copier<'_> {
     /// Sweep the refc list, then the separate writable list, before releasing from-space.
     // Port of erts/emulator/beam/erl_gc.c:2996-3289 (sweep_off_heap), OTP-29.1.1.
     fn sweep_off_heap(&mut self) {
+        let (refc_head, writable_head) = self.from.owners.chain_heads();
+        if refc_head == 0 && writable_head == 0 && !self.to.owners.is_allocated() {
+            return;
+        }
         self.sweep_binary_chain(false);
         self.sweep_binary_chain(true);
         if self.to.owners.is_allocated() {
@@ -1090,7 +1096,12 @@ impl ProcessHeap {
         if self.collection_is_major() {
             return false;
         }
-        let mature = self.mature_words();
+        self.minor_attempt_fails(self.mature_words())
+    }
+
+    /// The `minor_collection` old-heap checks for a mature region of `mature` words.
+    #[inline]
+    fn minor_attempt_fails(&self, mature: usize) -> bool {
         (self.old_words.is_empty() && mature == 0)
             || (!self.old_words.is_empty()
                 && (mature > self.old_words.len().saturating_sub(self.old_htop)
@@ -1247,7 +1258,7 @@ impl ProcessHeap {
         let abandoned_mature = abandoned.map_or((0, 0), |abandoned| {
             (abandoned.start, abandoned.start + abandoned.high_water * 8)
         });
-        let mature_words = self.mature_words();
+        let mature_words = abandoned.map_or(self.high_water, |abandoned| abandoned.high_water);
         let fragments = (self.fragment_words as usize)
             .saturating_add(abandoned.map_or(0, |abandoned| abandoned.used))
             .saturating_add(message_words);
@@ -1265,8 +1276,8 @@ impl ProcessHeap {
             ranges
         };
         // `erl_gc.c:3285` sizes the old virtual heap from MSO(p).overhead before sweep_off_heap.
-        let off_heap_overhead = self.owners.overhead;
-        let major = self.collection_is_major() || self.minor_falls_back_to_major();
+        let off_heap_overhead = self.owners.overhead();
+        let major = self.collection_is_major() || self.minor_attempt_fails(mature_words);
         let stack = self.stack_words();
         let source_words = self
             .htop
@@ -1393,6 +1404,10 @@ impl ProcessHeap {
             young,
             mature,
             old,
+            literals: {
+                let (start, end) = crate::literal::literal_area();
+                Area { start, end }
+            },
             #[cfg(debug_assertions)]
             fragment_ranges,
             sub_bits: Vec::new(),
@@ -1671,7 +1686,9 @@ impl ProcessHeap {
         }
         let prev_heap = self.words.as_ptr() as usize;
         let mut binref_nodes = binref_chain_nodes(self.owners.off_heap_first);
-        binref_nodes.extend(binref_chain_nodes(self.owners.wrt_bins));
+        if self.owners.wrt_bins != 0 {
+            binref_nodes.extend(binref_chain_nodes(self.owners.wrt_bins));
+        }
         let prev_stop = self.stop;
         let prev_stack = prev_heap + prev_stop * 8;
         let prev_stack_end = prev_heap + prev_len * 8;
