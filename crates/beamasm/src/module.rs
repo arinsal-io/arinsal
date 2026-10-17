@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::rt::{arinsal_enter_native_return, arinsal_enter_native_yield};
+use crate::rt::arinsal_enter_native_return;
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer, Label},
     enc::{Cond, Emitter, Gpr, Shift},
@@ -1822,7 +1822,9 @@ impl BeamModuleAssembler {
                 .union(crate::Update::X_REGS),
         )?;
         self.code.emit(|e| {
-            e.mov_const(Gpr::x(30), arinsal_enter_native_yield as *const () as u64)?;
+            e.mov_const(Gpr::x(0), 1)?;
+            e.str_uoff(Gpr::x(0), SCHEDULER_REGS, 16_408)?;
+            e.mov_const(Gpr::x(30), arinsal_enter_native_return as *const () as u64)?;
             e.ret(Gpr::x(30))
         })?;
         self.code.bind(self.error_label)?;
