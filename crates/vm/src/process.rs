@@ -2135,6 +2135,9 @@ impl Executor {
                                         }
                                         Err(error) => return Err(error),
                                     };
+                                    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624
+                                    // (emit_send, call_light_bif_shared GC test), OTP-29.1.1.
+                                    let value = process.gc_after_bif(value)?;
                                     process.x[0] = value;
                                     if !resume_after_native_return(process) {
                                         break Ok(RunState::Done(value));

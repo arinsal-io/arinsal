@@ -3800,7 +3800,12 @@ impl Vm {
                     if crate::trace::saves_calls(p) {
                         crate::trace::save_call(p, crate::trace::SavedCall::Send);
                     }
+                    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 (emit_send is
+                    // call_light_bif_shared with ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1.
+                    let value = p.gc_after_bif(value)?;
                     p.x[0] = value;
+                    (htop, stop) = p.heap.heap_cursor();
+                    heap_dirty = false;
                 }
                 Instr::LoopRec { empty, dst } => {
                     sync_cursor(p, htop, &mut heap_dirty);
