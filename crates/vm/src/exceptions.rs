@@ -796,11 +796,7 @@ pub(super) fn resume(
         p.heap.stack_set(index - frame_start, Term::NIL);
         p.module = module;
         p.ip = ip;
-        if p.x.len() < 4 {
-            let mut registers = p.x.to_vec();
-            registers.resize(4, Term::NIL);
-            p.x = registers.into();
-        }
+        p.x.ensure_x(4);
         p.x[0] = Term::catch(0);
         p.x[1] = trap.reason;
         p.x[2] = trace;

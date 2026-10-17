@@ -392,11 +392,7 @@ impl Vm {
                         "closure environment exceeds X registers".into(),
                     ));
                 }
-                if need > p.x.len() {
-                    let mut registers = p.x.to_vec();
-                    registers.resize(need, Term::NIL);
-                    p.x = registers.into();
-                }
+                p.x.ensure_x(need);
                 for (i, &word) in free_vars.iter().enumerate() {
                     // SAFETY: The fun header bounds the environment and every word is a term.
                     p.x[arity + i] = unsafe { std::mem::transmute::<u64, Term>(word) };
@@ -485,9 +481,7 @@ impl Vm {
         let list = TermBuilder::new(&mut p.heap)
             .list_from_iter(args)
             .map_err(|error| VmError::Unsupported(format!("lambda arg list: {error:?}")))?;
-        if p.x.len() < 4 {
-            return Err(VmError::Unsupported("lambda handler registers".into()));
-        }
+        p.x.ensure_x(4);
         p.x[0] = Term::atom(module);
         p.x[1] = fun;
         p.x[2] = list;
@@ -580,11 +574,7 @@ impl Vm {
         let function_atom = global_atoms()
             .intern(function)
             .map_err(|error| VmError::Unsupported(format!("trap function atom: {error:?}")))?;
-        if p.x.len() < arity {
-            let mut registers = p.x.to_vec();
-            registers.resize(arity, Term::NIL);
-            p.x = registers.into();
-        }
+        p.x.ensure_x(arity);
         p.x[..arity].copy_from_slice(&trap.args);
         self.call_named_atoms(
             p,
@@ -1152,10 +1142,8 @@ impl Vm {
         })?;
         // The register file is sized for the running module; the callee may take more
         // arguments (up to erts MAX_ARG), so grow it before the copy.
-        if args.len() <= 255 && args.len() >= p.x.len() {
-            let mut registers = p.x.to_vec();
-            registers.resize(args.len() + 1, Term::NIL);
-            p.x = registers.into();
+        if args.len() <= 255 {
+            p.x.ensure_x(args.len() + 1);
         }
         if args.len() >= p.x.len() {
             return Err(exceptions::bif_error(
