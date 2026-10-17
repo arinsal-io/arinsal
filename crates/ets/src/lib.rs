@@ -2664,7 +2664,7 @@ impl Table {
                     && let Some(prepared) = ctx.pending.pop_front()
                 {
                     self.put_hashed(prepared.stored, prepared.hash, false);
-                    loops -= 1;
+                    loops -= 2;
                 }
                 *reds = loops / ITERATIONS_PER_RED;
                 if ctx.pending.is_empty() {
@@ -2699,7 +2699,9 @@ impl Table {
             && let Some(prepared) = pending.pop_front()
         {
             self.put_hashed(prepared.stored, prepared.hash, false);
-            *loops -= 1;
+            // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_insert_db_term_list),
+            // OTP-29.1.1: one loop iteration and one `consumed_reds` per object.
+            *loops -= 2;
         }
     }
 

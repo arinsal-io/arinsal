@@ -187,6 +187,38 @@ const MATCHING_CASES: &[Case] = &[
     ),
 ];
 
+const SMALL: &[usize] = &[2, 3, 8, 16, 100];
+const ETS_CASES: &[Case] = &[
+    case(
+        "ets_insert_set",
+        TO_100K,
+        6,
+        "{ets:new(t, [set]), kv(N)}",
+        "ets:insert(element(1, In), element(2, In))",
+    ),
+    case(
+        "ets_insert_small",
+        SMALL,
+        6,
+        "{ets:new(t, [set]), kv(N)}",
+        "ets:insert(element(1, In), element(2, In))",
+    ),
+    case(
+        "ets_insert_ordered",
+        TO_100K,
+        6,
+        "{ets:new(t, [ordered_set]), kv(N)}",
+        "ets:insert(element(1, In), element(2, In))",
+    ),
+    case(
+        "ets_insert_bag",
+        TO_100K,
+        6,
+        "{ets:new(t, [bag]), kv(N)}",
+        "ets:insert(element(1, In), element(2, In))",
+    ),
+];
+
 fn function_name(case: &Case, size: usize) -> String {
     format!("{}_{size}", case.name)
 }
@@ -348,6 +380,11 @@ fn t2b_bifs_charge_like_otp() {
 #[test]
 fn matching_bifs_charge_like_otp() {
     check(MATCHING_CASES, 0xC300);
+}
+
+#[test]
+fn ets_bifs_charge_like_otp() {
+    check(ETS_CASES, 0xC400);
 }
 
 #[test]
