@@ -45,6 +45,7 @@ pub struct DispatchFragments {
     bif_is_eq_exact_offset: usize,
     bif_is_ne_exact_offset: usize,
     arith_compare_offset: usize,
+    bif_element_guard_offset: usize,
 }
 
 /// C functions called by the comparison fragments (`eq`, `erts_cmp_atoms`, `erts_cmp_compound`).
@@ -262,6 +263,7 @@ impl DispatchFragments {
         let bif_is_eq_exact = code.new_label();
         let bif_is_ne_exact = code.new_label();
         let arith_compare = code.new_label();
+        let bif_element_guard = code.new_label();
         code.bind(export)
             .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
         emit_export_fragment(&mut code, export_helper, raise_exception)
@@ -363,6 +365,10 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_arith_compare_shared(&mut code, compare.cmp_atoms, compare.cmp_compound)
             .map_err(|_| ExecError::InvalidSize("arith_compare fragment"))?;
+        code.bind(bif_element_guard)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_bif_element_guard_shared(&mut code)
+            .map_err(|_| ExecError::InvalidSize("bif_element fragment"))?;
         let (words, labels) = code
             .finish_with_labels()
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
@@ -396,6 +402,7 @@ impl DispatchFragments {
             bif_is_eq_exact_offset: labels[&bif_is_eq_exact],
             bif_is_ne_exact_offset: labels[&bif_is_ne_exact],
             arith_compare_offset: labels[&arith_compare],
+            bif_element_guard_offset: labels[&bif_element_guard],
         })
     }
 
@@ -498,6 +505,12 @@ impl DispatchFragments {
         self.memory.ptr_at(self.bif_is_ne_exact_offset) as usize
     }
 
+    /// `bif_element_guard_shared`: position in x0, tuple in x1. The element is returned in x0,
+    /// or `THE_NON_VALUE` with the arguments copied to x2 and x3 when `element/2` fails.
+    pub fn bif_element_guard_shared(&self) -> usize {
+        self.memory.ptr_at(self.bif_element_guard_offset) as usize
+    }
+
     /// `arith_compare_shared`: terms in x0 and x1, the relation left in the flags.
     pub fn arith_compare_shared(&self) -> usize {
         self.memory.ptr_at(self.arith_compare_offset) as usize
@@ -592,7 +605,45 @@ fn emit_is_unequal_based_on_tags(code: &mut CodeBuffer) -> Result<(), BufferErro
     })
 }
 
-// Port of erts/emulator/beam/jit/arm/instr_common.cpp:2113-2176 (emit_arith_compare_shared),
+// Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp (emit_bif_element_helper and
+// emit_bif_element_guard_shared), OTP-29.1.1. ARG1 is the 1-based position and ARG2 the tuple;
+// the arguments are also copied to ARG3 and ARG4 so a body caller can raise `badarg` with them.
+fn emit_bif_element_guard_shared(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    let fail = code.new_label();
+    code.emit(|e| {
+        e.mov_reg(Gpr::x(2), ARG1)?;
+        e.mov_reg(Gpr::x(3), ARG2)
+    })?;
+    code.tbnz(ARG2, 0, fail)?;
+    code.emit(|e| {
+        e.sub_imm(TMP1, ARG2, 2, false)?;
+        e.ldr_uoff(TMP2, TMP1, 0)?;
+        e.tst_imm(TMP2, 0x3f)
+    })?;
+    code.b_cond(Cond::Ne, fail)?;
+    code.emit(|e| {
+        e.and_imm(TMP3, ARG1, 0xf)?;
+        e.cmp_imm(TMP3, 0xf, false)?;
+        e.ccmp_imm(ARG1, 0xf, 0b0100, Cond::Eq)
+    })?;
+    code.b_cond(Cond::Eq, fail)?;
+    code.emit(|e| {
+        e.asr_imm(TMP3, ARG1, 4)?;
+        e.cmp_reg(TMP3, TMP2, Shift::Lsr, 6)
+    })?;
+    code.b_cond(Cond::Hi, fail)?;
+    code.emit(|e| {
+        e.ldr_regoff(ARG1, TMP1, TMP3, 3)?;
+        e.ret(Gpr::x(30))
+    })?;
+    code.bind(fail)?;
+    code.emit(|e| {
+        e.mov_reg(ARG1, Gpr::xzr())?;
+        e.ret(Gpr::x(30))
+    })
+}
+
+// Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_arith_compare_shared),
 // OTP-29.1.1. The relation is returned in the flags (the same codes `cmp` / `fcmpe` set).
 fn emit_arith_compare_shared(
     code: &mut CodeBuffer,

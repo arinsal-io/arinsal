@@ -1769,6 +1769,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
             eq_exact: fragments.bif_is_eq_exact_shared(),
             ne_exact: fragments.bif_is_ne_exact_shared(),
             arith: fragments.arith_compare_shared(),
+            element_guard: fragments.bif_element_guard_shared(),
             eq: 0,
         });
         // The general path of `=:=` / `=/=` calls `eq` directly, with or without fragments.

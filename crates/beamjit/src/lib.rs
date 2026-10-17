@@ -1661,6 +1661,13 @@ pub fn compile_parsed_module_with_options(
         if let Some((dispatch_return, test_yield, context_switch)) = env.yield_fragments() {
             assembler.set_yield_fragments(dispatch_return, test_yield, context_switch);
         }
+        let shared = env.compare_shared();
+        if shared.arith != 0 {
+            assembler.set_arith_compare_shared(shared.arith);
+        }
+        if shared.element_guard != 0 {
+            assembler.set_element_guard_shared(shared.element_guard);
+        }
         assembler.enable_dump(&beam.module);
         for lambda in &beam.lambdas {
             if !native_labels.contains(&lambda.label) {
@@ -2796,7 +2803,7 @@ fn emit_op(
                     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2537-2634, OTP-29.1.1.
                     count(5)?;
                     let helper = env.guard_helper();
-                    let source = value(2)?;
+                    let source = TypedArg::new(value(2)?, operand_type(args.get(2), beam));
                     assembler.emit_is_ge(source, value(3)?, fail, helper)?;
                     assembler.emit_is_ge(value(4)?, source, n(1)?, helper)?;
                     break 'body;
@@ -2812,10 +2819,13 @@ fn emit_op(
                             "range guard requires a failure label".to_owned(),
                         ));
                     }
-                    let helper = env.guard_helper();
-                    assembler.emit_is_integer(typed_source, fail)?;
-                    assembler.emit_is_ge(source, value(2)?, fail, helper)?;
-                    assembler.emit_is_ge(value(3)?, source, fail, helper)?;
+                    assembler.emit_is_int_in_range(
+                        typed_source,
+                        value(2)?,
+                        value(3)?,
+                        fail,
+                        env.guard_helper(),
+                    )?;
                     break 'body;
                 }
                 if op.name() == "i_is_tuple_of_arity_ff" {
@@ -2916,19 +2926,38 @@ fn emit_op(
                                 &eq_literal_operand(args.get(2), beam, env)?,
                                 env.compare_shared().eq,
                             )?,
-                            "is_eq" => assembler.emit_is_eq(lhs, rhs, fail, env.guard_helper())?,
-                            "is_ne" => assembler.emit_is_ne(lhs, rhs, fail, env.guard_helper())?,
-                            "is_lt" => assembler.emit_is_lt(lhs, rhs, fail, env.guard_helper())?,
-                            "is_ge" => assembler.emit_is_ge(lhs, rhs, fail, env.guard_helper())?,
+                            "is_eq" => assembler.emit_is_eq(
+                                typed_arg(args.get(1), beam, env)?,
+                                typed_arg(args.get(2), beam, env)?,
+                                fail,
+                                env.guard_helper(),
+                            )?,
+                            "is_ne" => assembler.emit_is_ne(
+                                typed_arg(args.get(1), beam, env)?,
+                                typed_arg(args.get(2), beam, env)?,
+                                fail,
+                                env.guard_helper(),
+                            )?,
+                            "is_lt" => assembler.emit_is_lt(
+                                typed_arg(args.get(1), beam, env)?,
+                                typed_arg(args.get(2), beam, env)?,
+                                fail,
+                                env.guard_helper(),
+                            )?,
+                            "is_ge" => assembler.emit_is_ge(
+                                typed_arg(args.get(1), beam, env)?,
+                                typed_arg(args.get(2), beam, env)?,
+                                fail,
+                                env.guard_helper(),
+                            )?,
                             // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_int_ge),
                             // OTP-29.1.1: fails unless the source is an integer AND >= Min.
-                            "is_int_ge" => {
-                                assembler.emit_is_integer(
-                                    TypedArg::new(lhs, operand_type(args.get(1), beam)),
-                                    fail,
-                                )?;
-                                assembler.emit_is_ge(lhs, rhs, fail, env.guard_helper())?
-                            }
+                            "is_int_ge" => assembler.emit_is_int_ge(
+                                TypedArg::new(lhs, operand_type(args.get(1), beam)),
+                                rhs,
+                                fail,
+                                env.guard_helper(),
+                            )?,
                             _ => {
                                 return Err(EmitError::Operand(format!(
                                     "unknown op {}",
@@ -2950,7 +2979,7 @@ fn emit_op(
         EmitterKind::PairedRangeGuard => {
             count(5)?;
             // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2696-2755, OTP-29.1.1.
-            let source = value(2)?;
+            let source = TypedArg::new(value(2)?, operand_type(args.get(2), beam));
             assembler.emit_is_ge(source, value(3)?, n(0)?, env.guard_helper())?;
             if op.name() == "is_ge_lt" {
                 // `is_ge_lt` is `is_ge Src A` followed by `is_lt B Src` (instr_common.cpp:2713-2716).
@@ -3903,7 +3932,13 @@ fn emit_op(
                 }
                 "bif_element" => {
                     count(4)?;
-                    assembler.emit_bif_element(n(0)?, value(1)?, value(2)?, value(3)?, runtime)
+                    assembler.emit_bif_element(
+                        n(0)?,
+                        typed_arg(args.get(1), beam, env)?,
+                        typed_arg(args.get(2), beam, env)?,
+                        value(3)?,
+                        runtime,
+                    )
                 }
                 "bif_node" | "bif_bit_size" | "bif_byte_size" | "bif_tuple_size"
                 | "bif_map_size" | "bif_length" | "bif_abs" => {
