@@ -1136,7 +1136,7 @@ pub(crate) struct CompiledVersion {
     // each site is boxed so its address stays put.
     #[allow(clippy::vec_box)]
     nif_sites: Vec<Box<crate::native_helpers::NativeNifSite>>,
-    literal_heap: Option<Arc<VecHeap>>,
+    literal_heap: std::sync::Mutex<Option<Arc<VecHeap>>>,
     // The module's literal area, which native code refers to directly.
     _module_literals: arinsal_loader::LiteralArea,
     native_functions: Vec<crate::NativeFunction>,
@@ -1306,10 +1306,37 @@ impl CompiledVersion {
     pub(crate) fn publish(&self, module: &arinsal_loader::Module) {
         publish_module(self.scope, module, &self.native_targets);
     }
-    /// Sends native callers of this version's exports to the export trampoline. Run when the
-    /// version is freed explicitly (purge `complete`, a load that reclaims it), never from drop.
+    /// Sends native callers of this version's exports to the export trampoline and queues the
+    /// version's literals for release. Run when the version is freed explicitly (purge
+    /// `complete`, a load that reclaims it), never from drop: the code is gone at that point
+    /// whatever else still holds this value, like the explicit free of the old code header in
+    /// erts.
+    // Port of erts/emulator/beam/beam_bif_load.c (erts_internal_purge_module_2 complete:
+    // erts_queue_release_literals after the code is freed), OTP-29.1.1.
     pub(crate) fn unpublish(&self) {
         unpublish_module(self.scope, &self.native_targets);
+        self.retire_literals();
+    }
+
+    fn retire_literals(&self) {
+        let heap = self
+            .literal_heap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(heap) = heap {
+            // Port of erts/emulator/beam/beam_bif_load.c:2341
+            // (erts_queue_release_literals), OTP-29.1.1: purged code literals
+            // are copied out by the same collector as interpreter literals.
+            if lifetime_trace_enabled() {
+                eprintln!(
+                    "[beamasm-lifetime] retire literal heap module={} words={}",
+                    self.module,
+                    heap.used_words()
+                );
+            }
+            arinsal_pterm::store_for(self.scope).retire_module_area(heap);
+        }
     }
     /// The half-open address range of this version's native code.
     pub(crate) fn code_range(&self) -> (usize, usize) {
@@ -1344,19 +1371,7 @@ impl Drop for CompiledVersion {
                 }
             }
         }
-        if let Some(heap) = self.literal_heap.take() {
-            // Port of erts/emulator/beam/beam_bif_load.c:2341
-            // (erts_queue_release_literals), OTP-29.1.1: purged code literals
-            // are copied out by the same collector as interpreter literals.
-            if lifetime_trace_enabled() {
-                eprintln!(
-                    "[beamasm-lifetime] retire literal heap module={} words={}",
-                    self.module,
-                    heap.used_words()
-                );
-            }
-            arinsal_pterm::store_for(self.scope).retire_module_area(heap);
-        }
+        self.retire_literals();
         crate::native_bridge::unregister_native_functions(&self.native_functions);
         crate::native_bridge::unregister_native_catches(self.scope, &self.catch_ids);
         if lifetime_trace_enabled() {
@@ -2141,7 +2156,7 @@ pub(crate) fn compile(
             .collect(),
         nif_patches,
         nif_sites,
-        literal_heap: Some(Arc::from(literal_heap)),
+        literal_heap: std::sync::Mutex::new(Some(Arc::from(literal_heap))),
         _module_literals: module.literal_area(),
         native_functions,
         native_targets,

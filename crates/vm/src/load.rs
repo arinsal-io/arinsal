@@ -1432,4 +1432,26 @@ mod purge_free_tests {
         drop(native);
         vm.purge_state.hold_stage_permission_for_test(false);
     }
+
+    // erts_internal:purge_module/2 `complete` queues the old code's literals for release when
+    // it frees the code, even while a snapshot of the code tables still names the version: the
+    // purge wakes the literal collector right after, so a later retirement would never be
+    // collected by it.
+    #[test]
+    fn explicit_free_of_native_code_queues_its_literals_while_the_version_is_shared() {
+        let Some(beam) = beam("-module(purge_free_mod).\n-export([f/0]).\nf() -> ok.\n") else {
+            eprintln!("erlc unavailable; skipping purge free test");
+            return;
+        };
+        let mut vm = Vm::new([]);
+        let id = vm.load_bytes(&beam).unwrap();
+        let store = arinsal_pterm::store_for(vm.code_scope);
+        let released = vm.code_ix.update_active(|tables| tables.release(id));
+        let native = released.expect("native code of the old version");
+        let before = store.retired_generation();
+        native.unpublish();
+        assert_eq!(store.retired_generation(), before + 1);
+        drop(native);
+        assert_eq!(store.retired_generation(), before + 1);
+    }
 }
