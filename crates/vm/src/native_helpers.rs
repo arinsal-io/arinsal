@@ -1085,22 +1085,13 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     );
     // The emitter passes the full checked free-space gap, including CP and
     // S_RESERVED. Process::ensure uses that gap to decide whether to collect.
-    // X registers above the register cache live in the X register array. Those below `live`
-    // are roots and move with the collection, so they round-trip through `process.x`.
-    let synced = live.clamp(6, registers.x_reg_array.len());
-    process.x.ensure_x(synced);
-    if !process.x.is_attached() {
-        for index in 6..synced {
-            process.x[index] = registers.x_reg_array[index];
-        }
-    }
+    // `process.x` is the scheduler's X register array: the live prefix is rooted and moved in
+    // place, as in erts_garbage_collect_nobump on `reg`.
     let result = process.ensure_uncharged(need_words, live);
     if result.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
     }
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    // Only the live prefix moved; X registers past it stay untouched, as in erts.
-    crate::native_hooks::store_x(process, registers, live);
     process.sync_native_header();
     // Port of erts/emulator/beam/erl_gc.c:588-597 and 975-980 (a delayed collection
     // returns the reductions left), OTP-29.1.1: FCALLS runs out and the process yields at
@@ -4489,10 +4480,10 @@ fn arinsal_beamasm_map_change(
     };
     let base = live.max(6);
     let source_slot = base + n;
-    if source_slot >= registers.x_reg_array.len() {
+    if source_slot >= process.x.len() {
         return 0;
     }
-    registers.x_reg_array[source_slot] = crate::native_hooks::from_raw(source);
+    process.x[source_slot] = crate::native_hooks::from_raw(source);
     let map = crate::native_hooks::from_raw(source);
     let need = match change {
         MapChange::New => arinsal_maps::new_map_need(n),
@@ -4502,14 +4493,14 @@ fn arinsal_beamasm_map_change(
     if process.heap.words_left() < need {
         // X registers between the live prefix and the staged vector are dead and may hold
         // stale words; they must not become GC roots.
-        registers.x_reg_array[live..base].fill(Term::NIL);
+        process.x[live..base].fill(Term::NIL);
         if crate::native_hooks::collect_native(process, registers, need, source_slot + 1).is_err() {
             crate::native_hooks::set_error(process, "system_limit");
             process.sync_native_header();
             return 0;
         }
     }
-    let x = &registers.x_reg_array;
+    let x = &process.x;
     let arg = |i: usize| x[base + i];
     let map = x[source_slot];
     let mut heap = crate::ProcessHeapHandle(&mut process.heap);
@@ -4666,23 +4657,12 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     );
     let base_slot = live.max(6);
     let root_live = base_slot + count * 7;
-    if root_live > registers.x_reg_array.len() {
+    if root_live > process.x.len() {
         crate::native_hooks::set_error(process, "system_limit");
         return 0;
     }
-    process.x.ensure_x(root_live);
-    if process.x.is_attached() {
-        // Dead X registers below the staged segments must not become GC roots.
-        process.x[live..base_slot].fill(Term::NIL);
-    } else {
-        for (index, slot) in registers.x_reg_array[..root_live].iter().enumerate() {
-            process.x[index] = if (live..base_slot).contains(&index) {
-                Term::NIL
-            } else {
-                *slot
-            };
-        }
-    }
+    // Dead X registers below the staged segments must not become GC roots.
+    process.x[live..base_slot].fill(Term::NIL);
     let all = crate::signals::atom("all");
     let parse = |process: &crate::Process| -> Option<Vec<Segment<'static>>> {
         let mut segments = Vec::with_capacity(count);
@@ -4777,7 +4757,6 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
             other => break other,
         }
     };
-    crate::native_hooks::store_x(process, registers, root_live);
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     if result.is_ok() {
         process.reductions = process
@@ -4869,11 +4848,10 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
         .set_frame_pointer(registers.tmp_mem[2] as usize);
     let base = (live as usize).max(6);
     let root_live = base + 4;
-    process.x.ensure_x(root_live);
     // The X registers below `base` and the staged operands (the context among them) are the
-    // roots of a collection; the staged copies follow the registers in `process.x`.
+    // roots of a collection; the staged copies follow the registers in `process.x`, which is
+    // the scheduler's array.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp (emit_gc_test_preserve), OTP-29.1.1.
-    crate::native_hooks::load_x(process, registers, base);
     for (index, slot) in registers.match_staging.iter().enumerate() {
         process.x[base + index] = crate::native_hooks::from_raw(*slot);
     }
@@ -4956,7 +4934,6 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
             }
         }
     }
-    crate::native_hooks::store_x(process, registers, base);
     for (index, slot) in registers.match_staging.iter_mut().enumerate() {
         *slot = crate::native_hooks::raw(process.x[base + index]);
     }

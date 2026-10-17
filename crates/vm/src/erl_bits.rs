@@ -34,8 +34,7 @@ pub extern "C" fn append_binary(
     let root_live = live
         .max(src_index.saturating_add(1))
         .max(extra_index.saturating_add(1));
-    if root_live > registers.x_reg_array.len() || src_index >= root_live || extra_index >= root_live
-    {
+    if root_live > process.x.len() || src_index >= root_live || extra_index >= root_live {
         set_error(process, "system_limit");
         return 0;
     }
@@ -65,8 +64,8 @@ pub extern "C" fn append_binary(
     // through `process.reductions`, which `enter_runtime` started from the stored FCALLS. BUMP_REDS
     // clamps FCALLS at zero.
     let copy_reductions = arinsal_bits::create_bin_reductions(&build(
-        registers.x_reg_array[src_index],
-        registers.x_reg_array[extra_index],
+        process.x[src_index],
+        process.x[extra_index],
     ))
     .unwrap_or(0);
     let charge = |process: &mut crate::Process| {
@@ -77,10 +76,10 @@ pub extern "C" fn append_binary(
     };
     // Port of `erts_bs_append_checked`'s ERL_REFC_BITS_SIZE heap request: BinRef + SubBits.
     // `<<Bin/binary, Bin2/binary>>` fills one destination with the two source ranges.
-    if let Ok(collected) = process.ensure_native_roots(8, &mut registers.x_reg_array, root_live)
+    if let Ok(collected) = process.ensure_native_roots(8, root_live)
         && let Ok(Some(term)) = arinsal_bits::concat_byte_binary(
-            registers.x_reg_array[src_index],
-            registers.x_reg_array[extra_index],
+            process.x[src_index],
+            process.x[extra_index],
             &mut process.heap,
         )
     {
@@ -93,8 +92,6 @@ pub extern "C" fn append_binary(
         }
         return raw(term);
     }
-    process.x.ensure_x(root_live);
-    crate::native_hooks::load_x(process, registers, root_live);
     let initial = build(process.x[src_index], process.x[extra_index]);
     let mut request = match arinsal_bits::create_bin_size(&initial) {
         Ok(size) => size.heap_words,
@@ -114,7 +111,6 @@ pub extern "C" fn append_binary(
             other => break other,
         }
     };
-    crate::native_hooks::store_x(process, registers, root_live);
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     if result.is_ok() {
         charge(process);

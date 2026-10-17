@@ -97,48 +97,14 @@ fn field_value(
 }
 
 /// Make the live X registers and the staged operands collector roots; the registers between
-/// the live prefix and the staged words are dead and must not be roots.
-fn stage_roots(
-    process: &mut Process,
-    registers: &SchedulerRegisters,
-    live: usize,
-    base: usize,
-    top: usize,
-) -> Option<()> {
-    if top > registers.x_reg_array.len() {
+/// the live prefix and the staged words are dead and must not be roots. `process.x` is the
+/// scheduler's array, so the collector moves the roots in place.
+fn stage_roots(process: &mut Process, live: usize, base: usize, top: usize) -> Option<()> {
+    if top > process.x.len() {
         return None;
     }
-    process.x.ensure_x(top);
-    if process.x.is_attached() {
-        process.x[live..base].fill(Term::NIL);
-        return Some(());
-    }
-    for (index, slot) in registers.x_reg_array[..top].iter().enumerate() {
-        process.x[index] = if (live..base).contains(&index) {
-            Term::NIL
-        } else {
-            *slot
-        };
-    }
+    process.x[live..base].fill(Term::NIL);
     Some(())
-}
-
-/// Publish the registers a collection may have moved.
-fn publish_roots(
-    process: &Process,
-    registers: &mut SchedulerRegisters,
-    live: usize,
-    base: usize,
-    top: usize,
-) {
-    if process.x.is_attached() {
-        return;
-    }
-    for index in 0..top {
-        if !(live..base).contains(&index) {
-            registers.x_reg_array[index] = process.x[index];
-        }
-    }
 }
 
 /// Merge the sorted staged `(key, value)` words with a record's sorted keys.
@@ -189,7 +155,6 @@ fn create(
     };
     let result = create_record(
         process,
-        registers,
         native_hooks::from_raw(id),
         (live, count, base),
         external,
@@ -209,7 +174,6 @@ fn create(
 
 fn create_record(
     process: &mut Process,
-    registers: &mut SchedulerRegisters,
     id: Term,
     (live, count, base): (usize, usize, usize),
     external: bool,
@@ -223,11 +187,10 @@ fn create_record(
     let definition = Definition::parse(definition_term).ok_or(Failure::SystemLimit)?;
     let defaults = term_sequence(defaults).ok_or(Failure::SystemLimit)?;
     let top = base + count;
-    stage_roots(process, registers, live, base, top).ok_or(Failure::SystemLimit)?;
+    stage_roots(process, live, base, top).ok_or(Failure::SystemLimit)?;
     process
         .ensure(2 + definition.keys.len(), top)
         .map_err(|_| Failure::SystemLimit)?;
-    publish_roots(process, registers, live, base, top);
     let pairs = staged_pairs(process, base, count);
     let mut values = Vec::with_capacity(definition.keys.len());
     let mut next = 0;
@@ -306,12 +269,7 @@ pub extern "C" fn arinsal_beamasm_update_record(
     ) else {
         return 0;
     };
-    let result = update_record(
-        process,
-        registers,
-        native_hooks::from_raw(source),
-        (live, count, base),
-    );
+    let result = update_record(process, native_hooks::from_raw(source), (live, count, base));
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     match result {
         Ok(record) => {
@@ -327,7 +285,6 @@ pub extern "C" fn arinsal_beamasm_update_record(
 
 fn update_record(
     process: &mut Process,
-    registers: &mut SchedulerRegisters,
     source: Term,
     (live, count, base): (usize, usize, usize),
 ) -> Result<Term, Failure> {
@@ -336,15 +293,14 @@ fn update_record(
     // staged words.
     let source_slot = base + count;
     let top = source_slot + 1;
-    if top > registers.x_reg_array.len() {
+    if top > process.x.len() {
         return Err(Failure::SystemLimit);
     }
-    registers.x_reg_array[source_slot] = source;
-    stage_roots(process, registers, live, base, top).ok_or(Failure::SystemLimit)?;
+    process.x[source_slot] = source;
+    stage_roots(process, live, base, top).ok_or(Failure::SystemLimit)?;
     process
         .ensure(2 + snapshot.fields.len(), top)
         .map_err(|_| Failure::SystemLimit)?;
-    publish_roots(process, registers, live, base, top);
     let source = process.x[source_slot];
     let snapshot = source.record_snapshot().ok_or(Failure::BadRecord(source))?;
     let definition = Definition::parse(snapshot.definition).ok_or(Failure::SystemLimit)?;
