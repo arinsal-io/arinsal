@@ -1090,7 +1090,7 @@ impl ProcessHeap {
     /// Whether heap fragments exceed the free young-generation area.
     /// Port of erl_gc.h:132-139 (`ERTS_IS_GC_DESIRED`), OTP-29.1.1.
     pub fn gc_desired(&self) -> bool {
-        self.free_words() < self.fragment_words as usize
+        self.bif_free_words() < self.fragment_words as usize
     }
 
     /// Whether a term points into the old generation.
@@ -1293,6 +1293,7 @@ impl ProcessHeap {
         next.fullsweep_after = self.fullsweep_after;
         next.heap_grow = self.heap_grow;
         next.native_allocation = self.native_allocation;
+        next.bif_hidden_words = self.bif_hidden_words;
         next.minor_since_major = if major {
             0
         } else {

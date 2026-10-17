@@ -776,6 +776,8 @@ fn emit_export_fragment(
         encoder.mov_reg(Gpr::x(4), Gpr::x(1))?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
+        // No call-site entry address: only `call_light_bif_shared` passes `I`.
+        encoder.mov_reg(Gpr::x(2), Gpr::xzr())?;
         encoder.blr(Gpr::x(8))
     })?;
     code.b(direct_done)?;
