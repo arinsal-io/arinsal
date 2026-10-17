@@ -1364,11 +1364,7 @@ pub(crate) fn install_export_trap(
     assert!(arity <= 3, "BIF traps pass at most three arguments");
     // erts BIF_TRAPn writes the arguments to reg[0..n] and sets c_p->arity: they are the live
     // X registers of the export call, rooted like any other. GC stays enabled while trapped.
-    if process.x.len() < arity {
-        let mut registers = process.x.to_vec();
-        registers.resize(arity, Term::NIL);
-        process.x = registers.into();
-    }
+    process.x.ensure_x(arity);
     process.x[..arity].copy_from_slice(&trap.args);
     process.gc_live = arity;
     let gc_was_enabled = process.heap.gc_enabled;

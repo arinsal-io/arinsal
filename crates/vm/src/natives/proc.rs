@@ -3022,11 +3022,7 @@ fn hibernate(
     // Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the
     // arguments stay in the argument registers (arity 3) as the only roots and the stack
     // is discarded; the executor shrinks the heap once the BIF has unwound.
-    if process.x.len() < 3 {
-        let mut registers = process.x.to_vec();
-        registers.resize(3, Term::NIL);
-        process.x = registers.into();
-    }
+    process.x.ensure_x(3);
     process.heap.release_stack(process.heap.stack_words());
     for register in process.x.iter_mut() {
         *register = Term::NIL;

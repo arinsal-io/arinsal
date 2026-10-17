@@ -181,7 +181,7 @@ fn literal_scan_words(process: &Process) -> usize {
         .heap
         .literal_scan_words()
         .saturating_add(process.inbox.literal_scan_words())
-        .saturating_add(process.x.len())
+        .saturating_add(process.x.saved_arity())
         .saturating_add(usize::from(
             process
                 .cold
@@ -2344,7 +2344,8 @@ pub(super) fn take_memory_sample() -> Option<(u64, u64, u64)> {
 
 pub(crate) fn snapshot_process(process: &mut Process, _live_x: usize) {
     let word = std::mem::size_of::<usize>();
-    let extra = std::mem::size_of::<Process>() + process.x.len() * word + process.fr.len() * word;
+    let extra =
+        std::mem::size_of::<Process>() + process.x.saved_arity() * word + process.fr.len() * word;
     let capacity = process
         .heap
         .total_heap_size_words()
