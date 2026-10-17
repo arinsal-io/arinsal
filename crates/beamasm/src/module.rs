@@ -185,9 +185,9 @@ pub struct BeamModuleAssembler {
     dump_recording_function: bool,
 }
 
-/// Size of the `i_func_info` slot that precedes every function's call entry (erts places the
-/// `ErtsCodeInfo` before the entry the same way; beam_asm_module.cpp:499-540, OTP-29.1.1).
-pub const FUNC_INFO_BYTES: usize = 4;
+/// Size of the `i_func_info` slot that precedes every function's call entry: the `ErtsCodeInfo`
+/// of erts (a `bl`, the breakpoint flag, the generic breakpoint word and the 24-byte MFA).
+pub const FUNC_INFO_BYTES: usize = 40;
 
 type BsColdEmit = Box<dyn FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>>;
 /// `tmp_mem[6]`: the native pc an exception is attributed to.
@@ -385,15 +385,30 @@ impl BeamModuleAssembler {
         self.catch_patches.push((offset, handler));
     }
 
-    /// Emits a four-byte aligned function entry label.
-    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:556-560, OTP-29.1.1
+    /// Pads with NOPs to an 8-byte boundary, then binds a function's label: the start of its
+    /// `i_func_info` slot.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:550-559 (emit_aligned_label and
+    // emit_i_func_label), OTP-29.1.1.
     pub fn emit_i_func_label(&mut self, id: u32) -> Result<(), ModuleError> {
+        while !self.code.offset().is_multiple_of(8) {
+            self.code.emit(|e| {
+                e.nop();
+                Ok(())
+            })?;
+        }
+        self.emit_label(id)?;
+        self.current_function_label = Some(id);
+        Ok(())
+    }
+
+    /// Binds a BEAM label at the current offset.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:541-548 (emit_label), OTP-29.1.1.
+    pub fn emit_label(&mut self, id: u32) -> Result<(), ModuleError> {
         if self.defined.insert(id, ()).is_some() {
             return Err(ModuleError::DuplicateLabel(id));
         }
         let label = self.label(id);
         self.code.bind(label)?;
-        self.current_function_label = Some(id);
         Ok(())
     }
 
@@ -511,20 +526,20 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Emits the metadata placeholder associated with an `i_func_info` entry.
-    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:499-554, OTP-29.1.1
+    /// Emits the `ErtsCodeInfo` slot that precedes a function's entry: the `bl` into the
+    /// function clause fragment, the breakpoint flag, the generic breakpoint word and the MFA.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:499-540 (emit_i_func_info) and
+    // 484-497 (emit_i_func_info_shared), OTP-29.1.1: a failing head match branches here and
+    // raises error:function_clause with the function's arguments as the top frame. Like erts'
+    // `bl`, the link register points 4 bytes into the slot, inside the function's code range.
     pub fn emit_i_func_info(
         &mut self,
         _label: u32,
-        _module: u32,
-        _function: u32,
+        module: u64,
+        function: u64,
         arity: u8,
     ) -> Result<(), ModuleError> {
         self.function_arity = arity;
-        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:499-540 (emit_i_func_info) and
-        // 484-497 (emit_i_func_info_shared), OTP-29.1.1: a failing head match branches here and
-        // raises error:function_clause with the function's arguments as the top frame. Like erts'
-        // `bl`, the link register names the function: the entry right after this slot.
         let stub = match self.func_clause_stub {
             Some(stub) => stub,
             None => {
@@ -533,7 +548,17 @@ impl BeamModuleAssembler {
                 stub
             }
         };
+        let start = self.code.offset();
         self.code.bl(stub)?;
+        self.code.emit(|e| {
+            e.embed_uint32(0);
+            e.embed_uint64(0);
+            e.embed_uint64(module);
+            e.embed_uint64(function);
+            e.embed_uint64(u64::from(arity));
+            Ok(())
+        })?;
+        debug_assert_eq!(self.code.offset() - start, FUNC_INFO_BYTES);
         Ok(())
     }
 
@@ -1526,7 +1551,11 @@ impl BeamModuleAssembler {
                 e.mov_const(Gpr::x(8), function_clause)?;
                 e.str_uoff(Gpr::x(8), Gpr::x(21), 48)
             })?;
-            // x30 still holds the function entry from the `bl` in `emit_i_func_info`.
+            // x30 points 4 bytes into the function's `i_func_info` slot (the `bl` in
+            // `emit_i_func_info`). Registered native function ranges start at the entry after
+            // the slot, so the recorded pc is moved there.
+            self.code
+                .emit(|e| e.add_imm(Gpr::x(30), Gpr::x(30), (FUNC_INFO_BYTES - 4) as u16, false))?;
             self.code.b(self.error_label)?;
         }
         self.flush_yield_stubs()?;

@@ -161,3 +161,36 @@ fn move_return_local_call_frame_tail_yield_and_far_call() {
     assert_eq!(result_e, ExitReason::Returned);
     drop(module_e);
 }
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn function_entries_are_eight_byte_aligned_behind_a_forty_byte_info_slot() {
+    use arinsal_beamasm::module::FUNC_INFO_BYTES;
+
+    let mut asm = BeamModuleAssembler::new();
+    for label in [1u32, 2, 3] {
+        asm.emit_i_func_label(label).unwrap();
+        asm.emit_i_func_info(label, 0xa, 0xb, 1).unwrap();
+        asm.emit_i_entry_label(label + 100).unwrap();
+        asm.return_().unwrap();
+        for _ in 0..label {
+            asm.return_().unwrap();
+        }
+    }
+    asm.emit_label(7).unwrap();
+    asm.return_().unwrap();
+    asm.emit_i_func_label(4).unwrap();
+    let module = asm.finalize().unwrap();
+    assert_eq!(FUNC_INFO_BYTES, 40);
+    for label in [1u32, 2, 3, 4] {
+        let info = module.entries[&label] as usize;
+        assert_eq!(info % 8, 0, "info slot of {label}");
+    }
+    let first = module.entries[&1] as usize;
+    assert_eq!(
+        (first + FUNC_INFO_BYTES) % 8,
+        0,
+        "entry of the first function"
+    );
+    assert!(module.entries[&2] as usize - first > FUNC_INFO_BYTES);
+}
