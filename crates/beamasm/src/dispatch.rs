@@ -25,6 +25,7 @@ pub struct DispatchFragments {
     memory: CodeMemory,
     export_offset: usize,
     light_bif_offset: usize,
+    light_bif_helper_offset: usize,
     /// Helper-ABI fragment for call breakpoints. `call_light_bif_shared` is not its entry:
     /// erts calls `erts_generic_breakpoint` from the trampoline itself.
     breakpoint_offset: usize,
@@ -243,6 +244,7 @@ impl DispatchFragments {
         let mut code = CodeBuffer::new();
         let export = code.new_label();
         let light_bif = code.new_label();
+        let light_bif_without_pointer = code.new_label();
         let breakpoint = code.new_label();
         let breakpoint_helper = code.new_label();
         let line_breakpoint = code.new_label();
@@ -272,8 +274,20 @@ impl DispatchFragments {
             light_bif_gc_helper,
             light_gc_offsets,
             exception_resolver,
+            false,
         )
         .map_err(|_| ExecError::InvalidSize("light BIF fragment"))?;
+        code.bind(light_bif_without_pointer)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_call_light_bif_shared(
+            &mut code,
+            light_bif_helper,
+            light_bif_gc_helper,
+            light_gc_offsets,
+            exception_resolver,
+            true,
+        )
+        .map_err(|_| ExecError::InvalidSize("light BIF helper fragment"))?;
         // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:176-229
         // (emit_i_breakpoint_trampoline_shared), OTP-29.1.1: the trampoline only calls this
         // fragment; it passes (c_p, identity, site) and a trap return to the helper. That is the
@@ -364,6 +378,7 @@ impl DispatchFragments {
             memory,
             export_offset: labels[&export],
             light_bif_offset: labels[&light_bif],
+            light_bif_helper_offset: labels[&light_bif_without_pointer],
             breakpoint_offset: labels[&breakpoint],
             line_breakpoint_offset: labels[&line_breakpoint],
             line_breakpoint_cleanup_offset: labels[&line_breakpoint_cleanup],
@@ -397,6 +412,12 @@ impl DispatchFragments {
     /// Shared light-BIF fragment address.
     pub fn call_light_bif(&self) -> usize {
         self.memory.ptr_at(self.light_bif_offset) as usize
+    }
+
+    /// Shared light-BIF fragment for exports without a published BIF pointer: the helper
+    /// dispatches them, so the call site passes no ARG8.
+    pub fn call_light_bif_helper(&self) -> usize {
+        self.memory.ptr_at(self.light_bif_helper_offset) as usize
     }
 
     /// Fragment the native call-breakpoint trampoline enters.
@@ -993,8 +1014,10 @@ fn emit_raise_exception_fragment(
 
 /// Shared body of every `call_light_bif`.
 ///
-/// On entry ARG3 (`x3`) is the call's entry address and ARG4 (`x4`) is the export.
-/// The fragment charges one reduction, calls the BIF helper, and either returns with
+/// On entry ARG3 (`x2`) is the call's entry address, ARG4 (`x3`) is the export and ARG8
+/// (`x7`) is the BIF to call, as at erts' call site. With `helper_only` there is no BIF
+/// pointer (the export is one the helper dispatches) and ARG8 is not read.
+/// The fragment charges one reduction, calls the BIF, and either returns with
 /// the result in XREG0 or leaves native code on a trap, an error or a yield.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-593 (emit_call_light_bif_shared),
 // OTP-29.1.1.
@@ -1004,6 +1027,7 @@ fn emit_call_light_bif_shared(
     gc_helper: usize,
     gc: LightGcOffsets,
     resolver: usize,
+    helper_only: bool,
 ) -> Result<(), BufferError> {
     let trace = code.new_label();
     let yield_bif = code.new_label();
@@ -1020,13 +1044,13 @@ fn emit_call_light_bif_shared(
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:384-387, OTP-29.1.1:
     // spill the entry before the trace check. The trace path never returns here, and
     // the scheduler names the caller from this slot (`native_error_pc` / `tmp_mem[6]`).
-    code.emit(|encoder| encoder.str_uoff(Gpr::x(3), Gpr::x(19), 16_432))?;
+    code.emit(|encoder| encoder.str_uoff(Gpr::x(2), Gpr::x(19), 16_432))?;
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397, OTP-29.1.1:
     // a traced BIF, or a process saving calls, dispatches through the export entry.
     code.emit(|encoder| {
         encoder.ldr_uoff(
             Gpr::w(9),
-            Gpr::x(4),
+            Gpr::x(3),
             crate::bif::EXPORT_IS_BIF_TRACED_OFFSET,
         )?;
         encoder.cmp_imm(Gpr::w(9), 0, false)?;
@@ -1040,40 +1064,36 @@ fn emit_call_light_bif_shared(
     code.b_cond(Cond::Eq, trace)?;
     code.emit(|encoder| encoder.subs_imm(Gpr::w(22), Gpr::w(22), 1, false))?;
     code.b_cond(Cond::Le, yield_bif)?;
+    // `emit_enter_runtime` runs before the host frame is made, so the `tmp_mem[2]` slot it
+    // stores x29 into holds the Erlang frame pointer, which the light trap path reads and
+    // `emit_leave_runtime` reloads.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:437-440 (emit_enter_runtime_frame),
+    // OTP-29.1.1.
+    emit_enter_runtime(code, MAX_BIF_ARITY, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
-        encoder.str_uoff(Gpr::x(4), Gpr::sp(), 16)?;
+        encoder.str_uoff(Gpr::x(3), Gpr::sp(), 16)?;
         encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
         Ok(())
     })?;
-    emit_enter_runtime(code, MAX_BIF_ARITY, RUNTIME_UPDATE)?;
     let helper_call = code.new_label();
     let after_bif = code.new_label();
-    code.emit(|encoder| {
-        // `emit_enter_runtime_frame` made x29 the host frame, and `emit_enter_runtime`
-        // stored that into `tmp_mem[2]`. The Erlang frame pointer is the x29 saved at
-        // `[sp]`; the light trap path reads `tmp_mem[2]` as that pointer.
-        // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:437-440 (emit_enter_runtime_frame),
-        // OTP-29.1.1, with the same repair as `emit_helper_fragment`.
-        encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 0)?;
-        encoder.str_uoff(Gpr::x(9), Gpr::x(19), frame_pointer_slot)?;
-        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:434-445, OTP-29.1.1:
-        // `dynamic_runtime_call<3>(ARG8)` of the BIF itself. A zero pointer is a BIF
-        // the helper still dispatches (traps, the executor, save_calls already branched).
-        encoder.ldr_uoff(Gpr::x(8), Gpr::x(4), crate::bif::EXPORT_LIGHT_BIF_OFFSET)
-    })?;
-    code.cbz(Gpr::x(8), helper_call)?;
-    code.emit(|encoder| {
-        // (c_p, reg, I, Export.info). x19 is the register array; the entry pc was
-        // spilled at the top. ARG4 stays the Export* the call site loaded
-        // (instr_bif.cpp:434-445). `info` is the descriptor, the same word the
-        // helper path loads; the BIF does not look the export up.
-        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
-        encoder.mov_reg(Gpr::x(2), Gpr::x(3))?;
-        encoder.ldr_uoff(Gpr::x(3), Gpr::x(4), crate::bif::EXPORT_INFO_OFFSET)?;
-        encoder.blr(Gpr::x(8))
-    })?;
+    if helper_only {
+        code.b(helper_call)?;
+    } else {
+        code.emit(|encoder| {
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:434-445, OTP-29.1.1:
+            // `dynamic_runtime_call<3>(ARG8)` of the BIF itself. (c_p, reg, I, Export.info).
+            // x19 is the register array and ARG3 the entry the call site loaded. `info` is
+            // the descriptor, the same word the helper path loads; the BIF does not look
+            // the export up, and takes it from x4.
+            encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
+            encoder.mov_reg(Gpr::x(4), Gpr::x(3))?;
+            encoder.ldr_uoff(Gpr::x(3), Gpr::x(3), crate::bif::EXPORT_INFO_OFFSET)?;
+            encoder.blr(Gpr::x(7))
+        })?;
+    }
     code.bind(after_bif)?;
     emit_leave_runtime(code, MAX_BIF_ARITY, RUNTIME_UPDATE)?;
     code.cbnz(Gpr::x(0), success)?;
@@ -1140,9 +1160,7 @@ fn emit_call_light_bif_shared(
             // Enabled: overhead against bin_vheap_sz. Disabled: C is set, so the next
             // condition fails and collection is taken.
             encoder.ccmp_reg(Gpr::x(12), Gpr::x(13), NZCV_CF, Cond::Eq)?;
-            encoder.ldr_uoff(Gpr::x(10), Gpr::x(21), 0)?;
-            encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 8)?;
-            encoder.sub_reg(Gpr::x(9), Gpr::x(9), Gpr::x(10), Shift::Lsl, 0)?;
+            encoder.sub_reg(Gpr::x(9), Gpr::x(20), Gpr::x(23), Shift::Lsl, 0)?;
             encoder.asr_imm(Gpr::x(9), Gpr::x(9), 3)?;
             encoder.ldr_uoff(Gpr::w(11), Gpr::x(21), gc.fragment_words)?;
             // Unless the binary test said "no collection" (LS), the flags force `lt`.
@@ -1192,9 +1210,10 @@ fn emit_call_light_bif_shared(
         // x0 = c_p, x1 = export, x2 = export (site; breakpoints use a real one),
         // x3 = the export's descriptor word.
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        encoder.mov_reg(Gpr::x(1), Gpr::x(4))?;
-        encoder.mov_reg(Gpr::x(2), Gpr::x(4))?;
-        encoder.ldr_uoff(Gpr::x(3), Gpr::x(4), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(3))?;
+        encoder.mov_reg(Gpr::x(2), Gpr::x(3))?;
+        encoder.mov_reg(Gpr::x(4), Gpr::x(3))?;
+        encoder.ldr_uoff(Gpr::x(3), Gpr::x(3), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
@@ -1215,8 +1234,8 @@ fn emit_call_light_bif_shared(
     code.bind(yield_bif)?;
     code.emit(|encoder| {
         // c_p->i = entry, c_p->arity = the export's arity, then the yield bridge.
-        encoder.str_uoff(Gpr::x(3), Gpr::x(21), 72)?;
-        encoder.ldrb_uoff(Gpr::w(8), Gpr::x(4), crate::bif::EXPORT_ARITY_OFFSET as u16)?;
+        encoder.str_uoff(Gpr::x(2), Gpr::x(21), 72)?;
+        encoder.ldrb_uoff(Gpr::w(8), Gpr::x(3), crate::bif::EXPORT_ARITY_OFFSET as u16)?;
         encoder.strb_uoff(Gpr::w(8), Gpr::x(21), 80)?;
         Ok(())
     })?;
@@ -1229,7 +1248,7 @@ fn emit_call_light_bif_shared(
     // beam_asm.hpp:388-403 (emit_setup_dispatchable_call), OTP-29.1.1.
     code.bind(trace)?;
     code.emit(|encoder| {
-        encoder.mov_reg(Gpr::x(0), Gpr::x(4))?;
+        encoder.mov_reg(Gpr::x(0), Gpr::x(3))?;
         encoder.ldr_regoff(Gpr::x(14), Gpr::x(0), Gpr::x(24), 3)?;
         encoder.br(Gpr::x(14))
     })?;
