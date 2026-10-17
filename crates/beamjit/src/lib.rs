@@ -2569,14 +2569,16 @@ fn emit_op(
             if args.len() == 2 {
                 Ok(assembler.init_yregs(n(0)?, n(1)?)?)
             } else if let [SpecificOperand::List(registers)] = args {
+                let mut indices = Vec::with_capacity(registers.len());
                 for register in registers {
                     let SpecificOperand::Y(index) = register else {
                         return Err(EmitError::Operand(
                             "init_yregs list must contain Y registers".to_owned(),
                         ));
                     };
-                    assembler.init_yregs(*index, 1)?;
+                    indices.push(*index);
                 }
+                assembler.init_yregs_list(&indices)?;
                 Ok(())
             } else {
                 Err(arinsal_beamasm::module::ModuleError::InvalidOperand(
@@ -3613,8 +3615,7 @@ fn emit_op(
             "put_list2" => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:775-792, OTP-29.1.1.
-                assembler.emit_put_list(value(0)?, value(2)?, value(3)?)?;
-                assembler.emit_put_list(value(1)?, value(3)?, value(3)?)
+                assembler.emit_put_list2(value(0)?, value(1)?, value(2)?, value(3)?)
             }
             "put_tuple2" => {
                 count(2)?;
@@ -3744,8 +3745,7 @@ fn emit_op(
             "move_trim" => {
                 count(3)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:559-600, OTP-29.1.1.
-                assembler.move_(value(0)?, value(1)?)?;
-                assembler.trim(n(2)?, 0)
+                assembler.move_trim(value(0)?, value(1)?, n(2)?)
             }
             "move_call_last" => {
                 count(4)?;
@@ -3755,21 +3755,19 @@ fn emit_op(
             "put_list_deallocate" => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:723-773, OTP-29.1.1.
-                assembler.emit_put_list(value(0)?, value(1)?, value(2)?)?;
-                assembler.deallocate(n(3)?)
+                assembler.emit_put_list_deallocate(value(0)?, value(1)?, value(2)?, n(3)?)
             }
             "move_two_trim" => {
                 count(5)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:521-557, OTP-29.1.1: both
                 // Y sources are read before either destination is written, then the frame is
                 // trimmed.
-                if !matches!((value(0)?, value(2)?), (ArgVal::Y(_), ArgVal::Y(_))) {
+                let (ArgVal::Y(src1), ArgVal::Y(src2)) = (value(0)?, value(2)?) else {
                     return Err(EmitError::Operand(
                         "move_two_trim sources must be Y registers".into(),
                     ));
-                }
-                assembler.emit_store_two_values(value(0)?, value(1)?, value(2)?, value(3)?)?;
-                assembler.trim(n(4)?, 0)
+                };
+                assembler.move_two_trim(src1, value(1)?, src2, value(3)?, n(4)?)
             }
             "move_call_ext_last" => {
                 count(4)?;

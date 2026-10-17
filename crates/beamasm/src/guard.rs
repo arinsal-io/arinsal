@@ -1408,12 +1408,12 @@ impl BeamModuleAssembler {
             return self.emit_exact_immediate_guard(lhs, rhs, fail, fail_on_equal);
         }
         if let Some((term, value)) = exact_immediate_operand(lhs.val, rhs.val) {
-            let left = self.source_reg(term)?;
-            self.emit_cmp_immediate_or_register(left, value)?;
-            let cond = if fail_on_equal { Cond::Eq } else { Cond::Ne };
-            let fail = self.label(fail);
-            self.code.b_cond(cond, fail)?;
-            return Ok(());
+            let word = TypedArg {
+                val: ArgVal::Immediate(value),
+                ..rhs
+            };
+            let term = TypedArg { val: term, ..lhs };
+            return self.emit_exact_immediate_guard(term, word, fail, fail_on_equal);
         }
         if *literal != EqLiteral::Generic {
             if !matches!(rhs.val, ArgVal::Literal(_)) {
@@ -1632,18 +1632,41 @@ impl BeamModuleAssembler {
         fail: u32,
         fail_on_equal: bool,
     ) -> Result<(), ModuleError> {
-        if rhs.is_immed() {
-            let left = self.source_reg(lhs.val)?;
-            self.emit_cmp_immediate_or_register(left, rhs.word())?;
-        } else {
-            let left = self.source_reg(lhs.val)?;
-            let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
-            self.code
-                .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        }
+        let left = self.source_reg_into(lhs.val, Gpr::x(0))?;
         let fail = self.label(fail);
+        self.preserve_cache(&[], |this| {
+            this.cmp_arg(left, rhs.val)?;
+            this.code
+                .b_cond(if fail_on_equal { Cond::Eq } else { Cond::Ne }, fail)?;
+            Ok(())
+        })
+    }
+
+    /// Compares a register with a signed constant: `cmp` or `cmn` with a 12-bit immediate,
+    /// otherwise through the super temporary.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:795-806 (cmp), OTP-29.1.1.
+    pub(super) fn cmp_signed(&mut self, reg: Gpr, value: i64) -> Result<(), ModuleError> {
+        if (0..=4095).contains(&value) {
+            self.code.emit(|e| e.cmp_imm(reg, value as u16, false))?;
+        } else if (-4095..0).contains(&value) {
+            self.code.emit(|e| e.cmn_imm(reg, (-value) as u16, false))?;
+        } else {
+            self.mov_value(Gpr::x(17), false, value as u64)?;
+            self.code
+                .emit(|e| e.cmp_reg(reg, Gpr::x(17), arinsal_a64::enc::Shift::Lsl, 0))?;
+        }
+        Ok(())
+    }
+
+    /// Compares a register with an immediate or with any other source operand.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1777-1790 (cmp_arg), OTP-29.1.1.
+    pub(super) fn cmp_arg(&mut self, reg: Gpr, arg: ArgVal) -> Result<(), ModuleError> {
+        if let ArgVal::Immediate(word) = arg {
+            return self.cmp_signed(reg, word as i64);
+        }
+        let other = self.source_reg_into(arg, Gpr::x(17))?;
         self.code
-            .b_cond(if fail_on_equal { Cond::Eq } else { Cond::Ne }, fail)?;
+            .emit(|e| e.cmp_reg(reg, other, arinsal_a64::enc::Shift::Lsl, 0))?;
         Ok(())
     }
 
