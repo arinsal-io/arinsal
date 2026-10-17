@@ -19,6 +19,7 @@ pub mod guard;
 pub mod map;
 pub mod misc;
 pub mod module;
+pub mod raise_frag;
 pub mod receive;
 pub mod records;
 mod regcache;

@@ -501,6 +501,20 @@ fn yield_fragments() -> Option<&'static arinsal_beamasm::yield_frag::YieldFragme
         .as_ref()
 }
 
+fn raise_fragments() -> Option<&'static arinsal_beamasm::raise_frag::RaiseFragments> {
+    static FRAGMENTS: OnceLock<Option<arinsal_beamasm::raise_frag::RaiseFragments>> =
+        OnceLock::new();
+    FRAGMENTS
+        .get_or_init(|| {
+            arinsal_beamasm::raise_frag::RaiseFragments::new(
+                crate::native_helpers::arinsal_beamasm_exception_resolver as *const () as usize,
+                crate::native_helpers::arinsal_beamasm_raise_class as *const () as usize,
+            )
+            .ok()
+        })
+        .as_ref()
+}
+
 fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
     static FRAGMENTS: OnceLock<Option<arinsal_beamasm::map::MapFragments>> = OnceLock::new();
     FRAGMENTS
@@ -1753,6 +1767,9 @@ impl ModuleEnv for VmModuleEnv<'_> {
                 fragments.context_switch(),
             )
         })
+    }
+    fn raise_fragments(&self) -> Option<(usize, usize)> {
+        raise_fragments().map(|fragments| (fragments.raise_shared(), fragments.raise_exception()))
     }
     fn send_fragment(&self) -> usize {
         self.send_fragment

@@ -119,6 +119,11 @@ pub trait ModuleEnv {
     fn yield_fragments(&self) -> Option<(usize, usize, usize)> {
         None
     }
+    /// Process-wide `(raise_shared, raise_exception)` fragments, or `None` when the
+    /// environment has none (each `raise` then carries the exception transfer inline).
+    fn raise_fragments(&self) -> Option<(usize, usize)> {
+        None
+    }
     /// Fragment called by `i_line_breakpoint_trampoline` when line instrumentation is enabled.
     fn line_breakpoint_fragment(&self) -> usize {
         0
@@ -1667,6 +1672,9 @@ pub fn compile_parsed_module_with_options(
         }
         if shared.element_guard != 0 {
             assembler.set_element_guard_shared(shared.element_guard);
+        }
+        if let Some((raise_shared, raise_exception)) = env.raise_fragments() {
+            assembler.set_raise_fragments(raise_shared, raise_exception);
         }
         assembler.enable_dump(&beam.module);
         for lambda in &beam.lambdas {
