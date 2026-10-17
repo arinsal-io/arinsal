@@ -1004,7 +1004,12 @@ pub fn run_native(
         resume_live - 1
     };
     let live = usize::from(arity);
-    process.ensure(1 + arinsal_term::S_RESERVED, live)?;
+    // erts does no collection at swap-in (process_main restores the registers and jumps); the
+    // heap invariant `HTOP + S_RESERVED <= E` is all native code needs on entry, and `ensure`
+    // already demands S_RESERVED while the heap is native. A later instruction that really needs
+    // heap collects inside the callee, with the callee's continuation word on the stack. Asking
+    // for more here collected at resume, one stack word and one collection away from erts.
+    process.ensure(0, live)?;
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-261 (emit_i_apply_only),
     // OTP-29.1.1: a call the scheduler performs for native code (fun/apply, BIF traps,
