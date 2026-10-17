@@ -10,7 +10,19 @@ const SEMANTICS: &str = r#"semantics() ->
     G = fun(L) when length(L) > 250000 -> big; (_) -> small end,
     Err = fun(L) -> try length(L) catch error:E:St -> {E, [{M, F, is_list(A)} || {M, F, A, _} <- [hd(St)]]} end end,
     Keep = fun(A, B, C, D) -> {A, length(B), C, D, length(B) + length(A)} end,
-    [G(Long), G(lists:seq(1, 10)), G(Bad), Err(Bad), Err(improper),
+    Uni = [I rem 3000 + 100 || I <- lists:seq(1, 120000)],
+    UniBin = unicode:characters_to_binary(Uni),
+    Cut = binary:part(UniBin, 0, byte_size(UniBin) - 1),
+    [unicode:characters_to_binary(Uni), unicode:characters_to_list(UniBin),
+     unicode:characters_to_binary(Uni ++ [16#D800 | Uni]),
+     unicode:characters_to_binary([Uni, <<255>>, Uni]),
+     unicode:characters_to_binary([Uni, Cut], utf8),
+     unicode:characters_to_list(Cut), unicode:characters_to_list(<<UniBin/binary, 255, UniBin/binary>>),
+     unicode:characters_to_list([Uni, UniBin, [Uni | UniBin]], latin1),
+     unicode:characters_to_binary(Uni, latin1), unicode:characters_to_binary([[Uni], [], [<<"x">>]]),
+     unicode:characters_to_list(lists:duplicate(100000, 255), latin1),
+     unicode:characters_to_list(<<(binary:copy(<<"abc">>, 70000))/binary>>),
+     G(Long), G(lists:seq(1, 10)), G(Bad), Err(Bad), Err(improper),
      Keep(Long, Long, 3, 4), erlang:crc32([lists:duplicate(100000, 5), <<1, 2, 3>>, [255 | <<4>>]]),
           erlang:md5([<<1>>, lists:duplicate(70000, 7), <<2>>])]
     ++ [T(fun() -> erlang:crc32([Long, a]) end), T(fun() -> erlang:phash2(Long, 0) end),
@@ -27,7 +39,7 @@ const MODULE: &str = "reds_size_bifs_test";
 const SLACK: i64 = 16;
 
 /// Sizes of the input in the no-GC window.
-const SIZES: [(&str, usize); 4] = [
+const DEFAULT_SIZES: [(&str, usize); 4] = [
     ("1", 1),
     ("1k", 1_000),
     ("100k", 100_000),
@@ -67,47 +79,124 @@ const CASES: &[(&str, &str, &str, Option<&str>)] = &[
     ("phash2_bin", "bin(N)", "erlang:phash2(In)", None),
     ("phash2_str", "binl(N)", "erlang:phash2(In)", None),
     (
-        "send_list",
-        "send_to(lists:seq(1, N))",
-        "send(In)",
-        Some("sent"),
+        "uni_to_bin",
+        "uni_list(N)",
+        "unicode:characters_to_binary(In)",
+        None,
     ),
     (
-        "send_tuples",
-        "send_to([{I, x} || I <- lists:seq(1, N)])",
-        "send(In)",
-        Some("sent"),
+        "uni_to_bin_ascii",
+        "ascii_list(N)",
+        "unicode:characters_to_binary(In)",
+        None,
     ),
-    ("send_binary", "send_to(bin(N))", "send(In)", Some("sent")),
     (
-        "send_erlang",
-        "send_to(lists:seq(1, N))",
-        "send_erlang(In)",
-        Some("sent"),
+        "uni_to_bin_latin1",
+        "ascii_list(N)",
+        "unicode:characters_to_binary(In, latin1)",
+        None,
+    ),
+    (
+        "uni_to_bin_bin",
+        "uni_bin(N)",
+        "unicode:characters_to_binary(In)",
+        None,
+    ),
+    (
+        "uni_to_bin_deep",
+        "uni_deep(N)",
+        "unicode:characters_to_binary(In)",
+        None,
+    ),
+    (
+        "uni_to_list_bin",
+        "uni_bin(N)",
+        "unicode:characters_to_list(In)",
+        None,
+    ),
+    (
+        "uni_to_list_ascii",
+        "ascii_bin(N)",
+        "unicode:characters_to_list(In)",
+        None,
+    ),
+    (
+        "uni_to_list_latin1",
+        "ascii_bin(N)",
+        "unicode:characters_to_list(In, latin1)",
+        None,
+    ),
+    (
+        "uni_to_list_list",
+        "uni_list(N)",
+        "unicode:characters_to_list(In)",
+        None,
+    ),
+    (
+        "uni_to_bin_chunks",
+        "uni_chunks(N)",
+        "unicode:characters_to_binary(In)",
+        None,
+    ),
+    (
+        "uni_to_bin_latin1_high",
+        "latin1_list(N)",
+        "unicode:characters_to_binary(In, latin1)",
+        None,
+    ),
+    (
+        "uni_to_list_chunks",
+        "uni_chunks(N)",
+        "unicode:characters_to_list(In)",
+        None,
+    ),
+    (
+        "uni_to_list_latin1_high",
+        "latin1_bin(N)",
+        "unicode:characters_to_list(In, latin1)",
+        None,
+    ),
+    (
+        "uni_to_list_bin_mixed",
+        "uni_bin(N)",
+        "unicode:characters_to_list(In, utf8)",
+        None,
     ),
 ];
 
 /// Large inputs are only run where the call is linear and the structure is light.
+/// `REDS_SIZES=200000,300000` replaces the sizes for a local investigation.
+fn sizes() -> Vec<(String, usize)> {
+    match std::env::var("REDS_SIZES") {
+        Ok(list) => list
+            .split(',')
+            .filter_map(|size| size.trim().parse::<usize>().ok())
+            .map(|size| (size.to_string(), size))
+            .collect(),
+        Err(_) => DEFAULT_SIZES
+            .iter()
+            .map(|(label, size)| (label.to_string(), *size))
+            .collect(),
+    }
+}
+
 fn skipped(name: &str, size: usize) -> bool {
     size > 100_000
-        && (name.ends_with("_list")
-            || name.ends_with("_str")
-            || name.starts_with("ets_")
-            || name.starts_with("uni_"))
+        && (name.ends_with("_list") || name.ends_with("_str") || name.starts_with("ets_"))
 }
 
 fn source() -> String {
     let mut exports = Vec::new();
     let mut bodies = String::new();
     for (name, build, call, post) in CASES {
-        for (label, size) in SIZES {
+        for (label, size) in sizes() {
             if skipped(name, size) {
                 continue;
             }
             let function = format!("{name}_{label}");
             let post = match post {
                 Some(post) => format!("fun post_{post}/1"),
-                None => "fun(R) -> R end".to_string(),
+                None => "fun post_hash/1".to_string(),
             };
             exports.push(format!("{function}/0"));
             bodies.push_str(&format!(
@@ -146,15 +235,29 @@ ascii_list(N) -> [97 + I rem 26 || I <- lists:seq(1, N)].
 
 uni_bin(N) -> unicode:characters_to_binary(uni_list(N)).
 
+uni_chunks(N) -> chunks(unicode:characters_to_binary(uni_list(N)), 37).
+
+chunks(<<>>, _) -> [];
+chunks(Bin, K) when byte_size(Bin) =< K -> [Bin];
+chunks(Bin, K) ->
+    {{A, B}} = split_binary(Bin, K),
+    [A | chunks(B, K)].
+
+latin1_list(N) -> [I rem 256 || I <- lists:seq(1, N)].
+
+latin1_bin(N) -> list_to_binary(latin1_list(N)).
+
 ascii_bin(N) -> list_to_binary(ascii_list(N)).
 
 uni_deep(N) -> uni_deep(uni_list(N), 100).
 
 uni_deep([], _) -> [];
-uni_deep(L, K) when length(L) =< K -> [L];
 uni_deep(L, K) ->
-    {{A, B}} = lists:split(K, L),
-    [A | uni_deep(B, K)].
+    try lists:split(K, L) of
+        {{A, B}} -> [A | uni_deep(B, K)]
+    catch
+        error:_ -> [L]
+    end.
 
 send_to(Msg) ->
     Rx = spawn(fun() -> receive stop -> ok end end),
@@ -163,6 +266,9 @@ send_to(Msg) ->
 send({{Rx, Msg}}) -> Rx ! Msg.
 
 send_erlang({{Rx, Msg}}) -> erlang:send(Rx, Msg).
+
+post_hash(R) when is_integer(R) -> R;
+post_hash(R) -> erlang:phash2(R, 4294967296).
 
 post_length(R) -> length(R).
 
@@ -183,7 +289,9 @@ measure(N, Build, Run, Post) ->
         Result = Run(In),
         {{reductions, R1}} = process_info(self(), reductions),
         {{garbage_collection, GC}} = process_info(self(), garbage_collection),
-        Parent ! {{measured, R1 - R0, true, proplists:get_value(minor_gcs, GC), Post(Result)}}
+        erlang:yield(),
+        Parent ! {{measured, R1 - R0, true, proplists:get_value(minor_gcs, GC), Post(Result)}},
+        erlang:yield()
     end, [{{min_heap_size, Words}}, {{min_bin_vheap_size, Words}}]),
     1 = erlang:trace(Pid, true, [running, {{tracer, Parent}}]),
     receive ready -> ok after 20000 -> exit(no_ready) end,
@@ -227,7 +335,7 @@ fn measured(term: &OwnedTerm) -> (i64, i64, i64, &OwnedTerm) {
 fn functions() -> Vec<String> {
     let mut names = Vec::new();
     for (name, _, _, _) in CASES {
-        for (label, size) in SIZES {
+        for (label, size) in sizes() {
             if skipped(name, size) {
                 continue;
             }

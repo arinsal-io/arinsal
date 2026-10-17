@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use arinsal_term::{Term, TermBuilder, TermKind, global_atoms};
 
+use crate::lists::DeferredTrap;
 use crate::pure::{Heap, bool_term, tuple_build};
 use crate::{BifError, Ctx};
 
@@ -769,11 +770,377 @@ fn process_binary(
 }
 
 fn characters_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    convert(ctx, args, false)
+    convert_charged(ctx, args, false)
 }
 
 fn characters_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    convert(ctx, args, true)
+    convert_charged(ctx, args, true)
+}
+
+/// Iterations of the conversion loops that make up one reduction.
+// Port of `LOOP_FACTOR` in erts/emulator/beam/erl_unicode.c, OTP-29.1.1.
+const LOOP_FACTOR: usize = 10;
+
+/// Iterations of the counting loops that make up one reduction.
+// Port of `LOOP_FACTOR_SIMPLE` in erts/emulator/beam/erl_unicode.c, OTP-29.1.1.
+const LOOP_FACTOR_SIMPLE: usize = 50;
+
+/// Iterations of one slice at most (`max_loop_limit`, `CONTEXT_REDS * LOOP_FACTOR`).
+const MAX_LOOP_LIMIT: usize = 4000 * LOOP_FACTOR;
+
+/// Largest on-heap binary, which never traps when it is the result.
+const ERL_ONHEAP_BINARY_LIMIT: i64 = 64;
+
+/// Where a trapped conversion resumes, one per `erlang:characters_to_*_trap` export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnicodeStage {
+    /// `characters_to_utf8_trap/4`: the rest of `characters_to_binary/2` input.
+    ToBinary,
+    /// `characters_to_list_trap_1/3`: the rest of the UTF-8 buffer build.
+    ListBuild,
+    /// `characters_to_list_trap_2/3`: the characters still to put on the list.
+    ListFinalize,
+    /// `characters_to_list_trap_3/3`: the rest of the analysis of a UTF-8 binary.
+    ListAnalyze,
+    /// `characters_to_list_trap_4/1`: the characters of an analyzed binary still to build.
+    ListFromBinary,
+}
+
+/// Resume state of a trapped `unicode:characters_to_binary/2` or `characters_to_list/2`.
+///
+/// Port of the restart arguments and `RestartContext` that `BIF_TRAP*` passes in
+/// erts/emulator/beam/erl_unicode.c, OTP-29.1.1. The converted value is built when the call
+/// starts and the loop counters that erts keeps in the continuation run down one slice at a
+/// time, so the reductions and scheduling points are those of erts.
+#[derive(Clone)]
+pub struct UnicodeCont {
+    stage: UnicodeStage,
+    result: Term,
+    work: usize,
+    chars: usize,
+}
+
+impl UnicodeCont {
+    /// The continuation export this state belongs to.
+    pub fn continuation(&self) -> &'static str {
+        match self.stage {
+            UnicodeStage::ToBinary => "erlang:characters_to_utf8_trap/4",
+            UnicodeStage::ListBuild => "erlang:characters_to_list_trap_1/3",
+            UnicodeStage::ListFinalize => "erlang:characters_to_list_trap_2/3",
+            UnicodeStage::ListAnalyze => "erlang:characters_to_list_trap_3/3",
+            UnicodeStage::ListFromBinary => "erlang:characters_to_list_trap_4/1",
+        }
+    }
+}
+
+/// One slice of a conversion.
+pub enum UnicodeStep {
+    /// The converted value.
+    Done(Term),
+    /// `BIF_TRAP` to the next slice.
+    More(UnicodeCont),
+}
+
+/// Work of a conversion: `cost` is `utf8_need`'s cost, `units` the iterations of
+/// `do_build_utf8` (one per integer, one per byte of a binary).
+struct Measure {
+    cost: usize,
+    units: usize,
+    ascii: bool,
+}
+
+// Port of erts/emulator/beam/erl_unicode.c:342 (utf8_need), OTP-29.1.1, for its cost.
+fn measure(root: Term, latin1: bool) -> Measure {
+    let mut measure = Measure {
+        cost: 0,
+        units: 0,
+        ascii: true,
+    };
+    let mut stack = vec![root];
+    let binary_work = |measure: &mut Measure, term: Term| -> bool {
+        let Ok(data) = bytes(term) else {
+            return false;
+        };
+        measure.units += data.len();
+        if latin1 {
+            measure.cost += data
+                .iter()
+                .map(|byte| if *byte < 128 { 1 } else { 2 })
+                .sum::<usize>();
+        } else {
+            measure.cost += 1;
+        }
+        measure.ascii &= data.iter().all(|byte| *byte < 128);
+        true
+    };
+    while let Some(mut current) = stack.pop() {
+        loop {
+            match current.classify() {
+                TermKind::List => {
+                    let Some((head, tail)) = crate::lists::cons_cell(current) else {
+                        return measure;
+                    };
+                    match head.classify() {
+                        TermKind::Nil => {}
+                        TermKind::List => {
+                            stack.push(tail);
+                            current = head;
+                            continue;
+                        }
+                        TermKind::Bitstring => {
+                            if !binary_work(&mut measure, head) {
+                                return measure;
+                            }
+                        }
+                        TermKind::Number if head.as_small().is_some() => {
+                            measure.cost += 1;
+                            measure.units += 1;
+                        }
+                        _ => return measure,
+                    }
+                    current = tail;
+                }
+                TermKind::Bitstring => {
+                    if !binary_work(&mut measure, current) {
+                        return measure;
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    measure
+}
+
+/// Characters in a converted list, or in the converted part of an error tuple.
+fn converted_chars(result: Term) -> usize {
+    let mut list = result;
+    if let Some(items) = crate::pure::tuple_terms(result) {
+        list = items.get(1).copied().unwrap_or(Term::NIL);
+    }
+    let mut count = 0;
+    while let Some((_, tail)) = crate::lists::cons_cell(list) {
+        count += 1;
+        list = tail;
+    }
+    count
+}
+
+/// `allowed_iterations`: iterations of the conversion loops for the reductions left.
+// Port of erts/emulator/beam/erl_unicode.c:166 (allowed_iterations), OTP-29.1.1.
+fn allowed_iterations(ctx: &Ctx<'_>) -> i64 {
+    (ctx.reduction_budget().saturating_mul(LOOP_FACTOR)).min(MAX_LOOP_LIMIT) as i64
+}
+
+/// `allowed_iterations` inside a continuation export, whose call costs a reduction first.
+fn allowed_iterations_resumed(ctx: &Ctx<'_>) -> i64 {
+    (ctx.reduction_budget().saturating_mul(LOOP_FACTOR)).min(MAX_LOOP_LIMIT) as i64
+}
+
+/// `cost_to_proc`: reductions for a number of loop iterations.
+// Port of erts/emulator/beam/erl_unicode.c:176 (cost_to_proc), OTP-29.1.1.
+fn cost_to_proc(ctx: &mut Ctx<'_>, cost: usize) {
+    ctx.charge_reductions(cost / LOOP_FACTOR);
+}
+
+fn trap(ctx: &mut Ctx<'_>, cont: UnicodeCont) -> UnicodeStep {
+    ctx.bump_all_reds();
+    UnicodeStep::More(cont)
+}
+
+/// `characters_to_binary/2` after `do_build_utf8` ran `left` iterations.
+// Port of erts/emulator/beam/erl_unicode.c:787 (build_utf8_return), OTP-29.1.1.
+fn to_binary_slice(ctx: &mut Ctx<'_>, result: Term, work: usize, left: i64) -> UnicodeStep {
+    let consumed = work.min(left.max(0) as usize);
+    cost_to_proc(ctx, consumed);
+    if consumed < work {
+        return trap(
+            ctx,
+            UnicodeCont {
+                stage: UnicodeStage::ToBinary,
+                result,
+                work: work - consumed,
+                chars: 0,
+            },
+        );
+    }
+    UnicodeStep::Done(result)
+}
+
+/// The list is built from the UTF-8 buffer `left` characters at a time.
+// Port of erts/emulator/beam/erl_unicode.c:1637 (finalize_list_to_list) and
+// :1342 (do_utf8_to_list), OTP-29.1.1.
+fn list_build_slice(
+    ctx: &mut Ctx<'_>,
+    stage: UnicodeStage,
+    result: Term,
+    chars: usize,
+    left: i64,
+) -> UnicodeStep {
+    if chars == 0 {
+        return UnicodeStep::Done(result);
+    }
+    let built = if left < chars as i64 {
+        if left > 0 { left as usize } else { 1 }
+    } else {
+        chars
+    };
+    cost_to_proc(ctx, built);
+    if built != chars {
+        return trap(
+            ctx,
+            UnicodeCont {
+                stage,
+                result,
+                work: 0,
+                chars: chars - built,
+            },
+        );
+    }
+    UnicodeStep::Done(result)
+}
+
+/// `characters_to_list/2` of a list or Latin-1 binary after `do_build_utf8` ran.
+// Port of erts/emulator/beam/erl_unicode.c:1024 (build_list_return), OTP-29.1.1.
+fn list_build_slice_after_buffer(
+    ctx: &mut Ctx<'_>,
+    result: Term,
+    work: usize,
+    chars: usize,
+    left: i64,
+) -> UnicodeStep {
+    let consumed = work.min(left.max(0) as usize);
+    cost_to_proc(ctx, consumed);
+    if consumed < work {
+        return trap(
+            ctx,
+            UnicodeCont {
+                stage: UnicodeStage::ListBuild,
+                result,
+                work: work - consumed,
+                chars,
+            },
+        );
+    }
+    let left = (left - consumed as i64).max(1);
+    list_build_slice(ctx, UnicodeStage::ListFinalize, result, chars, left)
+}
+
+/// Analyze a UTF-8 binary `left` characters at a time, then build its list.
+// Port of erts/emulator/beam/erl_unicode.c:1728 (do_bif_utf8_to_list) and
+// :1081 (analyze_utf8), OTP-29.1.1.
+fn list_analyze_slice(
+    ctx: &mut Ctx<'_>,
+    result: Term,
+    analyzed: usize,
+    chars: usize,
+    resumed: bool,
+) -> UnicodeStep {
+    let mut left = if resumed {
+        allowed_iterations_resumed(ctx)
+    } else {
+        allowed_iterations(ctx)
+    };
+    let remaining = chars - analyzed;
+    let count = if left <= 0 {
+        remaining.min(1)
+    } else {
+        remaining.min(left as usize)
+    };
+    left -= count as i64;
+    cost_to_proc(ctx, count);
+    if count < remaining {
+        return trap(
+            ctx,
+            UnicodeCont {
+                stage: UnicodeStage::ListAnalyze,
+                result,
+                work: analyzed + count,
+                chars,
+            },
+        );
+    }
+    list_build_slice(ctx, UnicodeStage::ListFromBinary, result, chars, left)
+}
+
+/// Run the slice that follows a trap.
+pub fn unicode_resume(ctx: &mut Ctx<'_>, cont: &UnicodeCont) -> UnicodeStep {
+    match cont.stage {
+        UnicodeStage::ToBinary => {
+            let left = allowed_iterations_resumed(ctx);
+            to_binary_slice(ctx, cont.result, cont.work, left)
+        }
+        UnicodeStage::ListBuild => {
+            let left = allowed_iterations_resumed(ctx);
+            list_build_slice_after_buffer(ctx, cont.result, cont.work, cont.chars, left)
+        }
+        UnicodeStage::ListFinalize | UnicodeStage::ListFromBinary => {
+            let left = allowed_iterations_resumed(ctx);
+            list_build_slice(ctx, cont.stage, cont.result, cont.chars, left)
+        }
+        UnicodeStage::ListAnalyze => {
+            list_analyze_slice(ctx, cont.result, cont.work, cont.chars, true)
+        }
+    }
+}
+
+/// `characters_to_binary/2` and `characters_to_list/2` with erts' loop accounting.
+// Port of erts/emulator/beam/erl_unicode.c:931 (unicode_characters_to_binary_2) and
+// :1122 (unicode_characters_to_list_2), OTP-29.1.1.
+fn convert_charged(ctx: &mut Ctx<'_>, args: &[Term], list_output: bool) -> Result<Term, BifError> {
+    let result = convert(ctx, args, list_output)?;
+    let Ok(encoding) = encoding(args[1]) else {
+        return Ok(result);
+    };
+    if !matches!(encoding, Encoding::Latin1 | Encoding::Utf8)
+        || ctx.reduction_budget() == usize::MAX
+    {
+        return Ok(result);
+    }
+    let latin1 = encoding == Encoding::Latin1;
+    let mut subject = args[0];
+    if !list_output
+        && let Some((head, tail)) = crate::lists::cons_cell(subject)
+        && tail == Term::NIL
+        && head.classify() == TermKind::Bitstring
+    {
+        subject = head;
+    }
+    let step = if list_output && subject.classify() == TermKind::Bitstring && !latin1 {
+        let chars = converted_chars(result);
+        list_analyze_slice(ctx, result, 0, chars, false)
+    } else {
+        let work = measure(subject, latin1);
+        let simple = work.cost / (LOOP_FACTOR_SIMPLE / LOOP_FACTOR);
+        if !list_output
+            && subject.classify() == TermKind::Bitstring
+            && (latin1 && work.ascii || !latin1 && result.classify() == TermKind::Bitstring)
+        {
+            cost_to_proc(ctx, simple);
+            return Ok(result);
+        }
+        cost_to_proc(ctx, simple);
+        let mut left = allowed_iterations(ctx) - simple as i64;
+        if list_output {
+            if left <= 0 {
+                left = 1;
+            }
+            list_build_slice_after_buffer(ctx, result, work.units, converted_chars(result), left)
+        } else {
+            if left <= ERL_ONHEAP_BINARY_LIMIT {
+                left = ERL_ONHEAP_BINARY_LIMIT;
+            }
+            to_binary_slice(ctx, result, work.units, left)
+        }
+    };
+    match step {
+        UnicodeStep::Done(value) => Ok(value),
+        UnicodeStep::More(cont) => {
+            ctx.defer_trap(DeferredTrap::Unicode(cont));
+            Ok(Term::NIL)
+        }
+    }
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2222 (erts_native_filename_need), OTP-29.1.1.
