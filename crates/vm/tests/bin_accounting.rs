@@ -104,3 +104,52 @@ value() -> {literal, <<16#5a:1600000>>}.
         local_after > local_before
     );
 }
+
+const CROSS_SCHEDULER_SOURCE: &str = r#"
+-module(bin_accounting_cross).
+-export([run/0]).
+
+run() ->
+    _ = erts_debug:set_internal_state(available_internal_state, true),
+    Base = erlang:memory(binary),
+    Self = self(),
+    Consumer = spawn_opt(fun() ->
+                                 receive {bin, Bin} -> Self ! {held, byte_size(Bin)} end,
+                                 receive stop -> ok end
+                         end, [{scheduler, 2}]),
+    Producer = spawn_opt(fun() ->
+                                 Bin = binary:copy(<<1>>, 400000),
+                                 Consumer ! {bin, Bin},
+                                 Self ! produced
+                         end, [{scheduler, 1}]),
+    receive produced -> ok end,
+    receive {held, Size} -> ok end,
+    Allocated = erlang:memory(binary),
+    MRef = erlang:monitor(process, Consumer),
+    Consumer ! stop,
+    receive {'DOWN', MRef, process, Consumer, _} -> ok end,
+    _ = Producer,
+    _ = erts_debug:set_internal_state(wait, deallocations),
+    After = erlang:memory(binary),
+    {Size, Allocated >= Base + 400000, After < Base + 100000}.
+"#;
+
+#[test]
+fn binary_freed_on_another_scheduler_is_gone_after_wait_deallocations() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping cross-scheduler binary differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named("bin_accounting_cross", CROSS_SCHEDULER_SOURCE, &[])
+        .unwrap();
+    reference.load("bin_accounting_cross", &beam).unwrap();
+    let expected = reference.call("bin_accounting_cross", "run", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("bin_accounting_cross", "run", &[], 2, None)
+        .unwrap();
+    let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
+    assert_eq!(expected, CallResult::Ok(canonical));
+}
