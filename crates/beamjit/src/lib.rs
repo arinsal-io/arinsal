@@ -2536,8 +2536,7 @@ fn emit_op(
         EmitterKind::GetTupleElementSwap => {
             count(4)?;
             let offset = tuple_byte_offset(args.get(1))?;
-            assembler.emit_get_tuple_element(value(0)?, offset, value(2)?)?;
-            assembler.swap(value(2)?, value(3)?)
+            assembler.emit_get_tuple_element_swap(value(0)?, offset, value(2)?, value(3)?)
         }
         EmitterKind::LengthSetup => {
             count(3)?;
@@ -3657,8 +3656,7 @@ fn emit_op(
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:408-421, OTP-29.1.1.
                 let offset = tuple_byte_offset(args.get(1))?;
-                assembler.emit_get_tuple_element(value(0)?, offset, value(2)?)?;
-                assembler.emit_get_tuple_element(value(0)?, offset.saturating_add(8), value(3)?)
+                assembler.emit_get_two_tuple_elements(value(0)?, offset, value(2)?, value(3)?)
             }
             "set_tuple_element" => {
                 count(3)?;
@@ -3735,9 +3733,13 @@ fn emit_op(
             }
         }
         EmitterKind::Fused => match op.name() {
-            "store_two_values" | "load_two_xregs" => {
+            "store_two_values" => {
                 count(4)?;
                 assembler.emit_store_two_values(value(0)?, value(1)?, value(2)?, value(3)?)
+            }
+            "load_two_xregs" => {
+                count(4)?;
+                assembler.emit_load_two_xregs(value(0)?, value(1)?, value(2)?, value(3)?)
             }
             "move_trim" => {
                 count(3)?;
@@ -3748,8 +3750,7 @@ fn emit_op(
             "move_call_last" => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:83-115, OTP-29.1.1.
-                assembler.move_(value(0)?, value(1)?)?;
-                assembler.call_last(n(2)?, n(3)?)
+                assembler.move_call_last(value(0)?, value(1)?, n(2)?, n(3)?)
             }
             "put_list_deallocate" => {
                 count(4)?;
