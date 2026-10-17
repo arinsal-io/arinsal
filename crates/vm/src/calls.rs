@@ -93,7 +93,7 @@ pub(super) fn gc_after_bif(
     arguments: &mut [Term],
     result: &mut Result<Term, arinsal_bifs::BifError>,
 ) -> Result<(), VmError> {
-    if !process.heap.gc_enabled || !process.heap.gc_desired() {
+    if !process.heap.gc_after_bif_desired() {
         return Ok(());
     }
     // Port of erl_gc.c:418-478 (`erts_gc_after_bif_call_lhf`), OTP-29.1.1:
@@ -195,7 +195,7 @@ pub(crate) fn gc_after_native_parts(
     value: Option<&mut Term>,
     raised: Option<&mut crate::exceptions::Trap>,
 ) -> Result<(), VmError> {
-    if !process.heap.gc_enabled || !process.heap.gc_desired() {
+    if !process.heap.gc_after_bif_desired() {
         return Ok(());
     }
     if let Some(value) = value {
@@ -1137,6 +1137,66 @@ mod tests {
         assert!(!process.heap.gc_desired());
         assert!(process.stats.gc.collections > 0);
         assert_eq!(result.unwrap().as_atom(), Some(arinsal_term::atoms::TRUE));
+    }
+
+    fn process_over_the_bin_vheap_limit() -> Process {
+        let mut process = Process::with_registers(4, 0);
+        process.heap = ProcessHeap::with_words(256);
+        let bytes = vec![1u8; 8 * (process.heap.bin_vheap_block_size() as usize + 1)];
+        TermBuilder::new(&mut process.heap).binary(&bytes).unwrap();
+        assert!(process.heap.bin_vheap_gc_due());
+        assert!(!process.heap.gc_desired());
+        process
+    }
+
+    #[test]
+    fn bif_epilogue_collects_when_the_bin_vheap_is_over_its_limit() {
+        let mut process = process_over_the_bin_vheap_limit();
+        let mut arguments = [Term::NIL];
+        let mut result = Ok(Term::atom(arinsal_term::atoms::TRUE));
+
+        gc_after_bif(&mut process, &mut arguments, &mut result).unwrap();
+
+        assert_eq!(process.stats.gc.collections, 1);
+        assert!(!process.heap.bin_vheap_gc_due());
+    }
+
+    #[test]
+    fn bif_epilogue_collects_a_failed_bif_when_the_bin_vheap_is_over_its_limit() {
+        let mut process = process_over_the_bin_vheap_limit();
+        let mut arguments = [Term::NIL];
+        let mut result = Err(arinsal_bifs::BifError::Badarg { cause: None });
+
+        gc_after_bif(&mut process, &mut arguments, &mut result).unwrap();
+
+        assert_eq!(process.stats.gc.collections, 1);
+        assert!(!process.heap.bin_vheap_gc_due());
+    }
+
+    #[test]
+    fn bif_epilogue_collects_once_for_fragments_and_bin_vheap() {
+        let mut process = process_over_the_bin_vheap_limit();
+        process.heap.gc_fragment(process.heap.free_words() + 1);
+        assert!(process.heap.gc_desired());
+        let mut arguments = [Term::NIL];
+        let mut result = Ok(Term::atom(arinsal_term::atoms::TRUE));
+
+        gc_after_bif(&mut process, &mut arguments, &mut result).unwrap();
+
+        assert_eq!(process.stats.gc.collections, 1);
+        assert!(!process.heap.gc_after_bif_desired());
+    }
+
+    #[test]
+    fn bif_epilogue_does_not_collect_with_gc_disabled() {
+        let mut process = process_over_the_bin_vheap_limit();
+        process.heap.gc_enabled = false;
+        let mut arguments = [Term::NIL];
+        let mut result = Ok(Term::atom(arinsal_term::atoms::TRUE));
+
+        gc_after_bif(&mut process, &mut arguments, &mut result).unwrap();
+
+        assert_eq!(process.stats.gc.collections, 0);
     }
 
     #[test]

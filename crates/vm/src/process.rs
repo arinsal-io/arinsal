@@ -6025,7 +6025,7 @@ impl Process {
     pub(crate) fn gc_after_bif(&mut self, result: Term) -> Result<Term, VmError> {
         // ERTS_IS_GC_AFTER_BIF_DESIRED: heap fragments or a virtual binary heap over its size;
         // `F_DISABLE_GC` returns before any collection (erl_gc.c:403-415).
-        if !(self.heap.gc_desired() || self.heap.bin_vheap_gc_due()) || !self.heap.gc_enabled {
+        if !self.heap.gc_after_bif_desired() {
             return Ok(result);
         }
         let mut roots = [result];
