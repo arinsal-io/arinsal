@@ -2438,10 +2438,7 @@ fn emit_op(
             }
             "i_breakpoint_trampoline" => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:224-237, OTP-29.1.1.
-                assembler.emit_i_breakpoint_trampoline(
-                    env.breakpoint_fragment(),
-                    arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY,
-                )
+                assembler.emit_i_breakpoint_trampoline(env.breakpoint_fragment())
             }
             "i_debug_line" => {
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3203-3222, OTP-29.1.1.

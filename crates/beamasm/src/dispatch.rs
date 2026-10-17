@@ -242,6 +242,7 @@ impl DispatchFragments {
         let export = code.new_label();
         let light_bif = code.new_label();
         let breakpoint = code.new_label();
+        let breakpoint_helper = code.new_label();
         let line_breakpoint = code.new_label();
         let send = code.new_label();
         let call_fun_unported = code.new_label();
@@ -271,12 +272,17 @@ impl DispatchFragments {
             exception_resolver,
         )
         .map_err(|_| ExecError::InvalidSize("light BIF fragment"))?;
-        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250
-        // (emit_i_breakpoint_trampoline), OTP-29.1.1: the trampoline passes (c_p, identity,
-        // site) and a trap return. That is the helper ABI, not ARG3/ARG4 of call_light_bif_shared.
-        code.bind(breakpoint)
+        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:176-229
+        // (emit_i_breakpoint_trampoline_shared), OTP-29.1.1: the trampoline only calls this
+        // fragment; it passes (c_p, identity, site) and a trap return to the helper. That is the
+        // helper ABI, not ARG3/ARG4 of call_light_bif_shared.
+        code.bind(breakpoint_helper)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_helper_fragment(&mut code, light_bif_helper, 6)
+            .map_err(|_| ExecError::InvalidSize("breakpoint fragment"))?;
+        code.bind(breakpoint)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_breakpoint_shared(&mut code, breakpoint_helper)
             .map_err(|_| ExecError::InvalidSize("breakpoint fragment"))?;
         code.bind(line_breakpoint)
             .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
@@ -1221,6 +1227,53 @@ fn emit_call_light_bif_shared(
         encoder.br(Gpr::x(14))
     })?;
     Ok(())
+}
+
+/// Shared body of every enabled `i_breakpoint_trampoline`.
+///
+/// Entered by `bl` from the trampoline, so `x30` is the address behind it. The breakpoint runs
+/// through the helper fragment, then control returns to `x30`. A trapping breakpoint resumes
+/// at that address too, after the executor delivered the events.
+// Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:176-229
+// (emit_i_breakpoint_trampoline_shared) and :231-250, OTP-29.1.1.
+fn emit_breakpoint_shared(
+    code: &mut CodeBuffer,
+    helper: arinsal_a64::buf::Label,
+) -> Result<(), BufferError> {
+    const UPDATE: Update = Update::HEAP_ALLOC
+        .union(Update::REDUCTIONS)
+        .union(Update::X_REGS);
+    let error = code.new_label();
+    code.emit(|encoder| {
+        encoder.str_uoff(Gpr::x(30), Gpr::x(19), crate::TRAP_RETURN_OFFSET as u32)?;
+        encoder.mov_const(Gpr::x(13), BREAKPOINT_DISPATCH_IDENTITY as u64)?;
+        encoder.mov_reg(Gpr::x(14), Gpr::x(30))
+    })?;
+    emit_enter_runtime(code, 6, UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(13))?;
+        encoder.mov_reg(Gpr::x(2), Gpr::x(14))?;
+        encoder.mov_reg(Gpr::x(3), Gpr::xzr())?;
+        encoder.str_uoff(Gpr::x(30), Gpr::x(21), 72)
+    })?;
+    code.bl(helper)?;
+    emit_leave_runtime(code, 6, UPDATE)?;
+    code.emit(|encoder| {
+        encoder.str_uoff(Gpr::xzr(), Gpr::x(19), crate::TRAP_RETURN_OFFSET as u32)?;
+        encoder.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
+    })?;
+    code.cbnz(Gpr::x(9), error)?;
+    code.emit(|encoder| encoder.ret(Gpr::x(30)))?;
+    code.bind(error)?;
+    code.emit(|encoder| {
+        encoder.sub_imm(Gpr::x(30), Gpr::x(30), 4, false)?;
+        encoder.str_uoff(Gpr::x(30), Gpr::x(19), 16_432)?;
+        encoder.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        encoder.ldr_uoff(Gpr::x(30), Gpr::x(19), 16_416)?;
+        encoder.br(Gpr::x(30))
+    })
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:527-540, OTP-29.1.1.
