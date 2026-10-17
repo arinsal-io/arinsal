@@ -84,9 +84,9 @@ fn native_transfer_continues(process: &mut Process, ctx: &RunCtx<'_, Message>) -
     true
 }
 
+#[inline]
 fn trace_boot_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("ARINSAL_TRACE_BOOT").is_some())
+    crate::calls::trace_boot_enabled()
 }
 
 #[cfg(feature = "pf-mem-counters")]
@@ -1229,9 +1229,6 @@ impl Executor {
     ) -> Result<RunState, VmError> {
         process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
         process.self_pid = Some(ctx.pid());
-        // `enif_self` of the built-in zstd NIFs is the process this scheduler runs, whichever
-        // dispatch path reaches them (import, apply, light BIF, static NIF body).
-        crate::native_helpers::note_zstd_caller(process);
         // Port of erts/emulator/beam/erl_process.c:10180 (erts_schedule: esdp->current_process
         // = p), OTP-29.1.1. A simulated scheduler shares its thread with other runtimes, so
         // it binds the thread's hub on every turn.
@@ -1389,11 +1386,11 @@ impl Executor {
                 // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1.
                 // A spawned MFA may name a BIF directly; execute it as the process entry so
                 // exceptions such as exit/1 retain their BIF class and reason.
-                if let Some((module, function, arity)) = process
-                    .cold
-                    .as_mut()
-                    .and_then(|cold| cold.initial_bif.take())
-                {
+                let (initial_bif, dirty_sys_gc) = match process.cold.as_deref_mut() {
+                    Some(cold) => (cold.initial_bif.take(), cold.dirty_sys_gc),
+                    None => (None, false),
+                };
+                if let Some((module, function, arity)) = initial_bif {
                     // A spawn request that fell back to `apply/3` leaves its operands in X0..X2
                     // (module, function, argument list); the entry runs the BIF on the list.
                     let mut args = if apply_operands {
@@ -1447,7 +1444,7 @@ impl Executor {
                 // Port of erts/emulator/beam/erl_process.c:10363-10372 and 11018-11040
                 // (a dirty scheduler executes the dirty GC system task, then the process
                 // returns to a normal scheduler), OTP-29.1.1.
-                if process.cold.as_ref().is_some_and(|cold| cold.dirty_sys_gc) {
+                if dirty_sys_gc {
                     if !ctx.scheduler_type().is_dirty() {
                         // ERTS_PSFLG_DIRTY_ACTIVE_SYS: the dirty work runs before Erlang code.
                         break 'execution Err(VmError::Dirty(arinsal_sched::DirtyKind::Cpu));
@@ -1561,7 +1558,7 @@ impl Executor {
                         match crate::native_helpers::run_static_nif(process, identity) {
                             Ok(value) => {
                                 process.x[0] = value;
-                                process.cold_mut().native_continuation_resume = true;
+                                process.native_continuation_resume = true;
                                 process.set_native_resume_arity(1);
                                 process.native_pc = Some(resume_pc);
                                 if ctx.scheduler_type().is_dirty() {
@@ -1626,7 +1623,7 @@ impl Executor {
                                 break Ok(RunState::Done(process.x[0]));
                             }
                         } else {
-                            process.cold_mut().native_continuation_resume = true;
+                            process.native_continuation_resume = true;
                             process.set_native_resume_arity(1);
                             process.native_pc = Some(resume_pc);
                         }
@@ -1639,9 +1636,6 @@ impl Executor {
                             collect_on_schedule_in(process)?;
                         }
                         process.native_pc = None;
-                        process.header.self_pid =
-                            ctx.pid().to_term().expect("valid pid").tagged_word();
-                        process.self_pid = Some(ctx.pid());
                         let trace_boot = trace_boot_enabled();
                         let function = trace_boot
                             .then(|| crate::native_function_at(code_ptr))
@@ -1690,7 +1684,7 @@ impl Executor {
                                 .and_then(|cold| cold.native_retry_site.take())
                                 .unwrap_or((0, 0));
                             if call_site_pc != 0 {
-                                process.cold_mut().native_error_pc = call_site_pc;
+                                process.native_error_pc = call_site_pc;
                             }
                             arinsal_beamasm::ExitReason::CallUnported {
                                 target_pc,
@@ -1865,10 +1859,7 @@ impl Executor {
                                 crate::beamasm_integration::count_call_unported();
                                 // The native call site names the caller only if the called BIF
                                 // raises; any other continuation must not inherit it.
-                                let call_site_pc = process
-                                    .cold
-                                    .as_mut()
-                                    .map_or(0, |cold| std::mem::take(&mut cold.native_error_pc));
+                                let call_site_pc = std::mem::take(&mut process.native_error_pc);
                                 process.cold_mut().native_retry_site =
                                     Some((resume_pc, call_site_pc));
                                 if target_pc
@@ -1891,7 +1882,7 @@ impl Executor {
                                             break Ok(RunState::Done(process.x[0]));
                                         }
                                     } else {
-                                        process.cold_mut().native_continuation_resume = true;
+                                        process.native_continuation_resume = true;
                                         process.set_native_resume_arity(1);
                                         process.native_pc = Some(resume_pc);
                                     }
@@ -1990,7 +1981,7 @@ impl Executor {
                                         }
                                     }
                                     if !handler || cycle {
-                                        process.cold_mut().native_continuation_resume = true;
+                                        process.native_continuation_resume = true;
                                         process.set_native_resume_arity(1);
                                         process.native_pc = Some(resume_pc);
                                         continue;
@@ -2081,7 +2072,7 @@ impl Executor {
                                     crate::trace::push_native_trace_frame(
                                         process, resume_pc, &actions, arity,
                                     )?;
-                                    process.cold_mut().native_continuation_resume = true;
+                                    process.native_continuation_resume = true;
                                     // Port of erts/emulator/beam/jit/arm/instr_trace.cpp (the
                                     // breakpoint stub saves the function's arguments in
                                     // `c_p->arity`), OTP-29.1.1: a collection while the process
@@ -2353,9 +2344,7 @@ impl Executor {
                                                 break Ok(RunState::Wait { timeout_ms: None });
                                             }
                                             process.native_pc = None;
-                                            if let Some(cold) = process.cold.as_mut() {
-                                                cold.native_continuation_resume = false;
-                                            }
+                                            process.native_continuation_resume = false;
                                             if hibernate_fetch_collect(process, ctx)? {
                                                 if let Some(runtime) = process.runtime.clone() {
                                                     runtime.mark_hibernating(ctx.pid(), true);
@@ -2376,7 +2365,7 @@ impl Executor {
                                     if call_site_pc != 0
                                         && target_pc != arinsal_beamasm::dispatch::CALL_FUN_UNPORTED
                                     {
-                                        process.cold_mut().native_error_pc = call_site_pc;
+                                        process.native_error_pc = call_site_pc;
                                         if process.heap.stack_get(0).is_some_and(|word| {
                                             word.tagged_word() as usize == resume_pc
                                         }) {
@@ -2550,7 +2539,7 @@ impl Executor {
                                         // failure erts reports with ERTS_BIF_ERROR_TRAPPED:
                                         // catch sees it, and the process does not exit.
                                         Some(Err(VmError::Trap(trap))) => {
-                                            process.cold_mut().native_error_pc = call_site_pc;
+                                            process.native_error_pc = call_site_pc;
                                             if process.heap.stack_get(0).is_some_and(|word| {
                                                 word.tagged_word() as usize == resume_pc
                                             }) {
@@ -2990,7 +2979,7 @@ impl Executor {
                                                             info: crate::stacktrace::BifErrorInfo::Plain,
                                                         });
                                                 }
-                                                process.cold_mut().native_error_pc = call_site_pc;
+                                                process.native_error_pc = call_site_pc;
                                                 // The BIF does not return: drop the native
                                                 // continuation the trap pushed as its CP, which
                                                 // erts never creates for a BIF call.
@@ -3075,9 +3064,7 @@ impl Executor {
                                                     break Ok(RunState::Wait { timeout_ms: None });
                                                 }
                                                 process.native_pc = None;
-                                                if let Some(cold) = process.cold.as_mut() {
-                                                    cold.native_continuation_resume = false;
-                                                }
+                                                process.native_continuation_resume = false;
                                                 if hibernate_fetch_collect(process, ctx)? {
                                                     if let Some(runtime) = process.runtime.clone() {
                                                         runtime.mark_hibernating(ctx.pid(), true);
@@ -3410,11 +3397,7 @@ impl Executor {
             // A native call the scheduler redoes (BIF trap, traced apply) carries the larger of
             // the two, whichever side stated it. From here on `header.arity` is the one count
             // every reader of the saved file takes.
-            let arity_set = process.native_pc.is_some()
-                && process
-                    .cold
-                    .as_ref()
-                    .is_some_and(|cold| cold.native_arity_set);
+            let arity_set = process.native_pc.is_some() && process.native_arity_set;
             let call_arity = usize::from(process.header.arity);
             let mut live_x = if arity_set {
                 call_arity
@@ -3708,7 +3691,7 @@ fn resume_after_native_return(process: &mut Process) -> bool {
         }
         if crate::native_bridge::is_native_continuation(raw) {
             process.heap.release_stack(1);
-            process.cold_mut().native_continuation_resume = true;
+            process.native_continuation_resume = true;
             process.set_native_resume_arity(1);
             process.native_pc = Some(raw);
             return true;
@@ -7010,6 +6993,7 @@ fn with_executor<R>(
 #[cold]
 #[inline(never)]
 fn new_executor(runtime: &Arc<Runtime>) -> Box<Executor> {
+    arinsal_nif_zlib::set_scheduler_caller(crate::natives::nif::scheduler_caller);
     Box::new(Executor {
         current_process: Default::default(),
         hub_bound: false,

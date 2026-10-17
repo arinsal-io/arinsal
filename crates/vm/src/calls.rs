@@ -2,7 +2,6 @@
 
 use crate::{Process, VmError};
 use arinsal_term::{Term, TermKind};
-use std::sync::LazyLock;
 
 enum BifErrorRoots {
     BadargCause(usize),
@@ -23,11 +22,9 @@ enum NativeTopRoots {
     CurrentArgs(usize),
 }
 
-static TRACE_BOOT_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("ARINSAL_TRACE_BOOT").is_some());
-
+#[inline]
 pub(crate) fn trace_boot_enabled() -> bool {
-    *TRACE_BOOT_ENABLED
+    crate::debug_env::slice::get() & crate::debug_env::slice::TRACE_BOOT != 0
 }
 
 /// Push a tagged continuation. The collector treats the CATCH immediate as a
@@ -576,7 +573,7 @@ impl Vm {
                     // A native return address, or the stub of a traced native function's
                     // return frame, which finishes the frame when entered.
                     p.heap.release_stack(1);
-                    p.cold_mut().native_continuation_resume = true;
+                    p.native_continuation_resume = true;
                     p.set_native_resume_arity(1);
                     p.native_pc = Some(word);
                     return None;

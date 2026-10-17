@@ -5,8 +5,8 @@
 //! anonymous caller because the frozen `Ctx` contract has no process identity yet.
 //!
 //! The `zstd` NIFs take their arguments as terms. Their resources are magic references
-//! and `enif_self` is [`set_caller`], which the VM calls when it runs a process and before a
-//! dirty `zstd` job.
+//! and `enif_self` is the scheduler thread's current process ([`set_scheduler_caller`]), or the
+//! process a dirty `zstd` job pins with [`with_caller`].
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -22,22 +22,40 @@ mod zstd;
 pub(crate) type Outcome = Result<O, Fault>;
 
 thread_local! {
-    static CALLER: Cell<Option<Term>> = const { Cell::new(None) };
+    static CALLER: Cell<Option<Option<Term>>> = const { Cell::new(None) };
 }
 
-/// Record the process that runs the built-in `zstd` NIFs on this thread.
+static SCHEDULER_CALLER: std::sync::OnceLock<fn() -> Option<Term>> = std::sync::OnceLock::new();
+
+/// Name the function that reports the process a scheduler thread runs.
 ///
-/// This is `enif_self` for the `zstd` NIFs: `BifFn` has no process identity, so the VM sets the
-/// caller's pid (an immediate local pid term, `None` outside a scheduler) when a scheduler runs
-/// the process, which covers every path that reaches a NIF from it. A dirty job sets it on the
-/// dirty scheduler thread.
-pub fn set_caller(pid: Option<Term>) {
-    CALLER.with(|caller| caller.set(pid));
+/// This is `enif_self` for the `zstd` NIFs: `BifFn` has no process identity, so the NIF reads
+/// the scheduler's current process (erts' `esdp->current_process`) when it needs it, instead
+/// of the scheduler storing the pid on every slice. The function returns an immediate local
+/// pid term, `None` outside a scheduler.
+pub fn set_scheduler_caller(current: fn() -> Option<Term>) {
+    let _ = SCHEDULER_CALLER.set(current);
 }
 
-/// The caller recorded by [`set_caller`] on this thread.
+/// Pin the process that runs the built-in `zstd` NIFs on this thread, overriding the
+/// scheduler's current process until the previous pin is restored.
+pub fn set_caller(pid: Option<Term>) {
+    CALLER.with(|caller| caller.set(Some(pid)));
+}
+
+/// Run `f` with `pid` pinned as the calling process, then restore the previous pin.
+pub fn with_caller<R>(pid: Option<Term>, f: impl FnOnce() -> R) -> R {
+    let previous = CALLER.with(|pinned| pinned.replace(Some(pid)));
+    let result = f();
+    CALLER.with(|pinned| pinned.set(previous));
+    result
+}
+
+/// The calling process: the pinned one, else the scheduler thread's current process.
 pub(crate) fn caller() -> Option<Term> {
-    CALLER.with(Cell::get)
+    CALLER
+        .with(Cell::get)
+        .unwrap_or_else(|| SCHEDULER_CALLER.get().and_then(|current| current()))
 }
 
 #[derive(Debug)]
@@ -179,10 +197,9 @@ pub fn call_with_pid(
             .ok()
             .and_then(|arity| zstd::lookup(name, arity))
             .ok_or(BifError::Unsupported("unknown NIF"))?;
-        let previous = self::caller();
-        set_caller(caller);
+        let previous = CALLER.with(|pinned| pinned.replace(Some(caller)));
         let result = function(ctx, args);
-        set_caller(previous);
+        CALLER.with(|pinned| pinned.set(previous));
         return result;
     }
     let owned = args

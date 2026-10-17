@@ -648,7 +648,7 @@ pub(crate) fn commit_catch(
     process.sync_native_header();
     match found.target {
         CatchTarget::Native(handler) => {
-            process.cold_mut().native_continuation_resume = true;
+            process.native_continuation_resume = true;
             process.set_native_resume_arity(4);
             CatchHandler::Native(handler)
         }
@@ -979,10 +979,15 @@ fn run_native_attached(
     registers: &mut SchedulerRegisters,
     code_address: usize,
 ) -> Result<ExitReason, VmError> {
-    // Debug knobs are environment switches: read once per entry, not at each use.
-    let return_trace = crate::native_bridge::return_trace_enabled();
-    let exception_trace = crate::native_bridge::exception_trace_enabled();
-    register_bridge_continuation().map_err(|error| VmError::Unsupported(error.into()))?;
+    // Debug knobs are environment switches held in one byte: read once per entry.
+    let debug = crate::debug_env::slice::get();
+    let return_trace = debug & crate::debug_env::slice::RETURN_TRACE != 0;
+    let exception_trace = debug & crate::debug_env::slice::EXCEPTION_TRACE != 0;
+    let lifetime_trace = debug & crate::debug_env::slice::LIFETIME_TRACE != 0;
+    if debug & crate::debug_env::slice::BRIDGE_REGISTERED == 0 {
+        register_bridge_continuation().map_err(|error| VmError::Unsupported(error.into()))?;
+        crate::debug_env::slice::set_bridge_registered();
+    }
     if return_trace && let Some(function) = native_function_at(code_address) {
         eprintln!(
             "[native-before-ensure] {}:{}/{} x0={:#x} E={:#x}",
@@ -993,23 +998,15 @@ fn run_native_attached(
             process.heap.frame_pointer()
         );
     }
-    if let Some(cold) = process.cold.as_mut() {
-        cold.native_error_pc = 0;
-    }
+    process.native_error_pc = 0;
     registers.tmp_mem[6] = 0;
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     registers.tmp_mem[5] =
         crate::native_helpers::arinsal_beamasm_native_trace_return as *const () as usize as u64;
-    let resuming_continuation = process
-        .cold
-        .as_mut()
-        .is_some_and(|cold| std::mem::take(&mut cold.native_continuation_resume));
+    let resuming_continuation = std::mem::take(&mut process.native_continuation_resume);
     // A resumed call return has only x0 live and an exception handler x0..x3, whatever
     // the arity of the function the native code belongs to.
-    let arity_set = process
-        .cold
-        .as_mut()
-        .is_some_and(|cold| std::mem::take(&mut cold.native_arity_set));
+    let arity_set = std::mem::take(&mut process.native_arity_set);
     // Port of erts/emulator/beam/erl_process.c:10550 and jit/arm/process_main.cpp (a process
     // resumes with the `c_p->arity` live registers its yield site saved), OTP-29.1.1: only a
     // call entry needs the function's arity from the code registry.
@@ -1074,7 +1071,7 @@ fn run_native_attached(
     process.heap.set_native_allocation(true);
     // The scheduler set `esdp->current_process` when it scheduled the process in
     // (Executor::run), so the NIF services native code calls already see this process.
-    if crate::native_bridge::lifetime_trace_enabled() {
+    if lifetime_trace {
         eprintln!(
             "[beamasm-lifetime] enter code={code_address:#x} owner={}",
             crate::beamasm_integration::owns_native_address(code_address)
@@ -1124,7 +1121,7 @@ fn run_native_attached(
     // A VM-backed light BIF leaves TRAP for the scheduler when it exits native code.
     // A call handed to the scheduler keeps its call site too, for a BIF that raises there.
     if process.header.freason != 0 || matches!(exit, ExitReason::CallUnported { .. }) {
-        process.cold_mut().native_error_pc = registers.tmp_mem[6] as usize;
+        process.native_error_pc = registers.tmp_mem[6] as usize;
     }
     if process.header.freason != 0 && process.header.freason != 1 << 10 && exception_trace {
         eprintln!(
@@ -1321,9 +1318,9 @@ fn run_native_attached(
                 process.native_pc = None;
                 ExitReason::Returned
             } else {
-                process.cold_mut().native_continuation_resume = true;
+                process.native_continuation_resume = true;
                 // The yield site stored its live X register count in `c_p->arity`.
-                process.cold_mut().native_arity_set = true;
+                process.native_arity_set = true;
                 process.gc_live = usize::from(process.header.arity);
                 process.native_pc = Some(if resume == 0 {
                     code_ptr as usize
@@ -1345,23 +1342,10 @@ fn run_native_attached(
     Ok(outcome)
 }
 
-#[inline]
-fn env_flag(cell: &'static OnceLock<bool>, name: &str, test: fn(&std::ffi::OsStr) -> bool) -> bool {
-    *cell.get_or_init(|| std::env::var_os(name).is_some_and(|value| test(&value)))
-}
-
 /// `ARINSAL_BEAMASM_RETURN_TRACE`: log native entries and exits.
 #[inline]
 pub(crate) fn return_trace_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    env_flag(&FLAG, "ARINSAL_BEAMASM_RETURN_TRACE", |_| true)
-}
-
-/// `ARINSAL_BEAMASM_EXCEPTION_TRACE`: log native exceptions.
-#[inline]
-pub(crate) fn exception_trace_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    env_flag(&FLAG, "ARINSAL_BEAMASM_EXCEPTION_TRACE", |_| true)
+    crate::debug_env::slice::get() & crate::debug_env::slice::RETURN_TRACE != 0
 }
 
 /// Install a SIGSEGV dump when `ARINSAL_CRASH_DUMP=1`.
@@ -1602,8 +1586,7 @@ extern "C" fn crash_dump_handler(
 /// `ARINSAL_BEAMASM_LIFETIME=1`: log native code memory lifetimes.
 #[inline]
 pub(crate) fn lifetime_trace_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    env_flag(&FLAG, "ARINSAL_BEAMASM_LIFETIME", |value| value == "1")
+    crate::debug_env::slice::get() & crate::debug_env::slice::LIFETIME_TRACE != 0
 }
 
 #[cfg(test)]
