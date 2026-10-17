@@ -939,12 +939,8 @@ static PF_SPAWN_CONSTRUCT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 fn ensure_register_file(need: (usize, usize), p: &mut Process) -> (*mut Term, *mut f64) {
     let (need_x, need_fr) = need;
     p.x.ensure_x(need_x);
-    if p.fr.len() < need_fr {
-        let mut registers = p.fr.to_vec();
-        registers.resize(need_fr, 0.0);
-        p.fr = registers.into_boxed_slice();
-    }
-    (p.x.as_mut_ptr(), p.fr.as_mut_ptr())
+    p.ensure_fr(need_fr);
+    (p.x.as_mut_ptr(), p.fr_ptr())
 }
 
 /// Locals carried across a streak of specialized instructions.
@@ -1801,11 +1797,7 @@ impl Vm {
         }
         let (need_x, need_fr) = self.code.registers[module_id];
         p.x.ensure_x(need_x);
-        if p.fr.len() < need_fr {
-            let mut registers = p.fr.to_vec();
-            registers.resize(need_fr, 0.0);
-            p.fr = registers.into_boxed_slice();
-        }
+        p.ensure_fr(need_fr);
         if crate::beamasm_integration::enabled() {
             let module = &self.code.modules[module_id];
             let at_native_entry = self
@@ -1825,7 +1817,7 @@ impl Vm {
             unsafe { base.add(p.ip) }
         };
         let mut x = p.x.as_mut_ptr();
-        let mut fr = p.fr.as_mut_ptr();
+        let mut fr = p.fr_ptr();
         let (mut htop, mut stop) = p.heap.heap_cursor();
         let mut heap_dirty = false;
         let mut depth = p.heap.stack_words();
@@ -1897,14 +1889,18 @@ impl Vm {
         }
         macro_rules! float_bin {
             ($a:expr, $b:expr, $dst:expr, $op:tt) => {{
-                // SAFETY: Specialization validates all FR indices below 1024.
-                let (lhs, rhs) = unsafe { (*fr.add($a as usize), *fr.add($b as usize)) };
-                let value = lhs $op rhs;
+                // SAFETY: Specialization validates the operand and destination FR indices below
+                // 1024; the destination is written only for a finite result.
+                let value = unsafe {
+                    let value = *fr.add($a as usize) $op *fr.add($b as usize);
+                    if value.is_finite() {
+                        *fr.add($dst as usize) = value;
+                    }
+                    value
+                };
                 if !value.is_finite() {
                     return Err(self.exception(p, "badarith"));
                 }
-                // SAFETY: Specialization validates the destination FR index.
-                unsafe { *fr.add($dst as usize) = value };
             }};
         }
         macro_rules! return_from_frame {
@@ -2185,7 +2181,7 @@ impl Vm {
                                 base = self.code.modules[module_id].code.as_ptr();
                                 module_handle = self.code.modules[module_id].clone();
                                 x = p.x.as_mut_ptr();
-                                fr = p.fr.as_mut_ptr();
+                                fr = p.fr_ptr();
                                 reds = p.reductions;
                                 depth = p.heap.stack_words();
                                 (htop, stop) = p.heap.heap_cursor();
@@ -2635,7 +2631,7 @@ impl Vm {
                     base = self.code.modules[module_id].code.as_ptr();
                     module_handle = self.code.modules[module_id].clone();
                     x = p.x.as_mut_ptr();
-                    fr = p.fr.as_mut_ptr();
+                    fr = p.fr_ptr();
                     reds = p.reductions;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
@@ -2924,7 +2920,7 @@ impl Vm {
                     }
                     // g_code_fix: nested on_load may reallocate X and FR.
                     x = p.x.as_mut_ptr();
-                    fr = p.fr.as_mut_ptr();
+                    fr = p.fr_ptr();
                     module_id = p.module;
                     base = self.code.modules[module_id].code.as_ptr();
                     reds = p.reductions;
@@ -4942,7 +4938,7 @@ impl Vm {
                     ) {
                         // g_code_fix: nested on_load may reallocate X and FR.
                         x = p.x.as_mut_ptr();
-                        fr = p.fr.as_mut_ptr();
+                        fr = p.fr_ptr();
                     }
                     if matches!(
                         opcode,
