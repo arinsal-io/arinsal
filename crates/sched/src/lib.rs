@@ -1295,6 +1295,9 @@ struct LocalInit<T: Task> {
     message_slabs: Vec<Vec<Event<T::Message>>>,
     pending_waits: Vec<PendingWait<T>>,
     check_time_reds: u32,
+    /// Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData.last_monotonic_time),
+    /// OTP-29.1.1: the time of this scheduler's latest clock read.
+    last_monotonic_ms: u64,
     profile_active: bool,
     last_process: Option<Pid>,
     metric_deltas: Vec<i64>,
@@ -1322,6 +1325,7 @@ impl<T: Task> LocalInit<T> {
             message_slabs: self.message_slabs,
             pending_waits: self.pending_waits,
             check_time_reds: self.check_time_reds,
+            last_monotonic_ms: self.last_monotonic_ms,
             profile_active: self.profile_active,
             last_process: self.last_process,
             metric_deltas: self.metric_deltas,
@@ -3140,6 +3144,20 @@ impl<T: Task> Inner<T> {
         }
     }
 
+    /// The scheduler's monotonic time for this pass.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c (schedule: check_activities_to_run) and
+    /// erl_time_sup.c (erts_get_monotonic_time), OTP-29.1.1: the clock is read once check_time_reds
+    /// reaches ERTS_CHECK_TIME_REDS, the read resets check_time_reds and is kept in
+    /// last_monotonic_time, and every other consumer in the pass uses that cached time.
+    fn scheduler_time(&self, local: &mut Local<T>, force: bool) -> u64 {
+        if force || local.check_time_reds >= self.config.reductions {
+            local.last_monotonic_ms = self.clock.now_ms();
+            local.check_time_reds = 0;
+        }
+        local.last_monotonic_ms
+    }
+
     /// Fire receive timeouts that were kept off the wheel while this worker
     /// stayed busy. A reply clears the epoch, so the common `gen_server:call`
     /// path never locks the timer wheel.
@@ -3159,7 +3177,7 @@ impl<T: Task> Inner<T> {
         if local.pending_waits.is_empty() {
             return;
         }
-        let now = self.clock.now_ms();
+        let now = self.scheduler_time(local, force);
         let mut index = 0;
         while index < local.pending_waits.len() {
             if local.pending_waits[index].deadline_ms > now {
@@ -3203,26 +3221,22 @@ impl<T: Task> Inner<T> {
                     return;
                 }
             }
-            let should_advance = force || local.check_time_reds >= self.config.reductions;
-            if should_advance {
-                local.check_time_reds = 0;
-                let now = self.clock.now_ms();
-                // Port of erts/emulator/beam/erl_process.c:9805-9809 (schedule: timers are
-                // bumped only when the monotonic time has reached erts_next_timeout_time),
-                // OTP-29.1.1.
-                let due = {
-                    let mut service = local.timer_service.borrow_mut();
-                    let due = if service.wheel.next_timeout().is_some_and(|next| now >= next) {
-                        service.wheel.advance(now)
-                    } else {
-                        Vec::new()
-                    };
-                    self.apply_link_events(&mut service.wheel);
-                    due
+            // Port of erts/emulator/beam/erl_process.c:9803-9809 (schedule: one clock read per
+            // ERTS_CHECK_TIME_REDS reductions, then the timers are bumped only when the cached
+            // monotonic time has reached erts_next_timeout_time), OTP-29.1.1.
+            let now = self.scheduler_time(local, force);
+            let due = {
+                let mut service = local.timer_service.borrow_mut();
+                let due = if service.wheel.next_timeout().is_some_and(|next| now >= next) {
+                    service.wheel.advance(now)
+                } else {
+                    Vec::new()
                 };
-                for (id, event) in due {
-                    self.fire_timer(worker, id, event, Some(local));
-                }
+                self.apply_link_events(&mut service.wheel);
+                due
+            };
+            for (id, event) in due {
+                self.fire_timer(worker, id, event, Some(local));
             }
             // Port of erts/emulator/beam/erl_hl_timer.c:1922-1964 (access_btm), OTP-29.1.1:
             // expired timers cannot be canceled successfully.
@@ -3698,6 +3712,9 @@ struct Local<T: Task> {
     /// Receive timeouts not yet published to the wheel.
     pending_waits: Vec<PendingWait<T>>,
     check_time_reds: u32,
+    /// Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData.last_monotonic_time),
+    /// OTP-29.1.1: the time of this scheduler's latest clock read.
+    last_monotonic_ms: u64,
     profile_active: bool,
     last_process: Option<Pid>,
     metric_deltas: Vec<i64>,
@@ -5176,6 +5193,7 @@ impl<T: Task> Scheduler<T> {
                 message_slabs: Vec::new(),
                 pending_waits: Vec::new(),
                 check_time_reds: 0,
+                last_monotonic_ms: now,
                 profile_active: false,
                 last_process: None,
                 metric_deltas: vec![0; workers],
