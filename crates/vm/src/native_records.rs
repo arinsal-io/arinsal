@@ -108,11 +108,7 @@ fn stage_roots(
     if top > registers.x_reg_array.len() {
         return None;
     }
-    if process.x.len() < top {
-        let mut x = process.x.to_vec();
-        x.resize(top, Term::NIL);
-        process.x = x.into();
-    }
+    process.x.ensure_x(top);
     for (index, slot) in registers.x_reg_array[..top].iter().enumerate() {
         process.x[index] = if (live..base).contains(&index) {
             Term::NIL

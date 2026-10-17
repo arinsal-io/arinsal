@@ -601,11 +601,7 @@ fn enter_native_nif(
     process.reductions = process.header.fcalls;
     // The arguments live in the native X register array, not in `process.x`, when native code
     // reaches the NIF body directly (local or tail call).
-    if process.x.len() < usize::from(arity) {
-        let mut x = process.x.to_vec();
-        x.resize(usize::from(arity), Term::NIL);
-        process.x = x.into();
-    }
+    process.x.ensure_x(usize::from(arity));
     for (destination, raw) in process
         .x
         .iter_mut()
@@ -1093,11 +1089,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     // X registers above the register cache live in the X register array. Those below `live`
     // are roots and move with the collection, so they round-trip through `process.x`.
     let synced = live.clamp(6, registers.x_reg_array.len());
-    if process.x.len() < synced {
-        let mut x = process.x.to_vec();
-        x.resize(synced, Term::NIL);
-        process.x = x.into();
-    }
+    process.x.ensure_x(synced);
     for index in 6..synced {
         process.x[index] = registers.x_reg_array[index];
     }
@@ -1239,11 +1231,7 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
             return 0;
         }
     }
-    if process.x.len() < 4 {
-        let mut x = process.x.to_vec();
-        x.resize(4, Term::NIL);
-        process.x = x.into();
-    }
+    process.x.ensure_x(4);
     let args = [
         Term::atom(function.module_atom),
         Term::atom(function.function_atom),
@@ -3760,11 +3748,7 @@ fn set_call_fun_error(
     }
     // `apply/2` may pass more arguments than the module's register file holds (erts raises
     // badarity with all of them, instr_fun.cpp:253-328).
-    if arity >= process.x.len() {
-        let mut x = process.x.to_vec();
-        x.resize(arity + 1, Term::NIL);
-        process.x = x.into();
-    }
+    process.x.ensure_x(arity + 1);
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
@@ -4027,8 +4011,7 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         // the next native exit as a continuation resume.
         cold.native_continuation_resume = false;
     }
-    let live = process.x.len().min(4);
-    registers.x_reg_array[..live].copy_from_slice(&process.x[..live]);
+    registers.x_reg_array[..4].copy_from_slice(&process.x[..4]);
     handler
 }
 
@@ -4676,11 +4659,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         crate::native_hooks::set_error(process, "system_limit");
         return 0;
     }
-    if process.x.len() < root_live {
-        let mut x = process.x.to_vec();
-        x.resize(root_live, Term::NIL);
-        process.x = x.into();
-    }
+    process.x.ensure_x(root_live);
     for (index, slot) in registers.x_reg_array[..root_live].iter().enumerate() {
         // Dead X registers below the staged segments must not become GC roots.
         process.x[index] = if (live..base_slot).contains(&index) {
@@ -4880,11 +4859,7 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
         .set_frame_pointer(registers.tmp_mem[2] as usize);
     let base = (live as usize).max(6);
     let root_live = base + 4;
-    if process.x.len() < root_live {
-        let mut x = process.x.to_vec();
-        x.resize(root_live, Term::NIL);
-        process.x = x.into();
-    }
+    process.x.ensure_x(root_live);
     // The X registers below `base` and the staged operands (the context among them) are the
     // roots of a collection; the staged copies follow the registers in `process.x`.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp (emit_gc_test_preserve), OTP-29.1.1.

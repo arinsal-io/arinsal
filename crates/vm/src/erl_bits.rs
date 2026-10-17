@@ -56,11 +56,7 @@ pub extern "C" fn append_binary(
         }
         return raw(term);
     }
-    if process.x.len() < root_live {
-        let mut x = process.x.to_vec();
-        x.resize(root_live, Term::NIL);
-        process.x = x.into();
-    }
+    process.x.ensure_x(root_live);
     process.x[..root_live].copy_from_slice(&registers.x_reg_array[..root_live]);
     let build = |src: Term, extra: Term| {
         [

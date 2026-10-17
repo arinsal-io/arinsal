@@ -705,11 +705,7 @@ pub(crate) fn collect_native(
     // Exactly the live X registers are GC roots, including those past the six register-backed
     // ones; dead registers may hold stale words (erts_garbage_collect_nobump, OTP-29.1.1).
     let roots = live.min(registers.x_reg_array.len());
-    if process.x.len() < roots {
-        let mut grown = process.x.to_vec();
-        grown.resize(roots, Term::NIL);
-        process.x = grown.into();
-    }
+    process.x.ensure_x(roots);
     for (destination, raw) in process.x.iter_mut().take(roots).zip(&registers.x_reg_array) {
         *destination = *raw;
     }
