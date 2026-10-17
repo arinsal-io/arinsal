@@ -13,7 +13,7 @@ thread_local! {
     pub(crate) static NODE_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Count of `NodeRef::word` calls on this thread, for the tree upkeep tests.
     pub(crate) static NODE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Count of node address checks (`NodeRef::new`) on this thread, for the tree upkeep tests.
+    /// Count of node address resolutions (`NodeRef::at`) on this thread, for the tree upkeep tests.
     pub(crate) static NODE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -24,25 +24,27 @@ pub(crate) const NODE_WORDS: usize = 7;
 /// A free-block or carrier tree node: a few consecutive machine words at a known address.
 ///
 /// Port of the intrusive `AOFF_RBTree_t`/`RBTree_t` node access of erl_ao_firstfit_alloc.c and
-/// erl_bestfit_alloc.c: once the node's address has been checked against its carrier's range,
-/// its fields are read and written through plain pointers, like the C code does.
+/// erl_bestfit_alloc.c: the node's fields are read and written through plain pointers, like the
+/// C code does.
 #[derive(Clone, Copy)]
 pub(crate) struct NodeRef {
     ptr: usize,
 }
 
 impl NodeRef {
-    /// The node at `key`, if all `NODE_WORDS` of it lie inside the carrier starting at
-    /// `span_start`. `node_limit` is the carrier's length minus `NODE_WORDS` words, plus one, so
-    /// one unsigned compare of the offset covers both ends.
+    /// The node at `key`, without any check.
     ///
-    /// The range must belong to a live carrier of the calling allocator; the allocator indexes
-    /// carriers by exactly this range and drops the index before the memory is released.
+    /// # Safety
+    ///
+    /// `key` must be the address of a tree node of a live carrier of the calling allocator: all
+    /// `NODE_WORDS` words from `key` lie inside that carrier and `key` is word aligned. The links
+    /// of a tree the allocator itself maintains satisfy this by construction, because a node is
+    /// linked only while its free block, which holds the node, is intact in an indexed carrier.
     #[inline(always)]
-    pub(crate) fn new(span_start: usize, node_limit: usize, key: usize) -> Option<Self> {
+    pub(crate) unsafe fn at(key: usize) -> Self {
         #[cfg(test)]
         NODE_CHECKS.with(|checks| checks.set(checks.get() + 1));
-        (key.wrapping_sub(span_start) < node_limit).then_some(Self { ptr: key })
+        Self { ptr: key }
     }
 
     /// The address of the node.
@@ -57,9 +59,9 @@ impl NodeRef {
         assert!(byte + std::mem::size_of::<T>() <= NODE_WORDS * WORD_BYTES);
         #[cfg(test)]
         NODE_READS.with(|reads| reads.set(reads.get() + 1));
-        // SAFETY: `new` checked that `NODE_WORDS` words from `ptr` lie inside a live carrier, and
-        // the access stays inside them. The read is unaligned so that a corrupt link cannot make
-        // it undefined behavior.
+        // SAFETY: `at` requires that `NODE_WORDS` words from `ptr` lie inside a live carrier, and
+        // the access stays inside them. The read is unaligned, which costs nothing on the targets
+        // of this runtime and does not depend on the alignment half of that contract.
         unsafe {
             (self.ptr as *const u8)
                 .add(byte)
