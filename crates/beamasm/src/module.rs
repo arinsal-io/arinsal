@@ -1643,6 +1643,14 @@ impl BeamModuleAssembler {
         let mut memory = CodeMemory::new(bytes.len().max(4))?;
         let offset = memory.alloc(bytes.len().max(4))?;
         memory.write_bytes(offset, &bytes)?;
+        if let Some(module) = &self.dump_module
+            && let Some(directory) = crate::dump_directory()
+        {
+            let _ = std::fs::write(
+                Path::new(directory).join(format!("{module}.base")),
+                format!("{:x}\n", memory.ptr_at(offset) as usize),
+            );
+        }
         let entry_offsets: HashMap<_, _> = self
             .labels
             .into_iter()
