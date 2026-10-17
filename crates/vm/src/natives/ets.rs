@@ -1339,47 +1339,87 @@ fn fix_table<H: HeapAlloc>(heap: &mut H, table: &mut Table, caller: Term) -> Res
         .map_err(err)
 }
 
-/// Results of one cycle of a hash table traversal.
+/// Results of one cycle of a table traversal.
 struct SelectCycle {
-    end: arinsal_ets::HashScanEnd,
+    /// Objects left of the budget; below zero when the last bucket ran past it.
+    iterations_left: isize,
+    /// Where a trapped call resumes, or `None` when the traversal is over.
+    resume: Option<arinsal_ets::ScanPosition>,
     results: Vec<Term>,
     counted: usize,
 }
 
+/// What a traversal visits: the buckets of a hash table or the key range of an ordered one.
+enum ScanPlan {
+    Hash(arinsal_ets::HashScanPlan),
+    Tree(arinsal_ets::TreeScanPlan),
+}
+
 fn select_cycle<H: HeapAlloc>(
     table: &Table,
-    plan: &arinsal_ets::HashScanPlan,
+    plan: &ScanPlan,
     program: &MatchProgram,
     count: bool,
-    from: usize,
+    backwards: bool,
+    from: Option<&arinsal_ets::ScanPosition>,
     heap: &mut H,
 ) -> Result<SelectCycle, EtsError> {
-    if count {
-        let (end, counted) = table.hash_count_cycle(plan, program, from)?;
-        Ok(SelectCycle {
-            end,
-            results: Vec::new(),
-            counted,
-        })
-    } else {
-        let (end, results) = table.hash_select_cycle(plan, program, from, heap)?;
-        Ok(SelectCycle {
-            end,
-            results,
-            counted: 0,
-        })
+    use arinsal_ets::ScanPosition;
+    match plan {
+        ScanPlan::Hash(plan) => {
+            let slot = match from {
+                Some(ScanPosition::Slot(slot)) => *slot,
+                _ => 0,
+            };
+            let (end, results, counted) = if count {
+                let (end, counted) = table.hash_count_cycle(plan, program, slot)?;
+                (end, Vec::new(), counted)
+            } else {
+                let (end, results) = table.hash_select_cycle(plan, program, slot, heap)?;
+                (end, results, 0)
+            };
+            Ok(SelectCycle {
+                iterations_left: end.iterations_left,
+                resume: end.trap_slot.map(ScanPosition::Slot),
+                results,
+                counted,
+            })
+        }
+        ScanPlan::Tree(plan) => {
+            let after = match from {
+                Some(ScanPosition::After(key)) => Some(key.term()),
+                _ => None,
+            };
+            let (end, results, counted) = if count {
+                let (end, counted) = table.tree_count_cycle(plan, program, after)?;
+                (end, Vec::new(), counted)
+            } else {
+                let (end, results) =
+                    table.tree_select_cycle(plan, program, backwards, after, heap)?;
+                (end, results, 0)
+            };
+            Ok(SelectCycle {
+                iterations_left: end.iterations_left,
+                resume: end.resume_key.map(ScanPosition::After),
+                results,
+                counted,
+            })
+        }
     }
 }
 
-/// `ets:select/2`, `select_reverse/2`, `match/2`, `match_object/2` and `select_count/2` on a
-/// set, bag or duplicate_bag table: a cycle visits up to 1000 objects, charges a reduction for
-/// each and traps as `ets:select_trap/1` (`ets:count_trap/1`) until the table is exhausted. A
-/// table another process may write is fixed while the call is trapped. `Ok(None)` leaves any
-/// other table type to the caller.
+/// `ets:select/2`, `select_reverse/2`, `match/2`, `match_object/2` and `select_count/2`: a
+/// cycle visits up to 1000 objects, charges a reduction for each and traps as
+/// `ets:select_trap/1` (`ets:count_trap/1`) on a hash table and as `ets:select/1`
+/// (`ets:count_trap/1`) on an ordered one, until the table is exhausted. A hash table another
+/// process may write is fixed while the call is trapped. `Ok(None)` leaves a call that names
+/// one key of an ordered table to the caller.
 ///
 /// Port of erts/emulator/beam/erl_db.c (ets_match_2, ets_select2, ets_select_trap_1,
-/// ets_select_count_2, ets_select_count_1) and erl_db_hash.c (match_traverse,
-/// match_traverse_continue, the select_chunk_* and select_count_* callbacks), OTP-29.1.1.
+/// ets_select_count_2, ets_select_count_1), erl_db_hash.c (match_traverse,
+/// match_traverse_continue, the select_chunk_* and select_count_* callbacks) and
+/// erl_db_tree.c (db_select_tree_common, db_select_continue_tree_common,
+/// db_select_count_tree_common, db_select_count_continue_tree_common), OTP-29.1.1.
 fn hash_select(
     process: &mut Process,
     mut ctx: Option<&mut RunCtx<'_, Message>>,
@@ -1412,6 +1452,10 @@ fn hash_select(
     };
     let iterations = arinsal_ets::HASH_SELECT_ITERATIONS;
     let mut scratch = arinsal_term::VecHeap::new();
+    let backwards = match resumed.as_ref() {
+        Some(state) => state.backwards,
+        None => function != EtsBif::SelectReverse,
+    };
 
     // Cycle under the table's read lock.
     let (tid, program, safety, cycle) = {
@@ -1430,9 +1474,6 @@ fn hash_select(
             }
             Err(error) => return Err(err(error)),
         };
-        if resumed.is_none() && !table.is_hash() {
-            return Ok(None);
-        }
         if !allowed(&table, caller, false) {
             return Err(badarg_cause("access"));
         }
@@ -1440,12 +1481,18 @@ fn hash_select(
         match resumed.as_ref() {
             Some(state) => {
                 let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+                let plan = if table.is_hash() {
+                    ScanPlan::Hash(arinsal_ets::HashScanPlan::all_slots())
+                } else {
+                    ScanPlan::Tree(table.tree_scan_plan(&state.program))
+                };
                 let cycle = select_cycle(
                     &table,
-                    &arinsal_ets::HashScanPlan::all_slots(),
+                    &plan,
                     &state.program,
                     count,
-                    state.slot,
+                    backwards,
+                    Some(&state.position),
                     &mut heap,
                 );
                 (tid, Arc::clone(&state.program), state.safety, cycle)
@@ -1463,18 +1510,37 @@ fn hash_select(
                     _ => MatchProgram::compile(args[1]),
                 }
                 .map_err(err)?;
-                let plan = table.hash_scan_plan(&program);
-                if !plan.something_can_match() {
-                    return empty_result().map(Some);
-                }
-                let safety = table.iteration_safety(caller);
+                let (plan, safety) = if table.is_hash() {
+                    let plan = table.hash_scan_plan(&program);
+                    if !plan.something_can_match() {
+                        return empty_result().map(Some);
+                    }
+                    (ScanPlan::Hash(plan), table.iteration_safety(caller))
+                } else {
+                    let plan = table.tree_scan_plan(&program);
+                    if plan.impossible() {
+                        return empty_result().map(Some);
+                    }
+                    if plan.key_bound() {
+                        return Ok(None);
+                    }
+                    (ScanPlan::Tree(plan), arinsal_ets::IterSafety::Safe)
+                };
                 // Native code caches the heap top, so a call that may still decline builds its
                 // results aside and copies them to the heap once it knows it completes.
                 let cycle = if direct {
-                    select_cycle(&table, &plan, &program, count, 0, &mut scratch)
+                    select_cycle(
+                        &table,
+                        &plan,
+                        &program,
+                        count,
+                        backwards,
+                        None,
+                        &mut scratch,
+                    )
                 } else {
                     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-                    select_cycle(&table, &plan, &program, count, 0, &mut heap)
+                    select_cycle(&table, &plan, &program, count, backwards, None, &mut heap)
                 };
                 (tid, Arc::new(program), safety, cycle)
             }
@@ -1490,7 +1556,7 @@ fn hash_select(
         }
     };
     let mut fixed_now = false;
-    if cycle.end.trap_slot.is_some() && !was_resumed {
+    if cycle.resume.is_some() && !was_resumed {
         // The first trap of a table that other processes may write: fix it under the write
         // lock, redoing the cycle in case the table changed in between.
         if ctx.is_none() {
@@ -1500,9 +1566,10 @@ fn hash_select(
             let registry = rt.ets.read().unwrap();
             let mut table = registry.get_mut(tid).map_err(err)?;
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            let plan = table.hash_scan_plan(&program);
-            cycle = select_cycle(&table, &plan, &program, count, 0, &mut heap).map_err(err)?;
-            if cycle.end.trap_slot.is_some() {
+            let plan = ScanPlan::Hash(table.hash_scan_plan(&program));
+            cycle = select_cycle(&table, &plan, &program, count, backwards, None, &mut heap)
+                .map_err(err)?;
+            if cycle.resume.is_some() {
                 fix_table(&mut heap, &mut table, caller)?;
                 fixed_now = true;
             }
@@ -1517,22 +1584,26 @@ fn hash_select(
         Some(state) => (state.saved, state.got),
         None => (arinsal_ets::SavedMatches::new(), 0),
     };
-    if let Some(slot) = cycle.end.trap_slot {
+    if let Some(position) = cycle.resume {
         saved.extend(&cycle.results).map_err(err)?;
+        let tree = matches!(position, arinsal_ets::ScanPosition::After(_));
         process.cold_mut().ets_select = Some(crate::proc_create::EtsSelect {
             tid,
             program,
             count,
-            slot,
+            position,
+            backwards,
             got: got + cycle.counted,
             saved,
             safety,
         });
         let ctx = ctx.as_deref_mut().ok_or_else(needs_context)?;
-        bump_reds(process, ctx, isize::MAX);
+        // A hash traversal charges all the reductions it has left, an ordered one the objects
+        // it visited.
+        bump_reds(process, ctx, if tree { iterations } else { isize::MAX });
         return Err(VmError::Yield);
     }
-    let used = iterations - cycle.end.iterations_left.min(iterations);
+    let used = iterations - cycle.iterations_left.min(iterations);
     match ctx.as_deref_mut() {
         Some(ctx) => bump_reds(process, ctx, used),
         None => bump_direct(process, used),
