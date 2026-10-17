@@ -6242,11 +6242,11 @@ impl Process {
         // the outer signal queue until this fetch. Scanning without it would
         // reclaim that term. Hibernate fetches too (erl_gc.c:1016).
         self.fetch_outer_queue_for_gc()?;
-        // Port of erl_gc.c:2616 (`setup_rootset` with `nobj == 0`, no dictionary and
-        // an empty message queue): the stack is scanned in place. Building and
-        // rewriting an auxiliary root vector is the on-heap message and dictionary case.
+        // Port of erl_gc.c:2616 (`setup_rootset` with no dictionary and an empty message
+        // queue): the stack is scanned in place and `extra` is rooted directly, as in
+        // `erts_garbage_collect(p, 0, &result, 1)` after a BIF. Building and rewriting
+        // an auxiliary root vector is the on-heap message and dictionary case.
         if !hibernate
-            && extra.is_empty()
             && self.inbox.is_empty()
             && self.sig_cont.is_empty()
             && self.dictionary.is_none()
@@ -6267,7 +6267,7 @@ impl Process {
         {
             let stats = self
                 .heap
-                .collect(&mut self.x[..live_x], &mut [], min_free)
+                .collect(&mut self.x[..live_x], extra, min_free)
                 .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
             self.stats.gc.collections += stats.collections;
             self.stats.gc.nanoseconds += stats.nanoseconds;
@@ -7880,6 +7880,25 @@ mod layout_tests {
             arinsal_term::to_owned(term).unwrap(),
             arinsal_etf::OwnedTerm::Tuple(vec![arinsal_etf::OwnedTerm::Int(17)])
         );
+    }
+
+    #[test]
+    fn post_bif_result_root_survives_collection_in_the_fast_arm() {
+        let mut process = Process::new();
+        let elements = [
+            Term::small(1).unwrap(),
+            Term::small(2).unwrap(),
+            Term::small(3).unwrap(),
+        ];
+        let result = TermBuilder::new(&mut process.heap)
+            .tuple(&elements)
+            .unwrap();
+        let expected = arinsal_term::to_owned(result).unwrap();
+        let mut roots = [result];
+        let stats = process.collect_heap_roots(0, &mut roots, 0).unwrap();
+        assert_eq!(stats.collections, 1);
+        assert_ne!(roots[0], result);
+        assert_eq!(arinsal_term::to_owned(roots[0]).unwrap(), expected);
     }
 
     #[test]
