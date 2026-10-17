@@ -42,8 +42,8 @@ impl ProcessStats {
     }
 }
 
-/// Registers a scan wider than the live count can reach: `run_native` copies at least this
-/// many, and `live.max(6)` root walks stay below it.
+/// Registers a scan wider than the live count can reach: a moving collection nils the
+/// attached file up to this many, and `live.max(6)` root walks stay below it.
 const DEAD_X_FLOOR: usize = 8;
 
 /// Number of X registers a scheduler array holds (`ERTS_X_REGS_ALLOCATED`, erl_vm.h).
@@ -105,12 +105,28 @@ impl ArgRegs {
         self.len
     }
 
-    /// Make `registers.x_reg_array` the X file. The saved registers stay in place and
-    /// `saved_arity` is unchanged; the caller copies them in (`copy_in_registers`).
+    /// Schedule-in (`copy_in_registers`): copy the `saved_arity` saved registers into
+    /// `registers.x_reg_array` and make it the X file. The saved storage and `saved_arity`
+    /// stay untouched until `detach_save`.
     ///
-    /// The scheduler must `detach_save` before `registers` moves or is dropped.
-    pub fn attach(&mut self, registers: &mut arinsal_beamasm::SchedulerRegisters) {
+    /// # Safety
+    /// `registers` must stay alive and at the same address until the matching `detach_save`,
+    /// and nothing else may reach `registers.x_reg_array` through a reference that is live
+    /// across a use of this file.
+    pub unsafe fn attach(&mut self, registers: &mut arinsal_beamasm::SchedulerRegisters) {
         assert!(self.attached == 0, "X registers are already attached");
+        assert!(
+            self.len <= ATTACHED_X_REGS,
+            "saved arity {} exceeds the X array",
+            self.len
+        );
+        let len = self.len;
+        let saved: &[Term] = if len <= 6 {
+            &self.inline[..len]
+        } else {
+            &self.extra[..len]
+        };
+        registers.x_reg_array[..len].copy_from_slice(saved);
         self.attached = registers.x_reg_array.as_mut_ptr() as usize;
     }
 
@@ -1633,6 +1649,9 @@ impl Process {
         {
             return Ok(false);
         }
+        if self.x.is_attached() {
+            return self.ensure(words, live).map(|()| true);
+        }
         self.x.ensure_x(live);
         self.x[..live].copy_from_slice(&registers[..live]);
         let result = self.ensure(words, live);
@@ -2067,6 +2086,11 @@ mod arg_regs_tests {
         Box::<SchedulerRegisters>::default()
     }
 
+    fn attach(regs: &mut ArgRegs, sched: &mut SchedulerRegisters) {
+        // SAFETY: every test keeps `sched` alive and in place until it detaches or drops `regs`.
+        unsafe { regs.attach(sched) }
+    }
+
     fn owned(values: &[i64]) -> ArgRegs {
         ArgRegs::from(values.iter().map(|&n| int(n)).collect::<Vec<_>>())
     }
@@ -2087,7 +2111,7 @@ mod arg_regs_tests {
         let mut sched = registers();
         sched.x_reg_array[3] = int(33);
         let mut regs = owned(&[1, 2]);
-        regs.attach(&mut sched);
+        attach(&mut regs, &mut sched);
         assert!(regs.is_attached());
         assert_eq!(regs.len(), ATTACHED_X_REGS);
         assert_eq!(regs.saved_arity(), 2);
@@ -2098,10 +2122,24 @@ mod arg_regs_tests {
     }
 
     #[test]
+    fn attach_copies_exactly_the_saved_registers_into_the_array() {
+        let mut sched = registers();
+        sched.x_reg_array[0] = int(77);
+        sched.x_reg_array[2] = int(78);
+        sched.x_reg_array[8] = int(79);
+        let mut regs = owned(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        attach(&mut regs, &mut sched);
+        assert_eq!(sched.x_reg_array[7], int(8));
+        assert_eq!(sched.x_reg_array[0], int(1));
+        assert_eq!(sched.x_reg_array[8], int(79));
+        regs.detach_save(0);
+    }
+
+    #[test]
     fn attached_writes_land_in_the_array_and_detach_saves_arity_registers() {
         let mut sched = registers();
         let mut regs = owned(&[9]);
-        regs.attach(&mut sched);
+        attach(&mut regs, &mut sched);
         for i in 0..4 {
             regs[i] = int(10 + i as i64);
         }
@@ -2117,7 +2155,7 @@ mod arg_regs_tests {
     fn detach_save_grows_past_the_inline_registers() {
         let mut sched = registers();
         let mut regs = owned(&[1]);
-        regs.attach(&mut sched);
+        attach(&mut regs, &mut sched);
         for i in 0..9 {
             regs[i] = int(100 + i as i64);
         }
@@ -2126,10 +2164,10 @@ mod arg_regs_tests {
         let expect: Vec<Term> = (0..9).map(|i| int(100 + i)).collect();
         assert_eq!(&regs[..], &expect[..]);
 
-        regs.attach(&mut sched);
+        attach(&mut regs, &mut sched);
         regs.detach_save(2);
         assert_eq!(&regs[..], &expect[..2]);
-        regs.attach(&mut sched);
+        attach(&mut regs, &mut sched);
         regs.detach_save(7);
         assert_eq!(&regs[..], &expect[..7]);
     }
@@ -2138,7 +2176,7 @@ mod arg_regs_tests {
     fn detach_save_is_isolated_from_later_array_changes() {
         let mut sched = registers();
         let mut regs = owned(&[]);
-        regs.attach(&mut sched);
+        attach(&mut regs, &mut sched);
         regs[0] = int(1);
         regs[1] = int(2);
         regs.detach_save(2);
@@ -2170,12 +2208,12 @@ mod arg_regs_tests {
     fn ensure_x_after_a_smaller_save_does_not_resurrect_stale_registers() {
         let mut sched = registers();
         let mut regs = owned(&[]);
-        regs.attach(&mut sched);
+        attach(&mut regs, &mut sched);
         for i in 0..8 {
             regs[i] = int(50 + i as i64);
         }
         regs.detach_save(8);
-        regs.attach(&mut sched);
+        attach(&mut regs, &mut sched);
         regs.detach_save(2);
         regs.ensure_x(4);
         assert_eq!(&regs[..], &[int(50), int(51), Term::NIL, Term::NIL]);
@@ -2188,7 +2226,7 @@ mod arg_regs_tests {
     fn ensure_x_is_a_no_op_while_attached() {
         let mut sched = registers();
         let mut regs = owned(&[1]);
-        regs.attach(&mut sched);
+        attach(&mut regs, &mut sched);
         regs.ensure_x(500);
         assert_eq!(regs.len(), ATTACHED_X_REGS);
         assert_eq!(regs.saved_arity(), 1);
