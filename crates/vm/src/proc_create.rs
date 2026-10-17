@@ -850,9 +850,9 @@ pub(crate) struct ProcessCold {
     pub(crate) priority_resume_cursor: Option<usize>,
     /// The next native entry resumes a raw continuation already on the stack.
     pub(crate) native_continuation_resume: bool,
-    /// Live X registers of the resumed native continuation plus one; 0 means the function
-    /// arity (yield resume).
-    pub(crate) native_resume_live: u8,
+    /// `header.arity` already holds the live X register count of the resumed native
+    /// continuation. Unset, the next native entry is a call and takes the function's arity.
+    pub(crate) native_arity_set: bool,
     /// A native `wait`/`wait_timeout` asked the scheduler to sleep (timeout in ms, `None` for
     /// `infinity`); the process resumes at the native `loop_rec` label.
     pub(crate) native_wait: Option<Option<u64>>,
@@ -1236,6 +1236,7 @@ impl Process {
             self.x[index] = *arg;
         }
         self.gc_live = args.len();
+        self.header.arity = args.len().min(usize::from(u8::MAX)) as u8;
         if let Some(saved) = self
             .cold
             .as_mut()
@@ -1326,6 +1327,22 @@ impl Process {
         self.header.i = std::ptr::null();
         self.header.arity = 0;
         self.header.current = std::ptr::null();
+    }
+
+    /// Records the live X register count a native continuation resumes with.
+    // Port of erts/emulator/beam/erl_process.h (`Process.arity`), OTP-29.1.1: the producer of
+    // a saved register file states how many registers are live, and every reader of a
+    // switched-out process takes that count.
+    pub(crate) fn set_native_resume_arity(&mut self, live: u8) {
+        self.header.arity = live;
+        self.cold_mut().native_arity_set = true;
+    }
+
+    /// Live X register count of a switched-out process (`c_p->arity`), bounded by the
+    /// saved file.
+    #[inline]
+    pub(crate) fn saved_arity(&self) -> usize {
+        usize::from(self.header.arity).min(self.x.len())
     }
 
     /// Publishes what a runtime call that did not collect can change: the heap and stack
@@ -1422,6 +1439,7 @@ impl Process {
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;
+        process.header.arity = x_registers.min(usize::from(u8::MAX)) as u8;
         if !crate::beamasm_integration::enabled() {
             crate::native_bridge::push_exit_bridge(&mut process);
         }

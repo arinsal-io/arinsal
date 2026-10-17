@@ -1945,7 +1945,7 @@ impl Vm {
                     p.reductions = reds;
                     p.heap.release_stack(1);
                     p.cold_mut().native_continuation_resume = true;
-                    p.cold_mut().native_resume_live = 2;
+                    p.set_native_resume_arity(1);
                     p.native_pc = Some(cp as usize);
                     p.cold_mut().native_transfer = true;
                     return Ok(RunState::Yield);

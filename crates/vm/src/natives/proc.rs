@@ -3035,6 +3035,7 @@ fn hibernate(
     process.x[1] = function;
     process.x[2] = args;
     process.gc_live = 3;
+    process.header.arity = 3;
     process.receive_cursor = 0;
     // Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the parked
     // continuation is process state.
