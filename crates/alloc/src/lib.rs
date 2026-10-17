@@ -10,4 +10,6 @@ pub mod raw;
 pub mod typed;
 pub mod types;
 
-pub use instances::{RegisterError, ThreadKind, notify_owner, register_thread, set_owner_notifier};
+pub use instances::{
+    RegisterError, ThreadKind, notify_owner, register_thread, set_owner_notifier, thread_alloc_ix,
+};

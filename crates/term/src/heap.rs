@@ -25,6 +25,9 @@ pub(crate) struct WordBlock {
     ptr: *mut u64,
 }
 
+/// `ProcessHeap::alloc_ix` of a heap whose allocations read the thread's allocator index.
+pub(crate) const NO_ALLOC_IX: u16 = u16::MAX;
+
 const LITERAL_HEAP_BIT: usize = MAPPED_WORDS;
 const MAPPED_WORDS: usize = 1 << (usize::BITS - 1);
 
@@ -71,6 +74,32 @@ impl WordBlock {
             ptr: AllocBlock::detach_heap(allocation_type, words)
                 .expect("ERTS heap block allocation failed"),
         }
+    }
+
+    /// [`WordBlock::new`] on the allocator index `ix` of the calling scheduler thread.
+    pub(crate) fn new_at(words: usize, allocation_type: ErtsAlcType, ix: usize) -> Self {
+        Self {
+            ptr: AllocBlock::detach_heap_at(ix, allocation_type, words)
+                .expect("ERTS heap block allocation failed"),
+        }
+    }
+
+    /// A block on the allocator index `alloc_ix`, or on the thread's own when it is
+    /// [`NO_ALLOC_IX`].
+    fn new_for(words: usize, allocation_type: ErtsAlcType, alloc_ix: u16) -> Self {
+        if alloc_ix == NO_ALLOC_IX {
+            Self::new(words, allocation_type)
+        } else {
+            Self::new_at(words, allocation_type, usize::from(alloc_ix))
+        }
+    }
+
+    /// Frees the block on the allocator index `ix` of the calling scheduler thread.
+    pub(crate) fn release_at(self, ix: usize) {
+        let ptr = self.ptr;
+        // The allocator frees the block here; the destructor must not free it again.
+        std::mem::forget(self);
+        AllocBlock::free_detached_heap_at(ix, ptr);
     }
 
     /// Grow or shrink this block in place when the carrier allows it.
@@ -809,6 +838,9 @@ pub struct ProcessHeap {
     pub(crate) min_heap_size: u32,
     pub(crate) fullsweep_after: u16,
     pub(crate) minor_since_major: u16,
+    /// Allocator index of the scheduler thread running this process, set for the span of one
+    /// run; [`NO_ALLOC_IX`] otherwise, when allocations read it from thread-local storage.
+    pub(crate) alloc_ix: u16,
     pub(crate) bin_vheap: u64,
     pub(crate) bin_vheap_size: u64,
     pub(crate) heap_grow: bool,
@@ -1002,8 +1034,19 @@ impl ProcessHeap {
 
     /// Create a heap fragment block with the requested typed allocator.
     pub fn with_words_for_type(words: usize, allocation_type: ErtsAlcType) -> Self {
+        Self::with_words_for_type_at(words, allocation_type, NO_ALLOC_IX)
+    }
+
+    /// Like [`ProcessHeap::with_words`] for a heap owned by the scheduler thread that
+    /// [`ProcessHeap::set_alloc_ix`] last named: no thread-local read, and the new heap serves
+    /// the same thread.
+    pub(crate) fn with_words_at(words: usize, alloc_ix: u16) -> Self {
+        Self::with_words_for_type_at(words, ErtsAlcType::HEAP, alloc_ix)
+    }
+
+    fn with_words_for_type_at(words: usize, allocation_type: ErtsAlcType, alloc_ix: u16) -> Self {
         Self {
-            words: WordBlock::new(words, allocation_type),
+            words: WordBlock::new_for(words, allocation_type, alloc_ix),
             htop: 0,
             stop: words,
             frame_pointer: 0,
@@ -1013,6 +1056,7 @@ impl ProcessHeap {
             min_heap_size: 233,
             fullsweep_after: u16::MAX,
             minor_since_major: 0,
+            alloc_ix,
             bin_vheap: 0,
             bin_vheap_size: 46_422,
             heap_grow: false,
@@ -1024,6 +1068,55 @@ impl ProcessHeap {
             gc_enabled: true,
             owners: LazyOwners::default(),
         }
+    }
+
+    /// Names the allocator index of the scheduler thread that runs this process, or `None` once
+    /// it stops running, so heap blocks are allocated and freed without a thread-local read.
+    ///
+    /// Port of the `esdp->no` the scheduler passes to `erts_alloc` for the thread-specific heap
+    /// types, in place of a lookup of the thread, OTP-29.1.1. The index must be that of the
+    /// calling thread for as long as it is set.
+    pub fn set_alloc_ix(&mut self, ix: Option<usize>) {
+        self.alloc_ix = ix.map_or(NO_ALLOC_IX, |ix| {
+            u16::try_from(ix).map_or(NO_ALLOC_IX, |ix| ix.min(NO_ALLOC_IX - 1))
+        });
+    }
+
+    /// A word block of `allocation_type` for this heap's scheduler thread.
+    pub(crate) fn new_block(&self, words: usize, allocation_type: ErtsAlcType) -> WordBlock {
+        WordBlock::new_for(words, allocation_type, self.alloc_ix)
+    }
+
+    /// Frees every block of `fragments`, as [`Vec::clear`] would, on the allocator index of this
+    /// heap's scheduler thread.
+    #[inline]
+    pub(crate) fn release_fragments(&self, fragments: &mut Vec<Fragment>) {
+        if self.alloc_ix != NO_ALLOC_IX {
+            for fragment in fragments.iter_mut() {
+                if let Fragment::Block { memory, .. } = fragment {
+                    memory.release_in_place_at(usize::from(self.alloc_ix));
+                }
+            }
+        }
+        fragments.clear();
+    }
+
+    /// Frees the heap's blocks on the allocator index of its scheduler thread, in the order the
+    /// fields drop: token owners, young heap, old heap, fragments.
+    pub(crate) fn release_all(mut self) {
+        drop(std::mem::take(&mut self.owners));
+        let ix = self.alloc_ix;
+        let words = std::mem::take(&mut self.words);
+        let old_words = std::mem::take(&mut self.old_words);
+        let mut fragments = std::mem::take(&mut self.fragments);
+        if ix == NO_ALLOC_IX {
+            drop(words);
+            drop(old_words);
+        } else {
+            words.release_at(usize::from(ix));
+            old_words.release_at(usize::from(ix));
+        }
+        self.release_fragments(&mut fragments);
     }
 
     /// Reserve contiguous words for a process object.
@@ -1276,8 +1369,16 @@ impl ProcessHeap {
         let block_words = words.checked_add(extra).unwrap_or(words);
         // Port of erts/emulator/beam/utils.c:173-186 (`erts_heap_alloc`), OTP-29.1.1.
         // ERTS initializes only the requested term span; the spare fragment capacity is untouched.
-        let mut memory = AllocBlock::new(ErtsAlcType::HEAP_FRAG, block_words)
-            .expect("heap fragment allocation size is valid");
+        let mut memory = if self.alloc_ix == NO_ALLOC_IX {
+            AllocBlock::new(ErtsAlcType::HEAP_FRAG, block_words)
+        } else {
+            AllocBlock::new_at(
+                usize::from(self.alloc_ix),
+                ErtsAlcType::HEAP_FRAG,
+                block_words,
+            )
+        }
+        .expect("heap fragment allocation size is valid");
         let ptr = memory.as_mut_ptr();
         self.fragments.push(Fragment::Block {
             memory,
@@ -3354,6 +3455,9 @@ mod heap_block_tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(200_000);
             let mut heap = ProcessHeap::with_words(64);
+            if std::env::var_os("FRAG_TLS").is_none() {
+                heap.set_alloc_ix(Some(arinsal_alloc::thread_alloc_ix()));
+            }
             let mut best = f64::MAX;
             for _ in 0..5 {
                 let started = std::time::Instant::now();
@@ -3361,7 +3465,9 @@ mod heap_block_tests {
                     for _ in 0..26 {
                         std::hint::black_box(heap.heap_fragment(1 + (next() % 12) as usize));
                     }
-                    heap.fragments.clear();
+                    let mut fragments = std::mem::take(&mut heap.fragments);
+                    heap.release_fragments(&mut fragments);
+                    heap.fragments = fragments;
                     heap.fragment_words = 0;
                 }
                 best = best.min(started.elapsed().as_nanos() as f64 / (cycles as f64 * 26.0));

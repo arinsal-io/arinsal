@@ -1306,7 +1306,7 @@ impl ProcessHeap {
         if major && self.heap_grow && capacity == self.heap_size_words() {
             capacity = next_heap_size(capacity, 1, self.min_heap_size as usize)?;
         }
-        let mut next = ProcessHeap::with_words(capacity);
+        let mut next = ProcessHeap::with_words_at(capacity, self.alloc_ix);
         next.stop = capacity - stack;
         next.frame_pointer = self.frame_pointer;
         next.min_heap_size = self.min_heap_size;
@@ -1333,11 +1333,8 @@ impl ProcessHeap {
                 // Port of erl_gc.c:1471 (`erts_next_heap_size(size_before, 1)`):
                 // the first old heap is one step larger than the mature data.
                 let old_capacity = next_heap_size(source_words, 1, 0)?;
-                next.old_words = ProcessHeap::with_words_for_type(
-                    old_capacity,
-                    arinsal_alloc::typed::ErtsAlcType::OLD_HEAP,
-                )
-                .words;
+                next.old_words =
+                    next.new_block(old_capacity, arinsal_alloc::typed::ErtsAlcType::OLD_HEAP);
             }
             next.old_htop = self.old_htop;
             if copy_old_owner_state {
@@ -1456,11 +1453,11 @@ impl ProcessHeap {
         // ErlHeapFragment headers live inside the fragment block in erts; here the fragment
         // list is a Vec, so keep its buffer for the next cycle instead of a malloc/free per GC.
         let mut spare = std::mem::take(&mut from.fragments);
-        spare.clear();
+        from.release_fragments(&mut spare);
         if self.fragments.is_empty() {
             self.fragments = spare;
         }
-        drop(from);
+        from.release_all();
         self.frame_pointer = new_frame_pointer;
         if let Some(error) = error {
             return Err(error);

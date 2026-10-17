@@ -405,6 +405,17 @@ impl Drop for BinaryBlock {
 impl AllocBlock {
     /// Allocates `words` from the allocator assigned to `allocation_type`.
     pub fn new(allocation_type: ErtsAlcType, words: usize) -> Result<Self, AllocError> {
+        Self::new_at(crate::instances::thread_alloc_ix(), allocation_type, words)
+    }
+
+    /// [`AllocBlock::new`] for a scheduler that knows its allocator index
+    /// ([`crate::instances::thread_alloc_ix`]) and hands it down instead of reading it from
+    /// thread-local storage; `ix` must belong to the calling thread.
+    pub fn new_at(
+        ix: usize,
+        allocation_type: ErtsAlcType,
+        words: usize,
+    ) -> Result<Self, AllocError> {
         let allocators = allocator_for(allocation_type)?;
         let bytes = words
             .checked_mul(std::mem::size_of::<u64>())
@@ -412,7 +423,7 @@ impl AllocBlock {
         let (handle, ptr) = if words == 0 {
             (None, std::ptr::NonNull::<u64>::dangling().as_ptr())
         } else {
-            let (handle, ptr) = allocators.alloc_with_ptr(bytes)?;
+            let (handle, ptr) = allocators.alloc_with_ptr_at(ix, bytes)?;
             (Some(handle), ptr)
         };
         Ok(Self {
@@ -421,6 +432,21 @@ impl AllocBlock {
             handle,
             allocators,
         })
+    }
+
+    /// Frees the block through the allocator index `ix` of the calling thread, without reading it
+    /// from thread-local storage.
+    pub fn release_at(mut self, ix: usize) {
+        self.release_in_place_at(ix);
+    }
+
+    /// [`AllocBlock::release_at`] for a block that stays in its container: the payload is gone
+    /// afterwards and the later drop frees nothing.
+    #[inline]
+    pub fn release_in_place_at(&mut self, ix: usize) {
+        if let Some(handle) = self.handle.take() {
+            let _ = self.allocators.free_at(ix, handle);
+        }
     }
 
     /// Resizes the payload while preserving its prefix.
@@ -499,13 +525,26 @@ impl AllocBlock {
         allocation_type: ErtsAlcType,
         user_words: usize,
     ) -> Result<*mut u64, AllocError> {
+        Self::detach_heap_at(
+            crate::instances::thread_alloc_ix(),
+            allocation_type,
+            user_words,
+        )
+    }
+
+    /// [`AllocBlock::detach_heap`] on the allocator index `ix` of the calling thread.
+    pub fn detach_heap_at(
+        ix: usize,
+        allocation_type: ErtsAlcType,
+        user_words: usize,
+    ) -> Result<*mut u64, AllocError> {
         if user_words == 0 {
             return Ok(std::ptr::null_mut());
         }
         let total = user_words
             .checked_add(HEAP_PREFIX_WORDS)
             .ok_or(AllocError::OutOfBounds)?;
-        let mut block = Self::new(allocation_type, total)?;
+        let mut block = Self::new_at(ix, allocation_type, total)?;
         let handle = block
             .handle
             .expect("a non-empty heap block has an allocator handle");
@@ -525,6 +564,11 @@ impl AllocBlock {
 
     /// Frees a block produced by [`AllocBlock::detach_heap`].
     pub fn free_detached_heap(user: *mut u64) {
+        Self::free_detached_heap_at(crate::instances::thread_alloc_ix(), user);
+    }
+
+    /// [`AllocBlock::free_detached_heap`] on the allocator index `ix` of the calling thread.
+    pub fn free_detached_heap_at(ix: usize, user: *mut u64) {
         if user.is_null() {
             return;
         }
@@ -536,7 +580,7 @@ impl AllocBlock {
             return;
         };
         let handle = InstanceAllocation::from_parts(prefix.instance, prefix.id, prefix.bytes);
-        let _ = allocators.free(handle);
+        let _ = allocators.free_at(ix, handle);
     }
 
     /// `ERTS_HEAP_REALLOC`: resize, preserving the user prefix, and return the user pointer.

@@ -1149,6 +1149,9 @@ pub struct SchedulerData {
     executor: Option<Box<Executor>>,
     /// The record and code scopes of this scheduler's runtime are selected on its thread.
     scopes_selected: bool,
+    /// `esdp->no` as the allocator numbers it: the allocator index of this scheduler's thread,
+    /// read once on its first process turn and handed to the heap of each process it runs.
+    alloc_ix: Option<usize>,
 }
 
 struct Executor {
@@ -6969,7 +6972,15 @@ impl Task for Process {
             crate::fun_dispatch::set_thread_code_scope(scope);
             data.scopes_selected = scope != 0;
         }
+        // Port of erts/emulator/beam/erl_alloc.c (erts_alloc passes `esdp->no` to the
+        // thread-specific allocators), OTP-29.1.1: the process heap allocates on this scheduler's
+        // instance without looking the thread up, for the span of this run.
+        let alloc_ix = *data
+            .alloc_ix
+            .get_or_insert_with(arinsal_alloc::thread_alloc_ix);
+        self.heap.set_alloc_ix(Some(alloc_ix));
         let outcome = abort_on_worker_panic(|| self.run_task(ctx, data, budget));
+        self.heap.set_alloc_ix(None);
         if matches!(outcome, RunOutcome::Exit(_)) {
             self._persistent_terms
                 .store()
