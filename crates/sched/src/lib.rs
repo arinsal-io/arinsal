@@ -4164,6 +4164,13 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn has_pending_input(&self) -> bool {
         self.input.has_pending()
     }
+    /// Whether non-message signals wait in this process's shared input queue. A process
+    /// with only messages queued handles them in its receive, not at schedule-in.
+    // Port of erts/emulator/beam/erl_process.c (schedule: signals are handled before Erlang
+    // code only for ERTS_PSFLG_RUNNING_SYS, which a message does not set), OTP-29.1.1.
+    pub fn has_pending_nmsg(&self) -> bool {
+        self.input.has_pending_nmsg()
+    }
     /// A handle that tells, without this context, whether signals wait in this process's
     /// shared input queue.
     pub fn signal_probe(&mut self) -> Option<SignalProbe<M>> {
