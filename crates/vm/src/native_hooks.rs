@@ -9,8 +9,6 @@ use arinsal_term::{Term, TermBuilder, TermKind, cmp, cmp_exact, exact_eq, loose_
 use num_traits::ToPrimitive;
 use std::cmp::Ordering;
 
-const NATIVE_X: usize = 6;
-
 /// Runtime lookup for native map element instructions.
 ///
 /// # Safety
@@ -23,7 +21,7 @@ pub extern "C" fn arinsal_beamasm_map_lookup(
     _hash: u64,
     _hashed: u64,
 ) -> u64 {
-    let Some((process, registers)) = process_and_registers(header) else {
+    let Some((process, _registers)) = enter_runtime(header) else {
         return 0;
     };
     match arinsal_maps::get(from_raw(map), from_raw(key)) {
@@ -31,13 +29,11 @@ pub extern "C" fn arinsal_beamasm_map_lookup(
         Ok(None) => 0,
         Err(MapError::Badmap(_)) => {
             set_error(process, "badmap");
-            publish_x(process, registers);
             process.sync_native_header();
             0
         }
         Err(_) => {
             set_error(process, "badarg");
-            publish_x(process, registers);
             process.sync_native_header();
             0
         }
@@ -70,55 +66,12 @@ pub extern "C" fn arinsal_beamasm_bif_mfa(
     _function: u64,
     _arity: u64,
 ) -> u64 {
-    let Some((process, registers)) = process_and_registers(header) else {
+    let Some((process, _registers)) = enter_runtime(header) else {
         return 0;
     };
     set_error(process, "undef");
-    publish_x(process, registers);
     process.sync_native_header();
     0
-}
-
-pub(crate) fn process_and_registers<'a>(
-    header: *mut ProcessHeader,
-) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
-    let (process, registers) = enter_runtime(header)?;
-    load_x(process, registers, NATIVE_X);
-    Some((process, registers))
-}
-
-/// `reg[0..n)` into `process.x`, for a process whose X file is its own saved storage (a
-/// helper driven outside a scheduler slice). While the scheduler array is attached it already
-/// is `process.x`, so nothing is copied.
-#[inline]
-pub(crate) fn load_x(process: &mut Process, registers: &SchedulerRegisters, n: usize) {
-    if process.x.is_attached() {
-        return;
-    }
-    for (destination, raw) in process
-        .x
-        .iter_mut()
-        .take(n)
-        .zip(registers.x_reg_array.iter())
-    {
-        *destination = *raw;
-    }
-}
-
-/// `process.x[0..n)` into `reg`, the counterpart of [`load_x`].
-#[inline]
-pub(crate) fn store_x(process: &Process, registers: &mut SchedulerRegisters, n: usize) {
-    if process.x.is_attached() {
-        return;
-    }
-    for (destination, term) in registers
-        .x_reg_array
-        .iter_mut()
-        .zip(process.x.iter())
-        .take(n)
-    {
-        *destination = *term;
-    }
 }
 
 /// The process and scheduler registers of a helper called from native code, with the heap
@@ -194,19 +147,6 @@ pub(crate) fn process_from_header<'a>(header: *mut ProcessHeader) -> Option<&'a 
     // SAFETY: ProcessHeader is the first repr(C) field of Process; native entry
     // passes the active process header for the duration of the helper call.
     Some(unsafe { &mut *header.cast::<Process>() })
-}
-
-/// `reg[index]`, the X register the light-BIF fragment passes as `x1`.
-///
-/// `c_p->ftrace` is the scheduler register file for the duration of native code.
-/// The word is copied out, so the caller does not borrow the register array.
-pub(crate) fn x_reg(process: &mut Process, index: usize) -> Option<Term> {
-    let (_, registers) = scheduler_registers(process)?;
-    registers.x_reg_array.get(index).copied()
-}
-
-fn publish_x(process: &Process, registers: &mut SchedulerRegisters) {
-    store_x(process, registers, NATIVE_X);
 }
 
 pub(crate) fn set_error(process: &mut Process, name: &str) {
@@ -306,7 +246,7 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     rhs: u64,
     extra: u64,
 ) -> u64 {
-    let Some((process, registers)) = process_and_registers(header) else {
+    let Some((process, registers)) = enter_runtime(header) else {
         return 0;
     };
     // An operation with a failure label branches there instead of raising (QUIET_GUARD).
@@ -314,7 +254,7 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     let op = op & !QUIET_GUARD;
     // The 128-bit product is a magnitude plus a sign, not two tagged terms.
     if op == 15 {
-        return int128_to_big(process, registers, lhs, rhs, extra);
+        return int128_to_big(process, lhs, rhs, extra);
     }
     let left = from_raw(lhs);
     let right = from_raw(rhs);
@@ -434,7 +374,6 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
             0
         }
     };
-    publish_x(process, registers);
     process.sync_native_header();
     answer
 }
@@ -463,13 +402,7 @@ fn arith_bif(op: u32) -> Option<(&'static str, usize)> {
 
 /// `beam_jit_int128_to_big`: a signed 128-bit magnitude becomes a small or a bignum.
 // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1025-1040, OTP-29.1.1.
-fn int128_to_big(
-    process: &mut Process,
-    registers: &mut SchedulerRegisters,
-    low: u64,
-    high: u64,
-    sign: u64,
-) -> u64 {
+fn int128_to_big(process: &mut Process, low: u64, high: u64, sign: u64) -> u64 {
     let mut magnitude = num_bigint::BigInt::from((u128::from(high) << 64) | u128::from(low));
     if sign != 0 {
         magnitude = -magnitude;
@@ -483,7 +416,6 @@ fn int128_to_big(
             0
         }
     };
-    publish_x(process, registers);
     process.sync_native_header();
     answer
 }
@@ -522,7 +454,7 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
     first: u64,
     second: u64,
 ) -> u64 {
-    let Some((process, registers)) = process_and_registers(header) else {
+    let Some((process, _registers)) = enter_runtime(header) else {
         return 0;
     };
     // A guard with a failure label passes QUIET_GUARD: the failure branches there instead of
@@ -652,7 +584,6 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
         }
         _ => 0,
     };
-    publish_x(process, registers);
     process.sync_native_header();
     answer
 }
