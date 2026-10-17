@@ -1377,11 +1377,7 @@ impl Executor {
                 .max(8)
                 .max(usize::from(process.header.arity).saturating_add(1));
         }
-        if self.x.len() < need_x {
-            let mut registers = self.x.to_vec();
-            registers.resize(need_x, Term::NIL);
-            self.x = registers.into();
-        }
+        self.x.ensure_x(need_x);
         if self.fr.len() < need_fr {
             let mut registers = self.fr.to_vec();
             registers.resize(need_fr, 0.0);
@@ -1391,12 +1387,9 @@ impl Executor {
         // process retains only the values needed to resume.
         std::mem::swap(&mut process.x, &mut self.x);
         std::mem::swap(&mut process.fr, &mut self.fr);
-        if process.x.len() < self.x.len() {
-            let mut registers = process.x.to_vec();
-            registers.resize(self.x.len(), Term::NIL);
-            process.x = registers.into();
-        }
-        process.x[..self.x.len()].copy_from_slice(&self.x);
+        let saved_len = self.x.len();
+        process.x.ensure_x(saved_len);
+        process.x[..saved_len].copy_from_slice(&self.x);
         // The tail still holds the previous run's registers on this executor; those are
         // pointers into another process's heap and must not reach this process's GC roots.
         let dead_fill = if crate::xreg_poison_enabled() {
@@ -1404,7 +1397,7 @@ impl Executor {
         } else {
             Term::NIL
         };
-        process.x[self.x.len()..].fill(dead_fill);
+        process.x[saved_len..].fill(dead_fill);
         if process.fr.len() < self.fr.len() {
             let mut registers = process.fr.to_vec();
             registers.resize(self.fr.len(), 0.0);
@@ -1956,11 +1949,7 @@ impl Executor {
                                     let live = usize::from(live);
                                     let width =
                                         live.max(6).min(self.native_registers.x_reg_array.len());
-                                    if process.x.len() < width {
-                                        let mut x = process.x.to_vec();
-                                        x.resize(width, Term::NIL);
-                                        process.x = x.into();
-                                    }
+                                    process.x.ensure_x(width);
                                     for (destination, raw) in process
                                         .x
                                         .iter_mut()
@@ -2097,11 +2086,7 @@ impl Executor {
                                     // above the X registers synced on exit.
                                     let arity = usize::from(function.arity)
                                         .min(self.native_registers.x_reg_array.len());
-                                    if process.x.len() < arity {
-                                        let mut x = process.x.to_vec();
-                                        x.resize(arity, Term::NIL);
-                                        process.x = x.into();
-                                    }
+                                    process.x.ensure_x(arity);
                                     for (destination, raw) in process
                                         .x
                                         .iter_mut()
@@ -2179,7 +2164,13 @@ impl Executor {
                                 ) {
                                     // The fragment pushed the native continuation as a CP, so the
                                     // interpreter performs these as tail calls.
-                                    let saved_x = process.x.to_vec();
+                                    // The retry redoes the apply from its operands: the
+                                    // arguments, the fun or module and function, and apply/3's
+                                    // three. Registers above them are dead.
+                                    let saved_live = (usize::from(process.header.arity) + 2)
+                                        .max(3)
+                                        .min(process.x.len());
+                                    let saved_x = process.x[..saved_live].to_vec();
                                     let collections_before = process.stats.gc.collections;
                                     let result = match target_pc {
                                         arinsal_beamasm::dispatch::CALL_FUN_UNPORTED => {

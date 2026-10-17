@@ -42,6 +42,10 @@ impl ProcessStats {
     }
 }
 
+/// Registers a scan wider than the live count can reach: `run_native` copies at least this
+/// many, and `live.max(6)` root walks stay below it.
+const DEAD_X_FLOOR: usize = 8;
+
 /// Number of X registers a scheduler array holds (`ERTS_X_REGS_ALLOCATED`, erl_vm.h).
 pub const ATTACHED_X_REGS: usize = 1024;
 
@@ -1245,11 +1249,7 @@ impl Process {
             .and_then(|cold| cold.entry_args_after_on_load.as_ref())
             .map(|saved| saved.args.clone())
             .unwrap_or_default();
-        if self.x.len() < args.len() {
-            let mut registers = self.x.to_vec();
-            registers.resize(args.len(), Term::NIL);
-            self.x = registers.into();
-        }
+        self.x.ensure_x(args.len());
         for (index, arg) in args.iter().enumerate() {
             self.x[index] = *arg;
         }
@@ -1633,11 +1633,7 @@ impl Process {
         {
             return Ok(false);
         }
-        if self.x.len() < live {
-            let mut roots = self.x.to_vec();
-            roots.resize(live, Term::NIL);
-            self.x = roots.into();
-        }
+        self.x.ensure_x(live);
         self.x[..live].copy_from_slice(&registers[..live]);
         let result = self.ensure(words, live);
         registers[..live].copy_from_slice(&self.x[..live]);
@@ -1706,7 +1702,15 @@ impl Process {
         // The collector rewrites only the live prefix. Nilling the rest is an
         // extra guard for a later scan that roots a wider prefix than this one.
         if clear_dead {
-            self.x[live..].fill(Term::NIL);
+            // A detached file is as long as its saved registers. An attached one is the whole
+            // scheduler array: the registers a wider scan can still reach end at the floor,
+            // so the 8 KB tail is not rewritten on every collection.
+            let dead_end = if self.x.is_attached() {
+                live.max(DEAD_X_FLOOR).min(self.x.len())
+            } else {
+                self.x.len()
+            };
+            self.x[live..dead_end].fill(Term::NIL);
         }
         natives::sys::after_collection(self, live, gc.collections, gc.words_reclaimed);
         if self.heap.free_words() < allocation_words {
