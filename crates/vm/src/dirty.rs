@@ -216,12 +216,16 @@ impl Process {
         None
     }
 
-    /// Take back a finished dirty job: its shadow heap becomes part of the process heap.
+    /// Take back a finished dirty job: what its shadow heap holds moves onto the process heap
+    /// when it fits, and stays in heap fragments otherwise.
+    ///
+    /// Port of erts/emulator/beam/erl_nif.c:551 (full_flush_env) and
+    /// erl_nfunc_sched.h (erts_flush_dirty_shadow_proc), OTP-29.1.1.
     pub(crate) fn finish_dirty_job(&mut self, result: Box<dyn Any>) {
         let Ok(done) = result.downcast::<DirtyDone>() else {
             return;
         };
-        let (heap, slot) = match *done {
+        let (heap, mut slot) = match *done {
             DirtyDone::Nif(pending, heap) => {
                 self.cold_mut().nif_pending = Some(pending);
                 (heap, None)
@@ -232,7 +236,20 @@ impl Process {
             }
             DirtyDone::Bif(result, heap) => (heap, Some(result)),
         };
-        if self.heap.adopt_message_fragment(heap).is_err() {
+        let flushed = {
+            let mut roots: Vec<&mut Term> = Vec::new();
+            if let Some(Ok(value)) = slot.as_mut() {
+                roots.push(value);
+            }
+            if let Some(cold) = self.cold.as_mut() {
+                if let Some(pending) = cold.nif_pending.as_mut() {
+                    roots.extend(pending.done_slots());
+                }
+                roots.extend(dirty_result_slots(None, cold.static_nif_done.as_mut()));
+            }
+            self.heap.flush_dirty_shadow(heap, &mut roots)
+        };
+        if flushed.is_err() {
             // A shadow heap never has a stack or an old generation.
             unreachable!("dirty job shadow heap is standalone");
         }
