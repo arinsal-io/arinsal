@@ -1195,14 +1195,13 @@ fn flatmap_next_words<H: HeapAlloc + ?Sized>(
         let need_words = 5 * n;
         let (output, start) =
             merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
-        let mut remaining = n;
         let mut at = start;
         let mut res = acc;
-        for words in output.as_chunks_mut::<5>().0 {
-            remaining -= 1;
+        let pairs = ks.iter().rev().zip(vs.iter().rev());
+        for (words, (key, value)) in output.as_chunks_mut::<5>().0.iter_mut().zip(pairs) {
             words[0].write(2 << 6);
-            words[1].write(ks[remaining]);
-            words[2].write(vs[remaining]);
+            words[1].write(*key);
+            words[2].write(*value);
             words[3].write(bits(boxed(at)));
             words[4].write(bits(res));
             res = cons(at.wrapping_add(3));
@@ -1213,14 +1212,13 @@ fn flatmap_next_words<H: HeapAlloc + ?Sized>(
         let need_words = 4 * n;
         let (output, start) =
             merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
-        let mut remaining = n;
         let mut at = start;
         let mut res = NONE;
-        for words in output.as_chunks_mut::<4>().0 {
-            remaining -= 1;
+        let pairs = ks.iter().rev().zip(vs.iter().rev());
+        for (words, (key, value)) in output.as_chunks_mut::<4>().0.iter_mut().zip(pairs) {
             words[0].write(3 << 6);
-            words[1].write(ks[remaining]);
-            words[2].write(vs[remaining]);
+            words[1].write(*key);
+            words[2].write(*value);
             words[3].write(bits(res));
             res = boxed(at);
             at = at.wrapping_add(4);

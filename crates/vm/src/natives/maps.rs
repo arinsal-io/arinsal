@@ -541,22 +541,27 @@ fn ordered_next(
 /// `erts_internal:map_next/3`.
 /// Port of erts/emulator/beam/erl_map.c:3636 (erts_internal_map_next_3), OTP-29.1.1.
 fn map_next(process: &mut Process, args: &[Term]) -> Result<Term, Trap> {
-    if let Some((path, flat, mode)) = iterator_flatmap(args) {
-        return flat_next(process, path, flat, false, mode);
+    if let Some((path, flat, list_mode, mode)) = flatmap_step(args) {
+        return flat_next(process, path, flat, list_mode, mode);
     }
     map_next_general(process, args)
 }
 
-/// The `maps:iterator/1` hot case: a small path over a flatmap in iterator mode.
+/// The hot case: a small path over a flatmap, in iterator mode or in list mode (`mode` is
+/// the accumulator list). The flag tells which.
 #[inline(always)]
-fn iterator_flatmap(args: &[Term]) -> Option<(Term, arinsal_maps::CheckedFlatMap, Term)> {
+fn flatmap_step(args: &[Term]) -> Option<(Term, arinsal_maps::CheckedFlatMap, bool, Term)> {
     if let &[path, map, mode] = args
-        && mode == ITERATOR
         && path.as_small().is_some()
         && let Ok(checked) = arinsal_maps::checked_map(map)
         && let arinsal_maps::CheckedMapKind::Flatmap(flat) = checked.kind()
     {
-        return Some((path, flat, mode));
+        if mode == ITERATOR {
+            return Some((path, flat, false, mode));
+        }
+        if mode == Term::NIL || mode.classify() == TermKind::List {
+            return Some((path, flat, true, mode));
+        }
     }
     None
 }
@@ -617,11 +622,47 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<sup
 /// The light-BIF call site entry for `erts_internal:map_next/3`.
 pub(crate) fn thin_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     match (module, function, arity) {
-        ("erts_internal", "map_next", 3) => {
-            Some(crate::native_helpers::thin_bif_light::<MapNext> as *const () as usize)
-        }
+        ("erts_internal", "map_next", 3) => Some(map_next_light as *const () as usize),
         _ => None,
     }
+}
+
+/// The light-BIF entry of `erts_internal:map_next/3`.
+///
+/// The flatmap step allocates its result on `c_p->htop` and returns it, as
+/// erts does: it reads no reduction counter and converts no heap cursor. Every other call
+/// takes the generic light-BIF path.
+// Port of erts/emulator/beam/erl_map.c (erts_internal_map_next_3, flatmap branch: HAlloc on
+// c_p->htop), OTP-29.1.1.
+extern "C" fn map_next_light(
+    header: *mut arinsal_beamasm::ProcessHeader,
+    regs: *mut u64,
+    i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    if let Some(raw) = map_next_native(header) {
+        return raw;
+    }
+    crate::native_helpers::thin_bif_light::<MapNext>(header, regs, i, descriptor, identity)
+}
+
+#[inline(always)]
+fn map_next_native(header: *mut arinsal_beamasm::ProcessHeader) -> Option<u64> {
+    let (process, registers) = crate::native_hooks::enter_runtime_no_cursors(header)?;
+    let (path, flat, list_mode, mode) = flatmap_step(&registers.x_reg_array[..3])?;
+    let n = flat.size();
+    if path.as_small().filter(|index| *index >= 0)? > n as i64 {
+        return None;
+    }
+    let mut top = crate::native_top_heap::NativeTopHeap::new(process)?;
+    let words = if list_mode { 5 * n } else { 4 * n };
+    if arinsal_term::HeapAlloc::words_left(&top)? < words {
+        return None;
+    }
+    let term = arinsal_maps::flatmap_next_checked(flat, n, list_mode, mode, &mut top).ok()?;
+    registers.x_reg_array[0] = term;
+    Some(crate::native_hooks::raw(term))
 }
 
 /// `erts_internal:map_next/3` for the light-BIF call site.
@@ -633,8 +674,8 @@ impl super::ThinProcessBif for MapNext {
 
     #[inline(always)]
     fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<Trap>> {
-        if let Some((path, flat, mode)) = iterator_flatmap(args) {
-            return flat_next(process, path, flat, false, mode).map_err(Box::new);
+        if let Some((path, flat, list_mode, mode)) = flatmap_step(args) {
+            return flat_next(process, path, flat, list_mode, mode).map_err(Box::new);
         }
         map_next_general(process, args).map_err(Box::new)
     }
