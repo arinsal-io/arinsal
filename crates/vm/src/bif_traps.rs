@@ -3209,10 +3209,17 @@ fn term_encode(
     restore_gc: bool,
     iovec: bool,
 ) -> Result<HandlerResult, BifError> {
-    // Port of erts/emulator/beam/external.c:2449-2590, OTP-29.1.1.
+    // Port of erts/emulator/beam/external.c (erts_term_to_binary_int), OTP-29.1.1.
     const TERM_TO_BINARY_LOOP_FACTOR: usize = 32;
     let chunk_work =
         (process.reductions.max(0) as usize).saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
+    let charge = |encoder: &arinsal_bifs::EncodeWalk, work: usize| {
+        if encoder.finishes_simple() {
+            1
+        } else {
+            (work / TERM_TO_BINARY_LOOP_FACTOR) as u32
+        }
+    };
     if let Some(state) = state {
         let state = Arc::clone(state);
         let encoder = state
@@ -3220,31 +3227,32 @@ fn term_encode(
             .ok_or(BifError::BADARG)?;
         let mut encoder_guard = encoder.lock().map_err(|_| BifError::SystemLimit)?;
         let (done, work) = encoder_guard.step(chunk_work)?;
-        let reductions = work.div_ceil(TERM_TO_BINARY_LOOP_FACTOR) as u32;
         if !done {
             drop(encoder_guard);
             return Ok(HandlerResult::Yield {
                 continuation: TERM_TO_BINARY_CONTINUATION,
                 state,
-                reductions,
+                reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
             });
         }
         process.set_gc_enabled(restore_gc);
+        let reductions = charge(&encoder_guard, work);
         let encoder = std::mem::replace(&mut *encoder_guard, arinsal_bifs::EncodeWalk::completed());
         drop(encoder_guard);
         return finish_term_encode(process, encoder, reductions, iovec);
     }
 
     let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
+    encoder.set_iovec(iovec);
     let (done, work) = encoder.step(chunk_work)?;
-    let reductions = work.div_ceil(TERM_TO_BINARY_LOOP_FACTOR) as u32;
     if !done {
         return Ok(HandlerResult::Yield {
             continuation: TERM_TO_BINARY_CONTINUATION,
             state: MagicRef::new(Mutex::new(encoder)),
-            reductions,
+            reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
         });
     }
+    let reductions = charge(&encoder, work);
     finish_term_encode(process, encoder, reductions, iovec)
 }
 
