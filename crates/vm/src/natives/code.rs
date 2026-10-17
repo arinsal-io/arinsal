@@ -344,6 +344,11 @@ fn resume_pending_lambda_callers(
     }
 }
 
+/// `mb->orig_size` of the magic binary `erts_alloc_loader_state` creates:
+/// `ERTS_MAGIC_BIN_ORIG_SIZE(sizeof(LoaderState))` for the 64-bit JIT loader, that is the
+/// 24-byte magic data offset plus the 568-byte `LoaderState` of beam/jit/load.h.
+const LOADER_STATE_MAGIC_ORIG_SIZE: usize = 24 + 568;
+
 struct Prepared {
     /// Parsed file, cleared once `finish_loading` has copied it. The magic ref stays
     /// reachable until the caller's next fullsweep; keeping every boot module's parse
@@ -655,12 +660,15 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         bytes: Mutex::new(bytes),
         module: Mutex::new(Some(module)),
     };
-    // The code server heap is often full when Mix loads the next test beam.
-    // `magic_ref` does not grow by itself; a 3-word miss became `system_limit`
-    // and the test module never finished loading.
-    process.ensure(16, 2)?;
-    TermBuilder::new(&mut process.heap)
-        .magic_ref(MagicRef::new(prepared))
+    // Port of erts/emulator/beam/beam_bif_load.c (erts_internal_prepare_loading_2),
+    // OTP-29.1.1: `HAlloc(BIF_P, ERTS_MAGIC_REF_THING_SIZE)` takes a heap fragment when the
+    // young heap is full, so no collection happens here. The magic binary charges
+    // `orig_size` of `erts_alloc_loader_state` (beam_load.c) to the virtual binary heap.
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
+        .magic_ref(MagicRef::with_orig_size(
+            prepared,
+            LOADER_STATE_MAGIC_ORIG_SIZE,
+        ))
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
 
