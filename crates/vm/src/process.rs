@@ -6259,7 +6259,7 @@ impl Process {
                     && cold.nif_pending.is_none()
                     && cold.call_memory.is_empty()
             })
-            && self.dirty_result_roots().is_empty()
+            && !self.has_dirty_result_roots()
             && self.max_heap_peak == 0
             && !self.max_heap_limited()
             && self
@@ -6467,13 +6467,18 @@ impl Process {
         }
         // erl_gc.h:26 (ERTS_POTENTIALLY_LONG_GC_HSIZE).
         const POTENTIALLY_LONG_GC_HSIZE: usize = 128 * 1024;
-        // A minor collection that cannot tenure continues as a major one
-        // (erl_gc.c:840-848), so the size check uses the collection that will run.
-        let major = self.heap.collection_is_major() || self.heap.minor_falls_back_to_major();
         let mut size = self
             .heap
             .young_gen_usage()
             .saturating_add(self.heap.stack_words());
+        // The old generation only counts for a major collection, so a young generation
+        // plus old heap below the limit is below it whichever collection runs.
+        if size.saturating_add(self.heap.old_used_words()) < POTENTIALLY_LONG_GC_HSIZE {
+            return false;
+        }
+        // A minor collection that cannot tenure continues as a major one
+        // (erl_gc.c:840-848), so the size check uses the collection that will run.
+        let major = self.heap.collection_is_major() || self.heap.minor_falls_back_to_major();
         if major {
             size = size.saturating_add(self.heap.old_used_words());
         }
