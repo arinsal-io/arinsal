@@ -1283,11 +1283,12 @@ impl ProcessHeap {
         {
             return Err(AdoptError::NotStandalone);
         }
-        // The block moves with its terms; no word is copied.
-        let adopted_words = source
-            .words
-            .len()
-            .saturating_add(source.fragment_words as usize);
+        // The block moves with its terms; no word is copied. Only the used words count towards
+        // the garbage collection test, not the block capacity.
+        // Port of erts/emulator/beam/erl_nfunc_sched.h (erts_flush_dirty_shadow_proc) and
+        // erts/emulator/beam/utils.c (erts_heap_alloc, MBUF_SIZE adds the requested words only),
+        // OTP-29.1.1.
+        let adopted_words = source.htop.saturating_add(source.fragment_words as usize);
         self.fragment_words = self
             .fragment_words
             .saturating_add(u32::try_from(adopted_words).unwrap_or(u32::MAX));
