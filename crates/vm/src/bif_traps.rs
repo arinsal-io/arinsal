@@ -529,6 +529,43 @@ fn erlang_phash2_trap_1(
     phash2_trap(process, args, state)
 }
 
+fn erlang_length_trap(
+    process: &mut Process,
+    _args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<HandlerResult, BifError> {
+    let state = state.ok_or(BifError::BADARG)?;
+    let (list, acc) = {
+        let saved = state
+            .downcast_ref::<Mutex<arinsal_bifs::LengthCont>>()
+            .ok_or(BifError::BADARG)?
+            .lock()
+            .map_err(|_| BifError::SystemLimit)?;
+        (saved.list(), saved.acc())
+    };
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
+    let step = arinsal_bifs::length_slice(&mut ctx, list, acc);
+    drop(ctx);
+    Ok(match step {
+        Ok(arinsal_bifs::LengthStep::Done(value)) => HandlerResult::Done {
+            value,
+            reductions: 0,
+        },
+        Ok(arinsal_bifs::LengthStep::More(cont)) => HandlerResult::Yield {
+            continuation: "erlang:length/3",
+            state: MagicRef::new(Mutex::new(cont)),
+            reductions: 0,
+        },
+        Err(error) => HandlerResult::Failed {
+            error,
+            reductions: 0,
+        },
+    })
+}
+
 fn bool_atom(value: bool) -> Term {
     Term::atom(
         global_atoms()
@@ -538,6 +575,13 @@ fn bool_atom(value: bool) -> Term {
 }
 
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "erlang",
+        function: "length",
+        arity: 3,
+        continuation: "erlang:length/3",
+        handler: erlang_length_trap,
+    },
     Entry {
         module: "erlang",
         function: "phash2_trap",
@@ -2119,6 +2163,9 @@ pub(crate) fn install_deferred_trap(
             },
             MagicRef::new(Mutex::new(cont)),
         ),
+        arinsal_bifs::DeferredTrap::Length(cont) => {
+            ("erlang:length/3", MagicRef::new(Mutex::new(cont)))
+        }
         arinsal_bifs::DeferredTrap::Phash2(cont) => {
             (cont.continuation(), MagicRef::new(Mutex::new(*cont)))
         }

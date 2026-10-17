@@ -39,9 +39,10 @@ pub use checksum::{ChksumCont, ChksumKind, ChksumStep, chksum_resume, chksum_sta
 pub use etf::{DecodeWalk, EncodeWalk, encode_term_to_binary};
 pub use lists::{
     APPEND_ALLOC_PER_RED, APPEND_EMPTY_PER_RED, APPEND_ONHEAP_PER_RED, AppendCont, AppendStep,
-    DeferredTrap, KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, MEMBER_PER_RED, MemberCont,
-    MemberStep, REVERSE_CELLS_PER_RED, REVERSE_ONHEAP_CELLS_PER_RED, ReverseCont, ReverseStep,
-    SubtractWalk, lists_append, lists_key, lists_member, lists_member_bif, lists_reverse,
+    DeferredTrap, KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, LENGTH_PER_RED, LengthCont,
+    LengthStep, MEMBER_PER_RED, MemberCont, MemberStep, REVERSE_CELLS_PER_RED,
+    REVERSE_ONHEAP_CELLS_PER_RED, ReverseCont, ReverseStep, SubtractWalk, length_slice,
+    lists_append, lists_key, lists_member, lists_member_bif, lists_reverse,
 };
 pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk, ProjectionStart};
 pub use maps_bifs::{maps_merge_start, maps_merge_start_on_process_heap};

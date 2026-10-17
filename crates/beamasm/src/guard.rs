@@ -2601,29 +2601,80 @@ impl BeamModuleAssembler {
         )
     }
 
-    /// Emits `length/1` through the runtime hook.
-    ///
-    /// The `i_length` entry calls `erts_trapping_length_1`. This inlines that
-    /// walk for lists that stay under the reduction budget (the trap itself is
-    /// a later task): one `is_list` test, then `CDR` at tagged+7.
-    // Port of erts/emulator/beam/erl_bif_guard.c:293-296 (erts_trapping_length_1), OTP-29.1.1.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:320-335 (emit_i_length), OTP-29.1.1.
-    pub fn emit_bif_length(
+    /// Emits `length/1` through the runtime hook, for a `bif_length` that has no `i_length` state.
+    pub fn emit_bif_length_helper(
         &mut self,
         fail: u32,
         list: ArgVal,
         destination: ArgVal,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
+        self.emit_guard_value_helper_fail(
+            fail,
+            false,
+            35,
+            list,
+            ArgVal::Immediate(0),
+            destination,
+            helper,
+        )
+    }
+
+    /// Emits the trap state `i_length` walks: the list, the length so far and, outside
+    /// guards, the original argument for an error.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:198-228 (emit_i_length_setup), OTP-29.1.1.
+    pub fn emit_i_length_setup(
+        &mut self,
+        fail: u32,
+        live: u32,
+        source: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let reg = self.source_reg(source)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(10), reg)?;
+            e.mov_const(Gpr::x(8), 15)
+        })?;
+        if fail == 0 {
+            self.store_operand(x_slot(live + 2)?, Gpr::x(10))?;
+        }
+        self.store_operand(x_slot(live + 1)?, Gpr::x(8))?;
+        self.store_operand(x_slot(live)?, Gpr::x(10))
+    }
+
+    /// Emits `length/1`: `erts_trapping_length_1` walks at most 16 elements per reduction
+    /// left, then charges the elements it walked or, past that, takes the rest of the
+    /// reductions and yields, to resume at this instruction with the state in the registers
+    /// above the live ones.
+    // Port of erts/emulator/beam/erl_bif_guard.c:270-320 (erts_trapping_length_1), OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:230-335 (emit_i_length_common,
+    // emit_i_length), OTP-29.1.1.
+    pub fn emit_bif_length(
+        &mut self,
+        fail: u32,
+        live: u32,
+        destination: ArgVal,
+        helper: GuardHelper,
+    ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
-        let list_reg = self.source_reg(list)?;
+        let list_slot = x_slot(live)?;
+        let acc_slot = x_slot(live + 1)?;
+        let entry = self.code.new_label();
         let loop_label = self.code.new_label();
         let not_list = self.code.new_label();
         let slow = self.code.new_label();
-        let done = self.code.new_label();
+        let trap = self.code.new_label();
+        let finished = self.code.new_label();
+        self.code.bind(entry)?;
+        let list_reg = self.source_reg_into(list_slot, Gpr::x(11))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(11), list_reg))?;
+        let acc_reg = self.source_reg_into(acc_slot, Gpr::x(12))?;
         self.code.emit(|e| {
-            e.mov_reg(Gpr::x(11), list_reg)?;
-            e.mov_const(Gpr::x(12), 0)
+            e.asr_imm(Gpr::x(12), acc_reg, 4)?;
+            e.mov_const(Gpr::x(13), 0)?;
+            e.cmp_imm(Gpr::w(22), 0, false)?;
+            e.csel(Gpr::w(13), Gpr::w(22), Gpr::w(13), Cond::Gt)?;
+            e.lsl_imm(Gpr::x(13), Gpr::x(13), 4)?;
+            e.mov_reg(Gpr::x(14), Gpr::x(13))
         })?;
         self.code.bind(loop_label)?;
         self.code.emit(|e| {
@@ -2631,22 +2682,27 @@ impl BeamModuleAssembler {
             e.cmp_imm(Gpr::x(8), 1, false)
         })?;
         self.code.b_cond(Cond::Ne, not_list)?;
+        self.code.cbz(Gpr::x(13), trap)?;
         // CDR(list_val(list)): a list tag of 1 puts the tail word at tagged+7.
         self.code.emit(|e| {
             e.ldur(Gpr::x(11), Gpr::x(11), 7)?;
-            e.add_imm(Gpr::x(12), Gpr::x(12), 1, false)
+            e.add_imm(Gpr::x(12), Gpr::x(12), 1, false)?;
+            e.sub_imm(Gpr::x(13), Gpr::x(13), 1, false)
         })?;
         self.code.b(loop_label)?;
         self.code.bind(not_list)?;
         self.code.emit(|e| e.cmp_imm(Gpr::x(11), 0x3b, false))?;
         self.code.b_cond(Cond::Ne, slow)?;
-        self.code.bind(done)?;
-        // Port of erts/emulator/beam/erl_bif_guard.c (erts_trapping_length_1): the walk charges
-        // one reduction per 16 elements, and BUMP_REDS clamps FCALLS at zero. The `i_length`
-        // fragment enters the runtime with `Update::eReductions`, so FCALLS carries the charge
-        // back to the caller.
+        // BUMP_REDS(p, (saved_max_iter - max_iter) / 16); BUMP_REDS clamps FCALLS at zero.
         self.code.emit(|e| {
-            e.lsr_imm(Gpr::x(9), Gpr::x(12), 4)?;
+            e.sub_reg(
+                Gpr::x(9),
+                Gpr::x(14),
+                Gpr::x(13),
+                arinsal_a64::enc::Shift::Lsl,
+                0,
+            )?;
+            e.lsr_imm(Gpr::x(9), Gpr::x(9), 4)?;
             e.sub_reg(
                 Gpr::w(22),
                 Gpr::w(22),
@@ -2660,18 +2716,37 @@ impl BeamModuleAssembler {
             e.orr_imm(output, output, 15)
         })?;
         self.store_guard_result(destination, output)?;
-        let finished = self.code.new_label();
         self.code.b(finished)?;
         self.code.bind(slow)?;
+        let original = if fail == 0 {
+            x_slot(live + 2)?
+        } else {
+            list_slot
+        };
         self.emit_guard_value_helper_fail(
             fail,
             false,
             35,
-            list,
+            original,
             ArgVal::Immediate(0),
             destination,
             helper,
         )?;
+        self.code.b(finished)?;
+        // The allotted iterations are used up: save the walk, take the rest of the
+        // reductions (BUMP_ALL_REDS) and yield. The instruction runs again on resume.
+        self.code.bind(trap)?;
+        self.code.emit(|e| {
+            e.lsl_imm(Gpr::x(9), Gpr::x(12), 4)?;
+            e.orr_imm(Gpr::x(9), Gpr::x(9), 15)
+        })?;
+        self.store_operand(list_slot, Gpr::x(11))?;
+        self.store_operand(acc_slot, Gpr::x(9))?;
+        self.code.emit(|e| e.mov_const(Gpr::x(22), 0))?;
+        self.code.adr(Gpr::x(8), entry)?;
+        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
+        self.emit_yield_live((live + if fail == 0 { 3 } else { 2 }) as u8)?;
+        self.code.b(self.yield_label)?;
         self.code.bind(finished)?;
         Ok(())
     }
@@ -2786,5 +2861,16 @@ fn small_comparison_immediate(lhs: ArgVal, rhs: ArgVal) -> Option<(ArgVal, u64, 
             Some((rhs, word, true))
         }
         _ => None,
+    }
+}
+
+/// The X register `index`: cached below 6, else in the register array.
+fn x_slot(index: u32) -> Result<ArgVal, ModuleError> {
+    match index {
+        0..6 => Ok(ArgVal::X(index as u8)),
+        6..1024 => Ok(ArgVal::XMemory(index)),
+        _ => Err(ModuleError::InvalidOperand(
+            "X register index exceeds scheduler register array",
+        )),
     }
 }
