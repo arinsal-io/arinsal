@@ -34,6 +34,9 @@ pub struct CompareShared {
     pub ne_exact: usize,
     /// `arith_compare_shared`: terms in x0/x1, the relation in the flags.
     pub arith: usize,
+    /// `bif_element_guard_shared`: position in x0, tuple in x1, the element or `THE_NON_VALUE`
+    /// in x0.
+    pub element_guard: usize,
     /// C `eq(Eterm, Eterm) -> int` (erts `eq`, utils.c:1125). Non-zero means equal; the general
     /// path of `=:=` / `=/=` calls it directly, so it must be set before emitting those ops.
     pub eq: usize,
@@ -858,7 +861,7 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    fn guard_destination(&mut self, destination: ArgVal) -> Result<Gpr, ModuleError> {
+    pub(super) fn guard_destination(&mut self, destination: ArgVal) -> Result<Gpr, ModuleError> {
         match destination {
             ArgVal::X(index) if index < 6 => Ok([
                 Gpr::x(25),
@@ -875,7 +878,11 @@ impl BeamModuleAssembler {
         }
     }
 
-    fn store_guard_result(&mut self, destination: ArgVal, result: Gpr) -> Result<(), ModuleError> {
+    pub(super) fn store_guard_result(
+        &mut self,
+        destination: ArgVal,
+        result: Gpr,
+    ) -> Result<(), ModuleError> {
         match destination {
             ArgVal::X(index) if index < 6 => {
                 let target = self.guard_destination(destination)?;
@@ -1671,46 +1678,61 @@ impl BeamModuleAssembler {
     }
 
     /// Emits a loose equality guard.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2055-2079, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_eq), OTP-29.1.1. Without the
+    // process-wide `arith_compare_shared` fragment (assemblers without a VM) the comparison
+    // goes through `helper`.
     pub fn emit_is_eq(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: impl Into<TypedArg>,
+        rhs: impl Into<TypedArg>,
         fail: u32,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let left = self.source_reg(lhs)?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
+        let (lhs, rhs) = (lhs.into(), rhs.into());
+        if self.has_arith_compare_shared() {
+            return self.emit_is_eq_shared(lhs, rhs, fail);
+        }
+        let left = self.source_reg(lhs.val)?;
+        let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_comparison(21, true, lhs, rhs, fail, helper)
+        self.emit_comparison(21, true, lhs.val, rhs.val, fail, helper)
     }
 
     /// Emits a loose inequality guard.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2081-2177, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_ne), OTP-29.1.1.
     pub fn emit_is_ne(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: impl Into<TypedArg>,
+        rhs: impl Into<TypedArg>,
         fail: u32,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let left = self.source_reg(lhs)?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
+        let (lhs, rhs) = (lhs.into(), rhs.into());
+        if self.has_arith_compare_shared() {
+            return self.emit_is_ne_shared(lhs, rhs, fail);
+        }
+        let left = self.source_reg(lhs.val)?;
+        let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_comparison(22, false, lhs, rhs, fail, helper)
+        self.emit_comparison(22, false, lhs.val, rhs.val, fail, helper)
     }
 
     /// Emits a less-than guard.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2179-2291, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_lt), OTP-29.1.1.
     pub fn emit_is_lt(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: impl Into<TypedArg>,
+        rhs: impl Into<TypedArg>,
         fail: u32,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
+        let (lhs, rhs) = (lhs.into(), rhs.into());
+        if self.has_arith_compare_shared() {
+            return self.emit_is_lt_shared(lhs, rhs, fail);
+        }
+        let (lhs, rhs) = (lhs.val, rhs.val);
         if let Some((other, immediate, immediate_is_lhs)) = small_comparison_immediate(lhs, rhs) {
             return self.emit_small_immediate_comparison(
                 other,
@@ -1729,14 +1751,19 @@ impl BeamModuleAssembler {
     }
 
     /// Emits a greater-or-equal guard.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2293-2355, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_ge), OTP-29.1.1.
     pub fn emit_is_ge(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: impl Into<TypedArg>,
+        rhs: impl Into<TypedArg>,
         fail: u32,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
+        let (lhs, rhs) = (lhs.into(), rhs.into());
+        if self.has_arith_compare_shared() {
+            return self.emit_is_ge_shared(lhs, rhs, fail);
+        }
+        let (lhs, rhs) = (lhs.val, rhs.val);
         if let Some((other, immediate, immediate_is_lhs)) = small_comparison_immediate(lhs, rhs) {
             return self.emit_small_immediate_comparison(
                 other,
@@ -1752,6 +1779,40 @@ impl BeamModuleAssembler {
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.emit_small_compare(lhs, rhs, Cond::Ge, 24, fail, helper)
+    }
+
+    /// Emits `is_int_ge`: fails unless the source is an integer not below `min`.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_int_ge), OTP-29.1.1.
+    pub fn emit_is_int_ge(
+        &mut self,
+        src: TypedArg,
+        min: ArgVal,
+        fail: u32,
+        helper: GuardHelper,
+    ) -> Result<(), ModuleError> {
+        if self.has_arith_compare_shared() {
+            return self.emit_is_int_ge_shared(src, min, fail);
+        }
+        self.emit_is_integer(src, fail)?;
+        self.emit_is_ge(src, min, fail, helper)
+    }
+
+    /// Emits `is_int_in_range`: fails unless the source is a small integer in `min..=max`.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_int_in_range), OTP-29.1.1.
+    pub fn emit_is_int_in_range(
+        &mut self,
+        src: TypedArg,
+        min: ArgVal,
+        max: ArgVal,
+        fail: u32,
+        helper: GuardHelper,
+    ) -> Result<(), ModuleError> {
+        if self.has_arith_compare_shared() {
+            return self.emit_is_int_in_range_shared(src, min, max, fail);
+        }
+        self.emit_is_integer(src, fail)?;
+        self.emit_is_ge(src, min, fail, helper)?;
+        self.emit_is_ge(max, src, fail, helper)
     }
 
     /// Emits a value-producing comparison BIF (`bif_is_eq_exact`, `bif_is_ne_exact`,
@@ -1902,11 +1963,29 @@ impl BeamModuleAssembler {
         self.emit_cond_to_bool(cc, destination)
     }
 
-    /// Emits the `element/2` guard BIF.
+    /// Emits the `element/2` BIF.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp (emit_bif_element), OTP-29.1.1.
+    // Without the process-wide `bif_element_guard_shared` fragment the whole test stays inline.
+    pub fn emit_bif_element(
+        &mut self,
+        fail: u32,
+        index: impl Into<TypedArg>,
+        tuple: impl Into<TypedArg>,
+        destination: ArgVal,
+        runtime: GuardHelper,
+    ) -> Result<(), ModuleError> {
+        let (index, tuple) = (index.into(), tuple.into());
+        if self.element_guard_shared != 0 {
+            return self.emit_bif_element_shared(fail, index, tuple, destination);
+        }
+        self.emit_bif_element_inline(fail, index.val, tuple.val, destination, runtime)
+    }
+
+    /// Emits `element/2` without the shared fragment (assemblers without a VM).
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:522-543 (emit_bif_element_helper)
     // and 579-767 (emit_bif_element), OTP-29.1.1: a non-tuple, a non-small or non-positive
     // position, or a position past the arity fails (branch to `fail`, or badarg).
-    pub fn emit_bif_element(
+    fn emit_bif_element_inline(
         &mut self,
         fail: u32,
         index: ArgVal,
@@ -1965,7 +2044,7 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    fn set_badarg_mfa(&mut self, index: u64) -> Result<(), ModuleError> {
+    pub(super) fn set_badarg_mfa(&mut self, index: u64) -> Result<(), ModuleError> {
         self.code.emit(|e| {
             e.mov_const(Gpr::x(9), index + 1)?;
             e.str_uoff(Gpr::x(9), Gpr::x(19), BADARG_MFA_SLOT)

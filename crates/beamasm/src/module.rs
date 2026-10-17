@@ -186,6 +186,13 @@ pub struct BeamModuleAssembler {
     gc_fragments: Vec<(usize, Label)>,
     /// Module-local dispatch stubs for process-wide executable fragments.
     dispatch_fragments: HashMap<usize, Label>,
+    /// Address of the process-wide `arith_compare_shared` fragment (0: not installed).
+    pub(crate) arith_compare_shared: usize,
+    /// Address of the process-wide `bif_element_guard_shared` fragment (0: not installed).
+    pub(crate) element_guard_shared: usize,
+    /// Shared `element/2` error raisers (entered after the guard fragment failed, entered with
+    /// the arguments in x0 and x1), bound in `finalize` when used.
+    pub(crate) element_error: Option<(Label, Label)>,
     /// Out-of-line `i_test_yield` continuations (stub, continuation, live X registers).
     yield_stubs: Vec<(Label, Label, u8)>,
     /// Process-wide yield fragments: `dispatch_return`, `i_test_yield_shared` and
@@ -274,6 +281,9 @@ impl BeamModuleAssembler {
             gc_fragments: Vec::new(),
             yield_stubs: Vec::new(),
             yield_fragments: None,
+            arith_compare_shared: 0,
+            element_guard_shared: 0,
+            element_error: None,
             entry_offset: None,
             entry_label: None,
             bs_cold: Vec::new(),
@@ -459,6 +469,18 @@ impl BeamModuleAssembler {
         self.entry_label = Some(label);
         self.entry_offset = Some(self.code.offset());
         Ok(())
+    }
+
+    /// Installs the process-wide `arith_compare_shared` fragment, so relational and loose
+    /// equality tests keep only their small fast path inline.
+    pub fn set_arith_compare_shared(&mut self, fragment: usize) {
+        self.arith_compare_shared = fragment;
+    }
+
+    /// Installs the process-wide `bif_element_guard_shared` fragment, so `element/2` keeps only
+    /// its constant-position fast path inline.
+    pub fn set_element_guard_shared(&mut self, fragment: usize) {
+        self.element_guard_shared = fragment;
     }
 
     /// Installs the process-wide yield fragments (`dispatch_return`, `i_test_yield_shared`,
@@ -2070,6 +2092,9 @@ impl BeamModuleAssembler {
             self.code.b(self.error_label)?;
         }
         self.flush_yield_stubs()?;
+        if let Some((from_guard, direct)) = self.element_error.take() {
+            self.emit_element_error_stubs(from_guard, direct)?;
+        }
         if let Some((label, helper)) = self.call_fun_error_stub.take() {
             self.code.bind(label)?;
             crate::fun::emit_call_fun_error(&mut self, helper)?;

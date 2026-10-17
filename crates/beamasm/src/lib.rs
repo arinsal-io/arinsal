@@ -9,6 +9,7 @@ mod bs_fast;
 pub mod bs_match;
 pub mod bs_segments;
 pub mod catch;
+mod compare;
 pub mod construct;
 pub mod dispatch;
 mod dump;
