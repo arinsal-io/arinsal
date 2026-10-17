@@ -7,7 +7,7 @@ use crate::alloc_util::{
 };
 use crate::raw::WordView;
 use crossbeam_queue::SegQueue;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -135,7 +135,7 @@ struct Instance {
 }
 
 /// A request another thread asks the owner of an instance to run.
-type OwnerRequest = Box<dyn FnOnce(&ThreadSpecificAllocators) + Send>;
+type OwnerRequest = Box<dyn FnOnce(&ThreadSpecificAllocators, &mut Instance) + Send>;
 
 /// Delayed frees handled per owner-work pass.
 ///
@@ -157,18 +157,40 @@ struct Shared {
     work_scheduled: AtomicBool,
 }
 
+/// The allocator state of one instance, reachable through a shared reference.
+///
+/// Port of the `thread_safe` split of `erts_alcu_alloc_thr_pref` and friends (erl_alloc_util.c,
+/// OTP-29.1.1): erts creates scheduler instances with `thread_safe = 0`, so their owner touches
+/// them without a lock, and creates instance 0 (and the dirty instances) with `thread_safe = 1`.
+/// Access follows the same split:
+///
+/// * instance 0, the dirty instances and every instance of a non thread specific allocator: under
+///   [`Slot::lock`];
+/// * a scheduler instance: by its owner thread alone, with no lock. A thread that is not the owner
+///   touches it only while it holds the [`CLAIMED`] set and the number is not in it, which keeps
+///   any thread from becoming the owner meanwhile.
+struct OwnerCell(UnsafeCell<Instance>);
+
+// SAFETY: the cell is only dereferenced under one of the two exclusion rules documented on
+// `OwnerCell`, so at most one thread has a reference to the `Instance` at any time, and
+// `Instance` (an `AllocUtil`) is `Send`.
+#[allow(unsafe_code)]
+unsafe impl Sync for OwnerCell {}
+
 /// An instance with its lock and block size mirror in one cache line pair: the counter and the
 /// lock word precede the first words of the allocator that every alloc and free touches.
 #[repr(C, align(128))]
 struct Slot {
     blocks_size: AtomicUsize,
-    lock: parking_lot::Mutex<Instance>,
+    lock: parking_lot::Mutex<()>,
+    state: OwnerCell,
 }
 
-/// The lock on an instance; releasing it publishes the counter mirror.
+/// Exclusive access to an instance; releasing it publishes the counter mirror.
 struct InstanceGuard<'a> {
-    guard: parking_lot::MutexGuard<'a, Instance>,
+    state: &'a mut Instance,
     slot: &'a Slot,
+    _lock: Option<parking_lot::MutexGuard<'a, ()>>,
 }
 
 impl std::ops::Deref for InstanceGuard<'_> {
@@ -176,14 +198,14 @@ impl std::ops::Deref for InstanceGuard<'_> {
 
     #[inline(always)]
     fn deref(&self) -> &Instance {
-        &self.guard
+        self.state
     }
 }
 
 impl std::ops::DerefMut for InstanceGuard<'_> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Instance {
-        &mut self.guard
+        self.state
     }
 }
 
@@ -192,15 +214,20 @@ impl Drop for InstanceGuard<'_> {
     fn drop(&mut self) {
         self.slot
             .blocks_size
-            .store(self.guard.allocator.blocks_size(), Ordering::Relaxed);
+            .store(self.state.allocator.blocks_size(), Ordering::Relaxed);
     }
 }
 
-fn owner_is_live(instance: usize) -> bool {
-    CLAIMED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(&instance)
+/// True when the calling thread registered as the owner of scheduler instance `instance`.
+fn owns_instance(instance: usize) -> bool {
+    CLAIM
+        .try_with(|claim| {
+            claim
+                .borrow()
+                .as_ref()
+                .is_some_and(|claim| claim.0 == instance)
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -280,8 +307,10 @@ struct HomecomingCarrier {
 /// Port of scheduler-specific allocator, delayed-free, and carrier-pool behavior
 /// in `erl_alloc_util.c:2260-2299,3968-4030,4180-4200`, OTP-29.1.1.
 pub struct ThreadSpecificAllocators {
-    // parking_lot: the uncontended lock is one CAS, on every alloc and free.
+    // parking_lot: the uncontended lock is one CAS, on every alloc and free of instance 0.
     instances: Vec<Slot>,
+    /// Instances `1..=scheduler_instances` belong to scheduler threads and take no lock.
+    scheduler_instances: usize,
     /// Cross-thread frees and carriers sent home. Lock-free so no foreign thread takes the owner's mutex.
     /// Port of erl_alloc_util.c:2225 (`enqueue_dealloc_other_instance` / `ddq_enqueue`), OTP-29.1.1.
     delayed: Vec<SegQueue<Delayed>>,
@@ -375,11 +404,19 @@ impl ThreadSpecificAllocators {
             })
             .collect();
         Self {
+            scheduler_instances: if thread_specific {
+                crate::typed::configured()
+                    .map_or(count - 1, |(schedulers, _)| schedulers)
+                    .min(count - 1)
+            } else {
+                0
+            },
             instances: allocators
                 .into_iter()
                 .map(|allocator| Slot {
                     blocks_size: AtomicUsize::new(0),
-                    lock: parking_lot::Mutex::new(Instance { allocator }),
+                    lock: parking_lot::Mutex::new(()),
+                    state: OwnerCell(UnsafeCell::new(Instance { allocator })),
                 })
                 .collect(),
             shared,
@@ -651,13 +688,17 @@ impl ThreadSpecificAllocators {
     ///
     /// Port of the `ERTS_SSI_AUX_WORK_DD` handler (`erts_alloc_handle_delayed_dealloc`,
     /// erl_alloc.c) and of `erts_alloc_notify_delayed_dealloc`, OTP-29.1.1: the owner calls this
-    /// from its aux work and is notified again while queued frees remain.
+    /// from its aux work and is notified again while queued frees remain. A thread that does not
+    /// own a scheduler instance does nothing.
     pub fn handle_owner_work(&self, instance: usize) -> Result<bool, AllocError> {
+        if self.lock_free(instance) && ALC_IX.with(Cell::get) != instance {
+            return Ok(false);
+        }
         self.shared[instance]
             .work_scheduled
             .store(false, Ordering::Release);
-        self.run_owner_requests(instance);
         let mut state = self.lock_instance(instance);
+        self.run_requests_on(instance, &mut state);
         let drained = self.drain_limited(instance, &mut state, OWNER_WORK_DD_LIMIT)?;
         self.clear_routes(drained);
         self.publish_transfers(instance, &mut state)?;
@@ -670,9 +711,21 @@ impl ThreadSpecificAllocators {
     }
 
     /// Runs the requests other threads queued for `instance`, without handling delayed frees.
+    ///
+    /// Does nothing for a scheduler instance the calling thread does not own.
     pub fn run_owner_requests(&self, instance: usize) {
+        if self.shared[instance].requests.is_empty()
+            || (self.lock_free(instance) && ALC_IX.with(Cell::get) != instance)
+        {
+            return;
+        }
+        let mut state = self.lock_instance(instance);
+        self.run_requests_on(instance, &mut state);
+    }
+
+    fn run_requests_on(&self, instance: usize, state: &mut Instance) {
         while let Some(request) = self.shared[instance].requests.pop() {
-            request(self);
+            request(self, state);
         }
     }
 
@@ -685,13 +738,6 @@ impl ThreadSpecificAllocators {
         }
     }
 
-    fn owned_by_other_thread(&self, instance: usize) -> bool {
-        self.thread_specific
-            && instance != 0
-            && self.current_instance() != instance
-            && owner_is_live(instance)
-    }
-
     /// Runs `work` on `instance` the way erts does: in place when the caller owns it or nobody
     /// does, else by the owner, which the caller waits for.
     ///
@@ -701,15 +747,28 @@ impl ThreadSpecificAllocators {
         F: FnOnce(&Self, &mut Instance) -> R + Send + 'static,
         R: Send + 'static,
     {
-        if !self.owned_by_other_thread(instance) {
+        if !self.lock_free(instance) || ALC_IX.with(Cell::get) == instance {
             let mut state = self.lock_instance(instance);
             return work(self, &mut state);
         }
+        let mut work = Some(work);
         let (reply, answer) = mpsc::channel();
-        self.shared[instance].requests.push(Box::new(move |this| {
-            let mut state = this.lock_instance(instance);
-            let _ = reply.send(work(this, &mut state));
-        }));
+        {
+            let claims = CLAIMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !claims.contains(&instance) {
+                let mut state = self.lock_unowned(instance, &claims);
+                let work = work.take().expect("work runs once");
+                return work(self, &mut state);
+            }
+            let work = work.take().expect("work runs once");
+            self.shared[instance]
+                .requests
+                .push(Box::new(move |this, state| {
+                    let _ = reply.send(work(this, state));
+                }));
+        }
         self.schedule_owner_work(instance);
         let own = ALC_IX.with(Cell::get);
         let mut waited = 0u32;
@@ -724,13 +783,18 @@ impl ThreadSpecificAllocators {
             if own != 0 {
                 crate::typed::run_owner_requests(own);
             }
-            if !owner_is_live(instance) {
-                self.run_owner_requests(instance);
-            } else {
+            let claims = CLAIMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if claims.contains(&instance) {
+                drop(claims);
                 waited += 1;
                 if waited.is_multiple_of(50) {
                     notify_owner(instance);
                 }
+            } else {
+                let mut state = self.lock_unowned(instance, &claims);
+                self.run_requests_on(instance, &mut state);
             }
         }
     }
@@ -822,14 +886,6 @@ impl ThreadSpecificAllocators {
             stats.blocks_size += blocks_size;
         }
         stats
-    }
-
-    #[inline]
-    fn lock_instance(&self, instance: usize) -> InstanceGuard<'_> {
-        InstanceGuard {
-            guard: self.instances[instance].lock.lock(),
-            slot: &self.instances[instance],
-        }
     }
 
     /// Runs queued cross-thread frees and hands abandoned carriers to the pool.
@@ -1263,6 +1319,72 @@ impl ThreadSpecificAllocators {
     }
 }
 
+#[allow(unsafe_code)]
+impl ThreadSpecificAllocators {
+    /// Whether `instance` is a scheduler instance, which its owner uses without a lock.
+    #[inline(always)]
+    fn lock_free(&self, instance: usize) -> bool {
+        instance.wrapping_sub(1) < self.scheduler_instances
+    }
+
+    /// Takes the instance for the calling thread, which must be its owner when it is a scheduler
+    /// instance and takes the instance lock otherwise.
+    ///
+    /// Port of the `thread_safe` branch of `erts_alcu_alloc_thr_pref` (erl_alloc_util.c,
+    /// OTP-29.1.1): `ERTS_ALCU_FLG_THREAD_SAFE` allocators lock, scheduler instances do not.
+    #[inline(always)]
+    fn lock_instance(&self, instance: usize) -> InstanceGuard<'_> {
+        let slot = &self.instances[instance];
+        if self.lock_free(instance) {
+            debug_assert!(
+                owns_instance(instance),
+                "scheduler instance {instance} touched by a thread that does not own it"
+            );
+            // SAFETY: `instance` is a scheduler instance and the caller is its registered owner
+            // (checked above in debug builds; every caller reaches here through the thread's own
+            // allocator index or through the owner's aux work). Registration gives an instance
+            // one owner at a time, and a non owner only enters through `lock_unowned`, which
+            // excludes registration, so no other reference to the state exists.
+            let state = unsafe { &mut *slot.state.0.get() };
+            InstanceGuard {
+                state,
+                slot,
+                _lock: None,
+            }
+        } else {
+            let lock = slot.lock.lock();
+            // SAFETY: the instance lock is held, and every other access to a locked instance
+            // takes it first.
+            let state = unsafe { &mut *slot.state.0.get() };
+            InstanceGuard {
+                state,
+                slot,
+                _lock: Some(lock),
+            }
+        }
+    }
+
+    /// Takes a scheduler instance that has no owner thread. `claims` is the held [`CLAIMED`] set,
+    /// which does not contain `instance`, so no thread can register as its owner until the
+    /// guard is gone and the caller releases `claims`.
+    fn lock_unowned<'a>(
+        &'a self,
+        instance: usize,
+        claims: &std::sync::MutexGuard<'_, BTreeSet<usize>>,
+    ) -> InstanceGuard<'a> {
+        debug_assert!(self.lock_free(instance) && !claims.contains(&instance));
+        let slot = &self.instances[instance];
+        // SAFETY: the scheduler instance has no owner and registration of one needs `CLAIMED`,
+        // which the caller holds; other non owner threads also hold `CLAIMED` while they touch it.
+        let state = unsafe { &mut *slot.state.0.get() };
+        InstanceGuard {
+            state,
+            slot,
+            _lock: None,
+        }
+    }
+}
+
 /// End offset of `len` bytes at `offset` inside the payload, checked against the block size.
 fn payload_range(
     handle: InstanceAllocation,
@@ -1298,8 +1420,15 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn with_scheduler_instances(
+        mut allocators: ThreadSpecificAllocators,
+    ) -> Arc<ThreadSpecificAllocators> {
+        allocators.scheduler_instances = allocators.instances.len() - 1;
+        Arc::new(allocators)
+    }
+
     fn four_instances() -> Arc<ThreadSpecificAllocators> {
-        Arc::new(ThreadSpecificAllocators::new(
+        with_scheduler_instances(ThreadSpecificAllocators::new(
             4,
             true,
             Strategy::AoffCbf,
@@ -1345,257 +1474,109 @@ mod tests {
         .unwrap();
     }
 
-    const P_LOCK: u32 = 1;
-    const P_TLS: u32 = 2;
-    const P_DDQ: u32 = 4;
-    const P_PEND: u32 = 128;
-    const P_PUB: u32 = 8;
-    const P_PTR: u32 = 16;
-    const P_ROUTE: u32 = 32;
-    const P_POOLED: u32 = 64;
-
-    impl ThreadSpecificAllocators {
-        #[inline(always)]
-        fn probe_alloc<const F: u32>(
-            &self,
-            ix: usize,
-            state: &mut Instance,
-            size: usize,
-        ) -> Allocation {
-            if F & P_DDQ != 0 && !self.delayed[ix].is_empty() {
-                panic!("delayed");
-            }
-            if F & P_POOLED != 0 && self.pooled.load(Ordering::Acquire) != 0 {
-                panic!("pooled");
-            }
-            let allocation = state.allocator.alloc(size).unwrap();
-            if F & P_PTR != 0 {
-                std::hint::black_box(state.allocator.payload_address(allocation));
-            }
-            allocation
-        }
-
-        #[inline(always)]
-        fn probe_free<const F: u32>(
-            &self,
-            ix: usize,
-            state: &mut Instance,
-            allocation: Allocation,
-        ) {
-            if F & P_ROUTE != 0 && self.routed.load(Ordering::Acquire) != 0 {
-                panic!("routed");
-            }
-            if F & P_DDQ != 0 && !self.delayed[ix].is_empty() {
-                panic!("delayed");
-            }
-            state.allocator.free(allocation).unwrap();
-            if F & P_PEND != 0 && state.allocator.has_pending_carriers() {
-                panic!("pending");
-            }
-        }
-
-        #[inline(always)]
-        fn probe_publish<const F: u32>(&self, ix: usize, state: &Instance) {
-            if F & P_PUB != 0 {
-                self.instances[ix]
-                    .blocks_size
-                    .store(state.allocator.blocks_size(), Ordering::Relaxed);
-            }
-        }
-
-        #[inline(never)]
-        fn probe_loop<const F: u32>(&self, cycles: usize, background: bool) -> f64 {
-            let mut rng = 0x2545_f491_4f6c_dd1d_u64;
-            let mut next = move || {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                rng
-            };
-            let mut held = if F & P_LOCK == 0 {
-                Some(self.instances[1].lock.lock())
-            } else {
-                None
-            };
-            let mut live: Vec<Allocation> = Vec::with_capacity(32);
-            let op_alloc = |this: &Self,
-                            held: &mut Option<parking_lot::MutexGuard<'_, Instance>>,
-                            size: usize|
-             -> Allocation {
-                let ix = if F & P_TLS != 0 {
-                    this.current_instance()
-                } else {
-                    1
-                };
-                if F & P_LOCK != 0 {
-                    let mut g = this.instances[ix].lock.lock();
-                    let a = this.probe_alloc::<F>(ix, &mut g, size);
-                    this.probe_publish::<F>(ix, &g);
-                    a
-                } else {
-                    this.probe_alloc::<F>(ix, held.as_mut().unwrap(), size)
-                }
-            };
-            let op_free = |this: &Self,
-                           held: &mut Option<parking_lot::MutexGuard<'_, Instance>>,
-                           a: Allocation| {
-                let ix = if F & P_TLS != 0 {
-                    this.current_instance()
-                } else {
-                    1
-                };
-                if F & P_LOCK != 0 {
-                    let mut g = this.instances[ix].lock.lock();
-                    this.probe_free::<F>(ix, &mut g, a);
-                    this.probe_publish::<F>(ix, &g);
-                } else {
-                    this.probe_free::<F>(ix, held.as_mut().unwrap(), a);
-                }
-            };
-            if background {
-                let bg: Vec<Allocation> = (0..2000)
-                    .map(|_| op_alloc(self, &mut held, 16 + (next() % 20) as usize * 16))
-                    .collect();
-                for a in bg.iter().step_by(2) {
-                    op_free(self, &mut held, *a);
-                }
-            }
-            let started = std::time::Instant::now();
-            for _ in 0..cycles {
-                for _ in 0..26 {
-                    let size = 8 + (next() % 12) as usize * 8;
-                    live.push(op_alloc(self, &mut held, size));
-                }
-                for a in live.drain(..) {
-                    op_free(self, &mut held, a);
-                }
-            }
-            started.elapsed().as_nanos() as f64 / (cycles as f64 * 26.0)
-        }
-    }
-
-    fn probe_set(background: bool, cycles: usize) -> Vec<(&'static str, f64)> {
-        let mut out = Vec::new();
-        macro_rules! step {
-            ($label:expr, $f:expr) => {{
-                let mut best = f64::MAX;
-                for _ in 0..5 {
-                    let allocators = four_instances();
-                    best = best.min(allocators.probe_loop::<{ $f }>(cycles, background));
-                }
-                out.push(($label, best));
-            }};
-        }
-        step!("S0 AllocUtil only (lock held outside)", 0);
-        step!("S1 + lock/unlock per op", P_LOCK);
-        step!("S2 + TLS current_instance", P_LOCK | P_TLS);
-        step!("S3 + delayed queue check (2/pair)", P_LOCK | P_TLS | P_DDQ);
-        step!(
-            "S4 + pending-carrier check (1/pair)",
-            P_LOCK | P_TLS | P_DDQ | P_PEND
-        );
-        step!(
-            "S5 + block size publish at unlock",
-            P_LOCK | P_TLS | P_DDQ | P_PEND | P_PUB
-        );
-        step!(
-            "S6 + payload address",
-            P_LOCK | P_TLS | P_DDQ | P_PEND | P_PUB | P_PTR
-        );
-        step!(
-            "S7 + routed/pooled loads",
-            P_LOCK | P_TLS | P_DDQ | P_PEND | P_PUB | P_PTR | P_ROUTE | P_POOLED
-        );
-        out
-    }
-
-    fn full_layer(background: bool, cycles: usize) -> f64 {
-        let mut state = 0x2545_f491_4f6c_dd1d_u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let mut best = f64::MAX;
-        for _ in 0..5 {
-            let allocators = four_instances();
-            if background {
-                let bg: Vec<_> = (0..2000)
-                    .map(|_| allocators.alloc(16 + (next() % 20) as usize * 16).unwrap())
-                    .collect();
-                for a in bg.iter().step_by(2) {
-                    allocators.free(*a).unwrap();
-                }
-            }
-            let mut live = Vec::with_capacity(32);
-            let started = std::time::Instant::now();
-            for _ in 0..cycles {
-                for _ in 0..26 {
-                    live.push(allocators.alloc(8 + (next() % 12) as usize * 8).unwrap());
-                }
-                for handle in live.drain(..) {
-                    allocators.free(handle).unwrap();
-                }
-            }
-            best = best.min(started.elapsed().as_nanos() as f64 / (cycles as f64 * 26.0));
-        }
-        best
-    }
-
     #[test]
-    #[ignore = "timing: cargo test --release -p arinsal-alloc layer_cost_steps -- --ignored --nocapture"]
-    fn layer_cost_steps() {
+    fn owner_instance_has_no_lock() {
         let _serial = registration();
-        let cycles: usize = std::env::var("FRAG_CYCLES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60_000);
+        let allocators = four_instances();
+        assert!(!allocators.lock_free(0));
+        for instance in 1..4 {
+            assert!(allocators.lock_free(instance));
+        }
+        let worker = Arc::clone(&allocators);
         thread::spawn(move || {
-            assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+            assert_eq!(register_thread(ThreadKind::Scheduler(2)), Ok(2));
+            let handle = worker.alloc(100).unwrap();
+            assert_eq!(handle.instance(), 2);
             {
-                use crate::typed::{AllocBlock, ErtsAlcType};
-                let mut rng = 0x2545_f491_4f6c_dd1d_u64;
-                let mut next = move || {
-                    rng ^= rng << 13;
-                    rng ^= rng >> 7;
-                    rng ^= rng << 17;
-                    rng
-                };
-                let mut best = f64::MAX;
-                for _ in 0..5 {
-                    let mut live = Vec::with_capacity(32);
-                    let started = std::time::Instant::now();
-                    for _ in 0..cycles {
-                        for _ in 0..26 {
-                            live.push(
-                                AllocBlock::new(ErtsAlcType::HEAP_FRAG, 1 + (next() % 12) as usize)
-                                    .unwrap(),
-                            );
-                        }
-                        live.clear();
-                    }
-                    best = best.min(started.elapsed().as_nanos() as f64 / (cycles as f64 * 26.0));
-                }
-                eprintln!(
-                    "  {:<44} {best:6.2} ns per pair",
-                    "AllocBlock::new + drop (HEAP_FRAG, registry)"
-                );
+                let state = worker.lock_instance(2);
+                assert!(state._lock.is_none());
+                assert!(!worker.instances[2].lock.is_locked());
             }
-            for background in [false, true] {
-                eprintln!("background fragmentation: {background}");
-                for (label, ns) in probe_set(background, cycles) {
-                    eprintln!("  {label:<44} {ns:6.2} ns per pair");
-                }
-                eprintln!(
-                    "  {:<44} {:6.2} ns per pair",
-                    "FULL ThreadSpecificAllocators alloc/free",
-                    full_layer(background, cycles)
-                );
+            {
+                let state = worker.lock_instance(0);
+                assert!(state._lock.is_some());
+                assert!(worker.instances[0].lock.is_locked());
             }
+            worker.free(handle).unwrap();
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn foreign_frees_are_never_lost() {
+        const OWNERS: usize = 3;
+        const ROUNDS: usize = 2000;
+        let _serial = registration();
+        let allocators = four_instances();
+        let start = Arc::new(Barrier::new(OWNERS));
+        let all_freed = Arc::new(Barrier::new(OWNERS));
+        let drained = Arc::new(Barrier::new(OWNERS));
+        let (senders, receivers): (Vec<_>, Vec<_>) = (0..OWNERS)
+            .map(|_| mpsc::channel::<InstanceAllocation>())
+            .unzip();
+        let mut receivers: Vec<_> = receivers.into_iter().map(Some).collect();
+        let workers: Vec<_> = (0..OWNERS)
+            .map(|index| {
+                let allocators = Arc::clone(&allocators);
+                let next = senders[(index + 1) % OWNERS].clone();
+                let inbox = receivers[index].take().unwrap();
+                let (start, all_freed, drained) = (
+                    Arc::clone(&start),
+                    Arc::clone(&all_freed),
+                    Arc::clone(&drained),
+                );
+                thread::spawn(move || {
+                    let own = index + 1;
+                    assert_eq!(register_thread(ThreadKind::Scheduler(own)), Ok(own));
+                    start.wait();
+                    let mut kept = Vec::new();
+                    for round in 0..ROUNDS {
+                        for n in 0..24 {
+                            let size = if n == 0 && round % 16 == 0 {
+                                300_000
+                            } else {
+                                8 + (n * 40 + round) % 600
+                            };
+                            let handle = allocators.alloc(size).unwrap();
+                            assert_eq!(handle.instance(), own);
+                            if n % 3 == 0 {
+                                kept.push(handle);
+                            } else {
+                                next.send(handle).unwrap();
+                            }
+                        }
+                        while let Ok(handle) = inbox.try_recv() {
+                            allocators.free(handle).unwrap();
+                        }
+                        for handle in kept.drain(..) {
+                            allocators.free(handle).unwrap();
+                        }
+                        if round % 7 == 0 {
+                            allocators.handle_owner_work(own).unwrap();
+                        }
+                    }
+                    drop(next);
+                    for handle in inbox {
+                        allocators.free(handle).unwrap();
+                    }
+                    all_freed.wait();
+                    while allocators.pending_deallocations(own) != 0 {
+                        allocators.handle_owner_work(own).unwrap();
+                    }
+                    allocators.drain_deallocations(own).unwrap();
+                    drained.wait();
+                })
+            })
+            .collect();
+        drop(senders);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        for instance in 0..allocators.instance_count() {
+            assert_eq!(allocators.pending_deallocations(instance), 0);
+        }
+        assert_eq!(allocators.current_blocks_size(), 0);
     }
 
     #[test]
@@ -1808,7 +1789,7 @@ mod tests {
     fn blocks_size_and_dyn_sbct_do_not_lock_instances() {
         let allocators = four_instances();
         let live = allocators.alloc(1000).unwrap();
-        let held = [allocators.lock_instance(0), allocators.lock_instance(1)];
+        let held = allocators.lock_instance(0);
         let worker_allocators = Arc::clone(&allocators);
         let result = within(Duration::from_secs(2), move || {
             let size = worker_allocators.current_blocks_size();
@@ -1936,7 +1917,7 @@ mod tests {
             cpool: Some('H'),
             ..AllocUtilOptions::default()
         };
-        Arc::new(ThreadSpecificAllocators::new(
+        with_scheduler_instances(ThreadSpecificAllocators::new(
             instances,
             true,
             Strategy::AoffCbf,
@@ -2141,6 +2122,9 @@ mod tests {
             if line.contains(".lock_instance(") {
                 sites.push(current);
             }
+            if line.contains(".lock_unowned(") {
+                sites.push("unowned");
+            }
         }
         assert_eq!(
             sites,
@@ -2150,8 +2134,10 @@ mod tests {
                 "free_at",
                 "free_routed",
                 "handle_owner_work",
+                "run_owner_requests",
                 "on_owner",
-                "on_owner",
+                "unowned",
+                "unowned",
             ]
         );
     }
