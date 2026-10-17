@@ -1316,7 +1316,7 @@ pub fn put<H: HeapAlloc + ?Sized>(
         return Err(MapError::Badmap(map));
     };
     if header & 0xc0 != 0 {
-        return hashmap_insert(map, key, value, false, heap);
+        return put_hashmap(map, key, value, heap);
     }
     // SAFETY: check() established a live flatmap; every write stays inside the
     // allocations made here, whose sizes are computed from the flatmap size.
@@ -1383,7 +1383,7 @@ pub fn put<H: HeapAlloc + ?Sized>(
         if n >= LIMIT {
             release!(heap, shp.add(first), shp);
             let (ks, vs) = flatmap_slices!(ks, vs, n);
-            return hashmap_from_ks_and_vs_extra(ks, vs, Some((key, value)), heap);
+            return put_grow_to_hashmap(ks, vs, key, value, heap);
         }
         // Still a small map: the new key tuple reuses the first allocation.
         let second = FLATMAP_HEADER_WORDS + n + 1;
@@ -1442,6 +1442,31 @@ pub fn put<H: HeapAlloc + ?Sized>(
         *kp.add(n - i) = POS_BIG_SUBTAG;
         Ok(boxed(hp))
     }
+}
+
+/// `erts_maps_put` on a HAMT, out of line so the flatmap path keeps a small frame.
+#[inline(never)]
+fn put_hashmap<H: HeapAlloc + ?Sized>(
+    map: Term,
+    key: Term,
+    value: Term,
+    heap: &mut H,
+) -> MapResult<Term> {
+    hashmap_insert(map, key, value, false, heap)
+}
+
+/// `erts_maps_put` on a full flatmap: builds the HAMT with the extra pair, out of line so the
+/// flatmap path keeps a small frame.
+#[cold]
+#[inline(never)]
+fn put_grow_to_hashmap<H: HeapAlloc + ?Sized>(
+    ks: &[Term],
+    vs: &[Term],
+    key: Term,
+    value: Term,
+    heap: &mut H,
+) -> MapResult<Term> {
+    hashmap_from_ks_and_vs_extra(ks, vs, Some((key, value)), heap)
 }
 
 /// `Map#{Key := Value}` / `maps:update/3`; `Badkey` when the key is absent.

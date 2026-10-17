@@ -50,7 +50,7 @@ impl<'a> NativeTopHeap<'a> {
         let limit = (self.header.stop as usize)
             .saturating_sub(S_REDZONE * 8)
             .max(htop as usize);
-        if words.checked_mul(8)? > limit - htop as usize {
+        if words > (limit - htop as usize) >> 3 {
             return None;
         }
         self.header.htop = htop.wrapping_add(words);
@@ -66,8 +66,27 @@ impl<'a> NativeTopHeap<'a> {
         &mut self.heap
     }
 
+    #[cold]
+    #[inline(never)]
+    fn alloc_slow(&mut self, words: usize) -> Option<*mut u64> {
+        self.slow().alloc(words)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_with_extra_slow(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        self.slow().alloc_with_extra(words, extra)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn release_slow(&mut self, end: *mut u64, start: *mut u64) {
+        self.slow().release(end, start);
+    }
+
     /// Publishes the native cursors to the [`ProcessHeap`] after the allocator is dropped.
-    #[inline(always)]
+    #[cold]
+    #[inline(never)]
     pub(crate) fn commit(mut self) {
         self.slow();
     }
@@ -87,14 +106,14 @@ impl HeapAlloc for NativeTopHeap<'_> {
         if let Some(ptr) = self.top_alloc(words) {
             return Some(ptr);
         }
-        self.slow().alloc(words)
+        self.alloc_slow(words)
     }
     #[inline(always)]
     fn alloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
         if let Some(ptr) = self.top_alloc(words) {
             return Some(ptr);
         }
-        self.slow().alloc_with_extra(words, extra)
+        self.alloc_with_extra_slow(words, extra)
     }
     fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
         self.slow().alloc_fragment_only(words)
@@ -114,7 +133,7 @@ impl HeapAlloc for NativeTopHeap<'_> {
             self.header.htop = start;
             return;
         }
-        self.slow().release(end, start);
+        self.release_slow(end, start);
     }
     fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         self.slow().retain_binary(binary)
