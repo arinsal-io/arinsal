@@ -1077,6 +1077,8 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     if !std::ptr::eq(registers, scheduler_registers) {
         return 0;
     }
+    // The generated code holds FCALLS in a register; a delayed collection reads what is left.
+    process.reductions = fcalls;
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
