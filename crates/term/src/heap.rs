@@ -1320,6 +1320,128 @@ impl ProcessHeap {
         Ok(())
     }
 
+    /// Flush the heap a dirty job built into this process.
+    ///
+    /// Port of erts/emulator/beam/erl_nfunc_sched.h (erts_flush_dirty_shadow_proc) and
+    /// erts/emulator/beam/erl_nif.c (alloc_heap, flush_env), OTP-29.1.1: a dirty NIF allocates
+    /// on the process heap from `HEAP_TOP` up to `HEAP_LIMIT`, so what fits lies on the young
+    /// heap and `c_p->htop` moves past it. Only when the job outgrew the free words do its
+    /// words stay in heap fragments, which [`ProcessHeap::adopt_message_fragment`] adopts.
+    ///
+    /// `roots` are the terms outside the block that point into it. The block moves word for
+    /// word, so unreachable words the job allocated stay as they are in erts.
+    pub fn flush_dirty_shadow(
+        &mut self,
+        mut source: ProcessHeap,
+        roots: &mut [&mut Term],
+    ) -> Result<(), AdoptError> {
+        if source.stop != source.words.len() || source.old_htop != 0 || !source.old_words.is_empty()
+        {
+            return Err(AdoptError::NotStandalone);
+        }
+        let used = source.htop;
+        let fits = !self.detached
+            && source.fragments.is_empty()
+            && source.fragment_words == 0
+            && !self.words.is_empty()
+            && !source.detached
+            && self.halloc_words_left().is_some_and(|left| used <= left)
+            && Self::shadow_block_is_movable(
+                &source.words.words()[..used],
+                &(source.words.as_ptr() as usize..source.words.as_ptr() as usize + used * 8),
+            );
+        if !fits {
+            return self.adopt_message_fragment(source);
+        }
+        let from = source.words.as_ptr() as usize;
+        let to = self.words.as_ptr() as usize + self.htop * 8;
+        let delta = to.wrapping_sub(from) as u64;
+        let range = from..from + used * 8;
+        let rebase = |word: u64| {
+            if word & 3 != 0 && word & 3 != 3 && range.contains(&((word & !7) as usize)) {
+                word.wrapping_add(delta)
+            } else {
+                word
+            }
+        };
+        {
+            let htop = self.htop;
+            let target = &mut self.words.words_mut()[htop..htop + used];
+            target.copy_from_slice(&source.words.words()[..used]);
+            let mut index = 0;
+            while index < used {
+                let word = target[index];
+                if word & 3 != 0 {
+                    target[index] = rebase(word);
+                    index += 1;
+                    continue;
+                }
+                match word & 63 {
+                    BIN_REF => {
+                        let next = target[index + 2];
+                        if range.contains(&(next as usize)) {
+                            target[index + 2] = next.wrapping_add(delta);
+                        }
+                        index += 1 + (word >> 6) as usize;
+                    }
+                    SUB_BITS => {
+                        target[index + 4] = rebase(target[index + 4]);
+                        index += 1 + (word >> 6) as usize;
+                    }
+                    ARITY => index += 1,
+                    _ => index += 1 + (word >> 6) as usize,
+                }
+            }
+        }
+        for root in roots.iter_mut() {
+            **root = Term(rebase(root.0));
+        }
+        if let Some(owners) = source.owners.0.as_deref_mut() {
+            for head in [&mut owners.off_heap_first, &mut owners.wrt_bins] {
+                if range.contains(&*head) {
+                    *head = (*head as u64).wrapping_add(delta) as usize;
+                }
+            }
+        }
+        self.htop += used;
+        self.absorb_fragment_owners(&mut source);
+        Ok(())
+    }
+
+    /// Whether every object in the used words of a dirty shadow block can move with a plain
+    /// word copy and pointer rebase: tuples, lists, numbers, heap binaries, binary
+    /// references (their off-heap chain links lie in the block) and sub-binaries of those.
+    fn shadow_block_is_movable(words: &[u64], block: &std::ops::Range<usize>) -> bool {
+        let mut index = 0;
+        while index < words.len() {
+            let word = words[index];
+            if word & 3 != 0 {
+                index += 1;
+                continue;
+            }
+            let object_words = 1 + (word >> 6) as usize;
+            match word & 63 {
+                ARITY => index += 1,
+                POS_BIG | NEG_BIG | FLOAT | HEAP_BITS => index += object_words,
+                BIN_REF => {
+                    if index + 2 >= words.len() {
+                        return false;
+                    }
+                    index += object_words;
+                }
+                SUB_BITS => {
+                    let base = words.get(index + 1).copied().unwrap_or(0) as usize;
+                    if index + object_words > words.len() || block.contains(&base) {
+                        return false;
+                    }
+                    index += object_words;
+                }
+                _ => return false,
+            }
+        }
+        index == words.len()
+    }
+
     /// Words of message data held by a standalone message heap: the used part of its block
     /// and of each heap fragment.
     // Port of erts/emulator/beam/erl_message.h (erts_msg_attached_data_size), OTP-29.1.1.

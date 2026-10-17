@@ -896,6 +896,28 @@ impl PendingNif {
         }
     }
 
+    /// The terms of a finished dirty call: its value, the arguments of a continuation, or the
+    /// terms of its exception.
+    pub(crate) fn done_slots(&mut self) -> Vec<&mut Term> {
+        use arinsal_bifs::BifError;
+        let mut slots = Vec::new();
+        match &mut self.done {
+            Some(Ok(arinsal_nif::NifCall::Return(value))) => slots.push(value),
+            Some(Ok(arinsal_nif::NifCall::Schedule(trap))) => slots.extend(trap.args.iter_mut()),
+            Some(Err(BifError::Badarg { cause: Some(term) } | BifError::Error(term))) => {
+                slots.push(term)
+            }
+            Some(Err(BifError::Raise {
+                reason, stacktrace, ..
+            })) => {
+                slots.push(reason);
+                slots.extend(stacktrace.as_mut());
+            }
+            _ => {}
+        }
+        slots
+    }
+
     /// Scheduler class this call or continuation must execute on.
     pub(crate) fn class(&self) -> SchedulerClass {
         arinsal_nif::scheduler_class(self.trap.flags)
