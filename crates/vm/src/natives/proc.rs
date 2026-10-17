@@ -1710,14 +1710,7 @@ fn backtrace_with(
         let _ = writeln!(text, "Program counter: {address:#018x} ({description})");
     }
     if !running {
-        let arity = if native_pc.is_some() {
-            usize::from(process.header.arity)
-        } else {
-            modules
-                .get(process.module)
-                .and_then(|code| code.function_at(process.ip))
-                .map_or(0, |(_, arity)| usize::from(arity))
-        };
+        let arity = crate::process::switched_out_live(process);
         let _ = writeln!(text, "arity = {arity}");
         for argument in process.x.iter().take(arity) {
             let _ = writeln!(text, "   {}", print(*argument));

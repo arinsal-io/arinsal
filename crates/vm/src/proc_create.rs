@@ -105,6 +105,26 @@ impl ArgRegs {
         self.len
     }
 
+    /// True while the saved registers fit the inline block, `arg_reg == def_arg_reg`. A file
+    /// that once grew past six keeps its separate block, as `arg_reg` does until the process
+    /// is freed.
+    #[inline]
+    pub fn is_def_arg_reg(&self) -> bool {
+        self.extra.is_empty()
+    }
+
+    /// Bytes `erts_process_memory` adds for the saved registers: `arity` words, and only when
+    /// `arg_reg` is not the inline default.
+    // Port of erts/emulator/beam/erl_process_dump.c (`erts_process_memory`), OTP-29.1.1.
+    #[inline]
+    pub fn arg_reg_bytes(&self) -> usize {
+        if self.is_def_arg_reg() {
+            0
+        } else {
+            self.len * std::mem::size_of::<Term>()
+        }
+    }
+
     /// Schedule-in (`copy_in_registers`): copy the `saved_arity` saved registers into
     /// `registers.x_reg_array` and make it the X file. The saved storage and `saved_arity`
     /// stay untouched until `detach_save`.
@@ -2098,6 +2118,25 @@ mod arg_regs_tests {
         attach(&mut regs, &mut sched);
         regs.detach_save(7);
         assert_eq!(&regs[..], &expect[..7]);
+    }
+
+    #[test]
+    fn process_memory_counts_the_saved_registers_only_past_the_inline_default() {
+        let mut sched = registers();
+        let mut regs = owned(&[1, 2, 3]);
+        assert!(regs.is_def_arg_reg());
+        assert_eq!(regs.arg_reg_bytes(), 0);
+        attach(&mut regs, &mut sched);
+        regs.detach_save(6);
+        assert_eq!(regs.arg_reg_bytes(), 0);
+        attach(&mut regs, &mut sched);
+        regs.detach_save(9);
+        assert!(!regs.is_def_arg_reg());
+        assert_eq!(regs.arg_reg_bytes(), 9 * std::mem::size_of::<Term>());
+        attach(&mut regs, &mut sched);
+        regs.detach_save(2);
+        assert!(!regs.is_def_arg_reg());
+        assert_eq!(regs.arg_reg_bytes(), 2 * std::mem::size_of::<Term>());
     }
 
     #[test]
