@@ -219,23 +219,33 @@ fn erl_launch(args: &[String]) -> ! {
                 .map(|count| usize::try_from(count.total).unwrap_or(0))
         })
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let dirty_instances = launch
+        .emulator
+        .allocator_options
+        .iter()
+        .find(|flag| flag.name == "+Mdai")
+        .and_then(|flag| flag.value.as_deref())
+        .and_then(|value| {
+            if value == "max" {
+                Some(default_dirty_allocators)
+            } else {
+                value
+                    .parse()
+                    .ok()
+                    .map(|count: usize| count.min(default_dirty_allocators))
+            }
+        });
     arinsal_args::configure_allocator_options(arinsal_args::ActiveAllocatorOptions {
         schedulers: launch.emulator.schedulers.map(|count| count.total),
-        dirty_instances: launch
-            .emulator
-            .allocator_options
-            .iter()
-            .find(|flag| flag.name == "+Mdai")
-            .and_then(|flag| flag.value.as_deref())
-            .and_then(|value| {
-                if value == "max" {
-                    Some(default_dirty_allocators)
-                } else {
-                    value.parse().ok()
-                }
-            }),
+        dirty_instances,
         flags: launch.emulator.allocator_options.clone(),
     });
+    let cpus = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let workers = arinsal_args::resolve_scheduler_count(launch.emulator.schedulers, cpus)
+        .map_or(cpus, |(total, _)| total);
+    // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_init), OTP-29.1.1: the allocator instances
+    // are sized from the scheduler count and `+Mdai` before anything allocates.
+    let _ = arinsal_alloc::typed::configure(workers, dirty_instances.unwrap_or(0));
     arinsal_args::configure_scheduler_options(arinsal_args::ActiveSchedulerOptions(
         launch.emulator.scheduler.clone(),
     ));
@@ -269,9 +279,6 @@ fn erl_launch(args: &[String]) -> ! {
     seeded.extend(launch.set_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     arinsal_vm::boot::seed_environment(&seeded);
     let root = PathBuf::from(&launch.root_dir);
-    let cpus = std::thread::available_parallelism().map_or(1, |count| count.get());
-    let workers = arinsal_args::resolve_scheduler_count(launch.emulator.schedulers, cpus)
-        .map_or(cpus, |(total, _)| total);
     match arinsal_vm::boot::run_with_debugger_flags(
         &root,
         &launch.boot_args,

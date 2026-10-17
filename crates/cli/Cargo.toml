@@ -13,6 +13,7 @@ workspace = true
 instr-count = ["arinsal-vm/instr-count"]
 
 [dependencies]
+arinsal-alloc = { path = "../alloc" }
 arinsal-args.workspace = true
 arinsal-beam.workspace = true
 arinsal-etf.workspace = true

@@ -6,19 +6,115 @@ use crate::alloc_util::{
     CarrierTransfer, Strategy,
 };
 use crossbeam_queue::SegQueue;
-use std::cell::Cell;
-use std::sync::Mutex;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::{self, ThreadId};
-
-static NEXT_INSTANCE_CACHE_ID: AtomicUsize = AtomicUsize::new(1);
-
-const INSTANCE_CACHE_SLOTS: usize = 32;
+use std::sync::{Mutex, OnceLock};
 
 thread_local! {
-    // One slot per allocator family (cache id modulo slots); a collision only costs the slow path.
-    static LAST_INSTANCE: [Cell<(usize, usize)>; INSTANCE_CACHE_SLOTS] =
-        const { [const { Cell::new((0, 0)) }; INSTANCE_CACHE_SLOTS] };
+    /// The allocator instance of this thread, shared by every allocator family.
+    ///
+    /// Port of the per-thread `alc_ix` word of erts (`erts_get_thr_alloc_ix` in
+    /// erl_alloc.c), OTP-29.1.1: zero until the thread registers.
+    static ALC_IX: Cell<usize> = const { Cell::new(0) };
+    static CLAIM: RefCell<Option<InstanceClaim>> = const { RefCell::new(None) };
+}
+
+/// Scheduler numbers whose thread currently owns the instance of that number.
+static CLAIMED: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+
+static OWNER_NOTIFIER: OnceLock<fn(usize)> = OnceLock::new();
+
+/// Releases a scheduler instance when its owning thread exits.
+struct InstanceClaim(usize);
+
+impl Drop for InstanceClaim {
+    fn drop(&mut self) {
+        ALC_IX.with(|ix| ix.set(0));
+        CLAIMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// The kind of thread that registers with the allocator, numbered as erts numbers its schedulers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadKind {
+    /// Normal scheduler `no`, one based. It owns instance `no`.
+    Scheduler(usize),
+    /// Dirty CPU scheduler `no`, one based.
+    DirtyCpu(usize),
+    /// Dirty I/O scheduler `no`, one based.
+    DirtyIo(usize),
+}
+
+/// Why a thread could not be registered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegisterError {
+    /// The calling thread already registered.
+    AlreadyRegistered,
+    /// Scheduler numbers start at one.
+    InvalidNumber,
+    /// Another live thread owns this scheduler instance.
+    InstanceTaken(usize),
+}
+
+/// Binds the calling thread to its allocator instance and returns the instance index.
+///
+/// Port of `erts_alloc_register_scheduler` in erl_alloc.c, OTP-29.1.1: normal scheduler `no` gets
+/// instance `no`. A dirty scheduler gets instance 0 unless dirty allocator instances (`+Mdai`) are
+/// configured; then dirty scheduler `no` of its type gets `schedulers + (no - 1) % dirty + 1`. Every
+/// thread that never registers (aux, async, poll, main, NIF and driver threads) uses instance 0.
+///
+/// A scheduler instance has one owner. A second live thread asking for the same scheduler number
+/// gets [`RegisterError::InstanceTaken`] and keeps using instance 0; the number is free again when
+/// the owner exits.
+pub fn register_thread(kind: ThreadKind) -> Result<usize, RegisterError> {
+    if CLAIM.with(|claim| claim.borrow().is_some()) || ALC_IX.with(Cell::get) != 0 {
+        return Err(RegisterError::AlreadyRegistered);
+    }
+    let (schedulers, dirty) = crate::typed::configured().unwrap_or((0, 0));
+    let (ix, claimed) = match kind {
+        ThreadKind::Scheduler(0) | ThreadKind::DirtyCpu(0) | ThreadKind::DirtyIo(0) => {
+            return Err(RegisterError::InvalidNumber);
+        }
+        ThreadKind::Scheduler(no) => (no, Some(no)),
+        ThreadKind::DirtyCpu(no) | ThreadKind::DirtyIo(no) => (
+            if dirty == 0 {
+                0
+            } else {
+                schedulers + (no - 1) % dirty + 1
+            },
+            None,
+        ),
+    };
+    if let Some(no) = claimed {
+        let mut owners = CLAIMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !owners.insert(no) {
+            return Err(RegisterError::InstanceTaken(no));
+        }
+        CLAIM.with(|claim| *claim.borrow_mut() = Some(InstanceClaim(no)));
+    }
+    ALC_IX.with(|current| current.set(ix));
+    Ok(ix)
+}
+
+/// Installs the callback that wakes the owner of a scheduler instance (once).
+///
+/// Port of `erts_alloc_notify_delayed_dealloc` in erl_alloc.c, OTP-29.1.1. The callback receives
+/// the instance index; returns false when one is already installed.
+pub fn set_owner_notifier(notify: fn(usize)) -> bool {
+    OWNER_NOTIFIER.set(notify).is_ok()
+}
+
+/// Wakes the owner of `instance` so it handles its delayed frees; a no-op until a notifier is set.
+pub fn notify_owner(instance: usize) {
+    if let Some(notify) = OWNER_NOTIFIER.get() {
+        notify(instance);
+    }
 }
 
 struct Instance {
@@ -89,7 +185,6 @@ pub struct ThreadSpecificAllocators {
     /// Cross-thread frees. Lock-free so a foreign free does not take the owner's mutex.
     /// Port of erl_alloc_util.c:2225 (`enqueue_dealloc_other_instance` / `ddq_enqueue`), OTP-29.1.1.
     delayed: Vec<SegQueue<(InstanceAllocation, Allocation)>>,
-    thread_instances: Mutex<HashMap<ThreadId, usize>>,
     /// Owner of blocks whose carrier left the instance named in their handle, by block address.
     routes: Mutex<HashMap<u64, AllocationRoute>>,
     /// Number of `routes` entries; zero lets handles route to their own instance without locking.
@@ -101,7 +196,6 @@ pub struct ThreadSpecificAllocators {
     next_pool_id: Mutex<u64>,
     pool_stats: Mutex<CarrierPoolStats>,
     thread_specific: bool,
-    cache_id: usize,
 }
 
 impl ThreadSpecificAllocators {
@@ -169,7 +263,6 @@ impl ThreadSpecificAllocators {
                 })
                 .collect(),
             delayed: (0..count).map(|_| SegQueue::new()).collect(),
-            thread_instances: Mutex::new(HashMap::default()),
             routes: Mutex::new(HashMap::default()),
             routed: AtomicUsize::new(0),
             carrier_pool: Mutex::new(Vec::new()),
@@ -178,8 +271,12 @@ impl ThreadSpecificAllocators {
             next_pool_id: Mutex::new(1),
             pool_stats: Mutex::new(CarrierPoolStats::default()),
             thread_specific,
-            cache_id: NEXT_INSTANCE_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Number of instances, including the shared instance 0.
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
     }
 
     /// Allocates on the instance assigned to the current thread.
@@ -352,34 +449,17 @@ impl ThreadSpecificAllocators {
             .len()
     }
 
-    /// Returns the allocator instance currently assigned to the calling thread.
+    /// Returns the allocator instance of the calling thread: the one it registered, else 0.
+    ///
+    /// Port of `erts_get_thr_alloc_ix` in erl_alloc.h, OTP-29.1.1. A registered number beyond this
+    /// allocator's instance count also maps to 0.
+    #[inline]
     pub fn current_instance(&self) -> usize {
         if !self.thread_specific {
             return 0;
         }
-        if let Some(instance) = LAST_INSTANCE.with(|cache| {
-            let (cache_id, instance) = cache[self.cache_id % INSTANCE_CACHE_SLOTS].get();
-            (cache_id == self.cache_id).then_some(instance)
-        }) {
-            return instance;
-        }
-        let id = thread::current().id();
-        let mut assignments = self
-            .thread_instances
-            .lock()
-            .expect("thread-instance lock poisoned");
-        if let Some(instance) = assignments.get(&id) {
-            LAST_INSTANCE.with(|cache| {
-                cache[self.cache_id % INSTANCE_CACHE_SLOTS].set((self.cache_id, *instance));
-            });
-            return *instance;
-        }
-        let instance = assignments.len() % self.instances.len();
-        assignments.insert(id, instance);
-        LAST_INSTANCE.with(|cache| {
-            cache[self.cache_id % INSTANCE_CACHE_SLOTS].set((self.cache_id, instance));
-        });
-        instance
+        let ix = ALC_IX.with(Cell::get);
+        if ix < self.instances.len() { ix } else { 0 }
     }
 
     /// Current size of allocated blocks across this allocator's instances.
@@ -722,6 +802,158 @@ impl ThreadSpecificAllocators {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    /// Registration is process wide, so tests that register threads must not overlap.
+    static REGISTRATION: Mutex<()> = Mutex::new(());
+
+    fn registration() -> std::sync::MutexGuard<'static, ()> {
+        REGISTRATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn four_instances() -> Arc<ThreadSpecificAllocators> {
+        Arc::new(ThreadSpecificAllocators::new(
+            4,
+            true,
+            Strategy::AoffCbf,
+            AllocUtilOptions::default(),
+        ))
+    }
+
+    #[test]
+    fn unregistered_threads_use_instance_zero() {
+        let allocators = four_instances();
+        for _ in 0..3 {
+            let worker_allocators = Arc::clone(&allocators);
+            let handle = thread::spawn(move || {
+                let handle = worker_allocators.alloc(24).unwrap();
+                worker_allocators.free(handle).unwrap();
+                handle.instance()
+            })
+            .join()
+            .unwrap();
+            assert_eq!(handle, 0);
+        }
+        assert_eq!(allocators.current_instance(), 0);
+    }
+
+    #[test]
+    fn registered_scheduler_thread_gets_its_own_instance() {
+        let _serial = registration();
+        let allocators = four_instances();
+        for no in [3, 1, 2] {
+            let worker_allocators = Arc::clone(&allocators);
+            let (registered, current, instance) = thread::spawn(move || {
+                let registered = register_thread(ThreadKind::Scheduler(no));
+                let handle = worker_allocators.alloc(24).unwrap();
+                worker_allocators.free(handle).unwrap();
+                (
+                    registered,
+                    worker_allocators.current_instance(),
+                    handle.instance(),
+                )
+            })
+            .join()
+            .unwrap();
+            assert_eq!(registered, Ok(no));
+            assert_eq!(current, no);
+            assert_eq!(instance, no);
+        }
+    }
+
+    #[test]
+    fn scheduler_beyond_instance_count_falls_back_to_zero() {
+        let _serial = registration();
+        let allocators = four_instances();
+        let worker_allocators = Arc::clone(&allocators);
+        let instance = thread::spawn(move || {
+            register_thread(ThreadKind::Scheduler(7)).unwrap();
+            let handle = worker_allocators.alloc(24).unwrap();
+            worker_allocators.free(handle).unwrap();
+            handle.instance()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(instance, 0);
+    }
+
+    #[test]
+    fn duplicate_scheduler_registration_is_rejected() {
+        let _serial = registration();
+        let owner_ready = Arc::new(Barrier::new(2));
+        let second_done = Arc::new(Barrier::new(2));
+        let owner = {
+            let (owner_ready, second_done) = (Arc::clone(&owner_ready), Arc::clone(&second_done));
+            thread::spawn(move || {
+                assert_eq!(register_thread(ThreadKind::Scheduler(2)), Ok(2));
+                assert_eq!(
+                    register_thread(ThreadKind::Scheduler(3)),
+                    Err(RegisterError::AlreadyRegistered)
+                );
+                owner_ready.wait();
+                second_done.wait();
+            })
+        };
+        owner_ready.wait();
+        let second = thread::spawn(|| {
+            let taken = register_thread(ThreadKind::Scheduler(2));
+            let other = register_thread(ThreadKind::Scheduler(3));
+            (taken, other)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(second, (Err(RegisterError::InstanceTaken(2)), Ok(3)));
+        second_done.wait();
+        owner.join().unwrap();
+        let reused = thread::spawn(|| register_thread(ThreadKind::Scheduler(2)))
+            .join()
+            .unwrap();
+        assert_eq!(reused, Ok(2));
+        let zero = thread::spawn(|| register_thread(ThreadKind::Scheduler(0)))
+            .join()
+            .unwrap();
+        assert_eq!(zero, Err(RegisterError::InvalidNumber));
+    }
+
+    #[test]
+    fn dirty_threads_share_instance_zero() {
+        let _serial = registration();
+        let allocators = four_instances();
+        let workers: Vec<_> = [
+            ThreadKind::DirtyCpu(1),
+            ThreadKind::DirtyCpu(2),
+            ThreadKind::DirtyIo(1),
+        ]
+        .into_iter()
+        .map(|kind| {
+            let worker_allocators = Arc::clone(&allocators);
+            thread::spawn(move || {
+                assert_eq!(register_thread(kind), Ok(0));
+                let handle = worker_allocators.alloc(24).unwrap();
+                worker_allocators.free(handle).unwrap();
+                handle.instance()
+            })
+        })
+        .collect();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn owner_notifier_is_called_with_the_instance() {
+        static NOTIFIED: AtomicUsize = AtomicUsize::new(usize::MAX);
+        notify_owner(2);
+        assert_eq!(NOTIFIED.load(Ordering::Relaxed), usize::MAX);
+        assert!(set_owner_notifier(|instance| {
+            NOTIFIED.store(instance, Ordering::Relaxed);
+        }));
+        assert!(!set_owner_notifier(|_| {}));
+        notify_owner(3);
+        assert_eq!(NOTIFIED.load(Ordering::Relaxed), 3);
+    }
 
     #[test]
     fn cross_instance_free_is_delayed_until_owner_drains() {
@@ -731,13 +963,15 @@ mod tests {
             Strategy::AoffCbf,
             AllocUtilOptions::default(),
         ));
+        let _serial = registration();
         let allocation = allocators.alloc(24).unwrap();
         let owner = allocation.instance;
+        assert_eq!(owner, 0);
         let barrier = Arc::new(Barrier::new(2));
         let worker_allocators = Arc::clone(&allocators);
         let worker_barrier = Arc::clone(&barrier);
         let worker = thread::spawn(move || {
-            let _ = worker_allocators.current_instance();
+            assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
             worker_barrier.wait();
             worker_barrier.wait();
             worker_allocators.free(allocation).unwrap();
@@ -761,6 +995,7 @@ mod tests {
 
     #[test]
     fn abandoned_carrier_migrates_and_routes_live_allocations() {
+        let _serial = registration();
         let options = AllocUtilOptions {
             sbct: 32 * 1024 * 1024,
             mmbcs: 4096,
@@ -792,6 +1027,7 @@ mod tests {
 
         let worker_allocators = Arc::clone(&allocators);
         let worker = thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
             assert_eq!(worker_allocators.current_instance(), 1);
             let mut bytes = [0; 17];
             worker_allocators.read(live, 0, &mut bytes).unwrap();

@@ -133,6 +133,7 @@ dependencies = [
 name = "arinsal-cli"
 version = "0.0.1"
 dependencies = [
+ "arinsal-alloc",
  "arinsal-args",
  "arinsal-beam",
  "arinsal-difftest",
@@ -346,6 +347,7 @@ name = "arinsal-sched"
 version = "0.0.1"
 dependencies = [
  "arc-swap",
+ "arinsal-alloc",
  "arinsal-term",
  "crossbeam-deque",
  "crossbeam-epoch",

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arinsal-alloc = { path = "../alloc" }
 arinsal-term.workspace = true
 crossbeam-deque = "0.8.6"
 crossbeam-epoch = "0.9.18"
