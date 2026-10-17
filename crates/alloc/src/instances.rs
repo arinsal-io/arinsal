@@ -3,13 +3,15 @@
 use crate::alloc_util::HashMap;
 use crate::alloc_util::{
     AllocError, AllocUtil, AllocUtilOptions, Allocation, AllocatorInfo, CarrierPoolStats,
-    CarrierTransfer, Strategy,
+    CarrierTransfer, Strategy, set_dyn_sbct,
 };
 use crossbeam_queue::SegQueue;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 thread_local! {
     /// The allocator instance of this thread, shared by every allocator family.
@@ -121,6 +123,73 @@ struct Instance {
     allocator: AllocUtil,
 }
 
+/// A request another thread asks the owner of an instance to run.
+type OwnerRequest = Box<dyn FnOnce(&ThreadSpecificAllocators) + Send>;
+
+/// Delayed frees handled per owner-work pass.
+///
+/// Port of `ERTS_ALCU_DD_OPS_LIM_HIGH` in erl_alloc_util.h, OTP-29.1.1.
+const OWNER_WORK_DD_LIMIT: usize = 20;
+
+/// How long a requester waits for its owner before it asks the owner again.
+const OWNER_WAIT_SLICE: Duration = Duration::from_micros(200);
+
+/// What other threads may read or write about an instance without taking it.
+///
+/// The counters are single-writer mirrors the owner refreshes whenever it releases the instance,
+/// like the size words erts reads in `erts_alcu_foreign_size` (erl_alloc_util.c, OTP-29.1.1); the
+/// threshold is the `sbc_threshold` word `erts_alloc_set_dyn_param` writes.
+struct Shared {
+    blocks_size: AtomicUsize,
+    carriers_size: AtomicUsize,
+    sbct: Arc<AtomicUsize>,
+    strategy: Strategy,
+    requests: SegQueue<OwnerRequest>,
+    work_scheduled: AtomicBool,
+}
+
+/// The lock on an instance; releasing it publishes the counter mirror.
+struct InstanceGuard<'a> {
+    guard: parking_lot::MutexGuard<'a, Instance>,
+    shared: &'a Shared,
+}
+
+impl std::ops::Deref for InstanceGuard<'_> {
+    type Target = Instance;
+
+    #[inline(always)]
+    fn deref(&self) -> &Instance {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for InstanceGuard<'_> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Instance {
+        &mut self.guard
+    }
+}
+
+impl Drop for InstanceGuard<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        let (blocks_size, carriers_size) = self.guard.allocator.size_counters();
+        self.shared
+            .blocks_size
+            .store(blocks_size, Ordering::Relaxed);
+        self.shared
+            .carriers_size
+            .store(carriers_size, Ordering::Relaxed);
+    }
+}
+
+fn owner_is_live(instance: usize) -> bool {
+    CLAIMED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&instance)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 /// A stable allocation handle that follows its block when a carrier migrates.
 pub struct InstanceAllocation {
@@ -185,6 +254,7 @@ pub struct ThreadSpecificAllocators {
     /// Cross-thread frees. Lock-free so a foreign free does not take the owner's mutex.
     /// Port of erl_alloc_util.c:2225 (`enqueue_dealloc_other_instance` / `ddq_enqueue`), OTP-29.1.1.
     delayed: Vec<SegQueue<(InstanceAllocation, Allocation)>>,
+    shared: Vec<Shared>,
     /// Owner of blocks whose carrier left the instance named in their handle, by block address.
     routes: Mutex<HashMap<u64, AllocationRoute>>,
     /// Number of `routes` entries; zero lets handles route to their own instance without locking.
@@ -244,24 +314,43 @@ impl ThreadSpecificAllocators {
         allocation_type: &'static str,
     ) -> Self {
         let count = instance_count.max(1);
+        let allocators: Vec<AllocUtil> = (0..count)
+            .map(|instance| {
+                AllocUtil::new_for_instance(
+                    if thread_specific && instance == 0 {
+                        global_strategy
+                    } else {
+                        strategy
+                    },
+                    options,
+                    allocation_type,
+                    instance,
+                    true,
+                )
+            })
+            .collect();
+        let shared = allocators
+            .iter()
+            .enumerate()
+            .map(|(instance, allocator)| Shared {
+                blocks_size: AtomicUsize::new(0),
+                carriers_size: AtomicUsize::new(0),
+                sbct: allocator.sbct_cell(),
+                strategy: if thread_specific && instance == 0 {
+                    global_strategy
+                } else {
+                    strategy
+                },
+                requests: SegQueue::new(),
+                work_scheduled: AtomicBool::new(false),
+            })
+            .collect();
         Self {
-            instances: (0..count)
-                .map(|instance| {
-                    parking_lot::Mutex::new(Instance {
-                        allocator: AllocUtil::new_for_instance(
-                            if thread_specific && instance == 0 {
-                                global_strategy
-                            } else {
-                                strategy
-                            },
-                            options,
-                            allocation_type,
-                            instance,
-                            true,
-                        ),
-                    })
-                })
+            instances: allocators
+                .into_iter()
+                .map(|allocator| parking_lot::Mutex::new(Instance { allocator }))
                 .collect(),
+            shared,
             delayed: (0..count).map(|_| SegQueue::new()).collect(),
             routes: Mutex::new(HashMap::default()),
             routed: AtomicUsize::new(0),
@@ -394,38 +483,137 @@ impl ThreadSpecificAllocators {
     }
 
     /// Applies a dynamic `sbct` to every instance; true if any instance accepted it.
-    // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_set_dyn_param), OTP-29.1.1.
+    ///
+    /// Port of `erts_alloc_set_dyn_param` in erl_alloc.c, OTP-29.1.1: the calling thread writes the
+    /// threshold word of every instance, no instance is locked and no owner is asked.
     pub fn try_set_dyn_sbct(&self, value: usize) -> bool {
         let mut ok = false;
-        for instance in 0..self.instances.len() {
-            ok |= self
-                .lock_instance(instance)
-                .allocator
-                .try_set_dyn_sbct(value);
+        for shared in &self.shared {
+            ok |= set_dyn_sbct(shared.strategy, &shared.sbct, value);
         }
         ok
     }
 
-    /// Processes delayed frees for every instance.
+    /// Processes delayed frees of the instances no scheduler owns (instance 0 and the dirty
+    /// instances) on the calling thread.
     ///
-    /// Used by `erts_debug:set_internal_state(wait, deallocations)`, which must
-    /// observe blocks a non-owner scheduler already queued.
-    pub fn drain_all_deallocations(&self) -> Result<usize, AllocError> {
+    /// Port of the aux and dirty threads' `erts_alloc_handle_delayed_dealloc` pass in erl_alloc.c,
+    /// OTP-29.1.1. Scheduler instances drain on their owners: see
+    /// [`ThreadSpecificAllocators::drain_deallocations`] and
+    /// [`ThreadSpecificAllocators::handle_owner_work`].
+    pub fn drain_shared_deallocations(&self) -> Result<usize, AllocError> {
+        let schedulers = crate::typed::configured().map_or(0, |(schedulers, _)| schedulers);
         let mut total = 0;
         for instance in 0..self.instances.len() {
-            total += self.drain_deallocations(instance)?;
+            if instance == 0 || instance > schedulers {
+                total += self.drain_deallocations(instance)?;
+            }
         }
         Ok(total)
     }
 
-    /// Processes the delayed-free queue for one instance.
+    /// Processes the delayed-free queue for one instance, on its owner.
+    ///
+    /// Port of `erts_alcu_check_delayed_dealloc` run by the owning scheduler, OTP-29.1.1. A call
+    /// from the owner, or for an instance with no live owner, drains in place; any other thread
+    /// queues the drain on the owner and waits for it.
     pub fn drain_deallocations(&self, instance: usize) -> Result<usize, AllocError> {
+        self.on_owner(instance, move |this, state| {
+            let drained = this.drain_locked(instance, state)?;
+            let count = drained.len();
+            this.clear_routes(drained);
+            this.publish_transfers(instance, state)?;
+            Ok(count)
+        })
+    }
+
+    /// Runs the requests other threads queued for `instance` and up to
+    /// [`OWNER_WORK_DD_LIMIT`] delayed frees; true when more frees remain.
+    ///
+    /// Port of the `ERTS_SSI_AUX_WORK_DD` handler (`erts_alloc_handle_delayed_dealloc`,
+    /// erl_alloc.c) and of `erts_alloc_notify_delayed_dealloc`, OTP-29.1.1: the owner calls this
+    /// from its aux work and is notified again while queued frees remain.
+    pub fn handle_owner_work(&self, instance: usize) -> Result<bool, AllocError> {
+        self.shared[instance]
+            .work_scheduled
+            .store(false, Ordering::Release);
+        self.run_owner_requests(instance);
         let mut state = self.lock_instance(instance);
-        let drained = self.drain_locked(instance, &mut state)?;
-        let count = drained.len();
+        let drained = self.drain_limited(instance, &mut state, OWNER_WORK_DD_LIMIT)?;
         self.clear_routes(drained);
         self.publish_transfers(instance, &mut state)?;
-        Ok(count)
+        drop(state);
+        let more = !self.delayed[instance].is_empty();
+        if more {
+            self.schedule_owner_work(instance);
+        }
+        Ok(more)
+    }
+
+    /// Runs the requests other threads queued for `instance`, without handling delayed frees.
+    pub fn run_owner_requests(&self, instance: usize) {
+        while let Some(request) = self.shared[instance].requests.pop() {
+            request(self);
+        }
+    }
+
+    fn schedule_owner_work(&self, instance: usize) {
+        if !self.shared[instance]
+            .work_scheduled
+            .swap(true, Ordering::AcqRel)
+        {
+            notify_owner(instance);
+        }
+    }
+
+    fn owned_by_other_thread(&self, instance: usize) -> bool {
+        self.thread_specific
+            && instance != 0
+            && self.current_instance() != instance
+            && owner_is_live(instance)
+    }
+
+    /// Runs `work` on `instance` the way erts does: in place when the caller owns it or nobody
+    /// does, else by the owner, which the caller waits for.
+    ///
+    /// Port of `request_alloc_info` / `erts_alloc_info` scheduling in erl_alloc.c, OTP-29.1.1.
+    fn on_owner<R, F>(&self, instance: usize, work: F) -> R
+    where
+        F: FnOnce(&Self, &mut Instance) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        if !self.owned_by_other_thread(instance) {
+            let mut state = self.lock_instance(instance);
+            return work(self, &mut state);
+        }
+        let (reply, answer) = mpsc::channel();
+        self.shared[instance].requests.push(Box::new(move |this| {
+            let mut state = this.lock_instance(instance);
+            let _ = reply.send(work(this, &mut state));
+        }));
+        self.schedule_owner_work(instance);
+        let own = ALC_IX.with(Cell::get);
+        let mut waited = 0u32;
+        loop {
+            match answer.recv_timeout(OWNER_WAIT_SLICE) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("allocator owner request dropped without a result")
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            if own != 0 {
+                crate::typed::run_owner_requests(own);
+            }
+            if !owner_is_live(instance) {
+                self.run_owner_requests(instance);
+            } else {
+                waited += 1;
+                if waited.is_multiple_of(50) {
+                    notify_owner(instance);
+                }
+            }
+        }
     }
 
     /// Returns the number of frees waiting for the instance.
@@ -463,18 +651,23 @@ impl ThreadSpecificAllocators {
     }
 
     /// Current size of allocated blocks across this allocator's instances.
+    ///
+    /// Port of `erts_alcu_foreign_size` (erl_alloc_util.c, OTP-29.1.1), which reads the size
+    /// counters of another thread's instance without a lock: each owner publishes them when it
+    /// releases its instance.
     // Port of erts/emulator/beam/erl_alloc_util.c:5952 (erts_alcu_current_size), OTP-29.1.1.
     pub(crate) fn current_blocks_size(&self) -> usize {
-        self.instances
+        self.shared
             .iter()
-            .enumerate()
-            .map(|(instance, _)| self.lock_instance(instance).allocator.stats().blocks_size)
+            .map(|shared| shared.blocks_size.load(Ordering::Relaxed))
             .sum()
     }
 
     /// Returns allocator information with the shared `{mbcs_pool, ...}` section.
+    ///
+    /// Gathered on the owner of `instance`; see [`ThreadSpecificAllocators::drain_deallocations`].
     pub fn info(&self, instance: usize) -> AllocatorInfo {
-        let mut info = self.lock_instance(instance).allocator.info();
+        let mut info = self.on_owner(instance, |_, state| state.allocator.info());
         if info.options.acul != 0 && info.options.cpool.is_some() {
             info.mbcs_pool = Some(self.carrier_pool_stats());
         }
@@ -504,8 +697,11 @@ impl ThreadSpecificAllocators {
     }
 
     #[inline]
-    fn lock_instance(&self, instance: usize) -> parking_lot::MutexGuard<'_, Instance> {
-        self.instances[instance].lock()
+    fn lock_instance(&self, instance: usize) -> InstanceGuard<'_> {
+        InstanceGuard {
+            guard: self.instances[instance].lock(),
+            shared: &self.shared[instance],
+        }
     }
 
     /// Runs queued cross-thread frees and hands abandoned carriers to the pool.
@@ -785,9 +981,20 @@ impl ThreadSpecificAllocators {
         instance: usize,
         state: &mut Instance,
     ) -> Result<Vec<InstanceAllocation>, AllocError> {
+        self.drain_limited(instance, state, usize::MAX)
+    }
+
+    fn drain_limited(
+        &self,
+        instance: usize,
+        state: &mut Instance,
+        limit: usize,
+    ) -> Result<Vec<InstanceAllocation>, AllocError> {
         let mut drained = Vec::new();
         let queue = &self.delayed[instance];
-        while let Some((handle, allocation)) = queue.pop() {
+        while drained.len() < limit
+            && let Some((handle, allocation)) = queue.pop()
+        {
             if let Err(error) = state.allocator.free(allocation) {
                 queue.push((handle, allocation));
                 return Err(error);
@@ -981,6 +1188,125 @@ mod tests {
         barrier.wait();
         assert_eq!(worker.join().unwrap(), 1);
         assert_eq!(allocators.drain_deallocations(owner).unwrap(), 1);
+    }
+
+    fn within<T: Send + 'static>(
+        timeout: Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver.recv_timeout(timeout).ok()
+    }
+
+    #[test]
+    fn blocks_size_and_dyn_sbct_do_not_lock_instances() {
+        let allocators = four_instances();
+        let live = allocators.alloc(1000).unwrap();
+        let held = [allocators.lock_instance(0), allocators.lock_instance(1)];
+        let worker_allocators = Arc::clone(&allocators);
+        let result = within(Duration::from_secs(2), move || {
+            let size = worker_allocators.current_blocks_size();
+            let accepted = worker_allocators.try_set_dyn_sbct(8192);
+            (size, accepted)
+        });
+        drop(held);
+        let (size, accepted) = result.expect("gathering waited for an instance lock");
+        assert!(size >= 1000, "blocks size {size}");
+        assert!(accepted);
+        allocators.free(live).unwrap();
+        assert_eq!(allocators.current_blocks_size(), 0);
+    }
+
+    #[test]
+    fn dyn_sbct_applies_to_the_next_allocation_of_every_instance() {
+        let allocators = four_instances();
+        let before = allocators.alloc(10_000).unwrap();
+        assert_eq!(allocators.info(0).sbcs.blocks, 0);
+        assert!(!allocators.try_set_dyn_sbct(100));
+        assert!(allocators.try_set_dyn_sbct(8192));
+        let after = allocators.alloc(10_000).unwrap();
+        let info = allocators.info(0);
+        assert_eq!(info.sbcs.blocks, 1);
+        assert_eq!(info.options.sbct, 8192);
+        allocators.free(before).unwrap();
+        allocators.free(after).unwrap();
+    }
+
+    #[test]
+    fn info_and_drain_for_scheduler_instance_run_on_the_owner() {
+        let _serial = registration();
+        let allocators = four_instances();
+        let (ready_sender, ready) = mpsc::channel();
+        let (go_sender, go) = mpsc::channel::<()>();
+        let (stop_sender, stop) = mpsc::channel::<()>();
+        let owner = {
+            let allocators = Arc::clone(&allocators);
+            thread::spawn(move || {
+                assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+                let handles: Vec<_> = (0..3).map(|_| allocators.alloc(24).unwrap()).collect();
+                ready_sender.send(handles).unwrap();
+                go.recv().unwrap();
+                while stop.try_recv().is_err() {
+                    allocators.handle_owner_work(1).unwrap();
+                    thread::sleep(Duration::from_micros(100));
+                }
+            })
+        };
+        let handles = ready.recv().unwrap();
+        let worker_allocators = Arc::clone(&allocators);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let info = worker_allocators.info(1);
+            sender
+                .send((info.instance, info.calls.alloc_calls))
+                .unwrap();
+        });
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(300)).is_err(),
+            "info answered before the owner ran its work"
+        );
+        go_sender.send(()).unwrap();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)), Ok((1, 3)));
+
+        allocators.free(handles[0]).unwrap();
+        allocators.free(handles[1]).unwrap();
+        assert!(allocators.drain_deallocations(1).unwrap() <= 2);
+        assert_eq!(allocators.pending_deallocations(1), 0);
+        stop_sender.send(()).unwrap();
+        owner.join().unwrap();
+        assert_eq!(allocators.info(1).mbcs.blocks, 1);
+        allocators.free(handles[2]).unwrap();
+    }
+
+    #[test]
+    fn owner_work_drains_a_bounded_number_of_frees_and_asks_again() {
+        let _serial = registration();
+        let allocators = four_instances();
+        let (ready_sender, ready) = mpsc::channel();
+        let (done_sender, done) = mpsc::channel::<()>();
+        let owner = {
+            let allocators = Arc::clone(&allocators);
+            thread::spawn(move || {
+                assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+                let handles: Vec<_> = (0..25).map(|_| allocators.alloc(24).unwrap()).collect();
+                ready_sender.send(handles).unwrap();
+                done.recv().unwrap();
+                let first = allocators.handle_owner_work(1).unwrap();
+                let left = allocators.pending_deallocations(1);
+                let second = allocators.handle_owner_work(1).unwrap();
+                (first, left, second, allocators.pending_deallocations(1))
+            })
+        };
+        let handles = ready.recv().unwrap();
+        for handle in handles {
+            allocators.free(handle).unwrap();
+        }
+        assert_eq!(allocators.pending_deallocations(1), 25);
+        done_sender.send(()).unwrap();
+        assert_eq!(owner.join().unwrap(), (true, 5, false, 0));
     }
 
     #[test]

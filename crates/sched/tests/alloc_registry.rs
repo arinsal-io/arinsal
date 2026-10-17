@@ -48,4 +48,24 @@ fn scheduler_threads_own_their_instance() {
         0,
         "an unregistered thread uses instance 0"
     );
+
+    let block = arinsal_alloc::typed::AllocBlock::new(ErtsAlcType::HEAP, 4).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    scheduler.request_aux_work(1, move || {
+        let owned = AllocBlock::new(ErtsAlcType::HEAP, 4).unwrap();
+        sender.send(owned).unwrap();
+    });
+    let owned = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert_eq!(owned.instance(), 2);
+    drop(owned);
+    drop(block);
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        done.send(arinsal_alloc::typed::drain_owned_deallocations(2))
+            .unwrap();
+    });
+    assert!(
+        finished.recv_timeout(Duration::from_secs(30)).is_ok(),
+        "the owner of instance 2 answers a drain request from this thread"
+    );
 }

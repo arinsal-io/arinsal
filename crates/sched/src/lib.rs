@@ -7251,6 +7251,57 @@ fn halting() -> bool {
     HALTING.load(Ordering::Acquire)
 }
 
+type OwnerWaker = Box<dyn Fn() + Send + Sync>;
+
+/// Wakers of the normal schedulers that own an allocator instance, by instance number.
+static ALLOC_OWNER_WAKERS: Mutex<Vec<(usize, OwnerWaker)>> = Mutex::new(Vec::new());
+
+/// Wakes the scheduler owning allocator instance `instance` to run its allocator owner work.
+///
+/// Port of `erts_alloc_notify_delayed_dealloc` (erl_alloc.c), OTP-29.1.1: the owner is woken
+/// through its aux work (`ERTS_SSI_AUX_WORK_DD`).
+fn notify_alloc_owner(instance: usize) {
+    let wakers = ALLOC_OWNER_WAKERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, wake)) = wakers.iter().find(|(owner, _)| *owner == instance) {
+        wake();
+    }
+}
+
+/// Registers a scheduler as the waker of its allocator instance for the life of its thread.
+struct AllocOwnerWaker(usize);
+
+impl AllocOwnerWaker {
+    fn install<T: Task>(inner: &Arc<Inner<T>>, worker: usize) -> Self {
+        let instance = worker + 1;
+        let weak = Arc::downgrade(inner);
+        let wake: OwnerWaker = Box::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.request_aux_work_one(
+                    worker,
+                    Arc::new(move |_| {
+                        arinsal_alloc::typed::handle_owner_work(instance);
+                    }),
+                );
+            }
+        });
+        ALLOC_OWNER_WAKERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((instance, wake));
+        let _ = arinsal_alloc::set_owner_notifier(notify_alloc_owner);
+        Self(instance)
+    }
+}
+
+impl Drop for AllocOwnerWaker {
+    fn drop(&mut self) {
+        ALLOC_OWNER_WAKERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(instance, _)| *instance != self.0);
+    }
+}
+
 fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     inner.sleepers[id]
         .set(thread::current())
@@ -7259,7 +7310,11 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_register_scheduler), OTP-29.1.1:
     // scheduler `no` owns allocator instance `no`. A refused registration leaves the thread on
     // instance 0, which is correct for a second runtime in the same process.
-    let _ = arinsal_alloc::register_thread(arinsal_alloc::ThreadKind::Scheduler(id + 1));
+    let _owner_waker =
+        match arinsal_alloc::register_thread(arinsal_alloc::ThreadKind::Scheduler(id + 1)) {
+            Ok(instance) if instance == id + 1 => Some(AllocOwnerWaker::install(&inner, id)),
+            _ => None,
+        };
     arinsal_term::set_reader_group(id);
     // Port of erts/emulator/beam/erl_process.c:8861 (sched_thread_func registers the
     // scheduler as a managed thread), OTP-29.1.1.
