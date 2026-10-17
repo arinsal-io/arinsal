@@ -543,7 +543,7 @@ fn owner_arcs_are_released_when_unreachable() {
 }
 
 #[test]
-fn shared_writable_owner_is_retained_once_and_then_released() {
+fn sub_binary_of_writable_owner_shares_the_binref_and_owner_is_released() {
     let mut heap = ProcessHeap::with_words(256);
     let writable = TermBuilder::new(&mut heap)
         .writable_binary(&[5; 100], 800, 1_024)
@@ -557,9 +557,9 @@ fn shared_writable_owner_is_retained_once_and_then_released() {
     let mut roots = [writable, sub];
     heap.collect(&mut roots, &mut [], 0).unwrap();
     let binary_info = heap.off_heap_binary_info();
-    assert_eq!(binary_info.len(), 2);
-    assert!(binary_info.iter().all(|entry| entry.2 == 3));
-    assert_eq!(witness.ref_count(), Some(3));
+    assert_eq!(binary_info.len(), 1);
+    assert!(binary_info.iter().all(|entry| entry.2 == 2));
+    assert_eq!(witness.ref_count(), Some(2));
     heap.collect(&mut [], &mut [], 0).unwrap();
     assert_eq!(witness.ref_count(), Some(1));
     assert_eq!(heap.off_heap_count(), 0);
