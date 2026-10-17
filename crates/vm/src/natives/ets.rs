@@ -947,7 +947,26 @@ fn insert_list(
     let shared = registry.shared(tid).map_err(err)?;
     let options = shared.options();
     let items = list(objects).ok_or_else(badarg)?;
-    if state.is_none()
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_check), OTP-29.1.1: the
+    // check pass is a yieldable loop that takes one iteration per object.
+    let checked = match &state {
+        None => 0,
+        Some(EtsInsert::Check(checked)) => *checked,
+        Some(_) => items.len(),
+    };
+    if checked < items.len() {
+        let step = (items.len() - checked).min(loops.max(0) as usize);
+        loops -= step as isize;
+        if checked + step < items.len() {
+            process.cold_mut().ets_insert = Some(EtsInsert::Check(checked + step));
+            bump_reds(process, ctx, isize::MAX);
+            return Err(VmError::Yield);
+        }
+        state = None;
+    }
+    if state
+        .as_ref()
+        .is_none_or(|state| matches!(state, EtsInsert::Check(_)))
         && options.table_type != TableType::Bag
         && options.table_type != TableType::DuplicateBag
         && items.len() as isize <= loops
@@ -963,7 +982,8 @@ fn insert_list(
             table.insert(&items).map_err(err)?;
             true
         };
-        loops -= items.len() as isize;
+        // One iteration of the insert loop and one `consumed_reds` per object.
+        loops -= 2 * items.len() as isize;
         return done(process, ctx, loops, yes);
     }
     // Copy the list into table form so that other processes can help.
@@ -1161,6 +1181,7 @@ fn help_busy_table(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     target: Term,
+    own_list_insert: bool,
 ) -> Result<(), VmError> {
     let Some(rt) = process.runtime.as_ref() else {
         return Ok(());
@@ -1194,6 +1215,11 @@ fn help_busy_table(
             initial - reds
         },
     );
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_continuation), OTP-29.1.1:
+    // the process that started the list insert returns its result as soon as it finishes it.
+    if own_list_insert && reds <= initial {
+        return Ok(());
+    }
     Err(VmError::Yield)
 }
 
@@ -1333,7 +1359,7 @@ fn call_inner(
         && gated_by_busy(function)
         && let Some(&target) = args.first()
     {
-        help_busy_table(process, ctx, target)?;
+        help_busy_table(process, ctx, target, false)?;
     }
     if matches!(
         (function, args.len()),
@@ -2613,7 +2639,14 @@ fn entry_insert(
     let (Some(target), Some(objects)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    if let Err(error) = help_busy_table(process, ctx, target) {
+    let own_list_insert = matches!(
+        process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.ets_insert.as_ref()),
+        Some(EtsInsert::Global(_))
+    );
+    if let Err(error) = help_busy_table(process, ctx, target, own_list_insert) {
         return Some(Err(error));
     }
     let result = {
@@ -2635,7 +2668,14 @@ fn entry_insert_new(
     let (Some(target), Some(objects)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    if let Err(error) = help_busy_table(process, ctx, target) {
+    let own_list_insert = matches!(
+        process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.ets_insert.as_ref()),
+        Some(EtsInsert::Global(_))
+    );
+    if let Err(error) = help_busy_table(process, ctx, target, own_list_insert) {
         return Some(Err(error));
     }
     let result = {
@@ -2657,7 +2697,7 @@ fn entry_lookup(
     let (Some(target), Some(key)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    if let Err(error) = help_busy_table(process, ctx, target) {
+    if let Err(error) = help_busy_table(process, ctx, target, false) {
         return Some(Err(error));
     }
     let result = lookup_args(process, caller_of(ctx), false, target, key);
@@ -2676,7 +2716,7 @@ fn entry_member(
     let (Some(target), Some(key)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    if let Err(error) = help_busy_table(process, ctx, target) {
+    if let Err(error) = help_busy_table(process, ctx, target, false) {
         return Some(Err(error));
     }
     let result = lookup_args(process, caller_of(ctx), true, target, key);

@@ -1702,6 +1702,8 @@ pub(crate) struct EtsFree {
 /// Port of erts/emulator/beam/erl_db.c:2161-2330 (ets_insert_2_list_info), OTP-29.1.1: the state a
 /// list insert keeps across traps.
 pub(crate) enum EtsInsert {
+    /// Objects of the list already seen by the check pass (`ets_insert_2_list_check`).
+    Check(usize),
     /// Objects copied into table form so far, before the table is locked.
     Copy(Vec<arinsal_ets::PreparedObject>),
     /// The remaining objects were handed to the busy table; the result lands in the slot.
