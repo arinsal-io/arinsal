@@ -2,7 +2,11 @@
 
 mod catree;
 mod hash;
+mod hash_select;
 pub mod match_spec;
+pub use hash_select::{
+    HASH_SELECT_ITERATIONS, HashScanEnd, HashScanPlan, IterSafety, SavedMatches,
+};
 pub mod rwmtx;
 mod tree;
 use catree::CATree;

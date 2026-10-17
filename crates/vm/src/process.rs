@@ -2179,6 +2179,7 @@ impl Executor {
                                     // The fragment pushed the native continuation as a CP, so the
                                     // interpreter performs these as tail calls.
                                     let saved_x = process.x.to_vec();
+                                    let collections_before = process.stats.gc.collections;
                                     let result = match target_pc {
                                         arinsal_beamasm::dispatch::CALL_FUN_UNPORTED => {
                                             let arity = usize::from(process.header.arity);
@@ -2342,10 +2343,15 @@ impl Executor {
                                             break Ok(RunState::Wait { timeout_ms: None });
                                         }
                                         Err(VmError::Yield) => {
-                                            for (register, value) in
-                                                process.x.iter_mut().zip(&saved_x)
-                                            {
-                                                *register = *value;
+                                            // A collection the call ran (the epilogue of a
+                                            // yielding BIF that allocated) moved the registers;
+                                            // the copies taken before it are stale.
+                                            if process.stats.gc.collections == collections_before {
+                                                for (register, value) in
+                                                    process.x.iter_mut().zip(&saved_x)
+                                                {
+                                                    *register = *value;
+                                                }
                                             }
                                             process.cold_mut().native_retry = Some(target_pc);
                                             process.native_pc = Some(code_ptr);
@@ -2646,6 +2652,7 @@ impl Executor {
                                 {
                                     let saved_arguments =
                                         process.x[..usize::from(export.arity)].to_vec();
+                                    let collections_before = process.stats.gc.collections;
                                     // BIFs such as load_nif/2 identify their caller through
                                     // `process.module`, which native code does not maintain: the
                                     // caller is the native function holding the return address.
@@ -3024,10 +3031,17 @@ impl Executor {
                                             // waiting for thread progress): the native call is
                                             // redone when the process is scheduled again.
                                             Err(VmError::Yield) => {
-                                                for (register, value) in
-                                                    process.x.iter_mut().zip(&saved_arguments)
+                                                // A collection the call ran (the epilogue of a
+                                                // yielding BIF that allocated) moved the
+                                                // registers; the copies taken before it are stale.
+                                                if process.stats.gc.collections
+                                                    == collections_before
                                                 {
-                                                    *register = *value;
+                                                    for (register, value) in
+                                                        process.x.iter_mut().zip(&saved_arguments)
+                                                    {
+                                                        *register = *value;
+                                                    }
                                                 }
                                                 let cold = process.cold_mut();
                                                 cold.native_retry = Some(target_pc);

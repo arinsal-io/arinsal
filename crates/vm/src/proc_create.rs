@@ -821,6 +821,8 @@ pub(crate) struct ProcessCold {
     pub(crate) ets_free: Option<EtsFree>,
     /// Progress of a trapped list `ets:insert/2` or `ets:insert_new/2`.
     pub(crate) ets_insert: Option<EtsInsert>,
+    /// Progress of a trapped `ets:select/2`, `match/2`, `match_object/2` or `select_count/2`.
+    pub(crate) ets_select: Option<EtsSelect>,
     /// The frame of a tail call that was already released when its callee yielded, so the
     /// re-executed instruction does not release it twice. Its words are GC roots.
     pub(crate) ext_last_released: Option<ReleasedFrame>,
@@ -1716,6 +1718,23 @@ pub(crate) struct EtsFree {
     /// Object count `ets:internal_delete_all/2` returns when done.
     pub(crate) nitems: usize,
     pub(crate) garbage: arinsal_ets::Garbage,
+}
+
+/// Port of erts/emulator/beam/erl_db_hash.c (select_chunk_on_trap and select_count_on_trap),
+/// OTP-29.1.1: the continuation a trapped hash table traversal resumes
+/// from (`ets:select_trap/1` and `ets:count_trap/1`).
+pub(crate) struct EtsSelect {
+    pub(crate) tid: arinsal_ets::Tid,
+    pub(crate) program: std::sync::Arc<arinsal_ets::match_spec::MatchProgram>,
+    /// `select_count/2` instead of a result list.
+    pub(crate) count: bool,
+    /// The next slot to visit.
+    pub(crate) slot: usize,
+    /// Objects counted so far (`select_count/2`).
+    pub(crate) got: usize,
+    /// Results of the earlier cycles.
+    pub(crate) saved: arinsal_ets::SavedMatches,
+    pub(crate) safety: arinsal_ets::IterSafety,
 }
 
 /// Port of erts/emulator/beam/erl_db.c:2161-2330 (ets_insert_2_list_info), OTP-29.1.1: the state a
