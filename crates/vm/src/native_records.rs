@@ -109,6 +109,10 @@ fn stage_roots(
         return None;
     }
     process.x.ensure_x(top);
+    if process.x.is_attached() {
+        process.x[live..base].fill(Term::NIL);
+        return Some(());
+    }
     for (index, slot) in registers.x_reg_array[..top].iter().enumerate() {
         process.x[index] = if (live..base).contains(&index) {
             Term::NIL
@@ -127,6 +131,9 @@ fn publish_roots(
     base: usize,
     top: usize,
 ) {
+    if process.x.is_attached() {
+        return;
+    }
     for index in 0..top {
         if !(live..base).contains(&index) {
             registers.x_reg_array[index] = process.x[index];

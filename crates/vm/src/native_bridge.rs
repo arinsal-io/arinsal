@@ -958,6 +958,27 @@ pub fn run_native(
     registers: &mut SchedulerRegisters,
     code_address: usize,
 ) -> Result<ExitReason, VmError> {
+    if process.x.is_attached() {
+        return run_native_attached(process, registers, code_address);
+    }
+    // A caller outside a scheduler slice (a test driving native code on its own process):
+    // schedule the registers in and out around the entry, like `Executor::run` does.
+    let saved = process.x.saved_arity();
+    // SAFETY: `registers` is borrowed for this whole call and `detach_save` below ends the
+    // attachment before it returns.
+    unsafe { process.x.attach(registers) };
+    let result = run_native_attached(process, registers, code_address);
+    process
+        .x
+        .detach_save(saved.max(usize::from(process.header.arity)));
+    result
+}
+
+fn run_native_attached(
+    process: &mut Process,
+    registers: &mut SchedulerRegisters,
+    code_address: usize,
+) -> Result<ExitReason, VmError> {
     // Debug knobs are environment switches: read once per entry, not at each use.
     let return_trace = crate::native_bridge::return_trace_enabled();
     let exception_trace = crate::native_bridge::exception_trace_enabled();
@@ -1038,17 +1059,6 @@ pub fn run_native(
     process.native_reds_in = process.header.fcalls;
     process.header.i = code_ptr;
     process.header.arity = arity;
-    // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_in_registers), OTP-29.1.1:
-    // only the `c_p->arity` registers the process saved are live. The floor of eight keeps
-    // the x0..x3 an exception handler entry reads and the six registers the native helpers
-    // publish; the file above that is dead and is not copied. The float registers are never
-    // live across a call or a scheduling point, so erts saves none.
-    let count = process.x.len().min(registers.x_reg_array.len());
-    let live_in = live.max(8).min(count);
-    registers.x_reg_array[..live_in].copy_from_slice(&process.x[..live_in]);
-    if crate::xreg_poison_enabled() {
-        registers.x_reg_array[live.min(count)..].fill(crate::XREG_POISON);
-    }
     if let Some(cold) = process.cold.as_mut() {
         cold.native_bif_error = None;
         cold.native_trap = None;
@@ -1093,27 +1103,6 @@ pub fn run_native(
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
     process.reductions = process.header.fcalls;
-    // Port of erts/emulator/beam/erl_process.c (schedule: `copy_out_registers` saves the
-    // `c_p->arity` registers), OTP-29.1.1: a plain yield saves only the registers its site
-    // declared live, which `publish_yield_xregs` copies. Every other exit hands the
-    // scheduler the whole file.
-    let bridge_return = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
-    let plain_yield = matches!(exit, ExitReason::Yield)
-        && process.header.freason == 0
-        && process.header.i as usize != bridge_return
-        && process.cold.as_ref().is_none_or(|cold| {
-            !cold.native_reserve_fetch && !cold.native_signal_fetch && cold.native_wait.is_none()
-        });
-    if !plain_yield {
-        for (destination, raw) in process
-            .x
-            .iter_mut()
-            .take(count)
-            .zip(&registers.x_reg_array[..count])
-        {
-            *destination = *raw;
-        }
-    }
     if return_trace && let Some(function) = native_function_at(code_address) {
         eprintln!(
             "[native-exit] {}:{}/{} pc={code_address:#x} exit={exit:?} x0={:#x} E={:#x} i={:p} stop={:p}",
@@ -1320,10 +1309,6 @@ pub fn run_native(
                 process.native_pc = None;
                 ExitReason::Returned
             } else {
-                // The live arguments are in the native array. The scheduler file may
-                // be shorter than `c_p->arity` when `process.module` is not the
-                // yielding function's module; copying them here is what the save keeps.
-                publish_yield_xregs(process, registers);
                 process.cold_mut().native_continuation_resume = true;
                 // The yield site stored its live X register count in `c_p->arity`.
                 process.cold_mut().native_arity_set = true;
@@ -1346,28 +1331,6 @@ pub fn run_native(
         }
     };
     Ok(outcome)
-}
-
-/// Copies a yielding continuation's live X registers into the process register file.
-///
-/// `i_test_yield` runs at function entry and stores that function's arity in
-/// `c_p->arity`. Registers past the scheduler file (floored at eight, sized from
-/// the interpreter module) exist only in `x_reg_array`. Saving a shorter file
-/// nil-fills the rest, so a resumed call sees `[]` in those argument registers.
-// Port of erts/emulator/beam/jit/arm/instr_common.cpp:3086-3094 (`emit_i_test_yield_shared`
-// stores the MFA arity in `c_p->arity`) and erl_process.c:10415 (`scheduler_gc_proc`
-// roots `p->arity` X registers), OTP-29.1.1.
-fn publish_yield_xregs(process: &mut Process, registers: &SchedulerRegisters) {
-    let live = usize::from(process.header.arity).min(registers.x_reg_array.len());
-    process.x.ensure_x(live);
-    for (destination, raw) in process
-        .x
-        .iter_mut()
-        .take(live)
-        .zip(&registers.x_reg_array[..live])
-    {
-        *destination = *raw;
-    }
 }
 
 #[inline]

@@ -57,7 +57,7 @@ pub extern "C" fn append_binary(
         return raw(term);
     }
     process.x.ensure_x(root_live);
-    process.x[..root_live].copy_from_slice(&registers.x_reg_array[..root_live]);
+    crate::native_hooks::load_x(process, registers, root_live);
     let build = |src: Term, extra: Term| {
         [
             Segment {
@@ -97,12 +97,7 @@ pub extern "C" fn append_binary(
             other => break other,
         }
     };
-    for (slot, term) in registers.x_reg_array[..root_live]
-        .iter_mut()
-        .zip(process.x.iter())
-    {
-        *slot = *term;
-    }
+    crate::native_hooks::store_x(process, registers, root_live);
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     process.sync_native_cursors();
     match result {

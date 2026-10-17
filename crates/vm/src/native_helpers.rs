@@ -602,14 +602,7 @@ fn enter_native_nif(
     // The arguments live in the native X register array, not in `process.x`, when native code
     // reaches the NIF body directly (local or tail call).
     process.x.ensure_x(usize::from(arity));
-    for (destination, raw) in process
-        .x
-        .iter_mut()
-        .zip(registers.x_reg_array.iter().copied())
-        .take(usize::from(arity))
-    {
-        *destination = raw;
-    }
+    crate::native_hooks::load_x(process, registers, usize::from(arity));
 }
 
 /// Returns the result of a native call-NIF body to native code: the result term, a trap to
@@ -1090,8 +1083,10 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     // are roots and move with the collection, so they round-trip through `process.x`.
     let synced = live.clamp(6, registers.x_reg_array.len());
     process.x.ensure_x(synced);
-    for index in 6..synced {
-        process.x[index] = registers.x_reg_array[index];
+    if !process.x.is_attached() {
+        for index in 6..synced {
+            process.x[index] = registers.x_reg_array[index];
+        }
     }
     let result = process.ensure_uncharged(need_words, live);
     if result.is_err() {
@@ -1099,14 +1094,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     }
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     // Only the live prefix moved; X registers past it stay untouched, as in erts.
-    for (destination, term) in registers
-        .x_reg_array
-        .iter_mut()
-        .zip(process.x.iter())
-        .take(live)
-    {
-        *destination = *term;
-    }
+    crate::native_hooks::store_x(process, registers, live);
     process.sync_native_header();
     // Port of erts/emulator/beam/erl_gc.c:588-597 and 975-980 (a delayed collection
     // returns the reductions left), OTP-29.1.1: FCALLS runs out and the process yields at
@@ -3753,14 +3741,7 @@ fn set_call_fun_error(
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
     // The arguments are still in the native X register array.
-    for (destination, raw) in process
-        .x
-        .iter_mut()
-        .zip(registers.x_reg_array.iter().copied())
-        .take(arity)
-    {
-        *destination = raw;
-    }
+    crate::native_hooks::load_x(process, registers, arity);
     process.x[arity] = fun;
     match crate::funs::call_error_reason(process, fun, arity) {
         Ok(reason) => {
@@ -3774,28 +3755,14 @@ fn set_call_fun_error(
 
 /// Loads the argument registers a dispatch path works on through `process.x`.
 fn load_dispatch_x(process: &mut crate::Process, registers: &arinsal_beamasm::SchedulerRegisters) {
-    for (destination, raw) in process
-        .x
-        .iter_mut()
-        .zip(registers.x_reg_array.iter().copied())
-        .take(6)
-    {
-        *destination = raw;
-    }
+    crate::native_hooks::load_x(process, registers, 6);
 }
 
 fn publish_dispatch_x(
     process: &crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
 ) {
-    for (destination, term) in registers
-        .x_reg_array
-        .iter_mut()
-        .zip(process.x.iter())
-        .take(6)
-    {
-        *destination = *term;
-    }
+    crate::native_hooks::store_x(process, registers, 6);
 }
 
 /// Records a native BIF failure so the scheduler raises it with the BIF as the top frame.
@@ -4011,7 +3978,9 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         // the next native exit as a continuation resume.
         cold.native_continuation_resume = false;
     }
-    registers.x_reg_array[..4].copy_from_slice(&process.x[..4]);
+    if !process.x.is_attached() {
+        registers.x_reg_array[..4].copy_from_slice(&process.x[..4]);
+    }
     handler
 }
 
@@ -4548,14 +4517,7 @@ pub extern "C" fn arinsal_beamasm_map_get(
         crate::native_hooks::from_raw(map),
         crate::native_hooks::from_raw(key),
     );
-    for (destination, term) in registers
-        .x_reg_array
-        .iter_mut()
-        .zip(process.x.iter())
-        .take(6)
-    {
-        *destination = *term;
-    }
+    crate::native_hooks::store_x(process, registers, 6);
     process.sync_native_header();
     match result {
         Ok(Some(value)) => crate::native_hooks::raw(value),
@@ -4660,13 +4622,17 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         return 0;
     }
     process.x.ensure_x(root_live);
-    for (index, slot) in registers.x_reg_array[..root_live].iter().enumerate() {
+    if process.x.is_attached() {
         // Dead X registers below the staged segments must not become GC roots.
-        process.x[index] = if (live..base_slot).contains(&index) {
-            Term::NIL
-        } else {
-            *slot
-        };
+        process.x[live..base_slot].fill(Term::NIL);
+    } else {
+        for (index, slot) in registers.x_reg_array[..root_live].iter().enumerate() {
+            process.x[index] = if (live..base_slot).contains(&index) {
+                Term::NIL
+            } else {
+                *slot
+            };
+        }
     }
     let all = crate::signals::atom("all");
     let parse = |process: &crate::Process| -> Option<Vec<Segment<'static>>> {
@@ -4762,12 +4728,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
             other => break other,
         }
     };
-    for (slot, term) in registers.x_reg_array[..root_live]
-        .iter_mut()
-        .zip(process.x.iter())
-    {
-        *slot = *term;
-    }
+    crate::native_hooks::store_x(process, registers, root_live);
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     if result.is_ok() {
         process.reductions = process
@@ -4863,9 +4824,7 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
     // The X registers below `base` and the staged operands (the context among them) are the
     // roots of a collection; the staged copies follow the registers in `process.x`.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp (emit_gc_test_preserve), OTP-29.1.1.
-    for (index, slot) in registers.x_reg_array[..base].iter().enumerate() {
-        process.x[index] = *slot;
-    }
+    crate::native_hooks::load_x(process, registers, base);
     for (index, slot) in registers.match_staging.iter().enumerate() {
         process.x[base + index] = crate::native_hooks::from_raw(*slot);
     }
@@ -4948,12 +4907,7 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
             }
         }
     }
-    for (slot, term) in registers.x_reg_array[..base]
-        .iter_mut()
-        .zip(process.x.iter())
-    {
-        *slot = *term;
-    }
+    crate::native_hooks::store_x(process, registers, base);
     for (index, slot) in registers.match_staging.iter_mut().enumerate() {
         *slot = crate::native_hooks::raw(process.x[base + index]);
     }

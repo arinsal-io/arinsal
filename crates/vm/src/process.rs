@@ -1160,7 +1160,6 @@ struct Executor {
     /// The scheduler thread's hub is bound to `current_process`.
     hub_bound: bool,
     vm: Vm,
-    x: crate::proc_create::ArgRegs,
     fr: Box<[f64]>,
     /// Native register backing is scheduler-local, as required by x19.
     native_registers: SchedulerRegisters,
@@ -1349,17 +1348,13 @@ impl Executor {
         {
             process.native_pc = Some(start);
         }
-        let (mut need_x, need_fr) = self.vm.code.registers[process.module];
-        if crate::beamasm_integration::enabled() {
-            // A switched-out process's live X count is `c_p->arity`
-            // (`header.arity`), independent of the interpreter module whose
-            // register count sized this file. Reading the cold box here
-            // was a cache miss on every schedule-in.
-            need_x = need_x
-                .max(8)
-                .max(usize::from(process.header.arity).saturating_add(1));
+        let (need_x, need_fr) = self.vm.code.registers[process.module];
+        if need_x > crate::proc_create::ATTACHED_X_REGS {
+            return Err(VmError::Unsupported(format!(
+                "module needs {need_x} X registers, the scheduler array has {}",
+                crate::proc_create::ATTACHED_X_REGS
+            )));
         }
-        self.x.ensure_x(need_x);
         if self.fr.len() < need_fr {
             let mut registers = self.fr.to_vec();
             registers.resize(need_fr, 0.0);
@@ -1367,25 +1362,23 @@ impl Executor {
         }
         // The scheduler owns the register file during execution. A suspended
         // process retains only the values needed to resume.
-        std::mem::swap(&mut process.x, &mut self.x);
         std::mem::swap(&mut process.fr, &mut self.fr);
-        let saved_len = self.x.len();
-        process.x.ensure_x(saved_len);
-        process.x[..saved_len].copy_from_slice(&self.x);
-        // The tail still holds the previous run's registers on this executor; those are
-        // pointers into another process's heap and must not reach this process's GC roots.
-        let dead_fill = if crate::xreg_poison_enabled() {
-            crate::XREG_POISON
-        } else {
-            Term::NIL
-        };
-        process.x[saved_len..].fill(dead_fill);
         if process.fr.len() < self.fr.len() {
             let mut registers = process.fr.to_vec();
             registers.resize(self.fr.len(), 0.0);
             process.fr = registers.into_boxed_slice();
         }
         process.fr[..self.fr.len()].copy_from_slice(&self.fr);
+        // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_in_registers) and
+        // erl_process.c (erts_schedule), OTP-29.1.1: the scheduler's one X register array is
+        // the process's file for the slice, loaded with the `c_p->arity` saved registers.
+        let saved_len = process.x.saved_arity();
+        // SAFETY: `self.native_registers` lives in this boxed `Executor`, which is not moved
+        // or dropped during the call, and the epilogue below detaches before `run` returns.
+        unsafe { process.x.attach(&mut self.native_registers) };
+        if crate::xreg_poison_enabled() {
+            process.x[saved_len..].fill(crate::XREG_POISON);
+        }
         let result = (|| -> Result<RunState, VmError> {
             'execution: {
                 // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1.
@@ -1919,17 +1912,6 @@ impl Executor {
                                         process.heap.release_stack(1);
                                     }
                                     let live = usize::from(live);
-                                    let width =
-                                        live.max(6).min(self.native_registers.x_reg_array.len());
-                                    process.x.ensure_x(width);
-                                    for (destination, raw) in process
-                                        .x
-                                        .iter_mut()
-                                        .zip(self.native_registers.x_reg_array.iter().copied())
-                                        .take(live)
-                                    {
-                                        *destination = raw;
-                                    }
                                     let handler =
                                         self.vm.load_named("erts_internal").is_ok_and(|id| {
                                             self.vm.code.modules[id].functions.iter().any(
@@ -2054,19 +2036,10 @@ impl Executor {
                                     }) {
                                         process.heap.release_stack(1);
                                     }
-                                    // The trace callbacks read every argument, including those
-                                    // above the X registers synced on exit.
+                                    // The trace callbacks read every argument from the scheduler
+                                    // array, which is the process's X file.
                                     let arity = usize::from(function.arity)
                                         .min(self.native_registers.x_reg_array.len());
-                                    process.x.ensure_x(arity);
-                                    for (destination, raw) in process
-                                        .x
-                                        .iter_mut()
-                                        .zip(self.native_registers.x_reg_array.iter().copied())
-                                        .take(arity)
-                                    {
-                                        *destination = raw;
-                                    }
                                     let actions = crate::trace::executor_native_call_event(
                                         &mut self.vm,
                                         process,
@@ -3348,7 +3321,6 @@ impl Executor {
             }
             other => other,
         };
-        std::mem::swap(&mut process.x, &mut self.x);
         std::mem::swap(&mut process.fr, &mut self.fr);
         if matches!(
             result,
@@ -3387,21 +3359,16 @@ impl Executor {
             };
             if crate::native_bridge::return_trace_enabled() && process.native_pc.is_some() {
                 eprintln!(
-                    "[sched-save-native] live_x={live_x} x_len={} x0={:#x} module={} native_pc={:?}",
-                    self.x.len(),
-                    self.x.first().map_or(0, |term| term.tagged_word()),
+                    "[sched-save-native] live_x={live_x} x0={:#x} module={} native_pc={:?}",
+                    process.x[0].tagged_word(),
                     self.vm.code.modules[process.module].name,
                     process.native_pc
                 );
             }
-            // Port of erts/emulator/beam/erl_process.h (`def_arg_reg`): up to six saved X
-            // registers stay inline in the process, so switching out allocates nothing.
-            if process.x.len() != save_x {
-                process.x = crate::proc_create::ArgRegs::new(save_x);
-            }
-            let copy_x = self.x.len().min(save_x);
-            process.x[..copy_x].copy_from_slice(&self.x[..copy_x]);
-            process.x[copy_x..].fill(Term::NIL);
+            // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_out_registers),
+            // OTP-29.1.1: the `c_p->arity` registers go from the scheduler array into the
+            // process, six of them inline (`def_arg_reg`) so switching out allocates nothing.
+            process.x.detach_save(save_x);
             if process.fr.len() != live_fr {
                 process.fr = vec![0.0; live_fr].into_boxed_slice();
             }
@@ -3412,6 +3379,7 @@ impl Executor {
                 process.fr[..copy_fr].copy_from_slice(&self.fr[..copy_fr]);
             }
         } else {
+            process.x.detach_save(0);
             process.x = crate::proc_create::ArgRegs::empty();
             process.fr = Box::new([]);
         }
@@ -6868,7 +6836,6 @@ fn new_executor(runtime: &Arc<Runtime>) -> Box<Executor> {
         current_process: Default::default(),
         hub_bound: false,
         vm: Vm::shared_replica(runtime.code_scope, &runtime.paths),
-        x: crate::proc_create::ArgRegs::empty(),
         fr: Box::new([]),
         native_registers: SchedulerRegisters::default(),
     })

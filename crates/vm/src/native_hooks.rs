@@ -83,15 +83,42 @@ pub(crate) fn process_and_registers<'a>(
     header: *mut ProcessHeader,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
     let (process, registers) = enter_runtime(header)?;
+    load_x(process, registers, NATIVE_X);
+    Some((process, registers))
+}
+
+/// `reg[0..n)` into `process.x`, for a process whose X file is its own saved storage (a
+/// helper driven outside a scheduler slice). While the scheduler array is attached it already
+/// is `process.x`, so nothing is copied.
+#[inline]
+pub(crate) fn load_x(process: &mut Process, registers: &SchedulerRegisters, n: usize) {
+    if process.x.is_attached() {
+        return;
+    }
     for (destination, raw) in process
         .x
         .iter_mut()
-        .take(NATIVE_X)
-        .zip(&registers.x_reg_array)
+        .take(n)
+        .zip(registers.x_reg_array.iter())
     {
         *destination = *raw;
     }
-    Some((process, registers))
+}
+
+/// `process.x[0..n)` into `reg`, the counterpart of [`load_x`].
+#[inline]
+pub(crate) fn store_x(process: &Process, registers: &mut SchedulerRegisters, n: usize) {
+    if process.x.is_attached() {
+        return;
+    }
+    for (destination, term) in registers
+        .x_reg_array
+        .iter_mut()
+        .zip(process.x.iter())
+        .take(n)
+    {
+        *destination = *term;
+    }
 }
 
 /// The process and scheduler registers of a helper called from native code, with the heap
@@ -179,14 +206,7 @@ pub(crate) fn x_reg(process: &mut Process, index: usize) -> Option<Term> {
 }
 
 fn publish_x(process: &Process, registers: &mut SchedulerRegisters) {
-    for (destination, term) in registers
-        .x_reg_array
-        .iter_mut()
-        .zip(process.x.iter())
-        .take(NATIVE_X)
-    {
-        *destination = *term;
-    }
+    store_x(process, registers, NATIVE_X);
 }
 
 pub(crate) fn set_error(process: &mut Process, name: &str) {
@@ -706,18 +726,9 @@ pub(crate) fn collect_native(
     // ones; dead registers may hold stale words (erts_garbage_collect_nobump, OTP-29.1.1).
     let roots = live.min(registers.x_reg_array.len());
     process.x.ensure_x(roots);
-    for (destination, raw) in process.x.iter_mut().take(roots).zip(&registers.x_reg_array) {
-        *destination = *raw;
-    }
+    load_x(process, registers, roots);
     let result = ensure_native_frame(process, registers, need_words, live);
-    for (destination, term) in registers
-        .x_reg_array
-        .iter_mut()
-        .zip(process.x.iter())
-        .take(roots)
-    {
-        *destination = *term;
-    }
+    store_x(process, registers, roots);
     result
 }
 
