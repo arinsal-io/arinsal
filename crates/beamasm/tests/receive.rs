@@ -88,6 +88,8 @@ extern "C" fn timeout(process: *mut ProcessHeader) {
 
 fn run(module: &FinalizedModule, label: u32, header: &mut ProcessHeader) -> ExitReason {
     let mut regs = SchedulerRegisters::default();
+    let mut stack = [0u64; 64];
+    header.stop = stack.as_mut_ptr().wrapping_add(stack.len());
     enter_native(
         header,
         &mut regs,
@@ -100,8 +102,10 @@ fn run(module: &FinalizedModule, label: u32, header: &mut ProcessHeader) -> Exit
 fn native_first_message() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_i_loop_rec(2, hooks()).unwrap();
     asm.emit_remove_message(hooks()).unwrap();
+    asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
@@ -123,11 +127,13 @@ fn native_first_message() {
 fn native_skip_then_match() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(10).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_i_loop_rec(11, hooks()).unwrap();
     asm.emit_loop_rec_end(12, hooks()).unwrap();
     asm.emit_i_func_label(12).unwrap();
     asm.emit_i_loop_rec(13, hooks()).unwrap();
     asm.emit_remove_message(hooks()).unwrap();
+    asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
@@ -152,8 +158,10 @@ fn native_skip_then_match() {
 fn native_wait_suspends_and_resumes() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(20).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_i_loop_rec(21, hooks()).unwrap();
     asm.emit_remove_message(hooks()).unwrap();
+    asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
@@ -179,9 +187,11 @@ fn native_wait_suspends_and_resumes() {
 fn native_after_zero_timeout() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(30).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_wait_timeout_locked(ArgVal::Immediate(0), 31, hooks())
         .unwrap();
     asm.emit_timeout(hooks()).unwrap();
+    asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
@@ -202,6 +212,7 @@ fn native_after_zero_timeout() {
 fn native_recv_marker() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(40).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_recv_marker_reserve(ArgVal::X(0), hooks()).unwrap();
     asm.emit_recv_marker_bind(ArgVal::X(0), ArgVal::Immediate(7), hooks())
         .unwrap();
@@ -209,6 +220,7 @@ fn native_recv_marker() {
         .unwrap();
     asm.emit_recv_marker_use(ArgVal::Immediate(7), hooks())
         .unwrap();
+    asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
