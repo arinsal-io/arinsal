@@ -6,9 +6,10 @@ use arinsal_a64::{
     exec::{CodeMemory, ExecError},
 };
 
-use crate::{Update, emit_enter_runtime, rt::arinsal_enter_native_yield};
+use crate::{Update, emit_enter_runtime, rt::arinsal_enter_native_return};
 
 const C_P: Gpr = Gpr::x(21);
+const SCHEDULER_REGS: Gpr = Gpr::x(19);
 const ARG2: Gpr = Gpr::x(1);
 const ARG3: Gpr = Gpr::x(2);
 const TMP2: Gpr = Gpr::x(9);
@@ -78,7 +79,9 @@ impl YieldFragments {
         )
         .map_err(fail)?;
         code.emit(|e| {
-            e.mov_const(Gpr::x(30), arinsal_enter_native_yield as *const () as u64)?;
+            e.mov_const(Gpr::x(0), 1)?;
+            e.str_uoff(Gpr::x(0), SCHEDULER_REGS, 16_408)?;
+            e.mov_const(Gpr::x(30), arinsal_enter_native_return as *const () as u64)?;
             e.ret(Gpr::x(30))
         })
         .map_err(fail)?;
