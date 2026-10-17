@@ -24,6 +24,36 @@ l_append(0, _) -> ok;
 l_append(I, B) -> _ = <<B/binary, 7>>, l_append(I - 1, B).
 l_format(0) -> ok;
 l_format(I) -> _ = io_lib:format("~w ~s", [I, "x"]), l_format(I - 1).
+l_gc(0, L) -> L;
+l_gc(I, L) -> l_gc(I - 1, [I, {I, I}, [I] | lists:sublist(L, 50)]).
+l_try(0) -> ok;
+l_try(I) -> try error(boom) catch error:boom -> ok end, l_try(I - 1).
+l_big(0, _) -> ok;
+l_big(I, B) -> _ = B * B + 1, l_big(I - 1, B).
+l_bs_int(0, _) -> ok;
+l_bs_int(I, Bin) -> <<X:200, _/binary>> = Bin, _ = X, l_bs_int(I - 1, Bin).
+l_priv(0, Acc) -> Acc;
+l_priv(I, Acc) -> l_priv(I - 1, <<Acc/binary, I:8>>).
+l_map_new(0) -> ok;
+l_map_new(I) -> _ = #{a => I, b => I, c => I}, l_map_new(I - 1).
+l_fun(0, _) -> ok;
+l_fun(I, F) -> _ = F(I), l_fun(I - 1, F).
+l_rev(0, _) -> ok;
+l_rev(I, L) -> _ = lists:reverse(L), l_rev(I - 1, L).
+l_mem(0, _) -> ok;
+l_mem(I, L) -> _ = lists:member(0, L), l_mem(I - 1, L).
+l_len(0, _) -> ok;
+l_len(I, L) -> _ = length(L), l_len(I - 1, L).
+l_lg(0, _) -> ok;
+l_lg(I, L) when length(L) > 3 -> l_lg(I - 1, L).
+l_app(0, _) -> ok;
+l_app(I, L) -> _ = L ++ [1], l_app(I - 1, L).
+l_bigcat(0, _) -> ok;
+l_bigcat(I, B) -> _ = <<B/binary, B/binary>>, l_bigcat(I - 1, B).
+l_bigmatch(0, _) -> ok;
+l_bigmatch(I, B) -> <<_:8, R/binary>> = B, _ = R, l_bigmatch(I - 1, B).
+l_bigcopy(0, _) -> ok;
+l_bigcopy(I, B) -> _ = binary:copy(B), l_bigcopy(I - 1, B).
 cases() ->
     M = id(#{a => 1, b => 2}),
     A = id(<<"abc">>),
@@ -36,6 +66,21 @@ cases() ->
      {map_update_exact_one, fun() -> l_upd_one(20000, M) end},
      {binary_concat, fun() -> l_cat(20000, A, B) end},
      {binary_append, fun() -> l_append(20000, A) end},
+     {gc_heavy, fun() -> l_gc(20000, []) end},
+     {try_catch, fun() -> l_try(20000) end},
+     {bignum_arith, fun() -> l_big(20000, id(1 bsl 100)) end},
+     {bs_get_big_int, fun() -> l_bs_int(20000, id(binary:copy(<<255>>, 40))) end},
+     {private_append, fun() -> l_priv(20000, <<>>) end},
+     {map_new, fun() -> l_map_new(20000) end},
+     {fun_call, fun() -> l_fun(20000, fun(X) -> X + 1 end) end},
+     {lists_reverse, fun() -> l_rev(20000, lists:seq(1, 20)) end},
+     {lists_member, fun() -> l_mem(20000, lists:seq(1, 20)) end},
+     {length_bif, fun() -> l_len(20000, lists:seq(1, 20)) end},
+     {length_guard, fun() -> l_lg(20000, lists:seq(1, 100)) end},
+     {list_append, fun() -> l_app(20000, lists:seq(1, 20)) end},
+     {big_binary_concat, fun() -> l_bigcat(20000, binary:copy(<<7>>, 20000)) end},
+     {big_binary_match, fun() -> l_bigmatch(20000, binary:copy(<<7>>, 20000)) end},
+     {big_binary_copy, fun() -> l_bigcopy(20000, binary:copy(<<7>>, 20000)) end},
      {io_lib_format, fun() -> l_format(2000) end}].
 observe({Name, Fun}) ->
     Parent = self(),
