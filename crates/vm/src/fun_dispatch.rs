@@ -60,7 +60,7 @@ pub(crate) extern "C" fn arinsal_beamasm_save_calls_fun(
     header: *mut ProcessHeader,
     fun_raw: u64,
 ) -> usize {
-    let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) else {
+    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
         return arinsal_term::beam_unloaded_fun();
     };
     let active = process.runtime.as_ref().map_or(0, |runtime| {

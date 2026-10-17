@@ -6,7 +6,7 @@
 //! key/value operands in the scheduler X register array, sorted by field name like the loader's
 //! `map_key_sort`, and these helpers merge them with the definition's keys in atom-index order.
 
-use crate::{Process, native_hooks, native_hooks::process_and_registers};
+use crate::{Process, native_hooks, native_hooks::enter_runtime};
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_term::{Atom, Term, TermBuilder, global_atoms, term_sequence};
 
@@ -139,7 +139,7 @@ fn create(
     base: u64,
     external: bool,
 ) -> u64 {
-    let Some((process, registers)) = process_and_registers(header) else {
+    let Some((process, registers)) = enter_runtime(header) else {
         return 0;
     };
     process.reductions = process.header.fcalls;
@@ -255,7 +255,7 @@ pub extern "C" fn arinsal_beamasm_update_record(
     count: u64,
     base: u64,
 ) -> u64 {
-    let Some((process, registers)) = process_and_registers(header) else {
+    let Some((process, registers)) = enter_runtime(header) else {
         return 0;
     };
     process.reductions = process.header.fcalls;
@@ -335,7 +335,7 @@ pub extern "C" fn arinsal_beamasm_get_record_elements(
     count: u64,
     base: u64,
 ) -> u64 {
-    let Some((process, registers)) = process_and_registers(header) else {
+    let Some((process, registers)) = enter_runtime(header) else {
         return 0;
     };
     let (Ok(count), Ok(base)) = (usize::try_from(count), usize::try_from(base)) else {
@@ -371,7 +371,7 @@ fn get_field(
     raise: u64,
     local: bool,
 ) -> u64 {
-    let Some((process, _)) = process_and_registers(header) else {
+    let Some((process, _)) = enter_runtime(header) else {
         return 0;
     };
     let source = native_hooks::from_raw(source);
