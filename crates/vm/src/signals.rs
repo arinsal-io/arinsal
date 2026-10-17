@@ -112,7 +112,7 @@ pub(crate) extern "C" fn whereis_light(
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
     };
-    let Some(arg) = crate::native_hooks::x_reg(process, 0) else {
+    let Some(arg) = process.x.first().copied() else {
         return 0;
     };
     // The error returns `THE_NON_VALUE` from a cold function. Building that
@@ -210,7 +210,7 @@ pub(crate) extern "C" fn is_process_alive_light(
         return 0;
     };
     let self_pid = process.header.self_pid;
-    let Some(arg) = crate::native_hooks::x_reg(process, 0) else {
+    let Some(arg) = process.x.first().copied() else {
         return 0;
     };
     if self_pid != 0 && arg.tagged_word() == self_pid {
