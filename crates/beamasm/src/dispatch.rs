@@ -15,7 +15,10 @@ const RUNTIME_UPDATE: Update = Update::HEAP_ALLOC
     .union(Update::STACK)
     .union(Update::REDUCTIONS)
     .union(Update::X_REGS);
+const LIGHT_BIF_UPDATE: Update = RUNTIME_UPDATE.union(Update::X_REGS_BY_LIVE);
 const THE_NON_VALUE: u16 = 0;
+/// Port of erts/emulator/beam/erl_vm.h, OTP-29.1.1: maximum arity of a BIF written in C.
+const MAX_BIF_ARITY: usize = 4;
 pub(crate) const TRAP_REASON: u16 = 1 << 10;
 
 /// Executable fragments shared by every compiled module in one VM process.
@@ -1049,7 +1052,7 @@ fn emit_call_light_bif_shared(
         encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
         Ok(())
     })?;
-    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    emit_enter_runtime(code, MAX_BIF_ARITY, LIGHT_BIF_UPDATE)?;
     let helper_call = code.new_label();
     let after_bif = code.new_label();
     code.emit(|encoder| {
@@ -1073,26 +1076,13 @@ fn emit_call_light_bif_shared(
         // helper path loads; the BIF does not look the export up.
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
-        encoder.ldr_uoff(Gpr::x(2), Gpr::x(19), 16_432)?;
+        encoder.mov_reg(Gpr::x(2), Gpr::x(3))?;
         encoder.ldr_uoff(Gpr::x(3), Gpr::x(4), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.blr(Gpr::x(8))
     })?;
-    code.b(after_bif)?;
-    code.bind(helper_call)?;
-    code.emit(|encoder| {
-        // x0 = c_p, x1 = export, x2 = export (site; breakpoints use a real one),
-        // x3 = the export's descriptor word.
-        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        encoder.mov_reg(Gpr::x(1), Gpr::x(4))?;
-        encoder.mov_reg(Gpr::x(2), Gpr::x(4))?;
-        encoder.ldr_uoff(Gpr::x(3), Gpr::x(4), crate::bif::EXPORT_INFO_OFFSET)?;
-        encoder.mov_const(Gpr::x(17), helper as u64)?;
-        encoder.blr(Gpr::x(17))
-    })?;
     code.bind(after_bif)?;
-    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
-    code.emit(|encoder| encoder.cmp_imm(Gpr::x(0), THE_NON_VALUE, false))?;
-    code.b_cond(Cond::Ne, success)?;
+    emit_leave_runtime(code, MAX_BIF_ARITY, LIGHT_BIF_UPDATE)?;
+    code.cbnz(Gpr::x(0), success)?;
     code.bind(not_value)?;
     code.emit(|encoder| {
         encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)?;
@@ -1188,7 +1178,7 @@ fn emit_call_light_bif_shared(
             encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 0)?;
             encoder.str_uoff(Gpr::x(9), Gpr::x(19), frame_pointer_slot)
         })?;
-        emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+        emit_enter_runtime(code, MAX_BIF_ARITY, LIGHT_BIF_UPDATE)?;
         code.emit(|encoder| {
             encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
             encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
@@ -1198,11 +1188,23 @@ fn emit_call_light_bif_shared(
             encoder.mov_const(Gpr::x(17), gc_helper as u64)?;
             encoder.blr(Gpr::x(17))
         })?;
-        emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+        emit_leave_runtime(code, MAX_BIF_ARITY, LIGHT_BIF_UPDATE)?;
         code.emit(|encoder| encoder.cmp_imm(Gpr::x(0), THE_NON_VALUE, false))?;
         code.b_cond(Cond::Eq, not_value)?;
         code.b(store)?;
     }
+    code.bind(helper_call)?;
+    code.emit(|encoder| {
+        // x0 = c_p, x1 = export, x2 = export (site; breakpoints use a real one),
+        // x3 = the export's descriptor word.
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(4))?;
+        encoder.mov_reg(Gpr::x(2), Gpr::x(4))?;
+        encoder.ldr_uoff(Gpr::x(3), Gpr::x(4), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.mov_const(Gpr::x(17), helper as u64)?;
+        encoder.blr(Gpr::x(17))
+    })?;
+    code.b(after_bif)?;
     code.bind(trap)?;
     code.emit(|encoder| {
         // The bl that entered this fragment left the continuation in x30, saved in the
