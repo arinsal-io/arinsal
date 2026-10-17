@@ -216,7 +216,7 @@ impl BeamModuleAssembler {
         self.code.bind(trampoline)?;
         if num_free != 0 {
             self.code.emit(|e| {
-                e.and_imm(Gpr::x(9), Gpr::x(4), !7)?;
+                e.and_imm(Gpr::x(9), Gpr::x(3), !7)?;
                 e.add_imm(Gpr::x(9), Gpr::x(9), 16, false)
             })?;
             let start = usize::from(total_arity - num_free);
@@ -300,7 +300,7 @@ impl BeamModuleAssembler {
         deallocate: u32,
     ) -> Result<(), ModuleError> {
         let source = self.source_reg(func)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(4), source))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(3), source))?;
         match tag {
             FunCallTag::Lambda(id) => {
                 let trampoline = self.lambda_label(id);
@@ -325,10 +325,12 @@ impl BeamModuleAssembler {
         }
     }
 
-    /// Calls the fun in x4 whose expected header bits (`FUN_SUBTAG` and arity) are in x2.
-    /// `skip_header_test` is the `safe` tag; otherwise a non-fun or a fun of another arity
-    /// lands in the module's `call_fun` error handler through the same call instruction.
-    /// Local and export funs are called alike: their entry starts with its dispatch addresses.
+    /// Calls the fun in ARG4 (x3) whose expected header bits (`FUN_SUBTAG` and arity) are in
+    /// ARG3 (x2). `skip_header_test` is the `safe` tag; otherwise a non-fun or a fun of another
+    /// arity lands in the module's `call_fun` error handler through the same call instruction.
+    /// The entry (an `ErlFunEntry` or an `Export`) is loaded into ARG1 (x0) and its address for
+    /// the active code index into TMP1 (x8), so the code, the export trampoline, the
+    /// `unloaded_fun` and the `save_calls_fun` fragments all start from ARG1 like erts.
     // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:346-400 (emit_call_fun), OTP-29.1.1.
     pub(crate) fn emit_call_fun(
         &mut self,
@@ -340,28 +342,30 @@ impl BeamModuleAssembler {
         let next = self.code.new_label();
         // Speculatively untag the ErlFunThing.
         self.code
-            .emit(|e| e.sub_imm(Gpr::x(10), Gpr::x(4), 2, false))?;
-        if skip_header_test {
-            self.code.emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(10), 8))?;
-        } else {
-            // Load the error handler into x14 so that any failed test lands there, and the
-            // call site into x12 for the raised exception (erts ARG5: LR points elsewhere
-            // for tail calls).
+            .emit(|e| e.sub_imm(Gpr::x(9), Gpr::x(3), 2, false))?;
+        if !skip_header_test {
+            // Load the error handler into TMP1 so that any failed test lands there.
             let error = self.call_fun_error_label(resolver as usize);
-            self.code.adr(Gpr::x(14), error)?;
-            self.code.adr(Gpr::x(12), next)?;
+            self.code.adr(Gpr::x(8), error)?;
+        }
+        // The `handle_call_fun_error` and `unloaded_fun` fragments expect the current pc in
+        // ARG5 (x4); LR points elsewhere for tail calls.
+        self.code.adr(Gpr::x(4), next)?;
+        if skip_header_test {
+            self.code.emit(|e| e.ldr_uoff(Gpr::x(0), Gpr::x(9), 8))?;
+        } else {
             // As emit_is_boxed(): anything but a boxed term has bit 0 set.
-            self.code.emit(|e| e.tst_imm(Gpr::x(4), 1))?;
+            self.code.emit(|e| e.tst_imm(Gpr::x(3), 1))?;
             self.code.b_cond(Cond::Ne, next)?;
             // Header word and `ErlFunThing->entry`: boxed terms are at least two words.
             self.code
-                .emit(|e| e.ldp(Gpr::x(11), Gpr::x(13), Gpr::x(10), 0))?;
+                .emit(|e| e.ldp(Gpr::x(9), Gpr::x(0), Gpr::x(9), 0))?;
             // Combined fun type and arity test.
             self.code.emit(|e| {
                 e.cmp_ext(
                     Gpr::x(2),
                     arinsal_a64::enc::Extended {
-                        reg: Gpr::w(11),
+                        reg: Gpr::w(9),
                         extend: arinsal_a64::enc::Extend::Uxth,
                         amount: 0,
                     },
@@ -371,29 +375,23 @@ impl BeamModuleAssembler {
         }
         // emit_setup_dispatchable_call: `addresses[active_code_ix]` of the fun or export entry.
         self.code
-            .emit(|e| e.ldr_regoff(Gpr::x(14), Gpr::x(13), ACTIVE_CODE_IX, 3))?;
+            .emit(|e| e.ldr_regoff(Gpr::x(8), Gpr::x(0), ACTIVE_CODE_IX, 3))?;
         self.code.bind(next)?;
-        // The callee receives c_p and its dispatchable entry like an export call.
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            e.mov_reg(Gpr::x(1), Gpr::x(13))
-        })?;
         crate::emit_validate_native_cursor(&mut self.code)?;
         if tail {
-            self.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(14)))?;
             self.deallocate(deallocate)?;
             self.emit_leave_frame()?;
-            self.code.emit(|e| e.br(Gpr::x(17)))?;
+            self.code.emit(|e| e.br(Gpr::x(8)))?;
         } else {
             // erlang_call (beam_asm.hpp:310-332): `blr` keeps the return-address
             // predictor paired with the callee's `ret`.
-            self.code.emit(|e| e.blr(Gpr::x(14)))?;
+            self.code.emit(|e| e.blr(Gpr::x(8)))?;
             crate::emit_validate_native_cursor(&mut self.code)?;
         }
         Ok(())
     }
 
-    /// Calls the fun in x4 with the argument count in x2 (`apply/2`).
+    /// Calls the fun in x3 with the argument count in x2 (`apply/2`).
     // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:253-344 (emit_apply_fun_shared sets
     // ARG3 to the fun header of that arity, then emit_i_apply_fun), OTP-29.1.1.
     pub(crate) fn emit_dynamic_fun_call(
@@ -411,7 +409,7 @@ impl BeamModuleAssembler {
 }
 
 /// Raises `badfun` or `badarity` for a failed `call_fun` test. Entered through the call
-/// instruction with x2 = expected header bits, x4 = fun and x12 = the call site.
+/// instruction with x2 = expected header bits, x3 = fun and x4 = the call site.
 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:64-131 (emit_handle_call_fun_error),
 // OTP-29.1.1: the resolver builds the exception like beam_jit_handle_call_fun_error's paths.
 pub(crate) fn emit_call_fun_error(
@@ -421,11 +419,11 @@ pub(crate) fn emit_call_fun_error(
     let update = Update::HEAP_ALLOC
         .union(Update::X_REGS)
         .union(Update::REDUCTIONS);
-    asm.code.emit(|e| e.str_uoff(Gpr::x(12), Gpr::x(21), 72))?;
+    asm.code.emit(|e| e.str_uoff(Gpr::x(4), Gpr::x(21), 72))?;
     emit_enter_runtime(&mut asm.code, 6, update)?;
     asm.code.emit(|e| {
         e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        e.mov_reg(Gpr::x(1), Gpr::x(4))?;
+        e.mov_reg(Gpr::x(1), Gpr::x(3))?;
         e.lsr_imm(Gpr::x(2), Gpr::x(2), 8)?;
         e.mov_const(Gpr::x(17), helper as u64)?;
         e.blr(Gpr::x(17))

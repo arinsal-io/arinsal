@@ -430,10 +430,8 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let target = Gpr::x(14);
         self.code.emit(|e| {
-            e.mov_const(Gpr::x(13), export as *const ExportEntry as u64)?;
-            e.ldr_regoff(target, Gpr::x(13), ACTIVE_CODE_IX, 3)?;
-            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            e.mov_reg(Gpr::x(1), Gpr::x(13))?;
+            e.mov_const(Gpr::x(0), export as *const ExportEntry as u64)?;
+            e.ldr_regoff(target, Gpr::x(0), ACTIVE_CODE_IX, 3)?;
             if tail {
                 e.ldr_post(Gpr::x(30), E, 8)?;
                 e.br(target)
