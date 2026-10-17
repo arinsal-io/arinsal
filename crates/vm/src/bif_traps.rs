@@ -566,6 +566,54 @@ fn erlang_length_trap(
     })
 }
 
+fn unicode_trap(
+    process: &mut Process,
+    state: Option<&Arc<MagicRef>>,
+) -> Result<HandlerResult, BifError> {
+    let cont = state
+        .ok_or(BifError::BADARG)?
+        .downcast_ref::<Mutex<arinsal_bifs::UnicodeCont>>()
+        .ok_or(BifError::BADARG)?
+        .lock()
+        .map_err(|_| BifError::SystemLimit)?
+        .clone();
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
+    let step = arinsal_bifs::unicode_resume(&mut ctx, &cont);
+    drop(ctx);
+    Ok(match step {
+        arinsal_bifs::UnicodeStep::Done(value) => HandlerResult::Done {
+            value,
+            reductions: 0,
+        },
+        arinsal_bifs::UnicodeStep::More(cont) => HandlerResult::Yield {
+            continuation: cont.continuation(),
+            state: MagicRef::new(Mutex::new(cont)),
+            reductions: 0,
+        },
+    })
+}
+
+macro_rules! unicode_trap_entry {
+    ($name:ident) => {
+        fn $name(
+            process: &mut Process,
+            _args: &[Term],
+            state: Option<&Arc<MagicRef>>,
+            _pid: Option<arinsal_sched::Pid>,
+            _gc_changed: bool,
+        ) -> Result<HandlerResult, BifError> {
+            unicode_trap(process, state)
+        }
+    };
+}
+
+unicode_trap_entry!(erlang_characters_to_utf8_trap);
+unicode_trap_entry!(erlang_characters_to_list_trap_1);
+unicode_trap_entry!(erlang_characters_to_list_trap_2);
+unicode_trap_entry!(erlang_characters_to_list_trap_3);
+unicode_trap_entry!(erlang_characters_to_list_trap_4);
+
 fn bool_atom(value: bool) -> Term {
     Term::atom(
         global_atoms()
@@ -575,6 +623,41 @@ fn bool_atom(value: bool) -> Term {
 }
 
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "erlang",
+        function: "characters_to_utf8_trap",
+        arity: 4,
+        continuation: "erlang:characters_to_utf8_trap/4",
+        handler: erlang_characters_to_utf8_trap,
+    },
+    Entry {
+        module: "erlang",
+        function: "characters_to_list_trap_1",
+        arity: 3,
+        continuation: "erlang:characters_to_list_trap_1/3",
+        handler: erlang_characters_to_list_trap_1,
+    },
+    Entry {
+        module: "erlang",
+        function: "characters_to_list_trap_2",
+        arity: 3,
+        continuation: "erlang:characters_to_list_trap_2/3",
+        handler: erlang_characters_to_list_trap_2,
+    },
+    Entry {
+        module: "erlang",
+        function: "characters_to_list_trap_3",
+        arity: 3,
+        continuation: "erlang:characters_to_list_trap_3/3",
+        handler: erlang_characters_to_list_trap_3,
+    },
+    Entry {
+        module: "erlang",
+        function: "characters_to_list_trap_4",
+        arity: 1,
+        continuation: "erlang:characters_to_list_trap_4/1",
+        handler: erlang_characters_to_list_trap_4,
+    },
     Entry {
         module: "erlang",
         function: "length",
@@ -2170,6 +2253,9 @@ pub(crate) fn install_deferred_trap(
             (cont.continuation(), MagicRef::new(Mutex::new(*cont)))
         }
         arinsal_bifs::DeferredTrap::Chksum(cont) => {
+            (cont.continuation(), MagicRef::new(Mutex::new(cont)))
+        }
+        arinsal_bifs::DeferredTrap::Unicode(cont) => {
             (cont.continuation(), MagicRef::new(Mutex::new(cont)))
         }
         arinsal_bifs::DeferredTrap::Subtract(walk) => (
