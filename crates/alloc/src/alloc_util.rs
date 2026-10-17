@@ -891,11 +891,10 @@ impl AllocUtil {
     /// Port of `erts_alcu_free`, `erl_alloc_util.c:2820`, OTP-29.1.1.
     pub fn free(&mut self, allocation: Allocation) -> Result<(), AllocError> {
         self.stats.free_calls += 1;
-        let b = self.live_block(allocation.id as usize)?;
+        let (span, b) = self.live_block_in_span(allocation.id as usize)?;
         let offset = b.offset;
         self.stats.blocks -= 1;
         self.stats.blocks_size -= b.size;
-        let span = self.span_of(offset).ok_or(AllocError::Corrupt)?;
         let sbc = span.sbc;
         self.block_removed(sbc, b.size);
         if sbc {
@@ -931,11 +930,14 @@ impl AllocUtil {
         }
         Self::write_block_in(span, &merged)?;
         Self::set_next_prev_free_in(span, &merged, true)?;
-        let c = self.carriers[merged.carrier]
-            .as_ref()
-            .ok_or(AllocError::Corrupt)?;
         // Port of erl_alloc_util.c:2791 (dealloc_block), OTP-29.1.1: the main carrier is never destroyed.
-        if merged.offset == c.start && merged.last && !c.main {
+        if merged.offset == span.start + self.mbc_header_size()
+            && merged.last
+            && !self.carriers[merged.carrier]
+                .as_ref()
+                .ok_or(AllocError::Corrupt)?
+                .main
+        {
             self.remove_carrier(merged.carrier)?;
         } else {
             self.link_free_in(span, merged.offset, merged.size)?;
@@ -1137,6 +1139,27 @@ impl AllocUtil {
             return Err(AllocError::InvalidAllocation);
         }
         Ok(block)
+    }
+
+    /// `live_block` for the free path: the carrier span is resolved once and the block header is
+    /// decoded once, so `free` needs no second carrier lookup.
+    #[inline(always)]
+    fn live_block_in_span(&self, key: usize) -> Result<(CarrierSpan, Block), AllocError> {
+        let span = self.span_of(key).ok_or(AllocError::InvalidAllocation)?;
+        let first = span.start
+            + if span.sbc {
+                SBC_HEADER
+            } else {
+                self.mbc_header_size()
+            };
+        if key < first || (span.sbc && key != first) {
+            return Err(AllocError::InvalidAllocation);
+        }
+        let block = Self::decode_block(span, key)?;
+        if !block.allocated || block.size == 0 {
+            return Err(AllocError::InvalidAllocation);
+        }
+        Ok((span, block))
     }
 
     /// Blocks of one carrier in address order, walked through their headers.
