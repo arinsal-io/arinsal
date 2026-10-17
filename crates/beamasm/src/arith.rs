@@ -638,35 +638,17 @@ impl BeamModuleAssembler {
             && base1 == base2
         {
             if off1 + 8 == off2 {
-                self.safe_ldp(tmp1, tmp2, base1, off1)?;
+                self.safe_ldp(tmp1, tmp2, base1, off1 as u32)?;
                 return Ok((tmp1, tmp2));
             }
             if off2 + 8 == off1 {
-                self.safe_ldp(tmp2, tmp1, base2, off2)?;
+                self.safe_ldp(tmp2, tmp1, base2, off2 as u32)?;
                 return Ok((tmp1, tmp2));
             }
         }
         let left = self.source_reg_into(src1, tmp1)?;
         let right = self.source_reg_into(src2, tmp2)?;
         Ok((left, right))
-    }
-
-    /// `safe_ldp`: one `ldp` inside the scaled immediate, otherwise two `ldr`s.
-    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1872-1895, OTP-29.1.1.
-    fn safe_ldp(&mut self, gp1: Gpr, gp2: Gpr, base: Gpr, offset: i64) -> Result<(), ModuleError> {
-        if offset.unsigned_abs() <= 8 * 0x3f
-            && let Ok(byte_off) = i16::try_from(offset)
-        {
-            self.code.emit(|e| e.ldp(gp1, gp2, base, byte_off))?;
-        } else {
-            let byte_off = u32::try_from(offset)
-                .map_err(|_| ModuleError::InvalidOperand("paired load offset overflows"))?;
-            self.code.emit(|e| {
-                e.ldr_uoff(gp1, base, byte_off)?;
-                e.ldr_uoff(gp2, base, byte_off + 8)
-            })?;
-        }
-        Ok(())
     }
 
     /// `emit_is_boxed(next, reg)`: branches when bit 0 is set, i.e. the value is not boxed.
