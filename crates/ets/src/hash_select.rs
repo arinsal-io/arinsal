@@ -11,6 +11,15 @@ use match_spec::{HeadKey, MatchProgram};
 // erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
 pub const HASH_SELECT_ITERATIONS: isize = 1000;
 
+/// The chunk of a chunked `select`: its size and how many results the call holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunk {
+    /// Results a page holds; zero for a call that returns every result.
+    pub size: usize,
+    /// Results held before the cycle.
+    pub held: usize,
+}
+
 /// How much of a traversal another process may change underneath it.
 // Port of `enum DbIterSafety` in erts/emulator/beam/erl_db.h and of ITERATION_SAFETY in
 // erl_db.c, OTP-29.1.1.
@@ -58,8 +67,12 @@ impl HashScanPlan {
 pub struct HashScanEnd {
     /// Iterations left of the budget; below zero when the last bucket ran past it.
     pub iterations_left: isize,
-    /// The slot a trapped call resumes from, or `None` when the table is exhausted.
+    /// The slot a trapped call resumes from, or `None` when the table is exhausted or a
+    /// chunk filled.
     pub trap_slot: Option<usize>,
+    /// The slot after the bucket in which a chunk filled, or `None` when the table is
+    /// exhausted or the call trapped.
+    pub chunk_slot: Option<usize>,
 }
 
 /// Results of earlier cycles of a trapped `select`, kept outside the process heap.
@@ -90,6 +103,11 @@ impl SavedMatches {
     /// Whether no result was kept.
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty()
+    }
+
+    /// How many results were kept.
+    pub fn len(&self) -> usize {
+        self.terms.len()
     }
 
     /// The saved results as terms on `dst`, oldest first.
@@ -184,6 +202,7 @@ impl Table {
         plan: &HashScanPlan,
         from: usize,
         mut iterations: isize,
+        full: &dyn Fn() -> bool,
         visit: &mut dyn FnMut(&StoredTerm) -> Result<(), EtsError>,
     ) -> Result<HashScanEnd, EtsError> {
         let Storage::Hash(storage) = &self.storage else {
@@ -205,6 +224,7 @@ impl Table {
             return Ok(HashScanEnd {
                 iterations_left: iterations,
                 trap_slot: None,
+                chunk_slot: None,
             });
         }
         if from >= storage.nactive() {
@@ -227,38 +247,71 @@ impl Table {
                     return Ok(HashScanEnd {
                         iterations_left: iterations,
                         trap_slot: None,
+                        chunk_slot: None,
                     });
                 }
+            }
+            if full() {
+                return Ok(HashScanEnd {
+                    iterations_left: iterations,
+                    trap_slot: None,
+                    chunk_slot: Some(slot),
+                });
             }
             if iterations <= 0 {
                 return Ok(HashScanEnd {
                     iterations_left: iterations,
                     trap_slot: Some(slot),
+                    chunk_slot: None,
                 });
             }
         }
     }
 
-    /// One `select` cycle: the results in visit order and where the cycle ended.
+    /// One `select` cycle: the results in visit order, where the cycle ended and how many
+    /// results a chunked call holds after it. A chunk (`chunk` above zero) ends at the first
+    /// bucket boundary at which `got` results are held; an exhausted `from` ends the cycle
+    /// before it visits anything.
     // Port of erts/emulator/beam/erl_db_hash.c, select_chunk_on_match_res,
-    // OTP-29.1.1.
+    // match_traverse and match_traverse_continue, OTP-29.1.1.
     pub fn hash_select_cycle<H: HeapAlloc>(
         &self,
         plan: &HashScanPlan,
         program: &MatchProgram,
         from: usize,
+        chunk: Chunk,
         dst: &mut H,
-    ) -> Result<(HashScanEnd, Vec<Term>), EtsError> {
+    ) -> Result<(HashScanEnd, Vec<Term>, usize), EtsError> {
+        let Chunk {
+            size: chunk,
+            held: got,
+        } = chunk;
+        if from == usize::MAX || (chunk > 0 && got >= chunk) {
+            let end = HashScanEnd {
+                iterations_left: HASH_SELECT_ITERATIONS,
+                trap_slot: None,
+                chunk_slot: (from != usize::MAX).then_some(from),
+            };
+            return Ok((end, Vec::new(), got));
+        }
         let mut runner = program.runner();
         let mut results = Vec::new();
-        let end = self.hash_scan(plan, from, HASH_SELECT_ITERATIONS, &mut |object| {
-            let term = object.term_for_filter(dst)?;
-            if let Some(result) = runner.run(term, dst)? {
-                results.push(result);
-            }
-            Ok(())
-        })?;
-        Ok((end, results))
+        let held = std::cell::Cell::new(got);
+        let end = self.hash_scan(
+            plan,
+            from,
+            HASH_SELECT_ITERATIONS,
+            &|| chunk > 0 && held.get() >= chunk,
+            &mut |object| {
+                let term = object.term_for_filter(dst)?;
+                if let Some(result) = runner.run(term, dst)? {
+                    results.push(result);
+                    held.set(held.get() + 1);
+                }
+                Ok(())
+            },
+        )?;
+        Ok((end, results, held.get()))
     }
 
     /// One `select_count` cycle: the objects the program selected and where the cycle ended.
@@ -273,16 +326,22 @@ impl Table {
         let true_atom = Term::atom(global_true());
         let mut scratch = VecHeap::new();
         let mut count = 0;
-        let end = self.hash_scan(plan, from, HASH_SELECT_ITERATIONS, &mut |object| {
-            let term = object.term_for_filter(&mut scratch)?;
-            if program
-                .run(term, &mut scratch)?
-                .is_some_and(|value| exact_eq(value, true_atom))
-            {
-                count += 1;
-            }
-            Ok(())
-        })?;
+        let end = self.hash_scan(
+            plan,
+            from,
+            HASH_SELECT_ITERATIONS,
+            &|| false,
+            &mut |object| {
+                let term = object.term_for_filter(&mut scratch)?;
+                if program
+                    .run(term, &mut scratch)?
+                    .is_some_and(|value| exact_eq(value, true_atom))
+                {
+                    count += 1;
+                }
+                Ok(())
+            },
+        )?;
         Ok((end, count))
     }
 }

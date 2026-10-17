@@ -3879,6 +3879,9 @@ pub(crate) fn running_mfa(
                 .as_ref()
                 .and_then(|cold| cold.ets_select.as_ref())
                 .map(|state| match (state.count, &state.position) {
+                    _ if matches!(state.stage, crate::proc_create::SelectStage::Reverse { .. }) => {
+                        ("ets", "reverse", 3)
+                    }
                     (false, arinsal_ets::ScanPosition::Slot(_)) => ("ets", "select_trap", 1),
                     (false, arinsal_ets::ScanPosition::After(_)) => ("ets", "select", 1),
                     (true, _) => ("ets", "count_trap", 1),

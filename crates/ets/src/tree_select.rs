@@ -19,7 +19,8 @@ pub struct SavedKey {
 }
 
 impl SavedKey {
-    fn new(key: Term) -> Result<Self, EtsError> {
+    /// Copy `key` out of its heap.
+    pub fn new(key: Term) -> Result<Self, EtsError> {
         let mut heap = VecHeap::new();
         let term = copy_term(key, &mut heap)?;
         Ok(Self { heap, term })
@@ -68,6 +69,12 @@ impl TreeScanPlan {
             let order = cmp_partly_bound(end, key);
             (backwards && order > 0) || (!backwards && order < 0)
         })
+    }
+
+    /// The key a chunked traversal in the given direction stops beyond, as its continuation
+    /// carries it.
+    pub fn end_condition_term(&self, backwards: bool) -> Option<Term> {
+        self.end_condition(backwards)
     }
 
     /// Where a traversal in the given direction stops. A traversal that starts at the high
@@ -218,6 +225,43 @@ impl Table {
         )?;
         end.finish_resumed(plan, backwards, after.is_some());
         Ok((end, results))
+    }
+
+    /// One chunked `select` cycle: the results in visit order, where the cycle ended and how
+    /// many results the call holds after it. The cycle stops when the chunk is full, and a
+    /// resumed one does not stop at the end of the key range.
+    // Port of erts/emulator/beam/erl_db_tree.c, doit_select_chunk, OTP-29.1.1.
+    pub fn tree_chunk_cycle<H: HeapAlloc>(
+        &self,
+        plan: &TreeScanPlan,
+        program: &MatchProgram,
+        backwards: bool,
+        after: Option<Term>,
+        chunk: Chunk,
+        dst: &mut H,
+    ) -> Result<(TreeScanEnd, Vec<Term>, usize), EtsError> {
+        let Chunk {
+            size: chunk,
+            held: got,
+        } = chunk;
+        let mut runner = program.runner();
+        let mut results = Vec::new();
+        let mut held = got;
+        let end = self.tree_scan(
+            plan,
+            backwards,
+            after,
+            TREE_SELECT_ITERATIONS,
+            &mut |object| {
+                let term = object.term_for_filter(dst)?;
+                if let Some(result) = runner.run(term, dst)? {
+                    results.push(result);
+                    held += 1;
+                }
+                Ok(held == chunk)
+            },
+        )?;
+        Ok((end, results, held))
     }
 
     /// One `select_count` cycle: the objects the program selected and where the cycle ended.
