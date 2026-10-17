@@ -188,6 +188,12 @@ pub struct BeamModuleAssembler {
     dispatch_fragments: HashMap<usize, Label>,
     /// Out-of-line `i_test_yield` continuations (stub, continuation, live X registers).
     yield_stubs: Vec<(Label, Label, u8)>,
+    /// Process-wide yield fragments: `dispatch_return`, `i_test_yield_shared` and
+    /// `context_switch_simplified`. Unset in assemblers that run without a VM.
+    yield_fragments: Option<(usize, usize, usize)>,
+    /// Offset right after the current function's entry label (its `i_breakpoint_trampoline`).
+    entry_offset: Option<usize>,
+    entry_label: Option<Label>,
     /// Failure and GC stubs for `bs_create_bin`, emitted with the yield stubs so the
     /// fall-through path is straight-line (erts `b.ls` / `b.ne` over a fragment).
     bs_cold: Vec<BsColdEmit>,
@@ -267,6 +273,9 @@ impl BeamModuleAssembler {
             dispatch_fragments: HashMap::new(),
             gc_fragments: Vec::new(),
             yield_stubs: Vec::new(),
+            yield_fragments: None,
+            entry_offset: None,
+            entry_label: None,
             bs_cold: Vec::new(),
             line_table: Vec::new(),
             arith_fail: 0,
@@ -447,6 +456,38 @@ impl BeamModuleAssembler {
         }
         let label = self.label(id);
         self.code.bind(label)?;
+        self.entry_label = Some(label);
+        self.entry_offset = Some(self.code.offset());
+        Ok(())
+    }
+
+    /// Installs the process-wide yield fragments (`dispatch_return`, `i_test_yield_shared`,
+    /// `context_switch_simplified`) so the module keeps no copy of them.
+    pub fn set_yield_fragments(
+        &mut self,
+        dispatch_return: usize,
+        test_yield_shared: usize,
+        context_switch: usize,
+    ) {
+        self.yield_fragments = Some((dispatch_return, test_yield_shared, context_switch));
+    }
+
+    /// Emits `b.cond` to this module's dispatch stub of the process-wide fragment `target`.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp (resolve_fragment), OTP-29.1.1.
+    pub(super) fn fragment_branch_cond(
+        &mut self,
+        cond: Cond,
+        target: usize,
+    ) -> Result<(), ModuleError> {
+        let label = match self.dispatch_fragments.get(&target) {
+            Some(&label) => label,
+            None => {
+                let label = self.code.new_label();
+                self.dispatch_fragments.insert(target, label);
+                label
+            }
+        };
+        self.code.b_cond(cond, label)?;
         Ok(())
     }
 
@@ -840,6 +881,15 @@ impl BeamModuleAssembler {
     pub fn test_yield(&mut self) -> Result<(), ModuleError> {
         // The yield sequence is out of line so the fall-through path has no taken branch,
         // like erts' `b.le` to the shared context-switch fragment.
+        if let (Some((_, test_yield_shared, _)), Some(entry), Some(after_entry)) =
+            (self.yield_fragments, self.entry_label, self.entry_offset)
+            && self.code.offset() == after_entry + crate::yield_frag::FUNC_PROLOGUE_SIZE
+        {
+            self.code.adr(Gpr::x(2), entry)?;
+            self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
+            self.fragment_branch_cond(Cond::Le, test_yield_shared)?;
+            return Ok(());
+        }
         let continuation = self.code.new_label();
         let stub = self.code.new_label();
         self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
@@ -952,6 +1002,11 @@ impl BeamModuleAssembler {
         // The yield path is the forward `b.mi`, so a return with reductions left falls
         // through to `ret`. erts keeps that sequence in the shared dispatch_return fragment.
         self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
+        if let Some((dispatch_return, _, _)) = self.yield_fragments {
+            self.fragment_branch_cond(Cond::Mi, dispatch_return)?;
+            self.code.emit(|e| e.ret(Gpr::x(30)))?;
+            return Ok(());
+        }
         let stub = self.code.new_label();
         self.code.b_cond(Cond::Mi, stub)?;
         self.code.emit(|e| e.ret(Gpr::x(30)))?;
@@ -2051,17 +2106,24 @@ impl BeamModuleAssembler {
         }
         let entry_label = self.yield_label;
         self.code.bind(entry_label)?;
-        crate::emit_enter_runtime(
-            &mut self.code,
-            6,
-            crate::Update::HEAP_ALLOC
-                .union(crate::Update::REDUCTIONS)
-                .union(crate::Update::X_REGS),
-        )?;
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(30), arinsal_enter_native_yield as *const () as u64)?;
-            e.ret(Gpr::x(30))
-        })?;
+        if let Some((_, _, context_switch)) = self.yield_fragments {
+            self.code.emit(|e| {
+                e.mov_const(Gpr::x(17), context_switch as u64)?;
+                e.br(Gpr::x(17))
+            })?;
+        } else {
+            crate::emit_enter_runtime(
+                &mut self.code,
+                6,
+                crate::Update::HEAP_ALLOC
+                    .union(crate::Update::REDUCTIONS)
+                    .union(crate::Update::X_REGS),
+            )?;
+            self.code.emit(|e| {
+                e.mov_const(Gpr::x(30), arinsal_enter_native_yield as *const () as u64)?;
+                e.ret(Gpr::x(30))
+            })?;
+        }
         self.code.bind(self.error_label)?;
         // The scheduler runs `handle_error`. Resolving the catch in this fragment
         // drops the BIF frame and `function_clause` argument list the scheduler records.

@@ -25,6 +25,7 @@ mod regcache;
 pub mod rt;
 pub mod select;
 pub mod types;
+pub mod yield_frag;
 
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer},

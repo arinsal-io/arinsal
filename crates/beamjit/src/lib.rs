@@ -114,6 +114,11 @@ pub trait ModuleEnv {
     fn breakpoint_fragment(&self) -> usize {
         self.light_bif_fragment()
     }
+    /// Process-wide `(dispatch_return, i_test_yield_shared, context_switch_simplified)`
+    /// fragments, or `None` when the environment has none (each module then keeps its own).
+    fn yield_fragments(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
     /// Fragment called by `i_line_breakpoint_trampoline` when line instrumentation is enabled.
     fn line_breakpoint_fragment(&self) -> usize {
         0
@@ -1653,6 +1658,9 @@ pub fn compile_parsed_module_with_options(
 
         assembler = BeamModuleAssembler::new();
         assembler.set_exception_resolver(env.exception_resolver() as usize);
+        if let Some((dispatch_return, test_yield, context_switch)) = env.yield_fragments() {
+            assembler.set_yield_fragments(dispatch_return, test_yield, context_switch);
+        }
         assembler.enable_dump(&beam.module);
         for lambda in &beam.lambdas {
             if !native_labels.contains(&lambda.label) {
