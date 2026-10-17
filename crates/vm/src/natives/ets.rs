@@ -13,6 +13,7 @@ use arinsal_sched::{Pid, RunCtx};
 use arinsal_term::{HeapAlloc, Term, TermBuilder, TermKind, copy_term, global_atoms};
 use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1157,6 +1158,17 @@ fn bump_reds(process: &mut Process, ctx: &mut RunCtx<'_, Message>, used: isize) 
     ctx.consume(used);
 }
 
+/// Charge `used` reductions from a BIF that runs from native code, where the live counter is
+/// the one in the process header.
+///
+/// Port of erts/emulator/beam/bif.h, BUMP_REDS, OTP-29.1.1.
+fn bump_direct(process: &mut Process, used: isize) {
+    let used = used.clamp(0, i32::MAX as isize) as i32;
+    let live = process.header.fcalls.saturating_sub(used).max(0);
+    process.header.fcalls = live;
+    process.reductions = live;
+}
+
 /// Whether the BIF looks its first argument up as a table (`db_get_table`), and so has to wait
 /// for a busy table.
 fn gated_by_busy(function: EtsBif) -> bool {
@@ -1304,6 +1316,266 @@ fn delete_or_clear(
         .map_err(|_| badarg())
 }
 
+/// Fix a table for `caller`, stamping the first fixation with the current times.
+///
+/// Port of erts/emulator/beam/erl_db.c, fix_table_locked, OTP-29.1.1.
+fn fix_table<H: HeapAlloc>(heap: &mut H, table: &mut Table, caller: Term) -> Result<(), VmError> {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| badarg())?
+        .as_micros();
+    let system_time = TermBuilder::new(heap)
+        .tuple(&[
+            Term::small((micros / 1_000_000_000_000) as i64).ok_or_else(badarg)?,
+            Term::small(((micros / 1_000_000) % 1_000_000) as i64).ok_or_else(badarg)?,
+            Term::small((micros % 1_000_000) as i64).ok_or_else(badarg)?,
+        ])
+        .map_err(|_| system_limit())?;
+    let monotonic_time = TermBuilder::new(heap)
+        .int_from_i128(arinsal_bifs::monotonic_time_nanos())
+        .map_err(|_| system_limit())?;
+    table
+        .safe_fixtable_for_at(caller, true, system_time, monotonic_time)
+        .map_err(err)
+}
+
+/// Results of one cycle of a hash table traversal.
+struct SelectCycle {
+    end: arinsal_ets::HashScanEnd,
+    results: Vec<Term>,
+    counted: usize,
+}
+
+fn select_cycle<H: HeapAlloc>(
+    table: &Table,
+    plan: &arinsal_ets::HashScanPlan,
+    program: &MatchProgram,
+    count: bool,
+    from: usize,
+    heap: &mut H,
+) -> Result<SelectCycle, EtsError> {
+    if count {
+        let (end, counted) = table.hash_count_cycle(plan, program, from)?;
+        Ok(SelectCycle {
+            end,
+            results: Vec::new(),
+            counted,
+        })
+    } else {
+        let (end, results) = table.hash_select_cycle(plan, program, from, heap)?;
+        Ok(SelectCycle {
+            end,
+            results,
+            counted: 0,
+        })
+    }
+}
+
+/// `ets:select/2`, `select_reverse/2`, `match/2`, `match_object/2` and `select_count/2` on a
+/// set, bag or duplicate_bag table: a cycle visits up to 1000 objects, charges a reduction for
+/// each and traps as `ets:select_trap/1` (`ets:count_trap/1`) until the table is exhausted. A
+/// table another process may write is fixed while the call is trapped. `Ok(None)` leaves any
+/// other table type to the caller.
+///
+/// Port of erts/emulator/beam/erl_db.c (ets_match_2, ets_select2, ets_select_trap_1,
+/// ets_select_count_2, ets_select_count_1) and erl_db_hash.c (match_traverse,
+/// match_traverse_continue, the select_chunk_* and select_count_* callbacks), OTP-29.1.1.
+fn hash_select(
+    process: &mut Process,
+    mut ctx: Option<&mut RunCtx<'_, Message>>,
+    caller_pid: Pid,
+    function: EtsBif,
+    args: &[Term],
+) -> Result<Option<Term>, VmError> {
+    let caller = caller_pid.to_term().ok_or_else(badarg)?;
+    let rt = process.runtime.clone().ok_or_else(badarg)?;
+    let count = function == EtsBif::SelectCount;
+    if ctx.is_none()
+        && process
+            .cold
+            .as_ref()
+            .is_some_and(|cold| cold.ets_select.is_some())
+    {
+        return Err(VmError::Yield);
+    }
+    let resumed = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.ets_select.take());
+    let was_resumed = resumed.is_some();
+    let empty_result = || -> Result<Term, VmError> {
+        if count {
+            Term::small(0).ok_or_else(badarg)
+        } else {
+            Ok(Term::NIL)
+        }
+    };
+    let iterations = arinsal_ets::HASH_SELECT_ITERATIONS;
+    let mut scratch = arinsal_term::VecHeap::new();
+
+    // Cycle under the table's read lock.
+    let (tid, program, safety, cycle) = {
+        let registry = rt.ets.read().unwrap();
+        let tid = match resumed.as_ref() {
+            Some(state) => state.tid,
+            None => handle(&registry, args[0])?,
+        };
+        let table = match registry.get_shared(tid) {
+            Ok(table) => table,
+            Err(EtsError::Busy) => {
+                if let Some(state) = resumed {
+                    process.cold_mut().ets_select = Some(state);
+                }
+                return Err(VmError::Yield);
+            }
+            Err(error) => return Err(err(error)),
+        };
+        if resumed.is_none() && !table.is_hash() {
+            return Ok(None);
+        }
+        if !allowed(&table, caller, false) {
+            return Err(badarg_cause("access"));
+        }
+        let direct = ctx.is_none();
+        match resumed.as_ref() {
+            Some(state) => {
+                let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+                let cycle = select_cycle(
+                    &table,
+                    &arinsal_ets::HashScanPlan::all_slots(),
+                    &state.program,
+                    count,
+                    state.slot,
+                    &mut heap,
+                );
+                (tid, Arc::clone(&state.program), state.safety, cycle)
+            }
+            None => {
+                if args[1] == Term::NIL
+                    && function != EtsBif::Match
+                    && function != EtsBif::MatchObject
+                {
+                    return empty_result().map(Some);
+                }
+                let program = match function {
+                    EtsBif::Match => MatchProgram::from_pattern(args[1], false),
+                    EtsBif::MatchObject => MatchProgram::from_pattern(args[1], true),
+                    _ => MatchProgram::compile(args[1]),
+                }
+                .map_err(err)?;
+                let plan = table.hash_scan_plan(&program);
+                if !plan.something_can_match() {
+                    return empty_result().map(Some);
+                }
+                let safety = table.iteration_safety(caller);
+                // Native code caches the heap top, so a call that may still decline builds its
+                // results aside and copies them to the heap once it knows it completes.
+                let cycle = if direct {
+                    select_cycle(&table, &plan, &program, count, 0, &mut scratch)
+                } else {
+                    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+                    select_cycle(&table, &plan, &program, count, 0, &mut heap)
+                };
+                (tid, Arc::new(program), safety, cycle)
+            }
+        }
+    };
+    let mut cycle = match cycle {
+        Ok(cycle) => cycle,
+        Err(error) => {
+            if was_resumed && safety != arinsal_ets::IterSafety::Safe {
+                unfix_table(&rt, tid, caller);
+            }
+            return Err(err(error));
+        }
+    };
+    let mut fixed_now = false;
+    if cycle.end.trap_slot.is_some() && !was_resumed {
+        // The first trap of a table that other processes may write: fix it under the write
+        // lock, redoing the cycle in case the table changed in between.
+        if ctx.is_none() {
+            return Err(VmError::Yield);
+        }
+        if safety != arinsal_ets::IterSafety::Safe {
+            let registry = rt.ets.read().unwrap();
+            let mut table = registry.get_mut(tid).map_err(err)?;
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            let plan = table.hash_scan_plan(&program);
+            cycle = select_cycle(&table, &plan, &program, count, 0, &mut heap).map_err(err)?;
+            if cycle.end.trap_slot.is_some() {
+                fix_table(&mut heap, &mut table, caller)?;
+                fixed_now = true;
+            }
+        }
+    }
+    if fixed_now {
+        rt.ets.write().unwrap().note_fixation(caller, tid);
+        // erl_db.c, fix_table_locked: a fixation sets F_USING_DB on the fixing process.
+        let _ = rt.publish_proc_flag(caller_pid, arinsal_sched::proc_flags::USING_DB);
+    }
+    let (mut saved, got) = match resumed {
+        Some(state) => (state.saved, state.got),
+        None => (arinsal_ets::SavedMatches::new(), 0),
+    };
+    if let Some(slot) = cycle.end.trap_slot {
+        saved.extend(&cycle.results).map_err(err)?;
+        process.cold_mut().ets_select = Some(crate::proc_create::EtsSelect {
+            tid,
+            program,
+            count,
+            slot,
+            got: got + cycle.counted,
+            saved,
+            safety,
+        });
+        let ctx = ctx.as_deref_mut().ok_or_else(needs_context)?;
+        bump_reds(process, ctx, isize::MAX);
+        return Err(VmError::Yield);
+    }
+    let used = iterations - cycle.end.iterations_left.min(iterations);
+    match ctx.as_deref_mut() {
+        Some(ctx) => bump_reds(process, ctx, used),
+        None => bump_direct(process, used),
+    }
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let unfix = was_resumed && safety != arinsal_ets::IterSafety::Safe;
+    if count {
+        if unfix {
+            unfix_table(&rt, tid, caller);
+        }
+        return TermBuilder::new(&mut heap)
+            .int_from_i128((got + cycle.counted) as i128)
+            .map(Some)
+            .map_err(|_| badarg());
+    }
+    let mut values = saved.copy_out(&mut heap).map_err(err)?;
+    if ctx.is_none() {
+        for term in cycle.results {
+            values.push(copy_term(term, &mut heap).map_err(|_| badarg())?);
+        }
+    } else {
+        values.extend(cycle.results);
+    }
+    values.reverse();
+    let list = TermBuilder::new(&mut heap)
+        .list_from_iter(values)
+        .map_err(|_| badarg())?;
+    if unfix {
+        unfix_table(&rt, tid, caller);
+    }
+    Ok(Some(list))
+}
+
+/// Release the fixation a trapped traversal held.
+///
+/// Port of erts/emulator/beam/erl_db.c, unfix_table_locked, OTP-29.1.1.
+fn unfix_table(rt: &crate::process::Runtime, tid: Tid, caller: Term) {
+    let registry = rt.ets.read().unwrap();
+    if let Ok(shared) = registry.shared(tid) {
+        let _ = shared.write().safe_fixtable_for(caller, false);
+    }
+}
+
 /// Run one ETS BIF. `ctx` is only present on the scheduler path: erts sends messages
 /// (give_away, request_all) and traps (delete) through the process, so those need it; every
 /// other table operation runs from the caller pid alone, as erts runs them from BeamAsm.
@@ -1367,6 +1639,20 @@ fn call_inner(
     ) {
         let ctx = ctx.as_deref_mut().ok_or_else(needs_context)?;
         return delete_or_clear(process, ctx, function, args, caller);
+    }
+    if matches!(
+        (function, args.len()),
+        (
+            EtsBif::Select
+                | EtsBif::SelectReverse
+                | EtsBif::Match
+                | EtsBif::MatchObject
+                | EtsBif::SelectCount,
+            2
+        )
+    ) && let Some(value) = hash_select(process, ctx.as_deref_mut(), caller_pid, function, args)?
+    {
+        return Ok(value);
     }
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     // Port of erts/emulator/beam/erl_db.c:446-500 (db_lock), OTP-29.1.1: table operations
@@ -1850,25 +2136,7 @@ fn call_inner(
             }
             let fixed = boolean(*fixed)?;
             if fixed {
-                // Port of erts/emulator/beam/erl_db.c:5148-5161 (fix_table_locked), OTP-29.1.1.
-                let micros = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|_| badarg())?
-                    .as_micros();
-                let system_time = TermBuilder::new(&mut heap)
-                    .tuple(&[
-                        Term::small((micros / 1_000_000_000_000) as i64).ok_or_else(badarg)?,
-                        Term::small(((micros / 1_000_000) % 1_000_000) as i64)
-                            .ok_or_else(badarg)?,
-                        Term::small((micros % 1_000_000) as i64).ok_or_else(badarg)?,
-                    ])
-                    .map_err(|_| system_limit())?;
-                let monotonic_time = TermBuilder::new(&mut heap)
-                    .int_from_i128(arinsal_bifs::monotonic_time_nanos())
-                    .map_err(|_| system_limit())?;
-                table
-                    .safe_fixtable_for_at(caller, true, system_time, monotonic_time)
-                    .map_err(err)?;
+                fix_table(&mut heap, &mut table, caller)?;
                 drop(table);
                 registry.exclusive()?.note_fixation(caller, tid);
                 // erl_db.c:3048 and 5187: a fixation sets F_USING_DB on the fixing process.

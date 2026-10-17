@@ -3870,6 +3870,18 @@ pub(crate) fn running_mfa(
         .map(|state| match state.tid {
             None => ("ets", "delete_trap", 1),
             Some(_) => ("ets", "internal_delete_all", 2),
+        })
+        .or_else(|| {
+            // Port of erts/emulator/beam/erl_db.c (init_db: ets_select_continue_exp and
+            // ets_select_count_continue_exp), OTP-29.1.1.
+            process
+                .cold
+                .as_ref()
+                .and_then(|cold| cold.ets_select.as_ref())
+                .map(|state| match state.count {
+                    false => ("ets", "select_trap", 1),
+                    true => ("ets", "count_trap", 1),
+                })
         });
     // Port of erts/emulator/beam/erl_process.c:12604 (`p->current = &p->u.initial`) and
     // erl_trace.c:752-760 (trace_sched_session), OTP-29.1.1: a process that has not run yet
