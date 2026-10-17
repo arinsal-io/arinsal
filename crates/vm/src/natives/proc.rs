@@ -3177,9 +3177,6 @@ fn hibernate(
     // is discarded; the executor shrinks the heap once the BIF has unwound.
     process.x.ensure_x(3);
     process.heap.release_stack(process.heap.stack_words());
-    for register in process.x.iter_mut() {
-        *register = Term::NIL;
-    }
     process.x[0] = module;
     process.x[1] = function;
     process.x[2] = args;
