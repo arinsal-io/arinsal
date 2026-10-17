@@ -826,6 +826,10 @@ pub struct ProcessHeap {
     pub(crate) bin_vheap_size: u64,
     pub(crate) heap_grow: bool,
     pub(crate) native_allocation: bool,
+    /// Words at the top of the stack that erts does not have while a BIF body runs: the native
+    /// continuation the executor pushed before it ran a native BIF. HAlloc and the post-BIF
+    /// collection test see `E` above them.
+    pub(crate) bif_hidden_words: usize,
     /// Allocations go to `owners.detached` (see [`ProcessHeap::begin_detached`]).
     pub(crate) detached: bool,
     /// Whether `fragments` holds the abandoned heap (erts `p->abandoned_heap != NULL`),
@@ -1019,6 +1023,7 @@ impl ProcessHeap {
             bin_vheap_size: 46_422,
             heap_grow: false,
             native_allocation: false,
+            bif_hidden_words: 0,
             detached: false,
             abandoned: false,
             fragments: Vec::new(),
@@ -1074,7 +1079,26 @@ impl ProcessHeap {
     // Port of erts/emulator/beam/erl_process.h:990-998, OTP-29.1.1.
     #[inline(always)]
     pub fn heap_limit_words(&self) -> usize {
-        self.htop.max(self.stop.saturating_sub(crate::S_REDZONE))
+        self.htop.max(
+            self.stop
+                .saturating_add(self.bif_hidden_words)
+                .saturating_sub(crate::S_REDZONE),
+        )
+    }
+    /// `E - HTOP` as the erts BIF epilogue sees it, with the words of a native continuation that
+    /// erts has not pushed yet left out of the stack.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared computes
+    // `E - HTOP` after the BIF returns, before any return address is pushed), OTP-29.1.1.
+    pub fn bif_free_words(&self) -> usize {
+        (self.stop + self.bif_hidden_words).saturating_sub(self.htop)
+    }
+    /// Run a native BIF body as erts runs it: the `words` the executor already pushed for the
+    /// caller's return are not part of the stack the body allocates against. Pass 0 to end it.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared calls the
+    // BIF with E at the caller's frame; only `context_switch_simplified` pushes the return
+    // address), OTP-29.1.1.
+    pub fn set_bif_hidden_words(&mut self, words: usize) {
+        self.bif_hidden_words = words;
     }
     /// Young-heap words available to `HAlloc` before it uses a fragment.
     // Port of erts/emulator/beam/erl_vm.h:150-175 (HAllocX/HeapWordsLeft), OTP-29.1.1.

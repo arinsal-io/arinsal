@@ -1526,21 +1526,30 @@ pub(crate) extern "C" fn node_light(
 pub(crate) extern "C" fn yield_executor_bif(
     header: *mut ProcessHeader,
     _regs: *mut u64,
-    _i: u64,
+    i: u64,
     descriptor: u64,
     identity: u64,
 ) -> u64 {
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared passes the
+    // call's entry address `I`), OTP-29.1.1: the export trampoline passes none.
+    let light_call = i != 0;
     let Some((process, _)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
-    park_executor(process, export, identity)
+    park_executor(process, export, identity, light_call)
 }
 
 /// `THE_NON_VALUE` + trap reason. The fragment context-switches into the executor.
-fn park_executor(process: &mut crate::Process, export: ExportDispatch, identity: u64) -> u64 {
+fn park_executor(
+    process: &mut crate::Process,
+    export: ExportDispatch,
+    identity: u64,
+    light_call: bool,
+) -> u64 {
+    process.cold_mut().native_light_bif_call = light_call;
     process.header.arity = export.arity;
     process.reductions = process.header.fcalls;
     process.header.i = identity as *const u8 as *const _;
@@ -2157,7 +2166,7 @@ pub(crate) extern "C" fn plain_bif_light(
             .unwrap_or(0);
     }
     let Some(bif) = export.light_bif else {
-        return park_executor(process, export, identity);
+        return park_executor(process, export, identity, false);
     };
     call_plain_bif(process, registers, identity as usize, export, bif, false)
 }
@@ -2346,12 +2355,12 @@ pub(crate) extern "C" fn process_bif_light(
         return 0;
     };
     let Some(bif) = export.light_process_bif else {
-        return park_executor(process, export, identity);
+        return park_executor(process, export, identity, false);
     };
     match call_process_bif(process, registers, export, bif, false) {
         Some(raw) => raw,
         // The entry declined before any side effect: the executor runs the whole BIF.
-        None => park_executor(process, export, identity),
+        None => park_executor(process, export, identity, false),
     }
 }
 
@@ -2394,7 +2403,7 @@ pub(crate) extern "C" fn trap_bif_light(
         return 0;
     };
     let Some(entry) = export.light_trap_bif else {
-        return park_executor(process, export, identity);
+        return park_executor(process, export, identity, false);
     };
     call_trap_bif(process, registers, identity as usize, export, entry, false).unwrap_or(0)
 }
@@ -2555,7 +2564,7 @@ fn try_light_monitor(
 }
 
 /// Calls a trapping BIF straight from native code; `None` when it trapped.
-// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-540 (call_light_bif_shared), OTP-29.1.1:
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared), OTP-29.1.1:
 // the BIF's value or error is handled like any light BIF's; THE_NON_VALUE with
 // `freason == TRAP` pushes the return address and context-switches to `c_p->i`, which the
 // scheduler resumes from the trap state.
@@ -2717,7 +2726,7 @@ pub(crate) extern "C" fn trap_bif_entry<T: crate::bif_traps::TrapBody>(
         return 0;
     };
     if export.light_trap_bif.is_none() {
-        return park_executor(process, export, identity);
+        return park_executor(process, export, identity, false);
     }
     trap_body_call::<T>(
         process,
@@ -2747,7 +2756,7 @@ pub(crate) extern "C" fn list_reverse_entry(
         return 0;
     };
     if export.light_trap_bif.is_none() {
-        return park_executor(process, export, identity);
+        return park_executor(process, export, identity, false);
     }
     let entry_top = process.heap.heap_top_index();
     let gc_was_enabled = process.heap.gc_enabled;
@@ -2965,6 +2974,7 @@ fn invoke_dispatch_bif_slow(
         process.header.arity = export.arity;
         process.header.i = identity as *const u8 as *const _;
         process.header.freason = 1 << 10;
+        process.cold_mut().native_light_bif_call = !export_call;
         process.sync_native_header();
         return None;
     }
