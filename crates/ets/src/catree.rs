@@ -514,6 +514,35 @@ impl CATree {
         &self,
         cursor: Option<Term>,
         reverse: bool,
+        visit: F,
+    ) -> Result<bool, EtsError>
+    where
+        F: FnMut(&StoredTerm) -> Result<bool, EtsError>,
+    {
+        self.scan_where(
+            reverse,
+            &|key| {
+                cursor.is_none_or(|cursor| {
+                    let order = cmp(key, cursor);
+                    if reverse {
+                        order == Ordering::Less
+                    } else {
+                        order == Ordering::Greater
+                    }
+                })
+            },
+            visit,
+        )
+    }
+
+    /// Visit the objects whose keys `eligible` accepts base node after base node in key order
+    /// (descending when `reverse`) until `visit` returns true.
+    // Port of erts/emulator/beam/erl_db_catree.c, catree_find_next_root and
+    // catree_find_prev_root, OTP-29.1.1.
+    pub(crate) fn scan_where<F>(
+        &self,
+        reverse: bool,
+        eligible: &dyn Fn(Term) -> bool,
         mut visit: F,
     ) -> Result<bool, EtsError>
     where
@@ -527,23 +556,8 @@ impl CATree {
         };
         for route in iter {
             let root = route.base.read();
-            let mut objects = Vec::new();
-            Node::walk(&root, &mut objects);
-            if reverse {
-                objects.reverse();
-            }
-            for object in objects {
-                let eligible = cursor.is_none_or(|key| {
-                    let order = cmp(object.key(self.keypos), key);
-                    if reverse {
-                        order == Ordering::Less
-                    } else {
-                        order == Ordering::Greater
-                    }
-                });
-                if eligible && visit(object)? {
-                    return Ok(true);
-                }
+            if Node::scan_where(&root, reverse, eligible, self.keypos, &mut visit)? {
+                return Ok(true);
             }
         }
         Ok(false)

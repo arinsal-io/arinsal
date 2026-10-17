@@ -35,6 +35,20 @@ pub(crate) enum HeadKey {
     Bound(Term),
 }
 
+/// How the clause heads of a program name the key of an ordered table.
+// Port of `enum ms_key_boundness` and `struct mp_info` in erts/emulator/beam/erl_db_tree.c,
+// OTP-29.1.1.
+pub(crate) enum TreeKeys {
+    /// No clause head can match any object.
+    Impossible,
+    /// Some clause matches any key.
+    Unbound,
+    /// Every key a clause names lies between `least` and `most`, both possibly partly bound.
+    Partial { least: Term, most: Term },
+    /// Every clause names the same fully bound key.
+    Bound,
+}
+
 /// An immutable match program reusable by ETS and tracing.
 pub struct MatchProgram {
     // Clauses point into this stable, private heap.
@@ -1092,6 +1106,49 @@ impl MatchProgram {
             || bounds.least.is_some()
             || bounds.most.is_some())
         .then_some(bounds)
+    }
+
+    /// How the clause heads bound the key of an ordered table.
+    // Port of erts/emulator/beam/erl_db_tree.c, analyze_pattern and key_boundness, OTP-29.1.1.
+    pub(crate) fn tree_keys(&self, keypos: usize) -> TreeKeys {
+        const UNBOUND: u8 = 0;
+        const PARTIAL: u8 = 1;
+        const BOUND: u8 = 2;
+        const IMPOSSIBLE: u8 = 3;
+        let mut boundness = IMPOSSIBLE;
+        let mut least: Option<Term> = None;
+        let mut most: Option<Term> = None;
+        for clause in &self.clauses {
+            let head = clause.head;
+            let (kind, key) = if is_match_variable(head) {
+                (UNBOUND, None)
+            } else {
+                match keypos
+                    .checked_sub(1)
+                    .and_then(|index| tuple_view(head)?.get(index))
+                {
+                    None => (IMPOSSIBLE, None),
+                    Some(key) if is_fully_bound(key) => (BOUND, Some(key)),
+                    Some(key) if !is_match_variable(key) && !has_map(key) => (PARTIAL, Some(key)),
+                    Some(_) => (UNBOUND, None),
+                }
+            };
+            if let Some(key) = key {
+                if least.is_none_or(|l| partly_bound_can_match_lesser(key, l)) {
+                    least = Some(key);
+                }
+                if most.is_none_or(|m| partly_bound_can_match_greater(key, m)) {
+                    most = Some(key);
+                }
+            }
+            boundness = boundness.min(kind);
+        }
+        match (boundness, least, most) {
+            (IMPOSSIBLE, ..) => TreeKeys::Impossible,
+            (BOUND, Some(least), Some(most)) if exact_eq(least, most) => TreeKeys::Bound,
+            (BOUND | PARTIAL, Some(least), Some(most)) => TreeKeys::Partial { least, most },
+            _ => TreeKeys::Unbound,
+        }
     }
 
     /// How each clause head names the key, as `analyze_pattern` classifies it for a hash table.

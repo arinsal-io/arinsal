@@ -326,18 +326,43 @@ impl Node {
     where
         F: FnMut(&StoredTerm) -> Result<bool, EtsError>,
     {
+        Self::scan_where(
+            root,
+            reverse,
+            &|key| {
+                cursor.is_none_or(|cursor| {
+                    let order = cmp(key, cursor);
+                    if reverse {
+                        order == Ordering::Less
+                    } else {
+                        order == Ordering::Greater
+                    }
+                })
+            },
+            keypos,
+            visit,
+        )
+    }
+
+    /// Visit the objects whose keys `eligible` accepts in key order (descending when `reverse`)
+    /// until `visit` returns true. The accepted keys must be a prefix of that order.
+    ///
+    /// Port of erts/emulator/beam/erl_db_tree.c, traverse_forward, traverse_backwards,
+    /// find_next and find_prev, OTP-29.1.1.
+    pub(super) fn scan_where<F>(
+        root: &Option<Box<Self>>,
+        reverse: bool,
+        eligible: &dyn Fn(Term) -> bool,
+        keypos: usize,
+        visit: &mut F,
+    ) -> Result<bool, EtsError>
+    where
+        F: FnMut(&StoredTerm) -> Result<bool, EtsError>,
+    {
         let mut pending = Vec::new();
         let mut current = root.as_deref();
         while let Some(node) = current {
-            let eligible = cursor.is_none_or(|key| {
-                let order = cmp(node.object.key(keypos), key);
-                if reverse {
-                    order == Ordering::Less
-                } else {
-                    order == Ordering::Greater
-                }
-            });
-            if eligible {
+            if eligible(node.object.key(keypos)) {
                 pending.push(node);
                 current = if reverse {
                     node.right.as_deref()

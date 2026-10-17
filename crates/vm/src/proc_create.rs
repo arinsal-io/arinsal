@@ -1731,8 +1731,10 @@ pub(crate) struct EtsSelect {
     pub(crate) program: std::sync::Arc<arinsal_ets::match_spec::MatchProgram>,
     /// `select_count/2` instead of a result list.
     pub(crate) count: bool,
-    /// The next slot to visit.
-    pub(crate) slot: usize,
+    /// Where the traversal resumes.
+    pub(crate) position: arinsal_ets::ScanPosition,
+    /// An ordered table is traversed from its last key downward, `select_reverse/2` upward.
+    pub(crate) backwards: bool,
     /// Objects counted so far (`select_count/2`).
     pub(crate) got: usize,
     /// Results of the earlier cycles.

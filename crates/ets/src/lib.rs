@@ -9,8 +9,10 @@ pub use hash_select::{
 };
 pub mod rwmtx;
 mod tree;
+mod tree_select;
 use catree::CATree;
 use tree::Node;
+pub use tree_select::{SavedKey, ScanPosition, TREE_SELECT_ITERATIONS, TreeScanEnd, TreeScanPlan};
 
 use arinsal_term::{
     Atom, ExportEntry, ExternalBinary, FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard,
