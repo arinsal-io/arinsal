@@ -294,6 +294,10 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     if fetched.is_ok()
         && let Some(message) = process.inbox.get(process.receive_cursor)
     {
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_receive_helper,
+        // `consumed_reds += 4` per fetch), OTP-29.1.1: the call site published FCALLS
+        // (Update::REDUCTIONS) and reloads it afterwards.
+        process.header.fcalls = process.header.fcalls.saturating_sub(4);
         return crate::native_hooks::raw(*message);
     }
     process.delay_gc = false;

@@ -61,20 +61,25 @@ impl ReceiveFragments {
         })
         .map_err(fail)?;
         code.b_cond(Cond::Le, schedule_out).map_err(fail)?;
-        emit_enter_runtime(&mut code, 0, Update::HEAP_ALLOC).map_err(fail)?;
+        emit_enter_runtime(&mut code, 0, Update::HEAP_ALLOC.union(Update::REDUCTIONS))
+            .map_err(fail)?;
         code.emit(|e| {
             e.mov_reg(ARG1, C_P)?;
             e.mov_const(SUPER_TMP, loop_rec as *const () as u64)?;
             e.blr(SUPER_TMP)
         })
         .map_err(fail)?;
-        emit_leave_runtime(&mut code, 0, Update::HEAP_ALLOC).map_err(fail)?;
+        emit_leave_runtime(&mut code, 0, Update::HEAP_ALLOC.union(Update::REDUCTIONS))
+            .map_err(fail)?;
         code.emit(|e| e.cmp_imm(ARG1, LOOP_REC_FETCH, false))
             .map_err(fail)?;
         code.b_cond(Cond::Hi, done).map_err(fail)?;
+        // A fetch the hook did not finish in place runs the helper on the scheduler side,
+        // which charges its own four reductions; an empty inner queue is charged here.
+        code.cbnz(ARG1, schedule_out).map_err(fail)?;
         code.emit(|e| e.subs_imm(FCALLS, FCALLS, 4, false))
             .map_err(fail)?;
-        code.cbz(ARG1, wait).map_err(fail)?;
+        code.b(wait).map_err(fail)?;
 
         code.bind(schedule_out).map_err(fail)?;
         code.emit(|e| {

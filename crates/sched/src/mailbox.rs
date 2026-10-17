@@ -470,6 +470,12 @@ impl<T: InSignal> Incoming<T> {
         self.pending.load(Ordering::SeqCst) != 0
     }
 
+    /// Whether a non-message signal waits in the in-queue or its buffers.
+    // Port of erts/emulator/beam/erl_process.h (ERTS_PSFLG_NMSG_SIG_IN_Q), OTP-29.1.1.
+    pub fn has_pending_nmsg(&self) -> bool {
+        self.nmsgs.load(Ordering::SeqCst) != 0
+    }
+
     /// Take the whole in-queue, in order, for the receiver's inner queue: the
     /// receiver handles the signals and moves the messages into its own message queue.
     // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch: the outer
