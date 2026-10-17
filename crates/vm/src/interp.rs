@@ -815,11 +815,7 @@ pub(crate) fn gc_stress_enabled() -> bool {
 /// (jit/arm/process_main.cpp, copy_in_registers) and leaves the rest of the array dirty.
 #[inline]
 pub(crate) fn xreg_poison_enabled() -> bool {
-    static XREG_POISON: OnceLock<bool> = OnceLock::new();
-    cfg!(debug_assertions)
-        && *XREG_POISON.get_or_init(|| {
-            std::env::var_os("ARINSAL_XREG_POISON").as_deref() == Some(std::ffi::OsStr::new("1"))
-        })
+    crate::debug_env::slice::get() & crate::debug_env::slice::XREG_POISON != 0
 }
 
 /// A catch-tagged immediate with the largest index: no valid register value looks like it, a
@@ -1932,7 +1928,7 @@ impl Vm {
                     sync_cursor(p, htop, &mut heap_dirty);
                     p.reductions = reds;
                     p.heap.release_stack(1);
-                    p.cold_mut().native_continuation_resume = true;
+                    p.native_continuation_resume = true;
                     p.set_native_resume_arity(1);
                     p.native_pc = Some(cp as usize);
                     p.cold_mut().native_transfer = true;
@@ -2370,9 +2366,6 @@ impl Vm {
                     // OTP-29.1.1: a static NIF flagged dirty first moves the process to a
                     // dirty scheduler of its class, which executes this body again.
                     let module_name = self.code.modules[module_id].name.as_str();
-                    if module_name == "zstd" {
-                        crate::native_helpers::note_zstd_caller(p);
-                    }
                     let to_dirty = if pending.is_none()
                         && matches!(
                             module_name,

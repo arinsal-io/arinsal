@@ -416,6 +416,13 @@ pub struct Process {
     pub(crate) entry: bool,
     /// A dist send that suspended must yield even if the queue drains before return.
     pub(crate) force_yield: bool,
+    /// The next native entry resumes a raw continuation already on the stack.
+    pub(crate) native_continuation_resume: bool,
+    /// `header.arity` already holds the live X register count of the resumed native
+    /// continuation. Unset, the next native entry is a call and takes the function's arity.
+    pub(crate) native_arity_set: bool,
+    /// Pc of the native instruction that raised the exception being dispatched (0 if none).
+    pub(crate) native_error_pc: usize,
 }
 // SAFETY: ProcessHeader pointers refer only to this process's stable heap/code allocations.
 // The scheduler transfers exclusive ownership of each Process between workers.
@@ -926,11 +933,6 @@ pub(crate) struct ProcessCold {
     pub(crate) prio_len: usize,
     /// Saved ordinary-message cursor while a newly arrived priority section is scanned.
     pub(crate) priority_resume_cursor: Option<usize>,
-    /// The next native entry resumes a raw continuation already on the stack.
-    pub(crate) native_continuation_resume: bool,
-    /// `header.arity` already holds the live X register count of the resumed native
-    /// continuation. Unset, the next native entry is a call and takes the function's arity.
-    pub(crate) native_arity_set: bool,
     /// A native `wait`/`wait_timeout` asked the scheduler to sleep (timeout in ms, `None` for
     /// `infinity`); the process resumes at the native `loop_rec` label.
     pub(crate) native_wait: Option<Option<u64>>,
@@ -945,8 +947,6 @@ pub(crate) struct ProcessCold {
     /// Sessions whose return_to frame a traced BIF raised through; the exception's catch
     /// reports their return_to events.
     pub(crate) bif_return_to: Vec<u64>,
-    /// Pc of the native instruction that raised the exception being dispatched (0 if none).
-    pub(crate) native_error_pc: usize,
     /// The current apply comes from native code, whose call site names the caller frame.
     pub(crate) native_apply: bool,
     /// Call site (module, ip) of a traced native BIF whose call event was emitted and which
@@ -1430,7 +1430,7 @@ impl Process {
     // switched-out process takes that count.
     pub(crate) fn set_native_resume_arity(&mut self, live: u8) {
         self.header.arity = live;
-        self.cold_mut().native_arity_set = true;
+        self.native_arity_set = true;
     }
 
     /// Live X register count of a switched-out process (`c_p->arity`), bounded by the
@@ -1617,6 +1617,9 @@ impl Process {
             exc_class: None,
             entry: false,
             force_yield: false,
+            native_continuation_resume: false,
+            native_arity_set: false,
+            native_error_pc: 0,
         };
         process.sync_header();
         #[cfg(feature = "pf-mem-counters")]

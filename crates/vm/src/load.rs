@@ -1085,11 +1085,21 @@ impl Vm {
     /// Makes this VM read the tables of `erts_active_code_ix()`. A VM keeps the tables it
     /// looked at last until its next code access point, like erts' processes keep the code
     /// index they were scheduled in with.
+    // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-247 and code_ix.h
+    // (erts_active_code_ix), OTP-29.1.1: with the code index unchanged this is one load and a
+    // compare.
+    #[inline(always)]
     pub(crate) fn refresh_code(&mut self) {
         if self.code.generation != self.code_ix.active_generation() {
-            self.code = self.code_ix.active_tables();
-            self.native_fns = self.code_ix.native_fns();
+            self.reload_code();
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reload_code(&mut self) {
+        self.code = self.code_ix.active_tables();
+        self.native_fns = self.code_ix.native_fns();
     }
 
     /// Generation of the tables this VM reads; interpreter caches are valid only within it.
@@ -1097,6 +1107,7 @@ impl Vm {
         self.code.generation
     }
 
+    #[inline(always)]
     pub(crate) fn sync_module(&mut self, id: usize) {
         if id >= self.code.modules.len() || id >= self.code.registers.len() {
             self.refresh_code();

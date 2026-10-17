@@ -453,6 +453,16 @@ fn thread_hub() -> Option<Hub> {
     HUB.with(|hub| hub.borrow().as_ref().map(Hub::resolved))
 }
 
+/// The process this thread's scheduler runs, as an immediate pid term: erts' `enif_self` of
+/// the built-in `zstd` NIFs reads `esdp->current_process` instead of a per-slice store.
+pub(crate) fn scheduler_caller() -> Option<Term> {
+    HUB.with(|hub| {
+        hub.borrow()
+            .as_ref()
+            .and_then(|hub| hub.current_pid().to_term())
+    })
+}
+
 /// The hub of the most recent NIF caller: NIF-created threads and the poller have no
 /// thread-local hub, but erts has one global runtime.
 static GLOBAL_HUB: Mutex<Option<Hub>> = Mutex::new(None);

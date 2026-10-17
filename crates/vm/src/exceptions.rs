@@ -856,10 +856,7 @@ fn save_raw(
             .backtrace_depth
             .load(std::sync::atomic::Ordering::Acquire)
     });
-    let error_pc = p
-        .cold
-        .as_deref_mut()
-        .map_or(0, |cold| std::mem::take(&mut cold.native_error_pc));
+    let error_pc = std::mem::take(&mut p.native_error_pc);
     // `handle_error` passes its `pc` directly to `save_stacktrace`; frame identity is
     // resolved later by `build_stacktrace` through the active ranges table.
     let native_pc = (error_pc != 0).then_some(error_pc);
