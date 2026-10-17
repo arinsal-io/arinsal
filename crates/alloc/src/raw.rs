@@ -98,6 +98,38 @@ impl NodeRef {
     }
 }
 
+/// The header of an aoff main block carrier, read through the carrier's address like
+/// `AOFF_Carrier_t` in erl_ao_firstfit_alloc.c: the carrier tree links carrier header to carrier
+/// header, and the chosen carrier's block tree root and size are fields of that header.
+#[derive(Clone, Copy)]
+pub(crate) struct CarrierHeaderRef {
+    ptr: usize,
+}
+
+impl CarrierHeaderRef {
+    /// The header of the carrier starting at `start`, without any check.
+    ///
+    /// # Safety
+    ///
+    /// `start` must be the first address of a live main block carrier of the calling allocator
+    /// whose header is longer than every offset passed to `word`, so each word read through the
+    /// result lies inside that carrier, and `start` must be word aligned. The carrier tree of the allocator links
+    /// only such carriers: a carrier is removed from the tree before it is released.
+    #[inline(always)]
+    pub(crate) unsafe fn at(start: usize) -> Self {
+        Self { ptr: start }
+    }
+
+    /// The word at byte offset `byte` of the header.
+    #[inline(always)]
+    pub(crate) fn word(self, byte: usize) -> usize {
+        // SAFETY: `at` requires that the whole header lie inside a live carrier and callers pass
+        // an offset inside the header; the carrier is not accessed from another thread while the
+        // allocator is borrowed.
+        unsafe { (self.ptr as *const usize).byte_add(byte).read() }
+    }
+}
+
 /// Pointer and extent for a typed allocator block.
 pub(crate) struct WordView {
     ptr: usize,
