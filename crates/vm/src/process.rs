@@ -1369,12 +1369,10 @@ impl Executor {
         }
         let (mut need_x, need_fr) = self.vm.code.registers[process.module];
         if crate::beamasm_integration::enabled() {
-            // A native continuation's live X count is `c_p->arity + 1`
+            // A switched-out process's live X count is `c_p->arity`
             // (`header.arity`), independent of the interpreter module whose
-            // register count sized this file. The cold `native_resume_live`
-            // copy is at most that, or a small constant (5) already covered
-            // by the floor of 8. Reading the cold box here was a cache miss
-            // on every schedule-in.
+            // register count sized this file. Reading the cold box here
+            // was a cache miss on every schedule-in.
             need_x = need_x
                 .max(8)
                 .max(usize::from(process.header.arity).saturating_add(1));
@@ -1580,7 +1578,7 @@ impl Executor {
                             Ok(value) => {
                                 process.x[0] = value;
                                 process.cold_mut().native_continuation_resume = true;
-                                process.cold_mut().native_resume_live = 2;
+                                process.set_native_resume_arity(1);
                                 process.native_pc = Some(resume_pc);
                                 if ctx.scheduler_type().is_dirty() {
                                     break Ok(RunState::Yield);
@@ -1645,7 +1643,7 @@ impl Executor {
                             }
                         } else {
                             process.cold_mut().native_continuation_resume = true;
-                            process.cold_mut().native_resume_live = 2;
+                            process.set_native_resume_arity(1);
                             process.native_pc = Some(resume_pc);
                         }
                         continue;
@@ -1845,7 +1843,7 @@ impl Executor {
                                     // slice began; the process resumes at the `loop_rec` label with
                                     // no live X registers.
                                     process.gc_live = 0;
-                                    process.cold_mut().native_resume_live = 1;
+                                    process.set_native_resume_arity(0);
                                     // A receive without clauses blocks even with messages queued,
                                     // like the interpreter's self-targeting `wait`.
                                     let self_wait =
@@ -1903,7 +1901,7 @@ impl Executor {
                                         }
                                     } else {
                                         process.cold_mut().native_continuation_resume = true;
-                                        process.cold_mut().native_resume_live = 2;
+                                        process.set_native_resume_arity(1);
                                         process.native_pc = Some(resume_pc);
                                     }
                                     continue;
@@ -2017,7 +2015,7 @@ impl Executor {
                                     }
                                     if !handler || cycle {
                                         process.cold_mut().native_continuation_resume = true;
-                                        process.cold_mut().native_resume_live = 2;
+                                        process.set_native_resume_arity(1);
                                         process.native_pc = Some(resume_pc);
                                         continue;
                                     }
@@ -2126,8 +2124,7 @@ impl Executor {
                                     // breakpoint stub saves the function's arguments in
                                     // `c_p->arity`), OTP-29.1.1: a collection while the process
                                     // is switched out, such as a delayed dirty one, roots them.
-                                    process.cold_mut().native_resume_live =
-                                        function.arity.saturating_add(1);
+                                    process.set_native_resume_arity(function.arity);
                                     process.gc_live = usize::from(function.arity);
                                     process.native_pc = Some(resume_pc);
                                     // A loop of traced calls leaves native code on every call and
@@ -3439,27 +3436,36 @@ impl Executor {
             result,
             Ok(RunState::Yield | RunState::Wait { .. }) | Err(VmError::Yield | VmError::Dirty(_))
         ) {
-            let (live_x, live_fr) = self.vm.code.registers[process.module];
-            // A native continuation keeps the live X registers of its yield site, which the
-            // interpreted module's register count does not bound.
-            let native_live = if process.native_pc.is_some() {
-                process
-                    .cold
-                    .as_ref()
-                    .map_or(0, |cold| usize::from(cold.native_resume_live))
-            } else {
-                0
-            };
-            // A pending exception handler reads x0-x3 even when the module's own register
-            // count is lower (`gc_live` is 4 from handler entry until it runs).
+            let (module_x, live_fr) = self.vm.code.registers[process.module];
             // Port of erts/emulator/beam/erl_process.c:10550 and beam_common.c (the yield or
             // wait site stores its live X register count in `c_p->arity`, and only those are
-            // saved in `c_p->arg_reg`), OTP-29.1.1: a native continuation records that count
-            // (plus one) in `native_resume_live`.
-            let live_x = if process.native_pc.is_some() && native_live != 0 {
-                (native_live - 1).max(process.gc_live)
+            // saved in `c_p->arg_reg`), OTP-29.1.1: a native continuation already holds it in
+            // `header.arity`; an interpreted switch-out has it in `gc_live`, the count of its
+            // last live operand or call arity (4 from exception handler entry until it runs).
+            // A native call the scheduler redoes (BIF trap, traced apply) carries the larger of
+            // the two, whichever side stated it. From here on `header.arity` is the one count
+            // every reader of the saved file takes.
+            let arity_set = process.native_pc.is_some()
+                && process
+                    .cold
+                    .as_ref()
+                    .is_some_and(|cold| cold.native_arity_set);
+            let live_x = if arity_set {
+                usize::from(process.header.arity)
+            } else if process.native_pc.is_some() {
+                process.gc_live.max(usize::from(process.header.arity))
             } else {
-                live_x.max(native_live).max(process.gc_live)
+                process.gc_live
+            };
+            process.header.arity = live_x.min(usize::from(u8::MAX)) as u8;
+            process.gc_live = live_x;
+            // Until every reader of a dead X register is gone (the poison knob finds them), a
+            // switch-out that did not state its count through a native continuation keeps the
+            // module's whole register file, as before; only `header.arity` registers are roots.
+            let save_x = if arity_set {
+                live_x
+            } else {
+                live_x.max(module_x)
             };
             if crate::native_bridge::return_trace_enabled() && process.native_pc.is_some() {
                 eprintln!(
@@ -3472,10 +3478,10 @@ impl Executor {
             }
             // Port of erts/emulator/beam/erl_process.h (`def_arg_reg`): up to six saved X
             // registers stay inline in the process, so switching out allocates nothing.
-            if process.x.len() != live_x {
-                process.x = crate::proc_create::ArgRegs::new(live_x);
+            if process.x.len() != save_x {
+                process.x = crate::proc_create::ArgRegs::new(save_x);
             }
-            let copy_x = self.x.len().min(live_x);
+            let copy_x = self.x.len().min(save_x);
             process.x[..copy_x].copy_from_slice(&self.x[..copy_x]);
             process.x[copy_x..].fill(Term::NIL);
             if process.fr.len() != live_fr {
@@ -3636,9 +3642,6 @@ impl Executor {
     }
 }
 
-/// Exact live X register count of a process that just switched out: a native
-/// continuation records `live + 1` in `native_resume_live` (the JIT's `c_p->arity`),
-/// interpreted code its switch-out point's count in `gc_live`.
 /// Collect when a slice starts and the heap wants it.
 ///
 /// The caller has already drained the outer queue, so a message that woke this
@@ -3650,7 +3653,12 @@ fn collect_on_schedule_in(process: &mut Process) -> Result<(), VmError> {
     process.collect_bin_vheap_if_due(switched_out_live(process))
 }
 
+/// Exact live X register count of a switched-out process, erts `c_p->arity`. Every
+/// producer of a saved register file stores it in `header.arity`: the native yield
+/// sites and trap continuations directly, an interpreted switch-out through the
+/// executor epilogue, a spawn or hibernate when it fills the file.
 pub(crate) fn switched_out_live(process: &Process) -> usize {
+    // A trap whose arguments are GC roots of its own keeps no live X registers.
     if process
         .cold
         .as_ref()
@@ -3659,19 +3667,7 @@ pub(crate) fn switched_out_live(process: &Process) -> usize {
     {
         return 0;
     }
-    let native_live = if process.native_pc.is_some() {
-        process
-            .cold
-            .as_ref()
-            .map_or(0, |cold| usize::from(cold.native_resume_live))
-    } else {
-        0
-    };
-    match native_live {
-        0 => process.gc_live,
-        live => live - 1,
-    }
-    .min(process.x.len())
+    process.saved_arity()
 }
 
 /// Return address, native code generation, code tables generation and the owning module.
@@ -3738,7 +3734,7 @@ fn resume_after_native_return(process: &mut Process) -> bool {
         if crate::native_bridge::is_native_continuation(raw) {
             process.heap.release_stack(1);
             process.cold_mut().native_continuation_resume = true;
-            process.cold_mut().native_resume_live = 2;
+            process.set_native_resume_arity(1);
             process.native_pc = Some(raw);
             return true;
         }
@@ -3849,6 +3845,7 @@ fn hibernate_collect(process: &mut Process) -> Result<(), VmError> {
         3
     };
     process.gc_live = live;
+    process.header.arity = live as u8;
     if !process.heap.gc_enabled {
         return Ok(());
     }

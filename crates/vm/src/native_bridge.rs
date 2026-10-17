@@ -653,7 +653,7 @@ pub(crate) fn commit_catch(
     match found.target {
         CatchTarget::Native(handler) => {
             process.cold_mut().native_continuation_resume = true;
-            process.cold_mut().native_resume_live = 5;
+            process.set_native_resume_arity(4);
             CatchHandler::Native(handler)
         }
         CatchTarget::Interpreted { module, ip } => {
@@ -989,19 +989,19 @@ pub fn run_native(
         .is_some_and(|cold| std::mem::take(&mut cold.native_continuation_resume));
     // A resumed call return has only x0 live and an exception handler x0..x3, whatever
     // the arity of the function the native code belongs to.
-    let resume_live = process
+    let arity_set = process
         .cold
         .as_mut()
-        .map_or(0, |cold| std::mem::take(&mut cold.native_resume_live));
+        .is_some_and(|cold| std::mem::take(&mut cold.native_arity_set));
     // Port of erts/emulator/beam/erl_process.c:10550 and jit/arm/process_main.cpp (a process
     // resumes with the `c_p->arity` live registers its yield site saved), OTP-29.1.1: only a
     // call entry needs the function's arity from the code registry.
-    let arity = if resume_live == 0 {
+    let arity = if arity_set {
+        process.header.arity
+    } else {
         native_arity_at(code_address).ok_or_else(|| {
             VmError::Unsupported(format!("unregistered native entry: {code_address:#x}"))
         })?
-    } else {
-        resume_live - 1
     };
     let live = usize::from(arity);
     // erts does no collection at swap-in (process_main restores the registers and jumps); the
@@ -1339,8 +1339,7 @@ pub fn run_native(
                 publish_yield_xregs(process, registers);
                 process.cold_mut().native_continuation_resume = true;
                 // The yield site stored its live X register count in `c_p->arity`.
-                process.cold_mut().native_resume_live = process.header.arity.saturating_add(1);
-                // Signal-time GC while switched out roots exactly these registers.
+                process.cold_mut().native_arity_set = true;
                 process.gc_live = usize::from(process.header.arity);
                 process.native_pc = Some(if resume == 0 {
                     code_ptr as usize
@@ -1372,9 +1371,7 @@ pub fn run_native(
 // stores the MFA arity in `c_p->arity`) and erl_process.c:10415 (`scheduler_gc_proc`
 // roots `p->arity` X registers), OTP-29.1.1.
 fn publish_yield_xregs(process: &mut Process, registers: &SchedulerRegisters) {
-    let live = usize::from(process.header.arity)
-        .saturating_add(1)
-        .min(registers.x_reg_array.len());
+    let live = usize::from(process.header.arity).min(registers.x_reg_array.len());
     if process.x.len() < live {
         let mut extended = process.x.to_vec();
         extended.resize(live, Term::NIL);

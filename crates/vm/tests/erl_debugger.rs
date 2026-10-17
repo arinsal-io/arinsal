@@ -532,3 +532,58 @@ many(N, A, B, C, D, E, F, G, H) ->
 "#;
     assert_debugger_fixture_matches_otp("erl_debugger_xregs_fixture", source);
 }
+
+/// A process suspended while it waits in a receive has no live X register: the count comes from
+/// the one `arity` the scheduler saved, so `peek_xreg` past it is `undefined`.
+#[test]
+fn erl_debugger_xregs_of_waiting_process_match_otp() {
+    let _serial = serial_test();
+    let source = r#"-module(erl_debugger_waiting_fixture).
+-export([run/0]).
+run() ->
+    ok = erl_debugger:toggle_instrumentations(#{line_breakpoint => true}),
+    {ok, _Session} = erl_debugger:register(self()),
+    Worker = spawn(fun() -> receive stop -> ok end end),
+    wait_waiting(Worker, 200),
+    true = erlang:suspend_process(Worker),
+    Result = {erl_debugger:xregs_count(Worker),
+              erl_debugger:peek_xreg(Worker, 0, 10),
+              erl_debugger:peek_xreg(Worker, 3, 10)},
+    true = erlang:resume_process(Worker),
+    Worker ! stop,
+    Result.
+wait_waiting(_Worker, 0) -> error(never_waiting);
+wait_waiting(Worker, N) ->
+    case erlang:process_info(Worker, status) of
+        {status, waiting} -> ok;
+        _ -> receive after 5 -> ok end, wait_waiting(Worker, N - 1)
+    end.
+"#;
+    assert_debugger_fixture_matches_otp("erl_debugger_waiting_fixture", source);
+}
+
+/// A runnable process suspended at a yield saves exactly the registers its yield site declared
+/// live, interpreted or native, and the debugger reads that count.
+#[test]
+fn erl_debugger_xregs_of_yielded_process_match_otp() {
+    let _serial = serial_test();
+    let source = r#"-module(erl_debugger_yielded_fixture).
+-export([run/0]).
+run() ->
+    ok = erl_debugger:toggle_instrumentations(#{line_breakpoint => true}),
+    {ok, _Session} = erl_debugger:register(self()),
+    Worker = spawn(fun() -> spin(alpha, beta, gamma, 0) end),
+    receive after 20 -> ok end,
+    true = erlang:suspend_process(Worker),
+    Result = {erl_debugger:xregs_count(Worker),
+              erl_debugger:peek_xreg(Worker, 0, 10),
+              erl_debugger:peek_xreg(Worker, 1, 10),
+              erl_debugger:peek_xreg(Worker, 2, 10),
+              erl_debugger:peek_xreg(Worker, 4, 10)},
+    true = erlang:resume_process(Worker),
+    exit(Worker, kill),
+    Result.
+spin(A, B, C, N) -> spin(A, B, C, N + 1).
+"#;
+    assert_debugger_fixture_matches_otp("erl_debugger_yielded_fixture", source);
+}
