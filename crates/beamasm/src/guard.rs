@@ -1450,15 +1450,16 @@ impl BeamModuleAssembler {
 
     /// Calls the C `eq(Eterm, Eterm)` on x11/x12 and leaves its result in x0 (zero extended).
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1866-1875 (emit_enter_runtime,
-    // runtime_call<eq>, emit_leave_runtime), OTP-29.1.1. No registers are published, as in erts:
-    // `eq` does not allocate or read process state.
+    // runtime_call<eq>, emit_leave_runtime), OTP-29.1.1. No process state is published, as in
+    // erts, but the caller's live X registers are not known here, so X4 and X5 are kept like
+    // erts does with its default live count of six.
     fn emit_exact_eq_call(&mut self, eq: usize) -> Result<(), ModuleError> {
         if eq == 0 {
             return Err(ModuleError::InvalidOperand(
                 "the eq helper is not installed for exact comparisons",
             ));
         }
-        emit_enter_runtime(&mut self.code, 0, Update::NONE)?;
+        emit_enter_runtime(&mut self.code, 6, Update::NONE)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), Gpr::x(11))?;
             e.mov_reg(Gpr::x(1), Gpr::x(12))?;
@@ -1466,7 +1467,7 @@ impl BeamModuleAssembler {
             e.mov_const(Gpr::x(17), eq as u64)?;
             e.blr(Gpr::x(17))
         })?;
-        emit_leave_runtime(&mut self.code, 0, Update::NONE)?;
+        emit_leave_runtime(&mut self.code, 6, Update::NONE)?;
         self.code.emit(|e| {
             e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
             // `eq` returns a C int: only the low word of x0 is defined.
