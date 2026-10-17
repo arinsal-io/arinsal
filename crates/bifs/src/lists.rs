@@ -228,6 +228,8 @@ pub enum DeferredTrap {
     Subtract(SubtractWalk),
     /// `erlang:crc32/1,2`, `adler32/1,2` or `md5/1`.
     Chksum(crate::checksum::ChksumCont),
+    /// `erlang:phash2/1,2`.
+    Phash2(Box<crate::pure::Phash2Cont>),
 }
 
 /// A finished key BIF, or a trap back to the same export.

@@ -59,7 +59,10 @@ pub use hamt::{
     swizzle_map_hash,
 };
 pub use hamt_yield::{HashmapBuild, MapReverseIter, initialize_scheduler_random};
-pub use hash::{make_hash, make_hash2, phash, phash2, phash2_range};
+pub use hash::{
+    HASH2_ITERATIONS_PER_RED, Hash2Progress, Hash2Run, make_hash, make_hash2, phash, phash2,
+    phash2_range,
+};
 pub use heap::{
     AdoptError, BinaryRef, CP_WORDS, ConsHeapBuilder, ConsHeapChain, ConsHeapSegment,
     ConsListBuilder, FrameLayout, HeapAlloc, HeapBlockBuilder, HeapReservation, LiteralArea,

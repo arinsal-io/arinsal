@@ -25,6 +25,19 @@ const CASES: &[(&str, &str, &str)] = &[
     ("md5", "bin(N)", "erlang:md5(In)"),
     ("crc32_list", "binl(N)", "erlang:crc32(In)"),
     ("md5_list", "binl(N)", "erlang:md5(In)"),
+    ("phash2_list", "lists:seq(1, N)", "erlang:phash2(In)"),
+    (
+        "phash2_list_2",
+        "lists:seq(1, N)",
+        "erlang:phash2(In, 1000)",
+    ),
+    (
+        "phash2_tuples",
+        "[{I, x, y} || I <- lists:seq(1, N)]",
+        "erlang:phash2(In)",
+    ),
+    ("phash2_bin", "bin(N)", "erlang:phash2(In)"),
+    ("phash2_str", "binl(N)", "erlang:phash2(In)"),
 ];
 
 fn source() -> String {
@@ -32,7 +45,7 @@ fn source() -> String {
     let mut bodies = String::new();
     for (name, build, call) in CASES {
         for (label, size) in SIZES {
-            if size > 100_000 && name.ends_with("_list") {
+            if size > 100_000 && (name.ends_with("_list") || name.ends_with("_str")) {
                 continue;
             }
             let function = format!("{name}_{label}");
@@ -64,14 +77,14 @@ measure(N, Build, Run) ->
         {{reductions, R1}} = process_info(self(), reductions),
         {{garbage_collection, GC}} = process_info(self(), garbage_collection),
         Parent ! {{measured, R1 - R0, is_integer(Result) orelse is_binary(Result),
-                  proplists:get_value(minor_gcs, GC)}}
+                  proplists:get_value(minor_gcs, GC), Result}}
     end, [{{min_heap_size, Words}}, {{min_bin_vheap_size, Words}}]),
     1 = erlang:trace(Pid, true, [running, {{tracer, Parent}}]),
     receive ready -> ok after 20000 -> exit(no_ready) end,
     drain(Pid),
     Pid ! go,
     receive
-        {{measured, Reds, true, Gcs}} -> {{Reds, schedule_ins(Pid, 0), Gcs}}
+        {{measured, Reds, true, Gcs, Value}} -> {{Reds, schedule_ins(Pid, 0), Gcs, Value}}
     after 20000 -> timeout
     end.
 
@@ -92,7 +105,7 @@ schedule_ins(Pid, Count) ->
     )
 }
 
-fn measured(term: &OwnedTerm) -> (i64, i64, i64) {
+fn measured(term: &OwnedTerm) -> (i64, i64, i64, &OwnedTerm) {
     let OwnedTerm::Tuple(elems) = term else {
         panic!("probe did not return a tuple: {term:?}");
     };
@@ -101,14 +114,14 @@ fn measured(term: &OwnedTerm) -> (i64, i64, i64) {
     else {
         panic!("probe returned {term:?}");
     };
-    (*reds, *ins, *gcs)
+    (*reds, *ins, *gcs, &elems[3])
 }
 
 fn functions() -> Vec<String> {
     let mut names = Vec::new();
     for (name, _, _) in CASES {
         for (label, size) in SIZES {
-            if size > 100_000 && name.ends_with("_list") {
+            if size > 100_000 && (name.ends_with("_list") || name.ends_with("_str")) {
                 continue;
             }
             names.push(format!("{name}_{label}"));
@@ -134,13 +147,16 @@ fn size_proportional_bifs_charge_and_yield_like_otp() {
         let actual = vm
             .eval_scheduled_reductions(MODULE, function, &[], 1, Some(0xB500 + index as u64), 4_000)
             .unwrap();
-        let (expected_reds, expected_ins, expected_gcs) = measured(&expected);
-        let (actual_reds, actual_ins, actual_gcs) = measured(&actual.term);
+        let (expected_reds, expected_ins, expected_gcs, expected_value) = measured(&expected);
+        let (actual_reds, actual_ins, actual_gcs, actual_value) = measured(&actual.term);
         eprintln!(
             "{function}: erl reds {expected_reds} ins {expected_ins} gcs {expected_gcs}; \
              arinsal reds {actual_reds} ins {actual_ins} gcs {actual_gcs}"
         );
         let tolerance = SLACK + 4 * expected_ins;
+        if expected_value != actual_value {
+            failures.push(format!("{function}: the result differs from OTP"));
+        }
         if expected_ins != actual_ins
             || !(expected_reds - tolerance..=expected_reds + tolerance).contains(&actual_reds)
         {
