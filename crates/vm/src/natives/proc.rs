@@ -3,7 +3,9 @@
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
-use arinsal_term::{FunRef, Identity, Term, TermBuilder, TermKind, global_atoms};
+use arinsal_term::{
+    FunRef, HeapReservation, Identity, Term, TermBuilder, TermError, TermKind, global_atoms,
+};
 use std::sync::atomic::Ordering;
 
 fn atom(name: &str) -> Term {
@@ -72,6 +74,63 @@ fn make_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
     TermBuilder::new(&mut heap)
         .tuple(values)
         .map_err(|error| VmError::Unsupported(format!("process tuple allocation: {error:?}")))
+}
+
+/// One `erts_produce_heap(hfact, words, extra)` of `process_info`: a block of exactly `words`
+/// words that lands on the young heap when it fits and otherwise whole in one heap fragment of
+/// `words + extra` words, filled by `build` through a [`TermBuilder`].
+///
+/// Port of `erts_produce_heap` (erts/emulator/beam/erl_message.h) and `erts_reserve_heap__`
+/// (erl_message.c) on the process factory of `process_info_bif` (erl_bif_info.c), OTP-29.1.1.
+fn info_produce<R>(
+    process: &mut Process,
+    extra: usize,
+    words: usize,
+    build: impl FnOnce(
+        &mut TermBuilder<'_, HeapReservation<'_, arinsal_bifs::ProcessHeapHandle<'_>>>,
+    ) -> Result<R, TermError>,
+) -> Result<R, VmError> {
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut block = HeapReservation::with_extra(&mut heap, words, extra)
+        .map_err(|error| VmError::Unsupported(format!("process info allocation: {error:?}")))?;
+    build(&mut TermBuilder::new(&mut block))
+        .map_err(|error| VmError::Unsupported(format!("process info allocation: {error:?}")))
+}
+
+/// `ERTS_PI_UNRESERVE`: take `words` out of the words still reserved for the result.
+fn info_unreserve(reserve: &mut usize, words: usize) {
+    *reserve = reserve.saturating_sub(words);
+}
+
+/// `ERTS_MAX_HEAP_SIZE_MAP_SZ` (erl_gc.h): a four-key flat map and its key tuple.
+const MAX_HEAP_SIZE_MAP_WORDS: usize = 2 * 4 + 1 + 3;
+
+/// `ERTS_PROCESS_GC_INFO_MAX_SIZE` (erl_gc.h): eleven rows of cons, 2-tuple and a bignum.
+const GC_INFO_MAX_WORDS: usize = 11 * (2 + 3 + 2);
+
+/// The `reserve_size` column of `pi_args` (erl_bif_info.c) for `key`: words `process_info_aux`
+/// asks the factory for besides the result tuple.
+fn info_reserve_words(key: Term) -> usize {
+    if dictionary_lookup(key).is_some() {
+        return 3;
+    }
+    match key.as_atom() {
+        Some(arinsal_term::atoms::CURRENT_FUNCTION | arinsal_term::atoms::INITIAL_CALL) => 4,
+        Some(arinsal_term::atoms::GARBAGE_COLLECTION) => 5 * (3 + 2) + MAX_HEAP_SIZE_MAP_WORDS,
+        Some(arinsal_term::atoms::GARBAGE_COLLECTION_INFO) => GC_INFO_MAX_WORDS,
+        _ => 0,
+    }
+}
+
+/// The `reserve_size` `process_info_bif` hands to the factory: one result tuple for a single
+/// item, a 2-tuple and a cons per item for a list, plus each item's own column.
+fn info_reserve_total(keys: &[Term], singleton: bool) -> usize {
+    if singleton {
+        return 3 + keys.first().map_or(0, |key| info_reserve_words(*key));
+    }
+    keys.iter()
+        .map(|key| info_reserve_words(*key) + 3 + 2)
+        .sum()
 }
 
 /// Scheduler priority named by a `priority` process flag value.
@@ -309,8 +368,18 @@ fn process_info(
         .collect()
     };
     let info_reds = i32::try_from(keys.len()).unwrap_or(i32::MAX);
-    let mut pairs = Vec::new();
-    for key in keys {
+    let singleton = !list_form && !all_form;
+    // Port of erts/emulator/beam/erl_bif_info.c (process_info_bif, erts_process_info),
+    // OTP-29.1.1: the result is sized up front (`reserve_size`) and every part is one
+    // factory allocation, so a part lands on the heap or whole in a heap fragment.
+    let mut reserve = info_reserve_total(&keys, singleton);
+    let skipped = |key: Term, value: Term| {
+        key.as_atom() == Some(arinsal_term::atoms::REGISTERED_NAME)
+            && value == Term::NIL
+            && !list_form
+    };
+    if singleton {
+        let key = keys[0];
         let (tuple_key, value) = process_info_aux(
             vm,
             src,
@@ -320,24 +389,82 @@ fn process_info(
             status,
             heap_size,
             total_heap_size,
+            &mut reserve,
         )?;
-        if key.as_atom() == Some(arinsal_term::atoms::REGISTERED_NAME)
-            && value == Term::NIL
-            && !list_form
-        {
+        let result = if skipped(key, value) {
+            Term::NIL
+        } else {
+            info_unreserve(&mut reserve, 3);
+            info_produce(process, reserve, 3, |block| {
+                block.tuple(&[tuple_key, value])
+            })?
+        };
+        // A request handled on its target bumps nothing: the caller is charged when it takes the reply.
+        if charge {
+            charge_info_reductions(process, info_reds);
+        }
+        return Ok(result);
+    }
+    // The items other than `{dictionary, Key}` first, last item first, one value per distinct
+    // item (`part_res`).
+    let mut parts: Vec<(Term, Option<Term>)> = Vec::with_capacity(keys.len());
+    for key in keys.iter().rev().copied() {
+        if dictionary_lookup(key).is_some() || parts.iter().any(|(done, _)| *done == key) {
             continue;
         }
-        pairs.push(make_tuple(process, &[tuple_key, value])?);
+        let (tuple_key, value) = process_info_aux(
+            vm,
+            src,
+            process,
+            pid,
+            key,
+            status,
+            heap_size,
+            total_heap_size,
+            &mut reserve,
+        )?;
+        if skipped(key, value) {
+            parts.push((key, None));
+            continue;
+        }
+        info_unreserve(&mut reserve, 3);
+        let pair = info_produce(process, reserve, 3, |block| {
+            block.tuple(&[tuple_key, value])
+        })?;
+        parts.push((key, Some(pair)));
+    }
+    let mut result = Term::NIL;
+    for key in keys.iter().rev().copied() {
+        let pair = if dictionary_lookup(key).is_some() {
+            let (tuple_key, value) = process_info_aux(
+                vm,
+                src,
+                process,
+                pid,
+                key,
+                status,
+                heap_size,
+                total_heap_size,
+                &mut reserve,
+            )?;
+            info_unreserve(&mut reserve, 3);
+            info_produce(process, reserve, 3, |block| {
+                block.tuple(&[tuple_key, value])
+            })?
+        } else {
+            match parts.iter().find(|(done, _)| *done == key) {
+                Some((_, Some(pair))) => *pair,
+                _ => continue,
+            }
+        };
+        info_unreserve(&mut reserve, 2);
+        result = info_produce(process, reserve, 2, |block| block.cons(pair, result))?;
     }
     // A request handled on its target bumps nothing: the caller is charged when it takes the reply.
     if charge {
         charge_info_reductions(process, info_reds);
     }
-    if list_form || all_form {
-        make_list(process, pairs)
-    } else {
-        Ok(pairs.into_iter().next().unwrap_or(Term::NIL))
-    }
+    Ok(result)
 }
 
 /// The item names `process_info_aux` answers. A key outside this list is `badarg`.
@@ -508,7 +635,11 @@ fn process_info_aux(
     status: Term,
     heap_size: usize,
     total_heap_size: usize,
+    reserve: &mut usize,
 ) -> Result<(Term, Term), VmError> {
+    // Port of the `ERTS_PI_UNRESERVE(reserve_size, pi_ix2rsz(item_ix))` that starts `process_info_aux`
+    // (erl_bif_info.c), OTP-29.1.1.
+    info_unreserve(reserve, info_reserve_words(key));
     // Callers check `remote_readable` and `needs_vm` for a foreign source before the lock.
     debug_assert!(match src {
         InfoSource::Other(rp) => remote_readable(key) && !needs_vm(rp, key),
@@ -661,24 +792,22 @@ fn process_info_aux(
         arinsal_term::atoms::INITIAL_CALL => match src.read(process).initial_mfa {
             // Port of erts/emulator/beam/erl_bif_info.c:2027 (ERTS_PI_IX_INITIAL_CALL), OTP-29.1.1:
             // `p->u.initial` is the spawn MFA.
-            Some((module, function, arity)) => make_tuple(
-                process,
-                &[
-                    Term::atom(module),
-                    Term::atom(function),
-                    Term::small(i64::from(arity)).ok_or_else(badarg)?,
-                ],
-            )?,
+            Some((module, function, arity)) => {
+                let arity = Term::small(i64::from(arity)).ok_or_else(badarg)?;
+                info_produce(process, *reserve, 4, |block| {
+                    block.tuple(&[Term::atom(module), Term::atom(function), arity])
+                })?
+            }
             None => process_info_item_initial_call(vm, process)?,
         },
         arinsal_term::atoms::CURRENT_FUNCTION => process_info_item_current_function(vm, process)?,
         arinsal_term::atoms::CURRENT_LOCATION => process_info_item_current_location(vm, process)?,
         arinsal_term::atoms::CURRENT_STACKTRACE => current_stacktrace(vm, process)?,
         arinsal_term::atoms::GARBAGE_COLLECTION => {
-            process_info_item_garbage_collection(src, process)?
+            process_info_item_garbage_collection(src, process, *reserve)?
         }
         arinsal_term::atoms::GARBAGE_COLLECTION_INFO => {
-            process_info_item_garbage_collection_info(process)?
+            process_info_item_garbage_collection_info(process, *reserve)?
         }
         // Port of erts/emulator/beam/erl_bif_info.c:2183 (ERTS_PI_IX_LAST_CALLS), OTP-29.1.1.
         arinsal_term::atoms::LAST_CALLS => match crate::trace::saved_calls(src.read(process)) {
@@ -1009,78 +1138,77 @@ fn process_info_item_current_location(
     })
 }
 
+/// Port of `ERTS_PI_IX_GARBAGE_COLLECTION` in erts/emulator/beam/erl_bif_info.c
+/// (`process_info_aux`), OTP-29.1.1: the `max_heap_size` map is one factory allocation and the
+/// five rows are one more, `5 * (3 + 2)` words.
 #[inline(never)]
 fn process_info_item_garbage_collection(
     src: InfoSource<'_>,
     process: &mut Process,
+    reserve: usize,
 ) -> Result<Term, VmError> {
-    Ok({
-        let rp = src.read(process);
-        let stored = stored_max_heap(rp);
-        let min_bin_vheap_size = rp.heap.min_bin_vheap_size();
-        let min_heap_size = rp.heap.min_heap_size_words();
-        let fullsweep_after = rp.heap.fullsweep_after();
-        let minor_gcs = rp.heap.minor_gcs();
-        let limit = max_heap_map(process, stored)?;
-        // Port of erts/emulator/beam/erl_bif_info.c:2072-2087
-        // (ERTS_PI_IX_GARBAGE_COLLECTION), OTP-29.1.1.
-        let entries = [
+    let rp = src.read(process);
+    let stored = stored_max_heap(rp);
+    let min_bin_vheap_size = rp.heap.min_bin_vheap_size();
+    let min_heap_size = rp.heap.min_heap_size_words();
+    let fullsweep_after = rp.heap.fullsweep_after();
+    let minor_gcs = rp.heap.minor_gcs();
+    let limit = max_heap_map(process, stored)?;
+    let min_bin_vheap_size = Term::small(min_bin_vheap_size as i64).unwrap();
+    let min_heap_size = Term::small(min_heap_size as i64).ok_or_else(badarg)?;
+    let fullsweep_after = Term::small(i64::from(fullsweep_after)).unwrap();
+    let minor_gcs = Term::small(i64::from(minor_gcs)).unwrap();
+    info_produce(process, reserve, 5 * (3 + 2), |block| {
+        let mut rows = [Term::NIL; 5];
+        for (row, (name, value)) in rows.iter_mut().zip([
             ("max_heap_size", limit),
-            (
-                "min_bin_vheap_size",
-                Term::small(min_bin_vheap_size as i64).unwrap(),
-            ),
-            (
-                "min_heap_size",
-                Term::small(min_heap_size as i64).ok_or_else(badarg)?,
-            ),
-            (
-                "fullsweep_after",
-                Term::small(i64::from(fullsweep_after)).unwrap(),
-            ),
-            ("minor_gcs", Term::small(i64::from(minor_gcs)).unwrap()),
-        ]
-        .into_iter()
-        // Port of erts/emulator/beam/erl_bif_info.c (garbage_collection): the list starts
-        // with max_heap_size and ends with minor_gcs.
-        .map(|(name, value)| make_tuple(process, &[atom(name), value]))
-        .collect::<Result<Vec<_>, _>>()?;
-        make_list(process, entries)?
+            ("min_bin_vheap_size", min_bin_vheap_size),
+            ("min_heap_size", min_heap_size),
+            ("fullsweep_after", fullsweep_after),
+            ("minor_gcs", minor_gcs),
+        ]) {
+            *row = block.tuple(&[atom(name), value])?;
+        }
+        block.list_from_slice(&rows)
     })
 }
 
+/// Port of `ERTS_PI_IX_GARBAGE_COLLECTION_INFO` in erts/emulator/beam/erl_bif_info.c
+/// (`process_info_aux`) and `erts_process_gc_info` in erl_gc.c, OTP-29.1.1: the eleven rows
+/// are sized first (`11 * (3 + 2)` words) and built from one factory allocation.
 #[inline(never)]
-fn process_info_item_garbage_collection_info(process: &mut Process) -> Result<Term, VmError> {
-    Ok({
-        let entries = [
-            ("old_heap_block_size", process.heap.old_heap_block_size()),
-            ("heap_block_size", process.heap.heap_size_words()),
-            ("mbuf_size", process.heap.fragment_words()),
-            ("recent_size", process.heap.recent_words()),
-            ("stack_size", process.observed_stack_words()),
-            ("old_heap_size", process.heap.old_used_words()),
-            ("heap_size", process.heap.used_words()),
-            ("bin_vheap_size", process.heap.bin_vheap_used() as usize),
-            (
-                "bin_vheap_block_size",
-                process.heap.bin_vheap_block_size() as usize,
-            ),
-            (
-                "bin_old_vheap_size",
-                process.heap.bin_old_vheap_used() as usize,
-            ),
-            (
-                "bin_old_vheap_block_size",
-                process.heap.bin_old_vheap_block_size() as usize,
-            ),
-        ];
-        let rows = entries
-            .into_iter()
-            .map(|(name, value)| {
-                make_tuple(process, &[atom(name), Term::small(value as i64).unwrap()])
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        make_list(process, rows)?
+fn process_info_item_garbage_collection_info(
+    process: &mut Process,
+    reserve: usize,
+) -> Result<Term, VmError> {
+    let entries = [
+        ("old_heap_block_size", process.heap.old_heap_block_size()),
+        ("heap_block_size", process.heap.heap_size_words()),
+        ("mbuf_size", process.heap.fragment_words()),
+        ("recent_size", process.heap.recent_words()),
+        ("stack_size", process.observed_stack_words()),
+        ("old_heap_size", process.heap.old_used_words()),
+        ("heap_size", process.heap.used_words()),
+        ("bin_vheap_size", process.heap.bin_vheap_used() as usize),
+        (
+            "bin_vheap_block_size",
+            process.heap.bin_vheap_block_size() as usize,
+        ),
+        (
+            "bin_old_vheap_size",
+            process.heap.bin_old_vheap_used() as usize,
+        ),
+        (
+            "bin_old_vheap_block_size",
+            process.heap.bin_old_vheap_block_size() as usize,
+        ),
+    ];
+    info_produce(process, reserve, entries.len() * (3 + 2), |block| {
+        let mut rows = [Term::NIL; 11];
+        for (row, (name, value)) in rows.iter_mut().zip(entries) {
+            *row = block.tuple(&[atom(name), Term::small(value as i64).unwrap()])?;
+        }
+        block.list_from_slice(&rows)
     })
 }
 
@@ -1874,19 +2002,17 @@ pub(crate) fn process_info_light(
     if busy {
         return None;
     }
-    // A result that does not fit in the young heap would be built in a heap fragment, and the
-    // light call cannot collect. The executor path can, as erts' HAlloc does for a BIF, so a
-    // nearly full heap takes the executor.
-    if process
-        .heap
-        .halloc_words_left()
-        .is_none_or(|left| left < LIGHT_RESULT_HEAP_WORDS)
-    {
-        return None;
-    }
+    // A result that does not fit in the young heap is placed by the factory of the executor
+    // path (one allocation per part, whole in a fragment when it does not fit), so the light
+    // call, which allocates cell by cell, takes only a result that fits entirely: the
+    // `reserve_size` of `process_info_bif` bounds it.
+    let left = process.heap.halloc_words_left()?;
     // The key list is walked once, into a stack array, so a short list allocates nothing. A
     // singleton item needs no array.
     if item.as_atom().is_some() {
+        if left < LIGHT_RESULT_HEAP_WORDS.max(info_reserve_total(&[item], true)) {
+            return None;
+        }
         return process_info_light_read(process, own, pid, &[item], true);
     }
     let mut keys = [Term::NIL; LIGHT_LIST_MAX];
@@ -1900,6 +2026,9 @@ pub(crate) fn process_info_light(
         true
     });
     if !proper || count == 0 {
+        return None;
+    }
+    if left < LIGHT_RESULT_HEAP_WORDS.max(info_reserve_total(&keys[..count], false)) {
         return None;
     }
     process_info_light_read(process, own, pid, &keys[..count], false)
@@ -1990,6 +2119,7 @@ fn process_info_light_build(
             status,
             heap_size,
             total_heap_size,
+            &mut 0,
         ) {
             Ok(pair) => pair,
             Err(VmError::Trap(trap)) => return Some(Err(trap)),
@@ -2013,6 +2143,7 @@ fn process_info_light_build(
             status,
             heap_size,
             total_heap_size,
+            &mut 0,
         ) {
             Ok(pair) => pair,
             Err(VmError::Trap(trap)) => return Some(Err(trap)),
@@ -3667,10 +3798,11 @@ fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result
         ),
         (atom("size"), size),
     ];
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    TermBuilder::new(&mut heap)
-        .flatmap_from_pairs(&pairs)
-        .map_err(|error| VmError::Unsupported(format!("max_heap_size map: {error:?}")))
+    // Port of `erts_map_from_ks_and_vs` (erts/emulator/beam/erl_map.c), OTP-29.1.1: the key
+    // tuple and the map are one factory allocation of `1 + 3 + 2 * n` words.
+    info_produce(process, 0, MAX_HEAP_SIZE_MAP_WORDS, |block| {
+        block.flatmap_from_pairs(&pairs)
+    })
 }
 
 pub(crate) fn parse_max_heap(value: Term) -> Result<crate::process::MaxHeap, ()> {
