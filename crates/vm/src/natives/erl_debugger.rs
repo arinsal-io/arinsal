@@ -416,10 +416,12 @@ fn peek_stack_frame_slot(
 fn xregs_count(process: &Process, pid_term: Term) -> Result<Term, VmError> {
     let pid = inspect_pid(process, pid_term)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let Some(count) = runtime.inspect_suspended(pid, |target, _| target.header.arity) else {
+    let Some(count) =
+        runtime.inspect_suspended(pid, |target, _| crate::process::switched_out_live(target))
+    else {
         return Ok(atom("running"));
     };
-    Term::small(i64::from(count)).ok_or_else(badarg)
+    Term::small(count as i64).ok_or_else(badarg)
 }
 
 // Port of erts/emulator/beam/erl_debugger.c:833-900, OTP-29.1.1.
@@ -434,9 +436,8 @@ fn peek_xreg(
     let max_size = nonnegative(max_size_term)?;
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     let Some(value) = runtime.inspect_suspended(pid, |target, _| {
-        (register < usize::from(target.header.arity))
-            .then(|| target.x.get(register).copied())
-            .flatten()
+        (register < crate::process::switched_out_live(target))
+            .then(|| target.x[register])
             .map(|term| limit_term(term, max_size))
     }) else {
         return Ok(atom("running"));

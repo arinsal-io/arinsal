@@ -3957,9 +3957,9 @@ fn off_heap_binary_words(process: &Process) -> usize {
     let mut seen = HashSet::new();
     let mut bytes = HashMap::<usize, usize>::new();
     let mut stack = Vec::new();
-    // Completed processes release their X register array before the scheduler's
-    // final max-heap check, while gc_live still describes the last BEAM frame.
-    for term in process.x[..process.gc_live.min(process.x.len())]
+    // Only the `arity` registers a switched-out process saved are roots; a completed process
+    // has released its register file.
+    for term in process.x[..switched_out_live(process)]
         .iter()
         .copied()
         .chain(process.inbox.iter().copied())
