@@ -5,6 +5,7 @@ use crate::alloc_util::{
     AllocError, AllocUtil, AllocUtilOptions, Allocation, AllocatorInfo, CarrierPoolStats,
     CarrierTransfer, Strategy, set_dyn_sbct,
 };
+use crate::raw::WordView;
 use crossbeam_queue::SegQueue;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -406,12 +407,20 @@ impl ThreadSpecificAllocators {
     }
 
     /// Resizes an allocation and returns the handle and payload address it now has.
+    ///
+    /// Port of `erts_alcu_realloc_thr_pref` (erl_alloc_util.c), OTP-29.1.1: a block owned by the
+    /// calling thread's instance is resized in place; a block owned by another instance is
+    /// allocated afresh on the calling thread's instance, copied, and the old block is queued
+    /// on its owner without taking the owner's lock.
     pub fn realloc_with_ptr(
         &self,
         handle: InstanceAllocation,
         size: usize,
     ) -> Result<(InstanceAllocation, *mut u64), AllocError> {
         let (instance, allocation) = self.route(handle)?;
+        if self.current_instance() != instance {
+            return self.realloc_foreign(handle, allocation, size);
+        }
         let mut state = self.lock_instance(instance);
         self.drain_and_publish(instance, &mut state)?;
         let resized = state.allocator.realloc(allocation, size)?;
@@ -426,6 +435,27 @@ impl ThreadSpecificAllocators {
             },
             ptr,
         ))
+    }
+
+    /// Moves a block owned by another instance to the calling thread's instance.
+    ///
+    /// Port of the `used_allctr != pref_allctr` branch of `erts_alcu_realloc_thr_pref`
+    /// (erl_alloc_util.c), OTP-29.1.1: allocate in the caller's instance, copy the smaller of
+    /// the two sizes, then free the old block, which queues it on its owner.
+    fn realloc_foreign(
+        &self,
+        handle: InstanceAllocation,
+        old: Allocation,
+        size: usize,
+    ) -> Result<(InstanceAllocation, *mut u64), AllocError> {
+        let (new_handle, new_ptr) = self.alloc_with_ptr(size)?;
+        let copy = size.min(old.size());
+        // The caller owns the live old block and the new block is exclusive to this thread.
+        let source = WordView::new(old.payload_address() as *mut u64, copy.div_ceil(8));
+        let mut target = WordView::new(new_ptr, copy.div_ceil(8));
+        target.bytes_mut()[..copy].copy_from_slice(&source.bytes()[..copy]);
+        self.free(handle)?;
+        Ok((new_handle, new_ptr))
     }
 
     /// Frees immediately on the current instance or queues the free for its owner.
@@ -448,38 +478,37 @@ impl ThreadSpecificAllocators {
         Ok(())
     }
 
-    /// Writes bytes through the allocation's current carrier owner.
+    /// Writes bytes into the payload of a live block.
+    ///
+    /// Handles are block addresses, so no instance is consulted and no lock is taken; the
+    /// caller owns the live block, as with a pointer into an erts block.
     pub fn write(
         &self,
         handle: InstanceAllocation,
         offset: usize,
         bytes: &[u8],
     ) -> Result<(), AllocError> {
-        let (instance, allocation) = self.route(handle)?;
-        self.lock_instance(instance)
-            .allocator
-            .write(allocation, offset, bytes)
+        let end = payload_range(handle, offset, bytes.len())?;
+        let mut view = payload_view(handle);
+        view.bytes_mut()[offset..end].copy_from_slice(bytes);
+        Ok(())
     }
 
-    /// Reads bytes through the allocation's current carrier owner.
+    /// Reads bytes from the payload of a live block, without consulting any instance.
     pub fn read(
         &self,
         handle: InstanceAllocation,
         offset: usize,
         out: &mut [u8],
     ) -> Result<(), AllocError> {
-        let (instance, allocation) = self.route(handle)?;
-        self.lock_instance(instance)
-            .allocator
-            .read(allocation, offset, out)
+        let end = payload_range(handle, offset, out.len())?;
+        out.copy_from_slice(&payload_view(handle).bytes()[offset..end]);
+        Ok(())
     }
 
-    /// Returns the stable payload address while the allocation remains live.
+    /// Returns the payload address of a live block, without consulting any instance.
     pub fn allocation_ptr(&self, handle: InstanceAllocation) -> Result<*mut u64, AllocError> {
-        let (instance, allocation) = self.route(handle)?;
-        self.lock_instance(instance)
-            .allocator
-            .allocation_ptr(allocation)
+        Ok(handle.allocation.payload_address() as *mut u64)
     }
 
     /// Applies a dynamic `sbct` to every instance; true if any instance accepted it.
@@ -1005,6 +1034,26 @@ impl ThreadSpecificAllocators {
     }
 }
 
+/// End offset of `len` bytes at `offset` inside the payload, checked against the block size.
+fn payload_range(
+    handle: InstanceAllocation,
+    offset: usize,
+    len: usize,
+) -> Result<usize, AllocError> {
+    offset
+        .checked_add(len)
+        .filter(|end| *end <= handle.allocation.size())
+        .ok_or(AllocError::OutOfBounds)
+}
+
+/// The payload of a live block as words. Payloads are word aligned and padded to whole words.
+fn payload_view(handle: InstanceAllocation) -> WordView {
+    WordView::new(
+        handle.allocation.payload_address() as *mut u64,
+        handle.allocation.size().div_ceil(8),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1356,11 +1405,13 @@ mod tests {
             assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
             assert_eq!(worker_allocators.current_instance(), 1);
             let mut bytes = [0; 17];
+            worker_allocators.route(live).unwrap();
             worker_allocators.read(live, 0, &mut bytes).unwrap();
             assert_eq!(&bytes, b"carrier migration");
             let next = worker_allocators.alloc(1_500_000).unwrap();
             worker_allocators.free(next).unwrap();
             assert_eq!(worker_allocators.homecoming_carrier_count(), 1);
+            worker_allocators.route(live).unwrap();
             worker_allocators.read(live, 0, &mut bytes).unwrap();
             assert_eq!(&bytes, b"carrier migration");
         });
@@ -1372,5 +1423,89 @@ mod tests {
         assert_eq!(pool_info.fetch.giga, 0);
         allocators.free(live).unwrap();
         allocators.free(first).unwrap();
+    }
+
+    #[test]
+    fn foreign_realloc_moves_block_to_calling_instance() {
+        let _serial = registration();
+        let allocators = four_instances();
+        let (owned_tx, owned_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let owner_allocators = Arc::clone(&allocators);
+        let owner = thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+            let handle = owner_allocators.alloc(64).unwrap();
+            let pattern: Vec<u8> = (0..64).collect();
+            owner_allocators.write(handle, 0, &pattern).unwrap();
+            owned_tx.send((handle, pattern)).unwrap();
+            done_rx.recv().unwrap();
+            assert_eq!(owner_allocators.pending_deallocations(1), 1);
+            assert_eq!(owner_allocators.drain_deallocations(1).unwrap(), 1);
+            assert_eq!(owner_allocators.pending_deallocations(1), 0);
+        });
+        let (handle, pattern) = owned_rx.recv().unwrap();
+        let worker_allocators = Arc::clone(&allocators);
+        let moved = thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(2)), Ok(2));
+            let (moved, ptr) = worker_allocators.realloc_with_ptr(handle, 256).unwrap();
+            assert_eq!(ptr, worker_allocators.allocation_ptr(moved).unwrap());
+            let mut bytes = vec![0; 64];
+            worker_allocators.read(moved, 0, &mut bytes).unwrap();
+            assert_eq!(bytes, pattern);
+            moved
+        })
+        .join()
+        .unwrap();
+        assert_eq!(moved.instance(), 2);
+        assert_eq!(allocators.pending_deallocations(1), 1);
+        done_tx.send(()).unwrap();
+        owner.join().unwrap();
+        allocators.free(moved).unwrap();
+    }
+
+    #[test]
+    fn same_instance_realloc_stays_on_the_owner() {
+        let _serial = registration();
+        let allocators = four_instances();
+        let worker_allocators = Arc::clone(&allocators);
+        thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+            let handle = worker_allocators.alloc(64).unwrap();
+            let grown = worker_allocators.realloc(handle, 256).unwrap();
+            assert_eq!(grown.instance(), 1);
+            assert_eq!(worker_allocators.pending_deallocations(1), 0);
+            worker_allocators.free(grown).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn read_write_allocation_ptr_do_not_wait_for_owner_instance() {
+        let allocators = four_instances();
+        let handle = allocators.alloc(32).unwrap();
+        assert_eq!(handle.instance(), 0);
+        let guard = allocators.lock_instance(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_allocators = Arc::clone(&allocators);
+        let worker = thread::spawn(move || {
+            worker_allocators.write(handle, 8, b"pointer only").unwrap();
+            let mut bytes = [0; 12];
+            worker_allocators.read(handle, 8, &mut bytes).unwrap();
+            let ptr = worker_allocators.allocation_ptr(handle).unwrap();
+            tx.send((bytes, ptr as usize)).unwrap();
+        });
+        let (bytes, ptr) = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("pointer-only access must not wait for the owner instance lock");
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(&bytes, b"pointer only");
+        assert_eq!(ptr, handle.allocation.payload_address());
+        assert!(matches!(
+            allocators.write(handle, 30, b"abc"),
+            Err(AllocError::OutOfBounds)
+        ));
+        allocators.free(handle).unwrap();
     }
 }

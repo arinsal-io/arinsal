@@ -208,6 +208,16 @@ impl Allocation {
     pub(crate) fn id(self) -> u64 {
         self.id
     }
+
+    /// Address of the payload: the block header address plus the header size.
+    pub(crate) fn payload_address(self) -> usize {
+        self.id as usize + BLOCK_HEADER
+    }
+
+    /// Payload size in bytes as requested.
+    pub(crate) fn size(self) -> usize {
+        self.size
+    }
 }
 
 /// Current and peak allocated block and carrier counters.
