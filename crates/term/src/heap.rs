@@ -683,6 +683,19 @@ impl<'a, H: HeapAlloc + ?Sized> HeapReservation<'a, H> {
         let end = cur.wrapping_add(words);
         Ok(Self { heap, cur, end })
     }
+    /// Reserve `words` words from `heap`, leaving `extra` spare words in a new heap fragment.
+    ///
+    /// Port of `erts_produce_heap(hfact, words, extra)` in erts/emulator/beam/erl_message.h
+    /// and its `erts_reserve_heap__` in erl_message.c (`HAllocX`), OTP-29.1.1: the block lands
+    /// on the young heap when it fits and otherwise whole in one heap fragment sized
+    /// `words + extra`.
+    pub fn with_extra(heap: &'a mut H, words: usize, extra: usize) -> Result<Self, TermError> {
+        let cur = heap
+            .alloc_with_extra(words, extra)
+            .ok_or(TermError::SystemLimit)?;
+        let end = cur.wrapping_add(words);
+        Ok(Self { heap, cur, end })
+    }
     /// Cursor (`HEAP_TOP` after the `HAlloc` of this block).
     #[inline]
     pub fn cursor(&self) -> *mut u64 {
