@@ -68,6 +68,38 @@ const ARITH_CASES: &[Case] = &[
     ),
 ];
 
+const STD: &[usize] = &[1, 1_000, 100_000, 1_000_000];
+const IOLIST_CASES: &[Case] = &[
+    case(
+        "iolist_size_deep",
+        STD,
+        14,
+        "deep(N)",
+        "erlang:iolist_size(In)",
+    ),
+    case(
+        "iolist_size_flat",
+        STD,
+        4,
+        "flat(N)",
+        "erlang:iolist_size(In)",
+    ),
+    case(
+        "list_to_bitstring",
+        STD,
+        4,
+        "flat(N)",
+        "erlang:list_to_bitstring(In)",
+    ),
+    case(
+        "list_to_bitstring_deep",
+        STD,
+        14,
+        "deep(N)",
+        "erlang:list_to_bitstring(In)",
+    ),
+];
+
 fn function_name(case: &Case, size: usize) -> String {
     format!("{}_{size}", case.name)
 }
@@ -214,4 +246,51 @@ fn check(cases: &[Case], seed: u64) {
 #[test]
 fn arith_bifs_charge_like_otp() {
     check(ARITH_CASES, 0xC000);
+}
+
+#[test]
+fn iolist_bifs_charge_like_otp() {
+    check(IOLIST_CASES, 0xC100);
+}
+
+#[test]
+fn list_to_bitstring_values_match_otp_across_yields() {
+    use arinsal_difftest::{CompareMode, compare};
+    let source = r#"-module(reds_l2b_values).
+-export([small/0, odd/0, large/0, tail/0, bad_unit/0, size/0]).
+
+small() -> erlang:list_to_bitstring([1, <<2:3>>, [<<7:5>>, 255, <<1, 2, 3>>], <<5:7>>, 9, <<1:1>>]).
+
+odd() -> erlang:list_to_bitstring([[<<I:3>> || I <- lists:seq(0, 7)], <<1:1>>, [[<<1, 2>>], 3, <<3:2>>]]).
+
+large() ->
+    L = [[I rem 256, <<(I rem 7):3>>, [<<I:5>>, <<1, 2, 3, 4, 5>>]] || I <- lists:seq(1, 60000)],
+    B = erlang:list_to_bitstring([L, <<1:1>>]),
+    {bit_size(B), erlang:phash2(B), B}.
+
+tail() -> erlang:list_to_bitstring([1, 2 | <<3:5>>]).
+
+bad_unit() ->
+    try erlang:list_to_binary([1, <<1:3>>]) catch error:badarg -> badarg end.
+
+size() ->
+    {element(1, catch erlang:iolist_size([[1, <<1:3>>]])), element(1, catch erlang:iolist_size([1 | 2])),
+     erlang:iolist_size([<<1, 2>>, 3 | <<4>>]),
+     erlang:iolist_size([[I rem 256, <<I>>] || I <- lists:seq(1, 70000)])}.
+"#;
+    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    let beam = reference
+        .compile_named("reds_l2b_values", source, &[])
+        .unwrap();
+    reference.load("reds_l2b_values", &beam).unwrap();
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    for function in ["small", "odd", "large", "tail", "bad_unit", "size"] {
+        let expected = reference.call("reds_l2b_values", function, &[]);
+        let actual = vm
+            .eval_scheduled("reds_l2b_values", function, &[], 1, Some(7))
+            .unwrap_or_else(|error| panic!("{function}: {}", &format!("{error:?}")[..200]));
+        compare(&CallResult::Ok(actual.term), &expected, CompareMode::Exact)
+            .unwrap_or_else(|error| panic!("{function}: {error:?}"));
+    }
 }
