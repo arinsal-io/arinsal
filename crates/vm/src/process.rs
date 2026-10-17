@@ -1310,6 +1310,7 @@ impl Executor {
         // export's code address), OTP-29.1.1: every process starts its function natively on
         // its first run; later runs continue wherever its interpreted or native continuation is.
         // erts starts a spawned process at beam_run_process; its first run applies the MFA.
+        let mut apply_operands = false;
         if !process.entry_started && process.module == RUN_PROCESS {
             match crate::beamasm_integration::run_process_entry()
                 .filter(|_| crate::beamasm_integration::enabled())
@@ -1322,8 +1323,9 @@ impl Executor {
                     process.module = module_id;
                     process.ip = entry;
                     process.native_pc = Some(start);
+                    apply_operands = true;
                 }
-                None => self.vm.resolve_run_process(process)?,
+                None => apply_operands = self.vm.resolve_run_process(process)?,
             }
         }
         let first_run = !std::mem::replace(&mut process.entry_started, true);
@@ -1407,7 +1409,18 @@ impl Executor {
                     .as_mut()
                     .and_then(|cold| cold.initial_bif.take())
                 {
-                    let mut args = process.x[..usize::from(arity)].to_vec();
+                    // A spawn request that fell back to `apply/3` leaves its operands in X0..X2
+                    // (module, function, argument list); the entry runs the BIF on the list.
+                    let mut args = if apply_operands {
+                        let list = crate::signals::list(process.x[2])
+                            .ok_or_else(|| VmError::Unsupported("run_process arguments".into()))?;
+                        for (register, term) in process.x.iter_mut().zip(&list) {
+                            *register = *term;
+                        }
+                        list
+                    } else {
+                        process.x[..usize::from(arity)].to_vec()
+                    };
                     let Some(bif) = arinsal_bifs::lookup(&module, &function, arity) else {
                         // A BIF implemented by a VM native (process-aware BIFs such as
                         // erlang:node/1 or register/2) runs through the native table.
@@ -1667,6 +1680,13 @@ impl Executor {
                             .as_mut()
                             .and_then(|cold| cold.native_retry.take());
                         let outcome = if let Some(target_pc) = retry {
+                            if let Some(call_arity) = process
+                                .cold
+                                .as_mut()
+                                .and_then(|cold| cold.native_retry_arity.take())
+                            {
+                                process.header.arity = call_arity;
+                            }
                             if process
                                 .cold
                                 .as_ref()
@@ -3398,7 +3418,7 @@ impl Executor {
             result,
             Ok(RunState::Yield | RunState::Wait { .. }) | Err(VmError::Yield | VmError::Dirty(_))
         ) {
-            let (module_x, live_fr) = self.vm.code.registers[process.module];
+            let live_fr = self.vm.code.registers[process.module].1;
             // Port of erts/emulator/beam/erl_process.c:10550 and beam_common.c (the yield or
             // wait site stores its live X register count in `c_p->arity`, and only those are
             // saved in `c_p->arg_reg`), OTP-29.1.1: a native continuation already holds it in
@@ -3412,23 +3432,31 @@ impl Executor {
                     .cold
                     .as_ref()
                     .is_some_and(|cold| cold.native_arity_set);
-            let live_x = if arity_set {
-                usize::from(process.header.arity)
+            let call_arity = usize::from(process.header.arity);
+            let mut live_x = if arity_set {
+                call_arity
             } else if process.native_pc.is_some() {
-                process.gc_live.max(usize::from(process.header.arity))
+                process.gc_live.max(call_arity)
             } else {
                 process.gc_live
             };
+            // A fun call or apply the scheduler redoes reads its operands from the saved file:
+            // the arguments and the fun or module and function above them. The retry takes the
+            // call's own arity back from `native_retry_arity`.
+            if !arity_set
+                && process.native_pc.is_some()
+                && let Some(operands) = process
+                    .cold
+                    .as_ref()
+                    .and_then(|cold| cold.native_retry)
+                    .and_then(|target| retry_operand_count(target, call_arity))
+            {
+                live_x = live_x.max(operands);
+                process.cold_mut().native_retry_arity = Some(process.header.arity);
+            }
             process.header.arity = live_x.min(usize::from(u8::MAX)) as u8;
             process.gc_live = live_x;
-            // Until every reader of a dead X register is gone (the poison knob finds them), a
-            // switch-out that did not state its count through a native continuation keeps the
-            // module's whole register file, as before; only `header.arity` registers are roots.
-            let save_x = if arity_set {
-                live_x
-            } else {
-                live_x.max(module_x)
-            };
+            let save_x = live_x;
             if crate::native_bridge::return_trace_enabled() && process.native_pc.is_some() {
                 eprintln!(
                     "[sched-save-native] live_x={live_x} x0={:#x} module={} native_pc={:?}",
@@ -3611,6 +3639,22 @@ fn collect_on_schedule_in(process: &mut Process) -> Result<(), VmError> {
     process.collect_bin_vheap_if_due(switched_out_live(process))
 }
 
+/// Registers a redone fun call or apply reads: the arguments and the fun (`call_fun`) or the
+/// module and function (`apply_fixed`) above them, `apply/2` and `apply/3`'s own operands.
+/// `None` for every other call the scheduler redoes: it takes its `arity` registers.
+fn retry_operand_count(target_pc: usize, arity: usize) -> Option<usize> {
+    use arinsal_beamasm::dispatch::{
+        APPLY_FIXED_UNPORTED, APPLY2_UNPORTED, APPLY3_UNPORTED, CALL_FUN_UNPORTED,
+    };
+    match target_pc {
+        CALL_FUN_UNPORTED => Some(arity + 1),
+        APPLY_FIXED_UNPORTED => Some(arity + 2),
+        APPLY2_UNPORTED => Some(2),
+        APPLY3_UNPORTED => Some(3),
+        _ => None,
+    }
+}
+
 /// Exact live X register count of a switched-out process, erts `c_p->arity`. Every
 /// producer of a saved register file stores it in `header.arity`: the native yield
 /// sites and trap continuations directly, an interpreted switch-out through the
@@ -3727,7 +3771,7 @@ impl Vm {
     /// on X0..X2 (module, function, argument list). The export is the target when it exists;
     /// otherwise the process starts at erlang:apply/3, so an undefined function fails in the
     /// child with `undef`, as in erts.
-    pub(crate) fn resolve_run_process(&mut self, process: &mut Process) -> Result<(), VmError> {
+    pub(crate) fn resolve_run_process(&mut self, process: &mut Process) -> Result<bool, VmError> {
         let module = process.x[0]
             .as_atom()
             .ok_or_else(|| VmError::Unsupported("run_process module".into()))?;
@@ -3736,22 +3780,26 @@ impl Vm {
             .ok_or_else(|| VmError::Unsupported("run_process function".into()))?;
         let args = crate::signals::list(process.x[2])
             .ok_or_else(|| VmError::Unsupported("run_process arguments".into()))?;
-        let (module_id, ip) = match self.spawn_export(module, function, args.len() as u8) {
-            Ok((module_id, ip)) => {
-                for (index, term) in args.iter().enumerate() {
-                    process.x[index] = *term;
+        let (module_id, ip, apply_operands) =
+            match self.spawn_export(module, function, args.len() as u8) {
+                Ok((module_id, ip)) => {
+                    process.x.ensure_x(args.len());
+                    for (index, term) in args.iter().enumerate() {
+                        process.x[index] = *term;
+                    }
+                    process.gc_live = args.len();
+                    process.header.arity = args.len().min(usize::from(u8::MAX)) as u8;
+                    (module_id, ip, false)
                 }
-                (module_id, ip)
-            }
-            Err(_) => {
-                let (module_id, entry) = erlang_apply_entry(self)?;
-                (module_id, entry)
-            }
-        };
+                Err(_) => {
+                    let (module_id, entry) = erlang_apply_entry(self)?;
+                    (module_id, entry, true)
+                }
+            };
         process.module = module_id;
         process.ip = ip;
         process.initial_call = Some((module_id, ip));
-        Ok(())
+        Ok(apply_operands)
     }
 }
 
