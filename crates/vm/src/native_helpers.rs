@@ -4374,7 +4374,52 @@ pub extern "C" fn arinsal_beamasm_map_update_single(
     map_single::<true>(header, key, value, map, result_pointer)
 }
 
+#[inline(always)]
+fn put_single_native(process: &mut crate::Process, key: u64, value: u64, map: u64) -> Option<u64> {
+    let mut top = crate::native_top_heap::NativeTopHeap::new(process)?;
+    let (key, value, map) = (
+        crate::native_hooks::from_raw(key),
+        crate::native_hooks::from_raw(value),
+        crate::native_hooks::from_raw(map),
+    );
+    match arinsal_maps::put(map, key, value, &mut top) {
+        Ok(term) => Some(crate::native_hooks::raw(term)),
+        Err(error) => {
+            top.commit();
+            Some(map_result(process, Err(error), false, false))
+        }
+    }
+}
+
+#[inline(always)]
 fn map_single<const EXACT: bool>(
+    header: *mut ProcessHeader,
+    key: u64,
+    value: u64,
+    map: u64,
+    result_pointer: u64,
+) -> u64 {
+    // erts_maps_put/erts_maps_update consume their operands from arguments and
+    // do not read the X register array.
+    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:579-598,686-694,
+    // OTP-29.1.1.
+    if !EXACT {
+        let Some(process) = crate::native_hooks::process_from_header(header) else {
+            return 0;
+        };
+        // HAllocX on `c_p->htop`: the word-index cursors are only brought up to date when the
+        // put leaves the fast path.
+        if let Some(raw) = put_single_native(process, key, value, map) {
+            return raw;
+        }
+    }
+    map_single_generic::<EXACT>(header, key, value, map, result_pointer)
+}
+
+/// The heap-fragment path of a single-pair map update: used by the exact update and when the
+/// put cannot allocate on the native heap top.
+#[inline(never)]
+fn map_single_generic<const EXACT: bool>(
     header: *mut ProcessHeader,
     key: u64,
     value: u64,
@@ -4383,31 +4428,6 @@ fn map_single<const EXACT: bool>(
 ) -> u64 {
     // Two monomorphic helpers: the put entry carries no exact-update state.
     let exact = EXACT;
-    // erts_maps_put/erts_maps_update consume their operands from arguments and
-    // do not read the X register array.
-    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:579-598,686-694,
-    // OTP-29.1.1.
-    if !exact {
-        let Some(process) = crate::native_hooks::process_from_header(header) else {
-            return 0;
-        };
-        // HAllocX on `c_p->htop`: the word-index cursors are only brought up to date when the
-        // put leaves the fast path.
-        if let Some(mut top) = crate::native_top_heap::NativeTopHeap::new(process) {
-            let (key, value, map) = (
-                crate::native_hooks::from_raw(key),
-                crate::native_hooks::from_raw(value),
-                crate::native_hooks::from_raw(map),
-            );
-            return match arinsal_maps::put(map, key, value, &mut top) {
-                Ok(term) => crate::native_hooks::raw(term),
-                Err(error) => {
-                    top.commit();
-                    map_result(process, Err(error), false, false)
-                }
-            };
-        }
-    }
     let (process, registers) = if exact {
         let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
             return 0;
