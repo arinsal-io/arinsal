@@ -49,6 +49,7 @@ mod maps;
 mod native_helpers;
 mod native_hooks;
 mod native_records;
+mod native_top_heap;
 mod natives;
 pub use calls::call_bif;
 pub use native_bridge::install_crash_dump;
