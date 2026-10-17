@@ -1728,3 +1728,54 @@ fn generic_literal_takes_the_eq_call() {
         true,
     );
 }
+
+/// Like erts' `emit_enter_runtime()` with its default live count, the deep exact comparison
+/// keeps X4 and X5 (caller-saved machine registers) across the C `eq` call, whose caller does
+/// not tell how many X registers are live.
+#[test]
+fn exact_comparison_runtime_call_keeps_x4_and_x5() {
+    let fixture = terms();
+    let mut clobber = BeamModuleAssembler::new();
+    clobber
+        .emit_raw(|e| {
+            e.mov_const(Gpr::x(15), 0xdead_0015)?;
+            e.mov_const(Gpr::x(16), 0xdead_0016)?;
+            e.mov_const(Gpr::x(0), 1)?;
+            e.ret(Gpr::x(30))
+        })
+        .unwrap();
+    let clobber = clobber.finalize().unwrap();
+    let eq = clobber.memory.ptr_at(0) as usize;
+    let finalized = module(|asm| {
+        asm.emit_is_eq_exact(ArgVal::X(0), ArgVal::X(1), 2, &EqLiteral::Generic, eq)?;
+        asm.emit_raw(|e| {
+            e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+            e.ret(Gpr::x(30))
+        })?;
+        asm.emit_i_func_label(2)?;
+        asm.emit_raw(|e| {
+            e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+            e.ret(Gpr::x(30))
+        })
+    });
+    let mut regs = SchedulerRegisters::default();
+    for index in 0..6 {
+        regs.x_reg_array[index] = rt::fixture_term(0x1000 + index as u64);
+    }
+    regs.x_reg_array[0] = rt::fixture_term(bits(fixture.tuple));
+    regs.x_reg_array[1] = rt::fixture_term(bits(fixture.binary));
+    let mut stack = [0u64; 128];
+    let mut header = ProcessHeader {
+        stop: stack.as_mut_ptr().wrapping_add(stack.len()),
+        fcalls: 10,
+        ..ProcessHeader::default()
+    };
+    let exit = enter_native(&mut header, &mut regs, &finalized.entry(1).unwrap());
+    assert_eq!(exit, ExitReason::Returned);
+    for index in 4..6 {
+        assert_eq!(
+            regs.x_reg_array[index],
+            rt::fixture_term(0x1000 + index as u64)
+        );
+    }
+}
