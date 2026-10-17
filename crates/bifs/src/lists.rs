@@ -59,7 +59,7 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
 
 /// CAR/CDR of a cons cell.
 #[inline(always)]
-fn cons_cell(term: Term) -> Option<(Term, Term)> {
+pub(crate) fn cons_cell(term: Term) -> Option<(Term, Term)> {
     // SAFETY: BIF arguments stay on the live process heap for this call.
     unsafe { term.cons_ref() }
 }
@@ -226,6 +226,8 @@ pub enum DeferredTrap {
     Append(AppendCont),
     /// `erlang:'--'/2` or `erlang:subtract/2`.
     Subtract(SubtractWalk),
+    /// `erlang:crc32/1,2`, `adler32/1,2` or `md5/1`.
+    Chksum(crate::checksum::ChksumCont),
 }
 
 /// A finished key BIF, or a trap back to the same export.

@@ -1,11 +1,22 @@
 //! zlib-compatible checksum BIFs.
 
-use arinsal_term::{Term, TermBuilder};
-use md5::{Digest, Md5};
+use arinsal_term::{Term, TermBuilder, TermKind};
 use num_traits::ToPrimitive;
 
-use crate::pure::{Heap, bigint, binary_bytes, iolist_bytes};
+use crate::lists::{DeferredTrap, cons_cell};
+use crate::pure::{Heap, bigint, binary_bytes, copy_binary_range, iolist_bytes, with_binary_bytes};
 use crate::{BifError, Ctx};
+
+/// Bytes of a checksum charged as one reduction.
+// Port of `BYTES_PER_REDUCTION` in erts/emulator/beam/erl_bif_chksum.c, OTP-29.1.1.
+pub const BYTES_PER_REDUCTION: usize = 10;
+
+/// Reductions in one scheduler slice, as `CONTEXT_REDS`.
+const CONTEXT_REDS: usize = 4000;
+
+/// Bytes `erlang:crc32/1,2` and `adler32/1,2` consume before they trap.
+// Port of `CHUNK_PER_SCHEDULE` in erts/emulator/beam/erl_bif_chksum.c, OTP-29.1.1.
+pub const CHUNK_PER_SCHEDULE: usize = BYTES_PER_REDUCTION * CONTEXT_REDS;
 
 pub(super) fn lookup<V: crate::BifTableVisitor>(
     module: &str,
@@ -33,31 +44,331 @@ fn u32_arg(term: Term) -> Result<u32, BifError> {
 fn result(value: u32) -> Term {
     Term::small(value as i64).expect("checksum fits small integer")
 }
-fn checksum(args: &[Term], adler: bool) -> Result<Term, BifError> {
+/// Which checksum a continuation computes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChksumKind {
+    /// `erlang:crc32/1,2`.
+    Crc32,
+    /// `erlang:adler32/1,2`.
+    Adler32,
+    /// `erlang:md5/1`.
+    Md5,
+}
+
+#[derive(Clone)]
+enum ChksumSum {
+    Zlib(std::ffi::c_ulong),
+    Md5(Md5State),
+}
+
+/// Resume state of `erlang:crc32/2`, `adler32/2` and the hidden `md5` trap target.
+///
+/// Port of the arguments `BIF_TRAP2` passes in erts/emulator/beam/erl_bif_chksum.c
+/// (the sum so far and the rest of the input), OTP-29.1.1.
+#[derive(Clone)]
+pub struct ChksumCont {
+    kind: ChksumKind,
+    sum: ChksumSum,
+    rest: Term,
+}
+
+impl ChksumCont {
+    /// The continuation export this state belongs to.
+    pub fn continuation(&self) -> &'static str {
+        match self.kind {
+            ChksumKind::Crc32 => "erlang:crc32/2",
+            ChksumKind::Adler32 => "erlang:adler32/2",
+            ChksumKind::Md5 => "erlang:md5_trap/2",
+        }
+    }
+
+    /// The input not yet consumed.
+    pub fn rest(&self) -> Term {
+        self.rest
+    }
+}
+
+/// One slice of a checksum.
+pub enum ChksumStep {
+    /// The finished value.
+    Done(Term),
+    /// `BIF_TRAP2` with the sum so far and the rest of the input.
+    More(ChksumCont),
+}
+
+fn is_bitstring(term: Term) -> bool {
+    term.classify() == TermKind::Bitstring
+}
+
+fn is_byte(term: Term) -> bool {
+    term.as_small().is_some_and(|n| (0..=255).contains(&n))
+}
+
+/// Feed the first `count` bytes of a byte-aligned binary to `sum`, or `None` for a bitstring
+/// that is not a whole number of bytes.
+fn binary_prefix(term: Term, count: usize, sum: &mut dyn FnMut(&[u8])) {
+    let done = with_binary_bytes(term, |view| {
+        if view.start_bit().is_multiple_of(8) {
+            let start = view.start_bit() / 8;
+            sum(&view.bytes()[start..start + count]);
+            true
+        } else {
+            false
+        }
+    });
+    if done == Ok(true) {
+        return;
+    }
+    let mut bytes = vec![0u8; count];
+    let _ = copy_binary_range(term, 0, &mut bytes);
+    sum(&bytes);
+}
+
+/// Sum up to `left` bytes of an iolist. Returns the unconsumed rest (`[]` when everything was
+/// consumed), the bytes consumed, and whether the input is not an iolist.
+// Port of erts/emulator/beam/erl_bif_chksum.c (do_chksum), OTP-29.1.1.
+fn do_chksum(
+    ctx: &mut Ctx<'_>,
+    sum: &mut dyn FnMut(&[u8]),
+    mut ioterm: Term,
+    mut left: usize,
+) -> Result<(Term, usize), usize> {
+    if left == 0 || ioterm == Term::NIL {
+        return Ok((ioterm, 0));
+    }
+    if is_bitstring(ioterm) {
+        let bits = crate::pure::bitstring_bit_len(ioterm).map_err(|_| 0usize)?;
+        if !bits.is_multiple_of(8) {
+            return Err(0);
+        }
+        let mut size = bits / 8;
+        let mut rest = Term::NIL;
+        if size > left {
+            rest = TermBuilder::new(&mut Heap(&mut ctx.heap))
+                .sub_binary(ioterm, left * 8, (size - left) * 8)
+                .map_err(|_| 0usize)?;
+            size = left;
+        }
+        binary_prefix(ioterm, size, sum);
+        return Ok((rest, size));
+    }
+    if cons_cell(ioterm).is_none() {
+        return Err(0);
+    }
+    let mut res = 0usize;
+    let mut stack: Vec<Term> = vec![ioterm];
+    while !stack.is_empty() && left != 0 {
+        ioterm = stack.pop().unwrap();
+        if ioterm == Term::NIL {
+            continue;
+        }
+        if let Some((mut obj, mut tail)) = cons_cell(ioterm) {
+            loop {
+                if is_byte(obj) {
+                    let mut buffer: Vec<u8> = Vec::new();
+                    loop {
+                        buffer.push(obj.as_small().unwrap() as u8);
+                        left -= 1;
+                        ioterm = tail;
+                        let Some((head, next)) = cons_cell(ioterm) else {
+                            break;
+                        };
+                        obj = head;
+                        tail = next;
+                        if !is_byte(obj) {
+                            break;
+                        }
+                        if left == 0 {
+                            break;
+                        }
+                    }
+                    sum(&buffer);
+                    res += buffer.len();
+                } else if obj == Term::NIL {
+                    ioterm = tail;
+                    let Some((head, next)) = cons_cell(ioterm) else {
+                        break;
+                    };
+                    obj = head;
+                    tail = next;
+                } else if let Some((head, next)) = cons_cell(obj) {
+                    stack.push(tail);
+                    obj = head;
+                    tail = next;
+                    continue;
+                } else if is_bitstring(obj) {
+                    match do_chksum(ctx, sum, obj, left) {
+                        Err(sres) => return Err(res + sres),
+                        Ok((rest_term, sres)) => {
+                            res += sres;
+                            left -= sres;
+                            if rest_term != Term::NIL {
+                                ioterm = TermBuilder::new(&mut Heap(&mut ctx.heap))
+                                    .cons(rest_term, tail)
+                                    .map_err(|_| res)?;
+                                left = 0;
+                                break;
+                            }
+                            ioterm = tail;
+                            if let Some((head, next)) = cons_cell(ioterm) {
+                                obj = head;
+                                tail = next;
+                            }
+                        }
+                    }
+                } else {
+                    return Err(res);
+                }
+                if left == 0 || ioterm == Term::NIL || cons_cell(ioterm).is_none() {
+                    break;
+                }
+            }
+        }
+        if left != 0 && cons_cell(ioterm).is_none() && ioterm != Term::NIL {
+            if is_bitstring(ioterm) {
+                match do_chksum(ctx, sum, ioterm, left) {
+                    Err(sres) => return Err(res + sres),
+                    Ok((rest_term, sres)) => {
+                        ioterm = rest_term;
+                        res += sres;
+                        left -= sres;
+                    }
+                }
+            } else {
+                return Err(res);
+            }
+        }
+    }
+    while let Some(entry) = stack.pop() {
+        ioterm = TermBuilder::new(&mut Heap(&mut ctx.heap))
+            .cons(ioterm, entry)
+            .map_err(|_| res)?;
+    }
+    Ok((ioterm, res))
+}
+
+fn chksum_left(ctx: &Ctx<'_>, kind: ChksumKind) -> usize {
+    let budget = ctx.reduction_budget();
+    if budget == usize::MAX {
+        return usize::MAX;
+    }
+    match kind {
+        // Calibrated so that each reduction does one round of MD5 (4 bytes), rounded down to
+        // whole 64 byte blocks.
+        ChksumKind::Md5 => budget.saturating_mul(4) & !0x3f,
+        _ => CHUNK_PER_SCHEDULE,
+    }
+}
+
+/// Run one slice of a checksum over `input`.
+///
+/// Port of `crc32_1`, `crc32_2`, `adler32_1`, `adler32_2`, `md5_1` and the hidden `md5_2` in
+/// erts/emulator/beam/erl_bif_chksum.c, OTP-29.1.1: the sums consume a bounded number of
+/// bytes, charge per byte and trap with the sum so far and the rest of the input.
+fn chksum_slice(
+    ctx: &mut Ctx<'_>,
+    kind: ChksumKind,
+    mut sum: ChksumSum,
+    input: Term,
+) -> Result<ChksumStep, BifError> {
+    let left = chksum_left(ctx, kind);
+    let outcome = {
+        let mut feed = |bytes: &[u8]| match &mut sum {
+            ChksumSum::Zlib(value) => {
+                for chunk in bytes.chunks(u32::MAX as usize) {
+                    // SAFETY: the chunk pointer stays valid for the duration of this zlib call.
+                    *value = unsafe {
+                        if kind == ChksumKind::Adler32 {
+                            libz_sys::adler32(*value, chunk.as_ptr(), chunk.len() as u32)
+                        } else {
+                            libz_sys::crc32(*value, chunk.as_ptr(), chunk.len() as u32)
+                        }
+                    };
+                }
+            }
+            ChksumSum::Md5(state) => state.update(bytes),
+        };
+        do_chksum(ctx, &mut feed, input, left)
+    };
+    let (rest, res) = match outcome {
+        Ok(done) => done,
+        Err(res) => {
+            ctx.charge_reductions(match kind {
+                ChksumKind::Md5 => res,
+                _ => res / BYTES_PER_REDUCTION,
+            });
+            return Err(BifError::BADARG);
+        }
+    };
+    match kind {
+        ChksumKind::Crc32 | ChksumKind::Adler32 => {
+            ctx.charge_reductions(res / BYTES_PER_REDUCTION);
+            let ChksumSum::Zlib(value) = sum else {
+                unreachable!("zlib kinds carry a zlib sum")
+            };
+            if rest != Term::NIL && ctx.reduction_budget() != usize::MAX {
+                ctx.bump_all_reds();
+                return Ok(ChksumStep::More(ChksumCont {
+                    kind,
+                    sum: ChksumSum::Zlib(value),
+                    rest,
+                }));
+            }
+            Ok(ChksumStep::Done(result(value as u32)))
+        }
+        ChksumKind::Md5 => {
+            if rest != Term::NIL && ctx.reduction_budget() != usize::MAX {
+                ctx.bump_all_reds();
+                return Ok(ChksumStep::More(ChksumCont { kind, sum, rest }));
+            }
+            ctx.charge_reductions(res);
+            let ChksumSum::Md5(state) = sum else {
+                unreachable!("md5 carries an md5 state")
+            };
+            Ok(ChksumStep::Done(binary(ctx, &state.final_digest())?))
+        }
+    }
+}
+
+/// The first slice of `crc32/1,2`, `adler32/1,2` or `md5/1`, or of `crc32/2` and `adler32/2`
+/// called directly.
+pub fn chksum_start(
+    ctx: &mut Ctx<'_>,
+    kind: ChksumKind,
+    args: &[Term],
+) -> Result<ChksumStep, BifError> {
     let (seed, data) = if args.len() == 1 {
-        (if adler { 1 } else { 0 }, args[0])
+        (if kind == ChksumKind::Adler32 { 1 } else { 0 }, args[0])
     } else {
         (u32_arg(args[0])?, args[1])
     };
-    let bytes = iolist_bytes(data)?;
-    let mut sum = seed as std::ffi::c_ulong;
-    for chunk in bytes.chunks(u32::MAX as usize) {
-        // SAFETY: the chunk pointer stays valid for the duration of this zlib call.
-        sum = unsafe {
-            if adler {
-                libz_sys::adler32(sum, chunk.as_ptr(), chunk.len() as u32)
-            } else {
-                libz_sys::crc32(sum, chunk.as_ptr(), chunk.len() as u32)
-            }
-        };
+    let sum = if kind == ChksumKind::Md5 {
+        ChksumSum::Md5(Md5State::new())
+    } else {
+        ChksumSum::Zlib(seed as std::ffi::c_ulong)
+    };
+    chksum_slice(ctx, kind, sum, data)
+}
+
+/// Run the slice that follows a trap.
+pub fn chksum_resume(ctx: &mut Ctx<'_>, cont: &ChksumCont) -> Result<ChksumStep, BifError> {
+    chksum_slice(ctx, cont.kind, cont.sum.clone(), cont.rest)
+}
+
+fn run_chksum(ctx: &mut Ctx<'_>, kind: ChksumKind, args: &[Term]) -> Result<Term, BifError> {
+    match chksum_start(ctx, kind, args)? {
+        ChksumStep::Done(value) => Ok(value),
+        ChksumStep::More(cont) => {
+            ctx.defer_trap(DeferredTrap::Chksum(cont));
+            Ok(Term::NIL)
+        }
     }
-    Ok(result(sum as u32))
 }
-fn crc32(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    checksum(args, false)
+fn crc32(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    run_chksum(ctx, ChksumKind::Crc32, args)
 }
-fn adler32(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    checksum(args, true)
+fn adler32(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    run_chksum(ctx, ChksumKind::Adler32, args)
 }
 fn combine(args: &[Term], adler: bool) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_chksum.c:340-455, OTP-29.1.1.
@@ -90,12 +401,11 @@ fn binary(ctx: &mut Ctx<'_>, bytes: &[u8]) -> Result<Term, BifError> {
         .map_err(|_| BifError::SystemLimit)
 }
 fn md5(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bytes = iolist_bytes(args[0])?;
-    binary(ctx, &Md5::digest(bytes))
+    run_chksum(ctx, ChksumKind::Md5, args)
 }
 
 #[derive(Clone)]
-struct Md5State {
+pub(crate) struct Md5State {
     words: [u32; 4],
     processed: u64,
     len: usize,
