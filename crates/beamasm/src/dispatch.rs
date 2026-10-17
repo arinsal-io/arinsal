@@ -734,6 +734,14 @@ fn emit_export_fragment(
 ) -> Result<(), BufferError> {
     let interpreted = code.new_label();
     code.emit(|encoder| {
+        // A non-tail call site only loaded the export (x1) and called through its address, so
+        // the pc a raising BIF is attributed to is the return address in x30, tagged as a
+        // return site. A tail call site passes its own address in x0 instead of c_p, because
+        // its frame is gone and x30 is the caller's continuation.
+        encoder.orr_imm(Gpr::x(9), Gpr::x(30), crate::module::RETURN_SITE_TAG as u64)?;
+        encoder.cmp_reg(Gpr::x(0), Gpr::x(21), Shift::Lsl, 0)?;
+        encoder.csel(Gpr::x(9), Gpr::x(9), Gpr::x(0), Cond::Eq)?;
+        encoder.str_uoff(Gpr::x(9), Gpr::x(19), tmp_mem_offset(6))?;
         // Interpreted targets have no native prologue to save this continuation.
         encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
@@ -791,6 +799,7 @@ fn emit_export_fragment(
     code.emit(|encoder| {
         // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_bif trampolines read the
         // BIF from their own Export), OTP-29.1.1: x2 = the export's descriptor word.
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.ldr_uoff(Gpr::x(2), Gpr::x(1), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))
@@ -849,7 +858,10 @@ fn emit_save_calls_export_fragment(
     code: &mut CodeBuffer,
     helper: usize,
 ) -> Result<(), BufferError> {
-    code.emit(|encoder| encoder.stp_pre(Gpr::x(30), Gpr::x(1), Gpr::sp(), -16))?;
+    code.emit(|encoder| {
+        encoder.stp_pre(Gpr::x(30), Gpr::x(1), Gpr::sp(), -32)?;
+        encoder.str_uoff(Gpr::x(0), Gpr::sp(), 16)
+    })?;
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
@@ -860,8 +872,8 @@ fn emit_save_calls_export_fragment(
     })?;
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
-        encoder.ldp_post(Gpr::x(30), Gpr::x(1), Gpr::sp(), 16)?;
-        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.ldr_uoff(Gpr::x(0), Gpr::sp(), 16)?;
+        encoder.ldp_post(Gpr::x(30), Gpr::x(1), Gpr::sp(), 32)?;
         encoder.br(Gpr::x(17))
     })
 }
@@ -1219,7 +1231,7 @@ fn emit_call_light_bif_shared(
     // beam_asm.hpp:388-403 (emit_setup_dispatchable_call), OTP-29.1.1.
     code.bind(trace)?;
     code.emit(|encoder| {
-        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(0), Gpr::x(3))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(4))?;
         encoder.ldr_regoff(Gpr::x(14), Gpr::x(4), Gpr::x(24), 3)?;
         encoder.br(Gpr::x(14))
@@ -1418,7 +1430,7 @@ fn emit_line_breakpoint_shared(
     code.emit(|encoder| {
         encoder.mov_reg(Gpr::x(13), Gpr::x(0))?;
         encoder.ldr_regoff(Gpr::x(14), Gpr::x(13), Gpr::x(24), 3)?;
-        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.ldr_uoff(Gpr::x(0), Gpr::x(19), native_error_pc_slot)?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(13))?;
         encoder.blr(Gpr::x(14))
     })?;
