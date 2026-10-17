@@ -423,6 +423,10 @@ pub struct Process {
     pub(crate) native_arity_set: bool,
     /// Pc of the native instruction that raised the exception being dispatched (0 if none).
     pub(crate) native_error_pc: usize,
+    /// Native code left a request for the scheduler in the cold state (`native_wait`,
+    /// `native_signal_fetch`, `native_reserve_fetch`, `native_timeout_trace`). Clear means none
+    /// is pending, so an ordinary yield reads this one byte instead of four cold fields.
+    pub(crate) native_exit_pending: bool,
 }
 // SAFETY: ProcessHeader pointers refer only to this process's stable heap/code allocations.
 // The scheduler transfers exclusive ownership of each Process between workers.
@@ -1620,6 +1624,7 @@ impl Process {
             native_continuation_resume: false,
             native_arity_set: false,
             native_error_pc: 0,
+            native_exit_pending: false,
         };
         process.sync_header();
         #[cfg(feature = "pf-mem-counters")]
