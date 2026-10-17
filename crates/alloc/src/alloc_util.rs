@@ -1,4 +1,5 @@
-//! Safe alloc_util core with OTP block headers and bestfit policies.
+//! Safe alloc_util core with OTP block headers and bestfit policies. The one exception is `tn`,
+//! which turns a tree link into a node pointer like the C code does.
 
 use crate::mseg::{CacheConfig, CallCount, MsegAllocator, MsegOptions, Segment, SegmentFlags};
 use crate::raw::{MapError, NODE_WORDS, NodeRef, RawRegion, WordView, page_size};
@@ -460,24 +461,7 @@ struct CarrierSpan {
     sbc: bool,
 }
 
-/// The carrier range a tree walk checks node addresses against, copied out of the allocator once
-/// per tree operation so the checks stay in registers instead of reloading `tree_span` after every
-/// node store.
-#[derive(Clone, Copy)]
-struct TreeWindow {
-    start: usize,
-    limit: usize,
-}
-
 impl CarrierSpan {
-    #[inline(always)]
-    const fn window(self) -> TreeWindow {
-        TreeWindow {
-            start: self.start,
-            limit: self.node_limit,
-        }
-    }
-
     const EMPTY: Self = Self::new(0, 0, usize::MAX, false);
 
     /// The number of byte offsets of `[start, end)` at which a whole tree node still fits.
@@ -902,15 +886,19 @@ impl AllocUtil {
                 size,
             });
         }
-        let offset = if let Some(block) = self.choose_free(block_size)? {
-            block
+        let (offset, found) = if let Some(chosen) = self.choose_free_in(block_size)? {
+            chosen
         } else {
             let ci = self.add_mbc(block_size)?;
-            self.carriers[ci].as_ref().ok_or(AllocError::Corrupt)?.start
+            let start = self.carriers[ci].as_ref().ok_or(AllocError::Corrupt)?.start;
+            (start, None)
         };
         // Port of mbc_alloc_finalize, erl_alloc_util.c:1913, OTP-29.1.1: the carrier is resolved
         // once and the header decoded once; the unlink and the header writes reuse both.
-        let span = self.span_of(offset).ok_or(AllocError::Corrupt)?;
+        let span = match found {
+            Some(span) => span,
+            None => self.span_of(offset).ok_or(AllocError::Corrupt)?,
+        };
         let old = Self::decode_block(span, offset)?;
         self.unlink_free_in(span, offset, old.size)?;
         let actual = old.size;
@@ -2446,36 +2434,37 @@ impl AllocUtil {
         }
     }
 
-    /// The tree node at `key`: one range compare against the span of the tree being walked, then
-    /// its fields are plain loads, like the pointer dereference of the C code.
+    /// The tree node at `key`, then its fields are plain loads, like the pointer dereference of
+    /// the C code. Every link of a tree this allocator maintains is the address of a free block
+    /// of an indexed carrier, which holds the whole node; debug builds check that.
     #[inline(always)]
-    fn tn<const A: bool>(&self, key: usize) -> Result<TNode<A>, AllocError> {
-        self.tn_in(self.tree_span.get().window(), key)
+    #[allow(unsafe_code)]
+    fn tn<const A: bool>(&self, key: usize) -> TNode<A> {
+        debug_assert!(self.is_tree_node_address(key), "tree link {key:#x}");
+        // SAFETY: `key` is a link of a tree this allocator maintains, or the address of the
+        // carrier tree node in the header of an indexed carrier. Both are word aligned and lie
+        // inside a carrier that stays indexed, and so mapped, while the tree refers to them: a
+        // carrier is unlinked from the carrier tree and its blocks are unlinked from its block
+        // tree before it is unindexed and released.
+        let raw = unsafe { NodeRef::at(key) };
+        TNode { raw }
     }
 
-    /// `tn` against a window taken once by the caller.
-    #[inline(always)]
-    fn tn_in<const A: bool>(&self, window: TreeWindow, key: usize) -> Result<TNode<A>, AllocError> {
-        match NodeRef::new(window.start, window.limit, key) {
-            Some(raw) => Ok(TNode { raw }),
-            None => self.tn_slow(key),
+    /// Whether the `NODE_WORDS` words at `key` lie inside one indexed carrier, word aligned.
+    fn is_tree_node_address(&self, key: usize) -> bool {
+        let span = self.tree_span.get();
+        if key.wrapping_sub(span.start) < span.node_limit {
+            return key.is_multiple_of(WORD);
         }
-    }
-
-    /// `tn` for a node outside the span of the tree being walked: a carrier tree node of another
-    /// carrier, or a corrupt link.
-    #[cold]
-    #[inline(never)]
-    fn tn_slow<const A: bool>(&self, key: usize) -> Result<TNode<A>, AllocError> {
-        let index = self
+        let Some(index) = self
             .carrier_ranges
             .partition_point(|&(start, _, _)| start <= key)
             .checked_sub(1)
-            .ok_or(AllocError::Corrupt)?;
+        else {
+            return false;
+        };
         let (start, end, _) = self.carrier_ranges[index];
-        NodeRef::new(start, CarrierSpan::node_limit(start, end), key)
-            .map(|raw| TNode { raw })
-            .ok_or(AllocError::Corrupt)
+        key.wrapping_sub(start) < CarrierSpan::node_limit(start, end) && key.is_multiple_of(WORD)
     }
 
     /// The root of the free-block tree of the carrier `span`, kept in the carrier header like
@@ -2527,11 +2516,8 @@ impl AllocUtil {
 
     /// `IS_RED` of erl_ao_firstfit_alloc.c: a null link is black.
     #[inline(always)]
-    fn red<const A: bool>(&self, link: usize) -> Result<bool, AllocError> {
-        if link == 0 {
-            return Ok(false);
-        }
-        Ok(self.tn::<A>(link)?.is_red())
+    fn red<const A: bool>(&self, link: usize) -> bool {
+        link != 0 && self.tn::<A>(link).is_red()
     }
 
     #[inline(always)]
@@ -2552,45 +2538,39 @@ impl AllocUtil {
 
     #[inline(always)]
     fn tree_node_size(&self, node: usize) -> Result<usize, AllocError> {
-        Ok(self.tn::<true>(node)?.size())
+        Ok(self.tn::<true>(node).size())
     }
 
     #[inline(always)]
     /// Port of rbt_search, erl_ao_firstfit_alloc.c, OTP-29.1.1.
-    fn aoff_search(
-        &self,
-        window: TreeWindow,
-        root: usize,
-        need: usize,
-    ) -> Result<Option<usize>, AllocError> {
+    fn aoff_search(&self, root: usize, need: usize) -> Option<usize> {
         if root == 0 {
-            return Ok(None);
+            return None;
         }
-        let mut node = self.tn_in::<true>(window, root)?;
+        let mut node = self.tn::<true>(root);
         loop {
             let left = node.left();
             if left != 0 {
-                let left_node = self.tn_in::<true>(window, left)?;
+                let left_node = self.tn::<true>(left);
                 if left_node.max() >= need {
                     node = left_node;
                     continue;
                 }
             }
             if node.size() >= need {
-                return Ok(Some(node.raw.key()));
+                return Some(node.raw.key());
             }
             let right = node.right();
             if right == 0 {
-                return Ok(None);
+                return None;
             }
-            node = self.tn_in::<true>(window, right)?;
+            node = self.tn::<true>(right);
         }
     }
 
     #[inline]
-    fn aoff_raise_carrier_max(&mut self, span: CarrierSpan, size: usize) -> Result<(), AllocError> {
-        let window = span.window();
-        let mut crr = self.tn_in::<true>(window, span.start + MBC_HEADER)?;
+    fn aoff_raise_carrier_max(&mut self, span: CarrierSpan, size: usize) {
+        let mut crr = self.tn::<true>(span.start + MBC_HEADER);
         if size > crr.size() {
             crr.raw.set_word(0, size);
             while size > crr.max() {
@@ -2599,27 +2579,25 @@ impl AllocUtil {
                 if parent == 0 {
                     break;
                 }
-                crr = self.tn_in::<true>(window, parent)?;
+                crr = self.tn::<true>(parent);
             }
         }
-        Ok(())
     }
 
     #[inline(never)]
-    fn aoff_lower_carrier_max(&mut self, span: CarrierSpan) -> Result<(), AllocError> {
-        let window = span.window();
-        let crr = self.tn_in::<true>(window, span.start + MBC_HEADER)?;
+    fn aoff_lower_carrier_max(&mut self, span: CarrierSpan) {
+        let crr = self.tn::<true>(span.start + MBC_HEADER);
         let root = self.aoff_root(span);
         if root != 0 {
-            let root_max = self.tn_in::<true>(window, root)?.max();
+            let root_max = self.tn::<true>(root).max();
             if crr.size() == root_max {
-                return Ok(());
+                return;
             }
             crr.raw.set_word(0, root_max);
         } else {
             crr.raw.set_word(0, 0);
         }
-        self.lower_max_size(window, crr, 0)
+        self.lower_max_size(crr, 0)
     }
 
     fn aoff_add_carrier_node(&mut self, carrier_index: usize) -> Result<(), AllocError> {
@@ -2633,7 +2611,7 @@ impl AllocUtil {
             carrier.in_aoff_tree = true;
             carrier.key_base + MBC_HEADER
         };
-        self.tn::<true>(node)?.raw.set_word(0, 0);
+        self.tn::<true>(node).raw.set_word(0, 0);
         let span = self.span_of(node).ok_or(AllocError::Corrupt)?;
         // Port of aoff_creating_mbc (erl_ao_firstfit_alloc.c): the block order is stored in the header.
         let blk_order = match self.strategy {
@@ -2775,7 +2753,8 @@ impl AllocUtil {
         }
         if is_aoff(self.strategy) {
             self.insert_tree_node::<true>(node, size, span)?;
-            self.aoff_raise_carrier_max(span, size)
+            self.aoff_raise_carrier_max(span, size);
+            Ok(())
         } else {
             self.insert_tree_node::<false>(node, size, span)
         }
@@ -2792,15 +2771,15 @@ impl AllocUtil {
         span: CarrierSpan,
     ) -> Result<(), AllocError> {
         let block_node = !(A && !span.sbc && node == span.start + MBC_HEADER);
-        let (tree, window) = if block_node {
+        let tree = if block_node {
             self.tree_span.set(span);
-            (TreeId::Blocks, span.window())
+            TreeId::Blocks
         } else {
-            (TreeId::Carriers, self.tree_span.get().window())
+            TreeId::Carriers
         };
         let by_address = !block_node || self.strategy == Strategy::Aoff;
         let bestfit = block_node && matches!(self.strategy, Strategy::BestFit | Strategy::AoffCbf);
-        let blk = self.tn_in::<A>(window, node)?;
+        let blk = self.tn::<A>(node);
         blk.set_left(0);
         blk.set_right(0);
         if A {
@@ -2816,7 +2795,7 @@ impl AllocUtil {
             self.set_root_of::<A>(tree, node);
             return Ok(());
         }
-        let mut x = self.tn_in::<A>(window, root)?;
+        let mut x = self.tn::<A>(root);
         let go_left = loop {
             let x_size = x.size();
             if A && x.max() < size {
@@ -2828,7 +2807,7 @@ impl AllocUtil {
                 blk.set_parent(x.key());
                 blk.set_next(head_next);
                 if head_next != 0 {
-                    self.tn_in::<A>(window, head_next)?.set_parent(node);
+                    self.tn::<A>(head_next).set_parent(node);
                 }
                 x.set_next(node);
                 return Ok(());
@@ -2842,7 +2821,7 @@ impl AllocUtil {
             if child == 0 {
                 break go_left;
             }
-            x = self.tn_in::<A>(window, child)?;
+            x = self.tn::<A>(child);
         };
         blk.set_parent(x.key());
         if go_left {
@@ -2852,7 +2831,7 @@ impl AllocUtil {
         }
         blk.set_flags(TREE_NODE | RED);
         if x.is_red() {
-            self.insert_fixup(tree, blk)?;
+            self.insert_fixup(tree, blk);
         }
         if bestfit {
             blk.set_next(0);
@@ -2881,6 +2860,16 @@ impl AllocUtil {
     /// Port of `bf_get_free_block` and `aobf_get_free_block`, `erl_bestfit_alloc.c:657-865`, OTP-29.1.1.
     #[inline]
     fn choose_free(&self, need: usize) -> Result<Option<usize>, AllocError> {
+        Ok(self.choose_free_in(need)?.map(|(block, _)| block))
+    }
+
+    /// `choose_free` that also returns the span of the aoff carrier holding the block, which the
+    /// search had to resolve anyway.
+    #[inline]
+    fn choose_free_in(
+        &self,
+        need: usize,
+    ) -> Result<Option<(usize, Option<CarrierSpan>)>, AllocError> {
         // Port of aoff_get_free_block, erl_ao_firstfit_alloc.c:895, OTP-29.1.1;
         // goodfit_get_free_block, erl_goodfit_alloc.c:393, OTP-29.1.1; and
         // afit_get_free_block, erl_afit_alloc.c:123, OTP-29.1.1.
@@ -2889,7 +2878,7 @@ impl AllocUtil {
             if head == 0 || self.blk(head)?.size < need {
                 return Ok(None);
             }
-            return Ok(Some(head));
+            return Ok(Some((head, None)));
         }
         if self.strategy == Strategy::GoodFit {
             let first_bucket = goodfit_bucket(need, self.goodfit_interval_d);
@@ -2911,15 +2900,13 @@ impl AllocUtil {
                     node = self.word_at(node, LIST_NEXT_WORD)?;
                 }
                 if let Some((node, _)) = best {
-                    return Ok(Some(node));
+                    return Ok(Some((node, None)));
                 }
             }
             return Ok(None);
         }
         if is_aoff(self.strategy) {
-            let Some(carrier_node) =
-                self.aoff_search(self.tree_span.get().window(), self.aoff_carrier_root, need)?
-            else {
+            let Some(carrier_node) = self.aoff_search(self.aoff_carrier_root, need) else {
                 return Ok(None);
             };
             let span = self
@@ -2927,7 +2914,9 @@ impl AllocUtil {
                 .filter(|span| !span.sbc && carrier_node == span.start + MBC_HEADER)
                 .ok_or(AllocError::Corrupt)?;
             self.tree_span.set(span);
-            return self.aoff_search(span.window(), self.aoff_root(span), need);
+            return Ok(self
+                .aoff_search(self.aoff_root(span), need)
+                .map(|block| (block, Some(span))));
         }
         let mut current = self.free_root;
         let mut best = 0;
@@ -2949,7 +2938,7 @@ impl AllocUtil {
                 best = next;
             }
         }
-        Ok(Some(best))
+        Ok(Some((best, None)))
     }
 
     /// Removes a free block from its intrusive tree node or BF size list.
@@ -2996,7 +2985,7 @@ impl AllocUtil {
         node: usize,
     ) -> Result<(), AllocError> {
         let tree = TreeId::Blocks;
-        let del = self.tn::<A>(node)?;
+        let del = self.tn::<A>(node);
         if matches!(self.strategy, Strategy::BestFit | Strategy::AoffCbf) {
             if del.flags() & TREE_NODE == 0 {
                 let prev = del.parent();
@@ -3004,49 +2993,55 @@ impl AllocUtil {
                 if prev == 0 {
                     return Err(AllocError::Corrupt);
                 }
-                self.tn::<A>(prev)?.set_next(next);
+                self.tn::<A>(prev).set_next(next);
                 if next != 0 {
-                    self.tn::<A>(next)?.set_parent(prev);
+                    self.tn::<A>(next).set_parent(prev);
                 }
                 return Ok(());
             }
             let next = del.next();
             if next != 0 {
-                let new = self.tn::<A>(next)?;
-                return self.replace_tree_node(tree, del, new);
+                let new = self.tn::<A>(next);
+                self.replace_tree_node(tree, del, new);
+                return Ok(());
             }
         }
         self.delete_tree_node::<A>(tree, node)?;
         if A {
-            self.aoff_lower_carrier_max(span)?;
+            self.aoff_lower_carrier_max(span);
         }
         Ok(())
     }
 
+    /// `red` for the validator, which follows links that may be corrupt: the node address is
+    /// checked first.
     fn is_red(&self, node: usize) -> Result<bool, AllocError> {
-        if is_aoff(self.strategy) {
+        if node != 0 && !self.is_tree_node_address(node) {
+            return Err(AllocError::Corrupt);
+        }
+        Ok(if is_aoff(self.strategy) {
             self.red::<true>(node)
         } else {
             self.red::<false>(node)
-        }
+        })
     }
 
     /// Port of left_rotate, erl_ao_firstfit_alloc.c, OTP-29.1.1.
     #[inline(always)]
-    fn rotate_left<const A: bool>(&mut self, tree: TreeId, x: TNode<A>) -> Result<(), AllocError> {
+    fn rotate_left<const A: bool>(&mut self, tree: TreeId, x: TNode<A>) {
         let y_key = x.right();
-        let y = self.tn::<A>(y_key)?;
+        let y = self.tn::<A>(y_key);
         let beta = y.left();
         x.set_right(beta);
         if beta != 0 {
-            self.tn::<A>(beta)?.set_parent(x.key());
+            self.tn::<A>(beta).set_parent(x.key());
         }
         let parent = x.parent();
         y.set_parent(parent);
         if parent == 0 {
             self.set_root_of::<A>(tree, y_key);
         } else {
-            let p = self.tn::<A>(parent)?;
+            let p = self.tn::<A>(parent);
             if x.key() == p.left() {
                 p.set_left(y_key);
             } else {
@@ -3057,28 +3052,27 @@ impl AllocUtil {
         x.set_parent(y_key);
         if A {
             y.set_max(x.max());
-            let max = self.node_max_size(self.tree_span.get().window(), x)?;
+            let max = self.node_max_size(x);
             x.set_max(max);
         }
-        Ok(())
     }
 
     /// Port of right_rotate, erl_ao_firstfit_alloc.c, OTP-29.1.1.
     #[inline(always)]
-    fn rotate_right<const A: bool>(&mut self, tree: TreeId, x: TNode<A>) -> Result<(), AllocError> {
+    fn rotate_right<const A: bool>(&mut self, tree: TreeId, x: TNode<A>) {
         let y_key = x.left();
-        let y = self.tn::<A>(y_key)?;
+        let y = self.tn::<A>(y_key);
         let beta = y.right();
         x.set_left(beta);
         if beta != 0 {
-            self.tn::<A>(beta)?.set_parent(x.key());
+            self.tn::<A>(beta).set_parent(x.key());
         }
         let parent = x.parent();
         y.set_parent(parent);
         if parent == 0 {
             self.set_root_of::<A>(tree, y_key);
         } else {
-            let p = self.tn::<A>(parent)?;
+            let p = self.tn::<A>(parent);
             if x.key() == p.right() {
                 p.set_right(y_key);
             } else {
@@ -3089,39 +3083,29 @@ impl AllocUtil {
         x.set_parent(y_key);
         if A {
             y.set_max(x.max());
-            let max = self.node_max_size(self.tree_span.get().window(), x)?;
+            let max = self.node_max_size(x);
             x.set_max(max);
         }
-        Ok(())
     }
 
     #[inline(always)]
-    fn node_max_size<const A: bool>(
-        &self,
-        window: TreeWindow,
-        x: TNode<A>,
-    ) -> Result<usize, AllocError> {
+    fn node_max_size<const A: bool>(&self, x: TNode<A>) -> usize {
         let mut sz = x.size();
         let left = x.left();
         if left != 0 {
-            sz = sz.max(self.tn_in::<A>(window, left)?.max());
+            sz = sz.max(self.tn::<A>(left).max());
         }
         let right = x.right();
         if right != 0 {
-            sz = sz.max(self.tn_in::<A>(window, right)?.max());
+            sz = sz.max(self.tn::<A>(right).max());
         }
-        Ok(sz)
+        sz
     }
 
     #[inline(never)]
-    fn lower_max_size<const A: bool>(
-        &self,
-        window: TreeWindow,
-        node: TNode<A>,
-        stop_at: usize,
-    ) -> Result<(), AllocError> {
+    fn lower_max_size<const A: bool>(&self, node: TNode<A>, stop_at: usize) {
         let old_max = node.max();
-        let new_max = self.node_max_size(window, node)?;
+        let new_max = self.node_max_size(node);
         if new_max < old_max {
             node.set_max(new_max);
             let mut x = node;
@@ -3130,89 +3114,78 @@ impl AllocUtil {
                 if parent == stop_at {
                     break;
                 }
-                x = self.tn_in::<A>(window, parent)?;
+                x = self.tn::<A>(parent);
                 if x.max() != old_max {
                     break;
                 }
-                let max = self.node_max_size(window, x)?;
+                let max = self.node_max_size(x);
                 x.set_max(max);
             }
         }
-        Ok(())
     }
 
     /// Port of tree_insert_fixup, erl_ao_firstfit_alloc.c, OTP-29.1.1.
-    fn insert_fixup<const A: bool>(
-        &mut self,
-        tree: TreeId,
-        blk: TNode<A>,
-    ) -> Result<(), AllocError> {
+    fn insert_fixup<const A: bool>(&mut self, tree: TreeId, blk: TNode<A>) {
         let mut x = blk;
         loop {
-            let parent = self.tn::<A>(x.parent())?;
-            let grand = self.tn::<A>(parent.parent())?;
+            let parent = self.tn::<A>(x.parent());
+            let grand = self.tn::<A>(parent.parent());
             if parent.key() == grand.left() {
                 let y_key = grand.right();
-                if self.red::<A>(y_key)? {
-                    self.tn::<A>(y_key)?.set_black();
+                if self.red::<A>(y_key) {
+                    self.tn::<A>(y_key).set_black();
                     parent.set_black();
                     grand.set_red();
                     x = grand;
                 } else {
                     if x.key() == parent.right() {
                         x = parent;
-                        self.rotate_left(tree, x)?;
+                        self.rotate_left(tree, x);
                     }
-                    let parent = self.tn::<A>(x.parent())?;
-                    let grand = self.tn::<A>(parent.parent())?;
+                    let parent = self.tn::<A>(x.parent());
+                    let grand = self.tn::<A>(parent.parent());
                     parent.set_black();
                     grand.set_red();
-                    self.rotate_right(tree, grand)?;
+                    self.rotate_right(tree, grand);
                     break;
                 }
             } else {
                 let y_key = grand.left();
-                if self.red::<A>(y_key)? {
-                    self.tn::<A>(y_key)?.set_black();
+                if self.red::<A>(y_key) {
+                    self.tn::<A>(y_key).set_black();
                     parent.set_black();
                     grand.set_red();
                     x = grand;
                 } else {
                     if x.key() == parent.left() {
                         x = parent;
-                        self.rotate_right(tree, x)?;
+                        self.rotate_right(tree, x);
                     }
-                    let parent = self.tn::<A>(x.parent())?;
-                    let grand = self.tn::<A>(parent.parent())?;
+                    let parent = self.tn::<A>(x.parent());
+                    let grand = self.tn::<A>(parent.parent());
                     parent.set_black();
                     grand.set_red();
-                    self.rotate_left(tree, grand)?;
+                    self.rotate_left(tree, grand);
                     break;
                 }
             }
-            if !self.red::<A>(x.parent())? {
+            if !self.red::<A>(x.parent()) {
                 break;
             }
         }
         let root = self.root_of::<A>(tree);
-        self.tn::<A>(root)?.set_black();
-        Ok(())
+        self.tn::<A>(root).set_black();
     }
 
     /// Port of replace, erl_ao_firstfit_alloc.c, OTP-29.1.1: `new` takes over every link, the color
     /// and the max of `old`. The block header of `new` is not changed.
     #[inline(always)]
-    fn replace_tree_node<const A: bool>(
-        &mut self,
-        tree: TreeId,
-        old: TNode<A>,
-        new: TNode<A>,
-    ) -> Result<(), AllocError> {
+    fn replace_tree_node<const A: bool>(&mut self, tree: TreeId, old: TNode<A>, new: TNode<A>) {
         let parent = old.parent();
         if parent == 0 {
             self.set_root_of::<A>(tree, new.key());
         } else {
-            let p = self.tn::<A>(parent)?;
+            let p = self.tn::<A>(parent);
             if old.key() == p.left() {
                 p.set_left(new.key());
             } else {
@@ -3221,11 +3194,11 @@ impl AllocUtil {
         }
         let left = old.left();
         if left != 0 {
-            self.tn::<A>(left)?.set_parent(new.key());
+            self.tn::<A>(left).set_parent(new.key());
         }
         let right = old.right();
         if right != 0 {
-            self.tn::<A>(right)?.set_parent(new.key());
+            self.tn::<A>(right).set_parent(new.key());
         }
         new.set_flags(old.flags());
         new.set_parent(parent);
@@ -3234,7 +3207,6 @@ impl AllocUtil {
         if A {
             new.set_max(old.max());
         }
-        Ok(())
     }
 
     /// Port of rbt_delete, erl_ao_firstfit_alloc.c, OTP-29.1.1. The sentinel `null_x` of the C code
@@ -3246,19 +3218,18 @@ impl AllocUtil {
         tree: TreeId,
         node: usize,
     ) -> Result<(), AllocError> {
-        let window = self.tree_span.get().window();
-        let z = self.tn_in::<A>(window, node)?;
+        let z = self.tn::<A>(node);
         let z_right = z.right();
         let y = if z.left() == 0 || z_right == 0 {
             z
         } else {
-            let mut y = self.tn_in::<A>(window, z_right)?;
+            let mut y = self.tn::<A>(z_right);
             loop {
                 let left = y.left();
                 if left == 0 {
                     break y;
                 }
-                y = self.tn_in::<A>(window, left)?;
+                y = self.tn::<A>(left);
             }
         };
         let y_left = y.left();
@@ -3267,111 +3238,105 @@ impl AllocUtil {
         let y_parent = y.parent();
         let mut x_parent = y_parent;
         if x != 0 {
-            self.tn_in::<A>(window, x)?.set_parent(y_parent);
+            self.tn::<A>(x).set_parent(y_parent);
         }
         if y_parent == 0 {
             self.set_root_of::<A>(tree, x);
         } else {
-            let p = self.tn_in::<A>(window, y_parent)?;
+            let p = self.tn::<A>(y_parent);
             if y.key() == p.left() {
                 p.set_left(x);
             } else {
                 p.set_right(x);
             }
             if A && y_parent != node {
-                self.lower_max_size(window, p, if y.key() == node { 0 } else { node })?;
+                self.lower_max_size(p, if y.key() == node { 0 } else { node });
             }
         }
         if y.key() != node {
-            self.replace_tree_node(tree, z, y)?;
+            self.replace_tree_node(tree, z, y);
             if A {
-                self.lower_max_size(window, y, 0)?;
+                self.lower_max_size(y, 0);
             }
             if x_parent == node {
                 x_parent = y.key();
             }
         }
         if spliced_is_black {
-            self.delete_fixup::<A>(tree, x, x_parent)?;
+            self.delete_fixup::<A>(tree, x, x_parent);
         }
         Ok(())
     }
 
     /// The fixup loop of rbt_delete, erl_ao_firstfit_alloc.c, OTP-29.1.1.
-    fn delete_fixup<const A: bool>(
-        &mut self,
-        tree: TreeId,
-        mut x: usize,
-        mut x_parent: usize,
-    ) -> Result<(), AllocError> {
-        while x_parent != 0 && !self.red::<A>(x)? {
-            let parent = self.tn::<A>(x_parent)?;
+    fn delete_fixup<const A: bool>(&mut self, tree: TreeId, mut x: usize, mut x_parent: usize) {
+        while x_parent != 0 && !self.red::<A>(x) {
+            let parent = self.tn::<A>(x_parent);
             if x == parent.left() {
-                let mut y = self.tn::<A>(parent.right())?;
+                let mut y = self.tn::<A>(parent.right());
                 if y.is_red() {
                     y.set_black();
                     parent.set_red();
-                    self.rotate_left(tree, parent)?;
-                    y = self.tn::<A>(parent.right())?;
+                    self.rotate_left(tree, parent);
+                    y = self.tn::<A>(parent.right());
                 }
                 let y_left = y.left();
                 let y_right = y.right();
-                if !self.red::<A>(y_left)? && !self.red::<A>(y_right)? {
+                if !self.red::<A>(y_left) && !self.red::<A>(y_right) {
                     y.set_red();
                     x = x_parent;
                     x_parent = parent.parent();
                 } else {
-                    if !self.red::<A>(y_right)? {
-                        self.tn::<A>(y_left)?.set_black();
+                    if !self.red::<A>(y_right) {
+                        self.tn::<A>(y_left).set_black();
                         y.set_red();
-                        self.rotate_right(tree, y)?;
-                        y = self.tn::<A>(parent.right())?;
+                        self.rotate_right(tree, y);
+                        y = self.tn::<A>(parent.right());
                     }
                     if parent.is_red() {
                         parent.set_black();
                         y.set_red();
                     }
-                    self.tn::<A>(y.right())?.set_black();
-                    self.rotate_left(tree, parent)?;
+                    self.tn::<A>(y.right()).set_black();
+                    self.rotate_left(tree, parent);
                     x = self.root_of::<A>(tree);
                     break;
                 }
             } else {
-                let mut y = self.tn::<A>(parent.left())?;
+                let mut y = self.tn::<A>(parent.left());
                 if y.is_red() {
                     y.set_black();
                     parent.set_red();
-                    self.rotate_right(tree, parent)?;
-                    y = self.tn::<A>(parent.left())?;
+                    self.rotate_right(tree, parent);
+                    y = self.tn::<A>(parent.left());
                 }
                 let y_right = y.right();
                 let y_left = y.left();
-                if !self.red::<A>(y_right)? && !self.red::<A>(y_left)? {
+                if !self.red::<A>(y_right) && !self.red::<A>(y_left) {
                     y.set_red();
                     x = x_parent;
                     x_parent = parent.parent();
                 } else {
-                    if !self.red::<A>(y_left)? {
-                        self.tn::<A>(y_right)?.set_black();
+                    if !self.red::<A>(y_left) {
+                        self.tn::<A>(y_right).set_black();
                         y.set_red();
-                        self.rotate_left(tree, y)?;
-                        y = self.tn::<A>(parent.left())?;
+                        self.rotate_left(tree, y);
+                        y = self.tn::<A>(parent.left());
                     }
                     if parent.is_red() {
                         parent.set_black();
                         y.set_red();
                     }
-                    self.tn::<A>(y.left())?.set_black();
-                    self.rotate_right(tree, parent)?;
+                    self.tn::<A>(y.left()).set_black();
+                    self.rotate_right(tree, parent);
                     x = self.root_of::<A>(tree);
                     break;
                 }
             }
         }
         if x != 0 {
-            self.tn::<A>(x)?.set_black();
+            self.tn::<A>(x).set_black();
         }
-        Ok(())
     }
 
     fn tree_free_blocks(&self) -> Result<HashSet<usize>, AllocError> {
