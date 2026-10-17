@@ -515,6 +515,22 @@ fn raise_fragments() -> Option<&'static arinsal_beamasm::raise_frag::RaiseFragme
         .as_ref()
 }
 
+fn receive_fragments() -> Option<&'static arinsal_beamasm::receive_frag::ReceiveFragments> {
+    static FRAGMENTS: OnceLock<Option<arinsal_beamasm::receive_frag::ReceiveFragments>> =
+        OnceLock::new();
+    FRAGMENTS
+        .get_or_init(|| {
+            arinsal_beamasm::receive_frag::ReceiveFragments::new(
+                crate::native_helpers::arinsal_beamasm_loop_rec,
+                crate::native_helpers::arinsal_beamasm_wait,
+                crate::native_helpers::arinsal_beamasm_wait,
+                yield_fragments()?.context_switch(),
+            )
+            .ok()
+        })
+        .as_ref()
+}
+
 fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
     static FRAGMENTS: OnceLock<Option<arinsal_beamasm::map::MapFragments>> = OnceLock::new();
     FRAGMENTS
@@ -1901,11 +1917,20 @@ impl ModuleEnv for VmModuleEnv<'_> {
             recv_marker_bind: h::arinsal_beamasm_recv_marker_bind,
             recv_marker_clear: h::arinsal_beamasm_recv_marker_clear,
             recv_marker_use: h::arinsal_beamasm_recv_marker_use,
-            loop_rec: h::arinsal_beamasm_loop_rec,
+            loop_rec_shared: receive_fragments().map_or(
+                0,
+                arinsal_beamasm::receive_frag::ReceiveFragments::loop_rec_shared,
+            ),
             remove_message: h::arinsal_beamasm_remove_message,
             set_save_next: h::arinsal_beamasm_set_save_next,
-            wait_unlocked: h::arinsal_beamasm_wait,
-            wait_locked: h::arinsal_beamasm_wait,
+            wait_unlocked_shared: receive_fragments().map_or(
+                0,
+                arinsal_beamasm::receive_frag::ReceiveFragments::wait_unlocked_shared,
+            ),
+            wait_locked_shared: receive_fragments().map_or(
+                0,
+                arinsal_beamasm::receive_frag::ReceiveFragments::wait_locked_shared,
+            ),
             take_receive_lock: h::arinsal_beamasm_take_receive_lock,
             wait_timeout: h::arinsal_beamasm_wait_timeout,
             timeout_locked: h::arinsal_beamasm_timeout,

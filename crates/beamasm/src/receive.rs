@@ -7,7 +7,6 @@ use crate::{
     module::{ArgVal, BeamModuleAssembler, ModuleError},
 };
 
-const XREG0: Gpr = Gpr::x(25);
 const FCALLS: Gpr = Gpr::w(22);
 
 /// Runtime callback which reserves a receive marker and returns its term.
@@ -52,16 +51,16 @@ pub struct ReceiveHooks {
     pub recv_marker_clear: RecvMarkerClearHook,
     /// Restores the saved position for a reference.
     pub recv_marker_use: RecvMarkerUseHook,
-    /// Peeks a message at the saved mailbox position.
-    pub loop_rec: LoopRecHook,
+    /// Entry of the process-wide `i_loop_rec_shared` fragment.
+    pub loop_rec_shared: usize,
     /// Removes the current message.
     pub remove_message: RemoveMessageHook,
     /// Advances the saved mailbox position.
     pub set_save_next: SetSaveNextHook,
-    /// Waits with the message queue lock in the supplied state.
-    pub wait_unlocked: WaitHook,
-    /// Waits while retaining the message queue lock.
-    pub wait_locked: WaitHook,
+    /// Entry of the process-wide unlocked wait fragment.
+    pub wait_unlocked_shared: usize,
+    /// Entry of the process-wide locked wait fragment.
+    pub wait_locked_shared: usize,
     /// Takes the receive lock before a timeout wait.
     pub take_receive_lock: TakeReceiveLockHook,
     /// Waits for a message or timeout.
@@ -161,38 +160,15 @@ impl BeamModuleAssembler {
 
     /// Peeks the next message and branches to the wait label when the queue is empty.
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:106-238 (emit_i_loop_rec_shared,
-    // emit_i_loop_rec), OTP-29.1.1.
+    // emit_i_loop_rec), OTP-29.1.1. The reduction test, the receive helper, the four-reduction
+    // charge per fetch and the schedule-out live in the process-wide fragment.
     pub fn emit_i_loop_rec(&mut self, wait: u32, hooks: ReceiveHooks) -> Result<(), ModuleError> {
         let entry = self.code.new_label();
-        let schedule_out = self.code.new_label();
-        let done = self.code.new_label();
         self.code.bind(entry)?;
-        // erts checks reductions before peeking and schedules out at the `loop_rec` itself.
-        self.code.emit(|e| e.cmp_imm(FCALLS, 0, false))?;
-        self.code.b_cond(Cond::Le, schedule_out)?;
-        // erts enters the runtime with eHeapAlloc for the receive helper, which may copy
-        // fetched messages onto the heap (instr_msg.cpp:139-153).
-        self.emit_runtime_hook_with(hooks.loop_rec as usize, &[], 6, crate::Update::HEAP_ALLOC)?;
-        // Any word above the sentinel is a message.
-        self.code
-            .emit(|e| e.cmp_imm(Gpr::x(0), LOOP_REC_FETCH, false))?;
-        self.code.b_cond(Cond::Hi, done)?;
-        // The inner queue is empty: erts calls erts_proc_sig_receive_helper, which charges
-        // four reductions per fetch (erl_proc_sig_queue.c:7770).
-        self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 4, false))?;
+        self.code.adr(Gpr::x(0), entry)?;
         let wait = self.label(wait);
-        self.code.cbz(Gpr::x(0), wait)?;
-        // Signals wait in the outer queue. Their handling needs the scheduler context, which
-        // this runtime keeps on the scheduler side, so the fetch runs there and the process
-        // re-enters at `entry` within the same slice (`emit_i_loop_rec_shared` restarts too).
-        self.code.bind(schedule_out)?;
-        self.code.adr(Gpr::x(8), entry)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
-        self.emit_yield_live(0)?;
-        self.code.b(self.yield_label)?;
-        self.code.bind(done)?;
-        self.code.emit(|e| e.mov_reg(XREG0, Gpr::x(0)))?;
-        Ok(())
+        self.code.adr(Gpr::x(1), wait)?;
+        self.fragment_call(hooks.loop_rec_shared)
     }
 
     /// Removes the current message and updates the reduction count.
@@ -214,14 +190,9 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:151-164, OTP-29.1.1
     pub fn emit_loop_rec_end(&mut self, dest: u32, hooks: ReceiveHooks) -> Result<(), ModuleError> {
         self.emit_runtime_hook_with(hooks.set_save_next as usize, &[], 0, crate::Update::NONE)?;
-        self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
+        self.code.emit(|e| e.sub_imm(FCALLS, FCALLS, 1, false))?;
         let dest = self.label(dest);
-        self.code.b_cond(Cond::Pl, dest)?;
-        // Out of reductions: yield and resume at the next receive iteration.
-        self.code.adr(Gpr::x(8), dest)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
-        self.emit_yield_live(0)?;
-        self.code.b(self.yield_label)?;
+        self.code.b(dest)?;
         Ok(())
     }
 
@@ -233,36 +204,32 @@ impl BeamModuleAssembler {
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
         let start = self.code.offset();
-        self.emit_wait(hooks.wait_unlocked, dest, start)
+        self.emit_wait(hooks.wait_unlocked_shared, dest, start)
     }
 
     /// Waits with the queue lock held, then returns to the scheduler.
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:182-198, OTP-29.1.1
     pub fn emit_wait_locked(&mut self, dest: u32, hooks: ReceiveHooks) -> Result<(), ModuleError> {
         let start = self.code.offset();
-        self.emit_wait(hooks.wait_locked, dest, start)
+        self.emit_wait(hooks.wait_locked_shared, dest, start)
     }
 
-    // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:271-295, OTP-29.1.1.
-    // The hook records the wait for the scheduler; the process then leaves native code as
-    // a yield that resumes at `dest` (the `loop_rec` label of the receive).
+    // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:166-198 (emit_wait_unlocked,
+    // emit_wait_locked), OTP-29.1.1.
+    // The process-wide fragment records the wait for the scheduler; the process then leaves
+    // native code as a yield that resumes at `dest` (the `loop_rec` label of the receive).
     //
     // A receive without clauses targets the wait itself: its queued messages never match,
     // so it sleeps until a new message arrives. Bit 0 of the resume address tells the hook.
-    fn emit_wait(&mut self, hook: WaitHook, dest: u32, start: usize) -> Result<(), ModuleError> {
+    fn emit_wait(&mut self, shared: usize, dest: u32, start: usize) -> Result<(), ModuleError> {
         let dest = self.label(dest);
         let self_target = self.code.label_offset(dest) == Some(start);
-        self.code.adr(Gpr::x(9), dest)?;
+        self.code.adr(Gpr::x(0), dest)?;
         if self_target {
             self.code
-                .emit(|e| e.add_imm(Gpr::x(9), Gpr::x(9), 1, false))?;
+                .emit(|e| e.add_imm(Gpr::x(0), Gpr::x(0), 1, false))?;
         }
-        self.emit_runtime_hook_with(hook as usize, &[Gpr::x(9)], 0, crate::Update::NONE)?;
-        self.code.adr(Gpr::x(8), dest)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
-        self.emit_yield_live(0)?;
-        self.code.b(self.yield_label)?;
-        Ok(())
+        self.fragment_call(shared)
     }
 
     /// Takes the receive lock, then uses the locked timeout wait path.
@@ -319,7 +286,7 @@ impl BeamModuleAssembler {
         self.code.b_cond(Cond::Eq, next)?;
         self.branch_error()?;
         self.code.bind(wait)?;
-        self.emit_wait(hooks.wait_locked, dest, start)?;
+        self.emit_wait(hooks.wait_locked_shared, dest, start)?;
         self.code.bind(next)?;
         Ok(())
     }
