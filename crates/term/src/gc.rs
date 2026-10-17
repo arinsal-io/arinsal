@@ -2088,6 +2088,16 @@ mod tests {
     }
 
     #[test]
+    fn list_that_fits_the_heap_lands_entirely_on_it() {
+        let mut heap = ProcessHeap::with_words(64);
+        crate::TermBuilder::new(&mut heap)
+            .string_to_list("12345")
+            .unwrap();
+        assert_eq!(heap.fragment_words, 0);
+        assert_eq!(heap.used_words(), 10);
+    }
+
+    #[test]
     fn adopted_message_fragment_exposes_only_the_words_below_its_heap_top() {
         // The message heap block is not cleared; words above its heap top are not objects, so a
         // literal-area scan must not walk them (heap fragment `used_size`).
