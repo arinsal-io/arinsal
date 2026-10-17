@@ -105,6 +105,16 @@ pub fn register_thread(kind: ThreadKind) -> Result<usize, RegisterError> {
     Ok(ix)
 }
 
+/// The allocator instance index the calling thread registered, 0 for a thread that did not.
+///
+/// Port of `erts_get_thr_alloc_ix` in erl_alloc.h, OTP-29.1.1. A scheduler reads this once and
+/// hands the value down to the `*_at` allocation calls, the way erts passes `esdp->no` instead of
+/// looking the scheduler up on every allocation.
+#[inline]
+pub fn thread_alloc_ix() -> usize {
+    ALC_IX.with(Cell::get)
+}
+
 /// Installs the callback that wakes the owner of a scheduler instance (once).
 ///
 /// Port of `erts_alloc_notify_delayed_dealloc` in erl_alloc.c, OTP-29.1.1. The callback receives
@@ -396,11 +406,26 @@ impl ThreadSpecificAllocators {
     }
 
     /// Allocates and returns the stable payload pointer.
+    #[inline]
     pub fn alloc_with_ptr(
         &self,
         size: usize,
     ) -> Result<(InstanceAllocation, *mut u64), AllocError> {
-        let instance = self.current_instance();
+        self.alloc_with_ptr_at(thread_alloc_ix(), size)
+    }
+
+    /// [`ThreadSpecificAllocators::alloc_with_ptr`] for a caller that already knows its thread's
+    /// allocator index (see [`thread_alloc_ix`]), so no thread-local read is needed.
+    ///
+    /// `ix` must be the index of the calling thread; any other value allocates on an instance the
+    /// caller does not own, which a debug build rejects.
+    pub fn alloc_with_ptr_at(
+        &self,
+        ix: usize,
+        size: usize,
+    ) -> Result<(InstanceAllocation, *mut u64), AllocError> {
+        let instance = self.instance_for(ix);
+        debug_assert_eq!(instance, self.current_instance());
         let mut state = self.lock_instance(instance);
         if !self.delayed[instance].is_empty() {
             self.drain_and_publish(instance, &mut state)?;
@@ -490,8 +515,20 @@ impl ThreadSpecificAllocators {
 
     /// Frees immediately on the current instance or queues the free for its owner.
     /// Port of erl_alloc_util.c:6216 (erts_alcu_free_thr_pref) delayed-dealloc enqueue, OTP-29.1.1.
+    #[inline]
     pub fn free(&self, handle: InstanceAllocation) -> Result<(), AllocError> {
-        if self.routed.load(Ordering::Acquire) == 0 && self.current_instance() == handle.instance {
+        self.free_at(thread_alloc_ix(), handle)
+    }
+
+    /// [`ThreadSpecificAllocators::free`] for a caller that already knows its thread's allocator
+    /// index (see [`thread_alloc_ix`]).
+    ///
+    /// `ix` must be the index of the calling thread; a debug build rejects any other value.
+    #[inline]
+    pub fn free_at(&self, ix: usize, handle: InstanceAllocation) -> Result<(), AllocError> {
+        let current = self.instance_for(ix);
+        debug_assert_eq!(current, self.current_instance());
+        if self.routed.load(Ordering::Acquire) == 0 && current == handle.instance {
             let instance = handle.instance;
             let mut state = self.lock_instance(instance);
             if self.delayed[instance].is_empty() {
@@ -501,17 +538,16 @@ impl ThreadSpecificAllocators {
                 return freed;
             }
         }
-        self.free_routed(handle)
+        self.free_routed(current, handle)
     }
 
     /// `free` for a block that may have been routed to another instance, queued behind
     /// delayed frees, or sit in a carrier that changed hands.
     #[cold]
     #[inline(never)]
-    fn free_routed(&self, handle: InstanceAllocation) -> Result<(), AllocError> {
+    fn free_routed(&self, current: usize, handle: InstanceAllocation) -> Result<(), AllocError> {
         loop {
             let (instance, allocation) = self.route(handle)?;
-            let current = self.current_instance();
             if current != instance {
                 // Port of erl_alloc_util.c:6225-6230 (erts_alcu_free_thr_pref), OTP-29.1.1:
                 // a block freed by another scheduler is queued on the owning instance
@@ -729,8 +765,17 @@ impl ThreadSpecificAllocators {
         if !self.thread_specific {
             return 0;
         }
-        let ix = ALC_IX.with(Cell::get);
-        if ix < self.instances.len() { ix } else { 0 }
+        self.instance_for(ALC_IX.with(Cell::get))
+    }
+
+    /// The instance a thread with allocator index `ix` allocates on.
+    #[inline(always)]
+    fn instance_for(&self, ix: usize) -> usize {
+        if self.thread_specific && ix < self.instances.len() {
+            ix
+        } else {
+            0
+        }
     }
 
     /// Current size of allocated blocks across this allocator's instances.
@@ -1687,6 +1732,40 @@ mod tests {
     }
 
     #[test]
+    fn passed_index_allocates_on_the_owner_and_queues_a_foreign_free() {
+        let _serial = registration();
+        let allocators = four_instances();
+        let owner_allocators = Arc::clone(&allocators);
+        let (handle, ptr) = thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+            let ix = thread_alloc_ix();
+            assert_eq!(ix, 1);
+            let (handle, ptr) = owner_allocators.alloc_with_ptr_at(ix, 64).unwrap();
+            assert_eq!(handle.instance(), 1);
+            assert_eq!(ptr, owner_allocators.allocation_ptr(handle).unwrap());
+            let (second, _) = owner_allocators.alloc_with_ptr_at(ix, 64).unwrap();
+            owner_allocators.free_at(ix, second).unwrap();
+            assert_eq!(owner_allocators.pending_deallocations(1), 0);
+            (handle, ptr as usize)
+        })
+        .join()
+        .unwrap();
+        assert_ne!(ptr, 0);
+        let foreign_allocators = Arc::clone(&allocators);
+        thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(2)), Ok(2));
+            foreign_allocators
+                .free_at(thread_alloc_ix(), handle)
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(allocators.pending_deallocations(1), 1);
+        assert_eq!(allocators.drain_deallocations(1).unwrap(), 1);
+        assert_eq!(allocators.current_blocks_size(), 0);
+    }
+
+    #[test]
     fn cross_instance_free_is_delayed_until_owner_drains() {
         let allocators = Arc::new(ThreadSpecificAllocators::new(
             2,
@@ -2066,9 +2145,9 @@ mod tests {
         assert_eq!(
             sites,
             [
-                "alloc_with_ptr",
+                "alloc_with_ptr_at",
                 "realloc_with_ptr",
-                "free",
+                "free_at",
                 "free_routed",
                 "handle_owner_work",
                 "on_owner",
