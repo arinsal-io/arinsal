@@ -938,11 +938,7 @@ static PF_SPAWN_CONSTRUCT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 fn ensure_register_file(need: (usize, usize), p: &mut Process) -> (*mut Term, *mut f64) {
     let (need_x, need_fr) = need;
-    if p.x.len() < need_x {
-        let mut registers = p.x.to_vec();
-        registers.resize(need_x, Term::NIL);
-        p.x = registers.into();
-    }
+    p.x.ensure_x(need_x);
     if p.fr.len() < need_fr {
         let mut registers = p.fr.to_vec();
         registers.resize(need_fr, 0.0);
@@ -1804,11 +1800,7 @@ impl Vm {
             )));
         }
         let (need_x, need_fr) = self.code.registers[module_id];
-        if p.x.len() < need_x {
-            let mut registers = p.x.to_vec();
-            registers.resize(need_x, Term::NIL);
-            p.x = registers.into();
-        }
+        p.x.ensure_x(need_x);
         if p.fr.len() < need_fr {
             let mut registers = p.fr.to_vec();
             registers.resize(need_fr, 0.0);
@@ -2729,6 +2721,7 @@ impl Vm {
                     p.reductions_used = p
                         .reductions_used
                         .saturating_add(u64::from(bif_reductions));
+                    x = p.x.as_mut_ptr();
                     match result {
                         Ok(value) => {
                             let value = p.gc_after_bif(value)?;
