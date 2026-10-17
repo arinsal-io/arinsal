@@ -1420,6 +1420,23 @@ impl Process {
     pub(crate) fn ensure(&mut self, words: usize, live: usize) -> Result<(), VmError> {
         self.ensure_roots(words, live, true)
     }
+    /// [`Process::ensure`] with the no-collection case inline, for the native entry that runs
+    /// once per scheduling turn.
+    // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1: the
+    // entry check only reads the heap cursors unless a collection is wanted.
+    #[inline]
+    pub(crate) fn ensure_entry(&mut self, words: usize, live: usize) -> Result<(), VmError> {
+        if live <= self.x.len()
+            && self.heap.free_words()
+                >= words + arinsal_term::S_RESERVED * usize::from(self.heap.native_active())
+            && !self.heap.bin_vheap_gc_due()
+            && !crate::interp::gc_stress_enabled()
+        {
+            self.gc_live = live;
+            return Ok(());
+        }
+        self.ensure(words, live)
+    }
     /// [`Process::ensure`] that returns the collection's reduction cost instead of charging it,
     /// for `arinsal_beamasm_gc_sync`, whose generated code subtracts the cost from FCALLS.
     #[cold]
