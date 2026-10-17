@@ -1160,7 +1160,6 @@ struct Executor {
     /// The scheduler thread's hub is bound to `current_process`.
     hub_bound: bool,
     vm: Vm,
-    fr: Box<[f64]>,
     /// Native register backing is scheduler-local, as required by x19.
     native_registers: SchedulerRegisters,
 }
@@ -1350,27 +1349,13 @@ impl Executor {
         {
             process.native_pc = Some(start);
         }
-        let (need_x, need_fr) = self.vm.code.registers[process.module];
+        let need_x = self.vm.code.registers[process.module].0;
         if need_x > crate::proc_create::ATTACHED_X_REGS {
             return Err(VmError::Unsupported(format!(
                 "module needs {need_x} X registers, the scheduler array has {}",
                 crate::proc_create::ATTACHED_X_REGS
             )));
         }
-        if self.fr.len() < need_fr {
-            let mut registers = self.fr.to_vec();
-            registers.resize(need_fr, 0.0);
-            self.fr = registers.into_boxed_slice();
-        }
-        // The scheduler owns the register file during execution. A suspended
-        // process retains only the values needed to resume.
-        std::mem::swap(&mut process.fr, &mut self.fr);
-        if process.fr.len() < self.fr.len() {
-            let mut registers = process.fr.to_vec();
-            registers.resize(self.fr.len(), 0.0);
-            process.fr = registers.into_boxed_slice();
-        }
-        process.fr[..self.fr.len()].copy_from_slice(&self.fr);
         // Port of erts/emulator/beam/jit/arm/process_main.cpp (copy_in_registers) and
         // erl_process.c (erts_schedule), OTP-29.1.1: the scheduler's one X register array is
         // the process's file for the slice, loaded with the `c_p->arity` saved registers.
@@ -3340,12 +3325,10 @@ impl Executor {
             }
             other => other,
         };
-        std::mem::swap(&mut process.fr, &mut self.fr);
         if matches!(
             result,
             Ok(RunState::Yield | RunState::Wait { .. }) | Err(VmError::Yield | VmError::Dirty(_))
         ) {
-            let live_fr = self.vm.code.registers[process.module].1;
             // Port of erts/emulator/beam/erl_process.c:10550 and beam_common.c (the yield or
             // wait site stores its live X register count in `c_p->arity`, and only those are
             // saved in `c_p->arg_reg`), OTP-29.1.1: a native continuation already holds it in
@@ -3396,19 +3379,9 @@ impl Executor {
             // OTP-29.1.1: the `c_p->arity` registers go from the scheduler array into the
             // process, six of them inline (`def_arg_reg`) so switching out allocates nothing.
             process.x.detach_save(save_x);
-            if process.fr.len() != live_fr {
-                process.fr = vec![0.0; live_fr].into_boxed_slice();
-            }
-            // Float registers are never live across a scheduling point (erts saves none), so a
-            // native continuation keeps no copy.
-            if process.native_pc.is_none() {
-                let copy_fr = self.fr.len().min(live_fr);
-                process.fr[..copy_fr].copy_from_slice(&self.fr[..copy_fr]);
-            }
         } else {
             process.x.detach_save(0);
             process.x = crate::proc_create::ArgRegs::empty();
-            process.fr = Box::new([]);
         }
         // A waiting process is not collected when it switches out: erts only runs
         // `scheduler_gc_proc` for a process being scheduled in (a yielded process is still
@@ -6883,7 +6856,6 @@ fn new_executor(runtime: &Arc<Runtime>) -> Box<Executor> {
         current_process: Default::default(),
         hub_bound: false,
         vm: Vm::shared_replica(runtime.code_scope, &runtime.paths),
-        fr: Box::new([]),
         native_registers: SchedulerRegisters::default(),
     })
 }

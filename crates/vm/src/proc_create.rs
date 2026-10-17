@@ -49,6 +49,9 @@ const DEAD_X_FLOOR: usize = 8;
 /// Number of X registers a scheduler array holds (`ERTS_X_REGS_ALLOCATED`, erl_vm.h).
 pub const ATTACHED_X_REGS: usize = 1024;
 
+/// `esdp->registers->f_reg_array` length.
+pub const ATTACHED_F_REGS: usize = 1024;
+
 /// X registers, in one of two representations.
 ///
 /// Owned (scheduled out): the saved arguments. The first six live in the process, like
@@ -59,6 +62,10 @@ pub const ATTACHED_X_REGS: usize = 1024;
 /// (`esdp->registers->x_reg_array`), `ATTACHED_X_REGS` long. The owned storage and its
 /// `arity` are kept untouched until `detach_save` copies the live registers back, like
 /// `copy_out_registers` at schedule-out.
+///
+/// An attached file also carries the address of `esdp->registers->f_reg_array`. erts saves no
+/// float register across a scheduling point (they are dead there), so that array is the float
+/// file for the slice and nothing is copied in or out.
 pub struct ArgRegs {
     inline: [Term; 6],
     extra: Box<[Term]>,
@@ -66,6 +73,8 @@ pub struct ArgRegs {
     /// Address of the scheduler array while attached, zero otherwise. An address and not a
     /// pointer so `Process` stays `Sync` without an `unsafe impl`.
     attached: usize,
+    /// Address of the scheduler's float register array while attached, zero otherwise.
+    f_attached: usize,
 }
 
 impl ArgRegs {
@@ -77,6 +86,7 @@ impl ArgRegs {
                 extra: Box::from([]),
                 len,
                 attached: 0,
+                f_attached: 0,
             }
         } else {
             Self {
@@ -84,6 +94,7 @@ impl ArgRegs {
                 extra: vec![Term::NIL; len].into_boxed_slice(),
                 len,
                 attached: 0,
+                f_attached: 0,
             }
         }
     }
@@ -148,6 +159,7 @@ impl ArgRegs {
         };
         registers.x_reg_array[..len].copy_from_slice(saved);
         self.attached = registers.x_reg_array.as_mut_ptr() as usize;
+        self.f_attached = registers.f_reg_array.as_mut_ptr() as usize;
     }
 
     /// Schedule-out (`copy_out_registers`): copy the first `arity` array registers into the
@@ -173,6 +185,28 @@ impl ArgRegs {
         }
         self.len = arity;
         self.attached = 0;
+        self.f_attached = 0;
+    }
+
+    /// The scheduler's float register array while attached (`f_reg_array`, 1024 long), or
+    /// null.
+    #[inline]
+    pub fn float_ptr(&self) -> *mut f64 {
+        self.f_attached as *mut f64
+    }
+
+    /// The attached float register array, or `None` while the registers are owned.
+    #[inline]
+    pub fn attached_floats(&mut self) -> Option<&mut [f64]> {
+        if self.f_attached == 0 {
+            return None;
+        }
+        // SAFETY: `attach` took the address from the scheduler's live `f_reg_array`, which stays
+        // alive and in place until `detach_save`; `&mut self` makes this the only access to it
+        // through the process.
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(self.f_attached as *mut f64, ATTACHED_F_REGS)
+        })
     }
 
     /// Make at least `n` registers addressable. Owned: grow, keeping the registers and
@@ -226,6 +260,7 @@ impl From<Vec<Term>> for ArgRegs {
                 extra: Box::from([]),
                 len,
                 attached: 0,
+                f_attached: 0,
             }
         } else {
             Self {
@@ -233,6 +268,7 @@ impl From<Vec<Term>> for ArgRegs {
                 extra: values.into_boxed_slice(),
                 len,
                 attached: 0,
+                f_attached: 0,
             }
         }
     }
@@ -283,7 +319,9 @@ pub struct Process {
     pub(crate) header: ProcessHeader,
     /// X registers. Inline for the erts default of six (`def_arg_reg`).
     pub x: ArgRegs,
-    /// Float registers.
+    /// Float registers of a process that runs outside a scheduler slice (an evaluation on its
+    /// own thread). Inside a slice the float file is the scheduler's `f_reg_array`, reached
+    /// through `x`, and this stays empty.
     pub fr: Box<[f64]>,
     /// Contiguous process heap and Y stack.
     pub heap: ProcessHeap,
@@ -1769,10 +1807,35 @@ impl Process {
             _ => Err(VmError::Unsupported("invalid destination".into())),
         }
     }
-    pub(crate) fn float(&self, src: Arg) -> Result<f64, VmError> {
+    /// The float register file: the scheduler's `f_reg_array` while the registers are
+    /// attached, the process's own otherwise.
+    fn float_file(&mut self) -> &mut [f64] {
+        match self.x.attached_floats() {
+            Some(file) => file,
+            None => &mut self.fr,
+        }
+    }
+    /// The base of the float register file, for the interpreter's register window.
+    pub(crate) fn fr_ptr(&mut self) -> *mut f64 {
+        if self.x.is_attached() {
+            self.x.float_ptr()
+        } else {
+            self.fr.as_mut_ptr()
+        }
+    }
+    /// Make `need` float registers addressable. The scheduler's array always is; a process
+    /// outside a scheduler slice grows its own.
+    pub(crate) fn ensure_fr(&mut self, need: usize) {
+        if !self.x.is_attached() && self.fr.len() < need {
+            let mut registers = self.fr.to_vec();
+            registers.resize(need, 0.0);
+            self.fr = registers.into_boxed_slice();
+        }
+    }
+    pub(crate) fn float(&mut self, src: Arg) -> Result<f64, VmError> {
         if src.kind() == Arg::FR {
             return self
-                .fr
+                .float_file()
                 .get(src.value() as usize)
                 .copied()
                 .ok_or_else(|| VmError::Unsupported("FR register out of range".into()));
@@ -1792,7 +1855,7 @@ impl Process {
         }
         if dst.kind() == Arg::FR {
             *self
-                .fr
+                .float_file()
                 .get_mut(dst.value() as usize)
                 .ok_or_else(|| VmError::Unsupported("FR register out of range".into()))? = value;
             return Ok(());
@@ -2052,6 +2115,26 @@ mod arg_regs_tests {
         let wide = owned(&[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(wide.len(), 8);
         assert_eq!(wide[7], int(8));
+    }
+
+    #[test]
+    fn attached_floats_are_the_scheduler_float_array_and_nothing_is_saved() {
+        let mut sched = registers();
+        sched.f_reg_array[5] = 2.5;
+        let mut regs = owned(&[1]);
+        assert!(regs.attached_floats().is_none());
+        assert!(regs.float_ptr().is_null());
+        attach(&mut regs, &mut sched);
+        assert_eq!(regs.float_ptr(), sched.f_reg_array.as_mut_ptr());
+        let file = regs.attached_floats().expect("attached float file");
+        assert_eq!(file.len(), super::ATTACHED_F_REGS);
+        assert_eq!(file[5], 2.5);
+        file[7] = -1.5;
+        assert_eq!(sched.f_reg_array[7], -1.5);
+        regs.detach_save(1);
+        assert!(regs.attached_floats().is_none());
+        assert!(regs.float_ptr().is_null());
+        assert_eq!(sched.f_reg_array[7], -1.5);
     }
 
     #[test]
