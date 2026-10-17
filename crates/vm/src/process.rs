@@ -3603,6 +3603,14 @@ fn collect_on_schedule_in(process: &mut Process) -> Result<(), VmError> {
 }
 
 pub(crate) fn switched_out_live(process: &Process) -> usize {
+    if process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.bif_trap.as_ref())
+        .is_some_and(|trap| trap.args_are_roots())
+    {
+        return 0;
+    }
     let native_live = if process.native_pc.is_some() {
         process
             .cold
@@ -6063,7 +6071,7 @@ impl Process {
         let mut roots = [result];
         let gc = self.collect_heap_roots(0, &mut roots, 0)?;
         crate::natives::sys::after_collection(self, 0, gc.collections, gc.words_reclaimed);
-        self.bump_gc_reds(gc.reductions);
+        self.charge_gc_stats(&gc);
         // Only X0 survives a call; the dead registers now point into the freed heap and
         // must not be scanned by later literal-area or root walks.
         self.x[1..].fill(Term::NIL);
@@ -6320,6 +6328,10 @@ impl Process {
                     && cold.apply_roots.is_empty()
                     && cold.ext_last_released.is_none()
                     && cold.nif_pending.is_none()
+                    && cold
+                        .bif_trap
+                        .as_ref()
+                        .is_none_or(|trap| !trap.args_are_roots())
                     && cold.call_memory.is_empty()
             })
             && !self.has_dirty_result_roots()
@@ -6371,6 +6383,7 @@ impl Process {
         let inline_len = usize::from(self.apply_inline_len);
         roots.extend_from_slice(&self.apply_inline[..inline_len]);
         let mut nif_roots_len = 0;
+        let mut trap_roots_len = 0;
         if let Some(cold) = self.cold.as_mut() {
             roots.extend_from_slice(&cold.apply_roots);
             if let Some(released) = cold.ext_last_released.as_ref() {
@@ -6379,6 +6392,13 @@ impl Process {
             if let Some(pending) = cold.nif_pending.as_mut() {
                 nif_roots_len = pending.roots_mut().len();
                 roots.extend_from_slice(pending.roots_mut());
+            }
+            // Port of erts/emulator/beam/bif.h (ERTS_BIF_PREP_TRAPn leaves the arguments in
+            // `reg`, the `c_p->arity` live registers of the process while it is trapped),
+            // OTP-29.1.1.
+            if let Some(trap) = cold.bif_trap.as_ref().filter(|trap| trap.args_are_roots()) {
+                trap_roots_len = trap.arity;
+                roots.extend_from_slice(&trap.args[..trap.arity]);
             }
         }
         // A finished dirty job's result is in erts' argument registers until the call resumes.
@@ -6494,6 +6514,12 @@ impl Process {
                 pending
                     .roots_mut()
                     .copy_from_slice(&roots[released_end..released_end + nif_roots_len]);
+            }
+            if trap_roots_len != 0
+                && let Some(trap) = cold.bif_trap.as_mut()
+            {
+                let start = released_end + nif_roots_len;
+                trap.args[..trap_roots_len].copy_from_slice(&roots[start..start + trap_roots_len]);
             }
         }
         for (slot, &term) in self
@@ -6619,7 +6645,7 @@ impl Process {
             stats.collections,
             stats.words_reclaimed,
         );
-        self.bump_gc_reds(stats.reductions);
+        self.charge_gc_stats(&stats);
         Ok(())
     }
 

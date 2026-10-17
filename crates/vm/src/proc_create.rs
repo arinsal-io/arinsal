@@ -987,6 +987,16 @@ pub(crate) struct BifTrapPending {
     /// `apply(Module, Function, Args)` built from the trap state.
     pub(crate) callee: (arinsal_term::Atom, arinsal_term::Atom),
 }
+impl BifTrapPending {
+    /// Whether `args` are the trapped call's live registers: they are collection roots, and
+    /// the caller's own X registers are dead while the process waits in the trap.
+    // Port of erts/emulator/beam/bif.h (ERTS_BIF_PREP_TRAPn: the arguments are `reg[0..n]`),
+    // OTP-29.1.1.
+    pub(crate) fn args_are_roots(&self) -> bool {
+        self.continuation == crate::bif_traps::REVERSE_CONTINUATION
+    }
+}
+
 impl Process {
     /// The caller frame of the BIF the process waits in, while it is scheduled out in the
     /// export trap of an interpreter call.
@@ -1427,6 +1437,18 @@ impl Process {
         } else {
             self.reductions_used = self.reductions_used.saturating_add(u64::from(cost));
         }
+    }
+    /// Charge a collection the epilogue of a BIF ran: its cost, or, when erts postponed it, the
+    /// rest of the slice.
+    // Port of erts/emulator/beam/erl_gc.c (`delay_garbage_collection` returns `reds_left` from
+    // `force_reschedule`, and `erts_gc_after_bif_call_lhf` bumps the process by it),
+    // OTP-29.1.1. The part of it that is not the process's own work is already in `virtual_reds`.
+    pub(crate) fn charge_gc_stats(&mut self, stats: &arinsal_term::GcStats) {
+        if stats.collections == 0 && self.heap.native_active() {
+            self.reductions = 0;
+            return;
+        }
+        self.bump_gc_reds(stats.reductions);
     }
     /// Ensure native code's register slice directly, copying it through `self.x` only if GC runs.
     ///
