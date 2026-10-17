@@ -372,6 +372,98 @@ fn differential_mixed_flatmap_keys() {
 }
 
 #[test]
+fn differential_mixed_flatmap_keys_via_put() {
+    use arinsal_etf::OwnedTerm as O;
+    let erl_keys = [
+        "kcmp_zeta",
+        "7",
+        "kcmp_alpha",
+        "2.5",
+        "{1,2}",
+        "kcmp_mid",
+        "-5",
+        "<<\"x\">>",
+        "[1]",
+        "1.0",
+        "kcmp_omega",
+        "1",
+    ];
+    let keys = [
+        O::atom("kcmp_zeta"),
+        O::Int(7),
+        O::atom("kcmp_alpha"),
+        O::Float(2.5),
+        O::tuple(vec![O::Int(1), O::Int(2)]),
+        O::atom("kcmp_mid"),
+        O::Int(-5),
+        O::Binary(b"x".to_vec()),
+        O::list(vec![O::Int(1)]),
+        O::Float(1.0),
+        O::atom("kcmp_omega"),
+        O::Int(1),
+    ];
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut orders = Vec::new();
+    for _ in 0..60 {
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        for i in (1..order.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            order.swap(i, (state % (i as u64 + 1)) as usize);
+        }
+        orders.push(order);
+    }
+    let erl_orders = orders
+        .iter()
+        .map(|order| {
+            format!(
+                "[{}]",
+                order
+                    .iter()
+                    .map(|i| (i + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let eval = format!(
+        "Keys=list_to_tuple([{}]),Orders=[{erl_orders}],R=[maps:to_list(lists:foldl(fun(I,A)->maps:put(element(I,Keys),I,A) end,#{{}},O))||O<-Orders],io:put_chars(binary:encode_hex(term_to_binary(R))),halt().",
+        erl_keys.join(",")
+    );
+    let Some(expected) = reference_terms(&eval) else {
+        return;
+    };
+    let mut heap = VecHeap::new();
+    let terms: Vec<Term> = keys
+        .iter()
+        .map(|key| arinsal_term::from_owned(key, &mut heap).unwrap())
+        .collect();
+    let actual: Vec<O> = orders
+        .iter()
+        .map(|order| {
+            let mut map = from_pairs(&[], &mut heap).unwrap();
+            for &i in order {
+                map = put(map, terms[i], small(i as i64 + 1), &mut heap).unwrap();
+            }
+            O::list(
+                iter(map)
+                    .unwrap()
+                    .map(|(k, v)| {
+                        O::tuple(vec![
+                            arinsal_term::to_owned(k).unwrap(),
+                            arinsal_term::to_owned(v).unwrap(),
+                        ])
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(format!("{:?}", O::list(actual)), format!("{expected:?}"));
+}
+
+#[test]
 fn differential_random_integer_updates() {
     let mut state = 0x1234_5678_u64;
     let mut operations = Vec::new();
