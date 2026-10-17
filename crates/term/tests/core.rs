@@ -807,18 +807,22 @@ fn differential_binary_flat_size_for_matching_layouts() {
 #[test]
 fn offheap_sub_binary_retains_data_after_source_drops() {
     let mut source = VecHeap::new();
-    let mut destination = VecHeap::new();
     let source_binary = TermBuilder::new(&mut source).binary(&[0xab; 128]).unwrap();
-    let slice = TermBuilder::new(&mut destination)
+    let slice = TermBuilder::new(&mut source)
         .sub_binary(source_binary, 3, 517)
         .unwrap();
     assert_eq!(slice.header().unwrap() & 63, 0x24);
-    drop(source);
     let mut copy_heap = VecHeap::new();
     let copy = copy_term(slice, &mut copy_heap).unwrap();
     assert!(exact_eq(slice, copy));
     assert_eq!(size_object(slice), 8);
     assert_eq!(copy_heap.used_words(), 8);
+    drop(source);
+    assert_eq!(copy_heap.used_words(), 8);
+    // SAFETY: `copy` is a live sub-binary on `copy_heap`.
+    let view = unsafe { copy.binary_ref() }.unwrap();
+    assert_eq!(view.bit_len(), 517);
+    assert_eq!(view.bytes()[0], 0xab);
 }
 
 #[test]

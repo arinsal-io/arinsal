@@ -9,7 +9,8 @@ const MODULE: &str = "bin_vheap_differential";
 const SOURCE: &str = r#"
 -module(bin_vheap_differential).
 -export([minimum/0, flag/0, gc_info/0, spawn_minimum/0, spawn_minimum_only/0,
-         allocation_gc/0, private_append_info/0, message_binary/0]).
+         allocation_gc/0, private_append_info/0, message_binary/0, sub_binary_tails/0,
+         match_alias_tails/0]).
 minimum() -> {erlang:system_info(min_bin_vheap_size), process_info(self(), min_bin_vheap_size)}.
 flag() -> Old=process_flag(min_bin_vheap_size, 80000), {Old,process_info(self(), min_bin_vheap_size)}.
 gc_info() ->
@@ -92,6 +93,50 @@ message_binary() ->
     receive {message_binary,Size,Referenced,ReceivedInfo,PostGcInfo} ->
         {Size,Referenced,QueuedInfo,CollectedInfo,ReceivedInfo,PostGcInfo}
     end.
+sub_binary_tails() ->
+    Parent=self(),
+    Child=spawn_opt(fun() ->
+        B=binary:copy(<<"abcdefgh">>,4000),
+        {garbage_collection,G0}=process_info(self(),garbage_collection),
+        L=lists:foldl(fun(I,Acc) -> [tail(B,I rem 7)|Acc] end,[],lists:seq(1,100)),
+        {garbage_collection,G1}=process_info(self(),garbage_collection),
+        {garbage_collection_info,I}=process_info(self(),garbage_collection_info),
+        {binary,Bins}=process_info(self(),binary),
+        Parent!{sub_binary_tails,
+                length(L),
+                proplists:get_value(minor_gcs,G1)-proplists:get_value(minor_gcs,G0),
+                [{K,proplists:get_value(K,I)} || K <- [bin_vheap_size,bin_vheap_block_size]],
+                [{Size,Refc} || {_,Size,Refc} <- Bins]},
+        receive stop -> keep(L) end
+    end,[{min_heap_size,4000}]),
+    receive {sub_binary_tails,_,_,_,_}=Result ->
+        Heap=process_info(Child,[heap_size,total_heap_size]),
+        Child!stop,
+        erlang:append_element(Result,Heap)
+    end.
+keep(L) -> length(L).
+tail(B,K) -> <<_:K/binary,R/binary>> = B, R.
+match_alias_tails() ->
+    Parent=self(),
+    Child=spawn_opt(fun() ->
+        B=binary:copy(<<"FOR1abcd">>,4000),
+        {garbage_collection,G0}=process_info(self(),garbage_collection),
+        L=lists:foldl(fun(_,Acc) -> [alias(B),rest(B)|Acc] end,[],lists:seq(1,50)),
+        {garbage_collection,G1}=process_info(self(),garbage_collection),
+        {garbage_collection_info,I}=process_info(self(),garbage_collection_info),
+        Parent!{match_alias_tails,
+                length(L),
+                proplists:get_value(minor_gcs,G1)-proplists:get_value(minor_gcs,G0),
+                [{K,proplists:get_value(K,I)} || K <- [bin_vheap_size,bin_vheap_block_size]]},
+        receive stop -> keep(L) end
+    end,[{min_heap_size,4000}]),
+    receive {match_alias_tails,_,_,_}=Result ->
+        Heap=process_info(Child,[heap_size,total_heap_size]),
+        Child!stop,
+        erlang:append_element(Result,Heap)
+    end.
+alias(<<"FOR1",_/bits>>=C) -> C.
+rest(<<"FOR1",R/bits>>) -> R.
 append_loop(0,Acc) -> Acc;
 append_loop(N,Acc) -> append_loop(N-1,<<Acc/binary,N:8>>).
 "#;
@@ -188,4 +233,22 @@ fn queued_binary_fragment_gc_matches_otp() {
         panic!("expected queued binary info: {value:?}");
     };
     assert_eq!(fields.len(), 6);
+}
+
+#[test]
+fn sub_binary_tails_share_the_referenced_binary_like_otp() {
+    let value = assert_equal("sub_binary_tails");
+    let OwnedTerm::Tuple(fields) = &value else {
+        panic!("expected sub-binary info tuple: {value:?}");
+    };
+    assert_eq!(fields.len(), 6);
+}
+
+#[test]
+fn match_alias_and_tail_do_not_charge_the_binary_again() {
+    let value = assert_equal("match_alias_tails");
+    let OwnedTerm::Tuple(fields) = &value else {
+        panic!("expected alias info tuple: {value:?}");
+    };
+    assert_eq!(fields.len(), 5);
 }
