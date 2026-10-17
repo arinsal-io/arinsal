@@ -708,8 +708,8 @@ impl BeamModuleAssembler {
             self.code.adr(Gpr::x(0), call_site)?;
             self.emit_leave_frame()?;
         }
+        self.code.ldr_literal(Gpr::x(1), entry as u64)?;
         self.code.emit(|e| {
-            e.mov_const(Gpr::x(1), entry as u64)?;
             // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:388-403
             // (emit_setup_dispatchable_call), OTP-29.1.1.
             e.ldr_regoff(Gpr::x(14), Gpr::x(1), Gpr::x(24), 3)?;
@@ -740,11 +740,9 @@ impl BeamModuleAssembler {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-609, OTP-29.1.1.
         let entry = self.code.new_label();
         self.code.bind(entry)?;
-        // ARG4 = export. `mov` rather than a literal: the constant pool is flushed at
-        // the end of the module, past the ±1MB literal reach on the largest OTP modules.
-        // ARG3 = this entry (the address a yield resumes at).
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(4), identity as u64))?;
+        // ARG4 = export, from the literal pool. ARG3 = this entry (the address a yield
+        // resumes at).
+        self.code.ldr_literal(Gpr::x(4), identity as u64)?;
         self.code.adr(Gpr::x(3), entry)?;
         // One module-local veneer per fragment. `x30` is the next instruction.
         self.fragment_call(fragment)
