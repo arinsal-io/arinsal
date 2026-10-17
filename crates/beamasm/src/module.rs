@@ -156,6 +156,7 @@ impl FinalizedModule {
 /// Builds one module's native code and associates BEAM labels with code offsets.
 pub struct BeamModuleAssembler {
     pub(super) code: CodeBuffer,
+    pub(super) reg_cache: crate::regcache::RegCache,
     pub(super) map_lookups: Vec<crate::map::MapLookupTable>,
     /// Failure label of the arithmetic instruction being emitted (0: raise the error).
     pub(super) arith_fail: u32,
@@ -248,6 +249,7 @@ impl BeamModuleAssembler {
         let error_label = code.new_label();
         Self {
             code,
+            reg_cache: crate::regcache::RegCache::default(),
             map_lookups: Vec::new(),
             labels: HashMap::new(),
             defined: HashMap::new(),
@@ -1170,6 +1172,8 @@ impl BeamModuleAssembler {
     pub(super) fn flush_var(&mut self, var: PairVar) -> Result<(), ModuleError> {
         if let Some(slot) = var.slot {
             self.store_operand(slot, var.reg)?;
+        } else {
+            self.cache_invalidate_reg(var.reg);
         }
         Ok(())
     }
@@ -1187,9 +1191,9 @@ impl BeamModuleAssembler {
             && base1 == base2
         {
             if offset1 + 8 == offset2 {
-                return self.safe_stp(first.reg, second.reg, base1, offset1);
+                return self.stp_cache(first.reg, second.reg, base1, offset1);
             } else if offset1 == offset2 + 8 {
-                return self.safe_stp(second.reg, first.reg, base1, offset2);
+                return self.stp_cache(second.reg, first.reg, base1, offset2);
             }
         }
         self.flush_var(first)?;
@@ -1281,6 +1285,30 @@ impl BeamModuleAssembler {
         self.flush_vars(first, second)
     }
 
+    /// Loads an operand into any register: the cached register of a memory operand when the
+    /// cache holds it and the emitter does not write that register (`avoid`), otherwise `tmp`.
+    ///
+    /// The result must be consumed without writing a register outside `avoid` first.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1575-1584 (load_source without a tmp),
+    // OTP-29.1.1.
+    pub(super) fn load_source_any(
+        &mut self,
+        src: ArgVal,
+        tmp: Gpr,
+        avoid: &[Gpr],
+    ) -> Result<Gpr, ModuleError> {
+        if let Some((base, offset)) = memory_slot(src) {
+            let slot = crate::regcache::Slot { base, offset };
+            if let Some(reg) = self.cache_find(slot)
+                && !avoid.contains(&reg)
+            {
+                self.ldr_cached(reg, slot)?;
+                return Ok(reg);
+            }
+        }
+        self.source_reg_into(src, tmp)
+    }
+
     pub(super) fn source_reg(&mut self, src: ArgVal) -> Result<Gpr, ModuleError> {
         self.source_reg_into(src, TMP)
     }
@@ -1334,15 +1362,20 @@ impl BeamModuleAssembler {
                 let offset = i
                     .checked_mul(8)
                     .ok_or(ModuleError::InvalidOperand("X register offset overflow"))?;
-                self.code
-                    .emit(|e| e.ldr_uoff(scratch, SCHEDULER_REGS, offset))?;
+                self.ldr_cached(
+                    scratch,
+                    crate::regcache::Slot {
+                        base: SCHEDULER_REGS,
+                        offset,
+                    },
+                )?;
                 Ok(scratch)
             }
             ArgVal::Y(i) => {
                 let offset = i
                     .checked_mul(8)
                     .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
-                self.code.emit(|e| e.ldr_uoff(scratch, E, offset))?;
+                self.ldr_cached(scratch, crate::regcache::Slot { base: E, offset })?;
                 Ok(scratch)
             }
             ArgVal::Immediate(v) | ArgVal::Literal(v) => {
@@ -1686,17 +1719,26 @@ impl BeamModuleAssembler {
         match src {
             ArgVal::X(i) if i < 6 => {
                 if dst != XREGS[i as usize] {
-                    self.code.emit(|e| e.mov_reg(dst, XREGS[i as usize]))?;
+                    self.preserve_cache(&[dst], |this| {
+                        this.code.emit(|e| e.mov_reg(dst, XREGS[i as usize]))?;
+                        Ok(())
+                    })?;
                 }
             }
             ArgVal::XMemory(i) if i < 1024 => {
-                self.code.emit(|e| e.ldr_uoff(dst, SCHEDULER_REGS, i * 8))?;
+                self.ldr_cached(
+                    dst,
+                    crate::regcache::Slot {
+                        base: SCHEDULER_REGS,
+                        offset: i * 8,
+                    },
+                )?;
             }
             ArgVal::Y(i) => {
                 let offset = i
                     .checked_mul(8)
                     .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
-                self.code.emit(|e| e.ldr_uoff(dst, E, offset))?;
+                self.ldr_cached(dst, crate::regcache::Slot { base: E, offset })?;
             }
             _ => {
                 return Err(ModuleError::InvalidOperand(
@@ -1713,17 +1755,27 @@ impl BeamModuleAssembler {
         match dst {
             ArgVal::X(i) if i < 6 => {
                 if src != XREGS[i as usize] {
-                    self.code.emit(|e| e.mov_reg(XREGS[i as usize], src))?;
+                    let target = XREGS[i as usize];
+                    self.preserve_cache(&[target], |this| {
+                        this.code.emit(|e| e.mov_reg(target, src))?;
+                        Ok(())
+                    })?;
                 }
             }
             ArgVal::XMemory(i) if i < 1024 => {
-                self.code.emit(|e| e.str_uoff(src, SCHEDULER_REGS, i * 8))?;
+                self.str_cache(
+                    src,
+                    crate::regcache::Slot {
+                        base: SCHEDULER_REGS,
+                        offset: i * 8,
+                    },
+                )?;
             }
             ArgVal::Y(i) => {
                 let offset = i
                     .checked_mul(8)
                     .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
-                self.code.emit(|e| e.str_uoff(src, E, offset))?;
+                self.str_cache(src, crate::regcache::Slot { base: E, offset })?;
             }
             _ => {
                 return Err(ModuleError::InvalidOperand(
