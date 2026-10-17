@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::rt::{arinsal_enter_native_return, arinsal_enter_native_yield};
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer, Label},
-    enc::{Cond, Emitter, Gpr, Shift},
+    enc::{Cond, Emitter, Gpr, Shift, VecReg},
     exec::{CodeMemory, ExecError},
 };
 
@@ -1050,20 +1050,168 @@ impl BeamModuleAssembler {
     }
 
     /// Removes words from the top of a frame by advancing the stack cursor.
-    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1061-1073, OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:511-514 (emit_trim), OTP-29.1.1.
     pub fn trim(&mut self, words: u32, _remaining: u32) -> Result<(), ModuleError> {
-        self.deallocate(words)
+        self.trim_preserve_cache(words)
     }
 
-    /// Initializes Y slots to the nil immediate (`0x3b`).
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:424-508, OTP-29.1.1
+    /// `move` fused with a trim: a post-index `ldr` when the source is Y0, a pre-index `str`
+    /// when the destination is the first slot that survives the trim.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:559-600 (emit_move_trim), OTP-29.1.1.
+    pub fn move_trim(&mut self, src: ArgVal, dst: ArgVal, words: u32) -> Result<(), ModuleError> {
+        let trim = words
+            .checked_mul(8)
+            .and_then(|bytes| i16::try_from(bytes).ok())
+            .filter(|bytes| *bytes < 256);
+        if let (ArgVal::Y(0), Some(trim)) = (src, trim)
+            && let Some(trimmed) = trimmed_arg(dst, words)
+        {
+            let to = self.pair_destination(trimmed, Gpr::x(8))?;
+            self.code.emit(|e| e.ldr_post(to.reg, E, trim))?;
+            return self.flush_var(to);
+        }
+        if let (ArgVal::Y(index), Some(trim)) = (dst, trim)
+            && index == words
+        {
+            let value = self.source_reg_into(src, Gpr::x(8))?;
+            self.code.emit(|e| e.str_pre(value, E, trim))?;
+            return Ok(());
+        }
+        self.move_(src, dst)?;
+        self.trim_preserve_cache(words)
+    }
+
+    /// Two Y moves fused with a trim: one `ldp` (post-index when the sources start at Y0) and a
+    /// pre-index `str` when a destination is the first slot that survives the trim.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:521-557 (emit_move_two_trim),
+    // OTP-29.1.1.
+    pub fn move_two_trim(
+        &mut self,
+        src1: u32,
+        dst1: ArgVal,
+        src2: u32,
+        dst2: ArgVal,
+        words: u32,
+    ) -> Result<(), ModuleError> {
+        let trim = words
+            .checked_mul(8)
+            .and_then(|bytes| i16::try_from(bytes).ok())
+            .filter(|bytes| *bytes < 256);
+        if src2 != src1 + 1 {
+            self.emit_store_two_values(ArgVal::Y(src1), dst1, ArgVal::Y(src2), dst2)?;
+            return self.trim_preserve_cache(words);
+        }
+        let first = self.pair_destination(dst1, Gpr::x(8))?;
+        let second = self.pair_destination(dst2, Gpr::x(9))?;
+        if src1 == 0
+            && let Some(trim) = trim
+            && let (Some(trimmed1), Some(trimmed2)) =
+                (trimmed_arg(dst1, words), trimmed_arg(dst2, words))
+        {
+            self.code
+                .emit(|e| e.ldp_post(first.reg, second.reg, E, trim))?;
+            let first = self.pair_destination(trimmed1, Gpr::x(8))?;
+            let second = self.pair_destination(trimmed2, Gpr::x(9))?;
+            return self.flush_vars(first, second);
+        }
+        self.safe_ldp(first.reg, second.reg, E, src1 * 8)?;
+        if let (ArgVal::Y(index), Some(trim)) = (dst1, trim)
+            && index == words
+        {
+            self.flush_var(second)?;
+            self.code.emit(|e| e.str_pre(first.reg, E, trim))?;
+        } else if let (ArgVal::Y(index), Some(trim)) = (dst2, trim)
+            && index == words
+        {
+            self.flush_var(first)?;
+            self.code.emit(|e| e.str_pre(second.reg, E, trim))?;
+        } else {
+            self.flush_vars(first, second)?;
+            self.trim_preserve_cache(words)?;
+        }
+        Ok(())
+    }
+
+    /// Initializes `count` consecutive Y slots starting at `first`.
     pub fn init_yregs(&mut self, first: u32, count: u32) -> Result<(), ModuleError> {
-        self.code.emit(|e| e.mov_const(TMP, 0x3b))?;
-        for i in first..first.saturating_add(count) {
-            let offset = i
-                .checked_mul(8)
-                .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
-            self.code.emit(|e| e.str_uoff(TMP, E, offset))?;
+        let registers: Vec<u32> = (first..first.saturating_add(count)).collect();
+        self.init_yregs_list(&registers)
+    }
+
+    /// Initializes Y slots: runs of four or more slots with vector stores of the all-ones
+    /// word, shorter runs with `stp` and `str` of the nil immediate.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:424-508 (emit_init_yregs), OTP-29.1.1.
+    pub fn init_yregs_list(&mut self, registers: &[u32]) -> Result<(), ModuleError> {
+        const MAX_LDP_STP_DISPLACEMENT: u32 = 0x3f;
+        const MAX_LDUR_STUR_DISPLACEMENT: u32 = 0xff;
+        let nil = Gpr::x(8);
+        let vector = VecReg(0);
+        let mut x_initialized = false;
+        let mut q_initialized = false;
+        let mut index = 0;
+        while index < registers.len() {
+            let mut first_y = registers[index];
+            let mut slots = 1u32;
+            while index + (slots as usize) < registers.len() {
+                if first_y + slots != registers[index + slots as usize] {
+                    break;
+                }
+                slots += 1;
+            }
+            index += slots as usize;
+            while slots >= 4 && first_y.is_multiple_of(2) && first_y <= 2 * MAX_LDP_STP_DISPLACEMENT
+            {
+                if !q_initialized {
+                    self.code.emit(|e| e.movi_2d(vector, u64::MAX))?;
+                    q_initialized = true;
+                }
+                let offset = first_y_offset(first_y)?;
+                self.code
+                    .emit(|e| e.stp_q(vector, vector, E, offset as i16))?;
+                first_y += 4;
+                slots -= 4;
+            }
+            while slots >= 2
+                && q_initialized
+                && (first_y.is_multiple_of(2) || first_y * 8 <= MAX_LDUR_STUR_DISPLACEMENT)
+            {
+                let offset = first_y_offset(first_y)?;
+                if offset % 16 == 0 && offset / 16 <= 0xfff {
+                    self.code.emit(|e| e.str_q_uoff(vector, E, offset))?;
+                } else {
+                    self.code.emit(|e| e.stur_q(vector, E, offset as i16))?;
+                }
+                first_y += 2;
+                slots -= 2;
+            }
+            while slots >= 2 {
+                if !x_initialized {
+                    self.mov_value(nil, false, 0x3b)?;
+                    x_initialized = true;
+                }
+                let offset = first_y_offset(first_y)?;
+                if first_y <= MAX_LDP_STP_DISPLACEMENT {
+                    self.code.emit(|e| e.stp(nil, nil, E, offset as i16))?;
+                    first_y += 2;
+                    slots -= 2;
+                } else {
+                    self.code.emit(|e| e.str_uoff(nil, E, offset))?;
+                    first_y += 1;
+                    slots -= 1;
+                }
+            }
+            if slots == 1 {
+                let offset = first_y_offset(first_y)?;
+                if q_initialized {
+                    self.code.emit(|e| e.str_d_uoff(vector, E, offset))?;
+                } else {
+                    if !x_initialized {
+                        self.mov_value(nil, false, 0x3b)?;
+                        x_initialized = true;
+                    }
+                    self.code.emit(|e| e.str_uoff(nil, E, offset))?;
+                }
+            }
         }
         Ok(())
     }
@@ -1071,30 +1219,25 @@ impl BeamModuleAssembler {
     /// Moves a typed value between X registers, Y slots, and immediates.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:760-780, OTP-29.1.1
     pub fn move_(&mut self, src: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
-        let reg = match dst {
-            ArgVal::X(i) if i < 6 => XREGS[i as usize],
+        match dst {
+            ArgVal::X(i) if i < 6 => {
+                let to = XREGS[i as usize];
+                let from = self.source_reg_into(src, to)?;
+                if from != to {
+                    self.preserve_cache(&[to], |this| {
+                        this.code.emit(|e| e.mov_reg(to, from))?;
+                        Ok(())
+                    })?;
+                }
+                self.cache_invalidate_reg(to);
+                Ok(())
+            }
             ArgVal::Y(_) | ArgVal::XMemory(_) => {
-                let source = self.source_reg(src)?;
-                return self.store_operand(dst, source);
+                let from = self.source_reg_into(src, Gpr::x(17))?;
+                self.store_operand(dst, from)
             }
-            _ => return Err(ModuleError::InvalidOperand("destination must be X or Y")),
-        };
-        match src {
-            ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(reg, XREGS[i as usize]))?,
-            ArgVal::Immediate(v) | ArgVal::Literal(v) => self.code.emit(|e| e.mov_const(reg, v))?,
-            ArgVal::Export(v) => self.code.emit(|e| e.mov_const(reg, u64::from(v)))?,
-            ArgVal::Label(id) => {
-                let label = self.label(id);
-                self.code.adr(reg, label)?;
-            }
-            ArgVal::Y(_) | ArgVal::XMemory(_) => self.load_operand(src, reg)?,
-            _ => {
-                return Err(ModuleError::InvalidOperand(
-                    "X register index must be below 6",
-                ));
-            }
+            _ => Err(ModuleError::InvalidOperand("destination must be X or Y")),
         }
-        Ok(())
     }
 
     /// Loads any source operand (cached X, X array, Y, immediate, literal, export or label)
@@ -1125,22 +1268,19 @@ impl BeamModuleAssembler {
         src2: ArgVal,
         dst2: ArgVal,
     ) -> Result<(), ModuleError> {
-        // Consecutive Y slots are one `stp`, the way flush_vars stores a register pair
-        // (instr_common.cpp:602-614).
-        if let (ArgVal::Y(first), ArgVal::Y(second)) = (dst1, dst2)
-            && second == first + 1
-            && let Ok(offset) = i16::try_from(first * 8)
-            && (-512..504).contains(&offset)
+        if matches!(dst1, ArgVal::Y(_) | ArgVal::XMemory(_))
+            && matches!(dst2, ArgVal::Y(_) | ArgVal::XMemory(_))
         {
-            let left = self.source_reg(src1)?;
-            let right_scratch = if left == Gpr::x(10) {
-                Gpr::x(11)
-            } else {
-                Gpr::x(10)
+            let (first, second) = self.load_two_sources(src1, Gpr::x(8), src2, Gpr::x(9))?;
+            let first = PairVar {
+                reg: first,
+                slot: Some(dst1),
             };
-            let right = self.source_reg_into(src2, right_scratch)?;
-            self.code.emit(|e| e.stp(left, right, E, offset))?;
-            return Ok(());
+            let second = PairVar {
+                reg: second,
+                slot: Some(dst2),
+            };
+            return self.flush_vars(first, second);
         }
         self.mov_arg_to_reg(TMP, src1)?;
         self.mov_arg_to_reg(Gpr::x(10), src2)?;
@@ -1220,8 +1360,11 @@ impl BeamModuleAssembler {
         offset: u32,
     ) -> Result<(), ModuleError> {
         if offset <= 8 * 0x3F {
-            self.code
-                .emit(|e| e.ldp(first, second, base, offset as i16))?;
+            self.preserve_cache(&[first, second], |this| {
+                this.code
+                    .emit(|e| e.ldp(first, second, base, offset as i16))?;
+                Ok(())
+            })?;
         } else if offset < 8 * 0xFFF {
             self.code.emit(|e| {
                 e.ldr_uoff(first, base, offset)?;
@@ -1309,6 +1452,55 @@ impl BeamModuleAssembler {
         self.source_reg_into(src, tmp)
     }
 
+    /// Loads an immediate or literal term the way `load_source` does: a value that fits 32 bits
+    /// (signed or unsigned) is a `mov`, anything else, and every boxed or list literal, is an
+    /// `ldr` from the literal pool. The register cache survives except for `dst`.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1498-1553 (load_source for literals,
+    // immediates and words), OTP-29.1.1.
+    pub(super) fn mov_value(
+        &mut self,
+        dst: Gpr,
+        literal: bool,
+        value: u64,
+    ) -> Result<(), ModuleError> {
+        let fits = i32::try_from(value as i64).is_ok() || u32::try_from(value).is_ok();
+        if literal || !fits {
+            self.preserve_cache(&[dst], |this| Ok(this.code.ldr_literal(dst, value)?))
+        } else {
+            self.preserve_cache(&[dst], |this| {
+                this.code.emit(|e| e.mov_const(dst, value))?;
+                Ok(())
+            })
+        }
+    }
+
+    /// Loads two operands into `tmp1` and `tmp2`, with one `ldp` when both live in consecutive
+    /// memory slots, in either order.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1586-1604 (load_sources), OTP-29.1.1.
+    pub(super) fn load_two_sources(
+        &mut self,
+        src1: ArgVal,
+        tmp1: Gpr,
+        src2: ArgVal,
+        tmp2: Gpr,
+    ) -> Result<(Gpr, Gpr), ModuleError> {
+        if let (Some((base1, offset1)), Some((base2, offset2))) =
+            (memory_slot(src1), memory_slot(src2))
+            && base1 == base2
+        {
+            if offset1 + 8 == offset2 {
+                self.safe_ldp(tmp1, tmp2, base1, offset1)?;
+                return Ok((tmp1, tmp2));
+            } else if offset2 + 8 == offset1 {
+                self.safe_ldp(tmp2, tmp1, base1, offset2)?;
+                return Ok((tmp1, tmp2));
+            }
+        }
+        let first = self.source_reg_into(src1, tmp1)?;
+        let second = self.source_reg_into(src2, tmp2)?;
+        Ok((first, second))
+    }
+
     pub(super) fn source_reg(&mut self, src: ArgVal) -> Result<Gpr, ModuleError> {
         self.source_reg_into(src, TMP)
     }
@@ -1379,7 +1571,7 @@ impl BeamModuleAssembler {
                 Ok(scratch)
             }
             ArgVal::Immediate(v) | ArgVal::Literal(v) => {
-                self.code.emit(|e| e.mov_const(scratch, v))?;
+                self.mov_value(scratch, src_is_literal(src), v)?;
                 Ok(scratch)
             }
             ArgVal::Export(v) => {
@@ -2072,4 +2264,27 @@ mod runtime_sync_tests {
         assert_eq!(header.stop, 0x5678usize as *mut u64);
         assert_eq!(header.fcalls, 77);
     }
+}
+
+fn first_y_offset(index: u32) -> Result<u32, ModuleError> {
+    index
+        .checked_mul(8)
+        .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))
+}
+
+/// The operand a destination becomes once `words` have been trimmed from the frame.
+// Port of erts/emulator/beam/jit/arm/beam_jit_args.hpp (ArgVal::trimmed), OTP-29.1.1.
+fn trimmed_arg(dst: ArgVal, words: u32) -> Option<ArgVal> {
+    match dst {
+        ArgVal::Y(index) => index.checked_sub(words).map(ArgVal::Y),
+        ArgVal::X(_) | ArgVal::XMemory(_) => Some(dst),
+        _ => None,
+    }
+}
+
+/// Whether a source operand is a beam literal that lives in the literal area (a list or boxed
+/// term) and so is loaded from the literal pool; an immediate-valued literal is a plain
+/// immediate.
+fn src_is_literal(src: ArgVal) -> bool {
+    matches!(src, ArgVal::Literal(term) if matches!(term & 3, 1 | 2))
 }
