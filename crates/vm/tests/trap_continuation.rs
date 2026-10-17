@@ -76,12 +76,17 @@ plain_child(Parent) ->
     Parent ! ready,
     receive stop -> ok end.
 probe(Tag, Want, Fun) ->
+    %% A runnable high priority parent always runs before the normal priority
+    %% child, so the parent samples the child at a schedule-out whatever the
+    %% order in which the seeded simulation draws among runnable processes.
+    Old = process_flag(priority, high),
     Parent = self(),
     Pid = spawn(trap_cont, child, [Parent, Tag, Fun]),
     1 = erlang:trace(Pid, true, [running, {tracer, Parent}]),
     Pid ! go,
     Frames = wait(Pid, Want, []),
     Fin = receive {done, Pid} -> finished after 60000 -> hung end,
+    process_flag(priority, Old),
     {Tag, Frames, Fin}.
 child(Parent, _Tag, Fun) ->
     receive go ->
