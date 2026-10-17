@@ -492,6 +492,22 @@ impl ThreadSpecificAllocators {
     /// Frees immediately on the current instance or queues the free for its owner.
     /// Port of erl_alloc_util.c:6216 (erts_alcu_free_thr_pref) delayed-dealloc enqueue, OTP-29.1.1.
     pub fn free(&self, handle: InstanceAllocation) -> Result<(), AllocError> {
+        if self.routed.load(Ordering::Acquire) == 0 && self.current_instance() == handle.instance {
+            let instance = handle.instance;
+            let mut state = self.lock_instance(instance);
+            if self.delayed[instance].is_empty() && !state.allocator.has_pending_carriers() {
+                state.allocator.free(handle.allocation)?;
+                return self.publish_transfers(instance, &mut state);
+            }
+        }
+        self.free_routed(handle)
+    }
+
+    /// `free` for a block that may have been routed to another instance, queued behind
+    /// delayed frees, or sit in a carrier that changed hands.
+    #[cold]
+    #[inline(never)]
+    fn free_routed(&self, handle: InstanceAllocation) -> Result<(), AllocError> {
         loop {
             let (instance, allocation) = self.route(handle)?;
             let current = self.current_instance();
@@ -1246,6 +1262,44 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "timing: cargo test --release -p arinsal-alloc instance_cycle_bench -- --ignored --nocapture"]
+    fn instance_cycle_bench() {
+        let _serial = registration();
+        let allocators = four_instances();
+        thread::spawn(move || {
+            assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let cycles: usize = std::env::var("FRAG_CYCLES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200_000);
+            let mut live = Vec::with_capacity(32);
+            let started = std::time::Instant::now();
+            for _ in 0..cycles {
+                for _ in 0..26 {
+                    live.push(allocators.alloc(8 + (next() % 12) as usize * 8).unwrap());
+                }
+                for handle in live.drain(..) {
+                    allocators.free(handle).unwrap();
+                }
+            }
+            let nanos = started.elapsed().as_nanos() as f64;
+            eprintln!(
+                "instance layer: {:.2} ns per alloc+free pair",
+                nanos / (cycles as f64 * 26.0)
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
     fn unregistered_threads_use_instance_zero() {
         let allocators = four_instances();
         for _ in 0..3 {
@@ -1761,6 +1815,7 @@ mod tests {
                 "alloc_with_ptr",
                 "realloc_with_ptr",
                 "free",
+                "free_routed",
                 "handle_owner_work",
                 "on_owner",
                 "on_owner",
