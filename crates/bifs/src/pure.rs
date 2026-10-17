@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arinsal_term::{
     AtomEncoding, AtomError, BinaryRef, ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef,
     Node, Term, TermBuilder, TermError, TermKind, atoms, cmp, copy_term, exact_eq, flat_size,
-    global_atoms, loose_eq, phash, phash2, phash2_range,
+    global_atoms, loose_eq, phash,
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -634,14 +634,102 @@ compare!(le, |a, b| cmp(a, b) != Ordering::Greater);
 compare!(gt, |a, b| cmp(a, b) == Ordering::Greater);
 compare!(ge, |a, b| cmp(a, b) != Ordering::Less);
 
-fn phash2_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let value = if args.len() == 1 {
-        phash2(args[0])
+/// Resume state of `erlang:phash2/1,2`.
+///
+/// Port of the trap state `trapping_make_hash2` hands back in
+/// erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+pub struct Phash2Cont {
+    run: arinsal_term::Hash2Run,
+    range: Option<u64>,
+}
+
+impl Phash2Cont {
+    /// The continuation export this state belongs to.
+    pub fn continuation(&self) -> &'static str {
+        if self.range.is_some() {
+            "erlang:phash2_trap/2"
+        } else {
+            "erlang:phash2_trap/1"
+        }
+    }
+}
+
+/// A started `phash2`: finished, or the state to trap with.
+pub enum Phash2Step {
+    /// The finished value.
+    Done(Term),
+    /// The saved hash state.
+    More(Box<Phash2Cont>),
+}
+
+/// Run `run` for the reductions left, then charge them.
+// Port of erts/emulator/beam/bif.c (phash2_1, phash2_2), OTP-29.1.1, over `trapping_make_hash2`.
+pub fn phash2_slice(ctx: &mut Ctx<'_>, cont: &mut Phash2Cont) -> Result<Option<Term>, BifError> {
+    let budget = ctx.reduction_budget();
+    let iterations = (budget != usize::MAX).then(|| {
+        i64::try_from(budget)
+            .unwrap_or(i64::MAX / arinsal_term::HASH2_ITERATIONS_PER_RED)
+            .saturating_mul(arinsal_term::HASH2_ITERATIONS_PER_RED)
+    });
+    match cont.run.run(iterations) {
+        arinsal_term::Hash2Progress::Yield => {
+            ctx.bump_all_reds();
+            Ok(None)
+        }
+        arinsal_term::Hash2Progress::Done { hash, used } => {
+            if iterations.is_some() {
+                ctx.charge_reductions(
+                    (used / arinsal_term::HASH2_ITERATIONS_PER_RED).max(0) as usize
+                );
+            }
+            let value = match cont.range {
+                None => u64::from(hash & ((1 << 27) - 1)),
+                Some(range) if range == 1_u64 << 32 => u64::from(hash),
+                Some(range) => u64::from(hash % range as u32),
+            };
+            Ok(Some(integer(ctx, value as usize)?))
+        }
+    }
+}
+
+/// The range argument of `phash2/2`.
+pub fn phash2_range_arg(term: Term) -> Result<u64, BifError> {
+    let range: u64 = term
+        .as_small()
+        .ok_or(BADARG)?
+        .try_into()
+        .map_err(|_| BADARG)?;
+    if range == 0 || range > (1_u64 << 32) {
+        return Err(BADARG);
+    }
+    Ok(range)
+}
+
+/// Start `phash2/1` or `phash2/2`.
+pub fn phash2_start(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Phash2Step, BifError> {
+    let range = if args.len() == 2 {
+        Some(phash2_range_arg(args[1])?)
     } else {
-        let range = args[1].as_small().ok_or(BADARG)?;
-        phash2_range(args[0], range.try_into().map_err(|_| BADARG)?).ok_or(BADARG)?
+        None
     };
-    integer(ctx, value as usize)
+    let mut cont = Phash2Cont {
+        run: arinsal_term::Hash2Run::new(args[0]),
+        range,
+    };
+    Ok(match phash2_slice(ctx, &mut cont)? {
+        Some(value) => Phash2Step::Done(value),
+        None => Phash2Step::More(Box::new(cont)),
+    })
+}
+
+fn phash2_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    match phash2_start(ctx, args)? {
+        Phash2Step::Done(value) => Ok(value),
+        Phash2Step::More(cont) => {
+            ctx.defer_trap(crate::lists::DeferredTrap::Phash2(cont));
+            Ok(Term::NIL)
+        }
+    }
 }
 fn phash_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let range = args[1].as_small().ok_or(BADARG)?;

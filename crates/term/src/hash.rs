@@ -65,255 +65,503 @@ enum Job {
     Reset,
     Xor,
     Finish(u32),
+    /// A run of bytes in a list that trapped part way: the next cons and the packed word.
+    ListRun {
+        tail: Term,
+        packed: u32,
+        count: u32,
+    },
+    /// A binary hashed in several slices: the bytes done and the block hash state.
+    Binary {
+        term: Term,
+        processed: usize,
+        state: (u32, u32, u32),
+    },
 }
-/// Compute OTP's `make_hash2` for supported term kinds.
-/// Port of `erts/emulator/beam/erl_term_hashing.c:858` (`make_hash2_helper`), OTP-29.1.1.
-pub fn make_hash2(term: Term) -> u32 {
-    if let Some(n) = term.as_small() {
-        let mut hash = 0;
-        if (-(1 << 27)..(1 << 27)).contains(&n) {
-            let signed = n as i32;
-            if signed < 0 {
-                combine(&mut hash, signed.wrapping_neg() as u32, 0, H);
-            }
-            combine(&mut hash, signed as u32, 0, H);
-        } else {
-            let mag = n.unsigned_abs();
-            combine(
-                &mut hash,
-                mag as u32,
-                (mag >> 32) as u32,
-                H.wrapping_mul(if n < 0 { 10 } else { 11 }),
-            );
+
+/// Bytes of a binary hashed per iteration.
+// Port of `BLOCK_HASH_BYTES_PER_ITER` in erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+const BLOCK_HASH_BYTES_PER_ITER: usize = 12;
+
+/// Iterations `phash2` runs per reduction left.
+// Port of `ITERATIONS_PER_RED` in `make_hash2_helper`, erts/emulator/beam/erl_term_hashing.c,
+// OTP-29.1.1.
+pub const HASH2_ITERATIONS_PER_RED: i64 = 64;
+
+/// Progress of a resumable `make_hash2`.
+pub enum Hash2Progress {
+    /// The hash, and the iterations the run consumed.
+    Done { hash: u32, used: i64 },
+    /// The iteration budget ran out; call [`Hash2Run::run`] again.
+    Yield,
+}
+
+/// A `make_hash2` that can stop when its iteration budget runs out and continue later.
+///
+/// Port of the trapping `make_hash2_helper` (`trapping_make_hash2`) in
+/// erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1: the work stack is the saved state and
+/// every loop iteration, and the inner loops over tuple, record, fun and bignum parts, count as
+/// one iteration.
+pub struct Hash2Run {
+    hash: u32,
+    stack: smallvec::SmallVec<[Job; 16]>,
+    xors: smallvec::SmallVec<[u32; 4]>,
+    simple: Option<u32>,
+}
+
+fn small_hash(n: i64) -> u32 {
+    let mut hash = 0;
+    if (-(1 << 27)..(1 << 27)).contains(&n) {
+        let signed = n as i32;
+        if signed < 0 {
+            combine(&mut hash, signed.wrapping_neg() as u32, 0, H);
         }
-        return hash;
+        combine(&mut hash, signed as u32, 0, H);
+    } else {
+        let mag = n.unsigned_abs();
+        combine(
+            &mut hash,
+            mag as u32,
+            (mag >> 32) as u32,
+            H.wrapping_mul(if n < 0 { 10 } else { 11 }),
+        );
+    }
+    hash
+}
+
+fn simple_hash(term: Term) -> Option<u32> {
+    if let Some(n) = term.as_small() {
+        return Some(small_hash(n));
     }
     if let Some(atom) = term.as_atom() {
-        return global_atoms().hash(atom).unwrap();
+        return Some(global_atoms().hash(atom).unwrap());
     }
     if term == Term::NIL {
-        return 3_468_870_702;
+        return Some(3_468_870_702);
     }
     if let Some((index, _)) = term.as_pid() {
         let mut hash = 0;
         combine(&mut hash, index, 0, H.wrapping_mul(5));
-        return hash;
+        return Some(hash);
     }
     if let Some(id) = term.as_port() {
         let mut hash = 0;
         combine(&mut hash, id as u32, (id >> 32) as u32, H.wrapping_mul(6));
-        return hash;
+        return Some(hash);
     }
-    let mut hash = 0_u32;
-    // erts keeps the work stack on the C stack until it outgrows its default size
-    // (erl_term_hashing.c:1003 DECLARE_ESTACK, global.h:322 DEF_ESTACK_SIZE), OTP-29.1.1.
-    let mut stack: smallvec::SmallVec<[Job; 16]> = smallvec::smallvec![Job::Visit(term)];
-    let mut xors: smallvec::SmallVec<[u32; 4]> = smallvec::SmallVec::new();
-    while let Some(job) = stack.pop() {
-        match job {
-            Job::Reset => hash = 0,
-            Job::Xor => *xors.last_mut().unwrap() ^= hash,
-            Job::Finish(saved) => {
-                let pairs = xors.pop().unwrap();
-                hash = saved;
-                combine(&mut hash, pairs, 0, H.wrapping_mul(19));
-            }
-            Job::Visit(term) => match term.classify() {
-                TermKind::Atom => {
-                    let value = global_atoms().hash(term.as_atom().unwrap()).unwrap();
-                    if hash == 0 {
-                        hash = value;
-                    } else {
-                        combine(&mut hash, value, 0, H.wrapping_mul(3));
-                    }
-                }
-                TermKind::Nil => {
-                    if hash == 0 {
-                        hash = 3_468_870_702;
-                    } else {
-                        combine(&mut hash, 2, 0, H.wrapping_mul(2));
-                    }
-                }
-                TermKind::Number => {
-                    if let Some(n) = term.as_small() {
-                        if (-(1 << 27)..(1 << 27)).contains(&n) {
-                            let signed = n as i32;
-                            if signed < 0 {
-                                combine(&mut hash, signed.wrapping_neg() as u32, 0, H);
-                            }
-                            combine(&mut hash, signed as u32, 0, H);
-                        } else {
-                            let mag = n.unsigned_abs();
-                            combine(
-                                &mut hash,
-                                mag as u32,
-                                (mag >> 32) as u32,
-                                H.wrapping_mul(if n < 0 { 10 } else { 11 }),
-                            );
-                        }
-                    } else {
-                        let header = term.header().unwrap();
-                        // SAFETY: numeric header determines the object words.
-                        let p = unsafe { term.raw_ptr() };
-                        if header & 63 == FLOAT {
-                            // SAFETY: float has one payload word.
-                            let mut bits = unsafe { *p.add(1) };
-                            if f64::from_bits(bits) == 0.0 {
-                                bits = 0;
-                            }
-                            combine(
-                                &mut hash,
-                                (bits >> 32) as u32,
-                                bits as u32,
-                                H.wrapping_mul(12),
-                            );
-                        } else if header & 63 == POS_BIG || header & 63 == NEG_BIG {
-                            let con = H.wrapping_mul(if header & 63 == NEG_BIG { 10 } else { 11 });
-                            for i in 0..(header >> 6) as usize {
-                                // SAFETY: bignum header gives the digit count.
-                                let digit = unsafe { *p.add(i + 1) };
-                                combine(&mut hash, digit as u32, (digit >> 32) as u32, con);
-                            }
-                        }
-                    }
-                }
-                TermKind::Pid | TermKind::Port | TermKind::Ref => match term.identity().unwrap() {
-                    crate::Identity::Pid { index, .. } => {
-                        combine(&mut hash, index, 0, H.wrapping_mul(5))
-                    }
-                    crate::Identity::Port { id, .. } => {
-                        combine(&mut hash, id as u32, (id >> 32) as u32, H.wrapping_mul(6))
-                    }
-                    crate::Identity::Ref { ids, .. } => {
-                        combine(&mut hash, ids[0], 0, H.wrapping_mul(7))
-                    }
-                },
-                TermKind::Record => {
-                    // SAFETY: source record and definition remain live during hashing.
-                    let record = unsafe { term.record_ref().unwrap() };
-                    combine(
-                        &mut hash,
-                        record.len() as u32,
-                        record.definition_hash(),
-                        H.wrapping_mul(23),
-                    );
-                    for i in (0..record.len()).rev() {
-                        stack.push(Job::Visit(record.value(i).unwrap()));
-                    }
-                }
-                TermKind::Fun => {
-                    // SAFETY: the owning heap retains the referenced entry.
-                    match unsafe { term.fun_ref().unwrap() } {
-                        crate::FunRef::Local { entry, free_vars } => {
-                            let module = global_atoms().text(entry.module).unwrap();
-                            combine(&mut hash, free_vars.len() as u32, atom_hash(module), H);
-                            combine(&mut hash, entry.index, entry.old_uniq, H);
-                            for value in free_vars.iter().rev() {
-                                stack.push(Job::Visit(Term(*value)));
-                            }
-                        }
-                        crate::FunRef::Export { entry } => {
-                            let module = global_atoms().text(entry.module).unwrap();
-                            let function = global_atoms().text(entry.function).unwrap();
-                            combine(&mut hash, entry.arity as u32, atom_hash(module), H);
-                            combine(&mut hash, atom_hash(function), 0, H.wrapping_mul(14));
-                        }
-                    }
-                }
-                TermKind::Tuple => {
-                    // SAFETY: source heap remains live throughout hashing.
-                    let tuple = unsafe { term.tuple_ref().unwrap() };
-                    combine(&mut hash, tuple.len() as u32, 0, H.wrapping_mul(9));
-                    for i in (0..tuple.len()).rev() {
-                        stack.push(Job::Visit(tuple.get(i).unwrap()));
-                    }
-                }
-                TermKind::List => {
-                    let mut tail = term;
-                    let mut packed = 0_u32;
-                    let mut count = 0;
-                    // SAFETY: the list remains live throughout hashing.
-                    while let Some((head, next)) = unsafe { tail.cons_ref() } {
-                        if let Some(byte) = head.as_small().filter(|n| (0..=255).contains(n)) {
-                            packed = (packed << 8) | byte as u32;
-                            count += 1;
-                            if count == 4 {
-                                combine(&mut hash, packed, 0, H.wrapping_mul(4));
-                                packed = 0;
-                                count = 0;
-                            }
-                            tail = next;
-                        } else {
-                            break;
-                        }
-                    }
-                    if count != 0 {
-                        combine(&mut hash, packed, 0, H.wrapping_mul(4));
-                    }
-                    // SAFETY: the list remains live throughout hashing.
-                    if let Some((head, next)) = unsafe { tail.cons_ref() } {
-                        stack.push(Job::Visit(next));
-                        stack.push(Job::Visit(head));
-                    } else {
-                        stack.push(Job::Visit(tail));
-                    }
-                }
-                TermKind::Bitstring => {
-                    // SAFETY: source heap and binary backing remain live.
-                    let view = unsafe { term.binary_ref().unwrap() };
-                    let mut aligned = Vec::new();
-                    let data = if view.start_bit() % 8 == 0 {
-                        &view.bytes()[view.start_bit() / 8
-                            ..view.start_bit() / 8 + view.bit_len().div_ceil(8)]
-                    } else {
-                        aligned.resize(view.bit_len().div_ceil(8), 0);
-                        for i in 0..view.bit_len() {
-                            let bit = (view.bytes()[(view.start_bit() + i) / 8]
-                                >> (7 - (view.start_bit() + i) % 8))
-                                & 1;
-                            aligned[i / 8] |= bit << (7 - i % 8);
-                        }
-                        &aligned
-                    };
-                    let con = H.wrapping_mul(13).wrapping_add(hash);
-                    if view.bit_len() == 0 {
-                        hash = con;
-                    } else {
-                        let whole = view.bit_len() / 8;
-                        hash = block_hash(&data[..whole], con);
-                        let tail = view.bit_len() % 8;
-                        if tail != 0 {
-                            combine(
-                                &mut hash,
-                                tail as u32,
-                                (data[whole] >> (8 - tail)) as u32,
-                                H.wrapping_mul(15),
-                            );
-                        }
-                    }
-                }
-                TermKind::Map => {
-                    // Port of erts/emulator/beam/erl_term_hashing.c:1130-1215
-                    // (make_hash2_helper map branch), OTP-29.1.1.
-                    let n = crate::hamt::len(term);
-                    combine(&mut hash, n as u32, 0, H.wrapping_mul(16));
-                    if n > 0 {
-                        let saved = hash;
-                        xors.push(0);
-                        stack.push(Job::Finish(saved));
-                        for (key, value) in crate::hamt::PairIter::new(term) {
-                            stack.push(Job::Xor);
-                            stack.push(Job::Visit(value));
-                            stack.push(Job::Visit(key));
-                            stack.push(Job::Reset);
-                        }
-                    }
-                }
-                other => panic!("unsupported term kind in make_hash2: {other:?}"),
-            },
+    None
+}
+
+fn aligned_binary<'a>(view: &'a crate::BinaryRef<'_>, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    if view.start_bit().is_multiple_of(8) {
+        &view.bytes()[view.start_bit() / 8..view.start_bit() / 8 + view.bit_len().div_ceil(8)]
+    } else {
+        scratch.resize(view.bit_len().div_ceil(8), 0);
+        for i in 0..view.bit_len() {
+            let bit =
+                (view.bytes()[(view.start_bit() + i) / 8] >> (7 - (view.start_bit() + i) % 8)) & 1;
+            scratch[i / 8] |= bit << (7 - i % 8);
+        }
+        scratch
+    }
+}
+
+// Port of `block_hash_buffer` in erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+fn block_hash_buffer(state: &mut (u32, u32, u32), bytes: &[u8]) {
+    let (mut a, mut b, mut c) = *state;
+    for block in bytes.as_chunks::<BLOCK_HASH_BYTES_PER_ITER>().0 {
+        a = a.wrapping_add(u32::from_le_bytes(block[0..4].try_into().unwrap()));
+        b = b.wrapping_add(u32::from_le_bytes(block[4..8].try_into().unwrap()));
+        c = c.wrapping_add(u32::from_le_bytes(block[8..12].try_into().unwrap()));
+        (a, b, c) = mix_state(a, b, c);
+    }
+    *state = (a, b, c);
+}
+
+// Port of `block_hash_final_bytes` in erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+fn block_hash_final_bytes(state: (u32, u32, u32), remaining: &[u8], full_length: usize) -> u32 {
+    let (mut a, mut b, mut c) = state;
+    c = c.wrapping_add(full_length as u32);
+    for (i, byte) in remaining.iter().enumerate() {
+        match i {
+            0..=3 => a = a.wrapping_add((*byte as u32) << (8 * i)),
+            4..=7 => b = b.wrapping_add((*byte as u32) << (8 * (i - 4))),
+            _ => c = c.wrapping_add((*byte as u32) << (8 * (i - 7))),
         }
     }
-    hash
+    mix(a, b, c)
+}
+
+impl Hash2Run {
+    /// Start hashing `term`.
+    pub fn new(term: Term) -> Self {
+        let simple = simple_hash(term);
+        let mut stack: smallvec::SmallVec<[Job; 16]> = smallvec::SmallVec::new();
+        if simple.is_none() {
+            stack.push(Job::Visit(term));
+        }
+        Self {
+            hash: 0,
+            stack,
+            xors: smallvec::SmallVec::new(),
+            simple,
+        }
+    }
+
+    /// Hash until done, or until `iterations` is used up (`None` never stops).
+    // Port of erts/emulator/beam/erl_term_hashing.c:858 (make_hash2_helper), OTP-29.1.1.
+    pub fn run(&mut self, iterations: Option<i64>) -> Hash2Progress {
+        if let Some(hash) = self.simple {
+            return Hash2Progress::Done { hash, used: 0 };
+        }
+        let can_trap = iterations.is_some();
+        let max_iterations = iterations.unwrap_or(0);
+        let mut left = max_iterations;
+        let hash = &mut self.hash;
+        let stack = &mut self.stack;
+        let xors = &mut self.xors;
+        while let Some(job) = stack.pop() {
+            // Each job is one loop iteration of the erts loop, plus its inner iterations.
+            let mut ticks = 1_i64;
+            let mut marker = false;
+            match job {
+                Job::Reset => {
+                    *hash = 0;
+                    ticks = 0;
+                }
+                Job::Xor => {
+                    *xors.last_mut().unwrap() ^= *hash;
+                    marker = true;
+                }
+                Job::Finish(saved) => {
+                    let pairs = xors.pop().unwrap();
+                    *hash = saved;
+                    combine(hash, pairs, 0, H.wrapping_mul(19));
+                    marker = true;
+                }
+                Job::ListRun {
+                    tail,
+                    packed,
+                    count,
+                } => {
+                    if Self::list(hash, stack, tail, packed, count, &mut left, can_trap) {
+                        return Hash2Progress::Yield;
+                    }
+                }
+                Job::Binary {
+                    term,
+                    processed,
+                    state,
+                } => {
+                    if Self::binary(
+                        hash,
+                        stack,
+                        term,
+                        Some((processed, state)),
+                        &mut left,
+                        can_trap,
+                    ) {
+                        return Hash2Progress::Yield;
+                    }
+                }
+                Job::Visit(term) => match term.classify() {
+                    TermKind::Atom => {
+                        let value = global_atoms().hash(term.as_atom().unwrap()).unwrap();
+                        if *hash == 0 {
+                            *hash = value;
+                        } else {
+                            combine(hash, value, 0, H.wrapping_mul(3));
+                        }
+                    }
+                    TermKind::Nil => {
+                        if *hash == 0 {
+                            *hash = 3_468_870_702;
+                        } else {
+                            combine(hash, 2, 0, H.wrapping_mul(2));
+                        }
+                    }
+                    TermKind::Number => {
+                        if let Some(n) = term.as_small() {
+                            if (-(1 << 27)..(1 << 27)).contains(&n) {
+                                let signed = n as i32;
+                                if signed < 0 {
+                                    combine(hash, signed.wrapping_neg() as u32, 0, H);
+                                }
+                                combine(hash, signed as u32, 0, H);
+                            } else {
+                                let mag = n.unsigned_abs();
+                                combine(
+                                    hash,
+                                    mag as u32,
+                                    (mag >> 32) as u32,
+                                    H.wrapping_mul(if n < 0 { 10 } else { 11 }),
+                                );
+                            }
+                        } else {
+                            let header = term.header().unwrap();
+                            // SAFETY: numeric header determines the object words.
+                            let p = unsafe { term.raw_ptr() };
+                            if header & 63 == FLOAT {
+                                // SAFETY: float has one payload word.
+                                let mut bits = unsafe { *p.add(1) };
+                                if f64::from_bits(bits) == 0.0 {
+                                    bits = 0;
+                                }
+                                combine(hash, (bits >> 32) as u32, bits as u32, H.wrapping_mul(12));
+                            } else if header & 63 == POS_BIG || header & 63 == NEG_BIG {
+                                let con =
+                                    H.wrapping_mul(if header & 63 == NEG_BIG { 10 } else { 11 });
+                                let digits = (header >> 6) as usize;
+                                for i in 0..digits {
+                                    // SAFETY: bignum header gives the digit count.
+                                    let digit = unsafe { *p.add(i + 1) };
+                                    combine(hash, digit as u32, (digit >> 32) as u32, con);
+                                }
+                                ticks += digits as i64;
+                            }
+                        }
+                    }
+                    TermKind::Pid | TermKind::Port | TermKind::Ref => {
+                        match term.identity().unwrap() {
+                            crate::Identity::Pid { index, .. } => {
+                                combine(hash, index, 0, H.wrapping_mul(5))
+                            }
+                            crate::Identity::Port { id, .. } => {
+                                combine(hash, id as u32, (id >> 32) as u32, H.wrapping_mul(6))
+                            }
+                            crate::Identity::Ref { ids, .. } => {
+                                combine(hash, ids[0], 0, H.wrapping_mul(7))
+                            }
+                        }
+                    }
+                    TermKind::Record => {
+                        // SAFETY: source record and definition remain live during hashing.
+                        let record = unsafe { term.record_ref().unwrap() };
+                        combine(
+                            hash,
+                            record.len() as u32,
+                            record.definition_hash(),
+                            H.wrapping_mul(23),
+                        );
+                        for i in (0..record.len()).rev() {
+                            stack.push(Job::Visit(record.value(i).unwrap()));
+                        }
+                        ticks += record.len().saturating_sub(1) as i64;
+                    }
+                    TermKind::Fun => {
+                        // SAFETY: the owning heap retains the referenced entry.
+                        match unsafe { term.fun_ref().unwrap() } {
+                            crate::FunRef::Local { entry, free_vars } => {
+                                let module = global_atoms().text(entry.module).unwrap();
+                                combine(hash, free_vars.len() as u32, atom_hash(module), H);
+                                combine(hash, entry.index, entry.old_uniq, H);
+                                for value in free_vars.iter().rev() {
+                                    stack.push(Job::Visit(Term(*value)));
+                                }
+                                ticks += free_vars.len().saturating_sub(1) as i64;
+                            }
+                            crate::FunRef::Export { entry } => {
+                                let module = global_atoms().text(entry.module).unwrap();
+                                let function = global_atoms().text(entry.function).unwrap();
+                                combine(hash, entry.arity as u32, atom_hash(module), H);
+                                combine(hash, atom_hash(function), 0, H.wrapping_mul(14));
+                            }
+                        }
+                    }
+                    TermKind::Tuple => {
+                        // SAFETY: source heap remains live throughout hashing.
+                        let tuple = unsafe { term.tuple_ref().unwrap() };
+                        combine(hash, tuple.len() as u32, 0, H.wrapping_mul(9));
+                        for i in (0..tuple.len()).rev() {
+                            stack.push(Job::Visit(tuple.get(i).unwrap()));
+                        }
+                        ticks += tuple.len().saturating_sub(1) as i64;
+                    }
+                    TermKind::List => {
+                        if Self::list(hash, stack, term, 0, 0, &mut left, can_trap) {
+                            return Hash2Progress::Yield;
+                        }
+                    }
+                    TermKind::Bitstring => {
+                        if Self::binary(hash, stack, term, None, &mut left, can_trap) {
+                            return Hash2Progress::Yield;
+                        }
+                    }
+                    TermKind::Map => {
+                        // Port of erts/emulator/beam/erl_term_hashing.c:1130-1215
+                        // (make_hash2_helper map branch), OTP-29.1.1.
+                        let n = crate::hamt::len(term);
+                        combine(hash, n as u32, 0, H.wrapping_mul(16));
+                        if n > 0 {
+                            let saved = *hash;
+                            xors.push(0);
+                            stack.push(Job::Finish(saved));
+                            for (key, value) in crate::hamt::PairIter::new(term) {
+                                stack.push(Job::Xor);
+                                stack.push(Job::Visit(value));
+                                stack.push(Job::Visit(key));
+                                stack.push(Job::Reset);
+                            }
+                            ticks += n as i64;
+                        }
+                    }
+                    other => panic!("unsupported term kind in make_hash2: {other:?}"),
+                },
+            }
+            if can_trap {
+                if stack.is_empty() && !marker {
+                    break;
+                }
+                left -= ticks;
+                if left <= 0 && !stack.is_empty() {
+                    return Hash2Progress::Yield;
+                }
+            }
+        }
+        Hash2Progress::Done {
+            hash: *hash,
+            used: max_iterations - left,
+        }
+    }
+
+    /// The byte-run loop of the list case. Returns whether it trapped part way.
+    // Port of the `TAG_PRIMARY_LIST` case of `make_hash2_helper`,
+    // erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+    fn list(
+        hash: &mut u32,
+        stack: &mut smallvec::SmallVec<[Job; 16]>,
+        term: Term,
+        mut packed: u32,
+        mut count: u32,
+        left: &mut i64,
+        can_trap: bool,
+    ) -> bool {
+        let mut tail = term;
+        // SAFETY: the list remains live throughout hashing.
+        while let Some((head, next)) = unsafe { tail.cons_ref() } {
+            let Some(byte) = head.as_small().filter(|n| (0..=255).contains(n)) else {
+                break;
+            };
+            packed = (packed << 8) | byte as u32;
+            count += 1;
+            if count == 4 {
+                combine(hash, packed, 0, H.wrapping_mul(4));
+                packed = 0;
+                count = 0;
+            }
+            tail = next;
+            // SAFETY: the list remains live throughout hashing.
+            if can_trap && unsafe { next.cons_ref() }.is_some() {
+                *left -= 1;
+                if *left <= 0 {
+                    stack.push(Job::ListRun {
+                        tail,
+                        packed,
+                        count,
+                    });
+                    return true;
+                }
+            }
+        }
+        if count != 0 {
+            combine(hash, packed, 0, H.wrapping_mul(4));
+        }
+        // SAFETY: the list remains live throughout hashing.
+        if let Some((head, next)) = unsafe { tail.cons_ref() } {
+            stack.push(Job::Visit(next));
+            stack.push(Job::Visit(head));
+        } else {
+            stack.push(Job::Visit(tail));
+        }
+        false
+    }
+
+    /// The binary case. Returns whether it trapped part way.
+    // Port of the `BIN_REF_SUBTAG`, `HEAP_BITS_SUBTAG` and `SUB_BITS_SUBTAG` case of
+    // `make_hash2_helper`, erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+    fn binary(
+        hash: &mut u32,
+        stack: &mut smallvec::SmallVec<[Job; 16]>,
+        term: Term,
+        resumed: Option<(usize, (u32, u32, u32))>,
+        left: &mut i64,
+        can_trap: bool,
+    ) -> bool {
+        // SAFETY: source heap and binary backing remain live.
+        let view = unsafe { term.binary_ref().unwrap() };
+        let mut scratch = Vec::new();
+        let data = aligned_binary(&view, &mut scratch);
+        let bit_len = view.bit_len();
+        let size = (bit_len / 8) & 0xFFFF_FFFF;
+        let bitsize = bit_len % 8;
+        let iters_for_bin = ((size / BLOCK_HASH_BYTES_PER_ITER) as i64).max(1);
+        let con = H.wrapping_mul(13).wrapping_add(*hash);
+        let (mut processed, mut state) = match resumed {
+            Some(saved) => saved,
+            None => {
+                if size == 0 && bitsize == 0 {
+                    *hash = con;
+                    return false;
+                }
+                if !can_trap || *left - iters_for_bin > 0 {
+                    if can_trap {
+                        *left -= iters_for_bin;
+                    }
+                    *hash = block_hash(&data[..size], con);
+                    Self::binary_tail(hash, data, size, bitsize);
+                    return false;
+                }
+                (0, (H, H, con))
+            }
+        };
+        loop {
+            let max_bytes = if *left <= 0 {
+                BLOCK_HASH_BYTES_PER_ITER
+            } else {
+                (*left as usize).saturating_mul(BLOCK_HASH_BYTES_PER_ITER)
+            };
+            let bytes_left = size - processed;
+            let even_left = bytes_left - bytes_left % BLOCK_HASH_BYTES_PER_ITER;
+            let to_process = max_bytes.min(even_left);
+            block_hash_buffer(&mut state, &data[processed..processed + to_process]);
+            processed += to_process;
+            *left -= ((to_process / BLOCK_HASH_BYTES_PER_ITER) as i64).max(1);
+            if *left <= 0 {
+                stack.push(Job::Binary {
+                    term,
+                    processed,
+                    state,
+                });
+                return true;
+            }
+            if size - processed < BLOCK_HASH_BYTES_PER_ITER {
+                break;
+            }
+        }
+        *hash = block_hash_final_bytes(state, &data[processed..size], size);
+        Self::binary_tail(hash, data, size, bitsize);
+        false
+    }
+
+    fn binary_tail(hash: &mut u32, data: &[u8], size: usize, bitsize: usize) {
+        if bitsize > 0 {
+            combine(
+                hash,
+                bitsize as u32,
+                (data[size] >> (8 - bitsize)) as u32,
+                H.wrapping_mul(15),
+            );
+        }
+    }
+}
+
+/// Compute OTP's `make_hash2` for supported term kinds.
+/// Port of `erts/emulator/beam/erl_term_hashing.c:858` (`make_hash2_helper`), OTP-29.1.1.
+pub fn make_hash2(term: Term) -> u32 {
+    match Hash2Run::new(term).run(None) {
+        Hash2Progress::Done { hash, .. } => hash,
+        Hash2Progress::Yield => unreachable!("an unbounded run never yields"),
+    }
 }
 /// OTP `phash2/1`, using its fixed 27-bit range.
 pub fn phash2(term: Term) -> u32 {

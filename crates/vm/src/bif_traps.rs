@@ -468,6 +468,67 @@ fn erlang_md5_trap(
     chksum_trap(process, args, state, arinsal_bifs::ChksumKind::Md5)
 }
 
+fn phash2_trap(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+) -> Result<HandlerResult, BifError> {
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
+    let Some(state) = state else {
+        let step = arinsal_bifs::phash2_start(&mut ctx, args);
+        drop(ctx);
+        return Ok(match step {
+            Ok(arinsal_bifs::Phash2Step::Done(value)) => HandlerResult::Done {
+                value,
+                reductions: 0,
+            },
+            Ok(arinsal_bifs::Phash2Step::More(cont)) => HandlerResult::Yield {
+                continuation: cont.continuation(),
+                state: MagicRef::new(Mutex::new(*cont)),
+                reductions: 0,
+            },
+            Err(error) => HandlerResult::Failed {
+                error,
+                reductions: 0,
+            },
+        });
+    };
+    let saved = state
+        .downcast_ref::<Mutex<arinsal_bifs::Phash2Cont>>()
+        .ok_or(BifError::BADARG)?;
+    let mut cont = saved.lock().map_err(|_| BifError::SystemLimit)?;
+    let step = arinsal_bifs::phash2_slice(&mut ctx, &mut cont);
+    let continuation = cont.continuation();
+    drop(cont);
+    drop(ctx);
+    Ok(match step {
+        Ok(Some(value)) => HandlerResult::Done {
+            value,
+            reductions: 0,
+        },
+        Ok(None) => HandlerResult::Yield {
+            continuation,
+            state: Arc::clone(state),
+            reductions: 0,
+        },
+        Err(error) => HandlerResult::Failed {
+            error,
+            reductions: 0,
+        },
+    })
+}
+
+fn erlang_phash2_trap_1(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<HandlerResult, BifError> {
+    phash2_trap(process, args, state)
+}
+
 fn bool_atom(value: bool) -> Term {
     Term::atom(
         global_atoms()
@@ -477,6 +538,20 @@ fn bool_atom(value: bool) -> Term {
 }
 
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "erlang",
+        function: "phash2_trap",
+        arity: 1,
+        continuation: "erlang:phash2_trap/1",
+        handler: erlang_phash2_trap_1,
+    },
+    Entry {
+        module: "erlang",
+        function: "phash2_trap",
+        arity: 2,
+        continuation: "erlang:phash2_trap/2",
+        handler: erlang_phash2_trap_1,
+    },
     Entry {
         module: "erlang",
         function: "crc32",
@@ -2044,6 +2119,9 @@ pub(crate) fn install_deferred_trap(
             },
             MagicRef::new(Mutex::new(cont)),
         ),
+        arinsal_bifs::DeferredTrap::Phash2(cont) => {
+            (cont.continuation(), MagicRef::new(Mutex::new(*cont)))
+        }
         arinsal_bifs::DeferredTrap::Chksum(cont) => {
             (cont.continuation(), MagicRef::new(Mutex::new(cont)))
         }
