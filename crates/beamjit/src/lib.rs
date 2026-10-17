@@ -98,6 +98,15 @@ pub trait ModuleEnv {
     fn light_bif_fragment(&self) -> usize {
         0
     }
+    /// Return the light-BIF fragment for exports the helper dispatches (no BIF pointer).
+    fn light_bif_helper_fragment(&self) -> usize {
+        self.light_bif_fragment()
+    }
+    /// The BIF the export entry at `entry` publishes for `call_light_bif_shared`, or zero when
+    /// the helper dispatches it.
+    fn light_bif_func(&self, _entry: usize) -> usize {
+        0
+    }
     /// Fragment for `i_breakpoint_trampoline`.
     ///
     /// erts does not route it through `call_light_bif_shared`; the trampoline calls
@@ -3841,12 +3850,16 @@ fn emit_op(
                 count(2)?;
                 let import = n(1)?;
                 let entry = env.export_entry(beam, import).map_err(EmitError::Operand)?;
-                let arity = beam
-                    .imports
-                    .get(import as usize)
-                    .and_then(|import| u8::try_from(import.arity).ok())
-                    .ok_or_else(|| EmitError::Operand("light BIF import is missing".to_owned()))?;
-                assembler.dispatch_light_bif(env.light_bif_fragment(), entry, arity)
+                if beam.imports.get(import as usize).is_none() {
+                    return Err(EmitError::Operand("light BIF import is missing".to_owned()));
+                }
+                let bif = env.light_bif_func(entry);
+                let fragment = if bif != 0 {
+                    env.light_bif_fragment()
+                } else {
+                    env.light_bif_helper_fragment()
+                };
+                assembler.dispatch_light_bif(fragment, entry, bif)
             }
             "i_call_ext_last" => {
                 count(2)?;

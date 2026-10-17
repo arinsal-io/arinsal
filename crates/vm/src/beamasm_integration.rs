@@ -1426,6 +1426,7 @@ struct VmModuleEnv<'a> {
     export_entries: Vec<usize>,
     export_trampoline: usize,
     light_bif_fragment: usize,
+    light_bif_helper_fragment: usize,
     breakpoint_fragment: usize,
     line_breakpoint_fragment: usize,
     send_fragment: usize,
@@ -1521,6 +1522,7 @@ impl<'a> VmModuleEnv<'a> {
             export_entries,
             export_trampoline: fragments.export_trampoline(),
             light_bif_fragment: fragments.call_light_bif(),
+            light_bif_helper_fragment: fragments.call_light_bif_helper(),
             breakpoint_fragment: fragments.breakpoint(),
             line_breakpoint_fragment: fragments.line_breakpoint(),
             send_fragment: fragments.send(),
@@ -1716,6 +1718,18 @@ impl ModuleEnv for VmModuleEnv<'_> {
 
     fn light_bif_fragment(&self) -> usize {
         self.light_bif_fragment
+    }
+    fn light_bif_helper_fragment(&self) -> usize {
+        self.light_bif_helper_fragment
+    }
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610 (emit_call_light_bif, the BIF
+    // pointer passed in ARG8), OTP-29.1.1.
+    fn light_bif_func(&self, entry: usize) -> usize {
+        // SAFETY: `entry` is an export slot address taken from `export_entries`. Slots are
+        // leaked when created and never freed, like erts' export entries.
+        let slot = unsafe { &*(entry as *const arinsal_beamasm::bif::ExportEntry) };
+        slot.light_bif_func
+            .load(std::sync::atomic::Ordering::Acquire)
     }
     fn breakpoint_fragment(&self) -> usize {
         self.breakpoint_fragment

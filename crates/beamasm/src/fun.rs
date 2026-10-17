@@ -341,8 +341,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let next = self.code.new_label();
         // Speculatively untag the ErlFunThing.
-        self.code
-            .emit(|e| e.sub_imm(Gpr::x(9), Gpr::x(3), 2, false))?;
+        self.code.emit(|e| e.and_imm(Gpr::x(9), Gpr::x(3), !7))?;
         if !skip_header_test {
             // Load the error handler into TMP1 so that any failed test lands there.
             let error = self.call_fun_error_label(resolver as usize);

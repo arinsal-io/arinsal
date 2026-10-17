@@ -721,23 +721,24 @@ impl BeamModuleAssembler {
     ///
     /// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610 (emit_call_light_bif), OTP-29.1.1.
     /// The reduction check, the error pc and the trap continuation live in the shared
-    /// fragment, the same place as `call_light_bif_shared`.
+    /// fragment, the same place as `call_light_bif_shared`. ARG3 is the entry, ARG4 the
+    /// export and ARG8 the BIF (`bif`, or zero for an export the helper dispatches, which
+    /// calls the fragment that does not read it).
     pub fn dispatch_light_bif(
         &mut self,
         fragment: usize,
         identity: usize,
-        arity: u8,
+        bif: usize,
     ) -> Result<(), ModuleError> {
-        // `arity` is `ExportEntry::arity`, published when the slot is created. The yield
-        // path in the fragment loads it; the call site does not.
-        let _ = arity;
-        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-609, OTP-29.1.1.
         let entry = self.code.new_label();
         self.code.bind(entry)?;
-        // ARG4 = export, from the literal pool. ARG3 = this entry (the address a yield
-        // resumes at).
-        self.code.ldr_literal(Gpr::x(4), identity as u64)?;
-        self.code.adr(Gpr::x(3), entry)?;
+        // ARG4 = export and ARG8 = BIF, both from the literal pool. ARG3 = this entry (the
+        // address a yield resumes at).
+        self.code.ldr_literal(Gpr::x(3), identity as u64)?;
+        if bif != 0 {
+            self.code.ldr_literal(Gpr::x(7), bif as u64)?;
+        }
+        self.code.adr(Gpr::x(2), entry)?;
         // One module-local veneer per fragment. `x30` is the next instruction.
         self.fragment_call(fragment)
     }
