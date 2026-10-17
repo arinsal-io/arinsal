@@ -33,6 +33,7 @@ const TAG_BOXED: u64 = 2;
 const RESERVED_WORDS: u32 = arinsal_term::S_RESERVED as u32;
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:137-149 and erl_vm.h:120, OTP-29.1.1.
 const MAX_LIVE_X_REGS: u32 = 1027;
+const MAX_REGISTER_X: usize = 6;
 
 /// GC callback used by emitted heap checks. It receives the raw allocation
 /// need and the live X register count; the reserve belongs to the heap check.
@@ -482,30 +483,50 @@ impl BeamModuleAssembler {
         self.code
             .emit(|e| e.cmp_reg(SCRATCH[0], E, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.code.b_cond(Cond::Ls, done)?;
-        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:99-129, OTP-29.1.1.
-        let update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
-        crate::emit_enter_runtime(&mut self.code, live as usize, update)?;
-        self.code.emit(|e| {
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
-            e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
-            // `test_heap` checks with S_RESERVED but GC receives the raw need;
-            // `ensure()` reapplies the reserve only to its heap-space check.
-            e.mov_const(Gpr::x(2), requested_words as u64)?;
-            e.mov_const(Gpr::x(3), live as u64)?;
-            e.mov_reg(Gpr::w(4), FCALLS)?;
-            e.mov_const(Gpr::x(17), hook as usize as u64)?;
-            e.blr(Gpr::x(17))
-        })?;
-        crate::emit_leave_runtime(&mut self.code, live as usize, update)?;
-        self.code.emit(|e| {
-            e.sub_reg(FCALLS, FCALLS, Gpr::w(0), arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
-            e.ldr_uoff(Gpr::x(9), C_P, 40)
-        })?;
-        self.error_if_nonzero(Gpr::x(9))?;
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(3), u64::from(live)))?;
+        self.gc_fragment_call(hook as usize)?;
         self.code.bind(done)?;
         Ok(())
+    }
+
+    /// Emits the shared garbage-collection fragment called by every heap and stack check.
+    ///
+    /// ARG3 (x8) is `HTOP` plus the reserve and the bytes needed, ARG4 (x3) the live X count.
+    /// The reserve is removed again: the collector adds it itself.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:99-129 (emit_garbage_collect),
+    // OTP-29.1.1.
+    pub(super) fn emit_garbage_collect_fragment(&mut self, hook: usize) -> Result<(), ModuleError> {
+        let error = self.code.new_label();
+        let update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
+        self.code
+            .emit(|e| e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16))?;
+        self.code.emit(|e| {
+            e.sub_reg(Gpr::x(2), SCRATCH[0], HTOP, arinsal_a64::enc::Shift::Lsl, 0)?;
+            e.lsr_imm(Gpr::x(2), Gpr::x(2), 3)?;
+            e.sub_imm(Gpr::x(2), Gpr::x(2), RESERVED_WORDS as u16, false)?;
+            e.str_uoff(Gpr::x(30), C_P, 72)
+        })?;
+        crate::emit_enter_runtime(&mut self.code, MAX_REGISTER_X, update)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), C_P)?;
+            e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
+            e.mov_reg(Gpr::w(4), FCALLS)?;
+            e.mov_const(Gpr::x(17), hook as u64)?;
+            e.blr(Gpr::x(17))
+        })?;
+        crate::emit_leave_runtime(&mut self.code, MAX_REGISTER_X, update)?;
+        self.code.emit(|e| {
+            e.sub_reg(FCALLS, FCALLS, Gpr::w(0), arinsal_a64::enc::Shift::Lsl, 0)?;
+            e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
+            e.ldr_uoff(Gpr::x(9), C_P, 40)
+        })?;
+        self.code.cbnz(Gpr::x(9), error)?;
+        self.code.emit(|e| e.ret(Gpr::x(30)))?;
+        self.code.bind(error)?;
+        self.code
+            .emit(|e| e.sub_imm(Gpr::x(30), Gpr::x(30), 4, false))?;
+        self.branch_error_from_lr()
     }
 
     pub(super) fn emit_stack_check(

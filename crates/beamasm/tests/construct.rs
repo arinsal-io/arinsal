@@ -135,8 +135,10 @@ fn run_native(
 ) -> (ProcessHeader, [u64; 1024], [u64; 128], usize) {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_raw(|e| e.mov_reg(Gpr::x(24), Gpr::x(30))).unwrap();
     emit(&mut asm, moving_gc).unwrap();
     asm.emit_raw(|e| {
+        e.mov_reg(Gpr::x(30), Gpr::x(24))?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
     })
