@@ -670,7 +670,7 @@ fn emit_framed_call(
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:253-328 (emit_apply_fun_shared), OTP-29.1.1:
-// the fun (X0) goes to x4 and the arity to x2 for `call_fun`; x0 is zero once every argument is
+// the fun (X0) goes to x3 and the arity to x2 for `call_fun`; x0 is zero once every argument is
 // in the X registers. A malformed list or one with too many elements returns nonzero with X0
 // and X1 untouched, and the caller hands the apply to the interpreter, which raises
 // badarg/system_limit for erlang:apply/2 like erts' error path.
@@ -680,7 +680,7 @@ fn emit_apply_fun_fragment(code: &mut CodeBuffer) -> Result<(), BufferError> {
     let finished = code.new_label();
     code.emit(|e| {
         e.mov_reg(Gpr::x(2), Gpr::xzr())?;
-        e.mov_reg(Gpr::x(4), Gpr::x(25))?;
+        e.mov_reg(Gpr::x(3), Gpr::x(25))?;
         e.mov_reg(Gpr::x(5), Gpr::x(26))
     })?;
     // No X register is live: the arguments are written straight to the X register array.
@@ -736,20 +736,17 @@ fn emit_export_fragment(
 ) -> Result<(), BufferError> {
     let interpreted = code.new_label();
     code.emit(|encoder| {
-        // A non-tail call site only loaded the export (x1) and called through its address, so
-        // the pc a raising BIF is attributed to is the return address in x30, tagged as a
-        // return site. A tail call site passes its own address in x0 instead of c_p, because
-        // its frame is gone and x30 is the caller's continuation.
+        // The call site loaded the export into ARG1 (x0) and called through its address, so the
+        // pc a raising BIF is attributed to is the return address in x30, tagged as a return
+        // site. A tail call site's x30 is the caller's continuation, which is also where erts
+        // attributes it.
         encoder.orr_imm(Gpr::x(9), Gpr::x(30), crate::module::RETURN_SITE_TAG as u64)?;
-        encoder.cmp_reg(Gpr::x(0), Gpr::x(21), Shift::Lsl, 0)?;
-        encoder.csel(Gpr::x(9), Gpr::x(9), Gpr::x(0), Cond::Eq)?;
         encoder.str_uoff(Gpr::x(9), Gpr::x(19), tmp_mem_offset(6))?;
         // Interpreted targets have no native prologue to save this continuation.
         encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
         encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
-        encoder.str_uoff(Gpr::x(1), Gpr::sp(), 16)?;
-        // The caller supplies c_p in x0 and the export identity in x1.
+        encoder.str_uoff(Gpr::x(0), Gpr::sp(), 16)?;
         Ok(())
     })?;
     let helper_call = code.new_label();
@@ -760,7 +757,7 @@ fn emit_export_fragment(
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:730-776 (call_bif_shared),
         // OTP-29.1.1: a BIF export calls `bif_table[].f` directly. The pointer is the
         // one published on the export; zero stays on the helper (ordinary remote calls).
-        encoder.ldr_uoff(Gpr::x(8), Gpr::x(1), crate::bif::EXPORT_LIGHT_BIF_OFFSET)
+        encoder.ldr_uoff(Gpr::x(8), Gpr::x(0), crate::bif::EXPORT_LIGHT_BIF_OFFSET)
     })?;
     code.cbz(Gpr::x(8), helper_call)?;
     code.emit(|encoder| {
@@ -770,7 +767,7 @@ fn emit_export_fragment(
         // (instr_bif.cpp:388-397) and an export entry has not.
         encoder.ldr_uoff(
             Gpr::w(9),
-            Gpr::x(1),
+            Gpr::x(0),
             crate::bif::EXPORT_IS_BIF_TRACED_OFFSET,
         )?;
         encoder.cmp_imm(Gpr::w(9), 0, false)?;
@@ -783,13 +780,13 @@ fn emit_export_fragment(
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     emit_publish_erlang_frame_pointer(code)?;
     code.emit(|encoder| {
-        // c_p->arity from the export, then (c_p, reg, I, Export.info). x4 stays
-        // the Export* the call site loaded. `info` is the descriptor, the same
-        // word the helper path loads; the BIF does not look the export up.
-        encoder.ldrb_uoff(Gpr::w(9), Gpr::x(1), crate::bif::EXPORT_ARITY_OFFSET as u16)?;
+        // c_p->arity from the export, then (c_p, reg, I, Export.info). x4 is the Export*
+        // the call site loaded. `info` is the descriptor, the same word the helper path
+        // loads; the BIF does not look the export up.
+        encoder.ldrb_uoff(Gpr::w(9), Gpr::x(0), crate::bif::EXPORT_ARITY_OFFSET as u16)?;
         encoder.strb_uoff(Gpr::w(9), Gpr::x(21), 80)?;
-        encoder.ldr_uoff(Gpr::x(3), Gpr::x(1), crate::bif::EXPORT_INFO_OFFSET)?;
-        encoder.mov_reg(Gpr::x(4), Gpr::x(1))?;
+        encoder.ldr_uoff(Gpr::x(3), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.mov_reg(Gpr::x(4), Gpr::x(0))?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
         // No call-site entry address: only `call_light_bif_shared` passes `I`.
@@ -803,8 +800,9 @@ fn emit_export_fragment(
     code.emit(|encoder| {
         // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_bif trampolines read the
         // BIF from their own Export), OTP-29.1.1: x2 = the export's descriptor word.
+        encoder.ldr_uoff(Gpr::x(2), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(0))?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        encoder.ldr_uoff(Gpr::x(2), Gpr::x(1), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))
     })?;
@@ -854,7 +852,7 @@ fn emit_export_fragment(
 }
 
 /// Records a remote call of a process saving calls, then continues through the export's
-/// address in the active code index. The export entry is in x1 and the return address in
+/// address in the active code index. The export entry is in x0 and the return address in
 /// x30; both are preserved since this runs between caller and callee.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:123-148 (emit_dispatch_save_calls_export),
 // OTP-29.1.1.
@@ -862,28 +860,26 @@ fn emit_save_calls_export_fragment(
     code: &mut CodeBuffer,
     helper: usize,
 ) -> Result<(), BufferError> {
-    code.emit(|encoder| {
-        encoder.stp_pre(Gpr::x(30), Gpr::x(1), Gpr::sp(), -32)?;
-        encoder.str_uoff(Gpr::x(0), Gpr::sp(), 16)
-    })?;
+    code.emit(|encoder| encoder.stp_pre(Gpr::x(30), Gpr::x(0), Gpr::sp(), -32))?;
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(2), Gpr::x(0), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(0))?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        encoder.ldr_uoff(Gpr::x(2), Gpr::x(1), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))?;
         encoder.mov_reg(Gpr::x(17), Gpr::x(0))
     })?;
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
-        encoder.ldr_uoff(Gpr::x(0), Gpr::sp(), 16)?;
-        encoder.ldp_post(Gpr::x(30), Gpr::x(1), Gpr::sp(), 32)?;
+        encoder.ldp_post(Gpr::x(30), Gpr::x(0), Gpr::sp(), 32)?;
         encoder.br(Gpr::x(17))
     })
 }
 
 /// Calls a fun whose entry has no code in the active code index. Entered from a `call_fun`
-/// site between caller and callee: x2 = expected fun header bits, x4 = fun, x30 = the caller's continuation.
+/// site between caller and callee: ARG1 (x0) = the fun entry, ARG3 (x2) = expected fun header
+/// bits, ARG4 (x3) = fun, ARG5 (x4) = the call site, x30 = the caller's continuation.
 /// The helper either returns the address to continue with (the interpreter's fun call for an
 /// unloaded fun, which runs the error handler) or zero with the exception set, raised with the
 /// call site as the current pc.
@@ -896,16 +892,17 @@ fn emit_unloaded_fun_fragment(
     let error = code.new_label();
     code.emit(|encoder| {
         // emit_enter_runtime_frame: only a native frame. E stays the caller's, so the runtime
-        // sees the caller's stack like beam_jit_handle_unloaded_fun does in erts; the
-        // continuation (erts keeps ARG5 in TMP_MEM1q) is saved in the native frame.
+        // sees the caller's stack like beam_jit_handle_unloaded_fun does in erts; the fun
+        // (ARG4) and the call site (ARG5, which erts keeps in TMP_MEM1q) are saved in the
+        // native frame.
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
         encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
-        encoder.stp(Gpr::x(2), Gpr::x(4), Gpr::sp(), 16)
+        encoder.stp(Gpr::x(3), Gpr::x(4), Gpr::sp(), 16)
     })?;
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        encoder.ldp(Gpr::x(2), Gpr::x(1), Gpr::sp(), 16)?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(3))?;
         encoder.lsr_imm(Gpr::x(2), Gpr::x(2), 8)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))?;
@@ -914,7 +911,7 @@ fn emit_unloaded_fun_fragment(
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     code.cbz(Gpr::x(17), error)?;
     code.emit(|encoder| {
-        encoder.ldp(Gpr::x(2), Gpr::x(4), Gpr::sp(), 16)?;
+        encoder.ldp(Gpr::x(3), Gpr::x(4), Gpr::sp(), 16)?;
         encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.br(Gpr::x(17))
@@ -923,35 +920,35 @@ fn emit_unloaded_fun_fragment(
     // erts raises with ARG2 = the saved call site; the shared raise fragment here reads the
     // exception pc from the top of E and pops the native frame itself.
     code.emit(|encoder| {
-        encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 8)?;
+        encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 24)?;
         encoder.str_pre(Gpr::x(9), Gpr::x(20), -8)
     })?;
     code.b(raise_exception)
 }
 
 /// Continues a local fun call of a process saving calls with its node's active code index.
-/// x4 = fun and x30 = return address are preserved: this runs between caller and callee.
+/// ARG1 (x0) = the fun entry, ARG4 (x3) = fun and x30 = return address are preserved: this
+/// runs between caller and callee.
 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:139-149 (emit_dispatch_save_calls_fun),
 // OTP-29.1.1. erts reads the one `the_active_code_index`; each node here has its own, which
 // the helper reads.
 fn emit_save_calls_fun_fragment(code: &mut CodeBuffer, helper: usize) -> Result<(), BufferError> {
     code.emit(|encoder| {
-        encoder.stp_pre(Gpr::x(30), Gpr::x(4), Gpr::sp(), -32)?;
-        encoder.stp(Gpr::x(1), Gpr::x(2), Gpr::sp(), 16)
+        encoder.stp_pre(Gpr::x(30), Gpr::x(3), Gpr::sp(), -32)?;
+        encoder.str_uoff(Gpr::x(0), Gpr::sp(), 16)
     })?;
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        encoder.ldr_uoff(Gpr::x(1), Gpr::sp(), 8)?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(3))?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))?;
         encoder.mov_reg(Gpr::x(17), Gpr::x(0))
     })?;
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
-        encoder.ldp(Gpr::x(1), Gpr::x(2), Gpr::sp(), 16)?;
-        encoder.ldp_post(Gpr::x(30), Gpr::x(4), Gpr::sp(), 32)?;
-        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.ldr_uoff(Gpr::x(0), Gpr::sp(), 16)?;
+        encoder.ldp_post(Gpr::x(30), Gpr::x(3), Gpr::sp(), 32)?;
         encoder.br(Gpr::x(17))
     })
 }
@@ -1234,9 +1231,8 @@ fn emit_call_light_bif_shared(
     // beam_asm.hpp:388-403 (emit_setup_dispatchable_call), OTP-29.1.1.
     code.bind(trace)?;
     code.emit(|encoder| {
-        encoder.mov_reg(Gpr::x(0), Gpr::x(3))?;
-        encoder.mov_reg(Gpr::x(1), Gpr::x(4))?;
-        encoder.ldr_regoff(Gpr::x(14), Gpr::x(4), Gpr::x(24), 3)?;
+        encoder.mov_reg(Gpr::x(0), Gpr::x(4))?;
+        encoder.ldr_regoff(Gpr::x(14), Gpr::x(0), Gpr::x(24), 3)?;
         encoder.br(Gpr::x(14))
     })?;
     Ok(())
@@ -1431,10 +1427,7 @@ fn emit_line_breakpoint_shared(
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     code.cbz(Gpr::x(0), no_handler)?;
     code.emit(|encoder| {
-        encoder.mov_reg(Gpr::x(13), Gpr::x(0))?;
-        encoder.ldr_regoff(Gpr::x(14), Gpr::x(13), Gpr::x(24), 3)?;
-        encoder.ldr_uoff(Gpr::x(0), Gpr::x(19), native_error_pc_slot)?;
-        encoder.mov_reg(Gpr::x(1), Gpr::x(13))?;
+        encoder.ldr_regoff(Gpr::x(14), Gpr::x(0), Gpr::x(24), 3)?;
         encoder.blr(Gpr::x(14))
     })?;
     code.bind(cleanup)?;
