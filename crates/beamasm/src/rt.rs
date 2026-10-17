@@ -169,6 +169,44 @@ unsafe extern "C" {
 
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
+    ".global _arinsal_enter_native_trace_return",
+    "_arinsal_enter_native_trace_return:",
+    // Publish the BEAM cursors and register cache before the Rust trace hook.
+    "str x20, [x21, #8]",
+    "str x23, [x21, #0]",
+    "str w22, [x21, #32]",
+    "stp x25, x26, [x19, #0]",
+    "stp x27, x28, [x19, #16]",
+    "stp x15, x16, [x19, #32]",
+    "add x15, x19, #8192",
+    "stp d8, d9, [x15, #0]",
+    "stp d10, d11, [x15, #16]",
+    "stp d12, d13, [x15, #32]",
+    "stp d14, d15, [x15, #48]",
+    "mov x0, x21",
+    "ldr x16, [x19, #16424]",
+    "blr x16",
+    "mov x14, x0",
+    "ldr x20, [x21, #8]",
+    "ldr x23, [x21, #0]",
+    "ldr w22, [x21, #32]",
+    "ldp x25, x26, [x19, #0]",
+    "ldp x27, x28, [x19, #16]",
+    "ldp x15, x16, [x19, #32]",
+    "add x17, x19, #8192",
+    "ldp d8, d9, [x17, #0]",
+    "ldp d10, d11, [x17, #16]",
+    "ldp d12, d13, [x17, #32]",
+    "ldp d14, d15, [x17, #48]",
+    // A hook that hands the return to the scheduler leaves the exit target and resume
+    // address in tmp_mem[0..2] and returns the exit fragment; x1/x2 are free at a return.
+    "ldr x1, [x19, #16384]",
+    "ldr x2, [x19, #16392]",
+    "br x14",
+);
+
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
     ".global _arinsal_enter_native",
     "_arinsal_enter_native:",
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
@@ -216,53 +254,18 @@ core::arch::global_asm!(
     "cbz x9, 1f",
     "mov x30, x9",
     "str xzr, [x19, #16488]",
-    "1:",
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:284-288, OTP-29.1.1.
     // A scheduler re-entry can target a BIF continuation, whose result is in XREG0.
     "ldr x0, [x19]",
     "br x2",
-);
-
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".global _arinsal_enter_native_trace_return",
-    "_arinsal_enter_native_trace_return:",
-    // Publish the BEAM cursors and register cache before the Rust trace hook.
-    "str x20, [x21, #8]",
-    "str x23, [x21, #0]",
-    "str w22, [x21, #32]",
-    "stp x25, x26, [x19, #0]",
-    "stp x27, x28, [x19, #16]",
-    "stp x15, x16, [x19, #32]",
-    "add x15, x19, #8192",
-    "stp d8, d9, [x15, #0]",
-    "stp d10, d11, [x15, #16]",
-    "stp d12, d13, [x15, #32]",
-    "stp d14, d15, [x15, #48]",
-    "mov x0, x21",
-    "ldr x16, [x19, #16424]",
-    "blr x16",
-    "mov x14, x0",
-    "ldr x20, [x21, #8]",
-    "ldr x23, [x21, #0]",
-    "ldr w22, [x21, #32]",
-    "ldp x25, x26, [x19, #0]",
-    "ldp x27, x28, [x19, #16]",
-    "ldp x15, x16, [x19, #32]",
-    "add x17, x19, #8192",
-    "ldp d8, d9, [x17, #0]",
-    "ldp d10, d11, [x17, #16]",
-    "ldp d12, d13, [x17, #32]",
-    "ldp d14, d15, [x17, #48]",
-    // A hook that hands the return to the scheduler leaves the exit target and resume
-    // address in tmp_mem[0..2] and returns the exit fragment; x1/x2 are free at a return.
-    "ldr x1, [x19, #16384]",
-    "ldr x2, [x19, #16392]",
-    "br x14",
-);
-
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
+    "1:",
+    "ldr x0, [x19]",
+    // The call pushes the exit fragment's address on the return-address predictor, so the
+    // native function's RET to it and the fragment's own RET back to the Rust caller are both
+    // predicted. A `br` here leaves the predictor one entry short and every RET up the
+    // scheduler's call chain after a switch-out mispredicts.
+    "blr x2",
+    // This label must directly follow the `blr x2` above: its link value is the exit fragment.
     ".global _arinsal_enter_native_return",
     "_arinsal_enter_native_return:",
     // The marker distinguishes an interpreter handoff without adding work to each BEAM return.
