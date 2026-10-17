@@ -1595,16 +1595,16 @@ impl Process {
             self.reductions_used = self.reductions_used.saturating_add(u64::from(cost));
         }
     }
-    /// Ensure native code's register slice directly, copying it through `self.x` only if GC runs.
+    /// Ensure with `live` roots in `self.x`, the scheduler's X register array, without a
+    /// collection when the heap has room.
     ///
     /// Port of erts/emulator/beam/erl_bits.c:1769-1840 (`erts_bs_append_checked`), OTP-29.1.1.
     pub(crate) fn ensure_native_roots(
         &mut self,
         words: usize,
-        registers: &mut [Term],
         live: usize,
     ) -> Result<bool, VmError> {
-        if live > registers.len() {
+        if live > self.x.len() {
             return Err(VmError::Unsupported("live X register count".into()));
         }
         let allocation_words = words
@@ -1619,14 +1619,7 @@ impl Process {
         {
             return Ok(false);
         }
-        if self.x.is_attached() {
-            return self.ensure(words, live).map(|()| true);
-        }
-        self.x.ensure_x(live);
-        self.x[..live].copy_from_slice(&registers[..live]);
-        let result = self.ensure(words, live);
-        registers[..live].copy_from_slice(&self.x[..live]);
-        result.map(|()| true)
+        self.ensure(words, live).map(|()| true)
     }
     /// Collect with `live` X roots.
     ///

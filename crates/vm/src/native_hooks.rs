@@ -714,22 +714,18 @@ fn list_length(mut list: Term) -> Option<usize> {
     }
 }
 
-/// Collects with the first `live` scheduler X registers as roots and writes the moved
-/// roots back, like `erts_garbage_collect(p, need, reg, live)` on the register array.
+/// Collects with the first `live` scheduler X registers as roots, like
+/// `erts_garbage_collect(p, need, reg, live)` on the register array. `process.x` is that
+/// array, so the roots move in place.
+// Exactly the live X registers are GC roots, including those past the six register-backed
+// ones; dead registers may hold stale words (erts_garbage_collect_nobump, OTP-29.1.1).
 pub(crate) fn collect_native(
     process: &mut Process,
     registers: &mut SchedulerRegisters,
     need_words: usize,
     live: usize,
 ) -> Result<(), VmError> {
-    // Exactly the live X registers are GC roots, including those past the six register-backed
-    // ones; dead registers may hold stale words (erts_garbage_collect_nobump, OTP-29.1.1).
-    let roots = live.min(registers.x_reg_array.len());
-    process.x.ensure_x(roots);
-    load_x(process, registers, roots);
-    let result = ensure_native_frame(process, registers, need_words, live);
-    store_x(process, registers, roots);
-    result
+    ensure_native_frame(process, registers, need_words, live)
 }
 
 /// Heap slow path used by `test_heap` and heap allocation emitters.
