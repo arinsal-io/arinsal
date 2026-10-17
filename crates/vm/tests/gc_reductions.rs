@@ -6,6 +6,7 @@
 //! full sweep that moves it, and once with nothing live. The loop costs the same in both runs,
 //! so the difference is the cost of the collections. A process that spends its slice stops
 //! counting at zero, so the loops stay well inside one slice of 4000 reductions.
+//! `erlang:garbage_collect/0` bumps the reductions by the cost of its collection too.
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -15,11 +16,13 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(gc_reds_diff).
--export([heap_test/0, bif_epilogue/0]).
+-export([heap_test/0, bif_epilogue/0, explicit_gc/0]).
 
 heap_test() -> measure(fun heap_loop/2, 300, 1000).
 
 bif_epilogue() -> measure(fun bif_loop/2, 300, 3000).
+
+explicit_gc() -> measure(fun gc_loop/2, 5, 2000).
 
 measure(Loop, Iterations, LiveCount) ->
     process_flag(fullsweep_after, 0),
@@ -41,6 +44,11 @@ heap_loop(0, _) -> ok;
 heap_loop(N, Live) ->
     _ = erlang:phash2({N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N,N}),
     heap_loop(N - 1, Live).
+
+gc_loop(0, _) -> ok;
+gc_loop(N, Live) ->
+    true = erlang:garbage_collect(),
+    gc_loop(N - 1, Live).
 
 bif_loop(0, _) -> ok;
 bif_loop(N, Live) ->
@@ -117,4 +125,9 @@ fn gc_charged_to_reductions_from_the_heap_test() {
 #[test]
 fn gc_charged_to_reductions_from_the_bif_epilogue() {
     check("bif_epilogue", 3000 * 2);
+}
+
+#[test]
+fn gc_charged_to_reductions_from_erlang_garbage_collect() {
+    check("explicit_gc", 2000 * 2);
 }

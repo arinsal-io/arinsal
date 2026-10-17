@@ -3986,6 +3986,9 @@ fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
     process.heap.set_fullsweep_after(fullsweep_after);
     let gc = collected.map_err(|error| VmError::Unsupported(format!("GC {error:?}")))?;
     after_collection(process, live, gc.collections, gc.words_reclaimed);
+    // Port of erts/emulator/beam/erl_gc.c (`erts_garbage_collect`: BUMP_REDS(p, reds) with the
+    // cost `garbage_collect` returns), OTP-29.1.1.
+    process.bump_gc_reds(gc.reductions);
     Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
