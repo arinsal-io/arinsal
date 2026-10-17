@@ -8,9 +8,7 @@
 //! unsalted `erts_internal_hash` for HAMT keys. Trie iteration visits slots
 //! from 0 to 15 at each depth, independently of insertion order.
 
-use arinsal_term::{
-    HeapAlloc, Term, TermError, TermKind, cmp, exact_eq, global_atoms, internal_hash,
-};
+use arinsal_term::{HeapAlloc, Term, TermError, TermKind, atoms, cmp, exact_eq, internal_hash};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
@@ -1217,7 +1215,7 @@ fn flatmap_next_words<H: HeapAlloc + ?Sized>(
             merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
         let mut remaining = n;
         let mut at = start;
-        let mut res = none_atom();
+        let mut res = NONE;
         for words in output.as_chunks_mut::<4>().0 {
             remaining -= 1;
             words[0].write(3 << 6);
@@ -1894,16 +1892,7 @@ pub fn get_many(map: Term, keys: &[Term]) -> MapResult<Vec<Option<Term>>> {
     keys.iter().map(|key| get(map, *key)).collect()
 }
 
-fn none_atom() -> Term {
-    static NONE: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
-    *NONE.get_or_init(|| {
-        Term::atom(
-            global_atoms()
-                .intern("none")
-                .expect("OTP predefined atom fits"),
-        )
-    })
-}
+const NONE: Term = Term::atom(atoms::NONE);
 
 /// `maps:iterator/1` or `maps:iterator/2` with `ordered = true`.
 /// The initial terms are `[0 | Map]` and `[SortedKeys | Map]` respectively.
@@ -2014,7 +2003,7 @@ enum NextPath {
 /// Flatmap and ordered paths build a tuple chain; HAMT paths return one pair.
 pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResult<Term> {
     // Port of erts/emulator/beam/erl_map.c:3620-3744, OTP-29.1.1.
-    if iterator == none_atom() {
+    if iterator == NONE {
         return Ok(iterator);
     }
     if iterator.classify() == TermKind::Tuple {
@@ -2036,13 +2025,13 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
             return Err(MapError::Badarg(iterator));
         }
         if entries.is_empty() {
-            return Ok(none_atom());
+            return Ok(NONE);
         }
         let need_words = 4 * entries.len();
         let p = heap
             .alloc(need_words)
             .ok_or(MapError::HeapFull { need_words })?;
-        let mut result = none_atom();
+        let mut result = NONE;
         for (i, (key, value)) in entries.into_iter().rev().enumerate() {
             // SAFETY: one allocation reserves a three-element tuple per pair.
             unsafe {
@@ -2057,7 +2046,7 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
         return Ok(result);
     }
     if path == Term::NIL {
-        return Ok(none_atom());
+        return Ok(NONE);
     }
     if path.classify() == TermKind::List {
         let mut keys = path;
@@ -2075,7 +2064,7 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
         let p = heap
             .alloc(need_words)
             .ok_or(MapError::HeapFull { need_words })?;
-        let mut result = none_atom();
+        let mut result = NONE;
         for (i, (key, value)) in entries.into_iter().rev().enumerate() {
             // SAFETY: one allocation reserves a three-element tuple per pair.
             unsafe {
@@ -2097,7 +2086,7 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
             entries.extend(iter(map)?.enumerate().map(|(i, (k, v))| (i as u128, k, v)));
         }
         if entries.is_empty() && path == 0 {
-            return Ok(none_atom());
+            return Ok(NONE);
         }
         let at = entries
             .iter()
@@ -2111,7 +2100,7 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
         )
     } else {
         if path == Term::NIL {
-            return Ok(none_atom());
+            return Ok(NONE);
         }
         // SAFETY: ordered iterator path is a live proper list of keys.
         let (key, tail) = unsafe { path.cons_ref() }.ok_or(MapError::Badarg(iterator))?;
@@ -2153,7 +2142,7 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
             *tail.add(1) = bits(map);
             *p.add(3) = bits(cons(tail));
         } else {
-            *p.add(3) = bits(none_atom());
+            *p.add(3) = bits(NONE);
         }
     }
     Ok(boxed(p))

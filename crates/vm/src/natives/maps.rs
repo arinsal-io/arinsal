@@ -4,7 +4,9 @@ use crate::exceptions::Trap;
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::RunCtx;
-use arinsal_term::{HeapReservation, Term, TermBuilder, TermKind, Tuple3Chain, global_atoms};
+use arinsal_term::{
+    HeapReservation, Term, TermBuilder, TermKind, Tuple3Chain, atoms, global_atoms,
+};
 
 /// Elements returned on the first `path = 0` hashmap call.
 /// Port of erts/emulator/beam/erl_map.h:96 (MAP_SMALL_MAP_LIMIT), OTP-29.1.1.
@@ -21,21 +23,18 @@ fn atom(name: &str) -> Term {
     Term::atom(global_atoms().intern(name).expect("built-in atom"))
 }
 
-/// The `iterator` and `none` atoms, interned once instead of hashed on every call.
-fn iterator_atom() -> Term {
-    static ATOM: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
-    *ATOM.get_or_init(|| atom("iterator"))
-}
+/// The `iterator` and `none` atoms. Both are predefined, so their indices are constants.
+const ITERATOR: Term = Term::atom(atoms::ITERATOR);
+const NONE: Term = Term::atom(atoms::NONE);
 
-fn none_atom() -> Term {
-    static ATOM: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
-    *ATOM.get_or_init(|| atom("none"))
-}
-
+#[cold]
+#[inline(never)]
 fn badarg() -> Trap {
     Trap::error(atom("badarg"))
 }
 
+#[cold]
+#[inline(never)]
 fn system_limit() -> Trap {
     Trap::error(atom("system_limit"))
 }
@@ -472,13 +471,14 @@ fn hamt_next(
     } else if list_mode {
         res
     } else {
-        chain.finish(none_atom())
+        chain.finish(NONE)
     };
     process.reductions -= (4 * (orig_elems as i64 - elems as i64)) as i32;
     Ok(result)
 }
 
 /// Port of erts/emulator/beam/erl_map.c:3709-3738 (flatmap branch), OTP-29.1.1.
+#[inline(always)]
 fn flat_next(
     process: &mut Process,
     path: Term,
@@ -532,7 +532,7 @@ fn ordered_next(
         process.reductions = process
             .reductions
             .saturating_sub(ORDERED_ITER_FACTOR * (orig_elems - elems) as i32);
-        Ok(chain.finish(none_atom()))
+        Ok(chain.finish(NONE))
     } else {
         Err(badarg())
     }
@@ -541,13 +541,35 @@ fn ordered_next(
 /// `erts_internal:map_next/3`.
 /// Port of erts/emulator/beam/erl_map.c:3636 (erts_internal_map_next_3), OTP-29.1.1.
 fn map_next(process: &mut Process, args: &[Term]) -> Result<Term, Trap> {
+    if let Some((path, flat, mode)) = iterator_flatmap(args) {
+        return flat_next(process, path, flat, false, mode);
+    }
+    map_next_general(process, args)
+}
+
+/// The `maps:iterator/1` hot case: a small path over a flatmap in iterator mode.
+#[inline(always)]
+fn iterator_flatmap(args: &[Term]) -> Option<(Term, arinsal_maps::CheckedFlatMap, Term)> {
+    if let &[path, map, mode] = args
+        && mode == ITERATOR
+        && path.as_small().is_some()
+        && let Ok(checked) = arinsal_maps::checked_map(map)
+        && let arinsal_maps::CheckedMapKind::Flatmap(flat) = checked.kind()
+    {
+        return Some((path, flat, mode));
+    }
+    None
+}
+
+#[inline(never)]
+fn map_next_general(process: &mut Process, args: &[Term]) -> Result<Term, Trap> {
     if args.len() != 3 {
         return Err(badarg());
     }
     let path = args[0];
     let map = arinsal_maps::checked_map(args[1]).map_err(|_| badarg())?;
     let mode = args[2];
-    let iterator = mode == iterator_atom();
+    let iterator = mode == ITERATOR;
     let list_mode = !iterator && (mode == Term::NIL || mode.classify() == TermKind::List);
     if !iterator && !list_mode {
         return Err(badarg());
@@ -589,6 +611,32 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<sup
     match (module, function, arity) {
         ("erts_internal", "map_next", 3) => Some(map_next_process_bif),
         _ => None,
+    }
+}
+
+/// The light-BIF call site entry for `erts_internal:map_next/3`.
+pub(crate) fn thin_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
+    match (module, function, arity) {
+        ("erts_internal", "map_next", 3) => {
+            Some(crate::native_helpers::thin_bif_light::<MapNext> as *const () as usize)
+        }
+        _ => None,
+    }
+}
+
+/// `erts_internal:map_next/3` for the light-BIF call site.
+// Port of erts/emulator/beam/erl_map.c:3636 (erts_internal_map_next_3), OTP-29.1.1.
+pub(crate) struct MapNext;
+
+impl super::ThinProcessBif for MapNext {
+    const ARITY: usize = 3;
+
+    #[inline(always)]
+    fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<Trap>> {
+        if let Some((path, flat, mode)) = iterator_flatmap(args) {
+            return flat_next(process, path, flat, false, mode).map_err(Box::new);
+        }
+        map_next_general(process, args).map_err(Box::new)
     }
 }
 
