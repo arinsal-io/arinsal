@@ -2078,7 +2078,13 @@ mod tests {
         let mut message_heap = ProcessHeap::with_words(32);
         message_heap.gc_fragment(7);
         heap.adopt_message_fragment(message_heap).unwrap();
-        assert_eq!(heap.fragment_words, 168);
+        assert_eq!(heap.fragment_words, 136);
+
+        let mut dirty_shadow = ProcessHeap::with_words(256);
+        dirty_shadow.htop = 9;
+        dirty_shadow.gc_fragment(5);
+        heap.adopt_message_fragment(dirty_shadow).unwrap();
+        assert_eq!(heap.fragment_words, 150);
     }
 
     #[test]
