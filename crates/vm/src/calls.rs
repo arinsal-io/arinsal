@@ -104,6 +104,7 @@ pub(super) fn gc_after_bif(
         *value = roots[0];
         // Port of erl_gc.c:922-932 (`garbage_collect` records scheduler GC statistics), OTP-29.1.1.
         crate::natives::sys::after_collection(process, 0, stats.collections, stats.words_reclaimed);
+        process.bump_gc_reds(stats.reductions);
         return Ok(());
     }
 
@@ -169,6 +170,7 @@ pub(super) fn gc_after_bif(
         stats.collections,
         stats.words_reclaimed,
     );
+    process.bump_gc_reds(stats.reductions);
     Ok(())
 }
 
@@ -202,6 +204,7 @@ pub(crate) fn gc_after_native_parts(
         *value = roots[0];
         // Port of erl_gc.c:922-932 (`garbage_collect` records scheduler GC statistics), OTP-29.1.1.
         crate::natives::sys::after_collection(process, 0, stats.collections, stats.words_reclaimed);
+        process.bump_gc_reds(stats.reductions);
         return Ok(());
     }
     let mut roots = arguments.to_vec();
@@ -266,6 +269,7 @@ pub(crate) fn gc_after_native_parts(
         stats.collections,
         stats.words_reclaimed,
     );
+    process.bump_gc_reds(stats.reductions);
     Ok(())
 }
 

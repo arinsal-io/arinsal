@@ -1101,7 +1101,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     for index in 6..synced {
         process.x[index] = registers.x_reg_array[index];
     }
-    let result = process.ensure(need_words, live);
+    let result = process.ensure_uncharged(need_words, live);
     if result.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
     }
@@ -1122,7 +1122,12 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     if process.force_yield {
         return fcalls.max(0);
     }
-    0
+    // Port of erts/emulator/beam/erl_gc.c (erts_garbage_collect_nobump), OTP-29.1.1:
+    // the collection's cost, at most the reductions left, is what the generated code
+    // subtracts from FCALLS.
+    i32::try_from(result.unwrap_or(0))
+        .unwrap_or(i32::MAX)
+        .min(fcalls.max(0))
 }
 
 /// `send` from its own fragment. A traced send, a port id, or a registered port
