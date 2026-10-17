@@ -335,9 +335,11 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     if let Some((operation, args)) = operation {
         // The charge comes off FCALLS, which the scheduler adds to the process's count.
         let charge = arinsal_arith::reduction_charge(operation, args);
+        // Port of erts/emulator/beam/bif.h (BUMP_REDS): the count never goes below zero.
         process.reductions = process
             .reductions
-            .saturating_sub(charge.min(i32::MAX as u32) as i32);
+            .saturating_sub(charge.min(i32::MAX as u32) as i32)
+            .max(0);
     }
     let result = match op {
         16 => float_value(left)
