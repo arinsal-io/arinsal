@@ -1240,14 +1240,12 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
             return 0;
         }
     }
-    process.x.ensure_x(4);
     let args = [
         Term::atom(function.module_atom),
         Term::atom(function.function_atom),
         Term::small(i64::from(function.arity)).expect("arity is a small integer"),
         Term::small(i64::from(line)).expect("debug line is a small integer"),
     ];
-    process.x[..4].copy_from_slice(&args);
     registers.x_reg_array[..4].copy_from_slice(&args);
     process.header.arity = 4;
     process.sync_native_header();
@@ -4021,9 +4019,6 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         // The branch below resumes the handler. The scheduler must not treat
         // the next native exit as a continuation resume.
         cold.native_continuation_resume = false;
-    }
-    if !process.x.is_attached() {
-        registers.x_reg_array[..4].copy_from_slice(&process.x[..4]);
     }
     handler
 }
