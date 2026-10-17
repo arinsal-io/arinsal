@@ -807,6 +807,26 @@ pub(crate) fn gc_stress_enabled() -> bool {
     })
 }
 
+/// `ARINSAL_XREG_POISON=1` (debug builds only): at schedule-in, every X register above the
+/// registers the process saved is filled with [`XREG_POISON`] instead of a stale or NIL value,
+/// so code that reads a dead register faults or is caught by the root walk.
+///
+/// erts copies exactly `c_p->arity` registers into the scheduler array at schedule-in
+/// (jit/arm/process_main.cpp, copy_in_registers) and leaves the rest of the array dirty.
+#[inline]
+pub(crate) fn xreg_poison_enabled() -> bool {
+    static XREG_POISON: OnceLock<bool> = OnceLock::new();
+    cfg!(debug_assertions)
+        && *XREG_POISON.get_or_init(|| {
+            std::env::var_os("ARINSAL_XREG_POISON").as_deref() == Some(std::ffi::OsStr::new("1"))
+        })
+}
+
+/// A catch-tagged immediate with the largest index: no valid register value looks like it, a
+/// dead register used as a list, tuple or `[]` takes the wrong branch, and the root walk can
+/// recognize it.
+pub(crate) const XREG_POISON: Term = Term::catch(u64::MAX >> 6);
+
 /// Live X register count before `instr` when the process may be switched out there.
 ///
 /// erts only schedules a process out where the live count is exact: at call

@@ -1383,7 +1383,12 @@ impl Executor {
         process.x[..self.x.len()].copy_from_slice(&self.x);
         // The tail still holds the previous run's registers on this executor; those are
         // pointers into another process's heap and must not reach this process's GC roots.
-        process.x[self.x.len()..].fill(Term::NIL);
+        let dead_fill = if crate::xreg_poison_enabled() {
+            crate::XREG_POISON
+        } else {
+            Term::NIL
+        };
+        process.x[self.x.len()..].fill(dead_fill);
         if process.fr.len() < self.fr.len() {
             let mut registers = process.fr.to_vec();
             registers.resize(self.fr.len(), 0.0);
@@ -6229,6 +6234,13 @@ impl Process {
         min_free: usize,
         hibernate: bool,
     ) -> Result<arinsal_term::GcStats, VmError> {
+        if crate::xreg_poison_enabled()
+            && let Some(register) = self.x[..live_x.min(self.x.len())]
+                .iter()
+                .position(|term| *term == crate::XREG_POISON)
+        {
+            panic!("xreg poison: GC roots dead register x{register} (live_x={live_x})");
+        }
         // Port of erts/emulator/beam/erl_gc.c:782-785 (garbage_collect: F_DELAY_GC), OTP-29.1.1.
         if !hibernate && self.delay_gc {
             self.heap.delay_collection(min_free);

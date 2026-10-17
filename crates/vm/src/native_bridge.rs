@@ -1050,6 +1050,9 @@ pub fn run_native(
     let count = process.x.len().min(registers.x_reg_array.len());
     let live_in = live.max(8).min(count);
     registers.x_reg_array[..live_in].copy_from_slice(&process.x[..live_in]);
+    if crate::xreg_poison_enabled() {
+        registers.x_reg_array[live.min(count)..].fill(crate::XREG_POISON);
+    }
     if let Some(cold) = process.cold.as_mut() {
         cold.native_bif_error = None;
         cold.native_trap = None;
