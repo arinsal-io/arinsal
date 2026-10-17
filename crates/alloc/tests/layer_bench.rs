@@ -206,6 +206,45 @@ fn alloc_block_at(background: bool) -> f64 {
     })
 }
 
+/// Alloc and free halves of `alloc_util_alone`, timed apart: ns per alloc and ns per free.
+fn alloc_util_split(background: bool) -> (f64, f64) {
+    let cycles = cycles();
+    let mut best = (f64::MAX, f64::MAX);
+    for _ in 0..5 {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut allocator = AllocUtil::new(Strategy::AoffCbf, AllocUtilOptions::default());
+        if background {
+            let bg: Vec<_> = (0..2000)
+                .map(|_| {
+                    allocator
+                        .alloc(16 + (rng.next() % 20) as usize * 16)
+                        .unwrap()
+                })
+                .collect();
+            for allocation in bg.iter().step_by(2) {
+                allocator.free(*allocation).unwrap();
+            }
+        }
+        let mut live = Vec::with_capacity(32);
+        let (mut alloc_ns, mut free_ns) = (0u128, 0u128);
+        for _ in 0..cycles {
+            let started = Instant::now();
+            for _ in 0..26 {
+                live.push(allocator.alloc(8 + (rng.next() % 12) as usize * 8).unwrap());
+            }
+            alloc_ns += started.elapsed().as_nanos();
+            let started = Instant::now();
+            for allocation in live.drain(..) {
+                allocator.free(allocation).unwrap();
+            }
+            free_ns += started.elapsed().as_nanos();
+        }
+        let per = |ns: u128| ns as f64 / (cycles as f64 * 26.0);
+        best = (best.0.min(per(alloc_ns)), best.1.min(per(free_ns)));
+    }
+    best
+}
+
 #[test]
 #[ignore = "timing: cargo test --release -p arinsal-alloc --test layer_bench -- --ignored --nocapture"]
 fn layer_bench() {
@@ -216,6 +255,10 @@ fn layer_bench() {
             eprintln!(
                 "  AllocUtil alone          {:6.2} ns per pair",
                 alloc_util_alone(background)
+            );
+            let (alloc_ns, free_ns) = alloc_util_split(background);
+            eprintln!(
+                "  AllocUtil split          {alloc_ns:6.2} ns per alloc, {free_ns:6.2} ns per free"
             );
             eprintln!(
                 "  ThreadSpecificAllocators {:6.2} ns per pair",
