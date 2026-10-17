@@ -293,7 +293,11 @@ impl BeamModuleAssembler {
         fail: u32,
     ) -> Result<(), ModuleError> {
         let fail = self.label(fail);
-        let src = self.source_reg_into(source.val, Gpr::x(11))?;
+        let src = if matches!(op, InlineType::NonemptyList | InlineType::Nil) {
+            self.load_source_any(source.val, Gpr::x(8), &[])?
+        } else {
+            self.source_reg_into(source.val, Gpr::x(11))?
+        };
         let tmp1 = Gpr::x(8);
         let tmp2 = Gpr::x(9);
         let tmp3 = Gpr::x(10);
@@ -337,13 +341,22 @@ impl BeamModuleAssembler {
                     .emit(|e| e.ccmp_reg(src, Gpr::x(14), 4, Cond::Ne))?;
                 self.code.b_cond(Cond::Ne, fail)?;
             }
-            InlineType::NonemptyList => self.code.tbnz(src, 1, fail)?,
+            // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1121-1129 and beam_asm.hpp:1163-1167
+            // (emit_is_nonempty_list, emit_is_cons: preserve_cache), OTP-29.1.1.
+            InlineType::NonemptyList => {
+                self.preserve_cache(&[], |this| Ok(this.code.tbnz(src, 1, fail)?))?
+            }
+            // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1389-1401 (emit_is_nil),
+            // OTP-29.1.1.
             InlineType::Nil => {
                 if source.always_one_of(type_id::CONS | type_id::NIL) {
-                    self.code.tbz(src, 1, fail)?;
+                    self.preserve_cache(&[], |this| Ok(this.code.tbz(src, 1, fail)?))?;
                 } else {
-                    self.code.emit(|e| e.cmp_imm(src, 0x3b, false))?;
-                    self.code.b_cond(Cond::Ne, fail)?;
+                    self.preserve_cache(&[], |this| {
+                        this.code.emit(|e| e.cmp_imm(src, 0x3b, false))?;
+                        this.code.b_cond(Cond::Ne, fail)?;
+                        Ok(())
+                    })?;
                 }
             }
             InlineType::Tuple => {

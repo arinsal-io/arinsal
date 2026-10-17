@@ -49,28 +49,17 @@ impl BeamModuleAssembler {
         tail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), ModuleError> {
-        // Port of load_sources + stp into HTOP (instr_common.cpp:707-720): the source
-        // registers are stored directly. The tagged pointer is subtracted into the
-        // destination register.
-        let head_reg = self.source_reg(head)?;
-        let tail_scratch = if head_reg == Gpr::x(17) {
-            SCRATCH[5]
-        } else {
-            Gpr::x(17)
-        };
-        let tail_reg = self.source_reg_into(tail, tail_scratch)?;
-        let (dst_reg, store) = match dst {
-            ArgVal::X(index) if index < 6 => (XREGS[index as usize], false),
-            _ => (SCRATCH[4], true),
-        };
-        self.code.emit(|e| {
-            e.stp_post(head_reg, tail_reg, HTOP, 16)?;
-            e.sub_imm(dst_reg, HTOP, 15, false)
+        let head_reg = self.source_reg_into(head, SCRATCH[0])?;
+        let tail_reg = self.source_reg_into(tail, SCRATCH[1])?;
+        let dst = self.pair_destination(dst, SCRATCH[2])?;
+        self.preserve_cache(&[], |this| {
+            this.code.emit(|e| {
+                e.stp_post(head_reg, tail_reg, HTOP, 16)?;
+                e.sub_imm(dst.reg, HTOP, 15, false)
+            })?;
+            Ok(())
         })?;
-        if store {
-            self.store_arg(dst, dst_reg)?;
-        }
-        Ok(())
+        self.flush_var(dst)
     }
 
     /// Builds a tuple whose elements are supplied in source order.
@@ -126,24 +115,22 @@ impl BeamModuleAssembler {
         head: ArgVal,
         tail: ArgVal,
     ) -> Result<(), ModuleError> {
-        let list = self.source_reg(src)?;
-        self.code.emit(|e| e.and_imm(SCRATCH[0], list, !7))?;
-        if head == tail {
-            let tdst = self.destination_reg(tail)?;
-            self.code.emit(|e| e.ldr_uoff(tdst, SCRATCH[0], 8))?;
-            self.store_arg(tail, tdst)
+        let list = self.load_source_any(src, SCRATCH[0], &[])?;
+        self.preserve_cache(&[SCRATCH[0]], |this| {
+            this.code.emit(|e| e.and_imm(SCRATCH[0], list, !7))?;
+            Ok(())
+        })?;
+        let hd = self.pair_destination(head, SCRATCH[1])?;
+        let tl = self.pair_destination(tail, SCRATCH[2])?;
+        if hd.reg == tl.reg {
+            self.code.emit(|e| e.ldr_uoff(tl.reg, SCRATCH[0], 8))?;
+            self.flush_var(tl)
         } else {
-            let hdst = match head {
-                ArgVal::X(i) if i < 6 => XREGS[i as usize],
-                _ => SCRATCH[2],
-            };
-            let tdst = match tail {
-                ArgVal::X(i) if i < 6 => XREGS[i as usize],
-                _ => SCRATCH[3],
-            };
-            self.code.emit(|e| e.ldp(hdst, tdst, SCRATCH[0], 0))?;
-            self.store_arg(head, hdst)?;
-            self.store_arg(tail, tdst)
+            self.preserve_cache(&[], |this| {
+                this.code.emit(|e| e.ldp(hd.reg, tl.reg, SCRATCH[0], 0))?;
+                Ok(())
+            })?;
+            self.flush_vars(hd, tl)
         }
     }
 
