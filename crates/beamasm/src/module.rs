@@ -614,37 +614,33 @@ impl BeamModuleAssembler {
 
     /// Dispatches through the VM-owned native address word for an export.
     ///
-    /// Port of erts/emulator/beam/jit/arm/instr_call.cpp:150-200, OTP-29.1.1.
+    /// Port of erts/emulator/beam/jit/arm/instr_call.cpp:150-164 (emit_i_call_ext,
+    /// emit_i_call_ext_only), OTP-29.1.1: the export is loaded into `x1` (ARG1), its address
+    /// for the active code index is called or branched to, and nothing else is set up. The
+    /// export trampoline and the other fragments between caller and callee take what they need
+    /// from `x30`, which for a non-tail call is the return address (erts keeps it in the stack
+    /// frame pushed by the trampoline). `x0` tells them which: `c_p` for a non-tail call, the
+    /// address of this call site for a tail call, whose frame is gone and whose `x30` is the
+    /// caller's continuation.
     pub fn dispatch_export(&mut self, entry: usize, tail: bool) -> Result<(), ModuleError> {
-        let continuation = self.code.new_label();
         if tail {
-            self.record_call_site()?;
-        } else {
-            self.record_return_site(continuation)?;
-        }
-        if tail {
+            let call_site = self.code.new_label();
+            self.code.bind(call_site)?;
+            self.code.adr(Gpr::x(0), call_site)?;
             self.emit_leave_frame()?;
-        } else {
-            self.code.adr(Gpr::x(30), continuation)?;
         }
         self.code.emit(|e| {
-            e.mov_const(Gpr::x(13), entry as u64)?;
+            e.mov_const(Gpr::x(1), entry as u64)?;
             // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:388-403
             // (emit_setup_dispatchable_call), OTP-29.1.1.
-            e.ldr_regoff(Gpr::x(14), Gpr::x(13), Gpr::x(24), 3)?;
-            e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_reg(Gpr::x(1), Gpr::x(13))
-        })?;
-        self.code.emit(|e| {
+            e.ldr_regoff(Gpr::x(14), Gpr::x(1), Gpr::x(24), 3)?;
             if tail {
                 e.br(Gpr::x(14))
             } else {
+                e.mov_reg(Gpr::x(0), C_P)?;
                 e.blr(Gpr::x(14))
             }
         })?;
-        if !tail {
-            self.code.bind(continuation)?;
-        }
         Ok(())
     }
 
