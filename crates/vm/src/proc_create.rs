@@ -42,13 +42,26 @@ impl ProcessStats {
     }
 }
 
-/// X registers. The first six live in the process, like `def_arg_reg[6]`
-/// (erl_process.h:1079). A longer file is a separate block, like `arg_reg` when
-/// `max_arg_reg` exceeds `sizeof(def_arg_reg)`.
+/// Number of X registers a scheduler array holds (`ERTS_X_REGS_ALLOCATED`, erl_vm.h).
+pub const ATTACHED_X_REGS: usize = 1024;
+
+/// X registers, in one of two representations.
+///
+/// Owned (scheduled out): the saved arguments. The first six live in the process, like
+/// `def_arg_reg[6]` (erl_process.h:1079); a longer file is a separate block, like `arg_reg`
+/// when `max_arg_reg` exceeds `sizeof(def_arg_reg)`. The slice is `arity` registers long.
+///
+/// Attached (running): a pointer to the scheduler's single X register array
+/// (`esdp->registers->x_reg_array`), `ATTACHED_X_REGS` long. The owned storage and its
+/// `arity` are kept untouched until `detach_save` copies the live registers back, like
+/// `copy_out_registers` at schedule-out.
 pub struct ArgRegs {
     inline: [Term; 6],
     extra: Box<[Term]>,
     len: usize,
+    /// Address of the scheduler array while attached, zero otherwise. An address and not a
+    /// pointer so `Process` stays `Sync` without an `unsafe impl`.
+    attached: usize,
 }
 
 impl ArgRegs {
@@ -59,18 +72,106 @@ impl ArgRegs {
                 inline: [Term::NIL; 6],
                 extra: Box::from([]),
                 len,
+                attached: 0,
             }
         } else {
             Self {
                 inline: [Term::NIL; 6],
                 extra: vec![Term::NIL; len].into_boxed_slice(),
                 len,
+                attached: 0,
             }
         }
     }
 
     pub fn empty() -> Self {
         Self::new(0)
+    }
+
+    /// True while the registers are the scheduler's array.
+    #[inline]
+    pub fn is_attached(&self) -> bool {
+        self.attached != 0
+    }
+
+    /// The saved argument count (`c_p->arity`): the length of the owned file, which an
+    /// attached file keeps until `detach_save`.
+    #[inline]
+    pub fn saved_arity(&self) -> usize {
+        self.len
+    }
+
+    /// Make `registers.x_reg_array` the X file. The saved registers stay in place and
+    /// `saved_arity` is unchanged; the caller copies them in (`copy_in_registers`).
+    ///
+    /// The scheduler must `detach_save` before `registers` moves or is dropped.
+    pub fn attach(&mut self, registers: &mut arinsal_beamasm::SchedulerRegisters) {
+        assert!(self.attached == 0, "X registers are already attached");
+        self.attached = registers.x_reg_array.as_mut_ptr() as usize;
+    }
+
+    /// Schedule-out (`copy_out_registers`): copy the first `arity` array registers into the
+    /// owned file, growing it past six like `arg_reg`, record `arity`, and drop the
+    /// attachment.
+    pub fn detach_save(&mut self, arity: usize) {
+        assert!(
+            arity <= ATTACHED_X_REGS,
+            "arity {arity} exceeds the X array"
+        );
+        assert!(self.attached != 0, "X registers are not attached");
+        if arity <= 6 {
+            let mut saved = self.inline;
+            saved[..arity].copy_from_slice(&self[..arity]);
+            self.inline = saved;
+        } else {
+            let mut block = std::mem::take(&mut self.extra);
+            if block.len() < arity {
+                block = vec![Term::NIL; arity].into_boxed_slice();
+            }
+            block[..arity].copy_from_slice(&self[..arity]);
+            self.extra = block;
+        }
+        self.len = arity;
+        self.attached = 0;
+    }
+
+    /// Make at least `n` registers addressable. Owned: grow, keeping the registers and
+    /// filling the new ones with `NIL`. Attached: nothing to do, the array has
+    /// `ATTACHED_X_REGS` registers.
+    #[inline]
+    pub fn ensure_x(&mut self, n: usize) {
+        if self.attached != 0 {
+            debug_assert!(n <= ATTACHED_X_REGS);
+            return;
+        }
+        if n > self.len {
+            self.grow_owned(n);
+        }
+    }
+
+    #[cold]
+    fn grow_owned(&mut self, n: usize) {
+        let len = self.len;
+        if n > 6 {
+            if self.extra.len() < n {
+                let mut grown = vec![Term::NIL; n];
+                let old: &[Term] = if len <= 6 {
+                    &self.inline[..len]
+                } else {
+                    &self.extra[..len]
+                };
+                grown[..len].copy_from_slice(old);
+                self.extra = grown.into_boxed_slice();
+            } else {
+                if len <= 6 {
+                    self.extra[..len].copy_from_slice(&self.inline[..len]);
+                }
+                self.extra[len..n].fill(Term::NIL);
+            }
+        } else {
+            self.inline[len..n].fill(Term::NIL);
+        }
+        self.len = n;
     }
 }
 
@@ -84,12 +185,14 @@ impl From<Vec<Term>> for ArgRegs {
                 inline,
                 extra: Box::from([]),
                 len,
+                attached: 0,
             }
         } else {
             Self {
                 inline: [Term::NIL; 6],
                 extra: values.into_boxed_slice(),
                 len,
+                attached: 0,
             }
         }
     }
@@ -98,21 +201,37 @@ impl From<Vec<Term>> for ArgRegs {
 impl std::ops::Deref for ArgRegs {
     type Target = [Term];
 
+    #[inline]
     fn deref(&self) -> &[Term] {
+        if self.attached != 0 {
+            // SAFETY: `attach` took the address from a live `[Term; ATTACHED_X_REGS]` that the
+            // scheduler keeps alive and in place until `detach_save`.
+            return unsafe {
+                std::slice::from_raw_parts(self.attached as *const Term, ATTACHED_X_REGS)
+            };
+        }
         if self.len <= 6 {
             &self.inline[..self.len]
         } else {
-            &self.extra
+            &self.extra[..self.len]
         }
     }
 }
 
 impl std::ops::DerefMut for ArgRegs {
+    #[inline]
     fn deref_mut(&mut self) -> &mut [Term] {
+        if self.attached != 0 {
+            // SAFETY: as in `deref`; `&mut self` makes this the only access to the array
+            // through the process.
+            return unsafe {
+                std::slice::from_raw_parts_mut(self.attached as *mut Term, ATTACHED_X_REGS)
+            };
+        }
         if self.len <= 6 {
             &mut self.inline[..self.len]
         } else {
-            &mut self.extra
+            &mut self.extra[..self.len]
         }
     }
 }
@@ -1841,5 +1960,155 @@ impl ProcFlags {
     /// Stores a flag and returns the previous value.
     pub(crate) fn insert(&mut self, name: &str, value: Term) -> Option<Term> {
         self.slot(name).replace(value)
+    }
+}
+
+#[cfg(test)]
+mod arg_regs_tests {
+    use super::{ATTACHED_X_REGS, ArgRegs};
+    use arinsal_beamasm::SchedulerRegisters;
+    use arinsal_term::Term;
+
+    fn int(n: i64) -> Term {
+        Term::small(n).unwrap()
+    }
+
+    fn registers() -> Box<SchedulerRegisters> {
+        Box::<SchedulerRegisters>::default()
+    }
+
+    fn owned(values: &[i64]) -> ArgRegs {
+        ArgRegs::from(values.iter().map(|&n| int(n)).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn owned_len_is_the_arity() {
+        let regs = owned(&[1, 2, 3]);
+        assert!(!regs.is_attached());
+        assert_eq!(regs.len(), 3);
+        assert_eq!(regs.saved_arity(), 3);
+        let wide = owned(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(wide.len(), 8);
+        assert_eq!(wide[7], int(8));
+    }
+
+    #[test]
+    fn attached_deref_is_the_whole_scheduler_array() {
+        let mut sched = registers();
+        sched.x_reg_array[3] = int(33);
+        let mut regs = owned(&[1, 2]);
+        regs.attach(&mut sched);
+        assert!(regs.is_attached());
+        assert_eq!(regs.len(), ATTACHED_X_REGS);
+        assert_eq!(regs.saved_arity(), 2);
+        assert_eq!(regs[3], int(33));
+        regs[1000] = int(7);
+        regs.detach_save(0);
+        assert_eq!(sched.x_reg_array[1000], int(7));
+    }
+
+    #[test]
+    fn attached_writes_land_in_the_array_and_detach_saves_arity_registers() {
+        let mut sched = registers();
+        let mut regs = owned(&[9]);
+        regs.attach(&mut sched);
+        for i in 0..4 {
+            regs[i] = int(10 + i as i64);
+        }
+        assert_eq!(sched.x_reg_array[2], int(12));
+        regs.detach_save(3);
+        assert!(!regs.is_attached());
+        assert_eq!(regs.len(), 3);
+        assert_eq!(regs.saved_arity(), 3);
+        assert_eq!(&regs[..], &[int(10), int(11), int(12)]);
+    }
+
+    #[test]
+    fn detach_save_grows_past_the_inline_registers() {
+        let mut sched = registers();
+        let mut regs = owned(&[1]);
+        regs.attach(&mut sched);
+        for i in 0..9 {
+            regs[i] = int(100 + i as i64);
+        }
+        regs.detach_save(9);
+        assert_eq!(regs.len(), 9);
+        let expect: Vec<Term> = (0..9).map(|i| int(100 + i)).collect();
+        assert_eq!(&regs[..], &expect[..]);
+
+        regs.attach(&mut sched);
+        regs.detach_save(2);
+        assert_eq!(&regs[..], &expect[..2]);
+        regs.attach(&mut sched);
+        regs.detach_save(7);
+        assert_eq!(&regs[..], &expect[..7]);
+    }
+
+    #[test]
+    fn detach_save_is_isolated_from_later_array_changes() {
+        let mut sched = registers();
+        let mut regs = owned(&[]);
+        regs.attach(&mut sched);
+        regs[0] = int(1);
+        regs[1] = int(2);
+        regs.detach_save(2);
+        sched.x_reg_array[0] = int(99);
+        assert_eq!(&regs[..], &[int(1), int(2)]);
+    }
+
+    #[test]
+    fn ensure_x_grows_an_owned_file_and_keeps_registers() {
+        let mut regs = owned(&[1, 2]);
+        regs.ensure_x(1);
+        assert_eq!(regs.len(), 2);
+        regs.ensure_x(5);
+        assert_eq!(regs.len(), 5);
+        assert_eq!(&regs[..2], &[int(1), int(2)]);
+        assert_eq!(&regs[2..], &[Term::NIL; 3]);
+        regs.ensure_x(10);
+        assert_eq!(regs.len(), 10);
+        assert_eq!(&regs[..2], &[int(1), int(2)]);
+        assert_eq!(&regs[2..], &[Term::NIL; 8]);
+        regs.ensure_x(12);
+        assert_eq!(regs.len(), 12);
+        assert_eq!(regs[1], int(2));
+        assert_eq!(regs[11], Term::NIL);
+        assert_eq!(regs.saved_arity(), 12);
+    }
+
+    #[test]
+    fn ensure_x_after_a_smaller_save_does_not_resurrect_stale_registers() {
+        let mut sched = registers();
+        let mut regs = owned(&[]);
+        regs.attach(&mut sched);
+        for i in 0..8 {
+            regs[i] = int(50 + i as i64);
+        }
+        regs.detach_save(8);
+        regs.attach(&mut sched);
+        regs.detach_save(2);
+        regs.ensure_x(4);
+        assert_eq!(&regs[..], &[int(50), int(51), Term::NIL, Term::NIL]);
+        regs.ensure_x(8);
+        assert_eq!(regs.len(), 8);
+        assert_eq!(&regs[2..], &[Term::NIL; 6]);
+    }
+
+    #[test]
+    fn ensure_x_is_a_no_op_while_attached() {
+        let mut sched = registers();
+        let mut regs = owned(&[1]);
+        regs.attach(&mut sched);
+        regs.ensure_x(500);
+        assert_eq!(regs.len(), ATTACHED_X_REGS);
+        assert_eq!(regs.saved_arity(), 1);
+        regs.detach_save(1);
+        assert_eq!(regs.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "not attached")]
+    fn detach_without_attach_panics() {
+        owned(&[1]).detach_save(1);
     }
 }
