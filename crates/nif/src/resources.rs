@@ -208,20 +208,6 @@ pub(crate) fn resource_magic_orig_size(size: usize, has_down: bool) -> usize {
     }
 }
 
-#[cfg(test)]
-mod orig_size_tests {
-    use super::resource_magic_orig_size;
-
-    #[test]
-    fn orig_size_follows_enif_alloc_resource() {
-        // 24 magic data offset + 16 ErtsResource head + user data.
-        assert_eq!(resource_magic_orig_size(4, false), 44);
-        assert_eq!(resource_magic_orig_size(0, false), 40);
-        // The monitors block follows the user data rounded up to 8 bytes.
-        assert_eq!(resource_magic_orig_size(4, true), 40 + 8 + 88);
-        assert_eq!(resource_magic_orig_size(16, true), 40 + 16 + 88);
-    }
-}
 fn from_reference(reference: Term) -> Option<Arc<Resource>> {
     // SAFETY: the caller retains the reference term and its heap during the callback.
     let magic = unsafe { reference.magic_ref() }?;
@@ -725,4 +711,19 @@ pub(crate) fn call_down(resource: &Arc<Resource>, pid: Term, monitor: &[u8; 32])
 /// Whether the type of `resource` has a `down` callback.
 pub(crate) fn has_down(resource: &Resource) -> bool {
     resource.kind.callbacks().down.is_some()
+}
+
+#[cfg(test)]
+mod orig_size_tests {
+    use super::resource_magic_orig_size;
+
+    #[test]
+    fn orig_size_follows_enif_alloc_resource() {
+        // 24 magic data offset + 16 ErtsResource head + user data.
+        assert_eq!(resource_magic_orig_size(4, false), 44);
+        assert_eq!(resource_magic_orig_size(0, false), 40);
+        // The monitors block follows the user data rounded up to 8 bytes.
+        assert_eq!(resource_magic_orig_size(4, true), 40 + 8 + 88);
+        assert_eq!(resource_magic_orig_size(16, true), 40 + 16 + 88);
+    }
 }
