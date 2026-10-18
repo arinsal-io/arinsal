@@ -239,6 +239,37 @@ fn misc_bifs_decode_packet_and_dflag_match_erts() {
     );
 }
 
+/// `decode_packet_3` opens a heap factory, which claims the free young heap, so its sub binaries
+/// are `HAlloc`ed into heap fragments: `mbuf_size` grows by the words erts reports.
+#[test]
+fn misc_bifs_decode_packet_sub_binaries_go_to_heap_fragments_like_erts() {
+    let _ = global_atoms();
+    compare(
+        r#"-module(misc_bifs_packet_mbuf). -export([run/0]).
+        run() ->
+            {_, R} = spawn_monitor(fun() ->
+                Bin = <<148:32, (binary:copy(<<1>>, 148))/binary, 0:8>>,
+                Small = <<4:32, 1,2,3,4, 9>>,
+                Mb = fun() ->
+                    {_, I} = process_info(self(), garbage_collection_info),
+                    proplists:get_value(mbuf_size, I)
+                end,
+                M0 = Mb(),
+                {ok, P1, R1} = erlang:decode_packet(4, Bin, []),
+                M1 = Mb(),
+                {ok, P2, R2} = erlang:decode_packet(4, Small, []),
+                M2 = Mb(),
+                {more, _} = erlang:decode_packet(4, <<0,0>>, []),
+                M3 = Mb(),
+                exit({[M1 - M0, M2 - M1, M3 - M2],
+                      byte_size(P1), byte_size(R1), byte_size(P2), byte_size(R2)})
+            end),
+            receive {'DOWN', R, _, _, Reason} -> Reason end."#,
+        "misc_bifs_packet_mbuf",
+        "run",
+    );
+}
+
 #[test]
 fn misc_bifs_decode_packet_errors_options_and_more_match_erts() {
     let _ = global_atoms();
