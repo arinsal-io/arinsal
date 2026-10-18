@@ -1941,16 +1941,17 @@ impl<T: Task> Inner<T> {
         // the monotonic clock only once check_time_reds reaches ERTS_CHECK_TIME_REDS and bumps
         // its timers with that time), OTP-29.1.1. Receive timeouts are checked before the
         // timer wheel resets check_time_reds.
-        if !self.halt_requested.load(Ordering::Acquire) {
-            self.poll_pending_waits(local, false);
+        // The scheduler loop polls them again right after this call with the cached time, so a
+        // round without aux work and without a halt leaves them to that poll.
+        let halting = self.halt_requested.load(Ordering::Acquire);
+        if aux_work != 0 || halting {
+            if !halting {
+                self.poll_pending_waits(local, false);
+            }
+            // Port of erts/emulator/beam/erl_process.c:2719 (canceled timers before
+            // debug-wait completion), OTP-29.1.1.
+            self.poll_timers(worker, Some(local), halting);
         }
-        // Port of erts/emulator/beam/erl_process.c:2719 (canceled timers before
-        // debug-wait completion), OTP-29.1.1.
-        self.poll_timers(
-            worker,
-            Some(local),
-            self.halt_requested.load(Ordering::Acquire),
-        );
         if aux_work & AUX_WORK_FUNC != 0 {
             self.handle_aux_work(worker);
         }
@@ -2335,13 +2336,18 @@ impl<T: Task> Inner<T> {
     /// Move what other threads appended to this scheduler's run queue into its local deques.
     // Port of erts/emulator/beam/erl_process.c:9824 (schedule: the run queue's
     // ERTS_RUNQ_FLGS_PROCS_QMASK flags say which priority queues hold processes), OTP-29.1.1.
+    #[inline]
     fn take_injected(&self, local: &mut Local<T>) {
-        let id = local.worker_id;
-        let flags =
-            self.run_queue_flags[id].load(Ordering::Acquire) & ((1 << PINNED_FLAGS_SHIFT) - 1);
-        if flags == 0 {
-            return;
+        let flags = self.run_queue_flags[local.worker_id].load(Ordering::Acquire)
+            & ((1 << PINNED_FLAGS_SHIFT) - 1);
+        if flags != 0 {
+            self.drain_injected(local, flags);
         }
+    }
+
+    #[inline(never)]
+    fn drain_injected(&self, local: &mut Local<T>, flags: u32) {
+        let id = local.worker_id;
         // Clear before draining: an append that races with the drain sets its bit again.
         self.run_queue_flags[id].fetch_and(!flags, Ordering::AcqRel);
         for priority in 0..local.queues.len() {
@@ -2742,7 +2748,15 @@ impl<T: Task> Inner<T> {
     /// Applies the receiver-tree changes `wheel` recorded since the last call.
     // Port of erts/emulator/beam/erl_hl_timer.c:1832 (setup_bif_timer links the timer into
     // `p->bif_timers`) and :1500 (unlink on expiry or cancel), OTP-29.1.1.
+    #[inline]
     fn apply_link_events(&self, wheel: &mut Wheel<T::Message>) {
+        if wheel.has_link_events() {
+            self.drain_link_events(wheel);
+        }
+    }
+
+    #[inline(never)]
+    fn drain_link_events(&self, wheel: &mut Wheel<T::Message>) {
         let worker = wheel.worker();
         // Applying an event can record more (a timer created for a paused receiver is
         // canceled again), so run until the wheel has none.
@@ -3161,10 +3175,15 @@ impl<T: Task> Inner<T> {
     /// Fire receive timeouts that were kept off the wheel while this worker
     /// stayed busy. A reply clears the epoch, so the common `gen_server:call`
     /// path never locks the timer wheel.
+    #[inline]
     fn poll_pending_waits(&self, local: &mut Local<T>, force: bool) {
-        if local.pending_waits.is_empty() {
-            return;
+        if !local.pending_waits.is_empty() {
+            self.poll_pending_waits_due(local, force);
         }
+    }
+
+    #[inline(never)]
+    fn poll_pending_waits_due(&self, local: &mut Local<T>, force: bool) {
         // Port of erts/emulator/beam/erl_process.c:9803 (schedule: a busy scheduler reads the
         // monotonic clock only once check_time_reds reaches ERTS_CHECK_TIME_REDS), OTP-29.1.1.
         if !force && local.check_time_reds < self.config.reductions {
@@ -3212,19 +3231,19 @@ impl<T: Task> Inner<T> {
     fn poll_timers(&self, worker: usize, local: Option<&mut Local<T>>, force: bool) {
         if let Some(local) = local {
             debug_assert_eq!(local.worker_id, worker);
-            {
-                let service = local.timer_service.borrow();
-                if !service.wheel.has_timers()
-                    && service.commands.is_empty()
-                    && service.canceled.is_empty()
-                {
-                    return;
-                }
-            }
             // Port of erts/emulator/beam/erl_process.c:9803-9809 (schedule: one clock read per
             // ERTS_CHECK_TIME_REDS reductions, then the timers are bumped only when the cached
             // monotonic time has reached erts_next_timeout_time), OTP-29.1.1.
             let now = self.scheduler_time(local, force);
+            {
+                let service = local.timer_service.borrow();
+                if service.commands.is_empty()
+                    && service.canceled.is_empty()
+                    && (!service.wheel.has_timers() || service.wheel.quiet_at(now))
+                {
+                    return;
+                }
+            }
             let due = {
                 let mut service = local.timer_service.borrow_mut();
                 let due = if service.wheel.next_timeout().is_some_and(|next| now >= next) {
@@ -3757,7 +3776,7 @@ impl<T: Task> Local<T> {
     fn set_msacc_enabled(&mut self, enabled: bool) {
         if self.msacc_enabled != enabled {
             if self.msacc_enabled {
-                self.set_msacc_state(self.msacc_state);
+                self.switch_msacc_state(self.msacc_state);
                 self.msacc_started = None;
             }
             self.msacc_enabled = enabled;
@@ -3792,10 +3811,15 @@ impl<T: Task> Local<T> {
         }
     }
 
+    #[inline(always)]
     fn set_msacc_state(&mut self, state: MsaccState) {
-        if !self.msacc_enabled {
-            return;
+        if self.msacc_enabled && self.msacc_state != state {
+            self.switch_msacc_state(state);
         }
+    }
+
+    #[inline(never)]
+    fn switch_msacc_state(&mut self, state: MsaccState) {
         let now = Instant::now();
         if let Some(started) = self.msacc_started.replace(now) {
             let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -7371,12 +7395,16 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             continue;
         }
         let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
-        local.set_msacc_enabled(accounting_flags & ACCOUNTING_MSACC != 0);
         let wall_enabled = accounting_flags & ACCOUNTING_WALL != 0;
-        let started_at = (wall_enabled && !local.wall_enabled)
-            .then(|| inner.take_wall_start(id))
-            .flatten();
-        local.set_wall_enabled_at(wall_enabled, started_at);
+        if local.msacc_enabled != (accounting_flags & ACCOUNTING_MSACC != 0)
+            || local.wall_enabled != wall_enabled
+        {
+            local.set_msacc_enabled(accounting_flags & ACCOUNTING_MSACC != 0);
+            let started_at = (wall_enabled && !local.wall_enabled)
+                .then(|| inner.take_wall_start(id))
+                .flatten();
+            local.set_wall_enabled_at(wall_enabled, started_at);
+        }
         local.set_msacc_state(MsaccState::Other);
         let aux_work = inner.take_aux_work(id);
         if aux_work & AUX_WORK_STATS != 0 {
@@ -7533,11 +7561,17 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         // Port of erts/emulator/beam/erl_process.c:9976 (wakeup_other check), OTP-29.1.1.
         wakeup_other_check(&inner, &mut *local);
         // Port execution releases the run queue, so another scheduler can steal a
-        // port while this one is inside erts_port_task_execute.
-        inner.in_schedule[id].store(false, Ordering::Release);
+        // port while this one is inside erts_port_task_execute. Without a queued port
+        // the run queue stays held up to the dequeue below.
+        let mut run_queue_held = true;
+        let port_queued = inner.balance.rqs[id].len(balance::PORT_PRIO_LEVEL) > 0;
+        if port_queued {
+            inner.in_schedule[id].store(false, Ordering::Release);
+            run_queue_held = false;
+        }
         // Port of erts/emulator/beam/erl_process.c:9977-9986 (find a new port to run),
         // OTP-29.1.1.
-        let ran_port = inner.balance.rqs[id].len(balance::PORT_PRIO_LEVEL) > 0 && {
+        let ran_port = port_queued && {
             if !local.profile_active {
                 let count = inner.active_schedulers.fetch_add(1, Ordering::Relaxed) + 1;
                 local.profile_active = true;
@@ -7548,6 +7582,8 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             inner.execute_port(&mut *local)
         };
         if inner.scheduling_blocked.load(Ordering::Acquire) && inner.sim.is_none() {
+            inner.in_schedule[id].store(false, Ordering::Release);
+            run_queue_held = false;
             let pinned = (0..4).find(|&p| !inner.pinned_injectors[id][p].is_empty());
             let normal_prio = match (local.best_priority(), pinned) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -7569,7 +7605,9 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         }
         // Dequeue holds the run queue again so a concurrent steal cannot take the
         // process this scheduler is about to run.
-        inner.in_schedule[id].store(true, Ordering::Release);
+        if !run_queue_held {
+            inner.in_schedule[id].store(true, Ordering::Release);
+        }
         let mut item = None;
         // Port of erts/emulator/beam/erl_process.c:9603 (one run queue per scheduler,
         // FIFO within a priority), OTP-29.1.1: bound processes share their scheduler with
