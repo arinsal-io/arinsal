@@ -28,8 +28,9 @@ pub type ArithResult = Result<Term, ArithError>;
 
 /// Estimate OTP's reduction charge for a bignum arithmetic operation.
 ///
-/// Port of erts/emulator/beam/erl_arith.c:56-85 and erts/emulator/beam/emu/arith_instrs.tab:520,
-/// OTP-29.1.1. `args` must be the operation's original integer operands.
+/// Port of `bump_reds_linear` and `bump_reds_quadratic` in `erl_arith.c`, plus `BUMP_REDS` in
+/// `bif.h` and the bignum arithmetic instruction in `arith_instrs.tab`, OTP-29.1.1. `args` must
+/// be the operation's original integer operands.
 pub fn reduction_charge(operation: &str, args: &[Term]) -> u32 {
     const WORDS_PER_REDUCTION: usize = 16;
     const MAX_REDUCTIONS: usize = 4_000;
@@ -101,8 +102,8 @@ pub fn reduction_charge(operation: &str, args: &[Term]) -> u32 {
         "+" => linear(left_words.max(right_words) + 2),
         "-" if right.as_small() == Some(0) => 0,
         "-" => linear(left_words.max(right_words) + 1),
-        "*" if left.as_small().is_some_and(|n| n.abs() <= 1)
-            || right.as_small().is_some_and(|n| n.abs() <= 1) =>
+        "*" if matches!(left.as_small(), Some(0 | 1))
+            || matches!(right.as_small(), Some(0 | 1)) =>
         {
             0
         }

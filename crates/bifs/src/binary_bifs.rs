@@ -64,13 +64,12 @@ fn bit_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, bitstring_bit_len(args[0])?)
 }
 
-// Port of erts/emulator/beam/binary.c:202-403 (binary_to_list_1/3), OTP-29.1.1.
+// Port of erts/emulator/beam/binary.c (binary_to_list_1/3), OTP-29.1.1.
 fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     with_binary_bytes(args[0], |view| {
         if !view.bit_len().is_multiple_of(8) {
             return Err(BADARG);
         }
-        let input = binary_input(&view)?;
         let size = view.bit_len() / 8;
         let (start, len) = if args.len() == 3 {
             let start = args[1].as_small().ok_or(BADARG)?;
@@ -85,6 +84,9 @@ fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
         if len == 0 {
             return Ok(Term::NIL);
         }
+        let bit_offset = view.start_bit() % 8;
+        let source_start = (view.start_bit() / 8).checked_add(start).ok_or(BADARG)?;
+        validate_binary_to_list_range(view.bytes(), source_start, len, bit_offset)?;
 
         let budget = ctx.reduction_budget();
         let min_reds = 1_000;
@@ -94,17 +96,12 @@ fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
             && size < min_reds * B2L_BYTES_PER_REDUCTION
             && budget <= resched_reds
         {
-            let aligned = match input {
-                Cow::Borrowed(_) => None,
-                Cow::Owned(bytes) => Some(bytes),
-            };
             ctx.defer_trap(DeferredTrap::BinaryToList(BinaryToListWalk {
                 source: args[0],
                 start,
                 remaining: len,
                 total: len,
                 list: None,
-                aligned,
             }));
             return Ok(Term::NIL);
         }
@@ -118,12 +115,17 @@ fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
                 .map_err(|_| BifError::SystemLimit)?
         };
         if one_chunk {
+            // Port of erts/emulator/beam/binary.c (erts_bin_bytes_to_list), OTP-29.1.1.
             let value = reservation
                 .prepend_exact_with_tail(
-                    input[start..start + len]
-                        .iter()
-                        .rev()
-                        .map(|byte| Term::small(i64::from(*byte)).expect("byte fits small")),
+                    (source_start..source_start + len).rev().map(|index| {
+                        Term::small(i64::from(binary_to_list_byte(
+                            view.bytes(),
+                            index,
+                            bit_offset,
+                        )))
+                        .expect("byte fits small")
+                    }),
                     Term::NIL,
                 )
                 .map_err(|_| BifError::SystemLimit)?;
@@ -136,21 +138,17 @@ fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
             remaining: len,
             total: len,
             list: Some(reservation),
-            aligned: None,
         };
         let chunk = len.min(
             budget
                 .saturating_add(1)
                 .saturating_mul(B2L_BYTES_PER_REDUCTION),
         );
-        let (result, used) = walk.step_bytes(input.as_ref(), chunk)?;
+        let (result, used) = walk.step_bytes(view.bytes(), source_start, bit_offset, chunk)?;
         if let Some(result) = result {
             ctx.charge_reductions(used.div_ceil(B2L_BYTES_PER_REDUCTION));
             Ok(result)
         } else {
-            if let Cow::Owned(bytes) = input {
-                walk.aligned = Some(bytes);
-            }
             ctx.charge_reductions(used.div_ceil(B2L_BYTES_PER_REDUCTION));
             ctx.defer_trap(DeferredTrap::BinaryToList(walk));
             Ok(Term::NIL)
@@ -158,17 +156,41 @@ fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
     })?
 }
 
+fn validate_binary_to_list_range(
+    bytes: &[u8],
+    source_start: usize,
+    len: usize,
+    bit_offset: usize,
+) -> Result<(), BifError> {
+    let end = source_start
+        .checked_add(len)
+        .and_then(|end| end.checked_add(usize::from(bit_offset != 0)))
+        .ok_or(BADARG)?;
+    if end > bytes.len() {
+        return Err(BADARG);
+    }
+    Ok(())
+}
+
+// Port of erts/emulator/beam/binary.c (erts_bin_bytes_to_list), OTP-29.1.1.
+fn binary_to_list_byte(bytes: &[u8], index: usize, bit_offset: usize) -> u8 {
+    if bit_offset == 0 {
+        bytes[index]
+    } else {
+        (bytes[index] << bit_offset) | (bytes[index + 1] >> (8 - bit_offset))
+    }
+}
+
 const B2L_BYTES_PER_REDUCTION: usize = 256;
 
 /// Resumable fill of one HAlloc reservation, as in `ErtsB2LState`.
-// Port of erts/emulator/beam/binary.c:182-239, OTP-29.1.1.
+// Port of erts/emulator/beam/binary.c (binary_to_list_chunk), OTP-29.1.1.
 pub struct BinaryToListWalk {
     source: Term,
     start: usize,
     remaining: usize,
     total: usize,
     list: Option<ConsListBuilder>,
-    aligned: Option<Vec<u8>>,
 }
 
 impl BinaryToListWalk {
@@ -191,24 +213,32 @@ impl BinaryToListWalk {
                     .map_err(|_| BifError::SystemLimit)?,
             );
         }
-        if let Some(bytes) = self.aligned.take() {
-            let result = self.step_bytes(&bytes, max_bytes);
-            self.aligned = Some(bytes);
-            return result;
-        }
-        with_binary_input(self.source, |bytes| self.step_bytes(bytes, max_bytes))
+        with_binary_bytes(self.source, |view| {
+            if !view.bit_len().is_multiple_of(8) {
+                return Err(BADARG);
+            }
+            let bit_offset = view.start_bit() % 8;
+            let source_start = (view.start_bit() / 8)
+                .checked_add(self.start)
+                .ok_or(BADARG)?;
+            validate_binary_to_list_range(view.bytes(), source_start, self.remaining, bit_offset)?;
+            self.step_bytes(view.bytes(), source_start, bit_offset, max_bytes)
+        })?
     }
 
     fn step_bytes(
         &mut self,
         bytes: &[u8],
+        source_start: usize,
+        bit_offset: usize,
         max_bytes: usize,
     ) -> Result<(Option<Term>, usize), BifError> {
         let count = self.remaining.min(max_bytes);
-        let from = self.start + self.remaining - count;
+        let from = source_start + self.remaining - count;
         let list = self.list.as_mut().ok_or(BifError::SystemLimit)?;
-        for byte in bytes[from..from + count].iter().rev() {
-            list.prepend(Term::small(i64::from(*byte)).expect("byte fits small integer"))
+        for index in (from..from + count).rev() {
+            let byte = binary_to_list_byte(bytes, index, bit_offset);
+            list.prepend(Term::small(i64::from(byte)).expect("byte fits small integer"))
                 .map_err(|_| BifError::SystemLimit)?;
         }
         self.remaining -= count;
