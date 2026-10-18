@@ -1701,11 +1701,12 @@ impl Vm {
         }
     }
 
-    /// Drain the ingress and report whether `wait` / `wait_timeout` may block.
+    /// Report whether `wait` / `wait_timeout` may block: nothing waits in the middle queue, the
+    /// outer queue or the message queue past the save pointer.
     ///
     /// A scheduling quantum can expire on the wait instruction after `loop_rec`
-    /// has already observed an empty mailbox. The next slice drains before that
-    /// instruction runs, which would otherwise sleep with the message queued.
+    /// has already observed an empty mailbox. Signals that arrived since send the
+    /// process back to `loop_rec`, which fetches them, instead of sleeping with them queued.
     pub(crate) fn mailbox_ready_to_wait(
         process: &mut Process,
         ctx: &mut Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
@@ -1714,10 +1715,10 @@ impl Vm {
             .as_deref_mut()
             .ok_or_else(|| VmError::Unsupported("receive requires a scheduler".into()))?;
         // erts reaches `wait` from `loop_rec` with the message queue lock held: nothing can
-        // arrive in between. Here signals that arrived since (or are left in the middle queue)
-        // send the process back to `loop_rec`, whose receive helper handles them.
-        process.fetch_signals(ctx)?;
-        if !process.sig_cont_empty() {
+        // arrive in between, and `wait` does not fetch. Here signals that arrived since (or are
+        // left in the middle queue) send the process back to `loop_rec`, whose receive helper
+        // fetches and handles them.
+        if ctx.has_pending_input() || !process.sig_cont_empty() {
             return Ok(false);
         }
         Ok(process.receive_cursor >= process.inbox.len())

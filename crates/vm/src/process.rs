@@ -1696,7 +1696,7 @@ impl Executor {
                             let consumed = fcalls_before.saturating_sub(process.reductions);
                             ctx.consume(u32::try_from(consumed).unwrap_or(0));
                             // Native `timeout` has no scheduler context to send its trace event.
-                            if process.native_exit_pending
+                            if process.native_exit_kind != crate::proc_create::NativeExit::None
                                 && process.cold.as_mut().is_some_and(|cold| {
                                     std::mem::take(&mut cold.native_timeout_trace)
                                 })
@@ -1750,10 +1750,9 @@ impl Executor {
                         match outcome {
                             arinsal_beamasm::ExitReason::Yield => {
                                 crate::beamasm_integration::count_native_yield();
-                                if process.native_exit_pending {
-                                    if process.cold.as_mut().is_some_and(|cold| {
-                                        std::mem::take(&mut cold.native_reserve_fetch)
-                                    }) {
+                                let exit_kind = std::mem::take(&mut process.native_exit_kind);
+                                if exit_kind != crate::proc_create::NativeExit::None {
+                                    if exit_kind == crate::proc_create::NativeExit::ReserveFetch {
                                         // Native `recv_marker_reserve` needs the outer queue
                                         // fetched first. Port of erts/emulator/beam/
                                         // erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert),
@@ -1770,9 +1769,7 @@ impl Executor {
                                         reenter = true;
                                         continue;
                                     }
-                                    if process.cold.as_mut().is_some_and(|cold| {
-                                        std::mem::take(&mut cold.native_signal_fetch)
-                                    }) {
+                                    if exit_kind == crate::proc_create::NativeExit::SignalFetch {
                                         // Native `loop_rec` reached the end of the message queue
                                         // with signals to fetch or handle. Port of
                                         // erts/emulator/beam/jit/arm/instr_msg.cpp:84-104
@@ -1795,10 +1792,11 @@ impl Executor {
                                             process.reductions_used.saturating_add(u64::from(used));
                                         continue;
                                     }
-                                    if let Some(timeout_ms) = process
-                                        .cold
-                                        .as_mut()
-                                        .and_then(|cold| cold.native_wait.take())
+                                    if exit_kind == crate::proc_create::NativeExit::Wait
+                                        && let Some(timeout_ms) = process
+                                            .cold
+                                            .as_mut()
+                                            .and_then(|cold| cold.native_wait.take())
                                     {
                                         // A native receive found no matching message. Like the
                                         // interpreter's `wait`, sleep only if nothing arrived since the
@@ -1823,7 +1821,6 @@ impl Executor {
                                         }
                                         break Ok(RunState::Wait { timeout_ms });
                                     }
-                                    process.native_exit_pending = false;
                                 }
                                 // A native `i_yield` is a scheduler boundary even when the
                                 // interpreter left a deferred yield request in the process.

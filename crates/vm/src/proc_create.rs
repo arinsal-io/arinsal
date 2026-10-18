@@ -2,6 +2,23 @@
 
 use super::*;
 
+/// Why native code left for the scheduler. One byte of the process, set by the helper that
+/// requests the exit, so the exit path is one load and one match.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum NativeExit {
+    #[default]
+    None,
+    /// A traced `timeout` left its event for the scheduler (`ColdState::native_timeout_trace`).
+    TimeoutTrace,
+    /// `recv_marker_reserve` needs the outer signal queue fetched first.
+    ReserveFetch,
+    /// `loop_rec` reached the end of the message queue with signals to fetch or handle.
+    SignalFetch,
+    /// `wait` or `wait_timeout` (`ColdState::native_wait`).
+    Wait,
+}
+
 #[derive(Default)]
 pub(crate) struct ProcessStats {
     pub(crate) instructions: u64,
@@ -423,10 +440,9 @@ pub struct Process {
     pub(crate) native_arity_set: bool,
     /// Pc of the native instruction that raised the exception being dispatched (0 if none).
     pub(crate) native_error_pc: usize,
-    /// Native code left a request for the scheduler in the cold state (`native_wait`,
-    /// `native_signal_fetch`, `native_reserve_fetch`, `native_timeout_trace`). Clear means none
-    /// is pending, so an ordinary yield reads this one byte instead of four cold fields.
-    pub(crate) native_exit_pending: bool,
+    /// The request native code left for the scheduler. `None` means no request is pending, so
+    /// an ordinary yield reads this one byte instead of cold fields.
+    pub(crate) native_exit_kind: NativeExit,
 }
 // SAFETY: ProcessHeader pointers refer only to this process's stable heap/code allocations.
 // The scheduler transfers exclusive ownership of each Process between workers.
@@ -976,10 +992,6 @@ pub(crate) struct ProcessCold {
     pub(crate) native_wait_timeout: Option<u64>,
     /// The pending native wait belongs to a receive without clauses.
     pub(crate) native_wait_self: bool,
-    /// Native `loop_rec` scheduled out so the scheduler fetches the outer signal queue.
-    pub(crate) native_signal_fetch: bool,
-    /// Native `recv_marker_reserve` exited for the scheduler to fetch the outer signal queue.
-    pub(crate) native_reserve_fetch: bool,
     /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
     pub(crate) signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
     /// The last slice ended because the process is suspended, not because it waits in a
@@ -1606,7 +1618,7 @@ impl Process {
             native_continuation_resume: false,
             native_arity_set: false,
             native_error_pc: 0,
-            native_exit_pending: false,
+            native_exit_kind: NativeExit::None,
         };
         process.sync_header();
         #[cfg(feature = "pf-mem-counters")]
