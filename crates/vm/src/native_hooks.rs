@@ -259,6 +259,7 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     }
     let left = from_raw(lhs);
     let right = from_raw(rhs);
+    let mut guard_add_reductions = 0;
     let operation = match op {
         0 => Some(("+", &[left, right][..])),
         1 => Some(("-", &[left, right][..])),
@@ -337,6 +338,12 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
             // Port of erts/emulator/beam/erl_arith.c:919 (erts_mul_add), OTP-29.1.1.
             13 => {
                 let product = arinsal_arith::mul(a, b, heap)?;
+                if quiet {
+                    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp, OTP-29.1.1.
+                    // The guard helper calls mixed_times then mixed_plus; charge both BUMP_REDS.
+                    guard_add_reductions =
+                        arinsal_arith::reduction_charge("+", &[product, from_raw(extra)]);
+                }
                 arinsal_arith::add(product, from_raw(extra), heap)
             }
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:802-854 (erts_int_div_rem
@@ -352,6 +359,12 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
         .map(raw),
         _ => Err(ArithError::Badarith),
     };
+    if guard_add_reductions != 0 {
+        process.reductions = process
+            .reductions
+            .saturating_sub(guard_add_reductions.min(i32::MAX as u32) as i32)
+            .max(0);
+    }
     let answer = match result {
         Ok(value) => value,
         Err(error) => {
