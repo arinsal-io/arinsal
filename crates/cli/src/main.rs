@@ -7,11 +7,16 @@ mod disasm;
 mod eval;
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--child-setup") {
+        arinsal_vm::run_child_setup();
+    }
+    if args.first().is_some_and(|arg| arg == "--child-setup-exec") {
+        arinsal_vm::run_child_setup_exec();
+    }
     arinsal_vm::install_crash_dump();
     arinsal_nif::ensure_exports();
-    let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("--port-exec-config") if args.len() == 2 => port_exec_config(&args[1]),
         Some("--version") => println!("arinsal {}", env!("CARGO_PKG_VERSION")),
         Some("beam-info") => {
             let code = args.iter().any(|arg| arg == "--code");
@@ -55,112 +60,6 @@ fn main() {
         }
         _ if args.first().is_some_and(|arg| arg == "erl") => erl_launch(&args[1..]),
         _ => erl_launch(&args),
-    }
-}
-
-// Port of erts/emulator/sys/unix/erl_child_setup.c:220-363, OTP-29.1.1.
-fn port_exec_config(path: &str) -> ! {
-    use std::io;
-    use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    fn take_u32(bytes: &[u8], offset: &mut usize) -> io::Result<usize> {
-        let end = offset
-            .checked_add(4)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short port config"))?;
-        let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap()) as usize;
-        *offset = end;
-        Ok(value)
-    }
-
-    fn take_bytes(bytes: &[u8], offset: &mut usize) -> io::Result<std::ffi::OsString> {
-        let len = take_u32(bytes, offset)?;
-        let end = offset
-            .checked_add(len)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short port config"))?;
-        let value = bytes[*offset..end].to_vec();
-        *offset = end;
-        Ok(std::ffi::OsString::from_vec(value))
-    }
-
-    fn take_optional_bytes(
-        bytes: &[u8],
-        offset: &mut usize,
-    ) -> io::Result<Option<std::ffi::OsString>> {
-        let present = *bytes
-            .get(*offset)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short port config"))?;
-        *offset += 1;
-        match present {
-            0 => Ok(None),
-            1 => take_bytes(bytes, offset).map(Some),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid optional port config field",
-            )),
-        }
-    }
-
-    let result = (|| -> io::Result<Command> {
-        let bytes = std::fs::read(path)?;
-        if !bytes.starts_with(b"ARPC\x01") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid port config header",
-            ));
-        }
-        let mut offset = 5;
-        let program = take_bytes(&bytes, &mut offset)?;
-        let arg0 = take_optional_bytes(&bytes, &mut offset)?;
-        let cwd = take_optional_bytes(&bytes, &mut offset)?;
-        let arg_count = take_u32(&bytes, &mut offset)?;
-        let mut args = Vec::with_capacity(arg_count);
-        for _ in 0..arg_count {
-            args.push(take_bytes(&bytes, &mut offset)?);
-        }
-        let env_count = take_u32(&bytes, &mut offset)?;
-        let mut env = Vec::with_capacity(env_count);
-        for _ in 0..env_count {
-            env.push((
-                take_bytes(&bytes, &mut offset)?,
-                take_bytes(&bytes, &mut offset)?,
-            ));
-        }
-        if offset != bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "trailing port config bytes",
-            ));
-        }
-        let _ = std::fs::remove_file(path);
-        let mut command = Command::new(program);
-        command.args(args).env_clear().envs(env);
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
-        }
-        if let Some(arg0) = arg0 {
-            command.arg0(arg0);
-        }
-        Ok(command)
-    })();
-
-    match result {
-        Ok(mut command) => {
-            let error = command.exec();
-            eprintln!("arinsal port child: {error}");
-            std::process::exit(if error.kind() == io::ErrorKind::NotFound {
-                127
-            } else {
-                126
-            });
-        }
-        Err(error) => {
-            eprintln!("arinsal port child: {error}");
-            std::process::exit(126);
-        }
     }
 }
 
