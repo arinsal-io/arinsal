@@ -486,9 +486,10 @@ pub struct Event<M> {
 
 /// A message envelope as the signal queue sees it.
 pub trait SignalMessage: Send + 'static {
-    /// A priority message: erts sends it as an `ERTS_SIG_Q_OP_ALTACT_MSG` non-message
-    /// signal (erl_proc_sig_queue.c:6888, handle_altact_msg), OTP-29.1.1.
-    fn is_priority(&self) -> bool {
+    /// A priority message or a message sent through an alias: erts sends it as an
+    /// `ERTS_SIG_Q_OP_ALTACT_MSG` non-message signal (erl_proc_sig_queue.c, handle_altact_msg),
+    /// OTP-29.1.1.
+    fn is_altact_msg(&self) -> bool {
         false
     }
     /// The Erlang reference key of a BIF timer message: the timer is created with the key as its
@@ -509,7 +510,7 @@ impl<M: SignalMessage> InSignal for Event<M> {
     fn is_message(&self) -> bool {
         match &self.payload {
             Payload::Message(message) | Payload::TimerMessage { message, .. } => {
-                !message.is_priority()
+                !message.is_altact_msg()
             }
             Payload::Timer { .. } => true,
             Payload::Signal(_) => false,
@@ -6229,7 +6230,7 @@ mod in_signal_tests {
 
     struct Envelope(bool);
     impl SignalMessage for Envelope {
-        fn is_priority(&self) -> bool {
+        fn is_altact_msg(&self) -> bool {
             self.0
         }
     }
