@@ -773,21 +773,32 @@ fn process_info_aux(
                 .as_ref()
                 .is_some_and(|runtime| runtime.is_hibernating(pid)) =>
         {
-            // elixir_loop1: OTP reports hibernate/0 while the stack is retained.
-            let arity = process
+            // Port of erts/emulator/beam/erl_bif_info.c (`current_function`) and
+            // beam_common.c (`erts_hibernate`), OTP-29.1.1: hibernate/3 parks at its export
+            // entry; i_hibernate/0 keeps the process's current function.
+            let current = process
                 .cold
                 .as_ref()
                 .and_then(|cold| cold.hibernate.as_ref())
-                .map(|cont| if cont.resume_in_place { 0 } else { 3 })
-                .unwrap_or(3);
-            make_tuple(
-                process,
-                &[
-                    atom("erlang"),
-                    atom("hibernate"),
-                    Term::small(arity).unwrap(),
-                ],
-            )?
+                .and_then(|cont| {
+                    if cont.resume_in_place {
+                        cont.current_mfa.clone()
+                    } else {
+                        Some(("erlang".to_owned(), "hibernate".to_owned(), 3))
+                    }
+                });
+            if let Some((module, function, arity)) = current {
+                make_tuple(
+                    process,
+                    &[
+                        Term::atom(global_atoms().intern(&module).map_err(|_| badarg())?),
+                        atom(&function),
+                        Term::small(i64::from(arity)).ok_or_else(badarg)?,
+                    ],
+                )?
+            } else {
+                process_info_item_current_function(vm, process)?
+            }
         }
         arinsal_term::atoms::INITIAL_CALL => match src.read(process).initial_mfa {
             // Port of erts/emulator/beam/erl_bif_info.c:2027 (ERTS_PI_IX_INITIAL_CALL), OTP-29.1.1:
@@ -2868,7 +2879,7 @@ fn call_values(
             ("hibernate", [module, function, args]) => {
                 hibernate(process, ctx, *module, *function, *args)
             }
-            ("hibernate", []) if module == "erlang" => hibernate_zero(process, ctx),
+            ("hibernate", []) if module == "erlang" => hibernate_zero(vm, process, ctx),
             ("suspend_process", [pid, options]) if module == "erts_internal" => {
                 suspend_process(process, ctx, *pid, *options)
             }
@@ -3163,6 +3174,7 @@ fn hibernate(
     process.cold_mut().hibernate = Some(crate::process::HibernateCont {
         stop: true,
         resume_in_place: false, // elixir_loop1
+        current_mfa: None,
     });
     runtime.mark_hibernating(ctx.pid(), true);
     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
@@ -3171,7 +3183,11 @@ fn hibernate(
 }
 
 // OTP-29.1.1 `erts/emulator/beam/ops.tab` lowers `hibernate/0` to `i_hibernate`.
-fn hibernate_zero(process: &mut Process, ctx: &RunCtx<'_, Message>) -> Result<Term, VmError> {
+fn hibernate_zero(
+    vm: &Vm,
+    process: &mut Process,
+    ctx: &RunCtx<'_, Message>,
+) -> Result<Term, VmError> {
     let runtime = process
         .runtime
         .clone()
@@ -3186,9 +3202,13 @@ fn hibernate_zero(process: &mut Process, ctx: &RunCtx<'_, Message>) -> Result<Te
         process.cold_mut().hibernate = None;
         return Ok(atom("ok"));
     }
+    // `i_hibernate/0` retains the current MFA. Capture it before the scheduler hands the process
+    // off, since the interpreter IP may then describe the process entry trampoline.
+    let current_mfa = resolve_mfa(Some(vm), process)?;
     process.cold_mut().hibernate = Some(crate::process::HibernateCont {
         stop: true,
         resume_in_place: true,
+        current_mfa: Some(current_mfa),
     });
     runtime.mark_hibernating(pid, true);
     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.

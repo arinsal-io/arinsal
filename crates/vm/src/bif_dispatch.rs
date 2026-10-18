@@ -172,6 +172,7 @@ impl Vm {
             meter.finish(p, ctx.as_deref_mut(), result.reductions());
             return match result {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
+                    let value = p.gc_after_bif(value)?;
                     p.write(dst, value)?;
                     p.ip += 1;
                     Ok(BifOpOutcome::Done(0))

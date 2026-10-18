@@ -1271,6 +1271,9 @@ pub(crate) struct HibernateCont {
     pub stop: bool,
     /// elixir_loop1: `hibernate/0` resumes at its call site with the stack intact.
     pub resume_in_place: bool,
+    /// `Process.current` survives `i_hibernate/0` in erts; retain that MFA across the scheduler
+    /// handoff because Arinsal's interpreter position can point at its spawn trampoline.
+    pub current_mfa: Option<(String, String, u8)>,
 }
 
 /// `max_heap_size` flag. Size 0 disables the check, matching `MAX_HEAP_SIZE_GET`.
@@ -1547,13 +1550,14 @@ impl Executor {
                     let Some(bif) = arinsal_bifs::lookup(&module, &function, arity) else {
                         // A BIF implemented by a VM native (process-aware BIFs such as
                         // erlang:node/1 or register/2) runs through the native table.
+                        let resolved = crate::natives::classify(&module, &function, arity, true);
                         match self.vm.dispatch_native(
                             process,
                             ctx,
                             &module,
                             &function,
                             usize::from(arity),
-                            (arinsal_loader::ImportClass::Dynamic, 0),
+                            resolved,
                         ) {
                             Some(Ok(value)) => break 'execution Ok(RunState::Done(value)),
                             Some(Err(error)) => break 'execution Err(error),
@@ -2891,8 +2895,7 @@ impl Executor {
                                                     value,
                                                     ..
                                                 }) => {
-                                                    process.x[0] = value;
-                                                    process.collect_bin_vheap_if_due(1)?;
+                                                    process.x[0] = process.gc_after_bif(value)?;
                                                     Some(Ok(process.x[0]))
                                                 }
                                                 Ok(crate::bif_traps::HandlerResult::Failed {
@@ -4681,8 +4684,10 @@ impl Process {
                 },
             };
             match payload {
-                Payload::Signal(Signal::Monitor { reference, shared }) => {
-                    self.insert_target_monitor(reference, from, shared);
+                Payload::Signal(Signal::Monitor { reference, .. }) => {
+                    // Port of erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
+                    // OTP-29.1.1: a monitor arriving after exit has begun is answered as noproc.
+                    let _ = ctx.signal(from, Signal::MonitorNoproc(reference));
                 }
                 Payload::Signal(Signal::Demonitor(reference)) => {
                     if let Some(cold) = self.cold.as_mut() {
@@ -6050,12 +6055,19 @@ impl Process {
                 0
             }
             arinsal_sched::Signal::Unlink(id) => {
-                // Port of erl_proc_sig_queue.c:6693-6713: removing the link costs 4.
+                // Port of erl_proc_sig_queue.c:6693-6713: a pending local unlink keeps its
+                // link record until the matching acknowledgement is handled.
                 let removed = self.cold.as_mut().is_some_and(|cold| {
-                    cold.prio_links.remove(&from);
-                    cold.links.remove(&from)
+                    if cold.unlinking.values().any(|&target| target == from) {
+                        false
+                    } else {
+                        cold.prio_links.remove(&from);
+                        cold.links.remove(&from)
+                    }
                 });
-                self.trace_getting_unlinked(ctx, from);
+                if removed {
+                    self.trace_getting_unlinked(ctx, from);
+                }
                 let _ = ctx.signal(from, arinsal_sched::Signal::UnlinkAckSignal(id));
                 if removed { 4 } else { 0 }
             }
@@ -6769,6 +6781,43 @@ impl Process {
             } else {
                 (Vec::new(), Vec::new())
             };
+        if self.max_heap_limited() {
+            if hibernate {
+                self.heap.request_full_sweep();
+            }
+            let limit = self
+                .cold
+                .as_ref()
+                .expect("limited heap has cold data")
+                .max_heap;
+            let binary_words = (if limit.include_shared_binaries {
+                off_heap_binary_words(self)
+            } else {
+                0
+            }) as u64;
+            let checks = match self.heap.max_heap_collection_checks(min_free, &moved) {
+                Ok(checks) => checks,
+                Err(error) => {
+                    if !moved_indices.is_empty() {
+                        self.inbox.restore_moved_messages(&moved_indices, moved);
+                    }
+                    return Err(VmError::Unsupported(format!("process GC: {error:?}")));
+                }
+            };
+            let exceeded = [Some(checks.0), checks.1]
+                .into_iter()
+                .flatten()
+                .find(|&size| (size as u64).saturating_add(binary_words) > limit.size);
+            if let Some(size) = exceeded {
+                self.max_heap_peak = self.max_heap_peak.max(size);
+                if limit.kill {
+                    if !moved_indices.is_empty() {
+                        self.inbox.restore_moved_messages(&moved_indices, moved);
+                    }
+                    return Err(VmError::Unsupported("max_heap_size".into()));
+                }
+            }
+        }
         let stats = if hibernate {
             self.heap
                 .collect_hibernate(&mut self.x[..live_x], &mut roots)
@@ -7791,7 +7840,7 @@ impl Process {
             self.cold_mut().profile_active = false;
         }
         // g_proc_sched. Port of erts/emulator/beam/erl_gc.c:1197 (max_heap_size kill), OTP-29.1.1.
-        if result.is_ok() && heap_limit_kills(self, ctx) {
+        if heap_limit_kills(self, ctx) {
             let entry_result = self
                 .entry
                 .then(|| Err(VmError::Unsupported("max_heap_size".into())));

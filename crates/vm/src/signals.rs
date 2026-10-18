@@ -988,12 +988,15 @@ pub(crate) fn erl_create_process(
     child.module = crate::process::RUN_PROCESS;
     child.ip = 0;
     child.initial_mfa = Some((m, f, args_list.len() as u8));
-    if let Ok(arity) = u8::try_from(args_list.len())
+    let initial_bif = if let Ok(arity) = u8::try_from(args_list.len())
         && is_bif_export(m, f, arity)
         && let (Some(m_name), Some(f_name)) = (atom_name(module), atom_name(function))
     {
-        child.cold_mut().initial_bif = Some((m_name, f_name, arity));
-    }
+        Some((m_name, f_name, arity))
+    } else {
+        None
+    };
+    child.cold_mut().initial_bif = initial_bif.clone();
     child.group_leader = Some(parent.group_leader_pid(ctx.pid()));
     child.parent = Some(ctx.pid());
     // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: `args` is copied
@@ -1003,9 +1006,16 @@ pub(crate) fn erl_create_process(
         arinsal_term::copy_term_litopt(args, &mut heap, &literals)
             .map_err(|error| VmError::Unsupported(format!("spawn arguments: {error:?}")))?
     };
-    child.x[0] = module;
-    child.x[1] = function;
-    child.x[2] = copied_args;
+    if let Some((_, _, arity)) = initial_bif {
+        let copied_args = list(copied_args)
+            .filter(|copied| copied.len() == usize::from(arity))
+            .ok_or_else(|| VmError::Unsupported("spawned BIF argument list".into()))?;
+        child.x[..usize::from(arity)].copy_from_slice(&copied_args);
+    } else {
+        child.x[0] = module;
+        child.x[1] = function;
+        child.x[2] = copied_args;
+    }
     // The link and monitor must be on the child before enqueue. Another scheduler can run
     // `code_server`'s on_load fun to `exit/1` before a Monitor signal sent after `spawn` is
     // delivered, and the DOWN is then lost. Port of erts/emulator/beam/erl_process.c
@@ -2127,6 +2137,10 @@ pub(crate) fn unlink_light(
     let pid = Pid::from_term(*target)?;
     let me = process.self_pid?;
     let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
+    let cold = process.cold.as_deref()?;
+    if !cold.links.contains(&pid) || cold.unlinking.values().any(|&target| target == pid) {
+        return Some(Ok(atom("true")));
+    }
     let id = rt.next_ref();
     process.cold_mut().unlinking.insert(id, pid);
     let _ = rt
@@ -2164,7 +2178,9 @@ pub(crate) fn link_light(
         .ok()?
         .signal_ordered(me, pid, arinsal_sched::Signal::Link)
         .ok()?;
-    process.cold_mut().links.insert(pid);
+    let cold = process.cold_mut();
+    cold.unlinking.retain(|_, target| *target != pid);
+    cold.links.insert(pid);
     process.cold_mut().prio_links.remove(&pid);
     Some(Ok(atom("true")))
 }
@@ -2550,11 +2566,6 @@ fn call_resolved(
         (SignalBif::Unlink1, [pid]) => {
             let pid = Pid::from_term(*pid).ok_or_else(|| badarg("unlink/1"));
             pid.map(|pid| {
-                let id = process
-                    .runtime
-                    .as_ref()
-                    .map_or(1, |runtime| runtime.next_ref());
-                process.cold_mut().unlinking.insert(id, pid);
                 if let Some(pid_term) = pid.to_term() {
                     crate::trace::emit(
                         Some(vm),
@@ -2566,7 +2577,18 @@ fn call_resolved(
                         &[pid_term],
                     );
                 }
-                let _ = ctx.signal(pid, Signal::Unlink(id));
+                let should_unlink = process.cold.as_deref().is_some_and(|cold| {
+                    cold.links.contains(&pid)
+                        && !cold.unlinking.values().any(|&target| target == pid)
+                });
+                if should_unlink {
+                    let id = process
+                        .runtime
+                        .as_ref()
+                        .map_or(1, |runtime| runtime.next_ref());
+                    process.cold_mut().unlinking.insert(id, pid);
+                    let _ = ctx.signal(pid, Signal::Unlink(id));
+                }
                 wake_for_procs_trace(process, ctx, pid);
                 atom("true")
             })
@@ -2600,7 +2622,7 @@ fn call_resolved(
             let ref_term = reference(process, id)?;
             // Port of erts/emulator/beam/bif.c:782-784 (monitor), OTP-29.1.1.
             // Monitoring oneself creates no monitor and sends no signal.
-            if name.is_none() && pid == Some(ctx.pid()) {
+            if pid == Some(ctx.pid()) {
                 return Ok(ref_term);
             }
             // The default `DOWN` tag without a name is the shared default data: no allocation.
@@ -3876,7 +3898,9 @@ fn link_opt(
         return link_noproc(process, pid, priority);
     }
     crate::trace::linked(process, ctx.pid(), pid);
-    process.cold_mut().links.insert(pid);
+    let cold = process.cold_mut();
+    cold.unlinking.retain(|_, target| *target != pid);
+    cold.links.insert(pid);
     if priority {
         process.cold_mut().prio_links.insert(pid);
     } else {

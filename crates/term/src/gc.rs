@@ -1540,6 +1540,83 @@ impl ProcessHeap {
         Ok(stats)
     }
 
+    /// Return the heap-size checks OTP performs before this collection can proceed.
+    ///
+    /// The first value is the minor-collection check. The optional second value is
+    /// the major-collection check when the minor collection would fall back.
+    // Port of erts/emulator/beam/erl_gc.c:1441-1455 (`minor_collection`) and
+    // erts/emulator/beam/erl_gc.c:1875-1904 (`major_collection`), OTP-29.1.1.
+    pub fn max_heap_collection_checks(
+        &self,
+        min_free: usize,
+        messages: &[(Term, Option<ProcessHeap>)],
+    ) -> Result<(usize, Option<usize>), TermError> {
+        let message_words = messages
+            .iter()
+            .filter_map(|(_, heap)| heap.as_ref())
+            .map(ProcessHeap::message_data_size)
+            .fold(0usize, usize::saturating_add);
+        let source_words = self
+            .young_gen_usage()
+            .checked_add(message_words)
+            .ok_or(TermError::SystemLimit)?;
+        let young_free = self.stop.saturating_sub(self.htop);
+        if self.collection_is_major() {
+            return Ok((self.major_max_heap_size(source_words)?, None));
+        }
+
+        let mature_words = self.mature_words();
+        let old_heap_capacity = if self.old_words.is_empty() && mature_words != 0 {
+            next_heap_size(source_words, 1, 0)?
+        } else {
+            self.old_words.len()
+        };
+        let need = min_free
+            .checked_add(S_RESERVED)
+            .ok_or(TermError::SystemLimit)?;
+        let young_capacity = next_heap_size(
+            young_free
+                .checked_add(source_words.max(need))
+                .ok_or(TermError::SystemLimit)?,
+            0,
+            self.min_heap_size as usize,
+        )?;
+        let minor_size = source_words
+            .checked_add(young_free)
+            .and_then(|size| size.checked_add(old_heap_capacity))
+            .and_then(|size| size.checked_add(young_capacity))
+            .ok_or(TermError::SystemLimit)?;
+        let major_size = self
+            .minor_falls_back_to_major()
+            .then(|| self.major_max_heap_size(source_words))
+            .transpose()?;
+        Ok((minor_size, major_size))
+    }
+
+    fn major_max_heap_size(&self, source_words: usize) -> Result<usize, TermError> {
+        let size_before = source_words
+            .checked_add(self.old_htop)
+            .ok_or(TermError::SystemLimit)?;
+        let capacity = next_heap_size(
+            self.stack_words()
+                .checked_add(size_before)
+                .and_then(|size| size.checked_add(S_RESERVED))
+                .ok_or(TermError::SystemLimit)?,
+            0,
+            self.min_heap_size as usize,
+        )?;
+        let capacity = if capacity == self.heap_size_words() && self.heap_grow {
+            next_heap_size(capacity, 1, self.min_heap_size as usize)?
+        } else {
+            capacity
+        };
+        size_before
+            .checked_add(self.old_words.len().saturating_sub(self.old_htop))
+            .and_then(|size| size.checked_add(self.stop.saturating_sub(self.htop)))
+            .and_then(|size| size.checked_add(capacity))
+            .ok_or(TermError::SystemLimit)
+    }
+
     /// Full sweep that leaves the young heap exactly as large as the live data,
     /// the stack, and `S_RESERVED`, with no old heap.
     // Port of erts/emulator/beam/erl_gc.c:1004 (garbage_collect_hibernate), OTP-29.1.1.

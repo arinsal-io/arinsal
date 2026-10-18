@@ -743,6 +743,12 @@ impl Process {
             self.timeout();
             return Err(timeout_value());
         }
+        if ms > u32::MAX as i64 {
+            // Port of erts/emulator/beam/erl_hl_timer.c:2799-2804
+            // (erts_set_proc_timer_term), OTP-29.1.1.
+            self.timeout();
+            return Err(timeout_value());
+        }
         if let Some(runtime) = self.runtime.as_ref()
             && runtime.simulated
         {
