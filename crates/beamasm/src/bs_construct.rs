@@ -80,15 +80,11 @@ impl BeamModuleAssembler {
             for (index, arg) in args.iter().copied().enumerate() {
                 e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
             }
-            e.mov_const(Gpr::x(17), helper as u64)?;
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
-            e.blr(Gpr::x(17))
+            Ok(())
         })?;
+        self.fragment_call(helper)?;
         crate::emit_leave_runtime(&mut self.code, live, update)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
-            e.ldr_uoff(Gpr::x(9), C_P, 40)
-        })?;
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
         self.error_if_nonzero(Gpr::x(9))?;
         Ok(())
     }
@@ -192,24 +188,18 @@ impl BeamModuleAssembler {
             e.mov_const(Gpr::x(1), segments.len() as u64)?;
             // Bit 32 marks a guard with a fail label: no error_info is kept for it.
             e.mov_const(Gpr::x(2), u64::from(live) | (u64::from(fail != 0) << 32))?;
-            e.mov_const(Gpr::x(3), u64::from(alloc))?;
-            e.mov_const(Gpr::x(17), helper as usize as u64)?;
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
-            e.blr(Gpr::x(17))
+            e.mov_const(Gpr::x(3), u64::from(alloc))
         })?;
+        self.fragment_call(helper as usize)?;
         crate::emit_leave_runtime(&mut self.code, 6, update)?;
         let ok = self.code.new_label();
         let failed = self.code.new_label();
         self.code.cbz(Gpr::x(0), failed)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(30), C_P, 72))?;
         self.code.b(ok)?;
         self.code.bind(failed)?;
-        // The error position is this instruction (the shared error path reads LR).
-        self.code.adr(Gpr::x(30), failed)?;
         if fail != 0 {
             let label = self.label(fail);
             self.code.emit(|e| e.str_uoff(Gpr::xzr(), C_P, 40))?;
-            self.code.emit(|e| e.ldr_uoff(Gpr::x(30), C_P, 72))?;
             self.code.b(label)?;
         } else {
             self.branch_error()?;
