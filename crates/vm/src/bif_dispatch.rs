@@ -12,11 +12,12 @@ impl Vm {
         arity: usize,
         resolved: (ImportClass, usize),
     ) -> Option<Result<Term, VmError>> {
-        if arity > p.x.len() {
+        if arity > crate::proc_create::ATTACHED_X_REGS {
             return Some(Err(VmError::Unsupported(format!(
                 "native arity {arity} exceeds register file"
             ))));
         }
+        p.x.ensure_x(arity);
         let mut result = self.dispatch_native_source(
             p,
             ctx,

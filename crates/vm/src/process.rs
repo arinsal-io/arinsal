@@ -1676,10 +1676,8 @@ impl Executor {
                             .as_mut()
                             .and_then(|cold| cold.native_retry.take());
                         let outcome = if let Some(target_pc) = retry {
-                            if let Some(call_arity) = process
-                                .cold
-                                .as_mut()
-                                .and_then(|cold| cold.native_retry_arity.take())
+                            if let Some(call_arity) =
+                                retry_call_arity(target_pc, process.x.saved_arity())
                             {
                                 process.header.arity = call_arity;
                             }
@@ -3381,8 +3379,9 @@ impl Executor {
                 process.gc_live
             };
             // A fun call or apply the scheduler redoes reads its operands from the saved file:
-            // the arguments and the fun or module and function above them. The retry takes the
-            // call's own arity back from `native_retry_arity`.
+            // the arguments and the fun or module and function above them, and nothing else is
+            // live. The saved count is that operand count; the retry takes the call's own arity
+            // back from it (`retry_call_arity`).
             if !arity_set
                 && process.native_pc.is_some()
                 && let Some(operands) = process
@@ -3391,8 +3390,7 @@ impl Executor {
                     .and_then(|cold| cold.native_retry)
                     .and_then(|target| retry_operand_count(target, call_arity))
             {
-                live_x = live_x.max(operands);
-                process.cold_mut().native_retry_arity = Some(process.header.arity);
+                live_x = operands;
             }
             process.header.arity = live_x.min(usize::from(u8::MAX)) as u8;
             process.gc_live = live_x;
@@ -3583,6 +3581,22 @@ fn retry_operand_count(target_pc: usize, arity: usize) -> Option<usize> {
         APPLY3_UNPORTED => Some(3),
         _ => None,
     }
+}
+
+/// The call arity of a redone fun call or apply, from the operand count its switch-out saved
+/// (`retry_operand_count` backwards). `None` for every other call the scheduler redoes.
+fn retry_call_arity(target_pc: usize, saved: usize) -> Option<u8> {
+    use arinsal_beamasm::dispatch::{
+        APPLY_FIXED_UNPORTED, APPLY2_UNPORTED, APPLY3_UNPORTED, CALL_FUN_UNPORTED,
+    };
+    let arity = match target_pc {
+        CALL_FUN_UNPORTED => saved.saturating_sub(1),
+        APPLY_FIXED_UNPORTED => saved.saturating_sub(2),
+        APPLY2_UNPORTED => 2,
+        APPLY3_UNPORTED => 3,
+        _ => return None,
+    };
+    u8::try_from(arity).ok()
 }
 
 /// Exact live X register count of a switched-out process, erts `c_p->arity`. Every
@@ -6116,9 +6130,6 @@ impl Process {
         let gc = self.collect_heap_roots(0, &mut roots, 0)?;
         crate::natives::sys::after_collection(self, 0, gc.collections, gc.words_reclaimed);
         self.bump_gc_reds(gc.reductions);
-        // Only X0 survives a call; the dead registers now point into the freed heap and
-        // must not be scanned by later literal-area or root walks.
-        self.x[1..].fill(Term::NIL);
         Ok(roots[0])
     }
 

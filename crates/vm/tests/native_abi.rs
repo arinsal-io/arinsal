@@ -521,9 +521,13 @@ fn loaded_native_function_returns_x0_and_gc_preserves_its_cp() {
     assert!(process.heap.release_stack(1));
 
     let mut registers = SchedulerRegisters::default();
+    // SAFETY: `registers` outlives the attachment, which `detach_save` below ends, and nothing
+    // else touches its X array in between.
+    unsafe { process.x.attach(&mut registers) };
     let exit = run_native(&mut process, &mut registers, entry).unwrap();
     assert_eq!(exit, ExitReason::Returned);
     assert_eq!(process.x[0].as_small(), Some(42));
+    process.x.detach_save(1);
     let _ = Box::leak(Box::new(memory));
 }
 
