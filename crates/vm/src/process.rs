@@ -1450,7 +1450,6 @@ impl Executor {
         // export's code address), OTP-29.1.1: every process starts its function natively on
         // its first run; later runs continue wherever its interpreted or native continuation is.
         // erts starts a spawned process at beam_run_process; its first run applies the MFA.
-        let mut apply_operands = false;
         if !process.entry_started && process.module == RUN_PROCESS {
             match crate::beamasm_integration::run_process_entry()
                 .filter(|_| crate::beamasm_integration::enabled())
@@ -1463,9 +1462,10 @@ impl Executor {
                     process.module = module_id;
                     process.ip = entry;
                     process.native_pc = Some(start);
-                    apply_operands = true;
                 }
-                None => apply_operands = self.vm.resolve_run_process(process)?,
+                None => {
+                    self.vm.resolve_run_process(process)?;
+                }
             }
         }
         let first_run = !std::mem::replace(&mut process.entry_started, true);
@@ -1535,18 +1535,9 @@ impl Executor {
                     None => (None, false),
                 };
                 if let Some((module, function, arity)) = initial_bif {
-                    // A spawn request that fell back to `apply/3` leaves its operands in X0..X2
-                    // (module, function, argument list); the entry runs the BIF on the list.
-                    let mut args = if apply_operands {
-                        let list = crate::signals::list(process.x[2])
-                            .ok_or_else(|| VmError::Unsupported("run_process arguments".into()))?;
-                        for (register, term) in process.x.iter_mut().zip(&list) {
-                            *register = *term;
-                        }
-                        list
-                    } else {
-                        process.x[..usize::from(arity)].to_vec()
-                    };
+                    // Both spawn paths (erl_create_process and the distributed spawn) place the
+                    // BIF's arguments in X0..X(arity-1); the entry runs the BIF on them.
+                    let mut args = process.x[..usize::from(arity)].to_vec();
                     let Some(bif) = arinsal_bifs::lookup(&module, &function, arity) else {
                         // A BIF implemented by a VM native (process-aware BIFs such as
                         // erlang:node/1 or register/2) runs through the native table.
