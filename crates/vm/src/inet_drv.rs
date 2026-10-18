@@ -37,6 +37,8 @@ const REQ_BIND: i64 = 6;
 const REQ_SETOPTS: i64 = 7;
 const REQ_GETOPTS: i64 = 8;
 const REQ_GETSTAT: i64 = 11;
+const REQ_FDOPEN: i64 = 13;
+const REQ_GETFD: i64 = 14;
 const REQ_GETTYPE: i64 = 15;
 const REQ_GETSTATUS: i64 = 16;
 const REQ_GETIFLIST: i64 = 21;
@@ -602,6 +604,8 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
         let mut inner = sock.inner.lock().unwrap();
         match cmd {
             REQ_OPEN => open_socket(&mut inner, data),
+            REQ_FDOPEN => fdopen_socket(&mut inner, data),
+            REQ_GETFD => getfd(&inner),
             REQ_CLOSE => {
                 // inet_drv.c:11932 (tcp_desc_close) drops the fd. Write bytes
                 // already accepted by tcp_sendv first so FIN cannot overtake them.
@@ -615,6 +619,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
                     inner.sendq.clear();
                 }
                 inner.fd.take();
+                inner.fd_external = None;
                 inner.phase = Phase::Closed;
                 ok_bytes(&[])
             }
@@ -739,9 +744,66 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     ));
     inner.domain = domain;
     inner.family_code = data[0];
+    inner.fd_external = None;
     inner.phase = Phase::Open;
     apply_saved(inner);
     ok_bytes(&[])
+}
+
+fn fdopen_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
+    // Port of inet_ctl_fdopen and tcp_inet_ctl INET_REQ_FDOPEN, OTP-29.1.1.
+    if (data.len() != 6 && data.len() < 10) || inner.fd.is_some() {
+        return err_bytes("einval");
+    }
+    let domain = match data[0] {
+        AF_INET_CODE => libc::AF_INET,
+        AF_INET6_CODE => libc::AF_INET6,
+        AF_LOCAL_CODE => libc::AF_UNIX,
+        _ => return err_bytes("eafnosupport"),
+    };
+    if data[1] != 1 {
+        return err_bytes("einval");
+    }
+    let raw_fd = i32::from_be_bytes(data[2..6].try_into().unwrap());
+    if raw_fd < 0 {
+        return err_bytes("einval");
+    }
+    let bound = data.len() == 6 || i32::from_be_bytes(data[6..10].try_into().unwrap()) != 0;
+    let fd = match crate::port::duplicate_fd(raw_fd) {
+        Ok(fd) => fd,
+        Err(error) => return err_bytes(errno_name(error.raw_os_error().unwrap_or(libc::EINVAL))),
+    };
+    if bound {
+        let addr = match rustix::net::getsockname(&fd) {
+            Ok(addr) => addr,
+            Err(error) => return err_bytes(errno_name(error.raw_os_error())),
+        };
+        if addr.address_family() != rustix::net::AddressFamily::from_raw(domain as _) {
+            return err_bytes("einval");
+        }
+    }
+    let connected = rustix::net::getpeername(&fd).is_ok();
+    set_nonblock(fd.as_raw_fd());
+    set_nosigpipe(fd.as_raw_fd());
+    inner.fd = Some(SockFd::new(fd, inner.selection_owner));
+    inner.fd_external = Some(raw_fd);
+    inner.domain = domain;
+    inner.family_code = data[0];
+    inner.phase = if connected {
+        Phase::Connected
+    } else {
+        Phase::Open
+    };
+    ok_bytes(&[])
+}
+
+fn getfd(inner: &Inner) -> Vec<u8> {
+    // Port of inet_ctl INET_REQ_GETFD, OTP-29.1.1.
+    let Some(fd) = inner.fd.as_ref() else {
+        return err_bytes("einval");
+    };
+    let raw = inner.fd_external.unwrap_or_else(|| fd.as_raw_fd());
+    ok_bytes(&(raw as u32).to_be_bytes())
 }
 
 fn bind_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
@@ -2620,6 +2682,7 @@ struct SendWait {
 
 struct Inner {
     fd: Option<SockFd>,
+    fd_external: Option<RawFd>,
     selection_owner: usize,
     domain: i32,
     family_code: u8,
@@ -2699,6 +2762,7 @@ impl Default for Inner {
     fn default() -> Self {
         Self {
             fd: None,
+            fd_external: None,
             selection_owner: 0,
             domain: libc::AF_INET,
             family_code: AF_INET_CODE,
