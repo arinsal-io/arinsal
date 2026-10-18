@@ -2725,7 +2725,11 @@ fn call_inner(
         (EtsBif::IsCompiledMs, [value]) => {
             // Port of erts/emulator/beam/erl_db.c:4582-4587
             // (ets_is_compiled_ms_1), OTP-29.1.1.
-            Ok(boolean_term(compiled_match_program(*value).is_some()))
+            // A continuation's program is held by the registry; one made by match_spec_compile/1
+            // lives with its magic reference. Both are compiled match specifications.
+            Ok(boolean_term(
+                compiled_match_program(*value).is_some() || registry.match_program(*value).is_some(),
+            ))
         }
         (EtsBif::InternalRequestAll, []) => {
             // Port of erts/emulator/beam/erl_db.c:3714 (ets_internal_request_all_0)

@@ -52,7 +52,10 @@ pub(super) fn decode_hash(
     if chunk < 0 || got < 0 || rest.len() != got as usize {
         return Err(badarg());
     }
-    let program = registry.match_program(items[3]).ok_or_else(badarg)?;
+    let program = registry
+        .match_program(items[3])
+        .or_else(|| super::compiled_match_program(items[3]))
+        .ok_or_else(badarg)?;
     let mut saved = SavedMatches::new();
     let oldest_first: Vec<Term> = rest.into_iter().rev().collect();
     saved.extend(&oldest_first).map_err(super::err)?;
@@ -78,7 +81,10 @@ pub(super) fn decode_tree(
     let accum = held(items[5]).ok_or_else(badarg)?;
     let reverse = small(items[6]).ok_or_else(badarg)?;
     let got = small(items[7]).ok_or_else(badarg)?;
-    let program = registry.match_program(items[4]).ok_or_else(badarg)?;
+    let program = registry
+        .match_program(items[4])
+        .or_else(|| super::compiled_match_program(items[4]))
+        .ok_or_else(badarg)?;
     if chunk <= 0 || got < 0 || accum.len() != got as usize {
         return Err(badarg());
     }
