@@ -1894,6 +1894,8 @@ enum BusyOp {
 // Port of erts/emulator/beam/erl_db.c:1850-2330 (ets_insert_2_list_info), OTP-29.1.1.
 pub struct InsertListCtx {
     pending: std::collections::VecDeque<PreparedObject>,
+    member_cursor: Option<usize>,
+    destroy_copied: bool,
     outcome: Arc<std::sync::atomic::AtomicU8>,
 }
 
@@ -2368,6 +2370,17 @@ impl Table {
         Ok(PreparedObject { stored, hash })
     }
 
+    /// Validate an object for this table without copying it into table storage.
+    pub fn check_object(options: &TableOptions, object: Term) -> Result<(), EtsError> {
+        key_of(object, options.keypos).map(|_| ())
+    }
+
+    /// Look up the key in an object without copying the object into table storage.
+    pub fn member_object(&self, object: Term) -> Result<bool, EtsError> {
+        let key = key_of(object, self.options.keypos)?;
+        Ok(self.member(key))
+    }
+
     /// Store a prepared object through a shared reference when the storage synchronizes its own
     /// writers (a CA tree), returning `None`; any other storage hands the object back for
     /// `insert_prepared` under the exclusive table lock.
@@ -2524,6 +2537,18 @@ impl Table {
         self.put_hashed(prepared.stored, prepared.hash, false);
     }
 
+    /// Store one object and return extra reductions spent comparing same-key bag objects.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_put_dbterm_hash), OTP-29.1.1.
+    pub fn insert_prepared_counted(&mut self, prepared: PreparedObject) -> usize {
+        self.put_hashed_counted(prepared.stored, prepared.hash, false)
+    }
+
+    /// Look up one already prepared key without copying the object.
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_new_2_dbterm_list_has_member), OTP-29.1.1.
+    pub fn member_prepared(&self, prepared: &PreparedObject) -> bool {
+        self.member_hashed(prepared.stored.key(self.options.keypos), prepared.hash)
+    }
+
     /// Insert a prepared object if its key has no live entry, under its hash stripe.
     pub fn insert_new_prepared_shared(&self, prepared: PreparedObject) -> Result<bool, EtsError> {
         let Storage::Hash(storage) = &self.storage else {
@@ -2589,12 +2614,22 @@ impl Table {
     }
 
     fn put_hashed(&mut self, object: StoredTerm, hash: u64, new_only: bool) {
+        let _ = self.put_hashed_counted(object, hash, new_only);
+    }
+
+    fn put_hashed_counted(&mut self, object: StoredTerm, hash: u64, new_only: bool) -> usize {
         let keypos = self.options.keypos;
         match &mut self.storage {
-            Storage::Ordered(root) => *root = Some(Node::insert(root.take(), object, keypos)),
-            Storage::CATree(tree) => tree.insert(object),
+            Storage::Ordered(root) => {
+                *root = Some(Node::insert(root.take(), object, keypos));
+                0
+            }
+            Storage::CATree(tree) => {
+                tree.insert(object);
+                0
+            }
             Storage::Hash(storage) => {
-                let accepted = storage.insert_exclusive(
+                let (accepted, extra_reds) = storage.insert_exclusive_counted(
                     object,
                     hash,
                     self.options.table_type,
@@ -2603,6 +2638,7 @@ impl Table {
                     new_only,
                 );
                 debug_assert!(accepted || new_only);
+                extra_reds
             }
         }
     }
@@ -2636,9 +2672,16 @@ impl Table {
     pub fn begin_busy_insert_list(
         &mut self,
         pending: std::collections::VecDeque<PreparedObject>,
+        member_cursor: Option<usize>,
+        destroy_copied: bool,
         outcome: InsertOutcome,
     ) {
-        self.set_busy(Some(BusyOp::InsertList(InsertListCtx { pending, outcome })));
+        self.set_busy(Some(BusyOp::InsertList(InsertListCtx {
+            pending,
+            member_cursor,
+            destroy_copied,
+            outcome,
+        })));
     }
 
     /// Do a slice of the busy operation. `reds` counts down by the work done (a negative value
@@ -2662,11 +2705,56 @@ impl Table {
             BusyOp::InsertList(mut ctx) => {
                 const ITERATIONS_PER_RED: isize = 8;
                 let mut loops = (*reds).max(0) * ITERATIONS_PER_RED;
-                while loops > 0
-                    && let Some(prepared) = ctx.pending.pop_front()
-                {
-                    self.put_hashed(prepared.stored, prepared.hash, false);
-                    loops -= 2;
+                if let Some(mut index) = ctx.member_cursor {
+                    while index < ctx.pending.len() {
+                        loops -= 1;
+                        if loops <= 0 {
+                            ctx.member_cursor = Some(index);
+                            *reds = loops / ITERATIONS_PER_RED;
+                            self.busy = Some(BusyOp::InsertList(ctx));
+                            return false;
+                        }
+                        if self.member_prepared(&ctx.pending[index]) {
+                            ctx.member_cursor = None;
+                            ctx.destroy_copied = true;
+                            break;
+                        }
+                        index += 1;
+                    }
+                    if index == ctx.pending.len() {
+                        ctx.member_cursor = None;
+                    }
+                }
+                if ctx.destroy_copied {
+                    while !ctx.pending.is_empty() {
+                        loops -= 1;
+                        if loops <= 0 {
+                            *reds = loops / ITERATIONS_PER_RED;
+                            self.busy = Some(BusyOp::InsertList(ctx));
+                            return false;
+                        }
+                        drop(ctx.pending.pop_front());
+                    }
+                    *reds = loops / ITERATIONS_PER_RED;
+                    ctx.outcome.store(2, AtomicOrdering::Release);
+                    self.set_busy(None);
+                    return true;
+                }
+                while !ctx.pending.is_empty() {
+                    loops -= 1;
+                    if loops <= 0 {
+                        *reds = loops / ITERATIONS_PER_RED;
+                        self.busy = Some(BusyOp::InsertList(ctx));
+                        return false;
+                    }
+                    let prepared = ctx.pending.pop_front().unwrap();
+                    let extra_reds = self.insert_prepared_counted(prepared);
+                    loops -= 1 + extra_reds as isize;
+                    if loops <= 0 {
+                        *reds = loops / ITERATIONS_PER_RED;
+                        self.busy = Some(BusyOp::InsertList(ctx));
+                        return false;
+                    }
                 }
                 *reds = loops / ITERATIONS_PER_RED;
                 if ctx.pending.is_empty() {
@@ -2697,13 +2785,36 @@ impl Table {
         pending: &mut std::collections::VecDeque<PreparedObject>,
         loops: &mut isize,
     ) {
-        while *loops > 0
-            && let Some(prepared) = pending.pop_front()
-        {
-            self.put_hashed(prepared.stored, prepared.hash, false);
-            // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_insert_db_term_list),
-            // OTP-29.1.1: one loop iteration and one `consumed_reds` per object.
-            *loops -= 2;
+        while !pending.is_empty() {
+            // YCF consumes the loop reduction before removing the next dbterm.
+            *loops -= 1;
+            if *loops <= 0 {
+                return;
+            }
+            let prepared = pending.pop_front().unwrap();
+            let extra_reds = self.insert_prepared_counted(prepared);
+            // db_put_dbterm starts with one consumed reduction. Hash bags add one for each
+            // same-key object compared before the match or end of its key run.
+            *loops -= 1 + extra_reds as isize;
+            if *loops <= 0 {
+                return;
+            }
+        }
+    }
+
+    /// Release copied list objects while charging the yieldable destroy loop.
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_destroy_copied_dbterms), OTP-29.1.1.
+    pub fn destroy_prepared_batch(
+        &mut self,
+        pending: &mut std::collections::VecDeque<PreparedObject>,
+        loops: &mut isize,
+    ) {
+        while !pending.is_empty() {
+            *loops -= 1;
+            if *loops <= 0 {
+                return;
+            }
+            drop(pending.pop_front());
         }
     }
 

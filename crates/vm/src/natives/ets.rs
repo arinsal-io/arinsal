@@ -167,12 +167,23 @@ fn binary_info_err(error: EtsError) -> VmError {
         error => err(error),
     }
 }
+fn list_next(term: Term) -> Option<(Term, Term)> {
+    // SAFETY: every caller keeps the source list on the active process heap while traversing it.
+    unsafe { term.cons_ref() }
+}
+fn advance_list(cursor: &mut Term) -> Result<Option<Term>, VmError> {
+    if *cursor == Term::NIL {
+        return Ok(None);
+    }
+    let (head, tail) = list_next(*cursor).ok_or_else(badarg)?;
+    *cursor = tail;
+    Ok(Some(head))
+}
 fn list(term: Term) -> Option<Vec<Term>> {
     let mut result = Vec::new();
     let mut tail = term;
     while tail.classify() == TermKind::List {
-        // SAFETY: the BIF call keeps the caller heap stable.
-        let (head, next) = unsafe { tail.cons_ref()? };
+        let (head, next) = list_next(tail)?;
         result.push(head);
         tail = next;
     }
@@ -842,7 +853,9 @@ fn insert_args(
             .cold
             .as_ref()
             .is_some_and(|cold| cold.ets_insert.is_some())
-            || list(objects).is_some_and(|items| items.len() >= 2))
+            || list_next(objects)
+                .and_then(|(_, tail)| list_next(tail))
+                .is_some())
     {
         // A list insert traps, which only the scheduler path can do.
         let ctx = ctx.ok_or(VmError::Yield)?;
@@ -947,34 +960,65 @@ fn insert_list(
     let tid = handle(&registry, target)?;
     let shared = std::sync::Arc::clone(registry.shared(tid).map_err(err)?);
     let options = shared.options();
-    let items = list(objects).ok_or_else(badarg)?;
     // Keep the table alive by its shared handle. Holding the registry lock while waiting for a
     // table writer prevents ets:delete/1 from detaching the table, unlike erts' btid reference.
     drop(registry);
     // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_check), OTP-29.1.1: the
     // check pass is a yieldable loop that takes one iteration per object.
-    let checked = match &state {
-        None => 0,
-        Some(EtsInsert::Check(checked)) => *checked,
-        Some(_) => items.len(),
-    };
-    if checked < items.len() {
-        let step = (items.len() - checked).min(loops.max(0) as usize);
-        loops -= step as isize;
-        if checked + step < items.len() {
-            process.cold_mut().ets_insert = Some(EtsInsert::Check(checked + step));
-            bump_reds(process, ctx, isize::MAX);
-            return Err(VmError::Yield);
+    let check_failure = || {
+        let table = shared.read();
+        if table.is_detached()
+            || target
+                .as_atom()
+                .is_some_and(|name| table.options.named_table && table.options.name != name)
+        {
+            err(EtsError::NoTable)
+        } else if !allowed(&table, caller, true) {
+            badarg_cause("access")
+        } else {
+            badarg()
         }
-        state = None;
+    };
+    let (mut cursor, mut checked, prepared) = match state.take() {
+        None => (objects, 0, None),
+        Some(EtsInsert::Check { cursor, count }) => (cursor, count, None),
+        Some(EtsInsert::Copy { cursor, prepared }) => (cursor, 0, Some(prepared)),
+        Some(EtsInsert::Global(_)) => unreachable!("global state returned above"),
+    };
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_check), OTP-29.1.1: the
+    // check pass advances a saved list cursor, so a trap never rescans its prefix.
+    if prepared.is_none() {
+        while cursor.classify() == TermKind::List {
+            // YCF consumes the automatic loop reduction before entering its body and yields
+            // at that point when the counter reaches zero.
+            loops -= 1;
+            if loops <= 0 {
+                process.cold_mut().ets_insert = Some(EtsInsert::Check {
+                    cursor,
+                    count: checked,
+                });
+                bump_reds(process, ctx, isize::MAX);
+                return Err(VmError::Yield);
+            }
+            let object = match advance_list(&mut cursor) {
+                Ok(Some(object)) => object,
+                Ok(None) => unreachable!(),
+                Err(_) => return Err(check_failure()),
+            };
+            if Table::check_object(&options, object).is_err() {
+                return Err(check_failure());
+            }
+            checked += 1;
+        }
+        if cursor != Term::NIL {
+            return Err(check_failure());
+        }
     }
-    if state
-        .as_ref()
-        .is_none_or(|state| matches!(state, EtsInsert::Check(_)))
+    if prepared.is_none()
         && options.table_type != TableType::Bag
         && options.table_type != TableType::DuplicateBag
-        // Port of erts/emulator/beam/erl_db.c:1946-1949 (can_insert_without_yield), OTP-29.1.1.
-        && items.len() as isize <= initial
+        // Port of erts/emulator/beam/erl_db.c (can_insert_without_yield), OTP-29.1.1.
+        && checked as isize <= loops
     {
         // Enough reductions to insert straight from the heap.
         let mut table = shared.write();
@@ -991,47 +1035,62 @@ fn insert_list(
         if !allowed(&table, caller, true) {
             return Err(badarg_cause("access"));
         }
-        let yes = if insert_new {
-            table.insert_new(&items).map_err(err)?
-        } else {
-            table.insert(&items).map_err(err)?;
-            true
-        };
-        // One iteration of the insert loop and one `consumed_reds` per object.
-        loops -= 2 * items.len() as isize;
+        let mut check_cursor = objects;
+        if insert_new {
+            while check_cursor.classify() == TermKind::List {
+                loops -= 1;
+                let object = advance_list(&mut check_cursor)?.expect("list cursor checked");
+                if table.member_object(object).map_err(err)? {
+                    return done(process, ctx, loops, false);
+                }
+            }
+        }
+        let mut insert_cursor = objects;
+        while insert_cursor.classify() == TermKind::List {
+            // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_from_p_heap): the
+            // generated loop consumes one reduction before db_put, which consumes at least one.
+            loops -= 1;
+            let object = advance_list(&mut insert_cursor)?.expect("list cursor checked");
+            let prepared = Table::prepare_object(&options, object).map_err(err)?;
+            let extra_reds = table.insert_prepared_counted(prepared);
+            loops -= 1 + extra_reds as isize;
+        }
+        let yes = true;
         return done(process, ctx, loops, yes);
     }
     // erts keeps the table identity alive while copying but releases the global table registry
     // lock. A concurrent delete must be able to detach the table during this yielding phase.
     // Copy the list into table form so that other processes can help.
-    let mut prepared = match state.take() {
-        Some(EtsInsert::Copy(prepared)) => prepared,
-        _ => Vec::with_capacity(items.len().min(1 << 20)),
-    };
-    while prepared.len() < items.len() {
+    let mut prepared = prepared.unwrap_or_else(|| Vec::with_capacity(checked.min(1 << 20)));
+    if cursor == Term::NIL && prepared.is_empty() {
+        cursor = objects;
+    }
+    while cursor.classify() == TermKind::List {
+        // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_copy_term_list): the
+        // generated loop yields before copying the current object when this consumes the slice.
+        loops -= 1;
         if loops <= 0 {
-            process.cold_mut().ets_insert = Some(EtsInsert::Copy(prepared));
+            process.cold_mut().ets_insert = Some(EtsInsert::Copy { cursor, prepared });
             bump_reds(process, ctx, isize::MAX);
             return Err(VmError::Yield);
         }
-        match Table::prepare_object(&options, items[prepared.len()]) {
+        let object = match advance_list(&mut cursor) {
+            Ok(Some(object)) => object,
+            Ok(None) => unreachable!(),
+            Err(_) => return Err(check_failure()),
+        };
+        match Table::prepare_object(&options, object) {
             Ok(object) => prepared.push(object),
             Err(error) => {
-                // A malformed object: the access failure is reported first, as the list check
-                // of ets_insert_2_list does.
                 if error == EtsError::BadArg {
-                    let table = shared.read();
-                    if table.is_detached() {
-                        return Err(err(EtsError::NoTable));
-                    }
-                    if !allowed(&table, caller, true) {
-                        return Err(badarg_cause("access"));
-                    }
+                    return Err(check_failure());
                 }
                 return Err(err(error));
             }
         }
-        loops -= 1;
+    }
+    if cursor != Term::NIL {
+        return Err(check_failure());
     }
     // Acquire the table lock independently of the registry, as in ets_insert_2_list_lock_tbl.
     let mut table = shared.write();
@@ -1044,22 +1103,48 @@ fn insert_list(
     }
     if table.is_busy() {
         drop(table);
-        process.cold_mut().ets_insert = Some(EtsInsert::Copy(prepared));
+        process.cold_mut().ets_insert = Some(EtsInsert::Copy { cursor, prepared });
         return Err(err(EtsError::Busy));
     }
     if !allowed(&table, caller, true) {
         return Err(badarg_cause("access"));
     }
-    if insert_new && table.any_member_prepared(&prepared) {
-        return done(process, ctx, loops, false);
+    let mut member_cursor = None;
+    let mut destroy_copied = false;
+    if insert_new {
+        let mut index = 0;
+        while index < prepared.len() {
+            // Port of erts/emulator/beam/erl_db.c (ets_insert_new_2_dbterm_list_has_member).
+            loops -= 1;
+            if loops <= 0 {
+                member_cursor = Some(index);
+                break;
+            }
+            if table.member_prepared(&prepared[index]) {
+                destroy_copied = true;
+                break;
+            }
+            index += 1;
+        }
     }
     let mut pending: std::collections::VecDeque<_> = prepared.into();
-    table.insert_prepared_batch(&mut pending, &mut loops);
-    if pending.is_empty() {
-        return done(process, ctx, loops, true);
+    if destroy_copied {
+        // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_destroy_copied_dbterms):
+        // copied objects are released by a yieldable loop after insert_new finds a key.
+        table.destroy_prepared_batch(&mut pending, &mut loops);
+    } else if member_cursor.is_none() {
+        table.insert_prepared_batch(&mut pending, &mut loops);
+    }
+    if pending.is_empty() && loops > 0 {
+        return done(process, ctx, loops, !destroy_copied);
     }
     let outcome: arinsal_ets::InsertOutcome = Default::default();
-    table.begin_busy_insert_list(pending, std::sync::Arc::clone(&outcome));
+    table.begin_busy_insert_list(
+        pending,
+        member_cursor,
+        destroy_copied,
+        std::sync::Arc::clone(&outcome),
+    );
     process.cold_mut().ets_insert = Some(EtsInsert::Global(outcome));
     bump_reds(process, ctx, isize::MAX);
     Err(VmError::Yield)

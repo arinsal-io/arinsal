@@ -6633,6 +6633,10 @@ impl Process {
                     && cold.ext_last_released.is_none()
                     && cold.nif_pending.is_none()
                     && cold
+                        .ets_insert
+                        .as_ref()
+                        .is_none_or(|state| state.cursor().is_none())
+                    && cold
                         .bif_trap
                         .as_ref()
                         .is_none_or(|trap| !trap.args_are_roots())
@@ -6705,6 +6709,16 @@ impl Process {
                 roots.extend_from_slice(&trap.args[..trap.arity]);
             }
         }
+        let ets_insert_root = self
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.ets_insert.as_ref())
+            .and_then(crate::proc_create::EtsInsert::cursor)
+            .map(|cursor| {
+                let index = roots.len();
+                roots.push(cursor);
+                index
+            });
         // A finished dirty job's result is in erts' argument registers until the call resumes.
         let dirty_start = roots.len();
         roots.extend(self.dirty_result_roots());
@@ -6872,6 +6886,11 @@ impl Process {
             {
                 let start = released_end + nif_roots_len;
                 trap.args[..trap_roots_len].copy_from_slice(&roots[start..start + trap_roots_len]);
+            }
+            if let Some(index) = ets_insert_root
+                && let Some(state) = cold.ets_insert.as_mut()
+            {
+                state.update_cursor(roots[index]);
             }
         }
         for (slot, &term) in self
