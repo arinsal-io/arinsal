@@ -68,10 +68,14 @@ fn record(process: *mut ProcessHeader) {
     });
 }
 
+const FRAME_BYTES: usize = 8;
+
 fn execute(emit: impl FnOnce(&mut BeamModuleAssembler)) -> (ProcessHeader, SchedulerRegisters) {
     let mut assembler = BeamModuleAssembler::new();
     assembler.emit_i_func_label(1).unwrap();
+    assembler.emit_enter_frame().unwrap();
     emit(&mut assembler);
+    assembler.emit_leave_frame().unwrap();
     assembler
         .emit_raw(|e| {
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;
@@ -123,6 +127,15 @@ fn assert_registers(registers: &SchedulerRegisters, written_xreg: Option<usize>)
 }
 
 fn assert_runtime_state(header: &ProcessHeader) {
+    assert_eq!(SEEN_HTOP.load(Ordering::Relaxed), header.htop as usize);
+    assert_eq!(
+        SEEN_STOP.load(Ordering::Relaxed),
+        header.stop as usize - FRAME_BYTES
+    );
+    assert_eq!(SEEN_FCALLS.load(Ordering::Relaxed), header.fcalls as usize);
+}
+
+fn assert_unpublished_stack(header: &ProcessHeader) {
     assert_eq!(SEEN_HTOP.load(Ordering::Relaxed), header.htop as usize);
     assert_eq!(SEEN_STOP.load(Ordering::Relaxed), header.stop as usize);
     assert_eq!(SEEN_FCALLS.load(Ordering::Relaxed), header.fcalls as usize);
@@ -216,7 +229,7 @@ fn apply_runtime_call_preserves_register_state() {
             .emit_i_apply(resolve_helper as ApplyResolver, 3)
             .unwrap();
     });
-    assert_runtime_state(&header);
+    assert_unpublished_stack(&header);
     assert_registers(&registers, None);
 }
 

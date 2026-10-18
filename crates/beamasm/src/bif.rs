@@ -329,15 +329,11 @@ impl BeamModuleAssembler {
                     e.mov_reg(Gpr::x(index as u8 + 2), reg)?;
                 }
             }
-            e.mov_const(Gpr::x(17), helper as u64)?;
-            e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-            e.blr(Gpr::x(17))
+            Ok(())
         })?;
+        self.fragment_call(helper)?;
         emit_leave_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-            e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
-        })?;
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40))?;
         let ok = self.code.new_label();
         self.code.cbz(Gpr::x(9), ok)?;
         if fail != 0 {
@@ -409,15 +405,11 @@ impl BeamModuleAssembler {
             for (index, arg) in args.iter().copied().enumerate() {
                 e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
             }
-            e.mov_const(Gpr::x(17), target as u64)?;
-            e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-            e.blr(Gpr::x(17))
+            Ok(())
         })?;
+        self.fragment_call(target)?;
         emit_leave_runtime(&mut self.code, live, update)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-            e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
-        })?;
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40))?;
         self.error_if_nonzero(Gpr::x(9))?;
         Ok(())
     }
