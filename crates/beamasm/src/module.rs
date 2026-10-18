@@ -853,10 +853,9 @@ impl BeamModuleAssembler {
             e.mov_reg(Gpr::x(0), C_P)?;
             e.mov_reg(Gpr::x(1), Gpr::x(13))?;
             // The send identity carries no export descriptor.
-            e.mov_reg(Gpr::x(3), Gpr::xzr())?;
-            e.mov_const(Gpr::x(17), fragment as u64)?;
-            e.blr(Gpr::x(17))
+            e.mov_reg(Gpr::x(3), Gpr::xzr())
         })?;
+        self.fragment_call(fragment)?;
         self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
         self.error_if_nonzero(Gpr::x(9))?;
         self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
@@ -877,11 +876,8 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         self.mov_arg_to_reg(Gpr::x(1), source)?;
         crate::emit_enter_runtime(&mut self.code, 6, crate::Update::NONE)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_const(Gpr::x(17), helper as u64)?;
-            e.blr(Gpr::x(17))
-        })?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(0), C_P))?;
+        self.fragment_call(helper)?;
         crate::emit_leave_runtime(&mut self.code, 6, crate::Update::NONE)?;
         self.store_register(destination, Gpr::x(0))
     }
@@ -1887,11 +1883,9 @@ impl BeamModuleAssembler {
         crate::emit_enter_runtime(&mut self.code, 6, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_reg(Gpr::x(1), Gpr::x(13))?;
-            e.mov_const(Gpr::x(17), helper as u64)?;
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
-            e.blr(Gpr::x(17))
+            e.mov_reg(Gpr::x(1), Gpr::x(13))
         })?;
+        self.fragment_call(helper)?;
         crate::emit_leave_runtime(&mut self.code, 6, update)?;
         self.code.emit(|e| {
             e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
@@ -2132,11 +2126,9 @@ impl BeamModuleAssembler {
                 e.mov_reg(Gpr::x(0), C_P)?;
                 e.mov_const(Gpr::x(1), u64::from(op))?;
                 e.mov_reg(Gpr::x(2), Gpr::x(14))?;
-                e.mov_reg(Gpr::x(3), Gpr::x(17))?;
-                e.mov_const(Gpr::x(17), helper as u64)?;
-                e.str_uoff(Gpr::x(30), C_P, 72)?;
-                e.blr(Gpr::x(17))
+                e.mov_reg(Gpr::x(3), Gpr::x(17))
             })?;
+            self.fragment_call(helper)?;
             crate::emit_leave_runtime(&mut self.code, 6, update)?;
             self.code.emit(|e| {
                 e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;

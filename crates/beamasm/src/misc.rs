@@ -82,8 +82,6 @@ pub fn emit_apply_tail(
     emit_apply_common(asm, kind, runtime, true)
 }
 
-const C_P: Gpr = Gpr::x(21);
-
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-320, OTP-29.1.1.
 // A fixed apply and `apply/3` resolve their target in the runtime; one that is not natively
 // compiled (or an invalid apply, which raises) goes to the interpreter through a shared
@@ -144,12 +142,7 @@ fn emit_apply_fun(
     }
     let unpacked = asm.code.new_label();
     let done = asm.code.new_label();
-    asm.code.emit(|e| {
-        e.mov_const(Gpr::x(17), runtime.apply_fun_shared as u64)?;
-        e.str_uoff(Gpr::x(30), C_P, 72)?;
-        e.blr(Gpr::x(17))?;
-        e.ldr_uoff(Gpr::x(30), C_P, 72)
-    })?;
+    asm.fragment_call(runtime.apply_fun_shared)?;
     asm.code.cbz(Gpr::x(0), unpacked)?;
     let continuation = asm.code.new_label();
     if tail {
