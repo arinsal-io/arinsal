@@ -670,6 +670,7 @@ impl Message {
 }
 
 /// A term already measured by `size_object_litopt` against `literals`.
+#[derive(Clone, Copy)]
 struct CountedSend<'a> {
     value: Term,
     words: usize,
@@ -4880,6 +4881,36 @@ impl Process {
         if counted.words == 0 {
             return Ok(false);
         }
+        if ctx.is_none() {
+            let mut failure = None;
+            let native = arinsal_sched::native_try_send_on_heap::<Message>(
+                from,
+                to,
+                &mut |task: &mut dyn std::any::Any| {
+                    let receiver = task.downcast_mut::<Process>()?;
+                    match message_on_receiver_heap(receiver, counted, priority, seq_token) {
+                        Ok(envelope) => envelope,
+                        Err(error) => {
+                            failure = Some(error);
+                            None
+                        }
+                    }
+                },
+            );
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            match native {
+                Some(
+                    arinsal_sched::OnHeapSend::Unavailable | arinsal_sched::OnHeapSend::Declined,
+                ) => return Ok(false),
+                Some(arinsal_sched::OnHeapSend::Queued) => return Ok(true),
+                Some(arinsal_sched::OnHeapSend::Failed(error)) => {
+                    return Err(VmError::Unsupported(format!("send: {error}")));
+                }
+                None => {}
+            }
+        }
         let Some(runtime) = self.runtime.as_ref() else {
             return Ok(false);
         };
@@ -5168,7 +5199,9 @@ impl Process {
             )))
         })?;
         // Port of erts/emulator/beam/erl_trace.c:824-832 (trace_send), OTP-29.1.1.
-        let event = if crate::trace::active()
+        let hooked = !crate::trace::send_hooks_idle(self);
+        let event = if hooked
+            && crate::trace::active()
             && self
                 .runtime
                 .as_ref()
@@ -5179,17 +5212,19 @@ impl Process {
         } else {
             "send"
         };
-        self.trace_send(
-            vm.as_deref_mut(),
-            ctx.as_deref_mut(),
-            sender,
-            event,
-            value,
-            target,
-        );
-        let mut seq_token = SendMeta {
+        if hooked {
+            self.trace_send(
+                vm.as_deref_mut(),
+                ctx.as_deref_mut(),
+                sender,
+                event,
+                value,
+                target,
+            );
+        }
+        let seq_token = SendMeta {
             alias: via_alias,
-            seq: if crate::seq_trace::has_token(self) {
+            seq: if hooked && crate::seq_trace::has_token(self) {
                 let state = {
                     // Port of erts/emulator/beam/erl_message.c:753-755, OTP-29.1.1: the event names the
                     // receiving process by pid, whatever name the sender used; an alias stays the alias.
@@ -5216,6 +5251,38 @@ impl Process {
                 crate::seq_trace::SeqState::Nil
             },
         };
+        self.send_counted(ctx, sender, pid, value, via_prio_alias, seq_token)
+    }
+
+    /// `Pid ! Msg` from native code for a sender with no trace hooks (see
+    /// `trace::send_hooks_idle`) and an internal pid as the destination: no destination
+    /// resolution, no trace or token work.
+    // Port of erts/emulator/beam/bif.c (do_send) and erl_message.c (erts_send_message), OTP-29.1.1.
+    pub(crate) fn send_to_pid_idle(&mut self, pid: Pid, value: Term) -> Result<Term, VmError> {
+        let sender = self
+            .self_pid
+            .ok_or_else(|| VmError::Unsupported("send requires a scheduled process".into()))?;
+        // A sender without a token sends `Nil`: the message clears a token its receiver holds.
+        let seq_token = SendMeta {
+            alias: 0,
+            seq: crate::seq_trace::SeqState::Nil,
+        };
+        self.send_counted(None, sender, pid, value, false, seq_token)
+    }
+
+    /// The part of a local send after the destination and the trace hooks are settled: size
+    /// the term once, try the receiver's heap, else queue a copy.
+    // Port of erts/emulator/beam/erl_message.c (erts_send_message from the size computation on),
+    // OTP-29.1.1.
+    fn send_counted(
+        &mut self,
+        mut ctx: Option<&mut RunCtx<'_, Message>>,
+        sender: Pid,
+        pid: Pid,
+        value: Term,
+        via_prio_alias: bool,
+        mut seq_token: SendMeta,
+    ) -> Result<Term, VmError> {
         // Size once. The on-heap attempt and the fragment fallback both consume it
         // (erts_send_message: size_object_litopt, then alloc, then copy_struct_litopt).
         let literals = arinsal_term::LiteralAreas::current();

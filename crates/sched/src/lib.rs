@@ -7099,6 +7099,15 @@ trait NativeSend<M> {
     /// enqueued there directly. Gives the message back when the scheduler-local state is
     /// not available.
     fn send(&self, from: Pid, to: Pid, msg: M) -> Result<Result<(), Error>, M>;
+    /// [`Scheduler::try_send_on_heap`] on this scheduler: the receiver is found without taking
+    /// a reference, `prepare` builds the message on its heap, and the same lookup delivers it.
+    /// `None` when the scheduler-local state is not available.
+    fn send_on_heap(
+        &self,
+        from: Pid,
+        to: Pid,
+        prepare: &mut dyn FnMut(&mut dyn std::any::Any) -> Option<M>,
+    ) -> Option<OnHeapSend>;
     /// Whether this handle belongs to the scheduler whose shared state sits at `inner`.
     fn belongs_to(&self, inner: usize) -> bool;
     /// Start a message timer for `target` owned by `owner` on this scheduler's wheel.
@@ -7135,6 +7144,43 @@ struct WorkerSender<T: Task> {
 impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
     fn belongs_to(&self, inner: usize) -> bool {
         Arc::as_ptr(&self.inner) as usize == inner
+    }
+
+    // Port of erts/emulator/beam/erl_message.c (erts_try_alloc_message_on_heap under the
+    // receiver's main lock, then erts_queue_proc_message), OTP-29.1.1, with the receiver found
+    // by erts_proc_lookup_raw: one table lookup, no reference count, serves the lock, the
+    // heap, the queue push and the wake.
+    fn send_on_heap(
+        &self,
+        from: Pid,
+        to: Pid,
+        prepare: &mut dyn FnMut(&mut dyn std::any::Any) -> Option<T::Message>,
+    ) -> Option<OnHeapSend> {
+        let local = self.local.upgrade()?;
+        let mut local = local.try_borrow_mut().ok()?;
+        let outcome = self.inner.table.with_live(to, |process| {
+            if !receiver_heap_stable(process) {
+                return OnHeapSend::Unavailable;
+            }
+            let Ok(mut cell) = process.cell.try_lock() else {
+                return OnHeapSend::Unavailable;
+            };
+            if !receiver_heap_stable(process) {
+                return OnHeapSend::Unavailable;
+            }
+            let Some(message) = prepare(&mut cell.task) else {
+                return OnHeapSend::Declined;
+            };
+            let local = process.bound_worker().is_none().then_some(&mut *local);
+            match self
+                .inner
+                .deliver_live(process, from, Payload::Message(message), local)
+            {
+                Ok(()) | Err(Error::NoProcess) => OnHeapSend::Queued,
+                Err(error) => OnHeapSend::Failed(error),
+            }
+        });
+        Some(outcome.unwrap_or(OnHeapSend::Unavailable))
     }
 
     fn send(&self, from: Pid, to: Pid, msg: T::Message) -> Result<Result<(), Error>, T::Message> {
@@ -7264,6 +7310,20 @@ pub fn native_send<M: SignalMessage>(from: Pid, to: Pid, msg: M) -> Result<Resul
         Some(Err(msg)) => Err(msg),
         None => Err(msg.take().expect("message not sent")),
     }
+}
+
+/// [`Scheduler::try_send_on_heap`] from a task's native code through the normal scheduler
+/// thread it runs on. `prepare` gets the receiver task as `dyn Any` and builds the message on
+/// its heap; the receiver is looked up once for the lock, the copy, the queue push and the wake.
+///
+/// `None` when this thread is no normal scheduler; the caller then goes through
+/// [`Scheduler::try_send_on_heap`].
+pub fn native_try_send_on_heap<M: SignalMessage>(
+    from: Pid,
+    to: Pid,
+    prepare: &mut dyn FnMut(&mut dyn std::any::Any) -> Option<M>,
+) -> Option<OnHeapSend> {
+    native_sender::with::<M, _>(|handle| handle.send_on_heap(from, to, prepare)).flatten()
 }
 
 /// Start a message timer from native code on the calling scheduler's timer wheel.

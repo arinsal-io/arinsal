@@ -8,13 +8,18 @@
 use arinsal_alloc::alloc_util::{AllocUtil, Allocation};
 use arinsal_alloc::raw::RawRegion;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 const LITERAL_VIRTUAL_AREA_SIZE: usize = 1024 * 1024 * 1024;
 const LITERAL_AREA_HEADER_WORDS: usize = 2;
 
 static GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Number of purge ranges in the registry, readable without the registry or its thread cache.
+/// Port of erts/emulator/beam/copy.c (the purge area globals, null unless a literal area is
+/// being purged), OTP-29.1.1.
+static PURGE_RANGES: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static CACHE: RefCell<(u64, Arc<[LiteralRange]>)> = RefCell::new((0, Arc::from([])));
@@ -152,6 +157,7 @@ fn update(edit: impl FnOnce(&mut Vec<LiteralRange>)) {
     let mut slot = registry().write().expect("literal registry poisoned");
     let mut ranges = slot.to_vec();
     edit(&mut ranges);
+    PURGE_RANGES.store(ranges.len(), Ordering::Release);
     *slot = Arc::from(ranges);
     GENERATION.fetch_add(1, Ordering::Release);
 }
@@ -231,13 +237,21 @@ fn find(ranges: &[LiteralRange], address: usize) -> Option<&LiteralRange> {
 /// One consistent view of the collector's purge ranges during a copy.
 #[derive(Clone)]
 pub struct LiteralAreas {
-    ranges: Arc<[LiteralRange]>,
+    ranges: Option<Arc<[LiteralRange]>>,
 }
 
 impl LiteralAreas {
-    /// Snapshot the current literal purge area.
+    /// Snapshot the current literal purge area. Without a purge in progress there is nothing
+    /// to snapshot: the view is empty and no registry, thread cache or reference count is
+    /// touched.
+    #[inline]
     pub fn current() -> Self {
-        Self { ranges: snapshot() }
+        if PURGE_RANGES.load(Ordering::Acquire) == 0 {
+            return Self { ranges: None };
+        }
+        Self {
+            ranges: Some(snapshot()),
+        }
     }
 
     /// Whether a copy keeps `term` by reference: it is a literal outside the purge area.
@@ -249,7 +263,9 @@ impl LiteralAreas {
         if !is_literal_address(address as usize) {
             return false;
         }
-        self.ranges.is_empty() || find(&self.ranges, address as usize).is_none()
+        self.ranges
+            .as_deref()
+            .is_none_or(|ranges| ranges.is_empty() || find(ranges, address as usize).is_none())
     }
 
     /// Whether `term`'s object lies in any literal area, including the purge area.
