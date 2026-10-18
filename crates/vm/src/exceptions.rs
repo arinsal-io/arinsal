@@ -395,6 +395,36 @@ pub(crate) fn error_info_option(options: &Term) -> Option<OwnedTerm> {
     error_info
 }
 
+/// `error_info_option` on the heap terms themselves: the last `{error_info, Map}` map of a
+/// proper, non-empty option list. The scheduler path copies it off-heap; the native resolver
+/// keeps the live term, as erts keeps it in `c_p->ftrace`.
+// Port of erts/emulator/beam/bif.c (error_3 option validation), OTP-29.1.1.
+pub(crate) fn error_info_term(options: Term) -> Option<Term> {
+    let mut info = None;
+    let mut valid = true;
+    let proper = arinsal_bifs::for_each_list_term(options, |option| {
+        match arinsal_bifs::tuple_pair(option) {
+            Some((key, map))
+                if key == Term::atom(arinsal_term::atoms::ERROR_INFO)
+                    && map.classify() == arinsal_term::TermKind::Map =>
+            {
+                info = Some(map);
+            }
+            _ => valid = false,
+        }
+        Ok(())
+    });
+    if proper.is_err() || !valid {
+        return None;
+    }
+    info
+}
+
+/// Whether `term` is a proper list, without copying it.
+pub(crate) fn is_proper_list(term: Term) -> bool {
+    arinsal_bifs::for_each_list_term(term, |_| Ok(())).is_ok()
+}
+
 fn proper_list(term: Term) -> bool {
     matches!(
         to_owned(term).as_ref(),

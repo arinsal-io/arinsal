@@ -417,6 +417,17 @@ pub(super) fn capture(
                 to_owned(*args)
                     .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
             )),
+            TopFrame::CurrentArgsInfoTerm(args, info) => Ok(StoredTopFrame::CurrentArgsWithInfo(
+                args.map(|args| {
+                    to_owned(args)
+                        .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))
+                })
+                .transpose()?,
+                Box::new(
+                    to_owned(*info)
+                        .map_err(|e| VmError::Unsupported(format!("error_info {e:?}")))?,
+                ),
+            )),
             TopFrame::CurrentArgsWithInfo(args, info) => Ok(StoredTopFrame::CurrentArgsWithInfo(
                 args.map(|args| {
                     to_owned(args)
@@ -871,10 +882,11 @@ fn save_ftrace_values(
                 .map_err(|error| VmError::Unsupported(format!("exception args {error:?}")))?
         }
         Some(SaveTop::Live(TopFrame::CurrentArgs(args)))
-        | Some(SaveTop::Live(TopFrame::CurrentArgsWithInfo(Some(args), _))) => *args,
-        Some(SaveTop::Live(TopFrame::CurrentArgsWithInfo(None, _))) | None => {
-            Term::atom(arinsal_term::atoms::TRUE)
-        }
+        | Some(SaveTop::Live(TopFrame::CurrentArgsWithInfo(Some(args), _)))
+        | Some(SaveTop::Live(TopFrame::CurrentArgsInfoTerm(Some(args), _))) => *args,
+        Some(SaveTop::Live(TopFrame::CurrentArgsWithInfo(None, _)))
+        | Some(SaveTop::Live(TopFrame::CurrentArgsInfoTerm(None, _)))
+        | None => Term::atom(arinsal_term::atoms::TRUE),
         Some(SaveTop::Stored(_)) => unreachable!(),
     };
     let info_map = match top {
@@ -884,6 +896,7 @@ fn save_ftrace_values(
         Some(SaveTop::Live(TopFrame::BifRegisters { module, info, .. })) => {
             bif_error_info(heap, *module, *info)?
         }
+        Some(SaveTop::Live(TopFrame::CurrentArgsInfoTerm(_, info))) => Some(*info),
         Some(SaveTop::Live(TopFrame::CurrentArgsWithInfo(_, info))) => Some(
             from_owned(info, heap)
                 .map_err(|error| VmError::Unsupported(format!("error_info {error:?}")))?,
@@ -1277,6 +1290,11 @@ pub(super) enum TopFrame {
     },
     CurrentArgs(Term),
     CurrentArgsWithInfo(Option<Term>, Box<OwnedTerm>),
+    /// `erlang:error/2,3` read straight from the argument registers: the argument list (if
+    /// it is a proper list) and the validated `error_info` map stay heap terms, as in erts'
+    /// `c_p->ftrace`. Only the native exception resolver builds it; nothing collects before
+    /// `save_stacktrace` copies the two words.
+    CurrentArgsInfoTerm(Option<Term>, Term),
 }
 
 pub(super) fn handler_tag(module: usize, ip: usize) -> Result<Term, VmError> {

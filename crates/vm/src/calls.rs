@@ -231,6 +231,8 @@ pub(crate) fn gc_after_native_parts(
                 Some(NativeTopRoots::CurrentArgs(roots.len() - 1))
             }
             crate::stacktrace::TopFrame::CurrentArgsWithInfo(None, _) => None,
+            // Resolver-local; it never reaches a trap that survives a collection.
+            crate::stacktrace::TopFrame::CurrentArgsInfoTerm(..) => None,
         });
         Some(NativeErrorRoots::Trap { reason, trace, top })
     } else {

@@ -3510,10 +3510,7 @@ fn plain_bif_result(
             }
             value
         }
-        Err(error) => {
-            let args = argument_registers(process, arity);
-            plain_bif_error(process, export, &args, error)
-        }
+        Err(error) => plain_bif_error(process, export, error),
     }
 }
 
@@ -3581,10 +3578,9 @@ fn gc_after_plain_bif(
 fn plain_bif_error(
     process: &mut crate::Process,
     export: ExportDispatch,
-    args: &[Term],
     error: arinsal_bifs::BifError,
 ) -> u64 {
-    set_native_bif_export_error(process, export, args, error);
+    set_native_bif_export_error(process, export, error);
     process.sync_native_header();
     0
 }
@@ -3696,12 +3692,6 @@ pub(crate) fn set_native_bif_error(
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
-    // A caught native failure still returns to the scheduler, which raises with this
-    // record (`native_bif_error`). The pending frame is `s->current` if a later
-    // `save_stacktrace` runs in-process (beam_common.c:903-925, OTP-29.1.1).
-    if process.header.catches > 0 {
-        crate::stacktrace::note_caught_bif_frame(process, module, function, args, &error);
-    }
     let (freason, fvalue) = (process.header.freason, process.header.fvalue);
     process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Owned {
@@ -3719,19 +3709,9 @@ pub(crate) fn set_native_bif_error(
 fn set_native_bif_export_error(
     process: &mut crate::Process,
     export: ExportDispatch,
-    args: &[Term],
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
-    if process.header.catches > 0 {
-        crate::stacktrace::note_caught_bif_frame(
-            process,
-            &export.module,
-            &export.function,
-            args,
-            &error,
-        );
-    }
     let (freason, fvalue) = (process.header.freason, process.header.fvalue);
     process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Export(export),
@@ -3896,6 +3876,12 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
             }),
             _ => None,
         });
+    // A failing BIF in the argument registers is the top frame, with its arguments read
+    // from the registers (erts `save_stacktrace` reads them from `reg`), no copies.
+    let top = top.or_else(|| failure_top(process, &registers.x_reg_array));
+    if top.is_none() {
+        note_owned_failure(process);
+    }
     // `erlang:raise/3` already built the list the catch must see (`bif.c:1643`).
     // A native walk would name `eval_external_handler` instead of that list.
     let trace = if let Some(trace) = take_explicit_raise(process) {
@@ -3929,6 +3915,88 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // the next native exit as a continuation resume.
     process.native_continuation_resume = false;
     handler
+}
+
+/// A failure whose BIF has no export entry keeps its frame in the owned record; park it as
+/// the pending top frame only now that a catch will consume it.
+#[cold]
+#[inline(never)]
+fn note_owned_failure(process: &mut crate::Process) {
+    let Some(failure) = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.native_bif_error.take())
+    else {
+        return;
+    };
+    if failure.freason == process.header.freason
+        && failure.fvalue == process.header.fvalue
+        && let crate::proc_create::NativeBifCall::Owned {
+            module,
+            function,
+            args,
+        } = &failure.call
+    {
+        crate::stacktrace::note_caught_bif_frame(process, module, function, args, &failure.error);
+    }
+    process.cold_mut().native_bif_error = Some(failure);
+}
+
+/// The top frame of a BIF failure parked by the native BIF helpers, built from the live
+/// argument registers.
+// Port of erts/emulator/beam/beam_common.c (save_stacktrace: a failing BIF other than
+// `error/1,2,3`, `exit/1` and `throw/1` is `s->current`; `error/2,3` name the caller and
+// keep the argument list and `error_info` map from `c_p->ftrace`), OTP-29.1.1.
+fn failure_top(
+    process: &mut crate::Process,
+    registers: &[Term],
+) -> Option<crate::stacktrace::TopFrame> {
+    use crate::stacktrace::{BifErrorInfo, TopFrame};
+    let cold = process.cold.as_ref()?;
+    let failure = cold.native_bif_error.as_ref()?;
+    if failure.freason != process.header.freason || failure.fvalue != process.header.fvalue {
+        return None;
+    }
+    match &failure.call {
+        crate::proc_create::NativeBifCall::Export(export) => {
+            let info = match failure.error {
+                arinsal_bifs::BifError::Badarg { cause: Some(cause) } => BifErrorInfo::Cause(cause),
+                arinsal_bifs::BifError::Badarg { .. }
+                | arinsal_bifs::BifError::Badarith
+                | arinsal_bifs::BifError::SystemLimit
+                | arinsal_bifs::BifError::Error(_) => BifErrorInfo::Plain,
+                arinsal_bifs::BifError::Raise { .. } => {
+                    let arity = usize::from(export.arity);
+                    if export.module_atom != arinsal_term::atoms::ERLANG
+                        || export.function_atom != arinsal_term::atoms::ERROR
+                        || arity < 2
+                    {
+                        return None;
+                    }
+                    let args = registers[1];
+                    let args = crate::exceptions::is_proper_list(args).then_some(args);
+                    return match registers
+                        .get(2)
+                        .filter(|_| arity > 2)
+                        .and_then(|options| crate::exceptions::error_info_term(*options))
+                    {
+                        Some(info) => Some(TopFrame::CurrentArgsInfoTerm(args, info)),
+                        None => args.map(TopFrame::CurrentArgs),
+                    };
+                }
+                arinsal_bifs::BifError::Unsupported(_) | arinsal_bifs::BifError::Dirty(_) => {
+                    return None;
+                }
+            };
+            Some(TopFrame::BifRegisters {
+                module: export.module_atom,
+                function: export.function_atom,
+                arity: usize::from(export.arity),
+                info,
+            })
+        }
+        crate::proc_create::NativeBifCall::Owned { .. } => None,
+    }
 }
 
 /// Port of erts/emulator/beam/beam_common.c:742 (`expand_error_value`), OTP-29.1.1.
