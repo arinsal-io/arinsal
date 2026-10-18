@@ -3032,6 +3032,14 @@ fn call_direct_bif(
     // A direct BIF that failed has parked its exception (freason/fvalue set, as an erts
     // BIF returns THE_NON_VALUE); the call is not redone.
     if process.header.freason != 0 {
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared) and erl_gc.c
+        // (erts_gc_after_bif_call_lhf), OTP-29.1.1: the GC-desired test runs before the result
+        // is looked at, so a failed BIF collects too, with its arguments live.
+        if process.heap.gc_after_bif_desired()
+            && !direct_bif_error_gc(process, usize::from(export.arity))
+        {
+            return Some(0);
+        }
         process.sync_native_header();
         return Some(0);
     }
@@ -3048,6 +3056,29 @@ fn call_direct_bif(
     }
     process.sync_native_header();
     Some(raw)
+}
+
+/// Collects after a direct BIF that parked its exception: the arguments and the parked
+/// exception are the roots. False when the collection failed and the call raised.
+#[cold]
+#[inline(never)]
+fn direct_bif_error_gc(process: &mut crate::Process, arity: usize) -> bool {
+    let Some(mut parked) = process.cold_mut().native_trap.take() else {
+        return true;
+    };
+    let mut args = argument_registers(process, arity);
+    let collected =
+        crate::calls::gc_after_native_parts(process, &mut args, None, Some(&mut parked.trap));
+    parked.fvalue = crate::native_hooks::raw(parked.trap.reason);
+    process.header.fvalue = parked.fvalue;
+    process.cold_mut().native_trap = Some(parked);
+    if collected.is_err() {
+        crate::native_hooks::set_error(process, "system_limit");
+        process.sync_native_header();
+        return false;
+    }
+    process.sync_native_header();
+    true
 }
 
 /// `make_ref/0` and `unique_integer/0,1` on the scheduler that is already running
