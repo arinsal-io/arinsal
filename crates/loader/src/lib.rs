@@ -483,6 +483,10 @@ impl LiteralArea {
         Self(Arc::new(std::sync::Mutex::new(Some(Arc::new(heap)))))
     }
 
+    fn empty() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(None)))
+    }
+
     /// Removes the literal heap from the module; `None` when it was already released.
     pub fn take(&self) -> Option<Arc<VecHeap>> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
@@ -637,6 +641,48 @@ pub struct CoverageProbe {
 type LineCoverageInsertion = (u32, u32, u32, u32, usize);
 
 impl Module {
+    /// Drop code and code-specific metadata after no process can reference this version.
+    /// Callers must queue its literal area first; export and lambda entries remain alive.
+    // Port of erts/emulator/beam/beam_bif_load.c
+    // (erts_internal_purge_module_2 complete frees old.code_hdr), OTP-29.1.1.
+    pub fn release_code(&mut self) {
+        self.records = Vec::new();
+        self.record_defs = Vec::new();
+        self.code = Box::new([]);
+        self.generic = Vec::new();
+        self.selects = Vec::new();
+        self.imports = Vec::new();
+        self.export_atoms = HashMap::new();
+        self.tails = Vec::new();
+        self.lists = Vec::new();
+        self.bit_commands = Vec::new();
+        self.strings = Box::new([]);
+        self.types = Vec::new();
+        self.lines = Vec::new();
+        self.line_file_terms = HashMap::new();
+        self.line_terms = Vec::new();
+        self.unsupported = HashMap::new();
+        self.unsupported_reasons = Vec::new();
+        self.functions = Vec::new();
+        self.function_atoms = Vec::new();
+        self.nif_stubs = None;
+        self.on_entry_fn = Box::new([]);
+        self.entry_arity = Box::new([]);
+        self.breakpoint_originals = HashMap::new();
+        self.return_trace_ip = 0;
+        self.return_to_trace_ip = 0;
+        self.export_breakpoint_base = 0;
+        self.export_entry_targets = Box::new([]);
+        self.coverage = None;
+        self.coverage_probes = Vec::new();
+        self.line_breakpoints_supported = false;
+        self.debug_line_points = Vec::new();
+        self.debug_line_items = Vec::new();
+        self.debug_breakpoint_import = 0;
+        self.literal_terms = Arc::new(HashMap::new());
+        self._literals = LiteralArea::empty();
+    }
+
     /// Retain this code version's literal heap for process root scanning.
     pub fn literal_area(&self) -> LiteralArea {
         self._literals.clone()

@@ -479,8 +479,10 @@ fn alloc_slot(
     }
 }
 
-// g_code_fix
+// Port of erts/emulator/beam/beam_bif_load.c
+// (erts_internal_purge_module_2 complete clears old.code_hdr), OTP-29.1.1.
 fn release_slot(
+    modules: &mut [Arc<Module>],
     live: &mut [bool],
     meta: &mut [Option<Arc<CodeMeta>>],
     free_ids: &mut Vec<usize>,
@@ -488,6 +490,9 @@ fn release_slot(
 ) {
     if id >= live.len() || !live[id] || free_ids.contains(&id) {
         return;
+    }
+    if let Some(module) = modules.get_mut(id) {
+        Arc::make_mut(module).release_code();
     }
     live[id] = false;
     if id < meta.len() {
@@ -614,6 +619,7 @@ impl CodeTables {
             }
         }
         release_slot(
+            &mut self.modules,
             &mut self.module_live,
             &mut self.code_meta,
             &mut self.free_ids,
@@ -1463,8 +1469,41 @@ mod purge_free_tests {
         let native = released.expect("native code of the old version");
         let before = store.retired_generation();
         native.unpublish();
-        assert_eq!(store.retired_generation(), before + 1);
+        similar_asserts::assert_eq!(store.retired_generation(), before + 1);
         drop(native);
-        assert_eq!(store.retired_generation(), before + 1);
+        similar_asserts::assert_eq!(store.retired_generation(), before + 1);
+    }
+
+    #[test]
+    fn purge_release_drops_module_code_and_keeps_permanent_entries() {
+        let Some(beam) =
+            beam("-module(purge_free_mod).\n-export([f/0]).\nf() -> fun() -> ok end.\n")
+        else {
+            eprintln!("erlc unavailable; skipping purge free test");
+            return;
+        };
+        let mut vm = Vm::new([]);
+        let id = vm.load_bytes(&beam).unwrap();
+        assert!(!vm.code.modules[id].code.is_empty());
+        assert!(!vm.code.modules[id].exports.is_empty());
+        assert!(!vm.code.modules[id].funs.is_empty());
+        let export_count = vm.code.exports.order.len();
+        let fun_count = vm.code.fun_entries().count();
+
+        let native = vm
+            .code_ix
+            .update_active(|tables| tables.release(id))
+            .expect("native code of the purged version");
+        vm.refresh_code();
+
+        assert!(vm.code.modules[id].code.is_empty());
+        assert!(vm.code.modules[id].functions.is_empty());
+        assert!(!vm.code.modules[id].exports.is_empty());
+        assert!(!vm.code.modules[id].funs.is_empty());
+        similar_asserts::assert_eq!(vm.code.exports.order.len(), export_count);
+        similar_asserts::assert_eq!(vm.code.fun_entries().count(), fun_count);
+        assert!(vm.code.code_meta[id].is_none());
+        native.unpublish();
+        drop(native);
     }
 }
