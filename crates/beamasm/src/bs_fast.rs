@@ -808,11 +808,17 @@ fn emit_static_gc(
 /// `S_RESERVED`, and `Process::ensure` adds only the redzone. Subtracting here
 /// would skip a collection when fewer than `S_RESERVED` words remain.
 fn emit_gc_stub(asm: &mut BeamModuleAssembler, live: u32, hook: usize) -> Result<(), ModuleError> {
+    // Port of beam_asm_global.cpp (emit_garbage_collect), OTP-29.1.1: the fragment keeps its
+    // return address in a runtime frame, because the runtime call below overwrites x30.
+    asm.code
+        .emit(|e| e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16))?;
     asm.code.emit(|e| {
         e.sub_reg(Gpr::x(12), Gpr::x(2), HTOP, Shift::Lsl, 0)?;
         e.lsr_imm(Gpr::x(12), Gpr::x(12), 3)
     })?;
     emit_gc_call(asm, live, hook, Gpr::x(12), &[])?;
+    asm.code
+        .emit(|e| e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
     asm.code.emit(|e| e.ret(Gpr::x(30)))?;
     Ok(())
 }
