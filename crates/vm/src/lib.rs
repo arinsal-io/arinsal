@@ -100,7 +100,7 @@ mod boot_loop1_shared_tests {
     use arinsal_difftest::RefErl;
 
     #[test]
-    fn collection_clears_dead_registers_before_conservative_scan() {
+    fn collection_roots_only_the_live_registers() {
         let mut process = Process::with_registers(2, 0);
         process.ensure(2, 0).unwrap();
         let value = TermBuilder::new(&mut process.heap)
@@ -111,7 +111,10 @@ mod boot_loop1_shared_tests {
         let allocation_to_force_gc = process.heap.free_words() + 1;
         process.ensure(allocation_to_force_gc, 1).unwrap();
         assert_ne!(process.x[0], Term::NIL);
-        assert_eq!(process.x[1], Term::NIL);
+        // Port of erts/emulator/beam/erl_gc.c (setup_rootset), OTP-29.1.1: only the live prefix
+        // is rewritten and the dead registers above it are left as they are, so the stale x1 must
+        // be made live again before the next, wider collection.
+        process.x[1] = process.x[0];
         let allocation_to_force_wider_gc = process.heap.free_words() + 1;
         process.ensure(allocation_to_force_wider_gc, 2).unwrap();
     }
