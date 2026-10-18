@@ -866,6 +866,29 @@ impl<M> Wheel<M> {
         Some(next)
     }
 
+    /// Receiver-tree changes recorded since the last [`Wheel::pop_link_event`] drain.
+    #[inline]
+    pub(crate) fn has_link_events(&self) -> bool {
+        !self.link_events.is_empty()
+    }
+
+    /// `true` when the cached next timeout lies after both `now` and the wheel's own position
+    /// and nothing is waiting to be bumped, so [`Wheel::advance`] and
+    /// [`Wheel::next_timeout`] have nothing to do.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c (erts_schedule: the timers are bumped only when
+    /// the cached monotonic time has reached erts_next_timeout_time), OTP-29.1.1.
+    #[inline]
+    pub(crate) fn quiet_at(&self, now: u64) -> bool {
+        self.link_events.is_empty()
+            && self.at_once.is_empty()
+            && self.pending.is_empty()
+            && self.bump_cursor >= self.bump_pending.len()
+            && self
+                .next_timeout
+                .is_some_and(|next| next > now && next > self.now)
+    }
+
     // Port of erts/emulator/beam/time.c:1270-1291, OTP-29.1.1.
     pub(crate) fn has_timers(&self) -> bool {
         !self.entries.is_empty()
