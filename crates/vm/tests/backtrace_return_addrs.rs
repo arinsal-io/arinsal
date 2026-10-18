@@ -1,6 +1,8 @@
 //! `process_info(P, backtrace)` must list one return address per frame like erts: a call the
 //! scheduler performs for native code (spawn, apply, funs) leaves only the caller's real
 //! continuation, and a process's first frame returns to `<terminate process normally>`.
+//! The backtrace of a waiting or runnable process has no `arity = N` line and no register
+//! lines: the target prints it while it handles the signal, so it is a running process.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -42,10 +44,14 @@ wait() -> receive stop -> ok end.
 "#;
 
 fn run(program: &std::path::Path, dir: &std::path::Path) -> String {
+    run_eval(program, dir, "bt_return_addrs:run(), halt().")
+}
+
+fn run_eval(program: &std::path::Path, dir: &std::path::Path, eval: &str) -> String {
     let mut child = Command::new(program)
         .args(["-noshell", "-pa"])
         .arg(dir)
-        .args(["-eval", "bt_return_addrs:run(), halt()."])
+        .args(["-eval", eval])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -92,6 +98,56 @@ fn backtrace_return_addresses_match_erl() {
     assert!(
         expected.contains("<terminate process normally>"),
         "unexpected erl output: {expected}"
+    );
+    assert_eq!(actual, expected);
+}
+
+const ARITY_MODULE: &str = r#"
+-module(bt_arity_lines).
+-export([run/0, spin/0, wait/3]).
+
+run() ->
+    Waiting = spawn(bt_arity_lines, wait, [a, {b, c}, [d]]),
+    Runnable = spawn(bt_arity_lines, spin, []),
+    timer:sleep(100),
+    Result = [{waiting, shape(Waiting)}, {runnable, shape(Runnable)}],
+    exit(Waiting, kill),
+    exit(Runnable, kill),
+    io:format("~p~n", [Result]).
+
+shape(P) ->
+    {backtrace, B} = process_info(P, backtrace),
+    Lines = string:split(binary_to_list(B), "\n", all),
+    {length([L || "arity = " ++ _ = L <- Lines]),
+     length([L || "   " ++ _ = L <- Lines]),
+     [L || "Program counter" ++ _ = L <- Lines] =/= []}.
+
+spin() -> spin().
+wait(_A, _B, _C) -> receive stop -> ok end.
+"#;
+
+#[test]
+fn backtrace_of_a_waiting_or_runnable_process_has_no_arity_lines() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping backtrace arity line test");
+        return;
+    };
+    let module = reference
+        .compile_named("bt_arity_lines", ARITY_MODULE, &[])
+        .expect("compile bt_arity_lines");
+    drop(reference);
+    let dir = std::env::temp_dir().join(format!("arinsal-bt-arity-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(dir.join("bt_arity_lines.beam"), &module).expect("write beam");
+    let eval = "bt_arity_lines:run(), halt().";
+    let expected = run_eval(std::path::Path::new("erl"), &dir, eval);
+    let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/arinsal");
+    assert!(bin.is_file(), "build target/release/arinsal first");
+    let actual = run_eval(&bin, &dir, eval);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        expected, "[{waiting,{0,0,true}},{runnable,{0,0,true}}]",
+        "unexpected erl output"
     );
     assert_eq!(actual, expected);
 }
