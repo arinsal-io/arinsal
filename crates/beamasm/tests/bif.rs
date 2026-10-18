@@ -87,7 +87,9 @@ extern "C" fn resolve_apply(_: *mut ProcessHeader, _: u64, _: u32, _: u32) -> us
 fn run(emit: impl FnOnce(&mut BeamModuleAssembler)) -> (u64, u64, u64) {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     emit(&mut asm);
+    asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
