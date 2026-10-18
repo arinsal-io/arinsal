@@ -633,7 +633,7 @@ fn process_info_aux(
                 _ => Term::small(0).unwrap(),
             })
         }
-        arinsal_term::atoms::BACKTRACE => process_info_item_backtrace(vm, process, status)?,
+        arinsal_term::atoms::BACKTRACE => process_info_item_backtrace(vm, process)?,
         arinsal_term::atoms::BINARY => process_info_item_binary(process)?,
         arinsal_term::atoms::CATCHLEVEL => Term::small(0).unwrap(),
         arinsal_term::atoms::CURRENT_FUNCTION
@@ -882,14 +882,9 @@ fn process_info_item_monitored_by(process: &mut Process, pid: Pid) -> Result<Ter
 }
 
 #[inline(never)]
-fn process_info_item_backtrace(
-    vm: Option<&Vm>,
-    process: &mut Process,
-    status: Term,
-) -> Result<Term, VmError> {
+fn process_info_item_backtrace(vm: Option<&Vm>, process: &mut Process) -> Result<Term, VmError> {
     Ok({
-        let running = status == atom("running");
-        let text = backtrace_text(vm, process, running)?;
+        let text = backtrace_text(vm, process)?;
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap)
             .binary(&text)
@@ -1622,11 +1617,10 @@ fn pc_description(modules: &[std::sync::Arc<crate::Module>], word: Term, native:
 /// The text of `process_info(Pid, backtrace)`: program counter and the stack, innermost first.
 // Port of erts/emulator/beam/erl_process.c:14896 (erts_stack_dump), :14911
 // (erts_program_counter_info), :14970 (stack_element_dump), OTP-29.1.1.
-fn backtrace_text(
-    vm: Option<&Vm>,
-    process: &mut Process,
-    running: bool,
-) -> Result<Vec<u8>, VmError> {
+// The `backtrace` item is always answered by the target while it handles the request
+// signal (`ERTS_PI_FLAG_FORCE_SIG_SEND`), so the target is in a running state when
+// `erts_program_counter_info` reads it and prints neither `arity = N` nor the registers.
+fn backtrace_text(vm: Option<&Vm>, process: &mut Process) -> Result<Vec<u8>, VmError> {
     if process
         .self_pid
         .is_some_and(|pid| crate::trace::is_sensitive(process, pid))
@@ -1634,19 +1628,15 @@ fn backtrace_text(
         return Ok(Vec::new());
     }
     match vm {
-        Some(vm) => Ok(backtrace_with(&vm.code.modules, process, running)),
+        Some(vm) => Ok(backtrace_with(&vm.code.modules, process)),
         None => {
             let runtime = process.runtime.clone().ok_or_else(badarg)?;
-            Ok(runtime.with_modules(|modules| backtrace_with(modules, process, running)))
+            Ok(runtime.with_modules(|modules| backtrace_with(modules, process)))
         }
     }
 }
 
-fn backtrace_with(
-    modules: &[std::sync::Arc<crate::Module>],
-    process: &Process,
-    running: bool,
-) -> Vec<u8> {
+fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) -> Vec<u8> {
     use std::fmt::Write as _;
     let print = |word: Term| match arinsal_term::to_owned(word) {
         Ok(owned) => super::sys::print_otp_term(&owned, i32::MAX as usize),
@@ -1708,13 +1698,6 @@ fn backtrace_with(
         );
     } else {
         let _ = writeln!(text, "Program counter: {address:#018x} ({description})");
-    }
-    if !running {
-        let arity = crate::process::switched_out_live(process);
-        let _ = writeln!(text, "arity = {arity}");
-        for argument in process.x.iter().take(arity) {
-            let _ = writeln!(text, "   {}", print(*argument));
-        }
     }
     let base = process.heap.frame_pointer();
     if let Some(frame) = process.trap_return_frame()
