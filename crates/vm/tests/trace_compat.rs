@@ -12,7 +12,7 @@ const SOURCE: &str = r#"
          trapped_bif_return/0, trapped_bif_exception/0, system_monitor_session/0,
          system_monitor_old_api/0, port_tracer_gone/0, seq_token_counters/0,
          call_match_self/0, seq_receive_states/0, call_match_set_seq_token/0,
-         alias_reply_once/0, big_call_message_tracer/0, new_tracing_dies_with_tracer/0,
+         alias_reply_once/0, alias_reply_once_two_senders/0, big_call_message_tracer/0, new_tracing_dies_with_tracer/0,
          nocatch_stack_with_trace_frames/0, bif_session_global_destroyed/0,
          link_events_in_signal_order/0]).
 -export([d1/1, d2/1]).
@@ -202,6 +202,25 @@ alias_reply_once() ->
     A = receive {alias, X} -> X end,
     A ! one,
     A ! two,
+    R ! three,
+    collect([]).
+
+%% Two processes send through a `reply` alias before its owner receives anything: only the
+%% first message gets through, whatever else arrives in the same batch.
+alias_reply_once_two_senders() ->
+    Me = self(),
+    R = spawn(fun() ->
+                      A = alias([reply]),
+                      Me ! {alias, A},
+                      receive go -> ok end,
+                      receive M1 -> Me ! {got, M1} end,
+                      receive M2 -> Me ! {got, M2} end
+              end),
+    A = receive {alias, X} -> X end,
+    Second = spawn(fun() -> receive first_sent -> A ! two, Me ! second_sent end end),
+    spawn(fun() -> A ! one, Second ! first_sent end),
+    receive second_sent -> ok end,
+    R ! go,
     R ! three,
     collect([]).
 
@@ -413,6 +432,11 @@ fn match_spec_sets_the_seq_token() {
 #[test]
 fn reply_alias_dies_with_its_first_message() {
     check("alias_reply_once");
+}
+
+#[test]
+fn reply_alias_drops_the_second_of_two_senders_in_one_batch() {
+    check("alias_reply_once_two_senders");
 }
 
 #[test]

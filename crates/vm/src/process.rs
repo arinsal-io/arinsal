@@ -631,6 +631,12 @@ impl Message {
         self.priority
     }
 
+    /// A priority message or one sent through an alias: an `ERTS_SIG_Q_OP_ALTACT_MSG` signal
+    /// that is handled, not spliced into the message queue, when the outer queue is fetched.
+    pub(crate) fn is_altact_msg(&self) -> bool {
+        self.priority || self.alias != 0
+    }
+
     /// The seq_trace token the sender attached, if any.
     pub(crate) fn take_seq_token(&mut self) -> Option<Box<crate::seq_trace::Token>> {
         self.fragment
@@ -5594,11 +5600,12 @@ impl Process {
     }
 
     /// An ordinary message signal: it joins the message queue without being handled. A
-    /// priority message is an `ERTS_SIG_Q_OP_ALTACT_MSG` non-message signal in erts.
+    /// priority message or a message sent through an alias is an `ERTS_SIG_Q_OP_ALTACT_MSG`
+    /// non-message signal in erts.
     fn is_ordinary_message(payload: &Payload<Message>) -> bool {
         match payload {
             Payload::Message(message) | Payload::TimerMessage { message, .. } => {
-                !message.is_priority()
+                !message.is_altact_msg()
             }
             Payload::Timer { .. } => true,
             Payload::Signal(_) => false,
@@ -6371,7 +6378,8 @@ impl Process {
         let Some(probe) = cold.signal_probe.take() else {
             return Ok(0);
         };
-        let fetched = probe.fetch_messages_if(|message| !message.is_priority(), &mut self.sig_cont);
+        let fetched =
+            probe.fetch_messages_if(|message| !message.is_altact_msg(), &mut self.sig_cont);
         self.cold_mut().signal_probe = Some(probe);
         while let Some(Event { payload, .. }) = self.sig_cont.pop_front() {
             self.sig_cont_taken += 1;
@@ -7156,8 +7164,8 @@ fn new_executor(runtime: &Arc<Runtime>) -> Box<Executor> {
 }
 
 impl arinsal_sched::SignalMessage for Message {
-    fn is_priority(&self) -> bool {
-        self.priority
+    fn is_altact_msg(&self) -> bool {
+        self.priority || self.alias != 0
     }
     fn timer_ref_key(&self) -> Option<u64> {
         self.timer_id
