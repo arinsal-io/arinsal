@@ -576,6 +576,33 @@ impl Process {
         crate::natives::erts_debug::after_message_queue_change(self);
     }
 
+    /// Removes the first message of a plain receive: no priority range, no receive marker, no
+    /// memory breakpoint and no seq_trace token to apply. `Ok(false)` means the general path
+    /// must run; nothing was changed then.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h (erts_msgq_unlink_msg_set_save_first
+    // with the save pointer at the first message), OTP-29.1.1.
+    #[inline]
+    pub(crate) fn remove_first_message(&mut self) -> Result<bool, VmError> {
+        if self.receive_cursor != 0
+            || self.cold.as_ref().is_some_and(|cold| {
+                cold.prio_len != 0
+                    || cold.priority_resume_cursor.is_some()
+                    || cold.receive_markers.is_some()
+                    || !cold.call_memory.is_empty()
+            })
+            || !self
+                .inbox
+                .pop_front_untokened(&mut self.heap, self.seq_trace_token.is_some())?
+        {
+            return Ok(false);
+        }
+        self.delay_gc = false;
+        crate::natives::erts_debug::after_message_queue_change(self);
+        self.receive_deadline = None;
+        self.receive_deadline_ms = None;
+        Ok(true)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn remove_message(
         &mut self,

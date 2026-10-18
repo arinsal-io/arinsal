@@ -322,13 +322,24 @@ pub extern "C" fn arinsal_beamasm_remove_message(
     fcalls: i32,
     active_code_ix: usize,
 ) -> i32 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
         return fcalls;
     };
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1087-1089 (beam_jit_remove_message),
     // OTP-29.1.1.
     if active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX {
+        crate::native_hooks::convert_native_cursors(process);
         crate::trace::save_call(process, crate::trace::SavedCall::Receive);
+    } else {
+        match process.remove_first_message() {
+            Ok(true) => return fcalls,
+            Ok(false) => {}
+            Err(_) => {
+                crate::native_hooks::set_error(process, "system_limit");
+                return fcalls;
+            }
+        }
+        crate::native_hooks::convert_native_cursors(process);
     }
     // A message carrying a seq_trace token emits its `receive` event on the receiver's own
     // heap here (the tracer may be the receiver itself), so the native HTOP and stack

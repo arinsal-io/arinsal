@@ -277,6 +277,41 @@ impl MessageQueue {
         Ok((removed.map(|(term, _token)| term), prio_len))
     }
 
+    /// Unlink the head message when it carries no seq_trace token to apply to the receiver.
+    /// Returns `Ok(false)` and leaves the queue untouched otherwise.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h (erts_msgq_unlink_msg_set_save_first for
+    // the first message) and erl_message.c (erts_save_message_in_proc), OTP-29.1.1.
+    #[inline]
+    pub(crate) fn pop_front_untokened(
+        &mut self,
+        heap: &mut ProcessHeap,
+        receiver_has_token: bool,
+    ) -> Result<bool, VmError> {
+        let Some(entry) = self.entries.front_mut() else {
+            return Ok(false);
+        };
+        if (entry.seq_nil && receiver_has_token)
+            || entry
+                .fragment
+                .as_ref()
+                .is_some_and(|fragment| fragment.seq_token.is_some())
+        {
+            return Ok(false);
+        }
+        if let Some(heap_fragment) = entry
+            .fragment
+            .as_mut()
+            .and_then(|fragment| fragment.heap.take())
+        {
+            heap.adopt_message_fragment(heap_fragment)
+                .map_err(|error| {
+                    VmError::Unsupported(format!("message fragment adoption: {error:?}"))
+                })?;
+        }
+        self.entries.pop_front();
+        Ok(true)
+    }
+
     pub(crate) fn remove_to_heap_with_token(
         &mut self,
         index: usize,
