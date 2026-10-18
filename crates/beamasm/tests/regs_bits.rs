@@ -63,12 +63,14 @@ fn execute(asm: BeamModuleAssembler, values: &[u64]) -> (ProcessHeader, Schedule
 
 #[cfg(target_arch = "aarch64")]
 fn finish(asm: &mut BeamModuleAssembler) {
+    asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
     })
     .unwrap();
     asm.emit_i_func_label(99).unwrap();
+    asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| e.ret(Gpr::x(30))).unwrap();
 }
 
@@ -77,6 +79,7 @@ fn finish(asm: &mut BeamModuleAssembler) {
 fn writable_runtime_publishes_heap_and_stack_pointers() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_bs_init_writable(ArgVal::X(0), writable_hook as BsInitWritableHelper)
         .unwrap();
     finish(&mut asm);
@@ -104,6 +107,7 @@ fn construction_runtime_keeps_non_destination_x_registers() {
     };
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_i_bs_create_bin(
         0,
         3,
@@ -135,6 +139,7 @@ fn float_runtime_preserves_register_backed_values() {
     let term = bignum.as_mut_ptr() as u64 + 2;
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     emit_fconv(&mut asm, ArgVal::X(0), 0, float_hook as BigToFloat).unwrap();
     finish(&mut asm);
     let (_, regs) = execute(asm, &[term, 0x222, 0x333, 0x444, 0x555, 0x666]);
@@ -150,6 +155,7 @@ fn float_runtime_preserves_register_backed_values() {
 fn match_string_runtime_keeps_the_argument_registers() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_i_bs_match_string(
         ArgVal::X(0),
         99,
@@ -231,6 +237,7 @@ fn fixed_integer_construction_is_inline() {
     ];
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_i_bs_create_bin(
         0,
         0,
@@ -284,7 +291,6 @@ fn utf8_construction_is_inline() {
     asm.call(2).unwrap();
     asm.move_(ArgVal::Y(0), ArgVal::X(1)).unwrap();
     asm.deallocate(1).unwrap();
-    asm.emit_leave_frame().unwrap();
     finish(&mut asm);
     let (mem, header, regs) = execute_inline(asm, &[small(0x20ac)]);
     SEEN.with(|seen| assert!(seen.borrow().is_empty()));
@@ -318,6 +324,7 @@ fn non_small_integer_construction_uses_the_helper() {
     };
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_i_bs_create_bin(
         0,
         0,
