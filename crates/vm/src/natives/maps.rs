@@ -647,6 +647,8 @@ extern "C" fn map_next_light(
     crate::native_helpers::thin_bif_light::<MapNext>(header, regs, i, descriptor, identity)
 }
 
+/// Run OTP's flatmap iterator branch directly against the native heap top.
+// Port of erts/emulator/beam/erl_map.c (erts_internal_map_next_3), OTP-29.1.1.
 #[inline(always)]
 fn map_next_native(header: *mut arinsal_beamasm::ProcessHeader) -> Option<u64> {
     let (process, registers) = crate::native_hooks::enter_runtime_no_cursors(header)?;
@@ -656,10 +658,6 @@ fn map_next_native(header: *mut arinsal_beamasm::ProcessHeader) -> Option<u64> {
         return None;
     }
     let mut top = crate::native_top_heap::NativeTopHeap::new(process)?;
-    let words = if list_mode { 5 * n } else { 4 * n };
-    if arinsal_term::HeapAlloc::words_left(&top)? < words {
-        return None;
-    }
     let term = arinsal_maps::flatmap_next_checked(flat, n, list_mode, mode, &mut top).ok()?;
     registers.x_reg_array[0] = term;
     Some(crate::native_hooks::raw(term))

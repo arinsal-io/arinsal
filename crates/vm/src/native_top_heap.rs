@@ -66,16 +66,22 @@ impl<'a> NativeTopHeap<'a> {
         &mut self.heap
     }
 
+    /// Allocate a heap fragment after the native `HAllocX` test fails.
+    // Port of erts/emulator/beam/erl_vm.h (HAllocX) and utils.c
+    // (erts_heap_alloc), OTP-29.1.1.
     #[cold]
     #[inline(never)]
     fn alloc_slow(&mut self, words: usize) -> Option<*mut u64> {
-        self.slow().alloc(words)
+        Some(self.slow().0.heap_fragment(words))
     }
 
+    /// Allocate an extended heap fragment after the native `HAllocX` test fails.
+    // Port of erts/emulator/beam/erl_vm.h (HAllocX) and utils.c
+    // (erts_heap_alloc), OTP-29.1.1.
     #[cold]
     #[inline(never)]
     fn alloc_with_extra_slow(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
-        self.slow().alloc_with_extra(words, extra)
+        Some(self.slow().0.heap_fragment_with_extra(words, extra))
     }
 
     #[cold]

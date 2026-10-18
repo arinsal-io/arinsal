@@ -60,7 +60,7 @@ fn maps_iterator_operations_match_otp_for_flatmaps_and_hamts() {
         -export([to_list/1,to_list_iter/1,to_list_ordered/1,to_list_reversed/1,\n\
                  next/1,next_unordered/1,iterator/1,iterator_unordered/1,\n\
                  iterator_reversed/1,iterator_custom/1,raw/1,raw_at/2,raw_iter/1,raw_iter_at/2,fold/1,\n\
-                 invalid/0,bad_mode/1,bad_path/1,bounds/0,churn/1]).\n\
+                 fold_put/1,invalid/0,bad_mode/1,bad_path/1,bounds/0,churn/1]).\n\
         to_list(M) -> maps:to_list(M).\n\
         to_list_iter(M) -> maps:to_list(maps:iterator(M)).\n\
         to_list_ordered(M) -> maps:to_list(maps:iterator(M, ordered)).\n\
@@ -76,6 +76,7 @@ fn maps_iterator_operations_match_otp_for_flatmaps_and_hamts() {
         raw_iter(M) -> erts_internal:map_next(0, M, iterator).\n\
         raw_iter_at(M, Path) -> erts_internal:map_next(Path, M, iterator).\n\
         fold(M) -> maps:fold(fun(K, _V, A) -> [K | A] end, [], M).\n\
+        fold_put(M) -> maps:fold(fun(K, V, A) -> A#{K => V} end, #{}, M).\n\
         invalid() -> try erts_internal:map_next(0, not_a_map, iterator) catch error:badarg -> badarg end.\n\
         bad_mode(M) -> try erts_internal:map_next(0, M, bad) catch error:badarg -> badarg end.\n\
         bad_path(M) -> try erts_internal:map_next(not_a_path, M, []) catch error:badarg -> badarg end.\n\
@@ -111,6 +112,23 @@ fn maps_iterator_operations_match_otp_for_flatmaps_and_hamts() {
                 "raw",
                 "raw_iter",
                 "fold",
+            ]
+        } else if size == 3 {
+            &[
+                "to_list",
+                "to_list_iter",
+                "to_list_ordered",
+                "to_list_reversed",
+                "next",
+                "next_unordered",
+                "iterator",
+                "iterator_unordered",
+                "iterator_reversed",
+                "iterator_custom",
+                "raw",
+                "raw_iter",
+                "fold",
+                "fold_put",
             ]
         } else {
             &[
