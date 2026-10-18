@@ -2745,26 +2745,55 @@ fn iolist_size(
     // charges one reduction per eight of them.
     let root = args[0];
     let reds_left = process.reductions.max(0) as usize;
-    let state = match state {
-        Some(state) => Arc::clone(state),
-        None => magic_binary_state(
-            Mutex::new(arinsal_bifs::IolistSizeWalk::new(root)),
-            ERTS_IOLIST_SIZE_STATE_SIZE,
-        ),
+    // erts walks on the C stack and allocates trap state only when it yields, so the common
+    // call that finishes in one go allocates nothing.
+    let (progress, size, parked) = match state {
+        Some(state) => {
+            let mut walker = state
+                .downcast_ref::<Mutex<arinsal_bifs::IolistSizeWalk>>()
+                .ok_or(BifError::BADARG)?
+                .lock()
+                .map_err(|_| BifError::SystemLimit)?;
+            if reds_left == 0 {
+                drop(walker);
+                return Ok(HandlerResult::Yield {
+                    continuation: IOLIST_SIZE_CONTINUATION,
+                    state: Arc::clone(state),
+                    reductions: 0,
+                });
+            }
+            let progress = walker.step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED));
+            let size = if matches!(progress, Ok((true, _))) {
+                walker.take_size()
+            } else {
+                0
+            };
+            (progress, size, Some(Arc::clone(state)))
+        }
+        None => {
+            let mut walker = arinsal_bifs::IolistSizeWalk::new(root);
+            if reds_left == 0 {
+                return Ok(HandlerResult::Yield {
+                    continuation: IOLIST_SIZE_CONTINUATION,
+                    state: magic_binary_state(Mutex::new(walker), ERTS_IOLIST_SIZE_STATE_SIZE),
+                    reductions: 0,
+                });
+            }
+            let progress = walker.step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED));
+            match progress {
+                Ok((true, _)) => (progress, walker.take_size(), None),
+                _ => (
+                    progress,
+                    0,
+                    Some(magic_binary_state(
+                        Mutex::new(walker),
+                        ERTS_IOLIST_SIZE_STATE_SIZE,
+                    )),
+                ),
+            }
+        }
     };
-    let walker = state
-        .downcast_ref::<Mutex<arinsal_bifs::IolistSizeWalk>>()
-        .ok_or(BifError::BADARG)?;
-    let mut walker = walker.lock().map_err(|_| BifError::SystemLimit)?;
-    if reds_left == 0 {
-        drop(walker);
-        return Ok(HandlerResult::Yield {
-            continuation: IOLIST_SIZE_CONTINUATION,
-            state,
-            reductions: 0,
-        });
-    }
-    let (done, work) = match walker.step(reds_left.saturating_mul(SIZE_YIELDS_PER_RED)) {
+    let (done, work) = match progress {
         Ok(progress) => progress,
         Err((error, work)) => {
             return Ok(HandlerResult::Failed {
@@ -2775,15 +2804,15 @@ fn iolist_size(
     };
     let reductions = arinsal_bifs::iolist_yield_reductions(work) as u32;
     if !done {
-        drop(walker);
+        let Some(state) = parked else {
+            return Err(BifError::SystemLimit);
+        };
         return Ok(HandlerResult::Yield {
             continuation: IOLIST_SIZE_CONTINUATION,
             state,
             reductions,
         });
     }
-    let size = walker.take_size();
-    drop(walker);
     process.set_gc_enabled(restore_gc);
     let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .int_from_u64(u64::try_from(size).map_err(|_| BifError::SystemLimit)?)
