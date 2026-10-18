@@ -6795,7 +6795,10 @@ impl Process {
             } else {
                 0
             }) as u64;
-            let checks = match self.heap.max_heap_collection_checks(min_free, moved.iter().map(|(_, _, heap)| heap)) {
+            let checks = match self
+                .heap
+                .max_heap_collection_checks(min_free, moved.iter().map(|(_, _, heap)| heap))
+            {
                 Ok(checks) => checks,
                 Err(error) => {
                     if !moved_indices.is_empty() {
