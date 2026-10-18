@@ -139,18 +139,13 @@ impl BeamModuleAssembler {
         let update = crate::Update::HEAP_ALLOC;
         crate::emit_enter_runtime(&mut self.code, 2, update)?;
         self.code.emit(|e| {
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
             e.mov_reg(Gpr::x(0), C_P)?;
             e.mov_reg(Gpr::x(1), XREGS[0])?;
-            e.mov_reg(Gpr::x(2), XREGS[2])?;
-            e.mov_const(Gpr::x(17), add_stacktrace as usize as u64)?;
-            e.blr(Gpr::x(17))
+            e.mov_reg(Gpr::x(2), XREGS[2])
         })?;
+        self.fragment_call(add_stacktrace as usize)?;
         crate::emit_leave_runtime(&mut self.code, 2, update)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
-            e.mov_reg(XREGS[0], Gpr::x(0))
-        })?;
+        self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
         self.code.bind(have_reason)?;
         // The reason or {Reason, Stacktrace} stays live in X0 across the possible GC.
         self.emit_test_heap(3, 1, gc)?;
@@ -253,17 +248,12 @@ impl BeamModuleAssembler {
         let update = crate::Update::HEAP_ALLOC;
         crate::emit_enter_runtime(&mut self.code, 0, update)?;
         self.code.emit(|e| {
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
             e.mov_reg(Gpr::x(0), C_P)?;
-            e.mov_reg(Gpr::x(1), XREGS[0])?;
-            e.mov_const(Gpr::x(17), helper_address as u64)?;
-            e.blr(Gpr::x(17))
+            e.mov_reg(Gpr::x(1), XREGS[0])
         })?;
+        self.fragment_call(helper_address)?;
         crate::emit_leave_runtime(&mut self.code, 0, update)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
-            e.mov_reg(XREGS[0], Gpr::x(0))
-        })?;
+        self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
         Ok(())
     }
 
@@ -324,14 +314,11 @@ impl BeamModuleAssembler {
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), C_P)?;
             e.mov_reg(Gpr::x(1), XREGS[2])?;
-            e.mov_reg(Gpr::x(2), XREGS[1])?;
-            e.mov_const(Gpr::x(17), class_helper as u64)?;
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
-            e.blr(Gpr::x(17))
+            e.mov_reg(Gpr::x(2), XREGS[1])
         })?;
+        self.fragment_call(class_helper)?;
         crate::emit_leave_runtime(&mut self.code, 3, update)?;
         self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
             e.mov_reg(TMP3, Gpr::x(0))?;
             e.ldr_uoff(TMP2, C_P, 48)
         })?;
@@ -437,15 +424,12 @@ impl BeamModuleAssembler {
             e.str_uoff(class, C_P, 40)?;
             e.str_uoff(value, C_P, 48)?;
             e.str_uoff(trace, C_P, 56)?;
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
             e.mov_reg(Gpr::x(0), C_P)?;
             e.mov_reg(Gpr::x(1), Gpr::x(19))?;
-            e.mov_reg(Gpr::x(2), E)?;
-            e.mov_const(Gpr::x(17), resolver_address as u64)?;
-            e.blr(Gpr::x(17))
+            e.mov_reg(Gpr::x(2), E)
         })?;
+        self.fragment_call(resolver_address)?;
         crate::emit_leave_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(30), C_P, 72))?;
         self.code.cbnz(Gpr::x(0), caught)?;
         // Port of beam_asm_global.cpp:328 (`cbz ARG1, do_schedule`): an uncaught
         // exception must leave native via the enter_native bridge, not `ret` to
