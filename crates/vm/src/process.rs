@@ -1457,6 +1457,8 @@ impl Executor {
                 // Port of erts/emulator/beam/erl_process.c:10318-10351 (schedule: a process
                 // with signals queued handles them before Erlang code; with Erlang work to do
                 // and no dirty work, at most ERTS_SIG_HANDLE_REDS_MAX_PREFERED), OTP-29.1.1.
+                // A process parked on a request reply reads it from its message queue like
+                // erts_internal:await_result's receive, so the reply message is fetched here.
                 if ctx.sys_task_run()
                     || !process.sig_cont_empty()
                     || process.delayed_gc_due()

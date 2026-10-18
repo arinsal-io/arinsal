@@ -10,7 +10,14 @@ use std::process::Command;
 
 const CHILD: &str = "ARINSAL_PROC_SIG_ORDER_CHILD";
 const MODULE: &str = "proc_sig_order";
-const CASES: &[&str] = &["monitor_then_send", "demonitor_then_send", "link_then_exit"];
+const CASES: &[&str] = &[
+    "monitor_then_send",
+    "demonitor_then_send",
+    "link_then_exit",
+    "message_exit_message",
+    "message_exit_message_running",
+    "info_reply_after_unmatched_message",
+];
 
 const SOURCE: &str = r#"-module(proc_sig_order).
 -export([run/1]).
@@ -42,7 +49,69 @@ run(link_then_exit) ->
     Seen = receive {P, Found} -> Found after 5000 -> timeout end,
     P ! stop,
     unlink(P),
-    Seen.
+    Seen;
+run(message_exit_message) ->
+    Self = self(),
+    P = spawn(fun() -> collecting_target(Self) end),
+    receive {P, ready} -> ok end,
+    link(P),
+    P ! first,
+    exit(P, boom),
+    P ! second,
+    receive {P, Seen} -> Seen after 5000 -> timeout end;
+run(message_exit_message_running) ->
+    Self = self(),
+    P = spawn(fun() -> running_target(Self) end),
+    receive {P, ready} -> ok end,
+    link(P),
+    P ! go,
+    P ! first,
+    exit(P, boom),
+    P ! second,
+    receive {P, Seen} -> Seen after 5000 -> timeout end;
+run(info_reply_after_unmatched_message) ->
+    Self = self(),
+    P = spawn(fun() -> Self ! {self(), ready}, receive stop -> ok end end),
+    receive {P, ready} -> ok end,
+    wait_waiting(P),
+    P ! unmatched,
+    {message_queue_len, Len} = process_info(P, message_queue_len),
+    {memory, Memory} = process_info(P, memory),
+    exit(P, kill),
+    {Len, is_integer(Memory)}.
+
+wait_waiting(P) ->
+    case process_info(P, status) of
+        {status, waiting} -> ok;
+        _ -> timer:sleep(1), wait_waiting(P)
+    end.
+
+%% Reports the order in which messages and the exit signal of the parent are received.
+collecting_target(Parent) ->
+    process_flag(trap_exit, true),
+    Parent ! {self(), ready},
+    receive
+        first -> ok
+    end,
+    Parent ! {self(), [first | drain(Parent)]}.
+
+drain(Parent) ->
+    receive
+        {'EXIT', Parent, Reason} -> [{exit, Reason} | drain(Parent)];
+        Message -> [Message | drain(Parent)]
+    after 200 -> []
+    end.
+
+%% Like collecting_target, but the process is runnable when the signals arrive.
+running_target(Parent) ->
+    process_flag(trap_exit, true),
+    Parent ! {self(), ready},
+    receive go -> ok end,
+    spin(2000),
+    Parent ! {self(), drain(Parent)}.
+
+spin(0) -> ok;
+spin(N) -> erlang:yield(), spin(N - 1).
 
 %% Replies with whether the probing parent is among the monitors it has when the probe is handled.
 target() ->
