@@ -4087,24 +4087,16 @@ fn emit_op(
                 .collect::<Vec<_>>();
             if matches!(ported(op.name()), Some(EmitterKind::SelectVal)) {
                 let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
+                // Port of erts/emulator/beam/jit/arm/instr_select.cpp:107-190,
+                // OTP-29.1.1, and of gen.select_val in generators.tab, which
+                // sorts the pairs for the linear and the binary search alike
+                // (beam_load_sort_select_vals; see sorted_select_val_pairs). Atom words are process-local
+                // here, so order the pairs by the words the emitted comparison
+                // sees.
+                pairs = sorted_select_val_pairs(&pairs);
                 if op.name() == "i_select_val_lins" {
                     assembler.emit_i_select_val_lins(source, value(1)?, size, &pairs)
                 } else {
-                    // Port of erts/emulator/beam/jit/arm/instr_select.cpp:107-190,
-                    // OTP-29.1.1. Atom words are process-local here, so order
-                    // the pairs by the words the emitted comparison sees.
-                    let count = pairs.len() / 2;
-                    let mut order = (0..count).collect::<Vec<_>>();
-                    order.sort_by_key(|&index| match pairs[index] {
-                        ArgVal::Immediate(value) | ArgVal::Literal(value) => value,
-                        _ => 0,
-                    });
-                    let values = order.iter().map(|&index| pairs[index]).collect::<Vec<_>>();
-                    let labels = order
-                        .iter()
-                        .map(|&index| pairs[index + count])
-                        .collect::<Vec<_>>();
-                    pairs = values.into_iter().chain(labels).collect();
                     assembler.emit_i_select_val_bins(source, value(1)?, size, &pairs)
                 }
             } else {
@@ -4561,6 +4553,25 @@ pub fn emitter_for(name: &str) -> bool {
     ported(name).is_some()
 }
 
+/// Orders a `select_val` pair list (all values, then all labels) by the raw word each value
+/// compares as, for the linear and the binary search alike.
+// Port of gen.select_val in erts/emulator/beam/jit/arm/generators.tab
+// (beam_load_sort_select_vals), OTP-29.1.1. Atom words are process-local here, so the order
+// is taken from the words the emitted comparison sees.
+fn sorted_select_val_pairs(pairs: &[ArgVal]) -> Vec<ArgVal> {
+    let count = pairs.len() / 2;
+    let mut order = (0..count).collect::<Vec<_>>();
+    order.sort_by_key(|&index| match pairs[index] {
+        ArgVal::Immediate(value) | ArgVal::Literal(value) => value,
+        _ => 0,
+    });
+    order
+        .iter()
+        .map(|&index| pairs[index])
+        .chain(order.iter().map(|&index| pairs[index + count]))
+        .collect()
+}
+
 #[cfg(test)]
 mod function_allowlist_tests {
     use super::function_allowlist_contains;
@@ -4575,5 +4586,33 @@ mod function_allowlist_tests {
         assert!(!function_allowlist_contains("with/2", "with", 1));
         assert!(!function_allowlist_contains("with/2", "with_1", 2));
         assert!(!function_allowlist_contains("broken,with/nope", "with", 2));
+    }
+}
+
+#[cfg(test)]
+mod select_val_order_tests {
+    use super::{ArgVal, sorted_select_val_pairs};
+
+    #[test]
+    fn pairs_are_ordered_by_raw_value_for_short_lists() {
+        let pairs = [
+            ArgVal::Immediate(0x38b),
+            ArgVal::Immediate(0xa18b),
+            ArgVal::Immediate(0x38b - 0x40),
+            ArgVal::Label(1),
+            ArgVal::Label(2),
+            ArgVal::Label(3),
+        ];
+        assert_eq!(
+            sorted_select_val_pairs(&pairs),
+            [
+                ArgVal::Immediate(0x38b - 0x40),
+                ArgVal::Immediate(0x38b),
+                ArgVal::Immediate(0xa18b),
+                ArgVal::Label(3),
+                ArgVal::Label(1),
+                ArgVal::Label(2),
+            ]
+        );
     }
 }
