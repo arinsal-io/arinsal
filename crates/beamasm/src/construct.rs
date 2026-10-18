@@ -577,14 +577,9 @@ impl BeamModuleAssembler {
         let small = self.code.new_label();
         // No X register is live after a call, and the clock touches no process state.
         crate::emit_enter_runtime(&mut self.code, 0, crate::Update::NONE)?;
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(17), clock as u64)?;
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
-            e.blr(Gpr::x(17))
-        })?;
+        self.fragment_call(clock)?;
         crate::emit_leave_runtime(&mut self.code, 0, crate::Update::NONE)?;
         self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
             // A small has SMALL_BITS (60) bits: the top five bits must all be equal.
             e.asr_imm(SCRATCH[0], Gpr::x(0), 59)?;
             e.add_imm(SCRATCH[0], SCRATCH[0], 1, false)?;
@@ -710,17 +705,15 @@ impl BeamModuleAssembler {
         self.code.emit(|e| {
             e.sub_reg(Gpr::x(2), SCRATCH[0], HTOP, arinsal_a64::enc::Shift::Lsl, 0)?;
             e.lsr_imm(Gpr::x(2), Gpr::x(2), 3)?;
-            e.sub_imm(Gpr::x(2), Gpr::x(2), RESERVED_WORDS as u16, false)?;
-            e.str_uoff(Gpr::x(30), C_P, 72)
+            e.sub_imm(Gpr::x(2), Gpr::x(2), RESERVED_WORDS as u16, false)
         })?;
         crate::emit_enter_runtime(&mut self.code, MAX_REGISTER_X, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), C_P)?;
             e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
-            e.mov_reg(Gpr::w(4), FCALLS)?;
-            e.mov_const(Gpr::x(17), hook as u64)?;
-            e.blr(Gpr::x(17))
+            e.mov_reg(Gpr::w(4), FCALLS)
         })?;
+        self.fragment_call(hook)?;
         crate::emit_leave_runtime(&mut self.code, MAX_REGISTER_X, update)?;
         self.code.emit(|e| {
             e.sub_reg(FCALLS, FCALLS, Gpr::w(0), arinsal_a64::enc::Shift::Lsl, 0)?;

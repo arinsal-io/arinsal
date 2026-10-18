@@ -54,15 +54,11 @@ impl BeamModuleAssembler {
             for (index, arg) in args.iter().copied().enumerate() {
                 e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
             }
-            e.mov_const(Gpr::x(17), helper as u64)?;
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
-            e.blr(Gpr::x(17))
+            Ok(())
         })?;
+        self.fragment_call(helper)?;
         crate::emit_leave_runtime(&mut self.code, 6, update)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
-            e.ldr_uoff(Gpr::x(9), C_P, 40)
-        })?;
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
         self.error_if_nonzero(Gpr::x(9))?;
         Ok(())
     }
