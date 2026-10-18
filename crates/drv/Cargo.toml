@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 libloading = "0.8.9"
 libc = "0.2"
+arinsal-alloc = { path = "../alloc" }
 arinsal-etf.workspace = true
 arinsal-sched.workspace = true
 num-bigint.workspace = true

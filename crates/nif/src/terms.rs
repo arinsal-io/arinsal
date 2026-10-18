@@ -76,18 +76,16 @@ unsafe extern "C" {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_alloc(n: usize) -> *mut c_void {
-    // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    unsafe { malloc(n) }
+    // Port of erts/emulator/beam/erl_nif.c (enif_alloc: erts_alloc_fnf ERTS_ALC_T_NIF), OTP-29.1.1.
+    arinsal_alloc::typed::driver_alloc(n).cast()
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_realloc(p: *mut c_void, n: usize) -> *mut c_void {
-    // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    unsafe { realloc(p, n) }
+    arinsal_alloc::typed::driver_realloc(p.cast(), n).cast()
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_free(p: *mut c_void) {
-    // SAFETY: The NIF caller retains live term heaps and provides ABI-valid storage.
-    unsafe { free(p) }
+    arinsal_alloc::typed::driver_free(p.cast());
 }
 
 macro_rules! is_kind { ($name:ident, $($pat:pat_param)|+) => {

@@ -694,6 +694,8 @@ fn heap_type_tag(allocation_type: ErtsAlcType) -> u64 {
         2
     } else if allocation_type == ErtsAlcType::HEAP_FRAG {
         3
+    } else if allocation_type == ErtsAlcType::DRV {
+        4
     } else {
         0
     }
@@ -703,6 +705,7 @@ fn heap_type_from_tag(tag: u64) -> ErtsAlcType {
     match tag {
         2 => ErtsAlcType::OLD_HEAP,
         3 => ErtsAlcType::HEAP_FRAG,
+        4 => ErtsAlcType::DRV,
         _ => ErtsAlcType::HEAP,
     }
 }
@@ -825,6 +828,28 @@ fn for_each_allocator(mut visit: impl FnMut(&ThreadSpecificAllocators)) {
     for allocators in registry().iter().flatten() {
         visit(allocators);
     }
+}
+
+/// `erts_alloc(ERTS_ALC_T_DRV, bytes)`, which `driver_alloc` and `enif_alloc` (ERTS_ALC_T_NIF,
+/// also the driver allocator) both use. Null when the request cannot be served.
+// Port of erts/emulator/beam/io.c (driver_alloc) and erl_nif.c (enif_alloc), OTP-29.1.1.
+pub fn driver_alloc(bytes: usize) -> *mut u8 {
+    let words = bytes.div_ceil(8).max(1);
+    AllocBlock::detach_heap(ErtsAlcType::DRV, words).map_or(std::ptr::null_mut(), |p| p.cast())
+}
+
+/// `erts_realloc` of a block from [`driver_alloc`]; a null `ptr` allocates.
+pub fn driver_realloc(ptr: *mut u8, bytes: usize) -> *mut u8 {
+    if ptr.is_null() {
+        return driver_alloc(bytes);
+    }
+    let words = bytes.div_ceil(8).max(1);
+    AllocBlock::realloc_detached_heap(ptr.cast(), words).map_or(std::ptr::null_mut(), |p| p.cast())
+}
+
+/// `erts_free` of a block from [`driver_alloc`]; null is ignored.
+pub fn driver_free(ptr: *mut u8) {
+    AllocBlock::free_detached_heap(ptr.cast());
 }
 
 /// Apply the queued cross-thread frees of the instances no scheduler owns.
