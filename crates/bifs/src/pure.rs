@@ -6,9 +6,9 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arinsal_term::{
-    AtomEncoding, AtomError, BinaryRef, ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef,
-    Node, Term, TermBuilder, TermError, TermKind, atoms, cmp, copy_term, exact_eq, flat_size,
-    global_atoms, loose_eq, phash,
+    AtomEncoding, AtomError, BinaryRef, ExternalBinary, HeapAlloc, MagicRef, Node, Term,
+    TermBuilder, TermError, TermKind, atoms, cmp, copy_term, exact_eq, flat_size, global_atoms,
+    loose_eq, phash,
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -102,12 +102,6 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     }
     fn supports_external_binary(&self) -> bool {
         self.0.supports_external_binary()
-    }
-    fn retain_fun(&mut self, value: Arc<FunEntry>) {
-        self.0.retain_fun(value)
-    }
-    fn retain_export(&mut self, value: Arc<ExportEntry>) {
-        self.0.retain_export(value)
     }
     fn link_magic_ref(
         &mut self,
@@ -224,12 +218,6 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for ConsBlock<'_, H> {
     }
     fn link_node(&mut self, thing: *mut u64, value: Arc<Node>) {
         self.backing.link_node(thing, value)
-    }
-    fn retain_fun(&mut self, value: Arc<FunEntry>) {
-        self.backing.retain_fun(value)
-    }
-    fn retain_export(&mut self, value: Arc<ExportEntry>) {
-        self.backing.retain_export(value)
     }
     fn link_magic_ref(
         &mut self,

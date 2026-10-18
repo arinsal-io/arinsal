@@ -1,11 +1,9 @@
 //! Iterative deep copy into one destination allocation.
-use crate::fun::{clone_export_entry, clone_fun_entry};
 use crate::literal::LiteralAreas;
 use crate::ops::{LiteralSkip, size_object_inner, size_object_with_prior};
 use crate::{
-    ARITY, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, FUN,
-    FunEntry, FunRef, HEAP_BITS, HeapAlloc, MAP, Node, RECORD, REF, SUB_BITS, Term, TermError,
-    TermKind, size_object,
+    ARITY, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, FUN, FunRef, HEAP_BITS,
+    HeapAlloc, MAP, Node, RECORD, REF, SUB_BITS, Term, TermError, TermKind, size_object,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -325,12 +323,6 @@ fn copy_struct_into<H: HeapAlloc + ?Sized>(
                             std::ptr::copy_nonoverlapping(objp, dst_fun, words);
                             htop = htop.add(words);
                             *argp = Term::from_ptr(dst_fun, 2).0;
-                            let entry = *dst_fun.add(1);
-                            if hdr & (1 << 24) != 0 {
-                                dst.retain_export(clone_export_entry(entry as *const ExportEntry));
-                            } else {
-                                dst.retain_fun(clone_fun_entry(entry as *const FunEntry));
-                            }
                         }
                         EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
                             copy_off_heap_thing(objp, hdr, argp, &mut htop, dst, false)?;
@@ -720,13 +712,9 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                         }
                     }
                     FUN => {
-                        // SAFETY: source fun entry is retained by the source heap.
+                        // SAFETY: source fun entries are permanent code-table entries.
                         match unsafe { source.fun_ref().unwrap() } {
                             FunRef::Local { .. } => {
-                                // SAFETY: word one holds Arc<FunEntry> data.
-                                unsafe {
-                                    dst.retain_fun(clone_fun_entry(*to.add(1) as *const FunEntry));
-                                }
                                 for i in (2..words).rev() {
                                     // SAFETY: local fun environment starts at word two.
                                     unsafe {
@@ -734,14 +722,7 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                                     }
                                 }
                             }
-                            FunRef::Export { .. } => {
-                                // SAFETY: word one holds Arc<ExportEntry> data.
-                                unsafe {
-                                    dst.retain_export(clone_export_entry(
-                                        *to.add(1) as *const ExportEntry
-                                    ));
-                                }
-                            }
+                            FunRef::Export { .. } => {}
                         }
                     }
                     EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {

@@ -8,7 +8,7 @@ use arinsal_loader::Module;
 use arinsal_term::{
     Atom, HeapAlloc, ProcessHeap, Term, TermBuilder, TermKind, from_owned, global_atoms, to_owned,
 };
-use arinsal_term::{ExportEntry, ExternalBinary, FunEntry, MagicRef, Node, WritableBinary};
+use arinsal_term::{ExternalBinary, MagicRef, Node, WritableBinary};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // The final continuation module index identifies an empty-trace catch immediate.
@@ -123,14 +123,6 @@ impl HeapAlloc for TraceHeap<'_> {
 
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         HeapAlloc::link_node(self.heap, thing, node);
-    }
-
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        HeapAlloc::retain_fun(self.heap, entry);
-    }
-
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        HeapAlloc::retain_export(self.heap, entry);
     }
 
     fn link_magic_ref(

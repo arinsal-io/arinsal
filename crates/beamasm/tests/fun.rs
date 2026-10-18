@@ -133,10 +133,6 @@ fn native_i_make_fun3() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_i_make_fun3_entry_matches_interpreter_layout() {
-    extern "C" fn retain_owner_for_layout_test(_header: *mut ProcessHeader, _identity: u64) -> u64 {
-        1
-    }
-
     let entry = std::sync::Arc::new(arinsal_term::FunEntry {
         dispatch_target: Default::default(),
         pend_purge_address: Default::default(),
@@ -160,7 +156,6 @@ fn native_i_make_fun3_entry_matches_interpreter_layout() {
         entry_ptr as usize,
         1,
         &[ArgVal::Immediate(79), ArgVal::Immediate(111)],
-        retain_owner_for_layout_test as *const () as usize,
     )
     .unwrap();
     asm.emit_leave_frame().unwrap();
@@ -182,7 +177,6 @@ fn native_i_make_fun3_entry_matches_interpreter_layout() {
     execute(&module, &mut header, &mut regs, &mut stack);
     assert_eq!(regs.x_reg_array[1].tagged_word() & !7, heap.as_ptr() as u64);
     assert_eq!(&heap[..4], &[1 << 8 | 2 << 16 | 0x14, entry_ptr, 79, 111]);
-    std::mem::forget(entry);
 }
 
 #[cfg(target_arch = "aarch64")]

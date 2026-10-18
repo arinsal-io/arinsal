@@ -1817,12 +1817,6 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapAdapter<'_, H> {
     fn link_node(&mut self, thing: *mut u64, node: std::sync::Arc<arinsal_term::Node>) {
         self.0.link_node(thing, node);
     }
-    fn retain_fun(&mut self, entry: std::sync::Arc<arinsal_term::FunEntry>) {
-        self.0.retain_fun(entry);
-    }
-    fn retain_export(&mut self, entry: std::sync::Arc<arinsal_term::ExportEntry>) {
-        self.0.retain_export(entry);
-    }
 }
 
 fn tracer_trace(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {

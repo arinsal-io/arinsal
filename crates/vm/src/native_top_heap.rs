@@ -9,8 +9,8 @@ use crate::Process;
 use arinsal_beamasm::ProcessHeader;
 use arinsal_bifs::ProcessHeapHandle;
 use arinsal_term::{
-    ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, OwnedBinaryRef, RefcBinary,
-    S_REDZONE, Term, TermError, WritableBinary,
+    ExternalBinary, HeapAlloc, MagicRef, Node, OwnedBinaryRef, RefcBinary, S_REDZONE, Term,
+    TermError, WritableBinary,
 };
 use std::sync::Arc;
 
@@ -206,12 +206,6 @@ impl HeapAlloc for NativeTopHeap<'_> {
     }
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         self.slow().link_node(thing, node)
-    }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        self.slow().retain_fun(entry)
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        self.slow().retain_export(entry)
     }
     fn link_magic_ref(&mut self, thing: *mut u64, owner: Arc<MagicRef>) -> Result<(), TermError> {
         self.slow().link_magic_ref(thing, owner)

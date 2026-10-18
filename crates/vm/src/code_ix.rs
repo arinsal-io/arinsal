@@ -673,6 +673,7 @@ pub(crate) fn take_code_barrier() -> bool {
 }
 
 fn scopes() -> &'static RwLock<HashMap<u64, Arc<CodeIndexes>>> {
+    // Scope entries are not evicted: their fun and export tables own entries for the VM life.
     static SCOPES: OnceLock<RwLock<HashMap<u64, Arc<CodeIndexes>>>> = OnceLock::new();
     SCOPES.get_or_init(Default::default)
 }

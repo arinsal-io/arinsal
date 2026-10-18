@@ -193,12 +193,6 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
     fn link_node(&mut self, thing: *mut u64, node: Arc<arinsal_term::Node>) {
         self.0.link_node(thing, node)
     }
-    fn retain_fun(&mut self, entry: Arc<arinsal_term::FunEntry>) {
-        self.0.retain_fun(entry)
-    }
-    fn retain_export(&mut self, entry: Arc<arinsal_term::ExportEntry>) {
-        self.0.retain_export(entry)
-    }
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,

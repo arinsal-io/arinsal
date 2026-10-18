@@ -160,7 +160,8 @@ pub(crate) struct CodeTables {
     pub(crate) loaded_nifs: SharedTable<std::collections::HashSet<String>>,
     // g_code_fix
     pub(crate) exports: SharedTable<ExportIndex>,
-    /// OTP's global local-fun table, staged with the node's code indexes.
+    /// OTP's global local-fun table. It never removes entries on purge; its node scope is
+    /// retained by the code-index registry for the VM lifetime.
     funs: SharedTable<FunEntries>,
     pub(crate) free_ids: SharedTable<Vec<usize>>,
     pub(crate) module_live: SharedTable<Vec<bool>>,

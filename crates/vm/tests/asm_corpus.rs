@@ -87,7 +87,7 @@ impl ModuleEnv for CorpusEnv {
             && let Some(entry) = self.lambda_entries.get(&lambda_index)
         {
             return TermBuilder::new(&mut *heap)
-                .local_fun(Arc::clone(entry), &[])
+                .local_fun(entry, &[])
                 .map(Term::tagged_word)
                 .map_err(|error| format!("zero-capture fun {lambda_index}: {error:?}"));
         }
@@ -120,10 +120,6 @@ impl ModuleEnv for CorpusEnv {
             .get(&index)
             .map(|entry| (Arc::as_ptr(entry) as usize, entry.arity))
             .ok_or_else(|| format!("lambda {index} is missing"))
-    }
-
-    fn retain_fun_helper(&self) -> usize {
-        1
     }
 
     fn raise_class_helper(&self) -> usize {

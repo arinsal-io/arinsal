@@ -600,7 +600,7 @@ fn fun_layout_copy_and_conversion() {
         dispatch_epoch: Default::default(),
     });
     let local = builder
-        .local_fun(entry, &[Term::small(42).unwrap()])
+        .local_fun(&entry, &[Term::small(42).unwrap()])
         .unwrap();
     assert_eq!(size_object(local), 3);
     // SAFETY: the owning heap is live and stable.
@@ -949,24 +949,22 @@ fn differential_local_fun_hashes() {
     let module = arinsal_term::global_atoms()
         .intern("arinsal_term_hash_fixture")
         .unwrap();
+    let entry = Arc::new(arinsal_term::FunEntry {
+        dispatch_target: Default::default(),
+        pend_purge_address: Default::default(),
+        module,
+        arity: 0,
+        index: fields[0] as u32,
+        uniq: [0; 16],
+        old_index: 0,
+        old_uniq: fields[1] as u32,
+        pid: Term::pid(0, 0).unwrap(),
+        dispatch: Default::default(),
+        dispatch_code: Default::default(),
+        dispatch_epoch: Default::default(),
+    });
     let fun = TermBuilder::new(&mut heap)
-        .local_fun(
-            Arc::new(arinsal_term::FunEntry {
-                dispatch_target: Default::default(),
-                pend_purge_address: Default::default(),
-                module,
-                arity: 0,
-                index: fields[0] as u32,
-                uniq: [0; 16],
-                old_index: 0,
-                old_uniq: fields[1] as u32,
-                pid: Term::pid(0, 0).unwrap(),
-                dispatch: Default::default(),
-                dispatch_code: Default::default(),
-                dispatch_epoch: Default::default(),
-            }),
-            &[Term::small(42).unwrap()],
-        )
+        .local_fun(&entry, &[Term::small(42).unwrap()])
         .unwrap();
     assert_eq!(make_hash2(fun) as u64, fields[2]);
     assert_eq!(phash(fun, 1_u64 << 32), Some(fields[3]));

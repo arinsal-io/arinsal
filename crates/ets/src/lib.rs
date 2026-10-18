@@ -15,10 +15,9 @@ use tree::Node;
 pub use tree_select::{SavedKey, ScanPosition, TREE_SELECT_ITERATIONS, TreeScanEnd, TreeScanPlan};
 
 use arinsal_term::{
-    Atom, ExportEntry, ExternalBinary, FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard,
-    FunEntry, HeapAlloc, Identity, MagicRef, Node as TermNode, Term, TermBuilder, TermError,
-    TermKind, VecHeap, WritableBinary, cmp, copy_term, exact_eq, global_atoms, internal_hash,
-    term_sequence,
+    Atom, ExternalBinary, FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, HeapAlloc,
+    Identity, MagicRef, Node as TermNode, Term, TermBuilder, TermError, TermKind, VecHeap,
+    WritableBinary, cmp, copy_term, exact_eq, global_atoms, internal_hash, term_sequence,
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -926,8 +925,6 @@ struct OffHeap {
     binary_refs: Vec<arinsal_term::OwnedBinaryRef>,
     external: Vec<Arc<ExternalBinary>>,
     nodes: Vec<Arc<TermNode>>,
-    funs: Vec<Arc<FunEntry>>,
-    exports: Vec<Arc<ExportEntry>>,
     magic: Vec<Arc<MagicRef>>,
 }
 
@@ -1031,12 +1028,6 @@ impl HeapAlloc for ObjectHeap {
     fn link_node(&mut self, thing: *mut u64, node: Arc<TermNode>) {
         let _ = self.chain_first_oh(thing as usize);
         self.off_heap().nodes.push(node);
-    }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        self.off_heap().funs.push(entry);
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        self.off_heap().exports.push(entry);
     }
     // The DbTerm's first_oh chain links the thing; the token stands in for the counted
     // reference the thing holds until db_free_term.

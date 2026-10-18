@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use arinsal_bifs::{BifError, BifFn, Ctx, for_each_list_term, tuple_pair, with_binary_bytes};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::{ExportEntry, FunEntry, HeapAlloc, Node, Term, TermBuilder, atoms, from_owned};
+use arinsal_term::{HeapAlloc, Node, Term, TermBuilder, atoms, from_owned};
 
 /// `erlang:decode_packet/3`, callable without a name lookup.
 pub const DECODE_PACKET_3: BifFn = decode_packet;
@@ -51,12 +51,6 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     }
     fn link_node(&mut self, thing: *mut u64, value: Arc<Node>) {
         self.0.link_node(thing, value)
-    }
-    fn retain_fun(&mut self, value: Arc<FunEntry>) {
-        self.0.retain_fun(value)
-    }
-    fn retain_export(&mut self, value: Arc<ExportEntry>) {
-        self.0.retain_export(value)
     }
 }
 

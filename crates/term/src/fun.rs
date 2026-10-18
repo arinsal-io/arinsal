@@ -1,5 +1,7 @@
 //! OTP 29 two-word fun head and opaque code-table entries.
 use crate::{Atom, FUN, LiteralArea, Term, TermError};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -377,6 +379,7 @@ impl ExportEntry {
 /// Build and retain `Export.lambda` in the global literal area.
 // Port of erts/emulator/beam/export.c:44-56 (create_shared_lambda), OTP-29.1.1.
 pub(crate) fn export_lambda(entry: Arc<ExportEntry>) -> Result<Term, TermError> {
+    make_export_entry_permanent(&entry);
     if let Some(lambda) = entry.lambda() {
         return Ok(lambda);
     }
@@ -388,13 +391,25 @@ pub(crate) fn export_lambda(entry: Arc<ExportEntry>) -> Result<Term, TermError> 
     if let Some(lambda) = entry.lambda() {
         return Ok(lambda);
     }
-    let lambda = literals.builder().export_fun_in_heap(Arc::clone(&entry))?;
+    let lambda = literals.builder().export_fun_in_heap(entry.as_ref())?;
     let _ = entry.lambda.set(lambda);
     Ok(entry.lambda().unwrap_or(lambda))
 }
 
+// This table covers entries whose callers are outside a node's export table.
+fn make_export_entry_permanent(entry: &Arc<ExportEntry>) {
+    static ENTRIES: OnceLock<Mutex<HashMap<usize, Arc<ExportEntry>>>> = OnceLock::new();
+    let entries = ENTRIES.get_or_init(Default::default);
+    let mut entries = entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    entries
+        .entry(Arc::as_ptr(entry) as usize)
+        .or_insert_with(|| Arc::clone(entry));
+}
+
 /// Node hook resolving an external fun identity to its global fun-table entry.
-pub type FunEntryStubFn = fn(Arc<FunEntry>) -> Arc<FunEntry>;
+pub type FunEntryStubFn = fn(Arc<FunEntry>) -> Option<Arc<FunEntry>>;
 
 static FUN_ENTRY_STUB: OnceLock<FunEntryStubFn> = OnceLock::new();
 
@@ -403,13 +418,66 @@ pub fn set_fun_entry_stub_hook(hook: FunEntryStubFn) {
     let _ = FUN_ENTRY_STUB.set(hook);
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct FunKey {
+    module: Atom,
+    index: u32,
+    arity: u8,
+    uniq: [u8; 16],
+}
+
+impl From<&FunEntry> for FunKey {
+    fn from(entry: &FunEntry) -> Self {
+        Self {
+            module: entry.module,
+            index: entry.index,
+            arity: entry.arity,
+            uniq: entry.uniq,
+        }
+    }
+}
+
+impl Hash for FunKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let first = u64::from_ne_bytes(self.uniq[..8].try_into().expect("eight bytes"));
+        let second = u64::from_ne_bytes(self.uniq[8..].try_into().expect("eight bytes"));
+        state.write_u64(first ^ second ^ u64::from(self.index));
+    }
+}
+
+fn fallback_fun_table() -> &'static Mutex<HashMap<FunKey, Arc<FunEntry>>> {
+    // Standalone ETF decoding still needs a permanent table when no VM scope is active.
+    static TABLE: OnceLock<Mutex<HashMap<FunKey, Arc<FunEntry>>>> = OnceLock::new();
+    TABLE.get_or_init(Default::default)
+}
+
+/// Permanently owns fun entries used by terms, which hold only the table pointer.
+pub(crate) fn make_fun_entry_permanent(entry: &Arc<FunEntry>) {
+    // Node entries are already held by their code table; this table covers public builders.
+    static ENTRIES: OnceLock<Mutex<HashMap<usize, Arc<FunEntry>>>> = OnceLock::new();
+    let entries = ENTRIES.get_or_init(Default::default);
+    let mut entries = entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    entries
+        .entry(Arc::as_ptr(entry) as usize)
+        .or_insert_with(|| Arc::clone(entry));
+}
+
 /// Returns the global entry for a decoded local fun, inserting its stub when absent.
 // Port of erts/emulator/beam/erl_fun.c:299-309 (erts_fun_entry_get_or_make_stub), OTP-29.1.1.
 pub(crate) fn fun_entry_get_or_make_stub(candidate: Arc<FunEntry>) -> Arc<FunEntry> {
-    match FUN_ENTRY_STUB.get() {
-        Some(hook) => hook(candidate),
-        None => candidate,
+    if let Some(entry) = FUN_ENTRY_STUB
+        .get()
+        .and_then(|hook| hook(Arc::clone(&candidate)))
+    {
+        return entry;
     }
+    let key = FunKey::from(candidate.as_ref());
+    let mut table = fallback_fun_table()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(table.entry(key).or_insert(candidate))
 }
 
 /// Node hook resolving `module:function/arity` to its export entry
@@ -417,6 +485,7 @@ pub(crate) fn fun_entry_get_or_make_stub(candidate: Arc<FunEntry>) -> Arc<FunEnt
 pub type ExportStubFn = fn(Atom, Atom, u8) -> Option<Arc<ExportEntry>>;
 
 static EXPORT_STUB: std::sync::OnceLock<ExportStubFn> = std::sync::OnceLock::new();
+type FallbackExports = HashMap<(Atom, Atom, u8), Arc<ExportEntry>>;
 
 /// Installs the runtime's export table lookup used by terms built outside a process
 /// (literals, `binary_to_term`).
@@ -427,10 +496,23 @@ pub fn set_export_stub_hook(hook: ExportStubFn) {
 /// The export entry of `module:function/arity`, creating a stub when it has none.
 // Port of erts/emulator/beam/export.c:200-245 (erts_export_get_or_make_stub), OTP-29.1.1.
 pub fn export_get_or_make_stub(module: Atom, function: Atom, arity: u8) -> Arc<ExportEntry> {
-    EXPORT_STUB
+    if let Some(entry) = EXPORT_STUB
         .get()
         .and_then(|hook| hook(module, function, arity))
-        .unwrap_or_else(|| Arc::new(ExportEntry::new(module, function, arity)))
+    {
+        return entry;
+    }
+    // Standalone term construction has no node export table, so keep these stubs permanently.
+    static FALLBACK: OnceLock<Mutex<FallbackExports>> = OnceLock::new();
+    let table = FALLBACK.get_or_init(Default::default);
+    let mut table = table
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(
+        table
+            .entry((module, function, arity))
+            .or_insert_with(|| Arc::new(ExportEntry::new(module, function, arity))),
+    )
 }
 
 /// Borrowed local or export fun.
@@ -463,20 +545,20 @@ impl Term {
     /// Borrow a fun entry and its captured variables.
     ///
     /// # Safety
-    /// The owning heap and retained entry must remain live during the view.
+    /// The owning heap and process-lifetime code-table entry must remain live during the view.
     pub unsafe fn fun_ref<'a>(self) -> Option<FunRef<'a>> {
         let h = self.header()?;
         if h & 63 != FUN {
             return None;
         }
-        // SAFETY: fun header encodes kind and free-variable count; word one is retained Arc data.
+        // SAFETY: the boxed header encodes the fun kind and environment size.
         let p = unsafe { self.raw_ptr() };
         if h & (1 << 24) != 0 {
-            // SAFETY: export funs retain their ExportEntry pointer.
+            // SAFETY: export entries are permanent export-table entries.
             let entry = unsafe { &*(*p.add(1) as *const ExportEntry) };
             Some(FunRef::Export { entry })
         } else {
-            // SAFETY: local funs retain their FunEntry pointer and allocate num_free variables.
+            // SAFETY: local fun entries are permanent fun-table entries.
             let entry = unsafe { &*(*p.add(1) as *const FunEntry) };
             // SAFETY: the fun header gives the number of allocated environment words.
             let free_vars =
@@ -497,21 +579,4 @@ pub(crate) fn local_header(arity: u8, free: usize) -> Option<u64> {
 /// Build an export fun header.
 pub(crate) fn export_header(arity: u8) -> u64 {
     FUN | ((arity as u64) << 8) | (1 << 24)
-}
-
-/// Retain a fun-table entry by its raw heap pointer during a deep copy.
-pub(crate) unsafe fn clone_fun_entry(ptr: *const FunEntry) -> Arc<FunEntry> {
-    // SAFETY: The source heap retains one strong Arc reference.
-    unsafe {
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
-    }
-}
-/// Retain an export-table entry by its raw heap pointer during a deep copy.
-pub(crate) unsafe fn clone_export_entry(ptr: *const ExportEntry) -> Arc<ExportEntry> {
-    // SAFETY: The source heap retains one strong Arc reference.
-    unsafe {
-        Arc::increment_strong_count(ptr);
-        Arc::from_raw(ptr)
-    }
 }

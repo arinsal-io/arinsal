@@ -12,8 +12,7 @@ use arinsal_bifs::with_binary_bytes;
 use arinsal_bifs::{BifError, BifFn, Ctx};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{
-    ExportEntry, FunEntry, HeapAlloc, MagicRef, Node, Term, TermBuilder, from_owned, global_atoms,
-    to_owned,
+    HeapAlloc, MagicRef, Node, Term, TermBuilder, from_owned, global_atoms, to_owned,
 };
 use num_traits::ToPrimitive;
 
@@ -211,12 +210,6 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     }
     fn link_node(&mut self, thing: *mut u64, value: Arc<Node>) {
         self.0.link_node(thing, value)
-    }
-    fn retain_fun(&mut self, value: Arc<FunEntry>) {
-        self.0.retain_fun(value)
-    }
-    fn retain_export(&mut self, value: Arc<ExportEntry>) {
-        self.0.retain_export(value)
     }
 }
 fn call(
