@@ -4717,6 +4717,7 @@ pub struct Registry {
     tables: Vec<TableSlot>,
     free_slots: Vec<usize>,
     names: HashMap<Atom, Tid>,
+    named_tables: Arc<NamedTableIndex>,
     owned_tables: HashMap<Term, HashSet<Tid>>,
     /// Tables each process has fixed (erts `ERTS_P_FIXED_TABLES`).
     fixed_tables: HashMap<Term, HashSet<Tid>>,
@@ -4726,6 +4727,109 @@ pub struct Registry {
 struct TableSlot {
     generation: u32,
     table: Option<SharedTable>,
+}
+
+const META_NAME_TAB_BUCKET_COUNT: usize = 8192;
+const META_NAME_TAB_LOCK_COUNT: usize = 256;
+
+#[derive(Clone)]
+struct NamedTableEntry {
+    name: Atom,
+    table: SharedTable,
+}
+
+struct NamedTableEntries {
+    data: Vec<NamedTableEntry>,
+}
+
+/// Lock-free read index for named tables, matching OTP's `meta_name_tab` buckets.
+pub struct NamedTableIndex {
+    mask: usize,
+    buckets: Box<[arc_swap::ArcSwap<NamedTableEntries>]>,
+    empty: Arc<NamedTableEntries>,
+    locks: [parking_lot::Mutex<()>; META_NAME_TAB_LOCK_COUNT],
+}
+
+impl NamedTableIndex {
+    /// Create an empty erts-sized name index.
+    pub fn new() -> Self {
+        let empty = Arc::new(NamedTableEntries { data: Vec::new() });
+        Self {
+            mask: META_NAME_TAB_BUCKET_COUNT - 1,
+            buckets: (0..META_NAME_TAB_BUCKET_COUNT)
+                .map(|_| arc_swap::ArcSwap::from(Arc::clone(&empty)))
+                .collect(),
+            empty,
+            locks: std::array::from_fn(|_| parking_lot::Mutex::new(())),
+        }
+    }
+
+    /// Resolve an atom without acquiring the ETS registry lock or allocating.
+    // Port of erts/emulator/beam/erl_db.c (meta_name_tab_bucket, db_get_table_aux), OTP-29.1.1.
+    // Readers scan the atom-hashed immutable bucket snapshot.
+    pub fn lookup(&self, name: Atom) -> Option<SharedTable> {
+        let bucket = name.0 as usize & self.mask;
+        let entries = self.buckets[bucket].load();
+        entries
+            .data
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| Arc::clone(&entry.table))
+    }
+
+    fn insert(&self, name: Atom, table: SharedTable) -> bool {
+        // Port of erts/emulator/beam/erl_db.c (insert_named_tab), OTP-29.1.1.
+        let bucket_index = name.0 as usize & self.mask;
+        let _lock = self.locks[bucket_index % META_NAME_TAB_LOCK_COUNT].lock();
+        let current = self.buckets[bucket_index].load_full();
+        if current.data.iter().any(|entry| entry.name == name) {
+            return false;
+        }
+
+        let size = current.data.len() + 1;
+        let old_capacity = current.data.capacity();
+        let capacity = old_capacity.max(named_entries_capacity(size));
+        let mut data = Vec::with_capacity(capacity);
+        data.extend(current.data.iter().cloned());
+        data.push(NamedTableEntry { name, table });
+        self.buckets[bucket_index].store(Arc::new(NamedTableEntries { data }));
+        true
+    }
+
+    fn remove(&self, name: Atom, table: &SharedTable) -> bool {
+        // Port of erts/emulator/beam/erl_db.c (remove_named_tab), OTP-29.1.1.
+        let bucket_index = name.0 as usize & self.mask;
+        let _lock = self.locks[bucket_index % META_NAME_TAB_LOCK_COUNT].lock();
+        let current = self.buckets[bucket_index].load_full();
+        let Some(index) = current
+            .data
+            .iter()
+            .position(|entry| entry.name == name && Arc::ptr_eq(&entry.table, table))
+        else {
+            return false;
+        };
+
+        let size = current.data.len() - 1;
+        if size == 0 {
+            self.buckets[bucket_index].store(Arc::clone(&self.empty));
+        } else {
+            let mut data = Vec::with_capacity(named_entries_capacity(size));
+            data.extend(current.data[..index].iter().cloned());
+            data.extend(current.data[index + 1..].iter().cloned());
+            self.buckets[bucket_index].store(Arc::new(NamedTableEntries { data }));
+        }
+        true
+    }
+}
+
+fn named_entries_capacity(size: usize) -> usize {
+    size.max(8).checked_next_power_of_two().unwrap_or(size)
+}
+
+impl Default for NamedTableIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A table behind its own lock, so operations on different tables never serialize.
@@ -4841,6 +4945,11 @@ impl TableLock {
 impl Registry {
     /// Start an empty registry.
     pub fn new() -> Self {
+        Self::new_with_named_index(Arc::new(NamedTableIndex::new()))
+    }
+
+    /// Start an empty registry using a name index shared with the VM runtime.
+    pub fn new_with_named_index(named_tables: Arc<NamedTableIndex>) -> Self {
         Self {
             tables: vec![TableSlot {
                 generation: 0,
@@ -4848,6 +4957,7 @@ impl Registry {
             }],
             free_slots: Vec::new(),
             names: HashMap::new(),
+            named_tables,
             owned_tables: HashMap::new(),
             fixed_tables: HashMap::new(),
             match_programs: std::sync::RwLock::new(HashMap::new()),
@@ -4911,23 +5021,30 @@ impl Registry {
         if self.free_slots.last() == Some(&index) {
             self.free_slots.pop();
         }
-        if options.named_table {
-            self.names.insert(options.name, tid);
-        }
         if index == self.tables.len() {
             self.tables.push(TableSlot {
                 generation,
                 table: None,
             });
         }
-        self.tables[index].table = Some(Arc::new(TableLock::new(
+        let shared = Arc::new(TableLock::new(
             table,
             options.read_concurrency || options.write_concurrency != WriteConcurrency::Disabled,
-        )));
+        ));
+        self.tables[index].table = Some(Arc::clone(&shared));
         self.owned_tables
             .entry(options.owner)
             .or_default()
             .insert(tid);
+        if options.named_table {
+            if !self.named_tables.insert(options.name, Arc::clone(&shared)) {
+                self.remove_owned_table(options.owner, tid);
+                self.tables[index].table = None;
+                self.free_slots.push(index);
+                return Err(EtsError::NameTaken);
+            }
+            self.names.insert(options.name, tid);
+        }
         Ok(tid)
     }
 
@@ -5047,6 +5164,7 @@ impl Registry {
         self.remove_owned_table(table.options.owner, tid);
         if table.options.named_table {
             self.names.remove(&table.options.name);
+            assert!(self.named_tables.remove(table.options.name, &shared));
         }
         let mut fixations = 0;
         for (pid, count) in &table.fixed_processes {
@@ -5096,30 +5214,24 @@ impl Registry {
     /// Unnamed tables only change the name reported by `ets:info/2`. They are
     /// not registered, so the new name may collide with another table's name.
     pub fn rename(&mut self, tid: Tid, name: Atom) -> Result<(), EtsError> {
-        let index = tid.slot().ok_or(EtsError::NoTable)?;
-        let slot = self
-            .tables
-            .get(index)
-            .filter(|slot| slot.generation == tid.generation())
-            .ok_or(EtsError::NoTable)?;
-        let named = slot
-            .table
-            .as_ref()
-            .ok_or(EtsError::NoTable)?
-            .read()
-            .options
-            .named_table;
+        let shared = Arc::clone(self.shared(tid)?);
+        let mut table = shared.write();
+        let named = table.options.named_table;
         if named {
             // Port of erts/emulator/beam/erl_db.c:2516 (insert_named_tab), OTP-29.1.1:
             // any registered name fails, including the table's own.
             if self.names.contains_key(&name) {
                 return Err(EtsError::NameTaken);
             }
-            let old = self.get(tid)?.options.name;
+            let old = table.options.name;
+            if !self.named_tables.insert(name, Arc::clone(&shared)) {
+                return Err(EtsError::NameTaken);
+            }
+            assert!(self.named_tables.remove(old, &shared));
             self.names.remove(&old);
             self.names.insert(name, tid);
         }
-        self.shared(tid)?.write().options.name = name;
+        table.options.name = name;
         Ok(())
     }
 
@@ -5738,5 +5850,45 @@ mod registry_tests {
         }
         assert!(registry.tables.len() <= 2);
         assert!(matches!(registry.get(stale), Err(EtsError::NoTable)));
+    }
+
+    #[test]
+    fn named_bucket_collisions_survive_rename_and_delete() {
+        let index = Arc::new(NamedTableIndex::new());
+        let mut registry = Registry::new_with_named_index(Arc::clone(&index));
+        let first_name = Atom(0x1234);
+        let second_name = Atom(0x1234 + META_NAME_TAB_BUCKET_COUNT as u32);
+        let renamed_name = Atom(0x1234 + 2 * META_NAME_TAB_BUCKET_COUNT as u32);
+        let mut first_options = options();
+        first_options.named_table = true;
+        first_options.name = first_name;
+        let mut second_options = first_options;
+        second_options.name = second_name;
+
+        let first = registry.create(first_options).unwrap();
+        let second = registry.create(second_options).unwrap();
+        assert!(Arc::ptr_eq(
+            registry.shared(first).unwrap(),
+            &index.lookup(first_name).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            registry.shared(second).unwrap(),
+            &index.lookup(second_name).unwrap()
+        ));
+
+        registry.rename(first, renamed_name).unwrap();
+        assert!(index.lookup(first_name).is_none());
+        assert!(Arc::ptr_eq(
+            registry.shared(first).unwrap(),
+            &index.lookup(renamed_name).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            registry.shared(second).unwrap(),
+            &index.lookup(second_name).unwrap()
+        ));
+
+        registry.delete(first).unwrap();
+        assert!(index.lookup(renamed_name).is_none());
+        assert!(index.lookup(second_name).is_some());
     }
 }

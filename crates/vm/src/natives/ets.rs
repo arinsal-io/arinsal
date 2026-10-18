@@ -702,6 +702,14 @@ fn with_cached_table<R>(
     body: impl FnOnce(&arinsal_ets::SharedTable, &TableOptions, &mut Process) -> Option<R>,
 ) -> Option<R> {
     let tid = Tid::from_term(target)?;
+    with_cached_tid(process, tid, body)
+}
+
+fn with_cached_tid<R>(
+    process: &mut Process,
+    tid: Tid,
+    body: impl FnOnce(&arinsal_ets::SharedTable, &TableOptions, &mut Process) -> Option<R>,
+) -> Option<R> {
     let rt_id = std::sync::Arc::as_ptr(process.runtime.as_ref()?) as usize;
     let slot = (tid.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 59) as usize;
     TABLE_CACHE.with(|cache| {
@@ -726,8 +734,12 @@ fn direct_lookup(
     module: arinsal_term::Atom,
     function: arinsal_term::Atom,
 ) -> Option<Term> {
-    direct_lookup_cached(process, args)
-        .or_else(|| direct_plain(process, args, module, function, lookup_args_member))
+    if let Some(tid) = Tid::from_term(args[0]) {
+        direct_lookup_cached(process, args, tid)
+            .or_else(|| direct_plain(process, args, module, function, lookup_args_member))
+    } else {
+        direct_plain(process, args, module, function, lookup_args_member)
+    }
 }
 
 /// `lookup`/`member`/`insert`/`insert_new` through the registry, for named tables and
@@ -753,10 +765,10 @@ fn lookup_args_member(
     lookup_args(process, caller, false, target, key)
 }
 
-fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
+fn direct_lookup_cached(process: &mut Process, args: &[Term], tid: Tid) -> Option<Term> {
     let caller = direct_caller(process)?;
     let key = args[1];
-    with_cached_table(process, args[0], |shared, _options, process| {
+    with_cached_tid(process, tid, |shared, _options, process| {
         let table = shared.read();
         if table.is_detached() || table.is_busy() || !allowed(&table, caller, false) {
             return None;
@@ -1247,6 +1259,33 @@ fn lookup_args(
     key: Term,
 ) -> Result<Term, VmError> {
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
+    if let Some(name) = target.as_atom() {
+        // Port of erts/emulator/beam/erl_db.c (db_get_table_aux), OTP-29.1.1.
+        // The metadata bucket is lock-free; after locking the table, verify the name again to
+        // reject a concurrent rename or deletion.
+        let shared = rt
+            .named_ets
+            .lookup(name)
+            .ok_or_else(|| badarg_cause("id"))?;
+        let table = shared.read();
+        if table.is_detached() || !table.options.named_table || table.options.name != name {
+            return Err(badarg_cause("id"));
+        }
+        if table.is_busy() {
+            return Err(err(arinsal_ets::EtsError::Busy));
+        }
+        if !allowed(&table, caller, false) {
+            return Err(badarg_cause("access"));
+        }
+        return if member {
+            Ok(boolean_term(table.member(key)))
+        } else {
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            let values = table.lookup(key, &mut heap).map_err(err)?;
+            output_list(&mut heap, values)
+        };
+    }
+
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
     let table = registry.get_shared(tid).map_err(err)?;

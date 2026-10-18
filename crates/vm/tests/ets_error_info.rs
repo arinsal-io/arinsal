@@ -27,14 +27,17 @@ causes() ->
     Owner = spawn(fun() ->
         Prot = ets:new(q, [protected]),
         Priv = ets:new(p, [private]),
-        Parent ! {tabs, Prot, Priv},
+        NamedPriv = ets:new(named_private, [named_table, private]),
+        Parent ! {tabs, Prot, Priv, NamedPriv},
         receive stop -> ok end
     end),
-    {Prot, Priv} = receive {tabs, A1, A2} -> {A1, A2} end,
+    {Prot, Priv, _NamedPriv} = receive {tabs, A1, A2, A3} -> {A1, A2, A3} end,
     ets:insert(T, {k, 1}),
     Cases = [
         fun() -> ets:lookup(1, a) end,
         fun() -> ets:lookup(nonexist, a) end,
+        fun() -> ets:lookup(named_missing, a) end,
+        fun() -> ets:lookup(named_private, a) end,
         fun() -> ets:lookup(D, a) end,
         fun() -> ets:lookup(Priv, a) end,
         fun() -> ets:insert(Prot, {a}) end,

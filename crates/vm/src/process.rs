@@ -1062,6 +1062,8 @@ pub(crate) struct Runtime {
     pub(crate) port_ids: PtabIdRing,
     pub(crate) simulated: bool,
     pub(crate) virtual_ms: AtomicU64,
+    /// `meta_name_tab`, read without taking the global ETS registry lock.
+    pub(crate) named_ets: Arc<arinsal_ets::NamedTableIndex>,
     pub(crate) ets: std::sync::RwLock<arinsal_ets::Registry>,
     result: mpsc::Sender<Result<ScheduledResult, VmError>>,
     // g_proc_sched: suspend counts and the status other processes can observe.
@@ -8140,6 +8142,7 @@ impl Vm {
         let port_ids = PtabIdRing::new(port_layout.max());
         // erts creates its forker port first and keeps port id zero occupied.
         assert_eq!(port_ids.reserve(), Some(0));
+        let named_ets = Arc::new(arinsal_ets::NamedTableIndex::new());
         let runtime = Arc::new(Runtime {
             statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
             backtrace_depth: AtomicUsize::new(8),
@@ -8163,7 +8166,8 @@ impl Vm {
             port_ids,
             simulated: simulation_seed.is_some(),
             virtual_ms: AtomicU64::new(0),
-            ets: std::sync::RwLock::new(arinsal_ets::Registry::new()),
+            named_ets: Arc::clone(&named_ets),
+            ets: std::sync::RwLock::new(arinsal_ets::Registry::new_with_named_index(named_ets)),
             result: sender,
             code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
             breakpoints: Arc::new(crate::trace_bp::BpNode::new(self.code_scope)),
