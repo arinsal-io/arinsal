@@ -4541,29 +4541,21 @@ impl Runtime {
         body(&code.modules)
     }
 
-    /// Create a distributed spawn child without running it before the spawn reply.
-    // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1.
-    pub(crate) fn spawn_mfa_unscheduled(
+    /// Create a distributed child with its remote monitor (and optional link) installed before
+    /// it can run.
+    // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process, so->mref
+    // monitor insertion), OTP-29.1.1: a spawn_request monitor lives in the child from creation,
+    // so a child that exits at once still sends its own exit reason in the DOWN.
+    pub(crate) fn spawn_mfa_unscheduled_watched(
         self: &Arc<Self>,
         module: &str,
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
+        linker: Option<Pid>,
+        monitor: Option<(Pid, u64)>,
         parent: &arinsal_etf::OwnedTerm,
     ) -> Result<Pid, VmError> {
-        self.spawn_mfa_scheduled(module, function, args, false, None, Some(parent))
-    }
-
-    /// Create a distributed child with its remote link installed before it can run.
-    // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1.
-    pub(crate) fn spawn_mfa_unscheduled_linked(
-        self: &Arc<Self>,
-        module: &str,
-        function: &str,
-        args: &[arinsal_etf::OwnedTerm],
-        linker: Pid,
-        parent: &arinsal_etf::OwnedTerm,
-    ) -> Result<Pid, VmError> {
-        self.spawn_mfa_scheduled(module, function, args, false, Some(linker), Some(parent))
+        self.spawn_mfa_scheduled(module, function, args, false, linker, monitor, Some(parent))
     }
 
     fn spawn_mfa_scheduled(
@@ -4573,6 +4565,7 @@ impl Runtime {
         args: &[arinsal_etf::OwnedTerm],
         scheduled: bool,
         linker: Option<Pid>,
+        monitor: Option<(Pid, u64)>,
         parent: Option<&arinsal_etf::OwnedTerm>,
     ) -> Result<Pid, VmError> {
         let (module_id, ip) = {
@@ -4604,6 +4597,13 @@ impl Runtime {
         }
         if let Some(linker) = linker {
             child.cold_mut().links.insert(linker);
+        }
+        if let Some((watcher, reference)) = monitor {
+            child.insert_target_monitor(
+                reference,
+                watcher,
+                arinsal_sched::SharedPayload(crate::proc_create::default_monitor_data()),
+            );
         }
         if let Some(arity) = u8::try_from(args.len()).ok()
             && (arinsal_bifs::lookup(module, function, arity).is_some()
