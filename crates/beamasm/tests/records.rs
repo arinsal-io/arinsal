@@ -134,9 +134,11 @@ fn run_native(
 ) -> (ExitReason, ProcessHeader, [u64; 1024], [u64; 128]) {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     emit(&mut asm).unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
         e.ret(Gpr::x(30))
     })
     .unwrap();
@@ -234,12 +236,14 @@ fn native_is_native_record() {
             asm.move_(ArgVal::Immediate(tagged_small(1)), ArgVal::X(1))?;
             asm.emit_raw(|e| {
                 e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
                 e.ret(Gpr::x(30))
             })?;
             asm.emit_i_func_label(2)?;
             asm.move_(ArgVal::Immediate(tagged_small(2)), ArgVal::X(1))?;
             asm.emit_raw(|e| {
                 e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
                 e.ret(Gpr::x(30))
             })
         },
@@ -259,12 +263,14 @@ fn native_is_native_record() {
             asm.move_(ArgVal::Immediate(tagged_small(1)), ArgVal::X(1))?;
             asm.emit_raw(|e| {
                 e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
                 e.ret(Gpr::x(30))
             })?;
             asm.emit_i_func_label(2)?;
             asm.move_(ArgVal::Immediate(tagged_small(2)), ArgVal::X(1))?;
             asm.emit_raw(|e| {
                 e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
                 e.ret(Gpr::x(30))
             })
         },
@@ -290,12 +296,14 @@ fn native_record_accessibility() {
                 asm.move_(ArgVal::Immediate(tagged_small(1)), ArgVal::X(1))?;
                 asm.emit_raw(|e| {
                     e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                    e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
                     e.ret(Gpr::x(30))
                 })?;
                 asm.emit_i_func_label(2)?;
                 asm.move_(ArgVal::Immediate(tagged_small(2)), ArgVal::X(1))?;
                 asm.emit_raw(|e| {
                     e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                    e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
                     e.ret(Gpr::x(30))
                 })
             },
@@ -320,11 +328,13 @@ fn native_get_elements() {
             )?;
             asm.emit_raw(|e| {
                 e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
                 e.ret(Gpr::x(30))
             })?;
             asm.emit_i_func_label(2)?;
             asm.emit_raw(|e| {
                 e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
                 e.ret(Gpr::x(30))
             })
         },
@@ -378,12 +388,14 @@ fn accessible(record: u64, external: bool, current_module: &str) -> u64 {
             asm.move_(ArgVal::Immediate(tagged_small(1)), ArgVal::X(1))?;
             asm.emit_raw(|e| {
                 e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
                 e.ret(Gpr::x(30))
             })?;
             asm.emit_i_func_label(2)?;
             asm.move_(ArgVal::Immediate(tagged_small(2)), ArgVal::X(1))?;
             asm.emit_raw(|e| {
                 e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
                 e.ret(Gpr::x(30))
             })
         },
