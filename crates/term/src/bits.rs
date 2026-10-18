@@ -35,6 +35,30 @@ pub(crate) fn external_val_ptr(val: u64) -> *const ExternalBinary {
     (val & !EXTERNAL_VAL_TAG) as *const ExternalBinary
 }
 
+/// Length of the resource-backed binary a BinRef's tagged `val` word names.
+///
+/// `val` must come from a BinRef whose off-heap list entry still holds its counted reference.
+pub(crate) fn external_val_len(val: u64) -> usize {
+    // SAFETY: the list entry's counted reference keeps the `Arc<ExternalBinary>` alive.
+    unsafe { (*external_val_ptr(val)).len() }
+}
+
+/// Strong count of the `Arc<ExternalBinary>` a live BinRef's tagged `val` word names.
+pub(crate) fn external_val_strong_count(val: u64) -> usize {
+    // SAFETY: as for `external_val_len`; the temporary handle is not dropped.
+    let owner = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(external_val_ptr(val)) });
+    Arc::strong_count(&owner)
+}
+
+/// Take over the counted reference of a resource-backed BinRef's tagged `val` word.
+///
+/// The caller must own that reference: an unforwarded list entry being released, or a
+/// forwarded one whose copy takes the reference over.
+pub(crate) fn external_val_take(val: u64) -> Arc<ExternalBinary> {
+    // SAFETY: the caller owns the list entry's `Arc::into_raw` reference.
+    unsafe { Arc::from_raw(external_val_ptr(val)) }
+}
+
 /// Return live allocated bytes for erts' `BINARY` allocation type.
 pub fn binary_memory_bytes() -> u64 {
     binary_allocation_bytes()

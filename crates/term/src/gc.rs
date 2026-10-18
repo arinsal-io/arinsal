@@ -232,8 +232,8 @@ fn release_off_heap_node(node: usize) {
             drop(unsafe { Arc::from_raw(word as *const Node) })
         }
         crate::heap::OffHeapKind::BinRef if crate::bits::bin_ref_val_is_external(word) => {
-            // SAFETY: an unforwarded resource-backed BinRef's list entry owns its count.
-            drop(unsafe { Arc::from_raw(crate::bits::external_val_ptr(word)) })
+            // An unforwarded resource-backed BinRef's list entry owns its count.
+            drop(crate::bits::external_val_take(word))
         }
         crate::heap::OffHeapKind::BinRef => release_binary_ref(node),
     }
@@ -621,11 +621,12 @@ fn off_heap_node_overhead_words(node: usize) -> u64 {
             owner.orig_size() as u64 / 8
         }
         crate::heap::OffHeapKind::BinRef if crate::bits::bin_ref_val_is_external(word) => {
-            // SAFETY: the list entry owns the `Arc<ExternalBinary>` named by `word`.
-            unsafe { (*crate::bits::external_val_ptr(word)).len() as u64 / 8 }
+            crate::bits::external_val_len(word) as u64 / 8
         }
-        // SAFETY: a refc BinRef's word one is its live Binary header; word three is orig_size.
-        crate::heap::OffHeapKind::BinRef => (unsafe { *(word as *const u64).add(3) }) / 8,
+        // A refc BinRef's word one is its live Binary header; word three is orig_size.
+        crate::heap::OffHeapKind::BinRef => {
+            crate::heap::load((word as *const u64).wrapping_add(3)) / 8
+        }
     }
 }
 
