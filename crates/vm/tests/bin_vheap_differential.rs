@@ -10,7 +10,7 @@ const SOURCE: &str = r#"
 -module(bin_vheap_differential).
 -export([minimum/0, flag/0, gc_info/0, spawn_minimum/0, spawn_minimum_only/0,
          allocation_gc/0, private_append_info/0, message_binary/0, sub_binary_tails/0,
-         match_alias_tails/0]).
+         match_alias_tails/0, append_trap_magic_orig_size/0, resource_magic_orig_sizes/0]).
 minimum() -> {erlang:system_info(min_bin_vheap_size), process_info(self(), min_bin_vheap_size)}.
 flag() -> Old=process_flag(min_bin_vheap_size, 80000), {Old,process_info(self(), min_bin_vheap_size)}.
 gc_info() ->
@@ -135,6 +135,49 @@ match_alias_tails() ->
         Child!stop,
         erlang:append_element(Result,Heap)
     end.
+append_trap_magic_orig_size() ->
+    Parent=self(),
+    Child=spawn(fun() ->
+        Values=lists:seq(1,250000),
+        garbage_collect(),
+        {garbage_collection_info,BeforeInfo}=process_info(self(),garbage_collection_info),
+        Before=proplists:get_value(bin_vheap_size,BeforeInfo),
+        Parent!{ready,self(),Before},
+        _=Values ++ [0],
+        Parent!finished,
+        receive stop -> ok end
+    end),
+    receive {ready,Child,Before} ->
+        await_magic_vheap(Child,Before,5000)
+    end.
+await_magic_vheap(P,Before,Timeout) when Timeout > 0 ->
+    case process_info(P,garbage_collection_info) of
+        {garbage_collection_info,Info} ->
+            Size=proplists:get_value(bin_vheap_size,Info),
+            case Size > Before of
+                true -> P!stop, Size-Before;
+                false -> receive after 1 -> await_magic_vheap(P,Before,Timeout-1) end
+            end;
+        undefined -> Timeout
+    end;
+await_magic_vheap(P,_Before,_Timeout) -> P!stop, timeout.
+resource_magic_orig_sizes() ->
+    [{measure(fun() -> atomics:new(1,[]) end),ref},
+     {measure(fun() -> erts_internal:counters_new(1) end),ref},
+     {measure(fun() -> binary:compile_pattern(<<"abc">>) end),tuple},
+     {measure(fun() -> {ok,Pattern}=re:compile(<<"abc">>), Pattern end),tuple},
+     {measure(fun() -> ets:match_spec_compile([{{foo},[],[true]}]) end),ref}].
+measure(Create) ->
+    garbage_collect(),
+    Before=vheap_words(),
+    Resource=Create(),
+    garbage_collect(),
+    {vheap_words()-Before,resource_tag(Resource)}.
+vheap_words() ->
+    {garbage_collection_info,Info}=process_info(self(),garbage_collection_info),
+    proplists:get_value(bin_vheap_size,Info)+proplists:get_value(bin_old_vheap_size,Info).
+resource_tag(Resource) when is_reference(Resource) -> ref;
+resource_tag(Resource) when is_tuple(Resource) -> tuple.
 alias(<<"FOR1",_/bits>>=C) -> C.
 rest(<<"FOR1",R/bits>>) -> R.
 append_loop(0,Acc) -> Acc;
@@ -173,6 +216,56 @@ fn bin_vheap_system_and_process_minimum_match_otp() {
 #[test]
 fn bin_vheap_process_flag_updates_the_process_minimum() {
     assert_equal("flag");
+}
+
+#[test]
+fn append_trap_magic_binary_size_matches_otp() {
+    let reference = RefErl::start_with_erl_args(&["+S", "1"]).expect("OTP 29.1.1");
+    let beam = reference.compile_named(MODULE, SOURCE, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    let expected = reference.call(MODULE, "append_trap_magic_orig_size", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled_reductions(MODULE, "append_trap_magic_orig_size", &[], 1, Some(83), 20)
+        .map(|outcome| CallResult::Ok(outcome.term))
+        .unwrap_or_else(|error| CallResult::TransportError(format!("{error:?}")));
+    assert_eq!(expected, actual, "append trap binary virtual heap size");
+    assert_eq!(expected, CallResult::Ok(OwnedTerm::Int(8)));
+}
+
+#[test]
+fn resource_magic_orig_sizes_match_otp() {
+    let value = assert_equal("resource_magic_orig_sizes");
+    let OwnedTerm::List { elems, tail } = &value else {
+        panic!("expected resource size deltas: {value:?}");
+    };
+    assert!(matches!(tail.as_ref(), OwnedTerm::Nil));
+    assert_eq!(
+        elems,
+        &vec![
+            OwnedTerm::Tuple(vec![
+                OwnedTerm::Tuple(vec![OwnedTerm::Int(6), OwnedTerm::Atom("ref".into())]),
+                OwnedTerm::Atom("ref".into()),
+            ]),
+            OwnedTerm::Tuple(vec![
+                OwnedTerm::Tuple(vec![OwnedTerm::Int(92), OwnedTerm::Atom("ref".into())]),
+                OwnedTerm::Atom("ref".into()),
+            ]),
+            OwnedTerm::Tuple(vec![
+                OwnedTerm::Tuple(vec![OwnedTerm::Int(267), OwnedTerm::Atom("tuple".into())]),
+                OwnedTerm::Atom("tuple".into()),
+            ]),
+            OwnedTerm::Tuple(vec![
+                OwnedTerm::Tuple(vec![OwnedTerm::Int(4), OwnedTerm::Atom("tuple".into())]),
+                OwnedTerm::Atom("tuple".into()),
+            ]),
+            OwnedTerm::Tuple(vec![
+                OwnedTerm::Tuple(vec![OwnedTerm::Int(19), OwnedTerm::Atom("ref".into())]),
+                OwnedTerm::Atom("ref".into()),
+            ]),
+        ]
+    );
 }
 
 #[test]

@@ -4413,11 +4413,16 @@ pub(crate) fn session_handle(
         .map_or_else(std::sync::Weak::new, |runtime| {
             std::sync::Arc::downgrade(&runtime.breakpoints)
         });
-    let handle = arinsal_term::MagicRef::new(TraceSessionHandle {
-        owner,
-        session,
-        breakpoints,
-    });
+    // Port of erts/emulator/beam/erl_bif_trace.c (trace_session_create): ErtsTraceSession is
+    // 248 bytes on macOS arm64 and is allocated in an aligned magic binary.
+    let handle = arinsal_term::MagicRef::with_erts_payload_size(
+        TraceSessionHandle {
+            owner,
+            session,
+            breakpoints,
+        },
+        248,
+    );
     let magic_id = handle.id();
     session_handle_ids()
         .lock()

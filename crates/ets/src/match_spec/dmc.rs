@@ -230,6 +230,79 @@ pub(super) enum Op {
     Halt,
 }
 
+impl Op {
+    /// Number of `UWord`s emitted for this instruction by OTP's DMC compiler.
+    // Port of erts/emulator/beam/erl_db_util.c (DMC_PUSH/DMC_PUSH2), OTP-29.1.1.
+    pub(super) fn erts_word_size(self) -> usize {
+        match self {
+            Self::TryMeElse(_)
+            | Self::Array(_)
+            | Self::ArrayPrefix(_)
+            | Self::ArrayBind(_)
+            | Self::Tuple(_)
+            | Self::PushT(_)
+            | Self::Map(_)
+            | Self::PushM(_)
+            | Self::Key(_)
+            | Self::Bind(_)
+            | Self::Cmp(_)
+            | Self::EqBin(_)
+            | Self::EqFloat(_)
+            | Self::Eq(_)
+            | Self::PushC(_)
+            | Self::MkTuple(_)
+            | Self::MkFlatMap(_)
+            | Self::MkHashMap(_)
+            | Self::Call0(_)
+            | Self::Call1(_)
+            | Self::Call2(_)
+            | Self::Call3(_)
+            | Self::PushVResult(_)
+            | Self::PushV(_)
+            | Self::Or(_)
+            | Self::And(_)
+            | Self::OrElse(_)
+            | Self::AndAlso(_)
+            | Self::Jump(_) => 2,
+            Self::EqRef(term) | Self::EqBig(term) => 1 + arinsal_term::size_object(term),
+            Self::List
+            | Self::PushL
+            | Self::Pop
+            | Self::Swap
+            | Self::Skip
+            | Self::ConsA
+            | Self::ConsB
+            | Self::PushExpr
+            | Self::PushArrayAsList
+            | Self::PushArrayAsListU
+            | Self::True
+            | Self::SelfPid
+            | Self::Waste
+            | Self::Return
+            | Self::ProcessDump
+            | Self::Display
+            | Self::SetReturnTrace
+            | Self::SetExceptionTrace
+            | Self::IsSeqTrace
+            | Self::SetSeqToken
+            | Self::SetSeqTokenFake
+            | Self::GetSeqToken
+            | Self::EnableTrace
+            | Self::EnableTrace2
+            | Self::DisableTrace
+            | Self::DisableTrace2
+            | Self::Caller
+            | Self::CallerLine
+            | Self::CurrentStacktrace
+            | Self::Silent
+            | Self::Trace2
+            | Self::Trace3
+            | Self::Catch
+            | Self::Halt => 1,
+        }
+    }
+}
+
 /// `MatchProg` minus the saved terms, which live in the program's heap.
 pub(super) struct Compiled {
     pub text: Vec<Op>,

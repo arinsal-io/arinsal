@@ -194,6 +194,11 @@ impl ExternalBinary {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// `Binary.orig_size` of the retained owner.
+    pub fn owner_orig_size(&self) -> usize {
+        self._owner.orig_size()
+    }
 }
 
 /// Off-heap bytes with reserved capacity and one active process writer.

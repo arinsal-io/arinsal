@@ -9,8 +9,8 @@ use arinsal_term::Term;
 use zstd_sys as z;
 
 use super::{
-    CtxBox, CtxState, Kind, atom_term, get_uint64, get_zstd_context, is_error, make_resource,
-    zstd_error,
+    CtxBox, CtxState, Kind, ZSTD_CTX_MAGIC_ORIG_SIZE, atom_term, get_uint64, get_zstd_context,
+    is_error, make_resource, zstd_error,
 };
 use crate::caller;
 
@@ -36,6 +36,7 @@ fn init(ctx: &mut Ctx<'_>, kind: Kind) -> Result<Term, BifError> {
                 in_use: false,
             }),
         },
+        ZSTD_CTX_MAGIC_ORIG_SIZE,
     )
 }
 

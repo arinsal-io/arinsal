@@ -6694,6 +6694,7 @@ impl Process {
         roots.extend_from_slice(&self.apply_inline[..inline_len]);
         let mut nif_roots_len = 0;
         let mut trap_roots_len = 0;
+        let mut bif_trap_state_root = None;
         if let Some(cold) = self.cold.as_mut() {
             roots.extend_from_slice(&cold.apply_roots);
             if let Some(released) = cold.ext_last_released.as_ref() {
@@ -6709,6 +6710,10 @@ impl Process {
             if let Some(trap) = cold.bif_trap.as_ref().filter(|trap| trap.args_are_roots()) {
                 trap_roots_len = trap.arity;
                 roots.extend_from_slice(&trap.args[..trap.arity]);
+            }
+            if let Some(term) = cold.bif_trap.as_ref().and_then(|trap| trap.state_term) {
+                bif_trap_state_root = Some(roots.len());
+                roots.push(term);
             }
         }
         let ets_insert_root = self
@@ -6888,6 +6893,11 @@ impl Process {
             {
                 let start = released_end + nif_roots_len;
                 trap.args[..trap_roots_len].copy_from_slice(&roots[start..start + trap_roots_len]);
+            }
+            if let Some(index) = bif_trap_state_root
+                && let Some(trap) = cold.bif_trap.as_mut()
+            {
+                trap.state_term = Some(roots[index]);
             }
             if let Some(index) = ets_insert_root
                 && let Some(state) = cold.ets_insert.as_mut()

@@ -8,6 +8,9 @@ use std::sync::{Mutex, OnceLock, Weak};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Offset from `Binary.orig_bytes` to data in an aligned OTP magic binary on 64-bit targets.
+pub const MAGIC_BIN_DATA_OFFSET: usize = 24;
+
 /// A reference payload whose lifetime follows every copied term and GC owner.
 pub struct MagicRef {
     id: u64,
@@ -34,6 +37,17 @@ impl MagicRef {
             false,
             orig_size,
         )
+    }
+
+    /// Allocate a reference backed by `erts_create_magic_binary(payload_size, ...)`.
+    ///
+    /// The reported `orig_size` includes the aligned magic binary data offset.
+    // Port of erts/emulator/beam/erl_binary.h (ERTS_MAGIC_BIN_ORIG_SIZE), OTP-29.1.1.
+    pub fn with_erts_payload_size<T: Any + Send + Sync>(
+        payload: T,
+        payload_size: usize,
+    ) -> Arc<Self> {
+        Self::with_orig_size(payload, MAGIC_BIN_DATA_OFFSET + payload_size)
     }
 
     /// Recreate an opaque reference using an identity retained in an external term.

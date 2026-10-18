@@ -16,6 +16,10 @@ use crate::{BifError, Ctx};
 const BADARG: BifError = BifError::BADARG;
 const SIGNED_OPTION: u64 = 1;
 const COUNTER_SHARDS: usize = 16;
+// OTP's reference runtime has ten schedulers on the supported M1 host.
+const ERTS_NO_SCHEDULERS: usize = 10;
+const ERTS_CACHE_LINE_SIZE: usize = 64;
+const ERTS_ATOMIC64_SIZE: usize = 8;
 static NEXT_SLOT: AtomicU32 = AtomicU32::new(0);
 enum Cells {
     Signed(Vec<AtomicI64>),
@@ -65,8 +69,34 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
 }
 
 fn new_ref(ctx: &mut Ctx<'_>, array: Array) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/erl_bif_atomics.c (erts_internal_atomics_new_2) and
+    // erl_bif_counters.c (erts_internal_counters_new_1), OTP-29.1.1. The arrays' backing
+    // storage is in the magic binary, so charge the C allocation rather than this Rust wrapper.
+    let count = len(&array);
+    let payload_size = match &array.cells {
+        Cells::Signed(_) | Cells::Unsigned(_) => 16_usize
+            .checked_add(
+                count
+                    .checked_mul(ERTS_ATOMIC64_SIZE)
+                    .ok_or(BifError::SystemLimit)?,
+            )
+            .ok_or(BifError::SystemLimit)?,
+        Cells::Sharded(_) => {
+            let atomics_per_cache_line = ERTS_CACHE_LINE_SIZE / ERTS_ATOMIC64_SIZE;
+            let cache_lines = (count.div_ceil(atomics_per_cache_line))
+                .checked_mul(ERTS_NO_SCHEDULERS + 1)
+                .ok_or(BifError::SystemLimit)?;
+            8_usize
+                .checked_add(
+                    cache_lines
+                        .checked_mul(ERTS_CACHE_LINE_SIZE)
+                        .ok_or(BifError::SystemLimit)?,
+                )
+                .ok_or(BifError::SystemLimit)?
+        }
+    };
     TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .magic_ref(MagicRef::new(array))
+        .magic_ref(MagicRef::with_erts_payload_size(array, payload_size))
         .map_err(|_| BifError::SystemLimit)
 }
 

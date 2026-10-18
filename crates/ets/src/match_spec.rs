@@ -798,6 +798,18 @@ fn validate_construct(
 }
 
 impl MatchProgram {
+    /// Payload bytes used by OTP's `MatchProg` magic binary for this program.
+    // Port of erts/emulator/beam/erl_db_util.c (match program allocation), OTP-29.1.1.
+    pub fn erts_magic_payload_size(&self) -> usize {
+        // sizeof(MatchProg) - sizeof(UWord) is 56 bytes on macOS arm64.
+        56 + self
+            .text
+            .iter()
+            .map(|op| op.erts_word_size())
+            .sum::<usize>()
+            * 8
+    }
+
     pub(crate) fn runner(&self) -> MatchRunner<'_> {
         MatchRunner {
             program: self,

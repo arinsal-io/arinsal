@@ -741,8 +741,9 @@ fn magic_compile_result(ctx: &mut Ctx<'_>, result: Term) -> Result<Term, BifErro
         .iter()
         .map(|item| from_owned(item, &mut heap).map_err(|_| BifError::SystemLimit))
         .collect::<Result<Vec<_>, _>>()?;
+    // Port of erts/emulator/beam/erl_bif_re.c (struct regex_magic_indirect): one code pointer.
     let reference = TermBuilder::new(&mut heap)
-        .magic_ref(MagicRef::new(RegexHandle(serialized)))
+        .magic_ref(MagicRef::with_erts_payload_size(RegexHandle(serialized), 8))
         .map_err(|_| BifError::SystemLimit)?;
     terms.push(reference);
     let compiled = TermBuilder::new(&mut heap)
