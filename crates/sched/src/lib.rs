@@ -6950,7 +6950,9 @@ fn run_slice<'a, T: Task>(
                 let online = inner.online_schedulers.load(Ordering::Acquire);
                 // Port of erts/emulator/beam/erl_process.c:6668 (schedule_out_process
                 // checks emigration), OTP-29.1.1: a single online scheduler has no path to
-                // emigrate to.
+                // emigrate to, so the process goes back on the run queue it ran from. A
+                // process that ran on a scheduler that went offline goes to the only online
+                // one.
                 let emigrate = if online == 1 || inner.scheduling_blocked.load(Ordering::Acquire) {
                     None
                 } else {
@@ -6959,7 +6961,7 @@ fn run_slice<'a, T: Task>(
                         .check_emigration_need(local.worker_id, process.priority().index())
                         .filter(|&to| to < online)
                 };
-                if online == 1 {
+                if online == 1 && local.worker_id != 0 {
                     inner.enqueue(next, true);
                 } else if let Some(to) = emigrate {
                     inner.push_run_queue(to, next, true);
