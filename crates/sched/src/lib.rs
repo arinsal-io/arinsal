@@ -4192,6 +4192,14 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn has_pending_input(&self) -> bool {
         self.input.has_pending()
     }
+    /// Whether non-message signals wait in this process's shared input queue
+    /// (`ERTS_PSFLG_NMSG_SIG_IN_Q`). A plain message does not count: erts fetches it with the
+    /// receive helper, not when the process is scheduled in.
+    // Port of erts_schedule in erts/emulator/beam/erl_process.c (the test of
+    // `ERTS_PSFLG_SIG_Q|ERTS_PSFLG_NMSG_SIG_IN_Q` before handling signals), OTP-29.1.1.
+    pub fn has_pending_nonmessage_signal(&self) -> bool {
+        self.input.state().load(Ordering::Relaxed) & psflg::NMSG_SIG_IN_Q != 0
+    }
     /// A handle that tells, without this context, whether signals wait in this process's
     /// shared input queue.
     pub fn signal_probe(&mut self) -> Option<SignalProbe<M>> {
