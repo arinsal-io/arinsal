@@ -160,6 +160,7 @@ dependencies = [
 name = "arinsal-drv"
 version = "0.0.1"
 dependencies = [
+ "arinsal-alloc",
  "arinsal-etf",
  "arinsal-sched",
  "cc",
@@ -233,6 +234,7 @@ dependencies = [
 name = "arinsal-nif"
 version = "0.0.1"
 dependencies = [
+ "arinsal-alloc",
  "arinsal-bifs",
  "arinsal-etf",
  "arinsal-maps",

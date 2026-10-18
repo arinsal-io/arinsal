@@ -126,20 +126,17 @@ pub(crate) fn from_bytes(data: &[u8]) -> *mut ErlDrvBinary {
 
 /// `driver_alloc` (erts_alloc_fnf of ERTS_ALC_T_DRV).
 pub fn alloc(size: usize) -> *mut c_void {
-    // SAFETY: plain allocation.
-    unsafe { libc::malloc(size) }
+    arinsal_alloc::typed::driver_alloc(size).cast()
 }
 
 /// `driver_realloc`.
 pub fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
-    // SAFETY: `ptr` is null or came from driver_alloc/driver_realloc.
-    unsafe { libc::realloc(ptr, size) }
+    arinsal_alloc::typed::driver_realloc(ptr.cast(), size).cast()
 }
 
 /// `driver_free`.
 pub fn free(ptr: *mut c_void) {
-    // SAFETY: `ptr` is null or came from driver_alloc/driver_realloc.
-    unsafe { libc::free(ptr) }
+    arinsal_alloc::typed::driver_free(ptr.cast());
 }
 
 /// Copy of `len` bytes at `offset` in the binary; the caller checked the bounds.
