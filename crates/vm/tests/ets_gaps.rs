@@ -3,8 +3,8 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ets_gaps_diff).
--export([all_tables/0, run_r/0, stats/0, errors/0, select_delete_large/0,
-         write_concurrency_lookup_element/0]).
+-export([all_tables/0, run_r/0, stats/0, errors/0, dets_catch/0, select_delete_large/0,
+         write_concurrency_lookup_element/0, compiled_reference_lifetime/0]).
 
 all_tables() ->
     Named = ets:new(gap_named, [named_table, public, set]),
@@ -168,6 +168,16 @@ errors() ->
 caught(Fun) ->
     try Fun() catch error:Reason -> Reason end.
 
+dets_catch() ->
+    Spec = <<17>>,
+    A = try {Spec, {match_spec, ets:match_spec_compile(Spec)}}
+        catch error:_ -> badarg end,
+    B = try dets:select(no_such_dets_table, Spec)
+        catch error:_ -> badarg end,
+    C = try dets:select_delete(no_such_dets_table, Spec)
+        catch error:_ -> badarg end,
+    {A, B, C}.
+
 recv(Tag) ->
     receive
         {Tag, Value} -> Value
@@ -193,6 +203,16 @@ write_concurrency_lookup_element() ->
     Missing = caught(fun() -> ets:lookup_element(Table, missing, 3) end),
     PastArity = caught(fun() -> ets:lookup_element(Table, inserted_new, 4) end),
     {InsertedNew, CounterDefault, ElementDefault, Missing, PastArity}.
+
+compiled_reference_lifetime() ->
+    Serialized = (fun() ->
+        Compiled = ets:match_spec_compile([{'_', [], [true]}]),
+        term_to_binary(Compiled)
+    end)(),
+    true = erlang:garbage_collect(),
+    Restored = binary_to_term(Serialized),
+    {ets:is_compiled_ms(Restored),
+     caught(fun() -> ets:match_spec_run([anything], Restored) end)}.
 "#;
 
 #[test]
@@ -203,6 +223,16 @@ fn ets_all_matches_otp_29() {
 #[test]
 fn match_spec_run_r_matches_otp_29() {
     assert_same("run_r");
+}
+
+#[test]
+fn compiled_match_program_follows_magic_reference_lifetime() {
+    assert_same("compiled_reference_lifetime");
+}
+
+#[test]
+fn dets_match_spec_badargs_are_caught_as_erts_does() {
+    assert_same("dets_catch");
 }
 
 #[test]
@@ -248,6 +278,6 @@ fn assert_same(function: &str) -> CallResult {
     let actual = vm
         .eval_scheduled("ets_gaps_diff", function, &[], 2, Some(81))
         .unwrap_or_else(|error| panic!("{function}: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     expected
 }

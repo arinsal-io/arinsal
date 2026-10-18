@@ -10,7 +10,7 @@ use arinsal_ets::{
     TableType, Tid, WriteConcurrency,
 };
 use arinsal_sched::{Pid, RunCtx};
-use arinsal_term::{HeapAlloc, Term, TermBuilder, TermKind, copy_term, global_atoms};
+use arinsal_term::{HeapAlloc, MagicRef, Term, TermBuilder, TermKind, copy_term, global_atoms};
 use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1205,6 +1205,22 @@ fn gated_by_busy(function: EtsBif) -> bool {
             | EtsBif::IsCompiledMs
             | EtsBif::MatchSpecRunR
     )
+}
+
+fn compiled_match_program(reference: Term) -> Option<Arc<MatchProgram>> {
+    if !reference.is_magic_ref() {
+        return None;
+    }
+    let arinsal_term::Identity::Ref { ids, .. } = reference.identity()? else {
+        return None;
+    };
+    if ids.len() != 3 || ids[2] != u32::MAX {
+        return None;
+    }
+    let id = u64::from(ids[0]) | (u64::from(ids[1]) << 32);
+    MagicRef::live_by_id(id)?
+        .downcast_ref::<Arc<MatchProgram>>()
+        .cloned()
 }
 
 /// Help finish the operation a busy table waits for, then trap so that the BIF runs again.
@@ -2698,13 +2714,18 @@ fn call_inner(
                 .map_err(|_| badarg())
         }
         (EtsBif::MatchSpecCompile, [spec]) => {
-            let program = MatchProgram::compile(*spec).map_err(err)?;
-            let reference = program.reference(&mut heap).map_err(err)?;
-            registry.retain_match_program(program);
-            Ok(reference)
+            // Port of erts/emulator/beam/erl_db.c:4591-4602
+            // (ets_match_spec_compile_1), OTP-29.1.1. The program lifetime follows
+            // the magic reference through the process heap and its garbage collector.
+            let program = Arc::new(MatchProgram::compile(*spec).map_err(err)?);
+            TermBuilder::new(&mut heap)
+                .magic_ref(MagicRef::new(program))
+                .map_err(|_| badarg())
         }
         (EtsBif::IsCompiledMs, [value]) => {
-            Ok(boolean_term(MatchProgram::is_compiled_reference(*value)))
+            // Port of erts/emulator/beam/erl_db.c:4582-4587
+            // (ets_is_compiled_ms_1), OTP-29.1.1.
+            Ok(boolean_term(compiled_match_program(*value).is_some()))
         }
         (EtsBif::InternalRequestAll, []) => {
             // Port of erts/emulator/beam/erl_db.c:3714 (ets_internal_request_all_0)
@@ -2737,7 +2758,9 @@ fn call_inner(
             if objects.classify() != TermKind::List && *objects != Term::NIL {
                 return Err(badarg());
             }
-            let program = registry.match_program(*compiled).ok_or_else(badarg)?;
+            let program = compiled_match_program(*compiled)
+                .or_else(|| registry.match_program(*compiled))
+                .ok_or_else(badarg)?;
             if *objects == Term::NIL {
                 return Ok(*accumulator);
             }
