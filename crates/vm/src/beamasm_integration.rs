@@ -1181,6 +1181,8 @@ pub(crate) struct CompiledVersion {
     literal_heap: std::sync::Mutex<Option<Arc<VecHeap>>>,
     // The module's literal area, which native code refers to directly.
     _module_literals: arinsal_loader::LiteralArea,
+    // Coverage pointers embedded in native code remain valid through the code version's lifetime.
+    _coverage: Option<arinsal_loader::Coverage>,
     native_functions: Vec<crate::NativeFunction>,
     native_targets: Vec<(Mfa, usize)>,
     code_start: usize,
@@ -1475,6 +1477,8 @@ struct VmModuleEnv<'a> {
     send_fragment: usize,
     native_bodies: HashMap<(String, u8), (usize, usize)>,
     module_name: String,
+    functions: Vec<(String, u8)>,
+    coverage: Option<arinsal_loader::Coverage>,
     code_index: usize,
     module_id: u32,
     // Call-NIF sites of functions a later load_nif may replace.
@@ -1572,6 +1576,12 @@ impl<'a> VmModuleEnv<'a> {
             send_fragment: fragments.send(),
             native_bodies,
             module_name: module.name.clone(),
+            functions: module
+                .functions
+                .iter()
+                .map(|(_, function, arity)| (function.clone(), *arity))
+                .collect(),
+            coverage: module.coverage.clone(),
             code_index: crate::code_ix::for_scope(code_scope).staging(),
             module_id,
             dynamic_nifs: std::cell::RefCell::new(HashMap::new()),
@@ -1598,6 +1608,56 @@ impl VmModuleEnv<'_> {
 }
 
 impl ModuleEnv for VmModuleEnv<'_> {
+    fn function_coverage_probe(
+        &self,
+        function: &str,
+        arity: u8,
+    ) -> Option<arinsal_beamjit::CoverageProbe> {
+        let coverage = self.coverage.as_ref()?;
+        if !matches!(
+            coverage.mode,
+            arinsal_loader::CoverageMode::Function | arinsal_loader::CoverageMode::FunctionCounters
+        ) {
+            return None;
+        }
+        let owner = self
+            .functions
+            .iter()
+            .position(|(name, found_arity)| name == function && *found_arity == arity)?;
+        let index = coverage
+            .function_owners
+            .iter()
+            .position(|owner_index| *owner_index as usize == owner)?;
+        Some(arinsal_beamjit::CoverageProbe {
+            address: coverage.probe_address(index)?,
+            flags: coverage.stores_flags(),
+        })
+    }
+
+    fn line_coverage_probe(
+        &self,
+        location: u32,
+        cover_id: u32,
+    ) -> Option<arinsal_beamjit::CoverageProbe> {
+        let coverage = self.coverage.as_ref()?;
+        if !matches!(
+            coverage.mode,
+            arinsal_loader::CoverageMode::Line | arinsal_loader::CoverageMode::LineCounters
+        ) {
+            return None;
+        }
+        let index = coverage.line_probe_mappings.iter().find_map(
+            |(found_location, found_cover_id, counter)| {
+                (*found_location == location && *found_cover_id == cover_id)
+                    .then_some(*counter as usize)
+            },
+        )?;
+        Some(arinsal_beamjit::CoverageProbe {
+            address: coverage.probe_address(index)?,
+            flags: coverage.stores_flags(),
+        })
+    }
+
     fn integer_literal(&self, value: i64) -> Result<u64, String> {
         self.intern_dynamic_integer_literal(BigInt::from(value))
     }
@@ -2266,6 +2326,7 @@ pub(crate) fn compile(
         nif_sites,
         literal_heap: std::sync::Mutex::new(Some(Arc::from(literal_heap))),
         _module_literals: module.literal_area(),
+        _coverage: module.coverage.clone(),
         native_functions,
         native_targets,
         code_start,

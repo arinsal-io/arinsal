@@ -41,6 +41,14 @@ pub trait ModuleEnv {
     fn bigint_literal(&self, _decimal: &str) -> Result<u64, String> {
         Err("module environment cannot build bignum literals".into())
     }
+    /// Return the retained storage address for a function coverage probe.
+    fn function_coverage_probe(&self, _function: &str, _arity: u8) -> Option<CoverageProbe> {
+        None
+    }
+    /// Return the retained storage address for an executable-line coverage probe.
+    fn line_coverage_probe(&self, _location: u32, _cover_id: u32) -> Option<CoverageProbe> {
+        None
+    }
     /// Build a tuple literal (for example the key tuple of a small map literal) from tagged
     /// element words and return its tagged word.
     fn tuple_literal(&self, _elements: &[u64]) -> Result<u64, String> {
@@ -269,6 +277,15 @@ pub trait ModuleEnv {
     }
 }
 
+/// Native coverage storage selected by the loaded module's OTP coverage mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoverageProbe {
+    /// Stable address of the byte flag or machine-word counter.
+    pub address: usize,
+    /// Byte flags are set to a nonzero value; counters are atomically incremented.
+    pub flags: bool,
+}
+
 extern "C" fn unused_add_stacktrace(
     _process: *mut ProcessHeader,
     _reason: u64,
@@ -470,6 +487,10 @@ pub static PORTED_OPS: &[PortedOp] = &[
     },
     PortedOp {
         name: "line",
+        emitter: EmitterKind::Metadata,
+    },
+    PortedOp {
+        name: "executable_line",
         emitter: EmitterKind::Metadata,
     },
     PortedOp {
@@ -1758,7 +1779,7 @@ pub fn compile_parsed_module_with_options(
                     }
                     break;
                 }
-                if let Err(error) = emit_op(&mut assembler, op, beam, env) {
+                if let Err(error) = emit_op(&mut assembler, op, beam, env, name, *arity) {
                     failure_index = Some(index);
                     failure_reason = Some((
                         op.name().to_owned(),
@@ -2307,6 +2328,8 @@ fn emit_op(
     op: &SpecificOp,
     beam: &BeamFile,
     env: &impl ModuleEnv,
+    function: &str,
+    arity: u8,
 ) -> Result<(), EmitError> {
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:452 (BeamModuleAssembler::emit),
     // OTP-29.1.1: `tbz`/`tbnz` reach only ±32KB, so each instruction flushes a veneer before a
@@ -2483,6 +2506,34 @@ fn emit_op(
                 }
                 Ok(())
             }
+            "executable_line" => {
+                // Port of erts/emulator/beam/jit/asm_load.c:685-715, OTP-29.1.1.
+                count(2)?;
+                let location = n(0)?;
+                let cover_id = n(1)?;
+                if let Some(item) = beam.lines.as_ref().and_then(|table| {
+                    location
+                        .checked_sub(1)
+                        .and_then(|index| table.items.get(index as usize))
+                }) && let Ok(line) = u32::try_from(item.line)
+                {
+                    let file = if item.name_index == 0 {
+                        format!("{}.erl", beam.module)
+                    } else {
+                        beam.lines
+                            .as_ref()
+                            .and_then(|table| table.names.get(item.name_index as usize - 1))
+                            .filter(|name| !name.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| format!("{}.erl", beam.module))
+                    };
+                    assembler.record_line(file, line);
+                }
+                if let Some(probe) = env.line_coverage_probe(location, cover_id) {
+                    assembler.emit_coverage(probe.address, probe.flags)?;
+                }
+                Ok(())
+            }
             "i_breakpoint_trampoline" => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:224-237, OTP-29.1.1.
                 assembler.emit_i_breakpoint_trampoline(env.breakpoint_fragment())
@@ -2533,7 +2584,13 @@ fn emit_op(
             }
             "i_test_yield" => {
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3097-3115, OTP-29.1.1.
-                assembler.test_yield()
+                count(0)?;
+                assembler.test_yield()?;
+                // Port of erts/emulator/beam/jit/asm_load.c:757-769, OTP-29.1.1.
+                if let Some(probe) = env.function_coverage_probe(function, arity) {
+                    assembler.emit_coverage(probe.address, probe.flags)?;
+                }
+                Ok(())
             }
             "nif_start" => {
                 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:627, OTP-29.1.1.

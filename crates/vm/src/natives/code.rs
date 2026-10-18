@@ -936,14 +936,14 @@ fn get_coverage(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
         _ => return Err(badarg()),
     };
     if line_mode {
-        let mut rows = Vec::with_capacity(coverage.counters.len());
-        for index in 0..coverage.counters.len() {
+        let mut rows = Vec::with_capacity(coverage.len());
+        for index in 0..coverage.len() {
             let key = if ids {
                 coverage.cover_ids[index]
             } else {
                 coverage.lines[index]
             };
-            let count = coverage.counters[index].load(Ordering::Relaxed);
+            let count = coverage.load(index).unwrap_or(0);
             let key = Term::small(i64::from(key)).ok_or_else(badarg)?;
             rows.push(make_tuple(process, &[key, coverage_count(count, flags)])?);
         }
@@ -960,13 +960,12 @@ fn get_coverage(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
                 .iter()
                 .enumerate()
                 .filter(|(_, owner)| **owner as usize == index)
-                .any(|(counter, _)| coverage.counters[counter].load(Ordering::Relaxed) > 0)
-                as u64
+                .any(|(counter, _)| coverage.load(counter).unwrap_or(0) > 0) as u64
         } else {
-            let Some(counter) = coverage.counters.get(index) else {
+            let Some(count) = coverage.load(index) else {
                 continue;
             };
-            counter.load(Ordering::Relaxed)
+            count
         };
         let mfa = make_tuple(
             process,
@@ -986,9 +985,7 @@ fn reset_coverage(vm: &Vm, module: Term) -> Result<Term, VmError> {
     let Some(coverage) = module.coverage.as_ref() else {
         return Err(badarg());
     };
-    for counter in coverage.counters.iter() {
-        counter.store(0, Ordering::Relaxed);
-    }
+    coverage.reset();
     Ok(atom("ok"))
 }
 
@@ -1138,7 +1135,11 @@ fn get_debug_info(vm: &Vm, process: &mut Process, module: Term) -> Result<Term, 
 }
 
 // Port of erts/emulator/beam/beam_bif_load.c:679-745 (delete_module_1), OTP-29.1.1.
-fn delete(vm: &mut Vm, name: &str) -> Result<Term, VmError> {
+fn delete(
+    vm: &mut Vm,
+    process: &Process,
+    name: &str,
+) -> Result<(Term, Option<crate::code_ix::EndedStaging>), VmError> {
     enum Outcome {
         NotPurged,
         Undefined,
@@ -1162,23 +1163,23 @@ fn delete(vm: &mut Vm, name: &str) -> Result<Term, VmError> {
             Outcome::Undefined
         }
     });
-    let result = match outcome {
+    match outcome {
         Outcome::NotPurged => {
             staging.abort();
             Err(badarg())
         }
         Outcome::Undefined => {
             staging.abort();
-            Ok(atom("undefined"))
+            Ok((atom("undefined"), None))
         }
         Outcome::Deleted => {
             crate::beamasm_integration::unpublish_module_exports(vm.code_scope, name);
-            drop(staging);
-            Ok(atom("true"))
+            crate::trace_bp::module_code_changed(process, vm.code_scope, name);
+            // Port of erts/emulator/beam/beam_bif_load.c (staging_epilogue), OTP-29.1.1:
+            // successful nonblocking deletes commit only after the caller's code barrier.
+            Ok((atom("true"), staging.end()))
         }
-    };
-    vm.refresh_code();
-    result
+    }
 }
 
 fn module_id_referenced(
@@ -1584,14 +1585,48 @@ fn call_values(
         })()),
         ("erlang", "delete_module", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
+            // The thread-progress callback commits the ended staging area and releases this
+            // process's code permission before it resumes the BIF.
+            if let Some(result) = process
+                .cold
+                .as_mut()
+                .and_then(|cold| cold.delete_module_result.take())
+            {
+                vm.refresh_code();
+                return Ok(result);
+            }
             // Port of erts/emulator/beam/beam_bif_load.c:691-694, OTP-29.1.1.
             seize_code_load_permission(process, Some(ctx.pid()))?;
-            let result = delete(vm, &name);
-            release_code_load_permission(process, Some(ctx.pid()));
-            if matches!(result, Ok(term) if term == atom("true")) {
-                crate::trace_bp::module_code_changed(process, vm.code_scope, &name);
+            match delete(vm, process, &name) {
+                Ok((result, Some(ended))) => {
+                    if let Some(runtime) = process.runtime.clone() {
+                        let pid = ctx.pid();
+                        process.cold_mut().delete_module_result = Some(result);
+                        crate::suspend::suspend_self(process);
+                        ctx.thread_progress_later(move || {
+                            ended.commit();
+                            release_code_mod_permission(&runtime);
+                            resume_suspended(&runtime, pid);
+                        });
+                        Err(VmError::Yield)
+                    } else {
+                        ctx.block_thread_progress(std::time::Duration::ZERO);
+                        ended.commit();
+                        vm.refresh_code();
+                        release_code_load_permission(process, Some(ctx.pid()));
+                        Ok(result)
+                    }
+                }
+                Ok((result, None)) => {
+                    vm.refresh_code();
+                    release_code_load_permission(process, Some(ctx.pid()));
+                    Ok(result)
+                }
+                Err(error) => {
+                    release_code_load_permission(process, Some(ctx.pid()));
+                    Err(error)
+                }
             }
-            result
         })()),
         ("erts_internal", "purge_module", 2) => Some((|| {
             let allowed = process
@@ -2047,8 +2082,14 @@ mod tests {
             .unwrap();
         assert_eq!(loaded(&mut vm, &deletion), OwnedTerm::Atom("ok".into()));
         reference.load("arinsal_hot_delete", &deletion).unwrap();
+        let process = Process::new();
+        let (deleted, ended) = delete(&mut vm, &process, "arinsal_hot_delete").unwrap();
+        if let Some(ended) = ended {
+            ended.commit();
+        }
+        vm.refresh_code();
         assert_eq!(
-            to_owned(delete(&mut vm, "arinsal_hot_delete").unwrap()).unwrap(),
+            to_owned(deleted).unwrap(),
             match reference.call(
                 "erlang",
                 "delete_module",

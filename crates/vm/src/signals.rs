@@ -3073,6 +3073,8 @@ type Slot = (usize, Pid);
 #[derive(Default)]
 struct Requests {
     plain: VecDeque<Pending>,
+    /// System tasks whose ordered wakeup signal has not reached the target yet.
+    pending_sys: [VecDeque<Pending>; 4],
     sys: [VecDeque<Pending>; 4],
     /// Normal-priority tasks run since the last low-priority one.
     ncount: u8,
@@ -3080,7 +3082,24 @@ struct Requests {
 
 impl Requests {
     fn is_empty(&self) -> bool {
-        self.plain.is_empty() && self.sys.iter().all(VecDeque::is_empty)
+        self.plain.is_empty()
+            && self.pending_sys.iter().all(VecDeque::is_empty)
+            && self.sys.iter().all(VecDeque::is_empty)
+    }
+
+    /// Make a task eligible only after its ordered system-task signal is handled.
+    fn handle_sys_wakeup(&mut self, id: u64) {
+        if id == u64::MAX {
+            return;
+        }
+        for (index, queue) in self.pending_sys.iter_mut().enumerate() {
+            if let Some(position) = queue.iter().position(|pending| pending.id == id) {
+                if let Some(pending) = queue.remove(position) {
+                    self.sys[index].push_back(pending);
+                }
+                return;
+            }
+        }
     }
 
     /// The highest-priority queued check_process_code task.
@@ -3335,7 +3354,7 @@ fn submit_from(
         let queues = tables.requests.entry((slot_of, target)).or_default();
         let pending = Pending { id, from, op };
         match priority {
-            Some(priority) => queues.sys[sys_index(priority)].push_back(pending),
+            Some(priority) => queues.pending_sys[sys_index(priority)].push_back(pending),
             None => queues.plain.push_back(pending),
         }
         if let Some(kind) = wait {
@@ -3349,7 +3368,8 @@ fn submit_from(
             if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
                 match priority {
                     Some(priority) => {
-                        queues.sys[sys_index(priority)].retain(|pending| pending.id != id)
+                        queues.pending_sys[sys_index(priority)].retain(|pending| pending.id != id);
+                        queues.sys[sys_index(priority)].retain(|pending| pending.id != id);
                     }
                     None => queues.plain.retain(|pending| pending.id != id),
                 }
@@ -3383,6 +3403,9 @@ fn submit_from(
             if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
                 queues.plain.retain(|pending| pending.id != id);
                 for queue in &mut queues.sys {
+                    queue.retain(|pending| pending.id != id);
+                }
+                for queue in &mut queues.pending_sys {
                     queue.retain(|pending| pending.id != id);
                 }
             }
@@ -3421,15 +3444,19 @@ fn elevate_sig_handling_prio(
         if proc_is_exiting(process, target) {
             return Ok(());
         }
-        tables.requests.entry((slot_of, target)).or_default().sys[sys_index(min_prio)].push_back(
-            Pending {
-                id,
-                from: ctx.pid(),
-                op: RemoteOp::PrioSig,
-            },
-        );
+        tables
+            .requests
+            .entry((slot_of, target))
+            .or_default()
+            .pending_sys[sys_index(min_prio)]
+        .push_back(Pending {
+            id,
+            from: ctx.pid(),
+            op: RemoteOp::PrioSig,
+        });
         if !note_request(process, target) || proc_is_exiting(process, target) {
             if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
+                queues.pending_sys[sys_index(min_prio)].retain(|pending| pending.id != id);
                 queues.sys[sys_index(min_prio)].retain(|pending| pending.id != id);
             }
             return Ok(());
@@ -3440,6 +3467,7 @@ fn elevate_sig_handling_prio(
         Err(arinsal_sched::Error::NoProcess) => {
             let mut tables = tables().lock().unwrap();
             if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
+                queues.pending_sys[sys_index(min_prio)].retain(|pending| pending.id != id);
                 queues.sys[sys_index(min_prio)].retain(|pending| pending.id != id);
             }
             Ok(())
@@ -3473,8 +3501,11 @@ pub(crate) fn handle_request(
         let Some(queues) = tables.requests.get_mut(&(scope(process), ctx.pid())) else {
             return Ok(());
         };
-        // A wakeup for a system task runs whichever task erts would fetch next; ids of
-        // plain requests are matched exactly.
+        // Port of erts/emulator/beam/erl_process.c:11518 (`sched_sig_sys_task`), OTP-29.1.1:
+        // the request enters the system-task queue only when its ordered signal is consumed.
+        queues.handle_sys_wakeup(id);
+        // A wakeup for a system task only makes it eligible; erts runs queued system tasks
+        // after the complete incoming-signal batch has been handled. Plain requests run here.
         let plain = queues
             .plain
             .iter()
@@ -3506,7 +3537,7 @@ pub(crate) fn handle_request(
         } else {
             None
         };
-        let Some(pending) = plain.or(dirty_cpc).or_else(|| queues.fetch_sys_task()) else {
+        let Some(pending) = plain.or(dirty_cpc) else {
             return Ok(());
         };
         if queues.is_empty() {
@@ -3514,7 +3545,9 @@ pub(crate) fn handle_request(
         }
         pending
     };
-    run_request(process, ctx, pending)
+    run_request(process, ctx, pending)?;
+    clear_sys_task_priority_if_idle(process, ctx);
+    Ok(())
 }
 
 /// Run one fetched request: a GC request may be saved or moved to a dirty scheduler first.
@@ -3576,18 +3609,37 @@ pub(crate) fn execute_sys_tasks(
         let pending = {
             let mut tables = tables().lock().unwrap();
             let slot = (scope(process), ctx.pid());
-            let Some(queues) = tables.requests.get_mut(&slot) else {
-                return Ok(());
+            let (pending, empty) = if let Some(queues) = tables.requests.get_mut(&slot) {
+                let pending = queues.fetch_sys_task();
+                (pending, queues.is_empty())
+            } else {
+                (None, false)
             };
-            let Some(pending) = queues.fetch_sys_task() else {
-                return Ok(());
-            };
-            if queues.is_empty() {
+            if empty {
                 tables.requests.remove(&slot);
             }
             pending
         };
+        let Some(pending) = pending else {
+            clear_sys_task_priority_if_idle(process, ctx);
+            return Ok(());
+        };
         run_request(process, ctx, pending)?;
+    }
+}
+
+fn clear_sys_task_priority_if_idle(process: &Process, ctx: &RunCtx<'_, Message>) {
+    let pending = tables()
+        .lock()
+        .unwrap()
+        .requests
+        .get(&(scope(process), ctx.pid()))
+        .is_some_and(|queues| {
+            queues.sys.iter().any(|queue| !queue.is_empty())
+                || queues.pending_sys.iter().any(|queue| !queue.is_empty())
+        });
+    if !pending {
+        ctx.clear_sys_task_priority();
     }
 }
 
@@ -3692,7 +3744,7 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
         let mut tables = tables().lock().unwrap();
         let queues = tables.requests.remove(&slot).unwrap_or_default();
         let mut all = queues.plain;
-        for queue in queues.sys {
+        for queue in queues.sys.into_iter().chain(queues.pending_sys) {
             all.extend(queue);
         }
         all

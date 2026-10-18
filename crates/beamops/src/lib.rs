@@ -986,6 +986,73 @@ fn apply_rule(
                     offset: code[at].offset,
                 });
             }
+            "split_values" => {
+                // Port of erts/emulator/beam/generators.tab:83-128 (gen.split_values),
+                // OTP-29.1.1. The integer table falls through to the literal table.
+                if args.len() != 5 {
+                    return None;
+                }
+                let Operand::List(rest) = &args[4] else {
+                    return None;
+                };
+                let size = usize::try_from(operand_integer(&args[3])?).ok()?;
+                if size < 2 || size % 2 != 0 || rest.len() != size {
+                    return None;
+                }
+                let mut small_values = Vec::new();
+                let mut literal_values = Vec::new();
+                for pair in rest.chunks_exact(2) {
+                    let values = if is_literal_integer(&pair[0]) {
+                        &mut literal_values
+                    } else {
+                        &mut small_values
+                    };
+                    values.extend_from_slice(pair);
+                }
+
+                produced.push(Node {
+                    name: "is_integer",
+                    args: vec![args[1].clone(), args[0].clone()],
+                    offset: code[at].offset,
+                });
+
+                let small_size = small_values.len();
+                let small_count = small_size / 2;
+                let mut small_args =
+                    vec![args[0].clone(), Operand::Nil, Operand::U(small_size as u64)];
+                small_args.extend(small_values);
+                produced.push(Node {
+                    name: if small_count <= 10 {
+                        "i_select_val_lins"
+                    } else {
+                        "i_select_val_bins"
+                    },
+                    args: small_args,
+                    offset: code[at].offset,
+                });
+
+                let literal_count = literal_values.len() / 2;
+                if literal_count == 0 {
+                    produced.push(Node {
+                        name: "i_select_val_lins",
+                        args: vec![args[0].clone(), args[2].clone(), Operand::U(0)],
+                        offset: code[at].offset,
+                    });
+                } else {
+                    for pair in literal_values.chunks_exact(2) {
+                        produced.push(Node {
+                            name: "is_ne_exact",
+                            args: vec![pair[1].clone(), args[0].clone(), pair[0].clone()],
+                            offset: code[at].offset,
+                        });
+                    }
+                    produced.push(Node {
+                        name: "jump",
+                        args: vec![args[2].clone()],
+                        offset: code[at].offset,
+                    });
+                }
+            }
             "bs_match" => {
                 if args.len() != 4 {
                     return None;
@@ -1395,6 +1462,9 @@ fn eval_c_predicate(
                 let (Operand::Int(key), Operand::Label(_)) = (&pair[0], &pair[1]) else {
                     return false;
                 };
+                if !is_small_integer(*key) {
+                    return false;
+                }
                 keys.push(*key);
             }
             keys.iter()
@@ -1411,7 +1481,7 @@ fn eval_c_predicate(
                 && size % 2 == 0
                 && usize::try_from(size).ok() == Some(rest.len())
                 && rest.chunks_exact(2).all(|pair| {
-                    matches!(pair[0], Operand::Literal(_)) && matches!(pair[1], Operand::Label(_))
+                    is_literal_integer(&pair[0]) && matches!(pair[1], Operand::Label(_))
                 })
         }
         "fixed_size_values" if args.len() == 2 => {
@@ -1425,9 +1495,8 @@ fn eval_c_predicate(
                 && rest.chunks_exact(2).all(|pair| {
                     matches!(pair[1], Operand::Label(_))
                         && match pair[0] {
-                            Operand::Atom(_) | Operand::Int(_) | Operand::U(_) | Operand::Nil => {
-                                true
-                            }
+                            Operand::Atom(_) | Operand::U(_) | Operand::Nil => true,
+                            Operand::Int(value) => is_small_integer(value),
                             Operand::Literal(index) => beam
                                 .literal(index)
                                 .is_ok_and(|term| !matches!(term, OwnedTerm::Float(_))),
@@ -1610,7 +1679,9 @@ fn operand_tag(value: &Operand) -> u8 {
         Operand::FR(_) => 3,
         Operand::Label(_) => 4,
         Operand::Atom(_) => 5,
-        Operand::Literal(_) => 6,
+        Operand::Literal(_) | Operand::BigInt(_) => 6,
+        // Port of erts/emulator/beam/beam_file.c:2132-2212 (marshal_integer), OTP-29.1.1.
+        Operand::Int(value) if !is_small_integer(*value) => 6,
         Operand::Int(_) => 7,
         Operand::U(_) => 8,
         Operand::Nil => 9,
@@ -1619,6 +1690,16 @@ fn operand_tag(value: &Operand) -> u8 {
         Operand::Alloc(_) => 12,
         _ => 13,
     }
+}
+
+// OTP converts signed BEAM integers outside SSMALL to literal-table entries while reading code.
+fn is_small_integer(value: i64) -> bool {
+    (-(1_i64 << 59)..(1_i64 << 59)).contains(&value)
+}
+
+fn is_literal_integer(value: &Operand) -> bool {
+    matches!(value, Operand::Literal(_) | Operand::BigInt(_))
+        || matches!(value, Operand::Int(value) if !is_small_integer(*value))
 }
 
 fn type_matches(ty: Option<&str>, value: &Operand) -> bool {

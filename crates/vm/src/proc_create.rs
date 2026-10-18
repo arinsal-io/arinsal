@@ -1029,6 +1029,8 @@ pub(crate) struct ProcessCold {
     /// Modules a suspended `finish_loading/1` staged; the thread-progress callback commits
     /// them and releases code-load permission before rescheduling the loader.
     pub(crate) finish_loading_commit: Option<crate::load::StagedLoad>,
+    /// Result of `delete_module/1` retained until its code barrier commits the index.
+    pub(crate) delete_module_result: Option<Term>,
     /// Breakpoint update a trace BIF caller finishes between code barriers while it holds
     /// the code modification permission.
     pub(crate) trace_finish: Option<crate::trace_bp::TraceFinish>,

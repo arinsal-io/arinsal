@@ -505,37 +505,125 @@ pub enum CoverageMode {
     LineCounters,
 }
 
-/// Atomic coverage storage for an interpreted module.
-///
-/// BeamAsm native execution does not run these probes yet, so coverage queries
-/// for a module executing natively reflect only interpreted calls.
+/// Atomic coverage storage shared by interpreted and BeamAsm execution.
+#[derive(Clone)]
 pub struct Coverage {
     /// Mode selected when the module was loaded.
     pub mode: CoverageMode,
     /// Function or line counters, indexed by the probe metadata.
-    pub counters: Box<[AtomicU64]>,
+    storage: CoverageStorage,
     /// Line number for each line probe.
     pub lines: Box<[u32]>,
     /// Compiler cover identifier for each line probe.
     pub cover_ids: Box<[u32]>,
+    /// BEAM line-table location index for each line probe.
+    pub locations: Box<[u32]>,
+    /// Compiler marker IDs and counter slots for each executable-line instruction.
+    pub line_probe_mappings: Box<[(u32, u32, u32)]>,
     /// Function-table index owning each probe.
     pub function_owners: Box<[u32]>,
 }
 
-impl Clone for Coverage {
-    fn clone(&self) -> Self {
+#[derive(Clone)]
+enum CoverageStorage {
+    Flags(Arc<[AtomicU8]>),
+    Counters(Arc<[AtomicU64]>),
+}
+
+impl Coverage {
+    fn new(mode: CoverageMode, count: usize) -> Self {
+        let storage = match mode {
+            CoverageMode::Function | CoverageMode::Line => CoverageStorage::Flags(
+                (0..count)
+                    .map(|_| AtomicU8::new(0))
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            CoverageMode::FunctionCounters | CoverageMode::LineCounters => {
+                CoverageStorage::Counters(
+                    (0..count)
+                        .map(|_| AtomicU64::new(0))
+                        .collect::<Vec<_>>()
+                        .into(),
+                )
+            }
+            CoverageMode::None => CoverageStorage::Counters(Arc::from([])),
+        };
         Self {
-            mode: self.mode,
-            counters: self
-                .counters
-                .iter()
-                .map(|counter| AtomicU64::new(counter.load(Ordering::Relaxed)))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            lines: self.lines.clone(),
-            cover_ids: self.cover_ids.clone(),
-            function_owners: self.function_owners.clone(),
+            mode,
+            storage,
+            lines: Box::new([]),
+            cover_ids: Box::new([]),
+            locations: Box::new([]),
+            line_probe_mappings: Box::new([]),
+            function_owners: Box::new([]),
         }
+    }
+
+    /// Number of function or line probes retained by this code version.
+    pub fn len(&self) -> usize {
+        match &self.storage {
+            CoverageStorage::Flags(values) => values.len(),
+            CoverageStorage::Counters(values) => values.len(),
+        }
+    }
+
+    /// Whether this code version has no function or line probes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether this mode stores one-byte flags rather than machine-word counters.
+    pub fn stores_flags(&self) -> bool {
+        matches!(&self.storage, CoverageStorage::Flags(_))
+    }
+
+    /// Read the counter for `index`, if it exists.
+    pub fn load(&self, index: usize) -> Option<u64> {
+        Some(match &self.storage {
+            CoverageStorage::Flags(values) => u64::from(values.get(index)?.load(Ordering::Relaxed)),
+            CoverageStorage::Counters(values) => values.get(index)?.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Mark a flag or increment a counter, matching the storage selected by the mode.
+    pub fn hit(&self, index: usize) {
+        match &self.storage {
+            CoverageStorage::Flags(values) => {
+                if let Some(flag) = values.get(index) {
+                    flag.store(1, Ordering::Relaxed);
+                }
+            }
+            CoverageStorage::Counters(values) => {
+                if let Some(counter) = values.get(index) {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Clear every probe.
+    pub fn reset(&self) {
+        match &self.storage {
+            CoverageStorage::Flags(values) => {
+                for flag in values.iter() {
+                    flag.store(0, Ordering::Relaxed);
+                }
+            }
+            CoverageStorage::Counters(values) => {
+                for counter in values.iter() {
+                    counter.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Stable address of a probe retained by this code version.
+    pub fn probe_address(&self, index: usize) -> Option<usize> {
+        Some(match &self.storage {
+            CoverageStorage::Flags(values) => values.get(index)?.as_ptr() as usize,
+            CoverageStorage::Counters(values) => values.get(index)?.as_ptr() as usize,
+        })
     }
 }
 
@@ -545,6 +633,9 @@ pub struct CoverageProbe {
     /// Counter index.
     pub counter: u32,
 }
+
+type LineCoverageInsertion = (u32, u32, u32, u32, usize);
+
 impl Module {
     /// Retain this code version's literal heap for process root scanning.
     pub fn literal_area(&self) -> LiteralArea {
@@ -892,17 +983,52 @@ pub fn load_with_instrumentations(
     );
     let mut source_functions = Vec::new();
     let mut source_lines = Vec::new();
+    let mut counter_lines = Vec::new();
+    let mut counter_ids = Vec::new();
+    let mut counter_locations = Vec::new();
+    let mut line_probe_mappings = Vec::new();
+    let mut function_owners = Vec::new();
+    let mut previous_line_location = None;
+    let mut previous_line_probe = None;
+    let line_mode = matches!(
+        coverage_mode,
+        CoverageMode::Line | CoverageMode::LineCounters
+    );
     for instruction in &file.code.instructions {
         if instruction.op == Opcode::Label {
             if let Some(Operand::U(n)) = instruction.args.first() {
                 labels.insert(*n as u32, count);
             }
+        } else if instruction.op == Opcode::Line {
+            // Port of erts/emulator/beam/jit/asm_load.c:318-348 (add_line_entry), OTP-29.1.1.
+            if let Some(Operand::U(location)) = instruction.args.first()
+                && *location != 0
+                && let Ok(location) = u32::try_from(*location)
+                && previous_line_location != Some(location)
+            {
+                previous_line_location = Some(location);
+                previous_line_probe = None;
+            }
         } else if instruction.op == Opcode::DebugLine {
+            // Port of erts/emulator/beam/jit/asm_load.c:715-735, OTP-29.1.1: debugger line
+            // entries keep duplicates, so a following executable-line marker gets its own slot.
+            if let Some(Operand::U(location)) = instruction.args.get(1)
+                && let Ok(location) = u32::try_from(*location)
+            {
+                previous_line_location = Some(location);
+                previous_line_probe = None;
+            }
             if debugger_lines && is_line_debug_instruction(file, instruction) {
                 count += 2;
             }
         } else if instruction.op != Opcode::Line && instruction.op != Opcode::NifStart {
             if instruction.op == Opcode::FuncInfo {
+                // Port of erts/emulator/beam/jit/asm_load.c:642-647 (func_line), OTP-29.1.1:
+                // each function's coverage locations start at its recorded line-table boundary.
+                if line_mode {
+                    previous_line_location = None;
+                    previous_line_probe = None;
+                }
                 source_functions.push(count);
             }
             if instruction.op == Opcode::ExecutableLine {
@@ -914,14 +1040,50 @@ pub fn load_with_instrumentations(
                     Operand::U(value) => u32::try_from(*value).ok(),
                     _ => None,
                 });
-                if let (Some(location), Some(cover_id)) = (location, cover_id) {
+                if line_mode && let (Some(location), Some(cover_id)) = (location, cover_id) {
                     let line = file
                         .lines
                         .as_ref()
                         .and_then(|table| location.checked_sub(1).and_then(|i| table.items.get(i)))
                         .and_then(|item| u32::try_from(item.line).ok())
                         .unwrap_or(0);
-                    source_lines.push((count, line, cover_id));
+                    if let Ok(location) = u32::try_from(location) {
+                        // Port of erts/emulator/beam/jit/asm_load.c:681-711: consecutive line
+                        // markers for one location share the line table's coverage slot.
+                        let (counter, owner) = if previous_line_location == Some(location) {
+                            if let Some(counter) = previous_line_probe {
+                                (counter, function_owners[counter])
+                            } else {
+                                let counter = counter_lines.len();
+                                let owner = source_functions.len().saturating_sub(1) as u32;
+                                counter_lines.push(line);
+                                counter_ids.push(cover_id);
+                                counter_locations.push(location);
+                                function_owners.push(owner);
+                                previous_line_probe = Some(counter);
+                                (counter, owner)
+                            }
+                        } else {
+                            let counter = counter_lines.len();
+                            let owner = source_functions.len().saturating_sub(1) as u32;
+                            counter_lines.push(line);
+                            counter_ids.push(cover_id);
+                            counter_locations.push(location);
+                            function_owners.push(owner);
+                            previous_line_location = Some(location);
+                            previous_line_probe = Some(counter);
+                            (counter, owner)
+                        };
+                        if let Some(existing_id) = counter_ids.get_mut(counter) {
+                            *existing_id = cover_id;
+                        }
+                        line_probe_mappings.push((
+                            location,
+                            cover_id,
+                            u32::try_from(counter).map_err(|_| LoadError::Limit)?,
+                        ));
+                        source_lines.push((count, line, cover_id, owner, location, counter));
+                    }
                 }
             }
             count += 1;
@@ -930,28 +1092,25 @@ pub fn load_with_instrumentations(
     if count > u32::MAX as usize {
         return Err(LoadError::Limit);
     }
-    let mut insertions: HashMap<usize, Vec<(u32, u32, u32)>> = HashMap::new();
+    let mut insertions: HashMap<usize, Vec<LineCoverageInsertion>> = HashMap::new();
     if coverage_enabled {
         if function_mode {
             for (owner, start) in source_functions.iter().enumerate() {
                 let body = start.saturating_add(1);
                 if body < count {
+                    function_owners.push(owner as u32);
                     insertions
                         .entry(body)
                         .or_default()
-                        .push((0, 0, owner as u32));
+                        .push((0, 0, owner as u32, 0, owner));
                 }
             }
         } else {
-            for (ip, line, cover_id) in source_lines {
-                let owner = source_functions
-                    .iter()
-                    .rposition(|start| start.saturating_add(1) <= ip)
-                    .unwrap_or(0) as u32;
+            for (ip, line, cover_id, owner, location, counter) in source_lines {
                 insertions
                     .entry(ip)
                     .or_default()
-                    .push((line, cover_id, owner));
+                    .push((line, cover_id, owner, location, counter));
             }
         }
     }
@@ -963,7 +1122,7 @@ pub fn load_with_instrumentations(
         target
             + insertions
                 .iter()
-                .filter(|(ip, _)| **ip <= target)
+                .filter(|(ip, _)| **ip < target)
                 .map(|(_, probes)| probes.len())
                 .sum::<usize>()
     };
@@ -1149,9 +1308,6 @@ pub fn load_with_instrumentations(
     let mut debug_line_items = Vec::new();
     let mut notify_breakpoint_stub = None;
     let mut coverage_probes = Vec::new();
-    let mut counter_lines = Vec::new();
-    let mut counter_ids = Vec::new();
-    let mut function_owners = Vec::new();
     let mut source_ip = 0_usize;
     for instruction in &file.code.instructions {
         if instruction.op == Opcode::Label {
@@ -1233,13 +1389,10 @@ pub fn load_with_instrumentations(
             notify_breakpoint_stub = Some((*function_ip, import));
         }
         if let Some(probes) = insertions.get(&source_ip) {
-            for (line, cover_id, owner) in probes {
+            for (_, _, _, _, counter) in probes {
                 let probe = u32::try_from(coverage_probes.len()).map_err(|_| LoadError::Limit)?;
-                let counter = u32::try_from(coverage_probes.len()).map_err(|_| LoadError::Limit)?;
+                let counter = u32::try_from(*counter).map_err(|_| LoadError::Limit)?;
                 coverage_probes.push(CoverageProbe { counter });
-                counter_lines.push(*line);
-                counter_ids.push(*cover_id);
-                function_owners.push(*owner);
                 code.push(Instr::CoverageProbe { index: probe });
                 types.push(Vec::new());
                 lines.push(current_line.clone());
@@ -1497,16 +1650,15 @@ pub fn load_with_instrumentations(
     }
     // vm_binparse2: specialize bit commands independently of function shape.
     maps_bits::specialize_bit_commands(&mut code, &generic, &lists, &tails);
+    let coverage_count = function_owners.len();
     let coverage = if coverage_enabled {
         Some(Coverage {
-            mode: coverage_mode,
-            counters: (0..coverage_probes.len())
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
             lines: counter_lines.into_boxed_slice(),
             cover_ids: counter_ids.into_boxed_slice(),
+            locations: counter_locations.into_boxed_slice(),
+            line_probe_mappings: line_probe_mappings.into_boxed_slice(),
             function_owners: function_owners.into_boxed_slice(),
+            ..Coverage::new(coverage_mode, coverage_count)
         })
     } else {
         None

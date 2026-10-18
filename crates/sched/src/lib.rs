@@ -4073,6 +4073,7 @@ pub struct RunCtx<'a, M: SignalMessage> {
     gc_accounted_total: u64,
     sched_type: SchedulerType,
     user_priority: &'a AtomicU8,
+    sys_priority: &'a AtomicU8,
     active: &'a AtomicBool,
     /// [`proc_flags`] of the running process. Exit tests this before any global table.
     exit_flags: &'a AtomicU32,
@@ -4474,6 +4475,12 @@ impl<M: SignalMessage> RunCtx<'_, M> {
         self.user_priority
             .store(priority.index() as u8, Ordering::Release);
     }
+    /// Clear the active system-task priority after its queued work has drained.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:10737 (`fetch_sys_task`), OTP-29.1.1.
+    pub fn clear_sys_task_priority(&self) {
+        self.sys_priority.store(NO_SYS_PRIORITY, Ordering::Release);
+    }
     /// Whether this run was scheduled for system tasks (erts `ERTS_PSFLG_RUNNING_SYS`).
     /// The task should handle its queued signals before executing code.
     pub fn sys_task_run(&self) -> bool {
@@ -4717,6 +4724,7 @@ impl<T: Task> Runner<'_, T> {
             gc_accounted_total: 0,
             sched_type: SchedulerType::Normal,
             user_priority: &process.user_priority,
+            sys_priority: &process.sys_priority,
             active: &process.active,
             exit_flags: &process.exit_flags,
             sys_task_run: false,
@@ -6397,6 +6405,7 @@ mod msgq_stage_microbench {
         let backlog = AtomicUsize::new(N);
         let bound_worker = AtomicUsize::new(UNBOUND_WORKER);
         let user_priority = AtomicU8::new(Priority::Normal.index() as u8);
+        let sys_priority = AtomicU8::new(NO_SYS_PRIORITY);
         let active = AtomicBool::new(true);
         let exit_flags = AtomicU32::new(0);
         let mut context = RunCtx {
@@ -6414,6 +6423,7 @@ mod msgq_stage_microbench {
             gc_accounted_total: 0,
             sched_type: SchedulerType::Normal,
             user_priority: &user_priority,
+            sys_priority: &sys_priority,
             active: &active,
             exit_flags: &exit_flags,
             sys_task_run: false,
@@ -6812,13 +6822,11 @@ fn run_slice<'a, T: Task>(
     {
         return;
     }
-    // Port of erts/emulator/beam/erl_process.c:10646 (fetch_sys_task), OTP-29.1.1:
-    // this run executes every system task queued so far, so the actual priority
-    // falls back to the user priority. A task queued later elevates it again.
+    // Port of erts/emulator/beam/erl_process.c:7028-7134 (active_sys_enqueue), OTP-29.1.1:
+    // keep the elevated priority while ordered system-task signals are still pending.
     // Dirty schedulers never execute system tasks (erl_process.c:10255).
-    let sys_task_run = dirty.is_none()
-        && process.sys_priority.load(Ordering::Acquire) != NO_SYS_PRIORITY
-        && process.sys_priority.swap(NO_SYS_PRIORITY, Ordering::AcqRel) != NO_SYS_PRIORITY;
+    let sys_task_run =
+        dirty.is_none() && process.sys_priority.load(Ordering::Acquire) != NO_SYS_PRIORITY;
     let worker_id = worker.unwrap_or(0);
     // A process on a dirty run queue left the normal run queue accounting when it migrated.
     if dirty.is_none() {
@@ -6889,6 +6897,7 @@ fn run_slice<'a, T: Task>(
                 },
                 sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
                 user_priority: &process.user_priority,
+                sys_priority: &process.sys_priority,
                 active: &process.active,
                 exit_flags: &process.exit_flags,
                 sys_task_run,
