@@ -19,6 +19,7 @@ enum NativeErrorRoots {
 
 enum NativeTopRoots {
     BifArgs { start: usize, len: usize },
+    BifRegisters { start: usize, len: usize },
     CurrentArgs(usize),
 }
 
@@ -217,6 +218,10 @@ pub(crate) fn gc_after_native_parts(
             crate::stacktrace::TopFrame::Bif { args, .. } => args
                 .root_terms(&mut roots)
                 .map(|(start, len)| NativeTopRoots::BifArgs { start, len }),
+            crate::stacktrace::TopFrame::BifRegisters { arity, .. } => {
+                let len = (*arity).min(arguments.len());
+                Some(NativeTopRoots::BifRegisters { start: 0, len })
+            }
             crate::stacktrace::TopFrame::CurrentArgs(args) => {
                 roots.push(*args);
                 Some(NativeTopRoots::CurrentArgs(roots.len() - 1))
@@ -240,9 +245,20 @@ pub(crate) fn gc_after_native_parts(
         trap.trace = trace.map(|index| roots[index]);
         if let Some(top_roots) = top {
             match trap.top.as_mut() {
-                Some(crate::stacktrace::TopFrame::Bif { args, .. }) => {
-                    if let NativeTopRoots::BifArgs { start, len } = top_roots {
+                Some(crate::stacktrace::TopFrame::Bif { args, .. }) => match top_roots {
+                    NativeTopRoots::BifArgs { start, len } => {
                         args.update_root_terms(&roots, start, len);
+                    }
+                    NativeTopRoots::BifRegisters { .. } => {
+                        unreachable!("BIF argument storage remains stable across GC")
+                    }
+                    NativeTopRoots::CurrentArgs(_) => {
+                        unreachable!("BIF argument storage remains stable across GC")
+                    }
+                },
+                Some(crate::stacktrace::TopFrame::BifRegisters { .. }) => {
+                    if let NativeTopRoots::BifRegisters { start, len } = top_roots {
+                        arguments[..len].copy_from_slice(&roots[start..start + len]);
                     }
                 }
                 Some(crate::stacktrace::TopFrame::CurrentArgs(args))

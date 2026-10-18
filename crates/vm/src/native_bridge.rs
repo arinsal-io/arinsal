@@ -507,12 +507,11 @@ fn scan_catch(
     table: &[Option<CatchTarget>],
     native_only: bool,
 ) -> Option<LocatedCatch> {
-    let mut index = 0usize;
+    let mut stack = heap.stack_terms().enumerate();
     let mut previous_cp = 0usize;
     let mut seen_cp = false;
     let mut traced = false;
-    while index < heap.stack_words() {
-        let word = heap.stack_get(index)?;
+    while let Some((index, word)) = stack.next() {
         let raw = word.tagged_word();
         let address = raw as usize;
         if address == native_trace_return_address() {
@@ -526,14 +525,20 @@ fn scan_catch(
             // The whole trace frame sits below the catching frame's Y slots.
             previous_cp = index + words - arinsal_term::CP_WORDS;
             seen_cp = true;
-            index += words;
+            for _ in 1..words {
+                if stack.next().is_none() {
+                    break;
+                }
+            }
             continue;
         }
         // Port of erl_term.h:1378-1379 (`is_CP`), OTP-29.1.1.
         if arinsal_term::is_cp(raw) {
             previous_cp = index;
             seen_cp = true;
-            index += arinsal_term::CP_WORDS;
+            for _ in 0..arinsal_term::CP_WORDS.saturating_sub(1) {
+                stack.next();
+            }
             continue;
         }
         if raw & 63 == 0x1b
@@ -543,7 +548,6 @@ fn scan_catch(
                 .and_then(|slot| table.get(slot).copied().flatten())
         {
             if native_only && !matches!(target, CatchTarget::Native(_)) {
-                index += 1;
                 continue;
             }
             // Both native and interpreted frames keep the caller-pushed CP above their Y slots
@@ -565,9 +569,9 @@ fn scan_catch(
         if crate::stacktrace::decode_tag(word).is_some_and(|(handler, _, _)| !handler) {
             previous_cp = index;
             seen_cp = true;
-            index += arinsal_term::CP_WORDS;
-        } else {
-            index += 1;
+            for _ in 0..arinsal_term::CP_WORDS.saturating_sub(1) {
+                stack.next();
+            }
         }
     }
     None

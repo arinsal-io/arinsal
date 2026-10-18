@@ -881,6 +881,7 @@ fn save_raw(
             native_pc,
             top: save_top,
         },
+        None,
     )
 }
 
@@ -897,11 +898,13 @@ pub(super) fn materialize(vm: Option<&Vm>, p: &mut Process, trace: Term) -> Resu
     }
     // The saved trace stays behind the term: the same one can be rebuilt by a later raise.
     // A plain raw bignum is built from one temporary frame array and one heap block.
-    if let Some(result) = stacktrace::build_direct(p, trace) {
+    let direct = stacktrace::build_direct(p, trace);
+    if let Some(result) = direct {
         return result;
     }
     let modules = vm.map_or(&[][..], |vm| vm.code.modules.as_slice());
-    match stacktrace::with_saved(trace, |raw| stacktrace::build_saved(p, raw, modules)) {
+    let saved = stacktrace::with_saved(trace, |raw| stacktrace::build_saved(p, raw, modules));
+    match saved {
         Some(result) => result,
         None => Ok(trace),
     }

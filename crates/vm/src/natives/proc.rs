@@ -2602,10 +2602,28 @@ pub(crate) fn direct_dictionary(
         return None;
     }
     match (function, arity) {
-        ("put", 2) => Some(|process, args| Some(dict_put(process, args[0], args[1]))),
-        ("erase", 1) => Some(|process, args| Some(dict_erase(process, args[0]))),
+        ("put", 2) => Some(direct_put),
+        ("erase", 1) => Some(direct_erase),
         _ => None,
     }
+}
+
+fn direct_put(
+    process: &mut Process,
+    args: &[Term],
+    _module: arinsal_term::Atom,
+    _function: arinsal_term::Atom,
+) -> Option<Term> {
+    Some(dict_put(process, args[0], args[1]))
+}
+
+fn direct_erase(
+    process: &mut Process,
+    args: &[Term],
+    _module: arinsal_term::Atom,
+    _function: arinsal_term::Atom,
+) -> Option<Term> {
+    Some(dict_erase(process, args[0]))
 }
 
 fn undefined_atom() -> Term {

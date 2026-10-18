@@ -348,12 +348,14 @@ pub(super) enum StoredTopFrame {
 }
 
 /// Where the exception was raised: erts' `s->pc` (save_stacktrace's `pc`).
-pub(super) struct Current {
+pub(super) struct Current<'a> {
     /// Last interpreter module and instruction.
     pub(super) module: usize,
     pub(super) ip: usize,
     /// Raising pc inside native code, when the process was executing there.
     pub(super) native_pc: Option<usize>,
+    /// Current X registers, which carry live arguments for native BIF failures.
+    pub(super) registers: &'a [Term],
     /// The process is scheduled out in the export trap of a BIF call.
     pub(super) trapped: bool,
     /// Return address of that BIF call when it is not on the stack (interpreter calls).
@@ -366,7 +368,7 @@ pub(super) fn capture(
     class: Option<Class>,
     top: Option<&TopFrame>,
     modules: &[Arc<Module>],
-    current: Current,
+    current: Current<'_>,
     heap: &ProcessHeap,
     depth: usize,
 ) -> Result<(), VmError> {
@@ -376,6 +378,7 @@ pub(super) fn capture(
         module,
         ip,
         native_pc,
+        registers,
         trapped,
         trap_return,
     } = current;
@@ -393,6 +396,22 @@ pub(super) fn capture(
                 args: args.detached()?,
                 info: *info,
             }),
+            TopFrame::BifRegisters {
+                module,
+                function,
+                arity,
+                info,
+            } => {
+                let args = registers
+                    .get(..*arity)
+                    .ok_or_else(|| VmError::Unsupported("native BIF argument registers".into()))?;
+                Ok(StoredTopFrame::Bif {
+                    module: *module,
+                    function: *function,
+                    args: BifArgs::from_terms(args)?.detached()?,
+                    info: *info,
+                })
+            }
             TopFrame::CurrentArgs(args) => Ok(StoredTopFrame::CurrentArgs(
                 to_owned(*args)
                     .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
@@ -658,8 +677,13 @@ pub(crate) fn save_lazy(
     p: &mut Process,
     class: Class,
     native_pc: Option<usize>,
+    top: Option<&TopFrame>,
+    registers: &[Term],
 ) -> Result<Term, VmError> {
-    let top = clone_matching_pending(p);
+    let pending = top.is_none().then(|| clone_matching_pending(p)).flatten();
+    let top = top
+        .map(SaveTop::Live)
+        .or_else(|| pending.as_ref().map(SaveTop::Stored));
     save_direct(
         p,
         StackTraceSave {
@@ -667,14 +691,19 @@ pub(crate) fn save_lazy(
             depth: runtime_backtrace_depth(p, 8),
             freason: process_freason(p, class),
             native_pc,
-            top: top.as_ref().map(SaveTop::Stored),
+            top,
         },
+        Some(registers),
     )
 }
 
 /// Port of erts/emulator/beam/beam_common.c:880-1010 (`save_stacktrace`), OTP-29.1.1.
 /// The trace block is sized and allocated before the stack walk, then filled in place.
-pub(super) fn save_direct(p: &mut Process, input: StackTraceSave<'_>) -> Result<Term, VmError> {
+pub(super) fn save_direct(
+    p: &mut Process,
+    input: StackTraceSave<'_>,
+    registers: Option<&[Term]>,
+) -> Result<Term, VmError> {
     let StackTraceSave {
         class,
         depth,
@@ -757,7 +786,7 @@ pub(super) fn save_direct(p: &mut Process, input: StackTraceSave<'_>) -> Result<
         })
         .ok_or_else(|| VmError::Unsupported("stacktrace bignum".into()))?;
     let mut heap = TraceHeap::new(&mut p.heap);
-    let (args, error_info) = save_ftrace_values(&mut heap, top)?;
+    let (args, error_info) = save_ftrace_values(&mut heap, top, registers.unwrap_or(&p.x))?;
     Ftrace {
         stack_trace,
         args,
@@ -784,13 +813,18 @@ impl SaveTop<'_> {
     fn is_bif(self) -> bool {
         matches!(
             self,
-            Self::Live(TopFrame::Bif { .. }) | Self::Stored(StoredTopFrame::Bif { .. })
+            Self::Live(TopFrame::Bif { .. })
+                | Self::Live(TopFrame::BifRegisters { .. })
+                | Self::Stored(StoredTopFrame::Bif { .. })
         )
     }
 
     fn bif_mfa(&self) -> Option<(Atom, Atom)> {
         match self {
             Self::Live(TopFrame::Bif {
+                module, function, ..
+            })
+            | Self::Live(TopFrame::BifRegisters {
                 module, function, ..
             })
             | Self::Stored(StoredTopFrame::Bif {
@@ -820,12 +854,21 @@ fn process_freason(p: &Process, class: Class) -> u64 {
 fn save_ftrace_values(
     heap: &mut TraceHeap<'_>,
     top: Option<SaveTop<'_>>,
+    registers: &[Term],
 ) -> Result<(Term, Term), VmError> {
     if let Some(SaveTop::Stored(top)) = top {
         return ftrace_values(heap, Some(top));
     }
     let args = match top {
         Some(SaveTop::Live(TopFrame::Bif { args, .. })) => args.to_term(heap)?,
+        Some(SaveTop::Live(TopFrame::BifRegisters { arity, .. })) => {
+            let values = registers
+                .get(..*arity)
+                .ok_or_else(|| VmError::Unsupported("native BIF argument registers".into()))?;
+            TermBuilder::new(heap)
+                .list_from_slice(values)
+                .map_err(|error| VmError::Unsupported(format!("exception args {error:?}")))?
+        }
         Some(SaveTop::Live(TopFrame::CurrentArgs(args)))
         | Some(SaveTop::Live(TopFrame::CurrentArgsWithInfo(Some(args), _))) => *args,
         Some(SaveTop::Live(TopFrame::CurrentArgsWithInfo(None, _))) | None => {
@@ -835,6 +878,9 @@ fn save_ftrace_values(
     };
     let info_map = match top {
         Some(SaveTop::Live(TopFrame::Bif { module, info, .. })) => {
+            bif_error_info(heap, *module, *info)?
+        }
+        Some(SaveTop::Live(TopFrame::BifRegisters { module, info, .. })) => {
             bif_error_info(heap, *module, *info)?
         }
         Some(SaveTop::Live(TopFrame::CurrentArgsWithInfo(_, info))) => Some(
@@ -1148,15 +1194,7 @@ fn term_error_info_map(value: Term) -> Option<Term> {
 }
 
 fn term_error_info(value: Term) -> BifErrorInfo {
-    let Some(info) = term_error_info_map(value) else {
-        return BifErrorInfo::None;
-    };
-    let cause = arinsal_term::record_map_pairs(info).and_then(|pairs| {
-        pairs
-            .into_iter()
-            .find_map(|(key, value)| (key.as_atom() == Some(trace_atoms().cause)).then_some(value))
-    });
-    cause.map_or(BifErrorInfo::Plain, BifErrorInfo::Cause)
+    term_error_info_map(value).map_or(BifErrorInfo::None, BifErrorInfo::Map)
 }
 
 /// Run `f` on the saved trace behind `term`, or return `None` when it is not one.
@@ -1216,6 +1254,8 @@ pub(super) enum BifErrorInfo {
     Plain,
     /// `EXF_HAS_EXT_INFO`: `#{cause => c_p->fvalue, module => FormatModule}`.
     Cause(Term),
+    /// An `error_info` map already stored in the saved ftrace tuple.
+    Map(Term),
 }
 
 #[derive(Debug)]
@@ -1225,6 +1265,13 @@ pub(super) enum TopFrame {
         module: Atom,
         function: Atom,
         args: BifArgs,
+        info: BifErrorInfo,
+    },
+    /// A native BIF frame whose arguments are still live in the scheduler X registers.
+    BifRegisters {
+        module: Atom,
+        function: Atom,
+        arity: usize,
         info: BifErrorInfo,
     },
     CurrentArgs(Term),
@@ -1422,6 +1469,7 @@ fn bif_error_info(
 ) -> Result<Option<Term>, VmError> {
     let cause = match info {
         BifErrorInfo::None => return Ok(None),
+        BifErrorInfo::Map(map) => return Ok(Some(map)),
         BifErrorInfo::Plain => None,
         BifErrorInfo::Cause(cause) => Some(cause),
     };
@@ -1430,11 +1478,20 @@ fn bif_error_info(
     else {
         return Ok(None);
     };
-    let module_pair = (Term::atom(atoms.module), Term::atom(format_module));
     let mut builder = TermBuilder::new(heap);
-    let map = match cause {
-        Some(cause) => builder.flatmap_from_pairs(&[(Term::atom(atoms.cause), cause), module_pair]),
-        None => builder.flatmap_from_pairs(&[module_pair]),
+    // Port of beam_common.c (`MAP1`/`MAP2` in save_stacktrace), OTP-29.1.1:
+    // both key tuples are already sorted, so constructing a generic map from pairs would
+    // sort and deduplicate keys that erts emits in a fixed order.
+    let map = if let Some(cause) = cause {
+        let keys = builder
+            .tuple(&[Term::atom(atoms.cause), Term::atom(atoms.module)])
+            .map_err(|e| VmError::Unsupported(format!("BIF error_info keys {e:?}")))?;
+        builder.flatmap_with_key_tuple(keys, &[cause, Term::atom(format_module)])
+    } else {
+        let keys = builder
+            .tuple(&[Term::atom(atoms.module)])
+            .map_err(|e| VmError::Unsupported(format!("BIF error_info keys {e:?}")))?;
+        builder.flatmap_with_key_tuple(keys, &[Term::atom(format_module)])
     }
     .map_err(|e| VmError::Unsupported(format!("BIF error info {e:?}")))?;
     Ok(Some(map))
@@ -1534,6 +1591,7 @@ pub(super) fn build(
             module: p.module,
             ip: p.ip,
             native_pc,
+            registers: &p.x,
             trapped,
             trap_return: p.trap_return_frame().map(|frame| frame.ip),
         },
@@ -1551,10 +1609,19 @@ struct PreparedFrames {
     block: AllocBlock,
     frames: usize,
     words: usize,
+    bif: Option<PreparedBif>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedBif {
+    module: Atom,
+    function: Atom,
+    args: Term,
+    error_info: Option<Term>,
 }
 
 enum FramePrep {
-    /// BIF tops, explicit traces, and interpreter module tables still use `build_saved`.
+    /// Explicit traces and unsupported interpreter module tables still use `build_saved`.
     Fallback,
     Ready(PreparedFrames),
 }
@@ -1562,22 +1629,40 @@ enum FramePrep {
 /// Port of beam_common.c:1205 (`build_stacktrace`), OTP-29.1.1.
 ///
 /// Lookups land in one `ERTS_ALC_T_TMP` array. The symbolic list is one `HAlloc`.
-/// `None` means this term is not a plain raw trace.
+/// `None` means the saved frame metadata needs the general builder.
 pub(super) fn build_direct(p: &mut Process, term: Term) -> Option<Result<Term, VmError>> {
     let fields = arinsal_term::term_sequence(term)?;
-    if fields.len() != 3
-        || fields[1] != Term::atom(arinsal_term::atoms::TRUE)
-        || fields[2] != Term::NIL
-        || fields[0].is_negative_bignum()
-    {
+    if fields.len() != 3 || fields[0].is_negative_bignum() {
         return None;
     }
     let stack_trace = fields[0];
+    let bif_top = stack_trace.with_bignum_digits_mut(|digits| {
+        digits
+            .get(2)
+            .is_some_and(|current| current & (1 << 63) == 0)
+    })?;
+    let error_info = if fields[2] == Term::NIL {
+        None
+    } else {
+        Some(term_error_info_map(fields[2])?)
+    };
+    if !bif_top && (fields[1] != Term::atom(arinsal_term::atoms::TRUE) || error_info.is_some()) {
+        return None;
+    }
+    if bif_top && !matches!(fields[1].classify(), TermKind::List | TermKind::Nil) {
+        return None;
+    }
     let prepared = match p.runtime.as_ref() {
         Some(runtime) => runtime.with_active_code(|ranges, tables| {
-            stack_trace
-                .with_bignum_digits_mut(|digits| prepare_frames(digits, Some(ranges), Some(tables)))
+            stack_trace.with_bignum_digits_mut(|digits| {
+                if bif_top {
+                    prepare_bif_frames(digits, Some(ranges), Some(tables), fields[1], error_info)
+                } else {
+                    prepare_frames(digits, Some(ranges), Some(tables))
+                }
+            })
         }),
+        None if bif_top => None,
         None => stack_trace.with_bignum_digits_mut(|digits| prepare_frames(digits, None, None)),
     }?;
     match prepared {
@@ -1707,6 +1792,129 @@ fn prepare_frames(
         block,
         frames,
         words,
+        bif: None,
+    }))
+}
+
+/// Port of beam_common.c (`build_stacktrace`), OTP-29.1.1.
+/// A BIF MFA is already stored in `current`; the first saved continuation is its caller.
+fn prepare_bif_frames(
+    digits: &[u64],
+    ranges: Option<&[crate::native_bridge::ModuleRange]>,
+    tables: Option<&crate::load::CodeTables>,
+    args: Term,
+    error_info: Option<Term>,
+) -> Result<FramePrep, VmError> {
+    const CURRENT_IS_FUNCTION: u64 = 1 << 63;
+    if digits.len() < 5 {
+        return Ok(FramePrep::Fallback);
+    }
+    let (pc, current) = (digits[1], digits[2]);
+    let count = usize::try_from(digits[3]).unwrap_or(usize::MAX);
+    let max_depth = usize::try_from(digits[4]).unwrap_or(0);
+    if pc != 0
+        || current & CURRENT_IS_FUNCTION != 0
+        || count > max_depth
+        || digits.len() < 5 + count
+    {
+        return Ok(FramePrep::Fallback);
+    }
+    let module = Atom((current >> 32) as u32);
+    let function = Atom(current as u32);
+    if module.0 == 0 || function.0 == 0 {
+        return Ok(FramePrep::Fallback);
+    }
+    let mut block = AllocBlock::new(ErtsAlcType::TMP, count.max(1) * FRAME_INFO_WORDS)
+        .map_err(|error| VmError::Unsupported(format!("stacktrace temp {error:?}")))?;
+    let slots = block.as_mut_slice();
+    let mut frames = 0usize;
+    let mut words = 0usize;
+    let mut first_continuation = 5;
+    if count > 0 {
+        let word = digits[5];
+        if word & CURRENT_IS_FUNCTION != 0 {
+            let payload = word & !CURRENT_IS_FUNCTION;
+            let module_index = (payload >> 32) as usize;
+            let ip = payload as u32 as usize;
+            let Some(module) = tables.and_then(|tables| tables.modules.get(module_index)) else {
+                return Ok(FramePrep::Fallback);
+            };
+            let Some((function, arity)) = module.function_atom_at(ip) else {
+                return Ok(FramePrep::Fallback);
+            };
+            let location = module.line_term_at(ip);
+            let located = location.is_some();
+            write_frame(slots, frames, module.name_atom, function, arity, location);
+            words += if located { 17 } else { 7 };
+        } else {
+            let Some(frame) = usize::try_from(word)
+                .ok()
+                .and_then(|address| crate::native_bridge::stack_frame_in(ranges, address))
+            else {
+                return Ok(FramePrep::Fallback);
+            };
+            let location = literal_location(&frame, None);
+            let located = location.is_some();
+            write_frame(
+                slots,
+                frames,
+                frame.module_atom,
+                frame.function_atom,
+                frame.arity,
+                location,
+            );
+            words += if located { 17 } else { 7 };
+        }
+        frames += 1;
+        first_continuation += 1;
+    }
+    for word in &digits[first_continuation..5 + count] {
+        if word & CURRENT_IS_FUNCTION == 0 {
+            let Some(frame) = usize::try_from(*word)
+                .ok()
+                .and_then(|address| crate::native_bridge::stack_frame_in(ranges, address))
+            else {
+                continue;
+            };
+            let location = literal_location(&frame, None);
+            let located = location.is_some();
+            write_frame(
+                slots,
+                frames,
+                frame.module_atom,
+                frame.function_atom,
+                frame.arity,
+                location,
+            );
+            words += if located { 17 } else { 7 };
+            frames += 1;
+            continue;
+        }
+        let payload = *word & !CURRENT_IS_FUNCTION;
+        let Some(module) = tables.and_then(|tables| tables.modules.get((payload >> 32) as usize))
+        else {
+            continue;
+        };
+        let call_site = (payload as u32 as usize).saturating_sub(1);
+        let Some((function, arity)) = module.function_atom_at(call_site) else {
+            continue;
+        };
+        let location = module.line_term_at(call_site);
+        let located = location.is_some();
+        write_frame(slots, frames, module.name_atom, function, arity, location);
+        words += if located { 17 } else { 7 };
+        frames += 1;
+    }
+    Ok(FramePrep::Ready(PreparedFrames {
+        block,
+        frames,
+        words,
+        bif: Some(PreparedBif {
+            module,
+            function,
+            args,
+            error_info,
+        }),
     }))
 }
 
@@ -1748,31 +1956,50 @@ fn read_frame(slots: &[u64], index: usize) -> (Atom, Atom, u8, Option<(Term, u64
 }
 
 fn cons_prepared(p: &mut Process, ready: PreparedFrames) -> Result<Term, VmError> {
-    if ready.frames == 0 || ready.words == 0 {
+    let bif_words = ready
+        .bif
+        .map_or(0, |bif| if bif.error_info.is_some() { 12 } else { 7 });
+    if ready.frames == 0 && ready.bif.is_none() {
         return Ok(Term::NIL);
     }
-    let mut heap = TraceHeap::with_block(&mut p.heap, ready.words);
+    let mut heap = TraceHeap::with_block(&mut p.heap, ready.words + bif_words);
     let file_atom = Term::atom(trace_atoms().file);
     let line_atom = Term::atom(trace_atoms().line);
-    let mut builder = TermBuilder::new(&mut heap);
     let mut list = Term::NIL;
-    for index in (0..ready.frames).rev() {
-        let (module, function, arity, location) = read_frame(ready.block.as_slice(), index);
-        let location = location.map(|(file, number)| arinsal_term::MfaLocation {
-            file_atom,
-            file,
-            line_atom,
-            line: Term::small(number as i64).expect("source line is a small"),
-        });
-        list = builder
-            .cons_mfa_frame(
-                Term::atom(module),
-                Term::atom(function),
-                Term::small(i64::from(arity)).expect("arity is small"),
-                location,
-                list,
-            )
-            .map_err(|error| VmError::Unsupported(format!("stacktrace {error:?}")))?;
+    {
+        let mut builder = TermBuilder::new(&mut heap);
+        for index in (0..ready.frames).rev() {
+            let (module, function, arity, location) = read_frame(ready.block.as_slice(), index);
+            let location = location.map(|(file, number)| arinsal_term::MfaLocation {
+                file_atom,
+                file,
+                line_atom,
+                line: Term::small(number as i64).expect("source line is a small"),
+            });
+            list = builder
+                .cons_mfa_frame(
+                    Term::atom(module),
+                    Term::atom(function),
+                    Term::small(i64::from(arity)).expect("arity is small"),
+                    location,
+                    list,
+                )
+                .map_err(|error| VmError::Unsupported(format!("stacktrace {error:?}")))?;
+        }
+    }
+    if let Some(bif) = ready.bif {
+        let frame = build_frame(
+            &mut heap,
+            bif.module,
+            bif.function,
+            bif.args,
+            None,
+            true,
+            bif.error_info,
+        )?;
+        list = TermBuilder::new(&mut heap)
+            .cons(frame, list)
+            .map_err(|error| VmError::Unsupported(format!("BIF stacktrace frame {error:?}")))?;
     }
     Ok(list)
 }
