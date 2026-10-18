@@ -106,19 +106,27 @@ thread_local! {
 }
 
 thread_local! {
-    static BIF_NAME_ATOMS: std::cell::RefCell<std::collections::HashMap<(usize, usize), arinsal_term::Atom>> =
-        std::cell::RefCell::new(std::collections::HashMap::default());
+    /// Atoms of the cause names raised so far, keyed by the literal's address. There are a few
+    /// dozen causes, so a scan beats hashing on the failure path.
+    static BIF_NAME_ATOMS: std::cell::RefCell<Vec<(usize, usize, arinsal_term::Atom)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn bif_name_atom(name: &'static str) -> Result<arinsal_term::Atom, VmError> {
     let key = (name.as_ptr() as usize, name.len());
-    if let Some(atom) = BIF_NAME_ATOMS.with(|names| names.borrow().get(&key).copied()) {
+    if let Some(atom) = BIF_NAME_ATOMS.with(|names| {
+        names
+            .borrow()
+            .iter()
+            .find(|entry| (entry.0, entry.1) == key)
+            .map(|entry| entry.2)
+    }) {
         return Ok(atom);
     }
     let atom = global_atoms()
         .intern(name)
         .map_err(|_| VmError::Unsupported(format!("BIF frame atom {name}")))?;
-    BIF_NAME_ATOMS.with(|names| names.borrow_mut().insert(key, atom));
+    BIF_NAME_ATOMS.with(|names| names.borrow_mut().push((key.0, key.1, atom)));
     Ok(atom)
 }
 
