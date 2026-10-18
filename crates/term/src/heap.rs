@@ -346,10 +346,6 @@ pub trait HeapAlloc {
     /// thing's node word names `node`, and the list entry takes over the counted reference.
     // Port of erts/emulator/beam/external.c (erts_ref_node_entry with `ohp->first`), OTP-29.1.1.
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>);
-    /// Retain a local fun entry.
-    fn retain_fun(&mut self, entry: Arc<FunEntry>);
-    /// Retain an export entry.
-    fn retain_export(&mut self, entry: Arc<ExportEntry>);
     /// Link a magic reference thing into this heap's off-heap list. The thing's pointer
     /// word names `owner`, and the list entry takes over the counted reference.
     // Port of erts/emulator/beam/erl_bif_unique.h (erts_mk_magic_ref), OTP-29.1.1.
@@ -434,12 +430,6 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
     }
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         (**self).link_node(thing, node)
-    }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        (**self).retain_fun(entry)
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        (**self).retain_export(entry)
     }
     fn link_magic_ref(
         &mut self,
@@ -884,12 +874,6 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         self.heap.link_node(thing, node)
     }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        self.heap.retain_fun(entry)
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        self.heap.retain_export(entry)
-    }
 }
 
 /// A process heap with an upward bump pointer and a downward stack pointer.
@@ -979,63 +963,12 @@ impl Default for VheapCold {
     }
 }
 
-/// Multiplicative pointer hasher for [`OwnerSet`]: keys are allocation addresses.
-#[derive(Default)]
-pub(crate) struct PtrHasher(u64);
-impl std::hash::Hasher for PtrHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 = (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        }
-    }
-    fn write_usize(&mut self, value: usize) {
-        self.0 = (value as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    }
-}
-
-/// Counted references a heap holds for the fun and export entries its terms point at, one per
-/// distinct entry. erts keeps no such reference (entries live in the code tables until
-/// purge), so a hash set keeps the per-collection cost independent of how many funs share an
-/// entry.
-pub(crate) struct OwnerSet<T>(
-    std::collections::HashMap<usize, Arc<T>, std::hash::BuildHasherDefault<PtrHasher>>,
-);
-impl<T> Default for OwnerSet<T> {
-    fn default() -> Self {
-        Self(Default::default())
-    }
-}
-impl<T> OwnerSet<T> {
-    /// Hold `entry` unless an equal pointer is already held.
-    pub(crate) fn insert(&mut self, entry: Arc<T>) {
-        self.0.entry(Arc::as_ptr(&entry) as usize).or_insert(entry);
-    }
-    /// Whether the entry at address `key` is held.
-    pub(crate) fn contains(&self, key: usize) -> bool {
-        self.0.contains_key(&key)
-    }
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-    /// Move every entry of `other` into this set.
-    pub(crate) fn absorb(&mut self, other: &mut Self) {
-        self.0.extend(other.0.drain());
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct HeapOwners {
     pub(crate) vheap: VheapCold,
     pub(crate) off_heap_first: usize,
     pub(crate) wrt_bins: usize,
     pub(crate) overhead: u64,
-    pub(crate) funs: OwnerSet<FunEntry>,
-    pub(crate) exports: OwnerSet<ExportEntry>,
-    pub(crate) old_funs: OwnerSet<FunEntry>,
-    pub(crate) old_exports: OwnerSet<ExportEntry>,
     /// Heap that receives all allocations while the heap is detached.
     pub(crate) detached: Option<Box<VecHeap>>,
 }
@@ -1095,11 +1028,7 @@ impl LazyOwners {
         let Some(owners) = self.0.as_deref() else {
             return false;
         };
-        owners.vheap.min != 46_422
-            || owners.vheap.old != 0
-            || owners.vheap.old_size != 46_422
-            || !owners.old_funs.is_empty()
-            || !owners.old_exports.is_empty()
+        owners.vheap.min != 46_422 || owners.vheap.old != 0 || owners.vheap.old_size != 46_422
     }
 }
 
@@ -1697,7 +1626,7 @@ impl ProcessHeap {
     // Port of erts/emulator/beam/erl_message.c:980-990 (erts_save_message_in_proc) and
     // erl_gc.c:2524 (OH_OVERHEAD in erts_copy_one_frag), OTP-29.1.1.
     pub(crate) fn absorb_fragment_owners(&mut self, source: &mut ProcessHeap) {
-        if let Some(mut owners) = source.owners.0.take() {
+        if let Some(owners) = source.owners.0.take() {
             let source_old_vheap = owners.vheap.old;
             self.bin_vheap = self.bin_vheap.saturating_add(source.bin_vheap);
             self.owners.vheap.old = self.owners.vheap.old.saturating_add(source_old_vheap);
@@ -1705,10 +1634,6 @@ impl ProcessHeap {
                 Self::prepend_bin_ref_chain(&mut target.off_heap_first, owners.off_heap_first);
                 Self::prepend_bin_ref_chain(&mut target.wrt_bins, owners.wrt_bins);
                 target.overhead = target.overhead.saturating_add(owners.overhead);
-                target.funs.absorb(&mut owners.funs);
-                target.exports.absorb(&mut owners.exports);
-                target.old_funs.absorb(&mut owners.old_funs);
-                target.old_exports.absorb(&mut owners.old_exports);
             } else {
                 self.owners.0 = Some(owners);
             }
@@ -2065,22 +1990,6 @@ impl HeapAlloc for ProcessHeap {
         }
         link_node_thing(&mut self.owners.off_heap_first, thing, node);
     }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        if self.detached
-            && let Some(heap) = self.owners.detached.as_deref_mut()
-        {
-            return heap.retain_fun(entry);
-        }
-        self.owners.funs.insert(entry);
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        if self.detached
-            && let Some(heap) = self.owners.detached.as_deref_mut()
-        {
-            return heap.retain_export(entry);
-        }
-        self.owners.exports.insert(entry);
-    }
     fn link_magic_ref(
         &mut self,
         thing: *mut u64,
@@ -2152,8 +2061,6 @@ pub struct VecHeap {
     off_heap_first: usize,
     wrt_bins: usize,
     overhead: u64,
-    funs: Vec<Arc<FunEntry>>,
-    exports: Vec<Arc<ExportEntry>>,
     used: usize,
     total_used: usize,
     chunk_words: usize,
@@ -2176,8 +2083,6 @@ impl VecHeap {
             off_heap_first: 0,
             wrt_bins: 0,
             overhead: 0,
-            funs: Vec::new(),
-            exports: Vec::new(),
             used: 0,
             total_used: 0,
             chunk_words: words,
@@ -2197,8 +2102,6 @@ impl VecHeap {
         self.off_heap_first = 0;
         self.wrt_bins = 0;
         self.overhead = 0;
-        self.funs.clear();
-        self.exports.clear();
         self.used = 0;
         self.total_used = 0;
         let literal = self.chunk_words & LITERAL_HEAP_BIT;
@@ -2334,12 +2237,6 @@ impl HeapAlloc for VecHeap {
     }
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         link_node_thing(&mut self.off_heap_first, thing, node);
-    }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        self.funs.push(entry);
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        self.exports.push(entry);
     }
     fn link_magic_ref(
         &mut self,
@@ -3268,19 +3165,20 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         Ok(Term::from_ptr(instance, 2))
     }
     /// Construct a local fun, with a two-word head and captured environment.
-    pub fn local_fun(&mut self, entry: Arc<FunEntry>, free: &[Term]) -> Result<Term, TermError> {
+    /// The permanent fun table keeps the entry alive after this builder returns.
+    pub fn local_fun(&mut self, entry: &Arc<FunEntry>, free: &[Term]) -> Result<Term, TermError> {
+        crate::fun::make_fun_entry_permanent(entry);
         let header =
             crate::fun::local_header(entry.arity, free.len()).ok_or(TermError::SystemLimit)?;
         let p = self.words(2 + free.len())?;
         // SAFETY: header, entry pointer, and environment words were reserved.
         unsafe {
             *p = header;
-            *p.add(1) = Arc::as_ptr(&entry) as u64;
+            *p.add(1) = Arc::as_ptr(entry) as u64;
             for (i, value) in free.iter().enumerate() {
                 *p.add(2 + i) = value.bits();
             }
         }
-        self.heap.retain_fun(entry);
         Ok(Term::from_ptr(p, 2))
     }
     /// Construct a decoded local fun, resolving its identity through the node fun table.
@@ -3290,7 +3188,8 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         entry: Arc<FunEntry>,
         free: &[Term],
     ) -> Result<Term, TermError> {
-        self.local_fun(crate::fun::fun_entry_get_or_make_stub(entry), free)
+        let entry = crate::fun::fun_entry_get_or_make_stub(entry);
+        self.local_fun(&entry, free)
     }
     /// Construct an export fun with no environment.
     pub fn export_fun(&mut self, entry: Arc<ExportEntry>) -> Result<Term, TermError> {
@@ -3306,15 +3205,11 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         crate::fun::export_lambda(entry)
     }
 
-    /// Build the heap object retained by a global `Export.lambda` literal.
-    pub(crate) fn export_fun_in_heap(
-        &mut self,
-        entry: Arc<ExportEntry>,
-    ) -> Result<Term, TermError> {
+    /// Build the heap object referenced by a global `Export.lambda` literal.
+    pub(crate) fn export_fun_in_heap(&mut self, entry: &ExportEntry) -> Result<Term, TermError> {
         let p = self.words(2)?;
         store(p, crate::fun::export_header(entry.arity));
-        store(p.wrapping_add(1), Arc::as_ptr(&entry) as u64);
-        self.heap.retain_export(entry);
+        store(p.wrapping_add(1), std::ptr::from_ref(entry) as u64);
         Ok(Term::from_ptr(p, 2))
     }
     /// Construct an external pid with the OTP four-word ExternalThing head.

@@ -1528,7 +1528,7 @@ impl<'a> VmModuleEnv<'a> {
                 .find(|slot| slot.entry.old_index == lambda.index)
                 .ok_or_else(|| format!("zero-capture fun {} has no loaded entry", lambda.index))?;
             let term = TermBuilder::new(literal_heap)
-                .local_fun(Arc::clone(&slot.entry), &[])
+                .local_fun(&slot.entry, &[])
                 .map_err(|error| format!("zero-capture fun {}: {error:?}", lambda.index))?;
             zero_capture_funs.insert(lambda.index, raw_word(term));
         }
@@ -1751,10 +1751,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
     fn lambda_fun_entry(&self, _beam: &BeamFile, index: u32) -> Result<(usize, u8), String> {
         self.lambda_entries
             .get(&index)
-            .map(|entry| {
-                crate::native_helpers::register_native_fun_owner(entry);
-                (Arc::as_ptr(entry) as usize, entry.arity)
-            })
+            .map(|entry| (Arc::as_ptr(entry) as usize, entry.arity))
             .ok_or_else(|| format!("lambda {index} has no loaded fun entry"))
     }
 
@@ -1767,10 +1764,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
             get_elements: crate::native_records::arinsal_beamasm_get_record_elements,
             update: crate::native_records::arinsal_beamasm_update_record,
         }
-    }
-
-    fn retain_fun_helper(&self) -> usize {
-        crate::native_helpers::arinsal_beamasm_retain_fun_owner as *const () as usize
     }
 
     fn raise_class_helper(&self) -> usize {

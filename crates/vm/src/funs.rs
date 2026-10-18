@@ -46,7 +46,7 @@ pub(super) fn make_fun(
         .map(|&src| p.read(src))
         .collect::<Result<Vec<_>, _>>()?;
     let value = TermBuilder::new(&mut p.heap)
-        .local_fun(Arc::clone(&slot.entry), &free)
+        .local_fun(&slot.entry, &free)
         .map_err(|e| VmError::Unsupported(format!("fun allocation {e:?}")))?;
     slot.set_dispatch(0, p.module, module.code.as_ptr() as usize, code_generation);
     p.write(dst, value)

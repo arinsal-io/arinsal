@@ -33,12 +33,12 @@ fn export_stub_hook(module: Atom, function: Atom, arity: u8) -> Option<Arc<Expor
 
 /// Local fun lookup for ETF terms decoded by a process on this node.
 // Port of erts/emulator/beam/erl_fun.c:299-309 (erts_fun_entry_get_or_make_stub), OTP-29.1.1.
-fn fun_entry_stub_hook(candidate: Arc<FunEntry>) -> Arc<FunEntry> {
+fn fun_entry_stub_hook(candidate: Arc<FunEntry>) -> Option<Arc<FunEntry>> {
     let scope = CODE_SCOPE.with(Cell::get);
     if scope == 0 {
-        candidate
+        None
     } else {
-        crate::code_ix::for_scope(scope).intern_fun_entry(candidate)
+        Some(crate::code_ix::for_scope(scope).intern_fun_entry(candidate))
     }
 }
 

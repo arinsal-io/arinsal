@@ -106,7 +106,7 @@ impl BeamModuleAssembler {
         self.finish_fun_destination(dst, spill)
     }
 
-    /// Allocates an OTP local fun using its retained module lambda entry.
+    /// Allocates an OTP local fun using its permanent module lambda entry.
     // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:211-251, OTP-29.1.1.
     pub fn emit_i_make_fun3_entry(
         &mut self,
@@ -114,51 +114,8 @@ impl BeamModuleAssembler {
         entry: usize,
         arity: u8,
         env: &[ArgVal],
-        retain_helper: usize,
     ) -> Result<(), ModuleError> {
-        if env.len() > u8::MAX as usize || arity as usize + env.len() >= 64 {
-            return Err(ModuleError::InvalidOperand(
-                "invalid fun arity or environment size",
-            ));
-        }
-        if retain_helper == 0 {
-            return Err(ModuleError::InvalidOperand(
-                "local fun owner retention helper is missing",
-            ));
-        }
-        let (destination, spill) = self.fun_destination(dst)?;
-        let header = FUN_SUBTAG | (u64::from(arity) << 8) | ((env.len() as u64) << 16);
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(9), header)?;
-            e.str_uoff(Gpr::x(9), Gpr::x(23), 0)?;
-            e.mov_const(Gpr::x(9), entry as u64)?;
-            e.str_uoff(Gpr::x(9), Gpr::x(23), 8)
-        })?;
-        for (index, source) in env.iter().copied().enumerate() {
-            let value = self.source_reg(source)?;
-            self.code
-                .emit(|e| e.str_uoff(value, Gpr::x(23), 16 + index as u32 * 8))?;
-        }
-        self.code.emit(|e| {
-            e.add_imm(destination, Gpr::x(23), 2, false)?;
-            e.add_imm(
-                Gpr::x(23),
-                Gpr::x(23),
-                ((2 + env.len() as u32) * 8) as u16,
-                false,
-            )
-        })?;
-        self.finish_fun_destination(dst, spill)?;
-        self.code.emit(|e| e.mov_const(Gpr::x(13), entry as u64))?;
-        self.emit_runtime_fragment_with(
-            retain_helper,
-            &[Gpr::x(13)],
-            6,
-            Update::HEAP_ALLOC
-                .union(Update::X_REGS)
-                .union(Update::REDUCTIONS),
-        )?;
-        Ok(())
+        self.emit_i_make_fun3(dst, entry, arity, env)
     }
 
     /// Allocates an OTP two-word fun header and copies its environment terms.

@@ -18,9 +18,7 @@
 
 use std::sync::Arc;
 
-use arinsal_term::{
-    ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, ProcessHeap, Term,
-};
+use arinsal_term::{ExternalBinary, HeapAlloc, MagicRef, Node, ProcessHeap, Term};
 
 mod arith;
 mod atomics;
@@ -545,12 +543,6 @@ impl HeapAlloc for ProcessHeapHandle<'_> {
     }
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         HeapAlloc::link_node(self.0, thing, node)
-    }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        HeapAlloc::retain_fun(self.0, entry)
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        HeapAlloc::retain_export(self.0, entry)
     }
     fn link_magic_ref(
         &mut self,

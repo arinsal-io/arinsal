@@ -67,10 +67,6 @@ pub trait ModuleEnv {
     fn lambda_fun_entry(&self, _beam: &BeamFile, index: u32) -> Result<(usize, u8), String> {
         Err(format!("module environment has no lambda entry {index}"))
     }
-    /// Return the runtime hook that retains local fun owners on the process heap.
-    fn retain_fun_helper(&self) -> usize {
-        0
-    }
     /// Return the runtime hook that restores the exception class for `raise/2`.
     fn raise_class_helper(&self) -> usize {
         0
@@ -3626,13 +3622,7 @@ fn emit_op(
                         "lambda table arity differs from make_fun3".to_owned(),
                     ));
                 }
-                assembler.emit_i_make_fun3_entry(
-                    value(1)?,
-                    entry,
-                    entry_arity,
-                    &environment_values,
-                    env.retain_fun_helper(),
-                )
+                assembler.emit_i_make_fun3_entry(value(1)?, entry, entry_arity, &environment_values)
             }
             "i_call_fun" => {
                 count(1)?;

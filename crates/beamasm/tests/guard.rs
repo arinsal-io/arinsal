@@ -53,25 +53,21 @@ fn terms() -> Terms {
     let port = Term::port(7).unwrap();
     let reference = b.local_ref([1, 2, 3]).unwrap();
     let module = global_atoms().intern("guard_test").unwrap();
-    let function = b
-        .local_fun(
-            Arc::new(FunEntry {
-                dispatch_target: Default::default(),
-                pend_purge_address: Default::default(),
-                module,
-                arity: 1,
-                index: 1,
-                uniq: [0; 16],
-                old_uniq: 1,
-                old_index: 1,
-                pid,
-                dispatch: Default::default(),
-                dispatch_code: Default::default(),
-                dispatch_epoch: Default::default(),
-            }),
-            &[],
-        )
-        .unwrap();
+    let fun_entry = Arc::new(FunEntry {
+        dispatch_target: Default::default(),
+        pend_purge_address: Default::default(),
+        module,
+        arity: 1,
+        index: 1,
+        uniq: [0; 16],
+        old_uniq: 1,
+        old_index: 1,
+        pid,
+        dispatch: Default::default(),
+        dispatch_code: Default::default(),
+        dispatch_epoch: Default::default(),
+    });
+    let function = b.local_fun(&fun_entry, &[]).unwrap();
     let export = b
         .export_fun(Arc::new(ExportEntry::new(module, alpha_atom, 0)))
         .unwrap();

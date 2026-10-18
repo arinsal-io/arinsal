@@ -11,8 +11,8 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock, Weak};
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
 use arinsal_term::{
-    ExportEntry, FunEntry, HeapAlloc, LiteralArea, Node, Term, TermBuilder, TermError, VecHeap,
-    copy_term, exact_eq, global_atoms, internal_hash, size_object,
+    HeapAlloc, LiteralArea, Node, Term, TermBuilder, TermError, VecHeap, copy_term, exact_eq,
+    global_atoms, internal_hash, size_object,
 };
 #[cfg(test)]
 use crossbeam_epoch::pin;
@@ -1118,12 +1118,6 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapAdapter<'_, H> {
     }
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         self.0.link_node(thing, node);
-    }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        self.0.retain_fun(entry);
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        self.0.retain_export(entry);
     }
 }
 fn system_limit(_: TermError) -> BifError {

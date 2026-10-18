@@ -80,9 +80,7 @@ pub const C_SHIM_EXPORTS: &[&str] = &[
 
 use crate::raw::{cstr, deref, deref_mut};
 use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle, SchedulerClass};
-use arinsal_term::{
-    ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, VecHeap, WritableBinary,
-};
+use arinsal_term::{ExternalBinary, HeapAlloc, MagicRef, Node, Term, VecHeap, WritableBinary};
 pub(crate) use libloading::os::unix::Library;
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::path::Path;
@@ -342,18 +340,6 @@ impl HeapAlloc for EnvHeap {
         match self {
             Self::Owned(h) => h.link_node(thing, x),
             Self::Bound(h) => Self::bound_mut(*h).link_node(thing, x),
-        }
-    }
-    fn retain_fun(&mut self, x: Arc<FunEntry>) {
-        match self {
-            Self::Owned(h) => h.retain_fun(x),
-            Self::Bound(h) => Self::bound_mut(*h).retain_fun(x),
-        }
-    }
-    fn retain_export(&mut self, x: Arc<ExportEntry>) {
-        match self {
-            Self::Owned(h) => h.retain_export(x),
-            Self::Bound(h) => Self::bound_mut(*h).retain_export(x),
         }
     }
     fn link_magic_ref(

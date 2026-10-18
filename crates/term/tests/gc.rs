@@ -552,7 +552,7 @@ fn live_binary_keeps_one_reference_per_binref_through_collections() {
 }
 
 #[test]
-fn owner_arcs_are_released_when_unreachable() {
+fn heaps_do_not_count_fun_or_export_entries() {
     let mut heap = ProcessHeap::with_words(256);
     let module = global_atoms().intern("gc_owner_module").unwrap();
     let function = global_atoms().intern("gc_owner_function").unwrap();
@@ -575,12 +575,12 @@ fn owner_arcs_are_released_when_unreachable() {
     let _identity = TermBuilder::new(&mut heap)
         .external_pid(node.clone(), 1, 0)
         .unwrap();
-    let _fun = TermBuilder::new(&mut heap)
-        .local_fun(fun.clone(), &[])
-        .unwrap();
+    let _fun = TermBuilder::new(&mut heap).local_fun(&fun, &[]).unwrap();
     let _export = TermBuilder::new(&mut heap)
         .export_fun(export.clone())
         .unwrap();
+    let fun_owners = Arc::strong_count(&fun);
+    let export_owners = Arc::strong_count(&export);
     let binary = TermBuilder::new(&mut heap).binary(&[9; 100]).unwrap();
     let Some(BinaryOwner::Binary(binary_owner)) = binary_owner(binary) else {
         panic!("a 100 byte binary is reference counted");
@@ -590,8 +590,48 @@ fn owner_arcs_are_released_when_unreachable() {
     assert_eq!(binary_owner.ref_count(), Some(1));
     assert_eq!(heap.off_heap_count(), 0);
     assert_eq!(Arc::strong_count(&node), 1);
-    assert_eq!(Arc::strong_count(&fun), 1);
-    assert_eq!(Arc::strong_count(&export), 1);
+    assert_eq!(Arc::strong_count(&fun), fun_owners);
+    assert_eq!(Arc::strong_count(&export), export_owners);
+}
+
+#[test]
+fn fun_entries_survive_heap_owner_drop_and_collection() {
+    let mut heap = ProcessHeap::with_words(256);
+    let module = global_atoms().intern("gc_permanent_fun_module").unwrap();
+    let function = global_atoms().intern("gc_permanent_fun_function").unwrap();
+    let local = {
+        let entry = Arc::new(FunEntry {
+            dispatch_target: Default::default(),
+            pend_purge_address: Default::default(),
+            module,
+            arity: 0,
+            uniq: [2; 16],
+            index: 2,
+            old_index: 2,
+            old_uniq: 2,
+            pid: Term::pid(2, 0).unwrap(),
+            dispatch: Default::default(),
+            dispatch_code: Default::default(),
+            dispatch_epoch: Default::default(),
+        });
+        TermBuilder::new(&mut heap).local_fun(&entry, &[]).unwrap()
+    };
+    let export = {
+        let entry = Arc::new(ExportEntry::new(module, function, 0));
+        TermBuilder::new(&mut heap).export_fun(entry).unwrap()
+    };
+    let mut roots = [local, export];
+    heap.set_fullsweep_after(0);
+    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.collect(&mut roots, &mut [], 0).unwrap();
+    assert!(matches!(
+        to_owned(roots[0]).unwrap(),
+        arinsal_etf::OwnedTerm::Fun { ref module, .. } if module == "gc_permanent_fun_module"
+    ));
+    assert!(matches!(
+        to_owned(roots[1]).unwrap(),
+        arinsal_etf::OwnedTerm::Export { ref function, .. } if function == "gc_permanent_fun_function"
+    ));
 }
 
 #[test]
@@ -681,7 +721,7 @@ fn mixed_boxed_graph_survives_one_hundred_collections() {
         dispatch_epoch: Default::default(),
     });
     let fun = TermBuilder::new(&mut heap)
-        .local_fun(fun_entry, &[record, hamt])
+        .local_fun(&fun_entry, &[record, hamt])
         .unwrap();
     let export = TermBuilder::new(&mut heap)
         .export_fun(Arc::new(ExportEntry::new(module, name, 2)))

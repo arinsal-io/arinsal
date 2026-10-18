@@ -4,8 +4,7 @@
 //! freezes every word; the ordinary term tags and readers then need no adapter.
 
 use crate::{
-    ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, RefcBinary, Term,
-    TermBuilder, TermError, copy_term,
+    ExternalBinary, HeapAlloc, MagicRef, Node, RefcBinary, Term, TermBuilder, TermError, copy_term,
 };
 use arinsal_etf::OwnedTerm;
 use std::alloc::{Layout, alloc, dealloc};
@@ -76,8 +75,6 @@ struct Storage {
     off_heap_first: usize,
     wrt_bins: usize,
     overhead: u64,
-    funs: Vec<Arc<FunEntry>>,
-    exports: Vec<Arc<ExportEntry>>,
     dependencies: HashMap<usize, Arc<Region>>,
 }
 
@@ -97,8 +94,6 @@ impl Storage {
             off_heap_first: 0,
             wrt_bins: 0,
             overhead: 0,
-            funs: Vec::new(),
-            exports: Vec::new(),
             dependencies: HashMap::new(),
         }
     }
@@ -156,12 +151,6 @@ impl HeapAlloc for Storage {
     }
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         crate::heap::link_node_thing(&mut self.off_heap_first, thing, node);
-    }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        self.funs.push(entry);
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        self.exports.push(entry);
     }
     fn link_magic_ref(&mut self, thing: *mut u64, owner: Arc<MagicRef>) -> Result<(), TermError> {
         crate::heap::link_magic_thing(&mut self.off_heap_first, &mut self.overhead, thing, owner);

@@ -10,9 +10,8 @@ use crate::VecHeap;
 use crate::bits::{binary_data, writable_gc_visit};
 use crate::hamt::{boxed_object_words, boxed_term_range};
 use crate::{
-    ARITY, BIN_REF, ExportEntry, ExternalBinary, FUN, FunEntry, HEAP_BITS, HeapAlloc, MAP,
-    MagicRef, Node, ProcessHeap, RECORD, RefcBinary, S_RESERVED, SUB_BITS, StackWord, Term,
-    TermError, WritableBinary,
+    ARITY, BIN_REF, ExternalBinary, FUN, HEAP_BITS, HeapAlloc, MAP, MagicRef, Node, ProcessHeap,
+    RECORD, RefcBinary, S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -137,12 +136,6 @@ impl HeapAlloc for FragmentAlloc<'_> {
     }
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         HeapAlloc::link_node(self.0, thing, node);
-    }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        HeapAlloc::retain_fun(self.0, entry);
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        HeapAlloc::retain_export(self.0, entry);
     }
     fn link_magic_ref(&mut self, thing: *mut u64, owner: Arc<MagicRef>) -> Result<(), TermError> {
         HeapAlloc::link_magic_ref(self.0, thing, owner)
@@ -369,8 +362,8 @@ impl Copier<'_> {
             // Binary references, magic references and external things move with their
             // counted reference: `sweep_off_heap` relinks the copy from the forwarded
             // original, as erts does.
-            if matches!(val & 63, FUN | SUB_BITS) {
-                self.retain_owner(val, destination, Term(moved), promote);
+            if val & 63 == SUB_BITS {
+                self.sub_bits.push(Term(moved));
             }
             moved
         }
@@ -457,44 +450,6 @@ impl Copier<'_> {
             in_fragment || (self.major && in_old),
             "collection found a pointer {address:#x} outside the process heap and literals"
         );
-    }
-
-    fn retain_owner(&mut self, header: u64, ptr: *mut u64, term: Term, promote: bool) {
-        let key = crate::heap::load(ptr.wrapping_add(1)) as usize;
-        match header & 63 {
-            FUN => {
-                // The entry word is a counted `Arc` pointer held by the source heap's list, so
-                // the copy takes its own count without searching the source list.
-                if header & (1 << 24) != 0 {
-                    let target = if promote {
-                        &mut self.to.owners.old_exports
-                    } else {
-                        &mut self.to.owners.exports
-                    };
-                    if !target.contains(key) {
-                        // SAFETY: word one of a live export fun names an `ExportEntry` the
-                        // source heap retains.
-                        target.insert(unsafe {
-                            crate::fun::clone_export_entry(key as *const ExportEntry)
-                        });
-                    }
-                } else {
-                    let target = if promote {
-                        &mut self.to.owners.old_funs
-                    } else {
-                        &mut self.to.owners.funs
-                    };
-                    if !target.contains(key) {
-                        // SAFETY: word one of a live local fun names a `FunEntry` the source
-                        // heap retains.
-                        target
-                            .insert(unsafe { crate::fun::clone_fun_entry(key as *const FunEntry) });
-                    }
-                }
-            }
-            SUB_BITS => self.sub_bits.push(term),
-            _ => {}
-        }
     }
 
     fn finish_bits(&mut self) {
@@ -1279,10 +1234,6 @@ impl ProcessHeap {
                     next.new_block(old_capacity, arinsal_alloc::typed::ErtsAlcType::OLD_HEAP);
             }
             next.old_htop = self.old_htop;
-            if copy_old_owner_state {
-                next.owners.old_funs = std::mem::take(&mut self.owners.old_funs);
-                next.owners.old_exports = std::mem::take(&mut self.owners.old_exports);
-            }
         }
         let mut from = std::mem::replace(self, next);
         let stack_move = MoveRange {

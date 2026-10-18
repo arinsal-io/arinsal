@@ -13,46 +13,6 @@ struct StaticNif {
     entry: arinsal_bifs::BifFn,
 }
 
-fn native_fun_owners() -> &'static std::sync::Mutex<
-    std::collections::HashMap<usize, std::sync::Weak<arinsal_term::FunEntry>>,
-> {
-    static OWNERS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<usize, std::sync::Weak<arinsal_term::FunEntry>>>,
-    > = std::sync::OnceLock::new();
-    OWNERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-pub(crate) fn register_native_fun_owner(entry: &std::sync::Arc<arinsal_term::FunEntry>) {
-    native_fun_owners().lock().unwrap().insert(
-        std::sync::Arc::as_ptr(entry) as usize,
-        std::sync::Arc::downgrade(entry),
-    );
-}
-
-/// Retains a native-created closure's shared owner on the process heap.
-// Port of erts/emulator/beam/jit/arm/instr_fun.cpp:211-251, OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_retain_fun_owner(
-    header: *mut ProcessHeader,
-    identity: u64,
-) -> u64 {
-    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
-        return 0;
-    };
-    let owner = native_fun_owners().lock().ok().and_then(|owners| {
-        owners
-            .get(&(identity as usize))
-            .and_then(std::sync::Weak::upgrade)
-    });
-    let Some(owner) = owner else {
-        crate::native_hooks::set_error(process, "system_limit");
-        process.sync_native_header();
-        return 0;
-    };
-    arinsal_term::HeapAlloc::retain_fun(&mut process.heap, owner);
-    process.sync_native_header();
-    1
-}
-
 /// Restores the class saved with an OTP raw stacktrace for native `raise/2`.
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3018-3030, OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_raise_class(
