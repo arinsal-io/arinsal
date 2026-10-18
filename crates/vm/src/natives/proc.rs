@@ -1831,7 +1831,7 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
     } else {
         let _ = writeln!(text, "Program counter: {address:#018x} ({description})");
     }
-    let base = process.heap.frame_pointer();
+    let base = process.heap.heap_cursor().1 as usize;
     if let Some(frame) = process.trap_return_frame()
         && let Ok(word) = crate::stacktrace::continuation_tag(frame.module, frame.ip)
     {

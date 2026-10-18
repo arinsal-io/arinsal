@@ -220,20 +220,6 @@ pub(crate) fn fun_view(term: Term) -> Option<arinsal_term::FunRef<'static>> {
     arinsal_beamasm::rt::fun_ref(term)
 }
 
-fn ensure_native_frame(
-    process: &mut Process,
-    registers: &mut SchedulerRegisters,
-    words: usize,
-    live: usize,
-) -> Result<(), VmError> {
-    process
-        .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
-    let result = process.ensure(words, live);
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    result
-}
-
 // Port of erts/emulator/beam/erl_arith.c:358-405 (erts_mixed_plus), OTP-29.1.1.
 fn with_fragment_alloc(
     process: &mut Process,
@@ -669,11 +655,11 @@ fn list_length(mut list: Term) -> Option<usize> {
 // ones; dead registers may hold stale words (erts_garbage_collect_nobump, OTP-29.1.1).
 pub(crate) fn collect_native(
     process: &mut Process,
-    registers: &mut SchedulerRegisters,
+    _registers: &mut SchedulerRegisters,
     need_words: usize,
     live: usize,
 ) -> Result<(), VmError> {
-    ensure_native_frame(process, registers, need_words, live)
+    process.ensure(need_words, live)
 }
 
 /// Heap slow path used by `test_heap` and heap allocation emitters.
