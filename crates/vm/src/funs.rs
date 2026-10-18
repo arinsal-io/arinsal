@@ -339,9 +339,10 @@ impl Vm {
         tail: bool,
         ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<ImportOutcome, VmError> {
-        if arity >= p.x.len() {
+        if arity >= crate::proc_create::ATTACHED_X_REGS {
             return Err(VmError::Unsupported("fun arity exceeds X registers".into()));
         }
+        p.x.ensure_x(arity + 1);
         p.x[arity] = fun;
         // SAFETY: The fun is held in an X register while this process is live.
         let view = unsafe { fun.fun_ref() };
@@ -387,7 +388,7 @@ impl Vm {
                 // past that size (elixir_erl_compiler's spawn fun). OTP grows the
                 // process X array; shrinking never happens, so the callee keeps it.
                 let need = arity + free_vars.len();
-                if need > 1024 {
+                if need > crate::proc_create::ATTACHED_X_REGS {
                     return Err(VmError::Unsupported(
                         "closure environment exceeds X registers".into(),
                     ));
@@ -1033,9 +1034,10 @@ impl Vm {
         dealloc: usize,
         ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<ImportOutcome, VmError> {
-        if arity + 1 >= p.x.len() {
+        if arity + 1 >= crate::proc_create::ATTACHED_X_REGS {
             return Err(self.exception(p, "system_limit"));
         }
+        p.x.ensure_x(arity + 2);
         if p.x[arity].as_atom().is_none() || p.x[arity + 1].as_atom().is_none() {
             // Port of erts/emulator/beam/beam_common.c:1543-1550 (fixed_apply), OTP-29.1.1.
             let words = arity
@@ -1140,12 +1142,7 @@ impl Vm {
                 },
             )
         })?;
-        // The register file is sized for the running module; the callee may take more
-        // arguments (up to erts MAX_ARG), so grow it before the copy.
-        if args.len() <= 255 {
-            p.x.ensure_x(args.len() + 1);
-        }
-        if args.len() >= p.x.len() {
+        if args.len() >= crate::proc_create::ATTACHED_X_REGS {
             return Err(exceptions::bif_error(
                 p,
                 "erlang",
@@ -1154,6 +1151,7 @@ impl Vm {
                 BifError::SystemLimit,
             ));
         }
+        p.x.ensure_x(args.len() + 1);
         p.x[..args.len()].copy_from_slice(&args);
         if named.is_some_and(|(module, function)| {
             global_atoms().text(module) == Some("erlang")

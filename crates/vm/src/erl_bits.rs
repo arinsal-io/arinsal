@@ -34,7 +34,10 @@ pub extern "C" fn append_binary(
     let root_live = live
         .max(src_index.saturating_add(1))
         .max(extra_index.saturating_add(1));
-    if root_live > process.x.len() || src_index >= root_live || extra_index >= root_live {
+    if root_live > crate::proc_create::ATTACHED_X_REGS
+        || src_index >= root_live
+        || extra_index >= root_live
+    {
         set_error(process, "system_limit");
         return 0;
     }

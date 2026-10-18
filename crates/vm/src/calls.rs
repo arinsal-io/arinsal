@@ -45,7 +45,7 @@ pub(super) fn push_continuation(
     // erts/emulator/beam/erl_gc.c:2639 (setup_rootset), OTP-29.1.1.
     // `nobj` is the callee arity. Registers above that prefix are not roots
     // and are not rewritten.
-    p.ensure_roots(1, arity, false)?;
+    p.ensure(1, arity)?;
     if !p.heap.reserve_stack(1) {
         return Err(VmError::Unsupported("continuation stack".into()));
     }

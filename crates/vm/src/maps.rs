@@ -76,9 +76,10 @@ pub(super) fn execute(
             };
             // reg[live] = map: the collection keeps it as the extra root.
             if p.heap.words_left() < need {
-                if live >= p.x.len() {
+                if live >= crate::proc_create::ATTACHED_X_REGS {
                     return Err(VmError::Unsupported("live X register count".into()));
                 }
+                p.x.ensure_x(live + 1);
                 p.x[live] = map;
                 p.ensure(need, live + 1)?;
                 map = p.x[live];

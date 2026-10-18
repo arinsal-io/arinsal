@@ -958,27 +958,10 @@ pub fn run_native(
     registers: &mut SchedulerRegisters,
     code_address: usize,
 ) -> Result<ExitReason, VmError> {
-    if process.x.is_attached() {
-        return run_native_attached(process, registers, code_address);
-    }
-    // A caller outside a scheduler slice (a test driving native code on its own process):
-    // schedule the registers in and out around the entry, like `Executor::run` does.
-    let saved = process.x.saved_arity();
-    // SAFETY: `registers` is borrowed for this whole call and `detach_save` below ends the
-    // attachment before it returns.
-    unsafe { process.x.attach(registers) };
-    let result = run_native_attached(process, registers, code_address);
-    process
-        .x
-        .detach_save(saved.max(usize::from(process.header.arity)));
-    result
-}
-
-fn run_native_attached(
-    process: &mut Process,
-    registers: &mut SchedulerRegisters,
-    code_address: usize,
-) -> Result<ExitReason, VmError> {
+    debug_assert!(
+        process.x.is_attached(),
+        "native code runs on the scheduler's X array: attach the registers first"
+    );
     // Debug knobs are environment switches held in one byte: read once per entry.
     let debug = crate::debug_env::slice::get();
     let return_trace = debug & crate::debug_env::slice::RETURN_TRACE != 0;

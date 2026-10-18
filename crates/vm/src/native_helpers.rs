@@ -606,17 +606,16 @@ fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
     result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
 }
 
-/// Moves the arguments of a native call-NIF body into `process.x`.
+/// Syncs the heap frame pointer and reductions of a native call-NIF body; the arguments are
+/// already in the scheduler's X array.
 fn enter_native_nif(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    arity: u8,
 ) {
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
     process.reductions = process.header.fcalls;
-    process.x.ensure_x(usize::from(arity));
 }
 
 /// Returns the result of a native call-NIF body to native code: the result term, a trap to
@@ -675,7 +674,7 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
         crate::native_hooks::set_error(process, "undef");
         return 0;
     };
-    enter_native_nif(process, registers, nif.arity);
+    enter_native_nif(process, registers);
     // Port of erts/emulator/beam/erl_nif.c (schedule_dirty_nif / erts_call_dirty_nif),
     // OTP-29.1.1: a dirty NIF called on a normal scheduler first moves the process to a
     // dirty scheduler; the executor runs it there and returns to this body's caller.
@@ -719,7 +718,7 @@ pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64
         crate::native_hooks::set_error(process, "undef");
         return 0;
     };
-    enter_native_nif(process, registers, site.arity);
+    enter_native_nif(process, registers);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::natives::nif::call_native(
             &mut process.heap,
@@ -3756,9 +3755,8 @@ fn set_call_fun_error(
         crate::native_hooks::set_error(process, "system_limit");
         return;
     }
-    // `apply/2` may pass more arguments than the module's register file holds (erts raises
-    // badarity with all of them, instr_fun.cpp:253-328).
-    process.x.ensure_x(arity + 1);
+    // `apply/2` may pass more arguments than the module's registers (erts raises badarity with
+    // all of them): the scheduler array holds them.
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
@@ -4445,7 +4443,7 @@ fn arinsal_beamasm_map_change(
     };
     let base = live.max(6);
     let source_slot = base + n;
-    if source_slot >= process.x.len() {
+    if source_slot >= crate::proc_create::ATTACHED_X_REGS {
         return 0;
     }
     process.x[source_slot] = crate::native_hooks::from_raw(source);
@@ -4621,7 +4619,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     );
     let base_slot = live.max(6);
     let root_live = base_slot + count * 7;
-    if root_live > process.x.len() {
+    if root_live > crate::proc_create::ATTACHED_X_REGS {
         crate::native_hooks::set_error(process, "system_limit");
         return 0;
     }

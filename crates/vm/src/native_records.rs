@@ -100,7 +100,7 @@ fn field_value(
 /// the live prefix and the staged words are dead and must not be roots. `process.x` is the
 /// scheduler's array, so the collector moves the roots in place.
 fn stage_roots(process: &mut Process, live: usize, base: usize, top: usize) -> Option<()> {
-    if top > process.x.len() {
+    if top > crate::proc_create::ATTACHED_X_REGS {
         return None;
     }
     process.x[live..base].fill(Term::NIL);
@@ -293,7 +293,7 @@ fn update_record(
     // staged words.
     let source_slot = base + count;
     let top = source_slot + 1;
-    if top > process.x.len() {
+    if top > crate::proc_create::ATTACHED_X_REGS {
         return Err(Failure::SystemLimit);
     }
     process.x[source_slot] = source;
