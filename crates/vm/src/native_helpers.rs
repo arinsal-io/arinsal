@@ -328,7 +328,7 @@ pub extern "C" fn arinsal_beamasm_remove_message(
         crate::trace::save_call(process, crate::trace::SavedCall::Receive);
     } else {
         match process.remove_first_message() {
-            Ok(true) => return fcalls,
+            Ok(true) => return remove_message_leave_reds(process, fcalls),
             Ok(false) => {}
             Err(_) => {
                 crate::native_hooks::set_error(process, "system_limit");
@@ -348,6 +348,24 @@ pub extern "C" fn arinsal_beamasm_remove_message(
     process.sync_native_header();
     if result.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
+    }
+    remove_message_leave_reds(process, fcalls)
+}
+
+/// Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_remove_message), OTP-29.1.1:
+/// when the received message's fragments outgrew the free young area or the off-heap binary
+/// overhead passed its limit, a collection is wanted soon, so only a few reductions are left
+/// to let the message turn into garbage (ERTS_IS_GC_DESIRED_INTERNAL, then
+/// ERTS_VBUMP_LEAVE_REDS_INTERNAL).
+fn remove_message_leave_reds(process: &mut crate::Process, fcalls: i32) -> i32 {
+    const REDS_LEFT_BEFORE_GC: i32 = 5;
+    let free_words = (process.header.stop as usize).wrapping_sub(process.header.htop as usize) / 8;
+    let desired = free_words < process.heap.mbuf_size() || process.heap.bin_vheap_gc_due();
+    if desired && fcalls > REDS_LEFT_BEFORE_GC {
+        process.virtual_reds = process
+            .virtual_reds
+            .saturating_add((fcalls - REDS_LEFT_BEFORE_GC) as u32);
+        return REDS_LEFT_BEFORE_GC;
     }
     fcalls
 }
@@ -1137,6 +1155,24 @@ fn dispatch_native_send(
             // OTP-29.1.1.
             if !idle && crate::trace::saves_calls(process) {
                 crate::trace::save_call(process, crate::trace::SavedCall::Send);
+            }
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (emit_send mirrors
+            // call_light_bif, ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: the send is a light
+            // BIF call, so heap fragments that outgrew the free young area are collected
+            // right after it, with the BIF result as the only root.
+            let mut value = value;
+            if process.heap.gc_after_bif_desired() {
+                process
+                    .heap
+                    .set_frame_pointer(registers.tmp_mem[2] as usize);
+                let collected =
+                    crate::calls::gc_after_native_parts(process, &mut [], Some(&mut value), None);
+                registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+                if collected.is_err() {
+                    crate::native_hooks::set_error(process, "system_limit");
+                    process.sync_native_header();
+                    return Some(0);
+                }
             }
             let raw = crate::native_hooks::raw(value);
             registers.x_reg_array[0] = value;
