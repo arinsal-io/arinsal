@@ -819,10 +819,15 @@ fn offheap_sub_binary_retains_data_after_source_drops() {
     assert_eq!(copy_heap.used_words(), 8);
     drop(source);
     assert_eq!(copy_heap.used_words(), 8);
-    // SAFETY: `copy` is a live sub-binary on `copy_heap`.
-    let view = unsafe { copy.binary_ref() }.unwrap();
-    assert_eq!(view.bit_len(), 517);
-    assert_eq!(view.bytes()[0], 0xab);
+    // The copy still equals a fresh slice of the same bytes once its source is gone.
+    let mut reference_heap = VecHeap::new();
+    let reference_binary = TermBuilder::new(&mut reference_heap)
+        .binary(&[0xab; 128])
+        .unwrap();
+    let reference = TermBuilder::new(&mut reference_heap)
+        .sub_binary(reference_binary, 3, 517)
+        .unwrap();
+    assert!(exact_eq(copy, reference));
 }
 
 #[test]
