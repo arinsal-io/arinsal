@@ -466,23 +466,29 @@ impl Copier<'_> {
                 // The entry word is a counted `Arc` pointer held by the source heap's list, so
                 // the copy takes its own count without searching the source list.
                 if header & (1 << 24) != 0 {
-                    // SAFETY: word one of a live export fun names an `ExportEntry` the
-                    // source heap retains.
-                    let owner =
-                        unsafe { crate::fun::clone_export_entry(key as *const ExportEntry) };
-                    if promote {
-                        self.to.owners.old_exports.push(owner);
+                    let target = if promote {
+                        &mut self.to.owners.old_exports
                     } else {
-                        self.to.owners.exports.push(owner);
+                        &mut self.to.owners.exports
+                    };
+                    if !target.contains(key) {
+                        // SAFETY: word one of a live export fun names an `ExportEntry` the
+                        // source heap retains.
+                        target.insert(unsafe {
+                            crate::fun::clone_export_entry(key as *const ExportEntry)
+                        });
                     }
                 } else {
-                    // SAFETY: word one of a live local fun names a `FunEntry` the source
-                    // heap retains.
-                    let owner = unsafe { crate::fun::clone_fun_entry(key as *const FunEntry) };
-                    if promote {
-                        self.to.owners.old_funs.push(owner);
+                    let target = if promote {
+                        &mut self.to.owners.old_funs
                     } else {
-                        self.to.owners.funs.push(owner);
+                        &mut self.to.owners.funs
+                    };
+                    if !target.contains(key) {
+                        // SAFETY: word one of a live local fun names a `FunEntry` the source
+                        // heap retains.
+                        target
+                            .insert(unsafe { crate::fun::clone_fun_entry(key as *const FunEntry) });
                     }
                 }
             }
