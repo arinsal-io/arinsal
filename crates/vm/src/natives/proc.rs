@@ -1723,7 +1723,7 @@ fn backtrace_with(
             let _ = writeln!(text, "   {}", print(*argument));
         }
     }
-    let base = process.heap.frame_pointer();
+    let base = process.heap.heap_cursor().1 as usize;
     if let Some(frame) = process.trap_return_frame()
         && let Ok(word) = crate::stacktrace::continuation_tag(frame.module, frame.ip)
     {

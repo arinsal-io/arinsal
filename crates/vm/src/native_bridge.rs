@@ -968,19 +968,17 @@ pub fn run_native(
     register_bridge_continuation().map_err(|error| VmError::Unsupported(error.into()))?;
     if return_trace && let Some(function) = native_function_at(code_address) {
         eprintln!(
-            "[native-before-ensure] {}:{}/{} x0={:#x} E={:#x}",
+            "[native-before-ensure] {}:{}/{} x0={:#x}",
             function.module,
             function.function,
             function.arity,
-            process.x[0].tagged_word(),
-            process.heap.frame_pointer()
+            process.x[0].tagged_word()
         );
     }
     if let Some(cold) = process.cold.as_mut() {
         cold.native_error_pc = 0;
     }
     registers.tmp_mem[6] = 0;
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     registers.tmp_mem[5] =
         crate::native_helpers::arinsal_beamasm_native_trace_return as *const () as usize as u64;
     let resuming_continuation = process
@@ -1005,7 +1003,6 @@ pub fn run_native(
     };
     let live = usize::from(arity);
     process.ensure(1 + arinsal_term::S_RESERVED, live)?;
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-261 (emit_i_apply_only),
     // OTP-29.1.1: a call the scheduler performs for native code (fun/apply, BIF traps,
     // breakpoint handlers) pops the caller's continuation into LR, so the callee's frame
@@ -1026,12 +1023,11 @@ pub fn run_native(
     let code_ptr = code_address as *const std::ffi::c_void;
     if return_trace && let Some(function) = native_function_at(code_address) {
         eprintln!(
-            "[native-enter] {}:{}/{} pc={code_address:#x} x0={:#x} E={:#x} freason={:#x}",
+            "[native-enter] {}:{}/{} pc={code_address:#x} x0={:#x} freason={:#x}",
             function.module,
             function.function,
             function.arity,
             process.x[0].tagged_word(),
-            process.heap.frame_pointer(),
             process.header.freason
         );
     }
@@ -1091,9 +1087,6 @@ pub fn run_native(
     // Native returns may release stack slots and allocate into the newly freed gap.
     process.heap.set_stack_pointer(process.header.stop);
     process.heap.set_heap_top(process.header.htop);
-    process
-        .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
     process.reductions = process.header.fcalls;
     for (destination, raw) in process
         .x
@@ -1105,12 +1098,11 @@ pub fn run_native(
     }
     if return_trace && let Some(function) = native_function_at(code_address) {
         eprintln!(
-            "[native-exit] {}:{}/{} pc={code_address:#x} exit={exit:?} x0={:#x} E={:#x} i={:p} stop={:p}",
+            "[native-exit] {}:{}/{} pc={code_address:#x} exit={exit:?} x0={:#x} i={:p} stop={:p}",
             function.module,
             function.function,
             function.arity,
             process.x[0].tagged_word(),
-            process.heap.frame_pointer(),
             process.header.i,
             process.header.stop
         );

@@ -4,7 +4,7 @@
 //! `<<Bin/binary, Bin2/binary>>` shape the compiler lowers to append + one binary.
 
 use crate::native_hooks::{enter_runtime, raw, set_error};
-use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
+use arinsal_beamasm::ProcessHeader;
 use arinsal_bits::{BitsError, SegFlags, SegSize, SegType, Segment, SegmentValue};
 use arinsal_term::Term;
 
@@ -21,9 +21,6 @@ pub extern "C" fn append_binary(
     let Some((process, registers)) = enter_runtime(header) else {
         return 0;
     };
-    process
-        .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
     let (Ok(src_index), Ok(extra_index), Ok(live)) = (
         usize::try_from(src_index),
         usize::try_from(extra_index),
@@ -48,7 +45,6 @@ pub extern "C" fn append_binary(
             &mut process.heap,
         )
     {
-        registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
         if collected {
             process.sync_native_header();
         } else {
@@ -85,12 +81,11 @@ pub extern "C" fn append_binary(
     let initial = build(process.x[src_index], process.x[extra_index]);
     let mut request = match arinsal_bits::create_bin_size(&initial) {
         Ok(size) => size.heap_words,
-        Err(error) => return fail(process, registers, error),
+        Err(error) => return fail(process, error),
     };
     let result = loop {
         if process.ensure(request, root_live).is_err() {
             set_error(process, "system_limit");
-            registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
             return 0;
         }
         let segments = build(process.x[src_index], process.x[extra_index]);
@@ -107,18 +102,16 @@ pub extern "C" fn append_binary(
     {
         *slot = *term;
     }
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     process.sync_native_cursors();
     match result {
         Ok(term) => raw(term),
-        Err(error) => fail(process, registers, error),
+        Err(error) => fail(process, error),
     }
 }
 
-fn fail(process: &mut crate::Process, registers: &mut SchedulerRegisters, error: BitsError) -> u64 {
+fn fail(process: &mut crate::Process, error: BitsError) -> u64 {
     let (reason, info) = crate::bits::native_error(error);
     process.cold_mut().native_error_info = info;
     set_error(process, &reason);
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     0
 }

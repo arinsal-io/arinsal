@@ -831,7 +831,6 @@ pub struct ProcessHeap {
     pub(crate) words: WordBlock,
     pub(crate) htop: usize,
     pub(crate) stop: usize,
-    pub(crate) frame_pointer: usize,
     pub(crate) old_words: WordBlock,
     pub(crate) old_htop: usize,
     pub(crate) high_water: usize,
@@ -1049,7 +1048,6 @@ impl ProcessHeap {
             words: WordBlock::new_for(words, allocation_type, alloc_ix),
             htop: 0,
             stop: words,
-            frame_pointer: 0,
             old_words: WordBlock::default(),
             old_htop: 0,
             high_water: 0,
@@ -1218,21 +1216,6 @@ impl ProcessHeap {
             let base = self.words.as_ptr().cast::<u64>().cast_mut();
             (base.add(self.htop), base.add(self.stop))
         }
-    }
-    /// Publish the active native frame pointer before a moving collection.
-    pub fn set_frame_pointer(&mut self, frame_pointer: usize) {
-        let base = self.words.as_ptr() as usize;
-        let start = base + self.stop * 8;
-        let end = base + self.words.len() * 8;
-        self.frame_pointer = if frame_pointer >= start && frame_pointer < end {
-            frame_pointer
-        } else {
-            0
-        };
-    }
-    /// Return the active native frame pointer after collection.
-    pub fn frame_pointer(&self) -> usize {
-        self.frame_pointer
     }
     /// Return the start and end of the young heap allocation.
     pub fn heap_bounds(&self) -> (*mut u64, *mut u64) {

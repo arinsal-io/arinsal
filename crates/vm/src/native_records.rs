@@ -174,9 +174,6 @@ fn create(
         return 0;
     };
     process.reductions = process.header.fcalls;
-    process
-        .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
     let (Ok(live), Ok(count), Ok(base)) = (
         usize::try_from(live),
         usize::try_from(count),
@@ -191,7 +188,6 @@ fn create(
         (live, count, base),
         external,
     );
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     match result {
         Ok(record) => {
             process.sync_native_header();
@@ -293,9 +289,6 @@ pub extern "C" fn arinsal_beamasm_update_record(
         return 0;
     };
     process.reductions = process.header.fcalls;
-    process
-        .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
     let (Ok(live), Ok(count), Ok(base)) = (
         usize::try_from(live),
         usize::try_from(count),
@@ -309,7 +302,6 @@ pub extern "C" fn arinsal_beamasm_update_record(
         native_hooks::from_raw(source),
         (live, count, base),
     );
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     match result {
         Ok(record) => {
             process.sync_native_header();

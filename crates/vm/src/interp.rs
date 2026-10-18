@@ -1916,9 +1916,8 @@ impl Vm {
                 if crate::native_bridge::is_native_continuation(cp as usize) {
                     if crate::native_bridge::return_trace_enabled() {
                         eprintln!(
-                            "[interp-native-return] CP={cp:#x} x0={:#x} E={:#x}",
-                            p.x[0].tagged_word(),
-                            p.heap.frame_pointer()
+                            "[interp-native-return] CP={cp:#x} x0={:#x}",
+                            p.x[0].tagged_word()
                         );
                     }
                     sync_cursor(p, htop, &mut heap_dirty);
