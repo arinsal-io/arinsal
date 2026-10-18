@@ -694,8 +694,6 @@ fn heap_type_tag(allocation_type: ErtsAlcType) -> u64 {
         2
     } else if allocation_type == ErtsAlcType::HEAP_FRAG {
         3
-    } else if allocation_type == ErtsAlcType::DRV {
-        4
     } else {
         0
     }
@@ -705,7 +703,6 @@ fn heap_type_from_tag(tag: u64) -> ErtsAlcType {
     match tag {
         2 => ErtsAlcType::OLD_HEAP,
         3 => ErtsAlcType::HEAP_FRAG,
-        4 => ErtsAlcType::DRV,
         _ => ErtsAlcType::HEAP,
     }
 }
@@ -830,12 +827,38 @@ fn for_each_allocator(mut visit: impl FnMut(&ThreadSpecificAllocators)) {
     }
 }
 
+/// Bytes in front of a `driver_alloc` payload: the owning instance, which erts reads from the
+/// carrier header (`BLK_TO_MBC(blk)->allctr`) and which a block here does not carry.
+const DRV_PREFIX_BYTES: usize = 8;
+/// Distance from a block's allocation id (its address) to its payload (`BLOCK_HEADER`).
+const DRV_BLOCK_HEADER: usize = 16;
+
+fn driver_handle(user: *mut u8) -> InstanceAllocation {
+    let base = user.wrapping_sub(DRV_PREFIX_BYTES).cast::<u64>();
+    let instance = crate::raw::words_at(base, 1)[0] as usize;
+    let id = base as usize - DRV_BLOCK_HEADER;
+    InstanceAllocation::from_parts(instance, id as u64, 0)
+}
+
+fn driver_publish(handle: InstanceAllocation, base: *mut u64) -> *mut u8 {
+    crate::raw::words_at_mut(base, 1)[0] = handle.instance() as u64;
+    base.cast::<u8>().wrapping_add(DRV_PREFIX_BYTES)
+}
+
 /// `erts_alloc(ERTS_ALC_T_DRV, bytes)`, which `driver_alloc` and `enif_alloc` (ERTS_ALC_T_NIF,
 /// also the driver allocator) both use. Null when the request cannot be served.
 // Port of erts/emulator/beam/io.c (driver_alloc) and erl_nif.c (enif_alloc), OTP-29.1.1.
 pub fn driver_alloc(bytes: usize) -> *mut u8 {
-    let words = bytes.div_ceil(8).max(1);
-    AllocBlock::detach_heap(ErtsAlcType::DRV, words).map_or(std::ptr::null_mut(), |p| p.cast())
+    let Some(total) = bytes.checked_add(DRV_PREFIX_BYTES) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(allocators) = allocator_for(ErtsAlcType::DRV) else {
+        return std::ptr::null_mut();
+    };
+    match allocators.alloc_with_ptr_at(crate::instances::thread_alloc_ix(), total) {
+        Ok((handle, base)) => driver_publish(handle, base),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 /// `erts_realloc` of a block from [`driver_alloc`]; a null `ptr` allocates.
@@ -843,13 +866,26 @@ pub fn driver_realloc(ptr: *mut u8, bytes: usize) -> *mut u8 {
     if ptr.is_null() {
         return driver_alloc(bytes);
     }
-    let words = bytes.div_ceil(8).max(1);
-    AllocBlock::realloc_detached_heap(ptr.cast(), words).map_or(std::ptr::null_mut(), |p| p.cast())
+    let Some(total) = bytes.checked_add(DRV_PREFIX_BYTES) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(allocators) = allocator_for(ErtsAlcType::DRV) else {
+        return std::ptr::null_mut();
+    };
+    match allocators.realloc_with_ptr(driver_handle(ptr), total) {
+        Ok((handle, base)) => driver_publish(handle, base),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 /// `erts_free` of a block from [`driver_alloc`]; null is ignored.
 pub fn driver_free(ptr: *mut u8) {
-    AllocBlock::free_detached_heap(ptr.cast());
+    if ptr.is_null() {
+        return;
+    }
+    if let Ok(allocators) = allocator_for(ErtsAlcType::DRV) {
+        let _ = allocators.free_at(crate::instances::thread_alloc_ix(), driver_handle(ptr));
+    }
 }
 
 /// Apply the queued cross-thread frees of the instances no scheduler owns.

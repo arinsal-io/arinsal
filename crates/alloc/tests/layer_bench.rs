@@ -281,3 +281,42 @@ fn layer_bench() {
     .join()
     .unwrap();
 }
+
+/// The `enif_alloc(160)` + `enif_free` pair of issue #49 at each layer, in ns per pair.
+#[test]
+#[ignore = "timing: cargo test --release -p arinsal-alloc --test layer_bench pair160 -- --ignored --nocapture"]
+fn pair160() {
+    std::thread::spawn(|| {
+        assert_eq!(register_thread(ThreadKind::Scheduler(1)), Ok(1));
+        let n: usize = std::env::var("PAIR_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000_000);
+        let best = |mut f: Box<dyn FnMut()>| {
+            (0..7)
+                .map(|_| {
+                    let started = Instant::now();
+                    for _ in 0..n {
+                        f();
+                    }
+                    started.elapsed().as_nanos() as f64 / n as f64
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let mut allocator = AllocUtil::new(Strategy::AoffCbf, AllocUtilOptions::default());
+        if std::env::var_os("PAIR_ONLY_DRIVER").is_none() {
+            let util = best(Box::new(move || {
+                let a = allocator.alloc(160).unwrap();
+                allocator.free(a).unwrap();
+            }));
+            eprintln!("AllocUtil alloc+free         {util:6.2} ns");
+        }
+        let driver = best(Box::new(|| {
+            let p = arinsal_alloc::typed::driver_alloc(160);
+            arinsal_alloc::typed::driver_free(std::hint::black_box(p));
+        }));
+        eprintln!("driver_alloc+driver_free     {driver:6.2} ns");
+    })
+    .join()
+    .unwrap();
+}
