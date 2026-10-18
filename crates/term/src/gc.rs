@@ -1546,14 +1546,14 @@ impl ProcessHeap {
     /// the major-collection check when the minor collection would fall back.
     // Port of erts/emulator/beam/erl_gc.c:1441-1455 (`minor_collection`) and
     // erts/emulator/beam/erl_gc.c:1875-1904 (`major_collection`), OTP-29.1.1.
-    pub fn max_heap_collection_checks(
+    pub fn max_heap_collection_checks<'a>(
         &self,
         min_free: usize,
-        messages: &[(Term, Option<ProcessHeap>)],
+        message_heaps: impl IntoIterator<Item = &'a Option<ProcessHeap>>,
     ) -> Result<(usize, Option<usize>), TermError> {
-        let message_words = messages
-            .iter()
-            .filter_map(|(_, heap)| heap.as_ref())
+        let message_words = message_heaps
+            .into_iter()
+            .filter_map(Option::as_ref)
             .map(ProcessHeap::message_data_size)
             .fold(0usize, usize::saturating_add);
         let source_words = self
