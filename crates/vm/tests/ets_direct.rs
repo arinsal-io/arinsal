@@ -6,7 +6,8 @@ use arinsal_vm::Vm;
 const SOURCE: &str = r#"
 -module(ets_direct_diff).
 -export([compressed_roundtrip/0, access_and_deleted/0, concurrent_inserts/0, native_loop/0,
-         tail_delete/0, tail_delete_in_fun/0, catree_update_counter/0]).
+         tail_delete/0, tail_delete_in_fun/0, catree_update_counter/0,
+         insert_list_trap_cursor/0]).
 
 sample_terms() ->
     [{"abc", abc, 42, -7, 1.5, <<1,2,3>>, [a|b], {nested, {deep, [1,2,3]}}},
@@ -141,6 +142,16 @@ catree_update_counter() ->
      ets:update_counter(T, hd(Keys), {2, -1}, {hd(Keys), 0, 0}),
      ets:update_counter(T, {absent, [x]}, {2, 5}, {{absent, [x]}, 1, 0}),
      ets:lookup(T, {absent, [x]})}.
+
+insert_list_trap_cursor() ->
+    T = ets:new(t, [public, set]),
+    First = [{I, I * 2} || I <- lists:seq(1, 4096)],
+    true = ets:insert(T, First),
+    false = ets:insert_new(T, First),
+    Second = [{I, I * 3} || I <- lists:seq(4097, 8192)],
+    true = ets:insert_new(T, Second),
+    {ets:info(T, size), ets:lookup(T, 1), ets:lookup(T, 4096),
+     ets:lookup(T, 4097), ets:lookup(T, 8192), ets:insert_new(T, Second)}.
 "#;
 
 #[test]
@@ -174,6 +185,11 @@ fn catree_update_counter_matches_otp_29() {
     assert_same("catree_update_counter");
 }
 
+#[test]
+fn trapped_insert_lists_match_otp_29() {
+    assert_same("insert_list_trap_cursor");
+}
+
 fn assert_same(function: &str) {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping ETS direct-path differential {function}");
@@ -189,5 +205,5 @@ fn assert_same(function: &str) {
     let actual = vm
         .eval_scheduled("ets_direct_diff", function, &[], 4, Some(81))
         .unwrap_or_else(|error| panic!("{function}: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }

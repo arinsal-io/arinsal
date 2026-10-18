@@ -463,10 +463,11 @@ impl HashStorage {
     ) -> bool {
         let hvalue = hash >> 1;
         object.hvalue = hvalue;
-        let (accepted, added, memory_delta) = self.with_hash_bucket_mut(hvalue, |_slot, bucket| {
-            let next_order = || self.next_order.fetch_add(1, Ordering::Relaxed);
-            put_in_bucket(bucket, object, table_type, keypos, new_only, next_order)
-        });
+        let (accepted, added, memory_delta, _) =
+            self.with_hash_bucket_mut(hvalue, |_slot, bucket| {
+                let next_order = || self.next_order.fetch_add(1, Ordering::Relaxed);
+                put_in_bucket(bucket, object, table_type, keypos, new_only, next_order)
+            });
         self.add_object_memory(hvalue, memory_delta);
         if added {
             self.add_items(hash, 1);
@@ -475,8 +476,8 @@ impl HashStorage {
         accepted
     }
 
-    /// `insert_shared` for a table without fine-grained locks, which the caller owns.
-    pub(super) fn insert_exclusive(
+    /// `insert_exclusive` with the extra hash-bag comparison reductions reported by erts.
+    pub(super) fn insert_exclusive_counted(
         &mut self,
         mut object: StoredTerm,
         hash: u64,
@@ -484,13 +485,13 @@ impl HashStorage {
         keypos: usize,
         fixed: bool,
         new_only: bool,
-    ) -> bool {
+    ) -> (bool, usize) {
         let hvalue = hash >> 1;
         object.hvalue = hvalue;
         let slot = self.slot_index(hvalue);
         // The caller owns the table, so taking the order up front cannot reorder inserts.
         let order = self.next_order.fetch_add(1, Ordering::Relaxed);
-        let (accepted, added, memory_delta) = put_in_bucket(
+        let (accepted, added, memory_delta, extra_reds) = put_in_bucket(
             self.segment_bucket_mut(slot),
             object,
             table_type,
@@ -503,7 +504,7 @@ impl HashStorage {
             self.add_items(hash, 1);
             self.maybe_grow(fixed, keypos);
         }
-        accepted
+        (accepted, extra_reds)
     }
 
     /// Delete all objects at a key while holding its write stripe.
@@ -1975,12 +1976,13 @@ fn put_in_bucket(
     keypos: usize,
     new_only: bool,
     next_order: impl FnOnce() -> u64,
-) -> (bool, bool, isize) {
+) -> (bool, bool, isize, usize) {
     let hvalue = object.hvalue;
     let key = object.key(keypos);
     let has_key =
         |node: &HashDbTerm| node.hvalue == hvalue && exact_key(node.object.key(keypos), key);
     let mut link = &mut bucket.head;
+    let mut extra_reds = 0;
     while link.as_ref().is_some_and(|node| !has_key(node)) {
         link = &mut link.as_mut().unwrap().next;
     }
@@ -1989,7 +1991,7 @@ fn put_in_bucket(
         && let Some(node) = link.as_mut()
     {
         if new_only && !node.pseudo_deleted {
-            return (false, false, 0);
+            return (false, false, 0, 0);
         }
         let memory_delta = object.db_size_words as isize
             - if node.pseudo_deleted {
@@ -2002,7 +2004,7 @@ fn put_in_bucket(
         let revived = node.pseudo_deleted;
         node.pseudo_deleted = false;
         node.object = object;
-        return (true, revived, memory_delta);
+        return (true, revived, memory_delta, 0);
     }
     if new_only {
         // key_clash_fail: only pseudo-deleted nodes of the key may be present; the new object
@@ -2010,7 +2012,7 @@ fn put_in_bucket(
         let mut node = link.as_deref();
         while let Some(current) = node.filter(|node| has_key(node)) {
             if !current.pseudo_deleted {
-                return (false, false, 0);
+                return (false, false, 0, 0);
             }
             node = current.next.as_deref();
         }
@@ -2022,12 +2024,12 @@ fn put_in_bucket(
         while let Some(node) = cursor.as_deref_mut().filter(|node| has_key(node)) {
             if node.object.exact_eq_stored(&object) {
                 if !node.pseudo_deleted {
-                    return (true, false, 0);
+                    return (true, false, 0, extra_reds);
                 }
                 memory_delta = object.db_size_words as isize;
                 node.pseudo_deleted = false;
                 if at_group_head {
-                    return (true, true, memory_delta);
+                    return (true, true, memory_delta, extra_reds);
                 }
                 // Move to the head of the key's run to preserve key insertion order.
                 let mut node = cursor.take().unwrap();
@@ -2037,11 +2039,12 @@ fn put_in_bucket(
             }
             cursor = &mut cursor.as_mut().unwrap().next;
             at_group_head = false;
+            extra_reds += 1;
         }
         if let Some(mut node) = revived {
             node.next = link.take();
             *link = Some(node);
-            return (true, true, memory_delta);
+            return (true, true, memory_delta, extra_reds);
         }
     }
     let memory_delta = object.db_size_words as isize;
@@ -2053,7 +2056,7 @@ fn put_in_bucket(
         pseudo_deleted: false,
         object,
     }));
-    (true, true, memory_delta)
+    (true, true, memory_delta, extra_reds)
 }
 
 /// The bucket walk of `db_erase_hash`; returns the number of items removed from the count.

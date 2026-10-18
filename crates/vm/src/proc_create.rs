@@ -1997,11 +1997,30 @@ pub(crate) enum SelectStage {
 /// list insert keeps across traps.
 pub(crate) enum EtsInsert {
     /// Objects of the list already seen by the check pass (`ets_insert_2_list_check`).
-    Check(usize),
+    Check { cursor: Term, count: usize },
     /// Objects copied into table form so far, before the table is locked.
-    Copy(Vec<arinsal_ets::PreparedObject>),
+    Copy {
+        cursor: Term,
+        prepared: Vec<arinsal_ets::PreparedObject>,
+    },
     /// The remaining objects were handed to the busy table; the result lands in the slot.
     Global(arinsal_ets::InsertOutcome),
+}
+
+impl EtsInsert {
+    pub(crate) fn cursor(&self) -> Option<Term> {
+        match self {
+            Self::Check { cursor, .. } | Self::Copy { cursor, .. } => Some(*cursor),
+            Self::Global(_) => None,
+        }
+    }
+
+    pub(crate) fn update_cursor(&mut self, term: Term) {
+        match self {
+            Self::Check { cursor, .. } | Self::Copy { cursor, .. } => *cursor = term,
+            Self::Global(_) => unreachable!("global ETS insert has no list cursor"),
+        }
+    }
 }
 
 /// Port of erts/emulator/beam/erl_process.c:14160 (erts_continue_exit_process trap state),
