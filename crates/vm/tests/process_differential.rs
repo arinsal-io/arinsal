@@ -3,6 +3,19 @@ use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
 use arinsal_vm::Vm;
 
+/// The child setup helper is the `arinsal` binary next to the test executable's target directory, as
+/// `erl_child_setup` sits in erts's bindir. Ports with a working directory or a large environment
+/// run through it, so fail with the missing build step named instead of an opaque `badarg`.
+fn require_child_setup_helper() {
+    let mut directory = std::env::current_exe().unwrap();
+    while directory.pop() {
+        if directory.join("arinsal").is_file() {
+            return;
+        }
+    }
+    panic!("build the arinsal binary first: cargo build -p arinsal-cli");
+}
+
 const SOURCE: &str = r#"
 -module(proc_diff).
 -export([scenario/2,scenario33_many/1,scenario33_start/0,scenario33_cycle/0,
@@ -472,6 +485,7 @@ fn otp_6237_owner_exit_100_cycles_match_otp_29() {
 
 #[test]
 fn child_port_round_trip_and_exit_events_match_otp() {
+    require_child_setup_helper();
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping child port differential scenarios");
         return;
@@ -780,6 +794,7 @@ run() ->
 
 #[test]
 fn invalid_port_working_directory_returns_child_exit_status() {
+    require_child_setup_helper();
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping invalid port cwd differential test");
         return;
