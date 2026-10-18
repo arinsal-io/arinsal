@@ -216,6 +216,7 @@ fn groups(term: &OwnedTerm) -> [Vec<GcCase>; 4] {
 /// The reductions of a dirty explicit collection: the call and `min(reds_left, 10)` on the normal
 /// scheduler, then four per whole microsecond on the dirty CPU scheduler.
 const DIRTY_BASE: i64 = 13;
+#[cfg(not(debug_assertions))]
 const SLACK_US: i64 = 100;
 
 fn check_dirty(runtime: &str, label: &str, group: &[GcCase]) {
@@ -234,6 +235,8 @@ fn check_dirty(runtime: &str, label: &str, group: &[GcCase]) {
             "{runtime} {label} below trace {case:?}"
         );
     }
+    // Debug-build overhead between pickup and the traced collection is not erts behaviour.
+    #[cfg(not(debug_assertions))]
     assert!(
         group
             .iter()
