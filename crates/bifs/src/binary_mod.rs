@@ -31,12 +31,21 @@ impl SearchPattern {
             Self::AhoCorasick(_) => "ac",
         }
     }
+
+    /// Payload bytes allocated by OTP's `create_bmdata` or `create_acdata`.
+    pub(super) fn erts_payload_size(&self) -> usize {
+        match self {
+            Self::BoyerMoore(pattern) => pattern.erts_payload_size,
+            Self::AhoCorasick(trie) => trie.erts_payload_size,
+        }
+    }
 }
 
 pub(crate) struct BoyerMoore {
     pattern: Vec<u8>,
     good_shift: Vec<usize>,
     bad_shift: Vec<usize>,
+    erts_payload_size: usize,
 }
 
 impl BoyerMoore {
@@ -44,6 +53,18 @@ impl BoyerMoore {
     // create_bmdata), OTP-29.1.1.
     fn new(pattern: Vec<u8>) -> Result<Self, BifError> {
         let width = pattern.len();
+        // Port of BM_SIZE_SINGLE / BM_SIZE_MULTI in erl_bif_binary.c. The inline C allocator
+        // aligns each field to a pointer-sized boundary on 64-bit macOS.
+        let align = |size: usize| size.div_ceil(8).checked_mul(8);
+        let erts_payload_size = if width == 1 {
+            8 + 32 // MYALIGN(1) + MYALIGN(sizeof(BMData))
+        } else {
+            align(width.checked_mul(8).ok_or(BifError::SystemLimit)?)
+                .and_then(|good| good.checked_add(2048))
+                .and_then(|arrays| arrays.checked_add(align(width)?))
+                .and_then(|saved| saved.checked_add(32))
+                .ok_or(BifError::SystemLimit)?
+        };
         let mut bad_shift = Vec::new();
         bad_shift
             .try_reserve_exact(ALPHABET_SIZE)
@@ -83,6 +104,7 @@ impl BoyerMoore {
             pattern,
             good_shift,
             bad_shift,
+            erts_payload_size,
         })
     }
 }
@@ -119,6 +141,7 @@ fn suffixes(pattern: &[u8]) -> Result<Vec<isize>, BifError> {
 
 pub(crate) struct AhoCorasick {
     nodes: Vec<Node>,
+    erts_payload_size: usize,
 }
 
 struct Node {
@@ -146,6 +169,13 @@ impl AhoCorasick {
         let max_nodes = patterns
             .iter()
             .try_fold(1_usize, |sum, pattern| sum.checked_add(pattern.len()))
+            .ok_or(BifError::SystemLimit)?;
+        // Port of AC_SIZE: reserve one C ACNode per input byte plus the root and one ACTrie.
+        const C_AC_NODE_SIZE: usize = 2064;
+        const C_AC_TRIE_SIZE: usize = 16;
+        let erts_payload_size = max_nodes
+            .checked_mul(C_AC_NODE_SIZE)
+            .and_then(|nodes| nodes.checked_add(C_AC_TRIE_SIZE))
             .ok_or(BifError::SystemLimit)?;
         let mut nodes = Vec::new();
         nodes
@@ -217,7 +247,10 @@ impl AhoCorasick {
             }
         }
         nodes[0].failure = 0;
-        Ok(Self { nodes })
+        Ok(Self {
+            nodes,
+            erts_payload_size,
+        })
     }
 }
 

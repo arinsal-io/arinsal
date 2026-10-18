@@ -14,8 +14,8 @@ use arinsal_term::{Term, TermBuilder};
 use zstd_sys as z;
 
 use super::{
-    DictBox, Kind, atom_term, bitstring, copy_bits_fwd, get_int, get_zstd_context, get_zstd_dict,
-    inspect_binary, is_error, make_resource, zstd_error,
+    DictBox, Kind, ZSTD_DICT_MAGIC_ORIG_SIZE, atom_term, bitstring, copy_bits_fwd, get_int,
+    get_zstd_context, get_zstd_dict, inspect_binary, is_error, make_resource, zstd_error,
 };
 use crate::Heap;
 
@@ -222,7 +222,11 @@ fn create(ctx: &mut Ctx<'_>, args: &[Term], kind: Kind) -> Result<Term, BifError
         let (error, name) = (atom_term("error")?, atom_term(name)?);
         return pair(ctx, error, name);
     }
-    make_resource(ctx, Arc::new(DictBox { kind, ptr, data }))
+    make_resource(
+        ctx,
+        Arc::new(DictBox { kind, ptr, data }),
+        ZSTD_DICT_MAGIC_ORIG_SIZE,
+    )
 }
 
 pub(super) fn create_cdict_nif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {

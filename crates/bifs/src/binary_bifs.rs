@@ -1415,9 +1415,10 @@ fn pattern(term: Term) -> Result<Arc<SearchPattern>, BifError> {
 fn compile_pattern(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let patterns = patterns(args[0])?;
     let compiled = Arc::new(SearchPattern::compile(&patterns)?);
+    let orig_size = arinsal_term::MAGIC_BIN_DATA_OFFSET + compiled.erts_payload_size();
     let tag = Term::atom(global_atoms().intern(compiled.tag()).expect("atom"));
     let reference = TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .magic_ref(MagicRef::new(compiled))
+        .magic_ref(MagicRef::with_orig_size(compiled, orig_size))
         .map_err(|_| BifError::SystemLimit)?;
     Ok(tuple_build(ctx, &[tag, reference]))
 }

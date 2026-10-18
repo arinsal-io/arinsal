@@ -1197,6 +1197,8 @@ pub(crate) struct BifTrapPending {
     pub(crate) import: usize,
     pub(crate) continuation: &'static str,
     pub(crate) state: std::sync::Arc<arinsal_term::MagicRef>,
+    /// The live magic-reference thing passed to the continuation export, when erts allocates one.
+    pub(crate) state_term: Option<Term>,
     pub(crate) gc_was_enabled: bool,
     /// The call's arguments, kept with the trap state like the arguments of a BIF_TRAP export:
     /// a retry never reads them back from the X registers.

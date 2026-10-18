@@ -11,7 +11,8 @@ const MODULE: &str = "zstd_compat_probe";
 
 const SOURCE: &str = r#"
 -module(zstd_compat_probe).
--export([oneshot/0, lifecycle/0, streams/0, corrupt/0, raw/0, reductions/0, external/0, dirty/0]).
+-export([oneshot/0, lifecycle/0, streams/0, corrupt/0, raw/0, reductions/0, external/0, dirty/0,
+         magic_orig_sizes/0]).
 
 inputs() ->
     Text = iolist_to_binary(lists:duplicate(2000, <<"the quick brown fox jumps over the lazy dog ">>)),
@@ -53,6 +54,24 @@ lifecycle() ->
     io:format("~w~n", [Created]),
     io:format("~w~n", [Dead]),
     io:format("~w~n", [closed()]).
+
+magic_orig_sizes() ->
+    garbage_collect(),
+    {garbage_collection_info, BeforeInfo} = process_info(self(), garbage_collection_info),
+    Before = proplists:get_value(bin_vheap_size, BeforeInfo),
+    {ok, Ctx} = zstd:context(compress),
+    garbage_collect(),
+    {garbage_collection_info, CtxInfo} = process_info(self(), garbage_collection_info),
+    CtxWords = proplists:get_value(bin_vheap_size, CtxInfo) - Before,
+    {ok, Dict} = zstd:dict(decompress, <<"dictionary">>),
+    garbage_collect(),
+    {garbage_collection_info, DictInfo} = process_info(self(), garbage_collection_info),
+    DictWords = proplists:get_value(bin_vheap_size, DictInfo)
+                - proplists:get_value(bin_vheap_size, CtxInfo),
+    ok = zstd:close(Ctx),
+    Result = {CtxWords, DictWords, element(1, Dict)},
+    io:format("~w~n", [Result]),
+    Result.
 
 in_other_process(Fun) ->
     Parent = self(),
@@ -1294,6 +1313,11 @@ fn corrupted_frames_match_erl() {
 #[test]
 fn one_shot_levels_match_erl() {
     assert_matches_erl(param_both("levels"), &["level {-22,", "level {22,"]);
+}
+
+#[test]
+fn resource_magic_orig_sizes_match_erl() {
+    assert_matches_erl(both("magic_orig_sizes"), &["{9,7,ddict}"]);
 }
 
 /// A dictionary by reference (`zstd:dict/2,3`) or by load (a binary, an iolist or an unaligned

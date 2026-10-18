@@ -2892,8 +2892,12 @@ fn call_inner(
             // (ets_match_spec_compile_1), OTP-29.1.1. The program lifetime follows
             // the magic reference through the process heap and its garbage collector.
             let program = Arc::new(MatchProgram::compile(*spec).map_err(err)?);
+            let payload_size = program.erts_magic_payload_size();
             TermBuilder::new(&mut heap)
-                .magic_ref(MagicRef::new(program))
+                .magic_ref(MagicRef::with_erts_payload_size(
+                    program,
+                    payload_size,
+                ))
                 .map_err(|_| badarg())
         }
         (EtsBif::IsCompiledMs, [value]) => {

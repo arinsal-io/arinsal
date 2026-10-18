@@ -32,6 +32,11 @@ use zstd_sys as z;
 
 use crate::{Heap, caller};
 
+// Port of zstd_nif.c (ZstdCtx, ZstdDict) and erl_nif.c (enif_alloc_resource), OTP-29.1.1.
+// The C payloads are 32 and 16 bytes on 64-bit macOS; the unaligned resource prefix is 40 bytes.
+pub(crate) const ZSTD_CTX_MAGIC_ORIG_SIZE: usize = 40 + 32;
+pub(crate) const ZSTD_DICT_MAGIC_ORIG_SIZE: usize = 40 + 16;
+
 /// Which of the two context or dictionary resource types a value is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -191,9 +196,10 @@ pub(crate) fn get_zstd_dict(term: Term, kind: Kind) -> Option<Arc<DictBox>> {
 pub(crate) fn make_resource<T: Any + Send + Sync>(
     ctx: &mut Ctx<'_>,
     payload: T,
+    orig_size: usize,
 ) -> Result<Term, BifError> {
     TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .magic_ref(MagicRef::new(payload))
+        .magic_ref(MagicRef::with_orig_size(payload, orig_size))
         .map_err(|_| BifError::SystemLimit)
 }
 

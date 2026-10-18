@@ -13,7 +13,10 @@ unsafe extern "C" {
 }
 
 /// A `malloc`ed block released with `free` when its last handle goes away.
-pub(crate) struct MallocBlock(pub(crate) *mut u8);
+pub(crate) struct MallocBlock {
+    pub(crate) data: *mut u8,
+    pub(crate) orig_size: usize,
+}
 // SAFETY: the block is plain memory; whoever holds a handle may read it, and writers
 // synchronize themselves, as for any NIF binary.
 unsafe impl Send for MallocBlock {}
@@ -22,7 +25,7 @@ unsafe impl Sync for MallocBlock {}
 impl Drop for MallocBlock {
     fn drop(&mut self) {
         // SAFETY: the block came from malloc and this is the last reference.
-        unsafe { free(self.0.cast()) }
+        unsafe { free(self.data.cast()) }
     }
 }
 
@@ -34,6 +37,19 @@ pub(crate) enum NifBinary {
     Owner(BinaryOwner),
     /// A `malloc` block.
     Block(Arc<MallocBlock>),
+}
+
+impl NifBinary {
+    /// `Binary.orig_size` for the binary retained by this handle.
+    pub(crate) fn orig_size(&self) -> usize {
+        match self {
+            Self::Owner(arinsal_term::BinaryOwner::Binary(binary)) => binary
+                .capacity()
+                .expect("retained Binary has a live allocation"),
+            Self::Owner(arinsal_term::BinaryOwner::External(binary)) => binary.owner_orig_size(),
+            Self::Block(block) => block.orig_size,
+        }
+    }
 }
 
 /// A new handle (reference count 1).
@@ -66,7 +82,10 @@ pub(crate) fn alloc_block(len: usize) -> Option<(*mut c_void, *mut u8)> {
         return None;
     }
     Some((
-        handle_new(NifBinary::Block(Arc::new(MallocBlock(block)))),
+        handle_new(NifBinary::Block(Arc::new(MallocBlock {
+            data: block,
+            orig_size: len,
+        }))),
         block,
     ))
 }
@@ -81,6 +100,6 @@ pub(crate) fn copy_to_block(bytes: *const u8, len: usize) -> Option<(*mut c_void
 
 /// The handle of a binary from `enif_alloc_binary` (a `malloc` block): ownership of the block
 /// moves to the handle.
-pub(crate) fn adopt_block(data: *mut u8) -> *mut c_void {
-    handle_new(NifBinary::Block(Arc::new(MallocBlock(data))))
+pub(crate) fn adopt_block(data: *mut u8, orig_size: usize) -> *mut c_void {
+    handle_new(NifBinary::Block(Arc::new(MallocBlock { data, orig_size })))
 }

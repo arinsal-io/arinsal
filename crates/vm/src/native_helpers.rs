@@ -2220,14 +2220,20 @@ pub(crate) extern "C" fn list_member_entry(
             return 0;
         };
         crate::native_hooks::convert_native_cursors(process);
-        crate::bif_traps::install_deferred_trap(
+        if crate::bif_traps::install_deferred_trap(
             process,
             identity as usize,
             (export.module_atom, export.function_atom),
             export.function.as_str(),
             &args,
             trap,
-        );
+        )
+        .is_err()
+        {
+            crate::native_hooks::set_error(process, "system_limit");
+            process.sync_native_header();
+            return 0;
+        }
         debug_assert_native_heap(process);
         crate::bif_traps::arm_export_trap(process);
         process.header.freason = 1 << 10;
@@ -2745,7 +2751,8 @@ pub(crate) extern "C" fn list_reverse_entry(
         }
         Ok(arinsal_bifs::ReverseStep::Trap(cont)) => Ok(crate::bif_traps::HandlerResult::Yield {
             continuation: "lists:reverse/2",
-            state: arinsal_term::MagicRef::new(std::sync::Mutex::new(cont)),
+            // erts keeps lists:reverse/2's arguments in X registers and allocates no magic bin.
+            state: arinsal_term::MagicRef::with_orig_size(std::sync::Mutex::new(cont), 0),
             reductions: 0,
         }),
         Err(error) => Err(error),
@@ -3208,14 +3215,20 @@ fn call_list_slice_bif(
         process.reductions = process.header.fcalls;
         let mut args = [Term::NIL; 3];
         args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
-        crate::bif_traps::install_deferred_trap(
+        if crate::bif_traps::install_deferred_trap(
             process,
             identity,
             (export.module_atom, export.function_atom),
             export.function.as_str(),
             &args[..arity],
             trap,
-        );
+        )
+        .is_err()
+        {
+            crate::native_hooks::set_error(process, "system_limit");
+            process.sync_native_header();
+            return Some(0);
+        }
         debug_assert_native_heap(process);
         crate::bif_traps::arm_export_trap(process);
         process.header.freason = 1 << 10;
@@ -3313,14 +3326,20 @@ fn install_deferred_bif_trap(
     trap: Box<arinsal_bifs::DeferredTrap>,
 ) -> u64 {
     process.reductions = process.header.fcalls;
-    crate::bif_traps::install_deferred_trap(
+    if crate::bif_traps::install_deferred_trap(
         process,
         identity,
         (export.module_atom, export.function_atom),
         export.function.as_str(),
         args,
         trap,
-    );
+    )
+    .is_err()
+    {
+        crate::native_hooks::set_error(process, "system_limit");
+        process.sync_native_header();
+        return 0;
+    }
     debug_assert_native_heap(process);
     crate::bif_traps::arm_export_trap(process);
     process.header.freason = 1 << 10;

@@ -17,13 +17,25 @@ const SOURCE: &str = r#"
          sendv_several_binaries/0, send_after_shutdown_write/0,
          shutdown_on_closed_socket/0, cancel_send/0, writer_queue_order/0,
          writer_abort_on_error/0, packet_send_sendv/0, sendto_sendmsg_stream/0,
-         dirty_io_nifs_wait_for_dirty_schedulers/0]).
+         dirty_io_nifs_wait_for_dirty_schedulers/0, socket_magic_orig_size/0]).
 
 listen() ->
     {ok, Listen} = gen_tcp:listen(0, [{inet_backend, socket}, {ip, {127,0,0,1}},
                                       {active, false}]),
     {ok, Port} = inet:port(Listen),
     {Listen, Port}.
+
+socket_magic_orig_size() ->
+    garbage_collect(),
+    {garbage_collection_info, BeforeInfo} = process_info(self(), garbage_collection_info),
+    Before = proplists:get_value(bin_vheap_size, BeforeInfo),
+    {ok, Listen} = gen_tcp:listen(0, [{inet_backend, socket}, {ip, {127,0,0,1}},
+                                      {active, false}]),
+    garbage_collect(),
+    {garbage_collection_info, AfterInfo} = process_info(self(), garbage_collection_info),
+    Size = proplists:get_value(bin_vheap_size, AfterInfo) - Before,
+    ok = gen_tcp:close(Listen),
+    Size.
 
 connect_accept_send_recv() ->
     {Listen, Port} = listen(),
@@ -577,15 +589,15 @@ fn run(program: &Path, dir: &Path, module: &str, function: &str) -> (bool, Strin
 }
 
 fn compare(function: &str) {
-    compare_in("gen_tcp_socket_compat", SOURCE, function);
+    let _ = compare_in("gen_tcp_socket_compat", SOURCE, function);
 }
 
-fn compare_in(module: &str, source: &str, function: &str) {
+fn compare_in(module: &str, source: &str, function: &str) -> Option<(String, String)> {
     let arinsal = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/arinsal");
     assert!(arinsal.is_file(), "build target/debug/arinsal first");
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping gen_tcp_socket differential test");
-        return;
+        return None;
     };
     let beam = reference
         .compile_named(module, source, &[])
@@ -599,11 +611,20 @@ fn compare_in(module: &str, source: &str, function: &str) {
     assert!(erl_ok, "erl failed in {function}: {expected}");
     assert!(ok, "arinsal failed in {function}: {actual}");
     similar_asserts::assert_eq!(expected, actual, "{function}");
+    Some((expected, actual))
 }
 
 #[test]
 fn connect_accept_send_recv_matches_erts() {
     compare("connect_accept_send_recv");
+}
+
+#[test]
+fn socket_magic_binary_size_matches_erts() {
+    let (expected, actual) =
+        compare_in("gen_tcp_socket_compat", SOURCE, "socket_magic_orig_size").expect("OTP 29.1.1");
+    similar_asserts::assert_eq!("121", expected);
+    similar_asserts::assert_eq!(expected, actual);
 }
 
 #[test]
@@ -704,7 +725,7 @@ fn sendto_and_sendmsg_on_stream_match_erts() {
 const ACTIVE_SOURCE: &str = include_str!("fixtures/sock_active_compat.erl");
 
 fn compare_active(function: &str) {
-    compare_in("sock_active_compat", ACTIVE_SOURCE, function);
+    let _ = compare_in("sock_active_compat", ACTIVE_SOURCE, function);
 }
 
 #[test]
@@ -780,7 +801,7 @@ fn gen_tcp_close_wakes_blocked_recv_like_erts() {
 const CLOSE_SOURCE: &str = include_str!("fixtures/sock_close_compat.erl");
 
 fn compare_close(function: &str) {
-    compare_in("sock_close_compat", CLOSE_SOURCE, function);
+    let _ = compare_in("sock_close_compat", CLOSE_SOURCE, function);
 }
 
 #[test]

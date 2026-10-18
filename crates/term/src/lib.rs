@@ -72,7 +72,7 @@ pub use heap::{
 pub use identity::{Identity, Node};
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};
 pub use literal::{LiteralAreas, set_literal_purge_area};
-pub use magic::MagicRef;
+pub use magic::{MAGIC_BIN_DATA_OFFSET, MagicRef};
 pub use native_code::{
     is_cp, is_native_code_pointer, may_be_native_code_pointer, register_native_code_range,
     unregister_native_code_range,

@@ -20,6 +20,10 @@ mod options;
 use options::bool_atom;
 
 const MAGIC: u32 = 0x534f_434b;
+// Port of prim_socket_nif.c (esock_alloc_descriptor) and erl_nif.c
+// (enif_alloc_resource), OTP-29.1.1. On macOS arm64, sizeof(ESockDescriptor) is 928 bytes;
+// the unaligned magic data offset and ErtsResource header add 24 + 16 bytes to orig_size.
+const SOCKET_MAGIC_ORIG_SIZE: usize = 24 + 16 + 928;
 #[cfg(target_os = "macos")]
 const ATMARK_REQUEST: u64 = 0x4004_7307;
 #[cfg(target_os = "linux")]
@@ -356,20 +360,23 @@ fn reference(
     options: HashMap<i32, O>,
     ctype: O,
 ) -> O {
-    let magic = MagicRef::new(Handle {
-        socket: Mutex::new(Some(socket)),
-        reference: OnceLock::new(),
-        selector: Mutex::new(None),
-        owner: Mutex::new(owner.clone()),
-        state: Mutex::new(State::default()),
-        counters: Mutex::new(Counters::default()),
-        otp_options: Mutex::new(options),
-        sendfile_fd: Mutex::new(None),
-        domain,
-        kind,
-        protocol,
-        ctype,
-    });
+    let magic = MagicRef::with_orig_size(
+        Handle {
+            socket: Mutex::new(Some(socket)),
+            reference: OnceLock::new(),
+            selector: Mutex::new(None),
+            owner: Mutex::new(owner.clone()),
+            state: Mutex::new(State::default()),
+            counters: Mutex::new(Counters::default()),
+            otp_options: Mutex::new(options),
+            sendfile_fd: Mutex::new(None),
+            domain,
+            kind,
+            protocol,
+            ctype,
+        },
+        SOCKET_MAGIC_ORIG_SIZE,
+    );
     let id = magic.id();
     let reference = O::Ref {
         node: "nonode@nohost".into(),
