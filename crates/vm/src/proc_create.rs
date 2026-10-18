@@ -342,6 +342,10 @@ pub struct Process {
     pub(crate) dictionary: Option<ProcDict>,
     /// Per-process sequential trace token; `None` is the no-token fast path.
     pub(crate) seq_trace_token: Option<Box<crate::seq_trace::Token>>,
+    /// The token tuple that `SEQ_TRACE_TOKEN(p)` names on the young heap: a collection roots
+    /// it like erts' `setup_rootset`, so its words stay live. `NIL` when the token has no
+    /// heap copy.
+    pub(crate) seq_token_root: Term,
     /// `p->seq_trace_clock` and `p->seq_trace_lastcnt` (erl_process.h:1112); the epoch of the
     /// last `seq_trace:reset_trace/0` this process has applied.
     pub(crate) seq_trace_clock: u64,
@@ -1557,6 +1561,7 @@ impl Process {
             heap,
             dictionary: None,
             seq_trace_token: None,
+            seq_token_root: Term::NIL,
             seq_trace_clock: 0,
             seq_trace_lastcnt: 0,
             seq_trace_epoch: crate::seq_trace::current_epoch(),

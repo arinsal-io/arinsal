@@ -125,6 +125,17 @@ struct MessageFragment {
 
 type RemovedMessage = (Term, crate::seq_trace::SeqState);
 
+/// A queued message whose data is still in its heap fragment, as an on-heap collection moves
+/// it: the term, the copy of its sequential trace token in the same fragment, and the fragment.
+pub(crate) type MovedMessage = (Term, Term, Option<ProcessHeap>);
+
+/// Which part of a queued message a collection root stands for.
+#[derive(Clone, Copy)]
+pub(crate) struct RootSlot {
+    entry: usize,
+    token: bool,
+}
+
 /// Private message queue whose detached fragments remain owned by each entry.
 ///
 /// Port of erts/emulator/beam/erl_proc_sig_queue.c:1285 (private message queue), OTP-29.1.1.
@@ -342,26 +353,41 @@ impl MessageQueue {
         Ok((removed, prio_len))
     }
 
-    /// Obtain and later rewrite only the mailbox entries scanned by process GC.
-    pub(crate) fn gc_root_snapshot(&self) -> (Vec<usize>, Vec<Term>) {
-        let indices = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                (entry.term.is_pointer()
-                    && entry
-                        .fragment
-                        .as_ref()
-                        .is_none_or(|fragment| fragment.heap.is_none()))
-                .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        let roots = indices
-            .iter()
-            .map(|&index| self.entries[index].term)
-            .collect();
-        (indices, roots)
+    /// Obtain and later rewrite only the mailbox entries scanned by process GC: the message
+    /// terms that live on the heap and, like erts' `ERL_MESSAGE_TOKEN` roots, the copies of
+    /// sequential trace tokens that live there.
+    pub(crate) fn gc_root_snapshot(&self) -> (Vec<RootSlot>, Vec<Term>) {
+        let mut slots = Vec::new();
+        let mut roots = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let on_heap = entry
+                .fragment
+                .as_ref()
+                .is_none_or(|fragment| fragment.heap.is_none());
+            if !on_heap {
+                continue;
+            }
+            if entry.term.is_pointer() {
+                slots.push(RootSlot {
+                    entry: index,
+                    token: false,
+                });
+                roots.push(entry.term);
+            }
+            if let Some(token) = entry
+                .fragment
+                .as_ref()
+                .and_then(|fragment| fragment.seq_token.as_ref())
+                && token.root().is_pointer()
+            {
+                slots.push(RootSlot {
+                    entry: index,
+                    token: true,
+                });
+                roots.push(token.heap_ref());
+            }
+        }
+        (slots, roots)
     }
 
     /// Check queue roots and detached fragments for pointers into a retiring area.
@@ -428,11 +454,10 @@ impl MessageQueue {
     }
 
     /// Take the heap fragments of queued messages for a collection that moves them onto
-    /// the heap (on-heap message queue).
+    /// the heap (on-heap message queue). Each entry carries the message term and the copy of
+    /// its sequential trace token that sits in the same fragment.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8851-8880 (move_msg_to_heap), OTP-29.1.1.
-    pub(crate) fn take_message_fragments(
-        &mut self,
-    ) -> (Vec<usize>, Vec<(Term, Option<ProcessHeap>)>) {
+    pub(crate) fn take_message_fragments(&mut self) -> (Vec<usize>, Vec<MovedMessage>) {
         let mut indices = Vec::new();
         let mut fragments = Vec::new();
         for (index, entry) in self.entries.iter_mut().enumerate() {
@@ -440,22 +465,25 @@ impl MessageQueue {
                 && let Some(heap) = fragment.heap.take()
             {
                 indices.push(index);
-                fragments.push((entry.term, Some(heap)));
+                let token = fragment
+                    .seq_token
+                    .as_ref()
+                    .map_or(Term::NIL, |token| token.heap_ref());
+                fragments.push((entry.term, token, Some(heap)));
             }
         }
         (indices, fragments)
     }
 
     /// Store the terms of messages moved onto the heap; their fragments are gone.
-    pub(crate) fn restore_moved_messages(
-        &mut self,
-        indices: &[usize],
-        moved: Vec<(Term, Option<ProcessHeap>)>,
-    ) {
-        for (&index, (term, heap)) in indices.iter().zip(moved) {
+    pub(crate) fn restore_moved_messages(&mut self, indices: &[usize], moved: Vec<MovedMessage>) {
+        for (&index, (term, token, heap)) in indices.iter().zip(moved) {
             let entry = &mut self.entries[index];
             entry.term = term;
             if let Some(fragment) = entry.fragment.as_mut() {
+                if let Some(seq_token) = fragment.seq_token.as_mut() {
+                    *seq_token.heap_ref_mut() = token;
+                }
                 fragment.heap = heap;
                 if fragment.heap.is_none() && fragment.seq_token.is_none() {
                     entry.fragment = None;
@@ -464,9 +492,20 @@ impl MessageQueue {
         }
     }
 
-    pub(crate) fn update_gc_roots(&mut self, indices: &[usize], roots: &[Term]) {
-        for (&index, &term) in indices.iter().zip(roots) {
-            self.entries[index].term = term;
+    pub(crate) fn update_gc_roots(&mut self, slots: &[RootSlot], roots: &[Term]) {
+        for (slot, &term) in slots.iter().zip(roots) {
+            let entry = &mut self.entries[slot.entry];
+            if slot.token {
+                if let Some(token) = entry
+                    .fragment
+                    .as_mut()
+                    .and_then(|fragment| fragment.seq_token.as_mut())
+                {
+                    *token.heap_ref_mut() = term;
+                }
+            } else {
+                entry.term = term;
+            }
         }
     }
 
@@ -494,6 +533,27 @@ impl Message {
                 .is_none_or(|fragment| fragment.heap.is_none())
     }
 
+    /// The copy of the sequential trace token that sits on the receiver's heap, a collection
+    /// root like the message term.
+    fn heap_token_root(&self) -> Option<Term> {
+        let fragment = self.fragment.as_ref()?;
+        if fragment.heap.is_some() {
+            return None;
+        }
+        let token = fragment.seq_token.as_ref()?;
+        token.root().is_pointer().then_some(token.heap_ref())
+    }
+
+    fn set_heap_token_root(&mut self, root: Term) {
+        if let Some(token) = self
+            .fragment
+            .as_mut()
+            .and_then(|fragment| fragment.seq_token.as_mut())
+        {
+            *token.heap_ref_mut() = root;
+        }
+    }
+
     /// Build a scheduler-safe message from a self-contained term snapshot.
     pub(crate) fn from_owned(term: &arinsal_etf::OwnedTerm) -> Result<Self, VmError> {
         let mut heap = ProcessHeap::with_words(4096);
@@ -513,24 +573,44 @@ impl Message {
         // Literals outside the collector's purge area stay shared (copy_struct_litopt).
         let literals = arinsal_term::LiteralAreas::current();
         let words = arinsal_term::size_object_litopt(term, &literals);
-        Self::copy_counted(term, words, &literals)
+        Self::copy_counted(term, words, None, &literals)
     }
 
-    /// `copy_from` when `words` is already `size_object_litopt(term, literals)`.
+    /// `copy_from` when `words` is already `size_object_litopt(term, literals)`. A sequential
+    /// trace `token` is copied into the same fragment after the message, and its words count
+    /// towards the fragment size.
+    // Port of erts/emulator/beam/erl_message.c (erts_send_message, seq trace): the fragment
+    // holds the message and then the copied token, OTP-29.1.1.
     fn copy_counted(
         term: Term,
         words: usize,
+        token: Option<&mut crate::seq_trace::Token>,
         literals: &arinsal_term::LiteralAreas,
     ) -> Result<Self, VmError> {
-        if words == 0 {
+        let token_words = token
+            .as_deref()
+            .map_or(0, crate::seq_trace::Token::heap_words);
+        if words + token_words == 0 {
             return Ok(Self::immediate(term));
         }
-        let mut fragment =
-            ProcessHeap::with_words_for_type(words, arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG);
+        let mut fragment = ProcessHeap::with_words_for_type(
+            words + token_words,
+            arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG,
+        );
         // Size was computed by the caller; copy_struct must not walk the term again
         // (erts_send_message: size_object then copy_struct).
-        let term = copy_struct_litopt(term, &mut fragment, words, literals)
-            .map_err(|error| VmError::Unsupported(format!("message copy: {error:?}")))?;
+        let term = if words == 0 {
+            term
+        } else {
+            copy_struct_litopt(term, &mut fragment, words, literals)
+                .map_err(|error| VmError::Unsupported(format!("message copy: {error:?}")))?
+        };
+        if let Some(token) = token {
+            let copy = token
+                .build_on(&mut arinsal_bifs::ProcessHeapHandle(&mut fragment))
+                .map_err(|error| VmError::Unsupported(format!("message token copy: {error:?}")))?;
+            *token.heap_ref_mut() = copy;
+        }
         Ok(Self {
             term,
             fragment: Some(Box::new(MessageFragment {
@@ -715,6 +795,8 @@ impl Message {
 struct CountedSend<'a> {
     value: Term,
     words: usize,
+    /// Words of the sequential trace token copied after the message, 0 without a token.
+    token_words: usize,
     literals: &'a arinsal_term::LiteralAreas,
 }
 
@@ -731,9 +813,11 @@ fn message_on_receiver_heap(
     let CountedSend {
         value,
         words,
+        token_words,
         literals,
     } = counted;
-    if words == 0
+    let total_words = words + token_words;
+    if total_words == 0
         || receiver.message_queue_data() != MessageQueueData::OnHeap
         || !receiver.heap.gc_enabled
         || receiver.heap.is_detached()
@@ -745,16 +829,31 @@ fn message_on_receiver_heap(
     let Some(left) = receiver.heap.halloc_words_left() else {
         return Ok(None);
     };
-    if left <= words {
+    if left <= total_words {
         return Ok(None);
     }
-    let term = match copy_struct_litopt(value, &mut receiver.heap, words, literals) {
-        Ok(term) => term,
-        Err(arinsal_term::TermError::HeapFull) => return Ok(None),
-        Err(error) => {
-            return Err(VmError::Unsupported(format!("message copy: {error:?}")));
+    let term = if words == 0 {
+        value
+    } else {
+        match copy_struct_litopt(value, &mut receiver.heap, words, literals) {
+            Ok(term) => term,
+            Err(arinsal_term::TermError::HeapFull) => return Ok(None),
+            Err(error) => {
+                return Err(VmError::Unsupported(format!("message copy: {error:?}")));
+            }
         }
     };
+    if let crate::seq_trace::SeqState::Token(token) = &mut seq_token.seq {
+        match token.build_on(&mut arinsal_bifs::ProcessHeapHandle(&mut receiver.heap)) {
+            Ok(copy) => *token.heap_ref_mut() = copy,
+            Err(arinsal_term::TermError::HeapFull) => return Ok(None),
+            Err(error) => {
+                return Err(VmError::Unsupported(format!(
+                    "message token copy: {error:?}"
+                )));
+            }
+        }
+    }
     let mut envelope = Message {
         term,
         fragment: None,
@@ -4933,7 +5032,7 @@ impl Process {
         priority: bool,
         seq_token: &mut SendMeta,
     ) -> Result<bool, VmError> {
-        if counted.words == 0 {
+        if counted.words + counted.token_words == 0 {
             return Ok(false);
         }
         if ctx.is_none() {
@@ -5345,6 +5444,7 @@ impl Process {
         let shares_own_term = pid == sender
             && matches!(seq_token.seq, crate::seq_trace::SeqState::Nil)
             && self.message_queue_data() == MessageQueueData::OnHeap;
+        let mut on_own_heap = shares_own_term;
         let envelope = if shares_own_term {
             let mut envelope = Message::immediate(value);
             if via_prio_alias {
@@ -5362,31 +5462,53 @@ impl Process {
             } else {
                 0
             };
-            if self.try_send_on_receiver_heap(
+            let token = match &seq_token.seq {
+                crate::seq_trace::SeqState::Token(token) => Some(token.as_ref()),
+                _ => None,
+            };
+            let token_words = token.map_or(0, crate::seq_trace::Token::heap_words);
+            let counted = CountedSend {
+                value,
+                words,
+                token_words,
+                literals: &literals,
+            };
+            let mut on_heap = None;
+            if pid == sender {
+                // Port of erts/emulator/beam/erl_message.c (erts_try_alloc_message_on_heap),
+                // OTP-29.1.1: a process that sends to itself holds its own main lock, so the
+                // message and its token are allocated on its own young heap when they fit.
+                on_heap = message_on_receiver_heap(self, counted, via_prio_alias, &mut seq_token)?;
+                on_own_heap = on_heap.is_some();
+            } else if self.try_send_on_receiver_heap(
                 ctx.as_deref_mut(),
                 sender,
                 pid,
-                CountedSend {
-                    value,
-                    words,
-                    literals: &literals,
-                },
+                counted,
                 via_prio_alias,
                 &mut seq_token,
             )? {
                 return Ok(value);
             }
-            let mut envelope = Message::copy_counted(value, words, &literals)?;
-            if via_prio_alias {
-                envelope = envelope.with_priority();
+            if let Some(envelope) = on_heap {
+                envelope
+            } else {
+                let token = match &mut seq_token.seq {
+                    crate::seq_trace::SeqState::Token(token) => Some(token.as_mut()),
+                    _ => None,
+                };
+                let mut envelope = Message::copy_counted(value, words, token, &literals)?;
+                if via_prio_alias {
+                    envelope = envelope.with_priority();
+                }
+                envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
+                envelope.alias = seq_token.alias;
+                envelope
             }
-            envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
-            envelope.alias = seq_token.alias;
-            envelope
         };
         let delivered = match ctx {
             Some(ctx) => {
-                let shared = shares_own_term && value.is_pointer();
+                let shared = on_own_heap && value.is_pointer();
                 let delivered = ctx.send(pid, envelope);
                 // A buffered message names a term on this heap. Publish it before anything
                 // can collect, so the signal queue holds it as a root.
@@ -6385,6 +6507,7 @@ impl Process {
             && self.inbox.is_empty()
             && self.sig_cont.is_empty()
             && self.dictionary.is_none()
+            && !self.seq_token_root.is_pointer()
             && self.apply_inline_len == 0
             && self.cold.as_ref().is_none_or(|cold| {
                 cold.persistent_get_all.is_none()
@@ -6464,6 +6587,14 @@ impl Process {
             Self::sig_cont_message(&event.payload)
                 .filter(|message| message.is_heap_root())
                 .map(|message| message.term)
+        }));
+        // Port of erts/emulator/beam/erl_gc.c:2616 (setup_rootset roots `p->seq_trace_token` and
+        // the token of each queued on-heap message), OTP-29.1.1.
+        crate::seq_trace::sync_epoch(self);
+        let seq_start = roots.len();
+        roots.push(self.seq_token_root);
+        roots.extend(self.sig_cont.iter().filter_map(|event| {
+            Self::sig_cont_message(&event.payload).and_then(Message::heap_token_root)
         }));
         // Port of erts/emulator/beam/erl_gc.c:832-901 (`trace_gc` around minor/major collections), OTP-29.1.1.
         let traced = self
@@ -6574,7 +6705,16 @@ impl Process {
         {
             *slot = term;
         }
-        let mut cont_roots = roots[cont_start..].iter();
+        self.seq_token_root = roots[seq_start];
+        let mut token_roots = roots[seq_start + 1..].iter();
+        for event in &mut self.sig_cont {
+            if let Some(message) = Self::sig_cont_message_mut(&mut event.payload)
+                && message.heap_token_root().is_some()
+            {
+                message.set_heap_token_root(*token_roots.next().expect("middle queue token root"));
+            }
+        }
+        let mut cont_roots = roots[cont_start..seq_start].iter();
         for event in &mut self.sig_cont {
             if let Some(message) = Self::sig_cont_message_mut(&mut event.payload)
                 && message.is_heap_root()
