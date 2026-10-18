@@ -532,11 +532,12 @@ impl HeapAlloc for ProcessHeapHandle<'_> {
     fn supports_writable_binary(&self) -> bool {
         HeapAlloc::supports_writable_binary(self.0)
     }
-    fn retain_external_binary(
+    fn link_external_binary(
         &mut self,
+        bin_ref: *mut u64,
         binary: Arc<ExternalBinary>,
     ) -> Result<(), arinsal_term::TermError> {
-        HeapAlloc::retain_external_binary(self.0, binary)
+        HeapAlloc::link_external_binary(self.0, bin_ref, binary)
     }
     fn supports_external_binary(&self) -> bool {
         true

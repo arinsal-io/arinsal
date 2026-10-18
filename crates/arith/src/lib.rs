@@ -180,11 +180,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
     fn supports_writable_binary(&self) -> bool {
         self.0.supports_writable_binary()
     }
-    fn retain_external_binary(
+    fn link_external_binary(
         &mut self,
+        bin_ref: *mut u64,
         binary: Arc<arinsal_term::ExternalBinary>,
     ) -> Result<(), TermError> {
-        self.0.retain_external_binary(binary)
+        self.0.link_external_binary(bin_ref, binary)
     }
     fn supports_external_binary(&self) -> bool {
         self.0.supports_external_binary()

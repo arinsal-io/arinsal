@@ -93,11 +93,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn link_node(&mut self, thing: *mut u64, value: Arc<Node>) {
         self.0.link_node(thing, value)
     }
-    fn retain_external_binary(
+    fn link_external_binary(
         &mut self,
+        bin_ref: *mut u64,
         value: Arc<ExternalBinary>,
     ) -> Result<(), arinsal_term::TermError> {
-        self.0.retain_external_binary(value)
+        self.0.link_external_binary(bin_ref, value)
     }
     fn supports_external_binary(&self) -> bool {
         self.0.supports_external_binary()
@@ -211,8 +212,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for ConsBlock<'_, H> {
     fn supports_writable_binary(&self) -> bool {
         self.backing.supports_writable_binary()
     }
-    fn retain_external_binary(&mut self, value: Arc<ExternalBinary>) -> Result<(), TermError> {
-        self.backing.retain_external_binary(value)
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        value: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        self.backing.link_external_binary(bin_ref, value)
     }
     fn supports_external_binary(&self) -> bool {
         self.backing.supports_external_binary()

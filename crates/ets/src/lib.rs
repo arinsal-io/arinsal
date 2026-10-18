@@ -1014,7 +1014,12 @@ impl HeapAlloc for ObjectHeap {
     fn supports_writable_binary(&self) -> bool {
         true
     }
-    fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        let _ = self.chain_first_oh(bin_ref as usize);
         self.off_heap().external.push(binary);
         Ok(())
     }

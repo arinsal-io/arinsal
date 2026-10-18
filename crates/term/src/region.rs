@@ -76,7 +76,6 @@ struct Storage {
     off_heap_first: usize,
     wrt_bins: usize,
     overhead: u64,
-    external: Vec<Arc<ExternalBinary>>,
     funs: Vec<Arc<FunEntry>>,
     exports: Vec<Arc<ExportEntry>>,
     dependencies: HashMap<usize, Arc<Region>>,
@@ -98,7 +97,6 @@ impl Storage {
             off_heap_first: 0,
             wrt_bins: 0,
             overhead: 0,
-            external: Vec::new(),
             funs: Vec::new(),
             exports: Vec::new(),
             dependencies: HashMap::new(),
@@ -145,8 +143,12 @@ impl HeapAlloc for Storage {
         self.overhead = self.overhead.saturating_add(overhead_words);
         Ok(())
     }
-    fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {
-        self.external.push(binary);
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        crate::heap::link_external_bin_ref(&mut self.off_heap_first, bin_ref, binary);
         Ok(())
     }
     fn supports_external_binary(&self) -> bool {
