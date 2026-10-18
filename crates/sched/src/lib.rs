@@ -790,6 +790,20 @@ impl std::error::Error for Error {}
 pub trait Clock: Send + Sync {
     /// Current virtual or real time.
     fn now_ms(&self) -> u64;
+
+    /// The erts wheel position for a relative millisecond timeout.
+    fn timeout_pos(&self, ms: u64) -> u64 {
+        if ms == 0 {
+            self.now_ms()
+        } else {
+            self.now_ms().saturating_add(ms)
+        }
+    }
+
+    /// The erts clock position used to report a timer's remaining milliseconds.
+    fn time_left_now_ms(&self) -> u64 {
+        self.now_ms()
+    }
 }
 
 /// Source of scheduling choices, local to one scheduler.
@@ -820,14 +834,29 @@ struct RealClock(Instant);
 impl Clock for RealClock {
     fn now_ms(&self) -> u64 {
         let elapsed = self.0.elapsed();
-        // Port of erts/emulator/beam/erl_hl_timer.c:670-679
-        // (get_timeout_pos), OTP-29.1.1: millisecond deadlines round up so
-        // positive timers do not expire before their requested interval. 64-bit math only:
-        // `as_millis` divides in 128 bits.
         elapsed
             .as_secs()
             .saturating_mul(1000)
-            .saturating_add(u64::from(elapsed.subsec_nanos().div_ceil(1_000_000)))
+            .saturating_add(u64::from(elapsed.subsec_millis()))
+    }
+
+    fn timeout_pos(&self, ms: u64) -> u64 {
+        if ms == 0 {
+            return self.now_ms();
+        }
+        // Port of erts/emulator/beam/erl_hl_timer.c:670-679 (get_timeout_pos), OTP-29.1.1.
+        let ticks = self.0.elapsed().as_nanos().saturating_sub(1) / 1_000_000;
+        u64::try_from(ticks)
+            .unwrap_or(u64::MAX)
+            .saturating_add(ms)
+            .saturating_add(1)
+    }
+
+    fn time_left_now_ms(&self) -> u64 {
+        // Port of erts/emulator/beam/erl_hl_timer.c:682-689 (get_time_left), OTP-29.1.1.
+        let nanos = self.0.elapsed().as_nanos();
+        let ticks = nanos.saturating_sub(1) / 1_000_000 + u128::from(nanos != 0);
+        u64::try_from(ticks).unwrap_or(u64::MAX)
     }
 }
 
@@ -2779,7 +2808,7 @@ impl<T: Task> Inner<T> {
                         });
                         if stashed == Some(true)
                             && let Some((remaining, payload)) =
-                                wheel.cancel_at(id, self.clock.now_ms())
+                                wheel.cancel_at(id, self.clock.time_left_now_ms())
                         {
                             self.stash_paused(wheel, pid, remaining, payload);
                         }
@@ -2818,10 +2847,9 @@ impl<T: Task> Inner<T> {
             payload
         };
         if let Some(payload) = rejected {
-            let now = self.clock.now_ms();
             wheel.insert(
                 self.next_timer.fetch_add(1, Ordering::Relaxed),
-                now.saturating_add(remaining.max(1)),
+                self.clock.timeout_pos(remaining),
                 payload,
             );
         }
@@ -2878,7 +2906,7 @@ impl<T: Task> Inner<T> {
         process.bif_timer_wheels.store(u64::MAX, Ordering::Release);
         proc_flags::publish(&process.exit_flags, proc_flags::BIF_TIMERS);
         if let Some(timers) = self.sim_timers.as_ref() {
-            let now = self.clock.now_ms();
+            let now = self.clock.time_left_now_ms();
             for wheel in timers {
                 let mut wheel = wheel.lock().unwrap();
                 let ids = self.bif_timer_ids(pid, wheel.worker());
@@ -2920,7 +2948,7 @@ impl<T: Task> Inner<T> {
                 .bif_timer_wheels
                 .fetch_or(timer_wheel_bit(worker), Ordering::AcqRel);
             let id = self.next_timer.fetch_add(1, Ordering::Relaxed);
-            let _ = self.insert_timer(worker, id, payload, None, remaining.max(1));
+            let _ = self.insert_timer(worker, id, payload, None, remaining);
         }
     }
 
@@ -3151,7 +3179,10 @@ impl<T: Task> Inner<T> {
         let worker = process.wait_timer_worker.load(Ordering::Relaxed);
         if let Some(timers) = self.sim_timers.as_ref() {
             if let Some(wheel) = timers.get(worker) {
-                wheel.lock().unwrap().cancel_at(id, self.clock.now_ms());
+                wheel
+                    .lock()
+                    .unwrap()
+                    .cancel_at(id, self.clock.time_left_now_ms());
             }
         } else if let Some(queue) = self.canceled_timers.get(worker) {
             queue.push(CanceledTimer { id });
@@ -3319,12 +3350,16 @@ impl<T: Task> Inner<T> {
                     service.wheel.insert(id, deadline, payload);
                 }
                 TimerCommand::Read { id, callback } => {
-                    callback(service.wheel.remaining_at(id, self.clock.now_ms()));
+                    callback(
+                        service
+                            .wheel
+                            .remaining_at(id, self.clock.time_left_now_ms()),
+                    );
                 }
                 TimerCommand::Cancel { id, callback } => {
                     let remaining = service
                         .wheel
-                        .cancel_at(id, self.clock.now_ms())
+                        .cancel_at(id, self.clock.time_left_now_ms())
                         .map(|(remaining, _)| remaining);
                     callback(remaining);
                 }
@@ -3332,13 +3367,17 @@ impl<T: Task> Inner<T> {
                     service.wheel.cancel_target(&ids);
                 }
                 TimerCommand::PauseTarget { pid, ids } => {
-                    service.wheel.pause_target(pid, &ids, self.clock.now_ms());
+                    service
+                        .wheel
+                        .pause_target(pid, &ids, self.clock.time_left_now_ms());
                 }
             }
         }
         let canceled_queue = service.canceled.clone();
         while let Some(canceled) = canceled_queue.pop() {
-            service.wheel.cancel_at(canceled.id, self.clock.now_ms());
+            service
+                .wheel
+                .cancel_at(canceled.id, self.clock.time_left_now_ms());
         }
         self.apply_link_events(&mut service.wheel);
     }
@@ -3537,7 +3576,7 @@ impl<T: Task> Inner<T> {
         ms: u64,
     ) -> Result<TimerRef, Error> {
         let now = self.clock.now_ms();
-        let deadline = now.saturating_add(ms.max(1));
+        let deadline = self.clock.timeout_pos(ms);
         if let Some(local) = local.filter(|local| local.worker_id == worker) {
             let mut service = local.timer_service.borrow_mut();
             if !service.wheel.has_timers() {
@@ -3609,7 +3648,7 @@ impl<T: Task> Inner<T> {
                 .get(reference.worker)
                 .and_then(|wheel| {
                     let mut wheel = wheel.lock().unwrap();
-                    let canceled = wheel.cancel_at(reference.id, self.clock.now_ms());
+                    let canceled = wheel.cancel_at(reference.id, self.clock.time_left_now_ms());
                     self.apply_link_events(&mut wheel);
                     canceled
                 })
@@ -3622,7 +3661,9 @@ impl<T: Task> Inner<T> {
             // time is measured against the current time.
             let remaining = {
                 let mut service = service.borrow_mut();
-                let canceled = service.wheel.cancel_at(reference.id, self.clock.now_ms());
+                let canceled = service
+                    .wheel
+                    .cancel_at(reference.id, self.clock.time_left_now_ms());
                 self.apply_link_events(&mut service.wheel);
                 canceled.map(|(remaining, _)| remaining)
             };
@@ -3661,7 +3702,7 @@ impl<T: Task> Inner<T> {
         reference: TimerRef,
         cancel: bool,
     ) -> Option<Option<u64>> {
-        let now = self.clock.now_ms();
+        let now = self.clock.time_left_now_ms();
         let mut service = service.borrow_mut();
         Some(if cancel {
             let canceled = service.wheel.cancel_at(reference.id, now);
@@ -3691,7 +3732,7 @@ impl<T: Task> Inner<T> {
                 wheel
                     .lock()
                     .unwrap()
-                    .remaining_at(reference.id, self.clock.now_ms())
+                    .remaining_at(reference.id, self.clock.time_left_now_ms())
             }));
             return;
         }
@@ -3699,7 +3740,7 @@ impl<T: Task> Inner<T> {
             let remaining = service
                 .borrow()
                 .wheel
-                .remaining_at(reference.id, self.clock.now_ms());
+                .remaining_at(reference.id, self.clock.time_left_now_ms());
             callback(remaining);
             return;
         }
@@ -7013,14 +7054,13 @@ fn run_slice<'a, T: Task>(
                 } else if let Some(local) = local.as_deref_mut().filter(|_| worker.is_some()) {
                     // Arm the timeout locally. The wheel insert waits until this
                     // worker is about to park, or until the deadline is due.
-                    let now = inner.clock.now_ms();
                     process
                         .wait_timer
                         .store(WAIT_TIMER_DEFERRED, Ordering::Release);
                     local.pending_waits.push(PendingWait {
                         process: process.clone(),
                         epoch,
-                        deadline_ms: now.saturating_add(ms.max(1)),
+                        deadline_ms: inner.clock.timeout_pos(ms),
                     });
                     if process.run_state().load(Ordering::Acquire) != WAITING
                         || process.wait_epoch.load(Ordering::Acquire) != epoch

@@ -2831,7 +2831,15 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
         Ok(crate::bif_traps::HandlerResult::Done { value, reductions }) => {
             process.set_gc_enabled(gc_was_enabled);
             crate::bif_traps::charge_light(process, reductions);
-            Some(light_value_return(process, registers, entry_top, value))
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:488-523
+            // (post-BIF heap-fragment check), OTP-29.1.1.
+            Some(plain_bif_result(
+                process,
+                registers,
+                export,
+                arity,
+                Ok(value),
+            ))
         }
         other => {
             let mut args = [Term::NIL; 3];

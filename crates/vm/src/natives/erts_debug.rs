@@ -1309,7 +1309,7 @@ fn owned_signed(value: &OwnedTerm) -> Option<i64> {
 }
 
 fn internal_state_tuple_get(
-    vm: &mut Vm,
+    _vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     selector: Term,
@@ -1482,12 +1482,15 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
-                return match remote_relations(vm, ctx, pid)? {
+                return match remote_relations(ctx, pid)? {
                     Some(relations) => internal_link_list_from(process, &relations.links).map(Some),
                     None => Ok(Some(atom("undefined"))),
                 };
             }
-            internal_link_list(process).map(Some)
+            match current_relations(process, ctx)? {
+                Some(relations) => internal_link_list_from(process, &relations.links).map(Some),
+                None => Ok(Some(atom("undefined"))),
+            }
         }
         (
             "monitor_list",
@@ -1500,7 +1503,7 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
-                return match remote_relations(vm, ctx, pid)? {
+                return match remote_relations(ctx, pid)? {
                     Some(relations) => internal_monitor_list_from(
                         process,
                         &relations.monitors,
@@ -1510,7 +1513,15 @@ fn internal_state_tuple_get(
                     None => Ok(Some(atom("undefined"))),
                 };
             }
-            internal_monitor_list(process).map(Some)
+            match current_relations(process, ctx)? {
+                Some(relations) => internal_monitor_list_from(
+                    process,
+                    &relations.monitors,
+                    &relations.monitored_by,
+                )
+                .map(Some),
+                None => Ok(Some(atom("undefined"))),
+            }
         }
         ("channel_number", OwnedTerm::Atom(node)) if node == "nonode@nohost" => {
             Ok(Some(Term::small(0).unwrap()))
@@ -1830,54 +1841,34 @@ fn count_owned_external_identities(
     }
 }
 
-/// Port of erl_bif_info.c:make_link_list for the current process, OTP-29.1.1.
-fn internal_link_list(process: &mut Process) -> Result<Term, VmError> {
-    let links = process
-        .cold
-        .as_ref()
-        .map(|cold| cold.links.iter().copied().collect::<Vec<_>>())
-        .unwrap_or_default();
-    internal_link_list_from(process, &links)
-}
-
 fn internal_link_list_from(
     process: &mut Process,
-    links: &[arinsal_sched::Pid],
+    links: &[(arinsal_sched::Pid, bool)],
 ) -> Result<Term, VmError> {
     let mut records = Vec::with_capacity(links.len());
-    for &pid in links {
+    for &(pid, unlinking) in links {
         let Some(pid_term) = pid.to_term() else {
             continue;
         };
         let id = int(process, pid.number() as usize)?;
+        let state = if unlinking {
+            atom("unlinking")
+        } else {
+            atom("linked")
+        };
         records.push(tuple(
             process,
-            &[
-                atom("erl_link"),
-                atom("process"),
-                pid_term,
-                atom("linked"),
-                id,
-            ],
+            &[atom("erl_link"), atom("process"), pid_term, state, id],
         )?);
     }
     list(process, &records)
 }
 
-/// Port of erl_bif_info.c:make_monitor_list for the current process, OTP-29.1.1.
-fn internal_monitor_list(process: &mut Process) -> Result<Term, VmError> {
-    let Some(cold) = process.cold.as_ref() else {
-        return Ok(Term::NIL);
-    };
-    let relations = Relations::of(cold);
-    internal_monitor_list_from(process, &relations.monitors, &relations.monitored_by)
-}
-
 /// The links and monitors of one process, copied out under its main lock.
 struct Relations {
-    links: Vec<arinsal_sched::Pid>,
+    links: Vec<(arinsal_sched::Pid, bool)>,
     monitors: Vec<(u64, arinsal_sched::Pid, Option<OwnedTerm>)>,
-    monitored_by: Vec<(u64, arinsal_sched::Pid)>,
+    monitored_by: Vec<(u64, arinsal_sched::Pid, Option<OwnedTerm>)>,
 }
 
 impl Relations {
@@ -1891,7 +1882,15 @@ impl Relations {
 
     fn of(cold: &crate::proc_create::ProcessCold) -> Self {
         Self {
-            links: cold.links.iter().copied().collect(),
+            links: cold
+                .links
+                .iter()
+                .copied()
+                .map(|pid| {
+                    let unlinking = cold.unlinking.values().any(|&target| target == pid);
+                    (pid, unlinking)
+                })
+                .collect(),
             monitors: cold
                 .monitors
                 .iter()
@@ -1909,7 +1908,7 @@ impl Relations {
             monitored_by: cold
                 .monitored_by
                 .iter()
-                .map(|(&id, half)| (id, half.origin))
+                .map(|(&id, half)| (id, half.origin, monitor_extra(&half.data)))
                 .collect(),
         }
     }
@@ -1922,18 +1921,22 @@ impl Relations {
 /// until all are handled or it is exiting, then reads the relations. A running target holds
 /// the lock, so the BIF yields and retries where erts waits for it.
 fn remote_relations(
-    vm: &mut Vm,
     ctx: &mut RunCtx<'_, Message>,
     pid: arinsal_sched::Pid,
 ) -> Result<Option<Relations>, VmError> {
     let mut relations = None;
+    let mut signal_error = None;
     let locked = ctx.with_locked_target(pid, &mut |task, target_ctx| {
         let Some(target) = task.downcast_mut::<Process>() else {
             return;
         };
         let exiting = |target: &Process| target.dirty_exiting() || target.exit_cont.is_some();
-        while !exiting(target) && !target.handle_dirty_signals(vm, target_ctx) {}
-        if !exiting(target) {
+        if !exiting(target)
+            && let Err(error) = target.drain(target_ctx)
+        {
+            signal_error = Some(error);
+        }
+        if signal_error.is_none() && !exiting(target) {
             relations = Some(
                 target
                     .cold
@@ -1943,16 +1946,40 @@ fn remote_relations(
         }
     });
     match locked {
-        Ok(()) => Ok(relations),
-        Err(arinsal_sched::SignalFreeError::NoProcess) => Ok(None),
-        Err(arinsal_sched::SignalFreeError::Busy) => Err(VmError::Yield),
+        Ok(()) => {}
+        Err(arinsal_sched::SignalFreeError::NoProcess) => return Ok(None),
+        Err(arinsal_sched::SignalFreeError::Busy) => return Err(VmError::Yield),
     }
+    match signal_error {
+        Some(error) => Err(error),
+        None => Ok(relations),
+    }
+}
+
+/// Fetch and handle the current process's incoming signals before reading its link tree.
+///
+/// Port of erts/emulator/beam/erl_bif_info.c:4650-4668 (`link_list` and `monitor_list`),
+/// OTP-29.1.1: the debug introspection path drains pending signals even for the caller itself.
+fn current_relations(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) -> Result<Option<Relations>, VmError> {
+    let exiting = |target: &Process| target.dirty_exiting() || target.exit_cont.is_some();
+    if !exiting(process) {
+        process.drain(ctx)?;
+    }
+    Ok((!exiting(process)).then(|| {
+        process
+            .cold
+            .as_deref()
+            .map_or_else(Relations::empty, Relations::of)
+    }))
 }
 
 fn internal_monitor_list_from(
     process: &mut Process,
     origins: &[(u64, arinsal_sched::Pid, Option<OwnedTerm>)],
-    targets: &[(u64, arinsal_sched::Pid)],
+    targets: &[(u64, arinsal_sched::Pid, Option<OwnedTerm>)],
 ) -> Result<Term, VmError> {
     let mut records = Vec::with_capacity(origins.len() + targets.len());
     for &(id, pid, ref tag) in origins {
@@ -1960,14 +1987,7 @@ fn internal_monitor_list_from(
             continue;
         };
         let reference = crate::signals::reference(process, id)?;
-        let tag = tag
-            .as_ref()
-            .map(|tag| {
-                from_owned(tag, &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-                    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
-            })
-            .transpose()?
-            .unwrap_or(Term::NIL);
+        let tag = monitor_extra_term(process, tag.as_ref())?;
         records.push(tuple(
             process,
             &[
@@ -1980,11 +2000,12 @@ fn internal_monitor_list_from(
             ],
         )?);
     }
-    for (id, pid) in targets {
+    for (id, pid, extra) in targets {
         let Some(pid) = pid.to_term() else {
             continue;
         };
         let reference = crate::signals::reference(process, *id)?;
+        let extra = monitor_extra_term(process, extra.as_ref())?;
         records.push(tuple(
             process,
             &[
@@ -1993,11 +2014,31 @@ fn internal_monitor_list_from(
                 atom("target"),
                 reference,
                 pid,
-                Term::NIL,
+                extra,
             ],
         )?);
     }
     list(process, &records)
+}
+
+fn monitor_extra(data: &crate::proc_create::MonitorData) -> Option<OwnedTerm> {
+    data.name
+        .clone()
+        .map(OwnedTerm::Atom)
+        .or_else(|| data.tag.clone())
+}
+
+fn monitor_extra_term(process: &mut Process, extra: Option<&OwnedTerm>) -> Result<Term, VmError> {
+    extra
+        .map(|extra| {
+            from_owned(
+                extra,
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            )
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        })
+        .transpose()
+        .map(|extra| extra.unwrap_or(Term::NIL))
 }
 
 /// Port of erts/emulator/beam/erl_bif_info.c:4339-4947, OTP-29.1.1.

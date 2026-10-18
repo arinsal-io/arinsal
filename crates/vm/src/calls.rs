@@ -97,7 +97,8 @@ pub(super) fn gc_after_bif(
     // a successful BIF return roots only the result slot; argument registers are dead.
     if let Ok(value) = result {
         let mut roots = [*value];
-        let stats = process.collect_heap_roots(0, &mut roots, 0)?;
+        let collected = process.collect_heap_roots(0, &mut roots, 0);
+        let stats = collected?;
         *value = roots[0];
         // Port of erl_gc.c:922-932 (`garbage_collect` records scheduler GC statistics), OTP-29.1.1.
         crate::natives::sys::after_collection(process, 0, stats.collections, stats.words_reclaimed);

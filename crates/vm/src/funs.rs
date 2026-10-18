@@ -808,8 +808,7 @@ impl Vm {
             meter.finish(p, ctx.as_deref_mut(), result.reductions());
             return match result {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
-                    p.x[0] = value;
-                    p.collect_bin_vheap_if_due(1)?;
+                    p.x[0] = p.gc_after_bif(value)?;
                     if tail {
                         Ok(match Self::ret(p) {
                             Some(value) => ImportOutcome::Returned(value),
