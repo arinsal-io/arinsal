@@ -5318,36 +5318,63 @@ impl Process {
         via_prio_alias: bool,
         mut seq_token: SendMeta,
     ) -> Result<Term, VmError> {
-        // Size once. The on-heap attempt and the fragment fallback both consume it
-        // (erts_send_message: size_object_litopt, then alloc, then copy_struct_litopt).
-        let literals = arinsal_term::LiteralAreas::current();
-        let words = if value.is_pointer() {
-            arinsal_term::size_object_litopt(value, &literals)
+        // Port of erts/emulator/beam/erl_message.c (erts_send_message), OTP-29.1.1: a process
+        // that sends to itself, with no sequential trace token and an on-heap message queue,
+        // queues the term itself. It is neither sized nor copied, and no reductions are bumped
+        // for its size.
+        let shares_own_term = pid == sender
+            && matches!(seq_token.seq, crate::seq_trace::SeqState::Nil)
+            && self.message_queue_data() == MessageQueueData::OnHeap;
+        let envelope = if shares_own_term {
+            let mut envelope = Message::immediate(value);
+            if via_prio_alias {
+                envelope = envelope.with_priority();
+            }
+            envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
+            envelope.alias = seq_token.alias;
+            envelope
         } else {
-            0
+            // Size once. The on-heap attempt and the fragment fallback both consume it
+            // (erts_send_message: size_object_litopt, then alloc, then copy_struct_litopt).
+            let literals = arinsal_term::LiteralAreas::current();
+            let words = if value.is_pointer() {
+                arinsal_term::size_object_litopt(value, &literals)
+            } else {
+                0
+            };
+            if self.try_send_on_receiver_heap(
+                ctx.as_deref_mut(),
+                sender,
+                pid,
+                CountedSend {
+                    value,
+                    words,
+                    literals: &literals,
+                },
+                via_prio_alias,
+                &mut seq_token,
+            )? {
+                return Ok(value);
+            }
+            let mut envelope = Message::copy_counted(value, words, &literals)?;
+            if via_prio_alias {
+                envelope = envelope.with_priority();
+            }
+            envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
+            envelope.alias = seq_token.alias;
+            envelope
         };
-        if self.try_send_on_receiver_heap(
-            ctx.as_deref_mut(),
-            sender,
-            pid,
-            CountedSend {
-                value,
-                words,
-                literals: &literals,
-            },
-            via_prio_alias,
-            &mut seq_token,
-        )? {
-            return Ok(value);
-        }
-        let mut envelope = Message::copy_counted(value, words, &literals)?;
-        if via_prio_alias {
-            envelope = envelope.with_priority();
-        }
-        envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
-        envelope.alias = seq_token.alias;
         let delivered = match ctx {
-            Some(ctx) => ctx.send(pid, envelope),
+            Some(ctx) => {
+                let shared = shares_own_term && value.is_pointer();
+                let delivered = ctx.send(pid, envelope);
+                // A buffered message names a term on this heap. Publish it before anything
+                // can collect, so the signal queue holds it as a root.
+                if shared {
+                    ctx.flush_pending();
+                }
+                delivered
+            }
             // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message from a BIF called
             // by JIT code, with the scheduler data of the calling scheduler), OTP-29.1.1. A
             // process sending to itself is running: erts_proc_notify_new_message
