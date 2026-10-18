@@ -884,7 +884,7 @@ impl ProcDict {
 }
 /// The traced native functions a return left, innermost first with their trace actions, and the
 /// returned value.
-pub(crate) type NativeReturnEvents = (Vec<(usize, Vec<crate::trace::NativeTraceAction>)>, Term);
+pub(crate) type NativeReturnEvents = crate::trace::PoppedNativeFrames;
 
 /// The data of one local process monitor, shared by its origin and target halves (erts
 /// `ErtsMonitorData`, erl_monitor_link.h). It is immutable after creation, so both halves hold

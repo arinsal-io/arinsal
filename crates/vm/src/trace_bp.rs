@@ -194,115 +194,146 @@ pub(crate) fn release_meta_frame(process: &mut Process, id: u64) {
     }
 }
 
-/// Keeps the call time and call memory counters of one call together for a reader.
-// Port of the idea of erts/emulator/beam/erl_bif_trace.c (trace_info_finisher): erts reads the
-// counters after a code barrier, when no call is half way through its accounting. Here an
-// accounting section counts itself on its scheduler's cell and a reader waits for all cells to
-// drain.
-#[repr(align(64))]
-struct GateCell(std::sync::atomic::AtomicU32);
-
-const GATE_CELLS: usize = 16;
-static GATE: [GateCell; GATE_CELLS] =
-    [const { GateCell(std::sync::atomic::AtomicU32::new(0)) }; GATE_CELLS];
-static GATE_CLOSED: AtomicBool = AtomicBool::new(false);
-static GATE_READER: Mutex<()> = Mutex::new(());
-
-/// An accounting section of a traced call.
-pub(crate) struct AccSection(&'static GateCell);
-
-impl AccSection {
-    pub(crate) fn enter() -> Self {
-        let ix = arinsal_sched::current_normal_scheduler()
-            .map_or(GATE_CELLS - 1, |id| id % (GATE_CELLS - 1));
-        let cell = &GATE[ix];
-        loop {
-            cell.0.fetch_add(1, Ordering::SeqCst);
-            if !GATE_CLOSED.load(Ordering::SeqCst) {
-                return Self(cell);
-            }
-            cell.0.fetch_sub(1, Ordering::SeqCst);
-            while GATE_CLOSED.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-        }
-    }
-}
-
-impl Drop for AccSection {
-    fn drop(&mut self) {
-        self.0.0.fetch_sub(1, Ordering::Release);
-    }
-}
-
-/// Runs `read` while no traced call is half way through its accounting.
-fn quiesced<R>(read: impl FnOnce() -> R) -> R {
-    let _reader = GATE_READER.lock().unwrap();
-    GATE_CLOSED.store(true, Ordering::SeqCst);
-    for cell in &GATE {
-        while cell.0.load(Ordering::SeqCst) != 0 {
-            std::hint::spin_loop();
-        }
-    }
-    let result = read();
-    GATE_CLOSED.store(false, Ordering::SeqCst);
-    result
-}
-
-/// Port of erts/emulator/beam/beam_bp.h:30-40 (bp_pid_timem_bucket_t, BpTimemTrace),
-/// OTP-29.1.1: per-process call count and accumulated time (nanoseconds) or memory (words)
-/// of one function. erts keeps one hash per scheduler to avoid contention; one lock suffices
-/// here.
+/// Port of erts/emulator/beam/beam_bp.h (bp_pid_timem_bucket_t, bp_pid_timem_hash_t,
+/// BpTimemTrace), OTP-29.1.1: per-process call count and accumulated time or memory for one
+/// function, with one bucket hash per normal scheduler and a shared dirty-scheduler hash.
 pub(crate) struct TimemTrace {
-    /// One bucket map per shard of the process table, like erts' hash per scheduler: processes
-    /// running in parallel do not contend on one lock.
-    shards: [Mutex<TimemInner>; TIMEM_SHARDS],
+    shards: Vec<Mutex<TimemInner>>,
 }
 
-const TIMEM_SHARDS: usize = 16;
+#[derive(Clone, Copy)]
+struct TimemBucket {
+    pid: Pid,
+    count: i64,
+    accumulator: i64,
+}
+
+struct TimemHash {
+    buckets: Vec<Option<TimemBucket>>,
+    used: usize,
+}
+
+impl TimemHash {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buckets: vec![None; capacity],
+            used: 0,
+        }
+    }
+
+    fn index(pid: Pid, capacity: usize) -> usize {
+        // An Erlang pid term's low four bits are its tag, so `Pid::data()` is `Eterm >> 4`.
+        pid.data() as usize % capacity
+    }
+
+    fn find(&self, pid: Pid) -> Option<usize> {
+        let mut index = Self::index(pid, self.buckets.len());
+        loop {
+            match self.buckets[index] {
+                Some(bucket) if bucket.pid == pid => return Some(index),
+                None => return None,
+                _ => index = (index + 1) % self.buckets.len(),
+            }
+        }
+    }
+
+    fn put(&mut self, bucket: TimemBucket) {
+        if self.used as f32 / self.buckets.len() as f32 > 0.7_f32 {
+            self.rehash(self.buckets.len() * 2);
+        }
+        let mut index = Self::index(bucket.pid, self.buckets.len());
+        while self.buckets[index].is_some() {
+            index = (index + 1) % self.buckets.len();
+        }
+        self.buckets[index] = Some(bucket);
+        self.used += 1;
+    }
+
+    fn rehash(&mut self, capacity: usize) {
+        let mut buckets = Self::new(capacity);
+        for bucket in self.buckets.iter().flatten().copied() {
+            let mut index = Self::index(bucket.pid, buckets.buckets.len());
+            while buckets.buckets[index].is_some() {
+                index = (index + 1) % buckets.buckets.len();
+            }
+            buckets.buckets[index] = Some(bucket);
+            buckets.used += 1;
+        }
+        *self = buckets;
+    }
+
+    fn accum(&mut self, pid: Pid, count: i64, accumulator: i64) {
+        if self.buckets.is_empty() {
+            *self = Self::new(32);
+        }
+        if let Some(index) = self.find(pid) {
+            let bucket = self.buckets[index].as_mut().unwrap();
+            bucket.count += count;
+            bucket.accumulator += accumulator;
+        } else {
+            self.put(TimemBucket {
+                pid,
+                count,
+                accumulator,
+            });
+        }
+    }
+
+    fn merge_into(&self, merged: &mut HashMap<Pid, (i64, i64), FastHash>) {
+        for bucket in self.buckets.iter().flatten() {
+            let total = merged.entry(bucket.pid).or_default();
+            total.0 += bucket.count;
+            total.1 += bucket.accumulator;
+        }
+    }
+}
 
 struct TimemInner {
-    buckets: HashMap<Pid, (i64, i64), FastHash>,
+    buckets: TimemHash,
+}
+
+impl Default for TimemInner {
+    fn default() -> Self {
+        Self {
+            buckets: TimemHash::new(0),
+        }
+    }
+}
+
+impl TimemInner {
+    fn accum(&mut self, pid: Pid, count: i64, accumulator: i64) {
+        self.buckets.accum(pid, count, accumulator);
+    }
+
+    fn merge_into(&self, merged: &mut HashMap<Pid, (i64, i64), FastHash>) {
+        self.buckets.merge_into(merged);
+    }
 }
 
 impl Default for TimemTrace {
     fn default() -> Self {
+        let normal_schedulers = arinsal_sched::current_normal_scheduler_count()
+            .unwrap_or(1)
+            .max(1);
         Self {
-            shards: std::array::from_fn(|_| {
-                Mutex::new(TimemInner {
-                    buckets: HashMap::default(),
-                })
-            }),
+            shards: (0..=normal_schedulers)
+                .map(|_| Mutex::new(TimemInner::default()))
+                .collect(),
         }
     }
 }
 
 impl TimemTrace {
-    /// The bucket map of the calling scheduler: only that scheduler writes it, so its lock is
-    /// never contended; readers merge all maps.
-    // Port of erts/emulator/beam/beam_bp.c:2392-2408 (acquire_bp_sched_ix: one hash per
-    // scheduler, the dirty schedulers share the last one), OTP-29.1.1.
+    /// The bucket map of the calling scheduler; dirty schedulers share the last map.
+    // Port of erts/emulator/beam/beam_bp.c (acquire_bp_sched_ix, release_bp_sched_ix), OTP-29.1.1.
     fn shard(&self) -> &Mutex<TimemInner> {
-        let ix = arinsal_sched::current_normal_scheduler()
-            .map_or(TIMEM_SHARDS - 1, |id| id % (TIMEM_SHARDS - 1));
+        let ix = arinsal_sched::current_normal_scheduler().unwrap_or(self.shards.len() - 1);
         &self.shards[ix]
     }
 
-    // Port of erts/emulator/beam/beam_bp.c:1990-2008 (bp_hash_accum). Pausing only clears the
-    // ACTIVE flag of the breakpoint data; the trace_pattern code barrier guarantees no call
-    // that saw the flag set is still being counted.
+    // Port of erts/emulator/beam/beam_bp.c (bp_hash_get, bp_hash_put, bp_hash_accum), OTP-29.1.1.
     fn accum(&self, pid: Pid, count: i64, accumulator: i64) {
-        let mut inner = self.shard().lock().unwrap();
-        let bucket = inner.buckets.entry(pid).or_default();
-        bucket.0 += count;
-        bucket.1 += accumulator;
-    }
-
-    // Port of erts/emulator/beam/beam_bp.c:2012-2016 (bp_hash_reset).
-    fn reset(&self) {
-        for shard in &self.shards {
-            shard.lock().unwrap().buckets.clear();
-        }
+        self.shard().lock().unwrap().accum(pid, count, accumulator);
     }
 
     /// `(pid, count, accumulator)` of every process that called the function, the per-scheduler
@@ -312,11 +343,7 @@ impl TimemTrace {
     pub(crate) fn snapshot(&self) -> Vec<(Pid, i64, i64)> {
         let mut merged: HashMap<Pid, (i64, i64), FastHash> = HashMap::default();
         for shard in &self.shards {
-            for (pid, (count, accumulator)) in shard.lock().unwrap().buckets.iter() {
-                let total = merged.entry(*pid).or_default();
-                total.0 += count;
-                total.1 += accumulator;
-            }
+            shard.lock().unwrap().merge_into(&mut merged);
         }
         merged
             .into_iter()
@@ -623,8 +650,9 @@ fn set_function_break(
             bp.flags &= !BPF_TIME_TRACE_ACTIVE;
         } else {
             bp.flags |= BPF_TIME_TRACE_ACTIVE;
-            if let Some(time) = &bp.time {
-                time.reset();
+            if bp.time.is_some() {
+                // Port of bp_hash_reset: a restart installs fresh per-scheduler hashes.
+                bp.time = Some(Arc::new(TimemTrace::default()));
             }
         }
         return;
@@ -633,8 +661,8 @@ fn set_function_break(
             bp.flags &= !BPF_MEM_TRACE_ACTIVE;
         } else {
             bp.flags |= BPF_MEM_TRACE_ACTIVE;
-            if let Some(memory) = &bp.memory {
-                memory.reset();
+            if bp.memory.is_some() {
+                bp.memory = Some(Arc::new(TimemTrace::default()));
             }
         }
         return;
@@ -1182,7 +1210,7 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
 /// What a native trampoline hit did when it needs no trace event: the counters are
 /// incremented and the call time or memory accounted. `actions` are the return frames to push.
 pub(crate) struct NativeBreakpointHit {
-    pub(crate) actions: Vec<crate::trace::NativeTraceAction>,
+    pub(crate) action: Option<crate::trace::NativeTraceAction>,
     pub(crate) arity: u8,
 }
 
@@ -1200,7 +1228,7 @@ pub(crate) fn native_breakpoint_accounting(
 ) -> Option<NativeBreakpointHit> {
     if crate::trace::is_sensitive(process, pid) {
         return Some(NativeBreakpointHit {
-            actions: Vec::new(),
+            action: None,
             arity: 0,
         });
     }
@@ -1245,8 +1273,7 @@ pub(crate) fn native_breakpoint_accounting(
             return None;
         }
     }
-    let _section = AccSection::enter();
-    let mut actions = Vec::new();
+    let mut action = None;
     for (index, bp) in entry.bps.iter().enumerate() {
         let bp_flags = if traced[index] || bp.flags & (BPF_LOCAL_TRACE | acc) == 0 {
             bp.flags
@@ -1265,7 +1292,7 @@ pub(crate) fn native_breakpoint_accounting(
         if bp_flags & BPF_TIME_TRACE_ACTIVE != 0
             && let Some(bdt) = bp.time.as_ref()
         {
-            let time = arinsal_bifs::monotonic_time_nanos() as i64;
+            let time = arinsal_bifs::monotonic_time_raw_nanos();
             prev = trace_call_acc(process, pid, bp.session, false, entry.ci, time, bdt);
         }
         if bp_flags & BPF_MEM_TRACE_ACTIVE != 0
@@ -1286,8 +1313,8 @@ pub(crate) fn native_breakpoint_accounting(
             };
             prev = trace_call_acc(process, pid, bp.session, true, entry.ci, allocated, bdt);
         }
-        if !frame_on_top {
-            actions.push(crate::trace::NativeTraceAction {
+        if !frame_on_top && action.is_none() {
+            action = Some(crate::trace::NativeTraceAction {
                 session: bp.session,
                 return_trace: false,
                 exception_trace: false,
@@ -1299,10 +1326,8 @@ pub(crate) fn native_breakpoint_accounting(
             });
         }
     }
-    // dedupe_return_frames: after the first acc frame the others would sit on a trace frame.
-    actions.truncate(1);
     Some(NativeBreakpointHit {
-        actions,
+        action,
         arity: entry.arity,
     })
 }
@@ -1434,17 +1459,12 @@ pub(crate) fn function_info(
         got = BPF_GLOBAL_TRACE;
     }
     let source = |spec: &Option<Arc<MatchSpec>>| spec.as_deref().map(|spec| spec.source.clone());
-    // Time and memory are read together, between the calls' accounting sections.
-    let (time, memory) = quiesced(|| {
-        (
-            (got & BPF_TIME_TRACE != 0)
-                .then(|| bp.time.as_ref().map(|bdt| bdt.snapshot()))
-                .flatten(),
-            (got & BPF_MEM_TRACE != 0)
-                .then(|| bp.memory.as_ref().map(|bdt| bdt.snapshot()))
-                .flatten(),
-        )
-    });
+    let time = (got & BPF_TIME_TRACE != 0)
+        .then(|| bp.time.as_ref().map(|bdt| bdt.snapshot()))
+        .flatten();
+    let memory = (got & BPF_MEM_TRACE != 0)
+        .then(|| bp.memory.as_ref().map(|bdt| bdt.snapshot()))
+        .flatten();
     FunctionInfo {
         got,
         counters_active: bp.flags
@@ -1947,27 +1967,21 @@ fn timem_break(process: &Process, session: u64, id: u32, memory: bool) -> Option
 /// The call time or memory counters of function `id`, from the session's per-process cache.
 fn cached_timem_break(
     process: &mut Process,
-    session: u64,
+    pbt_index: usize,
     id: u32,
     memory: bool,
 ) -> Option<Arc<TimemTrace>> {
     let epoch = BP_EPOCH.load(Ordering::Acquire);
-    if let Some((cached_id, cached_epoch, bdt)) = pbt_list(process, memory)
-        .iter()
-        .find(|pbt| pbt.session == session)
-        .and_then(|pbt| pbt.cache.as_ref())
+    if let Some((cached_id, cached_epoch, bdt)) =
+        pbt_list(process, memory).get(pbt_index)?.cache.as_ref()
         && *cached_id == id
         && *cached_epoch == epoch
     {
         return Some(bdt.clone());
     }
+    let session = pbt_list(process, memory).get(pbt_index)?.session;
     let found = timem_break(process, session, id, memory)?;
-    if let Some(pbt) = pbt_list(process, memory)
-        .iter_mut()
-        .find(|pbt| pbt.session == session)
-    {
-        pbt.cache = Some((id, epoch, found.clone()));
-    }
+    pbt_list(process, memory).get_mut(pbt_index)?.cache = Some((id, epoch, found.clone()));
     Some(found)
 }
 
@@ -2000,44 +2014,42 @@ pub(crate) fn trace_call_acc(
     accum: i64,
     bdt: &TimemTrace,
 ) -> Option<u32> {
-    let known = pbt_list(process, memory)
+    let pbt_index = if let Some(index) = pbt_list(process, memory)
         .iter()
-        .find(|pbt| pbt.session == session)
-        .map(|pbt| (pbt.ci, pbt.accumulator));
+        .position(|pbt| pbt.session == session)
+    {
+        index
+    } else {
+        pbt_list(process, memory).push(ProcBpTrace {
+            session,
+            ci: None,
+            accumulator: 0,
+            allocated: 0,
+            cache: None,
+        });
+        pbt_list(process, memory).len() - 1
+    };
+    let (previous, accumulator) = {
+        let pbt = &pbt_list(process, memory)[pbt_index];
+        (pbt.ci, pbt.accumulator)
+    };
     let mut counted = false;
-    match known {
-        None => {
-            // First call of the process to an instrumented function.
-            pbt_list(process, memory).push(ProcBpTrace {
-                session,
-                ci: None,
-                accumulator: 0,
-                allocated: 0,
-                cache: None,
-            });
-        }
-        Some((Some(previous), accumulator)) => {
-            // Add time/allocation to the previous code; none if its breakpoint was removed.
-            if let Some(previous_bdt) = cached_timem_break(process, session, previous, memory) {
-                if std::ptr::eq(&*previous_bdt, bdt) {
-                    // Recursion: one bucket update takes the call and the time.
-                    previous_bdt.accum(pid, 1, accum - accumulator);
-                    counted = true;
-                } else {
-                    previous_bdt.accum(pid, 0, accum - accumulator);
-                }
+    if let Some(previous) = previous {
+        // Add time/allocation to the previous code; none if its breakpoint was removed.
+        if let Some(previous_bdt) = cached_timem_break(process, pbt_index, previous, memory) {
+            if std::ptr::eq(&*previous_bdt, bdt) {
+                // Recursion: one bucket update takes the call and the time.
+                previous_bdt.accum(pid, 1, accum - accumulator);
+                counted = true;
+            } else {
+                previous_bdt.accum(pid, 0, accum - accumulator);
             }
         }
-        // The caller is not call_time traced.
-        Some((None, _)) => {}
     }
     if !counted {
         bdt.accum(pid, 1, 0);
     }
-    let pbt = pbt_list(process, memory)
-        .iter_mut()
-        .find(|pbt| pbt.session == session)
-        .expect("pbt exists");
+    let pbt = &mut pbt_list(process, memory)[pbt_index];
     let prev = pbt.ci.replace(ci);
     pbt.accumulator = accum;
     prev
@@ -2053,40 +2065,39 @@ pub(crate) fn call_trace_return(
     bp_flags: u32,
     prev: Option<u32>,
 ) {
-    let _section = AccSection::enter();
     if bp_flags & BPF_TIME_TRACE_ACTIVE != 0 {
-        let found = pbt_list(process, false)
+        let pbt_index = pbt_list(process, false)
             .iter()
-            .find(|pbt| pbt.session == session)
-            .map(|pbt| (pbt.ci, pbt.accumulator));
-        if let Some((ci, accumulator)) = found {
-            let time = arinsal_bifs::monotonic_time_nanos() as i64;
+            .position(|pbt| pbt.session == session);
+        if let Some(pbt_index) = pbt_index {
+            let (ci, accumulator) = {
+                let pbt = &pbt_list(process, false)[pbt_index];
+                (pbt.ci, pbt.accumulator)
+            };
+            let time = arinsal_bifs::monotonic_time_raw_nanos();
             // Might have been removed by trace_pattern(false).
-            if let Some(bdt) = ci.and_then(|ci| cached_timem_break(process, session, ci, false)) {
+            if let Some(bdt) = ci.and_then(|ci| cached_timem_break(process, pbt_index, ci, false)) {
                 bdt.accum(pid, 0, time - accumulator);
             }
-            let pbt = pbt_list(process, false)
-                .iter_mut()
-                .find(|pbt| pbt.session == session)
-                .expect("pbt exists");
+            let pbt = &mut pbt_list(process, false)[pbt_index];
             pbt.ci = prev;
             pbt.accumulator = time;
         }
     }
     if bp_flags & BPF_MEM_TRACE_ACTIVE != 0 {
-        let found = pbt_list(process, true)
+        let pbt_index = pbt_list(process, true)
             .iter()
-            .find(|pbt| pbt.session == session)
-            .map(|pbt| (pbt.ci, pbt.accumulator, pbt.allocated));
-        if let Some((ci, accumulator, allocated)) = found {
+            .position(|pbt| pbt.session == session);
+        if let Some(pbt_index) = pbt_index {
+            let (ci, accumulator, allocated) = {
+                let pbt = &pbt_list(process, true)[pbt_index];
+                (pbt.ci, pbt.accumulator, pbt.allocated)
+            };
             let words = process.allocated_words(allocated);
-            if let Some(bdt) = ci.and_then(|ci| cached_timem_break(process, session, ci, true)) {
+            if let Some(bdt) = ci.and_then(|ci| cached_timem_break(process, pbt_index, ci, true)) {
                 bdt.accum(pid, 0, words - accumulator);
             }
-            let pbt = pbt_list(process, true)
-                .iter_mut()
-                .find(|pbt| pbt.session == session)
-                .expect("pbt exists");
+            let pbt = &mut pbt_list(process, true)[pbt_index];
             pbt.ci = prev;
             pbt.accumulator = words;
         }
@@ -2097,7 +2108,7 @@ pub(crate) fn call_trace_return(
 /// accounting.
 // Port of erts/emulator/beam/beam_bp.c:2017-2073 (erts_schedule_time_break), OTP-29.1.1.
 pub(crate) fn schedule_time_break(process: &mut Process, pid: Pid, out: bool) {
-    let now = arinsal_bifs::monotonic_time_nanos() as i64;
+    let now = arinsal_bifs::monotonic_time_raw_nanos();
     let entries = pbt_list(process, false).clone();
     if out {
         // When a process is scheduled out, add its delta to the previous breakpoint.

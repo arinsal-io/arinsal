@@ -129,8 +129,16 @@ pub fn monotonic_time_milliseconds() -> i128 {
 /// Return the same clock value as `erts_get_monotonic_time`, used by
 /// `erlang:monotonic_time/0` in `erts/emulator/beam/erl_time_sup.c`, OTP-29.1.1.
 pub fn monotonic_time_nanos() -> i128 {
+    -(1_i128 << 59) + i128::from(monotonic_time_raw_nanos())
+}
+
+/// Return OTP's raw internal monotonic clock value for call_time accounting.
+// Port of erts/emulator/beam/beam_bp.c (get_mtime), OTP-29.1.1. On macOS, OTP's
+// ERTS_MONOTONIC unit is nanoseconds; unlike trace timestamps in erl_trace.c, call_time does not
+// convert the value or add the external monotonic offset.
+pub fn monotonic_time_raw_nanos() -> i64 {
     let start = START.get_or_init(Instant::now);
-    -(1_i128 << 59) + start.elapsed().as_nanos() as i128
+    start.elapsed().as_nanos() as i64
 }
 
 fn mono_nanos() -> i128 {

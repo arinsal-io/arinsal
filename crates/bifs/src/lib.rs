@@ -56,7 +56,8 @@ pub use pure::{
     with_iolist_binary_output,
 };
 pub use time::{
-    monotonic_time_milliseconds, monotonic_time_nanos, next_now_micros, time_offset_nanos_value,
+    monotonic_time_milliseconds, monotonic_time_nanos, monotonic_time_raw_nanos, next_now_micros,
+    time_offset_nanos_value,
 };
 pub use unicode::{UnicodeCont, UnicodeStage, UnicodeStep, unicode_resume};
 pub use unique::{
