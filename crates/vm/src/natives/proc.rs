@@ -2291,7 +2291,13 @@ pub(crate) fn fulfill_collect(
     crate::natives::code::code_mod_permission_before_gc(process, ctx.pid());
     let collected = collect_heap(process, major, &mut []);
     crate::natives::code::code_mod_permission_after_gc(process, ctx.pid());
-    collected?;
+    // Port of erts/emulator/beam/erl_process.c (execute_sys_tasks, ERTS_PSTT_GC_MAJOR/MINOR),
+    // OTP-29.1.1: the task is answered even when its collection hit max_heap_size; the kill
+    // takes effect when the process is scheduled out.
+    match collected {
+        Err(VmError::Unsupported(reason)) if reason == "max_heap_size" => {}
+        other => other?,
+    }
     process.heap.begin_detached();
     let reply = request_id
         .decode_into(process)
