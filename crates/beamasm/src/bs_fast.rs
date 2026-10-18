@@ -839,7 +839,7 @@ fn reload_boxed(
 }
 
 /// Calls the installed GC hook. `words` includes `S_RESERVED`, as `emit_test_heap` does.
-/// `keep` is restored afterwards; the frame-pointer slot (`tmp_mem[2]`) is left alone.
+/// `keep` is restored afterwards.
 fn emit_gc_call(
     asm: &mut BeamModuleAssembler,
     live: u32,

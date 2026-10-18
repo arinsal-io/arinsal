@@ -3414,8 +3414,8 @@ fn call_process_bif(
     }
     let arity = usize::from(export.arity);
     // `garbage_collect` moves the heap and rebases the frame pointer. The light
-    // fragment stored the Erlang frame in `tmp_mem[2]` and reloads heap bounds
-    // from the process header on the way out (`RUNTIME_UPDATE`).
+    // fragment reloads heap bounds from the process header on the way out
+    // (`RUNTIME_UPDATE`).
     let collects =
         (bif as usize) == (crate::natives::sys::garbage_collect_bif as *const () as usize);
     if collects {
@@ -4367,9 +4367,18 @@ fn put_single_native(process: &mut crate::Process, key: u64, value: u64, map: u6
         Ok(term) => Some(crate::native_hooks::raw(term)),
         Err(error) => {
             top.commit();
-            Some(map_result(process, Err(error), false, false))
+            put_single_failed(error)
         }
     }
+}
+
+/// `erts_maps_put` asserts that its operand is a map; the compiler guards every single-pair put
+/// with `is_map`, and the shared fragment returns without looking for a pending error.
+// Port of erts/emulator/beam/erl_map.c, erts_maps_put (ASSERT(is_map(map))), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn put_single_failed(error: arinsal_maps::MapError) -> ! {
+    panic!("single-pair map put failed after the is_map guard: {error:?}")
 }
 
 #[inline(always)]
@@ -4454,6 +4463,7 @@ fn map_single_generic<const EXACT: bool>(
             process.header.htop = process.heap.heap_cursor().0;
             0
         }
+        Err(error) if !exact => put_single_failed(error),
         Err(error) => map_result(process, Err(error), exact, false),
     }
 }
