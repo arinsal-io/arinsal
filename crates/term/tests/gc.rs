@@ -531,6 +531,27 @@ fn external_things_move_their_node_reference_through_collections() {
 }
 
 #[test]
+fn live_binary_keeps_one_reference_per_binref_through_collections() {
+    let mut heap = ProcessHeap::with_words(256);
+    let binary = TermBuilder::new(&mut heap).binary(&[7; 100]).unwrap();
+    let Some(BinaryOwner::Binary(token)) = binary_owner(binary) else {
+        panic!("a 100 byte binary is reference counted");
+    };
+    // The BinRef and the token.
+    assert_eq!(token.ref_count(), Some(2));
+    let mut roots = [binary];
+    heap.collect(&mut roots, &mut [], 0).unwrap();
+    assert_eq!(token.ref_count(), Some(2));
+    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.set_fullsweep_after(0);
+    heap.collect(&mut roots, &mut [], 0).unwrap();
+    assert_eq!(token.ref_count(), Some(2));
+    assert_eq!(heap.off_heap_count(), 1);
+    heap.collect(&mut [], &mut [], 0).unwrap();
+    assert_eq!(token.ref_count(), Some(1));
+}
+
+#[test]
 fn owner_arcs_are_released_when_unreachable() {
     let mut heap = ProcessHeap::with_words(256);
     let module = global_atoms().intern("gc_owner_module").unwrap();
