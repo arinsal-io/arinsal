@@ -93,11 +93,11 @@ fn gc_rebases_message_binary_chains_before_releasing_fragments() {
     let expected = to_owned(message).unwrap();
 
     let mut receiver = ProcessHeap::with_words(256);
-    let mut messages = [(message, Some(message_heap))];
+    let mut messages = [(message, Term::NIL, Some(message_heap))];
     receiver
         .collect_with_messages(&mut [], &mut [], 0, &mut messages)
         .unwrap();
-    assert!(messages[0].1.is_none());
+    assert!(messages[0].2.is_none());
     assert_eq!(receiver.off_heap_count(), 1);
     assert_eq!(to_owned(messages[0].0).unwrap(), expected);
 

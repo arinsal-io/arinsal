@@ -19,10 +19,7 @@ worker(Parent, Kind) ->
     {_, Before} = lists:keyfind(minor_gcs, 1, element(2, process_info(self(), garbage_collection))),
     Value = workload(Kind),
     {_, After} = lists:keyfind(minor_gcs, 1, element(2, process_info(self(), garbage_collection))),
-    Info = case Kind of
-        7 -> process_info(self(), [message_queue_len, message_queue_data]);
-        _ -> {After - Before, process_info(self(), [heap_size, total_heap_size, message_queue_len, message_queue_data])}
-    end,
+    Info = {After - Before, process_info(self(), [heap_size, total_heap_size, message_queue_len, message_queue_data])},
     Parent ! {result, self(), {Value, Info}}.
 
 workload(0) -> loop_immediate(100000, 0);
@@ -131,6 +128,14 @@ fn self_send_matches_otp() {
     reference.load(MODULE, &beam).expect("load self send probe");
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).expect("load probe into Arinsal");
+
+    // The first use of seq_trace in the reference node loads code and allocates on the
+    // calling heap, so its GC counts are only deterministic after a warm-up run. Both sides
+    // run the warm-up so they stay symmetric.
+    let warm_up = Term::small(7).expect("workload id");
+    let _ = reference.call(MODULE, "run", &[OwnedTerm::Int(7)]);
+    vm.eval_scheduled(MODULE, "run", &[warm_up], 1, None)
+        .expect("Arinsal seq trace warm-up");
 
     for (kind, name) in KINDS {
         let expected = match reference.call(MODULE, "run", &[OwnedTerm::Int(kind)]) {

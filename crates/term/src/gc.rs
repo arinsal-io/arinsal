@@ -1237,7 +1237,9 @@ impl ProcessHeap {
     /// holds the queued messages whose data is still in their own heap fragment
     /// (`ErtsMessage` with `data.attached`). Their size counts as young-generation usage,
     /// and after copying they are moved onto the new heap; each moved entry's heap
-    /// becomes `None` and its term points into this heap.
+    /// becomes `None` and its term points into this heap. The second element of an
+    /// entry is the sequential trace token copied into the same fragment (`NIL` when
+    /// there is none); it moves with the fragment like the message term.
     // Port of erts/emulator/beam/erl_gc.c:606-644 (young_gen_usage, FS_ON_HEAP_MSGQ) and
     // erl_gc.c:1500-1501, 1947-1948 (move_msgs_to_heap after do_minor/do_major), OTP-29.1.1.
     pub fn collect_with_messages(
@@ -1245,14 +1247,14 @@ impl ProcessHeap {
         roots: &mut [Term],
         extra: &mut [Term],
         min_free: usize,
-        messages: &mut [(Term, Option<ProcessHeap>)],
+        messages: &mut [(Term, Term, Option<ProcessHeap>)],
     ) -> Result<GcStats, TermError> {
         // Port of erl_gc.c:803-804: the clock is read only for long_gc monitoring.
         // Microstate accounting uses the same sample (`ERTS_MSACC_IS_ENABLED`).
         let start = gc_clock_active().then(Instant::now);
         let message_words = messages
             .iter()
-            .filter_map(|(_, heap)| heap.as_ref())
+            .filter_map(|(_, _, heap)| heap.as_ref())
             .map(ProcessHeap::message_data_size)
             .fold(0usize, usize::saturating_add);
         let abandoned = self.abandoned_heap();
@@ -1469,11 +1471,13 @@ impl ProcessHeap {
             self.move_msgs_to_heap(messages)?;
             // erts resize_new_heap offsets the on-heap queue with the rest of the root set.
             let mut moved = extra.to_vec();
-            moved.extend(messages.iter().map(|(term, _)| *term));
+            moved.extend(messages.iter().flat_map(|(term, token, _)| [*term, *token]));
             let adjusted = self.adjust_young_heap(major, min_free, roots, &mut moved)?;
             extra.copy_from_slice(&moved[..extra.len()]);
-            for ((term, _), &updated) in messages.iter_mut().zip(&moved[extra.len()..]) {
-                *term = updated;
+            let (updated_pairs, _) = moved[extra.len()..].as_chunks::<2>();
+            for ((term, token, _), updated) in messages.iter_mut().zip(updated_pairs) {
+                *term = updated[0];
+                *token = updated[1];
             }
             adjusted
         };
@@ -1616,10 +1620,10 @@ impl ProcessHeap {
     // copy.c:2049 (erts_move_multi_frags), OTP-29.1.1.
     fn move_msgs_to_heap(
         &mut self,
-        messages: &mut [(Term, Option<ProcessHeap>)],
+        messages: &mut [(Term, Term, Option<ProcessHeap>)],
     ) -> Result<(), TermError> {
         let pre_overhead = self.bin_vheap;
-        for (term, slot) in messages.iter_mut() {
+        for (term, token, slot) in messages.iter_mut() {
             let Some(mut fragment) = slot.take() else {
                 continue;
             };
@@ -1656,6 +1660,7 @@ impl ProcessHeap {
             for range in &ranges {
                 offset_young_objects(base, words, range.old_start, range.old_end, range.new_start);
                 term.0 = offset_word(term.0, *range);
+                token.0 = offset_word(token.0, *range);
             }
             // The message heap is released after this loop. Its BinRef nodes live in
             // the copied blocks too, so move both intrusive lists before adopting them.
