@@ -173,9 +173,53 @@ impl Resource {
         if let Some(magic) = slot.upgrade() {
             return magic;
         }
-        let magic = MagicRef::new(Arc::clone(self));
+        let magic = MagicRef::with_orig_size(Arc::clone(self), self.magic_orig_size());
         *slot = Arc::downgrade(&magic);
         magic
+    }
+
+    /// `mb->orig_size` of the magic binary `enif_alloc_resource` creates for this resource:
+    /// the unaligned magic data offset plus `offsetof(ErtsResource, data)` and the user data,
+    /// followed by an aligned `ErtsResourceMonitors` when the type has a `down` callback.
+    // Port of erts/emulator/beam/erl_nif.c (enif_alloc_resource) and erl_binary.h
+    // (erts_create_magic_binary_x, ERTS_MAGIC_BIN_UNALIGNED_ORIG_SIZE), OTP-29.1.1, 64-bit.
+    fn magic_orig_size(&self) -> usize {
+        resource_magic_orig_size(self.size, self.kind.callbacks().down.is_some())
+    }
+}
+
+/// `mb->orig_size` for a resource of `size` user bytes, with the monitors block that a type
+/// with a `down` callback adds after the user data.
+pub(crate) fn resource_magic_orig_size(size: usize, has_down: bool) -> usize {
+    // offsetof(ErtsMagicBinary, u.unaligned.data) - offsetof(Binary, orig_bytes).
+    const MAGIC_DATA_OFFSET: usize = 24;
+    // offsetof(ErtsResource, data): the `type` and `monitors` pointers.
+    const RESOURCE_DATA_OFFSET: usize = 16;
+    // sizeof(ErtsResourceMonitors): erts_mtx_t (a 64-byte pthread mutex on the reference
+    // macOS arm64 host), `root`, `refc` and `user_data_sz`.
+    const MONITORS_SIZE: usize = 64 + 3 * 8;
+    // ERTS_ALLOC_ALIGN_BYTES
+    const ALLOC_ALIGN: usize = 8;
+    let base = MAGIC_DATA_OFFSET + RESOURCE_DATA_OFFSET;
+    if has_down {
+        base + size.next_multiple_of(ALLOC_ALIGN) + MONITORS_SIZE
+    } else {
+        base + size
+    }
+}
+
+#[cfg(test)]
+mod orig_size_tests {
+    use super::resource_magic_orig_size;
+
+    #[test]
+    fn orig_size_follows_enif_alloc_resource() {
+        // 24 magic data offset + 16 ErtsResource head + user data.
+        assert_eq!(resource_magic_orig_size(4, false), 44);
+        assert_eq!(resource_magic_orig_size(0, false), 40);
+        // The monitors block follows the user data rounded up to 8 bytes.
+        assert_eq!(resource_magic_orig_size(4, true), 40 + 8 + 88);
+        assert_eq!(resource_magic_orig_size(16, true), 40 + 16 + 88);
     }
 }
 fn from_reference(reference: Term) -> Option<Arc<Resource>> {
