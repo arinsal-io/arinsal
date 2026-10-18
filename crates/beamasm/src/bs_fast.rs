@@ -320,13 +320,7 @@ fn emit_private(
         e.mov_const(Gpr::x(3), plan.extra_bits)
     })?;
     crate::emit_enter_runtime(&mut asm.code, live as usize, update)?;
-    asm.code.emit(|e| {
-        e.mov_const(
-            Gpr::x(17),
-            PRIVATE_APPEND_FAST.load(Ordering::Relaxed) as u64,
-        )?;
-        e.blr(Gpr::x(17))
-    })?;
+    asm.fragment_call(PRIVATE_APPEND_FAST.load(Ordering::Relaxed))?;
     crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
     // `u64::MAX` is the grow sentinel from the leaf. The reallocating entry is
     // off the byte loop (instr_bs.cpp calls one function; the leaf split keeps
@@ -389,13 +383,7 @@ fn emit_private(
             e.mov_const(Gpr::x(3), extra_bits)
         })?;
         crate::emit_enter_runtime(&mut asm.code, live as usize, update)?;
-        asm.code.emit(|e| {
-            e.mov_const(
-                Gpr::x(17),
-                PRIVATE_APPEND_CHECKED.load(Ordering::Relaxed) as u64,
-            )?;
-            e.blr(Gpr::x(17))
-        })?;
+        asm.fragment_call(PRIVATE_APPEND_CHECKED.load(Ordering::Relaxed))?;
         crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
         asm.code.cbz(Gpr::x(0), slow)?;
         asm.code.b(store)?;
@@ -749,13 +737,10 @@ fn emit_append_binary(
         e.mov_reg(Gpr::x(0), C_P)?;
         e.mov_const(Gpr::x(1), u64::from(src))?;
         e.mov_const(Gpr::x(2), u64::from(extra))?;
-        e.mov_const(Gpr::x(3), u64::from(roots))?;
-        e.mov_const(Gpr::x(17), function as u64)?;
-        e.str_uoff(Gpr::x(30), C_P, 72)?;
-        e.blr(Gpr::x(17))
+        e.mov_const(Gpr::x(3), u64::from(roots))
     })?;
+    asm.fragment_call(function)?;
     crate::emit_leave_runtime(&mut asm.code, roots as usize, update)?;
-    asm.code.emit(|e| e.ldr_uoff(Gpr::x(30), C_P, 72))?;
     asm.code.cbz(Gpr::x(0), slow)?;
     asm.store_register(dst, Gpr::x(0))?;
     asm.code.bind(done)?;
@@ -876,15 +861,13 @@ fn emit_gc_call(
     let update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
     crate::emit_enter_runtime(&mut asm.code, live as usize, update)?;
     asm.code.emit(|e| {
-        e.str_uoff(Gpr::x(30), C_P, 72)?;
         e.mov_reg(Gpr::x(0), C_P)?;
         e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
         e.ldr_uoff(Gpr::x(2), SCHEDULER_REGS, tmp_at(3))?;
         e.mov_const(Gpr::x(3), u64::from(live))?;
-        e.mov_reg(Gpr::w(4), Gpr::w(22))?;
-        e.mov_const(Gpr::x(17), hook as u64)?;
-        e.blr(Gpr::x(17))
+        e.mov_reg(Gpr::w(4), Gpr::w(22))
     })?;
+    asm.fragment_call(hook)?;
     // The word count lived in tmp_mem[3], which the native-return bridge treats
     // as a handoff marker. A leftover count would be consumed as that marker.
     asm.code
@@ -892,7 +875,6 @@ fn emit_gc_call(
     crate::emit_leave_runtime(&mut asm.code, live as usize, update)?;
     asm.code.emit(|e| {
         e.sub_reg(Gpr::w(22), Gpr::w(22), Gpr::w(0), Shift::Lsl, 0)?;
-        e.ldr_uoff(Gpr::x(30), C_P, 72)?;
         e.ldr_uoff(Gpr::x(9), C_P, 40)
     })?;
     asm.error_if_nonzero(Gpr::x(9))?;
