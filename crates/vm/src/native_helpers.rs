@@ -3003,7 +3003,12 @@ fn call_direct_bif(
         registers.x_reg_array[2],
         registers.x_reg_array[3],
     ];
-    let value = direct(process, &args[..arity])?;
+    let value = direct(
+        process,
+        &args[..arity],
+        export.module_atom,
+        export.function_atom,
+    )?;
     process.reductions = process.header.fcalls;
     if export_call {
         charge_bif_reductions(process, 1);
@@ -3840,7 +3845,8 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // writes `stop` only at `found_catch`), OTP-29.1.1. Resolve the catch once before saving
     // the trace; a miss or a caller catch remains with the scheduler's unwind.
     let raising_pc = registers.tmp_mem[6] as usize;
-    let Some(found) = crate::native_bridge::current_native_catch(process, raising_pc) else {
+    let found = crate::native_bridge::current_native_catch(process, raising_pc);
+    let Some(found) = found else {
         process.sync_native_header();
         return 0;
     };
@@ -3868,6 +3874,28 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // Port of beam_common.c:880-925 (`save_stacktrace`), OTP-29.1.1: `pc` stays raw
     // until `build_stacktrace` resolves it against the active native ranges table.
     let native_pc = (raising_pc != 0).then_some(raising_pc);
+    let top = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.native_trap.as_ref())
+        .filter(|native_trap| {
+            native_trap.freason == process.header.freason
+                && native_trap.fvalue == process.header.fvalue
+        })
+        .and_then(|native_trap| match native_trap.trap.top.as_ref() {
+            Some(crate::stacktrace::TopFrame::BifRegisters {
+                module,
+                function,
+                arity,
+                info,
+            }) => Some(crate::stacktrace::TopFrame::BifRegisters {
+                module: *module,
+                function: *function,
+                arity: *arity,
+                info: *info,
+            }),
+            _ => None,
+        });
     // `erlang:raise/3` already built the list the catch must see (`bif.c:1643`).
     // A native walk would name `eval_external_handler` instead of that list.
     let trace = if let Some(trace) = take_explicit_raise(process) {
@@ -3877,7 +3905,13 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         };
         trace
     } else {
-        let Ok(trace) = crate::stacktrace::save_lazy(process, class, native_pc) else {
+        let Ok(trace) = crate::stacktrace::save_lazy(
+            process,
+            class,
+            native_pc,
+            top.as_ref(),
+            &registers.x_reg_array,
+        ) else {
             process.sync_native_header();
             return 0;
         };

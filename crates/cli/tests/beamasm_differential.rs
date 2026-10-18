@@ -16,6 +16,7 @@ const MODULES: &[&str] = &[
     "beamasm_map_elements",
     "beamasm_map_callee",
     "beamasm_caught_bif_error",
+    "beamasm_exceptions",
 ];
 
 /// OTP modules compiled natively alongside a fixture, for fixtures that exercise them.
