@@ -3695,6 +3695,25 @@ pub(crate) fn timeout_event(
     );
 }
 
+/// Whether a send from `process` can skip every trace hook: no trace entry was ever published
+/// for it, it carries no sequential trace token and it does not save calls. The three are
+/// read once, like `ERTS_TRACE_FLAGS(c_p)` and `have_seqtrace(token)` in `erts_send_message`.
+/// A process without a signal probe (not scheduled yet) reports false.
+// Port of erts/emulator/beam/erl_message.c (erts_send_message: the trace flags and the seq
+// trace token are tested before any send trace work), OTP-29.1.1. The trace bit is sticky, as
+// `note_trace_owner` only ever sets it, so false only means a hook may apply.
+#[inline(always)]
+pub(crate) fn send_hooks_idle(process: &Process) -> bool {
+    process.seq_trace_token.is_none()
+        && process.cold.as_deref().is_some_and(|cold| {
+            cold.saved_calls.is_none()
+                && cold.signal_probe.as_ref().is_some_and(|probe| {
+                    probe.proc_flags().load(Ordering::Relaxed) & arinsal_sched::proc_flags::TRACE
+                        == 0
+                })
+        })
+}
+
 /// Whether `process` has send tracing on: its sends then need the scheduler context that
 /// send trace patterns are evaluated with.
 pub(crate) fn traces_sends(process: &Process) -> bool {

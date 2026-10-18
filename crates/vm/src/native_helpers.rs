@@ -1114,12 +1114,15 @@ fn dispatch_native_send(
     // once inside the send; a port name comes back here to be redone by the scheduler.
     let target = registers.x_reg_array[0];
     let message = registers.x_reg_array[1];
-    let result = if crate::trace::traces_sends(process) || target.as_port().is_some() {
+    let idle = crate::trace::send_hooks_idle(process);
+    let result = if (!idle && crate::trace::traces_sends(process)) || target.as_port().is_some() {
         Err(crate::VmError::Unsupported(
             crate::process::REMOTE_SEND_NEEDS_CONTEXT.into(),
         ))
     } else if target.as_atom().is_some() {
         process.send_message_native(target, message)
+    } else if idle && let Some(pid) = arinsal_sched::Pid::from_term(target) {
+        process.send_to_pid_idle(pid, message)
     } else {
         process.send_message(target, message)
     };
@@ -1127,7 +1130,7 @@ fn dispatch_native_send(
         Ok(value) => {
             // Port of erts/emulator/beam/bif.c:2451-2452 (erl_send: save_calls(p, &exp_send)),
             // OTP-29.1.1.
-            if crate::trace::saves_calls(process) {
+            if !idle && crate::trace::saves_calls(process) {
                 crate::trace::save_call(process, crate::trace::SavedCall::Send);
             }
             let raw = crate::native_hooks::raw(value);
