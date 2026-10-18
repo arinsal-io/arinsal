@@ -416,11 +416,17 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "decode_packet" && arity == 3 {
         return Some(misc::decode_packet_light);
     }
-    if module == "erlang" && function == "monitor" && arity == 2 {
+    if module == "erlang" && function == "monitor" && (arity == 2 || arity == 3) {
         return Some(crate::signals::monitor_light);
     }
     if module == "erlang" && function == "demonitor" && (arity == 1 || arity == 2) {
         return Some(crate::signals::demonitor_light);
+    }
+    if module == "erlang" && function == "alias" && arity == 1 {
+        return Some(crate::signals::alias_light);
+    }
+    if module == "erlang" && function == "unalias" && arity == 1 {
+        return Some(crate::signals::unalias_light);
     }
     if module == "erlang" && function == "link" && arity == 1 {
         return Some(crate::signals::link_light);

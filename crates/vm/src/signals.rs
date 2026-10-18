@@ -2032,14 +2032,24 @@ pub(crate) fn monitor_light(
     process: &mut Process,
     args: &[Term],
 ) -> Option<Result<Term, crate::exceptions::Trap>> {
-    let [kind, target] = args else {
-        return None;
+    // `monitor/3` with `{alias, Mode}` is what `gen:call` and every `gen_server:call` with a
+    // timeout issue; a custom tag or `priority` takes the executor.
+    let (kind, target, alias) = match args {
+        [kind, target] => (*kind, *target, false),
+        [kind, target, _] => {
+            let (tag, alias, priority) = monitor_options(args).ok()?;
+            if tag != atom("DOWN") || priority {
+                return None;
+            }
+            (*kind, *target, alias)
+        }
+        _ => return None,
     };
-    if *kind != atom("process") || crate::trace::active() {
+    if kind != atom("process") || crate::trace::active() {
         return None;
     }
     let me = process.self_pid?;
-    let pid = Pid::from_term(*target)?;
+    let pid = Pid::from_term(target)?;
     if pid == me {
         return None;
     }
@@ -2057,6 +2067,11 @@ pub(crate) fn monitor_light(
             data: data.clone(),
         },
     );
+    if alias {
+        // Bound before the signal leaves: the target may reply through the alias at once.
+        process.cold_mut().aliases.insert(id);
+        rt.alias_bind_prio(id, Some(me), false);
+    }
     if rt
         .scheduler()
         .ok()?
@@ -2071,9 +2086,71 @@ pub(crate) fn monitor_light(
         .is_err()
     {
         process.cold_mut().monitors.remove(&id);
+        if alias {
+            process.cold_mut().aliases.remove(&id);
+            rt.alias_bind(id, None);
+        }
         return None;
     }
     Some(Ok(ref_term))
+}
+
+/// `alias/1` called directly from native code. An unknown option takes the executor, which raises
+/// `badarg`.
+// Port of erts/emulator/beam/bif.c (alias_1), OTP-29.1.1.
+pub(crate) fn alias_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [options] = args else {
+        return None;
+    };
+    let (explicit_unalias, reply, priority_atom) =
+        (atom("explicit_unalias"), atom("reply"), atom("priority"));
+    let (mut reply_once, mut priority) = (false, false);
+    let mut bad = false;
+    each_list_item(*options, |option| {
+        if option == reply {
+            reply_once = true;
+        } else if option == priority_atom {
+            priority = true;
+        } else if option != explicit_unalias {
+            bad = true;
+        }
+    })?;
+    if bad {
+        return None;
+    }
+    let me = process.self_pid?;
+    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
+    let id = rt.next_ref();
+    let reference = reference(process, id).ok()?;
+    rt.alias_bind_prio(id, Some(me), priority);
+    if reply_once {
+        process.cold_mut().once_aliases.insert(id);
+    }
+    process.cold_mut().aliases.insert(id);
+    Some(Ok(reference))
+}
+
+/// `unalias/1` called directly from native code.
+// Port of erts/emulator/beam/bif.c (unalias_1), OTP-29.1.1.
+pub(crate) fn unalias_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [reference] = args else {
+        return None;
+    };
+    let id = ref_id(*reference)?;
+    let owned = process
+        .cold
+        .as_mut()
+        .is_some_and(|cold| cold.aliases.remove(&id));
+    if owned && let Some(runtime) = &process.runtime {
+        runtime.alias_bind(id, None);
+    }
+    Some(Ok(atom(if owned { "true" } else { "false" })))
 }
 
 /// `demonitor(Ref)` / `demonitor(Ref, Opts)` called directly from native code (erts bif.c:437-454
@@ -2095,12 +2172,10 @@ pub(crate) fn demonitor_light(
     let (flush, info) = demonitor_flags(options)?;
     let id = ref_id(reference)?;
     let cold = process.cold.as_ref()?;
-    if cold.aliases.contains(&id)
-        || cold.dist_monitors.contains(&id)
-        || cold.port_monitors.contains_key(&id)
-    {
+    if cold.dist_monitors.contains(&id) || cold.port_monitors.contains_key(&id) {
         return None;
     }
+    let alias_active = cold.aliases.contains(&id);
     let active = cold.monitors.get(&id).map(|half| half.target);
     if active.is_none() && flush {
         return None;
@@ -2108,6 +2183,11 @@ pub(crate) fn demonitor_light(
     let me = process.self_pid?;
     let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
     let scheduler = rt.scheduler().ok()?;
+    if alias_active {
+        // `demonitor` deactivates the alias of a `{alias, demonitor}` monitor.
+        process.cold_mut().aliases.remove(&id);
+        rt.alias_bind(id, None);
+    }
     let result = if let Some(pid) = active {
         process.cold_mut().monitors.remove(&id);
         // erts consumes the held process monitor instead of sending the demonitor when it can
