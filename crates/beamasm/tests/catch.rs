@@ -397,8 +397,10 @@ fn native_build_stacktrace() {
     }
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.move_(ArgVal::Immediate(9), ArgVal::X(0)).unwrap();
     asm.emit_build_stacktrace(build).unwrap();
+    asm.emit_leave_frame().unwrap();
     finish(&mut asm);
     let (_, _, regs, _) = execute(asm, 1);
     assert_eq!(
