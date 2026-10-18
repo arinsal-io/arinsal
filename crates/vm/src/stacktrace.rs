@@ -120,8 +120,8 @@ impl HeapAlloc for TraceHeap<'_> {
         true
     }
 
-    fn retain_node(&mut self, node: Arc<Node>) {
-        HeapAlloc::retain_node(self.heap, node);
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+        HeapAlloc::link_node(self.heap, thing, node);
     }
 
     fn retain_fun(&mut self, entry: Arc<FunEntry>) {

@@ -337,8 +337,10 @@ pub trait HeapAlloc {
     fn supports_external_binary(&self) -> bool {
         false
     }
-    /// Keep a node-table entry alive for external identities.
-    fn retain_node(&mut self, node: Arc<Node>);
+    /// Link an external pid, port or reference thing into this heap's off-heap list. The
+    /// thing's node word names `node`, and the list entry takes over the counted reference.
+    // Port of erts/emulator/beam/external.c (erts_ref_node_entry with `ohp->first`), OTP-29.1.1.
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>);
     /// Retain a local fun entry.
     fn retain_fun(&mut self, entry: Arc<FunEntry>);
     /// Retain an export entry.
@@ -421,8 +423,8 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
     fn supports_external_binary(&self) -> bool {
         (**self).supports_external_binary()
     }
-    fn retain_node(&mut self, node: Arc<Node>) {
-        (**self).retain_node(node)
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+        (**self).link_node(thing, node)
     }
     fn retain_fun(&mut self, entry: Arc<FunEntry>) {
         (**self).retain_fun(entry)
@@ -465,15 +467,45 @@ pub(crate) fn load(ptr: *const u64) -> u64 {
     unsafe { *ptr }
 }
 
-/// Whether an off-heap list node is a magic reference thing (the list also holds BinRefs).
-/// A forwarded node keeps its type in the header of its copy.
+/// What an off-heap list node is: erts' list holds refc/writable binaries, magic references
+/// and external things alike, told apart by the thing word.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OffHeapKind {
+    /// A `BinRef` (`ProcBin`).
+    BinRef,
+    /// A magic reference thing (`ErtsMRefThing`).
+    Magic,
+    /// An external pid, port or reference thing (`ExternalThing`).
+    Node,
+}
+
+/// The kind of an off-heap list node. A forwarded node keeps its type in the header of its copy.
 #[inline]
-pub(crate) fn off_heap_node_is_magic(node: usize) -> bool {
+pub(crate) fn off_heap_node_kind(node: usize) -> OffHeapKind {
     let mut header = load(node as *const u64);
     if header & 3 == 2 {
         header = load((header & !3) as *const u64);
     }
-    header & 63 == crate::REF
+    match header & 63 {
+        crate::REF => OffHeapKind::Magic,
+        BIN_REF => OffHeapKind::BinRef,
+        _ => OffHeapKind::Node,
+    }
+}
+
+/// Whether an off-heap list node is a `BinRef`.
+#[inline]
+pub(crate) fn off_heap_node_is_bin_ref(node: usize) -> bool {
+    off_heap_node_kind(node) == OffHeapKind::BinRef
+}
+
+/// Link an external thing at the head of an off-heap list, which takes over `node`'s counted
+/// reference. External things add nothing to the list's overhead.
+// Port of erts/emulator/beam/external.c (erts_ref_node_entry; `ohp->first = ...`), OTP-29.1.1.
+pub(crate) fn link_node_thing(head: &mut usize, thing: *mut u64, node: Arc<Node>) {
+    store(thing.wrapping_add(1), Arc::into_raw(node) as u64);
+    store(thing.wrapping_add(2), *head as u64);
+    *head = thing as usize;
 }
 
 /// Link a magic reference thing at the head of an off-heap list, which takes over `owner`'s
@@ -826,8 +858,8 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
         self.heap
             .update_writable_binary_overhead(source, old_size_bits, new_size_bits)
     }
-    fn retain_node(&mut self, node: Arc<Node>) {
-        self.heap.retain_node(node)
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+        self.heap.link_node(thing, node)
     }
     fn retain_fun(&mut self, entry: Arc<FunEntry>) {
         self.heap.retain_fun(entry)
@@ -931,11 +963,9 @@ pub(crate) struct HeapOwners {
     pub(crate) wrt_bins: usize,
     pub(crate) overhead: u64,
     pub(crate) external: Vec<Arc<ExternalBinary>>,
-    pub(crate) nodes: Vec<Arc<Node>>,
     pub(crate) funs: Vec<Arc<FunEntry>>,
     pub(crate) exports: Vec<Arc<ExportEntry>>,
     pub(crate) old_external: Vec<Arc<ExternalBinary>>,
-    pub(crate) old_nodes: Vec<Arc<Node>>,
     pub(crate) old_funs: Vec<Arc<FunEntry>>,
     pub(crate) old_exports: Vec<Arc<ExportEntry>>,
     /// Heap that receives all allocations while the heap is detached.
@@ -1001,7 +1031,6 @@ impl LazyOwners {
             || owners.vheap.old != 0
             || owners.vheap.old_size != 46_422
             || !owners.old_external.is_empty()
-            || !owners.old_nodes.is_empty()
             || !owners.old_funs.is_empty()
             || !owners.old_exports.is_empty()
     }
@@ -1610,11 +1639,9 @@ impl ProcessHeap {
                 Self::prepend_bin_ref_chain(&mut target.wrt_bins, owners.wrt_bins);
                 target.overhead = target.overhead.saturating_add(owners.overhead);
                 target.external.append(&mut owners.external);
-                target.nodes.append(&mut owners.nodes);
                 target.funs.append(&mut owners.funs);
                 target.exports.append(&mut owners.exports);
                 target.old_external.append(&mut owners.old_external);
-                target.old_nodes.append(&mut owners.old_nodes);
                 target.old_funs.append(&mut owners.old_funs);
                 target.old_exports.append(&mut owners.old_exports);
             } else {
@@ -1649,7 +1676,7 @@ impl ProcessHeap {
     fn bin_ref_chain_count(mut head: usize) -> usize {
         let mut count = 0;
         while head != 0 {
-            count += usize::from(!off_heap_node_is_magic(head));
+            count += usize::from(off_heap_node_is_bin_ref(head));
             head = load((head as *const u64).wrapping_add(2)) as usize;
         }
         count
@@ -1660,7 +1687,7 @@ impl ProcessHeap {
         let mut bytes = 0u64;
         let mut head = self.owners.off_heap_first;
         while head != 0 {
-            if !off_heap_node_is_magic(head) {
+            if off_heap_node_is_bin_ref(head) {
                 let header = load((head as *const u64).wrapping_add(1)) as *const u64;
                 bytes = bytes.saturating_add(load(header.wrapping_add(3)));
             }
@@ -1686,7 +1713,7 @@ impl ProcessHeap {
         for mut head in [o.off_heap_first, o.wrt_bins] {
             while head != 0 {
                 let bin_ref = head as *const u64;
-                if !off_heap_node_is_magic(head) {
+                if off_heap_node_is_bin_ref(head) {
                     let binary = load(bin_ref.wrapping_add(1)) as *const u64;
                     out.push((
                         binary as usize,
@@ -1964,13 +1991,13 @@ impl HeapAlloc for ProcessHeap {
     fn supports_external_binary(&self) -> bool {
         true
     }
-    fn retain_node(&mut self, node: Arc<Node>) {
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         if self.detached
             && let Some(heap) = self.owners.detached.as_deref_mut()
         {
-            return heap.retain_node(node);
+            return heap.link_node(thing, node);
         }
-        self.owners.nodes.push(node);
+        link_node_thing(&mut self.owners.off_heap_first, thing, node);
     }
     fn retain_fun(&mut self, entry: Arc<FunEntry>) {
         if self.detached
@@ -2060,7 +2087,6 @@ pub struct VecHeap {
     wrt_bins: usize,
     overhead: u64,
     external: Vec<Arc<ExternalBinary>>,
-    nodes: Vec<Arc<Node>>,
     funs: Vec<Arc<FunEntry>>,
     exports: Vec<Arc<ExportEntry>>,
     used: usize,
@@ -2086,7 +2112,6 @@ impl VecHeap {
             wrt_bins: 0,
             overhead: 0,
             external: Vec::new(),
-            nodes: Vec::new(),
             funs: Vec::new(),
             exports: Vec::new(),
             used: 0,
@@ -2109,7 +2134,6 @@ impl VecHeap {
         self.wrt_bins = 0;
         self.overhead = 0;
         self.external.clear();
-        self.nodes.clear();
         self.funs.clear();
         self.exports.clear();
         self.used = 0;
@@ -2241,8 +2265,8 @@ impl HeapAlloc for VecHeap {
     fn supports_external_binary(&self) -> bool {
         true
     }
-    fn retain_node(&mut self, node: Arc<Node>) {
-        self.nodes.push(node);
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+        link_node_thing(&mut self.off_heap_first, thing, node);
     }
     fn retain_fun(&mut self, entry: Arc<FunEntry>) {
         self.funs.push(entry);
@@ -3241,7 +3265,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             *p.add(2) = 0;
             *p.add(3) = (index as u64) | ((serial as u64) << 32);
         }
-        self.heap.retain_node(node);
+        self.heap.link_node(p, node);
         Ok(Term::from_ptr(p, 2))
     }
     /// Construct an external port.
@@ -3254,7 +3278,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             *p.add(2) = 0;
             *p.add(3) = id;
         }
-        self.heap.retain_node(node);
+        self.heap.link_node(p, node);
         Ok(Term::from_ptr(p, 2))
     }
     /// Construct an external ordinary or pid reference.
@@ -3283,7 +3307,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
                 }
             }
         }
-        self.heap.retain_node(node);
+        self.heap.link_node(p, node);
         Ok(Term::from_ptr(p, 2))
     }
     /// Construct an ordinary local reference (three 32-bit components).

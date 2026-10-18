@@ -209,8 +209,8 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn supports_magic(&self) -> bool {
         self.0.supports_magic()
     }
-    fn retain_node(&mut self, value: Arc<Node>) {
-        self.0.retain_node(value)
+    fn link_node(&mut self, thing: *mut u64, value: Arc<Node>) {
+        self.0.link_node(thing, value)
     }
     fn retain_fun(&mut self, value: Arc<FunEntry>) {
         self.0.retain_fun(value)

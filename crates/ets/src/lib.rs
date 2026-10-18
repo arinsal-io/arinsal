@@ -1021,7 +1021,10 @@ impl HeapAlloc for ObjectHeap {
     fn supports_external_binary(&self) -> bool {
         true
     }
-    fn retain_node(&mut self, node: Arc<TermNode>) {
+    // The DbTerm's first_oh chain links the thing; the token stands in for the counted
+    // reference the thing holds until db_free_term.
+    fn link_node(&mut self, thing: *mut u64, node: Arc<TermNode>) {
+        let _ = self.chain_first_oh(thing as usize);
         self.off_heap().nodes.push(node);
     }
     fn retain_fun(&mut self, entry: Arc<FunEntry>) {

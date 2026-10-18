@@ -500,6 +500,37 @@ fn writable_append_survives_collections_and_releases_dead_owners() {
 }
 
 #[test]
+fn external_things_move_their_node_reference_through_collections() {
+    let mut heap = ProcessHeap::with_words(256);
+    let module = global_atoms().intern("gc_external_node_module").unwrap();
+    let node = Node::new(module, 1);
+    let mut roots = [
+        TermBuilder::new(&mut heap)
+            .external_pid(node.clone(), 1, 0)
+            .unwrap(),
+        TermBuilder::new(&mut heap)
+            .external_port(node.clone(), 7)
+            .unwrap(),
+        TermBuilder::new(&mut heap)
+            .external_ref(node.clone(), &[1, 2, 3])
+            .unwrap(),
+    ];
+    // A dead one among live ones.
+    let _dead = TermBuilder::new(&mut heap)
+        .external_pid(node.clone(), 2, 0)
+        .unwrap();
+    assert_eq!(Arc::strong_count(&node), 5);
+    heap.collect(&mut roots, &mut [], 0).unwrap();
+    assert_eq!(Arc::strong_count(&node), 4);
+    heap.collect(&mut roots, &mut [], 0).unwrap();
+    heap.set_fullsweep_after(0);
+    heap.collect(&mut roots, &mut [], 0).unwrap();
+    assert_eq!(Arc::strong_count(&node), 4);
+    drop(heap);
+    assert_eq!(Arc::strong_count(&node), 1);
+}
+
+#[test]
 fn owner_arcs_are_released_when_unreachable() {
     let mut heap = ProcessHeap::with_words(256);
     let module = global_atoms().intern("gc_owner_module").unwrap();
