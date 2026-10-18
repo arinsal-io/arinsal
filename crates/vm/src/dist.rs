@@ -1574,31 +1574,24 @@ fn handle_spawn_request(
         let watcher = (monitor || link)
             .then(|| remote_proxy(handle, &from))
             .transpose()?;
-        let child = if link {
-            let watcher = watcher.ok_or_else(badarg)?;
-            runtime.spawn_mfa_unscheduled_linked(module, function, &args, watcher, &from)
+        let monitor_ref = if monitor {
+            remote_ref_id(&reference)
         } else {
-            runtime.spawn_mfa_unscheduled(module, function, &args, &from)
+            None
         };
+        let child = runtime.spawn_mfa_unscheduled_watched(
+            module,
+            function,
+            &args,
+            link.then_some(watcher).flatten(),
+            watcher.zip(monitor_ref),
+            &from,
+        );
         if let Ok(child) = child {
             result = local_pid_owned(child);
             child_to_schedule = Some(child);
-            let scheduler = runtime.scheduler()?;
-            if monitor && let Some(ref_id) = remote_ref_id(&reference) {
+            if let Some(ref_id) = monitor_ref {
                 remember_remote_monitor_ref(handle, ref_id, &reference, true)?;
-                let watcher = watcher.ok_or_else(badarg)?;
-                scheduler
-                    .signal(
-                        watcher,
-                        child,
-                        arinsal_sched::Signal::Monitor {
-                            reference: ref_id,
-                            shared: arinsal_sched::SharedPayload(
-                                crate::proc_create::default_monitor_data(),
-                            ),
-                        },
-                    )
-                    .map_err(|error| VmError::Unsupported(format!("spawn monitor arm: {error}")))?;
             }
         }
     }
@@ -1702,13 +1695,20 @@ fn handle_spawn_request_port(
     } else {
         None
     };
+    let monitor_ref = if monitor {
+        remote_ref_id(&reference)
+    } else {
+        None
+    };
     let spawn_result = if spawn_opts_acceptable(options) {
-        if link {
-            let watcher = watcher.ok_or_else(badarg)?;
-            runtime.spawn_mfa_unscheduled_linked(mod_name, fun_name, &arg_list, watcher, &from)
-        } else {
-            runtime.spawn_mfa_unscheduled(mod_name, fun_name, &arg_list, &from)
-        }
+        runtime.spawn_mfa_unscheduled_watched(
+            mod_name,
+            fun_name,
+            &arg_list,
+            link.then_some(watcher).flatten(),
+            watcher.zip(monitor_ref),
+            &from,
+        )
     } else {
         Err(VmError::Unsupported("bad spawn options".into()))
     };
@@ -1728,31 +1728,8 @@ fn handle_spawn_request_port(
         };
         drop(tables);
         child_to_schedule = Some(child);
-        if monitor && let Some(ref_id) = remote_ref_id(&reference) {
+        if let Some(ref_id) = monitor_ref {
             remember_remote_monitor_ref(handle, ref_id, &reference, true)?;
-            if crate::debug_env::trace_dist() {
-                eprintln!("DIST_SPAWN_MONITOR_REF {ref_id} {reference:?}");
-            }
-            let watcher = watcher.ok_or_else(badarg)?;
-            if crate::debug_env::trace_dist() {
-                eprintln!("DIST_SPAWN_MONITOR_WATCHER {watcher:?} child={child:?}");
-            }
-            runtime
-                .scheduler()?
-                .signal(
-                    watcher,
-                    child,
-                    arinsal_sched::Signal::Monitor {
-                        reference: ref_id,
-                        shared: arinsal_sched::SharedPayload(
-                            crate::proc_create::default_monitor_data(),
-                        ),
-                    },
-                )
-                .map_err(|error| VmError::Unsupported(format!("spawn monitor arm: {error}")))?;
-            if crate::debug_env::trace_dist() {
-                eprintln!("DIST_SPAWN_MONITOR_ARMED");
-            }
         }
     }
     let flags = if matches!(result, OwnedTerm::Pid { .. }) {
