@@ -5450,6 +5450,29 @@ impl<T: Task> Scheduler<T> {
     pub fn send(&self, from: Pid, to: Pid, msg: T::Message) -> Result<(), Error> {
         self.inner.deliver(from, to, Payload::Message(msg), None)
     }
+    /// [`Self::send`] for a sender running on one of this scheduler's normal threads: a woken
+    /// receiver that belongs to that thread's run queue joins it directly. Any other thread
+    /// takes the plain send.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c (add2runq on the calling scheduler's own run
+    /// queue, reached from erts_proc_notify_new_message), OTP-29.1.1.
+    fn send_from_native(&self, from: Pid, to: Pid, msg: T::Message) -> Result<(), Error> {
+        let inner = Arc::as_ptr(&self.inner) as usize;
+        let mut msg = Some(msg);
+        let mut sent = None;
+        native_sender::with::<T::Message, _>(|handle| {
+            if handle.belongs_to(inner) {
+                match handle.send(from, to, msg.take().expect("message present")) {
+                    Ok(result) => sent = Some(result),
+                    Err(returned) => msg = Some(returned),
+                }
+            }
+        });
+        match sent {
+            Some(result) => result,
+            None => self.send(from, to, msg.take().expect("message not sent")),
+        }
+    }
     /// Queue a signal in the same ordered stream.
     pub fn signal(&self, from: Pid, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
         self.inner.deliver(from, to, Payload::Signal(signal), None)
@@ -5751,7 +5774,12 @@ impl<T: Task> Scheduler<T> {
         let Some(message) = prepare(&mut cell.task)? else {
             return Ok(OnHeapSend::Declined);
         };
-        match self.send(from, to, message) {
+        let sent = if process.bound_worker().is_some() {
+            self.send(from, to, message)
+        } else {
+            self.send_from_native(from, to, message)
+        };
+        match sent {
             Ok(()) | Err(Error::NoProcess) => Ok(OnHeapSend::Queued),
             Err(error) => Ok(OnHeapSend::Failed(error)),
         }
@@ -7061,6 +7089,8 @@ trait NativeSend<M> {
     /// enqueued there directly. Gives the message back when the scheduler-local state is
     /// not available.
     fn send(&self, from: Pid, to: Pid, msg: M) -> Result<Result<(), Error>, M>;
+    /// Whether this handle belongs to the scheduler whose shared state sits at `inner`.
+    fn belongs_to(&self, inner: usize) -> bool;
     /// Start a message timer for `target` owned by `owner` on this scheduler's wheel.
     /// Gives the message back when the scheduler-local state is not available.
     fn start_timer(
@@ -7093,6 +7123,10 @@ struct WorkerSender<T: Task> {
 }
 
 impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
+    fn belongs_to(&self, inner: usize) -> bool {
+        Arc::as_ptr(&self.inner) as usize == inner
+    }
+
     fn send(&self, from: Pid, to: Pid, msg: T::Message) -> Result<Result<(), Error>, T::Message> {
         let Some(local) = self.local.upgrade() else {
             return Err(msg);
