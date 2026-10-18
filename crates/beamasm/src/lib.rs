@@ -334,10 +334,9 @@ pub(crate) fn dump_directory() -> Option<&'static std::ffi::OsStr> {
 }
 
 /// Emits the JIT_HARD_DEBUG heap and stack cursor invariant check when requested.
-// Port of erts/emulator/beam/jit/arm/instr_common.cpp:160-177, OTP-29.1.1.
+// Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_validate), OTP-29.1.1.
 pub fn emit_validate_native_cursor(code: &mut CodeBuffer) -> Result<(), BufferError> {
-    static VALIDATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*VALIDATE.get_or_init(|| std::env::var_os("ARINSAL_BEAMASM_VALIDATE").is_some()) {
+    if !native_cursor_validation_enabled() {
         return Ok(());
     }
 
@@ -395,6 +394,12 @@ pub fn emit_validate_native_cursor(code: &mut CodeBuffer) -> Result<(), BufferEr
         Ok(())
     })?;
     code.bind(valid)
+}
+
+/// Reports whether optional native cursor checks are enabled for this process.
+pub(crate) fn native_cursor_validation_enabled() -> bool {
+    static VALIDATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALIDATE.get_or_init(|| std::env::var_os("ARINSAL_BEAMASM_VALIDATE").is_some())
 }
 
 extern "C" fn report_native_cursor_failure(

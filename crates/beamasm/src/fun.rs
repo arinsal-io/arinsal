@@ -376,15 +376,24 @@ impl BeamModuleAssembler {
         self.code
             .emit(|e| e.ldr_regoff(Gpr::x(8), Gpr::x(0), ACTIVE_CODE_IX, 3))?;
         self.code.bind(next)?;
+        let target = if crate::native_cursor_validation_enabled() {
+            // The optional validator uses TMP1 (x8), so keep the live dispatch target in
+            // SUPER_TMP (x14) across the check.
+            // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_validate), OTP-29.1.1.
+            self.code.emit(|e| e.mov_reg(Gpr::x(14), Gpr::x(8)))?;
+            Gpr::x(14)
+        } else {
+            Gpr::x(8)
+        };
         crate::emit_validate_native_cursor(&mut self.code)?;
         if tail {
             self.deallocate(deallocate)?;
             self.emit_leave_frame()?;
-            self.code.emit(|e| e.br(Gpr::x(8)))?;
+            self.code.emit(|e| e.br(target))?;
         } else {
             // erlang_call (beam_asm.hpp:310-332): `blr` keeps the return-address
             // predictor paired with the callee's `ret`.
-            self.code.emit(|e| e.blr(Gpr::x(8)))?;
+            self.code.emit(|e| e.blr(target))?;
             crate::emit_validate_native_cursor(&mut self.code)?;
         }
         Ok(())
