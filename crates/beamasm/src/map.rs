@@ -1185,16 +1185,16 @@ fn emit_update_map_single_exact_body_shared(
 // Port of erts/emulator/beam/jit/arm/instr_map.cpp:540-583 (emit_update_map_assoc_shared,
 // emit_update_map_single_assoc_shared) and 604-648 (emit_update_map_exact_guard_shared,
 // emit_update_map_exact_body_shared), OTP-29.1.1. X1..X4 reach `helper` unchanged; the
-// register array of a multi-pair update (X2) is loaded here. A pending error leaves through
-// the scheduler like the module error exit, with the raising pc of the calling `bl`.
+// register array of a multi-pair update (X2) is loaded here. As in erts, the single-pair
+// put returns straight after the runtime call: `erts_maps_put` cannot fail on the map the
+// compiler guarded with is_map, and the helper aborts where erts asserts. A multi-pair
+// update still leaves a pending error through the scheduler like the module error exit,
+// with the raising pc of the calling `bl`.
 fn emit_update_map_shared(
     code: &mut CodeBuffer,
     helper: MapUpdateHelper,
     update: Update,
 ) -> Result<(), BufferError> {
-    let error = code.new_label();
-    let native_error_pc = std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + 6 * 8;
-    let scheduler_return = 16_416;
     let single = !update.contains(Update::X_REGS);
     code.emit(|e| {
         e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
@@ -1203,15 +1203,22 @@ fn emit_update_map_shared(
     emit_enter_runtime(code, 6, update)?;
     code.emit(|e| {
         e.mov_reg(ARG1, Gpr::x(21))?;
-        if single {
-            e.mov_reg(ARG5, Gpr::xzr())?;
-        } else {
+        if !single {
             e.mov_reg(ARG3, Gpr::x(19))?;
         }
         e.mov_const(Gpr::x(17), helper as usize as u64)?;
         e.blr(Gpr::x(17))
     })?;
     emit_leave_runtime(code, 6, update)?;
+    if single {
+        return code.emit(|e| {
+            e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
+            e.ret(Gpr::x(30))
+        });
+    }
+    let error = code.new_label();
+    let native_error_pc = std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + 6 * 8;
+    let scheduler_return = 16_416;
     code.emit(|e| {
         e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
         e.ldr_uoff(TMP2, Gpr::x(21), 40)

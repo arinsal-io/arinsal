@@ -13,7 +13,7 @@ fn runtime_sync_emitters_encode_process_and_register_pairs() {
     emit_enter_runtime(&mut code, 6, update).unwrap();
     emit_leave_runtime(&mut code, 6, update).unwrap();
     let (words, _) = code.finish_with_labels().unwrap();
-    assert_eq!(words.len(), 12);
+    assert_eq!(words.len(), 10);
 }
 
 #[cfg(target_arch = "aarch64")]

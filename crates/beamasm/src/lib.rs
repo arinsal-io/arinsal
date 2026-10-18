@@ -243,8 +243,6 @@ pub fn emit_enter_runtime(
     update: Update,
 ) -> Result<(), BufferError> {
     code.emit(|e| {
-        let frame_pointer_slot = std::mem::offset_of!(SchedulerRegisters, tmp_mem) as u32 + 2 * 8;
-        e.str_uoff(Gpr::x(29), Gpr::x(19), frame_pointer_slot)?;
         if update.contains(Update::STACK) && update.contains(Update::HEAP) {
             e.stp(Gpr::x(23), Gpr::x(20), Gpr::x(21), 0)?;
         } else {
@@ -282,8 +280,6 @@ pub fn emit_leave_runtime(
     update: Update,
 ) -> Result<(), BufferError> {
     code.emit(|e| {
-        let frame_pointer_slot = std::mem::offset_of!(SchedulerRegisters, tmp_mem) as u32 + 2 * 8;
-        e.ldr_uoff(Gpr::x(29), Gpr::x(19), frame_pointer_slot)?;
         if update.contains(Update::STACK) && update.contains(Update::HEAP) {
             e.ldp(Gpr::x(23), Gpr::x(20), Gpr::x(21), 0)?;
         } else {
