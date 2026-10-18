@@ -12,7 +12,8 @@ use arinsal_bifs::with_binary_bytes;
 use arinsal_bifs::{BifError, BifFn, Ctx};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{
-    ExportEntry, FunEntry, HeapAlloc, MagicRef, Node, Term, TermBuilder, from_owned, to_owned,
+    ExportEntry, FunEntry, HeapAlloc, MagicRef, Node, Term, TermBuilder, from_owned, global_atoms,
+    to_owned,
 };
 use num_traits::ToPrimitive;
 
@@ -256,6 +257,14 @@ fn number(value: &O) -> Option<i64> {
         _ => None,
     }
 }
+// Port of erts/emulator/beam/erl_bif_re.c (re_compile, re_run), OTP-29.1.1.
+fn badopt_error() -> BifError {
+    global_atoms()
+        .intern("badopt")
+        .map(Term::atom)
+        .map(|cause| BifError::Badarg { cause: Some(cause) })
+        .unwrap_or(BifError::SystemLimit)
+}
 fn list(value: &O) -> Result<&[O], BifError> {
     match value {
         O::Nil => Ok(&[]),
@@ -342,9 +351,12 @@ fn options(value: &O) -> Result<Options, BifError> {
         depth_limit: -1,
         ..Options::default()
     };
-    for item in list(value)? {
+    for item in list(value).map_err(|_| badopt_error())? {
         if let O::Tuple(fields) = item {
-            let key = fields.first().and_then(atom_name).ok_or(BifError::BADARG)?;
+            let key = fields
+                .first()
+                .and_then(atom_name)
+                .ok_or_else(badopt_error)?;
             match (key, fields.as_slice()) {
                 ("capture", [_, spec]) => {
                     result.capture = Some((spec.clone(), CaptureType::Index));
@@ -355,32 +367,32 @@ fn options(value: &O) -> Result<Options, BifError> {
                         Some("index") => CaptureType::Index,
                         Some("list") => CaptureType::List,
                         Some("binary") => CaptureType::Binary,
-                        _ => return Err(BifError::BADARG),
+                        _ => return Err(badopt_error()),
                     };
                     result.capture = Some((spec.clone(), kind));
                     result.unique_exec = true;
                 }
                 ("offset", [_, n]) => {
-                    result.offset = usize::try_from(number(n).ok_or(BifError::BADARG)?)
-                        .map_err(|_| BifError::BADARG)?;
+                    result.offset = usize::try_from(number(n).ok_or_else(badopt_error)?)
+                        .map_err(|_| badopt_error())?;
                     if result.offset > i32::MAX as usize {
-                        return Err(BifError::BADARG);
+                        return Err(badopt_error());
                     }
                     result.unique_exec = true;
                 }
                 ("match_limit", [_, n]) => {
-                    result.match_limit = i32::try_from(number(n).ok_or(BifError::BADARG)?)
-                        .map_err(|_| BifError::BADARG)?;
+                    result.match_limit = i32::try_from(number(n).ok_or_else(badopt_error)?)
+                        .map_err(|_| badopt_error())?;
                     if result.match_limit < 0 {
-                        return Err(BifError::BADARG);
+                        return Err(badopt_error());
                     }
                     result.unique_exec = true;
                 }
                 ("match_limit_recursion", [_, n]) => {
-                    result.depth_limit = i32::try_from(number(n).ok_or(BifError::BADARG)?)
-                        .map_err(|_| BifError::BADARG)?;
+                    result.depth_limit = i32::try_from(number(n).ok_or_else(badopt_error)?)
+                        .map_err(|_| badopt_error())?;
                     if result.depth_limit < 0 {
-                        return Err(BifError::BADARG);
+                        return Err(badopt_error());
                     }
                     result.unique_exec = true;
                 }
@@ -392,14 +404,14 @@ fn options(value: &O) -> Result<Options, BifError> {
                         Some("any") => 4,
                         Some("anycrlf") => 5,
                         Some("nul") => 6,
-                        _ => return Err(BifError::BADARG),
+                        _ => return Err(badopt_error()),
                     }
                 }
-                _ => return Err(BifError::BADARG),
+                _ => return Err(badopt_error()),
             }
             continue;
         }
-        let name = atom_name(item).ok_or(BifError::BADARG)?;
+        let name = atom_name(item).ok_or_else(badopt_error)?;
         match name {
             "anchored" => {
                 result.compile |= ANCHORED;
@@ -430,7 +442,7 @@ fn options(value: &O) -> Result<Options, BifError> {
             "global" => result.global = true,
             "report_errors" => result.report_errors = true,
             "export" => result.export = true,
-            _ => return Err(BifError::BADARG),
+            _ => return Err(badopt_error()),
         }
         match name {
             "caseless" | "dollar_endonly" | "dotall" | "dupnames" | "extended" | "firstline"
@@ -497,7 +509,7 @@ fn compiled_tuple(code: &Code, unicode: bool) -> Result<O, BifError> {
 fn compile_owned(args: &[O]) -> Result<O, BifError> {
     let opts = options(args.get(1).unwrap_or(&O::Nil))?;
     if opts.unique_exec {
-        return Err(BifError::BADARG);
+        return Err(badopt_error());
     }
     let pattern = iodata(&args[0], opts.unicode)?;
     let code = match compile_code(&pattern, &opts) {
@@ -1385,7 +1397,7 @@ fn run_owned_slice(
         None => {
             let opts = options(args.get(2).unwrap_or(&O::Nil))?;
             if opts.export {
-                return Err(BifError::BADARG);
+                return Err(badopt_error());
             }
             let compiled = matches!(&args[1], O::Tuple(fields) if fields.len() == 5);
             let (code, unicode) = if compiled {
