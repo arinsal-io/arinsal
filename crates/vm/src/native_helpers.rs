@@ -1174,10 +1174,16 @@ fn dispatch_native_send(
             // call_light_bif_shared) and 488-523 (ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1:
             // a send that left heap fragments or virtual binary heap over its limit collects
             // with the result as the only root.
-            if process.heap.gc_enabled
-                && (process.heap.gc_desired() || process.heap.bin_vheap_gc_due())
-            {
-                return Some(collect_after_plain_bif(process, registers, raw));
+            if process.heap.gc_after_bif_desired() {
+                let mut result = Ok(value);
+                if !gc_after_plain_bif(process, registers, 2, &mut result) {
+                    return Some(0);
+                }
+                let Ok(value) = result else { return Some(0) };
+                let raw = crate::native_hooks::raw(value);
+                registers.x_reg_array[0] = crate::native_hooks::from_raw(raw);
+                process.sync_native_header();
+                return Some(raw);
             }
             process.x[0] = value;
             publish_dispatch_x(process, registers);
