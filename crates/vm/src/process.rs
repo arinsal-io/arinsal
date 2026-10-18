@@ -3393,6 +3393,8 @@ impl Executor {
                             schedule_in_gc = false;
                             collect_on_schedule_in(process)?;
                         }
+                        // Interpreted code keeps no redzone: only a BIF run for a native exit does.
+                        process.heap.clear_native_redzone();
                         self.vm.run_slice(process, Some(ctx), remaining)
                     });
                     // erts schedules out only when FCALLS runs out; an interpreted step that

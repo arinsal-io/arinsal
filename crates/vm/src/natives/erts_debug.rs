@@ -2669,7 +2669,9 @@ fn internal_state_set(
             }) else {
                 return Err(badarg());
             };
-            let left = process.heap.free_words();
+            // Port of erts/emulator/beam/erl_bif_info.c (fill_heap): HeapWordsLeft is bounded
+            // by HEAP_LIMIT, which leaves the redzone free.
+            let left = process.heap.words_left();
             if left > 1 {
                 let filler = BigInt::from(1_u8) << ((left - 2) * 64);
                 from_owned(&OwnedTerm::BigInt(filler), &mut process.heap)

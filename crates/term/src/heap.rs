@@ -1237,6 +1237,17 @@ impl ProcessHeap {
     pub fn native_active(&self) -> bool {
         self.native_allocation
     }
+    /// Words a collection check must leave free for an allocation: the redzone and the CP while
+    /// generated code runs, only the redzone for a BIF the scheduler runs for a native exit.
+    pub fn check_reserve(&self) -> usize {
+        if self.native_allocation {
+            crate::S_RESERVED
+        } else if self.native_redzone {
+            crate::S_REDZONE
+        } else {
+            0
+        }
+    }
     /// Words a normal allocation must leave free below the stack.
     pub fn allocation_reserve(&self) -> usize {
         if self.native_allocation {
@@ -1244,6 +1255,10 @@ impl ProcessHeap {
         } else {
             0
         }
+    }
+    /// Interpreted code allocates up to the stack pointer, like the erts interpreter.
+    pub fn clear_native_redzone(&mut self) {
+        self.native_redzone = false;
     }
     /// Record whether generated Erlang code is active on this heap.
     pub fn set_native_allocation(&mut self, active: bool) {

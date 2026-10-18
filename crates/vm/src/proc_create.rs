@@ -1720,12 +1720,7 @@ impl Process {
         if live > self.x.len() {
             return Err(VmError::Unsupported("live X register count".into()));
         }
-        let allocation_words = words
-            + if self.heap.native_active() {
-                arinsal_term::S_RESERVED
-            } else {
-                0
-            };
+        let allocation_words = words + self.heap.check_reserve();
         if self.heap.free_words() >= allocation_words
             && !self.heap.bin_vheap_gc_due()
             && !gc_stress_enabled()
@@ -1742,12 +1737,7 @@ impl Process {
             return Err(VmError::Unsupported("live X register count".into()));
         }
         self.gc_live = live;
-        let allocation_words = words
-            + if self.heap.native_active() {
-                arinsal_term::S_RESERVED
-            } else {
-                0
-            };
+        let allocation_words = words + self.heap.check_reserve();
         // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
         if self.heap.free_words() >= allocation_words
             && !self.heap.bin_vheap_gc_due()
