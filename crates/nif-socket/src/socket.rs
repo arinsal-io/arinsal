@@ -1324,7 +1324,7 @@ fn essio_send(
 }
 /// The binaries `enif_inspect_iovec` took, and what is left of the list.
 struct IoVec<'a> {
-    slices: Vec<&'a [u8]>,
+    slices: Vec<IoSlice<'a>>,
     tail: Tail<'a>,
 }
 /// The rest of the list after the first `IOV_MAX` elements.
@@ -1347,8 +1347,8 @@ impl Tail<'_> {
         }
     }
 }
-/// `enif_inspect_iovec(NULL, IOV_MAX, list, &tail, &iovec)`: at most `IOV_MAX`
-/// elements, every one a whole-byte binary, empty ones add no entry.
+/// Port of erts/emulator/beam/erl_nif.c (enif_inspect_iovec) and
+/// erts/emulator/nifs/unix/unix_socket_syncio.c (essio_sendv), OTP-29.1.1.
 fn inspect_iovec(value: &O) -> Option<IoVec<'_>> {
     let (elems, term): (&[O], &O) = match value {
         O::Nil => (&[], value),
@@ -1362,7 +1362,7 @@ fn inspect_iovec(value: &O) -> Option<IoVec<'_>> {
             return None;
         };
         if !binary.is_empty() {
-            slices.push(binary.as_slice());
+            slices.push(IoSlice::new(binary.as_slice()));
         }
     }
     let tail = Tail {
@@ -1431,12 +1431,7 @@ fn essio_sendv(h: &Handle, send_ref: &O, iov: &O) -> Result<O, BifError> {
         Err(result) => return Ok(result),
     };
     h.counters.lock().unwrap().write_tries += 1;
-    let buffers: Vec<IoSlice<'_>> = iovec
-        .slices
-        .iter()
-        .map(|slice| IoSlice::new(slice))
-        .collect();
-    let result = rustix::io::writev(s, &buffers).map_err(io::Error::from);
+    let result = rustix::io::writev(s, &iovec.slices).map_err(io::Error::from);
     send_check_result(
         h,
         &mut st,
