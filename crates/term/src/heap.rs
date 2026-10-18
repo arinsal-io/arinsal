@@ -857,6 +857,8 @@ pub struct ProcessHeap {
     pub(crate) bin_vheap_size: u64,
     pub(crate) heap_grow: bool,
     pub(crate) native_allocation: bool,
+    /// Set once generated code has run on this heap: runtime allocations stay below `HEAP_LIMIT`.
+    pub(crate) native_redzone: bool,
     /// Words at the top of the stack that erts does not have while a BIF body runs: the native
     /// continuation the executor pushed before it ran a native BIF. HAlloc and the post-BIF
     /// collection test see `E` above them.
@@ -1076,6 +1078,7 @@ impl ProcessHeap {
             bin_vheap_size: 46_422,
             heap_grow: false,
             native_allocation: false,
+            native_redzone: false,
             bif_hidden_words: 0,
             detached: false,
             abandoned: false,
@@ -1166,7 +1169,7 @@ impl ProcessHeap {
     /// erts `HeapWordsLeft`: words a normal heap allocation can hand out.
     // Port of erts/emulator/beam/erl_vm.h:175 (HeapWordsLeft), OTP-29.1.1.
     pub fn words_left(&self) -> usize {
-        let limit = if self.native_allocation {
+        let limit = if self.native_allocation || self.native_redzone {
             self.heap_limit_words()
         } else {
             self.stop
@@ -1245,6 +1248,9 @@ impl ProcessHeap {
     /// Record whether generated Erlang code is active on this heap.
     pub fn set_native_allocation(&mut self, active: bool) {
         self.native_allocation = active;
+        // Port of erts/emulator/beam/erl_process.h (HEAP_LIMIT), OTP-29.1.1: a BIF the scheduler
+        // runs for a native call exit allocates below the redzone like one called from the JIT.
+        self.native_redzone |= active;
     }
     /// Return the current heap top and stack boundary for a VM-local bump cursor.
     /// The pointers remain valid until this heap collects or grows.
@@ -1800,7 +1806,7 @@ impl HeapAlloc for ProcessHeap {
         if self.detached {
             return self.owners.detached.as_deref_mut()?.alloc(words);
         }
-        let limit = if self.native_allocation {
+        let limit = if self.native_allocation || self.native_redzone {
             self.heap_limit_words()
         } else {
             self.stop

@@ -1338,6 +1338,7 @@ impl ProcessHeap {
         next.fullsweep_after = self.fullsweep_after;
         next.heap_grow = self.heap_grow;
         next.native_allocation = self.native_allocation;
+        next.native_redzone = self.native_redzone;
         next.bif_hidden_words = self.bif_hidden_words;
         next.minor_since_major = if major {
             0
