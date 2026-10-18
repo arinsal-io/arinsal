@@ -28,6 +28,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
+    // The sub binaries are `HAlloc`ed while the factory holds `HEAP_TOP == HEAP_LIMIT`, so they
+    // always land in heap fragments.
+    // Port of erts/emulator/beam/erl_bif_port.c (decode_packet_3, erts_factory_proc_init), OTP-29.1.1.
+    fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
+        self.0.alloc_fragment_only(words)
+    }
     fn retain_binary(&mut self, value: Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(value)
     }
