@@ -548,26 +548,42 @@ fn external_reference_id_counts_survive_copy_and_compare() {
 }
 
 #[test]
-fn serialized_magic_reference_recovers_its_identity_after_owner_collection() {
-    use arinsal_term::{Identity, MagicRef};
-    let id = 0x1_0000_0000;
-    let external = OwnedTerm::Ref {
+fn owned_magic_reference_keeps_its_owner_and_a_decoded_reference_is_plain() {
+    use arinsal_term::{Identity, MagicRef, TermBuilder};
+    let mut heap = VecHeap::new();
+    let owner = MagicRef::new(7_u32);
+    let id = owner.id();
+    let original = TermBuilder::new(&mut heap)
+        .magic_ref(owner.clone())
+        .unwrap();
+    // The owned form carries the owner pointer, so a copy resolves without any lookup.
+    let owned = to_owned(original).unwrap();
+    assert!(matches!(owned, OwnedTerm::MagicRef(_)));
+    let copy = from_owned(&owned, &mut heap).unwrap();
+    assert!(copy.is_magic_ref());
+    assert!(std::sync::Arc::ptr_eq(&copy.magic_owner().unwrap(), &owner));
+    // Reference numbers of a magic reference that was never saved give a plain reference.
+    let plain = OwnedTerm::Ref {
         node: "nonode@nohost".into(),
         creation: 0,
         ids: vec![id as u32, (id >> 32) as u32, u32::MAX],
     };
-    let mut heap = VecHeap::new();
-    let reference = from_owned(&external, &mut heap).unwrap();
-    assert!(reference.is_magic_ref());
+    let decoded = from_owned(&plain, &mut heap).unwrap();
+    assert!(!decoded.is_magic_ref());
     assert!(matches!(
-        reference.identity(),
+        decoded.identity(),
         Some(Identity::Ref { ids, .. }) if ids == [id as u32, (id >> 32) as u32, u32::MAX]
     ));
-    assert!(matches!(
-        to_owned(reference).unwrap(),
-        OwnedTerm::Ref { ref ids, .. } if *ids == [id as u32, (id >> 32) as u32, u32::MAX]
+    // erts_magic_ref_save_bin (term_to_binary, ref_to_list) makes the numbers resolvable.
+    original.save_magic_ref();
+    let resolved = from_owned(&plain, &mut heap).unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &resolved.magic_owner().unwrap(),
+        &owner
     ));
-    assert_eq!(MagicRef::live_by_id(id).unwrap().id(), id);
+    drop((resolved, copy, original, owned, owner));
+    drop(heap);
+    assert!(MagicRef::lookup_saved(id).is_none());
 }
 
 #[test]

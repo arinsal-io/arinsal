@@ -132,7 +132,7 @@ fn magic_reference_survives_copy_and_gc_then_releases() {
 }
 
 #[test]
-fn magic_reference_leaves_the_registry_with_its_last_reference() {
+fn magic_reference_is_freed_with_its_last_reference() {
     let count = Arc::new(AtomicUsize::new(0));
     let mut heap = ProcessHeap::with_words(1 << 16);
     let mut ids = Vec::new();
@@ -142,18 +142,14 @@ fn magic_reference_leaves_the_registry_with_its_last_reference() {
         let term = TermBuilder::new(&mut heap).magic_ref(owner).unwrap();
         assert!(term.is_magic_ref());
     }
-    assert!(ids.iter().all(|id| MagicRef::is_registered(*id)));
-    assert!(ids.iter().all(|id| MagicRef::live_by_id(*id).is_some()));
     assert_eq!(count.load(Ordering::SeqCst), 0);
     heap.collect(&mut [], &mut [], 0).unwrap();
     heap.collect(&mut [], &mut [], 0).unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 10_000);
-    assert!(ids.iter().all(|id| !MagicRef::is_registered(*id)));
-    assert!(ids.iter().all(|id| MagicRef::live_by_id(*id).is_none()));
 }
 
 #[test]
-fn magic_reference_stays_registered_while_any_heap_holds_it() {
+fn magic_reference_stays_alive_while_any_heap_holds_it() {
     let count = Arc::new(AtomicUsize::new(0));
     let owner = MagicRef::new(DropCounter(count.clone()));
     let id = owner.id();
@@ -165,14 +161,12 @@ fn magic_reference_stays_registered_while_any_heap_holds_it() {
     let mut roots = [copy_term(term, &mut heap).unwrap()];
     drop(owner);
     drop(source);
-    assert!(MagicRef::is_registered(id));
     assert_eq!(count.load(Ordering::SeqCst), 0);
     heap.collect(&mut roots, &mut [], 0).unwrap();
-    assert!(MagicRef::is_registered(id));
-    assert_eq!(MagicRef::live_by_id(id).unwrap().id(), id);
+    // SAFETY: the root and its copied owner remain live on this process heap.
+    assert_eq!(unsafe { roots[0].magic_ref() }.unwrap().id(), id);
     heap.collect(&mut [], &mut [], 0).unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    assert!(!MagicRef::is_registered(id));
 }
 
 #[test]
@@ -201,7 +195,6 @@ fn collections_with_many_live_magic_references_stay_linear() {
         started.elapsed()
     );
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    assert!(ids.iter().all(|id| MagicRef::is_registered(*id)));
     heap.request_full_sweep();
     heap.collect(&mut [], &mut [], 0).unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 40_000);

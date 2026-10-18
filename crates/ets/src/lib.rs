@@ -964,16 +964,7 @@ impl ObjectHeap {
     }
 
     fn magic_owner(&self, term: Term) -> Option<Arc<MagicRef>> {
-        if !term.is_magic_ref() {
-            return None;
-        }
-        let Identity::Ref { ids, .. } = term.identity()? else {
-            return None;
-        };
-        if ids.len() != 3 || ids[2] != u32::MAX {
-            return None;
-        }
-        MagicRef::live_by_id(u64::from(ids[0]) | (u64::from(ids[1]) << 32))
+        term.magic_owner()
     }
 }
 

@@ -270,6 +270,39 @@ fn misc_bifs_decode_packet_sub_binaries_go_to_heap_fragments_like_erts() {
     );
 }
 
+/// A magic reference encodes as its numbers; decoding finds the binary again only because
+/// `term_to_binary` saved it in erts' magic reference table, so the copy stays usable.
+#[test]
+fn misc_bifs_magic_reference_roundtrip_through_the_external_format_matches_erts() {
+    let _ = global_atoms();
+    compare(
+        r#"-module(misc_bifs_magic_ref).
+-export([run/0]).
+ref_of(T) when is_reference(T) -> T;
+ref_of({_, _} = T) -> element(2, T);
+ref_of(T) when is_tuple(T) -> element(tuple_size(T), T).
+rt(T) -> binary_to_term(term_to_binary(T)).
+probe(T, Use) ->
+    T2 = rt(T),
+    R = ref_of(T), R2 = ref_of(T2),
+    [is_reference(R2), T =:= T2, R =:= R2, R == R2, R < R2, R2 < R,
+     catch_class(fun() -> Use(T) end), catch_class(fun() -> Use(T2) end)].
+catch_class(F) -> try F(), ok catch C:E -> {C, E} end.
+run() ->
+    Pat = binary:compile_pattern(<<"bc">>),
+    Ac = binary:compile_pattern([<<"b">>, <<"c">>]),
+    A = atomics:new(2, []),
+    Ms = ets:match_spec_compile([{'_', [], [true]}]),
+    Res = [probe(Pat, fun(P) -> binary:match(<<"abc">>, P) end),
+           probe(Ac, fun(P) -> binary:match(<<"abc">>, P) end),
+           probe(A, fun(X) -> atomics:get(X, 1) end),
+           begin T = ets:new(t, []), probe(Ms, fun(M) -> ets:match_spec_run([{a}], M) end) end],
+    Res."#,
+        "misc_bifs_magic_ref",
+        "run",
+    );
+}
+
 #[test]
 fn misc_bifs_decode_packet_errors_options_and_more_match_erts() {
     let _ = global_atoms();

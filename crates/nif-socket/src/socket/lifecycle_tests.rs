@@ -679,8 +679,11 @@ fn last_reference_closes_an_open_descriptor_and_drops_the_monitors() {
     assert_eq!(reactor.monitored().len(), 1);
     assert!(handle(&sock).is_ok());
     crate::socket::release_created(0);
+    // The test's own term is a counted pointer, as a term on a heap would be.
+    let weak = std::sync::Arc::downgrade(&owner_of(&sock).unwrap());
+    drop(sock);
     assert!(reactor.monitored().is_empty());
-    assert!(handle(&sock).is_err());
+    assert!(weak.upgrade().is_none());
     set_reactor(None);
 }
 
@@ -693,11 +696,14 @@ fn a_selected_socket_lives_until_its_stop_callback_releases_it() {
         atom("select")
     );
     crate::socket::release_created(0);
+    let weak = std::sync::Arc::downgrade(&owner_of(&sock).unwrap());
     assert!(handle(&sock).is_ok(), "the selection holds the resource");
     assert_eq!(reactor.monitored().len(), 2);
     let closed = call("nif_close", std::slice::from_ref(&sock));
     assert!(matches!(closed, O::Atom(_) | O::Tuple(_)));
-    assert!(handle(&sock).is_err(), "the stop callback released it");
+    // The test's own term is a counted pointer, as a term on a heap would be.
+    drop(sock);
+    assert!(weak.upgrade().is_none(), "the stop callback released it");
     assert!(reactor.monitored().is_empty());
     set_reactor(None);
 }
@@ -717,9 +723,16 @@ fn a_selected_socket_with_a_scheduled_stop_lives_until_the_callback_runs() {
         matches!(closed, O::Tuple(_)),
         "a scheduled stop returns a close ref"
     );
-    assert!(handle(&sock).is_ok());
-    crate::stop(&sock);
-    assert!(handle(&sock).is_err());
+    let owner = owner_of(&sock).unwrap();
+    let weak = std::sync::Arc::downgrade(&owner);
+    let name = O::MagicRef(arinsal_etf::MagicHandle::weak(
+        owner.id(),
+        weak.clone() as std::sync::Weak<dyn std::any::Any + Send + Sync>,
+    ));
+    drop((sock, owner));
+    assert!(handle(&name).is_ok());
+    crate::stop(&name);
+    assert!(weak.upgrade().is_none());
     set_reactor(None);
 }
 

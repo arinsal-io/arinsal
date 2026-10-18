@@ -1268,6 +1268,8 @@ fn ref_to_list(term: Term) -> Result<String, VmError> {
     let Some(Identity::Ref { ids, .. }) = term.identity() else {
         return Err(badarg());
     };
+    // Port of erts/emulator/beam/bif.c (ref_to_list_1), OTP-29.1.1.
+    term.save_magic_ref();
     let magic = term.is_magic_ref();
     let mut numbers: Vec<u32> = ids;
     if magic && numbers.last() == Some(&u32::MAX) {
@@ -1424,6 +1426,17 @@ fn list_to_ref(process: &mut Process, chars: Term) -> Result<Term, VmError> {
         refn[slot] = *value;
     }
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    // erts_magic_ref_lookup_bin: numbers of a saved magic reference give that reference.
+    let saved = (refn[2] == u32::MAX)
+        .then(|| {
+            arinsal_term::MagicRef::lookup_saved(u64::from(refn[0]) | (u64::from(refn[1]) << 32))
+        })
+        .flatten();
+    if let Some(owner) = saved {
+        return arinsal_term::TermBuilder::new(&mut heap)
+            .magic_ref(owner)
+            .map_err(|_| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))));
+    }
     Term::local_ref(&mut heap, refn)
         .map_err(|_| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))
 }
@@ -3484,23 +3497,15 @@ fn spawn_request(
 pub(crate) fn trace_session_id(process: &Process, session: Term) -> Option<u64> {
     let owned = arinsal_term::to_owned(session).ok()?;
     match &owned {
-        arinsal_etf::OwnedTerm::Ref { ids, .. } if ids.len() >= 3 && ids[2] == u32::MAX => {
-            crate::trace::session_from_magic_ref(
-                process,
-                u64::from(ids[0]) | (u64::from(ids[1]) << 32),
-            )
+        arinsal_etf::OwnedTerm::MagicRef(handle) => {
+            crate::trace::session_from_magic_ref(process, handle.id())
         }
         arinsal_etf::OwnedTerm::Ref { ids, .. } if ids.len() >= 2 => {
             Some(ids[0] as u64 | (u64::from(ids[1]) << 32))
         }
         arinsal_etf::OwnedTerm::Tuple(fields) => match fields.as_slice() {
-            [arinsal_etf::OwnedTerm::Ref { ids, .. }, _]
-                if ids.len() >= 3 && ids[2] == u32::MAX =>
-            {
-                crate::trace::session_from_magic_ref(
-                    process,
-                    u64::from(ids[0]) | (u64::from(ids[1]) << 32),
-                )
+            [arinsal_etf::OwnedTerm::MagicRef(handle), _] => {
+                crate::trace::session_from_magic_ref(process, handle.id())
             }
             [arinsal_etf::OwnedTerm::Ref { ids, .. }, _] if ids.len() >= 2 => {
                 Some(ids[0] as u64 | (u64::from(ids[1]) << 32))

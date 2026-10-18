@@ -798,6 +798,9 @@ impl EncodeWalk {
                             creation,
                             ids,
                         } => {
+                            // Port of erts/emulator/beam/external.c (enc_term, reference
+                            // case), OTP-29.1.1: the numbers leave the term.
+                            term.save_magic_ref();
                             out.push(90);
                             out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
                             write_node(out, node, opts)?;
@@ -1509,23 +1512,22 @@ fn parse_step(
                         built(&mut ctx, |b| b.external_port(Node::new(node, creation), id))?
                     }
                 } else if node == arinsal_term::atoms::NONAME && creation == 0 {
-                    let magic_owner = if ids.len() == 3 && ids[2] == u32::MAX {
-                        let id = u64::from(ids[0]) | (u64::from(ids[1]) << 32);
-                        Some(
-                            arinsal_term::MagicRef::live_by_id(id)
-                                .unwrap_or_else(|| arinsal_term::MagicRef::new_with_id(id, ())),
-                        )
-                    } else {
-                        None
-                    };
-                    if let Some(owner) = magic_owner {
-                        built(&mut ctx, |b| b.magic_ref(owner))?
-                    } else {
-                        let mut local = [0; 3];
-                        for (slot, value) in local.iter_mut().zip(ids) {
-                            *slot = value;
-                        }
-                        built(&mut ctx, |b| b.local_ref(local))?
+                    // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT),
+                    // OTP-29.1.1: numbers of a saved magic reference give that reference.
+                    let mut local = [0; 3];
+                    for (slot, value) in local.iter_mut().zip(ids) {
+                        *slot = value;
+                    }
+                    let saved = (local[2] == u32::MAX)
+                        .then(|| {
+                            arinsal_term::MagicRef::lookup_saved(
+                                u64::from(local[0]) | (u64::from(local[1]) << 32),
+                            )
+                        })
+                        .flatten();
+                    match saved {
+                        Some(owner) => built(&mut ctx, |b| b.magic_ref(owner))?,
+                        None => built(&mut ctx, |b| b.local_ref(local))?,
                     }
                 } else {
                     built(&mut ctx, |b| {

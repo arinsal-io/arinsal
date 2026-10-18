@@ -3,8 +3,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock, Weak};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -14,16 +14,17 @@ pub const MAGIC_BIN_DATA_OFFSET: usize = 24;
 /// A reference payload whose lifetime follows every copied term and GC owner.
 pub struct MagicRef {
     id: u64,
-    restored_from_external_term: bool,
     /// `mb->orig_size`: what the owning heap charges to its virtual binary heap.
     orig_size: usize,
+    /// Whether the reference numbers are in the lazily filled table (`erts_magic_ref_save_bin`).
+    saved: AtomicBool,
     payload: Box<dyn Any + Send + Sync>,
 }
 
 impl MagicRef {
     /// Allocate an opaque reference with a process-wide unique identity.
     pub fn new<T: Any + Send + Sync>(payload: T) -> Arc<Self> {
-        Self::allocate(NEXT_ID.fetch_add(1, Ordering::Relaxed), payload, false)
+        Self::allocate(NEXT_ID.fetch_add(1, Ordering::Relaxed), payload)
     }
 
     /// Allocate an opaque reference whose `mb->orig_size` is `orig_size` bytes instead of
@@ -31,12 +32,7 @@ impl MagicRef {
     // Port of erts/emulator/beam/erl_binary.h (erts_create_magic_binary_x), OTP-29.1.1:
     // `orig_size` is `ERTS_MAGIC_BIN_ORIG_SIZE(size)`, the data offset plus the payload size.
     pub fn with_orig_size<T: Any + Send + Sync>(payload: T, orig_size: usize) -> Arc<Self> {
-        Self::allocate_sized(
-            NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            payload,
-            false,
-            orig_size,
-        )
+        Self::allocate_sized(NEXT_ID.fetch_add(1, Ordering::Relaxed), payload, orig_size)
     }
 
     /// Allocate a reference backed by `erts_create_magic_binary(payload_size, ...)`.
@@ -50,47 +46,19 @@ impl MagicRef {
         Self::with_orig_size(payload, MAGIC_BIN_DATA_OFFSET + payload_size)
     }
 
-    /// Recreate an opaque reference using an identity retained in an external term.
-    pub fn new_with_id<T: Any + Send + Sync>(id: u64, payload: T) -> Arc<Self> {
-        NEXT_ID.fetch_max(id.saturating_add(1), Ordering::Relaxed);
-        Self::allocate(id, payload, true)
+    fn allocate<T: Any + Send + Sync>(id: u64, payload: T) -> Arc<Self> {
+        Self::allocate_sized(id, payload, std::mem::size_of::<T>())
     }
 
-    fn allocate<T: Any + Send + Sync>(
-        id: u64,
-        payload: T,
-        restored_from_external_term: bool,
-    ) -> Arc<Self> {
-        Self::allocate_sized(
+    fn allocate_sized<T: Any + Send + Sync>(id: u64, payload: T, orig_size: usize) -> Arc<Self> {
+        // erts keeps no registry of magic binaries: the reference thing points at the
+        // refcounted binary and the destructor runs on the last release.
+        Arc::new(Self {
             id,
-            payload,
-            restored_from_external_term,
-            std::mem::size_of::<T>(),
-        )
-    }
-
-    fn allocate_sized<T: Any + Send + Sync>(
-        id: u64,
-        payload: T,
-        restored_from_external_term: bool,
-        orig_size: usize,
-    ) -> Arc<Self> {
-        let owner = Arc::new(Self {
-            id,
-            restored_from_external_term,
             orig_size,
+            saved: AtomicBool::new(false),
             payload: Box::new(payload),
-        });
-        registry()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, Arc::downgrade(&owner));
-        owner
-    }
-
-    /// Whether this identity has no process-local native resource owner.
-    pub fn is_external_only(&self) -> bool {
-        self.restored_from_external_term
+        })
     }
 
     /// `mb->orig_size` of the magic binary: the payload's size in bytes.
@@ -125,48 +93,71 @@ impl MagicRef {
     }
 }
 
+// Port of erts/emulator/beam/erl_bif_unique.c (magic_ref_table), OTP-29.1.1: a table from
+// reference numbers to the magic binary, sharded like erts' per-scheduler tables. Creating a
+// magic reference never touches it. It is filled only when the numbers leave the term
+// (`term_to_binary`, `ref_to_list`), so that decoding or `list_to_ref` on this node finds the
+// binary again, and the entry goes away when the binary is freed.
+const TABLE_SHARDS: usize = 64;
+type Shard = RwLock<HashMap<u64, Weak<MagicRef>>>;
+
+fn shard(id: u64) -> &'static Shard {
+    static TABLE: OnceLock<Vec<Shard>> = OnceLock::new();
+    &TABLE.get_or_init(|| (0..TABLE_SHARDS).map(|_| RwLock::default()).collect())
+        [(id as usize) % TABLE_SHARDS]
+}
+
 impl MagicRef {
-    /// Find a live magic-reference owner by its term identity.
-    pub fn live_by_id(id: u64) -> Option<Arc<Self>> {
-        let entry = registry()
-            .lock()
+    /// `erts_magic_ref_save_bin`: make the reference numbers resolvable on this node.
+    pub fn save_in_table(self: &Arc<Self>) {
+        if self.saved.load(Ordering::Acquire) {
+            return;
+        }
+        shard(self.id)
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&id)
-            .cloned();
-        entry?.upgrade()
+            .insert(self.id, Arc::downgrade(self));
+        self.saved.store(true, Ordering::Release);
     }
 
-    /// Whether the identity still has an entry in the process-wide registry.
-    ///
-    /// The entry is removed when the last reference to the owner is released.
-    pub fn is_registered(id: u64) -> bool {
-        registry()
-            .lock()
+    /// `erts_magic_ref_lookup_bin`: the live magic binary saved under these reference numbers.
+    pub fn lookup_saved(id: u64) -> Option<Arc<Self>> {
+        shard(id)
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&id)
+            .get(&id)?
+            .upgrade()
     }
 }
 
 impl Drop for MagicRef {
+    /// `erts_magic_binary_free` calls `erts_magic_ref_remove_bin`; the flag only spares the
+    /// lock for the references that were never saved.
     fn drop(&mut self) {
-        let mut owners = registry()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if owners
-            .get(&self.id)
-            .is_some_and(|entry| entry.strong_count() == 0)
-        {
-            owners.remove(&self.id);
+        if self.saved.load(Ordering::Acquire) {
+            shard(self.id)
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.id);
         }
     }
 }
 
-fn registry() -> &'static Mutex<HashMap<u64, Weak<MagicRef>>> {
-    static OWNERS: OnceLock<Mutex<HashMap<u64, Weak<MagicRef>>>> = OnceLock::new();
-    OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 impl crate::Term {
+    /// `erts_magic_ref_save_bin` for a reference term; other terms are left alone.
+    pub fn save_magic_ref(self) {
+        if let Some(owner) = self.magic_owner() {
+            owner.save_in_table();
+        }
+    }
+
+    /// A counted reference to the magic owner of a live magic reference term, like
+    /// `erts_refc_inc` on `ErtsMRefThing.mb`.
+    pub fn magic_owner(self) -> Option<Arc<MagicRef>> {
+        self.magic_word()
+            .map(|word| MagicRef::thing_owner(word, true))
+    }
+
     /// Borrow the magic owner from a live reference term.
     ///
     /// # Safety

@@ -128,9 +128,7 @@ impl Handle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if selector.is_none() {
-            *selector = handle_id(self.reference())
-                .ok()
-                .and_then(MagicRef::live_by_id);
+            *selector = owner_of(self.reference());
         }
     }
 
@@ -242,22 +240,16 @@ impl Counters {
         ])
     }
 }
-/// The identity of the magic reference `value` stands for.
-fn handle_id(value: &O) -> Result<u64, BifError> {
-    match value {
-        O::Ref {
-            node,
-            creation,
-            ids,
-        } if node == "nonode@nohost" && *creation == 0 && ids.len() == 3 && ids[2] == u32::MAX => {
-            Ok(u64::from(ids[0]) | (u64::from(ids[1]) << 32))
-        }
-        _ => Err(BifError::BADARG),
-    }
+/// The owner a socket handle term carries, like the `mb` pointer of an `ErtsMRefThing`.
+fn owner_of(value: &O) -> Option<Arc<MagicRef>> {
+    let O::MagicRef(handle) = value else {
+        return None;
+    };
+    handle.owner()?.downcast::<MagicRef>().ok()
 }
 /// `enif_get_resource`: the descriptor behind a socket reference.
 fn handle(value: &O) -> Result<Sock, BifError> {
-    let magic = MagicRef::live_by_id(handle_id(value)?).ok_or(BifError::BADARG)?;
+    let magic = owner_of(value).ok_or(BifError::BADARG)?;
     if magic.downcast_ref::<Handle>().is_none() {
         return Err(BifError::BADARG);
     }
@@ -265,7 +257,7 @@ fn handle(value: &O) -> Result<Sock, BifError> {
 }
 /// The magic reference of the socket `handle`, if the socket is still alive.
 pub(super) fn resource(handle: &O) -> Option<Arc<MagicRef>> {
-    let magic = MagicRef::live_by_id(handle_id(handle).ok()?)?;
+    let magic = owner_of(handle)?;
     magic.downcast_ref::<Handle>().is_some().then_some(magic)
 }
 const OTP_OPT_DEBUG: i32 = 1001;
@@ -378,13 +370,13 @@ fn reference(
         SOCKET_MAGIC_ORIG_SIZE,
     );
     let id = magic.id();
-    let reference = O::Ref {
-        node: "nonode@nohost".into(),
-        creation: 0,
-        ids: vec![id as u32, (id >> 32) as u32, u32::MAX],
-    };
+    let reference = O::MagicRef(arinsal_etf::MagicHandle::strong(id, magic.clone()));
     let h = Sock(magic);
-    let _ = h.reference.set(reference.clone());
+    // The descriptor names itself by a weak handle: a counted one would keep it alive forever.
+    let _ = h.reference.set(O::MagicRef(arinsal_etf::MagicHandle::weak(
+        id,
+        Arc::downgrade(&h.0) as std::sync::Weak<dyn std::any::Any + Send + Sync>,
+    )));
     CREATED.with(|created| created.borrow_mut().push(h.clone()));
     if let Some(pid) = owner.as_ref() {
         let mon = monitor_process(&h, pid);

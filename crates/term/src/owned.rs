@@ -60,6 +60,13 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                         tasks.push(Task::Visit(key));
                     }
                 }
+                OwnedTerm::MagicRef(handle) => {
+                    let owner = handle
+                        .owner()
+                        .and_then(|owner| owner.downcast::<MagicRef>().ok())
+                        .ok_or(TermError::BadArg)?;
+                    values.push(builder.magic_ref(owner)?);
+                }
                 OwnedTerm::Pid {
                     node,
                     id,
@@ -78,16 +85,21 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     creation,
                     ids,
                 } if node == "nonode@nohost" && *creation == 0 && ids.len() <= 3 => {
-                    if ids.as_slice().get(2) == Some(&u32::MAX) {
-                        let id = u64::from(ids[0]) | (u64::from(ids[1]) << 32);
-                        let owner = MagicRef::live_by_id(id)
-                            .unwrap_or_else(|| MagicRef::new_with_id(id, ()));
-                        values.push(builder.magic_ref(owner)?);
-                    } else {
-                        let mut local_ids = [0; 3];
-                        local_ids[..ids.len()].copy_from_slice(ids);
-                        values.push(builder.local_ref(local_ids)?);
-                    }
+                    // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT),
+                    // OTP-29.1.1: numbers of a saved magic reference give that reference.
+                    let mut local_ids = [0; 3];
+                    local_ids[..ids.len()].copy_from_slice(ids);
+                    let saved = (local_ids[2] == u32::MAX)
+                        .then(|| {
+                            MagicRef::lookup_saved(
+                                u64::from(local_ids[0]) | (u64::from(local_ids[1]) << 32),
+                            )
+                        })
+                        .flatten();
+                    values.push(match saved {
+                        Some(owner) => builder.magic_ref(owner)?,
+                        None => builder.local_ref(local_ids)?,
+                    });
                 }
                 OwnedTerm::Pid {
                     node,
@@ -318,6 +330,13 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
                             id,
                             creation,
                         }),
+                        Identity::Ref { .. } if term.is_magic_ref() => {
+                            let owner = term.magic_owner().ok_or(TermError::BadArg)?;
+                            values.push(OwnedTerm::MagicRef(arinsal_etf::MagicHandle::strong(
+                                owner.id(),
+                                owner,
+                            )));
+                        }
                         Identity::Ref {
                             node,
                             creation,

@@ -4,8 +4,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use arinsal_term::{
-    ConsListBuilder, HeapAlloc, Identity, MagicRef, TermBuilder, writable_bytes_mut,
-    writable_extend_private, writable_finalize,
+    ConsListBuilder, HeapAlloc, MagicRef, TermBuilder, writable_bytes_mut, writable_extend_private,
+    writable_finalize,
 };
 
 use crate::binary_mod::{SearchPattern, SearchWalk};
@@ -1390,17 +1390,7 @@ fn pattern(term: Term) -> Result<Arc<SearchPattern>, BifError> {
         let tag = atom_name(tuple_element(term, 0)?).filter(|tag| matches!(*tag, "bm" | "ac"));
         if let Some(tag) = tag {
             let reference = tuple_element(term, 1)?;
-            if !reference.is_magic_ref() {
-                return Err(BADARG);
-            }
-            let Identity::Ref { ids, .. } = reference.identity().ok_or(BADARG)? else {
-                return Err(BADARG);
-            };
-            if ids.len() != 3 || ids[2] != u32::MAX {
-                return Err(BADARG);
-            }
-            let id = u64::from(ids[0]) | (u64::from(ids[1]) << 32);
-            let owner = MagicRef::live_by_id(id).ok_or(BADARG)?;
+            let owner = reference.magic_owner().ok_or(BADARG)?;
             let compiled = owner
                 .downcast_ref::<Arc<SearchPattern>>()
                 .filter(|compiled| compiled.tag() == tag)
