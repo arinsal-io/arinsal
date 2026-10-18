@@ -979,16 +979,63 @@ impl Default for VheapCold {
     }
 }
 
+/// Multiplicative pointer hasher for [`OwnerSet`]: keys are allocation addresses.
+#[derive(Default)]
+pub(crate) struct PtrHasher(u64);
+impl std::hash::Hasher for PtrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+    fn write_usize(&mut self, value: usize) {
+        self.0 = (value as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+/// Counted references a heap holds for the fun and export entries its terms point at, one per
+/// distinct entry. erts keeps no such reference (entries live in the code tables until
+/// purge), so a hash set keeps the per-collection cost independent of how many funs share an
+/// entry.
+pub(crate) struct OwnerSet<T>(
+    std::collections::HashMap<usize, Arc<T>, std::hash::BuildHasherDefault<PtrHasher>>,
+);
+impl<T> Default for OwnerSet<T> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+impl<T> OwnerSet<T> {
+    /// Hold `entry` unless an equal pointer is already held.
+    pub(crate) fn insert(&mut self, entry: Arc<T>) {
+        self.0.entry(Arc::as_ptr(&entry) as usize).or_insert(entry);
+    }
+    /// Whether the entry at address `key` is held.
+    pub(crate) fn contains(&self, key: usize) -> bool {
+        self.0.contains_key(&key)
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// Move every entry of `other` into this set.
+    pub(crate) fn absorb(&mut self, other: &mut Self) {
+        self.0.extend(other.0.drain());
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct HeapOwners {
     pub(crate) vheap: VheapCold,
     pub(crate) off_heap_first: usize,
     pub(crate) wrt_bins: usize,
     pub(crate) overhead: u64,
-    pub(crate) funs: Vec<Arc<FunEntry>>,
-    pub(crate) exports: Vec<Arc<ExportEntry>>,
-    pub(crate) old_funs: Vec<Arc<FunEntry>>,
-    pub(crate) old_exports: Vec<Arc<ExportEntry>>,
+    pub(crate) funs: OwnerSet<FunEntry>,
+    pub(crate) exports: OwnerSet<ExportEntry>,
+    pub(crate) old_funs: OwnerSet<FunEntry>,
+    pub(crate) old_exports: OwnerSet<ExportEntry>,
     /// Heap that receives all allocations while the heap is detached.
     pub(crate) detached: Option<Box<VecHeap>>,
 }
@@ -1658,10 +1705,10 @@ impl ProcessHeap {
                 Self::prepend_bin_ref_chain(&mut target.off_heap_first, owners.off_heap_first);
                 Self::prepend_bin_ref_chain(&mut target.wrt_bins, owners.wrt_bins);
                 target.overhead = target.overhead.saturating_add(owners.overhead);
-                target.funs.append(&mut owners.funs);
-                target.exports.append(&mut owners.exports);
-                target.old_funs.append(&mut owners.old_funs);
-                target.old_exports.append(&mut owners.old_exports);
+                target.funs.absorb(&mut owners.funs);
+                target.exports.absorb(&mut owners.exports);
+                target.old_funs.absorb(&mut owners.old_funs);
+                target.old_exports.absorb(&mut owners.old_exports);
             } else {
                 self.owners.0 = Some(owners);
             }
@@ -2024,7 +2071,7 @@ impl HeapAlloc for ProcessHeap {
         {
             return heap.retain_fun(entry);
         }
-        self.owners.funs.push(entry);
+        self.owners.funs.insert(entry);
     }
     fn retain_export(&mut self, entry: Arc<ExportEntry>) {
         if self.detached
@@ -2032,7 +2079,7 @@ impl HeapAlloc for ProcessHeap {
         {
             return heap.retain_export(entry);
         }
-        self.owners.exports.push(entry);
+        self.owners.exports.insert(entry);
     }
     fn link_magic_ref(
         &mut self,
