@@ -5,7 +5,9 @@ use crate::tree::Node;
 use arc_swap::ArcSwap;
 use arinsal_term::{TermBuilder, VecHeap};
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicIsize, AtomicUsize, Ordering as AtomicOrdering,
+};
 use std::sync::{Arc, Mutex, RwLock};
 
 const LOCK_FAILURE_CONTRIBUTION: i64 = 250;
@@ -37,7 +39,9 @@ impl BaseNode {
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, Option<Box<Node>>> {
         match self.root.try_write() {
             Ok(guard) => {
-                self.adjust_stat(LOCK_SUCCESS_CONTRIBUTION);
+                // Port of erts/emulator/beam/erl_db_catree.c:809 (wlock_base_node), OTP-29.1.1.
+                // OTP subtracts the negative success contribution, so an uncontended write adds one.
+                self.adjust_stat(-LOCK_SUCCESS_CONTRIBUTION);
                 guard
             }
             Err(_) => {
@@ -180,6 +184,7 @@ pub(crate) struct CATree {
     gravity_join_count: AtomicUsize,
     force_split: AtomicBool,
     debug_random_split_join: AtomicBool,
+    memory_words: AtomicIsize,
 }
 
 impl CATree {
@@ -198,7 +203,12 @@ impl CATree {
             gravity_join_count: AtomicUsize::new(0),
             force_split: AtomicBool::new(false),
             debug_random_split_join: AtomicBool::new(false),
+            memory_words: AtomicIsize::new(0),
         }
+    }
+
+    pub(crate) fn object_memory_words(&self) -> isize {
+        self.memory_words.load(AtomicOrdering::Relaxed)
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c:1757 (catree_find_root), OTP-29.1.1.
@@ -225,11 +235,16 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
+            let old_words = Node::get(&root, key, self.keypos)
+                .map_or(0, |stored| stored.db_size_words as isize);
+            let new_words = object.as_ref().unwrap().db_size_words as isize;
             *root = Some(Node::insert(
                 root.take(),
                 object.take().unwrap(),
                 self.keypos,
             ));
+            self.memory_words
+                .fetch_add(new_words - old_words, AtomicOrdering::Relaxed);
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
             self.adapt(base, stat);
@@ -374,9 +389,13 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
-            if Node::get(&root, key, self.keypos).is_some_and(|found| found.exact_eq_input(object))
-            {
+            let removed_words = Node::get(&root, key, self.keypos)
+                .filter(|found| found.exact_eq_input(object))
+                .map_or(0, |found| found.db_size_words as isize);
+            if removed_words != 0 {
                 *root = Node::remove(root.take(), key, self.keypos);
+                self.memory_words
+                    .fetch_sub(removed_words, AtomicOrdering::Relaxed);
             }
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
@@ -397,7 +416,11 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
+            let removed_words =
+                Node::get(&root, key, self.keypos).map_or(0, |found| found.db_size_words as isize);
             *root = Node::remove(root.take(), key, self.keypos);
+            self.memory_words
+                .fetch_sub(removed_words, AtomicOrdering::Relaxed);
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
             self.adapt(base, stat);
@@ -425,6 +448,7 @@ impl CATree {
                 roots.push(root);
             }
         }
+        self.memory_words.store(0, AtomicOrdering::Relaxed);
         self.routes
             .store(Arc::new(RouteSnapshot::new(vec![RouteEntry {
                 first_key: None,

@@ -22,3 +22,4 @@ num-traits.workspace = true
 [dev-dependencies]
 arinsal-difftest.workspace = true
 arinsal-etf.workspace = true
+similar-asserts = "2"
