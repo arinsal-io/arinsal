@@ -1051,6 +1051,8 @@ pub(crate) struct Runtime {
     aliases: AliasTable,
     pub(crate) next_trace_weak_id: AtomicU64,
     pub(crate) ports: Mutex<HashMap<u64, Arc<crate::port::PortHandle>>>,
+    /// Persistent `erl_child_setup` process; all OS port children are forked there.
+    pub(crate) child_setup: Arc<crate::child_setup::ChildSetup>,
     pub(crate) system_monitor: Mutex<Option<crate::natives::erts_debug::SystemMonitorState>>,
     /// `system_monitor` state of dynamic trace sessions, keyed by session id.
     pub(crate) session_monitors: Mutex<Vec<(u64, crate::natives::erts_debug::SystemMonitorState)>>,
@@ -8104,6 +8106,16 @@ impl Vm {
         if module != "erl_init" {
             initialize_feature_defaults(arinsal_pterm::store_for(self.code_scope))?;
         }
+        let child_setup = match &self.child_setup {
+            Some(child_setup) => Arc::clone(child_setup),
+            None => {
+                let child_setup = crate::child_setup::start().map_err(|error| {
+                    VmError::Load(format!("cannot start erl_child_setup: {error}"))
+                })?;
+                self.child_setup = Some(Arc::clone(&child_setup));
+                child_setup
+            }
+        };
         let module_id = self.load_named(module)?;
         let ip = self.code.modules[module_id]
             .export(function, args.len() as u8)
@@ -8133,6 +8145,7 @@ impl Vm {
             aliases: AliasTable::new(),
             next_trace_weak_id: AtomicU64::new(0),
             ports: Mutex::new(HashMap::new()),
+            child_setup,
             system_monitor: Mutex::new(None),
             session_monitors: Mutex::new(Vec::new()),
             system_monitor_flags: AtomicU8::new(0),

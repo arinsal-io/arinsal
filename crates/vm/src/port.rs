@@ -10,13 +10,10 @@ use arinsal_term::{
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 mod drv_sig;
@@ -24,82 +21,103 @@ mod drv_sig;
 // Port of erts/emulator/beam/erl_bif_port.c:824 (open_port defaults), OTP-29.1.1.
 const DEFAULT_HIGH: usize = 8192;
 const DEFAULT_LOW: usize = 4096;
-const INLINE_ENV_LIMIT: usize = 128 * 1024;
-static NEXT_CHILD_CONFIG: AtomicU64 = AtomicU64::new(0);
+const CHILD_FLAG_USE_STDIO: i32 = 1 << 0;
+const CHILD_FLAG_EXIT_STATUS: i32 = 1 << 1;
+const CHILD_FLAG_DO_READ: i32 = 1 << 2;
+const CHILD_FLAG_DO_WRITE: i32 = 1 << 3;
 
-fn write_port_exec_config(
+// Port of erts/emulator/sys/unix/sys_drivers.c (`spawn_start`) and
+// erts/emulator/sys/unix/erl_child_setup.c (`start_new_child`), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)]
+fn child_setup_payload(
+    executable: bool,
+    name: &str,
     program: &OsStr,
     args: &[OsString],
     arg0: Option<&OsStr>,
     cwd: Option<&OsStr>,
     env: &[(OsString, OsString)],
-) -> std::io::Result<std::path::PathBuf> {
-    fn push_bytes(output: &mut Vec<u8>, value: &[u8]) -> std::io::Result<()> {
-        let len = u32::try_from(value.len()).map_err(|_| {
-            std::io::Error::new(
+    use_stdio: bool,
+    read_write: u8,
+    exit_status: bool,
+) -> std::io::Result<Vec<u8>> {
+    fn push_cstring(payload: &mut Vec<u8>, value: &[u8]) -> std::io::Result<()> {
+        if value.contains(&0) {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "port config field too large",
-            )
-        })?;
-        output.extend_from_slice(&len.to_le_bytes());
-        output.extend_from_slice(value);
+                "NUL in child setup string",
+            ));
+        }
+        payload.extend_from_slice(value);
+        payload.push(0);
         Ok(())
     }
 
-    fn push_optional(output: &mut Vec<u8>, value: Option<&OsStr>) -> std::io::Result<()> {
-        match value {
-            Some(value) => {
-                output.push(1);
-                push_bytes(output, value.as_bytes())
-            }
-            None => {
-                output.push(0);
-                Ok(())
-            }
+    fn push_i32(payload: &mut Vec<u8>, value: usize) -> std::io::Result<()> {
+        let value = i32::try_from(value).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "child setup field too large",
+            )
+        })?;
+        payload.extend_from_slice(&value.to_be_bytes());
+        Ok(())
+    }
+
+    let mut flags = 0;
+    if use_stdio {
+        flags |= CHILD_FLAG_USE_STDIO;
+    }
+    if exit_status {
+        flags |= CHILD_FLAG_EXIT_STATUS;
+    }
+    if read_write & 1 != 0 {
+        flags |= CHILD_FLAG_DO_READ;
+    }
+    if read_write & 2 != 0 {
+        flags |= CHILD_FLAG_DO_WRITE;
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&flags.to_be_bytes());
+    if executable {
+        push_cstring(&mut payload, program.as_bytes())?;
+    } else {
+        let mut command = b"exec ".to_vec();
+        command.extend_from_slice(name.as_bytes());
+        push_cstring(&mut payload, &command)?;
+    }
+    let current_directory = std::env::current_dir()?;
+    push_cstring(&mut payload, current_directory.as_os_str().as_bytes())?;
+    if let Some(wd) = cwd {
+        push_cstring(&mut payload, wd.as_bytes())?;
+        payload.push(0);
+    } else {
+        payload.push(0);
+    }
+    push_i32(&mut payload, env.len())?;
+    for (key, value) in env {
+        let mut entry = key.as_bytes().to_vec();
+        entry.push(b'=');
+        entry.extend_from_slice(value.as_bytes());
+        push_cstring(&mut payload, &entry)?;
+    }
+    if executable {
+        push_i32(&mut payload, args.len() + 1)?;
+        push_cstring(&mut payload, arg0.unwrap_or(program).as_bytes())?;
+        for arg in args {
+            push_cstring(&mut payload, arg.as_bytes())?;
         }
     }
-
-    let mut bytes = b"ARPC\x01".to_vec();
-    push_bytes(&mut bytes, program.as_bytes())?;
-    push_optional(&mut bytes, arg0)?;
-    push_optional(&mut bytes, cwd)?;
-    bytes.extend_from_slice(
-        &u32::try_from(args.len())
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many port args")
-            })?
-            .to_le_bytes(),
-    );
-    for arg in args {
-        push_bytes(&mut bytes, arg.as_bytes())?;
-    }
-    bytes.extend_from_slice(
-        &u32::try_from(env.len())
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many port env vars")
-            })?
-            .to_le_bytes(),
-    );
-    for (key, value) in env {
-        push_bytes(&mut bytes, key.as_bytes())?;
-        push_bytes(&mut bytes, value.as_bytes())?;
-    }
-
-    let path = std::env::temp_dir().join(format!(
-        "arinsal-port-child-{}-{}.bin",
-        std::process::id(),
-        NEXT_CHILD_CONFIG.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
-    if let Err(error) = file.write_all(&bytes) {
-        let _ = std::fs::remove_file(&path);
-        return Err(error);
-    }
-    Ok(path)
+    let size = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "child setup payload too large",
+        )
+    })?;
+    let mut request = Vec::with_capacity(payload.len() + 4);
+    request.extend_from_slice(&size.to_ne_bytes());
+    request.extend_from_slice(&payload);
+    Ok(request)
 }
 
 thread_local! {
@@ -1053,126 +1071,63 @@ fn start(
             ));
         }
     }
-    let env_size = child_env
-        .iter()
-        .map(|(key, value)| key.as_bytes().len() + value.as_bytes().len() + 2)
-        .sum::<usize>();
-    let mut config_path = None;
-    let mut command = if env_size > INLINE_ENV_LIMIT || child_cwd.is_some() {
-        // Port of erts/emulator/sys/unix/erl_child_setup.c:220-363, OTP-29.1.1.
-        let helper = port_exec_helper().ok_or_else(badarg)?;
-        let path = write_port_exec_config(
-            &child_program,
-            &child_args,
-            child_arg0.as_deref(),
-            child_cwd.as_deref(),
-            &child_env,
-        )
-        .map_err(|_| badarg())?;
-        config_path = Some(path.clone());
-        let mut helper_command = Command::new(helper);
-        helper_command
-            .arg("--port-exec-config")
-            .arg(path)
-            .env_clear();
-        helper_command
-    } else {
-        let mut child_command = Command::new(child_program);
-        child_command.args(child_args).env_clear().envs(child_env);
-        if let Some(arg0) = child_arg0 {
-            child_command.arg0(arg0);
-        }
-        if let Some(cwd) = child_cwd {
-            child_command.current_dir(cwd);
-        }
-        child_command
-    };
-    command
-        .stdin(if rw & 2 != 0 {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(if rw & 1 != 0 {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stderr(if stderr_to_stdout {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        });
-    // Hold the publish lock across the fd scan and spawn so a descriptor created on
-    // another thread cannot appear after the list is taken (erl_child_setup.c:313-318
-    // and closefrom at :466-470: only 0, 1, 2 and maybe 3, 4 survive exec).
-    let mut child = match cloexec_publish(|| {
-        let stray: Vec<i32> = std::fs::read_dir("/dev/fd")
-            .map(|entries| {
-                entries
-                    .filter_map(|entry| entry.ok()?.file_name().into_string().ok()?.parse().ok())
-                    .filter(|fd: &i32| *fd >= 3)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let keep_below = if use_stdio { 3 } else { 5 };
-        // SAFETY: pre_exec runs in the forked child after Command has dup2'd stdio.
-        // dup2 and close are async-signal-safe. Descriptors at or above `keep_below`
-        // are the ones erl_child_setup closes before exec.
-        unsafe {
-            command.pre_exec(move || {
-                unsafe extern "C" {
-                    fn dup2(oldfd: i32, newfd: i32) -> i32;
-                    fn close(fd: i32) -> i32;
-                }
-                // dup2/close are async-signal-safe and run in the forked child.
-                if stderr_to_stdout && dup2(1, 2) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if !use_stdio {
-                    if rw & 2 != 0 && dup2(0, 3) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if rw & 1 != 0 && dup2(1, 4) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                for fd in &stray {
-                    if *fd >= keep_below {
-                        close(*fd);
-                    }
-                }
-                Ok(())
-            });
-        }
-        command.spawn()
-    }) {
-        Ok(child) => child,
-        Err(error) => {
-            if let Some(path) = config_path {
-                let _ = std::fs::remove_file(path);
-            }
-            if executable {
-                let reason = match error.kind() {
-                    std::io::ErrorKind::NotFound => "enoent",
-                    std::io::ErrorKind::PermissionDenied => "eacces",
-                    _ => return Err(badarg()),
-                };
-                return Err(VmError::Trap(crate::exceptions::Trap::error(atom(reason))));
-            }
-            return Err(badarg());
-        }
-    };
-    let os_pid = child.id();
-    let out = child.stdin.take().map(owned_stdio);
-    let read_fd = child
-        .stdout
-        .take()
-        .map(|stdout: ChildStdout| stdout.into_raw_fd());
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
     let reservation = reserve_port_id(runtime)?;
     let port_id = reservation.id();
+    if executable
+        && let Err(error) = rustix::fs::access(&child_program, rustix::fs::Access::EXEC_OK)
+    {
+        return match error.raw_os_error() {
+            libc::ENOENT => Err(VmError::Trap(crate::exceptions::Trap::error(atom(
+                "enoent",
+            )))),
+            libc::EACCES => Err(VmError::Trap(crate::exceptions::Trap::error(atom(
+                "eacces",
+            )))),
+            _ => Err(badarg()),
+        };
+    }
+    let setup = child_setup_payload(
+        executable,
+        &name,
+        &child_program,
+        &child_args,
+        child_arg0.as_deref(),
+        child_cwd.as_deref(),
+        &child_env,
+        use_stdio,
+        rw,
+        want_status,
+    )
+    .map_err(|_| badarg())?;
+    let spawned = runtime
+        .child_setup
+        .spawn(
+            port_id,
+            &setup,
+            want_status,
+            use_stdio,
+            rw,
+            stderr_to_stdout,
+        )
+        .map_err(|error| {
+            if executable {
+                let reason = match error.kind() {
+                    std::io::ErrorKind::NotFound => Some("enoent"),
+                    std::io::ErrorKind::PermissionDenied => Some("eacces"),
+                    _ => None,
+                };
+                if let Some(reason) = reason {
+                    return VmError::Trap(crate::exceptions::Trap::error(atom(reason)));
+                }
+            }
+            badarg()
+        })?;
+    let os_pid = spawned.os_pid;
+    let out = spawned.input;
+    let read_fd = spawned.output.map(IntoRawFd::into_raw_fd);
+    let child_status = spawned.status;
     let port = Term::port(port_id).ok_or_else(badarg)?;
     let handle = make_handle(
         port_id,
@@ -1202,7 +1157,7 @@ fn start(
         .spawn(move || {
             worker(
                 handle,
-                Some(child),
+                child_status,
                 read_fd,
                 scheduler,
                 runtime_weak,
@@ -2067,22 +2022,6 @@ fn erl_launcher(name: &str, executable: bool) -> bool {
         .is_some_and(|file| file == "erl")
 }
 
-fn port_exec_helper() -> Option<std::path::PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    if executable.file_stem().is_some_and(|name| name == "arinsal") {
-        return Some(executable);
-    }
-    let mut directory = executable.parent();
-    while let Some(parent) = directory {
-        let candidate = parent.join("arinsal");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        directory = parent.parent();
-    }
-    None
-}
-
 /// Failure while creating the accepted TCP port.
 pub(crate) enum InetPortAllocError {
     /// The runtime port table has no free identifiers.
@@ -2270,13 +2209,6 @@ pub(crate) fn duplicate_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
         // SAFETY: copy is a fresh descriptor owned by this OwnedFd.
         Ok(unsafe { OwnedFd::from_raw_fd(copy) })
     })
-}
-
-fn owned_stdio(file: impl IntoRawFd) -> OwnedFd {
-    let fd = file.into_raw_fd();
-    set_nonblock(fd);
-    // SAFETY: into_raw_fd transferred ownership of this descriptor.
-    unsafe { OwnedFd::from_raw_fd(fd) }
 }
 
 fn set_nonblock(fd: RawFd) {
@@ -2787,15 +2719,6 @@ fn command_bytes(handle: &PortHandle, data: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
-/// Exit status of a child as a driver reports it: the exit code, or 128 plus the signal number.
-fn child_exit_code(status: std::process::ExitStatus) -> i64 {
-    use std::os::unix::process::ExitStatusExt;
-    match status.signal() {
-        Some(signal) => 128 + i64::from(signal),
-        None => i64::from(status.code().unwrap_or(0)),
-    }
-}
-
 fn exit_status_message(
     scheduler: &Scheduler<Process>,
     owner: Pid,
@@ -2861,7 +2784,7 @@ fn end_of_input(
 #[allow(clippy::too_many_arguments)]
 fn worker(
     handle: Arc<PortHandle>,
-    mut child: Option<Child>,
+    child_status: Option<Receiver<i64>>,
     read_fd: Option<RawFd>,
     scheduler: Arc<Scheduler<Process>>,
     runtime: Weak<crate::process::Runtime>,
@@ -2895,11 +2818,10 @@ fn worker(
             break;
         }
         if eof_waiting
-            && let Some(status) = child
-                .as_mut()
-                .and_then(|child| child.try_wait().ok().flatten())
+            && exit_code.is_none()
+            && let Some(code) = child_status_code(&child_status)
         {
-            exit_code = Some(child_exit_code(status));
+            exit_code = Some(code);
             eof_waiting = false;
             match end_of_input(
                 &handle, &scheduler, owner, id, binary, framing, want_eof, exit_code, false,
@@ -3028,13 +2950,11 @@ fn worker(
                 }
                 if want_status
                     && exit_code.is_none()
-                    && let Some(status) = child
-                        .as_mut()
-                        .and_then(|child| child.try_wait().ok().flatten())
+                    && let Some(code) = child_status_code(&child_status)
                 {
-                    exit_code = Some(child_exit_code(status));
+                    exit_code = Some(code);
                 }
-                let child_running = want_status && exit_code.is_none() && child.is_some();
+                let child_running = want_status && exit_code.is_none() && child_status.is_some();
                 match end_of_input(
                     &handle,
                     &scheduler,
@@ -3080,30 +3000,23 @@ fn worker(
         drop(st);
     }
     if eof_terminate && !handle.state.lock().unwrap().closed {
-        eof_exit(
-            &handle, &scheduler, &runtime, owner, id, wake_r, read_fd, child,
-        );
+        eof_exit(&handle, &scheduler, &runtime, owner, id, wake_r, read_fd);
         return;
     }
     let woken = flush_output(&handle);
     wake_suspended(&scheduler, woken);
     close_worker_fds(wake_r, read_fd);
     let closed = handle.state.lock().unwrap().closed;
-    // Port of erts/emulator/sys/unix/sys_drivers.c:1039 (stop), OTP-29.1.1.
-    // Close the child's input first; a detached child may keep running after
-    // the port descriptors close, so reap it only after its own exit.
-    if let Some(mut child) = child.take() {
-        if closed {
-            handle.out.lock().unwrap().take();
-            // erts frees a killed port without waiting for the child; the forker
-            // reports its exit later (sys_drivers.c:1039 stop), so halt need not wait.
-            handle.finish_halt();
-        }
-        let status = child.wait().ok();
-        if !closed && want_status && !status_reported {
-            let code = status.map(child_exit_code).unwrap_or(1);
-            exit_status_message(&scheduler, owner, id, handle.trace_scope, code);
-        }
+    // Port of erts/emulator/sys/unix/sys_drivers.c (`stop`), OTP-29.1.1.
+    // The helper reaps children after their ports close and reports statuses by port id.
+    if closed {
+        handle.out.lock().unwrap().take();
+        handle.finish_halt();
+    } else if want_status
+        && !status_reported
+        && let Some(code) = child_status_code(&child_status)
+    {
+        exit_status_message(&scheduler, owner, id, handle.trace_scope, code);
     }
     handle.state.lock().unwrap().exit_complete = true;
     handle.finish_halt();
@@ -3139,7 +3052,6 @@ fn eof_exit(
     id: u64,
     wake_r: RawFd,
     read_fd: Option<RawFd>,
-    mut child: Option<Child>,
 ) {
     if let Some(runtime) = runtime.upgrade() {
         let listed = runtime.ports.lock().unwrap().contains_key(&id);
@@ -3173,8 +3085,14 @@ fn eof_exit(
         event_message(scheduler, owner, id, handle.trace_scope, atom("closed"));
     }
     notify_closed(handle, id, scheduler, owner, false);
-    if let Some(mut child) = child.take() {
-        let _ = child.wait();
+}
+
+fn child_status_code(status: &Option<Receiver<i64>>) -> Option<i64> {
+    let status = status.as_ref()?;
+    match status.try_recv() {
+        Ok(code) => Some(code),
+        Err(mpsc::TryRecvError::Empty) => None,
+        Err(mpsc::TryRecvError::Disconnected) => Some(1),
     }
 }
 

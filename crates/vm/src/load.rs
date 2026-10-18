@@ -758,6 +758,7 @@ impl Vm {
         let code_ix = crate::code_ix::for_scope(code_scope);
         Self {
             paths,
+            child_setup: None,
             statistics_origins: if replica {
                 crate::natives::sys::StatisticsOrigins::now()
             } else {

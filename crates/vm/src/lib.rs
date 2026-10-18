@@ -9,6 +9,7 @@ mod bif_table;
 pub mod boot;
 mod calls;
 mod check_io;
+mod child_setup;
 mod code_ix;
 mod compare;
 mod ddll;
@@ -30,6 +31,12 @@ mod lists;
 mod process;
 mod register;
 pub use beamasm_integration::{interp_native_starts, interp_slices};
+/// Run the persistent child-setup helper mode selected by the CLI.
+#[doc(hidden)]
+pub use child_setup::run_child_setup;
+/// Run one staged child exec request selected by the CLI.
+#[doc(hidden)]
+pub use child_setup::run_child_setup_exec;
 pub use process::ScheduledResult;
 mod inet_drv;
 // g_inet_udp
@@ -234,6 +241,8 @@ pub struct EvalResult {
 /// Lazy module loader and single-process execution engine.
 pub struct Vm {
     paths: Vec<PathBuf>,
+    /// The node's `erl_child_setup` process, started when scheduled execution begins.
+    pub(crate) child_setup: Option<Arc<crate::child_setup::ChildSetup>>,
     pub(crate) statistics_origins: crate::natives::sys::StatisticsOrigins,
     pub(crate) otp_root: Option<PathBuf>,
     /// The code tables of `erts_active_code_ix()` this VM reads (see [`Vm::refresh_code`]).
