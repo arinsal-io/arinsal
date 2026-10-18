@@ -898,7 +898,7 @@ pub(crate) struct StoredTerm {
     compressed_elements: Vec<Option<Vec<u8>>>,
     compressed_magic_refs: Vec<Option<Arc<MagicRef>>>,
     compressed_bytes: usize,
-    db_size_words: usize,
+    pub(crate) db_size_words: usize,
     order: u64,
     group_order: u64,
     hvalue: u64,
@@ -2068,10 +2068,7 @@ impl Table {
                 } else {
                     146
                 };
-                table
-                    + tree.objects().map_or(0, |objects| {
-                        objects.iter().map(|object| object.db_size_words).sum()
-                    })
+                table + tree.object_memory_words().max(0) as usize
             }
             Storage::Hash(storage) => {
                 // The empty hash table reports 312 words on OTP 29.1.1/M1;
@@ -2135,13 +2132,12 @@ impl Table {
                 } else {
                     0
                 };
-                312 + extra_slots + ext_table + fine_locks + read_lock + decentralized + {
-                    let mut object_words = 0;
-                    storage.for_each_value(|object| {
-                        object_words += object.db_size_words;
-                    });
-                    object_words
-                }
+                312 + extra_slots
+                    + ext_table
+                    + fine_locks
+                    + read_lock
+                    + decentralized
+                    + storage.object_memory_words().max(0) as usize
             }
         }
     }
@@ -3064,6 +3060,7 @@ impl Table {
                 }
                 let garbage = storage.take_garbage();
                 storage.size.store(0, AtomicOrdering::Relaxed);
+                storage.reset_object_memory();
                 Garbage(GarbageKind::Hash(garbage))
             }
         }
@@ -3087,6 +3084,7 @@ impl Table {
                     return false;
                 }
                 storage.size.store(0, AtomicOrdering::Relaxed);
+                storage.reset_object_memory();
                 *reds = loops.max(0) / LOOPS_PER_REDUCTION;
                 return true;
             }
@@ -3109,6 +3107,7 @@ impl Table {
                     storage.clear_buckets();
                 }
                 storage.size.store(0, AtomicOrdering::Relaxed);
+                storage.reset_object_memory();
             }
         }
     }

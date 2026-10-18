@@ -191,6 +191,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "parking_lot",
+ "similar-asserts",
  "smallvec",
 ]
 

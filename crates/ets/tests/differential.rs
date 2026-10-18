@@ -1,11 +1,12 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_ets::{
-    BigCounterOp, ConcurrentTable, CounterOp, Protection, Registry, TableOptions, TableType,
+    BigCounterOp, ConcurrentTable, CounterOp, Protection, Registry, Table, TableOptions, TableType,
     WriteConcurrency,
     match_spec::{MatchContext, MatchDialect, MatchProgram, match_spec_test},
 };
 use arinsal_term::{Term, TermBuilder, VecHeap, from_owned, global_atoms, to_owned};
+use similar_asserts::assert_eq;
 
 fn atom(name: &str) -> OwnedTerm {
     OwnedTerm::atom(name)
@@ -581,6 +582,56 @@ fn table_memory_concurrency_options_match_otp() {
             .collect::<Vec<_>>(),
         "set, fixed write concurrency locks=1024"
     );
+}
+
+#[test]
+fn table_memory_counter_tracks_concurrent_writes_like_otp() {
+    let Some(erl) = reference() else { return };
+    let schedulers = match erl.eval("erlang:system_info(schedulers)").unwrap() {
+        OwnedTerm::Int(count) => count as usize,
+        other => panic!("unexpected scheduler count: {other:?}"),
+    };
+    const PER_WORKER: i64 = 256;
+    const WORKERS: i64 = 4;
+    let max_key = PER_WORKER * WORKERS;
+    for (kind, name) in [
+        (TableType::Set, "set"),
+        (TableType::OrderedSet, "ordered_set"),
+    ] {
+        let expected = erl
+            .eval(&format!(
+                "T=ets:new(t,[public,{name},{{write_concurrency,true}},{{decentralized_counters,false}}]), ets:insert(T,[{{I,I}} || I <- lists:seq(1,{max_key})]), ets:info(T,memory)"
+            ))
+            .unwrap();
+        let mut settings = options(kind);
+        settings.protection = Protection::Public;
+        settings.write_concurrency = WriteConcurrency::Enabled;
+        let mut registry = Registry::new();
+        let tid = registry.create(settings).unwrap();
+        let shared = std::sync::Arc::clone(registry.shared(tid).unwrap());
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let shared = std::sync::Arc::clone(&shared);
+                scope.spawn(move || {
+                    for offset in 1..=PER_WORKER {
+                        let key = worker * PER_WORKER + offset;
+                        let mut heap = VecHeap::new();
+                        let object = TermBuilder::new(&mut heap)
+                            .tuple(&[Term::small(key).unwrap(), Term::small(key).unwrap()])
+                            .unwrap();
+                        let table = shared.read();
+                        let prepared = Table::prepare_object(&table.options, object).unwrap();
+                        assert!(table.insert_shared(prepared).is_none());
+                    }
+                });
+            }
+        });
+        let actual = registry
+            .get(tid)
+            .unwrap()
+            .memory_words_for_schedulers(schedulers);
+        assert_eq!(expected, OwnedTerm::Int(actual as i64), "{name}");
+    }
 }
 
 #[test]

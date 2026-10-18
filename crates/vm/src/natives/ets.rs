@@ -851,7 +851,7 @@ fn insert_args(
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
-    let shared = registry.shared(tid).map_err(err)?;
+    let shared = std::sync::Arc::clone(registry.shared(tid).map_err(err)?);
     let options = shared.options();
     if single
         && options.write_concurrency != WriteConcurrency::Disabled
@@ -945,9 +945,12 @@ fn insert_list(
     }
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
-    let shared = registry.shared(tid).map_err(err)?;
+    let shared = std::sync::Arc::clone(registry.shared(tid).map_err(err)?);
     let options = shared.options();
     let items = list(objects).ok_or_else(badarg)?;
+    // Keep the table alive by its shared handle. Holding the registry lock while waiting for a
+    // table writer prevents ets:delete/1 from detaching the table, unlike erts' btid reference.
+    drop(registry);
     // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_check), OTP-29.1.1: the
     // check pass is a yieldable loop that takes one iteration per object.
     let checked = match &state {
@@ -970,10 +973,21 @@ fn insert_list(
         .is_none_or(|state| matches!(state, EtsInsert::Check(_)))
         && options.table_type != TableType::Bag
         && options.table_type != TableType::DuplicateBag
-        && items.len() as isize <= loops
+        // Port of erts/emulator/beam/erl_db.c:1946-1949 (can_insert_without_yield), OTP-29.1.1.
+        && items.len() as isize <= initial
     {
         // Enough reductions to insert straight from the heap.
-        let mut table = registry.get_mut(tid).map_err(err)?;
+        let mut table = shared.write();
+        if table.is_detached()
+            || target
+                .as_atom()
+                .is_some_and(|name| table.options.named_table && table.options.name != name)
+        {
+            return Err(err(EtsError::NoTable));
+        }
+        if table.is_busy() {
+            return Err(err(EtsError::Busy));
+        }
         if !allowed(&table, caller, true) {
             return Err(badarg_cause("access"));
         }
@@ -987,6 +1001,8 @@ fn insert_list(
         loops -= 2 * items.len() as isize;
         return done(process, ctx, loops, yes);
     }
+    // erts keeps the table identity alive while copying but releases the global table registry
+    // lock. A concurrent delete must be able to detach the table during this yielding phase.
     // Copy the list into table form so that other processes can help.
     let mut prepared = match state.take() {
         Some(EtsInsert::Copy(prepared)) => prepared,
@@ -1004,7 +1020,10 @@ fn insert_list(
                 // A malformed object: the access failure is reported first, as the list check
                 // of ets_insert_2_list does.
                 if error == EtsError::BadArg {
-                    let table = registry.get_shared(tid).map_err(err)?;
+                    let table = shared.read();
+                    if table.is_detached() {
+                        return Err(err(EtsError::NoTable));
+                    }
                     if !allowed(&table, caller, true) {
                         return Err(badarg_cause("access"));
                     }
@@ -1014,16 +1033,20 @@ fn insert_list(
         }
         loops -= 1;
     }
-    let mut table = match registry.get_mut(tid) {
-        Ok(table) => table,
-        Err(error) => {
-            // A busy table: keep the copies and try again after helping.
-            if error == EtsError::Busy {
-                process.cold_mut().ets_insert = Some(EtsInsert::Copy(prepared));
-            }
-            return Err(err(error));
-        }
-    };
+    // Acquire the table lock independently of the registry, as in ets_insert_2_list_lock_tbl.
+    let mut table = shared.write();
+    if table.is_detached()
+        || target
+            .as_atom()
+            .is_some_and(|name| table.options.named_table && table.options.name != name)
+    {
+        return Err(err(EtsError::NoTable));
+    }
+    if table.is_busy() {
+        drop(table);
+        process.cold_mut().ets_insert = Some(EtsInsert::Copy(prepared));
+        return Err(err(EtsError::Busy));
+    }
     if !allowed(&table, caller, true) {
         return Err(badarg_cause("access"));
     }
