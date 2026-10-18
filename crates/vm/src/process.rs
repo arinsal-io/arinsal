@@ -4555,7 +4555,7 @@ impl Runtime {
         monitor: Option<(Pid, u64)>,
         parent: &arinsal_etf::OwnedTerm,
     ) -> Result<Pid, VmError> {
-        self.spawn_mfa_scheduled(module, function, args, false, linker, monitor, Some(parent))
+        self.spawn_mfa_scheduled(module, function, args, linker, monitor, Some(parent))
     }
 
     fn spawn_mfa_scheduled(
@@ -4563,7 +4563,6 @@ impl Runtime {
         module: &str,
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
-        scheduled: bool,
         linker: Option<Pid>,
         monitor: Option<(Pid, u64)>,
         parent: Option<&arinsal_etf::OwnedTerm>,
@@ -4617,12 +4616,9 @@ impl Runtime {
                 .map_err(|_| VmError::Unsupported("spawn argument copy failed".into()))?;
         }
         let scheduler = self.scheduler()?;
-        let pid = if scheduled {
-            scheduler.spawn(child)
-        } else {
-            scheduler.spawn_unscheduled(child)
-        }
-        .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
+        let pid = scheduler
+            .spawn_unscheduled(child)
+            .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
         Ok(pid)
     }
 
