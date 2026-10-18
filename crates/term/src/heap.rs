@@ -1706,8 +1706,7 @@ impl ProcessHeap {
             if off_heap_node_is_bin_ref(head) {
                 let val = load((head as *const u64).wrapping_add(1));
                 bytes = bytes.saturating_add(if crate::bits::bin_ref_val_is_external(val) {
-                    // SAFETY: the list entry owns the `Arc<ExternalBinary>` named by `val`.
-                    unsafe { (*crate::bits::external_val_ptr(val)).len() as u64 }
+                    crate::bits::external_val_len(val) as u64
                 } else {
                     load((val as *const u64).wrapping_add(3))
                 });
@@ -1730,13 +1729,11 @@ impl ProcessHeap {
                 if off_heap_node_is_bin_ref(head) {
                     let val = load(bin_ref.wrapping_add(1));
                     if crate::bits::bin_ref_val_is_external(val) {
-                        let ptr = crate::bits::external_val_ptr(val);
-                        // SAFETY: the list entry owns the `Arc<ExternalBinary>` named by `val`.
-                        let (len, count) = unsafe {
-                            let owner = std::mem::ManuallyDrop::new(Arc::from_raw(ptr));
-                            ((*ptr).len(), Arc::strong_count(&owner))
-                        };
-                        out.push((ptr as usize, len, count));
+                        out.push((
+                            crate::bits::external_val_ptr(val) as usize,
+                            crate::bits::external_val_len(val),
+                            crate::bits::external_val_strong_count(val),
+                        ));
                     } else {
                         let binary = val as *const u64;
                         out.push((
