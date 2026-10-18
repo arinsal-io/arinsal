@@ -11,6 +11,7 @@ use arinsal_beamjit::{
     BifMfaHelper, MapLookupHelper, ModuleEnv, compile_parsed_module_with_options,
 };
 use arinsal_term::{Term, TermBuilder, VecHeap, from_owned, global_atoms};
+use num_bigint::BigInt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1461,6 +1462,7 @@ fn beamasm_enabled(
 
 struct VmModuleEnv<'a> {
     literal_heap: std::cell::RefCell<&'a mut VecHeap>,
+    dynamic_integer_literals: std::cell::RefCell<HashMap<BigInt, u64>>,
     literals: Vec<u64>,
     zero_capture_funs: HashMap<u32, u64>,
     lambda_entries: HashMap<u32, Arc<arinsal_term::FunEntry>>,
@@ -1557,6 +1559,7 @@ impl<'a> VmModuleEnv<'a> {
         }
         Ok(Self {
             literal_heap: std::cell::RefCell::new(literal_heap),
+            dynamic_integer_literals: std::cell::RefCell::new(HashMap::new()),
             literals,
             zero_capture_funs,
             lambda_entries,
@@ -1577,12 +1580,26 @@ impl<'a> VmModuleEnv<'a> {
     }
 }
 
+impl VmModuleEnv<'_> {
+    // Port of erts/emulator/beam/beam_file.c (beamfile_add_literal), OTP-29.1.1.
+    fn intern_dynamic_integer_literal(&self, value: BigInt) -> Result<u64, String> {
+        if let Some(word) = self.dynamic_integer_literals.borrow().get(&value).copied() {
+            return Ok(word);
+        }
+        let mut heap = self.literal_heap.borrow_mut();
+        let word = from_owned(&arinsal_etf::OwnedTerm::BigInt(value.clone()), &mut **heap)
+            .map(raw_word)
+            .map_err(|error| format!("integer literal: {error:?}"))?;
+        self.dynamic_integer_literals
+            .borrow_mut()
+            .insert(value, word);
+        Ok(word)
+    }
+}
+
 impl ModuleEnv for VmModuleEnv<'_> {
     fn integer_literal(&self, value: i64) -> Result<u64, String> {
-        let mut heap = self.literal_heap.borrow_mut();
-        from_owned(&arinsal_etf::OwnedTerm::Int(value), &mut **heap)
-            .map(raw_word)
-            .map_err(|error| format!("integer literal: {error:?}"))
+        self.intern_dynamic_integer_literal(BigInt::from(value))
     }
 
     fn match_string(&self, bytes: &[u8]) -> Result<u64, String> {
@@ -1593,10 +1610,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
         let value = decimal
             .parse::<num_bigint::BigInt>()
             .map_err(|error| format!("bignum literal: {error}"))?;
-        let mut heap = self.literal_heap.borrow_mut();
-        from_owned(&arinsal_etf::OwnedTerm::BigInt(value), &mut **heap)
-            .map(raw_word)
-            .map_err(|error| format!("bignum literal: {error:?}"))
+        self.intern_dynamic_integer_literal(value)
     }
 
     fn tuple_literal(&self, elements: &[u64]) -> Result<u64, String> {

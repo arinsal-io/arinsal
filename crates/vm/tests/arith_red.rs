@@ -90,7 +90,7 @@ fn arith_red_cached_export_targets_follow_code_epoch() {
     let actual = vm
         .eval_scheduled("arith_red_reload_caller", "run", &[argument], 1, None)
         .unwrap();
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
 #[test]
@@ -128,12 +128,12 @@ fn assert_reduction_minimums(result: &OwnedTerm, minimums: &[i64], runtime: &str
         panic!("{runtime} returned a non-list reduction result: {result:?}");
     };
     assert!(matches!(tail.as_ref(), OwnedTerm::Nil));
-    assert_eq!(elems.len(), minimums.len());
+    similar_asserts::assert_eq!(elems.len(), minimums.len());
     for (index, (measurement, minimum)) in elems.iter().zip(minimums).enumerate() {
         let OwnedTerm::Tuple(values) = measurement else {
             panic!("{runtime} returned a non-tuple measurement: {measurement:?}");
         };
-        assert_eq!(values.len(), 2);
+        similar_asserts::assert_eq!(values.len(), 2);
         let OwnedTerm::Int(actual) = values[0] else {
             panic!(
                 "{runtime} returned a non-integer reduction result: {:?}",
@@ -208,12 +208,13 @@ fn arith_red_bignum_instruction_and_bif_reductions_meet_otp_minimums() {
             A = id(1) bsl (64 * 100), B = id(1) bsl (64 * 75),
             MaxInt = erlang:system_info(max_integer),
             [measure('+', A, B), measure('-', A, B),
-             measure('*', A, 7), measure('div', A, 7),
+             measure('*', A, 7), measure('*', A, -1), measure('div', A, 7),
              measure('rem', A, 7), measure('band', A, B),
              measure('bor', A, B), measure('bxor', A, B),
              measure('bsl', A, 1), measure('bsr', A, 1),
              measure1('bnot', A), measure1('-', A),
              measure_bif('+', A, B), measure_bif('*', A, 7),
+             measure_bif('*', A, -1),
              measure_bif('div', A, 7), measure_bif('rem', A, 7),
              measure_bif('band', A, B), measure_bif('bor', A, B),
              measure_bif('bxor', A, B), measure_bif('bsl', A, 1),
@@ -236,19 +237,67 @@ fn arith_red_bignum_instruction_and_bif_reductions_meet_otp_minimums() {
     };
     // OTP charges size-dependent reductions for runtime bignum arithmetic. The compiler
     // folds the unary operations on the constant operand, which OTP charges as a plain
-    // call, so each minimum is capped at OTP's own count.
+    // call, so each minimum is capped at OTP's own count. The final instruction is
+    // scheduler-slice saturated, where the surrounding bytecode contributes to the
+    // reduction total, so compare its OTP minimum rather than the whole count.
     let otp_counts = measurement_reductions(&expected);
-    let minimums = [7_i64; 23]
+    let actual_counts = measurement_reductions(&actual.term);
+    similar_asserts::assert_eq!(
+        &otp_counts[..25],
+        &actual_counts[..25],
+        "bignum reduction counts"
+    );
+    let minimums = [7_i64; 25]
         .into_iter()
         .zip(&otp_counts)
         .map(|(minimum, otp)| minimum.min(*otp))
         .chain([3_900, 3_900])
         .collect::<Vec<_>>();
     assert_reduction_minimums(&actual.term, &minimums, "Arinsal");
-    assert_eq!(
+    similar_asserts::assert_eq!(
         measurement_values(&expected),
         measurement_values(&actual.term)
     );
+}
+
+#[test]
+fn arith_red_bignum_select_literals_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping bignum select literal differential test");
+        return;
+    };
+    let source = r#"
+        -module(arith_red_bignum_select_literals).
+        -export([run/0]).
+        run() ->
+            [match(-999766349740978337),
+             match(9734097866575478),
+             match(-966394677364879734),
+             match(13987294872948990),
+             match(777723896192459245),
+             match(7),
+             match(39789827988888888888888888888347474444444444444444)].
+        match(-999766349740978337) -> a;
+        match(9734097866575478) -> b;
+        match(-966394677364879734) -> c;
+        match(13987294872948990) -> d;
+        match(777723896192459245) -> e;
+        match(_) -> other.
+    "#;
+    let beam = reference
+        .compile_named("arith_red_bignum_select_literals", source, &[])
+        .expect("compile bignum select literal fixture");
+    reference
+        .load("arith_red_bignum_select_literals", &beam)
+        .unwrap();
+    let expected = reference.call("arith_red_bignum_select_literals", "run", &[]);
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("arith_red_bignum_select_literals", "run", &[], 1, None)
+        .unwrap();
+    compare(&CallResult::Ok(actual.term), &expected, CompareMode::Exact).unwrap();
 }
 
 fn measurement_reductions(result: &OwnedTerm) -> Vec<i64> {
@@ -278,7 +327,7 @@ fn measurement_values(result: &OwnedTerm) -> Vec<OwnedTerm> {
             let OwnedTerm::Tuple(values) = measurement else {
                 panic!("arithmetic fixture returned a non-tuple measurement: {measurement:?}");
             };
-            assert_eq!(values.len(), 2);
+            similar_asserts::assert_eq!(values.len(), 2);
             values[1].clone()
         })
         .collect()
