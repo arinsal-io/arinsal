@@ -13,6 +13,68 @@ use flate2::Compression;
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 
+/// The owner of a magic reference inside an [`OwnedTerm`]: an opaque counted (or, for a
+/// resource naming itself, weak) pointer plus the reference identity.
+#[derive(Clone)]
+pub struct MagicHandle {
+    id: u64,
+    owner: MagicOwner,
+}
+
+#[derive(Clone)]
+enum MagicOwner {
+    Strong(std::sync::Arc<dyn std::any::Any + Send + Sync>),
+    Weak(std::sync::Weak<dyn std::any::Any + Send + Sync>),
+}
+
+impl MagicHandle {
+    /// A handle that keeps `owner` alive.
+    pub fn strong(id: u64, owner: std::sync::Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        Self {
+            id,
+            owner: MagicOwner::Strong(owner),
+        }
+    }
+    /// A handle that does not keep `owner` alive, for a resource's reference to itself.
+    pub fn weak(id: u64, owner: std::sync::Weak<dyn std::any::Any + Send + Sync>) -> Self {
+        Self {
+            id,
+            owner: MagicOwner::Weak(owner),
+        }
+    }
+    /// The reference identity (low and high 32 bits are the first two reference numbers).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+    /// The owner, unless a weak handle outlived it.
+    pub fn owner(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        match &self.owner {
+            MagicOwner::Strong(owner) => Some(owner.clone()),
+            MagicOwner::Weak(owner) => owner.upgrade(),
+        }
+    }
+    /// The plain reference with the same numbers, which is what a magic reference encodes as.
+    pub fn as_plain_ref(&self) -> OwnedTerm {
+        OwnedTerm::Ref {
+            node: "nonode@nohost".into(),
+            creation: 0,
+            ids: vec![self.id as u32, (self.id >> 32) as u32, u32::MAX],
+        }
+    }
+}
+
+impl std::fmt::Debug for MagicHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MagicHandle({})", self.id)
+    }
+}
+
+impl PartialEq for MagicHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
 /// A decoded Erlang term independent of the VM heap.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -61,6 +123,10 @@ pub enum OwnedTerm {
         creation: u32,
         ids: Vec<u32>,
     },
+    /// An internal magic reference. Besides the reference numbers it carries the owner,
+    /// the way an `ErtsMRefThing` carries its `mb` pointer, so copies keep the resource.
+    /// Encoding gives a plain reference with the same numbers, as in erts.
+    MagicRef(MagicHandle),
     /// External fun, `fun M:F/A`.
     Export {
         module: String,
@@ -1093,6 +1159,17 @@ fn encode_terms_into(
                     out.extend_from_slice(&id.to_be_bytes());
                 }
             }
+            OwnedTerm::MagicRef(handle) => {
+                // Port of erts/emulator/beam/external.c (enc_term, magic reference case),
+                // OTP-29.1.1: only the reference numbers are encoded, never the binary.
+                out.push(90);
+                out.extend_from_slice(&3_u16.to_be_bytes());
+                put_encoded_atom(out, "nonode@nohost", minor, atom_refs);
+                out.extend_from_slice(&0_u32.to_be_bytes());
+                for number in [handle.id as u32, (handle.id >> 32) as u32, u32::MAX] {
+                    out.extend_from_slice(&number.to_be_bytes());
+                }
+            }
             OwnedTerm::Export {
                 module,
                 function,
@@ -1174,6 +1251,7 @@ fn collect_atoms(term: &OwnedTerm, atoms: &mut Vec<String>) {
             OwnedTerm::Pid { node, .. }
             | OwnedTerm::Port { node, .. }
             | OwnedTerm::Ref { node, .. } => atoms.push(node.clone()),
+            OwnedTerm::MagicRef(_) => atoms.push("nonode@nohost".to_owned()),
             OwnedTerm::Export {
                 module, function, ..
             } => {
@@ -1439,7 +1517,7 @@ fn rank(t: &OwnedTerm) -> u8 {
     match t {
         OwnedTerm::Int(_) | OwnedTerm::BigInt(_) | OwnedTerm::Float(_) => 0,
         OwnedTerm::Atom(_) => 1,
-        OwnedTerm::Ref { .. } => 2,
+        OwnedTerm::Ref { .. } | OwnedTerm::MagicRef(_) => 2,
         OwnedTerm::Fun { .. } | OwnedTerm::Export { .. } => 3,
         OwnedTerm::Port { .. } => 4,
         OwnedTerm::Pid { .. } => 5,
@@ -1500,6 +1578,8 @@ pub fn erl_cmp(a: &OwnedTerm, b: &OwnedTerm) -> Ordering {
         return ranks;
     }
     match (a, b) {
+        (OwnedTerm::MagicRef(handle), _) => erl_cmp(&handle.as_plain_ref(), b),
+        (_, OwnedTerm::MagicRef(handle)) => erl_cmp(a, &handle.as_plain_ref()),
         (OwnedTerm::Int(_) | OwnedTerm::BigInt(_) | OwnedTerm::Float(_), _) => num_cmp(a, b),
         (OwnedTerm::Atom(x), OwnedTerm::Atom(y)) => x.cmp(y),
         (
@@ -1807,6 +1887,7 @@ impl std::fmt::Display for OwnedTerm {
             } => write!(f, "<{}.{id}.{serial}>", node),
             Self::Port { node, id, .. } => write!(f, "#Port<{}.{id}>", node),
             Self::Ref { node, ids, .. } => write!(f, "#Ref<{}.{ids:?}>", node),
+            Self::MagicRef(handle) => write!(f, "#Ref<nonode@nohost.{}>", handle.id),
             Self::Export {
                 module,
                 function,

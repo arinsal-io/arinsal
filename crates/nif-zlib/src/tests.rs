@@ -1107,11 +1107,10 @@ fn zstd_nif_table_matches_zstd_nif_c() {
 }
 
 fn context_id(resource: &O) -> u64 {
-    let O::Ref { ids, .. } = resource else {
-        panic!("a zstd context is a reference")
+    let O::MagicRef(handle) = resource else {
+        panic!("a zstd context is a magic reference")
     };
-    assert_eq!(ids[2], u32::MAX, "a magic reference");
-    u64::from(ids[0]) | (u64::from(ids[1]) << 32)
+    handle.id()
 }
 
 #[test]
@@ -1269,18 +1268,18 @@ fn owner_is_checked_after_closed_and_applies_to_every_context_nif() {
 #[test]
 fn context_is_freed_with_the_heap_that_holds_its_reference() {
     use arinsal_bifs::{Ctx, ProcessHeapHandle};
-    use arinsal_term::{MagicRef, ProcessHeap, to_owned};
+    use arinsal_term::ProcessHeap;
     let mut heap = ProcessHeap::with_words(1024);
-    let id = {
+    let owner = {
         let mut alloc = ProcessHeapHandle(&mut heap);
         let mut ctx = Ctx::new(&mut alloc);
         let entry = super::zstd::lookup("init_compress_nif", 0).unwrap();
         let resource = entry(&mut ctx, &[]).unwrap();
-        context_id(&to_owned(resource).unwrap())
+        std::sync::Arc::downgrade(&resource.magic_owner().unwrap())
     };
-    assert!(MagicRef::live_by_id(id).is_some());
+    assert!(owner.upgrade().is_some());
     drop(heap);
-    assert!(MagicRef::live_by_id(id).is_none());
+    assert!(owner.upgrade().is_none());
 }
 
 /// Any exception out of a stream NIF resets the session, not only a zstd error: a bad end op in

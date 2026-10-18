@@ -286,7 +286,7 @@ fn differential_1000_per_stable_bif() {
                 (
                     "erts_internal",
                     "atomics_new" | "counters_new",
-                    arinsal_difftest::CallResult::Ok(O::Ref { .. }),
+                    arinsal_difftest::CallResult::Ok(O::MagicRef(_)),
                     arinsal_difftest::CallResult::Ok(O::Ref { .. })
                 )
             );

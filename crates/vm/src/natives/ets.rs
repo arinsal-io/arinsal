@@ -1421,17 +1421,8 @@ fn gated_by_busy(function: EtsBif) -> bool {
 }
 
 fn compiled_match_program(reference: Term) -> Option<Arc<MatchProgram>> {
-    if !reference.is_magic_ref() {
-        return None;
-    }
-    let arinsal_term::Identity::Ref { ids, .. } = reference.identity()? else {
-        return None;
-    };
-    if ids.len() != 3 || ids[2] != u32::MAX {
-        return None;
-    }
-    let id = u64::from(ids[0]) | (u64::from(ids[1]) << 32);
-    MagicRef::live_by_id(id)?
+    reference
+        .magic_owner()?
         .downcast_ref::<Arc<MatchProgram>>()
         .cloned()
 }

@@ -409,11 +409,17 @@ impl Term {
     /// Whether a boxed term is an internal magic reference.
     #[inline]
     pub fn is_magic_ref(self) -> bool {
-        self.header() == Some(REF_THING_HEADER) && {
-            // SAFETY: a REF thing of arity two has an initialized word one.
-            let word1 = unsafe { *self.raw_ptr().add(1) };
-            is_magic_ref_thing_with_hdr(REF_THING_HEADER, word1)
+        self.magic_word().is_some()
+    }
+    /// The owner pointer word of a magic reference thing.
+    #[inline]
+    pub(crate) fn magic_word(self) -> Option<u64> {
+        if self.header() != Some(REF_THING_HEADER) {
+            return None;
         }
+        // SAFETY: a REF thing of arity two has an initialized word one.
+        let word1 = unsafe { *self.raw_ptr().add(1) };
+        is_magic_ref_thing_with_hdr(REF_THING_HEADER, word1).then_some(word1)
     }
     /// Access a raw heap pointer. Caller must ensure its owner is live and
     /// prevent concurrent mutation or movement for the duration of access.

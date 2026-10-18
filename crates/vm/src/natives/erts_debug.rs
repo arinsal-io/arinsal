@@ -1608,22 +1608,9 @@ fn internal_state_tuple_get(
             let Some(reference) = selector_value.filter(|term| term.is_magic_ref()) else {
                 return Ok(Some(atom("false")));
             };
-            let Some(arinsal_term::Identity::Ref { ids, .. }) = reference.identity() else {
+            let Some(owner) = reference.magic_owner() else {
                 return Ok(Some(atom("false")));
             };
-            let Some(id) = ids
-                .first()
-                .zip(ids.get(1))
-                .map(|(lo, hi)| u64::from(*lo) | (u64::from(*hi) << 32))
-            else {
-                return Ok(Some(atom("false")));
-            };
-            let Some(owner) = arinsal_term::MagicRef::live_by_id(id) else {
-                return Ok(Some(atom("false")));
-            };
-            if owner.is_external_only() {
-                return Ok(Some(atom("true")));
-            }
             let address = std::sync::Arc::as_ptr(&owner) as usize;
             let references = std::sync::Arc::strong_count(&owner).saturating_sub(1);
             let address = int(process, address)?;
