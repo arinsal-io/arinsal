@@ -2685,7 +2685,7 @@ impl Vm {
                     dealloc,
                     tail,
                 } => {
-                    if arity as usize > p.x.len() {
+                    if arity as usize > crate::proc_create::ATTACHED_X_REGS {
                         return Err(VmError::Unsupported("BIF argument registers".into()));
                     }
                     sync_cursor(p, htop, &mut heap_dirty);
@@ -2775,7 +2775,7 @@ impl Vm {
                     // Tail calls and stack deallocation stay on the general path.
                     if dealloc == 0
                         && !tail
-                        && (arity as usize) <= p.x.len()
+                        && (arity as usize) <= crate::proc_create::ATTACHED_X_REGS
                         && let Some(bif) = self.pure_bif(module_id, import as usize)
                     {
                         sync_cursor(p, htop, &mut heap_dirty);

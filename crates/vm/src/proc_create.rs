@@ -59,10 +59,6 @@ impl ProcessStats {
     }
 }
 
-/// Registers a scan wider than the live count can reach: a moving collection nils the
-/// attached file up to this many, and `live.max(6)` root walks stay below it.
-const DEAD_X_FLOOR: usize = 8;
-
 /// Number of X registers a scheduler array holds (`ERTS_X_REGS_ALLOCATED`, erl_vm.h).
 pub const ATTACHED_X_REGS: usize = 1024;
 
@@ -958,9 +954,6 @@ pub(crate) struct ProcessCold {
     pub(crate) native_wait: Option<Option<u64>>,
     /// Export dispatch to redo after the process wakes from a parked native BIF call.
     pub(crate) native_retry: Option<usize>,
-    /// The arity a redone fun call or apply (`native_retry`) takes from `header.arity`, which
-    /// holds the saved register count while the process is switched out.
-    pub(crate) native_retry_arity: Option<u8>,
     /// The traced function (by pc), actions and return value of a native trace frame whose
     /// return events the executor emits.
     pub(crate) native_return_events: Option<NativeReturnEvents>,
@@ -1652,7 +1645,11 @@ impl Process {
     #[cold]
     #[inline(never)]
     pub(crate) fn ensure(&mut self, words: usize, live: usize) -> Result<(), VmError> {
-        self.ensure_roots(words, live, true)
+        let cost = self.ensure_roots_cost(words, live)?;
+        if cost != 0 {
+            self.bump_gc_reds(cost);
+        }
+        Ok(())
     }
     /// [`Process::ensure`] with the no-collection case inline, for the native entry that runs
     /// once per scheduling turn.
@@ -1676,7 +1673,7 @@ impl Process {
     #[cold]
     #[inline(never)]
     pub(crate) fn ensure_uncharged(&mut self, words: usize, live: usize) -> Result<u32, VmError> {
-        self.ensure_roots_cost(words, live, true)
+        self.ensure_roots_cost(words, live)
     }
     /// Charge `cost` reductions for a collection.
     ///
@@ -1732,34 +1729,10 @@ impl Process {
         }
         self.ensure(words, live).map(|()| true)
     }
-    /// Collect with `live` X roots.
-    ///
-    /// `clear_dead` nils registers outside that prefix after a moving
-    /// collection. Allocation sites do this so a later wider scan cannot
-    /// follow the evacuated heap. A call passes `false`: erts roots only the
-    /// callee arguments and leaves the other X words unchanged.
+    /// Collect with `live` X roots; the registers above them are left as they are.
     #[cold]
     #[inline(never)]
-    pub(crate) fn ensure_roots(
-        &mut self,
-        words: usize,
-        live: usize,
-        clear_dead: bool,
-    ) -> Result<(), VmError> {
-        let cost = self.ensure_roots_cost(words, live, clear_dead)?;
-        if cost != 0 {
-            self.bump_gc_reds(cost);
-        }
-        Ok(())
-    }
-    #[cold]
-    #[inline(never)]
-    fn ensure_roots_cost(
-        &mut self,
-        words: usize,
-        live: usize,
-        clear_dead: bool,
-    ) -> Result<u32, VmError> {
+    fn ensure_roots_cost(&mut self, words: usize, live: usize) -> Result<u32, VmError> {
         if live > self.x.len() {
             return Err(VmError::Unsupported("live X register count".into()));
         }
@@ -1791,20 +1764,8 @@ impl Process {
         if words == 0 && gc.collections == 0 {
             return Ok(0);
         }
-        // Port of erts/emulator/beam/erl_gc.c:2639 (setup_rootset nobj), OTP-29.1.1.
-        // The collector rewrites only the live prefix. Nilling the rest is an
-        // extra guard for a later scan that roots a wider prefix than this one.
-        if clear_dead {
-            // A detached file is as long as its saved registers. An attached one is the whole
-            // scheduler array: the registers a wider scan can still reach end at the floor,
-            // so the 8 KB tail is not rewritten on every collection.
-            let dead_end = if self.x.is_attached() {
-                live.max(DEAD_X_FLOOR).min(self.x.len())
-            } else {
-                self.x.len()
-            };
-            self.x[live..dead_end].fill(Term::NIL);
-        }
+        // Port of erts/emulator/beam/erl_gc.c (setup_rootset nobj), OTP-29.1.1: the collector
+        // rewrites only the live prefix and leaves the other X words as they are.
         natives::sys::after_collection(self, live, gc.collections, gc.words_reclaimed);
         if self.heap.free_words() < allocation_words {
             return Err(VmError::Unsupported("heap exhausted after GC".into()));
