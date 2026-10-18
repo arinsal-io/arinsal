@@ -634,16 +634,23 @@ pub(crate) fn commit_catch(
         .heap
         .set_stack_pointer(base.wrapping_add(found.resume));
     process.x.ensure_x(4);
-    // Port of erts/emulator/beam/beam_common.c:541-544 (handle_error), OTP-29.1.1:
+    // Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1:
     // x0 = non-value marker, x1 = reason, x2 = raw stacktrace, x3 = class.
     process.x[0] = Term::catch(0);
     process.x[1] = reason;
     process.x[2] = trace;
     process.x[3] = exception_class_atom(class);
     process.exc_class = Some(class);
+    // Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1.
+    // The catch registers own the expanded reason and raw trace now, so stale native error
+    // metadata must not survive this transfer.
     process.header.freason = 0;
+    process.header.fvalue = Term::NIL.tagged_word();
     if let Some(cold) = process.cold.as_mut() {
         cold.native_bif_error = None;
+        cold.native_trap = None;
+        cold.pending_trace_top = None;
+        cold.explicit_raise = None;
     }
     process.sync_native_header();
     match found.target {
@@ -1113,6 +1120,8 @@ pub fn run_native(
             ))
         );
     }
+    // Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1:
+    // save the raw trace before reducing the failure state to its primary class or clearing it.
     let trapped_bif =
         process.header.freason == 1 << 10 && matches!(exit, ExitReason::CallUnported { .. });
     if trapped_bif {
@@ -1148,7 +1157,6 @@ pub fn run_native(
         && raised.freason == process.header.freason
         && raised.fvalue == process.header.fvalue
     {
-        process.header.freason = 0;
         return Err(VmError::Trap(raised.trap));
     } else if process.header.freason != 0
         && let Some(failure) = process
@@ -1158,7 +1166,7 @@ pub fn run_native(
         && failure.freason == process.header.freason
         && failure.fvalue == process.header.fvalue
     {
-        process.header.freason = 0;
+        // `save_raw` also matches the pending BIF frame against this reason/value pair.
         let error = match failure.call {
             crate::proc_create::NativeBifCall::Export(export) => {
                 let args = process.x[..usize::from(export.arity)].to_vec();
