@@ -409,7 +409,9 @@ fn copy_off_heap_thing<H: HeapAlloc + ?Sized>(
         if !magic_already_retained {
             let ptr = *tp.add(1) as *const Node;
             Arc::increment_strong_count(ptr);
-            dst.retain_node(Arc::from_raw(ptr));
+            // The copied `next` belongs to the source list; the link below rewrites it.
+            *tp.add(2) = 0;
+            dst.link_node(tp, Arc::from_raw(ptr));
         }
     }
     Ok(())
@@ -747,7 +749,8 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                         unsafe {
                             let ptr = *to.add(1) as *const Node;
                             Arc::increment_strong_count(ptr);
-                            dst.retain_node(Arc::from_raw(ptr));
+                            *to.add(2) = 0;
+                            dst.link_node(to, Arc::from_raw(ptr));
                         }
                     }
                     BIN_REF => {

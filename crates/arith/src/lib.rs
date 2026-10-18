@@ -189,8 +189,8 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
     fn supports_external_binary(&self) -> bool {
         self.0.supports_external_binary()
     }
-    fn retain_node(&mut self, node: Arc<arinsal_term::Node>) {
-        self.0.retain_node(node)
+    fn link_node(&mut self, thing: *mut u64, node: Arc<arinsal_term::Node>) {
+        self.0.link_node(thing, node)
     }
     fn retain_fun(&mut self, entry: Arc<arinsal_term::FunEntry>) {
         self.0.retain_fun(entry)

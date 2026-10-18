@@ -194,8 +194,8 @@ impl HeapAlloc for NativeTopHeap<'_> {
     fn supports_external_binary(&self) -> bool {
         self.heap.supports_external_binary()
     }
-    fn retain_node(&mut self, node: Arc<Node>) {
-        self.slow().retain_node(node)
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+        self.slow().link_node(thing, node)
     }
     fn retain_fun(&mut self, entry: Arc<FunEntry>) {
         self.slow().retain_fun(entry)

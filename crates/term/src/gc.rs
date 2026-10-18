@@ -133,8 +133,8 @@ impl HeapAlloc for FragmentAlloc<'_> {
     fn supports_external_binary(&self) -> bool {
         true
     }
-    fn retain_node(&mut self, node: Arc<Node>) {
-        HeapAlloc::retain_node(self.0, node);
+    fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
+        HeapAlloc::link_node(self.0, thing, node);
     }
     fn retain_fun(&mut self, entry: Arc<FunEntry>) {
         HeapAlloc::retain_fun(self.0, entry);
@@ -208,8 +208,8 @@ fn rebase_binref_chains(
     }
 }
 
-/// Release the reference every node of an off-heap list holds: a refc Binary behind a BinRef
-/// or the owner of a magic reference.
+/// Release the reference every node of an off-heap list holds: a refc Binary behind a BinRef,
+/// the owner of a magic reference or the node of an external thing.
 // Port of erts/emulator/beam/erl_binary.h (`erts_bin_release`), OTP-29.1.1.
 pub(crate) fn release_off_heap_chain(mut head: usize) {
     while head != 0 {
@@ -222,13 +222,14 @@ pub(crate) fn release_off_heap_chain(mut head: usize) {
 
 /// Release one off-heap list node that has not been forwarded.
 fn release_off_heap_node(node: usize) {
-    if crate::heap::off_heap_node_is_magic(node) {
-        drop(MagicRef::thing_owner(
-            crate::heap::load((node as *const u64).wrapping_add(1)),
-            false,
-        ));
-    } else {
-        release_binary_ref(node);
+    let word = crate::heap::load((node as *const u64).wrapping_add(1));
+    match crate::heap::off_heap_node_kind(node) {
+        crate::heap::OffHeapKind::Magic => drop(MagicRef::thing_owner(word, false)),
+        crate::heap::OffHeapKind::Node => {
+            // SAFETY: an unforwarded external thing's list entry owns its `Arc<Node>` count.
+            drop(unsafe { Arc::from_raw(word as *const Node) })
+        }
+        crate::heap::OffHeapKind::BinRef => release_binary_ref(node),
     }
 }
 
@@ -521,26 +522,13 @@ impl Copier<'_> {
                 }
             }
             EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
-                let target = if promote {
-                    &mut self.to.owners.old_nodes
-                } else {
-                    &mut self.to.owners.nodes
-                };
-                if !target.iter().any(|arc| Arc::as_ptr(arc) as usize == key) {
-                    let owner = self
-                        .from
-                        .owners
-                        .nodes
-                        .iter()
-                        .chain(&self.from.owners.old_nodes)
-                        .find(|arc| Arc::as_ptr(arc) as usize == key)
-                        .cloned();
-                    if let Some(owner) = owner {
-                        target.push(owner);
-                    } else {
-                        self.error = Some(TermError::BadArg);
-                    }
-                }
+                // Port of erts/emulator/beam/erl_gc.c (sweep_off_heap, ExternalThing case),
+                // OTP-29.1.1: the moved thing is linked into the new off-heap list and takes
+                // over the node reference of its source.
+                // SAFETY: the source thing's list entry owns this `Arc::into_raw` reference;
+                // the forwarded source is skipped by the sweep, so the count moves here.
+                let node = unsafe { Arc::from_raw(key as *const Node) };
+                self.to.link_node(ptr, node);
             }
             FUN => {
                 let fun = self
@@ -653,9 +641,9 @@ impl Copier<'_> {
             let next = crate::heap::load(ptr.wrapping_add(2)) as usize;
             let moved = thing & 3 == 2;
             if moved {
-                // A forwarded magic reference thing handed its counted reference to the
+                // A forwarded magic or external thing handed its counted reference to the
                 // copy linked into the new list; a BinRef copy took its own.
-                if !crate::heap::off_heap_node_is_magic(source) {
+                if crate::heap::off_heap_node_is_bin_ref(source) {
                     release_binary_ref(source);
                 }
             } else if !self.major && self.old.contains(source) {
@@ -1365,7 +1353,6 @@ impl ProcessHeap {
             next.old_htop = self.old_htop;
             if copy_old_owner_state {
                 next.owners.old_external = std::mem::take(&mut self.owners.old_external);
-                next.owners.old_nodes = std::mem::take(&mut self.owners.old_nodes);
                 next.owners.old_funs = std::mem::take(&mut self.owners.old_funs);
                 next.owners.old_exports = std::mem::take(&mut self.owners.old_exports);
             }
