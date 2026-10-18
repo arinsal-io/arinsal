@@ -8,6 +8,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
+use arinsal_bifs::with_binary_bytes;
 use arinsal_bifs::{BifError, BifFn, Ctx};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{
@@ -264,18 +265,11 @@ fn list(value: &O) -> Result<&[O], BifError> {
 }
 fn iodata(value: &O, unicode: bool) -> Result<Vec<u8>, BifError> {
     let mut out = Vec::new();
-    fn append(value: &O, unicode: bool, out: &mut Vec<u8>) -> Result<(), BifError> {
+    fn append_element(value: &O, unicode: bool, out: &mut Vec<u8>) -> Result<(), BifError> {
         match value {
             O::Binary(bytes) => out.extend(bytes),
             O::Nil => (),
-            O::List { elems, tail } => {
-                for item in elems {
-                    append(item, unicode, out)?;
-                }
-                if **tail != O::Nil {
-                    append(tail, unicode, out)?;
-                }
-            }
+            O::List { .. } => append_list(value, unicode, out)?,
             O::Int(n) => {
                 if unicode {
                     let ch = u32::try_from(*n)
@@ -292,7 +286,29 @@ fn iodata(value: &O, unicode: bool) -> Result<Vec<u8>, BifError> {
         }
         Ok(())
     }
-    append(value, unicode, &mut out)?;
+    fn append_list(value: &O, unicode: bool, out: &mut Vec<u8>) -> Result<(), BifError> {
+        let O::List { elems, tail } = value else {
+            return append_element(value, unicode, out);
+        };
+        for item in elems {
+            append_element(item, unicode, out)?;
+        }
+        match tail.as_ref() {
+            O::Nil => Ok(()),
+            O::Binary(bytes) => {
+                out.extend(bytes);
+                Ok(())
+            }
+            O::List { .. } => append_list(tail, unicode, out),
+            _ => Err(BifError::BADARG),
+        }
+    }
+    match value {
+        O::Binary(bytes) => out.extend(bytes),
+        O::Nil => (),
+        O::List { .. } => append_list(value, unicode, &mut out)?,
+        _ => return Err(BifError::BADARG),
+    }
     Ok(out)
 }
 
@@ -557,17 +573,31 @@ fn compile_2(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     call(ctx, args, compile_owned)
 }
 fn run_2(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    call(ctx, args, |a| run_owned(a, true))
+    run_direct(ctx, "run", args)
 }
 fn run_3(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    call(ctx, args, |a| run_owned(a, true))
+    run_direct(ctx, "run", args)
 }
 fn internal_run_4(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    call(ctx, args, |a| match atom_name(&a[3]) {
-        Some("true") => run_owned(a, true),
-        Some("false") => run_owned(a, false),
-        _ => Err(BifError::BADARG),
-    })
+    run_direct(ctx, "internal_run", args)
+}
+
+// Port of erts/emulator/beam/erl_bif_re.c (re_run), OTP-29.1.1.
+fn run_direct(ctx: &mut Ctx<'_>, name: &str, args: &[Term]) -> Result<Term, BifError> {
+    let mut state = None;
+    let mut total = 0;
+    loop {
+        let (progress, loops) =
+            run_slice(ctx, name, args, state.take(), LOOP_BUDGET.with(Cell::get))?;
+        total += loops;
+        match progress {
+            Progress::Done(value) => {
+                LAST_LOOP_COUNT.with(|count| count.set(total));
+                return Ok(value);
+            }
+            Progress::Yield(next) => state = Some(next),
+        }
+    }
 }
 fn inspect(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     call(ctx, args, |a| {
@@ -834,61 +864,66 @@ fn capture_values(
     ovector: &[usize],
     subject: &[u8],
     unicode: bool,
-) -> O {
+) -> (O, Vec<Option<(usize, usize)>>) {
     // Port of erts/emulator/beam/erl_bif_re.c:1030-1262 (build_exec_return), OTP-29.1.1.
     let indexes = selected_indices(code, selection, rc, ovector);
-    O::list(
-        indexes
-            .into_iter()
-            .map(|index| {
-                let (start, end) = index
-                    .filter(|i| *i < rc as usize && ovector[*i * 2] != UNSET)
-                    .map(|i| (ovector[2 * i], ovector[2 * i + 1]))
-                    .unwrap_or((UNSET, UNSET));
-                match kind {
-                    CaptureType::Index => {
-                        if start == UNSET {
-                            pair(O::Int(-1), O::Int(0))
-                        } else {
-                            pair(O::Int(start as i64), O::Int((end - start) as i64))
-                        }
-                    }
-                    CaptureType::Binary => O::Binary(if start == UNSET {
-                        Vec::new()
+    let mut binary_ranges = Vec::with_capacity(indexes.len());
+    let captures = indexes
+        .into_iter()
+        .map(|index| {
+            let (start, end) = index
+                .filter(|i| *i < rc as usize && ovector[*i * 2] != UNSET)
+                .map(|i| (ovector[2 * i], ovector[2 * i + 1]))
+                .unwrap_or((UNSET, UNSET));
+            binary_ranges.push(if matches!(kind, CaptureType::Binary) && start != UNSET {
+                Some((start, end - start))
+            } else {
+                None
+            });
+            match kind {
+                CaptureType::Index => {
+                    if start == UNSET {
+                        pair(O::Int(-1), O::Int(0))
                     } else {
-                        subject[start..end].to_vec()
-                    }),
-                    CaptureType::List => {
-                        let bytes = if start == UNSET {
-                            &[][..]
-                        } else {
-                            &subject[start..end]
-                        };
-                        if unicode {
-                            match std::str::from_utf8(bytes) {
-                                Ok(s) => O::charlist(s),
-                                Err(err) => {
-                                    let valid = std::str::from_utf8(&bytes[..err.valid_up_to()])
-                                        .expect("validated prefix");
-                                    O::Tuple(vec![
-                                        atom(if err.error_len().is_some() {
-                                            "error"
-                                        } else {
-                                            "incomplete"
-                                        }),
-                                        O::charlist(valid),
-                                        O::Binary(bytes[err.valid_up_to()..].to_vec()),
-                                    ])
-                                }
-                            }
-                        } else {
-                            O::list(bytes.iter().map(|b| O::Int(i64::from(*b))).collect())
-                        }
+                        pair(O::Int(start as i64), O::Int((end - start) as i64))
                     }
                 }
-            })
-            .collect(),
-    )
+                CaptureType::Binary => O::Binary(if start == UNSET {
+                    Vec::new()
+                } else {
+                    subject[start..end].to_vec()
+                }),
+                CaptureType::List => {
+                    let bytes = if start == UNSET {
+                        &[][..]
+                    } else {
+                        &subject[start..end]
+                    };
+                    if unicode {
+                        match std::str::from_utf8(bytes) {
+                            Ok(s) => O::charlist(s),
+                            Err(err) => {
+                                let valid = std::str::from_utf8(&bytes[..err.valid_up_to()])
+                                    .expect("validated prefix");
+                                O::Tuple(vec![
+                                    atom(if err.error_len().is_some() {
+                                        "error"
+                                    } else {
+                                        "incomplete"
+                                    }),
+                                    O::charlist(valid),
+                                    O::Binary(bytes[err.valid_up_to()..].to_vec()),
+                                ])
+                            }
+                        }
+                    } else {
+                        O::list(bytes.iter().map(|b| O::Int(i64::from(*b))).collect())
+                    }
+                }
+            }
+        })
+        .collect();
+    (O::list(captures), binary_ranges)
 }
 enum MatchFailure {
     Badarg,
@@ -907,6 +942,8 @@ pub struct RunState {
     flags: u32,
     offset: usize,
     matches: Vec<O>,
+    binary_ranges: Vec<Vec<Option<(usize, usize)>>>,
+    suppress_duplicate: Option<(usize, usize)>,
     phase: Phase,
     /// The call's options, kept so a resumed run needs none of its arguments, as erts' trap
     /// export is called with the restart state in place of the options.
@@ -1067,20 +1104,9 @@ fn advance_with(
                 };
                 let start = ov[0];
                 let end = ov[1];
-                if !matches!(selection, Selection::None) {
-                    let code = state.code();
-                    let value = capture_values(
-                        &code,
-                        &selection,
-                        kind,
-                        rc,
-                        &ov,
-                        &state.subject,
-                        state.unicode,
-                    );
-                    state.matches.push(value);
-                } else {
-                    state.matches.push(O::Nil);
+                let duplicate = state.suppress_duplicate.take() == Some((start, end));
+                if !duplicate {
+                    push_match(state, &selection, kind, rc, &ov);
                 }
                 if !opts.global {
                     break;
@@ -1106,27 +1132,26 @@ fn advance_with(
                     Err(MatchFailure::Limit(reason)) => return Ok(Step::Done(error(atom(reason)))),
                     Err(MatchFailure::Badarg) => return Err(BifError::BADARG),
                 };
-                state.phase = Phase::Main;
                 if let Some((retry_rc, retry_ov)) = retry
-                    && retry_ov[1] > retry_ov[0]
+                    && (retry_ov[0], retry_ov[1]) != (start, start)
                 {
-                    let code = state.code();
-                    let value = capture_values(
-                        &code,
-                        &selection,
-                        kind,
-                        retry_rc,
-                        &retry_ov,
-                        &state.subject,
-                        state.unicode,
-                    );
-                    state.matches.push(value);
+                    // PCRE2's NOTEMPTY_ATSTART rejects an empty engine match. `\\K` may still
+                    // reset the returned start to its end, so the ovector can be empty here.
+                    push_match(state, &selection, kind, retry_rc, &retry_ov);
                     state.offset = retry_ov[1];
                     state.flags |= NO_UTF_CHECK;
+                    state.phase = Phase::Main;
                     continue;
                 }
                 if start >= state.subject.len() {
                     break;
+                }
+                if state.offset != start {
+                    state.offset = start;
+                    state.flags |= NO_UTF_CHECK;
+                    state.suppress_duplicate = Some((start, start));
+                    state.phase = Phase::Main;
+                    continue;
                 }
                 let step = if state.unicode {
                     let b = state.subject[start];
@@ -1148,10 +1173,11 @@ fn advance_with(
                 };
                 state.offset = start + step;
                 state.flags |= NO_UTF_CHECK;
+                state.phase = Phase::Main;
             }
         }
     }
-    let mut matches = std::mem::take(&mut state.matches);
+    let mut matches = state.matches.clone();
     if matches.is_empty() {
         return Ok(Step::Done(atom("nomatch")));
     }
@@ -1166,6 +1192,32 @@ fn advance_with(
     } else {
         pair(atom("match"), matches.remove(0))
     }))
+}
+
+fn push_match(
+    state: &mut RunState,
+    selection: &Selection,
+    kind: CaptureType,
+    rc: i32,
+    ovector: &[usize],
+) {
+    if matches!(selection, Selection::None) {
+        state.matches.push(O::Nil);
+        state.binary_ranges.push(Vec::new());
+    } else {
+        let code = state.code();
+        let (value, ranges) = capture_values(
+            &code,
+            selection,
+            kind,
+            rc,
+            ovector,
+            &state.subject,
+            state.unicode,
+        );
+        state.matches.push(value);
+        state.binary_ranges.push(ranges);
+    }
 }
 
 /// Where a `re:run`/`re:internal_run` call stands after one slice.
@@ -1224,14 +1276,102 @@ pub fn run_slice(
     };
     let (step, loops) = run_owned_slice(&owned, first, state, loop_budget)?;
     match step {
-        (Step::Done(result), _) => Ok((
-            Progress::Done(
-                from_owned(&result, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)?,
-            ),
-            loops,
-        )),
+        (Step::Done(result), state) => {
+            let heap = &mut Heap(&mut ctx.heap);
+            let value = match binary_capture_result(&result, &state, args.first().copied(), heap)? {
+                Some(value) => value,
+                None => from_owned(&result, heap).map_err(|_| BifError::SystemLimit)?,
+            };
+            Ok((Progress::Done(value), loops))
+        }
         (Step::Yield, state) => Ok((Progress::Yield(state), loops)),
     }
+}
+
+fn binary_capture_result<H: HeapAlloc + ?Sized>(
+    result: &O,
+    state: &RunState,
+    subject: Option<Term>,
+    heap: &mut H,
+) -> Result<Option<Term>, BifError> {
+    if !state
+        .opts
+        .capture
+        .as_ref()
+        .is_some_and(|(_, kind)| matches!(kind, CaptureType::Binary))
+    {
+        return Ok(None);
+    }
+    let O::Tuple(fields) = result else {
+        return Ok(None);
+    };
+    if fields.len() != 2 || atom_name(&fields[0]) != Some("match") {
+        return Ok(None);
+    }
+    let Some(subject) = subject.filter(|term| term.classify() == arinsal_term::TermKind::Bitstring)
+    else {
+        return Ok(None);
+    };
+    let can_reference = with_binary_bytes(subject, |view| {
+        view.is_off_heap()
+            && view.start_bit().is_multiple_of(8)
+            && view.bit_len().is_multiple_of(8)
+            && view.bit_len() > 64 * 8
+    })?;
+    let value = if state.opts.global {
+        let matches = state
+            .binary_ranges
+            .iter()
+            .map(|ranges| binary_capture_list(ranges, state, subject, can_reference, heap))
+            .collect::<Result<Vec<_>, _>>()?;
+        let matches = TermBuilder::new(&mut *heap)
+            .list_from_slice(&matches)
+            .map_err(|_| BifError::SystemLimit)?;
+        let tag =
+            from_owned(&atom("match"), &mut Heap(&mut *heap)).map_err(|_| BifError::SystemLimit)?;
+        TermBuilder::new(&mut *heap)
+            .tuple(&[tag, matches])
+            .map_err(|_| BifError::SystemLimit)?
+    } else {
+        let Some(ranges) = state.binary_ranges.first() else {
+            return Ok(None);
+        };
+        let captures = binary_capture_list(ranges, state, subject, can_reference, heap)?;
+        let tag =
+            from_owned(&atom("match"), &mut Heap(&mut *heap)).map_err(|_| BifError::SystemLimit)?;
+        TermBuilder::new(&mut *heap)
+            .tuple(&[tag, captures])
+            .map_err(|_| BifError::SystemLimit)?
+    };
+    Ok(Some(value))
+}
+
+fn binary_capture_list<H: HeapAlloc + ?Sized>(
+    ranges: &[Option<(usize, usize)>],
+    state: &RunState,
+    subject: Term,
+    can_reference: bool,
+    heap: &mut H,
+) -> Result<Term, BifError> {
+    let mut captures = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let capture = match (can_reference, range) {
+            (true, Some((start, length))) => TermBuilder::new(&mut *heap)
+                .sub_binary_bif(subject, start * 8, length * 8)
+                .map_err(|_| BifError::SystemLimit)?,
+            (_, None) => from_owned(&O::Binary(Vec::new()), &mut Heap(&mut *heap))
+                .map_err(|_| BifError::SystemLimit)?,
+            (false, Some((start, length))) => from_owned(
+                &O::Binary(state.subject[*start..*start + *length].to_vec()),
+                &mut Heap(&mut *heap),
+            )
+            .map_err(|_| BifError::SystemLimit)?,
+        };
+        captures.push(capture);
+    }
+    TermBuilder::new(&mut *heap)
+        .list_from_slice(&captures)
+        .map_err(|_| BifError::SystemLimit)
 }
 
 fn run_owned_slice(
@@ -1283,6 +1423,8 @@ fn run_owned_slice(
             Box::new(RunState {
                 code: code.into_raw(),
                 subject,
+                binary_ranges: Vec::new(),
+                suppress_duplicate: None,
                 session: 0,
                 unicode,
                 flags: if first {
@@ -1307,6 +1449,8 @@ impl RunState {
         RunState {
             code: 0,
             subject: Vec::new(),
+            binary_ranges: Vec::new(),
+            suppress_duplicate: None,
             session: 0,
             unicode: false,
             flags: 0,
@@ -1316,21 +1460,4 @@ impl RunState {
             opts: Options::default(),
         }
     }
-}
-
-fn run_owned(args: &[O], first: bool) -> Result<O, BifError> {
-    // The synchronous entry: resume until the match is done.
-    let mut state = None;
-    let mut total = 0;
-    let result = loop {
-        let ((step, next), loops) =
-            run_owned_slice(args, first, state.take(), LOOP_BUDGET.with(Cell::get))?;
-        total += loops;
-        match step {
-            Step::Done(result) => break result,
-            Step::Yield => state = Some(next),
-        }
-    };
-    LAST_LOOP_COUNT.with(|count| count.set(total));
-    Ok(result)
 }
