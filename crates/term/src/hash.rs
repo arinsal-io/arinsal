@@ -438,7 +438,10 @@ impl Hash2Run {
     ) -> bool {
         let mut tail = term;
         // SAFETY: the list remains live throughout hashing.
-        while let Some((head, next)) = unsafe { tail.cons_ref() } {
+        while let Some((head, next, next_is_cons)) = unsafe {
+            tail.cons_ref()
+                .map(|(head, next)| (head, next, next.cons_ref().is_some()))
+        } {
             let Some(byte) = head.as_small().filter(|n| (0..=255).contains(n)) else {
                 break;
             };
@@ -450,8 +453,7 @@ impl Hash2Run {
                 count = 0;
             }
             tail = next;
-            // SAFETY: the list remains live throughout hashing.
-            if can_trap && unsafe { next.cons_ref() }.is_some() {
+            if can_trap && next_is_cons {
                 *left -= 1;
                 if *left <= 0 {
                     stack.push(Job::ListRun {
