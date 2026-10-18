@@ -548,6 +548,22 @@ struct Carrier {
     key_base: usize,
     start: usize,
     size: usize,
+    /// Sum of this carrier's allocated block sizes (`cpool.total_blocks_size`), kept incrementally.
+    blocks_size: usize,
+    /// `cpool.abandon_limit`, fixed when the carrier is created.
+    abandon_limit: usize,
+    /// `cpool.discard_limit`, fixed when the carrier is created.
+    discard_limit: usize,
+}
+
+/// Port of cpoll_init_carrier_limit and allctr_abandon_limit, erl_alloc_util.c, OTP-29.1.1.
+fn percent_limit(size: usize, percent: usize) -> usize {
+    let limit = size.wrapping_mul(percent);
+    if limit > size {
+        limit / 100
+    } else {
+        (size / 100) * percent
+    }
 }
 
 pub(crate) struct CarrierTransfer {
@@ -770,6 +786,12 @@ pub struct AllocUtil {
     /// instance is pool managed and the strategy is an aoff one. Fixed at creation, so a free
     /// on an instance without a carrier pool tests one byte next to the strategy.
     abandon: bool,
+    /// `cpool.abandon_limit` of erl_alloc_util.c: `acul` percent of the multiblock carrier bytes.
+    abandon_limit: usize,
+    #[cfg(test)]
+    carrier_walks: std::cell::Cell<usize>,
+    #[cfg(test)]
+    verify_abandon_by_walk: bool,
     instance_index: usize,
     /// Number of live multiblock carriers.
     mbc_count: usize,
@@ -849,6 +871,11 @@ impl AllocUtil {
                 && options.cpool.is_some()
                 && pool_managed
                 && is_aoff(strategy),
+            abandon_limit: 0,
+            #[cfg(test)]
+            carrier_walks: std::cell::Cell::new(0),
+            #[cfg(test)]
+            verify_abandon_by_walk: true,
             carriers: Vec::new(),
             free_carrier_slots: Vec::new(),
             mbc_count: 0,
@@ -935,6 +962,7 @@ impl AllocUtil {
         };
         let used = self.mbc_alloc(span, offset, block_size)?;
         self.block_added(false, used);
+        self.carrier_blk_alloc(span.index, used)?;
         Ok(Allocation {
             id: offset as u64,
             size,
@@ -1031,6 +1059,7 @@ impl AllocUtil {
     fn mbc_free(&mut self, span: CarrierSpan, key: usize, header: usize) -> Result<(), AllocError> {
         let mut start = key;
         let mut size = header & !BLOCK_FLAGS;
+        self.carrier_blk_free(span.index, size)?;
         let mut prev_free = header & PREV_FREE;
         let mut last = header & LAST;
         if prev_free != 0 {
@@ -1076,7 +1105,7 @@ impl AllocUtil {
             }
         }
         self.link_free_in(span, start, size)?;
-        self.check_abandon_carrier(span.index)
+        self.check_abandon_carrier(span)
     }
 
     /// Frees the block of a single-block carrier, which destroys the carrier.
@@ -1289,6 +1318,8 @@ impl AllocUtil {
 
     /// Blocks of one carrier in address order, walked through their headers.
     fn carrier_blocks(&self, index: usize) -> Result<Vec<Block>, AllocError> {
+        #[cfg(test)]
+        self.carrier_walks.set(self.carrier_walks.get() + 1);
         let carrier = self.carriers[index].as_ref().ok_or(AllocError::Corrupt)?;
         let end = carrier.key_base + carrier.size;
         let mut blocks = Vec::new();
@@ -1347,25 +1378,121 @@ impl AllocUtil {
         Ok(())
     }
 
+    /// Port of STAT_MBC_BLK_ALLOC, erl_alloc_util.c, OTP-29.1.1: the carrier's allocated bytes.
     #[inline(always)]
-    fn check_abandon_carrier(&mut self, carrier_index: usize) -> Result<(), AllocError> {
-        if !self.abandon || self.pending_carriers.len() >= self.options.acnl {
-            return Ok(());
-        }
-        self.consider_abandoning_carrier(carrier_index)
+    fn carrier_blk_alloc(&mut self, carrier: usize, size: usize) -> Result<(), AllocError> {
+        self.carriers[carrier]
+            .as_mut()
+            .ok_or(AllocError::Corrupt)?
+            .blocks_size += size;
+        Ok(())
     }
 
-    #[inline(never)]
-    fn consider_abandoning_carrier(&mut self, carrier_index: usize) -> Result<(), AllocError> {
+    /// Port of STAT_MBC_BLK_FREE, erl_alloc_util.c, OTP-29.1.1.
+    #[inline(always)]
+    fn carrier_blk_free(&mut self, carrier: usize, size: usize) -> Result<(), AllocError> {
+        self.carriers[carrier]
+            .as_mut()
+            .ok_or(AllocError::Corrupt)?
+            .blocks_size -= size;
+        Ok(())
+    }
+
+    /// In-place block resize: the net change of STAT_MBC_BLK_FREE plus STAT_MBC_BLK_ALLOC.
+    #[inline(always)]
+    fn carrier_blk_resize(
+        &mut self,
+        carrier: usize,
+        old: usize,
+        new: usize,
+    ) -> Result<(), AllocError> {
+        let entry = self.carriers[carrier].as_mut().ok_or(AllocError::Corrupt)?;
+        entry.blocks_size = entry.blocks_size - old + new;
+        Ok(())
+    }
+
+    /// Port of aoff_largest_fblk_in_mbc, erl_ao_firstfit_alloc.c, OTP-29.1.1: the carrier tree
+    /// node holds the largest free block size of its carrier.
+    #[inline(always)]
+    fn aoff_largest_fblk_in_mbc(&self, span: CarrierSpan) -> usize {
+        self.tn::<true>(span.start + MBC_HEADER).size()
+    }
+
+    /// Port of check_abandon_carrier, erl_alloc_util.c, OTP-29.1.1: decided from counters only.
+    #[inline(always)]
+    fn check_abandon_carrier(&mut self, span: CarrierSpan) -> Result<(), AllocError> {
+        let abandon = self.abandon_decision(span)?;
+        #[cfg(test)]
+        if self.verify_abandon_by_walk {
+            assert_eq!(
+                abandon,
+                self.abandon_decision_by_walk(span.index),
+                "carrier {}",
+                span.index
+            );
+        }
+        if abandon {
+            self.abandon_carrier(span.index)?;
+        }
+        Ok(())
+    }
+
+    /// The tests of check_abandon_carrier, in the order of erts. The precomputed `abandon` flag
+    /// stands for the checks of the pool and the strategy.
+    #[inline(always)]
+    fn abandon_decision(&self, span: CarrierSpan) -> Result<bool, AllocError> {
+        if !self.abandon || self.class_stats[0].blocks_size.current > self.abandon_limit {
+            return Ok(false);
+        }
+        if self.pending_carriers.len() >= self.options.acnl {
+            return Ok(false);
+        }
+        let carrier = self.carriers[span.index]
+            .as_ref()
+            .ok_or(AllocError::Corrupt)?;
+        if carrier.main || carrier.blocks_size > carrier.abandon_limit {
+            return Ok(false);
+        }
+        Ok(self.aoff_largest_fblk_in_mbc(span) >= self.options.acfml)
+    }
+
+    /// The same decision recomputed by walking every carrier, for the tests.
+    #[cfg(test)]
+    fn abandon_decision_by_walk(&self, carrier_index: usize) -> bool {
+        let walks = self.carrier_walks.get();
+        let decision = self.abandon_decision_walk_inner(carrier_index);
+        self.carrier_walks.set(walks);
+        decision
+    }
+
+    #[cfg(test)]
+    fn abandon_decision_walk_inner(&self, carrier_index: usize) -> bool {
+        if !self.abandon || self.pending_carriers.len() >= self.options.acnl {
+            return false;
+        }
         let Some(carrier) = self.carriers.get(carrier_index).and_then(Option::as_ref) else {
-            return Ok(());
+            return false;
         };
         if carrier.sbc || carrier.main {
-            return Ok(());
+            return false;
         }
-        let carrier_size = carrier.size;
-        let blocks = self.carrier_blocks(carrier_index)?;
-        let allocated_size = blocks
+        let (mut mbc_allocated, mut mbc_size) = (0, 0);
+        for (index, entry) in self.carriers.iter().enumerate() {
+            let Some(entry) = entry else { continue };
+            if entry.sbc {
+                continue;
+            }
+            mbc_size += entry.size;
+            mbc_allocated += self
+                .carrier_blocks(index)
+                .unwrap()
+                .iter()
+                .filter(|block| block.allocated)
+                .map(|block| block.size)
+                .sum::<usize>();
+        }
+        let blocks = self.carrier_blocks(carrier_index).unwrap();
+        let allocated = blocks
             .iter()
             .filter(|block| block.allocated)
             .map(|block| block.size)
@@ -1376,42 +1503,25 @@ impl AllocUtil {
             .map(|block| block.size)
             .max()
             .unwrap_or(0);
-        let total_carrier_size = self
-            .carriers
-            .iter()
-            .flatten()
-            .filter(|entry| !entry.sbc)
-            .map(|entry| entry.size)
-            .sum::<usize>();
-        let below = |used: usize, total: usize| {
-            (used as u128) * 100 <= (total as u128) * (self.options.acul as u128)
-        };
-        if !below(self.blocks_size(), total_carrier_size)
-            || !below(allocated_size, carrier_size)
-            || largest_free < self.options.acfml
-        {
-            return Ok(());
-        }
+        mbc_allocated <= percent_limit(mbc_size, self.options.acul)
+            && allocated <= percent_limit(carrier.size, self.options.acul)
+            && largest_free >= self.options.acfml
+    }
+
+    #[inline(never)]
+    fn abandon_carrier(&mut self, carrier_index: usize) -> Result<(), AllocError> {
         self.discard_free_blocks(carrier_index)?;
         self.detach_carrier(carrier_index)
     }
 
     fn discard_free_blocks(&mut self, carrier_index: usize) -> Result<(), AllocError> {
-        if self.options.acful == 0 {
-            return Ok(());
-        }
-        let blocks = self.carrier_blocks(carrier_index)?;
         let carrier = self.carriers[carrier_index]
             .as_ref()
             .ok_or(AllocError::Corrupt)?;
-        let allocated_size = blocks
-            .iter()
-            .filter(|block| block.allocated)
-            .map(|block| block.size)
-            .sum::<usize>();
-        if (allocated_size as u128) * 100 > (carrier.size as u128) * (self.options.acful as u128) {
+        if self.options.acful == 0 || carrier.blocks_size > carrier.discard_limit {
             return Ok(());
         }
+        let blocks = self.carrier_blocks(carrier_index)?;
         let base = carrier.key_base;
         let memory_base = carrier.memory.as_ptr() as usize;
         let page = page_size();
@@ -1702,6 +1812,7 @@ impl AllocUtil {
             }
             self.link_free(tail.offset)?;
             self.block_resized(false, old.size, needed);
+            self.carrier_blk_resize(old.carrier, old.size, needed)?;
             return Ok(same);
         }
         if !old_sbc
@@ -1745,6 +1856,7 @@ impl AllocUtil {
                 grown
             };
             self.block_resized(false, old.size, grown.size);
+            self.carrier_blk_resize(old.carrier, old.size, grown.size)?;
             return Ok(same);
         }
         if !old_sbc && old.prev_free && (needed > old.size || large_shrink) {
@@ -1799,6 +1911,7 @@ impl AllocUtil {
                         self.set_next_prev_free(&moved, false)?;
                     }
                     self.block_resized(false, old.size, used);
+                    self.carrier_blk_resize(old.carrier, old.size, used)?;
                     return Ok(Allocation {
                         id: previous as u64,
                         size,
@@ -1971,6 +2084,7 @@ impl AllocUtil {
                 return Err(AllocError::Corrupt);
             }
             let mut previous_free = false;
+            let mut carrier_bytes = 0;
             while pos < end {
                 let b = self.blk(pos)?;
                 if b.carrier != ci
@@ -1997,6 +2111,7 @@ impl AllocUtil {
                 } else {
                     count[usize::from(c.sbc)] += 1;
                     bytes[usize::from(c.sbc)] += b.size;
+                    carrier_bytes += b.size;
                 }
                 pos += b.size;
                 if b.last {
@@ -2009,6 +2124,14 @@ impl AllocUtil {
             if !c.sbc && pos != end {
                 return Err(AllocError::Corrupt);
             }
+            if !c.sbc && carrier_bytes != c.blocks_size {
+                return Err(AllocError::Corrupt);
+            }
+        }
+        if self.abandon_limit
+            != percent_limit(self.class_stats[0].carriers_size.current, self.options.acul)
+        {
+            return Err(AllocError::Corrupt);
         }
         if free != self.tree_free_blocks()?
             || (0..2).any(|class| {
@@ -2213,6 +2336,9 @@ impl AllocUtil {
             key_base,
             start,
             size: total,
+            blocks_size: 0,
+            abandon_limit: 0,
+            discard_limit: 0,
         });
         self.write_carrier(ci)?;
         self.write_block(&Block {
@@ -2302,6 +2428,9 @@ impl AllocUtil {
             key_base,
             start,
             size,
+            blocks_size: 0,
+            abandon_limit: percent_limit(size, self.options.acul),
+            discard_limit: percent_limit(size, self.options.acful),
         });
         self.write_carrier(ci)?;
         if is_aoff(self.strategy) {
@@ -3618,6 +3747,16 @@ impl AllocUtil {
         bytes.current += size;
         Self::update_series(count);
         Self::update_series(bytes);
+        if !sbc {
+            self.set_new_allctr_abandon_limit();
+        }
+    }
+
+    /// Port of set_new_allctr_abandon_limit, erl_alloc_util.c, OTP-29.1.1.
+    #[inline(always)]
+    fn set_new_allctr_abandon_limit(&mut self) {
+        self.abandon_limit =
+            percent_limit(self.class_stats[0].carriers_size.current, self.options.acul);
     }
     fn carrier_removed(&mut self, sbc: bool, mseg: bool, size: usize) {
         let class = &mut self.class_stats[usize::from(sbc)];
@@ -3630,6 +3769,9 @@ impl AllocUtil {
         };
         count.current -= 1;
         bytes.current -= size;
+        if !sbc {
+            self.set_new_allctr_abandon_limit();
+        }
     }
     fn carrier_resized(&mut self, sbc: bool, mseg: bool, old_size: usize, new_size: usize) {
         let class = &mut self.class_stats[usize::from(sbc)];
@@ -4217,6 +4359,94 @@ mod tests {
         assert!(large <= small, "{small} vs {large}");
     }
 
+    fn abandon_options() -> AllocUtilOptions {
+        AllocUtilOptions {
+            sbct: 1 << 20,
+            mmbcs: 64 << 10,
+            smbcs: 64 << 10,
+            lmbcs: 64 << 10,
+            mbcgs: 1,
+            acul: 60,
+            acful: 40,
+            acnl: 1000,
+            acfml: 64,
+            cpool: Some('H'),
+            ..AllocUtilOptions::default()
+        }
+    }
+
+    fn drop_abandoned(
+        allocator: &mut AllocUtil,
+        live: &mut Vec<Allocation>,
+        abandoned: &mut usize,
+    ) {
+        for transfer in allocator.take_pending_carriers() {
+            *abandoned += 1;
+            for (gone, _) in transfer.allocations() {
+                live.retain(|allocation| allocation.id != gone.id);
+            }
+        }
+    }
+
+    #[test]
+    fn abandon_limits_follow_erts_rounding() {
+        assert_eq!(percent_limit(1000, 60), 600);
+        assert_eq!(percent_limit(1000, 1), 10);
+        assert_eq!(percent_limit(150, 1), 1);
+        assert_eq!(percent_limit(0, 45), 0);
+    }
+
+    #[test]
+    fn abandon_decision_from_counters_matches_carrier_walk_and_frees_do_not_walk() {
+        let mut allocator = AllocUtil::new_for_instance(
+            Strategy::AoffCbf,
+            abandon_options(),
+            "eheap_alloc",
+            0,
+            true,
+        );
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut live: Vec<Allocation> = Vec::new();
+        let (mut abandoned, mut plain_frees) = (0, 0);
+        for step in 0..30_000_usize {
+            let grow_bias = if (step / 1500) % 2 == 0 { 75 } else { 25 };
+            let roll = next() % 100;
+            if live.is_empty() || roll < grow_bias {
+                let size = 16 + (next() % 3000) as usize;
+                live.push(allocator.alloc(size).unwrap());
+            } else if roll % 9 == 0 {
+                let at = (next() as usize) % live.len();
+                let size = 16 + (next() % 3000) as usize;
+                if let Ok(moved) = allocator.realloc(live[at], size) {
+                    live[at] = moved;
+                }
+            } else {
+                let at = (next() as usize) % live.len();
+                let victim = live.swap_remove(at);
+                let walks = allocator.carrier_walks.get();
+                let pending = allocator.pending_carriers.len();
+                allocator.free(victim).unwrap();
+                if allocator.pending_carriers.len() == pending {
+                    assert_eq!(allocator.carrier_walks.get(), walks, "step {step}");
+                    plain_frees += 1;
+                }
+            }
+            drop_abandoned(&mut allocator, &mut live, &mut abandoned);
+            if step % 97 == 0 {
+                allocator.validate().unwrap();
+            }
+        }
+        allocator.validate().unwrap();
+        assert!(abandoned >= 3, "{abandoned}");
+        assert!(plain_frees >= 3000, "{plain_frees}");
+    }
+
     #[test]
     fn aoff_block_orders_follow_the_strategy() {
         for (strategy, best_fit_block) in [
@@ -4236,6 +4466,56 @@ mod tests {
             assert_eq!(picked.id, expected.id, "{strategy:?}");
             allocator.validate().unwrap();
         }
+    }
+
+    #[test]
+    #[ignore = "timing: cargo test --release -p arinsal-alloc abandon_check_bench -- --ignored --nocapture"]
+    fn abandon_check_bench() {
+        let mut allocator = AllocUtil::new_for_instance(
+            Strategy::AoffCbf,
+            AllocUtilOptions {
+                acul: 45,
+                acful: 25,
+                acnl: 1000,
+                acfml: 0,
+                mmmbc: 0,
+                ..abandon_options()
+            },
+            "eheap_alloc",
+            0,
+            true,
+        );
+        allocator.verify_abandon_by_walk = false;
+        let mut blocks = Vec::new();
+        for _ in 0..2300 {
+            blocks.push(allocator.alloc(100).unwrap());
+        }
+        for (index, allocation) in blocks.iter().enumerate() {
+            let Ok(block) = allocator.live_block(allocation.id as usize) else {
+                continue;
+            };
+            if index % 4 == 1 && !allocator.carriers[block.carrier].as_ref().unwrap().main {
+                allocator.free(*allocation).unwrap();
+            }
+        }
+        assert!(allocator.pending_carriers.is_empty());
+        let cycles: usize = std::env::var("FRAG_CYCLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500_000);
+        let started = std::time::Instant::now();
+        for _ in 0..cycles {
+            let allocation = allocator.alloc(100).unwrap();
+            allocator.free(allocation).unwrap();
+        }
+        let nanos = started.elapsed().as_nanos() as f64;
+        eprintln!(
+            "abandon check: {:.1} ns per alloc+free pair, {} carriers, {} walks, {} pending",
+            nanos / cycles as f64,
+            allocator.mbc_count,
+            allocator.carrier_walks.get(),
+            allocator.pending_carriers.len()
+        );
     }
 
     #[test]
