@@ -20,7 +20,7 @@ worker(Parent, Kind) ->
     Value = workload(Kind),
     {_, After} = lists:keyfind(minor_gcs, 1, element(2, process_info(self(), garbage_collection))),
     Info = case Kind of
-        K when K =:= 6; K =:= 7 -> process_info(self(), [message_queue_len, message_queue_data]);
+        7 -> process_info(self(), [message_queue_len, message_queue_data]);
         _ -> {After - Before, process_info(self(), [heap_size, total_heap_size, message_queue_len, message_queue_data])}
     end,
     Parent ! {result, self(), {Value, Info}}.
