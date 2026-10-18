@@ -967,54 +967,57 @@ fn gather_continuations(
 fn gather_continuations_in(
     p: &Process,
     pcs: &mut [u64],
-    mut previous_native: Option<usize>,
+    previous_native: Option<usize>,
     mut previous: Option<(usize, usize)>,
 ) -> usize {
     let limit = pcs.len();
+    if limit == 0 {
+        return 0;
+    }
     let mut count = 0usize;
     let trace_return = crate::native_bridge::native_trace_return_address();
     let bridge = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
-    let mut stack = p.heap.stack_terms().enumerate();
-    while count < limit {
-        let Some((index, word)) = stack.next() else {
-            break;
-        };
-        let raw_address = word.tagged_word() as usize;
-        if raw_address == trace_return {
-            let action_count = p
-                .heap
-                .stack_get(index + 3)
-                .and_then(Term::as_small)
-                .and_then(|n| usize::try_from(n).ok())
-                .unwrap_or(0);
-            let advance = 4usize.saturating_add(action_count.saturating_mul(2));
-            stack.nth(advance.saturating_sub(2));
-            continue;
-        }
-        if raw_address == bridge {
-            continue;
-        }
-        // Port of erts/emulator/beam/erl_term.h:1378-1379 (`is_CP`) and
-        // beam_common.c:805 (`gather_stacktrace`), OTP-29.1.1. A continuation is
-        // classified from its tag bits; code-range membership is deferred to the builder.
+    // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`), OTP-29.1.1: one
+    // forward pass over the live stack words. A plain term costs the `is_CP` test and, for a
+    // catch immediate, one more. `usize::MAX` is "no previous CP" (a CP has its low bits clear).
+    let words = p.heap.stack_raw_words();
+    let mut previous_cp = previous_native.unwrap_or(usize::MAX);
+    let mut index = 0usize;
+    while index < words.len() {
+        let raw_address = words[index] as usize;
+        index += 1;
         if arinsal_term::is_cp(raw_address as u64) {
-            if previous_native != Some(raw_address) {
-                previous_native = Some(raw_address);
+            if raw_address == trace_return {
+                let action_count = p
+                    .heap
+                    .stack_get(index + 2)
+                    .and_then(Term::as_small)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(0);
+                index = index.saturating_add(3 + action_count.saturating_mul(2));
+            } else if raw_address != bridge && previous_cp != raw_address {
+                previous_cp = raw_address;
                 previous = None;
                 pcs[count] = u64::try_from(raw_address.wrapping_sub(1)).unwrap_or(0);
                 count += 1;
+                if count == limit {
+                    break;
+                }
             }
             continue;
         }
-        if let Some((module, ip)) = continuation_word(word) {
+        if raw_address & 63 != 0x1b {
+            continue;
+        }
+        if let Some((module, ip)) = p.heap.stack_get(index - 1).and_then(continuation_word) {
             // Port of erts/emulator/beam/beam_common.c:803-815 (gather_stacktrace), OTP-29.1.1:
             // trace stack frames are skipped.
             if module as u64 & RETURN_TRACE_FLAG != 0 {
-                stack.nth(4);
+                index += 5;
                 continue;
             }
             if module as u64 & RETURN_TO_TRACE_FLAG != 0 {
-                stack.next();
+                index += 1;
                 continue;
             }
             let call_site = ip.saturating_sub(1);
@@ -1022,12 +1025,14 @@ fn gather_continuations_in(
                 continue;
             }
             previous = Some((module, call_site));
-            previous_native = None;
+            previous_cp = usize::MAX;
             if let Some(packed) = pack_indexed(module, ip) {
                 pcs[count] = packed;
                 count += 1;
+                if count == limit {
+                    break;
+                }
             }
-            continue;
         }
     }
     count

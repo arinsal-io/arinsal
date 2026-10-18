@@ -1071,6 +1071,12 @@ impl ProcessHeap {
         self.words.len() - self.stop
     }
 
+    /// The live stack words in stack order, as raw words.
+    #[inline]
+    pub fn stack_raw_words(&self) -> &[u64] {
+        &self.words.words()[self.stop..]
+    }
+
     /// Iterate over live stack words in stack order without an indexed bounds check per word.
     #[inline]
     pub fn stack_terms(&self) -> impl ExactSizeIterator<Item = Term> + '_ {

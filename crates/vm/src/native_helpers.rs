@@ -3929,6 +3929,19 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
 #[cold]
 #[inline(never)]
 fn note_owned_failure(process: &mut crate::Process) {
+    // Only an owned record needs the move below; the record of an export failure stays put.
+    if !process.cold.as_ref().is_some_and(|cold| {
+        cold.native_bif_error.as_ref().is_some_and(|failure| {
+            failure.freason == process.header.freason
+                && failure.fvalue == process.header.fvalue
+                && matches!(
+                    failure.call,
+                    crate::proc_create::NativeBifCall::Owned { .. }
+                )
+        })
+    }) {
+        return;
+    }
     let Some(failure) = process
         .cold
         .as_mut()
