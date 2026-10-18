@@ -1004,14 +1004,7 @@ pub fn run_native(
     // already demands S_RESERVED while the heap is native. A later instruction that really needs
     // heap collects inside the callee, with the callee's continuation word on the stack. Asking
     // for more here collected at resume, one stack word and one collection away from erts.
-    // The check runs with native allocation on, so it demands S_RESERVED: a BIF the scheduler ran
-    // for the previous native exit may have filled the heap up to E, and the callee's first
-    // instruction pushes its CP.
-    process.heap.set_native_allocation(true);
-    if let Err(error) = process.ensure_entry(0, live) {
-        process.heap.set_native_allocation(false);
-        return Err(error);
-    }
+    process.ensure_entry(0, live)?;
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-261 (emit_i_apply_only),
     // OTP-29.1.1: a call the scheduler performs for native code (fun/apply, BIF traps,
     // breakpoint handlers) pops the caller's continuation into LR, so the callee's frame
