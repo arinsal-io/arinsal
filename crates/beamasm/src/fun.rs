@@ -423,10 +423,9 @@ pub(crate) fn emit_call_fun_error(
     asm.code.emit(|e| {
         e.mov_reg(Gpr::x(0), Gpr::x(21))?;
         e.mov_reg(Gpr::x(1), Gpr::x(3))?;
-        e.lsr_imm(Gpr::x(2), Gpr::x(2), 8)?;
-        e.mov_const(Gpr::x(17), helper as u64)?;
-        e.blr(Gpr::x(17))
+        e.lsr_imm(Gpr::x(2), Gpr::x(2), 8)
     })?;
+    asm.fragment_call(helper)?;
     emit_leave_runtime(&mut asm.code, 6, update)?;
     asm.code.emit(|e| e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72))?;
     asm.branch_error_from_lr()?;
