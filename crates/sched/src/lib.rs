@@ -599,12 +599,19 @@ thread_local! {
         const { std::cell::Cell::new(SchedulerType::Normal) };
     static NORMAL_SCHEDULER_ID: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static NORMAL_SCHEDULER_COUNT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Zero-based index of the normal scheduler running on the calling thread, like
 /// `erts_get_scheduler_id() - 1`; `None` on other threads.
 pub fn current_normal_scheduler() -> Option<usize> {
     NORMAL_SCHEDULER_ID.with(std::cell::Cell::get)
+}
+
+/// Number of normal schedulers in the calling scheduler thread's runtime.
+pub fn current_normal_scheduler_count() -> Option<usize> {
+    NORMAL_SCHEDULER_COUNT.with(std::cell::Cell::get)
 }
 
 /// Scheduler type of the calling thread, like `erts_get_scheduler_data()->type`.
@@ -7509,6 +7516,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         .set(thread::current())
         .expect("worker registers once");
     NORMAL_SCHEDULER_ID.with(|current| current.set(Some(id)));
+    NORMAL_SCHEDULER_COUNT.with(|current| current.set(Some(inner.config.workers)));
     // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_register_scheduler), OTP-29.1.1:
     // scheduler `no` owns allocator instance `no`. A refused registration leaves the thread on
     // instance 0, which is correct for a second runtime in the same process.

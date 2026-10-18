@@ -4,6 +4,7 @@ use crate::{Process, Vm, VmError, process::Message};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, RunCtx};
 use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned, global_atoms, to_owned};
+use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -147,10 +148,12 @@ impl NativeTraceAction {
 
 /// The traced function's pc and the actions of the native trace frame whose function pc word
 /// is at stack index `pc_index` (the frame starts two words earlier), with the frame's size.
+type NativeFrameActions = SmallVec<[NativeTraceAction; 1]>;
+
 pub(crate) fn native_frame_actions(
     process: &Process,
     pc_index: usize,
-) -> (usize, Vec<NativeTraceAction>, usize) {
+) -> (usize, NativeFrameActions, usize) {
     let function_pc = process
         .heap
         .stack_get(pc_index)
@@ -2180,13 +2183,12 @@ fn call_event_scope(
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if bp_flags & acc_flags != 0 {
-            let _section = crate::trace_bp::AccSection::enter();
             let ci = crate::trace_bp::func_id(module, function, arity);
             let mut prev = None;
             if bp_flags & BPF_TIME_TRACE_ACTIVE != 0
                 && let Some(bdt) = hit.time.as_ref()
             {
-                let time = arinsal_bifs::monotonic_time_nanos() as i64;
+                let time = arinsal_bifs::monotonic_time_raw_nanos();
                 prev = crate::trace_bp::trace_call_acc(
                     process,
                     pid,
@@ -2583,13 +2585,9 @@ pub(crate) fn call_acc_return(
     bp_flags: u32,
     prev: Option<u32>,
 ) {
-    // Port of erts/emulator/beam/beam_bp.c:1352-1365 (erts_call_trace_return): a session that
-    // no longer traces the process has no state to update.
-    if !table()
-        .read()
-        .unwrap()
-        .contains_key(&(scope(process), session, pid))
-    {
+    // Port of erts/emulator/beam/beam_bp.c (erts_call_trace_return) and
+    // :1022 (get_tracer_ref): the return frame resolves its session through the process.
+    if session_flags_cached(process, session, pid) == 0 {
         return;
     }
     crate::trace_bp::call_trace_return(process, pid, session, bp_flags, prev);
@@ -2909,7 +2907,9 @@ pub(crate) fn executor_native_call_event(
 
 /// The traced native functions a return passes through, innermost first, and the address that
 /// execution continues at.
-pub(crate) type PoppedNativeFrames = (Vec<(usize, Vec<NativeTraceAction>)>, Term);
+/// Frames popped by a native return, with one inline frame and action for the common trace case.
+pub(crate) type NativeTraceFrames = SmallVec<[(usize, NativeFrameActions); 1]>;
+pub(crate) type PoppedNativeFrames = (NativeTraceFrames, Term);
 
 /// Pop the native trace frames a return passes through. The frame's stub word is already
 /// dropped: the saved caller is at stack index 0 and the traced function's pc follows. A caller
@@ -2921,7 +2921,7 @@ pub(crate) fn pop_native_trace_frames(
     mut drop_words: impl FnMut(&mut Process, usize),
 ) -> Option<PoppedNativeFrames> {
     let trace_stub = crate::native_bridge::native_trace_return_address();
-    let mut frames = Vec::new();
+    let mut frames = SmallVec::new();
     loop {
         let saved_caller = process.heap.stack_get(0)?;
         let (function_pc, actions, _) = native_frame_actions(process, 1);
@@ -2939,6 +2939,31 @@ pub(crate) fn pop_native_trace_frames(
             return Some((frames, saved_caller));
         }
     }
+}
+
+/// Pop the single accounting frame handled by erts' `i_call_trace_return` instruction.
+// Port of erts/emulator/beam/jit/arm/instr_trace.cpp, OTP-29.1.1.
+pub(crate) fn pop_native_call_acc_frame(
+    process: &mut Process,
+    mut drop_words: impl FnMut(&mut Process, usize),
+) -> Option<(Term, NativeTraceAction)> {
+    let (saved_caller, action) = {
+        let mut words = process.heap.stack_terms();
+        let saved_caller = words.next()?;
+        words.next()?;
+        let count = words.next()?.as_small()?;
+        if count != 1 {
+            return None;
+        }
+        let session = words.next()?.as_small()?;
+        let flags = words.next()?.as_small()?;
+        (saved_caller, NativeTraceAction::from_words(session, flags))
+    };
+    if action.acc.is_none() || action.return_trace || action.exception_trace || action.return_to {
+        return None;
+    }
+    drop_words(process, 6);
+    Some((saved_caller, action))
 }
 
 /// The continuation word that starts a native trace frame on the stack.

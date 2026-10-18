@@ -1000,6 +1000,17 @@ pub extern "C" fn arinsal_beamasm_native_trace_return(header: *mut ProcessHeader
         return 0;
     };
     let value = process.x[0];
+    if let Some(pid) = process.self_pid
+        && let Some((saved_caller, action)) =
+            crate::trace::pop_native_call_acc_frame(process, |p, words| {
+                p.heap.set_stack_pointer(p.header.stop.wrapping_add(words));
+                p.sync_native_header();
+            })
+        && let Some(acc) = action.acc
+    {
+        crate::trace::call_acc_return(process, pid, action.session, acc.flags, acc.prev);
+        return saved_caller.tagged_word();
+    }
     let Some((frames, saved_caller)) =
         crate::trace::pop_native_trace_frames(process, |p, words| {
             p.heap.set_stack_pointer(p.header.stop.wrapping_add(words));
@@ -2894,15 +2905,20 @@ fn native_breakpoint_accounted(process: &mut crate::Process, site: usize) -> boo
     let Some(hit) = crate::trace_bp::native_breakpoint_accounting(process, pid, site) else {
         return false;
     };
-    if hit.actions.is_empty() {
+    let Some(action) = hit.action else {
         return true;
-    }
+    };
     // The header holds the live reduction counter of the native code; publishing the header
     // below must not rewind it.
     process.reductions = process.header.fcalls;
     // The frame may need a collection, whose roots are the function's arguments.
-    if crate::trace::push_native_trace_frame(process, site, &hit.actions, usize::from(hit.arity))
-        .is_err()
+    if crate::trace::push_native_trace_frame(
+        process,
+        site,
+        std::slice::from_ref(&action),
+        usize::from(hit.arity),
+    )
+    .is_err()
     {
         crate::native_hooks::set_error(process, "system_limit");
     }

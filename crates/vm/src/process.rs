@@ -1337,7 +1337,7 @@ impl Executor {
         &mut self,
         process: &mut Process,
         ctx: &mut RunCtx<'_, Message>,
-        frames: Vec<(usize, Vec<crate::trace::NativeTraceAction>)>,
+        frames: crate::trace::NativeTraceFrames,
         value: Term,
         resume_pc: usize,
     ) -> Result<(), VmError> {
