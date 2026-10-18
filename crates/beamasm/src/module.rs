@@ -170,6 +170,8 @@ pub struct BeamModuleAssembler {
     pub(crate) yield_label: Label,
     /// Arity of the function being emitted: the live X registers at its `i_test_yield`.
     function_arity: u8,
+    /// Whether this host can execute AArch64 Large System Extension atomics.
+    coverage_lse: bool,
     pub(super) error_label: Label,
     /// Module-local stub that turns the `bl` return address of a raise site into the raising pc
     /// and continues at `error_label`.
@@ -281,6 +283,7 @@ impl BeamModuleAssembler {
             defined_lambdas: HashMap::new(),
             yield_label,
             function_arity: 0,
+            coverage_lse: has_lse_at_runtime(),
             error_label,
             error_pc_label,
             exception_resolver: 0,
@@ -941,6 +944,40 @@ impl BeamModuleAssembler {
         self.code.bind(continuation)?;
         self.yield_stubs
             .push((stub, continuation, self.function_arity));
+        Ok(())
+    }
+
+    /// Emits one OTP function or line coverage update.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3172 (`emit_coverage`), OTP-29.1.1.
+    pub fn emit_coverage(&mut self, address: usize, flags: bool) -> Result<(), ModuleError> {
+        let address_reg = Gpr::x(8);
+        let value_reg = Gpr::x(9);
+        self.code
+            .emit(|encoder| encoder.mov_const(address_reg, address as u64))?;
+        if flags {
+            if address & 0xff != 0 {
+                self.code
+                    .emit(|encoder| encoder.strb_uoff(address_reg, address_reg, 0))?;
+            } else {
+                self.code.emit(|encoder| encoder.mov_const(value_reg, 1))?;
+                self.code
+                    .emit(|encoder| encoder.strb_uoff(value_reg, address_reg, 0))?;
+            }
+        } else if self.coverage_lse {
+            self.code.emit(|encoder| encoder.mov_const(value_reg, 1))?;
+            self.code
+                .emit(|encoder| encoder.ldaddal(value_reg, value_reg, address_reg))?;
+        } else {
+            let retry = self.code.new_label();
+            self.code.bind(retry)?;
+            self.code
+                .emit(|encoder| encoder.ldaxr(value_reg, address_reg))?;
+            self.code
+                .emit(|encoder| encoder.add_imm(value_reg, value_reg, 1, false))?;
+            self.code
+                .emit(|encoder| encoder.stlxr(Gpr::w(10), value_reg, address_reg))?;
+            self.code.cbnz(Gpr::w(10), retry)?;
+        }
         Ok(())
     }
 
@@ -2278,6 +2315,17 @@ impl BeamModuleAssembler {
             line_breakpoint_returns: self.line_breakpoint_returns,
             nif_patches: self.nif_patches,
         })
+    }
+}
+
+fn has_lse_at_runtime() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("lse")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
     }
 }
 

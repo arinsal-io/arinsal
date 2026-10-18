@@ -2317,8 +2317,7 @@ impl Vm {
                         module.coverage.as_ref(),
                         module.coverage_probes.get(index as usize),
                     ) {
-                        coverage.counters[probe.counter as usize]
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        coverage.hit(probe.counter as usize);
                     }
                 }
                 Instr::NativeBody { index } => {

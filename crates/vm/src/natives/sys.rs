@@ -1021,6 +1021,9 @@ fn system_info(
         Some("process_count") => Some(non_neg(process, process_count(process) as u64)),
         // Port of erts/emulator/beam/erl_bif_info.c:3521, OTP-29.1.1.
         Some("atom_count") => Some(non_neg(process, global_atoms().len() as u64)),
+        // Port of erts/emulator/beam/erl_gc.c:243-291 (erts_init_gc) and :353-381
+        // (erts_heap_sizes), OTP-29.1.1.
+        Some("heap_sizes") => Some(heap_sizes(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:3518 (atom_limit), OTP-29.1.1.
         Some("atom_limit") => Some(non_neg(process, global_atoms().limit() as u64)),
         // Port of erts/emulator/beam/erl_bif_info.c:3524-3529, OTP-29.1.1.
@@ -1203,6 +1206,44 @@ fn system_info(
         _ if selector.classify() == TermKind::Tuple => Some(Err(badarg())),
         _ => None,
     }
+}
+
+fn heap_sizes(process: &mut Process) -> Result<Term, VmError> {
+    use arinsal_etf::OwnedTerm as O;
+
+    let capacity = if usize::BITS == 64 { 154 } else { 59 };
+    let max_size = if usize::BITS == 64 {
+        1_u64 << 50
+    } else {
+        u64::from(u32::MAX) / 4
+    };
+    let mut sizes = Vec::with_capacity(capacity);
+    sizes.extend([12_u64, 38]);
+    for index in 2..23 {
+        sizes.push(sizes[index - 1] + sizes[index - 2] + 1);
+    }
+    for _ in 23..capacity {
+        let previous = *sizes.last().expect("the initial heap sizes are nonempty");
+        let next = previous + previous / 5;
+        if next > max_size {
+            // erts decrements its loop index before publishing num_heap_sizes, which drops
+            // the last valid entry as well as the first entry that exceeds max_size.
+            sizes.pop();
+            break;
+        }
+        sizes.push(next);
+    }
+    let values = sizes
+        .into_iter()
+        .map(|size| O::Int(i64::try_from(size).expect("heap size fits a signed word")))
+        .collect();
+    owned_system_info(
+        process,
+        O::List {
+            elems: values,
+            tail: Box::new(O::Nil),
+        },
+    )
 }
 
 fn allocator_names(process: &mut Process) -> Result<Term, VmError> {
