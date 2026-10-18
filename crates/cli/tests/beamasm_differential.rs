@@ -15,6 +15,7 @@ const MODULES: &[&str] = &[
     "beamasm_eq_exact",
     "beamasm_map_elements",
     "beamasm_map_callee",
+    "beamasm_caught_bif_error",
 ];
 
 /// OTP modules compiled natively alongside a fixture, for fixtures that exercise them.
@@ -63,21 +64,35 @@ fn compile_fixtures() -> Option<PathBuf> {
 }
 
 fn reference(dir: &Path, module: &str) -> Output {
-    Command::new("erl")
-        .args(["-noshell", "-pa"])
+    Command::new("timeout")
+        .args(["120", "erl", "-noshell", "-pa"])
         .arg(dir)
         .args(["-eval", &format!("{module}:run(), halt().")])
+        .stdin(std::process::Stdio::null())
         .output()
         .expect("erl must be available")
 }
 
 fn native(dir: &Path, module: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_arinsal"))
-        .args(["-noshell", "-pa"])
+    Command::new("timeout")
+        .args(["120", env!("CARGO_BIN_EXE_arinsal"), "-noshell", "-pa"])
         .arg(dir)
         .args(["-eval", &format!("{module}:run(), halt().")])
         .env("ARINSAL_BEAMASM", "1")
         .env("ARINSAL_BEAMASM_MODULES", native_modules(module))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn interpreted(dir: &Path, module: &str) -> Output {
+    Command::new("timeout")
+        .args(["120", env!("CARGO_BIN_EXE_arinsal"), "-noshell", "-pa"])
+        .arg(dir)
+        .args(["-eval", &format!("{module}:run(), halt().")])
+        .env("ARINSAL_BEAMASM", "1")
+        .env("ARINSAL_BEAMASM_MODULES", module)
+        .env("ARINSAL_INTERP", "1")
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap()
@@ -98,5 +113,32 @@ fn native_modules_print_what_erl_prints() {
             "{module}: BeamAsm output differs from erl"
         );
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn caught_bif_error_stacktrace_matches_jit_interpreter_and_otp() {
+    let Some(dir) = compile_fixtures() else {
+        return;
+    };
+    let expected = reference(&dir, "beamasm_caught_bif_error");
+    assert!(expected.status.success(), "erl failed: {expected:?}");
+    let interpreted = interpreted(&dir, "beamasm_caught_bif_error");
+    assert!(
+        interpreted.status.success(),
+        "interpreter failed: {interpreted:?}"
+    );
+    let actual = native(&dir, "beamasm_caught_bif_error");
+    assert!(actual.status.success(), "BeamAsm failed: {actual:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout),
+        String::from_utf8_lossy(&expected.stdout),
+        "interpreter output differs from erl"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&actual.stdout),
+        String::from_utf8_lossy(&expected.stdout),
+        "BeamAsm output differs from erl"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
