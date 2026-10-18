@@ -37,6 +37,9 @@ pub(crate) struct Token {
     sender: OwnedTerm,
     lastcnt: u64,
     epoch: u64,
+    /// Where a queued message's copy of the token lives (the words copied after the message
+    /// term); `NIL` when it has none. Not part of the token's value.
+    heap_ref: Term,
 }
 
 /// What a queued message says about the sequential trace token: erts keeps `NIL` for a message
@@ -109,11 +112,12 @@ pub(crate) fn token_term_on(process: &mut Process, token: Option<&Token>) -> Res
 }
 /// Apply a `seq_trace:reset_trace/0` that happened since the process last looked: erts clears
 /// every process's token, `seq_trace_clock` and `seq_trace_lastcnt` (bif.c:5150-5170).
-fn sync_epoch(process: &mut Process) {
+pub(crate) fn sync_epoch(process: &mut Process) {
     let now = epoch().load(Ordering::Relaxed);
     if process.seq_trace_epoch != now {
         process.seq_trace_epoch = now;
         process.seq_trace_token = None;
+        process.seq_token_root = Term::NIL;
         process.seq_trace_clock = 0;
         process.seq_trace_lastcnt = 0;
     }
@@ -137,6 +141,9 @@ fn token(process: &mut Process) -> Option<Token> {
     process.seq_trace_token.as_deref().cloned()
 }
 fn put(process: &mut Process, value: Option<Token>) {
+    if value.is_none() {
+        process.seq_token_root = Term::NIL;
+    }
     process.seq_trace_token = value.map(Box::new);
 }
 
@@ -267,26 +274,58 @@ fn token_term(process: &mut Process, token: Option<&Token>) -> Result<Term, VmEr
     let Some(token) = token else {
         return Ok(Term::NIL);
     };
-    let fields = [
-        OwnedTerm::Int(token.flags as i64),
-        token.label.clone(),
-        OwnedTerm::Int(token.serial as i64),
-        token.sender.clone(),
-        OwnedTerm::Int(token.lastcnt as i64),
-    ];
-    let mut values = Vec::with_capacity(fields.len());
-    for field in &fields {
-        values.push(
-            from_owned(
-                field,
-                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-            )
-            .map_err(|e| VmError::Unsupported(format!("seq token: {e:?}")))?,
-        );
+    token
+        .build_on(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .map_err(|e| VmError::Unsupported(format!("seq token: {e:?}")))
+}
+
+impl Token {
+    /// Where the copy of this token that travels with a queued message lives.
+    pub(crate) fn heap_ref(&self) -> Term {
+        self.heap_ref
     }
-    TermBuilder::new(&mut process.heap)
-        .tuple(&values)
-        .map_err(|e| VmError::Unsupported(format!("seq token tuple: {e:?}")))
+
+    pub(crate) fn heap_ref_mut(&mut self) -> &mut Term {
+        &mut self.heap_ref
+    }
+
+    /// The heap copy as a collection root: a `seq_trace:reset_trace/0` since the token was
+    /// made cleared it (`erts_proc_sig_clear_seq_trace_tokens`), so it names nothing.
+    pub(crate) fn root(&self) -> Term {
+        if self.epoch == epoch().load(Ordering::Relaxed) {
+            self.heap_ref
+        } else {
+            Term::NIL
+        }
+    }
+
+    /// The five-tuple built on `heap`.
+    pub(crate) fn build_on<H: arinsal_term::HeapAlloc>(
+        &self,
+        heap: &mut H,
+    ) -> Result<Term, arinsal_term::TermError> {
+        let fields = [
+            OwnedTerm::Int(self.flags as i64),
+            self.label.clone(),
+            OwnedTerm::Int(self.serial as i64),
+            self.sender.clone(),
+            OwnedTerm::Int(self.lastcnt as i64),
+        ];
+        let mut values = Vec::with_capacity(fields.len());
+        for field in &fields {
+            values.push(from_owned(field, heap)?);
+        }
+        TermBuilder::new(heap).tuple(&values)
+    }
+
+    /// Words the token takes on a heap: `size_object` of the five-tuple a send copies along
+    /// with the message.
+    // Port of erts/emulator/beam/erl_message.c (erts_send_message, seq_trace_size), OTP-29.1.1.
+    pub(crate) fn heap_words(&self) -> usize {
+        let mut scratch = arinsal_term::VecHeap::new();
+        self.build_on(&mut scratch)
+            .map_or(0, arinsal_term::size_object)
+    }
 }
 
 pub(crate) fn get_token_term(process: &mut Process, _pid: Pid) -> Result<Term, VmError> {
@@ -348,6 +387,10 @@ pub(crate) fn on_receive(
     }
     process.seq_trace_lastcnt = token.serial;
     process.seq_trace_clock = process.seq_trace_clock.max(token.serial);
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp (beam_jit_remove_message), OTP-29.1.1:
+    // SEQ_TRACE_TOKEN(c_p) becomes the message's own token tuple, no copy.
+    let mut token = token;
+    process.seq_token_root = std::mem::replace(&mut token.heap_ref, Term::NIL);
     put(process, Some(token.clone()));
     let receiver = pid
         .to_term()
@@ -730,6 +773,15 @@ impl Local {
             put(process, self.token);
             process.seq_trace_clock = self.clock;
             process.seq_trace_lastcnt = self.lastcnt;
+            // Port of erts/emulator/beam/erl_bif_trace.c (new_seq_trace_token), OTP-29.1.1: a
+            // new token is a tuple built on the process heap.
+            if let Some(token) = process.seq_trace_token.as_deref()
+                && !process.seq_token_root.is_pointer()
+                && let Ok(root) =
+                    token.build_on(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+            {
+                process.seq_token_root = root;
+            }
         }
     }
 
@@ -798,6 +850,7 @@ impl Local {
                 .unwrap_or(OwnedTerm::atom("undefined")),
             lastcnt,
             epoch: epoch().load(Ordering::Relaxed),
+            heap_ref: Term::NIL,
         });
         self.changed = true;
         Some(if let Some(bit) = bit {
