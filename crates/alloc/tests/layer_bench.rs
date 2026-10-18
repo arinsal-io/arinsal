@@ -311,6 +311,14 @@ fn pair160() {
             }));
             eprintln!("AllocUtil alloc+free         {util:6.2} ns");
         }
+        let allocators =
+            ThreadSpecificAllocators::new(4, true, Strategy::AoffCbf, AllocUtilOptions::default());
+        let inst = best(Box::new(move || {
+            let (h, p) = allocators.alloc_with_ptr_at(1, 160).unwrap();
+            std::hint::black_box(p);
+            allocators.free_at(1, h).unwrap();
+        }));
+        eprintln!("instance layer alloc+free    {inst:6.2} ns");
         let driver = best(Box::new(|| {
             let p = arinsal_alloc::typed::driver_alloc(160);
             arinsal_alloc::typed::driver_free(std::hint::black_box(p));
