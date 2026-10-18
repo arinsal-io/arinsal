@@ -7,12 +7,12 @@
 //! current stack block are rebased; code pointers and CATCH words remain intact.
 
 use crate::VecHeap;
-use crate::bits::{BINARY_FLAG_WRITABLE, binary_data, writable_gc_visit};
+use crate::bits::{binary_data, writable_gc_visit};
 use crate::hamt::{boxed_object_words, boxed_term_range};
 use crate::{
-    ARITY, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, ExternalBinary, FUN,
-    FunEntry, HEAP_BITS, HeapAlloc, MAP, MagicRef, Node, ProcessHeap, RECORD, REF, RefcBinary,
-    S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
+    ARITY, BIN_REF, ExportEntry, ExternalBinary, FUN, FunEntry, HEAP_BITS, HeapAlloc, MAP,
+    MagicRef, Node, ProcessHeap, RECORD, RefcBinary, S_RESERVED, SUB_BITS, StackWord, Term,
+    TermError, WritableBinary,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -366,12 +366,10 @@ impl Copier<'_> {
             }
             let moved = destination as u64 | 2;
             *ptr = moved;
-            if matches!(
-                val & 63,
-                BIN_REF | EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF | FUN | SUB_BITS
-            ) || (val == crate::REF_THING_HEADER
-                && crate::is_magic_ref_thing_with_hdr(val, *destination.add(1)))
-            {
+            // Binary references, magic references and external things move with their
+            // counted reference: `sweep_off_heap` relinks the copy from the forwarded
+            // original, as erts does.
+            if matches!(val & 63, FUN | SUB_BITS) {
                 self.retain_owner(val, destination, Term(moved), promote);
             }
             moved
@@ -462,65 +460,8 @@ impl Copier<'_> {
     }
 
     fn retain_owner(&mut self, header: u64, ptr: *mut u64, term: Term, promote: bool) {
-        // SAFETY: `ptr` is a complete copied object with the owner field in word one.
         let key = crate::heap::load(ptr.wrapping_add(1)) as usize;
         match header & 63 {
-            BIN_REF => {
-                if crate::bits::bin_ref_val_is_external(key as u64) {
-                    // SAFETY: the source BinRef's list entry owns this `Arc<ExternalBinary>`;
-                    // the forwarded source is skipped by the sweep, so the count moves here.
-                    let binary =
-                        unsafe { Arc::from_raw(crate::bits::external_val_ptr(key as u64)) };
-                    let vheap_words = (binary.len() / 8) as u64;
-                    if self.to.link_external_binary(ptr, binary).is_err() {
-                        self.error = Some(TermError::BadArg);
-                    }
-                    self.to.add_vheap(promote, vheap_words);
-                } else {
-                    // BinRef.val points directly at the erts Binary header.
-                    // SAFETY: the copied BinRef retains the source Binary allocation.
-                    let binary_flags = unsafe { *(key as *const u64) };
-                    let writable = binary_flags & BINARY_FLAG_WRITABLE != 0;
-                    // SAFETY: the same live Binary header contains `orig_size` in word three.
-                    let orig_size = unsafe { *((key as *const u64).add(3)) } as usize;
-                    // Port of erts/emulator/beam/erl_gc.c:3155-3178 (writable BinRef sweep),
-                    // OTP-29.1.1: the vheap charges allocated Binary.orig_size, not apparent size.
-                    let overhead_words = (orig_size / 8) as u64;
-                    // SAFETY: the source BinRef owns this Binary through the collection.
-                    let view = unsafe {
-                        arinsal_alloc::raw::BinaryView::from_header(
-                            key as *const u64,
-                            4 + orig_size.div_ceil(8),
-                        )
-                    };
-                    let Some(owner) = arinsal_alloc::raw::OwnedBinaryRef::clone_from_view(view)
-                    else {
-                        self.error = Some(TermError::BadArg);
-                        return;
-                    };
-                    if self
-                        .to
-                        .link_bin_ref(ptr, writable, overhead_words, Some(owner))
-                        .is_err()
-                    {
-                        self.error = Some(TermError::BadArg);
-                    }
-                    if writable {
-                        self.to.add_vheap(promote, overhead_words);
-                        return;
-                    }
-                    self.to.add_vheap(promote, overhead_words);
-                }
-            }
-            EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
-                // Port of erts/emulator/beam/erl_gc.c (sweep_off_heap, ExternalThing case),
-                // OTP-29.1.1: the moved thing is linked into the new off-heap list and takes
-                // over the node reference of its source.
-                // SAFETY: the source thing's list entry owns this `Arc::into_raw` reference;
-                // the forwarded source is skipped by the sweep, so the count moves here.
-                let node = unsafe { Arc::from_raw(key as *const Node) };
-                self.to.link_node(ptr, node);
-            }
             FUN => {
                 // The entry word is a counted `Arc` pointer held by the source heap's list, so
                 // the copy takes its own count without searching the source list.
@@ -546,18 +487,6 @@ impl Copier<'_> {
                 }
             }
             SUB_BITS => self.sub_bits.push(term),
-            REF if crate::is_magic_ref_thing_with_hdr(header, key as u64) => {
-                // Port of erts/emulator/beam/erl_gc.c (sweep_off_heap, magic reference
-                // case), OTP-29.1.1: the moved thing is linked into the new off-heap list
-                // and carries the counted reference of its source; the vheap is charged
-                // `mb->orig_size`.
-                let owner = MagicRef::thing_owner(key as u64, false);
-                let words = owner.orig_size() as u64 / 8;
-                if self.to.link_magic_ref(ptr, owner).is_err() {
-                    self.error = Some(TermError::BadArg);
-                }
-                self.to.add_vheap(promote, words);
-            }
             _ => {}
         }
     }
@@ -593,83 +522,57 @@ impl Copier<'_> {
         }
     }
 
-    /// Keep moved and old BinRefs, and release unreachable young BinRefs.
-    // Port of erts/emulator/beam/erl_gc.c:2996-3150 (sweep_off_heap), OTP-29.1.1.
-    fn sweep_binary_chain(&mut self, writable: bool) {
-        let source_head = if writable {
-            self.from.owners.wrt_bins
-        } else {
-            self.from.owners.off_heap_first
-        };
-        if source_head == 0 && !self.to.owners.is_allocated() {
-            return;
-        }
-        let mut old_head = 0usize;
-        let mut old_tail = 0usize;
+    /// Walk one off-heap list of the abandoned heap and build the new list in source order:
+    /// a forwarded thing is replaced by its copy, which carries the counted reference of the
+    /// original; a thing in the old generation stays in place when a minor collection leaves
+    /// it there; the rest is released. Returns the head of the new list.
+    ///
+    /// The refc list keeps young things before old ones, so a minor collection links the
+    /// remaining tail at the first old thing without visiting it. The writable list is walked
+    /// whole, because writable binaries may live on the old heap.
+    // Port of erts/emulator/beam/erl_gc.c (sweep_off_heap), OTP-29.1.1.
+    fn sweep_off_heap_list(
+        &mut self,
+        source_head: usize,
+        writable: bool,
+        old_block: Area,
+    ) -> usize {
+        let mut head = 0usize;
+        let mut last = 0usize;
         let mut source = source_head;
         while source != 0 {
-            let ptr = source as *mut u64;
-            // SAFETY: the source chain contains live three-word BinRef objects in heap or
-            // fragment storage; the collector has exclusive access while forwarding them.
+            let ptr = source as *const u64;
             let thing = crate::heap::load(ptr);
             let next = crate::heap::load(ptr.wrapping_add(2)) as usize;
-            let moved = thing & 3 == 2;
-            if moved {
-                // A forwarded magic or external thing, or resource-backed BinRef, handed its
-                // counted reference to the copy linked into the new list; a refc BinRef copy
-                // took its own.
-                if crate::heap::off_heap_node_is_bin_ref(source)
-                    && !crate::bits::bin_ref_val_is_external(crate::heap::load(
-                        (source as *const u64).wrapping_add(1),
-                    ))
-                {
-                    release_binary_ref(source);
-                }
+            let keep = if thing & 3 == 2 {
+                let copy = (thing & !3) as usize;
+                let words = off_heap_node_overhead_words(copy);
+                self.to.add_vheap(old_block.contains(copy), words);
+                Some(copy)
             } else if !self.major && self.old.contains(source) {
-                // Minor GC leaves old-generation BinRefs in place. Build the retained old
-                // suffix in source-list order, matching `insert_old_here` in erts.
-                if old_head == 0 {
-                    old_head = source;
-                } else {
-                    crate::heap::store((old_tail as *mut u64).wrapping_add(2), source as u64);
-                }
-                old_tail = source;
+                Some(source)
             } else {
                 release_off_heap_node(source);
+                None
+            };
+            if let Some(node) = keep {
+                if last == 0 {
+                    head = node;
+                } else {
+                    crate::heap::store((last as *mut u64).wrapping_add(2), node as u64);
+                }
+                last = node;
+                if !writable && node == source {
+                    // The rest of the list is on the old heap and needs no attention.
+                    return head;
+                }
             }
             source = next;
         }
-
-        // The retained suffix was spliced into the destination chain above; all other
-        // source references were released while sweeping.
-        if writable {
-            self.from.owners.wrt_bins = 0;
-        } else {
-            self.from.owners.off_heap_first = 0;
+        if last != 0 {
+            crate::heap::store((last as *mut u64).wrapping_add(2), 0);
         }
-
-        let destination_head = if writable {
-            &mut self.to.owners.wrt_bins
-        } else {
-            &mut self.to.owners.off_heap_first
-        };
-        if old_head != 0 {
-            if *destination_head == 0 {
-                *destination_head = old_head;
-            } else {
-                let mut tail = *destination_head;
-                loop {
-                    // SAFETY: destination_head and every next link point to live BinRefs.
-                    let next = crate::heap::load((tail as *const u64).wrapping_add(2)) as usize;
-                    if next == 0 {
-                        break;
-                    }
-                    tail = next;
-                }
-                crate::heap::store((tail as *mut u64).wrapping_add(2), old_head as u64);
-            }
-            crate::heap::store((old_tail as *mut u64).wrapping_add(2), 0);
-        }
+        head
     }
 
     /// Sweep the refc list, then the separate writable list, before releasing from-space.
@@ -679,11 +582,50 @@ impl Copier<'_> {
         if refc_head == 0 && writable_head == 0 && !self.to.owners.is_allocated() {
             return;
         }
-        self.sweep_binary_chain(false);
-        self.sweep_binary_chain(true);
+        let old_block = if self.major {
+            Area::EMPTY
+        } else {
+            let start = self.to.old_words.as_ptr() as usize;
+            Area {
+                start,
+                end: start + self.to.old_words.len() * 8,
+            }
+        };
+        let refc = self.sweep_off_heap_list(refc_head, false, old_block);
+        let writable = self.sweep_off_heap_list(writable_head, true, old_block);
+        if let Some(owners) = self.from.owners.as_mut() {
+            owners.off_heap_first = 0;
+            owners.wrt_bins = 0;
+        }
+        if refc != 0 || writable != 0 {
+            let owners = &mut *self.to.owners;
+            owners.off_heap_first = refc;
+            owners.wrt_bins = writable;
+        }
         if self.to.owners.is_allocated() {
             self.to.owners.overhead = self.to.bin_vheap;
         }
+    }
+}
+
+/// The virtual binary heap words an off-heap list node of the new heap charges: `orig_size`
+/// of its binary or magic binary in words, nothing for an external thing.
+// Port of erts/emulator/beam/erl_gc.c (sweep_off_heap: `overhead / sizeof(Eterm)`), OTP-29.1.1.
+fn off_heap_node_overhead_words(node: usize) -> u64 {
+    let word = crate::heap::load((node as *const u64).wrapping_add(1));
+    match crate::heap::off_heap_node_kind(node) {
+        crate::heap::OffHeapKind::Node => 0,
+        crate::heap::OffHeapKind::Magic => {
+            // SAFETY: the list entry owns the counted reference the thing's pointer word names.
+            let owner = std::mem::ManuallyDrop::new(MagicRef::thing_owner(word, false));
+            owner.orig_size() as u64 / 8
+        }
+        crate::heap::OffHeapKind::BinRef if crate::bits::bin_ref_val_is_external(word) => {
+            // SAFETY: the list entry owns the `Arc<ExternalBinary>` named by `word`.
+            unsafe { (*crate::bits::external_val_ptr(word)).len() as u64 / 8 }
+        }
+        // SAFETY: a refc BinRef's word one is its live Binary header; word three is orig_size.
+        crate::heap::OffHeapKind::BinRef => (unsafe { *(word as *const u64).add(3) }) / 8,
     }
 }
 
