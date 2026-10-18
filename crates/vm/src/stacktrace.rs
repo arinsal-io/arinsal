@@ -109,11 +109,12 @@ impl HeapAlloc for TraceHeap<'_> {
         true
     }
 
-    fn retain_external_binary(
+    fn link_external_binary(
         &mut self,
+        bin_ref: *mut u64,
         binary: Arc<ExternalBinary>,
     ) -> Result<(), arinsal_term::TermError> {
-        HeapAlloc::retain_external_binary(self.heap, binary)
+        HeapAlloc::link_external_binary(self.heap, bin_ref, binary)
     }
 
     fn supports_external_binary(&self) -> bool {

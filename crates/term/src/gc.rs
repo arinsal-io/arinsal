@@ -7,9 +7,7 @@
 //! current stack block are rebased; code pointers and CATCH words remain intact.
 
 use crate::VecHeap;
-use crate::bits::{
-    BINARY_FLAG_WRITABLE, bin_ref_is_legacy_external, binary_data, writable_gc_visit,
-};
+use crate::bits::{BINARY_FLAG_WRITABLE, binary_data, writable_gc_visit};
 use crate::hamt::{boxed_object_words, boxed_term_range};
 use crate::{
     ARITY, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, ExternalBinary, FUN,
@@ -127,8 +125,12 @@ impl HeapAlloc for FragmentAlloc<'_> {
     fn supports_writable_binary(&self) -> bool {
         true
     }
-    fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {
-        HeapAlloc::retain_external_binary(self.0, binary)
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        HeapAlloc::link_external_binary(self.0, bin_ref, binary)
     }
     fn supports_external_binary(&self) -> bool {
         true
@@ -228,6 +230,10 @@ fn release_off_heap_node(node: usize) {
         crate::heap::OffHeapKind::Node => {
             // SAFETY: an unforwarded external thing's list entry owns its `Arc<Node>` count.
             drop(unsafe { Arc::from_raw(word as *const Node) })
+        }
+        crate::heap::OffHeapKind::BinRef if crate::bits::bin_ref_val_is_external(word) => {
+            // SAFETY: an unforwarded resource-backed BinRef's list entry owns its count.
+            drop(unsafe { Arc::from_raw(crate::bits::external_val_ptr(word)) })
         }
         crate::heap::OffHeapKind::BinRef => release_binary_ref(node),
     }
@@ -460,31 +466,16 @@ impl Copier<'_> {
         let key = crate::heap::load(ptr.wrapping_add(1)) as usize;
         match header & 63 {
             BIN_REF => {
-                // SAFETY: BinRef word two is either the legacy external tag or an intrusive next.
-                let next_or_flags = unsafe { *ptr.add(2) };
-                if bin_ref_is_legacy_external(next_or_flags) {
-                    let target = if promote {
-                        &mut self.to.owners.old_external
-                    } else {
-                        &mut self.to.owners.external
-                    };
-                    if !target.iter().any(|arc| Arc::as_ptr(arc) as usize == key) {
-                        let owner = self
-                            .from
-                            .owners
-                            .external
-                            .iter()
-                            .chain(&self.from.owners.old_external)
-                            .find(|arc| Arc::as_ptr(arc) as usize == key)
-                            .cloned();
-                        if let Some(owner) = owner {
-                            let vheap_words = (owner.len() / 8) as u64;
-                            target.push(owner);
-                            self.to.add_vheap(promote, vheap_words);
-                        } else {
-                            self.error = Some(TermError::BadArg);
-                        }
+                if crate::bits::bin_ref_val_is_external(key as u64) {
+                    // SAFETY: the source BinRef's list entry owns this `Arc<ExternalBinary>`;
+                    // the forwarded source is skipped by the sweep, so the count moves here.
+                    let binary =
+                        unsafe { Arc::from_raw(crate::bits::external_val_ptr(key as u64)) };
+                    let vheap_words = (binary.len() / 8) as u64;
+                    if self.to.link_external_binary(ptr, binary).is_err() {
+                        self.error = Some(TermError::BadArg);
                     }
+                    self.to.add_vheap(promote, vheap_words);
                 } else {
                     // BinRef.val points directly at the erts Binary header.
                     // SAFETY: the copied BinRef retains the source Binary allocation.
@@ -531,43 +522,26 @@ impl Copier<'_> {
                 self.to.link_node(ptr, node);
             }
             FUN => {
-                let fun = self
-                    .from
-                    .owners
-                    .funs
-                    .iter()
-                    .chain(&self.from.owners.old_funs)
-                    .find(|arc| Arc::as_ptr(arc) as usize == key)
-                    .cloned();
-                if let Some(owner) = fun {
-                    let target = if promote {
-                        &mut self.to.owners.old_funs
+                // The entry word is a counted `Arc` pointer held by the source heap's list, so
+                // the copy takes its own count without searching the source list.
+                if header & (1 << 24) != 0 {
+                    // SAFETY: word one of a live export fun names an `ExportEntry` the
+                    // source heap retains.
+                    let owner =
+                        unsafe { crate::fun::clone_export_entry(key as *const ExportEntry) };
+                    if promote {
+                        self.to.owners.old_exports.push(owner);
                     } else {
-                        &mut self.to.owners.funs
-                    };
-                    if !target.iter().any(|arc| Arc::as_ptr(arc) as usize == key) {
-                        target.push(owner);
+                        self.to.owners.exports.push(owner);
                     }
                 } else {
-                    let target = if promote {
-                        &mut self.to.owners.old_exports
+                    // SAFETY: word one of a live local fun names a `FunEntry` the source
+                    // heap retains.
+                    let owner = unsafe { crate::fun::clone_fun_entry(key as *const FunEntry) };
+                    if promote {
+                        self.to.owners.old_funs.push(owner);
                     } else {
-                        &mut self.to.owners.exports
-                    };
-                    if !target.iter().any(|arc| Arc::as_ptr(arc) as usize == key) {
-                        let owner = self
-                            .from
-                            .owners
-                            .exports
-                            .iter()
-                            .chain(&self.from.owners.old_exports)
-                            .find(|arc| Arc::as_ptr(arc) as usize == key)
-                            .cloned();
-                        if let Some(owner) = owner {
-                            target.push(owner);
-                        } else {
-                            self.error = Some(TermError::BadArg);
-                        }
+                        self.to.owners.funs.push(owner);
                     }
                 }
             }
@@ -641,9 +615,14 @@ impl Copier<'_> {
             let next = crate::heap::load(ptr.wrapping_add(2)) as usize;
             let moved = thing & 3 == 2;
             if moved {
-                // A forwarded magic or external thing handed its counted reference to the
-                // copy linked into the new list; a BinRef copy took its own.
-                if crate::heap::off_heap_node_is_bin_ref(source) {
+                // A forwarded magic or external thing, or resource-backed BinRef, handed its
+                // counted reference to the copy linked into the new list; a refc BinRef copy
+                // took its own.
+                if crate::heap::off_heap_node_is_bin_ref(source)
+                    && !crate::bits::bin_ref_val_is_external(crate::heap::load(
+                        (source as *const u64).wrapping_add(1),
+                    ))
+                {
                     release_binary_ref(source);
                 }
             } else if !self.major && self.old.contains(source) {
@@ -1352,7 +1331,6 @@ impl ProcessHeap {
             }
             next.old_htop = self.old_htop;
             if copy_old_owner_state {
-                next.owners.old_external = std::mem::take(&mut self.owners.old_external);
                 next.owners.old_funs = std::mem::take(&mut self.owners.old_funs);
                 next.owners.old_exports = std::mem::take(&mut self.owners.old_exports);
             }

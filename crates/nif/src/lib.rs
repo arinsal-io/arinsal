@@ -322,13 +322,14 @@ impl HeapAlloc for EnvHeap {
             Self::Bound(h) => Self::bound_ref(*h).supports_writable_binary(),
         }
     }
-    fn retain_external_binary(
+    fn link_external_binary(
         &mut self,
+        bin_ref: *mut u64,
         x: Arc<ExternalBinary>,
     ) -> Result<(), arinsal_term::TermError> {
         match self {
-            Self::Owned(h) => h.retain_external_binary(x),
-            Self::Bound(h) => Self::bound_mut(*h).retain_external_binary(x),
+            Self::Owned(h) => h.link_external_binary(bin_ref, x),
+            Self::Bound(h) => Self::bound_mut(*h).link_external_binary(bin_ref, x),
         }
     }
     fn supports_external_binary(&self) -> bool {

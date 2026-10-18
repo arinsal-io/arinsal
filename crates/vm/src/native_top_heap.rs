@@ -188,8 +188,12 @@ impl HeapAlloc for NativeTopHeap<'_> {
     fn supports_writable_binary(&self) -> bool {
         self.heap.supports_writable_binary()
     }
-    fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {
-        self.slow().retain_external_binary(binary)
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        self.slow().link_external_binary(bin_ref, binary)
     }
     fn supports_external_binary(&self) -> bool {
         self.heap.supports_external_binary()

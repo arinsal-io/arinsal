@@ -329,8 +329,13 @@ pub trait HeapAlloc {
     fn supports_writable_binary(&self) -> bool {
         false
     }
-    /// Retain a resource-backed binary until GC examines its BinRef.
-    fn retain_external_binary(&mut self, _binary: Arc<ExternalBinary>) -> Result<(), TermError> {
+    /// Link a BinRef over a resource-backed binary into this heap's off-heap list. The BinRef's
+    /// `val` word already names `binary`, and the list entry takes over the counted reference.
+    fn link_external_binary(
+        &mut self,
+        _bin_ref: *mut u64,
+        _binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
         Err(TermError::Unsupported("external binary heap owner"))
     }
     /// Whether the heap retains external binary owners across collection.
@@ -417,8 +422,12 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
     fn supports_writable_binary(&self) -> bool {
         (**self).supports_writable_binary()
     }
-    fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {
-        (**self).retain_external_binary(binary)
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        (**self).link_external_binary(bin_ref, binary)
     }
     fn supports_external_binary(&self) -> bool {
         (**self).supports_external_binary()
@@ -497,6 +506,20 @@ pub(crate) fn off_heap_node_kind(node: usize) -> OffHeapKind {
 #[inline]
 pub(crate) fn off_heap_node_is_bin_ref(node: usize) -> bool {
     off_heap_node_kind(node) == OffHeapKind::BinRef
+}
+
+/// Link a BinRef over a resource-backed binary at the head of an off-heap list, which takes
+/// over `binary`'s counted reference. The BinRef's `val` word was tagged by the builder.
+// Port of erts/emulator/beam/erl_nif.c (enif_make_resource_binary: `erts_wrap_refc_bitstring`
+// links the BinRef at `ohp->first`), OTP-29.1.1.
+pub(crate) fn link_external_bin_ref(
+    head: &mut usize,
+    bin_ref: *mut u64,
+    binary: Arc<ExternalBinary>,
+) {
+    std::mem::forget(binary);
+    store(bin_ref.wrapping_add(2), *head as u64);
+    *head = bin_ref as usize;
 }
 
 /// Link an external thing at the head of an off-heap list, which takes over `node`'s counted
@@ -962,10 +985,8 @@ pub(crate) struct HeapOwners {
     pub(crate) off_heap_first: usize,
     pub(crate) wrt_bins: usize,
     pub(crate) overhead: u64,
-    pub(crate) external: Vec<Arc<ExternalBinary>>,
     pub(crate) funs: Vec<Arc<FunEntry>>,
     pub(crate) exports: Vec<Arc<ExportEntry>>,
-    pub(crate) old_external: Vec<Arc<ExternalBinary>>,
     pub(crate) old_funs: Vec<Arc<FunEntry>>,
     pub(crate) old_exports: Vec<Arc<ExportEntry>>,
     /// Heap that receives all allocations while the heap is detached.
@@ -1030,7 +1051,6 @@ impl LazyOwners {
         owners.vheap.min != 46_422
             || owners.vheap.old != 0
             || owners.vheap.old_size != 46_422
-            || !owners.old_external.is_empty()
             || !owners.old_funs.is_empty()
             || !owners.old_exports.is_empty()
     }
@@ -1638,10 +1658,8 @@ impl ProcessHeap {
                 Self::prepend_bin_ref_chain(&mut target.off_heap_first, owners.off_heap_first);
                 Self::prepend_bin_ref_chain(&mut target.wrt_bins, owners.wrt_bins);
                 target.overhead = target.overhead.saturating_add(owners.overhead);
-                target.external.append(&mut owners.external);
                 target.funs.append(&mut owners.funs);
                 target.exports.append(&mut owners.exports);
-                target.old_external.append(&mut owners.old_external);
                 target.old_funs.append(&mut owners.old_funs);
                 target.old_exports.append(&mut owners.old_exports);
             } else {
@@ -1669,8 +1687,6 @@ impl ProcessHeap {
     pub fn off_heap_count(&self) -> usize {
         Self::bin_ref_chain_count(self.owners.off_heap_first)
             + Self::bin_ref_chain_count(self.owners.wrt_bins)
-            + self.owners.external.len()
-            + self.owners.old_external.len()
     }
 
     fn bin_ref_chain_count(mut head: usize) -> usize {
@@ -1688,19 +1704,17 @@ impl ProcessHeap {
         let mut head = self.owners.off_heap_first;
         while head != 0 {
             if off_heap_node_is_bin_ref(head) {
-                let header = load((head as *const u64).wrapping_add(1)) as *const u64;
-                bytes = bytes.saturating_add(load(header.wrapping_add(3)));
+                let val = load((head as *const u64).wrapping_add(1));
+                bytes = bytes.saturating_add(if crate::bits::bin_ref_val_is_external(val) {
+                    // SAFETY: the list entry owns the `Arc<ExternalBinary>` named by `val`.
+                    unsafe { (*crate::bits::external_val_ptr(val)).len() as u64 }
+                } else {
+                    load((val as *const u64).wrapping_add(3))
+                });
             }
             head = load((head as *const u64).wrapping_add(2)) as usize;
         }
-        bytes.saturating_add(
-            self.owners
-                .external
-                .iter()
-                .chain(&self.owners.old_external)
-                .map(|binary| binary.len() as u64)
-                .sum(),
-        )
+        bytes
     }
 
     /// Return one `(identity, byte length, refcount)` per retained refc binary reference.
@@ -1714,22 +1728,26 @@ impl ProcessHeap {
             while head != 0 {
                 let bin_ref = head as *const u64;
                 if off_heap_node_is_bin_ref(head) {
-                    let binary = load(bin_ref.wrapping_add(1)) as *const u64;
-                    out.push((
-                        binary as usize,
-                        load(binary.wrapping_add(3)) as usize,
-                        load(binary.wrapping_add(2)) as usize,
-                    ));
+                    let val = load(bin_ref.wrapping_add(1));
+                    if crate::bits::bin_ref_val_is_external(val) {
+                        let ptr = crate::bits::external_val_ptr(val);
+                        // SAFETY: the list entry owns the `Arc<ExternalBinary>` named by `val`.
+                        let (len, count) = unsafe {
+                            let owner = std::mem::ManuallyDrop::new(Arc::from_raw(ptr));
+                            ((*ptr).len(), Arc::strong_count(&owner))
+                        };
+                        out.push((ptr as usize, len, count));
+                    } else {
+                        let binary = val as *const u64;
+                        out.push((
+                            binary as usize,
+                            load(binary.wrapping_add(3)) as usize,
+                            load(binary.wrapping_add(2)) as usize,
+                        ));
+                    }
                 }
                 head = load(bin_ref.wrapping_add(2)) as usize;
             }
-        }
-        for binary in o.external.iter().chain(&o.old_external) {
-            out.push((
-                Arc::as_ptr(binary) as usize,
-                binary.len(),
-                Arc::strong_count(binary),
-            ));
         }
         out
     }
@@ -1979,13 +1997,17 @@ impl HeapAlloc for ProcessHeap {
     fn supports_writable_binary(&self) -> bool {
         true
     }
-    fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
         if self.detached
             && let Some(heap) = self.owners.detached.as_deref_mut()
         {
-            return heap.retain_external_binary(binary);
+            return heap.link_external_binary(bin_ref, binary);
         }
-        self.owners.external.push(binary);
+        link_external_bin_ref(&mut self.owners.off_heap_first, bin_ref, binary);
         Ok(())
     }
     fn supports_external_binary(&self) -> bool {
@@ -2086,7 +2108,6 @@ pub struct VecHeap {
     off_heap_first: usize,
     wrt_bins: usize,
     overhead: u64,
-    external: Vec<Arc<ExternalBinary>>,
     funs: Vec<Arc<FunEntry>>,
     exports: Vec<Arc<ExportEntry>>,
     used: usize,
@@ -2111,7 +2132,6 @@ impl VecHeap {
             off_heap_first: 0,
             wrt_bins: 0,
             overhead: 0,
-            external: Vec::new(),
             funs: Vec::new(),
             exports: Vec::new(),
             used: 0,
@@ -2133,7 +2153,6 @@ impl VecHeap {
         self.off_heap_first = 0;
         self.wrt_bins = 0;
         self.overhead = 0;
-        self.external.clear();
         self.funs.clear();
         self.exports.clear();
         self.used = 0;
@@ -2258,8 +2277,12 @@ impl HeapAlloc for VecHeap {
     fn supports_writable_binary(&self) -> bool {
         true
     }
-    fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {
-        self.external.push(binary);
+    fn link_external_binary(
+        &mut self,
+        bin_ref: *mut u64,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), TermError> {
+        link_external_bin_ref(&mut self.off_heap_first, bin_ref, binary);
         Ok(())
     }
     fn supports_external_binary(&self) -> bool {
@@ -3577,9 +3600,8 @@ impl Term {
                 unsafe {
                     let bin_ref = original.raw_ptr();
                     let owner = *bin_ref.add(1);
-                    let next = *bin_ref.add(2);
-                    let size = if crate::bits::bin_ref_is_legacy_external(next) {
-                        (&*(owner as *const ExternalBinary)).len()
+                    let size = if crate::bits::bin_ref_val_is_external(owner) {
+                        (&*crate::bits::external_val_ptr(owner)).len()
                     } else {
                         *(owner as *const u64).add(3) as usize
                     };

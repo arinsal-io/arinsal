@@ -9,14 +9,30 @@ use std::sync::atomic::Ordering;
 pub const SUB_BITS_MUTABLE: u64 = 1;
 /// The binary data may have moved, so readers must resolve the BinRef.
 pub const SUB_BITS_VOLATILE: u64 = 2;
+/// Flags marker `clone_binary_owner` returns for a resource-backed binary.
 pub(crate) const EXTERNAL_OWNER: u64 = 0x100;
+/// Tag bit of `BinRef.val` naming an `Arc<ExternalBinary>` instead of a `Binary` header.
+const EXTERNAL_VAL_TAG: u64 = 1;
 const BINARY_HEADER_WORDS: usize = 4;
 pub(crate) const BINARY_FLAG_WRITABLE: u64 = 1 << 2;
 pub(crate) const BINARY_FLAG_ACTIVE_WRITER: u64 = 1 << 3;
 
+/// Whether a BinRef's `val` word names a resource-backed binary.
 #[inline(always)]
-pub(crate) fn bin_ref_is_legacy_external(next: u64) -> bool {
-    next & !7 == EXTERNAL_OWNER
+pub(crate) fn bin_ref_val_is_external(val: u64) -> bool {
+    val & EXTERNAL_VAL_TAG != 0
+}
+
+/// The `val` word of a BinRef over `binary`, tagged as resource-backed.
+#[inline(always)]
+pub(crate) fn external_val_word(binary: &Arc<ExternalBinary>) -> u64 {
+    Arc::as_ptr(binary) as u64 | EXTERNAL_VAL_TAG
+}
+
+/// The `ExternalBinary` a resource-backed BinRef's `val` word names.
+#[inline(always)]
+pub(crate) fn external_val_ptr(val: u64) -> *const ExternalBinary {
+    (val & !EXTERNAL_VAL_TAG) as *const ExternalBinary
 }
 
 /// Return live allocated bytes for erts' `BINARY` allocation type.
@@ -292,6 +308,9 @@ fn owner(term: Term) -> Option<(*const u64, BinaryView<'static>)> {
     // SAFETY: the heap owns a live BinRef and its `val` points to a retained Binary allocation.
     unsafe {
         let p = original.raw_ptr();
+        if bin_ref_val_is_external(*p.add(1)) {
+            return None;
+        }
         let header = *p.add(1) as *const u64;
         if *header & BINARY_FLAG_WRITABLE == 0 {
             return None;
@@ -321,6 +340,9 @@ pub unsafe fn writable_gc_visit(term: Term) {
     // SAFETY: the caller supplies a live BinRef retained by this process.
     unsafe {
         let p = bin_ref.raw_ptr();
+        if bin_ref_val_is_external(*p.add(1)) {
+            return;
+        }
         let header = *p.add(1) as *const u64;
         if *header & BINARY_FLAG_WRITABLE == 0 {
             return;
@@ -366,8 +388,11 @@ pub(crate) fn binary_owner_is_writable(term: Term) -> bool {
     if term.header().is_none_or(|h| h & 63 != BIN_REF) {
         return false;
     }
-    // SAFETY: a live BinRef stores its Binary header in word one.
-    unsafe { *(*term.raw_ptr().add(1) as *const u64) & BINARY_FLAG_WRITABLE != 0 }
+    // SAFETY: a live BinRef stores its Binary header, or a tagged resource owner, in word one.
+    unsafe {
+        let val = *term.raw_ptr().add(1);
+        !bin_ref_val_is_external(val) && *(val as *const u64) & BINARY_FLAG_WRITABLE != 0
+    }
 }
 
 /// Byte offset folded into `SUB_BITS` positions to reserve low pointer bits.
@@ -477,15 +502,13 @@ pub fn external_binary_magic<'a>(term: Term) -> Option<&'a crate::MagicRef> {
     if original.header()? & 63 != BIN_REF {
         return None;
     }
-    // SAFETY: a BinRef with the external flag holds the Arc-owned ExternalBinary in word one.
+    // SAFETY: a BinRef with the external tag holds the Arc-owned ExternalBinary in word one.
     unsafe {
         let p = original.raw_ptr();
-        if *p.add(2) & EXTERNAL_OWNER == 0 {
+        if !bin_ref_val_is_external(*p.add(1)) {
             return None;
         }
-        Some(&*Arc::as_ptr(
-            &(*(*p.add(1) as *const ExternalBinary))._owner,
-        ))
+        Some(&*Arc::as_ptr(&(*external_val_ptr(*p.add(1)))._owner))
     }
 }
 
@@ -497,8 +520,8 @@ pub fn external_binary_magic<'a>(term: Term) -> Option<&'a crate::MagicRef> {
 pub(crate) unsafe fn binary_data(bin_ref: *const u64) -> *const u8 {
     // SAFETY: caller guarantees a live BinRef and retained owner.
     unsafe {
-        if bin_ref_is_legacy_external(*bin_ref.add(2)) {
-            (&*(*bin_ref.add(1) as *const ExternalBinary)).data
+        if bin_ref_val_is_external(*bin_ref.add(1)) {
+            (&*external_val_ptr(*bin_ref.add(1))).data
         } else {
             (*bin_ref.add(1) as *const u64)
                 .wrapping_add(BINARY_HEADER_WORDS)
@@ -518,11 +541,10 @@ pub(crate) unsafe fn clone_binary_owner(
     unsafe {
         let p = bin_ref.raw_ptr();
         let val = *p.add(1);
-        if bin_ref_is_legacy_external(*p.add(2)) {
-            let flags = *p.add(2);
-            let ptr = val;
-            Arc::increment_strong_count(ptr as *const ExternalBinary);
-            return Ok((ptr, flags, 0, None));
+        if bin_ref_val_is_external(val) {
+            let ptr = external_val_ptr(val);
+            Arc::increment_strong_count(ptr);
+            return Ok((ptr as u64, EXTERNAL_OWNER, 0, None));
         }
         let header = val as *const u64;
         let capacity = *header.add(3) as usize;
@@ -553,8 +575,10 @@ pub(crate) unsafe fn retain_cloned_binary_owner<H: HeapAlloc + ?Sized>(
 ) -> Result<(), TermError> {
     // SAFETY: external owner pointer was incremented by clone_binary_owner.
     unsafe {
-        if bin_ref_is_legacy_external(flags) {
-            heap.retain_external_binary(Arc::from_raw(ptr as *const ExternalBinary))
+        if flags == EXTERNAL_OWNER {
+            let binary = Arc::from_raw(ptr as *const ExternalBinary);
+            *bin_ref.add(1) = external_val_word(&binary);
+            heap.link_external_binary(bin_ref, binary)
         } else {
             *bin_ref.add(1) = ptr;
             let writable = flags & BINARY_FLAG_WRITABLE != 0;
@@ -820,15 +844,15 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
         unsafe {
             let sub = p.add(3);
             *p = (2 << 6) | BIN_REF;
-            *p.add(1) = Arc::as_ptr(&owner) as u64;
-            *p.add(2) = EXTERNAL_OWNER | (adjustment as u64) << 1;
+            *p.add(1) = external_val_word(&owner);
+            *p.add(2) = 0;
             *sub = (4 << 6) | SUB_BITS;
             *sub.add(1) = owner.data as u64 & !3;
             *sub.add(2) = (adjustment * 8) as u64;
             *sub.add(3) = end as u64;
             *sub.add(4) = Term::from_ptr(p, 2).0;
         }
-        self.heap.retain_external_binary(owner)?;
+        self.heap.link_external_binary(p, owner)?;
         // SAFETY: the BinRef occupies the first three words of this allocation.
         Ok(Term::from_ptr(unsafe { p.add(3) }, 2))
     }
