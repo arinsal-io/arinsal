@@ -982,9 +982,6 @@ impl ProcessHeap {
                 StackWord::Term(_) | StackWord::ReturnAddr(_) => word,
             };
         }
-        if self.frame_pointer != 0 {
-            self.frame_pointer = rebase_address(self.frame_pointer, stack_move);
-        }
         // erl_gc.c:563-566: the hole above htop is one heap filler (erts_write_heap_filler), not
         // a clear of every word. A scan of the abandoned heap steps over it in O(1).
         let used = self.htop;
@@ -1336,7 +1333,6 @@ impl ProcessHeap {
         }
         let mut next = ProcessHeap::with_words_at(capacity, self.alloc_ix);
         next.stop = capacity - stack;
-        next.frame_pointer = self.frame_pointer;
         next.min_heap_size = self.min_heap_size;
         next.bin_vheap_size = self.bin_vheap_size;
         next.fullsweep_after = self.fullsweep_after;
@@ -1374,7 +1370,6 @@ impl ProcessHeap {
             }
         }
         let mut from = std::mem::replace(self, next);
-        let old_frame_pointer = from.frame_pointer;
         let stack_move = MoveRange {
             old_start: from.words.as_ptr() as usize + from.stop * 8,
             old_end: from.words.as_ptr() as usize + from.words.len() * 8,
@@ -1462,11 +1457,6 @@ impl ProcessHeap {
                 };
             }
         }
-        let new_frame_pointer = if old_frame_pointer == 0 {
-            0
-        } else {
-            rebase_address(old_frame_pointer, stack_move)
-        };
         // Port of erts/emulator/beam/erl_gc.c:1728-1823 (do_minor), OTP-29.1.1: sweep the
         // new heap, then the tenured objects, whose young referents are tenured as well.
         copier.sweep::<false>(n_heap);
@@ -1487,7 +1477,6 @@ impl ProcessHeap {
             self.fragments = spare;
         }
         from.release_all();
-        self.frame_pointer = new_frame_pointer;
         if let Some(error) = error {
             return Err(error);
         }
@@ -1515,7 +1504,7 @@ impl ProcessHeap {
             let code_ranges = code_ranges
                 .as_deref()
                 .map_or(&[][..], |ranges| ranges.as_slice());
-            self.verify_frame_chain(code_ranges);
+            self.verify_stack_words(code_ranges);
         }
         // Verify all roots after collection so stale pointers fail where they enter.
         #[cfg(debug_assertions)]
@@ -1759,9 +1748,6 @@ impl ProcessHeap {
             old_end: prev_stack_end,
             new_start: new_stack,
         };
-        if self.frame_pointer != 0 {
-            self.frame_pointer = rebase_address(self.frame_pointer, stack_move);
-        }
         if new_heap != prev_heap {
             offset_young_objects(
                 self.words.as_ptr().cast::<u64>().cast_mut(),
@@ -1794,12 +1780,12 @@ impl ProcessHeap {
             let code_ranges = code_ranges
                 .as_deref()
                 .map_or(&[][..], |ranges| ranges.as_slice());
-            self.verify_frame_chain(code_ranges);
+            self.verify_stack_words(code_ranges);
         }
     }
 
     #[cfg(debug_assertions)]
-    fn verify_frame_chain(&self, code_ranges: &[(usize, usize)]) {
+    fn verify_stack_words(&self, code_ranges: &[(usize, usize)]) {
         let base = self.words.as_ptr() as usize;
         let stack_start = base + self.stop * 8;
         let stack_end = base + self.words.len() * 8;
@@ -1808,65 +1794,23 @@ impl ProcessHeap {
             old_end: stack_end,
             new_start: stack_start,
         };
-        let mut frame_pointer = self.frame_pointer;
-        if frame_pointer == 0 {
-            for index in 0..self.stack_words() {
-                let word = self
-                    .stack_get(index)
-                    .expect("live stack word is present")
-                    .tagged_word();
-                match classify_stack_word(word, stack_range, code_ranges) {
-                    StackWord::Term(_) => {}
-                    StackWord::ReturnAddr(address) => assert!(
-                        code_ranges
-                            .iter()
-                            .any(|&(start, end)| address >= start && address < end)
-                    ),
-                    StackWord::FramePtr(address) => {
-                        panic!("frame pointer {address:#x} exists without an active frame chain")
-                    }
+        for index in 0..self.stack_words() {
+            let word = self
+                .stack_get(index)
+                .expect("live stack word is present")
+                .tagged_word();
+            match classify_stack_word(word, stack_range, code_ranges) {
+                StackWord::Term(_) => {}
+                StackWord::ReturnAddr(address) => assert!(
+                    code_ranges
+                        .iter()
+                        .any(|&(start, end)| address >= start && address < end)
+                ),
+                StackWord::FramePtr(address) => {
+                    panic!("frame pointer {address:#x} found on the live stack")
                 }
             }
-            return;
         }
-        let max_frames = self.stack_words() / crate::FrameLayout::WORDS;
-        for _ in 0..max_frames {
-            assert!(frame_pointer >= stack_start && frame_pointer < stack_end);
-            assert_eq!((frame_pointer - stack_start) % 8, 0);
-            let fp_index = (frame_pointer - stack_start) / 8;
-            let previous_word = self
-                .stack_get(fp_index + crate::FrameLayout::FRAME_POINTER_WORD)
-                .expect("frame pointer word is present")
-                .tagged_word();
-            let previous = match classify_stack_word(previous_word, stack_range, code_ranges) {
-                StackWord::FramePtr(address) => address,
-                StackWord::Term(term) if term.tagged_word() == 0 => 0,
-                _ => panic!("invalid frame pointer word {previous_word:#x}"),
-            };
-            let return_word = self
-                .stack_get(fp_index + crate::FrameLayout::RETURN_ADDRESS_WORD)
-                .expect("return address word is present")
-                .tagged_word();
-            let StackWord::ReturnAddr(return_address) =
-                classify_stack_word(return_word, stack_range, code_ranges)
-            else {
-                panic!("invalid return address word {return_word:#x}");
-            };
-            assert!(
-                code_ranges
-                    .iter()
-                    .any(|&(start, end)| return_address >= start && return_address < end)
-            );
-            if previous == 0 {
-                return;
-            }
-            assert!(
-                previous >= frame_pointer && previous < stack_end,
-                "invalid previous FP {previous:#x} from {frame_pointer:#x} (stack {stack_start:#x}..{stack_end:#x})"
-            );
-            frame_pointer = previous;
-        }
-        panic!("native frame chain exceeds the live stack");
     }
 }
 
@@ -2203,42 +2147,6 @@ mod tests {
         heap.request_full_sweep();
         assert!(heap.collection_is_major());
         assert!(!heap.minor_falls_back_to_major());
-    }
-
-    #[test]
-    fn collection_relocates_frame_pointers_in_the_stack() {
-        let mut heap = ProcessHeap::with_words(8_192);
-        assert!(heap.alloc(4_000).is_some());
-        assert!(heap.reserve_stack(8));
-        heap.set_fullsweep_after(0);
-        let old_stack_start = heap.heap_cursor().1;
-        let code_pointer = 0x7000_0000_0000_usize;
-        if !crate::is_native_code_pointer(code_pointer) {
-            crate::register_native_code_range(code_pointer, code_pointer + 16).unwrap();
-        }
-        assert!(heap.stack_set(0, Term(old_stack_start.wrapping_add(2) as usize as u64)));
-        assert!(heap.stack_set(1, Term(code_pointer as u64)));
-        assert!(heap.stack_set(2, Term(0)));
-        assert!(heap.stack_set(3, Term(code_pointer as u64)));
-        // Like erts, the heap block is not cleared: every live stack slot is written.
-        for slot in 4..8 {
-            assert!(heap.stack_set(slot, Term::NIL));
-        }
-        heap.set_frame_pointer(old_stack_start as usize);
-
-        heap.collect(&mut [], &mut [], 0).unwrap();
-
-        let new_stack_start = heap.heap_cursor().1 as usize;
-        assert_ne!(new_stack_start, old_stack_start as usize);
-        assert_eq!(heap.frame_pointer(), new_stack_start);
-        assert_eq!(
-            heap.stack_get(0).unwrap().tagged_word(),
-            new_stack_start as u64 + 16
-        );
-        assert_eq!(
-            heap.stack_get(1).unwrap().tagged_word(),
-            code_pointer as u64
-        );
     }
 }
 

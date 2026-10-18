@@ -235,8 +235,6 @@ core::arch::global_asm!(
     "ldp x25, x26, [x19, #0]",
     "ldp x27, x28, [x19, #16]",
     "ldp x15, x16, [x19, #32]",
-    // Resume the Erlang FP_RA chain; zero in a fresh register area is its terminator.
-    "ldr x29, [x19, #16400]",
     "add x14, x19, #8192",
     "ldp d8, d9, [x14, #0]",
     "ldp d10, d11, [x14, #16]",
@@ -278,7 +276,6 @@ core::arch::global_asm!(
     "mov x0, x9",
     "2:",
     // Spill native process state and all six register-backed X registers.
-    "str x29, [x19, #16400]",
     "str x23, [x21, #0]",
     "str x20, [x21, #8]",
     "str w22, [x21, #32]",
