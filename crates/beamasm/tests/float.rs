@@ -70,6 +70,7 @@ fn execute(
 
 #[cfg(target_arch = "aarch64")]
 fn finish(asm: &mut BeamModuleAssembler) {
+    asm.emit_leave_frame().unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
@@ -86,6 +87,7 @@ fn native_fadd_boxed() {
     let rhs = boxed_float(&mut right, 2.5);
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     emit_fload(&mut asm, ArgVal::X(0), 0).unwrap();
     emit_fload(&mut asm, ArgVal::X(1), 1).unwrap();
     asm.emit_i_fadd(0, 1, 2).unwrap();
@@ -103,6 +105,7 @@ fn native_fadd_boxed() {
 fn native_fconv_small() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     emit_fconv(&mut asm, ArgVal::X(0), 0, big_to_float).unwrap();
     emit_fstore(&mut asm, 0, ArgVal::X(1)).unwrap();
     finish(&mut asm);
@@ -120,6 +123,7 @@ fn native_fconv_bignum() {
     let term = big.as_mut_ptr() as u64 + 2;
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     emit_fconv(&mut asm, ArgVal::X(0), 0, big_to_float).unwrap();
     emit_fstore(&mut asm, 0, ArgVal::X(1)).unwrap();
     finish(&mut asm);
@@ -134,6 +138,7 @@ fn native_fconv_bignum() {
 fn native_fconv_bad_number() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     emit_fconv(&mut asm, ArgVal::X(0), 0, big_to_float).unwrap();
     finish(&mut asm);
     let (header, _, _, _) = execute(asm, [11, 0], [0.0; 8]);
@@ -145,6 +150,7 @@ fn native_fconv_bad_number() {
 fn native_fdiv_zero_badarith() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_i_fdiv(0, 1, 2).unwrap();
     finish(&mut asm);
     let (header, _, _, _) = execute(asm, [0, 0], [3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
@@ -156,6 +162,7 @@ fn native_fdiv_zero_badarith() {
 fn native_fmul_overflow_badarith() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_i_fmul(0, 1, 2).unwrap();
     finish(&mut asm);
     let (header, _, _, _) = execute(asm, [0, 0], [f64::MAX, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
@@ -167,6 +174,7 @@ fn native_fmul_overflow_badarith() {
 fn native_fnegate() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
     asm.emit_i_fnegate(0, 1).unwrap();
     emit_fstore(&mut asm, 1, ArgVal::X(1)).unwrap();
     finish(&mut asm);
