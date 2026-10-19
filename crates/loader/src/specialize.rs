@@ -43,6 +43,8 @@ pub enum Instr {
     ExportBreakpoint { index: u32 },
     /// Traced function return continuation.
     ReturnTrace,
+    /// Call-time or call-memory accounting return continuation.
+    ReturnCallAccTrace,
     /// `return_to` continuation installed by a traced process flag.
     ReturnToTrace,
     /// Drop a Y frame and immediately return.

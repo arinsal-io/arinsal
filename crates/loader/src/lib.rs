@@ -399,6 +399,8 @@ pub struct Module {
     pub breakpoint_originals: HashMap<usize, Instr>,
     /// Instruction indices used by stack continuations for tracing.
     pub return_trace_ip: usize,
+    /// Call-time and call-memory return continuation.
+    pub return_call_acc_trace_ip: usize,
     pub return_to_trace_ip: usize,
     /// First per-export global breakpoint trampoline.
     pub export_breakpoint_base: usize,
@@ -454,6 +456,7 @@ impl Clone for Module {
             entry_arity: self.entry_arity.clone(),
             breakpoint_originals: self.breakpoint_originals.clone(),
             return_trace_ip: self.return_trace_ip,
+            return_call_acc_trace_ip: self.return_call_acc_trace_ip,
             return_to_trace_ip: self.return_to_trace_ip,
             export_breakpoint_base: self.export_breakpoint_base,
             export_entry_targets: self.export_entry_targets.clone(),
@@ -670,6 +673,7 @@ impl Module {
         self.entry_arity = Box::new([]);
         self.breakpoint_originals = HashMap::new();
         self.return_trace_ip = 0;
+        self.return_call_acc_trace_ip = 0;
         self.return_to_trace_ip = 0;
         self.export_breakpoint_base = 0;
         self.export_entry_targets = Box::new([]);
@@ -1604,6 +1608,8 @@ pub fn load_with_instrumentations(
     code.push(Instr::CodeEnd);
     let return_trace_ip = code.len();
     code.push(Instr::ReturnTrace);
+    let return_call_acc_trace_ip = code.len();
+    code.push(Instr::ReturnCallAccTrace);
     let return_to_trace_ip = code.len();
     code.push(Instr::ReturnToTrace);
     let breakpoint_originals = HashMap::new();
@@ -1848,6 +1854,7 @@ pub fn load_with_instrumentations(
         entry_arity,
         breakpoint_originals,
         return_trace_ip,
+        return_call_acc_trace_ip,
         return_to_trace_ip,
         export_breakpoint_base,
         export_entry_targets: export_entry_targets.into_boxed_slice(),

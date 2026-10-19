@@ -2508,6 +2508,9 @@ fn special_frames(
         if ip == module.return_trace_ip {
             frames.push(SpecialFrame::Trace);
             index += 6;
+        } else if ip == module.return_call_acc_trace_ip {
+            frames.push(SpecialFrame::Trace);
+            index += 4;
         } else if ip == module.return_to_trace_ip {
             let session = process.heap.stack_get(index + 1).and_then(Term::as_small);
             frames.push(SpecialFrame::ReturnTo(session.unwrap_or(-1) as u64));
@@ -2779,6 +2782,10 @@ fn caller_info(
             }
             if ip == module.return_trace_ip {
                 index += 6;
+                continue;
+            }
+            if ip == module.return_call_acc_trace_ip {
+                index += 4;
                 continue;
             }
             if ip == module.return_to_trace_ip {
@@ -3448,6 +3455,10 @@ fn return_to_target(vm: &Vm, process: &Process, start: usize) -> Option<(String,
         };
         if ip == module.return_trace_ip {
             index += 6;
+            continue;
+        }
+        if ip == module.return_call_acc_trace_ip {
+            index += 4;
             continue;
         }
         if ip == module.return_to_trace_ip {

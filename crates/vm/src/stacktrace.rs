@@ -20,7 +20,8 @@ const MAX_CONTINUATION_MODULE: u64 = 1 << 21;
 /// frame without a function lookup: their instruction pointers lie past the module's functions.
 const RETURN_TRACE_FLAG: u64 = 1 << 22;
 const RETURN_TO_TRACE_FLAG: u64 = 1 << 21;
-const TRACE_FLAGS: u64 = RETURN_TRACE_FLAG | RETURN_TO_TRACE_FLAG;
+const RETURN_CALL_ACC_TRACE_FLAG: u64 = 1 << 23;
+const TRACE_FLAGS: u64 = RETURN_TRACE_FLAG | RETURN_TO_TRACE_FLAG | RETURN_CALL_ACC_TRACE_FLAG;
 
 /// A catch handler: the code scope of its runtime, its module index and its code index.
 type CatchKey = (u64, usize, usize);
@@ -538,9 +539,17 @@ pub(super) fn capture(
         };
         if let Some(code) = modules.get(module)
             && !handler
-            && (ip == code.return_trace_ip || ip == code.return_to_trace_ip)
+            && (ip == code.return_trace_ip
+                || ip == code.return_call_acc_trace_ip
+                || ip == code.return_to_trace_ip)
         {
-            index += if ip == code.return_trace_ip { 6 } else { 2 };
+            index += if ip == code.return_trace_ip {
+                6
+            } else if ip == code.return_call_acc_trace_ip {
+                4
+            } else {
+                2
+            };
             continue;
         }
         let call_site = ip.saturating_sub(1);
@@ -1137,6 +1146,10 @@ fn gather_continuations_in(
         if let Some((module, ip)) = p.heap.stack_get(index - 1).and_then(continuation_word) {
             // Port of erts/emulator/beam/beam_common.c:803-815 (gather_stacktrace), OTP-29.1.1:
             // trace stack frames are skipped.
+            if module as u64 & RETURN_CALL_ACC_TRACE_FLAG != 0 {
+                index += 3;
+                continue;
+            }
             if module as u64 & RETURN_TRACE_FLAG != 0 {
                 index += 5;
                 continue;
@@ -1488,6 +1501,12 @@ pub(crate) fn continuation_tag(module: usize, ip: usize) -> Result<Term, VmError
 /// The continuation of an interpreter `return_trace` frame (six words).
 pub(crate) fn return_trace_tag(module: usize, ip: usize) -> Result<Term, VmError> {
     continuation_tag_flagged(module, ip, RETURN_TRACE_FLAG)
+}
+
+/// The continuation of an interpreter call-time or call-memory frame (four words).
+// Port of erts/emulator/beam/beam_bp.c:1127-1145 (do_session_breakpoint), OTP-29.1.1.
+pub(crate) fn return_call_acc_trace_tag(module: usize, ip: usize) -> Result<Term, VmError> {
+    continuation_tag_flagged(module, ip, RETURN_CALL_ACC_TRACE_FLAG)
 }
 
 /// The continuation of an interpreter `return_to` frame (two words).
