@@ -46,6 +46,57 @@ fn sockaddr(addr: *const libc::sockaddr) -> Option<O> {
                 a.sin6_scope_id,
             ))))
         }
+        #[cfg(target_os = "linux")]
+        libc::AF_PACKET => {
+            // Port of erts/emulator/nifs/common/socket_util.c (esock_encode_sockaddr_ll and
+            // the esock_encode_packet_* helpers), OTP-29.1.1.
+            // SAFETY: AF_PACKET identifies a sockaddr_ll from getifaddrs.
+            let a = unsafe { &*(addr as *const libc::sockaddr_ll) };
+            let hatype = match a.sll_hatype {
+                libc::ARPHRD_NETROM => atom("netrom"),
+                libc::ARPHRD_ETHER => atom("ether"),
+                libc::ARPHRD_EETHER => atom("eether"),
+                libc::ARPHRD_AX25 => atom("ax25"),
+                libc::ARPHRD_PRONET => atom("pronet"),
+                libc::ARPHRD_CHAOS => atom("chaos"),
+                libc::ARPHRD_IEEE802 => atom("ieee802"),
+                libc::ARPHRD_ARCNET => atom("arcnet"),
+                libc::ARPHRD_APPLETLK => atom("appletlk"),
+                libc::ARPHRD_DLCI => atom("dlci"),
+                libc::ARPHRD_ATM => atom("atm"),
+                libc::ARPHRD_METRICOM => atom("metricom"),
+                libc::ARPHRD_IEEE1394 => atom("ieee1394"),
+                libc::ARPHRD_EUI64 => atom("eui64"),
+                libc::ARPHRD_INFINIBAND => atom("infiniband"),
+                libc::ARPHRD_TUNNEL => atom("tunnel"),
+                libc::ARPHRD_TUNNEL6 => atom("tunnel6"),
+                libc::ARPHRD_LOOPBACK => atom("loopback"),
+                libc::ARPHRD_LOCALTLK => atom("localtlk"),
+                libc::ARPHRD_NONE => atom("none"),
+                libc::ARPHRD_VOID => atom("void"),
+                n => O::Int(n.into()),
+            };
+            let pkttype = match a.sll_pkttype {
+                0 => atom("host"),
+                1 => atom("broadcast"),
+                2 => atom("multicast"),
+                3 => atom("otherhost"),
+                4 => atom("outgoing"),
+                5 => atom("loopback"),
+                6 => atom("user"),
+                7 => atom("kernel"),
+                n => O::Int(n.into()),
+            };
+            let halen = usize::from(a.sll_halen).min(a.sll_addr.len());
+            Some(map(&[
+                ("family", atom("packet")),
+                ("protocol", O::Int(u16::from_be(a.sll_protocol).into())),
+                ("ifindex", O::Int(a.sll_ifindex.into())),
+                ("hatype", hatype),
+                ("pkttype", pkttype),
+                ("addr", O::Binary(a.sll_addr[..halen].to_vec())),
+            ]))
+        }
         #[cfg(target_os = "macos")]
         libc::AF_LINK => {
             // Port of erts/emulator/nifs/common/socket_util.c:1599 (esock_encode_sockaddr_dl), OTP-29.1.1.
