@@ -457,7 +457,9 @@ struct CarrierSpan {
     end: usize,
     node_limit: usize,
     index: usize,
-    sbc: bool,
+    /// A word, not a `bool`: padding bytes after a flag are copied with overlapping partial
+    /// stores whose reload stalls store forwarding on every `Option<(usize, CarrierSpan)>` move.
+    sbc: usize,
 }
 
 impl CarrierSpan {
@@ -477,8 +479,14 @@ impl CarrierSpan {
             end,
             node_limit: Self::node_limit(start, end),
             index,
-            sbc,
+            sbc: sbc as usize,
         }
+    }
+
+    /// Whether the carrier is a single-block carrier.
+    #[inline(always)]
+    const fn is_sbc(&self) -> bool {
+        self.sbc != 0
     }
 
     /// The carrier's words. A span exists only while its carrier is indexed, and a carrier
@@ -1036,7 +1044,7 @@ impl AllocUtil {
         self.stats.free_calls += 1;
         let key = allocation.id as usize;
         let span = self.span_of(key).ok_or(AllocError::InvalidAllocation)?;
-        if span.sbc {
+        if span.is_sbc() {
             return self.free_sbc(span, key);
         }
         if key < span.start + self.mbc_header_size() || !span.holds(key) {
@@ -1279,7 +1287,7 @@ impl AllocUtil {
         let index = span.index;
         let header = span.read(key, 0).ok_or(AllocError::Corrupt)?;
         let size = header & !BLOCK_FLAGS;
-        if span.sbc {
+        if span.is_sbc() {
             return Ok(Block {
                 carrier: index,
                 offset: key,
@@ -2675,7 +2683,7 @@ impl AllocUtil {
         }
         // A span starts at its carrier's key_base.
         let span = self.span_of(node)?;
-        (!span.sbc && node == span.start + MBC_HEADER).then_some(span.index)
+        (!span.is_sbc() && node == span.start + MBC_HEADER).then_some(span.index)
     }
 
     #[inline(always)]
@@ -2913,7 +2921,7 @@ impl AllocUtil {
     /// so no walk to the root follows.
     #[inline(never)]
     fn insert_tree_node<const A: bool>(&mut self, node: usize, size: usize, span: CarrierSpan) {
-        let block_node = !(A && !span.sbc && node == span.start + MBC_HEADER);
+        let block_node = !(A && !span.is_sbc() && node == span.start + MBC_HEADER);
         let tree = if block_node {
             self.tree_span.set(span);
             TreeId::Blocks
