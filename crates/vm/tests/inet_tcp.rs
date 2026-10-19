@@ -433,7 +433,7 @@ sendfile_active_true() -> sf_active(true, [{active, true}]).
 sendfile_active_once() -> sf_active(once, [{active, once}]).
 
 slow_reader_pair(Size) ->
-    {ok, L} = gen_tcp:listen(0, tcp([binary, {active, false}])),
+    {ok, L} = gen_tcp:listen(0, tcp([{ip, {127,0,0,1}}, binary, {active, false}])),
     {ok, Port} = inet:port(L),
     Parent = self(),
     Reader = spawn(fun() ->
@@ -444,7 +444,9 @@ slow_reader_pair(Size) ->
         Parent ! {reader, Got, Eof, erlang:monotonic_time(millisecond)},
         gen_tcp:close(S)
     end),
-    Opts = tcp([binary, {active, false}, {high_watermark, 16 * 1024 * 1024},
+    %% Keep the driver queue observable regardless of the host's default TCP send buffer.
+    Opts = tcp([binary, {active, false}, {sndbuf, 4096},
+                {high_watermark, 16 * 1024 * 1024},
                 {low_watermark, 8 * 1024 * 1024}]),
     {ok, C} = gen_tcp:connect({127,0,0,1}, Port, Opts, 2000),
     {L, C, Reader}.
@@ -519,7 +521,7 @@ fn run_cases(cases: &[&str]) {
         let actual = vm
             .eval_scheduled("inet_tcp_diff", "run", &[arg], 2, None)
             .unwrap_or_else(|error| panic!("{case}: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "{case}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{case}");
     }
 }
 
@@ -581,7 +583,7 @@ fn gen_tcp_matches_erts() {
         let actual = vm
             .eval_scheduled("inet_tcp_diff", "run", &[arg], 2, None)
             .unwrap_or_else(|error| panic!("{case}: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "{case}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{case}");
     }
     // sctp_inet is not a driver on macOS. prim_inet maps the open_port
     // badarg onto {error, eprotonosupport}, the same term erts returns.
@@ -591,7 +593,7 @@ fn gen_tcp_matches_erts() {
     let actual = vm
         .eval_scheduled("inet_tcp_diff", "run", &[arg], 2, None)
         .unwrap_or_else(|error| panic!("sctp: {error}"));
-    assert_eq!(
+    similar_asserts::assert_eq!(
         actual.term,
         OwnedTerm::Tuple(vec![
             OwnedTerm::Atom("error".into()),
