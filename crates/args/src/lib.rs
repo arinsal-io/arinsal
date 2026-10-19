@@ -731,7 +731,8 @@ pub fn parse<S: AsRef<str>>(argv: &[S], env: &impl Env) -> Result<Launch, ArgsEr
     let root_override = env.get("ERL_ROOTDIR").filter(|root| !root.is_empty());
     let root_dir = root_override
         .clone()
-        .or_else(|| env.get("ROOTDIR"))
+        .or_else(|| env.get("ROOTDIR").filter(|root| !root.is_empty()))
+        .or_else(|| bundled_otp_root().map(|root| root.to_string_lossy().into_owned()))
         .or_else(|| env.get("ARINSAL_OTP_ROOT"))
         .or_else(|| infer_root(argv.first().copied().unwrap_or("")))
         .or_else(|| discover_otp_root(env))
@@ -918,6 +919,24 @@ pub fn parse<S: AsRef<str>>(argv: &[S], env: &impl Env) -> Result<Launch, ArgsEr
         set_env,
         boot_args,
     })
+}
+
+/// Find the OTP tree bundled beside the running `arinsal` executable.
+pub fn bundled_otp_root() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    bundled_otp_root_for_executable(&executable)
+}
+
+/// Resolve the bundle location for an executable at `<prefix>/bin/arinsal`.
+pub fn bundled_otp_root_for_executable(executable: &Path) -> Option<PathBuf> {
+    let bin = executable.parent()?;
+    if bin.file_name()?.to_str()? != "bin" {
+        return None;
+    }
+    let prefix = bin.parent()?;
+    let root = prefix.join("lib/arinsal/otp");
+    (root.join("lib/erts-17.1/ebin").is_dir() && root.join("lib/kernel-11.0.4/ebin").is_dir())
+        .then_some(root)
 }
 
 /// Discover the OTP root through an `erl` executable other than this process.

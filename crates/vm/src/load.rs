@@ -715,9 +715,20 @@ impl Vm {
     pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
         // Fixes the execution mode, which erlang:system_info(emu_flavor) reports.
         crate::beamasm_integration::enabled();
-        let otp = std::env::var_os("ARINSAL_OTP_ROOT")
+        let otp = std::env::var_os("ERL_ROOTDIR")
+            .filter(|root| !root.is_empty())
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("ERL_ROOTDIR").map(PathBuf::from))
+            .or_else(|| {
+                std::env::var_os("ROOTDIR")
+                    .filter(|root| !root.is_empty())
+                    .map(PathBuf::from)
+            })
+            .or_else(arinsal_args::bundled_otp_root)
+            .or_else(|| {
+                std::env::var_os("ARINSAL_OTP_ROOT")
+                    .filter(|root| !root.is_empty())
+                    .map(PathBuf::from)
+            })
             .or_else(|| {
                 // Discovery runs the `erl` launcher (~100 ms); every VM of a process shares it.
                 static DISCOVERED: std::sync::OnceLock<Option<PathBuf>> =
