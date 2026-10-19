@@ -4951,6 +4951,29 @@ fn pull_accept(sock: &Arc<Sock>) {
 
 fn on_eof(sock: &Arc<Sock>) {
     // Port of inet_drv.c:12783 (tcp_recv_closed) and :12849 (tcp_recv_error), OTP-29.1.1.
+    // A sender blocked on the queue is released first: the queue is dropped, the port is no
+    // longer busy and the sender gets `{error, closed}` (tcp_clear_output).
+    let (blocked, reason) = {
+        let mut inner = sock.inner.lock().unwrap();
+        if inner.peer_closed || !inner.busy {
+            (Vec::new(), "closed")
+        } else {
+            inner.sendq.clear();
+            inner.busy = false;
+            let waits = std::mem::take(&mut inner.send_waits);
+            (waits, close_atom(&inner))
+        }
+    };
+    for wait in blocked {
+        emit(
+            sock,
+            Out::InetReply {
+                caller: wait.caller,
+                ids: wait.ids,
+                error: Some(reason),
+            },
+        );
+    }
     let (active, exit_on_close, owner, reason) = {
         let mut inner = sock.inner.lock().unwrap();
         if inner.peer_closed {
