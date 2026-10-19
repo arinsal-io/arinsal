@@ -1881,7 +1881,10 @@ impl Relations {
             monitors: cold
                 .monitors
                 .iter()
-                .map(|(&id, half)| {
+                .filter_map(|(&id, entry)| {
+                    let crate::proc_create::OriginMonitor::Process(half) = entry else {
+                        return None;
+                    };
                     // The name wins over the tag, as make_monitor_list shows a registered name.
                     let extra = half
                         .data
@@ -1889,7 +1892,7 @@ impl Relations {
                         .clone()
                         .map(OwnedTerm::Atom)
                         .or_else(|| half.data.tag.clone());
-                    (id, half.target, extra)
+                    Some((id, half.target, extra))
                 })
                 .collect(),
             monitored_by: cold

@@ -5,6 +5,7 @@ use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, global_atoms};
 use arinsal_vm::Vm;
+use similar_asserts::assert_eq;
 
 const MODULE: &str = "alias_light_differential";
 const CASES: &[&str] = &[
@@ -20,6 +21,22 @@ const CASES: &[&str] = &[
     "monitor_alias_tag",
     "monitor_alias_noproc",
     "monitor_bad_alias_mode",
+    "alias_default_lifecycle",
+    "alias_explicit_lifecycle",
+    "alias_reply_lifecycle",
+    "alias_reply_then_explicit",
+    "alias_explicit_then_reply",
+    "monitor_demonitor_explicit",
+    "monitor_demonitor_demonitor",
+    "monitor_demonitor_reply_demonitor",
+    "monitor_down_explicit",
+    "monitor_down_demonitor",
+    "monitor_down_reply_demonitor",
+    "monitor_reply_demonitor_once",
+    "monitor_alias_last_mode",
+    "spawn_opt_alias_explicit",
+    "spawn_opt_alias_demonitor",
+    "spawn_opt_alias_reply_demonitor",
     "iolist_size_small",
     "iolist_size_nested",
     "iolist_size_long",
@@ -32,6 +49,50 @@ const SOURCE: &str = r#"-module(alias_light_differential).
 -export([run/1]).
 
 recv(Msg) -> receive Msg -> got after 100 -> missed end.
+
+send_status(Alias, Msg) ->
+    Alias ! Msg,
+    receive Msg -> delivered after 0 -> dropped end.
+
+alias_lifecycle(Alias) ->
+    First = send_status(Alias, alias_first),
+    U1 = unalias(Alias),
+    Second = send_status(Alias, alias_second),
+    {First, U1, Second, unalias(Alias)}.
+
+monitor_demonitor(Mode) ->
+    P = spawn(fun() -> receive stop -> ok end end),
+    M = erlang:monitor(process, P, [{alias, Mode}]),
+    D = erlang:demonitor(M),
+    First = send_status(M, after_demonitor),
+    U = erlang:unalias(M),
+    Second = send_status(M, after_unalias),
+    P ! stop,
+    {D, First, U, Second}.
+
+monitor_down(Mode) ->
+    P = spawn(fun() -> ok end),
+    M = erlang:monitor(process, P, [{alias, Mode}]),
+    receive {'DOWN', M, process, P, _} -> ok after 1000 -> timeout end,
+    First = send_status(M, after_down),
+    U = erlang:unalias(M),
+    Second = send_status(M, after_unalias),
+    {First, U, Second}.
+
+spawn_opt_alias(Mode) ->
+    Parent = self(),
+    {P, M} = spawn_opt(fun() ->
+        receive {Alias, ParentPid} ->
+            Alias ! spawn_first,
+            Alias ! spawn_second,
+            ParentPid ! spawn_done
+        end
+    end, [{monitor, [{alias, Mode}]}]),
+    P ! {M, Parent},
+    receive spawn_done -> ok after 1000 -> timeout end,
+    First = receive spawn_first -> delivered after 0 -> dropped end,
+    Second = receive spawn_second -> delivered after 0 -> dropped end,
+    {First, Second, unalias(M)}.
 
 echo() -> receive {From, X} -> From ! {X, ok}, echo(); stop -> ok end.
 
@@ -77,6 +138,39 @@ run(monitor_alias_noproc) ->
 run(monitor_bad_alias_mode) ->
     P = self(),
     try erlang:monitor(process, spawn(fun() -> ok end), [{alias, bogus}]) catch error:E -> {E, P =:= P} end;
+run(alias_default_lifecycle) -> alias_lifecycle(alias());
+run(alias_explicit_lifecycle) -> alias_lifecycle(alias([explicit_unalias]));
+run(alias_reply_lifecycle) -> alias_lifecycle(alias([reply]));
+run(alias_reply_then_explicit) -> alias_lifecycle(alias([reply, explicit_unalias]));
+run(alias_explicit_then_reply) -> alias_lifecycle(alias([explicit_unalias, reply]));
+run(monitor_demonitor_explicit) -> monitor_demonitor(explicit_unalias);
+run(monitor_demonitor_demonitor) -> monitor_demonitor(demonitor);
+run(monitor_demonitor_reply_demonitor) -> monitor_demonitor(reply_demonitor);
+run(monitor_down_explicit) -> monitor_down(explicit_unalias);
+run(monitor_down_demonitor) -> monitor_down(demonitor);
+run(monitor_down_reply_demonitor) -> monitor_down(reply_demonitor);
+run(monitor_reply_demonitor_once) ->
+    P = spawn(fun() -> receive stop -> ok end end),
+    M = erlang:monitor(process, P, [{alias, reply_demonitor}]),
+    First = send_status(M, first_reply),
+    D = erlang:demonitor(M),
+    Second = send_status(M, second_reply),
+    U = erlang:unalias(M),
+    P ! stop,
+    {First, D, Second, U};
+run(monitor_alias_last_mode) ->
+    P = spawn(fun() -> receive stop -> ok end end),
+    M = erlang:monitor(process, P, [
+        {alias, reply_demonitor}, {alias, explicit_unalias}
+    ]),
+    D = erlang:demonitor(M),
+    First = send_status(M, last_mode),
+    U = erlang:unalias(M),
+    P ! stop,
+    {D, First, U};
+run(spawn_opt_alias_explicit) -> spawn_opt_alias(explicit_unalias);
+run(spawn_opt_alias_demonitor) -> spawn_opt_alias(demonitor);
+run(spawn_opt_alias_reply_demonitor) -> spawn_opt_alias(reply_demonitor);
 run(iolist_size_small) ->
     {iolist_size([]), iolist_size(<<"abc">>), iolist_size([1, 2, <<3, 4>>, [5]]), iolist_size("hello")};
 run(iolist_size_nested) ->

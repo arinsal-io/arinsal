@@ -639,7 +639,6 @@ fn light_demonitor_miss(
     let id = arinsal_bifs::ordinary_ref_key(ids);
     if let Some(cold) = process.cold.as_ref()
         && (cold.monitors.contains_key(&id)
-            || cold.aliases.contains(&id)
             || cold.dist_monitors.contains(&id)
             || cold.port_monitors.contains_key(&id))
     {
@@ -835,7 +834,7 @@ fn spawn_mfa(
     monitored: bool,
     min_heap_size: Option<usize>,
     monitor_tag: Option<arinsal_etf::OwnedTerm>,
-    monitor_alias: bool,
+    monitor_alias: Option<crate::proc_create::AliasMode>,
     scheduler_id: Option<usize>,
 ) -> Result<Term, VmError> {
     spawn_mfa_with_priority(
@@ -908,7 +907,7 @@ pub(crate) struct SpawnReply {
 pub(crate) struct SpawnMonitor {
     pub id: Option<u64>,
     pub tag: Option<arinsal_etf::OwnedTerm>,
-    pub alias: bool,
+    pub alias: Option<crate::proc_create::AliasMode>,
 }
 
 /// What `erl_create_process` returns: the child and the monitor it set up, if any.
@@ -1116,12 +1115,15 @@ pub(crate) fn erl_create_process(
         ));
     }
     if let (Some(id), Some(data), Some(monitor)) = (monitor_id, monitor_data, so.monitor.as_ref()) {
-        parent
-            .cold_mut()
-            .monitors
-            .insert(id, crate::proc_create::OriginHalf { target: pid, data });
-        if monitor.alias {
-            parent.cold_mut().aliases.insert(id);
+        parent.cold_mut().monitors.insert(
+            id,
+            crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf {
+                target: pid,
+                data,
+                alias_mode: monitor.alias,
+            }),
+        );
+        if monitor.alias.is_some() {
             rt.alias_bind(id, Some(parent_pid));
         }
     }
@@ -1172,7 +1174,7 @@ fn spawn_mfa_with_priority(
     monitored: bool,
     min_heap_size: Option<usize>,
     monitor_tag: Option<arinsal_etf::OwnedTerm>,
-    monitor_alias: bool,
+    monitor_alias: Option<crate::proc_create::AliasMode>,
     scheduler_id: Option<usize>,
     priority: Priority,
 ) -> Result<Term, VmError> {
@@ -1252,7 +1254,7 @@ struct SpawnOpts {
     link: bool,
     monitor: bool,
     monitor_tag: Option<arinsal_etf::OwnedTerm>,
-    monitor_alias: bool,
+    monitor_alias: Option<crate::proc_create::AliasMode>,
     min_heap_size: Option<usize>,
     scheduler: Option<usize>,
     priority: Priority,
@@ -1268,7 +1270,7 @@ fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmE
         link: false,
         monitor: false,
         monitor_tag: None,
-        monitor_alias: false,
+        monitor_alias: None,
         min_heap_size: None,
         scheduler: None,
         priority: Priority::Normal,
@@ -1308,16 +1310,11 @@ fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmE
                                     VmError::Unsupported(format!("monitor tag: {error:?}"))
                                 })?);
                         }
-                        (Some(key), Some(value))
-                            if key == atom("alias")
-                                && atom_name(value).is_some_and(|name| {
-                                    matches!(
-                                        name.as_str(),
-                                        "explicit_unalias" | "demonitor" | "reply_demonitor"
-                                    )
-                                }) =>
-                        {
-                            opts.monitor_alias = true;
+                        (Some(key), Some(value)) if key == atom("alias") => {
+                            opts.monitor_alias = Some(
+                                parse_alias_mode(value)
+                                    .ok_or_else(|| badarg("erlang:spawn_opt"))?,
+                            );
                         }
                         _ => return Err(badarg("erlang:spawn_opt")),
                     }
@@ -2034,14 +2031,14 @@ pub(crate) fn monitor_light(
 ) -> Option<Result<Term, crate::exceptions::Trap>> {
     // `monitor/3` with `{alias, Mode}` is what `gen:call` and every `gen_server:call` with a
     // timeout issue; a custom tag or `priority` takes the executor.
-    let (kind, target, alias) = match args {
-        [kind, target] => (*kind, *target, false),
+    let (kind, target, alias_mode) = match args {
+        [kind, target] => (*kind, *target, None),
         [kind, target, _] => {
-            let (tag, alias, priority) = monitor_options(args).ok()?;
+            let (tag, alias_mode, priority) = monitor_options(args).ok()?;
             if tag != atom("DOWN") || priority {
                 return None;
             }
-            (*kind, *target, alias)
+            (*kind, *target, alias_mode)
         }
         _ => return None,
     };
@@ -2062,14 +2059,14 @@ pub(crate) fn monitor_light(
     let data = crate::proc_create::default_monitor_data();
     process.cold_mut().monitors.insert(
         id,
-        crate::proc_create::OriginHalf {
+        crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf {
             target: pid,
             data: data.clone(),
-        },
+            alias_mode,
+        }),
     );
-    if alias {
+    if alias_mode.is_some() {
         // Bound before the signal leaves: the target may reply through the alias at once.
-        process.cold_mut().aliases.insert(id);
         rt.alias_bind_prio(id, Some(me), false);
     }
     if rt
@@ -2086,8 +2083,7 @@ pub(crate) fn monitor_light(
         .is_err()
     {
         process.cold_mut().monitors.remove(&id);
-        if alias {
-            process.cold_mut().aliases.remove(&id);
+        if alias_mode.is_some() {
             rt.alias_bind(id, None);
         }
         return None;
@@ -2107,14 +2103,16 @@ pub(crate) fn alias_light(
     };
     let (explicit_unalias, reply, priority_atom) =
         (atom("explicit_unalias"), atom("reply"), atom("priority"));
-    let (mut reply_once, mut priority) = (false, false);
+    let (mut mode, mut priority) = (crate::proc_create::AliasMode::ExplicitUnalias, false);
     let mut bad = false;
     each_list_item(*options, |option| {
         if option == reply {
-            reply_once = true;
+            mode = crate::proc_create::AliasMode::ReplyDemonitor;
         } else if option == priority_atom {
             priority = true;
-        } else if option != explicit_unalias {
+        } else if option == explicit_unalias {
+            mode = crate::proc_create::AliasMode::ExplicitUnalias;
+        } else {
             bad = true;
         }
     })?;
@@ -2126,10 +2124,10 @@ pub(crate) fn alias_light(
     let id = rt.next_ref();
     let reference = reference(process, id).ok()?;
     rt.alias_bind_prio(id, Some(me), priority);
-    if reply_once {
-        process.cold_mut().once_aliases.insert(id);
-    }
-    process.cold_mut().aliases.insert(id);
+    process.cold_mut().monitors.insert(
+        id,
+        crate::proc_create::OriginMonitor::Alias { mode, priority },
+    );
     Some(Ok(reference))
 }
 
@@ -2143,14 +2141,127 @@ pub(crate) fn unalias_light(
         return None;
     };
     let id = ref_id(*reference)?;
-    let owned = process
+    let owned = unalias_origin(process, id);
+    Some(Ok(atom(if owned { "true" } else { "false" })))
+}
+
+/// Clear alias state from this process's monitor tree, retaining an active monitor when present.
+// Port of erts/emulator/beam/bif.c (unalias_1), OTP-29.1.1.
+pub(crate) fn unalias_origin(process: &mut Process, id: u64) -> bool {
+    let mut remove = false;
+    let owned = if let Some(cold) = process.cold.as_mut() {
+        match cold.monitors.get_mut(&id) {
+            Some(crate::proc_create::OriginMonitor::Process(half)) => {
+                half.alias_mode.take().is_some()
+            }
+            Some(crate::proc_create::OriginMonitor::Alias { .. }) => {
+                remove = true;
+                true
+            }
+            Some(crate::proc_create::OriginMonitor::Distributed { alias_mode }) => {
+                alias_mode.take().is_some()
+            }
+            Some(crate::proc_create::OriginMonitor::Port { alias_mode, .. }) => {
+                alias_mode.take().is_some()
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    if owned {
+        if remove && let Some(cold) = process.cold.as_mut() {
+            cold.monitors.remove(&id);
+        }
+        if let Some(runtime) = &process.runtime {
+            runtime.alias_bind(id, None);
+        }
+    }
+    owned
+}
+
+/// Apply the alias transition that erts performs when an origin monitor reports DOWN.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_monitor_down), OTP-29.1.1.
+pub(crate) fn take_origin_monitor_down(
+    process: &mut Process,
+    id: u64,
+) -> Option<crate::proc_create::OriginMonitor> {
+    let entry = process.cold.as_mut()?.monitors.remove(&id)?;
+    if matches!(&entry, crate::proc_create::OriginMonitor::Alias { .. }) {
+        process.cold_mut().monitors.insert(id, entry);
+        return None;
+    }
+    if let Some(cold) = process.cold.as_mut() {
+        cold.dist_monitors.remove(&id);
+        cold.port_monitors.remove(&id);
+    }
+    let mode = entry.alias_mode();
+    match mode {
+        Some(crate::proc_create::AliasMode::ExplicitUnalias) => {
+            process.cold_mut().monitors.insert(
+                id,
+                crate::proc_create::OriginMonitor::Alias {
+                    mode: crate::proc_create::AliasMode::ExplicitUnalias,
+                    priority: false,
+                },
+            );
+        }
+        Some(
+            crate::proc_create::AliasMode::Demonitor
+            | crate::proc_create::AliasMode::ReplyDemonitor,
+        ) => {
+            if let Some(runtime) = &process.runtime {
+                runtime.alias_bind(id, None);
+            }
+        }
+        None => {}
+    }
+    process.cold_mut().prio_monitors.remove(&id);
+    Some(entry)
+}
+
+pub(crate) enum OriginDemonitor {
+    Missing,
+    Alias,
+    Process(crate::proc_create::OriginHalf),
+    Port(Option<u64>),
+    Distributed,
+}
+
+// Port of erts/emulator/beam/bif.c (demonitor), OTP-29.1.1.
+pub(crate) fn demonitor_origin(process: &mut Process, id: u64) -> OriginDemonitor {
+    let Some(entry) = process
         .cold
         .as_mut()
-        .is_some_and(|cold| cold.aliases.remove(&id));
-    if owned && let Some(runtime) = &process.runtime {
+        .and_then(|cold| cold.monitors.remove(&id))
+    else {
+        return OriginDemonitor::Missing;
+    };
+    if let crate::proc_create::OriginMonitor::Alias { .. } = &entry {
+        process.cold_mut().monitors.insert(id, entry);
+        return OriginDemonitor::Alias;
+    }
+    let mode = entry.alias_mode();
+    if mode == Some(crate::proc_create::AliasMode::ExplicitUnalias) {
+        process.cold_mut().monitors.insert(
+            id,
+            crate::proc_create::OriginMonitor::Alias {
+                mode: crate::proc_create::AliasMode::ExplicitUnalias,
+                priority: false,
+            },
+        );
+    } else if mode.is_some()
+        && let Some(runtime) = &process.runtime
+    {
         runtime.alias_bind(id, None);
     }
-    Some(Ok(atom(if owned { "true" } else { "false" })))
+    process.cold_mut().prio_monitors.remove(&id);
+    match entry {
+        crate::proc_create::OriginMonitor::Process(half) => OriginDemonitor::Process(half),
+        crate::proc_create::OriginMonitor::Port { port_id, .. } => OriginDemonitor::Port(port_id),
+        crate::proc_create::OriginMonitor::Distributed { .. } => OriginDemonitor::Distributed,
+        crate::proc_create::OriginMonitor::Alias { .. } => unreachable!(),
+    }
 }
 
 /// `demonitor(Ref)` / `demonitor(Ref, Opts)` called directly from native code (erts bif.c:437-454
@@ -2175,21 +2286,23 @@ pub(crate) fn demonitor_light(
     if cold.dist_monitors.contains(&id) || cold.port_monitors.contains_key(&id) {
         return None;
     }
-    let alias_active = cold.aliases.contains(&id);
-    let active = cold.monitors.get(&id).map(|half| half.target);
+    let active = match cold.monitors.get(&id) {
+        Some(crate::proc_create::OriginMonitor::Process(half)) => Some(half.target),
+        Some(crate::proc_create::OriginMonitor::Alias { .. }) => {
+            return Some(Ok(atom("false")));
+        }
+        _ => None,
+    };
     if active.is_none() && flush {
         return None;
     }
     let me = process.self_pid?;
     let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
     let scheduler = rt.scheduler().ok()?;
-    if alias_active {
-        // `demonitor` deactivates the alias of a `{alias, demonitor}` monitor.
-        process.cold_mut().aliases.remove(&id);
-        rt.alias_bind(id, None);
-    }
     let result = if let Some(pid) = active {
-        process.cold_mut().monitors.remove(&id);
+        if !matches!(demonitor_origin(process, id), OriginDemonitor::Process(_)) {
+            return None;
+        }
         // erts consumes the held process monitor instead of sending the demonitor when it can
         // (erl_proc_sig_queue.c:1104). The executor ignores a dead target here as well.
         if !flush || !scheduler.cancel_pending_monitor(pid, id) {
@@ -2468,7 +2581,7 @@ fn call_resolved(
             false,
             None,
             None,
-            false,
+            None,
             None,
         ),
         (SignalBif::SpawnLink3, [module, function, args]) => spawn_mfa(
@@ -2480,7 +2593,7 @@ fn call_resolved(
             false,
             None,
             None,
-            false,
+            None,
             None,
         ),
         (SignalBif::SpawnOpt4, [module, function, args, options]) => {
@@ -2676,7 +2789,7 @@ fn call_resolved(
         (SignalBif::Monitor2, [kind, target]) | (SignalBif::Monitor3, [kind, target, _])
             if *kind == atom("process") =>
         {
-            let (tag, alias, priority) = monitor_options(args)?;
+            let (tag, alias_mode, priority) = monitor_options(args)?;
             let rt = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
             // boot_loop1: code_server:call/1 monitors its registered name.
             // Port of erts/emulator/beam/bif.c:1100 (erts_internal_monitor? monitor_2/3
@@ -2707,10 +2820,9 @@ fn call_resolved(
             }
             // The default `DOWN` tag without a name is the shared default data: no allocation.
             let data = monitor_data_for(tag, name.as_deref())?;
-            if alias {
-                process.cold_mut().aliases.insert(id);
-                // Monitor aliases with `priority` are priority aliases.
-                rt.alias_bind_prio(id, Some(ctx.pid()), priority);
+            if alias_mode.is_some() {
+                // Monitor priority applies to DOWN delivery, not alias messages.
+                rt.alias_bind_prio(id, Some(ctx.pid()), false);
             }
             if priority {
                 process.cold_mut().prio_monitors.insert(id);
@@ -2718,10 +2830,11 @@ fn call_resolved(
             if let Some(pid) = pid.filter(|pid| rt.scheduler().is_ok_and(|s| s.lookup(*pid))) {
                 process.cold_mut().monitors.insert(
                     id,
-                    crate::proc_create::OriginHalf {
+                    crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf {
                         target: pid,
                         data: data.clone(),
-                    },
+                        alias_mode,
+                    }),
                 );
                 // The target half shares this object (erts: one ErtsMonitorData for both halves).
                 let signal = arinsal_sched::Signal::Monitor {
@@ -2734,10 +2847,28 @@ fn call_resolved(
                         return Err(VmError::Unsupported(format!("monitor: {error}")));
                     }
                     // The target stopped accepting monitor signals before this request.
-                    send_noproc_down(process, ctx, id, name.as_deref(), Some(pid), *target, tag)?;
+                    send_noproc_down(
+                        process,
+                        ctx,
+                        id,
+                        name.as_deref(),
+                        Some(pid),
+                        *target,
+                        tag,
+                        alias_mode,
+                    )?;
                 }
             } else {
-                send_noproc_down(process, ctx, id, name.as_deref(), pid, *target, tag)?;
+                send_noproc_down(
+                    process,
+                    ctx,
+                    id,
+                    name.as_deref(),
+                    pid,
+                    *target,
+                    tag,
+                    alias_mode,
+                )?;
             }
             Ok(ref_term)
         }
@@ -2755,12 +2886,11 @@ fn call_resolved(
         (SignalBif::Monitor2, [kind, target]) | (SignalBif::Monitor3, [kind, target, _])
             if *kind == atom("port") =>
         {
-            let (tag, alias, _priority) = monitor_options(args)?;
+            let (tag, alias_mode, _priority) = monitor_options(args)?;
             let runtime = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
             let reference_id = runtime.next_ref();
             let reference_term = reference(process, reference_id)?;
-            if alias {
-                process.cold_mut().aliases.insert(reference_id);
+            if alias_mode.is_some() {
                 runtime.alias_bind_prio(reference_id, Some(ctx.pid()), false);
             }
             let (port_id, object) = if let Some(id) = target.as_port() {
@@ -2795,6 +2925,15 @@ fn call_resolved(
             } else {
                 return Err(badarg("monitor/2"));
             };
+            if alias_mode.is_some() {
+                process.cold_mut().monitors.insert(
+                    reference_id,
+                    crate::proc_create::OriginMonitor::Port {
+                        port_id,
+                        alias_mode,
+                    },
+                );
+            }
             if let Some(id) = port_id.filter(|id| runtime.ports.lock().unwrap().contains_key(id)) {
                 if tag != atom("DOWN") {
                     // Port monitors carry no tag yet (typed gap, see report).
@@ -2818,6 +2957,7 @@ fn call_resolved(
                             VmError::Unsupported(format!("port DOWN tuple: {error:?}"))
                         })?;
                     process.inbox.push_back(down);
+                    let _ = take_origin_monitor_down(process, reference_id);
                 } else {
                     // Origin stays in this process; the target half is on the port.
                     process.cold_mut().port_monitors.insert(reference_id, id);
@@ -2831,6 +2971,7 @@ fn call_resolved(
                     .tuple(&[tag, reference_term, atom("port"), object, atom("noproc")])
                     .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
                 process.inbox.push_back(down);
+                let _ = take_origin_monitor_down(process, reference_id);
                 Ok(reference_term)
             }
         }
@@ -2848,45 +2989,42 @@ fn call_resolved(
                 return Err(badarg("demonitor/2"));
             }
             let flush = options.contains(&atom("flush"));
-            let mut was_active = if let Some(pid) = process
-                .cold
-                .as_mut()
-                .and_then(|cold| cold.monitors.remove(&id))
-                .map(|half| half.target)
-            {
-                if !flush || !ctx.cancel_pending_monitor(pid, id) {
-                    let _ = ctx.signal(pid, Signal::Demonitor(id));
-                }
-                true
-            } else {
-                false
+            let entry = demonitor_origin(process, id);
+            let (was_alias, process_target, port_target, distributed) = match entry {
+                OriginDemonitor::Alias => (true, None, None, false),
+                OriginDemonitor::Process(half) => (false, Some(half.target), None, false),
+                OriginDemonitor::Port(port_id) => (false, None, port_id, false),
+                OriginDemonitor::Distributed => (false, None, None, true),
+                OriginDemonitor::Missing => (false, None, None, false),
             };
-            let alias_active = process
-                .cold
-                .as_mut()
-                .is_some_and(|cold| cold.aliases.remove(&id));
-            if alias_active && let Some(runtime) = &process.runtime {
-                runtime.alias_bind(id, None);
+            let mut was_active = false;
+            if let Some(target) = process_target {
+                if !flush || !ctx.cancel_pending_monitor(target, id) {
+                    let _ = ctx.signal(target, Signal::Demonitor(id));
+                }
+                was_active = true;
             }
             // Port of erts/emulator/beam/bif.c:504-510 (demonitor, ERTS_MON_TYPE_PORT),
             // OTP-29.1.1: the origin is in this process's monitor tree. The port id
             // there selects the port; `erts_port_demonitor` sends the demonitor signal.
-            if let Some(port_id) = process
-                .cold
-                .as_mut()
-                .and_then(|cold| cold.port_monitors.remove(&id))
-            {
+            let port_id = port_target.or_else(|| {
+                process
+                    .cold
+                    .as_mut()
+                    .and_then(|cold| cold.port_monitors.remove(&id))
+            });
+            if let Some(port_id) = port_id {
                 crate::port::demonitor_port(process, ctx.pid(), port_id, id);
+                was_active = true;
+            }
+            if distributed {
                 was_active = true;
             }
             // Port of erts/emulator/beam/bif.c:640-654 (demonitor_2), OTP-29.1.1.
             // Flush runs only when the monitor is already gone (`am_false`). An
             // active process monitor just queues the demonitor signal.
-            let result = atom(if options.contains(&atom("info")) && !was_active {
-                "false"
-            } else {
-                "true"
-            });
+            let failed = was_alias || (options.contains(&atom("info")) && !was_active);
+            let result = atom(if failed { "false" } else { "true" });
             if flush && !was_active {
                 return Err(flush_monitor_trap(*reference, result));
             }
@@ -3053,7 +3191,7 @@ fn call_resolved(
                 false,
                 None,
                 None,
-                false,
+                None,
                 None,
             )?;
             if let (Some(pid), Some(runtime)) = (Pid::from_term(pid), process.runtime.as_ref()) {
@@ -3862,14 +4000,17 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
 }
 
 /// Options of `monitor/3`: `{tag, Tag}`, `{alias, Mode}` and `priority`.
-fn monitor_options(args: &[Term]) -> Result<(Term, bool, bool), VmError> {
+// Port of erts/emulator/beam/bif.c (erts_monitor_opts), OTP-29.1.1.
+fn monitor_options(
+    args: &[Term],
+) -> Result<(Term, Option<crate::proc_create::AliasMode>, bool), VmError> {
     let options = if args.len() == 3 {
         list(args[2]).ok_or_else(|| badarg("monitor/3"))?
     } else {
         Vec::new()
     };
     let mut tag = atom("DOWN");
-    let mut alias = false;
+    let mut alias_mode = None;
     let mut priority = false;
     for option in options {
         if option == atom("priority") {
@@ -3883,18 +4024,22 @@ fn monitor_options(args: &[Term]) -> Result<(Term, bool, bool), VmError> {
         }
         match (tuple.get(0), tuple.get(1)) {
             (Some(key), Some(value)) if key == atom("tag") => tag = value,
-            (Some(key), Some(value))
-                if key == atom("alias")
-                    && ["explicit_unalias", "demonitor", "reply_demonitor"]
-                        .iter()
-                        .any(|name| value == atom(name)) =>
-            {
-                alias = true
+            (Some(key), Some(value)) if key == atom("alias") => {
+                alias_mode = Some(parse_alias_mode(value).ok_or_else(|| badarg("monitor/3"))?);
             }
             _ => return Err(badarg("monitor/3")),
         }
     }
-    Ok((tag, alias, priority))
+    Ok((tag, alias_mode, priority))
+}
+
+fn parse_alias_mode(term: Term) -> Option<crate::proc_create::AliasMode> {
+    Some(match atom_name(term)?.as_str() {
+        "explicit_unalias" => crate::proc_create::AliasMode::ExplicitUnalias,
+        "demonitor" => crate::proc_create::AliasMode::Demonitor,
+        "reply_demonitor" => crate::proc_create::AliasMode::ReplyDemonitor,
+        _ => return None,
+    })
 }
 
 /// The object of a local process monitor's `DOWN`: `{Name, node()}` for a name, else the pid.
@@ -3923,6 +4068,7 @@ fn monitor_data_for(
     }))
 }
 
+#[allow(clippy::too_many_arguments)] // Keep monitor creation fields aligned with the erts call path.
 fn send_noproc_down(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -3931,6 +4077,7 @@ fn send_noproc_down(
     target_pid: Option<Pid>,
     target: Term,
     tag: Term,
+    alias_mode: Option<crate::proc_create::AliasMode>,
 ) -> Result<(), VmError> {
     // A named target is reported by name; the signal sender is then irrelevant.
     let from = target_pid.or_else(|| name.map(|_| ctx.pid()));
@@ -3938,10 +4085,14 @@ fn send_noproc_down(
         && let Some(runtime) = process.runtime.clone()
     {
         let data = monitor_data_for(tag, name)?;
-        process
-            .cold_mut()
-            .monitors
-            .insert(id, crate::proc_create::OriginHalf { target: from, data });
+        process.cold_mut().monitors.insert(
+            id,
+            crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf {
+                target: from,
+                data,
+                alias_mode,
+            }),
+        );
         let reason = Message::copy_from(atom("noproc"))?;
         return runtime
             .scheduler()?

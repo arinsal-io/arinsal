@@ -960,7 +960,10 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
             .map(|cold| {
                 cold.monitors
                     .values()
-                    .filter_map(|half| half.target.to_term())
+                    .filter_map(|entry| match entry {
+                        crate::proc_create::OriginMonitor::Process(half) => half.target.to_term(),
+                        _ => None,
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -2904,13 +2907,7 @@ fn call_values(
             ("alias", [options]) => create_alias(process, ctx, &list(*options).ok_or_else(badarg)?),
             ("unalias", [reference]) => {
                 let id = crate::signals::ref_id(*reference).ok_or_else(badarg)?;
-                let owned = process
-                    .cold
-                    .as_mut()
-                    .is_some_and(|cold| cold.aliases.remove(&id));
-                if owned && let Some(runtime) = &process.runtime {
-                    runtime.alias_bind(id, None);
-                }
+                let owned = crate::signals::unalias_origin(process, id);
                 Ok(atom(if owned { "true" } else { "false" }))
             }
             ("hibernate", [module, function, args]) => {
@@ -3759,7 +3756,7 @@ fn spawn_apply(
             monitor: options.monitor_id.map(|id| crate::signals::SpawnMonitor {
                 id: Some(id),
                 tag: None,
-                alias: false,
+                alias: None,
             }),
             min_heap: options.min_heap,
             min_bin_vheap: options.min_bin_vheap,
@@ -3919,6 +3916,14 @@ fn create_alias(
         return Err(badarg());
     }
     let priority = options.iter().any(|option| *option == atom("priority"));
+    let mut mode = crate::proc_create::AliasMode::ExplicitUnalias;
+    for option in options {
+        if *option == atom("reply") {
+            mode = crate::proc_create::AliasMode::ReplyDemonitor;
+        } else if *option == atom("explicit_unalias") {
+            mode = crate::proc_create::AliasMode::ExplicitUnalias;
+        }
+    }
     let id = process.runtime.as_ref().ok_or_else(badarg)?.next_ref();
     let reference = crate::signals::reference(process, id)?;
     let pid = ctx.pid();
@@ -3927,10 +3932,10 @@ fn create_alias(
         .as_ref()
         .ok_or_else(badarg)?
         .alias_bind_prio(id, Some(pid), priority);
-    if options.iter().any(|option| *option == atom("reply")) {
-        process.cold_mut().once_aliases.insert(id);
-    }
-    process.cold_mut().aliases.insert(id);
+    process.cold_mut().monitors.insert(
+        id,
+        crate::proc_create::OriginMonitor::Alias { mode, priority },
+    );
     Ok(reference)
 }
 
