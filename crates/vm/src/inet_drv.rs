@@ -11,6 +11,7 @@
 use crate::port::PortHandle;
 use crate::process::{Message, Runtime};
 use crate::{Process, VmError};
+use arinsal_alloc::typed::ErtsAlcType;
 use arinsal_packet::{
     HttpPacket, HttpUri, Packet, PacketOptions, PacketResult, PacketState, PacketType,
     parse_with_state,
@@ -18,6 +19,7 @@ use arinsal_packet::{
 use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
 use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -262,6 +264,12 @@ fn poke(sock: &Arc<Sock>) {
     wake.notify_one();
 }
 
+fn wake_io_loop() {
+    let (lock, wake) = tasks();
+    let _tasks = lock.lock().unwrap();
+    wake.notify_one();
+}
+
 /// `iready`/`oready`: schedule the port's I/O task on the inet thread.
 fn schedule_ready(sock: Arc<Sock>, fd: RawFd, ready: crate::check_io::Ready) {
     let (lock, wake) = tasks();
@@ -370,8 +378,10 @@ pub(crate) fn control(
 ) -> Result<Term, VmError> {
     // Port of inet_drv.c:11956 (tcp_inet_ctl subtracts the magic), OTP-29.1.1.
     let cmd = op.wrapping_sub(MAGIC);
-    let reply = dispatch(sock, caller, cmd, data);
-    poke(sock);
+    let (reply, selected) = dispatch(sock, caller, cmd, data);
+    if !selected {
+        poke(sock);
+    }
     byte_list(process, &reply)
 }
 
@@ -630,9 +640,10 @@ fn send_or_shutdown_failed(inner: &mut Inner, err: i32) -> SendOutcome {
     }
 }
 
-fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
+fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> (Vec<u8>, bool) {
     let mut accept_now: Option<(OwnedFd, u16)> = None;
     let mut sendfile_end: Option<SendfileEnd> = None;
+    let mut setopts_action = SetoptsAction::None;
     let reply = {
         let mut inner = sock.inner.lock().unwrap();
         match cmd {
@@ -668,7 +679,11 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
             },
             REQ_NAME => sockname(&inner),
             REQ_PEER => peername(&inner),
-            REQ_SETOPTS => setopts(&mut inner, data),
+            REQ_SETOPTS => {
+                let (reply, action) = setopts(&mut inner, data);
+                setopts_action = action;
+                reply
+            }
             REQ_GETOPTS => getopts(&inner, data),
             REQ_GETSTAT => getstat(&inner, data),
             REQ_GETIFLIST | REQ_IFGET | REQ_GETIFADDRS => interface_control(
@@ -698,7 +713,39 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
     if cmd == REQ_CLOSE {
         send_empty_out_q_msgs(sock);
     }
-    if cmd == TCP_REQ_RECV || cmd == REQ_SETOPTS || cmd == REQ_CONNECT {
+    if cmd == REQ_SETOPTS {
+        match setopts_action {
+            SetoptsAction::None => {}
+            SetoptsAction::Select => sock_select(sock),
+            SetoptsAction::Deliver => {
+                satisfy(sock);
+                sock_select(sock);
+            }
+            SetoptsAction::Recv => {
+                let eof = pull(sock);
+                satisfy(sock);
+                if eof {
+                    on_eof(sock);
+                }
+                sock_select(sock);
+            }
+        }
+        // A socket already closed (EOF, send error) reports it once it turns active.
+        deliver_pending_close(sock);
+    } else if cmd == TCP_REQ_RECV {
+        try_io(sock, false);
+        sock_select(sock);
+        if sock
+            .inner
+            .lock()
+            .unwrap()
+            .recv
+            .as_ref()
+            .is_some_and(|recv| recv.deadline.is_some())
+        {
+            wake_io_loop();
+        }
+    } else if cmd == REQ_CONNECT {
         try_io(sock, false);
     }
     let passive = {
@@ -718,7 +765,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
             },
         );
     }
-    reply
+    (reply, cmd == REQ_SETOPTS || cmd == TCP_REQ_RECV)
 }
 
 // Port of erts/emulator/drivers/common/inet_drv.c:11067-11100,
@@ -1277,22 +1324,48 @@ fn encode_addr(storage: &libc::sockaddr_storage) -> Option<Vec<u8>> {
     }
 }
 
-fn setopts(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
-    // Port of inet_drv.c:6871 (inet_set_opts), OTP-29.1.1.
+#[derive(Clone, Copy)]
+enum SetoptsAction {
+    None,
+    Select,
+    Deliver,
+    Recv,
+}
+
+fn setopts(inner: &mut Inner, data: &[u8]) -> (Vec<u8>, SetoptsAction) {
+    // Port of inet_drv.c:6871, 7950-7980 (inet_set_opts), OTP-29.1.1.
+    let old_active = inner.active_value;
+    let old_was_active = active_is(&inner.active);
+    let old_htype = inner.htype;
     let mut i = 0;
     while i < data.len() {
         let code = data[i];
         i += 1;
         if i + 4 > data.len() {
-            return err_bytes("einval");
+            return (err_bytes("einval"), SetoptsAction::None);
         }
         let val = i32::from_be_bytes(data[i..i + 4].try_into().unwrap());
         i += 4;
         if !apply_opt(inner, code, val, data, &mut i) {
-            return err_bytes("einval");
+            return (err_bytes("einval"), SetoptsAction::None);
         }
     }
-    ok_bytes(&[])
+    let action = if inner.phase != Phase::Connected {
+        SetoptsAction::None
+    } else if !old_was_active && matches!(inner.active_value, 2 | 3) && inner.htype == old_htype {
+        SetoptsAction::Recv
+    } else if inner.active_value != old_active {
+        if active_is(&inner.active) && !old_was_active {
+            SetoptsAction::Deliver
+        } else {
+            SetoptsAction::Select
+        }
+    } else if active_is(&inner.active) && inner.htype != old_htype {
+        SetoptsAction::Deliver
+    } else {
+        SetoptsAction::None
+    };
+    (ok_bytes(&[]), action)
 }
 
 fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) -> bool {
@@ -2373,7 +2446,7 @@ fn recv_req(inner: &mut Inner, caller: Pid, data: &[u8]) -> Vec<u8> {
 }
 
 fn has_buffered_packet(inner: &Inner) -> bool {
-    if inner.rbuf.is_empty() {
+    if rbuf_len(inner) == 0 {
         false
     } else if inner.htype == 0 {
         true
@@ -2385,12 +2458,12 @@ fn has_buffered_packet(inner: &Inner) -> bool {
 /// After EOF a receive still succeeds from input read before it (tcp_recv drains the buffer
 /// before it reads the socket again).
 fn buffered_deliverable(inner: &Inner, data: &[u8]) -> bool {
-    if inner.rbuf.is_empty() || active_is(&inner.active) || data.len() != 8 {
+    if rbuf_len(inner) == 0 || active_is(&inner.active) || data.len() != 8 {
         return false;
     }
     let length = i32::from_be_bytes(data[4..8].try_into().unwrap());
     if inner.htype == 0 {
-        usize::try_from(length).is_ok_and(|n| inner.rbuf.len() >= n.max(1))
+        usize::try_from(length).is_ok_and(|n| rbuf_len(inner) >= n.max(1))
     } else {
         tcp_packet_complete(inner)
     }
@@ -3084,6 +3157,9 @@ struct Inner {
     backlog: i32,
     op_ref: u16,
     rbuf: Vec<u8>,
+    rbuf_start: usize,
+    // Port of inet_drv.c (`i_buf`, `i_ptr_start`, `i_ptr`, `i_bufsz`), OTP-29.1.1.
+    rbuf_end: usize,
     sendq: IoQueue,
     empty_out_q_subs: Vec<Pid>,
     /// `Some` while TCP_ADDF_SENDFILE is set.
@@ -3167,6 +3243,8 @@ impl Default for Inner {
             backlog: 5,
             op_ref: 0,
             rbuf: Vec::new(),
+            rbuf_start: 0,
+            rbuf_end: 0,
             sendq: IoQueue::default(),
             empty_out_q_subs: Vec::new(),
             sendfile: None,
@@ -3632,6 +3710,10 @@ enum Out {
         owner: Pid,
         bytes: Vec<u8>,
     },
+    TcpMessage {
+        to: Pid,
+        message: Message,
+    },
     TcpClosed {
         owner: Pid,
     },
@@ -3670,21 +3752,25 @@ fn output_list_len(sock: &Sock, out: &Out) -> usize {
     match out {
         Out::AsyncData { bytes, .. } | Out::Tcp { bytes, .. } | Out::PortData { bytes, .. } => {
             let inner = sock.inner.lock().unwrap();
-            let header = if inner.header < 0 {
-                bytes.len()
-            } else {
-                inner.header as usize
-            };
-            if !inner.binary || header > bytes.len() {
-                bytes.len()
-            } else {
-                header
-            }
+            output_list_len_from_options(bytes.len(), inner.binary, inner.header)
         }
         Out::Http { packet, binary, .. } | Out::AsyncHttp { packet, binary, .. } => {
             http_list_len(packet, *binary)
         }
         _ => 0,
+    }
+}
+
+fn output_list_len_from_options(bytes_len: usize, binary: bool, header: i32) -> usize {
+    let header = if header < 0 {
+        bytes_len
+    } else {
+        header as usize
+    };
+    if !binary || header > bytes_len {
+        bytes_len
+    } else {
+        header
     }
 }
 
@@ -3742,6 +3828,13 @@ fn emit(sock: &Sock, out: Out) {
         // Still deliver tcp_closed to the connection ticker so it shuts down.
     }
     let sched = sock.handle().scheduler();
+    let out = match out {
+        Out::TcpMessage { to, message } => {
+            let _ = sched.send(to, to, message);
+            return;
+        }
+        out => out,
+    };
     let port = Term::port(sock.id).unwrap();
     // Port of inet_drv.c:3987-4005 (tcp_message uses LOAD_STRING sized to the
     // complete packet), OTP-29.1.1. List-mode packets need two heap words per byte.
@@ -3806,6 +3899,7 @@ fn emit(sock: &Sock, out: Out) {
                 })
                 .map(|term| (*owner, term))
         }
+        Out::TcpMessage { .. } => unreachable!("TCP message was already dispatched"),
         Out::TcpClosed { owner } => TermBuilder::new(&mut heap)
             .tuple(&[atom("tcp_closed"), port])
             .ok()
@@ -4037,9 +4131,22 @@ fn data_term(sock: &Sock, heap: &mut ProcessHeap, bytes: &[u8]) -> Option<Term> 
         let inner = sock.inner.lock().unwrap();
         (inner.binary, inner.header)
     };
+    data_term_with_options(heap, bytes, binary, hsz)
+}
+
+fn data_term_with_options(
+    heap: &mut ProcessHeap,
+    bytes: &[u8],
+    binary: bool,
+    header: i32,
+) -> Option<Term> {
     // Port of inet_drv.c:4000 (list, or [H1..Hsz | Binary]), OTP-29.1.1.
     let mut builder = TermBuilder::new(heap);
-    let hsz = if hsz < 0 { bytes.len() } else { hsz as usize };
+    let hsz = if header < 0 {
+        bytes.len()
+    } else {
+        header as usize
+    };
     if !binary || hsz > bytes.len() {
         return builder
             .list_from_iter(bytes.iter().map(|b| Term::small(i64::from(*b)).unwrap()))
@@ -4243,7 +4350,8 @@ fn satisfy(sock: &Arc<Sock>) {
     let (outs, abandon) = {
         let mut inner = sock.inner.lock().unwrap();
         let mut outs = Vec::new();
-        let abandon = take_packets(&sock.handle(), &mut inner, &mut outs);
+        let port = Term::port(sock.id).unwrap();
+        let abandon = take_packets(&sock.handle(), port, &mut inner, &mut outs);
         (outs, abandon)
     };
     for out in outs {
@@ -4254,25 +4362,26 @@ fn satisfy(sock: &Arc<Sock>) {
     }
 }
 
-fn take_packets(handle: &PortHandle, inner: &mut Inner, outs: &mut Vec<Out>) -> bool {
+fn take_packets(handle: &PortHandle, port: Term, inner: &mut Inner, outs: &mut Vec<Out>) -> bool {
     if inner.phase != Phase::Connected {
         return false;
     }
     if inner.recv.is_some() {
         if inner.htype == 0 {
             let recv = inner.recv.as_ref().unwrap();
+            let buffered = rbuf_len(inner);
             let ready = if recv.length == 0 {
-                !inner.rbuf.is_empty()
+                buffered != 0
             } else {
-                inner.rbuf.len() >= recv.length as usize
+                buffered >= recv.length as usize
             };
             if ready {
                 let n = if recv.length == 0 {
-                    inner.rbuf.len()
+                    buffered
                 } else {
                     recv.length as usize
                 };
-                let bytes: Vec<u8> = inner.rbuf.drain(..n).collect();
+                let bytes = rbuf_take(inner, n);
                 let recv = inner.recv.take().unwrap();
                 drop_pending(inner, recv.caller, recv.aref);
                 input_count(inner, bytes.len());
@@ -4284,7 +4393,13 @@ fn take_packets(handle: &PortHandle, inner: &mut Inner, outs: &mut Vec<Out>) -> 
                     let recv = inner.recv.take().unwrap();
                     drop_pending(inner, recv.caller, recv.aref);
                     input_count(inner, used);
-                    push_frame(inner, outs, DataWho::Async(recv.caller, recv.aref), frame);
+                    push_frame(
+                        inner,
+                        port,
+                        outs,
+                        DataWho::Async(recv.caller, recv.aref),
+                        frame,
+                    );
                 }
                 Read::Wait => {}
                 Read::Bad => return packet_error(handle, inner, outs),
@@ -4294,23 +4409,33 @@ fn take_packets(handle: &PortHandle, inner: &mut Inner, outs: &mut Vec<Out>) -> 
     while active_is(&inner.active) {
         let owner = handle.owner_pid();
         if inner.htype == 0 {
-            if inner.rbuf.is_empty() {
+            if rbuf_len(inner) == 0 {
                 break;
             }
-            let bytes = std::mem::take(&mut inner.rbuf);
+            let bytes = if inner.rbuf_start == 0 && inner.rbuf_end == inner.rbuf.len() {
+                std::mem::take(&mut inner.rbuf)
+            } else {
+                let len = rbuf_len(inner);
+                rbuf_take(inner, len)
+            };
+            inner.rbuf_start = 0;
+            inner.rbuf_end = 0;
             input_count(inner, bytes.len());
             push_data(inner, outs, DataWho::Active(owner), bytes);
         } else {
             match next_frame(inner) {
                 Read::Ready(frame, used) => {
                     input_count(inner, used);
-                    push_frame(inner, outs, DataWho::Active(owner), frame);
+                    push_frame(inner, port, outs, DataWho::Active(owner), frame);
                 }
                 Read::Wait => break,
                 Read::Bad => return packet_error(handle, inner, outs),
             }
         }
         note_active(inner, owner, outs);
+    }
+    if inner.rbuf_start == inner.rbuf_end {
+        rbuf_reset(inner);
     }
     false
 }
@@ -4325,7 +4450,7 @@ fn packet_error(handle: &PortHandle, inner: &mut Inner, outs: &mut Vec<Out>) -> 
             reason: "emsgsize",
         });
     }
-    inner.rbuf.clear();
+    rbuf_reset(inner);
     inner.fd.take();
     inner.phase = Phase::Closed;
     let active = active_is(&inner.active) && !inner.closed_sent;
@@ -4341,6 +4466,7 @@ fn packet_error(handle: &PortHandle, inner: &mut Inner, outs: &mut Vec<Out>) -> 
     active && inner.exit_on_close
 }
 
+#[derive(Clone, Copy)]
 enum DataWho {
     Active(Pid),
     Async(Pid, u16),
@@ -4364,10 +4490,38 @@ fn push_data(inner: &Inner, outs: &mut Vec<Out>, who: DataWho, bytes: Vec<u8>) {
     }
 }
 
-fn push_frame(inner: &Inner, outs: &mut Vec<Out>, who: DataWho, frame: Frame) {
+fn push_frame(inner: &Inner, port: Term, outs: &mut Vec<Out>, who: DataWho, frame: Frame) {
     let binary = inner.htype >= 13;
     match frame {
         Frame::Bytes(bytes) => push_data(inner, outs, who, bytes),
+        Frame::InputBytes(range) if inner.deliver != DELIVER_PORT => {
+            let bytes = &inner.rbuf[range];
+            let list_len = output_list_len_from_options(bytes.len(), inner.binary, inner.header);
+            let words = 128usize.saturating_add(list_len.saturating_mul(2));
+            let mut heap = ProcessHeap::with_words_for_type(words, ErtsAlcType::HEAP_FRAG);
+            let data = data_term_with_options(&mut heap, bytes, inner.binary, inner.header);
+            let message = data.and_then(|data| match who {
+                DataWho::Active(owner) => TermBuilder::new(&mut heap)
+                    .tuple(&[atom("tcp"), port, data])
+                    .ok()
+                    .map(|term| (owner, term)),
+                DataWho::Async(caller, aref) => {
+                    let status = TermBuilder::new(&mut heap)
+                        .tuple(&[atom("ok"), data])
+                        .ok()?;
+                    message_async(&mut heap, port, aref, status).map(|term| (caller, term))
+                }
+            });
+            if let Some((to, term)) = message {
+                outs.push(Out::TcpMessage {
+                    to,
+                    message: Message::from_heap(term, heap),
+                });
+            }
+        }
+        Frame::InputBytes(range) => {
+            push_data(inner, outs, who, inner.rbuf[range].to_vec());
+        }
         Frame::Http(packet) => match who {
             DataWho::Active(owner) if inner.deliver != DELIVER_PORT => {
                 outs.push(Out::Http {
@@ -4391,6 +4545,7 @@ fn push_frame(inner: &Inner, outs: &mut Vec<Out>, who: DataWho, frame: Frame) {
 
 enum Frame {
     Bytes(Vec<u8>),
+    InputBytes(Range<usize>),
     Http(HttpPacket),
 }
 
@@ -4400,6 +4555,7 @@ enum Read {
     Bad,
 }
 
+// Port of erts/emulator/drivers/common/inet_drv.c:13042 (tcp_deliver), OTP-29.1.1.
 fn next_frame(inner: &mut Inner) -> Read {
     let Some(ty) = packet_type(inner.htype) else {
         return Read::Wait;
@@ -4409,21 +4565,69 @@ fn next_frame(inner: &mut Inner) -> Read {
         line_length: 0,
         line_delimiter: inner.delimiter,
     };
-    let parsed = parse_with_state(ty, &inner.rbuf, opts, &mut inner.http);
+    let start = inner.rbuf_start;
+    let input = &inner.rbuf[start..inner.rbuf_end];
+    let parsed = parse_with_state(ty, input, opts, &mut inner.http);
     match parsed {
         PacketResult::Ok { packet, rest } => {
-            let used = inner.rbuf.len() - rest.len();
+            let used = input.len() - rest.len();
             let frame = match packet {
-                Packet::Bytes(bytes) => Frame::Bytes(bytes.to_vec()),
+                Packet::Bytes(bytes) => {
+                    let offset = bytes.as_ptr() as usize - input.as_ptr() as usize;
+                    let body_start = start + offset;
+                    Frame::InputBytes(body_start..body_start + bytes.len())
+                }
                 Packet::Http(http) => Frame::Http(http),
                 Packet::SslTls { data, .. } => Frame::Bytes(data),
             };
-            inner.rbuf.drain(..used);
+            rbuf_consume(inner, used);
             Read::Ready(frame, used)
         }
         PacketResult::More(_) => Read::Wait,
         // Port of inet_drv.c:13033 (tcp_remain packet error), OTP-29.1.1.
         PacketResult::Error => Read::Bad,
+    }
+}
+
+// Port of erts/emulator/drivers/common/inet_drv.c:13042 (tcp_deliver), OTP-29.1.1.
+fn rbuf_bytes(inner: &Inner) -> &[u8] {
+    &inner.rbuf[inner.rbuf_start..inner.rbuf_end]
+}
+
+// Port of inet_drv.c (`tcp_deliver`/`tcp_remain` valid range), OTP-29.1.1.
+fn rbuf_len(inner: &Inner) -> usize {
+    inner.rbuf_end - inner.rbuf_start
+}
+
+// Port of inet_drv.c (`tcp_clear_input` logical pointer reset), OTP-29.1.1.
+fn rbuf_reset(inner: &mut Inner) {
+    inner.rbuf_start = 0;
+    inner.rbuf_end = 0;
+}
+
+// Port of inet_drv.c (`tcp_deliver`), OTP-29.1.1.
+fn rbuf_consume(inner: &mut Inner, len: usize) {
+    inner.rbuf_start += len;
+}
+
+// Port of inet_drv.c (`tcp_deliver`), OTP-29.1.1.
+fn rbuf_take(inner: &mut Inner, len: usize) -> Vec<u8> {
+    let start = inner.rbuf_start;
+    let bytes = inner.rbuf[start..start + len].to_vec();
+    rbuf_consume(inner, len);
+    if inner.rbuf_start == inner.rbuf_end {
+        rbuf_reset(inner);
+    }
+    bytes
+}
+
+// Port of inet_drv.c (`tcp_restart_input`), OTP-29.1.1.
+fn rbuf_compact(inner: &mut Inner) {
+    if inner.rbuf_start != 0 {
+        let len = rbuf_len(inner);
+        inner.rbuf.copy_within(inner.rbuf_start..inner.rbuf_end, 0);
+        inner.rbuf_start = 0;
+        inner.rbuf_end = len;
     }
 }
 
@@ -4491,8 +4695,15 @@ fn get_bind_device(inner: &Inner) -> Option<Vec<u8>> {
 fn tcp_read_size(inner: &Inner) -> usize {
     // Port of inet_drv.c:12896-12949 (packet_header_length and tcp_remain), OTP-29.1.1.
     let buffer = inner.buffer.max(1) as usize;
-    if inner.read_ahead || inner.htype == 0 {
-        return buffer;
+    let buffered = rbuf_len(inner);
+    if inner.htype == 0 {
+        if !active_is(&inner.active)
+            && let Some(recv) = &inner.recv
+            && recv.length > 0
+        {
+            return (recv.length as usize).saturating_sub(buffered).max(1);
+        }
+        return buffer.saturating_sub(buffered).max(1);
     }
     let Some(ty) = packet_type(inner.htype) else {
         return 1;
@@ -4500,7 +4711,7 @@ fn tcp_read_size(inner: &Inner) -> usize {
     let mut http = inner.http;
     match parse_with_state(
         ty,
-        &inner.rbuf,
+        rbuf_bytes(inner),
         PacketOptions {
             packet_size: inner.packet_size,
             line_length: 0,
@@ -4509,10 +4720,13 @@ fn tcp_read_size(inner: &Inner) -> usize {
         &mut http,
     ) {
         PacketResult::More(Some(packet_len)) => {
-            return packet_len.saturating_sub(inner.rbuf.len()).max(1);
+            return packet_len.saturating_sub(buffered).max(1);
         }
         PacketResult::More(None) => {}
         PacketResult::Ok { .. } | PacketResult::Error => return 1,
+    }
+    if inner.read_ahead {
+        return buffer.saturating_sub(buffered).max(1);
     }
     let header_len: usize = match ty {
         PacketType::Length1 => 1,
@@ -4524,10 +4738,7 @@ fn tcp_read_size(inner: &Inner) -> usize {
         PacketType::SslTls => 5,
         _ => 1,
     };
-    header_len
-        .saturating_sub(inner.rbuf.len())
-        .max(1)
-        .min(buffer)
+    header_len.saturating_sub(buffered).max(1).min(buffer)
 }
 
 fn tcp_packet_complete(inner: &Inner) -> bool {
@@ -4538,7 +4749,7 @@ fn tcp_packet_complete(inner: &Inner) -> bool {
     matches!(
         parse_with_state(
             ty,
-            &inner.rbuf,
+            rbuf_bytes(inner),
             PacketOptions {
                 packet_size: inner.packet_size,
                 line_length: 0,
@@ -4550,6 +4761,26 @@ fn tcp_packet_complete(inner: &Inner) -> bool {
     )
 }
 
+// Port of erts/emulator/drivers/common/inet_drv.c:12967 (tcp_remain), OTP-29.1.1.
+fn tcp_input_ready(inner: &Inner) -> bool {
+    if inner.htype == 0 {
+        if active_is(&inner.active) {
+            rbuf_len(inner) != 0
+        } else if let Some(recv) = &inner.recv {
+            if recv.length == 0 {
+                rbuf_len(inner) != 0
+            } else {
+                rbuf_len(inner) >= recv.length as usize
+            }
+        } else {
+            false
+        }
+    } else {
+        tcp_packet_complete(inner)
+    }
+}
+
+// Port of erts/emulator/drivers/common/inet_drv.c:13130 (tcp_recv), OTP-29.1.1.
 fn pull(sock: &Arc<Sock>) -> bool {
     let phase = sock.inner.lock().unwrap().phase;
     if phase == Phase::Listening {
@@ -4568,37 +4799,56 @@ fn pull(sock: &Arc<Sock>) -> bool {
         if !want_read {
             return false;
         }
-        let fd = inner.fd.as_ref().unwrap().as_raw_fd();
-        let read_ahead = inner.read_ahead || inner.htype == 0;
         let mut eof = false;
         let mut bytes_read = 0;
-        for _ in 0..32 {
-            let read_size = if read_ahead {
-                inner.buffer.max(1) as usize
-            } else {
-                tcp_read_size(&inner)
+        loop {
+            // tcp_recv checks buffered data before issuing another read.
+            if tcp_input_ready(&inner) {
+                break;
+            }
+            // erts allocates the announced packet length without touching it; zero-filling it
+            // here would stall the poller on a bogus 4 GiB header, so a packet is read in
+            // chunks (the result is the same, the read loop just runs again).
+            const MAX_READ_CHUNK: usize = 1 << 20;
+            let read_size = tcp_read_size(&inner).min(MAX_READ_CHUNK);
+            rbuf_compact(&mut inner);
+            let read_start = inner.rbuf_end;
+            let read_end = read_start
+                .checked_add(read_size)
+                .expect("TCP receive buffer length overflow");
+            if inner.rbuf.len() < read_end {
+                inner.rbuf.resize(read_end, 0);
+            }
+            let read = {
+                let Inner { fd, rbuf, .. } = &mut *inner;
+                let fd = &fd.as_ref().unwrap().fd;
+                rustix::io::read(fd, &mut rbuf[read_start..read_end])
             };
-            let mut buf = vec![0u8; read_size];
-            // SAFETY: fd is the connected socket this driver owns.
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
-                bytes_read += n as usize;
-                inner.rbuf.extend_from_slice(&buf[..n as usize]);
-                if !read_ahead && tcp_packet_complete(&inner) {
+            match read {
+                Ok(n) if n > 0 => {
+                    bytes_read += n;
+                    inner.rbuf_end = read_start + n;
+                    // Port of inet_drv.c (tcp_recv): return to tcp_deliver as soon as a
+                    // complete message is buffered. In active_once mode, reading the next
+                    // chunk here can observe EOF and discard the remaining buffered frames.
+                    if tcp_input_ready(&inner) {
+                        break;
+                    }
+                }
+                Ok(_) => {
+                    eof = true;
                     break;
                 }
-            } else if n == 0 {
-                eof = true;
-                break;
-            } else {
-                let err = last_errno();
-                if err == libc::ECONNRESET {
-                    // Port of inet_drv.c:13190 (tcp_recv): an RST is an error only with
-                    // show_econnreset, else it reads as a plain close.
-                    inner.reset = inner.show_econnreset;
-                    eof = true;
+                Err(error) if error == rustix::io::Errno::INTR => continue,
+                Err(error) => {
+                    if error == rustix::io::Errno::CONNRESET {
+                        // Port of inet_drv.c:13190 (tcp_recv): an RST is an error only with
+                        // show_econnreset, else it reads as a plain close.
+                        inner.reset = inner.show_econnreset;
+                        eof = true;
+                    }
+                    break;
                 }
-                break;
             }
         }
         let _ = flush_send(&mut inner);
@@ -4667,7 +4917,7 @@ fn on_eof(sock: &Arc<Sock>) {
         // erts reads EOF only once the buffered input is consumed, so a passive socket with no
         // receive pending keeps what it holds for the receives that follow (tcp_recv).
         if active || inner.recv.is_some() {
-            inner.rbuf.clear();
+            rbuf_reset(&mut inner);
         }
         let owner = sock.handle().owner_pid();
         let reason = close_atom(&inner);
