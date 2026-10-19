@@ -166,10 +166,42 @@ unsafe extern "C" {
     );
 }
 
+// Mach-O prepends an underscore to C symbols and uses @PAGE/@PAGEOFF; ELF uses neither.
+#[cfg(target_vendor = "apple")]
+macro_rules! asm_sym {
+    ($name:literal) => {
+        concat!("_", $name)
+    };
+}
+#[cfg(not(target_vendor = "apple"))]
+macro_rules! asm_sym {
+    ($name:literal) => {
+        $name
+    };
+}
+#[cfg(target_vendor = "apple")]
+macro_rules! asm_load_enter_native_return {
+    () => {
+        concat!(
+            "adrp x30, _arinsal_enter_native_return@PAGE\n",
+            "add x30, x30, _arinsal_enter_native_return@PAGEOFF"
+        )
+    };
+}
+#[cfg(not(target_vendor = "apple"))]
+macro_rules! asm_load_enter_native_return {
+    () => {
+        concat!(
+            "adrp x30, arinsal_enter_native_return\n",
+            "add x30, x30, :lo12:arinsal_enter_native_return"
+        )
+    };
+}
+
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
-    ".global _arinsal_enter_native_trace_return",
-    "_arinsal_enter_native_trace_return:",
+    concat!(".global ", asm_sym!("arinsal_enter_native_trace_return")),
+    concat!(asm_sym!("arinsal_enter_native_trace_return"), ":"),
     // Publish the BEAM cursors and register cache before the Rust trace hook.
     "str x20, [x21, #8]",
     "str x23, [x21, #0]",
@@ -206,8 +238,8 @@ core::arch::global_asm!(
 
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
-    ".global _arinsal_enter_native",
-    "_arinsal_enter_native:",
+    concat!(".global ", asm_sym!("arinsal_enter_native")),
+    concat!(asm_sym!("arinsal_enter_native"), ":"),
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
     // Keep this entry trampoline and the exit fragment below shared across entries.
     // Preserve AAPCS64 callee-saved GPRs, frame/link registers, and d8-d15.
@@ -241,8 +273,7 @@ core::arch::global_asm!(
     "ldp d12, d13, [x14, #32]",
     "ldp d14, d15, [x14, #48]",
     // The native function's RET lands at the ABI exit fragment.
-    "adrp x30, _arinsal_enter_native_return@PAGE",
-    "add x30, x30, _arinsal_enter_native_return@PAGEOFF",
+    asm_load_enter_native_return!(),
     // Runtime error fragments use this slot after runtime hooks replace x30.
     "str x30, [x19, #16416]",
     // A call entered from the scheduler returns to its caller's continuation, so the
@@ -263,8 +294,8 @@ core::arch::global_asm!(
     // scheduler's call chain after a switch-out mispredicts.
     "blr x2",
     // This label must directly follow the `blr x2` above: its link value is the exit fragment.
-    ".global _arinsal_enter_native_return",
-    "_arinsal_enter_native_return:",
+    concat!(".global ", asm_sym!("arinsal_enter_native_return")),
+    concat!(asm_sym!("arinsal_enter_native_return"), ":"),
     // The marker distinguishes an interpreter handoff without adding work to each BEAM return.
     "ldr x9, [x19, #16408]",
     // Consume the marker so a later plain return is not taken for a handoff.

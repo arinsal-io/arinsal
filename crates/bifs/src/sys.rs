@@ -129,7 +129,10 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             },
         )),
         "build_type" | "emu_type" => Ok(atom("opt")),
-        "os_type" => Ok(tuple_build(ctx, &[atom("unix"), atom("darwin")])),
+        "os_type" => {
+            let flavor = uname_fields().0;
+            Ok(tuple_build(ctx, &[atom("unix"), atom(&flavor)]))
+        }
         "endian" => Ok(atom(if cfg!(target_endian = "little") {
             "little"
         } else {
@@ -177,11 +180,7 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         "os_monotonic_time_source" => clock_source(ctx, monotonic_clock_id(), true),
         "os_system_time_source" => clock_source(ctx, "CLOCK_REALTIME", false),
         "os_version" => {
-            let vals = if cfg!(target_os = "macos") {
-                [25, 6, 0]
-            } else {
-                [0, 0, 0]
-            };
+            let vals = uname_fields().1;
             Ok(tuple_build(ctx, &vals.map(|n| Term::small(n).unwrap())))
         }
         "scheduler_bind_type" => Ok(atom("unbound")),
@@ -314,3 +313,36 @@ crate::bif_bodies!(
     getpid,
     perf_counter,
 );
+
+/// `(os_flavor, os_version)` from `uname(2)`.
+// Port of erts/emulator/sys/unix/sys.c (os_flavor, os_version), OTP-29.1.1.
+fn uname_fields() -> (String, [i64; 3]) {
+    // SAFETY: utsname is plain bytes, so all-zero is valid; uname fills it in.
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: uts is a writable utsname.
+    unsafe { libc::uname(&mut uts) };
+    let text = |field: &[libc::c_char]| {
+        let bytes: Vec<u8> = field
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let flavor = text(&uts.sysname).to_ascii_lowercase();
+    // get_number: a component counts only when it starts with a digit; atoi stops at the
+    // first non-digit, and the rest of the release string is then skipped.
+    let release = text(&uts.release);
+    let mut rest = release.as_str();
+    let mut vals = [0i64; 3];
+    for v in &mut vals {
+        if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+            break;
+        }
+        let (part, tail) = rest.split_once('.').unwrap_or((rest, ""));
+        let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+        *v = digits.parse().unwrap_or(0);
+        rest = tail;
+    }
+    (flavor, vals)
+}

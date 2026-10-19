@@ -170,8 +170,8 @@ fn getnameinfo(args: &[O]) -> Result<O, BifError> {
         bits
     };
     let a = socket2::SockAddr::from(addr);
-    let mut host = [0i8; 1025];
-    let mut service = [0i8; 64];
+    let mut host = [0 as libc::c_char; 1025];
+    let mut service = [0 as libc::c_char; 64];
     // SAFETY: a, host, and service are live; lengths are their actual capacities.
     let code = unsafe {
         libc::getnameinfo(
@@ -199,6 +199,15 @@ fn getnameinfo(args: &[O]) -> Result<O, BifError> {
         ("service", O::charlist(&service.to_string_lossy())),
     ])))
 }
+// Linux names the broadcast/destination union member ifa_ifu.
+#[cfg(target_os = "linux")]
+fn ifa_dstaddr(item: &libc::ifaddrs) -> *mut libc::sockaddr {
+    item.ifa_ifu
+}
+#[cfg(not(target_os = "linux"))]
+fn ifa_dstaddr(item: &libc::ifaddrs) -> *mut libc::sockaddr {
+    item.ifa_dstaddr
+}
 fn ifaddrs() -> O {
     let mut first = ptr::null_mut::<libc::ifaddrs>();
     // SAFETY: first is a writable out-pointer released by freeifaddrs.
@@ -224,11 +233,11 @@ fn ifaddrs() -> O {
             entries.push((atom("netmask"), mask));
         }
         if item.ifa_flags as i32 & libc::IFF_BROADCAST != 0 {
-            if let Some(addr) = sockaddr(item.ifa_dstaddr) {
+            if let Some(addr) = sockaddr(ifa_dstaddr(item)) {
                 entries.push((atom("broadaddr"), addr));
             }
         } else if item.ifa_flags as i32 & libc::IFF_POINTOPOINT != 0
-            && let Some(addr) = sockaddr(item.ifa_dstaddr)
+            && let Some(addr) = sockaddr(ifa_dstaddr(item))
         {
             entries.push((atom("dstaddr"), addr));
         }
@@ -329,7 +338,7 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
             Ok(ifaddrs())
         }
         ("nif_gethostname", 0) => {
-            let mut buf = [0i8; 256];
+            let mut buf = [0 as libc::c_char; 256];
             // SAFETY: buf is writable with capacity passed to gethostname.
             let status = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
             if status < 0 {
@@ -356,7 +365,7 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
             let index = number(&args[0])
                 .and_then(|n| u32::try_from(n).ok())
                 .ok_or(BifError::BADARG)?;
-            let mut buf = [0i8; libc::IF_NAMESIZE];
+            let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
             // SAFETY: buf has IF_NAMESIZE bytes, as required by if_indextoname.
             let result = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
             if result.is_null() {

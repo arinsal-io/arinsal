@@ -399,6 +399,17 @@ fn bind_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     ok_bytes(&port.to_be_bytes())
 }
 
+// BSDs spell the IPv6 membership options JOIN/LEAVE_GROUP, Linux ADD/DROP_MEMBERSHIP;
+// erts maps both onto IPV6_ADD_MEMBERSHIP / IPV6_DROP_MEMBERSHIP.
+#[cfg(target_os = "macos")]
+const IPV6_ADD_MEMBERSHIP: i32 = libc::IPV6_JOIN_GROUP;
+#[cfg(target_os = "macos")]
+const IPV6_DROP_MEMBERSHIP: i32 = libc::IPV6_LEAVE_GROUP;
+#[cfg(target_os = "linux")]
+const IPV6_ADD_MEMBERSHIP: i32 = libc::IPV6_ADD_MEMBERSHIP;
+#[cfg(target_os = "linux")]
+const IPV6_DROP_MEMBERSHIP: i32 = libc::IPV6_DROP_MEMBERSHIP;
+
 fn connect_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     // Port of inet_drv.c:14710 (packet_inet_ctl INET_REQ_CONNECT, UDP), OTP-29.1.1.
     if !inner.open || inner.fd.is_none() {
@@ -407,8 +418,11 @@ fn connect_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     let fd = inner.fd.as_ref().unwrap().as_raw_fd();
     if data.is_empty() {
         let mut sa: libc::sockaddr = zeroed();
-        sa.sa_len = 2;
-        sa.sa_family = libc::AF_UNSPEC as u8;
+        #[cfg(target_os = "macos")]
+        {
+            sa.sa_len = 2;
+        }
+        sa.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
         // SAFETY: fd is the datagram socket this driver owns.
         unsafe { libc::connect(fd, &sa, 2) };
         inner.connected = false;
@@ -428,7 +442,7 @@ fn connect_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     if rc < 0 {
         let err = last_errno();
         let mut sa: libc::sockaddr = zeroed();
-        sa.sa_family = libc::AF_UNSPEC as u8;
+        sa.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
         // SAFETY: fd is the datagram socket this driver owns.
         unsafe { libc::connect(fd, &sa, 2) };
         inner.connected = false;
@@ -736,9 +750,9 @@ fn set_membership(
             ipv6mr_interface: ifindex as u32,
         };
         let name = if drop {
-            libc::IPV6_LEAVE_GROUP
+            IPV6_DROP_MEMBERSHIP
         } else {
-            libc::IPV6_JOIN_GROUP
+            IPV6_ADD_MEMBERSHIP
         };
         let _ = sock_bytes(
             inner,
@@ -1441,8 +1455,11 @@ fn parse_addr(domain: i32, data: &[u8]) -> Result<(Dest, usize), ()> {
 
 fn v4(port: u16, ip: [u8; 4]) -> libc::sockaddr_in {
     let mut addr: libc::sockaddr_in = zeroed();
-    addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-    addr.sin_family = libc::AF_INET as u8;
+    #[cfg(target_os = "macos")]
+    {
+        addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    }
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
     addr.sin_port = port.to_be();
     addr.sin_addr.s_addr = u32::from_ne_bytes(ip);
     addr
@@ -1450,8 +1467,11 @@ fn v4(port: u16, ip: [u8; 4]) -> libc::sockaddr_in {
 
 fn v6(port: u16, ip: [u8; 16], flow: u32, scope: u32) -> libc::sockaddr_in6 {
     let mut addr: libc::sockaddr_in6 = zeroed();
-    addr.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
-    addr.sin6_family = libc::AF_INET6 as u8;
+    #[cfg(target_os = "macos")]
+    {
+        addr.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+    }
+    addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
     addr.sin6_port = port.to_be();
     addr.sin6_flowinfo = flow;
     addr.sin6_addr.s6_addr = ip;
@@ -1467,8 +1487,11 @@ fn unix_addr(path: &[u8]) -> Result<(libc::sockaddr_un, libc::socklen_t), ()> {
     }
     let off = std::mem::offset_of!(libc::sockaddr_un, sun_path);
     let len = off + path.len();
-    addr.sun_len = len as u8;
-    addr.sun_family = libc::AF_UNIX as u8;
+    #[cfg(target_os = "macos")]
+    {
+        addr.sun_len = len as u8;
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     // SAFETY: path.len() is less than sun_path, and the struct was zeroed.
     unsafe {
         std::ptr::copy_nonoverlapping(path.as_ptr(), addr.sun_path.as_mut_ptr().cast(), path.len());
@@ -1526,7 +1549,7 @@ fn write_cmsg(buf: &mut [u8], used: &mut usize, level: i32, opt: i32, val: i32) 
         return false;
     }
     let hdr = libc::cmsghdr {
-        cmsg_len: (cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + 4) as libc::socklen_t,
+        cmsg_len: (cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + 4) as _,
         cmsg_level: level,
         cmsg_type: opt,
     };
