@@ -20,6 +20,7 @@ mod ext;
 mod hooks;
 mod linebuf;
 mod lock;
+mod native;
 mod poll;
 pub mod port_task;
 mod select;
@@ -57,6 +58,7 @@ pub use ext::{BUSY_MSGQ_DISABLED, ErlDrvMonitor, InitAck};
 pub use hooks::{SystemHooks, set_system_hooks};
 use linebuf::LineBuf;
 use lock::{ReentrantGuard, ReentrantLock};
+pub use native::{NativeDriver, SELECT_READ, SELECT_USE, SELECT_WRITE};
 pub use select::{NifSelectMessage, NifSelectResource, nif_select};
 
 // Port of erts/emulator/beam/global.h:172-181 (ERL_DE_* load error codes), OTP-29.1.1.
@@ -192,7 +194,7 @@ const _: () = assert!(size_of::<ErlIOVec>() == layout::SIZE_ErlIOVec);
 const _: () = assert!(offset_of!(ErlIOVec, binv) == layout::OFF_ErlIOVec_binv);
 
 /// Callbacks of a loaded entry (`erts_driver_t`, io.c:7554 init_driver).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct Callbacks {
     start: Option<StartFn>,
     stop: Option<DrvFn1>,
@@ -220,6 +222,8 @@ pub struct Driver {
     lock: Option<ReentrantLock>,
     /// Address of the `ErlDrvEntry` (`erts_driver_t.entry`).
     entry_addr: usize,
+    /// Callbacks of a driver written in Rust (no entry).
+    pub(crate) native: Option<Arc<dyn NativeDriver>>,
 }
 
 fn dl_errcodes() -> &'static Mutex<Vec<String>> {
@@ -382,6 +386,7 @@ impl Driver {
             library: Mutex::new(handle),
             lock: (flags & ERL_DRV_FLAG_USE_PORT_LOCKING == 0).then(ReentrantLock::default),
             entry_addr: entry_ptr as usize,
+            native: None,
         });
         if let Some(init) = entry.init {
             // SAFETY: the entry's init takes no arguments and runs once after loading.
@@ -423,6 +428,7 @@ impl Driver {
             library: Mutex::new(0),
             lock: (flags & ERL_DRV_FLAG_USE_PORT_LOCKING == 0).then(ReentrantLock::default),
             entry_addr: entry_ptr as usize,
+            native: None,
         });
         if let Some(init) = entry.init {
             // SAFETY: the entry's init takes no arguments and runs once when it is added.
@@ -629,6 +635,10 @@ pub struct DriverPort {
     sched: port_task::PortSched,
     /// `prt->run_queue`; the VM sets it at creation ([`DriverPort::init_run_queue`]).
     run_queue: arinsal_sched::PortRunQueue,
+    /// The port as an `Arc` (`Arc::new_cyclic`).
+    me: Weak<DriverPort>,
+    /// State of a [`NativeDriver`] port.
+    native_data: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// Set in `DriverPort::caller` while a callback has a caller (pid data 0 is a valid pid).
@@ -662,7 +672,7 @@ impl DriverPort {
     /// A port of `driver` with VM port id `id`; [`DriverPort::start`] runs the driver.
     pub fn new(driver: Arc<Driver>, id: u64, host: Box<dyn PortHost>) -> Arc<DriverPort> {
         let lock = driver.lock.is_none().then(ReentrantLock::default);
-        let port = Arc::new(DriverPort {
+        let port = Arc::new_cyclic(|me| DriverPort {
             driver,
             id,
             host,
@@ -684,6 +694,8 @@ impl DriverPort {
             async_open: std::sync::atomic::AtomicBool::new(false),
             sched: port_task::PortSched::default(),
             run_queue: arinsal_sched::PortRunQueue::default(),
+            me: me.clone(),
+            native_data: OnceLock::new(),
         });
         registry()
             .lock()
@@ -850,7 +862,14 @@ impl DriverPort {
             return false;
         }
         self.set_caller(caller);
-        if let Some(outputv) = self.driver.callbacks.outputv {
+        if let Some(native) = &self.driver.native {
+            let mut buf = Vec::new();
+            for piece in pieces {
+                let (IoPiece::Copied(bytes) | IoPiece::Refc(bytes)) = piece;
+                buf.extend_from_slice(bytes);
+            }
+            native.output(self, &buf);
+        } else if let Some(outputv) = self.driver.callbacks.outputv {
             self.call_outputv(outputv, pieces);
         } else if let Some(output) = self.driver.callbacks.output {
             let mut buf = Vec::new();
@@ -942,6 +961,12 @@ impl DriverPort {
         let _guard = self.guard();
         if !self.live() {
             return None;
+        }
+        if let Some(native) = &self.driver.native {
+            self.set_caller(caller);
+            let reply = native.control(self, command, data);
+            self.clear_caller();
+            return reply;
         }
         let control = self.driver.callbacks.control?;
         let mut input = data.to_vec();
@@ -1042,6 +1067,12 @@ impl DriverPort {
         // io.c:3725: the timer is cancelled before `stop`.
         self.cancel_timer();
         if previous & SFLG_STARTED != 0
+            && let Some(native) = &self.driver.native
+        {
+            self.state.fetch_or(SFLG_STOPPING, Ordering::AcqRel);
+            native.stop(self);
+            self.state.fetch_and(!SFLG_STOPPING, Ordering::AcqRel);
+        } else if previous & SFLG_STARTED != 0
             && let Some(stop) = self.driver.callbacks.stop
         {
             self.state.fetch_or(SFLG_STOPPING, Ordering::AcqRel);

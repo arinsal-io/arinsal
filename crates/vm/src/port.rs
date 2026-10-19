@@ -253,7 +253,6 @@ pub(crate) struct PortHandle {
     /// `port_set_data/2` term. `undefined` until the first store.
     data: Mutex<OwnedTerm>,
     /// `tcp_inet` / `tcp_inet6` port. I/O is owned by `inet_drv`, not a stdio worker.
-    inet: bool,
     /// Dynamically loaded (`erl_ddll`) driver port.
     driver: OnceLock<Arc<arinsal_drv::DriverPort>>,
     /// Processes this driver port monitors (`driver_monitor_process`): monitor id to pid.
@@ -392,10 +391,6 @@ impl PortHandle {
 
     pub(crate) fn take_tcp_driver_data(&self) -> Option<Arc<crate::inet_drv::Sock>> {
         self.inet_tcp.lock().unwrap().take()
-    }
-
-    pub(crate) fn udp_driver_data(&self) -> Option<Arc<crate::inet_udp::Sock>> {
-        self.inet_udp.lock().unwrap().clone()
     }
 
     pub(crate) fn set_udp_driver_data(&self, data: Arc<crate::inet_udp::Sock>) {
@@ -1004,7 +999,22 @@ fn start(
         let first = name.split(' ').next().unwrap_or_default();
         match crate::ddll::find_driver(first) {
             Some(crate::ddll::Found::Static) => {
-                return start_driver(process, ctx, name, binary);
+                let line = framing.and_then(|(mode, n)| (mode == 1).then_some(n));
+                return start_driver(
+                    process,
+                    ctx,
+                    name,
+                    binary,
+                    DriverIoFlags {
+                        msgq: limits
+                            .msgq_enabled
+                            .then_some((limits.msgq_low, limits.msgq_high)),
+                        binary,
+                        eof: want_eof,
+                        line,
+                        parallelism,
+                    },
+                );
             }
             None if *kind == atom("spawn_driver") => return Err(badarg()),
             Some(found) => {
@@ -1166,7 +1176,6 @@ fn start(
         limits,
         Arc::clone(&scheduler),
         Arc::as_ptr(runtime) as usize,
-        false,
     )?;
     runtime
         .ports
@@ -1206,45 +1215,40 @@ fn start(
 // `udp_inet6` and `sctp_inet` are absent, so `open_port` stays `badarg`
 // and `prim_inet` maps that onto `{error, eprotonosupport}`.
 fn start_driver(
-    process: &Process,
+    process: &mut Process,
     ctx: &RunCtx<'_, Message>,
     name: String,
     _binary: bool,
+    io: DriverIoFlags,
 ) -> Result<Term, VmError> {
     let udp = name == "udp_inet";
     let ram_file = name == "ram_file_drv";
     if name != "tcp_inet" && name != "tcp_inet6" && !udp && !ram_file {
         return Err(badarg());
     }
+    if !ram_file {
+        // Port of erts/emulator/beam/io.c:542 (erts_open_driver) for the linked-in
+        // tcp_inet and udp_inet drivers: ports on the generic port machinery.
+        let driver = if udp {
+            crate::inet_udp::driver()
+        } else {
+            crate::inet_drv::driver()
+        };
+        return start_dyn_driver(process, ctx, None, driver, name, io);
+    }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
     let reservation = reserve_port_id(runtime)?;
     let port_id = reservation.id();
     let port = Term::port(port_id).ok_or_else(badarg)?;
-    let handle = if ram_file {
-        make_driver_handle(
-            port_id,
-            ctx.pid(),
-            name,
-            false,
-            scheduler,
-            Arc::as_ptr(runtime) as usize,
-        )?
-    } else {
-        make_handle(
-            port_id,
-            None,
-            None,
-            ctx.pid(),
-            0,
-            name,
-            false,
-            default_limits(),
-            scheduler,
-            Arc::as_ptr(runtime) as usize,
-            true,
-        )?
-    };
+    let handle = make_driver_handle(
+        port_id,
+        ctx.pid(),
+        name,
+        false,
+        scheduler,
+        Arc::as_ptr(runtime) as usize,
+    )?;
     runtime
         .ports
         .lock()
@@ -1253,14 +1257,7 @@ fn start_driver(
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
-    // g_inet_udp
-    if ram_file {
-        *handle.ram_file.lock().unwrap() = Some(crate::ram_file_drv::start(_binary));
-    } else if udp {
-        crate::inet_udp::attach(port_id, Arc::clone(&handle));
-    } else {
-        crate::inet_drv::attach(Arc::clone(runtime), port_id, Arc::clone(&handle));
-    }
+    *handle.ram_file.lock().unwrap() = Some(crate::ram_file_drv::start(_binary));
     Ok(port)
 }
 
@@ -1324,6 +1321,13 @@ fn start_dyn_driver(
         );
     }
     drv_port.set_parallelism(io.parallelism);
+    if driver.is_native() {
+        if driver.name() == "udp_inet" {
+            crate::inet_udp::attach(&handle, &drv_port);
+        } else {
+            crate::inet_drv::attach(&runtime, &handle, &drv_port);
+        }
+    }
     runtime
         .ports
         .lock()
@@ -2059,30 +2063,42 @@ pub(crate) enum InetPortAllocError {
 }
 
 /// Allocate a connected `tcp_inet` port for an accepted socket.
+///
+/// Port of erts/emulator/beam/io.c:781 (driver_create_port) as `tcp_inet_copy` uses it:
+/// a port of the creator's driver owned by (and linked to) `owner`, on the run queue of
+/// the creating scheduler. `attach` installs the driver state before the port is visible.
 pub(crate) fn alloc_inet_port(
-    runtime: &crate::process::Runtime,
+    runtime: &Arc<crate::process::Runtime>,
     owner: Pid,
     name: String,
-) -> Result<(u64, Arc<PortHandle>), InetPortAllocError> {
+    driver: Arc<arinsal_drv::Driver>,
+    attach: impl FnOnce(&Arc<PortHandle>, &Arc<arinsal_drv::DriverPort>),
+) -> Result<(u64, Arc<PortHandle>, Arc<arinsal_drv::DriverPort>), InetPortAllocError> {
     let scheduler = runtime
         .scheduler()
         .map_err(|_| InetPortAllocError::NoMemory)?;
     let reservation = reserve_port_id(runtime).map_err(|_| InetPortAllocError::SystemLimit)?;
     let port_id = reservation.id();
-    let handle = make_handle(
+    let handle = make_driver_handle(
         port_id,
-        None,
-        None,
         owner,
-        0,
         name,
         false,
-        default_limits(),
-        scheduler,
-        runtime as *const crate::process::Runtime as usize,
-        true,
+        Arc::clone(&scheduler),
+        Arc::as_ptr(runtime) as usize,
     )
     .map_err(|_| InetPortAllocError::NoMemory)?;
+    let drv_port = arinsal_drv::DriverPort::new(
+        driver,
+        port_id,
+        Box::new(DrvHost {
+            runtime: Arc::downgrade(runtime),
+            own: Arc::downgrade(&handle),
+        }),
+    );
+    drv_port.init_run_queue(scheduler.current_run_queue());
+    let _ = handle.driver.set(Arc::clone(&drv_port));
+    attach(&handle, &drv_port);
     runtime
         .ports
         .lock()
@@ -2091,23 +2107,7 @@ pub(crate) fn alloc_inet_port(
     let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
-    Ok((port_id, handle))
-}
-
-/// Remove an inet port after the peer closes an active socket (`driver_exit`).
-pub(crate) fn abandon_port(runtime: &crate::process::Runtime, id: u64) {
-    let Some(handle) = remove_port(runtime, id) else {
-        return;
-    };
-    crate::inet_drv::detach(&handle);
-    // g_inet_udp
-    crate::inet_udp::detach(&handle);
-    let owner = *handle.owner.lock().unwrap();
-    let scheduler = Arc::clone(&handle.scheduler);
-    release_io(&handle);
-    // Port of erts/emulator/beam/io.c (driver_exit): the connected process is unlinked first,
-    // so it gets no exit signal for this port.
-    notify_closed(&handle, id, &scheduler, owner, true);
+    Ok((port_id, handle, drv_port))
 }
 
 fn notify_closed(
@@ -2307,7 +2307,6 @@ fn make_handle(
     limits: BusyLimits,
     scheduler: Arc<Scheduler<Process>>,
     trace_scope: usize,
-    inet: bool,
 ) -> Result<Arc<PortHandle>, VmError> {
     make_handle_with(
         id,
@@ -2320,7 +2319,6 @@ fn make_handle(
         limits,
         scheduler,
         trace_scope,
-        inet,
         true,
     )
 }
@@ -2348,7 +2346,6 @@ fn make_driver_handle(
         scheduler,
         trace_scope,
         false,
-        false,
     )
 }
 
@@ -2364,7 +2361,6 @@ fn make_handle_with(
     limits: BusyLimits,
     scheduler: Arc<Scheduler<Process>>,
     trace_scope: usize,
-    inet: bool,
     wake: bool,
 ) -> Result<Arc<PortHandle>, VmError> {
     let (wake_r, wake_w) = if wake {
@@ -2410,7 +2406,6 @@ fn make_handle_with(
         scheduler,
         trace_scope,
         data: Mutex::new(OwnedTerm::Atom("undefined".into())),
-        inet,
         driver: OnceLock::new(),
         drv_monitors: Mutex::new(HashMap::new()),
         async_open: Mutex::new(None),
@@ -2450,7 +2445,6 @@ fn start_fd(
         opts.limits,
         Arc::clone(&scheduler),
         Arc::as_ptr(runtime) as usize,
-        false,
     )?;
     runtime
         .ports
@@ -3323,22 +3317,7 @@ fn port_control(
     if let Some(drv_port) = handle.driver.get() {
         return driver_control(process, ctx, caller, drv_port, op, data);
     }
-    if !handle.inet {
-        return Ok(atom("badarg"));
-    }
-    let Some(op) = op.as_small() else {
-        return Ok(atom("badarg"));
-    };
-    let Some(data) = bytes(data) else {
-        return Ok(atom("badarg"));
-    };
-    if let Some(sock) = handle.udp_driver_data() {
-        return crate::inet_udp::control(process, &sock, caller, op, &data);
-    }
-    let Some(sock) = handle.tcp_driver_data() else {
-        return Ok(atom("badarg"));
-    };
-    crate::inet_drv::control(process, &sock, caller, op, &data)
+    Ok(atom("badarg"))
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:263 (erts_internal_port_call_3), OTP-29.1.1.
@@ -3486,7 +3465,7 @@ fn port_command(
                     .driver
                     .get()
                     .is_some_and(|d| d.driver().flags() & ERL_DRV_FLAG_SOFT_BUSY != 0);
-                if !handle.inet && !soft_busy {
+                if !soft_busy {
                     return Err(notsup());
                 }
             } else {
@@ -3535,30 +3514,6 @@ fn port_command(
     }
     let mut framed = iodata(data).ok_or_else(badarg)?;
     let bytes_out = framed.len();
-    if handle.inet {
-        let st = handle.state.lock().unwrap();
-        if st.closed || st.broken || st.graceful_close {
-            return Err(badarg());
-        }
-        drop(st);
-        // Port of erts/emulator/drivers/common/inet_drv.c:12629 (tcp_inet_command), OTP-29.1.1.
-        // g_inet_udp: datagram sends use packet_inet_command, not tcp_sendv.
-        if let Some(sock) = handle.udp_driver_data() {
-            let result = crate::inet_udp::command(&sock, ctx.pid(), &framed);
-            if result.is_ok() {
-                handle.add_bytes_out(bytes_out);
-            }
-            return result.map(|()| atom("true"));
-        }
-        let Some(sock) = handle.tcp_driver_data() else {
-            return Err(badarg());
-        };
-        let result = crate::inet_drv::command(&sock, ctx.pid(), framed);
-        if result.is_ok() {
-            handle.add_bytes_out(bytes_out);
-        }
-        return result.map(|()| atom("true"));
-    }
     let ram_file = handle.ram_file.lock().unwrap().clone();
     if let Some(ram_file) = ram_file {
         let state = handle.state.lock().unwrap();
@@ -3776,6 +3731,7 @@ fn release_io(handle: &PortHandle) {
     // Port of erts/emulator/beam/io.c:3698 (terminate_port) for a dynamic driver.
     if let Some(drv_port) = handle.driver.get()
         && drv_port.terminate()
+        && !drv_port.driver().is_native()
     {
         crate::ddll::port_closed(&handle.scheduler, drv_port.driver());
     }
@@ -3786,14 +3742,14 @@ fn release_io(handle: &PortHandle) {
         st.busy_port = false;
         st.busy_msgq = false;
         // Driver and inet ports have no worker thread to finish the exit.
-        if handle.wake_w.is_none() || handle.inet {
+        if handle.wake_w.is_none() {
             st.exit_complete = true;
         }
         std::mem::take(&mut st.suspended)
     };
     wake_suspended(&handle.scheduler, waiters);
     poke(handle);
-    if handle.wake_w.is_none() || handle.inet {
+    if handle.wake_w.is_none() {
         handle.finish_halt();
     }
 }
@@ -3842,10 +3798,6 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
     let removed = remove_and_notify(runtime, id, &scheduler, sender, atom("normal"));
     if let Some(handle) = removed {
         crate::trace::port_closed(runtime, id);
-        if handle.inet {
-            crate::inet_drv::detach(&handle);
-            crate::inet_udp::detach(&handle);
-        }
         release_io(&handle);
         Ok(atom("true"))
     } else {
@@ -3943,10 +3895,6 @@ pub(crate) fn exit_port(
         return Ok(());
     };
     crate::trace::port_closed(runtime, id);
-    if removed.inet {
-        crate::inet_drv::detach(&removed);
-        crate::inet_udp::detach(&removed);
-    }
     release_io(&removed);
     Ok(())
 }
@@ -3987,10 +3935,6 @@ pub(crate) fn halt_reap_ports(runtime: &Arc<crate::process::Runtime>, progress: 
             atom("killed"),
         ) {
             crate::trace::port_closed(runtime, handle.id);
-            if removed.inet {
-                crate::inet_drv::detach(&removed);
-                crate::inet_udp::detach(&removed);
-            }
             release_io(&removed);
         }
     }
@@ -4136,10 +4080,6 @@ pub(crate) fn owner_exit(
         };
         crate::trace::emit_port_event(runtime, port_id, crate::trace::PORTS, "closed", &[reason]);
         crate::trace::port_closed(runtime, port_id);
-        if handle.inet {
-            crate::inet_drv::detach(&handle);
-            crate::inet_udp::detach(&handle);
-        }
         release_io(&handle);
     }
 }
@@ -4890,13 +4830,10 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     };
     let input = port_counter_term(&mut heap, input_count)?;
     let output = port_counter_term(&mut heap, output_count)?;
-    let queue_size = drv_port.map_or_else(
-        || match handle.tcp_driver_data() {
-            Some(sock) => sock.out_queue_size(),
-            None => outq_size,
-        },
-        |drv| drv.queue_size(),
-    );
+    let queue_size = match handle.tcp_driver_data() {
+        Some(sock) => sock.out_queue_size(),
+        None => drv_port.map_or(outq_size, |drv| drv.queue_size()),
+    };
     // Port of erts/emulator/beam/io.c (port_info os_pid): a driver that never
     // called `erl_drv_set_os_pid` reports `undefined`.
     let os_pid = match drv_port.map(|drv| drv.os_pid()) {

@@ -8,10 +8,11 @@
 //! Port of `erts/emulator/drivers/common/inet_drv.c` (`tcp_inet_ctl`,
 //! `tcp_inet_command`, `tcp_message`, `tcp_closed_message`), OTP-29.1.1.
 
+use crate::VmError;
 use crate::port::PortHandle;
 use crate::process::{Message, Runtime};
-use crate::{Process, VmError};
 use arinsal_alloc::typed::ErtsAlcType;
+use arinsal_drv::{ControlReply, DriverPort, NativeDriver};
 use arinsal_packet::{
     HttpPacket, HttpUri, Packet, PacketOptions, PacketResult, PacketState, PacketType,
     parse_with_state,
@@ -21,7 +22,7 @@ use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 // Port of inet_drv.c ERTS_INET_DRV_CONTROL_MAGIC_NUMBER, OTP-29.1.1.
@@ -147,134 +148,111 @@ fn badarg() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
 }
 
-/// Extra `Arc` so `PortHandle`'s scheduler is not the last reference dropped
-/// on a scheduler worker (`Scheduler::drop` joins that worker).
+/// `driver_flags` of `tcp_inet_driver_entry`: `ERL_DRV_FLAG_USE_PORT_LOCKING |
+/// ERL_DRV_FLAG_SOFT_BUSY` (erts/emulator/drivers/common/inet_drv.c).
+const DRIVER_FLAGS: i32 = (1 << 0) | (1 << 1);
+
+/// The linked-in `tcp_inet` driver. A port of it is a port like any other driver's:
+/// process signals run as immediate calls or port tasks, `driver_select` readiness and
+/// the port timer schedule port tasks that a scheduler executes with the port locked.
 ///
-/// The arc is released when the last inet port on that scheduler closes, and
-/// the final drop runs on a helper thread once every other owner is gone.
-struct SchedPin {
-    sched: Arc<arinsal_sched::Scheduler<Process>>,
-    ports: usize,
+/// Port of erts/emulator/drivers/common/inet_drv.c (`tcp_inet_driver_entry`), OTP-29.1.1.
+pub(crate) fn driver() -> Arc<arinsal_drv::Driver> {
+    static DRIVER: OnceLock<Arc<arinsal_drv::Driver>> = OnceLock::new();
+    Arc::clone(
+        DRIVER.get_or_init(|| {
+            arinsal_drv::Driver::native("tcp_inet", DRIVER_FLAGS, Arc::new(TcpInet))
+        }),
+    )
 }
 
-fn pins() -> &'static Mutex<Vec<SchedPin>> {
-    static PINS: OnceLock<Mutex<Vec<SchedPin>>> = OnceLock::new();
-    PINS.get_or_init(|| Mutex::new(Vec::new()))
+/// The callbacks of `tcp_inet_driver_entry`.
+struct TcpInet;
+
+fn sock_of(port: &DriverPort) -> Option<Arc<Sock>> {
+    port.native_data::<Sock>()
 }
 
-fn pin_scheduler(sched: Arc<arinsal_sched::Scheduler<Process>>) {
-    let mut pins = pins().lock().unwrap();
-    let ptr = Arc::as_ptr(&sched);
-    if let Some(pin) = pins.iter_mut().find(|pin| Arc::as_ptr(&pin.sched) == ptr) {
-        pin.ports += 1;
-        return;
+impl NativeDriver for TcpInet {
+    // Port of inet_drv.c (tcp_inet_stop).
+    fn stop(&self, port: &DriverPort) {
+        if let Some(sock) = sock_of(port) {
+            tcp_inet_stop(&sock);
+        }
     }
-    pins.push(SchedPin { sched, ports: 1 });
+
+    // Port of inet_drv.c (tcp_inet_commandv).
+    fn output(&self, port: &DriverPort, data: &[u8]) {
+        if let Some(sock) = sock_of(port) {
+            command(&sock, Pid::from_data(port.caller()), data.to_vec());
+        }
+    }
+
+    // Port of inet_drv.c (tcp_inet_ctl).
+    fn control(&self, port: &DriverPort, op: u32, data: &[u8]) -> Option<ControlReply> {
+        let sock = sock_of(port)?;
+        let reply = control(&sock, Pid::from_data(port.caller()), op, data);
+        Some(ControlReply::List(reply))
+    }
+
+    // Port of inet_drv.c (tcp_inet_input).
+    fn ready_input(&self, port: &DriverPort, _fd: i32) {
+        if let Some(sock) = sock_of(port) {
+            try_io(&sock, false);
+            settle(&sock);
+        }
+    }
+
+    // Port of inet_drv.c (tcp_inet_output).
+    fn ready_output(&self, port: &DriverPort, _fd: i32) {
+        if let Some(sock) = sock_of(port) {
+            try_io(&sock, true);
+            settle(&sock);
+        }
+    }
+
+    // Port of inet_drv.c (tcp_inet_timeout).
+    fn timeout(&self, port: &DriverPort) {
+        if let Some(sock) = sock_of(port) {
+            sock.inner.lock().unwrap().timer_at = None;
+            expire(&sock);
+            settle(&sock);
+        }
+    }
+
+    // Port of inet_drv.c (inet_stop_select): the descriptor closes with its `SockFd`.
+    fn stop_select(&self, _fd: i32) {}
 }
 
-fn unpin_scheduler(sched: &Arc<arinsal_sched::Scheduler<Process>>) {
-    let release = {
-        let mut pins = pins().lock().unwrap();
-        let ptr = Arc::as_ptr(sched);
-        let Some(pin) = pins.iter_mut().find(|pin| Arc::as_ptr(&pin.sched) == ptr) else {
-            return;
-        };
-        pin.ports -= 1;
-        if pin.ports > 0 {
+/// Bring selection, port timer and busy state in line with the socket after a callback.
+fn settle(sock: &Arc<Sock>) {
+    sock_select(sock);
+    arm_timer(sock);
+    sync_busy(sock);
+}
+
+/// `set_busy_port` follows the socket's busy state (inet_drv.c: `tcp_sendv` sets it at
+/// the high watermark, `tcp_inet_output` clears it at the low one).
+fn sync_busy(sock: &Arc<Sock>) {
+    let Some(port) = sock.port() else {
+        return;
+    };
+    let busy = {
+        let mut inner = sock.inner.lock().unwrap();
+        if inner.busy == inner.port_busy {
             return;
         }
-        let index = pins
-            .iter()
-            .position(|pin| Arc::as_ptr(&pin.sched) == ptr)
-            .expect("pin");
-        Some(pins.swap_remove(index).sched)
+        inner.port_busy = inner.busy;
+        inner.busy
     };
-    let Some(sched) = release else {
-        return;
-    };
-    std::thread::Builder::new()
-        .name("arinsal-inet-unpin".into())
-        .spawn(move || {
-            // Drop the last Arc off the worker. A re-pin owns the scheduler again.
-            loop {
-                if pins()
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|pin| Arc::ptr_eq(&pin.sched, &sched))
-                {
-                    return;
-                }
-                if Arc::strong_count(&sched) == 1 {
-                    drop(sched);
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        })
-        .expect("inet unpin");
+    port.set_busy(busy);
 }
 
-/// Port tasks waiting for the inet thread, which runs them for every `tcp_inet`
-/// port: readiness from the poll set (`ready_input`/`ready_output`) and pokes
-/// from control and command calls on a port.
-///
-/// Port of the I/O port task queue of erts/emulator/beam/erl_port_task.c and the
-/// `iready`/`oready` scheduling of erts/emulator/sys/common/erl_check_io.c:1874-1908,
-/// OTP-29.1.1.
-#[derive(Default)]
-struct Tasks {
-    ready: Vec<(Arc<Sock>, RawFd, crate::check_io::Ready)>,
-    poked: Vec<Arc<Sock>>,
-    sockets: Vec<Weak<Sock>>,
-}
-
-fn tasks() -> &'static (Mutex<Tasks>, Condvar) {
-    static TASKS: OnceLock<(Mutex<Tasks>, Condvar)> = OnceLock::new();
-    TASKS.get_or_init(|| {
-        std::thread::Builder::new()
-            .name("arinsal-inet".into())
-            .spawn(io_loop)
-            .expect("inet thread");
-        (Mutex::new(Tasks::default()), Condvar::new())
-    })
-}
-
-/// Ask the inet thread to run port `id` (and recompute its selection).
-fn register_sock(sock: &Arc<Sock>) {
-    let (lock, _) = tasks();
-    let mut tasks = lock.lock().unwrap();
-    tasks.sockets.retain(|entry| entry.strong_count() > 0);
-    tasks.sockets.push(Arc::downgrade(sock));
-}
-
-fn live_socks() -> Vec<Arc<Sock>> {
-    let (lock, _) = tasks();
-    let mut tasks = lock.lock().unwrap();
-    tasks.sockets.retain(|entry| entry.strong_count() > 0);
-    tasks.sockets.iter().filter_map(Weak::upgrade).collect()
-}
-
-fn poke(sock: &Arc<Sock>) {
-    let (lock, wake) = tasks();
-    let mut tasks = lock.lock().unwrap();
-    if !tasks.poked.iter().any(|poked| Arc::ptr_eq(poked, sock)) {
-        tasks.poked.push(Arc::clone(sock));
+/// `driver_exit(port, 0)`: the peer closed an `{exit_on_close, true}` socket.
+fn driver_exit(sock: &Sock) {
+    if let Some(port) = sock.port() {
+        port.driver_exit();
     }
-    wake.notify_one();
-}
-
-fn wake_io_loop() {
-    let (lock, wake) = tasks();
-    let _tasks = lock.lock().unwrap();
-    wake.notify_one();
-}
-
-/// `iready`/`oready`: schedule the port's I/O task on the inet thread.
-fn schedule_ready(sock: Arc<Sock>, fd: RawFd, ready: crate::check_io::Ready) {
-    let (lock, wake) = tasks();
-    lock.lock().unwrap().ready.push((sock, fd, ready));
-    wake.notify_one();
 }
 
 // g_inet_udp
@@ -316,29 +294,29 @@ pub(crate) fn set_nosigpipe(fd: RawFd) {
     }
 }
 
-/// Register a `tcp_inet` port created by `open_port({spawn_driver, …})`.
-pub(crate) fn attach(runtime: Arc<Runtime>, id: u64, handle: Arc<PortHandle>) {
-    let _ = tasks();
-    pin_scheduler(handle.scheduler());
-    let sock = Arc::new(Sock::new(id, &runtime, &handle));
+/// Install the driver state of a `tcp_inet` port (`tcp_inet_start` /
+/// `tcp_inet_copy` for `driver_create_port`).
+pub(crate) fn attach(runtime: &Arc<Runtime>, handle: &Arc<PortHandle>, port: &Arc<DriverPort>) {
+    let sock = Arc::new(Sock::new(handle.id(), runtime, handle, port));
     handle.set_tcp_driver_data(Arc::clone(&sock));
-    register_sock(&sock);
-    poke(&sock);
+    port.start_native(sock);
 }
 
-/// Drop the socket behind a port. Waiters receive `{error, closed}`.
-pub(crate) fn detach(handle: &Arc<PortHandle>) {
-    let Some(sock) = handle.take_tcp_driver_data() else {
-        return;
-    };
+/// Port of erts/emulator/drivers/common/inet_drv.c (tcp_inet_stop and tcp_desc_close),
+/// OTP-29.1.1: the port terminates; waiters receive `{error, closed}`.
+fn tcp_inet_stop(sock: &Arc<Sock>) {
+    if let Some(handle) = sock.handle.upgrade() {
+        handle.take_tcp_driver_data();
+    }
     let id = sock.id;
     // The port closed while owning a dist connection (its controller exited, e.g. through
     // `net_kernel:disconnect/1`): tear the connection down and deliver nodedown.
     // Port of erts/emulator/beam/dist.c (erts_do_net_exits via the dist port's exit), OTP-29.1.1.
-    if crate::node_tables::is_dist_port(id) {
-        let _ = crate::dist::port_connection_closed(&sock.runtime(), id);
+    if crate::node_tables::is_dist_port(id)
+        && let Some(runtime) = sock.runtime.upgrade()
+    {
+        let _ = crate::dist::port_connection_closed(&runtime, id);
     }
-    unpin_scheduler(&sock.handle().scheduler());
     let pending = {
         let mut inner = sock.inner.lock().unwrap();
         // Port of erts/emulator/drivers/common/inet_drv.c:12718-12725 (tcp_inet_flush)
@@ -355,10 +333,10 @@ pub(crate) fn detach(handle: &Arc<PortHandle>) {
         inner.phase = Phase::Closed;
         std::mem::take(&mut inner.pending)
     };
-    send_empty_out_q_msgs(&sock);
+    send_empty_out_q_msgs(sock);
     for (caller, aref) in pending {
         emit(
-            &sock,
+            sock,
             Out::AsyncError {
                 caller,
                 aref,
@@ -366,45 +344,50 @@ pub(crate) fn detach(handle: &Arc<PortHandle>) {
             },
         );
     }
-    poke(&sock);
 }
 
-pub(crate) fn control(
-    process: &mut Process,
-    sock: &Arc<Sock>,
-    caller: Pid,
-    op: i64,
-    data: &[u8],
-) -> Result<Term, VmError> {
+/// Port of erts/emulator/drivers/common/inet_drv.c (tcp_inet_ctl), OTP-29.1.1.
+fn control(sock: &Arc<Sock>, caller: Pid, op: u32, data: &[u8]) -> Vec<u8> {
     // Port of inet_drv.c:11956 (tcp_inet_ctl subtracts the magic), OTP-29.1.1.
-    let cmd = op.wrapping_sub(MAGIC);
-    let (reply, selected) = dispatch(sock, caller, cmd, data);
-    if !selected {
-        poke(sock);
-    }
-    byte_list(process, &reply)
+    let cmd = i64::from(op).wrapping_sub(MAGIC);
+    let reply = dispatch(sock, caller, cmd, data);
+    settle(sock);
+    reply
 }
 
-pub(crate) fn command(sock: &Arc<Sock>, caller: Pid, data: Vec<u8>) -> Result<(), VmError> {
+fn command(sock: &Arc<Sock>, caller: Pid, data: Vec<u8>) {
     // Port of inet_drv.c:13736 (tcp_sendv) and :12629 (tcp_inet_command), OTP-29.1.1.
-    let (ids, payload) = split_caller(&data).ok_or_else(badarg)?;
+    let Some((ids, payload)) = split_caller(&data) else {
+        return;
+    };
     let start = data.len() - payload.len();
     let outcome = {
         let mut inner = sock.inner.lock().unwrap();
         accept_send(&mut inner, caller, ids, SendData::Owned(data, start))
     };
+    finish_command(sock, outcome, Some((caller, ids)));
+}
+
+/// What a send does once `tcp_sendv` decided: reply, or fail the socket.
+fn finish_command(sock: &Arc<Sock>, outcome: SendOutcome, reply: Option<(Pid, [u32; 3])>) {
     match outcome {
-        SendOutcome::Reply(error) => emit(sock, Out::InetReply { caller, ids, error }),
+        SendOutcome::Reply(error) => {
+            if let Some((caller, ids)) = reply {
+                emit(sock, Out::InetReply { caller, ids, error });
+            }
+        }
         SendOutcome::Deferred => {}
         SendOutcome::Failed { error, active } => {
-            emit(
-                sock,
-                Out::InetReply {
-                    caller,
-                    ids,
-                    error: Some(error),
-                },
-            );
+            if let Some((caller, ids)) = reply {
+                emit(
+                    sock,
+                    Out::InetReply {
+                        caller,
+                        ids,
+                        error: Some(error),
+                    },
+                );
+            }
             if active {
                 let owner = sock.handle().owner_pid();
                 if error == "econnreset" {
@@ -418,57 +401,39 @@ pub(crate) fn command(sock: &Arc<Sock>, caller: Pid, data: Vec<u8>) -> Result<()
                 }
                 emit(sock, Out::TcpClosed { owner });
                 if sock.inner.lock().unwrap().exit_on_close {
-                    crate::port::abandon_port(&sock.runtime(), sock.id);
+                    driver_exit(sock);
                 }
             }
             send_empty_out_q_msgs(sock);
         }
     }
     emit_ready(sock);
-    poke(sock);
-    Ok(())
+    settle(sock);
 }
 
-/// Write a raw distribution packet (no caller-ref prefix, no `inet_reply`).
+/// Write a raw distribution packet (no caller-ref prefix, no `inet_reply`) with the port
+/// locked, as the dist command task does.
 ///
 /// Port of dist.c:3794 (`dist_port_command`) calling `tcp_inet_command` with
 /// `prt->caller = NIL`, so `init_caller` skips the ref header, OTP-29.1.1.
 pub(crate) fn dist_output(sock: &Arc<Sock>, data: &[u8]) -> Result<bool, VmError> {
-    let outcome = {
-        let mut inner = sock.inner.lock().unwrap();
-        // Dummy caller/ids: dist never waits on inet_reply for these writes.
-        accept_send(
-            &mut inner,
-            Pid::new(0, 0),
-            [0, 0, 0],
-            SendData::Borrowed(data),
-        )
+    let Some(port) = sock.port() else {
+        return Err(badarg());
     };
-    match outcome {
-        SendOutcome::Reply(_) | SendOutcome::Deferred => {}
-        SendOutcome::Failed { error, active } => {
-            if active {
-                let owner = sock.handle().owner_pid();
-                if error == "econnreset" {
-                    emit(
-                        sock,
-                        Out::TcpError {
-                            owner,
-                            reason: "econnreset",
-                        },
-                    );
-                }
-                emit(sock, Out::TcpClosed { owner });
-                if sock.inner.lock().unwrap().exit_on_close {
-                    crate::port::abandon_port(&sock.runtime(), sock.id);
-                }
-            }
-            send_empty_out_q_msgs(sock);
-        }
-    }
-    emit_ready(sock);
-    poke(sock);
-    Ok(sock.inner.lock().unwrap().busy)
+    port.serialized(|| {
+        let outcome = {
+            let mut inner = sock.inner.lock().unwrap();
+            // Dummy caller/ids: dist never waits on inet_reply for these writes.
+            accept_send(
+                &mut inner,
+                Pid::new(0, 0),
+                [0, 0, 0],
+                SendData::Borrowed(data),
+            )
+        };
+        finish_command(sock, outcome, None);
+        Ok(sock.inner.lock().unwrap().busy)
+    })
 }
 
 enum SendOutcome {
@@ -640,7 +605,7 @@ fn send_or_shutdown_failed(inner: &mut Inner, err: i32) -> SendOutcome {
     }
 }
 
-fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> (Vec<u8>, bool) {
+fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
     let mut accept_now: Option<(OwnedFd, u16)> = None;
     let mut sendfile_end: Option<SendfileEnd> = None;
     let mut setopts_action = SetoptsAction::None;
@@ -735,17 +700,11 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> (Vec<u8>, b
     } else if cmd == TCP_REQ_RECV {
         try_io(sock, false);
         sock_select(sock);
-        if sock
-            .inner
-            .lock()
-            .unwrap()
-            .recv
-            .as_ref()
-            .is_some_and(|recv| recv.deadline.is_some())
-        {
-            wake_io_loop();
-        }
     } else if cmd == REQ_CONNECT {
+        // Port of inet_drv.c:12098-12114 (INET_REQ_CONNECT): `sock_select(FD_CONNECT)` right
+        // after connect() returns EINPROGRESS, so the completion event is reported ahead of
+        // the accept the connection causes on the listening side.
+        sock_select(sock);
         try_io(sock, false);
     }
     let passive = {
@@ -765,7 +724,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> (Vec<u8>, b
             },
         );
     }
-    (reply, cmd == REQ_SETOPTS || cmd == TCP_REQ_RECV)
+    reply
 }
 
 // Port of erts/emulator/drivers/common/inet_drv.c:11067-11100,
@@ -871,7 +830,7 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     // SAFETY: fd was just created and is moved into OwnedFd.
     inner.fd = Some(SockFd::new(
         unsafe { OwnedFd::from_raw_fd(fd) },
-        inner.selection_owner,
+        inner.port.clone(),
     ));
     inner.domain = domain;
     inner.family_code = data[0];
@@ -916,7 +875,7 @@ fn fdopen_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     let connected = rustix::net::getpeername(&fd).is_ok();
     set_nonblock(fd.as_raw_fd());
     set_nosigpipe(fd.as_raw_fd());
-    inner.fd = Some(SockFd::new(fd, inner.selection_owner));
+    inner.fd = Some(SockFd::new(fd, inner.port.clone()));
     inner.fd_external = Some(raw_fd);
     inner.domain = domain;
     inner.family_code = data[0];
@@ -1042,8 +1001,6 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
                 deadline: deadline(timeout),
             });
             inner.pending.push((caller, aref));
-            // Wake the inet thread so it selects FD_CONNECT for this fd.
-            poke(sock);
         }
         return ok_bytes(&aref.to_be_bytes());
     }
@@ -1117,9 +1074,18 @@ fn monitor_acceptor(sock: &Arc<Sock>, caller: Pid) {
 pub(crate) fn acceptor_exited(pid: Pid) {
     let socks = acceptors().lock().unwrap().remove(&pid).unwrap_or_default();
     for sock in socks.iter().filter_map(Weak::upgrade) {
-        let mut inner = sock.inner.lock().unwrap();
-        inner.accept_q.retain(|waiter| waiter.caller != pid);
-        inner.pending.retain(|(caller, _)| *caller != pid);
+        let Some(port) = sock.port() else {
+            continue;
+        };
+        // A port signal: it takes effect between the port's tasks.
+        port.serialized(|| {
+            {
+                let mut inner = sock.inner.lock().unwrap();
+                inner.accept_q.retain(|waiter| waiter.caller != pid);
+                inner.pending.retain(|(caller, _)| *caller != pid);
+            }
+            settle(&sock);
+        });
     }
 }
 
@@ -1163,9 +1129,45 @@ fn try_accept(inner: &Inner) -> Option<Result<OwnedFd, i32>> {
 fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
     let runtime = listen.runtime();
     let name = listen.handle().port_name();
+    let mut fd = Some(fd);
     // Port of erts/emulator/drivers/common/inet_drv.c:11829-11839 (tcp_inet_copy), OTP-29.1.1.
-    let (id, handle) = match crate::port::alloc_inet_port(&runtime, caller, name) {
-        Ok(port) => port,
+    let created = crate::port::alloc_inet_port(&runtime, caller, name, driver(), |handle, port| {
+        let fd = fd.take().expect("accepted descriptor");
+        // Port of inet_drv.c:11795 (tcp_inet_copy), OTP-29.1.1.
+        // `active` is not copied here; prim_inet:accept_opts sets it afterwards.
+        let born = {
+            let inner = listen.inner.lock().unwrap();
+            Inner {
+                fd: Some(SockFd::new(fd, Arc::downgrade(port))),
+                port: Arc::downgrade(port),
+                domain: inner.domain,
+                family_code: inner.family_code,
+                phase: Phase::Connected,
+                binary: inner.binary,
+                htype: inner.htype,
+                header: inner.header,
+                buffer: inner.buffer,
+                buffer_set: inner.buffer_set,
+                deliver: inner.deliver,
+                exit_on_close: inner.exit_on_close,
+                packet_size: inner.packet_size,
+                read_ahead: inner.read_ahead,
+                high: inner.high,
+                low: inner.low,
+                msgq_high: inner.msgq_high,
+                msgq_low: inner.msgq_low,
+                send_timeout: inner.send_timeout,
+                send_timeout_close: inner.send_timeout_close,
+                show_econnreset: inner.show_econnreset,
+                ..Inner::default()
+            }
+        };
+        let sock = Arc::new(Sock::with_inner(handle.id(), &runtime, handle, born));
+        handle.set_tcp_driver_data(Arc::clone(&sock));
+        port.start_native(sock);
+    });
+    let (id, handle, port) = match created {
+        Ok(created) => created,
         Err(crate::port::InetPortAllocError::SystemLimit) => {
             emit(
                 listen,
@@ -1189,47 +1191,6 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
             return;
         }
     };
-    let selection_owner = Arc::as_ptr(&handle) as usize;
-    // Port of inet_drv.c:11795 (tcp_inet_copy), OTP-29.1.1.
-    // `active` is not copied here; prim_inet:accept_opts sets it afterwards.
-    let born = {
-        let inner = listen.inner.lock().unwrap();
-        Inner {
-            fd: Some(SockFd::new(fd, selection_owner)),
-            selection_owner,
-            domain: inner.domain,
-            family_code: inner.family_code,
-            phase: Phase::Connected,
-            binary: inner.binary,
-            htype: inner.htype,
-            header: inner.header,
-            buffer: inner.buffer,
-            buffer_set: inner.buffer_set,
-            deliver: inner.deliver,
-            exit_on_close: inner.exit_on_close,
-            packet_size: inner.packet_size,
-            read_ahead: inner.read_ahead,
-            high: inner.high,
-            low: inner.low,
-            msgq_high: inner.msgq_high,
-            msgq_low: inner.msgq_low,
-            send_timeout: inner.send_timeout,
-            send_timeout_close: inner.send_timeout_close,
-            show_econnreset: inner.show_econnreset,
-            ..Inner::default()
-        }
-    };
-    pin_scheduler(handle.scheduler());
-    let sock = Arc::new(Sock {
-        id,
-        selection_owner,
-        runtime: Arc::downgrade(&runtime),
-        handle: Arc::downgrade(&handle),
-        inner: Mutex::new(born),
-        io: Mutex::new(()),
-    });
-    handle.set_tcp_driver_data(Arc::clone(&sock));
-    register_sock(&sock);
     // Port of inet_drv.c:2514 (send_async_ok_port), OTP-29.1.1.
     emit(
         listen,
@@ -1239,7 +1200,9 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
             port: id,
         },
     );
-    poke(&sock);
+    if let Some(sock) = handle.tcp_driver_data() {
+        port.serialized(|| settle(&sock));
+    }
 }
 
 fn sockname(inner: &Inner) -> Vec<u8> {
@@ -2975,7 +2938,7 @@ fn finish_sendfile(sock: &Arc<Sock>, end: SendfileEnd) {
                 }
                 emit(sock, Out::TcpClosed { owner });
                 if sock.inner.lock().unwrap().exit_on_close {
-                    crate::port::abandon_port(&sock.runtime(), sock.id);
+                    driver_exit(sock);
                 }
             }
             send_empty_out_q_msgs(sock);
@@ -2984,14 +2947,20 @@ fn finish_sendfile(sock: &Arc<Sock>, end: SendfileEnd) {
 }
 
 fn close_atom(inner: &Inner) -> &'static str {
-    if inner.reset { "econnreset" } else { "closed" }
+    if let Some(error) = inner.read_error {
+        error
+    } else if inner.reset {
+        "econnreset"
+    } else {
+        "closed"
+    }
 }
 
 pub(crate) struct Sock {
     id: u64,
-    selection_owner: usize,
     runtime: Weak<Runtime>,
     handle: Weak<PortHandle>,
+    port: Weak<DriverPort>,
     inner: Mutex<Inner>,
     /// Serializes taking packets from the receive buffer with emitting them, which happens
     /// after `inner` is released.
@@ -3008,17 +2977,30 @@ impl Sock {
         self.inner.lock().unwrap().sendq.size()
     }
 
-    fn new(id: u64, runtime: &Arc<Runtime>, handle: &Arc<PortHandle>) -> Self {
-        let selection_owner = Arc::as_ptr(handle) as usize;
+    fn new(
+        id: u64,
+        runtime: &Arc<Runtime>,
+        handle: &Arc<PortHandle>,
+        port: &Arc<DriverPort>,
+    ) -> Self {
+        Self::with_inner(
+            id,
+            runtime,
+            handle,
+            Inner {
+                port: Arc::downgrade(port),
+                ..Inner::default()
+            },
+        )
+    }
+
+    fn with_inner(id: u64, runtime: &Arc<Runtime>, handle: &Arc<PortHandle>, inner: Inner) -> Self {
         Self {
             id,
-            selection_owner,
             runtime: Arc::downgrade(runtime),
             handle: Arc::downgrade(handle),
-            inner: Mutex::new(Inner {
-                selection_owner,
-                ..Inner::default()
-            }),
+            port: inner.port.clone(),
+            inner: Mutex::new(inner),
             io: Mutex::new(()),
         }
     }
@@ -3030,29 +3012,34 @@ impl Sock {
     fn handle(&self) -> Arc<PortHandle> {
         self.handle.upgrade().expect("live inet port handle")
     }
+
+    /// The `DriverPort` this socket is the driver data of.
+    fn port(&self) -> Option<Arc<DriverPort>> {
+        self.port.upgrade()
+    }
 }
 
 /// The socket of a `tcp_inet` port with its poll-set selection.
 ///
 /// Dropping it deselects the descriptor before closing it, as `tcp_desc_close`
 /// does with `sock_select(desc, FD_READ|FD_WRITE|FD_CLOSE|ERL_DRV_USE_NO_CALLBACK, 0)`
-/// (erts/emulator/drivers/common/inet_drv.c:11473), OTP-29.1.1.
+/// (erts/emulator/drivers/common/inet_drv.c:11473), OTP-29.1.1; `inet_stop_select` then
+/// closes the descriptor.
 struct SockFd {
     fd: OwnedFd,
-    owner: usize,
-    /// Events selected in the shared poll set (`state->events` in erl_check_io.c).
-    selected: crate::check_io::InterestSet,
+    port: Weak<DriverPort>,
+    /// Events selected through `driver_select` (`FD_READ`, `FD_WRITE`).
+    readable: bool,
+    writable: bool,
 }
 
 impl SockFd {
-    fn new(fd: OwnedFd, owner: usize) -> Self {
+    fn new(fd: OwnedFd, port: Weak<DriverPort>) -> Self {
         Self {
             fd,
-            owner,
-            selected: crate::check_io::InterestSet {
-                readable: false,
-                writable: false,
-            },
+            port,
+            readable: false,
+            writable: false,
         }
     }
 }
@@ -3065,8 +3052,13 @@ impl AsRawFd for SockFd {
 
 impl Drop for SockFd {
     fn drop(&mut self) {
-        if self.selected.readable || self.selected.writable {
-            crate::check_io::driver_deselect(self.fd.as_raw_fd(), self.owner);
+        if let Some(port) = self.port.upgrade() {
+            use arinsal_drv::{SELECT_READ, SELECT_USE, SELECT_WRITE};
+            port.select(
+                self.fd.as_raw_fd(),
+                SELECT_READ | SELECT_WRITE | SELECT_USE,
+                false,
+            );
         }
     }
 }
@@ -3111,7 +3103,12 @@ struct SendWait {
 struct Inner {
     fd: Option<SockFd>,
     fd_external: Option<RawFd>,
-    selection_owner: usize,
+    /// The `DriverPort` of this socket (`desc->inet.port`).
+    port: Weak<DriverPort>,
+    /// The deadline the port timer is armed for (`driver_set_timer`).
+    timer_at: Option<Instant>,
+    /// `set_busy_port` state last reported to the port.
+    port_busy: bool,
     domain: i32,
     family_code: u8,
     phase: Phase,
@@ -3157,6 +3154,8 @@ struct Inner {
     backlog: i32,
     op_ref: u16,
     rbuf: Vec<u8>,
+    /// A receive failure other than a reset (`tcp_recv_error`), reported at close.
+    read_error: Option<&'static str>,
     rbuf_start: usize,
     // Port of inet_drv.c (`i_buf`, `i_ptr_start`, `i_ptr`, `i_bufsz`), OTP-29.1.1.
     rbuf_end: usize,
@@ -3199,7 +3198,9 @@ impl Default for Inner {
         Self {
             fd: None,
             fd_external: None,
-            selection_owner: 0,
+            port: Weak::new(),
+            timer_at: None,
+            port_busy: false,
             domain: libc::AF_INET,
             family_code: AF_INET_CODE,
             phase: Phase::Closed,
@@ -3243,6 +3244,7 @@ impl Default for Inner {
             backlog: 5,
             op_ref: 0,
             rbuf: Vec::new(),
+            read_error: None,
             rbuf_start: 0,
             rbuf_end: 0,
             sendq: IoQueue::default(),
@@ -3585,13 +3587,6 @@ fn put_u64(out: &mut Vec<u8>, val: u64) {
 }
 
 // g_inet_udp
-pub(crate) fn byte_list(process: &mut Process, bytes: &[u8]) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    TermBuilder::new(&mut heap)
-        .list_from_iter(bytes.iter().map(|b| Term::small(i64::from(*b)).unwrap()))
-        .map_err(|error| VmError::Unsupported(format!("inet control reply: {error:?}")))
-}
-
 // g_inet_udp
 pub(crate) fn split_caller(data: &[u8]) -> Option<([u32; 3], &[u8])> {
     if data.len() < 2 {
@@ -4302,7 +4297,7 @@ fn tcp_inet_output(sock: &Arc<Sock>) {
         }
         emit(sock, Out::TcpClosed { owner });
         if sock.inner.lock().unwrap().exit_on_close {
-            crate::port::abandon_port(&sock.runtime(), sock.id);
+            driver_exit(sock);
         }
     }
     send_empty_out_q_msgs(sock);
@@ -4341,7 +4336,7 @@ fn deliver_pending_close(sock: &Arc<Sock>) {
     }
     emit(sock, Out::TcpClosed { owner });
     if exit_on_close {
-        crate::port::abandon_port(&sock.runtime(), sock.id);
+        driver_exit(sock);
     }
 }
 
@@ -4358,7 +4353,7 @@ fn satisfy(sock: &Arc<Sock>) {
         emit(sock, out);
     }
     if abandon {
-        crate::port::abandon_port(&sock.runtime(), sock.id);
+        driver_exit(sock);
     }
 }
 
@@ -4628,6 +4623,7 @@ fn rbuf_compact(inner: &mut Inner) {
         inner.rbuf.copy_within(inner.rbuf_start..inner.rbuf_end, 0);
         inner.rbuf_start = 0;
         inner.rbuf_end = len;
+        inner.rbuf.truncate(len);
     }
 }
 
@@ -4806,23 +4802,23 @@ fn pull(sock: &Arc<Sock>) -> bool {
             if tcp_input_ready(&inner) {
                 break;
             }
-            // erts allocates the announced packet length without touching it; zero-filling it
-            // here would stall the poller on a bogus 4 GiB header, so a packet is read in
-            // chunks (the result is the same, the read loop just runs again).
-            const MAX_READ_CHUNK: usize = 1 << 20;
-            let read_size = tcp_read_size(&inner).min(MAX_READ_CHUNK);
+            // Port of inet_drv.c (tcp_expand_buffer, tcp_recv): the input buffer grows to the
+            // announced remaining size once and is read in place; the reserved pages stay
+            // untouched until data arrives, so a bogus 4 GiB header costs address space only.
+            let read_size = tcp_read_size(&inner);
             rbuf_compact(&mut inner);
             let read_start = inner.rbuf_end;
-            let read_end = read_start
-                .checked_add(read_size)
-                .expect("TCP receive buffer length overflow");
-            if inner.rbuf.len() < read_end {
-                inner.rbuf.resize(read_end, 0);
+            inner.rbuf.truncate(read_start);
+            if inner.rbuf.try_reserve_exact(read_size).is_err() {
+                // tcp_expand_buffer failing is tcp_recv_error(ENOMEM).
+                inner.read_error = Some("enomem");
+                eof = true;
+                break;
             }
             let read = {
                 let Inner { fd, rbuf, .. } = &mut *inner;
                 let fd = &fd.as_ref().unwrap().fd;
-                rustix::io::read(fd, &mut rbuf[read_start..read_end])
+                rustix::io::read(fd, rustix::buffer::spare_capacity(rbuf))
             };
             match read {
                 Ok(n) if n > 0 => {
@@ -4972,7 +4968,7 @@ fn on_eof(sock: &Arc<Sock>) {
         }
         emit(sock, Out::TcpClosed { owner });
         if exit_on_close {
-            crate::port::abandon_port(&sock.runtime(), sock.id);
+            driver_exit(sock);
         }
     }
 }
@@ -5021,68 +5017,6 @@ fn poll_connect(inner: &mut Inner) -> Option<Out> {
     })
 }
 
-/// The inet thread: run the I/O tasks of `tcp_inet` ports and their timers.
-///
-/// Port of the port-task side of erts/emulator/sys/common/erl_check_io.c, OTP-29.1.1:
-/// the poll set holds a persistent selection per socket (`driver_select`), a
-/// readiness event schedules that port's task (`iready`/`oready`), the task runs
-/// (`tcp_inet_input`/`tcp_inet_output` through `try_io`), and then the fired events
-/// are re-armed (`erts_io_notify_port_task_executed`, :546-640). Only ports with an
-/// event or a poke are touched; idle sockets cost nothing per event.
-fn io_loop() {
-    let (lock, wake) = tasks();
-    loop {
-        // Ports take the task lock (`poke`) while holding their own lock, so the
-        // timers are read before it is taken.
-        let timeout = next_timeout()
-            .map(|timeout| Duration::new(timeout.tv_sec as u64, timeout.tv_nsec as u32));
-        let (ready, poked) = {
-            let mut tasks = lock.lock().unwrap();
-            if tasks.ready.is_empty() && tasks.poked.is_empty() {
-                tasks = match timeout {
-                    Some(timeout) => wake.wait_timeout(tasks, timeout).unwrap().0,
-                    None => wake.wait(tasks).unwrap(),
-                };
-            }
-            (
-                std::mem::take(&mut tasks.ready),
-                std::mem::take(&mut tasks.poked),
-            )
-        };
-        for (sock, fd, event) in ready {
-            let Some(_runtime) = sock.runtime.upgrade() else {
-                continue;
-            };
-            let Some(_handle) = sock.handle.upgrade() else {
-                continue;
-            };
-            try_io(&sock, event.writable || event.error || event.closed);
-            sock_select(&sock);
-            crate::check_io::notify_executed(
-                fd,
-                sock.selection_owner,
-                crate::check_io::InterestSet {
-                    readable: true,
-                    writable: true,
-                },
-            );
-        }
-        for sock in poked {
-            let Some(_runtime) = sock.runtime.upgrade() else {
-                continue;
-            };
-            let Some(_handle) = sock.handle.upgrade() else {
-                continue;
-            };
-            try_io(&sock, false);
-            sock_select(&sock);
-        }
-        for sock in fire_timeouts() {
-            sock_select(&sock);
-        }
-    }
-}
-
 /// Bring the poll-set selection of `sock` in line with its state.
 ///
 /// Port of the `sock_select` calls of erts/emulator/drivers/common/inet_drv.c,
@@ -5091,6 +5025,10 @@ fn io_loop() {
 /// (:12126, :12317, :13110), FD_WRITE while the output queue is non-empty
 /// (:13844, :14303).
 fn sock_select(sock: &Arc<Sock>) {
+    use arinsal_drv::{SELECT_READ, SELECT_USE, SELECT_WRITE};
+    let Some(port) = sock.port() else {
+        return;
+    };
     let mut inner = sock.inner.lock().unwrap();
     let readable = match inner.phase {
         Phase::Listening => !inner.accept_q.is_empty(),
@@ -5105,152 +5043,157 @@ fn sock_select(sock: &Arc<Sock>) {
     let Some(fd) = inner.fd.as_mut() else {
         return;
     };
-    let want = crate::check_io::InterestSet { readable, writable };
-    if want.readable == fd.selected.readable && want.writable == fd.selected.writable {
-        return;
-    }
     let raw = fd.as_raw_fd();
-    let weak = Arc::downgrade(sock);
-    let ready: crate::check_io::SelectCallback = Arc::new(move |fd, event| {
-        if let Some(sock) = weak.upgrade() {
-            schedule_ready(sock, fd, event);
-        }
-    });
-    if crate::check_io::driver_select(raw, sock.selection_owner, want, ready).is_ok() {
-        fd.selected = want;
+    // Port of inet_drv.c (inet_driver_select): `ERL_DRV_USE` only when turning events on.
+    if readable != fd.readable {
+        let mode = if readable {
+            SELECT_READ | SELECT_USE
+        } else {
+            SELECT_READ
+        };
+        port.select(raw, mode, readable);
+        fd.readable = readable;
+    }
+    if writable != fd.writable {
+        let mode = if writable {
+            SELECT_WRITE | SELECT_USE
+        } else {
+            SELECT_WRITE
+        };
+        port.select(raw, mode, writable);
+        fd.writable = writable;
     }
 }
 
-fn next_timeout() -> Option<libc::timespec> {
-    let socks = live_socks();
-    let mut soon: Option<Instant> = None;
-    for sock in socks {
-        let inner = sock.inner.lock().unwrap();
-        for waiter in inner.accept_q.iter().chain(inner.connect.iter()) {
-            if let Some(deadline) = waiter.deadline {
-                soon = Some(soon.map_or(deadline, |cur| cur.min(deadline)));
-            }
-        }
-        if let Some(recv) = inner.recv.as_ref()
-            && let Some(deadline) = recv.deadline
-        {
-            soon = Some(soon.map_or(deadline, |cur| cur.min(deadline)));
-        }
-        for wait in &inner.send_waits {
-            if let Some(deadline) = wait.deadline {
-                soon = Some(soon.map_or(deadline, |cur| cur.min(deadline)));
-            }
-        }
-    }
-    let deadline = soon?;
-    let dur = deadline.saturating_duration_since(Instant::now());
-    Some(libc::timespec {
-        tv_sec: dur.as_secs() as libc::time_t,
-        tv_nsec: dur.subsec_nanos() as libc::c_long,
-    })
+/// The nearest accept, connect, receive or send deadline.
+fn next_deadline(inner: &Inner) -> Option<Instant> {
+    let waiters = inner
+        .accept_q
+        .iter()
+        .chain(inner.connect.iter())
+        .filter_map(|waiter| waiter.deadline);
+    let recv = inner.recv.as_ref().and_then(|recv| recv.deadline);
+    let sends = inner.send_waits.iter().filter_map(|wait| wait.deadline);
+    waiters.chain(recv).chain(sends).min()
 }
 
-/// Expire receive, accept, connect and send timers; returns the ports it changed.
-fn fire_timeouts() -> Vec<Arc<Sock>> {
-    let socks = live_socks();
+/// Keep the port timer at the nearest deadline.
+///
+/// Port of the `driver_set_timer`/`driver_cancel_timer` calls of
+/// erts/emulator/drivers/common/inet_drv.c, OTP-29.1.1: the timer expires as a port
+/// timeout task (`tcp_inet_timeout`) that a scheduler executes.
+fn arm_timer(sock: &Arc<Sock>) {
+    let Some(port) = sock.port() else {
+        return;
+    };
+    let next = {
+        let mut inner = sock.inner.lock().unwrap();
+        let next = next_deadline(&inner);
+        if next == inner.timer_at {
+            return;
+        }
+        inner.timer_at = next;
+        next
+    };
+    match next {
+        Some(at) => {
+            let left = at.saturating_duration_since(Instant::now());
+            // Round up so the callback never runs before the deadline.
+            let millis = left.as_millis() + u128::from(left.subsec_nanos() % 1_000_000 != 0);
+            port.set_timer(i64::try_from(millis).unwrap_or(i64::MAX));
+        }
+        None => port.cancel_timer(),
+    }
+}
+
+/// Expire receive, accept, connect and send timers of `sock`.
+///
+/// Port of erts/emulator/drivers/common/inet_drv.c (tcp_inet_timeout), OTP-29.1.1.
+fn expire(sock: &Arc<Sock>) {
     let now = Instant::now();
-    let mut fired = Vec::new();
-    for sock in socks {
-        let Some(_runtime) = sock.runtime.upgrade() else {
-            continue;
-        };
-        let Some(_handle) = sock.handle.upgrade() else {
-            continue;
-        };
-        let (due, sends, close) = {
-            let mut inner = sock.inner.lock().unwrap();
-            let mut due = Vec::new();
-            let mut keep = VecDeque::new();
-            while let Some(waiter) = inner.accept_q.pop_front() {
-                if waiter.deadline.is_some_and(|at| at <= now) {
-                    drop_pending(&mut inner, waiter.caller, waiter.aref);
-                    due.push((waiter.caller, waiter.aref));
-                } else {
-                    keep.push_back(waiter);
-                }
-            }
-            inner.accept_q = keep;
-            if let Some(recv) = inner.recv.as_ref()
-                && recv.deadline.is_some_and(|at| at <= now)
-            {
-                let recv = inner.recv.take().unwrap();
-                drop_pending(&mut inner, recv.caller, recv.aref);
-                due.push((recv.caller, recv.aref));
-            }
-            if let Some(waiter) = inner.connect.as_ref()
-                && waiter.deadline.is_some_and(|at| at <= now)
-            {
-                // Port of inet_drv.c:12569-12573 (tcp_inet_timeout): a connect
-                // timer closes the socket, then replies `{error, timeout}`.
-                let waiter = inner.connect.take().unwrap();
+    let (due, sends, close) = {
+        let mut inner = sock.inner.lock().unwrap();
+        let mut due = Vec::new();
+        let mut keep = VecDeque::new();
+        while let Some(waiter) = inner.accept_q.pop_front() {
+            if waiter.deadline.is_some_and(|at| at <= now) {
                 drop_pending(&mut inner, waiter.caller, waiter.aref);
-                inner.fd.take();
-                inner.phase = Phase::Closed;
                 due.push((waiter.caller, waiter.aref));
-            }
-            let mut sends = Vec::new();
-            inner.send_waits.retain(|wait| {
-                if wait.deadline.is_some_and(|at| at <= now) {
-                    sends.push((wait.caller, wait.ids));
-                    false
-                } else {
-                    true
-                }
-            });
-            if !sends.is_empty() {
-                inner.busy = false;
-            }
-            let close = if !sends.is_empty() && inner.send_timeout_close {
-                inner.fd.take();
-                inner.peer_closed = true;
-                let owner = sock.handle().owner_pid();
-                let active = active_is(&inner.active) && !inner.closed_sent;
-                if active {
-                    inner.closed_sent = true;
-                }
-                Some((owner, active, inner.exit_on_close))
             } else {
-                None
-            };
-            (due, sends, close)
-        };
-        let changed = !due.is_empty() || !sends.is_empty();
-        for (caller, aref) in due {
-            emit(
-                &sock,
-                Out::AsyncError {
-                    caller,
-                    aref,
-                    reason: "timeout",
-                },
-            );
-        }
-        for (caller, ids) in sends {
-            emit(
-                &sock,
-                Out::InetReply {
-                    caller,
-                    ids,
-                    error: Some("timeout"),
-                },
-            );
-        }
-        if let Some((owner, active, exit_on_close)) = close
-            && active
-        {
-            emit(&sock, Out::TcpClosed { owner });
-            if exit_on_close {
-                crate::port::abandon_port(&sock.runtime(), sock.id);
+                keep.push_back(waiter);
             }
         }
-        if changed {
-            fired.push(sock);
+        inner.accept_q = keep;
+        if let Some(recv) = inner.recv.as_ref()
+            && recv.deadline.is_some_and(|at| at <= now)
+        {
+            let recv = inner.recv.take().unwrap();
+            drop_pending(&mut inner, recv.caller, recv.aref);
+            due.push((recv.caller, recv.aref));
+        }
+        if let Some(waiter) = inner.connect.as_ref()
+            && waiter.deadline.is_some_and(|at| at <= now)
+        {
+            // Port of inet_drv.c:12569-12573 (tcp_inet_timeout): a connect
+            // timer closes the socket, then replies `{error, timeout}`.
+            let waiter = inner.connect.take().unwrap();
+            drop_pending(&mut inner, waiter.caller, waiter.aref);
+            inner.fd.take();
+            inner.phase = Phase::Closed;
+            due.push((waiter.caller, waiter.aref));
+        }
+        let mut sends = Vec::new();
+        inner.send_waits.retain(|wait| {
+            if wait.deadline.is_some_and(|at| at <= now) {
+                sends.push((wait.caller, wait.ids));
+                false
+            } else {
+                true
+            }
+        });
+        if !sends.is_empty() {
+            inner.busy = false;
+        }
+        let close = if !sends.is_empty() && inner.send_timeout_close {
+            inner.fd.take();
+            inner.peer_closed = true;
+            let owner = sock.handle().owner_pid();
+            let active = active_is(&inner.active) && !inner.closed_sent;
+            if active {
+                inner.closed_sent = true;
+            }
+            Some((owner, active, inner.exit_on_close))
+        } else {
+            None
+        };
+        (due, sends, close)
+    };
+    for (caller, aref) in due {
+        emit(
+            sock,
+            Out::AsyncError {
+                caller,
+                aref,
+                reason: "timeout",
+            },
+        );
+    }
+    for (caller, ids) in sends {
+        emit(
+            sock,
+            Out::InetReply {
+                caller,
+                ids,
+                error: Some("timeout"),
+            },
+        );
+    }
+    if let Some((owner, active, exit_on_close)) = close
+        && active
+    {
+        emit(sock, Out::TcpClosed { owner });
+        if exit_on_close {
+            driver_exit(sock);
         }
     }
-    fired
 }
