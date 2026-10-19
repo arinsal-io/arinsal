@@ -39,8 +39,9 @@ pub use bits::{
     writable_gc_visit,
 };
 pub use copy::{
-    SharedCopyCache, copy_shared, copy_struct, copy_struct_litopt, copy_term, copy_term_litopt,
-    copy_term_preserving_sharing, copy_term_preserving_sharing_with_cache,
+    SharedCopyCache, copy_shallow, copy_shared, copy_struct, copy_struct_litopt, copy_term,
+    copy_term_litopt, copy_term_preserving_sharing, copy_term_preserving_sharing_with_cache,
+    shallow_copyable,
 };
 pub use fun::{
     ERTS_ADDRESSV_SIZE, ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX, EXPORT_INFO_OFFSET,
