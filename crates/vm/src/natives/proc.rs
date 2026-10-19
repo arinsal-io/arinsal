@@ -1266,18 +1266,15 @@ fn charlist(process: &mut Process, value: &str) -> Result<Term, VmError> {
 
 /// `#Ref<0.ids reversed>`. OTP's first number is the distribution channel.
 /// This node has no distribution table, so every ref prints channel 0, which
-/// is what `make_ref/0` produces. A magic ref's sentinel third id is omitted.
+/// is what `make_ref/0` produces. OTP prints all three identity words for magic refs too.
 fn ref_to_list(term: Term) -> Result<String, VmError> {
     let Some(Identity::Ref { ids, .. }) = term.identity() else {
         return Err(badarg());
     };
     // Port of erts/emulator/beam/bif.c (ref_to_list_1), OTP-29.1.1.
     term.save_magic_ref();
-    let magic = term.is_magic_ref();
-    let mut numbers: Vec<u32> = ids;
-    if magic && numbers.last() == Some(&u32::MAX) {
-        numbers.pop();
-    }
+    // Port of erts/emulator/beam/erl_printf_term.c (REF_DEF), OTP-29.1.1.
+    let numbers = ids;
     let mut text = String::from("#Ref<0");
     for id in numbers.iter().rev() {
         text.push('.');
