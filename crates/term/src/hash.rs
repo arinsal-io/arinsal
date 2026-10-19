@@ -1,6 +1,7 @@
 //! Stable external `phash2` hashing for implemented term kinds.
 use crate::{FLOAT, NEG_BIG, POS_BIG, Term, TermKind, global_atoms};
 const H: u32 = 0x9e37_79b9;
+type BinaryResume = (usize, (u32, u32, u32), Option<Vec<u8>>);
 
 // Port of erts/emulator/beam/erl_term_hashing.c:426 (MIX), OTP-29.1.1.
 #[inline]
@@ -76,12 +77,17 @@ enum Job {
         term: Term,
         processed: usize,
         state: (u32, u32, u32),
+        buffer: Option<Vec<u8>>,
     },
 }
 
 /// Bytes of a binary hashed per iteration.
 // Port of `BLOCK_HASH_BYTES_PER_ITER` in erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
 const BLOCK_HASH_BYTES_PER_ITER: usize = 12;
+
+/// Bytes copied while trapping on a bit-offset binary.
+// Port of `BINARY_BUF_SIZE` in erts/emulator/beam/erl_term_hashing.c, OTP-29.1.1.
+const BINARY_BUFFER_SIZE: usize = BLOCK_HASH_BYTES_PER_ITER * 256;
 
 /// Iterations `phash2` runs per reduction left.
 // Port of `ITERATIONS_PER_RED` in `make_hash2_helper`, erts/emulator/beam/erl_term_hashing.c,
@@ -160,17 +166,50 @@ fn simple_hash(term: Term) -> Option<u32> {
     None
 }
 
-fn aligned_binary<'a>(view: &'a crate::BinaryRef<'_>, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+fn aligned_binary<'a>(
+    view: &'a crate::BinaryRef<'_>,
+    size: usize,
+    bitsize: usize,
+    scratch: &'a mut Vec<u8>,
+) -> &'a [u8] {
+    let needed = size + usize::from(bitsize != 0);
     if view.start_bit().is_multiple_of(8) {
-        &view.bytes()[view.start_bit() / 8..view.start_bit() / 8 + view.bit_len().div_ceil(8)]
+        let start = view.start_bit() / 8;
+        &view.bytes()[start..start + needed]
     } else {
-        scratch.resize(view.bit_len().div_ceil(8), 0);
-        for i in 0..view.bit_len() {
-            let bit =
-                (view.bytes()[(view.start_bit() + i) / 8] >> (7 - (view.start_bit() + i) % 8)) & 1;
-            scratch[i / 8] |= bit << (7 - i % 8);
-        }
+        scratch.resize(needed, 0);
+        copy_bit_range(view.bytes(), view.start_bit(), scratch, size * 8 + bitsize);
         scratch
+    }
+}
+
+/// Copies a forward bit range to a zero-offset buffer, matching `erts_copy_bits_fwd`.
+// Port of erts_copy_bits_fwd used by make_hash2_helper, OTP-29.1.1.
+fn copy_bit_range(source: &[u8], start_bit: usize, destination: &mut [u8], bit_len: usize) {
+    destination.fill(0);
+    let source_byte = start_bit / 8;
+    let bit_offset = start_bit % 8;
+    let whole_bytes = bit_len / 8;
+    if bit_offset == 0 {
+        destination[..whole_bytes].copy_from_slice(&source[source_byte..source_byte + whole_bytes]);
+    } else {
+        for (index, byte) in destination[..whole_bytes].iter_mut().enumerate() {
+            let current = source[source_byte + index];
+            let next = source.get(source_byte + index + 1).copied().unwrap_or(0);
+            *byte = (current << bit_offset) | (next >> (8 - bit_offset));
+        }
+    }
+    let tail_bits = bit_len % 8;
+    if tail_bits > 0 {
+        let bit = start_bit + whole_bytes * 8;
+        let first = source[bit / 8];
+        let value = if bit.is_multiple_of(8) {
+            first
+        } else {
+            let next = source.get(bit / 8 + 1).copied().unwrap_or(0);
+            (first << (bit % 8)) | (next >> (8 - bit % 8))
+        };
+        destination[whole_bytes] = value & (u8::MAX << (8 - tail_bits));
     }
 }
 
@@ -260,12 +299,13 @@ impl Hash2Run {
                     term,
                     processed,
                     state,
+                    buffer,
                 } => {
                     if Self::binary(
                         hash,
                         stack,
                         term,
-                        Some((processed, state)),
+                        Some((processed, state, buffer)),
                         &mut left,
                         can_trap,
                     ) {
@@ -493,47 +533,116 @@ impl Hash2Run {
         hash: &mut u32,
         stack: &mut smallvec::SmallVec<[Job; 16]>,
         term: Term,
-        resumed: Option<(usize, (u32, u32, u32))>,
+        resumed: Option<BinaryResume>,
         left: &mut i64,
         can_trap: bool,
     ) -> bool {
         // SAFETY: source heap and binary backing remain live.
         let view = unsafe { term.binary_ref().unwrap() };
-        let mut scratch = Vec::new();
-        let data = aligned_binary(&view, &mut scratch);
         let bit_len = view.bit_len();
         let size = (bit_len / 8) & 0xFFFF_FFFF;
         let bitsize = bit_len % 8;
         let iters_for_bin = ((size / BLOCK_HASH_BYTES_PER_ITER) as i64).max(1);
         let con = H.wrapping_mul(13).wrapping_add(*hash);
-        let (mut processed, mut state) = match resumed {
-            Some(saved) => saved,
-            None => {
-                if size == 0 && bitsize == 0 {
-                    *hash = con;
-                    return false;
-                }
-                if !can_trap || *left - iters_for_bin > 0 {
-                    if can_trap {
-                        *left -= iters_for_bin;
+
+        if size == 0 && bitsize == 0 {
+            *hash = con;
+            return false;
+        }
+
+        if view.start_bit().is_multiple_of(8) {
+            let mut scratch = Vec::new();
+            let data = aligned_binary(&view, size, bitsize, &mut scratch);
+            let (mut processed, mut state) = match resumed {
+                Some((processed, state, None)) => (processed, state),
+                Some((_, _, Some(_))) => unreachable!("aligned binary has no copy buffer"),
+                None => {
+                    if !can_trap || *left - iters_for_bin > 0 {
+                        if can_trap {
+                            *left -= iters_for_bin;
+                        }
+                        *hash = block_hash(&data[..size], con);
+                        Self::binary_tail(hash, data, size, bitsize);
+                        return false;
                     }
-                    *hash = block_hash(&data[..size], con);
-                    Self::binary_tail(hash, data, size, bitsize);
-                    return false;
+                    (0, (H, H, con))
                 }
-                (0, (H, H, con))
-            }
-        };
-        loop {
-            let max_bytes = if *left <= 0 {
-                BLOCK_HASH_BYTES_PER_ITER
-            } else {
-                (*left as usize).saturating_mul(BLOCK_HASH_BYTES_PER_ITER)
             };
+            loop {
+                let max_bytes = if *left <= 0 {
+                    BLOCK_HASH_BYTES_PER_ITER
+                } else {
+                    (*left as usize).saturating_mul(BLOCK_HASH_BYTES_PER_ITER)
+                };
+                let bytes_left = size - processed;
+                let even_left = bytes_left - bytes_left % BLOCK_HASH_BYTES_PER_ITER;
+                let to_process = max_bytes.min(even_left);
+                block_hash_buffer(&mut state, &data[processed..processed + to_process]);
+                processed += to_process;
+                *left -= ((to_process / BLOCK_HASH_BYTES_PER_ITER) as i64).max(1);
+                if *left <= 0 {
+                    stack.push(Job::Binary {
+                        term,
+                        processed,
+                        state,
+                        buffer: None,
+                    });
+                    return true;
+                }
+                if size - processed < BLOCK_HASH_BYTES_PER_ITER {
+                    break;
+                }
+            }
+            *hash = block_hash_final_bytes(state, &data[processed..size], size);
+            Self::binary_tail(hash, data, size, bitsize);
+            return false;
+        }
+
+        if resumed.is_none() && (!can_trap || *left - iters_for_bin > 0) {
+            let mut scratch = Vec::new();
+            let data = aligned_binary(&view, size, bitsize, &mut scratch);
+            if can_trap {
+                *left -= iters_for_bin;
+            }
+            *hash = block_hash(&data[..size], con);
+            Self::binary_tail(hash, data, size, bitsize);
+            return false;
+        }
+
+        let was_resumed = resumed.is_some();
+        let (mut processed, mut state, saved_buffer) = resumed.unwrap_or_else(|| {
+            (
+                0,
+                (H, H, con),
+                Some(vec![
+                    0;
+                    (size + usize::from(bitsize != 0))
+                        .min(BINARY_BUFFER_SIZE)
+                ]),
+            )
+        });
+        let mut buffer = saved_buffer
+            .unwrap_or_else(|| vec![0; (size + usize::from(bitsize != 0)).min(BINARY_BUFFER_SIZE)]);
+        let nr_bits = size * 8 + bitsize;
+        // Port of the bit-offset branch of make_hash2_helper, including its fixed-size
+        // copy buffer, so a trap resumes from the next source window instead of copying
+        // the full sub-binary again.
+        loop {
+            if was_resumed && size - processed < BLOCK_HASH_BYTES_PER_ITER {
+                break;
+            }
             let bytes_left = size - processed;
             let even_left = bytes_left - bytes_left % BLOCK_HASH_BYTES_PER_ITER;
-            let to_process = max_bytes.min(even_left);
-            block_hash_buffer(&mut state, &data[processed..processed + to_process]);
+            let to_process = BINARY_BUFFER_SIZE.min(even_left);
+            let bits_left = nr_bits - processed * 8;
+            let bits_to_copy = bits_left.min(BINARY_BUFFER_SIZE * 8);
+            copy_bit_range(
+                view.bytes(),
+                view.start_bit() + processed * 8,
+                &mut buffer,
+                bits_to_copy,
+            );
+            block_hash_buffer(&mut state, &buffer[..to_process]);
             processed += to_process;
             *left -= ((to_process / BLOCK_HASH_BYTES_PER_ITER) as i64).max(1);
             if *left <= 0 {
@@ -541,6 +650,7 @@ impl Hash2Run {
                     term,
                     processed,
                     state,
+                    buffer: Some(buffer),
                 });
                 return true;
             }
@@ -548,20 +658,36 @@ impl Hash2Run {
                 break;
             }
         }
-        *hash = block_hash_final_bytes(state, &data[processed..size], size);
-        Self::binary_tail(hash, data, size, bitsize);
+
+        let nr_bytes = size + usize::from(bitsize != 0);
+        let last_buffer_start = ((nr_bytes - 1) / BINARY_BUFFER_SIZE) * BINARY_BUFFER_SIZE;
+        let buffer_offset = processed - last_buffer_start;
+        let remaining = size - processed;
+        *hash = block_hash_final_bytes(
+            state,
+            &buffer[buffer_offset..buffer_offset + remaining],
+            size,
+        );
+        if bitsize > 0 {
+            let last_byte_index = nr_bytes - last_buffer_start - 1;
+            Self::binary_tail_byte(hash, buffer[last_byte_index], bitsize);
+        }
         false
     }
 
     fn binary_tail(hash: &mut u32, data: &[u8], size: usize, bitsize: usize) {
         if bitsize > 0 {
-            combine(
-                hash,
-                bitsize as u32,
-                (data[size] >> (8 - bitsize)) as u32,
-                H.wrapping_mul(15),
-            );
+            Self::binary_tail_byte(hash, data[size], bitsize);
         }
+    }
+
+    fn binary_tail_byte(hash: &mut u32, byte: u8, bitsize: usize) {
+        combine(
+            hash,
+            bitsize as u32,
+            (byte >> (8 - bitsize)) as u32,
+            H.wrapping_mul(15),
+        );
     }
 }
 

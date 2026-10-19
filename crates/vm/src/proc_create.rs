@@ -927,6 +927,7 @@ pub(crate) enum OriginMonitor {
     Port {
         port_id: Option<u64>,
         alias_mode: Option<AliasMode>,
+        object: arinsal_etf::OwnedTerm,
     },
     Alias {
         mode: AliasMode,

@@ -7236,9 +7236,10 @@ impl Process {
         if !active {
             return Ok(());
         }
-        let half = match entry {
-            Some(crate::proc_create::OriginMonitor::Process(half)) => Some(half),
-            _ => None,
+        let (half, port_object) = match entry {
+            Some(crate::proc_create::OriginMonitor::Process(half)) => (Some(half), None),
+            Some(crate::proc_create::OriginMonitor::Port { object, .. }) => (None, Some(object)),
+            _ => (None, None),
         };
         let tag = if let Some(owned) = half.as_ref().and_then(|half| half.data.tag.as_ref()) {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
@@ -7249,17 +7250,23 @@ impl Process {
         };
         let name = half.as_ref().and_then(|half| half.data.name.clone());
         let reference = crate::signals::reference(self, reference)?;
-        let from = crate::dist::remote_pid_term(self, from)?
-            .or_else(|| from.to_term())
-            .ok_or_else(|| VmError::Unsupported("invalid monitor sender pid".into()))?;
-        let from = crate::signals::monitor_object(self, name.as_deref(), from)?;
-        let tuple = self.tuple(&[
-            tag,
-            reference,
-            crate::signals::atom("process"),
-            from,
-            reason,
-        ])?;
+        let (from_type, from) = if let Some(object) = port_object {
+            // Port of erts/emulator/beam/erl_proc_sig_queue.c:4838-5056
+            // (convert_to_down_message), OTP-29.1.1.
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
+            let object = arinsal_term::from_owned(&object, &mut heap)
+                .map_err(|error| VmError::Unsupported(format!("port monitor object: {error:?}")))?;
+            (crate::signals::atom("port"), object)
+        } else {
+            let from = crate::dist::remote_pid_term(self, from)?
+                .or_else(|| from.to_term())
+                .ok_or_else(|| VmError::Unsupported("invalid monitor sender pid".into()))?;
+            (
+                crate::signals::atom("process"),
+                crate::signals::monitor_object(self, name.as_deref(), from)?,
+            )
+        };
+        let tuple = self.tuple(&[tag, reference, from_type, from, reason])?;
         if priority {
             self.push_priority_message(tuple)?;
         } else {

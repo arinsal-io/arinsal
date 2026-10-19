@@ -1019,6 +1019,22 @@ impl Vm {
         tail: bool,
         ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<ImportOutcome, VmError> {
+        // Port of erts/emulator/beam/beam_common.c:1294-1345
+        // (`call_error_handler`), OTP-29.1.1. Resolve the handler before changing X registers:
+        // with no handler, the undef stack frame must retain the original call arguments.
+        // `process_flag(error_handler, Module)` also disables autoload for that module.
+        let handler = error_handler_module(p);
+        let ready = self.code.loaded.get(&handler).is_some_and(|id| {
+            self.code.modules[*id]
+                .export("undefined_function", 3)
+                .is_some()
+        });
+        if !ready {
+            return Err(VmError::Exception {
+                reason: "undef".into(),
+                frame: format!("{module}:{function}/{arity}"),
+            });
+        }
         p.ensure(arity.saturating_mul(2).saturating_add(8), arity)?;
         let args: Vec<Term> = p.x[..arity].to_vec();
         let list = TermBuilder::new(&mut p.heap)
@@ -1033,24 +1049,6 @@ impl Vm {
         p.x[0] = Term::atom(module_atom);
         p.x[1] = Term::atom(function_atom);
         p.x[2] = list;
-        // `process_flag(error_handler, Module)` replaces the module the
-        // emulator calls. Elixir's compiler sets `Kernel.ErrorHandler`, which
-        // waits on `Kernel.ParallelCompiler` before the default handler runs.
-        // An unloaded handler raises `undef` for the original call; OTP does
-        // not autoload the handler. Port of erts/emulator/beam/beam_common.c
-        // (`call_error_handler`), OTP-29.1.1.
-        let handler = error_handler_module(p);
-        let ready = self.code.loaded.get(&handler).is_some_and(|id| {
-            self.code.modules[*id]
-                .export("undefined_function", 3)
-                .is_some()
-        });
-        if !ready {
-            return Err(VmError::Exception {
-                reason: "undef".into(),
-                frame: format!("{module}:{function}/{arity}"),
-            });
-        }
         self.call_named(p, &handler, "undefined_function", 3, tail, ctx)
     }
 

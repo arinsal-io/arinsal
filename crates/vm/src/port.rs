@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -514,13 +514,28 @@ fn append_binary(term: Term, out: &mut Vec<u8>) -> Option<()> {
     arinsal_bifs::copy_binary_range(term, 0, &mut out[start..]).ok()
 }
 fn string_bytes(t: Term) -> Option<Vec<u8>> {
-    // `args` entries are strings or binaries; a byte integer is not a string.
-    // Port of erts/emulator/beam/erl_bif_port.c (open_port args validation), OTP-29.1.1.
-    if t.as_small().is_some() {
-        None
-    } else {
-        bytes(t)
+    filename_bytes(t, true, true)
+}
+// Port of erts/emulator/beam/erl_unicode.c (erts_convert_filename_to_native), OTP-29.1.1.
+fn filename_bytes(t: Term, allow_empty: bool, allow_atom: bool) -> Option<Vec<u8>> {
+    if allow_atom && let Some(atom) = t.as_atom() {
+        return Some(global_atoms().text(atom)?.as_bytes().to_vec());
     }
+    if t.classify() == TermKind::Bitstring {
+        let mut out = Vec::new();
+        append_binary(t, &mut out)?;
+        return Some(out);
+    }
+    let characters = list(t)?;
+    if characters.is_empty() && !allow_empty {
+        return None;
+    }
+    let mut out = String::new();
+    for character in characters {
+        let codepoint = u32::try_from(character.as_small()?).ok()?;
+        out.push(char::from_u32(codepoint)?);
+    }
+    Some(out.into_bytes())
 }
 fn iodata(t: Term) -> Option<Vec<u8>> {
     fn append(mut term: Term, mut tail: bool, out: &mut Vec<u8>) -> Option<()> {
@@ -654,9 +669,9 @@ fn options(t: Term) -> Option<PortOptions> {
                     .map(string_bytes)
                     .collect::<Option<Vec<_>>>()?;
             } else if pair.len() == 2 && pair[0] == atom("arg0") {
-                opts.arg0 = Some(bytes(pair[1])?);
+                opts.arg0 = Some(filename_bytes(pair[1], true, true)?);
             } else if pair.len() == 2 && pair[0] == atom("cd") {
-                opts.cwd = Some(bytes(pair[1])?);
+                opts.cwd = Some(filename_bytes(pair[1], false, true)?);
             } else if pair.len() == 2 && pair[0] == atom("env") {
                 opts.env.clear();
                 for entry in list(pair[1])? {
@@ -1021,16 +1036,15 @@ fn start(
     }
     let (name, executable, child_program, child_args) = match spec.as_slice() {
         [kind, path] if *kind == atom("spawn_executable") => {
-            let path = bytes(*path).ok_or_else(badarg)?;
-            let name = String::from_utf8(path).map_err(|_| badarg())?;
-            let args = args
-                .into_iter()
-                .map(|arg| String::from_utf8(arg).map(Into::into).map_err(|_| badarg()))
-                .collect::<Result<Vec<OsString>, _>>()?;
-            let executable_path = if name.contains('/') {
-                OsString::from(&name)
+            let path = filename_bytes(*path, false, true).ok_or_else(badarg)?;
+            let name = String::from_utf8_lossy(&path).into_owned();
+            let args = args.into_iter().map(OsString::from_vec).collect::<Vec<_>>();
+            let executable_path = if path.contains(&b'/') {
+                OsString::from_vec(path)
             } else {
-                OsString::from(format!("./{name}"))
+                let mut relative = b"./".to_vec();
+                relative.extend_from_slice(&path);
+                OsString::from_vec(relative)
             };
             (name, true, executable_path, args)
         }
@@ -1047,22 +1061,11 @@ fn start(
         _ => return Err(badarg()),
     };
     let child_arg0 = if executable {
-        arg0.map(|arg0| {
-            String::from_utf8(arg0)
-                .map(OsString::from)
-                .map_err(|_| badarg())
-        })
-        .transpose()?
+        arg0.map(OsString::from_vec)
     } else {
         None
     };
-    let child_cwd = cwd
-        .map(|cwd| {
-            String::from_utf8(cwd)
-                .map(OsString::from)
-                .map_err(|_| badarg())
-        })
-        .transpose()?;
+    let child_cwd = cwd.map(OsString::from_vec);
     // Port of erts/emulator/beam/erl_bif_port.c:1024 (default child environment), OTP-29.1.1.
     let mut child_env = crate::natives::env::snapshot();
     // Keep `erl` child launchers on this VM's selected installation when the port changes cwd.
@@ -2135,6 +2138,7 @@ fn notify_links_monitors(
     skip_owner: bool,
     reason: Term,
 ) {
+    // Port of erts/emulator/beam/io.c:3815 (`monitor_port_exit`), OTP-29.1.1.
     let Some(port) = Term::port(id) else {
         return;
     };
@@ -2161,31 +2165,38 @@ fn notify_links_monitors(
     let monitors = std::mem::take(&mut *guard);
     for (reference, monitor) in monitors {
         let mut heap = ProcessHeap::with_words(32);
-        let Ok(reference_term) =
-            TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(reference))
-        else {
-            continue;
-        };
-        let Ok(object) = from_owned(&monitor.object, &mut heap) else {
-            continue;
-        };
-        let Ok(down) = TermBuilder::new(&mut heap).tuple(&[
-            atom("DOWN"),
-            reference_term,
-            atom("port"),
-            object,
-            reason,
-        ]) else {
-            continue;
-        };
-        if let Ok(message) = Message::copy_from(down) {
-            // A signal, not a message: the origin drops the DOWN when its monitor is gone
-            // (erl_proc_sig_queue.c:6355), so a `demonitor(_, [flush])` that races with the
-            // port exit cannot be followed by the DOWN.
+        if reason.is_pointer() {
+            let Ok(reference_term) =
+                TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(reference))
+            else {
+                continue;
+            };
+            let Ok(object) = from_owned(&monitor.object, &mut heap) else {
+                continue;
+            };
+            let Ok(down) = TermBuilder::new(&mut heap).tuple(&[
+                atom("DOWN"),
+                reference_term,
+                atom("port"),
+                object,
+                reason,
+            ]) else {
+                continue;
+            };
+            if let Ok(message) = Message::copy_from(down) {
+                // Port of erl_proc_sig_queue.c (erts_proc_sig_send_monitor_down), OTP-29.1.1.
+                let _ = scheduler.signal(
+                    from,
+                    monitor.pid,
+                    arinsal_sched::Signal::MonitorDownMsg { reference, message },
+                );
+            }
+        } else if let Ok(reason) = Message::copy_from(reason) {
+            // The reference and monitor type stay in the signal for immediate exit reasons.
             let _ = scheduler.signal(
                 from,
                 monitor.pid,
-                arinsal_sched::Signal::MonitorDownMsg { reference, message },
+                arinsal_sched::Signal::MonitorDown { reference, reason },
             );
         }
     }
@@ -3289,12 +3300,6 @@ pub(crate) fn family(
     Some(result)
 }
 
-fn copied_reason(reason: Term) -> Option<Message> {
-    let mut heap = ProcessHeap::with_words(64);
-    let term = copy_term(reason, &mut heap).ok()?;
-    Message::copy_from(term).ok()
-}
-
 // Port of erts/emulator/beam/erl_bif_port.c:322 (erts_internal_port_control_3), OTP-29.1.1.
 // Non-inet ports still return the atom `badarg`. `tcp_inet` returns a byte list.
 fn port_control(
@@ -4059,11 +4064,11 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
     Ok(atom("true"))
 }
 
-/// Close ports owned by a process when its scheduler task terminates.
+/// Exit ports linked to a process when its scheduler task terminates.
 ///
-/// Port of erts/emulator/beam/erl_process.c:14084 (erts_proc_exit_handle_link), OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_process.c:14068 (erts_proc_exit_handle_link), OTP-29.1.1.
 pub(crate) fn owner_exit(
-    runtime: &crate::process::Runtime,
+    runtime: &Arc<crate::process::Runtime>,
     scheduler: &Scheduler<Process>,
     owner: Pid,
     reason: Term,
@@ -4097,9 +4102,9 @@ pub(crate) fn owner_exit(
     for (drv_port, monitor) in fired {
         drv_port.process_exit(monitor);
     }
-    // g_port_fix: synchronous owner-exit hook; the caller is the termination path.
-    let closed = {
-        let mut ports = runtime.ports.lock().unwrap();
+    let abnormal = reason != atom("normal");
+    let affected = {
+        let ports = runtime.ports.lock().unwrap();
         for handle in ports.values() {
             handle
                 .monitors
@@ -4107,85 +4112,35 @@ pub(crate) fn owner_exit(
                 .unwrap()
                 .retain(|_, monitor| monitor.pid != owner);
         }
-        let abnormal = reason != atom("normal");
-        let ids = ports
+        ports
             .iter()
             .filter_map(|(&id, handle)| {
                 let is_owner = *handle.owner.lock().unwrap() == owner;
-                let linked = handle.links.lock().unwrap().remove(&owner);
-                (is_owner || (abnormal && linked)).then_some(id)
-            })
-            .collect::<Vec<_>>();
-        ids.into_iter()
-            .filter_map(|id| {
-                let handle = ports.remove(&id)?;
-                runtime.port_ids.release(id);
-                Some((id, handle))
+                let linked = if handle.driver.get().is_some() {
+                    handle.links.lock().unwrap().contains(&owner)
+                } else {
+                    handle.links.lock().unwrap().remove(&owner)
+                };
+                (is_owner || (abnormal && linked)).then(|| (id, Arc::clone(handle)))
             })
             .collect::<Vec<_>>()
     };
-    for (port_id, handle) in closed {
+    for (port_id, handle) in affected {
+        if handle.driver.get().is_some() {
+            let exit_reason = to_owned(reason).unwrap_or_else(|_| OwnedTerm::Atom("normal".into()));
+            drv_sig::exit_for_process_termination(Arc::clone(runtime), handle, owner, exit_reason);
+            continue;
+        }
+        let Some(handle) = remove_and_notify(runtime, port_id, scheduler, owner, reason) else {
+            continue;
+        };
         crate::trace::emit_port_event(runtime, port_id, crate::trace::PORTS, "closed", &[reason]);
-        release_port_name(runtime, &handle);
         crate::trace::port_closed(runtime, port_id);
         if handle.inet {
             crate::inet_drv::detach(&handle);
             crate::inet_udp::detach(&handle);
         }
         release_io(&handle);
-        let Some(port) = Term::port(port_id) else {
-            continue;
-        };
-        // Linked processes observe the port, the same shape `port_close` uses.
-        // A non-normal reason also becomes an exit signal so a process that does
-        // not trap exits terminates; `normal` is ignored by that path in erts.
-        let abnormal = reason != atom("normal");
-        for linked in handle.links.lock().unwrap().iter().copied() {
-            if linked == owner {
-                continue;
-            }
-            let mut heap = ProcessHeap::with_words(32);
-            let reason_term = copy_term(reason, &mut heap).unwrap_or_else(|_| atom("normal"));
-            let Ok(exit) = TermBuilder::new(&mut heap).tuple(&[atom("EXIT"), port, reason_term])
-            else {
-                continue;
-            };
-            if let Ok(message) = Message::copy_from(exit) {
-                let _ = scheduler.send(owner, linked, message);
-            }
-            if abnormal && let Some(message) = copied_reason(reason) {
-                let _ = scheduler.signal(owner, linked, arinsal_sched::Signal::Exit(message));
-            }
-        }
-        let monitors = std::mem::take(&mut *handle.monitors.lock().unwrap());
-        for (reference, monitor) in &monitors {
-            let mut heap = ProcessHeap::with_words(32);
-            let reference_term =
-                TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(*reference));
-            let Ok(reference_term) = reference_term else {
-                continue;
-            };
-            let reason_term = copy_term(reason, &mut heap).unwrap_or_else(|_| atom("normal"));
-            let object = arinsal_term::from_owned(&monitor.object, &mut heap).unwrap_or(port);
-            let down = TermBuilder::new(&mut heap).tuple(&[
-                atom("DOWN"),
-                reference_term,
-                atom("port"),
-                object,
-                reason_term,
-            ]);
-            let Ok(down) = down else { continue };
-            if let Ok(message) = Message::copy_from(down) {
-                let _ = scheduler.signal(
-                    owner,
-                    monitor.pid,
-                    arinsal_sched::Signal::MonitorDownMsg {
-                        reference: *reference,
-                        message,
-                    },
-                );
-            }
-        }
     }
 }
 
