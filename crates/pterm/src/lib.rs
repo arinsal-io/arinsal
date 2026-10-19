@@ -231,7 +231,6 @@ struct ProcessAccount {
     waiting_area: AtomicU64,
     capacity: AtomicU64,
     used: AtomicU64,
-    binary: AtomicU64,
 }
 /// Counters from the latest process collection that owed retired literal areas.
 #[derive(Clone, Copy, Debug, Default)]
@@ -364,7 +363,6 @@ impl Store {
             waiting_area: AtomicU64::new(0),
             capacity: AtomicU64::new(0),
             used: AtomicU64::new(0),
-            binary: AtomicU64::new(0),
         });
         self.processes.push(Arc::downgrade(&account));
         self.registrations_in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -373,26 +371,18 @@ impl Store {
             account: Some(account),
         }
     }
-    /// Record this process's heap and binary bytes for `erlang:memory/0,1`.
-    pub fn set_process_memory(
-        &self,
-        process: &ProcessRegistration<'_>,
-        capacity: u64,
-        used: u64,
-        binary: u64,
-    ) {
+    /// Record this process's heap bytes for `erlang:memory/0,1`.
+    pub fn set_process_memory(&self, process: &ProcessRegistration<'_>, capacity: u64, used: u64) {
         assert!(std::ptr::eq(self, process.store));
         let account = process.account.as_ref().expect("live process registration");
         account.capacity.store(capacity, Ordering::Relaxed);
         account.used.store(used.min(capacity), Ordering::Relaxed);
-        account.binary.store(binary, Ordering::Relaxed);
     }
     /// Sum the latest heap snapshot of every live registered process.
-    pub fn process_memory_totals(&self) -> (u64, u64, u64) {
+    pub fn process_memory_totals(&self) -> (u64, u64) {
         let _scan = self.process_scan.lock().expect("process scan poisoned");
         let mut capacity = 0;
         let mut used = 0;
-        let mut binary = 0;
         let mut live = Vec::new();
         while let Some(account) = self.processes.pop() {
             if let Some(account) = account.upgrade() {
@@ -405,13 +395,12 @@ impl Store {
                 }
                 capacity += account.capacity.load(Ordering::Relaxed);
                 used += account.used.load(Ordering::Relaxed);
-                binary += account.binary.load(Ordering::Relaxed);
             }
         }
         for account in live {
             self.processes.push(account);
         }
-        (capacity, used, binary)
+        (capacity, used)
     }
     /// Return the stored value pointer, with no copy or lock.
     #[inline]
