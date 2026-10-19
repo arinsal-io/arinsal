@@ -755,9 +755,21 @@ pub(super) fn save_direct(
     let interpreter_caller = (bif_top && native_top_word.is_none())
         .then(|| pack_indexed(p.module, p.ip.saturating_add(1)))
         .flatten();
-    let stack_trace = {
-        let mut heap = TraceHeap::new(&mut p.heap);
-        StackTrace::reserve(&mut heap, max_depth)?
+    // Port of erts/emulator/beam/beam_common.c (`save_stacktrace`), OTP-29.1.1: the trace, its
+    // argument list, the `error_info` map and the ftrace tuple are carved from one block that is
+    // sized first. A full young heap then costs one heap fragment per raise, not one per term.
+    let words = save_block_words(top, max_depth);
+    let (stack_trace, ftrace) = {
+        let mut heap = TraceHeap::with_block(&mut p.heap, words);
+        let stack_trace = StackTrace::reserve(&mut heap, max_depth)?;
+        let (args, error_info) = save_ftrace_values(&mut heap, top, registers.unwrap_or(&p.x))?;
+        let ftrace = Ftrace {
+            stack_trace,
+            args,
+            error_info,
+        }
+        .allocate(&mut heap)?;
+        (stack_trace, ftrace)
     };
     stack_trace
         .with_bignum_digits_mut(|digits| {
@@ -789,14 +801,47 @@ pub(super) fn save_direct(
             depth
         })
         .ok_or_else(|| VmError::Unsupported("stacktrace bignum".into()))?;
-    let mut heap = TraceHeap::new(&mut p.heap);
-    let (args, error_info) = save_ftrace_values(&mut heap, top, registers.unwrap_or(&p.x))?;
-    Ftrace {
-        stack_trace,
-        args,
-        error_info,
+    Ok(ftrace)
+}
+
+/// Words `save_stacktrace` allocates for one raise: the StackTrace bignum, the argument list,
+/// the `error_info` map and the `{StackTrace, Args, ErrorInfo}` tuple. An estimate only; a
+/// shortfall falls back to ordinary allocation.
+fn save_block_words(top: Option<SaveTop<'_>>, max_depth: usize) -> usize {
+    let mut words = 1 + 5 + max_depth + 4;
+    let info = match top {
+        Some(SaveTop::Live(TopFrame::BifRegisters {
+            arity,
+            module,
+            info,
+            ..
+        })) => {
+            words += 2 * arity;
+            Some((*module, *info))
+        }
+        Some(SaveTop::Live(TopFrame::Bif { module, info, .. })) => Some((*module, *info)),
+        Some(SaveTop::Live(
+            TopFrame::CurrentArgsWithInfo(..) | TopFrame::CurrentArgsInfoTerm(..),
+        )) => {
+            words += 5;
+            None
+        }
+        _ => None,
+    };
+    if let Some((module, info)) = info {
+        let has_format = trace_atoms()
+            .format_modules
+            .iter()
+            .any(|(bif, _)| *bif == module);
+        match info {
+            BifErrorInfo::None => {}
+            BifErrorInfo::Map(_) => words += 5,
+            BifErrorInfo::Plain if has_format => words += 6 + 5,
+            BifErrorInfo::Cause(_) if has_format => words += 8 + 5,
+            BifErrorInfo::Plain | BifErrorInfo::Cause(_) => {}
+        }
     }
-    .allocate(&mut heap)
+    words
 }
 
 pub(super) struct StackTraceSave<'a> {
