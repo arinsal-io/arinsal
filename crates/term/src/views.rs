@@ -117,6 +117,10 @@ impl FlatMapRef<'_> {
             .zip(self.values.iter().rev())
             .map(|(key, value)| (Term(*key), Term(*value)))
     }
+
+    pub(crate) fn with_arrays<R>(&self, body: impl for<'a> FnOnce(&'a [u64], &'a [u64]) -> R) -> R {
+        body(self.keys, self.values)
+    }
 }
 impl Term {
     /// Whether this pointer belongs to a loaded module's immutable literal area.

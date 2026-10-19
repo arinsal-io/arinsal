@@ -521,23 +521,13 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
 fn hashmap_delete<H: HeapAlloc + ?Sized>(
     map: Term,
     key: Term,
+    map_size: usize,
     heap: &mut H,
     value: &mut Option<Term>,
 ) -> MapResult<Term> {
     const NONE: u8 = 0;
     const LEAF: u8 = 1;
     const BOXED: u8 = 2;
-    if map.is_hashmap()
-        && size(map)? == LIMIT + 1
-        && let Some(found) = get(map, key)?
-    {
-        *value = Some(found);
-        let mut pairs: Vec<_> = iter(map)?
-            .filter(|(candidate, _)| !exact_eq(*candidate, key))
-            .collect();
-        pairs.sort_by(|a, b| key_cmp(a.0, b.0));
-        return flat(&pairs, heap);
-    }
     let mut path = [(map, 0_u32, 0_u32); MAX_HAMT_DEPTH];
     let mut depth = 0;
     let mut node = map;
@@ -595,6 +585,18 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
             let offset = if kind == 3 { 2 } else { 1 };
             node = term(*source.add(offset + index));
             level += 1;
+        }
+
+        // Port of erts/emulator/beam/erl_map.c (hashmap_delete), OTP-29.1.1.
+        // erts flattens only after the deletion walk has already found the key.
+        // Port of hashmap_size(map) - 1 in erl_map.c:2984-2989, OTP-29.1.1.
+        let new_size = map_size - 1;
+        if new_size <= LIMIT {
+            let mut pairs: Vec<_> = iter(map)?
+                .filter(|(candidate, _)| !exact_eq(*candidate, key))
+                .collect();
+            pairs.sort_by(|a, b| key_cmp(a.0, b.0));
+            return flat(&pairs, heap);
         }
 
         let mut shape = NONE;
@@ -1075,12 +1077,12 @@ fn maps_take<H: HeapAlloc + ?Sized>(
     key: Term,
     heap: &mut H,
 ) -> MapResult<Option<(Term, Term)>> {
-    check(map)?;
+    let checked = checked_map(map)?;
     if !map.is_hashmap() {
         return flatmap_take(map, key, heap);
     }
     let mut value = None;
-    let res = hashmap_delete(map, key, heap, &mut value)?;
+    let res = hashmap_delete(map, key, checked.size(), heap, &mut value)?;
     Ok(value.map(|value| (value, res)))
 }
 

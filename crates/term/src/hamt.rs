@@ -138,22 +138,30 @@ impl PairIter {
         self.nodes.push((node, first));
     }
 }
+
+// Port of the direct flatmap key/value arrays used by erts_cmp_compound
+// (erts/emulator/beam/utils.c:2030-2104), OTP-29.1.1.
+pub(crate) fn with_flatmap_arrays<R>(
+    map: Term,
+    body: impl for<'a> FnOnce(&'a [u64], &'a [u64]) -> R,
+) -> Option<R> {
+    // SAFETY: callers retain the source map and its owning heap for the callback.
+    let view = unsafe { map.flatmap_ref()? };
+    Some(view.with_arrays(body))
+}
+
 impl Iterator for PairIter {
     type Item = (Term, Term);
+    // Port of erts/emulator/beam/erl_map.c:2337-2376 (hashmap_iterator_next), OTP-29.1.1.
     fn next(&mut self) -> Option<Self::Item> {
         if !self.map.is_hashmap() && self.mode == PairIterMode::Pairs {
-            // SAFETY: the map and its key tuple remain live during iteration.
-            unsafe {
-                let ptr = self.map.raw_ptr();
-                let len = *ptr.add(1) as usize;
-                if self.flat_index == len {
-                    return None;
-                }
-                let keys = Term(*ptr.add(2));
-                let i = self.flat_index;
-                self.flat_index += 1;
-                return Some((Term(*keys.raw_ptr().add(i + 1)), Term(*ptr.add(i + 3))));
-            }
+            let index = self.flat_index;
+            let pair = with_flatmap_arrays(self.map, |keys, values| {
+                (index < keys.len()).then(|| (Term(keys[index]), Term(values[index])))
+            })?;
+            let pair = pair?;
+            self.flat_index += 1;
+            return Some(pair);
         }
         loop {
             let (node, next) = *self.nodes.last()?;
