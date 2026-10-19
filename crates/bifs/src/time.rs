@@ -325,6 +325,11 @@ fn localtime_to_universaltime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, 
     };
     // Port of erts/emulator/beam/erl_time_sup.c:1735 (local_to_univ), OTP-29.1.1.
     let mut local = to_tm(value, is_dst.map_or(-1, i32::from));
+    if !sys_daylight() {
+        // A zone without DST: simulate the Linux/Solaris behaviour of treating is_dst as unset
+        // instead of letting the OS refuse a DST time.
+        local.tm_isdst = 0;
+    }
     // SAFETY: `local` is initialized and mktime reads and normalizes this tm value.
     let seconds = unsafe { mktime(&mut local) };
     let utc = calendar_from_unix(seconds as i64);
@@ -453,3 +458,46 @@ crate::bif_bodies!(
     posixtime_to_universaltime,
     convert_time_unit,
 );
+
+/// Whether the local time zone has daylight saving time.
+// Port of erts/emulator/sys/unix/sys_time.c (sys_init_time, sys_daylight), OTP-29.1.1:
+// the libc `daylight` variable where it exists, else a scan of the current year.
+#[cfg(target_os = "linux")]
+fn sys_daylight() -> bool {
+    unsafe extern "C" {
+        static daylight: libc::c_int;
+        fn tzset();
+    }
+    // SAFETY: tzset initializes the libc time zone state that `daylight` reflects.
+    unsafe {
+        tzset();
+        daylight != 0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sys_daylight() -> bool {
+    static DAYLIGHT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DAYLIGHT.get_or_init(|| {
+        let now: time_t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as time_t);
+        // SAFETY: tm is plain data; localtime_r and mktime read and write only these values.
+        unsafe {
+            let mut base: tm = std::mem::zeroed();
+            localtime_r(&now, &mut base);
+            base.tm_hour = 0;
+            base.tm_min = 0;
+            base.tm_sec = 0;
+            base.tm_mday = 1;
+            (0..12).any(|month| {
+                base.tm_mon = month;
+                let mut probe = base;
+                let clock = mktime(&mut probe);
+                let mut local: tm = std::mem::zeroed();
+                localtime_r(&clock, &mut local);
+                local.tm_isdst > 0
+            })
+        }
+    })
+}

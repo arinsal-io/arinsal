@@ -117,7 +117,7 @@ fn erl_launch(args: &[String]) -> ! {
                 .schedulers
                 .map(|count| usize::try_from(count.total).unwrap_or(0))
         })
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+        .unwrap_or_else(|| arinsal_alloc::cpuinfo::default_schedulers().0);
     let dirty_instances = launch
         .emulator
         .allocator_options
@@ -139,9 +139,10 @@ fn erl_launch(args: &[String]) -> ! {
         dirty_instances,
         flags: launch.emulator.allocator_options.clone(),
     });
-    let cpus = std::thread::available_parallelism().map_or(1, |count| count.get());
-    let workers = arinsal_args::resolve_scheduler_count(launch.emulator.schedulers, cpus)
-        .map_or(cpus, |(total, _)| total);
+    let (cpus, cpus_online) = arinsal_alloc::cpuinfo::default_schedulers();
+    let workers =
+        arinsal_args::resolve_scheduler_count_online(launch.emulator.schedulers, cpus, cpus_online)
+            .map_or(cpus, |(total, _)| total);
     // Port of erts/emulator/beam/erl_alloc.c (erts_alloc_init), OTP-29.1.1: the allocator instances
     // are sized from the scheduler count and `+Mdai` before anything allocates.
     let _ = arinsal_alloc::typed::configure(workers, dirty_instances.unwrap_or(0));

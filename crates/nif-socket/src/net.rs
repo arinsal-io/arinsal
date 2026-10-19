@@ -82,15 +82,40 @@ fn sockaddr(addr: *const libc::sockaddr) -> Option<O> {
         _ => None,
     }
 }
+// glibc <netdb.h> value; the libc crate does not export it for Linux.
+#[cfg(target_os = "linux")]
+const EAI_ADDRFAMILY: i32 = -9;
+#[cfg(not(target_os = "linux"))]
+const EAI_ADDRFAMILY: i32 = libc::EAI_ADDRFAMILY;
+
+// Port of erts/emulator/nifs/common/prim_net_nif.c (enet_getaddrinfo), OTP-29.1.1.
 fn gai_error(code: i32) -> O {
     error(match code {
+        EAI_ADDRFAMILY => "eaddrfamily",
         libc::EAI_AGAIN => "eagain",
-        libc::EAI_NONAME => "noname",
+        libc::EAI_BADFLAGS => "ebadflags",
         libc::EAI_FAIL => "efail",
-        libc::EAI_FAMILY => "family",
-        libc::EAI_SOCKTYPE => "socktype",
-        libc::EAI_SERVICE => "service",
-        libc::EAI_MEMORY => "enomem",
+        libc::EAI_FAMILY => "efamily",
+        libc::EAI_MEMORY => "emem",
+        libc::EAI_NODATA => "enodata",
+        libc::EAI_NONAME => "enoname",
+        libc::EAI_SERVICE => "eservice",
+        libc::EAI_SOCKTYPE => "esocktype",
+        libc::EAI_SYSTEM => "esystem",
+        _ => "einval",
+    })
+}
+// Port of erts/emulator/nifs/common/prim_net_nif.c (enet_getnameinfo), OTP-29.1.1.
+fn gni_error(code: i32) -> O {
+    error(match code {
+        libc::EAI_AGAIN => "eagain",
+        libc::EAI_BADFLAGS => "ebadflags",
+        libc::EAI_FAIL => "efail",
+        libc::EAI_FAMILY => "efamily",
+        libc::EAI_MEMORY => "emem",
+        libc::EAI_NONAME => "enoname",
+        libc::EAI_OVERFLOW => "eoverflow",
+        libc::EAI_SYSTEM => return last_error(),
         _ => "einval",
     })
 }
@@ -131,11 +156,8 @@ fn getaddrinfo(args: &[O]) -> Result<O, BifError> {
                 libc::SOCK_RAW => "raw",
                 _ => "unknown",
             };
-            let proto = match ai.ai_protocol {
-                libc::IPPROTO_TCP => atom("tcp"),
-                libc::IPPROTO_UDP => atom("udp"),
-                n => O::Int(n.into()),
-            };
+            // The protocol name is added by prim_net:getaddrinfo/2 from the protocols table.
+            let proto = O::Int(ai.ai_protocol.into());
             rows.push(map(&[
                 ("family", atom(family)),
                 ("socktype", atom(kind)),
@@ -185,7 +207,7 @@ fn getnameinfo(args: &[O]) -> Result<O, BifError> {
         )
     };
     if code != 0 {
-        return Ok(gai_error(code));
+        return Ok(gni_error(code));
     }
     // SAFETY: successful getnameinfo null-terminates both buffers.
     let (host, service) = unsafe {
@@ -541,13 +563,30 @@ mod tests {
             ok(O::charlist("http"))
         );
     }
+    /// The protocol as `prim_net:getaddrinfo/2` presents it: the first name of the number.
+    fn protocol_name(protocol: Option<&O>) -> Option<O> {
+        let protocol = protocol?;
+        let O::Int(number) = protocol else {
+            return Some(protocol.clone());
+        };
+        let table = crate::socket::supports(Some(&atom("protocols")));
+        list(&table)
+            .unwrap()
+            .iter()
+            .find_map(|row| {
+                let O::Tuple(row) = row else { return None };
+                (row[1] == O::Int(*number)).then(|| list(&row[0]).and_then(|n| n.first().cloned()))
+            })
+            .flatten()
+            .or_else(|| Some(protocol.clone()))
+    }
     fn addrinfo_key(row: &O) -> String {
         let addr = field(row, "addr").unwrap();
         format!(
             "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             field(row, "family"),
             field(row, "socktype"),
-            field(row, "protocol"),
+            protocol_name(field(row, "protocol")),
             field(addr, "family"),
             field(addr, "addr"),
             field(addr, "port"),

@@ -1,4 +1,18 @@
 use std::collections::{HashMap, VecDeque};
+/// Name of the `prim_socket:p_get/1` snapshot for the OS this crate is built for.
+#[cfg(target_os = "macos")]
+macro_rules! os_supports_fixture {
+    () => {
+        "mac_otp29_supports.etf"
+    };
+}
+#[cfg(target_os = "linux")]
+macro_rules! os_supports_fixture {
+    () => {
+        "linux_otp29_supports.etf"
+    };
+}
+
 use std::io::{self, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -2348,11 +2362,14 @@ fn supports_protocols() -> O {
     O::list(protocols)
 }
 
-fn supports(key: Option<&O>) -> O {
-    // Snapshot of OTP 29.1.1's macOS NIF tables, captured via prim_socket:p_get/1.
+pub(crate) fn supports(key: Option<&O>) -> O {
+    // Snapshot of OTP 29.1.1's NIF tables for this OS, captured via prim_socket:p_get/1.
     // These tables describe the OS ABI compiled into the reference runtime.
-    let snapshot = arinsal_etf::decode(include_bytes!("../tests/fixtures/mac_otp29_supports.etf"))
-        .expect("OTP support fixture");
+    let snapshot = arinsal_etf::decode(include_bytes!(concat!(
+        "../tests/fixtures/",
+        os_supports_fixture!()
+    )))
+    .expect("OTP support fixture");
     let O::Tuple(ref parts) = snapshot else {
         unreachable!()
     };
@@ -2879,6 +2896,18 @@ mod tests {
         } else {
             assert_eq!(first, atom("ok"));
         }
+        // Linux leaves an asynchronously completed connection in SS_CONNECTING until the next
+        // connect(2) call, which then succeeds; only the one after it reports EISCONN.
+        #[cfg(target_os = "linux")]
+        if first == atom("select") {
+            assert_eq!(
+                invoke(
+                    "nif_connect",
+                    &[client.clone(), test_ref(11), addr("inet", port)]
+                ),
+                atom("ok")
+            );
+        }
         assert_eq!(
             invoke(
                 "nif_connect",
@@ -3295,7 +3324,12 @@ mod tests {
                 "nif_getopt",
                 &[sock.clone(), O::Int(level.into()), O::Int(opt.into())],
             ));
-            assert_eq!(got, value);
+            // Linux doubles the buffer sizes it is asked for (socket(7)).
+            let expected = match (cfg!(target_os = "linux"), opt, &value) {
+                (true, libc::SO_RCVBUF | libc::SO_SNDBUF, O::Int(size)) => O::Int(*size * 2),
+                _ => value.clone(),
+            };
+            assert_eq!(got, expected);
         }
         let native = result(invoke(
             "nif_getopt",
@@ -3925,13 +3959,16 @@ mod tests {
         let (_lock, _reactor) = caller_reactor();
         assert_eq!(
             invoke("nif_supports", &[]),
-            arinsal_etf::decode(include_bytes!("../tests/fixtures/mac_otp29_supports.etf"))
-                .ok()
-                .and_then(|o| match &o {
-                    O::Tuple(p) => Some(p[0].clone()),
-                    _ => None,
-                })
-                .unwrap()
+            arinsal_etf::decode(include_bytes!(concat!(
+                "../tests/fixtures/",
+                os_supports_fixture!()
+            )))
+            .ok()
+            .and_then(|o| match &o {
+                O::Tuple(p) => Some(p[0].clone()),
+                _ => None,
+            })
+            .unwrap()
         );
         assert!(
             !list(&invoke("nif_supports", &[atom("options")]))
@@ -3950,9 +3987,11 @@ mod tests {
     }
     #[test]
     fn support_tables_reconstruct_otp_wrapper_maps() {
-        let snapshot =
-            arinsal_etf::decode(include_bytes!("../tests/fixtures/mac_otp29_supports.etf"))
-                .unwrap();
+        let snapshot = arinsal_etf::decode(include_bytes!(concat!(
+            "../tests/fixtures/",
+            os_supports_fixture!()
+        )))
+        .unwrap();
         let O::Tuple(parts) = &snapshot else {
             panic!("support tuple")
         };

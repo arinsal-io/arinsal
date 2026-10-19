@@ -742,7 +742,15 @@ fn errno_atoms_cover_the_erts_table() {
         (libc::ECONNABORTED, "econnaborted"),
         (libc::ENETDOWN, "enetdown"),
         (libc::EHOSTDOWN, "ehostdown"),
-        (libc::EOPNOTSUPP, "eopnotsupp"),
+        // Where EOPNOTSUPP equals ENOTSUP (Linux) erl_errno_id names it by the first case.
+        (
+            libc::EOPNOTSUPP,
+            if libc::EOPNOTSUPP == libc::ENOTSUP {
+                "enotsup"
+            } else {
+                "eopnotsupp"
+            },
+        ),
         (libc::EMFILE, "emfile"),
         (libc::ENOENT, "enoent"),
         (libc::ECONNREFUSED, "econnrefused"),

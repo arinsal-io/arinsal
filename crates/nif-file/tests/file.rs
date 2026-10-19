@@ -599,6 +599,13 @@ fn differential_open_and_permission_errors() {
     let direct_list = call("list_dir_nif", &[path(&private)]).unwrap();
     let erl_list = expected(reference, "list_dir", &[name(&private)]);
     fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    // root bypasses directory permissions, so there is no permission error to compare (and
+    // `file:list_dir` would return decoded names where the NIF returns raw binaries).
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping permission-denied comparison: running as root");
+        return;
+    }
     assert_eq!(direct_read, erl_read);
     assert_eq!(direct_list, erl_list);
 }

@@ -129,29 +129,44 @@ pub struct SchedulerCount {
 }
 
 /// Resolve a parsed `+S`/`+SDcpu` count against the machine CPU count.
-// Port of erts/emulator/beam/erl_init.c:1048-1070, 1120-1140, OTP-29.1.1.
 pub fn resolve_scheduler_count(
     count: Option<SchedulerCount>,
     cpus: usize,
 ) -> Option<(usize, usize)> {
+    resolve_scheduler_count_online(count, cpus, cpus)
+}
+
+/// Like [`resolve_scheduler_count`] with a separate default for the online count, which on
+/// Linux is limited by the affinity mask and the cgroup CPU quota.
+// Port of erts/emulator/beam/erl_init.c (erl_start, `+S` and `+SDcpu` parsing), OTP-29.1.1.
+pub fn resolve_scheduler_count_online(
+    count: Option<SchedulerCount>,
+    cpus: usize,
+    cpus_online: usize,
+) -> Option<(usize, usize)> {
     let Some(count) = count else {
-        return Some((cpus, cpus));
+        return Some((cpus, cpus_online));
     };
-    let resolve = |value: i32, default: usize| {
-        let cpus = i32::try_from(cpus).unwrap_or(i32::MAX);
-        let count = if value < 0 {
-            cpus.saturating_add(value)
-        } else if value == 0 {
-            i32::try_from(default).unwrap_or(i32::MAX)
-        } else {
+    let resolve = |value: i32, base: usize| {
+        let base = i32::try_from(base).unwrap_or(i32::MAX);
+        let count = if value > 0 {
             value
+        } else {
+            base.saturating_add(value)
         };
         usize::try_from(count).ok().filter(|count| *count > 0)
     };
     let total = resolve(count.total, cpus)?;
-    let online = count
-        .online
-        .map_or_else(|| Some(total.min(cpus)), |value| resolve(value, total))?;
+    // `+S Total` alone: online = min(Total as scanned, default online), then as below.
+    let online = match count.online {
+        Some(value) => resolve(value, cpus_online)?,
+        None => resolve(
+            count
+                .total
+                .min(i32::try_from(cpus_online).unwrap_or(i32::MAX)),
+            cpus_online,
+        )?,
+    };
     (online <= total).then_some((total, online))
 }
 

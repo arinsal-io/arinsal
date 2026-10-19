@@ -64,14 +64,16 @@ fn string(ctx: &mut Ctx<'_>, value: &str) -> Result<Term, BifError> {
 // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
 fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let key = atom_name(args[0]).ok_or(BifError::BADARG)?;
-    let cpus = std::thread::available_parallelism().map_or(1, usize::from) as u64;
+    let info = arinsal_alloc::cpuinfo::cpu_info();
+    let (cpus, online) = arinsal_alloc::cpuinfo::default_schedulers();
+    let (cpus, online) = (cpus as u64, online as u64);
     match key {
         "otp_release" => string(ctx, "29"),
         "version" => string(ctx, "17.1"),
         "system_version" => string(
             ctx,
             &format!(
-                "Erlang/OTP 29 [erts-17.1] [arinsal {}] [{}-bit] [smp:{cpus}:{cpus}] [ds:{cpus}:{cpus}:10] [async-threads:1] [jit]\n",
+                "Erlang/OTP 29 [erts-17.1] [arinsal {}] [{}-bit] [smp:{cpus}:{online}] [ds:{cpus}:{online}:10] [async-threads:1] [jit]\n",
                 env!("CARGO_PKG_VERSION"),
                 std::mem::size_of::<usize>() * 8
             ),
@@ -80,13 +82,14 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
         "start_time" => Term::small(-(1_i64 << 59)).ok_or(BifError::SystemLimit),
         "context_reductions" => integer(ctx, 4000),
-        "schedulers"
-        | "schedulers_online"
-        | "logical_processors"
-        | "logical_processors_available"
-        | "logical_processors_online" => integer(ctx, cpus),
-        "dirty_cpu_schedulers" | "dirty_cpu_schedulers_online" => integer(ctx, cpus),
-        "dirty_io_schedulers" => integer(ctx, cpus),
+        "schedulers" => integer(ctx, cpus),
+        "schedulers_online" => integer(ctx, online),
+        "logical_processors" => integer(ctx, info.configured as u64),
+        "logical_processors_available" => integer(ctx, info.available as u64),
+        "logical_processors_online" => integer(ctx, info.online as u64),
+        "dirty_cpu_schedulers" => integer(ctx, cpus),
+        "dirty_cpu_schedulers_online" => integer(ctx, online),
+        "dirty_io_schedulers" => integer(ctx, 10),
         // Port of erts/emulator/beam/erl_bif_info.c:2876 and
         // erts/emulator/beam/erl_init.c:1354, OTP-29.1.1.
         "outstanding_system_requests_limit" => integer(ctx, cpus.saturating_mul(2)),
@@ -222,7 +225,7 @@ fn atom_list(ctx: &mut Ctx<'_>, names: &[&str]) -> Result<Term, BifError> {
 fn no_aux_work_threads(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_process.c:9234 and :6219-6223, OTP-29.1.1.
     // The runtime uses one standard auxiliary worker and no dirty allocator instances.
-    let schedulers = std::thread::available_parallelism().map_or(1, usize::from) as u64;
+    let schedulers = arinsal_alloc::cpuinfo::default_schedulers().0 as u64;
     integer(ctx, schedulers.saturating_add(1))
 }
 

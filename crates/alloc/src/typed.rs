@@ -777,7 +777,7 @@ fn registry() -> &'static Vec<Option<ThreadSpecificAllocators>> {
     static ALLOCATORS: OnceLock<Vec<Option<ThreadSpecificAllocators>>> = OnceLock::new();
     ALLOCATORS.get_or_init(|| {
         let config = *CONFIG.get_or_init(|| InstanceConfig {
-            schedulers: std::thread::available_parallelism().map_or(1, usize::from),
+            schedulers: crate::cpuinfo::default_schedulers().0,
             dirty_instances: 0,
         });
         let schedulers = config.schedulers;
