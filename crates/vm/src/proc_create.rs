@@ -2009,6 +2009,7 @@ pub(crate) struct EtsFree {
 pub(crate) struct EtsSelect {
     pub(crate) tid: arinsal_ets::Tid,
     pub(crate) program: std::sync::Arc<arinsal_ets::match_spec::MatchProgram>,
+    pub(crate) program_owner: std::sync::Arc<arinsal_term::MagicRef>,
     /// `select_count/2` instead of a result list.
     pub(crate) count: bool,
     /// Where the traversal resumes.
@@ -2023,8 +2024,6 @@ pub(crate) struct EtsSelect {
     /// The chunk size of `select/3` and its relatives; zero for the calls that return every
     /// result.
     pub(crate) chunk: usize,
-    /// The program is registered for a continuation the caller handed in.
-    pub(crate) retained: bool,
     pub(crate) stage: SelectStage,
     /// The end of the key range an ordered table's continuation names.
     pub(crate) end: Option<arinsal_ets::SavedKey>,

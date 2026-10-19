@@ -11,7 +11,7 @@ use super::{atom, badarg, list, tuple_items};
 use crate::VmError;
 use arinsal_ets::match_spec::MatchProgram;
 use arinsal_ets::{SavedKey, SavedMatches, ScanPosition, Tid};
-use arinsal_term::{HeapAlloc, Term, TermBuilder, VecHeap, copy_term};
+use arinsal_term::{HeapAlloc, MagicRef, Term, TermBuilder, copy_term};
 use std::sync::Arc;
 
 /// Reductions of `ets:reverse/3` per `CONTEXT_REDS` worth of list cells (it charges one per ten).
@@ -20,6 +20,7 @@ const REVERSE_CELLS: usize = 40_000;
 /// What a call starts from: a continuation the caller handed in.
 pub(super) struct Run {
     pub(super) program: Arc<MatchProgram>,
+    pub(super) program_owner: Arc<MagicRef>,
     pub(super) chunk: usize,
     pub(super) backwards: bool,
     pub(super) position: ScanPosition,
@@ -56,11 +57,13 @@ pub(super) fn decode_hash(
         .match_program(items[3])
         .or_else(|| super::compiled_match_program(items[3]))
         .ok_or_else(badarg)?;
+    let program_owner = match_program_owner(items[3], &program);
     let mut saved = SavedMatches::new();
     let oldest_first: Vec<Term> = rest.into_iter().rev().collect();
     saved.extend(&oldest_first).map_err(super::err)?;
     Ok(Run {
         program,
+        program_owner,
         chunk: chunk as usize,
         backwards: false,
         position: ScanPosition::Slot(if slot < 0 { usize::MAX } else { slot as usize }),
@@ -85,6 +88,7 @@ pub(super) fn decode_tree(
         .match_program(items[4])
         .or_else(|| super::compiled_match_program(items[4]))
         .ok_or_else(badarg)?;
+    let program_owner = match_program_owner(items[4], &program);
     if chunk <= 0 || got < 0 || accum.len() != got as usize {
         return Err(badarg());
     }
@@ -94,6 +98,7 @@ pub(super) fn decode_tree(
     saved.extend(&oldest_first).map_err(super::err)?;
     Ok(Run {
         program,
+        program_owner,
         chunk: chunk as usize,
         backwards: reverse != 0,
         position: ScanPosition::After(key),
@@ -114,18 +119,18 @@ pub(super) fn continuation_items(term: Term) -> Result<Vec<Term>, VmError> {
 ///
 /// `held` are the results in visit order, `slot` the next bucket (`None` at the end of the
 /// table) and `continued` whether a continuation was resumed. The result is the list or the
-/// pair with the new continuation and whether a continuation was made.
+/// pair with the new continuation.
 // Port of erts/emulator/beam/erl_db_hash.c, select_chunk_on_loop_ended and
 // select_chunk_continue_on_loop_ended, OTP-29.1.1.
 pub(super) fn hash_loop_ended<H: HeapAlloc>(
     heap: &mut H,
     tid: Tid,
-    program: &MatchProgram,
+    program_owner: &Arc<MagicRef>,
     chunk: usize,
     mut held: Vec<Term>,
     slot: Option<usize>,
     continued: bool,
-) -> Result<(Term, bool), VmError> {
+) -> Result<Term, VmError> {
     let got = held.len();
     let (rest, rest_size) = if got > chunk {
         let extra = held.split_off(chunk);
@@ -144,7 +149,7 @@ pub(super) fn hash_loop_ended<H: HeapAlloc>(
         .map_err(|_| badarg())?;
     if !rest.is_empty() || slot.is_some() {
         let tid = tid.to_term(heap).map_err(|_| badarg())?;
-        let reference = program.reference(heap).map_err(super::err)?;
+        let reference = match_program_reference(heap, program_owner)?;
         let rest = TermBuilder::new(heap)
             .list_from_iter(rest)
             .map_err(|_| badarg())?;
@@ -162,15 +167,15 @@ pub(super) fn hash_loop_ended<H: HeapAlloc>(
         let pair = TermBuilder::new(heap)
             .tuple(&[matches, continuation])
             .map_err(|_| badarg())?;
-        return Ok((pair, true));
+        return Ok(pair);
     }
     if kept {
         let pair = TermBuilder::new(heap)
             .tuple(&[matches, atom("$end_of_table")])
             .map_err(|_| badarg())?;
-        return Ok((pair, false));
+        return Ok(pair);
     }
-    Ok((atom("$end_of_table"), false))
+    Ok(atom("$end_of_table"))
 }
 
 /// The continuation an ordered table's chunk returns once `ets:reverse/3` has its results.
@@ -178,7 +183,7 @@ pub(super) fn hash_loop_ended<H: HeapAlloc>(
 pub(super) fn tree_continuation<H: HeapAlloc>(
     heap: &mut H,
     tid: Tid,
-    program: &MatchProgram,
+    program_owner: &Arc<MagicRef>,
     chunk: usize,
     reverse: bool,
     key: &SavedKey,
@@ -190,7 +195,7 @@ pub(super) fn tree_continuation<H: HeapAlloc>(
         Some(end) => copy_term(end.term(), heap).map_err(|_| badarg())?,
         None => Term::NIL,
     };
-    let reference = program.reference(heap).map_err(super::err)?;
+    let reference = match_program_reference(heap, program_owner)?;
     TermBuilder::new(heap)
         .tuple(&[
             tid,
@@ -228,9 +233,27 @@ pub(super) fn reverse_pass(left: usize) -> ReversePass {
     }
 }
 
-/// An empty scratch heap for a reference that only names a program.
-pub(super) fn program_reference(program: &MatchProgram) -> Result<(VecHeap, Term), VmError> {
-    let mut heap = VecHeap::new();
-    let reference = program.reference(&mut heap).map_err(super::err)?;
-    Ok((heap, reference))
+/// Keep the match program alive through every continuation term that names it.
+// Port of erts/emulator/beam/erl_db_util.h (erts_db_make_match_prog_ref), OTP-29.1.1.
+fn match_program_owner(reference: Term, program: &Arc<MatchProgram>) -> Arc<MagicRef> {
+    reference
+        .magic_owner()
+        .filter(|owner| owner.downcast_ref::<Arc<MatchProgram>>().is_some())
+        .unwrap_or_else(|| new_match_program_owner(program))
+}
+
+/// Create the binary owner used by the first continuation for a match program.
+pub(super) fn new_match_program_owner(program: &Arc<MatchProgram>) -> Arc<MagicRef> {
+    MagicRef::with_erts_payload_size(Arc::clone(program), program.erts_magic_payload_size())
+}
+
+/// Build a continuation reference with the same identity as its predecessor.
+// Port of erts/emulator/beam/erl_db_hash.c (select_chunk_on_loop_ended), OTP-29.1.1.
+fn match_program_reference<H: HeapAlloc>(
+    heap: &mut H,
+    owner: &Arc<MagicRef>,
+) -> Result<Term, VmError> {
+    TermBuilder::new(heap)
+        .magic_ref(Arc::clone(owner))
+        .map_err(|_| badarg())
 }
