@@ -217,6 +217,10 @@ pub struct BeamModuleAssembler {
     /// fall-through path is straight-line (erts `b.ls` / `b.ne` over a fragment).
     bs_cold: Vec<BsColdEmit>,
     line_table: Vec<ModuleLine>,
+    /// Return address of the latest emitted native exception branch, as used by `emit_line`.
+    last_error_offset: usize,
+    /// Location index of the latest line-table entry.
+    last_line_location: Option<u64>,
     trace_breakpoints: HashMap<u32, (usize, Label)>,
     /// Line, live count and word offset recorded by `i_debug_line` until its trampoline.
     pending_debug_line: Option<(u32, u16)>,
@@ -305,6 +309,8 @@ impl BeamModuleAssembler {
             entry_label: None,
             bs_cold: Vec::new(),
             line_table: Vec::new(),
+            last_error_offset: 0,
+            last_line_location: None,
             arith_fail: 0,
             arith_types: None,
             trace_breakpoints: HashMap::new(),
@@ -345,13 +351,30 @@ impl BeamModuleAssembler {
     }
 
     /// Records the native PC corresponding to a BEAM source line marker.
-    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:612-620, OTP-29.1.1.
-    pub fn record_line(&mut self, file: String, line: u32) {
+    // Port of erts/emulator/beam/jit/asm_load.c (add_line_entry), OTP-29.1.1: a repeat of the
+    // previous location index is skipped unless `insert_duplicates`.
+    pub fn record_line(&mut self, location: u64, file: String, line: u32, insert_duplicates: bool) {
+        if !insert_duplicates && self.last_line_location == Some(location) {
+            return;
+        }
+        self.last_line_location = Some(location);
         self.line_table.push(ModuleLine {
             offset: self.code.offset(),
             file,
             line,
         });
+    }
+
+    /// Moves past an exception return address before the next line mapping is registered.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp, OTP-29.1.1.
+    pub fn flush_last_error(&mut self) -> Result<(), ModuleError> {
+        if self.code.offset() == self.last_error_offset {
+            self.code.emit(|emitter| {
+                emitter.nop();
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     /// Starts collecting BEAM operation records for a function.
@@ -447,6 +470,7 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:550-559 (emit_aligned_label and
     // emit_i_func_label), OTP-29.1.1.
     pub fn emit_i_func_label(&mut self, id: u32) -> Result<(), ModuleError> {
+        self.flush_last_error()?;
         while !self.code.offset().is_multiple_of(8) {
             self.code.emit(|e| {
                 e.nop();
@@ -1811,6 +1835,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (emit_raise_exception ARG2 = pc), OTP-29.1.1.
     pub(super) fn branch_error(&mut self) -> Result<(), ModuleError> {
         self.code.bl(self.error_pc_label)?;
+        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp, OTP-29.1.1.
+        self.last_error_offset = self.code.offset();
         Ok(())
     }
 
