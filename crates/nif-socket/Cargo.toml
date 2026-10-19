@@ -18,3 +18,6 @@ arinsal-term.workspace = true
 libc = "0.2.175"
 rustix = "1.1.5"
 socket2 = { version = "0.6.0", features = ["all"] }
+
+[dev-dependencies]
+similar-asserts = "2"

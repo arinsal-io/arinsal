@@ -285,6 +285,7 @@ dependencies = [
  "arinsal-term",
  "libc",
  "rustix",
+ "similar-asserts",
  "socket2",
 ]
 
