@@ -749,7 +749,7 @@ fn wcswidth_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
             .as_chunks::<4>()
             .0
             .iter()
-            .map(|chunk| i32::from_ne_bytes(*chunk))
+            .map(|chunk| libc::wchar_t::from_ne_bytes(*chunk))
             .collect::<Vec<_>>();
         // SAFETY: chars is a valid contiguous wchar_t array for the supplied count.
         let width = unsafe { wcswidth(chars.as_ptr(), chars.len()) };

@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* Port of erts/emulator/beam/erl_bif_re.c:544-574 (compile), OTP-29.1.1. */
 #include "local_config.h"
 #include "pcre2.h"

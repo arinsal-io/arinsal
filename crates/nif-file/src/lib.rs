@@ -242,6 +242,8 @@ fn posix_code(code: i32) -> O {
         libc::ELOOP => "eloop",
         libc::EOVERFLOW => "eoverflow",
         libc::ENOTSUP => "enotsup",
+        // Same value as ENOTSUP on Linux, where erts compiles only the first case.
+        #[allow(unreachable_patterns)]
         libc::EOPNOTSUPP => "eopnotsupp",
         libc::EILSEQ => "eilseq",
         libc::ETIMEDOUT => "etimedout",
@@ -594,22 +596,41 @@ fn truncate_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
 }
 fn advise_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
     call(ctx, a, |a| {
-        with_file(&a[0], |_| {
+        with_file(&a[0], |_file| {
             let (Some(offset), Some(length)) = (numeric_i64(&a[1])?, numeric_i64(&a[2])?) else {
                 return Ok(invalid());
             };
-            if offset < 0
-                || length < 0
-                || !matches!(
-                    name(&a[3]),
-                    Some(
-                        "normal" | "random" | "sequential" | "will_need" | "dont_need" | "no_reuse"
-                    )
-                )
-            {
+            if offset < 0 || length < 0 {
                 return Ok(invalid());
             }
-            // macOS has no POSIX_FADVISE; OTP treats advice as successful.
+            #[cfg(target_os = "linux")]
+            let advice = match name(&a[3]) {
+                Some("normal") => libc::POSIX_FADV_NORMAL,
+                Some("random") => libc::POSIX_FADV_RANDOM,
+                Some("sequential") => libc::POSIX_FADV_SEQUENTIAL,
+                Some("will_need") => libc::POSIX_FADV_WILLNEED,
+                Some("dont_need") => libc::POSIX_FADV_DONTNEED,
+                Some("no_reuse") => libc::POSIX_FADV_NOREUSE,
+                _ => return Ok(invalid()),
+            };
+            #[cfg(not(target_os = "linux"))]
+            if !matches!(
+                name(&a[3]),
+                Some("normal" | "random" | "sequential" | "will_need" | "dont_need" | "no_reuse")
+            ) {
+                return Ok(invalid());
+            }
+            // Port of erts/emulator/nifs/unix/unix_prim_file.c (efile_advise), OTP-29.1.1.
+            // Without POSIX_FADVISE (macOS) OTP treats advice as successful.
+            #[cfg(target_os = "linux")]
+            {
+                // SAFETY: the descriptor is owned by the open file; posix_fadvise reads no memory.
+                let ret = unsafe { libc::posix_fadvise(_file.as_raw_fd(), offset, length, advice) };
+                // posix_fadvise returns the error number instead of setting errno.
+                if ret != 0 {
+                    return Ok(posix(&std::io::Error::from_raw_os_error(ret)));
+                }
+            }
             Ok(ok())
         })
     })
@@ -626,36 +647,70 @@ fn allocate_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
             else {
                 return Ok(invalid());
             };
-            let old = match file.metadata() {
-                Ok(m) => m.len(),
-                Err(e) => return Ok(posix(&e)),
-            };
-            if end as u64 <= old {
-                return Ok(ok());
+            // Port of erts/emulator/nifs/unix/unix_prim_file.c (efile_allocate), OTP-29.1.1.
+            #[cfg(target_os = "linux")]
+            {
+                let _ = end;
+                let mut ret;
+                loop {
+                    // SAFETY: the descriptor is owned by the open file; fallocate reads no memory.
+                    ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, offset, length) };
+                    if !(ret < 0
+                        && std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted)
+                    {
+                        break;
+                    }
+                }
+                if ret < 0 {
+                    // Fallback to posix_fallocate, which returns the error number.
+                    loop {
+                        // SAFETY: as above.
+                        let r = unsafe { libc::posix_fallocate(file.as_raw_fd(), offset, length) };
+                        if r == libc::EINTR {
+                            continue;
+                        }
+                        if r != 0 {
+                            return Ok(posix(&std::io::Error::from_raw_os_error(r)));
+                        }
+                        break;
+                    }
+                }
+                Ok(ok())
             }
-            // Port of erts/emulator/nifs/unix/unix_prim_file.c:600 (efile_allocate), OTP-29.1.1.
-            let mut request = libc::fstore_t {
-                fst_flags: libc::F_ALLOCATECONTIG,
-                fst_posmode: libc::F_PEOFPOSMODE,
-                fst_offset: 0,
-                fst_length: end - old as i64,
-                fst_bytesalloc: 0,
-            };
-            // SAFETY: request is initialized and file owns a valid descriptor.
-            let mut ret =
-                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut request) };
-            if ret < 0 {
-                request.fst_flags = libc::F_ALLOCATEALL;
-                // SAFETY: request remains initialized and file owns the descriptor.
-                ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut request) };
+            #[cfg(not(target_os = "linux"))]
+            {
+                let old = match file.metadata() {
+                    Ok(m) => m.len(),
+                    Err(e) => return Ok(posix(&e)),
+                };
+                if end as u64 <= old {
+                    return Ok(ok());
+                }
+                let mut request = libc::fstore_t {
+                    fst_flags: libc::F_ALLOCATECONTIG,
+                    fst_posmode: libc::F_PEOFPOSMODE,
+                    fst_offset: 0,
+                    fst_length: end - old as i64,
+                    fst_bytesalloc: 0,
+                };
+                // SAFETY: request is initialized and file owns a valid descriptor.
+                let mut ret =
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut request) };
+                if ret < 0 {
+                    request.fst_flags = libc::F_ALLOCATEALL;
+                    // SAFETY: request remains initialized and file owns the descriptor.
+                    ret =
+                        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut request) };
+                }
+                if ret < 0 {
+                    return Ok(posix(&std::io::Error::last_os_error()));
+                }
+                Ok(file
+                    .set_len(end as u64)
+                    .map(|()| ok())
+                    .unwrap_or_else(|e| posix(&e)))
             }
-            if ret < 0 {
-                return Ok(posix(&std::io::Error::last_os_error()));
-            }
-            Ok(file
-                .set_len(end as u64)
-                .map(|()| ok())
-                .unwrap_or_else(|e| posix(&e)))
         })
     })
 }

@@ -133,13 +133,34 @@ fn safe_module_name(module: &str) -> Result<&str, DumpError> {
     Ok(module)
 }
 
+#[cfg(target_vendor = "apple")]
+const ASSEMBLER: &str = "clang";
+#[cfg(target_vendor = "apple")]
+const ASSEMBLER_ARGS: &[&str] = &["-target", "arm64-apple-macos", "-c"];
+#[cfg(target_vendor = "apple")]
+const OBJDUMP: &str = "/usr/bin/objdump";
+#[cfg(not(target_vendor = "apple"))]
+const OBJDUMP: &str = "objdump";
+#[cfg(target_vendor = "apple")]
+const OBJDUMP_ARCH: &[&str] = &["--arch=arm64"];
+#[cfg(not(target_vendor = "apple"))]
+const ASSEMBLER: &str = "cc";
+#[cfg(not(target_vendor = "apple"))]
+const ASSEMBLER_ARGS: &[&str] = &["-c"];
+#[cfg(not(target_vendor = "apple"))]
+const OBJDUMP_ARCH: &[&str] = &[];
+
+#[cfg(target_vendor = "apple")]
+const DUMP_PROLOGUE: &str =
+    ".section __TEXT,__text,regular,pure_instructions\n.globl _arinsal_dump\n_arinsal_dump:\n";
+#[cfg(not(target_vendor = "apple"))]
+const DUMP_PROLOGUE: &str = ".text\n.globl arinsal_dump\narinsal_dump:\n";
+
 fn disassemble(bytes: &[u8]) -> Result<BTreeMap<usize, (String, String)>, DumpError> {
     let temp = TempDirectory::new()?;
     let assembly = temp.path.join("code.s");
     let object = temp.path.join("code.o");
-    let mut source = String::from(
-        ".section __TEXT,__text,regular,pure_instructions\n.globl _arinsal_dump\n_arinsal_dump:\n",
-    );
+    let mut source = String::from(DUMP_PROLOGUE);
     for chunk in bytes.chunks(16) {
         source.push_str(".byte ");
         for (index, byte) in chunk.iter().enumerate() {
@@ -151,20 +172,18 @@ fn disassemble(bytes: &[u8]) -> Result<BTreeMap<usize, (String, String)>, DumpEr
         source.push('\n');
     }
     fs::write(&assembly, source)?;
-    let clang = Command::new("clang")
-        .args(["-target", "arm64-apple-macos", "-c"])
-        .arg(&assembly)
-        .arg("-o")
-        .arg(&object)
-        .output()?;
+    let mut clang = Command::new(ASSEMBLER);
+    clang.args(ASSEMBLER_ARGS);
+    let clang = clang.arg(&assembly).arg("-o").arg(&object).output()?;
     if !clang.status.success() {
         return Err(DumpError(format!(
             "clang could not wrap dump bytes: {}",
             String::from_utf8_lossy(&clang.stderr).trim()
         )));
     }
-    let objdump = Command::new("/usr/bin/objdump")
-        .args(["-D", "--disassemble-zeroes", "--arch=arm64"])
+    let objdump = Command::new(OBJDUMP)
+        .args(["-D", "--disassemble-zeroes"])
+        .args(OBJDUMP_ARCH)
         .arg(&object)
         .output()?;
     if !objdump.status.success() {
