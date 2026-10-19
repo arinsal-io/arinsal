@@ -513,7 +513,10 @@ fn bit(bytes: &[u8], position: usize) -> u8 {
 }
 #[inline]
 fn put_bit(bytes: &mut [u8], position: usize, value: u8) {
-    bytes[position / 8] |= value << (7 - position % 8);
+    // Port of erts/emulator/beam/erl_bits.c:63 (`MASK_BITS`), OTP-29.1.1.
+    let mask = 1 << (7 - position % 8);
+    let byte = &mut bytes[position / 8];
+    *byte = (*byte & !mask) | (value << (7 - position % 8));
 }
 
 fn copy_bits(dst: &mut [u8], dst_pos: usize, src: &[u8], src_pos: usize, count: usize) {
