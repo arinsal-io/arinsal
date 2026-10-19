@@ -1523,6 +1523,7 @@ fn nif_api2_case(test_name: &str, body: &str) {
         test_name,
         &format!(
             r#"
+            #include <stdint.h>
             #include "erl_nif.h"
             static ERL_NIF_TERM run(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {{
                 (void)argc; (void)argv;
