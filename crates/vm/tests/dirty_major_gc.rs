@@ -11,6 +11,7 @@ const SOURCE: &str = r#"
 %% A worker that grows a heap past ERTS_POTENTIALLY_LONG_GC_HSIZE (128K words) has its own
 %% collections moved to a dirty CPU scheduler. The observer busy-polls so it sees one.
 run() ->
+    ensure_kernel_refc(),
     Schedulers = erlang:system_info(schedulers),
     DirtySchedulers = erlang:system_info(dirty_cpu_schedulers),
     false = erlang:system_flag(scheduler_wall_time, true),
@@ -65,6 +66,12 @@ active(Id, Stats) ->
         {Id, Active, _Total} -> Active;
         false -> 0
     end.
+
+ensure_kernel_refc() ->
+    case whereis(kernel_refc) of
+        undefined -> {ok, _} = kernel_refc:start_link(), ok;
+        _Pid -> ok
+    end.
 "#;
 
 #[test]
@@ -85,13 +92,13 @@ fn self_initiated_long_gc_matches_otp_and_uses_dirty_cpu() {
     let actual = vm
         .eval_scheduled("dirty_major_gc", "run", &[], 2, None)
         .expect("scheduled dirty major GC run");
-    assert_eq!(expected, CallResult::Ok(actual.term.clone()));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term.clone()));
     let run = OwnedTerm::Tuple(vec![
         OwnedTerm::Int(1_000_000),
         OwnedTerm::Atom("true".into()),
         OwnedTerm::Atom("running".into()),
     ]);
-    assert_eq!(
+    similar_asserts::assert_eq!(
         actual.term,
         OwnedTerm::Tuple(vec![
             OwnedTerm::List {
@@ -282,7 +289,7 @@ fn explicit_dirty_gc_reductions_match_otp_formula() {
     let small = |groups: &[Vec<GcCase>; 4]| -> Vec<(i64, i64)> {
         groups[0].iter().map(|case| (case.n, case.delta)).collect()
     };
-    assert_eq!(
+    similar_asserts::assert_eq!(
         small(&expected),
         small(&actual),
         "small heaps match exactly"
@@ -377,5 +384,5 @@ fn explicit_gc_heap_sizes_and_events_match_otp() {
     let actual = vm
         .eval_scheduled("dirty_gc_sizes", "run", &[], 2, None)
         .expect("scheduled dirty GC sizes run");
-    assert_eq!(expected, actual.term);
+    similar_asserts::assert_eq!(expected, actual.term);
 }

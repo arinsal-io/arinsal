@@ -36,6 +36,7 @@ run(5) ->
     Closed = err(fun() -> erlang:port_get_data(P) end),
     {Get0, Set, Get1, SetI, GetI, Ctrl, CtrlE, Bad, Closed};
 run(6) ->
+    ensure_kernel_refc(),
     Bd = erlang:system_flag(backtrace_depth, 4),
     erlang:system_flag(backtrace_depth, Bd),
     Fs = erlang:system_flag(fullsweep_after, 10),
@@ -76,6 +77,7 @@ run(6) ->
      err(fun() -> erlang:system_flag(trap_exit, true) end),
      err(fun() -> erlang:system_flag(scheduling_statistics, nope) end)};
 run(7) ->
+    ensure_kernel_refc(),
     _ = erlang:system_flag(scheduler_wall_time, false),
     {erts_internal:scheduler_wall_time(true),
      erts_internal:scheduler_wall_time(false),
@@ -132,6 +134,12 @@ err(F) ->
     catch
         error:Reason -> Reason
     end.
+
+ensure_kernel_refc() ->
+    case whereis(kernel_refc) of
+        undefined -> {ok, _} = kernel_refc:start_link(), ok;
+        _Pid -> ok
+    end.
 "#;
 
 #[test]
@@ -144,10 +152,10 @@ fn missing_bifs_match_otp_29() {
         .compile_named("missing_bifs", SOURCE, &[])
         .unwrap();
     reference.load("missing_bifs", &beam).unwrap();
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
     for scenario in 0..12 {
         let expected = reference.call("missing_bifs", "run", &[OwnedTerm::Int(scenario)]);
-        let mut vm = Vm::new([]);
-        vm.load_bytes(&beam).unwrap();
         let actual = vm.eval_scheduled(
             "missing_bifs",
             "run",
@@ -155,7 +163,7 @@ fn missing_bifs_match_otp_29() {
             1,
             Some(15),
         );
-        assert_eq!(
+        similar_asserts::assert_eq!(
             expected,
             CallResult::Ok(
                 actual

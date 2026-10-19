@@ -12,6 +12,7 @@ const SOURCE: &str = r#"
 -export([shapes/0, errors/0, enabled/0, toggle/0, gc_snapshot/0, grow/0, retire/0]).
 
 shapes() ->
+    ensure_kernel_refc(),
     erlang:system_flag(scheduler_wall_time, false),
     erlang:system_flag(microstate_accounting, false),
     Keys = [runtime, wall_clock, reductions, exact_reductions, context_switches,
@@ -24,6 +25,7 @@ shapes() ->
      erlang:memory([processes_used, code, ets, processes_used]), erlang:memory([])}.
 
 enabled() ->
+    ensure_kernel_refc(),
     erlang:system_flag(scheduler_wall_time, true),
     Wall = erlang:statistics(scheduler_wall_time),
     All = erlang:statistics(scheduler_wall_time_all),
@@ -79,6 +81,7 @@ catch_call(F) ->
     try F() of V -> {ok, V} catch Class:Reason -> {Class, Reason} end.
 
 grow() ->
+    ensure_kernel_refc(),
     erlang:system_flag(scheduler_wall_time, false),
     erlang:system_flag(microstate_accounting, false),
     R0 = element(1, erlang:statistics(reductions)),
@@ -118,6 +121,12 @@ fill(T, N) ->
 
 burn(0, _) -> ok;
 burn(N, Acc) -> burn(N - 1, [N | Acc]).
+
+ensure_kernel_refc() ->
+    case whereis(kernel_refc) of
+        undefined -> {ok, _} = kernel_refc:start_link(), ok;
+        _Pid -> ok
+    end.
 
 retire() ->
     Key = {stats_retire, 1},
@@ -234,7 +243,7 @@ fn map_get<'a>(term: &'a OwnedTerm, key: &str) -> &'a OwnedTerm {
 fn assert_microstate(actual: &OwnedTerm, expected: &OwnedTerm) {
     let actual_items = list_elems(actual);
     let expected_items = list_elems(expected);
-    assert_eq!(
+    similar_asserts::assert_eq!(
         actual_items.len(),
         expected_items.len(),
         "microstate length"
@@ -261,7 +270,7 @@ fn assert_microstate(actual: &OwnedTerm, expected: &OwnedTerm) {
                 })
                 .collect();
             names.sort();
-            assert_eq!(
+            similar_asserts::assert_eq!(
                 names,
                 [
                     "aux", "check_io", "emulator", "gc", "other", "port", "sleep"
@@ -278,7 +287,7 @@ fn assert_microstate(actual: &OwnedTerm, expected: &OwnedTerm) {
     }
     actual_types.sort();
     expected_types.sort();
-    assert_eq!(actual_types, expected_types);
+    similar_asserts::assert_eq!(actual_types, expected_types);
 }
 
 fn wall_total(term: &OwnedTerm) -> i64 {
@@ -288,7 +297,7 @@ fn wall_total(term: &OwnedTerm) -> i64 {
             let OwnedTerm::Tuple(fields) = entry else {
                 panic!("wall entry {entry:?}");
             };
-            assert_eq!(fields.len(), 3);
+            similar_asserts::assert_eq!(fields.len(), 3);
             assert!(fields.iter().all(is_int));
             as_int(&fields[2])
         })
@@ -327,7 +336,7 @@ fn sched_acct_statistics_and_memory_shapes_match_otp() {
     };
     let pairs = memory_pairs(&fields[1]);
     let value = |name: &str| pairs.iter().find(|(key, _)| key == name).unwrap().1;
-    assert_eq!(value("total"), value("processes") + value("system"));
+    similar_asserts::assert_eq!(value("total"), value("processes") + value("system"));
     assert!(value("processes_used") <= value("processes"));
     assert!(value("atom_used") <= value("atom"));
     assert!(value("system") >= value("atom") + value("binary") + value("code") + value("ets"));
@@ -341,7 +350,7 @@ fn sched_acct_statistics_and_memory_errors_match_otp() {
         return;
     };
     let (expected, actual) = run(&reference, "errors");
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }
 
 #[test]
@@ -361,8 +370,8 @@ fn sched_acct_enabled_scheduler_accounting_matches_otp_shape() {
     let OwnedTerm::Tuple(actual) = &actual else {
         panic!("enabled tuple");
     };
-    assert_eq!(list_elems(&actual[0]).len(), list_elems(&expected[0]).len());
-    assert_eq!(list_elems(&actual[1]).len(), list_elems(&expected[1]).len());
+    similar_asserts::assert_eq!(list_elems(&actual[0]).len(), list_elems(&expected[0]).len());
+    similar_asserts::assert_eq!(list_elems(&actual[1]).len(), list_elems(&expected[1]).len());
     assert!(list_elems(&actual[0]).iter().all(|entry| {
         matches!(entry, OwnedTerm::Tuple(fields) if fields.len() == 3 && fields.iter().all(is_int))
     }));
@@ -447,21 +456,21 @@ fn sched_acct_replaced_persistent_term_is_freed_after_gc() {
         return;
     };
     let (expected, actual) = run(&reference, "retire");
-    assert_eq!(
+    similar_asserts::assert_eq!(
         expected,
         CallResult::Ok(OwnedTerm::tuple(vec![
             OwnedTerm::atom("left"),
             OwnedTerm::atom("right")
         ]))
     );
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
     let trace = last_retirement_of_any_store();
     assert!(
         trace.pending_before >= 1,
         "pending_before {}",
         trace.pending_before
     );
-    assert_eq!(trace.pending_after, 0);
+    similar_asserts::assert_eq!(trace.pending_after, 0);
     assert!(trace.freed >= 1, "freed {}", trace.freed);
     assert!(
         trace.copied_roots >= 1,
