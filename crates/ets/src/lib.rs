@@ -885,7 +885,6 @@ pub(crate) struct StoredTerm {
     // Each object owns its heap. Moving this struct never moves the allocated words.
     heap: ObjectHeap,
     pub(crate) term: Term,
-    inline_pair: Option<[Term; 2]>,
     // ETS compressed tables retain only ETF bytes for non-key boxed elements.
     // The tuple heap contains NIL sentinels in those positions and never keeps
     // the original boxed values alive.
@@ -1127,7 +1126,6 @@ impl StoredTerm {
         Ok(Self {
             heap,
             term,
-            inline_pair: None,
             compressed_elements,
             compressed_magic_refs,
             compressed_bytes,
@@ -1149,22 +1147,6 @@ impl StoredTerm {
     }
 
     pub(crate) fn copy_stored(&self) -> Result<Self, EtsError> {
-        if let Some(pair) = self.inline_pair {
-            return Ok(Self {
-                heap: ObjectHeap::new(),
-                term: Term::small(0).unwrap(),
-                inline_pair: Some(pair),
-                compressed_elements: Vec::new(),
-                compressed_magic_refs: Vec::new(),
-                compressed_bytes: 0,
-                db_size_words: self.db_size_words,
-                term_size_words: self.term_size_words,
-                shallow: false,
-                order: self.order,
-                group_order: self.group_order,
-                hvalue: self.hvalue,
-            });
-        }
         if self.compressed_elements.iter().any(Option::is_some) {
             let mut copy = Self::copy_heap(self.term)?;
             copy.compressed_elements = self.compressed_elements.clone();
@@ -1179,7 +1161,6 @@ impl StoredTerm {
         Ok(Self {
             heap,
             term,
-            inline_pair: None,
             compressed_elements: Vec::new(),
             compressed_magic_refs: Vec::new(),
             compressed_bytes: 0,
@@ -1205,16 +1186,10 @@ impl StoredTerm {
     }
 
     fn arity(&self) -> usize {
-        self.inline_pair.map_or_else(
-            || term_sequence(self.term).map_or(0, |tuple| tuple.len()),
-            |_| 2,
-        )
+        term_sequence(self.term).map_or(0, |tuple| tuple.len())
     }
 
     pub(crate) fn key(&self, keypos: usize) -> Term {
-        if let Some(pair) = self.inline_pair {
-            return pair[keypos - 1];
-        }
         // SAFETY: this object retains the heap containing its tuple.
         unsafe { self.term.tuple_ref().unwrap().get(keypos - 1).unwrap() }
     }
@@ -1227,10 +1202,6 @@ impl StoredTerm {
     fn set_immediate_element(&mut self, index: usize, value: Term) -> bool {
         if value.is_pointer() || self.tuple_element(index).is_none_or(Term::is_pointer) {
             return false;
-        }
-        if let Some(pair) = self.inline_pair.as_mut() {
-            pair[index] = value;
-            return true;
         }
         if !self.compressed_elements.is_empty() || !self.term.is_pointer() {
             return false;
@@ -1249,9 +1220,6 @@ impl StoredTerm {
     }
 
     fn tuple_element(&self, index: usize) -> Option<Term> {
-        if let Some(pair) = self.inline_pair {
-            return pair.get(index).copied();
-        }
         // SAFETY: this object retains the heap containing its tuple.
         unsafe { self.term.tuple_ref() }.and_then(|tuple| tuple.get(index))
     }
@@ -1283,14 +1251,6 @@ impl StoredTerm {
     }
 
     fn exact_eq_term(&self, other: Term) -> bool {
-        if let Some(pair) = self.inline_pair {
-            // SAFETY: the caller retains the comparison term's source heap.
-            return unsafe { other.tuple_ref() }.is_some_and(|tuple| {
-                tuple.len() == 2
-                    && exact_eq(pair[0], tuple.get(0).unwrap())
-                    && exact_eq(pair[1], tuple.get(1).unwrap())
-            });
-        }
         // SAFETY: `self` owns the tuple heap for the duration of this comparison.
         let Some(left) = term_sequence(self.term) else {
             return false;
@@ -1331,9 +1291,6 @@ impl StoredTerm {
     }
 
     fn exact_eq_stored(&self, other: &StoredTerm) -> bool {
-        if let (Some(left), Some(right)) = (self.inline_pair, other.inline_pair) {
-            return exact_eq(left[0], right[0]) && exact_eq(left[1], right[1]);
-        }
         if self.compressed_elements.iter().any(Option::is_some)
             || other.compressed_elements.iter().any(Option::is_some)
         {
@@ -1372,9 +1329,6 @@ impl StoredTerm {
     }
 
     fn copy_out<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
-        if let Some(pair) = self.inline_pair {
-            return Ok(TermBuilder::new(dst).tuple(&pair)?);
-        }
         let _keep_live = &self.heap;
         if self.shallow && !self.compressed_elements.iter().any(Option::is_some) {
             // Port of erts/emulator/beam/erl_db_util.h (db_copy_object_from_ets): the stored
@@ -1460,9 +1414,6 @@ impl StoredTerm {
     }
 
     fn term_for_match<H: HeapAlloc>(&self, scratch: &mut H) -> Result<Term, EtsError> {
-        if let Some(pair) = self.inline_pair {
-            return Ok(TermBuilder::new(scratch).tuple(&pair)?);
-        }
         self.copy_out(scratch)
     }
 
@@ -1475,11 +1426,7 @@ impl StoredTerm {
         &self,
         scratch: &mut H,
     ) -> Result<(Term, Option<usize>), EtsError> {
-        if let Some(pair) = self.inline_pair {
-            let term = TermBuilder::new(scratch).tuple(&pair)?;
-            return Ok((term, Some(3)));
-        }
-        if self.inline_pair.is_none() && !self.compressed_elements.iter().any(Option::is_some) {
+        if !self.compressed_elements.iter().any(Option::is_some) {
             return Ok((self.term, Some(self.term_size_words)));
         }
         Ok((self.term_for_match(scratch)?, None))
@@ -3877,11 +3824,7 @@ impl Table {
         let mut heap = VecHeap::new();
         let mut stored_values = None;
         self.try_matching_first(key, |found| {
-            let tuple_len = if found.inline_pair.is_some() {
-                2
-            } else {
-                term_sequence(found.term).ok_or(EtsError::BadArg)?.len()
-            };
+            let tuple_len = term_sequence(found.term).ok_or(EtsError::BadArg)?.len();
             stored_values = Some(
                 (0..tuple_len)
                     .map(|index| found.copy_element_out(index, &mut heap))

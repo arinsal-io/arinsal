@@ -8,7 +8,6 @@ use arinsal_term::{
 use parking_lot::RwLock as FastRwLock;
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
@@ -284,10 +283,29 @@ pub(super) struct HashStorage {
     initial_slots: usize,
     auto_lock_count: AtomicUsize,
     decentralized_counters: bool,
-    resize_lock: Mutex<()>,
+    /// erts `tb->is_resizing`: at most one thread grows or shrinks the table at a time, and a
+    /// thread that finds it set does not wait.
+    is_resizing: AtomicBool,
+}
+
+/// Holds `is_resizing` until dropped (erts `done_resizing`).
+struct ResizeGuard<'a>(&'a AtomicBool);
+
+impl Drop for ResizeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl HashStorage {
+    /// Try to become the one resizing thread.
+    // Port of erts/emulator/beam/erl_db_hash.c (begin_resizing), OTP-29.1.1.
+    fn begin_resizing(&self) -> Option<ResizeGuard<'_>> {
+        (!self.is_resizing.load(Ordering::Acquire)
+            && !self.is_resizing.swap(true, Ordering::Acquire))
+        .then(|| ResizeGuard(&self.is_resizing))
+    }
+
     /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     pub(super) fn new(
         write_concurrency: WriteConcurrency,
@@ -331,7 +349,7 @@ impl HashStorage {
             initial_slots,
             auto_lock_count: AtomicUsize::new(locks),
             decentralized_counters,
-            resize_lock: Mutex::new(()),
+            is_resizing: AtomicBool::new(false),
         }
     }
 
@@ -840,7 +858,9 @@ impl HashStorage {
         if nitems >= self.shrink_limit() as isize {
             return;
         }
-        let _resize = self.resize_lock.lock().unwrap();
+        let Some(_resize) = self.begin_resizing() else {
+            return;
+        };
         for _ in 0..5 {
             let nslots = self.nslots.load(Ordering::Relaxed);
             if nitems >= ((nslots.saturating_sub(EXT_SEGMENT)) / 2) as isize {
@@ -894,16 +914,24 @@ impl HashStorage {
         if fixed {
             return;
         }
-        // Port of erts/emulator/beam/erl_db_hash.c (db_finalize_dbterm_hash),
-        // OTP-29.1.1.
-        if self.estimated_items(hash) <= self.nactive() as isize {
-            return;
+        // Port of erts/emulator/beam/erl_db_hash.c (db_finalize_dbterm_hash and the
+        // `loop_limit` of grow), OTP-29.1.1.
+        for _ in 0..5 {
+            if self.estimated_items(hash) <= self.nactive() as isize || !self.grow_one(hash) {
+                break;
+            }
         }
-        let _resize = self.resize_lock.lock().unwrap();
+    }
+
+    /// One bucket split; false when another thread is resizing or nothing is left to do.
+    fn grow_one(&self, hash: u64) -> bool {
+        let Some(_resize) = self.begin_resizing() else {
+            return false;
+        };
         let nitems = self.estimated_items(hash);
         let old_active = self.nactive();
         if nitems <= old_active as isize {
-            return;
+            return false;
         }
         let old_slots = self.nslots.load(Ordering::Relaxed);
         if old_active == old_slots {
@@ -971,6 +999,7 @@ impl HashStorage {
         }
         self.szm.store(new_mask, Ordering::Relaxed);
         self.nactive.store(old_active + 1, Ordering::Release);
+        true
     }
 
     pub(super) fn with_objects_hash<R>(
