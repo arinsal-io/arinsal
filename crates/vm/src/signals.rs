@@ -218,7 +218,29 @@ pub(crate) extern "C" fn is_process_alive_light(
     if self_pid != 0 && arg.tagged_word() == self_pid {
         return crate::native_hooks::raw(Term::atom(arinsal_term::atoms::TRUE));
     }
-    alive_trap(process, identity)
+    match alive_fast(process, arg) {
+        Some(result) => crate::native_hooks::raw(Term::atom(result)),
+        None => alive_trap(process, identity),
+    }
+}
+
+/// The part of `is_process_alive_1` that needs no signal: the target is gone or has an idle
+/// signal state, and the caller has no incoming signals to order against.
+// Port of erts/emulator/beam/erl_bif_info.c (is_process_alive_1), OTP-29.1.1. Where erts
+// traps out (`is_process_alive_trap`, `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`) this returns `None`
+// and the executor runs the alive request, which orders strictly more than erts does.
+fn alive_fast(process: &Process, arg: Term) -> Option<arinsal_term::Atom> {
+    let pid = Pid::from_term(arg)?;
+    let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
+    let own = process.self_pid?;
+    if scheduler.is_quiet(own) != Some(true) {
+        return None;
+    }
+    match scheduler.is_quiet(pid) {
+        None => Some(arinsal_term::atoms::FALSE),
+        Some(true) => Some(arinsal_term::atoms::TRUE),
+        Some(false) => None,
+    }
 }
 
 /// `BIF_TRAP1(is_process_alive_trap, ...)`: the fragment context-switches to
@@ -4180,6 +4202,12 @@ fn is_process_alive(
     }
     if !runtime(process)?.scheduler()?.lookup(pid) {
         return Ok(atom("false"));
+    }
+    if let Some(result) = alive_fast(
+        process,
+        pid.to_term().ok_or_else(|| badarg("is_process_alive/1"))?,
+    ) {
+        return Ok(Term::atom(result));
     }
     match submit(process, ctx, pid, RemoteOp::Alive, Some(WaitKind::Alive))? {
         Submit::Sent(_) => Err(await_reply()),

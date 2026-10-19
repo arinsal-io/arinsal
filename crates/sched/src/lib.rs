@@ -5464,6 +5464,17 @@ impl<T: Task> Scheduler<T> {
             .table
             .with_live(pid, |process| process.input.has_pending())
     }
+    /// Whether `pid` is alive with no exit started and no signals queued: the state word has none of
+    /// `ERTS_PSFLG_EXITING | SIG_Q | MSG_SIG_IN_Q | NMSG_SIG_IN_Q`. `None` when the process is gone.
+    // Port of erts/emulator/beam/erl_bif_info.c (is_process_alive_1: the state test before BIF_TRAP1),
+    // OTP-29.1.1.
+    pub fn is_quiet(&self, pid: Pid) -> Option<bool> {
+        self.inner.table.with_live(pid, |process| {
+            process.exit_flags.load(Ordering::Acquire) & proc_flags::EXITING == 0
+                && process.input.state().load(Ordering::Acquire) & (psflg::SIG_Q | psflg::SIG_IN_Q)
+                    == 0
+        })
+    }
     /// Spawn a normal-priority task.
     pub fn spawn(&self, task: T) -> Result<Pid, Error> {
         self.spawn_priority(task, Priority::Normal)
