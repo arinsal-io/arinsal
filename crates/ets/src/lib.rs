@@ -1114,7 +1114,9 @@ impl StoredTerm {
         } else {
             arinsal_term::copy_struct(term, &mut heap, plain_size.unwrap_or_default())?
         };
-        let term_size_words = plain_size.unwrap_or_default();
+        // A compressed object stores a placeholder tuple; its copy size is that of the stored
+        // term, not of the uncompressed source.
+        let term_size_words = plain_size.unwrap_or_else(|| arinsal_term::size_object(term));
         Ok(Self {
             heap,
             term,
@@ -6032,5 +6034,29 @@ mod registry_tests {
         registry.delete(first).unwrap();
         assert!(index.lookup(renamed_name).is_none());
         assert!(index.lookup(second_name).is_some());
+    }
+}
+
+#[cfg(test)]
+mod stored_size_tests {
+    use super::*;
+
+    /// A compressed object without compressed elements is copied out with the size of its
+    /// stored tuple. A zero size under-reserves the destination heap and the copy overruns it.
+    #[test]
+    fn compressed_object_copy_out_reserves_stored_size() {
+        let mut source = VecHeap::new();
+        let object = TermBuilder::new(&mut source)
+            .tuple(&[
+                Term::small(0).unwrap(),
+                Term::small(7).unwrap(),
+                Term::small(1).unwrap(),
+            ])
+            .unwrap();
+        let stored = StoredTerm::copy_for_table(object, true, 2, 1).unwrap();
+        let mut out = ObjectHeap::new();
+        let copy = stored.copy_out(&mut out).unwrap();
+        let reserved: usize = out.words.iter().map(|words| words.len()).sum();
+        assert_eq!(reserved, arinsal_term::size_object(copy));
     }
 }
