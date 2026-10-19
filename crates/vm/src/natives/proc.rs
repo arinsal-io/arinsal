@@ -3598,6 +3598,9 @@ fn spawn_request_abandon(id: Term) -> Result<Term, VmError> {
 struct LocalSpawn {
     link: bool,
     monitor: bool,
+    monitor_tag: Option<arinsal_etf::OwnedTerm>,
+    monitor_alias: Option<crate::proc_create::AliasMode>,
+    monitor_priority: bool,
     min_heap: Option<usize>,
     min_bin_vheap: Option<usize>,
     max_heap: Option<crate::process::MaxHeap>,
@@ -3621,6 +3624,9 @@ fn parse_spawn_options(
         opts: options,
         link: false,
         monitor: false,
+        monitor_tag: None,
+        monitor_alias: None,
+        monitor_priority: false,
         min_heap: None,
         min_bin_vheap: None,
         max_heap: None,
@@ -3700,7 +3706,15 @@ fn parse_spawn_options(
                 } else if key == atom("link") {
                     parsed.link = true;
                 } else {
-                    parsed.monitor = true;
+                    match crate::signals::spawn_monitor_options(value) {
+                        Some((tag, alias, priority)) => {
+                            parsed.monitor = true;
+                            parsed.monitor_tag = tag;
+                            parsed.monitor_alias = alias;
+                            parsed.monitor_priority = priority;
+                        }
+                        None => parsed.bad = true,
+                    }
                 }
             } else {
                 parsed.bad = true;
@@ -3755,8 +3769,9 @@ fn spawn_apply(
             link: options.link,
             monitor: options.monitor_id.map(|id| crate::signals::SpawnMonitor {
                 id: Some(id),
-                tag: None,
-                alias: None,
+                tag: options.monitor_tag.clone(),
+                alias: options.monitor_alias,
+                priority: options.monitor_priority,
             }),
             min_heap: options.min_heap,
             min_bin_vheap: options.min_bin_vheap,
