@@ -1406,7 +1406,7 @@ fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmEr
             .schedulers
             .and_then(|count| usize::try_from(count).ok())
             .filter(|count| *count > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+            .unwrap_or_else(|| arinsal_alloc::cpuinfo::default_schedulers().0);
         let (amcbf, rmcbf, mcs, _, _, _, _, _) = allocator_global_settings(&configured.flags);
         let count = schedulers + 1;
         let instances = (0..count)
@@ -1456,7 +1456,7 @@ fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmEr
         .schedulers
         .and_then(|count| usize::try_from(count).ok())
         .filter(|count| *count > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+        .unwrap_or_else(|| arinsal_alloc::cpuinfo::default_schedulers().0);
     let dirty = configured.dirty_instances.unwrap_or(0);
     let Some(mut spec) = default_allocator(name, schedulers) else {
         return Err(badarg());
@@ -1532,7 +1532,7 @@ fn all_allocator_options(process: &mut Process) -> Result<Term, VmError> {
         .schedulers
         .and_then(|count| usize::try_from(count).ok())
         .filter(|count| *count > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+        .unwrap_or_else(|| arinsal_alloc::cpuinfo::default_schedulers().0);
     let names = [
         "sys_alloc",
         "temp_alloc",
@@ -3237,7 +3237,7 @@ fn erts_alloc_flag(process: &mut Process, value: Term) -> Result<Term, VmError> 
     }
     // Only alloc_util allocators accept dynamic parameters, and only `sbct`.
     // Port of erts/emulator/beam/erl_alloc.c:3445 (`erts_alloc_set_dyn_param`), OTP-29.1.1.
-    let schedulers = std::thread::available_parallelism().map_or(1, usize::from);
+    let schedulers = arinsal_alloc::cpuinfo::default_schedulers().0;
     let configured = arinsal_args::active_allocator_options();
     let enabled = default_allocator(allocator, schedulers).is_some_and(|mut spec| {
         apply_allocator_overrides(&mut spec, allocator, &configured.flags, schedulers);
@@ -3463,7 +3463,7 @@ impl SystemFlags {
     pub(crate) fn boot() -> Self {
         static BOOT: OnceLock<SystemFlags> = OnceLock::new();
         BOOT.get_or_init(|| {
-            let cpus = logical_processors();
+            let (cpus, cpus_online) = logical_processors();
             let emulator = arinsal_args::active_emulator_flags();
             let (
                 schedulers_total,
@@ -3471,7 +3471,7 @@ impl SystemFlags {
                 dirty_cpu_total,
                 dirty_cpu_online,
                 dirty_io_total,
-            ) = boot_scheduler_counts_from(cpus, &emulator);
+            ) = boot_scheduler_counts_from(cpus, cpus_online, &emulator);
             SystemFlags {
                 // Port of erl_init.c:1328-1332 (`ERL_FULLSWEEP_AFTER`), OTP-29.1.1.
                 fullsweep_after: std::env::var("ERL_FULLSWEEP_AFTER")
@@ -3541,18 +3541,24 @@ pub(crate) fn scheduler_online_default(runtime: &crate::process::Runtime) -> usi
 
 #[cfg(test)]
 fn boot_scheduler_counts(cpus: usize) -> (usize, usize, usize, usize, usize) {
-    boot_scheduler_counts_from(cpus, &arinsal_args::EmulatorFlags::default())
+    boot_scheduler_counts_from(cpus, cpus, &arinsal_args::EmulatorFlags::default())
 }
 
 // Port of erts/emulator/beam/erl_init.c:851-867, 951-1140, 1193-1210, OTP-29.1.1.
 fn boot_scheduler_counts_from(
     cpus: usize,
+    cpus_online: usize,
     emulator: &arinsal_args::EmulatorFlags,
 ) -> (usize, usize, usize, usize, usize) {
     let schedulers =
-        arinsal_args::resolve_scheduler_count(emulator.schedulers, cpus).unwrap_or((cpus, cpus));
-    let dirty_cpu = arinsal_args::resolve_scheduler_count(emulator.dirty_cpu_schedulers, cpus)
-        .unwrap_or((cpus, cpus));
+        arinsal_args::resolve_scheduler_count_online(emulator.schedulers, cpus, cpus_online)
+            .unwrap_or((cpus, cpus_online));
+    let dirty_cpu = arinsal_args::resolve_scheduler_count_online(
+        emulator.dirty_cpu_schedulers,
+        cpus,
+        cpus_online,
+    )
+    .unwrap_or((cpus, cpus_online));
     // Port of erts/emulator/beam/erl_init.c:867 (dirty_io_scheds = 10), OTP-29.1.1.
     let dirty_io = emulator
         .dirty_io_schedulers
@@ -4270,8 +4276,8 @@ fn wall_ms(flags: &StatisticsState) -> u64 {
     u64::try_from(flags.wall_origin.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn logical_processors() -> usize {
-    std::thread::available_parallelism().map_or(1, |count| count.get())
+fn logical_processors() -> (usize, usize) {
+    arinsal_alloc::cpuinfo::default_schedulers()
 }
 
 fn scheduler_stats(
@@ -4602,6 +4608,7 @@ fn small(value: i64) -> Term {
 fn check_io_info(process: &mut Process) -> Result<Term, VmError> {
     // Port of erts_check_io_info in erts/emulator/sys/common/erl_check_io.c:2675,
     // OTP-29.1.1. The fallback and scheduler sets are part of OTP's Mac layout.
+    #[cfg(target_os = "macos")]
     let entries = [
         (
             "select", "false", 13_536, "true", "false", "false", "true", 0, 2,
@@ -4611,6 +4618,19 @@ fn check_io_info(process: &mut Process) -> Result<Term, VmError> {
         ),
         (
             "kqueue", "kqueue", 65_592, "false", "false", "true", "false", 1, 1,
+        ),
+    ];
+    // Linux layout of OTP 29.1.1 (poll fallback set, epoll set, epoll scheduler set).
+    #[cfg(not(target_os = "macos"))]
+    let entries = [
+        (
+            "poll", "false", 25_248, "true", "false", "false", "true", 0, 1,
+        ),
+        (
+            "epoll", "epoll", 56, "false", "false", "true", "false", 0, 1,
+        ),
+        (
+            "epoll", "epoll", 65_592, "false", "false", "true", "false", 1, 2,
         ),
     ];
     let mut sets = Vec::with_capacity(entries.len());
@@ -4628,7 +4648,10 @@ fn check_io_info(process: &mut Process) -> Result<Term, VmError> {
             ("batch_updates", atom(batch)),
             ("concurrent_updates", atom(concurrent)),
             ("fallback", atom(fallback)),
-            ("max_fds", non_neg(process, 1_048_576)?),
+            (
+                "max_fds",
+                non_neg(process, arinsal_alloc::cpuinfo::poll_max_fds() as u64)?,
+            ),
             ("active_fds", small(0)),
             ("poll_threads", small(poll_threads)),
         ];

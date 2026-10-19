@@ -155,7 +155,7 @@ fn system_info(sip: *mut ErlDrvSysInfo, si_size: usize) {
         let hooks = hooks();
         info.async_threads = hooks.map_or(1, |h| h.async_threads()) as c_int;
         info.scheduler_threads = hooks.map_or_else(
-            || std::thread::available_parallelism().map_or(1, usize::from),
+            || arinsal_alloc::cpuinfo::default_schedulers().0,
             |h| h.scheduler_threads(),
         ) as c_int;
     }

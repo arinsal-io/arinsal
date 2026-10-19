@@ -735,7 +735,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let available = thread::available_parallelism().map_or(1, |n| n.get());
+        let available = arinsal_alloc::cpuinfo::default_schedulers().0;
         Self {
             workers: available.max(1),
             max_processes: 1_048_576,

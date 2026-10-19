@@ -354,7 +354,7 @@ fn handle(registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, VmError> 
 
 /// `erlang:system_info(schedulers)`. `ets:all/0` receives exactly this many replies.
 fn scheduler_count() -> usize {
-    std::thread::available_parallelism().map_or(1, usize::from)
+    arinsal_alloc::cpuinfo::default_schedulers().0
 }
 
 /// Live tables as `ets:all/0` prints them: names for named tables, ids otherwise.

@@ -8238,7 +8238,7 @@ impl Vm {
         arinsal_ets::rwmtx::set_main_threads(
             config
                 .workers
-                .min(std::thread::available_parallelism().map_or(1, usize::from)),
+                .min(arinsal_alloc::cpuinfo::cpu_info().configured.max(1)),
         );
         let scheduler = Arc::new(match simulation_seed {
             Some(seed) => Scheduler::simulation(config, seed),

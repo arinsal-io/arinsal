@@ -1144,7 +1144,7 @@ fn convert_charged(ctx: &mut Ctx<'_>, args: &[Term], list_output: bool) -> Resul
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2222 (erts_native_filename_need), OTP-29.1.1.
-fn filename_list_bytes(root: Term) -> Result<Vec<u8>, BifError> {
+fn filename_list_bytes(root: Term, encoding: FilenameEncoding) -> Result<Vec<u8>, BifError> {
     if root != Term::NIL && root.classify() != TermKind::List {
         return Err(BifError::BADARG);
     }
@@ -1177,6 +1177,11 @@ fn filename_list_bytes(root: Term) -> Result<Vec<u8>, BifError> {
                         if cp == 0 || !valid_cp(cp) {
                             return Err(BifError::BADARG);
                         }
+                        if encoding == FilenameEncoding::Latin1 {
+                            result.push(u8::try_from(cp).map_err(|_| BifError::BADARG)?);
+                            current = tail;
+                            continue;
+                        }
                         let mut buffer = [0; 4];
                         result.extend_from_slice(
                             char::from_u32(cp)
@@ -1204,7 +1209,7 @@ fn internal_name2native(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifErr
         }
         data.into_owned()
     } else {
-        filename_list_bytes(args[0])?
+        filename_list_bytes(args[0], filename_encoding())?
     };
     data.push(0);
     Ok(binary(ctx, &data))
@@ -1217,10 +1222,22 @@ fn codepoint_list(ctx: &mut Ctx<'_>, points: impl IntoIterator<Item = u32>) -> T
 // Port of erts/emulator/beam/erl_unicode.c:2735 (prim_file_internal_native2name_1), OTP-29.1.1.
 fn internal_native2name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let data = bytes(args[0])?;
+    if data.is_empty() {
+        return Ok(Term::NIL);
+    }
+    let encoding = filename_encoding();
+    if encoding == FilenameEncoding::Latin1 {
+        return Ok(codepoint_list(ctx, data.iter().map(|b| u32::from(*b))));
+    }
     match std::str::from_utf8(&data) {
         Ok(text) => {
-            let points = text.chars().map(|c| c as u32).collect();
-            Ok(codepoint_list(ctx, normalize_filename(points)))
+            let points: Vec<u32> = text.chars().map(|c| c as u32).collect();
+            let points = if encoding == FilenameEncoding::Utf8Mac {
+                normalize_filename(points)
+            } else {
+                points
+            };
+            Ok(codepoint_list(ctx, points))
         }
         Err(_) => Ok(tuple_build(ctx, &[atom("error"), atom("warning")])),
     }
@@ -1236,12 +1253,52 @@ fn internal_normalize_utf8(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, Bif
 
 // Port of erts/emulator/beam/erl_unicode.c:2855 (prim_file_is_translatable_1), OTP-29.1.1.
 fn is_translatable(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(bool_term(std::str::from_utf8(&bytes(args[0])?).is_ok()))
+    let data = bytes(args[0])?;
+    Ok(bool_term(
+        data.is_empty()
+            || filename_encoding() == FilenameEncoding::Latin1
+            || std::str::from_utf8(&data).is_ok(),
+    ))
 }
 
-// OTP 29.1.1 defaults on macOS and Unix without emulator filename flags.
+/// How the OS names files, as `erts_get_native_filename_encoding` reports it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilenameEncoding {
+    Latin1,
+    Utf8,
+    /// UTF-8 with the decomposed forms macOS stores; names are recomposed on the way in.
+    Utf8Mac,
+}
+
+/// Port of erts/emulator/sys/common/erl_sys_common_misc.c (erts_init_sys_common_misc),
+/// OTP-29.1.1. The `+fn` flags that override the locale are not honoured.
+fn filename_encoding() -> FilenameEncoding {
+    static ENCODING: std::sync::OnceLock<FilenameEncoding> = std::sync::OnceLock::new();
+    *ENCODING.get_or_init(|| {
+        // macOS, Windows and Android default the user-requested encoding to UTF-8.
+        if cfg!(target_os = "macos") {
+            return FilenameEncoding::Utf8Mac;
+        }
+        // SAFETY: setlocale/nl_langinfo return process-owned strings; the empty locale name is
+        // a static C string. erts also switches LC_CTYPE to the environment's locale here.
+        let utf8 = unsafe {
+            !libc::setlocale(libc::LC_CTYPE, c"".as_ptr()).is_null()
+                && std::ffi::CStr::from_ptr(libc::nl_langinfo(libc::CODESET)).to_bytes() == b"UTF-8"
+        };
+        if utf8 {
+            FilenameEncoding::Utf8
+        } else {
+            FilenameEncoding::Latin1
+        }
+    })
+}
+
+// Port of erts/emulator/beam/erl_unicode.c (file_native_name_encoding_0), OTP-29.1.1.
 fn native_name_encoding(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
-    Ok(atom("utf8"))
+    Ok(atom(match filename_encoding() {
+        FilenameEncoding::Latin1 => "latin1",
+        FilenameEncoding::Utf8 | FilenameEncoding::Utf8Mac => "utf8",
+    }))
 }
 
 // OTP 29.1.1 defaults without the +pc emulator flag.

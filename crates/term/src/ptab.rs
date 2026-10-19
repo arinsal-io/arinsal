@@ -148,7 +148,36 @@ impl Default for PtabLayout {
 }
 
 static PROCESS_TABLE_BITS: AtomicU8 = AtomicU8::new(20);
-static PORT_TABLE_BITS: AtomicU8 = AtomicU8::new(20);
+/// Zero until the first use fixes the default size from the environment.
+static PORT_TABLE_BITS: AtomicU8 = AtomicU8::new(0);
+
+/// Size of the port table when neither `+Q` nor `ERL_MAX_PORTS` is given: the larger of
+/// `ERTS_DEFAULT_MAX_PORTS` and the descriptor limit.
+// Port of erts/emulator/beam/erl_init.c (erl_start) and io.c (erts_init_io), OTP-29.1.1.
+fn default_port_table_size() -> u32 {
+    const DEFAULT_MAX_PORTS: usize = 1 << 16;
+    const MIN_PORTS: usize = 1024;
+    const MAX_PORTS: usize = PTAB_MAX_SIZE as usize - 1;
+    if let Some(size) = std::env::var("ERL_MAX_PORTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        return size.clamp(MIN_PORTS, MAX_PORTS) as u32;
+    }
+    DEFAULT_MAX_PORTS
+        .max(arinsal_alloc::cpuinfo::poll_max_fds())
+        .clamp(MIN_PORTS, MAX_PORTS) as u32
+}
+
+#[cold]
+fn init_port_table_bits() -> u8 {
+    let bits = PtabLayout::new(default_port_table_size()).bits as u8;
+    // A concurrent `set_port_table_layout` (+Q) wins.
+    match PORT_TABLE_BITS.compare_exchange(0, bits, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => bits,
+        Err(set) => set,
+    }
+}
 
 /// Layout of this OS process's Erlang process table (`erts_proc`).
 #[inline]
@@ -164,7 +193,11 @@ pub fn set_process_table_layout(layout: PtabLayout) {
 /// Layout of this OS process's port table (`erts_port`).
 #[inline]
 pub fn port_table_layout() -> PtabLayout {
-    PtabLayout::from_bits(u32::from(PORT_TABLE_BITS.load(Ordering::Relaxed)))
+    let bits = match PORT_TABLE_BITS.load(Ordering::Relaxed) {
+        0 => init_port_table_bits(),
+        bits => bits,
+    };
+    PtabLayout::from_bits(u32::from(bits))
 }
 
 /// Install the port table layout; done once when the emulator sizes its table.

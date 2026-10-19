@@ -2025,6 +2025,9 @@ impl Table {
     }
 
     /// Return the OTP table allocation total for the runtime's scheduler count.
+    // `sizeof(DbTable)` and the lock structures depend on the platform ABI; the constants
+    // below are OTP 29.1.1 measured on macOS arm64, and Linux aarch64 is smaller by the
+    // amounts in `TABLE_HEADER_SHRINK` / `CATREE_BASE_SHRINK` (measured with ets:info/2).
     pub fn memory_words_for_schedulers(&self, schedulers: usize) -> usize {
         // Port of erl_db_hash.c:1017 and erl_db_tree.c:560, OTP-29.1.1.
         // OTP's frequent-read rwlocks reserve one cache line per reader group plus
@@ -2037,8 +2040,8 @@ impl Table {
             Storage::Ordered(root) => {
                 let mut objects = Vec::new();
                 Node::walk(root, &mut objects);
-                let table =
-                    146 + usize::from(concurrent && self.options.read_concurrency) * rwlock_words;
+                let table = (146 - TABLE_HEADER_SHRINK)
+                    + usize::from(concurrent && self.options.read_concurrency) * rwlock_words;
                 table
                     + objects
                         .iter()
@@ -2050,7 +2053,8 @@ impl Table {
                     // Port of erl_db_catree.c:1031-1053 and erl_flxctr.c:51-55,
                     // OTP-29.1.1. This includes the initial base node, its lock,
                     // and (when enabled) the decentralized counter allocation.
-                    93 + 8 * schedulers
+                    (93 - TABLE_HEADER_SHRINK - CATREE_BASE_SHRINK)
+                        + 8 * schedulers
                         + if self.options.decentralized_counters {
                             18 + 8 * schedulers
                         } else {
@@ -2058,7 +2062,7 @@ impl Table {
                         }
                         + usize::from(self.options.read_concurrency) * rwlock_words
                 } else {
-                    146
+                    146 - TABLE_HEADER_SHRINK
                 };
                 table + tree.object_memory_words().max(0) as usize
             }
@@ -2124,7 +2128,8 @@ impl Table {
                 } else {
                     0
                 };
-                312 + extra_slots
+                (312 - TABLE_HEADER_SHRINK)
+                    + extra_slots
                     + ext_table
                     + fine_locks
                     + read_lock
@@ -4720,6 +4725,10 @@ struct TableSlot {
     table: Option<SharedTable>,
 }
 
+/// Words by which a table header is smaller on Linux than on macOS.
+const TABLE_HEADER_SHRINK: usize = if cfg!(target_os = "linux") { 4 } else { 0 };
+/// Further words a CA tree's base node is smaller on Linux.
+const CATREE_BASE_SHRINK: usize = if cfg!(target_os = "linux") { 2 } else { 0 };
 const META_NAME_TAB_BUCKET_COUNT: usize = 8192;
 const META_NAME_TAB_LOCK_COUNT: usize = 256;
 

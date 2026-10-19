@@ -2,6 +2,7 @@
 
 pub mod alloc_util;
 pub mod allocator;
+pub mod cpuinfo;
 pub mod instances;
 pub mod mmap;
 pub mod mseg;

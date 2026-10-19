@@ -4,8 +4,8 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const ERL: &str = "$HOME/.asdf/installs/erlang/29.1.1/bin/erl";
-const ERLC: &str = "$HOME/.asdf/installs/erlang/29.1.1/bin/erlc";
+const ERL: &str = "erl";
+const ERLC: &str = "erlc";
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 const SOURCE: &str = r#"
