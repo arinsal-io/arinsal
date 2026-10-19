@@ -1,14 +1,11 @@
 //! ETS hash storage with OTP's segmented linear-hash directory.
 
+use crate::rwmtx::{RwMtxLock, RwMtxReadGuard, RwMtxWriteGuard};
 use crate::{EtsError, StoredTerm, TableType, WriteConcurrency};
-use arinsal_term::{
-    FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, HeapAlloc, Term, global_atoms,
-    internal_hash,
-};
+use arinsal_term::{HeapAlloc, Term, global_atoms, internal_hash};
 use parking_lot::RwLock as FastRwLock;
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
 const FIRST_SEGMENT: usize = 256;
@@ -116,52 +113,29 @@ struct Stripe {
 
 enum StripeBuckets {
     Plain(Vec<HashBucket>),
-    Normal(RwLock<Vec<HashBucket>>),
-    FrequentRead(FrequentReadRwLock<Vec<HashBucket>>),
+    /// erts `db_hash_slot` lock: a frequent-read rwmutex when the table has `DB_FREQ_READ`,
+    /// otherwise a normal one.
+    Locked(RwMtxLock<Vec<HashBucket>>),
 }
 
 enum StripeReadGuard<'a> {
     Plain(&'a Vec<HashBucket>),
-    Normal(std::sync::RwLockReadGuard<'a, Vec<HashBucket>>),
-    FrequentRead(FrequentReadGuard<'a, Vec<HashBucket>>),
+    Locked(RwMtxReadGuard<'a, Vec<HashBucket>>),
 }
 
 impl std::ops::Deref for StripeReadGuard<'_> {
     type Target = Vec<HashBucket>;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Plain(buckets) => buckets,
-            Self::Normal(guard) => guard,
-            Self::FrequentRead(guard) => guard,
+            Self::Locked(guard) => guard,
         }
     }
 }
 
-enum StripeWriteGuard<'a> {
-    Normal(std::sync::RwLockWriteGuard<'a, Vec<HashBucket>>),
-    FrequentRead(FrequentWriteGuard<'a, Vec<HashBucket>>),
-}
-
-impl std::ops::Deref for StripeWriteGuard<'_> {
-    type Target = Vec<HashBucket>;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Normal(guard) => guard,
-            Self::FrequentRead(guard) => guard,
-        }
-    }
-}
-
-impl std::ops::DerefMut for StripeWriteGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Normal(guard) => guard,
-            Self::FrequentRead(guard) => guard,
-        }
-    }
-}
+type StripeWriteGuard<'a> = RwMtxWriteGuard<'a, Vec<HashBucket>>;
 
 impl StripeBuckets {
     // Port of erl_db_hash.c (RLOCK_HASH is NULL for non-fine tables) and
@@ -175,33 +149,38 @@ impl StripeBuckets {
         if !fine_grained {
             Self::Plain(buckets())
         } else if frequent_read {
-            Self::FrequentRead(FrequentReadRwLock::new(buckets()))
+            Self::Locked(RwMtxLock::new_freq_read(buckets()))
         } else {
-            Self::Normal(RwLock::new(buckets()))
+            Self::Locked(RwMtxLock::new(buckets()))
         }
     }
 
+    #[inline]
     fn read(&self) -> StripeReadGuard<'_> {
+        self.read_at(arinsal_term::current_reader_group())
+    }
+
+    /// Read lock in reader group `group`, the scheduler id of the caller.
+    #[inline]
+    fn read_at(&self, group: usize) -> StripeReadGuard<'_> {
         match self {
             Self::Plain(buckets) => StripeReadGuard::Plain(buckets),
-            Self::Normal(lock) => StripeReadGuard::Normal(lock.read().unwrap()),
-            Self::FrequentRead(lock) => StripeReadGuard::FrequentRead(lock.read()),
+            Self::Locked(lock) => StripeReadGuard::Locked(lock.read_at(group)),
         }
     }
 
+    #[inline]
     fn write(&self) -> StripeWriteGuard<'_> {
         match self {
             Self::Plain(_) => panic!("non-fine hash stripe cannot be write-locked"),
-            Self::Normal(lock) => StripeWriteGuard::Normal(lock.write().unwrap()),
-            Self::FrequentRead(lock) => StripeWriteGuard::FrequentRead(lock.write()),
+            Self::Locked(lock) => lock.write(),
         }
     }
 
     fn get_mut(&mut self) -> &mut Vec<HashBucket> {
         match self {
             Self::Plain(buckets) => buckets,
-            Self::Normal(lock) => lock.get_mut().unwrap(),
-            Self::FrequentRead(lock) => lock.get_mut(),
+            Self::Locked(lock) => lock.get_mut(),
         }
     }
 }
@@ -1007,11 +986,22 @@ impl HashStorage {
         hval: u64,
         visit: impl FnOnce(HashIter<'_>) -> R,
     ) -> R {
+        self.with_objects_hash_at(hval, arinsal_term::current_reader_group(), visit)
+    }
+
+    /// `with_objects_hash` in reader group `group`.
+    #[inline]
+    pub(super) fn with_objects_hash_at<R>(
+        &self,
+        hval: u64,
+        group: usize,
+        visit: impl FnOnce(HashIter<'_>) -> R,
+    ) -> R {
         let hvalue = hval >> 1;
         loop {
             let slot = self.slot_index(hvalue);
             let stripe = &self.stripes[self.stripe_index(slot)];
-            let buckets = stripe.buckets.read();
+            let buckets = stripe.buckets.read_at(group);
             if self.slot_index(hvalue) == slot {
                 return visit(HashIter {
                     next: buckets[slot >> self.lock_shift].head.as_deref(),
