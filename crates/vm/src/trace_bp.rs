@@ -51,7 +51,7 @@ pub(crate) struct BpFunction {
     pub(crate) module: String,
     pub(crate) function: String,
     pub(crate) arity: u8,
-    /// Interpreted entry whose breakpoint data this MFA owns.
+    /// Interpreted entry whose breakpoint data this MFA owns; zero for an export-only BIF.
     pub(crate) entry: usize,
     /// Has an export entry, which is where global call tracing lives.
     pub(crate) exported: bool,
