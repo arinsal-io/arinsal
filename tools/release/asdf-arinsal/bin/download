@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ASDF_INSTALL_VERSION:?asdf did not set ASDF_INSTALL_VERSION}"
+: "${ASDF_DOWNLOAD_PATH:?asdf did not set ASDF_DOWNLOAD_PATH}"
+
+target=${ARINSAL_TARGET:-}
+if [ -z "$target" ]; then
+    case "$(uname -s):$(uname -m)" in
+        Darwin:arm64|Darwin:aarch64) target=aarch64-apple-darwin ;;
+        Darwin:x86_64) target=x86_64-apple-darwin ;;
+        Linux:x86_64|Linux:amd64) target=x86_64-unknown-linux-gnu ;;
+        Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-gnu ;;
+        *) echo "arinsal: unsupported platform $(uname -s)/$(uname -m)" >&2; exit 1 ;;
+    esac
+fi
+
+version=$ASDF_INSTALL_VERSION
+url=${ARINSAL_DIST_URL:-"https://github.com/arinsal-io/arinsal/releases/download/v${version}/arinsal-${version}-otp-29.1.1-${target}.tar.gz"}
+url=${url//\{version\}/$version}
+url=${url//\{target\}/$target}
+
+if [ -n "$(find "$ASDF_DOWNLOAD_PATH" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ]; then
+    echo "arinsal: ASDF_DOWNLOAD_PATH must be empty: $ASDF_DOWNLOAD_PATH" >&2
+    exit 1
+fi
+mkdir -p "$ASDF_DOWNLOAD_PATH"
+stage=$(mktemp -d "${TMPDIR:-/tmp}/arinsal-download.XXXXXX")
+trap 'rm -rf "$stage"' EXIT HUP INT TERM
+mkdir "$stage/unpacked"
+
+curl -fL "$url" -o "$stage/archive.tar.gz"
+tar -xzf "$stage/archive.tar.gz" -C "$stage/unpacked"
+if [ -f "$stage/unpacked/SHA256SUMS" ]; then
+    if command -v shasum >/dev/null 2>&1; then
+        (cd "$stage/unpacked" && shasum -a 256 -c SHA256SUMS)
+    elif command -v sha256sum >/dev/null 2>&1; then
+        (cd "$stage/unpacked" && sha256sum -c SHA256SUMS)
+    else
+        echo "arinsal: shasum or sha256sum is required to verify the distribution" >&2
+        exit 1
+    fi
+else
+    echo "arinsal: distribution archive has no SHA256SUMS file" >&2
+    exit 1
+fi
+cp -R "$stage/unpacked/." "$ASDF_DOWNLOAD_PATH/"

@@ -1,5 +1,6 @@
 /ref/
 /target/
+/dist/
 /.cache/
 /.agents/**/*.log
 **/bench/out/
