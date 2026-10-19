@@ -17,7 +17,7 @@ use arinsal_packet::{
 };
 use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -483,11 +483,17 @@ fn accept_send(
     payload: SendData<'_>,
 ) -> SendOutcome {
     // Port of erts/emulator/drivers/common/inet_drv.c:13736-13847 (tcp_sendv), OTP-29.1.1.
-    if inner.peer_closed {
+    // With `{exit_on_close, false}` an EOF only closes the read side (desc_close_read); the
+    // socket stays connected for sending until the send fails or it is closed.
+    if inner.peer_closed && inner.fd.is_none() {
         return SendOutcome::Reply(Some(close_atom(inner)));
     }
     if inner.phase != Phase::Connected {
         return SendOutcome::Reply(Some("enotconn"));
+    }
+    // Port of inet_drv.c (tcp_inet_commandv): a send after a pending shutdown(write).
+    if inner.pending_shut != 0 {
+        return send_or_shutdown_failed(inner, libc::EPIPE);
     }
     let len = payload.bytes().len();
     // inet_drv.c:13745-13761: TCP_PB_1/2/4 headers; htype 3 is TCP_PB_4.
@@ -580,12 +586,18 @@ fn accept_send(
 }
 
 fn send_failed(inner: &mut Inner, err: i32) -> SendOutcome {
-    // Port of inet_drv.c:13690 (tcp_send_error), OTP-29.1.1.
-    let err = if err == libc::EPIPE {
+    // Port of inet_drv.c:13690 (tcp_send_error), OTP-29.1.1: an EPIPE that is not the result
+    // of our own shutdown(write) is a reset by the peer.
+    let err = if err == libc::EPIPE && !inner.shutdown_wr_done {
         libc::ECONNRESET
     } else {
         err
     };
+    send_or_shutdown_failed(inner, err)
+}
+
+/// Port of inet_drv.c:13613 (tcp_send_or_shutdown_error), OTP-29.1.1.
+fn send_or_shutdown_failed(inner: &mut Inner, err: i32) -> SendOutcome {
     let show = inner.show_econnreset && err == libc::ECONNRESET;
     inner.reset = show;
     inner.peer_closed = true;
@@ -654,7 +666,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
             REQ_GETTYPE => gettype(&inner),
             REQ_GETSTATUS => getstatus(&inner),
             TCP_REQ_RECV => recv_req(&mut inner, caller, data),
-            TCP_REQ_SHUTDOWN => shutdown_sock(&inner, data),
+            TCP_REQ_SHUTDOWN => shutdown_sock(&mut inner, data),
             TCP_REQ_SENDFILE => sendfile_req(&mut inner, data, &mut sendfile_end),
             _ => err_bytes("exbadport"),
         }
@@ -960,9 +972,41 @@ fn accept_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8]) 
                     deadline: deadline(timeout),
                 });
                 inner.pending.push((caller, aref));
+                monitor_acceptor(sock, caller);
             }
             Accept::Reply(ok_bytes(&aref.to_be_bytes()))
         }
+    }
+}
+
+/// Processes with an accept pending, by pid: the driver monitors them
+/// (`driver_monitor_process`) so a dying acceptor leaves the accept queue.
+fn acceptors() -> &'static Mutex<HashMap<Pid, Vec<Weak<Sock>>>> {
+    static ACCEPTORS: OnceLock<Mutex<HashMap<Pid, Vec<Weak<Sock>>>>> = OnceLock::new();
+    ACCEPTORS.get_or_init(Default::default)
+}
+
+// Port of inet_drv.c (tcp_inet_ctl INET_REQ_ACCEPT: driver_monitor_process), OTP-29.1.1.
+fn monitor_acceptor(sock: &Arc<Sock>, caller: Pid) {
+    if let Some(runtime) = sock.runtime.upgrade() {
+        // The exit hook only runs for processes carrying the ports flag.
+        let _ = runtime.publish_proc_flag(caller, arinsal_sched::proc_flags::PORTS);
+    }
+    let mut map = acceptors().lock().unwrap();
+    let entry = map.entry(caller).or_default();
+    entry.retain(|weak| weak.strong_count() > 0);
+    entry.push(Arc::downgrade(sock));
+}
+
+/// A monitored process exited.
+// Port of inet_drv.c (tcp_inet_process_exit), OTP-29.1.1: its accepts are dequeued and a
+// listener left without any goes back from accepting to listening.
+pub(crate) fn acceptor_exited(pid: Pid) {
+    let socks = acceptors().lock().unwrap().remove(&pid).unwrap_or_default();
+    for sock in socks.iter().filter_map(Weak::upgrade) {
+        let mut inner = sock.inner.lock().unwrap();
+        inner.accept_q.retain(|waiter| waiter.caller != pid);
+        inner.pending.retain(|(caller, _)| *caller != pid);
     }
 }
 
@@ -2167,7 +2211,7 @@ fn recv_req(inner: &mut Inner, caller: Pid, data: &[u8]) -> Vec<u8> {
     ok_bytes(&aref.to_be_bytes())
 }
 
-fn shutdown_sock(inner: &Inner, data: &[u8]) -> Vec<u8> {
+fn shutdown_sock(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     // Port of inet_drv.c:12339 (TCP_REQ_SHUTDOWN), OTP-29.1.1.
     if inner.phase != Phase::Connected {
         return err_bytes("enotconn");
@@ -2175,13 +2219,35 @@ fn shutdown_sock(inner: &Inner, data: &[u8]) -> Vec<u8> {
     if data.len() != 1 || data[0] > 2 {
         return err_bytes("einval");
     }
+    let how = data[0];
+    // SHUT_RD is 0, SHUT_WR 1, SHUT_RDWR 2. Output still queued is sent first.
+    if how != 0 && inner.sendq.size() > 0 {
+        inner.pending_shut = how;
+        return ok_bytes(&[]);
+    }
     let fd = inner.fd.as_ref().unwrap().as_raw_fd();
     // SAFETY: fd is the connected socket this driver owns.
-    let rc = unsafe { libc::shutdown(fd, i32::from(data[0])) };
+    let rc = unsafe { libc::shutdown(fd, i32::from(how)) };
     if rc < 0 {
+        if how != 0 {
+            inner.shutdown_wr_done = true;
+        }
         return err_bytes(errno_name(last_errno()));
     }
     ok_bytes(&[])
+}
+
+/// Shutdown on the socket once the queue has emptied.
+// Port of inet_drv.c (tcp_shutdown_async), OTP-29.1.1. `Some(errno)` when it failed.
+fn shutdown_async(inner: &mut Inner) -> Option<i32> {
+    let how = if inner.pending_shut == 1 { 1 } else { 2 };
+    let fd = inner.fd.as_ref()?.as_raw_fd();
+    // SAFETY: fd is the connected socket this driver owns.
+    if unsafe { libc::shutdown(fd, how) } < 0 {
+        return Some(last_errno());
+    }
+    inner.shutdown_wr_done = true;
+    None
 }
 
 fn active_is(active: &Active) -> bool {
@@ -2846,6 +2912,11 @@ struct Inner {
     busy: bool,
     emit_passive: bool,
     peer_closed: bool,
+    /// `TCP_ADDF_PENDING_SHUT_WR` (1) / `TCP_ADDF_PENDING_SHUT_RDWR` (2): shutdown once the
+    /// output queue has drained. The flag stays set afterwards, as in erts.
+    pending_shut: u8,
+    /// `TCP_ADDF_SHUTDOWN_WR_DONE`.
+    shutdown_wr_done: bool,
     /// Read or send observed ECONNRESET (or show_econnreset mapped EPIPE).
     reset: bool,
     closed_sent: bool,
@@ -2923,6 +2994,8 @@ impl Default for Inner {
             busy: false,
             emit_passive: false,
             peer_closed: false,
+            pending_shut: 0,
+            shutdown_wr_done: false,
             reset: false,
             closed_sent: false,
             recv_timeout_if_empty: false,
@@ -3883,16 +3956,32 @@ fn tcp_inet_output(sock: &Arc<Sock>) {
         if inner.phase != Phase::Connected || inner.sendq.is_empty() {
             return;
         }
-        let Some(err) = flush_send(&mut inner) else {
-            drop(inner);
-            send_empty_out_q_msgs(sock);
-            return;
+        let (err, shutdown_error) = match flush_send(&mut inner) {
+            Some(err) => (err, false),
+            None => {
+                let failed = if inner.sendq.is_empty() && inner.pending_shut != 0 {
+                    shutdown_async(&mut inner)
+                } else {
+                    None
+                };
+                let Some(err) = failed else {
+                    drop(inner);
+                    send_empty_out_q_msgs(sock);
+                    return;
+                };
+                (err, true)
+            }
         };
         // Port of inet_drv.c:13690-13720 (tcp_send_error) and :13613-13688
         // (tcp_send_or_shutdown_error), OTP-29.1.1: the blocked senders get the
         // error reply; an active socket also gets `tcp_closed`.
         let waits = std::mem::take(&mut inner.send_waits);
-        match send_failed(&mut inner, err) {
+        let outcome = if shutdown_error {
+            send_or_shutdown_failed(&mut inner, err)
+        } else {
+            send_failed(&mut inner, err)
+        };
+        match outcome {
             SendOutcome::Failed { error, active } => (waits, error, active),
             SendOutcome::Reply(_) | SendOutcome::Deferred => return,
         }
@@ -3929,14 +4018,30 @@ fn tcp_inet_output(sock: &Arc<Sock>) {
 
 fn deliver_pending_close(sock: &Arc<Sock>) {
     // Port of inet_drv.c:7001 (inet_set_opts active while INET_STATE_CLOSED), OTP-29.1.1.
-    let (owner, exit_on_close) = {
+    let (owner, exit_on_close, delayed_reset) = {
         let mut inner = sock.inner.lock().unwrap();
         if !inner.peer_closed || inner.closed_sent || !active_is(&inner.active) {
             return;
         }
         inner.closed_sent = true;
-        (sock.handle().owner_pid(), inner.exit_on_close)
+        // TCP_ADDF_DELAYED_ECONNRESET: the reset that closed the passive socket is reported
+        // once, as `{tcp_error, S, econnreset}` ahead of `tcp_closed`.
+        let delayed_reset = std::mem::take(&mut inner.reset);
+        (
+            sock.handle().owner_pid(),
+            inner.exit_on_close,
+            delayed_reset,
+        )
     };
+    if delayed_reset {
+        emit(
+            sock,
+            Out::TcpError {
+                owner,
+                reason: "econnreset",
+            },
+        );
+    }
     emit(sock, Out::TcpClosed { owner });
     if exit_on_close {
         crate::port::abandon_port(&sock.runtime(), sock.id);
@@ -4298,7 +4403,9 @@ fn pull(sock: &Arc<Sock>) -> bool {
             } else {
                 let err = last_errno();
                 if err == libc::ECONNRESET {
-                    inner.reset = true;
+                    // Port of inet_drv.c:13190 (tcp_recv): an RST is an error only with
+                    // show_econnreset, else it reads as a plain close.
+                    inner.reset = inner.show_econnreset;
                     eof = true;
                 }
                 break;
