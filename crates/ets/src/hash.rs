@@ -273,6 +273,9 @@ fn purge_pseudo_deleted(mut current: Option<Box<HashDbTerm>>) -> Option<Box<Hash
 pub(super) struct HashStorage {
     stripes: Box<[Stripe]>,
     nlocks: usize,
+    /// `log2(nlocks)`: the lock count is a power of two, so stripe and bucket indexes are a mask
+    /// and a shift, as erts' `GET_LOCK_MASK`/`DB_HASH_LOCK_MASK` do.
+    lock_shift: u32,
     pub(super) next_order: AtomicU64,
     pub(super) size: AtomicIsize,
     pub(super) nactive: AtomicUsize,
@@ -319,6 +322,7 @@ impl HashStorage {
                 })
                 .collect(),
             nlocks: locks,
+            lock_shift: locks.trailing_zeros(),
             next_order: AtomicU64::new(0),
             size: AtomicIsize::new(0),
             nactive: AtomicUsize::new(FIRST_SEGMENT),
@@ -413,7 +417,7 @@ impl HashStorage {
     /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     #[inline]
     fn stripe_index(&self, slot: usize) -> usize {
-        slot % self.nlocks
+        slot & (self.nlocks - 1)
     }
 
     #[inline]
@@ -981,7 +985,7 @@ impl HashStorage {
             let buckets = stripe.buckets.read();
             if self.slot_index(hvalue) == slot {
                 return visit(HashIter {
-                    next: buckets[slot / self.nlocks].head.as_deref(),
+                    next: buckets[slot >> self.lock_shift].head.as_deref(),
                 });
             }
         }
@@ -999,7 +1003,7 @@ impl HashStorage {
             let buckets = stripe.buckets.read();
             if self.slot_index(hvalue) == slot {
                 return visit(RawHashIter {
-                    next: buckets[slot / self.nlocks].head.as_deref(),
+                    next: buckets[slot >> self.lock_shift].head.as_deref(),
                 });
             }
         }

@@ -375,6 +375,7 @@ fn live_table_terms<H: HeapAlloc>(
         })
         .collect()
 }
+#[inline(always)]
 fn allowed(table: &arinsal_ets::Table, caller: Term, write: bool) -> bool {
     // Port of erts/emulator/beam/erl_db.c (db_get_table_aux), OTP-29.1.1.
     // Access depends on stored flags, not the table-wide statistics in info().
@@ -688,6 +689,19 @@ fn direct_system_info(
     Term::small(i64::from(process.scheduler_id))
 }
 
+/// `allowed(.., write = false)` for a reader whose pid term is built only when the table's
+/// protection does not already grant access. Port of erts/emulator/beam/erl_db.c
+/// (db_get_table_aux, DB_READ access test), OTP-29.1.1.
+#[inline(always)]
+fn read_allowed(table: &arinsal_ets::Table, pid: arinsal_sched::Pid) -> bool {
+    match table.options.protection {
+        Protection::Public | Protection::Protected => true,
+        Protection::Private => pid
+            .to_term()
+            .is_some_and(|caller| allowed(table, caller, false)),
+    }
+}
+
 fn direct_caller(process: &Process) -> Option<Term> {
     process.self_pid?.to_term()
 }
@@ -723,15 +737,19 @@ fn with_cached_tid<R>(
     let rt_id = std::sync::Arc::as_ptr(process.runtime.as_ref()?) as usize;
     let slot = (tid.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 59) as usize;
     TABLE_CACHE.with(|cache| {
-        let hit = cache.borrow()[slot]
-            .as_ref()
-            .is_some_and(|(cached_rt, cached, ..)| *cached_rt == rt_id && *cached == tid);
-        if !hit {
-            let rt = process.runtime.as_ref()?;
-            let shared = rt.ets.read().unwrap().shared(tid).ok()?.clone();
-            let options = shared.options();
-            cache.borrow_mut()[slot] = Some((rt_id, tid, shared, options));
+        {
+            let cache = cache.borrow();
+            if let Some((cached_rt, cached, shared, options)) = cache[slot].as_ref()
+                && *cached_rt == rt_id
+                && *cached == tid
+            {
+                return body(shared, options, process);
+            }
         }
+        let rt = process.runtime.as_ref()?;
+        let shared = rt.ets.read().unwrap().shared(tid).ok()?.clone();
+        let options = shared.options();
+        cache.borrow_mut()[slot] = Some((rt_id, tid, shared, options));
         let cache = cache.borrow();
         let (_, _, shared, options) = cache[slot].as_ref()?;
         body(shared, options, process)
@@ -776,11 +794,11 @@ fn lookup_args_member(
 }
 
 fn direct_lookup_cached(process: &mut Process, args: &[Term], tid: Tid) -> Option<Term> {
-    let caller = direct_caller(process)?;
+    let pid = process.self_pid?;
     let key = args[1];
     with_cached_tid(process, tid, |shared, _options, process| {
         let table = shared.read();
-        if table.is_detached() || table.is_busy() || !allowed(&table, caller, false) {
+        if table.is_detached() || table.is_busy() || !read_allowed(&table, pid) {
             return None;
         }
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -809,11 +827,11 @@ fn direct_member(
 }
 
 fn direct_member_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
-    let caller = direct_caller(process)?;
+    let pid = process.self_pid?;
     let key = args[1];
     with_cached_table(process, args[0], |shared, _options, _| {
         let table = shared.read();
-        if table.is_detached() || table.is_busy() || !allowed(&table, caller, false) {
+        if table.is_detached() || table.is_busy() || !read_allowed(&table, pid) {
             return None;
         }
         Some(boolean_term(table.member(key)))
@@ -828,8 +846,36 @@ fn direct_lookup_element(
     module: arinsal_term::Atom,
     function: arinsal_term::Atom,
 ) -> Option<Term> {
-    direct_lookup_element_cached(process, args, module, function)
+    direct_lookup_element_hit(process, args)
+        .or_else(|| direct_lookup_element_cached(process, args, module, function))
         .or_else(|| direct_bif::<{ EtsBif::LookupElement as u8 }>(process, args, module, function))
+}
+
+/// The successful `lookup_element/3` of a set-like table, without a `Result` or an exception
+/// frame. Any failure declines, and the general path repeats the lookup and raises.
+// Port of erts/emulator/beam/erl_db.c (ets_lookup_element_3), OTP-29.1.1.
+fn direct_lookup_element_hit(process: &mut Process, args: &[Term]) -> Option<Term> {
+    if args.len() != 3 {
+        return None;
+    }
+    let pid = process.self_pid?;
+    let tid = Tid::from_term(args[0])?;
+    let (key, position) = (args[1], usize::try_from(args[2].as_small()?).ok()?);
+    with_cached_tid(process, tid, |shared, _, process| {
+        let table = shared.read();
+        if table.is_detached()
+            || table.is_busy()
+            || !read_allowed(&table, pid)
+            || matches!(
+                table.options.table_type,
+                TableType::Bag | TableType::DuplicateBag
+            )
+        {
+            return None;
+        }
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        table.lookup_element_one(key, position, &mut heap).ok()
+    })
 }
 
 fn direct_lookup_element_cached(
