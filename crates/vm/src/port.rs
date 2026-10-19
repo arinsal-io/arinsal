@@ -2130,8 +2130,8 @@ fn notify_links_monitors(
             );
         }
     }
-    // The lock is held while the DOWNs are queued so that a concurrent `demonitor(_, [flush])`
-    // either removes the monitor first or finds the message already in its mailbox.
+    // The lock is held while the DOWNs are queued so that a concurrent `demonitor` either
+    // removes the monitor first or leaves a signal the origin discards.
     let mut guard = handle.monitors.lock().unwrap();
     let monitors = std::mem::take(&mut *guard);
     for (reference, monitor) in monitors {
@@ -2154,7 +2154,14 @@ fn notify_links_monitors(
             continue;
         };
         if let Ok(message) = Message::copy_from(down) {
-            let _ = scheduler.send(from, monitor.pid, message);
+            // A signal, not a message: the origin drops the DOWN when its monitor is gone
+            // (erl_proc_sig_queue.c:6355), so a `demonitor(_, [flush])` that races with the
+            // port exit cannot be followed by the DOWN.
+            let _ = scheduler.signal(
+                from,
+                monitor.pid,
+                arinsal_sched::Signal::MonitorDownMsg { reference, message },
+            );
         }
     }
 }
@@ -4116,7 +4123,14 @@ pub(crate) fn owner_exit(
             ]);
             let Ok(down) = down else { continue };
             if let Ok(message) = Message::copy_from(down) {
-                let _ = scheduler.send(owner, monitor.pid, message);
+                let _ = scheduler.signal(
+                    owner,
+                    monitor.pid,
+                    arinsal_sched::Signal::MonitorDownMsg {
+                        reference: *reference,
+                        message,
+                    },
+                );
             }
         }
     }
