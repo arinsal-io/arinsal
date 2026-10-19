@@ -1373,14 +1373,6 @@ impl MatchProgram {
 }
 
 impl MatchRunner<'_> {
-    pub(crate) fn run<H: HeapAlloc>(
-        &mut self,
-        object: Term,
-        dst: &mut H,
-    ) -> Result<Option<Term>, EtsError> {
-        self.run_with_context(object, dst, &EmptyContext)
-    }
-
     pub(crate) fn run_with_context<H: HeapAlloc, C: MatchContext>(
         &mut self,
         object: Term,
