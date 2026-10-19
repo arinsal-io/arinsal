@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 const SOURCE: &str = r#"
 -module(gen_tcp_socket_compat).
 -export([connect_accept_send_recv/0, connect_refused/0, accept_timeout/0,
+         inet_active_once_packets_before_close/0,
          connect_after_listener_close/0, recv_partial_nowait/0, recv_partial_blocking/0,
          recv_timeouts/0, recv_nowait_select_message/0, two_readers/0,
          eof_aborts_queued_reader/0, gen_tcp_recv_n_partial/0,
@@ -72,6 +73,34 @@ connect_accept_send_recv() ->
     ok = gen_tcp:close(Listen),
     {Accepted, Sent, Received, element(1, Peer),
      element(1, element(2, Peer)) =:= {127,0,0,1}}.
+
+inet_active_once_packets_before_close() ->
+    Count = 256,
+    Payload = binary:copy(<<"x">>, 144),
+    {ok, Listen} = gen_tcp:listen(0, [{inet_backend, inet}, {ip, {127,0,0,1}},
+                                     binary, {packet, 4}, {active, false}]),
+    {ok, Port} = inet:port(Listen),
+    {ok, Client} = gen_tcp:connect({127,0,0,1}, Port,
+                                  [{inet_backend, inet}, binary, {packet, 4},
+                                   {active, false}], 2000),
+    {ok, Accepted} = gen_tcp:accept(Listen, 2000),
+    ok = inet:setopts(Accepted, [{active, once}]),
+    [ok = gen_tcp:send(Client, Payload) || _ <- lists:seq(1, Count)],
+    ok = gen_tcp:close(Client),
+    Result = receive_once_packets(Accepted, Count, []),
+    ok = gen_tcp:close(Accepted),
+    ok = gen_tcp:close(Listen),
+    Result.
+
+receive_once_packets(Socket, Left, Acc) ->
+    receive
+        {tcp, Socket, Data} ->
+            ok = inet:setopts(Socket, [{active, once}]),
+            receive_once_packets(Socket, Left - 1, [Data | Acc]);
+        {tcp_closed, Socket} -> {Left, lists:reverse(Acc)};
+        {tcp_error, Socket, Reason} -> {error, Reason, Left}
+    after 5000 -> {timeout, Left}
+    end.
 
 connect_refused() ->
     {Listen, Port} = listen(),
@@ -639,6 +668,11 @@ fn compare_in(module: &str, source: &str, function: &str) -> Option<(String, Str
 #[test]
 fn connect_accept_send_recv_matches_erts() {
     compare("connect_accept_send_recv");
+}
+
+#[test]
+fn inet_active_once_delivers_buffered_packets_before_close_matches_erts() {
+    compare("inet_active_once_packets_before_close");
 }
 
 #[test]

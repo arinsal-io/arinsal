@@ -572,6 +572,26 @@ impl Message {
         Self::copy_from(term)
     }
 
+    /// Queue a term built in a standalone message fragment without copying it again.
+    // Port of erts/emulator/beam/io.c:5658 (driver_deliver_term), OTP-29.1.1.
+    pub(crate) fn from_heap(term: Term, heap: ProcessHeap) -> Self {
+        if !term.is_pointer() {
+            return Self::immediate(term);
+        }
+        Self {
+            term,
+            fragment: Some(Box::new(MessageFragment {
+                heap: Some(heap),
+                seq_token: None,
+            })),
+            priority: false,
+            timer_id: None,
+            receive_traced: false,
+            seq_nil: false,
+            alias: 0,
+        }
+    }
+
     /// Copy the reachable object graph into an envelope owned by the receiver.
     pub fn copy_from(term: Term) -> Result<Self, VmError> {
         if !term.is_pointer() {

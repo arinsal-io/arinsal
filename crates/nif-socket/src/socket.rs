@@ -117,6 +117,8 @@ pub(crate) struct State {
     pub acceptors_q: VecDeque<Requestor>,
     pub writers_q: VecDeque<Requestor>,
     pub readers_q: VecDeque<Requestor>,
+    /// The reusable `ESockDescriptor.buf` receive allocation.
+    recv_buf: Vec<u8>,
     /// `rNumCnt`: consecutive full buffers read by a `recv` with length 0.
     pub r_num_cnt: u32,
 }
@@ -1886,6 +1888,28 @@ fn recv_config(h: &Handle) -> RecvConfig {
     }
 }
 
+/// Ensure the descriptor keeps the receive allocation until OTP transfers it to a binary.
+// Port of erts/emulator/nifs/unix/unix_socket_syncio.c:9820 (recv_alloc_buf), OTP-29.1.1.
+fn recv_alloc_buf(state: &mut State, size: usize) {
+    if state.recv_buf.len() != size {
+        state.recv_buf.resize(size, 0);
+    }
+}
+
+/// Apply the descriptor buffer handoff and copy thresholds used by `essio_recv`.
+// Port of erts/emulator/nifs/unix/unix_socket_syncio.c:9835 (recv_create_bin), OTP-29.1.1.
+fn recv_create_bin(state: &mut State, size: usize) -> Vec<u8> {
+    let buffer_size = state.recv_buf.len();
+    if size >= (buffer_size & !4095) || size >= (buffer_size >> 1) + (buffer_size >> 2) {
+        let mut binary = std::mem::take(&mut state.recv_buf);
+        binary.truncate(size);
+        binary.shrink_to_fit();
+        binary
+    } else {
+        state.recv_buf[..size].to_vec()
+    }
+}
+
 /// What `essio_recv`, `essio_recvfrom` and `essio_recvmsg` share for one call.
 struct Receiver<'a> {
     h: &'a Handle,
@@ -1944,7 +1968,8 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
     if let Some(early) = rx.check_entry(&mut st) {
         return early;
     }
-    let mut data = vec![0u8; buf_sz.min(RECV_BUFFER_SIZE_MAX)];
+    recv_alloc_buf(&mut st, buf_sz.min(RECV_BUFFER_SIZE_MAX));
+    let buffer_size = st.recv_buf.len();
     h.counters.lock().unwrap().read_tries += 1;
     // SAFETY: zeroed storage is valid for a returned sockaddr, and size is initialized.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -1954,8 +1979,8 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
     let mut control_len = 0usize;
     let received = if msg {
         let mut iov = libc::iovec {
-            iov_base: data.as_mut_ptr().cast(),
-            iov_len: data.len(),
+            iov_base: st.recv_buf.as_mut_ptr().cast(),
+            iov_len: buffer_size,
         };
         // SAFETY: zeroed msghdr is valid after setting all buffers used by recvmsg.
         let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -1984,8 +2009,8 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
         unsafe {
             libc::recvfrom(
                 rx.fd,
-                data.as_mut_ptr().cast(),
-                data.len(),
+                st.recv_buf.as_mut_ptr().cast(),
+                buffer_size,
                 flags,
                 (&mut storage as *mut libc::sockaddr_storage).cast(),
                 &mut addr_len,
@@ -2002,8 +2027,7 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
     if let Some(early) = rx.check_result(&mut st, received, errno) {
         return early;
     }
-    let buffer_size = data.len();
-    data.truncate(received as usize);
+    let data = recv_create_bin(&mut st, received as usize);
     if !msg && !from {
         return if data.len() < buffer_size {
             rx.check_partial(&mut st, len, data)
