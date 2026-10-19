@@ -777,19 +777,7 @@ fn direct_lookup_cached(process: &mut Process, args: &[Term], tid: Tid) -> Optio
         // Port of erts/emulator/beam/erl_db_hash.c (db_get_hash) and
         // erl_db_tree.c (db_get_tree), OTP-29.1.1: a set holds at most one object,
         // consed straight onto the process heap.
-        if matches!(
-            table.options.table_type,
-            TableType::Set | TableType::OrderedSet
-        ) {
-            let found = table.lookup_one(key, &mut heap).ok()?;
-            let mut builder = TermBuilder::new(&mut heap);
-            return match found {
-                Some(object) => builder.cons(object, Term::NIL).ok(),
-                None => Some(Term::NIL),
-            };
-        }
-        let values = table.lookup(key, &mut heap).ok()?;
-        output_list(&mut heap, values).ok()
+        table.lookup_list(key, &mut heap).ok()
     })
 }
 
@@ -1544,20 +1532,7 @@ fn lookup_args(
                 return Ok(boolean_term(table.member(key)));
             }
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            if matches!(
-                table.options.table_type,
-                TableType::Set | TableType::OrderedSet
-            ) {
-                let object = table.lookup_one(key, &mut heap).map_err(err)?;
-                return match object {
-                    Some(object) => TermBuilder::new(&mut heap)
-                        .cons(object, Term::NIL)
-                        .map_err(|_| badarg()),
-                    None => Ok(Term::NIL),
-                };
-            }
-            let values = table.lookup(key, &mut heap).map_err(err)?;
-            output_list(&mut heap, values)
+            table.lookup_list(key, &mut heap).map_err(err)
         });
         return lookup.unwrap_or_else(|| Err(badarg_cause("id")));
     }
@@ -1572,8 +1547,7 @@ fn lookup_args(
         Ok(boolean_term(table.member(key)))
     } else {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let values = table.lookup(key, &mut heap).map_err(err)?;
-        output_list(&mut heap, values)
+        table.lookup_list(key, &mut heap).map_err(err)
     }
 }
 
