@@ -273,7 +273,7 @@ fn create_channel(
     // messages in setup_connection_epiloge_rwunlock.
     notify_dist_ctrlr(process, ctx, args[1], args[0])?;
     if let Some(port_id) = port_controller {
-        flush_port_output(process.runtime.as_deref().ok_or_else(badarg)?, port_id)?;
+        flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)?;
     }
     send_nodes_monitor_events(process.runtime.as_ref().ok_or_else(badarg)?, nodeup_events)?;
     if let Some(handler) = flush_notify {
@@ -696,7 +696,7 @@ fn queue_remote_control(
         state.written = state.written.saturating_add(1);
         enqueue_port_output_no_suspend_locked(state, packets);
         drop(tables);
-        let runtime = process.runtime.as_deref().ok_or_else(badarg)?;
+        let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
         return flush_port_output(runtime, port_id);
     }
     state.queue_term(control, None).map_err(|_| badarg())?;
@@ -2690,8 +2690,10 @@ pub(crate) fn continue_fragmented_send(
     flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)
 }
 
-/// Drain the dist entry's queued buffers into its port while the port can accept data.
-// Port of erts/emulator/beam/dist.c:4161-4178 (drain queue and resume senders), OTP-29.1.1.
+/// Schedule the dist command task that drains the entry's queued buffers into its port.
+///
+/// Port of erts/emulator/beam/dist.c (erts_schedule_dist_command): the output goes out in
+/// a `ERTS_PORT_TASK_DIST_CMD` task of the connection's port, at most one scheduled at a time.
 fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<(), VmError> {
     let claimed = {
         let mut tables = node_tables::lock();
@@ -2713,7 +2715,70 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
     if !claimed {
         return Ok(());
     }
+    let handle = runtime.ports.read().unwrap().get(&port_id).cloned();
+    let (Some(drv), Some(task_runtime)) = (
+        handle.as_ref().and_then(|handle| handle.drv_port()),
+        handle.as_ref().and_then(|handle| handle.runtime()),
+    ) else {
+        // The port is gone: erts drops the data and the port exit tears the connection down
+        // (dist.c, dist_port_exit / erts_do_net_exits), OTP-29.1.1.
+        dist_cmd_done(port_id);
+        return Ok(());
+    };
+    drv.schedule_dist_cmd(Box::new(move |op| {
+        if op == arinsal_drv::port_task::SigOp::Exec {
+            dist_cmd(&task_runtime, port_id)
+        } else {
+            dist_cmd_done(port_id);
+            0
+        }
+    }));
+    Ok(())
+}
+
+/// The dist command task is no longer scheduled or running.
+fn dist_cmd_done(port_id: u64) {
+    let mut tables = node_tables::lock();
+    if let Some(state) = tables.entries.values_mut().find_map(|entry| {
+        entry
+            .dist
+            .as_mut()
+            .filter(|state| state.port_id == Some(port_id))
+    }) {
+        state.flushing_output = false;
+    }
+}
+
+/// Packets one dist command task writes before it yields the scheduler.
+const DIST_CMD_PACKETS: usize = 64;
+
+/// Port of erts/emulator/beam/dist.c (erts_dist_command, dist_port_commandv) and dist.c:4161-4178
+/// (drain queue and resume senders), OTP-29.1.1. Runs in the connection port's task with the
+/// port locked; returns its reductions.
+fn dist_cmd(runtime: &std::sync::Arc<crate::process::Runtime>, port_id: u64) -> i32 {
+    let mut written = 0usize;
     loop {
+        if written >= DIST_CMD_PACKETS {
+            // Out of reductions: stay scheduled by queueing the next slice.
+            let again = {
+                let mut tables = node_tables::lock();
+                tables
+                    .entries
+                    .values_mut()
+                    .find_map(|entry| {
+                        entry
+                            .dist
+                            .as_mut()
+                            .filter(|state| state.port_id == Some(port_id))
+                    })
+                    .is_some_and(|state| !state.port_busy && state.output_ready_packets != 0)
+            };
+            dist_cmd_done(port_id);
+            if again {
+                let _ = flush_port_output(runtime, port_id);
+            }
+            break;
+        }
         let packet = {
             let mut tables = node_tables::lock();
             let Some(state) = tables.entries.values_mut().find_map(|entry| {
@@ -2722,7 +2787,7 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
                     .as_mut()
                     .filter(|state| state.port_id == Some(port_id))
             }) else {
-                return Ok(());
+                return 0;
             };
             if state.port_busy || state.output_ready_packets == 0 {
                 state.flushing_output = false;
@@ -2734,13 +2799,10 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
         let Some(packet) = packet else {
             break;
         };
-        // The port is gone (closed between the queue push and this flush): erts drops the
-        // data and the port exit tears the connection down
-        // (erts/emulator/beam/dist.c, dist_port_exit / erts_do_net_exits), OTP-29.1.1.
         let sock = {
             runtime
                 .ports
-                .lock()
+                .read()
                 .unwrap()
                 .get(&port_id)
                 .and_then(|handle| handle.tcp_driver_data())
@@ -2748,6 +2810,7 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
         let port_busy = sock
             .and_then(|sock| crate::inet_drv::dist_output(&sock, &packet).ok())
             .unwrap_or_default();
+        written += 1;
         let resumed = {
             let mut tables = node_tables::lock();
             let Some(state) = tables.entries.values_mut().find_map(|entry| {
@@ -2756,7 +2819,7 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
                     .as_mut()
                     .filter(|state| state.port_id == Some(port_id))
             }) else {
-                return Ok(());
+                return 0;
             };
             state.pending_bytes = state.pending_bytes.saturating_sub(packet.len() as u64);
             state.output_ready_packets = state.output_ready_packets.saturating_sub(1);
@@ -2776,7 +2839,7 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
             break;
         }
     }
-    Ok(())
+    i32::try_from(written * 40).unwrap_or(i32::MAX).min(4000)
 }
 
 /// Suspends a dist sender: the running process takes it on itself, another process receives it as a

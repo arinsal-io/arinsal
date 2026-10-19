@@ -267,6 +267,7 @@ pub(crate) struct PortHandle {
     /// `ram_file_drv` port data (`drv_data`), present from `rfile_start` until `rfile_stop`.
     ram_file: Mutex<Option<Arc<crate::ram_file_drv::RamPort>>>,
     /// Driver-owned state returned by the inet driver's start callback.
+    runtime: OnceLock<Weak<crate::process::Runtime>>,
     inet_tcp: Mutex<Option<Arc<crate::inet_drv::Sock>>>,
     inet_udp: Mutex<Option<Arc<crate::inet_udp::Sock>>>,
 }
@@ -385,6 +386,16 @@ fn release_port_name(runtime: &crate::process::Runtime, handle: &PortHandle) {
 }
 
 impl PortHandle {
+    /// The runtime this port belongs to.
+    pub(crate) fn runtime(&self) -> Option<Arc<crate::process::Runtime>> {
+        self.runtime.get()?.upgrade()
+    }
+
+    /// The driver port of a port made by a driver (everything but ram_file and spawn ports).
+    pub(crate) fn drv_port(&self) -> Option<Arc<arinsal_drv::DriverPort>> {
+        self.driver.get().cloned()
+    }
+
     pub(crate) fn owner_pid(&self) -> Pid {
         *self.owner.lock().unwrap()
     }
@@ -1331,6 +1342,7 @@ fn start_dyn_driver(
     let drv_port = arinsal_drv::DriverPort::new(Arc::clone(&driver), port_id, Box::new(host));
     drv_port.init_run_queue(scheduler.current_run_queue());
     let _ = handle.driver.set(Arc::clone(&drv_port));
+    let _ = handle.runtime.set(Arc::downgrade(&runtime));
     if let Some(handle_id) = handle_id {
         crate::ddll::port_opened(handle_id, &drv_port);
     }
@@ -2149,6 +2161,7 @@ pub(crate) fn alloc_inet_port(
     );
     drv_port.init_run_queue(scheduler.current_run_queue());
     let _ = handle.driver.set(Arc::clone(&drv_port));
+    let _ = handle.runtime.set(Arc::downgrade(runtime));
     attach(&handle, &drv_port);
     runtime
         .ports
@@ -2464,6 +2477,7 @@ fn make_handle_with(
         reg_closing: AtomicBool::new(false),
         halt_progress: Mutex::new(None),
         ram_file: Mutex::new(None),
+        runtime: OnceLock::new(),
         inet_tcp: Mutex::new(None),
         inet_udp: Mutex::new(None),
     });
@@ -4082,7 +4096,6 @@ pub(crate) fn owner_exit(
     owner: Pid,
     reason: Term,
 ) {
-    crate::inet_drv::acceptor_exited(owner);
     // Port of erts/emulator/beam/io.c:7143 (erts_fire_port_monitor): ports that
     // monitor the exiting process run their driver's `process_exit` callback.
     let fired: Vec<(Arc<arinsal_drv::DriverPort>, u64)> = {
