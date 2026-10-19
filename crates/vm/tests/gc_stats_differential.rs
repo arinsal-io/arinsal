@@ -151,7 +151,8 @@ fn same_order(actual: i64, expected: i64) -> bool {
 
 #[test]
 fn garbage_collection_statistics_match_otp() {
-    let Ok(reference) = RefErl::start() else {
+    // `statistics(garbage_collection)` is VM-wide; match the single Arinsal worker below.
+    let Ok(reference) = RefErl::start_with_erl_args(&["+S", "1"]) else {
         eprintln!("erl unavailable; skipping GC statistics differential test");
         return;
     };
@@ -161,14 +162,14 @@ fn garbage_collection_statistics_match_otp() {
     reference.load(MODULE, &beam).expect("load GC stats probe");
 
     let (expected, actual) = call_both(&reference, &beam, "shape");
-    assert_eq!(expected.len(), 4);
-    assert_eq!(actual[0], 0, "statistics third element");
-    assert_eq!(actual[1], expected[1], "fullsweep_after");
-    assert_eq!(actual[2], expected[2], "min_heap_size");
-    assert_eq!(actual[3], expected[3], "min_bin_vheap_size");
+    similar_asserts::assert_eq!(expected.len(), 4);
+    similar_asserts::assert_eq!(actual[0], 0, "statistics third element");
+    similar_asserts::assert_eq!(actual[1], expected[1], "fullsweep_after");
+    similar_asserts::assert_eq!(actual[2], expected[2], "min_heap_size");
+    similar_asserts::assert_eq!(actual[3], expected[3], "min_bin_vheap_size");
 
     let (expected, actual) = call_both(&reference, &beam, "explicit");
-    assert_eq!(expected.len(), 5);
+    similar_asserts::assert_eq!(expected.len(), 5);
     // 30 major collections. Other schedulers may add a couple.
     assert_count("explicit", 0, actual[0], expected[0], true);
     assert!(
@@ -176,25 +177,25 @@ fn garbage_collection_statistics_match_otp() {
         "explicit collections {actual:?} expected at least 30 (OTP {expected:?})"
     );
     assert_count("explicit", 1, actual[1], expected[1], false);
-    assert_eq!(actual[2], 0, "statistics third element");
-    assert_eq!(actual[3], 0, "statistics third element");
+    similar_asserts::assert_eq!(actual[2], 0, "statistics third element");
+    similar_asserts::assert_eq!(actual[3], 0, "statistics third element");
     assert_count("explicit", 4, actual[4], expected[4], true);
 
     let (expected, actual) = call_both(&reference, &beam, "minors");
-    assert_eq!(expected.len(), 4);
+    similar_asserts::assert_eq!(expected.len(), 4);
     assert_count("minors", 0, actual[0], expected[0], true);
     assert!(
         actual[0] >= 8,
         "minor requests {actual:?} expected at least 8 (OTP {expected:?})"
     );
     assert_count("minors", 1, actual[1], expected[1], false);
-    assert_eq!(actual[2], 0, "statistics third element");
+    similar_asserts::assert_eq!(actual[2], 0, "statistics third element");
     assert_count("minors", 3, actual[3], expected[3], true);
 
     for function in ["take", "wide"] {
         let (expected, actual) = call_both(&reference, &beam, function);
-        assert_eq!(expected.len(), 5, "{function}");
-        assert_eq!(actual[2], 0, "{function} statistics third element");
+        similar_asserts::assert_eq!(expected.len(), 5, "{function}");
+        similar_asserts::assert_eq!(actual[2], 0, "{function} statistics third element");
         let exact = function == "wide";
         assert_count(function, 0, actual[0], expected[0], exact);
         assert_relative(function, 1, actual[1], expected[1]);
@@ -203,13 +204,13 @@ fn garbage_collection_statistics_match_otp() {
     }
 
     let (expected, actual) = call_both(&reference, &beam, "bif");
-    assert_eq!(actual[2], 0, "bif statistics third element");
+    similar_asserts::assert_eq!(actual[2], 0, "bif statistics third element");
     assert_count("bif", 0, actual[0], expected[0], true);
     assert_count("bif", 1, actual[1], expected[1], true);
     assert_count("bif", 4, actual[4], expected[4], true);
 
     let (expected, actual) = call_both(&reference, &beam, "alloc");
-    assert_eq!(actual[2], 0, "alloc statistics third element");
+    similar_asserts::assert_eq!(actual[2], 0, "alloc statistics third element");
     assert_count("alloc", 0, actual[0], expected[0], true);
     assert_count("alloc", 1, actual[1], expected[1], false);
     assert_count("alloc", 4, actual[4], expected[4], true);

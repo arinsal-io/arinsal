@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Re-exec a comparison without Cargo's test-binary-only dynamic-loader paths.
 #[allow(dead_code)]
@@ -46,10 +46,12 @@ fn eval_once(
 ) -> Option<arinsal_etf::OwnedTerm> {
     let script =
         format!("io:format(\"~s~n\", [binary:encode_hex(term_to_binary(({expr})))]), halt().");
+    // Keep one-shot evaluations independent of the test runner's terminal and input descriptors.
     let output = Command::new("timeout")
+        .stdin(Stdio::null())
         .args(["-s", "KILL", "120"])
         .arg(program)
-        .args(["-noshell", "-pa"])
+        .args(["-noshell", "-noinput", "-pa"])
         .arg(dir)
         .args(["-eval", &script])
         .output()
@@ -57,8 +59,8 @@ fn eval_once(
     if !output.status.success() {
         return None;
     }
-    let hex = String::from_utf8(output.stdout).ok()?;
-    let hex = hex.trim();
+    let output = String::from_utf8(output.stdout).ok()?;
+    let hex = output.lines().next()?.trim();
     let bytes: Vec<u8> = (0..hex.len() / 2)
         .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
         .collect::<Option<_>>()?;

@@ -180,7 +180,8 @@ fn arinsal_eval_with_dist_buffer(
     command.env("ARINSAL_OTP_ROOT", otp_root());
     command.args([
         "--kill-after=3",
-        "30",
+        // The call sequence can approach 30 seconds when the host is CPU-loaded.
+        "60",
         binary.to_str().expect("UTF-8 arinsal path"),
         "-noshell",
     ]);

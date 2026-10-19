@@ -716,7 +716,14 @@ pub(crate) fn debug_info() -> DebugInfo {
     for state in slots.iter() {
         let state = state.lock().unwrap();
         let driver_used = state.driver.events.readable || state.driver.events.writable;
-        if driver_used || !state.watches.is_empty() {
+        // Port of erts/emulator/sys/common/erl_check_io.c (doit_erts_check_io_debug), OTP-29.1.1:
+        // internal wake registrations do not contribute to the used-fd counter.
+        if driver_used
+            || state
+                .watches
+                .iter()
+                .any(|watch| !matches!(watch.kind, RegistrationKind::Internal))
+        {
             info.used_fds += 1;
         }
         info.driver_selects += usize::from(driver_used);
@@ -762,6 +769,26 @@ pub(crate) mod tests {
             erts_poll_control(-1, ErtsPollOp::Add, ERTS_POLL_EV_IN) & ERTS_POLL_EV_NVAL,
             0
         );
+    }
+
+    #[test]
+    fn check_io_debug_excludes_internal_watches_from_used_fds() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let registration = register_kind(
+            reader.as_raw_fd(),
+            InterestSet {
+                readable: true,
+                writable: false,
+            },
+            RegistrationKind::Internal,
+            |_, _| {},
+        )
+        .unwrap();
+        similar_asserts::assert_eq!(debug_info().used_fds, 0);
+        deregister(registration);
     }
 
     #[test]
