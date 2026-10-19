@@ -1698,6 +1698,7 @@ enum Next {
 struct Start {
     tid: Tid,
     program: Arc<MatchProgram>,
+    program_owner: Arc<MagicRef>,
     count: bool,
     chunk: usize,
     backwards: bool,
@@ -1705,7 +1706,6 @@ struct Start {
     got: usize,
     saved: arinsal_ets::SavedMatches,
     safety: arinsal_ets::IterSafety,
-    retained: bool,
     plan: ScanPlan,
     fresh_plan: bool,
     continued: bool,
@@ -1790,7 +1790,7 @@ fn hash_select(
         .is_some_and(|state| matches!(state.stage, SelectStage::Reverse { .. }))
     {
         let state = resumed.ok_or_else(badarg)?;
-        return reverse_trap(process, ctx, &rt, state).map(Some);
+        return reverse_trap(process, ctx, state).map(Some);
     }
     let was_resumed = resumed.is_some();
     let items = if resumed.is_none() && args.len() == 1 {
@@ -1845,6 +1845,7 @@ fn hash_select(
                     ScanPlan::Tree(table.tree_scan_plan(&state.program))
                 },
                 program: state.program,
+                program_owner: state.program_owner,
                 count: state.count,
                 chunk: state.chunk,
                 backwards: state.backwards,
@@ -1852,7 +1853,6 @@ fn hash_select(
                 got: state.got,
                 saved: state.saved,
                 safety: state.safety,
-                retained: state.retained,
                 fresh_plan: false,
                 continued: true,
             },
@@ -1871,6 +1871,7 @@ fn hash_select(
                         ScanPlan::Tree(table.tree_scan_plan(&run.program))
                     },
                     program: run.program,
+                    program_owner: run.program_owner,
                     count: false,
                     chunk: run.chunk,
                     backwards: run.backwards,
@@ -1882,7 +1883,6 @@ fn hash_select(
                     } else {
                         IterSafety::Safe
                     },
-                    retained: true,
                     fresh_plan: false,
                     continued: true,
                 }
@@ -1908,6 +1908,8 @@ fn hash_select(
                     _ => MatchProgram::compile(args[1]),
                 }
                 .map_err(err)?;
+                let program = Arc::new(program);
+                let program_owner = select_chunk::new_match_program_owner(&program);
                 let (plan, safety) = if hash {
                     let plan = table.hash_scan_plan(&program);
                     if !plan.something_can_match() {
@@ -1943,7 +1945,8 @@ fn hash_select(
                 Start {
                     tid,
                     plan,
-                    program: Arc::new(program),
+                    program,
+                    program_owner,
                     count,
                     chunk,
                     backwards: if chunk > 0 {
@@ -1955,7 +1958,6 @@ fn hash_select(
                     got: 0,
                     saved: arinsal_ets::SavedMatches::new(),
                     safety,
-                    retained: false,
                     fresh_plan: true,
                     continued: false,
                 }
@@ -1981,6 +1983,7 @@ fn hash_select(
     let Start {
         tid,
         program,
+        program_owner,
         count,
         chunk,
         backwards,
@@ -1988,7 +1991,6 @@ fn hash_select(
         got,
         mut saved,
         safety,
-        retained,
         plan,
         fresh_plan,
         continued,
@@ -2070,7 +2072,7 @@ fn hash_select(
                 saved,
                 safety,
                 chunk,
-                retained,
+                program_owner,
                 stage: SelectStage::Scan,
                 end: None,
             });
@@ -2103,7 +2105,7 @@ fn hash_select(
                 saved,
                 safety,
                 chunk,
-                retained,
+                program_owner,
                 stage: SelectStage::Reverse { done: 0, eot },
                 end,
             });
@@ -2141,48 +2143,26 @@ fn hash_select(
     }
     let result = if chunk == 0 {
         values.reverse();
-        let list = TermBuilder::new(&mut heap)
+        TermBuilder::new(&mut heap)
             .list_from_iter(values)
-            .map_err(|_| badarg())?;
-        (list, false)
+            .map_err(|_| badarg())?
     } else if !hash || nothing_visited {
-        (atom("$end_of_table"), false)
+        atom("$end_of_table")
     } else {
         select_chunk::hash_loop_ended(
             &mut heap,
             tid,
-            &program,
+            &program_owner,
             chunk,
             values,
             cycle.chunk_slot,
             continued,
         )?
     };
-    finish_program(&rt, &program, retained, result.1)?;
     if unfix {
         unfix_table(&rt, tid, caller);
     }
-    Ok(Some(result.0))
-}
-
-/// Keep the compiled program of a continuation the call returns, or let go of the one a
-/// continuation it consumed held.
-fn finish_program(
-    rt: &crate::process::Runtime,
-    program: &Arc<MatchProgram>,
-    retained: bool,
-    continues: bool,
-) -> Result<(), VmError> {
-    let registry = rt.ets.read().unwrap();
-    match (continues, retained) {
-        (true, false) => registry.retain_shared_match_program(Arc::clone(program)),
-        (false, true) => {
-            let (_heap, reference) = select_chunk::program_reference(program)?;
-            registry.release_match_program(reference);
-        }
-        _ => {}
-    }
-    Ok(())
+    Ok(Some(result))
 }
 
 /// A pass of `ets:reverse/3`, to which an ordered table's chunk trapped with its results: it
@@ -2192,7 +2172,6 @@ fn finish_program(
 fn reverse_trap(
     process: &mut Process,
     ctx: Option<&mut RunCtx<'_, Message>>,
-    rt: &crate::process::Runtime,
     mut state: crate::proc_create::EtsSelect,
 ) -> Result<Term, VmError> {
     let SelectStage::Reverse { done, eot } = state.stage else {
@@ -2221,7 +2200,7 @@ fn reverse_trap(
                 (arinsal_ets::ScanPosition::After(key), false) => select_chunk::tree_continuation(
                     &mut heap,
                     state.tid,
-                    &state.program,
+                    &state.program_owner,
                     state.chunk,
                     state.backwards,
                     key,
@@ -2229,7 +2208,6 @@ fn reverse_trap(
                 )?,
                 _ => atom("$end_of_table"),
             };
-            finish_program(rt, &state.program, state.retained, !eot)?;
             TermBuilder::new(&mut heap)
                 .tuple(&[list, continuation])
                 .map_err(|_| badarg())
@@ -2933,8 +2911,8 @@ fn call_inner(
         (EtsBif::IsCompiledMs, [value]) => {
             // Port of erts/emulator/beam/erl_db.c:4582-4587
             // (ets_is_compiled_ms_1), OTP-29.1.1.
-            // A continuation's program is held by the registry; one made by match_spec_compile/1
-            // lives with its magic reference. Both are compiled match specifications.
+            // Continuation references retain their program through the magic reference, as
+            // does a reference returned by match_spec_compile/1.
             Ok(boolean_term(
                 compiled_match_program(*value).is_some() || registry.match_program(*value).is_some(),
             ))
