@@ -679,25 +679,25 @@ fn unicode_convert_start(
     }
     let bif =
         arinsal_bifs::lookup("unicode", function, args.len() as u8).ok_or(BifError::BADARG)?;
-    let (result, reductions, deferred) = {
+    let (result, deferred) = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
-        ctx.set_reduction_budget(process.reductions.max(0) as usize);
+        // Port of erts/emulator/beam/erl_unicode.c:166 (allowed_iterations), OTP-29.1.1:
+        // the loop budget rereads FCALLS after cost_to_proc charges it.
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
         let result = bif(&mut ctx, args)?;
-        let reductions = ctx.reductions();
         let deferred = ctx.take_deferred();
-        (result, reductions, deferred)
+        (result, deferred)
     };
     match deferred.map(|trap| *trap) {
         Some(arinsal_bifs::DeferredTrap::Unicode(cont)) => Ok(HandlerResult::Yield {
             continuation: cont.continuation(),
             state: magic_binary_state(Mutex::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
-            reductions,
+            reductions: 0,
         }),
         Some(_) => Err(BifError::BADARG),
         None => Ok(HandlerResult::Done {
             value: result,
-            reductions,
+            reductions: 0,
         }),
     }
 }
