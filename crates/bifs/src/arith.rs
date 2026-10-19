@@ -5,6 +5,16 @@ use arinsal_term::{Term, global_atoms};
 
 use crate::{BifError, Ctx};
 
+/// A status atom of the integer parsers (`am_badarg`, `am_no_integer`, ...). Atoms are never
+/// freed, so each call site interns its name once instead of taking the atom table's lock on
+/// every failed parse.
+macro_rules! status {
+    ($name:literal) => {{
+        static ATOM: std::sync::OnceLock<arinsal_term::Atom> = std::sync::OnceLock::new();
+        Term::atom(*ATOM.get_or_init(|| global_atoms().intern($name).expect("OTP status atom")))
+    }};
+}
+
 pub(super) fn lookup<V: crate::BifTableVisitor>(
     module: &str,
     name: &str,
@@ -95,13 +105,13 @@ fn list_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/big.c:4258 (erts_internal_list_to_integer_2), OTP-29.1.1.
     let mut cursor = args[0];
     if cursor == Term::NIL {
-        return Ok(status("no_integer"));
+        return Ok(status!("no_integer"));
     }
     if cons(cursor).is_none() {
-        return Ok(status("not_a_list"));
+        return Ok(status!("not_a_list"));
     }
     let Some(base) = valid_base(args[1]) else {
-        return Ok(status("badarg"));
+        return Ok(status!("badarg"));
     };
     let (first, _) = cons(cursor).unwrap();
     let negative = first.as_small() == Some(45);
@@ -131,10 +141,10 @@ fn list_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         cursor = tail;
     }
     if digits > limit {
-        return Ok(status("big"));
+        return Ok(status!("big"));
     }
     if digits == 0 && zeros == 0 {
-        return Ok(status("no_integer"));
+        return Ok(status!("no_integer"));
     }
     let result = Term::small(if negative { -value } else { value }).expect("small parser limit");
     Ok(crate::pure::tuple_build(ctx, &[result, cursor]))
@@ -142,13 +152,13 @@ fn list_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 fn binary_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/big.c:4231 (erts_internal_binary_to_integer_2), OTP-29.1.1.
     let Some(base) = valid_base(args[1]) else {
-        return Ok(status("badarg"));
+        return Ok(status!("badarg"));
     };
     let Ok(bytes) = crate::pure::binary_bytes(args[0]) else {
-        return Ok(status("badarg"));
+        return Ok(status!("badarg"));
     };
     if bytes.is_empty() {
-        return Ok(status("badarg"));
+        return Ok(status!("badarg"));
     }
     let (negative, mut text) = match bytes[0] {
         b'-' => (true, &bytes[1..]),
@@ -156,7 +166,7 @@ fn binary_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
         _ => (false, bytes.as_slice()),
     };
     if text.is_empty() {
-        return Ok(status("badarg"));
+        return Ok(status!("badarg"));
     }
     while text.first() == Some(&b'0') {
         text = &text[1..];
@@ -165,12 +175,12 @@ fn binary_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
         return Ok(Term::small(0).unwrap());
     }
     if text.len() > DIGITS_PER_SMALL[(base - 2) as usize] {
-        return Ok(status("big"));
+        return Ok(status!("big"));
     }
     let mut value = 0_i64;
     for &byte in text {
         let Some(d) = digit(byte as i64, base) else {
-            return Ok(status("badarg"));
+            return Ok(status!("badarg"));
         };
         value = value * base as i64 + d as i64;
     }
@@ -183,9 +193,6 @@ const DIGITS_PER_SMALL: [usize; 35] = [
     59, 37, 29, 25, 22, 21, 19, 18, 17, 17, 16, 15, 15, 15, 14, 14, 14, 13, 13, 13, 13, 13, 12, 12,
     12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11,
 ];
-fn status(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("OTP status atom"))
-}
 fn valid_base(term: Term) -> Option<u32> {
     let base = term.as_small()?;
     (2..=36).contains(&base).then_some(base as u32)

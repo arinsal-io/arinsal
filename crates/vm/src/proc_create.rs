@@ -984,6 +984,8 @@ pub(crate) struct ProcessCold {
     pub(crate) dirty_bif_mfa: Option<(&'static str, &'static str, u8)>,
     /// Result of a static dirty NIF executed as a dirty job.
     pub(crate) static_nif_done: Option<Result<Term, arinsal_bifs::BifError>>,
+    /// Catch table the last exception scan saw, see `CodeIndexes::active_catches_cached`.
+    pub(crate) catch_cache: Option<crate::code_ix::CatchCache>,
     /// Completion latch for `erts_debug:set_internal_state(wait, ...)`.
     pub(crate) debug_wait_completion: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Whether this process currently has a runnable profile activation.
