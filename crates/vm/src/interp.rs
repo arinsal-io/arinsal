@@ -2871,6 +2871,16 @@ impl Vm {
                             }
                             return Err(VmError::Yield);
                         }
+                        // A BIF awaiting a signal reply is redone like a yielded one: its
+                        // frame is gone already and must not be released twice.
+                        Err(VmError::Unsupported(message))
+                            if release.is_some() && crate::signals::is_await_message(&message) =>
+                        {
+                            if let Some(release) = release.take() {
+                                p.note_tail_yield(site_module, offset, release, true);
+                            }
+                            return Err(VmError::Unsupported(message));
+                        }
                         other => other?,
                     };
                     sync_slice_use!();
@@ -4471,6 +4481,15 @@ impl Vm {
                                         p.note_tail_yield(site_module, site_ip, release, true);
                                     }
                                     return Err(VmError::Yield);
+                                }
+                                Err(VmError::Unsupported(message))
+                                    if release.is_some()
+                                        && crate::signals::is_await_message(&message) =>
+                                {
+                                    if let Some(release) = release.take() {
+                                        p.note_tail_yield(site_module, site_ip, release, true);
+                                    }
+                                    return Err(VmError::Unsupported(message));
                                 }
                                 other => other?,
                             };
