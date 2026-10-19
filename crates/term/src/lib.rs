@@ -61,8 +61,8 @@ pub use hamt::{
 };
 pub use hamt_yield::{HashmapBuild, MapReverseIter, initialize_scheduler_random};
 pub use hash::{
-    HASH2_ITERATIONS_PER_RED, Hash2Progress, Hash2Run, make_hash, make_hash2, phash, phash2,
-    phash2_range,
+    HASH2_ITERATIONS_PER_RED, Hash2Progress, Hash2Run, hash2_immediate, make_hash, make_hash2,
+    phash, phash2, phash2_range,
 };
 pub use heap::{
     AdoptError, BinaryRef, CP_WORDS, ConsHeapBuilder, ConsHeapChain, ConsHeapSegment,

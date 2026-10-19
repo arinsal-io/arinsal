@@ -129,6 +129,14 @@ fn small_hash(n: i64) -> u32 {
     hash
 }
 
+/// `make_hash2` of a term that hashes without a work stack (small integers, atoms, `[]`, pids
+/// and ports); `None` for everything else.
+// Port of erts/emulator/beam/erl_term_hashing.c (make_hash2_helper, the immediate cases),
+// OTP-29.1.1.
+pub fn hash2_immediate(term: Term) -> Option<u32> {
+    simple_hash(term)
+}
+
 fn simple_hash(term: Term) -> Option<u32> {
     if let Some(n) = term.as_small() {
         return Some(small_hash(n));
