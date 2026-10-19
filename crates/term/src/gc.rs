@@ -13,8 +13,8 @@ use crate::{
     ARITY, BIN_REF, ExternalBinary, FUN, HEAP_BITS, HeapAlloc, MAP, MagicRef, Node, ProcessHeap,
     RECORD, RefcBinary, S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
 };
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 /// `erts_system_monitor_long_gc`: the collector reads the clock only while this is set.
@@ -244,8 +244,48 @@ fn release_binary_ref(bin_ref: usize) {
         .expect("live BinRef has allocator metadata");
 }
 
+/// What a collection copies out of: the blocks and tops a process heap held when the collection
+/// began. erts keeps these in locals of `garbage_collect` while `Process` itself points at the
+/// to-space; the heap here is the to-space in place, so the from-space moves into this record
+/// instead of into a second `ProcessHeap` built and dropped for every collection.
+struct FromSpace {
+    words: crate::heap::WordBlock,
+    htop: usize,
+    stop: usize,
+    old_words: crate::heap::WordBlock,
+    old_htop: usize,
+    owners: crate::heap::LazyOwners,
+    fragments: Vec<crate::heap::Fragment>,
+}
+
+impl FromSpace {
+    /// Frees the from-space blocks on the allocator index of the scheduler thread, in the order
+    /// the fields of a `ProcessHeap` drop: token owners, young heap, old heap.
+    ///
+    /// Returns the fragment list, whose blocks the caller releases, so its buffer can serve the
+    /// next collection instead of a malloc/free per GC.
+    fn release(self, alloc_ix: u16) -> Vec<crate::heap::Fragment> {
+        let Self {
+            words,
+            old_words,
+            owners,
+            fragments,
+            ..
+        } = self;
+        drop(owners);
+        if alloc_ix == crate::heap::NO_ALLOC_IX {
+            drop(words);
+            drop(old_words);
+        } else {
+            words.release_at(usize::from(alloc_ix));
+            old_words.release_at(usize::from(alloc_ix));
+        }
+        fragments
+    }
+}
+
 struct Copier<'a> {
-    from: &'a mut ProcessHeap,
+    from: &'a mut FromSpace,
     to: &'a mut ProcessHeap,
     major: bool,
     /// The young heap being evacuated: `HEAP_START(p)..HEAP_TOP(p)`.
@@ -1208,40 +1248,57 @@ impl ProcessHeap {
         if major && self.heap_grow && capacity == self.heap_size_words() {
             capacity = next_heap_size(capacity, 1, self.min_heap_size as usize)?;
         }
-        let mut next = ProcessHeap::with_words_at(capacity, self.alloc_ix);
-        next.stop = capacity - stack;
-        next.min_heap_size = self.min_heap_size;
-        next.bin_vheap_size = self.bin_vheap_size;
-        next.fullsweep_after = self.fullsweep_after;
-        next.heap_grow = self.heap_grow;
-        next.native_allocation = self.native_allocation;
-        next.native_redzone = self.native_redzone;
-        next.bif_hidden_words = self.bif_hidden_words;
-        next.minor_since_major = if major {
+        // Match the embedded ERTS vheap state without materializing an empty owner
+        // box when a previous collection left only default values behind.
+        let old_vheap = self.owners.has_collection_state().then(|| {
+            (
+                self.owners.vheap_min(),
+                self.owners.vheap_old_size(),
+                if major { 0 } else { self.owners.vheap_old() },
+            )
+        });
+        if !major && self.old_words.is_empty() && mature_words > 0 {
+            // Port of erl_gc.c:1471 (`erts_next_heap_size(size_before, 1)`):
+            // the first old heap is one step larger than the mature data.
+            let old_capacity = next_heap_size(source_words, 1, 0)?;
+            self.old_words =
+                self.new_block(old_capacity, arinsal_alloc::typed::ErtsAlcType::OLD_HEAP);
+        }
+        let to_words = self.new_block(capacity, arinsal_alloc::typed::ErtsAlcType::HEAP);
+        let mut from = FromSpace {
+            words: std::mem::replace(&mut self.words, to_words),
+            htop: self.htop,
+            stop: self.stop,
+            old_words: if major {
+                std::mem::take(&mut self.old_words)
+            } else {
+                crate::heap::WordBlock::default()
+            },
+            old_htop: self.old_htop,
+            owners: std::mem::take(&mut self.owners),
+            fragments: std::mem::take(&mut self.fragments),
+        };
+        self.htop = 0;
+        self.stop = capacity - stack;
+        self.high_water = 0;
+        if major {
+            self.old_htop = 0;
+        }
+        self.minor_since_major = if major {
             0
         } else {
             self.minor_since_major.saturating_add(1)
         };
-        // Match the embedded ERTS vheap state without materializing an empty owner
-        // box when a previous collection left only default values behind.
-        let copy_old_owner_state = self.owners.has_collection_state();
-        if copy_old_owner_state {
-            next.owners.vheap.min = self.owners.vheap_min();
-            next.owners.vheap.old_size = self.owners.vheap_old_size();
-            next.owners.vheap.old = if major { 0 } else { self.owners.vheap_old() };
+        self.bin_vheap = 0;
+        self.fragment_words = 0;
+        self.abandoned = false;
+        self.detached = false;
+        self.gc_enabled = true;
+        if let Some((min, old_size, old)) = old_vheap {
+            self.owners.vheap.min = min;
+            self.owners.vheap.old_size = old_size;
+            self.owners.vheap.old = old;
         }
-        if !major {
-            next.old_words = std::mem::take(&mut self.old_words);
-            if next.old_words.is_empty() && mature_words > 0 {
-                // Port of erl_gc.c:1471 (`erts_next_heap_size(size_before, 1)`):
-                // the first old heap is one step larger than the mature data.
-                let old_capacity = next_heap_size(source_words, 1, 0)?;
-                next.old_words =
-                    next.new_block(old_capacity, arinsal_alloc::typed::ErtsAlcType::OLD_HEAP);
-            }
-            next.old_htop = self.old_htop;
-        }
-        let mut from = std::mem::replace(self, next);
         let stack_move = MoveRange {
             old_start: from.words.as_ptr() as usize + from.stop * 8,
             old_end: from.words.as_ptr() as usize + from.words.len() * 8,
@@ -1266,7 +1323,7 @@ impl ProcessHeap {
             } else {
                 Area {
                     start: young_start,
-                    end: young_start + from.high_water * 8,
+                    end: young_start + mature_words * 8,
                 }
             };
             let old_start = self.old_words.as_ptr() as usize;
@@ -1343,12 +1400,16 @@ impl ProcessHeap {
         drop(copier);
         // ErlHeapFragment headers live inside the fragment block in erts; here the fragment
         // list is a Vec, so keep its buffer for the next cycle instead of a malloc/free per GC.
-        let mut spare = std::mem::take(&mut from.fragments);
-        from.release_fragments(&mut spare);
-        if self.fragments.is_empty() {
-            self.fragments = spare;
+        let mut spare = from.release(self.alloc_ix);
+        if spare.capacity() != 0 {
+            self.release_fragments(&mut spare);
+            if self.fragments.is_empty() {
+                std::mem::swap(&mut self.fragments, &mut spare);
+            }
+        } else {
+            // An empty `Vec` owns no allocation: skip the drop glue call.
+            std::mem::forget(spare);
         }
-        from.release_all();
         if let Some(error) = error {
             return Err(error);
         }
@@ -1929,24 +1990,60 @@ fn offset_stack_slots(
     }
 }
 
-/// Port of erl_gc.c:265-291 (`heap_sizes[]`), OTP-29.1.1.
+/// Port of erl_gc.c:177-186 (`MAX_HEAP_SIZES`), OTP-29.1.1.
+const HEAP_SIZE_COUNT: usize = if usize::BITS == 64 { 154 } else { 59 };
+
+/// Port of erl_gc.c:265-291 (`heap_sizes[]`), OTP-29.1.1: a static table like erts, so a
+/// lookup reads no lazily initialized state.
+static HEAP_SIZES: [usize; HEAP_SIZE_COUNT] = {
+    let mut sizes = [0usize; HEAP_SIZE_COUNT];
+    sizes[0] = 12;
+    sizes[1] = 38;
+    let mut index = 2;
+    while index < 23 {
+        sizes[index] = sizes[index - 1] + sizes[index - 2] + 1;
+        index += 1;
+    }
+    while index < HEAP_SIZE_COUNT {
+        sizes[index] = sizes[index - 1] + sizes[index - 1] / 5;
+        index += 1;
+    }
+    sizes
+};
+
 fn heap_sizes() -> &'static [usize] {
-    static SIZES: OnceLock<Vec<usize>> = OnceLock::new();
-    SIZES.get_or_init(|| {
-        // Port of erl_gc.c:177-186 (`MAX_HEAP_SIZES`), OTP-29.1.1.
-        let count = if usize::BITS == 64 { 154 } else { 59 };
-        let mut sizes = Vec::with_capacity(count);
-        sizes.push(12);
-        sizes.push(38);
-        for index in 2..23 {
-            sizes.push(sizes[index - 1] + sizes[index - 2] + 1);
+    &HEAP_SIZES
+}
+
+/// For each bit length of a request, the first table index whose size reaches `2^(k-1)`: the
+/// answer for a request of that length is at or after it, and at most a few entries later
+/// because the table grows by a fifth per step. `erts_next_heap_size` bisects the whole table
+/// instead; the entry found is the same.
+static HEAP_SIZE_START: [u8; usize::BITS as usize + 1] = {
+    let mut start = [0u8; usize::BITS as usize + 1];
+    let mut bits = 1;
+    while bits <= usize::BITS as usize {
+        let floor = 1usize << (bits - 1);
+        let mut index = 0;
+        while index < HEAP_SIZE_COUNT && HEAP_SIZES[index] < floor {
+            index += 1;
         }
-        while sizes.len() < count {
-            let previous = *sizes.last().expect("initial heap sizes exist");
-            sizes.push(previous + previous / 5);
-        }
-        sizes
-    })
+        start[bits] = index as u8;
+        bits += 1;
+    }
+    start
+};
+
+/// Index of the first table size not below `target`, which must not exceed the first size.
+/// `HEAP_SIZE_COUNT` when `target` is above the table.
+#[inline]
+fn heap_size_index(target: usize) -> usize {
+    let bits = (usize::BITS - target.leading_zeros()) as usize;
+    let mut index = usize::from(HEAP_SIZE_START[bits]);
+    while index < HEAP_SIZE_COUNT && HEAP_SIZES[index] < target {
+        index += 1;
+    }
+    index
 }
 
 /// Words of the initial heap of a spawned process whose arguments and reserved words need
@@ -1975,8 +2072,7 @@ fn next_heap_size(minimum: usize, offset: usize, min_heap_size: usize) -> Result
     if minimum < sizes[0] {
         return Ok(sizes[0].max(min_heap_size));
     }
-    let target = minimum.max(sizes[0]);
-    let index = sizes.partition_point(|&size| size < target);
+    let index = heap_size_index(minimum);
     let index = index.checked_add(offset).ok_or(TermError::SystemLimit)?;
     sizes
         .get(index)
@@ -2008,6 +2104,22 @@ fn next_vheap_size(used: u64, current: u64, minimum: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heap_size_index_matches_a_bisection_of_the_table() {
+        let mut probes: Vec<usize> = (1..5000).collect();
+        for &size in &HEAP_SIZES {
+            probes.extend([size - 1, size, size + 1]);
+        }
+        probes.extend([usize::MAX, usize::MAX / 2, 1 << 40]);
+        for target in probes {
+            assert_eq!(
+                heap_size_index(target),
+                HEAP_SIZES.partition_point(|&size| size < target),
+                "target {target}"
+            );
+        }
+    }
 
     #[test]
     fn literal_area_scan_finds_raw_heap_references() {

@@ -1080,13 +1080,6 @@ impl ProcessHeap {
         Self::with_words_for_type_at(words, allocation_type, NO_ALLOC_IX)
     }
 
-    /// Like [`ProcessHeap::with_words`] for a heap owned by the scheduler thread that
-    /// [`ProcessHeap::set_alloc_ix`] last named: no thread-local read, and the new heap serves
-    /// the same thread.
-    pub(crate) fn with_words_at(words: usize, alloc_ix: u16) -> Self {
-        Self::with_words_for_type_at(words, ErtsAlcType::HEAP, alloc_ix)
-    }
-
     fn with_words_for_type_at(words: usize, allocation_type: ErtsAlcType, alloc_ix: u16) -> Self {
         Self {
             words: WordBlock::new_for(words, allocation_type, alloc_ix),
@@ -1143,24 +1136,6 @@ impl ProcessHeap {
             }
         }
         fragments.clear();
-    }
-
-    /// Frees the heap's blocks on the allocator index of its scheduler thread, in the order the
-    /// fields drop: token owners, young heap, old heap, fragments.
-    pub(crate) fn release_all(mut self) {
-        drop(std::mem::take(&mut self.owners));
-        let ix = self.alloc_ix;
-        let words = std::mem::take(&mut self.words);
-        let old_words = std::mem::take(&mut self.old_words);
-        let mut fragments = std::mem::take(&mut self.fragments);
-        if ix == NO_ALLOC_IX {
-            drop(words);
-            drop(old_words);
-        } else {
-            words.release_at(usize::from(ix));
-            old_words.release_at(usize::from(ix));
-        }
-        self.release_fragments(&mut fragments);
     }
 
     /// Reserve contiguous words for a process object.
