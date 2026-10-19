@@ -275,7 +275,15 @@ fn nif_select_stop_loops_finish() {
     std::fs::write(dir.join("select_close_nif.c"), SELECT_NIF_C).unwrap();
     std::fs::write(dir.join("select_close_nif.erl"), SELECT_NIF_ERL).unwrap();
     let status = Command::new("cc")
-        .args(["-shared", "-fPIC", "-undefined", "dynamic_lookup", "-I"])
+        .args([
+            "-shared",
+            "-fPIC",
+            #[cfg(target_os = "macos")]
+            "-undefined",
+            #[cfg(target_os = "macos")]
+            "dynamic_lookup",
+            "-I",
+        ])
         .arg(otp_include())
         .arg(dir.join("select_close_nif.c"))
         .arg("-o")

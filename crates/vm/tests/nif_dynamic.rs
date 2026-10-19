@@ -42,7 +42,15 @@ fn compile_so(dir: &Path, name: &str, source: &str) -> PathBuf {
     let object = dir.join(name);
     std::fs::write(&source_path, source).unwrap();
     let status = Command::new("cc")
-        .args(["-shared", "-fPIC", "-undefined", "dynamic_lookup", "-I"])
+        .args([
+            "-shared",
+            "-fPIC",
+            #[cfg(target_os = "macos")]
+            "-undefined",
+            #[cfg(target_os = "macos")]
+            "dynamic_lookup",
+            "-I",
+        ])
         .arg(otp_include())
         .arg(&source_path)
         .arg("-o")
