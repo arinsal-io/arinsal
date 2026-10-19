@@ -40,6 +40,97 @@ pub fn copy_struct<H: HeapAlloc + ?Sized>(
     copy_struct_x(root, size, dst, None)
 }
 
+/// Whether `block` is a self-contained heap block that [`copy_shallow`] can copy word by word:
+/// `root` is its first word, every pointer stays inside it (or is the empty tuple literal) and
+/// it holds no off-heap thing (binary references, sub-bitstrings, external or magic things),
+/// whose copy must link an owner into the destination.
+// Port of the block contract of erts/emulator/beam/copy.c (copy_shallow_x), OTP-29.1.1: a term
+// "guaranteed to be contained in a single heap block", here checked once when the block is made.
+pub fn shallow_copyable(root: Term, block: &[u64]) -> bool {
+    let base = block.as_ptr() as u64;
+    if block.is_empty() || root.0 & 3 != 2 && root.0 & 3 != 1 || root.0 & !7 != base {
+        return false;
+    }
+    let empty = crate::global_empty_tuple().0;
+    let mut i = 0;
+    while i < block.len() {
+        let word = block[i];
+        match word & 3 {
+            3 => i += 1,
+            1 | 2 => {
+                let target = word & !7;
+                if word != empty && !(target >= base && (target - base) < (block.len() as u64) * 8)
+                {
+                    return false;
+                }
+                i += 1;
+            }
+            _ => {
+                let kind = word & 63;
+                if kind == ARITY || kind == RECORD {
+                    i += 1;
+                    continue;
+                }
+                let plain_thing = matches!(
+                    kind,
+                    crate::POS_BIG | crate::NEG_BIG | crate::FLOAT | HEAP_BITS | MAP | FUN
+                );
+                let ordinary_ref = kind == REF
+                    && block
+                        .get(i + 1)
+                        .is_some_and(|next| !crate::is_magic_ref_thing_with_hdr(word, *next));
+                if !(plain_thing || ordinary_ref) {
+                    return false;
+                }
+                i += copy_scan_skip(word);
+            }
+        }
+    }
+    i == block.len()
+}
+
+/// Copy the heap block `block` (see [`shallow_copyable`]) word by word into `dst`, offsetting
+/// every pointer to its new location; returns the copy of `root`.
+// Port of erts/emulator/beam/copy.c (copy_shallow_x, copy_shallow_obj_x), OTP-29.1.1, as used by
+// erl_db_util.h (db_copy_object_from_ets).
+pub fn copy_shallow<H: HeapAlloc + ?Sized>(
+    root: Term,
+    block: &[u64],
+    dst: &mut H,
+) -> Result<Term, TermError> {
+    let base = dst.alloc(block.len()).ok_or(TermError::HeapFull)?;
+    // SAFETY: `alloc` returned `block.len()` writable words that do not alias `block`, a live
+    // table-owned block.
+    let out = unsafe { std::slice::from_raw_parts_mut(base, block.len()) };
+    let offset = (base as u64).wrapping_sub(block.as_ptr() as u64);
+    let empty = crate::global_empty_tuple().0;
+    let mut i = 0;
+    while i < block.len() {
+        let word = block[i];
+        match word & 3 {
+            1 | 2 if word != empty => {
+                out[i] = word.wrapping_add(offset);
+                i += 1;
+            }
+            0 => {
+                let kind = word & 63;
+                let skip = if kind == ARITY || kind == RECORD {
+                    1
+                } else {
+                    copy_scan_skip(word)
+                };
+                out[i..i + skip].copy_from_slice(&block[i..i + skip]);
+                i += skip;
+            }
+            _ => {
+                out[i] = word;
+                i += 1;
+            }
+        }
+    }
+    Ok(Term(root.0.wrapping_add(offset)))
+}
+
 /// Copy a term, keeping references to literals outside the collector's purge area.
 /// `literals` must be the snapshot used to size the destination.
 /// Port of erts/emulator/beam/copy.c:647 (copy_struct_x with a litopt), OTP-29.1.1.
@@ -763,4 +854,65 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
     }
     debug_assert_eq!(offset, size);
     Ok(Term(root_word))
+}
+
+#[cfg(test)]
+mod shallow_tests {
+    use super::*;
+    use crate::VecHeap;
+
+    fn block_root(block: &[u64]) -> Term {
+        Term::from_ptr(block.as_ptr().cast_mut(), 2)
+    }
+
+    #[test]
+    fn rejects_blocks_that_are_not_self_contained() {
+        // A tuple whose element points outside the block.
+        let outside = 0x1000_0000_u64 | 2;
+        let block = [1 << 6, outside];
+        assert!(!shallow_copyable(block_root(&block), &block));
+        // A tuple of one immediate is a block.
+        let block = [1 << 6, Term::small(5).unwrap().0];
+        assert!(shallow_copyable(block_root(&block), &block));
+        // A thing cut off by the end of the block (float header, no payload).
+        let block = [(1 << 6) | crate::FLOAT];
+        assert!(!shallow_copyable(block_root(&block), &block));
+        // A root that is not the first word.
+        let block = [1 << 6, Term::small(5).unwrap().0];
+        assert!(!shallow_copyable(
+            Term::from_ptr(block.as_ptr().wrapping_add(1).cast_mut(), 2),
+            &block
+        ));
+    }
+
+    #[test]
+    fn rejects_off_heap_things() {
+        // A magic reference thing needs an owner link in the destination.
+        let block = [crate::REF_THING_HEADER, 0, 0];
+        assert!(!shallow_copyable(block_root(&block), &block));
+        // A BinRef likewise.
+        let block = [(2 << 6) | BIN_REF, 0, 0];
+        assert!(!shallow_copyable(block_root(&block), &block));
+    }
+
+    #[test]
+    fn copies_internal_pointers_to_the_new_block() {
+        // {1, [2]} laid out as tuple (3 words) followed by one cons cell.
+        let mut block = [0_u64; 5];
+        let cell = block.as_ptr().wrapping_add(3).cast_mut();
+        block[0] = 2 << 6;
+        block[1] = Term::small(1).unwrap().0;
+        block[2] = Term::from_ptr(cell, 1).0;
+        block[3] = Term::small(2).unwrap().0;
+        block[4] = Term::NIL.0;
+        let root = block_root(&block);
+        assert!(shallow_copyable(root, &block));
+        let mut dst = VecHeap::new();
+        let copy = copy_shallow(root, &block, &mut dst).unwrap();
+        assert_ne!(copy.0, root.0);
+        assert_eq!(
+            crate::to_owned(copy).unwrap(),
+            crate::to_owned(root).unwrap()
+        );
+    }
 }

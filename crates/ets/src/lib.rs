@@ -899,6 +899,8 @@ pub(crate) struct StoredTerm {
     compressed_bytes: usize,
     pub(crate) db_size_words: usize,
     term_size_words: usize,
+    /// The stored block can be copied out word by word (`copy_shallow`).
+    shallow: bool,
     order: u64,
     group_order: u64,
     hvalue: u64,
@@ -935,6 +937,15 @@ impl ObjectHeap {
             words: smallvec::SmallVec::new(),
             off_heap: None,
         }
+    }
+
+    /// The one block holding the object, when `term` is a copyable term at its start and the
+    /// block has no off-heap owner to link.
+    fn shallow_block(&self, term: Term, size: usize) -> bool {
+        self.off_heap.is_none()
+            && self.words.len() == 1
+            && self.words[0].len() == size
+            && arinsal_term::shallow_copyable(term, &self.words[0])
     }
 
     fn off_heap(&mut self) -> &mut OffHeap {
@@ -1117,6 +1128,7 @@ impl StoredTerm {
         // A compressed object stores a placeholder tuple; its copy size is that of the stored
         // term, not of the uncompressed source.
         let term_size_words = plain_size.unwrap_or_else(|| arinsal_term::size_object(term));
+        let shallow = heap.shallow_block(term, term_size_words);
         Ok(Self {
             heap,
             term,
@@ -1130,6 +1142,7 @@ impl StoredTerm {
                 db_size_words
             },
             term_size_words,
+            shallow,
             order: 0,
             group_order: 0,
             hvalue: 0,
@@ -1151,6 +1164,7 @@ impl StoredTerm {
                 compressed_bytes: 0,
                 db_size_words: self.db_size_words,
                 term_size_words: self.term_size_words,
+                shallow: false,
                 order: self.order,
                 group_order: self.group_order,
                 hvalue: self.hvalue,
@@ -1166,6 +1180,7 @@ impl StoredTerm {
         }
         let mut heap = ObjectHeap::new();
         let term = arinsal_term::copy_struct(self.term, &mut heap, self.term_size_words)?;
+        let shallow = heap.shallow_block(term, self.term_size_words);
         Ok(Self {
             heap,
             term,
@@ -1175,6 +1190,7 @@ impl StoredTerm {
             compressed_bytes: 0,
             db_size_words: self.db_size_words,
             term_size_words: self.term_size_words,
+            shallow,
             order: self.order,
             group_order: self.group_order,
             hvalue: self.hvalue,
@@ -1365,6 +1381,15 @@ impl StoredTerm {
             return Ok(TermBuilder::new(dst).tuple(&pair)?);
         }
         let _keep_live = &self.heap;
+        if self.shallow && !self.compressed_elements.iter().any(Option::is_some) {
+            // Port of erts/emulator/beam/erl_db_util.h (db_copy_object_from_ets): the stored
+            // block is copied word by word with the pointers offset.
+            return Ok(arinsal_term::copy_shallow(
+                self.term,
+                &self.heap.words[0],
+                dst,
+            )?);
+        }
         if !self.compressed_elements.iter().any(Option::is_some) {
             // Port of erts/emulator/beam/erl_db_util.h:425 (db_copy_object_from_ets):
             // DbTerm.size is already known, so do not size the object again before copying it.
@@ -6097,5 +6122,94 @@ mod stored_size_tests {
         let copy = stored.copy_out(&mut out).unwrap();
         let reserved: usize = out.words.iter().map(|words| words.len()).sum();
         assert_eq!(reserved, arinsal_term::size_object(copy));
+    }
+
+    /// `copy_shallow` of a stored block equals the structural copy for every plain term kind,
+    /// and objects that need owner links (reference-counted binaries, magic references) are
+    /// not shallow-copied.
+    #[test]
+    fn shallow_copy_out_matches_structural_copy() {
+        use arinsal_term::{ExportEntry, FunEntry};
+        let module = global_atoms().intern("erlang").unwrap();
+        let function = global_atoms().intern("length").unwrap();
+        let fun_entry = Arc::new(FunEntry {
+            dispatch_target: Default::default(),
+            pend_purge_address: Default::default(),
+            module,
+            arity: 1,
+            index: 3,
+            uniq: [7; 16],
+            old_uniq: 9,
+            old_index: 2,
+            pid: Term::pid(4, 0).unwrap(),
+            dispatch: Default::default(),
+            dispatch_code: Default::default(),
+            dispatch_epoch: Default::default(),
+        });
+        let key = Term::small(1).unwrap();
+        let mut source = VecHeap::new();
+        let mut cases: Vec<(&str, Term, bool)> = Vec::new();
+        macro_rules! object {
+            ($name:expr, $shallow:expr, |$b:ident| $element:expr) => {{
+                let element = {
+                    let mut $b = TermBuilder::new(&mut source);
+                    $element
+                };
+                let object = TermBuilder::new(&mut source)
+                    .tuple(&[key, element])
+                    .unwrap();
+                cases.push(($name, object, $shallow));
+            }};
+        }
+        object!("immediates", true, |b| b
+            .tuple(&[Term::small(7).unwrap(), Term::NIL])
+            .unwrap());
+        object!("list", true, |b| b
+            .list_from_slice(&[Term::small(1).unwrap(), Term::small(2).unwrap()])
+            .unwrap());
+        object!("float", true, |b| b.float(1.5).unwrap());
+        object!("bignum", true, |b| b.int_from_i128(1 << 100).unwrap());
+        object!("heap binary", true, |b| b.binary(b"abc").unwrap());
+        object!("refc binary", false, |b| b.binary(&[7u8; 200]).unwrap());
+        object!("ordinary reference", true, |b| b
+            .local_ref([1, 2, 3])
+            .unwrap());
+        object!("flatmap", true, |b| {
+            let inner = b.tuple(&[Term::small(5).unwrap()]).unwrap();
+            b.flatmap_from_pairs(&[(Term::small(1).unwrap(), inner)])
+                .unwrap()
+        });
+        object!("nested", true, |b| {
+            let inner = b.tuple(&[Term::small(5).unwrap(), Term::NIL]).unwrap();
+            let list = b
+                .list_from_slice(&[inner, Term::small(9).unwrap()])
+                .unwrap();
+            b.tuple(&[list, inner]).unwrap()
+        });
+        object!("empty tuple", true, |b| b.tuple(&[]).unwrap());
+        object!("local fun", true, |b| b
+            .local_fun(&fun_entry, &[Term::small(42).unwrap()])
+            .unwrap());
+        object!("export fun", true, |b| b
+            .export_fun(Arc::new(ExportEntry::new(module, function, 1)))
+            .unwrap());
+        for (name, object, shallow) in cases {
+            let stored = StoredTerm::copy_for_table(object, false, 1, 1).unwrap();
+            assert_eq!(stored.shallow, shallow, "{name}: shallow flag");
+            let mut out = VecHeap::new();
+            let copy = stored.copy_out(&mut out).unwrap();
+            assert_eq!(
+                arinsal_term::to_owned(copy).unwrap(),
+                arinsal_term::to_owned(object).unwrap(),
+                "{name}"
+            );
+            assert!(exact_eq(copy, object), "{name}: exact equality");
+            if shallow {
+                let mut reserved = ObjectHeap::new();
+                stored.copy_out(&mut reserved).unwrap();
+                let words: usize = reserved.words.iter().map(|w| w.len()).sum();
+                assert_eq!(words, stored.term_size_words, "{name}: reserved words");
+            }
+        }
     }
 }
