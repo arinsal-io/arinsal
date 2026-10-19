@@ -1311,3 +1311,44 @@ fn list_bif_loops_match_otp_29() {
         );
     }
 }
+
+#[test]
+fn phash2_immediate_fast_path_matches_otp_29() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let terms = [
+        O::Int(0),
+        O::Int(1),
+        O::Int(-5),
+        O::Int((1 << 27) - 1),
+        O::Int(1 << 27),
+        O::Int(-(1 << 27)),
+        O::Int(1 << 40),
+        O::Int(-(1 << 40)),
+        atom("abc"),
+        atom("true"),
+        O::Nil,
+    ];
+    let ranges = [
+        None,
+        Some(O::Int(1)),
+        Some(O::Int(1000)),
+        Some(O::Int(1 << 32)),
+        Some(O::Int((1 << 32) - 1)),
+        Some(O::Int(0)),
+        Some(O::Int((1 << 32) + 1)),
+        Some(O::Int(-3)),
+        Some(atom("bad")),
+    ];
+    for term in &terms {
+        for range in &ranges {
+            let mut args = vec![term.clone()];
+            args.extend(range.clone());
+            let actual = call("erlang", "phash2", &args);
+            let expected = reference.call("erlang", "phash2", &args);
+            assert!(
+                equivalent(&actual, &expected),
+                "{args:?}: {actual:?} vs {expected:?}"
+            );
+        }
+    }
+}

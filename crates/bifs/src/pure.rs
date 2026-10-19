@@ -432,14 +432,19 @@ fn list_with_limit(term: Term, limit: usize) -> Result<Vec<Term>, BifError> {
     Ok(out)
 }
 
+/// The head and tail of a cons cell, `None` for any other term.
+#[inline(always)]
+fn next_cons(list: Term) -> Option<(Term, Term)> {
+    // SAFETY: The source heap remains live and stable for the call.
+    unsafe { list.cons_ref() }
+}
+
 /// Walk a proper list without allocating, as `unique_integer_1` walks `modlist`.
 fn for_each_cons(
     mut tail: Term,
     mut visit: impl FnMut(Term) -> Result<(), BifError>,
 ) -> Result<(), BifError> {
-    while tail.classify() == TermKind::List {
-        // SAFETY: The source heap remains live and stable for the call.
-        let (head, next) = unsafe { tail.cons_ref() }.ok_or(BADARG)?;
+    while let Some((head, next)) = next_cons(tail) {
         visit(head)?;
         tail = next;
     }
@@ -716,6 +721,20 @@ pub fn phash2_start(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Phash2Step, BifE
 }
 
 fn phash2_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/bif.c (phash2_1, phash2_2) over `trapping_make_hash2`: a term
+    // that hashes without a work stack never builds the resumable state.
+    let range = match args.get(1) {
+        Some(range) => Some(phash2_range_arg(*range)?),
+        None => None,
+    };
+    if let Some(hash) = arinsal_term::hash2_immediate(args[0]) {
+        let value = match range {
+            None => u64::from(hash & ((1 << 27) - 1)),
+            Some(range) if range == 1_u64 << 32 => u64::from(hash),
+            Some(range) => u64::from(hash % range as u32),
+        };
+        return integer(ctx, value as usize);
+    }
     match phash2_start(ctx, args)? {
         Phash2Step::Done(value) => Ok(value),
         Phash2Step::More(cont) => {
@@ -849,17 +868,15 @@ fn list_to_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             .tuple_from_fn(0, |_, _| unreachable!())
             .expect("empty tuple is static"));
     }
-    let mut builder = TermBuilder::new(&mut ctx.heap);
-    let mut tuple = builder
-        .reserve_tuple(len, Term::NIL)
-        .map_err(|_| BifError::SystemLimit)?;
-    let mut index = 0usize;
-    for_each_cons(args[0], |value| {
-        tuple.set(index, value).expect("validated tuple index");
-        index += 1;
-        Ok(())
-    })?;
-    Ok(tuple.finish())
+    // The list was walked above, so every cell is there: the tuple is filled in one pass.
+    let mut tail = args[0];
+    TermBuilder::new(&mut ctx.heap)
+        .tuple_from_fn(len, |_, _| {
+            let (head, next) = next_cons(tail).expect("validated list");
+            tail = next;
+            head
+        })
+        .map_err(|_| BifError::SystemLimit)
 }
 fn make_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3006-3076 (make_tuple_2/3), OTP-29.1.1.
