@@ -17,6 +17,7 @@ const CASES: &[&str] = &[
     "message_exit_message",
     "message_exit_message_running",
     "info_reply_after_unmatched_message",
+    "monitor_then_message_to_parent",
 ];
 
 const SOURCE: &str = r#"-module(proc_sig_order).
@@ -40,6 +41,13 @@ run(demonitor_then_send) ->
     Seen = receive {P, Found} -> Found after 5000 -> timeout end,
     P ! stop,
     Seen;
+run(monitor_then_message_to_parent) ->
+    %% The monitor is held on the sender's scheduler; a native message send to the same
+    %% receiver must publish it first.
+    process_flag(priority, high),
+    process_flag(scheduler, 1),
+    Lost = [monitor_then_message() || _ <- lists:seq(1, 5000)],
+    length([L || L <- Lost, L =/= ok]);
 run(link_then_exit) ->
     Self = self(),
     P = spawn(fun() -> trapping_target(Self) end),
@@ -79,6 +87,18 @@ run(info_reply_after_unmatched_message) ->
     {memory, Memory} = process_info(P, memory),
     exit(P, kill),
     {Len, is_integer(Memory)}.
+
+monitor_then_message() ->
+    Self = self(),
+    P = spawn_opt(fun() ->
+                          erlang:monitor(process, Self),
+                          Self ! {self(), ready},
+                          receive stop -> ok end
+                  end, [{priority, high}, {scheduler, 2}]),
+    receive {P, ready} -> ok end,
+    {monitored_by, Mons} = process_info(self(), monitored_by),
+    P ! stop,
+    case lists:member(P, Mons) of true -> ok; false -> lost end.
 
 wait_waiting(P) ->
     case process_info(P, status) of
