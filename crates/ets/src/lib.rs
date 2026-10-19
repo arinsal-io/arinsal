@@ -1425,9 +1425,15 @@ impl StoredTerm {
     fn term_for_filter_with_size<H: HeapAlloc>(
         &self,
         scratch: &mut H,
-    ) -> Result<(Term, Option<usize>), EtsError> {
+    ) -> Result<(Term, Option<match_spec::KnownObject<'_>>), EtsError> {
         if !self.compressed_elements.iter().any(Option::is_some) {
-            return Ok((self.term, Some(self.term_size_words)));
+            return Ok((
+                self.term,
+                Some(match_spec::KnownObject {
+                    size: self.term_size_words,
+                    block: self.shallow.then(|| &self.heap.words[0][..]),
+                }),
+            ));
         }
         Ok((self.term_for_match(scratch)?, None))
     }

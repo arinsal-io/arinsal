@@ -3,8 +3,8 @@
 use crate::EtsError;
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{
-    Atom, HeapAlloc, Identity, Term, TermBuilder, TermKind, VecHeap, cmp, copy_struct, copy_term,
-    exact_eq, from_owned, global_atoms, to_owned,
+    Atom, HeapAlloc, Identity, Term, TermBuilder, TermKind, VecHeap, cmp, copy_shallow,
+    copy_struct, copy_term, exact_eq, from_owned, global_atoms, to_owned,
 };
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
@@ -47,6 +47,13 @@ pub(crate) enum TreeKeys {
     Partial { least: Term, most: Term },
     /// Every clause names the same fully bound key.
     Bound,
+}
+
+/// A stored object whose size is known, and its block when that can be copied word by word.
+#[derive(Clone, Copy)]
+pub(crate) struct KnownObject<'a> {
+    pub(crate) size: usize,
+    pub(crate) block: Option<&'a [u64]>,
 }
 
 /// An immutable match program reusable by ETS and tracing.
@@ -1080,7 +1087,7 @@ impl MatchProgram {
         dst: &mut H,
         context: &C,
         state: &mut pam::PamState,
-        object_size: Option<usize>,
+        object_size: Option<KnownObject<'_>>,
     ) -> Result<Option<Term>, EtsError> {
         let _keep_live = &self.heap;
         let outcome = if self.trace {
@@ -1100,7 +1107,12 @@ impl MatchProgram {
         }
         let result = if outcome.value == object {
             match object_size {
-                Some(size) => copy_struct(outcome.value, dst, size)?,
+                // Port of erts/emulator/beam/erl_db_util.c (db_prog_match, `$_` of the
+                // object itself: copy_shallow of the stored block), OTP-29.1.1.
+                Some(KnownObject {
+                    block: Some(block), ..
+                }) => copy_shallow(outcome.value, block, dst)?,
+                Some(known) => copy_struct(outcome.value, dst, known.size)?,
                 None => copy_term(outcome.value, dst)?,
             }
         } else {
@@ -1385,7 +1397,7 @@ impl MatchRunner<'_> {
         object: Term,
         dst: &mut H,
         context: &C,
-        object_size: Option<usize>,
+        object_size: Option<KnownObject<'_>>,
     ) -> Result<Option<Term>, EtsError> {
         let result = self
             .program
@@ -1400,7 +1412,7 @@ impl MatchRunner<'_> {
         &mut self,
         object: Term,
         dst: &mut H,
-        object_size: Option<usize>,
+        object_size: Option<KnownObject<'_>>,
     ) -> Result<Option<Term>, EtsError> {
         self.run_with_context_sized(object, dst, &EmptyContext, object_size)
     }
