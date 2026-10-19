@@ -3,8 +3,8 @@
 use crate::EtsError;
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{
-    Atom, HeapAlloc, Identity, Term, TermBuilder, TermKind, VecHeap, cmp, copy_term, exact_eq,
-    from_owned, global_atoms, to_owned,
+    Atom, HeapAlloc, Identity, Term, TermBuilder, TermKind, VecHeap, cmp, copy_struct, copy_term,
+    exact_eq, from_owned, global_atoms, to_owned,
 };
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
@@ -63,7 +63,7 @@ pub struct MatchProgram {
 }
 
 /// Match pseudo-process state kept for one whole table traversal.
-// Port of erts/emulator/beam/erl_db_hash.c:1835-1850 (match_traverse reuses the process
+// Port of erts/emulator/beam/erl_db_hash.c (match_traverse reuses the process
 // match state for each DbTerm), OTP-29.1.1.
 pub(crate) struct MatchRunner<'a> {
     program: &'a MatchProgram,
@@ -305,7 +305,7 @@ fn sign(order: Ordering) -> i32 {
     order as i32
 }
 
-/// Port of erts/emulator/beam/erl_db_tree.c:3853 (do_cmp_partly_bound), OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_db_tree.c (do_cmp_partly_bound), OTP-29.1.1.
 fn do_cmp_partly_bound(a: Term, b: Term, done: &mut bool) -> i32 {
     if is_match_variable(a) {
         *done = true;
@@ -354,13 +354,13 @@ fn do_cmp_partly_bound(a: Term, b: Term, done: &mut bool) -> i32 {
     }
 }
 
-/// Port of erts/emulator/beam/erl_db_tree.c:3917 (cmp_partly_bound), OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_db_tree.c (cmp_partly_bound), OTP-29.1.1.
 pub(crate) fn cmp_partly_bound(partly_bound_key: Term, bound_key: Term) -> i32 {
     do_cmp_partly_bound(partly_bound_key, bound_key, &mut false)
 }
 
 /// Shared walk of `do_partly_bound_can_match_lesser/greater`; `lesser` picks the direction.
-// Port of erts/emulator/beam/erl_db_tree.c:3988 and :4059, OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db_tree.c and :4059, OTP-29.1.1.
 fn do_partly_bound_can_match(a: Term, b: Term, lesser: bool, done: &mut bool) -> bool {
     let want = |order: i32| if lesser { order < 0 } else { order > 0 };
     if is_match_variable(a) {
@@ -430,7 +430,7 @@ fn partly_bound_can_match_greater(a: Term, b: Term) -> bool {
     do_partly_bound_can_match(a, b, false, &mut false)
 }
 
-/// Port of erts/emulator/beam/erl_db_util.c:3962 (db_is_fully_bound), OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_db_util.c (db_is_fully_bound), OTP-29.1.1.
 /// Maps count as variable, like in erts.
 fn is_fully_bound(term: Term) -> bool {
     match term.classify() {
@@ -476,7 +476,7 @@ fn atom_name(term: Term) -> Option<String> {
 }
 
 fn proper_list(mut term: Term) -> Result<Vec<Term>, EtsError> {
-    // Port of erts/emulator/beam/erl_db_util.c:4269, OTP-29.1.1 (dmc_list).
+    // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_list).
     let mut values = Vec::new();
     while term != Term::NIL {
         let (head, tail) = cons(term).ok_or(EtsError::BadArg)?;
@@ -500,13 +500,13 @@ fn cons(term: Term) -> Option<(Term, Term)> {
 }
 
 fn tuple(term: Term) -> Result<Vec<Term>, EtsError> {
-    // Port of erts/emulator/beam/erl_db_util.c:4384, OTP-29.1.1 (dmc_tuple).
+    // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_tuple).
     let view = tuple_view(term).ok_or(EtsError::BadArg)?;
     Ok(view.iter().collect())
 }
 
 fn variable(term: Term) -> Option<usize> {
-    // Port of erts/emulator/beam/erl_db_util.c:3896-3914, OTP-29.1.1 (db_is_variable).
+    // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (db_is_variable).
     let text = global_atoms().text(term.as_atom()?)?;
     let digits = text.strip_prefix('$')?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -515,28 +515,28 @@ fn variable(term: Term) -> Option<usize> {
     digits.parse::<usize>().ok()
 }
 
-// Port of erts/emulator/beam/erl_db_util.c:4047, OTP-29.1.1 (dmc_one_term).
+// Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_one_term).
 fn head_variables(term: Term, bound: &mut HashSet<usize>) -> Result<(), EtsError> {
-    // Port of erts/emulator/beam/erl_db_util.c:2632, OTP-29.1.1 (matchPushV).
+    // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (matchPushV).
     if let Some(index) = variable(term) {
         bound.insert(index);
         return Ok(());
     }
     match term.classify() {
         TermKind::Tuple => {
-            // Port of erts/emulator/beam/erl_db_util.c:2304, OTP-29.1.1 (matchTuple).
+            // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (matchTuple).
             for element in tuple(term)? {
                 head_variables(element, bound)?;
             }
         }
         TermKind::List => {
-            // Port of erts/emulator/beam/erl_db_util.c:2324, OTP-29.1.1 (matchList).
+            // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (matchList).
             let (head, tail) = cons(term).ok_or(EtsError::BadArg)?;
             head_variables(head, bound)?;
             head_variables(tail, bound)?;
         }
         TermKind::Map => {
-            // Port of erts/emulator/beam/erl_db_util.c:2335, OTP-29.1.1 (matchMap).
+            // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (matchMap).
             let OwnedTerm::Map(pairs) = &to_owned(term)? else {
                 return Err(EtsError::BadArg);
             };
@@ -605,7 +605,7 @@ fn owned_unbound_variable(term: &OwnedTerm, bound: &HashSet<usize>) -> Option<us
     }
 }
 
-// Port of erts/emulator/beam/erl_db_util.c:6031, OTP-29.1.1 (match_spec_test).
+// Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (match_spec_test).
 fn compiler_diagnostics(specification: Term, trace: bool) -> Vec<String> {
     const INVALID: &str = "Invalid match specification.";
     let Ok(clauses) = proper_list(specification) else {
@@ -645,7 +645,7 @@ fn compiler_diagnostics(specification: Term, trace: bool) -> Vec<String> {
             for expression in expressions {
                 let valid = validate_expr(*expression, is_guard, &bound, trace, 0);
                 if valid == Err(EtsError::Term(arinsal_term::TermError::SystemLimit)) {
-                    // Port of erts/emulator/beam/erl_db_util.c:5602-5606, OTP-29.1.1.
+                    // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1.
                     messages.push("Excessive nesting; system limit reached.".into());
                 } else if let Some(index) = unbound_variable(*expression, &bound) {
                     messages.push(format!("Variable ${index} is unbound."));
@@ -665,7 +665,7 @@ fn compiler_diagnostics(specification: Term, trace: bool) -> Vec<String> {
 /// `system_limit` (erl 29.1.1 on this machine gives up after roughly 1300 levels).
 const MAX_NESTING: usize = 1000;
 
-// Port of erts/emulator/beam/erl_db_util.c:572, OTP-29.1.1 (guard_tab).
+// Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (guard_tab).
 fn validate_expr(
     term: Term,
     guard: bool,
@@ -673,7 +673,7 @@ fn validate_expr(
     trace: bool,
     depth: usize,
 ) -> Result<(), EtsError> {
-    // Port of erts/emulator/beam/erl_db_util.c:5602-5606 (dmc_expr stack_guard), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_util.c (dmc_expr stack_guard), OTP-29.1.1.
     // erts bounds the compiler recursion by the remaining C stack; a fixed nesting bound
     // keeps the same system_limit outcome without reading the native stack.
     if depth > MAX_NESTING {
@@ -688,7 +688,7 @@ fn validate_expr(
         };
     }
     if term.classify() == TermKind::List {
-        // Port of erts/emulator/beam/erl_db_util.c:4269, OTP-29.1.1 (dmc_list).
+        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_list).
         // Walk the spine iteratively: long lists are not nesting.
         let mut rest = term;
         while rest.classify() == TermKind::List {
@@ -699,7 +699,7 @@ fn validate_expr(
         return validate_expr(rest, guard, bound, trace, depth);
     }
     if term.classify() == TermKind::Map {
-        // Port of erts/emulator/beam/erl_db_util.c:4411, OTP-29.1.1 (dmc_map).
+        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_map).
         let owned = to_owned(term)?;
         let OwnedTerm::Map(pairs) = &owned else {
             return Err(EtsError::BadArg);
@@ -721,7 +721,7 @@ fn validate_expr(
         return Err(EtsError::BadArg);
     }
     if elements.len() == 1 && elements[0].classify() == TermKind::Tuple {
-        // Port of erts/emulator/beam/erl_db_util.c:4384, OTP-29.1.1 (dmc_tuple).
+        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_tuple).
         return validate_construct(elements[0], bound, trace, depth);
     }
     let Some(name) = atom_name(elements[0]) else {
@@ -775,7 +775,7 @@ fn validate_expr(
     Ok(())
 }
 
-// Port of erts/emulator/beam/erl_db_util.c:4384, OTP-29.1.1 (dmc_tuple).
+// Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_tuple).
 fn validate_construct(
     term: Term,
     bound: &HashSet<usize>,
@@ -786,7 +786,7 @@ fn validate_construct(
         return Err(EtsError::Term(arinsal_term::TermError::SystemLimit));
     }
     if term.classify() == TermKind::Tuple {
-        // Port of erts/emulator/beam/erl_db_util.c:4308-4334 (dmc_tuple), OTP-29.1.1: each
+        // Port of erts/emulator/beam/erl_db_util.c (dmc_tuple), OTP-29.1.1: each
         // element of a constructed tuple is an expression of its own.
         for element in tuple(term)? {
             validate_expr(element, false, bound, trace, depth + 1)?;
@@ -888,7 +888,7 @@ impl MatchProgram {
     ///
     /// `send` patterns drop the call-only forms; `receive` patterns also drop the
     /// effectful trace forms.
-    // Port of erts/emulator/beam/erl_db_util.c:1187-1192 (erts_match_set_compile_trace flags),
+    // Port of erts/emulator/beam/erl_db_util.c (erts_match_set_compile_trace flags),
     // OTP-29.1.1; `check_trace` in the compiler enforces them.
     pub fn compile_trace_event(specification: Term, receive: bool) -> Result<Self, EtsError> {
         Self::compile_with_flags(
@@ -921,7 +921,7 @@ impl MatchProgram {
     }
 
     /// Compile a specification that already lives in `heap`, which the program then owns.
-    // Port of erts/emulator/beam/erl_db_util.c:1211 (db_match_set_compile), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_util.c (db_match_set_compile), OTP-29.1.1.
     fn compile_in(mut heap: VecHeap, specification: Term, cflags: u32) -> Result<Self, EtsError> {
         let trace = cflags & dmc::DCOMP_TRACE != 0;
         let mut clauses = Vec::new();
@@ -1066,7 +1066,7 @@ impl MatchProgram {
         let mut state = STATE
             .take()
             .unwrap_or_else(|| Box::new(pam::PamState::new()));
-        let result = self.run_program(object, dst, context, &mut state);
+        let result = self.run_program(object, dst, context, &mut state, None);
         if state.heap.used_words() != 0 {
             state.heap.reset(128);
         }
@@ -1080,6 +1080,7 @@ impl MatchProgram {
         dst: &mut H,
         context: &C,
         state: &mut pam::PamState,
+        object_size: Option<usize>,
     ) -> Result<Option<Term>, EtsError> {
         let _keep_live = &self.heap;
         let outcome = if self.trace {
@@ -1097,11 +1098,19 @@ impl MatchProgram {
             // the `{message, Term}` payload.
             let _ = context.trace_operation("message", &[outcome.value]);
         }
-        Ok(Some(copy_term(outcome.value, dst)?))
+        let result = if outcome.value == object {
+            match object_size {
+                Some(size) => copy_struct(outcome.value, dst, size)?,
+                None => copy_term(outcome.value, dst)?,
+            }
+        } else {
+            copy_term(outcome.value, dst)?
+        };
+        Ok(Some(result))
     }
 
     /// Infer a key interval only when one clause has direct key comparisons.
-    // Port of erts/emulator/beam/erl_db_util.c:1700, OTP-29.1.1 (db_getkey).
+    // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (db_getkey).
     pub fn key_bounds(&self, keypos: usize) -> Option<KeyBounds> {
         let mut bounds = self.guard_bounds(keypos).unwrap_or(KeyBounds {
             lower: None,
@@ -1186,8 +1195,8 @@ impl MatchProgram {
     }
 
     /// Return the key pattern when the sole clause binds it completely.
-    // Port of erts/emulator/beam/erl_db_hash.c:3177 (analyze_pattern) and
-    // erl_db_util.c:3962 (db_is_fully_bound), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (analyze_pattern) and
+    // erl_db_util.c (db_is_fully_bound), OTP-29.1.1.
     pub fn exact_key_pattern(&self, keypos: usize) -> Option<Term> {
         let [clause] = self.clauses.as_slice() else {
             return None;
@@ -1199,7 +1208,7 @@ impl MatchProgram {
 
     /// Least and most key pattern over all clause heads when the keys are bound or
     /// partly bound in every clause that can match at all.
-    // Port of erts/emulator/beam/erl_db_tree.c:2756 (analyze_pattern) and :3828
+    // Port of erts/emulator/beam/erl_db_tree.c (analyze_pattern) and :3828
     // (key_boundness), OTP-29.1.1.
     fn head_key_range(&self, keypos: usize) -> Option<(Term, Term)> {
         let (mut least, mut most): (Option<Term>, Option<Term>) = (None, None);
@@ -1273,7 +1282,7 @@ impl MatchProgram {
 
     /// Whether every compiled clause reconstructs the matched object with the same key.
     pub(crate) fn keeps_key(&self, keypos: usize) -> bool {
-        // Port of erts/emulator/beam/erl_db_util.c:1422, OTP-29.1.1 (db_match_keeps_key).
+        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (db_match_keeps_key).
         self.clauses.iter().all(|clause| {
             if clause.body.len() != 1 {
                 return false;
@@ -1366,13 +1375,34 @@ impl MatchRunner<'_> {
         dst: &mut H,
         context: &C,
     ) -> Result<Option<Term>, EtsError> {
+        self.run_with_context_sized(object, dst, context, None)
+    }
+
+    /// Run a stored ETS object, reusing its known size if the clause returns that object.
+    // Port of erts/emulator/beam/erl_db_util.h:425 (db_copy_object_from_ets), OTP-29.1.1.
+    pub(crate) fn run_with_context_sized<H: HeapAlloc, C: MatchContext>(
+        &mut self,
+        object: Term,
+        dst: &mut H,
+        context: &C,
+        object_size: Option<usize>,
+    ) -> Result<Option<Term>, EtsError> {
         let result = self
             .program
-            .run_program(object, dst, context, &mut self.state);
+            .run_program(object, dst, context, &mut self.state, object_size);
         if self.state.heap.used_words() != 0 {
             self.state.heap.reset(128);
         }
         result
+    }
+
+    pub(crate) fn run_sized<H: HeapAlloc>(
+        &mut self,
+        object: Term,
+        dst: &mut H,
+        object_size: Option<usize>,
+    ) -> Result<Option<Term>, EtsError> {
+        self.run_with_context_sized(object, dst, &EmptyContext, object_size)
     }
 }
 
@@ -1391,7 +1421,7 @@ fn match_eq_body(match_term: Term, body_term: Term, constant: bool) -> bool {
 }
 
 /// Whether the body term rebuilds exactly the matched term.
-// Port of erts/emulator/beam/erl_db_util.c:1333-1419 (db_match_eq_body), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db_util.c (db_match_eq_body), OTP-29.1.1.
 fn owned_match_eq_body(a: &OwnedTerm, b: &OwnedTerm, constant: bool) -> bool {
     match b {
         OwnedTerm::List { .. } => {
@@ -1543,21 +1573,21 @@ fn map_get(key: Term, map: Term, _scratch: &mut VecHeap) -> Result<Option<Term>,
     if let Some(flat) = unsafe { map.flatmap_ref() } {
         return Ok(flat.get(key));
     }
-    // Port of erts/emulator/beam/erl_map.c:2424-2474 (erts_maps_get), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_map.c (erts_maps_get), OTP-29.1.1.
     // Keep HAMT lookups logarithmic instead of decoding and scanning the whole map per key.
     arinsal_maps::get(map, key).map_err(|_| EtsError::BadArg)
 }
 
-// Port of erts/emulator/beam/erl_db_util.c:5592, OTP-29.1.1 (dmc_expr).
+// Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_expr).
 /// Evaluate an already-argument-evaluated guard BIF.
-// Port of erts/emulator/beam/erl_db_util.c:572 (guard_tab), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db_util.c (guard_tab), OTP-29.1.1.
 fn builtin(name: &str, args: &[Term], scratch: &mut VecHeap) -> Result<Term, EtsError> {
     let a = args[0];
     let result = match name {
-        // Port of erts/emulator/beam/erl_db_util.c:2390, OTP-29.1.1 (matchCmp).
+        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (matchCmp).
         "==" => truth(cmp(a, args[1]) == Ordering::Equal),
         "/=" => truth(cmp(a, args[1]) != Ordering::Equal),
-        // Port of erts/emulator/beam/erl_db_util.c:2440, OTP-29.1.1 (matchEq).
+        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (matchEq).
         "=:=" => truth(exact_eq(a, args[1])),
         "=/=" => truth(!exact_eq(a, args[1])),
         ">" => truth(cmp(a, args[1]) == Ordering::Greater),
@@ -1567,7 +1597,7 @@ fn builtin(name: &str, args: &[Term], scratch: &mut VecHeap) -> Result<Term, Ets
         "+" | "-" | "*" => {
             if args.len() == 1 {
                 if name == "+" {
-                    // Port of erts/emulator/beam/erl_db_util.c:572-858 (guard_tab), OTP-29.1.1:
+                    // Port of erts/emulator/beam/erl_db_util.c (guard_tab), OTP-29.1.1:
                     // the unary plus BIF accepts numbers only, even though it returns them intact.
                     if integer(a).is_some() || float(a).is_some() {
                         a
@@ -1606,7 +1636,7 @@ fn builtin(name: &str, args: &[Term], scratch: &mut VecHeap) -> Result<Term, Ets
             scratch,
         )?,
         "not" => truth(!boolean(a).ok_or(EtsError::BadArg)?),
-        // Port of erts/emulator/beam/erl_db_util.c:4701, OTP-29.1.1 (dmc_and).
+        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (dmc_and).
         "and" | "or" => {
             let mut result = name == "and";
             for &argument in args {
@@ -1622,7 +1652,7 @@ fn builtin(name: &str, args: &[Term], scratch: &mut VecHeap) -> Result<Term, Ets
         "xor" => {
             truth(boolean(a).ok_or(EtsError::BadArg)? ^ boolean(args[1]).ok_or(EtsError::BadArg)?)
         }
-        // Port of erts/emulator/beam/erl_db_util.c:572, OTP-29.1.1 (guard_tab type tests).
+        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (guard_tab type tests).
         "is_atom" => truth(a.classify() == TermKind::Atom),
         "is_integer" if args.len() == 1 => truth(integer(a).is_some()),
         "is_integer" => {
@@ -1794,7 +1824,7 @@ fn builtin(name: &str, args: &[Term], scratch: &mut VecHeap) -> Result<Term, Ets
                 boxed_int(integral_float_to_bigint(rounded)?, scratch)?
             }
         }
-        // Port of erts/emulator/beam/erl_db_util.c:572, OTP-29.1.1 (guard_tab element/2).
+        // Port of erts/emulator/beam/erl_db_util.c, OTP-29.1.1 (guard_tab element/2).
         "element" => {
             let index = a.as_small().ok_or(EtsError::BadArg)?;
             if index <= 0 {

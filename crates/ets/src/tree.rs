@@ -23,12 +23,12 @@ impl Node {
         })
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:773 (db_put_dbterm_tree_common), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
     pub(super) fn insert(root: Option<Box<Self>>, object: StoredTerm, keypos: usize) -> Box<Self> {
         Self::insert_branch(root, object, keypos).0.unwrap()
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:448 (split_tree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (split_tree), OTP-29.1.1.
     pub(super) fn split_for_catree(
         mut root: Box<Self>,
         keypos: usize,
@@ -52,7 +52,7 @@ impl Node {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:560 (join_trees), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (join_trees), OTP-29.1.1.
     pub(super) fn join_ordered(
         left: Option<Box<Self>>,
         right: Option<Box<Self>>,
@@ -102,7 +102,7 @@ impl Node {
         (Some(Self::rebalance(root)), min)
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:773 (db_put_dbterm_tree_common), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
     fn insert_branch(
         root: Option<Box<Self>>,
         object: StoredTerm,
@@ -155,7 +155,7 @@ impl Node {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:2639 (linkout_tree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (linkout_tree), OTP-29.1.1.
     pub(super) fn remove(root: Option<Box<Self>>, key: Term, keypos: usize) -> Option<Box<Self>> {
         let mut root = root?;
         match cmp(key, root.object.key(keypos)) {
@@ -177,7 +177,7 @@ impl Node {
         Some(Self::rebalance(root))
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:3026 (delsub), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (delsub), OTP-29.1.1.
     fn take_max(mut root: Box<Self>) -> (Option<Box<Self>>, Box<Self>) {
         match root.right.take() {
             None => (root.left.take(), root),
@@ -189,7 +189,7 @@ impl Node {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:2909 (tree_balance_left) and :2954 (tree_balance_right), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (tree_balance_left) and :2954 (tree_balance_right), OTP-29.1.1.
     fn rebalance(mut root: Box<Self>) -> Box<Self> {
         Self::refresh(&mut root);
         if root.balance < -1 {
@@ -207,7 +207,7 @@ impl Node {
         root
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:2909 (tree_balance_left), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (tree_balance_left), OTP-29.1.1.
     fn rotate_right(mut root: Box<Self>) -> Box<Self> {
         let mut top = root
             .left
@@ -220,7 +220,7 @@ impl Node {
         top
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:2954 (tree_balance_right), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (tree_balance_right), OTP-29.1.1.
     fn rotate_left(mut root: Box<Self>) -> Box<Self> {
         let mut top = root
             .right
@@ -233,7 +233,7 @@ impl Node {
         top
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:758 (cmp_key_eq), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (cmp_key_eq), OTP-29.1.1.
     fn refresh(root: &mut Box<Self>) {
         let left_height = Self::height(&root.left);
         let right_height = Self::height(&root.right);
@@ -242,7 +242,7 @@ impl Node {
         root.size = 1 + Self::count(&root.left) + Self::count(&root.right);
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:3174 (find_next), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (find_next), OTP-29.1.1.
     pub(super) fn get(root: &Option<Box<Self>>, key: Term, keypos: usize) -> Option<&StoredTerm> {
         let mut node = root.as_deref();
         while let Some(current) = node {
@@ -257,7 +257,7 @@ impl Node {
 
     /// The object at `key`, for an update in place.
     ///
-    /// Port of erts/emulator/beam/erl_db_tree.c:3388 (find_node), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (find_node), OTP-29.1.1.
     pub(super) fn get_mut(
         root: &mut Option<Box<Self>>,
         key: Term,
@@ -274,7 +274,7 @@ impl Node {
         None
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:3396 (slot_search), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (slot_search), OTP-29.1.1.
     pub(super) fn nth(root: &Option<Box<Self>>, index: usize) -> Option<&StoredTerm> {
         let mut node = root.as_deref()?;
         let mut index = index;
@@ -291,7 +291,7 @@ impl Node {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:3174 (find_next) and :3232 (find_prev), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (find_next) and :3232 (find_prev), OTP-29.1.1.
     pub(super) fn count(root: &Option<Box<Self>>) -> usize {
         root.as_ref().map_or(0, |node| node.size)
     }
@@ -300,7 +300,7 @@ impl Node {
         root.as_ref().map_or(0, |node| node.height)
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:3663 (traverse_forward), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (traverse_forward), OTP-29.1.1.
     pub(super) fn walk<'a>(root: &'a Option<Box<Self>>, out: &mut Vec<&'a StoredTerm>) {
         let mut pending = Vec::new();
         let mut current = root.as_deref();
@@ -315,7 +315,7 @@ impl Node {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:3174 (find_next) and :3232 (find_prev), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (find_next) and :3232 (find_prev), OTP-29.1.1.
     pub(super) fn scan_after<F>(
         root: &Option<Box<Self>>,
         cursor: Option<Term>,
@@ -398,7 +398,7 @@ impl Node {
         Ok(false)
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:2753 (analyze_pattern), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (analyze_pattern), OTP-29.1.1.
     pub(super) fn select_range<H: HeapAlloc>(
         root: &Option<Box<Self>>,
         state: &mut RangeSelection<'_, '_, H>,
@@ -443,8 +443,8 @@ impl Node {
             return Ok(());
         }
         if !below && !above {
-            let term = node.object.term_for_filter(state.dst)?;
-            if let Some(result) = state.runner.run(term, state.dst)? {
+            let (term, size) = node.object.term_for_filter_with_size(state.dst)?;
+            if let Some(result) = state.runner.run_sized(term, state.dst, size)? {
                 state.out.push(result);
             }
         }
@@ -457,7 +457,7 @@ impl Node {
         Ok(())
     }
 
-    /// Port of erts/emulator/beam/erl_db_tree.c:2909 (tree_balance_left), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (tree_balance_left), OTP-29.1.1.
     pub(super) fn validate(root: &Option<Box<Self>>) -> bool {
         fn check(node: &Option<Box<Node>>) -> Option<(u8, usize)> {
             let Some(node) = node else {

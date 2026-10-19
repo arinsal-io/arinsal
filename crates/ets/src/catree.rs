@@ -35,11 +35,11 @@ impl BaseNode {
         })
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:790 (wlock_base_node), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (wlock_base_node), OTP-29.1.1.
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, Option<Box<Node>>> {
         match self.root.try_write() {
             Ok(guard) => {
-                // Port of erts/emulator/beam/erl_db_catree.c:809 (wlock_base_node), OTP-29.1.1.
+                // Port of erts/emulator/beam/erl_db_catree.c (wlock_base_node), OTP-29.1.1.
                 // OTP subtracts the negative success contribution, so an uncontended write adds one.
                 self.adjust_stat(-LOCK_SUCCESS_CONTRIBUTION);
                 guard
@@ -55,7 +55,7 @@ impl BaseNode {
         self.root.write().expect("CA-tree base lock poisoned")
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:842 (rlock_base_node), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (rlock_base_node), OTP-29.1.1.
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<Box<Node>>> {
         match self.root.try_read() {
             Ok(guard) => guard,
@@ -188,7 +188,7 @@ pub(crate) struct CATree {
 }
 
 impl CATree {
-    /// Port of erts/emulator/beam/erl_db_catree.c:1562 (db_initialize_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_initialize_catree), OTP-29.1.1.
     pub(crate) fn new(keypos: usize) -> Self {
         Self {
             keypos,
@@ -211,7 +211,7 @@ impl CATree {
         self.memory_words.load(AtomicOrdering::Relaxed)
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:1757 (catree_find_root), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (catree_find_root), OTP-29.1.1.
     fn route_index(&self, routes: &[RouteEntry], key: Term) -> usize {
         routes[1..].partition_point(|route| {
             route
@@ -221,7 +221,7 @@ impl CATree {
         })
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:1733 (db_put_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_put_catree), OTP-29.1.1.
     pub(crate) fn insert(&self, object: StoredTerm) {
         let key = object.key(self.keypos);
         let mut object = Some(object);
@@ -252,14 +252,76 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:1733 (db_put_catree), OTP-29.1.1.
+    /// Insert an object only when its ordered key is absent.
+    // Port of erts/emulator/beam/erl_db_catree.c (db_put_catree with key_clash_fail), OTP-29.1.1.
+    pub(crate) fn insert_new(&self, object: StoredTerm) -> bool {
+        let key = object.key(self.keypos);
+        let mut object = Some(object);
+        loop {
+            let routes = self.routes.load();
+            let base = routes.find_base(key);
+            let mut root = base.write();
+            if !base.is_valid.load(AtomicOrdering::Acquire) {
+                drop(root);
+                drop(routes);
+                std::thread::yield_now();
+                continue;
+            }
+            let inserted = if Node::get(&root, key, self.keypos).is_some() {
+                false
+            } else {
+                let stored = object
+                    .take()
+                    .expect("CA-tree insert object retained on retry");
+                self.memory_words
+                    .fetch_add(stored.db_size_words as isize, AtomicOrdering::Relaxed);
+                *root = Some(Node::insert(root.take(), stored, self.keypos));
+                true
+            };
+            let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
+            drop(root);
+            self.adapt(base, stat);
+            return inserted;
+        }
+    }
+
+    /// Update an existing object while holding its CA-tree base-node write lock.
+    // Port of erts/emulator/beam/erl_db_catree.c (db_lookup_dbterm_catree and
+    // db_finalize_dbterm_catree), OTP-29.1.1.
+    pub(crate) fn with_object_mut<R>(
+        &self,
+        key: Term,
+        update: impl FnOnce(&mut StoredTerm) -> Option<R>,
+    ) -> Option<R> {
+        let mut update = Some(update);
+        loop {
+            let routes = self.routes.load();
+            let base = routes.find_base(key);
+            let mut root = base.write();
+            if !base.is_valid.load(AtomicOrdering::Acquire) {
+                drop(root);
+                drop(routes);
+                std::thread::yield_now();
+                continue;
+            }
+            let result = Node::get_mut(&mut root, key, self.keypos).and_then(|object| {
+                update.take().expect("CA-tree update retained on retry")(object)
+            });
+            let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
+            drop(root);
+            self.adapt(base, stat);
+            return result;
+        }
+    }
+
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_put_catree), OTP-29.1.1.
     pub(crate) fn insert_many(&self, objects: Vec<StoredTerm>) {
         for object in objects {
             self.insert(object);
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2401 (db_get_binary_info_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_get_binary_info_catree), OTP-29.1.1.
     /// Reads the stored term in place so the reference counts are not inflated by a copy.
     pub(crate) fn binary_info<H: HeapAlloc>(
         &self,
@@ -282,7 +344,7 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:1746 (db_get_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_get_catree), OTP-29.1.1.
     pub(crate) fn lookup<H: HeapAlloc>(
         &self,
         key: Term,
@@ -308,7 +370,33 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2029 (db_member_catree), OTP-29.1.1.
+    /// Copy the one ordered object for a key without allocating a result vector.
+    // Port of erts/emulator/beam/erl_db_catree.c (db_get_catree), OTP-29.1.1.
+    pub(crate) fn lookup_one<H: HeapAlloc>(
+        &self,
+        key: Term,
+        dst: &mut H,
+    ) -> Result<Option<Term>, EtsError> {
+        loop {
+            let routes = self.routes.load();
+            let base = routes.find_base(key);
+            let root = base.read();
+            if !base.is_valid.load(AtomicOrdering::Acquire) {
+                drop(root);
+                drop(routes);
+                std::thread::yield_now();
+                continue;
+            }
+            let result = Node::get(&root, key, self.keypos)
+                .map(|object| object.copy_out(dst))
+                .transpose();
+            drop(root);
+            self.random_join();
+            return result;
+        }
+    }
+
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_member_catree), OTP-29.1.1.
     pub(crate) fn member(&self, key: Term) -> bool {
         loop {
             let routes = self.routes.load();
@@ -329,7 +417,7 @@ impl CATree {
 
     /// Copy one object element while holding the base read lock.
     ///
-    /// Port of erts/emulator/beam/erl_db_catree.c:2040 (`db_get_element_catree`), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (`db_get_element_catree`), OTP-29.1.1.
     pub(crate) fn lookup_element<H: HeapAlloc>(
         &self,
         key: Term,
@@ -355,7 +443,7 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:1746 (db_get_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_get_catree), OTP-29.1.1.
     pub(crate) fn matching(&self, key: Term) -> Result<Vec<StoredTerm>, EtsError> {
         loop {
             let routes = self.routes.load();
@@ -377,7 +465,7 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2040 (db_get_element_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_get_element_catree), OTP-29.1.1.
     pub(crate) fn delete_object(&self, key: Term, object: Term) {
         loop {
             let routes = self.routes.load();
@@ -404,7 +492,7 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2052 (db_erase_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_erase_catree), OTP-29.1.1.
     pub(crate) fn delete(&self, key: Term) {
         loop {
             let routes = self.routes.load();
@@ -430,7 +518,7 @@ impl CATree {
 
     /// Detach every base node's tree for incremental release, leaving one empty base node.
     ///
-    /// Port of erts/emulator/beam/erl_db_catree.c:1414 (db_free_table_continue_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_free_table_continue_catree), OTP-29.1.1.
     #[expect(clippy::vec_box, reason = "tree links already own boxed nodes")]
     pub(crate) fn take_all(&self) -> Vec<Box<Node>> {
         let _adaptation = self.adaptation.lock().expect("CA-tree adaptation poisoned");
@@ -465,7 +553,7 @@ impl CATree {
     /// Read-lock every base node of a consistent route snapshot. A split or join invalidates its
     /// bases under their write locks before publishing new routes, so when all bases are valid
     /// the held guards cover the table exactly once.
-    // Port of erts/emulator/beam/erl_db_catree.c:2449-2470 (lock_all_bases for
+    // Port of erts/emulator/beam/erl_db_catree.c (lock_all_bases for
     // db_calc_stats_catree / db_select_catree), OTP-29.1.1.
     fn with_all_bases<R>(
         &self,
@@ -485,32 +573,17 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2471 (db_calc_stats_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_calc_stats_catree), OTP-29.1.1.
     pub(crate) fn count(&self) -> usize {
         self.with_all_bases(|bases| bases.iter().map(|root| Node::count(root)).sum())
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2471 (db_calc_stats_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_calc_stats_catree), OTP-29.1.1.
     pub(crate) fn validate(&self) -> bool {
         self.with_all_bases(|bases| bases.iter().all(|root| Node::validate(root)))
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2350 (erts_db_foreach_thr_prgr_offheap_catree), OTP-29.1.1.
-    pub(crate) fn objects(&self) -> Result<Vec<StoredTerm>, EtsError> {
-        self.with_all_bases(|bases| {
-            let mut objects = Vec::new();
-            for root in bases {
-                let mut refs = Vec::new();
-                Node::walk(root, &mut refs);
-                for object in refs {
-                    objects.push(object.copy_stored()?);
-                }
-            }
-            Ok(objects)
-        })
-    }
-
-    /// Port of erts/emulator/beam/erl_db_catree.c:1633 (db_next_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_next_catree), OTP-29.1.1.
     pub(crate) fn edge<H: HeapAlloc>(
         &self,
         last: bool,
@@ -533,7 +606,7 @@ impl CATree {
         Ok(None)
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:1794 (catree_find_nextprev_root), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (catree_find_nextprev_root), OTP-29.1.1.
     pub(crate) fn scan_after<F>(
         &self,
         cursor: Option<Term>,
@@ -587,7 +660,7 @@ impl CATree {
         Ok(false)
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2079 (db_slot_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_slot_catree), OTP-29.1.1.
     pub(crate) fn nth<H: HeapAlloc>(
         &self,
         mut index: usize,
@@ -607,14 +680,14 @@ impl CATree {
         Ok(None)
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:1615 (db_next_catree_common), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_next_catree_common), OTP-29.1.1.
     pub(crate) fn next<H: HeapAlloc>(
         &self,
         key: Term,
         reverse: bool,
         dst: &mut H,
     ) -> Result<Option<Term>, EtsError> {
-        // Port of erts/emulator/beam/erl_db_catree.c:1792-1846 (db_next_catree /
+        // Port of erts/emulator/beam/erl_db_catree.c (db_next_catree /
         // db_prev_catree), OTP-29.1.1: search the base node that routes the key, then
         // the following (or preceding) base nodes, instead of scanning every object.
         'retry: loop {
@@ -661,7 +734,7 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2085 (db_select_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_select_catree), OTP-29.1.1.
     pub(crate) fn select_range<H: HeapAlloc>(
         &self,
         state: &mut RangeSelection<'_, '_, H>,
@@ -682,7 +755,8 @@ impl CATree {
         Ok(())
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:1794 (catree_find_nextprev_root), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_select_catree) and
+    /// erl_db_tree.c (db_select_tree_common): visit a locked base in key order.
     pub(crate) fn walk<H: HeapAlloc>(
         &self,
         reverse: bool,
@@ -697,19 +771,15 @@ impl CATree {
         let mut out = Vec::new();
         for route in iter {
             let root = route.base.read();
-            let mut objects = Vec::new();
-            Node::walk(&root, &mut objects);
-            if reverse {
-                objects.reverse();
-            }
-            for object in objects {
+            Node::scan_where(&root, reverse, &|_| true, self.keypos, &mut |object| {
                 out.push(object.copy_out(dst)?);
-            }
+                Ok(false)
+            })?;
         }
         Ok(out)
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:820 (wunlock_adapt_base_node), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (wunlock_adapt_base_node), OTP-29.1.1.
     fn adapt(&self, base: &Arc<BaseNode>, _stat: i64) {
         if self.force_split.load(AtomicOrdering::Relaxed) {
             base.lock_statistics
@@ -740,7 +810,7 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:1363 (split_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (split_catree), OTP-29.1.1.
     fn split(&self, base: &Arc<BaseNode>) {
         let routes = self.routes.load_full();
         let Some(index) = routes
@@ -786,7 +856,7 @@ impl CATree {
         self.split_count.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:1214 (join_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (join_catree), OTP-29.1.1.
     fn join(&self, base: &Arc<BaseNode>, cause: JoinCause) {
         let routes = self.routes.load_full();
         let Some(index) = routes
@@ -847,7 +917,7 @@ impl CATree {
         self.routes.load().len()
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2444, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c, OTP-29.1.1.
     pub(crate) fn force_split(&self, on: bool) {
         self.force_split.store(on, AtomicOrdering::Relaxed);
         for route in self.routes.load().iter() {
@@ -858,7 +928,7 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:2463, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c, OTP-29.1.1.
     pub(crate) fn debug_random_split_join(&self, on: bool) {
         self.debug_random_split_join
             .store(on, AtomicOrdering::Relaxed);
@@ -878,7 +948,7 @@ impl CATree {
         )
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c:769 (do_random_join_with_low_probability), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (do_random_join_with_low_probability), OTP-29.1.1.
     fn random_join(&self) {
         if !self.debug_random_split_join.load(AtomicOrdering::Relaxed) {
             return;
@@ -955,7 +1025,7 @@ fn scheduler_local_random() -> u32 {
     })
 }
 
-/// Port of erts/emulator/beam/erl_db_catree.c:1269 (join_trees), OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_db_catree.c (join_trees), OTP-29.1.1.
 fn key_object(key: Term) -> Result<StoredTerm, EtsError> {
     let mut heap = VecHeap::new();
     let tuple = TermBuilder::new(&mut heap)
