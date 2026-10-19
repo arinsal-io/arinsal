@@ -169,35 +169,39 @@ pub(crate) fn driver() -> Arc<arinsal_drv::Driver> {
 /// The callbacks of `tcp_inet_driver_entry`.
 struct TcpInet;
 
-fn sock_of(port: &DriverPort) -> Option<Arc<Sock>> {
-    port.native_data::<Sock>()
+/// The socket of a port together with its port handle, which stays alive for the whole
+/// callback: the callback may close the port (`driver_exit`) and still emits after that.
+fn sock_of(port: &DriverPort) -> Option<(Arc<Sock>, Arc<PortHandle>)> {
+    let sock = port.native_data::<Sock>()?;
+    let handle = sock.handle.upgrade()?;
+    Some((sock, handle))
 }
 
 impl NativeDriver for TcpInet {
     // Port of inet_drv.c (tcp_inet_stop).
     fn stop(&self, port: &DriverPort) {
-        if let Some(sock) = sock_of(port) {
+        if let Some((sock, _handle)) = sock_of(port) {
             tcp_inet_stop(&sock);
         }
     }
 
     // Port of inet_drv.c (tcp_inet_commandv).
     fn output(&self, port: &DriverPort, data: &[u8]) {
-        if let Some(sock) = sock_of(port) {
+        if let Some((sock, _handle)) = sock_of(port) {
             command(&sock, Pid::from_data(port.caller()), data.to_vec());
         }
     }
 
     // Port of inet_drv.c (tcp_inet_ctl).
     fn control(&self, port: &DriverPort, op: u32, data: &[u8]) -> Option<ControlReply> {
-        let sock = sock_of(port)?;
+        let (sock, _handle) = sock_of(port)?;
         let reply = control(&sock, Pid::from_data(port.caller()), op, data);
         Some(ControlReply::List(reply))
     }
 
     // Port of inet_drv.c (tcp_inet_input).
     fn ready_input(&self, port: &DriverPort, _fd: i32) {
-        if let Some(sock) = sock_of(port) {
+        if let Some((sock, _handle)) = sock_of(port) {
             try_io(&sock, false);
             settle(&sock);
         }
@@ -205,7 +209,7 @@ impl NativeDriver for TcpInet {
 
     // Port of inet_drv.c (tcp_inet_output).
     fn ready_output(&self, port: &DriverPort, _fd: i32) {
-        if let Some(sock) = sock_of(port) {
+        if let Some((sock, _handle)) = sock_of(port) {
             try_io(&sock, true);
             settle(&sock);
         }
@@ -213,7 +217,7 @@ impl NativeDriver for TcpInet {
 
     // Port of inet_drv.c (tcp_inet_timeout).
     fn timeout(&self, port: &DriverPort) {
-        if let Some(sock) = sock_of(port) {
+        if let Some((sock, _handle)) = sock_of(port) {
             sock.inner.lock().unwrap().timer_at = None;
             expire(&sock);
             settle(&sock);
@@ -331,6 +335,10 @@ fn tcp_inet_stop(sock: &Arc<Sock>) {
         }
         inner.fd.take();
         inner.phase = Phase::Closed;
+        // Port of inet_drv.c (tcp_inet_stop, tcp_clear_output): a sender blocked on the
+        // queue is released by the port's exit, not by a reply.
+        inner.ready.clear();
+        inner.send_waits.clear();
         std::mem::take(&mut inner.pending)
     };
     send_empty_out_q_msgs(sock);
@@ -417,7 +425,7 @@ fn finish_command(sock: &Arc<Sock>, outcome: SendOutcome, reply: Option<(Pid, [u
 /// Port of dist.c:3794 (`dist_port_command`) calling `tcp_inet_command` with
 /// `prt->caller = NIL`, so `init_caller` skips the ref header, OTP-29.1.1.
 pub(crate) fn dist_output(sock: &Arc<Sock>, data: &[u8]) -> Result<bool, VmError> {
-    let Some(port) = sock.port() else {
+    let (Some(port), Some(_handle)) = (sock.port(), sock.handle.upgrade()) else {
         return Err(badarg());
     };
     port.serialized(|| {
@@ -4173,9 +4181,14 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     // runs before iready for one fd.
     if writable_ready {
         tcp_inet_output(sock);
+        // The blocked sender's reply goes out when the queue drains (tcp_inet_output), ahead
+        // of whatever the input side finds.
+        emit_ready(sock);
     }
     satisfy(sock);
     let eof = pull(sock);
+    // `pull` flushes the output queue too: a sender released by that goes before the close.
+    emit_ready(sock);
     if sock.inner.lock().unwrap().sendfile.is_none() {
         send_empty_out_q_msgs(sock);
     }

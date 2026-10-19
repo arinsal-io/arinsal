@@ -115,28 +115,32 @@ pub(crate) fn driver() -> Arc<arinsal_drv::Driver> {
 /// The callbacks of `udp_inet_driver_entry`.
 struct UdpInet;
 
-fn sock_of(port: &DriverPort) -> Option<Arc<Sock>> {
-    port.native_data::<Sock>()
+/// The socket of a port together with its port handle, which stays alive for the whole
+/// callback: the callback may close the port and still emits after that.
+fn sock_of(port: &DriverPort) -> Option<(Arc<Sock>, Arc<PortHandle>)> {
+    let sock = port.native_data::<Sock>()?;
+    let handle = sock.handle.upgrade()?;
+    Some((sock, handle))
 }
 
 impl NativeDriver for UdpInet {
     // Port of inet_drv.c (packet_inet_stop).
     fn stop(&self, port: &DriverPort) {
-        if let Some(sock) = sock_of(port) {
+        if let Some((sock, _handle)) = sock_of(port) {
             udp_inet_stop(&sock);
         }
     }
 
     // Port of inet_drv.c (packet_inet_command).
     fn output(&self, port: &DriverPort, data: &[u8]) {
-        if let Some(sock) = sock_of(port) {
+        if let Some((sock, _handle)) = sock_of(port) {
             command(&sock, Pid::from_data(port.caller()), data);
         }
     }
 
     // Port of inet_drv.c (packet_inet_ctl).
     fn control(&self, port: &DriverPort, op: u32, data: &[u8]) -> Option<ControlReply> {
-        let sock = sock_of(port)?;
+        let (sock, _handle) = sock_of(port)?;
         // Port of inet_drv.c:14574 (packet_inet_ctl subtracts the magic), OTP-29.1.1.
         let cmd = i64::from(op).wrapping_sub(inet_drv::MAGIC);
         let reply = dispatch(&sock, Pid::from_data(port.caller()), cmd, data);
@@ -146,7 +150,7 @@ impl NativeDriver for UdpInet {
 
     // Port of inet_drv.c (packet_inet_input).
     fn ready_input(&self, port: &DriverPort, _fd: i32) {
-        if let Some(sock) = sock_of(port) {
+        if let Some((sock, _handle)) = sock_of(port) {
             pump(&sock);
             settle(&sock);
         }
@@ -154,7 +158,7 @@ impl NativeDriver for UdpInet {
 
     // Port of inet_drv.c (packet_inet_timeout).
     fn timeout(&self, port: &DriverPort) {
-        if let Some(sock) = sock_of(port) {
+        if let Some((sock, _handle)) = sock_of(port) {
             sock.inner.lock().unwrap().timer_at = None;
             expire(&sock);
             settle(&sock);
