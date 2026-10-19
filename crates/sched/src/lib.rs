@@ -5559,6 +5559,26 @@ impl<T: Task> Scheduler<T> {
         self.inner.publish_held_monitor_for(to, None);
         self.inner.deliver(from, to, Payload::Message(msg), None)
     }
+    /// Queue an ordered block of messages from one logical sender and notify the receiver
+    /// after the block is published.
+    ///
+    /// Port of erts/emulator/beam/erl_port_task.c (`erts_port_task_execute` runs port
+    /// tasks to a scheduling boundary) and erl_proc_sig_queue.h
+    /// (`erts_proc_notify_new_message`), OTP-29.1.1.
+    pub fn send_block(&self, from: Pid, to: Pid, messages: Vec<T::Message>) -> Result<(), Error> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        self.inner.publish_held_monitor_for(to, None);
+        let mut events = messages
+            .into_iter()
+            .map(|message| Event {
+                from,
+                payload: Payload::Message(message),
+            })
+            .collect();
+        self.inner.deliver_block(to, &mut events, None, true, false)
+    }
     /// [`Self::send`] for a sender running on one of this scheduler's normal threads: a woken
     /// receiver that belongs to that thread's run queue joins it directly. Any other thread
     /// takes the plain send.

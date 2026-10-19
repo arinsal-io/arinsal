@@ -3824,13 +3824,50 @@ fn http_uri_list_len(uri: &HttpUri) -> usize {
 }
 
 fn emit(sock: &Sock, out: Out) {
+    let Some((to, message)) = output_message(sock, out) else {
+        return;
+    };
+    let _ = sock.handle().scheduler().send(to, to, message);
+}
+
+/// Deliver the messages of one port task. Each receiver's ordered output is published as a
+/// block with one wake decision, so a receiver is scheduled once per task, not per message.
+///
+/// Port of erts/emulator/beam/erl_port_task.c (erts_port_task_execute runs the task to a
+/// scheduling boundary) and erl_proc_sig_queue.h (erts_proc_notify_new_message), OTP-29.1.1.
+fn emit_block(sock: &Sock, outs: Vec<Out>) {
+    let mut pending: Vec<(Pid, Vec<Message>)> = Vec::new();
+    for out in outs {
+        let Some((to, message)) = output_message(sock, out) else {
+            continue;
+        };
+        if let Some((_, messages)) = pending.iter_mut().find(|(current, _)| *current == to) {
+            messages.push(message);
+        } else {
+            pending.push((to, vec![message]));
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let sched = sock.handle().scheduler();
+    for (to, mut messages) in pending {
+        if messages.len() == 1 {
+            let _ = sched.send(to, to, messages.remove(0));
+        } else {
+            let _ = sched.send_block(to, to, messages);
+        }
+    }
+}
+
+fn output_message(sock: &Sock, out: Out) -> Option<(Pid, Message)> {
     // Distribution ports feed the emulator decoder, not the port owner.
     // Port of inet_drv.c + dist.c:2017 (erts_net_message), OTP-29.1.1.
     if let Out::PortData { bytes, .. } = &out
         && crate::node_tables::is_dist_port(sock.id)
     {
         let _ = crate::dist::ingest_port_data(&sock.runtime(), sock.id, bytes);
-        return;
+        return None;
     }
     if let Out::TcpClosed { .. } = &out
         && crate::node_tables::is_dist_port(sock.id)
@@ -3838,12 +3875,8 @@ fn emit(sock: &Sock, out: Out) {
         let _ = crate::dist::port_connection_closed(&sock.runtime(), sock.id);
         // Still deliver tcp_closed to the connection ticker so it shuts down.
     }
-    let sched = sock.handle().scheduler();
     let out = match out {
-        Out::TcpMessage { to, message } => {
-            let _ = sched.send(to, to, message);
-            return;
-        }
+        Out::TcpMessage { to, message } => return Some((to, message)),
         out => out,
     };
     let port = Term::port(sock.id).unwrap();
@@ -3971,11 +4004,7 @@ fn emit(sock: &Sock, out: Out) {
                 .map(|term| (*owner, term))
         }
     };
-    if let Some((to, term)) = term
-        && let Ok(message) = Message::copy_from(term)
-    {
-        let _ = sched.send(to, to, message);
-    }
+    term.and_then(|(to, term)| Message::copy_from(term).ok().map(|message| (to, message)))
 }
 
 fn message_async(heap: &mut ProcessHeap, port: Term, aref: u16, status: Term) -> Option<Term> {
@@ -4370,9 +4399,7 @@ fn satisfy(sock: &Arc<Sock>) {
         let abandon = take_packets(&sock.handle(), port, &mut inner, &mut outs);
         (outs, abandon)
     };
-    for out in outs {
-        emit(sock, out);
-    }
+    emit_block(sock, outs);
     if abandon {
         driver_exit(sock);
     }
