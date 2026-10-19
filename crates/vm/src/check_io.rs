@@ -634,7 +634,13 @@ fn io_control(registry: &mio::Registry, fd: RawFd, token: Token, active: Interes
         // kqueue's EV_ADD both adds and modifies a filter; mio deletes the
         // filters left out of `interest`.
         Some(interest) => {
-            let _ = registry.reregister(&mut { source }, token, interest);
+            // EPOLL_CTL_MOD needs the descriptor to be in the set already (EV_ADD does not),
+            // so a descriptor that left the set is added again.
+            if let Err(error) = registry.reregister(&mut { source }, token, interest)
+                && error.kind() == io::ErrorKind::NotFound
+            {
+                let _ = registry.register(&mut SourceFd(&fd), token, interest);
+            }
         }
         None => {
             let _ = registry.deregister(&mut { source });

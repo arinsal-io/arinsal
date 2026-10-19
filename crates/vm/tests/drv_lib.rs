@@ -32,7 +32,9 @@ fn compile_driver(dir: &Path, name: &str, defines: &[&str]) {
         .args([
             "-shared",
             "-fPIC",
+            #[cfg(target_os = "macos")]
             "-undefined",
+            #[cfg(target_os = "macos")]
             "dynamic_lookup",
             "-Wno-deprecated-declarations",
             "-I",

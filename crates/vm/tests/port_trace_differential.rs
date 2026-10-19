@@ -34,7 +34,15 @@ fn compile_driver(dir: &Path) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/otp/erts/emulator/test/port_trace_SUITE_data/echo_drv.c");
     let status = Command::new("cc")
-        .args(["-shared", "-fPIC", "-undefined", "dynamic_lookup", "-I"])
+        .args([
+            "-shared",
+            "-fPIC",
+            #[cfg(target_os = "macos")]
+            "-undefined",
+            #[cfg(target_os = "macos")]
+            "dynamic_lookup",
+            "-I",
+        ])
         .arg(otp_include())
         .arg(source)
         .arg("-o")

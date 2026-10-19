@@ -30,7 +30,15 @@ fn otp_include() -> PathBuf {
 
 fn compile_driver(dir: &Path, name: &str, defines: &[&str]) {
     let status = Command::new("cc")
-        .args(["-shared", "-fPIC", "-undefined", "dynamic_lookup", "-I"])
+        .args([
+            "-shared",
+            "-fPIC",
+            #[cfg(target_os = "macos")]
+            "-undefined",
+            #[cfg(target_os = "macos")]
+            "dynamic_lookup",
+            "-I",
+        ])
         .arg(otp_include())
         .args(defines)
         .arg(fixtures().join("smoke_drv.c"))

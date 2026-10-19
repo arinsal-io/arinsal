@@ -382,7 +382,9 @@ def main() -> int:
         PREFERRED_BASE = OTP / APP_BASES[app]
     suites = PILOT if args.suite == "all-pilot" else [args.suite.removesuffix("_SUITE")]
     partial = bool(args.case or args.group)
-    arinsal = args.arinsal or str(ROOT / ("target/fastrel/arinsal" if args.fast else "target/release/arinsal"))
+    # CARGO_TARGET_DIR lets a container keep its Linux build output outside the bind-mounted tree.
+    target_dir = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) if os.environ.get("CARGO_TARGET_DIR") else ROOT / "target"
+    arinsal = args.arinsal or str(target_dir / ("fastrel/arinsal" if args.fast else "release/arinsal"))
     if args.fast:
         result = run(["cargo", "build", "--profile", "fastrel", "-p", "arinsal-cli"], 1800, cwd=ROOT)
         if result.returncode:
