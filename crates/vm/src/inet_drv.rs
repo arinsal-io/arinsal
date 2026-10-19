@@ -2177,7 +2177,7 @@ fn sockaddr_body(storage: &libc::sockaddr_storage) -> Option<Vec<u8>> {
 
 fn recv_req(inner: &mut Inner, caller: Pid, data: &[u8]) -> Vec<u8> {
     // Port of inet_drv.c:12268 (TCP_REQ_RECV), OTP-29.1.1.
-    if inner.peer_closed {
+    if inner.peer_closed && !buffered_deliverable(inner, data) {
         return err_bytes(close_atom(inner));
     }
     if inner.phase != Phase::Connected {
@@ -2209,6 +2209,20 @@ fn recv_req(inner: &mut Inner, caller: Pid, data: &[u8]) -> Vec<u8> {
         inner.recv_timeout_if_empty = true;
     }
     ok_bytes(&aref.to_be_bytes())
+}
+
+/// After EOF a receive still succeeds from input read before it (tcp_recv drains the buffer
+/// before it reads the socket again).
+fn buffered_deliverable(inner: &Inner, data: &[u8]) -> bool {
+    if inner.rbuf.is_empty() || active_is(&inner.active) || data.len() != 8 {
+        return false;
+    }
+    let length = i32::from_be_bytes(data[4..8].try_into().unwrap());
+    if inner.htype == 0 {
+        usize::try_from(length).is_ok_and(|n| inner.rbuf.len() >= n.max(1))
+    } else {
+        tcp_packet_complete(inner)
+    }
 }
 
 fn shutdown_sock(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
@@ -4473,8 +4487,12 @@ fn on_eof(sock: &Arc<Sock>) {
             return;
         }
         inner.peer_closed = true;
-        inner.rbuf.clear();
         let active = active_is(&inner.active);
+        // erts reads EOF only once the buffered input is consumed, so a passive socket with no
+        // receive pending keeps what it holds for the receives that follow (tcp_recv).
+        if active || inner.recv.is_some() {
+            inner.rbuf.clear();
+        }
         let owner = sock.handle().owner_pid();
         let reason = close_atom(&inner);
         // Port of erts/emulator/drivers/common/inet_drv.c:12805-12810 (tcp_recv_closed
