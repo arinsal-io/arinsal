@@ -19,6 +19,7 @@ mod difftest;
 mod dirty;
 mod dist;
 mod erl_bits;
+mod erl_poll;
 mod exceptions;
 mod floats;
 mod interp;
