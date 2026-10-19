@@ -60,6 +60,8 @@ pub(crate) struct CodeIndexes {
     /// `r[ERTS_NUM_CODE_IX]` in beam_ranges.c: sorted module ranges. Readers load the
     /// active slot and binary-search it; publishing a new `Arc` takes no reader lock.
     ranges: [ArcSwap<Vec<crate::native_bridge::ModuleRange>>; ERTS_NUM_CODE_IX],
+    /// Process-wide unique stamp of the latest catch-table store, see [`CATCH_CACHE`].
+    catch_stamp: AtomicU64,
     /// Serializes clone-and-publish of a catch table. The hot path does not take it.
     catch_publish: Mutex<()>,
     permission: Mutex<Permission>,
@@ -70,6 +72,21 @@ pub(crate) struct CodeIndexes {
     /// `erts_coverage_mode`: applies to modules loaded after it is set.
     coverage_mode: Mutex<arinsal_loader::CoverageMode>,
     pub(crate) purge_state: Arc<crate::natives::code::PurgeState>,
+}
+
+/// A stamp never handed out before, so a stamp names one store of one `CodeIndexes`.
+fn next_catch_stamp() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+type CatchTable = Arc<Vec<Option<crate::native_bridge::CatchTarget>>>;
+
+/// A catch table a process saw, valid while the publish stamp and code index match.
+pub(crate) struct CatchCache {
+    stamp: u64,
+    index: usize,
+    table: CatchTable,
 }
 
 impl CodeIndexes {
@@ -87,6 +104,7 @@ impl CodeIndexes {
             ranges: std::array::from_fn(|_| {
                 ArcSwap::new(crate::native_bridge::scope0_code_ranges())
             }),
+            catch_stamp: AtomicU64::new(next_catch_stamp()),
             catch_publish: Mutex::default(),
             permission: Mutex::default(),
             released: Condvar::new(),
@@ -140,6 +158,30 @@ impl CodeIndexes {
         read(table.as_slice())
     }
 
+    /// The active catch table through a cache the caller keeps.
+    // Port of erts/emulator/beam/beam_catches.c:146-154 (`beam_catches_car` reads
+    // `bccix[erts_active_code_ix()]` with plain loads), OTP-29.1.1. `ArcSwap::load` pays a
+    // full fence per call, which a raise cannot afford; a process revalidates the table it
+    // last saw with one acquire load of the publish stamp.
+    pub(crate) fn active_catches_cached<'a>(
+        &self,
+        cache: &'a mut Option<CatchCache>,
+    ) -> &'a [Option<crate::native_bridge::CatchTarget>] {
+        let index = self.active();
+        let stamp = self.catch_stamp.load(Ordering::Acquire);
+        if !matches!(cache, Some(hit) if hit.stamp == stamp && hit.index == index) {
+            *cache = Some(CatchCache {
+                stamp,
+                index,
+                table: self.catches[index].load_full(),
+            });
+        }
+        match cache {
+            Some(hit) => hit.table.as_slice(),
+            None => &[],
+        }
+    }
+
     /// Module ranges of `erts_active_code_ix()`.
     // Port of erts/emulator/beam/beam_ranges.c:307-327 (`find_range` reads `r[erts_active_code_ix()]`
     // with no lock), OTP-29.1.1.
@@ -172,6 +214,8 @@ impl CodeIndexes {
     fn stage_catches(&self) {
         let copy = Arc::new(self.catches[self.active()].load_full().as_ref().clone());
         self.catches[self.staging()].store(copy);
+        self.catch_stamp
+            .store(next_catch_stamp(), Ordering::Release);
     }
 
     /// Replaces one code index's catch table. Callers hold [`CodeIndexes::catch_publish`].
@@ -181,6 +225,8 @@ impl CodeIndexes {
         table: Vec<Option<crate::native_bridge::CatchTarget>>,
     ) {
         self.catches[index].store(Arc::new(table));
+        self.catch_stamp
+            .store(next_catch_stamp(), Ordering::Release);
     }
 
     /// The catch table currently published at `index` (active or staging).

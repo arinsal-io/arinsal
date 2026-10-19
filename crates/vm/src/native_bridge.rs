@@ -485,17 +485,25 @@ pub(crate) struct LocatedCatch {
     target: CatchTarget,
     /// An exception-trace frame sits above the catch. The scheduler unwind emits
     /// `exception_from` for those frames; the native resolver leaves them to it.
-    traced: bool,
+    /// Word-sized on purpose: a trailing `bool` made the compiler move this struct with
+    /// overlapping sub-word copies, which stall on store-to-load forwarding at ~25 ns a raise.
+    traced: usize,
 }
 
 /// Port of erts/emulator/beam/beam_common.c:580-648 (`next_catch` up to `found_catch`),
 /// OTP-29.1.1. The scan only reads the stack and the active catch table. It does not move
 /// `stop`, so a miss leaves the scheduler's unwind the same stack erts would walk.
-fn locate_catch(process: &Process, native_only: bool) -> Option<LocatedCatch> {
+fn locate_catch(process: &mut Process, native_only: bool) -> Option<LocatedCatch> {
     if process.header.catches == 0 {
         return None;
     }
     let heap = &process.heap;
+    if let (Some(runtime), Some(cold)) = (process.runtime.as_ref(), process.cold.as_mut()) {
+        let table = runtime
+            .code_indexes()
+            .active_catches_cached(&mut cold.catch_cache);
+        return scan_catch(heap, table, native_only);
+    }
     if let Some(runtime) = process.runtime.as_ref() {
         return runtime.with_active_catches(|table| scan_catch(heap, table, native_only));
     }
@@ -511,12 +519,12 @@ fn scan_catch(
     let mut stack = heap.stack_terms().enumerate();
     let mut previous_cp = 0usize;
     let mut seen_cp = false;
-    let mut traced = false;
+    let mut traced = 0usize;
     while let Some((index, word)) = stack.next() {
         let raw = word.tagged_word();
         let address = raw as usize;
         if address == native_trace_return_address() {
-            traced = true;
+            traced = 1;
             let actions = heap
                 .stack_get(index + 3)
                 .and_then(Term::as_small)
@@ -580,9 +588,9 @@ fn scan_catch(
 
 /// Find the nearest catch without moving the stack cursor; only native handlers resume here.
 // Port of erts/emulator/beam/beam_common.c (`next_catch`), OTP-29.1.1.
-pub(crate) fn next_native_catch(process: &Process) -> Option<LocatedCatch> {
+pub(crate) fn next_native_catch(process: &mut Process) -> Option<LocatedCatch> {
     let found = locate_catch(process, false)?;
-    (!found.traced && matches!(found.target, CatchTarget::Native(_))).then_some(found)
+    (found.traced == 0 && matches!(found.target, CatchTarget::Native(_))).then_some(found)
 }
 
 fn exception_class_atom(class: arinsal_bifs::Class) -> Term {
@@ -607,7 +615,7 @@ pub(crate) fn next_catch(
     // An exception-trace frame above the catch is emitted by the scheduler unwind
     // (`exception_from`). erts does that inside `next_catch` before `found_catch`.
     // The native resolver has no trace session, so it leaves the stack unmoved.
-    if native_only && found.traced {
+    if native_only && found.traced != 0 {
         return None;
     }
     Some(commit_catch(process, found, class, reason, trace))

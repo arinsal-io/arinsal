@@ -1224,6 +1224,10 @@ impl Runtime {
     /// Catch table of this node's `erts_active_code_ix()`.
     // Port of erts/emulator/beam/code_ix.h:362 (`erts_active_code_ix` is one atomic, not
     // thread-local) and beam_catches.c:146 (`bccix[erts_active_code_ix()]`), OTP-29.1.1.
+    pub(crate) fn code_indexes(&self) -> &Arc<crate::code_ix::CodeIndexes> {
+        &self.code
+    }
+
     pub(crate) fn with_active_catches<R>(
         &self,
         read: impl FnOnce(&[Option<crate::native_bridge::CatchTarget>]) -> R,
