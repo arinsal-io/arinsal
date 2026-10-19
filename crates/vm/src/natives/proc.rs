@@ -4127,7 +4127,7 @@ fn trace(
             if !process
                 .runtime
                 .as_ref()
-                .is_some_and(|runtime| runtime.ports.lock().unwrap().contains_key(&id))
+                .is_some_and(|runtime| runtime.ports.read().unwrap().contains_key(&id))
             {
                 return Err(badarg());
             }
@@ -4173,7 +4173,7 @@ fn trace(
         let known = process
             .runtime
             .as_ref()
-            .is_some_and(|runtime| id == 0 || runtime.ports.lock().unwrap().contains_key(&id));
+            .is_some_and(|runtime| id == 0 || runtime.ports.read().unwrap().contains_key(&id));
         if !known {
             return Err(badarg());
         }
@@ -4339,7 +4339,7 @@ fn trace_session_create(
         if !process
             .runtime
             .as_ref()
-            .is_some_and(|runtime| runtime.ports.lock().unwrap().contains_key(&id))
+            .is_some_and(|runtime| runtime.ports.read().unwrap().contains_key(&id))
         {
             return Err(badarg());
         }

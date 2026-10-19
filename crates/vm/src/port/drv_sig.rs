@@ -424,7 +424,7 @@ fn call_driver_control(
     if !crate::trace::tracing_enabled() {
         return Some(reply);
     }
-    let handle = runtime.ports.lock().unwrap().get(&id).cloned();
+    let handle = runtime.ports.read().unwrap().get(&id).cloned();
     if let Some(handle) = handle
         && let Some(port) = Term::port(id)
     {
@@ -696,7 +696,7 @@ pub(crate) fn link(
         move |op| {
             let handle = &task_handle;
             let live =
-                op == SigOp::Exec && task_runtime.ports.lock().unwrap().contains_key(&handle.id);
+                op == SigOp::Exec && task_runtime.ports.read().unwrap().contains_key(&handle.id);
             if linked {
                 // Port of erts/emulator/beam/io.c:2669 (port_sig_link), OTP-29.1.1.
                 if live {

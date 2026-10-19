@@ -286,6 +286,30 @@ pub(crate) fn test_next_port_id(
     }))
 }
 
+/// The port table (`erts_port` ptab). Lookups by port id dominate (every `port_command`,
+/// `port_control`, monitor and link), so they take a shared lock; the table changes only
+/// when a port is created or removed.
+///
+/// Port of erts/emulator/beam/erl_ptab.c (erts_ptab_lookup lock-free reads), OTP-29.1.1.
+#[derive(Default)]
+pub(crate) struct PortTable(std::sync::RwLock<HashMap<u64, Arc<PortHandle>>>);
+
+impl PortTable {
+    /// Exclusive access for inserting and removing ports.
+    pub(crate) fn lock(
+        &self,
+    ) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'_, HashMap<u64, Arc<PortHandle>>>> {
+        self.0.write()
+    }
+
+    /// Shared access for lookups.
+    pub(crate) fn read(
+        &self,
+    ) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, HashMap<u64, Arc<PortHandle>>>> {
+        self.0.read()
+    }
+}
+
 /// Port of erts/emulator/beam/erl_ptab.c:500, 675 (new/delete element), OTP-29.1.1.
 /// A reserved local port id is returned to the ptab ring if construction fails.
 struct PortIdReservation<'a> {
@@ -1439,7 +1463,7 @@ impl arinsal_drv::PortHost for DrvHost {
         if !crate::natives::erts_debug::runtime_long_schedule_monitored(&runtime) {
             return;
         }
-        let Some(handle) = runtime.ports.lock().unwrap().get(&port.id()).cloned() else {
+        let Some(handle) = runtime.ports.read().unwrap().get(&port.id()).cloned() else {
             return;
         };
         if let Some(term) = Term::port(port.id()) {
@@ -3108,7 +3132,7 @@ fn eof_exit(
     read_fd: Option<RawFd>,
 ) {
     if let Some(runtime) = runtime.upgrade() {
-        let listed = runtime.ports.lock().unwrap().contains_key(&id);
+        let listed = runtime.ports.read().unwrap().contains_key(&id);
         if listed {
             crate::trace::emit_port_event(
                 &runtime,
@@ -3214,7 +3238,7 @@ fn lookup_port(process: &Process, term: Term) -> Result<Arc<PortHandle>, VmError
     process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
         .ok_or_else(badarg)
 }
 
@@ -3236,7 +3260,7 @@ pub(crate) fn is_live(process: &Process, id: u64) -> bool {
 
 /// Whether local port `id` of `runtime` exists and has not finished exiting.
 pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> bool {
-    let handle = runtime.ports.lock().unwrap().get(&id).cloned();
+    let handle = runtime.ports.read().unwrap().get(&id).cloned();
     handle.is_some_and(|handle| !handle.state.lock().unwrap().exit_complete)
 }
 
@@ -3319,7 +3343,7 @@ fn port_control(
     let Some(handle) = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
     else {
         return Ok(atom("badarg"));
     };
@@ -3343,7 +3367,7 @@ fn port_call(
     let Some(handle) = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
     else {
         return Ok(atom("badarg"));
     };
@@ -3457,7 +3481,7 @@ fn port_command(
     let handle = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
         .ok_or_else(badarg)?;
     let mut nosuspend = false;
     let mut force = false;
@@ -3839,7 +3863,7 @@ fn port_close(
         && let Some(handle) = process
             .runtime
             .as_ref()
-            .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+            .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
         && let Some(drv) = handle.driver.get().cloned()
     {
         // The `{Caller, close}` receive trace is emitted when the exit signal executes
@@ -3892,7 +3916,7 @@ pub(crate) fn exit_port(
     let Some(runtime) = process.runtime.as_ref() else {
         return Ok(());
     };
-    let handle = runtime.ports.lock().unwrap().get(&id).cloned();
+    let handle = runtime.ports.read().unwrap().get(&id).cloned();
     if let Some(handle) = handle
         && let Some(drv) = handle.driver.get().cloned()
     {
@@ -3927,7 +3951,7 @@ pub(crate) fn exit_port(
 /// Port of erts/emulator/beam/erl_process.c:2537-2581 (`handle_reap_ports`), OTP-29.1.1.
 pub(crate) fn halt_reap_ports(runtime: &Arc<crate::process::Runtime>, progress: HaltProgress) {
     let heart = global_atoms().intern("heart_port").ok();
-    let ports: Vec<_> = runtime.ports.lock().unwrap().values().cloned().collect();
+    let ports: Vec<_> = runtime.ports.read().unwrap().values().cloned().collect();
     for handle in ports {
         if heart.is_some() && handle.registered_atom() == heart {
             continue;
@@ -4111,7 +4135,7 @@ pub(crate) fn owner_exit(
 pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Result<bool, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let Some(handle) = runtime.ports.lock().unwrap().get(&id).cloned() else {
+    let Some(handle) = runtime.ports.read().unwrap().get(&id).cloned() else {
         return Ok(!linked);
     };
     if !linked {
@@ -4130,7 +4154,7 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
     // Termination removes the port from the table and drains `links` in one critical section
     // of the table lock (`remove_and_notify`); taking the locks in the same order makes this
     // registration either visible to it or refused.
-    let ports = runtime.ports.lock().unwrap();
+    let ports = runtime.ports.read().unwrap();
     if linked && !ports.contains_key(&id) {
         return Ok(false);
     }
@@ -4177,7 +4201,7 @@ pub(crate) fn monitor(
     let handle = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned());
+        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned());
     let Some(handle) = handle else {
         // The port vanished between lookup and registration: the caller sends DOWN noproc.
         return Ok(!monitored);
@@ -4208,7 +4232,7 @@ fn register_monitor(
     let ports = process
         .runtime
         .as_ref()
-        .map(|runtime| runtime.ports.lock().unwrap());
+        .map(|runtime| runtime.ports.read().unwrap());
     if monitored && !ports.as_ref().is_some_and(|ports| ports.contains_key(&id)) {
         return Ok(false);
     }
@@ -4298,7 +4322,7 @@ pub(crate) fn demonitor_port(process: &Process, caller: Pid, port_id: u64, refer
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
-    let handle = runtime.ports.lock().unwrap().get(&port_id).cloned();
+    let handle = runtime.ports.read().unwrap().get(&port_id).cloned();
     let Some(handle) = handle else {
         // `erts_port_lookup` failed: `ERTS_PORT_OP_DROPPED`, origin already released.
         return;
@@ -4349,7 +4373,7 @@ fn output_command(
         }
         if drv_port.output(&pieces, packed_pid(from)) {
             handle.add_bytes_out(bytes_out);
-        } else if runtime.ports.lock().unwrap().contains_key(&id) {
+        } else if runtime.ports.read().unwrap().contains_key(&id) {
             signal_badsig(handle, id);
         }
         return;
@@ -4424,7 +4448,7 @@ pub(crate) fn nif_port_command(
     let Some(id) = port.as_port() else {
         return false;
     };
-    let Some(handle) = runtime.ports.lock().unwrap().get(&id).cloned() else {
+    let Some(handle) = runtime.ports.read().unwrap().get(&id).cloned() else {
         return false;
     };
     if handle.state.lock().unwrap().exit_complete {
@@ -4498,7 +4522,7 @@ fn send_message_inner(
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     // A message to a dead local port is dropped (erts_port_command DROPPED).
-    let Some(handle) = runtime.ports.lock().unwrap().get(&id).cloned() else {
+    let Some(handle) = runtime.ports.read().unwrap().get(&id).cloned() else {
         return Ok(sent());
     };
     let Some(parts) = tuple(message) else {
@@ -4657,7 +4681,7 @@ fn send_message_inner(
         }
         trace_port_receive_term(process, from, id, parts[1]);
         if connect(process, port, command[1], Some(from)).is_err()
-            && runtime.ports.lock().unwrap().contains_key(&id)
+            && runtime.ports.read().unwrap().contains_key(&id)
         {
             signal_badsig(&handle, id);
         }
@@ -4678,7 +4702,7 @@ pub(crate) fn trace_command(process: &mut Process, port: Term, event: Term) -> R
     let owner = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
         .map(|handle| handle.owner_pid())
         .ok_or_else(badarg)?;
     let encoded = {
@@ -4800,7 +4824,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     let Some(handle) = process
         .runtime
         .as_ref()
-        .and_then(|r| r.ports.lock().unwrap().get(&id).cloned())
+        .and_then(|r| r.ports.read().unwrap().get(&id).cloned())
     else {
         // The forker is port zero and has no handle here (see `ports`).
         return if id == 0 {

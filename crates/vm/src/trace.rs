@@ -960,7 +960,7 @@ fn live_port_entry(process: &Process, session: u64, port: u64) -> Option<Entry> 
         Tracer::Port(id) => process
             .runtime
             .as_ref()
-            .is_some_and(|runtime| runtime.ports.lock().unwrap().contains_key(id)),
+            .is_some_and(|runtime| runtime.ports.read().unwrap().contains_key(id)),
         Tracer::Default | Tracer::Module { .. } => true,
     };
     if alive {
@@ -1207,7 +1207,7 @@ pub(crate) fn traced_port_by_other(
         Tracer::Pid(tracer) => runtime
             .scheduler()
             .is_ok_and(|scheduler| scheduler.lookup(tracer)),
-        Tracer::Port(tracer) => runtime.ports.lock().unwrap().contains_key(&tracer),
+        Tracer::Port(tracer) => runtime.ports.read().unwrap().contains_key(&tracer),
         Tracer::Module { module, state } => {
             module_tracer_alive(vm, process, &module, &state, Term::port(port))
         }
@@ -1322,7 +1322,7 @@ pub(crate) fn traced_by_other(
         Tracer::Pid(tracer) => runtime
             .scheduler()
             .is_ok_and(|scheduler| scheduler.lookup(tracer)),
-        Tracer::Port(id) => runtime.ports.lock().unwrap().contains_key(&id),
+        Tracer::Port(id) => runtime.ports.read().unwrap().contains_key(&id),
         Tracer::Module { module, state } => {
             module_tracer_alive(vm, process, &module, &state, pid.to_term())
         }
@@ -1648,7 +1648,7 @@ fn match_trace_tracer_alive(
         Tracer::Port(port) => process
             .runtime
             .as_ref()
-            .is_some_and(|runtime| runtime.ports.lock().unwrap().contains_key(port)),
+            .is_some_and(|runtime| runtime.ports.read().unwrap().contains_key(port)),
         Tracer::Module { module, state } => {
             module_tracer_alive(vm, process, module, state, tracee.to_term())
         }
@@ -2394,7 +2394,7 @@ fn emit_meta(
             let alive = process
                 .runtime
                 .as_ref()
-                .is_some_and(|runtime| runtime.ports.lock().unwrap().contains_key(id));
+                .is_some_and(|runtime| runtime.ports.read().unwrap().contains_key(id));
             if !alive {
                 if remove_dead {
                     meta.clear();

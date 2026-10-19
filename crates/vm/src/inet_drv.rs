@@ -876,6 +876,11 @@ fn fdopen_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     set_nonblock(fd.as_raw_fd());
     set_nosigpipe(fd.as_raw_fd());
     inner.fd = Some(SockFd::new(fd, inner.port.clone()));
+    // Port of inet_drv.c:5269 (inet_fdopen, `prebound`): the port selects on the descriptor
+    // number it was given, so a later port on it steals the selection from the earlier one.
+    if let Some(fd) = inner.fd.as_mut() {
+        fd.select_fd = raw_fd;
+    }
     inner.fd_external = Some(raw_fd);
     inner.domain = domain;
     inner.family_code = data[0];
@@ -3027,6 +3032,8 @@ impl Sock {
 /// closes the descriptor.
 struct SockFd {
     fd: OwnedFd,
+    /// The descriptor number given to `driver_select` (the caller's one for `{fd, Fd}`).
+    select_fd: RawFd,
     port: Weak<DriverPort>,
     /// Events selected through `driver_select` (`FD_READ`, `FD_WRITE`).
     readable: bool,
@@ -3036,6 +3043,7 @@ struct SockFd {
 impl SockFd {
     fn new(fd: OwnedFd, port: Weak<DriverPort>) -> Self {
         Self {
+            select_fd: fd.as_raw_fd(),
             fd,
             port,
             readable: false,
@@ -3055,7 +3063,7 @@ impl Drop for SockFd {
         if let Some(port) = self.port.upgrade() {
             use arinsal_drv::{SELECT_READ, SELECT_USE, SELECT_WRITE};
             port.select(
-                self.fd.as_raw_fd(),
+                self.select_fd,
                 SELECT_READ | SELECT_WRITE | SELECT_USE,
                 false,
             );
@@ -5043,7 +5051,7 @@ fn sock_select(sock: &Arc<Sock>) {
     let Some(fd) = inner.fd.as_mut() else {
         return;
     };
-    let raw = fd.as_raw_fd();
+    let raw = fd.select_fd;
     // Port of inet_drv.c (inet_driver_select): `ERL_DRV_USE` only when turning events on.
     if readable != fd.readable {
         let mode = if readable {

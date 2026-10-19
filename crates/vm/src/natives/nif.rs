@@ -1654,7 +1654,7 @@ fn state_alive(process: &Process, state: Term) -> Option<bool> {
     }
     if let Some(id) = state.as_port() {
         let runtime = process.runtime.as_ref()?;
-        return Some(runtime.ports.lock().unwrap().contains_key(&id));
+        return Some(runtime.ports.read().unwrap().contains_key(&id));
     }
     None
 }

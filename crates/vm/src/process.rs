@@ -1080,7 +1080,7 @@ pub(crate) struct Runtime {
     pub(crate) reg: crate::register::RegisterTable,
     aliases: AliasTable,
     pub(crate) next_trace_weak_id: AtomicU64,
-    pub(crate) ports: Mutex<HashMap<u64, Arc<crate::port::PortHandle>>>,
+    pub(crate) ports: crate::port::PortTable,
     /// Persistent `erl_child_setup` process; all OS port children are forked there.
     pub(crate) child_setup: Arc<crate::child_setup::ChildSetup>,
     pub(crate) system_monitor: Mutex<Option<crate::natives::erts_debug::SystemMonitorState>>,
@@ -8255,7 +8255,7 @@ impl Vm {
             reg: crate::register::RegisterTable::new(),
             aliases: AliasTable::new(),
             next_trace_weak_id: AtomicU64::new(0),
-            ports: Mutex::new(HashMap::new()),
+            ports: crate::port::PortTable::default(),
             child_setup,
             system_monitor: Mutex::new(None),
             session_monitors: Mutex::new(Vec::new()),
