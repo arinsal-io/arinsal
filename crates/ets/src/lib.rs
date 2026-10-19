@@ -1,5 +1,6 @@
 //! VM-independent ETS storage. The VM owns access checks and process lifecycle.
 
+mod block_cache;
 mod catree;
 mod hash;
 mod hash_select;
@@ -912,6 +913,9 @@ struct ObjectHeap {
 impl Drop for ObjectHeap {
     fn drop(&mut self) {
         self.off_heap = None;
+        for block in self.words.drain(..) {
+            block_cache::give(block);
+        }
     }
 }
 
@@ -976,7 +980,7 @@ impl ObjectHeap {
 
 impl HeapAlloc for ObjectHeap {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        let mut allocation = vec![0_u64; words].into_boxed_slice();
+        let mut allocation = block_cache::take(words);
         let ptr = allocation.as_mut_ptr();
         self.words.push(allocation);
         Some(ptr)
@@ -1071,6 +1075,28 @@ impl StoredTerm {
         prefix_words: usize,
     ) -> Result<Self, EtsError> {
         let object = term;
+        // Port of erts/emulator/beam/erl_db_util.c (db_store_term, a tuple of immediates): the
+        // block is exactly the tuple, so it is neither sized nor scanned.
+        if !compressed {
+            let mut heap = ObjectHeap::new();
+            if let Some(copied) = arinsal_term::copy_flat_tuple(term, &mut heap) {
+                let copied = copied?;
+                let size = heap.words[0].len();
+                return Ok(Self {
+                    heap,
+                    term: copied,
+                    compressed_elements: Vec::new(),
+                    compressed_magic_refs: Vec::new(),
+                    compressed_bytes: 0,
+                    db_size_words: prefix_words + 2 + size,
+                    term_size_words: size,
+                    shallow: true,
+                    order: 0,
+                    group_order: 0,
+                    hvalue: 0,
+                });
+            }
+        }
         // The object is sized once; the same size serves the accounting and the copy.
         let plain_size = (!compressed).then(|| arinsal_term::size_object(term));
         let db_size_words = match plain_size {

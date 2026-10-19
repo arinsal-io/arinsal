@@ -487,7 +487,7 @@ fn default_object(
 }
 
 /// The elements of a tuple argument.
-pub(crate) fn tuple_items(term: Term) -> Option<Vec<Term>> {
+pub(crate) fn tuple_items(term: Term) -> Option<smallvec::SmallVec<[Term; 8]>> {
     // SAFETY: BIF arguments are rooted in the caller's process heap.
     let tuple = unsafe { term.tuple_ref() }?;
     Some(tuple.iter().collect())

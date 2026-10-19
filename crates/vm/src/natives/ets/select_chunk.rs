@@ -112,7 +112,7 @@ pub(super) fn continuation_items(term: Term) -> Result<Vec<Term>, VmError> {
     if items.is_empty() {
         return Err(badarg());
     }
-    Ok(items)
+    Ok(items.into_vec())
 }
 
 /// The result of a hash traversal whose buckets are exhausted or whose chunk filled.
