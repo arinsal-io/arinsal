@@ -1425,10 +1425,10 @@ pub(super) enum TopFrame {
     },
     CurrentArgs(Term),
     CurrentArgsWithInfo(Option<Term>, Box<OwnedTerm>),
-    /// `erlang:error/2,3` read straight from the argument registers: the argument list (if
-    /// it is a proper list) and the validated `error_info` map stay heap terms, as in erts'
-    /// `c_p->ftrace`. Only the native exception resolver builds it; nothing collects before
-    /// `save_stacktrace` copies the two words.
+    /// `erlang:error/2,3` read straight from the argument registers: the supplied argument
+    /// term and validated `error_info` map stay heap terms, as in erts' `c_p->ftrace`. Only
+    /// the native exception resolver builds it; nothing collects before `save_stacktrace`
+    /// copies the two words.
     CurrentArgsInfoTerm(Option<Term>, Term),
 }
 
