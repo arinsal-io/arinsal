@@ -2363,14 +2363,16 @@ fn internal_state_set(
             arinsal_alloc::typed::drain_shared_deallocations();
         }
         let runtime = process.runtime.as_ref().ok_or_else(badarg)?.clone();
+        // Port of erts/emulator/beam/erl_process.c (erts_debug_wait_completed), OTP-29.1.1:
+        // erts yields and returns `ok` once, without re-running the BIF. A latch left by a
+        // finished wait therefore belongs to that earlier call, not to this one; reusing it
+        // made every second `wait` return at once (the BEAM JIT resumes after the call).
         if let Some(completion) = process.cold_mut().debug_wait_completion.clone() {
-            if completion.load(Ordering::Acquire) {
-                process.cold_mut().debug_wait_completion = None;
-                runtime.debug_wait_active.store(false, Ordering::Release);
+            if !completion.load(Ordering::Acquire) {
+                process.force_yield = true;
                 return Ok(atom("ok"));
             }
-            process.force_yield = true;
-            return Ok(atom("ok"));
+            process.cold_mut().debug_wait_completion = None;
         }
         // Port of erts/emulator/beam/erl_process.c:2499 (erts_debug_wait_completed): only one
         // process at a time can wait.
