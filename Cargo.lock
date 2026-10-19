@@ -267,6 +267,7 @@ dependencies = [
  "libc",
  "num-traits",
  "rustix",
+ "similar-asserts",
  "tempfile",
 ]
 
