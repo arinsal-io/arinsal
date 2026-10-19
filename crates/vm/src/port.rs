@@ -1416,6 +1416,9 @@ impl arinsal_drv::PortHost for DrvHost {
         scheduled_in: bool,
         where_: Option<&str>,
     ) {
+        if !crate::trace::tracing_enabled() {
+            return;
+        }
         let Some(runtime) = self.runtime.upgrade() else {
             return;
         };
@@ -1433,6 +1436,9 @@ impl arinsal_drv::PortHost for DrvHost {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
         };
+        if !crate::natives::erts_debug::runtime_long_schedule_monitored(&runtime) {
+            return;
+        }
         let Some(handle) = runtime.ports.lock().unwrap().get(&port.id()).cloned() else {
             return;
         };
@@ -1717,6 +1723,9 @@ impl arinsal_drv::PortHost for DrvHost {
 
     // Port of erts/emulator/beam/erl_port_task.c:107 (profile_runnable_port), OTP-29.1.1.
     fn profile_runnable_port(&self, port: &arinsal_drv::DriverPort, active: bool) {
+        if !crate::natives::misc::profile_ports_enabled() {
+            return;
+        }
         let Some(handle) = self.handle(port.id()) else {
             return;
         };
@@ -3588,6 +3597,9 @@ fn trace_command_received(
     pieces: &[arinsal_drv::IoPiece<'_>],
     outputv_segments: Option<Vec<Vec<u8>>>,
 ) {
+    if !crate::trace::tracing_enabled() {
+        return;
+    }
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
@@ -3631,6 +3643,10 @@ fn trace_command_received(
 }
 
 fn trace_command_received_data(process: &Process, caller: Pid, id: u64, data: Term, bytes: &[u8]) {
+    if !crate::trace::tracing_enabled() {
+        return;
+    }
+
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
@@ -3663,6 +3679,10 @@ fn trace_command_received_data(process: &Process, caller: Pid, id: u64, data: Te
 }
 
 fn trace_port_receive_term(process: &Process, caller: Pid, id: u64, message: Term) {
+    if !crate::trace::tracing_enabled() {
+        return;
+    }
+
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
@@ -3702,6 +3722,9 @@ fn trace_port_receive_indexed_rt(
     index: u32,
     data: &[u8],
 ) {
+    if !crate::trace::tracing_enabled() {
+        return;
+    }
     let Some(caller) = caller.to_term() else {
         return;
     };

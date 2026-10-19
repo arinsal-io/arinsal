@@ -170,7 +170,13 @@ pub(crate) fn output(
     let async_nosuspend = asynchronous && flags.nosuspend && !flags.force;
     let try_call = sched_flags & (invalid_flags | PTS_FLGS_FORCE_SCHEDULE_OP) == 0;
     let mut pieces = Vec::new();
-    if io_pieces(data, &mut pieces).is_none() {
+    // A native driver has no `outputv`: its command data is one flat buffer.
+    let flattened = if drv.driver().is_native() {
+        iodata(data).map(|bytes| pieces.push((bytes, false)))
+    } else {
+        io_pieces(data, &mut pieces)
+    };
+    if flattened.is_none() {
         // io.c:2160 bad_value: bad_port_signal.
         if flags.bang {
             signal_badsig(handle, handle.id);
@@ -415,6 +421,9 @@ fn call_driver_control(
         );
     }
     let reply = reply?;
+    if !crate::trace::tracing_enabled() {
+        return Some(reply);
+    }
     let handle = runtime.ports.lock().unwrap().get(&id).cloned();
     if let Some(handle) = handle
         && let Some(port) = Term::port(id)

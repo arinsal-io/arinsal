@@ -394,6 +394,11 @@ fn after_schedule_one(process: &mut Process, elapsed_nanoseconds: u64, state: &S
 
 /// Emit a long-schedule event for a port task that ran longer than the monitor limit.
 // Port of erts/emulator/beam/erl_trace.c:1591 (monitor_long_schedule_port), OTP-29.1.1.
+/// Whether a `long_schedule` system monitor is on.
+pub(crate) fn runtime_long_schedule_monitored(runtime: &crate::process::Runtime) -> bool {
+    runtime.system_monitor_flags.load(Ordering::Relaxed) & MONITOR_LONG_SCHEDULE != 0
+}
+
 pub(crate) fn after_port_task(
     runtime: &crate::process::Runtime,
     port: Term,
