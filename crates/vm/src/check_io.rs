@@ -130,16 +130,7 @@ struct Watch {
 }
 
 #[derive(Default)]
-struct DriverSelect {
-    owner: Option<usize>,
-    events: InterestSet,
-    active_events: InterestSet,
-    ready: Option<SelectCallback>,
-}
-
-#[derive(Default)]
 struct FdState {
-    driver: DriverSelect,
     watches: Vec<Watch>,
     poll_events: InterestSet,
     poll_registered: bool,
@@ -456,24 +447,6 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent) {
         writable: event.events & ERTS_POLL_EV_OUT != 0,
     };
     let poll_error = event.events & (ERTS_POLL_EV_ERR | ERTS_POLL_EV_NVAL) != 0;
-    let mut fired_driver = if poll_error {
-        state.driver.active_events
-    } else {
-        intersect(state.driver.active_events, seen)
-    };
-    let ready = Ready {
-        // ERTS converts an error to all active directions before it schedules
-        // the corresponding input/output port task.
-        readable: fired_driver.readable,
-        writable: fired_driver.writable,
-        closed: event.closed,
-        error: event.error || poll_error,
-    };
-    state.driver.active_events = minus(state.driver.active_events, fired_driver);
-    let mut driver_callback = (fired_driver.readable || fired_driver.writable)
-        .then(|| state.driver.ready.clone())
-        .flatten();
-
     let mut callbacks = Vec::new();
     state.watches.retain_mut(|watch| {
         let fired = poll_error
@@ -497,21 +470,12 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent) {
         }
     });
 
-    let mut callback_ready = ready;
     if sync_pollset(fd, &mut state).is_err() {
         // A failed re-arm is reported as NVAL by erts_check_io. Trigger every
-        // remaining active selection after removing the descriptor from mio.
-        let remaining = state.driver.active_events;
-        fired_driver = union(fired_driver, remaining);
-        state.driver.active_events = InterestSet::default();
+        // remaining watch after removing the descriptor from the poll set.
         state.poll_events = InterestSet::default();
         state.poll_registered = false;
         let _ = erts_poll_control(fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE);
-        if (fired_driver.readable || fired_driver.writable)
-            && let Some(callback) = state.driver.ready.clone()
-        {
-            driver_callback = Some(callback);
-        }
         callbacks.extend(state.watches.drain(..).filter_map(|mut watch| {
             watch.callback.take().map(|callback| {
                 (
@@ -525,26 +489,16 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent) {
                 )
             })
         }));
-        callback_ready = Ready {
-            readable: fired_driver.readable,
-            writable: fired_driver.writable,
-            closed: false,
-            error: true,
-        };
     }
     drop(state);
-    if let Some(callback) = driver_callback {
-        callback(fd, callback_ready);
-    }
     for (callback, watch_ready) in callbacks {
         callback(fd, watch_ready);
     }
 }
 
 fn sync_pollset(fd: RawFd, state: &mut FdState) -> io::Result<()> {
-    let next = union(state.driver.active_events, watch_interests(&state.watches));
-    let selected =
-        state.driver.events.readable || state.driver.events.writable || !state.watches.is_empty();
+    let next = watch_interests(&state.watches);
+    let selected = !state.watches.is_empty();
     if next == state.poll_events {
         if !next.readable && !next.writable && state.poll_registered && !selected {
             poll_control(fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE)?;
@@ -600,104 +554,6 @@ fn union(left: InterestSet, right: InterestSet) -> InterestSet {
     }
 }
 
-fn intersect(left: InterestSet, right: InterestSet) -> InterestSet {
-    InterestSet {
-        readable: left.readable && right.readable,
-        writable: left.writable && right.writable,
-    }
-}
-
-fn minus(left: InterestSet, right: InterestSet) -> InterestSet {
-    InterestSet {
-        readable: left.readable && !right.readable,
-        writable: left.writable && !right.writable,
-    }
-}
-
-/// Readiness callback for a persistent driver selection.
-pub(crate) type SelectCallback = Arc<dyn Fn(RawFd, Ready) + Send + Sync>;
-
-/// Select or deselect `fd` for the driver identified by `owner`.
-// Port of erts/emulator/sys/common/erl_check_io.c (driver_select), OTP-29.1.1.
-pub(crate) fn driver_select(
-    fd: RawFd,
-    owner: usize,
-    events: InterestSet,
-    ready: SelectCallback,
-) -> io::Result<()> {
-    let poller = poller();
-    let (index, slots) = poller.states.lock_slots(fd)?;
-    let mut state = slots[index].lock().unwrap();
-    if state.driver.owner.is_some_and(|current| current != owner) {
-        state.driver = DriverSelect::default();
-        sync_pollset(fd, &mut state)?;
-    }
-    if !events.readable && !events.writable && state.driver.owner.is_none() {
-        return Ok(());
-    }
-    let old_events = state.driver.events;
-    let added = minus(events, old_events);
-    let removed = minus(old_events, events);
-    state.driver.owner = (events.readable || events.writable).then_some(owner);
-    state.driver.ready = (events.readable || events.writable).then_some(ready);
-    state.driver.events = events;
-    state.driver.active_events = minus(union(state.driver.active_events, added), removed);
-    sync_pollset(fd, &mut state)
-}
-
-/// Re-arm the events whose port task has run.
-// Port of erts/emulator/sys/common/erl_check_io.c (erts_io_notify_port_task_executed), OTP-29.1.1.
-pub(crate) fn notify_executed(fd: RawFd, owner: usize, executed: InterestSet) {
-    let poller = poller();
-    let Ok((index, slots)) = poller.states.lock_slots(fd) else {
-        return;
-    };
-    let mut state = slots[index].lock().unwrap();
-    if state.driver.owner != Some(owner) {
-        return;
-    }
-    let rearm = minus(
-        intersect(executed, state.driver.events),
-        state.driver.active_events,
-    );
-    if !rearm.readable && !rearm.writable {
-        return;
-    }
-    state.driver.active_events = union(state.driver.active_events, rearm);
-    if sync_pollset(fd, &mut state).is_err() {
-        state.driver.active_events = InterestSet::default();
-        state.poll_events = InterestSet::default();
-        state.poll_registered = false;
-        let _ = erts_poll_control(fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE);
-        if let Some(callback) = state.driver.ready.clone() {
-            drop(state);
-            callback(
-                fd,
-                Ready {
-                    readable: rearm.readable,
-                    writable: rearm.writable,
-                    closed: false,
-                    error: true,
-                },
-            );
-        }
-    }
-}
-
-/// Drop every selection `owner` holds on `fd` before the descriptor is closed.
-pub(crate) fn driver_deselect(fd: RawFd, owner: usize) {
-    let poller = poller();
-    let Ok((index, slots)) = poller.states.lock_slots(fd) else {
-        return;
-    };
-    let mut state = slots[index].lock().unwrap();
-    if state.driver.owner != Some(owner) {
-        return;
-    }
-    state.driver = DriverSelect::default();
-    let _ = sync_pollset(fd, &mut state);
-}
-
 pub(crate) struct DebugInfo {
     pub used_fds: usize,
     pub driver_selects: usize,
@@ -715,18 +571,15 @@ pub(crate) fn debug_info() -> DebugInfo {
     };
     for state in slots.iter() {
         let state = state.lock().unwrap();
-        let driver_used = state.driver.events.readable || state.driver.events.writable;
         // Port of erts/emulator/sys/common/erl_check_io.c (doit_erts_check_io_debug), OTP-29.1.1:
         // internal wake registrations do not contribute to the used-fd counter.
-        if driver_used
-            || state
-                .watches
-                .iter()
-                .any(|watch| !matches!(watch.kind, RegistrationKind::Internal))
+        if state
+            .watches
+            .iter()
+            .any(|watch| !matches!(watch.kind, RegistrationKind::Internal))
         {
             info.used_fds += 1;
         }
-        info.driver_selects += usize::from(driver_used);
         for watch in &state.watches {
             match watch.kind {
                 RegistrationKind::Driver => info.driver_selects += 1,
@@ -954,74 +807,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn check_io_driver_select_is_one_shot_until_task_executed() {
-        let _guard = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        let fd = reader.as_raw_fd();
-        let (tx, rx) = mpsc::channel();
-        let tx = Mutex::new(tx);
-        let readable = InterestSet {
-            readable: true,
-            writable: false,
-        };
-        driver_select(
-            fd,
-            7,
-            readable,
-            Arc::new(move |_, ready| {
-                let _ = tx.lock().unwrap().send(ready);
-            }),
-        )
-        .unwrap();
-        writer.write_all(b"x").unwrap();
-        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().readable);
-        writer.write_all(b"y").unwrap();
-        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
-        notify_executed(fd, 7, readable);
-        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().readable);
-        assert_eq!(debug_info().driver_selects, 1);
-        driver_deselect(fd, 7);
-        notify_executed(fd, 7, readable);
-        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
-        assert_eq!(debug_info().used_fds, 0);
-    }
-
-    #[test]
-    fn check_io_driver_select_off_drops_event_and_other_owner_steals() {
-        let _guard = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        let fd = reader.as_raw_fd();
-        let (tx, rx) = mpsc::channel::<usize>();
-        let callback = |owner: usize| -> SelectCallback {
-            let tx = Mutex::new(tx.clone());
-            Arc::new(move |_, _| {
-                let _ = tx.lock().unwrap().send(owner);
-            })
-        };
-        let readable = InterestSet {
-            readable: true,
-            writable: false,
-        };
-        let none = InterestSet::default();
-        driver_select(fd, 1, readable, callback(1)).unwrap();
-        driver_select(fd, 1, none, callback(1)).unwrap();
-        writer.write_all(b"x").unwrap();
-        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
-        driver_select(fd, 1, readable, callback(1)).unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
-        driver_select(fd, 2, readable, callback(2)).unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
-        driver_deselect(fd, 1);
-        assert_eq!(debug_info().driver_selects, 1);
-        driver_deselect(fd, 2);
-        assert_eq!(debug_info().used_fds, 0);
-    }
-
-    #[test]
     fn check_io_one_shot_callback_runs_after_poll_set_update() {
         let _guard = TEST_LOCK
             .lock()
@@ -1034,20 +819,11 @@ pub(crate) mod tests {
             writable: false,
         };
         let (tx, rx) = mpsc::channel();
-        let _registration = register(fd, readable, move |fd, _| {
+        let _registration = register(fd, readable, move |_, _| {
             let tx = tx.clone();
-            driver_select(
-                fd,
-                7,
-                readable,
-                Arc::new(move |_, _| {
-                    let _ = tx.send(());
-                }),
-            )
-            .unwrap();
+            let _ = tx.send(());
         })
         .unwrap();
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
-        driver_deselect(fd, 7);
     }
 }

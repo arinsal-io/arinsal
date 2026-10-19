@@ -77,7 +77,12 @@ impl Reply {
     }
 
     fn send(self, build: impl FnOnce(&mut ProcessHeap) -> Option<Term>) {
-        let mut heap = ProcessHeap::with_words(64);
+        self.send_sized(64, build);
+    }
+
+    /// `send` for a value of up to `words` heap words (a control reply is a byte list).
+    fn send_sized(self, words: usize, build: impl FnOnce(&mut ProcessHeap) -> Option<Term>) {
+        let mut heap = ProcessHeap::with_words(64 + words);
         let Some(value) = build(&mut heap) else {
             return;
         };
@@ -371,7 +376,13 @@ pub(crate) fn control(
                 SigOp::Exec => call_driver_control(&runtime, &task_drv, caller, op, &bytes),
                 _ => None,
             };
-            reply.send(|heap| match result {
+            // A list reply takes two words per byte, a binary its bytes.
+            let words = match &result {
+                Some(arinsal_drv::ControlReply::List(bytes)) => bytes.len() * 2,
+                Some(arinsal_drv::ControlReply::Binary(bytes)) => bytes.len() / 8 + 8,
+                _ => 0,
+            };
+            reply.send_sized(words, |heap| match result {
                 Some(result) => control_term(heap, result).ok(),
                 None => Some(atom("badarg")),
             });

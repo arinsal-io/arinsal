@@ -171,7 +171,7 @@ impl DriverPort {
     /// `process_exit` callback, `1` when the process does not exist (or is not
     /// a pid), else `0` with the monitor in `monitor`.
     pub(crate) fn monitor_process(&self, process: usize, monitor: &mut ErlDrvMonitor) -> c_int {
-        if self.driver.callbacks.process_exit.is_none() {
+        if self.driver.callbacks.process_exit.is_none() && self.driver.native.is_none() {
             return -1;
         }
         // erts_proc_sig_send_monitor fails for anything but an existing process.
@@ -217,6 +217,13 @@ impl DriverPort {
     /// `process_exit` callback runs once and the monitor is dropped after it.
     pub fn process_exit(&self, monitor: u64) {
         let _guard = self.guard();
+        if let Some(native) = &self.driver.native {
+            if self.monitors.lock().unwrap().contains_key(&monitor) && self.live() {
+                native.process_exit(self, monitor);
+                self.monitors.lock().unwrap().remove(&monitor);
+            }
+            return;
+        }
         let Some(callback) = self.driver.callbacks.process_exit else {
             return;
         };

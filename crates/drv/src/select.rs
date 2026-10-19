@@ -17,11 +17,11 @@ use crate::task::{call2, event_of};
 use crate::{DriverPort, REDS_INPUT, layout, poll};
 
 /// `ERL_DRV_READ`.
-pub(crate) const READ: c_int = layout::ERL_DRV_READ as c_int;
+pub const READ: c_int = layout::ERL_DRV_READ as c_int;
 /// `ERL_DRV_WRITE`.
-pub(crate) const WRITE: c_int = layout::ERL_DRV_WRITE as c_int;
+pub const WRITE: c_int = layout::ERL_DRV_WRITE as c_int;
 /// `ERL_DRV_USE`.
-pub(crate) const USE: c_int = layout::ERL_DRV_USE as c_int;
+pub const USE: c_int = layout::ERL_DRV_USE as c_int;
 /// `ERL_DRV_USE_NO_CALLBACK`.
 pub(crate) const USE_NO_CALLBACK: c_int = layout::ERL_DRV_USE_NO_CALLBACK as c_int;
 
@@ -754,6 +754,18 @@ impl DriverPort {
         if !self.live() || !begin_io_task(self, fd, dir, reg) {
             return false;
         }
+        if let Some(native) = &self.driver.native {
+            let started = std::time::Instant::now();
+            if dir == 0 {
+                native.ready_input(self, fd);
+            } else {
+                native.ready_output(self, fd);
+            }
+            let op = if dir == 0 { "input" } else { "output" };
+            self.host
+                .task_done(self, op, started.elapsed().as_nanos() as u64);
+            return true;
+        }
         let callback = if dir == 0 {
             self.driver.callbacks.ready_input
         } else {
@@ -794,6 +806,10 @@ impl DriverPort {
 
     /// Call `stop_select(event, NULL)` of the driver (io.c:7541 when it has none).
     pub(crate) fn stop_select(&self, fd: i32) {
+        if let Some(native) = &self.driver.native {
+            native.stop_select(fd);
+            return;
+        }
         match self.driver.callbacks.stop_select {
             Some(callback) => call2(callback, event_of(fd), std::ptr::null_mut()),
             None => self.host.log_error(&format!(

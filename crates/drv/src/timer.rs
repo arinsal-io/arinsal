@@ -108,7 +108,7 @@ fn serve(service: &Service) {
 
 impl DriverPort {
     /// Port of erl_hl_timer.c:3031 (erts_set_port_timer). `tmo` in ms.
-    pub(crate) fn set_timer(self: &Arc<Self>, tmo: i64) {
+    pub fn set_timer(self: &Arc<Self>, tmo: i64) {
         let mut timer = self.timer.lock().unwrap();
         let epoch = self.timer_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         if tmo == 0 {
@@ -137,13 +137,13 @@ impl DriverPort {
 
     /// Port of erl_hl_timer.c:3063 (erts_cancel_port_timer): an expired timer whose task
     /// is still queued is aborted too.
-    pub(crate) fn cancel_timer(&self) {
+    pub fn cancel_timer(&self) {
         *self.timer.lock().unwrap() = PortTimer::None;
     }
 
     /// Port of erl_hl_timer.c:3082 (erts_read_port_timer) and io.c:6930
     /// (driver_read_timer): ms left, 0 without a timer.
-    pub(crate) fn read_timer(&self) -> i64 {
+    pub fn read_timer(&self) -> i64 {
         match *self.timer.lock().unwrap() {
             PortTimer::None | PortTimer::TimedOut { .. } => 0,
             PortTimer::Armed { pos, .. } => {
@@ -178,7 +178,10 @@ impl DriverPort {
         if !self.live() {
             return REDS_TIMEOUT;
         }
-        if let Some(callback) = self.driver.callbacks.timeout {
+        if let Some(native) = &self.driver.native {
+            self.host.trace_timeout(self);
+            native.timeout(self);
+        } else if let Some(callback) = self.driver.callbacks.timeout {
             self.host.trace_timeout(self);
             call1(callback, self.data());
         }

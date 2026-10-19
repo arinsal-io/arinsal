@@ -384,6 +384,9 @@ sendfile_reset() ->
     Parent = self(),
     {L, C} = sf_pair([{active, false}],
                      fun(S) ->
+                         %% The reset must not overtake the client's connect completion,
+                         %% which is a port task on a scheduler like the accept.
+                         timer:sleep(50),
                          ok = inet:setopts(S, [{linger, {true, 0}}]),
                          ok = gen_tcp:close(S),
                          Parent ! reset,
