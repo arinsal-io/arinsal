@@ -17,7 +17,23 @@ const SOURCE: &str = r#"
          sendv_several_binaries/0, send_after_shutdown_write/0,
          shutdown_on_closed_socket/0, cancel_send/0, writer_queue_order/0,
          writer_abort_on_error/0, packet_send_sendv/0, sendto_sendmsg_stream/0,
-         dirty_io_nifs_wait_for_dirty_schedulers/0, socket_magic_orig_size/0]).
+         dirty_io_nifs_wait_for_dirty_schedulers/0, socket_magic_orig_size/0,
+         local_unbound_sockname/0]).
+
+local_unbound_sockname() ->
+    Path = filename:join("/tmp", "arinsal_socket_unbound_" ++ os:getpid()),
+    Addr = {local, list_to_binary(Path)},
+    Backend = [{inet_backend, socket}],
+    {ok, L} = gen_tcp:listen(0, Backend ++ [{ifaddr, Addr}, {active, false}]),
+    {ok, C} = gen_tcp:connect(Addr, 0, Backend ++ [{active, false}], 2000),
+    {ok, S} = gen_tcp:accept(L, 2000),
+    Names = {inet:sockname(C), inet:peername(S),
+             element(1, element(2, inet:peername(C)))},
+    ok = gen_tcp:close(C),
+    ok = gen_tcp:close(S),
+    ok = gen_tcp:close(L),
+    ok = file:delete(Path),
+    Names.
 
 listen() ->
     {ok, Listen} = gen_tcp:listen(0, [{inet_backend, socket}, {ip, {127,0,0,1}},
@@ -572,9 +588,15 @@ fn run(program: &Path, dir: &Path, module: &str, function: &str) -> (bool, Strin
         match child.try_wait() {
             Ok(Some(_)) => {
                 let output = child.wait_with_output().expect("output");
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 return (
                     output.status.success(),
-                    String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                    if output.status.success() || stderr.is_empty() {
+                        stdout
+                    } else {
+                        format!("{stdout}\n{stderr}").trim().to_string()
+                    },
                 );
             }
             Ok(None) if started.elapsed() > Duration::from_secs(60) => {
@@ -617,6 +639,11 @@ fn compare_in(module: &str, source: &str, function: &str) -> Option<(String, Str
 #[test]
 fn connect_accept_send_recv_matches_erts() {
     compare("connect_accept_send_recv");
+}
+
+#[test]
+fn local_unbound_sockname_matches_erts() {
+    compare("local_unbound_sockname");
 }
 
 #[test]
