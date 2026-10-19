@@ -2211,6 +2211,16 @@ fn recv_req(inner: &mut Inner, caller: Pid, data: &[u8]) -> Vec<u8> {
     ok_bytes(&aref.to_be_bytes())
 }
 
+fn has_buffered_packet(inner: &Inner) -> bool {
+    if inner.rbuf.is_empty() {
+        false
+    } else if inner.htype == 0 {
+        true
+    } else {
+        tcp_packet_complete(inner)
+    }
+}
+
 /// After EOF a receive still succeeds from input read before it (tcp_recv drains the buffer
 /// before it reads the socket again).
 fn buffered_deliverable(inner: &Inner, data: &[u8]) -> bool {
@@ -4035,6 +4045,11 @@ fn deliver_pending_close(sock: &Arc<Sock>) {
     let (owner, exit_on_close, delayed_reset) = {
         let mut inner = sock.inner.lock().unwrap();
         if !inner.peer_closed || inner.closed_sent || !active_is(&inner.active) {
+            return;
+        }
+        // EOF is only seen once the input before it was consumed (tcp_recv delivers the
+        // buffer first), so `tcp_closed` waits behind buffered packets.
+        if has_buffered_packet(&inner) {
             return;
         }
         inner.closed_sent = true;
