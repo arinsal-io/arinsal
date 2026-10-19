@@ -141,7 +141,7 @@ fn decode_ip_tos(value: &O) -> Option<i32> {
 }
 
 /// `encode_ip_tos`: `#{native, tos, dscp}`.
-fn encode_ip_tos(value: i32) -> O {
+pub(super) fn encode_ip_tos(value: i32) -> O {
     let by_value = |table: &[(&str, i32)], number: i32| {
         table
             .iter()

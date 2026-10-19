@@ -44,6 +44,8 @@ const REQ_GETSTATUS: i64 = 16;
 const REQ_GETIFLIST: i64 = 21;
 const REQ_IFGET: i64 = 22;
 const REQ_SUBSCRIBE: i64 = 24;
+const REQ_GETSERVBYNAME: i64 = 17;
+const REQ_GETSERVBYPORT: i64 = 18;
 const REQ_GETIFADDRS: i64 = 25;
 const REQ_ACCEPT: i64 = 26;
 const REQ_LISTEN: i64 = 27;
@@ -60,7 +62,10 @@ const AF_LOCAL_CODE: u8 = 5;
 // Port of inet_drv.c:874 (INET_OPT_* / INET_LOPT_* / TCP_OPT_*), OTP-29.1.1.
 const OPT_REUSEADDR: u8 = 0;
 const OPT_KEEPALIVE: u8 = 1;
+const OPT_DONTROUTE: u8 = 2;
 const OPT_LINGER: u8 = 3;
+const OPT_BROADCAST: u8 = 4;
+const OPT_OOBINLINE: u8 = 5;
 const OPT_SNDBUF: u8 = 6;
 const OPT_RCVBUF: u8 = 7;
 const OPT_PRIORITY: u8 = 8;
@@ -69,6 +74,8 @@ const OPT_NODELAY: u8 = 10;
 const OPT_V6ONLY: u8 = 16;
 const OPT_REUSEPORT: u8 = 17;
 const OPT_REUSEPORT_LB: u8 = 18;
+const OPT_EXCLUSIVEADDRUSE: u8 = 19;
+const OPT_NON_BLOCK_SEND: u8 = 50;
 const OPT_BUFFER: u8 = 20;
 const OPT_HEADER: u8 = 21;
 const OPT_ACTIVE: u8 = 22;
@@ -96,6 +103,14 @@ const OPT_TTL: u8 = 46;
 const OPT_RECVTTL: u8 = 47;
 const OPT_NOPUSH: u8 = 48;
 const OPT_READ_AHEAD: u8 = 49;
+#[cfg(target_os = "linux")]
+const OPT_KEEPCNT: u8 = 51;
+#[cfg(target_os = "linux")]
+const OPT_KEEPIDLE: u8 = 52;
+#[cfg(target_os = "linux")]
+const OPT_KEEPINTVL: u8 = 53;
+#[cfg(target_os = "linux")]
+const OPT_USER_TIMEOUT: u8 = 54;
 const OPT_DEBUG: u8 = 99;
 
 const IFOPT_ADDR: u8 = 1;
@@ -662,6 +677,9 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
                 inner.phase != Phase::Closed && inner.fd.is_some(),
             )
             .unwrap_or_else(|| err_bytes("exbadport")),
+            REQ_GETSERVBYNAME | REQ_GETSERVBYPORT => {
+                interface_control(cmd, data, true).unwrap_or_else(|| err_bytes("exbadport"))
+            }
             REQ_SUBSCRIBE => subscribe(&mut inner, caller, data),
             REQ_GETTYPE => gettype(&inner),
             REQ_GETSTATUS => getstatus(&inner),
@@ -711,9 +729,57 @@ pub(crate) fn interface_control(cmd: i64, data: &[u8], open: bool) -> Option<Vec
         REQ_IFGET if open => ifget(data),
         REQ_GETIFADDRS if open => getifaddrs_reply(),
         REQ_GETIFLIST | REQ_IFGET | REQ_GETIFADDRS => err_bytes("exbadport"),
+        REQ_GETSERVBYNAME => servbyname_req(data),
+        REQ_GETSERVBYPORT => servbyport_req(data),
         _ => return None,
     };
     Some(reply)
+}
+
+/// Port of inet_drv.c (inet_ctl INET_REQ_GETSERVBYNAME), OTP-29.1.1: `L1 Name L2 Proto`.
+fn servbyname_req(data: &[u8]) -> Vec<u8> {
+    if data.len() < 2 {
+        return err_bytes("einval");
+    }
+    let n = usize::from(data[0]);
+    // The `=` makes the test include the next length byte.
+    if n >= data.len() - 1 {
+        return err_bytes("einval");
+    }
+    let name = &data[1..1 + n];
+    let rest = &data[1 + n..];
+    let m = usize::from(rest[0]);
+    if m > rest.len() - 1 {
+        return err_bytes("einval");
+    }
+    let proto = &rest[1..1 + m];
+    let (Ok(name), Ok(proto)) = (std::ffi::CString::new(name), std::ffi::CString::new(proto))
+    else {
+        return err_bytes("einval");
+    };
+    match arinsal_nif_socket::servbyname(&name, &proto) {
+        Some(port) => ok_bytes(&port.to_be_bytes()),
+        None => err_bytes("einval"),
+    }
+}
+
+/// Port of inet_drv.c (inet_ctl INET_REQ_GETSERVBYPORT), OTP-29.1.1: `P1 P0 L1 Proto`.
+fn servbyport_req(data: &[u8]) -> Vec<u8> {
+    if data.len() < 3 {
+        return err_bytes("einval");
+    }
+    let port = u16::from_be_bytes([data[0], data[1]]);
+    let n = usize::from(data[2]);
+    if n > data.len() - 3 {
+        return err_bytes("einval");
+    }
+    let Ok(proto) = std::ffi::CString::new(&data[3..3 + n]) else {
+        return err_bytes("einval");
+    };
+    match arinsal_nif_socket::servbyport(port, &proto) {
+        Some(name) => ok_bytes(name.as_bytes()),
+        None => err_bytes("einval"),
+    }
 }
 
 fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
@@ -1262,7 +1328,26 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
             sock_int(inner, libc::SOL_SOCKET, libc::SO_RCVBUF, val);
         }
         // SO_PRIORITY is absent on macOS: inet_drv.c:7398 ignores the set.
+        #[cfg(not(target_os = "linux"))]
         OPT_PRIORITY => {}
+        #[cfg(target_os = "linux")]
+        OPT_PRIORITY => {
+            if !sock_set(inner, libc::SOL_SOCKET, libc::SO_PRIORITY, val, true) {
+                return false;
+            }
+        }
+        // Port of inet_drv.c (TCP_OPT_KEEPCNT .. USER_TIMEOUT, `#if defined(TCP_KEEPCNT)` etc.).
+        #[cfg(target_os = "linux")]
+        OPT_KEEPCNT => sock_int(inner, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, val),
+        #[cfg(target_os = "linux")]
+        OPT_KEEPIDLE => sock_int(inner, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, val),
+        #[cfg(target_os = "linux")]
+        OPT_KEEPINTVL => sock_int(inner, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, val),
+        #[cfg(target_os = "linux")]
+        OPT_USER_TIMEOUT => sock_int(inner, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, val),
+        OPT_DONTROUTE => sock_bool(inner, libc::SOL_SOCKET, libc::SO_DONTROUTE, val != 0),
+        OPT_BROADCAST => sock_bool(inner, libc::SOL_SOCKET, libc::SO_BROADCAST, val != 0),
+        OPT_OOBINLINE => sock_bool(inner, libc::SOL_SOCKET, libc::SO_OOBINLINE, val != 0),
         OPT_TOS => {
             inner.tos = val;
             if !sock_set(inner, libc::IPPROTO_IP, libc::IP_TOS, val, true) {
@@ -1280,7 +1365,11 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
             sock_bool(inner, libc::IPPROTO_TCP, libc::TCP_NODELAY, val != 0);
         }
         // TCP_NOPUSH is not wired on Darwin (inet_drv.c:1103). Set is a no-op.
+        #[cfg(not(target_os = "linux"))]
         OPT_NOPUSH => {}
+        // INET_TCP_NOPUSH is TCP_CORK on Linux.
+        #[cfg(target_os = "linux")]
+        OPT_NOPUSH => sock_bool(inner, libc::IPPROTO_TCP, libc::TCP_CORK, val != 0),
         OPT_BUFFER => {
             // Port of inet_drv.c:6963 (bufsz floored at INET_BUFFER_MIN).
             inner.buffer = val.max(1);
@@ -1390,7 +1479,11 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
             sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, val != 0);
         }
         // SO_REUSEPORT_LB is absent on macOS: inet_drv.c:7234 ignores the set.
+        #[cfg(not(target_os = "linux"))]
         OPT_REUSEPORT_LB => {}
+        // SO_REUSEPORT is load balancing on Linux.
+        #[cfg(target_os = "linux")]
+        OPT_REUSEPORT_LB => sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, val != 0),
         OPT_V6ONLY => {
             inner.v6only = val != 0;
             if !sock_set(
@@ -1435,6 +1528,8 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
             }
         }
         OPT_DEBUG => inner.debug = val != 0,
+        // Port of inet_drv.c (inet_set_opts): Windows only / SCTP only, ignored elsewhere.
+        OPT_EXCLUSIVEADDRUSE | OPT_NON_BLOCK_SEND => {}
         _ => return false,
     }
     true
@@ -1495,7 +1590,53 @@ fn push_opt(inner: &Inner, code: u8, data: &[u8], i: &mut usize, out: &mut Vec<u
             }
         }
         // inet_drv.c:9321 returns 0 when SO_PRIORITY is missing.
+        #[cfg(not(target_os = "linux"))]
         OPT_PRIORITY => write_i32(out, 0),
+        #[cfg(target_os = "linux")]
+        OPT_PRIORITY => {
+            if let Some(value) = sock_get_int(inner, libc::SOL_SOCKET, libc::SO_PRIORITY) {
+                write_i32(out, value);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        OPT_KEEPCNT => {
+            if let Some(value) = sock_get_int(inner, libc::IPPROTO_TCP, libc::TCP_KEEPCNT) {
+                write_i32(out, value);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        OPT_KEEPIDLE => {
+            if let Some(value) = sock_get_int(inner, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE) {
+                write_i32(out, value);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        OPT_KEEPINTVL => {
+            if let Some(value) = sock_get_int(inner, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL) {
+                write_i32(out, value);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        OPT_USER_TIMEOUT => {
+            if let Some(value) = sock_get_int(inner, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT) {
+                write_i32(out, value);
+            }
+        }
+        OPT_DONTROUTE => {
+            if let Some(value) = sock_get_int(inner, libc::SOL_SOCKET, libc::SO_DONTROUTE) {
+                write_i32(out, value);
+            }
+        }
+        OPT_BROADCAST => {
+            if let Some(value) = sock_get_int(inner, libc::SOL_SOCKET, libc::SO_BROADCAST) {
+                write_i32(out, value);
+            }
+        }
+        OPT_OOBINLINE => {
+            if let Some(value) = sock_get_int(inner, libc::SOL_SOCKET, libc::SO_OOBINLINE) {
+                write_i32(out, value);
+            }
+        }
         OPT_TOS => {
             if let Some(value) = sock_get_int(inner, libc::IPPROTO_IP, libc::IP_TOS) {
                 write_i32(out, value);
@@ -1512,7 +1653,14 @@ fn push_opt(inner: &Inner, code: u8, data: &[u8], i: &mut usize, out: &mut Vec<u
             }
         }
         // inet_drv.c:9457 returns 0 when INET_TCP_NOPUSH is not defined.
+        #[cfg(not(target_os = "linux"))]
         OPT_NOPUSH => write_i32(out, 0),
+        #[cfg(target_os = "linux")]
+        OPT_NOPUSH => {
+            if let Some(value) = sock_get_int(inner, libc::IPPROTO_TCP, libc::TCP_CORK) {
+                write_i32(out, i32::from(value != 0));
+            }
+        }
         OPT_BUFFER => write_i32(out, inner.buffer),
         OPT_HEADER => write_i32(out, inner.header),
         OPT_ACTIVE => {
@@ -1566,7 +1714,16 @@ fn push_opt(inner: &Inner, code: u8, data: &[u8], i: &mut usize, out: &mut Vec<u
             }
         }
         // inet_drv.c:9400 returns 0 when SO_REUSEPORT_LB is missing.
+        #[cfg(not(target_os = "linux"))]
         OPT_REUSEPORT_LB => write_i32(out, 0),
+        #[cfg(target_os = "linux")]
+        OPT_REUSEPORT_LB => {
+            if let Some(value) = sock_get_int(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT) {
+                write_i32(out, i32::from(value != 0));
+            }
+        }
+        // inet_fill_opts answers 0 where SO_EXCLUSIVEADDRUSE does not exist (not Windows).
+        OPT_EXCLUSIVEADDRUSE => write_i32(out, 0),
         OPT_V6ONLY => {
             if let Some(value) = sock_get_int(inner, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) {
                 write_i32(out, i32::from(value != 0));
@@ -1584,7 +1741,11 @@ fn push_opt(inner: &Inner, code: u8, data: &[u8], i: &mut usize, out: &mut Vec<u
             *i += 1;
             let size = i32::from_be_bytes(data[*i..*i + 4].try_into().unwrap());
             *i += 4;
-            if size < 0 || size as usize > MAX_OPT_BUFFER {
+            // PLACE_FOR(13 + arg_sz) fails once the reply would pass INET_MAX_OPT_BUFFER.
+            if size < 0
+                || size as usize > MAX_OPT_BUFFER
+                || out.len() + 13 + size as usize > MAX_OPT_BUFFER
+            {
                 return false;
             }
             if provided != 0 {

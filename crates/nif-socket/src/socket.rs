@@ -1908,9 +1908,6 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
         Ok(decoded) => decoded,
         Err(early) => return early,
     };
-    if msg && ctrl_len > 0 {
-        return Err(BifError::Unsupported("ancillary receive control messages"));
-    }
     let Some(caller) = self_pid() else {
         return Err(BifError::BADARG);
     };
@@ -1918,6 +1915,17 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
     let mut st = h.state.lock().unwrap();
     let config = recv_config(&h);
     let buf_sz = if len != 0 { len } else { config.buf_sz };
+    // `ctrlSz = (ctrlLen != 0 ? ctrlLen : descP->rCtrlSz)` (essio_recvmsg).
+    let ctrl_len = if msg && ctrl_len == 0 {
+        h.otp_options
+            .lock()
+            .unwrap()
+            .get(&OTP_OPT_RCVCTRLBUF)
+            .and_then(decode_bufsz)
+            .unwrap_or(1024)
+    } else {
+        ctrl_len
+    };
     let Some(s) = guard
         .as_ref()
         .filter(|_| state_bits::is_open(st.read_state))
@@ -1942,6 +1950,8 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let mut returned_flags = 0;
+    let mut control: Vec<u64> = Vec::new();
+    let mut control_len = 0usize;
     let received = if msg {
         let mut iov = libc::iovec {
             iov_base: data.as_mut_ptr().cast(),
@@ -1953,10 +1963,21 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
         header.msg_namelen = addr_len;
         header.msg_iov = &mut iov;
         header.msg_iovlen = 1;
-        // SAFETY: header points to writable data, iov, and address buffers with valid lengths.
+        // u64 storage keeps the control buffer aligned for cmsghdr.
+        control = vec![0u64; ctrl_len.div_ceil(8)];
+        if ctrl_len > 0 {
+            header.msg_control = control.as_mut_ptr().cast();
+            header.msg_controllen = ctrl_len as _;
+        }
+        // SAFETY: header points to writable data, iov, control and address buffers with valid lengths.
         let value = unsafe { libc::recvmsg(rx.fd, &mut header, flags) };
         addr_len = header.msg_namelen;
         returned_flags = header.msg_flags;
+        control_len = if ctrl_len > 0 {
+            header.msg_controllen as usize
+        } else {
+            0
+        };
         value
     } else {
         // SAFETY: data and storage are writable buffers with matching lengths.
@@ -2019,7 +2040,7 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
         .collect();
         let mut entries = vec![
             (atom("iov"), O::list(vec![binary])),
-            (atom("ctrl"), O::Nil),
+            (atom("ctrl"), encode_cmsgs(&control, control_len)),
             (atom("flags"), O::list(flags)),
         ];
         if let Some(addr) = address {
@@ -2035,6 +2056,93 @@ fn recv(args: &[O], from: bool, msg: bool) -> Result<O, BifError> {
         rx.update_current_reader(&mut st);
         Ok(ok(message))
     }
+}
+
+/// `CMSG_ALIGN`: Darwin aligns to 4 bytes, elsewhere to `sizeof(size_t)`.
+const CMSG_ALIGNMENT: usize = if cfg!(target_os = "macos") {
+    4
+} else {
+    std::mem::size_of::<usize>()
+};
+
+/// The control messages of a `recvmsg` as a list of `cmsg()` maps.
+// Port of erts/emulator/nifs/unix/unix_socket_syncio.c (encode_cmsgs) and
+// erts/emulator/nifs/common/prim_socket_nif.c (esock_encode_cmsg, the socket, ip and ipv6
+// tables): types outside the tables are reported by number without a value.
+fn encode_cmsgs(control: &[u64], len: usize) -> O {
+    let bytes: Vec<u8> = control.iter().flat_map(|w| w.to_ne_bytes()).collect();
+    let bytes = &bytes[..len.min(bytes.len())];
+    let header = std::mem::size_of::<libc::cmsghdr>();
+    let data_start = header.div_ceil(CMSG_ALIGNMENT) * CMSG_ALIGNMENT;
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off + header <= bytes.len() {
+        let total = if header == 16 {
+            u64::from_ne_bytes(bytes[off..off + 8].try_into().unwrap()) as usize
+        } else {
+            u32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap()) as usize
+        };
+        let (level, kind) = if header == 16 {
+            (
+                i32::from_ne_bytes(bytes[off + 8..off + 12].try_into().unwrap()),
+                i32::from_ne_bytes(bytes[off + 12..off + 16].try_into().unwrap()),
+            )
+        } else {
+            (
+                i32::from_ne_bytes(bytes[off + 4..off + 8].try_into().unwrap()),
+                i32::from_ne_bytes(bytes[off + 8..off + 12].try_into().unwrap()),
+            )
+        };
+        if total < header || off + total > bytes.len() {
+            out.push(atom("bad_data"));
+            break;
+        }
+        let data = &bytes[(off + data_start).min(off + total)..off + total];
+        let level_term = match level {
+            libc::SOL_SOCKET => atom("socket"),
+            libc::IPPROTO_IP => atom("ip"),
+            libc::IPPROTO_IPV6 => atom("ipv6"),
+            libc::IPPROTO_TCP => atom("tcp"),
+            libc::IPPROTO_UDP => atom("udp"),
+            n => O::Int(n.into()),
+        };
+        let int = || {
+            data.get(..4)
+                .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+        };
+        let uchar = || data.first().copied().map(i32::from);
+        let (type_term, value): (O, Option<O>) = match (level, kind) {
+            (libc::IPPROTO_IP, libc::IP_TOS) => (atom("tos"), uchar().map(options::encode_ip_tos)),
+            (libc::IPPROTO_IP, libc::IP_RECVTOS) => {
+                (atom("recvtos"), uchar().map(options::encode_ip_tos))
+            }
+            (libc::IPPROTO_IP, libc::IP_TTL) => (atom("ttl"), int().map(|v| O::Int(v.into()))),
+            (libc::IPPROTO_IP, libc::IP_RECVTTL) => {
+                (atom("recvttl"), uchar().map(|v| O::Int(v.into())))
+            }
+            (libc::IPPROTO_IPV6, libc::IPV6_HOPLIMIT) => {
+                (atom("hoplimit"), int().map(|v| O::Int(v.into())))
+            }
+            (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => {
+                (atom("tclass"), int().map(|v| O::Int(v.into())))
+            }
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS) => {
+                (atom("recvtclass"), int().map(|v| O::Int(v.into())))
+            }
+            (_, n) => (O::Int(n.into()), None),
+        };
+        let mut entries = vec![
+            (atom("level"), level_term),
+            (atom("type"), type_term),
+            (atom("data"), O::Binary(data.to_vec())),
+        ];
+        if let Some(value) = value {
+            entries.push((atom("value"), value));
+        }
+        out.push(O::Map(entries));
+        off += total.div_ceil(CMSG_ALIGNMENT) * CMSG_ALIGNMENT;
+    }
+    O::list(out)
 }
 
 impl Receiver<'_> {
@@ -2310,7 +2418,9 @@ fn ioctl(args: &[O]) -> Result<O, BifError> {
             ok(bool_atom(value != 0))
         });
     }
-    Err(BifError::Unsupported("interface ioctl request"))
+    // essio_ioctl: a request without an implementation on the platform is `enotsup`. The
+    // interface requests (gifaddr, gifhwaddr, ...) are not ported yet.
+    Ok(error("enotsup"))
 }
 /// The protocol database rows as `getprotoent(3)` yields them: name, number, aliases.
 fn protocol_entries() -> Vec<(String, i64, Vec<String>)> {

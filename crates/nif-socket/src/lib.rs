@@ -14,6 +14,7 @@ use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{HeapAlloc, MagicRef, Node, Term, from_owned, to_owned};
 
 mod net;
+pub use net::{servbyname, servbyport};
 mod socket;
 
 /// Serializes the tests that install a process-wide [`Reactor`].

@@ -373,31 +373,42 @@ fn if_names() -> O {
     unsafe { libc::freeifaddrs(first) };
     ok(O::list(rows))
 }
+/// Port number of service `name` under `protocol` (`getservbyname`).
+pub fn servbyname(name: &CString, protocol: &CString) -> Option<u16> {
+    let _lock = SERVICE_DB.lock().unwrap();
+    // SAFETY: both strings remain live; the returned static servent is read under SERVICE_DB.
+    let entry = unsafe { libc::getservbyname(name.as_ptr(), protocol.as_ptr()) };
+    if entry.is_null() {
+        return None;
+    }
+    // SAFETY: entry remains valid while SERVICE_DB is held.
+    Some(unsafe { u16::from_be((*entry).s_port as u16) })
+}
+
+/// Name of the service on `port` under `protocol` (`getservbyport`).
+pub fn servbyport(port: u16, protocol: &CString) -> Option<String> {
+    let _lock = SERVICE_DB.lock().unwrap();
+    // SAFETY: protocol remains live; returned static servent is read under SERVICE_DB.
+    let entry = unsafe { libc::getservbyport(port.to_be() as i32, protocol.as_ptr()) };
+    if entry.is_null() {
+        return None;
+    }
+    // SAFETY: entry and s_name remain valid while SERVICE_DB is held.
+    let value = unsafe { CStr::from_ptr((*entry).s_name) };
+    Some(value.to_string_lossy().into_owned())
+}
+
 fn service(args: &[O], by_name: bool) -> Result<O, BifError> {
     let protocol = cstring(&args[1])?.ok_or(BifError::BADARG)?;
-    let _lock = SERVICE_DB.lock().unwrap();
     if by_name {
         let service = cstring(&args[0])?.ok_or(BifError::BADARG)?;
-        // SAFETY: both strings remain live; the returned static servent is read under SERVICE_DB.
-        let entry = unsafe { libc::getservbyname(service.as_ptr(), protocol.as_ptr()) };
-        if entry.is_null() {
-            return Ok(error("einval"));
-        }
-        // SAFETY: entry remains valid while SERVICE_DB is held.
-        let port = unsafe { u16::from_be((*entry).s_port as u16) };
-        Ok(ok(O::Int(port.into())))
+        Ok(servbyname(&service, &protocol)
+            .map_or_else(|| error("einval"), |p| ok(O::Int(p.into()))))
     } else {
         let port = number(&args[0])
             .and_then(|n| u16::try_from(n).ok())
             .ok_or(BifError::BADARG)?;
-        // SAFETY: protocol remains live; returned static servent is read under SERVICE_DB.
-        let entry = unsafe { libc::getservbyport(port.to_be() as i32, protocol.as_ptr()) };
-        if entry.is_null() {
-            return Ok(error("einval"));
-        }
-        // SAFETY: entry and s_name remain valid while SERVICE_DB is held.
-        let value = unsafe { CStr::from_ptr((*entry).s_name) };
-        Ok(ok(O::charlist(&value.to_string_lossy())))
+        Ok(servbyport(port, &protocol).map_or_else(|| error("einval"), |n| ok(O::charlist(&n))))
     }
 }
 pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
