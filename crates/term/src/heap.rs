@@ -1281,6 +1281,10 @@ impl ProcessHeap {
             0
         }
     }
+    /// Keep runtime allocations below `HEAP_LIMIT` from here on: native code is about to run.
+    pub fn arm_native_redzone(&mut self) {
+        self.native_redzone = true;
+    }
     /// Interpreted code allocates up to the stack pointer, like the erts interpreter.
     pub fn clear_native_redzone(&mut self) {
         self.native_redzone = false;

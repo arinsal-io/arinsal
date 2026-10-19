@@ -14,6 +14,7 @@ const E: Gpr = Gpr::x(20);
 const FCALLS: Gpr = Gpr::w(22);
 const C_P: Gpr = Gpr::x(21);
 const SCHEDULER_REGS: Gpr = Gpr::x(19);
+const TMP_MEM_ARITH_ARGS: u32 = 16_384;
 const XREGS: [Gpr; 6] = [
     Gpr::x(25),
     Gpr::x(26),
@@ -2154,6 +2155,20 @@ impl BeamModuleAssembler {
         for ((helper, op), label) in fragments {
             self.code.bind(label)?;
             let update = crate::Update::HEAP_ALLOC.union(crate::Update::REDUCTIONS);
+            let raising = op & 0x100 == 0;
+            let unary = matches!(op & 0xff, 8 | 9);
+            if raising {
+                // Port of erts/emulator/beam/jit/arm/instr_arith.cpp
+                // (`emit_plus_body_shared`), OTP-29.1.1: keep source args in TMP_MEM1q while
+                // the shared helper runs, and restore them only when it raises.
+                self.code.emit(|e| {
+                    e.str_uoff(Gpr::x(14), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
+                    if !unary {
+                        e.str_uoff(Gpr::x(17), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
+                    }
+                    Ok(())
+                })?;
+            }
             self.code
                 .emit(|e| e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16))?;
             crate::emit_enter_runtime(&mut self.code, 6, update)?;
@@ -2167,11 +2182,34 @@ impl BeamModuleAssembler {
             })?;
             self.fragment_call(helper)?;
             crate::emit_leave_runtime(&mut self.code, 6, update)?;
-            self.code.emit(|e| {
-                e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
-                e.ldr_uoff(Gpr::x(9), C_P, 40)?;
-                e.ret(Gpr::x(30))
-            })?;
+            self.code
+                .emit(|e| e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
+            let returns_non_value = op & 0xff <= 14;
+            if raising {
+                let success = self.code.new_label();
+                if returns_non_value {
+                    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp
+                    // (`emit_plus_body_shared`), OTP-29.1.1: test the helper's value sentinel.
+                    self.code.cbnz(Gpr::x(0), success)?;
+                } else {
+                    self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
+                    self.code.cbz(Gpr::x(9), success)?;
+                }
+                self.code.emit(|e| {
+                    e.ldr_uoff(Gpr::x(10), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS)?;
+                    e.mov_reg(Gpr::x(25), Gpr::x(10))?;
+                    if !unary {
+                        e.ldr_uoff(Gpr::x(11), SCHEDULER_REGS, TMP_MEM_ARITH_ARGS + 8)?;
+                        e.mov_reg(Gpr::x(26), Gpr::x(11))?;
+                    }
+                    Ok(())
+                })?;
+                self.code.b(self.error_label)?;
+                self.code.bind(success)?;
+            } else if !returns_non_value {
+                self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
+            }
+            self.code.emit(|e| e.ret(Gpr::x(30)))?;
         }
         let entry_label = self.yield_label;
         self.code.bind(entry_label)?;
@@ -2196,17 +2234,39 @@ impl BeamModuleAssembler {
             })?;
         }
         self.code.bind(self.error_pc_label)?;
-        self.code
-            .emit(|e| e.sub_imm(Gpr::x(30), Gpr::x(30), 4, false))?;
         self.code.bind(self.error_label)?;
-        // The scheduler runs `handle_error`. Resolving the catch in this fragment
-        // drops the BIF frame and `function_clause` argument list the scheduler records.
+        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp,
+        // OTP-29.1.1: save a fake CP for a catch in the raising frame, then resolve it before
+        // returning to the scheduler.
         self.code.emit(|e| {
-            e.str_uoff(Gpr::x(30), SCHEDULER_REGS, 16_432)?;
-            e.mov_reg(Gpr::x(0), Gpr::xzr())?;
-            e.ldr_uoff(Gpr::x(30), SCHEDULER_REGS, 16_416)?;
+            e.str_pre(Gpr::x(30), E, -8)?;
+            e.str_uoff(Gpr::x(30), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
+        })?;
+        let error_update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
+        crate::emit_enter_runtime(&mut self.code, 6, error_update)?;
+        let native_catch = self.code.new_label();
+        let scheduler_exit = self.code.new_label();
+        if self.exception_resolver != 0 {
+            let resolver = self.exception_resolver;
+            self.code.emit(|e| {
+                e.mov_reg(Gpr::x(0), C_P)?;
+                e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
+                e.mov_reg(Gpr::x(2), E)?;
+                e.mov_const(Gpr::x(17), resolver as u64)?;
+                e.blr(Gpr::x(17))?;
+                e.mov_reg(Gpr::x(14), Gpr::x(0))
+            })?;
+            crate::emit_leave_runtime(&mut self.code, 6, error_update)?;
+            self.code.cbnz(Gpr::x(14), native_catch)?;
+        }
+        self.code.bind(scheduler_exit)?;
+        self.code.emit(|e| {
+            e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, 16_408)?;
+            e.mov_const(Gpr::x(30), arinsal_enter_native_return as *const () as u64)?;
             e.br(Gpr::x(30))
         })?;
+        self.code.bind(native_catch)?;
+        self.code.emit(|e| e.br(Gpr::x(14)))?;
         let dispatch_fragments = std::mem::take(&mut self.dispatch_fragments);
         for (target, label) in dispatch_fragments {
             self.code.bind(label)?;

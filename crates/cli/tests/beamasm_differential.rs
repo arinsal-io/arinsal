@@ -27,6 +27,8 @@ fn native_modules(module: &str) -> String {
         // The group leader handles the io request while multi-scheduling is blocked.
         "beamasm_sched" => format!("{module},group"),
         "beamasm_map_elements" => format!("{module},beamasm_map_callee"),
+        // list_to_integer/1 reaches error_with_info/2 in the preloaded erlang module.
+        "beamasm_exceptions" => format!("{module},erlang"),
         _ => module.to_owned(),
     }
 }
@@ -108,6 +110,10 @@ fn native_modules_print_what_erl_prints() {
         let expected = reference(&dir, module);
         assert!(expected.status.success(), "{module}: erl failed");
         let actual = native(&dir, module);
+        assert!(
+            actual.status.success(),
+            "{module}: BeamAsm failed: {actual:?}"
+        );
         assert_eq!(
             String::from_utf8_lossy(&actual.stdout),
             String::from_utf8_lossy(&expected.stdout),

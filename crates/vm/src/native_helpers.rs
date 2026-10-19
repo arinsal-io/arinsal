@@ -3731,6 +3731,29 @@ pub(crate) fn set_native_bif_error(
     });
 }
 
+/// Records a BIF failure whose arguments are in the live scheduler registers.
+// Port of erts/emulator/beam/jit/arm/instr_arith.cpp, OTP-29.1.1.
+pub(crate) fn set_native_bif_register_error(
+    process: &mut crate::Process,
+    module: arinsal_term::Atom,
+    function: arinsal_term::Atom,
+    arity: u8,
+    error: arinsal_bifs::BifError,
+) {
+    set_light_bif_error(process, &error);
+    let (freason, fvalue) = (process.header.freason, process.header.fvalue);
+    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
+        call: crate::proc_create::NativeBifCall::Registers {
+            module,
+            function,
+            arity,
+        },
+        error,
+        freason,
+        fvalue,
+    });
+}
+
 /// Retains the export entry; its descriptor owns the BIF MFA while X registers own the arguments.
 fn set_native_bif_export_error(
     process: &mut crate::Process,
@@ -3851,7 +3874,15 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // writes `stop` only at `found_catch`), OTP-29.1.1. Resolve the catch once before saving
     // the trace; a miss or a caller catch remains with the scheduler's unwind.
     let raising_pc = registers.tmp_mem[6] as usize;
-    let found = crate::native_bridge::current_native_catch(process, raising_pc);
+    // A function_clause list of the current function's arguments and an inline guard BIF's
+    // top frame (`tmp_mem[7]`) are built by the scheduler's native exit; leave them there.
+    if process.header.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE
+        || registers.tmp_mem[7] != 0
+    {
+        process.sync_native_header();
+        return 0;
+    }
+    let found = crate::native_bridge::next_native_catch(process);
     let Some(found) = found else {
         process.sync_native_header();
         return 0;
@@ -3875,10 +3906,8 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // The light-BIF fragment and `error_label` spill the raising pc at `tmp_mem[6]`
     // (erts' `pc` argument to `save_stacktrace`). `p.ip` is the last interpreter
     // instruction and names the wrong function while native code is running.
-    // The raising pc is stored raw. `build_stacktrace` resolves it; a registry
-    // lookup here is not part of erts' `save_stacktrace`.
-    // Port of beam_common.c:880-925 (`save_stacktrace`), OTP-29.1.1: `pc` stays raw
-    // until `build_stacktrace` resolves it against the active native ranges table.
+    // Port of beam_common.c (`save_stacktrace`), OTP-29.1.1: retain the raw raising PC;
+    // `build_stacktrace` resolves it against the active code ranges when the trace is requested.
     let native_pc = (raising_pc != 0).then_some(raising_pc);
     let top = process
         .cold
@@ -3905,6 +3934,20 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // A failing BIF in the argument registers is the top frame, with its arguments read
     // from the registers (erts `save_stacktrace` reads them from `reg`), no copies.
     let top = top.or_else(|| failure_top(process, &registers.x_reg_array));
+    // A failure carrying only error_info (bit syntax) names the raising function, as the
+    // scheduler's native exit does for the same failure.
+    let top = top.or_else(|| {
+        let info = process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.native_error_info.as_deref().cloned())?;
+        let arity =
+            crate::native_function_at(raising_pc).map_or(0, |function| i64::from(function.arity));
+        Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
+            Term::small(arity),
+            Box::new(info),
+        ))
+    });
     if top.is_none() {
         note_owned_failure(process);
     }
@@ -3937,6 +3980,9 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         }
     };
     crate::stacktrace::clear_pending_top(process);
+    if let Some(cold) = process.cold.as_mut() {
+        cold.native_error_info = None;
+    }
     // The branch below resumes the handler. The scheduler must not treat
     // the next native exit as a continuation resume.
     process.native_continuation_resume = false;
@@ -4034,6 +4080,25 @@ fn failure_top(
                 info,
             })
         }
+        crate::proc_create::NativeBifCall::Registers {
+            module,
+            function,
+            arity,
+        } => Some(TopFrame::BifRegisters {
+            module: *module,
+            function: *function,
+            arity: usize::from(*arity),
+            info: match failure.error {
+                arinsal_bifs::BifError::Badarg { cause: Some(cause) } => BifErrorInfo::Cause(cause),
+                arinsal_bifs::BifError::Badarg { .. }
+                | arinsal_bifs::BifError::Badarith
+                | arinsal_bifs::BifError::SystemLimit
+                | arinsal_bifs::BifError::Error(_) => BifErrorInfo::Plain,
+                arinsal_bifs::BifError::Raise { .. }
+                | arinsal_bifs::BifError::Unsupported(_)
+                | arinsal_bifs::BifError::Dirty(_) => return None,
+            },
+        }),
         crate::proc_create::NativeBifCall::Owned { .. } => None,
     }
 }

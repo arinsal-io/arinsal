@@ -375,13 +375,12 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp (the arithmetic BIF and its
             // operands are the top frame of a raised error), OTP-29.1.1.
             match arith_bif(op) {
-                Some((name, arity)) if !quiet => {
-                    let args = [left, right];
-                    crate::native_helpers::set_native_bif_error(
+                Some((function, arity)) if !quiet => {
+                    crate::native_helpers::set_native_bif_register_error(
                         process,
-                        "erlang",
-                        name,
-                        &args[..arity],
+                        arinsal_term::atoms::ERLANG,
+                        function,
+                        arity,
                         error,
                     );
                 }
@@ -395,23 +394,24 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
 }
 
 /// The erlang BIF behind a generic arithmetic helper op.
-fn arith_bif(op: u32) -> Option<(&'static str, usize)> {
+// Port of erts/emulator/beam/jit/arm/instr_arith.cpp, OTP-29.1.1.
+fn arith_bif(op: u32) -> Option<(arinsal_term::Atom, u8)> {
     Some(match op {
-        0 => ("+", 2),
-        1 => ("-", 2),
-        2 => ("*", 2),
-        3 => ("div", 2),
-        4 => ("rem", 2),
-        5 => ("band", 2),
-        6 => ("bor", 2),
-        7 => ("bxor", 2),
-        8 => ("bnot", 1),
-        9 => ("-", 1),
-        10 => ("bsl", 2),
-        11 => ("bsr", 2),
-        12 => ("/", 2),
-        13 => ("*", 2),
-        14 => ("div", 2),
+        0 => (arinsal_term::atoms::PLUS, 2),
+        1 => (arinsal_term::atoms::MINUS, 2),
+        2 => (arinsal_term::atoms::TIMES, 2),
+        3 => (arinsal_term::atoms::DIV, 2),
+        4 => (arinsal_term::atoms::REM, 2),
+        5 => (arinsal_term::atoms::BAND, 2),
+        6 => (arinsal_term::atoms::BOR, 2),
+        7 => (arinsal_term::atoms::BXOR, 2),
+        8 => (arinsal_term::atoms::BNOT, 1),
+        9 => (arinsal_term::atoms::MINUS, 1),
+        10 => (arinsal_term::atoms::BSL, 2),
+        11 => (arinsal_term::atoms::BSR, 2),
+        12 => (arinsal_term::atoms::DIV_2, 2),
+        13 => (arinsal_term::atoms::TIMES, 2),
+        14 => (arinsal_term::atoms::DIV, 2),
         _ => return None,
     })
 }

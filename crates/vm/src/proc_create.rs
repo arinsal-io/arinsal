@@ -1706,8 +1706,7 @@ impl Process {
     #[inline]
     pub(crate) fn ensure_entry(&mut self, words: usize, live: usize) -> Result<(), VmError> {
         if live <= self.x.len()
-            && self.heap.free_words()
-                >= words + arinsal_term::S_RESERVED * usize::from(self.heap.native_active())
+            && self.heap.free_words() >= words + self.heap.check_reserve()
             && !self.heap.bin_vheap_gc_due()
             && !crate::interp::gc_stress_enabled()
         {
@@ -1947,6 +1946,12 @@ pub(crate) struct NativeTrap {
 pub(crate) enum NativeBifCall {
     /// Native export metadata and the scheduler's register array are the MFA and arguments.
     Export(crate::beamasm_integration::ExportDispatch),
+    /// A native operation writes its BIF arguments to X0.. before raising.
+    Registers {
+        module: arinsal_term::Atom,
+        function: arinsal_term::Atom,
+        arity: u8,
+    },
     /// NIF and legacy helper calls have no export entry to retain.
     Owned {
         module: String,

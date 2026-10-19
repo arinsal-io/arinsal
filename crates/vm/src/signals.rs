@@ -35,6 +35,8 @@ pub(crate) fn atom(name: &str) -> Term {
         "flush" => arinsal_term::atoms::FLUSH,
         "info" => arinsal_term::atoms::INFO,
         "badarg" => arinsal_term::atoms::BADARG,
+        "badarith" => arinsal_term::atoms::BADARITH,
+        "system_limit" => arinsal_term::atoms::SYSTEM_LIMIT,
         "noproc" => arinsal_term::atoms::NOPROC,
         "normal" => arinsal_term::atoms::NORMAL,
         "EXIT" => arinsal_term::atoms::EXIT_2,
