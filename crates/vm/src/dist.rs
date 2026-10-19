@@ -2072,18 +2072,17 @@ pub(crate) fn native_signal(
         }
         "monitor" => {
             // Port of dist.c:1528 (erts_dsig_send_monitor), OTP-29.1.1.
-            let (alias, priority) = if args.len() == 3 {
+            let (alias_mode, priority) = if args.len() == 3 {
                 monitor_alias_option(args[2])?
             } else {
-                (false, false)
+                (None, false)
             };
             let id = arinsal_bifs::next_ref_id();
             let reference = crate::signals::reference(process, id)?;
             if priority {
                 process.cold_mut().prio_monitors.insert(id);
             }
-            if alias {
-                process.cold_mut().aliases.insert(id);
+            if alias_mode.is_some() {
                 let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
                 runtime.alias_bind(id, Some(ctx.pid()));
             }
@@ -2109,6 +2108,10 @@ pub(crate) fn native_signal(
             )?;
             remember_monitor(&node, id, target)?;
             process.cold_mut().dist_monitors.insert(id);
+            process.cold_mut().monitors.insert(
+                id,
+                crate::proc_create::OriginMonitor::Distributed { alias_mode },
+            );
             Ok(reference)
         }
         "demonitor" => {
@@ -2118,6 +2121,10 @@ pub(crate) fn native_signal(
             };
             if args.len() == 2 && !valid_demonitor_options(args[1]) {
                 return Err(badarg());
+            }
+            let origin = crate::signals::demonitor_origin(process, id);
+            if matches!(origin, crate::signals::OriginDemonitor::Alias) {
+                return Ok(atom("false"));
             }
             let Some((node, target)) = take_monitor(id) else {
                 process.cold_mut().dist_monitors.remove(&id);
@@ -2154,12 +2161,14 @@ pub(crate) fn native_signal(
 
 /// Parse the options used by remote `monitor/3`.
 /// Port of erts/emulator/beam/dist.c:1528 (`erts_dsig_send_monitor`), OTP-29.1.1.
-fn monitor_alias_option(term: Term) -> Result<(bool, bool), VmError> {
+fn monitor_alias_option(
+    term: Term,
+) -> Result<(Option<crate::proc_create::AliasMode>, bool), VmError> {
     let options = owned(term)?;
     match &options {
-        OwnedTerm::Nil => Ok((false, false)),
+        OwnedTerm::Nil => Ok((None, false)),
         OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => {
-            let mut alias = false;
+            let mut alias_mode = None;
             let mut priority = false;
             for option in elems {
                 match option {
@@ -2167,20 +2176,22 @@ fn monitor_alias_option(term: Term) -> Result<(bool, bool), VmError> {
                     OwnedTerm::Tuple(parts)
                         if parts.len() == 2
                             && parts[0] == OwnedTerm::Atom("alias".into())
-                            && matches!(
-                                &parts[1],
-                                OwnedTerm::Atom(name)
-                                    if name == "demonitor"
-                                        || name == "reply_demonitor"
-                                        || name == "explicit_unalias"
-                            ) =>
+                            && matches!(&parts[1], OwnedTerm::Atom(name) if matches!(name.as_str(), "demonitor" | "reply_demonitor" | "explicit_unalias")) =>
                     {
-                        alias = true;
+                        let OwnedTerm::Atom(name) = &parts[1] else {
+                            unreachable!();
+                        };
+                        alias_mode = Some(match name.as_str() {
+                            "explicit_unalias" => crate::proc_create::AliasMode::ExplicitUnalias,
+                            "demonitor" => crate::proc_create::AliasMode::Demonitor,
+                            "reply_demonitor" => crate::proc_create::AliasMode::ReplyDemonitor,
+                            _ => unreachable!(),
+                        });
                     }
                     _ => return Err(badarg()),
                 }
             }
-            Ok((alias, priority))
+            Ok((alias_mode, priority))
         }
         _ => Err(badarg()),
     }
@@ -2294,6 +2305,36 @@ pub(crate) fn take_monitor(id: u64) -> Option<(String, OwnedTerm)> {
         }
     }
     None
+}
+
+/// Send the remote demonitor caused by the first message through a reply_demonitor alias.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_alias_message), OTP-29.1.1.
+pub(crate) fn demonitor_alias(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    id: u64,
+) -> Result<(), VmError> {
+    process.cold_mut().dist_monitors.remove(&id);
+    let Some((node, target)) = take_monitor(id) else {
+        return Ok(());
+    };
+    let wire_target = match &target {
+        OwnedTerm::Tuple(parts) if parts.len() == 2 && matches!(&parts[0], OwnedTerm::Atom(_)) => {
+            parts[0].clone()
+        }
+        _ => target,
+    };
+    let reference = crate::signals::reference(process, id)?;
+    queue_outgoing(
+        process,
+        ctx,
+        &node,
+        control(
+            20,
+            vec![local_pid_owned(ctx.pid()), wire_target, owned(reference)?],
+        ),
+        None,
+    )
 }
 
 fn monitor_node(id: u64) -> Option<String> {

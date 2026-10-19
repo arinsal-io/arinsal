@@ -5923,24 +5923,53 @@ impl Process {
     /// `reply` alias is deactivated by the first one.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_alias_message, ERTS_ALIAS_ONCE),
     // OTP-29.1.1.
-    fn alias_message_accepted(&mut self, alias: u64) -> bool {
+    fn alias_message_accepted(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        alias: u64,
+    ) -> Result<bool, VmError> {
         if alias == 0 {
-            return true;
+            return Ok(true);
         }
-        let Some(runtime) = self.runtime.as_ref() else {
-            return true;
+        let Some(runtime) = self.runtime.clone() else {
+            return Ok(true);
         };
-        if !matches!(runtime.alias_lookup(alias), Some(Some(_))) {
-            return false;
-        }
-        if self
+        let Some((Some(_), priority)) = runtime.alias_lookup_prio(alias) else {
+            return Ok(false);
+        };
+        let Some(entry) = self
             .cold
-            .as_mut()
-            .is_some_and(|cold| cold.once_aliases.remove(&alias))
-        {
+            .as_ref()
+            .and_then(|cold| cold.monitors.get(&alias))
+        else {
+            return Ok(false);
+        };
+        if entry.alias_priority() != priority {
+            return Ok(false);
+        }
+        if entry.alias_mode() == Some(crate::proc_create::AliasMode::ReplyDemonitor) {
+            let entry = self.cold_mut().monitors.remove(&alias);
+            match entry {
+                Some(crate::proc_create::OriginMonitor::Process(half)) => {
+                    self.cold_mut().prio_monitors.remove(&alias);
+                    let _ = ctx.signal(half.target, arinsal_sched::Signal::Demonitor(alias));
+                }
+                Some(crate::proc_create::OriginMonitor::Port {
+                    port_id: Some(port_id),
+                    ..
+                }) => {
+                    self.cold_mut().port_monitors.remove(&alias);
+                    crate::port::demonitor_port(self, ctx.pid(), port_id, alias);
+                }
+                Some(crate::proc_create::OriginMonitor::Alias { .. }) => {}
+                Some(crate::proc_create::OriginMonitor::Distributed { .. }) => {
+                    crate::dist::demonitor_alias(self, ctx, alias)?;
+                }
+                Some(crate::proc_create::OriginMonitor::Port { .. }) | None => {}
+            }
             runtime.alias_bind(alias, None);
         }
-        true
+        Ok(true)
     }
 
     /// Move a message signal into the message queue.
@@ -5952,7 +5981,7 @@ impl Process {
     ) -> Result<(), VmError> {
         match payload {
             Payload::Message(message) => {
-                if !self.alias_message_accepted(message.alias) {
+                if !self.alias_message_accepted(ctx, message.alias)? {
                     return Ok(());
                 }
                 let receive_traced = message.receive_traced;
@@ -7113,11 +7142,9 @@ impl Process {
         reference: u64,
         message: Message,
     ) -> Result<(), VmError> {
-        let active = self
-            .cold
-            .as_mut()
-            .is_some_and(|cold| cold.monitors.remove(&reference).is_some())
-            || crate::dist::take_monitor(reference).is_some();
+        let origin = crate::signals::take_origin_monitor_down(self, reference);
+        let remote = crate::dist::take_monitor(reference).is_some();
+        let active = origin.is_some() || remote;
         let priority = self
             .cold
             .as_mut()
@@ -7155,11 +7182,9 @@ impl Process {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:6355 (ERTS_SIG_Q_OP_MONITOR_DOWN),
         // OTP-29.1.1: a DOWN whose origin monitor is no longer in the table (a demonitor
         // raced with the target's exit) is dropped instead of becoming a message.
-        let half = self
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.monitors.remove(&reference));
-        let active = half.is_some() || crate::dist::take_monitor(reference).is_some();
+        let entry = crate::signals::take_origin_monitor_down(self, reference);
+        let remote = crate::dist::take_monitor(reference).is_some();
+        let active = entry.is_some() || remote;
         let priority = self
             .cold
             .as_mut()
@@ -7167,6 +7192,10 @@ impl Process {
         if !active {
             return Ok(());
         }
+        let half = match entry {
+            Some(crate::proc_create::OriginMonitor::Process(half)) => Some(half),
+            _ => None,
+        };
         let tag = if let Some(owned) = half.as_ref().and_then(|half| half.data.tag.as_ref()) {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
             arinsal_term::from_owned(owned, &mut heap)

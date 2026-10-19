@@ -907,11 +907,53 @@ pub(crate) fn default_monitor_data() -> std::sync::Arc<MonitorData> {
     })
 }
 
+/// Alias lifecycle stored in the origin monitor entry.
+// Port of erts/emulator/beam/erl_monitor_link.h (ERTS_ML_STATE_ALIAS_*), OTP-29.1.1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AliasMode {
+    ExplicitUnalias,
+    Demonitor,
+    ReplyDemonitor,
+}
+
+/// An origin-side entry in the per-process monitor tree.
+// Port of erts/emulator/beam/erl_monitor_link.c (monitor tree origin entries), OTP-29.1.1.
+#[derive(Clone, Debug)]
+pub(crate) enum OriginMonitor {
+    Process(OriginHalf),
+    Distributed {
+        alias_mode: Option<AliasMode>,
+    },
+    Port {
+        port_id: Option<u64>,
+        alias_mode: Option<AliasMode>,
+    },
+    Alias {
+        mode: AliasMode,
+        priority: bool,
+    },
+}
+
+impl OriginMonitor {
+    pub(crate) fn alias_mode(&self) -> Option<AliasMode> {
+        match self {
+            Self::Process(half) => half.alias_mode,
+            Self::Distributed { alias_mode } | Self::Port { alias_mode, .. } => *alias_mode,
+            Self::Alias { mode, .. } => Some(*mode),
+        }
+    }
+
+    pub(crate) fn alias_priority(&self) -> bool {
+        matches!(self, Self::Alias { priority: true, .. })
+    }
+}
+
 /// Origin half of a local monitor (erts `ERTS_P_MONITORS` entry): the monitored target.
 #[derive(Clone, Debug)]
 pub(crate) struct OriginHalf {
     pub(crate) target: arinsal_sched::Pid,
     pub(crate) data: std::sync::Arc<MonitorData>,
+    pub(crate) alias_mode: Option<AliasMode>,
 }
 
 /// Target half of a local monitor (erts `ERTS_P_LT_MONITORS` entry): the monitoring origin.
@@ -1089,8 +1131,8 @@ pub(crate) struct ProcessCold {
     pub(crate) links: std::collections::BTreeSet<arinsal_sched::Pid>,
     /// Links created with `link/2` `[priority]` — EXIT messages from these are priority.
     pub(crate) prio_links: std::collections::BTreeSet<arinsal_sched::Pid>,
-    /// Origin half of each local monitor, keyed by reference (erts `ERTS_P_MONITORS`).
-    pub(crate) monitors: std::collections::BTreeMap<u64, OriginHalf>,
+    /// Origin entries keyed by reference (erts `ERTS_P_MONITORS`), including standalone aliases.
+    pub(crate) monitors: std::collections::BTreeMap<u64, OriginMonitor>,
     /// Remote-process monitors. `demonitor` of any other ref does not take the
     /// node-table lock: erts finds `ERTS_MON_TYPE_DIST_PROC` in this process's
     /// own monitor tree (`bif.c` `demonitor`), not in a global scan.
@@ -1119,9 +1161,6 @@ pub(crate) struct ProcessCold {
     >,
     /// Active suspends of this process (erts `p->rcount`); nonzero exactly when `SUSPENDED` is set.
     pub(crate) suspend_count: u32,
-    pub(crate) aliases: std::collections::HashSet<u64>,
-    /// Aliases created with `reply`: deactivated by the first message handled through them.
-    pub(crate) once_aliases: std::collections::HashSet<u64>,
     /// Arguments of an `eval_scheduled` entry, restored when its `-on_load` prelude returns.
     ///
     /// The heap owns the copied terms so a collection inside `-on_load` cannot move them.
