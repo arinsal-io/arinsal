@@ -154,6 +154,7 @@ impl CodeMemory {
         };
 
         #[cfg(not(target_os = "macos"))]
+        // SAFETY: anonymous private mapping, checked results, cleaned up on failure below.
         let ptr = unsafe {
             // Port of erts/emulator/beam/jit/beam_jit_main.cpp:206-235, OTP-29.1.1
             let prot = libc::PROT_READ | libc::PROT_WRITE;

@@ -1159,7 +1159,7 @@ fn encode_addr(storage: &libc::sockaddr_storage) -> Option<Vec<u8>> {
                 n += 1;
             }
             let mut out = vec![AF_LOCAL_CODE, n as u8];
-            out.extend(path[..n].iter().map(|c| *c as u8));
+            out.extend(path[..n].iter().map(|c| c.to_ne_bytes()[0]));
             Some(out)
         } else {
             None
@@ -1918,7 +1918,7 @@ fn hwaddr(name: &[u8]) -> Option<Vec<u8>> {
         // SAFETY: SIOCGIFHWADDR writes a sockaddr into the ifreq union.
         let data = unsafe { ifr.ifr_ifru.ifru_hwaddr.sa_data };
         // IFHWADDRLEN is 6.
-        hw.extend(data[..6].iter().map(|b| *b as u8));
+        hw.extend(data[..6].iter().map(|b| b.to_ne_bytes()[0]));
     })?;
     Some(hw)
 }

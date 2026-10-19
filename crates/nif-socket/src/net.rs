@@ -133,11 +133,11 @@ fn sockaddr(addr: *const libc::sockaddr) -> Option<O> {
         _ => None,
     }
 }
-// glibc <netdb.h> value; the libc crate does not export it for Linux.
+// <netdb.h> values; the libc crate does not export EAI_ADDRFAMILY.
 #[cfg(target_os = "linux")]
 const EAI_ADDRFAMILY: i32 = -9;
 #[cfg(not(target_os = "linux"))]
-const EAI_ADDRFAMILY: i32 = libc::EAI_ADDRFAMILY;
+const EAI_ADDRFAMILY: i32 = 1; // Darwin <netdb.h>
 
 // Port of erts/emulator/nifs/common/prim_net_nif.c (enet_getaddrinfo), OTP-29.1.1.
 fn gai_error(code: i32) -> O {

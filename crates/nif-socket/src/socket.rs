@@ -2251,7 +2251,7 @@ fn sockaddr_storage_to_term(storage: &libc::sockaddr_storage) -> Option<O> {
             let path: Vec<u8> = a
                 .sun_path
                 .iter()
-                .map(|c| *c as u8)
+                .map(|c| c.to_ne_bytes()[0])
                 .take_while(|c| *c != 0)
                 .collect();
             Some(map(&[("family", atom("local")), ("path", O::Binary(path))]))

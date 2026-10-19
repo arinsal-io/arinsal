@@ -203,6 +203,7 @@ fn posix(err: &std::io::Error) -> O {
 }
 fn posix_code(code: i32) -> O {
     // Port of erts/emulator/beam/erl_errno_str.c:1229 (erl_errno_id), OTP-29.1.1.
+    #[allow(clippy::match_overlapping_arm)]
     let name = match code {
         libc::EPERM => "eperm",
         libc::ENOENT => "enoent",
@@ -762,6 +763,8 @@ fn ipread_s32bu_p32bu_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifErro
         })
     })
 }
+// mode_t is u16 on macOS and u32 on Linux, hence the conversions.
+#[allow(clippy::useless_conversion)]
 fn file_info(meta: &fs::Metadata, access: &str) -> O {
     // Port of erts/emulator/nifs/common/prim_file_nif.c:996 (build_file_info) and
     // erts/emulator/nifs/unix/unix_prim_file.c:699 (build_file_info), OTP-29.1.1.
