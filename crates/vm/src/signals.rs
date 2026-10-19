@@ -2287,7 +2287,12 @@ pub(crate) fn demonitor_origin(process: &mut Process, id: u64) -> OriginDemonito
     process.cold_mut().prio_monitors.remove(&id);
     match entry {
         crate::proc_create::OriginMonitor::Process(half) => OriginDemonitor::Process(half),
-        crate::proc_create::OriginMonitor::Port { port_id, .. } => OriginDemonitor::Port(port_id),
+        crate::proc_create::OriginMonitor::Port { port_id, .. } => {
+            if let Some(cold) = process.cold.as_mut() {
+                cold.port_monitors.remove(&id);
+            }
+            OriginDemonitor::Port(port_id)
+        }
         crate::proc_create::OriginMonitor::Distributed { .. } => OriginDemonitor::Distributed,
         crate::proc_create::OriginMonitor::Alias { .. } => unreachable!(),
     }
@@ -2954,15 +2959,16 @@ fn call_resolved(
             } else {
                 return Err(badarg("monitor/2"));
             };
-            if alias_mode.is_some() {
-                process.cold_mut().monitors.insert(
-                    reference_id,
-                    crate::proc_create::OriginMonitor::Port {
-                        port_id,
-                        alias_mode,
-                    },
-                );
-            }
+            // The port monitor stays in the origin tree until its DOWN signal is processed,
+            // just like the monitor object in `erts_proc_sig_send_monitor_down`.
+            process.cold_mut().monitors.insert(
+                reference_id,
+                crate::proc_create::OriginMonitor::Port {
+                    port_id,
+                    alias_mode,
+                    object: object.clone(),
+                },
+            );
             if let Some(id) = port_id.filter(|id| runtime.ports.lock().unwrap().contains_key(id)) {
                 if tag != atom("DOWN") {
                     // Port monitors carry no tag yet (typed gap, see report).

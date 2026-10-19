@@ -581,6 +581,31 @@ pub(crate) fn exit_for_halt(
     }
 }
 
+/// Queue the forced port exit used when a process exits while linked to a driver port.
+/// Port of erts/emulator/beam/erl_process.c:14068 (`erts_proc_exit_handle_link`) and
+/// erts/emulator/beam/io.c:2212 (`port_sig_exit`), OTP-29.1.1.
+pub(crate) fn exit_for_process_termination(
+    runtime: Arc<crate::process::Runtime>,
+    handle: Arc<PortHandle>,
+    from: Pid,
+    reason: OwnedTerm,
+) {
+    let Some(drv) = handle.driver.get().cloned() else {
+        return;
+    };
+    schedule(&drv, from, move |op| {
+        if op == SigOp::Exec {
+            // Port of erts/emulator/beam/io.c:2187 (`call_deliver_port_exit`),
+            // OTP-29.1.1: the forced exit breaks the exiting process's port link.
+            handle.links.lock().unwrap().remove(&from);
+            let mut heap = ProcessHeap::with_words(64);
+            let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
+            deliver_exit(&runtime, &handle, false, from, reason, None);
+        }
+        REDS_EXIT
+    });
+}
+
 /// Port of erts/emulator/beam/io.c:2434 (erts_port_connect) for `Port ! {From, {connect,
 /// Pid}}` on a loaded driver.
 pub(crate) fn connect(
