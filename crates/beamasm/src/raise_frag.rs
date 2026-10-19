@@ -83,8 +83,10 @@ impl RaiseFragments {
 
         code.bind(raise_exception).map_err(fail)?;
         code.emit(|e| {
-            e.sub_imm(TMP1, Gpr::x(30), 4, false)?;
-            e.str_uoff(TMP1, SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
+            // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp,
+            // OTP-29.1.1: the fake CP makes a catch in the raising frame visible to handle_error.
+            e.str_pre(Gpr::x(30), E, -8)?;
+            e.str_uoff(Gpr::x(30), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
         })
         .map_err(fail)?;
         let update = Update::HEAP_ALLOC.union(Update::X_REGS);

@@ -2,6 +2,7 @@
 
 use super::*;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Symbolic information attached to one executable native code range.
@@ -577,20 +578,11 @@ fn scan_catch(
     None
 }
 
-/// Find a native catch in the raising frame without moving the stack cursor.
-pub(crate) fn current_native_catch(process: &Process, raising_pc: usize) -> Option<LocatedCatch> {
-    let found = locate_catch(process, true)?;
-    if found.traced {
-        return None;
-    }
-    // `raise_exception_shared` places its raising PC in one fake CP. BIF dispatch already
-    // has the active Erlang frame on the stack and does not need that extra word.
-    let fake_cp = process
-        .heap
-        .stack_get(0)
-        .is_some_and(|word| word.tagged_word() as usize == raising_pc);
-    let resume = if fake_cp { arinsal_term::CP_WORDS } else { 0 };
-    (found.resume == resume).then_some(found)
+/// Find the nearest catch without moving the stack cursor; only native handlers resume here.
+// Port of erts/emulator/beam/beam_common.c (`next_catch`), OTP-29.1.1.
+pub(crate) fn next_native_catch(process: &Process) -> Option<LocatedCatch> {
+    let found = locate_catch(process, false)?;
+    (!found.traced && matches!(found.target, CatchTarget::Native(_))).then_some(found)
 }
 
 fn exception_class_atom(class: arinsal_bifs::Class) -> Term {
@@ -1015,6 +1007,11 @@ pub fn run_native(
     // already demands S_RESERVED while the heap is native. A later instruction that really needs
     // heap collects inside the callee, with the callee's continuation word on the stack. Asking
     // for more here collected at resume, one stack word and one collection away from erts.
+    // Port of erts/emulator/beam/erl_process.h (HEAP_LIMIT), OTP-29.1.1: erts allocates below
+    // `E - S_REDZONE`, so native code always finds room to push its continuation. The
+    // interpreter allocates up to the stack pointer; entering native code arms the redzone
+    // first so the check below leaves it free.
+    process.heap.arm_native_redzone();
     process.ensure_entry(0, live)?;
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-261 (emit_i_apply_only),
     // OTP-29.1.1: a call the scheduler performs for native code (fun/apply, BIF traps,
@@ -1181,6 +1178,18 @@ pub fn run_native(
                     &args,
                     failure.error,
                 )
+            }
+            crate::proc_create::NativeBifCall::Registers {
+                module,
+                function,
+                arity,
+            } => {
+                let module = arinsal_term::global_atoms()
+                    .text(module)
+                    .unwrap_or("erlang");
+                let function = arinsal_term::global_atoms().text(function).unwrap_or("+");
+                let args = process.x[..usize::from(arity)].to_vec();
+                exceptions::bif_error(process, module, function, &args, failure.error)
             }
             crate::proc_create::NativeBifCall::Owned {
                 module,

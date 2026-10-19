@@ -1882,18 +1882,19 @@ impl BeamModuleAssembler {
         let fragment = self.arith_fragment(helper as usize, op);
         self.mov_if_needed(ARG2, lhs)?;
         self.mov_if_needed(ARG3, rhs)?;
-        // x30 may hold the caller's return address (leaf code without a prologue); the
-        // fragment call overwrites it, so keep it on the machine stack.
-        self.code.emit(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))?;
         self.code.bl(fragment)?;
-        self.code.emit(|e| e.ldr_post(Gpr::x(30), Gpr::sp(), 16))?;
         let Some(fail) = fail else {
-            self.error_if_nonzero(Gpr::x(9))?;
             return Ok(());
         };
         // Guard context: the failure clears the pending exception and falls to the label.
         let ok = self.code.new_label();
-        self.code.cbz(Gpr::x(9), ok)?;
+        if op & 0xff <= 14 {
+            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp,
+            // OTP-29.1.1: arithmetic BIF helpers return THE_NON_VALUE on failure.
+            self.code.cbnz(Gpr::x(0), ok)?;
+        } else {
+            self.code.cbz(Gpr::x(9), ok)?;
+        }
         self.code.emit(|e| {
             e.str_uoff(Gpr::xzr(), Gpr::x(21), 40)?;
             e.str_uoff(Gpr::xzr(), Gpr::x(21), 48)

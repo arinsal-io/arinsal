@@ -109,8 +109,11 @@ extern "C" fn runtime_arith(
 fn run_binary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), lhs: u64, rhs: u64) -> u64 {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
+        .unwrap();
     emit(&mut asm, runtime_arith);
     asm.emit_raw(|e| {
+        e.ldr_post(Gpr::x(30), Gpr::sp(), 16)?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
     })
@@ -135,8 +138,11 @@ fn run_binary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), lhs: u64
 fn run_unary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), input: u64) -> u64 {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
+        .unwrap();
     emit(&mut asm, runtime_arith);
     asm.emit_raw(|e| {
+        e.ldr_post(Gpr::x(30), Gpr::sp(), 16)?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
     })
@@ -313,6 +319,8 @@ fn guard_arithmetic_emits_fail_label_handling() {
     let code_size = |with_fail_label| {
         let mut asm = BeamModuleAssembler::new();
         asm.emit_i_func_label(1).unwrap();
+        asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
+            .unwrap();
         if with_fail_label {
             asm.emit_i_plus_with_fail(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), 2, runtime_arith)
                 .unwrap();
@@ -430,6 +438,8 @@ fn adjacent_y_registers_subtract_in_address_order() {
     let sub = |left: u32, right: u32, a: i64, b: i64| {
         let mut asm = BeamModuleAssembler::new();
         asm.emit_i_func_label(1).unwrap();
+        asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
+            .unwrap();
         asm.emit_i_minus(
             ArgVal::Y(left),
             ArgVal::Y(right),
@@ -438,6 +448,7 @@ fn adjacent_y_registers_subtract_in_address_order() {
         )
         .unwrap();
         asm.emit_raw(|e| {
+            e.ldr_post(Gpr::x(30), Gpr::sp(), 16)?;
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;
             e.ret(Gpr::x(30))
         })
@@ -481,6 +492,8 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
     let eight = tagged(8).unwrap();
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
+        .unwrap();
     asm.set_arith_types(integer(0, 50), arinsal_beamasm::types::ArgType::ANY);
     asm.emit_i_times(
         ArgVal::X(0),
@@ -490,6 +503,7 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
     )
     .unwrap();
     asm.emit_raw(|e| {
+        e.ldr_post(Gpr::x(30), Gpr::sp(), 16)?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
     })
@@ -514,6 +528,8 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
     let five = tagged(5).unwrap();
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::sp(), -16))
+        .unwrap();
     asm.set_arith_types4([
         integer(0, 20),
         arinsal_beamasm::types::ArgType::ANY,
@@ -530,6 +546,7 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
     )
     .unwrap();
     asm.emit_raw(|e| {
+        e.ldr_post(Gpr::x(30), Gpr::sp(), 16)?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
         e.ret(Gpr::x(30))
     })

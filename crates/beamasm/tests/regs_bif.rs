@@ -137,7 +137,12 @@ fn assert_runtime_state(header: &ProcessHeader) {
 
 fn assert_unpublished_stack(header: &ProcessHeader) {
     assert_eq!(SEEN_HTOP.load(Ordering::Relaxed), header.htop as usize);
-    assert_eq!(SEEN_STOP.load(Ordering::Relaxed), header.stop as usize);
+    // The runtime call fails (the resolver returns 0), and the shared error fragment publishes
+    // E after pushing the fake CP of `raise_exception_shared`.
+    assert_eq!(
+        SEEN_STOP.load(Ordering::Relaxed),
+        header.stop as usize + FRAME_BYTES
+    );
     assert_eq!(SEEN_FCALLS.load(Ordering::Relaxed), header.fcalls as usize);
 }
 
