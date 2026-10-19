@@ -384,14 +384,15 @@ sendfile_reset() ->
     Parent = self(),
     {L, C} = sf_pair([{active, false}],
                      fun(S) ->
-                         %% The reset must not overtake the client's connect completion,
-                         %% which is a port task on a scheduler like the accept.
-                         timer:sleep(50),
+                         %% The reset is sent once the client's connect has completed.
+                         Parent ! {ready, self()},
+                         receive go -> ok end,
                          ok = inet:setopts(S, [{linger, {true, 0}}]),
                          ok = gen_tcp:close(S),
                          Parent ! reset,
                          reset
                      end),
+    receive {ready, Receiver} -> Receiver ! go after 2000 -> exit(no_receiver) end,
     receive reset -> ok after 2000 -> timeout end,
     timer:sleep(100),
     {ok, Fd} = file:open(Path, [raw, read, binary]),
