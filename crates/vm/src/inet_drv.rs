@@ -1910,17 +1910,49 @@ fn ifget_flags(cflags: u32) -> i32 {
     flags
 }
 
+/// Link-layer addresses by interface name, from the `AF_PACKET` rows of getifaddrs (the data
+/// `SIOCGIFHWADDR` returns, six bytes per interface), read through nix's safe wrapper.
+#[cfg(target_os = "linux")]
+fn hw_table() -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
+    nix::ifaddrs::getifaddrs()
+        .map(|rows| {
+            rows.filter_map(|row| {
+                let hw = row.address?.as_link_addr()?.addr()?;
+                Some((row.interface_name.into_bytes(), hw.to_vec()))
+            })
+            .collect()
+        })
+        .unwrap_or_default()
+}
+
+// Port of inet_drv.c (INET_IFOPT_HWADDR with SIOCGIFHWADDR), OTP-29.1.1.
 #[cfg(target_os = "linux")]
 fn hwaddr(name: &[u8]) -> Option<Vec<u8>> {
-    // Port of inet_drv.c (INET_IFOPT_HWADDR with SIOCGIFHWADDR), OTP-29.1.1.
-    let mut hw = Vec::new();
-    ifreq_ioctl(name, libc::SIOCGIFHWADDR, |ifr| {
-        // SAFETY: SIOCGIFHWADDR writes a sockaddr into the ifreq union.
-        let data = unsafe { ifr.ifr_ifru.ifru_hwaddr.sa_data };
-        // IFHWADDRLEN is 6.
-        hw.extend(data[..6].iter().map(|b| b.to_ne_bytes()[0]));
-    })?;
-    Some(hw)
+    hw_table().remove(name)
+}
+
+#[cfg(target_os = "linux")]
+fn link_addr_of(
+    table: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    name: &[u8],
+    _addr: *const libc::sockaddr,
+) -> Option<Vec<u8>> {
+    table.get(name).cloned()
+}
+
+/// macOS reads the `sockaddr_dl` rows themselves, so there is no table.
+#[cfg(target_os = "macos")]
+fn hw_table() -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
+    std::collections::HashMap::new()
+}
+
+#[cfg(target_os = "macos")]
+fn link_addr_of(
+    _table: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    _name: &[u8],
+    addr: *const libc::sockaddr,
+) -> Option<Vec<u8>> {
+    link_addr(addr)
 }
 
 #[cfg(target_os = "macos")]
@@ -1969,14 +2001,6 @@ const AF_HWADDR: i32 = libc::AF_LINK;
 #[cfg(target_os = "linux")]
 const AF_HWADDR: i32 = libc::AF_PACKET;
 
-// Port of inet_drv.c (sockaddr_to_buf, AF_PACKET), OTP-29.1.1.
-#[cfg(target_os = "linux")]
-fn link_addr(addr: *const libc::sockaddr) -> Option<Vec<u8>> {
-    // SAFETY: an AF_PACKET row of getifaddrs is a sockaddr_ll.
-    let sll = unsafe { &*addr.cast::<libc::sockaddr_ll>() };
-    Some(sll.sll_addr[..usize::from(sll.sll_halen).min(8)].to_vec())
-}
-
 #[cfg(target_os = "macos")]
 fn link_addr(addr: *const libc::sockaddr) -> Option<Vec<u8>> {
     // SAFETY: AF_LINK sockaddr_dl begins with the fixed header before sdl_data.
@@ -2009,13 +2033,16 @@ pub(crate) fn getifaddrs_reply() -> Vec<u8> {
         return err_bytes(errno_name(last_errno()));
     }
     let mut out = Vec::new();
+    let hw = hw_table();
     let mut cur = head;
     while !cur.is_null() {
         // SAFETY: cur is a live ifaddrs node from getifaddrs.
         let ifa = unsafe { &*cur };
+        let mut if_name = Vec::new();
         if !ifa.ifa_name.is_null() {
             // SAFETY: ifa_name is a NUL-terminated C string from getifaddrs.
             let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) };
+            if_name = name.to_bytes().to_vec();
             out.extend_from_slice(name.to_bytes());
         }
         out.push(0);
@@ -2037,12 +2064,12 @@ pub(crate) fn getifaddrs_reply() -> Vec<u8> {
                     push_ifaddr(&mut out, IFOPT_BROADADDR, ifa_dstaddr(ifa));
                 }
             } else if family == AF_HWADDR
-                && let Some(hw) = link_addr(ifa.ifa_addr)
-                && hw.len() + 2 > 3
+                && let Some(addr) = link_addr_of(&hw, &if_name, ifa.ifa_addr)
+                && addr.len() + 2 > 3
             {
                 out.push(IFOPT_HWADDR);
-                out.extend_from_slice(&(hw.len() as u16).to_be_bytes());
-                out.extend_from_slice(&hw);
+                out.extend_from_slice(&(addr.len() as u16).to_be_bytes());
+                out.extend_from_slice(&addr);
             }
         }
         out.push(0);
@@ -2053,26 +2080,6 @@ pub(crate) fn getifaddrs_reply() -> Vec<u8> {
     ok_bytes(&out)
 }
 
-/// Byte length of a getifaddrs sockaddr; BSDs carry it in `sa_len`.
-// SAFETY contract: `addr` is non-null.
-#[cfg(target_os = "macos")]
-unsafe fn sockaddr_len(addr: *const libc::sockaddr) -> usize {
-    // SAFETY: addr is non-null per the caller.
-    unsafe { (*addr).sa_len as usize }
-}
-
-#[cfg(not(target_os = "macos"))]
-unsafe fn sockaddr_len(addr: *const libc::sockaddr) -> usize {
-    // SAFETY: addr is non-null per the caller.
-    let family = i32::from(unsafe { (*addr).sa_family });
-    let len = if family == libc::AF_INET6 {
-        std::mem::size_of::<libc::sockaddr_in6>()
-    } else {
-        std::mem::size_of::<libc::sockaddr_in>()
-    };
-    len.min(std::mem::size_of::<libc::sockaddr_storage>())
-}
-
 fn push_ifaddr(out: &mut Vec<u8>, opt: u8, addr: *const libc::sockaddr) {
     // SAFETY: addr is a non-null sockaddr from getifaddrs.
     let storage = unsafe {
@@ -2080,7 +2087,21 @@ fn push_ifaddr(out: &mut Vec<u8>, opt: u8, addr: *const libc::sockaddr) {
         std::ptr::copy_nonoverlapping(
             addr.cast::<u8>(),
             (&mut storage as *mut libc::sockaddr_storage).cast(),
-            sockaddr_len(addr),
+            // BSD sockaddrs carry their length; elsewhere it follows from the family.
+            {
+                #[cfg(target_os = "macos")]
+                {
+                    (*addr).sa_len as usize
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    if i32::from((*addr).sa_family) == libc::AF_INET6 {
+                        std::mem::size_of::<libc::sockaddr_in6>()
+                    } else {
+                        std::mem::size_of::<libc::sockaddr_in>()
+                    }
+                }
+            },
         );
         storage
     };

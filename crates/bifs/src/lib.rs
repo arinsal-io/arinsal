@@ -57,7 +57,10 @@ pub use time::{
     monotonic_time_milliseconds, monotonic_time_nanos, monotonic_time_raw_nanos, next_now_micros,
     time_offset_nanos_value,
 };
-pub use unicode::{UnicodeCont, UnicodeStage, UnicodeStep, unicode_resume};
+pub use unicode::{
+    UnicodeCont, UnicodeStage, UnicodeStep, set_locale_utf8 as unicode_set_locale_utf8,
+    unicode_resume,
+};
 pub use unique::{
     SchedulerRefState, UniqueInt, bind_scheduler_ref_state, debug_make_unique_integer,
     init_unique_scheduler_count, next_ref_words, next_unique_integer,

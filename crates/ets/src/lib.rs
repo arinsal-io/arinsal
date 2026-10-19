@@ -2025,9 +2025,8 @@ impl Table {
     }
 
     /// Return the OTP table allocation total for the runtime's scheduler count.
-    // `sizeof(DbTable)` and the lock structures depend on the platform ABI; the constants
-    // below are OTP 29.1.1 measured on macOS arm64, and Linux aarch64 is smaller by the
-    // amounts in `TABLE_HEADER_SHRINK` / `CATREE_BASE_SHRINK` (measured with ets:info/2).
+    // `sizeof(DbTable)` depends on the platform's pthread mutex size, see
+    // `TABLE_HEADER_SHRINK` / `CATREE_BASE_SHRINK`; the constants below are the macOS values.
     pub fn memory_words_for_schedulers(&self, schedulers: usize) -> usize {
         // Port of erl_db_hash.c:1017 and erl_db_tree.c:560, OTP-29.1.1.
         // OTP's frequent-read rwlocks reserve one cache line per reader group plus
@@ -4725,10 +4724,24 @@ struct TableSlot {
     table: Option<SharedTable>,
 }
 
-/// Words by which a table header is smaller on Linux than on macOS.
-const TABLE_HEADER_SHRINK: usize = if cfg!(target_os = "linux") { 4 } else { 0 };
-/// Further words a CA tree's base node is smaller on Linux.
-const CATREE_BASE_SHRINK: usize = if cfg!(target_os = "linux") { 2 } else { 0 };
+/// `sizeof(pthread_mutex_t)` in words. erts' `ethr_mutex` wraps a pthread mutex, and the
+/// queue lock inside every own-implementation `ethr_rwmutex` is one too (erts/include/
+/// internal/ethr_mutex.h: `ETHR_MTX_QLOCK_TYPE__`, ethread.h: `ETHR_USE_OWN_RWMTX_IMPL__`).
+/// macOS: 64 bytes; glibc aarch64: 48; glibc x86_64: 40.
+const PTHREAD_MUTEX_WORDS: usize = if cfg!(target_os = "macos") {
+    8
+} else if cfg!(target_arch = "aarch64") {
+    6
+} else {
+    5
+};
+/// Words one pthread mutex is smaller than on macOS, where the constants in
+/// `memory_words_for_schedulers` were measured.
+const MUTEX_SHRINK: usize = 8 - PTHREAD_MUTEX_WORDS;
+/// `DbTableCommon` (erl_db_util.h) holds two such locks: `rwlock` and `fixlock`.
+const TABLE_HEADER_SHRINK: usize = 2 * MUTEX_SHRINK;
+/// A CA tree base node (erl_db_catree.h) adds one more: its `erts_rwmtx_t lock`.
+const CATREE_BASE_SHRINK: usize = MUTEX_SHRINK;
 const META_NAME_TAB_BUCKET_COUNT: usize = 8192;
 const META_NAME_TAB_LOCK_COUNT: usize = 256;
 

@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 arinsal-alloc = { path = "../alloc" }
+rustix = { version = "1.1.5", features = ["system"] }
 arinsal-spec.workspace = true
 arinsal-term.workspace = true
 arinsal-etf.workspace = true

@@ -26,13 +26,15 @@ pub fn cpu_info() -> CpuInfo {
 }
 
 /// Highest file descriptor count the poller supports.
-// Port of erts/emulator/sys/common/erl_poll.c (erts_poll_init, max_fds), OTP-29.1.1.
-#[allow(unsafe_code)]
+// Port of erts/emulator/sys/common/erl_poll.c (erts_poll_init, max_fds), OTP-29.1.1:
+// `sysconf(_SC_OPEN_MAX)` is the soft `RLIMIT_NOFILE`.
 pub fn poll_max_fds() -> usize {
-    // SAFETY: sysconf only reads a system limit.
-    let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    use rustix::process::{Resource, getrlimit};
     // macOS 11+ can report "unlimited"; erts then assumes the kernel's per-process cap.
-    usize::try_from(max).unwrap_or(24_576)
+    getrlimit(Resource::Nofile)
+        .current
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(24_576)
 }
 
 /// Default `(schedulers, schedulers_online)` before any `+S` flag.
@@ -55,17 +57,8 @@ pub fn default_schedulers() -> (usize, usize) {
     (total, online)
 }
 
-#[allow(unsafe_code)]
 fn read_cpu_info() -> CpuInfo {
-    // SAFETY: sysconf only reads a system limit.
-    let (configured, online) = unsafe {
-        (
-            libc::sysconf(libc::_SC_NPROCESSORS_CONF),
-            libc::sysconf(libc::_SC_NPROCESSORS_ONLN),
-        )
-    };
-    let configured = usize::try_from(configured).unwrap_or(0);
-    let online = usize::try_from(online).unwrap_or(0).min(configured);
+    let (configured, online) = configured_and_online();
     let mut available = affinity_count();
     // Capped by the online count; zero ("shouldn't happen") also falls back to it.
     if available > online || available == 0 {
@@ -80,19 +73,62 @@ fn read_cpu_info() -> CpuInfo {
     }
 }
 
+/// `(_SC_NPROCESSORS_CONF, _SC_NPROCESSORS_ONLN)`; glibc reads the same sysfs data.
+#[cfg(target_os = "linux")]
+fn configured_and_online() -> (usize, usize) {
+    let configured = std::fs::read_dir("/sys/devices/system/cpu")
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.strip_prefix("cpu"))
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let fallback = std::thread::available_parallelism().map_or(1, usize::from);
+    let configured = if configured == 0 {
+        fallback
+    } else {
+        configured
+    };
+    let online = std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .ok()
+        .and_then(|text| count_cpu_list(text.trim()))
+        .unwrap_or(configured);
+    (configured, online.min(configured))
+}
+
+/// Number of CPUs in a sysfs list such as `0-3,5,7-8`.
+#[cfg(target_os = "linux")]
+fn count_cpu_list(list: &str) -> Option<usize> {
+    let mut count = 0;
+    for part in list.split(',').filter(|part| !part.is_empty()) {
+        count += match part.split_once('-') {
+            Some((from, to)) => to.parse::<usize>().ok()? + 1 - from.parse::<usize>().ok()?,
+            None => {
+                part.parse::<usize>().ok()?;
+                1
+            }
+        };
+    }
+    (count > 0).then_some(count)
+}
+
+/// macOS has no separate configured/online data: `hw.ncpu` for both.
+#[cfg(not(target_os = "linux"))]
+fn configured_and_online() -> (usize, usize) {
+    let count = std::thread::available_parallelism().map_or(1, usize::from);
+    (count, count)
+}
+
 /// Processors in the affinity mask of this process; 0 where the platform has none (macOS).
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
 fn affinity_count() -> usize {
-    // SAFETY: cpu_set_t is plain bytes, so all-zero is valid; sched_getaffinity fills it
-    // for the size passed.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
-            return 0;
-        }
-        usize::try_from(libc::CPU_COUNT(&set)).unwrap_or(0)
-    }
+    rustix::thread::sched_getaffinity(None).map_or(0, |set| set.count() as usize)
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -13,6 +13,7 @@ workspace = true
 crossbeam-queue = "0.3.14"
 libc = "0.2"
 parking_lot = "0.12.5"
+rustix = { version = "1.1.5", features = ["process", "thread"] }
 
 [dev-dependencies]
 proptest.workspace = true

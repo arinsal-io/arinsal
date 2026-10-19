@@ -1270,27 +1270,35 @@ enum FilenameEncoding {
     Utf8Mac,
 }
 
+/// Whether the environment's locale uses a UTF-8 codeset, as the runtime found out at boot
+/// (`erts_init_sys_common_misc`); set once by the VM, which owns the libc locale calls.
+static LOCALE_UTF8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record the locale's codeset; later calls are ignored.
+pub fn set_locale_utf8(utf8: bool) {
+    let _ = LOCALE_UTF8.set(utf8);
+}
+
 /// Port of erts/emulator/sys/common/erl_sys_common_misc.c (erts_init_sys_common_misc),
-/// OTP-29.1.1. The `+fn` flags that override the locale are not honoured.
+/// OTP-29.1.1. The `+fn` flags that override the locale are not honoured. Without a boot
+/// (unit tests) the locale environment variables decide, as erts' `PRIMITIVE_UTF8_CHECK`.
 fn filename_encoding() -> FilenameEncoding {
-    static ENCODING: std::sync::OnceLock<FilenameEncoding> = std::sync::OnceLock::new();
-    *ENCODING.get_or_init(|| {
-        // macOS, Windows and Android default the user-requested encoding to UTF-8.
-        if cfg!(target_os = "macos") {
-            return FilenameEncoding::Utf8Mac;
-        }
-        // SAFETY: setlocale/nl_langinfo return process-owned strings; the empty locale name is
-        // a static C string. erts also switches LC_CTYPE to the environment's locale here.
-        let utf8 = unsafe {
-            !libc::setlocale(libc::LC_CTYPE, c"".as_ptr()).is_null()
-                && std::ffi::CStr::from_ptr(libc::nl_langinfo(libc::CODESET)).to_bytes() == b"UTF-8"
-        };
-        if utf8 {
-            FilenameEncoding::Utf8
-        } else {
-            FilenameEncoding::Latin1
-        }
-    })
+    // macOS, Windows and Android default the user-requested encoding to UTF-8.
+    if cfg!(target_os = "macos") {
+        return FilenameEncoding::Utf8Mac;
+    }
+    let utf8 = LOCALE_UTF8.get().copied().unwrap_or_else(|| {
+        ["LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .find(|value| !value.is_empty())
+            .is_some_and(|value| value.contains("UTF-8"))
+    });
+    if utf8 {
+        FilenameEncoding::Utf8
+    } else {
+        FilenameEncoding::Latin1
+    }
 }
 
 // Port of erts/emulator/beam/erl_unicode.c (file_native_name_encoding_0), OTP-29.1.1.
