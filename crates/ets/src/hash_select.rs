@@ -306,8 +306,8 @@ impl Table {
             HASH_SELECT_ITERATIONS,
             &|| chunk > 0 && held.get() >= chunk,
             &mut |object| {
-                let term = object.term_for_filter(dst)?;
-                if let Some(result) = runner.run(term, dst)? {
+                let (term, size) = object.term_for_filter_with_size(dst)?;
+                if let Some(result) = runner.run_sized(term, dst, size)? {
                     results.push(result);
                     held.set(held.get() + 1);
                 }
