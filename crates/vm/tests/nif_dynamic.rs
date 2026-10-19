@@ -1874,3 +1874,48 @@ fn nif_thread_send_whereis_and_self_match_erts() {
     assert_same(&dir, &erl, "nifthr");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Port of erts/emulator/beam/erl_term.h (erts_write_heap_filler) and beam_common.c
+// (save_stacktrace sizes its block exactly), OTP-29.1.1: a raise whose saved stacktrace
+// outgrew the estimated block left an uninitialized gap in the young heap, which the linear
+// heap scan of the next code purge (`check_process_code`) read as a header ("invalid boxed
+// subtag"). Every cycle raises `nif_error` and purges the module it came from.
+#[test]
+fn raise_stacktrace_block_tail_is_walkable_by_purge_scan() {
+    let dir = work_dir("stacktrace_filler");
+    for (module, source) in [
+        (
+            "nifdyn_filler_raiser",
+            "-module(nifdyn_filler_raiser).\n-export([f/3]).\n\
+             f(_, _, _) -> erlang:nif_error(nif_not_loaded).\n",
+        ),
+        (
+            "nifdyn_filler_run",
+            "-module(nifdyn_filler_run).\n-export([run/0]).\n\
+             run() ->\n\
+                 [begin\n\
+                      try nifdyn_filler_raiser:f(trace_status, self(), {#{}, self(), []})\n\
+                      catch C:_ -> C end,\n\
+                      code:purge(nifdyn_filler_raiser),\n\
+                      code:delete(nifdyn_filler_raiser),\n\
+                      code:purge(nifdyn_filler_raiser)\n\
+                  end || _ <- lists:seq(1, 300)],\n\
+                 ok.\n",
+        ),
+    ] {
+        let path = dir.join(format!("{module}.erl"));
+        std::fs::write(&path, source).unwrap();
+        let status = Command::new("erlc")
+            .arg("-o")
+            .arg(&dir)
+            .arg(&path)
+            .status()
+            .expect("erlc");
+        assert!(status.success(), "erlc {module}");
+    }
+    assert_eq!(
+        scheduled_cli(&dir, "nifdyn_filler_run"),
+        OwnedTerm::atom("ok")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

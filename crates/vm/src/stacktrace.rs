@@ -77,6 +77,16 @@ impl Drop for TraceHeap<'_> {
             && self.heap.used_words() == end
         {
             self.heap.set_heap_top(self.block.wrapping_add(self.used));
+            return;
+        }
+        // Port of erts/emulator/beam/erl_vm.h (HRelease) with erl_term.h (erts_write_heap_filler),
+        // OTP-29.1.1: a tail that cannot be given back (later terms were allocated past it, or
+        // the block is a fragment) becomes one filler object, so linear heap scans such as the
+        // literal-area check step over it instead of reading stale words.
+        let unused = self.capacity - self.used;
+        if !self.block.is_null() {
+            self.heap
+                .write_filler(self.block.wrapping_add(self.used), unused);
         }
     }
 }

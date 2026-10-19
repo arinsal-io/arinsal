@@ -733,6 +733,28 @@ impl ProcessHeap {
         false
     }
 
+    /// Overwrite `words` unused words at `ptr` with one filler object, so a linear scan of the
+    /// heap steps over them. The range must lie in this heap's young area or a fragment.
+    // Port of erts/emulator/beam/erl_term.h (erts_write_heap_filler), OTP-29.1.1.
+    pub fn write_filler(&mut self, ptr: *mut u64, words: usize) {
+        if words == 0 {
+            return;
+        }
+        let first = ptr as usize;
+        let last = first + (words - 1) * 8;
+        let young = self.words.as_ptr() as usize;
+        let in_young = first >= young && last < young + self.words.len() * 8;
+        let in_fragment = self.fragments.iter().any(|fragment| {
+            let start = fragment.as_ptr() as usize;
+            first >= start && last < start + fragment.len() * 8
+        });
+        assert!(
+            in_young || in_fragment || self.detached,
+            "filler outside the heap"
+        );
+        crate::heap::store(ptr, ((words as u64 - 1) << 6) | crate::POS_BIG);
+    }
+
     /// Whether a pointer belongs to this process's initialized heap storage.
     pub fn owns_term(&self, term: Term) -> bool {
         if !term.is_pointer() {
