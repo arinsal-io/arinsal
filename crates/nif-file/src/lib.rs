@@ -886,10 +886,56 @@ fn del_file_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
     unary_path(ctx, a, fs::remove_file)
 }
 fn del_dir_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
-    unary_path(ctx, a, fs::remove_dir)
+    // Port of erts/emulator/nifs/unix/unix_prim_file.c (efile_del_dir), OTP-29.1.1.
+    call(ctx, a, |a| {
+        let path = match path_result(&a[0]) {
+            Ok(path) => path,
+            Err(error) => return Ok(error),
+        };
+        match fs::remove_dir(&path) {
+            Ok(()) => Ok(ok()),
+            Err(error) => {
+                let mut code = error.raw_os_error().unwrap_or(libc::EINVAL);
+                if code == libc::ENOTEMPTY {
+                    code = libc::EEXIST;
+                }
+                if code == libc::EEXIST
+                    && let (Ok(path_stat), Ok(cwd_stat)) = (fs::metadata(&path), fs::metadata("."))
+                    && path_stat.dev() == cwd_stat.dev()
+                    && path_stat.ino() == cwd_stat.ino()
+                {
+                    code = libc::EINVAL;
+                }
+                Ok(posix_code(code))
+            }
+        }
+    })
 }
 fn rename_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
-    binary_path(ctx, a, fs::rename)
+    // Port of erts/emulator/nifs/unix/unix_prim_file.c (efile_rename), OTP-29.1.1.
+    call(ctx, a, |a| {
+        let old_path = match path_result(&a[0]) {
+            Ok(path) => path,
+            Err(error) => return Ok(error),
+        };
+        let new_path = match path_result(&a[1]) {
+            Ok(path) => path,
+            Err(error) => return Ok(error),
+        };
+        match fs::rename(&old_path, &new_path) {
+            Ok(()) => Ok(ok()),
+            Err(error) => {
+                let mut code = error.raw_os_error().unwrap_or(libc::EINVAL);
+                if code == libc::ENOTEMPTY {
+                    code = libc::EEXIST;
+                }
+                if old_path.as_os_str().as_bytes() == b"/" {
+                    code = libc::EINVAL;
+                }
+                Ok(posix_code(code))
+            }
+        }
+    })
 }
 fn make_hard_link_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
     binary_path(ctx, a, fs::hard_link)
