@@ -113,6 +113,9 @@ enum TaskKind {
         size: usize,
         callback: Mutex<Option<SigCallback>>,
     },
+    /// `ERTS_PORT_TASK_DIST_CMD`: the port drains the distribution output queue of its
+    /// connection.
+    DistCmd(Mutex<Option<SigCallback>>),
 }
 
 /// `ErtsPortTask`.
@@ -126,20 +129,22 @@ impl PortTask {
     fn caller(&self) -> u64 {
         match &self.kind {
             TaskKind::ProcSig { caller, .. } => *caller,
-            TaskKind::Timeout(_) | TaskKind::Io { .. } => INVALID_CALLER,
+            TaskKind::Timeout(_) | TaskKind::Io { .. } | TaskKind::DistCmd(_) => INVALID_CALLER,
         }
     }
 
     fn size(&self) -> usize {
         match &self.kind {
             TaskKind::ProcSig { size, .. } => *size,
-            TaskKind::Timeout(_) | TaskKind::Io { .. } => 0,
+            TaskKind::Timeout(_) | TaskKind::Io { .. } | TaskKind::DistCmd(_) => 0,
         }
     }
 
     fn take_callback(&self) -> Option<SigCallback> {
         match &self.kind {
-            TaskKind::ProcSig { callback, .. } => callback.lock().unwrap().take(),
+            TaskKind::ProcSig { callback, .. } | TaskKind::DistCmd(callback) => {
+                callback.lock().unwrap().take()
+            }
             TaskKind::Timeout(_) | TaskKind::Io { .. } => None,
         }
     }
@@ -456,6 +461,24 @@ impl DriverPort {
         }
     }
 
+    /// Queue a distribution command task (`ERTS_PORT_TASK_DIST_CMD`, dist.c
+    /// erts_schedule_dist_command). The callback runs with the port locked on a scheduler;
+    /// it is called in an abort mode when the port closes first.
+    pub fn schedule_dist_cmd(self: &Arc<Self>, callback: SigCallback) {
+        let task = Arc::new(PortTask {
+            state: AtomicU32::new(STATE_SCHEDULED),
+            flags: 0,
+            kind: TaskKind::DistCmd(Mutex::new(Some(callback))),
+        });
+        match self.enqueue_task(&task, false) {
+            Ok(act) => self.activate(act),
+            Err(_) => {
+                task.state.store(STATE_ABORTED, Ordering::Release);
+                self.abort_signal_task(&task, SigOp::Abort, false);
+            }
+        }
+    }
+
     /// Queue a timeout task (`ERTS_PORT_TASK_TIMEOUT`).
     pub(crate) fn schedule_timeout(self: &Arc<Self>, epoch: u64) {
         let task = Arc::new(PortTask {
@@ -682,7 +705,7 @@ impl DriverPort {
             if !task.claim(STATE_EXECUTING) {
                 continue;
             }
-            if let TaskKind::ProcSig { .. } = task.kind {
+            if let TaskKind::ProcSig { .. } | TaskKind::DistCmd(_) = task.kind {
                 self.abort_signal_task(task, SigOp::AbortClosed, bpq);
             }
         }
@@ -944,6 +967,12 @@ fn execute(port: &DriverPort) -> PortExecution {
             TaskKind::Timeout(epoch) => (port.run_timeout_task(*epoch), Some("timeout")),
             // The I/O callback reports its own long schedule (select.rs run_io).
             TaskKind::Io { fd, dir, reg } => (crate::select::ready(port, *fd, *dir, *reg), None),
+            TaskKind::DistCmd(_) => {
+                let reds = task
+                    .take_callback()
+                    .map_or(0, |callback| callback(SigOp::Exec));
+                (reds, Some("dist_cmd"))
+            }
             TaskKind::ProcSig { size, .. } => {
                 let reds = task
                     .take_callback()

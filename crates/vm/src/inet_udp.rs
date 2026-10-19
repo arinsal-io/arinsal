@@ -21,7 +21,7 @@ use crate::port::PortHandle;
 use crate::process::Message;
 use arinsal_drv::{ControlReply, DriverPort, NativeDriver};
 use arinsal_sched::Pid;
-use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
+use arinsal_term::{ProcessHeap, Term, TermBuilder};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -93,8 +93,8 @@ const F_OPEN: u32 = 0x0001;
 const F_ACTIVE: u32 = 0x0004;
 const INFINITY: u32 = 0xffff_ffff;
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("udp atom"))
+fn atom(name: &'static str) -> Term {
+    crate::atom_cache::atom(name)
 }
 
 /// `driver_flags` of `udp_inet_driver_entry`: `ERL_DRV_FLAG_USE_PORT_LOCKING`.
@@ -1810,7 +1810,7 @@ fn message_async(heap: &mut ProcessHeap, port: Term, aref: u16, status: Term) ->
         .ok()
 }
 
-fn error_tuple(heap: &mut ProcessHeap, reason: &str) -> Option<Term> {
+fn error_tuple(heap: &mut ProcessHeap, reason: &'static str) -> Option<Term> {
     TermBuilder::new(heap)
         .tuple(&[atom("error"), atom(reason)])
         .ok()

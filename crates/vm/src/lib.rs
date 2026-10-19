@@ -1,5 +1,6 @@
 //! Single-process BEAM interpreter for OTP 29 generic bytecode.
 mod arith;
+mod atom_cache;
 mod beamasm_integration;
 mod bif_traps;
 mod fun_dispatch;

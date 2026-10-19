@@ -19,7 +19,7 @@ use arinsal_packet::{
 };
 use arinsal_sched::Pid;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -140,7 +140,11 @@ const F_CON: u32 = 0x0010;
 const F_ACC: u32 = 0x0020;
 const F_BUSY: u32 = 0x0080;
 
-fn atom(name: &str) -> Term {
+fn atom(name: &'static str) -> Term {
+    crate::atom_cache::atom(name)
+}
+
+fn atom_dyn(name: &str) -> Term {
     Term::atom(global_atoms().intern(name).expect("inet atom"))
 }
 
@@ -226,6 +230,13 @@ impl NativeDriver for TcpInet {
 
     // Port of inet_drv.c (inet_stop_select): the descriptor closes with its `SockFd`.
     fn stop_select(&self, _fd: i32) {}
+
+    // Port of inet_drv.c (tcp_inet_process_exit).
+    fn process_exit(&self, port: &DriverPort, monitor: u64) {
+        if let Some((sock, _handle)) = sock_of(port) {
+            acceptor_exited(&sock, monitor);
+        }
+    }
 }
 
 /// Bring selection, port timer and busy state in line with the socket after a callback.
@@ -1009,6 +1020,7 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
         } else {
             inner.phase = Phase::Connecting;
             inner.connect = Some(Waiter {
+                monitor: None,
                 caller,
                 aref,
                 deadline: deadline(timeout),
@@ -1049,57 +1061,38 @@ fn accept_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8]) 
                     },
                 );
             } else {
+                // Port of inet_drv.c (INET_REQ_ACCEPT: driver_monitor_process on the caller).
+                let monitor = inner
+                    .port
+                    .upgrade()
+                    .and_then(|port| port.monitor(caller.data()));
                 inner.accept_q.push_back(Waiter {
                     caller,
                     aref,
                     deadline: deadline(timeout),
+                    monitor,
                 });
                 inner.pending.push((caller, aref));
-                monitor_acceptor(sock, caller);
             }
             Accept::Reply(ok_bytes(&aref.to_be_bytes()))
         }
     }
 }
 
-/// Processes with an accept pending, by pid: the driver monitors them
-/// (`driver_monitor_process`) so a dying acceptor leaves the accept queue.
-fn acceptors() -> &'static Mutex<HashMap<Pid, Vec<Weak<Sock>>>> {
-    static ACCEPTORS: OnceLock<Mutex<HashMap<Pid, Vec<Weak<Sock>>>>> = OnceLock::new();
-    ACCEPTORS.get_or_init(Default::default)
-}
-
-// Port of inet_drv.c (tcp_inet_ctl INET_REQ_ACCEPT: driver_monitor_process), OTP-29.1.1.
-fn monitor_acceptor(sock: &Arc<Sock>, caller: Pid) {
-    if let Some(runtime) = sock.runtime.upgrade() {
-        // The exit hook only runs for processes carrying the ports flag.
-        let _ = runtime.publish_proc_flag(caller, arinsal_sched::proc_flags::PORTS);
+/// A monitored acceptor exited: its accept leaves the queue.
+// Port of inet_drv.c (tcp_inet_process_exit), OTP-29.1.1.
+fn acceptor_exited(sock: &Arc<Sock>, monitor: u64) {
+    {
+        let mut inner = sock.inner.lock().unwrap();
+        let (gone, keep): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut inner.accept_q)
+            .into_iter()
+            .partition(|waiter| waiter.monitor == Some(monitor));
+        inner.accept_q = keep;
+        for waiter in &gone {
+            drop_pending(&mut inner, waiter.caller, waiter.aref);
+        }
     }
-    let mut map = acceptors().lock().unwrap();
-    let entry = map.entry(caller).or_default();
-    entry.retain(|weak| weak.strong_count() > 0);
-    entry.push(Arc::downgrade(sock));
-}
-
-/// A monitored process exited.
-// Port of inet_drv.c (tcp_inet_process_exit), OTP-29.1.1: its accepts are dequeued and a
-// listener left without any goes back from accepting to listening.
-pub(crate) fn acceptor_exited(pid: Pid) {
-    let socks = acceptors().lock().unwrap().remove(&pid).unwrap_or_default();
-    for sock in socks.iter().filter_map(Weak::upgrade) {
-        let Some(port) = sock.port() else {
-            continue;
-        };
-        // A port signal: it takes effect between the port's tasks.
-        port.serialized(|| {
-            {
-                let mut inner = sock.inner.lock().unwrap();
-                inner.accept_q.retain(|waiter| waiter.caller != pid);
-                inner.pending.retain(|(caller, _)| *caller != pid);
-            }
-            settle(&sock);
-        });
-    }
+    settle(sock);
 }
 
 fn try_accept(inner: &Inner) -> Option<Result<OwnedFd, i32>> {
@@ -3101,6 +3094,15 @@ struct Waiter {
     caller: Pid,
     aref: u16,
     deadline: Option<Instant>,
+    /// `driver_monitor_process` of an accepting process (`ar->mon`).
+    monitor: Option<u64>,
+}
+
+/// `driver_demonitor_process` once an accept no longer waits.
+fn demonitor_waiter(inner: &Inner, waiter: &Waiter) {
+    if let (Some(monitor), Some(port)) = (waiter.monitor, inner.port.upgrade()) {
+        port.demonitor(monitor);
+    }
 }
 
 struct Recv {
@@ -4019,7 +4021,7 @@ fn message_async(heap: &mut ProcessHeap, port: Term, aref: u16, status: Term) ->
         .ok()
 }
 
-fn error_tuple(heap: &mut ProcessHeap, reason: &str) -> Option<Term> {
+fn error_tuple(heap: &mut ProcessHeap, reason: &'static str) -> Option<Term> {
     TermBuilder::new(heap)
         .tuple(&[atom("error"), atom(reason)])
         .ok()
@@ -4078,7 +4080,7 @@ fn http_value(heap: &mut ProcessHeap, packet: &HttpPacket, binary: bool) -> Opti
             minor,
         } => {
             let method = if *known_method {
-                atom(std::str::from_utf8(method).unwrap_or("GET"))
+                atom_dyn(std::str::from_utf8(method).unwrap_or("GET"))
             } else {
                 bytes_term(heap, method, binary)?
             };
@@ -4920,6 +4922,7 @@ fn pull_accept(sock: &Arc<Sock>) {
                     let mut inner = sock.inner.lock().unwrap();
                     inner.accept_q.pop_front().inspect(|waiter| {
                         drop_pending(&mut inner, waiter.caller, waiter.aref);
+                        demonitor_waiter(&inner, waiter);
                     })
                 };
                 if let Some(waiter) = waiter {
@@ -4931,6 +4934,7 @@ fn pull_accept(sock: &Arc<Sock>) {
                     let mut inner = sock.inner.lock().unwrap();
                     inner.accept_q.pop_front().inspect(|waiter| {
                         drop_pending(&mut inner, waiter.caller, waiter.aref);
+                        demonitor_waiter(&inner, waiter);
                     })
                 };
                 if let Some(waiter) = waiter {
@@ -5189,6 +5193,7 @@ fn expire(sock: &Arc<Sock>) {
         while let Some(waiter) = inner.accept_q.pop_front() {
             if waiter.deadline.is_some_and(|at| at <= now) {
                 drop_pending(&mut inner, waiter.caller, waiter.aref);
+                demonitor_waiter(&inner, &waiter);
                 due.push((waiter.caller, waiter.aref));
             } else {
                 keep.push_back(waiter);

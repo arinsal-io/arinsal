@@ -122,9 +122,4 @@ impl DriverPort {
     pub fn demonitor(&self, monitor: u64) {
         self.demonitor_process(&crate::ErlDrvMonitor::new(monitor));
     }
-
-    /// The process (table data) behind `monitor` while its `process_exit` runs.
-    pub fn monitored_pid(&self, monitor: u64) -> Option<u64> {
-        self.monitors.lock().unwrap().get(&monitor).copied()
-    }
 }
