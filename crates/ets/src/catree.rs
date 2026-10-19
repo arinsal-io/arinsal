@@ -1,6 +1,7 @@
 //! Safe contention-adapting ordered storage built from the ETS AVL tree.
 
 use super::{EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, cmp};
+use crate::rwmtx::{RwMtxLock, RwMtxReadGuard, RwMtxWriteGuard};
 use crate::tree::Node;
 use arc_swap::ArcSwap;
 use arinsal_term::{TermBuilder, VecHeap};
@@ -8,7 +9,7 @@ use std::cmp::Ordering;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicIsize, AtomicUsize, Ordering as AtomicOrdering,
 };
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 const LOCK_FAILURE_CONTRIBUTION: i64 = 250;
 const LOCK_SUCCESS_CONTRIBUTION: i64 = -1;
@@ -21,47 +22,60 @@ const LOW_NO_CONTRIBUTION_LIMIT: i64 = -20_000;
 const HIGH_NO_CONTRIBUTION_LIMIT: i64 = 20_000;
 
 struct BaseNode {
-    root: RwLock<Option<Box<Node>>>,
+    root: RwMtxLock<Option<Box<Node>>>,
     lock_statistics: AtomicI64,
     is_valid: AtomicBool,
 }
 
 impl BaseNode {
-    fn new(root: Option<Box<Node>>) -> Arc<Self> {
+    // Port of erts/emulator/beam/erl_db_catree.c (create_base_node: the lock is a
+    // frequent-read rwmutex when the table has DB_FREQ_READ), OTP-29.1.1.
+    fn new(root: Option<Box<Node>>, frequent_read: bool) -> Arc<Self> {
         Arc::new(Self {
-            root: RwLock::new(root),
+            root: if frequent_read {
+                RwMtxLock::new_freq_read(root)
+            } else {
+                RwMtxLock::new(root)
+            },
             lock_statistics: AtomicI64::new(0),
             is_valid: AtomicBool::new(true),
         })
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (wlock_base_node), OTP-29.1.1.
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Option<Box<Node>>> {
+    fn write(&self) -> RwMtxWriteGuard<'_, Option<Box<Node>>> {
         match self.root.try_write() {
-            Ok(guard) => {
+            Some(guard) => {
                 // Port of erts/emulator/beam/erl_db_catree.c (wlock_base_node), OTP-29.1.1.
                 // OTP subtracts the negative success contribution, so an uncontended write adds one.
                 self.adjust_stat(-LOCK_SUCCESS_CONTRIBUTION);
                 guard
             }
-            Err(_) => {
+            None => {
                 self.adjust_stat(LOCK_FAILURE_CONTRIBUTION);
-                self.root.write().expect("CA-tree base lock poisoned")
+                self.root.write()
             }
         }
     }
 
-    fn write_no_stats(&self) -> std::sync::RwLockWriteGuard<'_, Option<Box<Node>>> {
-        self.root.write().expect("CA-tree base lock poisoned")
+    fn write_no_stats(&self) -> RwMtxWriteGuard<'_, Option<Box<Node>>> {
+        self.root.write()
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (rlock_base_node), OTP-29.1.1.
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<Box<Node>>> {
-        match self.root.try_read() {
-            Ok(guard) => guard,
-            Err(_) => {
+    fn read(&self) -> RwMtxReadGuard<'_, Option<Box<Node>>> {
+        self.read_at(arinsal_term::current_reader_group())
+    }
+
+    /// Port of erts/emulator/beam/erl_db_catree.c (rlock_base_node), OTP-29.1.1, in reader
+    /// group `group`.
+    #[inline]
+    fn read_at(&self, group: usize) -> RwMtxReadGuard<'_, Option<Box<Node>>> {
+        match self.root.try_read_at(group) {
+            Some(guard) => guard,
+            None => {
                 self.adjust_stat(LOCK_FAILURE_CONTRIBUTION);
-                self.root.read().expect("CA-tree base lock poisoned")
+                self.root.read_at(group)
             }
         }
     }
@@ -176,6 +190,8 @@ impl std::ops::Deref for RouteSnapshot {
 /// Ordered ETS storage whose AVL leaves split and join as lock contention changes.
 pub(crate) struct CATree {
     keypos: usize,
+    /// The table has DB_FREQ_READ: its base-node locks are frequent-read rwmutexes.
+    frequent_read: bool,
     routes: ArcSwap<RouteSnapshot>,
     adaptation: Mutex<()>,
     split_count: AtomicUsize,
@@ -189,12 +205,13 @@ pub(crate) struct CATree {
 
 impl CATree {
     /// Port of erts/emulator/beam/erl_db_catree.c (db_initialize_catree), OTP-29.1.1.
-    pub(crate) fn new(keypos: usize) -> Self {
+    pub(crate) fn new(keypos: usize, frequent_read: bool) -> Self {
         Self {
             keypos,
+            frequent_read,
             routes: ArcSwap::from_pointee(RouteSnapshot::new(vec![RouteEntry {
                 first_key: None,
-                base: BaseNode::new(None),
+                base: BaseNode::new(None, frequent_read),
             }])),
             adaptation: Mutex::new(()),
             split_count: AtomicUsize::new(0),
@@ -370,17 +387,17 @@ impl CATree {
         }
     }
 
-    /// Copy the one ordered object for a key without allocating a result vector.
-    // Port of erts/emulator/beam/erl_db_catree.c (db_get_catree), OTP-29.1.1.
-    pub(crate) fn lookup_one<H: HeapAlloc>(
+    /// `lookup_one` in reader group `group`.
+    pub(crate) fn lookup_one_at<H: HeapAlloc>(
         &self,
         key: Term,
+        group: usize,
         dst: &mut H,
     ) -> Result<Option<Term>, EtsError> {
         loop {
             let routes = self.routes.load();
             let base = routes.find_base(key);
-            let root = base.read();
+            let root = base.read_at(group);
             if !base.is_valid.load(AtomicOrdering::Acquire) {
                 drop(root);
                 drop(routes);
@@ -398,10 +415,15 @@ impl CATree {
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_member_catree), OTP-29.1.1.
     pub(crate) fn member(&self, key: Term) -> bool {
+        self.member_at(key, arinsal_term::current_reader_group())
+    }
+
+    /// `member` in reader group `group`.
+    pub(crate) fn member_at(&self, key: Term, group: usize) -> bool {
         loop {
             let routes = self.routes.load();
             let base = routes.find_base(key);
-            let root = base.read();
+            let root = base.read_at(group);
             if !base.is_valid.load(AtomicOrdering::Acquire) {
                 drop(root);
                 drop(routes);
@@ -415,19 +437,18 @@ impl CATree {
         }
     }
 
-    /// Copy one object element while holding the base read lock.
-    ///
-    /// Port of erts/emulator/beam/erl_db_catree.c (`db_get_element_catree`), OTP-29.1.1.
-    pub(crate) fn lookup_element<H: HeapAlloc>(
+    /// `lookup_element` in reader group `group`.
+    pub(crate) fn lookup_element_at<H: HeapAlloc>(
         &self,
         key: Term,
         index: usize,
+        group: usize,
         dst: &mut H,
     ) -> Result<Term, EtsError> {
         loop {
             let routes = self.routes.load();
             let base = routes.find_base(key);
-            let root = base.read();
+            let root = base.read_at(group);
             if !base.is_valid.load(AtomicOrdering::Acquire) {
                 drop(root);
                 drop(routes);
@@ -526,13 +547,7 @@ impl CATree {
         let mut roots = Vec::new();
         for route in routes.iter() {
             route.base.is_valid.store(false, AtomicOrdering::Release);
-            if let Some(root) = route
-                .base
-                .root
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
+            if let Some(root) = route.base.root.write().take() {
                 roots.push(root);
             }
         }
@@ -540,7 +555,7 @@ impl CATree {
         self.routes
             .store(Arc::new(RouteSnapshot::new(vec![RouteEntry {
                 first_key: None,
-                base: BaseNode::new(None),
+                base: BaseNode::new(None, self.frequent_read),
             }])));
         roots
     }
@@ -557,7 +572,7 @@ impl CATree {
     // db_calc_stats_catree / db_select_catree), OTP-29.1.1.
     fn with_all_bases<R>(
         &self,
-        visit: impl FnOnce(&[std::sync::RwLockReadGuard<'_, Option<Box<Node>>>]) -> R,
+        visit: impl FnOnce(&[RwMtxReadGuard<'_, Option<Box<Node>>>]) -> R,
     ) -> R {
         loop {
             let routes = self.routes.load_full();
@@ -838,8 +853,8 @@ impl CATree {
             key_object(first_right_key).expect("copying a route key succeeds"),
         ));
         base.lock_statistics.store(0, AtomicOrdering::Relaxed);
-        let left_base = BaseNode::new(Some(left_root));
-        let right_base = BaseNode::new(right_root);
+        let left_base = BaseNode::new(Some(left_root), self.frequent_read);
+        let right_base = BaseNode::new(right_root, self.frequent_read);
         let mut updated = routes.entries.clone();
         updated[index] = RouteEntry {
             first_key: routes[index].first_key.clone(),
@@ -873,11 +888,11 @@ impl CATree {
         let left_index = right_index - 1;
         let left = Arc::clone(&routes[left_index].base);
         let right = Arc::clone(&routes[right_index].base);
-        let Ok(mut left_root) = left.root.try_write() else {
+        let Some(mut left_root) = left.root.try_write() else {
             base.lock_statistics.store(0, AtomicOrdering::Relaxed);
             return;
         };
-        let Ok(mut right_root) = right.root.try_write() else {
+        let Some(mut right_root) = right.root.try_write() else {
             base.lock_statistics.store(0, AtomicOrdering::Relaxed);
             return;
         };
@@ -895,7 +910,7 @@ impl CATree {
         // Keeping the old route entries installed makes operations on these two
         // bases retry while readers of unrelated bases remain independent.
         let merged_root = Node::join_ordered(left_tree, right_tree);
-        let joined = BaseNode::new(merged_root);
+        let joined = BaseNode::new(merged_root, self.frequent_read);
         let mut updated = routes.entries.clone();
         updated[left_index].base = Arc::clone(&joined);
         updated.remove(right_index);
@@ -964,7 +979,7 @@ impl CATree {
         if (LOW_CONTENTION_LIMIT..=HIGH_CONTENTION_LIMIT).contains(&stat) {
             return;
         }
-        let Ok(root) = base.root.try_write() else {
+        let Some(root) = base.root.try_write() else {
             return;
         };
         if !base.is_valid.load(AtomicOrdering::Acquire) {

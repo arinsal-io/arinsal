@@ -16,9 +16,9 @@ use tree::Node;
 pub use tree_select::{SavedKey, ScanPosition, TREE_SELECT_ITERATIONS, TreeScanEnd, TreeScanPlan};
 
 use arinsal_term::{
-    Atom, ExternalBinary, FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, HeapAlloc,
-    Identity, MagicRef, Node as TermNode, Term, TermBuilder, TermError, TermKind, VecHeap,
-    WritableBinary, cmp, copy_term, exact_eq, global_atoms, internal_hash, term_sequence,
+    Atom, ExternalBinary, HeapAlloc, Identity, MagicRef, Node as TermNode, Term, TermBuilder,
+    TermError, TermKind, VecHeap, WritableBinary, cmp, copy_term, exact_eq, global_atoms,
+    internal_hash, term_sequence,
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -2001,7 +2001,7 @@ impl Table {
             if options.write_concurrency == WriteConcurrency::Disabled {
                 Storage::Ordered(None)
             } else {
-                Storage::CATree(CATree::new(options.keypos))
+                Storage::CATree(CATree::new(options.keypos, options.read_concurrency))
             }
         } else {
             Storage::Hash(HashStorage::new(
@@ -2647,7 +2647,11 @@ impl Table {
     /// Look up one already prepared key without copying the object.
     // Port of erts/emulator/beam/erl_db.c (ets_insert_new_2_dbterm_list_has_member), OTP-29.1.1.
     pub fn member_prepared(&self, prepared: &PreparedObject) -> bool {
-        self.member_hashed(prepared.stored.key(self.options.keypos), prepared.hash)
+        self.member_hashed(
+            prepared.stored.key(self.options.keypos),
+            prepared.hash,
+            arinsal_term::current_reader_group(),
+        )
     }
 
     /// Insert a prepared object if its key has no live entry, under its hash stripe.
@@ -2899,9 +2903,13 @@ impl Table {
     // Port of erts/emulator/beam/erl_db.c (ets_insert_new_2_dbterm_list_has_member),
     // OTP-29.1.1.
     pub fn any_member_prepared(&self, prepared: &[PreparedObject]) -> bool {
-        prepared
-            .iter()
-            .any(|object| self.member_hashed(object.stored.key(self.options.keypos), object.hash))
+        prepared.iter().any(|object| {
+            self.member_hashed(
+                object.stored.key(self.options.keypos),
+                object.hash,
+                arinsal_term::current_reader_group(),
+            )
+        })
     }
 
     /// Insert prepared objects in order while `loops` lasts.
@@ -3081,16 +3089,28 @@ impl Table {
     // OTP-29.1.1: the bucket chain is walked in order and every match is consed in front of
     // the result, which is the reversed chain order `lookup` returns.
     pub fn lookup_list<H: HeapAlloc>(&self, key: Term, dst: &mut H) -> Result<Term, EtsError> {
+        self.lookup_list_at(key, arinsal_term::current_reader_group(), dst)
+    }
+
+    /// `lookup_list` in reader group `group`, the scheduler id of the caller.
+    pub fn lookup_list_at<H: HeapAlloc>(
+        &self,
+        key: Term,
+        group: usize,
+        dst: &mut H,
+    ) -> Result<Term, EtsError> {
         match &self.storage {
-            Storage::Ordered(_) | Storage::CATree(_) => Ok(match self.lookup_one(key, dst)? {
-                Some(object) => TermBuilder::new(dst)
-                    .cons(object, Term::NIL)
-                    .map_err(EtsError::Term)?,
-                None => Term::NIL,
-            }),
+            Storage::Ordered(_) | Storage::CATree(_) => {
+                Ok(match self.lookup_one_at(key, group, dst)? {
+                    Some(object) => TermBuilder::new(dst)
+                        .cons(object, Term::NIL)
+                        .map_err(EtsError::Term)?,
+                    None => Term::NIL,
+                })
+            }
             Storage::Hash(storage) => {
                 let hash = ets_hash(key);
-                storage.with_objects_hash(hash, |objects| {
+                storage.with_objects_hash_at(hash, group, |objects| {
                     let mut list = Term::NIL;
                     for object in objects {
                         if object.hvalue == (hash >> 1)
@@ -3114,14 +3134,24 @@ impl Table {
         key: Term,
         dst: &mut H,
     ) -> Result<Option<Term>, EtsError> {
+        self.lookup_one_at(key, arinsal_term::current_reader_group(), dst)
+    }
+
+    /// `lookup_one` in reader group `group`.
+    pub fn lookup_one_at<H: HeapAlloc>(
+        &self,
+        key: Term,
+        group: usize,
+        dst: &mut H,
+    ) -> Result<Option<Term>, EtsError> {
         match &self.storage {
             Storage::Ordered(root) => Node::get(root, key, self.options.keypos)
                 .map(|object| object.copy_out(dst))
                 .transpose(),
-            Storage::CATree(tree) => tree.lookup_one(key, dst),
+            Storage::CATree(tree) => tree.lookup_one_at(key, group, dst),
             Storage::Hash(storage) => {
                 let hash = ets_hash(key);
-                storage.with_objects_hash(hash, |mut objects| {
+                storage.with_objects_hash_at(hash, group, |mut objects| {
                     objects
                         .find(|object| {
                             object.hvalue == (hash >> 1)
@@ -3179,18 +3209,23 @@ impl Table {
 
     /// Check whether a key is present.
     pub fn member(&self, key: Term) -> bool {
-        self.member_hashed(key, ets_hash(key))
+        self.member_at(key, arinsal_term::current_reader_group())
     }
 
-    fn member_hashed(&self, key: Term, hash: u64) -> bool {
+    /// `member` in reader group `group`, the scheduler id of the caller.
+    pub fn member_at(&self, key: Term, group: usize) -> bool {
+        self.member_hashed(key, ets_hash(key), group)
+    }
+
+    fn member_hashed(&self, key: Term, hash: u64, group: usize) -> bool {
         match &self.storage {
             Storage::Ordered(root) => Node::get(root, key, self.options.keypos).is_some(),
-            Storage::Hash(storage) => storage.with_objects_hash(hash, |objects| {
+            Storage::Hash(storage) => storage.with_objects_hash_at(hash, group, |objects| {
                 objects.into_iter().any(|object| {
                     object.hvalue == (hash >> 1) && exact_eq(object.key(self.options.keypos), key)
                 })
             }),
-            Storage::CATree(tree) => tree.member(key),
+            Storage::CATree(tree) => tree.member_at(key, group),
         }
     }
 
@@ -3233,6 +3268,17 @@ impl Table {
         position: usize,
         dst: &mut H,
     ) -> Result<Term, EtsError> {
+        self.lookup_element_list_at(key, position, arinsal_term::current_reader_group(), dst)
+    }
+
+    /// `lookup_element_list` in reader group `group`.
+    pub fn lookup_element_list_at<H: HeapAlloc>(
+        &self,
+        key: Term,
+        position: usize,
+        group: usize,
+        dst: &mut H,
+    ) -> Result<Term, EtsError> {
         if position == 0 {
             return Err(EtsError::BadArg);
         }
@@ -3243,7 +3289,7 @@ impl Table {
         let hash = ets_hash(key);
         let mut list = Term::NIL;
         let mut found = false;
-        storage.with_objects_hash(hash, |objects| {
+        storage.with_objects_hash_at(hash, group, |objects| {
             for object in objects {
                 if object.hvalue == (hash >> 1) && exact_eq(object.key(self.options.keypos), key) {
                     found = true;
@@ -3270,13 +3316,24 @@ impl Table {
         position: usize,
         dst: &mut H,
     ) -> Result<Term, EtsError> {
+        self.lookup_element_one_at(key, position, arinsal_term::current_reader_group(), dst)
+    }
+
+    /// `lookup_element_one` in reader group `group`.
+    pub fn lookup_element_one_at<H: HeapAlloc>(
+        &self,
+        key: Term,
+        position: usize,
+        group: usize,
+        dst: &mut H,
+    ) -> Result<Term, EtsError> {
         if position == 0 {
             return Err(EtsError::BadArg);
         }
         match &self.storage {
             Storage::Hash(storage) => {
                 let hash = ets_hash(key);
-                storage.with_objects_hash(hash, |mut objects| {
+                storage.with_objects_hash_at(hash, group, |mut objects| {
                     objects
                         .find(|object| {
                             object.hvalue == hash >> 1
@@ -3289,7 +3346,7 @@ impl Table {
             Storage::Ordered(root) => Node::get(root, key, self.options.keypos)
                 .ok_or(EtsError::BadArgCause("badkey"))?
                 .copy_element_out(position - 1, dst),
-            Storage::CATree(tree) => tree.lookup_element(key, position - 1, dst),
+            Storage::CATree(tree) => tree.lookup_element_at(key, position - 1, group, dst),
         }
     }
 
@@ -5072,7 +5129,7 @@ impl std::ops::Deref for SharedTable {
 /// Port of erts/emulator/beam/erl_db.c (`db_init_lock`) and :446-500 (`db_lock`),
 /// OTP-29.1.1.
 pub struct TableLock {
-    lock: TableRwLock<Table>,
+    lock: rwmtx::RwMtxLock<Table>,
     busy: Arc<std::sync::atomic::AtomicBool>,
     tid: Tid,
     /// The options the table was created with, readable without taking the table lock. The
@@ -5081,53 +5138,11 @@ pub struct TableLock {
     creation: TableOptions,
 }
 
-enum TableRwLock<T> {
-    Normal(rwmtx::RwMtxLock<T>),
-    FrequentRead(FrequentReadRwLock<T>),
-}
-
 /// Shared access to a live table.
-pub enum TableReadGuard<'a, T> {
-    Normal(rwmtx::RwMtxReadGuard<'a, T>),
-    FrequentRead(FrequentReadGuard<'a, T>),
-}
-
-impl<T> std::ops::Deref for TableReadGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Normal(guard) => guard,
-            Self::FrequentRead(guard) => guard,
-        }
-    }
-}
+pub type TableReadGuard<'a, T> = rwmtx::RwMtxReadGuard<'a, T>;
 
 /// Exclusive access to a live table.
-pub enum TableWriteGuard<'a, T> {
-    Normal(rwmtx::RwMtxWriteGuard<'a, T>),
-    FrequentRead(FrequentWriteGuard<'a, T>),
-}
-
-impl<T> std::ops::Deref for TableWriteGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Normal(guard) => guard,
-            Self::FrequentRead(guard) => guard,
-        }
-    }
-}
-
-impl<T> std::ops::DerefMut for TableWriteGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Normal(guard) => guard,
-            Self::FrequentRead(guard) => guard,
-        }
-    }
-}
+pub type TableWriteGuard<'a, T> = rwmtx::RwMtxWriteGuard<'a, T>;
 
 impl TableLock {
     /// The creation options (see the field note for which of them may be stale).
@@ -5147,27 +5162,27 @@ impl TableLock {
             tid: table.tid,
             creation: table.options,
             lock: if frequent_read {
-                TableRwLock::FrequentRead(FrequentReadRwLock::new(table))
+                rwmtx::RwMtxLock::new_freq_read(table)
             } else {
-                TableRwLock::Normal(rwmtx::RwMtxLock::new(table))
+                rwmtx::RwMtxLock::new(table)
             },
         }
     }
 
-    /// Lock the table for reading.
+    /// Lock the table for reading, in the calling thread's reader group.
     pub fn read(&self) -> TableReadGuard<'_, Table> {
-        match &self.lock {
-            TableRwLock::Normal(lock) => TableReadGuard::Normal(lock.read()),
-            TableRwLock::FrequentRead(lock) => TableReadGuard::FrequentRead(lock.read()),
-        }
+        self.lock.read()
+    }
+
+    /// Lock the table for reading in reader group `group`, the scheduler id of the caller.
+    #[inline]
+    pub fn read_at(&self, group: usize) -> TableReadGuard<'_, Table> {
+        self.lock.read_at(group)
     }
 
     /// Lock the table for writing.
     pub fn write(&self) -> TableWriteGuard<'_, Table> {
-        match &self.lock {
-            TableRwLock::Normal(lock) => TableWriteGuard::Normal(lock.write()),
-            TableRwLock::FrequentRead(lock) => TableWriteGuard::FrequentRead(lock.write()),
-        }
+        self.lock.write()
     }
 }
 
@@ -5696,7 +5711,7 @@ impl ConcurrentTable {
             multi_epoch: AtomicU64::new(0),
             concurrent_catree: (options.table_type == TableType::OrderedSet
                 && options.write_concurrency != WriteConcurrency::Disabled)
-                .then(|| CATree::new(options.keypos)),
+                .then(|| CATree::new(options.keypos, options.read_concurrency)),
             concurrent_hash: (options.table_type != TableType::OrderedSet)
                 .then(|| ConcurrentHashStorage::new(options.write_concurrency)),
             _heir_data: heir_data,
@@ -6003,7 +6018,7 @@ impl ConcurrentTable {
             {
                 return true;
             }
-            table.member_hashed(key, ets_hash(key))
+            table.member_hashed(key, ets_hash(key), arinsal_term::current_reader_group())
         }
     }
 

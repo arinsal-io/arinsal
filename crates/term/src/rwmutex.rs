@@ -33,6 +33,17 @@ pub fn set_reader_groups(no_reader_groups: usize) {
     READER_GROUPS_ARRAY_SIZE.store(size.min(READER_SLOTS), Ordering::Release);
 }
 
+/// `reader_groups_array_size`: how many reader indicators a frequent-read lock keeps.
+pub fn reader_group_slots() -> usize {
+    reader_groups_array_size()
+}
+
+/// The reader group of the calling thread: its scheduler id, or a slot assigned to the thread
+/// when it is not a scheduler.
+pub fn current_reader_group() -> usize {
+    reader_index()
+}
+
 fn reader_groups_array_size() -> usize {
     READER_GROUPS_ARRAY_SIZE.load(Ordering::Acquire)
 }

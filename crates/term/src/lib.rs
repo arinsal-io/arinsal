@@ -94,8 +94,8 @@ pub use region::{
     SEND_COPY_LIMIT_WORDS, SharedRoot, is_region_term, region_owner, seal_for_send,
 };
 pub use rwmutex::{
-    FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, is_scheduler_thread,
-    set_reader_group, set_reader_groups,
+    FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, current_reader_group,
+    is_scheduler_thread, reader_group_slots, set_reader_group, set_reader_groups,
 };
 pub use views::{BigRef, FlatMapRef, FloatRef, ListIter};
 

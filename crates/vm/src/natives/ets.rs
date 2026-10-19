@@ -702,6 +702,15 @@ fn read_allowed(table: &arinsal_ets::Table, pid: arinsal_sched::Pid) -> bool {
     }
 }
 
+/// The reader group of the calling scheduler: `erts_get_scheduler_id() - 1`.
+#[inline]
+fn reader_group(process: &Process) -> usize {
+    match process.scheduler_id {
+        0 => arinsal_term::current_reader_group(),
+        id => id as usize - 1,
+    }
+}
+
 fn direct_caller(process: &Process) -> Option<Term> {
     process.self_pid?.to_term()
 }
@@ -765,8 +774,9 @@ fn lookup_args_member(
 fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let pid = process.self_pid?;
     let key = args[1];
+    let group = reader_group(process);
     with_cached_table(process, args[0], |shared, _options, process| {
-        let table = shared.read();
+        let table = shared.read_at(group);
         if table.is_detached() || table.is_busy() || !read_allowed(&table, pid) {
             return None;
         }
@@ -774,7 +784,7 @@ fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
         // Port of erts/emulator/beam/erl_db_hash.c (db_get_hash) and
         // erl_db_tree.c (db_get_tree), OTP-29.1.1: a set holds at most one object,
         // consed straight onto the process heap.
-        table.lookup_list(key, &mut heap).ok()
+        table.lookup_list_at(key, group, &mut heap).ok()
     })
 }
 
@@ -798,12 +808,13 @@ fn direct_member(
 fn direct_member_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let pid = process.self_pid?;
     let key = args[1];
+    let group = reader_group(process);
     with_cached_table(process, args[0], |shared, _options, _| {
-        let table = shared.read();
+        let table = shared.read_at(group);
         if table.is_detached() || table.is_busy() || !read_allowed(&table, pid) {
             return None;
         }
-        Some(boolean_term(table.member(key)))
+        Some(boolean_term(table.member_at(key, group)))
     })
 }
 
@@ -829,8 +840,9 @@ fn direct_lookup_element_hit(process: &mut Process, args: &[Term]) -> Option<Ter
     }
     let pid = process.self_pid?;
     let (key, position) = (args[1], usize::try_from(args[2].as_small()?).ok()?);
+    let group = reader_group(process);
     with_cached_table(process, args[0], |shared, _, process| {
-        let table = shared.read();
+        let table = shared.read_at(group);
         if table.is_detached()
             || table.is_busy()
             || !read_allowed(&table, pid)
@@ -842,7 +854,9 @@ fn direct_lookup_element_hit(process: &mut Process, args: &[Term]) -> Option<Ter
             return None;
         }
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        table.lookup_element_one(key, position, &mut heap).ok()
+        table
+            .lookup_element_one_at(key, position, group, &mut heap)
+            .ok()
     })
 }
 
@@ -853,22 +867,23 @@ fn direct_lookup_element_cached(
     function: arinsal_term::Atom,
 ) -> Option<Term> {
     let caller = direct_caller(process)?;
+    let group = reader_group(process);
     let (target, key, position, default) = (args[0], args[1], args[2], args.get(3).copied());
     let result = if target.is_magic_ref() {
         with_cached_table(process, target, |shared, _, process| {
-            let table = shared.read();
+            let table = shared.read_at(group);
             if table.is_detached() || table.is_busy() {
                 return None;
             }
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             Some(lookup_element_locked(
-                &table, caller, key, position, default, &mut heap,
+                &table, group, caller, key, position, default, &mut heap,
             ))
         })
     } else if let Some(name) = target.as_atom() {
         let rt = process.runtime.as_ref()?;
         match rt.named_ets.with_table(name, |shared| {
-            let table = shared.read();
+            let table = shared.read_at(group);
             if table.is_detached() || !table.options.named_table || table.options.name != name {
                 return Some(Err(badarg_cause("id")));
             }
@@ -877,7 +892,7 @@ fn direct_lookup_element_cached(
             }
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             Some(lookup_element_locked(
-                &table, caller, key, position, default, &mut heap,
+                &table, group, caller, key, position, default, &mut heap,
             ))
         }) {
             Some(result) => result,
@@ -946,17 +961,18 @@ fn direct_delete_cached(
     function: arinsal_term::Atom,
 ) -> Option<Term> {
     let caller = direct_caller(process)?;
+    let group = reader_group(process);
     let target = args[0];
     let key = args[1];
     let result = if target.is_magic_ref() {
         with_cached_table(process, target, |shared, options, _| {
-            direct_delete_from_shared(shared, options, caller, key, None)
+            direct_delete_from_shared(shared, group, options, caller, key, None)
         })
     } else if let Some(name) = target.as_atom() {
         let rt = process.runtime.as_ref()?;
         rt.named_ets
             .with_table(name, |shared| {
-                direct_delete_from_shared(shared, &shared.options(), caller, key, Some(name))
+                direct_delete_from_shared(shared, group, &shared.options(), caller, key, Some(name))
             })
             .flatten()
     } else {
@@ -967,13 +983,14 @@ fn direct_delete_cached(
 
 fn direct_delete_from_shared(
     shared: &arinsal_ets::TableLock,
+    group: usize,
     options: &TableOptions,
     caller: Term,
     key: Term,
     name: Option<arinsal_term::Atom>,
 ) -> Option<Term> {
     if options.write_concurrency != WriteConcurrency::Disabled {
-        let table = shared.read();
+        let table = shared.read_at(group);
         if table.is_detached()
             || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
             || table.is_busy()
@@ -1017,11 +1034,12 @@ fn direct_insert_one_cached(
         return None;
     }
     let caller = direct_caller(process)?;
+    let group = reader_group(process);
     let object = args[1];
     let target = args[0];
     if target.is_magic_ref() {
         with_cached_table(process, target, |shared, options, _| {
-            direct_insert_one_from_shared(shared, options, caller, None, object, insert_new)
+            direct_insert_one_from_shared(shared, group, options, caller, None, object, insert_new)
         })
     } else if let Some(name) = target.as_atom() {
         let rt = process.runtime.as_ref()?;
@@ -1029,6 +1047,7 @@ fn direct_insert_one_cached(
             .with_table(name, |shared| {
                 direct_insert_one_from_shared(
                     shared,
+                    group,
                     &shared.options(),
                     caller,
                     Some(name),
@@ -1045,6 +1064,7 @@ fn direct_insert_one_cached(
 // Port of erts/emulator/beam/erl_db.c and erl_db_hash.c, OTP-29.1.1.
 fn direct_insert_one_from_shared(
     shared: &arinsal_ets::TableLock,
+    group: usize,
     options: &TableOptions,
     caller: Term,
     name: Option<arinsal_term::Atom>,
@@ -1052,7 +1072,7 @@ fn direct_insert_one_from_shared(
     insert_new: bool,
 ) -> Option<Term> {
     if options.write_concurrency != WriteConcurrency::Disabled {
-        let table = shared.read();
+        let table = shared.read_at(group);
         if table.is_detached()
             || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
             || table.is_busy()
@@ -1111,11 +1131,13 @@ fn direct_update_counter_cached(
     function: arinsal_term::Atom,
 ) -> Option<Term> {
     let caller = direct_caller(process)?;
+    let group = reader_group(process);
     let target = args[0];
     let result = if target.is_magic_ref() {
         with_cached_table(process, target, |shared, options, process| {
             direct_update_counter_from_shared(
                 shared,
+                group,
                 options,
                 caller,
                 None,
@@ -1128,6 +1150,7 @@ fn direct_update_counter_cached(
         match rt.named_ets.with_table(name, |shared| {
             direct_update_counter_from_shared(
                 shared,
+                group,
                 &shared.options(),
                 caller,
                 Some(name),
@@ -1146,6 +1169,7 @@ fn direct_update_counter_cached(
 
 fn direct_update_counter_from_shared(
     shared: &arinsal_ets::TableLock,
+    group: usize,
     options: &TableOptions,
     caller: Term,
     name: Option<arinsal_term::Atom>,
@@ -1153,7 +1177,7 @@ fn direct_update_counter_from_shared(
     heap: &mut arinsal_term::ProcessHeap,
 ) -> Option<Result<Term, VmError>> {
     if options.write_concurrency != WriteConcurrency::Disabled {
-        let table = shared.read();
+        let table = shared.read_at(group);
         if table.is_detached()
             || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
             || table.is_busy()
@@ -1537,12 +1561,13 @@ fn lookup_args(
     target: Term,
     key: Term,
 ) -> Result<Term, VmError> {
+    let group = reader_group(process);
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     if let Some(name) = target.as_atom() {
         // Port of erts/emulator/beam/erl_db.c (db_get_table_aux), OTP-29.1.1.
         // Keep the atom-hashed snapshot alive across the table lock instead of cloning its Arc.
         let lookup = rt.named_ets.with_table(name, |shared| {
-            let table = shared.read();
+            let table = shared.read_at(group);
             if table.is_detached() || !table.options.named_table || table.options.name != name {
                 return Err(badarg_cause("id"));
             }
@@ -1553,10 +1578,10 @@ fn lookup_args(
                 return Err(badarg_cause("access"));
             }
             if member {
-                return Ok(boolean_term(table.member(key)));
+                return Ok(boolean_term(table.member_at(key, group)));
             }
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            table.lookup_list(key, &mut heap).map_err(err)
+            table.lookup_list_at(key, group, &mut heap).map_err(err)
         });
         return lookup.unwrap_or_else(|| Err(badarg_cause("id")));
     }
@@ -1577,6 +1602,7 @@ fn lookup_args(
 
 fn lookup_element_locked(
     table: &arinsal_ets::Table,
+    group: usize,
     caller: Term,
     key: Term,
     position: Term,
@@ -1596,11 +1622,15 @@ fn lookup_element_locked(
             TableType::Bag | TableType::DuplicateBag
         )
     {
-        return table.lookup_element_one(key, position, heap).map_err(err);
+        return table
+            .lookup_element_one_at(key, position, group, heap)
+            .map_err(err);
     }
     let Some(default) = default else {
         // Bag and duplicate_bag: the list is consed on the heap without an intermediate vector.
-        return table.lookup_element_list(key, position, heap).map_err(err);
+        return table
+            .lookup_element_list_at(key, position, group, heap)
+            .map_err(err);
     };
     let values = match table
         .lookup_element_default(key, position, default, heap)
@@ -3323,6 +3353,7 @@ fn call_inner(
             let table = registry.get_shared(tid).map_err(err)?;
             lookup_element_locked(
                 &table,
+                arinsal_term::current_reader_group(),
                 caller,
                 *key,
                 *position,
