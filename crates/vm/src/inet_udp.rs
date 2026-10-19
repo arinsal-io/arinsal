@@ -60,7 +60,12 @@ const OPT_DONTROUTE: u8 = 2;
 const OPT_BROADCAST: u8 = 4;
 const OPT_SNDBUF: u8 = 6;
 const OPT_RCVBUF: u8 = 7;
+const OPT_PRIORITY: u8 = 8;
 const OPT_TOS: u8 = 9;
+const OPT_REUSEPORT_LB: u8 = 18;
+const OPT_EXCLUSIVEADDRUSE: u8 = 19;
+const OPT_MSGQ_HIGH: u8 = 36;
+const OPT_MSGQ_LOW: u8 = 37;
 const OPT_MULTICAST_IF: u8 = 11;
 const OPT_MULTICAST_TTL: u8 = 12;
 const OPT_MULTICAST_LOOP: u8 = 13;
@@ -548,6 +553,29 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
         OPT_DONTROUTE => sock_bool(inner, libc::SOL_SOCKET, libc::SO_DONTROUTE, val != 0),
         OPT_BROADCAST => sock_bool(inner, libc::SOL_SOCKET, libc::SO_BROADCAST, val != 0),
         OPT_REUSEPORT => sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, val != 0),
+        // Port of inet_drv.c (inet_set_opts): load balancing is SO_REUSEPORT on Linux and
+        // absent elsewhere; SO_PRIORITY and SO_EXCLUSIVEADDRUSE likewise.
+        #[cfg(target_os = "linux")]
+        OPT_REUSEPORT_LB => sock_bool(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, val != 0),
+        #[cfg(not(target_os = "linux"))]
+        OPT_REUSEPORT_LB => true,
+        OPT_EXCLUSIVEADDRUSE => true,
+        #[cfg(target_os = "linux")]
+        OPT_PRIORITY => sock_int(inner, libc::SOL_SOCKET, libc::SO_PRIORITY, val),
+        #[cfg(not(target_os = "linux"))]
+        OPT_PRIORITY => true,
+        OPT_MSGQ_HIGH | OPT_MSGQ_LOW => {
+            // Port of inet_drv.c:7071 (ERL_DRV_BUSY_MSGQ_LIM_MIN/MAX).
+            if val < 1 {
+                return false;
+            }
+            if code == OPT_MSGQ_HIGH {
+                inner.msgq_high = val;
+            } else {
+                inner.msgq_low = val;
+            }
+            true
+        }
         OPT_SNDBUF => sock_int(inner, libc::SOL_SOCKET, libc::SO_SNDBUF, val),
         OPT_RCVBUF => {
             if !inner.buffer_set {
@@ -865,6 +893,23 @@ fn push_opt(inner: &Inner, code: u8, out: &mut Vec<u8>) -> bool {
             out,
             sock_get_int(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, 0),
         ),
+        #[cfg(target_os = "linux")]
+        OPT_REUSEPORT_LB => put_i32(
+            out,
+            sock_get_int(inner, libc::SOL_SOCKET, libc::SO_REUSEPORT, 0),
+        ),
+        #[cfg(not(target_os = "linux"))]
+        OPT_REUSEPORT_LB => put_i32(out, 0),
+        OPT_EXCLUSIVEADDRUSE => put_i32(out, 0),
+        #[cfg(target_os = "linux")]
+        OPT_PRIORITY => put_i32(
+            out,
+            sock_get_int(inner, libc::SOL_SOCKET, libc::SO_PRIORITY, 0),
+        ),
+        #[cfg(not(target_os = "linux"))]
+        OPT_PRIORITY => put_i32(out, 0),
+        OPT_MSGQ_HIGH => put_i32(out, inner.msgq_high),
+        OPT_MSGQ_LOW => put_i32(out, inner.msgq_low),
         OPT_SNDBUF => put_i32(
             out,
             sock_get_int(inner, libc::SOL_SOCKET, libc::SO_SNDBUF, 0),
@@ -1942,6 +1987,8 @@ struct Inner {
     exit_on_close: bool,
     packet_size: u32,
     read_packets: i32,
+    msgq_high: i32,
+    msgq_low: i32,
     tos: i32,
     tclass: i32,
     ttl: i32,
@@ -1988,6 +2035,8 @@ impl Default for Inner {
             exit_on_close: true,
             packet_size: 0,
             read_packets: 5,
+            msgq_high: 8192,
+            msgq_low: 4096,
             tos: 0,
             tclass: 0,
             ttl: 0,
