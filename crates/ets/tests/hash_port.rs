@@ -286,3 +286,42 @@ fn lookup_list_matches_lookup_order() {
         }
     }
 }
+
+#[test]
+fn lookup_element_list_matches_lookup_element_order() {
+    for table_type in [TableType::Bag, TableType::DuplicateBag] {
+        let mut registry = Registry::new();
+        let tid = registry
+            .create(options(table_type, WriteConcurrency::Disabled))
+            .unwrap();
+        let mut heap = VecHeap::new();
+        for (key, value) in [(1, 10), (1, 11), (1, 10), (2, 20), (1, 12)] {
+            let item = object(&mut heap, key, value);
+            registry.get_mut(tid).unwrap().insert(&[item]).unwrap();
+        }
+        let table = registry.get(tid).unwrap();
+        let mut out = VecHeap::new();
+        let key = Term::small(1).unwrap();
+        let expected: Vec<_> = table
+            .lookup_element(key, 2, &mut out)
+            .unwrap()
+            .into_iter()
+            .map(|t| to_owned(t).unwrap())
+            .collect();
+        let list = table.lookup_element_list(key, 2, &mut out).unwrap();
+        assert_eq!(
+            to_owned(list).unwrap(),
+            OwnedTerm::List {
+                elems: expected,
+                tail: Box::new(OwnedTerm::Nil)
+            },
+            "{table_type:?}"
+        );
+        assert!(
+            table
+                .lookup_element_list(Term::small(9).unwrap(), 2, &mut out)
+                .is_err()
+        );
+        assert!(table.lookup_element_list(key, 0, &mut out).is_err());
+    }
+}

@@ -3208,6 +3208,45 @@ impl Table {
         Ok(found)
     }
 
+    /// Copy the element at `position` of every object at a key as an ETS result list, consing
+    /// straight onto the caller's heap.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_get_element_array), OTP-29.1.1: the bucket
+    // chain is walked in order and each element is consed in front, which is the reversed chain
+    // order `lookup_element` returns for bags.
+    pub fn lookup_element_list<H: HeapAlloc>(
+        &self,
+        key: Term,
+        position: usize,
+        dst: &mut H,
+    ) -> Result<Term, EtsError> {
+        if position == 0 {
+            return Err(EtsError::BadArg);
+        }
+        let Storage::Hash(storage) = &self.storage else {
+            let values = self.lookup_element(key, position, dst)?;
+            return Ok(TermBuilder::new(dst).list_from_iter(values)?);
+        };
+        let hash = ets_hash(key);
+        let mut list = Term::NIL;
+        let mut found = false;
+        storage.with_objects_hash(hash, |objects| {
+            for object in objects {
+                if object.hvalue == (hash >> 1) && exact_eq(object.key(self.options.keypos), key) {
+                    found = true;
+                    let element = object.copy_element_out(position - 1, dst)?;
+                    list = TermBuilder::new(dst).cons(element, list)?;
+                }
+            }
+            Ok::<_, EtsError>(())
+        })?;
+        if found {
+            Ok(list)
+        } else {
+            // Port of erts/emulator/beam/erl_db.c (DB_ERROR_BADKEY), OTP-29.1.1.
+            Err(EtsError::BadArgCause("badkey"))
+        }
+    }
+
     /// Copy one element from a set-like table without building an object list.
     ///
     /// Port of erts/emulator/beam/erl_db.c, OTP-29.1.1.
