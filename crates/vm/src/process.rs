@@ -4977,7 +4977,12 @@ impl Process {
                     // (send_ets_transfer_message), OTP-29.1.1.
                     let tab = match name {
                         Some(name) => Ok(Term::atom(name)),
-                        None => tid.to_term(&mut heap),
+                        None => runtime
+                            .ets
+                            .read()
+                            .unwrap()
+                            .tid_term(tid, &mut heap)
+                            .map_err(|_| arinsal_term::TermError::BadArg),
                     };
                     let message_term = tab.and_then(|tab| {
                         let from = ctx.pid().to_term().ok_or(arinsal_term::TermError::BadArg)?;

@@ -2578,24 +2578,17 @@ fn internal_state_set(
             return Ok(atom(if previous { "true" } else { "false" }));
         }
         Some("ets_force_split" | "ets_debug_random_split_join") => {
-            let Ok(owned) = to_owned(value) else {
+            let Some([table, on]) = super::ets::tuple_items(value)
+                .as_deref()
+                .and_then(|items| <&[Term; 2]>::try_from(items).ok().copied())
+            else {
                 return Err(badarg());
             };
-            let OwnedTerm::Tuple(parts) = &owned else {
+            let Some(tid) = arinsal_ets::Tid::from_term(table) else {
                 return Err(badarg());
             };
-            let [OwnedTerm::Ref { ids, .. }, on] = parts.as_slice() else {
-                return Err(badarg());
-            };
-            let Some(&[tag, low, high]) = ids.get(..3) else {
-                return Err(badarg());
-            };
-            if tag != 0x4554_5329 {
-                return Err(badarg());
-            }
-            let tid = arinsal_ets::Tid(u64::from(low) | (u64::from(high) << 32));
             let random = arg_name(selector).as_deref() == Some("ets_debug_random_split_join");
-            let enabled = matches!(on, OwnedTerm::Atom(name) if name == "true");
+            let enabled = on == atom("true");
             let changed = process.runtime.as_ref().is_some_and(|runtime| {
                 runtime
                     .ets

@@ -608,10 +608,10 @@ fn table_memory_counter_tracks_concurrent_writes_like_otp() {
         settings.write_concurrency = WriteConcurrency::Enabled;
         let mut registry = Registry::new();
         let tid = registry.create(settings).unwrap();
-        let shared = std::sync::Arc::clone(registry.shared(tid).unwrap());
+        let shared = registry.shared(tid).unwrap().clone();
         std::thread::scope(|scope| {
             for worker in 0..WORKERS {
-                let shared = std::sync::Arc::clone(&shared);
+                let shared = shared.clone();
                 scope.spawn(move || {
                     for offset in 1..=PER_WORKER {
                         let key = worker * PER_WORKER + offset;

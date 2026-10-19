@@ -370,7 +370,7 @@ fn live_table_terms<H: HeapAlloc>(
             if table.options.named_table {
                 Ok(Term::atom(table.options.name))
             } else {
-                tid.to_term(heap).map_err(|_| badarg())
+                registry.tid_term(tid, heap).map_err(err)
             }
         })
         .collect()
@@ -487,7 +487,7 @@ fn default_object(
 }
 
 /// The elements of a tuple argument.
-fn tuple_items(term: Term) -> Option<Vec<Term>> {
+pub(crate) fn tuple_items(term: Term) -> Option<Vec<Term>> {
     // SAFETY: BIF arguments are rooted in the caller's process heap.
     let tuple = unsafe { term.tuple_ref() }?;
     Some(tuple.iter().collect())
@@ -706,54 +706,23 @@ fn direct_caller(process: &Process) -> Option<Term> {
     process.self_pid?.to_term()
 }
 
-/// Runtime, table identity, lock handle and creation options of a cached table.
-type CachedTable = (usize, Tid, arinsal_ets::SharedTable, TableOptions);
-
-thread_local! {
-    /// Per-scheduler handles of recently used tables, keyed by runtime and table identity, so
-    /// a call takes no registry lock: erts reaches a table through its lock-free
-    /// `meta_main_tab` (erl_db.c db_get_table_aux). A deleted table is caught by its
-    /// `detached` flag under the table lock.
-    static TABLE_CACHE: std::cell::RefCell<[Option<CachedTable>; 32]> =
-        const { std::cell::RefCell::new([const { None }; 32]) };
-}
-
-/// Run `body` on the locked-table handle of a table reference, `None` for anything but a
-/// live unnamed table (named tables take the scheduler path).
+/// Run `body` on the table a tid reference points at: `None` for anything but the reference
+/// of a table (named tables take the name-table path). The reference thing leads to the
+/// magic binary that owns the table, so no cache, hash or reference count is involved.
+// Port of erts/emulator/beam/erl_db.c (db_get_table_aux): `erts_magic_ref2bin` and the
+// destructor check, then `ERTS_MAGIC_BIN_DATA`, OTP-29.1.1.
+#[inline(always)]
 fn with_cached_table<R>(
     process: &mut Process,
     target: Term,
-    body: impl FnOnce(&arinsal_ets::SharedTable, &TableOptions, &mut Process) -> Option<R>,
+    body: impl FnOnce(&arinsal_ets::TableLock, &TableOptions, &mut Process) -> Option<R>,
 ) -> Option<R> {
-    let tid = Tid::from_term(target)?;
-    with_cached_tid(process, tid, body)
-}
-
-fn with_cached_tid<R>(
-    process: &mut Process,
-    tid: Tid,
-    body: impl FnOnce(&arinsal_ets::SharedTable, &TableOptions, &mut Process) -> Option<R>,
-) -> Option<R> {
-    let rt_id = std::sync::Arc::as_ptr(process.runtime.as_ref()?) as usize;
-    let slot = (tid.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 59) as usize;
-    TABLE_CACHE.with(|cache| {
-        {
-            let cache = cache.borrow();
-            if let Some((cached_rt, cached, shared, options)) = cache[slot].as_ref()
-                && *cached_rt == rt_id
-                && *cached == tid
-            {
-                return body(shared, options, process);
-            }
-        }
-        let rt = process.runtime.as_ref()?;
-        let shared = rt.ets.read().unwrap().shared(tid).ok()?.clone();
-        let options = shared.options();
-        cache.borrow_mut()[slot] = Some((rt_id, tid, shared, options));
-        let cache = cache.borrow();
-        let (_, _, shared, options) = cache[slot].as_ref()?;
-        body(shared, options, process)
-    })
+    target
+        .with_magic_payload::<arinsal_ets::TableLock, _>(|lock| {
+            let options = lock.options();
+            body(lock, &options, process)
+        })
+        .flatten()
 }
 
 fn direct_lookup(
@@ -762,8 +731,8 @@ fn direct_lookup(
     module: arinsal_term::Atom,
     function: arinsal_term::Atom,
 ) -> Option<Term> {
-    if let Some(tid) = Tid::from_term(args[0]) {
-        direct_lookup_cached(process, args, tid)
+    if args[0].is_magic_ref() {
+        direct_lookup_cached(process, args)
             .or_else(|| direct_plain(process, args, module, function, lookup_args_member))
     } else {
         direct_plain(process, args, module, function, lookup_args_member)
@@ -793,10 +762,10 @@ fn lookup_args_member(
     lookup_args(process, caller, false, target, key)
 }
 
-fn direct_lookup_cached(process: &mut Process, args: &[Term], tid: Tid) -> Option<Term> {
+fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let pid = process.self_pid?;
     let key = args[1];
-    with_cached_tid(process, tid, |shared, _options, process| {
+    with_cached_table(process, args[0], |shared, _options, process| {
         let table = shared.read();
         if table.is_detached() || table.is_busy() || !read_allowed(&table, pid) {
             return None;
@@ -859,9 +828,8 @@ fn direct_lookup_element_hit(process: &mut Process, args: &[Term]) -> Option<Ter
         return None;
     }
     let pid = process.self_pid?;
-    let tid = Tid::from_term(args[0])?;
     let (key, position) = (args[1], usize::try_from(args[2].as_small()?).ok()?);
-    with_cached_tid(process, tid, |shared, _, process| {
+    with_cached_table(process, args[0], |shared, _, process| {
         let table = shared.read();
         if table.is_detached()
             || table.is_busy()
@@ -886,8 +854,8 @@ fn direct_lookup_element_cached(
 ) -> Option<Term> {
     let caller = direct_caller(process)?;
     let (target, key, position, default) = (args[0], args[1], args[2], args.get(3).copied());
-    let result = if let Some(tid) = Tid::from_term(target) {
-        with_cached_tid(process, tid, |shared, _, process| {
+    let result = if target.is_magic_ref() {
+        with_cached_table(process, target, |shared, _, process| {
             let table = shared.read();
             if table.is_detached() || table.is_busy() {
                 return None;
@@ -980,8 +948,8 @@ fn direct_delete_cached(
     let caller = direct_caller(process)?;
     let target = args[0];
     let key = args[1];
-    let result = if let Some(tid) = Tid::from_term(target) {
-        with_cached_tid(process, tid, |shared, options, _| {
+    let result = if target.is_magic_ref() {
+        with_cached_table(process, target, |shared, options, _| {
             direct_delete_from_shared(shared, options, caller, key, None)
         })
     } else if let Some(name) = target.as_atom() {
@@ -998,7 +966,7 @@ fn direct_delete_cached(
 }
 
 fn direct_delete_from_shared(
-    shared: &arinsal_ets::SharedTable,
+    shared: &arinsal_ets::TableLock,
     options: &TableOptions,
     caller: Term,
     key: Term,
@@ -1051,8 +1019,8 @@ fn direct_insert_one_cached(
     let caller = direct_caller(process)?;
     let object = args[1];
     let target = args[0];
-    if let Some(tid) = Tid::from_term(target) {
-        with_cached_tid(process, tid, |shared, options, _| {
+    if target.is_magic_ref() {
+        with_cached_table(process, target, |shared, options, _| {
             direct_insert_one_from_shared(shared, options, caller, None, object, insert_new)
         })
     } else if let Some(name) = target.as_atom() {
@@ -1076,7 +1044,7 @@ fn direct_insert_one_cached(
 
 // Port of erts/emulator/beam/erl_db.c and erl_db_hash.c, OTP-29.1.1.
 fn direct_insert_one_from_shared(
-    shared: &arinsal_ets::SharedTable,
+    shared: &arinsal_ets::TableLock,
     options: &TableOptions,
     caller: Term,
     name: Option<arinsal_term::Atom>,
@@ -1144,8 +1112,8 @@ fn direct_update_counter_cached(
 ) -> Option<Term> {
     let caller = direct_caller(process)?;
     let target = args[0];
-    let result = if let Some(tid) = Tid::from_term(target) {
-        with_cached_tid(process, tid, |shared, options, process| {
+    let result = if target.is_magic_ref() {
+        with_cached_table(process, target, |shared, options, process| {
             direct_update_counter_from_shared(
                 shared,
                 options,
@@ -1177,7 +1145,7 @@ fn direct_update_counter_cached(
 }
 
 fn direct_update_counter_from_shared(
-    shared: &arinsal_ets::SharedTable,
+    shared: &arinsal_ets::TableLock,
     options: &TableOptions,
     caller: Term,
     name: Option<arinsal_term::Atom>,
@@ -1276,7 +1244,7 @@ fn insert_args(
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
-    let shared = std::sync::Arc::clone(registry.shared(tid).map_err(err)?);
+    let shared = registry.shared(tid).map_err(err)?.clone();
     let options = shared.options();
     if single
         && options.write_concurrency != WriteConcurrency::Disabled
@@ -1370,7 +1338,7 @@ fn insert_list(
     }
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
-    let shared = std::sync::Arc::clone(registry.shared(tid).map_err(err)?);
+    let shared = registry.shared(tid).map_err(err)?.clone();
     let options = shared.options();
     // Keep the table alive by its shared handle. Holding the registry lock while waiting for a
     // table writer prevents ets:delete/1 from detaching the table, unlike erts' btid reference.
@@ -2455,9 +2423,15 @@ fn hash_select(
     } else if !hash || nothing_visited {
         atom("$end_of_table")
     } else {
+        let tid_term = rt
+            .ets
+            .read()
+            .unwrap()
+            .tid_term(tid, &mut heap)
+            .map_err(err)?;
         select_chunk::hash_loop_ended(
             &mut heap,
-            tid,
+            tid_term,
             &program_owner,
             chunk,
             values,
@@ -2502,10 +2476,19 @@ fn reverse_trap(
             let list = TermBuilder::new(&mut heap)
                 .list_from_iter(values)
                 .map_err(|_| badarg())?;
+            let tid_term = process
+                .runtime
+                .as_ref()
+                .ok_or_else(badarg)?
+                .ets
+                .read()
+                .unwrap()
+                .tid_term(state.tid, &mut heap)
+                .map_err(err)?;
             let continuation = match (&state.position, eot) {
                 (arinsal_ets::ScanPosition::After(key), false) => select_chunk::tree_continuation(
                     &mut heap,
-                    state.tid,
+                    tid_term,
                     &state.program_owner,
                     state.chunk,
                     state.backwards,
@@ -2774,14 +2757,14 @@ fn call_inner(
             if registry.get(tid).map_err(err)?.options.named_table {
                 Ok(Term::atom(name.as_atom().unwrap()))
             } else {
-                tid.to_term(&mut heap).map_err(|_| badarg())
+                registry.tid_term(tid, &mut heap).map_err(err)
             }
         }
         (EtsBif::Whereis, [name]) => Ok(registry
             .whereis(name.as_atom().ok_or_else(badarg)?)
-            .map(|tid| tid.to_term(&mut heap))
+            .map(|tid| registry.tid_term(tid, &mut heap))
             .transpose()
-            .map_err(|_| badarg())?
+            .map_err(err)?
             .unwrap_or(atom("undefined"))),
         (EtsBif::Rename, [target, name]) => {
             // Port of erts/emulator/beam/erl_db.c (ets_rename_2), OTP-29.1.1:
@@ -3154,7 +3137,7 @@ fn call_inner(
             let tab = if options.named_table {
                 Term::atom(options.name)
             } else {
-                tid.to_term(&mut heap).map_err(|_| badarg())?
+                registry.tid_term(tid, &mut heap).map_err(err)?
             };
             let transfer = TermBuilder::new(&mut heap)
                 .tuple(&[atom("ETS-TRANSFER"), tab, caller, *data])

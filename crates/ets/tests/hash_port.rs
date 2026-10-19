@@ -325,3 +325,33 @@ fn lookup_element_list_matches_lookup_element_order() {
         assert!(table.lookup_element_list(key, 0, &mut out).is_err());
     }
 }
+
+#[test]
+fn tid_term_is_the_tables_magic_reference() {
+    let mut registry = Registry::new();
+    let tid = registry
+        .create(options(TableType::Set, WriteConcurrency::Disabled))
+        .unwrap();
+    let other = registry
+        .create(options(TableType::Set, WriteConcurrency::Disabled))
+        .unwrap();
+    let mut heap = VecHeap::new();
+    let first = registry.tid_term(tid, &mut heap).unwrap();
+    let again = registry.tid_term(tid, &mut heap).unwrap();
+    let second = registry.tid_term(other, &mut heap).unwrap();
+    assert!(first.is_magic_ref());
+    // The reference resolves to its table without a registry lookup.
+    assert_eq!(arinsal_ets::Tid::from_term(first), Some(tid));
+    assert_eq!(arinsal_ets::Tid::from_term(second), Some(other));
+    // Every handle of one table is the same reference; tables differ.
+    assert!(arinsal_term::exact_eq(first, again));
+    assert!(!arinsal_term::exact_eq(first, second));
+    // Anything that is not an ETS magic reference is no table handle.
+    let plain = TermBuilder::new(&mut heap).local_ref([1, 2, 3]).unwrap();
+    assert_eq!(arinsal_ets::Tid::from_term(plain), None);
+    assert_eq!(arinsal_ets::Tid::from_term(Term::small(1).unwrap()), None);
+    // A deleted table's reference still names its identity, but the registry no longer has it.
+    registry.delete(tid).unwrap();
+    assert_eq!(arinsal_ets::Tid::from_term(first), Some(tid));
+    assert!(registry.shared(tid).is_err());
+}
