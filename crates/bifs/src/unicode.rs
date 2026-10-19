@@ -435,6 +435,9 @@ fn map_chardata(
                 let (head, tail) = unsafe { current.cons_ref() }.ok_or(BifError::BADARG)?;
                 match head.classify() {
                     TermKind::Number => {
+                        if matches!(arinsal_term::to_owned(head), Ok(OwnedTerm::Float(_))) {
+                            return Err(BifError::BADARG);
+                        }
                         if let Some((incomplete, _)) = state.pending.take() {
                             let prefix = binary(ctx, &incomplete);
                             return Ok(MapResult::Error(cons(ctx, prefix, current)));
@@ -592,7 +595,6 @@ fn convert(ctx: &mut Ctx<'_>, args: &[Term], list_output: bool) -> Result<Term, 
     let encoding = encoding(args[1])?;
     let direct = matches!(encoding, Encoding::Latin1 | Encoding::Utf8);
     if !direct {
-        check_structure(args[0], encoding)?;
         return wrapper_convert(ctx, args, list_output, encoding);
     }
     let mut root = args[0];

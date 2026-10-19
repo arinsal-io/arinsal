@@ -78,6 +78,7 @@ run(5) ->
     {Prev =:= Online, Type, Bad, Back};
 
 run(6) ->
+    ensure_kernel_refc(),
     Before = statistics(scheduler_wall_time_all),
     false = erlang:system_flag(scheduler_wall_time, true),
     erts_debug:dirty_io(wait, 50),
@@ -104,6 +105,12 @@ run(7) ->
     Busy = [T || #{type := T, counters := #{emulator := E}} <- Stats,
                  T =:= dirty_cpu_scheduler orelse T =:= dirty_io_scheduler, E > 0],
     {Rows, lists:usort(Busy)}.
+
+ensure_kernel_refc() ->
+    case whereis(kernel_refc) of
+        undefined -> {ok, _} = kernel_refc:start_link(), ok;
+        _Pid -> ok
+    end.
 "##;
 
 fn assert_scenario(reference: &RefErl, scenario: i64, simulation: Option<u64>) {
@@ -123,7 +130,7 @@ fn assert_scenario(reference: &RefErl, scenario: i64, simulation: Option<u64>) {
             simulation,
         )
         .unwrap_or_else(|error| panic!("scenario {scenario}: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "scenario {scenario}");
 }
 
 macro_rules! scenario {
