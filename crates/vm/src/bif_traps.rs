@@ -668,6 +668,62 @@ fn unicode_trap(
     })
 }
 
+fn unicode_convert_start(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    function: &'static str,
+) -> Result<HandlerResult, BifError> {
+    if state.is_some() {
+        return unicode_trap(process, state);
+    }
+    let bif =
+        arinsal_bifs::lookup("unicode", function, args.len() as u8).ok_or(BifError::BADARG)?;
+    let (result, reductions, deferred) = {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+        ctx.set_reduction_budget(process.reductions.max(0) as usize);
+        let result = bif(&mut ctx, args)?;
+        let reductions = ctx.reductions();
+        let deferred = ctx.take_deferred();
+        (result, reductions, deferred)
+    };
+    match deferred.map(|trap| *trap) {
+        Some(arinsal_bifs::DeferredTrap::Unicode(cont)) => Ok(HandlerResult::Yield {
+            continuation: cont.continuation(),
+            state: magic_binary_state(Mutex::new(cont), ERTS_UNICODE_RESTART_CONTEXT_SIZE),
+            reductions,
+        }),
+        Some(_) => Err(BifError::BADARG),
+        None => Ok(HandlerResult::Done {
+            value: result,
+            reductions,
+        }),
+    }
+}
+
+// Port of erts/emulator/beam/erl_unicode.c:931 (unicode_characters_to_binary_2), OTP-29.1.1.
+fn unicode_characters_to_binary(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<HandlerResult, BifError> {
+    unicode_convert_start(process, args, state, "characters_to_binary")
+}
+
+// Port of erts/emulator/beam/erl_unicode.c:1122 (unicode_characters_to_list_2), OTP-29.1.1.
+fn unicode_characters_to_list(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<HandlerResult, BifError> {
+    unicode_convert_start(process, args, state, "characters_to_list")
+}
+
 macro_rules! unicode_trap_entry {
     ($name:ident) => {
         fn $name(
@@ -697,6 +753,20 @@ fn bool_atom(value: bool) -> Term {
 }
 
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "unicode",
+        function: "characters_to_binary",
+        arity: 2,
+        continuation: "erlang:characters_to_utf8_trap/4",
+        handler: unicode_characters_to_binary,
+    },
+    Entry {
+        module: "unicode",
+        function: "characters_to_list",
+        arity: 2,
+        continuation: "erlang:characters_to_list_trap_1/3",
+        handler: unicode_characters_to_list,
+    },
     Entry {
         module: "erlang",
         function: "characters_to_utf8_trap",
@@ -753,6 +823,30 @@ const ENTRIES: &[Entry] = &[
         continuation: "erlang:phash2_trap/2",
         handler: erlang_phash2_trap_1,
     },
+    // Port of erts/emulator/beam/bif.c:5350 (phash2_1), OTP-29.1.1.
+    Entry {
+        module: "erlang",
+        function: "phash2",
+        arity: 1,
+        continuation: "erlang:phash2_trap/1",
+        handler: erlang_phash2_trap_1,
+    },
+    // Port of erts/emulator/beam/bif.c:5362 (phash2_2), OTP-29.1.1.
+    Entry {
+        module: "erlang",
+        function: "phash2",
+        arity: 2,
+        continuation: "erlang:phash2_trap/2",
+        handler: erlang_phash2_trap_1,
+    },
+    // Port of erts/emulator/beam/erl_bif_chksum.c:290 (crc32_1), OTP-29.1.1.
+    Entry {
+        module: "erlang",
+        function: "crc32",
+        arity: 1,
+        continuation: "erlang:crc32/2",
+        handler: erlang_crc32,
+    },
     Entry {
         module: "erlang",
         function: "crc32",
@@ -766,6 +860,22 @@ const ENTRIES: &[Entry] = &[
         arity: 2,
         continuation: "erlang:adler32/2",
         handler: erlang_adler32,
+    },
+    // Port of erts/emulator/beam/erl_bif_chksum.c:370 (adler32_1), OTP-29.1.1.
+    Entry {
+        module: "erlang",
+        function: "adler32",
+        arity: 1,
+        continuation: "erlang:adler32/2",
+        handler: erlang_adler32,
+    },
+    // Port of erts/emulator/beam/erl_bif_chksum.c:455 (md5_1), OTP-29.1.1.
+    Entry {
+        module: "erlang",
+        function: "md5",
+        arity: 1,
+        continuation: "erlang:md5_trap/2",
+        handler: erlang_md5_trap,
     },
     Entry {
         module: "erlang",

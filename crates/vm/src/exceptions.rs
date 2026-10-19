@@ -763,21 +763,27 @@ pub(super) fn resume(
         if !is_handler {
             let special = vm.code.modules.get(module).and_then(|module| {
                 if ip == module.return_trace_ip {
-                    Some((true, module))
+                    Some((0, module))
+                } else if ip == module.return_call_acc_trace_ip {
+                    Some((1, module))
                 } else if ip == module.return_to_trace_ip {
-                    Some((false, module))
+                    Some((2, module))
                 } else {
                     None
                 }
             });
-            if let Some((return_trace, _)) = special {
-                let width = if return_trace { 6 } else { 2 };
-                if !return_trace
+            if let Some((frame_kind, _)) = special {
+                let width = match frame_kind {
+                    0 => 6,
+                    1 => 4,
+                    _ => 2,
+                };
+                if frame_kind == 2
                     && let Some(session) = p.heap.stack_get(index + 1).and_then(Term::as_small)
                 {
                     return_to_sessions.push(session as u64);
                 }
-                if return_trace
+                if frame_kind == 0
                     && let (
                         Some(frame_module),
                         Some(entry),

@@ -1442,6 +1442,7 @@ fn push_trace_frames(
     module_id: usize,
     entry_ip: usize,
     return_trace_ip: usize,
+    return_call_acc_trace_ip: usize,
     return_to_ip: usize,
     actions: &[crate::trace::CallActions],
 ) -> Result<(), VmError> {
@@ -1472,43 +1473,54 @@ fn push_trace_frames(
                 .ok_or_else(|| VmError::Unsupported("trace session stack value".into()))?,
             );
         }
-        // The sixth word holds the trace frame flags: bit 0 exception_trace, bit 1 a call
-        // time/memory accounting frame with its breakpoint flags above.
-        let frame = if action.return_trace || action.exception_trace {
-            Some((module_id, entry_ip, usize::from(action.exception_trace)))
-        } else {
-            action.acc.map(|acc| {
-                (
-                    module_id,
-                    acc.prev.map_or(0, |prev| prev as usize + 1),
-                    2 | ((acc.flags as usize) << 2),
-                )
-            })
-        };
-        let Some((module, entry, flags)) = frame else {
-            continue;
-        };
-        if !reserve_trace_stack(process, 6)? {
-            return Err(VmError::Unsupported("call trace stack".into()));
-        }
-        process.heap.stack_set(
-            0,
-            crate::stacktrace::return_trace_tag(module_id, return_trace_ip)?,
-        );
-        for (index, value) in [
-            module,
-            entry,
-            (action.session >> 32) as usize,
-            action.session as u32 as usize,
-            flags,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            process.heap.stack_set(index + 1, small(value)?);
-        }
-        if crate::trace_bp::is_meta_id(action.session) {
-            crate::trace_bp::hold_meta_frame(process, action.session);
+        if action.return_trace || action.exception_trace {
+            if !reserve_trace_stack(process, 6)? {
+                return Err(VmError::Unsupported("call trace stack".into()));
+            }
+            process.heap.stack_set(
+                0,
+                crate::stacktrace::return_trace_tag(module_id, return_trace_ip)?,
+            );
+            for (index, value) in [
+                module_id,
+                entry_ip,
+                (action.session >> 32) as usize,
+                action.session as u32 as usize,
+                usize::from(action.exception_trace),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                process.heap.stack_set(index + 1, small(value)?);
+            }
+            if crate::trace_bp::is_meta_id(action.session) {
+                crate::trace_bp::hold_meta_frame(process, action.session);
+            }
+        } else if let Some(acc) = action.acc {
+            // ERTS stores prev_info, bp_flags, and the weak session id after the return CP.
+            // Port of erts/emulator/beam/beam_bp.c:1127-1145 (do_session_breakpoint), OTP-29.1.1.
+            if !reserve_trace_stack(process, 4)? {
+                return Err(VmError::Unsupported("call-time trace stack".into()));
+            }
+            let previous = acc
+                .prev
+                .map_or(Ok(Term::NIL), |prev| small(prev as usize))?;
+            let flags = small(acc.flags as usize)?;
+            let session = Term::small(
+                i64::try_from(action.session)
+                    .map_err(|_| VmError::Unsupported("trace session stack value".into()))?,
+            )
+            .ok_or_else(|| VmError::Unsupported("trace session stack value".into()))?;
+            process.heap.stack_set(
+                0,
+                crate::stacktrace::return_call_acc_trace_tag(module_id, return_call_acc_trace_ip)?,
+            );
+            process.heap.stack_set(1, previous);
+            process.heap.stack_set(2, flags);
+            process.heap.stack_set(3, session);
+            if crate::trace_bp::is_meta_id(action.session) {
+                crate::trace_bp::hold_meta_frame(process, action.session);
+            }
         }
     }
     Ok(())
@@ -1554,8 +1566,11 @@ fn trace_breakpoint_call(
         .iter()
         .map(|action| {
             usize::from(action.return_to) * 2
-                + usize::from(action.return_trace || action.exception_trace || action.acc.is_some())
-                    * 5
+                + if action.return_trace || action.exception_trace {
+                    5
+                } else {
+                    usize::from(action.acc.is_some()) * 3
+                }
         })
         .sum();
     if trace_words != 0 {
@@ -1568,6 +1583,7 @@ fn trace_breakpoint_call(
         module_id,
         entry_ip,
         vm.code.modules[module_id].return_trace_ip,
+        vm.code.modules[module_id].return_call_acc_trace_ip,
         vm.code.modules[module_id].return_to_trace_ip,
         &actions,
     )?;
@@ -2244,10 +2260,54 @@ impl Vm {
             }
             #[rustfmt::skip]
             traced_instruction_dispatch!(instr;
+                Instr::ReturnCallAccTrace => {
+                    // Port of erts/emulator/beam/emu/trace_instrs.tab:54-70
+                    // (i_call_trace_return), OTP-29.1.1.
+                    sync_cursor(p, htop, &mut heap_dirty);
+                    let (Some(previous), Some(bp_flags), Some(session)) = (
+                        p.heap.stack_get(0),
+                        p.heap.stack_get(1).and_then(Term::as_small),
+                        p.heap.stack_get(2).and_then(Term::as_small),
+                    ) else {
+                        return Err(VmError::Unsupported("call-time trace frame".into()));
+                    };
+                    let previous = if previous == Term::NIL {
+                        None
+                    } else {
+                        Some(
+                            u32::try_from(previous.as_small().ok_or_else(|| {
+                                VmError::Unsupported("call-time previous frame".into())
+                            })?)
+                            .map_err(|_| {
+                                VmError::Unsupported("call-time previous frame".into())
+                            })?,
+                        )
+                    };
+                    let bp_flags = u32::try_from(bp_flags)
+                        .map_err(|_| VmError::Unsupported("call-time breakpoint flags".into()))?;
+                    let session = u64::try_from(session)
+                        .map_err(|_| VmError::Unsupported("call-time session id".into()))?;
+                    if let Some(trace_ctx) = ctx.as_deref() {
+                        crate::trace::call_acc_return(
+                            p,
+                            trace_ctx.pid(),
+                            session,
+                            bp_flags,
+                            previous,
+                        );
+                    }
+                    if !p.heap.release_stack(3) {
+                        return Err(VmError::Unsupported("call-time trace stack".into()));
+                    }
+                    depth = depth.saturating_sub(3);
+                    (htop, stop) = p.heap.heap_cursor();
+                    heap_dirty = false;
+                    return_from_frame!();
+                }
                 Instr::ReturnTrace => {
                     // The handler reloads the heap cursor below: publish pending allocations first.
                     sync_cursor(p, htop, &mut heap_dirty);
-                    let (Some(module), Some(entry), Some(session_high), Some(session_low), Some(frame_flags)) = (
+                    let (Some(module), Some(entry), Some(session_high), Some(session_low), Some(_frame_flags)) = (
                         p.heap.stack_get(0).and_then(Term::as_small),
                         p.heap.stack_get(1).and_then(Term::as_small),
                         p.heap.stack_get(2).and_then(Term::as_small),
@@ -2257,20 +2317,7 @@ impl Vm {
                         return Err(VmError::Unsupported("return trace frame".into()));
                     };
                     let session = ((session_high as u64) << 32) | session_low as u32 as u64;
-                    if frame_flags & 2 != 0 {
-                        // Port of erts/emulator/beam/emu/trace_instrs.tab:54-70
-                        // (i_call_trace_return), OTP-29.1.1.
-                        sync_cursor(p, htop, &mut heap_dirty);
-                        if let Some(trace_ctx) = ctx.as_deref() {
-                            crate::trace::call_acc_return(
-                                p,
-                                trace_ctx.pid(),
-                                session,
-                                (frame_flags >> 2) as u32,
-                                (entry > 0).then(|| entry as u32 - 1),
-                            );
-                        }
-                    } else if let Some(trace_ctx) = ctx.as_deref_mut() {
+                    if let Some(trace_ctx) = ctx.as_deref_mut() {
                         // Port of erts/emulator/beam/emu/trace_instrs.tab:25-70, OTP-29.1.1.
                         sync_cursor(p, htop, &mut heap_dirty);
                         crate::trace::return_event(
@@ -5002,7 +5049,7 @@ mod trace_frame_tests {
             return_to: false,
             acc: None,
         }];
-        push_trace_frames(&mut process, 3, 7, 11, 13, &actions).unwrap();
+        push_trace_frames(&mut process, 3, 7, 11, 13, 17, &actions).unwrap();
         assert_eq!(process.heap.stack_get(1).and_then(Term::as_small), Some(3));
         assert_eq!(process.heap.stack_get(2).and_then(Term::as_small), Some(7));
         assert_eq!(
@@ -5014,5 +5061,32 @@ mod trace_frame_tests {
             Some(session as u32 as i64)
         );
         assert_eq!(process.heap.stack_get(5).and_then(Term::as_small), Some(1));
+    }
+
+    #[test]
+    fn call_time_frame_uses_three_metadata_words() {
+        let mut process = Process::new();
+        let actions = [crate::trace::CallActions {
+            session: 23,
+            return_trace: false,
+            exception_trace: false,
+            return_to: false,
+            acc: Some(crate::trace::CallAcc {
+                flags: 0x12,
+                prev: Some(19),
+            }),
+        }];
+        push_trace_frames(&mut process, 3, 7, 11, 13, 17, &actions).unwrap();
+        assert_eq!(
+            crate::stacktrace::decode_tag(process.heap.stack_get(0).unwrap()),
+            Some((false, 3, 13))
+        );
+        assert_eq!(process.heap.stack_get(1).and_then(Term::as_small), Some(19));
+        assert_eq!(
+            process.heap.stack_get(2).and_then(Term::as_small),
+            Some(0x12)
+        );
+        assert_eq!(process.heap.stack_get(3).and_then(Term::as_small), Some(23));
+        assert_eq!(process.heap.stack_words(), 4);
     }
 }
