@@ -2386,7 +2386,7 @@ fn hash_select(
     let unfix = was_resumed && safety != IterSafety::Safe;
     let nothing_visited = !continued && cycle.iterations_left == iterations;
     if !(hash && chunk > 0 && nothing_visited) {
-        match ctx.as_deref_mut() {
+        match ctx {
             Some(ctx) => bump_reds(process, ctx, used),
             None => bump_direct(process, used),
         }
