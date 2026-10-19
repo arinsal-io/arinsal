@@ -1689,16 +1689,28 @@ pub(crate) fn getiflist() -> Vec<u8> {
     let ifreq = std::mem::size_of::<libc::ifreq>();
     let name_len = libc::IFNAMSIZ;
     while i + name_len + 2 <= buf.len() {
-        let sa_len = buf[i + name_len] as usize;
-        let sa_size = sa_len.max(std::mem::size_of::<libc::sockaddr>());
-        let mut n = name_len + sa_size;
-        if n < ifreq {
-            n = ifreq;
-        }
+        // BSD sockaddrs carry sa_len (struct entries vary in size) and a one-byte family;
+        // Linux entries are all sizeof(struct ifreq) with a native-endian u16 family.
+        #[cfg(target_os = "macos")]
+        let (n, family) = {
+            let sa_len = buf[i + name_len] as usize;
+            let sa_size = sa_len.max(std::mem::size_of::<libc::sockaddr>());
+            (
+                (name_len + sa_size).max(ifreq),
+                i32::from(buf[i + name_len + 1]),
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (n, family) = (
+            ifreq,
+            i32::from(u16::from_ne_bytes([
+                buf[i + name_len],
+                buf[i + name_len + 1],
+            ])),
+        );
         if i + n > buf.len() {
             break;
         }
-        let family = i32::from(buf[i + name_len + 1]);
         if family == libc::AF_INET || family == libc::AF_INET6 {
             let name = &buf[i..i + name_len];
             let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
@@ -2646,6 +2658,11 @@ pub(crate) struct Sock {
 }
 
 impl Sock {
+    /// `driver_sizeq` of the port's output queue, for `port_info(Port, queue_size)`.
+    pub(crate) fn out_queue_size(&self) -> usize {
+        self.inner.lock().unwrap().sendq.size()
+    }
+
     fn new(id: u64, runtime: &Arc<Runtime>, handle: &Arc<PortHandle>) -> Self {
         let selection_owner = Arc::as_ptr(handle) as usize;
         Self {

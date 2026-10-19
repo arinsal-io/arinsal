@@ -4814,7 +4814,10 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         .map_err(|e| VmError::Unsupported(format!("port info monitors: {e:?}")))?;
     let memory = 48 + monitored_pids.len() * 24;
     let queue_size = drv_port.map_or_else(
-        || handle.state.lock().unwrap().outq.len(),
+        || match handle.tcp_driver_data() {
+            Some(sock) => sock.out_queue_size(),
+            None => handle.state.lock().unwrap().outq.len(),
+        },
         |drv| drv.queue_size(),
     );
     // Port of erts/emulator/beam/io.c (port_info os_pid): a driver that never
