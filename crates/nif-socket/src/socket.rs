@@ -38,10 +38,6 @@ const MAGIC: u32 = 0x534f_434b;
 // (enif_alloc_resource), OTP-29.1.1. On macOS arm64, sizeof(ESockDescriptor) is 928 bytes;
 // the unaligned magic data offset and ErtsResource header add 24 + 16 bytes to orig_size.
 const SOCKET_MAGIC_ORIG_SIZE: usize = 24 + 16 + 928;
-#[cfg(target_os = "macos")]
-const ATMARK_REQUEST: u64 = 0x4004_7307;
-#[cfg(target_os = "linux")]
-const ATMARK_REQUEST: u64 = 0x8905;
 static REACTOR: OnceLock<Mutex<Option<Arc<dyn Reactor>>>> = OnceLock::new();
 static DEBUG: AtomicBool = AtomicBool::new(false);
 static SOCKET_DEBUG: AtomicBool = AtomicBool::new(false);
@@ -2416,6 +2412,550 @@ fn shutdown(args: &[O]) -> Result<O, BifError> {
         },
     )
 }
+const IFNAMSIZ: usize = libc::IFNAMSIZ;
+
+// Port of the `struct ifreq` accesses in unix_socket_syncio.c:5904, OTP-29.1.1.
+// libc does not expose ifreq on Linux, so keep its ABI size and alignment here.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+#[repr(C, align(8))]
+struct IoctlIfReq {
+    name: [libc::c_char; IFNAMSIZ],
+    data: [u8; 24],
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "32"))]
+#[repr(C, align(4))]
+struct IoctlIfReq {
+    name: [libc::c_char; IFNAMSIZ],
+    data: [u8; 16],
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C, align(4))]
+struct IoctlIfReq {
+    name: [libc::c_char; IFNAMSIZ],
+    data: [u8; 16],
+}
+
+impl IoctlIfReq {
+    fn empty() -> Self {
+        Self {
+            name: [0; IFNAMSIZ],
+            data: [0; std::mem::size_of::<Self>() - IFNAMSIZ],
+        }
+    }
+
+    fn for_name(name: [libc::c_char; IFNAMSIZ]) -> Self {
+        Self {
+            data: [0; std::mem::size_of::<Self>() - IFNAMSIZ],
+            name,
+        }
+    }
+
+    fn int(&self) -> i32 {
+        i32::from_ne_bytes(self.data[..4].try_into().unwrap())
+    }
+
+    fn set_int(&mut self, value: i32) {
+        self.data[..4].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn short(&self) -> i16 {
+        i16::from_ne_bytes(self.data[..2].try_into().unwrap())
+    }
+
+    fn set_short(&mut self, value: i16) {
+        self.data[..2].copy_from_slice(&value.to_ne_bytes());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct IoctlIfConf {
+    len: libc::c_int,
+    buffer: *mut libc::c_char,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C, packed(4))]
+struct IoctlIfConf {
+    len: libc::c_int,
+    buffer: *mut libc::c_char,
+}
+
+// Port of erts/emulator/nifs/common/prim_socket_nif.c:5510 (esock_supports_ioctl_requests),
+// OTP-29.1.1. The existing OTP support snapshot is the platform's compiled #ifdef table.
+fn ioctl_request_code(request_name: &str) -> Option<u64> {
+    list(&supports(Some(&atom("ioctl_requests"))))?
+        .iter()
+        .find_map(|row| {
+            let O::Tuple(parts) = row else { return None };
+            (parts.len() == 2 && name(&parts[0]) == Some(request_name))
+                .then(|| number(&parts[1]).and_then(|n| u64::try_from(n).ok()))
+                .flatten()
+        })
+}
+
+// Port of erts/emulator/nifs/unix/unix_socket_syncio.c:5364,5431,5540 (essio_ioctl2/3/4),
+// OTP-29.1.1. The dispatch implements these requests even when supports omits their names.
+fn ioctl_request_name(request: u64) -> Option<String> {
+    if let Some(tag) = list(&supports(Some(&atom("ioctl_requests")))).and_then(|rows| {
+        rows.iter().find_map(|row| {
+            let O::Tuple(parts) = row else { return None };
+            (parts.len() == 2
+                && number(&parts[1]).and_then(|n| u64::try_from(n).ok()) == Some(request))
+            .then(|| name(&parts[0]).map(str::to_owned))
+            .flatten()
+        })
+    }) {
+        return Some(tag);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if request == 0x0000_891c {
+            return Some("sifnetmask".into());
+        }
+        if request == 0x0000_8924 {
+            return Some("sifhwaddr".into());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if request == 0x8020_6916 {
+        return Some("sifnetmask".into());
+    }
+    None
+}
+
+// Port of erts/emulator/nifs/common/socket_util.c:2917 (esock_decode_string) and
+// erts/emulator/nifs/unix/unix_socket_syncio.c:5912-5919 (IOCTL_GET_REQUEST3_DECL), OTP-29.1.1.
+fn ioctl_ifname(value: &O) -> Result<[libc::c_char; IFNAMSIZ], BifError> {
+    let chars = list(value).ok_or(BifError::BADARG)?;
+    let mut result = [0; IFNAMSIZ];
+    for (length, ch) in chars.iter().enumerate() {
+        let ch = u8::try_from(number(ch).ok_or(BifError::BADARG)?).map_err(|_| BifError::BADARG)?;
+        if ch == 0 || length == IFNAMSIZ - 1 {
+            break;
+        }
+        result[length] = ch as libc::c_char;
+    }
+    Ok(result)
+}
+
+// Port of erts/emulator/nifs/unix/unix_socket_syncio.c:6721 (encode_ioctl_ifreq_name), OTP-29.1.1.
+fn ioctl_ifname_term(name: &[libc::c_char; IFNAMSIZ]) -> O {
+    O::list(
+        name.iter()
+            .take_while(|ch| **ch != 0)
+            .map(|ch| O::Int(i64::from(*ch as u8)))
+            .collect(),
+    )
+}
+
+// Port of erts/emulator/nifs/common/socket_util.c:726 (esock_encode_sockaddr), OTP-29.1.1.
+fn ioctl_sockaddr_term(bytes: &[u8]) -> Option<O> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let family = i32::from(u16::from_ne_bytes([bytes[0], bytes[1]]));
+    #[cfg(target_os = "macos")]
+    let family = i32::from(bytes[1]);
+    match family {
+        libc::AF_INET if bytes.len() >= 16 => {
+            Some(from_addr(SocketAddr::V4(std::net::SocketAddrV4::new(
+                Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]),
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+            ))))
+        }
+        #[cfg(target_os = "macos")]
+        libc::AF_INET6 if bytes.len() >= 28 => {
+            let addr = Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[8..24]).ok()?);
+            Some(from_addr(SocketAddr::V6(SocketAddrV6::new(
+                addr,
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+                u32::from_ne_bytes(bytes[4..8].try_into().ok()?),
+                u32::from_ne_bytes(bytes[24..28].try_into().ok()?),
+            ))))
+        }
+        #[cfg(target_os = "macos")]
+        libc::AF_LINK => ioctl_sockaddr_dl_term(bytes),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        libc::AF_UNIX => {
+            let data_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+            let path = &bytes[data_offset.min(bytes.len())..];
+            let nul = path
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(path.len());
+            #[cfg(target_os = "linux")]
+            let path_len = if nul == 0 && !path.is_empty() { 1 } else { nul };
+            #[cfg(target_os = "macos")]
+            let path_len = nul;
+            Some(map(&[
+                ("family", atom("local")),
+                ("path", O::Binary(path[..path_len].to_vec())),
+            ]))
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        libc::AF_UNSPEC => Some(map(&[
+            ("family", atom("unspec")),
+            ("addr", O::Binary(bytes[2..].to_vec())),
+        ])),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        family => Some(map(&[
+            ("family", O::Int(i64::from(family))),
+            ("addr", O::Binary(bytes[2..].to_vec())),
+        ])),
+    }
+}
+
+// Port of erts/emulator/nifs/common/socket_util.c:1599 (esock_encode_sockaddr_dl), OTP-29.1.1.
+#[cfg(target_os = "macos")]
+fn ioctl_sockaddr_dl_term(bytes: &[u8]) -> Option<O> {
+    let length = usize::from(*bytes.first()?);
+    let data_offset = std::mem::offset_of!(libc::sockaddr_dl, sdl_data);
+    let native_len = data_offset;
+    let length = length.min(bytes.len());
+    if length >= native_len {
+        Some(map(&[
+            ("family", atom("link")),
+            (
+                "index",
+                O::Int(i64::from(u16::from_ne_bytes([bytes[2], bytes[3]]))),
+            ),
+            (
+                "type",
+                match bytes[4] {
+                    1 => atom("other"),
+                    3 => atom("hdh1822"),
+                    4 => atom("x25ddn"),
+                    5 => atom("x25"),
+                    6 => atom("ether"),
+                    23 => atom("ppp"),
+                    24 => atom("loop"),
+                    55 => atom("gif"),
+                    56 => atom("faith"),
+                    57 => atom("stf"),
+                    209 => atom("bridge"),
+                    255 => atom("cellular"),
+                    value => O::Int(i64::from(value)),
+                },
+            ),
+            ("nlen", O::Int(i64::from(bytes[5]))),
+            ("alen", O::Int(i64::from(bytes[6]))),
+            ("slen", O::Int(i64::from(bytes[7]))),
+            ("data", O::Binary(bytes[data_offset..length].to_vec())),
+        ]))
+    } else {
+        Some(map(&[
+            ("family", atom("link")),
+            ("addr", O::Binary(bytes[2..length].to_vec())),
+        ]))
+    }
+}
+
+// Port of erts/emulator/nifs/unix/unix_socket_syncio.c:6287 (SIZEA), OTP-29.1.1.
+fn ioctl_ifconf_record_size(address: &[u8]) -> usize {
+    #[cfg(target_os = "linux")]
+    let address_size = std::mem::size_of::<libc::sockaddr>();
+    #[cfg(target_os = "macos")]
+    let address_size = usize::from(address.first().copied().unwrap_or(0))
+        .max(std::mem::size_of::<libc::sockaddr>());
+    (IFNAMSIZ + address_size).max(std::mem::size_of::<IoctlIfReq>())
+}
+
+// Port of erts/emulator/nifs/common/socket_util.c:484 (esock_decode_sockaddr), OTP-29.1.1.
+fn ioctl_sockaddr_bytes(value: &O) -> Option<Vec<u8>> {
+    let family = field(value, "family")?;
+    match name(family) {
+        Some("inet") => {
+            let port = i32::try_from(number(field(value, "port")?)?).ok()? as u16;
+            let address = field(value, "addr")?;
+            let addr = match name(address) {
+                Some("any") => Ipv4Addr::UNSPECIFIED,
+                Some("loopback") => Ipv4Addr::LOCALHOST,
+                Some("broadcast") => Ipv4Addr::BROADCAST,
+                _ => match tuple_ip(address)? {
+                    IpAddr::V4(addr) => addr,
+                    IpAddr::V6(_) => return None,
+                },
+            };
+            let mut bytes = vec![0; 16];
+            #[cfg(target_os = "linux")]
+            bytes[..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+            #[cfg(target_os = "macos")]
+            {
+                bytes[0] = 16;
+                bytes[1] = libc::AF_INET as u8;
+            }
+            bytes[2..4].copy_from_slice(&port.to_be_bytes());
+            bytes[4..8].copy_from_slice(&addr.octets());
+            Some(bytes)
+        }
+        Some("inet6") => {
+            let port = i32::try_from(number(field(value, "port")?)?).ok()? as u16;
+            let flowinfo = u32::try_from(number(field(value, "flowinfo")?)?).ok()?;
+            let scope_id = u32::try_from(number(field(value, "scope_id")?)?).ok()?;
+            let address = field(value, "addr")?;
+            let addr = match name(address) {
+                Some("any") => Ipv6Addr::UNSPECIFIED,
+                Some("loopback") => Ipv6Addr::LOCALHOST,
+                _ => match tuple_ip(address)? {
+                    IpAddr::V6(addr) => addr,
+                    IpAddr::V4(_) => return None,
+                },
+            };
+            let mut bytes = vec![0; 28];
+            #[cfg(target_os = "linux")]
+            bytes[..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
+            #[cfg(target_os = "macos")]
+            {
+                // esock_decode_sockaddr_in6 sets sin6_len from sockaddr_in.
+                bytes[0] = std::mem::size_of::<libc::sockaddr_in>() as u8;
+                bytes[1] = libc::AF_INET6 as u8;
+            }
+            bytes[2..4].copy_from_slice(&port.to_be_bytes());
+            bytes[4..8].copy_from_slice(&flowinfo.to_ne_bytes());
+            bytes[8..24].copy_from_slice(&addr.octets());
+            bytes[24..28].copy_from_slice(&scope_id.to_ne_bytes());
+            Some(bytes)
+        }
+        Some("local") => {
+            let O::Binary(path) = field(value, "path")? else {
+                return None;
+            };
+            let max_path = std::mem::size_of::<libc::sockaddr_un>()
+                - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+            #[cfg(target_os = "linux")]
+            let path_len = path.len() + usize::from(path.first().is_some_and(|byte| *byte != 0));
+            #[cfg(target_os = "macos")]
+            let path_len = path.len() + 1;
+            if path_len > max_path {
+                return None;
+            }
+            let data_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+            let mut bytes = vec![0; data_offset + path.len()];
+            #[cfg(target_os = "linux")]
+            bytes[..2].copy_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
+            #[cfg(target_os = "macos")]
+            {
+                bytes[0] = bytes.len() as u8;
+                bytes[1] = libc::AF_UNIX as u8;
+            }
+            bytes[data_offset..].copy_from_slice(path);
+            Some(bytes)
+        }
+        Some("unspec") => ioctl_sockaddr_native(value, libc::AF_UNSPEC),
+        _ => {
+            let family = i32::try_from(number(family)?).ok()?;
+            ioctl_sockaddr_native(value, family)
+        }
+    }
+}
+
+// Port of erts/emulator/nifs/common/socket_util.c:2788 (esock_decode_sockaddr_native), OTP-29.1.1.
+fn ioctl_sockaddr_native(value: &O, family: i32) -> Option<Vec<u8>> {
+    let O::Binary(address) = field(value, "addr")? else {
+        return None;
+    };
+    let data_offset = 2;
+    if address.len() > std::mem::size_of::<libc::sockaddr_storage>() - data_offset {
+        return None;
+    }
+    let mut bytes = vec![0; data_offset + address.len()];
+    #[cfg(target_os = "linux")]
+    bytes[..2].copy_from_slice(&(family as u16).to_ne_bytes());
+    #[cfg(target_os = "macos")]
+    {
+        bytes[0] = bytes.len() as u8;
+        bytes[1] = family as u8;
+    }
+    bytes[data_offset..].copy_from_slice(address);
+    Some(bytes)
+}
+
+const IOCTL_FLAG_ORDER: &[&str] = &[
+    "up",
+    "broadcast",
+    "debug",
+    "loopback",
+    "pointopoint",
+    "notrailers",
+    "knowsepoch",
+    "running",
+    "noarp",
+    "promisc",
+    "allmulti",
+    "master",
+    "oactive",
+    "slave",
+    "simplex",
+    "multicast",
+    "link0",
+    "link1",
+    "link2",
+    "portsel",
+    "automedia",
+    "dynamic",
+    "cantconfig",
+    "lower_up",
+    "ppromisc",
+    "dormant",
+    "monitor",
+    "echo",
+    "staticarp",
+    "dying",
+    "renaming",
+    "nogroup",
+    "dhcprunning",
+    "private",
+];
+
+// Port of erts/emulator/nifs/common/prim_socket_nif.c:5631 (esock_supports_ioctl_flags),
+// OTP-29.1.1.
+fn ioctl_flag_code(flag_name: &str) -> i32 {
+    list(&supports(Some(&atom("ioctl_flags"))))
+        .into_iter()
+        .flatten()
+        .find_map(|row| {
+            let O::Tuple(parts) = row else { return None };
+            (parts.len() == 2 && name(&parts[0]) == Some(flag_name))
+                .then(|| number(&parts[1]).and_then(|n| i32::try_from(n).ok()))
+                .flatten()
+        })
+        .unwrap_or(0)
+}
+
+// Port of erts/emulator/nifs/unix/unix_socket_syncio.c:6467 (encode_ioctl_flags), OTP-29.1.1.
+fn ioctl_flags_term(flags: i16) -> O {
+    let mut remaining = flags as u16;
+    let mut encoded = Vec::new();
+    for flag_name in IOCTL_FLAG_ORDER {
+        let flag = ioctl_flag_code(flag_name) as u16;
+        if flag != 0 && remaining & flag == flag {
+            encoded.push(atom(flag_name));
+            remaining &= !flag;
+        }
+    }
+    if remaining != 0 {
+        encoded.push(O::Int(i64::from(remaining as i16)));
+    }
+    O::list(encoded)
+}
+
+// Port of erts/emulator/nifs/unix/unix_socket_syncio.c:6623 (decode_ioctl_flags), OTP-29.1.1.
+fn ioctl_flags_value(value: &O, current: i16) -> Result<i16, BifError> {
+    let O::Map(entries) = value else {
+        return Err(BifError::BADARG);
+    };
+    let mut flags = i32::from(current);
+    for (key, set) in entries {
+        let flag = number(key)
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or(BifError::BADARG)?;
+        if name(set) == Some("true") {
+            flags |= flag;
+        } else {
+            flags &= !flag;
+        }
+    }
+    Ok(flags as i16)
+}
+
+// Port of erts/emulator/nifs/common/socket_util.c:936 (esock_encode_hwsockaddr), OTP-29.1.1.
+fn ioctl_hwaddr_family(family: u16) -> O {
+    atom(match family {
+        0 => "netrom",
+        1 => "ether",
+        6 => "ieee802",
+        15 => "dlci",
+        24 => "ieee1394",
+        519 => "rawip",
+        770 => "frelay",
+        772 => "loopback",
+        65534 => "none",
+        _ => return O::Int(i64::from(family)),
+    })
+}
+
+// Port of erts/emulator/nifs/common/socket_util.c:1023 (esock_decode_hwsockaddr), OTP-29.1.1.
+fn ioctl_hwaddr_value(value: &O) -> Option<Vec<u8>> {
+    let family: u16 = match name(field(value, "family")?)? {
+        "netrom" => 0,
+        "ether" => 1,
+        "ieee802" => 6,
+        "dlci" => 15,
+        "ieee1394" => 24,
+        "rawip" => 519,
+        "frelay" => 770,
+        "loopback" => 772,
+        "none" => 65534,
+        _ => return None,
+    };
+    let O::Binary(address) = field(value, "addr")? else {
+        return None;
+    };
+    if address.len() > std::mem::size_of::<libc::sockaddr_storage>() - 2 {
+        return None;
+    }
+    let mut bytes = vec![0; 2 + address.len()];
+    bytes[..2].copy_from_slice(&family.to_ne_bytes());
+    bytes[2..2 + address.len()].copy_from_slice(address);
+    Some(bytes)
+}
+
+// Port of erts/emulator/nifs/unix/unix_socket_syncio.c:5620 (essio_ioctl_gifconf), OTP-29.1.1.
+fn ioctl_gifconf(request: u64, call: &dyn Fn(u64, *mut libc::c_void) -> io::Result<()>) -> O {
+    let mut previous_len = 0;
+    let mut buffer = vec![0; 100 * std::mem::size_of::<IoctlIfReq>()];
+    let mut conf = IoctlIfConf {
+        len: 0,
+        buffer: std::ptr::null_mut(),
+    };
+    loop {
+        conf.len = buffer.len() as libc::c_int;
+        conf.buffer = buffer.as_mut_ptr().cast();
+        let conf_ptr = (&mut conf as *mut IoctlIfConf).cast::<libc::c_void>();
+        if let Err(err) = call(request, conf_ptr) {
+            if err.raw_os_error() != Some(libc::EINVAL) || previous_len != 0 {
+                return fail(&err);
+            }
+        } else if conf.len == previous_len {
+            let result_len = usize::try_from(conf.len).unwrap_or(0).min(buffer.len());
+            let mut entries = Vec::new();
+            let mut offset = 0;
+            while offset + IFNAMSIZ + std::mem::size_of::<libc::sockaddr>() <= result_len {
+                let address_start = offset + IFNAMSIZ;
+                let stride = ioctl_ifconf_record_size(&buffer[address_start..result_len]);
+                if offset + stride > result_len {
+                    break;
+                }
+                let entry = &buffer[offset..offset + stride];
+                let name_bytes: [libc::c_char; IFNAMSIZ] = entry[..IFNAMSIZ]
+                    .iter()
+                    .map(|byte| *byte as libc::c_char)
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap();
+                let address =
+                    ioctl_sockaddr_term(&entry[IFNAMSIZ..]).unwrap_or_else(|| atom("undefined"));
+                entries.push(map(&[
+                    ("name", ioctl_ifname_term(&name_bytes)),
+                    ("addr", address),
+                ]));
+                offset += stride;
+            }
+            return ok(O::list(entries));
+        } else {
+            previous_len = conf.len;
+        }
+        buffer.resize(buffer.len() + 10 * std::mem::size_of::<IoctlIfReq>(), 0);
+    }
+}
+
+// Port of erts/emulator/nifs/unix/unix_socket_syncio.c (essio_ioctl2/3/4), OTP-29.1.1.
+// Port of erts/emulator/nifs/common/prim_socket_nif.c:13794 (nif_ioctl) and
+// erts/emulator/nifs/unix/unix_socket_syncio.c:5364,5431,5540 (essio_ioctl2/3/4), OTP-29.1.1.
 fn ioctl(args: &[O]) -> Result<O, BifError> {
     let h = handle(&args[0])?;
     let request = number(&args[1])
@@ -2429,21 +2969,181 @@ fn ioctl(args: &[O]) -> Result<O, BifError> {
     else {
         return Ok(error("closed"));
     };
-    if args.len() == 2 && (request == libc::FIONREAD || request == ATMARK_REQUEST) {
-        let mut value = 0i32;
-        // SAFETY: value is writable and the ioctl request expects a pointer to an int.
-        let status =
-            unsafe { libc::ioctl(socket.as_raw_fd(), request as libc::c_ulong, &mut value) };
-        return Ok(if status < 0 {
-            last_error()
-        } else if request == libc::FIONREAD {
-            ok(O::Int(value.into()))
+    let call = |request: u64, arg: *mut libc::c_void| -> io::Result<()> {
+        // SAFETY: the descriptor is an open socket protected by its read lock, and each caller
+        // supplies a live request buffer with the platform `ifreq`/`ifconf` layout until return.
+        let status = unsafe { libc::ioctl(socket.as_raw_fd(), request as libc::c_ulong, arg) };
+        if status < 0 {
+            Err(io::Error::last_os_error())
         } else {
-            ok(bool_atom(value != 0))
+            Ok(())
+        }
+    };
+    let request_name = ioctl_request_name(request);
+
+    if args.len() == 2 {
+        return Ok(match request_name.as_deref() {
+            Some("nread") => match rustix::io::ioctl_fionread(socket) {
+                Ok(value) => ok(O::Int(i64::from(value as i32))),
+                Err(err) => fail(&io::Error::from(err)),
+            },
+            Some("atmark" | "nwrite" | "nspace") => {
+                let mut value = 0i32;
+                match call(request, (&mut value as *mut i32).cast()) {
+                    Ok(()) if request_name.as_deref() == Some("atmark") => {
+                        ok(bool_atom(value != 0))
+                    }
+                    Ok(()) => ok(O::Int(i64::from(value))),
+                    Err(err) => fail(&err),
+                }
+            }
+            Some("gifconf") => ioctl_gifconf(request, &call),
+            _ => error("enotsup"),
         });
     }
-    // essio_ioctl: a request without an implementation on the platform is `enotsup`. The
-    // interface requests (gifaddr, gifhwaddr, ...) are not ported yet.
+
+    if args.len() == 3 {
+        let Some(request_name) = request_name.as_deref() else {
+            return Ok(error("enotsup"));
+        };
+        if request_name == "gifname" {
+            let index = integer(&args[2])?;
+            let mut ifreq = IoctlIfReq::empty();
+            ifreq.set_int(index);
+            return Ok(
+                match call(request, (&mut ifreq as *mut IoctlIfReq).cast()) {
+                    Ok(()) => ok(ioctl_ifname_term(&ifreq.name)),
+                    Err(err) => fail(&err),
+                },
+            );
+        }
+        if !matches!(
+            request_name,
+            "gifindex"
+                | "gifflags"
+                | "gifaddr"
+                | "gifdstaddr"
+                | "gifbrdaddr"
+                | "gifnetmask"
+                | "gifmtu"
+                | "gifhwaddr"
+                | "genaddr"
+                | "gifmap"
+                | "giftxqlen"
+        ) {
+            return Ok(error("enotsup"));
+        }
+        let name = ioctl_ifname(&args[2])?;
+        let mut ifreq = IoctlIfReq::for_name(name);
+        return Ok(
+            match call(request, (&mut ifreq as *mut IoctlIfReq).cast()) {
+                Err(err) => fail(&err),
+                Ok(()) => match request_name {
+                    "gifindex" => ok(O::Int(i64::from(ifreq.int()))),
+                    "gifflags" => ok(ioctl_flags_term(ifreq.short())),
+                    "gifaddr" | "gifdstaddr" | "gifbrdaddr" | "gifnetmask" => {
+                        ok(ioctl_sockaddr_term(&ifreq.data[..16])
+                            .unwrap_or_else(|| atom("undefined")))
+                    }
+                    "gifmtu" | "giftxqlen" => ok(O::Int(i64::from(ifreq.int()))),
+                    "gifhwaddr" => {
+                        let family = u16::from_ne_bytes(ifreq.data[..2].try_into().unwrap());
+                        ok(map(&[
+                            ("family", ioctl_hwaddr_family(family)),
+                            ("addr", O::Binary(ifreq.data[2..16].to_vec())),
+                        ]))
+                    }
+                    "gifmap" => {
+                        let word = std::mem::size_of::<libc::c_ulong>();
+                        let mem_start =
+                            libc::c_ulong::from_ne_bytes(ifreq.data[..word].try_into().unwrap());
+                        let mem_end = libc::c_ulong::from_ne_bytes(
+                            ifreq.data[word..2 * word].try_into().unwrap(),
+                        );
+                        ok(map(&[
+                            ("mem_start", O::Int(mem_start as i64)),
+                            ("mem_end", O::Int(mem_end as i64)),
+                            (
+                                "base_addr",
+                                O::Int(i64::from(u16::from_ne_bytes(
+                                    ifreq.data[2 * word..2 * word + 2].try_into().unwrap(),
+                                ))),
+                            ),
+                            ("irq", O::Int(i64::from(ifreq.data[2 * word + 2]))),
+                            ("dma", O::Int(i64::from(ifreq.data[2 * word + 3]))),
+                            ("port", O::Int(i64::from(ifreq.data[2 * word + 4]))),
+                        ]))
+                    }
+                    _ => error("enotsup"),
+                },
+            },
+        );
+    }
+
+    if args.len() == 4 {
+        let Some(request_name) = request_name.as_deref() else {
+            return Ok(error("enotsup"));
+        };
+        if !matches!(
+            request_name,
+            "sifflags"
+                | "sifaddr"
+                | "sifdstaddr"
+                | "sifbrdaddr"
+                | "sifnetmask"
+                | "sifmtu"
+                | "siftxqlen"
+                | "sifhwaddr"
+        ) {
+            return Ok(error("enotsup"));
+        }
+        let name = ioctl_ifname(&args[2])?;
+        let mut ifreq = IoctlIfReq::for_name(name);
+        if request_name == "sifflags" {
+            let Some(get_flags) = ioctl_request_code("gifflags") else {
+                return Ok(error("enotsup"));
+            };
+            if let Err(err) = call(get_flags, (&mut ifreq as *mut IoctlIfReq).cast()) {
+                return Ok(fail(&err));
+            }
+            let flags = ioctl_flags_value(&args[3], ifreq.short())?;
+            ifreq.set_short(flags);
+        } else if matches!(request_name, "sifmtu" | "siftxqlen") {
+            let value = match integer(&args[3]) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(invalid(if request_name == "sifmtu" {
+                        "mtu"
+                    } else {
+                        "txqlen"
+                    }));
+                }
+            };
+            ifreq.set_int(value);
+        } else {
+            let encoded = if request_name == "sifhwaddr" {
+                ioctl_hwaddr_value(&args[3])
+            } else {
+                ioctl_sockaddr_bytes(&args[3])
+            };
+            let Some(encoded) = encoded else {
+                return Ok(invalid(if request_name == "sifhwaddr" {
+                    "hwaddr"
+                } else {
+                    "sockaddr"
+                }));
+            };
+            let copy_len = encoded.len().min(ifreq.data.len());
+            ifreq.data[..copy_len].copy_from_slice(&encoded[..copy_len]);
+        }
+        return Ok(
+            match call(request, (&mut ifreq as *mut IoctlIfReq).cast()) {
+                Ok(()) => atom("ok"),
+                Err(err) => fail(&err),
+            },
+        );
+    }
+
     Ok(error("enotsup"))
 }
 /// The protocol database rows as `getprotoent(3)` yields them: name, number, aliases.
@@ -2781,6 +3481,60 @@ mod tests {
             atom("ok")
         );
     }
+    fn normalized_term(value: &O) -> String {
+        match value {
+            O::Map(entries) => {
+                let mut entries: Vec<_> = entries
+                    .iter()
+                    .map(|(key, value)| {
+                        format!("{}=>{}", normalized_term(key), normalized_term(value))
+                    })
+                    .collect();
+                entries.sort();
+                format!("#{{{}}}", entries.join(","))
+            }
+            O::Tuple(values) => format!(
+                "{{{}}}",
+                values
+                    .iter()
+                    .map(normalized_term)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            O::List { elems, tail } => format!(
+                "[{}|{}]",
+                elems
+                    .iter()
+                    .map(normalized_term)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                normalized_term(tail)
+            ),
+            _ => format!("{value:?}"),
+        }
+    }
+
+    fn eval_otp_term(expression: &str, path: &std::path::Path) -> Option<O> {
+        let output = match Command::new("timeout")
+            .args(["30", "erl", "-noshell", "-eval", expression])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => {
+                eprintln!("skipping ioctl differential: timeout or erl not installed");
+                return None;
+            }
+        };
+        assert!(
+            output.status.success(),
+            "OTP ioctl expression failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let term = arinsal_etf::decode(&std::fs::read(path).unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+        Some(term)
+    }
+
     fn invoke_bif(module: &str, op: &str, args: &[O]) -> O {
         let mut heap = ProcessHeap::with_words(2048);
         let mut alloc = ProcessHeapHandle(&mut heap);
@@ -4119,6 +4873,224 @@ mod tests {
         );
         assert_eq!(invoke("nif_close", &[sock]), atom("ok"));
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interface_ioctl_reads_match_otp_on_loopback() {
+        let (_lock, _reactor) = caller_reactor();
+        let path =
+            std::env::temp_dir().join(format!("arinsal_ioctl_reads_{}.etf", std::process::id()));
+        let expression = format!(
+            "{{ok,S}}=socket:open(inet,dgram,udp),R=[{{gifconf,socket:ioctl(S,gifconf)}},{{gifaddr,socket:ioctl(S,gifaddr,\"lo0\")}},{{gifnetmask,socket:ioctl(S,gifnetmask,\"lo0\")}},{{gifmtu,socket:ioctl(S,gifmtu,\"lo0\")}},{{gifflags,socket:ioctl(S,gifflags,\"lo0\")}}],socket:close(S),ok=file:write_file(\"{}\",term_to_binary(R)),halt().",
+            path.display()
+        );
+        let Some(expected) = eval_otp_term(&expression, &path) else {
+            return;
+        };
+        let socket = open_socket("inet", "dgram", libc::IPPROTO_UDP.into());
+        for row in list(&expected).unwrap() {
+            let O::Tuple(parts) = row else {
+                panic!("bad OTP ioctl row: {row:?}")
+            };
+            let request_name = name(&parts[0]).unwrap();
+            let request = ioctl_request_code(request_name).unwrap();
+            let actual = if request_name == "gifconf" {
+                invoke("nif_ioctl", &[socket.clone(), O::Int(request as i64)])
+            } else {
+                invoke(
+                    "nif_ioctl",
+                    &[
+                        socket.clone(),
+                        O::Int(request as i64),
+                        O::list(vec![
+                            O::Int(b'l'.into()),
+                            O::Int(b'o'.into()),
+                            O::Int(b'0'.into()),
+                        ]),
+                    ],
+                )
+            };
+            similar_asserts::assert_eq!(
+                normalized_term(&actual),
+                normalized_term(&parts[1]),
+                "{request_name}"
+            );
+        }
+        close_socket(&socket);
+        assert!(ioctl_request_code("gifindex").is_none());
+        assert!(ioctl_request_code("gifname").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interface_ioctl_setter_errors_match_otp_without_touching_interfaces() {
+        let (_lock, _reactor) = caller_reactor();
+        let path =
+            std::env::temp_dir().join(format!("arinsal_ioctl_setters_{}.etf", std::process::id()));
+        let expression = format!(
+            "{{ok,S}}=socket:open(inet,dgram,udp),Name=\"arinsal_noif0\",Addr=#{{family=>inet,addr=>{{127,0,0,1}},port=>0}},SRef=element(2,S),R=[{{sifflags,socket:ioctl(S,sifflags,Name,#{{}})}},{{sifaddr,socket:ioctl(S,sifaddr,Name,Addr)}},{{sifdstaddr,socket:ioctl(S,sifdstaddr,Name,Addr)}},{{sifbrdaddr,socket:ioctl(S,sifbrdaddr,Name,Addr)}},{{sifnetmask,prim_socket:ioctl(SRef,16#80206916,Name,Addr)}},{{sifmtu,socket:ioctl(S,sifmtu,Name,-1)}}],socket:close(S),ok=file:write_file(\"{}\",term_to_binary(R)),halt().",
+            path.display()
+        );
+        let Some(expected) = eval_otp_term(&expression, &path) else {
+            return;
+        };
+        let socket = open_socket("inet", "dgram", libc::IPPROTO_UDP.into());
+        let absent = O::list(
+            "arinsal_noif0"
+                .bytes()
+                .map(|byte| O::Int(i64::from(byte)))
+                .collect(),
+        );
+        let addr = map(&[
+            ("family", atom("inet")),
+            (
+                "addr",
+                O::tuple(vec![O::Int(127), O::Int(0), O::Int(0), O::Int(1)]),
+            ),
+            ("port", O::Int(0)),
+        ]);
+        let mut request_codes = [
+            ("sifflags", ioctl_request_code("sifflags")),
+            ("sifaddr", ioctl_request_code("sifaddr")),
+            ("sifdstaddr", ioctl_request_code("sifdstaddr")),
+            ("sifbrdaddr", ioctl_request_code("sifbrdaddr")),
+            ("sifnetmask", Some(0x8020_6916)),
+            ("sifmtu", ioctl_request_code("sifmtu")),
+        ];
+        for row in list(&expected).unwrap() {
+            let O::Tuple(parts) = row else {
+                panic!("bad OTP ioctl setter row: {row:?}")
+            };
+            let request_name = name(&parts[0]).unwrap();
+            let request = request_codes
+                .iter_mut()
+                .find(|(name, _)| *name == request_name)
+                .and_then(|(_, request)| request.take())
+                .expect("setter request code");
+            let value = match request_name {
+                "sifflags" => O::Map(vec![]),
+                "sifmtu" => O::Int(-1),
+                _ => addr.clone(),
+            };
+            let actual = invoke(
+                "nif_ioctl",
+                &[
+                    socket.clone(),
+                    O::Int(request as i64),
+                    absent.clone(),
+                    value,
+                ],
+            );
+            similar_asserts::assert_eq!(
+                normalized_term(&actual),
+                normalized_term(&parts[1]),
+                "{request_name}"
+            );
+        }
+        close_socket(&socket);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interface_ioctl_setter_permission_errors_match_otp_without_changes() {
+        let (_lock, _reactor) = caller_reactor();
+        let path = std::env::temp_dir().join(format!(
+            "arinsal_ioctl_permission_{}.etf",
+            std::process::id()
+        ));
+        let expression = format!(
+            "{{ok,S}}=socket:open(inet,dgram,udp),N=\"lo0\",{{ok,M}}=socket:ioctl(S,gifmtu,N),R=[{{sifflags,#{{}},socket:ioctl(S,sifflags,N,#{{}})}},{{sifmtu,M,socket:ioctl(S,sifmtu,N,M)}}],socket:close(S),ok=file:write_file(\"{}\",term_to_binary(R)),halt().",
+            path.display()
+        );
+        let Some(expected) = eval_otp_term(&expression, &path) else {
+            return;
+        };
+        let socket = open_socket("inet", "dgram", libc::IPPROTO_UDP.into());
+        for row in list(&expected).unwrap() {
+            let O::Tuple(parts) = row else {
+                panic!("bad OTP ioctl permission row: {row:?}")
+            };
+            let request_name = name(&parts[0]).unwrap();
+            let request = ioctl_request_code(request_name).unwrap();
+            let actual = invoke(
+                "nif_ioctl",
+                &[
+                    socket.clone(),
+                    O::Int(request as i64),
+                    O::list(vec![
+                        O::Int(b'l'.into()),
+                        O::Int(b'o'.into()),
+                        O::Int(b'0'.into()),
+                    ]),
+                    parts[1].clone(),
+                ],
+            );
+            let O::Tuple(error_parts) = &parts[2] else {
+                panic!("expected an OTP setter error: {:?}", parts[2])
+            };
+            assert!(error_parts[0] == atom("error"));
+            assert!(matches!(name(&error_parts[1]), Some("eperm" | "einval")));
+            similar_asserts::assert_eq!(
+                normalized_term(&actual),
+                normalized_term(&parts[2]),
+                "{request_name}"
+            );
+        }
+        close_socket(&socket);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interface_ioctl_setter_decode_errors_match_otp() {
+        let (_lock, _reactor) = caller_reactor();
+        let path = std::env::temp_dir().join(format!(
+            "arinsal_ioctl_decode_errors_{}.etf",
+            std::process::id()
+        ));
+        let expression = format!(
+            "{{ok,S}}=socket:open(inet,dgram,udp),SRef=element(2,S),N=\"lo0\",A=#{{family=>inet,port=>0}},R=[{{sifaddr,prim_socket:ioctl(SRef,sifaddr,N,A)}},{{sifmtu,prim_socket:ioctl(SRef,sifmtu,N,not_an_integer)}}],socket:close(S),ok=file:write_file(\"{}\",term_to_binary(R)),halt().",
+            path.display()
+        );
+        let Some(expected) = eval_otp_term(&expression, &path) else {
+            return;
+        };
+        let socket = open_socket("inet", "dgram", libc::IPPROTO_UDP.into());
+        let ifname = O::list(vec![
+            O::Int(b'l'.into()),
+            O::Int(b'o'.into()),
+            O::Int(b'0'.into()),
+        ]);
+        let bad_addr = map(&[("family", atom("inet")), ("port", O::Int(0))]);
+        let bad_mtu = atom("not_an_integer");
+        for row in list(&expected).unwrap() {
+            let O::Tuple(parts) = row else {
+                panic!("bad OTP ioctl decoder row: {row:?}")
+            };
+            let request_name = name(&parts[0]).unwrap();
+            let request = ioctl_request_code(request_name).unwrap();
+            let value = if request_name == "sifaddr" {
+                bad_addr.clone()
+            } else {
+                bad_mtu.clone()
+            };
+            let actual = invoke(
+                "nif_ioctl",
+                &[
+                    socket.clone(),
+                    O::Int(request as i64),
+                    ifname.clone(),
+                    value,
+                ],
+            );
+            similar_asserts::assert_eq!(
+                normalized_term(&actual),
+                normalized_term(&parts[1]),
+                "{request_name}"
+            );
+        }
+        close_socket(&socket);
+    }
+
     #[test]
     fn support_tables_reconstruct_otp_wrapper_maps() {
         let snapshot = arinsal_etf::decode(include_bytes!(concat!(
