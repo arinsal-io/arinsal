@@ -131,6 +131,32 @@ pub fn copy_shallow<H: HeapAlloc + ?Sized>(
     Ok(Term(root.0.wrapping_add(offset)))
 }
 
+/// Copy a nonempty tuple whose elements are all immediates in one pass, without sizing it first.
+/// `None` for any other term, which the caller copies with [`copy_struct`]. The copy occupies
+/// the tuple's arity plus one words.
+// Port of erts/emulator/beam/copy.c (copy_struct_x, the const-tuple case: a tuple with only
+// immediate elements needs no scan), OTP-29.1.1.
+pub fn copy_flat_tuple<H: HeapAlloc + ?Sized>(
+    root: Term,
+    dst: &mut H,
+) -> Option<Result<Term, TermError>> {
+    // SAFETY: the caller holds `root`'s heap live for this call, like every `Term` accessor.
+    let tuple = unsafe { root.tuple_ref() }?;
+    let elements = tuple.elements;
+    if elements.is_empty() || elements.iter().any(|&word| word & 3 != 3) {
+        return None;
+    }
+    let words = elements.len() + 1;
+    let Some(base) = dst.alloc(words) else {
+        return Some(Err(TermError::HeapFull));
+    };
+    // SAFETY: `alloc` returned `words` writable words that do not alias the source tuple.
+    let out = unsafe { std::slice::from_raw_parts_mut(base, words) };
+    out[0] = ((elements.len() as u64) << 6) | ARITY;
+    out[1..].copy_from_slice(elements);
+    Some(Ok(Term::from_ptr(base, 2)))
+}
+
 /// Copy a term, keeping references to literals outside the collector's purge area.
 /// `literals` must be the snapshot used to size the destination.
 /// Port of erts/emulator/beam/copy.c:647 (copy_struct_x with a litopt), OTP-29.1.1.
@@ -914,5 +940,38 @@ mod shallow_tests {
             crate::to_owned(copy).unwrap(),
             crate::to_owned(root).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod flat_tuple_tests {
+    use super::*;
+    use crate::{TermBuilder, VecHeap};
+
+    #[test]
+    fn copies_tuples_of_immediates_only() {
+        let mut source = VecHeap::new();
+        let flat = TermBuilder::new(&mut source)
+            .tuple(&[Term::small(1).unwrap(), Term::NIL])
+            .unwrap();
+        let mut dst = VecHeap::new();
+        let copy = copy_flat_tuple(flat, &mut dst)
+            .expect("a flat tuple")
+            .unwrap();
+        assert_ne!(copy.0, flat.0);
+        assert_eq!(
+            crate::to_owned(copy).unwrap(),
+            crate::to_owned(flat).unwrap()
+        );
+        let inner = TermBuilder::new(&mut source)
+            .tuple(&[Term::small(2).unwrap()])
+            .unwrap();
+        let nested = TermBuilder::new(&mut source)
+            .tuple(&[Term::small(1).unwrap(), inner])
+            .unwrap();
+        assert!(copy_flat_tuple(nested, &mut dst).is_none());
+        let empty = TermBuilder::new(&mut source).tuple(&[]).unwrap();
+        assert!(copy_flat_tuple(empty, &mut dst).is_none());
+        assert!(copy_flat_tuple(Term::small(1).unwrap(), &mut dst).is_none());
     }
 }
