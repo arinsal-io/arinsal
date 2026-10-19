@@ -1912,9 +1912,25 @@ struct DrvPollState {
     fired: HashSet<u64>,
 }
 
+/// Registration bookkeeping shards: ports arm and fire their events concurrently, so the
+/// table is split by registration id.
+const POLL_SHARDS: usize = 64;
+
 /// The shared poller as the `driver_select` poll set.
 struct DrvPoll {
-    state: Arc<Mutex<DrvPollState>>,
+    state: Arc<Vec<Mutex<DrvPollState>>>,
+}
+
+impl DrvPoll {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(
+                (0..POLL_SHARDS)
+                    .map(|_| Mutex::new(DrvPollState::default()))
+                    .collect(),
+            ),
+        }
+    }
 }
 
 impl arinsal_drv::PollBackend for DrvPoll {
@@ -1934,7 +1950,7 @@ impl arinsal_drv::PollBackend for DrvPoll {
             },
             move |_, _| {
                 {
-                    let mut state = state.lock().unwrap();
+                    let mut state = state[id as usize % POLL_SHARDS].lock().unwrap();
                     if state.live.remove(&id).is_none() {
                         state.fired.insert(id);
                     }
@@ -1942,7 +1958,7 @@ impl arinsal_drv::PollBackend for DrvPoll {
                 ready();
             },
         )?;
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state[id as usize % POLL_SHARDS].lock().unwrap();
         if !state.fired.remove(&id) {
             state.live.insert(id, registration);
         }
@@ -1950,7 +1966,11 @@ impl arinsal_drv::PollBackend for DrvPoll {
     }
 
     fn deregister(&self, id: u64) {
-        let registration = self.state.lock().unwrap().live.remove(&id);
+        let registration = self.state[id as usize % POLL_SHARDS]
+            .lock()
+            .unwrap()
+            .live
+            .remove(&id);
         if let Some(registration) = registration {
             crate::check_io::deregister(registration);
         }
@@ -2010,9 +2030,7 @@ impl arinsal_drv::SystemHooks for VmHooks {
 pub(crate) fn install_poll_backend() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
-        arinsal_drv::set_poll_backend(Arc::new(DrvPoll {
-            state: Arc::default(),
-        }));
+        arinsal_drv::set_poll_backend(Arc::new(DrvPoll::new()));
     });
 }
 

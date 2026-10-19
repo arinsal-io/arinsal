@@ -84,10 +84,15 @@ struct FdState {
     dirs: [Dir; 2],
 }
 
-fn table() -> MutexGuard<'static, HashMap<i32, FdState>> {
-    static TABLE: OnceLock<Mutex<HashMap<i32, FdState>>> = OnceLock::new();
-    TABLE
-        .get_or_init(|| Mutex::new(HashMap::new()))
+/// The descriptor event table (`ErtsDrvEventState` array), split in shards by descriptor
+/// so selections of different descriptors do not contend (erl_check_io.c locks per
+/// descriptor state; `fd_status` is a lock array indexed by fd).
+const SHARDS: usize = 64;
+
+fn table(fd: i32) -> MutexGuard<'static, HashMap<i32, FdState>> {
+    static TABLE: OnceLock<Vec<Mutex<HashMap<i32, FdState>>>> = OnceLock::new();
+    TABLE.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect())
+        [fd as usize % SHARDS]
         .lock()
         .unwrap()
 }
@@ -296,7 +301,7 @@ pub(crate) fn driver_select(port: &Arc<DriverPort>, fd: i32, mode: c_int, on: bo
         return -1;
     }
     let mut mode = mode;
-    let mut table = table();
+    let mut table = table(fd);
     if !on {
         if !table.contains_key(&fd) {
             drop(table);
@@ -451,7 +456,7 @@ pub fn nif_select(
     if fd < 0 {
         return i32::MIN | INVALID_EVENT;
     }
-    let mut table = table();
+    let mut table = table(fd);
     let known = table.contains_key(&fd);
     let (on, mode) = if mode & STOP != 0 {
         if !known {
@@ -634,7 +639,7 @@ fn notify(fd: i32, dir: usize, reg: u64) {
 /// input or output task of the owning port, or is reported stale.
 fn fired(fd: i32, dir: usize, reg: u64) {
     let owner = {
-        let mut table = table();
+        let mut table = table(fd);
         let Some(state) = table.get_mut(&fd) else {
             return;
         };
@@ -668,7 +673,7 @@ fn fired(fd: i32, dir: usize, reg: u64) {
     };
     if !owner.schedule_io(fd, dir, reg) {
         // The port is exiting and takes no more tasks (erl_port_task.c:1517 fail).
-        let mut table = table();
+        let mut table = table(fd);
         if let Some(state) = table.get_mut(&fd)
             && state.dirs[dir].reg == Some(reg)
         {
@@ -685,7 +690,7 @@ fn fired(fd: i32, dir: usize, reg: u64) {
 /// OTP-29.1.1.
 pub(crate) fn ready(port: &DriverPort, fd: i32, dir: usize, reg: u64) -> i32 {
     let owner = {
-        let mut table = table();
+        let mut table = table(fd);
         let Some(state) = table.get_mut(&fd) else {
             return 0;
         };
@@ -710,7 +715,7 @@ pub(crate) fn ready(port: &DriverPort, fd: i32, dir: usize, reg: u64) -> i32 {
         owner
     };
     let ran = owner.run_io(dir, fd, reg);
-    let mut table = table();
+    let mut table = table(fd);
     if let Some(state) = table.get_mut(&fd)
         && state.dirs[dir].running == Some(reg)
     {
@@ -725,7 +730,7 @@ pub(crate) fn ready(port: &DriverPort, fd: i32, dir: usize, reg: u64) -> i32 {
 /// Whether a scheduled ready task still owns the selected direction after taking the
 /// port lock (`abort_tasks` in erl_check_io.c:662-682).
 pub(crate) fn begin_io_task(port: &DriverPort, fd: i32, dir: usize, reg: u64) -> bool {
-    let mut table = table();
+    let mut table = table(fd);
     table.get_mut(&fd).is_some_and(|state| {
         let current = io_task_matches(state, dir, reg)
             && !state.dirs[dir].executing
