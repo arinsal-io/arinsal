@@ -4,8 +4,8 @@ use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{HaltProgress, Pid, RunCtx, Scheduler};
 use arinsal_term::{
-    ProcessHeap, Term, TermBuilder, TermKind, VecHeap, copy_term, from_owned, global_atoms,
-    to_owned,
+    HeapAlloc, ProcessHeap, Term, TermBuilder, TermKind, VecHeap, copy_term, from_owned,
+    global_atoms, to_owned,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -208,6 +208,8 @@ struct BusyLimits {
 
 struct PortState {
     outq: VecDeque<u8>,
+    bytes_in: u64,
+    bytes_out: u64,
     /// Bytes scheduled ahead of the driver when `{parallelism, true}`.
     msgq: usize,
     pending: VecDeque<Vec<u8>>,
@@ -368,6 +370,16 @@ impl PortHandle {
     }
     pub(crate) fn port_name(&self) -> String {
         self.name.clone()
+    }
+
+    fn add_bytes_in(&self, count: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.bytes_in = state.bytes_in.wrapping_add(count as u64);
+    }
+
+    fn add_bytes_out(&self, count: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.bytes_out = state.bytes_out.wrapping_add(count as u64);
     }
 
     pub(crate) fn tcp_driver_data(&self) -> Option<Arc<crate::inet_drv::Sock>> {
@@ -546,6 +558,13 @@ fn tuple(t: Term) -> Option<Vec<Term>> {
     // SAFETY: The borrowed tuple is collected while the caller heap remains live.
     unsafe { t.tuple_ref() }.map(|v| v.iter().collect())
 }
+fn unsigned_term(term: Term) -> Option<u64> {
+    match &to_owned(term).ok()? {
+        OwnedTerm::Int(value) => u64::try_from(*value).ok(),
+        OwnedTerm::BigInt(value) => num_traits::ToPrimitive::to_u64(value),
+        _ => None,
+    }
+}
 struct PortOptions {
     binary: bool,
     framing: Option<(u8, usize)>,
@@ -677,15 +696,17 @@ fn options(t: Term) -> Option<PortOptions> {
                     if limits.len() != 2 {
                         return None;
                     }
-                    let mut low = limits[0].as_small()?;
-                    let high = limits[1].as_small()?;
-                    if low < 1 || high < 1 {
+                    // Port of term_to_Uint in erl_bif_port.c:928-930, OTP-29.1.1.
+                    let mut low = usize::try_from(unsigned_term(limits[0])?).ok()?;
+                    let high = usize::try_from(unsigned_term(limits[1])?).ok()?;
+                    // ERL_DRV_BUSY_MSGQ_LIM_MAX is Uint max minus one; Uint max is reserved.
+                    if low == 0 || high == 0 || low == usize::MAX || high == usize::MAX {
                         return None;
                     }
                     if low > high {
                         low = high;
                     }
-                    (low as usize, high as usize, true)
+                    (low, high, true)
                 };
                 if port_limit {
                     opts.limits.port_low = low;
@@ -752,6 +773,7 @@ fn output_message(
 
 // Port of erts/emulator/drivers/common/ram_file_drv.c:217-229 (driver_output2 replies).
 pub(crate) fn static_driver_output(handle: &PortHandle, bytes: &[u8]) {
+    handle.add_bytes_in(bytes.len());
     output_message(
         &handle.scheduler,
         handle.owner_pid(),
@@ -776,6 +798,7 @@ pub(crate) fn static_driver_output_binary(
         static_driver_output(handle, &reply);
         return;
     }
+    handle.add_bytes_in(header.len() + bytes.len());
     let Some(port) = Term::port(handle.id) else {
         return;
     };
@@ -1434,6 +1457,7 @@ impl arinsal_drv::PortHost for DrvHost {
         };
         let owner = handle.owner_pid();
         let len = data.map_or(0, <[u8]>::len) + header.len();
+        handle.add_bytes_in(len + usize::from(line == Some(true)));
         let mut heap = ProcessHeap::with_words(output_heap_words(len, false, 32));
         let build = |heap: &mut ProcessHeap| -> Result<Term, arinsal_term::TermError> {
             let mut list = match data {
@@ -1571,6 +1595,7 @@ impl arinsal_drv::PortHost for DrvHost {
             return;
         };
         let total: usize = segments.iter().map(Vec::len).sum();
+        handle.add_bytes_in(header.len() + total);
         let words = if binary {
             total / 4 + segments.len() * 12
         } else {
@@ -2356,6 +2381,8 @@ fn make_handle_with(
         limits,
         state: Mutex::new(PortState {
             outq: VecDeque::new(),
+            bytes_in: 0,
+            bytes_out: 0,
             msgq: 0,
             pending: VecDeque::new(),
             busy_port: false,
@@ -2496,6 +2523,9 @@ fn poke(handle: &PortHandle) {
 
 fn wake_suspended(scheduler: &Scheduler<Process>, pids: Vec<Pid>) {
     for pid in pids {
+        // A busy-port sender owns one internal suspend until the port falls below its low
+        // watermark. The port task releases it before making the retried send runnable.
+        let _ = scheduler.signal(pid, pid, arinsal_sched::Signal::SuspendResume);
         // UnlinkAck wakes a waiting process without entering its mailbox.
         let _ = scheduler.signal(pid, pid, arinsal_sched::Signal::UnlinkAck(0));
     }
@@ -2986,6 +3016,7 @@ fn worker(
                 }
             } else {
                 let n = n as usize;
+                handle.add_bytes_in(n);
                 if framing.is_none() {
                     output_message(&scheduler, owner, id, &buf[..n], binary, handle.trace_scope);
                 } else {
@@ -3165,12 +3196,21 @@ fn decode_frames(
 }
 
 fn lookup_port(process: &Process, term: Term) -> Result<Arc<PortHandle>, VmError> {
-    let id = term.as_port().ok_or_else(badarg)?;
+    let id = port_id(process, term).ok_or_else(badarg)?;
     process
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
         .ok_or_else(badarg)
+}
+
+/// Resolve a port identifier or its registered name as `erts_whereis_name_to_id` does.
+fn port_id(process: &Process, term: Term) -> Option<u64> {
+    if let Some(id) = term.as_port() {
+        return Some(id);
+    }
+    let name = term.as_atom()?;
+    process.runtime.as_ref()?.reg.whereis_port(name)
 }
 
 pub(crate) fn is_live(process: &Process, id: u64) -> bool {
@@ -3265,7 +3305,7 @@ fn port_control(
     data: Term,
 ) -> Result<Term, VmError> {
     let caller = ctx.pid();
-    let Some(id) = port.as_port() else {
+    let Some(id) = port_id(process, port) else {
         return Ok(atom("badarg"));
     };
     let Some(handle) = process
@@ -3304,7 +3344,7 @@ fn port_call(
     op: Term,
     data: Term,
 ) -> Result<Term, VmError> {
-    let Some(id) = port.as_port() else {
+    let Some(id) = port_id(process, port) else {
         return Ok(atom("badarg"));
     };
     let Some(handle) = process
@@ -3420,7 +3460,7 @@ fn port_command(
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_port.c:168 (erts_internal_port_command_3), OTP-29.1.1.
-    let id = port.as_port().ok_or_else(badarg)?;
+    let id = port_id(process, port).ok_or_else(badarg)?;
     let handle = process
         .runtime
         .as_ref()
@@ -3489,6 +3529,7 @@ fn port_command(
         }
     }
     let mut framed = iodata(data).ok_or_else(badarg)?;
+    let bytes_out = framed.len();
     if handle.inet {
         let st = handle.state.lock().unwrap();
         if st.closed || st.broken || st.graceful_close {
@@ -3498,12 +3539,20 @@ fn port_command(
         // Port of erts/emulator/drivers/common/inet_drv.c:12629 (tcp_inet_command), OTP-29.1.1.
         // g_inet_udp: datagram sends use packet_inet_command, not tcp_sendv.
         if let Some(sock) = handle.udp_driver_data() {
-            return crate::inet_udp::command(&sock, ctx.pid(), &framed).map(|()| atom("true"));
+            let result = crate::inet_udp::command(&sock, ctx.pid(), &framed);
+            if result.is_ok() {
+                handle.add_bytes_out(bytes_out);
+            }
+            return result.map(|()| atom("true"));
         }
         let Some(sock) = handle.tcp_driver_data() else {
             return Err(badarg());
         };
-        return crate::inet_drv::command(&sock, ctx.pid(), framed).map(|()| atom("true"));
+        let result = crate::inet_drv::command(&sock, ctx.pid(), framed);
+        if result.is_ok() {
+            handle.add_bytes_out(bytes_out);
+        }
+        return result.map(|()| atom("true"));
     }
     let ram_file = handle.ram_file.lock().unwrap().clone();
     if let Some(ram_file) = ram_file {
@@ -3513,9 +3562,11 @@ fn port_command(
         }
         drop(state);
         trace_command_received_data(process, ctx.pid(), id, data, &framed);
-        return crate::ram_file_drv::command(&ram_file, &handle, &framed)
-            .map(|()| atom("true"))
-            .map_err(|()| badarg());
+        let result = crate::ram_file_drv::command(&ram_file, &handle, &framed);
+        if result.is_ok() {
+            handle.add_bytes_out(bytes_out);
+        }
+        return result.map(|()| atom("true")).map_err(|()| badarg());
     }
     if let Some((2, hdr)) = handle.framing {
         match hdr {
@@ -3553,6 +3604,7 @@ fn port_command(
                 return Ok(atom("false"));
             }
             let busy_port = st.busy_port;
+            crate::suspend::suspend_self(process);
             st.suspended.push(ctx.pid());
             drop(st);
             if busy_port {
@@ -3564,6 +3616,7 @@ fn port_command(
     }
     trace_command_received_data(process, ctx.pid(), id, data, &framed);
     command_bytes(&handle, &framed).map_err(|()| badarg())?;
+    handle.add_bytes_out(bytes_out);
     Ok(atom("true"))
 }
 
@@ -3764,7 +3817,7 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
     let sender = process.self_pid.ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler().map_err(|_| badarg())?;
-    let id = term.as_port().ok_or_else(badarg)?;
+    let id = port_id(process, term).ok_or_else(badarg)?;
     if trace_receive && let Some(caller) = sender.to_term() {
         let mut heap = VecHeap::new();
         if let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, atom("close")]) {
@@ -3802,7 +3855,7 @@ fn port_close(
     port: Term,
 ) -> Result<Term, VmError> {
     let caller = ctx.pid();
-    if let Some(id) = port.as_port()
+    if let Some(id) = port_id(process, port)
         && let Some(handle) = process
             .runtime
             .as_ref()
@@ -3939,7 +3992,7 @@ pub(crate) fn halt_reap_ports(runtime: &Arc<crate::process::Runtime>, progress: 
 }
 
 fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Result<Term, VmError> {
-    let id = port.as_port().ok_or_else(badarg)?;
+    let id = port_id(process, port).ok_or_else(badarg)?;
     let pid = Pid::from_term(pid).ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let handle = runtime
@@ -4356,6 +4409,7 @@ fn output_command(
             signal_badsig(handle, id);
             return;
         }
+        let bytes_out = pieces.iter().map(|(bytes, _)| bytes.len()).sum();
         let pieces = pieces
             .iter()
             .map(|(bytes, refc)| {
@@ -4375,9 +4429,9 @@ fn output_command(
                 drv_port.outputv_trace_segments(&pieces),
             );
         }
-        if !drv_port.output(&pieces, packed_pid(from))
-            && runtime.ports.lock().unwrap().contains_key(&id)
-        {
+        if drv_port.output(&pieces, packed_pid(from)) {
+            handle.add_bytes_out(bytes_out);
+        } else if runtime.ports.lock().unwrap().contains_key(&id) {
             signal_badsig(handle, id);
         }
         return;
@@ -4386,6 +4440,7 @@ fn output_command(
         signal_badsig(handle, id);
         return;
     };
+    let bytes_out = data.len();
     if let Some(process) = tracer {
         trace_command_received(
             process,
@@ -4399,6 +4454,8 @@ fn output_command(
     if let Some(ram_file) = ram_file {
         if crate::ram_file_drv::command(&ram_file, handle, &data).is_err() {
             signal_badsig(handle, id);
+        } else {
+            handle.add_bytes_out(bytes_out);
         }
         return;
     }
@@ -4433,6 +4490,8 @@ fn output_command(
     }
     if command_bytes(handle, &data).is_err() {
         signal_badsig(handle, id);
+    } else {
+        handle.add_bytes_out(bytes_out);
     }
 }
 
@@ -4649,6 +4708,27 @@ fn send_message_inner(
         );
     }
     if command.len() == 2 && command[0] == atom("command") {
+        // Port of erts/emulator/beam/io.c:1715-1754 (erts_port_output), OTP-29.1.1.
+        // `SEND_YIELD` leaves an already-busy port command unsent and retries it after resume.
+        if drv.is_none() {
+            let mut state = handle.state.lock().unwrap();
+            if state.busy_port || state.busy_msgq {
+                if !nosuspend {
+                    let pid = ctx.as_deref().map_or(from, |ctx| ctx.pid());
+                    if process.self_pid == Some(pid) {
+                        crate::suspend::suspend_self(process);
+                    }
+                    state.suspended.push(pid);
+                    let busy_port = state.busy_port;
+                    drop(state);
+                    if busy_port {
+                        crate::natives::erts_debug::notify_busy_port(process, pid, id);
+                    }
+                    BUSY_SUSPEND.with(|flag| flag.set(true));
+                }
+                return Ok((PortSend::Busy, None));
+            }
+        }
         output_command(runtime, &handle, id, from, command[1], Some(process));
         return Ok(sent());
     }
@@ -4778,8 +4858,27 @@ fn forker_port_info(process: &mut Process, item: Option<Term>) -> Result<Term, V
         .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")))
 }
 
+fn port_counter_term(heap: &mut impl HeapAlloc, counter: u64) -> Result<Term, VmError> {
+    TermBuilder::new(heap)
+        .int_from_bigint(&num_bigint::BigInt::from(counter))
+        .map_err(|e| VmError::Unsupported(format!("port info counter: {e:?}")))
+}
+
 fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Term, VmError> {
-    let id = port.as_port().ok_or_else(badarg)?;
+    let id = match (port.as_port(), port.as_atom()) {
+        (Some(id), _) => id,
+        (None, Some(name)) => {
+            let Some(id) = process
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.reg.whereis_port(name))
+            else {
+                return Ok(atom("undefined"));
+            };
+            id
+        }
+        (None, None) => return Err(badarg()),
+    };
     let Some(handle) = process
         .runtime
         .as_ref()
@@ -4830,10 +4929,16 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         .list_from_iter(process_monitors)
         .map_err(|e| VmError::Unsupported(format!("port info monitors: {e:?}")))?;
     let memory = 48 + monitored_pids.len() * 24;
+    let (input_count, output_count, outq_size) = {
+        let state = handle.state.lock().unwrap();
+        (state.bytes_in, state.bytes_out, state.outq.len())
+    };
+    let input = port_counter_term(&mut heap, input_count)?;
+    let output = port_counter_term(&mut heap, output_count)?;
     let queue_size = drv_port.map_or_else(
         || match handle.tcp_driver_data() {
             Some(sock) => sock.out_queue_size(),
-            None => handle.state.lock().unwrap().outq.len(),
+            None => outq_size,
         },
         |drv| drv.queue_size(),
     );
@@ -4847,13 +4952,19 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     let monitored_by = TermBuilder::new(&mut heap)
         .list_from_iter(monitored_pids)
         .map_err(|error| VmError::Unsupported(format!("port monitored_by: {error:?}")))?;
+    let registered_atom = handle.registered_atom();
+    let has_registered_name = registered_atom.is_some();
+    let registered_name = registered_atom
+        .map(Term::atom)
+        .unwrap_or_else(|| atom("undefined"));
     let fields = [
+        ("registered_name", registered_name),
         ("name", name),
         ("links", links),
         ("id", Term::small(id as i64).unwrap()),
         ("connected", connected),
-        ("input", Term::small(0).unwrap()),
-        ("output", Term::small(0).unwrap()),
+        ("input", input),
+        ("output", output),
         ("os_pid", os_pid),
         ("monitors", monitors),
         ("monitored_by", monitored_by),
@@ -4873,13 +4984,17 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
             .iter()
             .find_map(|(name, value)| (*name == key).then_some(*value))
             .ok_or_else(badarg)?;
+        if key == "registered_name" && value == atom("undefined") {
+            return Ok(Term::NIL);
+        }
         return TermBuilder::new(&mut heap)
             .tuple(&[item, value])
             .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")));
     }
     let tuples: Vec<Term> = fields
         .into_iter()
-        .take(7)
+        .filter(|(key, value)| *key != "registered_name" || *value != atom("undefined"))
+        .take(if has_registered_name { 8 } else { 7 })
         .map(|(key, value)| {
             let key = atom(key);
             TermBuilder::new(&mut heap)

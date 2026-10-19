@@ -260,6 +260,7 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     let left = from_raw(lhs);
     let right = from_raw(rhs);
     let mut guard_add_reductions = 0;
+    let mut mul_add_failure = None;
     let operation = match op {
         0 => Some(("+", &[left, right][..])),
         1 => Some(("-", &[left, right][..])),
@@ -337,14 +338,29 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
             12 => arinsal_arith::fdiv(a, b, heap),
             // Port of erts/emulator/beam/erl_arith.c:919 (erts_mul_add), OTP-29.1.1.
             13 => {
-                let product = arinsal_arith::mul(a, b, heap)?;
+                // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:437-486
+                // (emit_mul_add_body_shared), OTP-29.1.1: the failing stage supplies its own
+                // BIF and operands to the exception frame.
+                let product = match arinsal_arith::mul(a, b, heap) {
+                    Ok(product) => product,
+                    Err(error) => {
+                        mul_add_failure = Some(("*", vec![a, b]));
+                        return Err(error);
+                    }
+                };
+                let addend = from_raw(extra);
                 if quiet {
                     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp, OTP-29.1.1.
                     // The guard helper calls mixed_times then mixed_plus; charge both BUMP_REDS.
-                    guard_add_reductions =
-                        arinsal_arith::reduction_charge("+", &[product, from_raw(extra)]);
+                    guard_add_reductions = arinsal_arith::reduction_charge("+", &[product, addend]);
                 }
-                arinsal_arith::add(product, from_raw(extra), heap)
+                match arinsal_arith::add(product, addend, heap) {
+                    Ok(sum) => Ok(sum),
+                    Err(error) => {
+                        mul_add_failure = Some(("+", vec![product, addend]));
+                        Err(error)
+                    }
+                }
             }
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:802-854 (erts_int_div_rem
             // body): quotient is the return value, remainder is published for the caller.
@@ -374,17 +390,27 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
             };
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp (the arithmetic BIF and its
             // operands are the top frame of a raised error), OTP-29.1.1.
-            match arith_bif(op) {
-                Some((function, arity)) if !quiet => {
-                    crate::native_helpers::set_native_bif_register_error(
-                        process,
-                        arinsal_term::atoms::ERLANG,
-                        function,
-                        arity,
-                        error,
+            if op == 13 && !quiet {
+                if let Some((function, args)) = mul_add_failure {
+                    crate::native_helpers::set_native_bif_error(
+                        process, "erlang", function, &args, error,
                     );
+                } else {
+                    set_light_error(process, &error);
                 }
-                _ => set_light_error(process, &error),
+            } else {
+                match arith_bif(op) {
+                    Some((function, arity)) if !quiet => {
+                        crate::native_helpers::set_native_bif_register_error(
+                            process,
+                            arinsal_term::atoms::ERLANG,
+                            function,
+                            arity,
+                            error,
+                        );
+                    }
+                    _ => set_light_error(process, &error),
+                }
             }
             0
         }

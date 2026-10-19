@@ -495,7 +495,10 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                     return info_list(process, nifs);
                 }
                 // Natively backed stubs of modules that never ran load_nif are not NIFs in erts.
-                let loaded = vm.code.loaded_nifs.contains(module.name.as_str());
+                let loaded = vm.code.loaded_nifs.iter().any(|key| {
+                    key.strip_prefix(&module.name)
+                        .is_some_and(|tail| tail.starts_with('#'))
+                });
                 for (entry, function, arity) in module.functions.iter().rev() {
                     if loaded
                         && matches!(

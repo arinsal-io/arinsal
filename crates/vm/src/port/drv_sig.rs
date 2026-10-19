@@ -118,6 +118,7 @@ fn call_driver_output(
         signal_badsig(handle, handle.id);
         return;
     }
+    let size = pieces.iter().map(|(bytes, _)| bytes.len()).sum();
     let pieces = pieces
         .iter()
         .map(|(bytes, refc)| {
@@ -128,7 +129,9 @@ fn call_driver_output(
             }
         })
         .collect::<Vec<_>>();
-    drv.output(&pieces, caller_data(caller));
+    if drv.output(&pieces, caller_data(caller)) {
+        handle.add_bytes_out(size);
+    }
 }
 
 /// Port of erts/emulator/beam/io.c:1715 (erts_port_output). `want_ref` is a synchronous

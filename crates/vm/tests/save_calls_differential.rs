@@ -4,7 +4,16 @@ use arinsal_vm::Vm;
 const SOURCE: &str = r#"
 -module(save_calls_differential).
 -export([repro/0, suite_calls/0, suite_exact/0, do_bipp/0, do_bopp/1, do_bepp/0,
-         do_bipp_suite/0, do_bopp_suite/1, do_bepp_suite/0]).
+         do_bipp_suite/0, do_bopp_suite/1, do_bepp_suite/0, remote/0]).
+
+remote() ->
+    Parent = self(),
+    Pid = spawn(fun() -> Parent ! {self(), ready}, receive stop -> ok end end),
+    receive {Pid, ready} -> ok end,
+    Old = erlang:process_flag(Pid, save_calls, 10),
+    Info = process_info(Pid, last_calls),
+    Pid ! stop,
+    {Old, Info}.
 
 repro() ->
     0 = process_flag(save_calls, 10),
@@ -79,7 +88,7 @@ fn save_calls_matches_otp_for_export_fun_bif_and_message_entries() {
         .unwrap();
     reference.load("save_calls_differential", &beam).unwrap();
 
-    for function in ["suite_exact", "suite_calls", "repro"] {
+    for function in ["suite_exact", "suite_calls", "repro", "remote"] {
         let expected = reference.call("save_calls_differential", function, &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();

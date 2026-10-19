@@ -327,7 +327,15 @@ fn process_info(
     // report heap counters from one snapshot even though building the result may grow the heap.
     let (heap_size, total_heap_size) = {
         let rp = src.read(process);
-        (rp.heap.heap_size_words(), rp.heap.total_heap_size_words())
+        let total = rp.heap.total_heap_size_words();
+        // Port of erts/emulator/beam/erl_bif_info.c:2022-2044, OTP-29.1.1. Attached message
+        // fragments count as heap words only while the signal queue is on-heap.
+        let attached = if rp.cold.as_ref().is_some_and(|cold| !cold.off_heap_msgq) {
+            rp.inbox.attached_message_words()
+        } else {
+            0
+        };
+        (rp.heap.heap_size_words(), total.saturating_add(attached))
     };
     // Messages already queued are part of process_info. A request handled from
     // inside drain must not pull signals that were ordered after it.
@@ -2372,6 +2380,11 @@ pub(crate) fn fulfill_request(
             set_group_leader(process, leader)?;
             make_tuple(process, &[reference, atom("true")])
         }
+        crate::signals::RemoteOp::SaveCalls { value } => {
+            let value = value.decode_into(process)?;
+            let previous = save_calls_flag(process, value).unwrap_or_else(|_| atom("badarg"));
+            make_tuple(process, &[reference, previous])
+        }
         crate::signals::RemoteOp::Collect { .. } => Err(VmError::Unsupported(
             "garbage_collect system task is answered by fulfill_collect".into(),
         )),
@@ -2430,6 +2443,9 @@ pub(crate) fn failure_reply(
             make_tuple(process, &[reference, atom("undefined")])
         }
         crate::signals::RemoteOp::GroupLeader { .. } | crate::signals::RemoteOp::Display => {
+            make_tuple(process, &[reference, atom("badarg")])
+        }
+        crate::signals::RemoteOp::SaveCalls { .. } => {
             make_tuple(process, &[reference, atom("badarg")])
         }
         crate::signals::RemoteOp::Alive => make_tuple(process, &[reference, atom("false")]),
@@ -2887,14 +2903,29 @@ fn call_values(
                 Ok(previous)
             }
             ("process_flag", [target, name, value]) if module == "erts_internal" => {
-                if Pid::from_term(*target) != Some(ctx.pid()) {
-                    return Err(badarg());
+                if let Some(done) = crate::signals::poll(process)? {
+                    return Ok(done);
                 }
+                let pid = Pid::from_term(*target).ok_or_else(badarg)?;
                 let name = atom_name(*name).ok_or_else(badarg)?;
                 if name != "save_calls" {
                     return Err(badarg());
                 }
-                flag(process, &name, *value)
+                if pid == ctx.pid() {
+                    save_calls_flag(process, *value).map_err(VmError::Trap)
+                } else {
+                    let value = Message::copy_from(*value)?;
+                    match crate::signals::submit(
+                        process,
+                        ctx,
+                        pid,
+                        crate::signals::RemoteOp::SaveCalls { value },
+                        Some(crate::signals::WaitKind::ProcessFlag),
+                    )? {
+                        crate::signals::Submit::Sent(_) => Err(crate::signals::await_reply()),
+                        crate::signals::Submit::Dead => Err(badarg()),
+                    }
+                }
             }
             ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),
             ("process_info", [pid, item]) => process_info_call(vm, process, ctx, *pid, Some(*item)),

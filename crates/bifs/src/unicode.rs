@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 
+use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, TermBuilder, TermKind, global_atoms};
 
 use crate::lists::DeferredTrap;
@@ -167,7 +168,10 @@ fn check_structure(root: Term, encoding: Encoding) -> Result<usize, BifError> {
                         };
                         current = tail;
                     }
-                    TermKind::Number => return Ok(need),
+                    TermKind::Number => match arinsal_term::to_owned(head) {
+                        Ok(OwnedTerm::BigInt(_)) => return Ok(need),
+                        _ => return Err(BifError::BADARG),
+                    },
                     _ => return Err(BifError::BADARG),
                 }
             }
@@ -588,6 +592,7 @@ fn convert(ctx: &mut Ctx<'_>, args: &[Term], list_output: bool) -> Result<Term, 
     let encoding = encoding(args[1])?;
     let direct = matches!(encoding, Encoding::Latin1 | Encoding::Utf8);
     if !direct {
+        check_structure(args[0], encoding)?;
         return wrapper_convert(ctx, args, list_output, encoding);
     }
     let mut root = args[0];

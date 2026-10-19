@@ -2560,7 +2560,18 @@ fn system_flag(
             crate::seq_trace::clear_all();
             Ok(atom("true"))
         }
-        "scheduler_wall_time" => set_scheduler_wall(process, ctx, args[1]),
+        "scheduler_wall_time" => {
+            // Port of erts/emulator/beam/bif.c:5174-5176 (system_flag_2), OTP-29.1.1.
+            // The export owns the per-process reference count and calls the erts_internal
+            // scheduler-wall-time BIF only when the node-wide reference count changes.
+            if args[1] != atom("true") && args[1] != atom("false") {
+                return Err(badarg());
+            }
+            Err(VmError::TrapExport(crate::ExportTrap {
+                continuation: "erts_internal:system_flag_scheduler_wall_time/1",
+                args: vec![args[1]],
+            }))
+        }
         "microstate_accounting" => set_microstate(process, ctx, args[1]),
         "outstanding_system_requests_limit" => outstanding_limit(process, args[1]),
         "scheduling_statistics" => scheduling_statistics(args[1]),
@@ -3273,19 +3284,6 @@ pub(crate) fn set_system_logger(process: &Process, value: Term) -> Result<Term, 
         .lock()
         .expect("system logger");
     Ok(std::mem::replace(&mut *current, value))
-}
-
-fn set_scheduler_wall(
-    process: &Process,
-    ctx: &mut RunCtx<'_, Message>,
-    value: Term,
-) -> Result<Term, VmError> {
-    let enable = match atom_name(value) {
-        Some("true") => true,
-        Some("false") => false,
-        _ => return Err(badarg()),
-    };
-    set_scheduler_wall_enabled(process, ctx, enable)
 }
 
 fn set_scheduler_wall_enabled(
