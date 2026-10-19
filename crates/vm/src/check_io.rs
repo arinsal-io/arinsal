@@ -1,22 +1,24 @@
-//! Shared one-shot descriptor readiness service.
+//! Shared descriptor readiness service.
 //!
-//! Port of `erts_check_io` registration and wakeup semantics from
-//! `erts/emulator/sys/common/erl_check_io.c` (OTP-29.1.1). `mio` selects the
-//! native kqueue backend on macOS and keeps its descriptor operations behind
-//! safe APIs.
+//! The descriptor-indexed state and one-shot scheduling follow
+//! `erts/emulator/sys/common/erl_check_io.c` (OTP-29.1.1). `erl_poll` owns only
+//! the mio syscall adapter; registrations are changed by their caller thread.
 
-use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Registry, Token};
-use std::collections::HashMap;
+use crate::erl_poll::{
+    ERTS_POLL_EV_ERR, ERTS_POLL_EV_IN, ERTS_POLL_EV_NONE, ERTS_POLL_EV_NVAL, ERTS_POLL_EV_OUT,
+    ErtsPollEvent, ErtsPollOp, ErtsPollSet, erts_poll_control, erts_poll_init, erts_poll_max_fds,
+    erts_poll_wait,
+};
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-const EVENT_CAPACITY: usize = 1024;
+const EVENT_CAPACITY: usize = 512;
+const FD_TABLE_MIN_LENGTH: usize = 1024;
+const FD_TABLE_EXP_THRESHOLD: usize = 2048 * 1024;
 
 #[derive(Clone, Copy)]
 enum PollState {
@@ -30,7 +32,6 @@ struct PollMsacc {
     started: Instant,
     check_io_ns: u64,
     sleep_ns: u64,
-    /// Total time accounting was on: what a thread that only sleeps (aux, async) accrues.
     window_ns: u64,
 }
 
@@ -66,7 +67,7 @@ fn poll_msacc() -> &'static Mutex<PollMsacc> {
 }
 
 /// Enable or disable accounting for the dedicated poll thread.
-// Port of erts/emulator/sys/common/erl_poll.c:1956-2003, OTP-29.1.1.
+// Port of erts/emulator/sys/common/erl_poll.c (erts_poll_wait), OTP-29.1.1.
 pub(crate) fn set_msacc_enabled(enabled: bool) {
     let _ = poller();
     let mut msacc = poll_msacc().lock().expect("poll microstate");
@@ -76,9 +77,8 @@ pub(crate) fn set_msacc_enabled(enabled: bool) {
     msacc.started = now;
 }
 
-/// Snapshot the poll thread's check-I/O and sleep counters and the accounted-time total, in
-/// nanoseconds.
-// Port of erts/emulator/sys/common/erl_check_io.c:558-649, OTP-29.1.1.
+/// Snapshot the poll thread's check-I/O, sleep and accounted-time counters in nanoseconds.
+// Port of erts/emulator/sys/common/erl_check_io.c (erts_check_io), OTP-29.1.1.
 pub(crate) fn msacc_snapshot() -> [u64; 3] {
     let mut msacc = poll_msacc().lock().expect("poll microstate");
     msacc.update(Instant::now());
@@ -93,7 +93,7 @@ fn set_poll_state(state: PollState) {
     msacc.started = now;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Ready {
     pub readable: bool,
     pub writable: bool,
@@ -101,7 +101,7 @@ pub(crate) struct Ready {
     pub error: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct InterestSet {
     pub readable: bool,
     pub writable: bool,
@@ -111,82 +111,125 @@ pub(crate) struct InterestSet {
 enum RegistrationKind {
     Driver,
     Nif,
-    /// A wake-up pipe of the Rust runtime's own I/O threads. erts has no such descriptor, so
-    /// the `check_io_debug` counters leave it out.
     Internal,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Registration {
     fd: RawFd,
-    id: Token,
+    id: usize,
 }
 
-struct Request {
-    id: Token,
-    fd: RawFd,
+type OneShotCallback = Box<dyn FnOnce(RawFd, Ready) + Send>;
+
+struct Watch {
+    id: usize,
     interests: InterestSet,
     kind: RegistrationKind,
-    ready: Box<dyn FnOnce(RawFd, Ready) + Send>,
+    callback: Option<OneShotCallback>,
 }
 
-type Callback = Box<dyn FnOnce(RawFd, Ready) + Send>;
-
-struct ActiveRegistration {
-    fd: RawFd,
-    interests: InterestSet,
-    watchers: HashMap<Token, (InterestSet, Callback)>,
-}
-
-/// The one-shot selections of the NIF and internal wake-up descriptors, shared by the
-/// selecting threads and the poll thread.
 #[derive(Default)]
-struct NifSelects {
-    active: HashMap<Token, ActiveRegistration>,
-    fd_tokens: HashMap<RawFd, Token>,
+struct DriverSelect {
+    owner: Option<usize>,
+    events: InterestSet,
+    active_events: InterestSet,
+    ready: Option<SelectCallback>,
+}
+
+#[derive(Default)]
+struct FdState {
+    driver: DriverSelect,
+    watches: Vec<Watch>,
+    poll_events: InterestSet,
+    poll_registered: bool,
+}
+
+struct FdStateTable {
+    slots: RwLock<Vec<Mutex<FdState>>>,
+    max_fds: usize,
+}
+
+impl Default for FdStateTable {
+    fn default() -> Self {
+        Self {
+            slots: RwLock::new(Vec::new()),
+            max_fds: erts_poll_max_fds(),
+        }
+    }
+}
+
+impl FdStateTable {
+    fn ensure_fd(&self, fd: RawFd) -> io::Result<usize> {
+        let index = usize::try_from(fd)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative descriptor"))?;
+        if index >= self.max_fds {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "descriptor exceeds the ERTS poll limit",
+            ));
+        }
+        {
+            let slots = self.slots.read().unwrap();
+            if index < slots.len() {
+                return Ok(index);
+            }
+        }
+        let mut slots = self.slots.write().unwrap();
+        if index >= slots.len() {
+            let need_len = index + 1;
+            let mut new_len = if need_len < FD_TABLE_MIN_LENGTH {
+                FD_TABLE_MIN_LENGTH
+            } else {
+                slots.len().max(FD_TABLE_MIN_LENGTH)
+            };
+            while new_len < need_len {
+                new_len = if new_len < FD_TABLE_EXP_THRESHOLD {
+                    new_len.saturating_mul(2)
+                } else {
+                    new_len.saturating_add(FD_TABLE_EXP_THRESHOLD)
+                };
+            }
+            slots.resize_with(new_len.min(self.max_fds), || Mutex::new(FdState::default()));
+        }
+        Ok(index)
+    }
+
+    fn lock_slots(
+        &self,
+        fd: RawFd,
+    ) -> io::Result<(usize, std::sync::RwLockReadGuard<'_, Vec<Mutex<FdState>>>)> {
+        let index = self.ensure_fd(fd)?;
+        let slots = self.slots.read().unwrap();
+        Ok((index, slots))
+    }
 }
 
 struct Poller {
-    next_token: AtomicUsize,
-    registrations: Arc<Mutex<HashMap<usize, (RawFd, RegistrationKind)>>>,
-    nif: Arc<Mutex<NifSelects>>,
-    /// Shared with the poll thread; `driver_select` and the NIF selections change the kernel poll set
-    /// directly through it, as erts_io_control does from the selecting thread.
-    registry: mio::Registry,
-    selects: Arc<Mutex<DriverSelects>>,
+    next_registration: AtomicUsize,
+    states: Arc<FdStateTable>,
 }
 
 static POLLER: OnceLock<Poller> = OnceLock::new();
 
 fn poller() -> &'static Poller {
     POLLER.get_or_init(|| {
-        let poll = Poll::new().expect("create shared kqueue poller");
-        let registrations = Arc::new(Mutex::new(HashMap::new()));
-        let worker_registrations = Arc::clone(&registrations);
-        let registry = poll.registry().try_clone().expect("clone poller registry");
-        let selects = Arc::new(Mutex::new(DriverSelects::default()));
-        let worker_selects = Arc::clone(&selects);
-        let nif = Arc::new(Mutex::new(NifSelects::default()));
-        let worker_nif = Arc::clone(&nif);
+        let poll = erts_poll_init().expect("create shared ERTS poll set");
+        let states = Arc::new(FdStateTable::default());
+        let worker_states = Arc::clone(&states);
         thread::Builder::new()
             .name("arinsal-check-io".into())
-            .spawn(move || poll_loop(poll, worker_registrations, worker_selects, worker_nif))
-            .expect("start shared kqueue poller");
+            .spawn(move || poll_loop(poll, worker_states))
+            .expect("start shared ERTS poll thread");
         Poller {
-            next_token: AtomicUsize::new(1),
-            registrations,
-            nif,
-            registry,
-            selects,
+            next_registration: AtomicUsize::new(1),
+            states,
         }
     })
 }
 
 #[cfg(test)]
-/// Wait on a set of descriptors through the shared, one-shot poll set.
-///
-/// The returned descriptor is removed from the poll set before this function
-/// returns. Callers explicitly register it again after handling readiness.
+/// Wait on a set of descriptors through the shared one-shot poll set.
 pub(crate) fn wait_any(fds: &[(RawFd, InterestSet)]) -> io::Result<Option<(RawFd, Ready)>> {
     wait_any_timeout(fds, None)
 }
@@ -195,88 +238,104 @@ pub(crate) fn wait_any(fds: &[(RawFd, InterestSet)]) -> io::Result<Option<(RawFd
 /// Wait with an optional deadline; timeout removes all registrations.
 pub(crate) fn wait_any_timeout(
     fds: &[(RawFd, InterestSet)],
-    timeout: Option<std::time::Duration>,
+    timeout: Option<Duration>,
 ) -> io::Result<Option<(RawFd, Ready)>> {
     wait_any_timeout_kind(fds, timeout, RegistrationKind::Driver, None)
 }
 
-/// Like [`wait_any_timeout`], with `wake` the caller's own wake-up descriptor, which
-/// `check_io_debug` does not count.
+/// Like [`wait_any_timeout`], with `wake` the caller's own wake-up descriptor.
 pub(crate) fn wait_any_timeout_wake(
     fds: &[(RawFd, InterestSet)],
-    timeout: Option<std::time::Duration>,
+    timeout: Option<Duration>,
     wake: RawFd,
 ) -> io::Result<Option<(RawFd, Ready)>> {
     wait_any_timeout_kind(fds, timeout, RegistrationKind::Driver, Some(wake))
 }
 
-/// Wait for one NIF selection with an optional deadline; `wake` the caller's own wake-up descriptor.
+/// Wait for a NIF selection while sharing the single ERTS poll thread.
 pub(crate) fn wait_any_nif_timeout_wake(
     fds: &[(RawFd, InterestSet)],
-    timeout: Option<std::time::Duration>,
+    timeout: Option<Duration>,
     wake: RawFd,
 ) -> io::Result<Option<(RawFd, Ready)>> {
     wait_any_timeout_kind(fds, timeout, RegistrationKind::Nif, Some(wake))
 }
 
+struct WaitResult {
+    value: Mutex<Option<(RawFd, Ready)>>,
+    changed: Condvar,
+}
+
 fn wait_any_timeout_kind(
     fds: &[(RawFd, InterestSet)],
-    timeout: Option<std::time::Duration>,
+    timeout: Option<Duration>,
     kind: RegistrationKind,
     wake: Option<RawFd>,
 ) -> io::Result<Option<(RawFd, Ready)>> {
     if fds.is_empty() {
         return Ok(None);
     }
-    let poller = poller();
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let mut tokens = Vec::with_capacity(fds.len());
+    let result = Arc::new(WaitResult {
+        value: Mutex::new(None),
+        changed: Condvar::new(),
+    });
+    let mut registrations = Vec::with_capacity(fds.len());
     for (fd, interests) in fds {
-        let id = Token(poller.next_token.fetch_add(1, Ordering::Relaxed));
-        let registration = Registration { fd: *fd, id };
-        tokens.push(registration);
-        if let Err(error) = register_request(
-            poller,
-            Request {
-                id,
-                fd: *fd,
-                interests: *interests,
-                kind: if Some(*fd) == wake {
-                    RegistrationKind::Internal
-                } else {
-                    kind
-                },
-                ready: Box::new({
-                    let ready_tx = ready_tx.clone();
-                    move |fd, ready| {
-                        let _ = ready_tx.send((fd, ready));
-                    }
-                }),
-            },
-        ) {
-            cancel(poller, &tokens);
-            return Err(error);
+        let result_slot = Arc::clone(&result);
+        let watch_kind = if Some(*fd) == wake {
+            RegistrationKind::Internal
+        } else {
+            kind
+        };
+        match register_kind(*fd, *interests, watch_kind, move |ready_fd, ready| {
+            let mut value = result_slot.value.lock().unwrap();
+            if value.is_none() {
+                *value = Some((ready_fd, ready));
+                result_slot.changed.notify_one();
+            }
+        }) {
+            Ok(registration) => registrations.push(registration),
+            Err(error) => {
+                for registration in registrations {
+                    deregister(registration);
+                }
+                return Err(error);
+            }
         }
     }
-    let result = match timeout {
-        Some(timeout) => ready_rx
-            .recv_timeout(timeout)
-            .map(Some)
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => {
-                    io::Error::new(io::ErrorKind::TimedOut, "poll timeout")
+
+    let mut value = result.value.lock().unwrap();
+    let result_value = match timeout {
+        Some(timeout) => {
+            let deadline = Instant::now() + timeout;
+            while value.is_none() {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
                 }
-                mpsc::RecvTimeoutError::Disconnected => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "poller stopped")
+                let (next, wait) = result.changed.wait_timeout(value, deadline - now).unwrap();
+                value = next;
+                if wait.timed_out() && value.is_none() {
+                    break;
                 }
-            }),
-        None => ready_rx
-            .recv()
-            .map(Some)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "poller stopped")),
+            }
+            value
+                .take()
+                .map(Some)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "poll timeout"))
+        }
+        None => {
+            while value.is_none() {
+                value = result.changed.wait(value).unwrap();
+            }
+            Ok(value.take())
+        }
     };
-    cancel(poller, &tokens);
-    result
+    drop(value);
+    for registration in registrations {
+        deregister(registration);
+    }
+    result_value
 }
 
 /// Add an asynchronous one-shot selection to the shared poll set.
@@ -288,7 +347,7 @@ pub(crate) fn register(
     register_kind(fd, interests, RegistrationKind::Nif, ready)
 }
 
-/// Add an asynchronous one-shot `driver_select` event to the shared poll set.
+/// Add an asynchronous one-shot driver event to the shared poll set.
 pub(crate) fn register_driver(
     fd: RawFd,
     interests: InterestSet,
@@ -303,202 +362,373 @@ fn register_kind(
     kind: RegistrationKind,
     ready: impl FnOnce(RawFd, Ready) + Send + 'static,
 ) -> io::Result<Registration> {
+    if !interests.readable && !interests.writable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty poll interest",
+        ));
+    }
     let poller = poller();
-    let id = Token(poller.next_token.fetch_add(1, Ordering::Relaxed));
-    register_request(
-        poller,
-        Request {
-            id,
+    let id = poller.next_registration.fetch_add(1, Ordering::Relaxed);
+    let registration = Registration { fd, id };
+    if always_ready_fd(fd) {
+        ready(
             fd,
-            interests,
-            kind,
-            ready: Box::new(ready),
-        },
-    )?;
-    Ok(Registration { fd, id })
+            Ready {
+                readable: interests.readable,
+                writable: interests.writable,
+                closed: false,
+                error: false,
+            },
+        );
+        return Ok(registration);
+    }
+    let (index, slots) = poller.states.lock_slots(fd)?;
+    let mut state = slots[index].lock().unwrap();
+    state.watches.push(Watch {
+        id,
+        interests,
+        kind,
+        callback: Some(Box::new(ready)),
+    });
+    match sync_pollset(fd, &mut state) {
+        Ok(()) => Ok(registration),
+        Err(_error) if always_ready_fd(fd) => {
+            let watch = state.watches.pop().expect("newly added watch");
+            drop(state);
+            (watch.callback.expect("pending watch"))(
+                fd,
+                Ready {
+                    readable: interests.readable,
+                    writable: interests.writable,
+                    closed: false,
+                    error: false,
+                },
+            );
+            Ok(registration)
+        }
+        Err(error) => {
+            state.watches.retain(|watch| watch.id != id);
+            Err(error)
+        }
+    }
 }
 
 /// Remove a pending one-shot selection.
 pub(crate) fn deregister(registration: Registration) {
-    cancel(poller(), &[registration]);
-}
-
-/// Change the kernel poll set from the calling thread, as `erts_io_control` does; the poll
-/// thread is not woken.
-// Port of erts/emulator/sys/common/erl_check_io.c (erts_io_control), OTP-29.1.1.
-fn register_request(poller: &Poller, request: Request) -> io::Result<()> {
-    let ready_now = {
-        let mut nif = poller.nif.lock().unwrap();
-        add_registration(&poller.registry, &mut nif, &poller.registrations, request)?
+    let poller = poller();
+    let Ok((index, slots)) = poller.states.lock_slots(registration.fd) else {
+        return;
     };
-    if let Some(request) = ready_now {
-        deliver_always_ready(request);
-    }
-    Ok(())
+    let mut state = slots[index].lock().unwrap();
+    state.watches.retain(|watch| watch.id != registration.id);
+    let _ = sync_pollset(registration.fd, &mut state);
 }
 
-fn cancel(poller: &Poller, tokens: &[Registration]) {
-    let mut nif = poller.nif.lock().unwrap();
-    for token in tokens {
-        remove_registration(&poller.registry, &mut nif, &poller.registrations, *token);
-    }
-}
-
-fn poll_loop(
-    mut poll: Poll,
-    registrations: Arc<Mutex<HashMap<usize, (RawFd, RegistrationKind)>>>,
-    selects: Arc<Mutex<DriverSelects>>,
-    nif: Arc<Mutex<NifSelects>>,
-) {
-    // Port of erts/emulator/beam/erl_check_io.c:1933 (erts_check_io), OTP-29.1.1.
-    let mut events = Events::with_capacity(EVENT_CAPACITY);
+fn poll_loop(mut poll: ErtsPollSet, states: Arc<FdStateTable>) {
+    // Port of erts/emulator/sys/common/erl_check_io.c (erts_check_io), OTP-29.1.1.
+    let mut events = Vec::with_capacity(EVENT_CAPACITY);
     loop {
-        set_poll_state(PollState::CheckIo);
         set_poll_state(PollState::Sleep);
-        if poll.poll(&mut events, None).is_err() {
-            thread::sleep(std::time::Duration::from_millis(2));
-            set_poll_state(PollState::CheckIo);
+        if let Err(error) = erts_poll_wait(&mut poll, None, &mut events) {
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            thread::sleep(Duration::from_millis(2));
             continue;
         }
         set_poll_state(PollState::CheckIo);
-        for event in &events {
-            let token = event.token();
-            let delivery = selects
-                .lock()
-                .unwrap()
-                .triggered(poll.registry(), token, event);
-            if let Some(delivery) = delivery {
-                delivery();
-                continue;
-            }
-            let ready = Ready {
-                readable: event.is_readable(),
-                writable: event.is_writable(),
-                closed: event.is_read_closed() || event.is_write_closed(),
-                error: event.is_error(),
-            };
-            let mut callbacks = Vec::new();
-            let fd = {
-                let mut guard = nif.lock().unwrap();
-                let NifSelects { active, fd_tokens } = &mut *guard;
-                let Some(active_registration) = active.get_mut(&token) else {
-                    continue;
-                };
-                let fd = active_registration.fd;
-                let mut fired_ids = Vec::new();
-                active_registration
-                    .watchers
-                    .retain(|id, (interest, callback)| {
-                        let fired = (interest.readable
-                            && (ready.readable || ready.closed || ready.error))
-                            || (interest.writable
-                                && (ready.writable || ready.closed || ready.error));
-                        if fired {
-                            fired_ids.push(*id);
-                            callbacks.push(std::mem::replace(callback, Box::new(|_, _| {})));
-                        }
-                        !fired
-                    });
-                {
-                    let mut registrations = registrations.lock().unwrap();
-                    for id in fired_ids {
-                        registrations.remove(&id.0);
-                    }
-                }
-                // As `erts_check_io`: the poll set is brought to its state after the event
-                // (`ERTS_POLL_OP_MOD`) before any callback runs. A callback may hand the
-                // descriptor to a thread that closes it at once, so the poll thread must not
-                // touch the descriptor in the kernel poll set after a callback ran.
-                if active_registration.watchers.is_empty() {
-                    let source = SourceFd(&fd);
-                    let _ = poll.registry().deregister(&mut { source });
-                    active.remove(&token);
-                    fd_tokens.remove(&fd);
-                } else {
-                    active_registration.interests = active_registration.watchers.values().fold(
-                        InterestSet {
-                            readable: false,
-                            writable: false,
-                        },
-                        |mut union, (interest, _)| {
-                            union.readable |= interest.readable;
-                            union.writable |= interest.writable;
-                            union
-                        },
-                    );
-                    if let Some(interest) = poll_interest(active_registration.interests) {
-                        let source = SourceFd(&fd);
-                        let _ = poll.registry().reregister(&mut { source }, token, interest);
-                    }
-                }
-                fd
-            };
-            for callback in callbacks {
-                callback(fd, ready);
+        for event in events.drain(..) {
+            if let Some(fd) = event.fd {
+                check_event(&states, fd, event);
             }
         }
     }
 }
 
-/// Add one selection. A descriptor that is always ready (a regular file, `/dev/null`)
-/// is handed back to the caller, which delivers its event outside the lock.
-fn add_registration(
-    registry: &Registry,
-    nif: &mut NifSelects,
-    registrations: &Mutex<HashMap<usize, (RawFd, RegistrationKind)>>,
-    request: Request,
-) -> io::Result<Option<Request>> {
-    let NifSelects { active, fd_tokens } = nif;
-    let interest = poll_interest(request.interests)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty poll interest"))?;
-    if let Some(token) = fd_tokens.get(&request.fd).copied() {
-        let registration = active.get_mut(&token).expect("fd token has registration");
-        let next = InterestSet {
-            readable: registration.interests.readable || request.interests.readable,
-            writable: registration.interests.writable || request.interests.writable,
-        };
-        let source = SourceFd(&request.fd);
-        registry.reregister(
-            &mut { source },
-            token,
-            poll_interest(next).expect("non-empty registration interest"),
-        )?;
-        registration.interests = next;
-        registration
-            .watchers
-            .insert(request.id, (request.interests, request.ready));
+fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent) {
+    let Ok((index, slots)) = states.lock_slots(fd) else {
+        return;
+    };
+    let mut state = slots[index].lock().unwrap();
+    let seen = InterestSet {
+        readable: event.events & ERTS_POLL_EV_IN != 0,
+        writable: event.events & ERTS_POLL_EV_OUT != 0,
+    };
+    let poll_error = event.events & (ERTS_POLL_EV_ERR | ERTS_POLL_EV_NVAL) != 0;
+    let mut fired_driver = if poll_error {
+        state.driver.active_events
     } else {
-        if regular_file_fd(request.fd) {
-            return Ok(Some(request));
-        }
-        let source = SourceFd(&request.fd);
-        if let Err(error) = registry.register(&mut { source }, request.id, interest) {
-            // kqueue cannot watch regular files and some character devices such as
-            // /dev/null. They are always ready, so deliver the one-shot event now.
-            if matches!(
-                error.kind(),
-                io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
-            ) && always_ready_fd(request.fd)
-            {
-                return Ok(Some(request));
+        intersect(state.driver.active_events, seen)
+    };
+    let ready = Ready {
+        // ERTS converts an error to all active directions before it schedules
+        // the corresponding input/output port task.
+        readable: fired_driver.readable,
+        writable: fired_driver.writable,
+        closed: event.closed,
+        error: event.error || poll_error,
+    };
+    state.driver.active_events = minus(state.driver.active_events, fired_driver);
+    let mut driver_callback = (fired_driver.readable || fired_driver.writable)
+        .then(|| state.driver.ready.clone())
+        .flatten();
+
+    let mut callbacks = Vec::new();
+    state.watches.retain_mut(|watch| {
+        let fired = poll_error
+            || (watch.interests.readable && seen.readable)
+            || (watch.interests.writable && seen.writable);
+        if fired {
+            if let Some(callback) = watch.callback.take() {
+                callbacks.push((
+                    callback,
+                    Ready {
+                        readable: watch.interests.readable && (seen.readable || poll_error),
+                        writable: watch.interests.writable && (seen.writable || poll_error),
+                        closed: event.closed,
+                        error: event.error || poll_error,
+                    },
+                ));
             }
-            return Err(error);
+            false
+        } else {
+            true
         }
-        fd_tokens.insert(request.fd, request.id);
-        active.insert(
-            request.id,
-            ActiveRegistration {
-                fd: request.fd,
-                interests: request.interests,
-                watchers: HashMap::from([(request.id, (request.interests, request.ready))]),
-            },
-        );
+    });
+
+    let mut callback_ready = ready;
+    if sync_pollset(fd, &mut state).is_err() {
+        // A failed re-arm is reported as NVAL by erts_check_io. Trigger every
+        // remaining active selection after removing the descriptor from mio.
+        let remaining = state.driver.active_events;
+        fired_driver = union(fired_driver, remaining);
+        state.driver.active_events = InterestSet::default();
+        state.poll_events = InterestSet::default();
+        state.poll_registered = false;
+        let _ = erts_poll_control(fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE);
+        if (fired_driver.readable || fired_driver.writable)
+            && let Some(callback) = state.driver.ready.clone()
+        {
+            driver_callback = Some(callback);
+        }
+        callbacks.extend(state.watches.drain(..).filter_map(|mut watch| {
+            watch.callback.take().map(|callback| {
+                (
+                    callback,
+                    Ready {
+                        readable: watch.interests.readable,
+                        writable: watch.interests.writable,
+                        closed: false,
+                        error: true,
+                    },
+                )
+            })
+        }));
+        callback_ready = Ready {
+            readable: fired_driver.readable,
+            writable: fired_driver.writable,
+            closed: false,
+            error: true,
+        };
     }
-    registrations
-        .lock()
-        .unwrap()
-        .insert(request.id.0, (request.fd, request.kind));
-    Ok(None)
+    drop(state);
+    if let Some(callback) = driver_callback {
+        callback(fd, callback_ready);
+    }
+    for (callback, watch_ready) in callbacks {
+        callback(fd, watch_ready);
+    }
+}
+
+fn sync_pollset(fd: RawFd, state: &mut FdState) -> io::Result<()> {
+    let next = union(state.driver.active_events, watch_interests(&state.watches));
+    let selected =
+        state.driver.events.readable || state.driver.events.writable || !state.watches.is_empty();
+    if next == state.poll_events {
+        if !next.readable && !next.writable && state.poll_registered && !selected {
+            poll_control(fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE)?;
+            state.poll_registered = false;
+        }
+        return Ok(());
+    }
+    let flags = (if next.readable { ERTS_POLL_EV_IN } else { 0 })
+        | (if next.writable { ERTS_POLL_EV_OUT } else { 0 });
+    let op = if next.readable || next.writable {
+        if state.poll_registered {
+            ErtsPollOp::Mod
+        } else {
+            ErtsPollOp::Add
+        }
+    } else if selected {
+        ErtsPollOp::Mod
+    } else if state.poll_registered {
+        ErtsPollOp::Del
+    } else {
+        state.poll_events = next;
+        return Ok(());
+    };
+    poll_control(fd, op, flags)?;
+    state.poll_events = next;
+    state.poll_registered = op != ErtsPollOp::Del;
+    Ok(())
+}
+
+fn watch_interests(watches: &[Watch]) -> InterestSet {
+    watches
+        .iter()
+        .fold(InterestSet::default(), |events, watch| {
+            union(events, watch.interests)
+        })
+}
+
+fn poll_control(fd: RawFd, op: ErtsPollOp, events: u32) -> io::Result<()> {
+    if erts_poll_control(fd, op, events) & ERTS_POLL_EV_NVAL != 0 {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ERTS poll control returned ERTS_POLL_EV_NVAL",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn union(left: InterestSet, right: InterestSet) -> InterestSet {
+    InterestSet {
+        readable: left.readable || right.readable,
+        writable: left.writable || right.writable,
+    }
+}
+
+fn intersect(left: InterestSet, right: InterestSet) -> InterestSet {
+    InterestSet {
+        readable: left.readable && right.readable,
+        writable: left.writable && right.writable,
+    }
+}
+
+fn minus(left: InterestSet, right: InterestSet) -> InterestSet {
+    InterestSet {
+        readable: left.readable && !right.readable,
+        writable: left.writable && !right.writable,
+    }
+}
+
+/// Readiness callback for a persistent driver selection.
+pub(crate) type SelectCallback = Arc<dyn Fn(RawFd, Ready) + Send + Sync>;
+
+/// Select or deselect `fd` for the driver identified by `owner`.
+// Port of erts/emulator/sys/common/erl_check_io.c (driver_select), OTP-29.1.1.
+pub(crate) fn driver_select(
+    fd: RawFd,
+    owner: usize,
+    events: InterestSet,
+    ready: SelectCallback,
+) -> io::Result<()> {
+    let poller = poller();
+    let (index, slots) = poller.states.lock_slots(fd)?;
+    let mut state = slots[index].lock().unwrap();
+    if state.driver.owner.is_some_and(|current| current != owner) {
+        state.driver = DriverSelect::default();
+        sync_pollset(fd, &mut state)?;
+    }
+    if !events.readable && !events.writable && state.driver.owner.is_none() {
+        return Ok(());
+    }
+    let old_events = state.driver.events;
+    let added = minus(events, old_events);
+    let removed = minus(old_events, events);
+    state.driver.owner = (events.readable || events.writable).then_some(owner);
+    state.driver.ready = (events.readable || events.writable).then_some(ready);
+    state.driver.events = events;
+    state.driver.active_events = minus(union(state.driver.active_events, added), removed);
+    sync_pollset(fd, &mut state)
+}
+
+/// Re-arm the events whose port task has run.
+// Port of erts/emulator/sys/common/erl_check_io.c (erts_io_notify_port_task_executed), OTP-29.1.1.
+pub(crate) fn notify_executed(fd: RawFd, owner: usize, executed: InterestSet) {
+    let poller = poller();
+    let Ok((index, slots)) = poller.states.lock_slots(fd) else {
+        return;
+    };
+    let mut state = slots[index].lock().unwrap();
+    if state.driver.owner != Some(owner) {
+        return;
+    }
+    let rearm = minus(
+        intersect(executed, state.driver.events),
+        state.driver.active_events,
+    );
+    if !rearm.readable && !rearm.writable {
+        return;
+    }
+    state.driver.active_events = union(state.driver.active_events, rearm);
+    if sync_pollset(fd, &mut state).is_err() {
+        state.driver.active_events = InterestSet::default();
+        state.poll_events = InterestSet::default();
+        state.poll_registered = false;
+        let _ = erts_poll_control(fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE);
+        if let Some(callback) = state.driver.ready.clone() {
+            drop(state);
+            callback(
+                fd,
+                Ready {
+                    readable: rearm.readable,
+                    writable: rearm.writable,
+                    closed: false,
+                    error: true,
+                },
+            );
+        }
+    }
+}
+
+/// Drop every selection `owner` holds on `fd` before the descriptor is closed.
+pub(crate) fn driver_deselect(fd: RawFd, owner: usize) {
+    let poller = poller();
+    let Ok((index, slots)) = poller.states.lock_slots(fd) else {
+        return;
+    };
+    let mut state = slots[index].lock().unwrap();
+    if state.driver.owner != Some(owner) {
+        return;
+    }
+    state.driver = DriverSelect::default();
+    let _ = sync_pollset(fd, &mut state);
+}
+
+pub(crate) struct DebugInfo {
+    pub used_fds: usize,
+    pub driver_selects: usize,
+    pub nif_selects: usize,
+}
+
+/// Snapshot the active descriptors and selection counts exposed by check_io_debug.
+pub(crate) fn debug_info() -> DebugInfo {
+    let states = &poller().states;
+    let slots = states.slots.read().unwrap();
+    let mut info = DebugInfo {
+        used_fds: 0,
+        driver_selects: 0,
+        nif_selects: 0,
+    };
+    for state in slots.iter() {
+        let state = state.lock().unwrap();
+        let driver_used = state.driver.events.readable || state.driver.events.writable;
+        if driver_used || !state.watches.is_empty() {
+            info.used_fds += 1;
+        }
+        info.driver_selects += usize::from(driver_used);
+        for watch in &state.watches {
+            match watch.kind {
+                RegistrationKind::Driver => info.driver_selects += 1,
+                RegistrationKind::Nif => info.nif_selects += 1,
+                RegistrationKind::Internal => {}
+            }
+        }
+    }
+    info
 }
 
 fn always_ready_fd(fd: RawFd) -> bool {
@@ -515,334 +745,6 @@ fn always_ready_fd(fd: RawFd) -> bool {
         && std::fs::metadata("/dev/null").is_ok_and(|null| null.rdev() == metadata.rdev())
 }
 
-fn regular_file_fd(fd: RawFd) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-
-    std::fs::metadata(format!("/dev/fd/{fd}")).is_ok_and(|metadata| {
-        let file_type = metadata.file_type();
-        file_type.is_file() || file_type.is_block_device()
-    })
-}
-
-fn deliver_always_ready(request: Request) {
-    (request.ready)(
-        request.fd,
-        Ready {
-            readable: request.interests.readable,
-            writable: request.interests.writable,
-            closed: false,
-            error: false,
-        },
-    );
-}
-
-fn poll_interest(interests: InterestSet) -> Option<Interest> {
-    match (interests.readable, interests.writable) {
-        (true, true) => Some(Interest::READABLE.add(Interest::WRITABLE)),
-        (true, false) => Some(Interest::READABLE),
-        (false, true) => Some(Interest::WRITABLE),
-        (false, false) => None,
-    }
-}
-
-fn remove_registration(
-    registry: &Registry,
-    nif: &mut NifSelects,
-    registrations: &Mutex<HashMap<usize, (RawFd, RegistrationKind)>>,
-    registration: Registration,
-) {
-    let NifSelects { active, fd_tokens } = nif;
-    let Some(token) = fd_tokens.get(&registration.fd).copied() else {
-        registrations.lock().unwrap().remove(&registration.id.0);
-        return;
-    };
-    let Some(current) = active.get_mut(&token) else {
-        return;
-    };
-    current.watchers.remove(&registration.id);
-    registrations.lock().unwrap().remove(&registration.id.0);
-    if current.watchers.is_empty() {
-        let fd = current.fd;
-        let source = SourceFd(&fd);
-        let _ = registry.deregister(&mut { source });
-        active.remove(&token);
-        fd_tokens.remove(&fd);
-    } else {
-        let interests = current.watchers.values().fold(
-            InterestSet {
-                readable: false,
-                writable: false,
-            },
-            |mut union, (interest, _)| {
-                union.readable |= interest.readable;
-                union.writable |= interest.writable;
-                union
-            },
-        );
-        current.interests = interests;
-        let fd = current.fd;
-        let source = SourceFd(&fd);
-        if let Some(interest) = poll_interest(interests) {
-            let _ = registry.reregister(&mut { source }, token, interest);
-        }
-    }
-}
-
-/// Readiness callback of a persistent driver selection (`iready`/`oready`).
-pub(crate) type SelectCallback = Arc<dyn Fn(RawFd, Ready) + Send + Sync>;
-
-/// Persistent `driver_select` state of one descriptor.
-///
-/// Port of the `ErtsDrvEventState` fields `events` (selected by the driver) and
-/// `active_events` (armed in the poll set) from
-/// erts/emulator/sys/common/erl_check_io.c, OTP-29.1.1. A fired event leaves
-/// `active` until the driver's port task ran (`notify_executed`), as ERTS'
-/// one-shot poll set does.
-struct DriverSelect {
-    fd: RawFd,
-    owner: usize,
-    events: InterestSet,
-    active: InterestSet,
-    ready: SelectCallback,
-}
-
-#[derive(Default)]
-struct DriverSelects {
-    by_fd: HashMap<RawFd, Token>,
-    by_token: HashMap<Token, DriverSelect>,
-}
-
-fn union(a: InterestSet, b: InterestSet) -> InterestSet {
-    InterestSet {
-        readable: a.readable || b.readable,
-        writable: a.writable || b.writable,
-    }
-}
-
-fn minus(a: InterestSet, b: InterestSet) -> InterestSet {
-    InterestSet {
-        readable: a.readable && !b.readable,
-        writable: a.writable && !b.writable,
-    }
-}
-
-/// `erts_io_control` with `ERTS_POLL_OP_MOD`/`DEL`: put exactly `active` in the
-/// kernel poll set for `fd`.
-fn io_control(registry: &mio::Registry, fd: RawFd, token: Token, active: InterestSet) {
-    let source = SourceFd(&fd);
-    match poll_interest(active) {
-        // kqueue's EV_ADD both adds and modifies a filter; mio deletes the
-        // filters left out of `interest`.
-        Some(interest) => {
-            // EPOLL_CTL_MOD needs the descriptor to be in the set already (EV_ADD does not),
-            // so a descriptor that left the set is added again.
-            if let Err(error) = registry.reregister(&mut { source }, token, interest)
-                && error.kind() == io::ErrorKind::NotFound
-            {
-                let _ = registry.register(&mut SourceFd(&fd), token, interest);
-            }
-        }
-        None => {
-            let _ = registry.deregister(&mut { source });
-        }
-    }
-}
-
-impl DriverSelects {
-    /// The poll thread saw `event` for `token`.
-    ///
-    /// Port of erts/emulator/sys/common/erl_check_io.c:2018-2109, OTP-29.1.1:
-    /// disregard events that are not active, clear the fired ones from
-    /// `active_events`, re-enable the rest (`ERTS_POLL_OP_MOD`), then run oready
-    /// and iready. An error or hang-up triggers every active event (:2018-2027).
-    fn triggered(
-        &mut self,
-        registry: &mio::Registry,
-        token: Token,
-        event: &mio::event::Event,
-    ) -> Option<Box<dyn FnOnce()>> {
-        let state = self.by_token.get_mut(&token)?;
-        let hangup = event.is_error() || event.is_read_closed() || event.is_write_closed();
-        let seen = InterestSet {
-            readable: event.is_readable() || hangup,
-            writable: event.is_writable() || hangup,
-        };
-        let fired = InterestSet {
-            readable: seen.readable && state.active.readable,
-            writable: seen.writable && state.active.writable,
-        };
-        if !fired.readable && !fired.writable {
-            return Some(Box::new(|| {}));
-        }
-        state.active = minus(state.active, fired);
-        io_control(registry, state.fd, token, state.active);
-        let ready = Ready {
-            readable: fired.readable && event.is_readable(),
-            writable: fired.writable && event.is_writable(),
-            closed: event.is_read_closed() || event.is_write_closed(),
-            error: event.is_error(),
-        };
-        let (fd, callback) = (state.fd, Arc::clone(&state.ready));
-        Some(Box::new(move || callback(fd, ready)))
-    }
-}
-
-/// Select or deselect `fd` for the driver identified by `owner`.
-///
-/// Port of erts/emulator/sys/common/erl_check_io.c:988-1225 (`driver_select`),
-/// OTP-29.1.1: newly selected events are armed at once; events already selected
-/// stay as they are (a fired event is re-armed by `notify_executed` after its
-/// port task ran); deselected events leave the poll set. Selecting a descriptor
-/// that another owner still holds takes it over, as `drv_select_steal` does.
-/// The kernel poll set is changed from the calling thread; the poll thread is not
-/// woken.
-pub(crate) fn driver_select(
-    fd: RawFd,
-    owner: usize,
-    events: InterestSet,
-    ready: SelectCallback,
-) -> io::Result<()> {
-    let poller = poller();
-    let mut selects = poller.selects.lock().unwrap();
-    if let Some(token) = selects.by_fd.get(&fd).copied()
-        && selects.by_token[&token].owner != owner
-    {
-        selects.by_token.remove(&token);
-        selects.by_fd.remove(&fd);
-    }
-    let token = match selects.by_fd.get(&fd).copied() {
-        Some(token) => token,
-        None => {
-            if !events.readable && !events.writable {
-                return Ok(());
-            }
-            let token = Token(poller.next_token.fetch_add(1, Ordering::Relaxed));
-            selects.by_fd.insert(fd, token);
-            selects.by_token.insert(
-                token,
-                DriverSelect {
-                    fd,
-                    owner,
-                    events: InterestSet {
-                        readable: false,
-                        writable: false,
-                    },
-                    active: InterestSet {
-                        readable: false,
-                        writable: false,
-                    },
-                    ready: Arc::clone(&ready),
-                },
-            );
-            token
-        }
-    };
-    let state = selects.by_token.get_mut(&token).expect("selected fd");
-    state.ready = ready;
-    let added = minus(events, state.events);
-    let removed = minus(state.events, events);
-    state.events = events;
-    let active = minus(union(state.active, added), removed);
-    let changed =
-        active.readable != state.active.readable || active.writable != state.active.writable;
-    state.active = active;
-    if changed {
-        io_control(&poller.registry, fd, token, active);
-    }
-    if !events.readable && !events.writable {
-        selects.by_token.remove(&token);
-        selects.by_fd.remove(&fd);
-    }
-    Ok(())
-}
-
-/// Re-arm the events whose port task has run.
-///
-/// Port of erts/emulator/sys/common/erl_check_io.c:546-640
-/// (`erts_io_notify_port_task_executed`), OTP-29.1.1: an event that is still
-/// selected but no longer active goes back into the poll set.
-pub(crate) fn notify_executed(fd: RawFd, owner: usize, executed: InterestSet) {
-    let poller = poller();
-    let mut selects = poller.selects.lock().unwrap();
-    let Some(token) = selects.by_fd.get(&fd).copied() else {
-        return;
-    };
-    let state = selects.by_token.get_mut(&token).expect("selected fd");
-    if state.owner != owner {
-        return;
-    }
-    let rearm = minus(
-        InterestSet {
-            readable: executed.readable && state.events.readable,
-            writable: executed.writable && state.events.writable,
-        },
-        state.active,
-    );
-    if rearm.readable || rearm.writable {
-        state.active = union(state.active, rearm);
-        io_control(&poller.registry, fd, token, state.active);
-    }
-}
-
-/// Drop every selection `owner` holds on `fd` (`driver_select(..., ERL_DRV_USE, 0)`)
-/// before the descriptor is closed or replaced.
-pub(crate) fn driver_deselect(fd: RawFd, owner: usize) {
-    let poller = poller();
-    let mut selects = poller.selects.lock().unwrap();
-    let Some(token) = selects.by_fd.get(&fd).copied() else {
-        return;
-    };
-    if selects.by_token[&token].owner != owner {
-        return;
-    }
-    if let Some(state) = selects.by_token.remove(&token)
-        && (state.active.readable || state.active.writable)
-    {
-        io_control(
-            &poller.registry,
-            fd,
-            token,
-            InterestSet {
-                readable: false,
-                writable: false,
-            },
-        );
-    }
-    selects.by_fd.remove(&fd);
-}
-
-pub(crate) struct DebugInfo {
-    pub used_fds: usize,
-    pub driver_selects: usize,
-    pub nif_selects: usize,
-}
-
-pub(crate) fn debug_info() -> DebugInfo {
-    let registrations = poller().registrations.lock().unwrap();
-    let selects = poller().selects.lock().unwrap();
-    let used_fds = registrations
-        .values()
-        .filter(|(_, kind)| !matches!(kind, RegistrationKind::Internal))
-        .map(|(fd, _)| *fd)
-        .chain(selects.by_fd.keys().copied())
-        .collect::<std::collections::HashSet<_>>()
-        .len();
-    let mut driver_selects = selects.by_fd.len();
-    let mut nif_selects = 0;
-    for (_, kind) in registrations.values() {
-        match kind {
-            RegistrationKind::Driver => driver_selects += 1,
-            RegistrationKind::Nif => nif_selects += 1,
-            RegistrationKind::Internal => {}
-        }
-    }
-    DebugInfo {
-        used_fds,
-        driver_selects,
-        nif_selects,
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -850,10 +752,17 @@ pub(crate) mod tests {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
-    use std::time::Duration;
 
     /// Serializes tests that count the process-global poll set (`debug_info`).
     pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn erl_poll_control_reports_invalid_fds_as_nval() {
+        assert_ne!(
+            erts_poll_control(-1, ErtsPollOp::Add, ERTS_POLL_EV_IN) & ERTS_POLL_EV_NVAL,
+            0
+        );
+    }
 
     #[test]
     fn check_io_one_shot_rearms_after_delivery() {
@@ -1041,10 +950,8 @@ pub(crate) mod tests {
         .unwrap();
         writer.write_all(b"x").unwrap();
         assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().readable);
-        // Fired and not yet executed: more data does not deliver again.
         writer.write_all(b"y").unwrap();
         assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
-        // The task ran without reading: re-arming reports the pending data.
         notify_executed(fd, 7, readable);
         assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().readable);
         assert_eq!(debug_info().driver_selects, 1);
@@ -1072,17 +979,13 @@ pub(crate) mod tests {
             readable: true,
             writable: false,
         };
-        let none = InterestSet {
-            readable: false,
-            writable: false,
-        };
+        let none = InterestSet::default();
         driver_select(fd, 1, readable, callback(1)).unwrap();
         driver_select(fd, 1, none, callback(1)).unwrap();
         writer.write_all(b"x").unwrap();
         assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
         driver_select(fd, 1, readable, callback(1)).unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
-        // A new owner of the same descriptor number replaces the old selection.
         driver_select(fd, 2, readable, callback(2)).unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
         driver_deselect(fd, 1);
@@ -1091,13 +994,8 @@ pub(crate) mod tests {
         assert_eq!(debug_info().used_fds, 0);
     }
 
-    /// The poll thread must be done with the descriptor in the kernel poll set when it runs
-    /// a one-shot callback: the callback may select the descriptor again or hand it to a
-    /// thread that closes it. A late `kevent` of the poll thread on the descriptor removed
-    /// the selection made from the callback, and raced the close, which never returned on
-    /// macOS.
     #[test]
-    fn check_io_one_shot_callback_runs_after_the_poll_set_update() {
+    fn check_io_one_shot_callback_runs_after_poll_set_update() {
         let _guard = TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1122,11 +1020,7 @@ pub(crate) mod tests {
             .unwrap();
         })
         .unwrap();
-        let fired = rx.recv_timeout(Duration::from_secs(5));
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
         driver_deselect(fd, 7);
-        assert!(
-            fired.is_ok(),
-            "the selection made from the one-shot callback was removed by the poll thread"
-        );
     }
 }
