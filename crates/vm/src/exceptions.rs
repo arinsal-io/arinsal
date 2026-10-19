@@ -660,7 +660,7 @@ pub(super) fn resume(
         } else if empty_trace_class(trace).is_some() || stacktrace::is_saved(trace) {
             trace
         } else {
-            save_explicit(p, trace, trap.class)?
+            save_explicit(p, trace, trap.class, vm.backtrace_depth)?
         }
     } else {
         save_raw(p, vm.backtrace_depth, trap.class, trap.top.as_ref())?
@@ -668,7 +668,7 @@ pub(super) fn resume(
     let trace = if trap.raw_rethrow && trap.reason == atom("function_clause")? {
         let cooked = materialize(Some(vm), p, trace)?;
         let stripped = strip_top_location(p, cooked)?;
-        save_explicit(p, stripped, trap.class)?
+        save_explicit(p, stripped, trap.class, vm.backtrace_depth)?
     } else {
         trace
     };
@@ -915,8 +915,13 @@ fn save_raw(
     )
 }
 
-fn save_explicit(p: &mut Process, trace: Term, class: Class) -> Result<Term, VmError> {
-    stacktrace::save_explicit(p, class, trace)
+fn save_explicit(
+    p: &mut Process,
+    trace: Term,
+    class: Class,
+    backtrace_depth: usize,
+) -> Result<Term, VmError> {
+    stacktrace::save_explicit(p, class, trace, backtrace_depth)
 }
 
 pub(super) fn materialize(vm: Option<&Vm>, p: &mut Process, trace: Term) -> Result<Term, VmError> {

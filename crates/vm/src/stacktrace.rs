@@ -550,17 +550,87 @@ pub(super) fn capture(
 
 /// Preserve the supplied `raise/3` trace in Args behind erts' negative StackTrace marker.
 ///
-/// Port of erts/emulator/beam/bif.c:1675-1685 (`raise_3`), OTP-29.1.1.
-pub(super) fn save_explicit(p: &mut Process, class: Class, trace: Term) -> Result<Term, VmError> {
+/// Port of erts/emulator/beam/bif.c (`raise_3`), OTP-29.1.1.
+pub(super) fn save_explicit(
+    p: &mut Process,
+    class: Class,
+    trace: Term,
+    backtrace_depth: usize,
+) -> Result<Term, VmError> {
     let freason = class_to_freason(Some(class));
+    let args = normalize_raise_trace(p, trace, backtrace_depth)?;
     let mut heap = TraceHeap::new(&mut p.heap);
     let stack_trace = StackTrace::allocate_raised(&mut heap, freason)?;
     Ftrace {
         stack_trace,
-        args: trace,
+        args,
         error_info: Term::NIL,
     }
     .allocate(&mut heap)
+}
+
+// Port of erts/emulator/beam/bif.c (`raise_3`), OTP-29.1.1: copy only when a legacy
+// frame needs conversion or the runtime backtrace limit truncates the supplied trace.
+fn normalize_raise_trace(
+    p: &mut Process,
+    trace: Term,
+    backtrace_depth: usize,
+) -> Result<Term, VmError> {
+    let frames = arinsal_term::term_sequence(trace)
+        .ok_or_else(|| VmError::Unsupported("raise stacktrace list".into()))?;
+    let max_depth = runtime_backtrace_depth(p, backtrace_depth);
+    let depth = if max_depth < frames.len() {
+        max_depth.max(1)
+    } else {
+        frames.len()
+    };
+    let mut must_copy = max_depth < frames.len();
+    for frame in &frames {
+        let fields = arinsal_term::term_sequence(*frame)
+            .ok_or_else(|| VmError::Unsupported("raise stacktrace frame".into()))?;
+        match fields.as_slice() {
+            [fun, _args] if fun.classify() == TermKind::Fun => must_copy = true,
+            [module, function, _arity_or_args]
+                if module.classify() == TermKind::Atom && function.classify() == TermKind::Atom =>
+            {
+                must_copy = true;
+            }
+            _ => {}
+        }
+    }
+    if !must_copy {
+        return Ok(trace);
+    }
+
+    let mut heap = TraceHeap::new(&mut p.heap);
+    let mut normalized = Vec::with_capacity(depth);
+    for frame in frames.iter().take(depth) {
+        let fields = arinsal_term::term_sequence(*frame)
+            .ok_or_else(|| VmError::Unsupported("raise stacktrace frame".into()))?;
+        let converted = match fields.as_slice() {
+            [fun, args] if fun.classify() == TermKind::Fun => {
+                Some([*fun, *args, Term::NIL].to_vec())
+            }
+            [module, function, arity_or_args]
+                if module.classify() == TermKind::Atom && function.classify() == TermKind::Atom =>
+            {
+                Some(vec![*module, *function, *arity_or_args, Term::NIL])
+            }
+            _ => None,
+        };
+        normalized.push(if let Some(fields) = converted {
+            TermBuilder::new(&mut heap)
+                .tuple(&fields)
+                .map_err(|error| {
+                    VmError::Unsupported(format!("raise stacktrace tuple {error:?}"))
+                })?
+        } else {
+            *frame
+        });
+    }
+    TermBuilder::new(&mut heap)
+        .list_from_slice(&normalized)
+        .map_err(|error| VmError::Unsupported(format!("raise stacktrace list {error:?}")))
 }
 
 fn push_frame(raw: &mut RawTrace, continuation: Continuation) {
