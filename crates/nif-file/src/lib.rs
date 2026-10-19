@@ -606,12 +606,12 @@ fn advise_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
             }
             #[cfg(target_os = "linux")]
             let advice = match name(&a[3]) {
-                Some("normal") => libc::POSIX_FADV_NORMAL,
-                Some("random") => libc::POSIX_FADV_RANDOM,
-                Some("sequential") => libc::POSIX_FADV_SEQUENTIAL,
-                Some("will_need") => libc::POSIX_FADV_WILLNEED,
-                Some("dont_need") => libc::POSIX_FADV_DONTNEED,
-                Some("no_reuse") => libc::POSIX_FADV_NOREUSE,
+                Some("normal") => rustix::fs::Advice::Normal,
+                Some("random") => rustix::fs::Advice::Random,
+                Some("sequential") => rustix::fs::Advice::Sequential,
+                Some("will_need") => rustix::fs::Advice::WillNeed,
+                Some("dont_need") => rustix::fs::Advice::DontNeed,
+                Some("no_reuse") => rustix::fs::Advice::NoReuse,
                 _ => return Ok(invalid()),
             };
             #[cfg(not(target_os = "linux"))]
@@ -625,11 +625,10 @@ fn advise_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
             // Without POSIX_FADVISE (macOS) OTP treats advice as successful.
             #[cfg(target_os = "linux")]
             {
-                // SAFETY: the descriptor is owned by the open file; posix_fadvise reads no memory.
-                let ret = unsafe { libc::posix_fadvise(_file.as_raw_fd(), offset, length, advice) };
-                // posix_fadvise returns the error number instead of setting errno.
-                if ret != 0 {
-                    return Ok(posix(&std::io::Error::from_raw_os_error(ret)));
+                // A zero length means "to the end of the file" for posix_fadvise.
+                let len = std::num::NonZeroU64::new(length as u64);
+                if let Err(errno) = rustix::fs::fadvise(&*_file, offset as u64, len, advice) {
+                    return Ok(posix(&std::io::Error::from(errno)));
                 }
             }
             Ok(ok())
@@ -652,29 +651,30 @@ fn allocate_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
             #[cfg(target_os = "linux")]
             {
                 let _ = end;
-                let mut ret;
                 loop {
-                    // SAFETY: the descriptor is owned by the open file; fallocate reads no memory.
-                    ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, offset, length) };
-                    if !(ret < 0
-                        && std::io::Error::last_os_error().kind()
-                            == std::io::ErrorKind::Interrupted)
-                    {
-                        break;
-                    }
-                }
-                if ret < 0 {
-                    // Fallback to posix_fallocate, which returns the error number.
-                    loop {
-                        // SAFETY: as above.
-                        let r = unsafe { libc::posix_fallocate(file.as_raw_fd(), offset, length) };
-                        if r == libc::EINTR {
-                            continue;
+                    match rustix::fs::fallocate(
+                        &*file,
+                        rustix::fs::FallocateFlags::empty(),
+                        offset as u64,
+                        length as u64,
+                    ) {
+                        Err(rustix::io::Errno::INTR) => continue,
+                        // The posix_fallocate fallback of erts; glibc emulates by writing
+                        // blocks, which for a plain size extension is `set_len`.
+                        Err(rustix::io::Errno::OPNOTSUPP) => {
+                            let old = match file.metadata() {
+                                Ok(m) => m.len(),
+                                Err(e) => return Ok(posix(&e)),
+                            };
+                            if end as u64 > old
+                                && let Err(e) = file.set_len(end as u64)
+                            {
+                                return Ok(posix(&e));
+                            }
+                            break;
                         }
-                        if r != 0 {
-                            return Ok(posix(&std::io::Error::from_raw_os_error(r)));
-                        }
-                        break;
+                        Err(errno) => return Ok(posix(&std::io::Error::from(errno))),
+                        Ok(()) => break,
                     }
                 }
                 Ok(ok())

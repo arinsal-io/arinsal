@@ -29,6 +29,9 @@ pub fn run_with_debugger_flags(
     line_breakpoints: bool,
     distribution_buffer_busy_limit_kb: Option<u64>,
 ) -> Result<ScheduledResult, VmError> {
+    // Port of erts/emulator/sys/common/erl_sys_common_misc.c (erts_init_sys_common_misc):
+    // the locale is read once at boot and decides the native file name encoding.
+    arinsal_bifs::unicode_set_locale_utf8(arinsal_nif_tty::locale_is_utf8());
     // Port of erl_init.c:138 and :2223 (`+t` into `erts_atom_table_size`), OTP-29.1.1.
     // Read before `erl_init_atoms`, which publishes the process-wide table.
     if let Some(limit) = arinsal_args::active_emulator_flags().atom_limit {

@@ -419,7 +419,7 @@ fn to_tm(value: Calendar, is_dst: i32) -> tm {
     result
 }
 
-fn local_calendar(seconds: i64) -> Result<Calendar, BifError> {
+fn local_tm(seconds: i64) -> Result<tm, BifError> {
     let timestamp: time_t = seconds;
     // SAFETY: `out` is valid writable storage and localtime_r copies into it.
     let out = unsafe {
@@ -429,7 +429,11 @@ fn local_calendar(seconds: i64) -> Result<Calendar, BifError> {
         }
         out
     };
-    Ok(calendar_from_tm(out))
+    Ok(out)
+}
+
+fn local_calendar(seconds: i64) -> Result<Calendar, BifError> {
+    local_tm(seconds).map(calendar_from_tm)
 }
 
 fn calendar_from_tm(value: tm) -> Calendar {
@@ -460,44 +464,28 @@ crate::bif_bodies!(
 );
 
 /// Whether the local time zone has daylight saving time.
-// Port of erts/emulator/sys/unix/sys_time.c (sys_init_time, sys_daylight), OTP-29.1.1:
-// the libc `daylight` variable where it exists, else a scan of the current year.
-#[cfg(target_os = "linux")]
-fn sys_daylight() -> bool {
-    unsafe extern "C" {
-        static daylight: libc::c_int;
-        fn tzset();
-    }
-    // SAFETY: tzset initializes the libc time zone state that `daylight` reflects.
-    unsafe {
-        tzset();
-        daylight != 0
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
+// Port of erts/emulator/sys/unix/sys_time.c (sys_init_time, sys_daylight), OTP-29.1.1: the
+// scan of the current year that erts uses where libc has no `daylight` variable. glibc's
+// `daylight` is set from the zone rules; for the zones in use the two agree.
 fn sys_daylight() -> bool {
     static DAYLIGHT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DAYLIGHT.get_or_init(|| {
-        let now: time_t = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as time_t);
-        // SAFETY: tm is plain data; localtime_r and mktime read and write only these values.
-        unsafe {
-            let mut base: tm = std::mem::zeroed();
-            localtime_r(&now, &mut base);
-            base.tm_hour = 0;
-            base.tm_min = 0;
-            base.tm_sec = 0;
-            base.tm_mday = 1;
-            (0..12).any(|month| {
-                base.tm_mon = month;
-                let mut probe = base;
-                let clock = mktime(&mut probe);
-                let mut local: tm = std::mem::zeroed();
-                localtime_r(&clock, &mut local);
-                local.tm_isdst > 0
-            })
-        }
+        let Ok(now) = now_seconds() else { return false };
+        let Ok(year) = local_tm(now).map(|tm| tm.tm_year + 1900) else {
+            return false;
+        };
+        (1u32..=12).any(|month| {
+            let first = Calendar {
+                year,
+                month,
+                day: 1,
+                hour: 0,
+                minute: 0,
+                second: 0,
+            };
+            unix_from_calendar(first)
+                .and_then(|seconds| local_tm(seconds).ok())
+                .is_some_and(|tm| tm.tm_isdst > 0)
+        })
     })
 }

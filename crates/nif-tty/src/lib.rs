@@ -533,15 +533,19 @@ fn tty_init_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
         Ok(atom("ok"))
     })
 }
+/// Switch `LC_CTYPE` to the environment's locale and report whether its codeset is UTF-8.
+// Port of erts/emulator/nifs/common/prim_tty_nif.c (setlocale_nif) and
+// erts/emulator/sys/common/erl_sys_common_misc.c (erts_init_sys_common_misc), OTP-29.1.1.
+pub fn locale_is_utf8() -> bool {
+    // SAFETY: C string is static; setlocale and nl_langinfo return process-owned strings.
+    let locale = unsafe { libc::setlocale(libc::LC_CTYPE, c"".as_ptr()) };
+    // SAFETY: nl_langinfo(CODESET) returns a process-owned NUL-terminated string.
+    !locale.is_null()
+        && unsafe { CStr::from_ptr(libc::nl_langinfo(libc::CODESET)) }.to_bytes() == b"UTF-8"
+}
 fn setlocale_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
     call(ctx, a, |_| {
-        // Port of erts/emulator/nifs/common/prim_tty_nif.c:747 (setlocale_nif), OTP-29.1.1.
-        // SAFETY: C string is static; setlocale and nl_langinfo return process-owned strings.
-        let locale = unsafe { libc::setlocale(libc::LC_CTYPE, c"".as_ptr()) };
-        // SAFETY: nl_langinfo(CODESET) returns a process-owned NUL-terminated string.
-        let utf8 = !locale.is_null()
-            && unsafe { CStr::from_ptr(libc::nl_langinfo(libc::CODESET)) }.to_bytes() == b"UTF-8";
-        Ok(atom(if utf8 { "true" } else { "false" }))
+        Ok(atom(if locale_is_utf8() { "true" } else { "false" }))
     })
 }
 fn tty_select_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
