@@ -10,7 +10,7 @@
 use super::{atom, badarg, list, tuple_items};
 use crate::VmError;
 use arinsal_ets::match_spec::MatchProgram;
-use arinsal_ets::{SavedKey, SavedMatches, ScanPosition, Tid};
+use arinsal_ets::{SavedKey, SavedMatches, ScanPosition};
 use arinsal_term::{HeapAlloc, MagicRef, Term, TermBuilder, copy_term};
 use std::sync::Arc;
 
@@ -124,7 +124,7 @@ pub(super) fn continuation_items(term: Term) -> Result<Vec<Term>, VmError> {
 // select_chunk_continue_on_loop_ended, OTP-29.1.1.
 pub(super) fn hash_loop_ended<H: HeapAlloc>(
     heap: &mut H,
-    tid: Tid,
+    tid: Term,
     program_owner: &Arc<MagicRef>,
     chunk: usize,
     mut held: Vec<Term>,
@@ -148,7 +148,6 @@ pub(super) fn hash_loop_ended<H: HeapAlloc>(
         .list_from_iter(held.into_iter().rev())
         .map_err(|_| badarg())?;
     if !rest.is_empty() || slot.is_some() {
-        let tid = tid.to_term(heap).map_err(|_| badarg())?;
         let reference = match_program_reference(heap, program_owner)?;
         let rest = TermBuilder::new(heap)
             .list_from_iter(rest)
@@ -182,14 +181,13 @@ pub(super) fn hash_loop_ended<H: HeapAlloc>(
 // Port of erts/emulator/beam/erl_db_tree.c, db_select_chunk_tree_common, OTP-29.1.1.
 pub(super) fn tree_continuation<H: HeapAlloc>(
     heap: &mut H,
-    tid: Tid,
+    tid: Term,
     program_owner: &Arc<MagicRef>,
     chunk: usize,
     reverse: bool,
     key: &SavedKey,
     end: Option<&SavedKey>,
 ) -> Result<Term, VmError> {
-    let tid = tid.to_term(heap).map_err(|_| badarg())?;
     let key = copy_term(key.term(), heap).map_err(|_| badarg())?;
     let end = match end {
         Some(end) => copy_term(end.term(), heap).map_err(|_| badarg())?,

@@ -54,17 +54,12 @@ impl Tid {
 }
 
 impl Tid {
-    /// Build a local reference shaped table handle in the caller's heap.
-    pub fn to_term<H: HeapAlloc>(self, dst: &mut H) -> Result<Term, TermError> {
-        TermBuilder::new(dst).local_ref([0x4554_5329, self.0 as u32, (self.0 >> 32) as u32])
-    }
-
-    /// Decode a handle produced by `to_term`.
+    /// Decode a table handle: the table identity stored in the magic binary a tid reference
+    /// points at.
+    // Port of erts/emulator/beam/erl_db.c (db_get_table_aux, the `erts_magic_ref2bin` test):
+    // a reference that is not the magic reference of an ETS table is not a table handle.
     pub fn from_term(term: Term) -> Option<Self> {
-        match term.local_ref_numbers()? {
-            [0x4554_5329, low, high] => Some(Self(low as u64 | ((high as u64) << 32))),
-            _ => None,
-        }
+        term.with_magic_payload::<TableLock, _>(|lock| lock.tid)
     }
 }
 
@@ -255,7 +250,7 @@ impl CountContinuation {
         if self.tid != table.tid {
             return Err(EtsError::BadArg);
         }
-        let tid = self.tid.to_term(dst)?;
+        let tid = table.tid_term(dst)?;
         let program = copy_term(self.program_ref, dst)?;
         let total = TermBuilder::new(dst).int_from_i128(self.total as i128)?;
         if table.options.table_type == TableType::OrderedSet {
@@ -328,7 +323,7 @@ impl SelectContinuation {
         if self.tid != table.tid {
             return Err(EtsError::BadArg);
         }
-        let tid = self.tid.to_term(dst)?;
+        let tid = table.tid_term(dst)?;
         let program = copy_term(self.program_ref, dst)?;
         let limit = Term::small(self.limit as i64).ok_or(EtsError::BadArg)?;
         if table.options.table_type == TableType::OrderedSet {
@@ -1957,6 +1952,8 @@ pub struct PreparedObject {
 pub struct Table {
     /// Stable table identifier.
     pub tid: Tid,
+    /// The magic reference of this table (`tb->common.btid`), set once the table is registered.
+    btid: std::sync::OnceLock<std::sync::Weak<arinsal_term::MagicRef>>,
     /// Creation options and owner metadata.
     pub options: TableOptions,
     storage: Storage,
@@ -2000,6 +1997,18 @@ pub struct InsertListCtx {
 pub type InsertOutcome = Arc<std::sync::atomic::AtomicU8>;
 
 impl Table {
+    /// The table's reference term: the magic reference whose binary owns the table, as erts'
+    /// `make_tid` builds from `tb->common.btid`.
+    // Port of erts/emulator/beam/erl_db.c (make_tid), OTP-29.1.1.
+    pub fn tid_term<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
+        let owner = self
+            .btid
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(EtsError::NoTable)?;
+        Ok(TermBuilder::new(dst).magic_ref(owner)?)
+    }
+
     /// Whether the table was deleted while a cached handle to it was still in use.
     pub fn is_detached(&self) -> bool {
         self.detached
@@ -2031,6 +2040,7 @@ impl Table {
         }
         Ok(Self {
             tid,
+            btid: std::sync::OnceLock::new(),
             options,
             storage,
             fixed: 0,
@@ -2275,7 +2285,7 @@ impl Table {
             Ok(TermBuilder::new(dst).int_from_i128(value as i128)?)
         };
         match key {
-            "id" => Ok(self.tid.to_term(dst)?),
+            "id" => Ok(self.tid_term(dst)?),
             "name" => Ok(Term::atom(self.options.name)),
             "type" => Ok(atom(match self.options.table_type {
                 TableType::Set => "set",
@@ -4966,7 +4976,7 @@ impl NamedTableIndex {
             .data
             .iter()
             .find(|entry| entry.name == name)
-            .map(|entry| Arc::clone(&entry.table))
+            .map(|entry| entry.table.clone())
     }
 
     /// Use the table in an atom-hashed name snapshot without cloning its shared handle.
@@ -5012,7 +5022,7 @@ impl NamedTableIndex {
         let Some(index) = current
             .data
             .iter()
-            .position(|entry| entry.name == name && Arc::ptr_eq(&entry.table, table))
+            .position(|entry| entry.name == name && SharedTable::ptr_eq(&entry.table, table))
         else {
             return false;
         };
@@ -5045,7 +5055,41 @@ impl Default for NamedTableIndex {
 /// Port of erts/emulator/beam/erl_db.c (db_lock/db_unlock), OTP-29.1.1: each table
 /// carries its own `rwlock`; reads take it shared and writes exclusive. The registry lock
 /// only guards the identity and name maps (erts `meta_main_tab` and `meta_name_tab`).
-pub type SharedTable = Arc<TableLock>;
+#[derive(Clone)]
+pub struct SharedTable(Arc<arinsal_term::MagicRef>);
+
+impl SharedTable {
+    /// Wrap a table lock in its magic binary and register the table's own reference.
+    // Port of erts/emulator/beam/erl_db.c (db_create_table: erts_create_magic_binary with the
+    // DbTable as its data and `tb->common.btid`), OTP-29.1.1.
+    fn new(lock: TableLock) -> Self {
+        let size = std::mem::size_of::<Table>();
+        let magic = arinsal_term::MagicRef::with_erts_payload_size(lock, size);
+        let shared = Self(magic);
+        let _ = shared.read().btid.set(Arc::downgrade(&shared.0));
+        shared
+    }
+
+    /// The table's reference term.
+    pub fn to_term<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, TermError> {
+        TermBuilder::new(dst).magic_ref(Arc::clone(&self.0))
+    }
+
+    /// Whether both handles are the same table.
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.0, &b.0)
+    }
+}
+
+impl std::ops::Deref for SharedTable {
+    type Target = TableLock;
+
+    fn deref(&self) -> &TableLock {
+        self.0
+            .downcast_ref::<TableLock>()
+            .expect("a table handle holds its table lock")
+    }
+}
 
 /// A table rwmutex. erts selects its frequent-reader implementation when either
 /// `DB_FINE_LOCKED` or `DB_FREQ_READ` is set.
@@ -5055,6 +5099,7 @@ pub type SharedTable = Arc<TableLock>;
 pub struct TableLock {
     lock: TableRwLock<Table>,
     busy: Arc<std::sync::atomic::AtomicBool>,
+    tid: Tid,
     /// The options the table was created with, readable without taking the table lock. The
     /// type, key position, compression and write concurrency never change; the name and the
     /// protection do, so callers needing those read the table itself.
@@ -5124,6 +5169,7 @@ impl TableLock {
     fn new(table: Table, frequent_read: bool) -> Self {
         Self {
             busy: table.busy_flag(),
+            tid: table.tid,
             creation: table.options,
             lock: if frequent_read {
                 TableRwLock::FrequentRead(FrequentReadRwLock::new(table))
@@ -5235,17 +5281,17 @@ impl Registry {
                 table: None,
             });
         }
-        let shared = Arc::new(TableLock::new(
+        let shared = SharedTable::new(TableLock::new(
             table,
             options.read_concurrency || options.write_concurrency != WriteConcurrency::Disabled,
         ));
-        self.tables[index].table = Some(Arc::clone(&shared));
+        self.tables[index].table = Some(shared.clone());
         self.owned_tables
             .entry(options.owner)
             .or_default()
             .insert(tid);
         if options.named_table {
-            if !self.named_tables.insert(options.name, Arc::clone(&shared)) {
+            if !self.named_tables.insert(options.name, shared.clone()) {
                 self.remove_owned_table(options.owner, tid);
                 self.tables[index].table = None;
                 self.free_slots.push(index);
@@ -5265,6 +5311,11 @@ impl Registry {
             .filter(|slot| slot.generation == tid.generation())
             .ok_or(EtsError::NoTable)?;
         slot.table.as_ref().ok_or(EtsError::NoTable)
+    }
+
+    /// The reference term of a live table (erts `make_tid`).
+    pub fn tid_term<H: HeapAlloc>(&self, tid: Tid, dst: &mut H) -> Result<Term, EtsError> {
+        Ok(self.shared(tid)?.to_term(dst)?)
     }
 
     /// Lock a table exclusively while ETS hash storage is stripe-owned.
@@ -5422,7 +5473,7 @@ impl Registry {
     /// Unnamed tables only change the name reported by `ets:info/2`. They are
     /// not registered, so the new name may collide with another table's name.
     pub fn rename(&mut self, tid: Tid, name: Atom) -> Result<(), EtsError> {
-        let shared = Arc::clone(self.shared(tid)?);
+        let shared = self.shared(tid)?.clone();
         let mut table = shared.write();
         let named = table.options.named_table;
         if named {
@@ -5432,7 +5483,7 @@ impl Registry {
                 return Err(EtsError::NameTaken);
             }
             let old = table.options.name;
-            if !self.named_tables.insert(name, Arc::clone(&shared)) {
+            if !self.named_tables.insert(name, shared.clone()) {
                 return Err(EtsError::NameTaken);
             }
             assert!(self.named_tables.remove(old, &shared));
@@ -6075,22 +6126,22 @@ mod registry_tests {
 
         let first = registry.create(first_options).unwrap();
         let second = registry.create(second_options).unwrap();
-        assert!(Arc::ptr_eq(
+        assert!(SharedTable::ptr_eq(
             registry.shared(first).unwrap(),
             &index.lookup(first_name).unwrap()
         ));
-        assert!(Arc::ptr_eq(
+        assert!(SharedTable::ptr_eq(
             registry.shared(second).unwrap(),
             &index.lookup(second_name).unwrap()
         ));
 
         registry.rename(first, renamed_name).unwrap();
         assert!(index.lookup(first_name).is_none());
-        assert!(Arc::ptr_eq(
+        assert!(SharedTable::ptr_eq(
             registry.shared(first).unwrap(),
             &index.lookup(renamed_name).unwrap()
         ));
-        assert!(Arc::ptr_eq(
+        assert!(SharedTable::ptr_eq(
             registry.shared(second).unwrap(),
             &index.lookup(second_name).unwrap()
         ));

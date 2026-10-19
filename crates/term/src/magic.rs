@@ -158,6 +158,20 @@ impl crate::Term {
             .map(|word| MagicRef::thing_owner(word, true))
     }
 
+    /// Run `visit` on the payload of a magic reference, borrowed from the term without touching
+    /// the reference count. `None` when the term is not a magic reference or its payload is
+    /// not a `T`.
+    // Port of erts/emulator/beam/erl_bif_unique.c / erl_db.c (erts_magic_ref2bin and the
+    // `ERTS_MAGIC_BIN_DATA` read in db_get_table_aux), OTP-29.1.1: the magic binary is read
+    // through the reference thing, with no refcount write.
+    pub fn with_magic_payload<T: Any, R>(self, visit: impl FnOnce(&T) -> R) -> Option<R> {
+        // SAFETY: like every `Term` accessor taking a pointer-tagged term, the caller holds the
+        // term in a live heap (a BIF argument or register), which retains the magic binary on
+        // its off-heap list for the duration of this call.
+        let magic = unsafe { self.magic_ref() }?;
+        magic.downcast_ref::<T>().map(visit)
+    }
+
     /// Borrow the magic owner from a live reference term.
     ///
     /// # Safety
