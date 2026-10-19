@@ -4072,8 +4072,9 @@ fn failure_top(
                     {
                         return None;
                     }
-                    let args = registers[1];
-                    let args = crate::exceptions::is_proper_list(args).then_some(args);
+                    // Port of erts/emulator/beam/bif.c:1448-1456 (error_2), OTP-29.1.1:
+                    // retain the caller-supplied argument term without validating it.
+                    let args = Some(registers[1]);
                     return match registers
                         .get(2)
                         .filter(|_| arity > 2)

@@ -314,7 +314,9 @@ pub(super) fn bif_error_with_atoms(
         } = error
         {
             let top = if module == "erlang" && function == "error" && args.len() > 1 {
-                let frame_args = proper_list(args[1]).then_some(args[1]);
+                // Port of erts/emulator/beam/bif.c (error_2), OTP-29.1.1: the supplied
+                // argument term is kept verbatim in the exception's stack-frame data.
+                let frame_args = Some(args[1]);
                 match args.get(2).and_then(error_info_option) {
                     Some(info) => Some(stacktrace::TopFrame::CurrentArgsWithInfo(
                         frame_args,
@@ -418,18 +420,6 @@ pub(crate) fn error_info_term(options: Term) -> Option<Term> {
         return None;
     }
     info
-}
-
-/// Whether `term` is a proper list, without copying it.
-pub(crate) fn is_proper_list(term: Term) -> bool {
-    arinsal_bifs::for_each_list_term(term, |_| Ok(())).is_ok()
-}
-
-fn proper_list(term: Term) -> bool {
-    matches!(
-        to_owned(term).as_ref(),
-        Ok(OwnedTerm::List { tail, .. }) if **tail == OwnedTerm::Nil
-    )
 }
 
 /// Detach a direct host-to-BIF failure when there is no BEAM caller frame.

@@ -3581,9 +3581,12 @@ fn dist_spawn_request(
     };
     let mut tag = atom("spawn_reply");
     let mut reply_error = true;
+    let mut monitor = false;
     let mut bad = false;
     for item in items {
-        if let Some((key, value)) = tuple2(item) {
+        if item == atom("monitor") {
+            monitor = true;
+        } else if let Some((key, value)) = tuple2(item) {
             if key == atom("reply_tag") {
                 if kind != atom("spawn_request") {
                     return Ok(atom("badarg"));
@@ -3598,6 +3601,8 @@ fn dist_spawn_request(
                     None if kind == atom("spawn_request") => bad = true,
                     None => return Ok(atom("badarg")),
                 }
+            } else if key == atom("monitor") {
+                monitor = true;
             }
         }
     }
@@ -3613,7 +3618,15 @@ fn dist_spawn_request(
         let self_pid = ctx.pid().to_term().ok_or_else(badarg)?;
         process.send_message(self_pid, message)?;
     }
-    Ok(reference)
+    if kind == atom("spawn_opt") {
+        // Port of erts/emulator/beam/dist.c:6073-6080, OTP-29.1.1.
+        make_tuple(
+            process,
+            &[reference, atom(if monitor { "true" } else { "false" })],
+        )
+    } else {
+        Ok(reference)
+    }
 }
 
 // Port of erts/emulator/beam/bif.c:1166 (`spawn_request_abandon_1`), OTP-29.1.1.
