@@ -1349,6 +1349,7 @@ fn recv_one(inner: &mut Inner) -> RecvOne {
     }
     let addr = encode_addr(&storage, msg.msg_namelen).unwrap_or_else(|| vec![0]);
     let anc = if want_cmsg {
+        #[allow(clippy::unnecessary_cast)] // msg_controllen is u32 on macOS, usize on Linux
         parse_cmsgs(&ctrl.0[..msg.msg_controllen as usize])
     } else {
         Vec::new()

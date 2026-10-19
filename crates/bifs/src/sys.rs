@@ -328,7 +328,7 @@ fn uname_fields() -> (String, [i64; 3]) {
         let bytes: Vec<u8> = field
             .iter()
             .take_while(|c| **c != 0)
-            .map(|c| *c as u8)
+            .map(|c| c.to_ne_bytes()[0])
             .collect();
         String::from_utf8_lossy(&bytes).into_owned()
     };

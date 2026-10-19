@@ -4,8 +4,19 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const ERL: &str = "erl";
-const ERLC: &str = "erlc";
+/// `bin/<tool>` of the OTP root on PATH. The real binary is used rather than a version
+/// manager's shim, which would hide the exit signal this test compares.
+fn otp_tool(tool: &str) -> String {
+    let output = Command::new("erl")
+        .args([
+            "-noshell",
+            "-eval",
+            "io:format(\"~s\",[code:root_dir()]),halt().",
+        ])
+        .output()
+        .expect("run erl");
+    format!("{}/bin/{tool}", String::from_utf8(output.stdout).unwrap())
+}
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 const SOURCE: &str = r#"
@@ -40,7 +51,7 @@ fn fixture() -> std::path::PathBuf {
     let source = dir.join("halt_fixture.erl");
     fs::write(&source, SOURCE).unwrap();
     let status = Command::new("timeout")
-        .args(["30", ERLC, "-o"])
+        .args(["30", &otp_tool("erlc"), "-o"])
         .arg(&dir)
         .arg(&source)
         .status()
@@ -89,7 +100,7 @@ fn arinsal_boot(
 
 fn reference_eval(dir: &std::path::Path, function: &str) -> Output {
     Command::new("timeout")
-        .args(["30", ERL, "-noshell", "-pa"])
+        .args(["30", &otp_tool("erl"), "-noshell", "-pa"])
         .arg(dir)
         .args(["-eval", &format!("halt_fixture:{function}().")])
         .current_dir(dir)
@@ -103,7 +114,7 @@ fn reference_eval_with_dump(
     dump_path: &std::path::Path,
 ) -> Output {
     Command::new("timeout")
-        .args(["30", ERL, "-noshell", "-pa"])
+        .args(["30", &otp_tool("erl"), "-noshell", "-pa"])
         .arg(dir)
         .args(["-eval", &format!("halt_fixture:{function}().")])
         .env("ERL_CRASH_DUMP", dump_path)

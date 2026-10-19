@@ -31,11 +31,8 @@ pub fn cpu_info() -> CpuInfo {
 pub fn poll_max_fds() -> usize {
     // SAFETY: sysconf only reads a system limit.
     let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-    match usize::try_from(max) {
-        Ok(max) => max,
-        // macOS 11+ can report "unlimited"; erts then assumes the kernel's per-process cap.
-        Err(_) => 24_576,
-    }
+    // macOS 11+ can report "unlimited"; erts then assumes the kernel's per-process cap.
+    usize::try_from(max).unwrap_or(24_576)
 }
 
 /// Default `(schedulers, schedulers_online)` before any `+S` flag.
@@ -70,9 +67,8 @@ fn read_cpu_info() -> CpuInfo {
     let configured = usize::try_from(configured).unwrap_or(0);
     let online = usize::try_from(online).unwrap_or(0).min(configured);
     let mut available = affinity_count();
-    if available > online {
-        available = online;
-    } else if available == 0 {
+    // Capped by the online count; zero ("shouldn't happen") also falls back to it.
+    if available > online || available == 0 {
         available = online;
     }
     let quota = read_cpu_quota(online);
@@ -211,15 +207,15 @@ fn cgroup_path(controller: &str, read: &dyn Fn(&str) -> String) -> Option<(Cgrou
                     return Some((version, dir));
                 }
             }
-            CgroupVersion::V1 if tail[0] == "cgroup" => {
-                if tail[2].split(',').any(|c| c == controller) {
-                    let dir = if root == child {
-                        mount.to_owned()
-                    } else {
-                        format!("{mount}{child}")
-                    };
-                    return Some((version, dir));
-                }
+            CgroupVersion::V1
+                if tail[0] == "cgroup" && tail[2].split(',').any(|c| c == controller) =>
+            {
+                let dir = if root == child {
+                    mount.to_owned()
+                } else {
+                    format!("{mount}{child}")
+                };
+                return Some((version, dir));
             }
             _ => {}
         }
