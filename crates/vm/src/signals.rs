@@ -2969,7 +2969,7 @@ fn call_resolved(
                     object: object.clone(),
                 },
             );
-            if let Some(id) = port_id.filter(|id| runtime.ports.lock().unwrap().contains_key(id)) {
+            if let Some(id) = port_id.filter(|id| runtime.ports.read().unwrap().contains_key(id)) {
                 if tag != atom("DOWN") {
                     // Port monitors carry no tag yet (typed gap, see report).
                     return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));
