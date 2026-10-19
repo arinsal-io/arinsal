@@ -16,12 +16,12 @@ const FIRST_SEGMENT: usize = 256;
 const EXT_SEGMENT: usize = 2048;
 const NLOCKS_WITH_ITEM_COUNTERS: usize = 64;
 
-/// Port of erts/emulator/beam/erl_term_hashing.c:1770 (make_internal_hash), OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_term_hashing.c (make_internal_hash), OTP-29.1.1.
 /// The scalar path avoids constructing the term-walk stack for immediate integers.
 #[inline]
 pub(super) fn ets_hash(term: Term) -> u64 {
     if let Some(atom) = term.as_atom() {
-        // Port of erl_db_hash.c:280 (MAKE_HASH atom fast path), OTP-29.1.1.
+        // Port of erl_db_hash.c (MAKE_HASH atom fast path), OTP-29.1.1.
         return global_atoms().hvalue(atom).unwrap();
     }
     if term.as_small().is_some() {
@@ -56,7 +56,7 @@ impl Deref for HashDbTerm {
     }
 }
 
-/// Port of the bucket head in `struct segment` in erl_db_hash.c:605-609.
+/// Port of the bucket head in `struct segment` in erl_db_hash.c.
 #[derive(Default)]
 pub(super) struct HashBucket {
     head: Option<Box<HashDbTerm>>,
@@ -165,7 +165,7 @@ impl std::ops::DerefMut for StripeWriteGuard<'_> {
 }
 
 impl StripeBuckets {
-    // Port of erl_db_hash.c:403-416 (RLOCK_HASH is NULL for non-fine tables) and
+    // Port of erl_db_hash.c (RLOCK_HASH is NULL for non-fine tables) and
     // :1035-1041 (DB_FREQ_READ selects frequent-read stripe locks), OTP-29.1.1.
     fn new(bucket_count: usize, fine_grained: bool, frequent_read: bool) -> Self {
         let buckets = || {
@@ -269,7 +269,7 @@ fn purge_pseudo_deleted(mut current: Option<Box<HashDbTerm>>) -> Option<Box<Hash
     live
 }
 
-/// Port of erts/emulator/beam/erl_db_hash.c:164-170, OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
 pub(super) struct HashStorage {
     stripes: Box<[Stripe]>,
     nlocks: usize,
@@ -285,7 +285,7 @@ pub(super) struct HashStorage {
 }
 
 impl HashStorage {
-    /// Port of erts/emulator/beam/erl_db_hash.c:1017-1050, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     pub(super) fn new(
         write_concurrency: WriteConcurrency,
         decentralized_counters: bool,
@@ -331,7 +331,7 @@ impl HashStorage {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:207-217, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     #[inline]
     pub(super) fn slot_index(&self, hval: u64) -> usize {
         let nactive = self.nactive.load(Ordering::Acquire);
@@ -344,13 +344,13 @@ impl HashStorage {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:280, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     #[inline]
     fn make_hash(term: Term) -> u64 {
         ets_hash(term) >> 1
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:1041-1067, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     pub(super) fn lock_count(&self) -> usize {
         self.auto_lock_count.load(Ordering::Relaxed)
     }
@@ -410,7 +410,7 @@ impl HashStorage {
         self.nactive.load(Ordering::Acquire)
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:1526-1528, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     #[inline]
     fn stripe_index(&self, slot: usize) -> usize {
         slot % self.nlocks
@@ -426,7 +426,7 @@ impl HashStorage {
     }
 
     /// Hold the bucket's hash stripe while its borrowed terms are consumed.
-    // Port of erts/emulator/beam/erl_db_hash.c:404-419 (RLOCK_HASH), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (RLOCK_HASH), OTP-29.1.1.
     fn with_bucket<R>(&self, slot: usize, visit: impl FnOnce(&HashBucket) -> R) -> Option<R> {
         let stripe = &self.stripes[self.stripe_index(slot)];
         let buckets = stripe.buckets.read();
@@ -434,7 +434,7 @@ impl HashStorage {
     }
 
     /// Keep the key's write stripe held through the complete bucket mutation.
-    // Port of erts/emulator/beam/erl_db_hash.c:491-499 (WLOCK_HASH), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (WLOCK_HASH), OTP-29.1.1.
     fn with_hash_bucket_mut<R>(
         &self,
         hvalue: u64,
@@ -472,6 +472,37 @@ impl HashStorage {
         if added {
             self.add_items(hash, 1);
             self.grow_after_insert(hash, fixed);
+        }
+        accepted
+    }
+
+    /// Insert a prepared object into the bucket owned by the caller's exclusive table lock.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_put_hash), OTP-29.1.1.
+    pub(super) fn insert_exclusive(
+        &mut self,
+        mut object: StoredTerm,
+        hash: u64,
+        table_type: TableType,
+        keypos: usize,
+        fixed: bool,
+        new_only: bool,
+    ) -> bool {
+        let hvalue = hash >> 1;
+        object.hvalue = hvalue;
+        let slot = self.slot_index(hvalue);
+        let order = self.next_order.fetch_add(1, Ordering::Relaxed);
+        let (accepted, added, memory_delta, _) = put_in_bucket(
+            self.segment_bucket_mut(slot),
+            object,
+            table_type,
+            keypos,
+            new_only,
+            || order,
+        );
+        self.add_object_memory(hvalue, memory_delta);
+        if added {
+            self.add_items(hash, 1);
+            self.maybe_grow(fixed, keypos);
         }
         accepted
     }
@@ -541,7 +572,7 @@ impl HashStorage {
         }
     }
 
-    // Port of erts/emulator/beam/erl_db.c:1494-1683 (do_update_counter), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db.c (do_update_counter), OTP-29.1.1.
     pub(super) fn update_counter_shared(
         &self,
         key: Term,
@@ -597,7 +628,7 @@ impl HashStorage {
         })
     }
 
-    // Port of erts/emulator/beam/erl_db.c:1371-1442 (do_update_element) and :1494-1683
+    // Port of erts/emulator/beam/erl_db.c (do_update_element) and :1494-1683
     // (do_update_counter), OTP-29.1.1.
     pub(super) fn update_or_insert_shared<E>(
         &self,
@@ -766,7 +797,7 @@ impl HashStorage {
         Ok(values)
     }
 
-    // Port of erts/emulator/beam/erl_db_hash.c:2870-2905 (db_select_replace_hash), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_select_replace_hash), OTP-29.1.1.
     pub(super) fn replace_key_shared<E>(
         &self,
         key: Term,
@@ -801,7 +832,7 @@ impl HashStorage {
     }
 
     fn shrink_after_delete_shared(&self, nitems: isize) {
-        // Port of erts/emulator/beam/erl_db_hash.c:757-761 (try_shrink), OTP-29.1.1.
+        // Port of erts/emulator/beam/erl_db_hash.c (try_shrink), OTP-29.1.1.
         if nitems >= self.shrink_limit() as isize {
             return;
         }
@@ -854,12 +885,12 @@ impl HashStorage {
         }
     }
 
-    // Port of erts/emulator/beam/erl_db_hash.c:3648-3731 (grow), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (grow), OTP-29.1.1.
     fn grow_after_insert(&self, hash: u64, fixed: bool) {
         if fixed {
             return;
         }
-        // Port of erts/emulator/beam/erl_db_hash.c:3993-4001 (db_finalize_dbterm_hash),
+        // Port of erts/emulator/beam/erl_db_hash.c (db_finalize_dbterm_hash),
         // OTP-29.1.1.
         if self.estimated_items(hash) <= self.nactive() as isize {
             return;
@@ -985,7 +1016,7 @@ impl HashStorage {
     }
 
     /// Chain length and number of pseudo-deleted objects of every bucket.
-    // Port of erts/emulator/beam/erl_db_hash.c:4072-4112 (db_calc_stats_hash), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_calc_stats_hash), OTP-29.1.1.
     pub(super) fn chain_lengths(&self) -> (Vec<usize>, usize) {
         let mut kept = 0;
         let lengths = (0..self.nactive())
@@ -1033,7 +1064,7 @@ impl HashStorage {
 
     /// The live object at `key` in a set table, for an update in place.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:3872 (db_lookup_dbterm_hash), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c (db_lookup_dbterm_hash), OTP-29.1.1.
     pub(super) fn find_mut(&mut self, key: Term, keypos: usize) -> Option<&mut StoredTerm> {
         let hval = ets_hash(key);
         let slot = self.slot_index(hval >> 1);
@@ -1052,7 +1083,7 @@ impl HashStorage {
 
     /// Return the first live key in OTP's bucket order.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:4173-4194, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     pub(super) fn raw_first(&self, keypos: usize) -> Option<Term> {
         for slot in 0..self.nactive() {
             if let Some(Some(key)) = self.with_bucket(slot, |bucket| {
@@ -1070,7 +1101,7 @@ impl HashStorage {
 
     /// Return a key's raw successor, preserving the hash directory walk order.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:4196-4231, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     pub(super) fn raw_next(&self, key: Term, keypos: usize) -> Result<Option<Term>, EtsError> {
         let hash = ets_hash(key) >> 1;
         loop {
@@ -1119,7 +1150,7 @@ impl HashStorage {
 
     /// Pseudo-delete the objects of the buckets from `slot` on, until `loops` runs out. Returns
     /// the first slot not yet marked (`nactive` when done).
-    // Port of erts/emulator/beam/erl_db_hash.c:3008-3050 (db_mark_all_deleted_hash), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_mark_all_deleted_hash), OTP-29.1.1.
     pub(super) fn mark_deleted_from(&mut self, mut slot: usize, loops: &mut isize) -> usize {
         loop {
             let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
@@ -1147,7 +1178,7 @@ impl HashStorage {
     }
 
     /// Free every object and return to the initial single-segment layout.
-    // Port of erts/emulator/beam/erl_db_hash.c:4017 (db_delete_all_objects_hash:
+    // Port of erts/emulator/beam/erl_db_hash.c (db_delete_all_objects_hash:
     // db_free_table_continue_hash + db_create_hash), OTP-29.1.1.
     pub(super) fn clear_buckets(&mut self) {
         for (index, stripe) in self.stripes.iter_mut().enumerate() {
@@ -1165,7 +1196,7 @@ impl HashStorage {
     }
 
     /// Remove pseudo-deleted nodes once the last table fixation ends.
-    // Port of erts/emulator/beam/erl_db_hash.c:939-1007 (db_unfix_table_hash), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_unfix_table_hash), OTP-29.1.1.
     pub(super) fn unfix(&mut self) {
         for stripe in &mut self.stripes {
             for bucket in stripe.buckets.get_mut() {
@@ -1176,7 +1207,7 @@ impl HashStorage {
 
     /// Detach all buckets (and, for a table being deleted, the pseudo-deleted list) so they can
     /// be released a few segments at a time, leaving the initial single-segment layout.
-    // Port of erts/emulator/beam/erl_db_hash.c:3122 (db_free_table_continue_hash), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_free_table_continue_hash), OTP-29.1.1.
     pub(super) fn take_garbage(&mut self) -> HashGarbage {
         let nslots = self.nslots.load(Ordering::Relaxed);
         let mut segments = Vec::new();
@@ -1250,7 +1281,7 @@ impl HashStorage {
 
     /// Unlink every live object for which `predicate` holds while walking the buckets once.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:2723 (db_select_delete_hash), OTP-29.1.1:
+    /// Port of erts/emulator/beam/erl_db_hash.c (db_select_delete_hash), OTP-29.1.1:
     /// erts frees matching objects during the traversal and shrinks the table afterwards.
     pub(super) fn delete_where<E>(
         &mut self,
@@ -1306,19 +1337,19 @@ impl HashStorage {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:1624-1626, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     pub(super) fn is_valid_slot(&self, slot: usize) -> bool {
         slot <= self.nactive()
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:3883-3885, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     pub(super) fn slot_for_key(&self, key: Term) -> usize {
         self.slot_index(Self::make_hash(key))
     }
 
     /// Objects of one slot in traversal order, optionally with fixed-table pseudo-deleted ones.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:4196-4231 (db_next_hash), OTP-29.1.1: a
+    /// Port of erts/emulator/beam/erl_db_hash.c (db_next_hash), OTP-29.1.1: a
     /// traversal step only walks the key's own bucket and the following buckets, never the
     /// whole table.
     pub(super) fn try_with_slot_ordered<E>(
@@ -1360,7 +1391,7 @@ impl HashStorage {
         None
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:3411-3444, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     fn ensure_slot(&mut self) {
         let nactive = self.nactive();
         let nslots = self.nslots.load(Ordering::Relaxed);
@@ -1381,7 +1412,7 @@ impl HashStorage {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:3648-3731 (grow), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c (grow), OTP-29.1.1.
     #[inline]
     pub(super) fn maybe_grow(&mut self, fixed: bool, _keypos: usize) {
         if fixed || self.size() <= self.nactive() {
@@ -1421,7 +1452,7 @@ impl HashStorage {
         self.segment_bucket_mut(new_slot).head = moved_head;
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:3350-3398, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     fn shrink_limit(&self) -> usize {
         let nslots = self.nslots.load(Ordering::Relaxed);
         if nslots < 4352 {
@@ -1431,7 +1462,7 @@ impl HashStorage {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:3743-3800 (shrink), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c (shrink), OTP-29.1.1.
     fn shrink(&mut self) {
         let nactive = self.nactive();
         if nactive <= FIRST_SEGMENT {
@@ -1465,7 +1496,7 @@ impl HashStorage {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:757-760, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c, OTP-29.1.1.
     pub(super) fn shrink_after_delete(&mut self, _keypos: usize) {
         for _ in 0..5 {
             if self.size() >= self.shrink_limit() || self.nactive() <= FIRST_SEGMENT {
@@ -1968,7 +1999,7 @@ impl ConcurrentHashStorage {
 
 /// The bucket walk of `db_put_hash`: whether the object was accepted and whether it added an
 /// item to the count.
-// Port of erts/emulator/beam/erl_db_hash.c:1363-1460 (db_put_hash), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db_hash.c (db_put_hash), OTP-29.1.1.
 fn put_in_bucket(
     bucket: &mut HashBucket,
     mut object: StoredTerm,
@@ -2060,7 +2091,7 @@ fn put_in_bucket(
 }
 
 /// The bucket walk of `db_erase_hash`; returns the number of items removed from the count.
-// Port of erts/emulator/beam/erl_db_hash.c:1613-1666 (db_erase_hash), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db_hash.c (db_erase_hash), OTP-29.1.1.
 fn erase_in_bucket(
     bucket: &mut HashBucket,
     hvalue: u64,
@@ -2097,7 +2128,7 @@ fn erase_in_bucket(
 }
 
 /// The bucket walk of `db_erase_object_hash`.
-// Port of erts/emulator/beam/erl_db_hash.c:1669-1730 (db_erase_object_hash), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db_hash.c (db_erase_object_hash), OTP-29.1.1.
 fn erase_object_in_bucket(
     bucket: &mut HashBucket,
     hvalue: u64,
@@ -2141,7 +2172,7 @@ fn erase_object_in_bucket(
 
 /// The bucket walk of `db_take_hash`: the objects of the first live key and the number of
 /// nodes removed from the count.
-// Port of erts/emulator/beam/erl_db_hash.c:2949-3005 (db_take_hash), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db_hash.c (db_take_hash), OTP-29.1.1.
 fn take_in_bucket<H: HeapAlloc>(
     bucket: &mut HashBucket,
     hvalue: u64,
@@ -2203,7 +2234,7 @@ pub struct HashGarbage {
 impl HashGarbage {
     /// Release up to `reds` reductions of work. Returns whether everything is done.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:3122 (db_free_table_continue_hash), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c (db_free_table_continue_hash), OTP-29.1.1.
     pub(super) fn step(&mut self, reds: &mut isize) -> bool {
         while let Some(mut segment) = self.segments.pop() {
             let mut records = 0isize;

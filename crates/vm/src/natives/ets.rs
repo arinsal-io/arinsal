@@ -67,7 +67,7 @@ static ETS_ATOMS: LazyLock<HashMap<&'static str, arinsal_term::Atom>> = LazyLock
     .collect()
 });
 
-// Port of erts/emulator/beam/erl_db.c:4713 (`erts_internal_ets_super_user_1`),
+// Port of erts/emulator/beam/erl_db.c (`erts_internal_ets_super_user_1`),
 // OTP-29.1.1. Process currently has no ETS-specific flag word.
 static ETS_SUPER_USERS: LazyLock<Mutex<HashSet<Term>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -101,7 +101,7 @@ fn badarg() -> VmError {
 }
 thread_local! {
     /// The extended error information of the failing ETS BIF, as erts keeps it in
-    /// `p->fvalue` next to `BADARG | EXF_HAS_EXT_INFO` (erl_db.c:53-63), OTP-29.1.1.
+    /// `p->fvalue` next to `BADARG | EXF_HAS_EXT_INFO` (erl_db.c), OTP-29.1.1.
     static BIF_CAUSE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
@@ -137,7 +137,7 @@ fn badarg_cause(cause: &'static str) -> VmError {
 }
 
 /// Attach the failing BIF as the top stack frame, as erts does for every ETS BIF.
-// Port of erts/emulator/beam/beam_common.c:900-998 (save_stacktrace), OTP-29.1.1.
+// Port of erts/emulator/beam/beam_common.c (save_stacktrace), OTP-29.1.1.
 fn bif_frame(
     module: &'static str,
     function: &'static str,
@@ -249,9 +249,9 @@ fn err(error: EtsError) -> VmError {
         EtsError::BadArgCause(cause) => badarg_cause(cause),
         EtsError::BadArg | EtsError::NameTaken => badarg(),
         EtsError::Unsupported(_) => badarg(),
-        // Port of erts/emulator/beam/erl_db.c:770-796: the BIF traps and runs again.
+        // Port of erts/emulator/beam/erl_db.c: the BIF traps and runs again.
         EtsError::Busy => VmError::Yield,
-        // Port of erts/emulator/beam/erl_db.c:1450 (DB_ERROR_SYSRES -> SYSTEM_LIMIT), OTP-29.1.1.
+        // Port of erts/emulator/beam/erl_db.c (DB_ERROR_SYSRES -> SYSTEM_LIMIT), OTP-29.1.1.
         EtsError::Term(arinsal_term::TermError::SystemLimit) => system_limit(),
         EtsError::Term(_) => badarg(),
     }
@@ -316,7 +316,7 @@ impl std::ops::DerefMut for TableGuard<'_> {
     }
 }
 
-// Port of erts/emulator/beam/erl_db.c:446-500 (db_lock read/write modes), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db.c (db_lock read/write modes), OTP-29.1.1.
 fn table_guard<'a>(
     registry: &'a RegistryAccess<'_>,
     tid: Tid,
@@ -343,7 +343,7 @@ fn resolve(registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, ResolveF
     Err(ResolveFail::BadType)
 }
 
-// Port of erts/emulator/beam/erl_db.c:280-306 (tid2tab) and :805-910
+// Port of erts/emulator/beam/erl_db.c (tid2tab) and :805-910
 // (db_get_table_aux), OTP-29.1.1.
 fn handle(registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, VmError> {
     resolve(registry, term).map_err(|fail| match fail {
@@ -376,7 +376,7 @@ fn live_table_terms<H: HeapAlloc>(
         .collect()
 }
 fn allowed(table: &arinsal_ets::Table, caller: Term, write: bool) -> bool {
-    // Port of erts/emulator/beam/erl_db.c:800 (db_get_table_aux), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db.c (db_get_table_aux), OTP-29.1.1.
     // Access depends on stored flags, not the table-wide statistics in info().
     // The cheap owner and protection tests come first; the global super-user set is the
     // last resort so ordinary calls never take its lock.
@@ -398,7 +398,7 @@ fn position(term: Term) -> Option<usize> {
 /// Parse an update_counter `Incr | Op | [Op]` whose operands are all small integers, for
 /// [`Table::update_counter_in_place`]; `None` leaves the call to the general path. The flag
 /// is set when the result is a single counter rather than a list.
-// Port of erts/emulator/beam/erl_db.c:1517-1529 (do_update_counter, the UpdateOp forms),
+// Port of erts/emulator/beam/erl_db.c (do_update_counter, the UpdateOp forms),
 // OTP-29.1.1.
 fn small_counter_ops(
     keypos: usize,
@@ -471,7 +471,7 @@ fn update_list<T>(spec: Term, mut parse: impl FnMut(Term) -> Option<T>) -> Vec<O
 }
 
 /// Check the `Default` argument of update_element/4 and update_counter/4.
-// Port of erts/emulator/beam/erl_db.c:1480-1488 and :1718-1726, OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db.c and :1718-1726, OTP-29.1.1.
 fn default_object(
     table: &arinsal_ets::Table,
     default: Option<Term>,
@@ -527,6 +527,7 @@ pub(crate) fn direct_entry(module: &str, function: &str, arity: u8) -> Option<Di
     match (function, arity) {
         ("lookup", 2) => Some(direct_lookup),
         ("member", 2) => Some(direct_member),
+        ("lookup_element", 3 | 4) => Some(direct_lookup_element),
         ("insert", 2) => Some(direct_insert),
         ("insert_new", 2) => Some(direct_insert_new),
         ("update_counter", 3 | 4) => Some(direct_update_counter),
@@ -535,7 +536,7 @@ pub(crate) fn direct_entry(module: &str, function: &str, arity: u8) -> Option<Di
         ("rename", 2) => Some(direct_bif::<{ EtsBif::Rename as u8 }>),
         ("info", 1) => Some(direct_bif::<{ EtsBif::Info as u8 }>),
         ("info", 2) => Some(direct_info_2),
-        ("delete", 2) => Some(direct_bif::<{ EtsBif::Delete as u8 }>),
+        ("delete", 2) => Some(direct_delete),
         ("take", 2) => Some(direct_bif::<{ EtsBif::Take as u8 }>),
         ("slot", 2) => Some(direct_bif::<{ EtsBif::Slot as u8 }>),
         ("first", 1) => Some(direct_bif::<{ EtsBif::First as u8 }>),
@@ -558,7 +559,6 @@ pub(crate) fn direct_entry(module: &str, function: &str, arity: u8) -> Option<Di
         ("select_count", 2) => Some(direct_bif::<{ EtsBif::SelectCount as u8 }>),
         ("internal_select_delete", 2) => Some(direct_bif::<{ EtsBif::InternalSelectDelete as u8 }>),
         ("select_replace", 2) => Some(direct_bif::<{ EtsBif::SelectReplace as u8 }>),
-        ("lookup_element", 3 | 4) => Some(direct_bif::<{ EtsBif::LookupElement as u8 }>),
         ("update_element", 3 | 4) => Some(direct_bif::<{ EtsBif::UpdateElement as u8 }>),
         _ => None,
     }
@@ -579,7 +579,7 @@ fn direct_bif<const BIF: u8>(
 }
 
 /// `ets:info/2`: the `binary` item traps to an Erlang export, which only the scheduler path runs.
-// Port of erts/emulator/beam/erl_db.c:4541-4542 (ets_info_2: BIF_TRAP1 ets_info_binary_trap),
+// Port of erts/emulator/beam/erl_db.c (ets_info_2: BIF_TRAP1 ets_info_binary_trap),
 // OTP-29.1.1.
 fn direct_info_2(
     process: &mut Process,
@@ -657,7 +657,7 @@ fn bif_register_frame(
 
 /// `erlang:system_info(scheduler_id)` from the generated code: the process knows its scheduler,
 /// as erts reads `c_p->scheduler_data`. Every other item takes the scheduler path.
-// Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_bif_info.c (system_info scheduler_id), OTP-29.1.1.
 fn direct_system_info(
     process: &mut Process,
     args: &[Term],
@@ -688,7 +688,7 @@ type CachedTable = (usize, Tid, arinsal_ets::SharedTable, TableOptions);
 thread_local! {
     /// Per-scheduler handles of recently used tables, keyed by runtime and table identity, so
     /// a call takes no registry lock: erts reaches a table through its lock-free
-    /// `meta_main_tab` (erl_db.c:805 db_get_table_aux). A deleted table is caught by its
+    /// `meta_main_tab` (erl_db.c db_get_table_aux). A deleted table is caught by its
     /// `detached` flag under the table lock.
     static TABLE_CACHE: std::cell::RefCell<[Option<CachedTable>; 32]> =
         const { std::cell::RefCell::new([const { None }; 32]) };
@@ -774,8 +774,8 @@ fn direct_lookup_cached(process: &mut Process, args: &[Term], tid: Tid) -> Optio
             return None;
         }
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        // Port of erts/emulator/beam/erl_db_hash.c:1492 (db_get_hash) and
-        // erl_db_tree.c:1046 (db_get_tree), OTP-29.1.1: a set holds at most one object,
+        // Port of erts/emulator/beam/erl_db_hash.c (db_get_hash) and
+        // erl_db_tree.c (db_get_tree), OTP-29.1.1: a set holds at most one object,
         // consed straight onto the process heap.
         if matches!(
             table.options.table_type,
@@ -822,6 +822,61 @@ fn direct_member_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     })
 }
 
+/// `ets:lookup_element/3,4` through a stable table handle and the table's native read lock.
+// Port of erts/emulator/beam/erl_db.c (ets_lookup_element_3/4), OTP-29.1.1.
+fn direct_lookup_element(
+    process: &mut Process,
+    args: &[Term],
+    module: arinsal_term::Atom,
+    function: arinsal_term::Atom,
+) -> Option<Term> {
+    direct_lookup_element_cached(process, args, module, function)
+        .or_else(|| direct_bif::<{ EtsBif::LookupElement as u8 }>(process, args, module, function))
+}
+
+fn direct_lookup_element_cached(
+    process: &mut Process,
+    args: &[Term],
+    module: arinsal_term::Atom,
+    function: arinsal_term::Atom,
+) -> Option<Term> {
+    let caller = direct_caller(process)?;
+    let (target, key, position, default) = (args[0], args[1], args[2], args.get(3).copied());
+    let result = if let Some(tid) = Tid::from_term(target) {
+        with_cached_tid(process, tid, |shared, _, process| {
+            let table = shared.read();
+            if table.is_detached() || table.is_busy() {
+                return None;
+            }
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            Some(lookup_element_locked(
+                &table, caller, key, position, default, &mut heap,
+            ))
+        })
+    } else if let Some(name) = target.as_atom() {
+        let rt = process.runtime.as_ref()?;
+        match rt.named_ets.with_table(name, |shared| {
+            let table = shared.read();
+            if table.is_detached() || !table.options.named_table || table.options.name != name {
+                return Some(Err(badarg_cause("id")));
+            }
+            if table.is_busy() {
+                return None;
+            }
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            Some(lookup_element_locked(
+                &table, caller, key, position, default, &mut heap,
+            ))
+        }) {
+            Some(result) => result,
+            None => Some(Err(badarg_cause("id"))),
+        }
+    } else {
+        None
+    };
+    result.and_then(|result| finish_direct(process, module, function, args, result))
+}
+
 fn direct_insert(
     process: &mut Process,
     args: &[Term],
@@ -847,52 +902,185 @@ fn direct_insert_new(
     module: arinsal_term::Atom,
     function: arinsal_term::Atom,
 ) -> Option<Term> {
-    direct_plain(
-        process,
-        args,
-        module,
-        function,
-        |process, caller, target, objects| {
-            insert_args(process, None, caller, true, target, objects)
-        },
-    )
-}
-
-fn direct_insert_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
-    // A failed list insert may have stored a prefix, which a redo through the scheduler
-    // path would store again.
-    // SAFETY: the object term lives in the caller's process heap for this call.
-    unsafe { args[1].tuple_ref() }?;
-    let caller = direct_caller(process)?;
-    let object = args[1];
-    with_cached_table(process, args[0], |shared, options, _| {
-        // The copy into table storage is the long part of an insert: do it before the
-        // exclusive lock so readers are not held up behind it.
-        let prepared = Table::prepare_object(options, object).ok()?;
-        // Fine-grained hash tables and CA trees take their bucket or route locks.
-        let prepared = if options.write_concurrency != WriteConcurrency::Disabled {
-            let table = shared.read();
-            if table.is_detached() || table.is_busy() || !allowed(&table, caller, true) {
-                return None;
-            }
-            match table.insert_shared(prepared) {
-                None => return Some(boolean_term(true)),
-                Some(prepared) => prepared,
-            }
-        } else {
-            prepared
-        };
-        let mut table = shared.write();
-        if table.is_detached() || table.is_busy() || !allowed(&table, caller, true) {
-            return None;
-        }
-        table.insert_prepared(prepared);
-        Some(boolean_term(true))
+    direct_insert_new_cached(process, args).or_else(|| {
+        direct_plain(
+            process,
+            args,
+            module,
+            function,
+            |process, caller, target, objects| {
+                insert_args(process, None, caller, true, target, objects)
+            },
+        )
     })
 }
 
+/// `ets:delete/2` through the table lock and the storage's key-level write lock.
+// Port of erts/emulator/beam/erl_db.c (ets_delete_2), OTP-29.1.1.
+fn direct_delete(
+    process: &mut Process,
+    args: &[Term],
+    module: arinsal_term::Atom,
+    function: arinsal_term::Atom,
+) -> Option<Term> {
+    direct_delete_cached(process, args, module, function)
+        .or_else(|| direct_bif::<{ EtsBif::Delete as u8 }>(process, args, module, function))
+}
+
+fn direct_delete_cached(
+    process: &mut Process,
+    args: &[Term],
+    module: arinsal_term::Atom,
+    function: arinsal_term::Atom,
+) -> Option<Term> {
+    let caller = direct_caller(process)?;
+    let target = args[0];
+    let key = args[1];
+    let result = if let Some(tid) = Tid::from_term(target) {
+        with_cached_tid(process, tid, |shared, options, _| {
+            direct_delete_from_shared(shared, options, caller, key, None)
+        })
+    } else if let Some(name) = target.as_atom() {
+        let rt = process.runtime.as_ref()?;
+        rt.named_ets
+            .with_table(name, |shared| {
+                direct_delete_from_shared(shared, &shared.options(), caller, key, Some(name))
+            })
+            .flatten()
+    } else {
+        None
+    };
+    result.and_then(|result| finish_direct(process, module, function, args, Ok(result)))
+}
+
+fn direct_delete_from_shared(
+    shared: &arinsal_ets::SharedTable,
+    options: &TableOptions,
+    caller: Term,
+    key: Term,
+    name: Option<arinsal_term::Atom>,
+) -> Option<Term> {
+    if options.write_concurrency != WriteConcurrency::Disabled {
+        let table = shared.read();
+        if table.is_detached()
+            || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+            || table.is_busy()
+            || !allowed(&table, caller, true)
+        {
+            return None;
+        }
+        let deleted = table.delete_key_shared(key);
+        drop(table);
+        if deleted {
+            return Some(atom("true"));
+        }
+    }
+    let mut table = shared.write();
+    if table.is_detached()
+        || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+        || table.is_busy()
+        || !allowed(&table, caller, true)
+    {
+        return None;
+    }
+    table.delete_key(key);
+    Some(atom("true"))
+}
+
+fn direct_insert_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
+    direct_insert_one_cached(process, args, false)
+}
+
+fn direct_insert_new_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
+    direct_insert_one_cached(process, args, true)
+}
+
+// Port of erts/emulator/beam/erl_db.c (ets_insert_2/insert_new_2), OTP-29.1.1.
+fn direct_insert_one_cached(
+    process: &mut Process,
+    args: &[Term],
+    insert_new: bool,
+) -> Option<Term> {
+    if args[1].classify() != TermKind::Tuple {
+        return None;
+    }
+    let caller = direct_caller(process)?;
+    let object = args[1];
+    let target = args[0];
+    if let Some(tid) = Tid::from_term(target) {
+        with_cached_tid(process, tid, |shared, options, _| {
+            direct_insert_one_from_shared(shared, options, caller, None, object, insert_new)
+        })
+    } else if let Some(name) = target.as_atom() {
+        let rt = process.runtime.as_ref()?;
+        rt.named_ets
+            .with_table(name, |shared| {
+                direct_insert_one_from_shared(
+                    shared,
+                    &shared.options(),
+                    caller,
+                    Some(name),
+                    object,
+                    insert_new,
+                )
+            })
+            .flatten()
+    } else {
+        None
+    }
+}
+
+// Port of erts/emulator/beam/erl_db.c and erl_db_hash.c, OTP-29.1.1.
+fn direct_insert_one_from_shared(
+    shared: &arinsal_ets::SharedTable,
+    options: &TableOptions,
+    caller: Term,
+    name: Option<arinsal_term::Atom>,
+    object: Term,
+    insert_new: bool,
+) -> Option<Term> {
+    if options.write_concurrency != WriteConcurrency::Disabled {
+        let table = shared.read();
+        if table.is_detached()
+            || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+            || table.is_busy()
+            || !allowed(&table, caller, true)
+        {
+            return None;
+        }
+        let prepared = Table::prepare_object(&table.options, object).ok()?;
+        if insert_new {
+            return table
+                .insert_new_prepared_shared(prepared)
+                .ok()
+                .map(boolean_term);
+        }
+        return table
+            .insert_shared(prepared)
+            .is_none()
+            .then(|| boolean_term(true));
+    }
+
+    let mut table = shared.write();
+    if table.is_detached()
+        || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+        || table.is_busy()
+        || !allowed(&table, caller, true)
+    {
+        return None;
+    }
+    let prepared = Table::prepare_object(&table.options, object).ok()?;
+    let inserted = if insert_new {
+        table.insert_new_prepared(prepared)
+    } else {
+        table.insert_prepared(prepared);
+        true
+    };
+    Some(boolean_term(inserted))
+}
+
 /// `ets:update_counter/3,4` on small counters, updated in place under the table lock.
-// Port of erts/emulator/beam/erl_db.c:1494-1728 (do_update_counter, ets_update_counter_3/4),
+// Port of erts/emulator/beam/erl_db.c (do_update_counter, ets_update_counter_3/4),
 // OTP-29.1.1.
 fn direct_update_counter(
     process: &mut Process,
@@ -900,41 +1088,120 @@ fn direct_update_counter(
     module: arinsal_term::Atom,
     function: arinsal_term::Atom,
 ) -> Option<Term> {
-    direct_update_counter_cached(process, args)
+    direct_update_counter_cached(process, args, module, function)
         .or_else(|| direct_bif::<{ EtsBif::UpdateCounter as u8 }>(process, args, module, function))
 }
 
-fn direct_update_counter_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
+fn direct_update_counter_cached(
+    process: &mut Process,
+    args: &[Term],
+    module: arinsal_term::Atom,
+    function: arinsal_term::Atom,
+) -> Option<Term> {
     let caller = direct_caller(process)?;
-    let (key, operation, default) = (args[1], args[2], args.get(3).copied());
-    with_cached_table(process, args[0], |shared, options, process| {
-        let (operations, single) = small_counter_ops(options.keypos, operation)?;
-        // erl_db.c:1718-1726: a malformed default fails even when the key exists.
-        if let Some(default) = default
-            && tuple_items(default)?.len() < options.keypos
+    let target = args[0];
+    let result = if let Some(tid) = Tid::from_term(target) {
+        with_cached_tid(process, tid, |shared, options, process| {
+            direct_update_counter_from_shared(
+                shared,
+                options,
+                caller,
+                None,
+                args,
+                &mut process.heap,
+            )
+        })
+    } else if let Some(name) = target.as_atom() {
+        let rt = process.runtime.as_ref()?;
+        match rt.named_ets.with_table(name, |shared| {
+            direct_update_counter_from_shared(
+                shared,
+                &shared.options(),
+                caller,
+                Some(name),
+                args,
+                &mut process.heap,
+            )
+        }) {
+            Some(result) => result,
+            None => Some(Err(badarg_cause("id"))),
+        }
+    } else {
+        None
+    };
+    result.and_then(|result| finish_direct(process, module, function, args, result))
+}
+
+fn direct_update_counter_from_shared(
+    shared: &arinsal_ets::SharedTable,
+    options: &TableOptions,
+    caller: Term,
+    name: Option<arinsal_term::Atom>,
+    args: &[Term],
+    heap: &mut arinsal_term::ProcessHeap,
+) -> Option<Result<Term, VmError>> {
+    if options.write_concurrency != WriteConcurrency::Disabled {
+        let table = shared.read();
+        if table.is_detached()
+            || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+            || table.is_busy()
         {
             return None;
         }
-        let values = if options.write_concurrency != WriteConcurrency::Disabled
-            && options.table_type == TableType::Set
-        {
-            let table = shared.read();
-            if table.is_detached() || table.is_busy() || !allowed(&table, caller, true) {
-                return None;
-            }
-            table.update_counter_in_place_shared(key, &operations)?
-        } else {
-            let mut table = shared.write();
-            if table.is_detached() || table.is_busy() || !allowed(&table, caller, true) {
-                return None;
-            }
-            table.update_counter_in_place(key, &operations)?
+        let request = match counter_request(&table, caller, args) {
+            Ok(Some(request)) => request,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
         };
-        // The counters are immediates: only a result list needs the heap, and the process
-        // heap grows rather than fail, so the update is never redone.
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        counter_results(&mut heap, &values, single).ok()
-    })
+        let values = table.update_counter_in_place_shared(request.0, &request.1)?;
+        let mut process_heap = arinsal_bifs::ProcessHeapHandle(heap);
+        return Some(counter_results(&mut process_heap, &values, request.2));
+    }
+
+    let mut table = shared.write();
+    if table.is_detached()
+        || name.is_some_and(|name| !table.options.named_table || table.options.name != name)
+        || table.is_busy()
+    {
+        return None;
+    }
+    let request = match counter_request(&table, caller, args) {
+        Ok(Some(request)) => request,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    };
+    let values = table.update_counter_in_place(request.0, &request.1)?;
+    let mut process_heap = arinsal_bifs::ProcessHeapHandle(heap);
+    Some(counter_results(&mut process_heap, &values, request.2))
+}
+
+/// Key, counter operations, and whether the caller asked for a single result.
+type CounterRequest = (Term, smallvec::SmallVec<[CounterOp; 4]>, bool);
+
+fn counter_request(
+    table: &arinsal_ets::Table,
+    caller: Term,
+    args: &[Term],
+) -> Result<Option<CounterRequest>, VmError> {
+    if !allowed(table, caller, true) {
+        return Err(badarg_cause("access"));
+    }
+    // ets_update_counter_4 validates Default before do_update_counter checks table type.
+    if let Some(default) = args.get(3).copied()
+        && tuple_items(default).is_none_or(|items| items.len() < table.options.keypos)
+    {
+        return Err(badarg_cause("default"));
+    }
+    if !matches!(
+        table.options.table_type,
+        TableType::Set | TableType::OrderedSet
+    ) {
+        return Err(badarg_cause("table_type"));
+    }
+    let Some((operations, single)) = small_counter_ops(table.options.keypos, args[2]) else {
+        return Ok(None);
+    };
+    Ok(Some((args[1], operations, single)))
 }
 
 fn insert_args(
@@ -947,7 +1214,7 @@ fn insert_args(
 ) -> Result<Term, VmError> {
     // SAFETY: object terms remain in the caller's live process heap for this BIF.
     let single = unsafe { objects.tuple_ref() }.is_some();
-    // Port of erts/emulator/beam/erl_db.c:2330-2352 (ets_insert_2: a list of two or more
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_2: a list of two or more
     // objects, or a trapped continuation, goes to ets_insert_2_list_driver).
     if !single
         && (process
@@ -1022,7 +1289,7 @@ fn insert_args(
 
 /// `ets:insert/2` and `ets:insert_new/2` with a list of two or more objects.
 ///
-/// Port of erts/emulator/beam/erl_db.c:1960-2330 (ets_insert_2_list, ets_insert_2_list_driver),
+/// Port of erts/emulator/beam/erl_db.c (ets_insert_2_list, ets_insert_2_list_driver),
 /// OTP-29.1.1. A list that fits the reductions left and is not for a bag goes in directly. Any
 /// other list is first copied into table form without the table lock, then locked in and
 /// inserted a slice at a time; when it does not finish, the rest is installed in the table, which
@@ -1261,29 +1528,38 @@ fn lookup_args(
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     if let Some(name) = target.as_atom() {
         // Port of erts/emulator/beam/erl_db.c (db_get_table_aux), OTP-29.1.1.
-        // The metadata bucket is lock-free; after locking the table, verify the name again to
-        // reject a concurrent rename or deletion.
-        let shared = rt
-            .named_ets
-            .lookup(name)
-            .ok_or_else(|| badarg_cause("id"))?;
-        let table = shared.read();
-        if table.is_detached() || !table.options.named_table || table.options.name != name {
-            return Err(badarg_cause("id"));
-        }
-        if table.is_busy() {
-            return Err(err(arinsal_ets::EtsError::Busy));
-        }
-        if !allowed(&table, caller, false) {
-            return Err(badarg_cause("access"));
-        }
-        return if member {
-            Ok(boolean_term(table.member(key)))
-        } else {
+        // Keep the atom-hashed snapshot alive across the table lock instead of cloning its Arc.
+        let lookup = rt.named_ets.with_table(name, |shared| {
+            let table = shared.read();
+            if table.is_detached() || !table.options.named_table || table.options.name != name {
+                return Err(badarg_cause("id"));
+            }
+            if table.is_busy() {
+                return Err(err(arinsal_ets::EtsError::Busy));
+            }
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
+            }
+            if member {
+                return Ok(boolean_term(table.member(key)));
+            }
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            if matches!(
+                table.options.table_type,
+                TableType::Set | TableType::OrderedSet
+            ) {
+                let object = table.lookup_one(key, &mut heap).map_err(err)?;
+                return match object {
+                    Some(object) => TermBuilder::new(&mut heap)
+                        .cons(object, Term::NIL)
+                        .map_err(|_| badarg()),
+                    None => Ok(Term::NIL),
+                };
+            }
             let values = table.lookup(key, &mut heap).map_err(err)?;
             output_list(&mut heap, values)
-        };
+        });
+        return lookup.unwrap_or_else(|| Err(badarg_cause("id")));
     }
 
     let registry = rt.ets.read().unwrap();
@@ -1429,7 +1705,7 @@ fn compiled_match_program(reference: Term) -> Option<Arc<MatchProgram>> {
 
 /// Help finish the operation a busy table waits for, then trap so that the BIF runs again.
 ///
-/// Port of erts/emulator/beam/erl_db.c:770-796 (handle_lacking_permission with DB_BUSY):
+/// Port of erts/emulator/beam/erl_db.c (handle_lacking_permission with DB_BUSY):
 /// a process that finds the table busy runs the delete_all or list-insert continuation with its
 /// own reductions and then retries.
 fn help_busy_table(
@@ -1481,7 +1757,7 @@ fn help_busy_table(
 /// `ets:delete/1` and `ets:internal_delete_all/2`: release the storage a slice of reductions
 /// at a time, trapping to the same BIF until it is all released.
 ///
-/// Port of erts/emulator/beam/erl_db.c:3006 (ets_delete_1), :3234 (ets_internal_delete_all_2),
+/// Port of erts/emulator/beam/erl_db.c (ets_delete_1), :3234 (ets_internal_delete_all_2),
 /// :5378 (ets_delete_trap) and :5405 (free_table_continue), OTP-29.1.1.
 fn delete_or_clear(
     process: &mut Process,
@@ -1532,7 +1808,7 @@ fn delete_or_clear(
         let mut garbage = table.take_garbage(false);
         let done = table.free_garbage(&mut garbage, &mut reds);
         if !done {
-            // Port of erts/emulator/beam/erl_db.c:3252-3272 (ets_internal_delete_all_2): the
+            // Port of erts/emulator/beam/erl_db.c (ets_internal_delete_all_2): the
             // table turns busy and every process that meets it continues the release.
             table.begin_busy_delete_all(garbage);
         }
@@ -2237,7 +2513,7 @@ fn call_inner(
 ) -> Result<Term, VmError> {
     let caller = caller_pid.to_term().ok_or_else(badarg)?;
     if function == EtsBif::MatchSpecTest {
-        // Port of erts/emulator/beam/erl_db_util.c:6045-6121
+        // Port of erts/emulator/beam/erl_db_util.c
         // (`match_spec_test_3`, `match_spec_test`), OTP-29.1.1.
         let [against, specification, dialect] = args else {
             return Err(badarg());
@@ -2307,7 +2583,7 @@ fn call_inner(
         return Ok(value);
     }
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
-    // Port of erts/emulator/beam/erl_db.c:446-500 (db_lock), OTP-29.1.1: table operations
+    // Port of erts/emulator/beam/erl_db.c (db_lock), OTP-29.1.1: table operations
     // lock only their table; the registry is exclusive only while its maps change.
     let exclusive = matches!(
         (function, args.len()),
@@ -2325,7 +2601,7 @@ fn call_inner(
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     match (function, args) {
         (EtsBif::New, [name, options]) => {
-            // Port of erts/emulator/beam/erl_db.c:2560-2715 (ets_new_2 option state), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db.c (ets_new_2 option state), OTP-29.1.1.
             let mut opts = TableOptions {
                 name: name.as_atom().ok_or_else(badarg)?,
                 named_table: false,
@@ -2391,10 +2667,10 @@ fn call_inner(
                             && name == "debug_hash_fixed_number_of_locks"
                             && (1..=32_768).contains(count)
                         {
-                            // Port of erts/emulator/beam/erl_db.c:2642-2649, OTP-29.1.1.
+                            // Port of erts/emulator/beam/erl_db.c, OTP-29.1.1.
                             opts.decentralized_counters = true;
                             let count = *count as usize;
-                            // Port of erts/emulator/beam/erl_db_hash.c:1044-1048:
+                            // Port of erts/emulator/beam/erl_db_hash.c:
                             // lock arrays round down to the nearest power of two.
                             WriteConcurrency::Fixed(1 << (usize::BITS - 1 - count.leading_zeros()))
                         } else if value.as_atom() == Some(arinsal_term::atoms::FALSE) {
@@ -2416,7 +2692,7 @@ fn call_inner(
                         let pid = value;
                         if pid != atom("none") {
                             let heir_pid = Pid::from_term(pid).ok_or_else(badarg)?;
-                            // Port of erts/emulator/beam/erl_db.c:5319-5337 (set_heir),
+                            // Port of erts/emulator/beam/erl_db.c (set_heir),
                             // OTP-29.1.1: a dead heir leaves the table without one.
                             opts.heir = None;
                             if let Some(started_interval) = rt
@@ -2452,7 +2728,7 @@ fn call_inner(
             opts.decentralized_counters = decentralized_counters_option
                 .unwrap_or(opts.decentralized_counters)
                 && opts.write_concurrency != WriteConcurrency::Disabled;
-            // Port of erts/emulator/beam/erl_db.c:2810-2831 (ets_new_2), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db.c (ets_new_2), OTP-29.1.1.
             let tid = registry
                 .exclusive()?
                 .create(opts)
@@ -2460,7 +2736,7 @@ fn call_inner(
                     EtsError::NameTaken => badarg_cause("already_exists"),
                     error => err(error),
                 })?;
-            // erl_db.c:2834: BIF_P->flags |= F_USING_DB so exit can find the table.
+            // erl_db.c: BIF_P->flags |= F_USING_DB so exit can find the table.
             if !rt.publish_proc_flag(caller_pid, arinsal_sched::proc_flags::USING_DB) {
                 registry.exclusive()?.detach(tid).ok();
                 return Err(badarg());
@@ -2478,7 +2754,7 @@ fn call_inner(
             .map_err(|_| badarg())?
             .unwrap_or(atom("undefined"))),
         (EtsBif::Rename, [target, name]) => {
-            // Port of erts/emulator/beam/erl_db.c:2444-2503 (ets_rename_2), OTP-29.1.1:
+            // Port of erts/emulator/beam/erl_db.c (ets_rename_2), OTP-29.1.1:
             // the table needs write access, and is looked up even for a bad name.
             let tid = handle(&registry, *target)?;
             let named = {
@@ -2494,18 +2770,18 @@ fn call_inner(
             let new_name = name.as_atom().ok_or_else(badarg)?;
             registry.exclusive()?.rename(tid, new_name).map_err(err)?;
             // Unnamed tables keep their id; only the displayed name changes.
-            // Port of erts/emulator/beam/erl_db.c:2523 (ets_rename_2), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db.c (ets_rename_2), OTP-29.1.1.
             if named { Ok(*name) } else { Ok(*target) }
         }
         (EtsBif::Info, [target]) | (EtsBif::Info, [target, _]) => {
             // Missing tables yield `undefined`; a non-id argument is `badarg`.
-            // Port of erts/emulator/beam/erl_db.c:4434 and :4544, OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db.c and :4544, OTP-29.1.1.
             let tid = match resolve(&registry, *target) {
                 Ok(tid) => tid,
                 Err(ResolveFail::Missing) => return Ok(atom("undefined")),
                 Err(ResolveFail::BadType) => return Err(badarg_cause("type")),
             };
-            // Port of erts/emulator/beam/erl_db.c:4532-4564 (ets_info_2, DB_INFO/LCK_READ),
+            // Port of erts/emulator/beam/erl_db.c (ets_info_2, DB_INFO/LCK_READ),
             // OTP-29.1.1.
             if args.len() == 1 {
                 let table = table_guard(&registry, tid, true)?;
@@ -2550,7 +2826,7 @@ fn call_inner(
             table.delete_key(*key);
             Ok(atom("true"))
         }
-        // Port of erts/emulator/beam/erl_db.c:4648 and erl_db_hash.c:4117,
+        // Port of erts/emulator/beam/erl_db.c and erl_db_hash.c,
         // OTP-29.1.1.
         (EtsBif::LookupBinaryInfo, [target, key]) => {
             let tid = handle(&registry, *target)?;
@@ -2565,7 +2841,7 @@ fn call_inner(
                 .list_from_iter(binaries)
                 .map_err(|_| system_limit())
         }
-        // Port of erts/emulator/beam/erl_db.c:3146 (`ets_setopts_2`),
+        // Port of erts/emulator/beam/erl_db.c (`ets_setopts_2`),
         // OTP-29.1.1.
         (EtsBif::SetOpts, [target, options]) => {
             let tid = handle(&registry, *target)?;
@@ -2651,7 +2927,7 @@ fn call_inner(
             }
             Ok(atom("true"))
         }
-        // Port of erts/emulator/beam/erl_db.c:4672 (`erts_internal_ets_raw_first_1`),
+        // Port of erts/emulator/beam/erl_db.c (`erts_internal_ets_raw_first_1`),
         // OTP-29.1.1.
         (EtsBif::RawFirst, [target]) => {
             let tid = handle(&registry, *target)?;
@@ -2664,7 +2940,7 @@ fn call_inner(
                 .map_err(err)?
                 .unwrap_or(atom("$end_of_table")))
         }
-        // Port of erts/emulator/beam/erl_db.c:4692 (`erts_internal_ets_raw_next_2`),
+        // Port of erts/emulator/beam/erl_db.c (`erts_internal_ets_raw_next_2`),
         // OTP-29.1.1.
         (EtsBif::RawNext, [target, key]) => {
             let tid = handle(&registry, *target)?;
@@ -2728,7 +3004,7 @@ fn call_inner(
         }
         (EtsBif::Next | EtsBif::Prev, [target, key]) => {
             // `'$end_of_table'` is DB_ERROR_BADKEY in db_next_tree / db_prev_tree.
-            // Port of erts/emulator/beam/erl_db_tree.c:654, OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db_tree.c, OTP-29.1.1.
             if end_of_table(*key) {
                 return Err(badarg());
             }
@@ -2745,10 +3021,10 @@ fn call_inner(
             .map_err(err)?
             .unwrap_or(atom("$end_of_table")))
         }
-        // Port of erts/emulator/beam/erl_db.c:1193 (ets_first_lookup_1),
+        // Port of erts/emulator/beam/erl_db.c (ets_first_lookup_1),
         // :1238 (ets_next_lookup_2), :1286 (ets_last_lookup_1) and
         // :1332 (ets_prev_lookup_2), OTP-29.1.1. Hash tables treat last as
-        // first and prev as next (erl_db_hash.c:893).
+        // first and prev as next (erl_db_hash.c).
         (EtsBif::FirstLookup | EtsBif::LastLookup, [target]) => {
             let tid = handle(&registry, *target)?;
             let table = table_guard(&registry, tid, true)?;
@@ -2791,7 +3067,7 @@ fn call_inner(
                 fix_table(&mut heap, &mut table, caller)?;
                 drop(table);
                 registry.exclusive()?.note_fixation(caller, tid);
-                // erl_db.c:3048 and 5187: a fixation sets F_USING_DB on the fixing process.
+                // erl_db.c and 5187: a fixation sets F_USING_DB on the fixing process.
                 let _ = rt.publish_proc_flag(caller_pid, arinsal_sched::proc_flags::USING_DB);
             } else {
                 table.safe_fixtable_for(caller, false).map_err(err)?;
@@ -2823,7 +3099,7 @@ fn call_inner(
             Ok(atom("true"))
         }
         (EtsBif::GiveAway, [target, new_owner, data]) => {
-            // Port of erts/emulator/beam/erl_db.c:3087-3124 (ets_give_away_3), OTP-29.1.1:
+            // Port of erts/emulator/beam/erl_db.c (ets_give_away_3), OTP-29.1.1:
             // table errors come first, then the receiver, then ownership.
             let tid = handle(&registry, *target)?;
             {
@@ -2843,7 +3119,7 @@ fn call_inner(
             if *new_owner == caller {
                 return Err(badarg_cause("owner"));
             }
-            // Port of erts/emulator/beam/erl_db.c:4959-4962 (send_ets_transfer_message),
+            // Port of erts/emulator/beam/erl_db.c (send_ets_transfer_message),
             // OTP-29.1.1: a named table is identified by its name.
             let tab = if options.named_table {
                 Term::atom(options.name)
@@ -2854,7 +3130,7 @@ fn call_inner(
                 .tuple(&[atom("ETS-TRANSFER"), tab, caller, *data])
                 .map_err(|_| badarg())?;
             registry.exclusive()?.give_away(tid, *new_owner).map_err(err)?;
-            // erl_db.c:3128: the receiver's F_USING_DB is set so its exit deletes the table.
+            // erl_db.c: the receiver's F_USING_DB is set so its exit deletes the table.
             if !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::USING_DB) {
                 return Err(badarg());
             }
@@ -2896,7 +3172,7 @@ fn call_inner(
                 .map_err(|_| badarg())
         }
         (EtsBif::MatchSpecCompile, [spec]) => {
-            // Port of erts/emulator/beam/erl_db.c:4591-4602
+            // Port of erts/emulator/beam/erl_db.c
             // (ets_match_spec_compile_1), OTP-29.1.1. The program lifetime follows
             // the magic reference through the process heap and its garbage collector.
             let program = Arc::new(MatchProgram::compile(*spec).map_err(err)?);
@@ -2909,7 +3185,7 @@ fn call_inner(
                 .map_err(|_| badarg())
         }
         (EtsBif::IsCompiledMs, [value]) => {
-            // Port of erts/emulator/beam/erl_db.c:4582-4587
+            // Port of erts/emulator/beam/erl_db.c
             // (ets_is_compiled_ms_1), OTP-29.1.1.
             // Continuation references retain their program through the magic reference, as
             // does a reference returned by match_spec_compile/1.
@@ -2918,7 +3194,7 @@ fn call_inner(
             ))
         }
         (EtsBif::InternalRequestAll, []) => {
-            // Port of erts/emulator/beam/erl_db.c:3714 (ets_internal_request_all_0)
+            // Port of erts/emulator/beam/erl_db.c (ets_internal_request_all_0)
             // and lib/stdlib/src/ets.erl:318 (all/0), OTP-29.1.1.
             // Each scheduler sends `{Ref, Tables}`. This VM keeps every table in
             // one registry, so one reply carries them and the rest are empty.
@@ -2943,7 +3219,7 @@ fn call_inner(
             Ok(reference)
         }
         (EtsBif::MatchSpecRunR, [objects, compiled, accumulator]) => {
-            // Port of erts/emulator/beam/erl_db.c:4605 (ets_match_spec_run_r_3), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db.c (ets_match_spec_run_r_3), OTP-29.1.1.
             // The return value is the accumulator with each match consed in front.
             if objects.classify() != TermKind::List && *objects != Term::NIL {
                 return Err(badarg());
@@ -2970,7 +3246,7 @@ fn call_inner(
             Ok(out)
         }
         (EtsBif::SelectCount, [target, spec])
-        // Port of erts/emulator/beam/erl_db.c:3433 (ets_internal_select_delete_2), OTP-29.1.1.
+        // Port of erts/emulator/beam/erl_db.c (ets_internal_select_delete_2), OTP-29.1.1.
         // The BIF has no delete-all special case; `[]` returns 0 and a match spec deletes.
         | (EtsBif::InternalSelectDelete, [target, spec])
         | (EtsBif::SelectReplace, [target, spec]) => {
@@ -3021,7 +3297,7 @@ fn call_inner(
             if !allowed(&table, caller, function != EtsBif::SelectCount) {
                 return Err(badarg_cause("access"));
             }
-            // Port of erts/emulator/beam/erl_db.c:4195-4202 (ets_select_replace_2), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db.c (ets_select_replace_2), OTP-29.1.1.
             if function == EtsBif::SelectReplace && table.options.table_type == TableType::Bag {
                 return Err(badarg_cause("table_type"));
             }
@@ -3087,7 +3363,7 @@ fn call_inner(
                 return Err(badarg_cause("access"));
             }
             let default = default_object(&table, args.get(3).copied())?;
-            // Port of erts/emulator/beam/erl_db.c:1386-1414 (do_update_element), OTP-29.1.1:
+            // Port of erts/emulator/beam/erl_db.c (do_update_element), OTP-29.1.1:
             // a malformed `{Pos, Value}` fails only after the key lookup.
             let parsed = update_list(*updates, |entry| match tuple_items(entry)?.as_slice() {
                 [position_term, value] => Some((position(*position_term)?, *value)),
@@ -3170,7 +3446,7 @@ fn call_inner(
             {
                 return counter_results(&mut heap, &values, single);
             }
-            // Port of erts/emulator/beam/erl_db.c:1505-1603 (do_update_counter), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db.c (do_update_counter), OTP-29.1.1.
             // An integer increments the element after the key; a list returns a list.
             let parse = |entry: Term| -> Option<BigCounterOp> {
                 let (position_term, increment, threshold) = match tuple_items(entry)?.as_slice() {
@@ -3549,7 +3825,7 @@ fn entry_info_2(
         return Some(Err(badarg()));
     };
     if item == atom("binary") {
-        // Port of erts/emulator/beam/erl_db.c:4541-4542 (ets_info_2 traps to
+        // Port of erts/emulator/beam/erl_db.c (ets_info_2 traps to
         // ets_info_binary_trap), OTP-29.1.1. The Erlang export owns the walk so
         // each raw ETS operation has its own reductions and releases its table lock.
         return Some(Err(VmError::TrapExport(crate::ExportTrap {

@@ -113,10 +113,10 @@ pub struct Heir {
     /// Data copied by the VM when ownership changes.
     pub data: Term,
     /// `{heir, Pid, Data}` sends `'ETS-TRANSFER'`; `{heir, Pid}` keeps erts'
-    /// non-value heir data and transfers silently (erl_db.c:2670-2686, :4919-4929).
+    /// non-value heir data and transfers silently (erl_db.c, :4919-4929).
     pub transfer: bool,
     /// Creation order of the heir process when it was set, so a reused pid does not
-    /// inherit (erl_db.c:5327-5333, heir_started_interval).
+    /// inherit (erl_db.c, heir_started_interval).
     pub started_interval: u64,
 }
 
@@ -153,7 +153,7 @@ pub enum EtsError {
     /// Invalid argument, object, key, or option.
     BadArg,
     /// `badarg` with extended error information: the `cause` erts stores in
-    /// `p->fvalue` (`EXI_*` in erts/emulator/beam/erl_db.c:53-63, OTP-29.1.1).
+    /// `p->fvalue` (`EXI_*` in erts/emulator/beam/erl_db.c, OTP-29.1.1).
     BadArgCause(&'static str),
     /// No table has this identity.
     NoTable,
@@ -533,7 +533,7 @@ fn ets_fast_supported(bytes: &[u8]) -> bool {
 /// Build one ETS-external element straight on `dst`, for the common term shapes (integers,
 /// atoms, floats, binaries, strings, lists, tuples, local pids and references). `bytes`
 /// must have passed [`ets_fast_supported`].
-// Port of erts/emulator/beam/external.c:3263 (dec_term, the arms for these tags with the
+// Port of erts/emulator/beam/external.c (dec_term, the arms for these tags with the
 // ETS local-atom extension), OTP-29.1.1.
 fn decode_ets_fast<H: HeapAlloc>(bytes: &[u8], dst: &mut H) -> Result<Term, EtsError> {
     fn be(bytes: &[u8], pos: &mut usize, count: usize) -> u64 {
@@ -619,7 +619,7 @@ fn decode_ets_fast<H: HeapAlloc>(bytes: &[u8], dst: &mut H) -> Result<Term, EtsE
     build(bytes, &mut pos, dst)
 }
 
-// Port of erts/emulator/beam/external.c:750 and :810, OTP-29.1.1. The ETS
+// Port of erts/emulator/beam/external.c and :810, OTP-29.1.1. The ETS
 // external format replaces atom names with local atom-table references.
 fn ets_external_atoms(bytes: &[u8], compress: bool) -> Result<Vec<u8>, EtsError> {
     fn take<'a>(bytes: &'a [u8], pos: &mut usize, count: usize) -> Result<&'a [u8], EtsError> {
@@ -838,7 +838,7 @@ fn ets_external_atoms(bytes: &[u8], compress: bool) -> Result<Vec<u8>, EtsError>
                 for _ in 0..free_count {
                     walk(bytes, pos, out, compress)?;
                 }
-                // Port of erts/emulator/beam/external.c:3974-3990, OTP-29.1.1.
+                // Port of erts/emulator/beam/external.c, OTP-29.1.1.
                 // NEW_FUN_EXT's size includes its own four-byte size field.
                 if *pos - start + 4 != size {
                     return Err(EtsError::BadArg);
@@ -898,6 +898,7 @@ pub(crate) struct StoredTerm {
     compressed_magic_refs: Vec<Option<Arc<MagicRef>>>,
     compressed_bytes: usize,
     pub(crate) db_size_words: usize,
+    term_size_words: usize,
     order: u64,
     group_order: u64,
     hvalue: u64,
@@ -979,7 +980,7 @@ impl HeapAlloc for ObjectHeap {
     fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
         drop(binary);
     }
-    // Port of erts/emulator/beam/erl_db_util.c:3559 (db_store_term), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_util.c (db_store_term), OTP-29.1.1.
     fn link_bin_ref(
         &mut self,
         bin_ref: *mut u64,
@@ -1053,7 +1054,7 @@ impl StoredTerm {
         keypos: usize,
         prefix_words: usize,
     ) -> Result<Self, EtsError> {
-        // Port of erts/emulator/beam/erl_db_util.c:3559-3618 (db_store_term), OTP-29.1.1:
+        // Port of erts/emulator/beam/erl_db_util.c (db_store_term), OTP-29.1.1:
         // even immediate two-element objects have a table-owned tuple in their DbTerm.
         Self::copy_heap_for_table(term, compressed, keypos, prefix_words)
     }
@@ -1076,7 +1077,7 @@ impl StoredTerm {
         let mut compressed_magic_refs = Vec::new();
         let mut compressed_bytes = 0;
         let term = if compressed {
-            // Port of erts/emulator/beam/erl_db_util.c:3490 (copy_to_comp), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db_util.c (copy_to_comp), OTP-29.1.1.
             // SAFETY: insertion keeps the source tuple heap live while copying it.
             let tuple = term_sequence(term).ok_or(EtsError::BadArg)?;
             let mut elements = Vec::with_capacity(tuple.len());
@@ -1100,7 +1101,7 @@ impl StoredTerm {
                     elements.push(Term::NIL);
                 } else {
                     compressed_magic_refs.push(None);
-                    // Port of erts/emulator/beam/erl_db_util.c:3490-3501,
+                    // Port of erts/emulator/beam/erl_db_util.c,
                     // OTP-29.1.1: ETS external encoding keeps binary refs on
                     // the object's off-heap chain.
                     compressed_elements.push(None);
@@ -1113,6 +1114,7 @@ impl StoredTerm {
         } else {
             arinsal_term::copy_struct(term, &mut heap, plain_size.unwrap_or_default())?
         };
+        let term_size_words = plain_size.unwrap_or_default();
         Ok(Self {
             heap,
             term,
@@ -1125,6 +1127,7 @@ impl StoredTerm {
             } else {
                 db_size_words
             },
+            term_size_words,
             order: 0,
             group_order: 0,
             hvalue: 0,
@@ -1145,17 +1148,35 @@ impl StoredTerm {
                 compressed_magic_refs: Vec::new(),
                 compressed_bytes: 0,
                 db_size_words: self.db_size_words,
+                term_size_words: self.term_size_words,
                 order: self.order,
                 group_order: self.group_order,
                 hvalue: self.hvalue,
             });
         }
-        let mut copy = Self::copy_heap(self.term)?;
-        copy.compressed_elements = self.compressed_elements.clone();
-        copy.compressed_magic_refs = self.compressed_magic_refs.clone();
-        copy.compressed_bytes = self.compressed_bytes;
-        copy.db_size_words = self.db_size_words;
-        Ok(copy)
+        if self.compressed_elements.iter().any(Option::is_some) {
+            let mut copy = Self::copy_heap(self.term)?;
+            copy.compressed_elements = self.compressed_elements.clone();
+            copy.compressed_magic_refs = self.compressed_magic_refs.clone();
+            copy.compressed_bytes = self.compressed_bytes;
+            copy.db_size_words = self.db_size_words;
+            return Ok(copy);
+        }
+        let mut heap = ObjectHeap::new();
+        let term = arinsal_term::copy_struct(self.term, &mut heap, self.term_size_words)?;
+        Ok(Self {
+            heap,
+            term,
+            inline_pair: None,
+            compressed_elements: Vec::new(),
+            compressed_magic_refs: Vec::new(),
+            compressed_bytes: 0,
+            db_size_words: self.db_size_words,
+            term_size_words: self.term_size_words,
+            order: self.order,
+            group_order: self.group_order,
+            hvalue: self.hvalue,
+        })
     }
 
     pub(crate) fn exact_eq_input(&self, other: Term) -> bool {
@@ -1188,7 +1209,7 @@ impl StoredTerm {
     /// Overwrite the immediate element at zero-based `index` with another immediate, as
     /// erts writes a counter into the stored tuple when its size does not change.
     ///
-    /// Port of erts/emulator/beam/erl_db_util.c:3278 (db_do_update_element, the immediate
+    /// Port of erts/emulator/beam/erl_db_util.c (db_do_update_element, the immediate
     /// case), OTP-29.1.1.
     fn set_immediate_element(&mut self, index: usize, value: Term) -> bool {
         if value.is_pointer() || self.tuple_element(index).is_none_or(Term::is_pointer) {
@@ -1343,7 +1364,13 @@ impl StoredTerm {
         }
         let _keep_live = &self.heap;
         if !self.compressed_elements.iter().any(Option::is_some) {
-            return Ok(copy_term(self.term, dst)?);
+            // Port of erts/emulator/beam/erl_db_util.h:425 (db_copy_object_from_ets):
+            // DbTerm.size is already known, so do not size the object again before copying it.
+            return Ok(arinsal_term::copy_struct(
+                self.term,
+                dst,
+                self.term_size_words,
+            )?);
         }
         // SAFETY: this object owns the heap containing its tuple.
         let tuple = term_sequence(self.term).ok_or(EtsError::BadArg)?;
@@ -1394,7 +1421,7 @@ impl StoredTerm {
     }
 
     pub(crate) fn refc_binaries<H: HeapAlloc>(&self, dst: &mut H) -> Result<Vec<Term>, EtsError> {
-        // Port of erts/emulator/beam/erl_bif_info.c:179 (`erts_bld_bin_list`),
+        // Port of erts/emulator/beam/erl_bif_info.c (`erts_bld_bin_list`),
         // OTP-29.1.1: report each BinRef from this DbTerm's first_oh chain.
         let Some(off_heap) = self.heap.off_heap.as_ref() else {
             return Ok(Vec::new());
@@ -1418,10 +1445,22 @@ impl StoredTerm {
     }
 
     fn term_for_filter<H: HeapAlloc>(&self, scratch: &mut H) -> Result<Term, EtsError> {
-        if self.inline_pair.is_none() && !self.compressed_elements.iter().any(Option::is_some) {
-            return Ok(self.term);
+        self.term_for_filter_with_size(scratch)
+            .map(|(term, _size)| term)
+    }
+
+    fn term_for_filter_with_size<H: HeapAlloc>(
+        &self,
+        scratch: &mut H,
+    ) -> Result<(Term, Option<usize>), EtsError> {
+        if let Some(pair) = self.inline_pair {
+            let term = TermBuilder::new(scratch).tuple(&pair)?;
+            return Ok((term, Some(3)));
         }
-        self.term_for_match(scratch)
+        if self.inline_pair.is_none() && !self.compressed_elements.iter().any(Option::is_some) {
+            return Ok((self.term, Some(self.term_size_words)));
+        }
+        Ok((self.term_for_match(scratch)?, None))
     }
 }
 
@@ -1444,6 +1483,47 @@ fn small_counter_step(old: Term, operation: &BigCounterOp) -> Option<i64> {
         }
     }
     Some(next)
+}
+
+fn update_counter_object_in_place(
+    object: &mut StoredTerm,
+    keypos: usize,
+    operations: &[CounterOp],
+) -> Option<smallvec::SmallVec<[Term; 4]>> {
+    if !object.compressed_elements.is_empty() {
+        return None;
+    }
+    let mut updated: smallvec::SmallVec<[(usize, i64); 4]> = smallvec::SmallVec::new();
+    let mut results = smallvec::SmallVec::new();
+    for operation in operations {
+        if operation.position == keypos || operation.position == 0 {
+            return None;
+        }
+        let index = operation.position - 1;
+        let old = match updated.iter().rev().find(|(at, _)| *at == index) {
+            Some(&(_, value)) => value,
+            None => object.tuple_element(index)?.as_small()?,
+        };
+        let mut next = old.checked_add(operation.increment)?;
+        if let Some((threshold, reset)) = operation.threshold
+            && (if operation.increment < 0 {
+                next < threshold
+            } else {
+                next > threshold
+            })
+        {
+            next = reset;
+        }
+        results.push(Term::small(next)?);
+        updated.push((index, next));
+    }
+    for (index, value) in updated {
+        if !object.set_immediate_element(index, Term::small(value)?) {
+            debug_assert!(false, "verified counter element is not writable in place");
+            return None;
+        }
+    }
+    Some(results)
 }
 
 fn global_true() -> Atom {
@@ -1688,7 +1768,7 @@ mod _obsolete_hashmap_store {
 
     impl HashStorage {
         fn slot_index(&self, hash: u64) -> usize {
-            // Port of erl_db_hash.c:204 (hash_to_ix), OTP-29.1.1.
+            // Port of erl_db_hash.c (hash_to_ix), OTP-29.1.1.
             let mask = self.nactive.next_power_of_two() - 1;
             let index = ((hash >> 1) as usize) & mask;
             if index >= self.nactive {
@@ -1738,7 +1818,7 @@ mod _obsolete_hashmap_store {
         }
 
         fn shrink_after_delete(&mut self, keypos: usize) {
-            // Port of erts/emulator/beam/erl_db_hash.c:3350,3743 (calc_shrink_limit,
+            // Port of erts/emulator/beam/erl_db_hash.c,3743 (calc_shrink_limit,
             // shrink), OTP-29.1.1. OTP joins at most five buckets per delete.
             for _ in 0..5 {
                 let nslots = if self.nactive <= 256 {
@@ -1870,7 +1950,7 @@ pub struct Table {
 }
 
 /// The work a busy table is waiting for helpers to complete.
-// Port of erts/emulator/beam/erl_db.c:3258-3266 (DB_BUSY in ets_internal_delete_all_2) and
+// Port of erts/emulator/beam/erl_db.c (DB_BUSY in ets_internal_delete_all_2) and
 // :2315 (DB_BUSY with the insert_2_list continuation), OTP-29.1.1.
 enum BusyOp {
     /// `ets:delete_all_objects/1` released the objects a slice at a time.
@@ -1881,7 +1961,7 @@ enum BusyOp {
 
 /// The remaining objects of a trapping `ets:insert/2` list insert, shared with the process
 /// that started it so that it can collect the result whoever finishes the work.
-// Port of erts/emulator/beam/erl_db.c:1850-2330 (ets_insert_2_list_info), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_info), OTP-29.1.1.
 pub struct InsertListCtx {
     pending: std::collections::VecDeque<PreparedObject>,
     member_cursor: Option<usize>,
@@ -2028,7 +2108,7 @@ impl Table {
     // `sizeof(DbTable)` depends on the platform's pthread mutex size, see
     // `TABLE_HEADER_SHRINK` / `CATREE_BASE_SHRINK`; the constants below are the macOS values.
     pub fn memory_words_for_schedulers(&self, schedulers: usize) -> usize {
-        // Port of erl_db_hash.c:1017 and erl_db_tree.c:560, OTP-29.1.1.
+        // Port of erl_db_hash.c and erl_db_tree.c, OTP-29.1.1.
         // OTP's frequent-read rwlocks reserve one cache line per reader group plus
         // two bookkeeping lines. Its decentralized counter array reserves one
         // cache-line counter slot per scheduler plus one spare slot.
@@ -2049,7 +2129,7 @@ impl Table {
             }
             Storage::CATree(tree) => {
                 let table = if concurrent {
-                    // Port of erl_db_catree.c:1031-1053 and erl_flxctr.c:51-55,
+                    // Port of erl_db_catree.c and erl_flxctr.c,
                     // OTP-29.1.1. This includes the initial base node, its lock,
                     // and (when enabled) the decentralized counter allocation.
                     (93 - TABLE_HEADER_SHRINK - CATREE_BASE_SHRINK)
@@ -2068,7 +2148,7 @@ impl Table {
             Storage::Hash(storage) => {
                 // The empty hash table reports 312 words on OTP 29.1.1/M1;
                 // its initial segment is included in that allocation total.
-                // Port of erl_db_hash.c:3331-3345: an extended segment uses
+                // Port of erl_db_hash.c: an extended segment uses
                 // 2048 bucket words. The first extension table has 256
                 // pointers; later tables grow by 128 pointers at a time.
                 let lock_count = match self.options.write_concurrency {
@@ -2100,7 +2180,7 @@ impl Table {
                 let fine_locks = if !concurrent || lock_count == 0 {
                     0
                 } else {
-                    // Port of erl_db_hash.c:1041-1072 and erl_db_hash.h:54-69,
+                    // Port of erl_db_hash.c and erl_db_hash.h:54-69,
                     // OTP-29.1.1. The cache-line padded lock slots and the
                     // runtime-sized reader arrays are included in the ETS counter.
                     16 * lock_count
@@ -2159,7 +2239,7 @@ impl Table {
         let atom = |name: &str| -> Term { Term::atom(global_atoms().intern(name).unwrap()) };
         let bool_term = |value: bool| atom(if value { "true" } else { "false" });
         let int_term = |value: usize, dst: &mut H| -> Result<Term, EtsError> {
-            // Port of erts/emulator/beam/big.c:2247-2252 (erts_make_integer), OTP-29.1.1.
+            // Port of erts/emulator/beam/big.c (erts_make_integer), OTP-29.1.1.
             if let Ok(value) = i64::try_from(value)
                 && let Some(term) = Term::small(value)
             {
@@ -2183,7 +2263,7 @@ impl Table {
                 Protection::Public => "public",
             })),
             "owner" => Ok(copy_term(self.options.owner, dst)?),
-            // Port of erts/emulator/beam/erl_db.c:5500-5520 (table_info), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db.c (table_info), OTP-29.1.1.
             "heir" => match self.options.heir {
                 Some(heir) => Ok(copy_term(heir.pid, dst)?),
                 None => Ok(atom("none")),
@@ -2219,7 +2299,7 @@ impl Table {
     }
 
     fn fixation_info<H: HeapAlloc>(&self, monotonic: bool, dst: &mut H) -> Result<Term, EtsError> {
-        // Port of erts/emulator/beam/erl_db.c:5530 (safe_fixed info), OTP-29.1.1.
+        // Port of erts/emulator/beam/erl_db.c (safe_fixed info), OTP-29.1.1.
         let time = if monotonic {
             self.fixed_monotonic_time.as_ref()
         } else {
@@ -2305,7 +2385,7 @@ impl Table {
                 // db_calc_stats_hash stores these moments as C floats, then
                 // erts widens them to Erlang floats. The inner chain deviation
                 // is float arithmetic; the expected deviation is double sqrt
-                // rounded back through float. Port of erl_db_hash.c:4105, OTP-29.1.1.
+                // rounded back through float. Port of erl_db_hash.c, OTP-29.1.1.
                 let nactive = storage.nactive() as f32;
                 let average_f = sum as f32 / nactive;
                 let deviation = ((square_sum as f32 - average_f * sum as f32) / nactive) as f64;
@@ -2318,7 +2398,7 @@ impl Table {
                 let standard = builder.float(standard)?;
                 let expected = builder.float(expected)?;
                 // nlocks is 1 without fine locking and DB_HASH_LOCK_CNT (64) when
-                // write_concurrency is true or auto. Port of erl_db_hash.c:1023
+                // write_concurrency is true or auto. Port of erl_db_hash.c
                 // (db_create_hash) and erl_db_hash.h:54, OTP-29.1.1.
                 // Chain moments use db_calc_stats_hash's formula over these buckets.
                 // Placement can diverge from erts; that numeric gap is D2-style.
@@ -2343,7 +2423,7 @@ impl Table {
 
     /// Build the table-owned copy of one object, which needs no table state beyond the
     /// creation options: callers do it before taking the table's write lock.
-    // Port of erts/emulator/beam/erl_db_hash.c:1580 (db_put_hash: the term is copied by
+    // Port of erts/emulator/beam/erl_db_hash.c (db_put_hash: the term is copied by
     // `new_dbterm` before the bucket lock is taken for set tables), OTP-29.1.1.
     pub fn prepare_object(
         options: &TableOptions,
@@ -2378,7 +2458,7 @@ impl Table {
     /// Store a prepared object through a shared reference when the storage synchronizes its own
     /// writers (a CA tree), returning `None`; any other storage hands the object back for
     /// `insert_prepared` under the exclusive table lock.
-    // Port of erts/emulator/beam/erl_db_catree.c:1733 (db_put_catree: only the route and
+    // Port of erts/emulator/beam/erl_db_catree.c (db_put_catree: only the route and
     // base-node locks are taken, not the table lock), OTP-29.1.1.
     pub fn insert_shared(&self, prepared: PreparedObject) -> Option<PreparedObject> {
         match &self.storage {
@@ -2403,13 +2483,21 @@ impl Table {
         }
     }
 
-    /// Delete all objects at a key through the table's hash stripe.
+    /// Delete all objects at a key through the table's hash stripe or CA-tree base lock.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_erase_hash) and
+    // erl_db_catree.c (db_erase_catree), OTP-29.1.1.
     pub fn delete_key_shared(&self, key: Term) -> bool {
-        let Storage::Hash(storage) = &self.storage else {
-            return false;
-        };
-        storage.delete_key_shared(key, ets_hash(key), self.options.keypos, self.fixed > 0);
-        true
+        match &self.storage {
+            Storage::Hash(storage) => {
+                storage.delete_key_shared(key, ets_hash(key), self.options.keypos, self.fixed > 0);
+                true
+            }
+            Storage::CATree(tree) => {
+                tree.delete(key);
+                true
+            }
+            Storage::Ordered(_) => false,
+        }
     }
 
     /// Delete matching copies of one object through the table's hash stripe.
@@ -2429,19 +2517,22 @@ impl Table {
         Ok(true)
     }
 
-    /// Update small tuple counters under the key's hash stripe.
+    /// Update small tuple counters under the key's hash stripe or CA-tree base lock.
+    // Port of erts/emulator/beam/erl_db.c (do_update_counter), OTP-29.1.1.
     pub fn update_counter_in_place_shared(
         &self,
         key: Term,
         operations: &[CounterOp],
     ) -> Option<smallvec::SmallVec<[Term; 4]>> {
-        if self.options.table_type != TableType::Set {
-            return None;
+        match (&self.storage, self.options.table_type) {
+            (Storage::Hash(storage), TableType::Set) => {
+                storage.update_counter_shared(key, ets_hash(key), self.options.keypos, operations)
+            }
+            (Storage::CATree(tree), TableType::OrderedSet) => tree.with_object_mut(key, |object| {
+                update_counter_object_in_place(object, self.options.keypos, operations)
+            }),
+            _ => None,
         }
-        let Storage::Hash(storage) = &self.storage else {
-            return None;
-        };
-        storage.update_counter_shared(key, ets_hash(key), self.options.keypos, operations)
     }
 
     /// Apply arbitrary precision counter operations under the hash key's write stripe.
@@ -2544,18 +2635,42 @@ impl Table {
     }
 
     /// Insert a prepared object if its key has no live entry, under its hash stripe.
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_new_2) and
+    // erl_db_hash.c (db_put_hash with key_clash_fail), OTP-29.1.1.
+    pub fn insert_new_prepared(&mut self, prepared: PreparedObject) -> bool {
+        if let Storage::Hash(storage) = &mut self.storage {
+            return storage.insert_exclusive(
+                prepared.stored,
+                prepared.hash,
+                self.options.table_type,
+                self.options.keypos,
+                self.fixed > 0,
+                true,
+            );
+        }
+        if self.member_prepared(&prepared) {
+            return false;
+        }
+        self.insert_prepared(prepared);
+        true
+    }
+
+    /// Insert a prepared object if its key has no live entry, under its hash stripe or CA-tree
+    /// base-node lock.
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_new_2), OTP-29.1.1.
     pub fn insert_new_prepared_shared(&self, prepared: PreparedObject) -> Result<bool, EtsError> {
-        let Storage::Hash(storage) = &self.storage else {
-            return Err(EtsError::BadArg);
-        };
-        Ok(storage.insert_shared(
-            prepared.stored,
-            prepared.hash,
-            self.options.table_type,
-            self.options.keypos,
-            self.fixed > 0,
-            true,
-        ))
+        match &self.storage {
+            Storage::Hash(storage) => Ok(storage.insert_shared(
+                prepared.stored,
+                prepared.hash,
+                self.options.table_type,
+                self.options.keypos,
+                self.fixed > 0,
+                true,
+            )),
+            Storage::CATree(tree) => Ok(tree.insert_new(prepared.stored)),
+            Storage::Ordered(_) => Err(EtsError::BadArg),
+        }
     }
 
     /// Insert one or several objects. Validation and copying finish before mutation.
@@ -2654,14 +2769,14 @@ impl Table {
     }
 
     /// Mark the table busy while `garbage` is released by whoever uses it next.
-    // Port of erts/emulator/beam/erl_db.c:3258-3266 (ets_internal_delete_all_2), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db.c (ets_internal_delete_all_2), OTP-29.1.1.
     pub fn begin_busy_delete_all(&mut self, garbage: Garbage) {
         self.set_busy(Some(BusyOp::DeleteAll(garbage)));
     }
 
     /// Install the remaining objects of a trapping list insert, which other processes then help
     /// insert. Returns the slot the result is published in.
-    // Port of erts/emulator/beam/erl_db.c:2306-2318 (ets_insert_2_list_driver installs
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_2_list_driver installs
     // `continuation_ctx`), OTP-29.1.1.
     pub fn begin_busy_insert_list(
         &mut self,
@@ -2680,7 +2795,7 @@ impl Table {
 
     /// Do a slice of the busy operation. `reds` counts down by the work done (a negative value
     /// on return means the slice ran out). Returns whether the table is usable again.
-    // Port of erts/emulator/beam/erl_db.c:3301-3322 (delete_all_objects_continue) and
+    // Port of erts/emulator/beam/erl_db.c (delete_all_objects_continue) and
     // :2161-2200 (ets_insert_2_list_continuation), OTP-29.1.1.
     pub fn continue_busy(&mut self, reds: &mut isize) -> bool {
         let Some(op) = self.busy.take() else {
@@ -2765,7 +2880,7 @@ impl Table {
     }
 
     /// Whether any of the prepared objects has a key already in the table.
-    // Port of erts/emulator/beam/erl_db.c:1924-1940 (ets_insert_new_2_dbterm_list_has_member),
+    // Port of erts/emulator/beam/erl_db.c (ets_insert_new_2_dbterm_list_has_member),
     // OTP-29.1.1.
     pub fn any_member_prepared(&self, prepared: &[PreparedObject]) -> bool {
         prepared
@@ -2823,7 +2938,7 @@ impl Table {
     }
 
     fn insert_new_mode(&mut self, objects: &[Term], single: bool) -> Result<bool, EtsError> {
-        // Port of erts/emulator/beam/erl_db.c:2387 (ets_insert_new_2), OTP-29.1.1.
+        // Port of erts/emulator/beam/erl_db.c (ets_insert_new_2), OTP-29.1.1.
         for &object in objects {
             key_of(object, self.options.keypos)?;
         }
@@ -2954,9 +3069,7 @@ impl Table {
             Storage::Ordered(root) => Node::get(root, key, self.options.keypos)
                 .map(|object| object.copy_out(dst))
                 .transpose(),
-            Storage::CATree(tree) => tree
-                .lookup(key, dst)
-                .map(|mut objects| (!objects.is_empty()).then(|| objects.remove(0))),
+            Storage::CATree(tree) => tree.lookup_one(key, dst),
             Storage::Hash(storage) => {
                 let hash = ets_hash(key);
                 storage.with_objects_hash(hash, |mut objects| {
@@ -3048,7 +3161,7 @@ impl Table {
             Ok(())
         })?;
         if count == 0 {
-            // Port of erts/emulator/beam/erl_db.c:2958-2960 (DB_ERROR_BADKEY), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_db.c (DB_ERROR_BADKEY), OTP-29.1.1.
             return Err(EtsError::BadArgCause("badkey"));
         }
         // Hash buckets are traversed newest-first; `lookup/2` reverses that
@@ -3062,7 +3175,7 @@ impl Table {
 
     /// Copy one element from a set-like table without building an object list.
     ///
-    /// Port of erts/emulator/beam/erl_db.c:2935-2969, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db.c, OTP-29.1.1.
     pub fn lookup_element_one<H: HeapAlloc>(
         &self,
         key: Term,
@@ -3151,8 +3264,8 @@ impl Table {
     /// Detach every object for incremental release, leaving the table empty. `whole` also
     /// takes the pseudo-deleted objects of a table that is being deleted.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:4017 (db_delete_all_objects_hash) and
-    /// erl_db_tree.c:2531 (db_free_table_continue_tree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c (db_delete_all_objects_hash) and
+    /// erl_db_tree.c (db_free_table_continue_tree), OTP-29.1.1.
     pub fn take_garbage(&mut self, whole: bool) -> Garbage {
         match &mut self.storage {
             Storage::Ordered(root) => Garbage(GarbageKind::Tree(root.take().into_iter().collect())),
@@ -3174,7 +3287,7 @@ impl Table {
     /// Release `garbage` taken from this table within `reds` reductions. Returns whether all of
     /// it is released.
     pub fn free_garbage(&mut self, garbage: &mut Garbage, reds: &mut isize) -> bool {
-        // Port of erts/emulator/beam/erl_db_hash.c:4017-4033 (db_delete_all_objects_hash): the
+        // Port of erts/emulator/beam/erl_db_hash.c (db_delete_all_objects_hash): the
         // mark-or-free decision is retaken on every continuation, so an unfix in between turns
         // the rest into a plain release.
         if let GarbageKind::Mark { slot } = &mut garbage.0
@@ -3219,7 +3332,7 @@ impl Table {
 
     /// Replace the table access and heir settings used by `ets:setopts/2`.
     ///
-    /// Port of erts/emulator/beam/erl_db.c:3146 (`ets_setopts_2`), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db.c (`ets_setopts_2`), OTP-29.1.1.
     pub fn set_access_options(
         &mut self,
         protection: Option<Protection>,
@@ -3239,7 +3352,7 @@ impl Table {
 
     /// Raw first key for runtime table walkers that bypass protection checks.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:4160 and erl_db_tree.c raw-first,
+    /// Port of erts/emulator/beam/erl_db_hash.c and erl_db_tree.c raw-first,
     /// OTP-29.1.1.
     pub fn raw_first<H: HeapAlloc>(&self, dst: &mut H) -> Result<Option<Term>, EtsError> {
         if let Storage::Hash(storage) = &self.storage {
@@ -3253,8 +3366,8 @@ impl Table {
 
     /// Raw successor key. A hash table accepts pseudo-deleted keys; tree tables share `next`.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:4196 (db_raw_next_hash), erl_db_tree.c:540 and
-    /// erl_db_catree.c:242, OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_hash.c (db_raw_next_hash), erl_db_tree.c and
+    /// erl_db_catree.c, OTP-29.1.1.
     pub fn raw_next<H: HeapAlloc>(&self, key: Term, dst: &mut H) -> Result<Option<Term>, EtsError> {
         if let Storage::Hash(storage) = &self.storage {
             return storage
@@ -3268,7 +3381,7 @@ impl Table {
 
     /// Return ref-counted binary owners retained by objects with this key.
     ///
-    /// Port of erts/emulator/beam/erl_db_hash.c:4117 and erl_db_tree.c:3580,
+    /// Port of erts/emulator/beam/erl_db_hash.c and erl_db_tree.c,
     /// OTP-29.1.1.
     pub fn lookup_binary_info<H: HeapAlloc>(
         &self,
@@ -3494,7 +3607,7 @@ impl Table {
             return tree.walk(false, dst);
         }
         if let Storage::Hash(storage) = &self.storage {
-            // Port of erts/emulator/beam/erl_db_hash.c:2309-2335 (db_select_chunk_hash),
+            // Port of erts/emulator/beam/erl_db_hash.c (db_select_chunk_hash),
             // reached by ets:tab2list/1 through ets:match_object/2.
             let mut objects = Vec::new();
             storage.try_for_each_value(|object| {
@@ -3638,7 +3751,7 @@ impl Table {
     /// requested key) when the key is absent. A `None` entry is a malformed
     /// `{Pos, Value}` or list tail. Returns `false` for a missing key without default.
     ///
-    /// Port of erts/emulator/beam/erl_db.c:1370-1458 (do_update_element), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db.c (do_update_element), OTP-29.1.1.
     pub fn update_element(
         &mut self,
         key: Term,
@@ -3808,9 +3921,9 @@ impl Table {
     /// Apply counter operations in place when every operand, counter and result is a small
     /// integer, which needs no copy of the object; returns `None`, with the table untouched,
     /// when any operation needs [`Table::update_counter_big`] (a missing key, an error, a
-    /// bignum, a CA tree or compressed object).
+    /// bignum or compressed object).
     ///
-    /// Port of erts/emulator/beam/erl_db.c:1494-1690 (do_update_counter), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db.c (do_update_counter), OTP-29.1.1.
     pub fn update_counter_in_place(
         &mut self,
         key: Term,
@@ -3823,53 +3936,25 @@ impl Table {
             return None;
         }
         let keypos = self.options.keypos;
-        let object = match &mut self.storage {
-            Storage::Hash(storage) => storage.find_mut(key, keypos)?,
-            Storage::Ordered(root) => Node::get_mut(root, key, keypos)?,
-            Storage::CATree(_) => return None,
-        };
-        if !object.compressed_elements.is_empty() {
-            return None;
-        }
-        // Verify every operation first, as erts never rolls back a partial update.
-        let mut updated: smallvec::SmallVec<[(usize, i64); 4]> = smallvec::SmallVec::new();
-        let mut results = smallvec::SmallVec::new();
-        for operation in operations {
-            // A position past the tuple has no element below and takes the general path.
-            if operation.position == keypos || operation.position == 0 {
-                return None;
+        match &mut self.storage {
+            Storage::Hash(storage) => {
+                update_counter_object_in_place(storage.find_mut(key, keypos)?, keypos, operations)
             }
-            let index = operation.position - 1;
-            let old = match updated.iter().rev().find(|(at, _)| *at == index) {
-                Some(&(_, value)) => value,
-                None => object.tuple_element(index)?.as_small()?,
-            };
-            let mut next = old.checked_add(operation.increment)?;
-            if let Some((threshold, reset)) = operation.threshold
-                && (if operation.increment < 0 {
-                    next < threshold
-                } else {
-                    next > threshold
-                })
-            {
-                next = reset;
-            }
-            results.push(Term::small(next)?);
-            updated.push((index, next));
+            Storage::Ordered(root) => update_counter_object_in_place(
+                Node::get_mut(root, key, keypos)?,
+                keypos,
+                operations,
+            ),
+            Storage::CATree(tree) => tree.with_object_mut(key, |object| {
+                update_counter_object_in_place(object, keypos, operations)
+            }),
         }
-        for (index, value) in updated {
-            if !object.set_immediate_element(index, Term::small(value)?) {
-                debug_assert!(false, "verified counter element is not writable in place");
-                return None;
-            }
-        }
-        Some(results)
     }
 
     /// Atomically apply arbitrary precision counter operations. A `None` entry is a
     /// malformed operation or list tail; it fails without extended error information.
     ///
-    /// Port of erts/emulator/beam/erl_db.c:1492-1690 (do_update_counter), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db.c (do_update_counter), OTP-29.1.1.
     pub fn update_counter_big(
         &mut self,
         key: Term,
@@ -3888,7 +3973,7 @@ impl Table {
         let mut stored_values = None;
         self.try_matching_first(key, |found| {
             // erts reads and updates the stored object in place under the write lock
-            // (erl_db.c:1532 db_lookup_dbterm, erl_db_catree.c:2369-2385). A CA tree hands
+            // (erl_db.c db_lookup_dbterm, erl_db_catree.c). A CA tree hands
             // the visitor a copy that is dropped when the lookup returns, so the elements
             // are copied into the local heap rather than borrowed from `found`.
             let current = found.term_for_match(&mut heap)?;
@@ -3978,25 +4063,25 @@ impl Table {
     ) -> Result<Vec<Term>, EtsError> {
         let mut runner = program.runner();
         if let Storage::CATree(tree) = &self.storage {
-            let mut objects = tree.objects()?;
-            if reverse {
-                objects.reverse();
-            }
             let mut results = Vec::new();
-            for object in objects {
-                let term = object.term_for_filter(dst)?;
-                if let Some(result) = runner.run_with_context(term, dst, context)? {
+            // Port of erts/emulator/beam/erl_db_catree.c (db_select_catree) and
+            // erl_db_tree.c (db_select_tree_common): match a stored DbTerm under its
+            // base-node read lock and copy only the selected result to the process heap.
+            tree.scan_where(reverse, &|_| true, |object| {
+                let (term, size) = object.term_for_filter_with_size(dst)?;
+                if let Some(result) = runner.run_with_context_sized(term, dst, context, size)? {
                     results.push(result);
                 }
-            }
+                Ok(false)
+            })?;
             return Ok(results);
         }
         if let Storage::Hash(storage) = &self.storage {
-            // Port of erts/emulator/beam/erl_db_hash.c:2315-2335 (db_select_chunk_hash).
+            // Port of erts/emulator/beam/erl_db_hash.c (db_select_chunk_hash).
             let mut results = Vec::new();
             storage.try_for_each_value(|object| {
-                let term = object.term_for_filter(dst)?;
-                if let Some(result) = runner.run_with_context(term, dst, context)? {
+                let (term, size) = object.term_for_filter_with_size(dst)?;
+                if let Some(result) = runner.run_with_context_sized(term, dst, context, size)? {
                     results.push(result);
                 }
                 Ok::<_, EtsError>(())
@@ -4016,8 +4101,8 @@ impl Table {
         }
         let mut results = Vec::new();
         for object in objects {
-            let term = object.term_for_filter(dst)?;
-            if let Some(result) = runner.run_with_context(term, dst, context)? {
+            let (term, size) = object.term_for_filter_with_size(dst)?;
+            if let Some(result) = runner.run_with_context_sized(term, dst, context, size)? {
                 results.push(result);
             }
         }
@@ -4294,28 +4379,23 @@ impl Table {
             return Ok(state.out);
         }
         if let Storage::CATree(tree) = &self.storage {
-            let mut objects = tree.objects()?;
-            if reverse {
-                objects.reverse();
-            }
             let mut results = Vec::new();
-            for object in objects {
-                let term = object.term_for_filter(dst)?;
-                if let Some(result) = runner.run(term, dst)? {
+            // Port of erts/emulator/beam/erl_db_catree.c (db_select_catree), OTP-29.1.1.
+            tree.scan_where(reverse, &|_| true, |object| {
+                let (term, size) = object.term_for_filter_with_size(dst)?;
+                if let Some(result) = runner.run_sized(term, dst, size)? {
                     results.push(result);
                 }
-                if results.len() >= limit {
-                    break;
-                }
-            }
+                Ok(results.len() >= limit)
+            })?;
             return Ok(results);
         }
         if let Storage::Hash(storage) = &self.storage {
-            // Port of erts/emulator/beam/erl_db_hash.c:2315-2335 (db_select_chunk_hash).
+            // Port of erts/emulator/beam/erl_db_hash.c (db_select_chunk_hash).
             let mut results = Vec::new();
             storage.try_for_each_value_while(|object| {
-                let candidate = object.term_for_filter(dst)?;
-                if let Some(result) = runner.run(candidate, dst)? {
+                let (candidate, size) = object.term_for_filter_with_size(dst)?;
+                if let Some(result) = runner.run_sized(candidate, dst, size)? {
                     results.push(result);
                 }
                 Ok::<_, EtsError>(results.len() < limit)
@@ -4335,8 +4415,8 @@ impl Table {
         }
         let mut results = Vec::new();
         for object in objects {
-            let candidate = object.term_for_filter(dst)?;
-            if let Some(result) = runner.run(candidate, dst)? {
+            let (candidate, size) = object.term_for_filter_with_size(dst)?;
+            if let Some(result) = runner.run_sized(candidate, dst, size)? {
                 results.push(result);
             }
             if results.len() >= limit {
@@ -4449,8 +4529,8 @@ impl Table {
     }
 
     /// Count objects selected by a match specification.
-    // Port of erts/emulator/beam/erl_db_hash.c:2525 (db_select_count_hash),
-    // erl_db_tree.c:1800 (db_select_count_tree), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_select_count_hash),
+    // erl_db_tree.c (db_select_count_tree), OTP-29.1.1.
     pub fn select_count(&self, program: &match_spec::MatchProgram) -> Result<usize, EtsError> {
         let mut heap = VecHeap::new();
         let true_atom = Term::atom(global_true());
@@ -4500,8 +4580,8 @@ impl Table {
     }
 
     /// Delete objects selected by a match specification and return the count.
-    // Port of erts/emulator/beam/erl_db_hash.c:2723 (db_select_delete_hash),
-    // erl_db_tree.c:2217 (db_select_delete_tree), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_select_delete_hash),
+    // erl_db_tree.c (db_select_delete_tree), OTP-29.1.1.
     pub fn select_delete(&mut self, program: &match_spec::MatchProgram) -> Result<usize, EtsError> {
         let mut heap = VecHeap::new();
         let mut selected = Vec::new();
@@ -4582,8 +4662,8 @@ impl Table {
 
     /// Replace each selected object in place; the match specification must keep keys.
     ///
-    /// Port of erts/emulator/beam/erl_db.c:4185-4230 (ets_select_replace_2) and
-    /// erl_db_hash.c:2817-2890 (select_replace_on_match_res), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db.c (ets_select_replace_2) and
+    /// erl_db_hash.c (select_replace_on_match_res), OTP-29.1.1.
     pub fn select_replace(
         &mut self,
         program: &match_spec::MatchProgram,
@@ -4684,8 +4764,8 @@ impl Garbage {
     /// Release up to `reds` reductions of work, counting down below zero when it ran out.
     /// Returns whether everything is released.
     ///
-    /// Port of erts/emulator/beam/erl_db_tree.c:2531 (do_free_tree_continue) and
-    /// erl_db_hash.c:3122 (db_free_table_continue_hash), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_tree.c (do_free_tree_continue) and
+    /// erl_db_hash.c (db_free_table_continue_hash), OTP-29.1.1.
     pub fn step(&mut self, reds: &mut isize) -> bool {
         match &mut self.0 {
             GarbageKind::Hash(garbage) => garbage.step(reds),
@@ -4778,7 +4858,7 @@ impl NamedTableIndex {
     }
 
     /// Resolve an atom without acquiring the ETS registry lock or allocating.
-    // Port of erts/emulator/beam/erl_db.c (meta_name_tab_bucket, db_get_table_aux), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db.c (db_get_table_aux), OTP-29.1.1.
     // Readers scan the atom-hashed immutable bucket snapshot.
     pub fn lookup(&self, name: Atom) -> Option<SharedTable> {
         let bucket = name.0 as usize & self.mask;
@@ -4788,6 +4868,22 @@ impl NamedTableIndex {
             .iter()
             .find(|entry| entry.name == name)
             .map(|entry| Arc::clone(&entry.table))
+    }
+
+    /// Use the table in an atom-hashed name snapshot without cloning its shared handle.
+    ///
+    /// The snapshot guard keeps the table alive until `use_table` returns, including while the
+    /// caller holds the table lock.
+    // Port of erts/emulator/beam/erl_db.c (meta_name_tab_bucket, db_get_table_aux), OTP-29.1.1.
+    pub fn with_table<R>(
+        &self,
+        name: Atom,
+        use_table: impl FnOnce(&SharedTable) -> R,
+    ) -> Option<R> {
+        let bucket = name.0 as usize & self.mask;
+        let entries = self.buckets[bucket].load();
+        let entry = entries.data.iter().find(|entry| entry.name == name)?;
+        Some(use_table(&entry.table))
     }
 
     fn insert(&self, name: Atom, table: SharedTable) -> bool {
@@ -4847,7 +4943,7 @@ impl Default for NamedTableIndex {
 
 /// A table behind its own lock, so operations on different tables never serialize.
 ///
-/// Port of erts/emulator/beam/erl_db.c:446-500 (db_lock/db_unlock), OTP-29.1.1: each table
+/// Port of erts/emulator/beam/erl_db.c (db_lock/db_unlock), OTP-29.1.1: each table
 /// carries its own `rwlock`; reads take it shared and writes exclusive. The registry lock
 /// only guards the identity and name maps (erts `meta_main_tab` and `meta_name_tab`).
 pub type SharedTable = Arc<TableLock>;
@@ -4855,7 +4951,7 @@ pub type SharedTable = Arc<TableLock>;
 /// A table rwmutex. erts selects its frequent-reader implementation when either
 /// `DB_FINE_LOCKED` or `DB_FREQ_READ` is set.
 ///
-/// Port of erts/emulator/beam/erl_db.c:683-695 (`db_init_lock`) and :446-500 (`db_lock`),
+/// Port of erts/emulator/beam/erl_db.c (`db_init_lock`) and :446-500 (`db_lock`),
 /// OTP-29.1.1.
 pub struct TableLock {
     lock: TableRwLock<Table>,
@@ -5078,10 +5174,10 @@ impl Registry {
     }
 
     /// Lock a table for a fine-grained key read.
-    // Port of erts/emulator/beam/erl_db.c:446-500 (db_lock read mode), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db.c (db_lock read mode), OTP-29.1.1.
     pub fn get_shared(&self, tid: Tid) -> Result<TableReadGuard<'_, Table>, EtsError> {
         let table = self.shared(tid)?.read();
-        // Port of erts/emulator/beam/erl_db.c:770-796 (handle_lacking_permission, DB_BUSY).
+        // Port of erts/emulator/beam/erl_db.c (handle_lacking_permission, DB_BUSY).
         if table.is_busy() {
             return Err(EtsError::Busy);
         }
@@ -5160,7 +5256,7 @@ impl Registry {
     /// Remove a table from the registry and return its storage, to be released incrementally,
     /// with the number of fixations it dropped.
     ///
-    /// Port of erts/emulator/beam/erl_db.c:3006 (ets_delete_1: DB_DELETE status, name removal,
+    /// Port of erts/emulator/beam/erl_db.c (ets_delete_1: DB_DELETE status, name removal,
     /// free_fixations_locked) up to the free_table_continue call, OTP-29.1.1.
     pub fn detach(&mut self, tid: Tid) -> Result<(Garbage, usize), EtsError> {
         let index = tid.slot().ok_or(EtsError::NoTable)?;
@@ -5194,7 +5290,7 @@ impl Registry {
     }
 
     /// Any table `owner` still owns (head of erts `ERTS_PSD_ETS_OWNED_TABLES`).
-    // Port of erts/emulator/beam/erl_db.c:5057 (GET_OWNED_TABLE), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db.c (GET_OWNED_TABLE), OTP-29.1.1.
     pub fn first_owned(&self, owner: Term) -> Option<Tid> {
         self.owned_tables.get(&owner)?.iter().next().copied()
     }
@@ -5205,7 +5301,7 @@ impl Registry {
     }
 
     /// Return the tables owned by one process without inspecting unrelated tables.
-    // Port of erts/emulator/beam/erl_db.c:635 (owned table list), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db.c (owned table list), OTP-29.1.1.
     pub fn owned_by(&self, owner: Term) -> Vec<Tid> {
         self.owned_tables
             .get(&owner)
@@ -5231,7 +5327,7 @@ impl Registry {
         let mut table = shared.write();
         let named = table.options.named_table;
         if named {
-            // Port of erts/emulator/beam/erl_db.c:2516 (insert_named_tab), OTP-29.1.1:
+            // Port of erts/emulator/beam/erl_db.c (insert_named_tab), OTP-29.1.1:
             // any registered name fails, including the table's own.
             if self.names.contains_key(&name) {
                 return Err(EtsError::NameTaken);
@@ -5260,7 +5356,7 @@ impl Registry {
 
     /// Release every fixation held by an exiting process.
     ///
-    /// Port of erts/emulator/beam/erl_db.c:5236-5262 (free_fixations_op), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db.c (free_fixations_op), OTP-29.1.1.
     pub fn release_fixations(&mut self, pid: Term) {
         let Some(tables) = self.fixed_tables.remove(&pid) else {
             return;
@@ -5274,7 +5370,7 @@ impl Registry {
     }
 
     /// Record the new owner after the VM sends its transfer message.
-    // Port of erts/emulator/beam/erl_db.c:657 (owned table transfer), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db.c (owned table transfer), OTP-29.1.1.
     pub fn give_away(&mut self, tid: Tid, new_owner: Term) -> Result<(), EtsError> {
         let old_owner = self.get(tid)?.options.owner;
         if old_owner == new_owner {
