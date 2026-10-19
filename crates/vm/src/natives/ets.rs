@@ -602,6 +602,14 @@ fn finish_direct(
     args: &[Term],
     result: Result<Term, VmError>,
 ) -> Option<Term> {
+    // The value of a succeeded call is returned without moving the (large) error type again.
+    let result = match result {
+        Ok(value) => {
+            BIF_CAUSE.with(std::cell::Cell::take);
+            return Some(value);
+        }
+        Err(error) => Err(error),
+    };
     match bif_register_frame(module, function, args.len(), result) {
         Ok(value) => Some(value),
         Err(VmError::Trap(trap)) => {
@@ -627,6 +635,8 @@ fn finish_direct(
 
 // Port of erts/emulator/beam/beam_common.c (`save_stacktrace`), OTP-29.1.1.
 /// Keeps the BIF operands in the X registers until `save_stacktrace` materializes its argument list.
+#[cold]
+#[inline(never)]
 fn bif_register_frame(
     module: arinsal_term::Atom,
     function: arinsal_term::Atom,
@@ -1574,16 +1584,16 @@ fn lookup_element_locked(
     {
         return table.lookup_element_one(key, position, heap).map_err(err);
     }
-    let values = if let Some(default) = default {
-        match table
-            .lookup_element_default(key, position, default, heap)
-            .map_err(err)?
-        {
-            ElementLookup::Values(values) => values,
-            ElementLookup::Default(value) => return Ok(value),
-        }
-    } else {
-        table.lookup_element(key, position, heap).map_err(err)?
+    let Some(default) = default else {
+        // Bag and duplicate_bag: the list is consed on the heap without an intermediate vector.
+        return table.lookup_element_list(key, position, heap).map_err(err);
+    };
+    let values = match table
+        .lookup_element_default(key, position, default, heap)
+        .map_err(err)?
+    {
+        ElementLookup::Values(values) => values,
+        ElementLookup::Default(value) => return Ok(value),
     };
     if matches!(
         table.options.table_type,
