@@ -2085,7 +2085,6 @@ fn hash_select(
         }
     };
     let iterations = arinsal_ets::HASH_SELECT_ITERATIONS;
-    let mut scratch = arinsal_term::VecHeap::new();
 
     // Cycle under the table's read lock.
     let (start, hash, cycle) = {
@@ -2109,7 +2108,6 @@ fn hash_select(
             return Err(badarg_cause("access"));
         }
         let hash = table.is_hash();
-        let direct = ctx.is_none();
         let start = match resumed {
             Some(state) => Start {
                 tid,
@@ -2244,14 +2242,10 @@ fn hash_select(
             held: start.saved.len(),
             from: start.position.as_ref(),
         };
-        // Native code caches the heap top, so a call that may still decline builds its results
-        // aside and copies them to the heap once it knows it completes.
-        let cycle = if direct {
-            select_cycle(&table, &start.plan, &start.program, shape, &mut scratch)
-        } else {
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            select_cycle(&table, &start.plan, &start.program, shape, &mut heap)
-        };
+        // The results are built on the process heap in both modes; a direct call that has to
+        // trap declines afterwards, and the scheduler path redoes the cycle.
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let cycle = select_cycle(&table, &start.plan, &start.program, shape, &mut heap);
         (start, hash, cycle)
     };
     let Start {
@@ -2407,14 +2401,8 @@ fn hash_select(
             .map(Some)
             .map_err(|_| badarg());
     }
-    let mut values = saved.copy_out(&mut heap).map_err(err)?;
-    if ctx.is_none() {
-        for term in cycle.results {
-            values.push(copy_term(term, &mut heap).map_err(|_| badarg())?);
-        }
-    } else {
-        values.extend(cycle.results);
-    }
+    let mut values = saved.into_terms();
+    values.extend(cycle.results);
     let result = if chunk == 0 {
         values.reverse();
         TermBuilder::new(&mut heap)
@@ -2472,7 +2460,7 @@ fn reverse_trap(
             let ctx = ctx.ok_or_else(needs_context)?;
             bump_reds(process, ctx, reds);
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            let values = state.saved.copy_out(&mut heap).map_err(err)?;
+            let values = state.saved.terms().to_vec();
             let list = TermBuilder::new(&mut heap)
                 .list_from_iter(values)
                 .map_err(|_| badarg())?;

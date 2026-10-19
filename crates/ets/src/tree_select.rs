@@ -216,8 +216,8 @@ impl Table {
             after,
             TREE_SELECT_ITERATIONS,
             &mut |object| {
-                let term = object.term_for_filter(dst)?;
-                if let Some(result) = runner.run(term, dst)? {
+                let (term, size) = object.term_for_filter_with_size(dst)?;
+                if let Some(result) = runner.run_sized(term, dst, size)? {
                     results.push(result);
                 }
                 Ok(false)
@@ -253,8 +253,8 @@ impl Table {
             after,
             TREE_SELECT_ITERATIONS,
             &mut |object| {
-                let term = object.term_for_filter(dst)?;
-                if let Some(result) = runner.run(term, dst)? {
+                let (term, size) = object.term_for_filter_with_size(dst)?;
+                if let Some(result) = runner.run_sized(term, dst, size)? {
                     results.push(result);
                     held += 1;
                 }

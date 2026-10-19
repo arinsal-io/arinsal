@@ -75,28 +75,24 @@ pub struct HashScanEnd {
     pub chunk_slot: Option<usize>,
 }
 
-/// Results of earlier cycles of a trapped `select`, kept outside the process heap.
+/// Results of earlier cycles of a trapped `select`: terms on the calling process' heap, which
+/// the collector treats as roots of the trapped call while it waits.
 // Port of the match_list a trapped call carries in its continuation (erl_db_hash.c,
-// select_chunk_on_trap), OTP-29.1.1.
+// select_chunk_on_trap), OTP-29.1.1: the partial list is a term of the process heap, copied
+// once from the table.
 pub struct SavedMatches {
-    heap: VecHeap,
     terms: Vec<Term>,
 }
 
 impl SavedMatches {
     /// No results yet.
     pub fn new() -> Self {
-        Self {
-            heap: VecHeap::new(),
-            terms: Vec::new(),
-        }
+        Self { terms: Vec::new() }
     }
 
-    /// Keep the results of a cycle, oldest first.
+    /// Keep the results of a cycle, oldest first. They are already on the process heap.
     pub fn extend(&mut self, results: &[Term]) -> Result<(), EtsError> {
-        for &term in results {
-            self.terms.push(copy_term(term, &mut self.heap)?);
-        }
+        self.terms.extend_from_slice(results);
         Ok(())
     }
 
@@ -110,12 +106,19 @@ impl SavedMatches {
         self.terms.len()
     }
 
-    /// The saved results as terms on `dst`, oldest first.
-    pub fn copy_out<H: HeapAlloc>(&self, dst: &mut H) -> Result<Vec<Term>, EtsError> {
+    /// The saved results, oldest first.
+    pub fn into_terms(self) -> Vec<Term> {
         self.terms
-            .iter()
-            .map(|&term| Ok(copy_term(term, dst)?))
-            .collect()
+    }
+
+    /// The saved results, oldest first.
+    pub fn terms(&self) -> &[Term] {
+        &self.terms
+    }
+
+    /// The saved results as collector roots.
+    pub fn roots_mut(&mut self) -> &mut [Term] {
+        &mut self.terms
     }
 }
 

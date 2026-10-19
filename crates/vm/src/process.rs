@@ -6709,6 +6709,10 @@ impl Process {
                         .as_ref()
                         .is_none_or(|state| state.cursor().is_none())
                     && cold
+                        .ets_select
+                        .as_ref()
+                        .is_none_or(|state| state.saved.is_empty())
+                    && cold
                         .bif_trap
                         .as_ref()
                         .is_none_or(|trap| !trap.args_are_roots())
@@ -6796,6 +6800,14 @@ impl Process {
                 roots.push(cursor);
                 index
             });
+        // Port of erts/emulator/beam/erl_db_hash.c (select_chunk_on_trap: the partial result
+        // list is a term of the continuation), OTP-29.1.1: the results a trapped `select` has
+        // so far are roots until it resumes.
+        let ets_select_start = roots.len();
+        if let Some(state) = self.cold.as_ref().and_then(|cold| cold.ets_select.as_ref()) {
+            roots.extend_from_slice(state.saved.terms());
+        }
+        let ets_select_end = roots.len();
         // A finished dirty job's result is in erts' argument registers until the call resumes.
         let dirty_start = roots.len();
         roots.extend(self.dirty_result_roots());
@@ -6973,6 +6985,12 @@ impl Process {
                 && let Some(state) = cold.ets_insert.as_mut()
             {
                 state.update_cursor(roots[index]);
+            }
+            if let Some(state) = cold.ets_select.as_mut() {
+                state
+                    .saved
+                    .roots_mut()
+                    .copy_from_slice(&roots[ets_select_start..ets_select_end]);
             }
         }
         for (slot, &term) in self
