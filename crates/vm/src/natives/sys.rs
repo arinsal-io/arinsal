@@ -1066,6 +1066,10 @@ fn system_info(
         Some("threads") => Some(Ok(Term::atom(arinsal_term::atoms::TRUE))),
         Some("check_io") => Some(check_io_info(process)),
         Some("ethread_info") => Some(ethread_info(process)),
+        // Port of erts/emulator/beam/erl_bif_info.c (system_info_1) and
+        // erts/lib_src/common/ethr_aux.c (ethr_no_used_tse), OTP-29.1.1. Arinsal does not
+        // allocate ETHR thread-specific event objects, so its used-event count is zero.
+        Some("ethread_used_tse") => Some(non_neg(process, 0)),
         // Port of erts/emulator/beam/erl_bif_info.c:3549 (max_integer), OTP-29.1.1.
         Some("max_integer") => Some(max_integer(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:3179 (system_info_1), OTP-29.1.1.

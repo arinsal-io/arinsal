@@ -14,14 +14,44 @@ const SOURCE: &str = r#"
          call_match_self/0, seq_receive_states/0, call_match_set_seq_token/0,
          alias_reply_once/0, alias_reply_once_two_senders/0, big_call_message_tracer/0, new_tracing_dies_with_tracer/0,
          nocatch_stack_with_trace_frames/0, bif_session_global_destroyed/0,
-         link_events_in_signal_order/0]).
--export([d1/1, d2/1]).
+         link_events_in_signal_order/0, native_badmatch_location/0]).
+-export([d1/1, d2/1, id/1]).
 -export([k/1, f/1, g/1, w/1]).
 
 k(X) -> [X].
 f(X) -> g(X).
 g(X) -> [X].
 w(L) -> L ++ [a].
+
+%% The final case clause raises at its own line even when its return PC shares an offset with the
+%% following line marker.
+native_badmatch_location() ->
+    try deep_4({'=', [a, b]})
+    catch error:{badmatch, _}:Stack ->
+        [{trace_compat_diff, deep_4, 1, Location} | _] = Stack,
+        Location
+    end.
+
+id(Value) -> Value.
+
+deep_4(CR) ->
+    case trace_compat_diff:id(CR) of
+        {exit, [Reason]} -> erlang:exit(Reason);
+        {throw, [Reason]} -> erlang:throw(Reason);
+        {error, [Reason, Arglist]} -> erlang:error(Reason, Arglist);
+        {error, [Reason]} -> erlang:error(Reason);
+        {id, [Reason]} -> Reason;
+        {reverse, [A, B]} -> lists:reverse(A, B);
+        {append, [A, B]} -> A ++ B;
+        {apply, [Fun, Args]} -> erlang:apply(Fun, Args);
+        {apply, [M, F, Args]} -> erlang:apply(M, F, Args);
+        {deep_5, [A, B]} -> trace_compat_diff:deep_5(A, B);
+        {deep_5, [A]} -> trace_compat_diff:deep_5(A);
+        {'=', [A, B]} -> A = B
+    end.
+
+deep_5(A) when is_integer(A) -> A.
+deep_5(A, B) -> {A, B}.
 
 collect(Acc) ->
     receive M -> collect([M | Acc]) after 300 -> lists:reverse(Acc) end.
@@ -371,7 +401,7 @@ fn check(function: &str) {
         return;
     };
     let (expected, actual) = run(&reference, function);
-    assert_eq!(expected, CallResult::Ok(actual), "{function}");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual), "{function}");
 }
 
 #[test]
@@ -462,6 +492,11 @@ fn bif_stays_traced_when_only_the_global_session_is_destroyed() {
 #[test]
 fn link_events_follow_message_order() {
     check("link_events_in_signal_order");
+}
+
+#[test]
+fn native_badmatch_location_uses_the_failing_case_clause_line() {
+    check("native_badmatch_location");
 }
 
 #[test]

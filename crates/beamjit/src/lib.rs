@@ -2476,37 +2476,20 @@ fn emit_op(
                 };
                 assembler.emit_i_func_info(n(0)?, atom(1)?, atom(2)?, n(3)?.min(255) as u8)
             }
-            "line" | "func_line" => {
-                // Port of erts/emulator/beam/jit/asm_load.c:642-690 (op_func_line_I adds a line
-                // entry even when it repeats the previous one), OTP-29.1.1.
-                count(1)?;
-                let location = n(0)?;
-                if let Some(item) = beam.lines.as_ref().and_then(|table| {
-                    location
-                        .checked_sub(1)
-                        .and_then(|index| table.items.get(index as usize))
-                }) {
-                    let file = if item.name_index == 0 {
-                        format!("{}.erl", beam.module)
-                    } else {
-                        beam.lines
-                            .as_ref()
-                            .and_then(|table| table.names.get(item.name_index as usize - 1))
-                            .filter(|name| !name.is_empty())
-                            .cloned()
-                            .unwrap_or_else(|| format!("{}.erl", beam.module))
-                    };
-                    let line = u32::try_from(item.line)
-                        .map_err(|_| EmitError::Operand("source line exceeds u32".into()))?;
-                    assembler.record_line(file, line);
+            "line" | "func_line" | "executable_line" => {
+                // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (emit_line,
+                // emit_func_line, emit_executable_line) for the code and of
+                // erts/emulator/beam/jit/asm_load.c (add_line_entry) for the line table,
+                // OTP-29.1.1: `line` flushes a pending exception return address first;
+                // `func_line` keeps a duplicate entry, the others skip a repeat of the
+                // previous location.
+                let is_line = op.name() == "line";
+                let is_func_line = op.name() == "func_line";
+                count(if op.name() == "executable_line" { 2 } else { 1 })?;
+                if is_line {
+                    assembler.flush_last_error()?;
                 }
-                Ok(())
-            }
-            "executable_line" => {
-                // Port of erts/emulator/beam/jit/asm_load.c:685-715, OTP-29.1.1.
-                count(2)?;
                 let location = n(0)?;
-                let cover_id = n(1)?;
                 if let Some(item) = beam.lines.as_ref().and_then(|table| {
                     location
                         .checked_sub(1)
@@ -2523,10 +2506,13 @@ fn emit_op(
                             .cloned()
                             .unwrap_or_else(|| format!("{}.erl", beam.module))
                     };
-                    assembler.record_line(file, line);
+                    assembler.record_line(u64::from(location), file, line, is_func_line);
                 }
-                if let Some(probe) = env.line_coverage_probe(location, cover_id) {
-                    assembler.emit_coverage(probe.address, probe.flags)?;
+                if op.name() == "executable_line" {
+                    let cover_id = n(1)?;
+                    if let Some(probe) = env.line_coverage_probe(location, cover_id) {
+                        assembler.emit_coverage(probe.address, probe.flags)?;
+                    }
                 }
                 Ok(())
             }
@@ -2569,7 +2555,7 @@ fn emit_op(
                             }
                         })
                         .unwrap_or_else(|| format!("{}.erl", beam.module));
-                    assembler.record_line(file, line);
+                    assembler.record_line(u64::from(n(0)?), file, line, true);
                 }
                 Ok(())
             }
