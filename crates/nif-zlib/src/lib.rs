@@ -1,8 +1,8 @@
 //! OTP 29.1.1 `zlib` and `zstd` NIFs backed by stock zlib and zstd 1.5.7.
 //!
 //! `zlib` resource handles are local refs until stage 4 adds VM resource terms. The
-//! `call_with_pid` entry point checks the owner; the `zlib` entries of `lookup` use an
-//! anonymous caller because the frozen `Ctx` contract has no process identity yet.
+//! `call_with_pid` entry point checks the owner; the `zlib` entries of `lookup` read the
+//! current scheduler process because the frozen `Ctx` contract has no process identity yet.
 //!
 //! The `zstd` NIFs take their arguments as terms. Their resources are magic references
 //! and `enif_self` is the scheduler thread's current process ([`set_scheduler_caller`]), or the
@@ -37,7 +37,7 @@ pub fn set_scheduler_caller(current: fn() -> Option<Term>) {
     let _ = SCHEDULER_CALLER.set(current);
 }
 
-/// Pin the process that runs the built-in `zstd` NIFs on this thread, overriding the
+/// Pin the process that runs built-in compression NIFs on this thread, overriding the
 /// scheduler's current process until the previous pin is restored.
 pub fn set_caller(pid: Option<Term>) {
     CALLER.with(|caller| caller.set(Some(pid)));
@@ -196,6 +196,7 @@ pub fn call_with_pid(
         CALLER.with(|pinned| pinned.set(previous));
         return result;
     }
+    let caller = caller.or_else(self::caller);
     let owned = args
         .iter()
         .map(|t| to_owned(*t).map_err(|_| BifError::BADARG))

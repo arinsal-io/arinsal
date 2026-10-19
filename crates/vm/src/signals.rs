@@ -3251,6 +3251,8 @@ pub(crate) enum RemoteOp {
     Info { items: Option<Message> },
     /// `group_leader(Leader, Pid)`.
     GroupLeader { leader: Pid },
+    /// `erts_internal:process_flag(Pid, save_calls, Value)` applies on the target process.
+    SaveCalls { value: Message },
     /// `garbage_collect` request. `request_id` is the term in the reply tuple.
     Collect { request_id: Message, major: bool },
     /// `process_display(Pid, backtrace)`.
@@ -3284,6 +3286,8 @@ pub(crate) enum WaitKind {
     Display,
     /// `{Ref, Bool}`.
     Alive,
+    /// `{Ref, OldSaveCalls}`; `badarg` is raised in the caller.
+    ProcessFlag,
 }
 
 pub(crate) enum Submit {
@@ -3506,6 +3510,8 @@ pub(crate) fn poll(process: &mut Process) -> Result<Option<Term>, VmError> {
 fn interpret(kind: WaitKind, inner: Term) -> Result<Term, VmError> {
     match kind {
         WaitKind::Info | WaitKind::Alive => Ok(inner),
+        WaitKind::ProcessFlag if inner == atom("badarg") => Err(badarg("remote process_flag")),
+        WaitKind::ProcessFlag => Ok(inner),
         WaitKind::GroupLeader | WaitKind::Display => {
             if inner == atom("true") {
                 Ok(atom("true"))
@@ -3520,7 +3526,11 @@ fn reply_inner(term: Term, id: u64, kind: WaitKind) -> Option<Term> {
     // SAFETY: Inbox terms are rooted on the caller's heap for this scan.
     let tuple = unsafe { term.tuple_ref() }?;
     match kind {
-        WaitKind::Info | WaitKind::GroupLeader | WaitKind::Display | WaitKind::Alive => {
+        WaitKind::Info
+        | WaitKind::GroupLeader
+        | WaitKind::Display
+        | WaitKind::Alive
+        | WaitKind::ProcessFlag => {
             if tuple.len() == 2 && tuple.get(0).and_then(ref_id) == Some(id) {
                 tuple.get(1)
             } else {

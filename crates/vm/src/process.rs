@@ -259,6 +259,16 @@ impl MessageQueue {
             .is_some_and(|entry| entry.fragment.as_ref().is_none_or(|f| f.heap.is_none()))
     }
 
+    /// Words in message fragments that `process_info(total_heap_size)` counts for on-heap queues.
+    // Port of erts/emulator/beam/erl_message.h (erts_msg_attached_data_size), OTP-29.1.1.
+    pub(crate) fn attached_message_words(&self) -> usize {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.fragment.as_ref()?.heap.as_ref())
+            .map(ProcessHeap::message_data_size)
+            .fold(0, usize::saturating_add)
+    }
+
     /// Index of the first message at or after `start` that matches.
     pub(crate) fn position_from(
         &self,

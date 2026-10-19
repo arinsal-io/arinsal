@@ -477,7 +477,8 @@ pub(crate) fn static_nif_job(
     }
     let args = process.x.get(..usize::from(arity))?.to_vec();
     let fcalls = process.reductions;
-    let zstd_caller = (module == "zstd").then(|| process.self_pid.and_then(|pid| pid.to_term()));
+    let pinned_caller = (module == "zstd" || module == "zlib")
+        .then(|| process.self_pid.and_then(|pid| pid.to_term()));
     Some(crate::dirty::static_nif_job(move |heap| {
         let mut fcalls = fcalls;
         let mut run = || {
@@ -486,7 +487,7 @@ pub(crate) fn static_nif_job(
             }))
             .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))))
         };
-        match zstd_caller {
+        match pinned_caller {
             Some(caller) => arinsal_nif_zlib::with_caller(caller, run),
             None => run(),
         }
