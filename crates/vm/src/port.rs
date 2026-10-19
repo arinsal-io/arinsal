@@ -2077,7 +2077,9 @@ pub(crate) fn abandon_port(runtime: &crate::process::Runtime, id: u64) {
     let owner = *handle.owner.lock().unwrap();
     let scheduler = Arc::clone(&handle.scheduler);
     release_io(&handle);
-    notify_closed(&handle, id, &scheduler, owner, false);
+    // Port of erts/emulator/beam/io.c (driver_exit): the connected process is unlinked first,
+    // so it gets no exit signal for this port.
+    notify_closed(&handle, id, &scheduler, owner, true);
 }
 
 fn notify_closed(
@@ -4006,6 +4008,7 @@ pub(crate) fn owner_exit(
     owner: Pid,
     reason: Term,
 ) {
+    crate::inet_drv::acceptor_exited(owner);
     // Port of erts/emulator/beam/io.c:7143 (erts_fire_port_monitor): ports that
     // monitor the exiting process run their driver's `process_exit` callback.
     let fired: Vec<(Arc<arinsal_drv::DriverPort>, u64)> = {
