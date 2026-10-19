@@ -7148,7 +7148,12 @@ impl Process {
     ) -> Result<(), VmError> {
         let origin = crate::signals::take_origin_monitor_down(self, reference);
         let remote = crate::dist::take_monitor(reference).is_some();
-        let active = origin.is_some() || remote;
+        // A port monitor's origin half lives in `port_monitors` (`monitor(port, P)`).
+        let port = self
+            .cold
+            .as_mut()
+            .is_some_and(|cold| cold.port_monitors.remove(&reference).is_some());
+        let active = origin.is_some() || remote || port;
         let priority = self
             .cold
             .as_mut()
