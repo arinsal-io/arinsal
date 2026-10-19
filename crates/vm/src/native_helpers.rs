@@ -2987,6 +2987,7 @@ fn call_direct_bif(
         registers.x_reg_array[2],
         registers.x_reg_array[3],
     ];
+    let entry_top = process.heap.heap_top_index();
     let value = direct(
         process,
         &args[..arity],
@@ -3021,8 +3022,20 @@ fn call_direct_bif(
             return Some(0);
         }
         raw = crate::native_hooks::raw(registers.x_reg_array[0]);
+        // The collection moved the heap: publish every bound.
+        process.sync_native_header();
+        return Some(raw);
     }
-    process.sync_native_header();
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared,
+    // emit_leave_runtime<eReductions | eHeap | eStack | eXRegs>), OTP-29.1.1: a BIF that did not
+    // collect only moved HTOP and the reduction counter; the heap bounds and stack are unchanged.
+    let top = process.heap.heap_top_index();
+    if top != entry_top {
+        process.header.htop = native_htop(process, top);
+    }
+    if process.header.fcalls != process.reductions {
+        process.header.fcalls = process.reductions;
+    }
     Some(raw)
 }
 
