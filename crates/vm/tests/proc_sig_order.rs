@@ -18,6 +18,10 @@ const CASES: &[&str] = &[
     "message_exit_message_running",
     "info_reply_after_unmatched_message",
     "monitor_then_message_to_parent",
+    "alive_after_exit_signal",
+    "alive_after_exit_signal_running",
+    "alive_sees_message_before_exit",
+    "alive_live_idle",
 ];
 
 const SOURCE: &str = r#"-module(proc_sig_order).
@@ -48,6 +52,28 @@ run(monitor_then_message_to_parent) ->
     process_flag(scheduler, 1),
     Lost = [monitor_then_message() || _ <- lists:seq(1, 5000)],
     length([L || L <- Lost, L =/= ok]);
+run(alive_after_exit_signal) ->
+    %% is_process_alive/1 must order itself after an exit signal this process sent earlier
+    %% (erl_bif_info.c: a target with queued signals gets an 'is alive' request).
+    count_alive(3000, fun idle/0, 0);
+run(alive_after_exit_signal_running) ->
+    count_alive(1000, fun busy/0, 0);
+run(alive_sees_message_before_exit) ->
+    %% A message the inspected process sent before it exited is receivable once
+    %% is_process_alive/1 says false.
+    Self = self(),
+    Lost = [begin
+                P = spawn(fun() -> Self ! {m, I} end),
+                wait_dead(P),
+                receive {m, I} -> ok after 0 -> lost end
+            end || I <- lists:seq(1, 3000)],
+    length([L || L <- Lost, L =/= ok]);
+run(alive_live_idle) ->
+    P = spawn(fun idle/0),
+    R = [is_process_alive(P) || _ <- lists:seq(1, 1000)],
+    exit(P, kill),
+    wait_dead(P),
+    {lists:usort(R), is_process_alive(P), is_process_alive(self())};
 run(link_then_exit) ->
     Self = self(),
     P = spawn(fun() -> trapping_target(Self) end),
@@ -99,6 +125,30 @@ monitor_then_message() ->
     {monitored_by, Mons} = process_info(self(), monitored_by),
     P ! stop,
     case lists:member(P, Mons) of true -> ok; false -> lost end.
+
+count_alive(0, _, Acc) -> Acc;
+count_alive(N, Body, Acc) ->
+    case alive_after_kill(Body) of
+        false -> count_alive(N - 1, Body, Acc);
+        true -> count_alive(N - 1, Body, Acc + 1)
+    end.
+
+alive_after_kill(Body) ->
+    P = spawn(Body),
+    exit(P, kill),
+    case is_process_alive(P) of
+        Alive when is_boolean(Alive) -> Alive
+    end.
+
+idle() -> receive stop -> ok end.
+
+busy() -> busy().
+
+wait_dead(P) ->
+    case is_process_alive(P) of
+        true -> erlang:yield(), wait_dead(P);
+        false -> ok
+    end.
 
 wait_waiting(P) ->
     case process_info(P, status) of
@@ -238,7 +288,7 @@ fn process_signal_order_matches_erl() {
         assert_eq!(
             line,
             format!("{want:?}"),
-            "interpreter {MODULE}:run({case})"
+            "interpreter {MODULE}:run({case}) stdout={stdout}"
         );
     }
 }
