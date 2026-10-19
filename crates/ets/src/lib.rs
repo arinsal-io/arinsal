@@ -3059,6 +3059,39 @@ impl Table {
         self.lookup_hashed_into(key, ets_hash(key), dst, objects)
     }
 
+    /// Copy all objects at a key into the caller's heap as an ETS result list, consing each
+    /// copied object straight onto the list so no intermediate vector is built.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_get_hash) and erl_db_tree.c (db_get_tree),
+    // OTP-29.1.1: the bucket chain is walked in order and every match is consed in front of
+    // the result, which is the reversed chain order `lookup` returns.
+    pub fn lookup_list<H: HeapAlloc>(&self, key: Term, dst: &mut H) -> Result<Term, EtsError> {
+        match &self.storage {
+            Storage::Ordered(_) | Storage::CATree(_) => Ok(match self.lookup_one(key, dst)? {
+                Some(object) => TermBuilder::new(dst)
+                    .cons(object, Term::NIL)
+                    .map_err(EtsError::Term)?,
+                None => Term::NIL,
+            }),
+            Storage::Hash(storage) => {
+                let hash = ets_hash(key);
+                storage.with_objects_hash(hash, |objects| {
+                    let mut list = Term::NIL;
+                    for object in objects {
+                        if object.hvalue == (hash >> 1)
+                            && exact_eq(object.key(self.options.keypos), key)
+                        {
+                            let copied = object.copy_out(dst)?;
+                            list = TermBuilder::new(dst)
+                                .cons(copied, list)
+                                .map_err(EtsError::Term)?;
+                        }
+                    }
+                    Ok(list)
+                })
+            }
+        }
+    }
+
     /// Copy one matching object directly into the caller's heap.
     pub fn lookup_one<H: HeapAlloc>(
         &self,

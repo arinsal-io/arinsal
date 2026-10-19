@@ -247,3 +247,42 @@ fn reference() -> Option<&'static RefErl> {
 fn reference() -> Option<RefErl> {
     None
 }
+
+#[test]
+fn lookup_list_matches_lookup_order() {
+    for table_type in [
+        TableType::Set,
+        TableType::Bag,
+        TableType::DuplicateBag,
+        TableType::OrderedSet,
+    ] {
+        let mut registry = Registry::new();
+        let tid = registry
+            .create(options(table_type, WriteConcurrency::Disabled))
+            .unwrap();
+        let mut heap = VecHeap::new();
+        for (key, value) in [(1, 10), (1, 11), (1, 10), (2, 20), (3, 30), (1, 12)] {
+            let item = object(&mut heap, key, value);
+            registry.get_mut(tid).unwrap().insert(&[item]).unwrap();
+        }
+        for key in [1, 2, 4] {
+            let table = registry.get(tid).unwrap();
+            let mut out = VecHeap::new();
+            let expected = table.lookup(Term::small(key).unwrap(), &mut out).unwrap();
+            let expected: Vec<_> = expected.into_iter().map(|t| to_owned(t).unwrap()).collect();
+            let list = table
+                .lookup_list(Term::small(key).unwrap(), &mut out)
+                .unwrap();
+            let expected = if expected.is_empty() {
+                OwnedTerm::Nil
+            } else {
+                OwnedTerm::List {
+                    elems: expected,
+                    tail: Box::new(OwnedTerm::Nil),
+                }
+            };
+            let actual = to_owned(list).unwrap();
+            assert_eq!(actual, expected, "{table_type:?} key {key}");
+        }
+    }
+}
