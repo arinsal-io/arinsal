@@ -260,6 +260,11 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
             );
         }
     }
+    let passive = std::mem::take(&mut sock.inner.lock().unwrap().emit_passive);
+    if passive {
+        let owner = sock.handle().owner_pid();
+        emit(sock, Out::UdpPassive { owner });
+    }
     pump(sock);
     reply
 }
@@ -659,17 +664,27 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
 }
 
 fn set_active(inner: &mut Inner, val: i32, data: &[u8], i: &mut usize) -> bool {
+    // Port of inet_drv.c:6968 (inet_set_opts, INET_LOPT_ACTIVE), OTP-29.1.1.
     if val == 3 {
         if *i + 2 > data.len() {
             return false;
         }
         let n = i16::from_be_bytes([data[*i], data[*i + 1]]);
         *i += 2;
-        inner.active = if n <= 0 {
-            Active::Passive
-        } else {
-            Active::Multi(n)
+        let current = match inner.active {
+            Active::Multi(count) => count,
+            _ => 0,
         };
+        let sum = i32::from(current) + i32::from(n);
+        if sum > i32::from(i16::MAX) || sum < i32::from(i16::MIN) {
+            return false;
+        }
+        if sum <= 0 {
+            inner.active = Active::Passive;
+            inner.emit_passive = true;
+        } else {
+            inner.active = Active::Multi(sum as i16);
+        }
     } else {
         inner.active = match val {
             0 => Active::Passive,
@@ -1536,8 +1551,14 @@ fn encode_addr(storage: &libc::sockaddr_storage, len: libc::socklen_t) -> Option
 #[repr(C, align(8))]
 struct Aligned([u8; 256]);
 
+/// `CMSG_ALIGN`: Darwin aligns to 4 bytes, Linux to `sizeof(size_t)`.
 fn cmsg_align(len: usize) -> usize {
-    len.div_ceil(4) * 4
+    const ALIGN: usize = if cfg!(target_os = "macos") {
+        4
+    } else {
+        std::mem::size_of::<usize>()
+    };
+    len.div_ceil(ALIGN) * ALIGN
 }
 
 fn cmsg_space(len: usize) -> usize {
@@ -1902,6 +1923,8 @@ struct Recv {
 }
 
 struct Inner {
+    /// `{udp_passive, S}` is due after `setopts` (the `{active,N}` count reached zero).
+    emit_passive: bool,
     selection_owner: usize,
     fd: Option<UdpFd>,
     fd_external: Option<RawFd>,
@@ -1955,6 +1978,7 @@ impl Default for Inner {
             open: false,
             connected: false,
             binary: false,
+            emit_passive: false,
             active: Active::Passive,
             htype: 0,
             header: 0,
