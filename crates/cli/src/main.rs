@@ -81,9 +81,9 @@ fn erl_launch(args: &[String]) -> ! {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--root" => {
+            "--root" | "-root" => {
                 let Some(root) = args.get(index + 1) else {
-                    eprintln!("arinsal: --root needs a directory");
+                    eprintln!("arinsal: {} needs a directory", args[index]);
                     std::process::exit(2);
                 };
                 environment.insert("ERL_ROOTDIR".into(), root.clone());
