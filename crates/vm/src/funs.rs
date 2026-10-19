@@ -843,6 +843,36 @@ impl Vm {
             )
         {
             let result = match result {
+                Err(VmError::Trap(mut trap))
+                    if trap.class == arinsal_bifs::Class::Error
+                        && trap.top.is_none()
+                        && trap.trace.is_none()
+                        && !(module == "erlang" && function == "error") =>
+                {
+                    // Port of erts/emulator/beam/beam_common.c (save_stacktrace),
+                    // OTP-29.1.1: a failing BIF reached through apply owns the top frame too.
+                    let (module_atom, function_atom) = match atoms {
+                        Some(atoms) => atoms,
+                        None => (
+                            global_atoms().intern(module).map_err(|error| {
+                                VmError::Unsupported(format!("BIF module atom: {error:?}"))
+                            })?,
+                            global_atoms().intern(function).map_err(|error| {
+                                VmError::Unsupported(format!("BIF function atom: {error:?}"))
+                            })?,
+                        ),
+                    };
+                    trap.top = Some(crate::stacktrace::TopFrame::Bif {
+                        module: module_atom,
+                        function: function_atom,
+                        args: crate::stacktrace::BifArgs::from_terms(&p.x[..arity])?,
+                        info: crate::stacktrace::BifErrorInfo::Plain,
+                    });
+                    Err(VmError::Trap(trap))
+                }
+                result => result,
+            };
+            let result = match result {
                 Err(VmError::TrapExport(trap)) => {
                     return self.trap_to_export(p, trap, tail, Some(run));
                 }

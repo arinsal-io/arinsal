@@ -910,6 +910,7 @@ pub(crate) struct SpawnMonitor {
     pub id: Option<u64>,
     pub tag: Option<arinsal_etf::OwnedTerm>,
     pub alias: Option<crate::proc_create::AliasMode>,
+    pub priority: bool,
 }
 
 /// What `erl_create_process` returns: the child and the monitor it set up, if any.
@@ -1125,6 +1126,9 @@ pub(crate) fn erl_create_process(
                 alias_mode: monitor.alias,
             }),
         );
+        if monitor.priority {
+            parent.cold_mut().prio_monitors.insert(id);
+        }
         if monitor.alias.is_some() {
             rt.alias_bind(id, Some(parent_pid));
         }
@@ -1194,6 +1198,7 @@ fn spawn_mfa_with_priority(
                 id: None,
                 tag: monitor_tag,
                 alias: monitor_alias,
+                priority: false,
             }),
             min_heap: min_heap_size,
             min_bin_vheap: tuning.min_bin_vheap,
@@ -4001,7 +4006,7 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
     }
 }
 
-/// Options of `monitor/3`: `{tag, Tag}`, `{alias, Mode}` and `priority`.
+/// Options of `monitor/3` and nested spawn monitors: `{tag, Tag}`, `{alias, Mode}` and `priority`.
 // Port of erts/emulator/beam/bif.c (erts_monitor_opts), OTP-29.1.1.
 fn monitor_options(
     args: &[Term],
@@ -4011,25 +4016,51 @@ fn monitor_options(
     } else {
         Vec::new()
     };
+    parse_monitor_option_items(&options, "monitor/3")
+}
+
+/// Parse nested options using the same rules as `erts_monitor_opts`.
+// Port of erts/emulator/beam/bif.c (erts_monitor_opts), OTP-29.1.1.
+pub(crate) fn spawn_monitor_options(
+    options: Term,
+) -> Option<(
+    Option<arinsal_etf::OwnedTerm>,
+    Option<crate::proc_create::AliasMode>,
+    bool,
+)> {
+    let items = list(options)?;
+    let (tag, alias_mode, priority) = parse_monitor_option_items(&items, "spawn_request").ok()?;
+    let tag = if tag == atom("DOWN") {
+        None
+    } else {
+        Some(arinsal_term::to_owned(tag).ok()?)
+    };
+    Some((tag, alias_mode, priority))
+}
+
+fn parse_monitor_option_items(
+    options: &[Term],
+    caller: &str,
+) -> Result<(Term, Option<crate::proc_create::AliasMode>, bool), VmError> {
     let mut tag = atom("DOWN");
     let mut alias_mode = None;
     let mut priority = false;
-    for option in options {
+    for &option in options {
         if option == atom("priority") {
             priority = true;
             continue;
         }
         // SAFETY: Each option is rooted in the caller's heap.
-        let tuple = unsafe { option.tuple_ref() }.ok_or_else(|| badarg("monitor/3"))?;
+        let tuple = unsafe { option.tuple_ref() }.ok_or_else(|| badarg(caller))?;
         if tuple.len() != 2 {
-            return Err(badarg("monitor/3"));
+            return Err(badarg(caller));
         }
         match (tuple.get(0), tuple.get(1)) {
             (Some(key), Some(value)) if key == atom("tag") => tag = value,
             (Some(key), Some(value)) if key == atom("alias") => {
-                alias_mode = Some(parse_alias_mode(value).ok_or_else(|| badarg("monitor/3"))?);
+                alias_mode = Some(parse_alias_mode(value).ok_or_else(|| badarg(caller))?);
             }
-            _ => return Err(badarg("monitor/3")),
+            _ => return Err(badarg(caller)),
         }
     }
     Ok((tag, alias_mode, priority))
