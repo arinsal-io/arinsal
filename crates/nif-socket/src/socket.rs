@@ -803,12 +803,25 @@ fn to_sock_addr(value: &O) -> Option<SockAddr> {
 }
 fn from_sock_addr(value: &SockAddr) -> Option<O> {
     value.as_socket().map(from_addr).or_else(|| {
-        value.as_pathname().map(|path| {
-            map(&[
-                ("family", atom("local")),
-                ("path", O::Binary(path.as_os_str().as_bytes().to_vec())),
-            ])
-        })
+        if value.domain() != Domain::UNIX {
+            return None;
+        }
+        // Port of erts/emulator/nifs/common/socket_util.c (esock_encode_sockaddr_un),
+        // OTP-29.1.1: an unnamed local socket is encoded with an empty path; Linux abstract
+        // names retain their leading NUL byte in the returned path binary.
+        let path = value
+            .as_pathname()
+            .map(|path| path.as_os_str().as_bytes().to_vec())
+            .or_else(|| {
+                value.as_abstract_namespace().map(|name| {
+                    let mut path = Vec::with_capacity(name.len() + 1);
+                    path.push(0);
+                    path.extend_from_slice(name);
+                    path
+                })
+            })
+            .unwrap_or_default();
+        Some(map(&[("family", atom("local")), ("path", O::Binary(path))]))
     })
 }
 
