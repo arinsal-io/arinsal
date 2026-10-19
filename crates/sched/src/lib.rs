@@ -1738,6 +1738,39 @@ struct LocalStatsSnapshot {
 }
 
 impl<T: Task> Inner<T> {
+    /// Send the monitor this scheduler holds for `to` before another send to `to` goes out.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_send_pending via
+    // proc_queue_signal: the pending signal goes first when the next signal has the same
+    // receiver), OTP-29.1.1. Every send path must call it, message sends included.
+    fn publish_held_monitor_for(&self, to: Pid, mut local: Option<&mut Local<T>>) {
+        let Some(held) = take_held_monitor_for(to) else {
+            return;
+        };
+        let PendingProcMonitor {
+            from,
+            to,
+            id,
+            shared,
+        } = held;
+        let delivered = self.table.lookup(to).is_some_and(|process| {
+            self.deliver_process(
+                &process,
+                from,
+                Payload::Signal(Signal::Monitor {
+                    reference: id,
+                    shared,
+                }),
+                local.as_deref_mut(),
+                false,
+                false,
+            )
+            .is_ok()
+        });
+        if !delivered {
+            let _ = self.deliver(to, from, Payload::Signal(Signal::MonitorNoproc(id)), local);
+        }
+    }
+
     // Port of erts/emulator/beam/erl_process.c:6403 (schedule_dirty / enqueue on the
     // dirty run queue), OTP-29.1.1.
     fn enqueue_dirty(&self, process: Arc<Process<T>>, kind: DirtyKind) {
@@ -5512,6 +5545,7 @@ impl<T: Task> Scheduler<T> {
     }
     /// Queue a message from one logical sender.
     pub fn send(&self, from: Pid, to: Pid, msg: T::Message) -> Result<(), Error> {
+        self.inner.publish_held_monitor_for(to, None);
         self.inner.deliver(from, to, Payload::Message(msg), None)
     }
     /// [`Self::send`] for a sender running on one of this scheduler's normal threads: a woken
@@ -5539,6 +5573,7 @@ impl<T: Task> Scheduler<T> {
     }
     /// Queue a signal in the same ordered stream.
     pub fn signal(&self, from: Pid, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
+        self.inner.publish_held_monitor_for(to, None);
         self.inner.deliver(from, to, Payload::Signal(signal), None)
     }
     /// Consume the held process monitor for `reference` to `to` when it is still unsent, so a
@@ -7227,7 +7262,9 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
             let Some(message) = prepare(&mut cell.task) else {
                 return OnHeapSend::Declined;
             };
-            let local = process.bound_worker().is_none().then_some(&mut *local);
+            let mut local = process.bound_worker().is_none().then_some(&mut *local);
+            self.inner
+                .publish_held_monitor_for(to, local.as_deref_mut());
             match self
                 .inner
                 .deliver_live(process, from, Payload::Message(message), local)
@@ -7250,6 +7287,7 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         // erl_proc_sig_queue.h:2080 (erts_proc_notify_new_message -> erts_schedule_process),
         // OTP-29.1.1: the sender enqueues the woken receiver itself, on the run queue of the
         // scheduler it runs on when that is the receiver's run queue.
+        self.inner.publish_held_monitor_for(to, Some(&mut local));
         Ok(self
             .inner
             .deliver(from, to, Payload::Message(msg), Some(&mut local)))
