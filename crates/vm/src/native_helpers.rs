@@ -3954,7 +3954,7 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // `erlang:raise/3` already built the list the catch must see (`bif.c:1643`).
     // A native walk would name `eval_external_handler` instead of that list.
     let trace = if let Some(trace) = take_explicit_raise(process) {
-        let Ok(trace) = crate::stacktrace::save_explicit(process, class, trace) else {
+        let Ok(trace) = crate::stacktrace::save_explicit(process, class, trace, 8) else {
             process.sync_native_header();
             return 0;
         };

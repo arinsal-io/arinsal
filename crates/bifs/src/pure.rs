@@ -1739,7 +1739,7 @@ fn raise(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         Some("throw") => Class::Throw,
         _ => return Ok(invalid()),
     };
-    if list(args[2]).is_err() {
+    if !valid_raise_stacktrace(args[2]) {
         return Ok(invalid());
     }
     Err(BifError::Raise {
@@ -1747,6 +1747,32 @@ fn raise(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         reason: args[1],
         stacktrace: Some(args[2]),
     })
+}
+
+// Port of erts/emulator/beam/bif.c (raise_3 stacktrace validation), OTP-29.1.1.
+fn valid_raise_stacktrace(stacktrace: Term) -> bool {
+    for_each_cons(stacktrace, |frame| {
+        let Some(fields) = tuple_terms(frame) else {
+            return Err(BADARG);
+        };
+        let valid_location =
+            |location: Term| matches!(location.classify(), TermKind::List | TermKind::Nil);
+        let valid = match fields.as_slice() {
+            [fun, _args] if fun.classify() == TermKind::Fun => true,
+            [fun, _args, location] if fun.classify() == TermKind::Fun => valid_location(*location),
+            [module, function, _arity_or_args] => {
+                module.classify() == TermKind::Atom && function.classify() == TermKind::Atom
+            }
+            [module, function, _arity_or_args, location] => {
+                module.classify() == TermKind::Atom
+                    && function.classify() == TermKind::Atom
+                    && valid_location(*location)
+            }
+            _ => false,
+        };
+        if valid { Ok(()) } else { Err(BADARG) }
+    })
+    .is_ok()
 }
 
 fn numeric_float(term: Term) -> Result<f64, BifError> {
