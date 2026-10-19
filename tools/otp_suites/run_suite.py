@@ -61,10 +61,14 @@ def build_native(name: str, source_dir: pathlib.Path) -> None:
     # use the system strerror() instead of port_test.c's legacy fallback.
     defs = "-DHAVE_ISFINITE -DHAVE_UNISTD_H -DHAVE_STRERROR" if name in {"port", "port_bif"} else "-DHAVE_ISFINITE -DHAVE_UNISTD_H"
     erts_internal = next(root.glob("erts-*/include/internal"), root / "usr/include/internal")
+    # macOS needs -bundle/-undefined dynamic_lookup; GNU ld builds a plain shared object.
+    darwin = sys.platform == "darwin"
+    cc = "clang" if darwin else "cc"
+    shlib_ldflags = "-bundle -undefined dynamic_lookup" if darwin else "-shared"
     values = {
-        "CC": "clang", "LD": "clang", "SHLIB_LD": "clang",
+        "CC": cc, "LD": cc, "SHLIB_LD": cc,
         "CFLAGS": "-O2 -fPIC", "SHLIB_CFLAGS": "-O2 -fPIC",
-        "CROSSLDFLAGS": "", "SHLIB_LDFLAGS": "-bundle -undefined dynamic_lookup",
+        "CROSSLDFLAGS": "", "SHLIB_LDFLAGS": shlib_ldflags,
         "SHLIB_LDLIBS": "", "SHLIB_EXTRA_LDFLAGS": "", "SHLIB_EXTRA_LDLIBS": "",
         "DEFS": defs, "LIBS": "", "EI_CFLAGS": f"-I{ei}" if ei else "",
         "EI_LDFLAGS": f"-L{ei_lib}" if ei_lib else "",
@@ -79,7 +83,7 @@ def build_native(name: str, source_dir: pathlib.Path) -> None:
         "WSL": "",
         "dll": ".so", "obj": ".o", "exe": "", "EMULATOR": "beam",
         "erl_name": "erl",
-        "SHLIB_RULES": ".SUFFIXES: .so .o .c\n.c.so:\n\tclang -bundle -undefined dynamic_lookup -fPIC " + defs + " -DUSE_THREADS -D_THREAD_SAFE -D_REENTRANT -DPOSIX_THREADS -I" + str(erts_internal) + " -I" + str(root / "usr/include") + (" -I" + str(ei) if ei else "") + (" -L" + str(ei_lib) + " -lei" if ei_lib and name == "binary" else "") + " -o $@ $<",
+        "SHLIB_RULES": ".SUFFIXES: .so .o .c\n.c.so:\n\t" + cc + " " + shlib_ldflags + " -fPIC " + defs + " -DUSE_THREADS -D_THREAD_SAFE -D_REENTRANT -DPOSIX_THREADS -I" + str(erts_internal) + " -I" + str(root / "usr/include") + (" -I" + str(ei) if ei else "") + (" -L" + str(ei_lib) + " -lei" if ei_lib and name == "binary" else "") + " -o $@ $<",
     }
     makefile = source.read_text(encoding="utf-8")
     for key, value in values.items():
