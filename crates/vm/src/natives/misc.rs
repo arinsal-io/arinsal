@@ -255,6 +255,11 @@ pub(crate) fn profile_scheduler_event(
 
 /// Emit a port queue transition from the port task's runnable boundary.
 // Port of erts/emulator/beam/erl_trace.c:2330 (profile_runnable_port), OTP-29.1.1.
+/// Whether `profile(runnable_ports)` is on (hot paths test it before building an event).
+pub(crate) fn profile_ports_enabled() -> bool {
+    PROFILE_FLAGS.load(Ordering::Relaxed) & PROFILE_RUNNABLE_PORTS != 0
+}
+
 pub(crate) fn profile_port_event(
     scheduler: &arinsal_sched::Scheduler<Process>,
     sender: arinsal_sched::Pid,

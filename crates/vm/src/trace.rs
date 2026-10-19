@@ -660,6 +660,12 @@ pub(crate) fn active() -> bool {
     enabled().load(Ordering::Relaxed)
 }
 
+/// Whether any trace has been enabled (`erts_system_profile_flags`/trace state is cheap to
+/// test; hot paths check this before they build trace terms).
+pub(crate) fn tracing_enabled() -> bool {
+    enabled().load(Ordering::Relaxed)
+}
+
 fn enabled() -> &'static AtomicBool {
     static ENABLED: AtomicBool = AtomicBool::new(false);
     &ENABLED
