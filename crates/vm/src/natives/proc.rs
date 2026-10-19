@@ -5001,6 +5001,7 @@ fn matched_functions(vm: &Vm, module: &str, function: &str, arity: Option<u8>) -
 fn function_exists(vm: &Vm, module: &str, function: &str, arity: u8) -> bool {
     matched_functions(vm, module, function, Some(arity)) > 0
         || arinsal_bifs::lookup(module, function, arity).is_some()
+        || arinsal_spec::bif_lookup(module, function, arity).is_some()
 }
 
 fn trace_mfa(spec: Term) -> Option<(String, String, u8)> {
@@ -5512,32 +5513,60 @@ pub(crate) fn bp_functions(
     function: &str,
     arity: Option<u8>,
 ) -> Vec<crate::trace_bp::BpFunction> {
-    vm.code
-        .modules
-        .iter()
-        .enumerate()
-        .filter(|(id, loaded)| {
-            (module == "_" || loaded.name == module) && vm.code.loaded.get(&loaded.name) == Some(id)
-        })
-        .flat_map(|(_, loaded)| {
-            loaded
-                .functions
-                .iter()
-                .filter(|(_, name, n)| {
-                    (function == "_" || *name == function) && arity.is_none_or(|a| a == *n)
-                })
-                .map(|(entry, name, n)| crate::trace_bp::BpFunction {
-                    module: loaded.name.clone(),
-                    function: name.clone(),
-                    arity: *n,
-                    entry: entry + 1,
-                    exported: loaded
-                        .exports
-                        .iter()
-                        .any(|export| export.function == *name && export.arity == *n),
-                })
-        })
-        .collect()
+    let mut functions = Vec::new();
+    let mut positions = std::collections::HashMap::new();
+    for (id, loaded) in vm.code.modules.iter().enumerate() {
+        if (module != "_" && loaded.name != module) || vm.code.loaded.get(&loaded.name) != Some(&id)
+        {
+            continue;
+        }
+        for (entry, name, function_arity) in &loaded.functions {
+            if (function != "_" && name != function)
+                || arity.is_some_and(|requested| requested != *function_arity)
+            {
+                continue;
+            }
+            let key = (loaded.name.clone(), name.clone(), *function_arity);
+            let index = functions.len();
+            positions.insert(key, index);
+            functions.push(crate::trace_bp::BpFunction {
+                module: loaded.name.clone(),
+                function: name.clone(),
+                arity: *function_arity,
+                entry: entry + 1,
+                exported: loaded
+                    .exports
+                    .iter()
+                    .any(|export| export.function == *name && export.arity == *function_arity),
+            });
+        }
+    }
+
+    // Port of erts/emulator/beam/beam_bp.c (erts_bp_match_export), OTP-29.1.1:
+    // the active export table includes BIF exports even when their defining BEAM module is
+    // not loaded. Keep a loaded function entry when both tables name the same MFA.
+    for bif in arinsal_spec::BIFS.iter().filter(|bif| {
+        (module == "_" || bif.module == module)
+            && (function == "_" || bif.name == function)
+            && arity.is_none_or(|requested| requested == bif.arity)
+    }) {
+        let key = (bif.module.to_owned(), bif.name.to_owned(), bif.arity);
+        if let Some(&index) = positions.get(&key) {
+            functions[index].exported = true;
+        } else {
+            positions.insert(key, functions.len());
+            functions.push(crate::trace_bp::BpFunction {
+                module: bif.module.to_owned(),
+                function: bif.name.to_owned(),
+                arity: bif.arity,
+                // BIF exports have no interpreted code entry to patch.
+                entry: 0,
+                exported: true,
+            });
+        }
+    }
+
+    functions
 }
 
 fn live_pids(process: &Process) -> Result<Vec<Pid>, VmError> {

@@ -1244,6 +1244,9 @@ impl Vm {
         // every loaded function to recover the same MFA.
         let mut by_module: HashMap<usize, Vec<(usize, String, u8)>> = HashMap::new();
         for function in functions {
+            if function.entry == 0 {
+                continue;
+            }
             let Some(&module_id) = self.code.loaded.get(&function.module) else {
                 continue;
             };
