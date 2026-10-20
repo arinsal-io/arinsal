@@ -269,7 +269,7 @@ fn note_caller_pid(process: &Process, pid: Pid) {
     let key = std::ptr::from_ref(&process.heap) as usize;
     let target = Target {
         pid,
-        scheduler: Arc::downgrade(&scheduler),
+        scheduler: Arc::downgrade(scheduler),
     };
     registry().lock().unwrap().insert(key, target.clone());
     CURRENT.with(|slot| *slot.borrow_mut() = Some((key, target)));

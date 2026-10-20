@@ -990,14 +990,7 @@ pub(crate) fn emit_port_event(
     let Ok(scheduler) = runtime.scheduler() else {
         return;
     };
-    emit_port_event_scoped(
-        scope_runtime(runtime),
-        &scheduler,
-        port,
-        class,
-        name,
-        fields,
-    );
+    emit_port_event_scoped(scope_runtime(runtime), scheduler, port, class, name, fields);
 }
 
 pub(crate) fn emit_port_event_scoped(

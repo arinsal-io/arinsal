@@ -2008,22 +2008,23 @@ pub(crate) fn native_send3(
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    let options = owned(args[2])?;
-    let names = match &options {
-        OwnedTerm::Nil => Vec::new(),
-        OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.iter().collect(),
-        _ => return Err(badarg()),
-    };
     let mut want_priority = false;
     let mut noconnect = false;
     let mut nosuspend = false;
-    for option in &names {
-        match option {
-            OwnedTerm::Atom(name) if name == "nosuspend" => nosuspend = true,
-            OwnedTerm::Atom(name) if name == "noconnect" => noconnect = true,
-            OwnedTerm::Atom(name) if name == "priority" => want_priority = true,
-            _ => return Err(badarg()),
+    let mut bad = false;
+    // Port of erts/emulator/beam/bif.c (erlang:send/3 option loop): the list is walked in
+    // place, no copy of the options.
+    let walked = crate::signals::each_list_item(args[2], |option| {
+        let atoms = arinsal_term::global_atoms();
+        match option.as_atom().and_then(|a| atoms.text(a)) {
+            Some("nosuspend") => nosuspend = true,
+            Some("noconnect") => noconnect = true,
+            Some("priority") => want_priority = true,
+            _ => bad = true,
         }
+    });
+    if walked.is_none() || bad {
+        return Err(badarg());
     }
     if is_remote_target(args[0])? {
         return match try_remote_send_with_options(
@@ -2447,6 +2448,11 @@ fn control(op: i64, mut fields: Vec<OwnedTerm>) -> OwnedTerm {
 /// Whether `target` names a process, alias or registered name on another node, which only a
 /// send with a scheduler context (the distribution output path) can reach.
 pub(crate) fn is_remote_target(target: Term) -> Result<bool, VmError> {
+    // Port of erts/emulator/beam/bif.c:2469-2480 (do_send): internal pids and atoms skip the
+    // remote-destination checks.
+    if target.as_pid_data().is_some() || target.as_atom().is_some() {
+        return Ok(false);
+    }
     let local = node_tables::lock().local_name.clone();
     let remote = |node: &str| node != local && node != "nonode@nohost";
     if let Some((_, node)) = name_node_tuple(target)? {
