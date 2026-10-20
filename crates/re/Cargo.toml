@@ -21,4 +21,3 @@ cc = "1.2.38"
 
 [dev-dependencies]
 arinsal-difftest.workspace = true
-similar-asserts = "2"

@@ -2,6 +2,7 @@
 
 mod block_cache;
 mod catree;
+mod dbterm;
 mod hash;
 mod hash_select;
 pub mod match_spec;
@@ -12,6 +13,7 @@ pub mod rwmtx;
 mod tree;
 mod tree_select;
 use catree::CATree;
+pub(crate) use dbterm::{DbTerm, StoredTerm};
 use tree::{InsertResult, Node};
 pub use tree_select::{SavedKey, ScanPosition, TREE_SELECT_ITERATIONS, TreeScanEnd, TreeScanPlan};
 
@@ -882,30 +884,10 @@ fn cmp_ordered_key(left: Term, right: Term) -> Ordering {
     }
 }
 
-struct Compressed {
-    elements: Vec<Option<Vec<u8>>>,
-    magic_refs: Vec<Option<Arc<MagicRef>>>,
-    bytes: usize,
-}
-
-#[repr(C)]
-pub(crate) struct StoredTerm {
-    // First, so a tree descent reads the key through the node's first cache line.
-    pub(crate) term: Term,
-    // Each object owns its heap. Moving this struct never moves the allocated words.
-    heap: ObjectHeap,
-    // ETS compressed tables retain only ETF bytes for non-key boxed elements.
-    // The tuple heap contains NIL sentinels in those positions and never keeps
-    // the original boxed values alive.
-    // Absent in uncompressed tables, keeping the common object small to move.
-    compressed: Option<Box<Compressed>>,
-    pub(crate) db_size_words: usize,
-    term_size_words: usize,
-    /// The stored block can be copied out word by word (`copy_shallow`).
-    shallow: bool,
-    order: u64,
-    group_order: u64,
-    hvalue: u64,
+pub(crate) struct Compressed {
+    pub(crate) elements: Vec<Option<Vec<u8>>>,
+    pub(crate) magic_refs: Vec<Option<Arc<MagicRef>>>,
+    pub(crate) bytes: usize,
 }
 
 // `copy_term` asks for one allocation after computing `size_object`. An exact
@@ -927,13 +909,13 @@ impl Drop for ObjectHeap {
 }
 
 #[derive(Default)]
-struct OffHeap {
+pub(crate) struct OffHeap {
     // Per-object DbTerm.first_oh; dropping its tokens ports db_free_term cleanup.
-    first_oh: usize,
-    binary_refs: Vec<arinsal_term::OwnedBinaryRef>,
-    external: Vec<Arc<ExternalBinary>>,
-    nodes: Vec<Arc<TermNode>>,
-    magic: Vec<Arc<MagicRef>>,
+    pub(crate) first_oh: usize,
+    pub(crate) binary_refs: Vec<arinsal_term::OwnedBinaryRef>,
+    pub(crate) external: Vec<Arc<ExternalBinary>>,
+    pub(crate) nodes: Vec<Arc<TermNode>>,
+    pub(crate) magic: Vec<Arc<MagicRef>>,
 }
 
 impl ObjectHeap {
@@ -942,15 +924,6 @@ impl ObjectHeap {
             words: smallvec::SmallVec::new(),
             off_heap: None,
         }
-    }
-
-    /// The one block holding the object, when `term` is a copyable term at its start and the
-    /// block has no off-heap owner to link.
-    fn shallow_block(&self, term: Term, size: usize) -> bool {
-        self.off_heap.is_none()
-            && self.words.len() == 1
-            && self.words[0].len() == size
-            && arinsal_term::shallow_copyable(term, &self.words[0])
     }
 
     fn off_heap(&mut self) -> &mut OffHeap {
@@ -978,10 +951,6 @@ impl ObjectHeap {
         self.words[allocation_index][word_index + 2] = first_oh as u64;
         self.off_heap().first_oh = address;
         Ok(())
-    }
-
-    fn magic_owner(&self, term: Term) -> Option<Arc<MagicRef>> {
-        term.magic_owner()
     }
 }
 
@@ -1060,7 +1029,7 @@ impl StoredTerm {
         pair.iter().all(|term| !term.is_pointer()).then_some(pair)
     }
 
-    fn copy(term: Term) -> Result<Self, EtsError> {
+    fn copy(term: Term) -> Result<DbTerm, EtsError> {
         Self::copy_heap(term)
     }
 
@@ -1069,65 +1038,83 @@ impl StoredTerm {
         compressed: bool,
         keypos: usize,
         prefix_words: usize,
-    ) -> Result<Self, EtsError> {
+    ) -> Result<DbTerm, EtsError> {
         // Port of erts/emulator/beam/erl_db_util.c (db_store_term), OTP-29.1.1:
         // even immediate two-element objects have a table-owned tuple in their DbTerm.
         Self::copy_heap_for_table(term, compressed, keypos, prefix_words)
     }
 
+    // Port of erts/emulator/beam/erl_db_util.c (db_store_term), OTP-29.1.1: the term is sized,
+    // one block holds the DbTerm header and the words, and the term is copied into the block.
     fn copy_heap_for_table(
         term: Term,
         compressed: bool,
         keypos: usize,
         prefix_words: usize,
-    ) -> Result<Self, EtsError> {
+    ) -> Result<DbTerm, EtsError> {
         let object = term;
-        // Port of erts/emulator/beam/erl_db_util.c (db_store_term, a tuple of immediates): the
-        // block is exactly the tuple, so it is neither sized nor scanned.
         if !compressed {
-            let mut heap = ObjectHeap::new();
-            if let Some(copied) = arinsal_term::copy_flat_tuple(term, &mut heap) {
-                let copied = copied?;
-                let size = heap.words[0].len();
-                return Ok(Self {
-                    heap,
-                    term: copied,
-                    compressed: None,
-                    db_size_words: prefix_words + 2 + size,
-                    term_size_words: size,
-                    shallow: true,
-                    order: 0,
-                    group_order: 0,
-                    hvalue: 0,
-                });
+            // Port of erts/emulator/beam/erl_db_util.c (db_store_term, a tuple of immediates):
+            // the block is exactly the tuple, so it is neither sized nor scanned.
+            // SAFETY: the caller holds the source heap live for this call.
+            let flat = unsafe { term.tuple_ref() }
+                .filter(|tuple| !tuple.is_empty() && tuple.iter().all(|e| !e.is_pointer()))
+                .map(|tuple| tuple.len() + 1);
+            if let Some(size) = flat {
+                let mut block = dbterm::build_block(size, |heap| {
+                    arinsal_term::copy_flat_tuple(term, heap)
+                        .unwrap_or(Err(TermError::BadArg))
+                        .map_err(EtsError::from)
+                })?;
+                block.db_size_words = prefix_words + 2 + size;
+                block.term_size_words = size;
+                block.shallow = true;
+                return Ok(block);
             }
+            // The object is sized once; the same size serves the accounting and the copy.
+            let size = arinsal_term::size_object(term);
+            let mut block = dbterm::build_block(size, |heap| {
+                arinsal_term::copy_struct(term, heap, size).map_err(EtsError::from)
+            })?;
+            block.db_size_words = prefix_words + 2 + size;
+            block.term_size_words = size;
+            block.shallow = block.off_heap.is_none()
+                && arinsal_term::shallow_copyable(block.term, &block.words);
+            return Ok(block);
         }
-        // The object is sized once; the same size serves the accounting and the copy.
-        let plain_size = (!compressed).then(|| arinsal_term::size_object(term));
-        let db_size_words = match plain_size {
-            Some(size) => prefix_words + 2 + size,
-            None => Self::accounted_words(term, keypos, compressed, prefix_words, 0),
+        // Port of erts/emulator/beam/erl_db_util.c (copy_to_comp), OTP-29.1.1.
+        let tuple = term_sequence(term).ok_or(EtsError::BadArg)?;
+        let eligible = |index: usize, element: Term| {
+            index != keypos - 1 && element.is_pointer() && element.classify() != TermKind::Bitstring
         };
-        let mut heap = ObjectHeap::new();
+        // The block holds the stored tuple and the copies of the uncompressed elements; a magic
+        // reference is copied once more for the owner link, as the heap accounting always did.
+        let nwords = 1
+            + tuple.len()
+            + tuple
+                .iter()
+                .enumerate()
+                .map(|(index, &element)| {
+                    if !eligible(index, element) || element.is_magic_ref() {
+                        arinsal_term::size_object(element)
+                    } else {
+                        0
+                    }
+                })
+                .sum::<usize>();
         let mut compressed_elements = Vec::new();
         let mut compressed_magic_refs = Vec::new();
         let mut compressed_bytes = 0;
-        let term = if compressed {
-            // Port of erts/emulator/beam/erl_db_util.c (copy_to_comp), OTP-29.1.1.
-            // SAFETY: insertion keeps the source tuple heap live while copying it.
-            let tuple = term_sequence(term).ok_or(EtsError::BadArg)?;
+        let mut block = dbterm::build_block(nwords, |heap| {
             let mut elements = Vec::with_capacity(tuple.len());
-            for (index, element) in tuple.into_iter().enumerate() {
-                if index != keypos - 1
-                    && element.is_pointer()
-                    && element.classify() != TermKind::Bitstring
-                {
+            for (index, &element) in tuple.iter().enumerate() {
+                if eligible(index, element) {
                     if element.is_magic_ref() {
                         // Compressed bytes carry the reference identity, while ETS must retain
                         // its magic owner until the stored row is deleted.
-                        copy_term(element, &mut heap)?;
+                        copy_term(element, heap)?;
                     }
-                    compressed_magic_refs.push(heap.magic_owner(element));
+                    compressed_magic_refs.push(element.magic_owner());
                     let owned = arinsal_term::to_owned(element)?;
                     let ext = arinsal_etf::encode(&owned, arinsal_etf::EncodeOptions::default());
                     let mut ext = ets_external_atoms(&ext, true)?;
@@ -1141,47 +1128,33 @@ impl StoredTerm {
                     // OTP-29.1.1: ETS external encoding keeps binary refs on
                     // the object's off-heap chain.
                     compressed_elements.push(None);
-                    elements.push(copy_term(element, &mut heap)?);
+                    elements.push(copy_term(element, heap)?);
                 }
             }
-            TermBuilder::new(&mut heap).tuple(&elements)?
-        } else if let Some(pair) = Self::immediate_pair(term) {
-            TermBuilder::new(&mut heap).tuple(&pair)?
-        } else {
-            arinsal_term::copy_struct(term, &mut heap, plain_size.unwrap_or_default())?
-        };
+            Ok(TermBuilder::new(heap).tuple(&elements)?)
+        })?;
         // A compressed object stores a placeholder tuple; its copy size is that of the stored
         // term, not of the uncompressed source.
-        let term_size_words = plain_size.unwrap_or_else(|| arinsal_term::size_object(term));
-        let shallow = heap.shallow_block(term, term_size_words);
-        Ok(Self {
-            heap,
-            term,
-            compressed: compressed.then(|| {
-                Box::new(Compressed {
-                    elements: compressed_elements,
-                    magic_refs: compressed_magic_refs,
-                    bytes: compressed_bytes,
-                })
-            }),
-            db_size_words: if compressed {
-                Self::accounted_words(object, keypos, true, prefix_words, compressed_bytes)
-            } else {
-                db_size_words
-            },
-            term_size_words,
-            shallow,
-            order: 0,
-            group_order: 0,
-            hvalue: 0,
-        })
+        let term_size_words = arinsal_term::size_object(block.term);
+        block.shallow = block.off_heap.is_none()
+            && nwords == term_size_words
+            && arinsal_term::shallow_copyable(block.term, &block.words);
+        block.term_size_words = term_size_words;
+        block.db_size_words =
+            Self::accounted_words(object, keypos, true, prefix_words, compressed_bytes);
+        block.compressed = Some(Box::new(Compressed {
+            elements: compressed_elements,
+            magic_refs: compressed_magic_refs,
+            bytes: compressed_bytes,
+        }));
+        Ok(block)
     }
 
-    fn copy_heap(term: Term) -> Result<Self, EtsError> {
+    fn copy_heap(term: Term) -> Result<DbTerm, EtsError> {
         Self::copy_heap_for_table(term, false, 1, 1)
     }
 
-    pub(crate) fn copy_stored(&self) -> Result<Self, EtsError> {
+    pub(crate) fn copy_stored(&self) -> Result<DbTerm, EtsError> {
         if self.compressed_elements().iter().any(Option::is_some) {
             let mut copy = Self::copy_heap(self.term)?;
             copy.compressed = self.compressed.as_ref().map(|c| {
@@ -1194,20 +1167,18 @@ impl StoredTerm {
             copy.db_size_words = self.db_size_words;
             return Ok(copy);
         }
-        let mut heap = ObjectHeap::new();
-        let term = arinsal_term::copy_struct(self.term, &mut heap, self.term_size_words)?;
-        let shallow = heap.shallow_block(term, self.term_size_words);
-        Ok(Self {
-            heap,
-            term,
-            compressed: None,
-            db_size_words: self.db_size_words,
-            term_size_words: self.term_size_words,
-            shallow,
-            order: self.order,
-            group_order: self.group_order,
-            hvalue: self.hvalue,
-        })
+        let size = self.term_size_words;
+        let mut copy = dbterm::build_block(size, |heap| {
+            arinsal_term::copy_struct(self.term, heap, size).map_err(EtsError::from)
+        })?;
+        copy.shallow =
+            copy.off_heap.is_none() && arinsal_term::shallow_copyable(copy.term, &copy.words);
+        copy.db_size_words = self.db_size_words;
+        copy.term_size_words = size;
+        copy.order = self.order;
+        copy.group_order = self.group_order;
+        copy.hvalue = self.hvalue;
+        Ok(copy)
     }
 
     pub(crate) fn exact_eq_input(&self, other: Term) -> bool {
@@ -1251,15 +1222,13 @@ impl StoredTerm {
         if !self.compressed_elements().is_empty() || !self.term.is_pointer() {
             return false;
         }
-        // The tuple lives in one of this object's own allocations: find its words by address.
+        // The tuple lives in this object's own block: find its word by address.
         let header = (self.term.tagged_word() & !7) as usize;
         let word = header + (index + 1) * 8;
-        for allocation in &mut self.heap.words {
-            let start = allocation.as_ptr() as usize;
-            if (start..start + allocation.len() * 8).contains(&word) {
-                allocation[(word - start) / 8] = value.tagged_word();
-                return true;
-            }
+        let start = self.words.as_ptr() as usize;
+        if (start..start + self.words.len() * 8).contains(&word) {
+            self.words[(word - start) / 8] = value.tagged_word();
+            return true;
         }
         false
     }
@@ -1378,15 +1347,10 @@ impl StoredTerm {
     }
 
     fn copy_out<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
-        let _keep_live = &self.heap;
         if self.shallow && !self.compressed_elements().iter().any(Option::is_some) {
             // Port of erts/emulator/beam/erl_db_util.h (db_copy_object_from_ets): the stored
             // block is copied word by word with the pointers offset.
-            return Ok(arinsal_term::copy_shallow(
-                self.term,
-                &self.heap.words[0],
-                dst,
-            )?);
+            return Ok(arinsal_term::copy_shallow(self.term, &self.words, dst)?);
         }
         if !self.compressed_elements().iter().any(Option::is_some) {
             // Port of erts/emulator/beam/erl_db_util.h:425 (db_copy_object_from_ets):
@@ -1452,7 +1416,7 @@ impl StoredTerm {
     pub(crate) fn refc_binaries<H: HeapAlloc>(&self, dst: &mut H) -> Result<Vec<Term>, EtsError> {
         // Port of erts/emulator/beam/erl_bif_info.c (`erts_bld_bin_list`),
         // OTP-29.1.1: report each BinRef from this DbTerm's first_oh chain.
-        let Some(off_heap) = self.heap.off_heap.as_ref() else {
+        let Some(off_heap) = self.off_heap.as_ref() else {
             return Ok(Vec::new());
         };
         let mut terms = Vec::with_capacity(off_heap.binary_refs.len());
@@ -1484,7 +1448,7 @@ impl StoredTerm {
                 self.term,
                 Some(match_spec::KnownObject {
                     size: self.term_size_words,
-                    block: self.shallow.then(|| &self.heap.words[0][..]),
+                    block: self.shallow.then(|| &self.words[..]),
                 }),
             ));
         }
@@ -1562,7 +1526,7 @@ fn global_true() -> Atom {
 mod _obsolete_ordered_treap {
     use super::*;
     struct Node {
-        object: StoredTerm,
+        object: DbTerm,
         priority: u64,
         size: usize,
         left: Option<Box<Node>>,
@@ -1570,7 +1534,7 @@ mod _obsolete_ordered_treap {
     }
 
     impl Node {
-        fn new(object: StoredTerm, keypos: usize) -> Box<Self> {
+        fn new(object: DbTerm, keypos: usize) -> Box<Self> {
             let priority = internal_hash(object.key(keypos));
             Box::new(Self {
                 object,
@@ -1607,7 +1571,7 @@ mod _obsolete_ordered_treap {
             new_root
         }
 
-        fn insert(root: Option<Box<Self>>, object: StoredTerm, keypos: usize) -> Box<Self> {
+        fn insert(root: Option<Box<Self>>, object: DbTerm, keypos: usize) -> Box<Self> {
             let Some(mut root) = root else {
                 return Self::new(object, keypos);
             };
@@ -1692,7 +1656,7 @@ mod _obsolete_ordered_treap {
             }
         }
 
-        fn walk<'a>(root: &'a Option<Box<Self>>, out: &mut Vec<&'a StoredTerm>) {
+        fn walk<'a>(root: &'a Option<Box<Self>>, out: &mut Vec<&'a DbTerm>) {
             if let Some(node) = root {
                 Self::walk(&node.left, out);
                 out.push(&node.object);
@@ -1786,12 +1750,12 @@ mod _obsolete_hashmap_store {
     use super::*;
     struct HashStorage {
         // The hash is for distribution only. Exact key equality resolves collisions.
-        buckets: HashMap<u64, Vec<StoredTerm>, BuildHasherDefault<PrehashedU64>>,
+        buckets: HashMap<u64, Vec<DbTerm>, BuildHasherDefault<PrehashedU64>>,
         next_order: u64,
         size: usize,
         size_bias: isize,
         nactive: usize,
-        deleted: Vec<StoredTerm>,
+        deleted: Vec<DbTerm>,
     }
 
     impl HashStorage {
@@ -1837,11 +1801,11 @@ mod _obsolete_hashmap_store {
             });
         }
 
-        fn objects(&self, key: Term) -> &[StoredTerm] {
+        fn objects(&self, key: Term) -> &[DbTerm] {
             self.objects_hash(internal_hash(key))
         }
 
-        fn objects_hash(&self, hash: u64) -> &[StoredTerm] {
+        fn objects_hash(&self, hash: u64) -> &[DbTerm] {
             self.buckets.get(&hash).map(Vec::as_slice).unwrap_or(&[])
         }
 
@@ -1950,7 +1914,7 @@ enum Storage {
 
 /// An object already copied into table-owned storage, ready for `Table::insert_prepared`.
 pub struct PreparedObject {
-    stored: StoredTerm,
+    stored: DbTerm,
     hash: u64,
 }
 
@@ -1964,10 +1928,10 @@ pub struct Table {
     pub options: TableOptions,
     storage: Storage,
     fixed: usize,
-    fixed_system_time: Option<StoredTerm>,
-    fixed_monotonic_time: Option<StoredTerm>,
-    fixed_processes: Vec<(StoredTerm, usize)>,
-    _heir_data: Option<StoredTerm>,
+    fixed_system_time: Option<DbTerm>,
+    fixed_monotonic_time: Option<DbTerm>,
+    fixed_processes: Vec<(DbTerm, usize)>,
+    _heir_data: Option<DbTerm>,
     counter_results: Option<Box<VecHeap>>,
     /// Set once the registry has detached the table (`ets:delete/1`); cached handles to it
     /// must then fail like a deleted table.
@@ -2775,16 +2739,16 @@ impl Table {
         Ok(())
     }
 
-    fn put(&mut self, object: StoredTerm) {
+    fn put(&mut self, object: DbTerm) {
         let hash = ets_hash(object.key(self.options.keypos));
         self.put_hashed(object, hash, false);
     }
 
-    fn put_hashed(&mut self, object: StoredTerm, hash: u64, new_only: bool) {
+    fn put_hashed(&mut self, object: DbTerm, hash: u64, new_only: bool) {
         let _ = self.put_hashed_counted(object, hash, new_only);
     }
 
-    fn put_hashed_counted(&mut self, object: StoredTerm, hash: u64, new_only: bool) -> usize {
+    fn put_hashed_counted(&mut self, object: DbTerm, hash: u64, new_only: bool) -> usize {
         let keypos = self.options.keypos;
         match &mut self.storage {
             Storage::Ordered(root) => {
@@ -3060,7 +3024,7 @@ impl Table {
                         if node.hvalue == (hash >> 1)
                             && exact_eq(node.key(self.options.keypos), key)
                         {
-                            visit(&node.object)?;
+                            visit(node)?;
                             count += 1;
                         }
                     }
@@ -3097,7 +3061,7 @@ impl Table {
                     if let Some(node) = objects.into_iter().find(|node| {
                         node.hvalue == (hash >> 1) && exact_eq(node.key(self.options.keypos), key)
                     }) {
-                        visit(&node.object)?;
+                        visit(node)?;
                         found = true;
                     }
                     Ok::<_, EtsError>(())
@@ -4912,7 +4876,7 @@ impl Table {
             let mut heap = VecHeap::new();
             let current = object.copy_out(&mut heap)?;
             let Some(replacement) = program.run(current, &mut heap)? else {
-                return Ok::<Option<StoredTerm>, EtsError>(None);
+                return Ok::<Option<DbTerm>, EtsError>(None);
             };
             let replacement = StoredTerm::copy_for_table(replacement, compressed, keypos, 2)?;
             Ok(Some(replacement))
@@ -5607,7 +5571,7 @@ pub struct ConcurrentTable {
     multi_epoch: AtomicU64,
     concurrent_catree: Option<CATree>,
     concurrent_hash: Option<ConcurrentHashStorage>,
-    _heir_data: Option<StoredTerm>,
+    _heir_data: Option<DbTerm>,
 }
 
 // The fast slots own integer pairs directly. A writer holds `table` and marks
