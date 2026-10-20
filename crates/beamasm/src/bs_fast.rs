@@ -737,7 +737,8 @@ fn emit_append_binary(
         e.mov_reg(Gpr::x(0), C_P)?;
         e.mov_const(Gpr::x(1), u64::from(src))?;
         e.mov_const(Gpr::x(2), u64::from(extra))?;
-        e.mov_const(Gpr::x(3), u64::from(roots))
+        e.mov_const(Gpr::x(3), u64::from(roots))?;
+        e.mov_const(Gpr::x(4), u64::from(alloc))
     })?;
     asm.fragment_call(function)?;
     crate::emit_leave_runtime(&mut asm.code, roots as usize, update)?;
