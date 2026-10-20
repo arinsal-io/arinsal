@@ -1189,9 +1189,10 @@ const ENTRIES: &[Entry] = &[
     },
 ];
 
+// Port of erts/emulator/beam/erl_bif_binary.c:2365-2374 (CopyBinState), OTP-29.1.1.
 struct BinaryCopyState {
-    bytes: Vec<u8>,
-    copied: usize,
+    result: Term,
+    copied_bits: usize,
 }
 
 enum IolistBinaryPhase {
@@ -3341,6 +3342,8 @@ fn binary_loop_budget(process: &Process, loop_factor: u64) -> u64 {
     reds.max(1)
 }
 
+// Port of erts/emulator/beam/erl_bif_binary.c:2400-2495
+// (do_binary_copy, binary_copy_trap), OTP-29.1.1.
 fn binary_copy(
     process: &mut Process,
     args: &[Term],
@@ -3375,29 +3378,35 @@ fn binary_copy(
             reductions: 1,
         });
     }
-    let target_bits = (len as u64).saturating_mul(8);
-    let max_copy_bits = binary_loop_budget(process, BITSTRING_COPY_LOOP_FACTOR);
+    let target_bits = len.checked_mul(8).ok_or(BifError::SystemLimit)?;
+    let max_copy_bits = usize::try_from(binary_loop_budget(process, BITSTRING_COPY_LOOP_FACTOR))
+        .unwrap_or(usize::MAX);
     if let Some(state) = state {
         let state = Arc::clone(state);
         let copy = state
             .downcast_ref::<Mutex<BinaryCopyState>>()
             .ok_or(BifError::BADARG)?;
         let mut copy = copy.lock().map_err(|_| BifError::SystemLimit)?;
-        let initial_target_offset = (copy.copied as u64).saturating_mul(8);
+        let initial_target_offset = copy.copied_bits;
         let mut trap_offset = target_bits;
-        if (u64::MAX - max_copy_bits) < initial_target_offset
+        if (usize::MAX - max_copy_bits) < initial_target_offset
             && initial_target_offset.saturating_add(max_copy_bits) < trap_offset
         {
             trap_offset = initial_target_offset + max_copy_bits;
         }
-        copy_binary_to(&mut copy, input, input_len, len, trap_offset)?;
-        if copy.copied == len {
-            let bits_copied = target_bits - initial_target_offset;
+        let copied_bits = copy_binary_to(input, copy.result, initial_target_offset, trap_offset)?;
+        copy.copied_bits = copied_bits;
+        if copied_bits == target_bits {
+            let bits_copied = copied_bits - initial_target_offset;
+            let result = copy.result;
+            drop(copy);
+            arinsal_bifs::finish_iolist_binary_output(result);
             process.set_gc_enabled(restore_gc);
-            let value = finish_binary_copy(process, &copy.bytes)?;
             return Ok(HandlerResult::Done {
-                value,
-                reductions: reductions_from(bits_copied / BITSTRING_COPY_LOOP_FACTOR),
+                value: result,
+                reductions: reductions_from(
+                    (bits_copied / BITSTRING_COPY_LOOP_FACTOR as usize) as u64,
+                ),
             });
         }
         drop(copy);
@@ -3409,66 +3418,62 @@ fn binary_copy(
         });
     }
 
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(len)
-        .map_err(|_| BifError::SystemLimit)?;
-    bytes.resize(len, 0);
-    let mut copy = BinaryCopyState { bytes, copied: 0 };
-    copy_binary_to(
-        &mut copy,
-        input,
-        input_len,
-        len,
-        max_copy_bits.min(target_bits),
-    )?;
-    if copy.copied < len {
-        vbump_all_reds(process);
-        return Ok(HandlerResult::Yield {
-            continuation: BINARY_COPY_CONTINUATION,
-            state: argument_trap_state(Mutex::new(copy)),
-            reductions: 0,
+    if max_copy_bits >= target_bits {
+        let mut copy_error = None;
+        let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+            .binary_from_fn(len, |destination| {
+                if let Err(error) =
+                    arinsal_bifs::copy_binary_pattern(input, destination, 0, target_bits)
+                {
+                    copy_error = Some(error);
+                }
+            })
+            .map_err(|_| BifError::SystemLimit)?;
+        if let Some(error) = copy_error {
+            return Err(error);
+        }
+        return Ok(HandlerResult::Done {
+            value,
+            reductions: reductions_from((target_bits / BITSTRING_COPY_LOOP_FACTOR as usize) as u64),
         });
     }
-    let value = finish_binary_copy(process, &copy.bytes)?;
-    Ok(HandlerResult::Done {
-        value,
-        reductions: reductions_from(target_bits / BITSTRING_COPY_LOOP_FACTOR),
+
+    let result = arinsal_bifs::allocate_iolist_binary(
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+        len,
+    )?;
+    let copied_bits = copy_binary_to(input, result, 0, max_copy_bits.min(target_bits))?;
+    debug_assert!(copied_bits < target_bits);
+    vbump_all_reds(process);
+    Ok(HandlerResult::Yield {
+        continuation: BINARY_COPY_CONTINUATION,
+        state: argument_trap_state(Mutex::new(BinaryCopyState {
+            result,
+            copied_bits,
+        })),
+        reductions: 0,
     })
 }
 
+// Port of erts/emulator/beam/bif.h:71-78 (BUMP_REDS), OTP-29.1.1.
 fn reductions_from(reductions: u64) -> u32 {
     u32::try_from(reductions).unwrap_or(u32::MAX)
 }
 
-/// `binary_copy_loop`: copy the source repeatedly up to `trap_offset` bits of the target.
+/// Continue `binary_copy_loop` in the final binary allocated by `do_binary_copy`.
+// Port of erts/emulator/beam/erl_bif_binary.c:2379-2398 (binary_copy_loop), OTP-29.1.1.
 fn copy_binary_to(
-    copy: &mut BinaryCopyState,
     input: Term,
-    input_len: usize,
-    len: usize,
-    trap_offset: u64,
-) -> Result<(), BifError> {
-    let end = usize::try_from(trap_offset / 8).map_or(len, |end| end.min(len));
-    let mut offset = copy.copied;
-    while offset < end {
-        let source_offset = offset % input_len;
-        let amount = (end - offset).min(input_len - source_offset);
-        arinsal_bifs::copy_binary_range(
-            input,
-            source_offset,
-            &mut copy.bytes[offset..offset + amount],
-        )?;
-        offset += amount;
-    }
-    copy.copied = end.max(copy.copied);
-    Ok(())
-}
-
-fn finish_binary_copy(process: &mut Process, bytes: &[u8]) -> Result<Term, BifError> {
-    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-        .binary(bytes)
-        .map_err(|_| BifError::SystemLimit)
+    result: Term,
+    copied_bits: usize,
+    trap_offset: usize,
+) -> Result<usize, BifError> {
+    let mut copied = copied_bits;
+    arinsal_bifs::with_iolist_binary_output(result, |destination| {
+        copied = arinsal_bifs::copy_binary_pattern(input, destination, copied_bits, trap_offset)?;
+        Ok(())
+    })?;
+    Ok(copied)
 }
 
 fn term_to_binary(

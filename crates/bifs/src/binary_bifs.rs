@@ -1277,7 +1277,7 @@ fn binary_at(_ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     })?
 }
 
-// Port of erts/emulator/beam/erl_bif_binary.c:2400-2512 (do_binary_copy), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_bif_binary.c:2400-2447 (do_binary_copy), OTP-29.1.1.
 fn binary_copy(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let bits = bitstring_bit_len(args[0])?;
     let count = if args.len() == 2 {
@@ -1302,20 +1302,16 @@ fn binary_copy(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if length > (1 << 30) {
         return Err(BifError::SystemLimit);
     }
-    with_binary_input(args[0], |source| {
-        TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .binary_from_fn(length, |output| {
-                let mut copied = 0;
-                while copied < length {
-                    let source_offset = copied % source_len;
-                    let stride = (length - copied).min(source_len - source_offset);
-                    output[copied..copied + stride]
-                        .copy_from_slice(&source[source_offset..source_offset + stride]);
-                    copied += stride;
-                }
-            })
-            .map_err(|_| BifError::SystemLimit)
-    })
+    let target_bits = length.checked_mul(8).ok_or(BifError::SystemLimit)?;
+    let mut copy_error = None;
+    let result = TermBuilder::new(&mut Heap(&mut ctx.heap))
+        .binary_from_fn(length, |output| {
+            if let Err(error) = copy_binary_pattern(args[0], output, 0, target_bits) {
+                copy_error = Some(error);
+            }
+        })
+        .map_err(|_| BifError::SystemLimit)?;
+    copy_error.map_or(Ok(result), Err)
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2515-2555 (binary_referenced_byte_size_1), OTP-29.1.1.
