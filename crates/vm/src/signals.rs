@@ -662,9 +662,7 @@ fn light_demonitor_miss(
     let ids = reference.local_ref_numbers()?;
     let id = arinsal_bifs::ordinary_ref_key(ids);
     if let Some(cold) = process.cold.as_ref()
-        && (cold.monitors.contains_key(&id)
-            || cold.dist_monitors.contains(&id)
-            || cold.port_monitors.contains_key(&id))
+        && (cold.monitors.contains_key(&id) || cold.dist_monitors.contains(&id))
     {
         return None;
     }
@@ -2233,7 +2231,6 @@ pub(crate) fn take_origin_monitor_down(
     }
     if let Some(cold) = process.cold.as_mut() {
         cold.dist_monitors.remove(&id);
-        cold.port_monitors.remove(&id);
     }
     let mode = entry.alias_mode();
     match mode {
@@ -2298,12 +2295,7 @@ pub(crate) fn demonitor_origin(process: &mut Process, id: u64) -> OriginDemonito
     process.cold_mut().prio_monitors.remove(&id);
     match entry {
         crate::proc_create::OriginMonitor::Process(half) => OriginDemonitor::Process(half),
-        crate::proc_create::OriginMonitor::Port { port_id, .. } => {
-            if let Some(cold) = process.cold.as_mut() {
-                cold.port_monitors.remove(&id);
-            }
-            OriginDemonitor::Port(port_id)
-        }
+        crate::proc_create::OriginMonitor::Port { port_id, .. } => OriginDemonitor::Port(port_id),
         crate::proc_create::OriginMonitor::DistPort { .. } => OriginDemonitor::Port(None),
         crate::proc_create::OriginMonitor::Distributed { .. } => OriginDemonitor::Distributed,
         crate::proc_create::OriginMonitor::Alias { .. } => unreachable!(),
@@ -2342,9 +2334,6 @@ pub(crate) fn demonitor_light(
         let _ = demonitor_origin(process, id);
         crate::port::demonitor_port(process, me, port_id, id);
         return Some(Ok(Term::atom(arinsal_term::atoms::TRUE)));
-    }
-    if cold.port_monitors.contains_key(&id) {
-        return None;
     }
     let active = match cold.monitors.get(&id) {
         Some(crate::proc_create::OriginMonitor::Process(half)) => Some(half.target),
@@ -2684,7 +2673,7 @@ fn monitor_port(
             name,
         },
     );
-    if let Some(id) = port_id.filter(|id| runtime.ports.read().unwrap().contains_key(id)) {
+    if let Some(id) = port_id.filter(|id| runtime.ports.contains(*id)) {
         if tag != atom("DOWN") {
             // Port monitors carry no tag yet (typed gap, see report).
             return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));
@@ -2698,10 +2687,8 @@ fn monitor_port(
                 .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
             process.inbox.push_back(down);
             let _ = take_origin_monitor_down(process, reference_id);
-        } else {
-            // Origin stays in this process; the target half is on the port.
-            process.cold_mut().port_monitors.insert(reference_id, id);
         }
+        // Origin stays in this process; the target half is on the port.
         Ok(reference_term)
     } else {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -2816,10 +2803,10 @@ fn call_resolved(
                 Ok(atom("true"))
             } else if let Some(port_id) = id.as_port() {
                 let handle = {
-                    let ports = rt.ports.lock().unwrap();
-                    let handle = ports
-                        .get(&port_id)
-                        .cloned()
+                    let _ports = rt.ports.lock().unwrap();
+                    let handle = rt
+                        .ports
+                        .get(port_id)
                         .ok_or_else(|| badarg("register/2"))?;
                     if handle.exit_complete() {
                         return Err(badarg("register/2"));
@@ -3083,13 +3070,7 @@ fn call_resolved(
             // Port of erts/emulator/beam/bif.c:504-510 (demonitor, ERTS_MON_TYPE_PORT),
             // OTP-29.1.1: the origin is in this process's monitor tree. The port id
             // there selects the port; `erts_port_demonitor` sends the demonitor signal.
-            let port_id = port_target.or_else(|| {
-                process
-                    .cold
-                    .as_mut()
-                    .and_then(|cold| cold.port_monitors.remove(&id))
-            });
-            if let Some(port_id) = port_id {
+            if let Some(port_id) = port_target {
                 crate::port::demonitor_port(process, ctx.pid(), port_id, id);
                 was_active = true;
             }

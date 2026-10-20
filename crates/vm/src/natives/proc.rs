@@ -4130,7 +4130,7 @@ fn trace(
             if !process
                 .runtime
                 .as_ref()
-                .is_some_and(|runtime| runtime.ports.read().unwrap().contains_key(&id))
+                .is_some_and(|runtime| runtime.ports.contains(id))
             {
                 return Err(badarg());
             }
@@ -4176,7 +4176,7 @@ fn trace(
         let known = process
             .runtime
             .as_ref()
-            .is_some_and(|runtime| id == 0 || runtime.ports.read().unwrap().contains_key(&id));
+            .is_some_and(|runtime| id == 0 || runtime.ports.contains(id));
         if !known {
             return Err(badarg());
         }
@@ -4213,11 +4213,7 @@ fn trace(
                             .map(|runtime| {
                                 runtime
                                     .ports
-                                    .lock()
-                                    .unwrap()
-                                    .keys()
-                                    .copied()
-                                    .collect::<Vec<_>>()
+                                    .ids()
                             })
                             .unwrap_or_default(),
                     );
@@ -4272,11 +4268,7 @@ fn trace(
                         .map(|runtime| {
                             runtime
                                 .ports
-                                .lock()
-                                .unwrap()
-                                .keys()
-                                .copied()
-                                .collect::<Vec<_>>()
+                                .ids()
                         })
                         .unwrap_or_default(),
                 );
@@ -4342,7 +4334,7 @@ fn trace_session_create(
         if !process
             .runtime
             .as_ref()
-            .is_some_and(|runtime| runtime.ports.read().unwrap().contains_key(&id))
+            .is_some_and(|runtime| runtime.ports.contains(id))
         {
             return Err(badarg());
         }

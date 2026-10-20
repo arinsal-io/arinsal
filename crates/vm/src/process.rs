@@ -5096,8 +5096,14 @@ impl Process {
         };
         // Port of erts/emulator/beam/erl_process.c:13918 (origin ERTS_MON_TYPE_PORT),
         // OTP-29.1.1: exit demonitors each port the process was watching.
-        for (reference, port_id) in cold.port_monitors {
-            crate::port::demonitor_port(self, ctx.pid(), port_id, reference);
+        for (&reference, monitor) in &cold.monitors {
+            if let crate::proc_create::OriginMonitor::Port {
+                port_id: Some(port_id),
+                ..
+            } = monitor
+            {
+                crate::port::demonitor_port(self, ctx.pid(), *port_id, reference);
+            }
         }
         for pid in cold.links {
             if cold.unlinking.values().any(|unlinking| *unlinking == pid) {
@@ -6027,7 +6033,6 @@ impl Process {
                     port_id: Some(port_id),
                     ..
                 }) => {
-                    self.cold_mut().port_monitors.remove(&alias);
                     crate::port::demonitor_port(self, ctx.pid(), port_id, alias);
                 }
                 Some(crate::proc_create::OriginMonitor::Alias { .. }) => {}
@@ -7250,13 +7255,14 @@ impl Process {
         message: Message,
     ) -> Result<(), VmError> {
         let origin = crate::signals::take_origin_monitor_down(self, reference);
-        let remote = crate::dist::take_monitor(reference).is_some();
-        // A port monitor's origin half lives in `port_monitors` (`monitor(port, P)`).
-        let port = self
-            .cold
-            .as_mut()
-            .is_some_and(|cold| cold.port_monitors.remove(&reference).is_some());
-        let active = origin.is_some() || remote || port;
+        // erts reads the monitor type from the origin node in the process's own tree
+        // (erl_proc_sig_queue.c handle_monitor_down); only a distributed monitor has
+        // remote bookkeeping to release.
+        let remote = matches!(
+            origin,
+            Some(crate::proc_create::OriginMonitor::Distributed { .. })
+        ) && crate::dist::take_monitor(reference).is_some();
+        let active = origin.is_some() || remote;
         let priority = self
             .cold
             .as_mut()
@@ -8318,7 +8324,7 @@ impl Vm {
             reg: crate::register::RegisterTable::new(),
             aliases: AliasTable::new(),
             next_trace_weak_id: AtomicU64::new(0),
-            ports: crate::port::PortTable::default(),
+            ports: crate::port::PortTable::new(port_layout),
             child_setup,
             system_monitor: Mutex::new(None),
             session_monitors: Mutex::new(Vec::new()),

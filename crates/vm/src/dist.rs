@@ -216,9 +216,7 @@ fn create_channel(
             let owns_tcp_port = process.runtime.as_ref().is_some_and(|runtime| {
                 runtime
                     .ports
-                    .lock()
-                    .unwrap()
-                    .get(&port_id)
+                    .get(port_id)
                     .is_some_and(|handle| handle.tcp_driver_data().is_some())
             });
             if !owns_tcp_port {
@@ -2842,7 +2840,7 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
     if !claimed {
         return Ok(());
     }
-    let handle = runtime.ports.read().unwrap().get(&port_id).cloned();
+    let handle = runtime.ports.get(port_id);
     let (Some(drv), Some(task_runtime)) = (
         handle.as_ref().and_then(|handle| handle.drv_port()),
         handle.as_ref().and_then(|handle| handle.runtime()),
@@ -2929,9 +2927,7 @@ fn dist_cmd(runtime: &std::sync::Arc<crate::process::Runtime>, port_id: u64) -> 
         let sock = {
             runtime
                 .ports
-                .read()
-                .unwrap()
-                .get(&port_id)
+                .get(port_id)
                 .and_then(|handle| handle.tcp_driver_data())
         };
         let port_busy = sock

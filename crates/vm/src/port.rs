@@ -280,35 +280,123 @@ pub(crate) fn test_next_port_id(
     set: bool,
     next_id: u64,
 ) -> Option<u64> {
-    let ports = runtime.ports.lock().unwrap();
-    Some(runtime.port_ids.test_next_id(set, next_id, |pix| {
-        ports
-            .keys()
-            .any(|id| arinsal_term::ptab::port_table_layout().data2pix(*id) == pix)
-    }))
+    let _ports = runtime.ports.lock().unwrap();
+    Some(
+        runtime
+            .port_ids
+            .test_next_id(set, next_id, |pix| runtime.ports.occupied(pix)),
+    )
 }
 
-/// The port table (`erts_port` ptab). Lookups by port id dominate (every `port_command`,
-/// `port_control`, monitor and link), so they take a shared lock; the table changes only
-/// when a port is created or removed.
+/// Slots per lazily materialized page of the port table.
+const PORT_PAGE_SIZE: usize = 1024;
+
+type PortSlot = std::sync::RwLock<Option<Arc<PortHandle>>>;
+
+/// The port table (`erts_port` ptab): an array indexed by the port id's table index bits
+/// (`erts_ptab_data2pix`), so a lookup is a shift, a mask and a slot load without hashing.
+/// Pages of slots are materialized on first use. `list` is `ptab->list.data.rwmtx`: it orders
+/// table-wide scans, `test_next_id`, and insert/remove against each other, as in erts.
 ///
-/// Port of erts/emulator/beam/erl_ptab.c (erts_ptab_lookup lock-free reads), OTP-29.1.1.
-#[derive(Default)]
-pub(crate) struct PortTable(std::sync::RwLock<HashMap<u64, Arc<PortHandle>>>);
+/// Port of erts/emulator/beam/erl_ptab.c (erts_ptab_pix2intptr_ddrb, erts_ptab_new_element,
+/// erts_ptab_delete_element), OTP-29.1.1.
+pub(crate) struct PortTable {
+    list: std::sync::RwLock<()>,
+    pages: Vec<OnceLock<Box<[PortSlot]>>>,
+}
+
+impl Default for PortTable {
+    fn default() -> Self {
+        Self::new(arinsal_term::ptab::port_table_layout())
+    }
+}
 
 impl PortTable {
-    /// Exclusive access for inserting and removing ports.
-    pub(crate) fn lock(
-        &self,
-    ) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'_, HashMap<u64, Arc<PortHandle>>>> {
-        self.0.write()
+    pub(crate) fn new(layout: arinsal_term::ptab::PtabLayout) -> Self {
+        let pages = (layout.max() as usize).div_ceil(PORT_PAGE_SIZE);
+        Self {
+            list: std::sync::RwLock::new(()),
+            pages: (0..pages).map(|_| OnceLock::new()).collect(),
+        }
     }
 
-    /// Shared access for lookups.
-    pub(crate) fn read(
-        &self,
-    ) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, HashMap<u64, Arc<PortHandle>>>> {
-        self.0.read()
+    /// Exclusive access for inserting and removing ports and for table-wide exclusion.
+    pub(crate) fn lock(&self) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'_, ()>> {
+        self.list.write()
+    }
+
+    /// Shared access that excludes `lock()` holders: a port cannot be inserted or removed
+    /// while it is held.
+    pub(crate) fn read(&self) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, ()>> {
+        self.list.read()
+    }
+
+    fn slot(&self, id: u64) -> Option<&PortSlot> {
+        let pix = arinsal_term::ptab::port_table_layout().data2pix(id) as usize;
+        let page = self.pages.get(pix / PORT_PAGE_SIZE)?.get()?;
+        Some(&page[pix % PORT_PAGE_SIZE])
+    }
+
+    /// `erts_port_lookup_raw`: the handle of the live port `id`.
+    pub(crate) fn get(&self, id: u64) -> Option<Arc<PortHandle>> {
+        let slot = self.slot(id)?.read().unwrap();
+        slot.as_ref().filter(|handle| handle.id == id).cloned()
+    }
+
+    /// Whether port `id` is live.
+    pub(crate) fn contains(&self, id: u64) -> bool {
+        self.slot(id).is_some_and(|slot| {
+            slot.read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|handle| handle.id == id)
+        })
+    }
+
+    /// Whether any live port occupies table index `pix`.
+    fn occupied(&self, pix: u32) -> bool {
+        let pix = pix as usize;
+        self.pages
+            .get(pix / PORT_PAGE_SIZE)
+            .and_then(OnceLock::get)
+            .is_some_and(|page| page[pix % PORT_PAGE_SIZE].read().unwrap().is_some())
+    }
+
+    /// Publish a new port in its slot (`erts_ptab_new_element`, under the table lock).
+    pub(crate) fn insert(&self, id: u64, handle: Arc<PortHandle>) {
+        let _list = self.list.write().unwrap();
+        let pix = arinsal_term::ptab::port_table_layout().data2pix(id) as usize;
+        let page = self.pages[pix / PORT_PAGE_SIZE].get_or_init(|| {
+            (0..PORT_PAGE_SIZE)
+                .map(|_| std::sync::RwLock::new(None))
+                .collect()
+        });
+        *page[pix % PORT_PAGE_SIZE].write().unwrap() = Some(handle);
+    }
+
+    /// Clear the slot of port `id` and return its handle.
+    pub(crate) fn remove(&self, id: u64) -> Option<Arc<PortHandle>> {
+        let mut slot = self.slot(id)?.write().unwrap();
+        if slot.as_ref().is_some_and(|handle| handle.id == id) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    /// Ids of the live ports in table order.
+    pub(crate) fn ids(&self) -> Vec<u64> {
+        self.handles().iter().map(|handle| handle.id).collect()
+    }
+
+    /// Live ports in table order (`erts_ptab_processes` scan order).
+    pub(crate) fn handles(&self) -> Vec<Arc<PortHandle>> {
+        self.pages
+            .iter()
+            .filter_map(OnceLock::get)
+            .flat_map(|page| page.iter())
+            .filter_map(|slot| slot.read().unwrap().clone())
+            .collect()
     }
 }
 
@@ -356,8 +444,8 @@ fn reserve_port_id(runtime: &crate::process::Runtime) -> Result<PortIdReservatio
 }
 
 fn remove_port(runtime: &crate::process::Runtime, id: u64) -> Option<Arc<PortHandle>> {
-    let mut ports = runtime.ports.lock().unwrap();
-    let handle = ports.remove(&id)?;
+    let ports = runtime.ports.lock().unwrap();
+    let handle = runtime.ports.remove(id)?;
     runtime.port_ids.release(id);
     drop(ports);
     release_port_name(runtime, &handle);
@@ -1237,8 +1325,6 @@ fn start(
     )?;
     runtime
         .ports
-        .lock()
-        .unwrap()
         .insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
@@ -1309,8 +1395,6 @@ fn start_driver(
     )?;
     runtime
         .ports
-        .lock()
-        .unwrap()
         .insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
@@ -1389,8 +1473,6 @@ fn start_dyn_driver(
     }
     runtime
         .ports
-        .lock()
-        .unwrap()
         .insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(&runtime, port_id);
@@ -1459,10 +1541,7 @@ impl DrvHost {
         self.runtime
             .upgrade()?
             .ports
-            .lock()
-            .unwrap()
-            .get(&id)
-            .cloned()
+            .get(id)
             .or_else(|| self.own.upgrade())
     }
 }
@@ -1498,7 +1577,7 @@ impl arinsal_drv::PortHost for DrvHost {
         if !crate::natives::erts_debug::runtime_long_schedule_monitored(&runtime) {
             return;
         }
-        let Some(handle) = runtime.ports.read().unwrap().get(&port.id()).cloned() else {
+        let Some(handle) = runtime.ports.get(port.id()) else {
             return;
         };
         if let Some(term) = Term::port(port.id()) {
@@ -1945,7 +2024,7 @@ impl arinsal_drv::PortHost for DrvHost {
         drv_port.adopt(drv_data);
         let _ = handle.driver.set(Arc::clone(&drv_port));
         crate::ddll::port_opened_for(&driver, &drv_port);
-        runtime.ports.lock().unwrap().insert(port_id, handle);
+        runtime.ports.insert(port_id, handle);
         // The owner has a port in its link list (erl_process.c:14084). Exit scans the
         // port table only when that list is non-NULL.
         let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
@@ -2204,8 +2283,6 @@ pub(crate) fn alloc_inet_port(
     attach(&handle, &drv_port);
     runtime
         .ports
-        .lock()
-        .unwrap()
         .insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
@@ -2551,11 +2628,7 @@ fn start_fd(
         Arc::clone(&scheduler),
         Arc::as_ptr(runtime) as usize,
     )?;
-    runtime
-        .ports
-        .lock()
-        .unwrap()
-        .insert(id, Arc::clone(&handle));
+    runtime.ports.insert(id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, id);
     reservation.commit();
@@ -3204,7 +3277,7 @@ fn eof_exit(
     read_fd: Option<RawFd>,
 ) {
     if let Some(runtime) = runtime.upgrade() {
-        let listed = runtime.ports.read().unwrap().contains_key(&id);
+        let listed = runtime.ports.contains(id);
         if listed {
             crate::trace::emit_port_event(
                 &runtime,
@@ -3310,7 +3383,7 @@ fn lookup_port(process: &Process, term: Term) -> Result<Arc<PortHandle>, VmError
     process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
+        .and_then(|runtime| runtime.ports.get(id))
         .ok_or_else(badarg)
 }
 
@@ -3332,7 +3405,7 @@ pub(crate) fn is_live(process: &Process, id: u64) -> bool {
 
 /// Whether local port `id` of `runtime` exists and has not finished exiting.
 pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> bool {
-    let handle = runtime.ports.read().unwrap().get(&id).cloned();
+    let handle = runtime.ports.get(id);
     handle.is_some_and(|handle| !handle.state.lock().unwrap().exit_complete)
 }
 
@@ -3415,7 +3488,7 @@ fn port_control(
     let Some(handle) = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
+        .and_then(|runtime| runtime.ports.get(id))
     else {
         return Ok(atom("badarg"));
     };
@@ -3439,7 +3512,7 @@ fn port_call(
     let Some(handle) = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
+        .and_then(|runtime| runtime.ports.get(id))
     else {
         return Ok(atom("badarg"));
     };
@@ -3553,7 +3626,7 @@ fn port_command(
     let handle = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
+        .and_then(|runtime| runtime.ports.get(id))
         .ok_or_else(badarg)?;
     let mut nosuspend = false;
     let mut force = false;
@@ -3880,8 +3953,8 @@ fn remove_and_notify(
     from: Pid,
     reason: Term,
 ) -> Option<Arc<PortHandle>> {
-    let mut ports = runtime.ports.lock().unwrap();
-    let handle = ports.remove(&id)?;
+    let ports = runtime.ports.lock().unwrap();
+    let handle = runtime.ports.remove(id)?;
     runtime.port_ids.release(id);
     drop(ports);
     release_port_name(runtime, &handle);
@@ -3935,7 +4008,7 @@ fn port_close(
         && let Some(handle) = process
             .runtime
             .as_ref()
-            .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
+            .and_then(|runtime| runtime.ports.get(id))
         && let Some(drv) = handle.driver.get().cloned()
     {
         // The `{Caller, close}` receive trace is emitted when the exit signal executes
@@ -3988,7 +4061,7 @@ pub(crate) fn exit_port(
     let Some(runtime) = process.runtime.as_ref() else {
         return Ok(());
     };
-    let handle = runtime.ports.read().unwrap().get(&id).cloned();
+    let handle = runtime.ports.get(id);
     if let Some(handle) = handle
         && let Some(drv) = handle.driver.get().cloned()
     {
@@ -4023,7 +4096,7 @@ pub(crate) fn exit_port(
 /// Port of erts/emulator/beam/erl_process.c:2537-2581 (`handle_reap_ports`), OTP-29.1.1.
 pub(crate) fn halt_reap_ports(runtime: &Arc<crate::process::Runtime>, progress: HaltProgress) {
     let heart = global_atoms().intern("heart_port").ok();
-    let ports: Vec<_> = runtime.ports.read().unwrap().values().cloned().collect();
+    let ports: Vec<_> = runtime.ports.handles();
     for handle in ports {
         if heart.is_some() && handle.registered_atom() == heart {
             continue;
@@ -4065,10 +4138,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let handle = runtime
         .ports
-        .lock()
-        .unwrap()
-        .get(&id)
-        .cloned()
+        .get(id)
         .ok_or_else(badarg)?;
     if !runtime.scheduler()?.lookup(pid) {
         return Err(badarg());
@@ -4139,9 +4209,11 @@ pub(crate) fn owner_exit(
     // Port of erts/emulator/beam/io.c:7143 (erts_fire_port_monitor): ports that
     // monitor the exiting process run their driver's `process_exit` callback.
     let fired: Vec<(Arc<arinsal_drv::DriverPort>, u64)> = {
-        let ports = runtime.ports.lock().unwrap();
-        ports
-            .values()
+        let _ports = runtime.ports.lock().unwrap();
+        runtime
+            .ports
+            .handles()
+            .into_iter()
             .flat_map(|handle| {
                 let Some(drv_port) = handle.driver.get() else {
                     return Vec::new();
@@ -4166,17 +4238,19 @@ pub(crate) fn owner_exit(
     }
     let abnormal = reason != atom("normal");
     let affected = {
-        let ports = runtime.ports.lock().unwrap();
-        for handle in ports.values() {
+        let _ports = runtime.ports.lock().unwrap();
+        let handles = runtime.ports.handles();
+        for handle in &handles {
             handle
                 .monitors
                 .lock()
                 .unwrap()
                 .retain(|_, monitor| monitor.pid != owner);
         }
-        ports
+        handles
             .iter()
-            .filter_map(|(&id, handle)| {
+            .filter_map(|handle| {
+                let id = handle.id;
                 let is_owner = *handle.owner.lock().unwrap() == owner;
                 let linked = if handle.driver.get().is_some() {
                     handle.links.lock().unwrap().contains(&owner)
@@ -4206,7 +4280,7 @@ pub(crate) fn owner_exit(
 pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Result<bool, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let Some(handle) = runtime.ports.read().unwrap().get(&id).cloned() else {
+    let Some(handle) = runtime.ports.get(id) else {
         return Ok(!linked);
     };
     if !linked {
@@ -4226,7 +4300,7 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
     // of the table lock (`remove_and_notify`); taking the locks in the same order makes this
     // registration either visible to it or refused.
     let ports = runtime.ports.read().unwrap();
-    if linked && !ports.contains_key(&id) {
+    if linked && !runtime.ports.contains(id) {
         return Ok(false);
     }
     let mut links = handle.links.lock().unwrap();
@@ -4272,7 +4346,7 @@ pub(crate) fn monitor(
     let handle = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned());
+        .and_then(|runtime| runtime.ports.get(id));
     let Some(handle) = handle else {
         // The port vanished between lookup and registration: the caller sends DOWN noproc.
         return Ok(!monitored);
@@ -4300,11 +4374,16 @@ fn register_monitor(
         return Ok(false);
     }
     // See `link`: same lock order as termination (table, then monitors).
-    let ports = process
+    let _ports = process
         .runtime
         .as_ref()
         .map(|runtime| runtime.ports.read().unwrap());
-    if monitored && !ports.as_ref().is_some_and(|ports| ports.contains_key(&id)) {
+    if monitored
+        && !process
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.ports.contains(id))
+    {
         return Ok(false);
     }
     let mut monitors = handle.monitors.lock().unwrap();
@@ -4326,11 +4405,10 @@ pub(crate) fn linked_ports(process: &Process, pid: Pid) -> Vec<Term> {
     };
     let mut ids: Vec<u64> = runtime
         .ports
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(_, handle)| handle.links.lock().unwrap().contains(&pid))
-        .map(|(id, _)| *id)
+        .handles()
+        .into_iter()
+        .filter(|handle| handle.links.lock().unwrap().contains(&pid))
+        .map(|handle| handle.id)
         .collect();
     ids.sort_unstable();
     ids.into_iter().filter_map(Term::port).collect()
@@ -4343,10 +4421,9 @@ pub(crate) fn driver_monitoring_ports(process: &Process, pid: Pid) -> Vec<Term> 
     };
     let mut ids: Vec<u64> = runtime
         .ports
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(_, handle)| {
+        .handles()
+        .into_iter()
+        .filter(|handle| {
             handle
                 .drv_monitors
                 .lock()
@@ -4354,7 +4431,7 @@ pub(crate) fn driver_monitoring_ports(process: &Process, pid: Pid) -> Vec<Term> 
                 .values()
                 .any(|monitored| *monitored == pid)
         })
-        .map(|(id, _)| *id)
+        .map(|handle| handle.id)
         .collect();
     ids.sort_unstable();
     ids.into_iter().filter_map(Term::port).collect()
@@ -4367,9 +4444,8 @@ pub(crate) fn monitors_by(process: &Process, pid: Pid) -> Vec<OwnedTerm> {
     };
     runtime
         .ports
-        .lock()
-        .unwrap()
-        .values()
+        .handles()
+        .into_iter()
         .flat_map(|handle| {
             handle
                 .monitors
@@ -4406,7 +4482,7 @@ pub(crate) fn demonitor_port(process: &Process, caller: Pid, port_id: u64, refer
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
-    let handle = runtime.ports.read().unwrap().get(&port_id).cloned();
+    let handle = runtime.ports.get(port_id);
     let Some(handle) = handle else {
         // `erts_port_lookup` failed: `ERTS_PORT_OP_DROPPED`, origin already released.
         return;
@@ -4457,7 +4533,7 @@ fn output_command(
         }
         if drv_port.output(&pieces, packed_pid(from)) {
             handle.add_bytes_out(bytes_out);
-        } else if runtime.ports.read().unwrap().contains_key(&id) {
+        } else if runtime.ports.contains(id) {
             signal_badsig(handle, id);
         }
         return;
@@ -4532,7 +4608,7 @@ pub(crate) fn nif_port_command(
     let Some(id) = port.as_port() else {
         return false;
     };
-    let Some(handle) = runtime.ports.read().unwrap().get(&id).cloned() else {
+    let Some(handle) = runtime.ports.get(id) else {
         return false;
     };
     if handle.state.lock().unwrap().exit_complete {
@@ -4606,7 +4682,7 @@ fn send_message_inner(
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     // A message to a dead local port is dropped (erts_port_command DROPPED).
-    let Some(handle) = runtime.ports.read().unwrap().get(&id).cloned() else {
+    let Some(handle) = runtime.ports.get(id) else {
         return Ok(sent());
     };
     let Some(parts) = tuple(message) else {
@@ -4765,7 +4841,7 @@ fn send_message_inner(
         }
         trace_port_receive_term(process, from, id, parts[1]);
         if connect(process, port, command[1], Some(from)).is_err()
-            && runtime.ports.read().unwrap().contains_key(&id)
+            && runtime.ports.contains(id)
         {
             signal_badsig(&handle, id);
         }
@@ -4786,7 +4862,7 @@ pub(crate) fn trace_command(process: &mut Process, port: Term, event: Term) -> R
     let owner = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.read().unwrap().get(&id).cloned())
+        .and_then(|runtime| runtime.ports.get(id))
         .map(|handle| handle.owner_pid())
         .ok_or_else(badarg)?;
     let encoded = {
@@ -4818,11 +4894,10 @@ fn ports(_vm: &mut Vm, process: &mut Process) -> Result<Term, VmError> {
         values.extend(
             runtime
                 .ports
-                .lock()
-                .unwrap()
-                .keys()
-                .filter(|id| **id != 0)
-                .filter_map(|id| Term::port(*id)),
+                .ids()
+                .into_iter()
+                .filter(|id| *id != 0)
+                .filter_map(Term::port),
         );
     }
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -4908,7 +4983,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     let Some(handle) = process
         .runtime
         .as_ref()
-        .and_then(|r| r.ports.read().unwrap().get(&id).cloned())
+        .and_then(|r| r.ports.get(id))
     else {
         // The forker is port zero and has no handle here (see `ports`).
         return if id == 0 {
