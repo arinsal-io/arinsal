@@ -507,7 +507,7 @@ fn live_ports(handle: &DeHandle) -> Vec<Weak<DriverPort>> {
 }
 
 fn scheduler_of(process: &Process) -> Result<Arc<Scheduler<Process>>, VmError> {
-    process.runtime.as_ref().ok_or_else(badarg)?.scheduler()
+    process.runtime.as_ref().ok_or_else(badarg)?.scheduler_arc()
 }
 
 /// Port of erl_bif_ddll.c:178 (erl_ddll_try_load_3).

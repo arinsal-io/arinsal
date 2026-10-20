@@ -15,7 +15,7 @@ use arinsal_term::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 /// Raises the error of a native call to an undefined function that has no error handler
 /// (`undef`) at the call, like the interpreter's call_ext; the arguments are restored first.
@@ -1075,7 +1075,9 @@ pub(crate) struct Runtime {
     pub(crate) literal_collector: Mutex<Option<Pid>>,
     paths: Vec<std::path::PathBuf>,
     // Set once when the scheduler starts; read without a lock like erts' scheduler data.
-    scheduler: OnceLock<Weak<Scheduler<Process>>>,
+    /// Held for the VM lifetime (erts reads its scheduler data through globals / `esdp`, no
+    /// refcount per call); the cycle through the processes is broken by `Scheduler::shutdown`.
+    scheduler: OnceLock<Arc<Scheduler<Process>>>,
     /// `process_reg` (`regtab_rwmtx`). Names are atom indexes, not strings.
     pub(crate) reg: crate::register::RegisterTable,
     aliases: AliasTable,
@@ -4413,11 +4415,15 @@ impl Runtime {
         self.aliases.load(id)
     }
 
-    pub(crate) fn scheduler(&self) -> Result<Arc<Scheduler<Process>>, VmError> {
+    pub(crate) fn scheduler(&self) -> Result<&Arc<Scheduler<Process>>, VmError> {
         self.scheduler
             .get()
-            .and_then(Weak::upgrade)
             .ok_or_else(|| VmError::Unsupported("scheduler has stopped".into()))
+    }
+
+    /// Owned handle for the few callers that store the scheduler (ports, deferred replies).
+    pub(crate) fn scheduler_arc(&self) -> Result<Arc<Scheduler<Process>>, VmError> {
+        self.scheduler().cloned()
     }
 
     /// Read a suspended task and its active module table under scheduler ownership.
@@ -8378,12 +8384,15 @@ impl Vm {
             Some(seed) => Scheduler::simulation(config, seed),
             None => Scheduler::new(config),
         });
+        // The runtime owns the scheduler for the VM lifetime; stopping it here releases the
+        // processes' runtime references so the cycle is freed.
+        let _scheduler_shutdown = SchedulerShutdown(Arc::clone(&scheduler));
         let online = crate::natives::sys::scheduler_online_default(&runtime);
         let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
         let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
         runtime
             .scheduler
-            .set(Arc::downgrade(&scheduler))
+            .set(Arc::clone(&scheduler))
             .map_err(|_| VmError::Unsupported("runtime scheduler already set".into()))?;
         if module == "erl_init" && function == "start" && simulation_seed.is_none() {
             crate::natives::env::install_boot_signals(&runtime)?;
@@ -8505,6 +8514,15 @@ impl Vm {
         drop(code);
         self.refresh_code();
         result
+    }
+}
+
+/// Stops the scheduler when the VM run ends, on every exit path.
+struct SchedulerShutdown(Arc<Scheduler<Process>>);
+
+impl Drop for SchedulerShutdown {
+    fn drop(&mut self) {
+        self.0.shutdown();
     }
 }
 

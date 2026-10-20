@@ -1568,6 +1568,8 @@ fn access_timer_sync(
             .unwrap_or_else(|| atom("false"));
         return Ok(if info { value } else { atom("ok") });
     }
+    // Slow path: the parked reply keeps the scheduler while `process` is mutated.
+    let scheduler = std::sync::Arc::clone(scheduler);
     let state = std::sync::Arc::new(Mutex::new(TimerAccess::Pending));
     let answer = std::sync::Arc::clone(&state);
     let callback = move |remaining: Option<u64>| {
