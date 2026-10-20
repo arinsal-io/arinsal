@@ -792,12 +792,19 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
         return global_atoms().cmp_atoms(x, y);
     }
     let mut pending = SmallVec::<[CmpWork<'_>; 16]>::new();
-    pending.push(CmpWork::Terms {
+    let mut current = Some(CmpWork::Terms {
         left: a,
         right: b,
         exact,
     });
-    while let Some(work) = pending.pop() {
+    loop {
+        let work = match current.take() {
+            Some(work) => work,
+            None => match pending.pop() {
+                Some(work) => work,
+                None => return Ordering::Equal,
+            },
+        };
         let (mut a, mut b, exact) = match work {
             CmpWork::Terms { left, right, exact } => (left, right, exact),
             CmpWork::Array {
@@ -1053,7 +1060,6 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
             break;
         }
     }
-    Ordering::Equal
 }
 
 enum CmpArray<'a> {
@@ -1744,8 +1750,15 @@ fn first_unequal(
 #[inline(never)]
 fn eq(a: Term, b: Term) -> bool {
     let mut pending: SmallVec<[EqWork<'_>; 16]> = SmallVec::new();
-    pending.push(EqWork::Terms(a, b));
-    while let Some(work) = pending.pop() {
+    let mut current = Some(EqWork::Terms(a, b));
+    loop {
+        let work = match current.take() {
+            Some(work) => work,
+            None => match pending.pop() {
+                Some(work) => work,
+                None => return true,
+            },
+        };
         let (mut a, mut b) = match work {
             EqWork::Terms(a, b) => (a, b),
             EqWork::Array { left, right, start } => {
@@ -1942,7 +1955,6 @@ fn eq(a: Term, b: Term) -> bool {
             break;
         }
     }
-    true
 }
 /// Erlang `==` for implemented types.
 pub fn loose_eq(a: Term, b: Term) -> bool {
