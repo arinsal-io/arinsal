@@ -99,10 +99,6 @@ impl RegisterTable {
     pub(crate) fn whereis_proc_str(&self, name: &str) -> Option<Pid> {
         self.whereis_proc(global_atoms().get(name)?)
     }
-
-    pub(crate) fn whereis_port_str(&self, name: &str) -> Option<u64> {
-        self.whereis_port(global_atoms().get(name)?)
-    }
 }
 
 impl ProcessReg {

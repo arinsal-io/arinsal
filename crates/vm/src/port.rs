@@ -228,7 +228,8 @@ struct PortState {
 #[derive(Clone)]
 struct PortMonitor {
     pid: Pid,
-    object: OwnedTerm,
+    /// Registered name the monitor was created with (`{Name, node()}` in the DOWN message).
+    name: Option<arinsal_term::Atom>,
 }
 
 /// State retained for a live child or fd port.
@@ -2273,7 +2274,8 @@ fn notify_links_monitors(
             else {
                 continue;
             };
-            let Ok(object) = from_owned(&monitor.object, &mut heap) else {
+            let Ok(object) = crate::signals::port_monitor_object(&mut heap, Some(id), monitor.name)
+            else {
                 continue;
             };
             let Ok(down) = TermBuilder::new(&mut heap).tuple(&[
@@ -4263,7 +4265,7 @@ pub(crate) fn monitor(
     port: Term,
     reference: u64,
     pid: Pid,
-    object: OwnedTerm,
+    name: Option<arinsal_term::Atom>,
     monitored: bool,
 ) -> Result<bool, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
@@ -4279,10 +4281,10 @@ pub(crate) fn monitor(
         // Port of erts/emulator/beam/io.c:6787 (erts_port_monitor): the request is a port
         // signal, handled once the callback holding the port lock has returned.
         return drv_port.serialized(|| {
-            register_monitor(process, id, &handle, reference, pid, object, monitored)
+            register_monitor(process, id, &handle, reference, pid, name, monitored)
         });
     }
-    register_monitor(process, id, &handle, reference, pid, object, monitored)
+    register_monitor(process, id, &handle, reference, pid, name, monitored)
 }
 
 fn register_monitor(
@@ -4291,7 +4293,7 @@ fn register_monitor(
     handle: &Arc<PortHandle>,
     reference: u64,
     pid: Pid,
-    object: OwnedTerm,
+    name: Option<arinsal_term::Atom>,
     monitored: bool,
 ) -> Result<bool, VmError> {
     if monitored && handle.state.lock().unwrap().exit_complete {
@@ -4307,7 +4309,7 @@ fn register_monitor(
     }
     let mut monitors = handle.monitors.lock().unwrap();
     if monitored {
-        monitors.insert(reference, PortMonitor { pid, object });
+        monitors.insert(reference, PortMonitor { pid, name });
         if let Some(runtime) = process.runtime.as_ref() {
             let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS);
         }
@@ -4375,7 +4377,20 @@ pub(crate) fn monitors_by(process: &Process, pid: Pid) -> Vec<OwnedTerm> {
                 .unwrap()
                 .values()
                 .filter(|monitor| monitor.pid == pid)
-                .map(|monitor| monitor.object.clone())
+                .map(|monitor| match monitor.name {
+                    Some(name) => OwnedTerm::Tuple(vec![
+                        OwnedTerm::Atom(
+                            global_atoms()
+                                .text(name)
+                                .map(|text| text.to_string())
+                                .unwrap_or_default(),
+                        ),
+                        OwnedTerm::Atom(crate::node_tables::lock().local_name.clone()),
+                    ]),
+                    None => Term::port(handle.id)
+                        .and_then(|port| to_owned(port).ok())
+                        .unwrap_or(OwnedTerm::Nil),
+                })
                 .collect::<Vec<_>>()
         })
         .collect()

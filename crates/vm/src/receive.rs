@@ -600,6 +600,7 @@ impl Process {
         crate::natives::erts_debug::after_message_queue_change(self);
         self.receive_deadline = None;
         self.receive_deadline_ms = None;
+        self.receive_infinity = false;
         Ok(true)
     }
 
@@ -674,6 +675,7 @@ impl Process {
         }
         self.receive_deadline = None;
         self.receive_deadline_ms = None;
+        self.receive_infinity = false;
         Ok(())
     }
 
@@ -688,6 +690,7 @@ impl Process {
         }
         self.receive_deadline = None;
         self.receive_deadline_ms = None;
+        self.receive_infinity = false;
         if let Some(markers) = self
             .cold
             .as_mut()
@@ -723,7 +726,11 @@ impl Process {
             let remaining = deadline.saturating_duration_since(now).as_millis() as u64;
             return Ok(Some(remaining.max(1)));
         }
+        if self.receive_infinity {
+            return Ok(None);
+        }
         if value.as_atom() == Some(arinsal_term::atoms::INFINITY) {
+            self.receive_infinity = true;
             return Ok(None);
         }
         let timeout_value = || {
