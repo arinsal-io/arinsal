@@ -109,22 +109,24 @@ fn caller_data(pid: Pid) -> u64 {
     packed_pid(pid)
 }
 
-/// Port of erts/emulator/beam/io.c:1468 (call_driver_output) and io.c:1354
-/// (call_driver_outputv): the bang form checks the connected process first.
-fn call_driver_output(
-    handle: &PortHandle,
-    drv: &DriverPort,
-    bang: bool,
-    caller: Pid,
-    from: Pid,
-    pieces: &[(Vec<u8>, bool)],
-) {
-    if bang && from != handle.owner_pid() {
-        signal_badsig(handle, handle.id);
-        return;
+/// The data of one `command` signal: a native driver takes one flat buffer, a loaded driver the
+/// pieces of `erts_ioq_iolist_to_vec` (`true` marks a reference-counted binary).
+enum CommandData {
+    Flat(Vec<u8>),
+    Pieces(Vec<(Vec<u8>, bool)>),
+}
+
+impl CommandData {
+    fn size(&self) -> usize {
+        match self {
+            CommandData::Flat(bytes) => bytes.len(),
+            CommandData::Pieces(pieces) => pieces.iter().map(|(bytes, _)| bytes.len()).sum(),
+        }
     }
-    let size = pieces.iter().map(|(bytes, _)| bytes.len()).sum();
-    let pieces = pieces
+}
+
+fn io_views(pieces: &[(Vec<u8>, bool)]) -> Vec<arinsal_drv::IoPiece<'_>> {
+    pieces
         .iter()
         .map(|(bytes, refc)| {
             if *refc {
@@ -133,8 +135,29 @@ fn call_driver_output(
                 arinsal_drv::IoPiece::Copied(bytes)
             }
         })
-        .collect::<Vec<_>>();
-    if drv.output(&pieces, caller_data(caller)) {
+        .collect()
+}
+
+/// Port of erts/emulator/beam/io.c:1468 (call_driver_output) and io.c:1354
+/// (call_driver_outputv): the bang form checks the connected process first.
+fn call_driver_output(
+    handle: &PortHandle,
+    drv: &DriverPort,
+    bang: bool,
+    caller: Pid,
+    from: Pid,
+    data: CommandData,
+) {
+    if bang && from != handle.owner_pid() {
+        signal_badsig(handle, handle.id);
+        return;
+    }
+    let size = data.size();
+    let done = match data {
+        CommandData::Flat(bytes) => drv.output_owned(bytes, caller_data(caller)),
+        CommandData::Pieces(pieces) => drv.output(&io_views(&pieces), caller_data(caller)),
+    };
+    if done {
         handle.add_bytes_out(size);
     }
 }
@@ -169,35 +192,31 @@ pub(crate) fn output(
     }
     let async_nosuspend = asynchronous && flags.nosuspend && !flags.force;
     let try_call = sched_flags & (invalid_flags | PTS_FLGS_FORCE_SCHEDULE_OP) == 0;
-    let mut pieces = Vec::new();
     // A native driver has no `outputv`: its command data is one flat buffer.
-    let flattened = if drv.driver().is_native() {
-        iodata(data).map(|bytes| pieces.push((bytes, false)))
+    let command = if drv.driver().is_native() {
+        iodata(data).map(CommandData::Flat)
     } else {
-        io_pieces(data, &mut pieces)
+        let mut pieces = Vec::new();
+        io_pieces(data, &mut pieces).map(|()| CommandData::Pieces(pieces))
     };
-    if flattened.is_none() {
+    let Some(command) = command else {
         // io.c:2160 bad_value: bad_port_signal.
         if flags.bang {
             signal_badsig(handle, handle.id);
             return PortOp::Dropped;
         }
         return PortOp::Badarg;
-    }
+    };
     // erl_trace.c trace_port_receive for `command` (io.c:1503, call_driver_output).
-    let views = pieces
-        .iter()
-        .map(|(bytes, refc)| {
-            if *refc {
-                arinsal_drv::IoPiece::Refc(bytes)
-            } else {
-                arinsal_drv::IoPiece::Copied(bytes)
-            }
-        })
-        .collect::<Vec<_>>();
-    let segments = drv.outputv_trace_segments(&views);
-    let tracer = if flags.bang { from } else { caller };
-    trace_command_received(process, tracer, handle.id, &views, segments);
+    if crate::trace::tracing_enabled() {
+        let views = match &command {
+            CommandData::Flat(bytes) => vec![arinsal_drv::IoPiece::Copied(bytes)],
+            CommandData::Pieces(pieces) => io_views(pieces),
+        };
+        let segments = drv.outputv_trace_segments(&views);
+        let tracer = if flags.bang { from } else { caller };
+        trace_command_received(process, tracer, handle.id, &views, segments);
+    }
     if try_call {
         let reductions_left = ctx
             .as_deref()
@@ -207,7 +226,7 @@ pub(crate) fn output(
                 // Port of erts/emulator/beam/io.c:1005-1055 (try_imm_drv_call and
                 // finalize_imm_drv_call), OTP-29.1.1.
                 trace_immediate_process(process, caller, "out");
-                call_driver_output(handle, drv, flags.bang, caller, from, &pieces);
+                call_driver_output(handle, drv, flags.bang, caller, from, command);
                 let reductions_used = imm.reductions_used();
                 drop(imm);
                 trace_immediate_process(process, caller, "in");
@@ -258,7 +277,7 @@ pub(crate) fn output(
     if let Some(ctx) = ctx.filter(|_| want_ref) {
         set_save_end(process, ctx);
     }
-    let size = pieces.iter().map(|(bytes, _)| bytes.len()).sum();
+    let size = command.size();
     let task_handle = Arc::clone(handle);
     let task_drv = Arc::clone(drv);
     let bang = flags.bang;
@@ -266,7 +285,7 @@ pub(crate) fn output(
         // Port of erts/emulator/beam/io.c:1531 (port_sig_output), OTP-29.1.1.
         let result = match op {
             SigOp::Exec => {
-                call_driver_output(&task_handle, &task_drv, bang, caller, from, &pieces);
+                call_driver_output(&task_handle, &task_drv, bang, caller, from, command);
                 "true"
             }
             SigOp::AbortNosuspend => "false",

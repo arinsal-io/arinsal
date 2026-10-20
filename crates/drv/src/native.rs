@@ -22,6 +22,11 @@ pub trait NativeDriver: Send + Sync + 'static {
     fn stop(&self, _port: &DriverPort) {}
     /// `output`/`outputv` with the flattened command data.
     fn output(&self, _port: &DriverPort, _data: &[u8]) {}
+    /// `output` with a buffer the driver may keep (`erts_port_output` hands a native driver the
+    /// flattened command without a second copy).
+    fn output_owned(&self, port: &DriverPort, data: Vec<u8>) {
+        self.output(port, &data);
+    }
     /// `control`; `None` is `badarg`.
     fn control(&self, _port: &DriverPort, _command: u32, _data: &[u8]) -> Option<ControlReply> {
         None

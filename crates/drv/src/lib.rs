@@ -893,6 +893,28 @@ impl DriverPort {
         true
     }
 
+    /// `output` for a native driver with the flattened command data, which the driver may keep.
+    ///
+    /// Port of erts/emulator/beam/io.c:1468 (call_driver_output), OTP-29.1.1.
+    pub fn output_owned(&self, data: Vec<u8>, caller: u64) -> bool {
+        let _guard = self.guard();
+        if !self.live() {
+            return false;
+        }
+        self.set_caller(caller);
+        if let Some(native) = &self.driver.native {
+            native.output_owned(self, data);
+        } else if let Some(output) = self.driver.callbacks.output {
+            let mut buf = data;
+            // SAFETY: the buffer outlives the call; drv_data came from start.
+            unsafe { output(self.data(), buf.as_mut_ptr().cast(), buf.len()) };
+        } else {
+            self.output(&[IoPiece::Copied(&data)], caller);
+        }
+        self.clear_caller();
+        true
+    }
+
     /// Return the `outputv` segments represented by this output, when the driver uses `outputv`.
     ///
     /// Port of erts/emulator/beam/io.c:1380 and erl_trace.c:2172, OTP-29.1.1.

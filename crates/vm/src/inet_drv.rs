@@ -196,6 +196,13 @@ impl NativeDriver for TcpInet {
         }
     }
 
+    // Port of inet_drv.c (tcp_inet_commandv): the flattened command is queued as it is.
+    fn output_owned(&self, port: &DriverPort, data: Vec<u8>) {
+        if let Some((sock, _handle)) = sock_of(port) {
+            command(&sock, Pid::from_data(port.caller()), data);
+        }
+    }
+
     // Port of inet_drv.c (tcp_inet_ctl).
     fn control(&self, port: &DriverPort, op: u32, data: &[u8]) -> Option<ControlReply> {
         let (sock, _handle) = sock_of(port)?;
