@@ -1,11 +1,10 @@
 //! ETS hash storage with OTP's segmented linear-hash directory.
 
 use crate::rwmtx::{RwMtxLock, RwMtxReadGuard, RwMtxWriteGuard};
-use crate::{EtsError, StoredTerm, TableType, WriteConcurrency};
+use crate::{DbTerm, EtsError, StoredTerm, TableType, WriteConcurrency};
 use arinsal_term::{HeapAlloc, Term, global_atoms, internal_hash};
 use parking_lot::RwLock as FastRwLock;
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
 const FIRST_SEGMENT: usize = 256;
@@ -36,21 +35,9 @@ fn mix64(mut hash: u64) -> u64 {
     hash ^ (hash >> 33)
 }
 
-/// Port of `HashDbTerm` in erl_db_hash.h:41-49, OTP-29.1.1.
-pub(super) struct HashDbTerm {
-    next: Option<Box<HashDbTerm>>,
-    hvalue: u64,
-    pseudo_deleted: bool,
-    pub(super) object: StoredTerm,
-}
-
-impl Deref for HashDbTerm {
-    type Target = StoredTerm;
-
-    fn deref(&self) -> &Self::Target {
-        &self.object
-    }
-}
+/// Port of `HashDbTerm` in erl_db_hash.h:41-49, OTP-29.1.1: the bucket link, the hash value and
+/// the `DbTerm` are one block.
+pub(super) type HashDbTerm = StoredTerm;
 
 /// Port of the bucket head in `struct segment` in erl_db_hash.c.
 #[derive(Default)]
@@ -88,20 +75,6 @@ impl<'a> Iterator for HashIter<'a> {
                 return Some(node);
             }
         }
-    }
-}
-
-struct HashIterMut<'a> {
-    next: Option<&'a mut HashDbTerm>,
-}
-
-impl<'a> Iterator for HashIterMut<'a> {
-    type Item = &'a mut StoredTerm;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let node = self.next.take()?;
-        self.next = node.next.as_deref_mut();
-        Some(&mut node.object)
     }
 }
 
@@ -455,7 +428,7 @@ impl HashStorage {
     /// Insert a prepared object under its hash stripe.
     pub(super) fn insert_shared(
         &self,
-        mut object: StoredTerm,
+        mut object: DbTerm,
         hash: u64,
         table_type: TableType,
         keypos: usize,
@@ -481,7 +454,7 @@ impl HashStorage {
     // Port of erts/emulator/beam/erl_db_hash.c (db_put_hash), OTP-29.1.1.
     pub(super) fn insert_exclusive(
         &mut self,
-        mut object: StoredTerm,
+        mut object: DbTerm,
         hash: u64,
         table_type: TableType,
         keypos: usize,
@@ -511,7 +484,7 @@ impl HashStorage {
     /// `insert_exclusive` with the extra hash-bag comparison reductions reported by erts.
     pub(super) fn insert_exclusive_counted(
         &mut self,
-        mut object: StoredTerm,
+        mut object: DbTerm,
         hash: u64,
         table_type: TableType,
         keypos: usize,
@@ -587,9 +560,9 @@ impl HashStorage {
                 let current = node?;
                 if !current.pseudo_deleted
                     && current.hvalue == hash >> 1
-                    && exact_key(current.object.key(keypos), key)
+                    && exact_key(current.key(keypos), key)
                 {
-                    break &mut current.object;
+                    break current;
                 }
                 node = current.next.as_deref_mut();
             };
@@ -637,22 +610,23 @@ impl HashStorage {
         hash: u64,
         keypos: usize,
         fixed: bool,
-        update: impl FnOnce(Option<&StoredTerm>) -> Result<Option<StoredTerm>, E>,
+        update: impl FnOnce(Option<&StoredTerm>) -> Result<Option<DbTerm>, E>,
     ) -> Result<bool, E> {
         let hvalue = hash >> 1;
         let mut update = Some(update);
         let (changed, inserted, memory_delta) =
             self.with_hash_bucket_mut(hvalue, |_slot, bucket| {
                 let mut link = &mut bucket.head;
-                while link.as_ref().is_some_and(|node| {
-                    node.hvalue != hvalue || !exact_key(node.object.key(keypos), key)
-                }) {
+                while link
+                    .as_ref()
+                    .is_some_and(|node| node.hvalue != hvalue || !exact_key(node.key(keypos), key))
+                {
                     link = &mut link.as_mut().unwrap().next;
                 }
                 let found = link
                     .as_ref()
                     .filter(|node| !node.pseudo_deleted)
-                    .map(|node| &node.object);
+                    .map(|node| &**node);
                 let Some(mut replacement) = update.take().unwrap()(found)? else {
                     return Ok((false, false, 0));
                 };
@@ -663,13 +637,15 @@ impl HashStorage {
                         - if revived {
                             0
                         } else {
-                            node.object.db_size_words as isize
+                            node.db_size_words as isize
                         };
-                    replacement.order = node.object.order;
-                    replacement.group_order = node.object.group_order;
-                    node.object = replacement;
+                    replacement.order = node.order;
+                    replacement.group_order = node.group_order;
+                    // Port of erl_db_hash.c (db_put_hash): the new block takes the old one's
+                    // place in the chain.
+                    replacement.next = node.next.take();
+                    *link = Some(replacement);
                     if revived {
-                        node.pseudo_deleted = false;
                         self.add_items(hash, 1);
                         return Ok((true, true, memory_delta));
                     }
@@ -678,13 +654,8 @@ impl HashStorage {
                 let memory_delta = replacement.db_size_words as isize;
                 replacement.order = self.next_order.fetch_add(1, Ordering::Relaxed);
                 replacement.group_order = replacement.order;
-                let new = Box::new(HashDbTerm {
-                    next: link.take(),
-                    hvalue,
-                    pseudo_deleted: false,
-                    object: replacement,
-                });
-                *link = Some(new);
+                replacement.next = link.take();
+                *link = Some(replacement);
                 self.add_items(hash, 1);
                 Ok((true, true, memory_delta))
             })?;
@@ -804,27 +775,28 @@ impl HashStorage {
         key: Term,
         hash: u64,
         keypos: usize,
-        mut replace: impl FnMut(&StoredTerm) -> Result<Option<StoredTerm>, E>,
+        mut replace: impl FnMut(&StoredTerm) -> Result<Option<DbTerm>, E>,
     ) -> Result<usize, E> {
         let (count, memory_delta) = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
             let mut count = 0;
             let mut memory_delta = 0;
-            let mut node = bucket.head.as_deref_mut();
-            while let Some(current) = node {
+            let mut link = &mut bucket.head;
+            while let Some(current) = link.as_mut() {
                 if !current.pseudo_deleted
                     && current.hvalue == hash >> 1
-                    && exact_key(current.object.key(keypos), key)
-                    && let Some(mut replacement) = replace(&current.object)?
+                    && exact_key(current.key(keypos), key)
+                    && let Some(mut replacement) = replace(current)?
                 {
                     memory_delta +=
-                        replacement.db_size_words as isize - current.object.db_size_words as isize;
-                    replacement.order = current.object.order;
-                    replacement.group_order = current.object.group_order;
+                        replacement.db_size_words as isize - current.db_size_words as isize;
+                    replacement.order = current.order;
+                    replacement.group_order = current.group_order;
                     replacement.hvalue = current.hvalue;
-                    current.object = replacement;
+                    replacement.next = current.next.take();
+                    *link = Some(replacement);
                     count += 1;
                 }
-                node = current.next.as_deref_mut();
+                link = &mut link.as_mut().unwrap().next;
             }
             Ok((count, memory_delta))
         })?;
@@ -1069,7 +1041,7 @@ impl HashStorage {
                 for node in (HashIter {
                     next: bucket.head.as_deref(),
                 }) {
-                    if !visit(&node.object)? {
+                    if !visit(node)? {
                         return Ok::<_, E>(false);
                     }
                 }
@@ -1095,9 +1067,9 @@ impl HashStorage {
         while let Some(node) = next {
             if !node.pseudo_deleted
                 && node.hvalue == hval >> 1
-                && arinsal_term::exact_eq(node.object.key(keypos), key)
+                && arinsal_term::exact_eq(node.key(keypos), key)
             {
-                return Some(&mut node.object);
+                return Some(node);
             }
             next = node.next.as_deref_mut();
         }
@@ -1136,13 +1108,13 @@ impl HashStorage {
                     next: bucket.head.as_deref(),
                 }) {
                     if !found {
-                        if node.hvalue == hash && exact_key(node.object.key(keypos), key) {
+                        if node.hvalue == hash && exact_key(node.key(keypos), key) {
                             found = true;
                         }
                         continue;
                     }
-                    if node.hvalue != hash || !exact_key(node.object.key(keypos), key) {
-                        successor = Some(node.object.key(keypos));
+                    if node.hvalue != hash || !exact_key(node.key(keypos), key) {
+                        successor = Some(node.key(keypos));
                         break;
                     }
                 }
@@ -1162,7 +1134,7 @@ impl HashStorage {
                         next: bucket.head.as_deref(),
                     }
                     .next()
-                    .map(|node| node.object.key(keypos))
+                    .map(|node| node.key(keypos))
                 }) {
                     return Ok(Some(key));
                 }
@@ -1274,26 +1246,27 @@ impl HashStorage {
     /// Replace live objects in place, keeping their bucket position and insertion order.
     pub(super) fn replace_each(
         &mut self,
-        mut replace: impl FnMut(&StoredTerm) -> Result<Option<StoredTerm>, EtsError>,
+        mut replace: impl FnMut(&StoredTerm) -> Result<Option<DbTerm>, EtsError>,
     ) -> Result<usize, EtsError> {
         let mut count = 0;
         for slot in 0..self.nactive() {
             let stripe_ix = self.stripe_index(slot);
             let mut memory_delta = 0;
-            let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
-            while let Some(current) = node {
+            let mut link = &mut self.segment_bucket_mut(slot).head;
+            while let Some(current) = link.as_mut() {
                 if !current.pseudo_deleted
-                    && let Some(mut replacement) = replace(&current.object)?
+                    && let Some(mut replacement) = replace(current)?
                 {
                     memory_delta +=
-                        replacement.db_size_words as isize - current.object.db_size_words as isize;
-                    replacement.order = current.object.order;
-                    replacement.group_order = current.object.group_order;
-                    replacement.hvalue = current.object.hvalue;
-                    current.object = replacement;
+                        replacement.db_size_words as isize - current.db_size_words as isize;
+                    replacement.order = current.order;
+                    replacement.group_order = current.group_order;
+                    replacement.hvalue = current.hvalue;
+                    replacement.next = current.next.take();
+                    *link = Some(replacement);
                     count += 1;
                 }
-                node = current.next.as_deref_mut();
+                link = &mut link.as_mut().unwrap().next;
             }
             self.stripes[stripe_ix]
                 .memory_words
@@ -1321,7 +1294,7 @@ impl HashStorage {
                 let selected = if node.pseudo_deleted {
                     Ok(false)
                 } else {
-                    predicate(&node.object)
+                    predicate(&node)
                 };
                 match selected {
                     Ok(true) => {
@@ -1329,7 +1302,7 @@ impl HashStorage {
                         *link = node.next.take();
                         removed += 1;
                         per_lock[counter] += 1;
-                        per_stripe[stripe_ix] -= node.object.db_size_words as isize;
+                        per_stripe[stripe_ix] -= node.db_size_words as isize;
                     }
                     Ok(false) => {
                         *link = Some(node);
@@ -1386,7 +1359,7 @@ impl HashStorage {
                 next: bucket.head.as_deref(),
             }) {
                 if with_deleted || !node.pseudo_deleted {
-                    visit(&node.object, node.pseudo_deleted)?;
+                    visit(node, node.pseudo_deleted)?;
                 }
             }
             Ok(())
@@ -1406,7 +1379,7 @@ impl HashStorage {
                     next: bucket.head.as_deref(),
                 }
                 .next()
-                .map(|node| visit(&node.object))
+                .map(&mut visit)
             }) {
                 return Some(result);
             }
@@ -1535,7 +1508,6 @@ impl HashStorage {
                 };
                 let mut last_group = None;
                 for object in ordered {
-                    let object = &object.object;
                     if last_group != Some(object.group_order) {
                         rank += 1;
                         last_group = Some(object.group_order);
@@ -1544,13 +1516,12 @@ impl HashStorage {
                 }
             }
             for slot in [source, destination] {
-                let mut objects = HashIterMut {
-                    next: self.segment_bucket_mut(slot).head.as_deref_mut(),
-                };
-                for object in &mut objects {
+                let mut link = &mut self.segment_bucket_mut(slot).head;
+                while let Some(object) = link {
                     if let Some(&rank) = ranks.get(&object.order) {
                         object.group_order = rank;
                     }
+                    link = &mut object.next;
                 }
             }
             self.shrink();
@@ -1721,7 +1692,7 @@ impl ConcurrentHashStorage {
 
     pub(super) fn insert(
         &self,
-        mut object: StoredTerm,
+        mut object: DbTerm,
         hash: u64,
         table_type: TableType,
         keypos: usize,
@@ -1754,15 +1725,16 @@ impl ConcurrentHashStorage {
         object.hvalue = hvalue;
         let mut cursor = &mut bucket.head;
         while let Some(node) = cursor {
-            if node.hvalue == hvalue && exact_key(node.object.key(keypos), key) {
+            if node.hvalue == hvalue && exact_key(node.key(keypos), key) {
                 match table_type {
                     TableType::Set => {
-                        object.order = node.object.order;
-                        object.group_order = node.object.group_order;
-                        node.object = object;
+                        object.order = node.order;
+                        object.group_order = node.group_order;
+                        object.next = node.next.take();
+                        *cursor = Some(object);
                         return;
                     }
-                    TableType::Bag if node.object.exact_eq_stored(&object) => return,
+                    TableType::Bag if node.exact_eq_stored(&object) => return,
                     TableType::Bag => {}
                     TableType::DuplicateBag => {}
                     TableType::OrderedSet => unreachable!(),
@@ -1770,13 +1742,8 @@ impl ConcurrentHashStorage {
             }
             cursor = &mut cursor.as_mut().unwrap().next;
         }
-        let item = Box::new(HashDbTerm {
-            next: bucket.head.take(),
-            hvalue,
-            pseudo_deleted: false,
-            object,
-        });
-        bucket.head = Some(item);
+        object.next = bucket.head.take();
+        bucket.head = Some(object);
         locks[lock_ix].nitems.fetch_add(1, Ordering::Relaxed);
         let local_items = locks[lock_ix].nitems.load(Ordering::Relaxed);
         drop(slot);
@@ -1955,8 +1922,8 @@ impl ConcurrentHashStorage {
         let mut results = Vec::new();
         let mut node = bucket.head.as_deref();
         while let Some(current) = node {
-            if current.hvalue == hash >> 1 && exact_key(current.object.key(keypos), key) {
-                results.push(current.object.copy_out(dst)?);
+            if current.hvalue == hash >> 1 && exact_key(current.key(keypos), key) {
+                results.push(current.copy_out(dst)?);
             }
             node = current.next.as_deref();
         }
@@ -1977,7 +1944,7 @@ impl ConcurrentHashStorage {
         };
         let mut node = guard.bucket(index).head.as_deref();
         while let Some(current) = node {
-            if current.hvalue == hash >> 1 && exact_key(current.object.key(keypos), key) {
+            if current.hvalue == hash >> 1 && exact_key(current.key(keypos), key) {
                 return true;
             }
             node = current.next.as_deref();
@@ -2000,7 +1967,7 @@ impl ConcurrentHashStorage {
         let mut link = &mut guard.bucket_mut(index).head;
         let mut removed = 0;
         while let Some(mut node) = link.take() {
-            if node.hvalue == hash >> 1 && exact_key(node.object.key(keypos), key) {
+            if node.hvalue == hash >> 1 && exact_key(node.key(keypos), key) {
                 *link = node.next.take();
                 removed += 1;
             } else {
@@ -2025,7 +1992,7 @@ impl ConcurrentHashStorage {
 // Port of erts/emulator/beam/erl_db_hash.c (db_put_hash), OTP-29.1.1.
 fn put_in_bucket(
     bucket: &mut HashBucket,
-    mut object: StoredTerm,
+    mut object: DbTerm,
     table_type: TableType,
     keypos: usize,
     new_only: bool,
@@ -2033,14 +2000,13 @@ fn put_in_bucket(
 ) -> (bool, bool, isize, usize) {
     let hvalue = object.hvalue;
     let key = object.key(keypos);
-    let has_key =
-        |node: &HashDbTerm| node.hvalue == hvalue && exact_key(node.object.key(keypos), key);
+    let has_key = |node: &HashDbTerm| node.hvalue == hvalue && exact_key(node.key(keypos), key);
     let mut link = &mut bucket.head;
     let mut extra_reds = 0;
     while link.as_ref().is_some_and(|node| !has_key(node)) {
         link = &mut link.as_mut().unwrap().next;
     }
-    let group_order = link.as_ref().map(|node| node.object.group_order);
+    let group_order = link.as_ref().map(|node| node.group_order);
     if table_type == TableType::Set
         && let Some(node) = link.as_mut()
     {
@@ -2051,13 +2017,13 @@ fn put_in_bucket(
             - if node.pseudo_deleted {
                 0
             } else {
-                node.object.db_size_words as isize
+                node.db_size_words as isize
             };
-        object.order = node.object.order;
-        object.group_order = node.object.group_order;
+        object.order = node.order;
+        object.group_order = node.group_order;
         let revived = node.pseudo_deleted;
-        node.pseudo_deleted = false;
-        node.object = object;
+        object.next = node.next.take();
+        *link = Some(object);
         return (true, revived, memory_delta, 0);
     }
     if new_only {
@@ -2076,7 +2042,7 @@ fn put_in_bucket(
         let mut revived = None;
         let mut memory_delta = 0;
         while let Some(node) = cursor.as_deref_mut().filter(|node| has_key(node)) {
-            if node.object.exact_eq_stored(&object) {
+            if node.exact_eq_stored(&object) {
                 if !node.pseudo_deleted {
                     return (true, false, 0, extra_reds);
                 }
@@ -2104,12 +2070,8 @@ fn put_in_bucket(
     let memory_delta = object.db_size_words as isize;
     object.order = next_order();
     object.group_order = group_order.unwrap_or(object.order);
-    *link = Some(Box::new(HashDbTerm {
-        next: link.take(),
-        hvalue,
-        pseudo_deleted: false,
-        object,
-    }));
+    object.next = link.take();
+    *link = Some(object);
     (true, true, memory_delta, extra_reds)
 }
 
@@ -2126,10 +2088,9 @@ fn erase_in_bucket(
     let mut count = 0;
     let mut memory_delta = 0;
     while let Some(mut node) = link.take() {
-        if !node.pseudo_deleted && node.hvalue == hvalue && exact_key(node.object.key(keypos), key)
-        {
+        if !node.pseudo_deleted && node.hvalue == hvalue && exact_key(node.key(keypos), key) {
             count += 1;
-            memory_delta -= node.object.db_size_words as isize;
+            memory_delta -= node.db_size_words as isize;
             if count == 1 && fixed {
                 // Pseudo remove (no need to keep several of the same key).
                 node.pseudo_deleted = true;
@@ -2165,12 +2126,12 @@ fn erase_object_in_bucket(
     let (mut count, mut nkeys) = (0, 0);
     let mut memory_delta = 0;
     while let Some(mut node) = link.take() {
-        let same_key = node.hvalue == hvalue && exact_key(node.object.key(keypos), key);
+        let same_key = node.hvalue == hvalue && exact_key(node.key(keypos), key);
         if same_key && !node.pseudo_deleted {
             nkeys += 1;
-            if node.object.exact_eq_term(object) {
+            if node.exact_eq_term(object) {
                 count += 1;
-                memory_delta -= node.object.db_size_words as isize;
+                memory_delta -= node.db_size_words as isize;
                 if nkeys == 1 && fixed {
                     node.pseudo_deleted = true;
                     *link = Some(node);
@@ -2206,8 +2167,7 @@ fn take_in_bucket<H: HeapAlloc>(
     dst: &mut H,
 ) -> Result<(Vec<Term>, isize, isize), EtsError> {
     let multi = matches!(table_type, TableType::Bag | TableType::DuplicateBag);
-    let has_key =
-        |node: &HashDbTerm| node.hvalue == hvalue && exact_key(node.object.key(keypos), key);
+    let has_key = |node: &HashDbTerm| node.hvalue == hvalue && exact_key(node.key(keypos), key);
     let mut values = Vec::new();
     // The first live node, then (bag types) every following node of the same key:
     // get_term_list's `bend` also spans pseudo-deleted ones, which are counted below.
@@ -2222,8 +2182,8 @@ fn take_in_bucket<H: HeapAlloc>(
     let mut memory_delta = 0;
     while let Some(mut node) = link.take() {
         if !node.pseudo_deleted {
-            values.push(node.object.copy_out(dst)?);
-            memory_delta -= node.object.db_size_words as isize;
+            values.push(node.copy_out(dst)?);
+            memory_delta -= node.db_size_words as isize;
         }
         count += 1;
         // Pseudo remove only the first node (no need to keep several of the same key).

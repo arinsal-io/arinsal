@@ -1,4 +1,4 @@
-use super::{EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, cmp};
+use super::{DbTerm, EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, cmp};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
@@ -43,11 +43,11 @@ pub(super) struct Node {
     size: usize,
     pub(super) balance: i8,
     height: u8,
-    pub(super) object: StoredTerm,
+    pub(super) object: DbTerm,
 }
 
 impl Node {
-    fn new(object: StoredTerm) -> Box<Self> {
+    fn new(object: DbTerm) -> Box<Self> {
         Box::new(Self {
             object,
             balance: 0,
@@ -59,7 +59,7 @@ impl Node {
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
-    pub(super) fn insert(root: Option<Box<Self>>, object: StoredTerm, keypos: usize) -> Box<Self> {
+    pub(super) fn insert(root: Option<Box<Self>>, object: DbTerm, keypos: usize) -> Box<Self> {
         let key = object.key(keypos);
         Self::insert_with_key(root, object, key, keypos, false)
             .0
@@ -71,7 +71,7 @@ impl Node {
     // Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
     pub(super) fn insert_with_key(
         root: Option<Box<Self>>,
-        object: StoredTerm,
+        object: DbTerm,
         key: Term,
         keypos: usize,
         key_clash_fail: bool,
@@ -160,7 +160,7 @@ impl Node {
     /// changes, and a replaced object is overwritten at the node that holds it.
     fn insert_branch(
         mut root: Option<Box<Self>>,
-        object: StoredTerm,
+        object: DbTerm,
         key: Term,
         keypos: usize,
         key_clash_fail: bool,
@@ -187,7 +187,7 @@ impl Node {
 
     fn insert_at(
         slot: &mut Option<Box<Self>>,
-        object: &mut Option<StoredTerm>,
+        object: &mut Option<DbTerm>,
         key: Term,
         keypos: usize,
         key_clash_fail: bool,

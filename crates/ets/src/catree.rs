@@ -1,6 +1,6 @@
 //! Safe contention-adapting ordered storage built from the ETS AVL tree.
 
-use super::{EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, cmp};
+use super::{DbTerm, EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, cmp};
 use crate::rwmtx::{RwMtxLock, RwMtxReadGuard, RwMtxWriteGuard};
 use crate::tree::Node;
 use arc_swap::ArcSwap;
@@ -100,7 +100,7 @@ impl BaseNode {
 #[derive(Clone)]
 struct RouteEntry {
     /// The first key in this base node; the first route entry has no lower bound.
-    first_key: Option<Arc<StoredTerm>>,
+    first_key: Option<Arc<DbTerm>>,
     base: Arc<BaseNode>,
 }
 
@@ -112,7 +112,7 @@ struct RouteSnapshot {
 enum RouteNode {
     Base(Arc<BaseNode>),
     Branch {
-        key: Arc<StoredTerm>,
+        key: Arc<DbTerm>,
         left: Box<RouteNode>,
         right: Box<RouteNode>,
     },
@@ -240,7 +240,7 @@ impl CATree {
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_put_catree), OTP-29.1.1.
-    pub(crate) fn insert(&self, object: StoredTerm) {
+    pub(crate) fn insert(&self, object: DbTerm) {
         let key = object.key(self.keypos);
         let mut object = Some(object);
         loop {
@@ -273,7 +273,7 @@ impl CATree {
 
     /// Insert an object only when its ordered key is absent.
     // Port of erts/emulator/beam/erl_db_catree.c (db_put_catree with key_clash_fail), OTP-29.1.1.
-    pub(crate) fn insert_new(&self, object: StoredTerm) -> bool {
+    pub(crate) fn insert_new(&self, object: DbTerm) -> bool {
         let key = object.key(self.keypos);
         let mut object = Some(object);
         loop {
@@ -334,7 +334,7 @@ impl CATree {
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_put_catree), OTP-29.1.1.
-    pub(crate) fn insert_many(&self, objects: Vec<StoredTerm>) {
+    pub(crate) fn insert_many(&self, objects: Vec<DbTerm>) {
         for object in objects {
             self.insert(object);
         }
@@ -467,7 +467,7 @@ impl CATree {
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_get_catree), OTP-29.1.1.
-    pub(crate) fn matching(&self, key: Term) -> Result<Vec<StoredTerm>, EtsError> {
+    pub(crate) fn matching(&self, key: Term) -> Result<Vec<DbTerm>, EtsError> {
         loop {
             let routes = self.routes.load();
             let base = routes.find_base(key);
@@ -1060,7 +1060,7 @@ fn scheduler_local_random() -> u32 {
 }
 
 /// Port of erts/emulator/beam/erl_db_catree.c (join_trees), OTP-29.1.1.
-fn key_object(key: Term) -> Result<StoredTerm, EtsError> {
+fn key_object(key: Term) -> Result<DbTerm, EtsError> {
     let mut heap = VecHeap::new();
     let tuple = TermBuilder::new(&mut heap)
         .tuple(&[key])
