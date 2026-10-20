@@ -1,6 +1,5 @@
 use arinsal_etf::decode;
 use arinsal_term::{VecHeap, cmp, cmp_exact, exact_eq, from_owned, loose_eq};
-use similar_asserts::assert_eq;
 use std::cmp::Ordering;
 use std::process::Command;
 
@@ -27,7 +26,7 @@ fn sign(order: Ordering) -> i8 {
 #[test]
 fn compound_term_comparison_matches_erts() {
     let expression = r#"
-        Pairs = [
+        BasePairs = [
             {{alpha, 1, {nested, [a, 2]}}, {alpha, 1, {nested, [a, 2]}}},
             {{alpha, 1, beta}, {alpha, 2, beta}},
             {[a, 1, b, 2], [a, 1, b, 3]},
@@ -39,6 +38,12 @@ fn compound_term_comparison_matches_erts() {
             {#{1 => a, aa_cmp_key => b, {z, 1} => c},
              #{1 => a, aa_cmp_key => c, {z, 1} => c}},
             {#{number_key => 1}, #{number_key => 1.0}},
+            {maps:from_list([{#{x => 1}, a}, {#{y => 2}, b}]),
+             maps:from_list([{#{x => 1}, a}, {#{y => 3}, b}])},
+            {maps:from_list([{#{x => 1}, nested} |
+                             [{N, N} || N <- lists:seq(1, 40)]]),
+             maps:from_list([{#{x => 2}, nested} |
+                             [{N, N} || N <- lists:seq(1, 40)]])},
             {#{1 => #{x => 1}, 2 => {a, [2]}},
              #{1 => #{x => 2}, 2 => {a, [2]}}},
             {maps:from_list([{N, N} || N <- lists:seq(1, 40)]),
@@ -58,6 +63,36 @@ fn compound_term_comparison_matches_erts() {
              maps:from_list([{N, if N == 1 -> #{x => 2}; true -> N end}
                              || N <- lists:seq(1, 40)])}
         ],
+        LongLeft = lists:seq(1, 4096),
+        LongRight = lists:seq(1, 4095) ++ [0],
+        TupleLeft = list_to_tuple(lists:seq(1, 2048)),
+        TupleRight = list_to_tuple(lists:seq(1, 2047) ++ [0]),
+        DeepLeft = lists:foldl(fun(_, Acc) -> {branch, Acc} end,
+                               leaf, lists:seq(1, 512)),
+        DeepRight = lists:foldl(fun(_, Acc) -> {branch, Acc} end,
+                                other_leaf, lists:seq(1, 512)),
+        MapPairs = lists:append([
+            begin
+                Entries = [{K, K} || K <- lists:seq(1, N)],
+                Map = maps:from_list(Entries),
+                Reordered = maps:from_list(lists:reverse(Entries)),
+                Changed = maps:from_list([{K, K + 1} || K <- lists:seq(1, N)]),
+                [{Map, Reordered}, {Map, Changed}]
+            end
+            || N <- lists:seq(0, 40)
+        ]),
+        NumberPairs = [
+            {9007199254740993, 9007199254740992.0},
+            {9007199254740992, 9007199254740992.0},
+            {(1 bsl 128) + 17, float(1 bsl 128)},
+            {-(1 bsl 127) - 7, -float(1 bsl 127)}
+        ],
+        MixedPairs = [
+            {[a, {b, [1, 2]}], [a, {b, [1, 3]}]}
+        ],
+        Pairs = BasePairs ++ MapPairs ++ NumberPairs ++ MixedPairs ++
+                [{LongLeft, LongRight}, {TupleLeft, TupleRight},
+                 {DeepLeft, DeepRight}],
         lists:foreach(fun({A, B}) ->
             Order = if A < B -> -1; A > B -> 1; true -> 0 end,
             ExactOrder = erts_internal:cmp_term(A, B),
@@ -88,29 +123,29 @@ fn compound_term_comparison_matches_erts() {
     let mut heap = VecHeap::new();
     for (index, row) in stdout.lines().enumerate() {
         let fields: Vec<_> = row.split_whitespace().collect();
-        assert_eq!(fields.len(), 6, "row {index}: {row}");
+        similar_asserts::assert_eq!(fields.len(), 6, "row {index}: {row}");
         let left = from_owned(&decode(&hex_bytes(fields[4])).unwrap(), &mut heap).unwrap();
         let right = from_owned(&decode(&hex_bytes(fields[5])).unwrap(), &mut heap).unwrap();
-        assert_eq!(
+        similar_asserts::assert_eq!(
             sign(cmp(left, right)),
             fields[0].parse::<i8>().unwrap(),
             "order {index}"
         );
-        assert_eq!(
+        similar_asserts::assert_eq!(
             sign(cmp_exact(left, right)),
             fields[1].parse::<i8>().unwrap(),
             "exact order {index}"
         );
-        assert_eq!(
+        similar_asserts::assert_eq!(
             loose_eq(left, right),
             fields[2] == "1",
             "loose equality {index}"
         );
-        assert_eq!(
+        similar_asserts::assert_eq!(
             exact_eq(left, right),
             fields[3] == "1",
             "exact equality {index}"
         );
     }
-    assert_eq!(stdout.lines().count(), 17);
+    similar_asserts::assert_eq!(stdout.lines().count(), 109);
 }
