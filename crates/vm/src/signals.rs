@@ -75,6 +75,10 @@ fn system_limit() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(atom("system_limit")))
 }
 
+fn rt_ref(process: &Process) -> Option<&Runtime> {
+    process.runtime.as_deref()
+}
+
 fn runtime(process: &Process) -> Result<&Runtime, VmError> {
     process
         .runtime
@@ -790,7 +794,10 @@ pub(crate) fn start_timer_bif(
     } else {
         None
     };
-    let rt = process.runtime.clone().ok_or_else(|| badarg("timer/3"))?;
+    let rt = process
+        .runtime
+        .as_deref()
+        .ok_or_else(|| badarg("timer/3"))?;
     // A dead pid gets a ref but no timer entry; an unresolved name can become registered
     // before its timer expires.
     let id = rt.next_ref();
@@ -805,7 +812,7 @@ pub(crate) fn start_timer_bif(
     let timer = if let Some(pid) = pid {
         sink.schedule_timer(pid, ms, message, wrapped)
     } else {
-        let runtime = rt.clone();
+        let runtime = process.runtime.clone().ok_or_else(|| badarg("timer/3"))?;
         let name = registered_name.expect("resolved timer name");
         sink.schedule_resolved_timer(
             ms,
@@ -1998,13 +2005,13 @@ pub(crate) fn register_light(
         return None;
     }
     let pid = Pid::from_term(*id)?;
-    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
-    let scheduler = rt.scheduler().ok()?;
-    let mut table = rt.reg.write();
+    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
+    let scheduler = rt_ref(process)?.scheduler().ok()?;
+    let mut table = rt_ref(process)?.reg.write();
     if !scheduler.lookup(pid)
         || scheduler.registered_atom_index(pid).is_some()
         || table.contains(name)
-        || !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::REG)
+        || !rt_ref(process)?.publish_proc_flag(pid, arinsal_sched::proc_flags::REG)
     {
         return None;
     }
@@ -2028,13 +2035,13 @@ pub(crate) fn unregister_light(
         return None;
     }
     let name = name.as_atom()?;
-    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
-    let mut table = rt.reg.write();
+    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
+    let mut table = rt_ref(process)?.reg.write();
     let Some(crate::register::RegId::Proc(pid)) = table.fetch(name) else {
         return None;
     };
     let _ = table.erase(name);
-    if let Ok(scheduler) = rt.scheduler() {
+    if let Ok(scheduler) = rt_ref(process)?.scheduler() {
         scheduler.clear_registered_atom_index(pid, name.0);
     }
     drop(table);
@@ -2089,11 +2096,11 @@ pub(crate) fn monitor_light(
     if pid == me {
         return None;
     }
-    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
-    if !rt.scheduler().ok()?.lookup(pid) {
+    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
+    if !rt_ref(process)?.scheduler().ok()?.lookup(pid) {
         return None;
     }
-    let id = rt.next_ref();
+    let id = rt_ref(process)?.next_ref();
     let ref_term = reference(process, id).ok()?;
     let data = crate::proc_create::default_monitor_data();
     process.cold_mut().monitors.insert(
@@ -2106,9 +2113,9 @@ pub(crate) fn monitor_light(
     );
     if alias_mode.is_some() {
         // Bound before the signal leaves: the target may reply through the alias at once.
-        rt.alias_bind_prio(id, Some(me), false);
+        rt_ref(process)?.alias_bind_prio(id, Some(me), false);
     }
-    if rt
+    if rt_ref(process)?
         .scheduler()
         .ok()?
         .signal_ordered(
@@ -2123,7 +2130,7 @@ pub(crate) fn monitor_light(
     {
         process.cold_mut().monitors.remove(&id);
         if alias_mode.is_some() {
-            rt.alias_bind(id, None);
+            rt_ref(process)?.alias_bind(id, None);
         }
         return None;
     }
@@ -2159,10 +2166,10 @@ pub(crate) fn alias_light(
         return None;
     }
     let me = process.self_pid?;
-    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
-    let id = rt.next_ref();
+    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
+    let id = rt_ref(process)?.next_ref();
     let reference = reference(process, id).ok()?;
-    rt.alias_bind_prio(id, Some(me), priority);
+    rt_ref(process)?.alias_bind_prio(id, Some(me), priority);
     process.cold_mut().monitors.insert(
         id,
         crate::proc_create::OriginMonitor::Alias { mode, priority },
@@ -2348,12 +2355,12 @@ pub(crate) fn demonitor_light(
         return None;
     }
     let me = process.self_pid?;
-    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
-    let scheduler = rt.scheduler().ok()?;
+    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
     let result = if let Some(pid) = active {
         if !matches!(demonitor_origin(process, id), OriginDemonitor::Process(_)) {
             return None;
         }
+        let scheduler = rt_ref(process)?.scheduler().ok()?;
         // erts consumes the held process monitor instead of sending the demonitor when it can
         // (erl_proc_sig_queue.c:1104). The executor ignores a dead target here as well.
         if !flush || !scheduler.cancel_pending_monitor(pid, id) {
@@ -2380,17 +2387,18 @@ pub(crate) fn unlink_light(
     }
     let pid = Pid::from_term(*target)?;
     let me = process.self_pid?;
-    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
+    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
     let cold = process.cold.as_deref()?;
     if !cold.links.contains(&pid) || cold.unlinking.values().any(|&target| target == pid) {
         return Some(Ok(atom("true")));
     }
-    let id = rt.next_ref();
+    let id = rt_ref(process)?.next_ref();
     process.cold_mut().unlinking.insert(id, pid);
-    let _ = rt
-        .scheduler()
-        .ok()?
-        .signal_ordered(me, pid, arinsal_sched::Signal::Unlink(id));
+    let _ = rt_ref(process)?.scheduler().ok()?.signal_ordered(
+        me,
+        pid,
+        arinsal_sched::Signal::Unlink(id),
+    );
     Some(Ok(atom("true")))
 }
 
@@ -2412,13 +2420,14 @@ pub(crate) fn link_light(
     if pid == me {
         return None;
     }
-    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
-    if !rt.scheduler().ok()?.lookup(pid) {
+    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
+    if !rt_ref(process)?.scheduler().ok()?.lookup(pid) {
         return None;
     }
     // A refused signal means the target is gone: leave the link state untouched and let the
     // executor answer noproc.
-    rt.scheduler()
+    rt_ref(process)?
+        .scheduler()
         .ok()?
         .signal_ordered(me, pid, arinsal_sched::Signal::Link)
         .ok()?;
@@ -2445,11 +2454,12 @@ pub(crate) fn exit2_light(
         return None;
     }
     let message = Message::copy_from(*reason).ok()?;
-    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
-    let _ = rt
-        .scheduler()
-        .ok()?
-        .signal_ordered(me, pid, arinsal_sched::Signal::Exit(message));
+    // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
+    let _ = rt_ref(process)?.scheduler().ok()?.signal_ordered(
+        me,
+        pid,
+        arinsal_sched::Signal::Exit(message),
+    );
     Some(Ok(atom("true")))
 }
 
