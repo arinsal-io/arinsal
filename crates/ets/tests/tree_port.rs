@@ -4,8 +4,13 @@ use arinsal_ets::{
     Protection, Registry, TableOptions, TableType, WriteConcurrency, match_spec::MatchProgram,
 };
 use arinsal_term::{Term, TermBuilder, VecHeap, from_owned, global_atoms, to_owned};
+use similar_asserts::assert_eq;
 
 fn options() -> TableOptions {
+    options_with(WriteConcurrency::Disabled)
+}
+
+fn options_with(write_concurrency: WriteConcurrency) -> TableOptions {
     TableOptions {
         name: global_atoms().intern("ets_tree_port").unwrap(),
         named_table: false,
@@ -15,7 +20,7 @@ fn options() -> TableOptions {
         owner: Term::pid(1, 0).unwrap(),
         heir: None,
         read_concurrency: false,
-        write_concurrency: WriteConcurrency::Disabled,
+        write_concurrency,
         decentralized_counters: false,
         compressed: false,
     }
@@ -27,6 +32,10 @@ fn atom(name: &str) -> OwnedTerm {
 
 fn tuple(values: Vec<OwnedTerm>) -> OwnedTerm {
     OwnedTerm::Tuple(values)
+}
+
+fn op(name: &str, argument: OwnedTerm) -> OwnedTerm {
+    tuple(vec![atom(name), argument])
 }
 
 fn list(values: Vec<OwnedTerm>) -> OwnedTerm {
@@ -48,9 +57,9 @@ fn reference() -> Option<RefErl> {
     Some(erl)
 }
 
-fn run_local(ops: &[OwnedTerm]) -> Vec<OwnedTerm> {
+fn run_local(ops: &[OwnedTerm], write_concurrency: WriteConcurrency) -> Vec<OwnedTerm> {
     let mut registry = Registry::new();
-    let tid = registry.create(options()).unwrap();
+    let tid = registry.create(options_with(write_concurrency)).unwrap();
     let mut table = registry.get_mut(tid).unwrap();
     let mut results = Vec::new();
     for operation in ops {
@@ -68,6 +77,15 @@ fn run_local(ops: &[OwnedTerm]) -> Vec<OwnedTerm> {
                 table.insert(&[argument]).unwrap();
                 atom("true")
             }
+            "delete" => {
+                table.delete_key(argument);
+                atom("true")
+            }
+            "first" => table
+                .edge(false, &mut output)
+                .unwrap()
+                .map_or_else(|| atom("$end_of_table"), |term| to_owned(term).unwrap()),
+            "info_size" => OwnedTerm::Int(table.info().size as i64),
             "next" | "prev" => {
                 let found = if name == "next" {
                     table.next(argument, &mut output)
@@ -77,10 +95,17 @@ fn run_local(ops: &[OwnedTerm]) -> Vec<OwnedTerm> {
                 .unwrap();
                 found.map_or_else(|| atom("$end_of_table"), |term| to_owned(term).unwrap())
             }
-            "slot" => table
-                .slot(argument.as_small().unwrap() as usize, &mut output)
-                .unwrap()
-                .map_or_else(|| atom("$end_of_table"), |term| to_owned(term).unwrap()),
+            "slot" => match argument
+                .as_small()
+                .and_then(|index| usize::try_from(index).ok())
+            {
+                Some(index) => match table.slot(index, &mut output) {
+                    Ok(Some(term)) => to_owned(term).unwrap(),
+                    Ok(None) => atom("$end_of_table"),
+                    Err(_) => atom("badarg"),
+                },
+                None => atom("badarg"),
+            },
             "select" => {
                 let program = MatchProgram::compile(argument).unwrap();
                 list(
@@ -100,12 +125,33 @@ fn run_local(ops: &[OwnedTerm]) -> Vec<OwnedTerm> {
 }
 
 fn assert_reference(ops: Vec<OwnedTerm>) {
+    assert_reference_with_concurrency(ops, WriteConcurrency::Disabled);
+}
+
+fn assert_reference_with_concurrency(ops: Vec<OwnedTerm>, write_concurrency: WriteConcurrency) {
     let Some(erl) = reference() else { return };
-    let expected = erl.call("ets_ops", "run", &[atom("ordered_set"), list(ops.clone())]);
+    let write_enabled = write_concurrency != WriteConcurrency::Disabled;
+    let write_concurrency_term = atom(if write_enabled { "true" } else { "false" });
+    let expected = erl.call(
+        "ets_ops",
+        "run_ordered",
+        &[write_concurrency_term, list(ops.clone())],
+    );
     let CallResult::Ok(OwnedTerm::List { ref elems, .. }) = expected else {
         panic!("reference ETS call failed: {expected:?}");
     };
-    assert_eq!(run_local(&ops).as_slice(), elems.as_slice());
+    assert_eq!(
+        run_local(
+            &ops,
+            if write_enabled {
+                WriteConcurrency::Enabled
+            } else {
+                WriteConcurrency::Disabled
+            }
+        )
+        .as_slice(),
+        elems.as_slice()
+    );
 }
 
 #[test]
@@ -212,6 +258,44 @@ fn slot_vs_erl() {
             .collect(),
     );
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn slot_stack_history_and_size_vs_erl() {
+    let mut ops = vec![];
+    for key in [7, 2, 5, 9] {
+        ops.push(op(
+            "insert",
+            tuple(vec![OwnedTerm::Int(key), OwnedTerm::Int(key * 10)]),
+        ));
+    }
+    ops.extend([
+        op("slot", OwnedTerm::Int(0)),
+        op("slot", OwnedTerm::Int(3)),
+        op("info_size", OwnedTerm::Int(0)),
+        op("delete", OwnedTerm::Int(2)),
+        op("slot", OwnedTerm::Int(0)),
+        op("slot", OwnedTerm::Int(1)),
+        op("slot", OwnedTerm::Int(2)),
+        op("info_size", OwnedTerm::Int(0)),
+        op("insert", tuple(vec![OwnedTerm::Int(1), OwnedTerm::Int(10)])),
+        op("slot", OwnedTerm::Int(2)),
+        op("slot", OwnedTerm::Int(0)),
+        op("slot", OwnedTerm::Int(3)),
+        op("delete", OwnedTerm::Int(9)),
+        op("slot", OwnedTerm::Int(0)),
+        op("slot", OwnedTerm::Int(2)),
+        op("first", OwnedTerm::Int(0)),
+        op("next", OwnedTerm::Int(5)),
+        op("prev", OwnedTerm::Int(5)),
+        op("info_size", OwnedTerm::Int(0)),
+        op("slot", OwnedTerm::Int(-1)),
+        op("slot", atom("not_an_index")),
+        op("slot", OwnedTerm::Int(100)),
+    ]);
+
+    assert_reference_with_concurrency(ops.clone(), WriteConcurrency::Disabled);
+    assert_reference_with_concurrency(ops, WriteConcurrency::Enabled);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 -module(ets_ops).
--export([run/2, run_sequences/2, run_select/1, run_slots/1, run_counters/1, run_big_counters/0, run_big_counter_operands/0, run_element_default/0, run_lookup_element/1, run_count_delete/0, run_count_simple/1, run_continuation_slot/0, run_map_specs/2, run_replace/0, run_match/0, run_hash_traversal/2, run_hash_history/2, run_shrink/0, run_info/1, run_fixed_info/0, run_mutating_chunks/2, run_fixed/0, run_specs/1]).
+-export([run/2, run_ordered/2, run_sequences/2, run_select/1, run_slots/1, run_counters/1, run_big_counters/0, run_big_counter_operands/0, run_element_default/0, run_lookup_element/1, run_count_delete/0, run_count_simple/1, run_continuation_slot/0, run_map_specs/2, run_replace/0, run_match/0, run_hash_traversal/2, run_hash_history/2, run_shrink/0, run_info/1, run_fixed_info/0, run_mutating_chunks/2, run_fixed/0, run_specs/1]).
 
 run_map_specs(Object, Spec) ->
     ets:match_spec_run([Object], ets:match_spec_compile(Spec)).
@@ -119,7 +119,13 @@ walk_hash(_Table, '$end_of_table', Acc) -> lists:reverse(Acc);
 walk_hash(Table, Key, Acc) -> walk_hash(Table, ets:next(Table, Key), [Key | Acc]).
 
 run(Type, Ops) ->
-    Table = ets:new(ets_ops, [Type]),
+    run_with_options([Type], Ops).
+
+run_ordered(WriteConcurrency, Ops) ->
+    run_with_options([ordered_set, {write_concurrency, WriteConcurrency}], Ops).
+
+run_with_options(Options, Ops) ->
+    Table = ets:new(ets_ops, Options),
     lists:map(fun(Op) -> Result = apply_op(Table, Op),
                          {Result, ets:info(Table, size)} end, Ops).
 
@@ -129,9 +135,11 @@ apply_op(Table, {insert_new_list, Objects}) -> ets:insert_new(Table, Objects);
 apply_op(Table, {lookup, Key}) -> ets:lookup(Table, Key);
 apply_op(Table, {member, Key}) -> ets:member(Table, Key);
 apply_op(Table, {delete, Key}) -> ets:delete(Table, Key);
+apply_op(Table, {first, _}) -> ets:first(Table);
 apply_op(Table, {delete_object, Object}) -> ets:delete_object(Table, Object);
 apply_op(Table, {take, Key}) -> ets:take(Table, Key);
 apply_op(Table, {slot, Index}) -> safe(fun() -> ets:slot(Table, Index) end);
+apply_op(Table, {info_size, _}) -> ets:info(Table, size);
 apply_op(Table, {first, _}) -> ets:first(Table);
 apply_op(Table, {next, Key}) -> safe(fun() -> ets:next(Table, Key) end);
 apply_op(Table, {prev, Key}) -> safe(fun() -> ets:prev(Table, Key) end);

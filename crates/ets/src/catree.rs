@@ -1,8 +1,9 @@
 //! Safe contention-adapting ordered storage built from the ETS AVL tree.
 
 use super::{DbTerm, EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, cmp};
+use crate::dbterm::SlotSearch;
 use crate::rwmtx::{RwMtxLock, RwMtxReadGuard, RwMtxWriteGuard};
-use crate::tree::Node;
+use crate::tree::{Node, TreeRoot};
 use arc_swap::ArcSwap;
 use arinsal_term::{TermBuilder, VecHeap};
 use std::cmp::Ordering;
@@ -22,7 +23,7 @@ const LOW_NO_CONTRIBUTION_LIMIT: i64 = -20_000;
 const HIGH_NO_CONTRIBUTION_LIMIT: i64 = 20_000;
 
 struct BaseNode {
-    root: RwMtxLock<Option<Box<Node>>>,
+    root: RwMtxLock<TreeRoot>,
     lock_statistics: AtomicI64,
     is_valid: AtomicBool,
 }
@@ -30,7 +31,7 @@ struct BaseNode {
 impl BaseNode {
     // Port of erts/emulator/beam/erl_db_catree.c (create_base_node: the lock is a
     // frequent-read rwmutex when the table has DB_FREQ_READ), OTP-29.1.1.
-    fn new(root: Option<Box<Node>>, frequent_read: bool) -> Arc<Self> {
+    fn new(root: TreeRoot, frequent_read: bool) -> Arc<Self> {
         Arc::new(Self {
             root: if frequent_read {
                 RwMtxLock::new_freq_read(root)
@@ -43,7 +44,7 @@ impl BaseNode {
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (wlock_base_node), OTP-29.1.1.
-    fn write(&self) -> RwMtxWriteGuard<'_, Option<Box<Node>>> {
+    fn write(&self) -> RwMtxWriteGuard<'_, TreeRoot> {
         match self.root.try_write() {
             Some(guard) => {
                 // Port of erts/emulator/beam/erl_db_catree.c (wlock_base_node), OTP-29.1.1.
@@ -59,19 +60,19 @@ impl BaseNode {
         }
     }
 
-    fn write_no_stats(&self) -> RwMtxWriteGuard<'_, Option<Box<Node>>> {
+    fn write_no_stats(&self) -> RwMtxWriteGuard<'_, TreeRoot> {
         self.root.write()
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (rlock_base_node), OTP-29.1.1.
-    fn read(&self) -> RwMtxReadGuard<'_, Option<Box<Node>>> {
+    fn read(&self) -> RwMtxReadGuard<'_, TreeRoot> {
         self.read_at(arinsal_term::current_reader_group())
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (rlock_base_node), OTP-29.1.1, in reader
     /// group `group`.
     #[inline]
-    fn read_at(&self, group: usize) -> RwMtxReadGuard<'_, Option<Box<Node>>> {
+    fn read_at(&self, group: usize) -> RwMtxReadGuard<'_, TreeRoot> {
         match self.root.try_read_at(group) {
             Some(guard) => guard,
             None => {
@@ -212,7 +213,7 @@ impl CATree {
             frequent_read,
             routes: ArcSwap::from_pointee(RouteSnapshot::new(vec![RouteEntry {
                 first_key: None,
-                base: BaseNode::new(None, frequent_read),
+                base: BaseNode::new(TreeRoot::new(), frequent_read),
             }])),
             adaptation: Mutex::new(()),
             split_count: AtomicUsize::new(0),
@@ -254,14 +255,12 @@ impl CATree {
                 continue;
             }
             let new_words = object.as_ref().unwrap().db_size_words as isize;
-            let (updated, result) =
-                Node::insert_with_key(root.take(), object.take().unwrap(), key, self.keypos, false);
+            let result = root.insert_with_key(object.take().unwrap(), key, self.keypos, false);
             let old_words = match result {
                 crate::tree::InsertResult::Inserted => 0,
                 crate::tree::InsertResult::Replaced(words) => words as isize,
                 crate::tree::InsertResult::Exists => unreachable!("replacement cannot clash"),
             };
-            *root = updated;
             self.memory_words
                 .fetch_add(new_words - old_words, AtomicOrdering::Relaxed);
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
@@ -290,9 +289,7 @@ impl CATree {
                 .take()
                 .expect("CA-tree insert object retained on retry");
             let words = stored.db_size_words as isize;
-            let (updated, result) =
-                Node::insert_with_key(root.take(), stored, key, self.keypos, true);
-            *root = updated;
+            let result = root.insert_with_key(stored, key, self.keypos, true);
             let inserted = matches!(result, crate::tree::InsertResult::Inserted);
             if inserted {
                 self.memory_words.fetch_add(words, AtomicOrdering::Relaxed);
@@ -323,7 +320,7 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
-            let result = Node::get_mut(&mut root, key, self.keypos).and_then(|object| {
+            let result = root.get_mut(key, self.keypos).and_then(|object| {
                 update.take().expect("CA-tree update retained on retry")(object)
             });
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
@@ -500,11 +497,8 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
-            let (updated, removed_words) =
-                Node::remove_matching(root.take(), key, self.keypos, |found| {
-                    found.exact_eq_input(object)
-                });
-            *root = updated;
+            let removed_words =
+                root.remove_matching(key, self.keypos, |found| found.exact_eq_input(object));
             if let Some(removed_words) = removed_words {
                 self.memory_words
                     .fetch_sub(removed_words as isize, AtomicOrdering::Relaxed);
@@ -528,9 +522,7 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
-            let (updated, removed_words) =
-                Node::remove_matching(root.take(), key, self.keypos, |_| true);
-            *root = updated;
+            let removed_words = root.remove_matching(key, self.keypos, |_| true);
             if let Some(removed_words) = removed_words {
                 self.memory_words
                     .fetch_sub(removed_words as isize, AtomicOrdering::Relaxed);
@@ -545,14 +537,13 @@ impl CATree {
     /// Detach every base node's tree for incremental release, leaving one empty base node.
     ///
     /// Port of erts/emulator/beam/erl_db_catree.c (db_free_table_continue_catree), OTP-29.1.1.
-    #[expect(clippy::vec_box, reason = "tree links already own boxed nodes")]
-    pub(crate) fn take_all(&self) -> Vec<Box<Node>> {
+    pub(crate) fn take_all(&self) -> Vec<DbTerm> {
         let _adaptation = self.adaptation.lock().expect("CA-tree adaptation poisoned");
         let routes = self.routes.load_full();
         let mut roots = Vec::new();
         for route in routes.iter() {
             route.base.is_valid.store(false, AtomicOrdering::Release);
-            if let Some(root) = route.base.root.write().take() {
+            if let (Some(root), _) = route.base.root.write().take() {
                 roots.push(root);
             }
         }
@@ -560,7 +551,7 @@ impl CATree {
         self.routes
             .store(Arc::new(RouteSnapshot::new(vec![RouteEntry {
                 first_key: None,
-                base: BaseNode::new(None, self.frequent_read),
+                base: BaseNode::new(TreeRoot::new(), self.frequent_read),
             }])));
         roots
     }
@@ -575,10 +566,7 @@ impl CATree {
     /// the held guards cover the table exactly once.
     // Port of erts/emulator/beam/erl_db_catree.c (lock_all_bases for
     // db_calc_stats_catree / db_select_catree), OTP-29.1.1.
-    fn with_all_bases<R>(
-        &self,
-        visit: impl FnOnce(&[RwMtxReadGuard<'_, Option<Box<Node>>>]) -> R,
-    ) -> R {
+    fn with_all_bases<R>(&self, visit: impl FnOnce(&[RwMtxReadGuard<'_, TreeRoot>]) -> R) -> R {
         loop {
             let routes = self.routes.load_full();
             let guards: Vec<_> = routes.iter().map(|route| route.base.read()).collect();
@@ -595,7 +583,7 @@ impl CATree {
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_calc_stats_catree), OTP-29.1.1.
     pub(crate) fn count(&self) -> usize {
-        self.with_all_bases(|bases| bases.iter().map(|root| Node::count(root)).sum())
+        self.with_all_bases(|bases| bases.iter().map(|root| root.count()).sum())
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_calc_stats_catree), OTP-29.1.1.
@@ -617,9 +605,7 @@ impl CATree {
         };
         for route in iter {
             let root = route.base.read();
-            let count = Node::count(&root);
-            if count > 0 {
-                let object = Node::nth(&root, if last { count - 1 } else { 0 }).unwrap();
+            if let Some(object) = Node::edge(&root, last) {
                 return Ok(Some(arinsal_term::copy_term(object.key(self.keypos), dst)?));
             }
         }
@@ -693,11 +679,14 @@ impl CATree {
         let routes = self.routes.load();
         for route in routes.iter() {
             let root = route.base.read();
-            let count = Node::count(&root);
+            let count = root.count();
             if index < count {
-                return Node::nth(&root, index)
-                    .map(|object| copy_term_for_catree(object, dst))
-                    .transpose();
+                return match root.slot_search(index + 1) {
+                    SlotSearch::Found(object) => {
+                        Some(copy_term_for_catree(object, dst)).transpose()
+                    }
+                    SlotSearch::EndOfTable | SlotSearch::Out => Ok(None),
+                };
             }
             index -= count;
         }
@@ -861,18 +850,18 @@ impl CATree {
         {
             return;
         }
-        if Node::count(&root) < 2 {
+        if root.count() < 2 {
             base.lock_statistics.store(0, AtomicOrdering::Relaxed);
             return;
         }
         base.is_valid.store(false, AtomicOrdering::Release);
         let (left_root, right_root, first_right_key) =
-            Node::split_for_catree(root.take().expect("non-empty CA-tree base"), self.keypos);
+            std::mem::take(&mut *root).split_for_catree(self.keypos);
         let first_key = Some(Arc::new(
             key_object(first_right_key).expect("copying a route key succeeds"),
         ));
         base.lock_statistics.store(0, AtomicOrdering::Relaxed);
-        let left_base = BaseNode::new(Some(left_root), self.frequent_read);
+        let left_base = BaseNode::new(left_root, self.frequent_read);
         let right_base = BaseNode::new(right_root, self.frequent_read);
         let mut updated = routes.entries.clone();
         updated[index] = RouteEntry {
@@ -923,12 +912,12 @@ impl CATree {
         }
         left.is_valid.store(false, AtomicOrdering::Release);
         right.is_valid.store(false, AtomicOrdering::Release);
-        let left_tree = left_root.take();
-        let right_tree = right_root.take();
+        let left_tree = std::mem::take(&mut *left_root);
+        let right_tree = std::mem::take(&mut *right_root);
         // erts publishes the replacement route only after the merged tree is ready.
         // Keeping the old route entries installed makes operations on these two
         // bases retry while readers of unrelated bases remain independent.
-        let merged_root = Node::join_ordered(left_tree, right_tree);
+        let merged_root = TreeRoot::join_ordered(left_tree, right_tree);
         let joined = BaseNode::new(merged_root, self.frequent_read);
         let mut updated = routes.entries.clone();
         updated[left_index].base = Arc::clone(&joined);

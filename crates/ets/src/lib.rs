@@ -14,7 +14,7 @@ mod tree;
 mod tree_select;
 use catree::CATree;
 pub(crate) use dbterm::{DbTerm, StoredTerm};
-use tree::{InsertResult, Node};
+use tree::{InsertResult, Node, TreeRoot};
 pub use tree_select::{SavedKey, ScanPosition, TREE_SELECT_ITERATIONS, TreeScanEnd, TreeScanPlan};
 
 use arinsal_term::{
@@ -1874,19 +1874,19 @@ struct ConstantRangeSelection<'a, H: HeapAlloc> {
 }
 
 fn select_range_constant<H: HeapAlloc>(
-    root: &Option<Box<Node>>,
+    root: &dbterm::Link,
     state: &mut ConstantRangeSelection<'_, H>,
 ) -> Result<(), EtsError> {
     let Some(node) = root else {
         return Ok(());
     };
-    let key = node.object.key(state.keypos);
+    let key = node.key(state.keypos);
     let below = state.bounds.is_below(key);
     let above = state.bounds.is_above(key);
     let (first, second) = if state.reverse {
-        (&node.right, &node.left)
+        (&node.right, &node.next)
     } else {
-        (&node.left, &node.right)
+        (&node.next, &node.right)
     };
     if if state.reverse { !above } else { !below } {
         select_range_constant(first, state)?;
@@ -1908,7 +1908,7 @@ fn select_range_constant<H: HeapAlloc>(
 
 enum Storage {
     Hash(HashStorage),
-    Ordered(Option<Box<Node>>),
+    Ordered(TreeRoot),
     CATree(CATree),
 }
 
@@ -1990,7 +1990,7 @@ impl Table {
         }
         let storage = if options.table_type == TableType::OrderedSet {
             if options.write_concurrency == WriteConcurrency::Disabled {
-                Storage::Ordered(None)
+                Storage::Ordered(TreeRoot::new())
             } else {
                 Storage::CATree(CATree::new(options.keypos, options.read_concurrency))
             }
@@ -2028,7 +2028,7 @@ impl Table {
     /// OTP-compatible object count, including hash counter wrap behavior.
     pub fn len(&self) -> usize {
         match &self.storage {
-            Storage::Ordered(root) => Node::count(root),
+            Storage::Ordered(root) => root.count(),
             Storage::CATree(tree) => tree.count(),
             // An unsigned view of the signed counter: erts reads it as Uint, so a counter pushed
             // below zero by pseudo-deleted siblings (db_take_hash) wraps.
@@ -2094,7 +2094,7 @@ impl Table {
     /// Return core table metadata. The VM adds memory and scheduler details.
     pub fn info(&self) -> TableInfo {
         let key_count = match &self.storage {
-            Storage::Ordered(root) => Node::count(root),
+            Storage::Ordered(root) => root.count(),
             Storage::CATree(tree) => tree.count(),
             Storage::Hash(storage) => storage.key_count(self.options.keypos),
         };
@@ -2662,14 +2662,7 @@ impl Table {
         match &mut self.storage {
             Storage::Ordered(root) => {
                 let key = prepared.stored.key(self.options.keypos);
-                let (updated, result) = Node::insert_with_key(
-                    root.take(),
-                    prepared.stored,
-                    key,
-                    self.options.keypos,
-                    true,
-                );
-                *root = updated;
+                let result = root.insert_with_key(prepared.stored, key, self.options.keypos, true);
                 matches!(result, InsertResult::Inserted)
             }
             Storage::CATree(tree) => tree.insert_new(prepared.stored),
@@ -2752,7 +2745,7 @@ impl Table {
         let keypos = self.options.keypos;
         match &mut self.storage {
             Storage::Ordered(root) => {
-                *root = Some(Node::insert(root.take(), object, keypos));
+                root.insert(object, keypos);
                 0
             }
             Storage::CATree(tree) => {
@@ -3379,7 +3372,7 @@ impl Table {
     pub fn delete_key(&mut self, key: Term) {
         let fixed = self.fixed > 0;
         match &mut self.storage {
-            Storage::Ordered(root) => *root = Node::remove(root.take(), key, self.options.keypos),
+            Storage::Ordered(root) => drop(root.linkout(key, self.options.keypos)),
             Storage::CATree(tree) => tree.delete(key),
             Storage::Hash(storage) => {
                 storage.delete_key_exclusive(key, ets_hash(key), self.options.keypos, fixed);
@@ -3393,10 +3386,9 @@ impl Table {
         let fixed = self.fixed > 0;
         match &mut self.storage {
             Storage::Ordered(root) => {
-                *root = Node::remove_matching(root.take(), key, self.options.keypos, |found| {
+                root.remove_matching(key, self.options.keypos, |found| {
                     found.exact_eq_term(object)
-                })
-                .0;
+                });
             }
             Storage::CATree(tree) => tree.delete_object(key, object),
             Storage::Hash(storage) => storage.delete_object_exclusive(
@@ -3418,7 +3410,9 @@ impl Table {
     /// erl_db_tree.c (db_free_table_continue_tree), OTP-29.1.1.
     pub fn take_garbage(&mut self, whole: bool) -> Garbage {
         match &mut self.storage {
-            Storage::Ordered(root) => Garbage(GarbageKind::Tree(root.take().into_iter().collect())),
+            Storage::Ordered(root) => {
+                Garbage(GarbageKind::Tree(root.take().0.into_iter().collect()))
+            }
             Storage::CATree(tree) => Garbage(GarbageKind::Tree(tree.take_all())),
             Storage::Hash(storage) => {
                 // A fixed table keeps its objects pseudo-deleted in place: `free_garbage` marks
@@ -3466,7 +3460,7 @@ impl Table {
     /// Remove every object.
     pub fn delete_all_objects(&mut self) {
         match &mut self.storage {
-            Storage::Ordered(root) => *root = None,
+            Storage::Ordered(root) => drop(root.take()),
             Storage::CATree(tree) => tree.clear(),
             Storage::Hash(storage) => {
                 if self.fixed > 0 {
@@ -3587,14 +3581,20 @@ impl Table {
     pub fn slot<H: HeapAlloc>(&self, index: usize, dst: &mut H) -> Result<Option<Term>, EtsError> {
         match &self.storage {
             Storage::Ordered(root) => {
-                if index > Node::count(root) {
+                // Port of erts/emulator/beam/erl_db_tree.c (db_slot_tree_common), OTP-29.1.1.
+                if index > root.count() {
                     return Err(EtsError::BadArg);
                 }
-                if let Some(object) = Node::nth(root, index) {
-                    let object = object.copy_out(dst)?;
-                    Ok(Some(TermBuilder::new(dst).list_from_iter([object])?))
-                } else {
-                    Ok(None)
+                if index == root.count() {
+                    return Ok(None);
+                }
+                match root.slot_search(index + 1) {
+                    dbterm::SlotSearch::Found(object) => {
+                        let object = object.copy_out(dst)?;
+                        Ok(Some(TermBuilder::new(dst).list_from_iter([object])?))
+                    }
+                    dbterm::SlotSearch::EndOfTable => Ok(None),
+                    dbterm::SlotSearch::Out => Err(EtsError::BadArg),
                 }
             }
             Storage::CATree(tree) => {
@@ -3632,13 +3632,13 @@ impl Table {
             }
             return self.hash_next(key, dst);
         };
-        let mut node = root.as_deref();
+        let mut node = root.link().as_deref();
         let mut candidate = None;
         while let Some(current) = node {
-            let current_key = current.object.key(self.options.keypos);
+            let current_key = current.key(self.options.keypos);
             if cmp_ordered_key(key, current_key) == Ordering::Less {
                 candidate = Some(current_key);
-                node = current.left.as_deref();
+                node = current.next.as_deref();
             } else {
                 node = current.right.as_deref();
             }
@@ -3681,15 +3681,15 @@ impl Table {
             }
             return self.hash_next(key, dst);
         };
-        let mut node = root.as_deref();
+        let mut node = root.link().as_deref();
         let mut candidate = None;
         while let Some(current) = node {
-            let current_key = current.object.key(self.options.keypos);
+            let current_key = current.key(self.options.keypos);
             if cmp_ordered_key(key, current_key) == Ordering::Greater {
                 candidate = Some(current_key);
                 node = current.right.as_deref();
             } else {
-                node = current.left.as_deref();
+                node = current.next.as_deref();
             }
         }
         candidate.map(|key| Ok(copy_term(key, dst)?)).transpose()
@@ -3708,14 +3708,14 @@ impl Table {
                 .with_first_from_slot(0, |object| copy_term(object.key(self.options.keypos), dst))
                 .transpose()?);
         };
-        let mut node = root.as_deref();
+        let mut node = root.link().as_deref();
         let mut found = None;
         while let Some(current) = node {
-            found = Some(current.object.key(self.options.keypos));
+            found = Some(current.key(self.options.keypos));
             node = if last {
                 current.right.as_deref()
             } else {
-                current.left.as_deref()
+                current.next.as_deref()
             };
         }
         found.map(|key| Ok(copy_term(key, dst)?)).transpose()
@@ -4088,11 +4088,9 @@ impl Table {
             Storage::Hash(storage) => {
                 update_counter_object_in_place(storage.find_mut(key, keypos)?, keypos, operations)
             }
-            Storage::Ordered(root) => update_counter_object_in_place(
-                Node::get_mut(root, key, keypos)?,
-                keypos,
-                operations,
-            ),
+            Storage::Ordered(root) => {
+                update_counter_object_in_place(root.get_mut(key, keypos)?, keypos, operations)
+            }
             Storage::CATree(tree) => tree.with_object_mut(key, |object| {
                 update_counter_object_in_place(object, keypos, operations)
             }),
@@ -4502,7 +4500,7 @@ impl Table {
                     dst,
                     out: Vec::new(),
                 };
-                select_range_constant(root, &mut state)?;
+                select_range_constant(root.link(), &mut state)?;
                 return Ok(state.out);
             }
             let mut state = RangeSelection {
@@ -4894,8 +4892,7 @@ enum GarbageKind {
     /// A fixed hash table whose objects are being pseudo-deleted, from `slot` on.
     Mark { slot: usize },
     /// Tree nodes still to be freed.
-    #[expect(clippy::vec_box, reason = "tree links already own boxed nodes")]
-    Tree(Vec<Box<Node>>),
+    Tree(Vec<DbTerm>),
 }
 
 impl Garbage {
@@ -4916,7 +4913,7 @@ impl Garbage {
             GarbageKind::Mark { .. } => true,
             GarbageKind::Tree(stack) => {
                 while let Some(mut node) = stack.pop() {
-                    stack.extend(node.left.take());
+                    stack.extend(node.next.take());
                     stack.extend(node.right.take());
                     drop(node);
                     *reds -= 1;
