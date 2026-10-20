@@ -79,6 +79,8 @@ const MAPS_FROM_KEYS_CONTINUATION: &str = "maps:from_keys/2";
 const SUBTRACT_CONTINUATION: &str = "erlang:--/2";
 const CONTEXT_REDS: usize = 4000;
 const RE_RUN_CONTINUATION: &str = "erlang:re_run_trap/3";
+const RE_GRUN_CONTINUATION: &str = "re:grun/3";
+const RE_URUN_CONTINUATION: &str = "re:urun/3";
 
 // C payload sizes passed to erts_create_magic_binary on macOS arm64. The separate magic binary
 // data offset is added by MagicRef::with_erts_payload_size.
@@ -1292,10 +1294,10 @@ fn re_run_trap(
     // loop_limit = MIN(reds_initial * LOOP_FACTOR, max_loop_limit), max = CONTEXT_REDS * LOOP_FACTOR
     let reds_left = process.reductions.clamp(1, CONTEXT_REDS as i32);
     let budget = reds_left * arinsal_re::LOOP_FACTOR;
-    let (progress, loops) = {
+    let dispatch = {
         let mut heap = crate::ProcessHeapHandle(&mut process.heap);
         let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
-        arinsal_re::run_slice(
+        arinsal_re::run_slice_or_global(
             &mut ctx,
             if args.len() == 4 {
                 "internal_run"
@@ -1307,14 +1309,53 @@ fn re_run_trap(
             budget,
         )?
     };
-    let reductions = (loops / arinsal_re::LOOP_FACTOR as u64).min(u64::from(u32::MAX)) as u32;
-    Ok(match progress {
-        arinsal_re::Progress::Done(value) => HandlerResult::Done { value, reductions },
-        arinsal_re::Progress::Yield(run) => HandlerResult::Yield {
-            continuation: RE_RUN_CONTINUATION,
-            state: magic_binary_state(Mutex::new(Some(run)), ERTS_REGEX_RESTART_CONTEXT_SIZE),
-            reductions,
-        },
+    Ok(match dispatch {
+        arinsal_re::RunDispatch::Run { progress, loops } => {
+            let reductions =
+                (loops / arinsal_re::LOOP_FACTOR as u64).min(u64::from(u32::MAX)) as u32;
+            match progress {
+                arinsal_re::Progress::Done(value) => HandlerResult::Done { value, reductions },
+                arinsal_re::Progress::Yield(run) => HandlerResult::Yield {
+                    continuation: RE_RUN_CONTINUATION,
+                    state: magic_binary_state(
+                        Mutex::new(Some(run)),
+                        ERTS_REGEX_RESTART_CONTEXT_SIZE,
+                    ),
+                    reductions,
+                },
+            }
+        }
+        arinsal_re::RunDispatch::Global(arinsal_re::GlobalRun::Return(value)) => {
+            HandlerResult::Done {
+                value,
+                reductions: 0,
+            }
+        }
+        arinsal_re::RunDispatch::Global(arinsal_re::GlobalRun::UnicodeTrap) => {
+            // Port of erts/emulator/beam/erl_bif_re.c:1530-1533 and :1590-1597 (urun_trap_exportp),
+            // OTP-29.1.1.
+            process.x.ensure_x(3);
+            process.x[..3].copy_from_slice(&args[..3]);
+            process.gc_live = 3;
+            HandlerResult::Yield {
+                continuation: RE_URUN_CONTINUATION,
+                state: argument_trap_state(Mutex::new(())),
+                reductions: 0,
+            }
+        }
+        arinsal_re::RunDispatch::Global(arinsal_re::GlobalRun::Trap { pattern, options }) => {
+            // Port of erts/emulator/beam/erl_bif_re.c:1557-1603 (grun_trap_exportp), OTP-29.1.1.
+            process.x.ensure_x(3);
+            process.x[0] = args[0];
+            process.x[1] = pattern;
+            process.x[2] = options;
+            process.gc_live = 3;
+            HandlerResult::Yield {
+                continuation: RE_GRUN_CONTINUATION,
+                state: argument_trap_state(Mutex::new(())),
+                reductions: 0,
+            }
+        }
     })
 }
 
@@ -2118,6 +2159,8 @@ pub(crate) fn execute_named(
             if continuation != PTAB_LIST_CONTINUATION
                 && continuation != CODE_PERMISSION_CONTINUATION
                 && continuation != REVERSE_CONTINUATION
+                && continuation != RE_GRUN_CONTINUATION
+                && continuation != RE_URUN_CONTINUATION
             {
                 process.set_gc_enabled(false);
             }

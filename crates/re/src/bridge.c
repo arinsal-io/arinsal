@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-/* Port of erts/emulator/beam/erl_bif_re.c:544-574 (compile), OTP-29.1.1. */
+/* Port of erts/emulator/beam/erl_bif_re.c:199-205, 527-550, OTP-29.1.1. */
 #include "local_config.h"
 #include "pcre2.h"
 #include "pcre2_internal.h"
@@ -33,15 +33,28 @@ static int ar_re_stack_guard(uint32_t depth, void *unused) {
 #endif
 }
 
+static pcre2_compile_context *ar_re_tmp_compile_ctx;
+static pthread_once_t ar_re_compile_ctx_once = PTHREAD_ONCE_INIT;
+
+static void ar_re_init_compile_context(void) {
+    ar_re_tmp_compile_ctx = pcre2_compile_context_create(NULL);
+    if (ar_re_tmp_compile_ctx)
+        pcre2_set_compile_recursion_guard(ar_re_tmp_compile_ctx, ar_re_stack_guard, NULL);
+}
+
 pcre2_code *ar_re_compile(const uint8_t *pattern, size_t len, uint32_t options,
                           uint32_t newline, uint32_t bsr, int *error, size_t *offset) {
-    pcre2_compile_context *ctx = pcre2_compile_context_create(NULL);
-    if (!ctx) return NULL;
-    pcre2_set_compile_recursion_guard(ctx, ar_re_stack_guard, NULL);
-    if (newline) pcre2_set_newline(ctx, newline);
-    if (bsr) pcre2_set_bsr(ctx, bsr);
+    pthread_once(&ar_re_compile_ctx_once, ar_re_init_compile_context);
+    if (!ar_re_tmp_compile_ctx) return NULL;
+    pcre2_compile_context *ctx = ar_re_tmp_compile_ctx;
+    if (newline || bsr) {
+        ctx = pcre2_compile_context_copy(ar_re_tmp_compile_ctx);
+        if (!ctx) return NULL;
+        if (newline) pcre2_set_newline(ctx, newline);
+        if (bsr) pcre2_set_bsr(ctx, bsr);
+    }
     pcre2_code *code = pcre2_compile(pattern, len, options, error, offset, ctx);
-    pcre2_compile_context_free(ctx);
+    if (ctx != ar_re_tmp_compile_ctx) pcre2_compile_context_free(ctx);
     return code;
 }
 
@@ -99,30 +112,26 @@ ar_re_match_result ar_re_match(const pcre2_code *code, const uint8_t *subject,
                               size_t len, size_t offset, uint32_t options,
                               int match_limit, int depth_limit,
                               size_t *ovector, uint32_t ovec_count,
-                              int loop_budget, void **session_slot, int mode) {
+                              int loop_budget, ar_re_session *session, int mode) {
     ar_re_match_result result = {0, 0};
-    ar_re_session *session = (ar_re_session *)*session_slot;
     if (mode == 1) {
         if (session) {
             if (session->restart) pcre2_free_restart_data(session->data);
             if (session->ctx) pcre2_match_context_free(session->ctx);
             pcre2_match_data_free(session->data);
-            free(session);
-            *session_slot = NULL;
+            memset(session, 0, sizeof(*session));
         }
         return result;
     }
     int rc;
-    if (!session) {
-        session = calloc(1, sizeof(*session));
-        if (!session) { result.rc = PCRE2_ERROR_NOMEMORY; return result; }
+    if (!session->data) {
         session->data = pcre2_match_data_create(ovec_count, NULL);
-        if (!session->data) { free(session); result.rc = PCRE2_ERROR_NOMEMORY; return result; }
+        if (!session->data) { result.rc = PCRE2_ERROR_NOMEMORY; return result; }
         if (match_limit >= 0 || depth_limit >= 0) {
             session->ctx = pcre2_match_context_create(NULL);
             if (!session->ctx) {
                 pcre2_match_data_free(session->data);
-                free(session);
+                memset(session, 0, sizeof(*session));
                 result.rc = PCRE2_ERROR_NOMEMORY;
                 return result;
             }
@@ -141,7 +150,6 @@ ar_re_match_result ar_re_match(const pcre2_code *code, const uint8_t *subject,
     result.loops_consumed = (uint64_t)(loop_budget - pcre2_get_loops_left(session->data));
     result.rc = rc;
     if (rc == PCRE2_ERROR_LOOP_LIMIT) {
-        *session_slot = session;
         return result;
     }
     if (rc > 0) {
@@ -154,7 +162,6 @@ ar_re_match_result ar_re_match(const pcre2_code *code, const uint8_t *subject,
     if (session->restart) pcre2_free_restart_data(session->data);
     if (session->ctx) pcre2_match_context_free(session->ctx);
     pcre2_match_data_free(session->data);
-    free(session);
-    *session_slot = NULL;
+    memset(session, 0, sizeof(*session));
     return result;
 }
