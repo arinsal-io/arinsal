@@ -1,6 +1,6 @@
 mod support;
 
-use arinsal_bifs::{Ctx, ProcessHeapHandle, lookup};
+use arinsal_bifs::{Ctx, EncodeWalk, ProcessHeapHandle, lookup};
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm as O};
 use arinsal_term::{
@@ -10,6 +10,7 @@ use arinsal_term::{
 use num_bigint::BigInt;
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
+use similar_asserts::assert_eq;
 use support::{call, equivalent};
 
 fn opts() -> Vec<O> {
@@ -72,6 +73,79 @@ fn heap_etf_matches_otp_examples() {
             }
         }
     }
+}
+
+#[test]
+fn local_ext_round_trips_and_matches_otp_after_hash_normalization() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let term = O::Ref {
+        node: "nonode@nohost".to_owned(),
+        creation: 0,
+        ids: vec![1, 2, 3],
+    };
+    let local = O::list(vec![O::atom("local")]);
+    let ours = call("erlang", "term_to_binary", &[term.clone(), local.clone()]);
+    let otp = reference.call("erlang", "term_to_binary", &[term.clone(), local]);
+    let CallResult::Ok(O::Binary(ours_bytes)) = &ours else {
+        panic!("Arinsal local encoding failed: {ours:?}");
+    };
+    let CallResult::Ok(O::Binary(otp_bytes)) = &otp else {
+        panic!("OTP local encoding failed: {otp:?}");
+    };
+    assert_eq!(&ours_bytes[..2], &[131, 121]);
+    assert_ne!(&ours_bytes[2..6], &[0, 0, 0, 0]);
+    assert_eq!(&ours_bytes[..2], &otp_bytes[..2]);
+    assert_eq!(&ours_bytes[6..], &otp_bytes[6..]);
+
+    let decoded = call("erlang", "binary_to_term", &[O::Binary(ours_bytes.clone())]);
+    assert_eq!(decoded, CallResult::Ok(term));
+    let is_badarg = |result: &CallResult| {
+        matches!(result, CallResult::Exception { class, reason, .. }
+            if class == "error" && reason == &O::atom("badarg"))
+    };
+
+    let mut foreign_hash = ours_bytes.clone();
+    foreign_hash[2] ^= 1;
+    let rejected = call("erlang", "binary_to_term", &[O::Binary(foreign_hash)]);
+    assert!(is_badarg(&rejected));
+
+    let rejected_otp = call("erlang", "binary_to_term", &[O::Binary(otp_bytes.clone())]);
+    assert!(is_badarg(&rejected_otp));
+}
+
+#[test]
+fn local_ext_hash_resumes_in_erts_sized_chunks() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let source = O::Binary(vec![0x5a; 2048]);
+    let options = O::list(vec![O::atom("local")]);
+    let mut heap = VecHeap::new();
+    let term = from_owned(&source, &mut heap).unwrap();
+    let options = from_owned(&options, &mut heap).unwrap();
+    let mut encoder = EncodeWalk::new(&[term, options]).unwrap();
+    assert!(encoder.step_size(usize::MAX).unwrap().0);
+    let mut bytes = vec![0; encoder.encoded_size().unwrap()];
+    let mut done = false;
+    let mut steps = 0;
+    while !done {
+        (done, _) = encoder.step_into(&mut bytes, 32).unwrap();
+        steps += 1;
+        assert!(steps < 1000, "local hash walk made no progress");
+    }
+
+    let otp = reference.call(
+        "erlang",
+        "term_to_binary",
+        &[source.clone(), O::list(vec![O::atom("local")])],
+    );
+    let CallResult::Ok(O::Binary(ref otp_bytes)) = otp else {
+        panic!("OTP local encoding failed: {otp:?}");
+    };
+    assert_eq!(&bytes[..2], &otp_bytes[..2]);
+    assert_eq!(&bytes[6..], &otp_bytes[6..]);
+    assert_eq!(
+        call("erlang", "binary_to_term", &[O::Binary(bytes)]),
+        CallResult::Ok(source)
+    );
 }
 
 #[test]

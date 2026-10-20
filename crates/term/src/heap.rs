@@ -2768,14 +2768,36 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         size: usize,
         fill: impl FnOnce(&mut [u8]),
     ) -> Result<Term, TermError> {
+        self.binary_from_fn_with_len(size, |destination| {
+            fill(destination);
+            Ok(destination.len())
+        })
+    }
+
+    /// Allocate a byte-aligned binary with capacity `size` and publish the callback's length.
+    // Port of erts/emulator/beam/erl_bits.c:2881-2904 (`erts_shrink_binary_term`), OTP-29.1.1.
+    pub fn binary_from_fn_with_len(
+        &mut self,
+        size: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, TermError>,
+    ) -> Result<Term, TermError> {
+        let bit_len = size.checked_mul(8).ok_or(TermError::SystemLimit)?;
         if size <= 64 {
-            let mut bytes = vec![0; size];
-            fill(&mut bytes);
-            return self.binary(&bytes);
+            return self.heap_bitstring_with_data_len(bit_len, false, |destination| {
+                fill(destination)?
+                    .checked_mul(8)
+                    .ok_or(TermError::SystemLimit)
+            });
         }
         let mut binary = RefcBinary::new_zeroed(size)?;
-        fill(binary.bytes_mut_unique().ok_or(TermError::BadArg)?);
-        self.install_refc_binary(binary, size * 8)
+        let written = fill(binary.bytes_mut_unique().ok_or(TermError::BadArg)?)?;
+        if written > size {
+            return Err(TermError::BadArg);
+        }
+        self.install_refc_binary(
+            binary,
+            written.checked_mul(8).ok_or(TermError::SystemLimit)?,
+        )
     }
     /// Build a bitstring with high bits significant in its final byte.
     pub fn bitstring(&mut self, bytes: &[u8], bit_len: usize) -> Result<Term, TermError> {
@@ -2906,6 +2928,18 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         fragment_only: bool,
         fill: impl FnOnce(&mut [u8]),
     ) -> Result<Term, TermError> {
+        self.heap_bitstring_with_data_len(bit_len, fragment_only, |destination| {
+            fill(destination);
+            Ok(bit_len)
+        })
+    }
+
+    fn heap_bitstring_with_data_len(
+        &mut self,
+        bit_len: usize,
+        fragment_only: bool,
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, TermError>,
+    ) -> Result<Term, TermError> {
         let count = bit_len.div_ceil(8);
         let words = 2 + count.div_ceil(8);
         let p = if fragment_only {
@@ -2915,15 +2949,22 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
         .ok_or(TermError::HeapFull)?;
         // SAFETY: the allocation covers the complete heap-bitstring header and rounded payload.
-        unsafe {
+        let written_bits = unsafe {
             *p = (((words - 1) as u64) << 6) | HEAP_BITS;
             *p.add(1) = bit_len as u64;
             let destination = std::slice::from_raw_parts_mut(p.add(2).cast::<u8>(), count);
-            fill(destination);
-            if !bit_len.is_multiple_of(8) && count > 0 {
-                destination[count - 1] &= 0xff << (8 - (bit_len % 8));
+            let written_bits = fill(destination)?;
+            if written_bits > bit_len {
+                return Err(TermError::BadArg);
             }
-        }
+            *p.add(1) = written_bits as u64;
+            let written_bytes = written_bits.div_ceil(8);
+            if !written_bits.is_multiple_of(8) && written_bytes > 0 {
+                destination[written_bytes - 1] &= 0xff << (8 - (written_bits % 8));
+            }
+            written_bits
+        };
+        let _ = written_bits;
         Ok(Term::from_ptr(p, 2))
     }
     /// Create a slice of a bitstring, retaining the original owner.
