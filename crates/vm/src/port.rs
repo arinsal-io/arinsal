@@ -1782,6 +1782,22 @@ impl arinsal_drv::PortHost for DrvHost {
         }
     }
 
+    // Port of erts/emulator/beam/erl_hl_timer.c:3031 (erts_set_port_timer), OTP-29.1.1.
+    fn start_port_timer(&self, ms: u64, expired: Box<dyn FnOnce() + Send>) -> Option<u64> {
+        let scheduler = self.runtime.upgrade()?.scheduler().ok()?;
+        scheduler
+            .start_port_timer(ms, expired)
+            .ok()
+            .map(arinsal_sched::TimerRef::to_bits)
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c:3063 (erts_cancel_port_timer), OTP-29.1.1.
+    fn cancel_port_timer(&self, handle: u64) {
+        if let Some(Ok(scheduler)) = self.runtime.upgrade().map(|runtime| runtime.scheduler()) {
+            scheduler.cancel_port_timer(arinsal_sched::TimerRef::from_bits(handle));
+        }
+    }
+
     fn enqueue_port(&self, port: Arc<arinsal_drv::DriverPort>) {
         let Some(runtime) = self.runtime.upgrade() else {
             return;

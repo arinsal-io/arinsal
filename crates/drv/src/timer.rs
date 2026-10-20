@@ -22,7 +22,12 @@ pub(crate) enum PortTimer {
     #[default]
     None,
     /// Armed for tick `pos` since the service origin.
-    Armed { epoch: u64, pos: i128 },
+    Armed {
+        epoch: u64,
+        pos: i128,
+        /// The host's scheduler timer, when the host has one.
+        handle: Option<u64>,
+    },
     /// Expired; the timeout task is queued.
     TimedOut { epoch: u64 },
 }
@@ -110,6 +115,13 @@ impl DriverPort {
     /// Port of erl_hl_timer.c:3031 (erts_set_port_timer). `tmo` in ms.
     pub fn set_timer(self: &Arc<Self>, tmo: i64) {
         let mut timer = self.timer.lock().unwrap();
+        if let PortTimer::Armed {
+            handle: Some(handle),
+            ..
+        } = *timer
+        {
+            self.host.cancel_port_timer(handle);
+        }
         let epoch = self.timer_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         if tmo == 0 {
             *timer = PortTimer::TimedOut { epoch };
@@ -123,7 +135,20 @@ impl DriverPort {
         } else {
             ticks_before(now_ns()) + i128::from(tmo) + 1
         };
-        *timer = PortTimer::Armed { epoch, pos };
+        // erl_hl_timer.c:3031: the timer lives on a scheduler's timer wheel.
+        let weak = Arc::downgrade(self);
+        let handle = self.host.start_port_timer(
+            tmo.max(1) as u64,
+            Box::new(move || {
+                if let Some(port) = weak.upgrade() {
+                    port.timer_expired(epoch);
+                }
+            }),
+        );
+        *timer = PortTimer::Armed { epoch, pos, handle };
+        if handle.is_some() {
+            return;
+        }
         let millis = u64::try_from(pos).unwrap_or(u64::MAX).min(1 << 50);
         let at = origin() + Duration::from_millis(millis);
         let service = service();
@@ -138,7 +163,14 @@ impl DriverPort {
     /// Port of erl_hl_timer.c:3063 (erts_cancel_port_timer): an expired timer whose task
     /// is still queued is aborted too.
     pub fn cancel_timer(&self) {
-        *self.timer.lock().unwrap() = PortTimer::None;
+        let previous = std::mem::replace(&mut *self.timer.lock().unwrap(), PortTimer::None);
+        if let PortTimer::Armed {
+            handle: Some(handle),
+            ..
+        } = previous
+        {
+            self.host.cancel_port_timer(handle);
+        }
     }
 
     /// Port of erl_hl_timer.c:3082 (erts_read_port_timer) and io.c:6930

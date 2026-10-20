@@ -89,12 +89,14 @@ struct FdState {
 /// descriptor state; `fd_status` is a lock array indexed by fd).
 const SHARDS: usize = 64;
 
-fn table(fd: i32) -> MutexGuard<'static, HashMap<i32, FdState>> {
+fn shard(fd: i32) -> &'static Mutex<HashMap<i32, FdState>> {
     static TABLE: OnceLock<Vec<Mutex<HashMap<i32, FdState>>>> = OnceLock::new();
-    TABLE.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect())
+    &TABLE.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect())
         [fd as usize % SHARDS]
-        .lock()
-        .unwrap()
+}
+
+fn table(fd: i32) -> MutexGuard<'static, HashMap<i32, FdState>> {
+    shard(fd).lock().unwrap()
 }
 
 fn next_registration() -> u64 {
@@ -119,10 +121,10 @@ fn arm_dir(fd: i32, state: &mut FdState, dir: usize) -> bool {
     let ready: Box<dyn FnOnce() + Send> = match owner {
         Some(owner) => Box::new(move || {
             if !owner.schedule_io(fd, dir, id) {
-                notify(fd, dir, id);
+                fired(fd, dir, id);
             }
         }),
-        None => Box::new(move || notify(fd, dir, id)),
+        None => Box::new(move || fired(fd, dir, id)),
     };
     let notified = match poll::backend() {
         Some(backend) => backend.register(id, fd, dir == 1, ready).is_ok(),
@@ -625,7 +627,7 @@ fn notify(fd: i32, dir: usize, reg: u64) {
             .name("arinsal-drv-select".into())
             .spawn(move || {
                 for (fd, dir, reg) in rx {
-                    fired(fd, dir, reg);
+                    fired_locked(table(fd), fd, dir, reg);
                 }
             })
             .expect("start select notifier");
@@ -638,8 +640,21 @@ fn notify(fd: i32, dir: usize, reg: u64) {
 /// port task directly: a NIF selection sends its message; a driver selection becomes an
 /// input or output task of the owning port, or is reported stale.
 fn fired(fd: i32, dir: usize, reg: u64) {
+    // The poller thread handles the event itself (erl_check_io.c iready/oready run in the
+    // thread that polled). A callback that fires inside `driver_select` on a thread that
+    // holds the shard cannot take it again: that one goes to the notifier.
+    match shard(fd).try_lock() {
+        Ok(guard) => fired_locked(guard, fd, dir, reg),
+        Err(std::sync::TryLockError::Poisoned(poison)) => {
+            fired_locked(poison.into_inner(), fd, dir, reg)
+        }
+        Err(std::sync::TryLockError::WouldBlock) => notify(fd, dir, reg),
+    }
+}
+
+fn fired_locked(held: MutexGuard<'static, HashMap<i32, FdState>>, fd: i32, dir: usize, reg: u64) {
     let owner = {
-        let mut table = table(fd);
+        let mut table = held;
         let Some(state) = table.get_mut(&fd) else {
             return;
         };
