@@ -5,7 +5,8 @@
 //! budget as erts and resume through the same continuations.
 
 use arinsal_term::{
-    ConsHeapChain, HeapAlloc, HeapReservation, Term, TermBuilder, atoms, exact_eq, loose_eq,
+    ConsHeapChain, HeapAlloc, HeapReservation, Term, TermBuilder, atoms, exact_eq,
+    exact_eq_after_word_mismatch, loose_eq,
 };
 
 #[path = "rbtree.rs"]
@@ -1399,7 +1400,8 @@ pub fn lists_member(
                 }
                 scanned += 1;
                 let (car, next) = car_cdr!(list_bits);
-                if car == term_bits || exact_eq(Term::from_raw_bits(car), term) {
+                if car == term_bits || exact_eq_after_word_mismatch(Term::from_raw_bits(car), term)
+                {
                     charge(ctx, scanned);
                     return Ok(MemberStep::Done(true));
                 }
