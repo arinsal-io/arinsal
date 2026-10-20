@@ -8,7 +8,9 @@
 //! unsalted `erts_internal_hash` for HAMT keys. Trie iteration visits slots
 //! from 0 to 15 at each depth, independently of insertion order.
 
-use arinsal_term::{HeapAlloc, Term, TermError, TermKind, atoms, cmp, exact_eq, internal_hash};
+use arinsal_term::{
+    HeapAlloc, Term, TermBuilder, TermError, TermKind, atoms, cmp, exact_eq, internal_hash,
+};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
@@ -461,11 +463,15 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
                 let index = compact_index as usize;
                 let out_count = count + usize::from(added);
                 *cursor = (out_count as u64) << 6;
-                std::ptr::copy_nonoverlapping(source.add(1), cursor.add(1), count);
-                if added {
-                    std::ptr::copy(cursor.add(1 + index), cursor.add(2 + index), count - index);
+                for child in 0..index {
+                    *cursor.add(1 + child) = *source.add(1 + child);
                 }
                 *cursor.add(1 + index) = bits(replacement);
+                let source_tail = index + usize::from(!added);
+                let tail_count = count - source_tail;
+                for child in 0..tail_count {
+                    *cursor.add(2 + index + child) = *source.add(1 + source_tail + child);
+                }
                 replacement = boxed(cursor);
                 cursor = cursor.add(1 + out_count);
                 continue;
@@ -500,15 +506,15 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
             if root {
                 *cursor.add(1) = *source.add(1) + u64::from(new_key);
             }
-            std::ptr::copy_nonoverlapping(source.add(offset), cursor.add(offset), count);
-            if added {
-                std::ptr::copy(
-                    cursor.add(offset + index),
-                    cursor.add(offset + index + 1),
-                    count - index,
-                );
+            for child in 0..index {
+                *cursor.add(offset + child) = *source.add(offset + child);
             }
             *cursor.add(offset + index) = bits(replacement);
+            let source_tail = index + usize::from(!added);
+            let tail_count = count - source_tail;
+            for child in 0..tail_count {
+                *cursor.add(offset + index + 1 + child) = *source.add(offset + source_tail + child);
+            }
             replacement = boxed(cursor);
             cursor = cursor.add(offset + out_count);
         }
@@ -523,7 +529,7 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
     key: Term,
     map_size: usize,
     heap: &mut H,
-    value: &mut Option<Term>,
+    mut value: Option<&mut Option<Term>>,
 ) -> MapResult<Term> {
     const NONE: u8 = 0;
     const LEAF: u8 = 1;
@@ -543,7 +549,9 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
                 if !exact_eq(term(*leaf), key) {
                     return Ok(map);
                 }
-                *value = Some(term(*leaf.add(1)));
+                if let Some(output) = value.as_mut() {
+                    **output = Some(term(*leaf.add(1)));
+                }
                 break;
             }
 
@@ -559,7 +567,9 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
                 if index == arity {
                     return Ok(map);
                 }
-                *value = Some(term(*term(*source.add(1 + index)).raw_ptr().add(1)));
+                if let Some(output) = value.as_mut() {
+                    **output = Some(term(*term(*source.add(1 + index)).raw_ptr().add(1)));
+                }
                 path[depth] = (node, index as u32, 0);
                 depth += 1;
                 break;
@@ -592,11 +602,9 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
         // Port of hashmap_size(map) - 1 in erl_map.c:2984-2989, OTP-29.1.1.
         let new_size = map_size - 1;
         if new_size <= LIMIT {
-            let mut pairs: Vec<_> = iter(map)?
-                .filter(|(candidate, _)| !exact_eq(*candidate, key))
-                .collect();
-            pairs.sort_by(|a, b| key_cmp(a.0, b.0));
-            return flat(&pairs, heap);
+            let words = 4 + 2 * new_size;
+            return merge::flatmap_from_hashmap_without(map, key, new_size, heap)
+                .map_err(|_| MapError::HeapFull { need_words: words });
         }
 
         let mut shape = NONE;
@@ -1059,7 +1067,12 @@ pub fn is_key(map: Term, key: Term) -> MapResult<bool> {
 
 /// `maps:remove/2`.
 pub fn remove<H: HeapAlloc + ?Sized>(map: Term, key: Term, heap: &mut H) -> MapResult<Term> {
-    Ok(maps_take(map, key, heap)?.map_or(map, |(_, map)| map))
+    let checked = checked_map(map)?;
+    if map.is_hashmap() {
+        hashmap_delete(map, key, checked.size(), heap, None)
+    } else {
+        Ok(flatmap_take(map, key, heap, None)?.unwrap_or(map))
+    }
 }
 
 /// `maps:take/2`: the value under `key` and the map without it, or `None` when absent.
@@ -1079,10 +1092,14 @@ fn maps_take<H: HeapAlloc + ?Sized>(
 ) -> MapResult<Option<(Term, Term)>> {
     let checked = checked_map(map)?;
     if !map.is_hashmap() {
-        return flatmap_take(map, key, heap);
+        let mut value = None;
+        let Some(map) = flatmap_take(map, key, heap, Some(&mut value))? else {
+            return Ok(None);
+        };
+        return Ok(Some((value.expect("take writes the selected value"), map)));
     }
     let mut value = None;
-    let res = hashmap_delete(map, key, checked.size(), heap, &mut value)?;
+    let res = hashmap_delete(map, key, checked.size(), heap, Some(&mut value))?;
     Ok(value.map(|value| (value, res)))
 }
 
@@ -1093,7 +1110,8 @@ fn flatmap_take<H: HeapAlloc + ?Sized>(
     map: Term,
     key: Term,
     heap: &mut H,
-) -> MapResult<Option<(Term, Term)>> {
+    value: Option<&mut Option<Term>>,
+) -> MapResult<Option<Term>> {
     let (ks, vs, _) = merge::flatmap_kv(map);
     let n = ks.len();
     if n == 0 {
@@ -1154,7 +1172,10 @@ fn flatmap_take<H: HeapAlloc + ?Sized>(
     header[2].write(bits(keys));
     // The map header follows the key tuple inside the allocated block.
     let res = boxed(start.wrapping_add(tuple_words));
-    Ok(Some((term(vs[found]), res)))
+    if let Some(output) = value {
+        *output = Some(term(vs[found]));
+    }
+    Ok(Some(res))
 }
 
 /// One `erts_internal:map_next/3` step over a whole flatmap: the `{K, V, Next}` chain ending
@@ -1909,6 +1930,27 @@ pub fn flatmap_projection(
     let (key_words, value_words, _) = merge::flatmap_kv_with_size(map.term(), map.size());
     let words = if keys { key_words } else { value_words };
     words.iter().copied().map(term)
+}
+
+/// Build `maps:keys/1` or `maps:values/1` for a flatmap from its stored array.
+///
+/// Port of the indexed flatmap loops in `maps_keys_1_helper` and
+/// `maps_values_1_helper`, erts/emulator/beam/erl_map.c:1207-1241 and :2262-2298,
+/// OTP-29.1.1.
+pub fn flatmap_projection_list<H: HeapAlloc + ?Sized>(
+    map: CheckedFlatMap,
+    keys: bool,
+    heap: &mut H,
+) -> MapResult<Term> {
+    let (key_words, value_words, _) = merge::flatmap_kv_with_size(map.term(), map.size());
+    let words = if keys { key_words } else { value_words };
+    let needed = 2 * words.len();
+    let output = TermBuilder::new(heap)
+        .reserve_cons_list(words.len())
+        .map_err(|_| MapError::HeapFull { need_words: needed })?;
+    output
+        .prepend_exact_words_with_tail(words, Term::NIL)
+        .map_err(|_| MapError::HeapFull { need_words: needed })
 }
 
 /// Lookup several keys; absent keys return `None`.

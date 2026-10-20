@@ -3,7 +3,7 @@
 use arinsal_maps::{self, MapError, MapResult};
 use arinsal_term::{Term, atoms};
 
-use crate::pure::{bool_term, integer, make_list_from_reverse_exact_iter, tuple_build};
+use crate::pure::{bool_term, integer, make_list_from_reverse_exact_iter};
 use crate::{BifError, Ctx};
 
 pub(super) fn lookup<V: crate::BifTableVisitor>(
@@ -38,16 +38,19 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
 #[allow(deprecated)]
 fn map_error(ctx: &mut Ctx<'_>, error: MapError) -> BifError {
     match error {
-        MapError::Badmap(map) => {
-            BifError::Error(tuple_build(ctx, &[Term::atom(atoms::BADMAP), map]))
-        }
-        MapError::Badkey(key) => {
-            BifError::Error(tuple_build(ctx, &[Term::atom(atoms::BADKEY), key]))
-        }
+        MapError::Badmap(map) => BifError::Error(tuple2(ctx, Term::atom(atoms::BADMAP), map)),
+        MapError::Badkey(key) => BifError::Error(tuple2(ctx, Term::atom(atoms::BADKEY), key)),
         MapError::Badarg(_) => BifError::BADARG,
         MapError::UnsupportedKey(_) => BifError::Unsupported("HAMT nested map key"),
         MapError::HeapFull { .. } => panic!("infallible BIF heap returned HeapFull"),
     }
+}
+
+#[inline(always)]
+fn tuple2(ctx: &mut Ctx<'_>, first: Term, second: Term) -> Term {
+    arinsal_term::TermBuilder::new(&mut ctx.heap)
+        .tuple2(first, second)
+        .expect("infallible BIF heap")
 }
 
 fn mapped<T>(ctx: &mut Ctx<'_>, result: MapResult<T>) -> Result<T, BifError> {
@@ -76,7 +79,7 @@ fn is_key(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 fn find(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     match mapped(ctx, arinsal_maps::find(args[1], args[0]))? {
-        Some(value) => Ok(tuple_build(ctx, &[Term::atom(atoms::OK), value])),
+        Some(value) => Ok(tuple2(ctx, Term::atom(atoms::OK), value)),
         None => Ok(Term::atom(atoms::ERROR)),
     }
 }
@@ -116,10 +119,14 @@ fn projection(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<Term, BifError
 pub struct MapsProjectionWalk {
     iter: arinsal_term::MapReverseIter,
     keys: bool,
+    remaining: usize,
     output: arinsal_term::ConsListBuilder,
 }
 
 /// Outcome of starting a projection.
+// Keep the reverse iterator's 16-entry inline stack in the trap state, as OTP does with its
+// stack-local WStack. Boxing this variant would add a heap allocation to every HAMT projection.
+#[allow(clippy::large_enum_variant)]
 pub enum ProjectionStart {
     /// A flatmap: erts builds its list without yielding.
     Done(Term),
@@ -135,12 +142,15 @@ impl MapsProjectionWalk {
             arinsal_maps::CheckedMapKind::Flatmap(flat) => {
                 // Port of erts/emulator/beam/erl_map.c:1207-1241 and :2262-2298,
                 // OTP-29.1.1. The exact-size flatmap array is consed into one HAlloc block.
-                let items = arinsal_maps::flatmap_projection(flat, keys);
-                Ok(ProjectionStart::Done(make_list_from_reverse_exact_iter(
-                    ctx,
-                    items,
-                    Term::NIL,
-                )))
+                if flat.size() == 0 {
+                    return Ok(ProjectionStart::Done(make_list_from_reverse_exact_iter(
+                        ctx,
+                        std::iter::empty(),
+                        Term::NIL,
+                    )));
+                }
+                let result = arinsal_maps::flatmap_projection_list(flat, keys, &mut ctx.heap);
+                Ok(ProjectionStart::Done(mapped(ctx, result)?))
             }
             arinsal_maps::CheckedMapKind::Hashmap(_) => {
                 let iter = arinsal_term::MapReverseIter::new(map).expect("checked hashmap");
@@ -148,7 +158,12 @@ impl MapsProjectionWalk {
                 let output = arinsal_term::TermBuilder::new(&mut ctx.heap)
                     .reserve_cons_list(checked.size())
                     .expect("infallible BIF heap");
-                Ok(ProjectionStart::Walk(Self { iter, keys, output }))
+                Ok(ProjectionStart::Walk(Self {
+                    iter,
+                    keys,
+                    remaining: checked.size(),
+                    output,
+                }))
             }
         }
     }
@@ -156,17 +171,22 @@ impl MapsProjectionWalk {
     /// Walk entries while `reds` (the YCF reduction counter) stays positive. Returns whether
     /// the walk is complete.
     pub fn step(&mut self, reds: &mut i64) -> bool {
-        for (key, value) in self.iter.by_ref() {
-            let item = if self.keys { key } else { value };
-            self.output
-                .prepend(item)
-                .expect("reserved projection list length");
-            *reds -= 1;
-            if *reds <= 0 {
-                return false;
-            }
+        if self.remaining == 0 {
+            return true;
         }
-        true
+        let budget = usize::try_from((*reds).max(1)).unwrap_or(usize::MAX);
+        let count = self.remaining.min(budget);
+        self.output
+            .prepend_chunk(
+                count,
+                self.iter
+                    .by_ref()
+                    .map(|(key, value)| if self.keys { key } else { value }),
+            )
+            .expect("reserved projection list length");
+        self.remaining -= count;
+        *reds = reds.saturating_sub(i64::try_from(count).unwrap_or(i64::MAX));
+        self.remaining == 0 && *reds > 0
     }
 
     /// Cons the visited items; the backwards walk leaves them in reverse list order.
@@ -428,7 +448,7 @@ fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_map.c:1910-1925 (maps_take_2), OTP-29.1.1.
     let result = arinsal_maps::take(args[1], args[0], &mut ctx.heap);
     match mapped(ctx, result)? {
-        Some((value, map)) => Ok(tuple_build(ctx, &[value, map])),
+        Some((value, map)) => Ok(tuple2(ctx, value, map)),
         None => Ok(Term::atom(atoms::ERROR)),
     }
 }

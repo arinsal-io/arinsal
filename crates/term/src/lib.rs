@@ -56,7 +56,7 @@ pub use gc::{
 pub use hamt::{
     HxNode, alloc_terms, boxed_object_words, build_hamt_from_unique, flatmap_keys,
     hashmap_from_ks_and_vs, hashmap_from_ks_and_vs_extra, hashmap_from_unsorted_array,
-    hashmap_key_hash, hashmap_leaves, hashmap_leaves_hashed, hashmap_node_children,
+    hashmap_key_hash, hashmap_leaves, hashmap_leaves_hashed, hashmap_node_children, hashmap_pairs,
     swizzle_map_hash,
 };
 pub use hamt_yield::{HashmapBuild, MapReverseIter, initialize_scheduler_random};
