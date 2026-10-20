@@ -4928,11 +4928,11 @@ impl Process {
             if let Ok(scheduler) = runtime.scheduler() {
                 // Ports are links on the process (erl_process.c:14084). No port list, no scan.
                 if resources & proc_flags::PORTS != 0 {
-                    crate::port::owner_exit(&runtime, &scheduler, ctx.pid(), reason);
+                    crate::port::owner_exit(&runtime, scheduler, ctx.pid(), reason);
                 }
                 // Port of erts/emulator/beam/erl_process.c:14415-14417 (F_USING_DDLL).
                 if resources & proc_flags::DDLL != 0 {
-                    crate::ddll::proc_dead(&scheduler, ctx.pid());
+                    crate::ddll::proc_dead(scheduler, ctx.pid());
                 }
             }
         }
@@ -8522,7 +8522,7 @@ struct SchedulerShutdown(Arc<Scheduler<Process>>);
 
 impl Drop for SchedulerShutdown {
     fn drop(&mut self) {
-        self.0.shutdown();
+        self.0.release();
     }
 }
 

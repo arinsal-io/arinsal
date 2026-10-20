@@ -1431,7 +1431,7 @@ fn start_dyn_driver(
         ctx.pid(),
         name.clone(),
         io.parallelism,
-        Arc::clone(&scheduler),
+        Arc::clone(scheduler),
         Arc::as_ptr(&runtime) as usize,
     )?;
     install_poll_backend();
@@ -1474,7 +1474,7 @@ fn start_dyn_driver(
         drv_port.abandon();
         release_io(&handle);
         if handle_id.is_some() {
-            crate::ddll::port_closed(&scheduler, &driver);
+            crate::ddll::port_closed(scheduler, &driver);
         }
         // Port of erts/emulator/beam/erl_bif_port.c:69-89 (open_port error atoms).
         return Ok(match error {
@@ -1718,7 +1718,7 @@ impl arinsal_drv::PortHost for DrvHost {
         if let Some(runtime) = self.runtime.upgrade()
             && let Ok(scheduler) = runtime.scheduler()
         {
-            crate::ddll::dereference_referenced(&scheduler, port.driver());
+            crate::ddll::dereference_referenced(scheduler, port.driver());
         }
     }
 
@@ -2002,7 +2002,7 @@ impl arinsal_drv::PortHost for DrvHost {
             owner,
             name.to_owned(),
             false,
-            Arc::clone(&scheduler),
+            Arc::clone(scheduler),
             Arc::as_ptr(&runtime) as usize,
         )
         .ok()?;
@@ -2260,7 +2260,7 @@ pub(crate) fn alloc_inet_port(
         owner,
         name,
         false,
-        Arc::clone(&scheduler),
+        Arc::clone(scheduler),
         Arc::as_ptr(runtime) as usize,
     )
     .map_err(|_| InetPortAllocError::NoMemory)?;
@@ -3980,7 +3980,7 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
     // Port of erts/emulator/beam/io.c:3698 (terminate_port): links get a port exit signal,
     // monitors a DOWN, both with the port as origin. Removal and notification share one
     // critical section of the port table so `demonitor` cannot slip between them.
-    let removed = remove_and_notify(runtime, id, &scheduler, sender, atom("normal"));
+    let removed = remove_and_notify(runtime, id, scheduler, sender, atom("normal"));
     if let Some(handle) = removed {
         crate::trace::port_closed(runtime, id);
         release_io(&handle);
@@ -4076,7 +4076,7 @@ pub(crate) fn exit_port(
     }
     crate::trace::emit_port_event(runtime, id, crate::trace::PORTS, "closed", &[reason]);
     let scheduler = runtime.scheduler()?;
-    let Some(removed) = remove_and_notify(runtime, id, &scheduler, ctx.pid(), reason) else {
+    let Some(removed) = remove_and_notify(runtime, id, scheduler, ctx.pid(), reason) else {
         return Ok(());
     };
     crate::trace::port_closed(runtime, id);
@@ -4165,7 +4165,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
         // `! {connect, ...}` queues it.
         connected_message(
             runtime,
-            &scheduler,
+            scheduler,
             from,
             id,
             handle.trace_scope,

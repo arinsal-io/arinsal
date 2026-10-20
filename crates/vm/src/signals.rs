@@ -574,7 +574,7 @@ busy_wait(Until) ->
     }
 }
 
-fn each_list_item(term: Term, mut visit: impl FnMut(Term)) -> Option<()> {
+pub(crate) fn each_list_item(term: Term, mut visit: impl FnMut(Term)) -> Option<()> {
     let mut current = term;
     while current.classify() == TermKind::List {
         // SAFETY: The source heap remains live during this BIF call.

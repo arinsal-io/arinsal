@@ -1445,7 +1445,7 @@ fn load_dynamic(
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.scheduler().ok())
-        .map_or_else(Weak::new, |scheduler| Arc::downgrade(&scheduler));
+        .map_or_else(Weak::new, Arc::downgrade);
     install_stubs(vm, caller_id, library, &binds, scheduler)?;
     Ok(atom("ok"))
 }
@@ -1917,7 +1917,7 @@ fn install_hub_for(process: &Process, pid: Pid) {
         return;
     }
     let hub = Hub {
-        scheduler: Arc::downgrade(&scheduler),
+        scheduler: Arc::downgrade(scheduler),
         pid,
         runtime: Arc::downgrade(runtime),
         current: None,
