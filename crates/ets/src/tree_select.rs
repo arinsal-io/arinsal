@@ -274,11 +274,12 @@ impl Table {
     ) -> Result<(TreeScanEnd, usize), EtsError> {
         let true_atom = Term::atom(global_true());
         let mut scratch = VecHeap::new();
+        let mut runner = program.runner();
         let mut count = 0;
         let mut end = self.tree_scan(plan, true, after, TREE_SELECT_ITERATIONS, &mut |object| {
-            let term = object.term_for_filter(&mut scratch)?;
-            if program
-                .run(term, &mut scratch)?
+            let (term, size) = object.term_for_filter_with_size(&mut scratch)?;
+            if runner
+                .run_sized(term, &mut scratch, size)?
                 .is_some_and(|value| exact_eq(value, true_atom))
             {
                 count += 1;

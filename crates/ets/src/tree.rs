@@ -1,5 +1,42 @@
 use super::{EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, cmp};
+use smallvec::SmallVec;
 use std::cmp::Ordering;
+
+// Port of erl_db_tree_util.h (STACK_NEED): 90 entries on 64-bit, 50 on 32-bit.
+const TREE_STACK_NEED: usize = if usize::BITS == 64 { 90 } else { 50 };
+
+struct TreeStack<T> {
+    entries: SmallVec<[T; TREE_STACK_NEED]>,
+}
+
+impl<T> TreeStack<T> {
+    fn new() -> Self {
+        Self {
+            entries: SmallVec::new(),
+        }
+    }
+
+    fn push(&mut self, entry: T) {
+        self.entries.push(entry);
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.entries.pop()
+    }
+}
+
+struct PathEntry {
+    node: Box<Node>,
+    went_left: bool,
+}
+
+/// Result of one `db_put_dbterm_tree_common` descent.
+#[derive(Clone, Copy)]
+pub(super) enum InsertResult {
+    Inserted,
+    Replaced(usize),
+    Exists,
+}
 
 /// One AVL node. The stored subtree size gives `ets:slot/2` logarithmic lookup.
 pub(super) struct Node {
@@ -25,7 +62,24 @@ impl Node {
 
     /// Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
     pub(super) fn insert(root: Option<Box<Self>>, object: StoredTerm, keypos: usize) -> Box<Self> {
-        Self::insert_branch(root, object, keypos).0.unwrap()
+        let key = object.key(keypos);
+        Self::insert_with_key(root, object, key, keypos, false)
+            .0
+            .expect("inserting into an AVL tree returns a root")
+    }
+
+    /// Insert or replace using the key already read by the caller, as the C path does before it
+    /// descends. `key_clash_fail` ports `insert_new`'s single-path check.
+    // Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
+    pub(super) fn insert_with_key(
+        root: Option<Box<Self>>,
+        object: StoredTerm,
+        key: Term,
+        keypos: usize,
+        key_clash_fail: bool,
+    ) -> (Option<Box<Self>>, InsertResult) {
+        let (root, result, _) = Self::insert_branch(root, object, key, keypos, key_clash_fail);
+        (root, result)
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (split_tree), OTP-29.1.1.
@@ -106,87 +160,195 @@ impl Node {
     fn insert_branch(
         root: Option<Box<Self>>,
         object: StoredTerm,
+        key: Term,
         keypos: usize,
-    ) -> (Option<Box<Self>>, bool, bool) {
-        let Some(mut root) = root else {
-            return (Some(Self::new(object)), true, true);
-        };
-        let order = cmp(object.key(keypos), root.object.key(keypos));
-        if order == Ordering::Equal {
-            root.object = object;
-            return (Some(root), false, false);
-        }
-        let left = order == Ordering::Less;
-        let old_balance = root.balance;
-        let (child, inserted, child_grew) = if left {
-            Self::insert_branch(root.left.take(), object, keypos)
-        } else {
-            Self::insert_branch(root.right.take(), object, keypos)
-        };
-        if left {
-            root.left = child;
-        } else {
-            root.right = child;
-        }
-        if !inserted {
-            return (Some(root), false, false);
-        }
-        root.size += 1;
-        if !child_grew {
-            return (Some(root), true, false);
-        }
-        let delta = if left { -1 } else { 1 };
-        let balance = old_balance + delta;
-        match balance {
-            -1 | 1 => {
-                root.balance = balance;
-                root.height += 1;
-                (Some(root), true, true)
+        key_clash_fail: bool,
+    ) -> (Option<Box<Self>>, InsertResult, bool) {
+        let mut path = TreeStack::new();
+        let mut current = root;
+        let mut child_grew;
+        let result;
+        loop {
+            let Some(mut node) = current.take() else {
+                current = Some(Self::new(object));
+                child_grew = true;
+                result = InsertResult::Inserted;
+                break;
+            };
+            match cmp(key, node.object.key(keypos)) {
+                Ordering::Equal if key_clash_fail => {
+                    current = Some(node);
+                    child_grew = false;
+                    result = InsertResult::Exists;
+                    break;
+                }
+                Ordering::Equal => {
+                    let old_words = node.object.db_size_words;
+                    node.object = object;
+                    current = Some(node);
+                    child_grew = false;
+                    result = InsertResult::Replaced(old_words);
+                    break;
+                }
+                order => {
+                    let went_left = order == Ordering::Less;
+                    current = if went_left {
+                        node.left.take()
+                    } else {
+                        node.right.take()
+                    };
+                    path.push(PathEntry { node, went_left });
+                }
             }
-            0 => {
-                root.balance = 0;
-                (Some(root), true, false)
-            }
-            -2 | 2 => {
-                root.balance = balance;
-                (Some(Self::rebalance(root)), true, false)
-            }
-            _ => unreachable!("AVL balance factor is bounded"),
         }
+        while let Some(PathEntry {
+            mut node,
+            went_left,
+        }) = path.pop()
+        {
+            let old_balance = node.balance;
+            if went_left {
+                node.left = current.take();
+            } else {
+                node.right = current.take();
+            }
+            if !matches!(result, InsertResult::Inserted) {
+                current = Some(node);
+                child_grew = false;
+                continue;
+            }
+            node.size += 1;
+            if child_grew {
+                let delta = if went_left { -1 } else { 1 };
+                let balance = old_balance + delta;
+                match balance {
+                    -1 | 1 => {
+                        node.balance = balance;
+                        node.height += 1;
+                    }
+                    0 => {
+                        node.balance = 0;
+                        child_grew = false;
+                    }
+                    -2 | 2 => {
+                        node.balance = balance;
+                        node = Self::rebalance(node);
+                        child_grew = false;
+                    }
+                    _ => unreachable!("AVL balance factor is bounded"),
+                }
+            }
+            current = Some(node);
+        }
+        (current, result, child_grew)
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (linkout_tree), OTP-29.1.1.
     pub(super) fn remove(root: Option<Box<Self>>, key: Term, keypos: usize) -> Option<Box<Self>> {
-        let mut root = root?;
-        match cmp(key, root.object.key(keypos)) {
-            Ordering::Less => root.left = Self::remove(root.left.take(), key, keypos),
-            Ordering::Greater => root.right = Self::remove(root.right.take(), key, keypos),
-            Ordering::Equal => {
-                return match (root.left.take(), root.right.take()) {
-                    (None, right) => right,
-                    (left, None) => left,
-                    (Some(left), Some(right)) => {
-                        let (new_left, mut predecessor) = Self::take_max(left);
-                        predecessor.left = new_left;
-                        predecessor.right = Some(right);
-                        Some(Self::rebalance(predecessor))
-                    }
-                };
+        Self::remove_matching(root, key, keypos, |_| true).0
+    }
+
+    /// Remove by key and optional object predicate in one descent, returning the removed
+    /// object's accounting size for CA-tree memory updates.
+    // Port of erts/emulator/beam/erl_db_tree.c (linkout_tree/linkout_object_tree), OTP-29.1.1.
+    pub(super) fn remove_matching<F>(
+        root: Option<Box<Self>>,
+        key: Term,
+        keypos: usize,
+        mut matches: F,
+    ) -> (Option<Box<Self>>, Option<usize>)
+    where
+        F: FnMut(&StoredTerm) -> bool,
+    {
+        Self::remove_branch(root, key, keypos, &mut matches)
+    }
+
+    fn remove_branch<F>(
+        root: Option<Box<Self>>,
+        key: Term,
+        keypos: usize,
+        matches: &mut F,
+    ) -> (Option<Box<Self>>, Option<usize>)
+    where
+        F: FnMut(&StoredTerm) -> bool,
+    {
+        let mut path = TreeStack::new();
+        let mut current = root;
+        let removed;
+        loop {
+            let Some(mut node) = current.take() else {
+                removed = None;
+                break;
+            };
+            match cmp(key, node.object.key(keypos)) {
+                Ordering::Less => {
+                    current = node.left.take();
+                    path.push(PathEntry {
+                        node,
+                        went_left: true,
+                    });
+                }
+                Ordering::Greater => {
+                    current = node.right.take();
+                    path.push(PathEntry {
+                        node,
+                        went_left: false,
+                    });
+                }
+                Ordering::Equal if !matches(&node.object) => {
+                    current = Some(node);
+                    removed = None;
+                    break;
+                }
+                Ordering::Equal => {
+                    let words = node.object.db_size_words;
+                    current = match (node.left.take(), node.right.take()) {
+                        (None, right) => right,
+                        (left, None) => left,
+                        (Some(left), Some(right)) => {
+                            let (new_left, mut predecessor) = Self::take_max(left);
+                            predecessor.left = new_left;
+                            predecessor.right = Some(right);
+                            Some(Self::rebalance(predecessor))
+                        }
+                    };
+                    removed = Some(words);
+                    break;
+                }
             }
         }
-        Some(Self::rebalance(root))
+        while let Some(PathEntry {
+            mut node,
+            went_left,
+        }) = path.pop()
+        {
+            if went_left {
+                node.left = current.take();
+            } else {
+                node.right = current.take();
+            }
+            if removed.is_some() {
+                current = Some(Self::rebalance(node));
+            } else {
+                current = Some(node);
+            }
+        }
+        (current, removed)
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (delsub), OTP-29.1.1.
     fn take_max(mut root: Box<Self>) -> (Option<Box<Self>>, Box<Self>) {
-        match root.right.take() {
-            None => (root.left.take(), root),
-            Some(right) => {
-                let (new_right, max) = Self::take_max(right);
-                root.right = new_right;
-                (Some(Self::rebalance(root)), max)
-            }
+        let mut path = TreeStack::new();
+        while let Some(right) = root.right.take() {
+            path.push(root);
+            root = right;
         }
+        let mut current = root.left.take();
+        while let Some(mut node) = path.pop() {
+            node.right = current.take();
+            current = Some(Self::rebalance(node));
+        }
+        (current, root)
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (tree_balance_left) and :2954 (tree_balance_right), OTP-29.1.1.
@@ -302,7 +464,7 @@ impl Node {
 
     /// Port of erts/emulator/beam/erl_db_tree.c (traverse_forward), OTP-29.1.1.
     pub(super) fn walk<'a>(root: &'a Option<Box<Self>>, out: &mut Vec<&'a StoredTerm>) {
-        let mut pending = Vec::new();
+        let mut pending = TreeStack::new();
         let mut current = root.as_deref();
         loop {
             while let Some(node) = current {
@@ -313,6 +475,26 @@ impl Node {
             out.push(&node.object);
             current = node.right.as_deref();
         }
+    }
+
+    /// Visit each object in key order without materializing an object-reference vector.
+    // Port of erts/emulator/beam/erl_db_tree.c (traverse_forward), OTP-29.1.1.
+    pub(super) fn walk_each<F>(root: &Option<Box<Self>>, visit: &mut F) -> Result<(), EtsError>
+    where
+        F: FnMut(&StoredTerm) -> Result<(), EtsError>,
+    {
+        let mut pending = TreeStack::new();
+        let mut current = root.as_deref();
+        loop {
+            while let Some(node) = current {
+                pending.push(node);
+                current = node.left.as_deref();
+            }
+            let Some(node) = pending.pop() else { break };
+            visit(&node.object)?;
+            current = node.right.as_deref();
+        }
+        Ok(())
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (find_next) and :3232 (find_prev), OTP-29.1.1.
@@ -359,7 +541,7 @@ impl Node {
     where
         F: FnMut(&StoredTerm) -> Result<bool, EtsError>,
     {
-        let mut pending = Vec::new();
+        let mut pending = TreeStack::new();
         let mut current = root.as_deref();
         while let Some(node) = current {
             if eligible(node.object.key(keypos)) {
