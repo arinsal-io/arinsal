@@ -798,6 +798,11 @@ pub trait Clock: Send + Sync {
     /// Current virtual or real time.
     fn now_ms(&self) -> u64;
 
+    /// Nanoseconds until the clock reaches wheel position `pos`.
+    fn ns_until_pos(&self, pos: u64) -> u64 {
+        pos.saturating_sub(self.now_ms()).saturating_mul(1_000_000)
+    }
+
     /// The erts wheel position for a relative millisecond timeout.
     fn timeout_pos(&self, ms: u64) -> u64 {
         if ms == 0 {
@@ -845,6 +850,11 @@ impl Clock for RealClock {
             .as_secs()
             .saturating_mul(1000)
             .saturating_add(u64::from(elapsed.subsec_millis()))
+    }
+
+    fn ns_until_pos(&self, pos: u64) -> u64 {
+        let elapsed = u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        pos.saturating_mul(1_000_000).saturating_sub(elapsed)
     }
 
     fn timeout_pos(&self, ms: u64) -> u64 {
@@ -3492,6 +3502,7 @@ impl<T: Task> Inner<T> {
                 };
                 callback(&mut ctx);
             }
+            TimerPayload::Port(callback) => callback(),
             TimerPayload::ResolvedMessage(resolve, message, wrapped) => {
                 if let Some(pid) = resolve() {
                     let payload = if wrapped {
@@ -3551,6 +3562,24 @@ impl<T: Task> Inner<T> {
             local,
             None,
         )
+    }
+
+    fn start_port_timer(
+        &self,
+        ms: u64,
+        callback: Box<dyn FnOnce() + Send>,
+    ) -> Result<TimerRef, Error> {
+        let wheels = self.timer_commands.len().max(1);
+        let id = self.next_timer.fetch_add(1, Ordering::Relaxed);
+        let worker = self
+            .current_worker()
+            .filter(|worker| *worker < wheels)
+            .unwrap_or(id as usize % wheels);
+        if ms == 0 {
+            self.fire_timer(worker, id, TimerPayload::Port(callback), None);
+            return Ok(TimerRef { worker, id });
+        }
+        self.insert_timer(worker, id, TimerPayload::Port(callback), None, ms)
     }
 
     fn start_timer_payload(
@@ -6132,6 +6161,27 @@ impl<T: Task> Scheduler<T> {
             .is_ok()
     }
 
+    /// Start a port timer on the timer wheel of the calling scheduler (or of a wheel picked by
+    /// timer id from any other thread); `callback` runs on the wheel's scheduler when it
+    /// expires.
+    ///
+    /// Port of erts/emulator/beam/erl_hl_timer.c:3031 (erts_set_port_timer), OTP-29.1.1.
+    pub fn start_port_timer(
+        &self,
+        ms: u64,
+        callback: Box<dyn FnOnce() + Send>,
+    ) -> Result<TimerRef, Error> {
+        self.inner.start_port_timer(ms, callback)
+    }
+
+    /// Cancel a port timer; the cancel is delivered to the owning wheel and need not finish
+    /// before this returns.
+    ///
+    /// Port of erts/emulator/beam/erl_hl_timer.c:3063 (erts_cancel_port_timer), OTP-29.1.1.
+    pub fn cancel_port_timer(&self, reference: TimerRef) {
+        self.inner.cancel_timer_async(reference, Box::new(|_| {}));
+    }
+
     /// Schedule an opaque envelope for future delivery.
     pub fn start_timer(&self, pid: Pid, ms: u64, msg: T::Message) -> Result<TimerRef, Error> {
         self.inner
@@ -7988,18 +8038,23 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         }
         // Port of erts/emulator/beam/erl_process.c:3404 (scheduler_wait: sleep until the
         // next timeout, erts_check_next_timeout_time), OTP-29.1.1.
-        let timer_ms = {
+        let timer_ns = {
             let mut service = local.timer_service.borrow_mut();
             if !service.commands.is_empty() || !service.canceled.is_empty() {
-                Some(1)
+                Some(1_000_000)
             } else {
                 service
                     .wheel
                     .next_timeout()
-                    .map(|next| next.saturating_sub(inner.clock.now_ms()))
+                    .map(|next| inner.clock.ns_until_pos(next))
             }
         };
-        let wait_ms = match (inner.nearest_wait_ms(&*local), timer_ms) {
+        let wait_ns = match (
+            inner
+                .nearest_wait_ms(&*local)
+                .map(|ms| ms.saturating_mul(1_000_000)),
+            timer_ns,
+        ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
@@ -8029,8 +8084,8 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             // Port of erts/emulator/beam/erl_process.c (scheduler_wait): the sleep state
             // wraps only the blocking wait, the spin above counts as `other`.
             local.set_msacc_state(MsaccState::Sleep);
-            if let Some(ms) = wait_ms {
-                thread::park_timeout(Duration::from_millis(ms.max(1)));
+            if let Some(ns) = wait_ns {
+                park_until(&inner, id, ns);
             } else {
                 // `Thread::park` can return spuriously. A real wake clears `parked`
                 // before `unpark` (ssi_wake). Stay asleep until that happens so a
@@ -8056,6 +8111,35 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     OWNER_TIMER_SERVICES.with(|services| {
         services.borrow_mut().remove(&inner_id);
     });
+}
+
+/// The timed sleep of an idle scheduler.
+///
+/// erts sleeps in the poll set with a kernel timeout that is accurate to about a hundred
+/// microseconds; a plain `park_timeout` on macOS overshoots by 1.5 ms (timer coalescing),
+/// which is a full extra millisecond on every timer. The coarse part of the sleep is
+/// therefore shortened by the observed overshoot and the rest is waited for by yielding
+/// until the deadline or a wake-up.
+fn park_until<T: Task>(inner: &Inner<T>, id: usize, wait_ns: u64) {
+    const SLACK_NS: u64 = if cfg!(target_os = "macos") {
+        2_500_000
+    } else {
+        0
+    };
+    let deadline = Instant::now() + Duration::from_nanos(wait_ns);
+    let coarse = wait_ns.saturating_sub(SLACK_NS);
+    if coarse >= 200_000 || SLACK_NS == 0 {
+        thread::park_timeout(Duration::from_nanos(coarse.max(1_000)));
+    }
+    if SLACK_NS == 0 {
+        return;
+    }
+    while Instant::now() < deadline
+        && inner.parked[id].load(Ordering::SeqCst)
+        && !inner.stopped.load(Ordering::Acquire)
+    {
+        thread::yield_now();
+    }
 }
 
 /// What the receiver's BTM lock (`ERTS_PROC_LOCK_BTM`) protects: `p->bif_timers`, the BIF

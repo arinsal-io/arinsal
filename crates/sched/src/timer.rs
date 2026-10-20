@@ -419,6 +419,20 @@ pub struct TimerRef {
 }
 
 impl TimerRef {
+    /// The reference as one word (worker in the top 16 bits, timer id below), for owners that
+    /// keep it outside this crate.
+    pub fn to_bits(self) -> u64 {
+        ((self.worker as u64) << 48) | (self.id & ((1 << 48) - 1))
+    }
+
+    /// Inverse of [`TimerRef::to_bits`].
+    pub fn from_bits(bits: u64) -> Self {
+        Self {
+            worker: (bits >> 48) as usize,
+            id: bits & ((1 << 48) - 1),
+        }
+    }
+
     /// One-based scheduler that owns this timer's wheel.
     pub fn worker_id(self) -> usize {
         self.worker + 1
@@ -477,6 +491,8 @@ pub(crate) enum TimerPayload<M> {
     Wake(Pid, u64),
     /// Runtime callback owned by a process (erts `erts_start_timer_callback`).
     Callback(Pid, crate::TimerCallback<M>),
+    /// A port timer (`erts_set_port_timer`): the callback queues the port's timeout task.
+    Port(Box<dyn FnOnce() + Send>),
 }
 
 pub(crate) enum TimerCommand<M> {

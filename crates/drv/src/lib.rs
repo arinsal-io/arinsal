@@ -555,6 +555,15 @@ pub trait PortHost: Send + Sync {
         term: &arinsal_etf::OwnedTerm,
         trace: bool,
     ) -> bool;
+    /// Start a port timer on the scheduler timer wheel (`erts_set_port_timer`): `expired`
+    /// runs on the wheel's scheduler. The result is an opaque handle for
+    /// [`PortHost::cancel_port_timer`]; `None` when the host has no scheduler timers, which
+    /// leaves the driver crate's own timer thread to do it.
+    fn start_port_timer(&self, _ms: u64, _expired: Box<dyn FnOnce() + Send>) -> Option<u64> {
+        None
+    }
+    /// Cancel a timer started by [`PortHost::start_port_timer`].
+    fn cancel_port_timer(&self, _handle: u64) {}
     /// Trace `timeout` immediately before the driver callback runs.
     fn trace_timeout(&self, _port: &DriverPort) {}
     /// Process-table data of the connected process (`ERTS_PORT_GET_CONNECTED`).
