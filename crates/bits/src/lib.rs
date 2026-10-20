@@ -593,6 +593,24 @@ pub fn create_utf_segment<H: HeapAlloc>(
         .map_err(|error| term_error(error, 1, 3))
 }
 
+/// Young-heap words [`concat_byte_binary`] writes for these operands, or `None` when it does not
+/// apply (a non-byte-aligned operand). A result up to 64 bytes is a heap bitstring of
+/// `2 + ceil(total / 8)` words; a larger one is a BinRef plus SubBits (8 words).
+// Port of erts/emulator/beam/erl_bits.h (`heap_bits_size`, `ERL_REFC_BITS_SIZE`), OTP-29.1.1.
+pub fn concat_byte_binary_heap_words(prefix: Term, extra: Term) -> Option<usize> {
+    let left = bit_size(prefix)?;
+    let right = bit_size(extra)?;
+    if !left.is_multiple_of(8) || !right.is_multiple_of(8) {
+        return None;
+    }
+    let bytes = left.checked_add(right)? / 8;
+    Some(if bytes <= 64 {
+        2 + bytes.div_ceil(8)
+    } else {
+        8
+    })
+}
+
 /// Concatenate byte-aligned payloads directly into their final heap or Binary allocation.
 // Port of erts/emulator/beam/erl_bits.c:72,1812-1917 (`GROW_PROC_BIN_SIZE` and
 // `erts_bs_append_checked`), OTP-29.1.1.

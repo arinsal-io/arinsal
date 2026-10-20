@@ -17,14 +17,16 @@ pub extern "C" fn append_binary(
     src_index: u64,
     extra_index: u64,
     live: u64,
+    alloc: u64,
 ) -> u64 {
     let Some((process, _registers)) = enter_runtime(header) else {
         return 0;
     };
-    let (Ok(src_index), Ok(extra_index), Ok(live)) = (
+    let (Ok(src_index), Ok(extra_index), Ok(live), Ok(alloc)) = (
         usize::try_from(src_index),
         usize::try_from(extra_index),
         usize::try_from(live),
+        usize::try_from(alloc),
     ) else {
         return 0;
     };
@@ -74,7 +76,13 @@ pub extern "C" fn append_binary(
     };
     // Port of `erts_bs_append_checked`'s ERL_REFC_BITS_SIZE heap request: BinRef + SubBits.
     // `<<Bin/binary, Bin2/binary>>` fills one destination with the two source ranges.
-    if let Ok(collected) = process.ensure_native_roots(8, root_live)
+    // The heap bitstring of a result up to 64 bytes takes up to 10 words, more than a BinRef plus
+    // SubBits, so the request follows what the builder writes. `Alloc` is the heap the
+    // instruction's following stores use without their own test (`extra_words` in erts).
+    if let Some(words) =
+        arinsal_bits::concat_byte_binary_heap_words(process.x[src_index], process.x[extra_index])
+            .and_then(|words| words.checked_add(alloc))
+        && let Ok(collected) = process.ensure_native_roots(words, root_live)
         && let Ok(Some(term)) = arinsal_bits::concat_byte_binary(
             process.x[src_index],
             process.x[extra_index],
@@ -91,7 +99,7 @@ pub extern "C" fn append_binary(
     }
     let initial = build(process.x[src_index], process.x[extra_index]);
     let mut request = match arinsal_bits::create_bin_size(&initial) {
-        Ok(size) => size.heap_words,
+        Ok(size) => size.heap_words.saturating_add(alloc),
         Err(error) => return fail(process, error),
     };
     let result = loop {
@@ -103,7 +111,9 @@ pub extern "C" fn append_binary(
         let segments = build(process.x[src_index], process.x[extra_index]);
         match arinsal_bits::create_bin(&segments, &mut process.heap) {
             Err(BitsError::HeapFull { need_words }) => {
-                request = need_words.max(request.saturating_mul(2));
+                request = need_words
+                    .saturating_add(alloc)
+                    .max(request.saturating_mul(2));
             }
             other => break other,
         }

@@ -96,3 +96,30 @@ fn private_append_clears_zero_bits_in_a_dirty_destination_byte() {
     assert_eq!(to_owned(actual).unwrap(), expected);
     assert_eq!(expected, OwnedTerm::Binary(vec![0x80]));
 }
+
+/// The helper reserves `concat_byte_binary_heap_words` before building; the builder must never
+/// write more than that (a 57..64 byte result is a 9..10 word heap bitstring).
+#[test]
+fn concat_byte_binary_writes_no_more_than_it_reserves() {
+    for total in 0..=130usize {
+        for split in [0, total / 2, total] {
+            let mut heap = ProcessHeap::with_words(512);
+            let left = TermBuilder::new(&mut heap)
+                .bitstring(&vec![b'a'; split], split * 8)
+                .unwrap();
+            let right = TermBuilder::new(&mut heap)
+                .bitstring(&vec![b'b'; total - split], (total - split) * 8)
+                .unwrap();
+            let reserved = arinsal_bits::concat_byte_binary_heap_words(left, right).unwrap();
+            let before = heap.free_words();
+            arinsal_bits::concat_byte_binary(left, right, &mut heap)
+                .unwrap()
+                .unwrap();
+            let used = before - heap.free_words();
+            assert!(
+                used <= reserved,
+                "{total}/{split}: wrote {used}, reserved {reserved}"
+            );
+        }
+    }
+}
