@@ -207,6 +207,7 @@ pub struct MapsBuildWalk {
     phase: BuildPhase,
     cursor: Term,
     size: usize,
+    leaves_written: usize,
     build: Option<arinsal_maps::HashmapFromPairs>,
 }
 
@@ -228,6 +229,7 @@ impl MapsBuildWalk {
             phase: BuildPhase::Validate,
             cursor: list,
             size: 0,
+            leaves_written: 0,
             build: None,
         }
     }
@@ -280,6 +282,11 @@ impl MapsBuildWalk {
                         if *reds <= 0 {
                             return Ok(None);
                         }
+                        let (head, tail) = Self::cell(self.cursor)?;
+                        self.element(head)?;
+                        self.size += 1;
+                        self.cursor = tail;
+                        self.phase = BuildPhase::Validate;
                         continue;
                     }
                     if self.cursor != Term::NIL {
@@ -318,6 +325,27 @@ impl MapsBuildWalk {
                         if *reds <= 0 {
                             return Ok(None);
                         }
+                        // The current cell has paid its YCF iteration. Consume the
+                        // remaining available entries in the same direct-fill loop.
+                        let remaining = self.size - self.leaves_written;
+                        let count = remaining.min(*reds as usize);
+                        let fill = self.fill;
+                        let mut cursor = self.cursor;
+                        let pairs = std::iter::from_fn(|| {
+                            let (head, tail) = Self::cell(cursor).ok()?;
+                            cursor = tail;
+                            Self::element_of(fill, head, false).ok()
+                        })
+                        .take(count);
+                        self.build
+                            .as_mut()
+                            .expect("hashmap leaf builder")
+                            .push_chunk(count, pairs)
+                            .map_err(|error| map_error(ctx, error))?;
+                        self.cursor = cursor;
+                        self.leaves_written += count;
+                        *reds -= count.saturating_sub(1) as i64;
+                        self.phase = BuildPhase::Leaves;
                         continue;
                     }
                     self.build
@@ -335,6 +363,7 @@ impl MapsBuildWalk {
                         .push(key, value)
                         .map_err(|error| map_error(ctx, error))?;
                     self.cursor = tail;
+                    self.leaves_written += 1;
                     self.phase = BuildPhase::Leaves;
                 }
                 BuildPhase::Build => {
