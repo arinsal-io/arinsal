@@ -1877,11 +1877,7 @@ impl Relations {
             links: cold
                 .links
                 .iter()
-                .copied()
-                .map(|pid| {
-                    let unlinking = cold.unlinking.values().any(|&target| target == pid);
-                    (pid, unlinking)
-                })
+                .map(|(&pid, node)| (pid, node.unlinking != 0))
                 .collect(),
             monitors: cold
                 .monitors

@@ -963,6 +963,15 @@ impl OriginMonitor {
     }
 }
 
+/// One local link node (erts `ErtsILink`, erl_monitor_link.h): `unlinking` is the id of the
+/// pending unlink op (0 when none) and `prio` is `ERTS_ML_FLG_PRIO_ML` (EXIT messages from the
+/// peer are priority).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ILink {
+    pub(crate) unlinking: u64,
+    pub(crate) prio: bool,
+}
+
 /// Origin half of a local monitor (erts `ERTS_P_MONITORS` entry): the monitored target.
 #[derive(Clone, Debug)]
 pub(crate) struct OriginHalf {
@@ -986,8 +995,6 @@ pub(crate) struct ProcessCold {
     pub(crate) max_heap: crate::process::MaxHeap,
     /// `process_flag(save_calls, N)` buffer (erts `ERTS_PSD_SAVED_CALLS_BUF`).
     pub(crate) saved_calls: Option<crate::trace::SavedCalls>,
-    /// Link halves retained until the matching unlink acknowledgement arrives.
-    pub(crate) unlinking: std::collections::BTreeMap<u64, arinsal_sched::Pid>,
     /// The process already exited while its dirty job keeps running.
     /// Port of erl_process.c:10096 (`need_forced_exit`), OTP-29.1.1.
     pub(crate) dirty_exited: bool,
@@ -1151,9 +1158,8 @@ pub(crate) struct ProcessCold {
     pub(crate) parent_external: Option<arinsal_etf::OwnedTerm>,
     pub(crate) receive_markers: Option<Box<receive::ReceiveMarkers>>,
     pub(crate) receive_marker_uniq: i64,
-    pub(crate) links: std::collections::BTreeSet<arinsal_sched::Pid>,
-    /// Links created with `link/2` `[priority]` — EXIT messages from these are priority.
-    pub(crate) prio_links: std::collections::BTreeSet<arinsal_sched::Pid>,
+    /// Link nodes keyed by the other end (erts `ERTS_P_LINKS`, a tree of `ErtsILink`).
+    pub(crate) links: std::collections::BTreeMap<arinsal_sched::Pid, ILink>,
     /// Origin entries keyed by reference (erts `ERTS_P_MONITORS`), including standalone aliases.
     pub(crate) monitors: std::collections::BTreeMap<u64, OriginMonitor>,
     /// Remote-process monitors. `demonitor` of any other ref does not take the
