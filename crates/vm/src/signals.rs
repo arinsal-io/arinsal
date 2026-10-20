@@ -2361,11 +2361,9 @@ pub(crate) fn demonitor_light(
             return None;
         }
         let scheduler = rt_ref(process)?.scheduler().ok()?;
-        // erts consumes the held process monitor instead of sending the demonitor when it can
-        // (erl_proc_sig_queue.c:1104). The executor ignores a dead target here as well.
-        if !flush || !scheduler.cancel_pending_monitor(pid, id) {
-            let _ = scheduler.signal_ordered(me, pid, arinsal_sched::Signal::Demonitor(id));
-        }
+        // Port of erts/emulator/beam/bif.c:521 (demonitor, ERTS_MON_TYPE_PROC): the demonitor
+        // always goes through proc_queue_signal, which sends a held monitor first.
+        let _ = scheduler.signal_ordered(me, pid, arinsal_sched::Signal::Demonitor(id));
         Term::atom(arinsal_term::atoms::TRUE)
     } else {
         atom(if info { "false" } else { "true" })
@@ -3070,9 +3068,7 @@ fn call_resolved(
             };
             let mut was_active = false;
             if let Some(target) = process_target {
-                if !flush || !ctx.cancel_pending_monitor(target, id) {
-                    let _ = ctx.signal(target, Signal::Demonitor(id));
-                }
+                let _ = ctx.signal(target, Signal::Demonitor(id));
                 was_active = true;
             }
             // Port of erts/emulator/beam/bif.c:504-510 (demonitor, ERTS_MON_TYPE_PORT),
