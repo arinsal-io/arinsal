@@ -25,6 +25,8 @@ run() ->
     true = unlink(Pid),
     UnlinkedSelf = not has_link(erts_debug:get_internal_state({link_list, Parent}), Pid),
     UnlinkedTarget = not has_link(erts_debug:get_internal_state({link_list, Pid}), Parent),
+    {links, InfoLinks} = process_info(Parent, links),
+    UnlinkedInfoSelf = not lists:member(Pid, InfoLinks),
 
     Ref = monitor(process, Pid),
     Pid ! ping,
@@ -64,7 +66,7 @@ run() ->
             target, NamedRef, NamedOrigin, Name)
     end,
     Pid ! stop,
-    {LinkedSelf, LinkedTarget, UnlinkedSelf, UnlinkedTarget,
+    {LinkedSelf, LinkedTarget, UnlinkedSelf, UnlinkedTarget, UnlinkedInfoSelf,
      OriginBefore, TargetBefore, OriginAfter, TargetAfter,
      SelfNameAbsent, ChildOrigin, ChildTarget, ChildTargetAfter,
      NamedOriginBefore, NamedTargetBefore, NamedTargetAfter}.
@@ -125,6 +127,7 @@ fn link_and_monitor_introspection_matches_erts() {
         .term;
 
     let expected_shape = CallResult::Ok(OwnedTerm::Tuple(vec![
+        OwnedTerm::atom("true"),
         OwnedTerm::atom("true"),
         OwnedTerm::atom("true"),
         OwnedTerm::atom("true"),
