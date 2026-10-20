@@ -4224,7 +4224,6 @@ trait ContextOps<M: SignalMessage> {
     fn mark_exited(&mut self, pid: Pid);
     fn cancel_target_timers(&mut self, pid: Pid);
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error>;
-    fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool;
     fn request_aux_work_all(&mut self, work: SchedulerAuxWork);
     fn begin_halt(
         &mut self,
@@ -4290,11 +4289,6 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// A worker-local child runs before this worker parks.
     pub fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error> {
         self.inner.schedule_spawn(pid)
-    }
-    /// Cancel an unpublished monitor when a flushing demonitor follows it in
-    /// the same process turn.
-    pub fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool {
-        self.inner.cancel_pending_monitor(to, reference)
     }
     /// Consume reductions; returns false when the quantum is exhausted.
     pub fn consume(&mut self, count: u32) -> bool {
@@ -5023,22 +5017,6 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         }
     }
 
-    fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool {
-        if PENDING_PROC_MONITOR.with(|slot| {
-            slot.borrow()
-                .as_ref()
-                .is_some_and(|held| held.to == to && held.id == reference)
-        }) {
-            // Port of erts/emulator/beam/erl_proc_sig_queue.c:1104
-            // (pending process monitor), OTP-29.1.1. `demonitor([flush])`
-            // consumes any possible DOWN, so this unpublished monitor has no
-            // target-visible effect.
-            PENDING_PROC_MONITOR.with(|slot| slot.borrow_mut().take());
-            true
-        } else {
-            false
-        }
-    }
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error> {
         let process = self.lookup(pid).ok_or(Error::NoProcess)?;
         process
@@ -5658,18 +5636,6 @@ impl<T: Task> Scheduler<T> {
     pub fn signal(&self, from: Pid, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
         self.inner.publish_held_monitor_for(to, None);
         self.inner.deliver(from, to, Payload::Signal(signal), None)
-    }
-    /// Consume the held process monitor for `reference` to `to` when it is still unsent, so a
-    /// `demonitor(_, [flush])` need not send the demonitor signal. Returns true when consumed.
-    pub fn cancel_pending_monitor(&self, to: Pid, reference: u64) -> bool {
-        <Runner<'_, T> as ContextOps<T::Message>>::cancel_pending_monitor(
-            &mut Runner {
-                inner: &self.inner,
-                local: None,
-            },
-            to,
-            reference,
-        )
     }
     /// User priority of a live process.
     pub fn process_priority(&self, pid: Pid) -> Option<Priority> {
