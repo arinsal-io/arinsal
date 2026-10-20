@@ -1190,6 +1190,212 @@ pub fn copy_binary_range(term: Term, start: usize, output: &mut [u8]) -> Result<
     copy_bitstring_range(term, start_bit, output, bits)
 }
 
+/// Copy a bit range into a destination at an arbitrary bit offset.
+// Port of erts/emulator/beam/erl_bits.c:2389-2505 (erts_copy_bits_fwd), OTP-29.1.1.
+pub fn copy_bitstring_range_to(
+    term: Term,
+    source_start: usize,
+    destination: &mut [u8],
+    destination_start: usize,
+    bit_count: usize,
+) -> Result<(), BifError> {
+    with_binary_bytes(term, |view| {
+        copy_bitstring_view_range_to(
+            &view,
+            source_start,
+            destination,
+            destination_start,
+            bit_count,
+        )
+    })?
+}
+
+fn copy_bitstring_view_range_to(
+    view: &BinaryRef<'_>,
+    source_start: usize,
+    destination: &mut [u8],
+    destination_start: usize,
+    bit_count: usize,
+) -> Result<(), BifError> {
+    let destination_bits = destination.len().checked_mul(8).ok_or(BADARG)?;
+    let destination_end = destination_start
+        .checked_add(bit_count)
+        .filter(|&end| end <= destination_bits)
+        .ok_or(BADARG)?;
+
+    let _source_end = source_start
+        .checked_add(bit_count)
+        .filter(|&end| end <= view.bit_len())
+        .ok_or(BADARG)?;
+    let source_start = view.start_bit().checked_add(source_start).ok_or(BADARG)?;
+    if bit_count == 0 {
+        return Ok(());
+    }
+    if source_start.is_multiple_of(8)
+        && destination_start.is_multiple_of(8)
+        && bit_count.is_multiple_of(8)
+    {
+        // Port of erts/emulator/beam/erl_bits.h:541-552 (copy_binary_to_buffer), OTP-29.1.1.
+        let byte_count = bit_count / 8;
+        let source_byte = source_start / 8;
+        let destination_byte = destination_start / 8;
+        let source_end = source_byte.checked_add(byte_count).ok_or(BADARG)?;
+        let destination_end = destination_byte.checked_add(byte_count).ok_or(BADARG)?;
+        destination[destination_byte..destination_end]
+            .copy_from_slice(&view.bytes()[source_byte..source_end]);
+        return Ok(());
+    }
+    let source = view.bytes().get(source_start / 8..).ok_or(BADARG)?;
+    let destination = destination.get_mut(destination_start / 8..).ok_or(BADARG)?;
+    let mut source_index = 0;
+    let mut destination_index = 0;
+    let source_offset = source_start % 8;
+    let destination_offset = destination_start % 8;
+    let destination_end_offset = destination_end % 8;
+    let left_mask = if destination_offset == 0 {
+        0
+    } else {
+        0xff >> destination_offset
+    };
+    let right_mask = if destination_end_offset == 0 {
+        0
+    } else {
+        (((1_u16 << destination_end_offset) - 1) << (8 - destination_end_offset)) as u8
+    };
+
+    if destination_offset + bit_count < 8 {
+        let mask = if left_mask & right_mask != 0 {
+            left_mask & right_mask
+        } else {
+            left_mask | right_mask
+        };
+        let mut bits = if source_offset == destination_offset {
+            u16::from(source[source_index])
+        } else if source_offset > destination_offset {
+            let shift = source_offset - destination_offset;
+            let mut bits = u16::from(source[source_index]) << shift;
+            if source_offset + bit_count > 8 {
+                let next = source.get(source_index + 1).ok_or(BADARG)?;
+                bits |= u16::from(*next) >> (8 - shift);
+            }
+            bits
+        } else {
+            u16::from(source[source_index]) >> (destination_offset - source_offset)
+        };
+        bits &= 0xff;
+        destination[destination_index] =
+            (bits as u8 & mask) | (destination[destination_index] & !mask);
+        return Ok(());
+    }
+
+    let mut count = if left_mask == 0 {
+        bit_count >> 3
+    } else {
+        (bit_count - (8 - destination_offset)) >> 3
+    };
+
+    if source_offset == destination_offset {
+        if left_mask != 0 {
+            destination[destination_index] =
+                (source[source_index] & left_mask) | (destination[destination_index] & !left_mask);
+            destination_index += 1;
+            source_index += 1;
+        }
+        if count != 0 {
+            let source_end = source_index + count;
+            let destination_end = destination_index + count;
+            destination[destination_index..destination_end]
+                .copy_from_slice(&source[source_index..source_end]);
+            destination_index = destination_end;
+            source_index = source_end;
+        }
+        if right_mask != 0 {
+            destination[destination_index] = (source[source_index] & right_mask)
+                | (destination[destination_index] & !right_mask);
+        }
+        return Ok(());
+    }
+
+    let (mut bits, left_shift, right_shift) = if source_offset > destination_offset {
+        let left_shift = source_offset - destination_offset;
+        let right_shift = 8 - left_shift;
+        let bits = u16::from(source[source_index]);
+        if source_offset + bit_count > 8 {
+            source_index += 1;
+        }
+        (bits, left_shift, right_shift)
+    } else {
+        let right_shift = destination_offset - source_offset;
+        (0, 8 - right_shift, right_shift)
+    };
+
+    if left_mask != 0 {
+        let first = bits << left_shift;
+        bits = u16::from(source[source_index]);
+        source_index += 1;
+        let first = (first | (bits >> right_shift)) as u8;
+        destination[destination_index] =
+            (first & left_mask) | (destination[destination_index] & !left_mask);
+        destination_index += 1;
+    }
+
+    while count != 0 {
+        let high = bits << left_shift;
+        bits = u16::from(source[source_index]);
+        source_index += 1;
+        destination[destination_index] = (high | (bits >> right_shift)) as u8;
+        destination_index += 1;
+        count -= 1;
+    }
+
+    if right_mask != 0 {
+        let mut last = bits << left_shift;
+        if (u16::from(right_mask) << right_shift) & 0xff != 0 {
+            bits = u16::from(*source.get(source_index).ok_or(BADARG)?);
+            last |= bits >> right_shift;
+        }
+        let last = last as u8;
+        destination[destination_index] =
+            (last & right_mask) | (destination[destination_index] & !right_mask);
+    }
+    Ok(())
+}
+
+/// Repeat a byte-aligned bitstring into `destination` through `trap_offset` bits.
+// Port of erts/emulator/beam/erl_bif_binary.c:2379-2398 (binary_copy_loop), OTP-29.1.1.
+pub fn copy_binary_pattern(
+    term: Term,
+    destination: &mut [u8],
+    copied_bits: usize,
+    trap_offset: usize,
+) -> Result<usize, BifError> {
+    let target_size = destination.len().checked_mul(8).ok_or(BADARG)?;
+    if copied_bits > trap_offset || trap_offset > target_size {
+        return Err(BADARG);
+    }
+
+    with_binary_bytes(term, |view| {
+        let source_size = view.bit_len();
+        if !source_size.is_multiple_of(8) || source_size == 0 {
+            return Err(BADARG);
+        }
+        let mut copied_bits = copied_bits;
+        while copied_bits < trap_offset {
+            let source_offset = copied_bits % source_size;
+            let copy_stride = (trap_offset - copied_bits).min(source_size - source_offset);
+            copy_bitstring_view_range_to(
+                &view,
+                source_offset,
+                destination,
+                copied_bits,
+                copy_stride,
+            )?;
+            copied_bits += copy_stride;
+        }
+        Ok(copied_bits)
+    })?
+}
+
 /// Copy significant bits into a most-significant-bit-first packed byte slice.
 // Port of erts/emulator/beam/erl_bits.c:2389-2515 (erts_copy_bits_fwd), OTP-29.1.1.
 pub fn copy_bitstring_range(

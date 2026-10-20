@@ -10,7 +10,7 @@ const MODULE: &str = "binary_copy_reductions_test";
 
 const SOURCE: &str = r#"-module(binary_copy_reductions_test).
 -export([copy_4k/0, copy_64k/0, copy_100k/0, copy_300k/0, copy_odd_size/0, copy_1m/0,
-         copy_loop_limit/0]).
+         copy_loop_limit/0, copy_loop_limit_unaligned/0, copy_unaligned_source/0]).
 
 copy_4k() -> measure(fun() -> binary:copy(<<0, 1, 255, 17>>, 1000) end).
 copy_64k() -> measure(fun() -> binary:copy(<<0, 1, 255, 17>>, 16000) end).
@@ -24,6 +24,25 @@ copy_loop_limit() ->
     erts_debug:set_internal_state(binary_loop_limit, 800),
     try
         measure(fun() -> binary:copy(<<0, 1, 255, 17>>, 100000) end)
+    after
+        erts_debug:set_internal_state(binary_loop_limit, default)
+    end.
+
+copy_loop_limit_unaligned() ->
+    _ = erts_debug:set_internal_state(available_internal_state, true),
+    erts_debug:set_internal_state(binary_loop_limit, 801),
+    try
+        measure(fun() -> binary:copy(<<0, 1, 255, 17>>, 100) end)
+    after
+        erts_debug:set_internal_state(binary_loop_limit, default)
+    end.
+
+copy_unaligned_source() ->
+    _ = erts_debug:set_internal_state(available_internal_state, true),
+    erts_debug:set_internal_state(binary_loop_limit, 801),
+    <<_:3, Source:24/bitstring, _/bitstring>> = <<0:3, 5, 6, 7, 0:5>>,
+    try
+        measure(fun() -> binary:copy(Source, 1000) end)
     after
         erts_debug:set_internal_state(binary_loop_limit, default)
     end.
@@ -79,6 +98,8 @@ fn binary_copy_reductions_and_slices_match_otp() {
         "copy_odd_size",
         "copy_1m",
         "copy_loop_limit",
+        "copy_loop_limit_unaligned",
+        "copy_unaligned_source",
     ];
     for (index, function) in cases.iter().enumerate() {
         let CallResult::Ok(expected) = reference.call(MODULE, function, &[]) else {
