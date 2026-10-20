@@ -251,6 +251,102 @@ fn differential_5000_mixed_maps() {
 }
 
 #[test]
+#[cfg(not(miri))]
+fn differential_mixed_hamt_comparison_sizes() {
+    let sizes = [
+        33, 34, 35, 36, 37, 40, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1500, 2000,
+    ];
+    let erlang_sizes = sizes
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let expression = format!(
+        r#"
+      F=fun(I)->case I rem 6 of 0->I+100000; 1->I+0.5; 2->{{I}}; 3->[I]; 4->binary:copy(<<I:32>>); 5->-I-1 end end,
+      Cmp=fun(A,B)->if A<B->0; A>B->2; true->1 end end,
+      lists:foreach(fun(N)->Num=N-2,P=[{{F((I*37+4*977) rem 5000),I*3-4}}||I<-lists:seq(0,Num-1)],
+        M=maps:from_list([{{1,17}},{{1.0,19}}]++P), M2=maps:put(1.0,4,M),
+        M3=maps:remove(1.0,maps:put(2.0,4,M)), io:format("~B ~B ~B~n",[N,Cmp(M,M2),Cmp(M,M3)])
+      end,[{erlang_sizes}]),halt()."#
+    );
+    let output = Command::new("erl")
+        .args(["-noshell", "-eval", &expression])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .map(|v| v.parse::<u64>().unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    similar_asserts::assert_eq!(expected.len(), sizes.len());
+    for (size, expected) in sizes.into_iter().zip(expected) {
+        let mut heap = VecHeap::new();
+        let mut builder = TermBuilder::new(&mut heap);
+        let float_one = builder.float(1.0).unwrap();
+        let mut pairs = vec![
+            (Term::small(1).unwrap(), Term::small(17).unwrap()),
+            (float_one, Term::small(19).unwrap()),
+        ];
+        for index in 0..size - 2 {
+            let key_index = (index * 37 + 4 * 977) % 5000;
+            let n = key_index as i64;
+            let key = match key_index % 6 {
+                0 => Term::small(n + 100_000).unwrap(),
+                1 => builder.float(n as f64 + 0.5).unwrap(),
+                2 => builder.tuple(&[Term::small(n).unwrap()]).unwrap(),
+                3 => builder.list_from_iter([Term::small(n).unwrap()]).unwrap(),
+                4 => builder.binary(&(key_index as u32).to_be_bytes()).unwrap(),
+                _ => Term::small(-n - 1).unwrap(),
+            };
+            pairs.push((key, Term::small(index as i64 * 3 - 4).unwrap()));
+        }
+        let map = builder.flatmap_from_pairs(&pairs).unwrap();
+        let changed = builder
+            .flatmap_from_pairs(
+                &[
+                    pairs
+                        .iter()
+                        .filter(|(key, _)| !exact_eq(*key, float_one))
+                        .copied()
+                        .collect::<Vec<_>>(),
+                    vec![(float_one, Term::small(4).unwrap())],
+                ]
+                .concat(),
+            )
+            .unwrap();
+        let mut key_pairs = pairs
+            .into_iter()
+            .filter(|(key, _)| !exact_eq(*key, float_one))
+            .collect::<Vec<_>>();
+        let float_two = builder.float(2.0).unwrap();
+        key_pairs.push((float_two, Term::small(4).unwrap()));
+        let changed_key = builder.flatmap_from_pairs(&key_pairs).unwrap();
+        assert!(map.is_hashmap() && changed.is_hashmap() && changed_key.is_hashmap());
+        let sign = |order| match order {
+            std::cmp::Ordering::Less => 0,
+            std::cmp::Ordering::Equal => 1,
+            std::cmp::Ordering::Greater => 2,
+        };
+        let actual = vec![
+            size as u64,
+            sign(cmp(map, changed)),
+            sign(cmp(map, changed_key)),
+        ];
+        similar_asserts::assert_eq!(actual, expected, "map size {size}");
+    }
+}
+
+#[test]
 fn nested_hamt_key_and_value() {
     let mut heap = VecHeap::new();
     let mut builder = TermBuilder::new(&mut heap);

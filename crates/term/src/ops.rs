@@ -795,289 +795,217 @@ pub fn cmp_exact(a: Term, b: Term) -> Ordering {
 }
 fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
     // Port of erts/emulator/beam/utils.c:1658-2735 (erts_cmp_compound), OTP-29.1.1.
-    if a == b {
-        return Ordering::Equal;
-    }
-    if let (Some(x), Some(y)) = (a.as_small(), b.as_small()) {
-        return x.cmp(&y);
-    }
-    if let (Some(x), Some(y)) = (a.as_atom(), b.as_atom()) {
-        return global_atoms().cmp_atoms(x, y);
-    }
-    let mut pending = SmallVec::<[CmpWork<'_>; 16]>::new();
-    let mut current = Some(CmpWork::Terms {
-        left: a,
-        right: b,
-        exact,
-    });
-    loop {
-        let work = match current.take() {
-            Some(work) => work,
-            None => match pending.pop() {
-                Some(work) => work,
-                None => return Ordering::Equal,
-            },
-        };
-        let (mut a, mut b, exact) = match work {
-            CmpWork::Terms { left, right, exact } => (left, right, exact),
-            CmpWork::Array {
-                left,
-                right,
-                start,
-                exact,
-            } => match first_cmp_unequal(&left, &right, start) {
-                Err(order) => return order,
-                Ok(None) => continue,
-                Ok(Some((index, left_term, right_term))) => {
-                    let next = index + 1;
-                    if next < left.len() {
-                        pending.push(CmpWork::Array {
-                            left,
-                            right,
-                            start: next,
-                            exact,
-                        });
+    let mut pending = CmpStack::new();
+    let (mut a, mut b, mut exact) = (a, b, exact);
+    'term: loop {
+        macro_rules! resolve_order {
+            ($order:expr) => {{
+                match pending.resume_result($order) {
+                    CmpAction::Compare(left, right, next_exact) => {
+                        a = left;
+                        b = right;
+                        exact = next_exact;
+                        continue 'term;
                     }
-                    (left_term, right_term, exact)
+                    CmpAction::Return(order) => return order,
                 }
-            },
-            CmpWork::FlatmapValues {
-                left_map,
-                right_map,
-                start,
-                end,
-                exact,
-            } => {
-                match first_cmp_flatmap_values(left_map, right_map, start, end, exact, &mut pending)
-                {
-                    Err(order) => return order,
-                    Ok(None) => continue,
-                    Ok(Some((left_term, right_term))) => (left_term, right_term, exact),
-                }
-            }
-            CmpWork::FlatmapAtomValues {
-                left_map,
-                right_map,
-                start,
-                remaining,
-                exact,
-            } => {
-                let order = crate::hamt::with_flatmap_arrays(left_map, |left_keys, left_values| {
-                    crate::hamt::with_flatmap_arrays(right_map, |_, right_values| {
-                        cmp_flatmap_atom_values(
-                            left_keys,
-                            left_values,
-                            right_values,
-                            start,
-                            remaining,
-                            exact,
-                        )
-                    })
-                    .expect("right map is a live flatmap")
-                })
-                .expect("left map is a live flatmap");
-                if order != Ordering::Equal {
-                    return order;
-                }
-                continue;
-            }
-        };
-        loop {
-            if a == b {
-                break;
-            }
-            // Port of the immediate fast paths in erts/emulator/beam/utils.c:1723-1739,
-            // OTP-29.1.1. They also apply after a list or nested compound advances its pair.
-            if let (Some(left), Some(right)) = (a.as_atom(), b.as_atom()) {
-                return global_atoms().cmp_atoms(left, right);
-            }
-            if let (Some(left), Some(right)) = (a.as_small(), b.as_small()) {
-                return left.cmp(&right);
-            }
-            // Port of the primary-list dispatch in erts/emulator/beam/utils.c:1827-1850,
-            // OTP-29.1.1. Common list pairs stay in the tail-recursive path without classifying
-            // both terms on every cons cell.
-            if a.bits() & 3 == 1 {
-                if b.bits() & 3 != 1 {
-                    return TermKind::List.cmp(&b.classify());
-                }
-                // SAFETY: both list cells remain live on their owning heaps for this comparison.
-                let (left_head, left_tail) = unsafe { a.cons_ref().unwrap() };
-                // SAFETY: both list cells remain live on their owning heaps for this comparison.
-                let (right_head, right_tail) = unsafe { b.cons_ref().unwrap() };
-                if left_head != right_head {
-                    pending.push(CmpWork::Terms {
-                        left: left_tail,
-                        right: right_tail,
-                        exact,
-                    });
-                    a = left_head;
-                    b = right_head;
-                } else {
-                    a = left_tail;
-                    b = right_tail;
-                }
-                continue;
-            }
-            if b.bits() & 3 == 1 {
-                return a.classify().cmp(&TermKind::List);
-            }
-            let ak = a.classify();
-            let bk = b.classify();
-            let c = ak.cmp(&bk);
-            if c != Ordering::Equal {
-                return c;
-            }
-            let c = match ak {
-                TermKind::Number => number_cmp(a, b, exact),
-                TermKind::Atom => {
-                    global_atoms().cmp_atoms(a.as_atom().unwrap(), b.as_atom().unwrap())
-                }
-                TermKind::Nil => Ordering::Equal,
-                TermKind::Pid | TermKind::Port | TermKind::Ref => {
-                    identity_cmp(a.identity().unwrap(), b.identity().unwrap())
-                }
-                TermKind::List => unreachable!("list terms use the primary-tag fast path"),
-                TermKind::Tuple => {
-                    // SAFETY: both tuples remain on their owning heaps.
-                    let av = unsafe { a.tuple_ref().unwrap() };
-                    // SAFETY: both tuples remain on their owning heaps.
-                    let bv = unsafe { b.tuple_ref().unwrap() };
-                    let c = av.len().cmp(&bv.len());
-                    if c != Ordering::Equal {
-                        return c;
-                    }
-                    let left = CmpArray::Tuple(av);
-                    let right = CmpArray::Tuple(bv);
-                    match first_cmp_unequal(&left, &right, 0) {
-                        Err(order) => return order,
-                        Ok(None) => break,
-                        Ok(Some((index, left_term, right_term))) => {
-                            let next = index + 1;
-                            if next < left.len() {
-                                pending.push(CmpWork::Array {
-                                    left,
-                                    right,
-                                    start: next,
-                                    exact,
-                                });
-                            }
-                            a = left_term;
-                            b = right_term;
-                            continue;
-                        }
-                    }
-                }
-                TermKind::Bitstring => bits_cmp(a, b),
-                TermKind::Record => {
-                    // SAFETY: both record definitions and instances remain live.
-                    let av = unsafe { a.record_ref().unwrap() };
-                    // SAFETY: both record definitions and instances remain live.
-                    let bv = unsafe { b.record_ref().unwrap() };
-                    let c = node_order(av.module(), bv.module())
-                        .then(node_order(av.name(), bv.name()))
-                        .then(av.is_exported().cmp(&bv.is_exported()))
-                        .then(av.len().cmp(&bv.len()));
-                    if c != Ordering::Equal {
-                        return c;
-                    }
-                    // Port of erts/emulator/beam/erl_record.c:696-769, OTP-29.1.1.
-                    for i in 0..av.len() {
-                        let ai = av.sorted_index(i).unwrap();
-                        let bi = bv.sorted_index(i).unwrap();
-                        let c = node_order(av.key(ai).unwrap(), bv.key(bi).unwrap());
-                        if c != Ordering::Equal {
-                            return c;
-                        }
-                    }
-                    for i in (0..av.len()).rev() {
-                        let ai = av.sorted_index(i).unwrap();
-                        let bi = bv.sorted_index(i).unwrap();
-                        pending.push(CmpWork::Terms {
-                            left: av.value(ai).unwrap(),
-                            right: bv.value(bi).unwrap(),
-                            exact,
-                        });
-                    }
-                    Ordering::Equal
-                }
-                TermKind::Fun => {
-                    // SAFETY: both owning heaps retain their fun entries.
-                    let av = unsafe { a.fun_ref().unwrap() };
-                    // SAFETY: both owning heaps retain their fun entries.
-                    let bv = unsafe { b.fun_ref().unwrap() };
-                    match (av, bv) {
-                        (
-                            FunRef::Local {
-                                entry: ae,
-                                free_vars: af,
-                            },
-                            FunRef::Local {
-                                entry: be,
-                                free_vars: bf,
-                            },
-                        ) => {
-                            let c = node_order(ae.module, be.module)
-                                .then(ae.index.cmp(&be.index))
-                                .then(ae.old_uniq.cmp(&be.old_uniq))
-                                .then(af.len().cmp(&bf.len()));
-                            if c != Ordering::Equal {
-                                return c;
-                            }
-                            let left = CmpArray::Words(af);
-                            let right = CmpArray::Words(bf);
-                            match first_cmp_unequal(&left, &right, 0) {
-                                Err(order) => return order,
-                                Ok(None) => break,
-                                Ok(Some((index, left_term, right_term))) => {
-                                    let next = index + 1;
-                                    if next < left.len() {
-                                        pending.push(CmpWork::Array {
-                                            left,
-                                            right,
-                                            start: next,
-                                            exact,
-                                        });
-                                    }
-                                    a = left_term;
-                                    b = right_term;
-                                    continue;
-                                }
-                            }
-                        }
-                        (FunRef::Export { entry: ae }, FunRef::Export { entry: be }) => {
-                            node_order(ae.module, be.module)
-                                .then(node_order(ae.function, be.function))
-                                .then(ae.arity.cmp(&be.arity))
-                        }
-                        (FunRef::Local { .. }, FunRef::Export { .. }) => Ordering::Less,
-                        (FunRef::Export { .. }, FunRef::Local { .. }) => Ordering::Greater,
-                    }
-                }
-                TermKind::Map => {
-                    let c = crate::hamt::len(a).cmp(&crate::hamt::len(b));
-                    if c != Ordering::Equal {
-                        return c;
-                    }
-                    if !a.is_hashmap() && !b.is_hashmap() {
-                        cmp_flatmap(a, b, exact, &mut pending)
-                    } else {
-                        cmp_hashmap(a, b, exact)
-                    }
-                }
-                _ => a.bits().cmp(&b.bits()),
-            };
-            if c != Ordering::Equal {
-                return c;
-            }
-            break;
+            }};
         }
+        if a == b {
+            match pending.resume_result(Ordering::Equal) {
+                CmpAction::Compare(left, right, next_exact) => {
+                    a = left;
+                    b = right;
+                    exact = next_exact;
+                    continue 'term;
+                }
+                CmpAction::Return(order) => return order,
+            }
+        }
+
+        // Port of the immediate fast paths in erts/emulator/beam/utils.c:1723-1739,
+        // OTP-29.1.1. They also apply after a list or nested compound advances its pair.
+        if let (Some(left), Some(right)) = (a.as_atom(), b.as_atom()) {
+            resolve_order!(global_atoms().cmp_atoms(left, right));
+        }
+        if let (Some(left), Some(right)) = (a.as_small(), b.as_small()) {
+            resolve_order!(left.cmp(&right));
+        }
+        // Port of the primary-list dispatch in erts/emulator/beam/utils.c:1827-1850,
+        // OTP-29.1.1. Common list pairs stay in the tail-recursive path without classifying
+        // both terms on every cons cell.
+        if a.bits() & 3 == 1 {
+            if b.bits() & 3 != 1 {
+                resolve_order!(TermKind::List.cmp(&b.classify()));
+            }
+            // SAFETY: both list cells remain live on their owning heaps for this comparison.
+            let (left_head, left_tail) = unsafe { a.cons_ref().unwrap() };
+            // SAFETY: both list cells remain live on their owning heaps for this comparison.
+            let (right_head, right_tail) = unsafe { b.cons_ref().unwrap() };
+            if left_head != right_head {
+                pending.push_terms(left_tail, right_tail, exact);
+                a = left_head;
+                b = right_head;
+            } else {
+                a = left_tail;
+                b = right_tail;
+            }
+            continue 'term;
+        }
+        if b.bits() & 3 == 1 {
+            resolve_order!(a.classify().cmp(&TermKind::List));
+        }
+        let ak = a.classify();
+        let bk = b.classify();
+        let c = ak.cmp(&bk);
+        if c != Ordering::Equal {
+            resolve_order!(c);
+        }
+        if ak == TermKind::Map {
+            let size_order = crate::hamt::len(a).cmp(&crate::hamt::len(b));
+            if size_order != Ordering::Equal {
+                resolve_order!(size_order);
+            }
+            if a.is_hashmap() && b.is_hashmap() {
+                match pending.start_hashmap(a, b, exact) {
+                    CmpAction::Compare(left, right, next_exact) => {
+                        a = left;
+                        b = right;
+                        exact = next_exact;
+                        continue 'term;
+                    }
+                    CmpAction::Return(order) => resolve_order!(order),
+                }
+            } else {
+                pending.start_flatmap(a, b, exact);
+                a = b;
+                continue 'term;
+            }
+        }
+        let c = match ak {
+            TermKind::Number => number_cmp(a, b, exact),
+            TermKind::Atom => global_atoms().cmp_atoms(a.as_atom().unwrap(), b.as_atom().unwrap()),
+            TermKind::Nil => Ordering::Equal,
+            TermKind::Pid | TermKind::Port | TermKind::Ref => {
+                identity_cmp(a.identity().unwrap(), b.identity().unwrap())
+            }
+            TermKind::List => unreachable!("list terms use the primary-tag fast path"),
+            TermKind::Tuple => {
+                // SAFETY: both tuples remain on their owning heaps.
+                let av = unsafe { a.tuple_ref().unwrap() };
+                // SAFETY: both tuples remain on their owning heaps.
+                let bv = unsafe { b.tuple_ref().unwrap() };
+                let c = av.len().cmp(&bv.len());
+                if c != Ordering::Equal {
+                    resolve_order!(c);
+                }
+                let left = CmpArray::Tuple(av);
+                let right = CmpArray::Tuple(bv);
+                match first_cmp_unequal(&left, &right, 0) {
+                    Err(order) => resolve_order!(order),
+                    Ok(None) => Ordering::Equal,
+                    Ok(Some((index, left_term, right_term))) => {
+                        let next = index + 1;
+                        if next < left.len() {
+                            pending.push_array(left, right, next, exact);
+                        }
+                        a = left_term;
+                        b = right_term;
+                        continue 'term;
+                    }
+                }
+            }
+            TermKind::Bitstring => bits_cmp(a, b),
+            TermKind::Record => {
+                // SAFETY: both record definitions and instances remain live.
+                let av = unsafe { a.record_ref().unwrap() };
+                // SAFETY: both record definitions and instances remain live.
+                let bv = unsafe { b.record_ref().unwrap() };
+                let c = node_order(av.module(), bv.module())
+                    .then(node_order(av.name(), bv.name()))
+                    .then(av.is_exported().cmp(&bv.is_exported()))
+                    .then(av.len().cmp(&bv.len()));
+                if c != Ordering::Equal {
+                    resolve_order!(c);
+                }
+                // Port of erts/emulator/beam/erl_record.c:696-769, OTP-29.1.1.
+                for i in 0..av.len() {
+                    let ai = av.sorted_index(i).unwrap();
+                    let bi = bv.sorted_index(i).unwrap();
+                    let c = node_order(av.key(ai).unwrap(), bv.key(bi).unwrap());
+                    if c != Ordering::Equal {
+                        resolve_order!(c);
+                    }
+                }
+                for i in (0..av.len()).rev() {
+                    let ai = av.sorted_index(i).unwrap();
+                    let bi = bv.sorted_index(i).unwrap();
+                    pending.push_terms(av.value(ai).unwrap(), bv.value(bi).unwrap(), exact);
+                }
+                Ordering::Equal
+            }
+            TermKind::Fun => {
+                // SAFETY: both owning heaps retain their fun entries.
+                let av = unsafe { a.fun_ref().unwrap() };
+                // SAFETY: both owning heaps retain their fun entries.
+                let bv = unsafe { b.fun_ref().unwrap() };
+                match (av, bv) {
+                    (
+                        FunRef::Local {
+                            entry: ae,
+                            free_vars: af,
+                        },
+                        FunRef::Local {
+                            entry: be,
+                            free_vars: bf,
+                        },
+                    ) => {
+                        let c = node_order(ae.module, be.module)
+                            .then(ae.index.cmp(&be.index))
+                            .then(ae.old_uniq.cmp(&be.old_uniq))
+                            .then(af.len().cmp(&bf.len()));
+                        if c != Ordering::Equal {
+                            resolve_order!(c);
+                        }
+                        let left = CmpArray::Words(af);
+                        let right = CmpArray::Words(bf);
+                        match first_cmp_unequal(&left, &right, 0) {
+                            Err(order) => resolve_order!(order),
+                            Ok(None) => Ordering::Equal,
+                            Ok(Some((index, left_term, right_term))) => {
+                                let next = index + 1;
+                                if next < left.len() {
+                                    pending.push_array(left, right, next, exact);
+                                }
+                                a = left_term;
+                                b = right_term;
+                                continue 'term;
+                            }
+                        }
+                    }
+                    (FunRef::Export { entry: ae }, FunRef::Export { entry: be }) => {
+                        node_order(ae.module, be.module)
+                            .then(node_order(ae.function, be.function))
+                            .then(ae.arity.cmp(&be.arity))
+                    }
+                    (FunRef::Local { .. }, FunRef::Export { .. }) => Ordering::Less,
+                    (FunRef::Export { .. }, FunRef::Local { .. }) => Ordering::Greater,
+                }
+            }
+            TermKind::Map => unreachable!("maps are handled by the map work-stack paths"),
+            _ => a.bits().cmp(&b.bits()),
+        };
+        if c != Ordering::Equal {
+            resolve_order!(c);
+        }
+        a = b;
     }
 }
 
 enum CmpArray<'a> {
     Tuple(crate::TupleRef<'a>),
     Words(&'a [u64]),
+    FlatmapKeys { map: Term, start: usize, len: usize },
 }
 
 impl CmpArray<'_> {
@@ -1085,6 +1013,7 @@ impl CmpArray<'_> {
         match self {
             Self::Tuple(tuple) => tuple.len(),
             Self::Words(words) => words.len(),
+            Self::FlatmapKeys { len, .. } => *len,
         }
     }
 
@@ -1092,36 +1021,723 @@ impl CmpArray<'_> {
         match self {
             Self::Tuple(tuple) => tuple.get(index),
             Self::Words(words) => words.get(index).copied().map(Term),
+            Self::FlatmapKeys { map, start, len } => {
+                if index >= *len {
+                    return None;
+                }
+                crate::hamt::with_flatmap_arrays(*map, |keys, _| Term(keys[*start + index]))
+            }
         }
     }
 }
 
-enum CmpWork<'a> {
-    Terms {
-        left: Term,
-        right: Term,
-        exact: bool,
-    },
-    Array {
-        left: CmpArray<'a>,
-        right: CmpArray<'a>,
-        start: usize,
-        exact: bool,
-    },
-    FlatmapValues {
+struct CmpArrayPair<'a> {
+    left: CmpArray<'a>,
+    right: CmpArray<'a>,
+}
+
+enum CmpMapState {
+    Hashmap,
+    FlatmapAtomValues,
+}
+
+struct CmpHashmapState {
+    left: crate::hamt::PairIter,
+    right: crate::hamt::PairIter,
+    ap: Option<(Term, Term)>,
+    bp: Option<(Term, Term)>,
+    cmp_res: Ordering,
+    min_key: Option<Term>,
+    was_exact: bool,
+    rollback: usize,
+    arrays_rollback: usize,
+}
+
+struct CmpFlatmapAtomValuesState {
+    left_map: Term,
+    right_map: Term,
+    start: usize,
+    count: usize,
+    next_index: usize,
+    current_key: Option<Term>,
+    min_key: Option<Term>,
+    cmp_res: Ordering,
+    exact: bool,
+    rollback: usize,
+    arrays_rollback: usize,
+}
+
+enum CmpAction {
+    Compare(Term, Term, bool),
+    Return(Ordering),
+}
+
+// Port of the WSTACK work words in utils.c:1658-2735; typed array views are
+// referenced by LIFO indices so the work stack never stores or dereferences raw pointers.
+struct CmpStack<'a> {
+    words: SmallVec<[u64; 16]>,
+    arrays: Vec<CmpArrayPair<'a>>,
+    maps: Vec<CmpMapState>,
+    hashmaps: Vec<CmpHashmapState>,
+    flatmap_atom_values: Vec<CmpFlatmapAtomValuesState>,
+}
+
+const WORK_OP_MASK: u64 = 0xF;
+const CMP_EXACT_BIT: u64 = 1 << 6;
+const CMP_TERM_OP: u64 = 2;
+const CMP_ARRAY_OP: u64 = 3;
+const CMP_FLATMAP_VALUES_OP: u64 = 4;
+const CMP_FLATMAP_ATOM_KEYS_OP: u64 = 5;
+const CMP_FLATMAP_ATOM_VALUES_START_OP: u64 = 6;
+const CMP_FLATMAP_ATOM_VALUES_RESULT_OP: u64 = 7;
+const CMP_HASHMAP_PHASE1_KEYS_OP: u64 = 8;
+const CMP_HASHMAP_PHASE1_MIN_KEY_OP: u64 = 9;
+const CMP_HASHMAP_PHASE1_VALUES_OP: u64 = 10;
+const CMP_HASHMAP_PHASE2_KEYS_OP: u64 = 11;
+const CMP_HASHMAP_PHASE2_MIN_LEFT_OP: u64 = 12;
+const CMP_HASHMAP_PHASE2_MIN_RIGHT_OP: u64 = 13;
+
+impl<'a> CmpStack<'a> {
+    fn new() -> Self {
+        Self {
+            words: SmallVec::new(),
+            arrays: Vec::new(),
+            maps: Vec::new(),
+            hashmaps: Vec::new(),
+            flatmap_atom_values: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn op_word(operation: u64, exact: bool) -> u64 {
+        (operation << WORK_OP_SHIFT) | if exact { CMP_EXACT_BIT } else { 0 }
+    }
+
+    #[inline(always)]
+    fn push_terms(&mut self, left: Term, right: Term, exact: bool) {
+        self.words.push(right.bits());
+        self.words.push(left.bits());
+        self.words.push(Self::op_word(CMP_TERM_OP, exact));
+    }
+
+    #[inline(always)]
+    fn push_array(&mut self, left: CmpArray<'a>, right: CmpArray<'a>, start: usize, exact: bool) {
+        let index = self.arrays.len();
+        self.arrays.push(CmpArrayPair { left, right });
+        self.push_array_index(index, start, exact);
+    }
+
+    #[inline(always)]
+    fn push_array_index(&mut self, index: usize, start: usize, exact: bool) {
+        self.words.push(index as u64);
+        self.words.push(start as u64);
+        self.words.push(Self::op_word(CMP_ARRAY_OP, exact));
+    }
+
+    #[inline(always)]
+    fn push_flatmap_values(
+        &mut self,
         left_map: Term,
         right_map: Term,
         start: usize,
         end: usize,
         exact: bool,
-    },
-    FlatmapAtomValues {
+    ) {
+        self.words.push(right_map.bits());
+        self.words.push(left_map.bits());
+        self.words.push(start as u64);
+        self.words.push(end as u64);
+        self.words.push(Self::op_word(CMP_FLATMAP_VALUES_OP, exact));
+    }
+
+    #[inline(always)]
+    fn push_flatmap_atom_values(
+        &mut self,
         left_map: Term,
         right_map: Term,
         start: usize,
         remaining: usize,
         exact: bool,
-    },
+    ) {
+        if remaining == 0 {
+            return;
+        }
+        self.words.push(right_map.bits());
+        self.words.push(left_map.bits());
+        self.words.push(start as u64);
+        self.words.push(remaining as u64);
+        self.words
+            .push(Self::op_word(CMP_FLATMAP_ATOM_VALUES_START_OP, exact));
+    }
+
+    #[inline(always)]
+    fn push_flatmap_atom_keys(
+        &mut self,
+        left_map: Term,
+        right_map: Term,
+        start: usize,
+        count: usize,
+    ) {
+        if count == 0 {
+            return;
+        }
+        self.words.push(right_map.bits());
+        self.words.push(left_map.bits());
+        self.words.push(start as u64);
+        self.words.push(count as u64);
+        self.words
+            .push(Self::op_word(CMP_FLATMAP_ATOM_KEYS_OP, true));
+    }
+
+    #[inline(always)]
+    fn push_map_operation(&mut self, operation: u64, exact: bool) {
+        self.words.push(Self::op_word(operation, exact));
+        let rollback = self.words.len();
+        let arrays_rollback = self.arrays.len();
+        match self.maps.last().expect("map work state is present") {
+            CmpMapState::Hashmap => {
+                let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                state.rollback = rollback;
+                state.arrays_rollback = arrays_rollback;
+            }
+            CmpMapState::FlatmapAtomValues => {
+                let state = self
+                    .flatmap_atom_values
+                    .last_mut()
+                    .expect("flatmap atom value state is present");
+                state.rollback = rollback;
+                state.arrays_rollback = arrays_rollback;
+            }
+        }
+    }
+
+    // Port of erts/emulator/beam/utils.c:2080-2122 (hashmap compare setup), OTP-29.1.1.
+    fn start_hashmap(&mut self, left_map: Term, right_map: Term, exact: bool) -> CmpAction {
+        let mut left = crate::hamt::PairIter::new(left_map);
+        let mut right = crate::hamt::PairIter::new(right_map);
+        let ap = left.next();
+        let bp = right.next();
+        let (Some((left_key, _)), Some((right_key, _))) = (ap, bp) else {
+            return CmpAction::Return(Ordering::Equal);
+        };
+        self.hashmaps.push(CmpHashmapState {
+            left,
+            right,
+            ap,
+            bp,
+            cmp_res: Ordering::Equal,
+            min_key: None,
+            was_exact: exact,
+            rollback: 0,
+            arrays_rollback: self.arrays.len(),
+        });
+        self.maps.push(CmpMapState::Hashmap);
+        self.push_map_operation(CMP_HASHMAP_PHASE1_KEYS_OP, true);
+        CmpAction::Compare(left_key, right_key, true)
+    }
+
+    // Port of erts/emulator/beam/utils.c:1989-2104 (flatmap compare phases), OTP-29.1.1.
+    fn start_flatmap(&mut self, left_map: Term, right_map: Term, exact: bool) {
+        crate::hamt::with_flatmap_arrays(left_map, |left_keys, _| {
+            crate::hamt::with_flatmap_arrays(right_map, |right_keys, _| {
+                let len = left_keys.len();
+                if exact {
+                    if len != 0 {
+                        self.push_flatmap_values(left_map, right_map, 0, len, exact);
+                        self.push_array(
+                            CmpArray::FlatmapKeys {
+                                map: left_map,
+                                start: 0,
+                                len,
+                            },
+                            CmpArray::FlatmapKeys {
+                                map: right_map,
+                                start: 0,
+                                len,
+                            },
+                            0,
+                            true,
+                        );
+                    }
+                    return;
+                }
+
+                let mut split = 0;
+                while split < len
+                    && !(Term(left_keys[split]).as_atom().is_some()
+                        && Term(right_keys[split]).as_atom().is_some())
+                {
+                    split += 1;
+                }
+                let number_end = split;
+                while split < len
+                    && (Term(left_keys[split]).as_atom().is_some()
+                        || Term(right_keys[split]).as_atom().is_some())
+                {
+                    split += 1;
+                }
+                let atom_end = split;
+                let atom_count = atom_end - number_end;
+
+                if atom_end < len {
+                    self.push_flatmap_values(left_map, right_map, atom_end, len, exact);
+                }
+                self.push_flatmap_atom_values(left_map, right_map, number_end, atom_count, exact);
+                if number_end != 0 {
+                    self.push_flatmap_values(left_map, right_map, 0, number_end, exact);
+                }
+
+                if atom_end < len {
+                    self.push_array(
+                        CmpArray::FlatmapKeys {
+                            map: left_map,
+                            start: atom_end,
+                            len: len - atom_end,
+                        },
+                        CmpArray::FlatmapKeys {
+                            map: right_map,
+                            start: atom_end,
+                            len: len - atom_end,
+                        },
+                        0,
+                        true,
+                    );
+                }
+                self.push_flatmap_atom_keys(left_map, right_map, number_end, atom_count);
+                if number_end != 0 {
+                    self.push_array(
+                        CmpArray::FlatmapKeys {
+                            map: left_map,
+                            start: 0,
+                            len: number_end,
+                        },
+                        CmpArray::FlatmapKeys {
+                            map: right_map,
+                            start: 0,
+                            len: number_end,
+                        },
+                        0,
+                        true,
+                    );
+                }
+            })
+            .expect("right map is a live flatmap");
+        })
+        .expect("left map is a live flatmap");
+    }
+
+    // Port of pop_next and not_equal rollback in utils.c:2493-2745, OTP-29.1.1.
+    fn resume_result(&mut self, mut result: Ordering) -> CmpAction {
+        loop {
+            if result != Ordering::Equal {
+                let Some(state) = self.maps.last() else {
+                    return CmpAction::Return(result);
+                };
+                let (rollback, arrays_rollback) = match state {
+                    CmpMapState::Hashmap => {
+                        let state = self.hashmaps.last().expect("hashmap state is present");
+                        (state.rollback, state.arrays_rollback)
+                    }
+                    CmpMapState::FlatmapAtomValues => {
+                        let state = self
+                            .flatmap_atom_values
+                            .last()
+                            .expect("flatmap atom value state is present");
+                        (state.rollback, state.arrays_rollback)
+                    }
+                };
+                self.words.truncate(rollback);
+                self.arrays.truncate(arrays_rollback);
+            }
+
+            let Some(word) = self.words.pop() else {
+                return CmpAction::Return(result);
+            };
+            let operation = (word >> WORK_OP_SHIFT) & WORK_OP_MASK;
+            let exact = word & CMP_EXACT_BIT != 0;
+            let action = match operation {
+                CMP_TERM_OP => {
+                    let left = Term(self.words.pop().expect("left term is present"));
+                    let right = Term(self.words.pop().expect("right term is present"));
+                    return CmpAction::Compare(left, right, exact);
+                }
+                CMP_ARRAY_OP => self.resume_array(exact),
+                CMP_FLATMAP_VALUES_OP => self.resume_flatmap_values(exact),
+                CMP_FLATMAP_ATOM_KEYS_OP => self.resume_flatmap_atom_keys(),
+                CMP_FLATMAP_ATOM_VALUES_START_OP => self.start_flatmap_atom_values(exact),
+                CMP_FLATMAP_ATOM_VALUES_RESULT_OP => self.resume_flatmap_atom_values(result),
+                CMP_HASHMAP_PHASE1_KEYS_OP
+                | CMP_HASHMAP_PHASE1_MIN_KEY_OP
+                | CMP_HASHMAP_PHASE1_VALUES_OP
+                | CMP_HASHMAP_PHASE2_KEYS_OP
+                | CMP_HASHMAP_PHASE2_MIN_LEFT_OP
+                | CMP_HASHMAP_PHASE2_MIN_RIGHT_OP => self.resume_hashmap(operation, result),
+                _ => unreachable!("invalid comparison work word"),
+            };
+            match action {
+                CmpAction::Compare(left, right, next_exact) => {
+                    return CmpAction::Compare(left, right, next_exact);
+                }
+                CmpAction::Return(next_result) => result = next_result,
+            }
+        }
+    }
+
+    fn resume_array(&mut self, exact: bool) -> CmpAction {
+        let start = self.words.pop().expect("array start is present") as usize;
+        let array_index = self.words.pop().expect("array handle is present") as usize;
+        let (result, len) = {
+            let pair = &self.arrays[array_index];
+            (
+                first_cmp_unequal(&pair.left, &pair.right, start),
+                pair.left.len(),
+            )
+        };
+        match result {
+            Err(order) => CmpAction::Return(order),
+            Ok(None) => {
+                self.arrays.truncate(array_index);
+                CmpAction::Return(Ordering::Equal)
+            }
+            Ok(Some((index, left, right))) => {
+                let next = index + 1;
+                if next < len {
+                    self.push_array_index(array_index, next, exact);
+                } else {
+                    self.arrays.truncate(array_index);
+                }
+                CmpAction::Compare(left, right, exact)
+            }
+        }
+    }
+
+    fn resume_flatmap_values(&mut self, exact: bool) -> CmpAction {
+        let end = self.words.pop().expect("array end is present") as usize;
+        let start = self.words.pop().expect("array start is present") as usize;
+        let left_map = Term(self.words.pop().expect("left map is present"));
+        let right_map = Term(self.words.pop().expect("right map is present"));
+        match first_cmp_flatmap_values(left_map, right_map, start, end, exact, self) {
+            Err(order) => CmpAction::Return(order),
+            Ok(None) => CmpAction::Return(Ordering::Equal),
+            Ok(Some((left, right))) => CmpAction::Compare(left, right, exact),
+        }
+    }
+
+    fn resume_flatmap_atom_keys(&mut self) -> CmpAction {
+        let count = self.words.pop().expect("atom count is present") as usize;
+        let start = self.words.pop().expect("array start is present") as usize;
+        let left_map = Term(self.words.pop().expect("left map is present"));
+        let right_map = Term(self.words.pop().expect("right map is present"));
+        let order = crate::hamt::with_flatmap_arrays(left_map, |left_keys, _| {
+            crate::hamt::with_flatmap_arrays(right_map, |right_keys, _| {
+                flatmap_atom_key_cmp(left_keys, right_keys, start, count)
+            })
+            .expect("right map is a live flatmap")
+        })
+        .expect("left map is a live flatmap");
+        CmpAction::Return(order)
+    }
+
+    fn start_flatmap_atom_values(&mut self, exact: bool) -> CmpAction {
+        let count = self.words.pop().expect("atom count is present") as usize;
+        let start = self.words.pop().expect("array start is present") as usize;
+        let left_map = Term(self.words.pop().expect("left map is present"));
+        let right_map = Term(self.words.pop().expect("right map is present"));
+        self.flatmap_atom_values.push(CmpFlatmapAtomValuesState {
+            left_map,
+            right_map,
+            start,
+            count,
+            next_index: start,
+            current_key: None,
+            min_key: None,
+            cmp_res: Ordering::Equal,
+            exact,
+            rollback: 0,
+            arrays_rollback: self.arrays.len(),
+        });
+        self.maps.push(CmpMapState::FlatmapAtomValues);
+        self.start_next_flatmap_atom_value()
+    }
+
+    fn resume_flatmap_atom_values(&mut self, result: Ordering) -> CmpAction {
+        if result != Ordering::Equal {
+            if !matches!(self.maps.last(), Some(CmpMapState::FlatmapAtomValues)) {
+                unreachable!("flatmap atom value state is present");
+            }
+            let state = self
+                .flatmap_atom_values
+                .last_mut()
+                .expect("flatmap atom value state is present");
+            state.min_key = state.current_key;
+            state.cmp_res = result;
+        }
+        self.start_next_flatmap_atom_value()
+    }
+
+    // Port of FLATMAP_ATOM_VALUES in utils.c:2672-2717, OTP-29.1.1.
+    fn start_next_flatmap_atom_value(&mut self) -> CmpAction {
+        let (left_map, right_map, end, mut index, min_key, exact) = {
+            let Some(state) = self.flatmap_atom_values.last() else {
+                unreachable!("flatmap atom value state is present");
+            };
+            (
+                state.left_map,
+                state.right_map,
+                state.start + state.count,
+                state.next_index,
+                state.min_key,
+                state.exact,
+            )
+        };
+        let mut found = None;
+        crate::hamt::with_flatmap_arrays(left_map, |keys, _| {
+            while index < end {
+                let key = Term(keys[index]);
+                let atom = key.as_atom().expect("atom partition contains atoms");
+                let eligible = min_key.is_none_or(|current| {
+                    global_atoms().cmp_atoms(atom, current.as_atom().unwrap()) == Ordering::Less
+                });
+                let current = index;
+                index += 1;
+                if eligible {
+                    found = Some((current, key));
+                    break;
+                }
+            }
+        })
+        .expect("left map is a live flatmap");
+        let Some((value_index, key)) = found else {
+            let Some(CmpMapState::FlatmapAtomValues) = self.maps.pop() else {
+                unreachable!("flatmap atom value state is present");
+            };
+            let cmp_res = self.flatmap_atom_values.pop().unwrap().cmp_res;
+            return CmpAction::Return(cmp_res);
+        };
+        let (left_value, right_value) =
+            crate::hamt::with_flatmap_arrays(left_map, |_, left_values| {
+                crate::hamt::with_flatmap_arrays(right_map, |_, right_values| {
+                    (
+                        Term(left_values[value_index]),
+                        Term(right_values[value_index]),
+                    )
+                })
+                .expect("right map is a live flatmap")
+            })
+            .expect("left map is a live flatmap");
+        let state = self
+            .flatmap_atom_values
+            .last_mut()
+            .expect("flatmap atom value state is present");
+        state.next_index = index;
+        state.current_key = Some(key);
+        self.push_map_operation(CMP_FLATMAP_ATOM_VALUES_RESULT_OP, exact);
+        CmpAction::Compare(left_value, right_value, exact)
+    }
+
+    // Port of the HASHMAP_PHASE1/2 operations in utils.c:2511-2665, OTP-29.1.1.
+    fn resume_hashmap(&mut self, operation: u64, result: Ordering) -> CmpAction {
+        match operation {
+            CMP_HASHMAP_PHASE1_KEYS_OP => {
+                if result != Ordering::Equal {
+                    let state = self.hashmaps.last().expect("hashmap state is present");
+                    let hash_order = hashmap_key_hash_order(
+                        state.ap.map(|pair| pair.0),
+                        state.bp.map(|pair| pair.0),
+                    );
+                    let side = if hash_order == Ordering::Equal {
+                        result
+                    } else {
+                        hash_order
+                    };
+                    let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                    if side == Ordering::Less {
+                        state.min_key = state.ap.map(|pair| pair.0);
+                        state.cmp_res = Ordering::Less;
+                        state.ap = state.left.next();
+                    } else {
+                        state.min_key = state.bp.map(|pair| pair.0);
+                        state.cmp_res = Ordering::Greater;
+                        state.bp = state.right.next();
+                    }
+                    self.start_hashmap_phase2()
+                } else {
+                    let state = self.hashmaps.last().expect("hashmap state is present");
+                    let candidate = (state.cmp_res != Ordering::Equal)
+                        .then_some(state.min_key)
+                        .flatten();
+                    let was_exact = state.was_exact;
+                    if let Some(min_key) = candidate {
+                        let ap_key = self.hashmap_current_left_key();
+                        self.push_map_operation(CMP_HASHMAP_PHASE1_MIN_KEY_OP, true);
+                        CmpAction::Compare(ap_key, min_key, true)
+                    } else {
+                        let (left_value, right_value) = self.hashmap_current_values();
+                        self.push_map_operation(CMP_HASHMAP_PHASE1_VALUES_OP, was_exact);
+                        CmpAction::Compare(left_value, right_value, was_exact)
+                    }
+                }
+            }
+            CMP_HASHMAP_PHASE1_MIN_KEY_OP => {
+                if result == Ordering::Less {
+                    let (left_value, right_value) = self.hashmap_current_values();
+                    let was_exact = self.hashmap_was_exact();
+                    self.push_map_operation(CMP_HASHMAP_PHASE1_VALUES_OP, was_exact);
+                    CmpAction::Compare(left_value, right_value, was_exact)
+                } else {
+                    self.advance_hashmap_phase1()
+                }
+            }
+            CMP_HASHMAP_PHASE1_VALUES_OP => {
+                if result != Ordering::Equal {
+                    let left_key = self.hashmap_current_left_key();
+                    let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                    state.cmp_res = result;
+                    state.min_key = Some(left_key);
+                }
+                let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                state.ap = state.left.next();
+                state.bp = state.right.next();
+                self.start_hashmap_phase1()
+            }
+            CMP_HASHMAP_PHASE2_KEYS_OP => {
+                if result == Ordering::Equal {
+                    let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                    state.ap = state.left.next();
+                    state.bp = state.right.next();
+                    self.start_hashmap_phase2()
+                } else {
+                    self.hashmap_phase2_next(result)
+                }
+            }
+            CMP_HASHMAP_PHASE2_MIN_LEFT_OP => {
+                if result == Ordering::Less {
+                    let left_key = self.hashmap_current_left_key();
+                    let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                    state.cmp_res = Ordering::Less;
+                    state.min_key = Some(left_key);
+                }
+                let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                state.ap = state.left.next();
+                self.start_hashmap_phase2()
+            }
+            CMP_HASHMAP_PHASE2_MIN_RIGHT_OP => {
+                if result == Ordering::Less {
+                    let right_key = self.hashmap_current_right_key();
+                    let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                    state.cmp_res = Ordering::Greater;
+                    state.min_key = Some(right_key);
+                }
+                let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                state.bp = state.right.next();
+                self.start_hashmap_phase2()
+            }
+            _ => unreachable!("invalid hashmap comparison operation"),
+        }
+    }
+
+    fn hashmap_current_left_key(&self) -> Term {
+        let Some(pair) = self.hashmaps.last().and_then(|state| state.ap) else {
+            unreachable!("left hashmap entry is present");
+        };
+        pair.0
+    }
+
+    fn hashmap_current_right_key(&self) -> Term {
+        let Some(pair) = self.hashmaps.last().and_then(|state| state.bp) else {
+            unreachable!("right hashmap entry is present");
+        };
+        pair.0
+    }
+
+    fn hashmap_current_values(&self) -> (Term, Term) {
+        let Some((left, right)) = self
+            .hashmaps
+            .last()
+            .and_then(|state| state.ap.zip(state.bp))
+        else {
+            unreachable!("both hashmap entries are present");
+        };
+        (left.1, right.1)
+    }
+
+    fn hashmap_was_exact(&self) -> bool {
+        self.hashmaps
+            .last()
+            .expect("hashmap state is present")
+            .was_exact
+    }
+
+    fn start_hashmap_phase1(&mut self) -> CmpAction {
+        let state = self.hashmaps.last().expect("hashmap state is present");
+        let (left_key, right_key) = match (state.ap, state.bp) {
+            (Some(left), Some(right)) => (left.0, right.0),
+            (None, None) => {
+                let order = state.cmp_res;
+                self.hashmaps.pop();
+                assert!(matches!(self.maps.pop(), Some(CmpMapState::Hashmap)));
+                return CmpAction::Return(order);
+            }
+            _ => unreachable!("hashmap iterators advance together in phase one"),
+        };
+        self.push_map_operation(CMP_HASHMAP_PHASE1_KEYS_OP, true);
+        CmpAction::Compare(left_key, right_key, true)
+    }
+
+    fn advance_hashmap_phase1(&mut self) -> CmpAction {
+        let state = self.hashmaps.last_mut().expect("hashmap state is present");
+        state.ap = state.left.next();
+        state.bp = state.right.next();
+        self.start_hashmap_phase1()
+    }
+
+    fn start_hashmap_phase2(&mut self) -> CmpAction {
+        match self.hashmaps.last().unwrap() {
+            state if state.ap.zip(state.bp).is_some() => {
+                let (left, right) = state.ap.zip(state.bp).unwrap();
+                self.push_map_operation(CMP_HASHMAP_PHASE2_KEYS_OP, true);
+                CmpAction::Compare(left.0, right.0, true)
+            }
+            _ => self.hashmap_phase2_next(Ordering::Equal),
+        }
+    }
+
+    fn hashmap_phase2_next(&mut self, key_order: Ordering) -> CmpAction {
+        let (left_pair, right_pair, min_key) = {
+            let state = self.hashmaps.last().expect("hashmap state is present");
+            (state.ap, state.bp, state.min_key)
+        };
+        if left_pair.is_none() && right_pair.is_none() {
+            let cmp_res = self.hashmaps.pop().unwrap().cmp_res;
+            assert!(matches!(self.maps.pop(), Some(CmpMapState::Hashmap)));
+            return CmpAction::Return(cmp_res);
+        }
+        let hash_order =
+            hashmap_key_hash_order(left_pair.map(|pair| pair.0), right_pair.map(|pair| pair.0));
+        let side = if hash_order == Ordering::Equal {
+            match (left_pair, right_pair) {
+                (Some(_), Some(_)) => key_order,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => unreachable!(),
+            }
+        } else {
+            hash_order
+        };
+        if side == Ordering::Less {
+            let (Some((left_key, _)), Some(min_key)) = (left_pair, min_key) else {
+                unreachable!("left key and minimum key are present");
+            };
+            self.push_map_operation(CMP_HASHMAP_PHASE2_MIN_LEFT_OP, true);
+            CmpAction::Compare(left_key, min_key, true)
+        } else {
+            let (Some((right_key, _)), Some(min_key)) = (right_pair, min_key) else {
+                unreachable!("right key and minimum key are present");
+            };
+            self.push_map_operation(CMP_HASHMAP_PHASE2_MIN_RIGHT_OP, true);
+            CmpAction::Compare(right_key, min_key, true)
+        }
+    }
 }
 
 // Port of erts/emulator/beam/utils.c:2468-2486 (TERM_ARRAY_OP), OTP-29.1.1.
@@ -1159,13 +1775,13 @@ fn first_cmp_unequal(
 
 // Port of the flatmap value-array continuation in erts_cmp_compound
 // (erts/emulator/beam/utils.c:2046-2066), OTP-29.1.1.
-fn first_cmp_flatmap_values<'a>(
+fn first_cmp_flatmap_values(
     left_map: Term,
     right_map: Term,
     start: usize,
     end: usize,
     exact: bool,
-    pending: &mut SmallVec<[CmpWork<'a>; 16]>,
+    pending: &mut CmpStack<'_>,
 ) -> Result<Option<(Term, Term)>, Ordering> {
     let result = crate::hamt::with_flatmap_arrays(left_map, |_, left_values| {
         crate::hamt::with_flatmap_arrays(right_map, |_, right_values| {
@@ -1183,122 +1799,9 @@ fn first_cmp_flatmap_values<'a>(
     };
     let next = index + 1;
     if next < end {
-        pending.push(CmpWork::FlatmapValues {
-            left_map,
-            right_map,
-            start: next,
-            end,
-            exact,
-        });
+        pending.push_flatmap_values(left_map, right_map, next, end, exact);
     }
     Ok(Some((left_term, right_term)))
-}
-
-// Port of erts/emulator/beam/utils.c:2030-2104 (flatmap branch of erts_cmp_compound),
-// OTP-29.1.1.
-fn cmp_flatmap<'a>(
-    a: Term,
-    b: Term,
-    exact: bool,
-    pending: &mut SmallVec<[CmpWork<'a>; 16]>,
-) -> Ordering {
-    crate::hamt::with_flatmap_arrays(a, |left_keys, _| {
-        crate::hamt::with_flatmap_arrays(b, |right_keys, _| {
-            cmp_flatmap_arrays(a, b, left_keys, right_keys, exact, pending)
-        })
-        .expect("right map is a live flatmap")
-    })
-    .expect("left map is a live flatmap")
-}
-
-// Port of the flatmap key/value partition phases in erts_cmp_compound,
-// erts/emulator/beam/utils.c:1989-2053, OTP-29.1.1.
-fn cmp_flatmap_arrays<'a>(
-    a: Term,
-    b: Term,
-    left_keys: &[u64],
-    right_keys: &[u64],
-    exact: bool,
-    pending: &mut SmallVec<[CmpWork<'a>; 16]>,
-) -> Ordering {
-    let len = crate::hamt::len(a);
-    if exact {
-        for index in 0..len {
-            let order = cmp_map_key(Term(left_keys[index]), Term(right_keys[index]));
-            if order != Ordering::Equal {
-                return order;
-            }
-        }
-        if len != 0 {
-            pending.push(CmpWork::FlatmapValues {
-                left_map: a,
-                right_map: b,
-                start: 0,
-                end: len,
-                exact,
-            });
-        }
-        return Ordering::Equal;
-    }
-
-    let mut split = 0;
-    while split < len
-        && !(Term(left_keys[split]).as_atom().is_some()
-            && Term(right_keys[split]).as_atom().is_some())
-    {
-        let order = cmp_map_key(Term(left_keys[split]), Term(right_keys[split]));
-        if order != Ordering::Equal {
-            return order;
-        }
-        split += 1;
-    }
-    let number_end = split;
-    while split < len
-        && (Term(left_keys[split]).as_atom().is_some()
-            || Term(right_keys[split]).as_atom().is_some())
-    {
-        split += 1;
-    }
-    let atom_end = split;
-    let atom_count = atom_end - number_end;
-    let order = flatmap_atom_key_cmp(left_keys, right_keys, number_end, atom_count);
-    if order != Ordering::Equal {
-        return order;
-    }
-    for index in atom_end..len {
-        let order = cmp_map_key(Term(left_keys[index]), Term(right_keys[index]));
-        if order != Ordering::Equal {
-            return order;
-        }
-    }
-    if atom_end < len {
-        pending.push(CmpWork::FlatmapValues {
-            left_map: a,
-            right_map: b,
-            start: atom_end,
-            end: len,
-            exact,
-        });
-    }
-    if atom_count != 0 {
-        pending.push(CmpWork::FlatmapAtomValues {
-            left_map: a,
-            right_map: b,
-            start: number_end,
-            remaining: atom_count,
-            exact,
-        });
-    }
-    if number_end != 0 {
-        pending.push(CmpWork::FlatmapValues {
-            left_map: a,
-            right_map: b,
-            start: 0,
-            end: number_end,
-            exact,
-        });
-    }
-    Ordering::Equal
 }
 
 // Port of erts/emulator/beam/utils.c:1536-1625 (compare_flatmap_atom_keys), OTP-29.1.1.
@@ -1380,137 +1883,6 @@ fn flatmap_atom_key_cmp(
         }
     }
     minimum.map_or(Ordering::Equal, |(_, side)| side)
-}
-
-// Port of erts/emulator/beam/utils.c:2672-2717 (FLATMAP_ATOM_VALUES), OTP-29.1.1.
-fn cmp_flatmap_atom_values(
-    left_keys: &[u64],
-    left_values: &[u64],
-    right_values: &[u64],
-    start: usize,
-    count: usize,
-    exact: bool,
-) -> Ordering {
-    let mut minimum: Option<(crate::Atom, Ordering)> = None;
-    for index in start..start + count {
-        let atom = Term(left_keys[index])
-            .as_atom()
-            .expect("atom partition contains atoms");
-        if minimum
-            .is_none_or(|(current, _)| global_atoms().cmp_atoms(atom, current) == Ordering::Less)
-        {
-            let order = cmp_impl(Term(left_values[index]), Term(right_values[index]), exact);
-            if order != Ordering::Equal {
-                minimum = Some((atom, order));
-            }
-        }
-    }
-    minimum.map_or(Ordering::Equal, |(_, order)| order)
-}
-
-// Port of erts/emulator/beam/utils.c:2468-2486 (TERM_ARRAY_OP), OTP-29.1.1.
-#[inline(always)]
-fn cmp_map_key(left: Term, right: Term) -> Ordering {
-    if left == right {
-        return Ordering::Equal;
-    }
-    if let (Some(left), Some(right)) = (left.as_small(), right.as_small()) {
-        return left.cmp(&right);
-    }
-    if let (Some(left), Some(right)) = (left.as_atom(), right.as_atom()) {
-        return global_atoms().cmp_atoms(left, right);
-    }
-    cmp_impl(left, right, true)
-}
-
-// Port of erts/emulator/beam/utils.c:2511-2665 (hashmap comparison phases), OTP-29.1.1.
-fn cmp_hashmap(a: Term, b: Term, exact: bool) -> Ordering {
-    let mut left = crate::hamt::PairIter::new(a);
-    let mut right = crate::hamt::PairIter::new(b);
-    let mut left_pair = left.next();
-    let mut right_pair = right.next();
-    let mut minimum: Option<(Term, Ordering)> = None;
-
-    while let (Some((left_key, left_value)), Some((right_key, right_value))) =
-        (left_pair, right_pair)
-    {
-        if cmp_map_key(left_key, right_key) != Ordering::Equal {
-            break;
-        }
-        let is_new_minimum =
-            minimum.is_none_or(|(current, _)| cmp_map_key(left_key, current) == Ordering::Less);
-        if is_new_minimum {
-            let value_order = cmp_impl(left_value, right_value, exact);
-            if value_order != Ordering::Equal {
-                minimum = Some((left_key, value_order));
-            }
-        }
-        left_pair = left.next();
-        right_pair = right.next();
-    }
-
-    if left_pair.is_none() && right_pair.is_none() {
-        return minimum.map_or(Ordering::Equal, |(_, order)| order);
-    }
-
-    let key_order = match (left_pair, right_pair) {
-        (Some((left_key, _)), Some((right_key, _))) => cmp_map_key(left_key, right_key),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => unreachable!(),
-    };
-    let hash_order =
-        hashmap_key_hash_order(left_pair.map(|pair| pair.0), right_pair.map(|pair| pair.0));
-    let first_order = if hash_order == Ordering::Equal {
-        key_order
-    } else {
-        hash_order
-    };
-    if first_order == Ordering::Less {
-        minimum = Some((left_pair.unwrap().0, Ordering::Less));
-        left_pair = left.next();
-    } else {
-        minimum = Some((right_pair.unwrap().0, Ordering::Greater));
-        right_pair = right.next();
-    }
-
-    loop {
-        let current_order = match (left_pair, right_pair) {
-            (Some((left_key, _)), Some((right_key, _))) => {
-                let order = cmp_map_key(left_key, right_key);
-                if order == Ordering::Equal {
-                    left_pair = left.next();
-                    right_pair = right.next();
-                    continue;
-                }
-                order
-            }
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => break,
-        };
-        let hash_order =
-            hashmap_key_hash_order(left_pair.map(|pair| pair.0), right_pair.map(|pair| pair.0));
-        let side = if hash_order == Ordering::Equal {
-            current_order
-        } else {
-            hash_order
-        };
-        if side == Ordering::Less {
-            let candidate = left_pair.unwrap().0;
-            if cmp_map_key(candidate, minimum.unwrap().0) == Ordering::Less {
-                minimum = Some((candidate, Ordering::Less));
-            }
-            left_pair = left.next();
-        } else {
-            let candidate = right_pair.unwrap().0;
-            if cmp_map_key(candidate, minimum.unwrap().0) == Ordering::Less {
-                minimum = Some((candidate, Ordering::Greater));
-            }
-            right_pair = right.next();
-        }
-    }
-    minimum.map_or(Ordering::Equal, |(_, order)| order)
 }
 
 // Port of erts/emulator/beam/erl_map.c:1881-1898 (hashmap_key_hash_cmp/hash_cmp), OTP-29.1.1.
@@ -1605,112 +1977,23 @@ fn exact_ref_eq(a: Term, b: Term) -> bool {
     }
     node_order(an, bn) == Ordering::Equal && ac == bc && ai[..al] == bi[..bl]
 }
-fn exact_map_eq(a: Term, b: Term) -> bool {
-    if crate::hamt::len(a) != crate::hamt::len(b) {
-        return false;
-    }
-    if !a.is_hashmap() && !b.is_hashmap() {
-        // SAFETY: equal-length flatmaps have initialized key/value arrays.
-        unsafe {
-            let (ap, bp) = (a.raw_ptr(), b.raw_ptr());
-            let (ak, bk) = (Term(*ap.add(2)), Term(*bp.add(2)));
-            let len = crate::hamt::len(a);
-            let (akp, bkp) = (ak.raw_ptr(), bk.raw_ptr());
-            let mut same_keys = true;
-            for i in 0..len {
-                if !exact_eq(Term(*akp.add(i + 1)), Term(*bkp.add(i + 1))) {
-                    same_keys = false;
-                    break;
-                }
-            }
-            if same_keys {
-                return (0..len).all(|i| exact_eq(Term(*ap.add(i + 3)), Term(*bp.add(i + 3))));
-            }
-        }
-    }
-    if a.is_hashmap() && b.is_hashmap() {
-        // A canonical HAMT has the same bitmap at every node when keys are
-        // unchanged. Walk corresponding slots with an inline depth stack.
-        let mut frames: SmallVec<[(Term, Term, usize, usize); 20]> = SmallVec::new();
-        let mut nodes = Some((a, b));
-        let mut same_shape = true;
-        while let Some((left, right)) = nodes.take().or_else(|| {
-            while let Some((parent_a, parent_b, next, end)) = frames.last_mut() {
-                if *next == *end {
-                    frames.pop();
-                    continue;
-                }
-                // SAFETY: both parent ranges contain initialized child slots.
-                let child = unsafe {
-                    let pair = (
-                        Term(*parent_a.raw_ptr().add(*next)),
-                        Term(*parent_b.raw_ptr().add(*next)),
-                    );
-                    *next += 1;
-                    pair
-                };
-                return Some(child);
-            }
-            None
-        }) {
-            if left.classify() == TermKind::List && right.classify() == TermKind::List {
-                // SAFETY: corresponding HAMT leaves contain key and value.
-                let (lk, lv) = unsafe { left.cons_ref().unwrap() };
-                // SAFETY: corresponding HAMT leaves contain key and value.
-                let (rk, rv) = unsafe { right.cons_ref().unwrap() };
-                if lk != rk && !exact_eq(lk, rk) {
-                    same_shape = false;
-                    break;
-                }
-                if lv != rv && !exact_eq(lv, rv) {
-                    return false;
-                }
-                continue;
-            }
-            let (lh, rh) = (left.header(), right.header());
-            if lh != rh {
-                same_shape = false;
-                break;
-            }
-            let header = lh.unwrap();
-            // SAFETY: equal headers describe the same child range in both nodes.
-            let words = unsafe { crate::boxed_object_words(header, left.raw_ptr()) };
-            let start = if header & 63 == crate::MAP {
-                crate::hamt::child_range(header, words).start
-            } else {
-                1
-            };
-            frames.push((left, right, start, words));
-        }
-        if same_shape {
-            return true;
-        }
-    }
-    // Collision buckets can have a different stored order; match those maps
-    // by exact keys without materializing or sorting the entry arrays.
-    for (key, value) in crate::hamt::PairIter::new(a) {
-        let mut found = false;
-        for (other_key, other_value) in crate::hamt::PairIter::new(b) {
-            if exact_eq(key, other_key) {
-                if !exact_eq(value, other_value) {
-                    return false;
-                }
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return false;
-        }
-    }
-    true
-}
 /// Erlang `=:=` for implemented types. Signed zero compares by bit pattern.
 #[inline]
 pub fn exact_eq(a: Term, b: Term) -> bool {
     // Port of erts/emulator/beam/erl_utils.h:113 (EQ), OTP-29.1.1.
     a == b || (!Term(a.0 & b.0).is_immed() && eq(a, b))
 }
+
+fn exact_eq_mixed_map_layouts(left: Term, right: Term) -> Option<Vec<(Term, Term)>> {
+    let mut values = Vec::with_capacity(crate::hamt::len(left));
+    for (key, value) in crate::hamt::PairIter::new(left) {
+        let (_, right_value) = crate::hamt::PairIter::new(right)
+            .find(|(right_key, _)| cmp_impl(key, *right_key, true) == Ordering::Equal)?;
+        values.push((value, right_value));
+    }
+    Some(values)
+}
+
 // Port of erts/emulator/beam/utils.c:1488-1523 (eq's term_array continuation), OTP-29.1.1.
 enum EqArray<'a> {
     Tuple(crate::TupleRef<'a>),
@@ -1733,13 +2016,103 @@ impl EqArray<'_> {
     }
 }
 
-enum EqWork<'a> {
-    Terms(Term, Term),
-    Array {
-        left: EqArray<'a>,
-        right: EqArray<'a>,
-        start: usize,
-    },
+struct EqArrayPair<'a> {
+    left: EqArray<'a>,
+    right: EqArray<'a>,
+}
+
+struct EqHashmapIterPair {
+    left: crate::hamt::PairIter,
+    right: crate::hamt::PairIter,
+}
+
+// Port of WSTACK's 16-word inline representation in erts/emulator/beam/global.h,
+// OTP-29.1.1. Borrowed views and iterators stay typed here; their LIFO handles are words.
+struct EqStack<'a> {
+    words: SmallVec<[u64; 16]>,
+    arrays: Vec<EqArrayPair<'a>>,
+    hashmaps: Vec<EqHashmapIterPair>,
+}
+
+impl<'a> EqStack<'a> {
+    fn new() -> Self {
+        Self {
+            words: SmallVec::new(),
+            arrays: Vec::new(),
+            hashmaps: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn push_terms(&mut self, left: Term, right: Term) {
+        self.words.push(right.bits());
+        self.words.push(left.bits());
+    }
+
+    #[inline(always)]
+    fn push_array(&mut self, left: EqArray<'a>, right: EqArray<'a>, start: usize) {
+        let index = self.arrays.len();
+        self.arrays.push(EqArrayPair { left, right });
+        self.push_array_index(index, start);
+    }
+
+    #[inline(always)]
+    fn push_array_index(&mut self, index: usize, start: usize) {
+        self.words.push(index as u64);
+        self.words.push(start as u64);
+        self.words.push(eq_array_op());
+    }
+
+    #[inline(always)]
+    fn push_flatmap_values(&mut self, left: Term, right: Term, start: usize, end: usize) {
+        self.words.push(right.bits());
+        self.words.push(left.bits());
+        self.words.push(start as u64);
+        self.words.push(end as u64);
+        self.words.push(eq_flatmap_values_op());
+    }
+
+    #[inline(always)]
+    fn push_hashmap(&mut self, left: Term, right: Term) {
+        let index = self.hashmaps.len();
+        self.hashmaps.push(EqHashmapIterPair {
+            left: crate::hamt::PairIter::new(left),
+            right: crate::hamt::PairIter::new(right),
+        });
+        self.push_hashmap_index(index);
+    }
+
+    #[inline(always)]
+    fn push_hashmap_index(&mut self, index: usize) {
+        self.words.push(index as u64);
+        self.words.push(eq_hashmap_op());
+    }
+}
+
+const WORK_OP_SHIFT: u32 = 2;
+const EQ_ARRAY_OP: u64 = 1;
+const EQ_FLATMAP_VALUES_OP: u64 = 2;
+const EQ_HASHMAP_OP: u64 = 3;
+
+// Port of the operation words tagged as TAG_PRIMARY_HEADER in utils.c:1488-1510.
+#[inline(always)]
+const fn eq_array_op() -> u64 {
+    EQ_ARRAY_OP << WORK_OP_SHIFT
+}
+
+#[inline(always)]
+const fn eq_flatmap_values_op() -> u64 {
+    EQ_FLATMAP_VALUES_OP << WORK_OP_SHIFT
+}
+
+#[inline(always)]
+const fn eq_hashmap_op() -> u64 {
+    EQ_HASHMAP_OP << WORK_OP_SHIFT
+}
+
+#[inline(always)]
+const fn is_work_op(word: u64) -> bool {
+    word & 3 == 0
 }
 
 fn first_unequal(
@@ -1759,217 +2132,448 @@ fn first_unequal(
     None
 }
 
-/// Port of erts/emulator/beam/utils.c:1125 (eq), OTP-29.1.1.
+/// Port of erts/emulator/beam/utils.c:1125-1530 (eq), OTP-29.1.1.
 #[inline(never)]
 fn eq(a: Term, b: Term) -> bool {
-    let mut pending: SmallVec<[EqWork<'_>; 16]> = SmallVec::new();
-    let mut current = Some(EqWork::Terms(a, b));
-    loop {
-        let work = match current.take() {
-            Some(work) => work,
-            None => match pending.pop() {
-                Some(work) => work,
-                None => return true,
-            },
-        };
-        let (mut a, mut b) = match work {
-            EqWork::Terms(a, b) => (a, b),
-            EqWork::Array { left, right, start } => {
-                let Some((index, a, b)) = first_unequal(&left, &right, start) else {
-                    continue;
-                };
-                let next = index + 1;
-                if next < left.len() {
-                    pending.push(EqWork::Array {
-                        left,
-                        right,
-                        start: next,
-                    });
-                }
-                (a, b)
-            }
-        };
-        'term: loop {
-            if a == b {
-                break;
-            }
-            // Port of erts/emulator/beam/utils.c:1125 (eq): after the raw-word check,
-            // only list and boxed primary tags have a structural equality case.
-            if a.is_immed() {
-                return false;
-            }
-            let kind = if a.0 & 3 == 1 {
-                TermKind::List
-            } else {
-                a.classify()
+    let mut pending = EqStack::new();
+    let (mut a, mut b) = (a, b);
+    'term: loop {
+        if a == b {
+            let Some(word) = pending.words.pop() else {
+                return true;
             };
-            if (kind == TermKind::List && b.0 & 3 != 1)
-                || (kind != TermKind::List && kind != b.classify())
-            {
-                return false;
+            if !is_work_op(word) {
+                a = Term(word);
+                b = Term(pending.words.pop().expect("term pair is complete"));
+                continue 'term;
             }
-            match kind {
-                TermKind::Number => {
-                    if !exact_number_eq(a, b) {
-                        return false;
-                    }
-                }
-                TermKind::Atom => {
-                    // Port of erts/emulator/beam/utils.c:1728-1737, OTP-29.1.1.
-                    // Atom identities are canonical in the VM's global atom table.
-                    if a.as_atom() != b.as_atom() {
-                        return false;
-                    }
-                }
-                TermKind::Nil => {}
-                TermKind::Pid | TermKind::Port => {
-                    if identity_cmp(a.identity().unwrap(), b.identity().unwrap()) != Ordering::Equal
-                    {
-                        return false;
-                    }
-                }
-                TermKind::Ref => {
-                    if !exact_ref_eq(a, b) {
-                        return false;
-                    }
-                }
-                TermKind::List => {
-                    // Port of erts/emulator/beam/utils.c:1137-1161, OTP-29.1.1.
-                    // Keep equal list cells in the list walk instead of repeating term-tag dispatch.
-                    loop {
-                        // SAFETY: the caller keeps both list cells live and stable.
-                        let (ah, at) = unsafe { a.cons_ref().unwrap() };
-                        // SAFETY: the caller keeps both list cells live and stable.
-                        let (bh, bt) = unsafe { b.cons_ref().unwrap() };
-                        if ah != bh {
-                            pending.push(EqWork::Terms(at, bt));
-                            a = ah;
-                            b = bh;
-                            continue 'term;
-                        }
-                        if at == bt {
-                            break 'term;
-                        }
-                        if at.0 & 3 != 1 || bt.0 & 3 != 1 {
-                            a = at;
-                            b = bt;
-                            continue 'term;
-                        }
-                        a = at;
-                        b = bt;
-                    }
-                }
-                TermKind::Tuple => {
-                    // SAFETY: both tuple payloads remain live and stable.
-                    let (av, bv) = unsafe { (a.tuple_ref().unwrap(), b.tuple_ref().unwrap()) };
-                    if av.len() != bv.len() {
-                        return false;
-                    }
-                    let left = EqArray::Tuple(av);
-                    let right = EqArray::Tuple(bv);
-                    let Some((index, x, y)) = first_unequal(&left, &right, 0) else {
-                        break;
+            match word >> WORK_OP_SHIFT {
+                EQ_ARRAY_OP => {
+                    let start = pending.words.pop().expect("array start is present") as usize;
+                    let array_index =
+                        pending.words.pop().expect("array handle is present") as usize;
+                    let (result, len) = {
+                        let pair = &pending.arrays[array_index];
+                        (
+                            first_unequal(&pair.left, &pair.right, start),
+                            pair.left.len(),
+                        )
+                    };
+                    let Some((index, next_a, next_b)) = result else {
+                        pending.arrays.truncate(array_index);
+                        continue 'term;
                     };
                     let next = index + 1;
-                    if next < left.len() {
-                        pending.push(EqWork::Array {
-                            left,
-                            right,
-                            start: next,
-                        });
+                    if next < len {
+                        pending.push_array_index(array_index, next);
+                    } else {
+                        pending.arrays.truncate(array_index);
                     }
-                    a = x;
-                    b = y;
-                    continue;
+                    a = next_a;
+                    b = next_b;
+                    continue 'term;
                 }
-                TermKind::Bitstring => {
-                    if bits_cmp(a, b) != Ordering::Equal {
-                        return false;
+                EQ_FLATMAP_VALUES_OP => {
+                    let end = pending.words.pop().expect("value count is present") as usize;
+                    let start = pending.words.pop().expect("value index is present") as usize;
+                    let left_map = Term(pending.words.pop().expect("left map is present"));
+                    let right_map = Term(pending.words.pop().expect("right map is present"));
+                    let (result, len) =
+                        crate::hamt::with_flatmap_arrays(left_map, |_, left_values| {
+                            crate::hamt::with_flatmap_arrays(right_map, |_, right_values| {
+                                let left = EqArray::Words(&left_values[..end]);
+                                let right = EqArray::Words(&right_values[..end]);
+                                (first_unequal(&left, &right, start), left.len())
+                            })
+                            .expect("right map is a live flatmap")
+                        })
+                        .expect("left map is a live flatmap");
+                    let Some((index, next_a, next_b)) = result else {
+                        continue 'term;
+                    };
+                    let next = index + 1;
+                    if next < len {
+                        pending.push_flatmap_values(left_map, right_map, next, end);
                     }
+                    a = next_a;
+                    b = next_b;
+                    continue 'term;
                 }
-                TermKind::Map => {
-                    if !exact_map_eq(a, b) {
-                        return false;
-                    }
-                }
-                TermKind::Record => {
-                    // SAFETY: both record definitions and instances remain live.
-                    let (av, bv) = unsafe { (a.record_ref().unwrap(), b.record_ref().unwrap()) };
-                    if node_order(av.module(), bv.module()) != Ordering::Equal
-                        || node_order(av.name(), bv.name()) != Ordering::Equal
-                        || av.is_exported() != bv.is_exported()
-                        || av.len() != bv.len()
-                    {
-                        return false;
-                    }
-                    for i in 0..av.len() {
-                        let (ai, bi) = (av.sorted_index(i).unwrap(), bv.sorted_index(i).unwrap());
-                        if node_order(av.key(ai).unwrap(), bv.key(bi).unwrap()) != Ordering::Equal {
-                            return false;
+                EQ_HASHMAP_OP => {
+                    let index = pending
+                        .words
+                        .pop()
+                        .expect("hashmap iterator handle is present")
+                        as usize;
+                    let (left_pair, right_pair) = {
+                        let iterators = &mut pending.hashmaps[index];
+                        (iterators.left.next(), iterators.right.next())
+                    };
+                    match (left_pair, right_pair) {
+                        (None, None) => {
+                            pending.hashmaps.truncate(index);
+                            continue 'term;
                         }
-                        pending.push(EqWork::Terms(av.value(ai).unwrap(), bv.value(bi).unwrap()));
-                    }
-                }
-                TermKind::Fun => {
-                    // SAFETY: both fun entries are retained by their owning heaps.
-                    let (av, bv) = unsafe { (a.fun_ref().unwrap(), b.fun_ref().unwrap()) };
-                    match (av, bv) {
-                        (
-                            FunRef::Local {
-                                entry: ae,
-                                free_vars: af,
-                            },
-                            FunRef::Local {
-                                entry: be,
-                                free_vars: bf,
-                            },
-                        ) => {
-                            if node_order(ae.module, be.module) != Ordering::Equal
-                                || ae.index != be.index
-                                || ae.old_uniq != be.old_uniq
-                                || af.len() != bf.len()
-                            {
-                                return false;
-                            }
-                            let left = EqArray::Words(af);
-                            let right = EqArray::Words(bf);
-                            let Some((index, x, y)) = first_unequal(&left, &right, 0) else {
-                                break;
-                            };
-                            let next = index + 1;
-                            if next < left.len() {
-                                pending.push(EqWork::Array {
-                                    left,
-                                    right,
-                                    start: next,
-                                });
-                            }
-                            a = x;
-                            b = y;
-                            continue;
-                        }
-                        (FunRef::Export { entry: ae }, FunRef::Export { entry: be }) => {
-                            if node_order(ae.module, be.module) != Ordering::Equal
-                                || node_order(ae.function, be.function) != Ordering::Equal
-                                || ae.arity != be.arity
-                            {
-                                return false;
-                            }
+                        (Some((left_key, left_value)), Some((right_key, right_value))) => {
+                            pending.push_hashmap_index(index);
+                            pending.push_terms(left_value, right_value);
+                            pending.push_terms(left_key, right_key);
+                            continue 'term;
                         }
                         _ => return false,
                     }
                 }
-                _ => {
-                    if a.bits() != b.bits() {
-                        return false;
-                    }
+                _ => unreachable!("invalid equality work word"),
+            }
+        }
+        // Port of erts/emulator/beam/utils.c:1125 (eq): after the raw-word check,
+        // only list and boxed primary tags have a structural equality case.
+        if a.is_immed() {
+            return false;
+        }
+        let kind = if a.0 & 3 == 1 {
+            TermKind::List
+        } else {
+            a.classify()
+        };
+        if (kind == TermKind::List && b.0 & 3 != 1)
+            || (kind != TermKind::List && kind != b.classify())
+        {
+            return false;
+        }
+        match kind {
+            TermKind::Number => {
+                if !exact_number_eq(a, b) {
+                    return false;
                 }
             }
-            break;
+            TermKind::Atom => {
+                // Port of erts/emulator/beam/utils.c:1728-1737, OTP-29.1.1.
+                // Atom identities are canonical in the VM's global atom table.
+                if a.as_atom() != b.as_atom() {
+                    return false;
+                }
+            }
+            TermKind::Nil => {}
+            TermKind::Pid | TermKind::Port => {
+                if identity_cmp(a.identity().unwrap(), b.identity().unwrap()) != Ordering::Equal {
+                    return false;
+                }
+            }
+            TermKind::Ref => {
+                if !exact_ref_eq(a, b) {
+                    return false;
+                }
+            }
+            TermKind::List => {
+                // Port of erts/emulator/beam/utils.c:1137-1161, OTP-29.1.1.
+                // Keep equal list cells in the list walk instead of repeating term-tag dispatch.
+                loop {
+                    // SAFETY: the caller keeps both list cells live and stable.
+                    let (ah, at) = unsafe { a.cons_ref().unwrap() };
+                    // SAFETY: the caller keeps both list cells live and stable.
+                    let (bh, bt) = unsafe { b.cons_ref().unwrap() };
+                    if ah != bh {
+                        pending.push_terms(at, bt);
+                        a = ah;
+                        b = bh;
+                        continue 'term;
+                    }
+                    if at == bt {
+                        break;
+                    }
+                    if at.0 & 3 != 1 || bt.0 & 3 != 1 {
+                        a = at;
+                        b = bt;
+                        continue 'term;
+                    }
+                    a = at;
+                    b = bt;
+                }
+            }
+            TermKind::Tuple => {
+                // SAFETY: both tuple payloads remain live and stable.
+                let (av, bv) = unsafe { (a.tuple_ref().unwrap(), b.tuple_ref().unwrap()) };
+                if av.len() != bv.len() {
+                    return false;
+                }
+                let left = EqArray::Tuple(av);
+                let right = EqArray::Tuple(bv);
+                if let Some((index, x, y)) = first_unequal(&left, &right, 0) {
+                    let next = index + 1;
+                    if next < left.len() {
+                        pending.push_array(left, right, next);
+                    }
+                    a = x;
+                    b = y;
+                    continue 'term;
+                }
+            }
+            TermKind::Bitstring => {
+                if bits_cmp(a, b) != Ordering::Equal {
+                    return false;
+                }
+            }
+            TermKind::Map => {
+                let len = crate::hamt::len(a);
+                if len != crate::hamt::len(b) {
+                    return false;
+                }
+                if a.is_hashmap() != b.is_hashmap() {
+                    let Some(values) = exact_eq_mixed_map_layouts(a, b) else {
+                        return false;
+                    };
+                    for (left_value, right_value) in values {
+                        pending.push_terms(left_value, right_value);
+                    }
+                    a = b;
+                    continue 'term;
+                }
+                if a.is_hashmap() {
+                    pending.push_hashmap(a, b);
+                    a = b;
+                    continue 'term;
+                }
+                let left_keys = a.flatmap_keys_tuple().expect("left map is a live flatmap");
+                let right_keys = b.flatmap_keys_tuple().expect("right map is a live flatmap");
+                if len != 0 {
+                    pending.push_flatmap_values(a, b, 0, len);
+                }
+                a = left_keys;
+                b = right_keys;
+                continue 'term;
+            }
+            TermKind::Record => {
+                // SAFETY: both record definitions and instances remain live.
+                let (av, bv) = unsafe { (a.record_ref().unwrap(), b.record_ref().unwrap()) };
+                if node_order(av.module(), bv.module()) != Ordering::Equal
+                    || node_order(av.name(), bv.name()) != Ordering::Equal
+                    || av.is_exported() != bv.is_exported()
+                    || av.len() != bv.len()
+                {
+                    return false;
+                }
+                for i in 0..av.len() {
+                    let (ai, bi) = (av.sorted_index(i).unwrap(), bv.sorted_index(i).unwrap());
+                    if node_order(av.key(ai).unwrap(), bv.key(bi).unwrap()) != Ordering::Equal {
+                        return false;
+                    }
+                    pending.push_terms(av.value(ai).unwrap(), bv.value(bi).unwrap());
+                }
+            }
+            TermKind::Fun => {
+                // SAFETY: both fun entries are retained by their owning heaps.
+                let (av, bv) = unsafe { (a.fun_ref().unwrap(), b.fun_ref().unwrap()) };
+                match (av, bv) {
+                    (
+                        FunRef::Local {
+                            entry: ae,
+                            free_vars: af,
+                        },
+                        FunRef::Local {
+                            entry: be,
+                            free_vars: bf,
+                        },
+                    ) => {
+                        if node_order(ae.module, be.module) != Ordering::Equal
+                            || ae.index != be.index
+                            || ae.old_uniq != be.old_uniq
+                            || af.len() != bf.len()
+                        {
+                            return false;
+                        }
+                        let left = EqArray::Words(af);
+                        let right = EqArray::Words(bf);
+                        if let Some((index, x, y)) = first_unequal(&left, &right, 0) {
+                            let next = index + 1;
+                            if next < left.len() {
+                                pending.push_array(left, right, next);
+                            }
+                            a = x;
+                            b = y;
+                            continue 'term;
+                        }
+                    }
+                    (FunRef::Export { entry: ae }, FunRef::Export { entry: be }) => {
+                        if node_order(ae.module, be.module) != Ordering::Equal
+                            || node_order(ae.function, be.function) != Ordering::Equal
+                            || ae.arity != be.arity
+                        {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            _ => {
+                if a.bits() != b.bits() {
+                    return false;
+                }
+            }
         }
+        b = a;
     }
 }
 /// Erlang `==` for implemented types.
 pub fn loose_eq(a: Term, b: Term) -> bool {
     cmp_impl(a, b, false) == Ordering::Equal
+}
+
+#[cfg(test)]
+mod hashmap_oracle_tests {
+    use super::{cmp_impl, hashmap_key_hash_order};
+    use crate::{Term, TermBuilder, VecHeap};
+    use std::cmp::Ordering;
+    use std::process::Command;
+
+    fn old_cmp_map_key(left: Term, right: Term) -> Ordering {
+        cmp_impl(left, right, true)
+    }
+
+    // Test-only copy of the main-branch hashmap loop, retained as a small regression oracle.
+    fn old_main_hashmap_cmp(a: Term, b: Term, exact: bool) -> Ordering {
+        let mut left = crate::hamt::PairIter::new(a);
+        let mut right = crate::hamt::PairIter::new(b);
+        let mut ap = left.next();
+        let mut bp = right.next();
+        let mut min_key = None;
+        let mut cmp_res = Ordering::Equal;
+
+        while let (Some((left_key, left_value)), Some((right_key, right_value))) = (ap, bp) {
+            let j = old_cmp_map_key(left_key, right_key);
+            if j != Ordering::Equal {
+                break;
+            }
+            let is_new_minimum =
+                min_key.is_none_or(|current| old_cmp_map_key(left_key, current) == Ordering::Less);
+            if is_new_minimum {
+                let j = cmp_impl(left_value, right_value, exact);
+                if j != Ordering::Equal {
+                    min_key = Some(left_key);
+                    cmp_res = j;
+                }
+            }
+            ap = left.next();
+            bp = right.next();
+        }
+        if ap.is_none() && bp.is_none() {
+            return cmp_res;
+        }
+        let j = match (ap, bp) {
+            (Some((left_key, _)), Some((right_key, _))) => old_cmp_map_key(left_key, right_key),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => unreachable!(),
+        };
+        let hash_order = hashmap_key_hash_order(ap.map(|pair| pair.0), bp.map(|pair| pair.0));
+        let side = if hash_order == Ordering::Equal {
+            j
+        } else {
+            hash_order
+        };
+        if side == Ordering::Less {
+            min_key = Some(ap.unwrap().0);
+            cmp_res = Ordering::Less;
+            ap = left.next();
+        } else {
+            min_key = Some(bp.unwrap().0);
+            cmp_res = Ordering::Greater;
+            bp = right.next();
+        }
+
+        loop {
+            let j = match (ap, bp) {
+                (Some((left_key, _)), Some((right_key, _))) => old_cmp_map_key(left_key, right_key),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => break,
+            };
+            if j == Ordering::Equal {
+                ap = left.next();
+                bp = right.next();
+                continue;
+            }
+            let hash_order = hashmap_key_hash_order(ap.map(|pair| pair.0), bp.map(|pair| pair.0));
+            let side = if hash_order == Ordering::Equal {
+                j
+            } else {
+                hash_order
+            };
+            if side == Ordering::Less {
+                let key = ap.unwrap().0;
+                let j = old_cmp_map_key(key, min_key.unwrap());
+                if j == Ordering::Less {
+                    min_key = Some(key);
+                    cmp_res = Ordering::Less;
+                }
+                ap = left.next();
+            } else {
+                let key = bp.unwrap().0;
+                let j = old_cmp_map_key(key, min_key.unwrap());
+                if j == Ordering::Less {
+                    min_key = Some(key);
+                    cmp_res = Ordering::Greater;
+                }
+                bp = right.next();
+            }
+        }
+        cmp_res
+    }
+
+    #[test]
+    fn minimum_size_mixed_hamt_matches_main_and_erl() {
+        let expression = r#"F=fun(I)->case I rem 6 of 0->I+100000; 1->I+0.5; 2->{I}; 3->[I]; 4->binary:copy(<<I:32>>); 5->-I-1 end end, P=[{F((I*37+4*977) rem 5000),I*3-4}||I<-lists:seq(0,30)], M=maps:from_list([{1,17},{1.0,19}]++P), M2=maps:put(1.0,4,M), M3=maps:remove(1.0,maps:put(2.0,4,M)), C=fun(A,B)->if A<B->0; A>B->2; true->1 end end, io:format("~B ~B~n",[C(M,M2),C(M,M3)]),halt()."#;
+        let output = Command::new("erl")
+            .args(["-noshell", "-eval", expression])
+            .output()
+            .expect("erl is installed for the differential trace");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        similar_asserts::assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "2 0");
+
+        let mut heap = VecHeap::new();
+        let mut builder = TermBuilder::new(&mut heap);
+        let float_one = builder.float(1.0).unwrap();
+        let mut pairs = vec![
+            (Term::small(1).unwrap(), Term::small(17).unwrap()),
+            (float_one, Term::small(19).unwrap()),
+        ];
+        for index in 0..31 {
+            let key_index = (index * 37 + 4 * 977) % 5000;
+            let n = key_index as i64;
+            let key = match key_index % 6 {
+                0 => Term::small(n + 100_000).unwrap(),
+                1 => builder.float(n as f64 + 0.5).unwrap(),
+                2 => builder.tuple(&[Term::small(n).unwrap()]).unwrap(),
+                3 => builder.list_from_iter([Term::small(n).unwrap()]).unwrap(),
+                4 => builder.binary(&(key_index as u32).to_be_bytes()).unwrap(),
+                _ => Term::small(-n - 1).unwrap(),
+            };
+            pairs.push((key, Term::small(index as i64 * 3 - 4).unwrap()));
+        }
+        let map = builder.flatmap_from_pairs(&pairs).unwrap();
+        let mut value_pairs = pairs.clone();
+        value_pairs.push((float_one, Term::small(4).unwrap()));
+        let changed_value = builder.flatmap_from_pairs(&value_pairs).unwrap();
+        let mut key_pairs = pairs
+            .into_iter()
+            .filter(|(key, _)| !crate::exact_eq(*key, float_one))
+            .collect::<Vec<_>>();
+        key_pairs.push((builder.float(2.0).unwrap(), Term::small(4).unwrap()));
+        let changed_key = builder.flatmap_from_pairs(&key_pairs).unwrap();
+        assert!(map.is_hashmap() && changed_value.is_hashmap() && changed_key.is_hashmap());
+
+        for (right, expected) in [
+            (changed_value, Ordering::Greater),
+            (changed_key, Ordering::Less),
+        ] {
+            let old = old_main_hashmap_cmp(map, right, false);
+            let new = cmp_impl(map, right, false);
+            similar_asserts::assert_eq!(old, expected);
+            similar_asserts::assert_eq!(new, expected);
+        }
+    }
 }
