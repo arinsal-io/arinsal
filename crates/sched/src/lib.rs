@@ -3170,19 +3170,18 @@ impl<T: Task> Inner<T> {
 
     fn deliver_block(
         &self,
-        to: Pid,
+        process: &Arc<Process<T>>,
         events: &mut Vec<Event<T::Message>>,
         local: Option<&mut Local<T>>,
         wake: bool,
         force_enqueue: bool,
     ) -> Result<(), Error> {
-        let process = self.table.lookup(to).ok_or(Error::NoProcess)?;
         if process.run_state().load(Ordering::Acquire) == EXITED {
             return Err(Error::NoProcess);
         }
         let count = events.len();
         process.input.backlog.fetch_add(count, Ordering::Relaxed);
-        self.fanin_delivery(&process, count);
+        self.fanin_delivery(process, count);
         if process
             .input
             .push_block_routed(events, |event| signal_buffer_slot(event.from))
@@ -3195,7 +3194,7 @@ impl<T: Task> Inner<T> {
             return Err(Error::NoProcess);
         }
         if wake {
-            self.wake_after_publish(&process, local, force_enqueue, None);
+            self.wake_after_publish(process, local, force_enqueue, None);
         }
         Ok(())
     }
@@ -5108,75 +5107,106 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                 shared: held.shared,
             }),
         });
-        let process = self.lookup(to).ok_or(Error::NoProcess)?;
-        let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
-        let wakes = payload_wakes(&payload);
-        let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy { .. }));
-        // A literal-copy request is never buffered: a request lost to an exiting target
-        // would never be answered, so the sender must see `NoProcess` at once. Port of
-        // erts/emulator/beam/erl_proc_sig_queue.c:3480 (erts_proc_sig_send_cla_request), OTP-29.1.1.
-        // Neither is a link: erts enqueues it at once and `link/1` answers a target that is
-        // already gone with a `noproc` link exit; a buffered link dropped at slice end would
-        // lose the target's exit signal. Port of erts/emulator/beam/bif.c:180-183 (link_opt),
-        // OTP-29.1.1.
-        let link = matches!(&payload, Payload::Signal(Signal::Link));
-        if waiting || monitor || link || deferred.is_some() || force_enqueue {
-            if let Some(first) = deferred {
-                let mut events = self
-                    .local
-                    .map(RefCell::borrow_mut)
-                    .as_deref_mut()
-                    .and_then(|local| local.message_slabs.pop())
-                    .unwrap_or_else(|| Vec::with_capacity(2));
-                events.push(first);
-                events.push(Event { from, payload });
-                let delivered = self.inner.deliver_block(
-                    to,
-                    &mut events,
-                    self.local.map(RefCell::borrow_mut).as_deref_mut(),
-                    wakes,
-                    force_enqueue,
-                );
-                let lost = if delivered.is_err() {
-                    take_lost_monitors(&mut events)
-                } else {
-                    Vec::new()
-                };
-                events.clear();
-                if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut()
-                    && local.message_slabs.len() < 64
-                {
-                    local.message_slabs.push(events);
+        // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1: no
+        // reference count is taken on the receiver.
+        let inner = self.inner;
+        inner
+            .table
+            .with_live(to, |process| -> Result<(), Error> {
+                let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
+                let wakes = payload_wakes(&payload);
+                let force_enqueue =
+                    matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy { .. }));
+                // A literal-copy request is never buffered: a request lost to an exiting target
+                // would never be answered, so the sender must see `NoProcess` at once. Port of
+                // erts/emulator/beam/erl_proc_sig_queue.c:3480 (erts_proc_sig_send_cla_request), OTP-29.1.1.
+                // Neither is a link: erts enqueues it at once and `link/1` answers a target that is
+                // already gone with a `noproc` link exit; a buffered link dropped at slice end would
+                // lose the target's exit signal. Port of erts/emulator/beam/bif.c:180-183 (link_opt),
+                // OTP-29.1.1.
+                let link = matches!(&payload, Payload::Signal(Signal::Link));
+                if waiting || monitor || link || deferred.is_some() || force_enqueue {
+                    let mut deferred = deferred;
+                    let mut payload = Some(payload);
+                    if let Some(first) = deferred.take() {
+                        // The held monitor and this signal enter the queue together.
+                        let second = Event {
+                            from,
+                            payload: payload.take().expect("payload present"),
+                        };
+                        let (first, second) = match process.input.push_pair(first, second) {
+                            Ok(()) => {
+                                self.inner.fanin_delivery(process, 2);
+                                process.input.backlog.fetch_add(2, Ordering::Relaxed);
+                                if wakes {
+                                    self.inner.wake_after_publish(
+                                        process,
+                                        self.local.map(RefCell::borrow_mut).as_deref_mut(),
+                                        force_enqueue,
+                                        None,
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            Err(pair) => pair,
+                        };
+                        let mut events = self
+                            .local
+                            .map(RefCell::borrow_mut)
+                            .as_deref_mut()
+                            .and_then(|local| local.message_slabs.pop())
+                            .unwrap_or_else(|| Vec::with_capacity(2));
+                        events.push(first);
+                        events.push(second);
+                        let delivered = self.inner.deliver_block(
+                            process,
+                            &mut events,
+                            self.local.map(RefCell::borrow_mut).as_deref_mut(),
+                            wakes,
+                            force_enqueue,
+                        );
+                        let lost = if delivered.is_err() {
+                            take_lost_monitors(&mut events)
+                        } else {
+                            Vec::new()
+                        };
+                        events.clear();
+                        if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut()
+                            && local.message_slabs.len() < 64
+                        {
+                            local.message_slabs.push(events);
+                        }
+                        if delivered.is_err() {
+                            self.bounce_monitors(to, lost);
+                            return Err(Error::NoProcess);
+                        }
+                    } else {
+                        self.inner.deliver_process(
+                            process,
+                            from,
+                            payload.take().expect("payload present"),
+                            self.local.map(RefCell::borrow_mut).as_deref_mut(),
+                            wakes,
+                            force_enqueue,
+                        )?;
+                    }
+                    // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message), OTP-29.1.1.
+                    // Message queue depth does not create a scheduler event for the sender.
+                    return Ok(());
                 }
-                if delivered.is_err() {
-                    self.bounce_monitors(to, lost);
-                    return Err(Error::NoProcess);
-                }
-            } else {
-                self.inner.deliver_process(
-                    &process,
+                // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message) and
+                // erl_proc_sig_queue.c:712 (enqueue_signals), OTP-29.1.1: the signal is appended to
+                // the receiver's in-queue now; erts keeps no per-sender buffer to publish later. A
+                // receiver that is already gone drops it, as erts does for a dead receiver.
+                let _ = self.inner.deliver_live(
+                    process,
                     from,
                     payload,
                     self.local.map(RefCell::borrow_mut).as_deref_mut(),
-                    wakes,
-                    force_enqueue,
-                )?;
-            }
-            // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message), OTP-29.1.1.
-            // Message queue depth does not create a scheduler event for the sender.
-            return Ok(());
-        }
-        // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message) and
-        // erl_proc_sig_queue.c:712 (enqueue_signals), OTP-29.1.1: the signal is appended to
-        // the receiver's in-queue now; erts keeps no per-sender buffer to publish later. A
-        // receiver that is already gone drops it, as erts does for a dead receiver.
-        let _ = self.inner.deliver_live(
-            &process,
-            from,
-            payload,
-            self.local.map(RefCell::borrow_mut).as_deref_mut(),
-        );
-        Ok(())
+                );
+                Ok(())
+            })
+            .ok_or(Error::NoProcess)?
     }
     fn flush(&mut self) {
         self.publish_deferred_monitor();
@@ -5648,7 +5678,9 @@ impl<T: Task> Scheduler<T> {
                 payload: Payload::Message(message),
             })
             .collect();
-        self.inner.deliver_block(to, &mut events, None, true, false)
+        let process = self.inner.table.lookup(to).ok_or(Error::NoProcess)?;
+        self.inner
+            .deliver_block(&process, &mut events, None, true, false)
     }
     /// [`Self::send`] for a sender running on one of this scheduler's normal threads: a woken
     /// receiver that belongs to that thread's run queue joins it directly. Any other thread
