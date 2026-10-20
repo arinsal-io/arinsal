@@ -3701,6 +3701,9 @@ pub(crate) fn errno_name(code: i32) -> &'static str {
     }
 }
 
+/// The messages one callback delivers, in order; a packet is usually one.
+type Outs = smallvec::SmallVec<[Out; 1]>;
+
 enum Out {
     AsyncError {
         caller: Pid,
@@ -3844,7 +3847,14 @@ fn emit(sock: &Sock, out: Out) {
 ///
 /// Port of erts/emulator/beam/erl_port_task.c (erts_port_task_execute runs the task to a
 /// scheduling boundary) and erl_proc_sig_queue.h (erts_proc_notify_new_message), OTP-29.1.1.
-fn emit_block(sock: &Sock, outs: Vec<Out>) {
+fn emit_block(sock: &Sock, mut outs: Outs) {
+    // One message (the usual case of one received packet) goes out as `emit` does.
+    if outs.len() == 1 {
+        if let Some(out) = outs.pop() {
+            emit(sock, out);
+        }
+        return;
+    }
     let mut pending: Vec<(Pid, Vec<Message>)> = Vec::new();
     for out in outs {
         let Some((to, message)) = output_message(sock, out) else {
@@ -3891,8 +3901,22 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, Message)> {
     let port = Term::port(sock.id).unwrap();
     // Port of inet_drv.c:3987-4005 (tcp_message uses LOAD_STRING sized to the
     // complete packet), OTP-29.1.1. List-mode packets need two heap words per byte.
-    let words = 128usize.saturating_add(output_list_len(sock, &out).saturating_mul(2));
-    let mut heap = ProcessHeap::with_words(words);
+    let words = match out {
+        // Fixed-shape status messages: a tuple, a reference and a status tuple at most.
+        Out::AsyncError { .. }
+        | Out::AsyncOk { .. }
+        | Out::AsyncPort { .. }
+        | Out::InetReply { .. }
+        | Out::TcpClosed { .. }
+        | Out::TcpError { .. }
+        | Out::TcpPassive { .. }
+        | Out::EmptyOutQ { .. }
+        | Out::Sendfile { .. } => 32,
+        _ => 128usize.saturating_add(output_list_len(sock, &out).saturating_mul(2)),
+    };
+    // The term is built in the fragment that is queued, as driver_deliver_term does
+    // (io.c:5658), not copied out of a scratch heap.
+    let mut heap = ProcessHeap::with_words_for_type(words, ErtsAlcType::HEAP_FRAG);
     let term = match &out {
         Out::AsyncError {
             caller,
@@ -4013,7 +4037,7 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, Message)> {
                 .map(|term| (*owner, term))
         }
     };
-    term.and_then(|(to, term)| Message::copy_from(term).ok().map(|message| (to, message)))
+    term.map(|(to, term)| (to, Message::from_heap(term, heap)))
 }
 
 fn message_async(heap: &mut ProcessHeap, port: Term, aref: u16, status: Term) -> Option<Term> {
@@ -4403,7 +4427,7 @@ fn satisfy(sock: &Arc<Sock>) {
     let _io = sock.io.lock().unwrap_or_else(|poison| poison.into_inner());
     let (outs, abandon) = {
         let mut inner = sock.inner.lock().unwrap();
-        let mut outs = Vec::new();
+        let mut outs = Outs::new();
         let port = Term::port(sock.id).unwrap();
         let abandon = take_packets(&sock.handle(), port, &mut inner, &mut outs);
         (outs, abandon)
@@ -4414,7 +4438,7 @@ fn satisfy(sock: &Arc<Sock>) {
     }
 }
 
-fn take_packets(handle: &PortHandle, port: Term, inner: &mut Inner, outs: &mut Vec<Out>) -> bool {
+fn take_packets(handle: &PortHandle, port: Term, inner: &mut Inner, outs: &mut Outs) -> bool {
     if inner.phase != Phase::Connected {
         return false;
     }
@@ -4492,7 +4516,7 @@ fn take_packets(handle: &PortHandle, port: Term, inner: &mut Inner, outs: &mut V
     false
 }
 
-fn packet_error(handle: &PortHandle, inner: &mut Inner, outs: &mut Vec<Out>) -> bool {
+fn packet_error(handle: &PortHandle, inner: &mut Inner, outs: &mut Outs) -> bool {
     // Port of inet_drv.c:13170 (tcp_recv → tcp_recv_error EMSGSIZE), OTP-29.1.1.
     if let Some(recv) = inner.recv.take() {
         drop_pending(inner, recv.caller, recv.aref);
@@ -4524,7 +4548,7 @@ enum DataWho {
     Async(Pid, u16),
 }
 
-fn push_data(inner: &Inner, outs: &mut Vec<Out>, who: DataWho, bytes: Vec<u8>) {
+fn push_data(inner: &Inner, outs: &mut Outs, who: DataWho, bytes: Vec<u8>) {
     // Port of inet_drv.c:4287 (deliver == PORT skips packet_parse), OTP-29.1.1.
     if inner.deliver == DELIVER_PORT
         && let DataWho::Active(owner) = who
@@ -4542,7 +4566,7 @@ fn push_data(inner: &Inner, outs: &mut Vec<Out>, who: DataWho, bytes: Vec<u8>) {
     }
 }
 
-fn push_frame(inner: &Inner, port: Term, outs: &mut Vec<Out>, who: DataWho, frame: Frame) {
+fn push_frame(inner: &Inner, port: Term, outs: &mut Outs, who: DataWho, frame: Frame) {
     let binary = inner.htype >= 13;
     match frame {
         Frame::Bytes(bytes) => push_data(inner, outs, who, bytes),
@@ -4704,7 +4728,7 @@ fn packet_type(htype: i32) -> Option<PacketType> {
     })
 }
 
-fn note_active(inner: &mut Inner, owner: Pid, outs: &mut Vec<Out>) {
+fn note_active(inner: &mut Inner, owner: Pid, outs: &mut Outs) {
     // Port of inet_drv.c:1552 (INET_CHECK_ACTIVE_TO_PASSIVE), OTP-29.1.1.
     match inner.active {
         Active::Once => {
