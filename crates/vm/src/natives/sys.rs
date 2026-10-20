@@ -639,12 +639,13 @@ fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<
     {
         let snapshot = process._persistent_terms.store().snapshot();
         let remaining = snapshot.len();
-        process.cold_mut().persistent_get_all = Some(crate::proc_create::PersistentGetAll {
-            snapshot,
-            cursor: 0,
-            remaining,
-            result: Term::NIL,
-        });
+        process.cold_mut().persistent_get_all =
+            Some(Box::new(crate::proc_create::PersistentGetAll {
+                snapshot,
+                cursor: 0,
+                remaining,
+                result: Term::NIL,
+            }));
     }
 
     // OTP's BIF chunk size is `ERTS_BIF_REDS_LEFT(c_p)`, which is also how

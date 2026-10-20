@@ -896,6 +896,22 @@ impl Clock for VirtualClock {
 /// runs the process without its [`RunCtx`] (native receive). It does not keep the process
 /// alive; a probe of an exited process reports nothing pending.
 // Port of erts/emulator/beam/erl_process.h:1291 (ERTS_PSFLG_MSG_SIG_IN_Q), OTP-29.1.1.
+/// A child inserted by `spawn_unscheduled_handle*` and not yet scheduled. The spawner keeps the
+/// process it created, as `erl_create_process` keeps its `Process *`, so scheduling needs no
+/// process table lookup.
+pub struct SpawnedProcess<M> {
+    pid: Pid,
+    process: Arc<dyn Any + Send + Sync>,
+    _message: std::marker::PhantomData<fn() -> M>,
+}
+
+impl<M> SpawnedProcess<M> {
+    /// The child's pid.
+    pub fn pid(&self) -> Pid {
+        self.pid
+    }
+}
+
 #[derive(Clone)]
 pub struct SignalProbe<M>(Arc<Incoming<Event<M>>>, Arc<AtomicU32>);
 
@@ -4241,6 +4257,7 @@ trait ContextOps<M: SignalMessage> {
     fn mark_exited(&mut self, pid: Pid);
     fn cancel_target_timers(&mut self, pid: Pid);
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error>;
+    fn schedule_spawned(&mut self, spawned: SpawnedProcess<M>) -> Result<(), Error>;
     fn request_aux_work_all(&mut self, work: SchedulerAuxWork);
     fn begin_halt(
         &mut self,
@@ -4306,6 +4323,10 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// A worker-local child runs before this worker parks.
     pub fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error> {
         self.inner.schedule_spawn(pid)
+    }
+    /// Schedule a child returned by `Scheduler::spawn_unscheduled_handle` (no table lookup).
+    pub fn schedule_spawned(&mut self, spawned: SpawnedProcess<M>) -> Result<(), Error> {
+        self.inner.schedule_spawned(spawned)
     }
     /// Consume reductions; returns false when the quantum is exhausted.
     pub fn consume(&mut self, count: u32) -> bool {
@@ -4761,6 +4782,29 @@ impl<T: Task> Runner<'_, T> {
     }
 }
 impl<T: Task> Runner<'_, T> {
+    /// Publish an unscheduled child on a run queue.
+    // Port of erts/emulator/beam/erl_process.c:12525 (erl_create_process), OTP-29.1.1: the
+    // child joins its parent's run queue.
+    fn schedule_process(&mut self, process: Arc<Process<T>>) -> Result<(), Error> {
+        process
+            .run_state()
+            .compare_exchange(UNSCHEDULED, QUEUED, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::NoProcess)?;
+        let bound = process.bound_worker().is_some();
+        let item = Scheduled::new(process);
+        if bound {
+            self.inner.enqueue(item, false);
+        } else if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut() {
+            // Port of erl_process.c:12525-12531 (`erl_create_process`) and
+            // erl_process.c:3954 (`enqueue_process`), OTP-29.1.1: newly spawned
+            // children join the caller's FIFO run queue behind earlier children.
+            self.inner.push_run_queue(local.worker_id, item, false);
+        } else {
+            self.inner.enqueue_new(item);
+        }
+        Ok(())
+    }
+
     fn lookup(&mut self, pid: Pid) -> Option<Arc<Process<T>>> {
         if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut() {
             local.lookup(&self.inner.table, pid)
@@ -5059,24 +5103,14 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
 
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error> {
         let process = self.lookup(pid).ok_or(Error::NoProcess)?;
-        process
-            .run_state()
-            .compare_exchange(UNSCHEDULED, QUEUED, Ordering::AcqRel, Ordering::Acquire)
+        self.schedule_process(process)
+    }
+    fn schedule_spawned(&mut self, spawned: SpawnedProcess<T::Message>) -> Result<(), Error> {
+        let process = spawned
+            .process
+            .downcast::<Process<T>>()
             .map_err(|_| Error::NoProcess)?;
-        let item = Scheduled::new(process.clone());
-        // Port of erts/emulator/beam/erl_process.c:12525 (erl_create_process), OTP-29.1.1:
-        // the child joins its parent's run queue.
-        if process.bound_worker().is_some() {
-            self.inner.enqueue(item, false);
-        } else if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut() {
-            // Port of erl_process.c:12525-12531 (`erl_create_process`) and
-            // erl_process.c:3954 (`enqueue_process`), OTP-29.1.1: newly spawned
-            // children join the caller's FIFO run queue behind earlier children.
-            self.inner.push_run_queue(local.worker_id, item, false);
-        } else {
-            self.inner.enqueue_new(item);
-        }
-        Ok(())
+        self.schedule_process(process)
     }
     fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<T::Message>) -> Result<(), Error> {
         let monitor = matches!(payload, Payload::Signal(Signal::Monitor { .. }));
@@ -5591,9 +5625,22 @@ impl<T: Task> Scheduler<T> {
         task: T,
         priority: Priority,
     ) -> Result<Pid, Error> {
+        Ok(self.spawn_unscheduled_handle(task, priority)?.pid)
+    }
+    /// [`Self::spawn_unscheduled_with_priority`], returning the child for
+    /// [`RunCtx::schedule_spawned`].
+    pub fn spawn_unscheduled_handle(
+        &self,
+        task: T,
+        priority: Priority,
+    ) -> Result<SpawnedProcess<T::Message>, Error> {
         let process = self.inner.table.insert(task, priority, None)?;
         process.run_state().store(UNSCHEDULED, Ordering::Release);
-        Ok(process.pid)
+        Ok(SpawnedProcess {
+            pid: process.pid,
+            process,
+            _message: std::marker::PhantomData,
+        })
     }
     /// Insert a child whose caller publishes it on a one-based scheduler id.
     pub fn spawn_unscheduled_on(&self, task: T, scheduler_id: usize) -> Result<Pid, Error> {
@@ -5606,13 +5653,29 @@ impl<T: Task> Scheduler<T> {
         scheduler_id: usize,
         priority: Priority,
     ) -> Result<Pid, Error> {
+        Ok(self
+            .spawn_unscheduled_on_handle(task, scheduler_id, priority)?
+            .pid)
+    }
+    /// [`Self::spawn_unscheduled_on_with_priority`], returning the child for
+    /// [`RunCtx::schedule_spawned`].
+    pub fn spawn_unscheduled_on_handle(
+        &self,
+        task: T,
+        scheduler_id: usize,
+        priority: Priority,
+    ) -> Result<SpawnedProcess<T::Message>, Error> {
         let worker = scheduler_id.checked_sub(1).ok_or(Error::Capacity)?;
         if worker >= self.inner.config.workers {
             return Err(Error::Capacity);
         }
         let process = self.inner.table.insert(task, priority, Some(worker))?;
         process.run_state().store(UNSCHEDULED, Ordering::Release);
-        Ok(process.pid)
+        Ok(SpawnedProcess {
+            pid: process.pid,
+            process,
+            _message: std::marker::PhantomData,
+        })
     }
     /// Make an inserted child runnable after its caller publishes it.
     pub fn schedule_unscheduled(&self, pid: Pid) -> Result<(), Error> {

@@ -704,11 +704,11 @@ pub(crate) fn note_caught_bif_frame(
                 };
                 let freason = p.header.freason;
                 let fvalue = p.header.fvalue;
-                p.cold_mut().pending_trace_top = Some(PendingTop {
+                p.cold_mut().pending_trace_top = Some(Box::new(PendingTop {
                     freason,
                     fvalue,
                     top,
-                });
+                }));
             }
             return;
         }
@@ -721,11 +721,11 @@ pub(crate) fn note_caught_bif_frame(
     };
     let freason = p.header.freason;
     let fvalue = p.header.fvalue;
-    p.cold_mut().pending_trace_top = Some(PendingTop {
+    p.cold_mut().pending_trace_top = Some(Box::new(PendingTop {
         freason,
         fvalue,
         top,
-    });
+    }));
 }
 
 fn bif_pending_top(

@@ -526,7 +526,7 @@ pub(crate) fn run_static_nif(
     let pending = process
         .cold
         .as_mut()
-        .and_then(|cold| cold.nif_pending.take());
+        .and_then(|cold| cold.nif_pending.take().map(|boxed| *boxed));
     let done = process
         .cold
         .as_mut()
@@ -555,7 +555,7 @@ fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
     let Some(pending) = process
         .cold
         .as_mut()
-        .and_then(|cold| cold.nif_pending.take())
+        .and_then(|cold| cold.nif_pending.take().map(|boxed| *boxed))
     else {
         return Err(crate::VmError::Trap(crate::exceptions::Trap::error(
             crate::signals::atom("undef"),
@@ -598,7 +598,7 @@ fn leave_native_nif(
             // erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1: the call traps to a
             // continuation the executor runs on a scheduler of `class`.
             if let Some(pending) = crate::natives::nif::take_rescheduled() {
-                process.cold_mut().nif_pending = Some(pending);
+                process.cold_mut().nif_pending = Some(Box::new(pending));
             }
             trap_to_dirty_nif(process, identity, class, arity)
         }
@@ -1012,7 +1012,7 @@ pub extern "C" fn arinsal_beamasm_native_trace_return(header: *mut ProcessHeader
         // caller.
         // Port of erts/emulator/beam/emu/trace_instrs.tab:25-105 (return_trace,
         // i_return_to_trace), OTP-29.1.1.
-        process.cold_mut().native_return_events = Some((frames, value));
+        process.cold_mut().native_return_events = Some(Box::new((frames, value)));
         registers.tmp_mem[0] = arinsal_beamasm::dispatch::RETURN_TO_DISPATCH_IDENTITY as u64;
         registers.tmp_mem[1] = saved_caller.tagged_word();
         registers.tmp_mem[3] = 2;
@@ -3508,11 +3508,11 @@ fn process_bif_error(
     let fvalue = crate::native_hooks::raw(trap.reason);
     process.header.freason = freason;
     process.header.fvalue = fvalue;
-    process.cold_mut().native_trap = Some(crate::proc_create::NativeTrap {
+    process.cold_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
         trap,
         freason,
         fvalue,
-    });
+    }));
     process.sync_native_header();
     0
 }
@@ -3733,7 +3733,7 @@ pub(crate) fn set_native_bif_error(
 ) {
     set_light_bif_error(process, &error);
     let (freason, fvalue) = (process.header.freason, process.header.fvalue);
-    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
+    process.cold_mut().native_bif_error = Some(Box::new(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Owned {
             module: module.to_owned(),
             function: function.to_owned(),
@@ -3742,7 +3742,7 @@ pub(crate) fn set_native_bif_error(
         error,
         freason,
         fvalue,
-    });
+    }));
 }
 
 /// Records a BIF failure whose arguments are in the live scheduler registers.
@@ -3756,7 +3756,7 @@ pub(crate) fn set_native_bif_register_error(
 ) {
     set_light_bif_error(process, &error);
     let (freason, fvalue) = (process.header.freason, process.header.fvalue);
-    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
+    process.cold_mut().native_bif_error = Some(Box::new(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Registers {
             module,
             function,
@@ -3765,7 +3765,7 @@ pub(crate) fn set_native_bif_register_error(
         error,
         freason,
         fvalue,
-    });
+    }));
 }
 
 /// Retains the export entry; its descriptor owns the BIF MFA while X registers own the arguments.
@@ -3776,12 +3776,12 @@ fn set_native_bif_export_error(
 ) {
     set_light_bif_error(process, &error);
     let (freason, fvalue) = (process.header.freason, process.header.fvalue);
-    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
+    process.cold_mut().native_bif_error = Some(Box::new(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Export(export),
         error,
         freason,
         fvalue,
-    });
+    }));
 }
 
 fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifError) {
@@ -3818,7 +3818,7 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
     process.header.fvalue = crate::native_hooks::raw(reason);
     let freason = process.header.freason;
     let fvalue = process.header.fvalue;
-    process.cold_mut().explicit_raise = explicit.map(|trace| (freason, fvalue, trace));
+    process.cold_mut().explicit_raise = explicit.map(|trace| Box::new((freason, fvalue, trace)));
 }
 
 /// The `raise/3` list for this failure, copied back onto the heap.
@@ -3831,14 +3831,14 @@ fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
         let cold = process.cold.as_mut()?;
         let matches = cold
             .explicit_raise
-            .as_ref()
+            .as_deref()
             .is_some_and(|(freason, fvalue, _)| {
                 *freason == process.header.freason && *fvalue == process.header.fvalue
             });
         if !matches {
             return None;
         }
-        cold.explicit_raise.take().map(|(_, _, trace)| trace)?
+        cold.explicit_raise.take().map(|boxed| boxed.2)?
     };
     arinsal_term::from_owned(
         &owned,
