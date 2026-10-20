@@ -13,14 +13,16 @@ pub mod rwmtx;
 mod tree;
 mod tree_select;
 use catree::CATree;
-pub(crate) use dbterm::{DbTerm, StoredTerm};
+pub(crate) use dbterm::{
+    DbTerm, HashDbTerm, HashPrefix, PlainDbTerm, Prefix, StoredTerm, TreeDbTerm, TreePrefix,
+};
 use tree::{InsertResult, Node, TreeRoot};
 pub use tree_select::{SavedKey, ScanPosition, TREE_SELECT_ITERATIONS, TreeScanEnd, TreeScanPlan};
 
 use arinsal_term::{
-    Atom, ExternalBinary, HeapAlloc, Identity, MagicRef, Node as TermNode, Term, TermBuilder,
-    TermError, TermKind, VecHeap, WritableBinary, cmp, copy_term, exact_eq, global_atoms,
-    internal_hash, term_sequence,
+    Atom, BinaryOwner, ExternalBinary, HeapAlloc, Identity, MagicRef, Node as TermNode, Term,
+    TermBuilder, TermError, TermKind, VecHeap, WritableBinary, binary_owner, cmp, copy_term,
+    exact_eq, global_atoms, internal_hash, term_sequence,
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -35,7 +37,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(not(miri))]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use hash::{ConcurrentHashStorage, HashGarbage, HashStorage, ets_hash};
+use hash::{
+    ConcurrentHashStorage, HashGarbage, HashStorage, SourceInsertOptions, StoreOutcome, ets_hash,
+};
 
 /// Table identity. The VM can expose this as a local reference.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1029,29 +1033,71 @@ impl StoredTerm {
         pair.iter().all(|term| !term.is_pointer()).then_some(pair)
     }
 
-    fn copy(term: Term) -> Result<DbTerm, EtsError> {
+    fn copy(term: Term) -> Result<PlainDbTerm, EtsError> {
         Self::copy_heap(term)
     }
 
-    fn copy_for_table(
+    fn copy_for_table<P: Prefix>(
         term: Term,
         compressed: bool,
         keypos: usize,
         prefix_words: usize,
-    ) -> Result<DbTerm, EtsError> {
+    ) -> Result<DbTerm<P>, EtsError> {
         // Port of erts/emulator/beam/erl_db_util.c (db_store_term), OTP-29.1.1:
         // even immediate two-element objects have a table-owned tuple in their DbTerm.
         Self::copy_heap_for_table(term, compressed, keypos, prefix_words)
     }
 
-    // Port of erts/emulator/beam/erl_db_util.c (db_store_term), OTP-29.1.1: the term is sized,
-    // one block holds the DbTerm header and the words, and the term is copied into the block.
-    fn copy_heap_for_table(
+    fn copy_heap_for_table<P: Prefix>(
         term: Term,
         compressed: bool,
         keypos: usize,
         prefix_words: usize,
-    ) -> Result<DbTerm, EtsError> {
+    ) -> Result<DbTerm<P>, EtsError> {
+        let mut fresh = None;
+        Self::store_term(None, &mut fresh, term, compressed, keypos, prefix_words)?;
+        Ok(fresh.expect("a new DbTerm was built"))
+    }
+
+    /// Overwrite this object with `term`, as `replace_dbterm` does: the block is reused when
+    /// the size is unchanged, else reallocated, and the table links stay.
+    // Port of erts/emulator/beam/erl_db_hash.c (replace_dbterm) and erl_db_util.c
+    // (db_store_term with an old DbTerm), OTP-29.1.1.
+    pub(crate) fn overwrite_from_input<P: Prefix>(
+        old: &mut DbTerm<P>,
+        term: Term,
+        compressed: bool,
+        keypos: usize,
+        prefix_words: usize,
+    ) -> Result<(), EtsError> {
+        Self::store_term(Some(old), &mut None, term, compressed, keypos, prefix_words)
+    }
+
+    // Port of erts/emulator/beam/erl_db_util.c (db_store_term and db_store_term_comp),
+    // OTP-29.1.1: the term is sized, one block holds the DbTerm header and the words, and the
+    // term is copied into the block (the old one when given).
+    fn store_term<P: Prefix>(
+        old: Option<&mut DbTerm<P>>,
+        fresh: &mut Option<DbTerm<P>>,
+        term: Term,
+        compressed: bool,
+        keypos: usize,
+        prefix_words: usize,
+    ) -> Result<(), EtsError> {
+        fn store<'a, P: Prefix>(
+            old: Option<&'a mut DbTerm<P>>,
+            fresh: &'a mut Option<DbTerm<P>>,
+            nwords: usize,
+            fill: impl FnOnce(&mut dbterm::BlockHeap) -> Result<Term, EtsError>,
+        ) -> Result<&'a mut DbTerm<P>, EtsError> {
+            match old {
+                Some(old) => {
+                    dbterm::rebuild_block(old, nwords, fill)?;
+                    Ok(old)
+                }
+                None => Ok(fresh.insert(dbterm::build_block(nwords, fill)?)),
+            }
+        }
         let object = term;
         if !compressed {
             // Port of erts/emulator/beam/erl_db_util.c (db_store_term, a tuple of immediates):
@@ -1061,7 +1107,7 @@ impl StoredTerm {
                 .filter(|tuple| !tuple.is_empty() && tuple.iter().all(|e| !e.is_pointer()))
                 .map(|tuple| tuple.len() + 1);
             if let Some(size) = flat {
-                let mut block = dbterm::build_block(size, |heap| {
+                let block = store(old, fresh, size, |heap| {
                     arinsal_term::copy_flat_tuple(term, heap)
                         .unwrap_or(Err(TermError::BadArg))
                         .map_err(EtsError::from)
@@ -1069,65 +1115,89 @@ impl StoredTerm {
                 block.db_size_words = prefix_words + 2 + size;
                 block.term_size_words = size;
                 block.shallow = true;
-                return Ok(block);
+                return Ok(());
             }
             // The object is sized once; the same size serves the accounting and the copy.
             let size = arinsal_term::size_object(term);
-            let mut block = dbterm::build_block(size, |heap| {
+            let block = store(old, fresh, size, |heap| {
                 arinsal_term::copy_struct(term, heap, size).map_err(EtsError::from)
             })?;
             block.db_size_words = prefix_words + 2 + size;
             block.term_size_words = size;
             block.shallow = block.off_heap.is_none()
                 && arinsal_term::shallow_copyable(block.term, &block.words);
-            return Ok(block);
+            return Ok(());
         }
-        // Port of erts/emulator/beam/erl_db_util.c (copy_to_comp), OTP-29.1.1.
+        // Port of erts/emulator/beam/erl_db_util.c (copy_to_comp), OTP-29.1.1. Everything that
+        // can fail is done before the old block is touched.
         let tuple = term_sequence(term).ok_or(EtsError::BadArg)?;
-        let eligible = |index: usize, element: Term| {
-            index != keypos - 1 && element.is_pointer() && element.classify() != TermKind::Bitstring
-        };
-        // The block holds the stored tuple and the copies of the uncompressed elements; a magic
-        // reference is copied once more for the owner link, as the heap accounting always did.
-        let nwords = 1
-            + tuple.len()
-            + tuple
-                .iter()
-                .enumerate()
-                .map(|(index, &element)| {
-                    if !eligible(index, element) || element.is_magic_ref() {
-                        arinsal_term::size_object(element)
-                    } else {
-                        0
-                    }
-                })
-                .sum::<usize>();
-        let mut compressed_elements = Vec::new();
-        let mut compressed_magic_refs = Vec::new();
+        let mut compressed_elements = Vec::with_capacity(tuple.len());
+        let mut compressed_magic_refs = Vec::with_capacity(tuple.len());
+        let mut compressed_magic_copies = Vec::with_capacity(tuple.len());
         let mut compressed_bytes = 0;
-        let mut block = dbterm::build_block(nwords, |heap| {
-            let mut elements = Vec::with_capacity(tuple.len());
-            for (index, &element) in tuple.iter().enumerate() {
-                if eligible(index, element) {
-                    if element.is_magic_ref() {
-                        // Compressed bytes carry the reference identity, while ETS must retain
+        // The block holds the stored tuple and the copies of the uncompressed elements; a
+        // magic reference is copied once more for the owner link.
+        let mut nwords = 1 + tuple.len();
+        for (index, &element) in tuple.iter().enumerate() {
+            if index != keypos - 1 && element.is_pointer() {
+                if element.classify() == TermKind::Bitstring
+                    && let Some(owner) = binary_owner(element)
+                {
+                    // Port of erts/emulator/beam/external.c (erts_encode_ext_ets), OTP-29.1.1:
+                    // ETS compression stores an internal BinRef for a refc binary. The byte
+                    // area holds the tag and the BinRef, plus an ErlSubBits when the term is
+                    // a view that does not cover the whole binary.
+                    let owned = arinsal_term::to_owned(element)?;
+                    let whole_binary = match &owned {
+                        arinsal_etf::OwnedTerm::Binary(bytes) => {
+                            let owner_bytes = match &owner {
+                                BinaryOwner::Binary(binary) => binary.capacity().unwrap_or(0),
+                                BinaryOwner::External(binary) => binary.len(),
+                            };
+                            bytes.len() == owner_bytes
+                        }
+                        _ => false,
+                    };
+                    compressed_bytes +=
+                        1 + std::mem::size_of::<usize>() * (3 + if whole_binary { 0 } else { 5 });
+                    nwords += arinsal_term::size_object(element);
+                    compressed_elements.push(None);
+                    compressed_magic_refs.push(None);
+                    compressed_magic_copies.push(false);
+                } else {
+                    let magic = element.is_magic_ref();
+                    if magic {
+                        // Compressed bytes carry the reference identity, while ETS retains
                         // its magic owner until the stored row is deleted.
-                        copy_term(element, heap)?;
+                        nwords += arinsal_term::size_object(element);
+                        compressed_magic_refs.push(element.magic_owner());
+                    } else {
+                        compressed_magic_refs.push(None);
                     }
-                    compressed_magic_refs.push(element.magic_owner());
                     let owned = arinsal_term::to_owned(element)?;
                     let ext = arinsal_etf::encode(&owned, arinsal_etf::EncodeOptions::default());
                     let mut ext = ets_external_atoms(&ext, true)?;
                     ext.remove(0);
                     compressed_bytes += ext.len();
                     compressed_elements.push(Some(ext));
+                    compressed_magic_copies.push(magic);
+                }
+            } else {
+                nwords += arinsal_term::size_object(element);
+                compressed_elements.push(None);
+                compressed_magic_refs.push(None);
+                compressed_magic_copies.push(false);
+            }
+        }
+        let block = store(old, fresh, nwords, |heap| {
+            let mut elements = Vec::with_capacity(tuple.len());
+            for (index, &element) in tuple.iter().enumerate() {
+                if compressed_elements[index].is_some() {
+                    if compressed_magic_copies[index] {
+                        copy_term(element, heap)?;
+                    }
                     elements.push(Term::NIL);
                 } else {
-                    compressed_magic_refs.push(None);
-                    // Port of erts/emulator/beam/erl_db_util.c,
-                    // OTP-29.1.1: ETS external encoding keeps binary refs on
-                    // the object's off-heap chain.
-                    compressed_elements.push(None);
                     elements.push(copy_term(element, heap)?);
                 }
             }
@@ -1147,14 +1217,14 @@ impl StoredTerm {
             magic_refs: compressed_magic_refs,
             bytes: compressed_bytes,
         }));
-        Ok(block)
+        Ok(())
     }
 
-    fn copy_heap(term: Term) -> Result<DbTerm, EtsError> {
+    fn copy_heap<P: Prefix>(term: Term) -> Result<DbTerm<P>, EtsError> {
         Self::copy_heap_for_table(term, false, 1, 1)
     }
 
-    pub(crate) fn copy_stored(&self) -> Result<DbTerm, EtsError> {
+    pub(crate) fn copy_stored<P: Prefix>(&self) -> Result<DbTerm<P>, EtsError> {
         if self.compressed_elements().iter().any(Option::is_some) {
             let mut copy = Self::copy_heap(self.term)?;
             copy.compressed = self.compressed.as_ref().map(|c| {
@@ -1175,9 +1245,6 @@ impl StoredTerm {
             copy.off_heap.is_none() && arinsal_term::shallow_copyable(copy.term, &copy.words);
         copy.db_size_words = self.db_size_words;
         copy.term_size_words = size;
-        copy.order = self.order;
-        copy.group_order = self.group_order;
-        copy.hvalue = self.hvalue;
         Ok(copy)
     }
 
@@ -1222,15 +1289,14 @@ impl StoredTerm {
         if !self.compressed_elements().is_empty() || !self.term.is_pointer() {
             return false;
         }
-        // The tuple lives in this object's own block: find its word by address.
-        let header = (self.term.tagged_word() & !7) as usize;
-        let word = header + (index + 1) * 8;
-        let start = self.words.as_ptr() as usize;
-        if (start..start + self.words.len() * 8).contains(&word) {
-            self.words[(word - start) / 8] = value.tagged_word();
-            return true;
+        // The tuple heads this object's own block, so element `index` is word `index + 1`.
+        if self.term.tagged_word() & !7 != self.words.as_ptr() as u64
+            || index + 1 >= self.words.len()
+        {
+            return false;
         }
-        false
+        self.words[index + 1] = value.tagged_word();
+        true
     }
 
     fn tuple_element(&self, index: usize) -> Option<Term> {
@@ -1884,9 +1950,9 @@ fn select_range_constant<H: HeapAlloc>(
     let below = state.bounds.is_below(key);
     let above = state.bounds.is_above(key);
     let (first, second) = if state.reverse {
-        (&node.right, &node.next)
+        (&node.prefix.right, &node.prefix.left)
     } else {
-        (&node.next, &node.right)
+        (&node.prefix.left, &node.prefix.right)
     };
     if if state.reverse { !above } else { !below } {
         select_range_constant(first, state)?;
@@ -1914,8 +1980,70 @@ enum Storage {
 
 /// An object already copied into table-owned storage, ready for `Table::insert_prepared`.
 pub struct PreparedObject {
-    stored: DbTerm,
+    stored: StoredObject,
     hash: u64,
+}
+
+/// A copied object in the form of the table type it was made for: `HashDbTerm` or `TreeDbTerm`.
+pub(crate) enum StoredObject {
+    Hash(HashDbTerm),
+    Tree(TreeDbTerm),
+}
+
+impl StoredObject {
+    /// Copy `term` for a table with these options (`new_dbterm`).
+    fn make(options: &TableOptions, term: Term) -> Result<Self, EtsError> {
+        let prefix_words = if options.table_type == TableType::OrderedSet {
+            3
+        } else {
+            2
+        };
+        Self::make_with_prefix(options, term, prefix_words)
+    }
+
+    fn make_with_prefix(
+        options: &TableOptions,
+        term: Term,
+        prefix_words: usize,
+    ) -> Result<Self, EtsError> {
+        let (compressed, keypos) = (options.compressed, options.keypos);
+        Ok(if options.table_type == TableType::OrderedSet {
+            Self::Tree(StoredTerm::copy_for_table(
+                term,
+                compressed,
+                keypos,
+                prefix_words,
+            )?)
+        } else {
+            Self::Hash(StoredTerm::copy_for_table(
+                term,
+                compressed,
+                keypos,
+                prefix_words,
+            )?)
+        })
+    }
+
+    fn key(&self, keypos: usize) -> Term {
+        match self {
+            Self::Hash(object) => object.key(keypos),
+            Self::Tree(object) => object.key(keypos),
+        }
+    }
+
+    fn hash_object(self) -> HashDbTerm {
+        match self {
+            Self::Hash(object) => object,
+            Self::Tree(_) => unreachable!("a hash table gets hash objects"),
+        }
+    }
+
+    fn tree_object(self) -> TreeDbTerm {
+        match self {
+            Self::Tree(object) => object,
+            Self::Hash(_) => unreachable!("a tree table gets tree objects"),
+        }
+    }
 }
 
 /// One ETS table, with table-owned object heaps.
@@ -1928,10 +2056,10 @@ pub struct Table {
     pub options: TableOptions,
     storage: Storage,
     fixed: usize,
-    fixed_system_time: Option<DbTerm>,
-    fixed_monotonic_time: Option<DbTerm>,
-    fixed_processes: Vec<(DbTerm, usize)>,
-    _heir_data: Option<DbTerm>,
+    fixed_system_time: Option<PlainDbTerm>,
+    fixed_monotonic_time: Option<PlainDbTerm>,
+    fixed_processes: Vec<(PlainDbTerm, usize)>,
+    _heir_data: Option<PlainDbTerm>,
     counter_results: Option<Box<VecHeap>>,
     /// Set once the registry has detached the table (`ets:delete/1`); cached handles to it
     /// must then fail like a deleted table.
@@ -2045,7 +2173,7 @@ impl Table {
     #[doc(hidden)]
     pub fn avl_invariants_hold(&self) -> bool {
         match &self.storage {
-            Storage::Ordered(root) => Node::validate(root),
+            Storage::Ordered(root) => Node::validate_links(root) == Some(root.count()),
             Storage::CATree(tree) => tree.validate(),
             Storage::Hash(_) => true,
         }
@@ -2438,17 +2566,60 @@ impl Table {
     ) -> Result<PreparedObject, EtsError> {
         let key = key_of(object, options.keypos)?;
         let hash = ets_hash(key);
-        let stored = StoredTerm::copy_for_table(
-            object,
-            options.compressed,
-            options.keypos,
-            if options.table_type == TableType::OrderedSet {
-                3
-            } else {
-                2
-            },
-        )?;
+        let stored = StoredObject::make(options, object)?;
         Ok(PreparedObject { stored, hash })
+    }
+
+    fn source_insert_options(&self, new_only: bool) -> SourceInsertOptions {
+        SourceInsertOptions {
+            table_type: self.options.table_type,
+            keypos: self.options.keypos,
+            compressed: self.options.compressed,
+            prefix_words: 2,
+            fixed: self.fixed > 0,
+            new_only,
+        }
+    }
+
+    /// Insert one live source term into a hash or CA-tree table under its bucket or base-node
+    /// lock, so that an overwrite reuses the existing DbTerm block.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_put_hash) and erl_db_catree.c
+    // (db_put_catree), OTP-29.1.1.
+    pub fn insert_term_shared(&self, object: Term, new_only: bool) -> Result<bool, EtsError> {
+        let key = key_of(object, self.options.keypos)?;
+        match &self.storage {
+            Storage::Hash(storage) => storage.insert_term_shared(
+                object,
+                key,
+                ets_hash(key),
+                self.source_insert_options(new_only),
+            ),
+            Storage::CATree(tree) => {
+                tree.insert_term(object, key, self.options.compressed, new_only)
+            }
+            Storage::Ordered(_) => Err(EtsError::BadArg),
+        }
+    }
+
+    /// Insert one source term under the table's exclusive lock, reusing an overwritten block as
+    /// erts' `db_put_*` do.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_put_hash) and erl_db_tree.c
+    // (db_put_tree_common), OTP-29.1.1.
+    pub fn insert_term(&mut self, object: Term, new_only: bool) -> Result<bool, EtsError> {
+        let key = key_of(object, self.options.keypos)?;
+        let options = self.source_insert_options(new_only);
+        let keypos = self.options.keypos;
+        let compressed = self.options.compressed;
+        match &mut self.storage {
+            Storage::Hash(storage) => {
+                storage.insert_term_exclusive(object, key, ets_hash(key), options)
+            }
+            Storage::Ordered(root) => {
+                let (result, _) = root.put_term(object, key, keypos, compressed, new_only)?;
+                Ok(!matches!(result, InsertResult::Exists))
+            }
+            Storage::CATree(tree) => tree.insert_term(object, key, compressed, new_only),
+        }
     }
 
     /// Validate an object for this table without copying it into table storage.
@@ -2470,14 +2641,14 @@ impl Table {
     pub fn insert_shared(&self, prepared: PreparedObject) -> Option<PreparedObject> {
         match &self.storage {
             Storage::CATree(tree) => {
-                tree.insert(prepared.stored);
+                tree.insert(prepared.stored.tree_object());
                 None
             }
             Storage::Hash(storage)
                 if self.options.write_concurrency != WriteConcurrency::Disabled =>
             {
                 storage.insert_shared(
-                    prepared.stored,
+                    prepared.stored.hash_object(),
                     prepared.hash,
                     self.options.table_type,
                     self.options.keypos,
@@ -2564,7 +2735,7 @@ impl Table {
             self.fixed > 0,
             |found| {
                 let mut heap = ObjectHeap::new();
-                let mut values = if let Some(found) = found {
+                let mut values = if let Some(found) = found.as_deref() {
                     let current = found.term_for_filter(&mut heap)?;
                     // SAFETY: `current` is owned by `heap` until the replacement is copied.
                     let tuple = unsafe { current.tuple_ref() }.ok_or(EtsError::BadArg)?;
@@ -2611,14 +2782,25 @@ impl Table {
                     returned.push(copy_term(next, dst)?);
                 }
                 let tuple = TermBuilder::new(&mut heap).tuple(&values)?;
-                let replacement = StoredTerm::copy_for_table(
-                    tuple,
-                    self.options.compressed,
-                    self.options.keypos,
-                    2,
-                )?;
                 results = Some(returned);
-                Ok(Some(replacement))
+                match found {
+                    Some(found) => {
+                        StoredTerm::overwrite_from_input(
+                            found,
+                            tuple,
+                            self.options.compressed,
+                            self.options.keypos,
+                            2,
+                        )?;
+                        Ok(StoreOutcome::InPlace)
+                    }
+                    None => Ok(StoreOutcome::New(StoredTerm::copy_for_table(
+                        tuple,
+                        self.options.compressed,
+                        self.options.keypos,
+                        2,
+                    )?)),
+                }
             },
         )?;
         Ok(changed.then(|| results.unwrap_or_default()))
@@ -2651,7 +2833,7 @@ impl Table {
     pub fn insert_new_prepared(&mut self, prepared: PreparedObject) -> bool {
         if let Storage::Hash(storage) = &mut self.storage {
             return storage.insert_exclusive(
-                prepared.stored,
+                prepared.stored.hash_object(),
                 prepared.hash,
                 self.options.table_type,
                 self.options.keypos,
@@ -2662,10 +2844,15 @@ impl Table {
         match &mut self.storage {
             Storage::Ordered(root) => {
                 let key = prepared.stored.key(self.options.keypos);
-                let result = root.insert_with_key(prepared.stored, key, self.options.keypos, true);
+                let result = root.insert_with_key(
+                    prepared.stored.tree_object(),
+                    key,
+                    self.options.keypos,
+                    true,
+                );
                 matches!(result, InsertResult::Inserted)
             }
-            Storage::CATree(tree) => tree.insert_new(prepared.stored),
+            Storage::CATree(tree) => tree.insert_new(prepared.stored.tree_object()),
             Storage::Hash(_) => unreachable!("hash storage handled above"),
         }
     }
@@ -2676,14 +2863,14 @@ impl Table {
     pub fn insert_new_prepared_shared(&self, prepared: PreparedObject) -> Result<bool, EtsError> {
         match &self.storage {
             Storage::Hash(storage) => Ok(storage.insert_shared(
-                prepared.stored,
+                prepared.stored.hash_object(),
                 prepared.hash,
                 self.options.table_type,
                 self.options.keypos,
                 self.fixed > 0,
                 true,
             )),
-            Storage::CATree(tree) => Ok(tree.insert_new(prepared.stored)),
+            Storage::CATree(tree) => Ok(tree.insert_new(prepared.stored.tree_object())),
             Storage::Ordered(_) => Err(EtsError::BadArg),
         }
     }
@@ -2691,22 +2878,7 @@ impl Table {
     /// Insert one or several objects. Validation and copying finish before mutation.
     pub fn insert(&mut self, objects: &[Term]) -> Result<(), EtsError> {
         if let [object] = objects {
-            let key = key_of(*object, self.options.keypos)?;
-            let hash = ets_hash(key);
-            self.put_hashed(
-                StoredTerm::copy_for_table(
-                    *object,
-                    self.options.compressed,
-                    self.options.keypos,
-                    if self.options.table_type == TableType::OrderedSet {
-                        3
-                    } else {
-                        2
-                    },
-                )?,
-                hash,
-                false,
-            );
+            self.insert_term(*object, false)?;
             return Ok(());
         }
         for &object in objects {
@@ -2714,47 +2886,34 @@ impl Table {
         }
         for &object in objects {
             let hash = ets_hash(key_of(object, self.options.keypos)?);
-            self.put_hashed(
-                StoredTerm::copy_for_table(
-                    object,
-                    self.options.compressed,
-                    self.options.keypos,
-                    if self.options.table_type == TableType::OrderedSet {
-                        3
-                    } else {
-                        2
-                    },
-                )?,
-                hash,
-                false,
-            );
+            self.put_hashed(StoredObject::make(&self.options, object)?, hash, false);
         }
         Ok(())
     }
 
-    fn put(&mut self, object: DbTerm) {
+    fn put(&mut self, object: StoredObject) {
         let hash = ets_hash(object.key(self.options.keypos));
         self.put_hashed(object, hash, false);
     }
 
-    fn put_hashed(&mut self, object: DbTerm, hash: u64, new_only: bool) {
+    fn put_hashed(&mut self, object: StoredObject, hash: u64, new_only: bool) {
         let _ = self.put_hashed_counted(object, hash, new_only);
     }
 
-    fn put_hashed_counted(&mut self, object: DbTerm, hash: u64, new_only: bool) -> usize {
+    fn put_hashed_counted(&mut self, object: StoredObject, hash: u64, new_only: bool) -> usize {
         let keypos = self.options.keypos;
         match &mut self.storage {
             Storage::Ordered(root) => {
-                root.insert(object, keypos);
+                root.insert(object.tree_object(), keypos);
                 0
             }
             Storage::CATree(tree) => {
-                tree.insert(object);
+                tree.insert(object.tree_object());
                 0
             }
             Storage::Hash(storage) => {
                 let (accepted, extra_reds) = storage.insert_exclusive_counted(
-                    object,
+                    object.hash_object(),
                     hash,
                     self.options.table_type,
                     keypos,
@@ -2959,8 +3118,7 @@ impl Table {
     fn insert_new_mode(&mut self, objects: &[Term], single: bool) -> Result<bool, EtsError> {
         // Port of erts/emulator/beam/erl_db.c (ets_insert_new_2), OTP-29.1.1.
         if single {
-            let prepared = Self::prepare_object(&self.options, objects[0])?;
-            return Ok(self.insert_new_prepared(prepared));
+            return self.insert_term(objects[0], true);
         }
         for &object in objects {
             key_of(object, self.options.keypos)?;
@@ -2972,16 +3130,7 @@ impl Table {
         }
         let mut prepared = Vec::with_capacity(objects.len());
         for &object in objects {
-            prepared.push(StoredTerm::copy_for_table(
-                object,
-                self.options.compressed,
-                self.options.keypos,
-                if self.options.table_type == TableType::OrderedSet {
-                    3
-                } else {
-                    2
-                },
-            )?);
+            prepared.push(StoredObject::make(&self.options, object)?);
         }
         for object in prepared {
             let hash = ets_hash(object.key(self.options.keypos));
@@ -3014,7 +3163,7 @@ impl Table {
                 let hash = ets_hash(key);
                 storage.with_objects_hash(hash, |objects| {
                     for node in objects {
-                        if node.hvalue == (hash >> 1)
+                        if node.prefix.hvalue == (hash >> 1)
                             && exact_eq(node.key(self.options.keypos), key)
                         {
                             visit(node)?;
@@ -3052,7 +3201,8 @@ impl Table {
                 let hash = ets_hash(key);
                 storage.with_objects_hash(hash, |objects| {
                     if let Some(node) = objects.into_iter().find(|node| {
-                        node.hvalue == (hash >> 1) && exact_eq(node.key(self.options.keypos), key)
+                        node.prefix.hvalue == (hash >> 1)
+                            && exact_eq(node.key(self.options.keypos), key)
                     }) {
                         visit(node)?;
                         found = true;
@@ -3112,7 +3262,7 @@ impl Table {
                 storage.with_objects_hash_at(hash, group, |objects| {
                     let mut list = Term::NIL;
                     for object in objects {
-                        if object.hvalue == (hash >> 1)
+                        if object.prefix.hvalue == (hash >> 1)
                             && exact_eq(object.key(self.options.keypos), key)
                         {
                             let copied = object.copy_out(dst)?;
@@ -3153,7 +3303,7 @@ impl Table {
                 storage.with_objects_hash_at(hash, group, |mut objects| {
                     objects
                         .find(|object| {
-                            object.hvalue == (hash >> 1)
+                            object.prefix.hvalue == (hash >> 1)
                                 && exact_eq(object.key(self.options.keypos), key)
                         })
                         .map(|object| object.copy_out(dst))
@@ -3192,7 +3342,7 @@ impl Table {
                 let first = objects.len();
                 storage.with_objects_hash(hash, |bucket| {
                     for object in bucket {
-                        if object.hvalue == (hash >> 1)
+                        if object.prefix.hvalue == (hash >> 1)
                             && exact_eq(object.key(self.options.keypos), key)
                         {
                             objects.push(object.copy_out(dst)?);
@@ -3221,7 +3371,8 @@ impl Table {
             Storage::Ordered(root) => Node::get(root, key, self.options.keypos).is_some(),
             Storage::Hash(storage) => storage.with_objects_hash_at(hash, group, |objects| {
                 objects.into_iter().any(|object| {
-                    object.hvalue == (hash >> 1) && exact_eq(object.key(self.options.keypos), key)
+                    object.prefix.hvalue == (hash >> 1)
+                        && exact_eq(object.key(self.options.keypos), key)
                 })
             }),
             Storage::CATree(tree) => tree.member_at(key, group),
@@ -3290,7 +3441,9 @@ impl Table {
         let mut found = false;
         storage.with_objects_hash_at(hash, group, |objects| {
             for object in objects {
-                if object.hvalue == (hash >> 1) && exact_eq(object.key(self.options.keypos), key) {
+                if object.prefix.hvalue == (hash >> 1)
+                    && exact_eq(object.key(self.options.keypos), key)
+                {
                     found = true;
                     let element = object.copy_element_out(position - 1, dst)?;
                     list = TermBuilder::new(dst).cons(element, list)?;
@@ -3335,7 +3488,7 @@ impl Table {
                 storage.with_objects_hash_at(hash, group, |mut objects| {
                     objects
                         .find(|object| {
-                            object.hvalue == hash >> 1
+                            object.prefix.hvalue == hash >> 1
                                 && exact_eq(object.key(self.options.keypos), key)
                         })
                         .ok_or(EtsError::BadArgCause("badkey"))?
@@ -3538,7 +3691,7 @@ impl Table {
                 let hash = ets_hash(key);
                 storage.with_raw_objects_hash(hash, |objects| {
                     for object in objects {
-                        if object.hvalue == hash >> 1
+                        if object.prefix.hvalue == hash >> 1
                             && exact_eq(object.key(self.options.keypos), key)
                         {
                             binaries.extend(object.refc_binaries(dst)?);
@@ -3638,9 +3791,9 @@ impl Table {
             let current_key = current.key(self.options.keypos);
             if cmp_ordered_key(key, current_key) == Ordering::Less {
                 candidate = Some(current_key);
-                node = current.next.as_deref();
+                node = current.prefix.left.as_deref();
             } else {
-                node = current.right.as_deref();
+                node = current.prefix.right.as_deref();
             }
         }
         candidate.map(|key| Ok(copy_term(key, dst)?)).transpose()
@@ -3687,9 +3840,9 @@ impl Table {
             let current_key = current.key(self.options.keypos);
             if cmp_ordered_key(key, current_key) == Ordering::Greater {
                 candidate = Some(current_key);
-                node = current.right.as_deref();
+                node = current.prefix.right.as_deref();
             } else {
-                node = current.next.as_deref();
+                node = current.prefix.left.as_deref();
             }
         }
         candidate.map(|key| Ok(copy_term(key, dst)?)).transpose()
@@ -3708,14 +3861,15 @@ impl Table {
                 .with_first_from_slot(0, |object| copy_term(object.key(self.options.keypos), dst))
                 .transpose()?);
         };
+        root.prime_stack(last);
         let mut node = root.link().as_deref();
         let mut found = None;
         while let Some(current) = node {
             found = Some(current.key(self.options.keypos));
             node = if last {
-                current.right.as_deref()
+                current.prefix.right.as_deref()
             } else {
-                current.next.as_deref()
+                current.prefix.left.as_deref()
             };
         }
         found.map(|key| Ok(copy_term(key, dst)?)).transpose()
@@ -3973,15 +4127,15 @@ impl Table {
             ets_hash(key),
             self.options.keypos,
             self.fixed > 0,
-            |found| {
-                let mut values = if let Some(found) = found {
+            |mut found| {
+                let mut values = if let Some(found) = found.as_deref() {
                     (0..found.arity())
                         .map(|index| found.copy_element_out(index, &mut heap))
                         .collect::<Result<Vec<_>, _>>()?
                 } else if let Some(default) = default {
                     self.default_object(key, default, &mut heap)?
                 } else {
-                    return Ok(None);
+                    return Ok(StoreOutcome::Nothing);
                 };
                 for update in updates {
                     let Some((position, _)) = *update else {
@@ -3994,16 +4148,45 @@ impl Table {
                         return Err(EtsError::BadArgCause("position"));
                     }
                 }
+                // Port of erts/emulator/beam/erl_db_util.c (db_do_update_element: an immediate
+                // over an immediate is written into the stored tuple).
+                if let Some(found) = found.as_deref_mut() {
+                    let in_place = updates.iter().flatten().all(|&(position, value)| {
+                        !value.is_pointer()
+                            && found
+                                .tuple_element(position - 1)
+                                .is_some_and(|e| !e.is_pointer())
+                    }) && found.compressed_elements().is_empty();
+                    if in_place {
+                        for &(position, value) in updates.iter().flatten() {
+                            let written = found.set_immediate_element(position - 1, value);
+                            debug_assert!(written);
+                        }
+                        return Ok(StoreOutcome::InPlace);
+                    }
+                }
                 for &(position, value) in updates.iter().flatten() {
                     values[position - 1] = copy_term(value, &mut heap)?;
                 }
                 let tuple = TermBuilder::new(&mut heap).tuple(&values)?;
-                Ok(Some(StoredTerm::copy_for_table(
-                    tuple,
-                    self.options.compressed,
-                    self.options.keypos,
-                    2,
-                )?))
+                match found {
+                    Some(found) => {
+                        StoredTerm::overwrite_from_input(
+                            found,
+                            tuple,
+                            self.options.compressed,
+                            self.options.keypos,
+                            2,
+                        )?;
+                        Ok(StoreOutcome::InPlace)
+                    }
+                    None => Ok(StoreOutcome::New(StoredTerm::copy_for_table(
+                        tuple,
+                        self.options.compressed,
+                        self.options.keypos,
+                        2,
+                    )?)),
+                }
             },
         )
     }
@@ -4837,10 +5020,9 @@ impl Table {
             let Some(replacement) = program.run(object, &mut heap)? else {
                 continue;
             };
-            replacements.push(StoredTerm::copy_for_table(
+            replacements.push(StoredObject::make_with_prefix(
+                &self.options,
                 replacement,
-                compressed,
-                keypos,
                 3,
             )?);
         }
@@ -4874,7 +5056,7 @@ impl Table {
             let mut heap = VecHeap::new();
             let current = object.copy_out(&mut heap)?;
             let Some(replacement) = program.run(current, &mut heap)? else {
-                return Ok::<Option<DbTerm>, EtsError>(None);
+                return Ok::<Option<HashDbTerm>, EtsError>(None);
             };
             let replacement = StoredTerm::copy_for_table(replacement, compressed, keypos, 2)?;
             Ok(Some(replacement))
@@ -4892,7 +5074,7 @@ enum GarbageKind {
     /// A fixed hash table whose objects are being pseudo-deleted, from `slot` on.
     Mark { slot: usize },
     /// Tree nodes still to be freed.
-    Tree(Vec<DbTerm>),
+    Tree(Vec<TreeDbTerm>),
 }
 
 impl Garbage {
@@ -4913,8 +5095,8 @@ impl Garbage {
             GarbageKind::Mark { .. } => true,
             GarbageKind::Tree(stack) => {
                 while let Some(mut node) = stack.pop() {
-                    stack.extend(node.next.take());
-                    stack.extend(node.right.take());
+                    stack.extend(node.prefix.left.take());
+                    stack.extend(node.prefix.right.take());
                     drop(node);
                     *reds -= 1;
                     if *reds < 0 {
@@ -5568,7 +5750,7 @@ pub struct ConcurrentTable {
     multi_epoch: AtomicU64,
     concurrent_catree: Option<CATree>,
     concurrent_hash: Option<ConcurrentHashStorage>,
-    _heir_data: Option<DbTerm>,
+    _heir_data: Option<PlainDbTerm>,
 }
 
 // The fast slots own integer pairs directly. A writer holds `table` and marks
@@ -5816,12 +5998,7 @@ impl ConcurrentTable {
         }
         if let Some(storage) = &self.concurrent_hash {
             storage.insert(
-                StoredTerm::copy_for_table(
-                    object,
-                    self.options.compressed,
-                    self.options.keypos,
-                    2,
-                )?,
+                StoredObject::make_with_prefix(&self.options, object, 2)?.hash_object(),
                 ets_hash(key),
                 self.options.table_type,
                 self.options.keypos,
@@ -5836,12 +6013,7 @@ impl ConcurrentTable {
             None
         };
         let prepared = if pair.is_none() {
-            Some(StoredTerm::copy_for_table(
-                object,
-                self.options.compressed,
-                self.options.keypos,
-                2,
-            )?)
+            Some(StoredObject::make_with_prefix(&self.options, object, 2)?)
         } else {
             None
         };
@@ -5854,14 +6026,7 @@ impl ConcurrentTable {
             let hash = ets_hash(key);
             prepared
                 .map_or_else(
-                    || {
-                        StoredTerm::copy_for_table(
-                            object,
-                            self.options.compressed,
-                            self.options.keypos,
-                            2,
-                        )
-                    },
+                    || StoredObject::make_with_prefix(&self.options, object, 2),
                     Ok,
                 )
                 .map(|object| {
@@ -5900,17 +6065,17 @@ impl ConcurrentTable {
                 .iter()
                 .map(|&object| {
                     key_of(object, self.options.keypos)?;
-                    StoredTerm::copy_for_table(
-                        object,
-                        self.options.compressed,
-                        self.options.keypos,
-                        2,
-                    )
+                    StoredObject::make_with_prefix(&self.options, object, 2)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for object in prepared {
                 let hash = ets_hash(object.key(self.options.keypos));
-                storage.insert(object, hash, self.options.table_type, self.options.keypos);
+                storage.insert(
+                    object.hash_object(),
+                    hash,
+                    self.options.table_type,
+                    self.options.keypos,
+                );
             }
             return Ok(());
         }
@@ -5922,12 +6087,7 @@ impl ConcurrentTable {
                     (self.options.table_type == TableType::Set)
                         .then(|| Self::pair(object, self.options.keypos))
                         .flatten(),
-                    StoredTerm::copy_for_table(
-                        object,
-                        self.options.compressed,
-                        self.options.keypos,
-                        2,
-                    )?,
+                    StoredObject::make_with_prefix(&self.options, object, 2)?,
                 ))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -6157,7 +6317,7 @@ mod stored_size_tests {
                 Term::small(1).unwrap(),
             ])
             .unwrap();
-        let stored = StoredTerm::copy_for_table(object, true, 2, 1).unwrap();
+        let stored = StoredTerm::copy_for_table::<()>(object, true, 2, 1).unwrap();
         let mut out = ObjectHeap::new();
         let copy = stored.copy_out(&mut out).unwrap();
         let reserved: usize = out.words.iter().map(|words| words.len()).sum();
@@ -6234,7 +6394,7 @@ mod stored_size_tests {
             .export_fun(Arc::new(ExportEntry::new(module, function, 1)))
             .unwrap());
         for (name, object, shallow) in cases {
-            let stored = StoredTerm::copy_for_table(object, false, 1, 1).unwrap();
+            let stored = StoredTerm::copy_for_table::<()>(object, false, 1, 1).unwrap();
             assert_eq!(stored.shallow, shallow, "{name}: shallow flag");
             let mut out = VecHeap::new();
             let copy = stored.copy_out(&mut out).unwrap();

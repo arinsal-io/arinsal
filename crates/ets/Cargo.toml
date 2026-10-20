@@ -13,6 +13,7 @@ workspace = true
 arc-swap = "1.9.2"
 parking_lot = "0.12.5"
 smallvec = { version = "1.15.1", features = ["const_generics"] }
+arinsal-alloc = { path = "../alloc" }
 arinsal-term.workspace = true
 arinsal-etf.workspace = true
 arinsal-maps.workspace = true

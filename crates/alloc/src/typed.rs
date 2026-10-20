@@ -694,6 +694,8 @@ fn heap_type_tag(allocation_type: ErtsAlcType) -> u64 {
         2
     } else if allocation_type == ErtsAlcType::HEAP_FRAG {
         3
+    } else if allocation_type == ErtsAlcType::DB_TERM {
+        4
     } else {
         0
     }
@@ -703,6 +705,7 @@ fn heap_type_from_tag(tag: u64) -> ErtsAlcType {
     match tag {
         2 => ErtsAlcType::OLD_HEAP,
         3 => ErtsAlcType::HEAP_FRAG,
+        4 => ErtsAlcType::DB_TERM,
         _ => ErtsAlcType::HEAP,
     }
 }

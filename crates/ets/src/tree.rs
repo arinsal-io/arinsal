@@ -1,7 +1,8 @@
-use super::{DbTerm, EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, cmp};
+use super::{EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, TreeDbTerm, cmp};
 pub(super) use crate::dbterm::InsertResult;
 use crate::dbterm::{
     DbTreeStack, Link, SlotSearch, join_trees, slot_search, split_tree, tree_insert, tree_linkout,
+    tree_put,
 };
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -64,7 +65,7 @@ impl TreeRoot {
         &self.root
     }
 
-    /// `NITEMS` of the tree.
+    /// `NITEMS` of a plain tree table. CA-tree base nodes do not keep it.
     pub(super) fn count(&self) -> usize {
         self.nitems
     }
@@ -76,7 +77,7 @@ impl TreeRoot {
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
-    pub(super) fn insert(&mut self, object: DbTerm, keypos: usize) {
+    pub(super) fn insert(&mut self, object: TreeDbTerm, keypos: usize) {
         let key = object.key(keypos);
         self.insert_with_key(object, key, keypos, false);
     }
@@ -86,7 +87,7 @@ impl TreeRoot {
     // Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
     pub(super) fn insert_with_key(
         &mut self,
-        object: DbTerm,
+        object: TreeDbTerm,
         key: Term,
         keypos: usize,
         key_clash_fail: bool,
@@ -94,14 +95,53 @@ impl TreeRoot {
         self.version += 1;
         let result = tree_insert(&mut self.root, object, key, keypos, key_clash_fail);
         if matches!(result, InsertResult::Inserted) {
-            self.nitems += 1;
+            self.nitems = self.nitems.wrapping_add(1);
         }
         result
     }
 
+    /// Store the source object `term` under `key` in place, as `db_put_tree_common` does: an
+    /// equal key's block is reused (`replace_dbterm`), a new key gets a new block. Returns the
+    /// outcome and the accounting size of the stored object.
+    // Port of erts/emulator/beam/erl_db_tree.c (db_put_tree_common), OTP-29.1.1.
+    pub(super) fn put_term(
+        &mut self,
+        term: Term,
+        key: Term,
+        keypos: usize,
+        compressed: bool,
+        key_clash_fail: bool,
+    ) -> Result<(InsertResult, usize), EtsError> {
+        const PREFIX_WORDS: usize = 3;
+        self.version += 1;
+        let mut new_words = 0;
+        let result = tree_put(
+            &mut self.root,
+            key,
+            keypos,
+            key_clash_fail,
+            |old| match old {
+                Some(old) => {
+                    StoredTerm::overwrite_from_input(old, term, compressed, keypos, PREFIX_WORDS)?;
+                    new_words = old.db_size_words;
+                    Ok(None)
+                }
+                None => {
+                    let new = StoredTerm::copy_for_table(term, compressed, keypos, PREFIX_WORDS)?;
+                    new_words = new.db_size_words;
+                    Ok(Some(new))
+                }
+            },
+        )?;
+        if matches!(result, InsertResult::Inserted) {
+            self.nitems = self.nitems.wrapping_add(1);
+        }
+        Ok((result, new_words))
+    }
+
     /// Unlink the object with `key` and return it.
     // Port of erts/emulator/beam/erl_db_tree.c (linkout_tree), OTP-29.1.1.
-    pub(super) fn linkout(&mut self, key: Term, keypos: usize) -> Option<DbTerm> {
+    pub(super) fn linkout(&mut self, key: Term, keypos: usize) -> Option<TreeDbTerm> {
         self.linkout_matching(key, keypos, |_| true)
     }
 
@@ -113,10 +153,10 @@ impl TreeRoot {
         key: Term,
         keypos: usize,
         mut matches: impl FnMut(&StoredTerm) -> bool,
-    ) -> Option<DbTerm> {
+    ) -> Option<TreeDbTerm> {
         let removed = tree_linkout(&mut self.root, key, keypos, &mut matches)?;
         self.version += 1;
-        self.nitems -= 1;
+        self.nitems = self.nitems.wrapping_sub(1);
         Some(removed)
     }
 
@@ -139,11 +179,26 @@ impl TreeRoot {
         while let Some(current) = node {
             match cmp(key, current.key(keypos)) {
                 Ordering::Equal => return Some(current),
-                Ordering::Less => node = current.next.as_deref_mut(),
-                Ordering::Greater => node = current.right.as_deref_mut(),
+                Ordering::Less => node = current.prefix.left.as_deref_mut(),
+                Ordering::Greater => node = current.prefix.right.as_deref_mut(),
             }
         }
         None
+    }
+
+    /// Prime the slot stack as `db_first_tree_common` / `db_last_tree_common` do.
+    // Port of erts/emulator/beam/erl_db_tree.c (db_first_tree_common, db_last_tree_common),
+    // OTP-29.1.1.
+    pub(super) fn prime_stack(&self, last: bool) {
+        let mut stack = self.stack.lock();
+        stack.reset(self.version);
+        if last {
+            if stack.push_right_spine(&self.root) {
+                stack.set_slot(self.nitems);
+            }
+        } else if stack.push_left_spine(&self.root) {
+            stack.set_slot(1);
+        }
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (slot_search), OTP-29.1.1; `slot` counts from 1.
@@ -160,33 +215,18 @@ impl TreeRoot {
     pub(super) fn split_for_catree(mut self, keypos: usize) -> (Self, Self, Term) {
         let root = self.root.take().expect("non-empty CA-tree base");
         let (left, right, split_key) = split_tree(root, keypos);
-        // The split moves whole subtrees; their sizes are counted once here.
-        let left_count = count_nodes(&left);
+        // CA-tree base nodes keep no item count: the table counts (`DbTableCATree` counters).
         (
-            Self::from_link(left, left_count),
-            Self::from_link(right, self.nitems - left_count),
+            Self::from_link(left, 0),
+            Self::from_link(right, 0),
             split_key,
         )
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (join_trees), OTP-29.1.1.
     pub(super) fn join_ordered(left: Self, right: Self) -> Self {
-        let nitems = left.nitems + right.nitems;
-        Self::from_link(join_trees(left.root, right.root), nitems)
+        Self::from_link(join_trees(left.root, right.root), 0)
     }
-}
-
-fn count_nodes(link: &Link) -> usize {
-    let mut pending = vec![link.as_deref()];
-    let mut count = 0;
-    while let Some(node) = pending.pop() {
-        if let Some(node) = node {
-            count += 1;
-            pending.push(node.next.as_deref());
-            pending.push(node.right.as_deref());
-        }
-    }
-    count
 }
 
 /// Read access to an AVL tree of `TreeDbTerm` blocks.
@@ -199,8 +239,8 @@ impl Node {
         while let Some(current) = node {
             match cmp(key, current.key(keypos)) {
                 Ordering::Equal => return Some(current),
-                Ordering::Less => node = current.next.as_deref(),
-                Ordering::Greater => node = current.right.as_deref(),
+                Ordering::Less => node = current.prefix.left.as_deref(),
+                Ordering::Greater => node = current.prefix.right.as_deref(),
             }
         }
         None
@@ -212,7 +252,11 @@ impl Node {
     pub(super) fn edge(root: &TreeRoot, last: bool) -> Option<&StoredTerm> {
         let mut node = root.link().as_deref()?;
         loop {
-            let child = if last { &node.right } else { &node.next };
+            let child = if last {
+                &node.prefix.right
+            } else {
+                &node.prefix.left
+            };
             match child.as_deref() {
                 Some(child) => node = child,
                 None => return Some(node),
@@ -227,11 +271,11 @@ impl Node {
         loop {
             while let Some(node) = current {
                 pending.push(node);
-                current = node.next.as_deref();
+                current = node.prefix.left.as_deref();
             }
             let Some(node) = pending.pop() else { break };
             out.push(node);
-            current = node.right.as_deref();
+            current = node.prefix.right.as_deref();
         }
     }
 
@@ -246,11 +290,11 @@ impl Node {
         loop {
             while let Some(node) = current {
                 pending.push(node);
-                current = node.next.as_deref();
+                current = node.prefix.left.as_deref();
             }
             let Some(node) = pending.pop() else { break };
             visit(node)?;
-            current = node.right.as_deref();
+            current = node.prefix.right.as_deref();
         }
         Ok(())
     }
@@ -305,15 +349,15 @@ impl Node {
             if eligible(node.key(keypos)) {
                 pending.push(node);
                 current = if reverse {
-                    node.right.as_deref()
+                    node.prefix.right.as_deref()
                 } else {
-                    node.next.as_deref()
+                    node.prefix.left.as_deref()
                 };
             } else {
                 current = if reverse {
-                    node.next.as_deref()
+                    node.prefix.left.as_deref()
                 } else {
-                    node.right.as_deref()
+                    node.prefix.right.as_deref()
                 };
             }
         }
@@ -322,16 +366,16 @@ impl Node {
                 return Ok(true);
             }
             let mut branch = if reverse {
-                node.next.as_deref()
+                node.prefix.left.as_deref()
             } else {
-                node.right.as_deref()
+                node.prefix.right.as_deref()
             };
             while let Some(next) = branch {
                 pending.push(next);
                 branch = if reverse {
-                    next.right.as_deref()
+                    next.prefix.right.as_deref()
                 } else {
-                    next.next.as_deref()
+                    next.prefix.left.as_deref()
                 };
             }
         }
@@ -363,16 +407,16 @@ impl Node {
         let (right_below, right_above) = (below, check_above);
         let (first, first_checks, second, second_checks) = if state.reverse {
             (
-                &node.right,
+                &node.prefix.right,
                 (right_below, right_above),
-                &node.next,
+                &node.prefix.left,
                 (left_below, left_above),
             )
         } else {
             (
-                &node.next,
+                &node.prefix.left,
                 (left_below, left_above),
-                &node.right,
+                &node.prefix.right,
                 (right_below, right_above),
             )
         };
@@ -397,18 +441,23 @@ impl Node {
         Ok(())
     }
 
-    /// Check the balance factors against the subtree heights and the item count.
+    /// Check the balance factors against the subtree heights, and the number of objects.
     pub(super) fn validate(root: &TreeRoot) -> bool {
+        Self::validate_links(root).is_some()
+    }
+
+    /// The number of objects when the balance factors are right.
+    pub(super) fn validate_links(root: &TreeRoot) -> Option<usize> {
         fn check(node: &Link) -> Option<(i32, usize)> {
             let Some(node) = node else {
                 return Some((0, 0));
             };
-            let (lh, ls) = check(&node.next)?;
-            let (rh, rs) = check(&node.right)?;
-            (i32::from(node.balance) == rh - lh && (lh - rh).abs() <= 1)
+            let (lh, ls) = check(&node.prefix.left)?;
+            let (rh, rs) = check(&node.prefix.right)?;
+            (i32::from(node.prefix.balance) == rh - lh && (lh - rh).abs() <= 1)
                 .then_some((1 + lh.max(rh), 1 + ls + rs))
         }
-        check(root.link()).is_some_and(|(_, count)| count == root.count())
+        check(root.link()).map(|(_, count)| count)
     }
 }
 
@@ -430,11 +479,11 @@ mod tests {
         }
     }
 
-    fn object(heap: &mut VecHeap, key: i64) -> DbTerm {
+    fn object(heap: &mut VecHeap, key: i64) -> TreeDbTerm {
         let tuple = TermBuilder::new(heap)
             .tuple(&[Term::small(key).unwrap(), Term::small(key * 2).unwrap()])
             .unwrap();
-        StoredTerm::copy_for_table(tuple, false, 1, 3).unwrap()
+        StoredTerm::copy_for_table::<crate::TreePrefix>(tuple, false, 1, 3).unwrap()
     }
 
     fn keys(root: &TreeRoot) -> Vec<i64> {
@@ -504,7 +553,7 @@ mod tests {
             let split = split_key.as_small().unwrap();
             assert!(keys(&left).iter().all(|&key| key < split));
             assert_eq!(keys(&right).first().copied(), Some(split));
-            assert_eq!(left.count() + right.count(), size as usize);
+            assert_eq!(keys(&left).len() + keys(&right).len(), size as usize);
             let joined = TreeRoot::join_ordered(left, right);
             assert!(Node::validate(&joined));
             assert_eq!(keys(&joined), (0..size).collect::<Vec<_>>());
