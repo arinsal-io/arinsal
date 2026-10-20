@@ -5,7 +5,7 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(raise_stacktrace_differential).
--export([explicit/0, limited/1, invalid_frame/0]).
+-export([explicit/0, limited/1, invalid_frame/0, error3_none/2, error3_list/2, error3_empty/2]).
 
 explicit() ->
     try erlang:raise(error, reason,
@@ -22,6 +22,21 @@ limited(Depth) ->
     end.
 
 invalid_frame() -> erlang:raise(error, reason, [invalid_frame]).
+
+error3_none(_Left, _Right) ->
+    try erlang:error(reason, none, [{error_info, #{module => raise_stacktrace_differential}}])
+    catch error:reason:Stack -> hd(Stack)
+    end.
+
+error3_list(Left, Right) ->
+    try erlang:error(reason, [Left, Right], [{error_info, #{module => raise_stacktrace_differential}}])
+    catch error:reason:Stack -> hd(Stack)
+    end.
+
+error3_empty(_Left, _Right) ->
+    try erlang:error(reason, [], [{error_info, #{module => raise_stacktrace_differential}}])
+    catch error:reason:Stack -> hd(Stack)
+    end.
 "#;
 
 fn vm_call(vm: &mut Vm, function: &str, args: &[OwnedTerm]) -> CallResult {
@@ -61,5 +76,28 @@ fn legacy_raise_frames_and_depth_match_otp() {
         let expected = reference.call("raise_stacktrace_differential", "limited", &args);
         let actual = vm_call(&mut vm, "limited", &args);
         similar_asserts::assert_eq!(actual, expected, "backtrace_depth={depth}");
+    }
+}
+
+#[test]
+fn error_three_argument_frames_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping error/3 stacktrace differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named("raise_stacktrace_differential", SOURCE, &[])
+        .expect("compile raise_stacktrace_differential");
+    reference
+        .load("raise_stacktrace_differential", &beam)
+        .expect("load raise_stacktrace_differential");
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).expect("load test module");
+    let args = [OwnedTerm::Int(11), OwnedTerm::Int(22)];
+
+    for function in ["error3_none", "error3_list", "error3_empty"] {
+        let expected = reference.call("raise_stacktrace_differential", function, &args);
+        let actual = vm_call(&mut vm, function, &args);
+        similar_asserts::assert_eq!(actual, expected, "{function}");
     }
 }
