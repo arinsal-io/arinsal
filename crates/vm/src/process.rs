@@ -5670,7 +5670,11 @@ impl Process {
         let delivered = match ctx.as_deref_mut() {
             Some(ctx) => {
                 let shared = on_own_heap && value.is_pointer();
-                let delivered = ctx.send(pid, envelope);
+                let delivered = if pid == sender {
+                    ctx.send_self(envelope)
+                } else {
+                    ctx.send(pid, envelope)
+                };
                 // A buffered message names a term on this heap. Publish it before anything
                 // can collect, so the signal queue holds it as a root.
                 if shared {
@@ -5682,19 +5686,32 @@ impl Process {
             // by JIT code, with the scheduler data of the calling scheduler), OTP-29.1.1. A
             // process sending to itself is running: erts_proc_notify_new_message
             // (erl_proc_sig_queue.h:2080) schedules nothing, so no run queue is needed.
-            None => match if pid == sender {
-                Err(envelope)
-            } else {
-                arinsal_sched::native_send(sender, pid, envelope)
-            } {
-                Ok(delivered) => delivered,
-                Err(envelope) => self
-                    .runtime
-                    .as_ref()
-                    .ok_or_else(|| VmError::Unsupported("send requires a scheduler".into()))?
-                    .scheduler()?
-                    .send(sender, pid, envelope),
-            },
+            None => {
+                if pid == sender
+                    && let Some(probe) = self
+                        .cold
+                        .as_ref()
+                        .and_then(|cold| cold.signal_probe.as_ref())
+                {
+                    probe.send_self(pid, envelope)
+                } else {
+                    match if pid == sender {
+                        Err(envelope)
+                    } else {
+                        arinsal_sched::native_send(sender, pid, envelope)
+                    } {
+                        Ok(delivered) => delivered,
+                        Err(envelope) => self
+                            .runtime
+                            .as_ref()
+                            .ok_or_else(|| {
+                                VmError::Unsupported("send requires a scheduler".into())
+                            })?
+                            .scheduler()?
+                            .send(sender, pid, envelope),
+                    }
+                }
+            }
         };
         match delivered {
             Ok(()) | Err(arinsal_sched::Error::NoProcess) => {
@@ -5805,10 +5822,22 @@ impl Process {
             ctx.set_sig_q(!self.sig_cont_empty());
             return Ok(());
         }
+        // The whole batch is one splice onto the message queue in erts (LINK_MESSAGE of the
+        // fetched list); a plain message needs no alias, priority or receive-trace handling.
+        let count = self.sig_cont.len();
+        self.sig_cont_taken += count as u64;
+        ctx.consume_fetched_many(count);
         while let Some(Event { from, payload }) = self.sig_cont.pop_front() {
-            self.sig_cont_taken += 1;
-            ctx.consume_fetched();
-            self.move_message(ctx, from, payload)?;
+            match payload {
+                Payload::Message(message) if message.alias == 0 && !message.is_priority() => {
+                    let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
+                    let before = self.message_words_before();
+                    let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
+                    self.uncount_message_words(before);
+                    debug_assert_eq!(new_prio_len, old_prio_len);
+                }
+                payload => self.move_message(ctx, from, payload)?,
+            }
         }
         crate::natives::erts_debug::after_message_queue_change(self);
         Ok(())

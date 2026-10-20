@@ -916,6 +916,24 @@ impl<M: SignalMessage> SignalProbe<M> {
         self.0.set_sig_q(unhandled);
     }
 
+    /// Queue a message from the process to itself straight into its own outer signal queue.
+    // Port of erts/emulator/beam/erl_message.c:532 (erts_queue_proc_message with
+    // sender == receiver) and :698 (erts_send_message), OTP-29.1.1: the sender holds the
+    // receiver, so there is no process-table lookup, and a running receiver is not scheduled.
+    pub fn send_self(&self, pid: Pid, msg: M) -> Result<(), Error> {
+        self.0
+            .push_routed(
+                || signal_buffer_slot(pid),
+                Event {
+                    from: pid,
+                    payload: Payload::Message(msg),
+                },
+            )
+            .map_err(|_| Error::NoProcess)?;
+        self.0.backlog.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Move the whole outer queue to the end of `into`, the receiver's middle queue. Each
     /// event taken from there is accounted with [`RunCtx::consume_fetched`].
     // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch), OTP-29.1.1.
@@ -4544,6 +4562,14 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn consume_fetched(&self) {
         self.consumed_event();
     }
+    /// Account `count` events taken from [`Self::fetch_signals`] at once.
+    pub fn consume_fetched_many(&self, count: usize) {
+        let backlog = self.backlog.load(Ordering::Relaxed);
+        if backlog != 0 {
+            self.backlog
+                .fetch_sub(backlog.min(count), Ordering::Relaxed);
+        }
+    }
     /// Record whether this slice ends active (runnable) or waiting.
     // Port of erts/emulator/beam/erl_process.c (ERTS_PSFLG_ACTIVE in the process state
     // word, read by erts_process_state2status), OTP-29.1.1.
@@ -4553,6 +4579,21 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// Send an opaque envelope to another process.
     pub fn send(&mut self, to: Pid, msg: M) -> Result<(), Error> {
         self.inner.deliver(self.pid, to, Payload::Message(msg))
+    }
+    /// Send an opaque envelope to this process itself (see [`SignalProbe::send_self`]).
+    pub fn send_self(&mut self, msg: M) -> Result<(), Error> {
+        let pid = self.pid;
+        self.input
+            .push_routed(
+                || signal_buffer_slot(pid),
+                Event {
+                    from: pid,
+                    payload: Payload::Message(msg),
+                },
+            )
+            .map_err(|_| Error::NoProcess)?;
+        self.backlog.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
     /// Set this process's user priority; it takes effect when the process is next queued.
     ///
