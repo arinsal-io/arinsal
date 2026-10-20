@@ -937,7 +937,9 @@ pub(crate) enum OriginMonitor {
     /// `ERTS_MON_TYPE_DIST_PORT`: an external port of an old incarnation of this node.
     DistPort {
         alias_mode: Option<AliasMode>,
-        object: arinsal_etf::OwnedTerm,
+        /// Boxed so the common origin entries stay small: the monitor tree allocates a node
+        /// per entry sized by its largest variant.
+        object: Box<arinsal_etf::OwnedTerm>,
     },
     Alias {
         mode: AliasMode,

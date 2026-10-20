@@ -291,7 +291,7 @@ pub(crate) fn test_next_port_id(
 /// Slots per lazily materialized page of the port table.
 const PORT_PAGE_SIZE: usize = 1024;
 
-type PortSlot = std::sync::RwLock<Option<Arc<PortHandle>>>;
+type PortSlot = arc_swap::ArcSwapOption<PortHandle>;
 
 /// The port table (`erts_port` ptab): an array indexed by the port id's table index bits
 /// (`erts_ptab_data2pix`), so a lookup is a shift, a mask and a slot load without hashing.
@@ -339,18 +339,14 @@ impl PortTable {
 
     /// `erts_port_lookup_raw`: the handle of the live port `id`.
     pub(crate) fn get(&self, id: u64) -> Option<Arc<PortHandle>> {
-        let slot = self.slot(id)?.read().unwrap();
+        let slot = self.slot(id)?.load();
         slot.as_ref().filter(|handle| handle.id == id).cloned()
     }
 
     /// Whether port `id` is live.
     pub(crate) fn contains(&self, id: u64) -> bool {
-        self.slot(id).is_some_and(|slot| {
-            slot.read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|handle| handle.id == id)
-        })
+        self.slot(id)
+            .is_some_and(|slot| slot.load().as_ref().is_some_and(|handle| handle.id == id))
     }
 
     /// Whether any live port occupies table index `pix`.
@@ -359,7 +355,7 @@ impl PortTable {
         self.pages
             .get(pix / PORT_PAGE_SIZE)
             .and_then(OnceLock::get)
-            .is_some_and(|page| page[pix % PORT_PAGE_SIZE].read().unwrap().is_some())
+            .is_some_and(|page| page[pix % PORT_PAGE_SIZE].load().is_some())
     }
 
     /// Publish a new port in its slot (`erts_ptab_new_element`, under the table lock).
@@ -368,17 +364,18 @@ impl PortTable {
         let pix = arinsal_term::ptab::port_table_layout().data2pix(id) as usize;
         let page = self.pages[pix / PORT_PAGE_SIZE].get_or_init(|| {
             (0..PORT_PAGE_SIZE)
-                .map(|_| std::sync::RwLock::new(None))
+                .map(|_| arc_swap::ArcSwapOption::empty())
                 .collect()
         });
-        *page[pix % PORT_PAGE_SIZE].write().unwrap() = Some(handle);
+        page[pix % PORT_PAGE_SIZE].store(Some(handle));
     }
 
     /// Clear the slot of port `id` and return its handle.
     pub(crate) fn remove(&self, id: u64) -> Option<Arc<PortHandle>> {
-        let mut slot = self.slot(id)?.write().unwrap();
-        if slot.as_ref().is_some_and(|handle| handle.id == id) {
-            slot.take()
+        let slot = self.slot(id)?;
+        // The caller holds the table lock, so the slot cannot change between the check and the swap.
+        if slot.load().as_ref().is_some_and(|handle| handle.id == id) {
+            slot.swap(None)
         } else {
             None
         }
@@ -395,7 +392,7 @@ impl PortTable {
             .iter()
             .filter_map(OnceLock::get)
             .flat_map(|page| page.iter())
-            .filter_map(|slot| slot.read().unwrap().clone())
+            .filter_map(|slot| slot.load_full())
             .collect()
     }
 }
@@ -1323,9 +1320,7 @@ fn start(
         Arc::clone(&scheduler),
         Arc::as_ptr(runtime) as usize,
     )?;
-    runtime
-        .ports
-        .insert(port_id, Arc::clone(&handle));
+    runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
@@ -1393,9 +1388,7 @@ fn start_driver(
         scheduler,
         Arc::as_ptr(runtime) as usize,
     )?;
-    runtime
-        .ports
-        .insert(port_id, Arc::clone(&handle));
+    runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
@@ -1471,9 +1464,7 @@ fn start_dyn_driver(
             crate::inet_drv::attach(&runtime, &handle, &drv_port);
         }
     }
-    runtime
-        .ports
-        .insert(port_id, Arc::clone(&handle));
+    runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(&runtime, port_id);
     reservation.commit();
@@ -2281,9 +2272,7 @@ pub(crate) fn alloc_inet_port(
     let _ = handle.driver.set(Arc::clone(&drv_port));
     let _ = handle.runtime.set(Arc::downgrade(runtime));
     attach(&handle, &drv_port);
-    runtime
-        .ports
-        .insert(port_id, Arc::clone(&handle));
+    runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
@@ -4136,10 +4125,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
     let id = port_id(process, port).ok_or_else(badarg)?;
     let pid = Pid::from_term(pid).ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let handle = runtime
-        .ports
-        .get(id)
-        .ok_or_else(badarg)?;
+    let handle = runtime.ports.get(id).ok_or_else(badarg)?;
     if !runtime.scheduler()?.lookup(pid) {
         return Err(badarg());
     }
@@ -4333,32 +4319,25 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
     Ok(true)
 }
 
-/// Register or remove a process monitor on a port.
+/// Register or remove a process monitor on a port the caller already looked up
+/// (`erts_port_lookup` in bif.c monitor, then `erts_port_monitor`). A port that vanished
+/// in between is refused and the caller sends DOWN noproc.
 pub(crate) fn monitor(
     process: &Process,
-    port: Term,
+    id: u64,
+    handle: &Arc<PortHandle>,
     reference: u64,
     pid: Pid,
     name: Option<arinsal_term::Atom>,
     monitored: bool,
 ) -> Result<bool, VmError> {
-    let id = port.as_port().ok_or_else(badarg)?;
-    let handle = process
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.ports.get(id));
-    let Some(handle) = handle else {
-        // The port vanished between lookup and registration: the caller sends DOWN noproc.
-        return Ok(!monitored);
-    };
     if monitored && let Some(drv_port) = handle.driver.get() {
         // Port of erts/emulator/beam/io.c:6787 (erts_port_monitor): the request is a port
         // signal, handled once the callback holding the port lock has returned.
-        return drv_port.serialized(|| {
-            register_monitor(process, id, &handle, reference, pid, name, monitored)
-        });
+        return drv_port
+            .serialized(|| register_monitor(process, id, handle, reference, pid, name, monitored));
     }
-    register_monitor(process, id, &handle, reference, pid, name, monitored)
+    register_monitor(process, id, handle, reference, pid, name, monitored)
 }
 
 fn register_monitor(
@@ -4840,9 +4819,7 @@ fn send_message_inner(
             return Ok(sent());
         }
         trace_port_receive_term(process, from, id, parts[1]);
-        if connect(process, port, command[1], Some(from)).is_err()
-            && runtime.ports.contains(id)
-        {
+        if connect(process, port, command[1], Some(from)).is_err() && runtime.ports.contains(id) {
             signal_badsig(&handle, id);
         }
         return Ok(sent());
@@ -4980,11 +4957,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         }
         (None, None) => return Err(badarg()),
     };
-    let Some(handle) = process
-        .runtime
-        .as_ref()
-        .and_then(|r| r.ports.get(id))
-    else {
+    let Some(handle) = process.runtime.as_ref().and_then(|r| r.ports.get(id)) else {
         // The forker is port zero and has no handle here (see `ports`).
         return if id == 0 {
             forker_port_info(process, item)

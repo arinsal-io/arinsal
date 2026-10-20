@@ -4210,11 +4210,7 @@ fn trace(
                         process
                             .runtime
                             .as_ref()
-                            .map(|runtime| {
-                                runtime
-                                    .ports
-                                    .ids()
-                            })
+                            .map(|runtime| runtime.ports.ids())
                             .unwrap_or_default(),
                     );
                     for port in &ports {
@@ -4265,11 +4261,7 @@ fn trace(
                     process
                         .runtime
                         .as_ref()
-                        .map(|runtime| {
-                            runtime
-                                .ports
-                                .ids()
-                        })
+                        .map(|runtime| runtime.ports.ids())
                         .unwrap_or_default(),
                 );
                 for port in &ports {
