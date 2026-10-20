@@ -2395,11 +2395,14 @@ fn build_saved_active(
             return Err(VmError::Unsupported("stacktrace frame".into()));
         };
         let top_args = match top {
-            Some(TopFrame::CurrentArgs(args)) => *args,
-            Some(TopFrame::CurrentArgsWithInfo(Some(args), _)) => *args,
-            Some(TopFrame::CurrentArgsWithInfo(None, _)) => {
-                Term::small(i64::from(arity)).expect("arity is small")
+            Some(TopFrame::CurrentArgs(args))
+            | Some(TopFrame::CurrentArgsWithInfo(Some(args), _))
+                if matches!(args.classify(), TermKind::List | TermKind::Nil) =>
+            {
+                *args
             }
+            // Port of erts/emulator/beam/utils.c:3448-3455 (`erts_build_mfa_item`), OTP-29.1.1:
+            // a non-list `error/2,3` args marker such as `:none` means use the function arity.
             _ => Term::small(i64::from(arity)).expect("arity is small"),
         };
         let top_args = mfa_arity_or_args(top_args, arity);

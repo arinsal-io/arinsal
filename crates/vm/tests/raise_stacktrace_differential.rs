@@ -5,7 +5,8 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(raise_stacktrace_differential).
--export([explicit/0, limited/1, invalid_frame/0, error3_none/2, error3_list/2, error3_empty/2]).
+-export([explicit/0, limited/1, invalid_frame/0, error3_none/2, error3_list/2, error3_empty/2,
+         error_none/0]).
 
 explicit() ->
     try erlang:raise(error, reason,
@@ -37,6 +38,11 @@ error3_empty(_Left, _Right) ->
     try erlang:error(reason, [], [{error_info, #{module => raise_stacktrace_differential}}])
     catch error:reason:Stack -> hd(Stack)
     end.
+
+error_none() ->
+    try erlang:error(reason, none, [{error_info, #{module => exception}}])
+    catch Class:Reason:Stack -> {Class, Reason, hd(Stack)}
+    end.
 "#;
 
 fn vm_call(vm: &mut Vm, function: &str, args: &[OwnedTerm]) -> CallResult {
@@ -66,7 +72,7 @@ fn legacy_raise_frames_and_depth_match_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).expect("load test module");
 
-    for function in ["explicit", "invalid_frame"] {
+    for function in ["explicit", "invalid_frame", "error_none"] {
         let expected = reference.call("raise_stacktrace_differential", function, &[]);
         let actual = vm_call(&mut vm, function, &[]);
         similar_asserts::assert_eq!(actual, expected, "{function}");

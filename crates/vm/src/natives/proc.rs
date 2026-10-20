@@ -949,6 +949,9 @@ fn process_info_item_links(process: &mut Process, pid: Pid) -> Result<Term, VmEr
             .map(|cold| {
                 cold.links
                     .iter()
+                    // Port of erts/emulator/beam/erl_bif_info.c:574-590 (collect_one_link),
+                    // OTP-29.1.1: process_info/2 omits links while their unlink is pending.
+                    .filter(|pid| !cold.unlinking.values().any(|unlinking| unlinking == *pid))
                     .filter_map(|p| p.to_term())
                     .collect::<Vec<_>>()
             })
