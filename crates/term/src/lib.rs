@@ -79,9 +79,9 @@ pub use native_code::{
     unregister_native_code_range,
 };
 pub use ops::{
-    cmp, cmp_exact, exact_eq, flat_size, integer_magnitude_cmp, loose_eq, size_object,
-    size_object_litopt, size_object_preserving_sharing, size_object_preserving_sharing_after,
-    size_shared, small_add, small_mul, small_sub,
+    cmp, cmp_exact, exact_eq, exact_eq_after_word_mismatch, flat_size, integer_magnitude_cmp,
+    loose_eq, size_object, size_object_litopt, size_object_preserving_sharing,
+    size_object_preserving_sharing_after, size_shared, small_add, small_mul, small_sub,
 };
 pub use owned::{from_owned, to_owned};
 pub use record::{RecordRef, RecordSnapshot, record_map_pairs, term_sequence};

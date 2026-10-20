@@ -1,7 +1,10 @@
 //! Iterative comparison and object sizing.
 use crate::FunRef;
 use crate::identity::node_order;
-use crate::{EMPTY_TUPLE, FLOAT, Identity, NEG_BIG, POS_BIG, Term, TermKind, global_atoms};
+use crate::{
+    ARITY, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, FLOAT, FUN, HEAP_BITS,
+    Identity, MAP, NEG_BIG, POS_BIG, RECORD, REF, SUB_BITS, Term, TermKind, global_atoms,
+};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
@@ -1981,7 +1984,20 @@ fn exact_ref_eq(a: Term, b: Term) -> bool {
 #[inline]
 pub fn exact_eq(a: Term, b: Term) -> bool {
     // Port of erts/emulator/beam/erl_utils.h:113 (EQ), OTP-29.1.1.
-    a == b || (!Term(a.0 & b.0).is_immed() && eq(a, b))
+    a == b || (!both_immed(a, b) && eq(a, b))
+}
+
+/// Run `eq` after a caller's raw-word check, as `lists_member_2` does.
+// Port of `erl_bif_lists.c:1132`, OTP-29.1.1.
+#[inline(always)]
+pub fn exact_eq_after_word_mismatch(a: Term, b: Term) -> bool {
+    eq(a, b)
+}
+
+// Port of `is_both_immed` in erts/emulator/beam/erl_term.h:184, OTP-29.1.1.
+#[inline(always)]
+fn both_immed(a: Term, b: Term) -> bool {
+    Term(a.0 & b.0).is_immed()
 }
 
 fn exact_eq_mixed_map_layouts(left: Term, right: Term) -> Option<Vec<(Term, Term)>> {
@@ -2030,7 +2046,7 @@ struct EqHashmapIterPair {
 // OTP-29.1.1. Borrowed views and iterators stay typed here; their LIFO handles are words.
 struct EqStack<'a> {
     words: SmallVec<[u64; 16]>,
-    arrays: Vec<EqArrayPair<'a>>,
+    arrays: SmallVec<[EqArrayPair<'a>; 5]>,
     hashmaps: Vec<EqHashmapIterPair>,
 }
 
@@ -2038,7 +2054,7 @@ impl<'a> EqStack<'a> {
     fn new() -> Self {
         Self {
             words: SmallVec::new(),
-            arrays: Vec::new(),
+            arrays: SmallVec::new(),
             hashmaps: Vec::new(),
         }
     }
@@ -2094,6 +2110,41 @@ const EQ_ARRAY_OP: u64 = 1;
 const EQ_FLATMAP_VALUES_OP: u64 = 2;
 const EQ_HASHMAP_OP: u64 = 3;
 
+// Port of `primary_tag` and boxed-header dispatch in utils.c:1133-1190,
+// OTP-29.1.1. Matching the peer header here avoids classifying both terms.
+#[inline(always)]
+fn eq_kind_from_header(header: u64) -> Option<TermKind> {
+    Some(match header & 63 {
+        ARITY => TermKind::Tuple,
+        POS_BIG | NEG_BIG | FLOAT => TermKind::Number,
+        REF | EXTERNAL_REF => TermKind::Ref,
+        FUN => TermKind::Fun,
+        EXTERNAL_PORT => TermKind::Port,
+        EXTERNAL_PID => TermKind::Pid,
+        RECORD => TermKind::Record,
+        MAP => TermKind::Map,
+        HEAP_BITS | SUB_BITS => TermKind::Bitstring,
+        BIN_REF => TermKind::BinRef,
+        _ => return None,
+    })
+}
+
+#[inline(always)]
+fn eq_compound_kind(a: Term, b: Term) -> Option<TermKind> {
+    match a.0 & 3 {
+        1 if b.0 & 3 == 1 => Some(TermKind::List),
+        2 if b.0 & 3 == 2 => {
+            let header = a.header()?;
+            let kind = eq_kind_from_header(header)?;
+            if matches!(kind, TermKind::Tuple | TermKind::Record | TermKind::Number) {
+                return (b.header()? == header).then_some(kind);
+            }
+            (eq_kind_from_header(b.header()?)? == kind).then_some(kind)
+        }
+        _ => None,
+    }
+}
+
 // Port of the operation words tagged as TAG_PRIMARY_HEADER in utils.c:1488-1510.
 #[inline(always)]
 const fn eq_array_op() -> u64 {
@@ -2135,49 +2186,54 @@ fn first_unequal(
 /// Port of erts/emulator/beam/utils.c:1125-1530 (eq), OTP-29.1.1.
 #[inline(never)]
 fn eq(a: Term, b: Term) -> bool {
-    let mut pending = EqStack::new();
+    let mut pending: Option<EqStack<'_>> = None;
     let (mut a, mut b) = (a, b);
     'term: loop {
         if a == b {
-            let Some(word) = pending.words.pop() else {
+            let Some(stack) = pending.as_mut() else {
+                return true;
+            };
+            let Some(word) = stack.words.pop() else {
                 return true;
             };
             if !is_work_op(word) {
                 a = Term(word);
-                b = Term(pending.words.pop().expect("term pair is complete"));
+                b = Term(stack.words.pop().expect("term pair is complete"));
                 continue 'term;
             }
             match word >> WORK_OP_SHIFT {
                 EQ_ARRAY_OP => {
-                    let start = pending.words.pop().expect("array start is present") as usize;
-                    let array_index =
-                        pending.words.pop().expect("array handle is present") as usize;
+                    let start = stack.words.pop().expect("array start is present") as usize;
+                    let array_index = stack.words.pop().expect("array handle is present") as usize;
                     let (result, len) = {
-                        let pair = &pending.arrays[array_index];
+                        let pair = &stack.arrays[array_index];
                         (
                             first_unequal(&pair.left, &pair.right, start),
                             pair.left.len(),
                         )
                     };
                     let Some((index, next_a, next_b)) = result else {
-                        pending.arrays.truncate(array_index);
+                        stack.arrays.truncate(array_index);
                         continue 'term;
                     };
+                    if both_immed(next_a, next_b) {
+                        return false;
+                    }
                     let next = index + 1;
                     if next < len {
-                        pending.push_array_index(array_index, next);
+                        stack.push_array_index(array_index, next);
                     } else {
-                        pending.arrays.truncate(array_index);
+                        stack.arrays.truncate(array_index);
                     }
                     a = next_a;
                     b = next_b;
                     continue 'term;
                 }
                 EQ_FLATMAP_VALUES_OP => {
-                    let end = pending.words.pop().expect("value count is present") as usize;
-                    let start = pending.words.pop().expect("value index is present") as usize;
-                    let left_map = Term(pending.words.pop().expect("left map is present"));
-                    let right_map = Term(pending.words.pop().expect("right map is present"));
+                    let end = stack.words.pop().expect("value count is present") as usize;
+                    let start = stack.words.pop().expect("value index is present") as usize;
+                    let left_map = Term(stack.words.pop().expect("left map is present"));
+                    let right_map = Term(stack.words.pop().expect("right map is present"));
                     let (result, len) =
                         crate::hamt::with_flatmap_arrays(left_map, |_, left_values| {
                             crate::hamt::with_flatmap_arrays(right_map, |_, right_values| {
@@ -2191,33 +2247,36 @@ fn eq(a: Term, b: Term) -> bool {
                     let Some((index, next_a, next_b)) = result else {
                         continue 'term;
                     };
+                    if both_immed(next_a, next_b) {
+                        return false;
+                    }
                     let next = index + 1;
                     if next < len {
-                        pending.push_flatmap_values(left_map, right_map, next, end);
+                        stack.push_flatmap_values(left_map, right_map, next, end);
                     }
                     a = next_a;
                     b = next_b;
                     continue 'term;
                 }
                 EQ_HASHMAP_OP => {
-                    let index = pending
+                    let index = stack
                         .words
                         .pop()
                         .expect("hashmap iterator handle is present")
                         as usize;
                     let (left_pair, right_pair) = {
-                        let iterators = &mut pending.hashmaps[index];
+                        let iterators = &mut stack.hashmaps[index];
                         (iterators.left.next(), iterators.right.next())
                     };
                     match (left_pair, right_pair) {
                         (None, None) => {
-                            pending.hashmaps.truncate(index);
+                            stack.hashmaps.truncate(index);
                             continue 'term;
                         }
                         (Some((left_key, left_value)), Some((right_key, right_value))) => {
-                            pending.push_hashmap_index(index);
-                            pending.push_terms(left_value, right_value);
-                            pending.push_terms(left_key, right_key);
+                            stack.push_hashmap_index(index);
+                            stack.push_terms(left_value, right_value);
+                            stack.push_terms(left_key, right_key);
                             continue 'term;
                         }
                         _ => return false,
@@ -2226,21 +2285,10 @@ fn eq(a: Term, b: Term) -> bool {
                 _ => unreachable!("invalid equality work word"),
             }
         }
-        // Port of erts/emulator/beam/utils.c:1125 (eq): after the raw-word check,
-        // only list and boxed primary tags have a structural equality case.
-        if a.is_immed() {
+        // Port of erts/emulator/beam/utils.c:1125-1190 (eq), OTP-29.1.1.
+        let Some(kind) = eq_compound_kind(a, b) else {
             return false;
-        }
-        let kind = if a.0 & 3 == 1 {
-            TermKind::List
-        } else {
-            a.classify()
         };
-        if (kind == TermKind::List && b.0 & 3 != 1)
-            || (kind != TermKind::List && kind != b.classify())
-        {
-            return false;
-        }
         match kind {
             TermKind::Number => {
                 if !exact_number_eq(a, b) {
@@ -2274,7 +2322,7 @@ fn eq(a: Term, b: Term) -> bool {
                     // SAFETY: the caller keeps both list cells live and stable.
                     let (bh, bt) = unsafe { b.cons_ref().unwrap() };
                     if ah != bh {
-                        pending.push_terms(at, bt);
+                        pending.get_or_insert_with(EqStack::new).push_terms(at, bt);
                         a = ah;
                         b = bh;
                         continue 'term;
@@ -2300,9 +2348,14 @@ fn eq(a: Term, b: Term) -> bool {
                 let left = EqArray::Tuple(av);
                 let right = EqArray::Tuple(bv);
                 if let Some((index, x, y)) = first_unequal(&left, &right, 0) {
+                    if both_immed(x, y) {
+                        return false;
+                    }
                     let next = index + 1;
                     if next < left.len() {
-                        pending.push_array(left, right, next);
+                        pending
+                            .get_or_insert_with(EqStack::new)
+                            .push_array(left, right, next);
                     }
                     a = x;
                     b = y;
@@ -2324,20 +2377,24 @@ fn eq(a: Term, b: Term) -> bool {
                         return false;
                     };
                     for (left_value, right_value) in values {
-                        pending.push_terms(left_value, right_value);
+                        pending
+                            .get_or_insert_with(EqStack::new)
+                            .push_terms(left_value, right_value);
                     }
                     a = b;
                     continue 'term;
                 }
                 if a.is_hashmap() {
-                    pending.push_hashmap(a, b);
+                    pending.get_or_insert_with(EqStack::new).push_hashmap(a, b);
                     a = b;
                     continue 'term;
                 }
                 let left_keys = a.flatmap_keys_tuple().expect("left map is a live flatmap");
                 let right_keys = b.flatmap_keys_tuple().expect("right map is a live flatmap");
                 if len != 0 {
-                    pending.push_flatmap_values(a, b, 0, len);
+                    pending
+                        .get_or_insert_with(EqStack::new)
+                        .push_flatmap_values(a, b, 0, len);
                 }
                 a = left_keys;
                 b = right_keys;
@@ -2358,7 +2415,9 @@ fn eq(a: Term, b: Term) -> bool {
                     if node_order(av.key(ai).unwrap(), bv.key(bi).unwrap()) != Ordering::Equal {
                         return false;
                     }
-                    pending.push_terms(av.value(ai).unwrap(), bv.value(bi).unwrap());
+                    pending
+                        .get_or_insert_with(EqStack::new)
+                        .push_terms(av.value(ai).unwrap(), bv.value(bi).unwrap());
                 }
             }
             TermKind::Fun => {
@@ -2385,9 +2444,14 @@ fn eq(a: Term, b: Term) -> bool {
                         let left = EqArray::Words(af);
                         let right = EqArray::Words(bf);
                         if let Some((index, x, y)) = first_unequal(&left, &right, 0) {
+                            if both_immed(x, y) {
+                                return false;
+                            }
                             let next = index + 1;
                             if next < left.len() {
-                                pending.push_array(left, right, next);
+                                pending
+                                    .get_or_insert_with(EqStack::new)
+                                    .push_array(left, right, next);
                             }
                             a = x;
                             b = y;

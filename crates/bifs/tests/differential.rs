@@ -1412,6 +1412,19 @@ fn list_bif_loops_match_otp_29() {
         O::Tuple(vec![O::Int(2), atom("b")]),
         O::Tuple(vec![atom("c"), atom("d")]),
     ]);
+    let compound_key = O::Tuple(vec![
+        atom("nested_key"),
+        O::Map(vec![(atom("payload"), O::Binary(vec![1, 2, 3]))]),
+    ]);
+    let changed_compound_key = O::Tuple(vec![
+        atom("nested_key"),
+        O::Map(vec![(atom("payload"), O::Binary(vec![1, 2, 4]))]),
+    ]);
+    let compound_member_list = O::list(vec![changed_compound_key.clone(), compound_key.clone()]);
+    let compound_key_tuples = O::list(vec![
+        O::Tuple(vec![O::Int(1), changed_compound_key.clone()]),
+        O::Tuple(vec![O::Int(2), compound_key.clone()]),
+    ]);
     let improper = O::List {
         elems: vec![O::Int(1)],
         tail: Box::new(atom("tail")),
@@ -1430,6 +1443,21 @@ fn list_bif_loops_match_otp_29() {
         ("lists", "member", vec![O::Int(7), seq.clone()]),
         ("lists", "member", vec![O::Int(9), seq.clone()]),
         ("lists", "member", vec![O::Float(1.0), seq.clone()]),
+        (
+            "lists",
+            "member",
+            vec![compound_key.clone(), compound_member_list],
+        ),
+        (
+            "lists",
+            "member",
+            vec![compound_key.clone(), O::list(vec![changed_compound_key])],
+        ),
+        (
+            "lists",
+            "member",
+            vec![O::Int(1), O::list(vec![O::Float(1.0)])],
+        ),
         ("lists", "member", vec![O::Int(1), improper.clone()]),
         (
             "lists",
@@ -1440,6 +1468,16 @@ fn list_bif_loops_match_otp_29() {
             "lists",
             "keyfind",
             vec![O::Int(2), O::Int(1), tuples.clone()],
+        ),
+        (
+            "lists",
+            "keyfind",
+            vec![O::Int(1), O::Int(1), tuples.clone()],
+        ),
+        (
+            "lists",
+            "keyfind",
+            vec![compound_key, O::Int(2), compound_key_tuples],
         ),
         (
             "lists",

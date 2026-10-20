@@ -29,6 +29,11 @@ fn compound_term_comparison_matches_erts() {
         BasePairs = [
             {{alpha, 1, {nested, [a, 2]}}, {alpha, 1, {nested, [a, 2]}}},
             {{alpha, 1, beta}, {alpha, 2, beta}},
+            {{number, 1}, {number, 1.0}},
+            {{nested, [a, {map, #{key => <<1, 2, 3>>}}]},
+             {nested, [a, {map, #{key => <<1, 2, 4>>}}]}},
+            {<<1, 2, 3>>, <<1, 2, 3>>},
+            {<<1, 2, 3>>, <<1, 2, 4>>},
             {[a, 1, b, 2], [a, 1, b, 3]},
             {[a, 1], [a, 1, b]},
             {#{1 => a, 2 => b}, #{1 => a, 2 => c}},
@@ -82,6 +87,7 @@ fn compound_term_comparison_matches_erts() {
             || N <- lists:seq(0, 40)
         ]),
         NumberPairs = [
+            {(1 bsl 130) + 17, (1 bsl 130) + 17},
             {9007199254740993, 9007199254740992.0},
             {9007199254740992, 9007199254740992.0},
             {(1 bsl 128) + 17, float(1 bsl 128)},
@@ -147,5 +153,5 @@ fn compound_term_comparison_matches_erts() {
             "exact equality {index}"
         );
     }
-    similar_asserts::assert_eq!(stdout.lines().count(), 109);
+    similar_asserts::assert_eq!(stdout.lines().count(), 114);
 }
