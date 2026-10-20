@@ -210,6 +210,45 @@ impl TreeRoot {
         slot_search(&self.root, slot, &mut stack)
     }
 
+    /// Find the adjacent object using the table's reusable stack.
+    // Port of erts/emulator/beam/erl_db_tree.c:97 (get_any_stack), :647 (db_next_tree_common),
+    // and :724 (db_prev_tree_common), OTP-29.1.1.
+    pub(super) fn find_next_prev(
+        &self,
+        key: Term,
+        reverse: bool,
+        keypos: usize,
+    ) -> Option<&StoredTerm> {
+        if let Some(mut stack) = self.stack.try_lock() {
+            self.find_next_prev_with_stack(key, reverse, keypos, &mut stack)
+        } else {
+            // A busy table stack gets a call-local stack in `get_any_stack`.
+            let mut stack = DbTreeStack::new();
+            self.find_next_prev_with_stack(key, reverse, keypos, &mut stack)
+        }
+    }
+
+    /// Search with a caller-owned stack, as `db_next_catree_common` does for each base node.
+    // Port of erts/emulator/beam/erl_db_catree.c:1615 (db_next_catree_common), :1679
+    // (db_prev_catree_common), OTP-29.1.1.
+    pub(super) fn find_next_prev_with_stack<'a>(
+        &'a self,
+        key: Term,
+        reverse: bool,
+        keypos: usize,
+        stack: &mut DbTreeStack,
+    ) -> Option<&'a StoredTerm> {
+        if stack.version != self.version {
+            stack.reset(self.version);
+        }
+        let node = if reverse {
+            stack.find_prev(&self.root, key, keypos)
+        } else {
+            stack.find_next(&self.root, key, keypos)
+        }?;
+        Some(&node.data)
+    }
+
     /// Split into the objects below the split key, the rest and the split key.
     // Port of erts/emulator/beam/erl_db_catree.c (split_tree), OTP-29.1.1.
     pub(super) fn split_for_catree(mut self, keypos: usize) -> (Self, Self, Term) {

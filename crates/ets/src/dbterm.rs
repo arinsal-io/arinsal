@@ -1111,6 +1111,152 @@ impl DbTreeStack {
         }
         Some(this)
     }
+
+    /// Find the strict successor, reusing the path when its top is the supplied key.
+    // Port of erts/emulator/beam/erl_db_tree.c:3167 (find_next), OTP-29.1.1.
+    pub(crate) fn find_next<'a>(
+        &mut self,
+        root: &'a Link,
+        key: Term,
+        keypos: usize,
+    ) -> Option<&'a TreeNode> {
+        let mut this = match self.top() {
+            Some(node) if cmp(key, node.key(keypos)) == Ordering::Equal => node,
+            Some(_) => {
+                self.entries.clear();
+                self.slot = 0;
+                root.as_deref()?
+            }
+            None => root.as_deref()?,
+        };
+        let mut found_next = false;
+        if self.entries.is_empty() {
+            loop {
+                self.push(this);
+                match cmp(key, this.key(keypos)) {
+                    Ordering::Greater => match this.prefix.right.as_deref() {
+                        Some(right) => this = right,
+                        None => break,
+                    },
+                    Ordering::Less => match this.prefix.left.as_deref() {
+                        Some(left) => this = left,
+                        None => {
+                            found_next = true;
+                            break;
+                        }
+                    },
+                    Ordering::Equal => break,
+                }
+            }
+        }
+
+        if !found_next {
+            if let Some(right) = this.prefix.right.as_deref() {
+                this = right;
+                self.push(this);
+                while let Some(left) = this.prefix.left.as_deref() {
+                    this = left;
+                    self.push(this);
+                }
+            } else {
+                let mut child = self.entries.pop()?;
+                loop {
+                    let Some(parent) = self.top() else {
+                        self.slot = 0;
+                        return None;
+                    };
+                    if !parent
+                        .prefix
+                        .right
+                        .as_deref()
+                        .is_some_and(|right| std::ptr::eq(right, child.as_ptr()))
+                    {
+                        this = parent;
+                        break;
+                    }
+                    child = self.entries.pop()?;
+                }
+            }
+        }
+
+        if self.slot > 0 {
+            self.slot += 1;
+        }
+        Some(this)
+    }
+
+    /// Find the strict predecessor, reusing the path when its top is the supplied key.
+    // Port of erts/emulator/beam/erl_db_tree.c:3225 (find_prev), OTP-29.1.1.
+    pub(crate) fn find_prev<'a>(
+        &mut self,
+        root: &'a Link,
+        key: Term,
+        keypos: usize,
+    ) -> Option<&'a TreeNode> {
+        let mut this = match self.top() {
+            Some(node) if cmp(key, node.key(keypos)) == Ordering::Equal => node,
+            Some(_) => {
+                self.entries.clear();
+                self.slot = 0;
+                root.as_deref()?
+            }
+            None => root.as_deref()?,
+        };
+        let mut found_prev = false;
+        if self.entries.is_empty() {
+            loop {
+                self.push(this);
+                match cmp(key, this.key(keypos)) {
+                    Ordering::Less => match this.prefix.left.as_deref() {
+                        Some(left) => this = left,
+                        None => break,
+                    },
+                    Ordering::Greater => match this.prefix.right.as_deref() {
+                        Some(right) => this = right,
+                        None => {
+                            found_prev = true;
+                            break;
+                        }
+                    },
+                    Ordering::Equal => break,
+                }
+            }
+        }
+
+        if !found_prev {
+            if let Some(left) = this.prefix.left.as_deref() {
+                this = left;
+                self.push(this);
+                while let Some(right) = this.prefix.right.as_deref() {
+                    this = right;
+                    self.push(this);
+                }
+            } else {
+                let mut child = self.entries.pop()?;
+                loop {
+                    let Some(parent) = self.top() else {
+                        self.slot = 0;
+                        return None;
+                    };
+                    if !parent
+                        .prefix
+                        .left
+                        .as_deref()
+                        .is_some_and(|left| std::ptr::eq(left, child.as_ptr()))
+                    {
+                        this = parent;
+                        break;
+                    }
+                    child = self.entries.pop()?;
+                }
+            }
+        }
+
+        if self.slot > 0 {
+            self.slot -= 1;
+        }
+        Some(this)
+    }
 }
 
 /// Port of erts/emulator/beam/erl_db_tree.c (slot_search, without a CA-tree iterator),

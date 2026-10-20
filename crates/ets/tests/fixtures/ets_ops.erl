@@ -136,6 +136,9 @@ apply_op(Table, {lookup, Key}) -> ets:lookup(Table, Key);
 apply_op(Table, {member, Key}) -> ets:member(Table, Key);
 apply_op(Table, {delete, Key}) -> ets:delete(Table, Key);
 apply_op(Table, {first, _}) -> ets:first(Table);
+apply_op(Table, {last, _}) -> ets:last(Table);
+apply_op(Table, {walk_next, _}) -> walk_ordered(Table, false);
+apply_op(Table, {walk_prev, _}) -> walk_ordered(Table, true);
 apply_op(Table, {delete_object, Object}) -> ets:delete_object(Table, Object);
 apply_op(Table, {take, Key}) -> ets:take(Table, Key);
 apply_op(Table, {slot, Index}) -> safe(fun() -> ets:slot(Table, Index) end);
@@ -161,6 +164,15 @@ apply_op(Table, {fix, _}) -> ets:safe_fixtable(Table, true);
 apply_op(Table, {unfix, _}) -> ets:safe_fixtable(Table, false).
 
 safe(Fun) -> try Fun() catch error:badarg -> badarg end.
+
+walk_ordered(Table, Reverse) ->
+    First = case Reverse of true -> ets:last(Table); false -> ets:first(Table) end,
+    walk_ordered(Table, First, Reverse, []).
+
+walk_ordered(_Table, '$end_of_table', _Reverse, Acc) -> lists:reverse(Acc);
+walk_ordered(Table, Key, Reverse, Acc) ->
+    Next = case Reverse of true -> ets:prev(Table, Key); false -> ets:next(Table, Key) end,
+    walk_ordered(Table, Next, Reverse, [Key | Acc]).
 
 collect_chunks('$end_of_table', Acc) -> lists:reverse(Acc);
 collect_chunks({Rows, '$end_of_table'}, Acc) -> lists:reverse([Rows | Acc]);
