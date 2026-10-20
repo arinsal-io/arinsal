@@ -379,11 +379,13 @@ fn tuple_view(term: &Term) -> Result<arinsal_term::TupleRef<'_>, BifError> {
     unsafe { term.tuple_ref() }.ok_or(BADARG)
 }
 
-pub(super) fn tuple_arity(term: Term) -> Result<usize, BifError> {
+/// Return the arity of a tuple without copying its elements.
+pub fn tuple_arity(term: Term) -> Result<usize, BifError> {
     Ok(tuple_view(&term)?.len())
 }
 
-pub(super) fn tuple_element(term: Term, index: usize) -> Result<Term, BifError> {
+/// Read one tuple element without copying the tuple's element array.
+pub fn tuple_element(term: Term, index: usize) -> Result<Term, BifError> {
     tuple_view(&term)?.element(index).ok_or(BADARG)
 }
 
