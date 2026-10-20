@@ -469,6 +469,28 @@ impl<T: InSignal> Incoming<T> {
         Ok(())
     }
 
+    /// Publish two signals of one sender with one enqueue when no sender buffers are
+    /// installed. Gives both back, in order, when the buffers are installed (the caller takes
+    /// the block path) or the receiver closed its queue.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1146-1165 (proc_queue_signal prepends the
+    // pending signal to the new one and enqueues both), OTP-29.1.1.
+    pub fn push_pair(&self, first: T, second: T) -> Result<(), (T, T)> {
+        if self.buffers_enabled.load(Ordering::Acquire) {
+            return Err((first, second));
+        }
+        let (mut queue, contended) = self.lock_msgq();
+        if self.closed.load(Ordering::Relaxed) {
+            return Err((first, second));
+        }
+        let nmsgs = usize::from(!first.is_message()) + usize::from(!second.is_message());
+        queue.push_back(first);
+        queue.push_back(second);
+        self.enqueued(2, nmsgs);
+        drop(queue);
+        self.note_contention(contended);
+        Ok(())
+    }
+
     /// Close the queue for an exited receiver and move every signal still queued, buffered
     /// ones included, to `into`; enqueues after this fail.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_exit takes the
