@@ -2056,17 +2056,35 @@ pub(crate) fn monitor_light(
         [kind, target] => (*kind, *target, None),
         [kind, target, _] => {
             let (tag, alias_mode, priority) = monitor_options(args).ok()?;
-            if tag != atom("DOWN") || priority {
+            if tag != Term::atom(arinsal_term::atoms::DOWN) || priority {
                 return None;
             }
             (*kind, *target, alias_mode)
         }
         _ => return None,
     };
-    if kind != atom("process") || crate::trace::active() {
+    if crate::trace::active() {
         return None;
     }
     let me = process.self_pid?;
+    if kind == Term::atom(arinsal_term::atoms::PORT) {
+        // Only the default tag takes this path; a custom tag or `priority` is the executor's.
+        let (tag, alias_mode, priority) = match args {
+            [_, _] => (Term::atom(arinsal_term::atoms::DOWN), None, false),
+            _ => monitor_options(args).ok()?,
+        };
+        if tag != Term::atom(arinsal_term::atoms::DOWN) || priority {
+            return None;
+        }
+        return Some(match monitor_port(process, me, target, tag, alias_mode) {
+            Ok(term) => Ok(term),
+            Err(VmError::Trap(trap)) => Err(trap),
+            Err(_) => Err(crate::exceptions::Trap::error(atom("system_limit"))),
+        });
+    }
+    if kind != Term::atom(arinsal_term::atoms::PROCESS) {
+        return None;
+    }
     let pid = Pid::from_term(target)?;
     if pid == me {
         return None;
@@ -2182,9 +2200,10 @@ pub(crate) fn unalias_origin(process: &mut Process, id: u64) -> bool {
             Some(crate::proc_create::OriginMonitor::Distributed { alias_mode }) => {
                 alias_mode.take().is_some()
             }
-            Some(crate::proc_create::OriginMonitor::Port { alias_mode, .. }) => {
-                alias_mode.take().is_some()
-            }
+            Some(
+                crate::proc_create::OriginMonitor::Port { alias_mode, .. }
+                | crate::proc_create::OriginMonitor::DistPort { alias_mode, .. },
+            ) => alias_mode.take().is_some(),
             None => false,
         }
     } else {
@@ -2285,6 +2304,7 @@ pub(crate) fn demonitor_origin(process: &mut Process, id: u64) -> OriginDemonito
             }
             OriginDemonitor::Port(port_id)
         }
+        crate::proc_create::OriginMonitor::DistPort { .. } => OriginDemonitor::Port(None),
         crate::proc_create::OriginMonitor::Distributed { .. } => OriginDemonitor::Distributed,
         crate::proc_create::OriginMonitor::Alias { .. } => unreachable!(),
     }
@@ -2309,13 +2329,27 @@ pub(crate) fn demonitor_light(
     let (flush, info) = demonitor_flags(options)?;
     let id = ref_id(reference)?;
     let cold = process.cold.as_ref()?;
-    if cold.dist_monitors.contains(&id) || cold.port_monitors.contains_key(&id) {
+    if cold.dist_monitors.contains(&id) {
+        return None;
+    }
+    if let Some(crate::proc_create::OriginMonitor::Port {
+        port_id: Some(port_id),
+        ..
+    }) = cold.monitors.get(&id)
+    {
+        // Port of erts/emulator/beam/bif.c:504-510 (demonitor, ERTS_MON_TYPE_PORT), OTP-29.1.1.
+        let (port_id, me) = (*port_id, process.self_pid?);
+        let _ = demonitor_origin(process, id);
+        crate::port::demonitor_port(process, me, port_id, id);
+        return Some(Ok(Term::atom(arinsal_term::atoms::TRUE)));
+    }
+    if cold.port_monitors.contains_key(&id) {
         return None;
     }
     let active = match cold.monitors.get(&id) {
         Some(crate::proc_create::OriginMonitor::Process(half)) => Some(half.target),
         Some(crate::proc_create::OriginMonitor::Alias { .. }) => {
-            return Some(Ok(atom("false")));
+            return Some(Ok(Term::atom(arinsal_term::atoms::FALSE)));
         }
         _ => None,
     };
@@ -2334,7 +2368,7 @@ pub(crate) fn demonitor_light(
         if !flush || !scheduler.cancel_pending_monitor(pid, id) {
             let _ = scheduler.signal_ordered(me, pid, arinsal_sched::Signal::Demonitor(id));
         }
-        atom("true")
+        Term::atom(arinsal_term::atoms::TRUE)
     } else {
         atom(if info { "false" } else { "true" })
     };
@@ -2588,6 +2622,108 @@ pub(crate) fn call(
     _args: &[Term],
 ) -> Option<Result<Term, VmError>> {
     None
+}
+
+/// `monitor(port, Target)`: a port id, a registered name or `{Name, node()}`.
+// Port of erts/emulator/beam/bif.c:895-945 (monitor/3, type `port`), OTP-29.1.1.
+fn monitor_port(
+    process: &mut Process,
+    me: Pid,
+    target: Term,
+    tag: Term,
+    alias_mode: Option<crate::proc_create::AliasMode>,
+) -> Result<Term, VmError> {
+    let runtime = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
+    let reference_id = runtime.next_ref();
+    let reference_term = reference(process, reference_id)?;
+    if alias_mode.is_some() {
+        runtime.alias_bind_prio(reference_id, Some(me), false);
+    }
+    // Port of erts/emulator/beam/bif.c:895-945 (monitor/3, type `port`), OTP-29.1.1.
+    let local_node = || global_atoms().get(&crate::node_tables::lock().local_name);
+    let (port_id, name) = if let Some(id) = target.as_port() {
+        (Some(id), None)
+    } else if let Some(name) = target.as_atom() {
+        (runtime.reg.whereis_port(name), Some(name))
+    } else if let Some(name) = named_on_this_node(target, local_node()) {
+        (runtime.reg.whereis_port(name), Some(name))
+    } else if let Ok(object @ arinsal_etf::OwnedTerm::Port { .. }) = to_owned(target) {
+        // A port of another node is badarg; a port of another incarnation of this node
+        // never matches a live port (ERTS_MON_TYPE_DIST_PORT).
+        if let arinsal_etf::OwnedTerm::Port { node, .. } = &object
+            && *node != crate::node_tables::lock().local_name
+        {
+            return Err(badarg("monitor/2"));
+        }
+        process.cold_mut().monitors.insert(
+            reference_id,
+            crate::proc_create::OriginMonitor::DistPort {
+                alias_mode,
+                object: object.clone(),
+            },
+        );
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let object =
+            arinsal_term::from_owned(&object, &mut heap).map_err(|_| badarg("monitor/2"))?;
+        let down = TermBuilder::new(&mut heap)
+            .tuple(&[tag, reference_term, atom("port"), object, atom("noproc")])
+            .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
+        process.inbox.push_back(down);
+        let _ = take_origin_monitor_down(process, reference_id);
+        return Ok(reference_term);
+    } else {
+        return Err(badarg("monitor/2"));
+    };
+    // The port monitor stays in the origin tree until its DOWN signal is processed,
+    // just like the monitor object in `erts_proc_sig_send_monitor_down`.
+    process.cold_mut().monitors.insert(
+        reference_id,
+        crate::proc_create::OriginMonitor::Port {
+            port_id,
+            alias_mode,
+            name,
+        },
+    );
+    if let Some(id) = port_id.filter(|id| runtime.ports.read().unwrap().contains_key(id)) {
+        if tag != atom("DOWN") {
+            // Port monitors carry no tag yet (typed gap, see report).
+            return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));
+        }
+        let port = Term::port(id).ok_or_else(|| badarg("monitor/2"))?;
+        if !crate::port::monitor(process, port, reference_id, me, name, true)? {
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            let object = port_monitor_object(&mut heap, port_id, name)?;
+            let down = TermBuilder::new(&mut heap)
+                .tuple(&[tag, reference_term, atom("port"), object, atom("noproc")])
+                .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
+            process.inbox.push_back(down);
+            let _ = take_origin_monitor_down(process, reference_id);
+        } else {
+            // Origin stays in this process; the target half is on the port.
+            process.cold_mut().port_monitors.insert(reference_id, id);
+        }
+        Ok(reference_term)
+    } else {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let object = port_monitor_object(&mut heap, port_id, name)?;
+        let down = TermBuilder::new(&mut heap)
+            .tuple(&[tag, reference_term, atom("port"), object, atom("noproc")])
+            .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
+        process.inbox.push_back(down);
+        let _ = take_origin_monitor_down(process, reference_id);
+        Ok(reference_term)
+    }
+}
+
+/// `{Name, Node}` with both atoms and `Node` the local node: the by-name port target.
+fn named_on_this_node(target: Term, local_node: Option<Atom>) -> Option<Atom> {
+    // SAFETY: `target` is a BIF argument, rooted for the duration of the call.
+    let tuple = unsafe { target.tuple_ref() }?;
+    if tuple.len() != 2 {
+        return None;
+    }
+    let (name, node) = (tuple.get(0)?.as_atom()?, tuple.get(1)?.as_atom()?);
+    (Some(node) == local_node).then_some(name)
 }
 
 fn call_resolved(
@@ -2913,94 +3049,7 @@ fn call_resolved(
             if *kind == atom("port") =>
         {
             let (tag, alias_mode, _priority) = monitor_options(args)?;
-            let runtime = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
-            let reference_id = runtime.next_ref();
-            let reference_term = reference(process, reference_id)?;
-            if alias_mode.is_some() {
-                runtime.alias_bind_prio(reference_id, Some(ctx.pid()), false);
-            }
-            let (port_id, object) = if let Some(id) = target.as_port() {
-                (
-                    Some(id),
-                    to_owned(*target).map_err(|_| badarg("monitor/2"))?,
-                )
-            } else if let Some(name) = atom_name(*target).or_else(|| {
-                crate::dist::name_node_tuple(*target)
-                    .ok()
-                    .flatten()
-                    .map(|(name, _node)| name)
-            }) {
-                let id = runtime.reg.whereis_port_str(&name);
-                let node = crate::node_tables::lock().local_name.clone();
-                (
-                    id,
-                    arinsal_etf::OwnedTerm::Tuple(vec![
-                        arinsal_etf::OwnedTerm::Atom(name),
-                        arinsal_etf::OwnedTerm::Atom(node),
-                    ]),
-                )
-            } else if let Ok(object @ arinsal_etf::OwnedTerm::Port { .. }) = to_owned(*target) {
-                // Port of erts/emulator/beam/bif.c:923 (monitor/3): a port of another node is badarg;
-                // a port of another incarnation of this node never matches a live port.
-                if let arinsal_etf::OwnedTerm::Port { node, .. } = &object
-                    && *node != crate::node_tables::lock().local_name
-                {
-                    return Err(badarg("monitor/2"));
-                }
-                (None, object)
-            } else {
-                return Err(badarg("monitor/2"));
-            };
-            // The port monitor stays in the origin tree until its DOWN signal is processed,
-            // just like the monitor object in `erts_proc_sig_send_monitor_down`.
-            process.cold_mut().monitors.insert(
-                reference_id,
-                crate::proc_create::OriginMonitor::Port {
-                    port_id,
-                    alias_mode,
-                    object: object.clone(),
-                },
-            );
-            if let Some(id) = port_id.filter(|id| runtime.ports.read().unwrap().contains_key(id)) {
-                if tag != atom("DOWN") {
-                    // Port monitors carry no tag yet (typed gap, see report).
-                    return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));
-                }
-                let port = Term::port(id).ok_or_else(|| badarg("monitor/2"))?;
-                if !crate::port::monitor(
-                    process,
-                    port,
-                    reference_id,
-                    ctx.pid(),
-                    object.clone(),
-                    true,
-                )? {
-                    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-                    let object = arinsal_term::from_owned(&object, &mut heap)
-                        .map_err(|_| badarg("monitor/2"))?;
-                    let down = TermBuilder::new(&mut heap)
-                        .tuple(&[tag, reference_term, atom("port"), object, atom("noproc")])
-                        .map_err(|error| {
-                            VmError::Unsupported(format!("port DOWN tuple: {error:?}"))
-                        })?;
-                    process.inbox.push_back(down);
-                    let _ = take_origin_monitor_down(process, reference_id);
-                } else {
-                    // Origin stays in this process; the target half is on the port.
-                    process.cold_mut().port_monitors.insert(reference_id, id);
-                }
-                Ok(reference_term)
-            } else {
-                let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-                let object = arinsal_term::from_owned(&object, &mut heap)
-                    .map_err(|_| badarg("monitor/2"))?;
-                let down = TermBuilder::new(&mut heap)
-                    .tuple(&[tag, reference_term, atom("port"), object, atom("noproc")])
-                    .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
-                process.inbox.push_back(down);
-                let _ = take_origin_monitor_down(process, reference_id);
-                Ok(reference_term)
-            }
+            monitor_port(process, ctx.pid(), *target, tag, alias_mode)
         }
         (SignalBif::Demonitor1, [reference]) | (SignalBif::Demonitor2, [reference, _]) => {
             let id = ref_id(*reference).ok_or_else(|| badarg("demonitor/1"))?;
@@ -4194,6 +4243,25 @@ pub(crate) fn monitor_object(
         .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")))
 }
 
+/// The monitored object of a local port monitor in `'DOWN'` messages and `process_info`.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c (convert_to_down_message), OTP-29.1.1:
+// a monitor created by name reports `{Name, node()}`, otherwise the port id.
+pub(crate) fn port_monitor_object<H: arinsal_term::HeapAlloc + ?Sized>(
+    heap: &mut H,
+    port_id: Option<u64>,
+    name: Option<Atom>,
+) -> Result<Term, VmError> {
+    if let Some(name) = name {
+        let node = crate::node_tables::lock().local_name.clone();
+        return TermBuilder::new(heap)
+            .tuple(&[Term::atom(name), atom(&node)])
+            .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")));
+    }
+    port_id
+        .and_then(Term::port)
+        .ok_or_else(|| VmError::Unsupported("port monitor without a port id".into()))
+}
+
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:3027
 // (erts_proc_sig_send_is_alive_request), OTP-29.1.1.
 fn is_process_alive(
@@ -4358,6 +4426,11 @@ fn send_exit_signal_bif(
     };
     let suicide = exit2 && pid == ctx.pid() && (reason == atom("kill") || !process.trap_exit);
     if suicide {
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_exit_signal), OTP-29.1.1:
+        // the self-signal is handled like any exit signal, so `kill` becomes `killed`.
+        if reason == atom("kill") {
+            return Err(VmError::Trap(crate::exceptions::Trap::killed()));
+        }
         process.note_exit_reason(reason)?;
         return Err(VmError::Trap(crate::exceptions::Trap::untrappable_exit(
             reason,

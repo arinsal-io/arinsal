@@ -3778,6 +3778,7 @@ impl Executor {
         process.receive_cursor = 0;
         process.receive_deadline = None;
         process.receive_deadline_ms = None;
+        process.receive_infinity = false;
         // erts resumes a hibernated process at the export address of apply/3 too.
         self.vm.enter_native_at_jump(process);
         Ok(())
@@ -4049,6 +4050,12 @@ fn hibernate_stopped(process: &mut Process) -> bool {
 
 // Uncaught errors leave `{Reason, Stack}` so links and monitors match erts.
 // boot_loop2: OTP sends that pair; other raised classes send the reason alone.
+/// The origin entry of a port monitor, as needed to build its `'DOWN'` message.
+enum PortObject {
+    Local(Option<u64>, Option<arinsal_term::Atom>),
+    Dist(arinsal_etf::OwnedTerm),
+}
+
 fn exit_reason_from(process: &mut Process, error: &VmError) -> Term {
     if let Some(reason) = process
         .cold
@@ -6027,7 +6034,11 @@ impl Process {
                 Some(crate::proc_create::OriginMonitor::Distributed { .. }) => {
                     crate::dist::demonitor_alias(self, ctx, alias)?;
                 }
-                Some(crate::proc_create::OriginMonitor::Port { .. }) | None => {}
+                Some(
+                    crate::proc_create::OriginMonitor::Port { .. }
+                    | crate::proc_create::OriginMonitor::DistPort { .. },
+                )
+                | None => {}
             }
             runtime.alias_bind(alias, None);
         }
@@ -7295,7 +7306,12 @@ impl Process {
         }
         let (half, port_object) = match entry {
             Some(crate::proc_create::OriginMonitor::Process(half)) => (Some(half), None),
-            Some(crate::proc_create::OriginMonitor::Port { object, .. }) => (None, Some(object)),
+            Some(crate::proc_create::OriginMonitor::Port { port_id, name, .. }) => {
+                (None, Some(PortObject::Local(port_id, name)))
+            }
+            Some(crate::proc_create::OriginMonitor::DistPort { object, .. }) => {
+                (None, Some(PortObject::Dist(object)))
+            }
             _ => (None, None),
         };
         let tag = if let Some(owned) = half.as_ref().and_then(|half| half.data.tag.as_ref()) {
@@ -7311,8 +7327,16 @@ impl Process {
             // Port of erts/emulator/beam/erl_proc_sig_queue.c:4838-5056
             // (convert_to_down_message), OTP-29.1.1.
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
-            let object = arinsal_term::from_owned(&object, &mut heap)
-                .map_err(|error| VmError::Unsupported(format!("port monitor object: {error:?}")))?;
+            let object = match object {
+                PortObject::Local(port_id, name) => {
+                    crate::signals::port_monitor_object(&mut heap, port_id, name)?
+                }
+                PortObject::Dist(object) => {
+                    arinsal_term::from_owned(&object, &mut heap).map_err(|error| {
+                        VmError::Unsupported(format!("port monitor object: {error:?}"))
+                    })?
+                }
+            };
             (crate::signals::atom("port"), object)
         } else {
             let from = crate::dist::remote_pid_term(self, from)?

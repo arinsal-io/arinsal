@@ -409,6 +409,9 @@ pub struct Process {
     pub(crate) receive_cursor: usize,
     pub(crate) receive_deadline: Option<std::time::Instant>,
     pub(crate) receive_deadline_ms: Option<u64>,
+    /// `F_TIMO` for `wait_timeout infinity`: the wait is initialised, so a wakeup must not
+    /// re-read the operand (erts/emulator/beam/emu/msg_instrs.tab, wait.src).
+    pub(crate) receive_infinity: bool,
     pub(crate) cold: Option<Box<ProcessCold>>,
     /// `p->group_leader`. Kept on the process so a spawn does not allocate `ProcessCold`.
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
@@ -924,8 +927,15 @@ pub(crate) enum OriginMonitor {
     Distributed {
         alias_mode: Option<AliasMode>,
     },
+    /// `ERTS_MON_TYPE_PORT`: the port id (none when `name` is not registered) and the
+    /// registered name the monitor was created with.
     Port {
         port_id: Option<u64>,
+        alias_mode: Option<AliasMode>,
+        name: Option<arinsal_term::Atom>,
+    },
+    /// `ERTS_MON_TYPE_DIST_PORT`: an external port of an old incarnation of this node.
+    DistPort {
         alias_mode: Option<AliasMode>,
         object: arinsal_etf::OwnedTerm,
     },
@@ -939,7 +949,9 @@ impl OriginMonitor {
     pub(crate) fn alias_mode(&self) -> Option<AliasMode> {
         match self {
             Self::Process(half) => half.alias_mode,
-            Self::Distributed { alias_mode } | Self::Port { alias_mode, .. } => *alias_mode,
+            Self::Distributed { alias_mode }
+            | Self::Port { alias_mode, .. }
+            | Self::DistPort { alias_mode, .. } => *alias_mode,
             Self::Alias { mode, .. } => Some(*mode),
         }
     }
@@ -1715,6 +1727,7 @@ impl Process {
             receive_cursor: 0,
             receive_deadline: None,
             receive_deadline_ms: None,
+            receive_infinity: false,
             cold: None,
             group_leader: None,
             parent: None,
