@@ -1719,6 +1719,17 @@ fn build_frame(
         .map_err(|e| VmError::Unsupported(format!("stack frame {e:?}")))
 }
 
+/// Port of erts/emulator/beam/utils.c:3430 (`erts_build_mfa_item`), OTP-29.1.1.
+/// Saved `error/2,3` arguments are shown only when the term is a list or nil;
+/// every other sentinel means the frame's actual function arity.
+fn mfa_arity_or_args(args: Term, arity: u8) -> Term {
+    if matches!(args.classify(), TermKind::List | TermKind::Nil) {
+        args
+    } else {
+        Term::small(i64::from(arity)).expect("function arity is small")
+    }
+}
+
 /// Port of erts/emulator/beam/beam_common.c:781 (gather_stacktrace), OTP-29.1.1.
 /// A continuation points after the call; the preceding instruction owns its line.
 pub(super) fn build(
@@ -2391,6 +2402,7 @@ fn build_saved_active(
             }
             _ => Term::small(i64::from(arity)).expect("arity is small"),
         };
+        let top_args = mfa_arity_or_args(top_args, arity);
         let error_info = match top {
             Some(TopFrame::CurrentArgsWithInfo(_, info)) => Some(
                 from_owned(info.as_ref(), &mut heap)
