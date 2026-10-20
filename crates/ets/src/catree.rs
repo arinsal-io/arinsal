@@ -252,14 +252,15 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
-            let old_words = Node::get(&root, key, self.keypos)
-                .map_or(0, |stored| stored.db_size_words as isize);
             let new_words = object.as_ref().unwrap().db_size_words as isize;
-            *root = Some(Node::insert(
-                root.take(),
-                object.take().unwrap(),
-                self.keypos,
-            ));
+            let (updated, result) =
+                Node::insert_with_key(root.take(), object.take().unwrap(), key, self.keypos, false);
+            let old_words = match result {
+                crate::tree::InsertResult::Inserted => 0,
+                crate::tree::InsertResult::Replaced(words) => words as isize,
+                crate::tree::InsertResult::Exists => unreachable!("replacement cannot clash"),
+            };
+            *root = updated;
             self.memory_words
                 .fetch_add(new_words - old_words, AtomicOrdering::Relaxed);
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
@@ -284,17 +285,17 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
-            let inserted = if Node::get(&root, key, self.keypos).is_some() {
-                false
-            } else {
-                let stored = object
-                    .take()
-                    .expect("CA-tree insert object retained on retry");
-                self.memory_words
-                    .fetch_add(stored.db_size_words as isize, AtomicOrdering::Relaxed);
-                *root = Some(Node::insert(root.take(), stored, self.keypos));
-                true
-            };
+            let stored = object
+                .take()
+                .expect("CA-tree insert object retained on retry");
+            let words = stored.db_size_words as isize;
+            let (updated, result) =
+                Node::insert_with_key(root.take(), stored, key, self.keypos, true);
+            *root = updated;
+            let inserted = matches!(result, crate::tree::InsertResult::Inserted);
+            if inserted {
+                self.memory_words.fetch_add(words, AtomicOrdering::Relaxed);
+            }
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
             self.adapt(base, stat);
@@ -498,13 +499,14 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
-            let removed_words = Node::get(&root, key, self.keypos)
-                .filter(|found| found.exact_eq_input(object))
-                .map_or(0, |found| found.db_size_words as isize);
-            if removed_words != 0 {
-                *root = Node::remove(root.take(), key, self.keypos);
+            let (updated, removed_words) =
+                Node::remove_matching(root.take(), key, self.keypos, |found| {
+                    found.exact_eq_input(object)
+                });
+            *root = updated;
+            if let Some(removed_words) = removed_words {
                 self.memory_words
-                    .fetch_sub(removed_words, AtomicOrdering::Relaxed);
+                    .fetch_sub(removed_words as isize, AtomicOrdering::Relaxed);
             }
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
@@ -525,11 +527,13 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
-            let removed_words =
-                Node::get(&root, key, self.keypos).map_or(0, |found| found.db_size_words as isize);
-            *root = Node::remove(root.take(), key, self.keypos);
-            self.memory_words
-                .fetch_sub(removed_words, AtomicOrdering::Relaxed);
+            let (updated, removed_words) =
+                Node::remove_matching(root.take(), key, self.keypos, |_| true);
+            *root = updated;
+            if let Some(removed_words) = removed_words {
+                self.memory_words
+                    .fetch_sub(removed_words as isize, AtomicOrdering::Relaxed);
+            }
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
             drop(root);
             self.adapt(base, stat);
@@ -661,15 +665,19 @@ impl CATree {
         F: FnMut(&StoredTerm) -> Result<bool, EtsError>,
     {
         let routes = self.routes.load();
-        let iter: Box<dyn Iterator<Item = &RouteEntry>> = if reverse {
-            Box::new(routes.iter().rev())
+        if reverse {
+            for route in routes.iter().rev() {
+                let root = route.base.read();
+                if Node::scan_where(&root, reverse, eligible, self.keypos, &mut visit)? {
+                    return Ok(true);
+                }
+            }
         } else {
-            Box::new(routes.iter())
-        };
-        for route in iter {
-            let root = route.base.read();
-            if Node::scan_where(&root, reverse, eligible, self.keypos, &mut visit)? {
-                return Ok(true);
+            for route in routes.iter() {
+                let root = route.base.read();
+                if Node::scan_where(&root, reverse, eligible, self.keypos, &mut visit)? {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
@@ -755,17 +763,22 @@ impl CATree {
         state: &mut RangeSelection<'_, '_, H>,
     ) -> Result<(), EtsError> {
         let routes = self.routes.load();
-        let iter: Box<dyn Iterator<Item = &RouteEntry>> = if state.reverse {
-            Box::new(routes.iter().rev())
-        } else {
-            Box::new(routes.iter())
-        };
-        for route in iter {
-            if state.out.len() >= state.limit {
-                break;
+        if state.reverse {
+            for route in routes.iter().rev() {
+                if state.out.len() >= state.limit {
+                    break;
+                }
+                let root = route.base.read();
+                Node::select_range(&root, state)?;
             }
-            let root = route.base.read();
-            Node::select_range(&root, state)?;
+        } else {
+            for route in routes.iter() {
+                if state.out.len() >= state.limit {
+                    break;
+                }
+                let root = route.base.read();
+                Node::select_range(&root, state)?;
+            }
         }
         Ok(())
     }
@@ -778,18 +791,23 @@ impl CATree {
         dst: &mut H,
     ) -> Result<Vec<Term>, EtsError> {
         let routes = self.routes.load();
-        let iter: Box<dyn Iterator<Item = &RouteEntry>> = if reverse {
-            Box::new(routes.iter().rev())
-        } else {
-            Box::new(routes.iter())
-        };
         let mut out = Vec::new();
-        for route in iter {
-            let root = route.base.read();
-            Node::scan_where(&root, reverse, &|_| true, self.keypos, &mut |object| {
-                out.push(object.copy_out(dst)?);
-                Ok(false)
-            })?;
+        if reverse {
+            for route in routes.iter().rev() {
+                let root = route.base.read();
+                Node::scan_where(&root, reverse, &|_| true, self.keypos, &mut |object| {
+                    out.push(object.copy_out(dst)?);
+                    Ok(false)
+                })?;
+            }
+        } else {
+            for route in routes.iter() {
+                let root = route.base.read();
+                Node::scan_where(&root, reverse, &|_| true, self.keypos, &mut |object| {
+                    out.push(object.copy_out(dst)?);
+                    Ok(false)
+                })?;
+            }
         }
         Ok(out)
     }

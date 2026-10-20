@@ -12,7 +12,7 @@ pub mod rwmtx;
 mod tree;
 mod tree_select;
 use catree::CATree;
-use tree::Node;
+use tree::{InsertResult, Node};
 pub use tree_select::{SavedKey, ScanPosition, TREE_SELECT_ITERATIONS, TreeScanEnd, TreeScanPlan};
 
 use arinsal_term::{
@@ -2668,11 +2668,22 @@ impl Table {
                 true,
             );
         }
-        if self.member_prepared(&prepared) {
-            return false;
+        match &mut self.storage {
+            Storage::Ordered(root) => {
+                let key = prepared.stored.key(self.options.keypos);
+                let (updated, result) = Node::insert_with_key(
+                    root.take(),
+                    prepared.stored,
+                    key,
+                    self.options.keypos,
+                    true,
+                );
+                *root = updated;
+                matches!(result, InsertResult::Inserted)
+            }
+            Storage::CATree(tree) => tree.insert_new(prepared.stored),
+            Storage::Hash(_) => unreachable!("hash storage handled above"),
         }
-        self.insert_prepared(prepared);
-        true
     }
 
     /// Insert a prepared object if its key has no live entry, under its hash stripe or CA-tree
@@ -2963,6 +2974,10 @@ impl Table {
 
     fn insert_new_mode(&mut self, objects: &[Term], single: bool) -> Result<bool, EtsError> {
         // Port of erts/emulator/beam/erl_db.c (ets_insert_new_2), OTP-29.1.1.
+        if single {
+            let prepared = Self::prepare_object(&self.options, objects[0])?;
+            return Ok(self.insert_new_prepared(prepared));
+        }
         for &object in objects {
             key_of(object, self.options.keypos)?;
         }
@@ -3387,11 +3402,10 @@ impl Table {
         let fixed = self.fixed > 0;
         match &mut self.storage {
             Storage::Ordered(root) => {
-                if Node::get(root, key, self.options.keypos)
-                    .is_some_and(|found| found.exact_eq_term(object))
-                {
-                    *root = Node::remove(root.take(), key, self.options.keypos);
-                }
+                *root = Node::remove_matching(root.take(), key, self.options.keypos, |found| {
+                    found.exact_eq_term(object)
+                })
+                .0;
             }
             Storage::CATree(tree) => tree.delete_object(key, object),
             Storage::Hash(storage) => storage.delete_object_exclusive(
@@ -3762,15 +3776,17 @@ impl Table {
             objects.reverse();
             return Ok(objects);
         }
-        let mut objects = Vec::new();
         match &self.storage {
-            Storage::Ordered(root) => Node::walk(root, &mut objects),
+            Storage::Ordered(root) => {
+                let mut objects = Vec::new();
+                Node::walk_each(root, &mut |object| {
+                    objects.push(object.copy_out(dst)?);
+                    Ok(())
+                })?;
+                Ok(objects)
+            }
             Storage::CATree(_) | Storage::Hash(_) => unreachable!("storage handled above"),
         }
-        objects
-            .into_iter()
-            .map(|object| object.copy_out(dst))
-            .collect()
     }
 
     /// Drop all fixations `pid` holds on this table.
@@ -4230,22 +4246,26 @@ impl Table {
             results.reverse();
             return Ok(results);
         }
-        let mut objects = Vec::new();
+        let mut results = Vec::new();
         match &self.storage {
             Storage::Ordered(root) => {
-                Node::walk(root, &mut objects);
-                if reverse {
-                    objects.reverse();
-                }
+                Node::scan_where(
+                    root,
+                    reverse,
+                    &|_| true,
+                    self.options.keypos,
+                    &mut |object| {
+                        let (term, size) = object.term_for_filter_with_size(dst)?;
+                        if let Some(result) =
+                            runner.run_with_context_sized(term, dst, context, size)?
+                        {
+                            results.push(result);
+                        }
+                        Ok(false)
+                    },
+                )?;
             }
             Storage::Hash(_) | Storage::CATree(_) => unreachable!("storage handled above"),
-        }
-        let mut results = Vec::new();
-        for object in objects {
-            let (term, size) = object.term_for_filter_with_size(dst)?;
-            if let Some(result) = runner.run_with_context_sized(term, dst, context, size)? {
-                results.push(result);
-            }
         }
         Ok(results)
     }
@@ -4390,8 +4410,10 @@ impl Table {
                     &mut |object| {
                         let key = object.key(self.options.keypos);
                         continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
-                        let term = object.term_for_filter(dst)?;
-                        if let Some(result) = runner.run_with_context(term, dst, context)? {
+                        let (term, size) = object.term_for_filter_with_size(dst)?;
+                        if let Some(result) =
+                            runner.run_with_context_sized(term, dst, context, size)?
+                        {
                             rows.push(result);
                         }
                         Ok(rows.len() == limit)
@@ -4544,27 +4566,26 @@ impl Table {
             results.reverse();
             return Ok(results);
         }
-        let mut objects = Vec::new();
         match &self.storage {
             Storage::Ordered(root) => {
-                Node::walk(root, &mut objects);
-                if reverse {
-                    objects.reverse();
-                }
+                let mut results = Vec::new();
+                Node::scan_where(
+                    root,
+                    reverse,
+                    &|_| true,
+                    self.options.keypos,
+                    &mut |object| {
+                        let (candidate, size) = object.term_for_filter_with_size(dst)?;
+                        if let Some(result) = runner.run_sized(candidate, dst, size)? {
+                            results.push(result);
+                        }
+                        Ok(results.len() >= limit)
+                    },
+                )?;
+                Ok(results)
             }
             Storage::Hash(_) | Storage::CATree(_) => unreachable!("storage handled above"),
         }
-        let mut results = Vec::new();
-        for object in objects {
-            let (candidate, size) = object.term_for_filter_with_size(dst)?;
-            if let Some(result) = runner.run_sized(candidate, dst, size)? {
-                results.push(result);
-            }
-            if results.len() >= limit {
-                break;
-            }
-        }
-        Ok(results)
     }
 
     /// Count objects selected by a match specification.
@@ -4607,6 +4628,7 @@ impl Table {
         }
         let true_atom = Term::atom(global_true());
         let mut scratch = VecHeap::new();
+        let mut runner = program.runner();
         let mut visited = 0;
         let more = match &self.storage {
             Storage::Ordered(root) => {
@@ -4614,8 +4636,9 @@ impl Table {
                 Node::scan_after(root, cursor, false, self.options.keypos, &mut |object| {
                     let key = object.key(self.options.keypos);
                     continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
-                    if program
-                        .run(object.term_for_filter(&mut scratch)?, &mut scratch)?
+                    let (term, size) = object.term_for_filter_with_size(&mut scratch)?;
+                    if runner
+                        .run_sized(term, &mut scratch, size)?
                         .is_some_and(|value| exact_eq(value, true_atom))
                     {
                         continuation.total += 1;
@@ -4629,8 +4652,9 @@ impl Table {
                 tree.scan_after(cursor, false, |object| {
                     let key = object.key(self.options.keypos);
                     continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
-                    if program
-                        .run(object.term_for_filter(&mut scratch)?, &mut scratch)?
+                    let (term, size) = object.term_for_filter_with_size(&mut scratch)?;
+                    if runner
+                        .run_sized(term, &mut scratch, size)?
                         .is_some_and(|value| exact_eq(value, true_atom))
                     {
                         continuation.total += 1;
@@ -4645,8 +4669,9 @@ impl Table {
                 }
                 while continuation.slot < storage.nactive() {
                     storage.try_with_slot_ordered(continuation.slot, false, |object, _| {
-                        if program
-                            .run(object.term_for_filter(&mut scratch)?, &mut scratch)?
+                        let (term, size) = object.term_for_filter_with_size(&mut scratch)?;
+                        if runner
+                            .run_sized(term, &mut scratch, size)?
                             .is_some_and(|value| exact_eq(value, true_atom))
                         {
                             continuation.total += 1;
@@ -4674,45 +4699,31 @@ impl Table {
     // erl_db_tree.c (db_select_count_tree), OTP-29.1.1.
     pub fn select_count(&self, program: &match_spec::MatchProgram) -> Result<usize, EtsError> {
         let mut heap = VecHeap::new();
+        let mut runner = program.runner();
         let true_atom = Term::atom(global_true());
         let mut count = 0;
-        if let Some(key) = program.exact_key_pattern(self.options.keypos) {
-            self.try_for_matching(key, |object| {
-                let term = object.term_for_filter(&mut heap)?;
-                if program
-                    .run(term, &mut heap)?
+        {
+            let mut visit = |object: &StoredTerm| -> Result<(), EtsError> {
+                let (term, size) = object.term_for_filter_with_size(&mut heap)?;
+                if runner
+                    .run_sized(term, &mut heap, size)?
                     .is_some_and(|result| exact_eq(result, true_atom))
                 {
                     count += 1;
                 }
                 Ok(())
-            })?;
-            return Ok(count);
-        }
-        let visit = |object: &StoredTerm| -> Result<(), EtsError> {
-            let term = object.term_for_filter(&mut heap)?;
-            if program
-                .run(term, &mut heap)?
-                .is_some_and(|result| exact_eq(result, true_atom))
-            {
-                count += 1;
-            }
-            Ok(())
-        };
-        match &self.storage {
-            Storage::Hash(storage) => storage.try_for_each_value(visit)?,
-            Storage::Ordered(root) => {
-                let mut objects = Vec::new();
-                Node::walk(root, &mut objects);
-                objects.into_iter().try_for_each(visit)?;
-            }
-            Storage::CATree(tree) => {
-                for term in tree.walk(false, &mut heap)? {
-                    if program
-                        .run(term, &mut heap)?
-                        .is_some_and(|result| exact_eq(result, true_atom))
-                    {
-                        count += 1;
+            };
+            if let Some(key) = program.exact_key_pattern(self.options.keypos) {
+                self.try_for_matching(key, &mut visit)?;
+            } else {
+                match &self.storage {
+                    Storage::Hash(storage) => storage.try_for_each_value(&mut visit)?,
+                    Storage::Ordered(root) => Node::walk_each(root, &mut visit)?,
+                    Storage::CATree(tree) => {
+                        tree.scan_where(false, &|_| true, |object| {
+                            visit(object)?;
+                            Ok(false)
+                        })?;
                     }
                 }
             }

@@ -206,8 +206,13 @@ pub(super) fn db_prog_match<C: MatchContext>(
         sp,
         variables,
     } = state;
-    variables.clear();
-    variables.resize(prog.num_bindings, Term::NIL);
+    // Port of erts/emulator/beam/erl_db_util.c (db_prog_match): a binding is initialized by
+    // its matchBind instruction before any guarded or result read.
+    if variables.len() < prog.num_bindings {
+        variables.resize(prog.num_bindings, Term::NIL);
+    } else {
+        variables.truncate(prog.num_bindings);
+    }
     esp.reserve(prog.stack_need);
     let true_term = bool_term(true);
     let false_term = bool_term(false);
