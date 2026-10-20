@@ -7316,7 +7316,7 @@ impl Process {
                 (None, Some(PortObject::Local(port_id, name)))
             }
             Some(crate::proc_create::OriginMonitor::DistPort { object, .. }) => {
-                (None, Some(PortObject::Dist(object)))
+                (None, Some(PortObject::Dist(*object)))
             }
             _ => (None, None),
         };

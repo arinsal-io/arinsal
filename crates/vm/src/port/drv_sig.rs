@@ -712,8 +712,7 @@ pub(crate) fn link(
         if linked { "link" } else { "unlink" },
         move |op| {
             let handle = &task_handle;
-            let live =
-                op == SigOp::Exec && task_runtime.ports.contains(handle.id);
+            let live = op == SigOp::Exec && task_runtime.ports.contains(handle.id);
             if linked {
                 // Port of erts/emulator/beam/io.c:2669 (port_sig_link), OTP-29.1.1.
                 if live {

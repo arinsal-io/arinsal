@@ -2648,7 +2648,7 @@ fn monitor_port(
             reference_id,
             crate::proc_create::OriginMonitor::DistPort {
                 alias_mode,
-                object: object.clone(),
+                object: Box::new(object.clone()),
             },
         );
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
@@ -2673,13 +2673,12 @@ fn monitor_port(
             name,
         },
     );
-    if let Some(id) = port_id.filter(|id| runtime.ports.contains(*id)) {
+    if let Some((id, handle)) = port_id.and_then(|id| Some((id, runtime.ports.get(id)?))) {
         if tag != atom("DOWN") {
             // Port monitors carry no tag yet (typed gap, see report).
             return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));
         }
-        let port = Term::port(id).ok_or_else(|| badarg("monitor/2"))?;
-        if !crate::port::monitor(process, port, reference_id, me, name, true)? {
+        if !crate::port::monitor(process, id, &handle, reference_id, me, name, true)? {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let object = port_monitor_object(&mut heap, port_id, name)?;
             let down = TermBuilder::new(&mut heap)
@@ -2804,10 +2803,7 @@ fn call_resolved(
             } else if let Some(port_id) = id.as_port() {
                 let handle = {
                     let _ports = rt.ports.lock().unwrap();
-                    let handle = rt
-                        .ports
-                        .get(port_id)
-                        .ok_or_else(|| badarg("register/2"))?;
+                    let handle = rt.ports.get(port_id).ok_or_else(|| badarg("register/2"))?;
                     if handle.exit_complete() {
                         return Err(badarg("register/2"));
                     }
