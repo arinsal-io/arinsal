@@ -592,10 +592,32 @@ fn iodata(t: Term) -> Option<Vec<u8>> {
             None
         }
     }
+    // Port of erts/emulator/beam/erl_iolist.c (erts_iolist_size, erts_iolist_to_buf): size the
+    // result first so the flat buffer is allocated once.
+    fn size(mut term: Term, mut tail: bool) -> Option<usize> {
+        let mut total = 0usize;
+        while term.classify() == TermKind::List {
+            // SAFETY: The list is traversed before the caller's process heap can move.
+            let (head, rest) = unsafe { term.cons_ref()? };
+            total = total.checked_add(size(head, false)?)?;
+            term = rest;
+            tail = true;
+        }
+        if term == Term::NIL {
+            Some(total)
+        } else if term.classify() == TermKind::Bitstring {
+            let bits = arinsal_bifs::bitstring_bit_len(term).ok()?;
+            bits.is_multiple_of(8).then_some(total + bits / 8)
+        } else if !tail && matches!(term.as_small(), Some(0..=255)) {
+            Some(total + 1)
+        } else {
+            None
+        }
+    }
     if t.as_small().is_some() {
         return None;
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(size(t, false)?);
     append(t, false, &mut out)?;
     Some(out)
 }
@@ -3503,11 +3525,11 @@ fn driver_control(
     let Some(opcode) = op.as_small().and_then(|n| u32::try_from(n).ok()) else {
         return Ok(atom("badarg"));
     };
-    let mut pieces = Vec::new();
-    if io_pieces(data, &mut pieces).is_none() {
+    // Port of erts/emulator/beam/io.c:4268 (erts_port_control): the iolist is flattened into one
+    // buffer sized by erts_iolist_size.
+    let Some(bytes) = iodata(data) else {
         return Ok(atom("badarg"));
-    }
-    let bytes = pieces.into_iter().flat_map(|(b, _)| b).collect::<Vec<_>>();
+    };
     drv_sig::control(process, ctx, caller, drv_port, opcode, bytes)
 }
 
