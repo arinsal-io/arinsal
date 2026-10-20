@@ -18,11 +18,18 @@ impl SearchPattern {
     /// Build the search data selected by OTP from the number of patterns.
     // Port of erts/emulator/beam/erl_bif_binary.c:470-615 (create_bmdata,
     // ac_add_one_pattern, ac_compute_failure_functions), OTP-29.1.1.
-    pub(super) fn compile(patterns: &[Vec<u8>]) -> Result<Self, BifError> {
-        if patterns.len() == 1 {
-            return Ok(Self::BoyerMoore(BoyerMoore::new(patterns[0].clone())?));
+    pub(super) fn compile_single(pattern: &[u8]) -> Result<Self, BifError> {
+        if pattern.is_empty() {
+            return Err(BifError::BADARG);
         }
-        Ok(Self::AhoCorasick(AhoCorasick::new(patterns)?))
+        Ok(Self::BoyerMoore(BoyerMoore::new(pattern)?))
+    }
+
+    pub(super) fn compile(patterns: Vec<Vec<u8>>) -> Result<Self, BifError> {
+        if patterns.len() == 1 {
+            return Self::compile_single(&patterns[0]);
+        }
+        Ok(Self::AhoCorasick(AhoCorasick::new(&patterns)?))
     }
 
     pub(super) fn tag(&self) -> &'static str {
@@ -42,70 +49,95 @@ impl SearchPattern {
 }
 
 pub(crate) struct BoyerMoore {
-    pattern: Vec<u8>,
-    good_shift: Vec<usize>,
-    bad_shift: Vec<usize>,
+    data: Vec<u64>,
+    width: usize,
+    pattern_offset: usize,
+    good_shift_offset: usize,
+    bad_shift_offset: usize,
     erts_payload_size: usize,
 }
 
 impl BoyerMoore {
     // Port of erts/emulator/beam/erl_bif_binary.c:385-515 (compute shifts and
     // create_bmdata), OTP-29.1.1.
-    fn new(pattern: Vec<u8>) -> Result<Self, BifError> {
+    fn new(pattern: &[u8]) -> Result<Self, BifError> {
         let width = pattern.len();
-        // Port of BM_SIZE_SINGLE / BM_SIZE_MULTI in erl_bif_binary.c. The inline C allocator
-        // aligns each field to a pointer-sized boundary on 64-bit macOS.
-        let align = |size: usize| size.div_ceil(8).checked_mul(8);
-        let erts_payload_size = if width == 1 {
-            8 + 32 // MYALIGN(1) + MYALIGN(sizeof(BMData))
-        } else {
-            align(width.checked_mul(8).ok_or(BifError::SystemLimit)?)
-                .and_then(|good| good.checked_add(2048))
-                .and_then(|arrays| arrays.checked_add(align(width)?))
-                .and_then(|saved| saved.checked_add(32))
-                .ok_or(BifError::SystemLimit)?
-        };
-        let mut bad_shift = Vec::new();
-        bad_shift
-            .try_reserve_exact(ALPHABET_SIZE)
+        if width == 0 {
+            return Err(BifError::BADARG);
+        }
+        // BMData and its aligned arrays share one magic-binary allocation in ERTS.
+        let pattern_offset: usize = 4;
+        let pattern_words = width.div_ceil(8);
+        let good_shift_offset = pattern_offset
+            .checked_add(pattern_words)
+            .ok_or(BifError::SystemLimit)?;
+        let bad_shift_offset = good_shift_offset
+            .checked_add(if width > 1 { width } else { 0 })
+            .ok_or(BifError::SystemLimit)?;
+        let data_words = bad_shift_offset
+            .checked_add(if width > 1 { ALPHABET_SIZE } else { 0 })
+            .ok_or(BifError::SystemLimit)?;
+        let erts_payload_size = data_words.checked_mul(8).ok_or(BifError::SystemLimit)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(data_words)
             .map_err(|_| BifError::SystemLimit)?;
-        bad_shift.resize(ALPHABET_SIZE, width);
-        if width > 1 {
-            for index in 0..width - 1 {
-                bad_shift[pattern[index] as usize] = width - index - 1;
-            }
+        data.resize(data_words, 0);
+        data[0] = width as u64;
+        data[1] = pattern_offset as u64;
+        data[2] = good_shift_offset as u64;
+        data[3] = bad_shift_offset as u64;
+        for (index, byte) in pattern.iter().copied().enumerate() {
+            data[pattern_offset + index / 8] |= u64::from(byte) << ((index % 8) * 8);
         }
 
-        let mut good_shift = Vec::new();
         if width > 1 {
-            good_shift
-                .try_reserve_exact(width)
-                .map_err(|_| BifError::SystemLimit)?;
-            good_shift.resize(width, width);
-            let suffixes = suffixes(&pattern)?;
+            for index in 0..width {
+                data[good_shift_offset + index] = width as u64;
+            }
+            for index in 0..ALPHABET_SIZE {
+                data[bad_shift_offset + index] = width as u64;
+            }
+            for index in 0..width - 1 {
+                data[bad_shift_offset + pattern[index] as usize] = (width - index - 1) as u64;
+            }
+            let suffixes = suffixes(pattern)?;
             let mut j = 0;
             for i in (-1_isize..=(width as isize - 1)).rev() {
                 if i == -1 || suffixes[i as usize] == i + 1 {
                     while j < width as isize - 1 - i {
-                        if good_shift[j as usize] == width {
-                            good_shift[j as usize] = (width as isize - 1 - i) as usize;
+                        if data[good_shift_offset + j as usize] == width as u64 {
+                            data[good_shift_offset + j as usize] = (width as isize - 1 - i) as u64;
                         }
                         j += 1;
                     }
                 }
             }
             for i in 0..=(width as isize - 2) {
-                good_shift[width - 1 - suffixes[i as usize] as usize] =
-                    (width as isize - 1 - i) as usize;
+                data[good_shift_offset + width - 1 - suffixes[i as usize] as usize] =
+                    (width as isize - 1 - i) as u64;
             }
         }
 
         Ok(Self {
-            pattern,
-            good_shift,
-            bad_shift,
+            data,
+            width,
+            pattern_offset,
+            good_shift_offset,
+            bad_shift_offset,
             erts_payload_size,
         })
+    }
+
+    fn pattern_byte(&self, index: usize) -> u8 {
+        (self.data[self.pattern_offset + index / 8] >> ((index % 8) * 8)) as u8
+    }
+
+    fn good_shift(&self, index: usize) -> usize {
+        self.data[self.good_shift_offset + index] as usize
+    }
+
+    fn bad_shift(&self, index: usize) -> usize {
+        self.data[self.bad_shift_offset + index] as usize
     }
 }
 
@@ -298,7 +330,7 @@ impl SearchWalk {
         first_only: bool,
     ) -> Self {
         let too_short = match pattern.as_ref() {
-            SearchPattern::BoyerMoore(bm) => bm.pattern.len() > scope.1 - scope.0,
+            SearchPattern::BoyerMoore(bm) => bm.width > scope.1 - scope.0,
             SearchPattern::AhoCorasick(_) => false,
         };
         let state = match (pattern.as_ref(), first_only) {
@@ -364,22 +396,27 @@ impl SearchWalk {
         }
     }
 
-    /// Return recorded matches in the order produced by the OTP search.
-    // Port of erts/emulator/beam/erl_bif_binary.c:637-699, 729-824,
-    // 834-890, 918-1000 (match result collection), OTP-29.1.1.
-    pub(super) fn finish(&self) -> Vec<(usize, usize)> {
+    /// Read one recorded match without copying the search result buffer.
+    pub(super) fn match_at(&self, index: usize) -> Option<(usize, usize)> {
         match &self.state {
-            SearchState::BoyerMooreFirst { found, .. } => found.iter().copied().collect(),
+            SearchState::BoyerMooreFirst { found, .. } => {
+                if index == 0 {
+                    *found
+                } else {
+                    None
+                }
+            }
             SearchState::BoyerMooreAll { found, .. }
-            | SearchState::AhoCorasickAll { found, .. } => found.clone(),
+            | SearchState::AhoCorasickAll { found, .. } => found.get(index).copied(),
             SearchState::AhoCorasickFirst { candidate, .. } => {
+                if index != 0 {
+                    return None;
+                }
+                let (node, start) = (*candidate)?;
                 let SearchPattern::AhoCorasick(pattern) = self.pattern.as_ref() else {
                     unreachable!("Aho–Corasick state uses an Aho–Corasick pattern")
                 };
-                candidate
-                    .map(|(node, start)| (start, pattern.nodes[node].depth as usize))
-                    .into_iter()
-                    .collect()
+                Some((start, pattern.nodes[node].depth as usize))
             }
         }
     }
@@ -470,7 +507,7 @@ impl SearchWalk {
         done: &mut bool,
         mut on_match: impl FnMut((usize, usize), &mut usize, &mut bool),
     ) -> (bool, usize) {
-        let width = pattern.pattern.len();
+        let width = pattern.width;
         let last = width - 1;
         let mut work = 0;
         while !*done && work < budget {
@@ -491,7 +528,7 @@ impl SearchWalk {
             );
             let mem_read = available.min(read_limit);
             let haystack = &bytes[last_byte_start..last_byte_start + mem_read];
-            if let Some(offset) = memchr::memchr(pattern.pattern[last], haystack) {
+            if let Some(offset) = memchr::memchr(pattern.pattern_byte(last), haystack) {
                 work = work.saturating_add((last + offset) / MC_LOOP_FACTOR);
                 *position += offset;
             } else {
@@ -514,16 +551,15 @@ impl SearchWalk {
                 break;
             }
             work += 1;
-            let mismatch = pattern
-                .pattern
-                .iter()
-                .zip(bytes[*position..*position + width].iter())
-                .rposition(|(needle, hay)| needle != hay);
-            if let Some(index) = mismatch {
-                let index = index as isize;
+            let mut index = width;
+            while index > 0 && pattern.pattern_byte(index - 1) == bytes[*position + index - 1] {
+                index -= 1;
+            }
+            if index > 0 {
+                let index = (index - 1) as isize;
                 let hay_byte = bytes[*position + index as usize] as usize;
-                let bad = pattern.bad_shift[hay_byte] as isize - width as isize + 1 + index;
-                let good = pattern.good_shift[index as usize] as isize;
+                let bad = pattern.bad_shift(hay_byte) as isize - width as isize + 1 + index;
+                let good = pattern.good_shift(index as usize) as isize;
                 *position = position.saturating_add(good.max(bad) as usize);
             } else {
                 let result = (*position, width);
@@ -677,14 +713,16 @@ mod tests {
         scope: (usize, usize),
         first_only: bool,
     ) -> Vec<(usize, usize)> {
-        let pattern = Arc::new(SearchPattern::compile(&[needle.to_vec()]).unwrap());
+        let pattern = Arc::new(SearchPattern::compile(vec![needle.to_vec()]).unwrap());
         let mut walk = SearchWalk::new(bytes.len(), pattern, scope, first_only);
         let mut steps = 0;
         while !walk.step(bytes, 1).0 {
             steps += 1;
             assert!(steps < bytes.len() + 2, "search made no progress");
         }
-        walk.finish()
+        (0..walk.match_count())
+            .map(|index| walk.match_at(index).expect("recorded match"))
+            .collect()
     }
 
     #[test]
