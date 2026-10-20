@@ -7,7 +7,7 @@ const MODULE: &str = "re_run_yield";
 const SOURCE: &str = r#"
 -module(re_run_yield).
 -export([kill/0, same_result/0, kill_internal/0, internal_result/0, edge_cases/0,
-         sub_binaries/0, sub_binary_fallbacks/0, unicode_global/0]).
+         sub_binaries/0, sub_binary_fallbacks/0]).
 kill() ->
     Subject = binary:copy(<<"hejsan">>, 100000),
     {ok, Compiled} = re:compile(<<"\\w+\\d">>, []),
@@ -53,10 +53,6 @@ sub_binary_fallbacks() ->
     {match, [U]} = re:run(Unaligned, "(cdefgh)", [{capture, [1], binary}]),
     {match, [S]} = re:run(Small, "(cdefgh)", [{capture, [1], binary}]),
     {binary:referenced_byte_size(U), binary:referenced_byte_size(S)}.
-unicode_global() ->
-    {ok, Compiled} = re:compile("é", [unicode]),
-    [re:run("éaé", "é", [unicode, global, {capture, all, list}]),
-     re:run("éaé", Compiled, [global, {capture, all, binary}])].
 "#;
 
 fn both(function: &str) -> (CallResult, CallResult) {
@@ -96,12 +92,6 @@ fn sliced_matches_give_the_same_result() {
 #[test]
 fn global_empty_matches_and_improper_iodata_match_erts() {
     let (expected, actual) = both("edge_cases");
-    similar_asserts::assert_eq!(expected, actual);
-}
-
-#[test]
-fn unicode_global_inputs_trap_through_urun_and_grun_like_erts() {
-    let (expected, actual) = both("unicode_global");
     similar_asserts::assert_eq!(expected, actual);
 }
 

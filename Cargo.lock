@@ -349,7 +349,6 @@ dependencies = [
  "arinsal-term",
  "cc",
  "num-traits",
- "similar-asserts",
 ]
 
 [[package]]

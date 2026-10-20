@@ -2,7 +2,6 @@ use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_difftest::{CallResult, Error as RefError, RefErl};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, from_owned, to_owned};
-use similar_asserts::assert_eq;
 
 fn atom(name: &str) -> O {
     O::atom(name)
@@ -15,7 +14,8 @@ fn call(name: &str, args: &[O]) -> Result<O, BifError> {
         .map(|a| from_owned(a, &mut alloc).unwrap())
         .collect::<Vec<_>>();
     let mut ctx = Ctx::new(&mut alloc);
-    arinsal_re::invoke(&mut ctx, name, &terms).map(|value| to_owned(value).unwrap())
+    let bif = arinsal_re::lookup("re", name, args.len() as u8).unwrap();
+    bif(&mut ctx, &terms).map(|value| to_owned(value).unwrap())
 }
 fn reference() -> Option<&'static RefErl> {
     match RefErl::shared() {
@@ -535,32 +535,6 @@ fn compiled_patterns_match_reference_raw_runs() {
         }
     }
     assert!(checked >= 900);
-}
-
-#[test]
-fn global_list_captures_match_reference_for_large_binary_subjects() {
-    let Some(reference) = reference() else {
-        return;
-    };
-    let pattern = O::Binary(b"[0-9]+".to_vec());
-    let compiled = call("compile", std::slice::from_ref(&pattern)).unwrap();
-    let O::Tuple(ref compiled) = compiled else {
-        panic!("compile result")
-    };
-    let subject = O::Binary((0..128).flat_map(|_| b"ab12".iter().copied()).collect());
-    let options = O::list(vec![
-        O::atom("global"),
-        O::Tuple(vec![atom("capture"), atom("all"), atom("list")]),
-    ]);
-    let actual = local_result(
-        "run",
-        &[subject.clone(), compiled[1].clone(), options.clone()],
-    );
-    let expected = reference.call("re", "run", &[subject, pattern, options]);
-    assert!(
-        same_result(&actual, &expected),
-        "actual: {actual:?}\nreference: {expected:?}"
-    );
 }
 
 #[test]
