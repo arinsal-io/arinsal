@@ -882,16 +882,23 @@ fn cmp_ordered_key(left: Term, right: Term) -> Ordering {
     }
 }
 
+struct Compressed {
+    elements: Vec<Option<Vec<u8>>>,
+    magic_refs: Vec<Option<Arc<MagicRef>>>,
+    bytes: usize,
+}
+
+#[repr(C)]
 pub(crate) struct StoredTerm {
+    // First, so a tree descent reads the key through the node's first cache line.
+    pub(crate) term: Term,
     // Each object owns its heap. Moving this struct never moves the allocated words.
     heap: ObjectHeap,
-    pub(crate) term: Term,
     // ETS compressed tables retain only ETF bytes for non-key boxed elements.
     // The tuple heap contains NIL sentinels in those positions and never keeps
     // the original boxed values alive.
-    compressed_elements: Vec<Option<Vec<u8>>>,
-    compressed_magic_refs: Vec<Option<Arc<MagicRef>>>,
-    compressed_bytes: usize,
+    // Absent in uncompressed tables, keeping the common object small to move.
+    compressed: Option<Box<Compressed>>,
     pub(crate) db_size_words: usize,
     term_size_words: usize,
     /// The stored block can be copied out word by word (`copy_shallow`).
@@ -1085,9 +1092,7 @@ impl StoredTerm {
                 return Ok(Self {
                     heap,
                     term: copied,
-                    compressed_elements: Vec::new(),
-                    compressed_magic_refs: Vec::new(),
-                    compressed_bytes: 0,
+                    compressed: None,
                     db_size_words: prefix_words + 2 + size,
                     term_size_words: size,
                     shallow: true,
@@ -1152,9 +1157,13 @@ impl StoredTerm {
         Ok(Self {
             heap,
             term,
-            compressed_elements,
-            compressed_magic_refs,
-            compressed_bytes,
+            compressed: compressed.then(|| {
+                Box::new(Compressed {
+                    elements: compressed_elements,
+                    magic_refs: compressed_magic_refs,
+                    bytes: compressed_bytes,
+                })
+            }),
             db_size_words: if compressed {
                 Self::accounted_words(object, keypos, true, prefix_words, compressed_bytes)
             } else {
@@ -1173,11 +1182,15 @@ impl StoredTerm {
     }
 
     pub(crate) fn copy_stored(&self) -> Result<Self, EtsError> {
-        if self.compressed_elements.iter().any(Option::is_some) {
+        if self.compressed_elements().iter().any(Option::is_some) {
             let mut copy = Self::copy_heap(self.term)?;
-            copy.compressed_elements = self.compressed_elements.clone();
-            copy.compressed_magic_refs = self.compressed_magic_refs.clone();
-            copy.compressed_bytes = self.compressed_bytes;
+            copy.compressed = self.compressed.as_ref().map(|c| {
+                Box::new(Compressed {
+                    elements: c.elements.clone(),
+                    magic_refs: c.magic_refs.clone(),
+                    bytes: c.bytes,
+                })
+            });
             copy.db_size_words = self.db_size_words;
             return Ok(copy);
         }
@@ -1187,9 +1200,7 @@ impl StoredTerm {
         Ok(Self {
             heap,
             term,
-            compressed_elements: Vec::new(),
-            compressed_magic_refs: Vec::new(),
-            compressed_bytes: 0,
+            compressed: None,
             db_size_words: self.db_size_words,
             term_size_words: self.term_size_words,
             shallow,
@@ -1204,7 +1215,7 @@ impl StoredTerm {
     }
 
     fn raw_term(&self) -> Option<Term> {
-        if self.compressed_elements.iter().any(Option::is_some) {
+        if self.compressed_elements().iter().any(Option::is_some) {
             None
         } else {
             Some(self.term)
@@ -1213,6 +1224,14 @@ impl StoredTerm {
 
     fn arity(&self) -> usize {
         term_sequence(self.term).map_or(0, |tuple| tuple.len())
+    }
+
+    pub(crate) fn compressed_elements(&self) -> &[Option<Vec<u8>>] {
+        self.compressed.as_ref().map_or(&[], |c| &c.elements)
+    }
+
+    fn compressed_magic_refs(&self) -> &[Option<Arc<MagicRef>>] {
+        self.compressed.as_ref().map_or(&[], |c| &c.magic_refs)
     }
 
     pub(crate) fn key(&self, keypos: usize) -> Term {
@@ -1229,7 +1248,7 @@ impl StoredTerm {
         if value.is_pointer() || self.tuple_element(index).is_none_or(Term::is_pointer) {
             return false;
         }
-        if !self.compressed_elements.is_empty() || !self.term.is_pointer() {
+        if !self.compressed_elements().is_empty() || !self.term.is_pointer() {
             return false;
         }
         // The tuple lives in one of this object's own allocations: find its words by address.
@@ -1255,9 +1274,13 @@ impl StoredTerm {
         index: usize,
         dst: &mut H,
     ) -> Result<Term, EtsError> {
-        if let Some(bytes) = self.compressed_elements.get(index).and_then(Option::as_ref) {
+        if let Some(bytes) = self
+            .compressed_elements()
+            .get(index)
+            .and_then(Option::as_ref)
+        {
             if let Some(owner) = self
-                .compressed_magic_refs
+                .compressed_magic_refs()
                 .get(index)
                 .and_then(Option::as_ref)
             {
@@ -1291,7 +1314,7 @@ impl StoredTerm {
                 .enumerate()
                 .all(|(index, (stored, value))| {
                     if self
-                        .compressed_elements
+                        .compressed_elements()
                         .get(index)
                         .and_then(Option::as_ref)
                         .is_some()
@@ -1307,7 +1330,7 @@ impl StoredTerm {
                                     return false;
                                 };
                                 bytes.remove(0);
-                                self.compressed_elements[index].as_ref() == Some(&bytes)
+                                self.compressed_elements()[index].as_ref() == Some(&bytes)
                             })
                             .unwrap_or(false)
                     } else {
@@ -1317,10 +1340,10 @@ impl StoredTerm {
     }
 
     fn exact_eq_stored(&self, other: &StoredTerm) -> bool {
-        if self.compressed_elements.iter().any(Option::is_some)
-            || other.compressed_elements.iter().any(Option::is_some)
+        if self.compressed_elements().iter().any(Option::is_some)
+            || other.compressed_elements().iter().any(Option::is_some)
         {
-            return self.compressed_elements == other.compressed_elements
+            return self.compressed_elements() == other.compressed_elements()
                 && self.copy_equal_uncompressed(other);
         }
         exact_eq(self.term, other.term)
@@ -1341,13 +1364,13 @@ impl StoredTerm {
                 .enumerate()
                 .all(|(i, (a, b))| {
                     if self
-                        .compressed_elements
+                        .compressed_elements()
                         .get(i)
                         .and_then(Option::as_ref)
                         .is_some()
                     {
-                        self.compressed_elements[i]
-                            == other.compressed_elements.get(i).cloned().unwrap_or(None)
+                        self.compressed_elements()[i]
+                            == other.compressed_elements().get(i).cloned().unwrap_or(None)
                     } else {
                         exact_eq(*a, *b)
                     }
@@ -1356,7 +1379,7 @@ impl StoredTerm {
 
     fn copy_out<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
         let _keep_live = &self.heap;
-        if self.shallow && !self.compressed_elements.iter().any(Option::is_some) {
+        if self.shallow && !self.compressed_elements().iter().any(Option::is_some) {
             // Port of erts/emulator/beam/erl_db_util.h (db_copy_object_from_ets): the stored
             // block is copied word by word with the pointers offset.
             return Ok(arinsal_term::copy_shallow(
@@ -1365,7 +1388,7 @@ impl StoredTerm {
                 dst,
             )?);
         }
-        if !self.compressed_elements.iter().any(Option::is_some) {
+        if !self.compressed_elements().iter().any(Option::is_some) {
             // Port of erts/emulator/beam/erl_db_util.h:425 (db_copy_object_from_ets):
             // DbTerm.size is already known, so do not size the object again before copying it.
             return Ok(arinsal_term::copy_struct(
@@ -1378,9 +1401,13 @@ impl StoredTerm {
         let tuple = term_sequence(self.term).ok_or(EtsError::BadArg)?;
         let mut elements = Vec::with_capacity(tuple.len());
         for (index, element) in tuple.into_iter().enumerate() {
-            if let Some(bytes) = self.compressed_elements.get(index).and_then(Option::as_ref) {
+            if let Some(bytes) = self
+                .compressed_elements()
+                .get(index)
+                .and_then(Option::as_ref)
+            {
                 if let Some(owner) = self
-                    .compressed_magic_refs
+                    .compressed_magic_refs()
                     .get(index)
                     .and_then(Option::as_ref)
                 {
@@ -1452,7 +1479,7 @@ impl StoredTerm {
         &self,
         scratch: &mut H,
     ) -> Result<(Term, Option<match_spec::KnownObject<'_>>), EtsError> {
-        if !self.compressed_elements.iter().any(Option::is_some) {
+        if !self.compressed_elements().iter().any(Option::is_some) {
             return Ok((
                 self.term,
                 Some(match_spec::KnownObject {
@@ -1491,7 +1518,7 @@ fn update_counter_object_in_place(
     keypos: usize,
     operations: &[CounterOp],
 ) -> Option<smallvec::SmallVec<[Term; 4]>> {
-    if !object.compressed_elements.is_empty() {
+    if !object.compressed_elements().is_empty() {
         return None;
     }
     let mut updated: smallvec::SmallVec<[(usize, i64); 4]> = smallvec::SmallVec::new();

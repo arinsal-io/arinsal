@@ -771,7 +771,20 @@ pub fn flat_size(term: Term) -> usize {
 }
 /// Compare Erlang terms in term order. Port of `utils.c:1654` (`erts_cmp`),
 /// OTP-29.1.1, for the implemented term classes.
+#[inline]
 pub fn cmp(a: Term, b: Term) -> Ordering {
+    // Port of erts/emulator/beam/erl_utils.h (erts_cmp), OTP-29.1.1: atoms and small integers
+    // are compared inline; everything else goes to the out-of-line erts_cmp_compound.
+    if let (Some(x), Some(y)) = (a.as_atom(), b.as_atom()) {
+        return if a == b {
+            Ordering::Equal
+        } else {
+            global_atoms().cmp_atoms(x, y)
+        };
+    }
+    if let (Some(x), Some(y)) = (a.as_small(), b.as_small()) {
+        return x.cmp(&y);
+    }
     cmp_impl(a, b, false)
 }
 /// Compare Erlang terms using exact numeric ordering, including nested terms.

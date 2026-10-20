@@ -25,11 +25,6 @@ impl<T> TreeStack<T> {
     }
 }
 
-struct PathEntry {
-    node: Box<Node>,
-    went_left: bool,
-}
-
 /// Result of one `db_put_dbterm_tree_common` descent.
 #[derive(Clone, Copy)]
 pub(super) enum InsertResult {
@@ -39,13 +34,16 @@ pub(super) enum InsertResult {
 }
 
 /// One AVL node. The stored subtree size gives `ets:slot/2` logarithmic lookup.
+// Port of erts/emulator/beam/erl_db_tree_util.h (TreeDbTerm): the links and balance precede the
+// object, so one descent step reads one node cache line.
+#[repr(C)]
 pub(super) struct Node {
-    pub(super) object: StoredTerm,
-    pub(super) balance: i8,
-    size: usize,
-    height: u8,
     pub(super) left: Option<Box<Node>>,
     pub(super) right: Option<Box<Node>>,
+    size: usize,
+    pub(super) balance: i8,
+    height: u8,
+    pub(super) object: StoredTerm,
 }
 
 impl Node {
@@ -157,90 +155,89 @@ impl Node {
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
+    ///
+    /// The descent only reads: a node is written on the way back up only when its balance
+    /// changes, and a replaced object is overwritten at the node that holds it.
     fn insert_branch(
-        root: Option<Box<Self>>,
+        mut root: Option<Box<Self>>,
         object: StoredTerm,
         key: Term,
         keypos: usize,
         key_clash_fail: bool,
     ) -> (Option<Box<Self>>, InsertResult, bool) {
-        let mut path = TreeStack::new();
-        let mut current = root;
-        let mut child_grew;
-        let result;
-        loop {
-            let Some(mut node) = current.take() else {
-                current = Some(Self::new(object));
-                child_grew = true;
-                result = InsertResult::Inserted;
-                break;
-            };
+        // A key already in the tree is found by a plain loop; only a new key needs the
+        // rebalancing walk back up.
+        let mut cursor = &mut root;
+        while let Some(node) = cursor {
             match cmp(key, node.object.key(keypos)) {
-                Ordering::Equal if key_clash_fail => {
-                    current = Some(node);
-                    child_grew = false;
-                    result = InsertResult::Exists;
-                    break;
-                }
+                Ordering::Equal if key_clash_fail => return (root, InsertResult::Exists, false),
                 Ordering::Equal => {
                     let old_words = node.object.db_size_words;
                     node.object = object;
-                    current = Some(node);
-                    child_grew = false;
-                    result = InsertResult::Replaced(old_words);
-                    break;
+                    return (root, InsertResult::Replaced(old_words), false);
                 }
-                order => {
-                    let went_left = order == Ordering::Less;
-                    current = if went_left {
-                        node.left.take()
-                    } else {
-                        node.right.take()
-                    };
-                    path.push(PathEntry { node, went_left });
-                }
+                Ordering::Less => cursor = &mut node.left,
+                Ordering::Greater => cursor = &mut node.right,
             }
         }
-        while let Some(PathEntry {
-            mut node,
-            went_left,
-        }) = path.pop()
-        {
-            let old_balance = node.balance;
-            if went_left {
-                node.left = current.take();
-            } else {
-                node.right = current.take();
+        let mut object = Some(object);
+        let (result, grew) = Self::insert_at(&mut root, &mut object, key, keypos, key_clash_fail);
+        (root, result, grew)
+    }
+
+    fn insert_at(
+        slot: &mut Option<Box<Self>>,
+        object: &mut Option<StoredTerm>,
+        key: Term,
+        keypos: usize,
+        key_clash_fail: bool,
+    ) -> (InsertResult, bool) {
+        let Some(node) = slot.as_mut() else {
+            *slot = Some(Self::new(object.take().expect("object consumed once")));
+            return (InsertResult::Inserted, true);
+        };
+        let went_left = match cmp(key, node.object.key(keypos)) {
+            Ordering::Equal if key_clash_fail => return (InsertResult::Exists, false),
+            Ordering::Equal => {
+                let old_words = node.object.db_size_words;
+                node.object = object.take().expect("object consumed once");
+                return (InsertResult::Replaced(old_words), false);
             }
-            if !matches!(result, InsertResult::Inserted) {
-                current = Some(node);
-                child_grew = false;
-                continue;
-            }
-            node.size += 1;
-            if child_grew {
-                let delta = if went_left { -1 } else { 1 };
-                let balance = old_balance + delta;
-                match balance {
-                    -1 | 1 => {
-                        node.balance = balance;
-                        node.height += 1;
-                    }
-                    0 => {
-                        node.balance = 0;
-                        child_grew = false;
-                    }
-                    -2 | 2 => {
-                        node.balance = balance;
-                        node = Self::rebalance(node);
-                        child_grew = false;
-                    }
-                    _ => unreachable!("AVL balance factor is bounded"),
-                }
-            }
-            current = Some(node);
+            Ordering::Less => true,
+            Ordering::Greater => false,
+        };
+        let child = if went_left {
+            &mut node.left
+        } else {
+            &mut node.right
+        };
+        let (result, child_grew) = Self::insert_at(child, object, key, keypos, key_clash_fail);
+        if !matches!(result, InsertResult::Inserted) {
+            return (result, false);
         }
-        (current, result, child_grew)
+        node.size += 1;
+        if !child_grew {
+            return (result, false);
+        }
+        let balance = node.balance + if went_left { -1 } else { 1 };
+        match balance {
+            -1 | 1 => {
+                node.balance = balance;
+                node.height += 1;
+                (result, true)
+            }
+            0 => {
+                node.balance = 0;
+                (result, false)
+            }
+            -2 | 2 => {
+                node.balance = balance;
+                let node = slot.take().expect("slot holds the node");
+                *slot = Some(Self::rebalance(node));
+                (result, false)
+            }
+            _ => unreachable!("AVL balance factor is bounded"),
+        }
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (linkout_tree), OTP-29.1.1.
@@ -264,7 +261,7 @@ impl Node {
     }
 
     fn remove_branch<F>(
-        root: Option<Box<Self>>,
+        mut root: Option<Box<Self>>,
         key: Term,
         keypos: usize,
         matches: &mut F,
@@ -272,68 +269,45 @@ impl Node {
     where
         F: FnMut(&StoredTerm) -> bool,
     {
-        let mut path = TreeStack::new();
-        let mut current = root;
-        let removed;
-        loop {
-            let Some(mut node) = current.take() else {
-                removed = None;
-                break;
-            };
-            match cmp(key, node.object.key(keypos)) {
-                Ordering::Less => {
-                    current = node.left.take();
-                    path.push(PathEntry {
-                        node,
-                        went_left: true,
-                    });
-                }
-                Ordering::Greater => {
-                    current = node.right.take();
-                    path.push(PathEntry {
-                        node,
-                        went_left: false,
-                    });
-                }
-                Ordering::Equal if !matches(&node.object) => {
-                    current = Some(node);
-                    removed = None;
-                    break;
-                }
-                Ordering::Equal => {
-                    let words = node.object.db_size_words;
-                    current = match (node.left.take(), node.right.take()) {
-                        (None, right) => right,
-                        (left, None) => left,
-                        (Some(left), Some(right)) => {
-                            let (new_left, mut predecessor) = Self::take_max(left);
-                            predecessor.left = new_left;
-                            predecessor.right = Some(right);
-                            Some(Self::rebalance(predecessor))
-                        }
-                    };
-                    removed = Some(words);
-                    break;
-                }
+        let removed = Self::remove_at(&mut root, key, keypos, matches);
+        (root, removed)
+    }
+
+    // The descent only reads; ancestors are rebalanced on the way back only when an object
+    // was actually unlinked.
+    fn remove_at<F>(
+        slot: &mut Option<Box<Self>>,
+        key: Term,
+        keypos: usize,
+        matches: &mut F,
+    ) -> Option<usize>
+    where
+        F: FnMut(&StoredTerm) -> bool,
+    {
+        let node = slot.as_mut()?;
+        let removed = match cmp(key, node.object.key(keypos)) {
+            Ordering::Less => Self::remove_at(&mut node.left, key, keypos, matches)?,
+            Ordering::Greater => Self::remove_at(&mut node.right, key, keypos, matches)?,
+            Ordering::Equal if !matches(&node.object) => return None,
+            Ordering::Equal => {
+                let mut node = slot.take().expect("slot holds the node");
+                let words = node.object.db_size_words;
+                *slot = match (node.left.take(), node.right.take()) {
+                    (None, right) => right,
+                    (left, None) => left,
+                    (Some(left), Some(right)) => {
+                        let (new_left, mut predecessor) = Self::take_max(left);
+                        predecessor.left = new_left;
+                        predecessor.right = Some(right);
+                        Some(Self::rebalance(predecessor))
+                    }
+                };
+                return Some(words);
             }
-        }
-        while let Some(PathEntry {
-            mut node,
-            went_left,
-        }) = path.pop()
-        {
-            if went_left {
-                node.left = current.take();
-            } else {
-                node.right = current.take();
-            }
-            if removed.is_some() {
-                current = Some(Self::rebalance(node));
-            } else {
-                current = Some(node);
-            }
-        }
-        (current, removed)
+        };
+        let node = slot.take().expect("slot holds the node");
+        *slot = Some(Self::rebalance(node));
+        Some(removed)
     }
 
     /// Port of erts/emulator/beam/erl_db_tree.c (delsub), OTP-29.1.1.

@@ -55,6 +55,17 @@ fn split_under_contention() {
     assert_eq!(stored.len(), 512);
 }
 
+// Port of erts/emulator/beam/erl_db_catree.c (wlock_base_node): an uncontended write lowers the
+// base node statistics, so a single writer never splits the tree.
+#[test]
+fn uncontended_writes_never_split() {
+    let (registry, tid) = table(WriteConcurrency::Enabled);
+    let mut stored = registry.get_mut(tid).unwrap();
+    insert_range(&mut stored, 0, 3000);
+    assert_eq!(stored.catree_debug_base_count(), Some(1));
+    assert_eq!(stored.len(), 3000);
+}
+
 #[test]
 fn join_when_quiet() {
     let (registry, tid) = table(WriteConcurrency::Enabled);

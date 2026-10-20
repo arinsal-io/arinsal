@@ -47,8 +47,9 @@ impl BaseNode {
         match self.root.try_write() {
             Some(guard) => {
                 // Port of erts/emulator/beam/erl_db_catree.c (wlock_base_node), OTP-29.1.1.
-                // OTP subtracts the negative success contribution, so an uncontended write adds one.
-                self.adjust_stat(-LOCK_SUCCESS_CONTRIBUTION);
+                // BASE_NODE_STAT_SUB adds the negative success contribution: an uncontended
+                // write lowers the statistics by one.
+                self.adjust_stat(LOCK_SUCCESS_CONTRIBUTION);
                 guard
             }
             None => {
