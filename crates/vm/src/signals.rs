@@ -1064,7 +1064,10 @@ pub(crate) fn erl_create_process(
     // (spawn_opt monitor before schedule), OTP-29.1.1.
     let parent_pid = ctx.pid();
     if so.link {
-        child.cold_mut().links.insert(parent_pid);
+        child
+            .cold_mut()
+            .links
+            .insert(parent_pid, Default::default());
     }
     let monitor_id = so
         .monitor
@@ -1102,7 +1105,7 @@ pub(crate) fn erl_create_process(
     }
     .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
     if so.link {
-        parent.cold_mut().links.insert(pid);
+        parent.cold_mut().links.insert(pid, Default::default());
     }
     if crate::trace::spawn_interested(parent, parent_pid) {
         let arg_list = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut parent.heap))
@@ -2371,6 +2374,26 @@ pub(crate) fn demonitor_light(
     Some(Ok(result))
 }
 
+/// Port of erts/emulator/beam/bif.c:1231-1248 (unlink_1): send the unlink op, then mark the node
+/// with its id; a refused send (the peer is gone) deletes the node.
+fn unlink_send(
+    process: &mut Process,
+    pid: Pid,
+    id: u64,
+    send: impl FnOnce(arinsal_sched::Signal<Message>) -> bool,
+) {
+    let sent = send(arinsal_sched::Signal::Unlink(id));
+    let links = &mut process.cold_mut().links;
+    if sent {
+        if let Some(node) = links.get_mut(&pid) {
+            node.unlinking = id;
+            node.prio = false;
+        }
+    } else {
+        links.remove(&pid);
+    }
+}
+
 /// `unlink(Pid)` called directly from native code (erts unlink_1 with `c_p`) with tracing off.
 // Port of erts/emulator/beam/bif.c (unlink_1), OTP-29.1.1.
 pub(crate) fn unlink_light(
@@ -2387,16 +2410,14 @@ pub(crate) fn unlink_light(
     let me = process.self_pid?;
     // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
     let cold = process.cold.as_deref()?;
-    if !cold.links.contains(&pid) || cold.unlinking.values().any(|&target| target == pid) {
+    if !cold.links.get(&pid).is_some_and(|node| node.unlinking == 0) {
         return Some(Ok(atom("true")));
     }
     let id = rt_ref(process)?.next_ref();
-    process.cold_mut().unlinking.insert(id, pid);
-    let _ = rt_ref(process)?.scheduler().ok()?.signal_ordered(
-        me,
-        pid,
-        arinsal_sched::Signal::Unlink(id),
-    );
+    let scheduler = rt_ref(process)?.scheduler().ok()?.clone();
+    unlink_send(process, pid, id, |signal| {
+        scheduler.signal_ordered(me, pid, signal).is_ok()
+    });
     Some(Ok(atom("true")))
 }
 
@@ -2422,6 +2443,18 @@ pub(crate) fn link_light(
     if !rt_ref(process)?.scheduler().ok()?.lookup(pid) {
         return None;
     }
+    // Port of erts/emulator/beam/bif.c:165-183 (link_opt): a link that exists and is not
+    // unlinking sends nothing.
+    if process
+        .cold
+        .as_deref()?
+        .links
+        .get(&pid)
+        .is_some_and(|node| node.unlinking == 0)
+    {
+        process.cold_mut().links.get_mut(&pid)?.prio = false;
+        return Some(Ok(atom("true")));
+    }
     // A refused signal means the target is gone: leave the link state untouched and let the
     // executor answer noproc.
     rt_ref(process)?
@@ -2429,10 +2462,7 @@ pub(crate) fn link_light(
         .ok()?
         .signal_ordered(me, pid, arinsal_sched::Signal::Link)
         .ok()?;
-    let cold = process.cold_mut();
-    cold.unlinking.retain(|_, target| *target != pid);
-    cold.links.insert(pid);
-    process.cold_mut().prio_links.remove(&pid);
+    link_node_create(process.cold_mut(), pid, false);
     Some(Ok(atom("true")))
 }
 
@@ -2925,17 +2955,16 @@ fn call_resolved(
                         &[pid_term],
                     );
                 }
-                let should_unlink = process.cold.as_deref().is_some_and(|cold| {
-                    cold.links.contains(&pid)
-                        && !cold.unlinking.values().any(|&target| target == pid)
-                });
+                let should_unlink = process
+                    .cold
+                    .as_deref()
+                    .is_some_and(|cold| cold.links.get(&pid).is_some_and(|n| n.unlinking == 0));
                 if should_unlink {
                     let id = process
                         .runtime
                         .as_ref()
                         .map_or(1, |runtime| runtime.next_ref());
-                    process.cold_mut().unlinking.insert(id, pid);
-                    let _ = ctx.signal(pid, Signal::Unlink(id));
+                    unlink_send(process, pid, id, |signal| ctx.signal(pid, signal).is_ok());
                 }
                 wake_for_procs_trace(process, ctx, pid);
                 atom("true")
@@ -4303,14 +4332,9 @@ fn link_opt(
         return link_noproc(process, pid, priority);
     }
     crate::trace::linked(process, ctx.pid(), pid);
-    let cold = process.cold_mut();
-    cold.unlinking.retain(|_, target| *target != pid);
-    cold.links.insert(pid);
-    if priority {
-        process.cold_mut().prio_links.insert(pid);
-    } else {
-        process.cold_mut().prio_links.remove(&pid);
-    }
+    // Port of erts/emulator/beam/bif.c:165-183 (link_opt): one lookup_create on the link tree;
+    // a link that exists and is not unlinking sends nothing.
+    let send = link_node_create(process.cold_mut(), pid, priority);
     let linked_term = pid.to_term().ok_or_else(|| badarg("link"))?;
     crate::trace::emit(
         Some(vm),
@@ -4321,7 +4345,11 @@ fn link_opt(
         "link",
         &[linked_term],
     );
-    match ctx.signal(pid, Signal::Link) {
+    match if send {
+        ctx.signal(pid, Signal::Link)
+    } else {
+        Ok(())
+    } {
         // The linked process reports getting_linked when it handles the signal.
         Ok(()) => {}
         Err(arinsal_sched::Error::NoProcess) => {
@@ -4339,6 +4367,26 @@ fn link_opt(
     }
     wake_for_procs_trace(process, ctx, pid);
     Ok(atom("true"))
+}
+
+/// `erts_link_internal_tree_lookup_create` plus the `unlinking` reset of `link_opt`
+/// (bif.c:165-183): returns whether a link signal must be sent.
+fn link_node_create(cold: &mut crate::proc_create::ProcessCold, pid: Pid, priority: bool) -> bool {
+    use std::collections::btree_map::Entry;
+    match cold.links.entry(pid) {
+        Entry::Occupied(mut slot) => {
+            let node = slot.get_mut();
+            node.prio = priority;
+            std::mem::take(&mut node.unlinking) != 0
+        }
+        Entry::Vacant(slot) => {
+            slot.insert(crate::proc_create::ILink {
+                unlinking: 0,
+                prio: priority,
+            });
+            true
+        }
+    }
 }
 
 /// Linking to a process that does not exist: an `{'EXIT', Pid, noproc}` message when trapping

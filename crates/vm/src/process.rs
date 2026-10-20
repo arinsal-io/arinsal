@@ -4669,7 +4669,7 @@ impl Runtime {
             child.cold_mut().parent_external = Some(parent.clone());
         }
         if let Some(linker) = linker {
-            child.cold_mut().links.insert(linker);
+            child.cold_mut().links.insert(linker, Default::default());
         }
         if let Some((watcher, reference)) = monitor {
             child.insert_target_monitor(
@@ -4767,7 +4767,6 @@ impl Process {
                 Payload::Signal(Signal::Unlink(id)) => {
                     if let Some(cold) = self.cold.as_mut() {
                         cold.links.remove(&from);
-                        cold.prio_links.remove(&from);
                     }
                     let _ = ctx.signal(from, Signal::UnlinkAckSignal(id));
                 }
@@ -5111,8 +5110,8 @@ impl Process {
                 crate::port::demonitor_port(self, ctx.pid(), *port_id, reference);
             }
         }
-        for pid in cold.links {
-            if cold.unlinking.values().any(|unlinking| *unlinking == pid) {
+        for (pid, node) in cold.links {
+            if node.unlinking != 0 {
                 continue;
             }
             if self.runtime.as_ref().is_some_and(|runtime| {
@@ -6146,7 +6145,10 @@ impl Process {
             arinsal_sched::Signal::Link => {
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:6636-6646 (ERTS_SIG_Q_OP_LINK):
                 // the receiver reports getting_linked in signal order, for a new link only.
-                if self.cold_mut().links.insert(from) {
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    self.cold_mut().links.entry(from)
+                {
+                    slot.insert(Default::default());
                     self.trace_getting_linked(ctx, from);
                 }
                 0
@@ -6161,14 +6163,14 @@ impl Process {
             arinsal_sched::Signal::Unlink(id) => {
                 // Port of erl_proc_sig_queue.c:6693-6713: a pending local unlink keeps its
                 // link record until the matching acknowledgement is handled.
-                let removed = self.cold.as_mut().is_some_and(|cold| {
-                    if cold.unlinking.values().any(|&target| target == from) {
-                        false
-                    } else {
-                        cold.prio_links.remove(&from);
-                        cold.links.remove(&from)
-                    }
-                });
+                let removed = self
+                    .cold
+                    .as_mut()
+                    .is_some_and(|cold| match cold.links.get(&from) {
+                        Some(node) if node.unlinking != 0 => false,
+                        Some(_) => cold.links.remove(&from).is_some(),
+                        None => false,
+                    });
                 if removed {
                     self.trace_getting_unlinked(ctx, from);
                 }
@@ -6228,12 +6230,12 @@ impl Process {
                     || self
                         .cold
                         .as_ref()
-                        .is_some_and(|cold| cold.prio_links.contains(&from));
+                        .is_some_and(|cold| cold.links.get(&from).is_some_and(|node| node.prio));
                 let was_linked = linked_exit
-                    && self.cold.as_mut().is_some_and(|cold| {
-                        cold.prio_links.remove(&from);
-                        cold.links.remove(&from)
-                    });
+                    && self
+                        .cold
+                        .as_mut()
+                        .is_some_and(|cold| cold.links.remove(&from).is_some());
                 let mut message = message;
                 let seq_token = message.take_seq_token();
                 let reason = message.into_receiver(self)?;
@@ -6332,11 +6334,12 @@ impl Process {
             arinsal_sched::Signal::UnlinkAckSignal(id) => {
                 // Port of erl_proc_sig_queue.c:6745-6772: removing the link costs 4.
                 if let Some(cold) = self.cold.as_mut()
-                    && cold.unlinking.get(&id) == Some(&from)
+                    && cold
+                        .links
+                        .get(&from)
+                        .is_some_and(|node| node.unlinking == id)
                 {
-                    cold.unlinking.remove(&id);
                     cold.links.remove(&from);
-                    cold.prio_links.remove(&from);
                     4
                 } else {
                     0
