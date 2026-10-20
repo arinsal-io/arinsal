@@ -440,9 +440,20 @@ impl ProcessHeapCursor<'_, '_> {
     /// Write one `CONS` cell and return its list term.
     #[inline(always)]
     pub fn push_cons(&mut self, head: Term, tail: Term) -> Option<Term> {
+        self.push_cons_with(|| Some((head, tail, ())))
+            .map(|(term, ())| term)
+    }
+
+    /// Check room before loading the next source cell, then write its cons.
+    #[inline(always)]
+    pub(crate) fn push_cons_with<R>(
+        &mut self,
+        make: impl FnOnce() -> Option<(Term, Term, R)>,
+    ) -> Option<(Term, R)> {
         if !self.has_room() {
             return None;
         }
+        let (head, tail, value) = make()?;
         let cell = self.top;
         // SAFETY: the cursor was clipped to `HEAP_LIMIT - 2`; `top < end` leaves
         // two writable words, and ProcessHeap owns this young-heap allocation.
@@ -452,7 +463,7 @@ impl ProcessHeapCursor<'_, '_> {
             let term = Term::from_raw_bits(cell as u64 | 1);
             self.top = self.top.wrapping_add(2);
             self.cells += 1;
-            Some(term)
+            Some((term, value))
         }
     }
 

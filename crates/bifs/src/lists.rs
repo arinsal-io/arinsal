@@ -11,7 +11,7 @@ use arinsal_term::{
 #[path = "rbtree.rs"]
 mod rbtree;
 
-use crate::pure::{bool_term, integer, tuple_build};
+use crate::pure::{bool_term, integer};
 use crate::{BifError, Ctx};
 use rbtree::RbTree;
 
@@ -129,7 +129,10 @@ pub fn length_slice(ctx: &mut Ctx<'_>, mut list: Term, acc: usize) -> Result<Len
 
 fn length(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_guard.c:210-224 (length_1), OTP-29.1.1.
-    match length_slice(ctx, args[0], 0)? {
+    let &[list] = args else {
+        return Err(BADARG);
+    };
+    match length_slice(ctx, list, 0)? {
         LengthStep::Done(value) => Ok(value),
         LengthStep::More(cont) => {
             ctx.defer_trap(DeferredTrap::Length(cont));
@@ -264,6 +267,15 @@ pub enum KeyOp {
     Member,
     /// `lists:keysearch/3`.
     Search,
+}
+
+#[inline(always)]
+fn keysearch_result(ctx: &mut Ctx<'_>, tuple: Term) -> Term {
+    // Port of lists_keysearch_3's HAlloc(3) and TUPLE2 at
+    // erts/emulator/beam/erl_bif_lists.c:1280-1291, OTP-29.1.1.
+    TermBuilder::new(&mut ctx.heap)
+        .tuple2(Term::atom(atoms::VALUE), tuple)
+        .expect("infallible BIF heap")
 }
 
 /// Continuation built only after a slice's counter runs out.
@@ -1243,13 +1255,11 @@ pub fn lists_reverse(
     let cursor = ctx.heap.bounded_cursor(onheap_cells_left);
     let onheap_available = cursor.is_some();
     if let Some(mut cursor) = cursor {
-        while cursor.has_room() {
-            let Some((head, next)) = cons_cell(current) else {
-                break;
-            };
-            result_tail = cursor
-                .push_cons(head, result_tail)
-                .expect("bounded cursor has room");
+        while let Some((reversed, next)) = cursor.push_cons_with(|| {
+            let (head, next) = cons_cell(current)?;
+            Some((head, result_tail, next))
+        }) {
+            result_tail = reversed;
             current = next;
             built_onheap += 1;
             onheap_cells_left -= 1;
@@ -1319,7 +1329,10 @@ pub fn lists_reverse(
 }
 
 fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    match lists_reverse(ctx, args[0], args[1], usize::MAX)? {
+    let &[list, tail] = args else {
+        return Err(BADARG);
+    };
+    match lists_reverse(ctx, list, tail, usize::MAX)? {
         ReverseStep::Done(value) => Ok(value),
         ReverseStep::Trap(cont) => {
             ctx.defer_trap(DeferredTrap::Reverse(cont));
@@ -1358,8 +1371,7 @@ pub fn lists_member(
             }
         };
         let mut scanned = 0usize;
-        let step = if term_bits & 3 == 3 {
-            let mut found = false;
+        if term_bits & 3 == 3 {
             while is_list_bits(list_bits) {
                 if scanned >= max_iter {
                     charge(ctx, scanned);
@@ -1371,14 +1383,12 @@ pub fn lists_member(
                 scanned += 1;
                 let (car, next) = car_cdr!(list_bits);
                 if car == term_bits {
-                    found = true;
-                    break;
+                    charge(ctx, scanned);
+                    return Ok(MemberStep::Done(true));
                 }
                 list_bits = next;
             }
-            found
         } else {
-            let mut found = false;
             while is_list_bits(list_bits) {
                 if scanned >= max_iter {
                     charge(ctx, scanned);
@@ -1390,19 +1400,18 @@ pub fn lists_member(
                 scanned += 1;
                 let (car, next) = car_cdr!(list_bits);
                 if car == term_bits || exact_eq(Term::from_raw_bits(car), term) {
-                    found = true;
-                    break;
+                    charge(ctx, scanned);
+                    return Ok(MemberStep::Done(true));
                 }
                 list_bits = next;
             }
-            found
-        };
-        if !step && list_bits != nil_bits {
+        }
+        if list_bits != nil_bits {
             charge(ctx, scanned);
             return Err(BADARG);
         }
         charge(ctx, scanned);
-        Ok(MemberStep::Done(step))
+        Ok(MemberStep::Done(false))
     }
 }
 
@@ -1417,7 +1426,10 @@ pub fn lists_member_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifErr
     // Two loops, as in the C: an immediate compares by word. Only a boxed term
     // falls through to `eq`. The counter traps only when `16 * reds_left` runs out.
     let max_iter = ctx.reduction_budget().saturating_mul(MEMBER_PER_RED);
-    match lists_member(ctx, args[0], args[1], max_iter)? {
+    let &[term, list] = args else {
+        return Err(BADARG);
+    };
+    match lists_member(ctx, term, list, max_iter)? {
         MemberStep::Done(found) => Ok(bool_term(found)),
         MemberStep::More(cont) => {
             ctx.defer_trap(DeferredTrap::Member(cont));
@@ -1433,12 +1445,13 @@ fn key_search(args: &[Term], max_iter: usize) -> Result<KeyfindStep, BifError> {
     // immediate compares by word, and a boxed key uses `==`. `max_iter` is
     // `10 * CONTEXT_REDS` (not scaled by reductions left). A hit returns the
     // tuple without reading the rest and without bumping reductions.
-    let pos = args[1].as_small().ok_or(BADARG)?;
+    let &[key, pos_term, list] = args else {
+        return Err(BADARG);
+    };
+    let pos = pos_term.as_small().ok_or(BADARG)?;
     if pos < 1 {
         return Err(BADARG);
     }
-    let key = args[0];
-    let list = args[2];
     // SAFETY: list, tuple, and float words stay on the live process heap.
     // Boxed tag 2: the header is at tagged-2 and element `pos` (1-based) is
     // `header[pos]`, matching `tuple_val` / `arityval` in keyfind.
@@ -1447,19 +1460,18 @@ fn key_search(args: &[Term], max_iter: usize) -> Result<KeyfindStep, BifError> {
         let key_bits = key.raw_bits();
         let mut list_bits = list.raw_bits();
         let nil_bits = Term::NIL.raw_bits();
-        let mut scanned = 0usize;
-        let found = if let Some(small) = key.as_small() {
+        let mut remaining = max_iter;
+        if let Some(small) = key.as_small() {
             let float_key = small as f64;
-            let mut found = None;
             while is_list_bits(list_bits) {
-                if scanned >= max_iter {
+                if remaining == 0 {
                     return Ok(KeyfindStep::More(KeyfindCont {
                         key,
-                        pos: args[1],
+                        pos: pos_term,
                         list: Term::from_raw_bits(list_bits),
                     }));
                 }
-                scanned += 1;
+                remaining -= 1;
                 let (car, next) = car_cdr!(list_bits);
                 list_bits = next;
                 if car & 1 != 0 {
@@ -1472,8 +1484,7 @@ fn key_search(args: &[Term], max_iter: usize) -> Result<KeyfindStep, BifError> {
                 }
                 let element = hdr.add(pos as usize).read();
                 if element == key_bits {
-                    found = Some(car);
-                    break;
+                    return Ok(KeyfindStep::Done(Some(Term::from_raw_bits(car))));
                 }
                 // is_float: boxed, header word 0x58 (one-word FLOAT subtag 0x18).
                 if element & 1 != 0 {
@@ -1485,22 +1496,19 @@ fn key_search(args: &[Term], max_iter: usize) -> Result<KeyfindStep, BifError> {
                 }
                 let payload = (element as *const u8).add(6).cast::<u64>().read_unaligned();
                 if f64::from_bits(payload) == float_key {
-                    found = Some(car);
-                    break;
+                    return Ok(KeyfindStep::Done(Some(Term::from_raw_bits(car))));
                 }
             }
-            found
         } else if key_bits & 3 == 3 {
-            let mut found = None;
             while is_list_bits(list_bits) {
-                if scanned >= max_iter {
+                if remaining == 0 {
                     return Ok(KeyfindStep::More(KeyfindCont {
                         key,
-                        pos: args[1],
+                        pos: pos_term,
                         list: Term::from_raw_bits(list_bits),
                     }));
                 }
-                scanned += 1;
+                remaining -= 1;
                 let (car, next) = car_cdr!(list_bits);
                 list_bits = next;
                 if car & 1 != 0 {
@@ -1512,22 +1520,19 @@ fn key_search(args: &[Term], max_iter: usize) -> Result<KeyfindStep, BifError> {
                     continue;
                 }
                 if hdr.add(pos as usize).read() == key_bits {
-                    found = Some(car);
-                    break;
+                    return Ok(KeyfindStep::Done(Some(Term::from_raw_bits(car))));
                 }
             }
-            found
         } else {
-            let mut found = None;
             while is_list_bits(list_bits) {
-                if scanned >= max_iter {
+                if remaining == 0 {
                     return Ok(KeyfindStep::More(KeyfindCont {
                         key,
-                        pos: args[1],
+                        pos: pos_term,
                         list: Term::from_raw_bits(list_bits),
                     }));
                 }
-                scanned += 1;
+                remaining -= 1;
                 let (car, next) = car_cdr!(list_bits);
                 list_bits = next;
                 if car & 1 != 0 {
@@ -1540,20 +1545,14 @@ fn key_search(args: &[Term], max_iter: usize) -> Result<KeyfindStep, BifError> {
                 }
                 let element = Term::from_raw_bits(hdr.add(pos as usize).read());
                 if loose_eq(key, element) {
-                    found = Some(car);
-                    break;
+                    return Ok(KeyfindStep::Done(Some(Term::from_raw_bits(car))));
                 }
             }
-            found
-        };
-        if found.is_none() && list_bits != nil_bits {
+        }
+        if list_bits != nil_bits {
             return Err(BADARG);
         }
-        if let Some(bits) = found {
-            Ok(KeyfindStep::Done(Some(Term::from_raw_bits(bits))))
-        } else {
-            Ok(KeyfindStep::Done(None))
-        }
+        Ok(KeyfindStep::Done(None))
     }
 }
 
@@ -1573,7 +1572,7 @@ pub fn lists_key(
                 KeyOp::Find => found.unwrap_or(bool_term(false)),
                 KeyOp::Member => bool_term(found.is_some()),
                 KeyOp::Search => match found {
-                    Some(tuple) => tuple_build(ctx, &[Term::atom(atoms::VALUE), tuple]),
+                    Some(tuple) => keysearch_result(ctx, tuple),
                     None => bool_term(false),
                 },
             };
@@ -1582,17 +1581,8 @@ pub fn lists_key(
     }
 }
 
-fn key_limit(ctx: &Ctx<'_>) -> usize {
-    // `10 * CONTEXT_REDS`, not scaled by reductions left (erl_bif_lists.c:1304).
-    if ctx.reduction_budget() == usize::MAX {
-        usize::MAX
-    } else {
-        KEYFIND_MAX_ITER
-    }
-}
-
 fn keyfind(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    match key_search(args, key_limit(ctx))? {
+    match key_search(args, KEYFIND_MAX_ITER)? {
         KeyfindStep::Done(found) => Ok(found.unwrap_or(bool_term(false))),
         KeyfindStep::More(cont) => {
             ctx.defer_trap(DeferredTrap::Key(cont));
@@ -1602,7 +1592,7 @@ fn keyfind(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 
 fn keymember(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    match key_search(args, key_limit(ctx))? {
+    match key_search(args, KEYFIND_MAX_ITER)? {
         KeyfindStep::Done(found) => Ok(bool_term(found.is_some())),
         KeyfindStep::More(cont) => {
             ctx.defer_trap(DeferredTrap::Key(cont));
@@ -1612,9 +1602,9 @@ fn keymember(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 
 fn keysearch(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    match key_search(args, key_limit(ctx))? {
+    match key_search(args, KEYFIND_MAX_ITER)? {
         KeyfindStep::Done(found) => Ok(match found {
-            Some(tuple) => tuple_build(ctx, &[Term::atom(atoms::VALUE), tuple]),
+            Some(tuple) => keysearch_result(ctx, tuple),
             None => bool_term(false),
         }),
         KeyfindStep::More(cont) => {
