@@ -3,8 +3,7 @@
 //! reduction-bounded yielding, and hash-sorted bulk HAMT construction.
 
 use super::{
-    LIMIT, MAP, MAP_HEADER_FLATMAP, MapError, MapResult, bits, boxed, check, exact_cmp, key_cmp,
-    term,
+    LIMIT, MAP, MAP_HEADER_FLATMAP, MapError, MapResult, bits, boxed, exact_cmp, key_cmp, term,
 };
 use arinsal_term::{HeapAlloc, Term, TermError, exact_eq};
 use smallvec::SmallVec;
@@ -728,20 +727,39 @@ pub fn merge_start<H: HeapAlloc + ?Sized>(
     heap: &mut H,
 ) -> MapResult<MergeStart> {
     if left == right {
-        check(left)?;
+        checked_hashmap(left)?;
         return Ok(MergeStart::Done(left));
     }
-    check(left)?;
-    check(right)?;
-    allocation_result(merge_start_checked(left, right, heap))
+    let left_hashmap = checked_hashmap(left)?;
+    let right_hashmap = checked_hashmap(right)?;
+    allocation_result(merge_start_checked(
+        left,
+        right,
+        left_hashmap,
+        right_hashmap,
+        heap,
+    ))
 }
 
+// Port of the is_flatmap/is_hashmap tests in erts/emulator/beam/erl_map.c:1260-1280, OTP-29.1.1.
+// Keep the classification from that header read for the following dispatch.
+#[inline(always)]
+fn checked_hashmap(map: Term) -> MapResult<bool> {
+    match map.header() {
+        Some(header) if header & 63 == MAP => Ok(header & 0xc0 != 0),
+        _ => Err(MapError::Badmap(map)),
+    }
+}
+
+// Port of erts/emulator/beam/erl_map.c:1257-1284 (maps_merge_2), OTP-29.1.1.
 fn merge_start_checked<H: HeapAlloc + ?Sized>(
     left: Term,
     right: Term,
+    left_hashmap: bool,
+    right_hashmap: bool,
     heap: &mut H,
 ) -> Result<MergeStart, TermError> {
-    match (left.is_hashmap(), right.is_hashmap()) {
+    match (left_hashmap, right_hashmap) {
         (false, false) => flatmap_merge(left, right, heap).map(MergeStart::Done),
         (false, true) => map_merge_mixed(left, right, false, heap),
         (true, false) => map_merge_mixed(right, left, true, heap),
@@ -770,19 +788,13 @@ fn map_merge_mixed<H: HeapAlloc + ?Sized>(
 
 /// `maps:merge/2` without yielding; right values win.
 pub fn merge<H: HeapAlloc + ?Sized>(left: Term, right: Term, heap: &mut H) -> MapResult<Term> {
-    if left == right {
-        check(left)?;
-        return Ok(left);
-    }
-    check(left)?;
-    check(right)?;
-    allocation_result((|| match merge_start_checked(left, right, heap)? {
+    match merge_start(left, right, heap)? {
         MergeStart::Done(map) => Ok(map),
         MergeStart::Hashmap(mut ctx) => {
             let mut reds = isize::MAX;
-            Ok(hashmap_merge_loop(&mut ctx, &mut reds, heap)?.expect("unbounded merge completes"))
+            Ok(hashmap_merge(&mut ctx, &mut reds, heap)?.expect("unbounded merge completes"))
         }
-    })())
+    }
 }
 
 // Port of erts/emulator/beam/erl_map.c:367-472 (flatmap_from_validated_list), OTP-29.1.1.

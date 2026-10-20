@@ -455,6 +455,20 @@ fn for_each_cons(
     }
 }
 
+// Port of erts_list_length in erts/emulator/beam/utils.c:345-354, OTP-29.1.1.
+fn proper_list_length(mut list: Term) -> Result<usize, BifError> {
+    let mut len = 0usize;
+    while let Some((_, tail)) = next_cons(list) {
+        len += 1;
+        list = tail;
+    }
+    if list == Term::NIL {
+        Ok(len)
+    } else {
+        Err(BADARG)
+    }
+}
+
 const MAX_TUPLE_SIZE: usize = (1 << 24) - 1;
 
 fn check_tuple_arity(size: usize) -> Result<(), BifError> {
@@ -855,14 +869,8 @@ fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 fn list_to_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3789-3808 (list_to_tuple_1), OTP-29.1.1.
-    let mut len = 0usize;
-    for_each_cons(args[0], |_| {
-        if len == MAX_TUPLE_SIZE {
-            return Err(BADARG);
-        }
-        len += 1;
-        Ok(())
-    })?;
+    let len = proper_list_length(args[0])?;
+    check_tuple_arity(len)?;
     if len == 0 {
         return Ok(TermBuilder::new(&mut ctx.heap)
             .tuple_from_fn(0, |_, _| unreachable!())
@@ -926,20 +934,12 @@ fn make_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 fn append_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3083 (append_element_2), OTP-29.1.1.
     let source = tuple_view(&args[0])?;
-    let arity = source.len();
-    check_tuple_arity(arity + 1)?;
-    let appended = args[1];
     TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .tuple_from_fn(arity + 1, |slot, _| {
-            if slot == arity {
-                appended
-            } else {
-                source
-                    .element(slot)
-                    .expect("tuple arity was read from source")
-            }
+        .tuple_append(&source, args[1])
+        .map_err(|error| match error {
+            TermError::BadArg => BADARG,
+            _ => BifError::SystemLimit,
         })
-        .map_err(|_| BifError::SystemLimit)
 }
 fn delete_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3144-3178 (delete_element_2), OTP-29.1.1.
