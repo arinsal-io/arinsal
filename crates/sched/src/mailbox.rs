@@ -1,9 +1,10 @@
 //! The process signal in-queue (erts `ErtsSignalInQueue`) and the receiver-owned middle
 //! queue with selective-receive save positions.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
 
 const SIGNAL_BUFFER_COUNT: usize = 64;
 const BUFFER_CONTENTION_INSTALL_LIMIT: usize = 50;
@@ -227,11 +228,10 @@ impl<T: InSignal> Incoming<T> {
 
     /// Take the msgq lock; a busy lock counts as contention like erts' failed trylock.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10661-10694, OTP-29.1.1.
-    fn lock_msgq(&self) -> (std::sync::MutexGuard<'_, VecDeque<T>>, usize) {
+    fn lock_msgq(&self) -> (parking_lot::MutexGuard<'_, VecDeque<T>>, usize) {
         match self.msgq.try_lock() {
-            Ok(queue) => (queue, 0),
-            Err(TryLockError::WouldBlock) => (self.msgq.lock().unwrap(), 1),
-            Err(TryLockError::Poisoned(error)) => panic!("signal in-queue poisoned: {error}"),
+            Some(queue) => (queue, 0),
+            None => (self.msgq.lock(), 1),
         }
     }
 
@@ -274,10 +274,10 @@ impl<T: InSignal> Incoming<T> {
             return Err(value);
         }
         let slot = slot();
-        let Some(buffers) = self.buffers.lock().unwrap().clone() else {
+        let Some(buffers) = self.buffers.lock().clone() else {
             return Err(value);
         };
-        let mut buffer = buffers[slot % SIGNAL_BUFFER_COUNT].lock().unwrap();
+        let mut buffer = buffers[slot % SIGNAL_BUFFER_COUNT].lock();
         if !buffer.alive {
             return Err(value);
         }
@@ -299,7 +299,7 @@ impl<T: InSignal> Incoming<T> {
             return;
         }
         if !enabled {
-            let mut queue = self.msgq.lock().unwrap();
+            let mut queue = self.msgq.lock();
             self.uninstall_buffers_locked(&mut queue);
         }
         self.buffering_allowed.store(enabled, Ordering::Release);
@@ -308,7 +308,7 @@ impl<T: InSignal> Incoming<T> {
     /// Force installation for the test hook that enables OTP's adaptive optimization.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10700-10718, OTP-29.1.1.
     pub fn force_buffers_enabled(&self) {
-        let _queue = self.msgq.lock().unwrap();
+        let _queue = self.msgq.lock();
         self.buffering_allowed.store(true, Ordering::Release);
         self.install_buffers_locked();
     }
@@ -320,7 +320,7 @@ impl<T: InSignal> Incoming<T> {
         }
         let count = self.contention_count.fetch_add(retries, Ordering::AcqRel) + retries;
         if count > BUFFER_CONTENTION_INSTALL_LIMIT {
-            let _queue = self.msgq.lock().unwrap();
+            let _queue = self.msgq.lock();
             if self.buffering_allowed.load(Ordering::Acquire)
                 && !self.buffers_enabled.load(Ordering::Acquire)
             {
@@ -334,7 +334,7 @@ impl<T: InSignal> Incoming<T> {
         if self.closed.load(Ordering::Relaxed) {
             return;
         }
-        let mut buffers = self.buffers.lock().unwrap();
+        let mut buffers = self.buffers.lock();
         if buffers.is_none() {
             *buffers = Some(Arc::new(std::array::from_fn(|_| {
                 Mutex::new(SignalBuffer {
@@ -352,11 +352,11 @@ impl<T: InSignal> Incoming<T> {
 
     /// Flush, mark dead and drop the buffers; the caller holds the msgq lock.
     fn uninstall_buffers_locked(&self, queue: &mut VecDeque<T>) {
-        let taken = self.buffers.lock().unwrap().take();
+        let taken = self.buffers.lock().take();
         self.buffers_enabled.store(false, Ordering::Release);
         if let Some(buffers) = taken {
             for buffer in buffers.iter() {
-                let mut buffer = buffer.lock().unwrap();
+                let mut buffer = buffer.lock();
                 buffer.alive = false;
                 self.take_buffered(&mut buffer, queue);
             }
@@ -381,11 +381,11 @@ impl<T: InSignal> Incoming<T> {
     /// Move buffered signals to the queue tail; the caller holds the msgq lock.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10532 (sig_inq_buffers flush), OTP-29.1.1.
     fn flush_buffers_locked(&self, queue: &mut VecDeque<T>, adapt: bool) {
-        let Some(buffers) = self.buffers.lock().unwrap().clone() else {
+        let Some(buffers) = self.buffers.lock().clone() else {
             return;
         };
         for buffer in buffers.iter() {
-            self.take_buffered(&mut buffer.lock().unwrap(), queue);
+            self.take_buffered(&mut buffer.lock(), queue);
         }
         if adapt && self.buffers_enabled.load(Ordering::Acquire) {
             let count = self.buffer_enqueues.swap(0, Ordering::AcqRel);
@@ -496,7 +496,7 @@ impl<T: InSignal> Incoming<T> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_exit takes the
     // remaining signals of an exiting process under the msgq lock), OTP-29.1.1.
     pub fn close_into(&self, into: &mut VecDeque<T>) -> usize {
-        let mut queue = self.msgq.lock().unwrap();
+        let mut queue = self.msgq.lock();
         self.closed.store(true, Ordering::Relaxed);
         self.uninstall_buffers_locked(&mut queue);
         let count = queue.len();
@@ -528,7 +528,7 @@ impl<T: InSignal> Incoming<T> {
         if !self.has_pending() {
             return;
         }
-        let mut queue = self.msgq.lock().unwrap();
+        let mut queue = self.msgq.lock();
         if self.buffers_enabled.load(Ordering::Acquire) {
             self.flush_buffers_locked(&mut queue, true);
         }
@@ -547,7 +547,7 @@ impl<T: InSignal> Incoming<T> {
         if !self.has_pending() {
             return 0;
         }
-        let mut queue = self.msgq.lock().unwrap();
+        let mut queue = self.msgq.lock();
         if self.buffers_enabled.load(Ordering::Acquire) {
             self.flush_buffers_locked(&mut queue, true);
         }
@@ -573,7 +573,7 @@ impl<T: InSignal> Incoming<T> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper),
     // OTP-29.1.1.
     pub fn fetch_first_if(&self, accept: impl FnOnce(&T) -> bool) -> Option<T> {
-        let mut queue = self.msgq.lock().unwrap();
+        let mut queue = self.msgq.lock();
         if self.buffers_enabled.load(Ordering::Acquire) {
             self.flush_buffers_locked(&mut queue, true);
         }

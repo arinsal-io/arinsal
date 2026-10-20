@@ -364,6 +364,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-queue",
  "libc",
+ "parking_lot",
 ]
 
 [[package]]
