@@ -1251,7 +1251,7 @@ fn start(
         }
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let scheduler = runtime.scheduler()?;
+    let scheduler = runtime.scheduler_arc()?;
     let reservation = reserve_port_id(runtime)?;
     let port_id = reservation.id();
     if executable
@@ -1376,7 +1376,7 @@ fn start_driver(
         return start_dyn_driver(process, ctx, None, driver, name, io);
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let scheduler = runtime.scheduler()?;
+    let scheduler = runtime.scheduler_arc()?;
     let reservation = reserve_port_id(runtime)?;
     let port_id = reservation.id();
     let port = Term::port(port_id).ok_or_else(badarg)?;
@@ -1868,7 +1868,8 @@ impl arinsal_drv::PortHost for DrvHost {
 
     // Port of erts/emulator/beam/erl_process.c:9413 (erts_resume_processes), OTP-29.1.1.
     fn schedule_async_ready(&self, sched_id: usize, ready: Box<dyn FnOnce() + Send>) {
-        match self.runtime.upgrade().map(|runtime| runtime.scheduler()) {
+        let runtime = self.runtime.upgrade();
+        match runtime.as_ref().map(|runtime| runtime.scheduler()) {
             Some(Ok(scheduler)) => scheduler.request_aux_work(sched_id, ready),
             // Without schedulers the job is completed here so its data is released.
             _ => ready(),
@@ -1877,8 +1878,10 @@ impl arinsal_drv::PortHost for DrvHost {
 
     // Port of erts/emulator/beam/erl_hl_timer.c:3031 (erts_set_port_timer), OTP-29.1.1.
     fn start_port_timer(&self, ms: u64, expired: Box<dyn FnOnce() + Send>) -> Option<u64> {
-        let scheduler = self.runtime.upgrade()?.scheduler().ok()?;
-        scheduler
+        let runtime = self.runtime.upgrade()?;
+        runtime
+            .scheduler()
+            .ok()?
             .start_port_timer(ms, expired)
             .ok()
             .map(arinsal_sched::TimerRef::to_bits)
@@ -1886,7 +1889,8 @@ impl arinsal_drv::PortHost for DrvHost {
 
     // Port of erts/emulator/beam/erl_hl_timer.c:3063 (erts_cancel_port_timer), OTP-29.1.1.
     fn cancel_port_timer(&self, handle: u64) {
-        if let Some(Ok(scheduler)) = self.runtime.upgrade().map(|runtime| runtime.scheduler()) {
+        let runtime = self.runtime.upgrade();
+        if let Some(Ok(scheduler)) = runtime.as_ref().map(|runtime| runtime.scheduler()) {
             scheduler.cancel_port_timer(arinsal_sched::TimerRef::from_bits(handle));
         }
     }
@@ -2601,7 +2605,7 @@ fn start_fd(
     let reader = duplicate_fd(input_fd).map_err(|_| badarg())?;
     let writer = duplicate_fd(output_fd).map_err(|_| badarg())?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let scheduler = runtime.scheduler()?;
+    let scheduler = runtime.scheduler_arc()?;
     let reservation = reserve_port_id(runtime)?;
     let id = reservation.id();
     let port = Term::port(id).ok_or_else(badarg)?;

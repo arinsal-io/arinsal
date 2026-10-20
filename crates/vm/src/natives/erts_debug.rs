@@ -910,7 +910,7 @@ fn dirty_test(
     let scheduler_handle = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.scheduler().ok());
+        .and_then(|runtime| runtime.scheduler_arc().ok());
     let kind = match scheduler {
         "normal" => None,
         "dirty_cpu" => Some(DirtyKind::Cpu),
@@ -2311,7 +2311,7 @@ fn debug_wait_round(
         }
         completion.store(true, Ordering::Release);
         runtime.debug_wait_active.store(false, Ordering::Release);
-        debug_wait_wake(scheduler, pid, completion.clone());
+        debug_wait_wake(scheduler.clone(), pid, completion.clone());
     }));
 }
 

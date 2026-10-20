@@ -1242,6 +1242,23 @@ impl<T: Task> ProcessTable<T> {
         self.ids.release(pid.data());
     }
 
+    /// Detach every process at VM shutdown so the references they hold to shared runtime
+    /// objects are released (the runtime owns the scheduler, the table owns the processes).
+    fn clear_all(&self) {
+        let _shared = self.lock.read().unwrap();
+        let guard = &epoch::pin();
+        for page in self.pages.iter().filter_map(OnceLock::get) {
+            for slot in &page.slots {
+                let old = slot.swap(epoch::Shared::null(), Ordering::AcqRel, guard);
+                if !old.is_null() {
+                    // SAFETY: the old pointer is detached; epochs protect concurrent lookups.
+                    unsafe { guard.defer_destroy(old) };
+                }
+            }
+        }
+        guard.flush();
+    }
+
     fn live_count(&self) -> usize {
         let guard = &epoch::pin();
         self.pages
@@ -5246,8 +5263,9 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
 /// Scheduler facade. Dropping it stops and joins worker threads.
 pub struct Scheduler<T: Task> {
     inner: Arc<Inner<T>>,
-    threads: Vec<JoinHandle<()>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
     virtual_clock: Option<Arc<VirtualClock>>,
+    shut_down: AtomicBool,
 }
 
 /// A point-in-time snapshot of scheduler work and execution counters.
@@ -5469,8 +5487,9 @@ impl<T: Task> Scheduler<T> {
         }
         Self {
             inner,
-            threads,
+            threads: Mutex::new(threads),
             virtual_clock,
+            shut_down: AtomicBool::new(false),
         }
     }
 
@@ -6864,11 +6883,24 @@ mod offline_scheduler_tests {
 
 impl<T: Task> Drop for Scheduler<T> {
     fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl<T: Task> Scheduler<T> {
+    /// Stop and join the worker threads and release the table's processes. Idempotent; the
+    /// runtime keeps the scheduler for the VM lifetime, so its owner calls this at shutdown to
+    /// break the runtime -> scheduler -> process -> runtime cycle.
+    pub fn shutdown(&self) {
+        if self.shut_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.inner.stopped.store(true, Ordering::Release);
         for pool in &self.inner.dirty {
             pool.wake_all();
         }
-        for (id, handle) in self.threads.iter().enumerate() {
+        let mut threads = self.threads.lock().unwrap();
+        for (id, handle) in threads.iter().enumerate() {
             if let Some(flag) = self.inner.parked.get(id) {
                 flag.store(false, Ordering::SeqCst);
             }
@@ -6878,7 +6910,7 @@ impl<T: Task> Drop for Scheduler<T> {
         // released its handle); that worker cannot join itself and stops on its own.
         let current = std::thread::current().id();
         let mut on_worker = false;
-        for handle in self.threads.drain(..) {
+        for handle in threads.drain(..) {
             if handle.thread().id() != current {
                 let _ = handle.join();
             } else {
@@ -6892,9 +6924,13 @@ impl<T: Task> Drop for Scheduler<T> {
             let inner = Arc::clone(&self.inner);
             let _ = std::thread::Builder::new()
                 .name("sched-shutdown".into())
-                .spawn(move || inner.table.scheduler_shutdown());
+                .spawn(move || {
+                    inner.table.scheduler_shutdown();
+                    inner.table.clear_all();
+                });
         } else {
             self.inner.table.scheduler_shutdown();
+            self.inner.table.clear_all();
         }
     }
 }

@@ -2077,7 +2077,7 @@ fn process_info_light_read(
         );
     }
     // erts_try_lock_sig_free_proc: a plain table lookup and one lock attempt.
-    let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
+    let scheduler = process.runtime.as_ref()?.scheduler_arc().ok()?;
     match scheduler.inspect_signal_free(pid, |target| {
         // One pass: an item erts reads only through a request, or one that needs the module
         // table, waits for the executor.

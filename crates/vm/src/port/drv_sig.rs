@@ -262,7 +262,7 @@ pub(crate) fn output(
         .runtime
         .as_ref()
         .ok_or(())
-        .and_then(|runtime| runtime.scheduler().map_err(|_| ()))
+        .and_then(|runtime| runtime.scheduler_arc().map_err(|_| ()))
     else {
         return PortOp::Dropped;
     };
@@ -387,7 +387,7 @@ pub(crate) fn control(
             Err(_) => {}
         }
     }
-    let (reply, reference) = Reply::new(caller, runtime.scheduler()?);
+    let (reply, reference) = Reply::new(caller, runtime.scheduler_arc()?);
     // Port of erts/emulator/beam/io.c:1203 (erts_schedule_proc2port_signal), OTP-29.1.1.
     set_save_end(process, ctx);
     let task_drv = Arc::clone(drv);
@@ -556,7 +556,7 @@ pub(crate) fn exit(
         Err(_) => {}
     }
     let (reply, reference) = if want_ref {
-        let (reply, reference) = Reply::new(caller, runtime.scheduler()?);
+        let (reply, reference) = Reply::new(caller, runtime.scheduler_arc()?);
         (Some(reply), Some(reference))
     } else {
         (None, None)
