@@ -880,14 +880,6 @@ fn ets_external_atoms(bytes: &[u8], compress: bool) -> Result<Vec<u8>, EtsError>
     Ok(out)
 }
 
-#[inline]
-fn cmp_ordered_key(left: Term, right: Term) -> Ordering {
-    match (left.as_small(), right.as_small()) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => cmp(left, right),
-    }
-}
-
 pub(crate) struct Compressed {
     pub(crate) elements: Vec<Option<Vec<u8>>>,
     pub(crate) magic_refs: Vec<Option<Arc<MagicRef>>>,
@@ -3778,6 +3770,8 @@ impl Table {
     }
 
     /// Ordered successor of any key. Hash table traversal is not yet supported.
+    // Port of erts/emulator/beam/erl_db_tree.c:665 (db_next_tree) and
+    // erts/emulator/beam/erl_db_catree.c:1640 (db_next_catree), OTP-29.1.1.
     pub fn next<H: HeapAlloc>(&self, key: Term, dst: &mut H) -> Result<Option<Term>, EtsError> {
         let Storage::Ordered(root) = &self.storage else {
             if let Storage::CATree(tree) = &self.storage {
@@ -3785,18 +3779,10 @@ impl Table {
             }
             return self.hash_next(key, dst);
         };
-        let mut node = root.link().as_deref();
-        let mut candidate = None;
-        while let Some(current) = node {
-            let current_key = current.key(self.options.keypos);
-            if cmp_ordered_key(key, current_key) == Ordering::Less {
-                candidate = Some(current_key);
-                node = current.prefix.left.as_deref();
-            } else {
-                node = current.prefix.right.as_deref();
-            }
-        }
-        candidate.map(|key| Ok(copy_term(key, dst)?)).transpose()
+        Ok(root
+            .find_next_prev(key, false, self.options.keypos)
+            .map(|object| copy_term(object.key(self.options.keypos), dst))
+            .transpose()?)
     }
 
     fn hash_next<H: HeapAlloc>(&self, key: Term, dst: &mut H) -> Result<Option<Term>, EtsError> {
@@ -3827,6 +3813,8 @@ impl Table {
     }
 
     /// Ordered predecessor of any key.
+    // Port of erts/emulator/beam/erl_db_tree.c:740 (db_prev_tree) and
+    // erts/emulator/beam/erl_db_catree.c:1704 (db_prev_catree), OTP-29.1.1.
     pub fn prev<H: HeapAlloc>(&self, key: Term, dst: &mut H) -> Result<Option<Term>, EtsError> {
         let Storage::Ordered(root) = &self.storage else {
             if let Storage::CATree(tree) = &self.storage {
@@ -3834,18 +3822,10 @@ impl Table {
             }
             return self.hash_next(key, dst);
         };
-        let mut node = root.link().as_deref();
-        let mut candidate = None;
-        while let Some(current) = node {
-            let current_key = current.key(self.options.keypos);
-            if cmp_ordered_key(key, current_key) == Ordering::Greater {
-                candidate = Some(current_key);
-                node = current.prefix.right.as_deref();
-            } else {
-                node = current.prefix.left.as_deref();
-            }
-        }
-        candidate.map(|key| Ok(copy_term(key, dst)?)).transpose()
+        Ok(root
+            .find_next_prev(key, true, self.options.keypos)
+            .map(|object| copy_term(object.key(self.options.keypos), dst))
+            .transpose()?)
     }
 
     /// First or last key in an ordered table.

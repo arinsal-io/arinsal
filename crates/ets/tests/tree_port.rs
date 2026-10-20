@@ -85,6 +85,25 @@ fn run_local(ops: &[OwnedTerm], write_concurrency: WriteConcurrency) -> Vec<Owne
                 .edge(false, &mut output)
                 .unwrap()
                 .map_or_else(|| atom("$end_of_table"), |term| to_owned(term).unwrap()),
+            "last" => table
+                .edge(true, &mut output)
+                .unwrap()
+                .map_or_else(|| atom("$end_of_table"), |term| to_owned(term).unwrap()),
+            "walk_next" | "walk_prev" => {
+                let reverse = name == "walk_prev";
+                let mut current = table.edge(reverse, &mut output).unwrap();
+                let mut keys = Vec::new();
+                while let Some(key) = current {
+                    keys.push(to_owned(key).unwrap());
+                    current = if reverse {
+                        table.prev(key, &mut output)
+                    } else {
+                        table.next(key, &mut output)
+                    }
+                    .unwrap();
+                }
+                list(keys)
+            }
             "info_size" => OwnedTerm::Int(table.info().size as i64),
             "next" | "prev" => {
                 let found = if name == "next" {
@@ -199,6 +218,56 @@ fn next_prev_order_vs_erl() {
         ops.push(tuple(vec![atom("prev"), OwnedTerm::Int(key)]));
     }
     assert_reference(ops);
+}
+
+#[test]
+fn next_prev_stack_reuse_and_mutation_invalidation_vs_erl() {
+    let mut ops = vec![
+        op("first", atom("none")),
+        op("last", atom("none")),
+        op("walk_next", atom("none")),
+        op("walk_prev", atom("none")),
+        op("next", OwnedTerm::Int(5)),
+        op("prev", OwnedTerm::Int(5)),
+    ];
+    for key in [10, 30, 20] {
+        ops.push(op(
+            "insert",
+            tuple(vec![OwnedTerm::Int(key), OwnedTerm::Int(-key)]),
+        ));
+    }
+    ops.extend([
+        op("first", atom("none")),
+        op("next", OwnedTerm::Int(10)),
+        op("next", OwnedTerm::Int(20)),
+        op("prev", OwnedTerm::Int(30)),
+        op("prev", OwnedTerm::Int(20)),
+        op("next", OwnedTerm::Int(25)),
+        op("prev", OwnedTerm::Int(25)),
+        op("walk_next", atom("none")),
+        op("walk_prev", atom("none")),
+        op("delete", OwnedTerm::Int(20)),
+        op("next", OwnedTerm::Int(10)),
+        op("prev", OwnedTerm::Int(30)),
+        op(
+            "insert",
+            tuple(vec![OwnedTerm::Int(25), OwnedTerm::Int(-25)]),
+        ),
+        op("next", OwnedTerm::Int(20)),
+        op("prev", OwnedTerm::Int(30)),
+        op("last", atom("none")),
+        op("next", OwnedTerm::Int(25)),
+        op("prev", OwnedTerm::Int(30)),
+        op("delete", OwnedTerm::Int(10)),
+        op("delete", OwnedTerm::Int(25)),
+        op("delete", OwnedTerm::Int(30)),
+        op("first", atom("none")),
+        op("last", atom("none")),
+        op("walk_next", atom("none")),
+        op("walk_prev", atom("none")),
+    ]);
+    assert_reference_with_concurrency(ops.clone(), WriteConcurrency::Disabled);
+    assert_reference_with_concurrency(ops, WriteConcurrency::Enabled);
 }
 
 #[test]

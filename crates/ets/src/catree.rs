@@ -821,7 +821,9 @@ impl CATree {
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c (db_next_catree_common), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c:1615 (db_next_catree_common), :1679
+    /// (db_prev_catree_common), and :1868/:1873 (catree_find_next_root /
+    /// catree_find_prev_root), OTP-29.1.1.
     pub(crate) fn next<H: HeapAlloc>(
         &self,
         key: Term,
@@ -852,13 +854,11 @@ impl CATree {
                     std::thread::yield_now();
                     continue 'retry;
                 }
-                let mut found = None;
-                Node::scan_after(&root, Some(key), reverse, self.keypos, &mut |object| {
-                    found = Some(arinsal_term::copy_term(object.key(self.keypos), dst)?);
-                    Ok(true)
-                })?;
-                if found.is_some() {
-                    return Ok(found);
+                let mut stack = DbTreeStack::new();
+                if let Some(object) =
+                    root.find_next_prev_with_stack(key, reverse, self.keypos, &mut stack)
+                {
+                    return Ok(Some(arinsal_term::copy_term(object.key(self.keypos), dst)?));
                 }
                 if reverse {
                     if index == 0 {
