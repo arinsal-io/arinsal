@@ -261,6 +261,9 @@ pub struct Vm {
     replica: bool,
     // ---- vm_exc ----
     backtrace_depth: usize,
+    /// Module id and entry of `erlang:apply/3` once resolved (`apply` in the preloaded
+    /// `erlang` module never moves).
+    pub(crate) apply3_entry: Option<(usize, usize)>,
 }
 
 #[test]

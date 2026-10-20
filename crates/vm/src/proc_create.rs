@@ -1165,7 +1165,7 @@ pub(crate) struct ProcessCold {
     /// Remote-process monitors. `demonitor` of any other ref does not take the
     /// node-table lock: erts finds `ERTS_MON_TYPE_DIST_PROC` in this process's
     /// own monitor tree (`bif.c` `demonitor`), not in a global scan.
-    pub(crate) dist_monitors: std::collections::HashSet<u64>,
+    pub(crate) dist_monitors: std::collections::BTreeSet<u64>,
     /// Monitors created with the `priority` option; their DOWN messages are priority. Kept for
     /// every monitor kind, since the origin decides priority when it receives the DOWN.
     pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
@@ -1659,8 +1659,17 @@ impl Process {
         Self::with_registers_and_min_heap(x_registers, float_registers, 64, true)
     }
     pub(crate) fn with_spawn_registers(x_registers: usize, float_registers: usize) -> Self {
+        Self::with_spawn_registers_heap(x_registers, float_registers, 233)
+    }
+    /// [`Self::with_spawn_registers`] for a caller that installs the child's heap itself
+    /// (`erl_create_process`): `min_heap` 64 builds the zero-word placeholder heap.
+    pub(crate) fn with_spawn_registers_heap(
+        x_registers: usize,
+        float_registers: usize,
+        min_heap: usize,
+    ) -> Self {
         let mut process =
-            Self::with_registers_and_min_heap(x_registers, float_registers, 233, false);
+            Self::with_registers_and_min_heap(x_registers, float_registers, min_heap, false);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;

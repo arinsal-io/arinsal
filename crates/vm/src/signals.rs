@@ -946,6 +946,16 @@ pub(crate) struct CreatedProcess {
     pub monitor: Option<u64>,
 }
 
+fn spawn_scheduler(
+    parent: &Process,
+) -> Result<&std::sync::Arc<arinsal_sched::Scheduler<Process>>, VmError> {
+    parent
+        .runtime
+        .as_deref()
+        .ok_or_else(|| VmError::Unsupported("spawn requires a scheduler".into()))?
+        .scheduler()
+}
+
 // Port of erts/emulator/beam/erl_process.c:12437 (erl_create_process), OTP-29.1.1. Every spawn
 // variant comes through here: the child starts at erlang:apply/3 with `mod`, `func` and `args`
 // in X0..X2, its links and monitors exist before it is inserted, and it is scheduled last.
@@ -963,27 +973,29 @@ pub(crate) fn erl_create_process(
     if args_list.len() > 1024 {
         return Err(badarg("erlang:spawn/3"));
     }
-    let rt = parent
-        .runtime
-        .clone()
-        .ok_or_else(|| VmError::Unsupported("spawn requires a scheduler".into()))?;
-    let scheduler = rt.scheduler()?;
-    let defaults = crate::natives::sys::gc_spawn_defaults(Some(&rt));
-    let mut child = Process::with_spawn_registers(3, 0);
+    // The runtime is borrowed from the parent at each use: a clone is a refcount write on a
+    // line every scheduler shares.
+    spawn_scheduler(parent)?;
+    let defaults = crate::natives::sys::gc_spawn_defaults(parent.runtime.as_deref());
+    // The heap is installed below, so the child starts with the placeholder heap.
+    let mut child = Process::with_spawn_registers_heap(3, 0, 64);
     child.set_runtime(parent.runtime.clone());
     // Port of erts/emulator/beam/erl_process.c:12508 (erl_create_process initializes both
     // active and user priority from so->priority), OTP-29.1.1. The scheduler entry already
     // receives this priority below; keep process_info/process_flag's process-side value aligned.
-    crate::natives::proc::set_flag(
-        &mut child,
-        "priority",
-        atom(match so.priority {
-            Priority::Max => "max",
-            Priority::High => "high",
-            Priority::Normal => "normal",
-            Priority::Low => "low",
-        }),
-    );
+    // A normal priority is the absent flag (process_info reports `normal` for it).
+    if so.priority != Priority::Normal {
+        crate::natives::proc::set_flag(
+            &mut child,
+            "priority",
+            atom(match so.priority {
+                Priority::Max => "max",
+                Priority::High => "high",
+                Priority::Normal => "normal",
+                Priority::Low => "low",
+            }),
+        );
+    }
     // Port of erts/emulator/beam/erl_process.c:12594 (min_heap_size rounded up by
     // erts_next_heap_size), OTP-29.1.1.
     let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
@@ -1098,6 +1110,7 @@ pub(crate) fn erl_create_process(
     } else {
         None
     };
+    let scheduler = spawn_scheduler(parent)?;
     let pid = if let Some(scheduler_id) = so.scheduler {
         scheduler.spawn_unscheduled_on_with_priority(child, scheduler_id, so.priority)
     } else {
@@ -1172,7 +1185,9 @@ pub(crate) fn erl_create_process(
         if monitor.priority {
             parent.cold_mut().prio_monitors.insert(id);
         }
-        if monitor.alias.is_some() {
+        if monitor.alias.is_some()
+            && let Some(rt) = parent.runtime.as_deref()
+        {
             rt.alias_bind(id, Some(parent_pid));
         }
     }
@@ -1193,7 +1208,7 @@ pub(crate) fn erl_create_process(
         if let Some(token) = seq_reply_token.take() {
             envelope.attach_seq_token(Box::new(token));
         }
-        scheduler
+        spawn_scheduler(parent)?
             .send(pid, parent_pid, envelope)
             .map_err(|error| VmError::Unsupported(format!("spawn_reply: {error}")))?;
     }
@@ -2460,6 +2475,41 @@ pub(crate) fn link_light(
         .ok()?;
     link_node_create(process.cold_mut(), pid, false);
     Some(Ok(atom("true")))
+}
+
+/// `erlang:send(Pid, Msg, Options)` called directly from native code for a local pid, options
+/// without `priority`, and a sender with no trace or seq-trace hooks. Everything else declines
+/// before any state changes and takes the executor.
+// Port of erts/emulator/beam/bif.c:2697-2759 (send_3) and bif.c:2458 (do_send), OTP-29.1.1:
+// `noconnect` and `nosuspend` only matter for a remote destination or a port.
+pub(crate) fn send3_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [target, message, options] = args else {
+        return None;
+    };
+    let pid = Pid::from_term(*target)?;
+    if !crate::trace::send_hooks_idle(process) {
+        return None;
+    }
+    let atoms = global_atoms();
+    let mut plain = true;
+    each_list_item(*options, |option| {
+        plain &= option
+            .as_atom()
+            .and_then(|a| atoms.text(a))
+            .is_some_and(|name| name == "noconnect" || name == "nosuspend");
+    })?;
+    if !plain {
+        return None;
+    }
+    Some(
+        process
+            .send_to_pid_idle(pid, *message)
+            .map(|_| atom("ok"))
+            .map_err(|_| crate::exceptions::Trap::error(atom("badarg"))),
+    )
 }
 
 /// `exit(Pid, Reason)` called directly from native code (erts bif.c:1721 send_exit_signal_bif)
@@ -4101,12 +4151,30 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
 fn monitor_options(
     args: &[Term],
 ) -> Result<(Term, Option<crate::proc_create::AliasMode>, bool), VmError> {
-    let options = if args.len() == 3 {
-        list(args[2]).ok_or_else(|| badarg("monitor/3"))?
+    if args.len() != 3 {
+        return parse_monitor_option_items(&[], "monitor/3");
+    }
+    // Option lists are one or two items: keep them off the heap.
+    let mut small = [Term::NIL; 4];
+    let mut count = 0;
+    let mut overflow = Vec::new();
+    each_list_item(args[2], |item| {
+        if overflow.is_empty() && count < small.len() {
+            small[count] = item;
+            count += 1;
+        } else {
+            if overflow.is_empty() {
+                overflow.extend_from_slice(&small[..count]);
+            }
+            overflow.push(item);
+        }
+    })
+    .ok_or_else(|| badarg("monitor/3"))?;
+    if overflow.is_empty() {
+        parse_monitor_option_items(&small[..count], "monitor/3")
     } else {
-        Vec::new()
-    };
-    parse_monitor_option_items(&options, "monitor/3")
+        parse_monitor_option_items(&overflow, "monitor/3")
+    }
 }
 
 /// Parse nested options using the same rules as `erts_monitor_opts`.
@@ -4157,9 +4225,11 @@ fn parse_monitor_option_items(
 }
 
 fn parse_alias_mode(term: Term) -> Option<crate::proc_create::AliasMode> {
-    Some(match atom_name(term)?.as_str() {
+    if term == atom("demonitor") {
+        return Some(crate::proc_create::AliasMode::Demonitor);
+    }
+    Some(match global_atoms().text(term.as_atom()?)? {
         "explicit_unalias" => crate::proc_create::AliasMode::ExplicitUnalias,
-        "demonitor" => crate::proc_create::AliasMode::Demonitor,
         "reply_demonitor" => crate::proc_create::AliasMode::ReplyDemonitor,
         _ => return None,
     })

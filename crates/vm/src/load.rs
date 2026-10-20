@@ -791,6 +791,7 @@ impl Vm {
             code_ix,
             replica,
             backtrace_depth: 8,
+            apply3_entry: None,
         }
     }
 

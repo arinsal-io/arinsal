@@ -422,6 +422,7 @@ dependencies = [
  "nix",
  "num-bigint",
  "num-traits",
+ "parking_lot",
  "rustix",
  "signal-hook-mio",
  "similar-asserts",
