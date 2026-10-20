@@ -248,26 +248,29 @@ impl NativeDriver for TcpInet {
 
 /// Bring selection, port timer and busy state in line with the socket after a callback.
 fn settle(sock: &Arc<Sock>) {
-    sock_select(sock);
-    arm_timer(sock);
-    sync_busy(sock);
-}
-
-/// `set_busy_port` follows the socket's busy state (inet_drv.c: `tcp_sendv` sets it at
-/// the high watermark, `tcp_inet_output` clears it at the low one).
-fn sync_busy(sock: &Arc<Sock>) {
     let Some(port) = sock.port() else {
         return;
     };
-    let busy = {
+    // One look at the socket state for all three, as the C callback reads its descriptor once.
+    let (timer, busy) = {
         let mut inner = sock.inner.lock().unwrap();
-        if inner.busy == inner.port_busy {
-            return;
-        }
-        inner.port_busy = inner.busy;
-        inner.busy
+        select_locked(&port, &mut inner);
+        (timer_change(&mut inner), busy_change(&mut inner))
     };
-    port.set_busy(busy);
+    set_port_timer(&port, timer);
+    if let Some(busy) = busy {
+        port.set_busy(busy);
+    }
+}
+
+/// `set_busy_port` follows the socket's busy state (inet_drv.c: `tcp_sendv` sets it at
+/// the high watermark, `tcp_inet_output` clears it at the low one). `Some` when it changed.
+fn busy_change(inner: &mut Inner) -> Option<bool> {
+    if inner.busy == inner.port_busy {
+        return None;
+    }
+    inner.port_busy = inner.busy;
+    Some(inner.busy)
 }
 
 /// `driver_exit(port, 0)`: the peer closed an `{exit_on_close, true}` socket.
@@ -4193,9 +4196,7 @@ fn bytes_term(heap: &mut ProcessHeap, bytes: &[u8], binary: bool) -> Option<Term
     if binary {
         builder.binary(bytes).ok()
     } else {
-        builder
-            .list_from_iter(bytes.iter().map(|b| Term::small(i64::from(*b)).unwrap()))
-            .ok()
+        builder.bytes_to_list(bytes).ok()
     }
 }
 
@@ -4221,9 +4222,7 @@ fn data_term_with_options(
         header as usize
     };
     if !binary || hsz > bytes.len() {
-        return builder
-            .list_from_iter(bytes.iter().map(|b| Term::small(i64::from(*b)).unwrap()))
-            .ok();
+        return builder.bytes_to_list(bytes).ok();
     }
     let mut tail = builder.binary(&bytes[hsz..]).ok()?;
     for byte in bytes[..hsz].iter().rev() {
@@ -5131,11 +5130,14 @@ fn poll_connect(inner: &mut Inner) -> Option<Out> {
 /// (:12126, :12317, :13110), FD_WRITE while the output queue is non-empty
 /// (:13844, :14303).
 fn sock_select(sock: &Arc<Sock>) {
-    use arinsal_drv::{SELECT_READ, SELECT_USE, SELECT_WRITE};
     let Some(port) = sock.port() else {
         return;
     };
-    let mut inner = sock.inner.lock().unwrap();
+    select_locked(&port, &mut sock.inner.lock().unwrap());
+}
+
+fn select_locked(port: &DriverPort, inner: &mut Inner) {
+    use arinsal_drv::{SELECT_READ, SELECT_USE, SELECT_WRITE};
     let readable = match inner.phase {
         Phase::Listening => !inner.accept_q.is_empty(),
         Phase::Connected => {
@@ -5188,27 +5190,26 @@ fn next_deadline(inner: &Inner) -> Option<Instant> {
 /// Port of the `driver_set_timer`/`driver_cancel_timer` calls of
 /// erts/emulator/drivers/common/inet_drv.c, OTP-29.1.1: the timer expires as a port
 /// timeout task (`tcp_inet_timeout`) that a scheduler executes.
-fn arm_timer(sock: &Arc<Sock>) {
-    let Some(port) = sock.port() else {
-        return;
-    };
-    let next = {
-        let mut inner = sock.inner.lock().unwrap();
-        let next = next_deadline(&inner);
-        if next == inner.timer_at {
-            return;
-        }
-        inner.timer_at = next;
-        next
-    };
-    match next {
-        Some(at) => {
+/// The new port timer deadline when it differs from the armed one.
+fn timer_change(inner: &mut Inner) -> Option<Option<Instant>> {
+    let next = next_deadline(inner);
+    if next == inner.timer_at {
+        return None;
+    }
+    inner.timer_at = next;
+    Some(next)
+}
+
+fn set_port_timer(port: &Arc<DriverPort>, timer: Option<Option<Instant>>) {
+    match timer {
+        None => {}
+        Some(Some(at)) => {
             let left = at.saturating_duration_since(Instant::now());
             // Round up so the callback never runs before the deadline.
             let millis = left.as_millis() + u128::from(left.subsec_nanos() % 1_000_000 != 0);
             port.set_timer(i64::try_from(millis).unwrap_or(i64::MAX));
         }
-        None => port.cancel_timer(),
+        Some(None) => port.cancel_timer(),
     }
 }
 

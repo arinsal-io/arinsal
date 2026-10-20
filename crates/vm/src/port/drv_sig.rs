@@ -472,9 +472,7 @@ fn control_term<H: arinsal_term::HeapAlloc + ?Sized>(
     match reply {
         arinsal_drv::ControlReply::Nil => Ok(Term::NIL),
         arinsal_drv::ControlReply::Binary(bytes) => builder.binary(&bytes),
-        arinsal_drv::ControlReply::List(bytes) => {
-            builder.list_from_iter(bytes.iter().map(|b| Term::small(*b as i64).unwrap()))
-        }
+        arinsal_drv::ControlReply::List(bytes) => builder.bytes_to_list(&bytes),
     }
 }
 
