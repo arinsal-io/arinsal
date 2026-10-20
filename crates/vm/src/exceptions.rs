@@ -19,6 +19,13 @@ pub struct Trap {
     pub(super) untrappable: bool,
 }
 
+impl Trap {
+    /// The trace of this exception is still to be saved from the raising BIF (`save_raw`).
+    pub(super) fn is_raw_bif_failure(&self) -> bool {
+        self.trace.is_none()
+    }
+}
+
 /// An uncaught Erlang exception detached from the process heap.
 #[derive(Debug)]
 pub struct Raised {
@@ -632,6 +639,11 @@ pub(super) fn resume(
     // to that abandoned call, even if the error did not originate in its BIF.
     if let Some(pending) = p.cold_mut().bif_trap.take() {
         p.set_gc_enabled(pending.gc_was_enabled);
+    }
+    // `save_direct` consumes the flag; a trace that is not saved from the raising BIF must not
+    // leave it for a later exception.
+    if trap.trace.is_some() || trap.untrappable {
+        p.cold_mut().apply_frame_released = 0;
     }
     if trap.untrappable {
         let reason = to_owned(trap.reason)

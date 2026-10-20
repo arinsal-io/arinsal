@@ -364,6 +364,8 @@ pub(super) struct Current<'a> {
     pub(super) trapped: bool,
     /// Return address of that BIF call when it is not on the stack (interpreter calls).
     pub(super) trap_return: Option<usize>,
+    /// A tail apply released the caller frame: the BIF has no caller continuation to keep.
+    pub(super) frame_released: bool,
 }
 
 /// Port of erts/emulator/beam/beam_common.c:781 (gather_stacktrace), OTP-29.1.1.
@@ -385,6 +387,7 @@ pub(super) fn capture(
         registers,
         trapped,
         trap_return,
+        frame_released,
     } = current;
     raw.class = class;
     let captured_top = top
@@ -452,7 +455,8 @@ pub(super) fn capture(
     raw.continuations.reserve(raw.depth.min(16));
     raw.native_top = None;
     raw.no_current = trapped;
-    if matches!(raw.top, Some(StoredTopFrame::Bif { .. })) && native_pc.is_none() {
+    if matches!(raw.top, Some(StoredTopFrame::Bif { .. })) && native_pc.is_none() && !frame_released
+    {
         // Port of beam_common.c:880-930 (`save_stacktrace`), OTP-29.1.1: the BIF owns
         // `current`; preserve the interpreter caller's CP as the first trace word.
         let caller_cp = ip.saturating_add(1);
@@ -810,6 +814,22 @@ pub(super) fn save_direct(
     } else {
         class_to_freason(Some(class))
     };
+    // Consumed here: it describes the one exception being saved.
+    let released = p
+        .cold
+        .as_mut()
+        .map_or(0, |cold| std::mem::take(&mut cold.apply_frame_released));
+    let frame_released = released != 0;
+    // A tail fun call has no apply-site adjustment: the raising BIF's pc is the continuation on
+    // top of the stack, so the failing instruction is that continuation's call site.
+    let site = if released == crate::proc_create::TAIL_FUN_CALL
+        && native_pc.is_none()
+        && !top.is_some_and(SaveTop::is_bif)
+    {
+        top_continuation(p).unwrap_or((p.module, p.ip))
+    } else {
+        (p.module, p.ip)
+    };
     let (native_top, previous_native, previous) = match native_pc {
         Some(pc) if pc & arinsal_beamasm::module::RETURN_SITE_TAG != 0 => {
             let address = pc & !arinsal_beamasm::module::RETURN_SITE_TAG;
@@ -818,7 +838,7 @@ pub(super) fn save_direct(
         // Port of erts/emulator/beam/beam_common.c:791-835 (`gather_stacktrace`),
         // OTP-29.1.1: the raw `pc` seeds the duplicate check before the stack walk.
         Some(pc) => (Some(pc), Some(pc), None),
-        None => (None, None, Some((p.module, p.ip))),
+        None => (None, None, Some(site)),
     };
     // Port of erts/emulator/beam/beam_common.c:880-930 (`save_stacktrace`), OTP-29.1.1:
     // `StackTrace` is the bignum itself and ftrace is its three-element tuple. The current
@@ -827,21 +847,21 @@ pub(super) fn save_direct(
     let max_depth = depth.saturating_sub(1);
     let current = match top {
         Some(top) if let Some((module, function)) = top.bif_mfa() => pack_bif_mfa(module, function),
-        _ => pack_indexed(p.module, p.ip)
+        _ => pack_indexed(site.0, site.1)
             .ok_or_else(|| VmError::Unsupported("stacktrace current address".into()))?,
     };
     let pc = if bif_top {
         0
     } else {
         native_top
-            .map_or_else(|| pack_indexed(p.module, p.ip), |pc| u64::try_from(pc).ok())
+            .map_or_else(|| pack_indexed(site.0, site.1), |pc| u64::try_from(pc).ok())
             .unwrap_or(0)
     };
     let native_top_word = native_top
         .map(u64::try_from)
         .transpose()
         .map_err(|_| VmError::Unsupported("stacktrace pc".into()))?;
-    let interpreter_caller = (bif_top && native_top_word.is_none())
+    let interpreter_caller = (bif_top && native_top_word.is_none() && !frame_released)
         .then(|| pack_indexed(p.module, p.ip.saturating_add(1)))
         .flatten();
     // Port of erts/emulator/beam/beam_common.c (`save_stacktrace`), OTP-29.1.1: the trace, its
@@ -1174,6 +1194,22 @@ fn gather_continuations_in(
         }
     }
     count
+}
+
+/// Call site of the continuation on top of the stack: where a tail-called BIF returns to.
+fn top_continuation(p: &Process) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while let Some(word) = p.heap.stack_get(index) {
+        index += 1;
+        if let Some((module, ip)) = continuation_word(word)
+            && module as u64
+                & (RETURN_CALL_ACC_TRACE_FLAG | RETURN_TRACE_FLAG | RETURN_TO_TRACE_FLAG)
+                == 0
+        {
+            return Some((module, ip.saturating_sub(1)));
+        }
+    }
+    None
 }
 
 /// Interpreter continuation or catch tag carried as a catch immediate.
@@ -1765,6 +1801,7 @@ pub(super) fn build(
             registers: &p.x,
             trapped,
             trap_return: p.trap_return_frame().map(|frame| frame.ip),
+            frame_released: p.apply_frame_released(),
         },
         &p.heap,
         depth,

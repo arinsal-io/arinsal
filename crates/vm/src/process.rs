@@ -2541,7 +2541,30 @@ impl Executor {
                                     if call_site_pc != 0
                                         && target_pc != arinsal_beamasm::dispatch::CALL_FUN_UNPORTED
                                     {
-                                        process.native_error_pc = call_site_pc;
+                                        // Port of erts/emulator/beam/jit/arm/instr_call.cpp
+                                        // (emit_i_apply_last, OTP-29.1.1): a tail apply has
+                                        // deallocated its frame, so a BIF failure other than the
+                                        // error/exit/throw adjustment is attributed to the
+                                        // continuation it returns to, not to the apply site.
+                                        let tail_site = call_site_pc
+                                            & arinsal_beamasm::module::RETURN_SITE_TAG
+                                            == 0;
+                                        let bridge =
+                                            arinsal_beamasm::rt::arinsal_enter_native_return
+                                                as *const ()
+                                                as usize;
+                                        process.native_error_pc = if tail_site
+                                            && resume_pc != bridge
+                                            && matches!(
+                                                trap.top,
+                                                Some(crate::stacktrace::TopFrame::Bif { module, function, .. })
+                                                    if !(global_atoms().text(module) == Some("erlang")
+                                                        && global_atoms().text(function) == Some("apply"))
+                                            ) {
+                                            resume_pc | arinsal_beamasm::module::RETURN_SITE_TAG
+                                        } else {
+                                            call_site_pc
+                                        };
                                         if process.heap.stack_get(0).is_some_and(|word| {
                                             word.tagged_word() as usize == resume_pc
                                         }) {
