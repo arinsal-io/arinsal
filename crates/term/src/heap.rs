@@ -2359,6 +2359,19 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         self.tuple_iter(values.len(), values.iter().copied())
     }
 
+    /// Build a 2-tuple with the fixed `HAlloc(3)` layout used by map BIF results.
+    ///
+    /// Port of `maps_find_2` and `maps_take_2` in erts/emulator/beam/erl_map.c:225-267,
+    /// OTP-29.1.1.
+    #[inline(always)]
+    pub fn tuple2(&mut self, first: Term, second: Term) -> Result<Term, TermError> {
+        let start = self.words(3)?;
+        store(start, (2 << 6) | ARITY);
+        store(start.wrapping_add(1), first.bits());
+        store(start.wrapping_add(2), second.bits());
+        Ok(Term::from_ptr(start, 2))
+    }
+
     /// Reserve and initialize a nonempty tuple so a BIF can apply indexed updates in place.
     /// Port of the `HAlloc` and element stores in `make_tuple_3`,
     /// erts/emulator/beam/bif.c:3033-3074, OTP-29.1.1.
@@ -3436,6 +3449,31 @@ impl ConsListBuilder {
         Ok(head)
     }
 
+    /// Build a list directly from a flatmap's stored tagged-word array.
+    ///
+    /// Port of the indexed `while(n--) { CONS(hp, ks[n], res); hp += 2; }`
+    /// loops in erts/emulator/beam/erl_map.c:1222-1225 and :2277-2280,
+    /// OTP-29.1.1.
+    #[inline]
+    pub fn prepend_exact_words_with_tail(
+        self,
+        values: &[u64],
+        tail: Term,
+    ) -> Result<Term, TermError> {
+        if self.written != 0 || values.len() != self.len {
+            return Err(TermError::BadArg);
+        }
+        let mut head = tail;
+        let mut cell = self.start as *mut u64;
+        for &value in values.iter().rev() {
+            store(cell, value);
+            store(cell.wrapping_add(1), head.bits());
+            head = Term::from_ptr(cell, 1);
+            cell = cell.wrapping_add(2);
+        }
+        Ok(head)
+    }
+
     /// Fill the next reserved cons cell as an independent pair and return its term.
     /// Port of `CONS(hp, key, value)` in `erts/emulator/beam/erl_map.c:521`, OTP-29.1.1.
     #[inline(always)]
@@ -3501,6 +3539,44 @@ impl ConsListBuilder {
         }
         self.head = Term::from_ptr(cell, 1);
         self.written += 1;
+        Ok(())
+    }
+
+    /// Prepend a bounded run using the caller's exact count, checking capacity once per chunk.
+    ///
+    /// This keeps a resumable map projection's inner loop to the `CONS` stores and pointer
+    /// advance used by `hashmap_keys`/`hashmap_values` in erl_map.c:2827-2879.
+    #[inline]
+    pub fn prepend_chunk(
+        &mut self,
+        count: usize,
+        mut values: impl Iterator<Item = Term>,
+    ) -> Result<(), TermError> {
+        let end = self
+            .written
+            .checked_add(count)
+            .ok_or(TermError::SystemLimit)?;
+        if end > self.len {
+            return Err(TermError::BadArg);
+        }
+        if count == 0 {
+            return Ok(());
+        }
+
+        let mut cell = (self.start as *mut u64).wrapping_add(2 * self.written);
+        if self.written == 0 {
+            self.first_cdr = Some(cell.wrapping_add(1) as usize);
+        }
+        let mut head = self.head;
+        for _ in 0..count {
+            let value = values.next().ok_or(TermError::BadArg)?;
+            store(cell, value.bits());
+            store(cell.wrapping_add(1), head.bits());
+            head = Term::from_ptr(cell, 1);
+            cell = cell.wrapping_add(2);
+        }
+        self.head = head;
+        self.written = end;
         Ok(())
     }
 

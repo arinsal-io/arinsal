@@ -848,6 +848,175 @@ fn map_bifs_handle_hamt() {
 }
 
 #[test]
+fn changed_map_bifs_match_otp_for_flatmaps_hamts_and_errors() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    fn canonical(term: &O, projection: bool) -> O {
+        match term {
+            O::Map(entries) => {
+                let mut entries = entries
+                    .iter()
+                    .map(|(key, value)| (canonical(key, false), canonical(value, false)))
+                    .collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| match key {
+                    O::Int(value) => *value,
+                    other => panic!("unexpected test map key: {other:?}"),
+                });
+                O::Map(entries)
+            }
+            O::Tuple(elements) => O::Tuple(
+                elements
+                    .iter()
+                    .map(|element| canonical(element, false))
+                    .collect(),
+            ),
+            O::List { elems, tail } if projection => {
+                let mut elements = elems
+                    .iter()
+                    .map(|element| canonical(element, false))
+                    .collect::<Vec<_>>();
+                elements.sort_by_key(|element| match element {
+                    O::Int(value) => *value,
+                    other => panic!("unexpected test projection: {other:?}"),
+                });
+                O::List {
+                    elems: elements,
+                    tail: Box::new(canonical(tail, false)),
+                }
+            }
+            other => other.clone(),
+        }
+    }
+    let flat = O::Map((1..=8).map(|key| (O::Int(key), O::Int(key * 10))).collect());
+    let shrinking = O::Map(
+        (1..=33)
+            .map(|key| (O::Int(key), O::Int(key * 10)))
+            .collect(),
+    );
+    let hamt = O::Map(
+        (1..=40)
+            .map(|key| (O::Int(key), O::Int(key * 10)))
+            .collect(),
+    );
+    let keys = list((1..=40).map(O::Int).collect());
+    let cases = [
+        ("find", vec![O::Int(4), flat.clone()]),
+        ("find", vec![O::Int(99), hamt.clone()]),
+        ("find", vec![O::Int(4), atom("not_map")]),
+        ("get", vec![O::Int(4), flat.clone()]),
+        ("get", vec![O::Int(99), hamt.clone()]),
+        ("get", vec![O::Int(4), atom("not_map")]),
+        ("is_key", vec![O::Int(4), hamt.clone()]),
+        ("is_key", vec![O::Int(99), hamt.clone()]),
+        ("is_key", vec![O::Int(4), atom("not_map")]),
+        ("put", vec![O::Int(99), O::Int(7), flat.clone()]),
+        ("put", vec![O::Int(40), O::Int(7), hamt.clone()]),
+        ("put", vec![O::Int(99), O::Int(7), atom("not_map")]),
+        ("update", vec![O::Int(4), O::Int(7), hamt.clone()]),
+        ("update", vec![O::Int(99), O::Int(7), hamt.clone()]),
+        ("update", vec![O::Int(4), O::Int(7), atom("not_map")]),
+        ("remove", vec![O::Int(4), flat.clone()]),
+        ("remove", vec![O::Int(99), hamt.clone()]),
+        ("remove", vec![O::Int(1), shrinking]),
+        ("remove", vec![O::Int(4), atom("not_map")]),
+        ("take", vec![O::Int(4), hamt.clone()]),
+        ("take", vec![O::Int(99), hamt.clone()]),
+        ("take", vec![O::Int(4), atom("not_map")]),
+        ("keys", vec![hamt.clone()]),
+        ("values", vec![hamt]),
+        ("keys", vec![atom("not_map")]),
+        ("values", vec![atom("not_map")]),
+        ("from_keys", vec![keys, O::Int(7)]),
+    ];
+
+    for (name, input) in cases {
+        let actual = call("maps", name, &input);
+        let expected = reference.call("maps", name, &input);
+        match (&actual, &expected) {
+            (CallResult::Ok(actual), CallResult::Ok(expected)) => {
+                similar_asserts::assert_eq!(
+                    canonical(actual, name == "keys" || name == "values"),
+                    canonical(expected, name == "keys" || name == "values"),
+                    "maps:{name}({input:?})"
+                );
+            }
+            (
+                CallResult::Exception {
+                    class: actual_class,
+                    reason: actual_reason,
+                    ..
+                },
+                CallResult::Exception {
+                    class: expected_class,
+                    reason: expected_reason,
+                    ..
+                },
+            ) => similar_asserts::assert_eq!(
+                (actual_class, actual_reason),
+                (expected_class, expected_reason),
+                "maps:{name}({input:?})"
+            ),
+            _ => panic!("maps:{name}({input:?}): {actual:?} != {expected:?}"),
+        }
+    }
+}
+
+#[test]
+fn map_projections_walk_collision_nodes() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let pairs = [(1_i64, 10_i64), (2, 20), (3, 30)];
+    let expected_map = O::Map(
+        pairs
+            .iter()
+            .map(|(key, value)| (O::Int(*key), O::Int(*value)))
+            .collect(),
+    );
+    let mut heap = ProcessHeap::with_words(256);
+    let entries = pairs.map(|(key, value)| {
+        (
+            0,
+            arinsal_term::Term::small(key).unwrap(),
+            arinsal_term::Term::small(value).unwrap(),
+        )
+    });
+    let mut leaves = arinsal_term::hashmap_leaves_hashed(&entries, &mut heap).unwrap();
+    let map = arinsal_term::hashmap_from_unsorted_array(&mut leaves, false, &mut heap)
+        .unwrap()
+        .unwrap();
+    assert!(map.is_hashmap());
+
+    let mut allocator = ProcessHeapHandle(&mut heap);
+    let mut ctx = Ctx::new(&mut allocator);
+    for name in ["keys", "values"] {
+        let actual = to_owned(lookup("maps", name, 1).unwrap()(&mut ctx, &[map]).unwrap()).unwrap();
+        let expected = reference.call("maps", name, std::slice::from_ref(&expected_map));
+        let CallResult::Ok(O::List { elems, tail }) = &expected else {
+            panic!("OTP maps:{name} did not return a proper list: {expected:?}");
+        };
+        similar_asserts::assert_eq!(tail.as_ref(), &O::Nil);
+        let mut actual_values = match &actual {
+            O::List { elems, tail } if tail.as_ref() == &O::Nil => elems
+                .iter()
+                .map(|term| match term {
+                    O::Int(value) => *value,
+                    other => panic!("unexpected projection element: {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("maps:{name} returned {other:?}"),
+        };
+        let mut expected_values = elems
+            .iter()
+            .map(|term| match term {
+                O::Int(value) => *value,
+                other => panic!("unexpected OTP projection element: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        actual_values.sort_unstable();
+        expected_values.sort_unstable();
+        similar_asserts::assert_eq!(actual_values, expected_values, "maps:{name} collision node");
+    }
+}
+
+#[test]
 fn system_info_snifs_matches_otp() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     let expected = reference.call("erlang", "system_info", &[atom("snifs")]);

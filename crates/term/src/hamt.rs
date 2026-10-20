@@ -189,6 +189,14 @@ impl Iterator for PairIter {
     }
 }
 
+/// Iterate a hashmap's key/value pairs in OTP iterator order without collecting them.
+///
+/// Port of `hashmap_iterator_init` and `hashmap_iterator_next` in
+/// erts/emulator/beam/erl_map.c:2320-2410, OTP-29.1.1.
+pub fn hashmap_pairs(map: Term) -> Option<impl Iterator<Item = (Term, Term)>> {
+    (map.classify() == TermKind::Map && map.is_hashmap()).then(|| PairIter::new(map))
+}
+
 /// Collect pairs in `maps:to_list/1` order.
 pub(crate) fn pairs(map: Term) -> Vec<(Term, Term)> {
     if !map.is_hashmap() {

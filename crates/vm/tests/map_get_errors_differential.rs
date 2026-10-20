@@ -17,6 +17,7 @@ get_imm(M) -> map_get(a, M).
 get_int(M) -> map_get(1, M).
 get_bin(M) -> map_get(<<"k">>, M).
 get_any(K, M) -> map_get(K, M).
+maps_get_any(K, M) -> maps:get(K, M).
 get_boxed_key(K, M) when is_binary(K) -> map_get(K, M).
 get_exact(K, M) when is_map(M) -> map_get(K, M).
 get_exact_boxed(K, M) when is_map(M), is_binary(K) -> map_get(K, M).
@@ -141,7 +142,7 @@ run() ->
     OneM = [get_imm, get_int, get_bin, get_exact_imm, has_imm, size_any, size_exact,
             g_get_imm, g_get_bin, g_size, g_size_exact, g_size_eq, try_size, old_catch_size,
             pm2, pm3, pm8, pmy, pmb, pm2_strict, pm3_strict, pmy_strict],
-    TwoKM = [get_any, get_boxed_key, get_exact, get_exact_boxed, has_any, has_boxed_key,
+    TwoKM = [get_any, maps_get_any, get_boxed_key, get_exact, get_exact_boxed, has_any, has_boxed_key,
              has_exact, has_exact_boxed, g_get, g_get_exact, g_get_exact_boxed, g_get_or,
              g_has, g_has_exact, g_has_not, try_get, try_has, old_catch_get, nested, tail],
     R1 = [{F, norm(M), t(fun() -> map_get_err_probe:F(M) end)} || F <- OneM, M <- Ms],

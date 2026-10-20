@@ -1117,7 +1117,7 @@ impl HashmapBuild {
 /// hashmap_iterator_prev), OTP-29.1.1.
 pub struct MapReverseIter {
     /// Node and the index of the child visited last (one past the first child to visit).
-    nodes: Vec<(Term, usize)>,
+    nodes: SmallVec<[(Term, usize); 16]>,
 }
 
 impl MapReverseIter {
@@ -1126,7 +1126,9 @@ impl MapReverseIter {
         if map.classify() != TermKind::Map || !map.is_hashmap() {
             return None;
         }
-        let mut iter = Self { nodes: Vec::new() };
+        let mut iter = Self {
+            nodes: SmallVec::new(),
+        };
         iter.push_node(map);
         Some(iter)
     }
@@ -1148,7 +1150,11 @@ impl Iterator for MapReverseIter {
         loop {
             let (node, idx) = *self.nodes.last()?;
             let header = node.header().expect("HAMT node");
-            let first = child_range(header, 0).start;
+            let first = if header & 63 == crate::MAP {
+                child_range(header, 0).start
+            } else {
+                1
+            };
             if idx <= first {
                 self.nodes.pop();
                 continue;

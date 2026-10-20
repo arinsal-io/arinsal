@@ -176,6 +176,52 @@ pub(crate) fn flatmap_from_sorted<H: HeapAlloc + ?Sized>(
     Ok(term(ptr.wrapping_add(1 + n) as u64 | 2))
 }
 
+/// Build the flatmap produced when deleting a HAMT key shrinks it to flatmap size.
+///
+/// Port of `hashmap_delete`'s small-map branch and `erts_validate_and_sort_flatmap`
+/// in erts/emulator/beam/erl_map.c:2980-3038 and :3187-3212, OTP-29.1.1. The
+/// final map block is filled directly from the iterator, then sorted in place.
+pub(crate) fn flatmap_from_hashmap_without<H: HeapAlloc + ?Sized>(
+    map: Term,
+    removed_key: Term,
+    size: usize,
+    heap: &mut H,
+) -> Result<Term, TermError> {
+    if size == 0 {
+        return super::empty_flatmap(heap);
+    }
+    let words = 4 + 2 * size;
+    let (block, ptr) = arinsal_term::alloc_terms(heap, words)?;
+    block[0] = term((size as u64) << 6);
+    let map_at = size + 1;
+    let values_at = map_at + 3;
+    block[map_at] = term(MAP_HEADER_FLATMAP);
+    block[map_at + 1] = term(size as u64);
+    block[map_at + 2] = term(ptr as u64 | 2);
+
+    let mut written = 0;
+    for (key, value) in arinsal_term::hashmap_pairs(map).expect("checked hashmap") {
+        if exact_eq(key, removed_key) {
+            continue;
+        }
+        block[1 + written] = key;
+        block[values_at + written] = value;
+        written += 1;
+    }
+    assert_eq!(written, size, "deletion size matches hashmap iterator");
+
+    // erts_validate_and_sort_flatmap uses the same insertion sort over parallel arrays.
+    for ix in 1..size {
+        let mut jx = ix;
+        while jx > 0 && super::flatmap_key_cmp(block[1 + jx], block[jx]) == Ordering::Less {
+            block.swap(1 + jx, jx);
+            block.swap(values_at + jx, values_at + jx - 1);
+            jx -= 1;
+        }
+    }
+    Ok(term(ptr.wrapping_add(map_at) as u64 | 2))
+}
+
 /// Hash-sorted HAMT from unique (or later-wins) key/value arrays.
 fn hashmap_from_pairs<H: HeapAlloc + ?Sized>(
     pairs: impl ExactSizeIterator<Item = (Term, Term)>,
