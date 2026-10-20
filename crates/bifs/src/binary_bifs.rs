@@ -1255,14 +1255,26 @@ fn binary_last(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2335-2368 (binary_at_2), OTP-29.1.1.
-fn binary_at(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    with_binary_input(args[0], |bytes| {
+fn binary_at(_ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    with_binary_bytes(args[0], |view| {
+        if !view.bit_len().is_multiple_of(8) {
+            return Err(BADARG);
+        }
         let index = args[1].as_small().ok_or(BADARG)?;
-        let byte = bytes
-            .get(usize::try_from(index).map_err(|_| BADARG)?)
-            .ok_or(BADARG)?;
-        integer(ctx, usize::from(*byte))
-    })
+        let index = usize::try_from(index).map_err(|_| BADARG)?;
+        if index >= view.bit_len() / 8 {
+            return Err(BADARG);
+        }
+        let byte_offset = view.start_bit() / 8 + index;
+        let shift = view.start_bit() % 8;
+        let first = view.bytes()[byte_offset];
+        let byte = if shift == 0 {
+            first
+        } else {
+            (first << shift) | (view.bytes()[byte_offset + 1] >> (8 - shift))
+        };
+        Term::small(i64::from(byte)).ok_or(BADARG)
+    })?
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2400-2512 (do_binary_copy), OTP-29.1.1.
@@ -1364,24 +1376,26 @@ fn longest_common_suffix(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1004-1113 (do_binary_match_compile), OTP-29.1.1.
-fn patterns(term: Term) -> Result<Vec<Vec<u8>>, BifError> {
-    let candidates = if term.classify() == TermKind::Bitstring {
-        vec![term]
-    } else {
-        list(term)?
-    };
-    if candidates.is_empty() {
-        return Err(BADARG);
-    }
-    let mut result = Vec::new();
-    for candidate in candidates {
-        let bytes = binary_bytes(candidate)?;
-        if bytes.is_empty() {
-            return Err(BADARG);
+fn compile_search_pattern(term: Term) -> Result<SearchPattern, BifError> {
+    match term.classify() {
+        TermKind::Bitstring => with_binary_input(term, SearchPattern::compile_single),
+        TermKind::List => {
+            let (head, tail) = iolist_cons(term)?;
+            if tail == Term::NIL && head.classify() == TermKind::Bitstring {
+                return with_binary_input(head, SearchPattern::compile_single);
+            }
+            let mut patterns = Vec::new();
+            for candidate in list(term)? {
+                let bytes = binary_bytes(candidate)?;
+                if bytes.is_empty() {
+                    return Err(BADARG);
+                }
+                patterns.push(bytes);
+            }
+            SearchPattern::compile(patterns)
         }
-        result.push(bytes);
+        _ => Err(BADARG),
     }
-    Ok(result)
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1004-1113, 1230-1270 (pattern extraction), OTP-29.1.1.
@@ -1398,13 +1412,12 @@ fn pattern(term: Term) -> Result<Arc<SearchPattern>, BifError> {
             return Ok(Arc::clone(compiled));
         }
     }
-    Ok(Arc::new(SearchPattern::compile(&patterns(term)?)?))
+    Ok(Arc::new(compile_search_pattern(term)?))
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1004-1113 (binary_compile_pattern_1), OTP-29.1.1.
 fn compile_pattern(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let patterns = patterns(args[0])?;
-    let compiled = Arc::new(SearchPattern::compile(&patterns)?);
+    let compiled = Arc::new(compile_search_pattern(args[0])?);
     let orig_size = arinsal_term::MAGIC_BIN_DATA_OFFSET + compiled.erts_payload_size();
     let tag = Term::atom(global_atoms().intern(compiled.tag()).expect("atom"));
     let reference = TermBuilder::new(&mut Heap(&mut ctx.heap))
@@ -1557,47 +1570,78 @@ impl BinarySearchWalk {
 
     /// Build the BIF result after searching completes.
     pub fn finish(&self, ctx: &mut Ctx<'_>) -> Result<Term, BifError> {
-        let found = self.walk.finish();
+        let found_count = self.walk.match_count();
         match self.kind {
-            BinarySearchKind::Match => match found.first() {
-                Some(&(position, length)) => match_result(ctx, position, length),
+            BinarySearchKind::Match => match self.walk.match_at(0) {
+                Some((position, length)) => match_result(ctx, position, length),
                 None => Ok(Term::atom(global_atoms().intern("nomatch").expect("atom"))),
             },
             BinarySearchKind::Matches => {
-                let values = found
-                    .into_iter()
-                    .map(|(position, length)| match_result(ctx, position, length))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(make_list(ctx, values, Term::NIL))
+                let mut heap = Heap(&mut ctx.heap);
+                let mut builder = TermBuilder::new(&mut heap);
+                let mut result = Term::NIL;
+                for index in (0..found_count).rev() {
+                    let (position, length) = self
+                        .walk
+                        .match_at(index)
+                        .expect("match count matches recorded search results");
+                    let position = builder
+                        .int_from_i128(position as i128)
+                        .map_err(|_| BifError::SystemLimit)?;
+                    let length = builder
+                        .int_from_i128(length as i128)
+                        .map_err(|_| BifError::SystemLimit)?;
+                    let tuple = builder
+                        .tuple(&[position, length])
+                        .map_err(|_| BifError::SystemLimit)?;
+                    result = builder
+                        .cons(tuple, result)
+                        .map_err(|_| BifError::SystemLimit)?;
+                }
+                Ok(result)
             }
             BinarySearchKind::Split => {
-                let mut ranges = Vec::new();
-                let mut previous = 0;
-                for (position, length) in found {
-                    ranges.push((previous, position - previous));
-                    previous = position + length;
-                }
-                ranges.push((previous, self.walk.len() - previous));
-                if self.split_trim_all {
-                    ranges.retain(|(_, length)| *length != 0);
-                } else if self.split_trim {
-                    while ranges.last().is_some_and(|(_, length)| *length == 0) {
-                        ranges.pop();
+                if found_count == 0 {
+                    if (self.split_trim || self.split_trim_all) && self.walk.len() == 0 {
+                        return Ok(Term::NIL);
                     }
+                    return TermBuilder::new(&mut Heap(&mut ctx.heap))
+                        .cons(self.subject, Term::NIL)
+                        .map_err(|_| BifError::SystemLimit);
                 }
-                let values = {
-                    let mut heap = Heap(&mut ctx.heap);
-                    let mut builder = TermBuilder::new(&mut heap);
-                    ranges
-                        .into_iter()
-                        .map(|(start, length)| {
-                            builder
-                                .sub_binary_bif(self.subject, start * 8, length * 8)
-                                .map_err(|_| BifError::SystemLimit)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                Ok(make_list(ctx, values, Term::NIL))
+
+                let mut heap = Heap(&mut ctx.heap);
+                let mut builder = TermBuilder::new(&mut heap);
+                let mut result = Term::NIL;
+                let mut end = self.walk.len();
+                let mut trim_tail = self.split_trim;
+                for index in (0..found_count).rev() {
+                    let (position, length) = self
+                        .walk
+                        .match_at(index)
+                        .expect("match count matches recorded search results");
+                    let start = position + length;
+                    let segment_len = end - start;
+                    if segment_len != 0 || (!self.split_trim_all && !trim_tail) {
+                        let segment = builder
+                            .sub_binary_bif(self.subject, start * 8, segment_len * 8)
+                            .map_err(|_| BifError::SystemLimit)?;
+                        result = builder
+                            .cons(segment, result)
+                            .map_err(|_| BifError::SystemLimit)?;
+                        trim_tail = false;
+                    }
+                    end = position;
+                }
+                if end != 0 || (!self.split_trim_all && !trim_tail) {
+                    let prefix = builder
+                        .sub_binary_bif(self.subject, 0, end * 8)
+                        .map_err(|_| BifError::SystemLimit)?;
+                    result = builder
+                        .cons(prefix, result)
+                        .map_err(|_| BifError::SystemLimit)?;
+                }
+                Ok(result)
             }
         }
     }
@@ -1605,9 +1649,17 @@ impl BinarySearchWalk {
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1840-1850 (match result), OTP-29.1.1.
 fn match_result(ctx: &mut Ctx<'_>, position: usize, length: usize) -> Result<Term, BifError> {
-    let pos = integer(ctx, position)?;
-    let len = integer(ctx, length)?;
-    Ok(tuple_build(ctx, &[pos, len]))
+    let mut heap = Heap(&mut ctx.heap);
+    let mut builder = TermBuilder::new(&mut heap);
+    let position = builder
+        .int_from_i128(position as i128)
+        .map_err(|_| BifError::SystemLimit)?;
+    let length = builder
+        .int_from_i128(length as i128)
+        .map_err(|_| BifError::SystemLimit)?;
+    builder
+        .tuple(&[position, length])
+        .map_err(|_| BifError::SystemLimit)
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1538-1587 (binary_match_2/3), OTP-29.1.1.
