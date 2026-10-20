@@ -82,6 +82,7 @@ pub extern "C" fn arinsal_beamasm_bif_mfa(
 /// [`enter_runtime`] without the cursor conversion: the caller must not touch heap indices
 /// until it converts them. erts keeps HTOP and STOP as pointers in the process, so a BIF that
 /// never allocates needs no conversion.
+#[track_caller]
 pub(crate) fn enter_runtime_no_cursors<'a>(
     header: *mut ProcessHeader,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
@@ -103,6 +104,7 @@ pub(crate) fn convert_native_cursors(process: &mut Process) {
     );
 }
 
+#[track_caller]
 pub(crate) fn enter_runtime<'a>(
     header: *mut ProcessHeader,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
@@ -139,6 +141,7 @@ pub(crate) fn scheduler_registers(
 /// Enters a non-collecting heap helper that receives all operands as arguments.
 // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-537 (emit_enter_runtime with
 // Update::eHeapAlloc publishes HTOP and E), OTP-29.1.1.
+#[track_caller]
 pub(crate) fn enter_heap_runtime<'a>(header: *mut ProcessHeader) -> Option<&'a mut Process> {
     let process = process_from_header(header)?;
     // `c_p->heap` is the base; converting through the block pointer is the slow path.
@@ -155,13 +158,50 @@ pub(crate) fn enter_heap_runtime<'a>(header: *mut ProcessHeader) -> Option<&'a m
     Some(process)
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static HELPER_RING: std::cell::RefCell<std::collections::VecDeque<String>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Debug aid: the last native helper entries of this thread, printed when the generated code's
+/// cursor validation fails.
+#[cfg(debug_assertions)]
+pub(crate) extern "C" fn dump_helper_ring() {
+    HELPER_RING.with(|ring| {
+        for entry in ring.borrow().iter() {
+            eprintln!("  helper {entry}");
+        }
+    });
+}
+
+#[track_caller]
 pub(crate) fn process_from_header<'a>(header: *mut ProcessHeader) -> Option<&'a mut Process> {
     if header.is_null() {
         return None;
     }
+
     // SAFETY: ProcessHeader is the first repr(C) field of Process; native entry
     // passes the active process header for the duration of the helper call.
-    Some(unsafe { &mut *header.cast::<Process>() })
+    let process = unsafe { &mut *header.cast::<Process>() };
+    #[cfg(debug_assertions)]
+    {
+        let location = std::panic::Location::caller();
+        let (htop, heap) = (process.header.htop, process.header.heap);
+        HELPER_RING.with(|ring| {
+            let mut ring = ring.borrow_mut();
+            if ring.len() >= 6 {
+                ring.pop_front();
+            }
+            ring.push_back(format!(
+                "{}:{} htop={htop:p} heap={heap:p}",
+                location.file(),
+                location.line()
+            ));
+        });
+        arinsal_beamasm::set_cursor_failure_hook(dump_helper_ring);
+    }
+    Some(process)
 }
 
 pub(crate) fn set_error(process: &mut Process, name: &str) {

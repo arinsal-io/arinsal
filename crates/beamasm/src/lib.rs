@@ -402,6 +402,13 @@ pub(crate) fn native_cursor_validation_enabled() -> bool {
     *VALIDATE.get_or_init(|| std::env::var_os("ARINSAL_BEAMASM_VALIDATE").is_some())
 }
 
+static CURSOR_FAILURE_HOOK: std::sync::OnceLock<extern "C" fn()> = std::sync::OnceLock::new();
+
+/// Debug aid: a function the cursor validation failure report calls after its message.
+pub fn set_cursor_failure_hook(hook: extern "C" fn()) {
+    let _ = CURSOR_FAILURE_HOOK.set(hook);
+}
+
 extern "C" fn report_native_cursor_failure(
     instruction: u64,
     stack: u64,
@@ -415,6 +422,9 @@ extern "C" fn report_native_cursor_failure(
     eprintln!(
         "BeamAsm cursor invariant failed at native instruction {instruction} (LR={instruction_pc:#x}): E={stack:#x}, HTOP={heap_top:#x}, heap=[{heap_start:#x}, {heap_end:#x}], X0={x0:#x}, X1={x1:#x}"
     );
+    if let Some(hook) = CURSOR_FAILURE_HOOK.get() {
+        hook();
+    }
 }
 
 extern "C" fn report_native_cursor(

@@ -6670,6 +6670,22 @@ impl Process {
         min_free: usize,
         hibernate: bool,
     ) -> Result<arinsal_term::GcStats, VmError> {
+        let stats = self.collect_roots_inner(live_x, extra, min_free, hibernate)?;
+        // A collection moves the young heap. erts keeps HTOP, STOP, HEAP and HEND as the
+        // process's own fields, so they are right the moment the collector returns; here the
+        // ABI prefix is a copy, and every path that returns to native code after a collection
+        // (success, error or trap alike) must find the new heap in it.
+        self.sync_native_heap();
+        Ok(stats)
+    }
+
+    fn collect_roots_inner(
+        &mut self,
+        live_x: usize,
+        extra: &mut [Term],
+        min_free: usize,
+        hibernate: bool,
+    ) -> Result<arinsal_term::GcStats, VmError> {
         if crate::xreg_poison_enabled()
             && let Some(register) = self.x[..live_x.min(self.x.len())]
                 .iter()
@@ -8557,6 +8573,43 @@ mod layout_tests {
             arinsal_term::to_owned(term).unwrap(),
             arinsal_etf::OwnedTerm::Tuple(vec![arinsal_etf::OwnedTerm::Int(17)])
         );
+    }
+
+    /// Regression for the Elixir `base_test`/`calendar/iso_test` crashes: a collection inside a
+    /// native helper that returns an error (or any path without its own header sync) left
+    /// `heap`/`hend` of the ABI prefix on the old heap, and the next helper committed cursors of
+    /// the new heap against the old base.
+    #[test]
+    fn collection_publishes_the_new_heap_to_the_native_header() {
+        let mut process = Process::new();
+        process.sync_native_header();
+        let before = (process.header.heap, process.header.hend);
+        // Force a collection that grows the young heap.
+        process.ensure(1 << 14, 0).unwrap();
+        let (heap, hend) = process.heap.heap_bounds();
+        let (htop, stop) = process.heap.heap_cursor();
+        assert_ne!(
+            (heap, hend),
+            before,
+            "the collection must move or grow the heap"
+        );
+        assert_eq!(process.header.heap, heap);
+        assert_eq!(process.header.hend, hend);
+        assert_eq!(process.header.htop, htop);
+        assert_eq!(process.header.stop, stop);
+    }
+
+    #[test]
+    fn partial_cursor_sync_also_publishes_heap_bounds() {
+        let mut process = Process::new();
+        process.sync_native_header();
+        let _ = process.heap.heap_bounds();
+        process.heap.delay_collection(0);
+        process.header.heap = std::ptr::null_mut();
+        process.header.hend = std::ptr::null_mut();
+        process.sync_native_cursors();
+        assert_eq!(process.header.heap, process.heap.heap_bounds().0);
+        assert_eq!(process.header.hend, process.heap.heap_bounds().1);
     }
 
     #[test]
