@@ -4841,7 +4841,11 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         };
         match arinsal_bits::create_bin(&segments, &mut process.heap) {
             Err(BitsError::HeapFull { need_words }) => {
-                request = need_words.max(request.saturating_mul(2));
+                // The builder's own need excludes the `Alloc` words the following stores use
+                // without a heap test (`extra_words` in erts), which the retry must keep.
+                request = need_words
+                    .saturating_add(alloc)
+                    .max(request.saturating_mul(2));
             }
             other => break other,
         }

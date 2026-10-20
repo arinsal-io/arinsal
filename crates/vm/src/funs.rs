@@ -417,7 +417,10 @@ impl Vm {
                 if module == "erlang" && function == "apply" && matches!(arity, 2 | 3) {
                     return self.apply_bif(p, arity, tail, 0, ctx);
                 }
-                self.call_named_atoms(
+                // The fun's own checks (badfun, badarity) raise before the frame is released;
+                // only the callee BIF runs with it gone.
+                let began = p.begin_tail_apply(tail, crate::proc_create::TAIL_FUN_CALL);
+                let result = self.call_named_atoms(
                     p,
                     entry.module,
                     entry.function,
@@ -426,7 +429,9 @@ impl Vm {
                     arity,
                     tail,
                     ctx,
-                )
+                );
+                p.end_tail_apply(began, &result);
+                result
             }
         }
     }
@@ -1104,7 +1109,11 @@ impl Vm {
             // Port of erts/emulator/beam/beam_common.c:1445-1450 (apply), OTP-29.1.1.
             return self.apply_bif(p, 3, tail, dealloc, ctx);
         }
-        self.call_named_atoms(
+        // Port of erts/emulator/beam/jit/arm/instr_call.cpp (emit_i_apply_last, OTP-29.1.1):
+        // the frame is deallocated before the callee runs, but a failure of the apply itself
+        // (above) is raised at the apply instruction, in the caller.
+        let began = p.begin_tail_apply(tail, crate::proc_create::TAIL_APPLY);
+        let result = self.call_named_atoms(
             p,
             module_atom,
             function_atom,
@@ -1113,7 +1122,9 @@ impl Vm {
             arity,
             tail,
             ctx,
-        )
+        );
+        p.end_tail_apply(began, &result);
+        result
     }
 
     #[inline]
@@ -1223,6 +1234,7 @@ impl Vm {
                 .extend_from_slice(&original_operands[..arity]);
             base
         };
+        let began = p.begin_tail_apply(tail && arity == 3, crate::proc_create::TAIL_APPLY);
         let result = if let Some(fun) = target {
             self.call_fun_term(p, fun, args.len(), tail, ctx)
         } else {
@@ -1244,6 +1256,7 @@ impl Vm {
                 ctx,
             )
         };
+        p.end_tail_apply(began, &result);
         let mut operand_buf = [Term::NIL; 3];
         let operand_len = if inline {
             operand_buf[..arity].copy_from_slice(&p.apply_inline[..arity]);

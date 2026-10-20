@@ -1011,6 +1011,12 @@ pub(crate) struct ProcessCold {
     pub(crate) bif_return_to: Vec<u64>,
     /// The current apply comes from native code, whose call site names the caller frame.
     pub(crate) native_apply: bool,
+    /// A tail `apply` has deallocated its caller's frame and runs its callee: a BIF that raises
+    /// there has no caller continuation of its own (BeamAsm `emit_i_apply_last` deallocates first).
+    // Deviation (interpreter only): erts has no such flag; the interpreter derives a BIF's return
+    // address from `ip` instead of an explicit continuation. Remove once interpreter BIF calls
+    // carry their return address the way erts does.
+    pub(crate) apply_frame_released: u8,
     /// Call site (module, ip) of a traced native BIF whose call event was emitted and which
     /// yielded before finishing, with the trace actions its return events still need.
     /// Native code ran `timeout` while tracing is active; the executor emits the receive event.
@@ -1218,6 +1224,13 @@ pub(crate) struct ReleasedFrame {
     pub(crate) words: Vec<Term>,
 }
 
+/// `apply_frame_released` of a tail `apply/3` or fixed apply: erts passes the apply site `I`
+/// and a BIF failure other than error/exit/throw is attributed to the continuation.
+pub(crate) const TAIL_APPLY: u8 = 1;
+/// `apply_frame_released` of a tail fun call, which has no apply-site adjustment at all: the
+/// raising BIF's pc is the continuation on top of the stack.
+pub(crate) const TAIL_FUN_CALL: u8 = 2;
+
 const SAVED_FRAME_WORDS: usize = 16;
 
 /// What a tail call that releases its frame keeps until it knows whether the callee yields.
@@ -1262,6 +1275,30 @@ impl BifTrapPending {
 }
 
 impl Process {
+    /// Enter a tail apply whose caller frame is already deallocated (see `apply_frame_released`).
+    /// Returns whether this call set the flag, for `end_tail_apply`.
+    pub(crate) fn begin_tail_apply(&mut self, tail: bool, kind: u8) -> bool {
+        if !tail
+            || self.apply_frame_released()
+            || self.cold.as_ref().is_some_and(|c| c.native_apply)
+        {
+            return false;
+        }
+        self.cold_mut().apply_frame_released = kind;
+        true
+    }
+    /// Leave a tail apply. A BIF failure keeps the flag until `exceptions::resume` saves its trace.
+    pub(crate) fn end_tail_apply<T>(&mut self, began: bool, result: &Result<T, VmError>) {
+        if began && !matches!(result, Err(VmError::Trap(trap)) if trap.is_raw_bif_failure()) {
+            self.cold_mut().apply_frame_released = 0;
+        }
+    }
+    /// Whether a running tail `apply` has already deallocated its caller's frame.
+    pub(crate) fn apply_frame_released(&self) -> bool {
+        self.cold
+            .as_ref()
+            .is_some_and(|cold| cold.apply_frame_released != 0)
+    }
     /// The caller frame of the BIF the process waits in, while it is scheduled out in the
     /// export trap of an interpreter call.
     pub(crate) fn trap_return_frame(&self) -> Option<&TrapReturn> {
