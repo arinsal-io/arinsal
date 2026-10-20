@@ -10,7 +10,8 @@ const SOURCE: &str = r#"
 run(Function, Args) ->
     try apply(erlang, Function, Args) of
         Value -> {ok, Value}
-    catch Class:Reason:Stack -> {Class, Reason, Stack}
+    %% Only the BIF frame: caller frames carry checkout-dependent file paths.
+    catch Class:Reason:Stack -> {Class, Reason, [F || {erlang, _, _, _} = F <- Stack]}
     end.
 
 "#;
