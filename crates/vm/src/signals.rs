@@ -2374,15 +2374,9 @@ pub(crate) fn demonitor_light(
     Some(Ok(result))
 }
 
-/// Port of erts/emulator/beam/bif.c:1231-1248 (unlink_1): send the unlink op, then mark the node
+/// Port of erts/emulator/beam/bif.c:1231-1248 (unlink_1): after sending the unlink op, mark the node
 /// with its id; a refused send (the peer is gone) deletes the node.
-fn unlink_send(
-    process: &mut Process,
-    pid: Pid,
-    id: u64,
-    send: impl FnOnce(arinsal_sched::Signal<Message>) -> bool,
-) {
-    let sent = send(arinsal_sched::Signal::Unlink(id));
+fn unlink_mark(process: &mut Process, pid: Pid, id: u64, sent: bool) {
     let links = &mut process.cold_mut().links;
     if sent {
         if let Some(node) = links.get_mut(&pid) {
@@ -2414,10 +2408,12 @@ pub(crate) fn unlink_light(
         return Some(Ok(atom("true")));
     }
     let id = rt_ref(process)?.next_ref();
-    let scheduler = rt_ref(process)?.scheduler().ok()?.clone();
-    unlink_send(process, pid, id, |signal| {
-        scheduler.signal_ordered(me, pid, signal).is_ok()
-    });
+    let sent = rt_ref(process)?
+        .scheduler()
+        .ok()?
+        .signal_ordered(me, pid, arinsal_sched::Signal::Unlink(id))
+        .is_ok();
+    unlink_mark(process, pid, id, sent);
     Some(Ok(atom("true")))
 }
 
@@ -2964,7 +2960,8 @@ fn call_resolved(
                         .runtime
                         .as_ref()
                         .map_or(1, |runtime| runtime.next_ref());
-                    unlink_send(process, pid, id, |signal| ctx.signal(pid, signal).is_ok());
+                    let sent = ctx.signal(pid, Signal::Unlink(id)).is_ok();
+                    unlink_mark(process, pid, id, sent);
                 }
                 wake_for_procs_trace(process, ctx, pid);
                 atom("true")
