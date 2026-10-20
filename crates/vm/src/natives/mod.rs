@@ -434,6 +434,9 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "unlink" && arity == 1 {
         return Some(crate::signals::unlink_light);
     }
+    if module == "erlang" && function == "send" && arity == 3 {
+        return Some(crate::signals::send3_light);
+    }
     if module == "erlang" && function == "exit" && arity == 2 {
         return Some(crate::signals::exit2_light);
     }

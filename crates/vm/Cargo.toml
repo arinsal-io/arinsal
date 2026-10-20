@@ -53,6 +53,7 @@ mio = { version = "1", features = ["os-poll", "os-ext"] }
 signal-hook-mio = { version = "0.2.5", features = ["support-v1_0"] }
 nix = { version = "0.29.0", features = ["fs", "net"] }
 arc-swap = "1.9.2"
+parking_lot = "0.12.5"
 
 [dev-dependencies]
 arinsal-beamjit = { path = "../beamjit" }

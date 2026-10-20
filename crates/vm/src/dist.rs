@@ -2453,6 +2453,10 @@ pub(crate) fn is_remote_target(target: Term) -> Result<bool, VmError> {
     if target.as_pid_data().is_some() || target.as_atom().is_some() {
         return Ok(false);
     }
+    // An internal reference (an alias) names this node.
+    if target.local_ref_numbers().is_some() {
+        return Ok(false);
+    }
     let local = node_tables::lock().local_name.clone();
     let remote = |node: &str| node != local && node != "nonode@nohost";
     if let Some((_, node)) = name_node_tuple(target)? {

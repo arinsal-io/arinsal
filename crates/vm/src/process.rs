@@ -987,14 +987,48 @@ const ALIAS_INACTIVE: u64 = 1;
 /// not acquire a global mutex after the slab's one-time allocation.
 struct AliasTable {
     slabs: Box<[OnceLock<Box<[AtomicU64]>>]>,
-    overflow: Mutex<HashMap<u64, (Option<Pid>, bool)>>,
+    /// Ids beyond the dense slabs (per-scheduler reference counters): sharded by id so the
+    /// scheduler threads of unrelated processes do not meet on one lock.
+    overflow: Box<[AliasShard]>,
+}
+
+const ALIAS_SHARDS: usize = 64;
+
+type AliasShard = parking_lot::Mutex<
+    HashMap<u64, (Option<Pid>, bool), std::hash::BuildHasherDefault<AliasHasher>>,
+>;
+
+/// Multiplicative hash of the reference id; ids are not attacker chosen.
+#[derive(Default)]
+struct AliasHasher(u64);
+
+impl std::hash::Hasher for AliasHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+}
+
+fn alias_shard(id: u64) -> usize {
+    ((id.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40) as usize) % ALIAS_SHARDS
 }
 
 impl AliasTable {
     fn new() -> Self {
         Self {
             slabs: (0..ALIAS_SLABS).map(|_| OnceLock::new()).collect(),
-            overflow: Mutex::new(HashMap::new()),
+            overflow: (0..ALIAS_SHARDS)
+                .map(|_| parking_lot::Mutex::new(HashMap::default()))
+                .collect(),
         }
     }
 
@@ -1033,7 +1067,7 @@ impl AliasTable {
 
     fn load(&self, id: u64) -> Option<(Option<Pid>, bool)> {
         if id / ALIAS_SLAB as u64 >= ALIAS_SLABS as u64 {
-            return self.overflow.lock().unwrap().get(&id).copied();
+            return self.overflow[alias_shard(id)].lock().get(&id).copied();
         }
         let slab = self.slabs.get((id / ALIAS_SLAB as u64) as usize)?.get()?;
         let slot = (id % ALIAS_SLAB as u64) as usize;
@@ -1043,9 +1077,8 @@ impl AliasTable {
 
     fn store(&self, id: u64, target: Option<Pid>, priority: bool) {
         if id / ALIAS_SLAB as u64 >= ALIAS_SLABS as u64 {
-            self.overflow
+            self.overflow[alias_shard(id)]
                 .lock()
-                .unwrap()
                 .insert(id, (target, priority && target.is_some()));
             return;
         }
@@ -3979,6 +4012,9 @@ impl Vm {
 }
 
 pub(crate) fn erlang_apply_entry(vm: &mut Vm) -> Result<(usize, usize), VmError> {
+    if let Some(entry) = vm.apply3_entry {
+        return Ok(entry);
+    }
     let module_id = vm.load_named("erlang")?;
     let entry = vm.code.modules[module_id]
         .functions
@@ -3986,6 +4022,7 @@ pub(crate) fn erlang_apply_entry(vm: &mut Vm) -> Result<(usize, usize), VmError>
         .find(|(_, name, arity)| name == "apply" && *arity == 3)
         .map(|(ip, _, _)| ip + 1)
         .ok_or_else(|| VmError::Unsupported("erlang:apply/3 is not loaded".into()))?;
+    vm.apply3_entry = Some((module_id, entry));
     Ok((module_id, entry))
 }
 
