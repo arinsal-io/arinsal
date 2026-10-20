@@ -2,6 +2,7 @@
 //! including projection order, duplicate handling and the final merged map.
 
 use arinsal_difftest::{CallResult, RefErl};
+use arinsal_etf::OwnedTerm;
 use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
@@ -52,15 +53,18 @@ trap_count() ->
      TD = erlang:trace_delivered(Pid),
      receive {trace_delivered, Pid, TD} -> ok end,
      Tr ! {done, Fn},
-     receive {Fn, Outs} -> Outs > 2 end
+     receive {Fn, Outs} -> Outs end
    end || {Fn, F} <- [{from_list, fun() -> maps:from_list(Pairs) end},
                       {from_keys, fun() -> maps:from_keys(Ks, v) end},
                       {keys, fun() -> maps:keys(maps:from_keys(Ks, v)) end},
+                      {keys_only, fun() -> maps:keys(A) end},
                       {values, fun() -> maps:values(maps:from_list(Pairs)) end},
+                      {values_only, fun() -> maps:values(A) end},
                       {merge, fun() -> maps:merge(A, B) end}]].
 tracer(Me, N) ->
   receive
-    {trace, _, out, {maps, F, _}} when F =:= from_list; F =:= from_keys; F =:= keys; F =:= values ->
+    {trace, _, out, {maps, F, _}} when F =:= from_list; F =:= from_keys; F =:= keys;
+                                       F =:= values ->
       tracer(Me, N + 1);
     {trace, _, out, {maps, merge, _}} ->
       tracer(Me, N + 1);
@@ -79,13 +83,91 @@ fn yielding_map_bifs_match_otp_29() {
         .compile_named("maps_yield_diff", SOURCE, &[])
         .unwrap();
     reference.load("maps_yield_diff", &beam).unwrap();
-    for function in ["build", "merge", "trap_count"] {
+    for function in ["build", "merge"] {
         let expected = reference.call("maps_yield_diff", function, &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();
         let actual = vm
             .eval_scheduled("maps_yield_diff", function, &[], 2, Some(7))
             .unwrap_or_else(|error| panic!("{function}: {error}"));
-        assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+        similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
     }
+
+    // erts_qsort seeds its pivot selection from scheduler-local random state and the
+    // input array address (`utils.c:3681-3688`, called by `erl_map.c:777`), so map
+    // constructor yields vary between otherwise equal OTP runs. Separate OTP runs of
+    // this workload have differed by three trace-outs (12 versus 15). Use a fresh
+    // node per sample and widen the observed range by at least that qsort variation.
+    // Projection-only and merge counts do not use that randomized construction path.
+    let mut reference_counts = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let sample_reference = RefErl::start().expect("start OTP trap-count sample node");
+        sample_reference
+            .load("maps_yield_diff", &beam)
+            .expect("load map differential module into sample node");
+        reference_counts.push(trap_counts(sample_reference.call(
+            "maps_yield_diff",
+            "trap_count",
+            &[],
+        )));
+    }
+    for index in [3, 5, 6] {
+        let first = reference_counts[0][index];
+        assert!(
+            reference_counts.iter().all(|counts| counts[index] == first),
+            "deterministic OTP trap count at {index} varied: {reference_counts:?}"
+        );
+    }
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("maps_yield_diff", "trap_count", &[], 2, Some(7))
+        .unwrap_or_else(|error| panic!("trap_count: {error}"));
+    let actual_counts = trap_counts(CallResult::Ok(actual.term));
+    for index in [0, 1, 2, 4] {
+        let low = reference_counts
+            .iter()
+            .map(|counts| counts[index])
+            .min()
+            .unwrap();
+        let high = reference_counts
+            .iter()
+            .map(|counts| counts[index])
+            .max()
+            .unwrap();
+        let qsort_variation = (high - low).max(3);
+        let lower_bound = low - qsort_variation;
+        let upper_bound = high + qsort_variation;
+        assert!(
+            (lower_bound..=upper_bound).contains(&actual_counts[index]),
+            "qsort-affected OTP trap count at {index} was {low}..={high} over five runs; \
+             widened by qsort variation {qsort_variation} to {lower_bound}..={upper_bound}, \
+             Arinsal was {} (samples {reference_counts:?})",
+            actual_counts[index]
+        );
+    }
+    for index in [3, 5, 6] {
+        similar_asserts::assert_eq!(
+            reference_counts[0][index],
+            actual_counts[index],
+            "deterministic trap count at {index}"
+        );
+    }
+}
+
+fn trap_counts(result: CallResult) -> Vec<i64> {
+    let CallResult::Ok(OwnedTerm::List { elems, tail }) = &result else {
+        panic!("trap_count returned an unexpected result: {result:?}");
+    };
+    assert!(matches!(tail.as_ref(), OwnedTerm::Nil));
+    let counts = elems
+        .iter()
+        .map(|term| match term {
+            OwnedTerm::Int(count) => *count,
+            other => panic!("trap_count returned a non-integer: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(counts.len(), 7, "trap_count returned an unexpected shape");
+    counts
 }

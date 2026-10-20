@@ -2421,6 +2421,31 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         Ok(Term::from_ptr(p, 2))
     }
 
+    /// Copy a tuple and append one element in the same allocation.
+    ///
+    /// Port of `append_element_2`, erts/emulator/beam/bif.c:3083-3108, OTP-29.1.1.
+    #[inline]
+    pub fn tuple_append(
+        &mut self,
+        source: &crate::TupleRef<'_>,
+        appended: Term,
+    ) -> Result<Term, TermError> {
+        let arity = source.len();
+        let len = arity.checked_add(1).ok_or(TermError::BadArg)?;
+        if len > (1 << 24) - 1 {
+            return Err(TermError::BadArg);
+        }
+        let p = self.words(len + 1)?;
+        store(p, (len as u64) << 6 | ARITY);
+        let mut dst = p.wrapping_add(1);
+        for value in source.iter() {
+            store(dst, value.bits());
+            dst = dst.wrapping_add(1);
+        }
+        store(dst, appended.bits());
+        Ok(Term::from_ptr(p, 2))
+    }
+
     /// Append `{first, second, _}` to a destructively patched 3-tuple chain.
     ///
     /// The previous tuple's tail slot is patched to point at the new one, like

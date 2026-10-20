@@ -2,14 +2,15 @@
 
 use arinsal_term::{Term, cmp_exact, global_atoms};
 use std::cmp::Ordering;
+use std::ops::{Index, IndexMut};
 
-const NONE: usize = usize::MAX;
+const NONE: usize = 0;
 
 /// One node in the preallocated contiguous multiset node area.
 ///
 /// Port of `erts/emulator/beam/erl_bif_lists.c:389-398` and the configured
-/// `erl_rbtree.h` node operations, OTP-29.1.1. Integer links retain the C
-/// pointer slots' order and width while keeping all tree manipulation safe.
+/// `erl_rbtree.h` node operations, OTP-29.1.1. Pointer addresses retain the C
+/// node links' values, order, and width while keeping all tree manipulation safe.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Node {
@@ -24,9 +25,9 @@ struct Node {
 impl Node {
     fn candidate(key: Term) -> Self {
         Self {
-            parent: NONE,
-            left: NONE,
-            right: NONE,
+            parent: 0,
+            left: 0,
+            right: 0,
             is_red: 0,
             key,
             count: 1,
@@ -34,9 +35,60 @@ impl Node {
     }
 }
 
+/// Address-indexed view of the contiguous node allocation. ERTS stores native pointers in each
+/// node; this safe index maps those same pointer words into the Rust-owned array.
+struct NodeArena(Vec<Node>);
+
+impl NodeArena {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    fn push(&mut self, node: Node) -> usize {
+        debug_assert!(self.0.len() < self.0.capacity());
+        let address = self.0.as_ptr().wrapping_add(self.0.len()) as usize;
+        self.0.push(node);
+        address
+    }
+
+    fn pop(&mut self) {
+        self.0.pop().expect("unlinked candidate node");
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn index_of(&self, address: usize) -> usize {
+        debug_assert_ne!(address, NONE);
+        let base = self.0.as_ptr() as usize;
+        let offset = address.checked_sub(base).expect("node address in arena");
+        debug_assert_eq!(offset % std::mem::size_of::<Node>(), 0);
+        let index = offset / std::mem::size_of::<Node>();
+        debug_assert!(index < self.0.len());
+        index
+    }
+}
+
+impl Index<usize> for NodeArena {
+    type Output = Node;
+
+    fn index(&self, address: usize) -> &Self::Output {
+        &self.0[self.index_of(address)]
+    }
+}
+
+impl IndexMut<usize> for NodeArena {
+    fn index_mut(&mut self, address: usize) -> &mut Self::Output {
+        let index = self.index_of(address);
+        &mut self.0[index]
+    }
+}
+
 /// A contiguous red-black multiset with one count per exact Erlang key.
 pub(super) struct RbTree {
-    nodes: Vec<Node>,
+    nodes: NodeArena,
     root: usize,
 }
 
@@ -46,7 +98,7 @@ impl RbTree {
     /// Port of `subtract_enter_set_build` at `erl_bif_lists.c:797-804`, OTP-29.1.1.
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
-            nodes: Vec::with_capacity(capacity),
+            nodes: NodeArena::with_capacity(capacity),
             root: NONE,
         }
     }
@@ -56,11 +108,10 @@ impl RbTree {
     /// Port of `erl_rbtree.h:1056-1139` (`insert_aux__` and
     /// `lookup_insert`), OTP-29.1.1.
     pub(super) fn insert(&mut self, key: Term) -> usize {
-        let index = self.nodes.len();
+        let index = self.nodes.push(Node::candidate(key));
         // OTP writes key/count into the next arena slot before lookup_insert initializes
         // its links and searches the tree. A duplicate leaves alloc unchanged, so pop the
         // unlinked candidate after incrementing the existing node.
-        self.nodes.push(Node::candidate(key));
         if self.root == NONE {
             self.root = index;
             return index;

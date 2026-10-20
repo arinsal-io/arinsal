@@ -181,8 +181,12 @@ impl MapsProjectionWalk {
 enum BuildPhase {
     /// First loop of `maps_from_list_1_helper` / `maps_from_keys_2_helper`: check the list.
     Validate,
+    /// The body after `YCF_CONSUME_REDS(1)` at the top of the validation loop.
+    ValidateBody,
     /// Second loop of `hashmap_from_validated_list`: hash every entry.
     Leaves,
+    /// The body after `YCF_CONSUME_REDS(1)` at the top of the leaf loop.
+    LeavesBody,
     /// `hashmap_from_unsorted_array` and what it calls.
     Build,
 }
@@ -270,15 +274,13 @@ impl MapsBuildWalk {
                 BuildPhase::Validate => {
                     // `is_list` is the primary tag, not a full classification
                     // (erl_map.c:331, erl_term.h is_list).
-                    while self.cursor.tagged_word() & 3 == 1 {
+                    if self.cursor.tagged_word() & 3 == 1 {
+                        self.phase = BuildPhase::ValidateBody;
                         *reds -= 1;
-                        let (head, tail) = Self::cell(self.cursor)?;
-                        self.element(head)?;
-                        self.size += 1;
-                        self.cursor = tail;
                         if *reds <= 0 {
                             return Ok(None);
                         }
+                        continue;
                     }
                     if self.cursor != Term::NIL {
                         return Err(BifError::BADARG);
@@ -302,26 +304,38 @@ impl MapsBuildWalk {
                     self.build = Some(mapped(ctx, build)?);
                     self.phase = BuildPhase::Leaves;
                 }
+                BuildPhase::ValidateBody => {
+                    let (head, tail) = Self::cell(self.cursor)?;
+                    self.element(head)?;
+                    self.size += 1;
+                    self.cursor = tail;
+                    self.phase = BuildPhase::Validate;
+                }
                 BuildPhase::Leaves => {
-                    while self.cursor.tagged_word() & 3 == 1 {
+                    if self.cursor.tagged_word() & 3 == 1 {
+                        self.phase = BuildPhase::LeavesBody;
                         *reds -= 1;
-                        let (head, tail) = Self::cell(self.cursor)?;
-                        let (key, value) = self.element_after_validation(head)?;
-                        self.build
-                            .as_mut()
-                            .expect("hashmap leaf builder")
-                            .push(key, value)
-                            .map_err(|error| map_error(ctx, error))?;
-                        self.cursor = tail;
                         if *reds <= 0 {
                             return Ok(None);
                         }
+                        continue;
                     }
                     self.build
                         .as_mut()
                         .expect("hashmap leaf builder")
                         .finish_leaves();
                     self.phase = BuildPhase::Build;
+                }
+                BuildPhase::LeavesBody => {
+                    let (head, tail) = Self::cell(self.cursor)?;
+                    let (key, value) = self.element_after_validation(head)?;
+                    self.build
+                        .as_mut()
+                        .expect("hashmap leaf builder")
+                        .push(key, value)
+                        .map_err(|error| map_error(ctx, error))?;
+                    self.cursor = tail;
+                    self.phase = BuildPhase::Leaves;
                 }
                 BuildPhase::Build => {
                     let build = self.build.as_mut().ok_or(BifError::BADARG)?;
