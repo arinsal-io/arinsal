@@ -593,7 +593,7 @@ impl HashStorage {
                 }
                 node = current.next.as_deref_mut();
             };
-            if !object.compressed_elements.is_empty() {
+            if !object.compressed_elements().is_empty() {
                 return None;
             }
             let mut updated: smallvec::SmallVec<[(usize, i64); 4]> = smallvec::SmallVec::new();
