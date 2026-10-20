@@ -1158,10 +1158,6 @@ pub(crate) struct ProcessCold {
     /// node-table lock: erts finds `ERTS_MON_TYPE_DIST_PROC` in this process's
     /// own monitor tree (`bif.c` `demonitor`), not in a global scan.
     pub(crate) dist_monitors: std::collections::HashSet<u64>,
-    /// Origin half of `monitor(port, _)`: reference to port id.
-    /// The target half lives on the port (`ERTS_P_LT_MONITORS`).
-    /// Port of `ERTS_MON_TYPE_PORT` in `ERTS_P_MONITORS` (`bif.c` `monitor`), OTP-29.1.1.
-    pub(crate) port_monitors: std::collections::BTreeMap<u64, u64>,
     /// Monitors created with the `priority` option; their DOWN messages are priority. Kept for
     /// every monitor kind, since the origin decides priority when it receives the DOWN.
     pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
