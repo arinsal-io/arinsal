@@ -641,7 +641,29 @@ pub unsafe fn writable_bytes_mut<'a>(term: Term) -> Option<&'a mut [u8]> {
 
 /// Extend an active private writer's bit length and reserve space geometrically.
 pub fn writable_extend_private(term: Term, new_bits: usize) -> Result<bool, TermError> {
-    match prepare_private_append(term.tagged_word(), new_bits, true, core::ptr::null_mut()) {
+    match prepare_private_append(
+        term.tagged_word(),
+        new_bits,
+        true,
+        false,
+        core::ptr::null_mut(),
+    ) {
+        Ok(update) if update.result == 0 => Ok(false),
+        Ok(_) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Set an active private writer's visible byte length, shrinking or extending it.
+// Port of erts/emulator/beam/erl_bits.c:2881-2904 (`erts_shrink_binary_term`), OTP-29.1.1.
+pub fn writable_resize_private(term: Term, new_bits: usize) -> Result<bool, TermError> {
+    match prepare_private_append(
+        term.tagged_word(),
+        new_bits,
+        true,
+        true,
+        core::ptr::null_mut(),
+    ) {
         Ok(update) if update.result == 0 => Ok(false),
         Ok(_) => Ok(true),
         Err(error) => Err(error),
@@ -777,7 +799,7 @@ pub fn erts_bs_private_append_checked_with_update(
     let Ok(extra) = usize::try_from(extra_bits) else {
         return PrivateAppendUpdate::new(0);
     };
-    match prepare_private_append(bin, extra, false, ebs) {
+    match prepare_private_append(bin, extra, false, false, ebs) {
         Ok(update) => update,
         Err(_) => PrivateAppendUpdate::new(0),
     }
@@ -802,6 +824,7 @@ fn prepare_private_append(
     bin: u64,
     bits: usize,
     absolute: bool,
+    allow_shrink: bool,
     ebs: *mut u64,
 ) -> Result<PrivateAppendUpdate, TermError> {
     // SAFETY: `bin` is a tagged term from a live register or `Term::tagged_word`. This process
@@ -828,7 +851,7 @@ fn prepare_private_append(
         } else {
             current.checked_add(bits).ok_or(TermError::SystemLimit)?
         };
-        if new_bits < current || new_bits > isize::MAX as usize {
+        if (new_bits < current && !allow_shrink) || new_bits > isize::MAX as usize {
             return Err(TermError::SystemLimit);
         }
         // Port of erts/emulator/beam/erl_binary.h:321 (erts_bin_realloc_fnf) and

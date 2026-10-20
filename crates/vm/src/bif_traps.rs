@@ -3491,6 +3491,28 @@ fn term_to_iovec(
     term_encode(process, args, state, restore_gc, true)
 }
 
+/// Saved state for `erts_term_to_binary_int`, including the result binary once allocated.
+// Port of erts/emulator/beam/external.c:2450-2567, OTP-29.1.1.
+struct TermEncodeState {
+    encoder: arinsal_bifs::EncodeWalk,
+    output: Option<Term>,
+    source: Option<Term>,
+    compressing: bool,
+    iovec: bool,
+}
+
+impl TermEncodeState {
+    fn completed() -> Self {
+        Self {
+            encoder: arinsal_bifs::EncodeWalk::completed(),
+            output: None,
+            source: None,
+            compressing: false,
+            iovec: false,
+        }
+    }
+}
+
 fn term_encode(
     process: &mut Process,
     args: &[Term],
@@ -3498,7 +3520,7 @@ fn term_encode(
     restore_gc: bool,
     iovec: bool,
 ) -> Result<HandlerResult, BifError> {
-    // Port of erts/emulator/beam/external.c (erts_term_to_binary_int), OTP-29.1.1.
+    // Port of erts/emulator/beam/external.c:2450-2567 (erts_term_to_binary_int), OTP-29.1.1.
     const TERM_TO_BINARY_LOOP_FACTOR: usize = 32;
     let chunk_work =
         (process.reductions.max(0) as usize).saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
@@ -3509,15 +3531,63 @@ fn term_encode(
             (work / TERM_TO_BINARY_LOOP_FACTOR) as u32
         }
     };
-    if let Some(state) = state {
-        let state = Arc::clone(state);
-        let encoder = state
-            .downcast_ref::<Mutex<arinsal_bifs::EncodeWalk>>()
-            .ok_or(BifError::BADARG)?;
-        let mut encoder_guard = encoder.lock().map_err(|_| BifError::SystemLimit)?;
-        let (done, work) = encoder_guard.step(chunk_work)?;
+    if state.is_none() && !iovec {
+        let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
+        let (sized, size_work) = encoder.step_size(chunk_work)?;
+        if sized && encoder.finishes_simple() {
+            let value = encoder
+                .encode_simple_binary(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))?;
+            process.set_gc_enabled(restore_gc);
+            return Ok(HandlerResult::Done {
+                value,
+                reductions: 1,
+            });
+        }
+        let context = magic_binary_state(
+            Mutex::new(TermEncodeState {
+                encoder,
+                output: None,
+                source: None,
+                compressing: false,
+                iovec: false,
+            }),
+            ERTS_TERM_TO_BINARY_CONTEXT_SIZE,
+        );
+        if !sized {
+            return Ok(HandlerResult::Yield {
+                continuation: TERM_TO_BINARY_CONTINUATION,
+                state: context,
+                reductions: (size_work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
+            });
+        }
+        return term_encode(process, args, Some(&context), restore_gc, false);
+    }
+    let state = match state {
+        Some(state) => Arc::clone(state),
+        None => {
+            let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
+            encoder.set_iovec(iovec);
+            magic_binary_state(
+                Mutex::new(TermEncodeState {
+                    encoder,
+                    output: None,
+                    source: None,
+                    compressing: false,
+                    iovec,
+                }),
+                ERTS_TERM_TO_BINARY_CONTEXT_SIZE,
+            )
+        }
+    };
+    let saved = state
+        .downcast_ref::<Mutex<TermEncodeState>>()
+        .ok_or(BifError::BADARG)?;
+    let mut saved = saved.lock().map_err(|_| BifError::SystemLimit)?;
+
+    if saved.iovec {
+        let (done, work) = saved.encoder.step(chunk_work)?;
         if !done {
-            drop(encoder_guard);
+            drop(saved);
             return Ok(HandlerResult::Yield {
                 continuation: TERM_TO_BINARY_CONTINUATION,
                 state,
@@ -3525,24 +3595,154 @@ fn term_encode(
             });
         }
         process.set_gc_enabled(restore_gc);
-        let reductions = charge(&encoder_guard, work);
-        let encoder = std::mem::replace(&mut *encoder_guard, arinsal_bifs::EncodeWalk::completed());
-        drop(encoder_guard);
+        let reductions = charge(&saved.encoder, work);
+        let encoder = std::mem::replace(&mut saved.encoder, arinsal_bifs::EncodeWalk::completed());
+        drop(saved);
         return finish_term_encode(process, encoder, reductions, iovec);
     }
 
-    let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
-    encoder.set_iovec(iovec);
-    let (done, work) = encoder.step(chunk_work)?;
-    if !done {
-        return Ok(HandlerResult::Yield {
-            continuation: TERM_TO_BINARY_CONTINUATION,
-            state: magic_binary_state(Mutex::new(encoder), ERTS_TERM_TO_BINARY_CONTEXT_SIZE),
-            reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
+    let mut work = 0;
+    if !saved.compressing && saved.output.is_none() {
+        let (sized, size_work) = saved.encoder.step_size(chunk_work)?;
+        work += size_work;
+        if !sized {
+            drop(saved);
+            return Ok(HandlerResult::Yield {
+                continuation: TERM_TO_BINARY_CONTINUATION,
+                state,
+                reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
+            });
+        }
+        let size = saved.encoder.encoded_size().ok_or(BifError::SystemLimit)?;
+        if saved.encoder.finishes_simple() {
+            let value = saved
+                .encoder
+                .encode_simple_binary(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))?;
+            let reductions = 1;
+            *saved = TermEncodeState::completed();
+            drop(saved);
+            process.set_gc_enabled(restore_gc);
+            return Ok(HandlerResult::Done { value, reductions });
+        }
+        let output = arinsal_bifs::allocate_iolist_binary(
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            size,
+        )?;
+        saved.output = Some(output);
+    }
+
+    if !saved.compressing {
+        let raw = saved.output.ok_or(BifError::BADARG)?;
+        let encode_budget = chunk_work.saturating_sub(work);
+        let encoded = arinsal_bifs::with_iolist_binary_output(raw, |bytes| {
+            saved.encoder.step_into(bytes, encode_budget)
+        });
+        let (done, encode_work) = match encoded {
+            Ok(progress) => progress,
+            Err(error) => {
+                arinsal_bifs::finish_iolist_binary_output(raw);
+                process.set_gc_enabled(restore_gc);
+                return Err(error);
+            }
+        };
+        work += encode_work;
+        if !done {
+            drop(saved);
+            return Ok(HandlerResult::Yield {
+                continuation: TERM_TO_BINARY_CONTINUATION,
+                state,
+                reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
+            });
+        }
+        arinsal_bifs::finish_iolist_binary_output(raw);
+        if saved.encoder.uses_compression() {
+            let size = saved.encoder.encoded_size().ok_or(BifError::SystemLimit)?;
+            let compressed = arinsal_bifs::allocate_iolist_binary(
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+                size,
+            )?;
+            arinsal_bifs::with_iolist_binary_output(compressed, |bytes| {
+                bytes[..6].copy_from_slice(&[131, 80, 0, 0, 0, 0]);
+                bytes[2..6].copy_from_slice(&((size - 1) as u32).to_be_bytes());
+                Ok(())
+            })?;
+            saved.source = Some(raw);
+            saved.output = Some(compressed);
+            saved.compressing = true;
+        } else {
+            let reductions = charge(&saved.encoder, work);
+            *saved = TermEncodeState::completed();
+            drop(saved);
+            process.set_gc_enabled(restore_gc);
+            return Ok(HandlerResult::Done {
+                value: raw,
+                reductions,
+            });
+        }
+    }
+
+    let source = saved.source.ok_or(BifError::BADARG)?;
+    let output = saved.output.ok_or(BifError::BADARG)?;
+    if !saved.encoder.compression_output_full() {
+        let output_budget = chunk_work.saturating_sub(work).max(1);
+        let progress = arinsal_bifs::with_binary_bytes(source, |view| {
+            arinsal_bifs::with_iolist_binary_output(output, |bytes| {
+                saved
+                    .encoder
+                    .compress_into(&view.bytes()[1..], &mut bytes[6..], output_budget)
+            })
+        })??;
+        work += progress.1;
+        if !progress.0 && !saved.encoder.compression_output_full() {
+            drop(saved);
+            return Ok(HandlerResult::Yield {
+                continuation: TERM_TO_BINARY_CONTINUATION,
+                state,
+                reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
+            });
+        }
+    }
+    if saved.encoder.compression_is_useful() {
+        let final_size = 6usize
+            .checked_add(
+                saved
+                    .encoder
+                    .compressed_payload_len()
+                    .ok_or(BifError::SystemLimit)?,
+            )
+            .ok_or(BifError::SystemLimit)?;
+        arinsal_term::writable_resize_private(
+            output,
+            final_size.checked_mul(8).ok_or(BifError::SystemLimit)?,
+        )
+        .map_err(|_| BifError::SystemLimit)?;
+        arinsal_bifs::finish_iolist_binary_output(output);
+        let reductions = charge(&saved.encoder, work);
+        *saved = TermEncodeState::completed();
+        drop(saved);
+        process.set_gc_enabled(restore_gc);
+        return Ok(HandlerResult::Done {
+            value: output,
+            reductions,
         });
     }
-    let reductions = charge(&encoder, work);
-    finish_term_encode(process, encoder, reductions, iovec)
+    if saved.encoder.compression_output_full() || saved.encoder.compression_finished() {
+        arinsal_bifs::finish_iolist_binary_output(output);
+        let reductions = charge(&saved.encoder, work);
+        *saved = TermEncodeState::completed();
+        drop(saved);
+        process.set_gc_enabled(restore_gc);
+        return Ok(HandlerResult::Done {
+            value: source,
+            reductions,
+        });
+    }
+    drop(saved);
+    Ok(HandlerResult::Yield {
+        continuation: TERM_TO_BINARY_CONTINUATION,
+        state,
+        reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
+    })
 }
 
 fn finish_term_encode(

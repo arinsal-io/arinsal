@@ -115,6 +115,7 @@ dependencies = [
  "num-traits",
  "proptest",
  "rustix",
+ "similar-asserts",
  "smallvec",
 ]
 

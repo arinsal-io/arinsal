@@ -36,7 +36,7 @@ pub use bits::{
     erts_bs_private_append_fast, erts_bs_private_append_fast_with_update, external_binary_magic,
     is_match_context, is_writable_binary, match_position, set_match_position, sub_bits_flags,
     writable_bytes_mut, writable_capacity, writable_extend_private, writable_finalize,
-    writable_gc_visit,
+    writable_gc_visit, writable_resize_private,
 };
 pub use copy::{
     SharedCopyCache, copy_flat_tuple, copy_shallow, copy_shared, copy_struct, copy_struct_litopt,
