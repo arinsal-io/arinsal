@@ -8,15 +8,13 @@ The project is experimental and under active development. Its current
 compatibility target is Erlang/OTP 29.1.1; support is still incomplete, so this
 is not yet a drop-in replacement for the Erlang Run-Time System (ERTS).
 
-## Platform support
+## Platforms
 
-Arinsal currently supports ARM64 (AArch64) only. The supported and CI-tested
-target is macOS 15 on ARM64; x86-64 is not supported.
+Supported:
+- macOS on Apple Silicon (arm64)
+- Linux on arm64 (aarch64)
 
-| Platform | ARM64 (AArch64) | x86-64 |
-| --- | --- | --- |
-| macOS 15 | Supported | Not supported |
-| Linux | Supported | Not supported |
+Not supported yet: x86-64 (any OS), Windows.
 
 ## The name
 
