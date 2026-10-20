@@ -24,12 +24,13 @@ const HIGH_NO_CONTRIBUTION_LIMIT: i64 = 20_000;
 
 struct BaseNode {
     root: RwMtxLock<TreeRoot>,
+    frequent_read: bool,
     lock_statistics: AtomicI64,
     is_valid: AtomicBool,
 }
 
 impl BaseNode {
-    // Port of erts/emulator/beam/erl_db_catree.c (create_base_node: the lock is a
+    // Port of erts/emulator/beam/erl_db_catree.c:1034 (create_base_node: the lock is a
     // frequent-read rwmutex when the table has DB_FREQ_READ), OTP-29.1.1.
     fn new(root: TreeRoot, frequent_read: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -38,6 +39,7 @@ impl BaseNode {
             } else {
                 RwMtxLock::new(root)
             },
+            frequent_read,
             lock_statistics: AtomicI64::new(0),
             is_valid: AtomicBool::new(true),
         })
@@ -64,9 +66,13 @@ impl BaseNode {
         self.root.write()
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c (rlock_base_node), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c:842 (rlock_base_node), OTP-29.1.1.
     fn read(&self) -> RwMtxReadGuard<'_, TreeRoot> {
-        self.read_at(arinsal_term::current_reader_group())
+        self.read_at(if self.frequent_read {
+            arinsal_term::current_reader_group()
+        } else {
+            0
+        })
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (rlock_base_node), OTP-29.1.1, in reader
@@ -833,6 +839,8 @@ impl CATree {
         // Port of erts/emulator/beam/erl_db_catree.c (db_next_catree /
         // db_prev_catree), OTP-29.1.1: search the base node that routes the key, then
         // the following (or preceding) base nodes, instead of scanning every object.
+        let mut stack_array = DbTreeStack::inline_storage();
+        let mut stack = DbTreeStack::with_inline(&mut stack_array);
         'retry: loop {
             let routes = self.routes.load();
             let entries = &routes.entries;
@@ -854,9 +862,8 @@ impl CATree {
                     std::thread::yield_now();
                     continue 'retry;
                 }
-                let mut stack = DbTreeStack::new();
                 if let Some(object) =
-                    root.find_next_prev_with_stack(key, reverse, self.keypos, &mut stack)
+                    root.find_next_prev_in_base_with_stack(key, reverse, self.keypos, &mut stack)
                 {
                     return Ok(Some(arinsal_term::copy_term(object.key(self.keypos), dst)?));
                 }

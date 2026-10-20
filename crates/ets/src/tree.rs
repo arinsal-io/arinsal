@@ -1,8 +1,8 @@
 use super::{EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, TreeDbTerm, cmp};
 pub(super) use crate::dbterm::InsertResult;
 use crate::dbterm::{
-    DbTreeStack, Link, SlotSearch, join_trees, slot_search, split_tree, tree_insert, tree_linkout,
-    tree_put,
+    DbTreeStack, Link, SlotSearch, StackStorage, join_trees, slot_search, split_tree, tree_insert,
+    tree_linkout, tree_put,
 };
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -231,12 +231,12 @@ impl TreeRoot {
     /// Search with a caller-owned stack, as `db_next_catree_common` does for each base node.
     // Port of erts/emulator/beam/erl_db_catree.c:1615 (db_next_catree_common), :1679
     // (db_prev_catree_common), OTP-29.1.1.
-    pub(super) fn find_next_prev_with_stack<'a>(
+    pub(super) fn find_next_prev_with_stack<'a, S: StackStorage>(
         &'a self,
         key: Term,
         reverse: bool,
         keypos: usize,
-        stack: &mut DbTreeStack,
+        stack: &mut DbTreeStack<S>,
     ) -> Option<&'a StoredTerm> {
         if stack.version != self.version {
             stack.reset(self.version);
@@ -247,6 +247,20 @@ impl TreeRoot {
             stack.find_next(&self.root, key, keypos)
         }?;
         Some(&node.data)
+    }
+
+    /// Search one CA-tree base after `init_tree_stack` resets the shared call-local slots.
+    // Port of erts/emulator/beam/erl_db_catree.c:1205 (init_tree_stack), :1615
+    // (db_next_catree_common), and :1679 (db_prev_catree_common), OTP-29.1.1.
+    pub(super) fn find_next_prev_in_base_with_stack<'a, S: StackStorage>(
+        &'a self,
+        key: Term,
+        reverse: bool,
+        keypos: usize,
+        stack: &mut DbTreeStack<S>,
+    ) -> Option<&'a StoredTerm> {
+        stack.reset(self.version);
+        self.find_next_prev_with_stack(key, reverse, keypos, stack)
     }
 
     /// Split into the objects below the split key, the rest and the split key.

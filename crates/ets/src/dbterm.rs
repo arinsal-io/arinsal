@@ -961,13 +961,59 @@ pub(crate) fn split_tree(mut root: TreeDbTerm, keypos: usize) -> (Link, Link, Te
     (left, right, split_key)
 }
 
-/// `DbTreeStack` of erl_db_tree_util.h: the nodes from the root down to the last slot visited
-/// by `slot_search`, kept between `ets:slot/2` calls.
+/// Storage operations shared by the table stack and the CA-tree call-local stack.
+pub(crate) trait StackStorage {
+    fn clear(&mut self);
+    fn push(&mut self, pos: usize, node: NonNull<TreeNode>);
+    fn pop(&mut self, pos: usize) -> Option<NonNull<TreeNode>>;
+    fn top(&self, pos: usize) -> Option<NonNull<TreeNode>>;
+}
+
+pub(crate) struct OwnedStackSlots(Vec<NonNull<TreeNode>>);
+
+pub(crate) struct InlineStackSlots<'a>(&'a mut [Option<NonNull<TreeNode>>]);
+
+impl StackStorage for OwnedStackSlots {
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn push(&mut self, _pos: usize, node: NonNull<TreeNode>) {
+        self.0.push(node);
+    }
+
+    fn pop(&mut self, _pos: usize) -> Option<NonNull<TreeNode>> {
+        self.0.pop()
+    }
+
+    fn top(&self, _pos: usize) -> Option<NonNull<TreeNode>> {
+        self.0.last().copied()
+    }
+}
+
+impl StackStorage for InlineStackSlots<'_> {
+    fn clear(&mut self) {}
+
+    fn push(&mut self, pos: usize, node: NonNull<TreeNode>) {
+        self.0[pos] = Some(node);
+    }
+
+    fn pop(&mut self, pos: usize) -> Option<NonNull<TreeNode>> {
+        self.0.get(pos).and_then(Option::as_ref).copied()
+    }
+
+    fn top(&self, pos: usize) -> Option<NonNull<TreeNode>> {
+        self.0.get(pos.checked_sub(1)?)?.as_ref().copied()
+    }
+}
+
+/// The root-to-slot path of `slot_search`, or the call-local path used by CA-tree next/prev.
 ///
-/// The node pointers are only dereferenced while the tree is unchanged: the owner resets the
-/// stack on every change (`TreeRoot::version`).
-pub(crate) struct DbTreeStack {
-    entries: Vec<NonNull<TreeNode>>,
+/// Node pointers are dereferenced only while their tree is unchanged. The owner resets the
+/// table stack after mutation; CA-tree next/prev resets the local stack at each base.
+pub(crate) struct DbTreeStack<S = OwnedStackSlots> {
+    entries: S,
+    pos: usize,
     slot: usize,
     /// The tree version the entries were taken from.
     pub(crate) version: u64,
@@ -975,7 +1021,7 @@ pub(crate) struct DbTreeStack {
 
 // SAFETY: the entries point into the tree that owns the stack and are only used under the
 // owner's lock with a matching version, like the nodes themselves (`TreeDbTerm` is `Send + Sync`).
-unsafe impl Send for DbTreeStack {}
+unsafe impl Send for DbTreeStack<OwnedStackSlots> {}
 
 /// What `slot_search` found.
 pub(crate) enum SlotSearch<'a> {
@@ -986,34 +1032,73 @@ pub(crate) enum SlotSearch<'a> {
     Out,
 }
 
-impl DbTreeStack {
+impl DbTreeStack<OwnedStackSlots> {
     pub(crate) fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: OwnedStackSlots(Vec::new()),
+            pos: 0,
             slot: 0,
             version: 0,
         }
     }
+}
 
+impl DbTreeStack<OwnedStackSlots> {
+    /// Port of erts/emulator/beam/erl_db_catree.c:1615 (`db_next_catree_common`) and :1679
+    /// (`db_prev_catree_common`), OTP-29.1.1: each call owns a `stack_array[STACK_NEED]`.
+    pub(crate) fn inline_storage() -> [Option<NonNull<TreeNode>>; STACK_NEED] {
+        [None; STACK_NEED]
+    }
+
+    /// Bind this stack to the `stack_array` for one CA-tree next/prev call.
+    // Port of erts/emulator/beam/erl_db_catree.c:1205 (init_tree_stack), OTP-29.1.1.
+    pub(crate) fn with_inline<'storage>(
+        storage: &'storage mut [Option<NonNull<TreeNode>>],
+    ) -> DbTreeStack<InlineStackSlots<'storage>> {
+        DbTreeStack {
+            entries: InlineStackSlots(storage),
+            pos: 0,
+            slot: 0,
+            version: 0,
+        }
+    }
+}
+
+impl<S: StackStorage> DbTreeStack<S> {
     /// `reset_stack`.
     pub(crate) fn reset(&mut self, version: u64) {
-        self.entries.clear();
+        self.clear();
         self.slot = 0;
         self.version = version;
     }
 
-    fn push(&mut self, node: &TreeNode) {
-        self.entries.push(NonNull::from(node));
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.pos = 0;
     }
 
-    fn top<'a>(&self) -> Option<&'a TreeNode> {
-        // SAFETY: entries point into the tree the caller borrows for `'a` and that has not been
+    fn push(&mut self, node: &TreeNode) {
+        self.entries.push(self.pos, NonNull::from(node));
+        self.pos += 1;
+    }
+
+    fn pop(&mut self) -> Option<NonNull<TreeNode>> {
+        if self.pos == 0 {
+            return None;
+        }
+        self.pos -= 1;
+        self.entries.pop(self.pos)
+    }
+
+    fn top<'tree>(&self, _tree: &'tree Link) -> Option<&'tree TreeNode> {
+        let node = self.entries.top(self.pos)?;
+        // SAFETY: entries point into the tree borrowed by `_tree` and that has not been
         // changed since they were pushed (see the type's contract).
-        self.entries.last().map(|node| unsafe { node.as_ref() })
+        Some(unsafe { node.as_ref() })
     }
 }
 
-impl DbTreeStack {
+impl<S: StackStorage> DbTreeStack<S> {
     /// The `slot` the stack top stands for.
     pub(crate) fn slot(&self) -> usize {
         self.slot
@@ -1024,7 +1109,7 @@ impl DbTreeStack {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.pos == 0
     }
 
     /// Push the path from `root` down to its first object (`db_first_tree_common`'s walk);
@@ -1058,8 +1143,8 @@ impl DbTreeStack {
     /// holds; `None` when the tree has no such object (the stack is then left empty).
     // Port of erts/emulator/beam/erl_db_tree.c (slot_search, the `while (stack->slot != slot)`
     // loop), OTP-29.1.1.
-    pub(crate) fn walk_to<'a>(&mut self, slot: usize, _tree: &'a Link) -> Option<&'a TreeNode> {
-        let mut this = self.top()?;
+    pub(crate) fn walk_to<'a>(&mut self, slot: usize, tree: &'a Link) -> Option<&'a TreeNode> {
+        let mut this = self.top(tree)?;
         while self.slot != slot {
             if slot > self.slot {
                 if let Some(right) = this.prefix.right.as_deref() {
@@ -1071,8 +1156,8 @@ impl DbTreeStack {
                     self.push(this);
                 } else {
                     loop {
-                        let tmp = self.entries.pop().expect("stack is not empty here");
-                        this = self.top()?;
+                        let tmp = self.pop().expect("stack is not empty here");
+                        this = self.top(tree)?;
                         if this
                             .prefix
                             .left
@@ -1094,8 +1179,8 @@ impl DbTreeStack {
                     self.push(this);
                 } else {
                     loop {
-                        let tmp = self.entries.pop().expect("stack is not empty here");
-                        this = self.top()?;
+                        let tmp = self.pop().expect("stack is not empty here");
+                        this = self.top(tree)?;
                         if this
                             .prefix
                             .right
@@ -1120,17 +1205,17 @@ impl DbTreeStack {
         key: Term,
         keypos: usize,
     ) -> Option<&'a TreeNode> {
-        let mut this = match self.top() {
+        let mut this = match self.top(root) {
             Some(node) if cmp(key, node.key(keypos)) == Ordering::Equal => node,
             Some(_) => {
-                self.entries.clear();
+                self.clear();
                 self.slot = 0;
                 root.as_deref()?
             }
             None => root.as_deref()?,
         };
         let mut found_next = false;
-        if self.entries.is_empty() {
+        if self.is_empty() {
             loop {
                 self.push(this);
                 match cmp(key, this.key(keypos)) {
@@ -1159,9 +1244,9 @@ impl DbTreeStack {
                     self.push(this);
                 }
             } else {
-                let mut child = self.entries.pop()?;
+                let mut child = self.pop()?;
                 loop {
-                    let Some(parent) = self.top() else {
+                    let Some(parent) = self.top(root) else {
                         self.slot = 0;
                         return None;
                     };
@@ -1174,7 +1259,7 @@ impl DbTreeStack {
                         this = parent;
                         break;
                     }
-                    child = self.entries.pop()?;
+                    child = self.pop()?;
                 }
             }
         }
@@ -1193,17 +1278,17 @@ impl DbTreeStack {
         key: Term,
         keypos: usize,
     ) -> Option<&'a TreeNode> {
-        let mut this = match self.top() {
+        let mut this = match self.top(root) {
             Some(node) if cmp(key, node.key(keypos)) == Ordering::Equal => node,
             Some(_) => {
-                self.entries.clear();
+                self.clear();
                 self.slot = 0;
                 root.as_deref()?
             }
             None => root.as_deref()?,
         };
         let mut found_prev = false;
-        if self.entries.is_empty() {
+        if self.is_empty() {
             loop {
                 self.push(this);
                 match cmp(key, this.key(keypos)) {
@@ -1232,9 +1317,9 @@ impl DbTreeStack {
                     self.push(this);
                 }
             } else {
-                let mut child = self.entries.pop()?;
+                let mut child = self.pop()?;
                 loop {
-                    let Some(parent) = self.top() else {
+                    let Some(parent) = self.top(root) else {
                         self.slot = 0;
                         return None;
                     };
@@ -1247,7 +1332,7 @@ impl DbTreeStack {
                         this = parent;
                         break;
                     }
-                    child = self.entries.pop()?;
+                    child = self.pop()?;
                 }
             }
         }
@@ -1261,12 +1346,12 @@ impl DbTreeStack {
 
 /// Port of erts/emulator/beam/erl_db_tree.c (slot_search, without a CA-tree iterator),
 /// OTP-29.1.1. `slot` counts from 1.
-pub(crate) fn slot_search<'a>(
+pub(crate) fn slot_search<'a, S: StackStorage>(
     root: &'a Link,
     slot: usize,
-    stack: &mut DbTreeStack,
+    stack: &mut DbTreeStack<S>,
 ) -> SlotSearch<'a> {
-    let end = |stack: &DbTreeStack| {
+    let end = |stack: &DbTreeStack<S>| {
         if stack.slot == slot - 1 {
             SlotSearch::EndOfTable
         } else {
@@ -1278,9 +1363,9 @@ pub(crate) fn slot_search<'a>(
         stack.slot = 0;
     }
     if stack.slot == 0 {
-        stack.entries.clear();
+        stack.clear();
     }
-    if stack.entries.is_empty() {
+    if stack.is_empty() {
         if !stack.push_left_spine(root) {
             return end(stack);
         }
