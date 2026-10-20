@@ -242,7 +242,7 @@ pub(crate) enum InsertResult {
 /// The `tstack`/`dstack` pair of erts' non-recursive AVL routines: the slots of the nodes on the
 /// path from the root and the direction taken at each.
 struct Path {
-    slots: [*mut Link; STACK_NEED],
+    slots: [Slot; STACK_NEED],
     dirs: [u8; STACK_NEED + 1],
     tpos: usize,
     dpos: usize,
@@ -253,14 +253,14 @@ impl Path {
         let mut dirs = [DIR_END; STACK_NEED + 1];
         dirs[0] = DIR_END;
         Self {
-            slots: [std::ptr::null_mut(); STACK_NEED],
+            slots: [Slot::NULL; STACK_NEED],
             dirs,
             tpos: 0,
             dpos: 1,
         }
     }
 
-    fn push(&mut self, slot: *mut Link, dir: u8) {
+    fn push(&mut self, slot: Slot, dir: u8) {
         self.slots[self.tpos] = slot;
         self.tpos += 1;
         self.dirs[self.dpos] = dir;
@@ -268,13 +268,34 @@ impl Path {
     }
 
     /// `dir = dstack[--dpos]; this = tstack[--tpos]`, or `None` at `DIR_END`.
-    fn pop(&mut self) -> Option<(*mut Link, u8)> {
+    fn pop(&mut self) -> Option<(Slot, u8)> {
         if self.dpos <= 1 {
             return None;
         }
         self.dpos -= 1;
         self.tpos -= 1;
         Some((self.slots[self.tpos], self.dirs[self.dpos]))
+    }
+}
+
+/// A `TreeDbTerm **`: the address of a link field of a node (or of the root) that an AVL
+/// routine keeps on its stack while it changes the nodes below.
+#[derive(Clone, Copy)]
+struct Slot(*mut Link);
+
+impl Slot {
+    const NULL: Self = Self(std::ptr::null_mut());
+
+    fn of(link: &mut Link) -> Self {
+        Self(link)
+    }
+
+    /// The link the slot addresses. Slots are only made from, and used within, one AVL routine
+    /// that holds `&mut` to the whole tree, and rotations only exchange which block sits in a
+    /// slot, so every slot on the stack stays valid and is not otherwise referenced.
+    fn link<'a>(self) -> &'a mut Link {
+        // SAFETY: see above; the pointer is non-null because only `of` makes slots that are used.
+        unsafe { &mut *self.0 }
     }
 }
 
@@ -382,9 +403,7 @@ pub(crate) fn tree_balance_right(this: &mut Link) -> bool {
 // Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
 fn rebalance_after_insert(path: &mut Path) {
     while let Some((this, dir)) = path.pop() {
-        // SAFETY: `this` is a link field of a node on the path from the root (or the root
-        // slot); rotations below it only exchange which block sits in a slot and free nothing.
-        let this = unsafe { &mut *this };
+        let this = this.link();
         let balance = node(this).balance;
         if dir == DIR_LEFT {
             match balance {
@@ -457,8 +476,7 @@ fn rebalance_after_insert(path: &mut Path) {
 fn rebalance_after_delete(path: &mut Path, mut state: bool) {
     while state {
         let Some((this, dir)) = path.pop() else { break };
-        // SAFETY: as in `rebalance_after_insert`.
-        let this = unsafe { &mut *this };
+        let this = this.link();
         state = if dir == DIR_LEFT {
             tree_balance_left(this)
         } else {
@@ -478,11 +496,9 @@ pub(crate) fn tree_insert(
     key_clash_fail: bool,
 ) -> InsertResult {
     let mut path = Path::new();
-    let mut this: *mut Link = root;
+    let mut this = Slot::of(root);
     loop {
-        // SAFETY: `this` is the root slot or a child link of a node reached from it; nothing
-        // else refers to the tree during this call.
-        let slot = unsafe { &mut *this };
+        let slot = this.link();
         let order = match slot.as_ref() {
             None => {
                 value.balance = 0;
@@ -497,11 +513,11 @@ pub(crate) fn tree_insert(
         match order {
             Ordering::Less => {
                 path.push(this, DIR_LEFT);
-                this = &mut node(slot).next;
+                this = Slot::of(&mut node(slot).next);
             }
             Ordering::Greater => {
                 path.push(this, DIR_RIGHT);
-                this = &mut node(slot).right;
+                this = Slot::of(&mut node(slot).right);
             }
             Ordering::Equal if !key_clash_fail => {
                 let mut old = slot.take().expect("slot checked above");
@@ -522,31 +538,26 @@ pub(crate) fn tree_insert(
 /// the left subtree got shorter.
 fn delsub(this: &mut Link) -> (DbTerm, bool) {
     let mut q = this.take().expect("AVL slot holds a node");
-    let mut slots = [std::ptr::null_mut::<Link>(); STACK_NEED];
+    let mut slots = [Slot::NULL; STACK_NEED];
     let mut tpos = 0;
-    let mut r: *mut Link = &mut q.next;
+    let mut r = Slot::of(&mut q.next);
     // Walk down to the right looking for a void right child.
-    // SAFETY: `r` is the left link of `q` or a right link of a node below it.
-    while unsafe { &*r }.as_ref().is_some_and(|n| n.right.is_some()) {
+    while r.link().as_ref().is_some_and(|n| n.right.is_some()) {
         slots[tpos] = r;
         tpos += 1;
-        // SAFETY: as above.
-        r = &mut node(unsafe { &mut *r }).right;
+        r = Slot::of(&mut node(r.link()).right);
     }
-    // SAFETY: as above.
-    let mut pred = unsafe { &mut *r }.take().expect("predecessor exists");
-    // SAFETY: as above.
-    *unsafe { &mut *r } = pred.next.take();
+    let mut pred = r.link().take().expect("predecessor exists");
+    *r.link() = pred.next.take();
     pred.next = q.next.take();
     pred.right = q.right.take();
     pred.balance = q.balance;
     *this = Some(pred);
-    slots[0] = &mut node(this).next;
+    slots[0] = Slot::of(&mut node(this).next);
     let mut h = true;
     while tpos > 0 && h {
         tpos -= 1;
-        // SAFETY: a slot of the predecessor's left subtree or its own left link.
-        h = tree_balance_right(unsafe { &mut *slots[tpos] });
+        h = tree_balance_right(slots[tpos].link());
     }
     (q, h)
 }
@@ -560,21 +571,20 @@ pub(crate) fn tree_linkout(
     matches: &mut dyn FnMut(&StoredTerm) -> bool,
 ) -> Option<DbTerm> {
     let mut path = Path::new();
-    let mut this: *mut Link = root;
+    let mut this = Slot::of(root);
     let removed;
     let state;
     loop {
-        // SAFETY: as in `tree_insert`.
-        let slot = unsafe { &mut *this };
+        let slot = this.link();
         let order = cmp(key, slot.as_ref()?.key(keypos));
         match order {
             Ordering::Less => {
                 path.push(this, DIR_LEFT);
-                this = &mut node(slot).next;
+                this = Slot::of(&mut node(slot).next);
             }
             Ordering::Greater => {
                 path.push(this, DIR_RIGHT);
-                this = &mut node(slot).right;
+                this = Slot::of(&mut node(slot).right);
             }
             Ordering::Equal => {
                 if !matches(slot.as_ref().expect("slot checked above")) {
@@ -606,19 +616,18 @@ pub(crate) fn tree_linkout(
 /// Port of erts/emulator/beam/erl_db_catree.c (linkout_min_or_max_tree_node), OTP-29.1.1.
 fn linkout_min_or_max(root: &mut Link, is_min: bool) -> Option<DbTerm> {
     let mut path = Path::new();
-    let mut this: *mut Link = root;
+    let mut this = Slot::of(root);
     let removed;
     let state;
     loop {
-        // SAFETY: as in `tree_insert`.
-        let slot = unsafe { &mut *this };
+        let slot = this.link();
         let current = slot.as_mut()?;
         if is_min && current.next.is_some() {
             path.push(this, DIR_LEFT);
-            this = &mut current.next;
+            this = Slot::of(&mut current.next);
         } else if !is_min && current.right.is_some() {
             path.push(this, DIR_RIGHT);
-            this = &mut current.right;
+            this = Slot::of(&mut current.right);
         } else {
             let mut q = slot.take().expect("slot checked above");
             if q.right.is_none() {
@@ -671,21 +680,19 @@ pub(crate) fn join_trees(mut left: Link, mut right: Link) -> Link {
     if left_height >= right_height {
         let mut new_root = linkout_min_or_max(&mut right, true).expect("right tree is not empty");
         let new_right_height = compute_tree_height(&right);
-        let mut this: *mut Link = &mut left;
+        let mut this = Slot::of(&mut left);
         let mut current_height = left_height;
         while current_height > new_right_height + 1 {
-            // SAFETY: `this` is the `left` slot or a right link of a node below it.
-            let slot = unsafe { &mut *this };
+            let slot = this.link();
             if node(slot).balance == -1 {
                 current_height -= 2;
             } else {
                 current_height -= 1;
             }
             path.push(this, DIR_RIGHT);
-            this = &mut node(slot).right;
+            this = Slot::of(&mut node(slot).right);
         }
-        // SAFETY: as above.
-        let slot = unsafe { &mut *this };
+        let slot = this.link();
         new_root.next = slot.take();
         new_root.right = right;
         new_root.balance = (new_right_height as isize - current_height as isize) as i8;
@@ -696,21 +703,19 @@ pub(crate) fn join_trees(mut left: Link, mut right: Link) -> Link {
         // Symmetric to the previous case.
         let mut new_root = linkout_min_or_max(&mut left, false).expect("left tree is not empty");
         let new_left_height = compute_tree_height(&left);
-        let mut this: *mut Link = &mut right;
+        let mut this = Slot::of(&mut right);
         let mut current_height = right_height;
         while current_height > new_left_height + 1 {
-            // SAFETY: `this` is the `right` slot or a left link of a node below it.
-            let slot = unsafe { &mut *this };
+            let slot = this.link();
             if node(slot).balance == 1 {
                 current_height -= 2;
             } else {
                 current_height -= 1;
             }
             path.push(this, DIR_LEFT);
-            this = &mut node(slot).next;
+            this = Slot::of(&mut node(slot).next);
         }
-        // SAFETY: as above.
-        let slot = unsafe { &mut *this };
+        let slot = this.link();
         new_root.right = slot.take();
         new_root.next = left;
         new_root.balance = (current_height as isize - new_left_height as isize) as i8;
