@@ -1507,7 +1507,25 @@ impl Process {
         let (htop, stop) = self.heap.heap_cursor();
         self.header.htop = htop;
         self.header.stop = stop;
+        // A helper that collected moved the heap: the bounds go out with the cursors, or
+        // the next helper commits cursors of the new heap against the old base.
+        let (heap, hend) = self.heap.heap_bounds();
+        self.header.heap = heap;
+        self.header.hend = hend;
         self.header.fcalls = self.reductions;
+    }
+
+    /// Publish only the young-heap state (cursors, bounds, high water) to the ABI prefix,
+    /// leaving FCALLS alone: the collector uses it, and it may run in a helper that has not
+    /// taken over the stored reduction counter.
+    pub(crate) fn sync_native_heap(&mut self) {
+        let (htop, stop) = self.heap.heap_cursor();
+        let (heap, hend) = self.heap.heap_bounds();
+        self.header.htop = htop;
+        self.header.stop = stop;
+        self.header.heap = heap;
+        self.header.hend = hend;
+        self.header.high_water = self.heap.high_water_ptr();
     }
 
     /// Publish the heap bounds and cursors to the ABI prefix before entering native code,
