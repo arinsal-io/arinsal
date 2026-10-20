@@ -3387,6 +3387,39 @@ impl ConsListBuilder {
         Ok(Term::from_ptr(cell, 1))
     }
 
+    /// Fill a bounded run of independent cons cells and report each leaf term.
+    ///
+    /// The output range is checked once before the loop, then the pointer advances like
+    /// `hp += 2` in the bulk HAMT constructors. This keeps the per-entry loop free of a
+    /// repeated destination-capacity check while remaining bounded by the reservation.
+    /// Port of leaf construction in erts/emulator/beam/erl_map.c:513-531 and :732-739,
+    /// OTP-29.1.1.
+    #[inline]
+    pub fn fill_cons_cells_with(
+        &mut self,
+        count: usize,
+        mut pairs: impl Iterator<Item = (Term, Term)>,
+        mut on_cell: impl FnMut(usize, Term, Term, Term),
+    ) -> Result<(), TermError> {
+        let end = self
+            .written
+            .checked_add(count)
+            .ok_or(TermError::SystemLimit)?;
+        if end > self.len {
+            return Err(TermError::BadArg);
+        }
+        let mut cell = (self.start as *mut u64).wrapping_add(2 * self.written);
+        for index in self.written..end {
+            let (head, tail) = pairs.next().ok_or(TermError::BadArg)?;
+            store(cell, head.bits());
+            store(cell.wrapping_add(1), tail.bits());
+            on_cell(index, head, tail, Term::from_ptr(cell, 1));
+            cell = cell.wrapping_add(2);
+            self.written = index + 1;
+        }
+        Ok(())
+    }
+
     /// Allocate the next cell and link it to the list built so far.
     ///
     /// Push values in reverse output order to match `res = CONS(hp, value, res); hp += 2`.

@@ -5,7 +5,7 @@
 use super::{
     LIMIT, MAP, MAP_HEADER_FLATMAP, MapError, MapResult, bits, boxed, exact_cmp, key_cmp, term,
 };
-use arinsal_term::{HeapAlloc, Term, TermError, exact_eq};
+use arinsal_term::{HeapAlloc, Term, TermBuilder, TermError, exact_eq};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
@@ -181,7 +181,18 @@ fn hashmap_from_pairs<H: HeapAlloc + ?Sized>(
     pairs: impl ExactSizeIterator<Item = (Term, Term)>,
     heap: &mut H,
 ) -> Result<Term, TermError> {
-    let mut hxns = arinsal_term::hashmap_leaves(pairs, heap)?;
+    // Port of the leaf/hxnode loops in `erts_hashmap_from_ks_and_vs_extra`,
+    // `flatmap_merge`, and `map_merge_mixed`, erl_map.c:716-755 and :1387-1465,
+    // OTP-29.1.1.
+    // erts hashes each pair while it fills the heap leaf and hxnode array;
+    // do not stage a second Vec of `(hash, key, value)` tuples first.
+    let size = pairs.len();
+    let mut leaves = TermBuilder::new(heap).reserve_cons_list(size)?;
+    let mut hxns = Vec::with_capacity(size);
+    leaves.fill_cons_cells_with(size, pairs, |index, key, _, leaf| {
+        hxns.push(arinsal_term::HxNode::new(key, leaf, index));
+    })?;
+    leaves.finish_cells()?;
     Ok(
         arinsal_term::hashmap_from_unsorted_array(&mut hxns, false, heap)?
             .expect("duplicates accepted"),
@@ -970,6 +981,24 @@ impl HashmapFromPairs {
             val,
         });
         Ok(())
+    }
+
+    /// Fill several leaves while the caller's validated input cursor advances.
+    /// Port of the `while (is_list(item))` leaf loop at erl_map.c:513-531,
+    /// OTP-29.1.1.
+    pub fn push_chunk(
+        &mut self,
+        count: usize,
+        pairs: impl Iterator<Item = (Term, Term)>,
+    ) -> MapResult<()> {
+        let entries = &mut self.entries;
+        self.leaves
+            .as_mut()
+            .expect("leaf phase is active")
+            .fill_cons_cells_with(count, pairs, |index, key, _, leaf| {
+                entries.push(arinsal_term::HxNode::new(key, leaf, index));
+            })
+            .map_err(|_| MapError::HeapFull { need_words: 0 })
     }
 
     /// Finish leaf setup and begin the structural HAMT build.

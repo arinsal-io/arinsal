@@ -162,9 +162,8 @@ pub struct AppendCont {
     rhs: Term,
     iterator: Term,
     result: Term,
-    /// Last cons written, or `[]` when the result is still empty. Its tail is `[]`
-    /// until the next chunk or the final right-hand side overwrites it.
-    last: Term,
+    /// Address of the final CDR slot, or zero while the result is still empty.
+    last_cdr: usize,
 }
 
 impl AppendCont {
@@ -175,7 +174,7 @@ impl AppendCont {
             rhs,
             iterator: lhs,
             result: Term::NIL,
-            last: Term::NIL,
+            last_cdr: 0,
         }
     }
 
@@ -335,10 +334,10 @@ pub fn lists_append(
         }
         let nil_bits = Term::NIL.raw_bits();
         let mut head_bits = state.result.raw_bits();
-        let mut last_cdr: *mut u64 = if state.last == Term::NIL {
+        let mut last_cdr: *mut u64 = if state.last_cdr == 0 {
             std::ptr::null_mut()
         } else {
-            (state.last.raw_bits() as *mut u8).add(7).cast()
+            state.last_cdr as *mut u64
         };
         let mut built_onheap = 0usize;
         let mut ran_onheap = false;
@@ -390,17 +389,12 @@ pub fn lists_append(
                     built_onheap / APPEND_ONHEAP_PER_RED + built_alloc / APPEND_ALLOC_PER_RED,
                 );
             }
-            let last = if last_cdr.is_null() {
-                Term::NIL
-            } else {
-                Term::from_raw_bits((last_cdr as u64).wrapping_sub(8) | 1)
-            };
             AppendStep::More(AppendCont {
                 lhs_original,
                 rhs: rhs_term,
                 iterator: Term::from_raw_bits(list_bits),
                 result: Term::from_raw_bits(head_bits),
-                last,
+                last_cdr: last_cdr as usize,
             })
         };
         if !is_list_bits(list_bits) {
@@ -1134,17 +1128,12 @@ fn subtract_list_from_slice(
     if items.is_empty() {
         return Ok(tail);
     }
-    let words = items.len().checked_mul(2).ok_or(BifError::SystemLimit)?;
-    let mut reservation =
-        HeapReservation::new(&mut ctx.heap, words).map_err(|_| BifError::SystemLimit)?;
-    let mut builder = TermBuilder::new(&mut reservation);
-    let mut result = tail;
-    for item in items.iter().rev() {
-        result = builder
-            .cons(*item, result)
-            .map_err(|_| BifError::SystemLimit)?;
-    }
-    Ok(result)
+    let builder = TermBuilder::new(&mut ctx.heap)
+        .reserve_cons_list(items.len())
+        .map_err(|_| BifError::SystemLimit)?;
+    builder
+        .prepend_exact_with_tail(items.iter().rev().copied(), tail)
+        .map_err(|_| BifError::SystemLimit)
 }
 
 /// Count and validate one input list.
@@ -1301,19 +1290,22 @@ pub fn lists_reverse(
         ctx.charge_reductions(count / REVERSE_CELLS_PER_RED);
         return Err(BADARG);
     }
-    let words = count.checked_mul(2).ok_or(BifError::SystemLimit)?;
-    {
-        let mut reservation =
-            HeapReservation::new(&mut ctx.heap, words).map_err(|_| BifError::SystemLimit)?;
-        let mut builder = TermBuilder::new(&mut reservation);
-        for _ in 0..count {
-            let (head, next) = cons_cell(current).expect("validated list chunk");
-            result_tail = builder
-                .cons(head, result_tail)
-                .map_err(|_| BifError::SystemLimit)?;
-            current = next;
-        }
-    }
+    let builder = TermBuilder::new(&mut ctx.heap)
+        .reserve_cons_list(count)
+        .map_err(|_| BifError::SystemLimit)?;
+    let mut list = current;
+    result_tail = builder
+        .prepend_exact_with_tail(
+            std::iter::from_fn(|| {
+                let (head, next) = cons_cell(list)?;
+                list = next;
+                Some(head)
+            })
+            .take(count),
+            result_tail,
+        )
+        .map_err(|_| BifError::SystemLimit)?;
+    current = list;
     // Port of `BUMP_REDS(c_p, cells / 40)` in lists_reverse_alloc.
     ctx.charge_reductions(count / REVERSE_CELLS_PER_RED);
     if current == Term::NIL {
