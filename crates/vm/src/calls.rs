@@ -853,7 +853,12 @@ impl Vm {
                     {
                         self.trace_native_return(p, run, &module, &function, &args, &failed);
                     }
-                    return failed.map(|_| ImportOutcome::Advanced);
+                    return match failed {
+                        // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP transfers
+                        // interpreter call_ext to the trap's continuation export).
+                        Err(VmError::TrapExport(trap)) => self.trap_to_export(p, trap, tail, ctx),
+                        failed => failed.map(|_| ImportOutcome::Advanced),
+                    };
                 }
             };
             meter.finish(p, ctx.as_deref_mut(), result.reductions());
