@@ -2654,6 +2654,28 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
         Ok(tail)
     }
+    /// Build a list of the byte values of `bytes` with one reservation of `2 * n` words.
+    // Port of erts/emulator/beam/utils.c (buf_to_intlist), OTP-29.1.1.
+    pub fn bytes_to_list(&mut self, bytes: &[u8]) -> Result<Term, TermError> {
+        if bytes.is_empty() {
+            return Ok(Term::NIL);
+        }
+        let words = bytes.len().checked_mul(2).ok_or(TermError::SystemLimit)?;
+        let run = self.words(words)?;
+        let mut tail = Term::NIL;
+        for (index, byte) in bytes.iter().enumerate().rev() {
+            let cell = run.wrapping_add(2 * index);
+            store(
+                cell,
+                Term::small(i64::from(*byte))
+                    .ok_or(TermError::BadArg)?
+                    .bits(),
+            );
+            store(cell.wrapping_add(1), tail.bits());
+            tail = Term::from_ptr(cell, 1);
+        }
+        Ok(tail)
+    }
     /// Build a list of Unicode scalar values.
     pub fn string_to_list(&mut self, text: &str) -> Result<Term, TermError> {
         self.list_from_iter(text.chars().map(|c| Term::small(c as i64).unwrap()))
