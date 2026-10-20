@@ -7,7 +7,8 @@ const SOURCE: &str = r#"
 -module(ets_direct_diff).
 -export([compressed_roundtrip/0, access_and_deleted/0, concurrent_inserts/0, native_loop/0,
          tail_delete/0, tail_delete_in_fun/0, catree_update_counter/0,
-         insert_list_trap_cursor/0]).
+         insert_list_trap_cursor/0, overwrite_memory/0, overwrite_binary_refc/0,
+         overwrite_readers/0]).
 
 sample_terms() ->
     [{"abc", abc, 42, -7, 1.5, <<1,2,3>>, [a|b], {nested, {deep, [1,2,3]}}},
@@ -152,6 +153,70 @@ insert_list_trap_cursor() ->
     true = ets:insert_new(T, Second),
     {ets:info(T, size), ets:lookup(T, 1), ets:lookup(T, 4096),
      ets:lookup(T, 4097), ets:lookup(T, 8192), ets:insert_new(T, Second)}.
+
+overwrite_memory() ->
+    [overwrite_memory_case(set, []),
+     overwrite_memory_case(set, [compressed]),
+     overwrite_memory_case(set, [{write_concurrency, true}]),
+     overwrite_memory_case(bag, []),
+     overwrite_memory_case(duplicate_bag, [])].
+
+overwrite_memory_case(Type, Extra) ->
+    T = ets:new(t, [Type | Extra]),
+    Empty = ets:info(T, memory),
+    true = ets:insert(T, {key, [aa, bb]}),
+    First = ets:info(T, memory),
+    true = ets:insert(T, {key, [cc, dd]}),
+    EqualSizeOverwrite = ets:info(T, memory),
+    false = ets:insert_new(T, {key, [ee, ff]}),
+    FailedInsertNew = ets:info(T, memory),
+    true = ets:insert(T, {key, lists:seq(1, 20)}),
+    DifferentSize = ets:info(T, memory),
+    {Type, Extra, [Empty, First, EqualSizeOverwrite, FailedInsertNew, DifferentSize],
+     ets:info(T, size), ets:lookup(T, key)}.
+
+overwrite_binary_refc() ->
+    [overwrite_binary_refc_case([])].
+
+overwrite_binary_refc_case(Extra) ->
+    T = ets:new(t, [set | Extra]),
+    First = insert_and_measure_binary(T, 1, 100),
+    EqualSize = insert_and_measure_binary(T, 2, 100),
+    DifferentSize = insert_and_measure_binary(T, 3, 180),
+    {Extra, First, EqualSize, DifferentSize, ets:info(T, memory)}.
+
+insert_and_measure_binary(T, Byte, Size) ->
+    true = ets:insert(T, {key, binary:copy(<<Byte>>, Size)}),
+    garbage_collect(),
+    lists:sort([{Bytes, Refc} || {_, Bytes, Refc} <-
+                                  erts_internal:ets_lookup_binary_info(T, key)]).
+
+overwrite_readers() ->
+    T = ets:new(t, [set, public, {read_concurrency, true}, {write_concurrency, true}]),
+    A = {key, a, lists:seq(1, 20), binary:copy(<<1>>, 100)},
+    B = {key, b, lists:seq(1, 20), binary:copy(<<2>>, 100)},
+    true = ets:insert(T, A),
+    Parent = self(),
+    Readers = [spawn_link(fun() ->
+                  Parent ! {ready, self()},
+                  receive go -> Parent ! {done, self(), read_consistent(T, A, B, 10000)} end
+              end) || _ <- lists:seq(1, 4)],
+    [receive {ready, Reader} -> ok end || Reader <- Readers],
+    [Reader ! go || Reader <- Readers],
+    [begin
+         true = ets:insert(T, B),
+         true = ets:insert(T, A)
+     end || _ <- lists:seq(1, 2000)],
+    Results = [receive {done, Reader, Result} -> Result end || Reader <- Readers],
+    {lists:all(fun(X) -> X end, Results), ets:lookup(T, key)}.
+
+read_consistent(_T, _A, _B, 0) -> true;
+read_consistent(T, A, B, Left) ->
+    case ets:lookup(T, key) of
+        [A] -> read_consistent(T, A, B, Left - 1);
+        [B] -> read_consistent(T, A, B, Left - 1);
+        _ -> false
+    end.
 "#;
 
 #[test]
@@ -190,11 +255,30 @@ fn trapped_insert_lists_match_otp_29() {
     assert_same("insert_list_trap_cursor");
 }
 
+#[test]
+fn same_size_and_resized_overwrites_match_otp_29() {
+    assert_same_with_four_schedulers("overwrite_memory");
+    assert_same_with_four_schedulers("overwrite_binary_refc");
+    assert_same_with_four_schedulers("overwrite_readers");
+}
+
 fn assert_same(function: &str) {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping ETS direct-path differential {function}");
         return;
     };
+    assert_same_with_reference(function, &reference);
+}
+
+fn assert_same_with_four_schedulers(function: &str) {
+    let Ok(reference) = RefErl::start_with_erl_args(&["+S", "4"]) else {
+        eprintln!("erl unavailable; skipping ETS direct-path differential {function}");
+        return;
+    };
+    assert_same_with_reference(function, &reference);
+}
+
+fn assert_same_with_reference(function: &str, reference: &RefErl) {
     let beam = reference
         .compile_named("ets_direct_diff", SOURCE, &[])
         .unwrap();
