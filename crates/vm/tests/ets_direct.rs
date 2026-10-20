@@ -176,7 +176,8 @@ overwrite_memory_case(Type, Extra) ->
      ets:info(T, size), ets:lookup(T, key)}.
 
 overwrite_binary_refc() ->
-    [overwrite_binary_refc_case([])].
+    [overwrite_binary_refc_case([]),
+     overwrite_binary_refc_case([compressed])].
 
 overwrite_binary_refc_case(Extra) ->
     T = ets:new(t, [set | Extra]),

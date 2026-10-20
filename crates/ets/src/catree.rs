@@ -1,14 +1,14 @@
 //! Safe contention-adapting ordered storage built from the ETS AVL tree.
 
-use super::{DbTerm, EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, cmp};
-use crate::dbterm::SlotSearch;
+use super::{EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, TreeDbTerm, cmp};
+use crate::dbterm::DbTreeStack;
 use crate::rwmtx::{RwMtxLock, RwMtxReadGuard, RwMtxWriteGuard};
 use crate::tree::{Node, TreeRoot};
 use arc_swap::ArcSwap;
 use arinsal_term::{TermBuilder, VecHeap};
 use std::cmp::Ordering;
 use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicIsize, AtomicUsize, Ordering as AtomicOrdering,
+    AtomicBool, AtomicI64, AtomicIsize, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
 use std::sync::{Arc, Mutex};
 
@@ -101,7 +101,7 @@ impl BaseNode {
 #[derive(Clone)]
 struct RouteEntry {
     /// The first key in this base node; the first route entry has no lower bound.
-    first_key: Option<Arc<DbTerm>>,
+    first_key: Option<Arc<crate::PlainDbTerm>>,
     base: Arc<BaseNode>,
 }
 
@@ -113,7 +113,7 @@ struct RouteSnapshot {
 enum RouteNode {
     Base(Arc<BaseNode>),
     Branch {
-        key: Arc<DbTerm>,
+        key: Arc<crate::PlainDbTerm>,
         left: Box<RouteNode>,
         right: Box<RouteNode>,
     },
@@ -203,6 +203,22 @@ pub(crate) struct CATree {
     force_split: AtomicBool,
     debug_random_split_join: AtomicBool,
     memory_words: AtomicIsize,
+    /// `tb->common.counters` NITEMS: the table-wide object count.
+    nitems: AtomicIsize,
+    /// Bumped by every change of a base node's tree, split and join; the slot stack is only
+    /// valid for the version it was made at.
+    version: AtomicU64,
+    /// `DbTableCATree.static_stack`: the slot walk kept between `ets:slot/2` calls.
+    slot_stack: Mutex<SlotWalk>,
+}
+
+/// The table-wide slot stack: the nodes of the base node `base` down to the last slot visited,
+/// with `stack.slot` counting objects over all base nodes.
+struct SlotWalk {
+    routes: Option<Arc<RouteSnapshot>>,
+    version: u64,
+    base: usize,
+    stack: DbTreeStack,
 }
 
 impl CATree {
@@ -223,6 +239,14 @@ impl CATree {
             force_split: AtomicBool::new(false),
             debug_random_split_join: AtomicBool::new(false),
             memory_words: AtomicIsize::new(0),
+            nitems: AtomicIsize::new(0),
+            version: AtomicU64::new(0),
+            slot_stack: Mutex::new(SlotWalk {
+                routes: None,
+                version: 0,
+                base: 0,
+                stack: DbTreeStack::new(),
+            }),
         }
     }
 
@@ -241,7 +265,7 @@ impl CATree {
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_put_catree), OTP-29.1.1.
-    pub(crate) fn insert(&self, object: DbTerm) {
+    pub(crate) fn insert(&self, object: TreeDbTerm) {
         let key = object.key(self.keypos);
         let mut object = Some(object);
         loop {
@@ -256,8 +280,12 @@ impl CATree {
             }
             let new_words = object.as_ref().unwrap().db_size_words as isize;
             let result = root.insert_with_key(object.take().unwrap(), key, self.keypos, false);
+            self.version.fetch_add(1, AtomicOrdering::Release);
             let old_words = match result {
-                crate::tree::InsertResult::Inserted => 0,
+                crate::tree::InsertResult::Inserted => {
+                    self.nitems.fetch_add(1, AtomicOrdering::Relaxed);
+                    0
+                }
                 crate::tree::InsertResult::Replaced(words) => words as isize,
                 crate::tree::InsertResult::Exists => unreachable!("replacement cannot clash"),
             };
@@ -270,9 +298,55 @@ impl CATree {
         }
     }
 
+    /// Insert the source object `term` under its base-node lock, reusing an overwritten block.
+    // Port of erts/emulator/beam/erl_db_catree.c (db_put_catree with db_put_tree_common),
+    // OTP-29.1.1.
+    pub(crate) fn insert_term(
+        &self,
+        term: Term,
+        key: Term,
+        compressed: bool,
+        new_only: bool,
+    ) -> Result<bool, EtsError> {
+        loop {
+            let routes = self.routes.load();
+            let base = routes.find_base(key);
+            let mut root = base.write();
+            if !base.is_valid.load(AtomicOrdering::Acquire) {
+                drop(root);
+                drop(routes);
+                std::thread::yield_now();
+                continue;
+            }
+            let put = root.put_term(term, key, self.keypos, compressed, new_only);
+            self.version.fetch_add(1, AtomicOrdering::Release);
+            let (result, new_words) = put?;
+            let inserted = match result {
+                crate::tree::InsertResult::Inserted => {
+                    self.nitems.fetch_add(1, AtomicOrdering::Relaxed);
+                    self.memory_words
+                        .fetch_add(new_words as isize, AtomicOrdering::Relaxed);
+                    true
+                }
+                crate::tree::InsertResult::Replaced(old_words) => {
+                    self.memory_words.fetch_add(
+                        new_words as isize - old_words as isize,
+                        AtomicOrdering::Relaxed,
+                    );
+                    true
+                }
+                crate::tree::InsertResult::Exists => false,
+            };
+            let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
+            drop(root);
+            self.adapt(base, stat);
+            return Ok(inserted);
+        }
+    }
+
     /// Insert an object only when its ordered key is absent.
     // Port of erts/emulator/beam/erl_db_catree.c (db_put_catree with key_clash_fail), OTP-29.1.1.
-    pub(crate) fn insert_new(&self, object: DbTerm) -> bool {
+    pub(crate) fn insert_new(&self, object: TreeDbTerm) -> bool {
         let key = object.key(self.keypos);
         let mut object = Some(object);
         loop {
@@ -290,8 +364,10 @@ impl CATree {
                 .expect("CA-tree insert object retained on retry");
             let words = stored.db_size_words as isize;
             let result = root.insert_with_key(stored, key, self.keypos, true);
+            self.version.fetch_add(1, AtomicOrdering::Release);
             let inserted = matches!(result, crate::tree::InsertResult::Inserted);
             if inserted {
+                self.nitems.fetch_add(1, AtomicOrdering::Relaxed);
                 self.memory_words.fetch_add(words, AtomicOrdering::Relaxed);
             }
             let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
@@ -331,7 +407,7 @@ impl CATree {
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_put_catree), OTP-29.1.1.
-    pub(crate) fn insert_many(&self, objects: Vec<DbTerm>) {
+    pub(crate) fn insert_many(&self, objects: Vec<TreeDbTerm>) {
         for object in objects {
             self.insert(object);
         }
@@ -464,7 +540,7 @@ impl CATree {
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_get_catree), OTP-29.1.1.
-    pub(crate) fn matching(&self, key: Term) -> Result<Vec<DbTerm>, EtsError> {
+    pub(crate) fn matching(&self, key: Term) -> Result<Vec<TreeDbTerm>, EtsError> {
         loop {
             let routes = self.routes.load();
             let base = routes.find_base(key);
@@ -476,7 +552,7 @@ impl CATree {
                 continue;
             }
             let result = Node::get(&root, key, self.keypos)
-                .map(StoredTerm::copy_stored)
+                .map(StoredTerm::copy_stored::<crate::TreePrefix>)
                 .transpose()
                 .map(|object| object.into_iter().collect());
             drop(root);
@@ -500,6 +576,8 @@ impl CATree {
             let removed_words =
                 root.remove_matching(key, self.keypos, |found| found.exact_eq_input(object));
             if let Some(removed_words) = removed_words {
+                self.version.fetch_add(1, AtomicOrdering::Release);
+                self.nitems.fetch_sub(1, AtomicOrdering::Relaxed);
                 self.memory_words
                     .fetch_sub(removed_words as isize, AtomicOrdering::Relaxed);
             }
@@ -524,6 +602,8 @@ impl CATree {
             }
             let removed_words = root.remove_matching(key, self.keypos, |_| true);
             if let Some(removed_words) = removed_words {
+                self.version.fetch_add(1, AtomicOrdering::Release);
+                self.nitems.fetch_sub(1, AtomicOrdering::Relaxed);
                 self.memory_words
                     .fetch_sub(removed_words as isize, AtomicOrdering::Relaxed);
             }
@@ -537,7 +617,7 @@ impl CATree {
     /// Detach every base node's tree for incremental release, leaving one empty base node.
     ///
     /// Port of erts/emulator/beam/erl_db_catree.c (db_free_table_continue_catree), OTP-29.1.1.
-    pub(crate) fn take_all(&self) -> Vec<DbTerm> {
+    pub(crate) fn take_all(&self) -> Vec<TreeDbTerm> {
         let _adaptation = self.adaptation.lock().expect("CA-tree adaptation poisoned");
         let routes = self.routes.load_full();
         let mut roots = Vec::new();
@@ -548,6 +628,8 @@ impl CATree {
             }
         }
         self.memory_words.store(0, AtomicOrdering::Relaxed);
+        self.nitems.store(0, AtomicOrdering::Relaxed);
+        self.version.fetch_add(1, AtomicOrdering::Release);
         self.routes
             .store(Arc::new(RouteSnapshot::new(vec![RouteEntry {
                 first_key: None,
@@ -583,7 +665,7 @@ impl CATree {
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_calc_stats_catree), OTP-29.1.1.
     pub(crate) fn count(&self) -> usize {
-        self.with_all_bases(|bases| bases.iter().map(|root| root.count()).sum())
+        self.nitems.load(AtomicOrdering::Relaxed).max(0) as usize
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_calc_stats_catree), OTP-29.1.1.
@@ -670,27 +752,73 @@ impl CATree {
         Ok(false)
     }
 
-    /// Port of erts/emulator/beam/erl_db_catree.c (db_slot_catree), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_db_catree.c (db_slot_catree) and erl_db_tree.c
+    /// (slot_search with a CA-tree root iterator), OTP-29.1.1: one stack walks the base nodes in
+    /// key order, so a sequential `ets:slot/2` walk is amortized constant time.
     pub(crate) fn nth<H: HeapAlloc>(
         &self,
-        mut index: usize,
+        index: usize,
         dst: &mut H,
     ) -> Result<Option<Term>, EtsError> {
-        let routes = self.routes.load();
-        for route in routes.iter() {
-            let root = route.base.read();
-            let count = root.count();
-            if index < count {
-                return match root.slot_search(index + 1) {
-                    SlotSearch::Found(object) => {
-                        Some(copy_term_for_catree(object, dst)).transpose()
-                    }
-                    SlotSearch::EndOfTable | SlotSearch::Out => Ok(None),
-                };
+        let slot = index + 1;
+        let mut walk = self.slot_stack.lock().expect("CA-tree slot stack poisoned");
+        'restart: loop {
+            let routes = self.routes.load_full();
+            let version = self.version.load(AtomicOrdering::Acquire);
+            let fresh = walk.version != version
+                || !walk
+                    .routes
+                    .as_ref()
+                    .is_some_and(|saved| Arc::ptr_eq(saved, &routes));
+            if fresh || slot == 1 {
+                walk.routes = Some(Arc::clone(&routes));
+                walk.version = version;
+                walk.base = 0;
+                walk.stack = DbTreeStack::new();
             }
-            index -= count;
+            let mut base = walk.base;
+            loop {
+                let Some(route) = routes.entries.get(base) else {
+                    // Past the last object: the next walk starts over.
+                    walk.routes = None;
+                    return Ok(None);
+                };
+                let root = route.base.read();
+                if !route.base.is_valid.load(AtomicOrdering::Acquire)
+                    || self.version.load(AtomicOrdering::Acquire) != version
+                {
+                    drop(root);
+                    walk.routes = None;
+                    std::thread::yield_now();
+                    continue 'restart;
+                }
+                walk.base = base;
+                let stack = &mut walk.stack;
+                if stack.is_empty() {
+                    // Entering this base node: its first object is the next slot.
+                    if root.link().is_none() {
+                        base += 1;
+                        continue;
+                    }
+                    stack.push_left_spine(root.link());
+                    stack.set_slot(stack.slot() + 1);
+                }
+                match stack.walk_to(slot, root.link()) {
+                    Some(object) => {
+                        return Some(copy_term_for_catree(object, dst)).transpose();
+                    }
+                    None if slot > stack.slot() => {
+                        // This base node ran out: continue with the next one.
+                        base += 1;
+                    }
+                    None => {
+                        // Walked back past the first object of the base node: start over.
+                        walk.routes = None;
+                        continue 'restart;
+                    }
+                }
+            }
         }
-        Ok(None)
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c (db_next_catree_common), OTP-29.1.1.
@@ -1049,7 +1177,7 @@ fn scheduler_local_random() -> u32 {
 }
 
 /// Port of erts/emulator/beam/erl_db_catree.c (join_trees), OTP-29.1.1.
-fn key_object(key: Term) -> Result<DbTerm, EtsError> {
+fn key_object(key: Term) -> Result<crate::PlainDbTerm, EtsError> {
     let mut heap = VecHeap::new();
     let tuple = TermBuilder::new(&mut heap)
         .tuple(&[key])

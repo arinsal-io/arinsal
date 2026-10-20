@@ -7,29 +7,21 @@
 //! stored objects; everything else reaches the words through the safe slice field.
 
 use super::{EtsError, OffHeap};
+use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
 use arinsal_term::{
     ExternalBinary, HeapAlloc, MagicRef, Node as TermNode, Term, TermError, WritableBinary, cmp,
 };
-use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
 use std::cmp::Ordering;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use super::Compressed;
 
-/// A stored object: the table links, the `DbTerm` fields and, after them, the words of the
-/// term. `W = [u64]` is the unsized form every table works with.
-// Port of erts/emulator/beam/erl_db_util.h (DbTerm) and erl_db_hash.h (HashDbTerm), OTP-29.1.1.
+/// The `DbTerm` of erts (erl_db_util.h): the bookkeeping of one stored object and, after it, the
+/// words of the term. `W = [u64]` is the unsized form every table works with.
+// Port of erts/emulator/beam/erl_db_util.h (DbTerm), OTP-29.1.1.
 #[repr(C)]
-pub(crate) struct StoredTermG<W: ?Sized> {
-    /// `HashDbTerm.next`; `TreeDbTerm.left` of a tree node.
-    pub(crate) next: Option<Box<StoredTermG<[u64]>>>,
-    /// `TreeDbTerm.right`.
-    pub(crate) right: Option<Box<StoredTermG<[u64]>>>,
-    /// `TreeDbTerm.balance`.
-    pub(crate) balance: i8,
-    /// `HashDbTerm.hvalue`.
-    pub(crate) hvalue: u64,
+pub(crate) struct DbData<W: ?Sized> {
     /// The stored tuple, a pointer into `words`.
     pub(crate) term: Term,
     /// `DbTerm.size`-based memory accounting, in words (`ets:info(T, memory)`).
@@ -41,79 +33,239 @@ pub(crate) struct StoredTermG<W: ?Sized> {
     // ETS compressed tables retain only ETF bytes for non-key boxed elements. The tuple
     // contains NIL sentinels in those positions and never keeps the original values alive.
     pub(crate) compressed: Option<Box<Compressed>>,
-    pub(crate) order: u64,
-    pub(crate) group_order: u64,
     /// The stored block can be copied out word by word (`copy_shallow`).
     pub(crate) shallow: bool,
-    /// `HashDbTerm.pseudo_deleted`.
-    pub(crate) pseudo_deleted: bool,
     /// The heap words of the term.
     pub(crate) words: W,
 }
 
-/// A stored object of any size.
-pub(crate) type StoredTerm = StoredTermG<[u64]>;
-/// The owner of a stored object, as erts' `DbTerm *` / `HashDbTerm *`.
-pub(crate) type DbTerm = Box<StoredTerm>;
+/// A stored object of any size, as the table-independent code sees it (`DbTerm *`).
+pub(crate) type StoredTerm = DbData<[u64]>;
 
-/// Allocate a block for `nwords` words of term data, zeroed.
-// Port of erts/emulator/beam/erl_db_util.c (new_dbterm / db_store_term allocation), OTP-29.1.1.
-pub(crate) fn new_block(nwords: usize) -> DbTerm {
-    type Head = StoredTermG<[u64; 0]>;
-    let layout = Layout::new::<Head>()
-        .extend(Layout::array::<u64>(nwords).expect("object size fits an allocation"))
-        .expect("object size fits an allocation")
-        .0
-        .pad_to_align();
-    // SAFETY: the layout holds at least the header, so its size is not zero.
-    let raw = unsafe { alloc_zeroed(layout) };
-    if raw.is_null() {
-        handle_alloc_error(layout);
+/// A table's block: the table-specific prefix (`HashDbTerm` / `TreeDbTerm` fields before
+/// `dbterm`) and the `DbTerm`.
+#[repr(C)]
+pub(crate) struct Node<P, W: ?Sized> {
+    pub(crate) prefix: P,
+    pub(crate) data: DbData<W>,
+}
+
+impl<P, W: ?Sized> std::ops::Deref for Node<P, W> {
+    type Target = DbData<W>;
+
+    #[inline]
+    fn deref(&self) -> &DbData<W> {
+        &self.data
     }
-    // SAFETY: `raw` is a fresh allocation, aligned for and large enough for the header.
-    unsafe {
-        raw.cast::<Head>().write(Head {
+}
+
+impl<P, W: ?Sized> std::ops::DerefMut for Node<P, W> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut DbData<W> {
+        &mut self.data
+    }
+}
+
+/// `HashDbTerm` before the `dbterm` field (erl_db_hash.h). `order` and `group_order` are the
+/// hash bucket insertion ranks arinsal keeps for its bucket-order emulation.
+pub(crate) struct HashPrefix {
+    pub(crate) next: Option<HashDbTerm>,
+    pub(crate) hvalue: u64,
+    pub(crate) pseudo_deleted: bool,
+    pub(crate) order: u64,
+    pub(crate) group_order: u64,
+}
+
+/// `TreeDbTerm` before the `dbterm` field (erl_db_tree_util.h).
+pub(crate) struct TreePrefix {
+    pub(crate) left: Option<TreeDbTerm>,
+    pub(crate) right: Option<TreeDbTerm>,
+    pub(crate) balance: i8,
+}
+
+/// A prefix a block can be made with: all fields empty.
+pub(crate) trait Prefix: Sized {
+    fn empty() -> Self;
+}
+
+impl Prefix for () {
+    fn empty() -> Self {}
+}
+
+impl Prefix for HashPrefix {
+    fn empty() -> Self {
+        Self {
             next: None,
-            right: None,
-            balance: 0,
             hvalue: 0,
-            term: Term::NIL,
-            db_size_words: 0,
-            term_size_words: 0,
-            off_heap: None,
-            compressed: None,
+            pseudo_deleted: false,
             order: 0,
             group_order: 0,
-            shallow: false,
-            pseudo_deleted: false,
-            words: [],
-        });
+        }
     }
-    let fat = std::ptr::slice_from_raw_parts_mut(raw.cast::<u64>(), nwords) as *mut StoredTerm;
-    // SAFETY: the allocation has the size and alignment `Box` frees an unsized `StoredTerm` with
-    // (header plus `nwords` words, 8-aligned); the header is initialised and zero is a valid word.
-    unsafe { Box::from_raw(fat) }
+}
+
+impl Prefix for TreePrefix {
+    fn empty() -> Self {
+        Self {
+            left: None,
+            right: None,
+            balance: 0,
+        }
+    }
+}
+
+/// The owner of a stored block, as erts' `DbTerm *` / `HashDbTerm *` / `TreeDbTerm *`: one
+/// `ERTS_ALC_T_DB_TERM` allocation holding the prefix, the `DbTerm` and the words of the term.
+pub(crate) struct DbTerm<P> {
+    ptr: NonNull<Node<P, [u64]>>,
+}
+
+pub(crate) type HashDbTerm = DbTerm<HashPrefix>;
+pub(crate) type TreeDbTerm = DbTerm<TreePrefix>;
+/// A block with no table prefix (`offset` 0).
+pub(crate) type PlainDbTerm = DbTerm<()>;
+/// The block of a tree node as the tree code sees it.
+pub(crate) type TreeNode = Node<TreePrefix, [u64]>;
+
+// SAFETY: a `DbTerm` owns its block exclusively, like a `Box`, and its contents are `Send + Sync`.
+unsafe impl<P: Send> Send for DbTerm<P> {}
+// SAFETY: see above.
+unsafe impl<P: Sync> Sync for DbTerm<P> {}
+
+impl<P> std::ops::Deref for DbTerm<P> {
+    type Target = Node<P, [u64]>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `ptr` addresses the live block this value owns.
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<P> std::ops::DerefMut for DbTerm<P> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as above, and `&mut self` is the only access path.
+        unsafe { self.ptr.as_mut() }
+    }
+}
+
+impl<P> Drop for DbTerm<P> {
+    // Port of erts/emulator/beam/erl_db_util.c (db_free_term), OTP-29.1.1.
+    fn drop(&mut self) {
+        let base = self.ptr.as_ptr();
+        // SAFETY: the block is live and owned; its fields are dropped once, then its memory is
+        // returned to the allocator that made it.
+        unsafe { std::ptr::drop_in_place(base) };
+        AllocBlock::free_detached_heap(base.cast::<u64>());
+    }
+}
+
+impl<P: Prefix> DbTerm<P> {
+    const HEAD_WORDS: usize = std::mem::size_of::<Node<P, [u64; 0]>>() / 8;
+
+    fn into_ptr(self) -> NonNull<Node<P, [u64]>> {
+        let ptr = self.ptr;
+        std::mem::forget(self);
+        ptr
+    }
+
+    fn from_user(user: *mut u64, nwords: usize) -> Self {
+        let fat = std::ptr::slice_from_raw_parts_mut(user, nwords) as *mut Node<P, [u64]>;
+        Self {
+            // SAFETY: `user` comes from a successful allocation, so it is not null.
+            ptr: unsafe { NonNull::new_unchecked(fat) },
+        }
+    }
+
+    /// Make the block hold `nwords` words of term data, keeping the header; the words are
+    /// cleared. `erts_db_realloc` when the size changes.
+    // Port of erts/emulator/beam/erl_db_util.c (db_realloc_term), OTP-29.1.1.
+    fn resize(&mut self, nwords: usize) {
+        if self.data.words.len() != nwords {
+            let user = AllocBlock::realloc_detached_heap(
+                self.ptr.as_ptr().cast::<u64>(),
+                Self::HEAD_WORDS + nwords,
+            )
+            .expect("ets_alloc out of memory");
+            // The old block is gone (reallocated); only the pointer changes hands.
+            self.ptr = Self::from_user(user, nwords).into_ptr();
+        }
+        self.data.words.fill(0);
+    }
+}
+
+/// Allocate a block for `nwords` words of term data.
+// Port of erts/emulator/beam/erl_db_util.c (db_store_term allocation:
+// erts_db_alloc(ERTS_ALC_T_DB_TERM)), OTP-29.1.1.
+pub(crate) fn new_block<P: Prefix>(nwords: usize) -> DbTerm<P> {
+    let head_words = DbTerm::<P>::HEAD_WORDS;
+    let user = AllocBlock::detach_heap(ErtsAlcType::DB_TERM, head_words + nwords)
+        .expect("ets_alloc out of memory");
+    // SAFETY: `user` addresses `head_words + nwords` fresh words, 8-aligned: room for the
+    // header, and the term words after it are zeroed here.
+    unsafe {
+        user.cast::<Node<P, [u64; 0]>>().write(Node {
+            prefix: P::empty(),
+            data: DbData {
+                term: Term::NIL,
+                db_size_words: 0,
+                term_size_words: 0,
+                off_heap: None,
+                compressed: None,
+                shallow: false,
+                words: [],
+            },
+        });
+        std::ptr::write_bytes(user.add(head_words), 0, nwords);
+    }
+    DbTerm::from_user(user, nwords)
 }
 
 /// Allocate a block of `nwords` words and let `fill` copy the term into it; `fill` returns the
 /// stored term. The off-heap owners it links belong to the block.
 // Port of erts/emulator/beam/erl_db_util.c (db_store_term), OTP-29.1.1.
-pub(crate) fn build_block(
+pub(crate) fn build_block<P: Prefix>(
     nwords: usize,
     fill: impl FnOnce(&mut BlockHeap) -> Result<Term, EtsError>,
-) -> Result<DbTerm, EtsError> {
+) -> Result<DbTerm<P>, EtsError> {
     let mut block = new_block(nwords);
+    fill_block(&mut block, fill)?;
+    Ok(block)
+}
+
+/// `db_store_term` with an old DbTerm: the old term's off-heap owners are released and the block
+/// is reused when the size is unchanged, else reallocated; the links and hash value stay.
+// Port of erts/emulator/beam/erl_db_util.c (db_store_term), OTP-29.1.1.
+pub(crate) fn rebuild_block<P: Prefix>(
+    old: &mut DbTerm<P>,
+    nwords: usize,
+    fill: impl FnOnce(&mut BlockHeap) -> Result<Term, EtsError>,
+) -> Result<(), EtsError> {
+    // erts_cleanup_offheap_list(old->first_oh)
+    old.data.off_heap = None;
+    old.data.compressed = None;
+    old.data.term = Term::NIL;
+    old.resize(nwords);
+    fill_block(old, fill)
+}
+
+fn fill_block<P: Prefix>(
+    block: &mut DbTerm<P>,
+    fill: impl FnOnce(&mut BlockHeap) -> Result<Term, EtsError>,
+) -> Result<(), EtsError> {
+    let nwords = block.data.words.len();
     let mut heap = BlockHeap {
-        base: block.words.as_mut_ptr(),
+        base: block.data.words.as_mut_ptr(),
         cap: nwords,
         used: 0,
         off_heap: None,
     };
     let term = fill(&mut heap)?;
     debug_assert!(heap.used <= nwords, "object copy overran its block");
-    block.term = term;
-    block.off_heap = heap.off_heap.take();
-    Ok(block)
+    block.data.term = term;
+    block.data.off_heap = heap.off_heap.take();
+    Ok(())
 }
 
 /// The words of one stored block, handed out in order, as erts' `db_store_term` bumps `top`.
@@ -216,13 +368,13 @@ impl HeapAlloc for BlockHeap {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The AVL tree of an ordered_set: nodes are `StoredTerm` blocks linked through `next` (left) and
+// The AVL tree of an ordered_set: nodes are `TreeDbTerm` blocks linked through `left` and
 // `right`. The algorithms below keep erts' stacks of `TreeDbTerm **` slots, raw pointers to the
 // link fields of the nodes above the one being changed.
 // ---------------------------------------------------------------------------------------------
 
 /// A `TreeDbTerm *`.
-pub(crate) type Link = Option<DbTerm>;
+pub(crate) type Link = Option<TreeDbTerm>;
 
 // Port of erl_db_tree_util.h (STACK_NEED): 90 entries on 64-bit, 50 on 32-bit.
 pub(crate) const STACK_NEED: usize = if usize::BITS == 64 { 90 } else { 50 };
@@ -299,51 +451,59 @@ impl Slot {
     }
 }
 
-fn node(link: &mut Link) -> &mut DbTerm {
+fn node(link: &mut Link) -> &mut TreeDbTerm {
     link.as_mut().expect("AVL slot holds a node")
 }
 
 /// Port of erts/emulator/beam/erl_db_tree.c (tree_balance_left), OTP-29.1.1. Returns whether
 /// the height of the subtree decreased.
 pub(crate) fn tree_balance_left(this: &mut Link) -> bool {
-    match node(this).balance {
+    match node(this).prefix.balance {
         -1 => {
-            node(this).balance = 0;
+            node(this).prefix.balance = 0;
             true
         }
         0 => {
-            node(this).balance = 1;
+            node(this).prefix.balance = 1;
             false
         }
         _ => {
             let mut p = this.take().expect("AVL slot holds a node");
-            let mut p1 = p.right.take().expect("right-heavy node has a right child");
-            let b1 = p1.balance;
+            let mut p1 = p
+                .prefix
+                .right
+                .take()
+                .expect("right-heavy node has a right child");
+            let b1 = p1.prefix.balance;
             let mut h = true;
             if b1 >= 0 {
                 // Single RR rotation
-                p.right = p1.next.take();
+                p.prefix.right = p1.prefix.left.take();
                 if b1 == 0 {
-                    p.balance = 1;
-                    p1.balance = -1;
+                    p.prefix.balance = 1;
+                    p1.prefix.balance = -1;
                     h = false;
                 } else {
-                    p.balance = 0;
-                    p1.balance = 0;
+                    p.prefix.balance = 0;
+                    p1.prefix.balance = 0;
                 }
-                p1.next = Some(p);
+                p1.prefix.left = Some(p);
                 *this = Some(p1);
             } else {
                 // Double RL rotation
-                let mut p2 = p1.next.take().expect("RL rotation needs a grandchild");
-                let b2 = p2.balance;
-                p1.next = p2.right.take();
-                p.right = p2.next.take();
-                p.balance = if b2 == 1 { -1 } else { 0 };
-                p1.balance = if b2 == -1 { 1 } else { 0 };
-                p2.balance = 0;
-                p2.right = Some(p1);
-                p2.next = Some(p);
+                let mut p2 = p1
+                    .prefix
+                    .left
+                    .take()
+                    .expect("RL rotation needs a grandchild");
+                let b2 = p2.prefix.balance;
+                p1.prefix.left = p2.prefix.right.take();
+                p.prefix.right = p2.prefix.left.take();
+                p.prefix.balance = if b2 == 1 { -1 } else { 0 };
+                p1.prefix.balance = if b2 == -1 { 1 } else { 0 };
+                p2.prefix.balance = 0;
+                p2.prefix.right = Some(p1);
+                p2.prefix.left = Some(p);
                 *this = Some(p2);
             }
             h
@@ -353,44 +513,52 @@ pub(crate) fn tree_balance_left(this: &mut Link) -> bool {
 
 /// Port of erts/emulator/beam/erl_db_tree.c (tree_balance_right), OTP-29.1.1.
 pub(crate) fn tree_balance_right(this: &mut Link) -> bool {
-    match node(this).balance {
+    match node(this).prefix.balance {
         1 => {
-            node(this).balance = 0;
+            node(this).prefix.balance = 0;
             true
         }
         0 => {
-            node(this).balance = -1;
+            node(this).prefix.balance = -1;
             false
         }
         _ => {
             let mut p = this.take().expect("AVL slot holds a node");
-            let mut p1 = p.next.take().expect("left-heavy node has a left child");
-            let b1 = p1.balance;
+            let mut p1 = p
+                .prefix
+                .left
+                .take()
+                .expect("left-heavy node has a left child");
+            let b1 = p1.prefix.balance;
             let mut h = true;
             if b1 <= 0 {
                 // Single LL rotation
-                p.next = p1.right.take();
+                p.prefix.left = p1.prefix.right.take();
                 if b1 == 0 {
-                    p.balance = -1;
-                    p1.balance = 1;
+                    p.prefix.balance = -1;
+                    p1.prefix.balance = 1;
                     h = false;
                 } else {
-                    p.balance = 0;
-                    p1.balance = 0;
+                    p.prefix.balance = 0;
+                    p1.prefix.balance = 0;
                 }
-                p1.right = Some(p);
+                p1.prefix.right = Some(p);
                 *this = Some(p1);
             } else {
                 // Double LR rotation
-                let mut p2 = p1.right.take().expect("LR rotation needs a grandchild");
-                let b2 = p2.balance;
-                p1.right = p2.next.take();
-                p.next = p2.right.take();
-                p.balance = if b2 == -1 { 1 } else { 0 };
-                p1.balance = if b2 == 1 { -1 } else { 0 };
-                p2.balance = 0;
-                p2.next = Some(p1);
-                p2.right = Some(p);
+                let mut p2 = p1
+                    .prefix
+                    .right
+                    .take()
+                    .expect("LR rotation needs a grandchild");
+                let b2 = p2.prefix.balance;
+                p1.prefix.right = p2.prefix.left.take();
+                p.prefix.left = p2.prefix.right.take();
+                p.prefix.balance = if b2 == -1 { 1 } else { 0 };
+                p1.prefix.balance = if b2 == 1 { -1 } else { 0 };
+                p2.prefix.balance = 0;
+                p2.prefix.left = Some(p1);
+                p2.prefix.right = Some(p);
                 *this = Some(p2);
             }
             h
@@ -404,66 +572,82 @@ pub(crate) fn tree_balance_right(this: &mut Link) -> bool {
 fn rebalance_after_insert(path: &mut Path) {
     while let Some((this, dir)) = path.pop() {
         let this = this.link();
-        let balance = node(this).balance;
+        let balance = node(this).prefix.balance;
         if dir == DIR_LEFT {
             match balance {
                 1 => {
-                    node(this).balance = 0;
+                    node(this).prefix.balance = 0;
                     return;
                 }
-                0 => node(this).balance = -1,
+                0 => node(this).prefix.balance = -1,
                 _ => {
                     let mut p = this.take().expect("AVL slot holds a node");
-                    let mut p1 = p.next.take().expect("left-heavy node has a left child");
-                    if p1.balance == -1 {
+                    let mut p1 = p
+                        .prefix
+                        .left
+                        .take()
+                        .expect("left-heavy node has a left child");
+                    if p1.prefix.balance == -1 {
                         // Single LL rotation
-                        p.next = p1.right.take();
-                        p.balance = 0;
-                        p1.right = Some(p);
+                        p.prefix.left = p1.prefix.right.take();
+                        p.prefix.balance = 0;
+                        p1.prefix.right = Some(p);
                         *this = Some(p1);
                     } else {
                         // Double RR rotation
-                        let mut p2 = p1.right.take().expect("RR rotation needs a grandchild");
-                        p1.right = p2.next.take();
-                        p.next = p2.right.take();
-                        p.balance = if p2.balance == -1 { 1 } else { 0 };
-                        p1.balance = if p2.balance == 1 { -1 } else { 0 };
-                        p2.next = Some(p1);
-                        p2.right = Some(p);
+                        let mut p2 = p1
+                            .prefix
+                            .right
+                            .take()
+                            .expect("RR rotation needs a grandchild");
+                        p1.prefix.right = p2.prefix.left.take();
+                        p.prefix.left = p2.prefix.right.take();
+                        p.prefix.balance = if p2.prefix.balance == -1 { 1 } else { 0 };
+                        p1.prefix.balance = if p2.prefix.balance == 1 { -1 } else { 0 };
+                        p2.prefix.left = Some(p1);
+                        p2.prefix.right = Some(p);
                         *this = Some(p2);
                     }
-                    node(this).balance = 0;
+                    node(this).prefix.balance = 0;
                     return;
                 }
             }
         } else {
             match balance {
                 -1 => {
-                    node(this).balance = 0;
+                    node(this).prefix.balance = 0;
                     return;
                 }
-                0 => node(this).balance = 1,
+                0 => node(this).prefix.balance = 1,
                 _ => {
                     let mut p = this.take().expect("AVL slot holds a node");
-                    let mut p1 = p.right.take().expect("right-heavy node has a right child");
-                    if p1.balance == 1 {
+                    let mut p1 = p
+                        .prefix
+                        .right
+                        .take()
+                        .expect("right-heavy node has a right child");
+                    if p1.prefix.balance == 1 {
                         // Single RR rotation
-                        p.right = p1.next.take();
-                        p.balance = 0;
-                        p1.next = Some(p);
+                        p.prefix.right = p1.prefix.left.take();
+                        p.prefix.balance = 0;
+                        p1.prefix.left = Some(p);
                         *this = Some(p1);
                     } else {
                         // Double RL rotation
-                        let mut p2 = p1.next.take().expect("RL rotation needs a grandchild");
-                        p1.next = p2.right.take();
-                        p.right = p2.next.take();
-                        p.balance = if p2.balance == 1 { -1 } else { 0 };
-                        p1.balance = if p2.balance == -1 { 1 } else { 0 };
-                        p2.right = Some(p1);
-                        p2.next = Some(p);
+                        let mut p2 = p1
+                            .prefix
+                            .left
+                            .take()
+                            .expect("RL rotation needs a grandchild");
+                        p1.prefix.left = p2.prefix.right.take();
+                        p.prefix.right = p2.prefix.left.take();
+                        p.prefix.balance = if p2.prefix.balance == 1 { -1 } else { 0 };
+                        p1.prefix.balance = if p2.prefix.balance == -1 { 1 } else { 0 };
+                        p2.prefix.right = Some(p1);
+                        p2.prefix.left = Some(p);
                         *this = Some(p2);
                     }
-                    node(this).balance = 0;
+                    node(this).prefix.balance = 0;
                     return;
                 }
             }
@@ -490,45 +674,71 @@ fn rebalance_after_delete(path: &mut Path, mut state: bool) {
 // Port of erts/emulator/beam/erl_db_tree.c (db_put_dbterm_tree_common), OTP-29.1.1.
 pub(crate) fn tree_insert(
     root: &mut Link,
-    mut value: DbTerm,
+    value: TreeDbTerm,
     key: Term,
     keypos: usize,
     key_clash_fail: bool,
 ) -> InsertResult {
+    let mut value = Some(value);
+    tree_put(root, key, keypos, key_clash_fail, |old| match old {
+        Some(old) => {
+            // Equal key: the new block takes the old one's place and links.
+            let mut value = value.take().expect("value is consumed once");
+            value.prefix.balance = old.prefix.balance;
+            value.prefix.left = old.prefix.left.take();
+            value.prefix.right = old.prefix.right.take();
+            *old = value;
+            Ok(None)
+        }
+        None => Ok(value.take()),
+    })
+    .expect("storing an existing block cannot fail")
+}
+
+/// Find the place of `key` and let `make` store the object there: with the old block of an
+/// equal key (rewritten in place, `None` returned) or without one (the new block is returned and
+/// linked in). Returns what happened, with the replaced block's accounting size.
+// Port of erts/emulator/beam/erl_db_tree.c (db_put_tree_common: new_dbterm / replace_dbterm),
+// OTP-29.1.1.
+pub(crate) fn tree_put(
+    root: &mut Link,
+    key: Term,
+    keypos: usize,
+    key_clash_fail: bool,
+    make: impl FnOnce(Option<&mut TreeDbTerm>) -> Result<Option<TreeDbTerm>, EtsError>,
+) -> Result<InsertResult, EtsError> {
     let mut path = Path::new();
     let mut this = Slot::of(root);
     loop {
         let slot = this.link();
         let order = match slot.as_ref() {
             None => {
-                value.balance = 0;
-                value.next = None;
-                value.right = None;
-                *slot = Some(value);
+                let mut new = make(None)?.expect("a new block is made without an old one");
+                new.prefix.balance = 0;
+                new.prefix.left = None;
+                new.prefix.right = None;
+                *slot = Some(new);
                 rebalance_after_insert(&mut path);
-                return InsertResult::Inserted;
+                return Ok(InsertResult::Inserted);
             }
             Some(current) => cmp(key, current.key(keypos)),
         };
         match order {
             Ordering::Less => {
                 path.push(this, DIR_LEFT);
-                this = Slot::of(&mut node(slot).next);
+                this = Slot::of(&mut node(slot).prefix.left);
             }
             Ordering::Greater => {
                 path.push(this, DIR_RIGHT);
-                this = Slot::of(&mut node(slot).right);
+                this = Slot::of(&mut node(slot).prefix.right);
             }
             Ordering::Equal if !key_clash_fail => {
-                let mut old = slot.take().expect("slot checked above");
-                value.balance = old.balance;
-                value.next = old.next.take();
-                value.right = old.right.take();
+                let old = node(slot);
                 let words = old.db_size_words;
-                *slot = Some(value);
-                return InsertResult::Replaced(words);
+                make(Some(old))?;
+                return Ok(InsertResult::Replaced(words));
             }
-            Ordering::Equal => return InsertResult::Exists,
+            Ordering::Equal => return Ok(InsertResult::Exists),
         }
     }
 }
@@ -536,24 +746,24 @@ pub(crate) fn tree_insert(
 /// Port of erts/emulator/beam/erl_db_tree.c (delsub), OTP-29.1.1: replace the node in `this`,
 /// which has two children, by its in-order predecessor; returns the removed node and whether
 /// the left subtree got shorter.
-fn delsub(this: &mut Link) -> (DbTerm, bool) {
+fn delsub(this: &mut Link) -> (TreeDbTerm, bool) {
     let mut q = this.take().expect("AVL slot holds a node");
     let mut slots = [Slot::NULL; STACK_NEED];
     let mut tpos = 0;
-    let mut r = Slot::of(&mut q.next);
+    let mut r = Slot::of(&mut q.prefix.left);
     // Walk down to the right looking for a void right child.
-    while r.link().as_ref().is_some_and(|n| n.right.is_some()) {
+    while r.link().as_ref().is_some_and(|n| n.prefix.right.is_some()) {
         slots[tpos] = r;
         tpos += 1;
-        r = Slot::of(&mut node(r.link()).right);
+        r = Slot::of(&mut node(r.link()).prefix.right);
     }
     let mut pred = r.link().take().expect("predecessor exists");
-    *r.link() = pred.next.take();
-    pred.next = q.next.take();
-    pred.right = q.right.take();
-    pred.balance = q.balance;
+    *r.link() = pred.prefix.left.take();
+    pred.prefix.left = q.prefix.left.take();
+    pred.prefix.right = q.prefix.right.take();
+    pred.prefix.balance = q.prefix.balance;
     *this = Some(pred);
-    slots[0] = Slot::of(&mut node(this).next);
+    slots[0] = Slot::of(&mut node(this).prefix.left);
     let mut h = true;
     while tpos > 0 && h {
         tpos -= 1;
@@ -569,7 +779,7 @@ pub(crate) fn tree_linkout(
     key: Term,
     keypos: usize,
     matches: &mut dyn FnMut(&StoredTerm) -> bool,
-) -> Option<DbTerm> {
+) -> Option<TreeDbTerm> {
     let mut path = Path::new();
     let mut this = Slot::of(root);
     let removed;
@@ -580,25 +790,25 @@ pub(crate) fn tree_linkout(
         match order {
             Ordering::Less => {
                 path.push(this, DIR_LEFT);
-                this = Slot::of(&mut node(slot).next);
+                this = Slot::of(&mut node(slot).prefix.left);
             }
             Ordering::Greater => {
                 path.push(this, DIR_RIGHT);
-                this = Slot::of(&mut node(slot).right);
+                this = Slot::of(&mut node(slot).prefix.right);
             }
             Ordering::Equal => {
                 if !matches(slot.as_ref().expect("slot checked above")) {
                     return None;
                 }
                 let q = node(slot);
-                if q.right.is_none() {
+                if q.prefix.right.is_none() {
                     let mut q = slot.take().expect("slot checked above");
-                    *slot = q.next.take();
+                    *slot = q.prefix.left.take();
                     removed = q;
                     state = true;
-                } else if q.next.is_none() {
+                } else if q.prefix.left.is_none() {
                     let mut q = slot.take().expect("slot checked above");
-                    *slot = q.right.take();
+                    *slot = q.prefix.right.take();
                     removed = q;
                     state = true;
                 } else {
@@ -614,7 +824,7 @@ pub(crate) fn tree_linkout(
 }
 
 /// Port of erts/emulator/beam/erl_db_catree.c (linkout_min_or_max_tree_node), OTP-29.1.1.
-fn linkout_min_or_max(root: &mut Link, is_min: bool) -> Option<DbTerm> {
+fn linkout_min_or_max(root: &mut Link, is_min: bool) -> Option<TreeDbTerm> {
     let mut path = Path::new();
     let mut this = Slot::of(root);
     let removed;
@@ -622,18 +832,18 @@ fn linkout_min_or_max(root: &mut Link, is_min: bool) -> Option<DbTerm> {
     loop {
         let slot = this.link();
         let current = slot.as_mut()?;
-        if is_min && current.next.is_some() {
+        if is_min && current.prefix.left.is_some() {
             path.push(this, DIR_LEFT);
-            this = Slot::of(&mut current.next);
-        } else if !is_min && current.right.is_some() {
+            this = Slot::of(&mut current.prefix.left);
+        } else if !is_min && current.prefix.right.is_some() {
             path.push(this, DIR_RIGHT);
-            this = Slot::of(&mut current.right);
+            this = Slot::of(&mut current.prefix.right);
         } else {
             let mut q = slot.take().expect("slot checked above");
-            if q.right.is_none() {
-                *slot = q.next.take();
+            if q.prefix.right.is_none() {
+                *slot = q.prefix.left.take();
             } else {
-                *slot = q.right.take();
+                *slot = q.prefix.right.take();
             }
             removed = q;
             state = true;
@@ -650,14 +860,19 @@ pub(crate) fn compute_tree_height(root: &Link) -> usize {
         return 0;
     };
     let mut height = 1;
-    while current.next.is_some() || current.right.is_some() {
-        current = if current.balance == -1 {
+    while current.prefix.left.is_some() || current.prefix.right.is_some() {
+        current = if current.prefix.balance == -1 {
             current
-                .next
+                .prefix
+                .left
                 .as_deref()
                 .expect("left-heavy node has a left child")
         } else {
-            current.right.as_deref().expect("node has a right child")
+            current
+                .prefix
+                .right
+                .as_deref()
+                .expect("node has a right child")
         };
         height += 1;
     }
@@ -684,18 +899,18 @@ pub(crate) fn join_trees(mut left: Link, mut right: Link) -> Link {
         let mut current_height = left_height;
         while current_height > new_right_height + 1 {
             let slot = this.link();
-            if node(slot).balance == -1 {
+            if node(slot).prefix.balance == -1 {
                 current_height -= 2;
             } else {
                 current_height -= 1;
             }
             path.push(this, DIR_RIGHT);
-            this = Slot::of(&mut node(slot).right);
+            this = Slot::of(&mut node(slot).prefix.right);
         }
         let slot = this.link();
-        new_root.next = slot.take();
-        new_root.right = right;
-        new_root.balance = (new_right_height as isize - current_height as isize) as i8;
+        new_root.prefix.left = slot.take();
+        new_root.prefix.right = right;
+        new_root.prefix.balance = (new_right_height as isize - current_height as isize) as i8;
         *slot = Some(new_root);
         rebalance_after_insert(&mut path);
         left
@@ -707,18 +922,18 @@ pub(crate) fn join_trees(mut left: Link, mut right: Link) -> Link {
         let mut current_height = right_height;
         while current_height > new_left_height + 1 {
             let slot = this.link();
-            if node(slot).balance == 1 {
+            if node(slot).prefix.balance == 1 {
                 current_height -= 2;
             } else {
                 current_height -= 1;
             }
             path.push(this, DIR_LEFT);
-            this = Slot::of(&mut node(slot).next);
+            this = Slot::of(&mut node(slot).prefix.left);
         }
         let slot = this.link();
-        new_root.right = slot.take();
-        new_root.next = left;
-        new_root.balance = (current_height as isize - new_left_height as isize) as i8;
+        new_root.prefix.right = slot.take();
+        new_root.prefix.left = left;
+        new_root.prefix.balance = (current_height as isize - new_left_height as isize) as i8;
         *slot = Some(new_root);
         rebalance_after_insert(&mut path);
         right
@@ -727,20 +942,20 @@ pub(crate) fn join_trees(mut left: Link, mut right: Link) -> Link {
 
 /// Split a tree into the objects below the split node, the split node's key and the rest.
 // Port of erts/emulator/beam/erl_db_catree.c (split_tree), OTP-29.1.1.
-pub(crate) fn split_tree(mut root: DbTerm, keypos: usize) -> (Link, Link, Term) {
-    if root.next.is_none() {
+pub(crate) fn split_tree(mut root: TreeDbTerm, keypos: usize) -> (Link, Link, Term) {
+    if root.prefix.left.is_none() {
         // To get a non-empty split.
-        let right = root.right.take();
+        let right = root.prefix.right.take();
         let split_key = right
             .as_ref()
             .expect("a splittable CA-tree base has at least two objects")
             .key(keypos);
-        root.balance = 0;
+        root.prefix.balance = 0;
         return (Some(root), right, split_key);
     }
     let split_key = root.key(keypos);
-    let left = root.next.take();
-    let mut right = root.right.take();
+    let left = root.prefix.left.take();
+    let mut right = root.prefix.right.take();
     // insert_TreeDbTerm: the old root goes into the right tree.
     tree_insert(&mut right, root, split_key, keypos, false);
     (left, right, split_key)
@@ -752,19 +967,19 @@ pub(crate) fn split_tree(mut root: DbTerm, keypos: usize) -> (Link, Link, Term) 
 /// The node pointers are only dereferenced while the tree is unchanged: the owner resets the
 /// stack on every change (`TreeRoot::version`).
 pub(crate) struct DbTreeStack {
-    entries: Vec<NonNull<StoredTerm>>,
+    entries: Vec<NonNull<TreeNode>>,
     slot: usize,
     /// The tree version the entries were taken from.
     pub(crate) version: u64,
 }
 
 // SAFETY: the entries point into the tree that owns the stack and are only used under the
-// owner's lock with a matching version, like the nodes themselves (`DbTerm` is `Send + Sync`).
+// owner's lock with a matching version, like the nodes themselves (`TreeDbTerm` is `Send + Sync`).
 unsafe impl Send for DbTreeStack {}
 
 /// What `slot_search` found.
 pub(crate) enum SlotSearch<'a> {
-    Found(&'a StoredTerm),
+    Found(&'a TreeNode),
     /// The slot is one past the last object (`is_EOT`).
     EndOfTable,
     /// The slot is further out.
@@ -787,14 +1002,114 @@ impl DbTreeStack {
         self.version = version;
     }
 
-    fn push(&mut self, node: &StoredTerm) {
+    fn push(&mut self, node: &TreeNode) {
         self.entries.push(NonNull::from(node));
     }
 
-    fn top<'a>(&self) -> Option<&'a StoredTerm> {
+    fn top<'a>(&self) -> Option<&'a TreeNode> {
         // SAFETY: entries point into the tree the caller borrows for `'a` and that has not been
         // changed since they were pushed (see the type's contract).
         self.entries.last().map(|node| unsafe { node.as_ref() })
+    }
+}
+
+impl DbTreeStack {
+    /// The `slot` the stack top stands for.
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
+
+    pub(crate) fn set_slot(&mut self, slot: usize) {
+        self.slot = slot;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Push the path from `root` down to its first object (`db_first_tree_common`'s walk);
+    /// false for an empty tree.
+    pub(crate) fn push_left_spine(&mut self, root: &Link) -> bool {
+        let Some(mut this) = root.as_deref() else {
+            return false;
+        };
+        while let Some(left) = this.prefix.left.as_deref() {
+            self.push(this);
+            this = left;
+        }
+        self.push(this);
+        true
+    }
+
+    /// Push the path from `root` down to its last object (`db_last_tree_common`'s walk).
+    pub(crate) fn push_right_spine(&mut self, root: &Link) -> bool {
+        let Some(mut this) = root.as_deref() else {
+            return false;
+        };
+        while let Some(right) = this.prefix.right.as_deref() {
+            self.push(this);
+            this = right;
+        }
+        self.push(this);
+        true
+    }
+
+    /// Move the stack top to `slot`, forward or back, inside the tree whose nodes the stack
+    /// holds; `None` when the tree has no such object (the stack is then left empty).
+    // Port of erts/emulator/beam/erl_db_tree.c (slot_search, the `while (stack->slot != slot)`
+    // loop), OTP-29.1.1.
+    pub(crate) fn walk_to<'a>(&mut self, slot: usize, _tree: &'a Link) -> Option<&'a TreeNode> {
+        let mut this = self.top()?;
+        while self.slot != slot {
+            if slot > self.slot {
+                if let Some(right) = this.prefix.right.as_deref() {
+                    this = right;
+                    while let Some(left) = this.prefix.left.as_deref() {
+                        self.push(this);
+                        this = left;
+                    }
+                    self.push(this);
+                } else {
+                    loop {
+                        let tmp = self.entries.pop().expect("stack is not empty here");
+                        this = self.top()?;
+                        if this
+                            .prefix
+                            .left
+                            .as_deref()
+                            .is_some_and(|left| std::ptr::eq(left, tmp.as_ptr()))
+                        {
+                            break;
+                        }
+                    }
+                }
+                self.slot += 1;
+            } else {
+                if let Some(left) = this.prefix.left.as_deref() {
+                    this = left;
+                    while let Some(right) = this.prefix.right.as_deref() {
+                        self.push(this);
+                        this = right;
+                    }
+                    self.push(this);
+                } else {
+                    loop {
+                        let tmp = self.entries.pop().expect("stack is not empty here");
+                        this = self.top()?;
+                        if this
+                            .prefix
+                            .right
+                            .as_deref()
+                            .is_some_and(|right| std::ptr::eq(right, tmp.as_ptr()))
+                        {
+                            break;
+                        }
+                    }
+                }
+                self.slot -= 1;
+            }
+        }
+        Some(this)
     }
 }
 
@@ -820,69 +1135,13 @@ pub(crate) fn slot_search<'a>(
         stack.entries.clear();
     }
     if stack.entries.is_empty() {
-        let Some(mut this) = root.as_deref() else {
+        if !stack.push_left_spine(root) {
             return end(stack);
-        };
-        while let Some(left) = this.next.as_deref() {
-            stack.push(this);
-            this = left;
         }
-        stack.push(this);
         stack.slot += 1;
     }
-    let mut this = stack.top().expect("stack holds the leftmost node");
-    while stack.slot != slot {
-        if slot > stack.slot {
-            if let Some(right) = this.right.as_deref() {
-                this = right;
-                while let Some(left) = this.next.as_deref() {
-                    stack.push(this);
-                    this = left;
-                }
-                stack.push(this);
-            } else {
-                loop {
-                    let tmp = stack.entries.pop().expect("stack is not empty here");
-                    let Some(parent) = stack.top() else {
-                        return end(stack);
-                    };
-                    this = parent;
-                    if this
-                        .next
-                        .as_deref()
-                        .is_some_and(|left| std::ptr::eq(left, tmp.as_ptr()))
-                    {
-                        break;
-                    }
-                }
-            }
-            stack.slot += 1;
-        } else {
-            if let Some(left) = this.next.as_deref() {
-                this = left;
-                while let Some(right) = this.right.as_deref() {
-                    stack.push(this);
-                    this = right;
-                }
-                stack.push(this);
-            } else {
-                loop {
-                    let tmp = stack.entries.pop().expect("stack is not empty here");
-                    let Some(parent) = stack.top() else {
-                        return end(stack);
-                    };
-                    this = parent;
-                    if this
-                        .right
-                        .as_deref()
-                        .is_some_and(|right| std::ptr::eq(right, tmp.as_ptr()))
-                    {
-                        break;
-                    }
-                }
-            }
-            stack.slot -= 1;
-        }
+    match stack.walk_to(slot, root) {
+        Some(found) => SlotSearch::Found(found),
+        None => end(stack),
     }
-    SlotSearch::Found(this)
 }

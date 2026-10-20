@@ -177,7 +177,7 @@ impl Table {
                     let present = fine_locked
                         || storage.with_objects_hash(hash, |mut objects| {
                             objects.any(|node| {
-                                node.hvalue == (hash >> 1)
+                                node.prefix.hvalue == (hash >> 1)
                                     && exact_eq(node.key(self.options.keypos), key)
                             })
                         });

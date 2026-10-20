@@ -1080,17 +1080,10 @@ fn direct_insert_one_from_shared(
         {
             return None;
         }
-        let prepared = Table::prepare_object(&table.options, object).ok()?;
-        if insert_new {
-            return table
-                .insert_new_prepared_shared(prepared)
-                .ok()
-                .map(boolean_term);
-        }
         return table
-            .insert_shared(prepared)
-            .is_none()
-            .then(|| boolean_term(true));
+            .insert_term_shared(object, insert_new)
+            .ok()
+            .map(boolean_term);
     }
 
     let mut table = shared.write();
@@ -1101,13 +1094,7 @@ fn direct_insert_one_from_shared(
     {
         return None;
     }
-    let prepared = Table::prepare_object(&table.options, object).ok()?;
-    let inserted = if insert_new {
-        table.insert_new_prepared(prepared)
-    } else {
-        table.insert_prepared(prepared);
-        true
-    };
+    let inserted = table.insert_term(object, insert_new).ok()?;
     Some(boolean_term(inserted))
 }
 
@@ -1281,15 +1268,7 @@ fn insert_args(
         if !allowed(&table, caller, true) {
             return Err(badarg_cause("access"));
         }
-        let prepared = Table::prepare_object(&options, objects).map_err(err)?;
-        let yes = if insert_new {
-            table.insert_new_prepared_shared(prepared).map_err(err)?
-        } else {
-            if table.insert_shared(prepared).is_some() {
-                return Err(badarg());
-            }
-            true
-        };
+        let yes = table.insert_term_shared(objects, insert_new).map_err(err)?;
         return Ok(if insert_new {
             boolean_term(yes)
         } else {

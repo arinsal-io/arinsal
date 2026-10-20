@@ -203,3 +203,42 @@ fn order_matches_avl() {
     );
     assert!(ca.avl_invariants_hold());
 }
+
+/// `ets:slot/2` walks the base nodes with one table-wide stack: forward, backward, jumping and
+/// after changes, it agrees with the plain AVL table.
+#[test]
+fn slot_walk_across_bases_matches_avl() {
+    let (avl_registry, avl_tid) = table(WriteConcurrency::Disabled);
+    let (ca_registry, ca_tid) = table(WriteConcurrency::Enabled);
+    let mut avl = avl_registry.get_mut(avl_tid).unwrap();
+    let mut ca = ca_registry.get_mut(ca_tid).unwrap();
+    insert_range(&mut avl, 0, 300);
+    insert_range(&mut ca, 0, 300);
+    force_split(&ca, 0);
+    force_split(&ca, 150);
+    let slot = |table: &Table, index: usize| {
+        let mut heap = VecHeap::new();
+        table
+            .slot(index, &mut heap)
+            .map(|term| term.map(|term| arinsal_term::to_owned(term).unwrap()))
+            .ok()
+    };
+    let check = |avl: &Table, ca: &Table, index: usize| {
+        similar_asserts::assert_eq!(slot(avl, index), slot(ca, index), "slot {index}");
+    };
+    for index in (0..=300)
+        .chain((0..300).rev())
+        .chain([5, 250, 7, 299, 0, 120, 121, 119])
+    {
+        check(&avl, &ca, index);
+    }
+    check(&avl, &ca, 301);
+    for key in (0..300).step_by(7) {
+        avl.delete_key(Term::small(key).unwrap());
+        ca.delete_key(Term::small(key).unwrap());
+    }
+    assert_eq!(avl.len(), ca.len());
+    for index in 0..=avl.len() {
+        check(&avl, &ca, index);
+    }
+}

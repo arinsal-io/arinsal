@@ -1,7 +1,7 @@
 //! ETS hash storage with OTP's segmented linear-hash directory.
 
 use crate::rwmtx::{RwMtxLock, RwMtxReadGuard, RwMtxWriteGuard};
-use crate::{DbTerm, EtsError, StoredTerm, TableType, WriteConcurrency};
+use crate::{EtsError, HashDbTerm, StoredTerm, TableType, WriteConcurrency};
 use arinsal_term::{HeapAlloc, Term, global_atoms, internal_hash};
 use parking_lot::RwLock as FastRwLock;
 use std::collections::HashMap;
@@ -35,43 +35,64 @@ fn mix64(mut hash: u64) -> u64 {
     hash ^ (hash >> 33)
 }
 
-/// Port of `HashDbTerm` in erl_db_hash.h:41-49, OTP-29.1.1: the bucket link, the hash value and
-/// the `DbTerm` are one block.
-pub(super) type HashDbTerm = StoredTerm;
+/// Port of `HashNode` in erl_db_hash.h:41-49, OTP-29.1.1: the bucket link, the hash value and
+/// the `HashDbTerm` are one block.
+pub(super) type HashNode = crate::dbterm::Node<crate::dbterm::HashPrefix, [u64]>;
+
+/// What an update closure did with the object it was given.
+pub(super) enum StoreOutcome {
+    /// Nothing changed.
+    Nothing,
+    /// The found block was rewritten in place.
+    InPlace,
+    /// A new block replaces the found one, or is inserted when none was found.
+    New(HashDbTerm),
+}
+
+/// Storage policy for one synchronous source-term insertion into a hash table.
+#[derive(Clone, Copy)]
+pub(super) struct SourceInsertOptions {
+    pub(super) table_type: TableType,
+    pub(super) keypos: usize,
+    pub(super) compressed: bool,
+    pub(super) prefix_words: usize,
+    pub(super) fixed: bool,
+    pub(super) new_only: bool,
+}
 
 /// Port of the bucket head in `struct segment` in erl_db_hash.c.
 #[derive(Default)]
 pub(super) struct HashBucket {
-    head: Option<Box<HashDbTerm>>,
+    head: Option<HashDbTerm>,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct HashIter<'a> {
-    next: Option<&'a HashDbTerm>,
+    next: Option<&'a HashNode>,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct RawHashIter<'a> {
-    next: Option<&'a HashDbTerm>,
+    next: Option<&'a HashNode>,
 }
 
 impl<'a> Iterator for RawHashIter<'a> {
-    type Item = &'a HashDbTerm;
+    type Item = &'a HashNode;
 
     fn next(&mut self) -> Option<Self::Item> {
         let node = self.next?;
-        self.next = node.next.as_deref();
+        self.next = node.prefix.next.as_deref();
         Some(node)
     }
 }
 
 impl<'a> Iterator for HashIter<'a> {
-    type Item = &'a HashDbTerm;
+    type Item = &'a HashNode;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let node = self.next?;
-            self.next = node.next.as_deref();
-            if !node.pseudo_deleted {
+            self.next = node.prefix.next.as_deref();
+            if !node.prefix.pseudo_deleted {
                 return Some(node);
             }
         }
@@ -191,30 +212,30 @@ fn split_bucket(
     let (mut keep, mut moved) = (None, None);
     let (mut keep_tail, mut moved_tail) = (&mut keep, &mut moved);
     while let Some(mut node) = current {
-        current = node.next.take();
-        if node.pseudo_deleted {
+        current = node.prefix.next.take();
+        if node.prefix.pseudo_deleted {
             continue;
         }
-        if node.hvalue as usize & mask == new_slot {
+        if node.prefix.hvalue as usize & mask == new_slot {
             *moved_tail = Some(node);
-            moved_tail = &mut moved_tail.as_mut().unwrap().next;
+            moved_tail = &mut moved_tail.as_mut().unwrap().prefix.next;
         } else {
             *keep_tail = Some(node);
-            keep_tail = &mut keep_tail.as_mut().unwrap().next;
+            keep_tail = &mut keep_tail.as_mut().unwrap().prefix.next;
         }
     }
     source.head = keep;
     destination.head = moved;
 }
 
-fn purge_pseudo_deleted(mut current: Option<Box<HashDbTerm>>) -> Option<Box<HashDbTerm>> {
+fn purge_pseudo_deleted(mut current: Option<HashDbTerm>) -> Option<HashDbTerm> {
     let mut live = None;
     let mut tail = &mut live;
     while let Some(mut node) = current {
-        current = node.next.take();
-        if !node.pseudo_deleted {
+        current = node.prefix.next.take();
+        if !node.prefix.pseudo_deleted {
             *tail = Some(node);
-            tail = &mut tail.as_mut().unwrap().next;
+            tail = &mut tail.as_mut().unwrap().prefix.next;
         }
     }
     live
@@ -428,7 +449,7 @@ impl HashStorage {
     /// Insert a prepared object under its hash stripe.
     pub(super) fn insert_shared(
         &self,
-        mut object: DbTerm,
+        mut object: HashDbTerm,
         hash: u64,
         table_type: TableType,
         keypos: usize,
@@ -436,7 +457,7 @@ impl HashStorage {
         new_only: bool,
     ) -> bool {
         let hvalue = hash >> 1;
-        object.hvalue = hvalue;
+        object.prefix.hvalue = hvalue;
         let (accepted, added, memory_delta, _) =
             self.with_hash_bucket_mut(hvalue, |_slot, bucket| {
                 let next_order = || self.next_order.fetch_add(1, Ordering::Relaxed);
@@ -450,11 +471,63 @@ impl HashStorage {
         accepted
     }
 
+    /// Insert a live source term while holding its bucket write lock, so that a set overwrite
+    /// reuses the existing HashDbTerm block.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_put_hash), OTP-29.1.1.
+    pub(super) fn insert_term_shared(
+        &self,
+        term: Term,
+        key: Term,
+        hash: u64,
+        options: SourceInsertOptions,
+    ) -> Result<bool, EtsError> {
+        let hvalue = hash >> 1;
+        let (accepted, added, memory_delta, _) =
+            self.with_hash_bucket_mut(hvalue, |_slot, bucket| {
+                let next_order = || self.next_order.fetch_add(1, Ordering::Relaxed);
+                put_term_in_bucket(bucket, term, key, hvalue, options, next_order)
+            })?;
+        self.add_object_memory(hvalue, memory_delta);
+        if added {
+            self.add_items(hash, 1);
+            self.grow_after_insert(hash, options.fixed);
+        }
+        Ok(accepted)
+    }
+
+    /// Exclusive-table variant of [`Self::insert_term_shared`].
+    // Port of erts/emulator/beam/erl_db_hash.c (db_put_hash), OTP-29.1.1.
+    pub(super) fn insert_term_exclusive(
+        &mut self,
+        term: Term,
+        key: Term,
+        hash: u64,
+        options: SourceInsertOptions,
+    ) -> Result<bool, EtsError> {
+        let hvalue = hash >> 1;
+        let slot = self.slot_index(hvalue);
+        let order = self.next_order.fetch_add(1, Ordering::Relaxed);
+        let (accepted, added, memory_delta, _) = put_term_in_bucket(
+            self.segment_bucket_mut(slot),
+            term,
+            key,
+            hvalue,
+            options,
+            || order,
+        )?;
+        self.add_object_memory(hvalue, memory_delta);
+        if added {
+            self.add_items(hash, 1);
+            self.maybe_grow(options.fixed, options.keypos);
+        }
+        Ok(accepted)
+    }
+
     /// Insert a prepared object into the bucket owned by the caller's exclusive table lock.
     // Port of erts/emulator/beam/erl_db_hash.c (db_put_hash), OTP-29.1.1.
     pub(super) fn insert_exclusive(
         &mut self,
-        mut object: DbTerm,
+        mut object: HashDbTerm,
         hash: u64,
         table_type: TableType,
         keypos: usize,
@@ -462,7 +535,7 @@ impl HashStorage {
         new_only: bool,
     ) -> bool {
         let hvalue = hash >> 1;
-        object.hvalue = hvalue;
+        object.prefix.hvalue = hvalue;
         let slot = self.slot_index(hvalue);
         let order = self.next_order.fetch_add(1, Ordering::Relaxed);
         let (accepted, added, memory_delta, _) = put_in_bucket(
@@ -484,7 +557,7 @@ impl HashStorage {
     /// `insert_exclusive` with the extra hash-bag comparison reductions reported by erts.
     pub(super) fn insert_exclusive_counted(
         &mut self,
-        mut object: DbTerm,
+        mut object: HashDbTerm,
         hash: u64,
         table_type: TableType,
         keypos: usize,
@@ -492,7 +565,7 @@ impl HashStorage {
         new_only: bool,
     ) -> (bool, usize) {
         let hvalue = hash >> 1;
-        object.hvalue = hvalue;
+        object.prefix.hvalue = hvalue;
         let slot = self.slot_index(hvalue);
         // The caller owns the table, so taking the order up front cannot reorder inserts.
         let order = self.next_order.fetch_add(1, Ordering::Relaxed);
@@ -558,13 +631,13 @@ impl HashStorage {
             let mut node = bucket.head.as_deref_mut();
             let object = loop {
                 let current = node?;
-                if !current.pseudo_deleted
-                    && current.hvalue == hash >> 1
+                if !current.prefix.pseudo_deleted
+                    && current.prefix.hvalue == hash >> 1
                     && exact_key(current.key(keypos), key)
                 {
                     break current;
                 }
-                node = current.next.as_deref_mut();
+                node = current.prefix.next.as_deref_mut();
             };
             if !object.compressed_elements().is_empty() {
                 return None;
@@ -610,40 +683,46 @@ impl HashStorage {
         hash: u64,
         keypos: usize,
         fixed: bool,
-        update: impl FnOnce(Option<&StoredTerm>) -> Result<Option<DbTerm>, E>,
+        update: impl FnOnce(Option<&mut HashDbTerm>) -> Result<StoreOutcome, E>,
     ) -> Result<bool, E> {
         let hvalue = hash >> 1;
         let mut update = Some(update);
         let (changed, inserted, memory_delta) =
             self.with_hash_bucket_mut(hvalue, |_slot, bucket| {
                 let mut link = &mut bucket.head;
-                while link
-                    .as_ref()
-                    .is_some_and(|node| node.hvalue != hvalue || !exact_key(node.key(keypos), key))
-                {
-                    link = &mut link.as_mut().unwrap().next;
+                while link.as_ref().is_some_and(|node| {
+                    node.prefix.hvalue != hvalue || !exact_key(node.key(keypos), key)
+                }) {
+                    link = &mut link.as_mut().unwrap().prefix.next;
                 }
-                let found = link
-                    .as_ref()
-                    .filter(|node| !node.pseudo_deleted)
-                    .map(|node| &**node);
-                let Some(mut replacement) = update.take().unwrap()(found)? else {
-                    return Ok((false, false, 0));
+                let found = link.as_mut().filter(|node| !node.prefix.pseudo_deleted);
+                let old_words = found.as_ref().map(|node| node.db_size_words);
+                let outcome = update.take().unwrap()(found)?;
+                let mut replacement = match outcome {
+                    StoreOutcome::Nothing => return Ok((false, false, 0)),
+                    StoreOutcome::InPlace => {
+                        // The found block was rewritten (`replace_dbterm`).
+                        let node = link.as_ref().expect("an in-place update found a node");
+                        let delta = node.db_size_words as isize
+                            - old_words.expect("an in-place update found a node") as isize;
+                        return Ok((true, false, delta));
+                    }
+                    StoreOutcome::New(replacement) => replacement,
                 };
-                replacement.hvalue = hvalue;
+                replacement.prefix.hvalue = hvalue;
                 if let Some(node) = link.as_mut() {
-                    let revived = node.pseudo_deleted;
+                    let revived = node.prefix.pseudo_deleted;
                     let memory_delta = replacement.db_size_words as isize
                         - if revived {
                             0
                         } else {
                             node.db_size_words as isize
                         };
-                    replacement.order = node.order;
-                    replacement.group_order = node.group_order;
+                    replacement.prefix.order = node.prefix.order;
+                    replacement.prefix.group_order = node.prefix.group_order;
                     // Port of erl_db_hash.c (db_put_hash): the new block takes the old one's
                     // place in the chain.
-                    replacement.next = node.next.take();
+                    replacement.prefix.next = node.prefix.next.take();
                     *link = Some(replacement);
                     if revived {
                         self.add_items(hash, 1);
@@ -652,9 +731,9 @@ impl HashStorage {
                     return Ok((true, false, memory_delta));
                 }
                 let memory_delta = replacement.db_size_words as isize;
-                replacement.order = self.next_order.fetch_add(1, Ordering::Relaxed);
-                replacement.group_order = replacement.order;
-                replacement.next = link.take();
+                replacement.prefix.order = self.next_order.fetch_add(1, Ordering::Relaxed);
+                replacement.prefix.group_order = replacement.prefix.order;
+                replacement.prefix.next = link.take();
                 *link = Some(replacement);
                 self.add_items(hash, 1);
                 Ok((true, true, memory_delta))
@@ -775,28 +854,28 @@ impl HashStorage {
         key: Term,
         hash: u64,
         keypos: usize,
-        mut replace: impl FnMut(&StoredTerm) -> Result<Option<DbTerm>, E>,
+        mut replace: impl FnMut(&StoredTerm) -> Result<Option<HashDbTerm>, E>,
     ) -> Result<usize, E> {
         let (count, memory_delta) = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
             let mut count = 0;
             let mut memory_delta = 0;
             let mut link = &mut bucket.head;
             while let Some(current) = link.as_mut() {
-                if !current.pseudo_deleted
-                    && current.hvalue == hash >> 1
+                if !current.prefix.pseudo_deleted
+                    && current.prefix.hvalue == hash >> 1
                     && exact_key(current.key(keypos), key)
                     && let Some(mut replacement) = replace(current)?
                 {
                     memory_delta +=
                         replacement.db_size_words as isize - current.db_size_words as isize;
-                    replacement.order = current.order;
-                    replacement.group_order = current.group_order;
-                    replacement.hvalue = current.hvalue;
-                    replacement.next = current.next.take();
+                    replacement.prefix.order = current.prefix.order;
+                    replacement.prefix.group_order = current.prefix.group_order;
+                    replacement.prefix.hvalue = current.prefix.hvalue;
+                    replacement.prefix.next = current.prefix.next.take();
                     *link = Some(replacement);
                     count += 1;
                 }
-                link = &mut link.as_mut().unwrap().next;
+                link = &mut link.as_mut().unwrap().prefix.next;
             }
             Ok((count, memory_delta))
         })?;
@@ -840,10 +919,10 @@ impl HashStorage {
             let mut source_head = buckets[source_index].head.take();
             if let Some(mut head) = source_head.take() {
                 let mut tail = &mut head;
-                while tail.next.is_some() {
-                    tail = tail.next.as_mut().unwrap();
+                while tail.prefix.next.is_some() {
+                    tail = tail.prefix.next.as_mut().unwrap();
                 }
-                tail.next = buckets[destination_index].head.take();
+                tail.prefix.next = buckets[destination_index].head.take();
                 buckets[destination_index].head = purge_pseudo_deleted(Some(head));
             }
             drop(buckets);
@@ -1022,7 +1101,7 @@ impl HashStorage {
                         next: bucket.head.as_deref(),
                     }) {
                         length += 1;
-                        kept += usize::from(node.pseudo_deleted);
+                        kept += usize::from(node.prefix.pseudo_deleted);
                     }
                     length
                 })
@@ -1065,13 +1144,13 @@ impl HashStorage {
         let slot = self.slot_index(hval >> 1);
         let mut next = self.segment_bucket_mut(slot).head.as_deref_mut();
         while let Some(node) = next {
-            if !node.pseudo_deleted
-                && node.hvalue == hval >> 1
+            if !node.prefix.pseudo_deleted
+                && node.prefix.hvalue == hval >> 1
                 && arinsal_term::exact_eq(node.key(keypos), key)
             {
                 return Some(node);
             }
-            next = node.next.as_deref_mut();
+            next = node.prefix.next.as_deref_mut();
         }
         None
     }
@@ -1108,12 +1187,12 @@ impl HashStorage {
                     next: bucket.head.as_deref(),
                 }) {
                     if !found {
-                        if node.hvalue == hash && exact_key(node.key(keypos), key) {
+                        if node.prefix.hvalue == hash && exact_key(node.key(keypos), key) {
                             found = true;
                         }
                         continue;
                     }
-                    if node.hvalue != hash || !exact_key(node.key(keypos), key) {
+                    if node.prefix.hvalue != hash || !exact_key(node.key(keypos), key) {
                         successor = Some(node.key(keypos));
                         break;
                     }
@@ -1150,8 +1229,8 @@ impl HashStorage {
         loop {
             let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
             while let Some(current) = node {
-                current.pseudo_deleted = true;
-                node = current.next.as_deref_mut();
+                current.prefix.pseudo_deleted = true;
+                node = current.prefix.next.as_deref_mut();
             }
             slot += 1;
             *loops -= 1;
@@ -1166,8 +1245,8 @@ impl HashStorage {
         for slot in 0..self.nactive() {
             let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
             while let Some(current) = node {
-                current.pseudo_deleted = true;
-                node = current.next.as_deref_mut();
+                current.prefix.pseudo_deleted = true;
+                node = current.prefix.next.as_deref_mut();
             }
         }
     }
@@ -1246,7 +1325,7 @@ impl HashStorage {
     /// Replace live objects in place, keeping their bucket position and insertion order.
     pub(super) fn replace_each(
         &mut self,
-        mut replace: impl FnMut(&StoredTerm) -> Result<Option<DbTerm>, EtsError>,
+        mut replace: impl FnMut(&StoredTerm) -> Result<Option<HashDbTerm>, EtsError>,
     ) -> Result<usize, EtsError> {
         let mut count = 0;
         for slot in 0..self.nactive() {
@@ -1254,19 +1333,19 @@ impl HashStorage {
             let mut memory_delta = 0;
             let mut link = &mut self.segment_bucket_mut(slot).head;
             while let Some(current) = link.as_mut() {
-                if !current.pseudo_deleted
+                if !current.prefix.pseudo_deleted
                     && let Some(mut replacement) = replace(current)?
                 {
                     memory_delta +=
                         replacement.db_size_words as isize - current.db_size_words as isize;
-                    replacement.order = current.order;
-                    replacement.group_order = current.group_order;
-                    replacement.hvalue = current.hvalue;
-                    replacement.next = current.next.take();
+                    replacement.prefix.order = current.prefix.order;
+                    replacement.prefix.group_order = current.prefix.group_order;
+                    replacement.prefix.hvalue = current.prefix.hvalue;
+                    replacement.prefix.next = current.prefix.next.take();
                     *link = Some(replacement);
                     count += 1;
                 }
-                link = &mut link.as_mut().unwrap().next;
+                link = &mut link.as_mut().unwrap().prefix.next;
             }
             self.stripes[stripe_ix]
                 .memory_words
@@ -1291,22 +1370,22 @@ impl HashStorage {
             let stripe_ix = self.stripe_index(slot);
             let mut link = &mut self.segment_bucket_mut(slot).head;
             while let Some(mut node) = link.take() {
-                let selected = if node.pseudo_deleted {
+                let selected = if node.prefix.pseudo_deleted {
                     Ok(false)
                 } else {
                     predicate(&node)
                 };
                 match selected {
                     Ok(true) => {
-                        let counter = node.hvalue as usize % NLOCKS_WITH_ITEM_COUNTERS;
-                        *link = node.next.take();
+                        let counter = node.prefix.hvalue as usize % NLOCKS_WITH_ITEM_COUNTERS;
+                        *link = node.prefix.next.take();
                         removed += 1;
                         per_lock[counter] += 1;
                         per_stripe[stripe_ix] -= node.db_size_words as isize;
                     }
                     Ok(false) => {
                         *link = Some(node);
-                        link = &mut link.as_mut().unwrap().next;
+                        link = &mut link.as_mut().unwrap().prefix.next;
                     }
                     Err(error) => {
                         *link = Some(node);
@@ -1358,8 +1437,8 @@ impl HashStorage {
             for node in (RawHashIter {
                 next: bucket.head.as_deref(),
             }) {
-                if with_deleted || !node.pseudo_deleted {
-                    visit(node, node.pseudo_deleted)?;
+                if with_deleted || !node.prefix.pseudo_deleted {
+                    visit(node, node.prefix.pseudo_deleted)?;
                 }
             }
             Ok(())
@@ -1379,7 +1458,7 @@ impl HashStorage {
                     next: bucket.head.as_deref(),
                 }
                 .next()
-                .map(&mut visit)
+                .map(|node| visit(node))
             }) {
                 return Some(result);
             }
@@ -1435,13 +1514,13 @@ impl HashStorage {
         let mut keep_tail = &mut keep_head;
         let mut moved_tail = &mut moved_head;
         while let Some(mut node) = current {
-            current = node.next.take();
-            if node.hvalue as usize & mask == new_slot {
+            current = node.prefix.next.take();
+            if node.prefix.hvalue as usize & mask == new_slot {
                 *moved_tail = Some(node);
-                moved_tail = &mut moved_tail.as_mut().unwrap().next;
+                moved_tail = &mut moved_tail.as_mut().unwrap().prefix.next;
             } else {
                 *keep_tail = Some(node);
-                keep_tail = &mut keep_tail.as_mut().unwrap().next;
+                keep_tail = &mut keep_tail.as_mut().unwrap().prefix.next;
             }
         }
         self.segment_bucket_mut(source).head = keep_head;
@@ -1474,10 +1553,10 @@ impl HashStorage {
         let mut source_head = self.segment_bucket_mut(source).head.take();
         if let Some(mut head) = source_head.take() {
             let mut tail = &mut head;
-            while tail.next.is_some() {
-                tail = tail.next.as_mut().unwrap();
+            while tail.prefix.next.is_some() {
+                tail = tail.prefix.next.as_mut().unwrap();
             }
-            tail.next = self.segment_bucket_mut(destination).head.take();
+            tail.prefix.next = self.segment_bucket_mut(destination).head.take();
             self.segment_bucket_mut(destination).head = Some(head);
         }
         let nslots = self.nslots.load(Ordering::Relaxed);
@@ -1508,20 +1587,20 @@ impl HashStorage {
                 };
                 let mut last_group = None;
                 for object in ordered {
-                    if last_group != Some(object.group_order) {
+                    if last_group != Some(object.prefix.group_order) {
                         rank += 1;
-                        last_group = Some(object.group_order);
+                        last_group = Some(object.prefix.group_order);
                     }
-                    ranks.insert(object.order, rank);
+                    ranks.insert(object.prefix.order, rank);
                 }
             }
             for slot in [source, destination] {
                 let mut link = &mut self.segment_bucket_mut(slot).head;
                 while let Some(object) = link {
-                    if let Some(&rank) = ranks.get(&object.order) {
-                        object.group_order = rank;
+                    if let Some(&rank) = ranks.get(&object.prefix.order) {
+                        object.prefix.group_order = rank;
                     }
-                    link = &mut object.next;
+                    link = &mut object.prefix.next;
                 }
             }
             self.shrink();
@@ -1692,7 +1771,7 @@ impl ConcurrentHashStorage {
 
     pub(super) fn insert(
         &self,
-        mut object: DbTerm,
+        mut object: HashDbTerm,
         hash: u64,
         table_type: TableType,
         keypos: usize,
@@ -1722,15 +1801,15 @@ impl ConcurrentHashStorage {
         };
         let bucket = slot.bucket_mut(index);
         let key = object.key(keypos);
-        object.hvalue = hvalue;
+        object.prefix.hvalue = hvalue;
         let mut cursor = &mut bucket.head;
         while let Some(node) = cursor {
-            if node.hvalue == hvalue && exact_key(node.key(keypos), key) {
+            if node.prefix.hvalue == hvalue && exact_key(node.key(keypos), key) {
                 match table_type {
                     TableType::Set => {
-                        object.order = node.order;
-                        object.group_order = node.group_order;
-                        object.next = node.next.take();
+                        object.prefix.order = node.prefix.order;
+                        object.prefix.group_order = node.prefix.group_order;
+                        object.prefix.next = node.prefix.next.take();
                         *cursor = Some(object);
                         return;
                     }
@@ -1740,9 +1819,9 @@ impl ConcurrentHashStorage {
                     TableType::OrderedSet => unreachable!(),
                 }
             }
-            cursor = &mut cursor.as_mut().unwrap().next;
+            cursor = &mut cursor.as_mut().unwrap().prefix.next;
         }
-        object.next = bucket.head.take();
+        object.prefix.next = bucket.head.take();
         bucket.head = Some(object);
         locks[lock_ix].nitems.fetch_add(1, Ordering::Relaxed);
         let local_items = locks[lock_ix].nitems.load(Ordering::Relaxed);
@@ -1791,7 +1870,7 @@ impl ConcurrentHashStorage {
             let mut node = head.as_deref();
             while let Some(current) = node {
                 count += 1;
-                node = current.next.as_deref();
+                node = current.prefix.next.as_deref();
             }
             replacement[new_lock]
                 .buckets
@@ -1865,13 +1944,13 @@ impl ConcurrentHashStorage {
             let (mut keep, mut moved) = (None, None);
             let (mut keep_tail, mut moved_tail) = (&mut keep, &mut moved);
             while let Some(mut node) = current {
-                current = node.next.take();
-                if node.hvalue as usize & split_mask == destination {
+                current = node.prefix.next.take();
+                if node.prefix.hvalue as usize & split_mask == destination {
                     *moved_tail = Some(node);
-                    moved_tail = &mut moved_tail.as_mut().unwrap().next;
+                    moved_tail = &mut moved_tail.as_mut().unwrap().prefix.next;
                 } else {
                     *keep_tail = Some(node);
-                    keep_tail = &mut keep_tail.as_mut().unwrap().next;
+                    keep_tail = &mut keep_tail.as_mut().unwrap().prefix.next;
                 }
             }
             buckets.bucket_mut(source).head = keep;
@@ -1884,14 +1963,14 @@ impl ConcurrentHashStorage {
             destination_guard.ensure_global_slot(destination);
             let mut current = source_guard.bucket_mut(source).head.take();
             while let Some(mut node) = current {
-                current = node.next.take();
-                if node.hvalue as usize & split_mask == destination {
+                current = node.prefix.next.take();
+                if node.prefix.hvalue as usize & split_mask == destination {
                     let target = destination_guard.bucket_mut(destination);
-                    node.next = target.head.take();
+                    node.prefix.next = target.head.take();
                     target.head = Some(node);
                 } else {
                     let target = source_guard.bucket_mut(source);
-                    node.next = target.head.take();
+                    node.prefix.next = target.head.take();
                     target.head = Some(node);
                 }
             }
@@ -1922,10 +2001,10 @@ impl ConcurrentHashStorage {
         let mut results = Vec::new();
         let mut node = bucket.head.as_deref();
         while let Some(current) = node {
-            if current.hvalue == hash >> 1 && exact_key(current.key(keypos), key) {
+            if current.prefix.hvalue == hash >> 1 && exact_key(current.key(keypos), key) {
                 results.push(current.copy_out(dst)?);
             }
-            node = current.next.as_deref();
+            node = current.prefix.next.as_deref();
         }
         results.reverse();
         Ok(results)
@@ -1944,10 +2023,10 @@ impl ConcurrentHashStorage {
         };
         let mut node = guard.bucket(index).head.as_deref();
         while let Some(current) = node {
-            if current.hvalue == hash >> 1 && exact_key(current.key(keypos), key) {
+            if current.prefix.hvalue == hash >> 1 && exact_key(current.key(keypos), key) {
                 return true;
             }
-            node = current.next.as_deref();
+            node = current.prefix.next.as_deref();
         }
         false
     }
@@ -1967,12 +2046,12 @@ impl ConcurrentHashStorage {
         let mut link = &mut guard.bucket_mut(index).head;
         let mut removed = 0;
         while let Some(mut node) = link.take() {
-            if node.hvalue == hash >> 1 && exact_key(node.key(keypos), key) {
-                *link = node.next.take();
+            if node.prefix.hvalue == hash >> 1 && exact_key(node.key(keypos), key) {
+                *link = node.prefix.next.take();
                 removed += 1;
             } else {
                 *link = Some(node);
-                link = &mut link.as_mut().unwrap().next;
+                link = &mut link.as_mut().unwrap().prefix.next;
             }
         }
         locks[lock_ix].nitems.fetch_sub(removed, Ordering::Relaxed);
@@ -1992,37 +2071,38 @@ impl ConcurrentHashStorage {
 // Port of erts/emulator/beam/erl_db_hash.c (db_put_hash), OTP-29.1.1.
 fn put_in_bucket(
     bucket: &mut HashBucket,
-    mut object: DbTerm,
+    mut object: HashDbTerm,
     table_type: TableType,
     keypos: usize,
     new_only: bool,
     next_order: impl FnOnce() -> u64,
 ) -> (bool, bool, isize, usize) {
-    let hvalue = object.hvalue;
+    let hvalue = object.prefix.hvalue;
     let key = object.key(keypos);
-    let has_key = |node: &HashDbTerm| node.hvalue == hvalue && exact_key(node.key(keypos), key);
+    let has_key =
+        |node: &HashNode| node.prefix.hvalue == hvalue && exact_key(node.key(keypos), key);
     let mut link = &mut bucket.head;
     let mut extra_reds = 0;
     while link.as_ref().is_some_and(|node| !has_key(node)) {
-        link = &mut link.as_mut().unwrap().next;
+        link = &mut link.as_mut().unwrap().prefix.next;
     }
-    let group_order = link.as_ref().map(|node| node.group_order);
+    let group_order = link.as_ref().map(|node| node.prefix.group_order);
     if table_type == TableType::Set
         && let Some(node) = link.as_mut()
     {
-        if new_only && !node.pseudo_deleted {
+        if new_only && !node.prefix.pseudo_deleted {
             return (false, false, 0, 0);
         }
         let memory_delta = object.db_size_words as isize
-            - if node.pseudo_deleted {
+            - if node.prefix.pseudo_deleted {
                 0
             } else {
                 node.db_size_words as isize
             };
-        object.order = node.order;
-        object.group_order = node.group_order;
-        let revived = node.pseudo_deleted;
-        object.next = node.next.take();
+        object.prefix.order = node.prefix.order;
+        object.prefix.group_order = node.prefix.group_order;
+        let revived = node.prefix.pseudo_deleted;
+        object.prefix.next = node.prefix.next.take();
         *link = Some(object);
         return (true, revived, memory_delta, 0);
     }
@@ -2031,10 +2111,10 @@ fn put_in_bucket(
         // never revives one of them.
         let mut node = link.as_deref();
         while let Some(current) = node.filter(|node| has_key(node)) {
-            if !current.pseudo_deleted {
+            if !current.prefix.pseudo_deleted {
                 return (false, false, 0, 0);
             }
-            node = current.next.as_deref();
+            node = current.prefix.next.as_deref();
         }
     } else if table_type == TableType::Bag {
         let mut cursor = &mut *link;
@@ -2043,36 +2123,131 @@ fn put_in_bucket(
         let mut memory_delta = 0;
         while let Some(node) = cursor.as_deref_mut().filter(|node| has_key(node)) {
             if node.exact_eq_stored(&object) {
-                if !node.pseudo_deleted {
+                if !node.prefix.pseudo_deleted {
                     return (true, false, 0, extra_reds);
                 }
                 memory_delta = object.db_size_words as isize;
-                node.pseudo_deleted = false;
+                node.prefix.pseudo_deleted = false;
                 if at_group_head {
                     return (true, true, memory_delta, extra_reds);
                 }
                 // Move to the head of the key's run to preserve key insertion order.
                 let mut node = cursor.take().unwrap();
-                *cursor = node.next.take();
+                *cursor = node.prefix.next.take();
                 revived = Some(node);
                 break;
             }
-            cursor = &mut cursor.as_mut().unwrap().next;
+            cursor = &mut cursor.as_mut().unwrap().prefix.next;
             at_group_head = false;
             extra_reds += 1;
         }
         if let Some(mut node) = revived {
-            node.next = link.take();
+            node.prefix.next = link.take();
             *link = Some(node);
             return (true, true, memory_delta, extra_reds);
         }
     }
     let memory_delta = object.db_size_words as isize;
-    object.order = next_order();
-    object.group_order = group_order.unwrap_or(object.order);
-    object.next = link.take();
+    object.prefix.order = next_order();
+    object.prefix.group_order = group_order.unwrap_or(object.prefix.order);
+    object.prefix.next = link.take();
     *link = Some(object);
     (true, true, memory_delta, extra_reds)
+}
+
+/// Insert a source term at the point where erts receives the caller's heap object.
+// Port of erts/emulator/beam/erl_db_hash.c (db_put_hash), OTP-29.1.1.
+fn put_term_in_bucket(
+    bucket: &mut HashBucket,
+    term: Term,
+    key: Term,
+    hvalue: u64,
+    options: SourceInsertOptions,
+    next_order: impl FnOnce() -> u64,
+) -> Result<(bool, bool, isize, usize), EtsError> {
+    let has_key =
+        |node: &HashNode| node.prefix.hvalue == hvalue && exact_key(node.key(options.keypos), key);
+    let mut link = &mut bucket.head;
+    while link.as_ref().is_some_and(|node| !has_key(node)) {
+        link = &mut link.as_mut().unwrap().prefix.next;
+    }
+    let group_order = link.as_ref().map(|node| node.prefix.group_order);
+
+    if options.table_type == TableType::Set
+        && let Some(node) = link.as_mut()
+    {
+        if options.new_only && !node.prefix.pseudo_deleted {
+            return Ok((false, false, 0, 0));
+        }
+        let revived = node.prefix.pseudo_deleted;
+        let old_words = node.db_size_words;
+        // replace_dbterm: the stored term is rewritten in the existing block.
+        StoredTerm::overwrite_from_input(
+            node,
+            term,
+            options.compressed,
+            options.keypos,
+            options.prefix_words,
+        )?;
+        node.prefix.hvalue = hvalue;
+        node.prefix.pseudo_deleted = false;
+        let memory_delta =
+            node.db_size_words as isize - if revived { 0 } else { old_words as isize };
+        return Ok((true, revived, memory_delta, 0));
+    }
+
+    if options.new_only {
+        // key_clash_fail accepts only a key run containing pseudo-deleted rows.
+        let mut node = link.as_deref();
+        while let Some(current) = node.filter(|node| has_key(node)) {
+            if !current.prefix.pseudo_deleted {
+                return Ok((false, false, 0, 0));
+            }
+            node = current.prefix.next.as_deref();
+        }
+    } else if options.table_type == TableType::Bag {
+        let mut cursor = &mut *link;
+        let mut at_group_head = true;
+        let mut revived = None;
+        let mut memory_delta = 0;
+        while let Some(node) = cursor.as_deref_mut().filter(|node| has_key(node)) {
+            if node.exact_eq_input(term) {
+                if !node.prefix.pseudo_deleted {
+                    return Ok((true, false, 0, 0));
+                }
+                memory_delta = node.db_size_words as isize;
+                node.prefix.pseudo_deleted = false;
+                if at_group_head {
+                    return Ok((true, true, memory_delta, 0));
+                }
+                let mut node = cursor.take().unwrap();
+                *cursor = node.prefix.next.take();
+                revived = Some(node);
+                break;
+            }
+            cursor = &mut cursor.as_mut().unwrap().prefix.next;
+            at_group_head = false;
+        }
+        if let Some(mut node) = revived {
+            node.prefix.next = link.take();
+            *link = Some(node);
+            return Ok((true, true, memory_delta, 0));
+        }
+    }
+
+    let mut object = StoredTerm::copy_for_table::<crate::HashPrefix>(
+        term,
+        options.compressed,
+        options.keypos,
+        options.prefix_words,
+    )?;
+    object.prefix.hvalue = hvalue;
+    object.prefix.order = next_order();
+    object.prefix.group_order = group_order.unwrap_or(object.prefix.order);
+    let memory_delta = object.db_size_words as isize;
+    object.prefix.next = link.take();
+    *link = Some(object);
+    Ok((true, true, memory_delta, 0))
 }
 
 /// The bucket walk of `db_erase_hash`; returns the number of items removed from the count.
@@ -2088,25 +2263,28 @@ fn erase_in_bucket(
     let mut count = 0;
     let mut memory_delta = 0;
     while let Some(mut node) = link.take() {
-        if !node.pseudo_deleted && node.hvalue == hvalue && exact_key(node.key(keypos), key) {
+        if !node.prefix.pseudo_deleted
+            && node.prefix.hvalue == hvalue
+            && exact_key(node.key(keypos), key)
+        {
             count += 1;
             memory_delta -= node.db_size_words as isize;
             if count == 1 && fixed {
                 // Pseudo remove (no need to keep several of the same key).
-                node.pseudo_deleted = true;
+                node.prefix.pseudo_deleted = true;
                 *link = Some(node);
-                link = &mut link.as_mut().unwrap().next;
+                link = &mut link.as_mut().unwrap().prefix.next;
             } else {
-                *link = node.next.take();
+                *link = node.prefix.next.take();
             }
             continue;
         }
-        let stop = count != 0 && !node.pseudo_deleted;
+        let stop = count != 0 && !node.prefix.pseudo_deleted;
         *link = Some(node);
         if stop {
             break;
         }
-        link = &mut link.as_mut().unwrap().next;
+        link = &mut link.as_mut().unwrap().prefix.next;
     }
     (count, memory_delta)
 }
@@ -2126,30 +2304,30 @@ fn erase_object_in_bucket(
     let (mut count, mut nkeys) = (0, 0);
     let mut memory_delta = 0;
     while let Some(mut node) = link.take() {
-        let same_key = node.hvalue == hvalue && exact_key(node.key(keypos), key);
-        if same_key && !node.pseudo_deleted {
+        let same_key = node.prefix.hvalue == hvalue && exact_key(node.key(keypos), key);
+        if same_key && !node.prefix.pseudo_deleted {
             nkeys += 1;
             if node.exact_eq_term(object) {
                 count += 1;
                 memory_delta -= node.db_size_words as isize;
                 if nkeys == 1 && fixed {
-                    node.pseudo_deleted = true;
+                    node.prefix.pseudo_deleted = true;
                     *link = Some(node);
-                    link = &mut link.as_mut().unwrap().next;
+                    link = &mut link.as_mut().unwrap().prefix.next;
                 } else {
-                    *link = node.next.take();
+                    *link = node.prefix.next.take();
                 }
                 if table_type == TableType::DuplicateBag {
                     continue;
                 }
                 break;
             }
-        } else if count != 0 && !node.pseudo_deleted {
+        } else if count != 0 && !node.prefix.pseudo_deleted {
             *link = Some(node);
             break;
         }
         *link = Some(node);
-        link = &mut link.as_mut().unwrap().next;
+        link = &mut link.as_mut().unwrap().prefix.next;
     }
     (count, memory_delta)
 }
@@ -2167,32 +2345,33 @@ fn take_in_bucket<H: HeapAlloc>(
     dst: &mut H,
 ) -> Result<(Vec<Term>, isize, isize), EtsError> {
     let multi = matches!(table_type, TableType::Bag | TableType::DuplicateBag);
-    let has_key = |node: &HashDbTerm| node.hvalue == hvalue && exact_key(node.key(keypos), key);
+    let has_key =
+        |node: &HashNode| node.prefix.hvalue == hvalue && exact_key(node.key(keypos), key);
     let mut values = Vec::new();
     // The first live node, then (bag types) every following node of the same key:
     // get_term_list's `bend` also spans pseudo-deleted ones, which are counted below.
     let mut link = &mut bucket.head;
     while link
         .as_ref()
-        .is_some_and(|node| node.pseudo_deleted || !has_key(node))
+        .is_some_and(|node| node.prefix.pseudo_deleted || !has_key(node))
     {
-        link = &mut link.as_mut().unwrap().next;
+        link = &mut link.as_mut().unwrap().prefix.next;
     }
     let mut count = 0;
     let mut memory_delta = 0;
     while let Some(mut node) = link.take() {
-        if !node.pseudo_deleted {
+        if !node.prefix.pseudo_deleted {
             values.push(node.copy_out(dst)?);
             memory_delta -= node.db_size_words as isize;
         }
         count += 1;
         // Pseudo remove only the first node (no need to keep several of the same key).
         if fixed && count == 1 {
-            node.pseudo_deleted = true;
+            node.prefix.pseudo_deleted = true;
             *link = Some(node);
-            link = &mut link.as_mut().unwrap().next;
+            link = &mut link.as_mut().unwrap().prefix.next;
         } else {
-            *link = node.next.take();
+            *link = node.prefix.next.take();
         }
         if !multi || !link.as_ref().is_some_and(|next| has_key(next)) {
             break;
@@ -2224,7 +2403,7 @@ impl HashGarbage {
             for bucket in segment.iter_mut() {
                 let mut node = bucket.head.take();
                 while let Some(mut current) = node {
-                    node = current.next.take();
+                    node = current.prefix.next.take();
                     records += 1;
                 }
             }
