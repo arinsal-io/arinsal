@@ -49,6 +49,7 @@ pub type MapResult<T> = Result<T, MapError>;
 #[derive(Clone, Copy)]
 pub struct CheckedMap {
     map: Term,
+    header: u64,
 }
 
 /// The flatmap or HAMT branch selected after checking a map's tag.
@@ -84,13 +85,13 @@ impl CheckedMap {
     /// Looks up a key without repeating the map tag check.
     // Port of erts/emulator/beam/erl_map.c:2424-2474 (erts_maps_get), OTP-29.1.1.
     pub fn get(self, key: Term) -> Option<Term> {
-        lookup(self.map, key)
+        lookup_header(self.map, key, self.header)
     }
 
     /// Selects flatmap or HAMT storage after the map tag check.
     #[inline(always)]
     pub fn kind(self) -> CheckedMapKind {
-        if self.map.is_hashmap() {
+        if self.header & 0xc0 != 0 {
             CheckedMapKind::Hashmap(CheckedHashMap(self))
         } else {
             CheckedMapKind::Flatmap(CheckedFlatMap(self))
@@ -145,11 +146,14 @@ fn cons(ptr: *mut u64) -> Term {
 }
 fn check(map: Term) -> MapResult<()> {
     // Port of erts/emulator/beam/erl_term.h:1317 (is_map), OTP-29.1.1.
-    if map.header().is_some_and(|header| header & 63 == MAP) {
-        Ok(())
-    } else {
-        Err(MapError::Badmap(map))
-    }
+    checked_header(map).map(|_| ())
+}
+
+#[inline(always)]
+fn checked_header(map: Term) -> MapResult<u64> {
+    map.header()
+        .filter(|header| header & 63 == MAP)
+        .ok_or(MapError::Badmap(map))
 }
 
 const ATOM_TAG: u64 = 0x0b;
@@ -331,17 +335,19 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
             if header_word & 63 == 0 {
                 let arity = (header_word >> 6) as usize;
                 let mut index = 0;
+                let mut found = false;
                 while index < arity {
                     let leaf = term(*ptr.add(1 + index));
                     let candidate = term(*leaf.raw_ptr());
                     match exact_cmp(key, candidate, false) {
-                        Ordering::Equal => break,
                         Ordering::Less => break,
+                        Ordering::Equal => {
+                            found = true;
+                            break;
+                        }
                         Ordering::Greater => index += 1,
                     }
                 }
-                let found =
-                    index < arity && exact_eq(term(*term(*ptr.add(1 + index)).raw_ptr()), key);
                 if !found && is_update {
                     return Err(MapError::Badkey(key));
                 }
@@ -858,8 +864,8 @@ fn collect(node: Term, out: &mut Vec<(Term, Term)>) {
 // Port of erts/emulator/beam/erl_map.c:3636-3710, OTP-29.1.1.
 #[inline(always)]
 pub fn checked_map(map: Term) -> MapResult<CheckedMap> {
-    check(map)?;
-    Ok(CheckedMap { map })
+    let header = checked_header(map)?;
+    Ok(CheckedMap { map, header })
 }
 
 /// `map_size(Map)`.
@@ -870,8 +876,8 @@ pub fn size(map: Term) -> MapResult<usize> {
 /// Lookup; `Ok(None)` when the key is absent.
 #[inline]
 pub fn get(map: Term, key: Term) -> MapResult<Option<Term>> {
-    check(map)?;
-    Ok(lookup(map, key))
+    let header = checked_header(map)?;
+    Ok(lookup_header(map, key, header))
 }
 
 /// Fetches BEAM's staged `{key, destination, hash}` map-element triplets.
@@ -963,17 +969,7 @@ pub fn get_map_elements_with(
     }
 }
 
-/// Looks `key` up in a checked map.
-// Port of erts/emulator/beam/erl_map.c:185-223 (erts_maps_get), OTP-29.1.1.
-fn lookup(map: Term, key: Term) -> Option<Term> {
-    let h = map.header()?;
-    lookup_header(map, key, h)
-}
-
 fn lookup_header(map: Term, key: Term, h: u64) -> Option<Term> {
-    if h & 63 != MAP {
-        return None;
-    }
     if h & 0xc0 == 0 {
         return flatmap_get(map, key);
     }
@@ -981,21 +977,37 @@ fn lookup_header(map: Term, key: Term, h: u64) -> Option<Term> {
     lookup_hash(map, key, hash)
 }
 
-fn lookup_hash(map: Term, key: Term, hash: u64) -> Option<Term> {
-    let mut node = map;
-    // SAFETY: every node reached from the live root is a live HAMT node, collision
-    // tuple or leaf cons; the bitmap selects an initialized child.
+// Port of erts/emulator/beam/erl_map.c:2424-2474 (erts_hashmap_get), OTP-29.1.1.
+#[inline(always)]
+fn lookup_hash(map: Term, key: Term, mut hash: u64) -> Option<Term> {
+    // SAFETY: each bitmap selects an initialized child; the HAMT header identifies the
+    // collision tuple, and every reached leaf and collision child remains live with `map`.
     unsafe {
-        for level in 0..=17 {
+        let mut ptr = map.raw_ptr();
+        let mut header = *ptr;
+        ptr = ptr.add(1);
+        loop {
+            let bitmap = ((header >> 16) & 0xffff) as u16;
+            let mut index = (hash & 0xf) as usize;
+            if bitmap != u16::MAX {
+                let bit = 1_u16 << index;
+                if bitmap & bit == 0 {
+                    return None;
+                }
+                index = (bitmap & (bit - 1)).count_ones() as usize;
+            }
+            let node = term(*ptr.add(index + 1));
             if bits(node) & 3 == 1 {
                 let (candidate, value) = node.cons_ref().unwrap();
                 return exact_eq(candidate, key).then_some(value);
             }
-            let h = node.header().unwrap();
-            if h & 63 == 0 {
-                let p = node.raw_ptr();
-                for i in 0..(h >> 6) as usize {
-                    let leaf = term(*p.add(1 + i));
+
+            hash >>= 4;
+            ptr = node.raw_ptr();
+            header = *ptr;
+            if header & 63 == 0 {
+                for index in 0..(header >> 6) as usize {
+                    let leaf = term(*ptr.add(index + 1));
                     let (candidate, value) = leaf.cons_ref().unwrap();
                     if exact_eq(candidate, key) {
                         return Some(value);
@@ -1003,20 +1015,8 @@ fn lookup_hash(map: Term, key: Term, hash: u64) -> Option<Term> {
                 }
                 return None;
             }
-            if level == 17 {
-                return None;
-            }
-            let bitmap = ((h >> 16) & 0xffff) as u16;
-            let bit = 1u16 << slot(hash, level);
-            if bitmap & bit == 0 {
-                return None;
-            }
-            let index = (bitmap & (bit - 1)).count_ones() as usize;
-            let offset = if (h >> 6) & 3 >= 2 { 2 } else { 1 };
-            node = term(*node.raw_ptr().add(offset + index));
         }
     }
-    None
 }
 
 /// Flatmap half of `erts_maps_get`: word compare for an immediate key, `EQ` otherwise.
