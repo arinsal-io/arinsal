@@ -742,6 +742,29 @@ pub(crate) fn queue_outgoing(
     control: OwnedTerm,
     message: Option<OwnedTerm>,
 ) -> Result<(), VmError> {
+    match queue_outgoing_with_options(process, ctx, node, control, message, true, true)? {
+        DistSendResult::Queued => Ok(()),
+        DistSendResult::NotConnected | DistSendResult::WouldSuspend => Err(badarg()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DistSendResult {
+    Queued,
+    NotConnected,
+    WouldSuspend,
+}
+
+// Port of erts/emulator/beam/dist.c:3216-3280 (erts_dsig_prepare), OTP-29.1.1.
+fn queue_outgoing_with_options(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    node: &str,
+    control: OwnedTerm,
+    message: Option<OwnedTerm>,
+    connect: bool,
+    suspend: bool,
+) -> Result<DistSendResult, VmError> {
     if crate::debug_env::trace_dist()
         && matches!(&control, OwnedTerm::Tuple(parts) if matches!(parts.first(), Some(OwnedTerm::Int(6))) && matches!(parts.get(3), Some(OwnedTerm::Atom(name)) if name == "global_name_server"))
     {
@@ -749,7 +772,7 @@ pub(crate) fn queue_outgoing(
     }
     let mut tables = node_tables::lock();
     if !tables.alive {
-        return Err(badarg());
+        return Ok(DistSendResult::NotConnected);
     }
     let local_name = tables.local_name.clone();
     let local_creation = tables.local_creation;
@@ -759,30 +782,56 @@ pub(crate) fn queue_outgoing(
     let control = node_tables::relabel_local_node(control, &local_name, local_creation);
     let message = message.map(|m| node_tables::relabel_local_node(m, &local_name, local_creation));
     // Port of dist.c:3260 (erts_auto_connect on Idle), OTP-29.1.1.
-    let was_idle = tables
-        .entries
-        .get(node)
-        .map(|entry| entry.state == node_tables::ConnState::Idle)
-        .unwrap_or(true);
-    let (conn_id, entry_ref) = tables.new_connection(node).ok_or_else(badarg)?;
+    let was_idle = match tables.entries.get(node) {
+        Some(entry) if entry.state == node_tables::ConnState::Exiting => {
+            return Ok(DistSendResult::NotConnected);
+        }
+        Some(entry) => entry.state == node_tables::ConnState::Idle,
+        None => true,
+    };
+    if was_idle && !connect {
+        return Ok(DistSendResult::NotConnected);
+    }
+    let (conn_id, entry_ref) = if was_idle {
+        tables.new_connection(node).ok_or_else(badarg)?
+    } else {
+        let entry = tables.entries.get(node).ok_or_else(badarg)?;
+        (entry.connection_id, entry.entry_ref)
+    };
     let entry = tables.entries.get_mut(node).ok_or_else(badarg)?;
 
     if entry.state == node_tables::ConnState::Exiting {
-        return Err(badarg());
+        return Ok(DistSendResult::NotConnected);
     }
 
     if entry.connected
         && let Some(state) = entry.dist.as_mut().filter(|state| state.handle != 0)
     {
+        // Port of erts/emulator/beam/dist.c:3280, OTP-29.1.1.
+        if !suspend && state.busy {
+            return Ok(DistSendResult::WouldSuspend);
+        }
         if let Some(port_id) = state.port_id {
             let packets = state.encode_term(control, message).map_err(|_| badarg())?;
             state.written = state.written.saturating_add(1);
-            let sender = ctx.pid();
-            let should_suspend = enqueue_port_packets_locked(process, state, sender, packets);
+            let should_suspend = if suspend {
+                enqueue_port_packets_locked(process, state, ctx.pid(), packets)
+            } else {
+                enqueue_port_output_no_suspend_locked(state, packets);
+                false
+            };
             drop(tables);
-            return finish_port_enqueue(process, sender, port_id, should_suspend);
+            if suspend {
+                finish_port_enqueue(process, ctx.pid(), port_id, should_suspend)?;
+            } else {
+                flush_port_output(process.runtime.as_ref().ok_or_else(badarg)?, port_id)?;
+            }
+            return Ok(DistSendResult::Queued);
         }
         state.queue_term(control, message).map_err(|_| badarg())?;
+        if state.pending_bytes >= state.busy_limit {
+            state.busy = true;
+        }
         let notify = state.notify.then_some(state.owner);
         state.notify = false;
         drop(tables);
@@ -793,7 +842,7 @@ pub(crate) fn queue_outgoing(
                 })?;
         }
         let _ = process;
-        return Ok(());
+        return Ok(DistSendResult::Queued);
     }
 
     // Pending (or Connected without a controller yet): buffer until channel is up.
@@ -803,7 +852,7 @@ pub(crate) fn queue_outgoing(
     if let Some((node, conn_id, entry_ref)) = notify {
         notify_auto_connect(process, ctx, &node, conn_id, entry_ref)?;
     }
-    Ok(())
+    Ok(DistSendResult::Queued)
 }
 
 /// Port of erts/emulator/beam/dist.c:5713 (erts_auto_connect), OTP-29.1.1.
@@ -1954,7 +2003,7 @@ pub(crate) fn native_send(
     Ok(args[1])
 }
 
-/// `send/3` validates its options before queueing the same remote DOP_SEND.
+/// Port of erts/emulator/beam/bif.c:2697-2759 (`send_3`), OTP-29.1.1.
 pub(crate) fn native_send3(
     vm: &mut Vm,
     process: &mut Process,
@@ -1968,14 +2017,36 @@ pub(crate) fn native_send3(
         _ => return Err(badarg()),
     };
     let mut want_priority = false;
+    let mut noconnect = false;
     let mut nosuspend = false;
     for option in &names {
         match option {
             OwnedTerm::Atom(name) if name == "nosuspend" => nosuspend = true,
-            OwnedTerm::Atom(name) if name == "noconnect" => {}
+            OwnedTerm::Atom(name) if name == "noconnect" => noconnect = true,
             OwnedTerm::Atom(name) if name == "priority" => want_priority = true,
             _ => return Err(badarg()),
         }
+    }
+    if is_remote_target(args[0])? {
+        return match try_remote_send_with_options(
+            process, ctx, args[0], args[1], !noconnect, !nosuspend,
+        )? {
+            RemoteSendOutcome::Sent => {
+                crate::trace::emit_process(
+                    Some(vm),
+                    process,
+                    ctx.pid(),
+                    crate::trace::SEND,
+                    "send",
+                    &[args[1], args[0]],
+                );
+                let _ = want_priority;
+                Ok(atom("ok"))
+            }
+            RemoteSendOutcome::NotConnected => Ok(atom(if noconnect { "noconnect" } else { "ok" })),
+            RemoteSendOutcome::WouldSuspend => Ok(atom("nosuspend")),
+            RemoteSendOutcome::NotRemote => Err(badarg()),
+        };
     }
     if nosuspend {
         // Port of erts/emulator/beam/bif.c:2390 (send_3): a busy port gives `nosuspend`.
@@ -2395,18 +2466,59 @@ pub(crate) fn try_remote_send(
     target: Term,
     message: Term,
 ) -> Result<bool, VmError> {
+    Ok(!matches!(
+        try_remote_send_with_options(process, ctx, target, message, true, true)?,
+        RemoteSendOutcome::NotRemote
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteSendOutcome {
+    NotRemote,
+    Sent,
+    NotConnected,
+    WouldSuspend,
+}
+
+fn queue_remote_send(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    node: &str,
+    control: OwnedTerm,
+    message: Option<OwnedTerm>,
+    connect: bool,
+    suspend: bool,
+) -> Result<RemoteSendOutcome, VmError> {
+    if !node_tables::lock().alive {
+        return Ok(RemoteSendOutcome::NotConnected);
+    }
+    Ok(
+        match queue_outgoing_with_options(process, ctx, node, control, message, connect, suspend)? {
+            DistSendResult::Queued => RemoteSendOutcome::Sent,
+            DistSendResult::NotConnected => RemoteSendOutcome::NotConnected,
+            DistSendResult::WouldSuspend => RemoteSendOutcome::WouldSuspend,
+        },
+    )
+}
+
+// Port of erts/emulator/beam/bif.c:2381-2401 (`remote_send`), OTP-29.1.1.
+pub(crate) fn try_remote_send_with_options(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    target: Term,
+    message: Term,
+    connect: bool,
+    suspend: bool,
+) -> Result<RemoteSendOutcome, VmError> {
     // {Name, Node} — registered send on a (possibly remote) node.
     if let Some((name, node)) = name_node_tuple(target)? {
         let local = node_tables::lock().local_name.clone();
         if node == local || node == "nonode@nohost" {
-            return Ok(false);
+            return Ok(RemoteSendOutcome::NotRemote);
         }
-        // Port of erts/emulator/beam/dist.c (`erts_send` remote destination handling), OTP-29.1.1.
+        // Port of erts/emulator/beam/bif.c:2381-2401 (`remote_send`), OTP-29.1.1.
         // A send to a remote registered name on a non-distributed node is a successful
         // best-effort send; there is no distribution controller to queue it through.
-        if !node_tables::lock().alive {
-            return Ok(true);
-        }
         let control = control(
             6,
             vec![
@@ -2415,23 +2527,34 @@ pub(crate) fn try_remote_send(
                 OwnedTerm::Atom(name),
             ],
         );
-        queue_outgoing(process, ctx, &node, control, Some(owned(message)?))?;
-        return Ok(true);
+        return queue_remote_send(
+            process,
+            ctx,
+            &node,
+            control,
+            Some(owned(message)?),
+            connect,
+            suspend,
+        );
     }
     let target_owned = owned(target)?;
     if let OwnedTerm::Ref { node, .. } = &target_owned {
         let target_node = node.clone();
         let local = node_tables::lock().local_name.clone();
         if target_node == local || target_node == "nonode@nohost" {
-            return Ok(false);
+            return Ok(RemoteSendOutcome::NotRemote);
         }
-        // Port of erts/emulator/beam/dist.c (`erts_send` remote destination handling), OTP-29.1.1.
-        if !node_tables::lock().alive {
-            return Ok(true);
-        }
+        // Port of erts/emulator/beam/bif.c:2381-2401 (`remote_send`), OTP-29.1.1.
         let control = control(33, vec![local_pid_owned(ctx.pid()), target_owned]);
-        queue_outgoing(process, ctx, &target_node, control, Some(owned(message)?))?;
-        return Ok(true);
+        return queue_remote_send(
+            process,
+            ctx,
+            &target_node,
+            control,
+            Some(owned(message)?),
+            connect,
+            suspend,
+        );
     }
     let OwnedTerm::Pid {
         node,
@@ -2440,16 +2563,13 @@ pub(crate) fn try_remote_send(
         creation,
     } = &target_owned
     else {
-        return Ok(false);
+        return Ok(RemoteSendOutcome::NotRemote);
     };
     let local = node_tables::lock().local_name.clone();
     if node == &local || node == "nonode@nohost" {
-        return Ok(false);
+        return Ok(RemoteSendOutcome::NotRemote);
     }
-    // Port of erts/emulator/beam/dist.c (`erts_send` remote destination handling), OTP-29.1.1.
-    if !node_tables::lock().alive {
-        return Ok(true);
-    }
+    // Port of erts/emulator/beam/bif.c:2381-2401 (`remote_send`), OTP-29.1.1.
     let control = OwnedTerm::tuple(vec![
         OwnedTerm::Int(2),
         OwnedTerm::Atom(String::new()),
@@ -2460,8 +2580,15 @@ pub(crate) fn try_remote_send(
             creation: *creation,
         },
     ]);
-    queue_outgoing(process, ctx, node, control, Some(owned(message)?))?;
-    Ok(true)
+    queue_remote_send(
+        process,
+        ctx,
+        node,
+        control,
+        Some(owned(message)?),
+        connect,
+        suspend,
+    )
 }
 
 // Port of erts/emulator/beam/dist.c:3629-3773 (distribution output queue busy state), OTP-29.1.1.

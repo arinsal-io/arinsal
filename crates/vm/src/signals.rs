@@ -966,6 +966,19 @@ pub(crate) fn erl_create_process(
     let defaults = crate::natives::sys::gc_spawn_defaults(Some(&rt));
     let mut child = Process::with_spawn_registers(3, 0);
     child.set_runtime(parent.runtime.clone());
+    // Port of erts/emulator/beam/erl_process.c:12508 (erl_create_process initializes both
+    // active and user priority from so->priority), OTP-29.1.1. The scheduler entry already
+    // receives this priority below; keep process_info/process_flag's process-side value aligned.
+    crate::natives::proc::set_flag(
+        &mut child,
+        "priority",
+        atom(match so.priority {
+            Priority::Max => "max",
+            Priority::High => "high",
+            Priority::Normal => "normal",
+            Priority::Low => "low",
+        }),
+    );
     // Port of erts/emulator/beam/erl_process.c:12594 (min_heap_size rounded up by
     // erts_next_heap_size), OTP-29.1.1.
     let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
@@ -1895,28 +1908,7 @@ pub(crate) fn native_send3(
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    let options = list(args[2]).ok_or_else(|| badarg("erlang:send/3"))?;
-    let mut want_priority = false;
-    let mut nosuspend = false;
-    for option in &options {
-        if *option == atom("priority") {
-            want_priority = true;
-        } else if *option == atom("nosuspend") {
-            nosuspend = true;
-        } else if *option != atom("noconnect") {
-            return Err(badarg("erlang:send/3"));
-        }
-    }
-    if nosuspend {
-        // Port of erts/emulator/beam/bif.c:2390 (send_3): a busy port gives `nosuspend`.
-        let (sent, busy) = crate::port::send_nosuspend(|| {
-            process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)
-        });
-        sent?;
-        return Ok(atom(if busy { "nosuspend" } else { "ok" }));
-    }
-    process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)?;
-    Ok(atom("ok"))
+    crate::dist::native_send3(vm, process, ctx, args)
 }
 
 /// Direct load-time entry for `is_process_alive/1`.
