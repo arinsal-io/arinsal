@@ -185,7 +185,7 @@ impl Process {
             .as_ref()
             .is_some_and(|pending| !pending.is_done() && pending.class() == scheduler_class(kind))
         {
-            let mut pending = cold.nif_pending.take()?;
+            let mut pending = *cold.nif_pending.take()?;
             // The job runs on this thread; NIF services find the process through the hub.
             crate::natives::nif::refresh_hub_native(self);
             let runtime = self.runtime.clone();
@@ -236,7 +236,7 @@ impl Process {
         };
         let (heap, mut slot) = match *done {
             DirtyDone::Nif(pending, heap) => {
-                self.cold_mut().nif_pending = Some(pending);
+                self.cold_mut().nif_pending = Some(Box::new(pending));
                 (heap, None)
             }
             DirtyDone::Static(result, heap) => {

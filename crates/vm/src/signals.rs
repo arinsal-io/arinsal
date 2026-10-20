@@ -186,11 +186,11 @@ fn whereis_light_error(process: &mut Process, arg: Term, error: VmError) -> u64 
     let fvalue = crate::native_hooks::raw(trap.reason);
     process.header.freason = freason;
     process.header.fvalue = fvalue;
-    process.cold_mut().native_trap = Some(crate::proc_create::NativeTrap {
+    process.cold_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
         trap,
         freason,
         fvalue,
-    });
+    }));
     0
 }
 
@@ -886,7 +886,10 @@ fn spawn_mfa(
 // set once from bif.tab when the emulator starts), OTP-29.1.1.
 fn is_bif_export(module: arinsal_term::Atom, function: arinsal_term::Atom, arity: u8) -> bool {
     static BIF_EXPORTS: std::sync::OnceLock<
-        std::collections::HashSet<(arinsal_term::Atom, arinsal_term::Atom, u8)>,
+        std::collections::HashSet<
+            (arinsal_term::Atom, arinsal_term::Atom, u8),
+            crate::beamasm_integration::ExportHasher,
+        >,
     > = std::sync::OnceLock::new();
     BIF_EXPORTS
         .get_or_init(|| {
@@ -1111,12 +1114,13 @@ pub(crate) fn erl_create_process(
         None
     };
     let scheduler = spawn_scheduler(parent)?;
-    let pid = if let Some(scheduler_id) = so.scheduler {
-        scheduler.spawn_unscheduled_on_with_priority(child, scheduler_id, so.priority)
+    let spawned = if let Some(scheduler_id) = so.scheduler {
+        scheduler.spawn_unscheduled_on_handle(child, scheduler_id, so.priority)
     } else {
-        scheduler.spawn_unscheduled_with_priority(child, so.priority)
+        scheduler.spawn_unscheduled_handle(child, so.priority)
     }
     .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
+    let pid = spawned.pid();
     if so.link {
         parent.cold_mut().links.insert(pid, Default::default());
     }
@@ -1212,7 +1216,7 @@ pub(crate) fn erl_create_process(
             .send(pid, parent_pid, envelope)
             .map_err(|error| VmError::Unsupported(format!("spawn_reply: {error}")))?;
     }
-    ctx.schedule_spawn(pid)
+    ctx.schedule_spawned(spawned)
         .map_err(|error| VmError::Unsupported(format!("schedule spawn: {error}")))?;
     Ok(CreatedProcess {
         pid,

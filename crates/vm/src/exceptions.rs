@@ -294,7 +294,7 @@ pub(super) fn bif_error_with_atoms(
         // Port of erts/emulator/beam/erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1: the
         // call traps to a continuation that must run on a scheduler of `class`.
         if let Some(pending) = crate::natives::nif::take_rescheduled() {
-            p.cold_mut().nif_pending = Some(pending);
+            p.cold_mut().nif_pending = Some(Box::new(pending));
         }
         return match class {
             arinsal_bifs::SchedulerClass::Normal => VmError::Yield,

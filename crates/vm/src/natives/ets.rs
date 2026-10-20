@@ -622,11 +622,11 @@ fn finish_direct(
             let fvalue = crate::native_hooks::raw(trap.reason);
             process.header.freason = class;
             process.header.fvalue = fvalue;
-            process.cold_mut().native_trap = Some(crate::proc_create::NativeTrap {
+            process.cold_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
                 trap,
                 freason: class,
                 fvalue,
-            });
+            }));
             Some(Term::NIL)
         }
         // Not an Erlang exception (yield, unsupported): redo on the scheduler path.
@@ -1330,7 +1330,7 @@ fn insert_list(
         bump_reds(process, ctx, used);
         Ok(boolean_term(yes))
     };
-    if let Some(EtsInsert::Global(outcome)) = &state {
+    if let Some(EtsInsert::Global(outcome)) = state.as_deref() {
         // The table is no longer busy (or gone): the operation completed or was aborted by
         // someone else.
         return match outcome.load(std::sync::atomic::Ordering::Acquire) {
@@ -1362,7 +1362,7 @@ fn insert_list(
             badarg()
         }
     };
-    let (mut cursor, mut checked, prepared) = match state.take() {
+    let (mut cursor, mut checked, prepared) = match state.take().map(|boxed| *boxed) {
         None => (objects, 0, None),
         Some(EtsInsert::Check { cursor, count }) => (cursor, count, None),
         Some(EtsInsert::Copy { cursor, prepared }) => (cursor, 0, Some(prepared)),
@@ -1376,10 +1376,10 @@ fn insert_list(
             // at that point when the counter reaches zero.
             loops -= 1;
             if loops <= 0 {
-                process.cold_mut().ets_insert = Some(EtsInsert::Check {
+                process.cold_mut().ets_insert = Some(Box::new(EtsInsert::Check {
                     cursor,
                     count: checked,
-                });
+                }));
                 bump_reds(process, ctx, isize::MAX);
                 return Err(VmError::Yield);
             }
@@ -1453,7 +1453,7 @@ fn insert_list(
         // generated loop yields before copying the current object when this consumes the slice.
         loops -= 1;
         if loops <= 0 {
-            process.cold_mut().ets_insert = Some(EtsInsert::Copy { cursor, prepared });
+            process.cold_mut().ets_insert = Some(Box::new(EtsInsert::Copy { cursor, prepared }));
             bump_reds(process, ctx, isize::MAX);
             return Err(VmError::Yield);
         }
@@ -1486,7 +1486,7 @@ fn insert_list(
     }
     if table.is_busy() {
         drop(table);
-        process.cold_mut().ets_insert = Some(EtsInsert::Copy { cursor, prepared });
+        process.cold_mut().ets_insert = Some(Box::new(EtsInsert::Copy { cursor, prepared }));
         return Err(err(EtsError::Busy));
     }
     if !allowed(&table, caller, true) {
@@ -1528,7 +1528,7 @@ fn insert_list(
         destroy_copied,
         std::sync::Arc::clone(&outcome),
     );
-    process.cold_mut().ets_insert = Some(EtsInsert::Global(outcome));
+    process.cold_mut().ets_insert = Some(Box::new(EtsInsert::Global(outcome)));
     bump_reds(process, ctx, isize::MAX);
     Err(VmError::Yield)
 }
@@ -1799,7 +1799,7 @@ fn delete_or_clear(
             garbage,
         };
         let done = fresh.garbage.step(&mut reds);
-        state = Some(fresh);
+        state = Some(Box::new(fresh));
         done
     } else {
         let registry = rt.ets.read().unwrap();
@@ -1819,11 +1819,11 @@ fn delete_or_clear(
             // table turns busy and every process that meets it continues the release.
             table.begin_busy_delete_all(garbage);
         }
-        state = Some(EtsFree {
+        state = Some(Box::new(EtsFree {
             tid: Some(tid),
             nitems,
             garbage: arinsal_ets::Garbage::empty(),
-        });
+        }));
         done
     };
     let state = state.expect("delete state present");
@@ -2067,7 +2067,7 @@ fn hash_select(
     let resumed = process
         .cold
         .as_mut()
-        .and_then(|cold| cold.ets_select.take());
+        .and_then(|cold| cold.ets_select.take().map(|boxed| *boxed));
     if resumed
         .as_ref()
         .is_some_and(|state| matches!(state.stage, SelectStage::Reverse { .. }))
@@ -2107,7 +2107,7 @@ fn hash_select(
             Ok(table) => table,
             Err(EtsError::Busy) => {
                 if let Some(state) = resumed {
-                    process.cold_mut().ets_select = Some(state);
+                    process.cold_mut().ets_select = Some(Box::new(state));
                 }
                 return Err(VmError::Yield);
             }
@@ -2335,7 +2335,7 @@ fn hash_select(
         Next::Trap(position) => {
             saved.extend(&cycle.results).map_err(err)?;
             let tree = matches!(position, ScanPosition::After(_));
-            process.cold_mut().ets_select = Some(crate::proc_create::EtsSelect {
+            process.cold_mut().ets_select = Some(Box::new(crate::proc_create::EtsSelect {
                 tid,
                 program,
                 count,
@@ -2352,7 +2352,7 @@ fn hash_select(
                 program_owner,
                 stage: SelectStage::Scan,
                 end: None,
-            });
+            }));
             let ctx = ctx.as_deref_mut().ok_or_else(needs_context)?;
             // A hash traversal charges all the reductions it has left, an ordered one the
             // objects it visited.
@@ -2370,7 +2370,7 @@ fn hash_select(
                 _ => None,
             };
             let eot = key.is_none();
-            process.cold_mut().ets_select = Some(crate::proc_create::EtsSelect {
+            process.cold_mut().ets_select = Some(Box::new(crate::proc_create::EtsSelect {
                 tid,
                 program,
                 count,
@@ -2385,7 +2385,7 @@ fn hash_select(
                 program_owner,
                 stage: SelectStage::Reverse { done: 0, eot },
                 end,
-            });
+            }));
             let ctx = ctx.as_deref_mut().ok_or_else(needs_context)?;
             bump_reds(process, ctx, used);
             return Err(VmError::Yield);
@@ -2460,7 +2460,7 @@ fn reverse_trap(
                 done: done + cells,
                 eot,
             };
-            process.cold_mut().ets_select = Some(state);
+            process.cold_mut().ets_select = Some(Box::new(state));
             let ctx = ctx.ok_or_else(needs_context)?;
             bump_reds(process, ctx, isize::MAX);
             Err(VmError::Yield)
@@ -3702,7 +3702,7 @@ fn entry_insert(
         process
             .cold
             .as_ref()
-            .and_then(|cold| cold.ets_insert.as_ref()),
+            .and_then(|cold| cold.ets_insert.as_deref()),
         Some(EtsInsert::Global(_))
     );
     if let Err(error) = help_busy_table(process, ctx, target, own_list_insert) {
@@ -3731,7 +3731,7 @@ fn entry_insert_new(
         process
             .cold
             .as_ref()
-            .and_then(|cold| cold.ets_insert.as_ref()),
+            .and_then(|cold| cold.ets_insert.as_deref()),
         Some(EtsInsert::Global(_))
     );
     if let Err(error) = help_busy_table(process, ctx, target, own_list_insert) {

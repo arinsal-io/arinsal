@@ -717,7 +717,7 @@ fn finish(
     if let Some(staged) = process
         .cold
         .as_mut()
-        .and_then(|cold| cold.finish_loading_commit.take())
+        .and_then(|cold| cold.finish_loading_commit.take().map(|boxed| *boxed))
     {
         let barrier_callback = staged.barrier_passed.is_some();
         let result = finish_commit(vm, process, staged);
@@ -797,7 +797,7 @@ fn finish_stage(
                 let ended = staged.ended.take();
                 let barrier_passed = Arc::new(AtomicBool::new(false));
                 staged.barrier_passed = Some(Arc::clone(&barrier_passed));
-                process.cold_mut().finish_loading_commit = Some(staged);
+                process.cold_mut().finish_loading_commit = Some(Box::new(staged));
                 crate::suspend::suspend_self(process);
                 ctx.thread_progress_later(move || {
                     if let Some(ended) = ended {
@@ -808,7 +808,7 @@ fn finish_stage(
                     resume_suspended(&runtime, pid);
                 });
             } else {
-                process.cold_mut().finish_loading_commit = Some(staged);
+                process.cold_mut().finish_loading_commit = Some(Box::new(staged));
             }
             Err(VmError::Yield)
         }

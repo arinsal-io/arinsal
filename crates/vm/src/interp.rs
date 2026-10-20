@@ -2407,7 +2407,7 @@ impl Vm {
                     // Panic landing the previous native-body path used. The
                     // argument slice is not copied unless the body fails.
                     // A NIF rescheduled to this scheduler resumes its continuation instead.
-                    let pending = p.cold.as_mut().and_then(|cold| cold.nif_pending.take());
+                    let pending = p.cold.as_mut().and_then(|cold| cold.nif_pending.take().map(|boxed| *boxed));
                     // Port of erts/emulator/beam/erl_nif.c:3437-3477 (static_schedule_dirty_nif),
                     // OTP-29.1.1: a static NIF flagged dirty first moves the process to a
                     // dirty scheduler of its class, which executes this body again.

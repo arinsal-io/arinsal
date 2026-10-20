@@ -1026,7 +1026,7 @@ pub(crate) struct ProcessCold {
     pub(crate) native_retry: Option<usize>,
     /// The traced function (by pc), actions and return value of a native trace frame whose
     /// return events the executor emits.
-    pub(crate) native_return_events: Option<NativeReturnEvents>,
+    pub(crate) native_return_events: Option<Box<NativeReturnEvents>>,
     /// Sessions whose return_to frame a traced BIF raised through; the exception's catch
     /// reports their return_to events.
     pub(crate) bif_return_to: Vec<u64>,
@@ -1089,33 +1089,33 @@ pub(crate) struct ProcessCold {
     pub(crate) native_resume_after_call: Option<usize>,
     /// The BIF failure behind the current native exception, so the scheduler can name the BIF
     /// and its arguments as the top frame (erts passes the MFA to `raise_exception`).
-    pub(crate) native_bif_error: Option<NativeBifError>,
+    pub(crate) native_bif_error: Option<Box<NativeBifError>>,
     /// A table BIF failure raised from the direct path with its BIF frame already built, as
     /// erts' BIF returns THE_NON_VALUE with `freason`/`fvalue` set; the call is not redone.
-    pub(crate) native_trap: Option<NativeTrap>,
+    pub(crate) native_trap: Option<Box<NativeTrap>>,
     /// Stable snapshot and cursor for a trapped `persistent_term:get/0` call.
-    pub(crate) persistent_get_all: Option<PersistentGetAll>,
+    pub(crate) persistent_get_all: Option<Box<PersistentGetAll>>,
     /// Result of a published `persistent_term` update, returned when the yielded
     /// updater runs again (erts resumes the suspended updater after `table_updater`).
     pub(crate) persistent_update_result: Option<Term>,
     /// Modules a suspended `finish_loading/1` staged; the thread-progress callback commits
     /// them and releases code-load permission before rescheduling the loader.
-    pub(crate) finish_loading_commit: Option<crate::load::StagedLoad>,
+    pub(crate) finish_loading_commit: Option<Box<crate::load::StagedLoad>>,
     /// Result of `delete_module/1` retained until its code barrier commits the index.
     pub(crate) delete_module_result: Option<Term>,
     /// Breakpoint update a trace BIF caller finishes between code barriers while it holds
     /// the code modification permission.
-    pub(crate) trace_finish: Option<crate::trace_bp::TraceFinish>,
+    pub(crate) trace_finish: Option<Box<crate::trace_bp::TraceFinish>>,
     /// Storage of a table being released by a trapped `ets:delete/1` or
     /// `ets:internal_delete_all/2`.
-    pub(crate) ets_free: Option<EtsFree>,
+    pub(crate) ets_free: Option<Box<EtsFree>>,
     /// Progress of a trapped list `ets:insert/2` or `ets:insert_new/2`.
-    pub(crate) ets_insert: Option<EtsInsert>,
+    pub(crate) ets_insert: Option<Box<EtsInsert>>,
     /// Progress of a trapped `ets:select/2`, `match/2`, `match_object/2` or `select_count/2`.
-    pub(crate) ets_select: Option<EtsSelect>,
+    pub(crate) ets_select: Option<Box<EtsSelect>>,
     /// The frame of a tail call that was already released when its callee yielded, so the
     /// re-executed instruction does not release it twice. Its words are GC roots.
-    pub(crate) ext_last_released: Option<ReleasedFrame>,
+    pub(crate) ext_last_released: Option<Box<ReleasedFrame>>,
     /// The frames a trapped BIF call holds in erts but the interpreter does not push.
     pub(crate) trap_return: Option<TrapReturn>,
     /// A process-local BIF trap waiting for its private continuation export.
@@ -1124,7 +1124,7 @@ pub(crate) struct ProcessCold {
     /// yields back to re-execute the apply, so these stay GC roots until it returns.
     pub(crate) apply_roots: Vec<Term>,
     /// A NIF call rescheduled to another scheduler class; its arguments are GC roots.
-    pub(crate) nif_pending: Option<crate::natives::nif::PendingNif>,
+    pub(crate) nif_pending: Option<Box<crate::natives::nif::PendingNif>>,
     /// Explicit `exit/1` reason, owned off-heap. The process heap is collected
     /// while the stacktrace is built, so a raw `Term` here would dangle and
     /// monitors would observe a corrupted reason.
@@ -1155,7 +1155,7 @@ pub(crate) struct ProcessCold {
     pub(crate) monitor_nodes: usize,
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
     /// `p->parent` when the spawning process is external (a distributed spawn request).
-    pub(crate) parent_external: Option<arinsal_etf::OwnedTerm>,
+    pub(crate) parent_external: Option<Box<arinsal_etf::OwnedTerm>>,
     pub(crate) receive_markers: Option<Box<receive::ReceiveMarkers>>,
     pub(crate) receive_marker_uniq: i64,
     /// Link nodes keyed by the other end (erts `ERTS_P_LINKS`, a tree of `ErtsILink`).
@@ -1189,16 +1189,16 @@ pub(crate) struct ProcessCold {
     /// Arguments of an `eval_scheduled` entry, restored when its `-on_load` prelude returns.
     ///
     /// The heap owns the copied terms so a collection inside `-on_load` cannot move them.
-    pub(crate) entry_args_after_on_load: Option<EntryArgsAfterOnLoad>,
+    pub(crate) entry_args_after_on_load: Option<Box<EntryArgsAfterOnLoad>>,
     /// BIF MFA of a caught native failure. `save_stacktrace` keeps it as `s->current`
     /// without the uncaught path's `String` box; cleared once the trace is taken.
-    pub(crate) pending_trace_top: Option<crate::stacktrace::PendingTop>,
+    pub(crate) pending_trace_top: Option<Box<crate::stacktrace::PendingTop>>,
     /// Stack list from `erlang:raise/3`, keyed by that failure's `freason` and `fvalue`.
     ///
     /// Port of erts/emulator/beam/bif.c:1641-1688 (`raise_3` stores the caller's list
     /// in `c_p->ftrace`), OTP-29.1.1. Native code keeps the register file in
     /// `header.ftrace`, so the list stays here until the catch reads it.
-    pub(crate) explicit_raise: Option<(u64, u64, arinsal_etf::OwnedTerm)>,
+    pub(crate) explicit_raise: Option<Box<(u64, u64, arinsal_etf::OwnedTerm)>>,
 }
 
 /// Entry arguments held aside while `-on_load` runs as that process's first function.
@@ -1402,12 +1402,12 @@ impl Process {
             }
             None => vec![Term::NIL; release.dealloc],
         };
-        self.cold_mut().ext_last_released = Some(ReleasedFrame {
+        self.cold_mut().ext_last_released = Some(Box::new(ReleasedFrame {
             module,
             ip,
             kept,
             words,
-        });
+        }));
     }
     /// `true` when `-on_load` did not return `ok` and the entry call must not run.
     ///

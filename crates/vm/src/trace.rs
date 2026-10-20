@@ -3962,7 +3962,7 @@ pub(crate) fn running_mfa(
     let dirty_finalizer = process
         .cold
         .as_ref()
-        .and_then(|cold| cold.nif_pending.as_ref())
+        .and_then(|cold| cold.nif_pending.as_deref())
         .and_then(crate::natives::nif::PendingNif::finalizer_mfa);
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:944-946 (c_p->current is set when a
     // process yields): a process that yielded in native code runs the function it resumes in.

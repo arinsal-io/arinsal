@@ -5201,7 +5201,7 @@ fn with_code_mod_permission(
     if let Some(finish) = process
         .cold
         .as_mut()
-        .and_then(|cold| cold.trace_finish.take())
+        .and_then(|cold| cold.trace_finish.take().map(|boxed| *boxed))
     {
         // Resumed by the code barrier: the permission is still ours.
         let finish = advance_trace_finish(vm, process, ctx, finish, true)?;
@@ -5212,7 +5212,7 @@ fn with_code_mod_permission(
             return Term::small(result).ok_or_else(badarg);
         }
         // bif_trace_info_finish_trap: build the result again, without waiting.
-        process.cold_mut().trace_finish = Some(finish);
+        process.cold_mut().trace_finish = Some(Box::new(finish));
     } else if let Some(runtime) = &runtime
         && !crate::natives::code::try_seize_code_mod_permission(runtime, process, pid)
     {
@@ -5269,7 +5269,7 @@ fn wait_code_barriers(
     );
     loop {
         if suspend_for_code_barrier(process, ctx) {
-            process.cold_mut().trace_finish = Some(finish);
+            process.cold_mut().trace_finish = Some(Box::new(finish));
             return Err(VmError::Yield);
         }
         if finish.stages.pop_front().is_none() {
@@ -5292,7 +5292,7 @@ fn advance_trace_finish(
 ) -> Result<crate::trace_bp::TraceFinish, VmError> {
     loop {
         if !barrier_passed && suspend_for_code_barrier(process, ctx) {
-            process.cold_mut().trace_finish = Some(finish);
+            process.cold_mut().trace_finish = Some(Box::new(finish));
             return Err(VmError::Yield);
         }
         barrier_passed = false;
@@ -5338,7 +5338,7 @@ pub(crate) fn trace_finish_process_exit(
     let Some(mut finish) = process
         .cold
         .as_mut()
-        .and_then(|cold| cold.trace_finish.take())
+        .and_then(|cold| cold.trace_finish.take().map(|boxed| *boxed))
     else {
         return;
     };

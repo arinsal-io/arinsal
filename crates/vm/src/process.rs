@@ -2078,8 +2078,11 @@ impl Executor {
                                 {
                                     // A traced native return: its return_from events are out
                                     // and its frame is gone; resume_pc is the caller.
-                                    if let Some((frames, value)) =
-                                        process.cold_mut().native_return_events.take()
+                                    if let Some((frames, value)) = process
+                                        .cold_mut()
+                                        .native_return_events
+                                        .take()
+                                        .map(|boxed| *boxed)
                                     {
                                         self.emit_native_return_frames(
                                             process, ctx, frames, value, resume_pc,
@@ -4703,7 +4706,7 @@ impl Runtime {
         // Port of erts/emulator/beam/erl_process.c:12756-12767 (erl_create_process p->parent),
         // OTP-29.1.1: a remote parent is kept as its external pid.
         if let Some(parent) = parent {
-            child.cold_mut().parent_external = Some(parent.clone());
+            child.cold_mut().parent_external = Some(Box::new(parent.clone()));
         }
         if let Some(linker) = linker {
             child.cold_mut().links.insert(linker, Default::default());
@@ -4872,7 +4875,7 @@ impl Process {
         if let Some(staged) = self
             .cold
             .as_mut()
-            .and_then(|cold| cold.finish_loading_commit.take())
+            .and_then(|cold| cold.finish_loading_commit.take().map(|boxed| *boxed))
         {
             let barrier_callback = staged.barrier_passed.is_some();
             let barrier_passed = staged
@@ -6923,7 +6926,7 @@ impl Process {
         let ets_insert_root = self
             .cold
             .as_ref()
-            .and_then(|cold| cold.ets_insert.as_ref())
+            .and_then(|cold| cold.ets_insert.as_deref())
             .and_then(crate::proc_create::EtsInsert::cursor)
             .map(|cursor| {
                 let index = roots.len();
@@ -8318,12 +8321,12 @@ impl Vm {
         }
         crate::calls::push_continuation(process, module_id, user_ip, 0)?;
         process.cold_mut().entry_args_after_on_load =
-            Some(crate::proc_create::EntryArgsAfterOnLoad {
+            Some(Box::new(crate::proc_create::EntryArgsAfterOnLoad {
                 _heap: heap,
                 args: saved,
                 module: module_id,
                 ip: user_ip,
-            });
+            }));
         process.ip = on_ip;
         process.native_pc = None;
         Ok(())
