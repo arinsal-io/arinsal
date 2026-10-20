@@ -3495,6 +3495,7 @@ fn term_to_iovec(
 // Port of erts/emulator/beam/external.c:2450-2567, OTP-29.1.1.
 struct TermEncodeState {
     encoder: arinsal_bifs::EncodeWalk,
+    pending_work: usize,
     output: Option<Term>,
     source: Option<Term>,
     compressing: bool,
@@ -3505,6 +3506,7 @@ impl TermEncodeState {
     fn completed() -> Self {
         Self {
             encoder: arinsal_bifs::EncodeWalk::completed(),
+            pending_work: 0,
             output: None,
             source: None,
             compressing: false,
@@ -3546,6 +3548,7 @@ fn term_encode(
         let context = magic_binary_state(
             Mutex::new(TermEncodeState {
                 encoder,
+                pending_work: if sized { size_work } else { 0 },
                 output: None,
                 source: None,
                 compressing: false,
@@ -3570,6 +3573,7 @@ fn term_encode(
             magic_binary_state(
                 Mutex::new(TermEncodeState {
                     encoder,
+                    pending_work: 0,
                     output: None,
                     source: None,
                     compressing: false,
@@ -3601,9 +3605,10 @@ fn term_encode(
         return finish_term_encode(process, encoder, reductions, iovec);
     }
 
-    let mut work = 0;
+    let mut work = std::mem::take(&mut saved.pending_work);
     if !saved.compressing && saved.output.is_none() {
-        let (sized, size_work) = saved.encoder.step_size(chunk_work)?;
+        let size_budget = chunk_work.saturating_sub(work);
+        let (sized, size_work) = saved.encoder.step_size(size_budget)?;
         work += size_work;
         if !sized {
             drop(saved);

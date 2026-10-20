@@ -607,6 +607,8 @@ enum Work {
     MapSort(MapSort),
 }
 
+// Keep the reverse iterator's inline HAMT stack in the size walk; boxing adds an allocation per map.
+#[allow(clippy::large_enum_variant)]
 enum MapEntries {
     Flat(Box<dyn Iterator<Item = (Term, Term)> + Send>),
     Hash(arinsal_term::MapReverseIter),
@@ -749,6 +751,8 @@ pub struct EncodeWalk {
 
 /// A pending visit of the size pass.
 // Port of erts/emulator/beam/external.c (encode_size_struct_int), OTP-29.1.1.
+// Keep HAMT traversal state inline in the saved size stack, as the OTP WStack does.
+#[allow(clippy::large_enum_variant)]
 enum SizeItem {
     Term(Term),
     Tail(Term),
