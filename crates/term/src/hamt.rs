@@ -358,10 +358,21 @@ pub fn hashmap_leaves<H: HeapAlloc + ?Sized>(
     pairs: impl ExactSizeIterator<Item = (Term, Term)>,
     heap: &mut H,
 ) -> Result<Vec<HxNode>, TermError> {
-    let entries: Vec<_> = pairs
-        .map(|(key, value)| (hashmap_key_hash(key), key, value))
-        .collect();
-    hashmap_leaves_hashed(&entries, heap)
+    let n = pairs.len();
+    let (slice, ptr) = produce(heap, 2 * n)?;
+    let mut hxns = Vec::with_capacity(n);
+    for (i, (key, value)) in pairs.enumerate() {
+        let hx = hashmap_key_hash(key);
+        slice[2 * i].write(key.bits());
+        slice[2 * i + 1].write(value.bits());
+        hxns.push(HxNode {
+            hx,
+            skip: 1,
+            i,
+            val: Term::from_ptr(ptr.wrapping_add(2 * i), 1),
+        });
+    }
+    Ok(hxns)
 }
 
 /// [`hashmap_leaves`] for entries whose swizzled hash is already known (the yielding
@@ -477,10 +488,12 @@ fn hashmap_from_sorted_unique_array<H: HeapAlloc + ?Sized>(
                 jx += 1;
             }
             let n_colliders = jx - ix;
-            let mut words: SmallVec<[u64; 8]> = SmallVec::with_capacity(1 + n_colliders);
-            words.push((n_colliders as u64) << 6);
-            words.extend(hxns[ix..jx].iter().map(|node| node.val.bits()));
-            hxns[ix].val = produce_words(heap, &words)?;
+            let (words, ptr) = produce(heap, 1 + n_colliders)?;
+            words[0].write((n_colliders as u64) << 6);
+            for (word, node) in words[1..].iter_mut().zip(&hxns[ix..jx]) {
+                word.write(node.val.bits());
+            }
+            hxns[ix].val = Term::from_ptr(ptr, 2);
             hxns[ix].skip = n_colliders;
             ix = jx;
             if ix < n {
@@ -511,6 +524,7 @@ fn collision_chain<H: HeapAlloc + ?Sized>(
 }
 
 /// Pop `sz - 1` siblings from `stack` behind `res` into a node with `header`.
+// Port of erts/emulator/beam/erl_map.c:919-1158 (hashmap_from_chunked_array), OTP-29.1.1.
 fn stack_node<H: HeapAlloc + ?Sized>(
     header: &[u64],
     res: Term,
@@ -518,13 +532,16 @@ fn stack_node<H: HeapAlloc + ?Sized>(
     stack: &mut SmallVec<[u64; 16]>,
     heap: &mut H,
 ) -> Result<Term, TermError> {
-    let mut words: SmallVec<[u64; 18]> = SmallVec::new();
-    words.extend_from_slice(header);
-    words.push(res.bits());
-    for _ in 1..sz {
-        words.push(stack.pop().expect("HAMT build stack"));
+    let word_count = header.len() + sz;
+    let (words, ptr) = produce(heap, word_count)?;
+    for (word, value) in words.iter_mut().zip(header) {
+        word.write(*value);
     }
-    produce_words(heap, &words)
+    words[header.len()].write(res.bits());
+    for word in &mut words[header.len() + 1..] {
+        word.write(stack.pop().expect("HAMT build stack"));
+    }
+    Ok(Term::from_ptr(ptr, 2))
 }
 
 // Port of erts/emulator/beam/erl_map.c:919-1158 (hashmap_from_chunked_array), OTP-29.1.1.

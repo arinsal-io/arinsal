@@ -129,6 +129,11 @@ struct Partition {
     ph: PartPhase,
 }
 
+enum PartitionOut {
+    Yield(Partition),
+    Done(Frame, usize, usize),
+}
+
 /// Yielding `erts_qsort` over the hash records.
 ///
 /// Port of erts/emulator/beam/utils.c:3459-3690 (erts_qsort, erts_qsort_helper,
@@ -161,12 +166,13 @@ impl Qsort {
     /// Run until sorted (`true`) or out of reductions (`false`).
     fn step(&mut self, nodes: &mut [HxNode], reds: &mut i64) -> bool {
         loop {
-            if self.part.is_some() {
-                match self.partition_step(nodes, reds) {
-                    None => return false,
-                    Some((start, end)) => {
-                        let part = self.part.take().expect("partition in flight");
-                        let frame = part.frame;
+            if let Some(part) = self.part.take() {
+                match Self::partition_step(self.compare, part, nodes, reds) {
+                    PartitionOut::Yield(part) => {
+                        self.part = Some(part);
+                        return false;
+                    }
+                    PartitionOut::Done(frame, start, end) => {
                         let first = Frame {
                             base: frame.base,
                             n: start - frame.base,
@@ -224,10 +230,13 @@ impl Qsort {
         }
     }
 
-    /// Returns the pivot part `[start, end)` when the partition is done, `None` on a yield.
-    fn partition_step(&mut self, nodes: &mut [HxNode], reds: &mut i64) -> Option<(usize, usize)> {
-        let compare = self.compare;
-        let p = self.part.as_mut().expect("partition in flight");
+    // Port of erts/emulator/beam/utils.c:3495-3587 (erts_qsort_partion_array), OTP-29.1.1.
+    fn partition_step(
+        compare: NodeCompare,
+        mut p: Partition,
+        nodes: &mut [HxNode],
+        reds: &mut i64,
+    ) -> PartitionOut {
         let base = p.frame.base;
         loop {
             match p.ph {
@@ -236,13 +245,13 @@ impl Qsort {
                         p.ph = PartPhase::FastBody;
                         *reds -= 1;
                         if *reds <= 0 {
-                            return None;
+                            return PartitionOut::Yield(p);
                         }
                     } else {
                         // Fast path succeeded: no item equals the pivot.
                         let start = p.second_part_start - 1;
                         swap(nodes, base, start);
-                        return Some((start, p.second_part_start));
+                        return PartitionOut::Done(p.frame, start, p.second_part_start);
                     }
                 }
                 PartPhase::FastBody => {
@@ -268,10 +277,10 @@ impl Qsort {
                         p.ph = PartPhase::SlowBody;
                         *reds -= 1;
                         if *reds <= 0 {
-                            return None;
+                            return PartitionOut::Yield(p);
                         }
                     } else {
-                        return Some((p.pivot_part_start, p.pivot_part_end));
+                        return PartitionOut::Done(p.frame, p.pivot_part_start, p.pivot_part_end);
                     }
                 }
                 PartPhase::SlowBody => {
@@ -300,14 +309,84 @@ pub(crate) fn qsort_nodes(nodes: &mut [HxNode], key_order: bool) {
     if nodes.len() < 2 {
         return;
     }
-    let kind = if key_order {
-        SortKey::Key
+    let compare = if key_order {
+        node_cmp_key
     } else {
-        SortKey::Hash
+        node_cmp_hash
     };
-    let mut qsort = Qsort::new(kind, nodes.len());
-    let mut reductions = i64::MAX;
-    assert!(qsort.step(nodes, &mut reductions));
+    let seed = if nodes.len() > 128 {
+        sched_local_random(0)
+    } else {
+        1
+    };
+    qsort_helper(nodes, compare, seed);
+}
+
+// Port of erts/emulator/beam/utils.c:3495-3655
+// (erts_qsort_partion_array, erts_qsort_helper), OTP-29.1.1.
+fn qsort_helper(nodes: &mut [HxNode], compare: NodeCompare, extra_seed: u32) {
+    if nodes.len() <= 16 {
+        insertion_sort(compare, nodes);
+        return;
+    }
+    let (pivot_start, pivot_end) = partition_array(nodes, compare, extra_seed);
+    qsort_helper(
+        &mut nodes[..pivot_start],
+        compare,
+        extra_seed.wrapping_add(1),
+    );
+    qsort_helper(&mut nodes[pivot_end..], compare, extra_seed.wrapping_add(1));
+}
+
+// Port of erts/emulator/beam/utils.c:3499-3587 (erts_qsort_partion_array), OTP-29.1.1.
+fn partition_array(nodes: &mut [HxNode], compare: NodeCompare, extra_seed: u32) -> (usize, usize) {
+    let base = nodes.as_ptr() as usize as u64;
+    let n = nodes.len();
+    let compare_address = compare as *const () as usize as u64;
+    let pivot_index = random_hash_64_to_32(
+        u64::from(extra_seed)
+            .wrapping_add(compare_address)
+            .wrapping_add(base)
+            .wrapping_sub(n as u64),
+    ) as usize
+        % n;
+    swap(nodes, 0, pivot_index);
+
+    let mut second_part_start = n;
+    let mut curr = 1;
+    while curr != second_part_start {
+        match compare(&nodes[curr], &nodes[0]) {
+            value if value < 0 => curr += 1,
+            0 => {
+                let mut pivot_part_start = curr - 1;
+                let mut pivot_part_end = curr + 1;
+                let mut last_part_start = second_part_start;
+                swap(nodes, 0, pivot_part_start);
+                while pivot_part_end != last_part_start {
+                    match compare(&nodes[pivot_part_end], &nodes[pivot_part_end - 1]) {
+                        0 => pivot_part_end += 1,
+                        value if value < 0 => {
+                            swap(nodes, pivot_part_start, pivot_part_end);
+                            pivot_part_start += 1;
+                            pivot_part_end += 1;
+                        }
+                        _ => {
+                            last_part_start -= 1;
+                            swap(nodes, pivot_part_end, last_part_start);
+                        }
+                    }
+                }
+                return (pivot_part_start, pivot_part_end);
+            }
+            _ => {
+                second_part_start -= 1;
+                swap(nodes, curr, second_part_start);
+            }
+        }
+    }
+    let pivot_part_start = second_part_start - 1;
+    swap(nodes, 0, pivot_part_start);
+    (pivot_part_start, second_part_start)
 }
 
 // Port of erts/emulator/beam/utils.c:3466-3484 (erts_qsort_swap), OTP-29.1.1.

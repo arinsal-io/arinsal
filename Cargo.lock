@@ -232,6 +232,7 @@ dependencies = [
  "arinsal-etf",
  "arinsal-term",
  "proptest",
+ "similar-asserts",
  "smallvec",
 ]
 
