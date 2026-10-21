@@ -148,10 +148,44 @@ pub(crate) struct MessageQueue {
     entries: VecDeque<QueuedMessage>,
 }
 
-struct QueuedMessage {
-    term: Term,
-    fragment: Option<Box<MessageFragment>>,
-    seq_nil: bool,
+/// A message in the message queue: the signal node it arrived in, relinked from the middle
+/// queue without a copy (erl_proc_sig_queue.c, erts_proc_sig_handle_incoming moves message
+/// signals onto the message queue as they are), or a node allocated for a message the process
+/// built itself.
+pub(crate) type MessageNode = arinsal_sched::OwnedSignal<Event<Message>>;
+
+struct QueuedMessage(MessageNode);
+
+impl QueuedMessage {
+    fn new(term: Term, fragment: Option<Box<MessageFragment>>, seq_nil: bool) -> Self {
+        let mut message = Message::immediate(term);
+        message.fragment = fragment;
+        message.seq_nil = seq_nil;
+        Self(arinsal_sched::OwnedSignal::new(Event {
+            from: Pid::from_data(0),
+            payload: Payload::Message(message),
+        }))
+    }
+}
+
+impl std::ops::Deref for QueuedMessage {
+    type Target = Message;
+
+    fn deref(&self) -> &Message {
+        match &self.0.payload {
+            Payload::Message(message) => message,
+            _ => unreachable!("the message queue holds message nodes only"),
+        }
+    }
+}
+
+impl std::ops::DerefMut for QueuedMessage {
+    fn deref_mut(&mut self) -> &mut Message {
+        match &mut self.0.payload {
+            Payload::Message(message) => message,
+            _ => unreachable!("the message queue holds message nodes only"),
+        }
+    }
 }
 
 impl MessageQueue {
@@ -165,46 +199,47 @@ impl MessageQueue {
 
     /// Append a process-owned term, such as a locally generated control message.
     pub(crate) fn push_back(&mut self, term: Term) {
-        self.entries.push_back(QueuedMessage {
-            term,
-            fragment: None,
-            seq_nil: false,
-        });
+        self.entries
+            .push_back(QueuedMessage::new(term, None, false));
     }
 
     /// Append a message that carries a seq_trace token.
     pub(crate) fn push_back_token(&mut self, term: Term, token: Box<crate::seq_trace::Token>) {
-        self.entries.push_back(QueuedMessage {
+        self.entries.push_back(QueuedMessage::new(
             term,
-            fragment: Some(Box::new(MessageFragment {
+            Some(Box::new(MessageFragment {
                 heap: None,
                 seq_token: Some(token),
             })),
-            seq_nil: false,
-        });
+            false,
+        ));
     }
 
     /// Append a message from a process without a token (`ERL_MESSAGE_TOKEN == NIL`).
     pub(crate) fn push_back_nil(&mut self, term: Term) {
-        self.entries.push_back(QueuedMessage {
-            term,
-            fragment: None,
-            seq_nil: true,
-        });
+        self.entries.push_back(QueuedMessage::new(term, None, true));
     }
 
     /// Insert after the last accepted priority message.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (`insert_prepared_prio_msg`), OTP-29.1.1.
     pub(crate) fn push_priority(&mut self, term: Term, prio_len: usize) -> usize {
-        self.entries.insert(
-            prio_len,
-            QueuedMessage {
-                term,
-                fragment: None,
-                seq_nil: false,
-            },
-        );
+        self.entries
+            .insert(prio_len, QueuedMessage::new(term, None, false));
         prio_len + 1
+    }
+
+    /// Link a message node at the end of the queue, or after the last priority message.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_incoming: a
+    // message signal is moved onto the message queue as it is), OTP-29.1.1.
+    pub(crate) fn push_message_node(&mut self, node: MessageNode, prio_len: usize) -> usize {
+        let entry = QueuedMessage(node);
+        if entry.priority {
+            self.entries.insert(prio_len, entry);
+            prio_len + 1
+        } else {
+            self.entries.push_back(entry);
+            prio_len
+        }
     }
 
     /// Append a scheduler message while applying the active queue policy.
@@ -227,11 +262,7 @@ impl MessageQueue {
         if message.fragment.is_none() {
             push(
                 self,
-                QueuedMessage {
-                    term: message.term,
-                    fragment: None,
-                    seq_nil: message.seq_nil,
-                },
+                QueuedMessage::new(message.term, None, message.seq_nil),
             );
             return Ok(new_prio_len);
         }
@@ -242,11 +273,7 @@ impl MessageQueue {
         // fragment in the process (erts_save_message_in_proc).
         push(
             self,
-            QueuedMessage {
-                term: message.term,
-                fragment: message.fragment,
-                seq_nil: message.seq_nil,
-            },
+            QueuedMessage::new(message.term, message.fragment, message.seq_nil),
         );
         Ok(new_prio_len)
     }
@@ -5958,16 +5985,16 @@ impl Process {
         let count = self.sig_cont.len();
         self.sig_cont_taken += count as u64;
         ctx.consume_fetched_many(count);
-        while let Some(Event { from, payload }) = self.sig_cont.pop_front() {
-            match payload {
+        while let Some(node) = self.sig_cont.pop_front_signal() {
+            match &node.payload {
                 Payload::Message(message) if message.alias == 0 && !message.is_priority() => {
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                     let before = self.message_words_before();
-                    let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
+                    let new_prio_len = self.inbox.push_message_node(node, old_prio_len);
                     self.uncount_message_words(before);
                     debug_assert_eq!(new_prio_len, old_prio_len);
                 }
-                payload => self.move_message(ctx, from, payload)?,
+                _ => self.move_message(ctx, node)?,
             }
         }
         crate::natives::erts_debug::after_message_queue_change(self);
@@ -6058,11 +6085,10 @@ impl Process {
                 }
                 match self.sig_cont.front() {
                     Some(event) if Self::is_ordinary_message(&event.payload) => {
-                        let Event { from, payload } =
-                            self.sig_cont.pop_front().expect("front checked");
+                        let node = self.sig_cont.pop_front_signal().expect("front checked");
                         self.sig_cont_taken += 1;
                         ctx.consume_fetched();
-                        self.move_message(ctx, from, payload)?;
+                        self.move_message(ctx, node)?;
                     }
                     _ => break false,
                 }
@@ -6079,11 +6105,22 @@ impl Process {
                 cnt += 1;
                 continue;
             }
-            let Some(Event { from, payload }) = self.sig_cont.pop_front() else {
+            let Some(node) = self.sig_cont.pop_front_signal() else {
                 break Ok(true);
             };
             self.sig_cont_taken += 1;
             ctx.consume_fetched();
+            if !matches!(node.payload, Payload::Signal(_)) {
+                // ERTS_SIG_Q_OP_ALTACT_MSG: a priority message enters the priority queue.
+                match self.move_message(ctx, node) {
+                    Ok(()) => {
+                        cnt += 1;
+                        continue;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+            let Event { from, payload } = node.into_value();
             match self.handle_signal(ctx, from, payload) {
                 Ok(cost) => cnt += cost + 1,
                 Err(error) => break Err(error),
@@ -6223,20 +6260,43 @@ impl Process {
     fn move_message(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
-        from: Pid,
-        payload: Payload<Message>,
+        mut node: MessageNode,
     ) -> Result<(), VmError> {
-        match payload {
-            Payload::Message(message) => {
-                if !self.alias_message_accepted(ctx, message.alias)? {
+        let from = node.from;
+        if let Payload::TimerMessage { .. } = node.payload {
+            // An expired `send_after`: the timer reference is retired and the message is queued
+            // as it is, in its own node.
+            let placeholder = Payload::Signal(arinsal_sched::Signal::GarbageCollect);
+            if let Payload::TimerMessage { message, .. } =
+                std::mem::replace(&mut node.payload, placeholder)
+            {
+                let priority = message.is_priority();
+                node.payload = Payload::Message(message);
+                let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
+                let before = self.message_words_before();
+                let new_prio_len = self.inbox.push_message_node(node, old_prio_len);
+                self.uncount_message_words(before);
+                self.cold_mut().prio_len = new_prio_len;
+                if priority {
+                    let priority_term = self.inbox.get(old_prio_len).copied().ok_or_else(|| {
+                        VmError::Unsupported("priority message missing after insertion".into())
+                    })?;
+                    self.priority_item_inserted(old_prio_len, priority_term)?;
+                }
+            }
+            return Ok(());
+        }
+        if let Payload::Message(message) = &node.payload {
+            let (alias, receive_traced, priority) =
+                (message.alias, message.receive_traced, message.is_priority());
+            {
+                if !self.alias_message_accepted(ctx, alias)? {
                     return Ok(());
                 }
-                let receive_traced = message.receive_traced;
-                let priority = message.is_priority();
                 let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                 let sender = from;
                 let before = self.message_words_before();
-                let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
+                let new_prio_len = self.inbox.push_message_node(node, old_prio_len);
                 self.uncount_message_words(before);
                 let trace_index = if priority {
                     old_prio_len
@@ -6257,20 +6317,10 @@ impl Process {
                     self.priority_item_inserted(old_prio_len, priority_term)?;
                 }
             }
-            Payload::TimerMessage { message, .. } => {
-                let priority = message.is_priority();
-                let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
-                let before = self.message_words_before();
-                let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
-                self.uncount_message_words(before);
-                self.cold_mut().prio_len = new_prio_len;
-                if priority {
-                    let priority_term = self.inbox.get(old_prio_len).copied().ok_or_else(|| {
-                        VmError::Unsupported("priority message missing after insertion".into())
-                    })?;
-                    self.priority_item_inserted(old_prio_len, priority_term)?;
-                }
-            }
+            return Ok(());
+        }
+        let Event { from, payload } = node.into_value();
+        match payload {
             Payload::Timer { reference, message } => {
                 let timer_id = message.timer_id();
                 let term = message.into_receiver(self)?;
@@ -6280,7 +6330,7 @@ impl Process {
                 self.inbox.push_back(tuple);
                 self.trace_converted_signal(ctx, tuple, from);
             }
-            Payload::Signal(_) => unreachable!("move_message takes message signals"),
+            _ => unreachable!("move_message takes message signals"),
         }
         Ok(())
     }
@@ -6295,15 +6345,8 @@ impl Process {
         from: Pid,
         payload: Payload<Message>,
     ) -> Result<i32, VmError> {
-        let signal = match payload {
-            // ERTS_SIG_Q_OP_ALTACT_MSG: a priority message enters the priority queue.
-            payload @ (Payload::Message(_)
-            | Payload::TimerMessage { .. }
-            | Payload::Timer { .. }) => {
-                self.move_message(ctx, from, payload)?;
-                return Ok(0);
-            }
-            Payload::Signal(signal) => signal,
+        let Payload::Signal(signal) = payload else {
+            unreachable!("message signals are moved to the message queue before this");
         };
         let cost = match signal {
             arinsal_sched::Signal::Link => {
