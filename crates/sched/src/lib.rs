@@ -67,7 +67,7 @@ mod timer;
 
 pub use mailbox::{InSignal, Incoming, psflg};
 pub use ports::{PortExecution, PortRunQueue, RunPort};
-pub use sig_queue::{OwnedSignal, SignalQueue};
+pub use sig_queue::{MessageQueueList, OwnedSignal, SignalQueue};
 pub use timer::{TimerId, TimerRef};
 
 use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
