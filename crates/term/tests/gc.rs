@@ -81,6 +81,58 @@ fn adopted_message_keeps_term_and_off_heap_owner_through_gc() {
 }
 
 #[test]
+fn gc_moves_a_message_built_in_its_node_fragment() {
+    let payload = vec![0x5a; 100];
+    let mut node = arinsal_term::message::OwnedSignal::with_heap_fragment((), 32);
+    let message = {
+        let mut fragment = node.heap_fragment().unwrap();
+        let binary = TermBuilder::new(&mut fragment).binary(&payload).unwrap();
+        TermBuilder::new(&mut fragment).tuple(&[binary]).unwrap()
+    };
+    let expected = to_owned(message).unwrap();
+    let fragment = node.into_fragment().unwrap();
+
+    let mut receiver = ProcessHeap::with_words(256);
+    let mut messages = [(
+        message,
+        Term::NIL,
+        Some(arinsal_term::message::MessageHeap::Node(fragment)),
+    )];
+    receiver
+        .collect_with_messages(&mut [], &mut [], 0, &mut messages)
+        .unwrap();
+    assert!(messages[0].2.is_none());
+    assert_eq!(receiver.off_heap_count(), 1);
+    assert_eq!(to_owned(messages[0].0).unwrap(), expected);
+
+    let mut roots = [messages[0].0];
+    receiver.collect(&mut roots, &mut [], 0).unwrap();
+    assert_eq!(receiver.off_heap_count(), 1);
+    assert_eq!(to_owned(roots[0]).unwrap(), expected);
+}
+
+#[test]
+fn a_received_node_fragment_is_collected_with_the_process() {
+    let mut node = arinsal_term::message::OwnedSignal::with_heap_fragment(7_u32, 16);
+    let message = {
+        let mut fragment = node.heap_fragment().unwrap();
+        let binary = TermBuilder::new(&mut fragment).binary(&[1; 80]).unwrap();
+        TermBuilder::new(&mut fragment)
+            .tuple(&[binary, Term::small(3).unwrap()])
+            .unwrap()
+    };
+    let expected = to_owned(message).unwrap();
+    let mut receiver = ProcessHeap::with_words(256);
+    receiver.adopt_message_node(node.into_fragment().unwrap());
+    assert_eq!(receiver.off_heap_count(), 1);
+    let mut roots = [message];
+    receiver.collect(&mut roots, &mut [], 0).unwrap();
+    assert_eq!(receiver.fragment_count(), 0);
+    assert_eq!(to_owned(roots[0]).unwrap(), expected);
+    assert_eq!(receiver.off_heap_count(), 1);
+}
+
+#[test]
 fn gc_rebases_message_binary_chains_before_releasing_fragments() {
     let mut message_heap = ProcessHeap::with_words(128);
     let payload = vec![0x5a; 100];
@@ -93,7 +145,11 @@ fn gc_rebases_message_binary_chains_before_releasing_fragments() {
     let expected = to_owned(message).unwrap();
 
     let mut receiver = ProcessHeap::with_words(256);
-    let mut messages = [(message, Term::NIL, Some(message_heap))];
+    let mut messages = [(
+        message,
+        Term::NIL,
+        Some(arinsal_term::message::MessageHeap::Heap(message_heap)),
+    )];
     receiver
         .collect_with_messages(&mut [], &mut [], 0, &mut messages)
         .unwrap();

@@ -48,6 +48,10 @@ pub(crate) enum Fragment {
         used: usize,
         high_water: usize,
     },
+    /// A received message whose data is in the heap fragment inline in its node: erts keeps
+    /// the whole `ErtsMessage` on `p->msg_frag` until the next collection.
+    // Port of erts/emulator/beam/erl_message.c (erts_save_message_in_proc), OTP-29.1.1.
+    Node(crate::message::NodeFragment),
 }
 
 impl Fragment {
@@ -55,12 +59,14 @@ impl Fragment {
         match self {
             Self::Block { memory, .. } => memory.as_ptr(),
             Self::Abandoned { block, .. } => block.as_ptr().cast(),
+            Self::Node(fragment) => fragment.as_ptr(),
         }
     }
     /// Words that hold objects.
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Block { used, .. } | Self::Abandoned { used, .. } => *used,
+            Self::Node(fragment) => fragment.len(),
         }
     }
 }
@@ -1465,6 +1471,33 @@ impl ProcessHeap {
         Ok(())
     }
 
+    /// Keep the inline heap fragment of a received message as a fragment of this process,
+    /// with its off-heap objects linked into this process's lists (`erts_save_message_in_proc`
+    /// for an `ERTS_MSG_COMBINED_HFRAG` message). The words are not copied.
+    // Port of erts/emulator/beam/erl_message.c (erts_save_message_in_proc), OTP-29.1.1.
+    pub fn adopt_message_node(&mut self, mut fragment: crate::message::NodeFragment) {
+        let (owners, bin_vheap) = fragment.take_owners();
+        self.absorb_owners(owners, bin_vheap);
+        self.fragment_words = self
+            .fragment_words
+            .saturating_add(u32::try_from(fragment.len()).unwrap_or(u32::MAX));
+        self.fragments.push(Fragment::Node(fragment));
+    }
+
+    /// Adopt the data of a received message, wherever it was allocated.
+    pub fn adopt_message_heap(
+        &mut self,
+        data: crate::message::MessageHeap,
+    ) -> Result<(), AdoptError> {
+        match data {
+            crate::message::MessageHeap::Heap(heap) => self.adopt_message_fragment(heap),
+            crate::message::MessageHeap::Node(fragment) => {
+                self.adopt_message_node(fragment);
+                Ok(())
+            }
+        }
+    }
+
     /// Flush the heap a dirty job built into this process.
     ///
     /// Port of erts/emulator/beam/erl_nfunc_sched.h (erts_flush_dirty_shadow_proc) and
@@ -1595,6 +1628,7 @@ impl ProcessHeap {
             .iter()
             .filter_map(|fragment| match fragment {
                 Fragment::Block { used, .. } => Some(*used),
+                Fragment::Node(fragment) => Some(fragment.len()),
                 Fragment::Abandoned { .. } => None,
             })
             .fold(self.htop, usize::saturating_add)
@@ -1605,9 +1639,16 @@ impl ProcessHeap {
     // Port of erts/emulator/beam/erl_message.c:980-990 (erts_save_message_in_proc) and
     // erl_gc.c:2524 (OH_OVERHEAD in erts_copy_one_frag), OTP-29.1.1.
     pub(crate) fn absorb_fragment_owners(&mut self, source: &mut ProcessHeap) {
-        if let Some(owners) = source.owners.0.take() {
+        let owners = std::mem::take(&mut source.owners);
+        self.absorb_owners(owners, source.bin_vheap);
+    }
+
+    /// [`ProcessHeap::absorb_fragment_owners`] of the off-heap owners and virtual binary heap
+    /// words of a message fragment.
+    pub(crate) fn absorb_owners(&mut self, mut source: LazyOwners, bin_vheap: u64) {
+        if let Some(owners) = source.0.take() {
             let source_old_vheap = owners.vheap.old;
-            self.bin_vheap = self.bin_vheap.saturating_add(source.bin_vheap);
+            self.bin_vheap = self.bin_vheap.saturating_add(bin_vheap);
             self.owners.vheap.old = self.owners.vheap.old.saturating_add(source_old_vheap);
             if let Some(target) = self.owners.0.as_mut() {
                 Self::prepend_bin_ref_chain(&mut target.off_heap_first, owners.off_heap_first);

@@ -111,6 +111,9 @@ pub struct Message {
     seq_nil: bool,
     /// The alias the message was sent through, 0 for none (checked when it is handled).
     alias: u64,
+    /// The data is in the heap fragment inline in this message's own node
+    /// (`data.attached == ERTS_MSG_COMBINED_HFRAG`).
+    combined: bool,
 }
 
 /// What the sender knows about a message beyond its term: the sequential trace token state
@@ -122,7 +125,7 @@ struct SendMeta {
 }
 
 struct MessageFragment {
-    heap: Option<ProcessHeap>,
+    heap: Option<arinsal_term::message::MessageHeap>,
     seq_token: Option<Box<crate::seq_trace::Token>>,
 }
 
@@ -130,7 +133,7 @@ type RemovedMessage = (Term, crate::seq_trace::SeqState);
 
 /// A queued message whose data is still in its heap fragment, as an on-heap collection moves
 /// it: the term, the copy of its sequential trace token in the same fragment, and the fragment.
-pub(crate) type MovedMessage = (Term, Term, Option<ProcessHeap>);
+pub(crate) type MovedMessage = (Term, Term, Option<arinsal_term::message::MessageHeap>);
 
 /// Which part of a queued message a collection root stands for.
 #[derive(Clone, Copy)]
@@ -165,6 +168,45 @@ impl QueuedMessage {
             from: Pid::from_data(0),
             payload: Payload::Message(message),
         }))
+    }
+}
+
+impl QueuedMessage {
+    /// The words of data held inline in this message's node (`ERTS_MSG_COMBINED_HFRAG`).
+    fn inline_words(&self) -> Option<&[u64]> {
+        if self.combined {
+            self.0.fragment_words()
+        } else {
+            None
+        }
+    }
+
+    /// Move the inline data out as a fragment of its own, leaving the message in a node
+    /// without data (erts_shrink_message to a message reference after
+    /// erts_proc_sig_move_msgs_to_heap or a literal copy moved the data).
+    fn detach_inline(&mut self) -> Option<arinsal_term::message::NodeFragment> {
+        if !self.combined {
+            return None;
+        }
+        self.combined = false;
+        let placeholder = arinsal_sched::OwnedSignal::new(Event {
+            from: Pid::from_data(0),
+            payload: Payload::Message(Message::immediate(Term::NIL)),
+        });
+        let node = std::mem::replace(&mut self.0, placeholder);
+        let (value, fragment) = node.split_fragment();
+        *self.0 = value;
+        fragment
+    }
+
+    /// The node released into the receiver's heap: its inline data becomes a fragment of the
+    /// process (`erts_save_message_in_proc`); any other data was adopted already.
+    fn save_in_process(self, heap: &mut ProcessHeap) {
+        if self.combined
+            && let Some(fragment) = self.0.into_fragment()
+        {
+            heap.adopt_message_node(fragment);
+        }
     }
 }
 
@@ -242,6 +284,7 @@ impl MessageQueue {
         }
     }
 
+    #[cfg(test)]
     /// Append a scheduler message while applying the active queue policy.
     // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message), OTP-29.1.1.
     pub(crate) fn push_message(
@@ -249,6 +292,10 @@ impl MessageQueue {
         message: Message,
         prio_len: usize,
     ) -> Result<usize, VmError> {
+        debug_assert!(
+            !message.combined,
+            "a message with inline data stays in its node"
+        );
         let priority = message.priority;
         let mut new_prio_len = prio_len;
         let mut push = |queue: &mut Self, entry: QueuedMessage| {
@@ -284,9 +331,9 @@ impl MessageQueue {
 
     /// Whether the message's data lives on the receiver's heap (no off-heap fragment holds it).
     pub(crate) fn is_on_heap(&self, index: usize) -> bool {
-        self.entries
-            .get(index)
-            .is_some_and(|entry| entry.fragment.as_ref().is_none_or(|f| f.heap.is_none()))
+        self.entries.get(index).is_some_and(|entry| {
+            !entry.combined && entry.fragment.as_ref().is_none_or(|f| f.heap.is_none())
+        })
     }
 
     /// Words in message fragments that `process_info(total_heap_size)` counts for on-heap queues.
@@ -294,8 +341,14 @@ impl MessageQueue {
     pub(crate) fn attached_message_words(&self) -> usize {
         self.entries
             .iter()
-            .filter_map(|entry| entry.fragment.as_ref()?.heap.as_ref())
-            .map(ProcessHeap::message_data_size)
+            .map(|entry| {
+                entry.inline_words().map_or(0, <[u64]>::len)
+                    + entry
+                        .fragment
+                        .as_ref()
+                        .and_then(|fragment| fragment.heap.as_ref())
+                        .map_or(0, arinsal_term::message::MessageHeap::message_data_size)
+            })
             .fold(0, usize::saturating_add)
     }
 
@@ -354,12 +407,13 @@ impl MessageQueue {
             .as_mut()
             .and_then(|fragment| fragment.heap.take())
         {
-            heap.adopt_message_fragment(heap_fragment)
-                .map_err(|error| {
-                    VmError::Unsupported(format!("message fragment adoption: {error:?}"))
-                })?;
+            heap.adopt_message_heap(heap_fragment).map_err(|error| {
+                VmError::Unsupported(format!("message fragment adoption: {error:?}"))
+            })?;
         }
-        self.entries.pop_front();
+        if let Some(entry) = self.entries.pop_front() {
+            entry.save_in_process(heap);
+        }
         Ok(true)
     }
 
@@ -382,13 +436,16 @@ impl MessageQueue {
                 state = crate::seq_trace::SeqState::Token(token);
             }
             if let Some(heap_fragment) = fragment.heap.take() {
-                heap.adopt_message_fragment(heap_fragment)
-                    .map_err(|error| {
-                        VmError::Unsupported(format!("message fragment adoption: {error:?}"))
-                    })?;
+                heap.adopt_message_heap(heap_fragment).map_err(|error| {
+                    VmError::Unsupported(format!("message fragment adoption: {error:?}"))
+                })?;
             }
         }
-        let removed = self.entries.remove(index).map(|entry| (entry.term, state));
+        let removed = self.entries.remove(index).map(|entry| {
+            let term = entry.term;
+            entry.save_in_process(heap);
+            (term, state)
+        });
         let prio_len = prio_len - usize::from(removed.is_some() && index < prio_len);
         Ok((removed, prio_len))
     }
@@ -400,10 +457,11 @@ impl MessageQueue {
         let mut slots = Vec::new();
         let mut roots = Vec::new();
         for (index, entry) in self.entries.iter().enumerate() {
-            let on_heap = entry
-                .fragment
-                .as_ref()
-                .is_none_or(|fragment| fragment.heap.is_none());
+            let on_heap = !entry.combined
+                && entry
+                    .fragment
+                    .as_ref()
+                    .is_none_or(|fragment| fragment.heap.is_none());
             if !on_heap {
                 continue;
             }
@@ -435,6 +493,11 @@ impl MessageQueue {
     pub(crate) fn has_literal_area_reference(&self, area: &RetiredArea) -> bool {
         self.entries.iter().any(|entry| {
             area.contains(entry.term)
+                || entry.inline_words().is_some_and(|words| {
+                    arinsal_term::message::words_have_heap_reference(words, |term| {
+                        area.contains(term)
+                    })
+                })
                 || entry
                     .fragment
                     .as_ref()
@@ -448,11 +511,12 @@ impl MessageQueue {
         self.entries
             .iter()
             .map(|entry| {
-                1 + entry
-                    .fragment
-                    .as_ref()
-                    .and_then(|fragment| fragment.heap.as_ref())
-                    .map_or(0, ProcessHeap::literal_scan_words)
+                1 + entry.inline_words().map_or(0, <[u64]>::len)
+                    + entry
+                        .fragment
+                        .as_ref()
+                        .and_then(|fragment| fragment.heap.as_ref())
+                        .map_or(0, arinsal_term::message::MessageHeap::literal_scan_words)
             })
             .sum()
     }
@@ -468,6 +532,11 @@ impl MessageQueue {
         let mut copied = 0;
         for entry in &mut self.entries {
             let references_area = area.contains(entry.term)
+                || entry.inline_words().is_some_and(|words| {
+                    arinsal_term::message::words_have_heap_reference(words, |term| {
+                        area.contains(term)
+                    })
+                })
                 || entry
                     .fragment
                     .as_ref()
@@ -488,6 +557,7 @@ impl MessageQueue {
             if let Some(fragment) = entry.fragment.as_mut() {
                 fragment.heap = None;
             }
+            drop(entry.detach_inline());
             copied += 1;
         }
         Ok(copied)
@@ -501,6 +571,15 @@ impl MessageQueue {
         let mut indices = Vec::new();
         let mut fragments = Vec::new();
         for (index, entry) in self.entries.iter_mut().enumerate() {
+            if let Some(fragment) = entry.detach_inline() {
+                indices.push(index);
+                fragments.push((
+                    entry.term,
+                    Term::NIL,
+                    Some(arinsal_term::message::MessageHeap::Node(fragment)),
+                ));
+                continue;
+            }
             if let Some(fragment) = entry.fragment.as_mut()
                 && let Some(heap) = fragment.heap.take()
             {
@@ -520,6 +599,14 @@ impl MessageQueue {
         for (&index, (term, token, heap)) in indices.iter().zip(moved) {
             let entry = &mut self.entries[index];
             entry.term = term;
+            if entry.fragment.is_none() && heap.is_some() {
+                // A detached inline fragment the collection did not consume stays the
+                // message's data as a fragment of its own.
+                entry.fragment = Some(Box::new(MessageFragment {
+                    heap: None,
+                    seq_token: None,
+                }));
+            }
             if let Some(fragment) = entry.fragment.as_mut() {
                 if let Some(seq_token) = fragment.seq_token.as_mut() {
                     *seq_token.heap_ref_mut() = token;
@@ -567,6 +654,7 @@ impl Message {
     /// `erts_try_alloc_message_on_heap`), not in its own fragment.
     fn is_heap_root(&self) -> bool {
         self.term.is_pointer()
+            && !self.combined
             && self
                 .fragment
                 .as_ref()
@@ -611,7 +699,7 @@ impl Message {
         Self {
             term,
             fragment: Some(Box::new(MessageFragment {
-                heap: Some(heap),
+                heap: Some(arinsal_term::message::MessageHeap::Heap(heap)),
                 seq_token: None,
             })),
             priority: false,
@@ -620,6 +708,7 @@ impl Message {
             receive_traced: false,
             seq_nil: false,
             alias: 0,
+            combined: false,
         }
     }
 
@@ -675,7 +764,7 @@ impl Message {
         Ok(Self {
             term,
             fragment: Some(Box::new(MessageFragment {
-                heap: Some(fragment),
+                heap: Some(arinsal_term::message::MessageHeap::Heap(fragment)),
                 seq_token: None,
             })),
             priority: false,
@@ -684,7 +773,45 @@ impl Message {
             receive_traced: false,
             seq_nil: false,
             alias: 0,
+            combined: false,
         })
+    }
+
+    /// The message node of a send: `erts_alloc_message(sz, &hp)` then `copy_struct` into the
+    /// node's own heap fragment, so the message and its data are one allocation
+    /// (`ERTS_MSG_COMBINED_HFRAG`). `words` is `size_object_litopt(term, literals)`.
+    // Port of erts/emulator/beam/erl_message.c (erts_send_message) and erl_message.h
+    // (erts_alloc_message), OTP-29.1.1.
+    fn node_counted(
+        from: Pid,
+        term: Term,
+        words: usize,
+        literals: &arinsal_term::LiteralAreas,
+    ) -> Result<MessageNode, VmError> {
+        let mut message = Self::immediate(term);
+        if words == 0 {
+            return Ok(arinsal_sched::OwnedSignal::new(Event {
+                from,
+                payload: Payload::Message(message),
+            }));
+        }
+        message.combined = true;
+        let mut node = arinsal_sched::OwnedSignal::with_heap_fragment(
+            Event {
+                from,
+                payload: Payload::Message(message),
+            },
+            words,
+        );
+        let copied = {
+            let mut fragment = node.heap_fragment().expect("inline heap fragment");
+            copy_struct_litopt(term, &mut fragment, words, literals)
+                .map_err(|error| VmError::Unsupported(format!("message copy: {error:?}")))?
+        };
+        if let Payload::Message(message) = &mut node.payload {
+            message.term = copied;
+        }
+        Ok(node)
     }
 
     fn immediate(term: Term) -> Self {
@@ -697,6 +824,7 @@ impl Message {
             receive_traced: false,
             seq_nil: false,
             alias: 0,
+            combined: false,
         }
     }
 
@@ -727,7 +855,7 @@ impl Message {
         Ok(Self {
             term: request,
             fragment: Some(Box::new(MessageFragment {
-                heap: Some(heap),
+                heap: Some(arinsal_term::message::MessageHeap::Heap(heap)),
                 seq_token: None,
             })),
             priority: false,
@@ -736,19 +864,22 @@ impl Message {
             receive_traced: false,
             seq_nil: false,
             alias: 0,
+            combined: false,
         })
     }
 
     /// Append the collector reply to its original request fragment.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8083 (`send_cla_reply`), OTP-29.1.1.
     pub(crate) fn literal_copy_reply(mut self, result: Term) -> Result<Self, VmError> {
-        let heap = self
+        let Some(arinsal_term::message::MessageHeap::Heap(heap)) = self
             .fragment
             .as_mut()
             .and_then(|fragment| fragment.heap.as_mut())
-            .ok_or_else(|| {
-                VmError::Unsupported("literal-copy request lost its heap fragment".into())
-            })?;
+        else {
+            return Err(VmError::Unsupported(
+                "literal-copy request lost its heap fragment".into(),
+            ));
+        };
         self.term = TermBuilder::new(heap)
             .tuple(&[crate::signals::atom("copy_literals"), self.term, result])
             .map_err(|error| VmError::Unsupported(format!("literal-copy reply: {error:?}")))?;
@@ -815,6 +946,10 @@ impl Message {
     }
 
     pub(crate) fn into_receiver(self, process: &mut Process) -> Result<Term, VmError> {
+        debug_assert!(
+            !self.combined,
+            "a message with inline data stays in its node"
+        );
         if self.fragment.is_none() {
             // Immediate, literal, or already placed on this heap
             // (erl_message.c:657, `attached == NULL`).
@@ -846,7 +981,7 @@ impl Message {
         {
             process
                 .heap
-                .adopt_message_fragment(heap_fragment)
+                .adopt_message_heap(heap_fragment)
                 .map_err(|error| {
                     VmError::Unsupported(format!("message fragment adoption: {error:?}"))
                 })?;
@@ -933,6 +1068,7 @@ fn message_on_receiver_heap(
         receive_traced: false,
         seq_nil: false,
         alias: 0,
+        combined: false,
     };
     if priority {
         envelope = envelope.with_priority();
@@ -5746,6 +5882,14 @@ impl Process {
     /// the term once, try the receiver's heap, else queue a copy.
     // Port of erts/emulator/beam/erl_message.c (erts_send_message from the size computation on),
     // OTP-29.1.1.
+    /// A message envelope in a node of its own.
+    fn message_node(from: Pid, envelope: Message) -> MessageNode {
+        arinsal_sched::OwnedSignal::new(Event {
+            from,
+            payload: Payload::Message(envelope),
+        })
+    }
+
     fn send_counted(
         &mut self,
         mut ctx: Option<&mut RunCtx<'_, Message>>,
@@ -5770,7 +5914,7 @@ impl Process {
             }
             envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
             envelope.alias = seq_token.alias;
-            (envelope, 0)
+            (Self::message_node(sender, envelope), 0)
         } else {
             // Size once. The on-heap attempt and the fragment fallback both consume it
             // (erts_send_message: size_object_litopt, then alloc, then copy_struct_litopt).
@@ -5809,30 +5953,38 @@ impl Process {
                 self.bump_send_reds(ctx.as_deref_mut(), pid == sender, words);
                 return Ok(value);
             }
-            let envelope = if let Some(envelope) = on_heap {
-                envelope
-            } else {
-                let token = match &mut seq_token.seq {
-                    crate::seq_trace::SeqState::Token(token) => Some(token.as_mut()),
-                    _ => None,
-                };
-                let mut envelope = Message::copy_counted(value, words, token, &literals)?;
+            let node = if let Some(envelope) = on_heap {
+                Self::message_node(sender, envelope)
+            } else if let crate::seq_trace::SeqState::Token(token) = &mut seq_token.seq {
+                let mut envelope =
+                    Message::copy_counted(value, words, Some(token.as_mut()), &literals)?;
                 if via_prio_alias {
                     envelope = envelope.with_priority();
                 }
                 envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
                 envelope.alias = seq_token.alias;
-                envelope
+                Self::message_node(sender, envelope)
+            } else {
+                // Port of erts/emulator/beam/erl_message.c (erts_send_message): the message
+                // and its data in one allocation.
+                let mut node = Message::node_counted(sender, value, words, &literals)?;
+                if let Payload::Message(envelope) = &mut node.payload {
+                    envelope.priority = via_prio_alias;
+                    envelope.apply_seq_state(std::mem::take(&mut seq_token.seq));
+                    envelope.alias = seq_token.alias;
+                }
+                node
             };
-            (envelope, words)
+            (node, words)
         };
+        let node = envelope;
         let delivered = match ctx.as_deref_mut() {
             Some(ctx) => {
                 let shared = on_own_heap && value.is_pointer();
                 let delivered = if pid == sender {
-                    ctx.send_self(envelope)
+                    ctx.send_self_node(node)
                 } else {
-                    ctx.send(pid, envelope)
+                    ctx.send_node(pid, node)
                 };
                 // A buffered message names a term on this heap. Publish it before anything
                 // can collect, so the signal queue holds it as a root.
@@ -5852,22 +6004,22 @@ impl Process {
                         .as_ref()
                         .and_then(|cold| cold.signal_probe.as_ref())
                 {
-                    probe.send_self(pid, envelope)
+                    probe.send_self_node(pid, node)
                 } else {
                     match if pid == sender {
-                        Err(envelope)
+                        Err(node)
                     } else {
-                        arinsal_sched::native_send(sender, pid, envelope)
+                        arinsal_sched::native_send_node(pid, node)
                     } {
                         Ok(delivered) => delivered,
-                        Err(envelope) => self
+                        Err(node) => self
                             .runtime
                             .as_ref()
                             .ok_or_else(|| {
                                 VmError::Unsupported("send requires a scheduler".into())
                             })?
                             .scheduler()?
-                            .send(sender, pid, envelope),
+                            .send_node(pid, node),
                     }
                 }
             }
@@ -6846,14 +6998,15 @@ impl Process {
         let fetched =
             probe.fetch_messages_if(|message| !message.is_altact_msg(), &mut self.sig_cont);
         self.cold_mut().signal_probe = Some(probe);
-        while let Some(Event { payload, .. }) = self.sig_cont.pop_front() {
+        while let Some(node) = self.sig_cont.pop_front_signal() {
             self.sig_cont_taken += 1;
-            let Payload::Message(message) = payload else {
-                unreachable!("fetch_messages_if takes messages only");
-            };
+            debug_assert!(
+                matches!(node.payload, Payload::Message(_)),
+                "fetch_messages_if takes messages only"
+            );
             let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
             let before = self.message_words_before();
-            let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
+            let new_prio_len = self.inbox.push_message_node(node, old_prio_len);
             self.uncount_message_words(before);
             self.cold_mut().prio_len = new_prio_len;
         }
