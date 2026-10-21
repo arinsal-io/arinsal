@@ -1727,9 +1727,15 @@ impl ProcessHeap {
 
     /// Set the process minimum used by virtual binary heap growth.
     pub fn set_min_bin_vheap_size(&mut self, words: u64) {
-        self.owners.vheap.min = words.max(46_422);
-        self.bin_vheap_size = self.bin_vheap_size.max(self.owners.vheap.min);
-        self.owners.vheap.old_size = self.owners.vheap.old_size.max(self.owners.vheap.min);
+        let min = words.max(46_422);
+        self.bin_vheap_size = self.bin_vheap_size.max(min);
+        // erts keeps `min_vheap_size` in the process; the owner box is created only when the
+        // value differs from what it already holds (the default for a new process).
+        if min == self.owners.vheap_min() && self.owners.vheap_old_size() >= min {
+            return;
+        }
+        self.owners.vheap.min = min;
+        self.owners.vheap.old_size = self.owners.vheap.old_size.max(min);
     }
 
     /// Account `words` of virtual binary heap to the young or old counter.
