@@ -100,8 +100,11 @@ pub struct Message {
     /// When set, the receiver inserts this into the priority section of its
     /// private message queue (OTP 28+ priority messages).
     priority: bool,
-    /// The VM timer id carried until delivery so expiry and cancellation release its message.
-    timer_id: Option<u64>,
+    /// The VM timer id carried until delivery so expiry and cancellation release its message;
+    /// meaningful only when `has_timer_id` is set. Kept as a word and a flag beside the other
+    /// flags rather than an `Option<u64>`, which would widen every queued event by a word.
+    timer_id: u64,
+    has_timer_id: bool,
     /// The port connected handshake traces receipt before unblocking the recipient.
     receive_traced: bool,
     /// Sent by a process without a seq_trace token (`ERL_MESSAGE_TOKEN == NIL`).
@@ -585,7 +588,8 @@ impl Message {
                 seq_token: None,
             })),
             priority: false,
-            timer_id: None,
+            timer_id: 0,
+            has_timer_id: false,
             receive_traced: false,
             seq_nil: false,
             alias: 0,
@@ -648,7 +652,8 @@ impl Message {
                 seq_token: None,
             })),
             priority: false,
-            timer_id: None,
+            timer_id: 0,
+            has_timer_id: false,
             receive_traced: false,
             seq_nil: false,
             alias: 0,
@@ -660,7 +665,8 @@ impl Message {
             term,
             fragment: None,
             priority: false,
-            timer_id: None,
+            timer_id: 0,
+            has_timer_id: false,
             receive_traced: false,
             seq_nil: false,
             alias: 0,
@@ -698,7 +704,8 @@ impl Message {
                 seq_token: None,
             })),
             priority: false,
-            timer_id: None,
+            timer_id: 0,
+            has_timer_id: false,
             receive_traced: false,
             seq_nil: false,
             alias: 0,
@@ -732,8 +739,14 @@ impl Message {
         self
     }
 
+    /// The VM timer id this message carries, if it was sent by a timer.
+    fn timer_id(&self) -> Option<u64> {
+        self.has_timer_id.then_some(self.timer_id)
+    }
+
     pub(crate) fn with_timer_id(mut self, id: u64) -> Self {
-        self.timer_id = Some(id);
+        self.timer_id = id;
+        self.has_timer_id = true;
         self
     }
 
@@ -888,7 +901,8 @@ fn message_on_receiver_heap(
         term,
         fragment: None,
         priority: false,
-        timer_id: None,
+        timer_id: 0,
+        has_timer_id: false,
         receive_traced: false,
         seq_nil: false,
         alias: 0,
@@ -4810,9 +4824,10 @@ impl Process {
                     }
                     let _ = ctx.signal(from, Signal::UnlinkAckSignal(id));
                 }
-                Payload::Signal(Signal::LiteralAreaCopy {
-                    request, requester, ..
-                }) => {
+                Payload::Signal(Signal::LiteralAreaCopy(copy)) => {
+                    let arinsal_sched::LiteralAreaCopyRequest {
+                        request, requester, ..
+                    } = *copy;
                     let _ = crate::natives::sys::reply_exiting_literal_area(
                         self, ctx, request, requester,
                     );
@@ -4824,12 +4839,13 @@ impl Process {
                 }
                 // Port of erl_proc_sig_queue.c:7408 (erts_proc_exit_handle_signal,
                 // ERTS_SIG_Q_OP_SYNC_SUSPEND), OTP-29.1.1: answered from the exiting state.
-                Payload::Signal(Signal::SyncSuspend {
-                    requester,
-                    tag,
-                    reply,
-                    async_,
-                }) => {
+                Payload::Signal(Signal::SyncSuspend(sync)) => {
+                    let arinsal_sched::SyncSuspendRequest {
+                        requester,
+                        tag,
+                        reply,
+                        async_,
+                    } = *sync;
                     let _ =
                         crate::suspend::sync_reply(self, ctx, requester, tag, reply, async_, true);
                 }
@@ -6177,7 +6193,7 @@ impl Process {
                 }
             }
             Payload::Timer { reference, message } => {
-                let timer_id = message.timer_id;
+                let timer_id = message.timer_id();
                 let term = message.into_receiver(self)?;
                 let id = timer_id.or(reference.ref_key()).unwrap_or(reference.id());
                 let reference = crate::signals::reference(self, id)?;
@@ -6266,12 +6282,13 @@ impl Process {
                 crate::suspend::suspend_self(self);
                 2
             }
-            arinsal_sched::Signal::SyncSuspend {
-                requester,
-                tag,
-                reply,
-                async_,
-            } => {
+            arinsal_sched::Signal::SyncSuspend(sync) => {
+                let arinsal_sched::SyncSuspendRequest {
+                    requester,
+                    tag,
+                    reply,
+                    async_,
+                } = *sync;
                 crate::suspend::sync_reply(self, ctx, requester, tag, reply, async_, false)?;
                 2
             }
@@ -6348,7 +6365,8 @@ impl Process {
                 2
             }
             // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
-            arinsal_sched::Signal::PortExit { port, reason } => {
+            arinsal_sched::Signal::PortExit(exit) => {
+                let arinsal_sched::PortExitSignal { port, reason } = *exit;
                 let port = port.into_receiver(self)?;
                 let reason = reason.into_receiver(self)?;
                 if reason == crate::signals::atom("kill") {
@@ -6427,12 +6445,13 @@ impl Process {
                 }
                 0
             }
-            arinsal_sched::Signal::LiteralAreaCopy {
-                area_id,
-                request,
-                how,
-                requester,
-            } => {
+            arinsal_sched::Signal::LiteralAreaCopy(copy) => {
+                let arinsal_sched::LiteralAreaCopyRequest {
+                    area_id,
+                    request,
+                    how,
+                    requester,
+                } = *copy;
                 if !self.heap.gc_enabled && how != arinsal_sched::LiteralCopyHow::Init {
                     self.cold_mut()
                         .delayed_gc
@@ -7639,7 +7658,7 @@ impl arinsal_sched::SignalMessage for Message {
         self.priority || self.alias != 0
     }
     fn timer_ref_key(&self) -> Option<u64> {
-        self.timer_id
+        self.timer_id()
     }
 }
 
@@ -7824,9 +7843,10 @@ impl Task for Process {
                 }
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
                 // OTP-29.1.1: an exiting process still answers a queued literal-copy request.
-                Payload::Signal(Signal::LiteralAreaCopy {
-                    request, requester, ..
-                }) => {
+                Payload::Signal(Signal::LiteralAreaCopy(copy)) => {
+                    let arinsal_sched::LiteralAreaCopyRequest {
+                        request, requester, ..
+                    } = *copy;
                     if let Ok(reply) = request.literal_copy_reply(crate::signals::atom("ok")) {
                         literal_replies.push((requester, reply));
                     }
@@ -8833,5 +8853,17 @@ mod layout_tests {
             std::mem::size_of::<std::collections::VecDeque<arinsal_term::Term>>(),
             std::mem::size_of::<arinsal_sched::RunOutcome>()
         );
+    }
+
+    #[test]
+    fn queued_event_stays_compact() {
+        // Every message and signal crosses the in-queue and the middle queue as an `Event`, so
+        // its size is copied on each send and fetch. The rare wide signals (port exit, sync
+        // suspend, literal-area copy) are boxed and a fired timer carries only its id, which
+        // keeps an event within one 64-byte cache line.
+        assert_eq!(std::mem::size_of::<Message>(), 40);
+        assert_eq!(std::mem::size_of::<arinsal_sched::Signal<Message>>(), 56);
+        assert_eq!(std::mem::size_of::<arinsal_sched::Payload<Message>>(), 56);
+        assert_eq!(std::mem::size_of::<arinsal_sched::Event<Message>>(), 64);
     }
 }

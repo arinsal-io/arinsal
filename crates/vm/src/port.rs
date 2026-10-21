@@ -2325,10 +2325,10 @@ fn notify_links_monitors(
             let _ = scheduler.signal(
                 from,
                 linked,
-                arinsal_sched::Signal::PortExit {
+                arinsal_sched::Signal::PortExit(Box::new(arinsal_sched::PortExitSignal {
                     port: port_message,
                     reason: reason_message,
-                },
+                })),
             );
         }
     }
@@ -2385,7 +2385,10 @@ fn signal_port_exit(handle: &PortHandle, id: u64, reason: Term) {
         let _ = handle.scheduler.signal(
             owner,
             owner,
-            arinsal_sched::Signal::PortExit { port, reason },
+            arinsal_sched::Signal::PortExit(Box::new(arinsal_sched::PortExitSignal {
+                port,
+                reason,
+            })),
         );
     }
 }
