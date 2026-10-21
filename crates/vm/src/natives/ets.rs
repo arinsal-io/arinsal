@@ -2708,7 +2708,7 @@ fn call_inner(
                             if let Some(started_interval) = rt
                                 .scheduler()
                                 .map_err(|_| badarg())?
-                                .started_interval(heir_pid)
+                                .heir_started_interval(heir_pid)
                             {
                                 opts.heir = Some(Heir {
                                 started_interval,
@@ -2915,7 +2915,7 @@ fn call_inner(
                         let started = rt
                             .scheduler()
                             .map_err(|_| badarg())?
-                            .started_interval(pid);
+                            .heir_started_interval(pid);
                         heir = Some(started.map(|started_interval| Heir {
                             pid: pid_term,
                             data,
