@@ -158,6 +158,9 @@ pub(crate) struct DispatchTarget {
     pub native_bits: usize,
     /// The BIF has a continuation entry in `bif_traps`; others skip that table on every call.
     pub trap_entry: bool,
+    /// The MFA is a light (not heap) BIF in the BIF table (erts `Export.bif_number` with the
+    /// light-BIF kind), looked up once at intern.
+    pub light_kind: bool,
     /// `lists:keyfind/3`, `member/2`, `++` and `--`. Set once at intern so the
     /// light-BIF path does not compare the MFA strings on every call. The scan
     /// still runs as the plain BIF; trap state is built only when its counter
@@ -179,6 +182,12 @@ pub(crate) struct DispatchTarget {
     /// The trapping BIF a light BIF call runs straight away; it leaves native code only when
     /// it traps (see `bif_traps::call_light`).
     pub(crate) light_trap_bif: Option<&'static crate::bif_traps::Entry>,
+}
+
+/// Whether `module:function/arity` is a light BIF of the BIF table.
+fn light_kind(module: &str, function: &str, arity: u8) -> bool {
+    arinsal_spec::bif_lookup(module, function, arity)
+        .is_some_and(|bif| bif.kind != arinsal_spec::BifKind::Hbif)
 }
 
 impl DispatchTarget {
@@ -575,6 +584,7 @@ pub(crate) fn export_get_or_make_stub(
             slot: new_export_slot(mfa, trampoline, save_calls),
             scope,
             trap_entry: crate::bif_traps::traps(&module, &function, mfa.2),
+            light_kind: light_kind(&module, &function, mfa.2),
             list_slice: false,
             direct_ets: crate::natives::ets::direct_entry(&module, &function, mfa.2)
                 .or_else(|| crate::natives::proc::direct_dictionary(&module, &function, mfa.2)),
@@ -639,6 +649,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
                 slot: new_export_slot(mfa, trampoline, save_calls),
                 scope,
                 trap_entry: crate::bif_traps::traps(&import.module, &import.function, import.arity),
+                light_kind: light_kind(&import.module, &import.function, import.arity),
                 list_slice: false,
                 direct_ets: crate::natives::ets::direct_entry(
                     &import.module,
@@ -689,6 +700,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             slot: new_export_slot(key, trampoline, save_calls),
             scope: 0,
             trap_entry: crate::bif_traps::traps(module, function, arity),
+            light_kind: light_kind(module, function, arity),
             list_slice: false,
             direct_ets: crate::natives::ets::direct_entry(module, function, arity)
                 .or_else(|| crate::natives::proc::direct_dictionary(module, function, arity)),
@@ -730,6 +742,7 @@ fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, u
                 slot: new_export_slot(mfa, trampoline, save_calls),
                 scope,
                 trap_entry: crate::bif_traps::traps(&module.name, &export.function, export.arity),
+                light_kind: light_kind(&module.name, &export.function, export.arity),
                 list_slice: false,
                 direct_ets: crate::natives::ets::direct_entry(
                     &module.name,
