@@ -1106,7 +1106,7 @@ struct Process<T: Task> {
     /// wheel holds it. Inserted when the timer is created, removed when it fires or is
     /// canceled, and walked on exit (erts_cancel_bif_timers). The lock is the timer's own
     /// (ERTS_PROC_LOCK_BTM), not a global one.
-    btm: Mutex<ProcBtm<T::Message>>,
+    btm: parking_lot::Mutex<ProcBtm<T::Message>>,
     /// See [`proc_flags`]. Read on exit without the process cell lock.
     exit_flags: Arc<AtomicU32>,
     /// `p->common.u.alive.reg->name`, or [`u32::MAX`] when the process has no name.
@@ -1125,7 +1125,8 @@ struct Process<T: Task> {
     dirty_runner: AtomicUsize,
     /// Priority level whose run queue length counts this queued process.
     queued_prio: AtomicU8,
-    cell: Mutex<TaskCell<T>>,
+    /// The process main lock: embedded in the process, as erts' `p->lock`, with no allocation.
+    cell: parking_lot::Mutex<TaskCell<T>>,
 }
 
 impl<T: Task> Process<T> {
@@ -1235,7 +1236,7 @@ impl<T: Task> ProcessTable<T> {
             wait_epoch: AtomicU64::new(0),
             timer_epoch_used: AtomicBool::new(false),
             bif_timer_wheels: AtomicU64::new(0),
-            btm: Mutex::new(ProcBtm {
+            btm: parking_lot::Mutex::new(ProcBtm {
                 tree: std::collections::BTreeMap::new(),
                 paused: None,
             }),
@@ -1247,7 +1248,7 @@ impl<T: Task> ProcessTable<T> {
             dirty: AtomicU8::new(0),
             dirty_runner: AtomicUsize::new(0),
             queued_prio: AtomicU8::new(0),
-            cell: Mutex::new(TaskCell { task }),
+            cell: parking_lot::Mutex::new(TaskCell { task }),
         });
         // Publication needs only the release store. Flushing the epoch bag on
         // every spawn forced a global reclamation check in the hot path.
@@ -1314,7 +1315,7 @@ impl<T: Task> ProcessTable<T> {
             for pid in pids {
                 // A process still held by a blocked worker keeps its cell; it is only detached.
                 if let Some(process) = self.load_slot(self.index(pid))
-                    && let Ok(mut cell) = process.cell.try_lock()
+                    && let Some(mut cell) = process.cell.try_lock()
                 {
                     cell.task.scheduler_shutdown();
                 }
@@ -1502,11 +1503,10 @@ fn receiver_heap_stable<T: Task>(process: &Process<T>) -> bool {
     state != RUNNING && state != EXITED && process.dirty_runner.load(Ordering::Acquire) == 0
 }
 
-fn lock_cell<T: Task>(process: &Process<T>) -> std::sync::MutexGuard<'_, TaskCell<T>> {
+fn lock_cell<T: Task>(process: &Process<T>) -> parking_lot::MutexGuard<'_, TaskCell<T>> {
     match process.cell.try_lock() {
-        Ok(cell) => cell,
-        Err(std::sync::TryLockError::WouldBlock) => progress_wait(|| process.cell.lock().unwrap()),
-        Err(std::sync::TryLockError::Poisoned(error)) => panic!("task cell poisoned: {error}"),
+        Some(cell) => cell,
+        None => progress_wait(|| process.cell.lock()),
     }
 }
 
@@ -2932,7 +2932,7 @@ impl<T: Task> Inner<T> {
                             // a timer for a process whose timers are paused is created paused.
                             // The paused check and the link are one step under the paused lock,
                             // so a pause started meanwhile sees this timer in the tree.
-                            let mut btm = process.btm.lock().unwrap();
+                            let mut btm = process.btm.lock();
                             if btm.paused.is_some() {
                                 return true;
                             }
@@ -2948,7 +2948,7 @@ impl<T: Task> Inner<T> {
                     }
                     LinkEvent::Unlink(pid, id) => {
                         self.table.with_live(pid, |process| {
-                            process.btm.lock().unwrap().tree.remove(&id);
+                            process.btm.lock().tree.remove(&id);
                         });
                     }
                     LinkEvent::Stash(pid, remaining, payload) => {
@@ -2971,7 +2971,7 @@ impl<T: Task> Inner<T> {
         let rejected = {
             let mut payload = Some(payload);
             self.table.with_live(pid, |process| {
-                if let Some(paused) = process.btm.lock().unwrap().paused.as_mut() {
+                if let Some(paused) = process.btm.lock().paused.as_mut() {
                     paused
                         .list
                         .push((remaining, payload.take().expect("payload present")));
@@ -2991,7 +2991,7 @@ impl<T: Task> Inner<T> {
     fn destroy_paused_bif_timers(&self, pid: Pid) {
         // Port of erts/emulator/beam/erl_hl_timer.c:2988 (erts_destroy_paused_bif_timers).
         self.table.with_live(pid, |process| {
-            process.btm.lock().unwrap().paused.take();
+            process.btm.lock().paused.take();
         });
     }
 
@@ -3002,7 +3002,6 @@ impl<T: Task> Inner<T> {
                 process
                     .btm
                     .lock()
-                    .unwrap()
                     .tree
                     .iter()
                     .filter(|(_, owner)| **owner == worker)
@@ -3025,7 +3024,7 @@ impl<T: Task> Inner<T> {
             return;
         }
         {
-            let mut btm = process.btm.lock().unwrap();
+            let mut btm = process.btm.lock();
             if let Some(paused) = btm.paused.as_mut() {
                 paused.count += 1;
                 return;
@@ -3062,7 +3061,7 @@ impl<T: Task> Inner<T> {
     /// identity, on the resuming scheduler's wheel.
     fn resume_bif_timers(&self, pid: Pid, process: &Process<T>) {
         let list = {
-            let mut btm = process.btm.lock().unwrap();
+            let mut btm = process.btm.lock();
             let Some(held) = btm.paused.as_mut() else {
                 return;
             };
@@ -4984,8 +4983,8 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             return DirtySignals::Idle;
         }
         let mut cell = match process.cell.try_lock() {
-            Ok(cell) => cell,
-            Err(_) => return state(&process).unwrap_or(DirtySignals::More),
+            Some(cell) => cell,
+            None => return state(&process).unwrap_or(DirtySignals::More),
         };
         if let Some(result) = state(&process) {
             return result;
@@ -5017,7 +5016,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             _ => Ok(()),
         };
         check(&process)?;
-        let mut cell = process.cell.try_lock().map_err(|_| SignalFreeError::Busy)?;
+        let mut cell = process.cell.try_lock().ok_or(SignalFreeError::Busy)?;
         check(&process)?;
         self.run_as_target(&process, &mut cell, pid, remaining, &mut |task, ctx| {
             handle(task, ctx);
@@ -5995,8 +5994,8 @@ impl<T: Task> Scheduler<T> {
                 // ERTS uses `erts_proc_trylock`; waiting for a running target here would
                 // turn a cheap process_info into a scheduler stall.
                 let cell = match process.cell.try_lock() {
-                    Ok(cell) => cell,
-                    Err(_) => return Err(SignalFreeError::Busy),
+                    Some(cell) => cell,
+                    None => return Err(SignalFreeError::Busy),
                 };
                 let state = process.run_state().load(Ordering::Acquire);
                 if state == EXITED {
@@ -6032,8 +6031,8 @@ impl<T: Task> Scheduler<T> {
             return Err(SignalFreeError::Busy);
         }
         let mut cell = match process.cell.try_lock() {
-            Ok(cell) => cell,
-            Err(_) => return Err(SignalFreeError::Busy),
+            Some(cell) => cell,
+            None => return Err(SignalFreeError::Busy),
         };
         let state = process.run_state().load(Ordering::Acquire);
         if state == EXITED {
@@ -6059,10 +6058,7 @@ impl<T: Task> Scheduler<T> {
         if !receiver_heap_stable(&process) {
             return None;
         }
-        let mut cell = match process.cell.try_lock() {
-            Ok(cell) => cell,
-            Err(_) => return None,
-        };
+        let mut cell = process.cell.try_lock()?;
         if !receiver_heap_stable(&process) {
             return None;
         }
@@ -6087,8 +6083,8 @@ impl<T: Task> Scheduler<T> {
             return Ok(OnHeapSend::Unavailable);
         }
         let mut cell = match process.cell.try_lock() {
-            Ok(cell) => cell,
-            Err(_) => return Ok(OnHeapSend::Unavailable),
+            Some(cell) => cell,
+            None => return Ok(OnHeapSend::Unavailable),
         };
         if !receiver_heap_stable(&process) {
             return Ok(OnHeapSend::Unavailable);
@@ -6444,7 +6440,7 @@ impl<T: Task> Scheduler<T> {
     pub fn bif_timers_of(&self, pid: Pid) -> usize {
         self.inner
             .table
-            .with_live(pid, |process| process.btm.lock().unwrap().tree.len())
+            .with_live(pid, |process| process.btm.lock().tree.len())
             .unwrap_or(0)
     }
 
@@ -6984,7 +6980,7 @@ mod dirty_state_tests {
         target.dirty_runner.store(1, Ordering::Release);
         assert!(scheduler.try_with_task(to, |_| ()).is_none());
         target.dirty_runner.store(0, Ordering::Release);
-        let _held = target.cell.lock().unwrap();
+        let _held = target.cell.lock();
         assert!(scheduler.try_with_task(to, |_| ()).is_none());
     }
 }
@@ -7517,7 +7513,7 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
             if !receiver_heap_stable(process) {
                 return OnHeapSend::Unavailable;
             }
-            let Ok(mut cell) = process.cell.try_lock() else {
+            let Some(mut cell) = process.cell.try_lock() else {
                 return OnHeapSend::Unavailable;
             };
             if !receiver_heap_stable(process) {
