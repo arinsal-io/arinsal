@@ -2,9 +2,10 @@
 //! queue with selective-receive save positions.
 
 use parking_lot::Mutex;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+
+use crate::sig_queue::{OwnedSignal, SignalQueue};
 
 const SIGNAL_BUFFER_COUNT: usize = 64;
 const BUFFER_CONTENTION_INSTALL_LIMIT: usize = 50;
@@ -60,7 +61,7 @@ pub struct QueueClosed;
 struct SignalBuffer<T> {
     /// Cleared when the buffers are uninstalled; a sender then enqueues directly.
     alive: bool,
-    queue: VecDeque<T>,
+    queue: SignalQueue<T>,
 }
 
 type SignalBuffers<T> = [Mutex<SignalBuffer<T>>; SIGNAL_BUFFER_COUNT];
@@ -76,7 +77,7 @@ type SignalBuffers<T> = [Mutex<SignalBuffer<T>>; SIGNAL_BUFFER_COUNT];
 /// sender order, just as execution of one Erlang process serializes sends.
 pub struct Incoming<T> {
     /// `ERTS_PROC_LOCK_MSGQ` together with the queue it protects.
-    msgq: Mutex<VecDeque<T>>,
+    msgq: Mutex<SignalQueue<T>>,
     /// Signals in the sender buffers, counted under each buffer's lock. The signals in the
     /// msgq queue are counted by its length under the msgq lock, so an enqueue through the
     /// queue is one read-modify-write, the bor on `state`. A lock-free probe reads the
@@ -109,7 +110,7 @@ pub struct Incoming<T> {
 impl<T> Default for Incoming<T> {
     fn default() -> Self {
         Self {
-            msgq: Mutex::new(VecDeque::new()),
+            msgq: Mutex::new(SignalQueue::default()),
             buffered: AtomicUsize::new(0),
             state: AtomicU32::new(0),
             nmsgs: AtomicUsize::new(0),
@@ -216,19 +217,9 @@ impl<T: InSignal> Incoming<T> {
         bits
     }
 
-    fn count_nmsgs<'a>(values: impl IntoIterator<Item = &'a T>) -> usize
-    where
-        T: 'a,
-    {
-        values
-            .into_iter()
-            .filter(|value| !value.is_message())
-            .count()
-    }
-
     /// Take the msgq lock; a busy lock counts as contention like erts' failed trylock.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10661-10694, OTP-29.1.1.
-    fn lock_msgq(&self) -> (parking_lot::MutexGuard<'_, VecDeque<T>>, usize) {
+    fn lock_msgq(&self) -> (parking_lot::MutexGuard<'_, SignalQueue<T>>, usize) {
         match self.msgq.try_lock() {
             Some(queue) => (queue, 0),
             None => (self.msgq.lock(), 1),
@@ -238,12 +229,13 @@ impl<T: InSignal> Incoming<T> {
     /// Append an event, flushing the sender buffers first so it cannot overtake them.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:712 (signal enqueue), OTP-29.1.1.
     pub fn push(&self, value: T) {
+        let signal = OwnedSignal::new(value);
+        let nmsg = usize::from(!signal.is_message());
         let (mut queue, _) = self.lock_msgq();
         if self.buffers_enabled.load(Ordering::Acquire) {
             self.flush_buffers_locked(&mut queue, true);
         }
-        let nmsg = usize::from(!value.is_message());
-        queue.push_back(value);
+        queue.push_back_node(signal);
         self.enqueued(1, nmsg);
     }
 
@@ -253,36 +245,40 @@ impl<T: InSignal> Incoming<T> {
     // buffers are installed (erl_proc_sig_queue.c:10271-10288).
     /// Fails, giving the signal back, once the receiver closed its queue.
     pub fn push_routed(&self, slot: impl FnOnce() -> usize, value: T) -> Result<u32, T> {
-        let value = match self.try_push_buffer(slot, value) {
+        let signal = match self.try_push_buffer(slot, OwnedSignal::new(value)) {
             Ok(state) => return Ok(state),
-            Err(value) => value,
+            Err(signal) => signal,
         };
         let (mut queue, contended) = self.lock_msgq();
         if self.closed.load(Ordering::Relaxed) {
-            return Err(value);
+            return Err(signal.into_value());
         }
-        let nmsg = usize::from(!value.is_message());
-        queue.push_back(value);
+        let nmsg = usize::from(!signal.is_message());
+        queue.push_back_node(signal);
         let state = self.enqueued(1, nmsg);
         drop(queue);
         self.note_contention(contended);
         Ok(state)
     }
 
-    fn try_push_buffer(&self, slot: impl FnOnce() -> usize, value: T) -> Result<u32, T> {
+    fn try_push_buffer(
+        &self,
+        slot: impl FnOnce() -> usize,
+        signal: OwnedSignal<T>,
+    ) -> Result<u32, OwnedSignal<T>> {
         if !self.buffers_enabled.load(Ordering::Acquire) {
-            return Err(value);
+            return Err(signal);
         }
         let slot = slot();
         let Some(buffers) = self.buffers.lock().clone() else {
-            return Err(value);
+            return Err(signal);
         };
         let mut buffer = buffers[slot % SIGNAL_BUFFER_COUNT].lock();
         if !buffer.alive {
-            return Err(value);
+            return Err(signal);
         }
-        let nmsg = usize::from(!value.is_message());
-        buffer.queue.push_back(value);
+        let nmsg = usize::from(!signal.is_message());
+        buffer.queue.push_back_node(signal);
         self.buffered.fetch_add(1, Ordering::SeqCst);
         let state = self.enqueued(1, nmsg);
         self.buffer_enqueues.fetch_add(1, Ordering::Relaxed);
@@ -339,7 +335,7 @@ impl<T: InSignal> Incoming<T> {
             *buffers = Some(Arc::new(std::array::from_fn(|_| {
                 Mutex::new(SignalBuffer {
                     alive: true,
-                    queue: VecDeque::new(),
+                    queue: SignalQueue::default(),
                 })
             })));
         }
@@ -351,7 +347,7 @@ impl<T: InSignal> Incoming<T> {
     }
 
     /// Flush, mark dead and drop the buffers; the caller holds the msgq lock.
-    fn uninstall_buffers_locked(&self, queue: &mut VecDeque<T>) {
+    fn uninstall_buffers_locked(&self, queue: &mut SignalQueue<T>) {
         let taken = self.buffers.lock().take();
         self.buffers_enabled.store(false, Ordering::Release);
         if let Some(buffers) = taken {
@@ -370,17 +366,17 @@ impl<T: InSignal> Incoming<T> {
 
     /// Move one buffer's signals to the queue tail; the caller holds the msgq lock and the
     /// buffer's lock, under which the count of buffered signals changes with the buffer.
-    fn take_buffered(&self, buffer: &mut SignalBuffer<T>, queue: &mut VecDeque<T>) {
+    fn take_buffered(&self, buffer: &mut SignalBuffer<T>, queue: &mut SignalQueue<T>) {
         let count = buffer.queue.len();
         if count != 0 {
-            queue.extend(buffer.queue.drain(..));
+            queue.append(&mut buffer.queue);
             self.buffered.fetch_sub(count, Ordering::Relaxed);
         }
     }
 
     /// Move buffered signals to the queue tail; the caller holds the msgq lock.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10532 (sig_inq_buffers flush), OTP-29.1.1.
-    fn flush_buffers_locked(&self, queue: &mut VecDeque<T>, adapt: bool) {
+    fn flush_buffers_locked(&self, queue: &mut SignalQueue<T>, adapt: bool) {
         let Some(buffers) = self.buffers.lock().clone() else {
             return;
         };
@@ -417,13 +413,16 @@ impl<T: InSignal> Incoming<T> {
         if values.is_empty() {
             return;
         }
+        let mut block = SignalQueue::default();
+        for value in values.drain(..) {
+            block.push_back(value);
+        }
+        let (count, nmsgs) = (block.len(), block.non_messages());
         let (mut queue, _) = self.lock_msgq();
         if self.buffers_enabled.load(Ordering::Acquire) {
             self.flush_buffers_locked(&mut queue, true);
         }
-        let count = values.len();
-        let nmsgs = Self::count_nmsgs(values.iter());
-        queue.extend(values.drain(..));
+        queue.append(&mut block);
         self.enqueued(count, nmsgs);
     }
 
@@ -439,13 +438,16 @@ impl<T: InSignal> Incoming<T> {
             return Ok(());
         }
         if !self.buffers_enabled.load(Ordering::Acquire) {
+            let mut block = SignalQueue::default();
             let (mut queue, contended) = self.lock_msgq();
             if self.closed.load(Ordering::Relaxed) {
                 return Err(QueueClosed);
             }
-            let count = values.len();
-            let nmsgs = Self::count_nmsgs(values.iter());
-            queue.extend(values.drain(..));
+            for value in values.drain(..) {
+                block.push_back(value);
+            }
+            let (count, nmsgs) = (block.len(), block.non_messages());
+            queue.append(&mut block);
             self.enqueued(count, nmsgs);
             drop(queue);
             self.note_contention(contended);
@@ -454,15 +456,15 @@ impl<T: InSignal> Incoming<T> {
         let mut pending = std::mem::take(values).into_iter();
         while let Some(value) = pending.next() {
             let slot = sender_slot(&value);
-            if let Err(value) = self.try_push_buffer(|| slot, value) {
+            if let Err(signal) = self.try_push_buffer(|| slot, OwnedSignal::new(value)) {
                 let (mut queue, _) = self.lock_msgq();
                 if self.closed.load(Ordering::Relaxed) {
-                    values.push(value);
+                    values.push(signal.into_value());
                     values.extend(pending);
                     return Err(QueueClosed);
                 }
-                let nmsg = usize::from(!value.is_message());
-                queue.push_back(value);
+                let nmsg = usize::from(!signal.is_message());
+                queue.push_back_node(signal);
                 self.enqueued(1, nmsg);
             }
         }
@@ -478,13 +480,14 @@ impl<T: InSignal> Incoming<T> {
         if self.buffers_enabled.load(Ordering::Acquire) {
             return Err((first, second));
         }
+        let nmsgs = usize::from(!first.is_message()) + usize::from(!second.is_message());
+        let (first, second) = (OwnedSignal::new(first), OwnedSignal::new(second));
         let (mut queue, contended) = self.lock_msgq();
         if self.closed.load(Ordering::Relaxed) {
-            return Err((first, second));
+            return Err((first.into_value(), second.into_value()));
         }
-        let nmsgs = usize::from(!first.is_message()) + usize::from(!second.is_message());
-        queue.push_back(first);
-        queue.push_back(second);
+        queue.push_back_node(first);
+        queue.push_back_node(second);
         self.enqueued(2, nmsgs);
         drop(queue);
         self.note_contention(contended);
@@ -495,14 +498,14 @@ impl<T: InSignal> Incoming<T> {
     /// ones included, to `into`; enqueues after this fail.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_exit takes the
     // remaining signals of an exiting process under the msgq lock), OTP-29.1.1.
-    pub fn close_into(&self, into: &mut VecDeque<T>) -> usize {
+    pub fn close_into(&self, into: &mut SignalQueue<T>) -> usize {
         let mut queue = self.msgq.lock();
         self.closed.store(true, Ordering::Relaxed);
         self.uninstall_buffers_locked(&mut queue);
         let count = queue.len();
         if count != 0 {
-            let nmsgs = Self::count_nmsgs(queue.iter());
-            into.extend(queue.drain(..));
+            let nmsgs = queue.non_messages();
+            into.append(&mut queue);
             self.dequeued(nmsgs, 0);
         }
         count
@@ -524,7 +527,7 @@ impl<T: InSignal> Incoming<T> {
     /// receiver handles the signals and moves the messages into its own message queue.
     // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch: the outer
     // queue is spliced onto the end of the inner queue under the msgq lock), OTP-29.1.1.
-    pub fn take_all(&self, into: &mut VecDeque<T>) {
+    pub fn take_all(&self, into: &mut SignalQueue<T>) {
         if !self.has_pending() {
             return;
         }
@@ -532,10 +535,8 @@ impl<T: InSignal> Incoming<T> {
         if self.buffers_enabled.load(Ordering::Acquire) {
             self.flush_buffers_locked(&mut queue, true);
         }
-        let nmsgs = Self::count_nmsgs(queue.iter());
-        // Both queues keep their storage: a fetch allocates nothing, like erts splicing
-        // the outer signal list onto the inner one.
-        into.extend(queue.drain(..));
+        let nmsgs = queue.non_messages();
+        into.append(&mut queue);
         self.dequeued(nmsgs, 0);
     }
 
@@ -543,7 +544,7 @@ impl<T: InSignal> Incoming<T> {
     /// Returns the number of signals taken.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__: an outer
     // queue without non-message signals is spliced onto the message queue), OTP-29.1.1.
-    pub fn take_all_if(&self, accept: impl Fn(&T) -> bool, into: &mut VecDeque<T>) -> usize {
+    pub fn take_all_if(&self, accept: impl Fn(&T) -> bool, into: &mut SignalQueue<T>) -> usize {
         if !self.has_pending() {
             return 0;
         }
@@ -551,11 +552,11 @@ impl<T: InSignal> Incoming<T> {
         if self.buffers_enabled.load(Ordering::Acquire) {
             self.flush_buffers_locked(&mut queue, true);
         }
-        if !queue.iter().all(accept) {
+        if queue.non_messages() != 0 || !queue.iter().all(accept) {
             return 0;
         }
         let count = queue.len();
-        into.extend(queue.drain(..));
+        into.append(&mut queue);
         // `accept` took only messages.
         self.dequeued(0, 0);
         drop(queue);
@@ -580,14 +581,14 @@ impl<T: InSignal> Incoming<T> {
         if !accept(queue.front()?) {
             return None;
         }
-        let value = queue.pop_front();
-        let nmsgs = Self::count_nmsgs(value.iter());
+        let signal = queue.pop_front_signal()?;
+        let nmsgs = usize::from(!signal.is_message());
         self.dequeued(nmsgs, queue.len());
         drop(queue);
         if self.backlog.load(Ordering::Relaxed) != 0 {
             self.backlog.fetch_sub(1, Ordering::Relaxed);
         }
-        value
+        Some(signal.into_value())
     }
 }
 
@@ -610,7 +611,7 @@ mod tests {
     #[test]
     fn in_queue_state_bits_follow_enqueue_and_fetch() {
         let input = Incoming::default();
-        let mut inner = VecDeque::new();
+        let mut inner = SignalQueue::default();
         let bits = |input: &Incoming<i32>| input.state().load(Ordering::SeqCst) & psflg::SIG_IN_Q;
         assert_eq!(bits(&input), 0);
         input.push(1);
@@ -626,13 +627,13 @@ mod tests {
         assert_eq!(bits(&input), psflg::MSG_SIG_IN_Q);
         assert_eq!(input.take_all_if(|value| *value >= 0, &mut inner), 2);
         assert_eq!(bits(&input), 0);
-        assert_eq!(inner, VecDeque::from([-1, 2, 3, 4]));
+        assert_eq!(inner.iter().copied().collect::<Vec<_>>(), [-1, 2, 3, 4]);
     }
 
     #[test]
     fn batch_order() {
         let input = Incoming::default();
-        let mut inner = VecDeque::new();
+        let mut inner = SignalQueue::default();
         for i in 0..10 {
             input.push(i);
         }
@@ -640,7 +641,7 @@ mod tests {
         input.push(20);
         input.take_all(&mut inner);
         assert_eq!(
-            inner.into_iter().collect::<Vec<_>>(),
+            inner.iter().copied().collect::<Vec<_>>(),
             (0..10).chain([20]).collect::<Vec<_>>()
         );
     }
@@ -651,7 +652,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let input = Arc::new(Incoming::default());
         let done = Arc::new(AtomicUsize::new(0));
-        let mut inner = VecDeque::new();
+        let mut inner = SignalQueue::default();
         std::thread::scope(|scope| {
             for sender in 0..4 {
                 let input = input.clone();
@@ -680,7 +681,7 @@ mod tests {
     #[test]
     fn parallel_sender_buffer_flush_preserves_sender_order() {
         let input = Incoming::default();
-        let mut inner = VecDeque::new();
+        let mut inner = SignalQueue::default();
         input.force_buffers_enabled();
         for sequence in 0..128 {
             input.push_routed(|| 17, sequence).unwrap();
@@ -688,7 +689,7 @@ mod tests {
         assert!(input.has_pending());
         input.take_all(&mut inner);
         assert_eq!(
-            inner.drain(..).collect::<Vec<_>>(),
+            std::iter::from_fn(|| inner.pop_front()).collect::<Vec<_>>(),
             (0..128).collect::<Vec<_>>()
         );
 
@@ -696,6 +697,9 @@ mod tests {
         input.set_buffers_enabled(false);
         input.push_routed(|| 17, 129).unwrap();
         input.take_all(&mut inner);
-        assert_eq!(inner.drain(..).collect::<Vec<_>>(), [128, 129]);
+        assert_eq!(
+            std::iter::from_fn(|| inner.pop_front()).collect::<Vec<_>>(),
+            [128, 129]
+        );
     }
 }

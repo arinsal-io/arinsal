@@ -5946,10 +5946,9 @@ impl Process {
             || self.sig_cont.len() == start
             || (crate::trace::active()
                 && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0)
-            || !self
-                .sig_cont
-                .iter()
-                .all(|event| Self::is_ordinary_message(&event.payload))
+            // erts_proc_sig_fetch__ tests `nmsigs.next`: a fetched queue without non-message
+            // signals goes straight onto the message queue.
+            || self.sig_cont.non_messages() != 0
         {
             ctx.set_sig_q(!self.sig_cont_empty());
             return Ok(());
@@ -7912,7 +7911,7 @@ impl Task for Process {
         self.cold = None;
         self.dictionary = None;
         self.inbox = MessageQueue::default();
-        self.sig_cont = std::collections::VecDeque::new();
+        self.sig_cont = Default::default();
         self.exit_cont = None;
         self.seq_trace_token = None;
         self.final_exit_reason = None;

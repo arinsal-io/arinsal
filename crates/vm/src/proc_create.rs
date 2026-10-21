@@ -402,7 +402,7 @@ pub struct Process {
     pub(crate) inbox: process::MessageQueue,
     /// `sig_qs.cont`: signals fetched from the outer queue and not handled yet.
     /// Port of erts/emulator/beam/erl_process.h (ErtsSignalInQueue `sig_qs`), OTP-29.1.1.
-    pub(crate) sig_cont: std::collections::VecDeque<arinsal_sched::Event<crate::process::Message>>,
+    pub(crate) sig_cont: arinsal_sched::SignalQueue<arinsal_sched::Event<crate::process::Message>>,
     /// Signals taken from the front of `sig_cont` so far; receive markers inserted into the
     /// middle queue are positioned by it.
     pub(crate) sig_cont_taken: u64,
@@ -1841,7 +1841,7 @@ impl Process {
             scheduler_ref_state: None,
             hibernated: false,
             inbox: process::MessageQueue::default(),
-            sig_cont: std::collections::VecDeque::new(),
+            sig_cont: arinsal_sched::SignalQueue::default(),
             sig_cont_taken: 0,
             receive_cursor: 0,
             receive_deadline: None,

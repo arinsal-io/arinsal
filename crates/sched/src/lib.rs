@@ -62,11 +62,13 @@ mod balance;
 mod mailbox;
 mod ports;
 mod proc_ref;
+mod sig_queue;
 mod thr_progress;
 mod timer;
 
 pub use mailbox::{InSignal, Incoming, psflg};
 pub use ports::{PortExecution, PortRunQueue, RunPort};
+pub use sig_queue::{OwnedSignal, SignalQueue};
 pub use timer::{TimerId, TimerRef};
 
 use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
@@ -995,7 +997,7 @@ impl<M: SignalMessage> SignalProbe<M> {
     /// Move the whole outer queue to the end of `into`, the receiver's middle queue. Each
     /// event taken from there is accounted with [`RunCtx::consume_fetched`].
     // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch), OTP-29.1.1.
-    pub fn fetch_all(&self, into: &mut VecDeque<Event<M>>) {
+    pub fn fetch_all(&self, into: &mut SignalQueue<Event<M>>) {
         self.input().take_all(into);
     }
 
@@ -1005,7 +1007,7 @@ impl<M: SignalMessage> SignalProbe<M> {
     pub fn fetch_messages_if(
         &self,
         accept: impl Fn(&M) -> bool,
-        into: &mut VecDeque<Event<M>>,
+        into: &mut SignalQueue<Event<M>>,
     ) -> usize {
         self.input().take_all_if(
             |event| matches!(&event.payload, Payload::Message(message) if accept(message)),
@@ -4643,7 +4645,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// `into` is accounted with [`Self::consume_fetched`].
     // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch: the outer
     // queue is appended to the inner one), OTP-29.1.1.
-    pub fn fetch_signals(&mut self, into: &mut VecDeque<Event<M>>) {
+    pub fn fetch_signals(&mut self, into: &mut SignalQueue<Event<M>>) {
         self.inner.flush();
         self.input.take_all(into);
     }
@@ -6661,7 +6663,7 @@ mod in_signal_tests {
             input.state().load(Ordering::SeqCst) & psflg::SIG_IN_Q,
             psflg::SIG_IN_Q
         );
-        let mut inner = VecDeque::new();
+        let mut inner = SignalQueue::default();
         assert_eq!(input.take_all_if(InSignal::is_message, &mut inner), 0);
     }
 }
@@ -6724,11 +6726,12 @@ mod msgq_stage_microbench {
         }
         report("enqueue block", N, started);
 
-        let mut inner_queue = VecDeque::new();
+        let mut fetched = SignalQueue::default();
         let started = Instant::now();
-        ingress.take_all(&mut inner_queue);
-        assert_eq!(inner_queue.len(), N);
+        ingress.take_all(&mut fetched);
+        assert_eq!(fetched.len(), N);
         report("fetch batch", N, started);
+        let mut inner_queue: VecDeque<_> = std::iter::from_fn(|| fetched.pop_front()).collect();
 
         let started = Instant::now();
         for expected in 0..N {
@@ -6793,7 +6796,7 @@ mod msgq_stage_microbench {
             simulated: scheduler.inner.sim.is_some(),
         };
         let started = Instant::now();
-        let mut fetched = VecDeque::new();
+        let mut fetched = SignalQueue::default();
         context.fetch_signals(&mut fetched);
         assert_eq!(fetched.len(), N);
         while let Some(event) = fetched.pop_front() {
@@ -6854,7 +6857,7 @@ mod msgq_stage_microbench {
         let to = scheduler.spawn(Idle).unwrap();
         let target = scheduler.inner.table.lookup(to).unwrap();
         target.run_state().store(RUNNING, Ordering::Relaxed);
-        let mut inner_queue = VecDeque::new();
+        let mut inner_queue = SignalQueue::default();
         let started = Instant::now();
         for message in 0..N {
             let mut runner = Runner {
@@ -6871,11 +6874,11 @@ mod msgq_stage_microbench {
             runner.flush();
             if message % 32 == 31 {
                 target.input.take_all(&mut inner_queue);
-                inner_queue.clear();
+                while inner_queue.pop_front().is_some() {}
             }
         }
         target.input.take_all(&mut inner_queue);
-        inner_queue.clear();
+        while inner_queue.pop_front().is_some() {}
         report("one send per runner slice", N, started);
     }
 
@@ -6915,7 +6918,7 @@ mod msgq_stage_microbench {
         let ready = scheduler.inner.sim.as_ref().unwrap().lock().unwrap();
         assert_eq!(ready.queue.len(), 1);
         drop(ready);
-        let mut inner_queue = VecDeque::new();
+        let mut inner_queue = SignalQueue::default();
         process.input.take_all(&mut inner_queue);
         let messages = (0..3)
             .map(|_| match inner_queue.pop_front().unwrap().payload {
@@ -7510,9 +7513,10 @@ fn run_slice<'a, T: Task>(
             }
             // Close the in-queue under the msgq lock and reap what it still holds; a later
             // enqueue fails and the sender sees the process gone.
-            let mut remaining = VecDeque::new();
+            let mut remaining = SignalQueue::default();
             if process.input.close_into(&mut remaining) > 0 {
-                cell.task_mut().reap_signals(process.pid, remaining.into());
+                let events = std::iter::from_fn(|| remaining.pop_front()).collect();
+                cell.task_mut().reap_signals(process.pid, events);
             }
             cell.task_mut().delete_process();
             // `begin_exit` already deleted the element (erts deletes once, at
