@@ -60,11 +60,10 @@ impl<T: Task> ProcRef<T> {
         // `size_of::<ProcessBlock<T>>()` bytes that nothing else refers to, and the alignment of
         // `ProcessBlock<T>` is at most a word (asserted above).
         unsafe {
-            block.as_ptr().write(ProcessBlock {
-                refc: AtomicUsize::new(1),
-                handle,
-                process: build(),
-            });
+            let raw = block.as_ptr();
+            (&raw mut (*raw).refc).write(AtomicUsize::new(1));
+            (&raw mut (*raw).handle).write(handle);
+            (&raw mut (*raw).process).write(build());
         }
         Self { block }
     }
