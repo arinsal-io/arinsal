@@ -890,15 +890,36 @@ impl ProcDict {
 /// returned value.
 pub(crate) type NativeReturnEvents = crate::trace::PoppedNativeFrames;
 
-/// What both halves of a monitor share and never change (the tag and name parts of erts
-/// `ErtsMonitorData` / `ErtsMonitorDataExtended`, erl_monitor_link.h).
+/// What both halves of a monitor share and never change. The DOWN tag and the name are rare,
+/// so they live in a separate box, as erts keeps them only in `ErtsMonitorDataExtended` /
+/// `ErtsMonitorDataTagHeap` (erl_monitor_link.h) and a plain monitor stays small.
 #[derive(Debug, Default)]
-pub(crate) struct MonitorInfo {
-    /// DOWN tag, owned off-heap so a tuple tag such as `{'ON_LOAD_DOWN', Mod}` survives GC.
-    /// `None` is the default `DOWN` tag and allocates nothing.
-    pub(crate) tag: Option<arinsal_etf::OwnedTerm>,
-    /// Registered name of a monitor created by name; its DOWN object is `{Name, Node}`.
-    pub(crate) name: Option<String>,
+pub(crate) struct MonitorInfo(Option<Box<MonitorExtension>>);
+
+#[derive(Debug)]
+struct MonitorExtension {
+    tag: Option<arinsal_etf::OwnedTerm>,
+    name: Option<String>,
+}
+
+impl MonitorInfo {
+    /// `tag`: the DOWN tag, owned off-heap so a tuple tag such as `{'ON_LOAD_DOWN', Mod}`
+    /// survives GC, `None` for the default `DOWN`. `name`: the registered name of a monitor
+    /// created by name; its DOWN object is `{Name, Node}`.
+    pub(crate) fn new(tag: Option<arinsal_etf::OwnedTerm>, name: Option<String>) -> Self {
+        if tag.is_none() && name.is_none() {
+            return Self(None);
+        }
+        Self(Some(Box::new(MonitorExtension { tag, name })))
+    }
+
+    pub(crate) fn tag(&self) -> Option<&arinsal_etf::OwnedTerm> {
+        self.0.as_ref()?.tag.as_ref()
+    }
+
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.0.as_ref()?.name.as_deref()
+    }
 }
 
 /// One half of a monitor this process holds: an origin entry in `ERTS_P_MONITORS` or a target

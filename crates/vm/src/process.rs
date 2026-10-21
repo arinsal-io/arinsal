@@ -7501,14 +7501,14 @@ impl Process {
             }
             _ => (None, None),
         };
-        let tag = if let Some(owned) = info.and_then(|info| info.tag.as_ref()) {
+        let tag = if let Some(owned) = info.and_then(|info| info.tag()) {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
             arinsal_term::from_owned(owned, &mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?
         } else {
             crate::signals::atom("DOWN")
         };
-        let name = info.and_then(|info| info.name.clone());
+        let name = info.and_then(|info| info.name().map(str::to_owned));
         let reference = crate::signals::reference(self, reference)?;
         let (from_type, from) = if let Some(object) = port_object {
             // Port of erts/emulator/beam/erl_proc_sig_queue.c:4838-5056
@@ -7556,7 +7556,7 @@ fn down_message_on_sender(
     target: Pid,
     reason: Term,
 ) -> Result<Message, VmError> {
-    let tag = match data.tag.as_ref() {
+    let tag = match data.tag() {
         Some(owned) => {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             arinsal_term::from_owned(owned, &mut heap)
@@ -7568,7 +7568,7 @@ fn down_message_on_sender(
     let from = target
         .to_term()
         .ok_or_else(|| VmError::Unsupported("invalid monitor target pid".into()))?;
-    let object = crate::signals::monitor_object(process, data.name.as_deref(), from)?;
+    let object = crate::signals::monitor_object(process, data.name(), from)?;
     let tuple = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         arinsal_term::TermBuilder::new(&mut heap)
@@ -8986,5 +8986,11 @@ mod layout_tests {
         assert_eq!(std::mem::size_of::<arinsal_sched::Signal<Message>>(), 56);
         assert_eq!(std::mem::size_of::<arinsal_sched::Payload<Message>>(), 56);
         assert_eq!(std::mem::size_of::<arinsal_sched::Event<Message>>(), 64);
+        // Both halves of a monitor in one allocation, as small as erts' `ErtsMonitorDataHeap`:
+        // the rare tag and name are boxed separately.
+        assert_eq!(
+            std::mem::size_of::<crate::proc_create::ProcessMonitorData>(),
+            144
+        );
     }
 }

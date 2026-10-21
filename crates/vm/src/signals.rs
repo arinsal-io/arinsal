@@ -1042,10 +1042,7 @@ pub(crate) fn erl_create_process(
             id,
             parent_pid.data(),
             0,
-            crate::proc_create::MonitorInfo {
-                tag: monitor.tag.clone(),
-                name: None,
-            },
+            crate::proc_create::MonitorInfo::new(monitor.tag.clone(), None),
             crate::proc_create::OriginMonitor::Process(crate::proc_create::OriginHalf {
                 alias_mode: monitor.alias,
             }),
@@ -4382,10 +4379,10 @@ fn monitor_info_for(
                 .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?,
         )
     };
-    Ok(crate::proc_create::MonitorInfo {
+    Ok(crate::proc_create::MonitorInfo::new(
         tag,
-        name: name.map(str::to_owned),
-    })
+        name.map(str::to_owned),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)] // Keep monitor creation fields aligned with the erts call path.
