@@ -5,87 +5,17 @@
 //! (`ErtsSignalCommon.next`, `ErtsSignalInQueue`/`ErtsSignalPrivQueues` `first`/`last`,
 //! `enqueue_signals`, the splice of `erts_proc_sig_fetch__`), OTP-29.1.1.
 //!
-//! All raw-pointer work on queue nodes is confined to this module. Deviation from erts, for a
+//! The queue links of nodes are only touched in this module; node allocation is in
+//! `arinsal_term::message`. Deviation from erts, for a
 //! queue that may move in memory: `last` points to the last node rather than to the last `next`
 //! field (`ErtsMessage **last`); an empty queue has no `last`.
 
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
+pub use arinsal_term::message::{OwnedSignal, SignalNode};
+
 use crate::mailbox::InSignal;
-
-/// One queued signal (`ErtsSignalCommon`: `next`, then the signal itself).
-#[repr(C)]
-pub struct SignalNode<T> {
-    next: Option<NonNull<SignalNode<T>>>,
-    value: T,
-}
-
-/// A signal node owned outside any queue: the sender before it enqueues, or the receiver after
-/// it took the node out.
-pub struct OwnedSignal<T> {
-    node: NonNull<SignalNode<T>>,
-    _value: PhantomData<T>,
-}
-
-// SAFETY: the handle owns its node like a `Box` owns its value.
-unsafe impl<T: Send> Send for OwnedSignal<T> {}
-
-impl<T> OwnedSignal<T> {
-    /// Allocate a node for `value` (erts allocates the signal structure before it enqueues).
-    pub fn new(value: T) -> Self {
-        let node = Box::new(SignalNode { next: None, value });
-        Self {
-            node: NonNull::from(Box::leak(node)),
-            _value: PhantomData,
-        }
-    }
-
-    /// Free the node, giving back the signal.
-    pub fn into_value(self) -> T {
-        let node = self.node;
-        std::mem::forget(self);
-        // SAFETY: the handle owned the node, allocated by `Box` in `new`.
-        let node = unsafe { Box::from_raw(node.as_ptr()) };
-        node.value
-    }
-
-    fn into_node(self) -> NonNull<SignalNode<T>> {
-        let node = self.node;
-        std::mem::forget(self);
-        node
-    }
-
-    fn from_node(node: NonNull<SignalNode<T>>) -> Self {
-        Self {
-            node,
-            _value: PhantomData,
-        }
-    }
-}
-
-impl<T> std::ops::Deref for OwnedSignal<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        // SAFETY: the handle owns the node, so it is live and not borrowed elsewhere.
-        unsafe { &self.node.as_ref().value }
-    }
-}
-
-impl<T> std::ops::DerefMut for OwnedSignal<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: as in `deref`, and the handle is borrowed exclusively.
-        unsafe { &mut self.node.as_mut().value }
-    }
-}
-
-impl<T> Drop for OwnedSignal<T> {
-    fn drop(&mut self) {
-        // SAFETY: the handle owned the node, allocated by `Box` in `new`.
-        drop(unsafe { Box::from_raw(self.node.as_ptr()) });
-    }
-}
 
 /// A queue of signal nodes (`first`/`last` of `ErtsSignalInQueue` and of the private queues),
 /// with the count of its signals and of its non-message signals (erts tracks the latter with
@@ -116,7 +46,8 @@ impl<T> Default for SignalQueue<T> {
 impl<T> Drop for SignalQueue<T> {
     fn drop(&mut self) {
         while let Some(node) = self.pop_front_node() {
-            drop(OwnedSignal::from_node(node));
+            // SAFETY: the queue owned the node, which came from `OwnedSignal::into_raw`.
+            drop(unsafe { OwnedSignal::from_raw(node) });
         }
     }
 }
@@ -200,7 +131,7 @@ impl<T: InSignal> SignalQueue<T> {
     /// Link an allocated node at the end.
     pub fn push_back_node(&mut self, signal: OwnedSignal<T>) {
         let non_message = !signal.is_message();
-        let node = signal.into_node();
+        let node = signal.into_raw();
         match self.last {
             // SAFETY: `last` is a node this queue owns, and has no successor.
             Some(last) => unsafe { (*last.as_ptr()).next = Some(node) },
@@ -219,7 +150,8 @@ impl<T: InSignal> SignalQueue<T> {
     /// Take the first node out.
     pub fn pop_front_signal(&mut self) -> Option<OwnedSignal<T>> {
         let node = self.pop_front_node()?;
-        let signal = OwnedSignal::from_node(node);
+        // SAFETY: the queue owned the node, which came from `OwnedSignal::into_raw`.
+        let signal = unsafe { OwnedSignal::from_raw(node) };
         self.non_messages -= usize::from(!signal.is_message());
         Some(signal)
     }
