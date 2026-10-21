@@ -1882,24 +1882,30 @@ impl Relations {
             monitors: cold
                 .monitors
                 .iter()
-                .filter_map(|(&id, entry)| {
-                    let crate::proc_create::OriginMonitor::Process(half) = entry else {
+                .filter_map(|monitor| {
+                    let crate::proc_create::OriginMonitor::Process(_) = monitor.origin_state()?
+                    else {
                         return None;
                     };
                     // The name wins over the tag, as make_monitor_list shows a registered name.
-                    let extra = half
-                        .data
-                        .name
-                        .clone()
-                        .map(OwnedTerm::Atom)
-                        .or_else(|| half.data.tag.clone());
-                    Some((id, half.target, extra))
+                    Some((
+                        monitor.reference(),
+                        arinsal_sched::Pid::from_data(monitor.other()),
+                        monitor_extra(monitor.info()),
+                    ))
                 })
                 .collect(),
             monitored_by: cold
-                .monitored_by
+                .lt_monitors
                 .iter()
-                .map(|(&id, half)| (id, half.origin, monitor_extra(&half.data)))
+                .chain(cold.monitors.iter().filter(|monitor| monitor.is_target()))
+                .map(|monitor| {
+                    (
+                        monitor.reference(),
+                        arinsal_sched::Pid::from_data(monitor.other()),
+                        monitor_extra(monitor.info()),
+                    )
+                })
                 .collect(),
         }
     }
@@ -2012,7 +2018,7 @@ fn internal_monitor_list_from(
     list(process, &records)
 }
 
-fn monitor_extra(data: &crate::proc_create::MonitorData) -> Option<OwnedTerm> {
+fn monitor_extra(data: &crate::proc_create::MonitorInfo) -> Option<OwnedTerm> {
     data.name
         .clone()
         .map(OwnedTerm::Atom)

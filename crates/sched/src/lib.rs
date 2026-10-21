@@ -417,6 +417,10 @@ pub enum Signal<M> {
     MonitorNoproc(u64),
     /// Demonitor request carrying a VM reference.
     Demonitor(u64),
+    /// Demonitor request carrying the origin half of the monitor itself, as erts queues the
+    /// origin node (erl_proc_sig_queue.c, erts_proc_sig_send_demonitor): the target reaches
+    /// its own half through the data both halves share.
+    DemonitorOrigin(SharedPayload),
     /// Exit signal (`exit/2`) carrying an opaque reason envelope.
     Exit(M),
     /// Exit signal of a link: removes the receiver's link to the sender.
@@ -4801,6 +4805,7 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
             | Signal::Unlink(_)
             | Signal::Monitor { .. }
             | Signal::Demonitor(_)
+            | Signal::DemonitorOrigin(_)
             | Signal::Alias(_)
             | Signal::Unalias(_) => false,
         },
