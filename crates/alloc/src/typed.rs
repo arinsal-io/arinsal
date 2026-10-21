@@ -867,6 +867,14 @@ pub fn fix_free_at(
     allocator_for(allocation_type)?.fix_free_at(ix, fix_ix, handle)
 }
 
+/// One fix_alloc shrink pass for the calling thread (allocator index `ix`); see
+/// `ThreadSpecificAllocators::fix_shrink_at`.
+pub fn fix_alloc_shrink(ix: usize, lower_limit: bool) -> crate::instances::FixShrink {
+    allocator_for(ErtsAlcType::PROC)
+        .and_then(|allocators| allocators.fix_shrink_at(ix, lower_limit))
+        .unwrap_or_default()
+}
+
 /// Blocks of the fixed-size type `allocation_type` in use and allocated on `instance`.
 pub fn fix_info(allocation_type: ErtsAlcType, instance: usize) -> Option<(usize, usize)> {
     let fix_ix = allocation_type.fix_index()?;
@@ -1056,5 +1064,25 @@ mod tests {
         assert_eq!(third_ptr, second_ptr);
         fix_free_at(ix, ErtsAlcType::PROC, third).unwrap();
         assert!(fix_alloc_at(ix, ErtsAlcType::HEAP, 8).is_err());
+    }
+
+    #[test]
+    fn periodic_shrink_gives_back_blocks_the_list_did_not_need() {
+        use super::{ErtsAlcType, fix_alloc_at, fix_alloc_shrink, fix_free_at};
+        let ix = crate::instances::thread_alloc_ix();
+        let blocks: Vec<_> = (0..40)
+            .map(|_| fix_alloc_at(ix, ErtsAlcType::PROC, 1200).unwrap().0)
+            .collect();
+        for block in blocks {
+            fix_free_at(ix, ErtsAlcType::PROC, block).unwrap();
+        }
+        // The first pass only records the lowest list length; later passes give back what
+        // stayed unused, at most 30 blocks a pass.
+        let first = fix_alloc_shrink(ix, true);
+        assert!(first.listed);
+        let second = fix_alloc_shrink(ix, true);
+        assert!(second.dealloc);
+        let third = fix_alloc_shrink(ix, false);
+        assert!(!third.dealloc);
     }
 }

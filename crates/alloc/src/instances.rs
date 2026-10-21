@@ -155,6 +155,8 @@ struct FixList {
     type_size: usize,
     list: Vec<Allocation>,
     min_list_size: usize,
+    /// `u.cpool.shrink_list`: blocks still to give back to the carriers.
+    shrink_list: usize,
     used: usize,
     allocated: usize,
 }
@@ -859,6 +861,7 @@ impl ThreadSpecificAllocators {
         if listed && let Some(allocation) = fix.list.pop() {
             fix.min_list_size = fix.min_list_size.min(fix.list.len());
             fix.used += 1;
+            fix_check_shrink(&mut state, fix_ix)?;
             return Ok((
                 InstanceAllocation {
                     instance,
@@ -916,6 +919,16 @@ impl ThreadSpecificAllocators {
             self.forget_route(allocation.id());
             return Ok(());
         }
+    }
+
+    /// One shrink pass over the free lists of the calling thread's instance (allocator index
+    /// `ix`), run from the owner's aux work.
+    pub fn fix_shrink_at(&self, ix: usize, lower_limit: bool) -> Result<FixShrink, AllocError> {
+        let instance = self.instance_for(ix);
+        let mut state = self.lock_instance(instance);
+        let result = fix_shrink_owned(&mut state, lower_limit)?;
+        self.publish_transfers(instance, &mut state)?;
+        Ok(result)
     }
 
     /// Blocks of fixed-size type `fix_ix` in use and allocated (in use or on the free list) on
@@ -1484,12 +1497,82 @@ fn fix_free_owned(
         return state.allocator.free(allocation);
     }
     fix.used = fix.used.saturating_sub(1);
-    if fix.list.len() < FIX_MAX_LIST_SIZE {
+    if fix.shrink_list == 0 && fix.list.len() < FIX_MAX_LIST_SIZE {
         fix.list.push(allocation);
         return Ok(());
     }
     fix.allocated = fix.allocated.saturating_sub(1);
+    state.allocator.free(allocation)?;
+    fix_check_shrink(state, fix_ix)
+}
+
+/// Give one listed block back to its carrier while a shrink is pending.
+///
+/// Port of erts/emulator/beam/erl_alloc_util.c (fix_cpool_check_shrink), OTP-29.1.1.
+fn fix_check_shrink(state: &mut Instance, fix_ix: usize) -> Result<(), AllocError> {
+    let fix = &mut state.fix[fix_ix];
+    if fix.shrink_list == 0 {
+        return Ok(());
+    }
+    let Some(allocation) = fix.list.pop() else {
+        fix.shrink_list = 0;
+        return Ok(());
+    };
+    fix.shrink_list -= 1;
+    fix.min_list_size = fix.min_list_size.min(fix.list.len());
+    fix.allocated = fix.allocated.saturating_sub(1);
     state.allocator.free(allocation)
+}
+
+/// Most blocks one shrink pass gives back per list.
+///
+/// Port of erts/emulator/beam/erl_alloc_util.c (`ERTS_ALC_FIX_MAX_SHRINK_OPS`), OTP-29.1.1.
+const FIX_MAX_SHRINK_OPS: usize = 30;
+
+/// What one shrink pass leaves to do.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FixShrink {
+    /// Blocks are still to be given back (erts `ERTS_SSI_AUX_WORK_FIX_ALLOC_DEALLOC`).
+    pub dealloc: bool,
+    /// Some free list holds blocks, so the periodic pass stays scheduled.
+    pub listed: bool,
+}
+
+/// One shrink pass over the free lists of an instance. `lower_limit` is the periodic pass
+/// that sets the blocks to give back to the fewest the list held since the last pass.
+///
+/// Port of erts/emulator/beam/erl_alloc_util.c (fix_cpool_alloc_shrink), OTP-29.1.1.
+fn fix_shrink_owned(state: &mut Instance, lower_limit: bool) -> Result<FixShrink, AllocError> {
+    let mut result = FixShrink::default();
+    for fix_ix in 0..state.fix.len() {
+        {
+            let fix = &mut state.fix[fix_ix];
+            if lower_limit {
+                fix.shrink_list = fix.min_list_size;
+                fix.min_list_size = fix.list.len();
+            }
+        }
+        for _ in 0..FIX_MAX_SHRINK_OPS {
+            let fix = &mut state.fix[fix_ix];
+            if fix.shrink_list == 0 {
+                break;
+            }
+            let Some(allocation) = fix.list.pop() else {
+                fix.shrink_list = 0;
+                break;
+            };
+            fix.shrink_list -= 1;
+            fix.allocated = fix.allocated.saturating_sub(1);
+            state.allocator.free(allocation)?;
+        }
+        let fix = &mut state.fix[fix_ix];
+        fix.min_list_size = fix.min_list_size.min(fix.list.len());
+        if !fix.list.is_empty() {
+            result.dealloc |= fix.shrink_list > 0;
+            result.listed = true;
+        }
+    }
+    Ok(result)
 }
 
 #[allow(unsafe_code)]
@@ -2313,6 +2396,7 @@ mod tests {
                 "unowned",
                 "fix_alloc_with_ptr_at",
                 "fix_free_at",
+                "fix_shrink_at",
             ]
         );
     }
