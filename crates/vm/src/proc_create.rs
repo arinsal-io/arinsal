@@ -923,13 +923,18 @@ impl MonitorInfo {
 
 /// One half of a monitor this process holds: an origin entry in `ERTS_P_MONITORS` or a target
 /// entry in `ERTS_P_LT_MONITORS` (or, for a remote origin, in `ERTS_P_MONITORS`).
-pub(crate) type ProcessMonitor = crate::monitor_link::Monitor<MonitorInfo, OriginMonitor>;
+/// The signal value a monitor half is sent in.
+pub(crate) type MonitorSignal = arinsal_sched::Event<crate::process::Message>;
+pub(crate) type ProcessMonitor =
+    crate::monitor_link::Monitor<MonitorInfo, OriginMonitor, MonitorSignal>;
 /// The allocation both halves of a monitor share (`ErtsMonitorData`).
-pub(crate) type ProcessMonitorData = crate::monitor_link::MonitorData<MonitorInfo, OriginMonitor>;
+pub(crate) type ProcessMonitorData =
+    crate::monitor_link::MonitorData<MonitorInfo, OriginMonitor, MonitorSignal>;
 /// `ERTS_P_MONITORS`: origin halves, and target halves of remote origins, keyed by reference.
 pub(crate) type MonitorTree = crate::monitor_link::MonLnkTree<ProcessMonitor>;
 /// `ERTS_P_LT_MONITORS`: target halves of local monitors.
-pub(crate) type TargetMonitorList = crate::monitor_link::MonitorList<MonitorInfo, OriginMonitor>;
+pub(crate) type TargetMonitorList =
+    crate::monitor_link::MonitorList<MonitorInfo, OriginMonitor, MonitorSignal>;
 
 /// Both halves of a new monitor of `target` by `origin` (erts `erts_monitor_create`): the
 /// origin half's `other` is the target, the target half's the origin.

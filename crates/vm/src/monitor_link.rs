@@ -706,17 +706,17 @@ impl<H: NodeHandle> MonLnkTree<H> {
 }
 
 /// A doubly linked circular list of monitor target halves (`ERTS_P_LT_MONITORS`).
-pub(crate) struct MonitorList<I, O> {
+pub(crate) struct MonitorList<I, O, S = ()> {
     first: Option<NodePtr>,
     /// Identity checked when a target half is removed through its origin half.
     id: u64,
-    _handles: PhantomData<Monitor<I, O>>,
+    _handles: PhantomData<Monitor<I, O, S>>,
 }
 
 // SAFETY: as for `MonLnkTree`, the list owns its nodes as the handles it took in did.
-unsafe impl<I: Send + Sync, O: Send> Send for MonitorList<I, O> {}
+unsafe impl<I: Send + Sync, O: Send, S: Send> Send for MonitorList<I, O, S> {}
 
-impl<I, O> Default for MonitorList<I, O> {
+impl<I, O, S> Default for MonitorList<I, O, S> {
     fn default() -> Self {
         static NEXT_LIST_ID: AtomicU64 = AtomicU64::new(1);
         Self {
@@ -727,7 +727,7 @@ impl<I, O> Default for MonitorList<I, O> {
     }
 }
 
-impl<I, O> Drop for MonitorList<I, O> {
+impl<I, O, S> Drop for MonitorList<I, O, S> {
     fn drop(&mut self) {
         for handle in self.drain() {
             drop(handle);
@@ -745,14 +745,14 @@ fn list_links_mut<'a>(node: NodePtr) -> &'a mut ListLinks {
     unsafe { &mut (*node.as_ptr()).node.list }
 }
 
-impl<I, O> MonitorList<I, O> {
+impl<I, O, S> MonitorList<I, O, S> {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.first.is_none()
     }
 
     /// `erts_ml_dl_list_insert__`: append before the first node.
-    pub(crate) fn insert(&mut self, monitor: Monitor<I, O>) {
+    pub(crate) fn insert(&mut self, monitor: Monitor<I, O, S>) {
         debug_assert!(monitor.view().is_target());
         let ml = monitor.into_node();
         debug_assert_eq!(node_flags(ml) & node_flag::IN_TABLE, 0);
@@ -775,7 +775,7 @@ impl<I, O> MonitorList<I, O> {
             }
         }
         set_node_flags(ml, node_flags(ml) | node_flag::IN_TABLE);
-        MonitorData::<I, O>::from_node(ml).set_target_list(self.id);
+        MonitorData::<I, O, S>::from_node(ml).set_target_list(self.id);
     }
 
     /// `erts_ml_dl_list_delete__`.
@@ -793,13 +793,16 @@ impl<I, O> MonitorList<I, O> {
             list_links_mut(next).prev = Some(prev);
         }
         set_node_flags(ml, node_flags(ml) & !node_flag::IN_TABLE);
-        MonitorData::<I, O>::from_node(ml).set_target_list(0);
+        MonitorData::<I, O, S>::from_node(ml).set_target_list(0);
     }
 
     /// Take the target half of `origin`'s monitor out of this list, if it is here (the
     /// demonitor and monitor-down paths of erts reach `&mdp->u.target` through the data).
-    pub(crate) fn remove_target_of(&mut self, origin: &Monitor<I, O>) -> Option<Monitor<I, O>> {
-        let data = MonitorData::<I, O>::from_node(origin.node);
+    pub(crate) fn remove_target_of(
+        &mut self,
+        origin: &Monitor<I, O, S>,
+    ) -> Option<Monitor<I, O, S>> {
+        let data = MonitorData::<I, O, S>::from_node(origin.node);
         let target = data.target_node();
         if node_flags(target) & node_flag::IN_TABLE == 0 || data.target_list() != self.id {
             return None;
@@ -827,7 +830,7 @@ impl<I, O> MonitorList<I, O> {
     }
 
     /// The target halves in list order (`erts_monitor_list_foreach`).
-    pub(crate) fn iter(&self) -> impl Iterator<Item = MonitorRef<'_, I, O>> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = MonitorRef<'_, I, O, S>> {
         self.nodes().into_iter().map(|node| MonitorRef {
             node,
             _monitor: PhantomData,
@@ -835,14 +838,14 @@ impl<I, O> MonitorList<I, O> {
     }
 
     /// `erts_monitor_list_foreach_delete`: empty the list in list order.
-    pub(crate) fn drain(&mut self) -> std::vec::IntoIter<Monitor<I, O>> {
+    pub(crate) fn drain(&mut self) -> std::vec::IntoIter<Monitor<I, O, S>> {
         let nodes = self.nodes();
         self.first = None;
         nodes
             .into_iter()
             .map(|node| {
                 set_node_flags(node, node_flags(node) & !node_flag::IN_TABLE);
-                MonitorData::<I, O>::from_node(node).set_target_list(0);
+                MonitorData::<I, O, S>::from_node(node).set_target_list(0);
                 Monitor::from_node(ContainedNode {
                     node,
                     _handle: PhantomData,
@@ -861,7 +864,7 @@ impl<I, O> MonitorList<I, O> {
 /// and so does a half in transit as a monitor or demonitor signal (`Arc<MonitorData>` coerced
 /// into the scheduler's `SharedPayload`, so the signal costs no allocation of its own).
 #[repr(C)]
-pub(crate) struct MonitorData<I, O> {
+pub(crate) struct MonitorData<I, O, S = ()> {
     /// The halves are written by the process that holds each of them while the other process
     /// may read the shared fields, so they are interior-mutable.
     origin: UnsafeCell<MonLnkNode>,
@@ -875,6 +878,10 @@ pub(crate) struct MonitorData<I, O> {
     target_list: AtomicU64,
     info: I,
     origin_state: UnsafeCell<O>,
+    /// The nodes the halves are sent in: the target half as the monitor signal, the origin
+    /// half as the demonitor signal (erts queues the `ErtsMonitor` node itself).
+    target_signal: arinsal_term::message::EmbeddedSignal<S>,
+    origin_signal: arinsal_term::message::EmbeddedSignal<S>,
 }
 
 const ORIGIN_HELD: u32 = 1;
@@ -883,11 +890,11 @@ const TARGET_HELD: u32 = 2;
 // SAFETY: each half's node and the origin state are only touched through the one handle that
 // holds that half (`held`), and the rest is atomics or the immutable `info`; so the data may be
 // shared between the two processes that hold its halves.
-unsafe impl<I: Send + Sync, O: Send> Sync for MonitorData<I, O> {}
+unsafe impl<I: Send + Sync, O: Send, S: Send> Sync for MonitorData<I, O, S> {}
 // SAFETY: as above; moving the data moves the `info` and origin state with it.
-unsafe impl<I: Send + Sync, O: Send> Send for MonitorData<I, O> {}
+unsafe impl<I: Send + Sync, O: Send, S: Send> Send for MonitorData<I, O, S> {}
 
-impl<I, O> MonitorData<I, O> {
+impl<I, O, S> MonitorData<I, O, S> {
     /// The data of a monitor node, borrowed for as long as one of its halves is held.
     fn from_node<'a>(node: NodePtr) -> &'a Self {
         // SAFETY: monitor nodes are created only by `Monitor::create`, inside a `MonitorData`
@@ -927,8 +934,29 @@ impl<I, O> MonitorData<I, O> {
         self.reference
     }
 
+    /// The signal node of a half in transit, in this data's own storage for it: `build` gets
+    /// the reference that keeps the data alive and makes the signal value from it, so the value
+    /// owns the data its node lives in (erts sends the `ErtsMonitor` node itself). Gives the
+    /// value back when the storage is in use.
+    pub(crate) fn embedded_signal(
+        this: std::sync::Arc<Self>,
+        target: bool,
+        build: impl FnOnce(std::sync::Arc<Self>) -> S,
+    ) -> Result<arinsal_term::message::OwnedSignal<S>, S> {
+        let storage: *const arinsal_term::message::EmbeddedSignal<S> = if target {
+            &this.target_signal
+        } else {
+            &this.origin_signal
+        };
+        let value = build(this);
+        // SAFETY: `storage` is a field of the data, and `value` holds a strong reference to that
+        // data; the node owns `value` until the value is taken out or dropped, which is the last
+        // use of the storage by the node, so the storage outlives the node.
+        unsafe { (*storage).fill(value) }
+    }
+
     /// Turn a half in transit back into its handle. `None` when that half already has one.
-    pub(crate) fn take_half(this: std::sync::Arc<Self>, target: bool) -> Option<Monitor<I, O>> {
+    pub(crate) fn take_half(this: std::sync::Arc<Self>, target: bool) -> Option<Monitor<I, O, S>> {
         let bit = if target { TARGET_HELD } else { ORIGIN_HELD };
         if this.held.fetch_or(bit, AtomicOrdering::AcqRel) & bit != 0 {
             return None;
@@ -942,16 +970,16 @@ impl<I, O> MonitorData<I, O> {
 }
 
 /// One half of a monitor, owned by the process that holds it (`ErtsMonitor`).
-pub(crate) struct Monitor<I, O> {
+pub(crate) struct Monitor<I, O, S = ()> {
     node: NodePtr,
-    _data: PhantomData<std::sync::Arc<MonitorData<I, O>>>,
+    _data: PhantomData<std::sync::Arc<MonitorData<I, O, S>>>,
 }
 
 // SAFETY: a half is moved between processes only as a whole; the data it shares with the other
 // half is `Sync` (see `MonitorData`).
-unsafe impl<I: Send + Sync, O: Send> Send for Monitor<I, O> {}
+unsafe impl<I: Send + Sync, O: Send, S: Send> Send for Monitor<I, O, S> {}
 
-impl<I, O> NodeHandle for Monitor<I, O> {
+impl<I, O, S> NodeHandle for Monitor<I, O, S> {
     type Order = ReferenceOrder;
 
     fn into_node(self) -> NodePtr {
@@ -968,7 +996,7 @@ impl<I, O> NodeHandle for Monitor<I, O> {
     }
 }
 
-impl<I, O> Monitor<I, O> {
+impl<I, O, S> Monitor<I, O, S> {
     /// `erts_monitor_create`: both halves of a new monitor. The origin half's `other` is the
     /// target, the target half's `other` the origin.
     pub(crate) fn create(
@@ -982,9 +1010,9 @@ impl<I, O> Monitor<I, O> {
     ) -> (Self, Self) {
         debug_assert!(kind <= node_type::MONITOR_ALIAS);
         debug_assert_eq!(flags & node_flag::RESERVED, 0);
-        let key_offset = offset_of!(MonitorData<I, O>, reference);
-        let origin_offset = offset_of!(MonitorData<I, O>, origin);
-        let target_offset = offset_of!(MonitorData<I, O>, target);
+        let key_offset = offset_of!(MonitorData<I, O, S>, reference);
+        let origin_offset = offset_of!(MonitorData<I, O, S>, origin);
+        let target_offset = offset_of!(MonitorData<I, O, S>, target);
         let data = std::sync::Arc::new(MonitorData {
             origin: UnsafeCell::new(MonLnkNode::new(
                 target,
@@ -1003,8 +1031,10 @@ impl<I, O> Monitor<I, O> {
             target_list: AtomicU64::new(0),
             info,
             origin_state: UnsafeCell::new(origin_state),
+            target_signal: arinsal_term::message::EmbeddedSignal::default(),
+            origin_signal: arinsal_term::message::EmbeddedSignal::default(),
         });
-        let data = std::sync::Arc::into_raw(data);
+        let data: *const MonitorData<I, O, S> = std::sync::Arc::into_raw(data);
         // SAFETY: `data` came from `Arc::into_raw` and the allocation is live; the second count
         // is owned by the target half.
         unsafe { std::sync::Arc::increment_strong_count(data) };
@@ -1020,14 +1050,14 @@ impl<I, O> Monitor<I, O> {
         )
     }
 
-    pub(crate) fn view(&self) -> MonitorRef<'_, I, O> {
+    pub(crate) fn view(&self) -> MonitorRef<'_, I, O, S> {
         MonitorRef {
             node: self.node,
             _monitor: PhantomData,
         }
     }
 
-    pub(crate) fn view_mut(&mut self) -> MonitorMut<'_, I, O> {
+    pub(crate) fn view_mut(&mut self) -> MonitorMut<'_, I, O, S> {
         MonitorMut {
             node: self.node,
             _monitor: PhantomData,
@@ -1036,7 +1066,7 @@ impl<I, O> Monitor<I, O> {
 
     /// The origin state; `None` on a target half.
     pub(crate) fn state(&self) -> Option<&O> {
-        let view: MonitorRef<'_, I, O> = MonitorRef {
+        let view: MonitorRef<'_, I, O, S> = MonitorRef {
             node: self.node,
             _monitor: PhantomData,
         };
@@ -1050,9 +1080,9 @@ impl<I, O> Monitor<I, O> {
     }
 
     /// Give the half up for transit as a signal; [`MonitorData::take_half`] turns it back.
-    pub(crate) fn into_shared(self) -> std::sync::Arc<MonitorData<I, O>> {
+    pub(crate) fn into_shared(self) -> std::sync::Arc<MonitorData<I, O, S>> {
         let target = self.view().is_target();
-        let main = node_to_main(self.node).cast::<MonitorData<I, O>>();
+        let main = node_to_main(self.node).cast::<MonitorData<I, O, S>>();
         std::mem::forget(self);
         // SAFETY: the handle owned one strong count of the `Arc` its data came from, which this
         // takes over.
@@ -1063,30 +1093,30 @@ impl<I, O> Monitor<I, O> {
     }
 }
 
-impl<I, O> Drop for Monitor<I, O> {
+impl<I, O, S> Drop for Monitor<I, O, S> {
     /// `erts_monitor_release`: the data is destroyed with the last half.
     fn drop(&mut self) {
-        let main = node_to_main(self.node).cast::<MonitorData<I, O>>();
+        let main = node_to_main(self.node).cast::<MonitorData<I, O, S>>();
         // SAFETY: the handle owned one strong count of the `Arc` its data came from.
         drop(unsafe { std::sync::Arc::from_raw(main.as_ptr().cast_const()) });
     }
 }
 
 /// A borrowed monitor half.
-pub(crate) struct MonitorRef<'a, I, O> {
+pub(crate) struct MonitorRef<'a, I, O, S = ()> {
     node: NodePtr,
-    _monitor: PhantomData<&'a Monitor<I, O>>,
+    _monitor: PhantomData<&'a Monitor<I, O, S>>,
 }
 
-impl<I, O> Clone for MonitorRef<'_, I, O> {
+impl<I, O, S> Clone for MonitorRef<'_, I, O, S> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<I, O> Copy for MonitorRef<'_, I, O> {}
+impl<I, O, S> Copy for MonitorRef<'_, I, O, S> {}
 
-impl<'a, I, O> MonitorRef<'a, I, O> {
+impl<'a, I, O, S> MonitorRef<'a, I, O, S> {
     pub(crate) fn kind(self) -> u32 {
         node_flags(self.node) & node_flag::TYPE_MASK
     }
@@ -1101,11 +1131,11 @@ impl<'a, I, O> MonitorRef<'a, I, O> {
     }
 
     pub(crate) fn reference(self) -> u64 {
-        MonitorData::<I, O>::from_node(self.node).reference
+        MonitorData::<I, O, S>::from_node(self.node).reference
     }
 
     pub(crate) fn info(self) -> &'a I {
-        &MonitorData::<I, O>::from_node(self.node).info
+        &MonitorData::<I, O, S>::from_node(self.node).info
     }
 
     /// The origin state; `None` on a target half.
@@ -1113,7 +1143,7 @@ impl<'a, I, O> MonitorRef<'a, I, O> {
         if self.is_target() {
             return None;
         }
-        let data = MonitorData::<I, O>::from_node(self.node);
+        let data = MonitorData::<I, O, S>::from_node(self.node);
         // SAFETY: only the origin half reaches the origin state, and this view borrows it
         // shared, so no `&mut` to the state is alive.
         Some(unsafe { &*data.origin_state.get() })
@@ -1121,12 +1151,12 @@ impl<'a, I, O> MonitorRef<'a, I, O> {
 }
 
 /// A mutably borrowed monitor half.
-pub(crate) struct MonitorMut<'a, I, O> {
+pub(crate) struct MonitorMut<'a, I, O, S = ()> {
     node: NodePtr,
-    _monitor: PhantomData<&'a mut Monitor<I, O>>,
+    _monitor: PhantomData<&'a mut Monitor<I, O, S>>,
 }
 
-impl<'a, I, O> MonitorMut<'a, I, O> {
+impl<'a, I, O, S> MonitorMut<'a, I, O, S> {
     pub(crate) fn set_other(&mut self, other: u64) {
         set_node_other(self.node, other);
     }
@@ -1136,23 +1166,23 @@ impl<'a, I, O> MonitorMut<'a, I, O> {
         if node_flags(self.node) & node_flag::TARGET != 0 {
             return None;
         }
-        let data = MonitorData::<I, O>::from_node(self.node);
+        let data = MonitorData::<I, O, S>::from_node(self.node);
         // SAFETY: only the origin half reaches the origin state, and this view borrows that
         // half exclusively.
         Some(unsafe { &mut *data.origin_state.get() })
     }
 }
 
-impl<I, O> MonLnkTree<Monitor<I, O>> {
+impl<I, O, S> MonLnkTree<Monitor<I, O, S>> {
     /// `erts_monitor_tree_lookup`.
-    pub(crate) fn get(&self, reference: u64) -> Option<MonitorRef<'_, I, O>> {
+    pub(crate) fn get(&self, reference: u64) -> Option<MonitorRef<'_, I, O, S>> {
         self.lookup_node(reference).map(|node| MonitorRef {
             node,
             _monitor: PhantomData,
         })
     }
 
-    pub(crate) fn get_mut(&mut self, reference: u64) -> Option<MonitorMut<'_, I, O>> {
+    pub(crate) fn get_mut(&mut self, reference: u64) -> Option<MonitorMut<'_, I, O, S>> {
         self.lookup_node(reference).map(|node| MonitorMut {
             node,
             _monitor: PhantomData,
@@ -1170,7 +1200,7 @@ impl<I, O> MonLnkTree<Monitor<I, O>> {
     }
 
     /// `erts_monitor_tree_foreach`.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = MonitorRef<'_, I, O>> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = MonitorRef<'_, I, O, S>> {
         self.nodes().into_iter().map(|node| MonitorRef {
             node,
             _monitor: PhantomData,
