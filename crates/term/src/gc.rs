@@ -684,6 +684,14 @@ impl ProcessHeap {
         })
     }
 
+    /// [`ProcessHeap::has_heap_reference`] of a block of heap objects.
+    pub(crate) fn words_have_heap_reference(
+        words: &[u64],
+        mut is_area_pointer: impl FnMut(Term) -> bool,
+    ) -> bool {
+        Self::any_heap_reference_words(words.as_ptr(), 0, words.len(), true, &mut is_area_pointer)
+    }
+
     fn any_heap_reference_words(
         base: *const u64,
         start: usize,
@@ -1208,7 +1216,7 @@ impl ProcessHeap {
         roots: &mut [Term],
         extra: &mut [Term],
         min_free: usize,
-        messages: &mut [(Term, Term, Option<ProcessHeap>)],
+        messages: &mut [(Term, Term, Option<crate::message::MessageHeap>)],
     ) -> Result<GcStats, TermError> {
         // Port of erl_gc.c:803-804: the clock is read only for long_gc monitoring.
         // Microstate accounting uses the same sample (`ERTS_MSACC_IS_ENABLED`).
@@ -1216,7 +1224,7 @@ impl ProcessHeap {
         let message_words = messages
             .iter()
             .filter_map(|(_, _, heap)| heap.as_ref())
-            .map(ProcessHeap::message_data_size)
+            .map(crate::message::MessageHeap::message_data_size)
             .fold(0usize, usize::saturating_add);
         let abandoned = self.abandoned_heap();
         let abandoned_mature = abandoned.map_or((0, 0), |abandoned| {
@@ -1503,12 +1511,12 @@ impl ProcessHeap {
     pub fn max_heap_collection_checks<'a>(
         &self,
         min_free: usize,
-        message_heaps: impl IntoIterator<Item = &'a Option<ProcessHeap>>,
+        message_heaps: impl IntoIterator<Item = &'a Option<crate::message::MessageHeap>>,
     ) -> Result<(usize, Option<usize>), TermError> {
         let message_words = message_heaps
             .into_iter()
             .filter_map(Option::as_ref)
-            .map(ProcessHeap::message_data_size)
+            .map(crate::message::MessageHeap::message_data_size)
             .fold(0usize, usize::saturating_add);
         let source_words = self
             .young_gen_usage()
@@ -1667,18 +1675,24 @@ impl ProcessHeap {
     // copy.c:2049 (erts_move_multi_frags), OTP-29.1.1.
     fn move_msgs_to_heap(
         &mut self,
-        messages: &mut [(Term, Term, Option<ProcessHeap>)],
+        messages: &mut [(Term, Term, Option<crate::message::MessageHeap>)],
     ) -> Result<(), TermError> {
         let pre_overhead = self.bin_vheap;
         for (term, token, slot) in messages.iter_mut() {
-            let Some(mut fragment) = slot.take() else {
+            let Some(mut data) = slot.take() else {
                 continue;
             };
-            let mut blocks: Vec<&[u64]> = vec![&fragment.words.words()[..fragment.htop]];
-            for block in &fragment.fragments {
-                if let crate::heap::Fragment::Block { memory, used } = block {
-                    blocks.push(&memory.as_slice()[..*used]);
+            let mut blocks: Vec<&[u64]> = Vec::new();
+            match &data {
+                crate::message::MessageHeap::Heap(fragment) => {
+                    blocks.push(&fragment.words.words()[..fragment.htop]);
+                    for block in &fragment.fragments {
+                        if let crate::heap::Fragment::Block { memory, used } = block {
+                            blocks.push(&memory.as_slice()[..*used]);
+                        }
+                    }
                 }
+                crate::message::MessageHeap::Node(fragment) => blocks.push(fragment.words()),
             }
             let words = blocks.iter().map(|block| block.len()).sum::<usize>();
             if self.htop.saturating_add(words) > self.stop {
@@ -1711,8 +1725,17 @@ impl ProcessHeap {
             }
             // The message heap is released after this loop. Its BinRef nodes live in
             // the copied blocks too, so move both intrusive lists before adopting them.
-            rebase_binref_chains_to_ranges(&mut fragment, &ranges);
-            self.absorb_fragment_owners(&mut fragment);
+            match &mut data {
+                crate::message::MessageHeap::Heap(fragment) => {
+                    rebase_binref_chains_to_ranges(&mut fragment.owners, &ranges);
+                    self.absorb_fragment_owners(fragment);
+                }
+                crate::message::MessageHeap::Node(fragment) => {
+                    rebase_binref_chains_to_ranges(fragment.owners_mut(), &ranges);
+                    let (owners, bin_vheap) = fragment.take_owners();
+                    self.absorb_owners(owners, bin_vheap);
+                }
+            }
         }
         // Port of erts/emulator/beam/erl_gc.c:203-217 (move_msgs_to_heap), OTP-29.1.1.
         if pre_overhead != self.bin_vheap {
@@ -1855,8 +1878,8 @@ struct MoveRange {
 
 // Port of erts/emulator/beam/erl_gc.c:2514-2611 (erts_copy_one_frag off-heap links),
 // OTP-29.1.1. The source fragment is freed after its terms and off-heap ownership are adopted.
-fn rebase_binref_chains_to_ranges(heap: &mut ProcessHeap, ranges: &[MoveRange]) {
-    let Some(owners) = heap.owners.as_mut() else {
+fn rebase_binref_chains_to_ranges(owners: &mut crate::heap::LazyOwners, ranges: &[MoveRange]) {
+    let Some(owners) = owners.as_mut() else {
         return;
     };
     let nodes = binref_chain_nodes(owners.off_heap_first)

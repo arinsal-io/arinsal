@@ -245,13 +245,24 @@ impl<T: InSignal> Incoming<T> {
     // buffers are installed (erl_proc_sig_queue.c:10271-10288).
     /// Fails, giving the signal back, once the receiver closed its queue.
     pub fn push_routed(&self, slot: impl FnOnce() -> usize, value: T) -> Result<u32, T> {
-        let signal = match self.try_push_buffer(slot, OwnedSignal::new(value)) {
+        self.push_routed_node(slot, OwnedSignal::new(value))
+            .map_err(OwnedSignal::into_value)
+    }
+
+    /// [`Incoming::push_routed`] of a signal node the sender allocated (erts enqueues the
+    /// `ErtsMessage` the sender built). Gives the node back once the receiver closed its queue.
+    pub fn push_routed_node(
+        &self,
+        slot: impl FnOnce() -> usize,
+        signal: OwnedSignal<T>,
+    ) -> Result<u32, OwnedSignal<T>> {
+        let signal = match self.try_push_buffer(slot, signal) {
             Ok(state) => return Ok(state),
             Err(signal) => signal,
         };
         let (mut queue, contended) = self.lock_msgq();
         if self.closed.load(Ordering::Relaxed) {
-            return Err(signal.into_value());
+            return Err(signal);
         }
         let nmsg = usize::from(!signal.is_message());
         queue.push_back_node(signal);
@@ -431,7 +442,7 @@ impl<T: InSignal> Incoming<T> {
     /// Fails once the receiver closed its queue; the signals not enqueued stay in `values`.
     pub fn push_block_routed(
         &self,
-        values: &mut Vec<T>,
+        values: &mut Vec<OwnedSignal<T>>,
         sender_slot: impl Fn(&T) -> usize,
     ) -> Result<(), QueueClosed> {
         if values.is_empty() {
@@ -443,8 +454,8 @@ impl<T: InSignal> Incoming<T> {
             if self.closed.load(Ordering::Relaxed) {
                 return Err(QueueClosed);
             }
-            for value in values.drain(..) {
-                block.push_back(value);
+            for signal in values.drain(..) {
+                block.push_back_node(signal);
             }
             let (count, nmsgs) = (block.len(), block.non_messages());
             queue.append(&mut block);
@@ -454,12 +465,12 @@ impl<T: InSignal> Incoming<T> {
             return Ok(());
         }
         let mut pending = std::mem::take(values).into_iter();
-        while let Some(value) = pending.next() {
-            let slot = sender_slot(&value);
-            if let Err(signal) = self.try_push_buffer(|| slot, OwnedSignal::new(value)) {
+        while let Some(signal) = pending.next() {
+            let slot = sender_slot(&signal);
+            if let Err(signal) = self.try_push_buffer(|| slot, signal) {
                 let (mut queue, _) = self.lock_msgq();
                 if self.closed.load(Ordering::Relaxed) {
-                    values.push(signal.into_value());
+                    values.push(signal);
                     values.extend(pending);
                     return Err(QueueClosed);
                 }
@@ -476,15 +487,18 @@ impl<T: InSignal> Incoming<T> {
     /// the block path) or the receiver closed its queue.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1146-1165 (proc_queue_signal prepends the
     // pending signal to the new one and enqueues both), OTP-29.1.1.
-    pub fn push_pair(&self, first: T, second: T) -> Result<(), (T, T)> {
+    pub fn push_pair(
+        &self,
+        first: OwnedSignal<T>,
+        second: OwnedSignal<T>,
+    ) -> Result<(), (OwnedSignal<T>, OwnedSignal<T>)> {
         if self.buffers_enabled.load(Ordering::Acquire) {
             return Err((first, second));
         }
         let nmsgs = usize::from(!first.is_message()) + usize::from(!second.is_message());
-        let (first, second) = (OwnedSignal::new(first), OwnedSignal::new(second));
         let (mut queue, contended) = self.lock_msgq();
         if self.closed.load(Ordering::Relaxed) {
-            return Err((first.into_value(), second.into_value()));
+            return Err((first, second));
         }
         queue.push_back_node(first);
         queue.push_back_node(second);
