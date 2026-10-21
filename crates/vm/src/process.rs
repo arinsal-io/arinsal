@@ -4874,7 +4874,8 @@ impl Process {
             code: 0,
         }));
         let mut reds = isize::MAX;
-        self.exit_ets(ctx, &mut reds);
+        let mut garbage = None;
+        self.exit_ets(ctx, &mut reds, &mut garbage);
         self.exit_stage3(ctx, reason);
     }
 
@@ -5001,7 +5002,12 @@ impl Process {
     /// whether all of them are released; otherwise the process yields and calls again.
     ///
     /// Port of erts/emulator/beam/erl_db.c:5031 (erts_db_process_exiting), OTP-29.1.1.
-    fn exit_ets(&mut self, ctx: &mut RunCtx<'_, Message>, reds: &mut isize) -> bool {
+    fn exit_ets(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        reds: &mut isize,
+        interrupted: &mut Option<arinsal_ets::Garbage>,
+    ) -> bool {
         // erl_process.c:14362: erts_db_process_exiting runs only when F_USING_DB is set.
         if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::USING_DB == 0 {
             return true;
@@ -5010,10 +5016,10 @@ impl Process {
             return true;
         };
         // FREE_OWNED_TABLE: finish the table whose release was interrupted.
-        if let Some(mut garbage) = self.exit_cont.as_mut().and_then(|cont| cont.garbage.take())
+        if let Some(mut garbage) = interrupted.take()
             && !garbage.step(reds)
         {
-            self.exit_cont.as_mut().expect("exit state").garbage = Some(garbage);
+            *interrupted = Some(garbage);
             return false;
         }
         // GET_OWNED_TABLE
@@ -5112,7 +5118,7 @@ impl Process {
             // FREE_OWNED_TABLE
             *reds -= fixations as isize;
             if !garbage.step(reds) {
-                self.exit_cont.as_mut().expect("exit state").garbage = Some(garbage);
+                *interrupted = Some(garbage);
                 return false;
             }
         }
@@ -7822,6 +7828,20 @@ impl Task for Process {
         Process::finish_dirty_job(self, result);
     }
 
+    // Port of erts/emulator/beam/erl_process.c (delete_process), OTP-29.1.1: the heap,
+    // off-heap list, message queue, dictionary and the link and monitor state are freed by
+    // the exiting scheduler, not when the last reference to the struct goes.
+    fn delete_process(&mut self) {
+        self.heap = arinsal_term::ProcessHeap::with_words(0);
+        self.cold = None;
+        self.dictionary = None;
+        self.inbox = MessageQueue::default();
+        self.sig_cont = std::collections::VecDeque::new();
+        self.exit_cont = None;
+        self.seq_trace_token = None;
+        self.final_exit_reason = None;
+    }
+
     fn reap_signals(&mut self, pid: Pid, events: Vec<Event<Message>>) {
         let mut monitors = Vec::new();
         let mut links = Vec::new();
@@ -7936,13 +7956,15 @@ impl Process {
         with_executor(data, runtime, |executor| {
             self.exit_stage1(&mut executor.vm, ctx, reason)
         });
-        self.exit_cont = Some(Box::new(crate::proc_create::ExitCont {
+        // Port of erts/emulator/beam/erl_process.c (erts_continue_exit_process), OTP-29.1.1:
+        // the continuation state lives on the stack and is allocated only when the exit yields.
+        let state = crate::proc_create::ExitCont {
             reason,
             garbage: None,
             entry_result,
             code,
-        }));
-        self.continue_exit(runtime, ctx, data, false)
+        };
+        self.continue_exit(runtime, ctx, data, false, state)
     }
 
     /// Run the interruptible part of process exit; yields with `out_exiting` when the
@@ -7953,6 +7975,7 @@ impl Process {
         ctx: &mut RunCtx<'_, Message>,
         data: &mut SchedulerData,
         resumed: bool,
+        mut state: crate::proc_create::ExitCont,
     ) -> RunOutcome {
         let zero = [Term::small(0).expect("small zero")];
         if resumed {
@@ -7970,7 +7993,7 @@ impl Process {
         }
         let initial = ctx.remaining() as isize;
         let mut reds = initial;
-        let done = self.exit_ets(ctx, &mut reds);
+        let done = self.exit_ets(ctx, &mut reds, &mut state.garbage);
         ctx.consume((initial - reds).clamp(0, initial) as u32);
         if !done {
             with_executor(data, runtime, |executor| {
@@ -7984,9 +8007,10 @@ impl Process {
                     &zero,
                 );
             });
+            self.exit_cont = Some(Box::new(state));
             return RunOutcome::Yield;
         }
-        let cont = self.exit_cont.take().expect("exit state");
+        let cont = state;
         with_executor(data, runtime, |executor| {
             crate::trace::emit(
                 Some(&mut executor.vm),
@@ -8033,11 +8057,11 @@ impl Process {
             // Exited by a dirty signal handler while queued for a dirty scheduler.
             return RunOutcome::Exit(1);
         }
-        if self.exit_cont.is_some() {
+        if let Some(state) = self.exit_cont.take() {
             // Port of erts/emulator/beam/erl_process.c:10528 (in_exiting), OTP-29.1.1: an
             // exiting process only continues its exit when scheduled in.
             let runtime = self.runtime_handle();
-            return self.continue_exit(&runtime, ctx, data, true);
+            return self.continue_exit(&runtime, ctx, data, true, *state);
         }
         let result = self.run_executor(ctx, data, budget);
         if self.dirty_exiting() {
