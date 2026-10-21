@@ -9,10 +9,19 @@ use crate::{Process, Vm, VmError};
 use arinsal_etf::{DistributionHeader, OwnedTerm};
 use arinsal_sched::{Pid, RunCtx, Signal};
 use arinsal_term::{Term, TermBuilder, from_owned, global_atoms, to_owned};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1 << 40);
 static NEXT_REMOTE_PID: AtomicU32 = AtomicU32::new(1 << 27);
+/// Set once the first scheduler proxy for a remote pid exists. Until then no link, monitor or
+/// signal sender can be a proxy, and the exit and signal paths skip the node table lookup, as
+/// erts' local link and monitor nodes never touch distribution data.
+static PROXIES_CREATED: AtomicBool = AtomicBool::new(false);
+
+/// Whether `pid` may be a scheduler proxy for a remote pid.
+fn may_be_proxy() -> bool {
+    PROXIES_CREATED.load(Ordering::Acquire)
+}
 static NEXT_UNLINK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Distribution controller BIFs implemented by this module.
@@ -638,6 +647,7 @@ fn remote_proxy(handle: u64, remote: &OwnedTerm) -> Result<Pid, VmError> {
         NEXT_REMOTE_PID.fetch_add(1, Ordering::Relaxed) & ((1 << 28) - 1),
         local_creation,
     );
+    PROXIES_CREATED.store(true, Ordering::Release);
     state.remote_pids.insert(key, pid);
     state.proxy_to_remote.insert(pid, remote.clone());
     Ok(pid)
@@ -646,6 +656,9 @@ fn remote_proxy(handle: u64, remote: &OwnedTerm) -> Result<Pid, VmError> {
 /// Resolve a scheduler proxy to the external PID used in a remote DOWN tuple.
 // Port of erts/emulator/beam/dist.c:2689-2716 (DOP_MONITOR_P_EXIT), OTP-29.1.1.
 pub(crate) fn remote_pid_term(process: &mut Process, proxy: Pid) -> Result<Option<Term>, VmError> {
+    if !may_be_proxy() {
+        return Ok(None);
+    }
     let remote = node_tables::lock()
         .entries
         .values()
@@ -1838,6 +1851,9 @@ pub(crate) fn forward_link_exit_if_proxy(
     deceased: Pid,
     reason: Term,
 ) -> bool {
+    if !may_be_proxy() {
+        return false;
+    }
     let (remote_watcher, handle, local_name, local_creation, exit_payload) = {
         let mut tables = node_tables::lock();
         let local_name = tables.local_name.clone();
@@ -1915,6 +1931,9 @@ pub(crate) fn forward_monitor_down_if_proxy(
     reference: u64,
     reason: Term,
 ) -> bool {
+    if !may_be_proxy() {
+        return false;
+    }
     let (
         remote_watcher,
         reference_term,
