@@ -2024,10 +2024,9 @@ fn internal_monitor_list_from(
 }
 
 fn monitor_extra(data: &crate::proc_create::MonitorInfo) -> Option<OwnedTerm> {
-    data.name
-        .clone()
-        .map(OwnedTerm::Atom)
-        .or_else(|| data.tag.clone())
+    data.name()
+        .map(|name| OwnedTerm::Atom(name.to_owned()))
+        .or_else(|| data.tag().cloned())
 }
 
 fn monitor_extra_term(process: &mut Process, extra: Option<&OwnedTerm>) -> Result<Term, VmError> {
