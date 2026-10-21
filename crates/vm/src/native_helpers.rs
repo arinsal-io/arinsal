@@ -898,7 +898,7 @@ pub(crate) extern "C" fn persistent_term_get_1_light(
     let Some(key) = process.x.first().copied() else {
         return 0;
     };
-    let found = process._persistent_terms.store().get(key);
+    let found = process.persistent_terms.get(key);
     match found {
         Some(value) => crate::native_hooks::raw(value),
         None => {
@@ -926,11 +926,7 @@ pub(crate) extern "C" fn persistent_term_get_2_light(
     let Some(default) = process.x.get(1).copied() else {
         return 0;
     };
-    let value = process
-        ._persistent_terms
-        .store()
-        .get(key)
-        .unwrap_or(default);
+    let value = process.persistent_terms.get(key).unwrap_or(default);
     crate::native_hooks::raw(value)
 }
 
