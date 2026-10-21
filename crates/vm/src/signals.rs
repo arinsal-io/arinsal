@@ -585,6 +585,13 @@ pub(crate) fn each_list_item(term: Term, mut visit: impl FnMut(Term)) -> Option<
     (current == Term::NIL).then_some(())
 }
 
+/// Length of a proper list, `None` for an improper one (erts `erts_list_length`).
+pub(crate) fn list_length(term: Term) -> Option<usize> {
+    let mut length = 0;
+    each_list_item(term, |_| length += 1)?;
+    Some(length)
+}
+
 pub(crate) fn list(term: Term) -> Option<Vec<Term>> {
     let mut values = Vec::new();
     each_list_item(term, |head| values.push(head))?;
@@ -972,16 +979,34 @@ pub(crate) fn erl_create_process(
     let (module, function, args) = mfa;
     let m = module.as_atom().ok_or_else(|| badarg("erlang:spawn/3"))?;
     let f = function.as_atom().ok_or_else(|| badarg("erlang:spawn/3"))?;
-    let args_list = list(args).ok_or_else(|| badarg("erlang:spawn/3"))?;
-    if args_list.len() > 1024 {
+    // Port of erts/emulator/beam/erl_process.c (erl_create_process: erts_list_length),
+    // OTP-29.1.1: the argument list is only counted here.
+    let arity = list_length(args).ok_or_else(|| badarg("erlang:spawn/3"))?;
+    if arity > 1024 {
         return Err(badarg("erlang:spawn/3"));
     }
     // The runtime is borrowed from the parent at each use: a clone is a refcount write on a
     // line every scheduler shares.
     spawn_scheduler(parent)?;
     let defaults = crate::natives::sys::gc_spawn_defaults(parent.runtime.as_deref());
-    // The heap is installed below, so the child starts with the placeholder heap.
-    let mut child = Process::with_spawn_registers_heap(3, 0, 64);
+    // Port of erts/emulator/beam/erl_process.c (erl_create_process: min_heap_size rounded up by
+    // erts_next_heap_size), OTP-29.1.1.
+    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
+        parent.runtime.as_deref(),
+        so.min_heap,
+        false,
+    );
+    // Port of erts/emulator/beam/erl_process.c (erl_create_process), OTP-29.1.1: the initial
+    // heap holds the copied arguments and the reserved words, rounded up to a heap size, is
+    // never smaller than the process's minimum heap, and is allocated once.
+    let literals = arinsal_term::LiteralAreas::current();
+    let heap_need =
+        arinsal_term::size_object_litopt(args, &literals).saturating_add(arinsal_term::S_RESERVED);
+    let heap_words = arinsal_term::spawned_heap_words(heap_need, min_heap)
+        .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))?;
+    let mut heap = arinsal_term::ProcessHeap::with_words(heap_words);
+    heap.set_min_heap_size(min_heap);
+    let mut child = Process::with_spawn_registers_heap(3, 0, heap);
     child.set_runtime(parent.runtime.clone());
     // Port of erts/emulator/beam/erl_process.c:12508 (erl_create_process initializes both
     // active and user priority from so->priority), OTP-29.1.1. The scheduler entry already
@@ -999,23 +1024,6 @@ pub(crate) fn erl_create_process(
             }),
         );
     }
-    // Port of erts/emulator/beam/erl_process.c:12594 (min_heap_size rounded up by
-    // erts_next_heap_size), OTP-29.1.1.
-    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
-        parent.runtime.as_deref(),
-        so.min_heap,
-        false,
-    );
-    // Port of erts/emulator/beam/erl_process.c:12550-12591 (erl_create_process), OTP-29.1.1: the
-    // initial heap holds the copied arguments and the reserved words, rounded up to a heap
-    // size, and is never smaller than the process's minimum heap.
-    let literals = arinsal_term::LiteralAreas::current();
-    let heap_need =
-        arinsal_term::size_object_litopt(args, &literals).saturating_add(arinsal_term::S_RESERVED);
-    let heap_words = arinsal_term::spawned_heap_words(heap_need, min_heap)
-        .map_err(|error| VmError::Unsupported(format!("spawn heap: {error:?}")))?;
-    child.heap = arinsal_term::ProcessHeap::with_words(heap_words);
-    child.heap.set_min_heap_size(min_heap);
     // Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1: an
     // explicit min_bin_vheap_size alone takes the runtime default when no other heap option is set.
     let min_bin_vheap =
@@ -1044,8 +1052,8 @@ pub(crate) fn erl_create_process(
     // the apply_only sentinel; its first run applies X0..X2 (Vm::resolve_run_process).
     child.module = crate::process::RUN_PROCESS;
     child.ip = 0;
-    child.initial_mfa = Some((m, f, args_list.len() as u8));
-    let initial_bif = if let Ok(arity) = u8::try_from(args_list.len())
+    child.initial_mfa = Some((m, f, arity as u8));
+    let initial_bif = if let Ok(arity) = u8::try_from(arity)
         && is_bif_export(m, f, arity)
         && let (Some(m_name), Some(f_name)) = (atom_name(module), atom_name(function))
     {
@@ -1126,7 +1134,7 @@ pub(crate) fn erl_create_process(
     }
     if crate::trace::spawn_interested(parent, parent_pid) {
         let arg_list = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut parent.heap))
-            .list_from_iter(args_list.iter().copied())
+            .list_from_iter(list(args).unwrap_or_default())
             .map_err(|error| VmError::Unsupported(format!("spawn trace args: {error:?}")))?;
         let mfa = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut parent.heap))
             .tuple(&[module, function, arg_list])
@@ -1149,7 +1157,7 @@ pub(crate) fn erl_create_process(
                 crate::signals::reference(parent, arinsal_bifs::next_ref_id())?,
             ),
         };
-        let arity = Term::small(args_list.len() as i64).unwrap_or(Term::NIL);
+        let arity = Term::small(arity as i64).unwrap_or(Term::NIL);
         let group_leader = child_group_leader_term(parent, ctx.pid());
         let request_message = arinsal_etf::OwnedTerm::tuple(vec![
             arinsal_etf::OwnedTerm::atom("spawn_request"),

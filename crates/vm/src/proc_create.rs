@@ -1661,17 +1661,16 @@ impl Process {
         Self::with_registers_and_min_heap(x_registers, float_registers, 64, true)
     }
     pub(crate) fn with_spawn_registers(x_registers: usize, float_registers: usize) -> Self {
-        Self::with_spawn_registers_heap(x_registers, float_registers, 233)
+        Self::with_spawn_registers_heap(x_registers, float_registers, Self::initial_heap(233))
     }
-    /// [`Self::with_spawn_registers`] for a caller that installs the child's heap itself
-    /// (`erl_create_process`): `min_heap` 64 builds the zero-word placeholder heap.
+    /// [`Self::with_spawn_registers`] with the heap `erl_create_process` sized for the
+    /// child: erts allocates the initial heap once, at its final size.
     pub(crate) fn with_spawn_registers_heap(
         x_registers: usize,
         float_registers: usize,
-        min_heap: usize,
+        heap: ProcessHeap,
     ) -> Self {
-        let mut process =
-            Self::with_registers_and_min_heap(x_registers, float_registers, min_heap, false);
+        let mut process = Self::with_registers_and_heap(x_registers, float_registers, heap, false);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;
@@ -1687,8 +1686,15 @@ impl Process {
         min_heap: usize,
         register: bool,
     ) -> Self {
-        #[cfg(feature = "pf-mem-counters")]
-        let started = std::time::Instant::now();
+        Self::with_registers_and_heap(
+            x_registers,
+            float_registers,
+            Self::initial_heap(min_heap),
+            register,
+        )
+    }
+    /// A heap of `min_heap` words with the boot GC defaults; 64 builds the zero-word heap.
+    fn initial_heap(min_heap: usize) -> ProcessHeap {
         let mut heap = if min_heap == 64 {
             ProcessHeap::with_words(0)
         } else {
@@ -1700,6 +1706,18 @@ impl Process {
         heap.set_min_bin_vheap_size(
             crate::natives::sys::gc_spawn_defaults(None).min_bin_vheap_size as u64,
         );
+        heap
+    }
+    fn with_registers_and_heap(
+        x_registers: usize,
+        float_registers: usize,
+        heap: ProcessHeap,
+        register: bool,
+    ) -> Self {
+        #[cfg(feature = "pf-mem-counters")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "pf-mem-counters")]
+        let min_heap = heap.min_heap_size_words();
         let mut process = Self {
             header: ProcessHeader::default(),
             x: ArgRegs::new(x_registers),
