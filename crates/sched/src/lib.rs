@@ -1476,6 +1476,8 @@ impl<T: Task> LocalInit<T> {
             pending_waits: self.pending_waits,
             check_time_reds: self.check_time_reds,
             last_monotonic_ms: self.last_monotonic_ms,
+            fix_shrink_due_ms: 0,
+            fix_shrink_dealloc: false,
             profile_active: self.profile_active,
             last_process: self.last_process,
             metric_deltas: self.metric_deltas,
@@ -3350,6 +3352,7 @@ impl<T: Task> Inner<T> {
         if force || local.check_time_reds >= self.config.reductions {
             local.last_monotonic_ms = self.clock.now_ms();
             local.check_time_reds = 0;
+            fix_alloc_aux_work(local);
         }
         local.last_monotonic_ms
     }
@@ -3945,6 +3948,11 @@ struct Local<T: Task> {
     /// Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData.last_monotonic_time),
     /// OTP-29.1.1: the time of this scheduler's latest clock read.
     last_monotonic_ms: u64,
+    /// When the periodic fix_alloc shrink is due (erts aux work timeout of
+    /// `ERTS_SSI_AUX_WORK_FIX_ALLOC_LOWER_LIM`).
+    fix_shrink_due_ms: u64,
+    /// The last shrink pass left blocks to give back (`ERTS_SSI_AUX_WORK_FIX_ALLOC_DEALLOC`).
+    fix_shrink_dealloc: bool,
     profile_active: bool,
     last_process: Option<Pid>,
     metric_deltas: Vec<i64>,
@@ -7812,6 +7820,27 @@ pub fn begin_halt() {
 
 fn halting() -> bool {
     HALTING.load(Ordering::Acquire)
+}
+
+/// The fix_alloc shrink aux work of a scheduler: the lower-limit pass once a second, then
+/// deallocation passes until the blocks to give back are gone.
+///
+/// Port of erts/emulator/beam/erl_process.c (handle_fix_alloc on the aux work timeout set by
+/// erl_alloc_util.c sched_fix_shrink) and erl_alloc_util.c (erts_alcu_fix_alloc_shrink),
+/// OTP-29.1.1.
+fn fix_alloc_aux_work<T: Task>(local: &mut Local<T>) {
+    const FIX_SHRINK_INTERVAL_MS: u64 = 1000;
+    let now = local.last_monotonic_ms;
+    let lower_limit = now >= local.fix_shrink_due_ms;
+    if !lower_limit && !local.fix_shrink_dealloc {
+        return;
+    }
+    if lower_limit {
+        local.fix_shrink_due_ms = now + FIX_SHRINK_INTERVAL_MS;
+    }
+    let shrink =
+        arinsal_alloc::typed::fix_alloc_shrink(arinsal_alloc::thread_alloc_ix(), lower_limit);
+    local.fix_shrink_dealloc = shrink.dealloc;
 }
 
 type OwnerWaker = Box<dyn Fn() + Send + Sync>;
