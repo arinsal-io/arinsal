@@ -918,6 +918,11 @@ impl Store {
     pub fn release_update_permission(&self, process: &ProcessRegistration<'_>) {
         assert!(std::ptr::eq(self, process.store));
         let owner = registration_owner(process);
+        // Only the updater clears the word; every other process reads it and leaves its
+        // cache line shared.
+        if self.updater.load(Ordering::Acquire) != owner {
+            return;
+        }
         let _ = self
             .updater
             .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);

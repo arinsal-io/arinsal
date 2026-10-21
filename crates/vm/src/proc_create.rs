@@ -1493,7 +1493,10 @@ impl Process {
     /// Attaches the process to its node and registers it with the node's persistent-term
     /// store (its literal-area collector handshake).
     pub(crate) fn set_runtime(&mut self, runtime: Option<std::sync::Arc<crate::process::Runtime>>) {
-        let scope = runtime.as_ref().map_or(0, |runtime| runtime.code_scope);
+        let store = runtime.as_deref().map_or_else(
+            || arinsal_pterm::store_for(0),
+            |runtime| runtime.persistent_terms,
+        );
         if let Some(runtime) = runtime.as_deref() {
             // A new process takes `system_flag(min_bin_vheap_size)` of the runtime it joins;
             // explicit spawn options are applied after this.
@@ -1502,7 +1505,6 @@ impl Process {
             );
         }
         self.runtime = runtime;
-        let store = arinsal_pterm::store_for(scope);
         if !self._persistent_terms.is_registered()
             || !std::ptr::eq(self._persistent_terms.store(), store)
         {
