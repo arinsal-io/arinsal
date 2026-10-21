@@ -1,0 +1,203 @@
+//! Process structures: one fix_alloc block per process holding its reference count, and the
+//! release of the process table's reference once thread progress has passed.
+//!
+//! Port of erts/emulator/beam/erl_process.c (alloc_process takes the struct with
+//! `erts_alloc(ERTS_ALC_T_PROC)`, erts_free_proc gives it back), erl_process.h
+//! (erts_proc_inc_refc, erts_proc_dec_refc on `common.refc`) and erl_ptab.c
+//! (erts_ptab_delete_element hands the table's reference to release_process through
+//! erts_schedule_thr_prgr_later_cleanup_op), OTP-29.1.1. Every `unsafe` of the process lifetime is
+//! in this module.
+
+use super::{Process, Task};
+use arinsal_alloc::instances::InstanceAllocation;
+use arinsal_alloc::typed::{ErtsAlcType, fix_alloc_at, fix_free_at};
+use std::any::TypeId;
+use std::mem::ManuallyDrop;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
+
+/// The fix_alloc block of one process: `common.refc`, the allocator handle that frees the
+/// block, and the process.
+struct ProcessBlock<T: Task> {
+    refc: AtomicUsize,
+    handle: InstanceAllocation,
+    process: Process<T>,
+}
+
+/// A counted reference to a process (erts `Process *` with a reference taken by
+/// erts_proc_inc_refc).
+pub(crate) struct ProcRef<T: Task> {
+    block: NonNull<ProcessBlock<T>>,
+}
+
+// SAFETY: a `ProcRef` is a counted shared reference to a `Process<T>`, like `Arc<Process<T>>`:
+// the count is atomic and the process is only reached through `&Process<T>`, which may cross
+// threads because `Process<T>` is `Sync` and `Send`.
+unsafe impl<T: Task> Send for ProcRef<T> where Process<T>: Send + Sync {}
+// SAFETY: as for `Send`: shared access goes through `&Process<T>` only.
+unsafe impl<T: Task> Sync for ProcRef<T> where Process<T>: Send + Sync {}
+
+impl<T: Task> ProcRef<T> {
+    /// A new process struct with one reference, the caller's.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c (alloc_process: `erts_alloc(ERTS_ALC_T_PROC)`
+    /// and `refc` 1), OTP-29.1.1.
+    pub(crate) fn new(process: Process<T>) -> Self {
+        assert!(
+            std::mem::align_of::<ProcessBlock<T>>() <= std::mem::align_of::<u64>(),
+            "allocator blocks are word aligned"
+        );
+        let ix = arinsal_alloc::thread_alloc_ix();
+        let (handle, payload) = fix_alloc_at(
+            ix,
+            ErtsAlcType::PROC,
+            std::mem::size_of::<ProcessBlock<T>>(),
+        )
+        .expect("process struct allocation");
+        let block = NonNull::new(payload.cast::<ProcessBlock<T>>()).expect("allocated block");
+        // SAFETY: `fix_alloc_at` returned a live, word-aligned block of
+        // `size_of::<ProcessBlock<T>>()` bytes that nothing else refers to, and the alignment of
+        // `ProcessBlock<T>` is at most a word (asserted above).
+        unsafe {
+            block.as_ptr().write(ProcessBlock {
+                refc: AtomicUsize::new(1),
+                handle,
+                process,
+            });
+        }
+        Self { block }
+    }
+
+    fn block(&self) -> &ProcessBlock<T> {
+        // SAFETY: this reference is counted in `refc`, so the block is alive.
+        unsafe { self.block.as_ref() }
+    }
+
+    /// Give up this value and keep its reference in the returned address, for a process table
+    /// slot or a later operation.
+    pub(crate) fn into_raw(self) -> *mut () {
+        let raw = self.block.as_ptr().cast();
+        std::mem::forget(self);
+        raw
+    }
+
+    /// Take back a reference given up by [`ProcRef::into_raw`].
+    ///
+    /// # Safety
+    ///
+    /// `raw` came from `ProcRef::<T>::into_raw` and its reference was not taken back before.
+    pub(crate) unsafe fn from_raw(raw: *mut ()) -> Self {
+        Self {
+            // SAFETY: `into_raw` returned a non-null block address, per the caller's contract.
+            block: unsafe { NonNull::new_unchecked(raw.cast()) },
+        }
+    }
+
+    /// Run `f` on the process whose reference a table slot holds, without taking a reference.
+    ///
+    /// # Safety
+    ///
+    /// `raw` is the address in a slot that held it under the caller's thread progress delay:
+    /// the slot's reference is released only after thread progress, so the block outlives `f`.
+    pub(crate) unsafe fn with_borrowed<R>(raw: *mut (), f: impl FnOnce(&Self) -> R) -> R {
+        // SAFETY: per the caller's contract the block is alive for the call; `ManuallyDrop`
+        // keeps the borrowed value from giving back a reference it does not own.
+        let borrowed = ManuallyDrop::new(unsafe { Self::from_raw(raw) });
+        f(&borrowed)
+    }
+
+    /// Erase the process type, for values that cross the `Task`-generic boundary.
+    pub(crate) fn erase(self) -> ErasedProcRef {
+        ErasedProcRef {
+            raw: self.into_raw(),
+            type_id: TypeId::of::<T>(),
+            release: release_raw::<T>,
+        }
+    }
+
+    /// A later operation that releases the reference held at `raw`
+    /// (erts `release_process` scheduled by erts_ptab_delete_element).
+    pub(crate) fn release_later(raw: *mut ()) -> crate::thr_progress::LaterOp {
+        crate::thr_progress::LaterOp::Cleanup {
+            release: release_raw_address::<T>,
+            data: raw as usize,
+        }
+    }
+}
+
+impl<T: Task> Clone for ProcRef<T> {
+    /// Port of erts/emulator/beam/erl_process.h (erts_proc_inc_refc), OTP-29.1.1.
+    fn clone(&self) -> Self {
+        self.block().refc.fetch_add(1, Ordering::Relaxed);
+        Self { block: self.block }
+    }
+}
+
+impl<T: Task> Drop for ProcRef<T> {
+    /// Port of erts/emulator/beam/erl_process.h (erts_proc_dec_refc frees the struct with
+    /// erts_free_proc when the count reaches zero), OTP-29.1.1.
+    fn drop(&mut self) {
+        if self.block().refc.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        fence(Ordering::Acquire);
+        let handle = self.block().handle;
+        // SAFETY: the count reached zero, so this was the last reference: no other thread can
+        // reach the block, and the process is dropped exactly once before its block is freed.
+        unsafe { std::ptr::drop_in_place(&raw mut (*self.block.as_ptr()).process) };
+        let _ = fix_free_at(arinsal_alloc::thread_alloc_ix(), ErtsAlcType::PROC, handle);
+    }
+}
+
+impl<T: Task> std::ops::Deref for ProcRef<T> {
+    type Target = Process<T>;
+
+    fn deref(&self) -> &Process<T> {
+        &self.block().process
+    }
+}
+
+fn release_raw<T: Task>(raw: *mut ()) {
+    // SAFETY: `raw` was produced by `ProcRef::<T>::erase` and is released once, by the
+    // `ErasedProcRef` that owns it.
+    drop(unsafe { ProcRef::<T>::from_raw(raw) });
+}
+
+fn release_raw_address<T: Task>(data: usize) {
+    // SAFETY: `data` is the address a table slot gave up in `ProcRef::release_later`, and the
+    // later operation runs once.
+    drop(unsafe { ProcRef::<T>::from_raw(data as *mut ()) });
+}
+
+/// A [`ProcRef`] whose process type is not named, as `SpawnedProcess` carries it.
+pub(crate) struct ErasedProcRef {
+    raw: *mut (),
+    type_id: TypeId,
+    release: fn(*mut ()),
+}
+
+// SAFETY: it owns one counted reference to a `Process<T>` that is `Send` and `Sync`, and only
+// gives it back as a `ProcRef<T>` of the same type.
+unsafe impl Send for ErasedProcRef {}
+// SAFETY: shared access exposes nothing of the process.
+unsafe impl Sync for ErasedProcRef {}
+
+impl ErasedProcRef {
+    /// The reference as a `ProcRef<T>`, if the process type is `T`.
+    pub(crate) fn downcast<T: Task>(self) -> Option<ProcRef<T>> {
+        if self.type_id != TypeId::of::<T>() {
+            return None;
+        }
+        let raw = self.raw;
+        std::mem::forget(self);
+        // SAFETY: the type matches and the reference moves out of this value, which is
+        // forgotten so it does not release it.
+        Some(unsafe { ProcRef::from_raw(raw) })
+    }
+}
+
+impl Drop for ErasedProcRef {
+    fn drop(&mut self) {
+        (self.release)(self.raw);
+    }
+}

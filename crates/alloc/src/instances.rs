@@ -853,8 +853,10 @@ impl ThreadSpecificAllocators {
         if fix.type_size == 0 {
             fix.type_size = size;
         }
-        debug_assert_eq!(fix.type_size, size, "a fixed-size type keeps one size");
-        if let Some(allocation) = fix.list.pop() {
+        // erts fixes the size of each type at boot. A process that hosts schedulers of several
+        // task types allocates the other sizes outside the list.
+        let listed = fix.type_size == size;
+        if listed && let Some(allocation) = fix.list.pop() {
             fix.min_list_size = fix.min_list_size.min(fix.list.len());
             fix.used += 1;
             return Ok((
@@ -870,9 +872,11 @@ impl ThreadSpecificAllocators {
         }
         let allocation = state.allocator.alloc(size)?;
         let ptr = state.allocator.payload_address(allocation);
-        let fix = &mut state.fix[fix_ix];
-        fix.used += 1;
-        fix.allocated += 1;
+        if listed {
+            let fix = &mut state.fix[fix_ix];
+            fix.used += 1;
+            fix.allocated += 1;
+        }
         Ok((
             InstanceAllocation {
                 instance,
@@ -1476,6 +1480,9 @@ fn fix_free_owned(
         .fix
         .get_mut(fix_ix)
         .ok_or(AllocError::InvalidAllocation)?;
+    if allocation.size() != fix.type_size {
+        return state.allocator.free(allocation);
+    }
     fix.used = fix.used.saturating_sub(1);
     if fix.list.len() < FIX_MAX_LIST_SIZE {
         fix.list.push(allocation);

@@ -9,7 +9,6 @@ rust-version.workspace = true
 arinsal-alloc = { path = "../alloc" }
 arinsal-term.workspace = true
 crossbeam-deque = "0.8.6"
-crossbeam-epoch = "0.9.18"
 crossbeam-queue = "0.3.14"
 libc = "0.2.189"
 arc-swap = "1.9.2"
