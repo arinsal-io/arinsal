@@ -8,13 +8,13 @@
 //! erts_schedule_thr_prgr_later_cleanup_op), OTP-29.1.1. Every `unsafe` of the process lifetime is
 //! in this module.
 
-use super::{Process, Task};
+use super::{Event, Incoming, Process, Task};
 use arinsal_alloc::instances::InstanceAllocation;
 use arinsal_alloc::typed::{ErtsAlcType, fix_alloc_at, fix_free_at};
 use std::any::TypeId;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
 
 /// The fix_alloc block of one process: `common.refc`, the allocator handle that frees the
 /// block, and the process.
@@ -112,6 +112,7 @@ impl<T: Task> ProcRef<T> {
         ErasedProcRef {
             raw: self.into_raw(),
             type_id: TypeId::of::<T>(),
+            retain: retain_raw::<T>,
             release: release_raw::<T>,
         }
     }
@@ -158,6 +159,12 @@ impl<T: Task> std::ops::Deref for ProcRef<T> {
     }
 }
 
+fn retain_raw<T: Task>(raw: *mut ()) {
+    // SAFETY: `raw` belongs to a live `ErasedProcRef` of type `T`, whose reference keeps the
+    // block alive while the count is raised.
+    unsafe { ProcRef::<T>::with_borrowed(raw, |process| std::mem::forget(process.clone())) };
+}
+
 fn release_raw<T: Task>(raw: *mut ()) {
     // SAFETY: `raw` was produced by `ProcRef::<T>::erase` and is released once, by the
     // `ErasedProcRef` that owns it.
@@ -174,7 +181,20 @@ fn release_raw_address<T: Task>(data: usize) {
 pub(crate) struct ErasedProcRef {
     raw: *mut (),
     type_id: TypeId,
+    retain: fn(*mut ()),
     release: fn(*mut ()),
+}
+
+impl Clone for ErasedProcRef {
+    fn clone(&self) -> Self {
+        (self.retain)(self.raw);
+        Self {
+            raw: self.raw,
+            type_id: self.type_id,
+            retain: self.retain,
+            release: self.release,
+        }
+    }
 }
 
 // SAFETY: it owns one counted reference to a `Process<T>` that is `Send` and `Sync`, and only
@@ -210,5 +230,52 @@ impl ErasedProcRef {
 impl Drop for ErasedProcRef {
     fn drop(&mut self) {
         (self.release)(self.raw);
+    }
+}
+
+/// What a process's own code reaches without a table lookup: its outer signal queue (erts
+/// `sig_inq`) and its state flags, which live in the process struct the probe keeps alive.
+pub struct SignalProbe<M> {
+    input: NonNull<Incoming<Event<M>>>,
+    flags: NonNull<AtomicU32>,
+    _owner: ErasedProcRef,
+}
+
+// SAFETY: the probe only gives shared access to the queue and the flags of a process it keeps
+// alive; both are shared between threads already (`Incoming` is the cross-thread signal queue).
+unsafe impl<M: Send> Send for SignalProbe<M> {}
+// SAFETY: as for `Send`: every access is through `&`.
+unsafe impl<M: Send> Sync for SignalProbe<M> {}
+
+impl<M> SignalProbe<M> {
+    /// The probe of `process`.
+    pub(crate) fn of<T: Task<Message = M>>(process: &ProcRef<T>) -> Self {
+        Self {
+            input: NonNull::from(&process.input),
+            flags: NonNull::from(&process.exit_flags),
+            _owner: process.clone().erase(),
+        }
+    }
+
+    /// The process's outer signal queue.
+    pub(crate) fn input(&self) -> &Incoming<Event<M>> {
+        // SAFETY: the pointer is to a field of the process struct `_owner` keeps alive.
+        unsafe { self.input.as_ref() }
+    }
+
+    /// The process's state flags.
+    pub(crate) fn flags(&self) -> &AtomicU32 {
+        // SAFETY: the pointer is to a field of the process struct `_owner` keeps alive.
+        unsafe { self.flags.as_ref() }
+    }
+}
+
+impl<M> Clone for SignalProbe<M> {
+    fn clone(&self) -> Self {
+        Self {
+            input: self.input,
+            flags: self.flags,
+            _owner: self._owner.clone(),
+        }
     }
 }
