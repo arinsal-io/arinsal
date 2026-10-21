@@ -961,14 +961,19 @@ impl<M: SignalMessage> SignalProbe<M> {
     // sender == receiver) and :698 (erts_send_message), OTP-29.1.1: the sender holds the
     // receiver, so there is no process-table lookup, and a running receiver is not scheduled.
     pub fn send_self(&self, pid: Pid, msg: M) -> Result<(), Error> {
+        self.send_self_node(
+            pid,
+            OwnedSignal::new(Event {
+                from: pid,
+                payload: Payload::Message(msg),
+            }),
+        )
+    }
+
+    /// [`Self::send_self`] of a message node the sender allocated.
+    pub fn send_self_node(&self, pid: Pid, signal: OwnedSignal<Event<M>>) -> Result<(), Error> {
         self.0
-            .push_routed(
-                || signal_buffer_slot(pid),
-                Event {
-                    from: pid,
-                    payload: Payload::Message(msg),
-                },
-            )
+            .push_routed_node(|| signal_buffer_slot(pid), signal)
             .map_err(|_| Error::NoProcess)?;
         self.0.backlog.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1420,7 +1425,7 @@ struct LocalInit<T: Task> {
     balance: Arc<balance::Balance>,
     timer_service: TimerService<T::Message>,
     queues: [Worker<Scheduled<T>>; 4],
-    message_slabs: Vec<Vec<Event<T::Message>>>,
+    message_slabs: Vec<Vec<OwnedSignal<Event<T::Message>>>>,
     pending_waits: Vec<PendingWait<T>>,
     check_time_reds: u32,
     /// Port of erts/emulator/beam/erl_process.h (ErtsSchedulerData.last_monotonic_time),
@@ -3153,10 +3158,18 @@ impl<T: Task> Inner<T> {
         payload: Payload<T::Message>,
         local: Option<&mut Local<T>>,
     ) -> Result<(), Error> {
+        self.deliver_node(to, OwnedSignal::new(Event { from, payload }), local)
+    }
+
+    /// [`Self::deliver`] of a signal node the sender allocated.
+    fn deliver_node(
+        &self,
+        to: Pid,
+        signal: OwnedSignal<Event<T::Message>>,
+        local: Option<&mut Local<T>>,
+    ) -> Result<(), Error> {
         self.table
-            .with_live(to, |process| {
-                self.deliver_live(process, from, payload, local)
-            })
+            .with_live(to, |process| self.deliver_live_node(process, signal, local))
             .ok_or(Error::NoProcess)?
     }
 
@@ -3167,14 +3180,23 @@ impl<T: Task> Inner<T> {
         payload: Payload<T::Message>,
         local: Option<&mut Local<T>>,
     ) -> Result<(), Error> {
+        self.deliver_live_node(process, OwnedSignal::new(Event { from, payload }), local)
+    }
+
+    fn deliver_live_node(
+        &self,
+        process: &Arc<Process<T>>,
+        signal: OwnedSignal<Event<T::Message>>,
+        local: Option<&mut Local<T>>,
+    ) -> Result<(), Error> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1560-1563, OTP-29.1.1.
         // Literal-copy requests are non-message signals and enter a shared run queue.
-        let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
+        let force_enqueue = matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
         self.fanin_delivery(process, 1);
         // The send pressure counts only a receiver that was not waiting. The state word comes
         // back from the enqueue's own read-modify-write, so the shared word is touched once;
         // the receiver tolerates a count that lags (it only decrements a non-zero backlog).
-        let state = self.deliver_process(process, from, payload, local, true, force_enqueue)?;
+        let state = self.deliver_process_node(process, signal, local, true, force_enqueue)?;
         let state = run_state_of(state);
         if state != WAITING && state != UNSCHEDULED {
             process.input.backlog.fetch_add(1, Ordering::Relaxed);
@@ -3192,13 +3214,31 @@ impl<T: Task> Inner<T> {
         wake: bool,
         force_enqueue: bool,
     ) -> Result<u32, Error> {
+        self.deliver_process_node(
+            process,
+            OwnedSignal::new(Event { from, payload }),
+            local,
+            wake,
+            force_enqueue,
+        )
+    }
+
+    fn deliver_process_node(
+        &self,
+        process: &Arc<Process<T>>,
+        signal: OwnedSignal<Event<T::Message>>,
+        local: Option<&mut Local<T>>,
+        wake: bool,
+        force_enqueue: bool,
+    ) -> Result<u32, Error> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:712-800 (enqueue_signals), OTP-29.1.1:
         // an exited receiver is detected under the msgq lock, where its exit closed the queue.
         // No state load first: the closed in-queue rejects the signal, and the read-modify-write
         // that sets the in-queue bits returns the state word the wake decision works from.
+        let from = signal.from;
         let Ok(state) = process
             .input
-            .push_routed(|| signal_buffer_slot(from), Event { from, payload })
+            .push_routed_node(|| signal_buffer_slot(from), signal)
         else {
             return Err(Error::NoProcess);
         };
@@ -3211,7 +3251,7 @@ impl<T: Task> Inner<T> {
     fn deliver_block(
         &self,
         process: &Arc<Process<T>>,
-        events: &mut Vec<Event<T::Message>>,
+        events: &mut Vec<OwnedSignal<Event<T::Message>>>,
         local: Option<&mut Local<T>>,
         wake: bool,
         force_enqueue: bool,
@@ -3918,7 +3958,7 @@ struct Local<T: Task> {
     queues: [Worker<Scheduled<T>>; 4],
     /// The previous pick took a bound process ahead of equal-priority shared work.
     pinned_turn: bool,
-    message_slabs: Vec<Vec<Event<T::Message>>>,
+    message_slabs: Vec<Vec<OwnedSignal<Event<T::Message>>>>,
     /// Receive timeouts not yet published to the wheel.
     pending_waits: Vec<PendingWait<T>>,
     check_time_reds: u32,
@@ -4238,7 +4278,10 @@ pub struct RunCtx<'a, M: SignalMessage> {
 
 trait ContextOps<M: SignalMessage> {
     fn process_priority(&self, pid: Pid) -> Option<Priority>;
-    fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<M>) -> Result<(), Error>;
+    fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<M>) -> Result<(), Error> {
+        self.deliver_node(to, OwnedSignal::new(Event { from, payload }))
+    }
+    fn deliver_node(&mut self, to: Pid, signal: OwnedSignal<Event<M>>) -> Result<(), Error>;
     fn flush(&mut self);
     fn thread_progress_later(&self, op: LaterOp);
     fn block_thread_progress(&self, duration: Duration);
@@ -4624,17 +4667,23 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn send(&mut self, to: Pid, msg: M) -> Result<(), Error> {
         self.inner.deliver(self.pid, to, Payload::Message(msg))
     }
+    /// Send a message node this process allocated (erts queues the `ErtsMessage` it built).
+    pub fn send_node(&mut self, to: Pid, signal: OwnedSignal<Event<M>>) -> Result<(), Error> {
+        self.inner.deliver_node(to, signal)
+    }
     /// Send an opaque envelope to this process itself (see [`SignalProbe::send_self`]).
     pub fn send_self(&mut self, msg: M) -> Result<(), Error> {
         let pid = self.pid;
+        self.send_self_node(OwnedSignal::new(Event {
+            from: pid,
+            payload: Payload::Message(msg),
+        }))
+    }
+    /// [`Self::send_self`] of a message node this process allocated.
+    pub fn send_self_node(&mut self, signal: OwnedSignal<Event<M>>) -> Result<(), Error> {
+        let pid = self.pid;
         self.input
-            .push_routed(
-                || signal_buffer_slot(pid),
-                Event {
-                    from: pid,
-                    payload: Payload::Message(msg),
-                },
-            )
+            .push_routed_node(|| signal_buffer_slot(pid), signal)
             .map_err(|_| Error::NoProcess)?;
         self.backlog.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -4761,7 +4810,7 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
     }
 }
 
-fn take_lost_monitors<M>(events: &mut Vec<Event<M>>) -> Vec<(Pid, u64)> {
+fn take_lost_monitors<M>(events: &mut Vec<OwnedSignal<Event<M>>>) -> Vec<(Pid, u64)> {
     events
         .drain(..)
         .filter_map(|event| match event.payload {
@@ -5137,12 +5186,17 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             .map_err(|_| Error::NoProcess)?;
         self.schedule_process(process)
     }
-    fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<T::Message>) -> Result<(), Error> {
-        let monitor = matches!(payload, Payload::Signal(Signal::Monitor { .. }));
+    fn deliver_node(
+        &mut self,
+        to: Pid,
+        signal: OwnedSignal<Event<T::Message>>,
+    ) -> Result<(), Error> {
+        let from = signal.from;
+        let monitor = matches!(signal.payload, Payload::Signal(Signal::Monitor { .. }));
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1102-1125 (esdp->pending_signal),
         // OTP-29.1.1: on a normal scheduler every process monitor is held; a monitor replaces
         // the held one, which goes out first.
-        if let Payload::Signal(Signal::Monitor { reference, shared }) = &payload
+        if let Payload::Signal(Signal::Monitor { reference, shared }) = &signal.payload
             && matches!(current_scheduler_type(), SchedulerType::Normal)
         {
             let held = PendingProcMonitor {
@@ -5159,12 +5213,14 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         }
         // Erts sends the held monitor first when the next signal goes to its target
         // (erl_proc_sig_queue.c:1141-1150); a signal to another target leaves it held.
-        let deferred = take_held_monitor_for(to).map(|held| Event {
-            from: held.from,
-            payload: Payload::Signal(Signal::Monitor {
-                reference: held.id,
-                shared: held.shared,
-            }),
+        let deferred = take_held_monitor_for(to).map(|held| {
+            OwnedSignal::new(Event {
+                from: held.from,
+                payload: Payload::Signal(Signal::Monitor {
+                    reference: held.id,
+                    shared: held.shared,
+                }),
+            })
         });
         // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1: no
         // reference count is taken on the receiver.
@@ -5173,8 +5229,9 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             .table
             .with_live(to, |process| -> Result<(), Error> {
                 let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
-                let wakes = payload_wakes(&payload);
-                let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
+                let wakes = payload_wakes(&signal.payload);
+                let force_enqueue =
+                    matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
                 // A literal-copy request is never buffered: a request lost to an exiting target
                 // would never be answered, so the sender must see `NoProcess` at once. Port of
                 // erts/emulator/beam/erl_proc_sig_queue.c:3480 (erts_proc_sig_send_cla_request), OTP-29.1.1.
@@ -5182,16 +5239,11 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                 // already gone with a `noproc` link exit; a buffered link dropped at slice end would
                 // lose the target's exit signal. Port of erts/emulator/beam/bif.c:180-183 (link_opt),
                 // OTP-29.1.1.
-                let link = matches!(&payload, Payload::Signal(Signal::Link));
+                let link = matches!(&signal.payload, Payload::Signal(Signal::Link));
                 if waiting || monitor || link || deferred.is_some() || force_enqueue {
-                    let mut deferred = deferred;
-                    let mut payload = Some(payload);
-                    if let Some(first) = deferred.take() {
+                    if let Some(first) = deferred {
                         // The held monitor and this signal enter the queue together.
-                        let second = Event {
-                            from,
-                            payload: payload.take().expect("payload present"),
-                        };
+                        let second = signal;
                         let (first, second) = match process.input.push_pair(first, second) {
                             Ok(()) => {
                                 self.inner.fanin_delivery(process, 2);
@@ -5239,10 +5291,9 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                             return Err(Error::NoProcess);
                         }
                     } else {
-                        self.inner.deliver_process(
+                        self.inner.deliver_process_node(
                             process,
-                            from,
-                            payload.take().expect("payload present"),
+                            signal,
                             self.local.map(RefCell::borrow_mut).as_deref_mut(),
                             wakes,
                             force_enqueue,
@@ -5256,10 +5307,9 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                 // erl_proc_sig_queue.c:712 (enqueue_signals), OTP-29.1.1: the signal is appended to
                 // the receiver's in-queue now; erts keeps no per-sender buffer to publish later. A
                 // receiver that is already gone drops it, as erts does for a dead receiver.
-                let _ = self.inner.deliver_live(
+                let _ = self.inner.deliver_live_node(
                     process,
-                    from,
-                    payload,
+                    signal,
                     self.local.map(RefCell::borrow_mut).as_deref_mut(),
                 );
                 Ok(())
@@ -5747,6 +5797,11 @@ impl<T: Task> Scheduler<T> {
         self.inner.publish_held_monitor_for(to, None);
         self.inner.deliver(from, to, Payload::Message(msg), None)
     }
+    /// [`Self::send`] of a message node the sender allocated.
+    pub fn send_node(&self, to: Pid, signal: OwnedSignal<Event<T::Message>>) -> Result<(), Error> {
+        self.inner.publish_held_monitor_for(to, None);
+        self.inner.deliver_node(to, signal, None)
+    }
     /// Queue an ordered block of messages from one logical sender and notify the receiver
     /// after the block is published.
     ///
@@ -5760,9 +5815,11 @@ impl<T: Task> Scheduler<T> {
         self.inner.publish_held_monitor_for(to, None);
         let mut events = messages
             .into_iter()
-            .map(|message| Event {
-                from,
-                payload: Payload::Message(message),
+            .map(|message| {
+                OwnedSignal::new(Event {
+                    from,
+                    payload: Payload::Message(message),
+                })
             })
             .collect();
         let process = self.inner.table.lookup(to).ok_or(Error::NoProcess)?;
@@ -7442,6 +7499,13 @@ trait NativeSend<M> {
     /// enqueued there directly. Gives the message back when the scheduler-local state is
     /// not available.
     fn send(&self, from: Pid, to: Pid, msg: M) -> Result<Result<(), Error>, M>;
+    /// [`NativeSend::send`] of a message node the sender allocated.
+    #[allow(clippy::type_complexity)] // The node comes back unchanged when it was not sent.
+    fn send_node(
+        &self,
+        to: Pid,
+        signal: OwnedSignal<Event<M>>,
+    ) -> Result<Result<(), Error>, OwnedSignal<Event<M>>>;
     /// [`Scheduler::try_send_on_heap`] on this scheduler: the receiver is found without taking
     /// a reference, `prepare` builds the message on its heap, and the same lookup delivers it.
     /// `None` when the scheduler-local state is not available.
@@ -7545,6 +7609,21 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
             .deliver(from, to, Payload::Message(msg), Some(&mut local)))
     }
 
+    fn send_node(
+        &self,
+        to: Pid,
+        signal: OwnedSignal<Event<T::Message>>,
+    ) -> Result<Result<(), Error>, OwnedSignal<Event<T::Message>>> {
+        let Some(local) = self.local.upgrade() else {
+            return Err(signal);
+        };
+        let Ok(mut local) = local.try_borrow_mut() else {
+            return Err(signal);
+        };
+        self.inner.publish_held_monitor_for(to, Some(&mut local));
+        Ok(self.inner.deliver_node(to, signal, Some(&mut local)))
+    }
+
     fn start_timer(
         &self,
         owner: Pid,
@@ -7639,6 +7718,23 @@ mod native_sender {
             let handle = current.as_ref()?.downcast_ref::<Rc<dyn NativeSend<M>>>()?;
             Some(f(handle))
         })
+    }
+}
+
+/// [`native_send`] of a message node the sender allocated.
+#[allow(clippy::type_complexity)] // The node comes back unchanged when it was not sent.
+pub fn native_send_node<M: SignalMessage>(
+    to: Pid,
+    signal: OwnedSignal<Event<M>>,
+) -> Result<Result<(), Error>, OwnedSignal<Event<M>>> {
+    let mut signal = Some(signal);
+    let sent = native_sender::with::<M, _>(|handle| {
+        handle.send_node(to, signal.take().expect("message present"))
+    });
+    match sent {
+        Some(Ok(result)) => Ok(result),
+        Some(Err(signal)) => Err(signal),
+        None => Err(signal.take().expect("message not sent")),
     }
 }
 
