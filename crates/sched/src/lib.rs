@@ -786,6 +786,15 @@ pub enum Error {
     WrongMode,
 }
 
+/// Why [`Scheduler::spawn_unscheduled_init`] created no process.
+#[derive(Debug)]
+pub enum SpawnInitError<E> {
+    /// The process table refused the process.
+    Table(Error),
+    /// The caller's initialization failed; the process was freed.
+    Init(E),
+}
+
 /// Outcome of [`Scheduler::try_send_on_heap`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnHeapSend {
@@ -933,6 +942,13 @@ impl<M> SpawnedProcess<M> {
     /// The child's pid.
     pub fn pid(&self) -> Pid {
         self.pid
+    }
+
+    /// Run `f` on the not yet scheduled child's task, under its main lock; `None` when the
+    /// task type is not `T`.
+    pub fn with_task<T: Task<Message = M>, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.process
+            .with_typed(|process: &ProcRef<T>| f(&mut process.cell.lock().task))
     }
 }
 
@@ -1213,12 +1229,40 @@ impl<T: Task> ProcessTable<T> {
         priority: Priority,
         bound_worker: Option<usize>,
     ) -> Result<ProcRef<T>, Error> {
+        self.insert_init(
+            || task,
+            |_| Ok::<(), std::convert::Infallible>(()),
+            priority,
+            bound_worker,
+        )
+        .map_err(|error| match error {
+            SpawnInitError::Table(error) => error,
+            SpawnInitError::Init(never) => match never {},
+        })
+    }
+
+    /// Allocate a process struct with the task `make` builds, let `init` set the task up in
+    /// place, then publish it in the table.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c (erl_create_process: alloc_process takes the
+    /// struct and its table entry, then the fields are initialized in place) and erl_ptab.c
+    /// (erts_ptab_new_element), OTP-29.1.1. A failing `init` gives the identifier back.
+    fn insert_init<E>(
+        &self,
+        make: impl FnOnce() -> T,
+        init: impl FnOnce(&mut T) -> Result<(), E>,
+        priority: Priority,
+        bound_worker: Option<usize>,
+    ) -> Result<ProcRef<T>, SpawnInitError<E>> {
         // Port of erts/emulator/beam/erl_ptab.c:500 (erts_ptab_new_element), OTP-29.1.1.
         let _shared = self.lock.read();
-        let data = self.ids.reserve().ok_or(Error::Capacity)?;
+        let data = self
+            .ids
+            .reserve()
+            .ok_or(SpawnInitError::Table(Error::Capacity))?;
         let pid = Pid::from_data(data);
         let pix = self.ids.layout().data2pix(data) as usize;
-        let process = ProcRef::new(Process {
+        let process = ProcRef::new_with(|| Process {
             pid,
             // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
             // erts_current_interval_nob), OTP-29.1.1.
@@ -1244,8 +1288,14 @@ impl<T: Task> ProcessTable<T> {
             dirty: AtomicU8::new(0),
             dirty_runner: AtomicUsize::new(0),
             queued_prio: AtomicU8::new(0),
-            cell: parking_lot::Mutex::new(TaskCell { task }),
+            cell: parking_lot::Mutex::new(TaskCell { task: make() }),
         });
+        let initialized = init(&mut process.cell.lock().task);
+        if let Err(error) = initialized {
+            drop(process);
+            self.ids.release(data);
+            return Err(SpawnInitError::Init(error));
+        }
         // The table's reference (erts `refc` 1 at erts_ptab_new_element).
         self.slots[pix].store(process.clone().into_raw(), Ordering::Release);
         Ok(process)
@@ -5648,6 +5698,37 @@ impl<T: Task> Scheduler<T> {
         priority: Priority,
     ) -> Result<SpawnedProcess<T::Message>, Error> {
         let process = self.inner.table.insert(task, priority, None)?;
+        process.run_state().store(UNSCHEDULED, Ordering::Release);
+        Ok(SpawnedProcess {
+            pid: process.pid,
+            process: process.erase(),
+            _message: std::marker::PhantomData,
+        })
+    }
+    /// Insert a child built by `make` and set up in place by `init` before it is published,
+    /// on the one-based scheduler `scheduler_id` when given; the caller schedules it with
+    /// [`RunCtx::schedule_spawned`].
+    ///
+    /// Port of erts/emulator/beam/erl_process.c (erl_create_process: alloc_process, then the
+    /// fields initialized in place), OTP-29.1.1.
+    pub fn spawn_unscheduled_init<E>(
+        &self,
+        make: impl FnOnce() -> T,
+        init: impl FnOnce(&mut T) -> Result<(), E>,
+        priority: Priority,
+        scheduler_id: Option<usize>,
+    ) -> Result<SpawnedProcess<T::Message>, SpawnInitError<E>> {
+        let bound = match scheduler_id {
+            Some(id) => {
+                let worker = id
+                    .checked_sub(1)
+                    .filter(|worker| *worker < self.inner.config.workers)
+                    .ok_or(SpawnInitError::Table(Error::Capacity))?;
+                Some(worker)
+            }
+            None => None,
+        };
+        let process = self.inner.table.insert_init(make, init, priority, bound)?;
         process.run_state().store(UNSCHEDULED, Ordering::Release);
         Ok(SpawnedProcess {
             pid: process.pid,
