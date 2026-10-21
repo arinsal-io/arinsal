@@ -427,7 +427,8 @@ pub struct Process {
     pub(crate) apply_inline_len: u8,
     // Retired persistent-term areas are copied out and acknowledged in
     // `natives::sys::after_collection` on every collection.
-    pub(crate) _persistent_terms: arinsal_pterm::ProcessRegistration<'static>,
+    /// The persistent-term store of the node this process runs in.
+    pub(crate) persistent_terms: &'static arinsal_pterm::Store,
     pub(crate) trap_exit: bool,
     /// Class of the exception currently being handled. `raise/2` re-raises
     /// this after an `after` block, because that block may clobber X registers.
@@ -1505,11 +1506,7 @@ impl Process {
             );
         }
         self.runtime = runtime;
-        if !self._persistent_terms.is_registered()
-            || !std::ptr::eq(self._persistent_terms.store(), store)
-        {
-            self._persistent_terms = store.register_process();
-        }
+        self.persistent_terms = store;
     }
 
     /// Select a registered native function as the process's next entry point.
@@ -1654,11 +1651,11 @@ impl Process {
     }
     /// Construct a process with the erts minimum heap size.
     pub fn new() -> Self {
-        Self::with_registers_and_min_heap(1024, 1024, 233, true)
+        Self::with_registers_and_min_heap(1024, 1024, 233)
     }
     #[cfg(test)]
     pub(crate) fn with_registers(x_registers: usize, float_registers: usize) -> Self {
-        Self::with_registers_and_min_heap(x_registers, float_registers, 64, true)
+        Self::with_registers_and_min_heap(x_registers, float_registers, 64)
     }
     pub(crate) fn with_spawn_registers(x_registers: usize, float_registers: usize) -> Self {
         Self::with_spawn_registers_heap(x_registers, float_registers, Self::initial_heap(233))
@@ -1670,7 +1667,7 @@ impl Process {
         float_registers: usize,
         heap: ProcessHeap,
     ) -> Self {
-        let mut process = Self::with_registers_and_heap(x_registers, float_registers, heap, false);
+        let mut process = Self::with_registers_and_heap(x_registers, float_registers, heap);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;
@@ -1684,14 +1681,8 @@ impl Process {
         x_registers: usize,
         float_registers: usize,
         min_heap: usize,
-        register: bool,
     ) -> Self {
-        Self::with_registers_and_heap(
-            x_registers,
-            float_registers,
-            Self::initial_heap(min_heap),
-            register,
-        )
+        Self::with_registers_and_heap(x_registers, float_registers, Self::initial_heap(min_heap))
     }
     /// A heap of `min_heap` words with the boot GC defaults; 64 builds the zero-word heap.
     fn initial_heap(min_heap: usize) -> ProcessHeap {
@@ -1712,7 +1703,6 @@ impl Process {
         x_registers: usize,
         float_registers: usize,
         heap: ProcessHeap,
-        register: bool,
     ) -> Self {
         #[cfg(feature = "pf-mem-counters")]
         let started = std::time::Instant::now();
@@ -1767,13 +1757,7 @@ impl Process {
             exit_cont: None,
             apply_inline: [Term::NIL; 3],
             apply_inline_len: 0,
-            _persistent_terms: if register {
-                arinsal_pterm::global_store().register_process()
-            } else {
-                // The node's store is attached in `set_runtime`. A provisional
-                // global registration would be created and dropped on every spawn.
-                arinsal_pterm::global_store().unregistered()
-            },
+            persistent_terms: arinsal_pterm::global_store(),
             trap_exit: false,
             exc_class: None,
             entry: false,
@@ -1907,7 +1891,7 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_gc.c (setup_rootset nobj), OTP-29.1.1: the collector
         // rewrites only the live prefix and leaves the other X words as they are.
-        natives::sys::after_collection(self, live, gc.collections, gc.words_reclaimed);
+        natives::sys::after_collection(self, gc.collections, gc.words_reclaimed);
         if self.heap.free_words() < allocation_words {
             return Err(VmError::Unsupported("heap exhausted after GC".into()));
         }

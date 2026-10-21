@@ -57,13 +57,11 @@ fn get_is_lock_free_under_concurrent_put() {
             let start = Arc::clone(&start);
             let finished = &finished;
             scope.spawn(move || {
-                let registration = store.register_process();
                 start.wait();
                 while !finished.load(Ordering::Acquire) {
                     let (left, right) = pair(store.get(key).unwrap());
                     assert_eq!(left, -right, "reader observed an incomplete publication");
                 }
-                drop(registration);
             });
         }
         start.wait();
@@ -81,7 +79,6 @@ fn get_is_lock_free_under_concurrent_put() {
 #[test]
 fn erase_keeps_old_value_alive_for_readers() {
     let store = Store::new();
-    let process = store.register_process();
     let key = Term::small(41).unwrap();
     let mut source = VecHeap::new();
     let value = TermBuilder::new(&mut source)
@@ -93,12 +90,11 @@ fn erase_keeps_old_value_alive_for_readers() {
     assert!(store.erase(key));
     assert_eq!(pair(reader_value), (17, 23));
     assert!(store.collector_switch_area());
-    let retired = store.retired_areas(&process);
-    assert_eq!(retired.len(), 1);
-    assert!(retired[0].contains(reader_value));
-    let id = retired[0].id();
+    let id = store.collector_area().unwrap();
+    let retired = store.retired_area(id).unwrap();
+    assert!(retired.contains(reader_value));
     drop(retired);
-    assert!(store.acknowledge(&process, id));
+    assert!(store.acknowledge_copied(id, 1));
     assert!(store.has_retired());
     assert!(!store.collector_switch_area());
     assert!(!store.has_retired());
@@ -177,7 +173,6 @@ fn put_same_value_is_noop_like_erl() {
 #[test]
 fn release_get_10k_entries_reports_ns_per_op() {
     let store = Store::new();
-    let _process = store.register_process();
     for index in 0..10_000 {
         store
             .put(Term::small(index).unwrap(), Term::small(index + 1).unwrap())

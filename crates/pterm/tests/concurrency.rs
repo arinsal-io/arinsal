@@ -44,14 +44,12 @@ fn eight_readers_and_one_hundred_thousand_updates() {
             let store = &store;
             let done = &done;
             scope.spawn(move || {
-                let process = store.register_process();
                 start.wait();
                 while !done.load(Ordering::Acquire) {
                     let value = store.get(key).unwrap();
                     let (a, b) = tuple_pair(value);
                     similar_asserts::assert_eq!(b, -a, "torn persistent-term read");
                 }
-                assert!(store.retired_areas(&process).is_empty());
             });
         }
         let _done_on_drop = DoneOnDrop(&done);
@@ -68,7 +66,8 @@ fn eight_readers_and_one_hundred_thousand_updates() {
             "retired areas stay queued until the collector selects them"
         );
     });
-    assert!(!store.collector_switch_area());
+    // The collector releases one area per pass over the processes.
+    while store.collector_switch_area() {}
     similar_asserts::assert_eq!(store.retired_count(), 0);
     let value = store.get(key).unwrap();
     similar_asserts::assert_eq!(tuple_pair(value).0, 100_000);
@@ -77,7 +76,6 @@ fn eight_readers_and_one_hundred_thousand_updates() {
 #[test]
 fn get_latency_nanoseconds_per_operation() {
     let store = Store::new();
-    let process = store.register_process();
     let key = Term::small(99).unwrap();
     store.put(key, Term::small(123).unwrap()).unwrap();
     let iterations = 2_000_000;
@@ -100,14 +98,11 @@ fn get_latency_nanoseconds_per_operation() {
     };
     eprintln!("persistent_term get/1: {ns} ns/op ({build} build), checksum={checksum}");
     similar_asserts::assert_eq!(checksum, iterations as i64 * 123);
-    drop(process);
 }
 
 #[test]
 fn vm_test_double_copies_then_acknowledges_each_area() {
     let store = Store::new();
-    let first = store.register_process();
-    let second = store.register_process();
     let key = Term::small(1).unwrap();
     let mut source = VecHeap::new();
     let old = TermBuilder::new(&mut source)
@@ -118,23 +113,25 @@ fn vm_test_double_copies_then_acknowledges_each_area() {
     store.put(key, Term::small(99).unwrap()).unwrap();
     similar_asserts::assert_eq!(store.retired_count(), 1);
     assert!(store.collector_switch_area());
-    let first_area = store.retired_areas(&first).pop().unwrap();
-    let second_area = store.retired_areas(&second).pop().unwrap();
+    let id = store.collector_area().unwrap();
+    let first_area = store.retired_area(id).unwrap();
+    let second_area = store.retired_area(id).unwrap();
     assert!(first_area.contains(borrowed));
     let mut first_heap = VecHeap::new();
     let copied = first_area.copy_root(borrowed, &mut first_heap).unwrap();
     assert_ne!(copied, borrowed);
     assert!(!first_area.contains(copied));
-    let id = first_area.id();
+    assert_eq!(first_area.id(), id);
     drop(first_area);
-    assert!(store.acknowledge(&first, id));
+    assert!(store.acknowledge_copied(id, 1));
     similar_asserts::assert_eq!(store.retired_count(), 1);
     let mut second_heap = VecHeap::new();
     second_area.copy_root(borrowed, &mut second_heap).unwrap();
     drop(second_area);
-    assert!(store.acknowledge(&second, id));
+    assert!(store.acknowledge_copied(id, 0));
     similar_asserts::assert_eq!(store.retired_count(), 1);
-    assert!(!store.collector_switch_area());
+    // The collector releases one area per pass over the processes.
+    while store.collector_switch_area() {}
     similar_asserts::assert_eq!(store.retired_count(), 0);
     similar_asserts::assert_eq!(tuple_pair(copied), (17, 23));
 }

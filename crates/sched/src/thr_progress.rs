@@ -311,7 +311,7 @@ fn block_thread(tpd: &mut ThrPrgrData) -> u32 {
     lflgs
 }
 
-// Port of erl_thr_progress.c:660 (leader_update), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_thr_progress.c (leader_update), OTP-29.1.1.
 fn leader_update(tpd: &mut ThrPrgrData) -> bool {
     if !tpd.leader {
         // Probably need to block...
@@ -782,7 +782,7 @@ pub(crate) fn scheduler_progress(managed: &ManagedThread) {
 
 /// The next later operation of this thread, or of an unmanaged thread, that thread progress
 /// has reached.
-// Port of erts/emulator/beam/erl_process.c:2281 (handle_thr_prgr_later_op runs only when
+// Port of erts/emulator/beam/erl_process.c (handle_thr_prgr_later_op runs only when
 // ERTS_SSI_AUX_WORK_THR_PRGR_LATER_OP is set, that is, later operations exist), OTP-29.1.1.
 fn next_ready_later_op(tpd: &mut ThrPrgrData) -> Option<LaterOp> {
     let shared_len = tpd.progress.unmanaged_later_len.load(Ordering::Acquire);

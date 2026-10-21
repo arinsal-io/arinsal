@@ -5,9 +5,7 @@
 //! are exposed through `allocated_areas`; per-allocator carrier statistics
 //! are empty because Arinsal does not use erts_alloc.
 
-use super::{
-    Process, RunCtx, Vm, VmError, atom, badarg, cons_list, memory_values, snapshot_process, tuple,
-};
+use super::{Process, RunCtx, Vm, VmError, atom, badarg, cons_list, memory_values, tuple};
 use crate::process::Message;
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
@@ -114,7 +112,6 @@ fn request_allocators(
     if memory_internal {
         super::alloc_atoms::note_allocated_areas();
     }
-    snapshot_process(process, process.gc_live);
     let values = memory_values(vm, process);
     if memory_internal {
         let value = |key: &str| {

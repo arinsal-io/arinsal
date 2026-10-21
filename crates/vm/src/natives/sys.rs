@@ -60,17 +60,11 @@ pub(crate) fn initialize_statistics_origins() -> StatisticsOrigins {
     StatisticsOrigins::now()
 }
 
-/// Record a collection and acknowledge persistent-term literals this process may hold.
-pub(crate) fn after_collection(
-    process: &mut Process,
-    live_x: usize,
-    collections: u64,
-    words_reclaimed: u64,
-) {
+/// Record a collection in the runtime statistics.
+pub(crate) fn after_collection(process: &mut Process, collections: u64, words_reclaimed: u64) {
     let flags = runtime_state(process);
     flags.gc_count.fetch_add(collections, Ordering::Relaxed);
     flags.gc_words.fetch_add(words_reclaimed, Ordering::Relaxed);
-    snapshot_process(process, live_x);
 }
 
 /// Handle one phase of a literal-copy request after earlier signals have drained.
@@ -83,8 +77,8 @@ pub(crate) fn copy_literal_area(
     how: arinsal_sched::LiteralCopyHow,
     requester: arinsal_sched::Pid,
 ) -> Result<(), VmError> {
-    let store = process._persistent_terms.store();
-    let area = store.retired_area(&process._persistent_terms, area_id);
+    let store = process.persistent_terms;
+    let area = store.retired_area(area_id);
     let Some(area) = area else {
         reply_literal_area_copy(ctx, request, requester, atom("ok"))?;
         return Ok(());
@@ -112,7 +106,7 @@ pub(crate) fn copy_literal_area(
             reply_literal_area_copy(ctx, request, requester, atom("need_gc"))?;
             return Ok(());
         }
-        store.acknowledge_copied(&process._persistent_terms, area_id, 0);
+        store.acknowledge_copied(area_id, 0);
     } else {
         // `check_gc` repeats the root scan after signal-queue work; `need_gc`
         // performs the collection requested by the initial signal phase.
@@ -131,9 +125,9 @@ pub(crate) fn copy_literal_area(
                 // restores the hibernated heap), OTP-29.1.1.
                 process.garbage_collect_hibernate(live_x)?;
             }
-            store.acknowledge_copied(&process._persistent_terms, area_id, u64::from(copied));
+            store.acknowledge_copied(area_id, u64::from(copied));
         } else {
-            store.acknowledge_copied(&process._persistent_terms, area_id, 0);
+            store.acknowledge_copied(area_id, 0);
         }
     }
     reply_literal_area_copy(ctx, request, requester, atom("ok"))?;
@@ -484,7 +478,7 @@ fn call_values(
                 | ("persistent_term", "erase", 1)
                 | ("erts_internal", "erase_persistent_terms", 0)
         );
-        let store = process._persistent_terms.store();
+        let store = process.persistent_terms;
         if updating {
             // Port of erts/emulator/beam/erl_bif_persistent.c:533-539 (an updater resumes
             // after table_updater ran and returns the result it yielded with), OTP-29.1.1.
@@ -493,12 +487,12 @@ fn call_values(
                 .as_mut()
                 .and_then(|cold| cold.persistent_update_result.take())
             {
-                store.release_update_permission(&process._persistent_terms);
+                store.release_update_permission(persistent_owner(ctx.pid()));
                 return Some(Ok(result));
             }
             // Port of erts/emulator/beam/erl_bif_persistent.c:692-694 (ERTS_BIF_YIELD when
             // another process holds the update permission), OTP-29.1.1.
-            if !store.try_seize_update_permission(&process._persistent_terms) {
+            if !store.try_seize_update_permission(persistent_owner(ctx.pid())) {
                 return Some(Err(VmError::Yield));
             }
         }
@@ -520,7 +514,7 @@ fn call_values(
                 process.cold_mut().persistent_update_result = Some(*value);
                 return Some(Err(VmError::Yield));
             }
-            store.release_update_permission(&process._persistent_terms);
+            store.release_update_permission(persistent_owner(ctx.pid()));
         }
         return Some(result.map_err(|error| {
             crate::exceptions::bif_error(process, module, function, args, error)
@@ -613,7 +607,7 @@ impl PersistentTermUpdate {
 
 // Port of erts/emulator/beam/beam_bif_load.c:1916 (wake area-switch wait), OTP-29.1.1.
 pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, Message>) {
-    let store = process._persistent_terms.store();
+    let store = process.persistent_terms;
     if !store.has_retired() {
         return;
     }
@@ -637,7 +631,7 @@ fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<
         .as_ref()
         .is_none_or(|cold| cold.persistent_get_all.is_none())
     {
-        let snapshot = process._persistent_terms.store().snapshot();
+        let snapshot = process.persistent_terms.snapshot();
         let remaining = snapshot.len();
         process.cold_mut().persistent_get_all =
             Some(Box::new(crate::proc_create::PersistentGetAll {
@@ -2314,9 +2308,6 @@ fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
     // reply (`std_alloc`). A second sample sees the heap grow while those replies
     // are built, and `system = total - processes` then drops below atom+code.
     let sampled = take_memory_sample();
-    if sampled.is_none() {
-        snapshot_process(process, process.gc_live);
-    }
     let values = memory_values(vm, process);
     let value = |name: &str| {
         values
@@ -2325,7 +2316,7 @@ fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
             .map(|(_, value)| *value)
             .unwrap_or(0)
     };
-    let (_, persistent) = process._persistent_terms.store().info();
+    let (_, persistent) = process.persistent_terms.info();
     let external_bytes = persistent as u64;
     let external_size = non_neg(process, external_bytes)?;
     let external = tuple(process, &[atom("external_alloc"), external_size])?;
@@ -2345,8 +2336,11 @@ fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
 }
 
 pub(crate) fn memory_values(vm: &Vm, process: &Process) -> [(&'static str, u64); 9] {
-    let store = process._persistent_terms.store();
-    let (processes, processes_used) = store.process_memory_totals();
+    let store = process.persistent_terms;
+    // Port of erts/emulator/beam/erl_alloc.c (erts_memory: `processes` sums the allocator
+    // blocks of the PROCESSES class types, the process heaps and structs), OTP-29.1.1.
+    let processes = arinsal_alloc::typed::process_allocation_bytes();
+    let processes_used = processes;
     // Port of erts/emulator/beam/erl_bif_info.c:4459 (erts_memory) and erl_alloc.c:2495,
     // OTP-29.1.1: binary memory is global allocator usage, independent of process ownership.
     let binary = arinsal_term::binary_memory_bytes();
@@ -2388,23 +2382,9 @@ pub(super) fn take_memory_sample() -> Option<(u64, u64, u64)> {
     MEMORY_SAMPLE.replace(None)
 }
 
-pub(crate) fn snapshot_process(process: &mut Process, _live_x: usize) {
-    let word = std::mem::size_of::<usize>();
-    let extra =
-        std::mem::size_of::<Process>() + process.x.arg_reg_bytes() + process.fr.len() * word;
-    let capacity = process
-        .heap
-        .total_heap_size_words()
-        .saturating_mul(word)
-        .saturating_add(extra) as u64;
-    // Port of erts/emulator/beam/erl_alloc.c:2190-2303 (memory category reporting), OTP-29.1.1:
-    // ERTS accounts process heap blocks, including each block's unused tail.
-    let used = capacity;
-    process._persistent_terms.store().set_process_memory(
-        &process._persistent_terms,
-        capacity,
-        used,
-    );
+/// The persistent-term update permission owner of process `pid` (erts `updater_process`).
+pub(crate) fn persistent_owner(pid: arinsal_sched::Pid) -> u64 {
+    pid.data() + 1
 }
 
 fn code_bytes(vm: &Vm) -> u64 {
@@ -4103,7 +4083,7 @@ fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
     let collected = process.collect_heap_roots(live, &mut [], 0);
     process.heap.set_fullsweep_after(fullsweep_after);
     let gc = collected.map_err(|error| VmError::Unsupported(format!("GC {error:?}")))?;
-    after_collection(process, live, gc.collections, gc.words_reclaimed);
+    after_collection(process, gc.collections, gc.words_reclaimed);
     // Port of erts/emulator/beam/erl_gc.c (`erts_garbage_collect`: BUMP_REDS(p, reds) with the
     // cost `garbage_collect` returns), OTP-29.1.1.
     process.bump_gc_reds(gc.reductions);

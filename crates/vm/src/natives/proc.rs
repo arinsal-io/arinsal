@@ -2280,7 +2280,7 @@ pub(crate) fn collect_heap(
     let stats = collected?;
     // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
     // `esdp->gc_info`), OTP-29.1.1: a `garbage_collect` system task is a collection.
-    crate::natives::sys::after_collection(process, live, stats.collections, stats.words_reclaimed);
+    crate::natives::sys::after_collection(process, stats.collections, stats.words_reclaimed);
     Ok(())
 }
 

@@ -998,6 +998,16 @@ pub fn run_owner_requests(instance: usize) {
     });
 }
 
+/// Bytes of the process heap and process struct allocators (`eheap_alloc` and the process
+/// struct blocks of `fix_alloc`), the PROCESSES class of `erlang:memory/0`.
+pub fn process_allocation_bytes() -> u64 {
+    [ErtsAlcType::HEAP, ErtsAlcType::PROC]
+        .into_iter()
+        .filter_map(|allocation_type| allocator_for(allocation_type).ok())
+        .map(|allocators| allocators.current_blocks_size() as u64)
+        .sum()
+}
+
 /// Current allocated bytes belonging to the erts `BINARY` allocation type.
 // Port of erts/emulator/beam/erl_alloc.c:2124 (alcu_size), OTP-29.1.1.
 pub fn binary_allocation_bytes() -> u64 {
