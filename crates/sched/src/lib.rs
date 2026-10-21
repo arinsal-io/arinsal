@@ -241,7 +241,6 @@ const fn load_order(order: Ordering) -> Ordering {
 }
 
 const PID_LIMIT: u32 = 1 << 28;
-const PID_PAGE_SIZE: usize = 1024;
 const UNBOUND_WORKER: usize = usize::MAX;
 const QUEUE_COUNT_SHIFT: u32 = 32;
 const QUEUE_COUNT_UNIT: u64 = 1_u64 << QUEUE_COUNT_SHIFT;
@@ -1139,8 +1138,7 @@ impl<T: Task> Process<T> {
 /// Process table: erts' `ErtsPTab` slots plus its free identifier ring.
 ///
 /// Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element,
-/// erts_ptab_delete_element, erts_ptab_test_next_id), OTP-29.1.1. Slot pages are
-/// materialized lazily.
+/// erts_ptab_delete_element, erts_ptab_test_next_id), OTP-29.1.1.
 struct ProcessTable<T: Task> {
     ids: PtabIdRing,
     /// `ptab->list.data.rwmtx`: test_next_id excludes concurrent inserts and removals.
@@ -1151,45 +1149,30 @@ struct ProcessTable<T: Task> {
     /// `ptab->list.data.interval`: read into each new element's `started_interval` and
     /// stepped only when a later interval is needed.
     interval: AtomicU64,
-    pages: Vec<OnceLock<ProcessPage<T>>>,
-}
-
-struct ProcessPage<T: Task> {
+    /// `ptab->r.o.tab`: one slot per table index, allocated with the table as
+    /// erts_ptab_init_table does.
     slots: Box<[Atomic<Arc<Process<T>>>]>,
-}
-
-impl<T: Task> ProcessPage<T> {
-    fn new() -> Self {
-        Self {
-            slots: (0..PID_PAGE_SIZE).map(|_| Atomic::null()).collect(),
-        }
-    }
 }
 
 impl<T: Task> ProcessTable<T> {
     fn new(capacity: u32) -> Self {
         let ids = PtabIdRing::new(capacity);
-        let pages = (ids.layout().max() as usize).div_ceil(PID_PAGE_SIZE);
+        let slots = (0..ids.layout().max()).map(|_| Atomic::null()).collect();
         Self {
             ids,
             lock: arinsal_term::FrequentReadRwLock::new(()),
             interval: AtomicU64::new(0),
-            pages: (0..pages).map(|_| OnceLock::new()).collect(),
+            slots,
         }
     }
 
-    fn page(&self, pix: u32) -> Option<(&ProcessPage<T>, usize)> {
-        let pix = pix as usize;
-        let page = self.pages.get(pix / PID_PAGE_SIZE)?.get()?;
-        Some((page, pix % PID_PAGE_SIZE))
+    fn slot(&self, pix: u32) -> Option<&Atomic<Arc<Process<T>>>> {
+        self.slots.get(pix as usize)
     }
 
     fn slot_occupied(&self, pix: u32) -> bool {
-        self.page(pix).is_some_and(|(page, offset)| {
-            !page.slots[offset]
-                .load(Ordering::Acquire, &epoch::pin())
-                .is_null()
-        })
+        self.slot(pix)
+            .is_some_and(|slot| !slot.load(Ordering::Acquire, &epoch::pin()).is_null())
     }
 
     /// Table index of a pid, the order `erlang:processes/0` reports.
@@ -1208,8 +1191,6 @@ impl<T: Task> ProcessTable<T> {
         let data = self.ids.reserve().ok_or(Error::Capacity)?;
         let pid = Pid::from_data(data);
         let pix = self.ids.layout().data2pix(data) as usize;
-        let page = self.pages[pix / PID_PAGE_SIZE].get_or_init(ProcessPage::new);
-        let offset = pix % PID_PAGE_SIZE;
         let process = Arc::new(Process {
             pid,
             // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
@@ -1240,14 +1221,13 @@ impl<T: Task> ProcessTable<T> {
         });
         // Publication needs only the release store. Flushing the epoch bag on
         // every spawn forced a global reclamation check in the hot path.
-        page.slots[offset].store(Owned::new(process.clone()), Ordering::Release);
+        self.slots[pix].store(Owned::new(process.clone()), Ordering::Release);
         Ok(process)
     }
 
     /// Run `f` on the process in slot `pix` while the epoch guard keeps it alive.
     fn with_slot<R>(&self, pix: u32, f: impl FnOnce(&Arc<Process<T>>) -> R) -> Option<R> {
-        let (page, offset) = self.page(pix)?;
-        let slot = &page.slots[offset];
+        let slot = self.slot(pix)?;
         let guard = &epoch::pin();
         let ptr = slot.load(Ordering::Acquire, guard);
         if ptr.is_null() {
@@ -1280,8 +1260,7 @@ impl<T: Task> ProcessTable<T> {
         // Port of erts/emulator/beam/erl_ptab.c:675 (erts_ptab_delete_element), OTP-29.1.1.
         let _shared = self.lock.read();
         let guard = &epoch::pin();
-        let (page, offset) = self.page(self.index(pid)).expect("live pid has a page");
-        let slot = &page.slots[offset];
+        let slot = self.slot(self.index(pid)).expect("a live pid has a slot");
         let old = slot.swap(epoch::Shared::null(), Ordering::AcqRel, guard);
         if old.is_null() {
             return;
@@ -1316,10 +1295,8 @@ impl<T: Task> ProcessTable<T> {
 
     fn live_count(&self) -> usize {
         let guard = &epoch::pin();
-        self.pages
+        self.slots
             .iter()
-            .filter_map(OnceLock::get)
-            .flat_map(|page| page.slots.iter())
             .filter(|slot| !slot.load(Ordering::Acquire, guard).is_null())
             .count()
     }
@@ -1331,13 +1308,8 @@ impl<T: Task> ProcessTable<T> {
     fn pids_in_range(&self, first: u32, limit: u32, max: usize) -> (Vec<Pid>, u32) {
         let mut pids = Vec::new();
         let mut pix = first;
+        let limit = limit.min(self.slots.len() as u32);
         while pix < limit && pids.len() < max {
-            if self.page(pix).is_none() {
-                // An unmaterialized page has no live slot.
-                pix =
-                    ((pix as usize / PID_PAGE_SIZE + 1) * PID_PAGE_SIZE).min(limit as usize) as u32;
-                continue;
-            }
             if let Some(process) = self.load_slot(pix) {
                 pids.push(process.pid);
             }
