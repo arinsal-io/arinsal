@@ -73,7 +73,7 @@ use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
 use crossbeam_deque::{Steal, Stealer, Worker};
 use crossbeam_queue::SegQueue;
 pub use proc_ref::SignalProbe;
-use proc_ref::{ErasedProcRef, ProcRef};
+use proc_ref::{ErasedProcRef, ProcRef, TaskCell};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -931,7 +931,7 @@ impl<M> SpawnedProcess<M> {
     /// task type is not `T`.
     pub fn with_task<T: Task<Message = M>, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
         self.process
-            .with_typed(|process: &ProcRef<T>| f(&mut process.cell.lock().task))
+            .with_typed(|process: &ProcRef<T>| f(process.cell.lock().task_mut()))
     }
 }
 
@@ -996,10 +996,6 @@ impl<M> std::fmt::Debug for SignalProbe<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SignalProbe").finish_non_exhaustive()
     }
-}
-
-struct TaskCell<T: Task> {
-    task: T,
 }
 
 /// Process-local words `erts_continue_exit_process` tests before taking a global table lock.
@@ -1210,7 +1206,7 @@ impl<T: Task> ProcessTable<T> {
         bound_worker: Option<usize>,
     ) -> Result<ProcRef<T>, Error> {
         self.insert_init(
-            || task,
+            |slot| slot.write(task),
             |_| Ok::<(), std::convert::Infallible>(()),
             priority,
             bound_worker,
@@ -1229,7 +1225,7 @@ impl<T: Task> ProcessTable<T> {
     /// (erts_ptab_new_element), OTP-29.1.1. A failing `init` gives the identifier back.
     fn insert_init<E>(
         &self,
-        make: impl FnOnce() -> T,
+        make: impl for<'slot> FnOnce(&'slot mut std::mem::MaybeUninit<T>) -> &'slot mut T,
         init: impl FnOnce(&mut T) -> Result<(), E>,
         priority: Priority,
         bound_worker: Option<usize>,
@@ -1268,9 +1264,11 @@ impl<T: Task> ProcessTable<T> {
             dirty: AtomicU8::new(0),
             dirty_runner: AtomicUsize::new(0),
             queued_prio: AtomicU8::new(0),
-            cell: parking_lot::Mutex::new(TaskCell { task: make() }),
+            cell: parking_lot::Mutex::new(TaskCell::uninit()),
         });
-        let initialized = init(&mut process.cell.lock().task);
+        // alloc_process: the task is written straight into the allocated struct.
+        process.cell.lock().init_with(make);
+        let initialized = init(process.cell.lock().task_mut());
         if let Err(error) = initialized {
             drop(process);
             self.ids.release(data);
@@ -1347,7 +1345,7 @@ impl<T: Task> ProcessTable<T> {
                 if let Some(process) = self.load_slot(self.index(pid))
                     && let Some(mut cell) = process.cell.try_lock()
                 {
-                    cell.task.scheduler_shutdown();
+                    cell.task_mut().scheduler_shutdown();
                 }
                 self.remove(pid);
             }
@@ -1382,7 +1380,7 @@ impl<T: Task> ProcessTable<T> {
     fn scheduler_shutdown(&self) {
         for pix in 0..self.ids.layout().max() {
             if let Some(process) = self.load_slot(pix) {
-                lock_cell(&process).task.scheduler_shutdown();
+                lock_cell(&process).task_mut().scheduler_shutdown();
             }
         }
     }
@@ -4925,7 +4923,7 @@ impl<T: Task> Runner<'_, T> {
     ) -> bool {
         let workers = self.inner.config.workers;
         let simulated = self.inner.sim.is_some();
-        let TaskCell { task } = cell;
+        let task = cell.task_mut();
         let mut ctx = RunCtx {
             inner: self,
             pid,
@@ -5691,7 +5689,7 @@ impl<T: Task> Scheduler<T> {
     /// fields initialized in place), OTP-29.1.1.
     pub fn spawn_unscheduled_init<E>(
         &self,
-        make: impl FnOnce() -> T,
+        make: impl for<'slot> FnOnce(&'slot mut std::mem::MaybeUninit<T>) -> &'slot mut T,
         init: impl FnOnce(&mut T) -> Result<(), E>,
         priority: Priority,
         scheduler_id: Option<usize>,
@@ -6012,7 +6010,7 @@ impl<T: Task> Scheduler<T> {
             return None;
         }
         let cell = lock_cell(&process);
-        inspectable(process.run_state().load(Ordering::Acquire)).then(|| inspect(&cell.task))
+        inspectable(process.run_state().load(Ordering::Acquire)).then(|| inspect(cell.task()))
     }
     /// Try the process main lock while its scheduler signal queues are empty.
     ///
@@ -6052,7 +6050,7 @@ impl<T: Task> Scheduler<T> {
                 if !inspectable(state) || has_pending_signals(process) {
                     return Err(SignalFreeError::Busy);
                 }
-                Ok(inspect(&cell.task))
+                Ok(inspect(cell.task()))
             })
             .unwrap_or(Err(SignalFreeError::NoProcess))
     }
@@ -6089,7 +6087,7 @@ impl<T: Task> Scheduler<T> {
         if !receiver_heap_stable(&process) || process.input.has_pending() {
             return Err(SignalFreeError::Busy);
         }
-        Ok(body(&mut cell.task))
+        Ok(body(cell.task_mut()))
     }
     /// Run `body` while holding `pid`'s main lock, when the receiver is not executing.
     ///
@@ -6110,7 +6108,7 @@ impl<T: Task> Scheduler<T> {
         if !receiver_heap_stable(&process) {
             return None;
         }
-        Some(body(&mut cell.task))
+        Some(body(cell.task_mut()))
     }
     /// Copy helper for a sender that has no [`RunCtx`]: queue `prepare`'s message
     /// before the main lock drops. A [`RunCtx`] send must use [`Self::try_with_task`]
@@ -6137,7 +6135,7 @@ impl<T: Task> Scheduler<T> {
         if !receiver_heap_stable(&process) {
             return Ok(OnHeapSend::Unavailable);
         }
-        let Some(message) = prepare(&mut cell.task)? else {
+        let Some(message) = prepare(cell.task_mut())? else {
             return Ok(OnHeapSend::Declined);
         };
         let sent = if process.bound_worker().is_some() {
@@ -7217,7 +7215,7 @@ fn run_slice<'a, T: Task>(
     let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
     let mut cell = lock_cell(&process);
     if let Some(kind) = dirty
-        && let Some(job) = cell.task.take_dirty_job(kind)
+        && let Some(job) = cell.task_mut().take_dirty_job(kind)
     {
         // Port of erts/emulator/beam/erl_nif.c:468-499 (erts_call_dirty_nif), OTP-29.1.1:
         // the job runs without the main lock, so a dirty signal handler can take it.
@@ -7227,7 +7225,7 @@ fn run_slice<'a, T: Task>(
         let result = job();
         SCHEDULER_TYPE.with(|current| current.set(thread_type));
         cell = lock_cell(&process);
-        cell.task.finish_dirty_job(result);
+        cell.task_mut().finish_dirty_job(result);
     }
     drop(local_guard);
     let (outcome, remaining, active_ns) = {
@@ -7236,7 +7234,7 @@ fn run_slice<'a, T: Task>(
             local: local_cell,
         };
         let result = {
-            let TaskCell { task } = &mut *cell;
+            let task = cell.task_mut();
             let mut ctx = RunCtx {
                 inner: &mut runner,
                 pid: process.pid,
@@ -7484,9 +7482,9 @@ fn run_slice<'a, T: Task>(
             // enqueue fails and the sender sees the process gone.
             let mut remaining = VecDeque::new();
             if process.input.close_into(&mut remaining) > 0 {
-                cell.task.reap_signals(process.pid, remaining.into());
+                cell.task_mut().reap_signals(process.pid, remaining.into());
             }
-            cell.task.delete_process();
+            cell.task_mut().delete_process();
             // `begin_exit` already deleted the element (erts deletes once, at
             // ERTS_CONTINUE_EXIT_FREE). The identifier may have been reused; deleting
             // this pix again would free the new occupant. A forced exit that never
@@ -7577,7 +7575,7 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
             if !receiver_heap_stable(process) {
                 return OnHeapSend::Unavailable;
             }
-            let Some(message) = prepare(&mut cell.task) else {
+            let Some(message) = prepare(cell.task_mut()) else {
                 return OnHeapSend::Declined;
             };
             let mut local = process.bound_worker().is_none().then_some(&mut *local);
@@ -8543,7 +8541,7 @@ fn profile_scheduler_transition<T: Task>(
     {
         return;
     }
-    let Some((target, message)) = lock_cell(process).task.scheduler_profile_event(
+    let Some((target, message)) = lock_cell(process).task_mut().scheduler_profile_event(
         process.pid,
         scheduler_id as u32 + 1,
         active,

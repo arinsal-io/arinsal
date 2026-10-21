@@ -12,7 +12,7 @@ use super::{Event, Incoming, Process, Task};
 use arinsal_alloc::instances::InstanceAllocation;
 use arinsal_alloc::typed::{ErtsAlcType, fix_alloc_at, fix_free_at};
 use std::any::TypeId;
-use std::mem::ManuallyDrop;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
 
@@ -275,6 +275,67 @@ impl<M> Clone for SignalProbe<M> {
             input: self.input,
             flags: self.flags,
             _owner: self._owner.clone(),
+        }
+    }
+}
+
+/// The task of a process, written in place into the process struct after the struct is
+/// allocated (erts alloc_process takes the struct, then the fields are set in place).
+pub(crate) struct TaskCell<T: Task> {
+    task: MaybeUninit<T>,
+    initialized: bool,
+}
+
+impl<T: Task> TaskCell<T> {
+    /// A cell whose task [`TaskCell::init_with`] writes next.
+    pub(crate) fn uninit() -> Self {
+        Self {
+            task: MaybeUninit::uninit(),
+            initialized: false,
+        }
+    }
+
+    /// Let `make` write the task into the cell. `make` proves the write by returning the
+    /// reference `MaybeUninit::write` gave it for this slot.
+    pub(crate) fn init_with(
+        &mut self,
+        make: impl for<'slot> FnOnce(&'slot mut MaybeUninit<T>) -> &'slot mut T,
+    ) {
+        assert!(!self.initialized, "a task is written once");
+        let slot = self.task.as_ptr();
+        let written: *const T = make(&mut self.task);
+        assert!(
+            std::ptr::eq(written, slot),
+            "the task must be written into its own slot"
+        );
+        self.initialized = true;
+    }
+
+    pub(crate) fn task(&self) -> &T {
+        assert!(
+            self.initialized,
+            "a task is written before its process is reachable"
+        );
+        // SAFETY: `initialized` is set only after `init_with` saw the task written into this
+        // slot.
+        unsafe { self.task.assume_init_ref() }
+    }
+
+    pub(crate) fn task_mut(&mut self) -> &mut T {
+        assert!(
+            self.initialized,
+            "a task is written before its process is reachable"
+        );
+        // SAFETY: as for `task`.
+        unsafe { self.task.assume_init_mut() }
+    }
+}
+
+impl<T: Task> Drop for TaskCell<T> {
+    fn drop(&mut self) {
+        if self.initialized {
+            // SAFETY: the task was written (see `init_with`) and is dropped once, here.
+            unsafe { self.task.assume_init_drop() };
         }
     }
 }
