@@ -1383,7 +1383,7 @@ fn release_area_switch(
     process: &Process,
     ctx: &mut RunCtx<'_, crate::process::Message>,
 ) -> Result<Term, VmError> {
-    let store = process._persistent_terms.store();
+    let store = process.persistent_terms;
     if store.collector_area_complete() {
         // Port of beam_bif_load.c:1849-1938, OTP-29.1.1: wait for thread
         // progress only after all processes have copied the active area.
@@ -1429,7 +1429,7 @@ fn send_copy_request(
         "need_gc" => LiteralCopyHow::NeedGc,
         _ => return Err(badarg()),
     };
-    let Some(area_id) = process._persistent_terms.store().collector_area() else {
+    let Some(area_id) = process.persistent_terms.collector_area() else {
         return Err(notsup());
     };
     let target = Pid::from_term(args[0]).expect("validated pid");

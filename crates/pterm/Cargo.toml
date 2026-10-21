@@ -14,7 +14,6 @@ arinsal-term.workspace = true
 arinsal-bifs.workspace = true
 arinsal-maps.workspace = true
 crossbeam-epoch = "0.9.18"
-crossbeam-queue = "0.3.14"
 
 [dev-dependencies]
 arinsal-difftest.workspace = true

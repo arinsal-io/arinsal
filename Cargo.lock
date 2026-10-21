@@ -337,7 +337,6 @@ dependencies = [
  "arinsal-maps",
  "arinsal-term",
  "crossbeam-epoch",
- "crossbeam-queue",
  "similar-asserts",
 ]
 
@@ -362,7 +361,6 @@ dependencies = [
  "arinsal-alloc",
  "arinsal-term",
  "crossbeam-deque",
- "crossbeam-epoch",
  "crossbeam-queue",
  "libc",
  "parking_lot",

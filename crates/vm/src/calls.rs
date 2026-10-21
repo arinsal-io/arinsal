@@ -102,7 +102,7 @@ pub(super) fn gc_after_bif(
         let stats = collected?;
         *value = roots[0];
         // Port of erl_gc.c:922-932 (`garbage_collect` records scheduler GC statistics), OTP-29.1.1.
-        crate::natives::sys::after_collection(process, 0, stats.collections, stats.words_reclaimed);
+        crate::natives::sys::after_collection(process, stats.collections, stats.words_reclaimed);
         process.charge_gc_stats(&stats);
         return Ok(());
     }
@@ -163,12 +163,7 @@ pub(super) fn gc_after_bif(
     }
     // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
     // `esdp->gc_info`), OTP-29.1.1: the BIF epilogue collection is counted.
-    crate::natives::sys::after_collection(
-        process,
-        arguments.len(),
-        stats.collections,
-        stats.words_reclaimed,
-    );
+    crate::natives::sys::after_collection(process, stats.collections, stats.words_reclaimed);
     process.charge_gc_stats(&stats);
     Ok(())
 }
@@ -202,7 +197,7 @@ pub(crate) fn gc_after_native_parts(
         let stats = process.collect_heap_roots(0, &mut roots, 0)?;
         *value = roots[0];
         // Port of erl_gc.c:922-932 (`garbage_collect` records scheduler GC statistics), OTP-29.1.1.
-        crate::natives::sys::after_collection(process, 0, stats.collections, stats.words_reclaimed);
+        crate::natives::sys::after_collection(process, stats.collections, stats.words_reclaimed);
         process.charge_gc_stats(&stats);
         return Ok(());
     }
@@ -279,12 +274,7 @@ pub(crate) fn gc_after_native_parts(
     }
     // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
     // `esdp->gc_info`), OTP-29.1.1: the BIF epilogue collection is counted.
-    crate::natives::sys::after_collection(
-        process,
-        arguments.len(),
-        stats.collections,
-        stats.words_reclaimed,
-    );
+    crate::natives::sys::after_collection(process, stats.collections, stats.words_reclaimed);
     process.charge_gc_stats(&stats);
     Ok(())
 }

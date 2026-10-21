@@ -6567,7 +6567,7 @@ impl Process {
         }
         let mut roots = [result];
         let gc = self.collect_heap_roots(0, &mut roots, 0)?;
-        crate::natives::sys::after_collection(self, 0, gc.collections, gc.words_reclaimed);
+        crate::natives::sys::after_collection(self, gc.collections, gc.words_reclaimed);
         self.charge_gc_stats(&gc);
         Ok(roots[0])
     }
@@ -6590,7 +6590,7 @@ impl Process {
         }
         let live = live.min(self.x.len());
         let gc = self.collect_heap_roots(live, &mut [], 0)?;
-        crate::natives::sys::after_collection(self, live, gc.collections, gc.words_reclaimed);
+        crate::natives::sys::after_collection(self, gc.collections, gc.words_reclaimed);
         Ok(())
     }
 
@@ -6601,12 +6601,7 @@ impl Process {
             // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
             // `esdp->gc_info`), OTP-29.1.1: a collection deferred while GC was disabled
             // is counted when it actually runs.
-            crate::natives::sys::after_collection(
-                self,
-                live,
-                stats.collections,
-                stats.words_reclaimed,
-            );
+            crate::natives::sys::after_collection(self, stats.collections, stats.words_reclaimed);
         }
         Ok(())
     }
@@ -7248,7 +7243,7 @@ impl Process {
         }
         let live = switched_out_live(self);
         let stats = self.collect_heap_roots(live, &mut [], 0)?;
-        crate::natives::sys::after_collection(self, live, stats.collections, stats.words_reclaimed);
+        crate::natives::sys::after_collection(self, stats.collections, stats.words_reclaimed);
         Ok(())
     }
 
@@ -7269,12 +7264,7 @@ impl Process {
     fn collect_bin_vheap_now(&mut self, live_x: usize) -> Result<(), VmError> {
         let live_x = live_x.min(self.x.len());
         let stats = self.collect_heap_roots(live_x, &mut [], 0)?;
-        crate::natives::sys::after_collection(
-            self,
-            live_x,
-            stats.collections,
-            stats.words_reclaimed,
-        );
+        crate::natives::sys::after_collection(self, stats.collections, stats.words_reclaimed);
         self.charge_gc_stats(&stats);
         Ok(())
     }
@@ -7752,9 +7742,10 @@ impl Task for Process {
         let outcome = abort_on_worker_panic(|| self.run_task(ctx, data, budget));
         self.heap.set_alloc_ix(None);
         if matches!(outcome, RunOutcome::Exit(_)) {
-            self._persistent_terms
-                .store()
-                .process_exited(&self._persistent_terms);
+            // erts finishes a suspended updater's table_updater even when the process is
+            // killed, which releases the permission; the update is already published here.
+            self.persistent_terms
+                .release_update_permission(crate::natives::sys::persistent_owner(ctx.pid()));
             // Port of erts/emulator/beam/erl_process.c (delete_process): free the heap and
             // off-heap list. A fresh block would be allocated only to be dropped with the
             // process.
@@ -7774,9 +7765,10 @@ impl Task for Process {
     }
 
     fn scheduler_shutdown(&mut self) {
-        self._persistent_terms
-            .store()
-            .process_exited(&self._persistent_terms);
+        if let Some(pid) = self.self_pid {
+            self.persistent_terms
+                .release_update_permission(crate::natives::sys::persistent_owner(pid));
+        }
     }
 
     fn scheduler_profile_event(
