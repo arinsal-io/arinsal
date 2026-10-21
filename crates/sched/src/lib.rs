@@ -686,6 +686,12 @@ pub trait Task: Send + 'static {
     }
     /// Signals that landed after the task decided to exit, before it left the table.
     fn reap_signals(&mut self, _pid: Pid, _events: Vec<Event<Self::Message>>) {}
+    /// Release what the exited task owns on the scheduler it exited on; only the process
+    /// struct waits for the lookups that may still reach it.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c (delete_process, called at the end of
+    /// erts_continue_exit_process), OTP-29.1.1.
+    fn delete_process(&mut self) {}
     /// A dirty job this task wants to execute on the current dirty scheduler of `kind`
     /// without holding its task cell, so its signals can be handled meanwhile.
     ///
@@ -7429,6 +7435,7 @@ fn run_slice<'a, T: Task>(
             if process.input.close_into(&mut remaining) > 0 {
                 cell.task.reap_signals(process.pid, remaining.into());
             }
+            cell.task.delete_process();
             // `begin_exit` already deleted the element (erts deletes once, at
             // ERTS_CONTINUE_EXIT_FREE). The identifier may have been reused; deleting
             // this pix again would free the new occupant. A forced exit that never
