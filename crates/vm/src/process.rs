@@ -2849,22 +2849,21 @@ impl Executor {
                                     arinsal_loader::ImportClass::Native
                                         | arinsal_loader::ImportClass::Dynamic
                                         | arinsal_loader::ImportClass::Fun
-                                ) || crate::bif_traps::traps(
-                                    &export.module,
-                                    &export.function,
-                                    export.arity,
-                                ) || (crate::trace_bp::any_pattern()
-                                    && crate::beamasm_integration::dispatch_bif(target_pc)
-                                        .is_some()
-                                    && crate::trace_bp::selects(
-                                        process,
-                                        &export.module,
-                                        &export.function,
-                                        export.arity,
-                                    ))
+                                ) || export.trap_entry
+                                    || (crate::trace_bp::any_pattern()
+                                        && crate::beamasm_integration::dispatch_bif(target_pc)
+                                            .is_some()
+                                        && crate::trace_bp::selects(
+                                            process,
+                                            &export.module,
+                                            &export.function,
+                                            export.arity,
+                                        ))
                                 {
-                                    let saved_arguments =
-                                        process.x[..usize::from(export.arity)].to_vec();
+                                    let saved_arguments: smallvec::SmallVec<[Term; 8]> =
+                                        smallvec::SmallVec::from_slice(
+                                            &process.x[..usize::from(export.arity)],
+                                        );
                                     let collections_before = process.stats.gc.collections;
                                     // BIFs such as load_nif/2 identify their caller through
                                     // `process.module`, which native code does not maintain: the
@@ -3076,14 +3075,7 @@ impl Executor {
                                                 .cold
                                                 .as_ref()
                                                 .is_some_and(|cold| cold.native_light_bif_call)
-                                                && arinsal_spec::bif_lookup(
-                                                    &export.module,
-                                                    &export.function,
-                                                    export.arity,
-                                                )
-                                                .is_some_and(|bif| {
-                                                    bif.kind != arinsal_spec::BifKind::Hbif
-                                                });
+                                                && export.light_kind;
                                             let hidden = usize::from(
                                                 light
                                                     && process.heap.stack_get(0).is_some_and(
