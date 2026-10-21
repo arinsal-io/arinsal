@@ -30,6 +30,8 @@ mod proc_create;
 // ---- vm_funs ----
 mod funs;
 mod lists;
+#[allow(dead_code)]
+mod monitor_link;
 mod process;
 mod register;
 pub use beamasm_integration::{interp_native_starts, interp_slices};
