@@ -8,8 +8,8 @@
 //! [`schedule_later_op`] run once the global value has reached `confirmed + 2`.
 //!
 //! Unmanaged threads (dirty schedulers, the main thread) may block and unblock thread
-//! progress and schedule later operations; erts' unmanaged delay handles
-//! (`erts_thr_progress_unmanaged_delay`) have no user here and are not ported.
+//! progress and schedule later operations, and delay progress while they look at memory that a
+//! later operation frees ([`unmanaged_delay`], erts `erts_thr_progress_unmanaged_delay`).
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -18,7 +18,31 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::Thread;
 
 /// An operation that runs once every managed thread passed a thread progress point.
-pub(crate) type LaterOp = Box<dyn FnOnce() + Send>;
+pub(crate) enum LaterOp {
+    /// `erts_schedule_thr_prgr_later_op` with an allocated closure.
+    Boxed(Box<dyn FnOnce() + Send>),
+    /// `erts_schedule_thr_prgr_later_cleanup_op`: a release function and the address of the
+    /// element it releases, so scheduling it allocates nothing.
+    Cleanup { release: fn(usize), data: usize },
+}
+
+impl LaterOp {
+    fn run(self) {
+        match self {
+            Self::Boxed(op) => op(),
+            Self::Cleanup { release, data } => release(data),
+        }
+    }
+}
+
+/// A delay of thread progress by an unmanaged thread (erts `ErtsThrPrgrDelayHandle`).
+#[must_use]
+pub(crate) enum DelayHandle {
+    /// `ERTS_THR_PRGR_DHANDLE_MANAGED`: a managed thread delays progress by not passing a point.
+    Managed,
+    /// The index of the unmanaged reference count taken.
+    Unmanaged(usize),
+}
 
 /// `ERTS_THR_PRGR_VAL_WAITING`.
 const VAL_WAITING: u64 = u64::MAX;
@@ -107,6 +131,13 @@ pub(crate) struct ThrProgress {
     /// Later operations scheduled from unmanaged threads, run by any managed thread.
     unmanaged_later: Mutex<VecDeque<(u64, LaterOp)>>,
     unmanaged_later_len: AtomicUsize,
+    /// `intrnl->umrefc`: unmanaged threads delaying progress, counted in one of two slots.
+    umrefc: [AtomicUsize; 2],
+    /// `intrnl->misc.data.umrefc_ix.current`: the slot new delays count in.
+    umrefc_current: AtomicUsize,
+    /// `intrnl->misc.data.umrefc_ix.waiting`: the slot a leader that gave up leadership was
+    /// waiting to drain, `-1` for none.
+    umrefc_waiting: std::sync::atomic::AtomicI32,
 }
 
 /// Per thread data of a managed thread (erts `ErtsThrPrgrData`) and its later operations
@@ -124,6 +155,10 @@ struct ThrPrgrData {
     wakeup_request: [u64; WAKEUP_DATA_SIZE],
     later_ops: VecDeque<(u64, LaterOp)>,
     latest_wakeup: u64,
+    /// `leader_state.umrefc_ix.waiting`: the slot this leader waits to drain, `-1` for none.
+    leader_umrefc_waiting: i32,
+    /// `leader_state.umrefc_ix.current`.
+    leader_umrefc_current: usize,
 }
 
 thread_local! {
@@ -134,6 +169,34 @@ thread_local! {
     /// Later operations of a runtime without managed threads (the simulated scheduler):
     /// no thread can be in the middle of a slice, so they run after the current one.
     static LATER_READY: RefCell<Vec<LaterOp>> = const { RefCell::new(Vec::new()) };
+    /// The thread progress this thread is a managed thread of, compared by address only
+    /// (erts_thr_progress_is_managed_thread).
+    static MANAGED_OF: Cell<usize> = const { Cell::new(0) };
+    /// Process lookups without a reference this thread is inside (debug builds).
+    static LOOKUP_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A process lookup that holds no reference: a managed thread must not wait (and so let
+/// progress pass) until it ends. Debug builds check it, as erts' lock checker does.
+pub(crate) struct LookupScope;
+
+impl LookupScope {
+    #[inline]
+    pub(crate) fn enter() -> Self {
+        if cfg!(debug_assertions) {
+            LOOKUP_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        }
+        Self
+    }
+}
+
+impl Drop for LookupScope {
+    #[inline]
+    fn drop(&mut self) {
+        if cfg!(debug_assertions) {
+            LOOKUP_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
 }
 
 impl ThrProgress {
@@ -155,6 +218,9 @@ impl ThrProgress {
             sleepers,
             unmanaged_later: Mutex::new(VecDeque::new()),
             unmanaged_later_len: AtomicUsize::new(0),
+            umrefc: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            umrefc_current: AtomicUsize::new(0),
+            umrefc_waiting: std::sync::atomic::AtomicI32::new(-1),
         }
     }
 
@@ -245,7 +311,7 @@ fn block_thread(tpd: &mut ThrPrgrData) -> u32 {
     lflgs
 }
 
-// Port of erl_thr_progress.c:660 (leader_update), OTP-29.1.1, without unmanaged threads.
+// Port of erl_thr_progress.c:660 (leader_update), OTP-29.1.1.
 fn leader_update(tpd: &mut ThrPrgrData) -> bool {
     if !tpd.leader {
         // Probably need to block...
@@ -259,6 +325,8 @@ fn leader_update(tpd: &mut ThrPrgrData) -> bool {
         tpd.leader_current = progress.current.load(Ordering::Relaxed);
         tpd.leader_next = next_val(tpd.leader_current);
         tpd.chk_next_ix = 0;
+        tpd.leader_umrefc_waiting = progress.umrefc_waiting.load(Ordering::Relaxed);
+        tpd.leader_umrefc_current = progress.umrefc_current.load(Ordering::Relaxed);
         if tpd.confirmed == tpd.leader_current {
             let val = next_val(tpd.leader_current);
             tpd.confirmed = val;
@@ -279,6 +347,31 @@ fn leader_update(tpd: &mut ThrPrgrData) -> bool {
             break;
         }
     }
+    // Check unmanaged threads.
+    let mut waiting_unmanaged = tpd.leader_umrefc_waiting != -1;
+    let umrefc_ix = if waiting_unmanaged {
+        tpd.leader_umrefc_waiting as usize
+    } else {
+        tpd.leader_umrefc_current
+    };
+    if caught_up && progress.umrefc[umrefc_ix].load(Ordering::Relaxed) != 0 {
+        if waiting_unmanaged {
+            caught_up = false;
+        } else {
+            let new_umrefc_ix = (umrefc_ix + 1) & 1;
+            tpd.leader_umrefc_waiting = umrefc_ix as i32;
+            tpd.chk_next_ix = no_managed;
+            progress
+                .umrefc_current
+                .store(new_umrefc_ix, Ordering::Relaxed);
+            tpd.leader_umrefc_current = new_umrefc_ix;
+            fence(Ordering::SeqCst);
+            waiting_unmanaged = true;
+            if progress.umrefc[umrefc_ix].load(Ordering::Relaxed) != 0 {
+                caught_up = false;
+            }
+        }
+    }
     if caught_up {
         // Make progress.
         let current = next;
@@ -289,6 +382,13 @@ fn leader_update(tpd: &mut ThrPrgrData) -> bool {
         tpd.leader_next = next;
         tpd.leader_current = current;
         progress.handle_wakeup_requests(current);
+        if waiting_unmanaged {
+            waiting_unmanaged = false;
+            tpd.leader_umrefc_waiting = -1;
+            progress
+                .lflgs
+                .fetch_and(!LFLG_WAITING_UM, Ordering::Relaxed);
+        }
         tpd.chk_next_ix = 0;
     }
     if tpd.active {
@@ -298,9 +398,27 @@ fn leader_update(tpd: &mut ThrPrgrData) -> bool {
     } else {
         tpd.leader = false;
         tpd.leader_current = VAL_WAITING;
-        let lflgs = progress.lflgs.fetch_or(LFLG_NO_LEADER, Ordering::Release) | LFLG_NO_LEADER;
+        progress
+            .umrefc_waiting
+            .store(tpd.leader_umrefc_waiting, Ordering::Relaxed);
+        let mut set_flags = LFLG_NO_LEADER;
+        if waiting_unmanaged {
+            set_flags |= LFLG_WAITING_UM;
+        }
+        let lflgs = progress.lflgs.fetch_or(set_flags, Ordering::Release) | set_flags;
         if lflgs & LFLG_BLOCK != 0 {
             block_thread(tpd);
+        }
+        if waiting_unmanaged {
+            // Need to check umrefc again.
+            fence(Ordering::SeqCst);
+            let progress = &*tpd.progress;
+            if progress.umrefc[umrefc_ix].load(Ordering::Relaxed) == 0
+                && progress.got_sched_wakeups()
+            {
+                // Someone needs to make progress.
+                progress.wakeup_managed(tpd.id);
+            }
         }
     }
     tpd.leader
@@ -538,14 +656,110 @@ pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) ->
         wakeup_request: std::array::from_fn(|ix| (ix as u64).wrapping_sub(1)),
         later_ops: VecDeque::new(),
         latest_wakeup: VAL_WAITING,
+        leader_umrefc_waiting: -1,
+        leader_umrefc_current: 0,
     })));
     TPD.with(|tpd| *tpd.borrow_mut() = Some(managed.clone()));
+    MANAGED_OF.with(|of| of.set(Arc::as_ptr(progress) as usize));
     managed
 }
 
-/// Drop the calling thread's registration when its scheduler loop ends.
+/// Drop the calling thread's registration when its scheduler loop ends. Later operations it
+/// still holds move to the shared queue, where another managed thread, or
+/// [`run_remaining_later_ops`] once every managed thread stopped, runs them.
 pub(crate) fn unregister_managed_thread() {
-    TPD.with(|tpd| tpd.borrow_mut().take());
+    MANAGED_OF.with(|of| of.set(0));
+    let Some(managed) = TPD.with(|tpd| tpd.borrow_mut().take()) else {
+        return;
+    };
+    let tpd = &mut *managed.0.borrow_mut();
+    if tpd.later_ops.is_empty() {
+        return;
+    }
+    let progress = Arc::clone(&tpd.progress);
+    let mut shared = progress.unmanaged_later.lock().unwrap();
+    shared.extend(tpd.later_ops.drain(..));
+    progress
+        .unmanaged_later_len
+        .store(shared.len(), Ordering::Release);
+}
+
+/// Whether the calling thread is a managed thread of `progress`
+/// (erts_thr_progress_is_managed_thread).
+pub(crate) fn is_managed_thread_of(progress: &ThrProgress) -> bool {
+    MANAGED_OF.with(Cell::get) == std::ptr::from_ref(progress) as usize
+}
+
+/// Delay thread progress while an unmanaged thread looks at memory a later operation may free;
+/// a managed thread needs no delay.
+///
+/// Port of erts/emulator/beam/erl_thr_progress.c (erts_thr_progress_unmanaged_delay__) and
+/// erl_thr_progress.h (erts_thr_progress_unmanaged_delay), OTP-29.1.1.
+pub(crate) fn unmanaged_delay(progress: &ThrProgress) -> DelayHandle {
+    if is_managed_thread_of(progress) {
+        return DelayHandle::Managed;
+    }
+    let mut umrefc_ix = progress.umrefc_current.load(Ordering::Acquire);
+    loop {
+        progress.umrefc[umrefc_ix].fetch_add(1, Ordering::Acquire);
+        let tmp_ix = progress.umrefc_current.load(Ordering::Acquire);
+        if tmp_ix == umrefc_ix {
+            break;
+        }
+        unmanaged_continue_ix(progress, umrefc_ix);
+        umrefc_ix = tmp_ix;
+    }
+    DelayHandle::Unmanaged(umrefc_ix)
+}
+
+/// End a [`unmanaged_delay`].
+///
+/// Port of erts/emulator/beam/erl_thr_progress.c (unmanaged_continue), OTP-29.1.1.
+pub(crate) fn unmanaged_continue(progress: &ThrProgress, handle: DelayHandle) {
+    if let DelayHandle::Unmanaged(umrefc_ix) = handle {
+        unmanaged_continue_ix(progress, umrefc_ix);
+    }
+}
+
+fn unmanaged_continue_ix(progress: &ThrProgress, umrefc_ix: usize) {
+    let refc = progress.umrefc[umrefc_ix].fetch_sub(1, Ordering::Release) - 1;
+    if refc == 0 {
+        fence(Ordering::Acquire);
+        let lflgs = progress.lflgs.load(Ordering::Relaxed);
+        if lflgs & (LFLG_NO_LEADER | LFLG_WAITING_UM | LFLG_ACTIVE_MASK)
+            == (LFLG_NO_LEADER | LFLG_WAITING_UM)
+            && progress.got_sched_wakeups()
+        {
+            // Others are waiting for us.
+            progress.wakeup_managed(1.min(progress.managed_no().saturating_sub(1)));
+        }
+    }
+}
+
+/// Run every later operation still queued once no managed thread of `progress` runs any more:
+/// the scheduler stopped, so none will reach a progress point. Unmanaged threads that delay
+/// progress are waited for first.
+pub(crate) fn run_remaining_later_ops(progress: &ThrProgress) {
+    loop {
+        while progress
+            .umrefc
+            .iter()
+            .any(|refc| refc.load(Ordering::Acquire) != 0)
+        {
+            std::thread::yield_now();
+        }
+        let ready: Vec<_> = {
+            let mut shared = progress.unmanaged_later.lock().unwrap();
+            progress.unmanaged_later_len.store(0, Ordering::Release);
+            shared.drain(..).map(|(_, op)| op).collect()
+        };
+        if ready.is_empty() {
+            return;
+        }
+        for op in ready {
+            op.run();
+        }
+    }
 }
 
 /// The scheduler's progress point: update, lead, block if requested, then run the
@@ -553,52 +767,56 @@ pub(crate) fn unregister_managed_thread() {
 // Port of erl_process.c:9857-9866 (schedule: erts_thr_progress_update and
 // erts_thr_progress_leader_update) and :2281 (handle_thr_prgr_later_op), OTP-29.1.1.
 pub(crate) fn scheduler_progress(managed: &ManagedThread) {
-    let ready = {
+    {
         let tpd = &mut *managed.0.borrow_mut();
         if update(tpd) {
             leader_update(tpd);
         }
-        take_ready_later_ops(tpd)
-    };
-    for op in ready {
-        op();
+    }
+    // Each operation runs with the thread data released: releasing a process can schedule
+    // another later operation.
+    while let Some(op) = next_ready_later_op(&mut managed.0.borrow_mut()) {
+        op.run();
     }
 }
 
-fn take_ready_later_ops(tpd: &mut ThrPrgrData) -> Vec<LaterOp> {
-    // Port of erts/emulator/beam/erl_process.c:2281 (handle_thr_prgr_later_op runs only
-    // when ERTS_SSI_AUX_WORK_THR_PRGR_LATER_OP is set, that is, later operations exist),
-    // OTP-29.1.1.
-    if tpd.later_ops.is_empty() && tpd.progress.unmanaged_later_len.load(Ordering::Acquire) == 0 {
-        return Vec::new();
+/// The next later operation of this thread, or of an unmanaged thread, that thread progress
+/// has reached.
+// Port of erts/emulator/beam/erl_process.c:2281 (handle_thr_prgr_later_op runs only when
+// ERTS_SSI_AUX_WORK_THR_PRGR_LATER_OP is set, that is, later operations exist), OTP-29.1.1.
+fn next_ready_later_op(tpd: &mut ThrPrgrData) -> Option<LaterOp> {
+    let shared_len = tpd.progress.unmanaged_later_len.load(Ordering::Acquire);
+    if tpd.later_ops.is_empty() && shared_len == 0 {
+        return None;
     }
-    let progress = Arc::clone(&tpd.progress);
-    let current = progress.current.load(Ordering::Acquire);
-    let mut ready = Vec::new();
-    while tpd
+    let current = tpd.progress.current.load(Ordering::Acquire);
+    if tpd
         .later_ops
         .front()
         .is_some_and(|(later, _)| has_reached_this(current, *later))
     {
-        ready.extend(tpd.later_ops.pop_front().map(|(_, op)| op));
+        return tpd.later_ops.pop_front().map(|(_, op)| op);
     }
-    if progress.unmanaged_later_len.load(Ordering::Acquire) != 0 {
-        let mut shared = progress.unmanaged_later.lock().unwrap();
-        while shared
-            .front()
-            .is_some_and(|(later, _)| has_reached_this(current, *later))
-        {
-            ready.extend(shared.pop_front().map(|(_, op)| op));
-        }
+    if shared_len == 0 {
+        return None;
+    }
+    let progress = Arc::clone(&tpd.progress);
+    let mut shared = progress.unmanaged_later.lock().unwrap();
+    if shared
+        .front()
+        .is_some_and(|(later, _)| has_reached_this(current, *later))
+    {
+        let op = shared.pop_front().map(|(_, op)| op);
         progress
             .unmanaged_later_len
             .store(shared.len(), Ordering::Release);
-        if let Some(&(later, _)) = shared.front() {
-            drop(shared);
-            request_wakeup_managed(tpd, later);
-        }
+        return op;
     }
-    ready
+    if let Some(&(later, _)) = shared.front() {
+        drop(shared);
+        request_wakeup_managed(tpd, later);
+    }
+    None
 }
 
 /// Before a managed thread sleeps: it stops counting as active and waits.
@@ -693,7 +911,7 @@ pub(crate) fn run_unmanaged_later_ops() {
             return;
         }
         for op in ready {
-            op();
+            op.run();
         }
     }
 }
@@ -729,6 +947,10 @@ pub(crate) fn scheduler_later_op_ready() -> bool {
 /// :913 (erts_thr_progress_finalize_wait), OTP-29.1.1; the caller must not hold locks that
 /// a thread blocking progress needs.
 pub fn thread_progress_wait<R>(wait: impl FnOnce() -> R) -> R {
+    debug_assert!(
+        MANAGED_OF.with(Cell::get) == 0 || LOOKUP_DEPTH.with(Cell::get) == 0,
+        "a managed thread waits inside a process lookup that holds no reference"
+    );
     // Port of erts/emulator/beam/erl_process.c:3576-3579,3611,3660 (scheduler_wait): a thread
     // that sleeps first stops counting as active, so the leader election sees no active
     // thread and a waking thread is not missed, then prepares to wait. Skipping the
@@ -790,7 +1012,7 @@ mod tests {
                 let flag = Arc::clone(&ran);
                 schedule_later_op(
                     &progress,
-                    Box::new(move || flag.store(true, Ordering::SeqCst)),
+                    LaterOp::Boxed(Box::new(move || flag.store(true, Ordering::SeqCst))),
                 );
                 for _ in 0..8 {
                     scheduler_progress(&managed);
@@ -800,6 +1022,67 @@ mod tests {
                 unregister_managed_thread();
             });
         });
+    }
+
+    #[test]
+    fn unmanaged_delay_holds_back_later_ops() {
+        let progress = progress(1);
+        let delay = unmanaged_delay(&progress);
+        assert!(matches!(delay, DelayHandle::Unmanaged(_)));
+        let ran = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                progress.sleepers[0].set(std::thread::current()).unwrap();
+                let managed = register_managed_thread(&progress, 0);
+                assert!(matches!(unmanaged_delay(&progress), DelayHandle::Managed));
+                let flag = Arc::clone(&ran);
+                schedule_later_op(
+                    &progress,
+                    LaterOp::Boxed(Box::new(move || flag.store(true, Ordering::SeqCst))),
+                );
+                for _ in 0..8 {
+                    scheduler_progress(&managed);
+                }
+                assert!(
+                    !ran.load(Ordering::SeqCst),
+                    "progress passed an unmanaged delay"
+                );
+                unmanaged_continue(&progress, delay);
+                for _ in 0..8 {
+                    scheduler_progress(&managed);
+                }
+                assert!(ran.load(Ordering::SeqCst));
+                unregister_managed_thread();
+            });
+        });
+    }
+
+    #[test]
+    fn later_ops_of_a_stopped_thread_run_at_shutdown() {
+        let progress = progress(1);
+        let ran = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                progress.sleepers[0].set(std::thread::current()).unwrap();
+                let _managed = register_managed_thread(&progress, 0);
+                let flag = Arc::clone(&ran);
+                schedule_later_op(
+                    &progress,
+                    LaterOp::Cleanup {
+                        release: |_| {},
+                        data: 0,
+                    },
+                );
+                schedule_later_op(
+                    &progress,
+                    LaterOp::Boxed(Box::new(move || flag.store(true, Ordering::SeqCst))),
+                );
+                unregister_managed_thread();
+            });
+        });
+        assert!(!ran.load(Ordering::SeqCst));
+        run_remaining_later_ops(&progress);
+        assert!(ran.load(Ordering::SeqCst));
     }
 
     #[test]
