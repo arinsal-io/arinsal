@@ -1356,6 +1356,142 @@ struct SpawnOpts {
 }
 
 // Port of erts/emulator/beam/erl_process.c (erts_parse_spawn_opts), OTP-29.1.1.
+/// The atom `link`, interned once (erts `am_link`).
+fn link_atom() -> Term {
+    static LINK: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
+    *LINK.get_or_init(|| atom("link"))
+}
+
+/// One `spawn_opt` option into `opts`.
+fn parse_spawn_option(
+    runtime: Option<&Runtime>,
+    opts: &mut SpawnOpts,
+    option: Term,
+) -> Result<(), VmError> {
+    if option == link_atom() {
+        opts.link = true;
+    } else if option == Term::atom(arinsal_term::atoms::MONITOR) {
+        opts.monitor = true;
+    } else if option.classify() == TermKind::Tuple {
+        // SAFETY: The option term remains in the caller's live heap.
+        let tuple = unsafe { option.tuple_ref() }.ok_or_else(|| badarg("erlang:spawn_opt"))?;
+        if tuple.len() == 2 && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::MIN_HEAP_SIZE))
+        {
+            let words = tuple
+                .get(1)
+                .and_then(Term::as_small)
+                .filter(|&words| words >= 0)
+                .ok_or_else(|| badarg("erlang:spawn_opt"))?;
+            opts.min_heap_size = Some(words as usize);
+        } else if tuple.len() == 2 && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::MONITOR))
+        {
+            // code_server:spawn_opt(Fun, [{monitor, [{tag, {'ON_LOAD_DOWN', Mod}}]}]).
+            // Port of erl_process.c spawn option `{monitor, MonitorOpts}`, OTP-29.1.1.
+            opts.monitor = true;
+            let items = list(tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?)
+                .ok_or_else(|| badarg("erlang:spawn_opt"))?;
+            for item in items {
+                // SAFETY: Each option stays rooted in the caller's heap.
+                let item = unsafe { item.tuple_ref() }.ok_or_else(|| badarg("erlang:spawn_opt"))?;
+                if item.len() != 2 {
+                    return Err(badarg("erlang:spawn_opt"));
+                }
+                match (item.get(0), item.get(1)) {
+                    (Some(key), Some(value)) if key == atom("tag") => {
+                        opts.monitor_tag =
+                            Some(arinsal_term::to_owned(value).map_err(|error| {
+                                VmError::Unsupported(format!("monitor tag: {error:?}"))
+                            })?);
+                    }
+                    (Some(key), Some(value)) if key == atom("alias") => {
+                        opts.monitor_alias = Some(
+                            parse_alias_mode(value).ok_or_else(|| badarg("erlang:spawn_opt"))?,
+                        );
+                    }
+                    _ => return Err(badarg("erlang:spawn_opt")),
+                }
+            }
+        } else if tuple.len() == 2
+            && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::PRIORITY))
+        {
+            opts.priority = match atom_name(tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?)
+                .as_deref()
+            {
+                Some("low") => Priority::Low,
+                Some("normal") => Priority::Normal,
+                Some("high") => Priority::High,
+                Some("max") => Priority::Max,
+                _ => return Err(badarg("erlang:spawn_opt")),
+            };
+        } else if tuple.len() == 2
+            && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::MAX_HEAP_SIZE))
+        {
+            opts.tuning.max_heap = Some(
+                crate::natives::proc::parse_max_heap_from(
+                    tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?,
+                    crate::natives::sys::gc_spawn_defaults(runtime).max_heap_size,
+                )
+                .map_err(|()| badarg("erlang:spawn_opt"))?,
+            );
+        } else if tuple.len() == 2
+            && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::FULLSWEEP_AFTER))
+        {
+            let value = tuple
+                .get(1)
+                .and_then(Term::as_small)
+                .filter(|&value| value >= 0)
+                .ok_or_else(|| badarg("erlang:spawn_opt"))?;
+            opts.tuning.fullsweep = Some(value.min(i64::from(u16::MAX)) as u16);
+        } else if tuple.len() == 2
+            && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::MIN_BIN_VHEAP_SIZE))
+        {
+            let value = tuple
+                .get(1)
+                .and_then(Term::as_small)
+                .filter(|&value| value >= 0)
+                .ok_or_else(|| badarg("erlang:spawn_opt"))?;
+            opts.tuning.min_bin_vheap = Some(value as usize);
+        } else if tuple.len() == 2
+            && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::MESSAGE_QUEUE_DATA))
+        {
+            match tuple.get(1) {
+                Some(value) if value == Term::atom(arinsal_term::atoms::OFF_HEAP) => {
+                    opts.tuning.off_heap_queue = Some(true);
+                }
+                Some(value) if value == Term::atom(arinsal_term::atoms::ON_HEAP) => {
+                    opts.tuning.off_heap_queue = Some(false);
+                }
+                _ => return Err(badarg("erlang:spawn_opt")),
+            }
+        } else if tuple.len() == 2
+            && tuple
+                .get(0)
+                .and_then(atom_name)
+                .is_some_and(|name| matches!(name.as_str(), "async_dist"))
+        {
+            // Accepted; async_dist is applied through process_flag.
+        } else if tuple.len() == 2
+            && tuple.get(0) == Some(Term::atom(arinsal_term::atoms::SCHEDULER))
+        {
+            let scheduler_count = runtime
+                .and_then(|runtime| runtime.scheduler().ok())
+                .map_or(0, |scheduler| scheduler.scheduler_count());
+            let scheduler = tuple
+                .get(1)
+                .and_then(Term::as_small)
+                .filter(|&scheduler| scheduler >= 0 && scheduler as usize <= scheduler_count)
+                .ok_or_else(|| badarg("erlang:spawn_opt"))?;
+            // Port of erts/emulator/beam/erl_process.c:12361 (erts_parse_spawn_opts): 0 means unbound.
+            opts.scheduler = (scheduler != 0).then_some(scheduler as usize);
+        } else {
+            return Err(badarg("erlang:spawn_opt"));
+        }
+    } else {
+        return Err(badarg("erlang:spawn_opt"));
+    }
+    Ok(())
+}
+
 fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmError> {
     let mut opts = SpawnOpts {
         tuning: SpawnTuning {
@@ -1370,117 +1506,21 @@ fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmE
         scheduler: None,
         priority: Priority::Normal,
     };
-    for option in list(term).ok_or_else(|| badarg("erlang:spawn_opt"))? {
-        if option == atom("link") {
-            opts.link = true;
-        } else if option == atom("monitor") {
-            opts.monitor = true;
-        } else if option.classify() == TermKind::Tuple {
-            // SAFETY: The option term remains in the caller's live heap.
-            let tuple = unsafe { option.tuple_ref() }.ok_or_else(|| badarg("erlang:spawn_opt"))?;
-            if tuple.len() == 2 && tuple.get(0) == Some(atom("min_heap_size")) {
-                let words = tuple
-                    .get(1)
-                    .and_then(Term::as_small)
-                    .filter(|&words| words >= 0)
-                    .ok_or_else(|| badarg("erlang:spawn_opt"))?;
-                opts.min_heap_size = Some(words as usize);
-            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("monitor")) {
-                // code_server:spawn_opt(Fun, [{monitor, [{tag, {'ON_LOAD_DOWN', Mod}}]}]).
-                // Port of erl_process.c spawn option `{monitor, MonitorOpts}`, OTP-29.1.1.
-                opts.monitor = true;
-                let items = list(tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?)
-                    .ok_or_else(|| badarg("erlang:spawn_opt"))?;
-                for item in items {
-                    // SAFETY: Each option stays rooted in the caller's heap.
-                    let item =
-                        unsafe { item.tuple_ref() }.ok_or_else(|| badarg("erlang:spawn_opt"))?;
-                    if item.len() != 2 {
-                        return Err(badarg("erlang:spawn_opt"));
-                    }
-                    match (item.get(0), item.get(1)) {
-                        (Some(key), Some(value)) if key == atom("tag") => {
-                            opts.monitor_tag =
-                                Some(arinsal_term::to_owned(value).map_err(|error| {
-                                    VmError::Unsupported(format!("monitor tag: {error:?}"))
-                                })?);
-                        }
-                        (Some(key), Some(value)) if key == atom("alias") => {
-                            opts.monitor_alias = Some(
-                                parse_alias_mode(value)
-                                    .ok_or_else(|| badarg("erlang:spawn_opt"))?,
-                            );
-                        }
-                        _ => return Err(badarg("erlang:spawn_opt")),
-                    }
-                }
-            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("priority")) {
-                opts.priority =
-                    match atom_name(tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?)
-                        .as_deref()
-                    {
-                        Some("low") => Priority::Low,
-                        Some("normal") => Priority::Normal,
-                        Some("high") => Priority::High,
-                        Some("max") => Priority::Max,
-                        _ => return Err(badarg("erlang:spawn_opt")),
-                    };
-            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("max_heap_size")) {
-                opts.tuning.max_heap = Some(
-                    crate::natives::proc::parse_max_heap_from(
-                        tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?,
-                        crate::natives::sys::gc_spawn_defaults(runtime).max_heap_size,
-                    )
-                    .map_err(|()| badarg("erlang:spawn_opt"))?,
-                );
-            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("fullsweep_after")) {
-                let value = tuple
-                    .get(1)
-                    .and_then(Term::as_small)
-                    .filter(|&value| value >= 0)
-                    .ok_or_else(|| badarg("erlang:spawn_opt"))?;
-                opts.tuning.fullsweep = Some(value.min(i64::from(u16::MAX)) as u16);
-            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("min_bin_vheap_size")) {
-                let value = tuple
-                    .get(1)
-                    .and_then(Term::as_small)
-                    .filter(|&value| value >= 0)
-                    .ok_or_else(|| badarg("erlang:spawn_opt"))?;
-                opts.tuning.min_bin_vheap = Some(value as usize);
-            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("message_queue_data")) {
-                match tuple.get(1) {
-                    Some(value) if value == atom("off_heap") => {
-                        opts.tuning.off_heap_queue = Some(true);
-                    }
-                    Some(value) if value == atom("on_heap") => {
-                        opts.tuning.off_heap_queue = Some(false);
-                    }
-                    _ => return Err(badarg("erlang:spawn_opt")),
-                }
-            } else if tuple.len() == 2
-                && tuple
-                    .get(0)
-                    .and_then(atom_name)
-                    .is_some_and(|name| matches!(name.as_str(), "async_dist"))
-            {
-                // Accepted; async_dist is applied through process_flag.
-            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("scheduler")) {
-                let scheduler_count = runtime
-                    .and_then(|runtime| runtime.scheduler().ok())
-                    .map_or(0, |scheduler| scheduler.scheduler_count());
-                let scheduler = tuple
-                    .get(1)
-                    .and_then(Term::as_small)
-                    .filter(|&scheduler| scheduler >= 0 && scheduler as usize <= scheduler_count)
-                    .ok_or_else(|| badarg("erlang:spawn_opt"))?;
-                // Port of erts/emulator/beam/erl_process.c:12361 (erts_parse_spawn_opts): 0 means unbound.
-                opts.scheduler = (scheduler != 0).then_some(scheduler as usize);
-            } else {
-                return Err(badarg("erlang:spawn_opt"));
-            }
-        } else {
-            return Err(badarg("erlang:spawn_opt"));
+    // Port of erts/emulator/beam/erl_process.c (erts_parse_spawn_opts), OTP-29.1.1: the option
+    // list is walked in place and each option compared with its atom.
+    let mut failure = None;
+    let proper = each_list_item(term, |option| {
+        if failure.is_none()
+            && let Err(error) = parse_spawn_option(runtime, &mut opts, option)
+        {
+            failure = Some(error);
         }
+    });
+    if proper.is_none() {
+        return Err(badarg("erlang:spawn_opt"));
+    }
+    if let Some(error) = failure {
+        return Err(error);
     }
     // The child keeps the system default virtual binary heap minimum unless `min_heap_size` or
     // `max_heap_size` is also given (verified against `erl` 29.1.1).
