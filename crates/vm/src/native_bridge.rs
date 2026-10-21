@@ -890,15 +890,6 @@ pub(crate) fn native_stack_frame_at(address: usize) -> Option<NativeStackFrame> 
     })
 }
 
-fn native_arity_at(address: usize) -> Option<u8> {
-    let functions = native_functions().read();
-    let index = functions.partition_point(|function| function.start <= address);
-    functions
-        .get(index.checked_sub(1)?)
-        .filter(|function| address < function.end)
-        .map(|function| function.arity)
-}
-
 /// Every registered native function of `module`, keyed by name and arity, restricted to the
 /// module version whose native code spans `range` when one is given.
 // The registry holds every loaded version (current and old) ordered by address, so the
@@ -995,10 +986,19 @@ pub fn run_native(
     // Port of erts/emulator/beam/erl_process.c:10550 and jit/arm/process_main.cpp (a process
     // resumes with the `c_p->arity` live registers its yield site saved), OTP-29.1.1: only a
     // call entry needs the function's arity from the code registry.
+    // One registry lookup gives both the arity of a call entry and whether the address
+    // starts a function.
+    let function = (!arity_set || !resuming_continuation)
+        .then(|| {
+            with_native_function_at(code_address, |function| {
+                (function.arity, function.start == code_address)
+            })
+        })
+        .flatten();
     let arity = if arity_set {
         process.header.arity
     } else {
-        native_arity_at(code_address).ok_or_else(|| {
+        function.map(|(arity, _)| arity).ok_or_else(|| {
             VmError::Unsupported(format!("unregistered native entry: {code_address:#x}"))
         })?
     };
@@ -1021,8 +1021,7 @@ pub fn run_native(
     // erts' `beam_normal_exit`.
     registers.entry_return = 0;
     if !resuming_continuation
-        && with_native_function_at(code_address, |function| function.start == code_address)
-            .unwrap_or(false)
+        && function.is_some_and(|(_, starts)| starts)
         && let Some(word) = process.heap.stack_get(0)
     {
         let raw = word.tagged_word() as usize;
