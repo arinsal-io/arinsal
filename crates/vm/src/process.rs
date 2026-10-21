@@ -7402,7 +7402,11 @@ impl Process {
         // OTP-29.1.1: a DOWN whose origin monitor is no longer in the table (a demonitor
         // raced with the target's exit) is dropped instead of becoming a message.
         let entry = crate::signals::take_origin_monitor_down(self, reference);
-        let remote = crate::dist::take_monitor(reference).is_some();
+        // erts takes the monitor type from the origin node in the process's own tree
+        // (erl_proc_sig_queue.c handle_monitor_down): a local process monitor has no
+        // distribution bookkeeping to release.
+        let remote = !matches!(entry, Some(crate::proc_create::OriginMonitor::Process(_)))
+            && crate::dist::take_monitor(reference).is_some();
         let active = entry.is_some() || remote;
         let priority = self
             .cold
