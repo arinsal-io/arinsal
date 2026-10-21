@@ -12,6 +12,7 @@ mod identity;
 mod internal_hash;
 mod literal;
 mod magic;
+pub mod message;
 mod ops;
 mod owned;
 pub mod ptab;
