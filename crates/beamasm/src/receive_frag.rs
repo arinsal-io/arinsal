@@ -24,6 +24,16 @@ const SUPER_TMP: Gpr = Gpr::x(17);
 const PROCESS_I: u32 = 72;
 const PROCESS_ARITY: u16 = 80;
 
+/// Where `i_loop_rec_shared` finds the message at the save position without a call, as erts'
+/// `emit_i_loop_rec_shared` loads `*c_p->sig_qs.save`: byte offsets from the process.
+#[derive(Clone, Copy)]
+pub struct InlinePeek {
+    /// The address of the term of the message at the save position, 0 when there is none.
+    pub save_term_offset: u32,
+    /// The `F_DELAY_GC` byte set while a receive looks at a message.
+    pub delay_gc_offset: u16,
+}
+
 /// Receive fragments: `i_loop_rec_shared`, `wait_unlocked_shared` and `wait_locked_shared`.
 pub struct ReceiveFragments {
     memory: CodeMemory,
@@ -42,6 +52,7 @@ impl ReceiveFragments {
         wait_unlocked: WaitHook,
         wait_locked: WaitHook,
         context_switch: usize,
+        inline_peek: Option<InlinePeek>,
     ) -> Result<Self, ExecError> {
         let mut code = CodeBuffer::new();
         let fail = |_: BufferError| ExecError::InvalidSize("receive fragment");
@@ -61,6 +72,23 @@ impl ReceiveFragments {
         })
         .map_err(fail)?;
         code.b_cond(Cond::Le, schedule_out).map_err(fail)?;
+        if let Some(peek) = inline_peek {
+            // Port of erts/emulator/beam/jit/arm/instr_msg.cpp (emit_i_loop_rec_shared, "Peek
+            // next message"), OTP-29.1.1: load the message at the save position; only an empty
+            // message queue calls the receive helper.
+            let fetch = code.new_label();
+            code.emit(|e| e.ldr_uoff(TMP1, C_P, peek.save_term_offset))
+                .map_err(fail)?;
+            code.cbz(TMP1, fetch).map_err(fail)?;
+            code.emit(|e| {
+                e.ldr_uoff(XREG0, TMP1, 0)?;
+                e.mov_const(TMP2, 1)?;
+                e.strb_uoff(TMP2, C_P, peek.delay_gc_offset)?;
+                e.ret(XREG1)
+            })
+            .map_err(fail)?;
+            code.bind(fetch).map_err(fail)?;
+        }
         emit_enter_runtime(&mut code, 0, Update::HEAP_ALLOC.union(Update::REDUCTIONS))
             .map_err(fail)?;
         code.emit(|e| {
