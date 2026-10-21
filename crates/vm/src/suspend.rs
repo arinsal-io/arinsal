@@ -203,12 +203,12 @@ pub(crate) fn send_sync_suspend(
     reply: Term,
     asynchronous: bool,
 ) -> Result<(), VmError> {
-    let signal = Signal::SyncSuspend {
+    let signal = Signal::SyncSuspend(Box::new(arinsal_sched::SyncSuspendRequest {
         requester: me,
         tag: Message::copy_from(tag)?,
         reply: reply.as_atom().map_or(0, |atom| atom.0),
         async_: asynchronous,
-    };
+    }));
     if send_signal(process, me, target, signal).is_err() {
         let gone = crate::signals::atom(if asynchronous { "badarg" } else { "exited" });
         let message = process.tuple(&[tag, gone])?;

@@ -66,7 +66,7 @@ mod timer;
 
 pub use mailbox::{InSignal, Incoming, psflg};
 pub use ports::{PortExecution, PortRunQueue, RunPort};
-pub use timer::TimerRef;
+pub use timer::{TimerId, TimerRef};
 
 use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
 use crossbeam_deque::{Steal, Stealer, Worker};
@@ -410,13 +410,8 @@ pub enum Signal<M> {
     /// Synchronous or tagged suspend reply request (erl_proc_sig_queue.c:3192
     /// erts_proc_sig_send_sync_suspend): queued behind the suspend, the target sends `{tag, reply}`
     /// to `requester` once it handled everything before it, patching the result to its state.
-    SyncSuspend {
-        requester: Pid,
-        tag: M,
-        /// Atom index of the reply when the target is suspended.
-        reply: u32,
-        async_: bool,
-    },
+    /// Boxed: the request is rare and would otherwise widen every queued event.
+    SyncSuspend(Box<SyncSuspendRequest<M>>),
     /// `Monitor` could not be published because the target exited first.
     MonitorNoproc(u64),
     /// Demonitor request carrying a VM reference.
@@ -427,7 +422,8 @@ pub enum Signal<M> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:4640 (ERTS_SIG_Q_OP_EXIT_LINKED), OTP-29.1.1.
     ExitLinked(M),
     /// Port exit signal preserving the port term used as the signal origin.
-    PortExit { port: M, reason: M },
+    /// Boxed: the signal is rare and would otherwise widen every queued event.
+    PortExit(Box<PortExitSignal<M>>),
     /// Monitor DOWN signal carrying an opaque reason envelope.
     MonitorDown { reference: u64, reason: M },
     /// Monitor DOWN message the sender already built (a non-immediate reason, erl_proc_sig_queue.c:2836-2900).
@@ -439,14 +435,36 @@ pub enum Signal<M> {
     /// Ask a process to collect its heap at its next signal safe point.
     GarbageCollect,
     /// Ask a process to copy terms from a retiring literal area.
-    LiteralAreaCopy {
-        area_id: u64,
-        request: M,
-        how: LiteralCopyHow,
-        requester: Pid,
-    },
+    /// Boxed: the request is rare and would otherwise widen every queued event.
+    LiteralAreaCopy(Box<LiteralAreaCopyRequest<M>>),
     /// Execute the process-signal blocking callback on the target process.
     ProcSigBlock(i64),
+}
+
+/// The fields of [`Signal::SyncSuspend`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncSuspendRequest<M> {
+    pub requester: Pid,
+    pub tag: M,
+    /// Atom index of the reply when the target is suspended.
+    pub reply: u32,
+    pub async_: bool,
+}
+
+/// The fields of [`Signal::PortExit`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortExitSignal<M> {
+    pub port: M,
+    pub reason: M,
+}
+
+/// The fields of [`Signal::LiteralAreaCopy`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiteralAreaCopyRequest<M> {
+    pub area_id: u64,
+    pub request: M,
+    pub how: LiteralCopyHow,
+    pub requester: Pid,
 }
 
 /// Phase of a literal-area copy request.
@@ -466,12 +484,12 @@ pub enum Payload<M> {
     Signal(Signal<M>),
     /// An expired `start_timer`; the VM can form `{timeout, Ref, Msg}`.
     Timer {
-        reference: TimerRef,
+        reference: TimerId,
         message: M,
     },
     /// An expired `send_after`; the VM retires the timer reference and delivers the message as-is.
     TimerMessage {
-        reference: TimerRef,
+        reference: TimerId,
         message: M,
     },
 }
@@ -3145,7 +3163,7 @@ impl<T: Task> Inner<T> {
     ) -> Result<(), Error> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1560-1563, OTP-29.1.1.
         // Literal-copy requests are non-message signals and enter a shared run queue.
-        let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy { .. }));
+        let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
         self.fanin_delivery(process, 1);
         // The send pressure counts only a receiver that was not waiting. The state word comes
         // back from the enqueue's own read-modify-write, so the shared word is touched once;
@@ -3538,12 +3556,12 @@ impl<T: Task> Inner<T> {
             TimerPayload::Message(pid, message, wrapped) => {
                 let payload = if wrapped {
                     Payload::Timer {
-                        reference: TimerRef { worker, id },
+                        reference: TimerId(id),
                         message,
                     }
                 } else {
                     Payload::TimerMessage {
-                        reference: TimerRef { worker, id },
+                        reference: TimerId(id),
                         message,
                     }
                 };
@@ -3563,12 +3581,12 @@ impl<T: Task> Inner<T> {
                 if let Some(pid) = resolve() {
                     let payload = if wrapped {
                         Payload::Timer {
-                            reference: TimerRef { worker, id },
+                            reference: TimerId(id),
                             message,
                         }
                     } else {
                         Payload::TimerMessage {
-                            reference: TimerRef { worker, id },
+                            reference: TimerId(id),
                             message,
                         }
                     };
@@ -4711,7 +4729,7 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
         Payload::Signal(signal) => match signal {
             Signal::Exit(_)
             | Signal::ExitLinked(_)
-            | Signal::PortExit { .. }
+            | Signal::PortExit(_)
             | Signal::MonitorDown { .. }
             | Signal::MonitorDownMsg { .. }
             | Signal::Suspend { .. }
@@ -4719,10 +4737,10 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
             | Signal::SuspendDown { .. }
             | Signal::SuspendResume
             | Signal::SuspendInternal
-            | Signal::SyncSuspend { .. }
+            | Signal::SyncSuspend(_)
             | Signal::MonitorNoproc(_)
             | Signal::GarbageCollect
-            | Signal::LiteralAreaCopy { .. }
+            | Signal::LiteralAreaCopy(_)
             | Signal::ProcSigBlock(_) => true,
             Signal::UnlinkAck(id) => *id != 0,
             Signal::UnlinkAckSignal(_) => true,
@@ -5149,8 +5167,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             .with_live(to, |process| -> Result<(), Error> {
                 let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
                 let wakes = payload_wakes(&payload);
-                let force_enqueue =
-                    matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy { .. }));
+                let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
                 // A literal-copy request is never buffered: a request lost to an exiting target
                 // would never be answered, so the sender must see `NoProcess` at once. Port of
                 // erts/emulator/beam/erl_proc_sig_queue.c:3480 (erts_proc_sig_send_cla_request), OTP-29.1.1.

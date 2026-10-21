@@ -1436,12 +1436,12 @@ fn send_copy_request(
     let request = crate::process::Message::literal_copy_request(args[1], how, target)?;
     let signal_result = ctx.signal(
         target,
-        Signal::LiteralAreaCopy {
+        Signal::LiteralAreaCopy(Box::new(arinsal_sched::LiteralAreaCopyRequest {
             area_id,
             request,
             how,
             requester: ctx.pid(),
-        },
+        })),
     );
     if signal_result.is_err() {
         super::sys::reply_failed_literal_area_request(process, ctx, args[1], how, target)?;

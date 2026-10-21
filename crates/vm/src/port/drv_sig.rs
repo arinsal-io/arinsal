@@ -731,7 +731,10 @@ pub(crate) fn link(
                     let _ = handle.scheduler.signal(
                         pid,
                         pid,
-                        arinsal_sched::Signal::PortExit { port, reason },
+                        arinsal_sched::Signal::PortExit(Box::new(arinsal_sched::PortExitSignal {
+                            port,
+                            reason,
+                        })),
                     );
                 }
                 REDS_LINK

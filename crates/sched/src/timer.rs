@@ -445,7 +445,12 @@ impl TimerRef {
 
     /// The reference key a BIF timer was started with, `None` for other timers.
     pub fn ref_key(self) -> Option<u64> {
-        (self.id & REF_KEY_TIMER_BIT != 0).then_some(self.id & !REF_KEY_TIMER_BIT)
+        self.timer_id().ref_key()
+    }
+
+    /// The timer's identity without its owning wheel.
+    pub fn timer_id(self) -> TimerId {
+        TimerId(self.id)
     }
 
     /// The timer a reference key names: its wheel is the scheduler whose thread id the key
@@ -464,6 +469,24 @@ impl TimerRef {
             worker,
             id: key | REF_KEY_TIMER_BIT,
         }
+    }
+}
+
+/// A fired timer as its timeout event names it: the timer id without the owning wheel, which
+/// only a cancel or a read of a running timer needs. One word, so a queued timeout event is no
+/// wider than a monitor DOWN signal.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TimerId(pub(crate) u64);
+
+impl TimerId {
+    /// Stable numeric identity for the VM's reference representation.
+    pub fn id(self) -> u64 {
+        self.0
+    }
+
+    /// The reference key a BIF timer was started with, `None` for other timers.
+    pub fn ref_key(self) -> Option<u64> {
+        (self.0 & REF_KEY_TIMER_BIT != 0).then_some(self.0 & !REF_KEY_TIMER_BIT)
     }
 }
 
