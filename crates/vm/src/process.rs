@@ -1142,6 +1142,10 @@ pub(crate) struct Runtime {
     pub(crate) debug_wait_active: AtomicBool,
     /// `erlang:system_flag/2` settings of this runtime.
     pub(crate) system_flags: Mutex<crate::natives::sys::SystemFlags>,
+    /// Spawn GC defaults, read without a lock (erts' `H_MIN_SIZE` and friends).
+    pub(crate) gc_defaults: crate::natives::sys::GcDefaults,
+    /// The persistent term store of this runtime's code scope, looked up once.
+    pub(crate) persistent_terms: &'static arinsal_pterm::Store,
     /// Multi-scheduling block state of this runtime.
     pub(crate) multi_scheduling: Mutex<MultiScheduling>,
 }
@@ -8418,6 +8422,8 @@ impl Vm {
             breakpoints: Arc::new(crate::trace_bp::BpNode::new(self.code_scope)),
             debug_wait_active: AtomicBool::new(false),
             system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
+            gc_defaults: crate::natives::sys::GcDefaults::boot(),
+            persistent_terms: arinsal_pterm::store_for(self.code_scope),
             multi_scheduling: Mutex::new(MultiScheduling::default()),
         });
         let (dirty_cpu_schedulers, dirty_cpu_online, dirty_io_schedulers) =

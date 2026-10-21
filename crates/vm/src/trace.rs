@@ -7,8 +7,8 @@ use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned, global_ato
 use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub(crate) const SEND: u64 = 1 << 4;
 pub(crate) const RECEIVE: u64 = 1 << 5;
@@ -709,11 +709,74 @@ fn sessions() -> &'static Mutex<HashMap<(usize, u64), TraceSession>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-type NewProcessTracing = Mutex<HashMap<(usize, u64), (u64, Option<Tracer>)>>;
+type NewProcessDefaults = HashMap<(usize, u64), (u64, Option<Tracer>)>;
+
+/// Per-session tracing that new processes inherit, and how many sessions have any.
+///
+/// Port of erts/emulator/beam/erl_trace.c (`erts_new_procs_trace_cnt`), OTP-29.1.1:
+/// erl_create_process reads the count and takes the session list lock only when it is not
+/// zero.
+struct NewProcessTracing {
+    sessions: Mutex<NewProcessDefaults>,
+    active: AtomicUsize,
+}
+
+impl NewProcessTracing {
+    fn lock(
+        &self,
+    ) -> Result<
+        NewProcessTracingGuard<'_>,
+        std::sync::PoisonError<MutexGuard<'_, NewProcessDefaults>>,
+    > {
+        self.sessions.lock().map(|sessions| NewProcessTracingGuard {
+            sessions,
+            active: &self.active,
+        })
+    }
+
+    /// Whether any session traces new processes.
+    fn any_active(&self) -> bool {
+        self.active.load(Ordering::Acquire) != 0
+    }
+}
+
+/// The locked defaults; dropping it recounts the sessions that trace new processes.
+struct NewProcessTracingGuard<'a> {
+    sessions: MutexGuard<'a, NewProcessDefaults>,
+    active: &'a AtomicUsize,
+}
+
+impl std::ops::Deref for NewProcessTracingGuard<'_> {
+    type Target = NewProcessDefaults;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sessions
+    }
+}
+
+impl std::ops::DerefMut for NewProcessTracingGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.sessions
+    }
+}
+
+impl Drop for NewProcessTracingGuard<'_> {
+    fn drop(&mut self) {
+        let active = self
+            .sessions
+            .values()
+            .filter(|(flags, _)| *flags != 0)
+            .count();
+        self.active.store(active, Ordering::Release);
+    }
+}
 
 fn new_process_tracing() -> &'static NewProcessTracing {
     static TRACING: OnceLock<NewProcessTracing> = OnceLock::new();
-    TRACING.get_or_init(|| Mutex::new(HashMap::new()))
+    TRACING.get_or_init(|| NewProcessTracing {
+        sessions: Mutex::new(HashMap::new()),
+        active: AtomicUsize::new(0),
+    })
 }
 
 #[derive(Clone)]
@@ -3624,11 +3687,12 @@ pub(crate) fn spawned(
 pub(crate) fn spawn_interested(process: &Process, parent: Pid) -> bool {
     flags(process, parent) & (PROCS | SET_ON_SPAWN | SET_ON_FIRST_SPAWN | SET_ON_LINK | FIRST_LINK)
         != 0
-        || new_process_tracing()
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|((runtime, _), (flags, _))| *runtime == scope(process) && *flags != 0)
+        || new_process_tracing().any_active()
+            && new_process_tracing()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|((runtime, _), (flags, _))| *runtime == scope(process) && *flags != 0)
 }
 
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:618-655, OTP-29.1.1.
