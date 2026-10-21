@@ -969,13 +969,20 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
             .cold
             .as_ref()
             .map(|cold| {
-                cold.monitors
-                    .values()
-                    .filter_map(|entry| match entry {
-                        crate::proc_create::OriginMonitor::Process(half) => half.target.to_term(),
+                // Port of erts/emulator/beam/erl_bif_info.c (process_info_aux,
+                // ERTS_PI_IX_MONITORS): tree foreach order, each item consed onto the result.
+                let mut targets = cold
+                    .monitors
+                    .iter()
+                    .filter_map(|monitor| match monitor.origin_state() {
+                        Some(crate::proc_create::OriginMonitor::Process(_)) => {
+                            Pid::from_data(monitor.other()).to_term()
+                        }
                         _ => None,
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                targets.reverse();
+                targets
             })
             .unwrap_or_default();
         let vals = raw
@@ -1004,10 +1011,21 @@ fn process_info_item_monitored_by(process: &mut Process, pid: Pid) -> Result<Ter
             .cold
             .as_ref()
             .map(|cold| {
-                cold.monitored_by
-                    .values()
-                    .filter_map(|half| half.origin.to_term())
-                    .collect::<Vec<_>>()
+                // Port of erts/emulator/beam/erl_bif_info.c (process_info_aux,
+                // ERTS_PI_IX_MONITORED_BY): the local target list, then the target halves of
+                // remote origins in the tree, each item consed onto the result.
+                let local = cold.lt_monitors.iter().map(|monitor| monitor.other());
+                let remote = cold
+                    .monitors
+                    .iter()
+                    .filter(|monitor| monitor.is_target())
+                    .map(|monitor| monitor.other());
+                let mut origins = local
+                    .chain(remote)
+                    .filter_map(|origin| Pid::from_data(origin).to_term())
+                    .collect::<Vec<_>>();
+                origins.reverse();
+                origins
             })
             .unwrap_or_default();
         let mut vals = vals;
@@ -3994,10 +4012,14 @@ fn create_alias(
         .as_ref()
         .ok_or_else(badarg)?
         .alias_bind_prio(id, Some(pid), priority);
-    process.cold_mut().monitors.insert(
-        id,
-        crate::proc_create::OriginMonitor::Alias { mode, priority },
-    );
+    process
+        .cold_mut()
+        .monitors
+        .insert(crate::proc_create::origin_monitor(
+            id,
+            0,
+            crate::proc_create::OriginMonitor::Alias { mode, priority },
+        ));
     Ok(reference)
 }
 

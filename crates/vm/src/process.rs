@@ -4722,11 +4722,16 @@ impl Runtime {
             child.cold_mut().links.insert(linker, Default::default());
         }
         if let Some((watcher, reference)) = monitor {
-            child.insert_target_monitor(
+            // The watcher is a remote process: the target half is an `ERTS_MON_TYPE_DIST_PROC`
+            // entry of the child's monitor tree.
+            let (_origin, target) = crate::proc_create::create_monitor(
                 reference,
-                watcher,
-                arinsal_sched::SharedPayload(crate::proc_create::default_monitor_data()),
+                watcher.data(),
+                0,
+                crate::proc_create::MonitorInfo::default(),
+                crate::proc_create::OriginMonitor::Distributed { alias_mode: None },
             );
+            child.cold_mut().monitors.insert(target);
         }
         if let Some(arity) = u8::try_from(args.len()).ok()
             && (arinsal_bifs::lookup(module, function, arity).is_some()
@@ -4755,21 +4760,29 @@ impl Runtime {
 }
 
 impl Process {
-    /// Insert the target half a monitor signal carries into this process's monitor tree
-    /// (erl_proc_sig_queue.c handle_monitor): a process monitor, or the `ERTS_MON_TYPE_RESOURCE`
-    /// monitor of a NIF resource.
+    /// Insert the target half a monitor signal carries (erl_proc_sig_queue.c
+    /// erts_proc_sig_handle_incoming, ERTS_SIG_Q_OP_MONITOR): a remote origin's half goes into
+    /// the monitor tree, a local one into the `ERTS_P_LT_MONITORS` list; or the
+    /// `ERTS_MON_TYPE_RESOURCE` monitor of a NIF resource.
     pub(crate) fn insert_target_monitor(
         &mut self,
         reference: u64,
-        from: Pid,
         shared: arinsal_sched::SharedPayload,
     ) {
-        match shared.0.downcast::<crate::proc_create::MonitorData>() {
+        match shared
+            .0
+            .downcast::<crate::proc_create::ProcessMonitorData>()
+        {
             Ok(data) => {
-                self.cold_mut().monitored_by.insert(
-                    reference,
-                    crate::proc_create::TargetHalf { origin: from, data },
-                );
+                let Some(target) = crate::proc_create::ProcessMonitorData::take_half(data, true)
+                else {
+                    return;
+                };
+                if target.view().kind() == crate::monitor_link::node_type::MONITOR_DIST_PROC {
+                    self.cold_mut().monitors.insert(target);
+                } else {
+                    self.cold_mut().lt_monitors.insert(target);
+                }
             }
             Err(other) => {
                 if let Ok(monitor) = other.downcast::<arinsal_nif::ResourceMonitor>() {
@@ -4777,6 +4790,42 @@ impl Process {
                 }
             }
         }
+    }
+
+    /// A demonitor by reference: of a remote origin (its target half is in the monitor tree) or
+    /// of a NIF resource.
+    fn remove_target_monitor(&mut self, reference: u64) {
+        if let Some(cold) = self.cold.as_mut() {
+            if cold
+                .monitors
+                .get(reference)
+                .is_some_and(|monitor| monitor.is_target())
+            {
+                cold.monitors.remove(reference);
+            }
+            cold.resource_monitors.remove(&reference);
+        }
+    }
+
+    /// The demonitor signal of a local monitor carries its origin half; the target half is
+    /// reached through the data they share (erl_proc_sig_queue.c erts_proc_sig_handle_incoming,
+    /// ERTS_SIG_Q_OP_DEMONITOR): both are released.
+    fn remove_demonitored_target(&mut self, shared: arinsal_sched::SharedPayload) {
+        let Ok(data) = shared
+            .0
+            .downcast::<crate::proc_create::ProcessMonitorData>()
+        else {
+            return;
+        };
+        let Some(origin) = crate::proc_create::ProcessMonitorData::take_half(data, false) else {
+            return;
+        };
+        let target = self
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.lt_monitors.remove_target_of(&origin));
+        drop(target);
+        drop(origin);
     }
 
     fn absorb_exit_signals(&mut self, ctx: &mut RunCtx<'_, Message>) {
@@ -4801,10 +4850,10 @@ impl Process {
                     let _ = ctx.signal(from, Signal::MonitorNoproc(reference));
                 }
                 Payload::Signal(Signal::Demonitor(reference)) => {
-                    if let Some(cold) = self.cold.as_mut() {
-                        cold.monitored_by.remove(&reference);
-                        cold.resource_monitors.remove(&reference);
-                    }
+                    self.remove_target_monitor(reference);
+                }
+                Payload::Signal(Signal::DemonitorOrigin(shared)) => {
+                    self.remove_demonitored_target(shared);
                 }
                 Payload::Signal(Signal::Link) => {
                     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426
@@ -5154,18 +5203,18 @@ impl Process {
         // Further publishes fail with `NoProcess` and the watcher synthesizes DOWN.
         // Signals already queued are installed before we notify.
         self.absorb_exit_signals(ctx);
-        let Some(cold) = self.cold.take() else {
+        let Some(mut cold) = self.cold.take() else {
             return;
         };
         // Port of erts/emulator/beam/erl_process.c:13918 (origin ERTS_MON_TYPE_PORT),
         // OTP-29.1.1: exit demonitors each port the process was watching.
-        for (&reference, monitor) in &cold.monitors {
-            if let crate::proc_create::OriginMonitor::Port {
+        for monitor in cold.monitors.iter() {
+            if let Some(crate::proc_create::OriginMonitor::Port {
                 port_id: Some(port_id),
                 ..
-            } = monitor
+            }) = monitor.origin_state()
             {
-                crate::port::demonitor_port(self, ctx.pid(), *port_id, reference);
+                crate::port::demonitor_port(self, ctx.pid(), *port_id, monitor.reference());
             }
         }
         for (pid, node) in cold.links {
@@ -5198,8 +5247,17 @@ impl Process {
                 monitor.fire(exiting);
             }
         }
-        for (reference, half) in cold.monitored_by {
-            let pid = half.origin;
+        // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor): the target
+        // halves, of remote origins in the monitor tree and of local ones in the list.
+        let mut monitors = cold.monitors;
+        let remote_targets = monitors
+            .drain()
+            .filter(|monitor| monitor.view().is_target());
+        let targets: Vec<_> = remote_targets.chain(cold.lt_monitors.drain()).collect();
+        for target in targets {
+            let half = target.view();
+            let reference = half.reference();
+            let pid = Pid::from_data(half.other());
             if let Some(runtime) = self.runtime.as_ref()
                 && crate::dist::forward_monitor_down_if_proxy(
                     runtime,
@@ -5216,7 +5274,7 @@ impl Process {
             // message; any other reason is copied into a DOWN message built here, on the sender.
             if reason.is_pointer() {
                 if let Ok(message) =
-                    down_message_on_sender(self, reference, &half.data, ctx.pid(), reason)
+                    down_message_on_sender(self, reference, half.info(), ctx.pid(), reason)
                 {
                     let _ = ctx.signal(
                         pid,
@@ -6107,7 +6165,7 @@ impl Process {
         let Some(entry) = self
             .cold
             .as_ref()
-            .and_then(|cold| cold.monitors.get(&alias))
+            .and_then(|cold| cold.monitors.get_state(alias))
         else {
             return Ok(false);
         };
@@ -6115,11 +6173,15 @@ impl Process {
             return Ok(false);
         }
         if entry.alias_mode() == Some(crate::proc_create::AliasMode::ReplyDemonitor) {
-            let entry = self.cold_mut().monitors.remove(&alias);
-            match entry {
-                Some(crate::proc_create::OriginMonitor::Process(half)) => {
+            let entry = self.cold_mut().monitors.remove(alias);
+            let state = entry.as_ref().and_then(|entry| entry.state()).cloned();
+            match state {
+                Some(crate::proc_create::OriginMonitor::Process(_)) => {
                     self.cold_mut().prio_monitors.remove(&alias);
-                    let _ = ctx.signal(half.target, arinsal_sched::Signal::Demonitor(alias));
+                    let origin = entry.expect("origin half of the entry");
+                    let target = Pid::from_data(origin.view().other());
+                    let shared = arinsal_sched::SharedPayload(origin.into_shared());
+                    let _ = ctx.signal(target, arinsal_sched::Signal::DemonitorOrigin(shared));
                 }
                 Some(crate::proc_create::OriginMonitor::Port {
                     port_id: Some(port_id),
@@ -6295,14 +6357,15 @@ impl Process {
                 2
             }
             arinsal_sched::Signal::Monitor { reference, shared } => {
-                self.insert_target_monitor(reference, from, shared);
+                self.insert_target_monitor(reference, shared);
                 2
             }
             arinsal_sched::Signal::Demonitor(reference) => {
-                if let Some(cold) = self.cold.as_mut() {
-                    cold.monitored_by.remove(&reference);
-                    cold.resource_monitors.remove(&reference);
-                }
+                self.remove_target_monitor(reference);
+                2
+            }
+            arinsal_sched::Signal::DemonitorOrigin(shared) => {
+                self.remove_demonitored_target(shared);
                 2
             }
             signal @ (arinsal_sched::Signal::Exit(_) | arinsal_sched::Signal::ExitLinked(_)) => {
@@ -7348,7 +7411,7 @@ impl Process {
         // (erl_proc_sig_queue.c handle_monitor_down); only a distributed monitor has
         // remote bookkeeping to release.
         let remote = matches!(
-            origin,
+            origin.as_ref().and_then(|origin| origin.state()),
             Some(crate::proc_create::OriginMonitor::Distributed { .. })
         ) && crate::dist::take_monitor(reference).is_some();
         let active = origin.is_some() || remote;
@@ -7393,7 +7456,10 @@ impl Process {
         // erts takes the monitor type from the origin node in the process's own tree
         // (erl_proc_sig_queue.c handle_monitor_down): a local process monitor has no
         // distribution bookkeeping to release.
-        let remote = !matches!(entry, Some(crate::proc_create::OriginMonitor::Process(_)))
+        let remote = !matches!(
+            entry.as_ref().and_then(|entry| entry.state()),
+            Some(crate::proc_create::OriginMonitor::Process(_))
+        )
             && crate::dist::take_monitor(reference).is_some();
         let active = entry.is_some() || remote;
         let priority = self
@@ -7403,24 +7469,26 @@ impl Process {
         if !active {
             return Ok(());
         }
-        let (half, port_object) = match entry {
-            Some(crate::proc_create::OriginMonitor::Process(half)) => (Some(half), None),
+        let (info, port_object) = match entry.as_ref().and_then(|entry| entry.state()) {
+            Some(crate::proc_create::OriginMonitor::Process(_)) => {
+                (entry.as_ref().map(|entry| entry.view().info()), None)
+            }
             Some(crate::proc_create::OriginMonitor::Port { port_id, name, .. }) => {
-                (None, Some(PortObject::Local(port_id, name)))
+                (None, Some(PortObject::Local(*port_id, *name)))
             }
             Some(crate::proc_create::OriginMonitor::DistPort { object, .. }) => {
-                (None, Some(PortObject::Dist(*object)))
+                (None, Some(PortObject::Dist((**object).clone())))
             }
             _ => (None, None),
         };
-        let tag = if let Some(owned) = half.as_ref().and_then(|half| half.data.tag.as_ref()) {
+        let tag = if let Some(owned) = info.and_then(|info| info.tag.as_ref()) {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
             arinsal_term::from_owned(owned, &mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?
         } else {
             crate::signals::atom("DOWN")
         };
-        let name = half.as_ref().and_then(|half| half.data.name.clone());
+        let name = info.and_then(|info| info.name.clone());
         let reference = crate::signals::reference(self, reference)?;
         let (from_type, from) = if let Some(object) = port_object {
             // Port of erts/emulator/beam/erl_proc_sig_queue.c:4838-5056
@@ -7464,7 +7532,7 @@ impl Process {
 fn down_message_on_sender(
     process: &mut Process,
     reference: u64,
-    data: &crate::proc_create::MonitorData,
+    data: &crate::proc_create::MonitorInfo,
     target: Pid,
     reason: Term,
 ) -> Result<Message, VmError> {
@@ -7857,6 +7925,15 @@ impl Task for Process {
                 Payload::Signal(Signal::Demonitor(reference)) => {
                     monitors.retain(|(id, _)| *id != reference);
                 }
+                Payload::Signal(Signal::DemonitorOrigin(shared)) => {
+                    if let Some(data) = shared
+                        .0
+                        .downcast_ref::<crate::proc_create::ProcessMonitorData>()
+                    {
+                        let reference = data.reference();
+                        monitors.retain(|(id, _)| *id != reference);
+                    }
+                }
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
                 // OTP-29.1.1: an exiting process still answers a queued literal-copy request.
                 Payload::Signal(Signal::LiteralAreaCopy(copy)) => {
@@ -8218,7 +8295,9 @@ impl Process {
                             .as_ref()
                             .and_then(|cold| cold.receive_markers.as_ref())
                             .map_or(0, |markers| markers.len()),
-                        self.cold.as_ref().map_or(0, |cold| cold.monitors.len()),
+                        self.cold
+                            .as_ref()
+                            .map_or(0, |cold| cold.monitors.iter().count()),
                         crate::PF_SPAWN_CONSTRUCTS.load(Ordering::Relaxed),
                         crate::PF_SPAWN_CONSTRUCT_NS.load(Ordering::Relaxed),
                         crate::signals::PF_SPAWN_FUN_LOAD_NS.load(Ordering::Relaxed),

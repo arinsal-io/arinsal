@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 type NodePtr = NonNull<MonLnkNode>;
 
 /// Monitor and link node types (`ERTS_MON_TYPE_*`, `ERTS_LNK_TYPE_*`).
+#[allow(dead_code)]
 pub(crate) mod node_type {
     pub(crate) const MONITOR_PROC: u32 = 0;
     pub(crate) const MONITOR_PORT: u32 = 1;
@@ -50,6 +51,7 @@ pub(crate) mod node_type {
 }
 
 /// Node flags (`ERTS_ML_*` in erl_monitor_link.h).
+#[allow(dead_code)]
 pub(crate) mod node_flag {
     const TYPE_BITS: u32 = 5;
     pub(crate) const TYPE_MASK: u32 = (1 << TYPE_BITS) - 1;
@@ -856,6 +858,10 @@ impl<I, O> MonitorList<I, O> {
 /// Both halves of one monitor in one allocation (`ErtsMonitorData`). `info` is shared by both
 /// halves and never changes; `origin_state` belongs to the origin half and is reached only
 /// through it.
+///
+/// The allocation is an `Arc` whose strong count is erts' `refc`: each held half owns one count,
+/// and so does a half in transit as a monitor or demonitor signal (`Arc<MonitorData>` coerced
+/// into the scheduler's `SharedPayload`, so the signal costs no allocation of its own).
 #[repr(C)]
 pub(crate) struct MonitorData<I, O> {
     /// The halves are written by the process that holds each of them while the other process
@@ -864,13 +870,24 @@ pub(crate) struct MonitorData<I, O> {
     target: UnsafeCell<MonLnkNode>,
     /// `ref`: the key of both halves.
     reference: u64,
-    /// `refc`: one for each half still held.
-    refc: AtomicU32,
+    /// Which halves have a [`Monitor`] handle ([`ORIGIN_HELD`], [`TARGET_HELD`]), so a half
+    /// in transit becomes a handle again at most once.
+    held: AtomicU32,
     /// The id of the list holding the target half, 0 when none.
     target_list: AtomicU64,
     info: I,
     origin_state: UnsafeCell<O>,
 }
+
+const ORIGIN_HELD: u32 = 1;
+const TARGET_HELD: u32 = 2;
+
+// SAFETY: each half's node and the origin state are only touched through the one handle that
+// holds that half (`held`), and the rest is atomics or the immutable `info`; so the data may be
+// shared between the two processes that hold its halves.
+unsafe impl<I: Send + Sync, O: Send> Sync for MonitorData<I, O> {}
+// SAFETY: as above; moving the data moves the `info` and origin state with it.
+unsafe impl<I: Send + Sync, O: Send> Send for MonitorData<I, O> {}
 
 impl<I, O> MonitorData<I, O> {
     /// The data of a monitor node, borrowed for as long as one of its halves is held.
@@ -882,8 +899,21 @@ impl<I, O> MonitorData<I, O> {
         unsafe { node_to_main(node).cast::<Self>().as_ref() }
     }
 
+    fn node_of(data: *const Self, target: bool) -> NodePtr {
+        // SAFETY: `data` points to a live `MonitorData`; this only forms a pointer to one of its
+        // fields, keeping the provenance of the whole allocation.
+        let node = unsafe {
+            if target {
+                std::ptr::addr_of!((*data).target)
+            } else {
+                std::ptr::addr_of!((*data).origin)
+            }
+        };
+        NonNull::new(node.cast_mut().cast()).expect("field pointer is not null")
+    }
+
     fn target_node(&self) -> NodePtr {
-        NonNull::new(self.target.get()).expect("field pointer is not null")
+        Self::node_of(self, true)
     }
 
     fn target_list(&self) -> u64 {
@@ -893,16 +923,34 @@ impl<I, O> MonitorData<I, O> {
     fn set_target_list(&self, id: u64) {
         self.target_list.store(id, AtomicOrdering::Relaxed);
     }
+
+    /// The reference of the monitor in transit.
+    pub(crate) fn reference(&self) -> u64 {
+        self.reference
+    }
+
+    /// Turn a half in transit back into its handle. `None` when that half already has one.
+    pub(crate) fn take_half(this: std::sync::Arc<Self>, target: bool) -> Option<Monitor<I, O>> {
+        let bit = if target { TARGET_HELD } else { ORIGIN_HELD };
+        if this.held.fetch_or(bit, AtomicOrdering::AcqRel) & bit != 0 {
+            return None;
+        }
+        let data = std::sync::Arc::into_raw(this);
+        Some(Monitor {
+            node: Self::node_of(data, target),
+            _data: PhantomData,
+        })
+    }
 }
 
 /// One half of a monitor, owned by the process that holds it (`ErtsMonitor`).
 pub(crate) struct Monitor<I, O> {
     node: NodePtr,
-    _data: PhantomData<MonitorData<I, O>>,
+    _data: PhantomData<std::sync::Arc<MonitorData<I, O>>>,
 }
 
-// SAFETY: a half is moved between processes only as a whole (the monitor and demonitor signals);
-// the data it shares with the other half is `info`, which must be `Sync`, and atomics.
+// SAFETY: a half is moved between processes only as a whole; the data it shares with the other
+// half is `Sync` (see `MonitorData`).
 unsafe impl<I: Send + Sync, O: Send> Send for Monitor<I, O> {}
 
 impl<I, O> NodeHandle for Monitor<I, O> {
@@ -939,7 +987,7 @@ impl<I, O> Monitor<I, O> {
         let key_offset = offset_of!(MonitorData<I, O>, reference);
         let origin_offset = offset_of!(MonitorData<I, O>, origin);
         let target_offset = offset_of!(MonitorData<I, O>, target);
-        let data = Box::new(MonitorData {
+        let data = std::sync::Arc::new(MonitorData {
             origin: UnsafeCell::new(MonLnkNode::new(
                 target,
                 origin_offset,
@@ -953,27 +1001,22 @@ impl<I, O> Monitor<I, O> {
                 kind | flags | node_flag::TARGET,
             )),
             reference,
-            refc: AtomicU32::new(2),
+            held: AtomicU32::new(ORIGIN_HELD | TARGET_HELD),
             target_list: AtomicU64::new(0),
             info,
             origin_state: UnsafeCell::new(origin_state),
         });
-        let data = Box::into_raw(data);
-        // SAFETY: `data` was just allocated and is valid; the node pointers keep the provenance
-        // of the whole allocation so a node can reach its key and its data.
-        let (origin, target) = unsafe {
-            (
-                NonNull::new_unchecked(std::ptr::addr_of_mut!((*data).origin).cast()),
-                NonNull::new_unchecked(std::ptr::addr_of_mut!((*data).target).cast()),
-            )
-        };
+        let data = std::sync::Arc::into_raw(data);
+        // SAFETY: `data` came from `Arc::into_raw` and the allocation is live; the second count
+        // is owned by the target half.
+        unsafe { std::sync::Arc::increment_strong_count(data) };
         (
             Self {
-                node: origin,
+                node: MonitorData::node_of(data, false),
                 _data: PhantomData,
             },
             Self {
-                node: target,
+                node: MonitorData::node_of(data, true),
                 _data: PhantomData,
             },
         )
@@ -993,24 +1036,49 @@ impl<I, O> Monitor<I, O> {
         }
     }
 
+    /// The origin state; `None` on a target half.
+    pub(crate) fn state(&self) -> Option<&O> {
+        let view: MonitorRef<'_, I, O> = MonitorRef {
+            node: self.node,
+            _monitor: PhantomData,
+        };
+        view.origin_state()
+    }
+
+    /// The origin state; `None` on a target half.
+    pub(crate) fn state_mut(&mut self) -> Option<&mut O> {
+        let view: MonitorMut<'_, I, O> = MonitorMut {
+            node: self.node,
+            _monitor: PhantomData,
+        };
+        view.origin_state()
+    }
+
     /// Whether `self` and `other` are the two halves of one monitor.
     pub(crate) fn is_other_half_of(&self, other: &Self) -> bool {
         self.node != other.node && node_to_main(self.node) == node_to_main(other.node)
+    }
+
+    /// Give the half up for transit as a signal; [`MonitorData::take_half`] turns it back.
+    pub(crate) fn into_shared(self) -> std::sync::Arc<MonitorData<I, O>> {
+        let target = self.view().is_target();
+        let main = node_to_main(self.node).cast::<MonitorData<I, O>>();
+        std::mem::forget(self);
+        // SAFETY: the handle owned one strong count of the `Arc` its data came from, which this
+        // takes over.
+        let data = unsafe { std::sync::Arc::from_raw(main.as_ptr().cast_const()) };
+        let bit = if target { TARGET_HELD } else { ORIGIN_HELD };
+        data.held.fetch_and(!bit, AtomicOrdering::AcqRel);
+        data
     }
 }
 
 impl<I, O> Drop for Monitor<I, O> {
     /// `erts_monitor_release`: the data is destroyed with the last half.
     fn drop(&mut self) {
-        let data = MonitorData::<I, O>::from_node(self.node);
-        if data.refc.fetch_sub(1, AtomicOrdering::Release) != 1 {
-            return;
-        }
-        std::sync::atomic::fence(AtomicOrdering::Acquire);
         let main = node_to_main(self.node).cast::<MonitorData<I, O>>();
-        // SAFETY: this was the last half, so nothing else reaches the data; it was allocated by
-        // `Box::new` in `Monitor::create`.
-        drop(unsafe { Box::from_raw(main.as_ptr()) });
+        // SAFETY: the handle owned one strong count of the `Arc` its data came from.
+        drop(unsafe { std::sync::Arc::from_raw(main.as_ptr().cast_const()) });
     }
 }
 
@@ -1117,6 +1185,16 @@ impl<I, O> MonLnkTree<Monitor<I, O>> {
             node,
             _monitor: PhantomData,
         })
+    }
+
+    /// The origin state of the origin half with `reference`; `None` when there is none or the
+    /// node with that key is a target half.
+    pub(crate) fn get_state(&self, reference: u64) -> Option<&O> {
+        self.get(reference)?.origin_state()
+    }
+
+    pub(crate) fn get_state_mut(&mut self, reference: u64) -> Option<&mut O> {
+        self.get_mut(reference)?.origin_state()
     }
 
     /// `erts_monitor_tree_foreach`.
@@ -1430,6 +1508,21 @@ mod tests {
         }
         assert!(origins.is_empty());
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn a_half_in_transit_becomes_a_handle_once() {
+        let (origin, target) = TestMonitor::create(node_type::MONITOR_PROC, 5, 1, 2, 0, 7, 0);
+        let shared = target.into_shared();
+        let copy = std::sync::Arc::clone(&shared);
+        let target = MonitorData::take_half(shared, true).expect("target half");
+        assert!(MonitorData::take_half(copy, true).is_none());
+        assert!(target.is_other_half_of(&origin));
+        let shared = origin.into_shared();
+        assert_eq!(shared.reference(), 5);
+        drop(target);
+        let origin = MonitorData::take_half(shared, false).expect("origin half");
+        assert_eq!(*origin.view().info(), 7);
     }
 
     #[test]

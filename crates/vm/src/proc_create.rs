@@ -890,11 +890,10 @@ impl ProcDict {
 /// returned value.
 pub(crate) type NativeReturnEvents = crate::trace::PoppedNativeFrames;
 
-/// The data of one local process monitor, shared by its origin and target halves (erts
-/// `ErtsMonitorData`, erl_monitor_link.h). It is immutable after creation, so both halves hold
-/// the same `Arc`; the pids live on the halves, as erts keeps `other.item` per half.
-#[derive(Debug)]
-pub(crate) struct MonitorData {
+/// What both halves of a monitor share and never change (the tag and name parts of erts
+/// `ErtsMonitorData` / `ErtsMonitorDataExtended`, erl_monitor_link.h).
+#[derive(Debug, Default)]
+pub(crate) struct MonitorInfo {
     /// DOWN tag, owned off-heap so a tuple tag such as `{'ON_LOAD_DOWN', Mod}` survives GC.
     /// `None` is the default `DOWN` tag and allocates nothing.
     pub(crate) tag: Option<arinsal_etf::OwnedTerm>,
@@ -902,13 +901,55 @@ pub(crate) struct MonitorData {
     pub(crate) name: Option<String>,
 }
 
-/// The data of a new local monitor with the default tag and no name. Each monitor gets its own
-/// object, shared by both halves and by the monitor signal (erts `erts_monitor_create`).
-pub(crate) fn default_monitor_data() -> std::sync::Arc<MonitorData> {
-    std::sync::Arc::new(MonitorData {
-        tag: None,
-        name: None,
-    })
+/// One half of a monitor this process holds: an origin entry in `ERTS_P_MONITORS` or a target
+/// entry in `ERTS_P_LT_MONITORS` (or, for a remote origin, in `ERTS_P_MONITORS`).
+pub(crate) type ProcessMonitor = crate::monitor_link::Monitor<MonitorInfo, OriginMonitor>;
+/// The allocation both halves of a monitor share (`ErtsMonitorData`).
+pub(crate) type ProcessMonitorData = crate::monitor_link::MonitorData<MonitorInfo, OriginMonitor>;
+/// `ERTS_P_MONITORS`: origin halves, and target halves of remote origins, keyed by reference.
+pub(crate) type MonitorTree = crate::monitor_link::MonLnkTree<ProcessMonitor>;
+/// `ERTS_P_LT_MONITORS`: target halves of local monitors.
+pub(crate) type TargetMonitorList = crate::monitor_link::MonitorList<MonitorInfo, OriginMonitor>;
+
+/// Both halves of a new monitor of `target` by `origin` (erts `erts_monitor_create`): the
+/// origin half's `other` is the target, the target half's the origin.
+pub(crate) fn create_monitor(
+    reference: u64,
+    origin: u64,
+    target: u64,
+    info: MonitorInfo,
+    state: OriginMonitor,
+) -> (ProcessMonitor, ProcessMonitor) {
+    let kind = state.kind();
+    crate::monitor_link::Monitor::create(kind, reference, origin, target, 0, info, state)
+}
+
+/// The monitor signal of a remote process monitoring local `target` (erts
+/// `ERTS_MON_TYPE_DIST_PROC`): the target half in transit, inserted into the target's monitor
+/// tree; the origin side of a remote monitor is kept by the distribution tables.
+pub(crate) fn remote_monitor_signal(
+    reference: u64,
+    watcher: arinsal_sched::Pid,
+    target: arinsal_sched::Pid,
+) -> arinsal_sched::Signal<crate::process::Message> {
+    let (_origin, target_half) = create_monitor(
+        reference,
+        watcher.data(),
+        target.data(),
+        MonitorInfo::default(),
+        OriginMonitor::Distributed { alias_mode: None },
+    );
+    arinsal_sched::Signal::Monitor {
+        reference,
+        shared: arinsal_sched::SharedPayload(target_half.into_shared()),
+    }
+}
+
+/// An origin entry whose target half no process holds: an alias, or a monitor of a port or a
+/// remote process, whose other end keeps its own record.
+pub(crate) fn origin_monitor(reference: u64, target: u64, state: OriginMonitor) -> ProcessMonitor {
+    let (origin, _target) = create_monitor(reference, 0, target, MonitorInfo::default(), state);
+    origin
 }
 
 /// Alias lifecycle stored in the origin monitor entry.
@@ -949,6 +990,18 @@ pub(crate) enum OriginMonitor {
 }
 
 impl OriginMonitor {
+    /// The erts monitor type of this entry (`ERTS_MON_TYPE_*`).
+    pub(crate) fn kind(&self) -> u32 {
+        use crate::monitor_link::node_type;
+        match self {
+            Self::Process(_) => node_type::MONITOR_PROC,
+            Self::Distributed { .. } => node_type::MONITOR_DIST_PROC,
+            Self::Port { .. } => node_type::MONITOR_PORT,
+            Self::DistPort { .. } => node_type::MONITOR_DIST_PORT,
+            Self::Alias { .. } => node_type::MONITOR_ALIAS,
+        }
+    }
+
     pub(crate) fn alias_mode(&self) -> Option<AliasMode> {
         match self {
             Self::Process(half) => half.alias_mode,
@@ -973,19 +1026,11 @@ pub(crate) struct ILink {
     pub(crate) prio: bool,
 }
 
-/// Origin half of a local monitor (erts `ERTS_P_MONITORS` entry): the monitored target.
+/// Origin state of a local process monitor; the target is the half's `other` and the shared
+/// data is its [`MonitorInfo`].
 #[derive(Clone, Debug)]
 pub(crate) struct OriginHalf {
-    pub(crate) target: arinsal_sched::Pid,
-    pub(crate) data: std::sync::Arc<MonitorData>,
     pub(crate) alias_mode: Option<AliasMode>,
-}
-
-/// Target half of a local monitor (erts `ERTS_P_LT_MONITORS` entry): the monitoring origin.
-#[derive(Clone, Debug)]
-pub(crate) struct TargetHalf {
-    pub(crate) origin: arinsal_sched::Pid,
-    pub(crate) data: std::sync::Arc<MonitorData>,
 }
 
 #[derive(Default)]
@@ -1161,8 +1206,9 @@ pub(crate) struct ProcessCold {
     pub(crate) receive_marker_uniq: i64,
     /// Link nodes keyed by the other end (erts `ERTS_P_LINKS`, a tree of `ErtsILink`).
     pub(crate) links: std::collections::BTreeMap<arinsal_sched::Pid, ILink>,
-    /// Origin entries keyed by reference (erts `ERTS_P_MONITORS`), including standalone aliases.
-    pub(crate) monitors: std::collections::BTreeMap<u64, OriginMonitor>,
+    /// Origin entries keyed by reference (erts `ERTS_P_MONITORS`), including standalone aliases,
+    /// and the target halves of monitors from remote processes.
+    pub(crate) monitors: MonitorTree,
     /// Remote-process monitors. `demonitor` of any other ref does not take the
     /// node-table lock: erts finds `ERTS_MON_TYPE_DIST_PROC` in this process's
     /// own monitor tree (`bif.c` `demonitor`), not in a global scan.
@@ -1171,7 +1217,7 @@ pub(crate) struct ProcessCold {
     /// every monitor kind, since the origin decides priority when it receives the DOWN.
     pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
     /// Target half of each local monitor on this process (erts `ERTS_P_LT_MONITORS`).
-    pub(crate) monitored_by: std::collections::BTreeMap<u64, TargetHalf>,
+    pub(crate) lt_monitors: TargetMonitorList,
     /// Target halves of NIF resource monitors (erts `ERTS_MON_TYPE_RESOURCE` in `ERTS_P_LT_MONITORS`).
     pub(crate) resource_monitors:
         std::collections::BTreeMap<u64, std::sync::Arc<arinsal_nif::ResourceMonitor>>,
