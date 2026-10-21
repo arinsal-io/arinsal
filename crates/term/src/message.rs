@@ -56,6 +56,78 @@ fn node_layout<T>(words: usize) -> (Layout, usize) {
     (layout.pad_to_align(), header_offset)
 }
 
+/// `fragment_words` of a node that lives in an [`EmbeddedSignal`] of another structure.
+const EMBEDDED: usize = usize::MAX;
+
+/// Storage for one signal node inside another structure: erts queues a monitor's own node as
+/// the monitor and demonitor signal (erl_proc_sig_queue.c, erts_proc_sig_send_monitor), so the
+/// signal costs no allocation of its own. `busy` is set while the node is out.
+#[repr(C)]
+pub struct EmbeddedSignal<T> {
+    node: std::cell::UnsafeCell<std::mem::MaybeUninit<SignalNode<T>>>,
+    busy: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: the node is only reached through the one `OwnedSignal` that `busy` lets out at a time.
+unsafe impl<T: Send> Sync for EmbeddedSignal<T> {}
+// SAFETY: as above; the storage holds a `T` only while the node is out.
+unsafe impl<T: Send> Send for EmbeddedSignal<T> {}
+
+impl<T> Default for EmbeddedSignal<T> {
+    fn default() -> Self {
+        Self {
+            node: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
+            busy: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl<T> EmbeddedSignal<T> {
+    /// The node holding `value`, in this storage. Gives `value` back while the node is out.
+    ///
+    /// # Safety
+    ///
+    /// The storage outlives the returned node: dropping the node, or its value, is the last
+    /// use of the storage by it (the value typically keeps the containing structure alive).
+    pub unsafe fn fill(&self, value: T) -> Result<OwnedSignal<T>, T> {
+        if self.busy.swap(true, std::sync::atomic::Ordering::Acquire) {
+            return Err(value);
+        }
+        let node = self.node.get().cast::<SignalNode<T>>();
+        // SAFETY: `busy` was clear, so no node is out of this storage and nothing reads it;
+        // `node` points to storage of a `SignalNode<T>`.
+        unsafe {
+            node.write(SignalNode {
+                next: None,
+                fragment_words: EMBEDDED,
+                value,
+            });
+        }
+        Ok(OwnedSignal {
+            node: NonNull::new(node).expect("field pointer is not null"),
+            _value: PhantomData,
+        })
+    }
+}
+
+/// Take the value out of an embedded node and let its storage be filled again.
+///
+/// # Safety
+///
+/// `node` is a node of an [`EmbeddedSignal`] that the caller owns; it is not used afterwards.
+unsafe fn take_embedded<T>(node: NonNull<SignalNode<T>>) -> T {
+    // SAFETY: the caller owns the node; the value is read once, then `busy` (right after the
+    // node in the `#[repr(C)]` storage) is cleared, which ends the use of the storage.
+    unsafe {
+        let value = std::ptr::addr_of!((*node.as_ptr()).value).read();
+        let storage = node.as_ptr().cast::<EmbeddedSignal<T>>();
+        (*storage)
+            .busy
+            .store(false, std::sync::atomic::Ordering::Release);
+        value
+    }
+}
+
 /// The words of a fragment start right after its header.
 fn fragment_words_ptr(header: NonNull<HeapFragment>) -> *mut u64 {
     header
@@ -122,7 +194,7 @@ impl<T> OwnedSignal<T> {
         // SAFETY: the handle owns the node; the header sits where `node_layout` put it.
         unsafe {
             let words = (*self.node.as_ptr()).fragment_words;
-            if words == 0 {
+            if words == 0 || words == EMBEDDED {
                 return None;
             }
             let (_, offset) = node_layout::<T>(words);
@@ -173,8 +245,12 @@ impl<T> OwnedSignal<T> {
         let header = self.header();
         let node = self.into_raw();
         // SAFETY: the handle owned the node; the value is read out exactly once, and the memory
-        // either moves to the returned fragment or is released here.
+        // either moves to the returned fragment, goes back to its embedding storage, or is
+        // released here.
         unsafe {
+            if (*node.as_ptr()).fragment_words == EMBEDDED {
+                return (take_embedded(node), None);
+            }
             let value = std::ptr::addr_of!((*node.as_ptr()).value).read();
             let words = (*node.as_ptr()).fragment_words;
             let (layout, _) = node_layout::<T>(words);
@@ -242,8 +318,12 @@ impl<T> Drop for OwnedSignal<T> {
     fn drop(&mut self) {
         let header = self.header();
         // SAFETY: the handle owns the node; the value is dropped once, and the memory is
-        // released by the fragment or here.
+        // released by the fragment or here, or goes back to its embedding storage.
         unsafe {
+            if (*self.node.as_ptr()).fragment_words == EMBEDDED {
+                drop(take_embedded(self.node));
+                return;
+            }
             std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.node.as_ptr()).value));
             let words = (*self.node.as_ptr()).fragment_words;
             let (layout, _) = node_layout::<T>(words);
@@ -545,6 +625,22 @@ mod tests {
         assert_eq!(*empty, vec![1, 2, 3]);
         assert!(empty.fragment_words().is_none());
         assert_eq!(empty.into_value(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn an_embedded_node_is_lent_out_once_at_a_time() {
+        let storage = EmbeddedSignal::<String>::default();
+        // SAFETY: `storage` outlives every node taken from it in this test.
+        let node = unsafe { storage.fill(String::from("one")) }.expect("free storage");
+        // SAFETY: as above.
+        assert!(unsafe { storage.fill(String::from("two")) }.is_err());
+        assert_eq!(node.into_value(), "one");
+        // SAFETY: as above.
+        let node = unsafe { storage.fill(String::from("three")) }.expect("free again");
+        assert_eq!(node.as_str(), "three");
+        drop(node);
+        // SAFETY: as above.
+        assert!(unsafe { storage.fill(String::new()) }.is_ok_and(|node| node.is_empty()));
     }
 
     #[test]

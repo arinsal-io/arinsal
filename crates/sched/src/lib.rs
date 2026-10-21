@@ -522,6 +522,26 @@ pub trait SignalMessage: Send + 'static {
     fn timer_ref_key(&self) -> Option<u64> {
         None
     }
+    /// The queue node of a non-message signal sent by `from`. A signal may live in storage of
+    /// its own, as erts queues a monitor's own node as the monitor signal
+    /// (erl_proc_sig_queue.c, erts_proc_sig_send_monitor); the default allocates a node.
+    fn signal_node(from: Pid, signal: Signal<Self>) -> OwnedSignal<Event<Self>>
+    where
+        Self: Sized,
+    {
+        OwnedSignal::new(Event {
+            from,
+            payload: Payload::Signal(signal),
+        })
+    }
+}
+
+/// The queue node of `payload` sent by `from` (`erts_alloc_message` for a message).
+fn event_node<M: SignalMessage>(from: Pid, payload: Payload<M>) -> OwnedSignal<Event<M>> {
+    match payload {
+        Payload::Signal(signal) => M::signal_node(from, signal),
+        payload => OwnedSignal::new(Event { from, payload }),
+    }
 }
 
 impl SignalMessage for () {}
@@ -3204,7 +3224,7 @@ impl<T: Task> Inner<T> {
         payload: Payload<T::Message>,
         local: Option<&mut Local<T>>,
     ) -> Result<(), Error> {
-        self.deliver_node(to, OwnedSignal::new(Event { from, payload }), local)
+        self.deliver_node(to, event_node(from, payload), local)
     }
 
     /// [`Self::deliver`] of a signal node the sender allocated.
@@ -3226,7 +3246,7 @@ impl<T: Task> Inner<T> {
         payload: Payload<T::Message>,
         local: Option<&mut Local<T>>,
     ) -> Result<(), Error> {
-        self.deliver_live_node(process, OwnedSignal::new(Event { from, payload }), local)
+        self.deliver_live_node(process, event_node(from, payload), local)
     }
 
     fn deliver_live_node(
@@ -3262,7 +3282,7 @@ impl<T: Task> Inner<T> {
     ) -> Result<u32, Error> {
         self.deliver_process_node(
             process,
-            OwnedSignal::new(Event { from, payload }),
+            event_node(from, payload),
             local,
             wake,
             force_enqueue,
@@ -4331,7 +4351,7 @@ pub struct RunCtx<'a, M: SignalMessage> {
 trait ContextOps<M: SignalMessage> {
     fn process_priority(&self, pid: Pid) -> Option<Priority>;
     fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<M>) -> Result<(), Error> {
-        self.deliver_node(to, OwnedSignal::new(Event { from, payload }))
+        self.deliver_node(to, event_node(from, payload))
     }
     fn deliver_node(&mut self, to: Pid, signal: OwnedSignal<Event<M>>) -> Result<(), Error>;
     fn flush(&mut self);
@@ -5264,13 +5284,13 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         // Erts sends the held monitor first when the next signal goes to its target
         // (erl_proc_sig_queue.c:1141-1150); a signal to another target leaves it held.
         let deferred = take_held_monitor_for(to).map(|held| {
-            OwnedSignal::new(Event {
-                from: held.from,
-                payload: Payload::Signal(Signal::Monitor {
+            T::Message::signal_node(
+                held.from,
+                Signal::Monitor {
                     reference: held.id,
                     shared: held.shared,
-                }),
-            })
+                },
+            )
         });
         // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1: no
         // reference count is taken on the receiver.

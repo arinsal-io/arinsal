@@ -7939,6 +7939,51 @@ impl arinsal_sched::SignalMessage for Message {
     fn timer_ref_key(&self) -> Option<u64> {
         self.timer_id()
     }
+
+    /// The monitor and demonitor signals are the monitor halves' own nodes, in the data both
+    /// halves share (erl_proc_sig_queue.c, erts_proc_sig_send_monitor and
+    /// erts_proc_sig_send_demonitor queue the `ErtsMonitor` itself), so they allocate nothing.
+    fn signal_node(
+        from: Pid,
+        signal: arinsal_sched::Signal<Self>,
+    ) -> arinsal_sched::OwnedSignal<Event<Self>> {
+        let allocated = |signal| {
+            arinsal_sched::OwnedSignal::new(Event {
+                from,
+                payload: Payload::Signal(signal),
+            })
+        };
+        let (target, shared, reference) = match signal {
+            arinsal_sched::Signal::Monitor { reference, shared } => (true, shared, Some(reference)),
+            arinsal_sched::Signal::DemonitorOrigin(shared) => (false, shared, None),
+            signal => return allocated(signal),
+        };
+        let data = match shared
+            .0
+            .downcast::<crate::proc_create::ProcessMonitorData>()
+        {
+            Ok(data) => data,
+            Err(other) => {
+                let shared = arinsal_sched::SharedPayload(other);
+                return allocated(match reference {
+                    Some(reference) => arinsal_sched::Signal::Monitor { reference, shared },
+                    None => arinsal_sched::Signal::DemonitorOrigin(shared),
+                });
+            }
+        };
+        let build = |data: Arc<crate::proc_create::ProcessMonitorData>| {
+            let shared = arinsal_sched::SharedPayload(data);
+            Event {
+                from,
+                payload: Payload::Signal(match reference {
+                    Some(reference) => arinsal_sched::Signal::Monitor { reference, shared },
+                    None => arinsal_sched::Signal::DemonitorOrigin(shared),
+                }),
+            }
+        };
+        crate::proc_create::ProcessMonitorData::embedded_signal(data, target, build)
+            .unwrap_or_else(arinsal_sched::OwnedSignal::new)
+    }
 }
 
 impl Message {
@@ -9181,11 +9226,12 @@ mod layout_tests {
         assert_eq!(std::mem::size_of::<arinsal_sched::Signal<Message>>(), 56);
         assert_eq!(std::mem::size_of::<arinsal_sched::Payload<Message>>(), 56);
         assert_eq!(std::mem::size_of::<arinsal_sched::Event<Message>>(), 64);
-        // Both halves of a monitor in one allocation, as small as erts' `ErtsMonitorDataHeap`:
-        // the rare tag and name are boxed separately.
+        // Both halves of a monitor in one allocation with the nodes they are sent in (erts
+        // `ErtsMonitorDataHeap`, whose signal header shares the halves' container links); the
+        // rare tag and name are boxed separately.
         assert_eq!(
             std::mem::size_of::<crate::proc_create::ProcessMonitorData>(),
-            144
+            320
         );
     }
 }
