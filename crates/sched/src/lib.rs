@@ -61,6 +61,7 @@
 mod balance;
 mod mailbox;
 mod ports;
+mod proc_ref;
 mod thr_progress;
 mod timer;
 
@@ -70,15 +71,15 @@ pub use timer::TimerRef;
 
 use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
 use crossbeam_deque::{Steal, Stealer, Worker};
-use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use crossbeam_queue::SegQueue;
+use proc_ref::{ErasedProcRef, ProcRef};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -906,7 +907,7 @@ impl Clock for VirtualClock {
 /// process table lookup.
 pub struct SpawnedProcess<M> {
     pid: Pid,
-    process: Arc<dyn Any + Send + Sync>,
+    process: ErasedProcRef,
     _message: std::marker::PhantomData<fn() -> M>,
 }
 
@@ -1150,29 +1151,37 @@ struct ProcessTable<T: Task> {
     /// stepped only when a later interval is needed.
     interval: AtomicU64,
     /// `ptab->r.o.tab`: one slot per table index, allocated with the table as
-    /// erts_ptab_init_table does.
-    slots: Box<[Atomic<Arc<Process<T>>>]>,
+    /// erts_ptab_init_table does. A slot holds the table's reference to its process.
+    slots: Box<[AtomicPtr<()>]>,
+    /// The thread progress that releases the table's references (erts_ptab_delete_element
+    /// schedules the release as a later operation).
+    progress: Arc<thr_progress::ThrProgress>,
+    _process: std::marker::PhantomData<ProcRef<T>>,
 }
 
 impl<T: Task> ProcessTable<T> {
-    fn new(capacity: u32) -> Self {
+    fn new(capacity: u32, progress: Arc<thr_progress::ThrProgress>) -> Self {
         let ids = PtabIdRing::new(capacity);
-        let slots = (0..ids.layout().max()).map(|_| Atomic::null()).collect();
+        let slots = (0..ids.layout().max())
+            .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+            .collect();
         Self {
             ids,
             lock: arinsal_term::FrequentReadRwLock::new(()),
             interval: AtomicU64::new(0),
             slots,
+            progress,
+            _process: std::marker::PhantomData,
         }
     }
 
-    fn slot(&self, pix: u32) -> Option<&Atomic<Arc<Process<T>>>> {
+    fn slot(&self, pix: u32) -> Option<&AtomicPtr<()>> {
         self.slots.get(pix as usize)
     }
 
     fn slot_occupied(&self, pix: u32) -> bool {
         self.slot(pix)
-            .is_some_and(|slot| !slot.load(Ordering::Acquire, &epoch::pin()).is_null())
+            .is_some_and(|slot| !slot.load(Ordering::Acquire).is_null())
     }
 
     /// Table index of a pid, the order `erlang:processes/0` reports.
@@ -1185,13 +1194,13 @@ impl<T: Task> ProcessTable<T> {
         task: T,
         priority: Priority,
         bound_worker: Option<usize>,
-    ) -> Result<Arc<Process<T>>, Error> {
+    ) -> Result<ProcRef<T>, Error> {
         // Port of erts/emulator/beam/erl_ptab.c:500 (erts_ptab_new_element), OTP-29.1.1.
         let _shared = self.lock.read();
         let data = self.ids.reserve().ok_or(Error::Capacity)?;
         let pid = Pid::from_data(data);
         let pix = self.ids.layout().data2pix(data) as usize;
-        let process = Arc::new(Process {
+        let process = ProcRef::new(Process {
             pid,
             // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
             // erts_current_interval_nob), OTP-29.1.1.
@@ -1219,37 +1228,43 @@ impl<T: Task> ProcessTable<T> {
             queued_prio: AtomicU8::new(0),
             cell: parking_lot::Mutex::new(TaskCell { task }),
         });
-        // Publication needs only the release store. Flushing the epoch bag on
-        // every spawn forced a global reclamation check in the hot path.
-        self.slots[pix].store(Owned::new(process.clone()), Ordering::Release);
+        // The table's reference (erts `refc` 1 at erts_ptab_new_element).
+        self.slots[pix].store(process.clone().into_raw(), Ordering::Release);
         Ok(process)
     }
 
-    /// Run `f` on the process in slot `pix` while the epoch guard keeps it alive.
-    fn with_slot<R>(&self, pix: u32, f: impl FnOnce(&Arc<Process<T>>) -> R) -> Option<R> {
+    /// Run `f` on the process in slot `pix`. Thread progress keeps it alive: a managed thread
+    /// passes no progress point meanwhile, and another thread delays progress.
+    ///
+    /// Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw and the
+    /// erts_thr_progress_unmanaged_delay of erts_proc_lookup_inc_refc), OTP-29.1.1.
+    fn with_slot<R>(&self, pix: u32, f: impl FnOnce(&ProcRef<T>) -> R) -> Option<R> {
         let slot = self.slot(pix)?;
-        let guard = &epoch::pin();
-        let ptr = slot.load(Ordering::Acquire, guard);
-        if ptr.is_null() {
-            return None;
-        }
-        // SAFETY: the epoch guard keeps the stored Arc alive while `f` runs.
-        Some(f(unsafe { ptr.deref() }))
+        let delay = thr_progress::unmanaged_delay(&self.progress);
+        let raw = slot.load(Ordering::Acquire);
+        let result = (!raw.is_null()).then(|| {
+            let _lookup = thr_progress::LookupScope::enter();
+            // SAFETY: `raw` was in the slot while this thread delays thread progress, and the
+            // slot's reference is released only by a later operation after thread progress.
+            unsafe { ProcRef::with_borrowed(raw, f) }
+        });
+        thr_progress::unmanaged_continue(&self.progress, delay);
+        result
     }
 
-    fn load_slot(&self, pix: u32) -> Option<Arc<Process<T>>> {
-        self.with_slot(pix, Arc::clone)
+    fn load_slot(&self, pix: u32) -> Option<ProcRef<T>> {
+        self.with_slot(pix, ProcRef::clone)
     }
 
-    fn lookup(&self, pid: Pid) -> Option<Arc<Process<T>>> {
+    fn lookup(&self, pid: Pid) -> Option<ProcRef<T>> {
         self.load_slot(self.index(pid))
             .filter(|process| process.pid == pid)
     }
 
     /// Run `f` on a live process without touching its reference count.
     // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1: thread
-    // progress (here the epoch guard) keeps the process struct alive during the lookup.
-    fn with_live<R>(&self, pid: Pid, f: impl FnOnce(&Arc<Process<T>>) -> R) -> Option<R> {
+    // progress keeps the process struct alive during the lookup.
+    fn with_live<R>(&self, pid: Pid, f: impl FnOnce(&ProcRef<T>) -> R) -> Option<R> {
         self.with_slot(self.index(pid), |process| {
             (process.pid == pid).then(|| f(process))
         })
@@ -1259,15 +1274,15 @@ impl<T: Task> ProcessTable<T> {
     fn remove(&self, pid: Pid) {
         // Port of erts/emulator/beam/erl_ptab.c:675 (erts_ptab_delete_element), OTP-29.1.1.
         let _shared = self.lock.read();
-        let guard = &epoch::pin();
         let slot = self.slot(self.index(pid)).expect("a live pid has a slot");
-        let old = slot.swap(epoch::Shared::null(), Ordering::AcqRel, guard);
+        let old = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if old.is_null() {
             return;
         }
-        // SAFETY: the old pointer is detached; epochs protect concurrent lookups.
-        unsafe { guard.defer_destroy(old) };
         self.ids.release(pid.data());
+        // erts_schedule_thr_prgr_later_cleanup_op(release_process, ...): a lookup that loaded
+        // the slot before it was cleared may still use the process.
+        thr_progress::schedule_later_op(&self.progress, ProcRef::<T>::release_later(old));
     }
 
     /// Detach every process at VM shutdown so the references they hold to shared runtime
@@ -1290,14 +1305,12 @@ impl<T: Task> ProcessTable<T> {
             }
             next = after;
         }
-        epoch::pin().flush();
     }
 
     fn live_count(&self) -> usize {
-        let guard = &epoch::pin();
         self.slots
             .iter()
-            .filter(|slot| !slot.load(Ordering::Acquire, guard).is_null())
+            .filter(|slot| !slot.load(Ordering::Acquire).is_null())
             .count()
     }
 
@@ -1335,7 +1348,7 @@ impl<T: Task> ProcessTable<T> {
 }
 
 struct Scheduled<T: Task> {
-    process: Arc<Process<T>>,
+    process: ProcRef<T>,
     /// `run_epoch` of the process when this entry was queued.
     epoch: u64,
     /// Port of erts/emulator/beam/erl_process.h (`Process.schedule_count`), OTP-29.1.1:
@@ -1344,7 +1357,7 @@ struct Scheduled<T: Task> {
 }
 
 impl<T: Task> Scheduled<T> {
-    fn new(process: Arc<Process<T>>) -> Self {
+    fn new(process: ProcRef<T>) -> Self {
         let epoch = process.run_epoch.load(Ordering::Acquire);
         // Port of erts/emulator/beam/erl_process.c:3957 (enqueue_process), OTP-29.1.1.
         let schedule_count = if process.priority() == Priority::Low {
@@ -1587,13 +1600,13 @@ struct DirtyQueue<T: Task> {
     /// Port of erts/emulator/beam/erl_process.c (`ErtsRunQueue.sleepers`), OTP-29.1.1.
     sleepers: VecDeque<usize>,
     /// Queued processes with their `schedule_count`; low priority shares the normal queue.
-    by_priority: [VecDeque<(Arc<Process<T>>, u8)>; 4],
+    by_priority: [VecDeque<(ProcRef<T>, u8)>; 4],
     len: usize,
 }
 
 impl<T: Task> DirtyQueue<T> {
     /// Port of erts/emulator/beam/erl_process.c:3951 (enqueue_process), OTP-29.1.1.
-    fn push(&mut self, process: Arc<Process<T>>) {
+    fn push(&mut self, process: ProcRef<T>) {
         let priority = process.priority().index();
         let schedule_count = if priority == balance::PRIORITY_LOW {
             balance::RESCHEDULE_LOW
@@ -1606,7 +1619,7 @@ impl<T: Task> DirtyQueue<T> {
 
     /// Port of erts/emulator/beam/erl_process.c:4040 (check_requeue_process) and
     /// erl_process.c:9988-10020 (pick_next_process), OTP-29.1.1.
-    fn pop(&mut self) -> Option<Arc<Process<T>>> {
+    fn pop(&mut self) -> Option<ProcRef<T>> {
         let queue = self
             .by_priority
             .iter_mut()
@@ -1826,7 +1839,7 @@ impl<T: Task> Inner<T> {
 
     // Port of erts/emulator/beam/erl_process.c:6403 (schedule_dirty / enqueue on the
     // dirty run queue), OTP-29.1.1.
-    fn enqueue_dirty(&self, process: Arc<Process<T>>, kind: DirtyKind) {
+    fn enqueue_dirty(&self, process: ProcRef<T>, kind: DirtyKind) {
         process
             .dirty
             .store(kind.index() as u8 + 1, Ordering::Release);
@@ -3123,7 +3136,7 @@ impl<T: Task> Inner<T> {
 
     fn deliver_live(
         &self,
-        process: &Arc<Process<T>>,
+        process: &ProcRef<T>,
         from: Pid,
         payload: Payload<T::Message>,
         local: Option<&mut Local<T>>,
@@ -3146,7 +3159,7 @@ impl<T: Task> Inner<T> {
     #[allow(clippy::too_many_arguments)] // `force_enqueue` routes literal-copy signals like erts.
     fn deliver_process(
         &self,
-        process: &Arc<Process<T>>,
+        process: &ProcRef<T>,
         from: Pid,
         payload: Payload<T::Message>,
         local: Option<&mut Local<T>>,
@@ -3171,7 +3184,7 @@ impl<T: Task> Inner<T> {
 
     fn deliver_block(
         &self,
-        process: &Arc<Process<T>>,
+        process: &ProcRef<T>,
         events: &mut Vec<Event<T::Message>>,
         local: Option<&mut Local<T>>,
         wake: bool,
@@ -3202,7 +3215,7 @@ impl<T: Task> Inner<T> {
 
     fn wake_after_publish(
         &self,
-        process: &Arc<Process<T>>,
+        process: &ProcRef<T>,
         local: Option<&mut Local<T>>,
         force_enqueue: bool,
         state: Option<u32>,
@@ -3867,7 +3880,7 @@ impl<T: Task> Inner<T> {
 }
 
 struct PendingWait<T: Task> {
-    process: Arc<Process<T>>,
+    process: ProcRef<T>,
     epoch: u64,
     deadline_ms: u64,
 }
@@ -4031,7 +4044,7 @@ impl<T: Task> Local<T> {
         process.scheduler_id.store(target, Ordering::Relaxed);
     }
 
-    fn lookup(&mut self, table: &ProcessTable<T>, pid: Pid) -> Option<Arc<Process<T>>> {
+    fn lookup(&mut self, table: &ProcessTable<T>, pid: Pid) -> Option<ProcRef<T>> {
         // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_lookup / pix to slot).
         // A side cache of Arcs kept exited processes alive until a later spawn
         // reused the slot, so delete_process ran on the spawner.
@@ -4677,7 +4690,8 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     // Port of erts/emulator/beam/erl_process.c:2351 (erts_schedule_thr_prgr_later_op) as
     // used by code_ix.c:556 (erts_schedule_code_barrier), OTP-29.1.1.
     pub fn thread_progress_later(&mut self, op: impl FnOnce() + Send + 'static) {
-        self.inner.thread_progress_later(Box::new(op));
+        self.inner
+            .thread_progress_later(LaterOp::Boxed(Box::new(op)));
     }
     /// Port of erts/emulator/beam/erl_bif_info.c:5079-5091, OTP-29.1.1.
     /// Pause other running tasks until the callback returns.
@@ -4770,7 +4784,7 @@ impl<T: Task> Runner<'_, T> {
     /// Publish an unscheduled child on a run queue.
     // Port of erts/emulator/beam/erl_process.c:12525 (erl_create_process), OTP-29.1.1: the
     // child joins its parent's run queue.
-    fn schedule_process(&mut self, process: Arc<Process<T>>) -> Result<(), Error> {
+    fn schedule_process(&mut self, process: ProcRef<T>) -> Result<(), Error> {
         process
             .run_state()
             .compare_exchange(UNSCHEDULED, QUEUED, Ordering::AcqRel, Ordering::Acquire)
@@ -4790,7 +4804,7 @@ impl<T: Task> Runner<'_, T> {
         Ok(())
     }
 
-    fn lookup(&mut self, pid: Pid) -> Option<Arc<Process<T>>> {
+    fn lookup(&mut self, pid: Pid) -> Option<ProcRef<T>> {
         if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut() {
             local.lookup(&self.inner.table, pid)
         } else {
@@ -5091,10 +5105,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         self.schedule_process(process)
     }
     fn schedule_spawned(&mut self, spawned: SpawnedProcess<T::Message>) -> Result<(), Error> {
-        let process = spawned
-            .process
-            .downcast::<Process<T>>()
-            .map_err(|_| Error::NoProcess)?;
+        let process = spawned.process.downcast::<T>().ok_or(Error::NoProcess)?;
         self.schedule_process(process)
     }
     fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<T::Message>) -> Result<(), Error> {
@@ -5456,7 +5467,7 @@ impl<T: Task> Scheduler<T> {
             });
         }
         let inner = Arc::new(Inner {
-            table: ProcessTable::new(config.max_processes),
+            table: ProcessTable::new(config.max_processes, Arc::clone(&progress)),
             config,
             run_queues: (0..workers)
                 .map(|_| std::array::from_fn(|_| SegQueue::new()))
@@ -5623,7 +5634,7 @@ impl<T: Task> Scheduler<T> {
         process.run_state().store(UNSCHEDULED, Ordering::Release);
         Ok(SpawnedProcess {
             pid: process.pid,
-            process,
+            process: process.erase(),
             _message: std::marker::PhantomData,
         })
     }
@@ -5658,7 +5669,7 @@ impl<T: Task> Scheduler<T> {
         process.run_state().store(UNSCHEDULED, Ordering::Release);
         Ok(SpawnedProcess {
             pid: process.pid,
-            process,
+            process: process.erase(),
             _message: std::marker::PhantomData,
         })
     }
@@ -6578,7 +6589,10 @@ mod msgq_stage_microbench {
     #[ignore = "manual message queue stage benchmark"]
     fn stages() {
         const N: usize = 200_000;
-        let table = ProcessTable::<Idle>::new(1);
+        let table = ProcessTable::<Idle>::new(
+            1,
+            Arc::new(thr_progress::ThrProgress::new(Arc::from([]), Arc::from([]))),
+        );
         let process = table.insert(Idle, Priority::Normal, None).unwrap();
         let pid = process.pid;
         let started = Instant::now();
@@ -7012,9 +7026,15 @@ impl<T: Task> Drop for Scheduler<T> {
             let inner = Arc::clone(&self.inner);
             let _ = std::thread::Builder::new()
                 .name("sched-shutdown".into())
-                .spawn(move || inner.table.scheduler_shutdown());
+                .spawn(move || {
+                    inner.table.scheduler_shutdown();
+                    thr_progress::run_remaining_later_ops(&inner.progress);
+                });
         } else {
             self.inner.table.scheduler_shutdown();
+            // No managed thread runs any more: release what the table and the stopped
+            // threads left for thread progress.
+            thr_progress::run_remaining_later_ops(&self.inner.progress);
         }
     }
 }
@@ -8435,7 +8455,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
 
 fn profile_scheduler_transition<T: Task>(
     inner: &Inner<T>,
-    process: &Arc<Process<T>>,
+    process: &ProcRef<T>,
     scheduler_id: usize,
     active: bool,
     active_schedulers: usize,
