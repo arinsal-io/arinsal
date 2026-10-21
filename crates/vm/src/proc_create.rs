@@ -406,7 +406,6 @@ pub struct Process {
     /// Signals taken from the front of `sig_cont` so far; receive markers inserted into the
     /// middle queue are positioned by it.
     pub(crate) sig_cont_taken: u64,
-    pub(crate) receive_cursor: usize,
     pub(crate) receive_deadline: Option<std::time::Instant>,
     pub(crate) receive_deadline_ms: Option<u64>,
     /// `F_TIMO` for `wait_timeout infinity`: the wait is initialised, so a wakeup must not
@@ -1848,7 +1847,6 @@ impl Process {
             inbox: process::MessageQueue::default(),
             sig_cont: arinsal_sched::SignalQueue::default(),
             sig_cont_taken: 0,
-            receive_cursor: 0,
             receive_deadline: None,
             receive_deadline_ms: None,
             receive_infinity: false,

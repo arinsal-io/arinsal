@@ -150,6 +150,11 @@ pub(crate) struct RootSlot {
 #[derive(Default)]
 pub(crate) struct MessageQueue {
     entries: arinsal_sched::MessageQueueList<Event<Message>>,
+    /// The save position (`sig_qs.save`): the next message a receive looks at.
+    save: usize,
+    /// The address of the term of the message at `save`, 0 when there is none: BeamAsm's
+    /// `loop_rec` reads it without a call, as erts' `emit_i_loop_rec_shared` loads `*save`.
+    save_term: usize,
 }
 
 /// A message in the message queue: the signal node it arrived in, relinked from the middle
@@ -211,8 +216,37 @@ impl QueuedMessage {
 }
 
 impl MessageQueue {
+    /// Byte offset of the save term address, for generated code.
+    pub(crate) const SAVE_TERM_OFFSET: usize = std::mem::offset_of!(MessageQueue, save_term);
+
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The save position (`sig_qs.save`).
+    pub(crate) fn save(&self) -> usize {
+        self.save
+    }
+
+    /// Move the save position (`erts_msgq_set_save_*`).
+    pub(crate) fn set_save(&mut self, save: usize) {
+        self.save = save;
+        self.refresh_save_term();
+    }
+
+    fn refresh_save_term(&mut self) {
+        self.save_term = self
+            .entries
+            .get(self.save)
+            .map_or(0, |entry| std::ptr::addr_of!(queued(entry).term) as usize);
+    }
+
+    /// After a node was linked or unlinked at `index`: the message at the save position may
+    /// have changed.
+    fn structure_changed_at(&mut self, index: usize) {
+        if index <= self.save {
+            self.refresh_save_term();
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -223,6 +257,7 @@ impl MessageQueue {
     pub(crate) fn push_back(&mut self, term: Term) {
         self.entries
             .push_back(QueuedMessage::node(term, None, false));
+        self.structure_changed_at(self.entries.len() - 1);
     }
 
     /// Append a message that carries a seq_trace token.
@@ -235,12 +270,14 @@ impl MessageQueue {
             })),
             false,
         ));
+        self.structure_changed_at(self.entries.len() - 1);
     }
 
     /// Append a message from a process without a token (`ERL_MESSAGE_TOKEN == NIL`).
     pub(crate) fn push_back_nil(&mut self, term: Term) {
         self.entries
             .push_back(QueuedMessage::node(term, None, true));
+        self.structure_changed_at(self.entries.len() - 1);
     }
 
     /// Insert after the last accepted priority message.
@@ -248,6 +285,7 @@ impl MessageQueue {
     pub(crate) fn push_priority(&mut self, term: Term, prio_len: usize) -> usize {
         self.entries
             .insert(prio_len, QueuedMessage::node(term, None, false));
+        self.structure_changed_at(prio_len);
         prio_len + 1
     }
 
@@ -257,9 +295,11 @@ impl MessageQueue {
     pub(crate) fn push_message_node(&mut self, node: MessageNode, prio_len: usize) -> usize {
         if queued(&node).priority {
             self.entries.insert(prio_len, node);
+            self.structure_changed_at(prio_len);
             prio_len + 1
         } else {
             self.entries.push_back(node);
+            self.structure_changed_at(self.entries.len() - 1);
             prio_len
         }
     }
@@ -379,6 +419,7 @@ impl MessageQueue {
         if let Some(node) = self.entries.pop_front() {
             QueuedMessage(node).save_in_process(heap);
         }
+        self.structure_changed_at(0);
         Ok(true)
     }
 
@@ -409,6 +450,7 @@ impl MessageQueue {
             QueuedMessage(node).save_in_process(heap);
             (term, state)
         });
+        self.structure_changed_at(index);
         let prio_len = prio_len - usize::from(removed.is_some() && index < prio_len);
         Ok((removed, prio_len))
     }
@@ -493,6 +535,7 @@ impl MessageQueue {
         let node = self.entries.remove(index)?;
         let (node, fragment) = QueuedMessage(node).detach_inline();
         self.entries.insert(index, node);
+        self.structure_changed_at(index);
         fragment
     }
 
@@ -3958,7 +4001,7 @@ impl Executor {
         let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
         process.module = module_id;
         process.ip = entry;
-        process.receive_cursor = 0;
+        process.inbox.set_save(0);
         process.receive_deadline = None;
         process.receive_deadline_ms = None;
         process.receive_infinity = false;
@@ -6267,7 +6310,7 @@ impl Process {
         }
         // The save pointer is in the message queue at a message (receive markers are not
         // queue entries here).
-        if self.receive_cursor < msgq_len {
+        if self.inbox.save() < msgq_len {
             return false;
         }
         *limit = (*limit + SIG_REDS_CNT_FACTOR * 100).min(abs_lim);
@@ -6294,7 +6337,7 @@ impl Process {
                 left_reds -= 4;
                 self.fetch_signals(ctx)?;
                 // Messages may have been moved directly to the message queue.
-                if self.inbox.get(self.receive_cursor).is_some() {
+                if self.inbox.get(self.inbox.save()).is_some() {
                     return Ok((consumed_reds, ReceiveHelper::Message));
                 }
                 if self.sig_cont_empty() {
@@ -6310,7 +6353,7 @@ impl Process {
             self.handle_incoming(ctx, &mut reds, max_reds, true)?;
             consumed_reds += reds;
             left_reds -= reds;
-            if self.inbox.get(self.receive_cursor).is_some() {
+            if self.inbox.get(self.inbox.save()).is_some() {
                 return Ok((consumed_reds, ReceiveHelper::Message));
             }
             if left_reds <= 0 {

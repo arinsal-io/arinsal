@@ -2727,7 +2727,7 @@ pub(crate) fn set_save_end(process: &mut Process, ctx: &mut RunCtx<'_, Message>)
     }
     if process.sig_cont_empty() {
         // `c_p->sig_qs.save = c_p->sig_qs.last`.
-        process.receive_cursor = len;
+        process.inbox.set_save(len);
     } else {
         // Unhandled signals in the middle queue: a receive marker passes through it and
         // sets the save pointer when it enters the message queue.
