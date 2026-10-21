@@ -8,7 +8,6 @@
 //! one process table and the one port table of this OS process is global, as
 //! `erts_proc` and `erts_port` are in erts.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// Bits of identifier data in a local pid or port word.
@@ -205,22 +204,20 @@ pub fn set_port_table_layout(layout: PtabLayout) {
     PORT_TABLE_BITS.store(layout.bits as u8, Ordering::Relaxed);
 }
 
-/// Entries per lazily materialized page of the free identifier ring.
-const RING_PAGE: usize = 1024;
-
 /// Identifier allocator of a process or port table: the element count and the
 /// free identifier ring (`free_id_data`, `aid_ix`, `fid_ix`) of erts' non-legacy
 /// `ErtsPTab`. Slot storage stays with the owner, which serializes
 /// [`PtabIdRing::test_next_id`] against reservations and releases as erts' table
-/// rwlock does. Pages of the ring are materialized on first use; an untouched page
-/// holds its initial content.
+/// rwlock does. The whole ring is allocated and initialized when the table is created, as
+/// erts_ptab_init_table does: a reservation is one exchange and never stalls on a first touch,
+/// so a release that runs right behind it finds the slot it emptied.
 pub struct PtabIdRing {
     layout: PtabLayout,
     limit: u32,
     count: AtomicU32,
     aid_ix: AtomicU32,
     fid_ix: AtomicU32,
-    pages: Box<[OnceLock<Box<[AtomicU64]>>]>,
+    free_id_data: Box<[AtomicU64]>,
     invalid_pix: Option<u32>,
 }
 
@@ -241,8 +238,10 @@ impl PtabIdRing {
             count: AtomicU32::new(u32::from(invalid_pix.is_some())),
             aid_ix: AtomicU32::new(u32::MAX),
             fid_ix: AtomicU32::new(u32::MAX),
-            pages: (0..(layout.max() as usize).div_ceil(RING_PAGE))
-                .map(|_| OnceLock::new())
+            // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_init_table: free_id_data),
+            // OTP-29.1.1.
+            free_id_data: (0..layout.max())
+                .map(|dix| AtomicU64::new(layout.initial_free_id_data(dix)))
                 .collect(),
             invalid_pix,
         }
@@ -272,14 +271,7 @@ impl PtabIdRing {
     }
 
     fn slot(&self, dix: u32) -> &AtomicU64 {
-        let dix = dix as usize;
-        let page = self.pages[dix / RING_PAGE].get_or_init(|| {
-            let base = (dix / RING_PAGE * RING_PAGE) as u32;
-            (0..RING_PAGE as u32)
-                .map(|offset| AtomicU64::new(self.layout.initial_free_id_data(base + offset)))
-                .collect()
-        });
-        &page[dix % RING_PAGE]
+        &self.free_id_data[dix as usize]
     }
 
     /// Reserve an element and take the next free identifier data; `None` when the
