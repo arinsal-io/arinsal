@@ -1737,7 +1737,7 @@ impl Vm {
         if ctx.has_pending_input() || !process.sig_cont_empty() {
             return Ok(false);
         }
-        Ok(process.receive_cursor >= process.inbox.len())
+        Ok(process.inbox.save() >= process.inbox.len())
     }
 
     /// After an apply left the process at an interpreted jump target, enter that function's
@@ -3875,7 +3875,7 @@ impl Vm {
                     p.gc_live = 0;
                     // Port of erts/emulator/beam/emu/msg_instrs.tab:76-110, OTP-29.1.1: at the
                     // end of the message queue the receive helper fetches and handles signals.
-                    if p.inbox.get(p.receive_cursor).is_none() {
+                    if p.inbox.get(p.inbox.save()).is_none() {
                         let ctx = ctx.as_deref_mut().ok_or_else(|| {
                             VmError::Unsupported("receive requires a scheduler".into())
                         })?;

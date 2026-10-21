@@ -338,7 +338,7 @@ impl Process {
         old_prio_len: usize,
         message: Term,
     ) -> Result<(), VmError> {
-        let cursor = self.receive_cursor;
+        let cursor = self.inbox.save();
         if self
             .cold
             .as_ref()
@@ -352,7 +352,7 @@ impl Process {
                 .expect("resume cursor checked") += 1;
         } else if cursor >= old_prio_len {
             self.cold_mut().priority_resume_cursor = Some(cursor + 1);
-            self.receive_cursor = old_prio_len;
+            self.inbox.set_save(old_prio_len);
         }
         if let Some(markers) = self
             .cold
@@ -456,7 +456,7 @@ impl Process {
             .and_then(|cold| cold.receive_markers.as_mut())
             .and_then(|markers| markers.enter_msgq(taken, position))
         {
-            self.receive_cursor = save;
+            self.inbox.set_save(save);
             self.cold_mut().priority_resume_cursor = None;
         }
     }
@@ -497,7 +497,7 @@ impl Process {
                 // the message queue, past the priority queue, so `loop_rec` handles signals.
                 SetSave::Pending => {
                     self.cold_mut().priority_resume_cursor = None;
-                    self.receive_cursor = self.inbox.len();
+                    self.inbox.set_save(self.inbox.len());
                     return;
                 }
             };
@@ -507,10 +507,10 @@ impl Process {
             if let Some(priority_position) =
                 priority_position.filter(|&position| position < prio_len)
             {
-                self.receive_cursor = priority_position;
+                self.inbox.set_save(priority_position);
                 self.cold_mut().priority_resume_cursor = Some(position);
             } else {
-                self.receive_cursor = position;
+                self.inbox.set_save(position);
             }
         }
     }
@@ -520,7 +520,7 @@ impl Process {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:9605 (save pointer loop), OTP-29.1.1.
         // Port of erts/emulator/beam/emu/msg_instrs.tab:59-67, 110 (F_DELAY_GC from loop_rec
         // until remove_message or wait), OTP-29.1.1.
-        if let Some(&message) = self.inbox.get(self.receive_cursor) {
+        if let Some(&message) = self.inbox.get(self.inbox.save()) {
             self.delay_gc = true;
             self.write(dst, message)?;
             Ok(true)
@@ -531,24 +531,24 @@ impl Process {
     }
 
     pub(crate) fn loop_rec_end(&mut self) {
-        self.receive_cursor += 1;
+        self.inbox.set_save(self.inbox.save() + 1);
         // Port of erl_proc_sig_queue.c:9360-9454 (continue after priority queue), OTP-29.1.1.
         let prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
-        if self.receive_cursor == prio_len
+        if self.inbox.save() == prio_len
             && let Some(resume) = self
                 .cold
                 .as_mut()
                 .and_then(|cold| cold.priority_resume_cursor.take())
         {
-            self.receive_cursor = resume;
+            self.inbox.set_save(resume);
         }
-        if self.receive_cursor >= prio_len
+        if self.inbox.save() >= prio_len
             && let Some(markers) = self
                 .cold
                 .as_mut()
                 .and_then(|cold| cold.receive_markers.as_mut())
         {
-            markers.passed(self.receive_cursor);
+            markers.passed(self.inbox.save());
         }
         self.release_empty_marker_block();
     }
@@ -570,8 +570,8 @@ impl Process {
             markers.removed(index);
         }
         self.release_empty_marker_block();
-        if self.receive_cursor > index {
-            self.receive_cursor -= 1;
+        if self.inbox.save() > index {
+            self.inbox.set_save(self.inbox.save() - 1);
         }
         crate::natives::erts_debug::after_message_queue_change(self);
     }
@@ -583,7 +583,7 @@ impl Process {
     // with the save pointer at the first message), OTP-29.1.1.
     #[inline]
     pub(crate) fn remove_first_message(&mut self) -> Result<bool, VmError> {
-        if self.receive_cursor != 0
+        if self.inbox.save() != 0
             || self.cold.as_ref().is_some_and(|cold| {
                 cold.prio_len != 0
                     || cold.priority_resume_cursor.is_some()
@@ -625,7 +625,7 @@ impl Process {
         vm: Option<&mut crate::Vm>,
         ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::process::Message>>,
     ) -> Result<(), VmError> {
-        let removed = self.receive_cursor;
+        let removed = self.inbox.save();
         let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
         // Port of erts/emulator/beam/erl_message.c:975 (erts_save_message_in_proc,
         // erts_adjust_message_break), OTP-29.1.1: a message that was copied onto the heap is
@@ -669,7 +669,7 @@ impl Process {
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2367
         // (erts_msgq_unlink_msg_set_save_first), OTP-29.1.1.
         self.message_removed(removed);
-        self.receive_cursor = 0;
+        self.inbox.set_save(0);
         if let Some(cold) = self.cold.as_mut() {
             cold.priority_resume_cursor = None;
         }
@@ -684,7 +684,7 @@ impl Process {
         // `timeout` leaves the current receive and prepares the next one.
         // Port of erts/emulator/beam/emu/msg_instrs.tab (`timeout`) and
         // erl_proc_sig_queue.h:2331 (`erts_msgq_set_save_first`), OTP-29.1.1.
-        self.receive_cursor = 0;
+        self.inbox.set_save(0);
         if let Some(cold) = self.cold.as_mut() {
             cold.priority_resume_cursor = None;
         }

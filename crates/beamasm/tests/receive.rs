@@ -16,7 +16,8 @@ fn fragments() -> &'static ReceiveFragments {
     &FRAGMENTS
         .get_or_init(|| {
             let yields = YieldFragments::new().unwrap();
-            let receive = ReceiveFragments::new(peek, wait, wait, yields.context_switch()).unwrap();
+            let receive =
+                ReceiveFragments::new(peek, wait, wait, yields.context_switch(), None).unwrap();
             (yields, receive)
         })
         .1
