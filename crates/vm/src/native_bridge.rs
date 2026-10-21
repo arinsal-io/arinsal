@@ -340,9 +340,13 @@ pub(crate) fn stack_frame_in(
     frame_in(ranges, address)
 }
 
-fn native_functions() -> &'static RwLock<Vec<NativeFunction>> {
-    static FUNCTIONS: OnceLock<RwLock<Vec<NativeFunction>>> = OnceLock::new();
-    FUNCTIONS.get_or_init(|| RwLock::new(Vec::new()))
+/// The registry of native code ranges. Every process entry and return reads it, so readers
+/// take only their own reader-group line, as erts' frequent-read rwlocks do
+/// (`ERTS_RWMTX_TYPE_FREQUENT_READ`).
+fn native_functions() -> &'static arinsal_term::FrequentReadRwLock<Vec<NativeFunction>> {
+    static FUNCTIONS: OnceLock<arinsal_term::FrequentReadRwLock<Vec<NativeFunction>>> =
+        OnceLock::new();
+    FUNCTIONS.get_or_init(|| arinsal_term::FrequentReadRwLock::new(Vec::new()))
 }
 
 fn native_generation() -> &'static AtomicU64 {
@@ -713,9 +717,7 @@ pub fn register_native_function(info: NativeFunction) -> Result<(), &'static str
     }
     let start = info.start;
     arinsal_term::register_native_code_range(info.start, info.end)?;
-    let mut functions = native_functions()
-        .write()
-        .map_err(|_| "native function registry poisoned")?;
+    let mut functions = native_functions().write();
     // The registry stays sorted by start: only the neighbours can overlap.
     let index = functions.partition_point(|function| function.start < info.start);
     let overlaps_previous = index
@@ -746,9 +748,7 @@ pub fn register_native_function(info: NativeFunction) -> Result<(), &'static str
 
 /// Unregisters native function entries when their owning module version is purged.
 pub(crate) fn unregister_native_functions(entries: &[NativeFunction]) {
-    let Ok(mut functions) = native_functions().write() else {
-        return;
-    };
+    let mut functions = native_functions().write();
     let before = functions.len();
     functions.retain(|registered| !entries.contains(registered));
     for entry in entries {
@@ -775,9 +775,7 @@ pub(crate) fn unregister_native_scope(scope: u64) {
     if scope == 0 {
         return;
     }
-    let Ok(mut functions) = native_functions().write() else {
-        return;
-    };
+    let mut functions = native_functions().write();
     let mut removed = Vec::new();
     functions.retain(|function| {
         if function.scope == scope {
@@ -818,7 +816,7 @@ pub fn native_function_at(address: usize) -> Option<NativeFunction> {
     if !arinsal_term::may_be_native_code_pointer(address) {
         return None;
     }
-    let functions = native_functions().read().ok()?;
+    let functions = native_functions().read();
     let index = functions.partition_point(|function| function.start <= address);
     functions
         .get(index.checked_sub(1)?)
@@ -835,7 +833,7 @@ pub(crate) fn with_native_function_at<R>(
     if !arinsal_term::may_be_native_code_pointer(address) {
         return None;
     }
-    let functions = native_functions().read().ok()?;
+    let functions = native_functions().read();
     let index = functions.partition_point(|function| function.start <= address);
     functions
         .get(index.checked_sub(1)?)
@@ -848,9 +846,7 @@ pub(crate) fn is_native_function_at(address: usize) -> bool {
     if !arinsal_term::may_be_native_code_pointer(address) {
         return false;
     }
-    let Ok(functions) = native_functions().read() else {
-        return false;
-    };
+    let functions = native_functions().read();
     let index = functions.partition_point(|function| function.start <= address);
     let Some(function) = index.checked_sub(1).and_then(|index| functions.get(index)) else {
         return false;
@@ -868,7 +864,7 @@ pub(crate) fn native_stack_frame_at(address: usize) -> Option<NativeStackFrame> 
     if !arinsal_term::may_be_native_code_pointer(address) {
         return None;
     }
-    let functions = native_functions().read().ok()?;
+    let functions = native_functions().read();
     let index = functions.partition_point(|function| function.start <= address);
     let function = functions
         .get(index.checked_sub(1)?)
@@ -895,7 +891,7 @@ pub(crate) fn native_stack_frame_at(address: usize) -> Option<NativeStackFrame> 
 }
 
 fn native_arity_at(address: usize) -> Option<u8> {
-    let functions = native_functions().read().ok()?;
+    let functions = native_functions().read();
     let index = functions.partition_point(|function| function.start <= address);
     functions
         .get(index.checked_sub(1)?)
@@ -913,9 +909,7 @@ pub(crate) fn native_functions_of(
     module: &str,
     range: Option<(usize, usize)>,
 ) -> std::collections::HashMap<(String, u8), NativeFunction> {
-    let Ok(functions) = native_functions().read() else {
-        return std::collections::HashMap::new();
-    };
+    let functions = native_functions().read();
     let in_version = |entry: &&NativeFunction| {
         entry.module == module
             && range.is_none_or(|(start, end)| start <= entry.start && entry.start < end)
@@ -948,7 +942,6 @@ pub(crate) fn native_function_for(
 ) -> Option<NativeFunction> {
     native_functions()
         .read()
-        .ok()?
         .iter()
         .find(|entry| {
             (entry.scope == scope || entry.scope == 0)
