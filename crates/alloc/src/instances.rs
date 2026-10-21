@@ -132,6 +132,31 @@ pub fn notify_owner(instance: usize) {
 
 struct Instance {
     allocator: AllocUtil,
+    /// `allctr->fix`: the free lists of the fixed-size types this instance serves.
+    fix: Vec<FixList>,
+}
+
+/// Number of fixed-size allocation types (`ERTS_ALC_NO_FIXED_SIZES`) the port knows.
+pub const FIX_TYPES: usize = 1;
+
+/// Longest free list of one fixed-size type.
+///
+/// Port of erts/emulator/beam/erl_alloc_util.c (`ERTS_ALCU_FIX_MAX_LIST_SZ`), OTP-29.1.1.
+const FIX_MAX_LIST_SIZE: usize = 1000;
+
+/// Free list of one fixed-size type in one instance.
+///
+/// Port of erts/emulator/beam/erl_alloc_util.h (`ErtsAlcFixList_t`, the `cpool` variant),
+/// OTP-29.1.1. erts threads the list through the first word of each free block; the blocks here
+/// are named by their allocation, so the list keeps those.
+#[derive(Default)]
+struct FixList {
+    /// `type_size`: zero until the type is first allocated.
+    type_size: usize,
+    list: Vec<Allocation>,
+    min_list_size: usize,
+    used: usize,
+    allocated: usize,
 }
 
 /// A request another thread asks the owner of an instance to run.
@@ -278,6 +303,8 @@ enum AllocationRoute {
 /// that was sent back to its origin.
 enum Delayed {
     Block(InstanceAllocation, Allocation),
+    /// A block of fixed-size type `usize` (its index), which goes back to the owner's free list.
+    Fix(usize, InstanceAllocation, Allocation),
     Homecoming(u64),
 }
 
@@ -416,7 +443,10 @@ impl ThreadSpecificAllocators {
                 .map(|allocator| Slot {
                     blocks_size: AtomicUsize::new(0),
                     lock: parking_lot::Mutex::new(()),
-                    state: OwnerCell(UnsafeCell::new(Instance { allocator })),
+                    state: OwnerCell(UnsafeCell::new(Instance {
+                        allocator,
+                        fix: (0..FIX_TYPES).map(|_| FixList::default()).collect(),
+                    })),
                 })
                 .collect(),
             shared,
@@ -797,6 +827,102 @@ impl ThreadSpecificAllocators {
                 self.run_requests_on(instance, &mut state);
             }
         }
+    }
+
+    /// Allocates a block of fixed-size type `fix_ix` (`size` bytes) on the instance of the
+    /// calling thread, whose allocator index is `ix`, taking it from the type's free list when
+    /// the list has one.
+    ///
+    /// Port of erts/emulator/beam/erl_alloc_util.c (fix_cpool_alloc), OTP-29.1.1.
+    pub fn fix_alloc_with_ptr_at(
+        &self,
+        ix: usize,
+        fix_ix: usize,
+        size: usize,
+    ) -> Result<(InstanceAllocation, *mut u64), AllocError> {
+        let instance = self.instance_for(ix);
+        debug_assert_eq!(instance, self.current_instance());
+        let mut state = self.lock_instance(instance);
+        if !self.delayed[instance].is_empty() {
+            self.drain_and_publish(instance, &mut state)?;
+        }
+        let fix = state
+            .fix
+            .get_mut(fix_ix)
+            .ok_or(AllocError::InvalidAllocation)?;
+        if fix.type_size == 0 {
+            fix.type_size = size;
+        }
+        debug_assert_eq!(fix.type_size, size, "a fixed-size type keeps one size");
+        if let Some(allocation) = fix.list.pop() {
+            fix.min_list_size = fix.min_list_size.min(fix.list.len());
+            fix.used += 1;
+            return Ok((
+                InstanceAllocation {
+                    instance,
+                    allocation,
+                },
+                allocation.payload_address() as *mut u64,
+            ));
+        }
+        if self.pooled.load(Ordering::Acquire) != 0 && state.allocator.needs_carrier(size)? {
+            self.fetch_for_size(instance, &mut state, size)?;
+        }
+        let allocation = state.allocator.alloc(size)?;
+        let ptr = state.allocator.payload_address(allocation);
+        let fix = &mut state.fix[fix_ix];
+        fix.used += 1;
+        fix.allocated += 1;
+        Ok((
+            InstanceAllocation {
+                instance,
+                allocation,
+            },
+            ptr,
+        ))
+    }
+
+    /// Frees a block of fixed-size type `fix_ix` from the thread with allocator index `ix`: the
+    /// owning instance puts it on its free list, another thread queues it for the owner.
+    ///
+    /// Port of erts/emulator/beam/erl_alloc_util.c (fix_cpool_free through
+    /// erts_alcu_free_thr_pref and handle_delayed_dealloc), OTP-29.1.1.
+    pub fn fix_free_at(
+        &self,
+        ix: usize,
+        fix_ix: usize,
+        handle: InstanceAllocation,
+    ) -> Result<(), AllocError> {
+        let current = self.instance_for(ix);
+        debug_assert_eq!(current, self.current_instance());
+        loop {
+            let (instance, allocation) = self.route(handle)?;
+            if current != instance {
+                self.delayed[instance].push(Delayed::Fix(fix_ix, handle, allocation));
+                return Ok(());
+            }
+            let mut state = self.lock_instance(instance);
+            self.drain_and_publish(instance, &mut state)?;
+            let allocation = match self.resolve_owned(instance, &mut state, handle, allocation)? {
+                Resolved::Owned(allocation) => allocation,
+                Resolved::Elsewhere(..) => continue,
+            };
+            fix_free_owned(&mut state, fix_ix, allocation)?;
+            self.publish_transfers(instance, &mut state)?;
+            self.forget_route(allocation.id());
+            return Ok(());
+        }
+    }
+
+    /// Blocks of fixed-size type `fix_ix` in use and allocated (in use or on the free list) on
+    /// `instance` (`erts_alloc_fix_info` `used` and `allocated`).
+    pub fn fix_info(&self, instance: usize, fix_ix: usize) -> (usize, usize) {
+        self.on_owner(instance, move |_, state| {
+            state
+                .fix
+                .get(fix_ix)
+                .map_or((0, 0), |fix| (fix.used, fix.allocated))
+        })
     }
 
     /// Returns the number of frees waiting for the instance.
@@ -1307,6 +1433,24 @@ impl ThreadSpecificAllocators {
                     }
                     drained.push(handle);
                 }
+                Delayed::Fix(fix_ix, handle, allocation) => {
+                    let allocation = match self.resolve_owned(instance, state, handle, allocation) {
+                        Ok(Resolved::Owned(allocation)) => allocation,
+                        Ok(Resolved::Elsewhere(owner, allocation)) => {
+                            self.delayed[owner].push(Delayed::Fix(fix_ix, handle, allocation));
+                            continue;
+                        }
+                        Err(error) => {
+                            queue.push(Delayed::Fix(fix_ix, handle, allocation));
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = fix_free_owned(state, fix_ix, allocation) {
+                        queue.push(Delayed::Fix(fix_ix, handle, allocation));
+                        return Err(error);
+                    }
+                    drained.push(handle);
+                }
                 Delayed::Homecoming(id) => {
                     if let Err(error) = self.import_homecoming(instance, state, id) {
                         queue.push(Delayed::Homecoming(id));
@@ -1317,6 +1461,28 @@ impl ThreadSpecificAllocators {
         }
         Ok(drained)
     }
+}
+
+/// The owner's half of fix_cpool_free: the block goes on the free list unless the list is full.
+///
+/// Port of erts/emulator/beam/erl_alloc_util.c (fix_cpool_free), OTP-29.1.1. erts also trims the
+/// lists from aux work (fix_cpool_alloc_shrink); the port keeps only the list size limit.
+fn fix_free_owned(
+    state: &mut Instance,
+    fix_ix: usize,
+    allocation: Allocation,
+) -> Result<(), AllocError> {
+    let fix = state
+        .fix
+        .get_mut(fix_ix)
+        .ok_or(AllocError::InvalidAllocation)?;
+    fix.used = fix.used.saturating_sub(1);
+    if fix.list.len() < FIX_MAX_LIST_SIZE {
+        fix.list.push(allocation);
+        return Ok(());
+    }
+    fix.allocated = fix.allocated.saturating_sub(1);
+    state.allocator.free(allocation)
 }
 
 #[allow(unsafe_code)]
@@ -2138,6 +2304,8 @@ mod tests {
                 "on_owner",
                 "unowned",
                 "unowned",
+                "fix_alloc_with_ptr_at",
+                "fix_free_at",
             ]
         );
     }
