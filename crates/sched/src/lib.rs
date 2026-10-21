@@ -1877,7 +1877,7 @@ impl<T: Task> Inner<T> {
                     shared,
                 }),
                 local.as_deref_mut(),
-                true,
+                false,
                 false,
             )
             .is_ok()
@@ -4795,6 +4795,41 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     }
 }
 
+/// Messages, exits, and DOWNs require the receiver to run. Link, monitor, and
+/// demonitor only update control state and are applied the next time the
+/// receiver is scheduled, including on exit.
+fn payload_wakes<M>(payload: &Payload<M>) -> bool {
+    match payload {
+        Payload::Message(_) | Payload::Timer { .. } | Payload::TimerMessage { .. } => true,
+        Payload::Signal(signal) => match signal {
+            Signal::Exit(_)
+            | Signal::ExitLinked(_)
+            | Signal::PortExit(_)
+            | Signal::MonitorDown { .. }
+            | Signal::MonitorDownMsg { .. }
+            | Signal::Suspend { .. }
+            | Signal::SuspendRelease { .. }
+            | Signal::SuspendDown { .. }
+            | Signal::SuspendResume
+            | Signal::SuspendInternal
+            | Signal::SyncSuspend(_)
+            | Signal::MonitorNoproc(_)
+            | Signal::GarbageCollect
+            | Signal::LiteralAreaCopy(_)
+            | Signal::ProcSigBlock(_) => true,
+            Signal::UnlinkAck(id) => *id != 0,
+            Signal::UnlinkAckSignal(_) => true,
+            Signal::Link
+            | Signal::Unlink(_)
+            | Signal::Monitor { .. }
+            | Signal::Demonitor(_)
+            | Signal::DemonitorOrigin(_)
+            | Signal::Alias(_)
+            | Signal::Unalias(_) => false,
+        },
+    }
+}
+
 fn take_lost_monitors<M>(events: &mut Vec<OwnedSignal<Event<M>>>) -> Vec<(Pid, u64)> {
     events
         .drain(..)
@@ -4914,7 +4949,7 @@ impl<T: Task> Runner<'_, T> {
                 from,
                 payload,
                 self.local.map(RefCell::borrow_mut).as_deref_mut(),
-                true,
+                false,
                 false,
             )
             .is_err()
@@ -5214,11 +5249,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             .table
             .with_live(to, |process| -> Result<(), Error> {
                 let waiting = process.run_state().load(Ordering::Acquire) == WAITING;
-                // Port of erts/emulator/beam/erl_proc_sig_queue.h (erts_proc_notify_new_sig) and
-                // erl_message.c (erts_proc_notify_new_message), OTP-29.1.1: every signal schedules
-                // a receiver that is not already active, non-message signals included, so a
-                // waiting process handles its links and monitors as they arrive.
-                let wakes = true;
+                let wakes = payload_wakes(&signal.payload);
                 let force_enqueue =
                     matches!(&signal.payload, Payload::Signal(Signal::LiteralAreaCopy(_)));
                 // A literal-copy request is never buffered: a request lost to an exiting target
