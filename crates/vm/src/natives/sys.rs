@@ -14,7 +14,7 @@ use arinsal_term::{
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -1133,26 +1133,26 @@ fn system_info(
         Some("thread_pool_size") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.thread_pool_size as u64)
         })),
-        Some("fullsweep_after") => Some(read_flags(process, |process, flags| {
-            tagged(process, "fullsweep_after", u64::from(flags.fullsweep_after))
-        })),
+        Some("fullsweep_after") => {
+            let value = gc_defaults(process.runtime.as_deref()).max_gen_gcs();
+            Some(tagged(process, "fullsweep_after", u64::from(value)))
+        }
         // Port of erts/emulator/beam/erl_bif_info.c:2884-2885, OTP-29.1.1.
         Some("trace_control_word") => {
             Some(Term::small(trace_control_word_value(process)).ok_or_else(badarg))
         }
-        Some("min_heap_size") => Some(read_flags(process, |process, flags| {
-            tagged(process, "min_heap_size", flags.min_heap_size as u64)
-        })),
-        Some("min_bin_vheap_size") => Some(read_flags(process, |process, flags| {
-            tagged(
-                process,
-                "min_bin_vheap_size",
-                flags.min_bin_vheap_size as u64,
-            )
-        })),
-        Some("max_heap_size") => Some(read_flags(process, |process, flags| {
-            max_heap_map(process, flags.max_heap)
-        })),
+        Some("min_heap_size") => {
+            let value = gc_defaults(process.runtime.as_deref()).min_heap_size();
+            Some(tagged(process, "min_heap_size", value as u64))
+        }
+        Some("min_bin_vheap_size") => {
+            let value = gc_defaults(process.runtime.as_deref()).min_bin_vheap_size();
+            Some(tagged(process, "min_bin_vheap_size", value as u64))
+        }
+        Some("max_heap_size") => {
+            let value = gc_defaults(process.runtime.as_deref()).max_heap();
+            Some(max_heap_map(process, value))
+        }
         Some("multi_scheduling") => Some(Ok(atom(multi_scheduling_state(process, |state| {
             state.state()
         })))),
@@ -3358,11 +3358,7 @@ pub(crate) struct StatisticsState {
 /// `erlang:system_flag/2` state of one runtime.
 #[derive(Clone)]
 pub(crate) struct SystemFlags {
-    fullsweep_after: u16,
-    min_heap_size: i64,
-    min_bin_vheap_size: i64,
     thread_pool_size: usize,
-    max_heap: crate::process::MaxHeap,
     schedulers_online: usize,
     schedulers_total: usize,
     dirty_cpu_online: usize,
@@ -3411,11 +3407,104 @@ pub(crate) struct GcSpawnDefaults {
 }
 
 pub(crate) fn gc_spawn_defaults(runtime: Option<&crate::process::Runtime>) -> GcSpawnDefaults {
-    with_runtime_flags(runtime, |flags| GcSpawnDefaults {
-        fullsweep_after: flags.fullsweep_after,
-        max_heap_size: flags.max_heap,
-        min_bin_vheap_size: flags.min_bin_vheap_size,
-    })
+    let defaults = gc_defaults(runtime);
+    GcSpawnDefaults {
+        fullsweep_after: defaults.max_gen_gcs(),
+        max_heap_size: defaults.max_heap(),
+        min_bin_vheap_size: defaults.min_bin_vheap_size(),
+    }
+}
+
+/// The GC defaults a spawn reads: erts' `H_MIN_SIZE`, `BIN_VH_MIN_SIZE`, `H_MAX_SIZE` and
+/// `H_MAX_FLAGS` globals and the `erts_max_gen_gcs` atomic.
+///
+/// Port of erts/emulator/beam/erl_process.c (erl_create_process and erts_parse_spawn_opts read
+/// them without a lock) and bif.c (system_flag_2 writes them), OTP-29.1.1. erts writes the plain
+/// globals under a thread-progress block; each value here is one atomic word, so a reader sees
+/// either the old or the new value. `H_MAX_SIZE` and `H_MAX_FLAGS` share one word so a spawn
+/// never pairs a new size with old flags.
+pub(crate) struct GcDefaults {
+    min_heap_size: AtomicI64,
+    min_bin_vheap_size: AtomicI64,
+    max_gen_gcs: AtomicU32,
+    max_heap: AtomicU64,
+}
+
+const MAX_HEAP_KILL: u64 = 1;
+const MAX_HEAP_LOG: u64 = 1 << 1;
+const MAX_HEAP_INCLUDE_SHARED_BINARIES: u64 = 1 << 2;
+const MAX_HEAP_FLAG_BITS: u32 = 3;
+
+impl GcDefaults {
+    /// Values a runtime boots with, from the command line and the environment.
+    pub(crate) fn boot() -> Self {
+        let emulator = arinsal_args::active_emulator_flags();
+        let defaults = Self {
+            // Port of erts/emulator/beam/erl_init.c (erl_start, +hms), OTP-29.1.1.
+            min_heap_size: AtomicI64::new(
+                emulator
+                    .min_heap_size
+                    .map(|words| next_heap_size(i64::try_from(words).unwrap_or(i64::MAX)))
+                    .unwrap_or(233),
+            ),
+            min_bin_vheap_size: AtomicI64::new(46_422),
+            // Port of erts/emulator/beam/erl_init.c (erl_start, `ERL_FULLSWEEP_AFTER`), OTP-29.1.1.
+            max_gen_gcs: AtomicU32::new(u32::from(
+                std::env::var("ERL_FULLSWEEP_AFTER")
+                    .ok()
+                    .map(|value| value.trim().parse::<i64>().unwrap_or(0) as u16)
+                    .unwrap_or(u16::MAX),
+            )),
+            max_heap: AtomicU64::new(0),
+        };
+        defaults.set_max_heap(crate::process::MaxHeap::default());
+        defaults
+    }
+
+    pub(crate) fn min_heap_size(&self) -> i64 {
+        self.min_heap_size.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn min_bin_vheap_size(&self) -> i64 {
+        self.min_bin_vheap_size.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn max_gen_gcs(&self) -> u16 {
+        self.max_gen_gcs.load(Ordering::Relaxed) as u16
+    }
+
+    pub(crate) fn max_heap(&self) -> crate::process::MaxHeap {
+        let word = self.max_heap.load(Ordering::Relaxed);
+        crate::process::MaxHeap {
+            size: word >> MAX_HEAP_FLAG_BITS,
+            kill: word & MAX_HEAP_KILL != 0,
+            log: word & MAX_HEAP_LOG != 0,
+            include_shared_binaries: word & MAX_HEAP_INCLUDE_SHARED_BINARIES != 0,
+            reported: false,
+        }
+    }
+
+    fn set_max_heap(&self, limit: crate::process::MaxHeap) {
+        let size = limit.size.min(u64::MAX >> MAX_HEAP_FLAG_BITS);
+        let word = (size << MAX_HEAP_FLAG_BITS)
+            | if limit.kill { MAX_HEAP_KILL } else { 0 }
+            | if limit.log { MAX_HEAP_LOG } else { 0 }
+            | if limit.include_shared_binaries {
+                MAX_HEAP_INCLUDE_SHARED_BINARIES
+            } else {
+                0
+            };
+        self.max_heap.store(word, Ordering::Relaxed);
+    }
+}
+
+/// GC defaults of `runtime`; an evaluation without a runtime shares one boot-time set.
+pub(crate) fn gc_defaults(runtime: Option<&crate::process::Runtime>) -> &GcDefaults {
+    static UNATTACHED: OnceLock<GcDefaults> = OnceLock::new();
+    match runtime {
+        Some(runtime) => &runtime.gc_defaults,
+        None => UNATTACHED.get_or_init(GcDefaults::boot),
+    }
 }
 
 pub(crate) fn multi_scheduling_blocked(process: &Process) -> bool {
@@ -3437,19 +3526,18 @@ pub(crate) fn normalize_spawn_heap_minimum(
     requested: Option<usize>,
     binary: bool,
 ) -> usize {
-    with_runtime_flags(runtime, |flags| {
-        let minimum = if binary {
-            flags.min_bin_vheap_size
-        } else {
-            flags.min_heap_size
-        } as usize;
-        match requested {
-            Some(size) if size > minimum => {
-                next_heap_size(i64::try_from(size).unwrap_or(i64::MAX)) as usize
-            }
-            _ => minimum,
+    let defaults = gc_defaults(runtime);
+    let minimum = if binary {
+        defaults.min_bin_vheap_size()
+    } else {
+        defaults.min_heap_size()
+    } as usize;
+    match requested {
+        Some(size) if size > minimum => {
+            next_heap_size(i64::try_from(size).unwrap_or(i64::MAX)) as usize
         }
-    })
+        _ => minimum,
+    }
 }
 
 /// `erlang:system_info(schedulers)` at boot: the scheduler count `driver_system_info` reports.
@@ -3472,20 +3560,8 @@ impl SystemFlags {
                 dirty_io_total,
             ) = boot_scheduler_counts_from(cpus, cpus_online, &emulator);
             SystemFlags {
-                // Port of erl_init.c:1328-1332 (`ERL_FULLSWEEP_AFTER`), OTP-29.1.1.
-                fullsweep_after: std::env::var("ERL_FULLSWEEP_AFTER")
-                    .ok()
-                    .map(|value| value.trim().parse::<i64>().unwrap_or(0) as u16)
-                    .unwrap_or(u16::MAX),
-                // Port of erts/emulator/beam/erl_init.c:1556-1562 (+hms), OTP-29.1.1.
-                min_heap_size: emulator
-                    .min_heap_size
-                    .map(|words| next_heap_size(i64::try_from(words).unwrap_or(i64::MAX)))
-                    .unwrap_or(233),
-                min_bin_vheap_size: 46_422,
                 // Port of erts/emulator/beam/erl_init.c:1162-1163 (+A zero clamp), OTP-29.1.1.
                 thread_pool_size: emulator.async_threads.unwrap_or(1).max(1) as usize,
-                max_heap: crate::process::MaxHeap::default(),
                 schedulers_online,
                 schedulers_total,
                 dirty_cpu_online,
@@ -3756,26 +3832,23 @@ fn schedulers_online(
 fn fullsweep_after(process: &Process, value: Term) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
     let stored = u16::try_from(requested).unwrap_or(u16::MAX);
-    with_flags(process, |flags| {
-        let previous = flags.fullsweep_after;
-        flags.fullsweep_after = stored;
-        Ok(Term::small(i64::from(previous)).unwrap())
-    })
+    let previous = gc_defaults(process.runtime.as_deref())
+        .max_gen_gcs
+        .swap(u32::from(stored), Ordering::Relaxed);
+    Ok(Term::small(i64::from(previous)).unwrap())
 }
 
 fn heap_minimum(process: &Process, value: Term, heap: bool) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
     let rounded = next_heap_size(requested);
-    with_flags(process, |flags| {
-        let slot = if heap {
-            &mut flags.min_heap_size
-        } else {
-            &mut flags.min_bin_vheap_size
-        };
-        let previous = *slot;
-        *slot = rounded;
-        Term::small(previous).ok_or_else(badarg)
-    })
+    let defaults = gc_defaults(process.runtime.as_deref());
+    let slot = if heap {
+        &defaults.min_heap_size
+    } else {
+        &defaults.min_bin_vheap_size
+    };
+    let previous = slot.swap(rounded, Ordering::Relaxed);
+    Term::small(previous).ok_or_else(badarg)
 }
 
 fn backtrace_depth(vm: &mut Vm, process: &Process, value: Term) -> Result<Term, VmError> {
@@ -3829,14 +3902,12 @@ fn scheduling_statistics(value: Term) -> Result<Term, VmError> {
 
 fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
     let parsed = parse_system_max_heap(process, value)?;
-    let previous = with_flags(process, |flags| {
-        let old = flags.max_heap;
-        if parsed.size < flags.min_heap_size as u64 && parsed.size != 0 {
-            return Err(badarg());
-        }
-        flags.max_heap = parsed;
-        Ok(old)
-    })?;
+    let defaults = gc_defaults(process.runtime.as_deref());
+    if parsed.size < defaults.min_heap_size() as u64 && parsed.size != 0 {
+        return Err(badarg());
+    }
+    let previous = defaults.max_heap();
+    defaults.set_max_heap(parsed);
     max_heap_map(process, previous)
 }
 
@@ -3845,10 +3916,7 @@ fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
 pub(crate) fn system_max_heap(
     runtime: Option<&crate::process::Runtime>,
 ) -> crate::process::MaxHeap {
-    crate::process::MaxHeap {
-        reported: false,
-        ..with_runtime_flags(runtime, |flags| flags.max_heap)
-    }
+    gc_defaults(runtime).max_heap()
 }
 
 fn parse_system_max_heap(
