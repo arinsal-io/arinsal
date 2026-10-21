@@ -72,6 +72,7 @@ pub use timer::TimerRef;
 use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
 use crossbeam_deque::{Steal, Stealer, Worker};
 use crossbeam_queue::SegQueue;
+pub use proc_ref::SignalProbe;
 use proc_ref::{ErasedProcRef, ProcRef};
 use std::any::Any;
 use std::cell::RefCell;
@@ -934,24 +935,21 @@ impl<M> SpawnedProcess<M> {
     }
 }
 
-#[derive(Clone)]
-pub struct SignalProbe<M>(Arc<Incoming<Event<M>>>, Arc<AtomicU32>);
-
 impl<M: SignalMessage> SignalProbe<M> {
     /// Whether the outer signal queue holds unfetched signals.
     pub fn has_pending(&self) -> bool {
-        self.0.has_pending()
+        self.input().has_pending()
     }
 
     /// The process's state flags ([`proc_flags`]), read without a table lookup.
     pub fn proc_flags(&self) -> &AtomicU32 {
-        &self.1
+        self.flags()
     }
 
     /// Record whether the receiver's middle signal queue holds unhandled signals
     /// (`ERTS_PSFLG_SIG_Q`).
     pub fn set_sig_q(&self, unhandled: bool) {
-        self.0.set_sig_q(unhandled);
+        self.input().set_sig_q(unhandled);
     }
 
     /// Queue a message from the process to itself straight into its own outer signal queue.
@@ -959,7 +957,7 @@ impl<M: SignalMessage> SignalProbe<M> {
     // sender == receiver) and :698 (erts_send_message), OTP-29.1.1: the sender holds the
     // receiver, so there is no process-table lookup, and a running receiver is not scheduled.
     pub fn send_self(&self, pid: Pid, msg: M) -> Result<(), Error> {
-        self.0
+        self.input()
             .push_routed(
                 || signal_buffer_slot(pid),
                 Event {
@@ -968,7 +966,7 @@ impl<M: SignalMessage> SignalProbe<M> {
                 },
             )
             .map_err(|_| Error::NoProcess)?;
-        self.0.backlog.fetch_add(1, Ordering::Relaxed);
+        self.input().backlog.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -976,7 +974,7 @@ impl<M: SignalMessage> SignalProbe<M> {
     /// event taken from there is accounted with [`RunCtx::consume_fetched`].
     // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch), OTP-29.1.1.
     pub fn fetch_all(&self, into: &mut VecDeque<Event<M>>) {
-        self.0.take_all(into);
+        self.input().take_all(into);
     }
 
     /// Move the whole outer queue to `into` when it holds only messages that `accept` takes;
@@ -987,7 +985,7 @@ impl<M: SignalMessage> SignalProbe<M> {
         accept: impl Fn(&M) -> bool,
         into: &mut VecDeque<Event<M>>,
     ) -> usize {
-        self.0.take_all_if(
+        self.input().take_all_if(
             |event| matches!(&event.payload, Payload::Message(message) if accept(message)),
             into,
         )
@@ -1112,13 +1110,13 @@ struct Process<T: Task> {
     /// (ERTS_PROC_LOCK_BTM), not a global one.
     btm: parking_lot::Mutex<ProcBtm<T::Message>>,
     /// See [`proc_flags`]. Read on exit without the process cell lock.
-    exit_flags: Arc<AtomicU32>,
+    exit_flags: AtomicU32,
     /// `p->common.u.alive.reg->name`, or [`u32::MAX`] when the process has no name.
     /// Port of erts/emulator/beam/erl_process.h (`common.u.alive.reg`), OTP-29.1.1.
     reg_atom: AtomicU32,
     wait_timer: AtomicU64,
     // Port of erts `Process.sig_inq`; shared with the task so receive can fetch in place.
-    input: Arc<Incoming<Event<T::Message>>>,
+    input: Incoming<Event<T::Message>>,
     /// Wheel that owns `wait_timer`, so cancel does not guess from the pid.
     wait_timer_worker: AtomicUsize,
     /// Dirty run queue that owns this process: 0 normal, 1 dirty CPU, 2 dirty I/O.
@@ -1262,10 +1260,10 @@ impl<T: Task> ProcessTable<T> {
                 tree: std::collections::BTreeMap::new(),
                 paused: None,
             }),
-            exit_flags: Arc::new(AtomicU32::new(0)),
+            exit_flags: AtomicU32::new(0),
             reg_atom: AtomicU32::new(u32::MAX),
             wait_timer: AtomicU64::new(0),
-            input: Arc::default(),
+            input: Incoming::default(),
             wait_timer_worker: AtomicUsize::new(0),
             dirty: AtomicU8::new(0),
             dirty_runner: AtomicUsize::new(0),
@@ -5293,10 +5291,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     }
     fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<T::Message>> {
         let process = self.lookup(pid)?;
-        Some(SignalProbe(
-            Arc::clone(&process.input),
-            Arc::clone(&process.exit_flags),
-        ))
+        Some(SignalProbe::of(&process))
     }
     fn total_reductions(&self) -> u64 {
         if self.inner.sim.is_some() {

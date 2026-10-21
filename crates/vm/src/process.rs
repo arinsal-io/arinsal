@@ -7765,6 +7765,10 @@ impl Task for Process {
     }
 
     fn scheduler_shutdown(&mut self) {
+        // The probe holds a reference to this process's own struct.
+        if let Some(cold) = self.cold.as_mut() {
+            cold.signal_probe = None;
+        }
         if let Some(pid) = self.self_pid {
             self.persistent_terms
                 .release_update_permission(crate::natives::sys::persistent_owner(pid));
