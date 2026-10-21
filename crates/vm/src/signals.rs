@@ -917,7 +917,7 @@ fn is_bif_export(module: arinsal_term::Atom, function: arinsal_term::Atom, arity
 
 #[allow(clippy::too_many_arguments)]
 // spawn_opt flags stay positional; packing them hides the monitor race.
-// Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_process.c (erts_parse_spawn_opts), OTP-29.1.1.
 /// Spawn options of `erl_create_process` (erl_process.c:12437, `ErlSpawnOpts`).
 pub(crate) struct ErlSpawnOpts {
     pub link: bool,
@@ -1014,7 +1014,7 @@ pub(crate) fn erl_create_process(
     } else {
         None
     };
-    // Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1: an
+    // Port of erts/emulator/beam/erl_process.c (erts_parse_spawn_opts), OTP-29.1.1: an
     // explicit min_bin_vheap_size alone takes the runtime default when no other heap option is set.
     let min_bin_vheap =
         if so.min_bin_vheap.is_some() && so.min_heap.is_none() && so.max_heap.is_none() {
@@ -1049,7 +1049,7 @@ pub(crate) fn erl_create_process(
     // in place.
     let init_child = |child: &mut Process| -> Result<(), VmError> {
         child.set_runtime(runtime);
-        // Port of erts/emulator/beam/erl_process.c:12508 (erl_create_process initializes both
+        // Port of erts/emulator/beam/erl_process.c (erl_create_process initializes both
         // active and user priority from so->priority), OTP-29.1.1. The scheduler entry already
         // receives this priority; keep process_info/process_flag's process-side value aligned.
         // A normal priority is the absent flag (process_info reports `normal` for it).
@@ -1077,7 +1077,7 @@ pub(crate) fn erl_create_process(
         }
         // `p->u.initial` is the spawned MFA, reported by process_info(initial_call); `p->i` is
         // the apply/3 entry the child starts at.
-        // Port of erts/emulator/beam/erl_process.c:12616 (`p->i = beam_run_process`): the child
+        // Port of erts/emulator/beam/erl_process.c (erl_create_process: `p->i = beam_run_process`): the child
         // starts at the apply_only sentinel; its first run applies X0..X2
         // (Vm::resolve_run_process).
         child.module = crate::process::RUN_PROCESS;
@@ -1088,7 +1088,7 @@ pub(crate) fn erl_create_process(
         }
         child.group_leader = Some(group_leader);
         child.parent = Some(parent_pid);
-        // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: `args` is
+        // Port of erts/emulator/beam/erl_process.c (erl_create_process: `args` is
         // copied with copy_struct_litopt and the three arg registers take mod, func and the
         // copy), OTP-29.1.1.
         let copied_args = {
@@ -1355,7 +1355,7 @@ struct SpawnOpts {
     priority: Priority,
 }
 
-// Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_process.c (erts_parse_spawn_opts), OTP-29.1.1.
 fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmError> {
     let mut opts = SpawnOpts {
         tuning: SpawnTuning {
