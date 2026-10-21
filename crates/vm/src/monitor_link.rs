@@ -321,6 +321,7 @@ impl<H: NodeHandle> Drop for MonLnkTree<H> {
 }
 
 impl<H: NodeHandle> MonLnkTree<H> {
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.root.is_none()
     }
@@ -335,10 +336,6 @@ impl<H: NodeHandle> MonLnkTree<H> {
                 Ordering::Greater => x = right(x)?,
             }
         }
-    }
-
-    pub(crate) fn contains_key(&self, key: u64) -> bool {
-        self.lookup_node(key).is_some()
     }
 
     /// `left_rotate__`.
@@ -749,6 +746,7 @@ fn list_links_mut<'a>(node: NodePtr) -> &'a mut ListLinks {
 }
 
 impl<I, O> MonitorList<I, O> {
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.first.is_none()
     }
@@ -1045,15 +1043,7 @@ impl<I, O> Monitor<I, O> {
         view.origin_state()
     }
 
-    /// The origin state; `None` on a target half.
-    pub(crate) fn state_mut(&mut self) -> Option<&mut O> {
-        let view: MonitorMut<'_, I, O> = MonitorMut {
-            node: self.node,
-            _monitor: PhantomData,
-        };
-        view.origin_state()
-    }
-
+    #[cfg(test)]
     /// Whether `self` and `other` are the two halves of one monitor.
     pub(crate) fn is_other_half_of(&self, other: &Self) -> bool {
         self.node != other.node && node_to_main(self.node) == node_to_main(other.node)
@@ -1101,10 +1091,6 @@ impl<'a, I, O> MonitorRef<'a, I, O> {
         node_flags(self.node) & node_flag::TYPE_MASK
     }
 
-    pub(crate) fn flags(self) -> u32 {
-        node_flags(self.node)
-    }
-
     pub(crate) fn is_target(self) -> bool {
         node_flags(self.node) & node_flag::TARGET != 0
     }
@@ -1141,20 +1127,6 @@ pub(crate) struct MonitorMut<'a, I, O> {
 }
 
 impl<'a, I, O> MonitorMut<'a, I, O> {
-    pub(crate) fn view(&self) -> MonitorRef<'_, I, O> {
-        MonitorRef {
-            node: self.node,
-            _monitor: PhantomData,
-        }
-    }
-
-    /// Set the holder flags (alias state, spawn and priority flags); the container state and
-    /// the half's identity stay.
-    pub(crate) fn set_flags(&mut self, flags: u32) {
-        let reserved = node_flags(self.node) & node_flag::RESERVED;
-        set_node_flags(self.node, reserved | (flags & !node_flag::RESERVED));
-    }
-
     pub(crate) fn set_other(&mut self, other: u64) {
         set_node_other(self.node, other);
     }
@@ -1258,6 +1230,7 @@ impl Link {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn view_mut(&mut self) -> LinkMut<'_> {
         LinkMut {
             node: self.node,
@@ -1291,16 +1264,18 @@ pub(crate) struct LinkRef<'a> {
 }
 
 impl LinkRef<'_> {
-    pub(crate) fn kind(self) -> u32 {
-        node_flags(self.node) & node_flag::TYPE_MASK
-    }
-
+    #[cfg(test)]
     pub(crate) fn flags(self) -> u32 {
         node_flags(self.node)
     }
 
     pub(crate) fn other(self) -> u64 {
         node_other(self.node)
+    }
+
+    /// `ERTS_ML_FLG_PRIO_ML`: exit signals from the other end are priority messages.
+    pub(crate) fn is_priority(self) -> bool {
+        node_flags(self.node) & node_flag::PRIO_ML != 0
     }
 
     pub(crate) fn unlinking(self) -> u64 {
@@ -1323,9 +1298,10 @@ impl LinkMut<'_> {
         }
     }
 
-    pub(crate) fn set_flags(&mut self, flags: u32) {
-        let reserved = node_flags(self.node) & node_flag::RESERVED;
-        set_node_flags(self.node, reserved | (flags & !node_flag::RESERVED));
+    pub(crate) fn set_priority(&mut self, priority: bool) {
+        let flags = node_flags(self.node) & !node_flag::PRIO_ML;
+        let priority = if priority { node_flag::PRIO_ML } else { 0 };
+        set_node_flags(self.node, flags | priority);
     }
 
     pub(crate) fn set_unlinking(&mut self, unlinking: u64) {

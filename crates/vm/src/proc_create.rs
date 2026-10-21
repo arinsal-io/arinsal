@@ -1016,13 +1016,18 @@ impl OriginMonitor {
     }
 }
 
-/// One local link node (erts `ErtsILink`, erl_monitor_link.h): `unlinking` is the id of the
-/// pending unlink op (0 when none) and `prio` is `ERTS_ML_FLG_PRIO_ML` (EXIT messages from the
-/// peer are priority).
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ILink {
-    pub(crate) unlinking: u64,
-    pub(crate) prio: bool,
+/// `ERTS_P_LINKS`: the local links of a process, keyed by the pid at the other end.
+pub(crate) type LinkTree = crate::monitor_link::MonLnkTree<crate::monitor_link::Link>;
+
+/// A new link to `pid` (`erts_link_internal_create(ERTS_LNK_TYPE_PROC, ...)`); `priority` is
+/// `ERTS_ML_FLG_PRIO_ML`.
+pub(crate) fn process_link(pid: arinsal_sched::Pid, priority: bool) -> crate::monitor_link::Link {
+    let flags = if priority {
+        crate::monitor_link::node_flag::PRIO_ML
+    } else {
+        0
+    };
+    crate::monitor_link::Link::create(crate::monitor_link::node_type::LINK_PROC, pid.data(), flags)
 }
 
 /// Origin state of a local process monitor; the target is the half's `other` and the shared
@@ -1204,7 +1209,7 @@ pub(crate) struct ProcessCold {
     pub(crate) receive_markers: Option<Box<receive::ReceiveMarkers>>,
     pub(crate) receive_marker_uniq: i64,
     /// Link nodes keyed by the other end (erts `ERTS_P_LINKS`, a tree of `ErtsILink`).
-    pub(crate) links: std::collections::BTreeMap<arinsal_sched::Pid, ILink>,
+    pub(crate) links: LinkTree,
     /// Origin entries keyed by reference (erts `ERTS_P_MONITORS`), including standalone aliases,
     /// and the target halves of monitors from remote processes.
     pub(crate) monitors: MonitorTree,

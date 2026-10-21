@@ -4723,7 +4723,10 @@ impl Runtime {
             child.cold_mut().parent_external = Some(Box::new(parent.clone()));
         }
         if let Some(linker) = linker {
-            child.cold_mut().links.insert(linker, Default::default());
+            child
+                .cold_mut()
+                .links
+                .insert(crate::proc_create::process_link(linker, false));
         }
         if let Some((watcher, reference)) = monitor {
             // The watcher is a remote process: the target half is an `ERTS_MON_TYPE_DIST_PROC`
@@ -4869,7 +4872,7 @@ impl Process {
                 }
                 Payload::Signal(Signal::Unlink(id)) => {
                     if let Some(cold) = self.cold.as_mut() {
-                        cold.links.remove(&from);
+                        cold.links.remove(from.data());
                     }
                     let _ = ctx.signal(from, Signal::UnlinkAckSignal(id));
                 }
@@ -5215,10 +5218,11 @@ impl Process {
                 crate::port::demonitor_port(self, ctx.pid(), *port_id, monitor.reference());
             }
         }
-        for (pid, node) in cold.links {
-            if node.unlinking != 0 {
+        for node in cold.links.drain() {
+            if node.view().unlinking() != 0 {
                 continue;
             }
+            let pid = Pid::from_data(node.view().other());
             if self.runtime.as_ref().is_some_and(|runtime| {
                 crate::dist::forward_link_exit_if_proxy(runtime, pid, ctx.pid(), reason)
             }) {
@@ -6292,10 +6296,13 @@ impl Process {
             arinsal_sched::Signal::Link => {
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:6636-6646 (ERTS_SIG_Q_OP_LINK):
                 // the receiver reports getting_linked in signal order, for a new link only.
-                if let std::collections::btree_map::Entry::Vacant(slot) =
-                    self.cold_mut().links.entry(from)
+                if let Err(duplicate) = self
+                    .cold_mut()
+                    .links
+                    .lookup_insert(crate::proc_create::process_link(from, false))
                 {
-                    slot.insert(Default::default());
+                    drop(duplicate);
+                } else {
                     self.trace_getting_linked(ctx, from);
                 }
                 0
@@ -6310,14 +6317,14 @@ impl Process {
             arinsal_sched::Signal::Unlink(id) => {
                 // Port of erl_proc_sig_queue.c:6693-6713: a pending local unlink keeps its
                 // link record until the matching acknowledgement is handled.
-                let removed = self
-                    .cold
-                    .as_mut()
-                    .is_some_and(|cold| match cold.links.get(&from) {
-                        Some(node) if node.unlinking != 0 => false,
-                        Some(_) => cold.links.remove(&from).is_some(),
-                        None => false,
-                    });
+                let removed =
+                    self.cold
+                        .as_mut()
+                        .is_some_and(|cold| match cold.links.get(from.data()) {
+                            Some(node) if node.unlinking() != 0 => false,
+                            Some(_) => cold.links.remove(from.data()).is_some(),
+                            None => false,
+                        });
                 if removed {
                     self.trace_getting_unlinked(ctx, from);
                 }
@@ -6376,15 +6383,16 @@ impl Process {
                 // (handle_exit_signal), OTP-29.1.1: a link exit removes the link and a
                 // process that survives it traces getting_unlinked.
                 let priority = message.is_priority()
-                    || self
-                        .cold
-                        .as_ref()
-                        .is_some_and(|cold| cold.links.get(&from).is_some_and(|node| node.prio));
+                    || self.cold.as_ref().is_some_and(|cold| {
+                        cold.links
+                            .get(from.data())
+                            .is_some_and(|node| node.is_priority())
+                    });
                 let was_linked = linked_exit
                     && self
                         .cold
                         .as_mut()
-                        .is_some_and(|cold| cold.links.remove(&from).is_some());
+                        .is_some_and(|cold| cold.links.remove(from.data()).is_some());
                 let mut message = message;
                 let seq_token = message.take_seq_token();
                 let reason = message.into_receiver(self)?;
@@ -6486,10 +6494,10 @@ impl Process {
                 if let Some(cold) = self.cold.as_mut()
                     && cold
                         .links
-                        .get(&from)
-                        .is_some_and(|node| node.unlinking == id)
+                        .get(from.data())
+                        .is_some_and(|node| node.unlinking() == id)
                 {
-                    cold.links.remove(&from);
+                    cold.links.remove(from.data());
                     4
                 } else {
                     0
