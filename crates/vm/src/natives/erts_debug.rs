@@ -1877,7 +1877,12 @@ impl Relations {
             links: cold
                 .links
                 .iter()
-                .map(|(&pid, node)| (pid, node.unlinking != 0))
+                .map(|node| {
+                    (
+                        arinsal_sched::Pid::from_data(node.other()),
+                        node.unlinking() != 0,
+                    )
+                })
                 .collect(),
             monitors: cold
                 .monitors
