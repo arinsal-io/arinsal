@@ -1128,9 +1128,15 @@ pub(crate) fn erl_create_process(
         }
         Ok(())
     };
-    let make_child = || Process::with_spawn_registers_heap(3, 0, heap);
     let spawned = spawn_scheduler(parent)?
-        .spawn_unscheduled_init(make_child, init_child, so.priority, so.scheduler)
+        .spawn_unscheduled_init(
+            |slot: &mut std::mem::MaybeUninit<Process>| {
+                Process::write_spawn_registers_heap(slot, 3, 0, heap)
+            },
+            init_child,
+            so.priority,
+            so.scheduler,
+        )
         .map_err(|error| match error {
             arinsal_sched::SpawnInitError::Init(error) => error,
             arinsal_sched::SpawnInitError::Table(error) => {

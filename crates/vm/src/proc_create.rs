@@ -1667,13 +1667,26 @@ impl Process {
         float_registers: usize,
         heap: ProcessHeap,
     ) -> Self {
-        let mut process = Self::with_registers_and_heap(x_registers, float_registers, heap);
+        let mut slot = std::mem::MaybeUninit::uninit();
+        Self::write_spawn_registers_heap(&mut slot, x_registers, float_registers, heap);
+        // SAFETY: `write_spawn_registers_heap` initialized the slot.
+        unsafe { slot.assume_init() }
+    }
+    /// [`Self::with_spawn_registers_heap`] written straight into `slot`, the task slot of the
+    /// allocated process struct (erl_create_process initializes the fields in place).
+    pub(crate) fn write_spawn_registers_heap(
+        slot: &mut std::mem::MaybeUninit<Self>,
+        x_registers: usize,
+        float_registers: usize,
+        heap: ProcessHeap,
+    ) -> &mut Self {
+        let process = Self::write_registers_and_heap(slot, x_registers, float_registers, heap);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;
         process.header.arity = x_registers.min(usize::from(u8::MAX)) as u8;
         if !crate::beamasm_integration::enabled() {
-            crate::native_bridge::push_exit_bridge(&mut process);
+            crate::native_bridge::push_exit_bridge(process);
         }
         process
     }
@@ -1704,11 +1717,22 @@ impl Process {
         float_registers: usize,
         heap: ProcessHeap,
     ) -> Self {
+        let mut slot = std::mem::MaybeUninit::uninit();
+        Self::write_registers_and_heap(&mut slot, x_registers, float_registers, heap);
+        // SAFETY: `write_registers_and_heap` initialized the slot.
+        unsafe { slot.assume_init() }
+    }
+    fn write_registers_and_heap(
+        slot: &mut std::mem::MaybeUninit<Self>,
+        x_registers: usize,
+        float_registers: usize,
+        heap: ProcessHeap,
+    ) -> &mut Self {
         #[cfg(feature = "pf-mem-counters")]
         let started = std::time::Instant::now();
         #[cfg(feature = "pf-mem-counters")]
         let min_heap = heap.min_heap_size_words();
-        let mut process = Self {
+        let process = slot.write(Self {
             header: ProcessHeader::default(),
             x: ArgRegs::new(x_registers),
             fr: vec![0.0; float_registers].into_boxed_slice(),
@@ -1766,7 +1790,7 @@ impl Process {
             native_arity_set: false,
             native_error_pc: 0,
             native_exit_kind: NativeExit::None,
-        };
+        });
         process.sync_header();
         #[cfg(feature = "pf-mem-counters")]
         if min_heap == 233 {
