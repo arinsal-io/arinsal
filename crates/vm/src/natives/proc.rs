@@ -947,13 +947,17 @@ fn process_info_item_links(process: &mut Process, pid: Pid) -> Result<Term, VmEr
             .cold
             .as_ref()
             .map(|cold| {
-                cold.links
+                // Port of erts/emulator/beam/erl_bif_info.c (collect_one_link, OTP-29.1.1):
+                // process_info/2 omits links while their unlink is pending, and conses each
+                // link onto the result in tree foreach order.
+                let mut links = cold
+                    .links
                     .iter()
-                    // Port of erts/emulator/beam/erl_bif_info.c:574-590 (collect_one_link),
-                    // OTP-29.1.1: process_info/2 omits links while their unlink is pending.
-                    .filter(|(_, node)| node.unlinking == 0)
-                    .filter_map(|(p, _)| p.to_term())
-                    .collect::<Vec<_>>()
+                    .filter(|node| node.unlinking() == 0)
+                    .filter_map(|node| Pid::from_data(node.other()).to_term())
+                    .collect::<Vec<_>>();
+                links.reverse();
+                links
             })
             .unwrap_or_default();
         let mut links = links;

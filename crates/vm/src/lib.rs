@@ -30,7 +30,6 @@ mod proc_create;
 // ---- vm_funs ----
 mod funs;
 mod lists;
-#[allow(dead_code)]
 mod monitor_link;
 mod process;
 mod register;

@@ -1125,7 +1125,7 @@ pub(crate) fn erl_create_process(
             child
                 .cold_mut()
                 .links
-                .insert(parent_pid, Default::default());
+                .insert(crate::proc_create::process_link(parent_pid, false));
         }
         if let Some(target) = monitor_target {
             child.cold_mut().lt_monitors.insert(target);
@@ -1158,7 +1158,10 @@ pub(crate) fn erl_create_process(
     };
     let pid = spawned.pid();
     if so.link {
-        parent.cold_mut().links.insert(pid, Default::default());
+        parent
+            .cold_mut()
+            .links
+            .insert(crate::proc_create::process_link(pid, false));
     }
     if crate::trace::spawn_interested(parent, parent_pid) {
         let arg_list = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut parent.heap))
@@ -2496,12 +2499,12 @@ pub(crate) fn demonitor_light(
 fn unlink_mark(process: &mut Process, pid: Pid, id: u64, sent: bool) {
     let links = &mut process.cold_mut().links;
     if sent {
-        if let Some(node) = links.get_mut(&pid) {
-            node.unlinking = id;
-            node.prio = false;
+        if let Some(mut node) = links.get_mut(pid.data()) {
+            node.set_unlinking(id);
+            node.set_priority(false);
         }
     } else {
-        links.remove(&pid);
+        links.remove(pid.data());
     }
 }
 
@@ -2521,7 +2524,11 @@ pub(crate) fn unlink_light(
     let me = process.self_pid?;
     // erts reads the runtime through globals; borrow it per use instead of a refcounted clone.
     let cold = process.cold.as_deref()?;
-    if !cold.links.get(&pid).is_some_and(|node| node.unlinking == 0) {
+    if !cold
+        .links
+        .get(pid.data())
+        .is_some_and(|node| node.unlinking() == 0)
+    {
         return Some(Ok(atom("true")));
     }
     let id = rt_ref(process)?.next_ref();
@@ -2562,10 +2569,14 @@ pub(crate) fn link_light(
         .cold
         .as_deref()?
         .links
-        .get(&pid)
-        .is_some_and(|node| node.unlinking == 0)
+        .get(pid.data())
+        .is_some_and(|node| node.unlinking() == 0)
     {
-        process.cold_mut().links.get_mut(&pid)?.prio = false;
+        process
+            .cold_mut()
+            .links
+            .get_mut(pid.data())?
+            .set_priority(false);
         return Some(Ok(atom("true")));
     }
     // A refused signal means the target is gone: leave the link state untouched and let the
@@ -3111,10 +3122,11 @@ fn call_resolved(
                         &[pid_term],
                     );
                 }
-                let should_unlink = process
-                    .cold
-                    .as_deref()
-                    .is_some_and(|cold| cold.links.get(&pid).is_some_and(|n| n.unlinking == 0));
+                let should_unlink = process.cold.as_deref().is_some_and(|cold| {
+                    cold.links
+                        .get(pid.data())
+                        .is_some_and(|node| node.unlinking() == 0)
+                });
                 if should_unlink {
                     let id = process
                         .runtime
@@ -4556,18 +4568,16 @@ fn link_opt(
 /// `erts_link_internal_tree_lookup_create` plus the `unlinking` reset of `link_opt`
 /// (bif.c:165-183): returns whether a link signal must be sent.
 fn link_node_create(cold: &mut crate::proc_create::ProcessCold, pid: Pid, priority: bool) -> bool {
-    use std::collections::btree_map::Entry;
-    match cold.links.entry(pid) {
-        Entry::Occupied(mut slot) => {
-            let node = slot.get_mut();
-            node.prio = priority;
-            std::mem::take(&mut node.unlinking) != 0
+    match cold.links.get_mut(pid.data()) {
+        Some(mut node) => {
+            node.set_priority(priority);
+            let unlinking = node.view().unlinking();
+            node.set_unlinking(0);
+            unlinking != 0
         }
-        Entry::Vacant(slot) => {
-            slot.insert(crate::proc_create::ILink {
-                unlinking: 0,
-                prio: priority,
-            });
+        None => {
+            cold.links
+                .insert(crate::proc_create::process_link(pid, priority));
             true
         }
     }
