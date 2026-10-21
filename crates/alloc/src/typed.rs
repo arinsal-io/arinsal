@@ -21,7 +21,7 @@ impl std::fmt::Debug for ErtsAlcType {
 
 /// Name and serving allocator (index in `ALLOCATOR_NAMES`, mapped like erl_alloc.types) of each
 /// type, indexed by the type number.
-const ALC_TYPES: [(&str, u8); 19] = [
+const ALC_TYPES: [(&str, u8); 20] = [
     ("HEAP", 4),
     ("OLD_HEAP", 4),
     ("HEAP_FRAG", 4),
@@ -41,6 +41,7 @@ const ALC_TYPES: [(&str, u8); 19] = [
     ("ATOM_TXT", 3),
     ("FUN_ENTRY", 3),
     ("TMP", 0),
+    ("PROC", 6),
 ];
 
 impl ErtsAlcType {
@@ -82,10 +83,21 @@ impl ErtsAlcType {
     pub const FUN_ENTRY: Self = Self(17);
     /// Short-lived scratch (`ERTS_ALC_T_TMP`), the temporary allocator.
     pub const TMP: Self = Self(18);
+    /// Process structures (`ERTS_ALC_T_PROC`), a fixed-size type of fix_alloc.
+    pub const PROC: Self = Self(19);
 
     /// Name generated from `erl_alloc.types`.
     pub const fn name(self) -> &'static str {
         ALC_TYPES[self.0 as usize].0
+    }
+
+    /// Index of this type among the fixed-size types (`ERTS_ALC_FIX_TYPE_IX`), `None` for a type
+    /// of another class.
+    const fn fix_index(self) -> Option<usize> {
+        match self.0 {
+            19 => Some(0),
+            _ => None,
+        }
     }
 
     /// Index of the allocator serving this type in `ALLOCATOR_NAMES`, mapped like erl_alloc.types.
@@ -824,6 +836,47 @@ fn allocator_for(
         .ok_or(AllocError::InvalidAllocation)
 }
 
+/// Allocates one block of the fixed-size type `allocation_type` (`bytes` long, the same on every
+/// call) on the instance of the calling thread, whose allocator index is `ix`; returns the handle
+/// that frees it and the payload address.
+///
+/// Port of erts/emulator/beam/erl_alloc.h (erts_alloc of a FIXED_SIZE type, served by fix_alloc
+/// through fix_cpool_alloc), OTP-29.1.1.
+pub fn fix_alloc_at(
+    ix: usize,
+    allocation_type: ErtsAlcType,
+    bytes: usize,
+) -> Result<(InstanceAllocation, *mut u64), AllocError> {
+    let fix_ix = allocation_type
+        .fix_index()
+        .ok_or(AllocError::InvalidAllocation)?;
+    allocator_for(allocation_type)?.fix_alloc_with_ptr_at(ix, fix_ix, bytes)
+}
+
+/// Frees a block from [`fix_alloc_at`] from the thread with allocator index `ix`.
+///
+/// Port of erts/emulator/beam/erl_alloc.h (erts_free of a FIXED_SIZE type), OTP-29.1.1.
+pub fn fix_free_at(
+    ix: usize,
+    allocation_type: ErtsAlcType,
+    handle: InstanceAllocation,
+) -> Result<(), AllocError> {
+    let fix_ix = allocation_type
+        .fix_index()
+        .ok_or(AllocError::InvalidAllocation)?;
+    allocator_for(allocation_type)?.fix_free_at(ix, fix_ix, handle)
+}
+
+/// Blocks of the fixed-size type `allocation_type` in use and allocated on `instance`.
+pub fn fix_info(allocation_type: ErtsAlcType, instance: usize) -> Option<(usize, usize)> {
+    let fix_ix = allocation_type.fix_index()?;
+    Some(
+        allocator_for(allocation_type)
+            .ok()?
+            .fix_info(instance, fix_ix),
+    )
+}
+
 fn for_each_allocator(mut visit: impl FnMut(&ThreadSpecificAllocators)) {
     for allocators in registry().iter().flatten() {
         visit(allocators);
@@ -974,5 +1027,24 @@ mod tests {
     fn typed_block_can_be_dropped_on_another_thread() {
         let block = AllocBlock::new(ErtsAlcType::HEAP_FRAG, 8).unwrap();
         std::thread::spawn(move || drop(block)).join().unwrap();
+    }
+
+    #[test]
+    fn fixed_size_blocks_come_back_from_the_free_list() {
+        use super::{ErtsAlcType, fix_alloc_at, fix_free_at};
+        let ix = crate::instances::thread_alloc_ix();
+        let (first, first_ptr) = fix_alloc_at(ix, ErtsAlcType::PROC, 1200).unwrap();
+        fix_free_at(ix, ErtsAlcType::PROC, first).unwrap();
+        let (second, second_ptr) = fix_alloc_at(ix, ErtsAlcType::PROC, 1200).unwrap();
+        assert_eq!(first_ptr, second_ptr);
+        let handle = std::thread::spawn(move || {
+            let ix = crate::instances::thread_alloc_ix();
+            fix_free_at(ix, ErtsAlcType::PROC, second).unwrap();
+        });
+        handle.join().unwrap();
+        let (third, third_ptr) = fix_alloc_at(ix, ErtsAlcType::PROC, 1200).unwrap();
+        assert_eq!(third_ptr, second_ptr);
+        fix_free_at(ix, ErtsAlcType::PROC, third).unwrap();
+        assert!(fix_alloc_at(ix, ErtsAlcType::HEAP, 8).is_err());
     }
 }
