@@ -491,12 +491,7 @@ fn route_incoming(
                 watcher,
                 target,
                 if *op == 19 {
-                    arinsal_sched::Signal::Monitor {
-                        reference,
-                        shared: arinsal_sched::SharedPayload(
-                            crate::proc_create::default_monitor_data(),
-                        ),
-                    }
+                    crate::proc_create::remote_monitor_signal(reference, watcher, target)
                 } else {
                     Signal::Demonitor(reference)
                 },
@@ -1217,12 +1212,7 @@ fn route_incoming_port(
             remember_remote_monitor_ref(handle, reference, &parts[3], *op == 19)?;
             if let Some(target) = target {
                 let signal = if *op == 19 {
-                    arinsal_sched::Signal::Monitor {
-                        reference,
-                        shared: arinsal_sched::SharedPayload(
-                            crate::proc_create::default_monitor_data(),
-                        ),
-                    }
+                    crate::proc_create::remote_monitor_signal(reference, watcher, target)
                 } else {
                     Signal::Demonitor(reference)
                 };
@@ -2178,10 +2168,14 @@ pub(crate) fn native_signal(
             )?;
             remember_monitor(&node, id, target)?;
             process.cold_mut().dist_monitors.insert(id);
-            process.cold_mut().monitors.insert(
-                id,
-                crate::proc_create::OriginMonitor::Distributed { alias_mode },
-            );
+            process
+                .cold_mut()
+                .monitors
+                .insert(crate::proc_create::origin_monitor(
+                    id,
+                    0,
+                    crate::proc_create::OriginMonitor::Distributed { alias_mode },
+                ));
             Ok(reference)
         }
         "demonitor" => {
