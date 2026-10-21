@@ -81,7 +81,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use timer::{CanceledTimer, LinkEvent, TimerCommand, TimerPayload, Wheel};
@@ -1137,7 +1137,13 @@ impl<T: Task> Process<T> {
 struct ProcessTable<T: Task> {
     ids: PtabIdRing,
     /// `ptab->list.data.rwmtx`: test_next_id excludes concurrent inserts and removals.
-    lock: RwLock<()>,
+    /// Port of erts/emulator/beam/erl_ptab.c (erts_ptab_init_table:
+    /// `ERTS_RWMTX_TYPE_EXTREMELY_FREQUENT_READ`), OTP-29.1.1: inserts and removals take it
+    /// as readers, each on its own reader-group line.
+    lock: arinsal_term::FrequentReadRwLock<()>,
+    /// `ptab->list.data.interval`: read into each new element's `started_interval` and
+    /// stepped only when a later interval is needed.
+    interval: AtomicU64,
     pages: Vec<OnceLock<ProcessPage<T>>>,
 }
 
@@ -1159,7 +1165,8 @@ impl<T: Task> ProcessTable<T> {
         let pages = (ids.layout().max() as usize).div_ceil(PID_PAGE_SIZE);
         Self {
             ids,
-            lock: RwLock::new(()),
+            lock: arinsal_term::FrequentReadRwLock::new(()),
+            interval: AtomicU64::new(0),
             pages: (0..pages).map(|_| OnceLock::new()).collect(),
         }
     }
@@ -1190,16 +1197,17 @@ impl<T: Task> ProcessTable<T> {
         bound_worker: Option<usize>,
     ) -> Result<Arc<Process<T>>, Error> {
         // Port of erts/emulator/beam/erl_ptab.c:500 (erts_ptab_new_element), OTP-29.1.1.
-        let _shared = self.lock.read().unwrap();
+        let _shared = self.lock.read();
         let data = self.ids.reserve().ok_or(Error::Capacity)?;
         let pid = Pid::from_data(data);
         let pix = self.ids.layout().data2pix(data) as usize;
         let page = self.pages[pix / PID_PAGE_SIZE].get_or_init(ProcessPage::new);
         let offset = pix % PID_PAGE_SIZE;
-        static NEXT_STARTED_INTERVAL: AtomicU64 = AtomicU64::new(1);
         let process = Arc::new(Process {
             pid,
-            started_interval: NEXT_STARTED_INTERVAL.fetch_add(1, Ordering::Relaxed),
+            // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
+            // erts_current_interval_nob), OTP-29.1.1.
+            started_interval: self.interval.load(Ordering::Relaxed),
             user_priority: AtomicU8::new(priority.index() as u8),
             active: AtomicBool::new(true),
             sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
@@ -1263,7 +1271,7 @@ impl<T: Task> ProcessTable<T> {
 
     fn remove(&self, pid: Pid) {
         // Port of erts/emulator/beam/erl_ptab.c:675 (erts_ptab_delete_element), OTP-29.1.1.
-        let _shared = self.lock.read().unwrap();
+        let _shared = self.lock.read();
         let guard = &epoch::pin();
         let (page, offset) = self.page(self.index(pid)).expect("live pid has a page");
         let slot = &page.slots[offset];
@@ -1341,7 +1349,7 @@ impl<T: Task> ProcessTable<T> {
 
     fn test_next_id(&self, set: bool, next: u64) -> u64 {
         // Port of erts/emulator/beam/erl_ptab.c:1356 (erts_ptab_test_next_id), OTP-29.1.1.
-        let _exclusive = self.lock.write().unwrap();
+        let _exclusive = self.lock.write();
         self.ids
             .test_next_id(set, next, |pix| self.slot_occupied(pix))
     }
@@ -5890,13 +5898,26 @@ impl<T: Task> Scheduler<T> {
     pub fn lookup(&self, pid: Pid) -> bool {
         self.inner.table.with_live(pid, |_| ()).is_some()
     }
-    /// Creation order of the live task with this pid; differs between incarnations
-    /// of a reused pid. Port of erts/emulator/beam/erl_db.c:4908 (heir_started_interval), OTP-29.1.1.
+    /// The process table interval the live task with this pid started in.
+    /// Port of erts/emulator/beam/erl_db.c (heir_started_interval), OTP-29.1.1.
     pub fn started_interval(&self, pid: Pid) -> Option<u64> {
         self.inner
             .table
             .lookup(pid)
             .map(|process| process.started_interval)
+    }
+    /// [`Self::started_interval`] of a new ETS heir, after making sure the table interval is
+    /// later, so a later incarnation of the same pid starts in a different interval.
+    ///
+    /// Port of erts/emulator/beam/erl_db.c (set_heir) and utils.c
+    /// (ensure_later_interval_nob), OTP-29.1.1.
+    pub fn heir_started_interval(&self, pid: Pid) -> Option<u64> {
+        let started = self.started_interval(pid)?;
+        let interval = &self.inner.table.interval;
+        if interval.load(Ordering::Relaxed) <= started {
+            interval.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(started)
     }
     /// Whether a live task's last slice ended active (erts `ERTS_PSFLG_ACTIVE`).
     pub fn is_active(&self, pid: Pid) -> Option<bool> {
