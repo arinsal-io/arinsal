@@ -13,7 +13,7 @@ use arinsal_term::{
     Atom, ProcessHeap, SharedCopyCache, Term, TermBuilder, VecHeap, copy_struct_litopt, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms, size_object,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
@@ -142,13 +142,14 @@ pub(crate) struct RootSlot {
     token: bool,
 }
 
-/// Private message queue whose detached fragments remain owned by each entry.
+/// The message queue (the inner queue of erts `ErtsSignalPrivQueues`): message nodes in
+/// arrival order, each owning its data when that is not on the process heap.
 ///
-/// Port of erts/emulator/beam/erl_proc_sig_queue.c:1285 (private message queue), OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_proc_sig_queue.c (private message queue), OTP-29.1.1.
 /// Priority messages occupy the leading range recorded in `ProcessCold`.
 #[derive(Default)]
 pub(crate) struct MessageQueue {
-    entries: VecDeque<QueuedMessage>,
+    entries: arinsal_sched::MessageQueueList<Event<Message>>,
 }
 
 /// A message in the message queue: the signal node it arrived in, relinked from the middle
@@ -157,75 +158,54 @@ pub(crate) struct MessageQueue {
 /// built itself.
 pub(crate) type MessageNode = arinsal_sched::OwnedSignal<Event<Message>>;
 
-struct QueuedMessage(MessageNode);
-
-impl QueuedMessage {
-    fn new(term: Term, fragment: Option<Box<MessageFragment>>, seq_nil: bool) -> Self {
-        let mut message = Message::immediate(term);
-        message.fragment = fragment;
-        message.seq_nil = seq_nil;
-        Self(arinsal_sched::OwnedSignal::new(Event {
-            from: Pid::from_data(0),
-            payload: Payload::Message(message),
-        }))
+/// The message of a message-queue node.
+fn queued(event: &Event<Message>) -> &Message {
+    match &event.payload {
+        Payload::Message(message) => message,
+        _ => unreachable!("the message queue holds message nodes only"),
     }
 }
 
+fn queued_mut(event: &mut Event<Message>) -> &mut Message {
+    match &mut event.payload {
+        Payload::Message(message) => message,
+        _ => unreachable!("the message queue holds message nodes only"),
+    }
+}
+
+/// A message node outside the queue.
+struct QueuedMessage(MessageNode);
+
 impl QueuedMessage {
-    /// The words of data held inline in this message's node (`ERTS_MSG_COMBINED_HFRAG`).
-    fn inline_words(&self) -> Option<&[u64]> {
-        if self.combined {
-            self.0.fragment_words()
-        } else {
-            None
-        }
+    fn node(term: Term, fragment: Option<Box<MessageFragment>>, seq_nil: bool) -> MessageNode {
+        let mut message = Message::immediate(term);
+        message.fragment = fragment;
+        message.seq_nil = seq_nil;
+        arinsal_sched::OwnedSignal::new(Event {
+            from: Pid::from_data(0),
+            payload: Payload::Message(message),
+        })
     }
 
-    /// Move the inline data out as a fragment of its own, leaving the message in a node
+    /// Move the inline data out as a fragment of its own, giving back the message in a node
     /// without data (erts_shrink_message to a message reference after
     /// erts_proc_sig_move_msgs_to_heap or a literal copy moved the data).
-    fn detach_inline(&mut self) -> Option<arinsal_term::message::NodeFragment> {
-        if !self.combined {
-            return None;
+    fn detach_inline(self) -> (MessageNode, Option<arinsal_term::message::NodeFragment>) {
+        if !queued(&self.0).combined {
+            return (self.0, None);
         }
-        self.combined = false;
-        let placeholder = arinsal_sched::OwnedSignal::new(Event {
-            from: Pid::from_data(0),
-            payload: Payload::Message(Message::immediate(Term::NIL)),
-        });
-        let node = std::mem::replace(&mut self.0, placeholder);
-        let (value, fragment) = node.split_fragment();
-        *self.0 = value;
-        fragment
+        let (mut value, fragment) = self.0.split_fragment();
+        queued_mut(&mut value).combined = false;
+        (arinsal_sched::OwnedSignal::new(value), fragment)
     }
 
     /// The node released into the receiver's heap: its inline data becomes a fragment of the
     /// process (`erts_save_message_in_proc`); any other data was adopted already.
     fn save_in_process(self, heap: &mut ProcessHeap) {
-        if self.combined
+        if queued(&self.0).combined
             && let Some(fragment) = self.0.into_fragment()
         {
             heap.adopt_message_node(fragment);
-        }
-    }
-}
-
-impl std::ops::Deref for QueuedMessage {
-    type Target = Message;
-
-    fn deref(&self) -> &Message {
-        match &self.0.payload {
-            Payload::Message(message) => message,
-            _ => unreachable!("the message queue holds message nodes only"),
-        }
-    }
-}
-
-impl std::ops::DerefMut for QueuedMessage {
-    fn deref_mut(&mut self) -> &mut Message {
-        match &mut self.0.payload {
-            Payload::Message(message) => message,
-            _ => unreachable!("the message queue holds message nodes only"),
         }
     }
 }
@@ -242,12 +222,12 @@ impl MessageQueue {
     /// Append a process-owned term, such as a locally generated control message.
     pub(crate) fn push_back(&mut self, term: Term) {
         self.entries
-            .push_back(QueuedMessage::new(term, None, false));
+            .push_back(QueuedMessage::node(term, None, false));
     }
 
     /// Append a message that carries a seq_trace token.
     pub(crate) fn push_back_token(&mut self, term: Term, token: Box<crate::seq_trace::Token>) {
-        self.entries.push_back(QueuedMessage::new(
+        self.entries.push_back(QueuedMessage::node(
             term,
             Some(Box::new(MessageFragment {
                 heap: None,
@@ -259,14 +239,15 @@ impl MessageQueue {
 
     /// Append a message from a process without a token (`ERL_MESSAGE_TOKEN == NIL`).
     pub(crate) fn push_back_nil(&mut self, term: Term) {
-        self.entries.push_back(QueuedMessage::new(term, None, true));
+        self.entries
+            .push_back(QueuedMessage::node(term, None, true));
     }
 
     /// Insert after the last accepted priority message.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (`insert_prepared_prio_msg`), OTP-29.1.1.
     pub(crate) fn push_priority(&mut self, term: Term, prio_len: usize) -> usize {
         self.entries
-            .insert(prio_len, QueuedMessage::new(term, None, false));
+            .insert(prio_len, QueuedMessage::node(term, None, false));
         prio_len + 1
     }
 
@@ -274,12 +255,11 @@ impl MessageQueue {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_incoming: a
     // message signal is moved onto the message queue as it is), OTP-29.1.1.
     pub(crate) fn push_message_node(&mut self, node: MessageNode, prio_len: usize) -> usize {
-        let entry = QueuedMessage(node);
-        if entry.priority {
-            self.entries.insert(prio_len, entry);
+        if queued(&node).priority {
+            self.entries.insert(prio_len, node);
             prio_len + 1
         } else {
-            self.entries.push_back(entry);
+            self.entries.push_back(node);
             prio_len
         }
     }
@@ -296,53 +276,37 @@ impl MessageQueue {
             !message.combined,
             "a message with inline data stays in its node"
         );
-        let priority = message.priority;
-        let mut new_prio_len = prio_len;
-        let mut push = |queue: &mut Self, entry: QueuedMessage| {
-            if priority {
-                queue.entries.insert(new_prio_len, entry);
-                new_prio_len += 1;
-            } else {
-                queue.entries.push_back(entry);
-            }
-        };
-        if message.fragment.is_none() {
-            push(
-                self,
-                QueuedMessage::new(message.term, None, message.seq_nil),
-            );
-            return Ok(new_prio_len);
-        }
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_fetch), OTP-29.1.1:
-        // fetching links the message into the private queue as is. Its data stays in the
-        // heap fragment in both queue modes; with an on-heap queue the next collection
-        // moves it onto the heap (move_msgs_to_heap), and receiving it first saves the
-        // fragment in the process (erts_save_message_in_proc).
-        push(
-            self,
-            QueuedMessage::new(message.term, message.fragment, message.seq_nil),
-        );
-        Ok(new_prio_len)
+        let node = QueuedMessage::node(message.term, message.fragment, message.seq_nil);
+        let mut node = node;
+        queued_mut(&mut node).priority = message.priority;
+        Ok(self.push_message_node(node, prio_len))
     }
 
     pub(crate) fn get(&self, index: usize) -> Option<&Term> {
-        self.entries.get(index).map(|entry| &entry.term)
+        self.entries.get(index).map(|entry| &queued(entry).term)
     }
 
     /// Whether the message's data lives on the receiver's heap (no off-heap fragment holds it).
     pub(crate) fn is_on_heap(&self, index: usize) -> bool {
-        self.entries.get(index).is_some_and(|entry| {
+        self.entries.get(index).map(queued).is_some_and(|entry| {
             !entry.combined && entry.fragment.as_ref().is_none_or(|f| f.heap.is_none())
+        })
+    }
+
+    /// The fragment words of messages whose data is inline in their node, with the message.
+    fn with_inline_words(&self) -> impl Iterator<Item = (&Message, Option<&[u64]>)> {
+        self.entries.iter_with_fragments().map(|(entry, words)| {
+            let message = queued(entry);
+            (message, words.filter(|_| message.combined))
         })
     }
 
     /// Words in message fragments that `process_info(total_heap_size)` counts for on-heap queues.
     // Port of erts/emulator/beam/erl_message.h (erts_msg_attached_data_size), OTP-29.1.1.
     pub(crate) fn attached_message_words(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|entry| {
-                entry.inline_words().map_or(0, <[u64]>::len)
+        self.with_inline_words()
+            .map(|(entry, inline)| {
+                inline.map_or(0, <[u64]>::len)
                     + entry
                         .fragment
                         .as_ref()
@@ -358,15 +322,16 @@ impl MessageQueue {
         start: usize,
         mut matches: impl FnMut(&Term) -> bool,
     ) -> Option<usize> {
-        let start = start.min(self.entries.len());
         self.entries
-            .range(start..)
-            .position(|entry| matches(&entry.term))
-            .map(|offset| start + offset)
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, entry)| matches(&queued(entry).term))
+            .map(|(index, _)| index)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Term> {
-        self.entries.iter().map(|entry| &entry.term)
+        self.entries.iter().map(|entry| &queued(entry).term)
     }
 
     /// Remove a message, transferring any off-heap fragment into the process heap.
@@ -391,7 +356,7 @@ impl MessageQueue {
         heap: &mut ProcessHeap,
         receiver_has_token: bool,
     ) -> Result<bool, VmError> {
-        let Some(entry) = self.entries.front_mut() else {
+        let Some(entry) = self.entries.front_mut().map(queued_mut) else {
             return Ok(false);
         };
         if (entry.seq_nil && receiver_has_token)
@@ -411,8 +376,8 @@ impl MessageQueue {
                 VmError::Unsupported(format!("message fragment adoption: {error:?}"))
             })?;
         }
-        if let Some(entry) = self.entries.pop_front() {
-            entry.save_in_process(heap);
+        if let Some(node) = self.entries.pop_front() {
+            QueuedMessage(node).save_in_process(heap);
         }
         Ok(true)
     }
@@ -424,26 +389,24 @@ impl MessageQueue {
         prio_len: usize,
     ) -> Result<(Option<RemovedMessage>, usize), VmError> {
         let mut state = crate::seq_trace::SeqState::Undefined;
-        if let Some(entry) = self.entries.get_mut(index)
-            && entry.seq_nil
-        {
-            state = crate::seq_trace::SeqState::Nil;
-        }
-        if let Some(entry) = self.entries.get_mut(index)
-            && let Some(fragment) = entry.fragment.as_mut()
-        {
-            if let Some(token) = fragment.seq_token.take() {
-                state = crate::seq_trace::SeqState::Token(token);
+        if let Some(entry) = self.entries.get_mut(index).map(queued_mut) {
+            if entry.seq_nil {
+                state = crate::seq_trace::SeqState::Nil;
             }
-            if let Some(heap_fragment) = fragment.heap.take() {
-                heap.adopt_message_heap(heap_fragment).map_err(|error| {
-                    VmError::Unsupported(format!("message fragment adoption: {error:?}"))
-                })?;
+            if let Some(fragment) = entry.fragment.as_mut() {
+                if let Some(token) = fragment.seq_token.take() {
+                    state = crate::seq_trace::SeqState::Token(token);
+                }
+                if let Some(heap_fragment) = fragment.heap.take() {
+                    heap.adopt_message_heap(heap_fragment).map_err(|error| {
+                        VmError::Unsupported(format!("message fragment adoption: {error:?}"))
+                    })?;
+                }
             }
         }
-        let removed = self.entries.remove(index).map(|entry| {
-            let term = entry.term;
-            entry.save_in_process(heap);
+        let removed = self.entries.remove(index).map(|node| {
+            let term = queued(&node).term;
+            QueuedMessage(node).save_in_process(heap);
             (term, state)
         });
         let prio_len = prio_len - usize::from(removed.is_some() && index < prio_len);
@@ -456,7 +419,7 @@ impl MessageQueue {
     pub(crate) fn gc_root_snapshot(&self) -> (Vec<RootSlot>, Vec<Term>) {
         let mut slots = Vec::new();
         let mut roots = Vec::new();
-        for (index, entry) in self.entries.iter().enumerate() {
+        for (index, entry) in self.entries.iter().map(queued).enumerate() {
             let on_heap = !entry.combined
                 && entry
                     .fragment
@@ -488,30 +451,31 @@ impl MessageQueue {
         (slots, roots)
     }
 
+    /// Whether a message's data refers to the retiring `area`.
+    fn references_area(entry: &Message, inline: Option<&[u64]>, area: &RetiredArea) -> bool {
+        area.contains(entry.term)
+            || inline.is_some_and(|words| {
+                arinsal_term::message::words_have_heap_reference(words, |term| area.contains(term))
+            })
+            || entry
+                .fragment
+                .as_ref()
+                .and_then(|fragment| fragment.heap.as_ref())
+                .is_some_and(|heap| heap.has_heap_reference(|term| area.contains(term)))
+    }
+
     /// Check queue roots and detached fragments for pointers into a retiring area.
     // Port of erts/emulator/beam/beam_bif_load.c:1046-1092, OTP-29.1.1.
     pub(crate) fn has_literal_area_reference(&self, area: &RetiredArea) -> bool {
-        self.entries.iter().any(|entry| {
-            area.contains(entry.term)
-                || entry.inline_words().is_some_and(|words| {
-                    arinsal_term::message::words_have_heap_reference(words, |term| {
-                        area.contains(term)
-                    })
-                })
-                || entry
-                    .fragment
-                    .as_ref()
-                    .and_then(|fragment| fragment.heap.as_ref())
-                    .is_some_and(|heap| heap.has_heap_reference(|term| area.contains(term)))
-        })
+        self.with_inline_words()
+            .any(|(entry, inline)| Self::references_area(entry, inline, area))
     }
 
     /// Maximum detached message words inspected by literal-copy checks.
     pub(crate) fn literal_scan_words(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|entry| {
-                1 + entry.inline_words().map_or(0, <[u64]>::len)
+        self.with_inline_words()
+            .map(|(entry, inline)| {
+                1 + inline.map_or(0, <[u64]>::len)
                     + entry
                         .fragment
                         .as_ref()
@@ -519,6 +483,17 @@ impl MessageQueue {
                         .map_or(0, arinsal_term::message::MessageHeap::literal_scan_words)
             })
             .sum()
+    }
+
+    /// Move the inline data of the message at `index` out of its node.
+    fn detach_inline_at(&mut self, index: usize) -> Option<arinsal_term::message::NodeFragment> {
+        if !self.entries.get(index).map(queued)?.combined {
+            return None;
+        }
+        let node = self.entries.remove(index)?;
+        let (node, fragment) = QueuedMessage(node).detach_inline();
+        self.entries.insert(index, node);
+        fragment
     }
 
     /// Move affected detached message terms into the process heap before releasing their area.
@@ -530,21 +505,14 @@ impl MessageQueue {
     ) -> Result<u32, VmError> {
         let mut shared_copy = SharedCopyCache::default();
         let mut copied = 0;
-        for entry in &mut self.entries {
-            let references_area = area.contains(entry.term)
-                || entry.inline_words().is_some_and(|words| {
-                    arinsal_term::message::words_have_heap_reference(words, |term| {
-                        area.contains(term)
-                    })
-                })
-                || entry
-                    .fragment
-                    .as_ref()
-                    .and_then(|fragment| fragment.heap.as_ref())
-                    .is_some_and(|fragment| {
-                        fragment.has_heap_reference(|term| area.contains(term))
-                    });
-            if !references_area {
+        for index in 0..self.entries.len() {
+            let inline = self.entries.fragment_words(index).filter(|_| {
+                self.entries
+                    .get(index)
+                    .is_some_and(|entry| queued(entry).combined)
+            });
+            let entry = queued(self.entries.get(index).expect("index within the queue"));
+            if !Self::references_area(entry, inline, area) {
                 continue;
             }
             let updated = copy_term_preserving_sharing_with_cache(
@@ -553,11 +521,12 @@ impl MessageQueue {
                 &mut shared_copy,
             )
             .map_err(|error| VmError::Unsupported(format!("literal message copy {error:?}")))?;
+            let entry = queued_mut(self.entries.get_mut(index).expect("index within the queue"));
             entry.term = updated;
             if let Some(fragment) = entry.fragment.as_mut() {
                 fragment.heap = None;
             }
-            drop(entry.detach_inline());
+            drop(self.detach_inline_at(index));
             copied += 1;
         }
         Ok(copied)
@@ -570,16 +539,19 @@ impl MessageQueue {
     pub(crate) fn take_message_fragments(&mut self) -> (Vec<usize>, Vec<MovedMessage>) {
         let mut indices = Vec::new();
         let mut fragments = Vec::new();
-        for (index, entry) in self.entries.iter_mut().enumerate() {
-            if let Some(fragment) = entry.detach_inline() {
+        for index in 0..self.entries.len() {
+            if let Some(fragment) = self.detach_inline_at(index) {
+                let term = queued(self.entries.get(index).expect("index within the queue")).term;
                 indices.push(index);
                 fragments.push((
-                    entry.term,
+                    term,
                     Term::NIL,
                     Some(arinsal_term::message::MessageHeap::Node(fragment)),
                 ));
                 continue;
             }
+            let entry = queued_mut(self.entries.get_mut(index).expect("index within the queue"));
+            let term = entry.term;
             if let Some(fragment) = entry.fragment.as_mut()
                 && let Some(heap) = fragment.heap.take()
             {
@@ -588,7 +560,7 @@ impl MessageQueue {
                     .seq_token
                     .as_ref()
                     .map_or(Term::NIL, |token| token.heap_ref());
-                fragments.push((entry.term, token, Some(heap)));
+                fragments.push((term, token, Some(heap)));
             }
         }
         (indices, fragments)
@@ -597,7 +569,7 @@ impl MessageQueue {
     /// Store the terms of messages moved onto the heap; their fragments are gone.
     pub(crate) fn restore_moved_messages(&mut self, indices: &[usize], moved: Vec<MovedMessage>) {
         for (&index, (term, token, heap)) in indices.iter().zip(moved) {
-            let entry = &mut self.entries[index];
+            let entry = queued_mut(self.entries.get_mut(index).expect("moved message index"));
             entry.term = term;
             if entry.fragment.is_none() && heap.is_some() {
                 // A detached inline fragment the collection did not consume stays the
@@ -621,7 +593,7 @@ impl MessageQueue {
 
     pub(crate) fn update_gc_roots(&mut self, slots: &[RootSlot], roots: &[Term]) {
         for (slot, &term) in slots.iter().zip(roots) {
-            let entry = &mut self.entries[slot.entry];
+            let entry = queued_mut(self.entries.get_mut(slot.entry).expect("root index"));
             if slot.token {
                 if let Some(token) = entry
                     .fragment
@@ -642,7 +614,7 @@ impl MessageQueue {
         self.entries
             .iter()
             .map(|entry| {
-                copy_term(entry.term, &mut target)
+                copy_term(queued(entry).term, &mut target)
                     .map_err(|error| VmError::Unsupported(format!("message info copy: {error:?}")))
             })
             .collect()
@@ -9085,7 +9057,11 @@ mod layout_tests {
         process.collect_heap_roots(0, &mut [], 0).unwrap();
         assert_eq!(process.inbox.gc_root_snapshot().1.len(), 1);
         assert_eq!(process.inbox.entries.len(), 1);
-        assert!(process.inbox.entries[0].fragment.is_none());
+        assert!(
+            super::queued(process.inbox.entries.get(0).unwrap())
+                .fragment
+                .is_none()
+        );
         process.collect_heap_roots(0, &mut [], 0).unwrap();
         let term = process
             .inbox
@@ -9202,10 +9178,9 @@ mod layout_tests {
 
     #[test]
     fn idle_process_layout_stays_compact() {
-        assert_eq!(
-            std::mem::size_of::<super::MessageQueue>(),
-            std::mem::size_of::<std::collections::VecDeque<Term>>()
-        );
+        // `first`, `last`, the length, the non-message count and the save cursor (position and
+        // node), like the inner queue of erts `ErtsSignalPrivQueues`.
+        assert_eq!(std::mem::size_of::<super::MessageQueue>(), 6 * 8);
         assert!(std::mem::size_of::<arinsal_term::ProcessHeap>() <= 128);
         eprintln!(
             "Process={} ProcessHeap={} VecDeque={} RunOutcome={}",

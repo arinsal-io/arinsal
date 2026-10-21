@@ -223,6 +223,25 @@ impl<T> OwnedSignal<T> {
         }
     }
 
+    /// [`OwnedSignal::fragment_words`] of a node a queue holds.
+    ///
+    /// # Safety
+    ///
+    /// `node` is a live node of this type, not written while the returned words are in use.
+    pub unsafe fn fragment_words_of<'a>(node: NonNull<SignalNode<T>>) -> Option<&'a [u64]> {
+        let handle = std::mem::ManuallyDrop::new(Self {
+            node,
+            _value: PhantomData,
+        });
+        let header = handle.header()?;
+        // SAFETY: the caller keeps the node live; the first `used_size` words were written by
+        // allocations of the fragment.
+        unsafe {
+            let used = (*header.as_ptr()).used_size;
+            Some(std::slice::from_raw_parts(fragment_words_ptr(header), used))
+        }
+    }
+
     /// The off-heap overhead the inline fragment adds to a receiver (`off_heap.overhead`
     /// plus the virtual binary heap words).
     pub fn fragment_bin_vheap(&self) -> u64 {
