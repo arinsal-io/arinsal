@@ -5254,10 +5254,22 @@ impl Process {
         // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor): the target
         // halves, of remote origins in the monitor tree and of local ones in the list.
         let mut monitors = cold.monitors;
-        let remote_targets = monitors
-            .drain()
-            .filter(|monitor| monitor.view().is_target());
-        let targets: Vec<_> = remote_targets.chain(cold.lt_monitors.drain()).collect();
+        let mut targets = Vec::new();
+        for monitor in monitors.drain() {
+            if monitor.view().is_target() {
+                targets.push(monitor);
+                continue;
+            }
+            // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor, origin
+            // ERTS_MON_TYPE_PROC), OTP-29.1.1: the origin half goes to the target as a
+            // demonitor signal, so the target drops its half.
+            if let Some(crate::proc_create::OriginMonitor::Process(_)) = monitor.state() {
+                let target = Pid::from_data(monitor.view().other());
+                let shared = arinsal_sched::SharedPayload(monitor.into_shared());
+                let _ = ctx.signal(target, arinsal_sched::Signal::DemonitorOrigin(shared));
+            }
+        }
+        targets.extend(cold.lt_monitors.drain());
         for target in targets {
             let half = target.view();
             let reference = half.reference();
