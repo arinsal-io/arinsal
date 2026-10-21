@@ -38,11 +38,12 @@ unsafe impl<T: Task> Send for ProcRef<T> where Process<T>: Send + Sync {}
 unsafe impl<T: Task> Sync for ProcRef<T> where Process<T>: Send + Sync {}
 
 impl<T: Task> ProcRef<T> {
-    /// A new process struct with one reference, the caller's.
+    /// A new process struct with one reference, the caller's, holding the process `build`
+    /// returns, written once into the allocated block.
     ///
     /// Port of erts/emulator/beam/erl_process.c (alloc_process: `erts_alloc(ERTS_ALC_T_PROC)`
     /// and `refc` 1), OTP-29.1.1.
-    pub(crate) fn new(process: Process<T>) -> Self {
+    pub(crate) fn new_with(build: impl FnOnce() -> Process<T>) -> Self {
         assert!(
             std::mem::align_of::<ProcessBlock<T>>() <= std::mem::align_of::<u64>(),
             "allocator blocks are word aligned"
@@ -62,7 +63,7 @@ impl<T: Task> ProcRef<T> {
             block.as_ptr().write(ProcessBlock {
                 refc: AtomicUsize::new(1),
                 handle,
-                process,
+                process: build(),
             });
         }
         Self { block }
@@ -183,6 +184,16 @@ unsafe impl Send for ErasedProcRef {}
 unsafe impl Sync for ErasedProcRef {}
 
 impl ErasedProcRef {
+    /// Run `f` on the reference if the process type is `T`.
+    pub(crate) fn with_typed<T: Task, R>(&self, f: impl FnOnce(&ProcRef<T>) -> R) -> Option<R> {
+        if self.type_id != TypeId::of::<T>() {
+            return None;
+        }
+        // SAFETY: the type matches, and this value owns a counted reference that keeps the
+        // block alive for the call.
+        Some(unsafe { ProcRef::with_borrowed(self.raw, f) })
+    }
+
     /// The reference as a `ProcRef<T>`, if the process type is `T`.
     pub(crate) fn downcast<T: Task>(self) -> Option<ProcRef<T>> {
         if self.type_id != TypeId::of::<T>() {
