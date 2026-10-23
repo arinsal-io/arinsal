@@ -930,8 +930,13 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
                     CmpAction::Return(order) => resolve_order!(order),
                 }
             } else {
-                pending.start_flatmap(a, b, exact);
-                a = b;
+                if let Some((left_keys, right_keys)) = pending.start_flatmap(a, b, exact) {
+                    a = left_keys;
+                    b = right_keys;
+                    exact = true;
+                } else {
+                    a = b;
+                }
                 continue 'term;
             }
         }
@@ -1321,31 +1326,29 @@ impl<'a> CmpStack<'a> {
     }
 
     // Port of erts/emulator/beam/utils.c:1989-2104 (flatmap compare phases), OTP-29.1.1.
-    fn start_flatmap(&mut self, left_map: Term, right_map: Term, exact: bool) {
+    fn start_flatmap(
+        &mut self,
+        left_map: Term,
+        right_map: Term,
+        exact: bool,
+    ) -> Option<(Term, Term)> {
+        if exact {
+            let len = crate::hamt::len(left_map);
+            if len != 0 {
+                self.push_flatmap_values(left_map, right_map, 0, len, true);
+            }
+            return Some((
+                left_map
+                    .flatmap_keys_tuple()
+                    .expect("left flatmap keys tuple"),
+                right_map
+                    .flatmap_keys_tuple()
+                    .expect("right flatmap keys tuple"),
+            ));
+        }
         crate::hamt::with_flatmap_arrays(left_map, |left_keys, _| {
             crate::hamt::with_flatmap_arrays(right_map, |right_keys, _| {
                 let len = left_keys.len();
-                if exact {
-                    if len != 0 {
-                        self.push_flatmap_values(left_map, right_map, 0, len, exact);
-                        self.push_array(
-                            CmpArray::FlatmapKeys {
-                                map: left_map,
-                                start: 0,
-                                len,
-                            },
-                            CmpArray::FlatmapKeys {
-                                map: right_map,
-                                start: 0,
-                                len,
-                            },
-                            0,
-                            true,
-                        );
-                    }
-                    return;
-                }
-
                 let mut split = 0;
                 while split < len
                     && !(Term(left_keys[split]).as_atom().is_some()
@@ -1404,10 +1407,11 @@ impl<'a> CmpStack<'a> {
                         true,
                     );
                 }
+                None
             })
-            .expect("right map is a live flatmap");
+            .expect("right map is a live flatmap")
         })
-        .expect("left map is a live flatmap");
+        .expect("left map is a live flatmap")
     }
 
     // Port of pop_next and not_equal rollback in utils.c:2493-2745, OTP-29.1.1.
@@ -1814,11 +1818,78 @@ fn first_cmp_unequal(
     right: &CmpArray<'_>,
     start: usize,
 ) -> Result<Option<(usize, Term, Term)>, Ordering> {
+    if let (
+        CmpArray::FlatmapKeys {
+            map: left_map,
+            start: left_start,
+            len: left_len,
+        },
+        CmpArray::FlatmapKeys {
+            map: right_map,
+            start: right_start,
+            len: right_len,
+        },
+    ) = (left, right)
+    {
+        debug_assert_eq!(left_len, right_len);
+        return crate::hamt::with_flatmap_arrays(*left_map, |left_keys, _| {
+            crate::hamt::with_flatmap_arrays(*right_map, |right_keys, _| {
+                first_cmp_words(
+                    &left_keys[*left_start..*left_start + *left_len],
+                    &right_keys[*right_start..*right_start + *right_len],
+                    start,
+                )
+            })
+            .expect("right map is a live flatmap")
+        })
+        .expect("left map is a live flatmap");
+    }
+    first_cmp_words_from_arrays(left, right, start)
+}
+
+#[inline]
+fn first_cmp_words_from_arrays(
+    left: &CmpArray<'_>,
+    right: &CmpArray<'_>,
+    start: usize,
+) -> Result<Option<(usize, Term, Term)>, Ordering> {
     for index in start..left.len() {
         let a = left.get(index).expect("array index is in range");
         let b = right
             .get(index)
             .expect("equal-length array index is in range");
+        if a == b {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (a.as_small(), b.as_small()) {
+            let order = a.cmp(&b);
+            if order != Ordering::Equal {
+                return Err(order);
+            }
+            continue;
+        }
+        if let (Some(a), Some(b)) = (a.as_atom(), b.as_atom()) {
+            let order = global_atoms().cmp_atoms(a, b);
+            if order != Ordering::Equal {
+                return Err(order);
+            }
+            continue;
+        }
+        return Ok(Some((index, a, b)));
+    }
+    Ok(None)
+}
+
+// Port of the direct pointer walk in utils.c:2468-2486 (TERM_ARRAY_OP), OTP-29.1.1.
+#[inline]
+fn first_cmp_words(
+    left: &[u64],
+    right: &[u64],
+    start: usize,
+) -> Result<Option<(usize, Term, Term)>, Ordering> {
+    for index in start..left.len() {
+        let a = Term(left[index]);
+        let b = Term(right[index]);
         if a == b {
             continue;
         }

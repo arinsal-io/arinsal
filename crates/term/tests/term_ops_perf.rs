@@ -1,6 +1,6 @@
 use arinsal_term::{
-    ProcessHeap, Term, TermBuilder, VecHeap, build_hamt_from_unique, cmp, copy_term, exact_eq,
-    size_object,
+    ProcessHeap, Term, TermBuilder, VecHeap, build_hamt_from_unique, cmp_exact, copy_term,
+    exact_eq, size_object,
 };
 use std::hint::black_box;
 use std::time::Instant;
@@ -174,8 +174,41 @@ fn equality_and_comparison_microbench_10m() {
     let map_equal = maps(&mut heap, 8, None);
     let map_different = maps(&mut heap, 8, Some(0));
     assert!(!map.is_hashmap(), "the OTP 8-entry fixture is a flatmap");
-    let selected_case = std::env::var("EQ_STACK_BENCH_CASE")
-        .expect("set EQ_STACK_BENCH_CASE to list, tuple, nested, or map");
+    let nested_key = TermBuilder::new(&mut heap)
+        .flatmap_from_pairs(&[(Term::small(1).unwrap(), Term::small(1).unwrap())])
+        .unwrap();
+    let nested_key_equal = TermBuilder::new(&mut heap)
+        .flatmap_from_pairs(&[(Term::small(1).unwrap(), Term::small(1).unwrap())])
+        .unwrap();
+    let nested_key_different = TermBuilder::new(&mut heap)
+        .flatmap_from_pairs(&[(Term::small(1).unwrap(), Term::small(2).unwrap())])
+        .unwrap();
+    let nested_key_map = TermBuilder::new(&mut heap)
+        .flatmap_from_pairs(&[(nested_key, Term::small(0).unwrap())])
+        .unwrap();
+    let nested_key_map_equal = TermBuilder::new(&mut heap)
+        .flatmap_from_pairs(&[(nested_key_equal, Term::small(0).unwrap())])
+        .unwrap();
+    let nested_key_map_different = TermBuilder::new(&mut heap)
+        .flatmap_from_pairs(&[(nested_key_different, Term::small(0).unwrap())])
+        .unwrap();
+    let hamt_pairs = (1..=40)
+        .map(|key| (Term::small(key).unwrap(), Term::small(key).unwrap()))
+        .collect::<Vec<_>>();
+    let hamt = build_hamt_from_unique(&hamt_pairs, &mut heap).unwrap();
+    let hamt_equal = build_hamt_from_unique(&hamt_pairs, &mut heap).unwrap();
+    let hamt_different_pairs = (1..=40)
+        .map(|key| {
+            (
+                Term::small(key).unwrap(),
+                Term::small(if key == 40 { 0 } else { key }).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let hamt_different = build_hamt_from_unique(&hamt_different_pairs, &mut heap).unwrap();
+    assert!(hamt.is_hashmap(), "the OTP 40-entry fixture is a HAMT");
+    let selected_cases = std::env::var("EQ_STACK_BENCH_CASE")
+        .expect("set EQ_STACK_BENCH_CASE to a comma-separated case list");
     let cases = vec![
         Case {
             name: "list",
@@ -197,11 +230,25 @@ fn equality_and_comparison_microbench_10m() {
             equal: (map, map_equal),
             compare: (map, map_different),
         },
+        Case {
+            name: "nested_key",
+            equal: (nested_key_map, nested_key_map_equal),
+            compare: (nested_key_map, nested_key_map_different),
+        },
+        Case {
+            name: "hamt40",
+            equal: (hamt, hamt_equal),
+            compare: (hamt, hamt_different),
+        },
     ]
     .into_iter()
-    .filter(|case| case.name == selected_case)
+    .filter(|case| selected_cases.split(',').any(|name| name == case.name))
     .collect::<Vec<_>>();
-    assert_eq!(cases.len(), 1, "unknown EQ_STACK_BENCH_CASE");
+    similar_asserts::assert_eq!(
+        cases.len(),
+        selected_cases.split(',').count(),
+        "unknown EQ_STACK_BENCH_CASE"
+    );
 
     fn rust_measure(left: Term, right: Term, operation: impl Fn(Term, Term) -> i32) -> f64 {
         let start = Instant::now();
@@ -236,10 +283,12 @@ fn equality_and_comparison_microbench_10m() {
             .map(|case| {
                 let eq = rust_measure(case.equal.0, case.equal.1, |a, b| i32::from(exact_eq(a, b)))
                     - empty;
-                let order = rust_measure(case.compare.0, case.compare.1, |a, b| match cmp(a, b) {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Equal => 0,
-                    std::cmp::Ordering::Greater => 1,
+                let order = rust_measure(case.compare.0, case.compare.1, |a, b| {
+                    match cmp_exact(a, b) {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    }
                 }) - empty;
                 (eq, order)
             })
@@ -249,7 +298,7 @@ fn equality_and_comparison_microbench_10m() {
     let reference_module = r#"
 -module(eq_stack_bench).
 -export([run/1]).
-run([Name]) ->
+run(Names) ->
     List = lists:seq(1, 8),
     ListEqual = lists:reverse(lists:reverse(List)),
     ListDifferent = lists:seq(1, 7) ++ [0],
@@ -263,11 +312,31 @@ run([Name]) ->
     MapEqual = maps:from_list([{K, K} || K <- lists:seq(1, 8)]),
     MapDifferent = maps:from_list([{K, if K == 8 -> 0; true -> K end}
                                    || K <- lists:seq(1, 8)]),
+    NestedKey = #{#{1 => 1} => 0},
+    NestedKeyEqual = #{#{1 => 1} => 0},
+    NestedKeyDifferent = #{#{1 => 2} => 0},
+    Hamt40 = maps:from_list([{K, K} || K <- lists:seq(1, 40)]),
+    Hamt40Equal = maps:from_list([{K, K} || K <- lists:seq(1, 40)]),
+    Hamt40Different = maps:from_list([{K, if K == 40 -> 0; true -> K end}
+                                      || K <- lists:seq(1, 40)]),
+    lists:foreach(fun(Name) ->
+        run_case(Name, List, ListEqual, ListDifferent, Tuple, TupleEqual, TupleDifferent,
+                 Deep, DeepEqual, DeepDifferent, Map, MapEqual, MapDifferent,
+                 NestedKey, NestedKeyEqual, NestedKeyDifferent,
+                 Hamt40, Hamt40Equal, Hamt40Different)
+    end, Names),
+    halt().
+run_case(Name, List, ListEqual, ListDifferent, Tuple, TupleEqual, TupleDifferent,
+         Deep, DeepEqual, DeepDifferent, Map, MapEqual, MapDifferent,
+         NestedKey, NestedKeyEqual, NestedKeyDifferent,
+         Hamt40, Hamt40Equal, Hamt40Different) ->
     {EqualLeft, EqualRight, CompareLeft, CompareRight} = case Name of
         "list" -> {List, ListEqual, List, ListDifferent};
         "tuple" -> {Tuple, TupleEqual, Tuple, TupleDifferent};
         "nested" -> {Deep, DeepEqual, Deep, DeepDifferent};
-        "map" -> {Map, MapEqual, Map, MapDifferent}
+        "map" -> {Map, MapEqual, Map, MapDifferent};
+        "nested_key" -> {NestedKey, NestedKeyEqual, NestedKey, NestedKeyDifferent};
+        "hamt40" -> {Hamt40, Hamt40Equal, Hamt40, Hamt40Different}
     end,
     N = 10000000,
     Base0 = erlang:monotonic_time(nanosecond),
@@ -279,8 +348,7 @@ run([Name]) ->
     Cmp0 = erlang:monotonic_time(nanosecond),
     _ = cmp_even(N, CompareLeft, CompareRight, 0),
     CmpTime = (erlang:monotonic_time(nanosecond) - Cmp0 - EmptyTime) / N,
-    io:format("~s ~.2f ~.2f~n", [Name, EqTime, CmpTime]),
-    halt().
+    io:format("~s ~.2f ~.2f~n", [Name, EqTime, CmpTime]).
 empty_even(0, _, _, Acc) -> Acc;
 empty_even(N, A, B, Acc) -> empty_odd(N - 1, A, B, Acc + 1).
 empty_odd(0, _, _, Acc) -> Acc;
@@ -295,11 +363,13 @@ eq_odd(N, A, B, Acc) ->
     eq_even(N - 1, A, B, Acc + V).
 cmp_even(0, _, _, Acc) -> Acc;
 cmp_even(N, A, B, Acc) ->
-    V = if A < B -> -1; A > B -> 1; true -> 0 end,
+    Order = erts_internal:cmp_term(A, B),
+    V = if Order < 0 -> -1; Order > 0 -> 1; true -> 0 end,
     cmp_odd(N - 1, A, B, Acc + V).
 cmp_odd(0, _, _, Acc) -> Acc;
 cmp_odd(N, A, B, Acc) ->
-    V = if B < A -> -1; B > A -> 1; true -> 0 end,
+    Order = erts_internal:cmp_term(B, A),
+    V = if Order < 0 -> -1; Order > 0 -> 1; true -> 0 end,
     cmp_even(N - 1, A, B, Acc + V).
     "#;
 
@@ -319,8 +389,13 @@ cmp_odd(N, A, B, Acc) ->
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    fn reference_round(directory: &std::path::Path, case: &str) -> Vec<(String, f64, f64)> {
-        let expression = format!("eq_stack_bench:run([\"{case}\"]).");
+    fn reference_round(directory: &std::path::Path, cases: &[Case]) -> Vec<(String, f64, f64)> {
+        let names = cases
+            .iter()
+            .map(|case| format!("\"{}\"", case.name))
+            .collect::<Vec<_>>()
+            .join(",");
+        let expression = format!("eq_stack_bench:run([{names}]).");
         let output = std::process::Command::new("erl")
             .args(["-noshell", "-pa"])
             .arg(directory)
@@ -355,11 +430,11 @@ cmp_odd(N, A, B, Acc) ->
     let mut reference_samples = vec![vec![(String::new(), 0.0, 0.0); cases.len()]; ROUNDS];
     for round in 0..ROUNDS {
         if round & 1 == 0 {
-            reference_samples[round] = reference_round(&reference_dir, &selected_case);
+            reference_samples[round] = reference_round(&reference_dir, &cases);
             rust_samples[round] = rust_round(&cases);
         } else {
             rust_samples[round] = rust_round(&cases);
-            reference_samples[round] = reference_round(&reference_dir, &selected_case);
+            reference_samples[round] = reference_round(&reference_dir, &cases);
         }
     }
     for (index, case) in cases.iter().enumerate() {
