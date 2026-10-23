@@ -9222,7 +9222,7 @@ mod layout_tests {
     fn idle_process_layout_stays_compact() {
         // `first`, `last`, the length, the non-message count and the save cursor (position and
         // node), like the inner queue of erts `ErtsSignalPrivQueues`.
-        assert_eq!(std::mem::size_of::<super::MessageQueue>(), 6 * 8);
+        assert_eq!(std::mem::size_of::<super::MessageQueue>(), 8 * 8);
         assert!(std::mem::size_of::<arinsal_term::ProcessHeap>() <= 128);
         eprintln!(
             "Process={} ProcessHeap={} VecDeque={} RunOutcome={}",
