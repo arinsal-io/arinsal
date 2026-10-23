@@ -233,6 +233,44 @@ struct PortMonitor {
     name: Option<arinsal_term::Atom>,
 }
 
+/// The processes linked to a port: the owner and a few more, kept without a table
+/// (`ErtsLink` tree of the port, one node per link).
+#[derive(Default)]
+pub(crate) struct PidSet(smallvec::SmallVec<[Pid; 2]>);
+
+impl PidSet {
+    fn from_one(pid: Pid) -> Self {
+        Self(smallvec::smallvec![pid])
+    }
+
+    pub(crate) fn insert(&mut self, pid: Pid) -> bool {
+        if self.0.contains(&pid) {
+            false
+        } else {
+            self.0.push(pid);
+            true
+        }
+    }
+
+    pub(crate) fn remove(&mut self, pid: &Pid) -> bool {
+        match self.0.iter().position(|current| current == pid) {
+            Some(index) => {
+                self.0.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn contains(&self, pid: &Pid) -> bool {
+        self.0.contains(pid)
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, Pid> {
+        self.0.iter()
+    }
+}
+
 /// State retained for a live child or fd port.
 pub(crate) struct PortHandle {
     id: u64,
@@ -243,7 +281,7 @@ pub(crate) struct PortHandle {
     wake_needed: AtomicBool,
     framing: Option<(u8, usize)>,
     owner: Mutex<Pid>,
-    links: Mutex<HashSet<Pid>>,
+    links: Mutex<PidSet>,
     monitors: Mutex<HashMap<u64, PortMonitor>>,
     os_pid: u32,
     name: String,
@@ -2676,7 +2714,7 @@ fn make_handle_with(
         wake_needed: AtomicBool::new(true),
         framing,
         owner: Mutex::new(owner),
-        links: Mutex::new(HashSet::from([owner])),
+        links: Mutex::new(PidSet::from_one(owner)),
         monitors: Mutex::new(HashMap::new()),
         os_pid,
         name,
@@ -3525,17 +3563,16 @@ pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> b
 /// The term of `port_set_data/2` in a heap block of its own (`ErtsPortDataHeap`: the term and
 /// the heap fragment it was copied into, with the off-heap list).
 // Port of erts/emulator/beam/erl_port.h (ErtsPortDataHeap), OTP-29.1.1.
-struct PortData {
+struct PortData(Option<Box<PortDataBlock>>);
+
+struct PortDataBlock {
     term: Term,
     _fragment: Option<ProcessHeap>,
 }
 
 impl PortData {
     fn undefined() -> Self {
-        Self {
-            term: atom("undefined"),
-            _fragment: None,
-        }
+        Self(None)
     }
 }
 
@@ -3595,9 +3632,12 @@ pub(crate) fn port_close_light(
 fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
     let handle = lookup_port(process, port)?;
     let data = handle.data.lock();
-    let size = arinsal_term::size_object(data.term);
+    let Some(block) = data.0.as_ref() else {
+        return Ok(atom("undefined"));
+    };
+    let size = arinsal_term::size_object(block.term);
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    arinsal_term::copy_struct(data.term, &mut heap, size).map_err(|_| badarg())
+    arinsal_term::copy_struct(block.term, &mut heap, size).map_err(|_| badarg())
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:687 (port_set_data_2), OTP-29.1.1.
@@ -3605,18 +3645,18 @@ fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmEr
     let handle = lookup_port(process, port)?;
     let size = arinsal_term::size_object(data);
     let stored = if size == 0 {
-        PortData {
+        PortData(Some(Box::new(PortDataBlock {
             term: data,
             _fragment: None,
-        }
+        })))
     } else {
         let mut heap =
             ProcessHeap::with_words_for_type(size, arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG);
         let term = arinsal_term::copy_struct(data, &mut heap, size).map_err(|_| badarg())?;
-        PortData {
+        PortData(Some(Box::new(PortDataBlock {
             term,
             _fragment: Some(heap),
-        }
+        })))
     };
     *handle.data.lock() = stored;
     Ok(atom("true"))
