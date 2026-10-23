@@ -291,6 +291,22 @@ pub struct NativeRecord {
     pub fields: Vec<(String, Option<OwnedTerm>)>,
 }
 impl BeamFile {
+    /// Drop the decoded code, tables and literals of a loaded module, keeping the atoms,
+    /// attributes, compiler info and the unknown chunks (erts frees the `BeamFile` after
+    /// `beam_load_finalize` and keeps `module_info` data in the code header).
+    pub fn release_decoded(&mut self) {
+        self.code.instructions = Vec::new();
+        self.imports = Vec::new();
+        self.exports = Vec::new();
+        self.locals = Vec::new();
+        self.lambdas = Vec::new();
+        self.literals = Vec::new();
+        self.strings = Vec::new();
+        self.lines = None;
+        self.types = None;
+        self.records = Vec::new();
+    }
+
     /// Resolve a one-based atom index; zero is not a table entry.
     pub fn atom(&self, index: u32) -> Option<&str> {
         index

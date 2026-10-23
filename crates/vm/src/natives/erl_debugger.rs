@@ -234,6 +234,7 @@ fn breakpoint(
     {
         let appears_in_source = code
             .lines
+            .values()
             .iter()
             .flatten()
             .any(|(_, n)| *n == u64::from(line));
