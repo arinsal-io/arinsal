@@ -262,6 +262,10 @@ pub(crate) fn exact_flat_key_cmp(a: Term, b: Term, flat_atom: bool) -> Ordering 
 pub trait HeapAlloc {
     /// Reserve contiguous words, or return `None` so the caller can collect.
     fn alloc(&mut self, words: usize) -> Option<*mut u64>;
+    /// Stable identity for reservations which outlive one borrowing call.
+    fn allocator_identity(&self) -> usize {
+        std::ptr::from_ref(self).cast::<()>() as usize
+    }
     /// Reserve words with spare capacity for later allocations from a heap fragment.
     ///
     /// Port of `HAllocX` in `erts/emulator/beam/erl_vm.h:154-159`, OTP-29.1.1.
@@ -379,6 +383,9 @@ pub trait HeapAlloc {
 }
 
 impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
+    fn allocator_identity(&self) -> usize {
+        (**self).allocator_identity()
+    }
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         (**self).alloc(words)
     }
@@ -756,6 +763,17 @@ pub struct HeapReservation<'a, H: HeapAlloc + ?Sized> {
     cur: *mut u64,
     end: *mut u64,
 }
+
+/// A suspended heap reservation whose owning process heap remains live across a BIF trap.
+///
+/// Resume this value only with the same live allocator. `ProcessHeap` allocations stay at a
+/// stable address while GC is disabled for the trapped BIF.
+pub struct HeapReservationState {
+    cur: usize,
+    end: usize,
+    allocator: usize,
+}
+
 impl<'a, H: HeapAlloc + ?Sized> HeapReservation<'a, H> {
     /// Reserve `words` words from `heap`.
     pub fn new(heap: &'a mut H, words: usize) -> Result<Self, TermError> {
@@ -775,6 +793,25 @@ impl<'a, H: HeapAlloc + ?Sized> HeapReservation<'a, H> {
             .ok_or(TermError::SystemLimit)?;
         let end = cur.wrapping_add(words);
         Ok(Self { heap, cur, end })
+    }
+    /// Reattach a reservation suspended by [`Self::suspend`].
+    pub fn resume(heap: &'a mut H, state: HeapReservationState) -> Self {
+        assert_eq!(heap.allocator_identity(), state.allocator);
+        Self {
+            heap,
+            cur: state.cur as *mut u64,
+            end: state.end as *mut u64,
+        }
+    }
+    /// Suspend this reservation without returning its unused words.
+    pub fn suspend(self) -> HeapReservationState {
+        let state = HeapReservationState {
+            cur: self.cur as usize,
+            end: self.end as usize,
+            allocator: self.heap.allocator_identity(),
+        };
+        std::mem::forget(self);
+        state
     }
     /// Cursor (`HEAP_TOP` after the `HAlloc` of this block).
     #[inline]
@@ -820,6 +857,9 @@ impl<H: HeapAlloc + ?Sized> Drop for HeapReservation<'_, H> {
     }
 }
 impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
+    fn allocator_identity(&self) -> usize {
+        self.heap.allocator_identity()
+    }
     #[inline]
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         if words <= (self.end as usize - self.cur as usize) / 8 {
@@ -879,6 +919,17 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
     }
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
         self.heap.link_node(thing, node)
+    }
+    // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT), OTP-29.1.1.
+    fn link_magic_ref(
+        &mut self,
+        thing: *mut u64,
+        owner: Arc<crate::MagicRef>,
+    ) -> Result<(), TermError> {
+        self.heap.link_magic_ref(thing, owner)
+    }
+    fn supports_magic(&self) -> bool {
+        self.heap.supports_magic()
     }
 }
 
@@ -1842,6 +1893,9 @@ impl Default for ProcessHeap {
     }
 }
 impl HeapAlloc for ProcessHeap {
+    fn allocator_identity(&self) -> usize {
+        self.words.as_ptr() as usize
+    }
     fn words_left(&self) -> Option<usize> {
         self.alloc_words_left()
     }
@@ -3258,6 +3312,36 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
         Ok(Term::from_ptr(p, 2))
     }
+    /// Build a decoded flatmap from already sorted, distinct key and value arrays.
+    ///
+    /// The key tuple and map share one reservation, as `erts_map_from_ks_and_vs` does.
+    pub fn flatmap_from_sorted_arrays(
+        &mut self,
+        keys: &[Term],
+        values: &[Term],
+    ) -> Result<Term, TermError> {
+        if keys.len() != values.len() || keys.is_empty() || keys.len() > 32 {
+            return Err(TermError::BadArg);
+        }
+        let size = keys.len();
+        let words = size
+            .checked_mul(2)
+            .and_then(|words| words.checked_add(4))
+            .ok_or(TermError::SystemLimit)?;
+        let mut block = self.reserve_boxed_words(words, 0)?;
+        block.write_header((size as u64) << 6)?;
+        for key in keys {
+            block.write_term(*key)?;
+        }
+        let key_tuple = block.term_at(0)?;
+        block.write_header(MAP_HEADER_FLATMAP)?;
+        block.write_header(size as u64)?;
+        block.write_term(key_tuple)?;
+        for value in values {
+            block.write_term(*value)?;
+        }
+        block.finish_at(size + 1)
+    }
     /// Port of erts/emulator/beam/erl_record.c:701-779 (records_create_4), OTP-29.1.1.
     /// Construct a native record, reusing the canonical definition of its module when one
     /// matches (`erts_canonical_record_def`). Fields are supplied in definition order and
@@ -3512,6 +3596,17 @@ impl HeapBlockBuilder {
         self.write_word(value)
     }
 
+    /// A boxed term at a previously initialized word offset in the reservation.
+    pub fn term_at(&self, word_offset: usize) -> Result<Term, TermError> {
+        if word_offset >= self.written {
+            return Err(TermError::BadArg);
+        }
+        Ok(Term::from_ptr(
+            (self.start as *mut u64).wrapping_add(word_offset),
+            2,
+        ))
+    }
+
     #[inline(always)]
     fn write_word(&mut self, value: u64) -> Result<(), TermError> {
         if self.written == self.words {
@@ -3526,10 +3621,21 @@ impl HeapBlockBuilder {
     /// Finish after every reserved word has been initialized.
     #[inline(always)]
     pub fn finish(self) -> Result<Term, TermError> {
+        self.finish_at(0)
+    }
+
+    /// Finish and return a boxed term whose header starts at `word_offset`.
+    pub fn finish_at(self, word_offset: usize) -> Result<Term, TermError> {
         if self.written != self.words {
             return Err(TermError::BadArg);
         }
-        Ok(Term::from_ptr(self.start as *mut u64, 2))
+        if word_offset >= self.words {
+            return Err(TermError::BadArg);
+        }
+        Ok(Term::from_ptr(
+            (self.start as *mut u64).wrapping_add(word_offset),
+            2,
+        ))
     }
 }
 
@@ -3780,6 +3886,7 @@ pub struct BinaryRef<'a> {
     bits: usize,
     referenced_size: usize,
     off_heap: bool,
+    refc: bool,
 }
 impl<'a> BinaryRef<'a> {
     /// Whole backing bytes; unused bits may be present at the ends.
@@ -3802,6 +3909,10 @@ impl<'a> BinaryRef<'a> {
     /// non-null `BinRef` from `ERTS_GET_BITSTRING_REF` in erts; on-heap bitstrings do not.
     pub fn is_off_heap(&self) -> bool {
         self.off_heap
+    }
+    /// Whether a reference-counted `Binary` owns the backing bytes.
+    pub fn is_refc(&self) -> bool {
+        self.refc
     }
 }
 impl Term {
@@ -3829,6 +3940,7 @@ impl Term {
                 bits,
                 referenced_size: bits.div_ceil(8),
                 off_heap: false,
+                refc: false,
             })
         } else if header & 63 == SUB_BITS {
             // SAFETY: SUB_BITS stores start/end and a live original in word four.
@@ -3836,13 +3948,15 @@ impl Term {
                 unsafe { (*p.add(2) as usize, *p.add(3) as usize, Term(*p.add(4))) };
             let adjustment = owner_adjustment(original) * 8;
             let off_heap = original.header().is_some_and(|h| h & 63 == BIN_REF);
+            let mut refc = false;
             let (base, referenced_size) = if off_heap {
                 // Port of erts/emulator/beam/erl_bif_binary.c:2520-2530, OTP-29.1.1.
                 // SAFETY: original is a retained BinRef and the caller prevents mutation.
                 unsafe {
                     let bin_ref = original.raw_ptr();
                     let owner = *bin_ref.add(1);
-                    let size = if crate::bits::bin_ref_val_is_external(owner) {
+                    refc = !crate::bits::bin_ref_val_is_external(owner);
+                    let size = if !refc {
                         (&*crate::bits::external_val_ptr(owner)).len()
                     } else {
                         *(owner as *const u64).add(3) as usize
@@ -3867,6 +3981,7 @@ impl Term {
                 bits: end - start,
                 referenced_size,
                 off_heap,
+                refc,
             })
         } else {
             None
