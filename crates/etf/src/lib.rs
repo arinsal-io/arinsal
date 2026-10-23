@@ -888,25 +888,34 @@ fn check_count(count: usize, remaining: usize, at: usize) -> Result<(), DecodeEr
 }
 
 fn put_atom(out: &mut Vec<u8>, atom: &str, minor: u8) {
-    if minor <= 1 && atom.chars().all(|c| (c as u32) <= 255) {
-        let chars: Vec<u8> = atom.chars().map(|c| c as u8).collect();
-        if chars.len() <= 255 && minor >= 2 {
-            out.extend_from_slice(&[115, chars.len() as u8]);
-        } else {
+    // Port of erts/emulator/beam/external.c:2877 (enc_atom), OTP-29.1.1.
+    if minor <= 1 {
+        let mut latin1_chars = 0;
+        let latin1 = atom.chars().all(|character| {
+            latin1_chars += 1;
+            character as u32 <= 255
+        });
+        if latin1 {
             out.push(100);
-            out.extend_from_slice(&(chars.len() as u16).to_be_bytes());
+            out.extend_from_slice(&(latin1_chars as u16).to_be_bytes());
+            if latin1_chars == atom.len() {
+                out.extend_from_slice(atom.as_bytes());
+            } else {
+                for character in atom.chars() {
+                    out.push(character as u8);
+                }
+            }
+            return;
         }
-        out.extend_from_slice(&chars);
-    } else {
-        let b = atom.as_bytes();
-        if b.len() <= 255 {
-            out.extend_from_slice(&[119, b.len() as u8]);
-        } else {
-            out.push(118);
-            out.extend_from_slice(&(b.len() as u16).to_be_bytes());
-        }
-        out.extend_from_slice(b);
     }
+    let bytes = atom.as_bytes();
+    if bytes.len() <= 255 {
+        out.extend_from_slice(&[119, bytes.len() as u8]);
+    } else {
+        out.push(118);
+        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    }
+    out.extend_from_slice(bytes);
 }
 
 fn put_encoded_atom(

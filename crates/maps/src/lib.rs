@@ -1882,13 +1882,46 @@ pub fn values(map: Term) -> MapResult<Vec<Term>> {
 /// `maps:keys/1` and `maps:values/1` result lists.
 ///
 /// Port of erts/emulator/beam/erl_map.c:1207-1241 and :2262-2298, OTP-29.1.1.
-pub fn flatmap_projection(
-    map: CheckedFlatMap,
-    keys: bool,
-) -> impl DoubleEndedIterator<Item = Term> + ExactSizeIterator {
+pub fn flatmap_projection(map: CheckedFlatMap, keys: bool) -> FlatMapProjection {
     let (key_words, value_words, _) = merge::flatmap_kv_with_size(map.term(), map.size());
     let words = if keys { key_words } else { value_words };
-    words.iter().copied().map(term)
+    FlatMapProjection {
+        terms: words.iter().copied().map(term as fn(u64) -> Term),
+    }
+}
+
+/// Allocation-free indexed projection over a flatmap's stored key or value words.
+///
+/// Port of `erts/emulator/beam/external.c` (`MAP_DEF`), OTP-29.1.1.
+type FlatMapProjectionIter =
+    std::iter::Map<std::iter::Copied<std::slice::Iter<'static, u64>>, fn(u64) -> Term>;
+
+pub struct FlatMapProjection {
+    terms: FlatMapProjectionIter,
+}
+
+impl Iterator for FlatMapProjection {
+    type Item = Term;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.terms.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.terms.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for FlatMapProjection {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.terms.next_back()
+    }
+}
+
+impl ExactSizeIterator for FlatMapProjection {
+    fn len(&self) -> usize {
+        self.terms.len()
+    }
 }
 
 /// Build `maps:keys/1` or `maps:values/1` for a flatmap from its stored array.
