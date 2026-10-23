@@ -4,8 +4,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use arinsal_term::{
-    ConsListBuilder, HeapAlloc, MagicRef, TermBuilder, writable_bytes_mut, writable_extend_private,
-    writable_finalize,
+    ConsListBuilder, HeapAlloc, HeapBinaryWriter, MagicRef, ProcessHeap, TermBuilder,
+    writable_bytes_mut, writable_extend_private, writable_finalize,
 };
 
 use crate::binary_mod::{SearchPattern, SearchWalk};
@@ -984,6 +984,160 @@ impl IolistCopyWalk {
                 None if self.source.is_none() => {
                     return Ok((true, yield_count - remaining));
                 }
+                None => self.current = Term::NIL,
+            }
+        }
+    }
+
+    /// Copy an iolist chunk directly into a reserved small process-heap binary.
+    // Port of erts/emulator/beam/erl_iolist.c:425-620 (`generic_iolist_copy`), OTP-29.1.1.
+    pub fn step_to_heap_binary(
+        &mut self,
+        heap: &mut ProcessHeap,
+        output: &mut HeapBinaryWriter,
+        yield_count: usize,
+    ) -> Result<(bool, usize), (BifError, usize)> {
+        if self.bit_mode {
+            return Err((BADARG, 0));
+        }
+        let mut remaining = yield_count;
+        loop {
+            if let Some(mut source) = self.source.take() {
+                let copy_limit = remaining.saturating_add(1).saturating_mul(32 * 8);
+                let copy_bits = source.remaining_bits.min(copy_limit);
+                if !copy_bits.is_multiple_of(8) {
+                    return Err((BADARG, yield_count.saturating_sub(remaining)));
+                }
+                let copied = with_binary_bytes(source.term, |view| {
+                    let start = view
+                        .start_bit()
+                        .checked_add(source.bit_offset)
+                        .ok_or(BADARG)?;
+                    if start
+                        .checked_add(copy_bits)
+                        .is_none_or(|end| end > view.start_bit() + view.bit_len())
+                    {
+                        return Err(BADARG);
+                    }
+                    let count = copy_bits / 8;
+                    if start.is_multiple_of(8) {
+                        let first = start / 8;
+                        let end = first.checked_add(count).ok_or(BADARG)?;
+                        output
+                            .write(heap, view.bytes().get(first..end).ok_or(BADARG)?)
+                            .map_err(|_| BADARG)?;
+                    } else {
+                        let mut chunk = [0_u8; 64];
+                        let shift = start % 8;
+                        let first = start / 8;
+                        let bytes = view.bytes();
+                        for (index, slot) in chunk[..count].iter_mut().enumerate() {
+                            let current = *bytes.get(first + index).ok_or(BADARG)?;
+                            let next = bytes.get(first + index + 1).copied().unwrap_or(0);
+                            *slot = (current << shift) | (next >> (8 - shift));
+                        }
+                        output.write(heap, &chunk[..count]).map_err(|_| BADARG)?;
+                    }
+                    Ok(())
+                })
+                .map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
+                copied.map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
+                let copy_bytes = copy_bits / 8;
+                self.offset = self
+                    .offset
+                    .checked_add(copy_bytes)
+                    .ok_or((BifError::SystemLimit, yield_count - remaining))?;
+                source.bit_offset = source
+                    .bit_offset
+                    .checked_add(copy_bits)
+                    .ok_or((BifError::SystemLimit, yield_count - remaining))?;
+                source.remaining_bits -= copy_bits;
+                if source.remaining_bits != 0 {
+                    self.source = Some(source);
+                    return Ok((false, yield_count));
+                }
+                if self.done_after_source {
+                    return Ok((true, yield_count - remaining));
+                }
+                remaining = remaining.saturating_sub(copy_bits / (32 * 8));
+                continue;
+            }
+
+            while self.current.classify() == TermKind::List {
+                if remaining <= 1 {
+                    return Ok((false, yield_count));
+                }
+                remaining -= 1;
+                let (head, tail) = iolist_cons(self.current)
+                    .map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
+                if head.classify() == TermKind::List {
+                    self.tails.push(tail);
+                    self.current = head;
+                    continue;
+                }
+                self.current = tail;
+                match head.classify() {
+                    TermKind::Nil => {}
+                    TermKind::Bitstring => {
+                        let bits = bitstring_bit_len(head)
+                            .map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
+                        if !bits.is_multiple_of(8) {
+                            return Err((BADARG, yield_count - remaining));
+                        }
+                        self.source = Some(CopySource {
+                            term: head,
+                            bit_offset: 0,
+                            remaining_bits: bits,
+                        });
+                        break;
+                    }
+                    TermKind::Number => {
+                        let byte = head
+                            .as_small()
+                            .and_then(|number| u8::try_from(number).ok())
+                            .ok_or((BADARG, yield_count - remaining))?;
+                        if self.offset >= output.len() {
+                            return Err((BifError::SystemLimit, yield_count - remaining));
+                        }
+                        output
+                            .write(heap, &[byte])
+                            .map_err(|_| (BifError::SystemLimit, yield_count - remaining))?;
+                        self.offset += 1;
+                    }
+                    _ => return Err((BADARG, yield_count - remaining)),
+                }
+                if self.source.is_some() {
+                    break;
+                }
+            }
+
+            if self.source.is_some() {
+                continue;
+            }
+            if remaining <= 1 {
+                return Ok((false, yield_count));
+            }
+            remaining -= 1;
+            match self.current.classify() {
+                TermKind::Nil => {}
+                TermKind::Bitstring => {
+                    let bits = bitstring_bit_len(self.current)
+                        .map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
+                    if !bits.is_multiple_of(8) {
+                        return Err((BADARG, yield_count - remaining));
+                    }
+                    self.source = Some(CopySource {
+                        term: self.current,
+                        bit_offset: 0,
+                        remaining_bits: bits,
+                    });
+                    self.done_after_source = self.tails.is_empty();
+                }
+                _ => return Err((BADARG, yield_count - remaining)),
+            }
+            match self.tails.pop() {
+                Some(tail) => self.current = tail,
+                None if self.source.is_none() => return Ok((true, yield_count - remaining)),
                 None => self.current = Term::NIL,
             }
         }

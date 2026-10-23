@@ -774,6 +774,160 @@ pub struct HeapReservationState {
     allocator: usize,
 }
 
+/// A small heap binary reserved across a BIF trap while GC is disabled.
+/// Port of `erts_new_bitstring` plus the retained `to` cursor in
+/// `erts/emulator/beam/erl_iolist.c` (`list_to_bitstring_engine`), OTP-29.1.1.
+pub struct HeapBinaryWriter {
+    reservation: HeapReservationState,
+    term: Term,
+    bytes: usize,
+    written: usize,
+    restore_gc: bool,
+    finished: bool,
+}
+
+impl HeapBinaryWriter {
+    /// Reserve the final heap binary. The owning process heap must remain live and GC disabled
+    /// until [`Self::finish`] is called.
+    // Port of erts/emulator/beam/erl_bits.c:2841-2860 (`erts_new_bitstring`), OTP-29.1.1.
+    pub fn new(heap: &mut ProcessHeap, bytes: usize) -> Result<Self, TermError> {
+        if bytes > 64 {
+            return Err(TermError::BadArg);
+        }
+        let words = 2 + bytes.div_ceil(8);
+        let restore_gc = heap.gc_enabled;
+        let start = heap
+            .alloc_halloc(words)
+            .unwrap_or_else(|| heap.heap_fragment(words));
+        let reservation = HeapReservation {
+            heap,
+            cur: start,
+            end: start.wrapping_add(words),
+        };
+        let start = reservation.cursor();
+        store(start, (((words - 1) as u64) << 6) | HEAP_BITS);
+        store(start.wrapping_add(1), (bytes * 8) as u64);
+        for index in 0..bytes.div_ceil(8) {
+            store(start.wrapping_add(2 + index), 0);
+        }
+        let term = Term::from_ptr(start, 2);
+        let state = reservation.suspend();
+        heap.gc_enabled = false;
+        Ok(Self {
+            reservation: state,
+            term,
+            bytes,
+            written: 0,
+            restore_gc,
+            finished: false,
+        })
+    }
+
+    /// Reserved payload length in bytes.
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    /// Whether the reserved binary has an empty payload.
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    /// Append the next source chunk at the retained write offset.
+    // Port of erts/emulator/beam/erl_iolist.c:425-620 (`generic_iolist_copy`), OTP-29.1.1.
+    pub fn write(&mut self, heap: &mut ProcessHeap, chunk: &[u8]) -> Result<(), TermError> {
+        assert!(!self.finished, "heap binary writer is finalized");
+        assert!(!heap.gc_enabled, "heap binary writer requires GC disabled");
+        let end = self
+            .written
+            .checked_add(chunk.len())
+            .ok_or(TermError::SystemLimit)?;
+        if end > self.bytes {
+            return Err(TermError::BadArg);
+        }
+        let reservation = HeapReservation::resume(
+            heap,
+            std::mem::replace(
+                &mut self.reservation,
+                HeapReservationState {
+                    cur: 0,
+                    end: 0,
+                    allocator: 0,
+                },
+            ),
+        );
+        let start = (self.term.0 & !7) as *mut u64;
+        let mut input = 0;
+        while input < chunk.len() {
+            let offset = self.written + input;
+            let in_word = offset % 8;
+            let count = (8 - in_word).min(chunk.len() - input);
+            let word = start.wrapping_add(2 + offset / 8);
+            if in_word == 0 && count == 8 {
+                let bytes: [u8; 8] = chunk[input..input + 8]
+                    .try_into()
+                    .expect("eight bytes remain in the chunk");
+                store(word, u64::from_le_bytes(bytes));
+            } else {
+                let mut value = load(word);
+                for (index, byte) in chunk[input..input + count].iter().copied().enumerate() {
+                    let shift = (in_word + index) * 8;
+                    value = (value & !(0xff_u64 << shift)) | (u64::from(byte) << shift);
+                }
+                store(word, value);
+            }
+            input += count;
+        }
+        self.written = end;
+        self.reservation = reservation.suspend();
+        Ok(())
+    }
+
+    /// Publish the fully written binary and release the retained reservation.
+    // Port of erts/emulator/beam/erl_iolist.c:765-834 (`list_to_bitstring_dispatch`), OTP-29.1.1.
+    pub fn finish(&mut self, heap: &mut ProcessHeap) -> Result<Term, TermError> {
+        assert!(!self.finished, "heap binary writer is finalized");
+        assert!(!heap.gc_enabled, "heap binary writer requires GC disabled");
+        if self.written != self.bytes {
+            return Err(TermError::BadArg);
+        }
+        let state = std::mem::replace(
+            &mut self.reservation,
+            HeapReservationState {
+                cur: 0,
+                end: 0,
+                allocator: 0,
+            },
+        );
+        let mut reservation = HeapReservation::resume(heap, state);
+        reservation.set_cursor(reservation.limit());
+        drop(reservation);
+        heap.gc_enabled = self.restore_gc;
+        self.finished = true;
+        Ok(self.term)
+    }
+
+    /// Discard a partial result and restore the process's previous GC state.
+    // Port of erts/emulator/beam/erl_iolist.c:806-821 (trapped error cleanup), OTP-29.1.1.
+    pub fn cancel(&mut self, heap: &mut ProcessHeap) {
+        if self.finished {
+            return;
+        }
+        assert!(!heap.gc_enabled, "heap binary writer requires GC disabled");
+        let state = std::mem::replace(
+            &mut self.reservation,
+            HeapReservationState {
+                cur: 0,
+                end: 0,
+                allocator: 0,
+            },
+        );
+        drop(HeapReservation::resume(heap, state));
+        heap.gc_enabled = self.restore_gc;
+        self.finished = true;
+    }
+}
+
 impl<'a, H: HeapAlloc + ?Sized> HeapReservation<'a, H> {
     /// Reserve `words` words from `heap`.
     pub fn new(heap: &'a mut H, words: usize) -> Result<Self, TermError> {

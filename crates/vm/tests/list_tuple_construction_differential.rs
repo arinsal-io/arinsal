@@ -98,6 +98,15 @@ fn tuple_construction_bifs_match_otp() {
         .expect("load test caller frame");
 
     for (function, args) in [
+        ("tuple_to_list", vec![O::Tuple(Vec::new())]),
+        (
+            "tuple_to_list",
+            vec![O::Tuple((0..10).map(O::Int).collect())],
+        ),
+        (
+            "tuple_to_list",
+            vec![O::Tuple((0..4096).map(O::Int).collect())],
+        ),
         ("list_to_tuple", vec![O::Nil]),
         (
             "list_to_tuple",

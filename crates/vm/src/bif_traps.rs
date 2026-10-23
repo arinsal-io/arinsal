@@ -1212,6 +1212,7 @@ enum IolistBinaryPhase {
         bit_len: usize,
         bitstring: bool,
         walk: arinsal_bifs::IolistCopyWalk,
+        restore_gc: bool,
     },
     Done,
 }
@@ -1219,7 +1220,8 @@ enum IolistBinaryPhase {
 /// Output staging for `erts_new_bitstring`: up to 64 bytes stay on heap after the walk completes.
 // Port of erts/emulator/beam/erl_bits.c:2841-2858 (erts_new_bitstring_refc), OTP-29.1.1.
 enum IolistOutput {
-    Small(Vec<u8>),
+    Small(arinsal_term::HeapBinaryWriter),
+    Bitstring(Vec<u8>),
     Writable(Term),
 }
 
@@ -3082,13 +3084,9 @@ fn iolist_to_iovec(
     }
 }
 
-enum IolistCopySetup {
-    Empty(Term),
-    Ready {
-        output: IolistOutput,
-        bit_len: usize,
-        walk: arinsal_bifs::IolistCopyWalk,
-    },
+struct IolistCopySetup {
+    empty: Option<Term>,
+    ready: Option<(IolistOutput, usize, arinsal_bifs::IolistCopyWalk, bool)>,
 }
 
 /// Allocate the result after the size pass of `list_to_binary/1` and friends (`bitstring` false)
@@ -3105,12 +3103,19 @@ fn iolist_copy_setup(
             let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .bitstring(&[], 0)
                 .map_err(|_| BifError::SystemLimit)?;
-            return Ok(IolistCopySetup::Empty(value));
+            return Ok(IolistCopySetup {
+                empty: Some(value),
+                ready: None,
+            });
         }
-        return Ok(IolistCopySetup::Ready {
-            output: IolistOutput::Small(vec![0; bit_len.div_ceil(8)]),
-            bit_len,
-            walk: arinsal_bifs::IolistCopyWalk::new_bits(root),
+        return Ok(IolistCopySetup {
+            empty: None,
+            ready: Some((
+                IolistOutput::Bitstring(vec![0; bit_len.div_ceil(8)]),
+                bit_len,
+                arinsal_bifs::IolistCopyWalk::new_bits(root),
+                process.heap.gc_enabled,
+            )),
         });
     }
     let byte_len = size.take_size();
@@ -3119,20 +3124,39 @@ fn iolist_copy_setup(
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             0,
         )?;
-        return Ok(IolistCopySetup::Empty(value));
+        return Ok(IolistCopySetup {
+            empty: Some(value),
+            ready: None,
+        });
     }
-    let output = if byte_len <= 64 {
-        IolistOutput::Small(vec![0; byte_len])
-    } else {
-        IolistOutput::Writable(arinsal_bifs::allocate_iolist_binary(
-            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-            byte_len,
-        )?)
-    };
-    Ok(IolistCopySetup::Ready {
-        output,
-        bit_len: byte_len * 8,
-        walk: arinsal_bifs::IolistCopyWalk::new(root),
+    if byte_len <= 64 {
+        let restore_gc = process.heap.gc_enabled;
+        let output = match arinsal_term::HeapBinaryWriter::new(&mut process.heap, byte_len) {
+            Ok(output) => output,
+            Err(_) => return Err(BifError::SystemLimit),
+        };
+        return Ok(IolistCopySetup {
+            empty: None,
+            ready: Some((
+                IolistOutput::Small(output),
+                byte_len * 8,
+                arinsal_bifs::IolistCopyWalk::new(root),
+                restore_gc,
+            )),
+        });
+    }
+    let output = IolistOutput::Writable(arinsal_bifs::allocate_iolist_binary(
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+        byte_len,
+    )?);
+    Ok(IolistCopySetup {
+        empty: None,
+        ready: Some((
+            output,
+            byte_len * 8,
+            arinsal_bifs::IolistCopyWalk::new(root),
+            process.heap.gc_enabled,
+        )),
     })
 }
 
@@ -3205,27 +3229,24 @@ fn iolist_binary_step(
                 return Ok(IolistStep::Yield(size_reductions as u32));
             }
             let bitstring = walk.is_bits();
-            match iolist_copy_setup(process, walk, root)? {
-                IolistCopySetup::Empty(value) => {
-                    *phase = IolistBinaryPhase::Done;
-                    return finished(HandlerResult::Done {
-                        value,
-                        reductions: size_reductions as u32,
-                    });
-                }
-                IolistCopySetup::Ready {
-                    output,
-                    bit_len,
-                    walk,
-                } => {
-                    *phase = IolistBinaryPhase::Copy {
-                        output,
-                        bit_len,
-                        bitstring,
-                        walk,
-                    };
-                }
+            let setup = iolist_copy_setup(process, walk, root)?;
+            if let Some(value) = setup.empty {
+                *phase = IolistBinaryPhase::Done;
+                return finished(HandlerResult::Done {
+                    value,
+                    reductions: size_reductions as u32,
+                });
             }
+            let (output, bit_len, walk, restore_gc) = setup
+                .ready
+                .expect("nonempty iolist output has a copy state");
+            *phase = IolistBinaryPhase::Copy {
+                output,
+                bit_len,
+                bitstring,
+                walk,
+                restore_gc,
+            };
             available_reductions = available_reductions.saturating_sub(size_reductions);
             if available_reductions == 0 {
                 return Ok(IolistStep::Yield(size_reductions as u32));
@@ -3240,13 +3261,17 @@ fn iolist_binary_step(
         bit_len,
         bitstring,
         walk,
+        restore_gc,
     } = &mut *phase
     else {
         unreachable!("the size phase transitions to copy or returns above")
     };
     let yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
     let stepped = match output {
-        IolistOutput::Small(bytes) => walk.step(bytes, yield_count),
+        IolistOutput::Small(writer) => {
+            walk.step_to_heap_binary(&mut process.heap, writer, yield_count)
+        }
+        IolistOutput::Bitstring(bytes) => walk.step(bytes, yield_count),
         IolistOutput::Writable(term) => arinsal_bifs::with_iolist_binary_output(*term, |bytes| {
             Ok(walk.step(bytes, yield_count))
         })?,
@@ -3255,7 +3280,12 @@ fn iolist_binary_step(
         Ok(progress) => progress,
         Err((error, work)) => {
             let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
-            output.finish_writer();
+            if let IolistOutput::Small(writer) = output {
+                writer.cancel(&mut process.heap);
+            } else {
+                output.finish_writer();
+            }
+            process.set_gc_enabled(*restore_gc);
             return finished(HandlerResult::Failed { error, reductions });
         }
     };
@@ -3264,7 +3294,12 @@ fn iolist_binary_step(
         return Ok(IolistStep::Yield(reductions));
     }
     if walk.written_bits() != *bit_len {
-        output.finish_writer();
+        if let IolistOutput::Small(writer) = output {
+            writer.cancel(&mut process.heap);
+        } else {
+            output.finish_writer();
+        }
+        process.set_gc_enabled(*restore_gc);
         return finished(HandlerResult::Failed {
             error: BifError::SystemLimit,
             reductions,
@@ -3272,7 +3307,10 @@ fn iolist_binary_step(
     }
     let (bit_len, bitstring) = (*bit_len, *bitstring);
     let value = match output {
-        IolistOutput::Small(bytes) => {
+        IolistOutput::Small(writer) => writer
+            .finish(&mut process.heap)
+            .map_err(|_| BifError::SystemLimit)?,
+        IolistOutput::Bitstring(bytes) => {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let mut builder = TermBuilder::new(&mut heap);
             if bitstring {
@@ -3287,6 +3325,7 @@ fn iolist_binary_step(
             *term
         }
     };
+    process.set_gc_enabled(*restore_gc);
     *phase = IolistBinaryPhase::Done;
     finished(HandlerResult::Done { value, reductions })
 }
