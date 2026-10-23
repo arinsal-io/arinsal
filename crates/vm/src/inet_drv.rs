@@ -4819,9 +4819,12 @@ fn rbuf_len(inner: &Inner) -> usize {
 }
 
 // Port of inet_drv.c (`tcp_clear_input` logical pointer reset), OTP-29.1.1.
+// Port of inet_drv.c (`tcp_clear_input`): a consumed input buffer is freed, so an idle
+// connection holds none.
 fn rbuf_reset(inner: &mut Inner) {
     inner.rbuf_start = 0;
     inner.rbuf_end = 0;
+    inner.rbuf = Vec::new();
 }
 
 // Port of inet_drv.c (`tcp_deliver`), OTP-29.1.1.

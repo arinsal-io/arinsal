@@ -513,7 +513,7 @@ fn external_identities_and_copy() {
         })
     ));
     assert!(
-        matches!(reference.identity(), Some(Identity::Ref { ids, creation: 7, .. }) if ids == [1,2,3])
+        matches!(reference.identity(), Some(Identity::Ref { ids, creation: 7, .. }) if ids.as_slice() == [1,2,3])
     );
     let mut copy_heap = VecHeap::new();
     let copied = copy_term(reference, &mut copy_heap).unwrap();
@@ -537,7 +537,7 @@ fn external_reference_id_counts_survive_copy_and_compare() {
             .external_ref(node.clone(), ids)
             .unwrap();
         assert!(
-            matches!(external.identity(), Some(Identity::Ref { ids: actual, .. }) if actual == ids)
+            matches!(external.identity(), Some(Identity::Ref { ids: actual, .. }) if actual.as_slice() == ids)
         );
         let mut target = VecHeap::new();
         let copied = copy_term(external, &mut target).unwrap();
@@ -572,7 +572,7 @@ fn owned_magic_reference_keeps_its_owner_and_a_decoded_reference_is_plain() {
     assert!(!decoded.is_magic_ref());
     assert!(matches!(
         decoded.identity(),
-        Some(Identity::Ref { ids, .. }) if ids == [id as u32, (id >> 32) as u32, u32::MAX]
+        Some(Identity::Ref { ids, .. }) if ids.as_slice() == [id as u32, (id >> 32) as u32, u32::MAX]
     ));
     // erts_magic_ref_save_bin (term_to_binary, ref_to_list) makes the numbers resolvable.
     original.save_magic_ref();

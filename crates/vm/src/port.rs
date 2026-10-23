@@ -3644,6 +3644,9 @@ fn port_control(
     Ok(atom("badarg"))
 }
 
+pub(crate) use drv_sig::command_light as port_command_light;
+pub(crate) use drv_sig::control_light as port_control_light;
+
 // Port of erts/emulator/beam/erl_bif_port.c:263 (erts_internal_port_call_3), OTP-29.1.1.
 fn port_call(
     process: &mut Process,
