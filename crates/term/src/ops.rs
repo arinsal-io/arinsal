@@ -801,8 +801,51 @@ pub fn cmp_exact(a: Term, b: Term) -> Ordering {
     if let (Some(left), Some(right)) = (a.as_small(), b.as_small()) {
         return left.cmp(&right);
     }
+    if let Some(order) = cmp_tuple_immediates(a, b) {
+        return order;
+    }
     cmp_impl(a, b, true)
 }
+
+// Port of utils.c:2466-2491 (erts_cmp_compound, term_array), OTP-29.1.1.
+// erts scans equal tuple fields and resolves atom/small pairs before scheduling a continuation.
+#[inline]
+fn cmp_tuple_immediates(a: Term, b: Term) -> Option<Ordering> {
+    if a.classify() != TermKind::Tuple || b.classify() != TermKind::Tuple {
+        return None;
+    }
+    // SAFETY: callers retain both tuple terms and their owning heaps for this comparison.
+    let (left, right) = unsafe { (a.tuple_ref().unwrap(), b.tuple_ref().unwrap()) };
+    let size = left.len().cmp(&right.len());
+    if size != Ordering::Equal {
+        return Some(size);
+    }
+    for index in 0..left.len() {
+        let (Some(a), Some(b)) = (left.get(index), right.get(index)) else {
+            unreachable!("tuple arity bounds its elements");
+        };
+        if a == b {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (a.as_atom(), b.as_atom()) {
+            let order = global_atoms().cmp_atoms(a, b);
+            if order != Ordering::Equal {
+                return Some(order);
+            }
+            continue;
+        }
+        if let (Some(a), Some(b)) = (a.as_small(), b.as_small()) {
+            let order = a.cmp(&b);
+            if order != Ordering::Equal {
+                return Some(order);
+            }
+            continue;
+        }
+        return None;
+    }
+    Some(Ordering::Equal)
+}
+
 fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
     // Port of erts/emulator/beam/utils.c:1658-2735 (erts_cmp_compound), OTP-29.1.1.
     let mut pending = CmpStack::new();
@@ -902,9 +945,7 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
             TermKind::List => unreachable!("list terms use the primary-tag fast path"),
             TermKind::Tuple => {
                 // SAFETY: both tuples remain on their owning heaps.
-                let av = unsafe { a.tuple_ref().unwrap() };
-                // SAFETY: both tuples remain on their owning heaps.
-                let bv = unsafe { b.tuple_ref().unwrap() };
+                let (av, bv) = unsafe { (a.tuple_ref().unwrap(), b.tuple_ref().unwrap()) };
                 let c = av.len().cmp(&bv.len());
                 if c != Ordering::Equal {
                     resolve_order!(c);
@@ -1090,10 +1131,11 @@ enum CmpAction {
 // Port of WSTACK_DECLARE(stack) and PSTACK_DECLARE(map_stack, 1) in
 // erts/emulator/beam/utils.c:1688-1701, OTP-29.1.1. Work words and the first array view
 // stay inline for the common shallow compound case; deeper map state grows only on demand.
+// Port of WSTACK_DECLARE/PSTACK_DECLARE in global.h:493-517, OTP-29.1.1.
 struct CmpStack<'a> {
     words: SmallVec<[u64; 16]>,
     arrays: SmallVec<[CmpArrayPair<'a>; 2]>,
-    map_frames: Vec<CmpMapFrame>,
+    map_frames: SmallVec<[CmpMapFrame; 1]>,
 }
 
 const WORK_OP_MASK: u64 = 0xF;
@@ -1116,7 +1158,7 @@ impl<'a> CmpStack<'a> {
         Self {
             words: SmallVec::new(),
             arrays: SmallVec::new(),
-            map_frames: Vec::new(),
+            map_frames: SmallVec::new(),
         }
     }
 
@@ -1369,6 +1411,7 @@ impl<'a> CmpStack<'a> {
     }
 
     // Port of pop_next and not_equal rollback in utils.c:2493-2745, OTP-29.1.1.
+    #[inline(always)]
     fn resume_result(&mut self, mut result: Ordering) -> CmpAction {
         loop {
             if result != Ordering::Equal {
@@ -1690,6 +1733,7 @@ impl<'a> CmpStack<'a> {
         self.hashmap_state().was_exact
     }
 
+    #[inline(always)]
     fn start_hashmap_phase1(&mut self) -> CmpAction {
         let state = self.hashmap_state();
         let (left_key, right_key) = match (state.ap, state.bp) {
@@ -1707,6 +1751,7 @@ impl<'a> CmpStack<'a> {
         CmpAction::Compare(left_key, right_key, true)
     }
 
+    #[inline(always)]
     fn advance_hashmap_phase1(&mut self) -> CmpAction {
         let state = self.hashmap_state_mut();
         state.ap = state.left.next();
