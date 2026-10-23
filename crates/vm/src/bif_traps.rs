@@ -712,6 +712,14 @@ fn unicode_characters_to_binary(
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
 ) -> Result<HandlerResult, BifError> {
+    if state.is_none()
+        && let Some(value) = arinsal_bifs::unicode_utf8_binary_fast_path(args)?
+    {
+        return Ok(HandlerResult::Done {
+            value,
+            reductions: 0,
+        });
+    }
     unicode_convert_start(process, args, state, "characters_to_binary")
 }
 

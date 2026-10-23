@@ -777,7 +777,107 @@ fn process_binary(
 }
 
 fn characters_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    if let Some(binary) = unicode_utf8_binary_fast_path(args)? {
+        return Ok(binary);
+    }
     convert_charged(ctx, args, false)
+}
+
+/// Return the original subject when it is already a valid UTF-8 binary.
+///
+/// Port of erts/emulator/beam/erl_unicode.c:931 (unicode_characters_to_binary_2), OTP-29.1.1.
+pub fn unicode_utf8_binary_fast_path(args: &[Term]) -> Result<Option<Term>, BifError> {
+    let [subject, encoding] = args else {
+        return Ok(None);
+    };
+    let Some(encoding_atom) = encoding.as_atom() else {
+        return Ok(None);
+    };
+    if !matches!(global_atoms().text(encoding_atom), Some("utf8" | "unicode")) {
+        return Ok(None);
+    }
+    let mut subject = *subject;
+    if let Some((head, tail)) = crate::lists::cons_cell(subject)
+        && tail == Term::NIL
+        && head.classify() == TermKind::Bitstring
+    {
+        subject = head;
+    }
+    if subject.classify() != TermKind::Bitstring {
+        return Ok(None);
+    }
+    let data = bytes(subject)?;
+    Ok(analyze_utf8(&data).then_some(subject))
+}
+
+// Port of erts/emulator/beam/erl_unicode.c:1177 (analyze_utf8), OTP-29.1.1.
+fn analyze_utf8(mut source: &[u8]) -> bool {
+    while !source.is_empty() {
+        let first = source[0];
+        let size = if first & 0x80 == 0 {
+            1
+        } else if first & 0xe0 == 0xc0 {
+            if source.len() < 2 || source[1] & 0xc0 != 0x80 || first < 0xc2 {
+                return false;
+            }
+            2
+        } else if first & 0xf0 == 0xe0 {
+            if source.len() < 3
+                || source[1] & 0xc0 != 0x80
+                || source[2] & 0xc0 != 0x80
+                || first == 0xe0 && source[1] < 0xa0
+                || first & 0x0f == 0x0d && source[1] & 0x20 != 0
+            {
+                return false;
+            }
+            3
+        } else if first & 0xf8 == 0xf0 {
+            if source.len() < 4
+                || source[1] & 0xc0 != 0x80
+                || source[2] & 0xc0 != 0x80
+                || source[3] & 0xc0 != 0x80
+                || first == 0xf0 && source[1] < 0x90
+                || first & 0x07 > 0x04
+                || first & 0x07 == 0x04 && source[1] & 0x3f > 0x0f
+            {
+                return false;
+            }
+            4
+        } else {
+            return false;
+        };
+        source = &source[size..];
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arinsal_term::{ProcessHeap, TermBuilder};
+
+    #[test]
+    fn valid_utf8_binary_returns_the_original_term() {
+        let mut heap = ProcessHeap::with_words(256);
+        let mut allocator = crate::ProcessHeapHandle(&mut heap);
+        let binary = TermBuilder::new(&mut allocator)
+            .binary(b"X-Request-Id: abc123          ")
+            .unwrap();
+        let singleton = TermBuilder::new(&mut allocator)
+            .cons(binary, Term::NIL)
+            .unwrap();
+        let utf8 = Term::atom(global_atoms().intern("utf8").unwrap());
+        let mut ctx = Ctx::new(&mut allocator);
+
+        similar_asserts::assert_eq!(
+            characters_to_binary(&mut ctx, &[binary, utf8]).unwrap(),
+            binary
+        );
+        similar_asserts::assert_eq!(
+            characters_to_binary(&mut ctx, &[singleton, utf8]).unwrap(),
+            binary
+        );
+    }
 }
 
 fn characters_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
