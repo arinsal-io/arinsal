@@ -113,14 +113,29 @@ impl ChildSetup {
         read_write: u8,
         stderr_to_stdout: bool,
     ) -> io::Result<SpawnedChild> {
-        let (child_input, parent_input) = pipe().map_err(to_io_error)?;
         let (parent_output, child_output) = pipe().map_err(to_io_error)?;
-        let vm_stderr = std::io::stderr();
-        let stderr = if stderr_to_stdout {
-            child_output.as_fd()
+        let max_files = crate::erl_poll::erts_poll_max_fds();
+        if parent_output.as_raw_fd() as usize >= max_files {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        let (child_input, parent_input) = pipe().map_err(to_io_error)?;
+        if parent_input.as_raw_fd() as usize >= max_files {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        // Port of erts/emulator/sys/unix/sys_drivers.c:502, OTP-29.1.1.
+        // `dup(2)` is part of spawn_start's capacity check when stderr is not redirected.
+        let stderr_dup = if stderr_to_stdout {
+            None
         } else {
-            vm_stderr.as_fd()
+            Some(fcntl_dupfd_cloexec(std::io::stderr(), 0).map_err(to_io_error)?)
         };
+        let stderr = stderr_dup
+            .as_ref()
+            .map(AsFd::as_fd)
+            .unwrap_or_else(|| child_output.as_fd());
+        if stderr.as_raw_fd() as usize >= max_files {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
         let fds: Vec<BorrowedFd<'_>> = vec![child_input.as_fd(), child_output.as_fd(), stderr];
         let (status_tx, status_rx) = mpsc::channel();
         {

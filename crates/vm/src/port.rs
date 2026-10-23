@@ -967,6 +967,7 @@ struct PortOptions {
     exit_status: bool,
     eof: bool,
     args: Vec<Vec<u8>>,
+    args_set: bool,
     arg0: Option<Vec<u8>>,
     cwd: Option<Vec<u8>>,
     env: Vec<(Vec<u8>, Option<Vec<u8>>)>,
@@ -983,6 +984,7 @@ fn options(t: Term) -> Option<PortOptions> {
         exit_status: false,
         eof: false,
         args: Vec::new(),
+        args_set: false,
         arg0: None,
         cwd: None,
         env: Vec::new(),
@@ -1049,6 +1051,7 @@ fn options(t: Term) -> Option<PortOptions> {
                     .into_iter()
                     .map(string_bytes)
                     .collect::<Option<Vec<_>>>()?;
+                opts.args_set = true;
             } else if pair.len() == 2 && pair[0] == atom("arg0") {
                 opts.arg0 = Some(filename_bytes(pair[1], true, true)?);
             } else if pair.len() == 2 && pair[0] == atom("cd") {
@@ -1345,6 +1348,15 @@ fn start(
 ) -> Result<Term, VmError> {
     let parsed_opts = options(opts).ok_or_else(badarg)?;
     let spec = tuple(spec).ok_or_else(badarg)?;
+    // Port of erts/emulator/beam/erl_bif_port.c:1086-1091, OTP-29.1.1.
+    // An argv vector is valid only for an explicit spawn_executable port.
+    if (parsed_opts.args_set || parsed_opts.arg0.is_some())
+        && !spec
+            .first()
+            .is_some_and(|kind| *kind == atom("spawn_executable"))
+    {
+        return Err(badarg());
+    }
     if let [kind, input, output] = spec.as_slice() {
         if *kind != atom("fd") {
             return Err(badarg());
@@ -1500,15 +1512,7 @@ fn start(
     if executable
         && let Err(error) = rustix::fs::access(&child_program, rustix::fs::Access::EXEC_OK)
     {
-        return match error.raw_os_error() {
-            libc::ENOENT => Err(VmError::Trap(crate::exceptions::Trap::error(atom(
-                "enoent",
-            )))),
-            libc::EACCES => Err(VmError::Trap(crate::exceptions::Trap::error(atom(
-                "eacces",
-            )))),
-            _ => Err(badarg()),
-        };
+        return Ok(atom(&arinsal_drv::errno_id(error.raw_os_error())));
     }
     let setup = child_setup_payload(
         executable,
@@ -1523,29 +1527,26 @@ fn start(
         want_status,
     )
     .map_err(|_| badarg())?;
-    let spawned = runtime
-        .child_setup
-        .spawn(
-            port_id,
-            &setup,
-            want_status,
-            use_stdio,
-            rw,
-            stderr_to_stdout,
-        )
-        .map_err(|error| {
-            if executable {
-                let reason = match error.kind() {
-                    std::io::ErrorKind::NotFound => Some("enoent"),
-                    std::io::ErrorKind::PermissionDenied => Some("eacces"),
-                    _ => None,
-                };
-                if let Some(reason) = reason {
-                    return VmError::Trap(crate::exceptions::Trap::error(atom(reason)));
-                }
+    let spawned = match runtime.child_setup.spawn(
+        port_id,
+        &setup,
+        want_status,
+        use_stdio,
+        rw,
+        stderr_to_stdout,
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            if let Some(errno) = error.raw_os_error() {
+                // Port of erts/emulator/beam/erl_bif_port.c:69-89 and
+                // erts/emulator/sys/unix/sys_drivers.c:471-501 (spawn_start), OTP-29.1.1.
+                // OS launch failures return their errno atom; badarg is reserved for invalid
+                // open_port arguments. In particular, a full descriptor table is `emfile`.
+                return Ok(atom(&arinsal_drv::errno_id(errno)));
             }
-            badarg()
-        })?;
+            return Err(badarg());
+        }
+    };
     let os_pid = spawned.os_pid;
     let out = spawned.input;
     let read_fd = spawned.output.map(IntoRawFd::into_raw_fd);
