@@ -2,6 +2,7 @@ use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, decode, encode};
 use arinsal_term::global_atoms;
 use arinsal_vm::Vm;
+use similar_asserts::assert_eq;
 use std::sync::Mutex;
 
 mod common;
@@ -211,10 +212,23 @@ fn misc_bifs_system_profile_emits_runnable_port_events_match_erts() {
 fn misc_bifs_string_list_to_float_prefix_and_errors_match_erts() {
     compare(
         r#"-module(misc_bifs_float). -export([run/0]).
-        run() -> [string:list_to_float("1.25rest"),
-                  string:list_to_float("2.5e-"),
-                  string:list_to_float("no_float"),
-                  string:list_to_float([])]."#,
+        run() ->
+            Inputs = ["1.25rest", "2.5e-", "no_float", [],
+                      "1.0e400", "-1.0e400", "1.0e-4000", "1.0e-324",
+                      "4.9406564584124654e-324", "2.2250738585072014e-308",
+                      "1.", ".1", "1.0e", "1.0e+", "1.0e--", "1.0e+2x",
+                      "+1.0", "-1.0", "1,0", "1e2", "1.0tail",
+                      "1.0e999999999999999999999999999999999999",
+                      lists:duplicate(400, $9) ++ ".0",
+                      lists:duplicate(400, $0) ++ "1.0"],
+            [begin
+                 Bin = list_to_binary(S),
+                 {S,
+                  string:to_float(S),
+                  string:list_to_float(S),
+                  try list_to_float(S) catch error:Reason1 -> {error, Reason1} end,
+                  try binary_to_float(Bin) catch error:Reason2 -> {error, Reason2} end}
+             end || S <- Inputs]."#,
         "misc_bifs_float",
         "run",
     );

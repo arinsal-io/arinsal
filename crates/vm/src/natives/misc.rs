@@ -455,12 +455,10 @@ fn string_list_to_float(process: &mut Process, term: Term) -> Result<Term, VmErr
         let byte = u8::try_from(*n).map_err(|_| badarg())?;
         bytes.push(byte);
     }
-    let parsed = (1..=bytes.len()).rev().find_map(|end| {
-        arinsal_float::list_to_float(&bytes[..end])
-            .ok()
-            .map(|number| (number, end))
-    });
-    let Some((number, end)) = parsed else {
+    let Some((token, end)) = scan_string_float(&bytes) else {
+        return tuple(process, &[atom("error"), atom("no_float")]);
+    };
+    let Ok(number) = arinsal_float::list_to_float(&token) else {
         return tuple(process, &[atom("error"), atom("no_float")]);
     };
     let rest = O::list(bytes[end..].iter().map(|b| O::Int(i64::from(*b))).collect());
@@ -473,6 +471,96 @@ fn string_list_to_float(process: &mut Process, term: Term) -> Result<Term, VmErr
         (rest, float)
     };
     tuple(process, &[float, rest])
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringFloatPart {
+    Sign,
+    Integer,
+    Fraction,
+    ExponentSign,
+    ExponentStart,
+    Exponent,
+    End,
+}
+
+// Port of erts/emulator/beam/bif.c:3517-3664 (string_list_to_float_1), OTP-29.1.1.
+fn scan_string_float(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut part = StringFloatPart::Sign;
+    let mut index = 0;
+    let mut saved_index = 0;
+    let mut saved_token_len = 0;
+    let mut token = Vec::with_capacity(bytes.len());
+
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'-' | b'+' => match part {
+                StringFloatPart::Sign => {
+                    part = StringFloatPart::Integer;
+                    if byte == b'+' {
+                        index += 1;
+                        continue;
+                    }
+                }
+                StringFloatPart::ExponentSign => part = StringFloatPart::ExponentStart,
+                StringFloatPart::ExponentStart => {
+                    index = saved_index;
+                    token.truncate(saved_token_len);
+                    part = StringFloatPart::End;
+                }
+                _ => part = StringFloatPart::End,
+            },
+            b'.' | b',' => match part {
+                StringFloatPart::Integer => part = StringFloatPart::Fraction,
+                StringFloatPart::ExponentSign | StringFloatPart::ExponentStart => {
+                    index = saved_index;
+                    token.truncate(saved_token_len);
+                    part = StringFloatPart::End;
+                }
+                _ => part = StringFloatPart::End,
+            },
+            b'e' | b'E' => match part {
+                StringFloatPart::Fraction => {
+                    saved_index = index;
+                    saved_token_len = token.len();
+                    part = StringFloatPart::ExponentSign;
+                }
+                StringFloatPart::ExponentStart | StringFloatPart::ExponentSign => {
+                    index = saved_index;
+                    token.truncate(saved_token_len);
+                    part = StringFloatPart::End;
+                }
+                _ => part = StringFloatPart::End,
+            },
+            b'0'..=b'9' => match part {
+                StringFloatPart::Sign => part = StringFloatPart::Integer,
+                StringFloatPart::ExponentSign | StringFloatPart::ExponentStart => {
+                    part = StringFloatPart::Exponent;
+                }
+                _ => {}
+            },
+            _ => break,
+        }
+
+        if part == StringFloatPart::End {
+            break;
+        }
+        token.push(byte);
+        index += 1;
+    }
+
+    if matches!(
+        part,
+        StringFloatPart::ExponentSign | StringFloatPart::ExponentStart
+    ) {
+        index = saved_index;
+        token.truncate(saved_token_len);
+    }
+    if token.is_empty() {
+        None
+    } else {
+        Some((token, index))
+    }
 }
 
 fn tuple(process: &mut Process, items: &[Term]) -> Result<Term, VmError> {
