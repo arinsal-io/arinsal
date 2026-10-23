@@ -1727,13 +1727,24 @@ impl ProcessHeap {
             // the copied blocks too, so move both intrusive lists before adopting them.
             match &mut data {
                 crate::message::MessageHeap::Heap(fragment) => {
-                    rebase_binref_chains_to_ranges(&mut fragment.owners, &ranges);
+                    if let Some(owners) = fragment.owners.as_mut() {
+                        rebase_binref_chains_to_ranges(
+                            &mut owners.off_heap_first,
+                            &mut owners.wrt_bins,
+                            &ranges,
+                        );
+                    }
                     self.absorb_fragment_owners(fragment);
                 }
                 crate::message::MessageHeap::Node(fragment) => {
-                    rebase_binref_chains_to_ranges(fragment.owners_mut(), &ranges);
-                    let (owners, bin_vheap) = fragment.take_owners();
-                    self.absorb_owners(owners, bin_vheap);
+                    let lists = fragment.owners_mut();
+                    rebase_binref_chains_to_ranges(
+                        &mut lists.off_heap_first,
+                        &mut lists.wrt_bins,
+                        &ranges,
+                    );
+                    let (off_heap, bin_vheap) = fragment.take_owners();
+                    self.absorb_off_heap(off_heap, bin_vheap);
                 }
             }
         }
@@ -1878,13 +1889,10 @@ struct MoveRange {
 
 // Port of erts/emulator/beam/erl_gc.c:2514-2611 (erts_copy_one_frag off-heap links),
 // OTP-29.1.1. The source fragment is freed after its terms and off-heap ownership are adopted.
-fn rebase_binref_chains_to_ranges(owners: &mut crate::heap::LazyOwners, ranges: &[MoveRange]) {
-    let Some(owners) = owners.as_mut() else {
-        return;
-    };
-    let nodes = binref_chain_nodes(owners.off_heap_first)
+fn rebase_binref_chains_to_ranges(first: &mut usize, wrt_bins: &mut usize, ranges: &[MoveRange]) {
+    let nodes = binref_chain_nodes(*first)
         .into_iter()
-        .chain(binref_chain_nodes(owners.wrt_bins))
+        .chain(binref_chain_nodes(*wrt_bins))
         .collect::<Vec<_>>();
     let rebase = |address: usize| {
         if address == 0 {
@@ -1898,8 +1906,8 @@ fn rebase_binref_chains_to_ranges(owners: &mut crate::heap::LazyOwners, ranges: 
             })
             .expect("message BinRef chain points outside copied heap fragments")
     };
-    owners.off_heap_first = rebase(owners.off_heap_first);
-    owners.wrt_bins = rebase(owners.wrt_bins);
+    *first = rebase(*first);
+    *wrt_bins = rebase(*wrt_bins);
     for source in nodes {
         let destination = rebase(source) as *mut u64;
         let next = crate::heap::load((source as *const u64).wrapping_add(2)) as usize;

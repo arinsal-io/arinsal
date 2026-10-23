@@ -979,6 +979,23 @@ pub(crate) struct HeapOwners {
     pub(crate) detached: Option<Box<VecHeap>>,
 }
 
+/// The off-heap lists of a message's inline heap fragment, stored in the fragment header
+/// (`ErlHeapFragment.off_heap`: `first` and `overhead`; the writable list is ours).
+// Port of erts/emulator/beam/erl_message.h (ErlHeapFragment, ErlOffHeap), OTP-29.1.1.
+#[derive(Default)]
+pub(crate) struct OffHeapLists {
+    pub(crate) off_heap_first: usize,
+    pub(crate) wrt_bins: usize,
+    pub(crate) overhead: u64,
+}
+
+impl Drop for OffHeapLists {
+    fn drop(&mut self) {
+        crate::gc::release_off_heap_chain(self.off_heap_first);
+        crate::gc::release_off_heap_chain(self.wrt_bins);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct LazyOwners(Option<Box<HeapOwners>>);
 impl Drop for LazyOwners {
@@ -1476,8 +1493,8 @@ impl ProcessHeap {
     /// for an `ERTS_MSG_COMBINED_HFRAG` message). The words are not copied.
     // Port of erts/emulator/beam/erl_message.c (erts_save_message_in_proc), OTP-29.1.1.
     pub fn adopt_message_node(&mut self, mut fragment: crate::message::NodeFragment) {
-        let (owners, bin_vheap) = fragment.take_owners();
-        self.absorb_owners(owners, bin_vheap);
+        let (off_heap, bin_vheap) = fragment.take_owners();
+        self.absorb_off_heap(off_heap, bin_vheap);
         self.fragment_words = self
             .fragment_words
             .saturating_add(u32::try_from(fragment.len()).unwrap_or(u32::MAX));
@@ -1645,6 +1662,20 @@ impl ProcessHeap {
 
     /// [`ProcessHeap::absorb_fragment_owners`] of the off-heap owners and virtual binary heap
     /// words of a message fragment.
+    pub(crate) fn absorb_off_heap(&mut self, mut source: OffHeapLists, bin_vheap: u64) {
+        if source.off_heap_first == 0 && source.wrt_bins == 0 && source.overhead == 0 {
+            return;
+        }
+        self.bin_vheap = self.bin_vheap.saturating_add(bin_vheap);
+        let target = &mut *self.owners;
+        Self::prepend_bin_ref_chain(
+            &mut target.off_heap_first,
+            std::mem::take(&mut source.off_heap_first),
+        );
+        Self::prepend_bin_ref_chain(&mut target.wrt_bins, std::mem::take(&mut source.wrt_bins));
+        target.overhead = target.overhead.saturating_add(source.overhead);
+    }
+
     pub(crate) fn absorb_owners(&mut self, mut source: LazyOwners, bin_vheap: u64) {
         if let Some(owners) = source.0.take() {
             let source_old_vheap = owners.vheap.old;
