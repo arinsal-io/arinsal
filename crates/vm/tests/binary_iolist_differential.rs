@@ -18,8 +18,9 @@ run() ->
     Chunks = lists:duplicate(20000, Chunk),
     Iolist = [[Chunks, [<<1,2>>, [4,5]]], binary:copy(<<6>>, 131072)],
     Flat = iolist_to_binary(Iolist),
+    Small = iolist_to_binary([<<1,2>>, [3, [4,5]]]),
     {byte_size(ListBin), erlang:crc32(ListBin),
-     iolist_size(Iolist), byte_size(Flat), erlang:crc32(Flat)}.
+     iolist_size(Iolist), byte_size(Flat), erlang:crc32(Flat), Small}.
 "#;
     let beam = reference
         .compile_named("binary_iolist_differential", source, &[])

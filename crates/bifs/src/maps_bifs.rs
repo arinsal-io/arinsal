@@ -292,21 +292,22 @@ impl MapsBuildWalk {
     /// after a yield.
     pub fn step(&mut self, ctx: &mut Ctx<'_>, reds: &mut i64) -> Result<Option<Term>, BifError> {
         loop {
-            match self.phase {
-                BuildPhase::Validate => {
-                    // `is_list` is the primary tag, not a full classification
-                    // (erl_map.c:331, erl_term.h is_list).
+            if matches!(self.phase, BuildPhase::Validate) {
+                // Port of `maps_from_keys_2_helper` and `maps_from_list_1_helper`,
+                // erts/emulator/beam/erl_map.c:279-366, OTP-29.1.1.
+                // Keep its steady-state list walk in one loop; ValidateBody is only needed
+                // when YCF yields after consuming a reduction and before the loop body.
+                loop {
                     if self.cursor.tagged_word() & 3 == 1 {
-                        self.phase = BuildPhase::ValidateBody;
                         *reds -= 1;
                         if *reds <= 0 {
+                            self.phase = BuildPhase::ValidateBody;
                             return Ok(None);
                         }
                         let (head, tail) = Self::cell(self.cursor)?;
                         self.element(head)?;
                         self.size += 1;
                         self.cursor = tail;
-                        self.phase = BuildPhase::Validate;
                         continue;
                     }
                     if self.cursor != Term::NIL {
@@ -330,7 +331,11 @@ impl MapsBuildWalk {
                     let build = arinsal_maps::HashmapFromPairs::new(self.size, &mut ctx.heap);
                     self.build = Some(mapped(ctx, build)?);
                     self.phase = BuildPhase::Leaves;
+                    break;
                 }
+            }
+            match self.phase {
+                BuildPhase::Validate => unreachable!("validation loop handles this phase"),
                 BuildPhase::ValidateBody => {
                     let (head, tail) = Self::cell(self.cursor)?;
                     self.element(head)?;

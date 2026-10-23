@@ -444,11 +444,25 @@ impl Hash2Run {
                             let saved = *hash;
                             xors.push(0);
                             stack.push(Job::Finish(saved));
-                            for (key, value) in crate::hamt::PairIter::new(term) {
-                                stack.push(Job::Xor);
-                                stack.push(Job::Visit(value));
-                                stack.push(Job::Visit(key));
-                                stack.push(Job::Reset);
+                            // Port of the direct flatmap array loop in
+                            // erts/emulator/beam/erl_term_hashing.c (make_hash2_helper, OTP-29.1.1).
+                            if term.is_hashmap() {
+                                for (key, value) in crate::hamt::PairIter::new(term) {
+                                    stack.push(Job::Xor);
+                                    stack.push(Job::Visit(value));
+                                    stack.push(Job::Visit(key));
+                                    stack.push(Job::Reset);
+                                }
+                            } else {
+                                crate::hamt::with_flatmap_arrays(term, |keys, values| {
+                                    for index in (0..keys.len()).rev() {
+                                        stack.push(Job::Xor);
+                                        stack.push(Job::Visit(Term(values[index])));
+                                        stack.push(Job::Visit(Term(keys[index])));
+                                        stack.push(Job::Reset);
+                                    }
+                                })
+                                .expect("map branch distinguishes flatmaps from HAMTs");
                             }
                             ticks += n as i64;
                         }

@@ -867,7 +867,21 @@ fn time_unit(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
 fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3762-3777 (tuple_to_list_1), OTP-29.1.1.
     let values = tuple_view(&args[0])?;
-    Ok(make_list(ctx, values.iter(), Term::NIL))
+    let len = values.len();
+    if len == 0 {
+        return Ok(Term::NIL);
+    }
+    let mut heap = Heap(&mut ctx.heap);
+    let list = TermBuilder::new(&mut heap)
+        .reserve_cons_list(len)
+        .map_err(|_| BifError::SystemLimit)?;
+    list.prepend_exact_with_tail(
+        (0..len)
+            .rev()
+            .map(|index| values.get(index).expect("tuple index")),
+        Term::NIL,
+    )
+    .map_err(|_| BifError::SystemLimit)
 }
 fn list_to_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3789-3808 (list_to_tuple_1), OTP-29.1.1.
