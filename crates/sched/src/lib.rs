@@ -4945,7 +4945,14 @@ impl<T: Task> Runner<'_, T> {
             // Port of erl_process.c:12525-12531 (`erl_create_process`) and
             // erl_process.c:3954 (`enqueue_process`), OTP-29.1.1: newly spawned
             // children join the caller's FIFO run queue behind earlier children.
-            self.inner.push_run_queue(local.worker_id, item, false);
+            // The child joins the same local deque a woken process does (place_runnable), so
+            // it runs before a process the parent wakes afterwards.
+            if self.inner.sim.is_none() {
+                local.record_queued(&item.process, local.worker_id, false);
+                local.queues[item.queue()].push(item);
+            } else {
+                self.inner.push_run_queue(local.worker_id, item, false);
+            }
         } else {
             self.inner.enqueue_new(item);
         }
