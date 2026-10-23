@@ -1799,6 +1799,14 @@ impl Vm {
         self.refresh_code();
         // The interpreter is the process's position now, not the last native address.
         p.header.i = std::ptr::null();
+        // The call site of a native call into interpreted code is only for a native call the
+        // scheduler redoes. Left behind, it makes a trap of an interpreted call push a native
+        // return address that erts' interpreter-free frames never have, shifting every Y.
+        if let Some(cold) = p.cold.as_mut()
+            && cold.native_retry.is_none()
+        {
+            cold.native_retry_site = None;
+        }
         // A migrated process may already be inside a module this replica has
         // not copied yet. Sync only when the id is past the local table.
         self.sync_module(p.module);
