@@ -4681,9 +4681,16 @@ fn check_io_info(process: &mut Process) -> Result<Term, VmError> {
         ),
     ];
     let mut sets = Vec::with_capacity(entries.len());
-    for (primary, kernel_poll, memory, lazy, batch, concurrent, fallback, poll_threads, set_size) in
-        entries
+    // The scheduler pollset (second entry) exists only with `+IOs true`.
+    let scheduler_polling = crate::check_io::sched_poll_enabled();
+    for (
+        index,
+        (primary, kernel_poll, memory, lazy, batch, concurrent, fallback, poll_threads, set_size),
+    ) in entries.into_iter().enumerate()
     {
+        if index == 1 && !scheduler_polling {
+            continue;
+        }
         let properties = [
             ("name", atom("erts_poll")),
             ("primary", atom(primary)),

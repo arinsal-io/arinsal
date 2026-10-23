@@ -383,3 +383,19 @@ fn emulator_acceptance_matches_otp_for_representative_flags() {
         );
     }
 }
+
+#[test]
+fn scheduler_polling_flag_is_a_boolean() {
+    let launch = parse(&["erl", "+IOs", "false"], &environment()).unwrap();
+    assert_eq!(launch.emulator.scheduler_polling, Some(false));
+    let launch = parse(&["erl", "+IOs", "true"], &environment()).unwrap();
+    assert_eq!(launch.emulator.scheduler_polling, Some(true));
+    let launch = parse(&["erl"], &environment()).unwrap();
+    assert_eq!(launch.emulator.scheduler_polling, None);
+    let error = parse(&["erl", "+IOs", "maybe"], &environment()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("bad +IOs boolean argument: maybe")
+    );
+}

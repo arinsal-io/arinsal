@@ -238,9 +238,13 @@ fn poller() -> &'static Poller {
 
 /// `+IOs`: schedulers poll the descriptors that are re-enabled often (the default).
 // Port of erts/emulator/sys/common/erl_check_io.c (erts_sched_poll_enabled), OTP-29.1.1.
-fn sched_poll_enabled() -> bool {
+pub(crate) fn sched_poll_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("ARINSAL_NO_SCHED_POLL").is_none())
+    *ENABLED.get_or_init(|| {
+        arinsal_args::active_emulator_flags()
+            .scheduler_polling
+            .unwrap_or(true)
+    })
 }
 
 /// The scheduler pollset; only the scheduler that owns `doing_sys_schedule` waits on it.
