@@ -146,6 +146,7 @@ dependencies = [
  "arinsal-nif",
  "arinsal-term",
  "arinsal-vm",
+ "rustix",
  "similar-asserts",
 ]
 
