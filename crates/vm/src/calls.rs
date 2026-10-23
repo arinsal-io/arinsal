@@ -83,6 +83,26 @@ pub(crate) fn call_bif_metered(
     (result, ctx.reductions())
 }
 
+/// Invoke a BIF and preserve a continuation it deferred after exhausting its slice.
+// Port of erts/emulator/beam/erl_bif_guard.c:210-244 (length_1), OTP-29.1.1.
+pub(crate) fn call_bif_metered_deferred(
+    heap: &mut arinsal_term::ProcessHeap,
+    fcalls: &mut i32,
+    target: arinsal_bifs::BifFn,
+    args: &[arinsal_term::Term],
+) -> (
+    Result<arinsal_term::Term, arinsal_bifs::BifError>,
+    u32,
+    Option<Box<arinsal_bifs::DeferredTrap>>,
+) {
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, fcalls);
+    let result = target(&mut ctx, args);
+    let reductions = ctx.reductions();
+    let deferred = ctx.take_deferred();
+    (result, reductions, deferred)
+}
+
 /// Collect after a BIF when message-buffer fragments occupy more space than
 /// the process can keep free on its heap.
 // Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf), OTP-29.1.1.
