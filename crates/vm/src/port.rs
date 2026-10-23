@@ -2274,6 +2274,7 @@ pub(crate) fn install_poll_backend() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
         arinsal_drv::set_poll_backend(Arc::new(DrvPoll::new()));
+        crate::check_io::install_scheduler_polling();
     });
 }
 

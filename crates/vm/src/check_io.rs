@@ -6,8 +6,8 @@
 
 use crate::erl_poll::{
     ERTS_POLL_EV_ERR, ERTS_POLL_EV_IN, ERTS_POLL_EV_NONE, ERTS_POLL_EV_NVAL, ERTS_POLL_EV_OUT,
-    ErtsPollEvent, ErtsPollOp, ErtsPollSet, erts_poll_control, erts_poll_init, erts_poll_max_fds,
-    erts_poll_wait,
+    ErtsPollEvent, ErtsPollOp, ErtsPollSet, PollSetKind, erts_poll_control, erts_poll_init,
+    erts_poll_interrupt, erts_poll_max_fds, erts_poll_wait,
 };
 use std::io;
 use std::os::fd::RawFd;
@@ -132,9 +132,25 @@ struct Watch {
 #[derive(Default)]
 struct FdState {
     watches: Vec<Watch>,
-    poll_events: InterestSet,
-    poll_registered: bool,
+    /// What the poll thread's set holds for this descriptor.
+    main: SetState,
+    /// What the scheduler pollset holds (the read interest once `scheduler` is set).
+    sched: SetState,
+    /// `ERTS_EV_FLAG_SCHEDULER`: the read interest has moved to the scheduler pollset.
+    scheduler: bool,
+    /// `ErtsDrvEventState.count`: read interests registered, to decide the migration.
+    count: u32,
 }
+
+#[derive(Default)]
+struct SetState {
+    events: InterestSet,
+    registered: bool,
+}
+
+/// Port of erts/emulator/sys/common/erl_check_io.c (erts_io_notify_port_task_executed):
+/// a read descriptor re-enabled more than this many times moves to the scheduler pollset.
+const SCHEDULER_MIGRATION_COUNT: u32 = 10;
 
 struct FdStateTable {
     slots: RwLock<Vec<Mutex<FdState>>>,
@@ -205,7 +221,8 @@ static POLLER: OnceLock<Poller> = OnceLock::new();
 
 fn poller() -> &'static Poller {
     POLLER.get_or_init(|| {
-        let poll = erts_poll_init().expect("create shared ERTS poll set");
+        let poll = erts_poll_init(PollSetKind::Main).expect("create shared ERTS poll set");
+
         let states = Arc::new(FdStateTable::default());
         let worker_states = Arc::clone(&states);
         thread::Builder::new()
@@ -217,6 +234,66 @@ fn poller() -> &'static Poller {
             states,
         }
     })
+}
+
+/// `+IOs`: schedulers poll the descriptors that are re-enabled often (the default).
+// Port of erts/emulator/sys/common/erl_check_io.c (erts_sched_poll_enabled), OTP-29.1.1.
+fn sched_poll_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("ARINSAL_NO_SCHED_POLL").is_none())
+}
+
+/// The scheduler pollset; only the scheduler that owns `doing_sys_schedule` waits on it.
+static SCHED_POLLSET: OnceLock<Mutex<ErtsPollSet>> = OnceLock::new();
+
+/// Install the scheduler pollset with the scheduler loop. The poll thread is started with the
+/// first selection; the scheduler pollset is created with it.
+pub(crate) fn install_scheduler_polling() {
+    if sched_poll_enabled() {
+        let _ = poller();
+        static CREATE: std::sync::Once = std::sync::Once::new();
+        CREATE.call_once(|| {
+            let sched = erts_poll_init(PollSetKind::Scheduler).expect("create scheduler poll set");
+            let _ = SCHED_POLLSET.set(Mutex::new(sched));
+        });
+        arinsal_sched::set_sched_poll(Arc::new(SchedPollHook));
+    }
+}
+
+struct SchedPollHook;
+
+impl arinsal_sched::SchedPoll for SchedPollHook {
+    fn enabled(&self) -> bool {
+        SCHED_POLLSET.get().is_some()
+    }
+
+    // Port of erts/emulator/sys/common/erl_check_io.c (erts_check_io on the scheduler pollset),
+    // OTP-29.1.1.
+    fn poll(&self, timeout: Option<Duration>) {
+        let (Some(set), Some(poller)) = (SCHED_POLLSET.get(), POLLER.get()) else {
+            return;
+        };
+        let mut events = Vec::with_capacity(EVENT_CAPACITY);
+        {
+            let mut poll = set.lock().unwrap();
+            if erts_poll_wait(&mut poll, timeout, &mut events).is_err() {
+                return;
+            }
+        }
+        for event in events.drain(..) {
+            if let Some(fd) = event.fd {
+                check_event(&poller.states, fd, event, PollSetKind::Scheduler);
+            }
+        }
+    }
+
+    fn interrupt(&self) {
+        let _ = erts_poll_interrupt(PollSetKind::Scheduler);
+    }
+
+    fn have_outstanding_io(&self) -> bool {
+        arinsal_drv::port_task::have_outstanding_io_tasks()
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +459,18 @@ fn register_kind(
         kind,
         callback: Some(Box::new(ready)),
     });
+    // Port of erl_check_io.c (erts_io_notify_port_task_executed): the read descriptor of a
+    // driver that was re-enabled often moves to the scheduler pollset.
+    if matches!(kind, RegistrationKind::Driver)
+        && interests.readable
+        && !state.scheduler
+        && SCHED_POLLSET.get().is_some()
+    {
+        state.count += 1;
+        if state.count > SCHEDULER_MIGRATION_COUNT {
+            state.scheduler = true;
+        }
+    }
     match sync_pollset(fd, &mut state) {
         Ok(()) => Ok(registration),
         Err(_error) if always_ready_fd(fd) => {
@@ -431,21 +520,26 @@ fn poll_loop(mut poll: ErtsPollSet, states: Arc<FdStateTable>) {
         set_poll_state(PollState::CheckIo);
         for event in events.drain(..) {
             if let Some(fd) = event.fd {
-                check_event(&states, fd, event);
+                check_event(&states, fd, event, PollSetKind::Main);
             }
         }
     }
 }
 
-fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent) {
+fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent, from: PollSetKind) {
     let Ok((index, slots)) = states.lock_slots(fd) else {
         return;
     };
     let mut state = slots[index].lock().unwrap();
-    let seen = InterestSet {
+    let mut seen = InterestSet {
         readable: event.events & ERTS_POLL_EV_IN != 0,
         writable: event.events & ERTS_POLL_EV_OUT != 0,
     };
+    if from == PollSetKind::Main && state.scheduler {
+        // Port of erl_check_io.c (erts_check_io): "We are in a poll thread and the fd is
+        // managed by a scheduler, we ignore the any IN events".
+        seen.readable = false;
+    }
     let poll_error = event.events & (ERTS_POLL_EV_ERR | ERTS_POLL_EV_NVAL) != 0;
     let mut callbacks = Vec::new();
     state.watches.retain_mut(|watch| {
@@ -473,9 +567,15 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent) {
     if sync_pollset(fd, &mut state).is_err() {
         // A failed re-arm is reported as NVAL by erts_check_io. Trigger every
         // remaining watch after removing the descriptor from the poll set.
-        state.poll_events = InterestSet::default();
-        state.poll_registered = false;
-        let _ = erts_poll_control(fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE);
+        state.main = SetState::default();
+        state.sched = SetState::default();
+        let _ = erts_poll_control(PollSetKind::Main, fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE);
+        let _ = erts_poll_control(
+            PollSetKind::Scheduler,
+            fd,
+            ErtsPollOp::Del,
+            ERTS_POLL_EV_NONE,
+        );
         callbacks.extend(state.watches.drain(..).filter_map(|mut watch| {
             watch.callback.take().map(|callback| {
                 (
@@ -499,32 +599,63 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent) {
 fn sync_pollset(fd: RawFd, state: &mut FdState) -> io::Result<()> {
     let next = watch_interests(&state.watches);
     let selected = !state.watches.is_empty();
-    if next == state.poll_events {
-        if !next.readable && !next.writable && state.poll_registered && !selected {
-            poll_control(fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE)?;
-            state.poll_registered = false;
+    // Port of erts/emulator/sys/common/erl_check_io.c (erts_io_control_wakeup): a descriptor
+    // that migrated keeps only its output interest in the poll thread's set; its read
+    // interest lives in the scheduler pollset.
+    let main_want = InterestSet {
+        readable: next.readable && !state.scheduler,
+        writable: next.writable,
+    };
+    sync_set(PollSetKind::Main, fd, main_want, selected, &mut state.main)?;
+    if state.scheduler || state.sched.registered {
+        let sched_want = InterestSet {
+            readable: next.readable && state.scheduler,
+            writable: false,
+        };
+        sync_set(
+            PollSetKind::Scheduler,
+            fd,
+            sched_want,
+            selected,
+            &mut state.sched,
+        )?;
+    }
+    Ok(())
+}
+
+fn sync_set(
+    kind: PollSetKind,
+    fd: RawFd,
+    next: InterestSet,
+    selected: bool,
+    set: &mut SetState,
+) -> io::Result<()> {
+    if next == set.events {
+        if !next.readable && !next.writable && set.registered && !selected {
+            poll_control(kind, fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE)?;
+            set.registered = false;
         }
         return Ok(());
     }
     let flags = (if next.readable { ERTS_POLL_EV_IN } else { 0 })
         | (if next.writable { ERTS_POLL_EV_OUT } else { 0 });
     let op = if next.readable || next.writable {
-        if state.poll_registered {
+        if set.registered {
             ErtsPollOp::Mod
         } else {
             ErtsPollOp::Add
         }
     } else if selected {
         ErtsPollOp::Mod
-    } else if state.poll_registered {
+    } else if set.registered {
         ErtsPollOp::Del
     } else {
-        state.poll_events = next;
+        set.events = next;
         return Ok(());
     };
-    poll_control(fd, op, flags)?;
-    state.poll_events = next;
-    state.poll_registered = op != ErtsPollOp::Del;
+    poll_control(kind, fd, op, flags)?;
+    set.events = next;
+    set.registered = op != ErtsPollOp::Del;
     Ok(())
 }
 
@@ -536,8 +667,8 @@ fn watch_interests(watches: &[Watch]) -> InterestSet {
         })
 }
 
-fn poll_control(fd: RawFd, op: ErtsPollOp, events: u32) -> io::Result<()> {
-    if erts_poll_control(fd, op, events) & ERTS_POLL_EV_NVAL != 0 {
+fn poll_control(kind: PollSetKind, fd: RawFd, op: ErtsPollOp, events: u32) -> io::Result<()> {
+    if erts_poll_control(kind, fd, op, events) & ERTS_POLL_EV_NVAL != 0 {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "ERTS poll control returned ERTS_POLL_EV_NVAL",
@@ -619,7 +750,8 @@ pub(crate) mod tests {
     #[test]
     fn erl_poll_control_reports_invalid_fds_as_nval() {
         assert_ne!(
-            erts_poll_control(-1, ErtsPollOp::Add, ERTS_POLL_EV_IN) & ERTS_POLL_EV_NVAL,
+            erts_poll_control(PollSetKind::Main, -1, ErtsPollOp::Add, ERTS_POLL_EV_IN)
+                & ERTS_POLL_EV_NVAL,
             0
         );
     }
