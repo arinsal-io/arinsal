@@ -5,9 +5,12 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::{Arc, OnceLock};
 
+use arinsal_etf::DecodedSizeWalk;
 use arinsal_term::{
-    Atom, ExportEntry, FunEntry, FunRef, HeapAlloc, Identity, Node, Term, TermBuilder, TermKind,
-    atoms, cmp_exact, global_atoms, writable_finalize, writable_resize_private,
+    Atom, BinaryOwner, ExportEntry, FunEntry, FunRef, HeapAlloc, HeapReservation,
+    HeapReservationState, Identity, Node, OwnedBinaryRef, Term, TermBuilder, TermKind, atoms,
+    binary_owner, cmp_exact, flat_key_cmp, global_atoms, hashmap_from_ks_and_vs_extra,
+    writable_finalize, writable_resize_private,
 };
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use num_bigint::{BigInt, Sign};
@@ -1790,11 +1793,38 @@ fn badopt() -> BifError {
     }
 }
 
-struct Reader {
-    bytes: SmallVec<[u8; 64]>,
+enum DecodeInput<'a> {
+    Inline(SmallVec<[u8; 64]>),
+    Borrowed {
+        bytes: &'a [u8],
+        term: Term,
+        offset: usize,
+        len: usize,
+    },
+    Refc {
+        owner: OwnedBinaryRef,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl DecodeInput<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Inline(bytes) => bytes,
+            Self::Borrowed { bytes, .. } => bytes,
+            Self::Refc { owner, offset, len } => owner
+                .payload(*offset, *len)
+                .expect("retained ETF bytes remain within the Binary allocation"),
+        }
+    }
+}
+
+struct Reader<'a> {
+    bytes: &'a [u8],
     at: usize,
 }
-impl Reader {
+impl Reader<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8], BifError> {
         let end = self.at.checked_add(n).ok_or(BifError::BADARG)?;
         let part = self
@@ -1816,10 +1846,10 @@ impl Reader {
     fn u64(&mut self) -> Result<u64, BifError> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
-    fn atom(
+    fn atom<H: HeapAlloc>(
         &mut self,
         safe: bool,
-        ctx: &mut Option<&mut Ctx<'_>>,
+        ctx: &mut Option<&mut Ctx<'_, H>>,
     ) -> Result<(Term, Option<String>), BifError> {
         let tag = self.u8()?;
         let (len, utf8) = match tag {
@@ -1872,7 +1902,10 @@ enum FrameKind {
         slots: Option<arinsal_term::HeapBlockBuilder>,
     },
     List,
-    Map,
+    Map {
+        keys: SmallVec<[Term; 4]>,
+        map_values: SmallVec<[Term; 4]>,
+    },
     Export,
     Fun {
         arity: u8,
@@ -1928,18 +1961,31 @@ fn reserve_tuple_slots<H: HeapAlloc>(
 
 // Port of erts/emulator/beam/external.c (dec_term, next child slot), OTP-29.1.1.
 fn accept_child(frame: &mut Frame, term: Term, shape: Shape) -> Result<(), BifError> {
-    if let FrameKind::Tuple { slots } = &mut frame.kind {
-        if let Some(slots) = slots {
-            slots.write_term(term).map_err(map_term_build_error)?;
+    match &mut frame.kind {
+        FrameKind::Tuple { slots } => {
+            if let Some(slots) = slots {
+                slots.write_term(term).map_err(map_term_build_error)?;
+            }
         }
-    } else {
-        frame.values.push(term);
-        frame.shapes.push(shape);
+        FrameKind::Map { keys, map_values } => {
+            if frame.left.is_multiple_of(2) {
+                keys.push(term);
+            } else {
+                map_values.push(term);
+            }
+        }
+        _ => {
+            frame.values.push(term);
+            frame.shapes.push(shape);
+        }
     }
     Ok(())
 }
 
-fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape), BifError> {
+fn finish<H: HeapAlloc>(
+    frame: Frame,
+    ctx: &mut Option<&mut Ctx<'_, H>>,
+) -> Result<(Term, Shape), BifError> {
     let values = frame.values;
     match frame.kind {
         FrameKind::Local { .. } => Err(BifError::BADARG),
@@ -1961,22 +2007,40 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
             }
             Ok((tail, Shape::Other))
         }
-        FrameKind::Map => {
-            // Port of erts/emulator/beam/external.c:5428, OTP-29.1.1.
-            let pairs: SmallVec<[(Term, Term); 4]> = values
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|p| (p[0], p[1]))
-                .collect();
+        FrameKind::Map {
+            mut keys,
+            mut map_values,
+        } => {
+            // Port of erts/emulator/beam/external.c:5047-5060, 5428-5445
+            // (decoded key/value arrays and bottom-up map construction), OTP-29.1.1.
             if ctx.is_some() {
                 let ctx = ctx.as_deref_mut().unwrap();
-                let map = arinsal_maps::from_pairs(&pairs, &mut ctx.heap)
-                    .map_err(|_| BifError::BADARG)?;
-                if arinsal_maps::size(map).map_err(|_| BifError::BADARG)? != pairs.len() {
-                    return Err(BifError::BADARG);
+                if keys.len() <= 32 {
+                    for index in 1..keys.len() {
+                        let mut current = index;
+                        while current > 0 {
+                            match flat_key_cmp(keys[current], keys[current - 1]) {
+                                Ordering::Greater => break,
+                                Ordering::Equal => return Err(BifError::BADARG),
+                                Ordering::Less => {
+                                    keys.swap(current, current - 1);
+                                    map_values.swap(current, current - 1);
+                                    current -= 1;
+                                }
+                            }
+                        }
+                    }
+                    let map = TermBuilder::new(&mut ctx.heap)
+                        .flatmap_from_sorted_arrays(&keys, &map_values)
+                        .map_err(map_term_build_error)?;
+                    Ok((map, Shape::Other))
+                } else {
+                    let map =
+                        hashmap_from_ks_and_vs_extra(&keys, &map_values, None, true, &mut ctx.heap)
+                            .map_err(map_term_build_error)?
+                            .ok_or(BifError::BADARG)?;
+                    Ok((map, Shape::Other))
                 }
-                Ok((map, Shape::Other))
             } else {
                 Ok((Term::NIL, Shape::Other))
             }
@@ -2088,11 +2152,11 @@ fn count_ok(count: usize, remaining: usize, input_complete: bool) -> Result<(), 
     }
 }
 
-fn parse_step(
+fn parse_step<H: HeapAlloc>(
     r: &mut Reader,
     stack: &mut SmallVec<[Frame; 4]>,
     safe: bool,
-    mut ctx: Option<&mut Ctx<'_>>,
+    mut ctx: Option<&mut Ctx<'_, H>>,
     budget: usize,
     input_complete: bool,
 ) -> Result<Option<(Term, usize)>, BifError> {
@@ -2235,11 +2299,18 @@ fn parse_step(
                         kind: if tag == 108 {
                             FrameKind::List
                         } else {
-                            FrameKind::Map
+                            FrameKind::Map {
+                                keys: SmallVec::with_capacity(n.min(1024)),
+                                map_values: SmallVec::with_capacity(n.min(1024)),
+                            }
                         },
                         left: count,
-                        values: SmallVec::with_capacity(count.min(1024)),
-                        shapes: SmallVec::with_capacity(count.min(1024)),
+                        values: if tag == 108 {
+                            SmallVec::with_capacity(count.min(1024))
+                        } else {
+                            SmallVec::new()
+                        },
+                        shapes: SmallVec::new(),
                     });
                     None
                 }
@@ -2259,6 +2330,8 @@ fn parse_step(
                         .and_then(|v| v.checked_add(bits))
                 }
                 .ok_or(BifError::BADARG)?;
+                // Port of erts/emulator/beam/external.c:4940-4997 (`dec_term` binary cases),
+                // OTP-29.1.1: short payloads are heap bits and long payloads copy to a new Binary.
                 let t = built(&mut ctx, |b| b.bitstring(raw, bit_len))?;
                 Some((t, Shape::Other))
             }
@@ -2283,6 +2356,7 @@ fn parse_step(
                     r.atom(safe, &mut ctx)?
                 };
                 let node = node_term.as_atom().unwrap();
+                let mut ids = [0; 5];
                 let identity = if tag == 103 || tag == 88 {
                     let id = r.u32()?;
                     let serial = r.u32()?;
@@ -2290,7 +2364,7 @@ fn parse_step(
                     if tag == 103 && creation > 3 {
                         return Err(BifError::BADARG);
                     }
-                    (id as u64, serial, creation, Vec::new())
+                    (id as u64, serial, creation, 0)
                 } else if matches!(tag, 102 | 89 | 120) {
                     let id = if tag == 120 {
                         r.u64()?
@@ -2301,30 +2375,30 @@ fn parse_step(
                     if tag == 102 && creation > 3 {
                         return Err(BifError::BADARG);
                     }
-                    (id, 0, creation, Vec::new())
+                    (id, 0, creation, 0)
                 } else if tag == 101 {
                     let id = r.u32()?;
                     let creation = r.u8()? as u32;
                     if id >= (1 << 18) || creation > 3 {
                         return Err(BifError::BADARG);
                     }
-                    (0, 0, creation, vec![id])
+                    ids[0] = id;
+                    (0, 0, creation, 1)
                 } else {
                     let creation = if tag == 90 { r.u32()? } else { r.u8()? as u32 };
                     if tag != 90 && creation > 3 {
                         return Err(BifError::BADARG);
                     }
-                    let mut ids = Vec::with_capacity(count);
-                    for i in 0..count {
+                    for (i, slot) in ids.iter_mut().take(count).enumerate() {
                         let id = r.u32()?;
                         if i == 0 && tag != 90 && id >= (1 << 18) {
                             return Err(BifError::BADARG);
                         }
-                        ids.push(id);
+                        *slot = id;
                     }
-                    (0, 0, creation, ids)
+                    (0, 0, creation, count)
                 };
-                let (id, serial, creation, ids) = identity;
+                let (id, serial, creation, ids_len) = identity;
                 let t = if ctx.is_none() {
                     Term::NIL
                 } else if tag == 103 || tag == 88 {
@@ -2345,8 +2419,8 @@ fn parse_step(
                     // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT),
                     // OTP-29.1.1: numbers of a saved magic reference give that reference.
                     let mut local = [0; 3];
-                    for (slot, value) in local.iter_mut().zip(ids) {
-                        *slot = value;
+                    for (slot, value) in local.iter_mut().zip(&ids[..ids_len]) {
+                        *slot = *value;
                     }
                     let saved = (local[2] == u32::MAX)
                         .then(|| {
@@ -2361,7 +2435,7 @@ fn parse_step(
                     }
                 } else {
                     built(&mut ctx, |b| {
-                        b.external_ref(Node::new(node, creation), &ids)
+                        b.external_ref(Node::new(node, creation), &ids[..ids_len])
                     })?
                 };
                 Some((
@@ -2463,10 +2537,7 @@ fn parse_step(
 }
 
 fn parse(bytes: &[u8], safe: bool, ctx: Option<&mut Ctx<'_>>) -> Result<(Term, usize), BifError> {
-    let mut reader = Reader {
-        bytes: SmallVec::from_slice(bytes),
-        at: 0,
-    };
+    let mut reader = Reader { bytes, at: 0 };
     let mut stack = SmallVec::new();
     match parse_step(&mut reader, &mut stack, safe, ctx, usize::MAX, true)? {
         Some(value) => Ok(value),
@@ -2475,85 +2546,150 @@ fn parse(bytes: &[u8], safe: bool, ctx: Option<&mut Ctx<'_>>) -> Result<(Term, u
 }
 
 /// Incremental ETF validator retained by `binary_to_term_trap/1`.
-pub struct DecodeWalk {
-    reader: Reader,
+pub struct DecodeWalk<'a> {
+    input: DecodeInput<'a>,
+    plain: SmallVec<[u8; 128]>,
+    validator_at: usize,
+    decode_at: usize,
     stack: SmallVec<[Frame; 4]>,
     safe: bool,
     used: bool,
     compressed: bool,
     used_prefix: usize,
     input_size: usize,
-    compressed_input: SmallVec<[u8; 64]>,
     input_offset: usize,
     expected_plain: usize,
     decompressor: Option<Decompress>,
     inflate_done: bool,
     checked_root: Option<usize>,
-    decoded_root: Option<Term>,
+    sizing: DecodedSizeWalk,
+    heap_words: Option<usize>,
+    reservation: Option<HeapReservationState>,
+    size_done: bool,
+    decode_started: bool,
 }
 
-impl DecodeWalk {
-    /// Start decoding an ETF binary and retain its compressed payload if needed.
-    pub fn new(args: &[Term]) -> Result<Self, BifError> {
+impl<'a> DecodeWalk<'a> {
+    /// Start decoding an ETF binary while borrowing a reference-counted input payload.
+    pub fn new(args: &'a [Term]) -> Result<Self, BifError> {
         let opts = decode_options(args.get(1).copied())?;
         // SAFETY: the input binary owner is live and stable during the BIF call.
         let view = unsafe { args[0].binary_ref() }.ok_or(BifError::BADARG)?;
         if !view.bit_len().is_multiple_of(8) {
             return Err(BifError::BADARG);
         }
-        let bytes = if view.start_bit().is_multiple_of(8) {
-            let start = view.start_bit() / 8;
-            let mut bytes = SmallVec::new();
-            bytes.extend_from_slice(&view.bytes()[start..start + view.bit_len() / 8]);
-            bytes
+        let can_borrow = view.is_refc()
+            && view.start_bit().is_multiple_of(8)
+            && !arinsal_term::is_writable_binary(args[0]);
+        let input = if can_borrow {
+            let offset = view.start_bit() / 8;
+            let len = view.bit_len() / 8;
+            DecodeInput::Borrowed {
+                bytes: &view.bytes()[offset..offset + len],
+                term: args[0],
+                offset,
+                len,
+            }
         } else {
-            bit_bytes(args[0])?.0
+            DecodeInput::Inline(bit_bytes(args[0])?.0)
         };
+        let bytes = input.bytes();
         if bytes.first() != Some(&131) {
             return Err(BifError::BADARG);
         }
-        let (plain, used_prefix, compressed, compressed_input, expected_plain, decompressor) =
+        let (plain, used_prefix, compressed, expected_plain, decompressor) =
             if bytes.get(1) == Some(&80) {
                 if bytes.len() < 6 {
                     return Err(BifError::BADARG);
                 }
                 let size = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
-                (
-                    SmallVec::new(),
-                    6,
-                    true,
-                    SmallVec::from_slice(&bytes[6..]),
-                    size,
-                    Some(Decompress::new(true)),
-                )
+                (SmallVec::new(), 6, true, size, Some(Decompress::new(true)))
             } else {
-                (
-                    SmallVec::from_slice(&bytes[1..]),
-                    1,
-                    false,
-                    SmallVec::new(),
-                    0,
-                    None,
-                )
+                (SmallVec::new(), 1, false, 0, None)
             };
+        let input_size = bytes.len();
         Ok(Self {
-            reader: Reader {
-                bytes: plain,
-                at: 0,
-            },
+            input,
+            plain,
+            validator_at: 0,
+            decode_at: 0,
             stack: SmallVec::new(),
             safe: opts.safe,
             used: opts.used,
             compressed,
             used_prefix,
-            input_size: bytes.len(),
-            compressed_input,
+            input_size,
             input_offset: 0,
             expected_plain,
             decompressor,
             inflate_done: !compressed,
             checked_root: None,
-            decoded_root: None,
+            sizing: DecodedSizeWalk::new(),
+            heap_words: None,
+            reservation: None,
+            size_done: false,
+            decode_started: false,
+        })
+    }
+
+    /// Retain the refc input only when the decoder is moved into a trap context.
+    pub fn into_owned(self) -> Result<DecodeWalk<'static>, BifError> {
+        let Self {
+            input,
+            plain,
+            validator_at,
+            decode_at,
+            stack,
+            safe,
+            used,
+            compressed,
+            used_prefix,
+            input_size,
+            input_offset,
+            expected_plain,
+            decompressor,
+            inflate_done,
+            checked_root,
+            sizing,
+            heap_words,
+            reservation,
+            size_done,
+            decode_started,
+        } = self;
+        let input = match input {
+            DecodeInput::Inline(bytes) => DecodeInput::Inline(bytes),
+            DecodeInput::Refc { owner, offset, len } => DecodeInput::Refc { owner, offset, len },
+            DecodeInput::Borrowed {
+                term, offset, len, ..
+            } => match binary_owner(term) {
+                // `new` excluded active writable handles. The process can still expose an
+                // immutable bitstring backed by a writable owner; pin it like the BIF argument
+                // root held by erts across a trap.
+                Some(BinaryOwner::Binary(owner)) => DecodeInput::Refc { owner, offset, len },
+                _ => return Err(BifError::BADARG),
+            },
+        };
+        Ok(DecodeWalk {
+            input,
+            plain,
+            validator_at,
+            decode_at,
+            stack,
+            safe,
+            used,
+            compressed,
+            used_prefix,
+            input_size,
+            input_offset,
+            expected_plain,
+            decompressor,
+            inflate_done,
+            checked_root,
+            sizing,
+            heap_words,
+            reservation,
+            size_done,
+            decode_started,
         })
     }
 
@@ -2561,11 +2697,11 @@ impl DecodeWalk {
         if self.inflate_done {
             return Ok(0);
         }
-        let remaining = self.expected_plain.saturating_sub(self.reader.bytes.len());
+        let remaining = self.expected_plain.saturating_sub(self.plain.len());
         let capacity = output_budget.max(1).min(remaining.saturating_add(1));
         let mut output = SmallVec::<[u8; 128]>::new();
         output.resize(capacity, 0);
-        let input = &self.compressed_input[self.input_offset..];
+        let input = &self.input.bytes()[6 + self.input_offset..];
         let flush = if input.is_empty() {
             FlushDecompress::Finish
         } else {
@@ -2582,20 +2718,28 @@ impl DecodeWalk {
         let produced =
             usize::try_from(inflater.total_out() - before_out).map_err(|_| BifError::BADARG)?;
         self.input_offset = self.input_offset.saturating_add(consumed);
-        if self.reader.bytes.len().saturating_add(produced) > self.expected_plain {
+        if self.plain.len().saturating_add(produced) > self.expected_plain {
             return Err(BifError::BADARG);
         }
-        self.reader.bytes.extend_from_slice(&output[..produced]);
+        self.plain.extend_from_slice(&output[..produced]);
         if status == Status::StreamEnd {
             self.inflate_done = true;
             self.used_prefix = 6 + self.input_offset;
-            if self.reader.bytes.len() != self.expected_plain {
+            if self.plain.len() != self.expected_plain {
                 return Err(BifError::BADARG);
             }
         } else if consumed == 0 && produced == 0 {
             return Err(BifError::BADARG);
         }
         Ok(produced)
+    }
+
+    fn plain_bytes(&self) -> &[u8] {
+        if self.compressed {
+            &self.plain
+        } else {
+            &self.input.bytes()[1..]
+        }
     }
 
     /// Validate at most `byte_budget` ETF input bytes and report consumed bytes.
@@ -2612,7 +2756,7 @@ impl DecodeWalk {
                 consumed += produced.max(1);
             }
             if self.inflate_done {
-                if checked != self.expected_plain || self.reader.bytes.len() != checked {
+                if checked != self.expected_plain || self.plain_bytes().len() != checked {
                     return Err((BifError::BADARG, consumed));
                 }
                 return Ok((Some(checked), consumed));
@@ -2620,7 +2764,7 @@ impl DecodeWalk {
             return Ok((None, consumed));
         }
         while consumed < byte_budget.max(1) {
-            let before = self.reader.at;
+            let before = self.validator_at;
             // One dec_term loop when the plain text is complete. Compressed
             // chunks stay at one tag so inflate can refill the buffer.
             let tags = if self.compressed && !self.inflate_done {
@@ -2628,16 +2772,27 @@ impl DecodeWalk {
             } else {
                 byte_budget.saturating_sub(consumed).max(1)
             };
-            match parse_step(
-                &mut self.reader,
-                &mut self.stack,
-                self.safe,
-                None,
-                tags,
-                !self.compressed || self.inflate_done,
-            ) {
+            let (parsed, after) = {
+                let bytes = if self.compressed {
+                    &self.plain[..]
+                } else {
+                    &self.input.bytes()[1..]
+                };
+                let mut reader = Reader { bytes, at: before };
+                let parsed = parse_step(
+                    &mut reader,
+                    &mut self.stack,
+                    self.safe,
+                    None::<&mut Ctx<'_, crate::ProcessHeapHandle<'_>>>,
+                    tags,
+                    !self.compressed || self.inflate_done,
+                );
+                (parsed, reader.at)
+            };
+            self.validator_at = after;
+            match parsed {
                 Ok(Some((_, checked))) => {
-                    consumed += self.reader.at - before;
+                    consumed += self.validator_at - before;
                     if self.compressed && !self.inflate_done {
                         self.checked_root = Some(checked);
                         let produced = self
@@ -2646,14 +2801,14 @@ impl DecodeWalk {
                         consumed += produced.max(1);
                         continue;
                     }
-                    if self.compressed && checked != self.reader.bytes.len() {
+                    if self.compressed && checked != self.plain_bytes().len() {
                         return Err((BifError::BADARG, consumed));
                     }
                     return Ok((Some(checked), consumed));
                 }
-                Ok(None) => consumed += self.reader.at - before,
+                Ok(None) => consumed += self.validator_at - before,
                 Err(BifError::Unsupported("incomplete ETF input")) => {
-                    self.reader.at = before;
+                    self.validator_at = before;
                     if !self.compressed || self.inflate_done {
                         return Err((BifError::BADARG, consumed));
                     }
@@ -2662,7 +2817,7 @@ impl DecodeWalk {
                         .map_err(|error| (error, consumed))?;
                     consumed += produced.max(1);
                 }
-                Err(error) => return Err((error, consumed + self.reader.at - before)),
+                Err(error) => return Err((error, consumed + self.validator_at - before)),
             }
         }
         Ok((None, consumed))
@@ -2675,74 +2830,146 @@ impl DecodeWalk {
         ctx: &mut Ctx<'_>,
     ) -> Result<(Option<Term>, usize), (BifError, usize)> {
         let mut consumed = 0;
-        if let Some(checked) = self.checked_root {
-            while !self.inflate_done && consumed < byte_budget.max(1) {
-                let produced = self
-                    .inflate_more(byte_budget.saturating_sub(consumed))
-                    .map_err(|error| (error, consumed))?;
-                consumed += produced.max(1);
+        if !self.size_done {
+            let (checked, size_work) = self.size_step(byte_budget.max(1))?;
+            consumed += size_work;
+            let Some(_) = checked else {
+                return Ok((None, consumed));
+            };
+            self.decode_at = 0;
+            self.stack.clear();
+            self.decode_started = true;
+            if consumed >= byte_budget.max(1) {
+                return Ok((None, consumed));
             }
-            if self.inflate_done {
-                if checked != self.expected_plain || self.reader.bytes.len() != checked {
-                    return Err((BifError::BADARG, consumed));
+        }
+        if !self.decode_started {
+            self.decode_at = 0;
+            self.stack.clear();
+            self.decode_started = true;
+        }
+        let Some(_heap_words) = self.heap_words else {
+            return Err((BifError::BADARG, consumed));
+        };
+        let reservation = match self.reservation.take() {
+            Some(state) => HeapReservation::resume(&mut ctx.heap, state),
+            None => HeapReservation::new(&mut ctx.heap, _heap_words)
+                .map_err(|error| (map_term_build_error(error), consumed))?,
+        };
+        let mut decode_ctx = Ctx::with_allocator(reservation);
+        let budget = byte_budget.max(1).saturating_sub(consumed);
+        let mut decoded = 0;
+        let parsed = loop {
+            if decoded >= budget {
+                break Ok(None);
+            }
+            let before = self.decode_at;
+            let (parsed, after) = {
+                let bytes = if self.compressed {
+                    &self.plain[..]
+                } else {
+                    &self.input.bytes()[1..]
+                };
+                let mut reader = Reader { bytes, at: before };
+                let parsed = parse_step(
+                    &mut reader,
+                    &mut self.stack,
+                    self.safe,
+                    Some(&mut decode_ctx),
+                    budget.saturating_sub(decoded).max(1),
+                    true,
+                );
+                (parsed, reader.at)
+            };
+            self.decode_at = after;
+            match parsed {
+                Ok(Some((term, checked))) => {
+                    decoded += self.decode_at - before;
+                    if self.compressed && checked != self.plain_bytes().len() {
+                        break Err((BifError::BADARG, decoded));
+                    }
+                    break Ok(Some((term, checked)));
                 }
-                let term = self
-                    .decoded_root
-                    .take()
-                    .ok_or((BifError::BADARG, consumed))?;
-                return self
-                    .wrap_used(ctx, term, checked)
-                    .map(|value| (Some(value), consumed))
-                    .map_err(|error| (error, consumed));
+                Ok(None) => decoded += self.decode_at - before,
+                Err(BifError::Unsupported("incomplete ETF input")) => {
+                    self.decode_at = before;
+                    break Err((BifError::BADARG, decoded));
+                }
+                Err(error) => break Err((error, decoded + self.decode_at - before)),
             }
+        };
+        let reservation = decode_ctx.into_allocator();
+        match parsed {
+            Ok(Some((term, checked))) => {
+                drop(reservation);
+                let value = self
+                    .wrap_used(ctx, term, checked)
+                    .map_err(|error| (error, consumed + decoded))?;
+                Ok((Some(value), consumed + decoded))
+            }
+            Ok(None) => {
+                self.reservation = Some(reservation.suspend());
+                Ok((None, consumed + decoded))
+            }
+            Err((error, work)) => {
+                drop(reservation);
+                Err((error, consumed + work))
+            }
+        }
+    }
+
+    fn size_step(
+        &mut self,
+        byte_budget: usize,
+    ) -> Result<(Option<usize>, usize), (BifError, usize)> {
+        let mut consumed = 0;
+        // Port of erts/emulator/beam/external.c (binary_to_term_int, B2TUncompressChunk to
+        // B2TSizeInit), OTP-29.1.1: finish inflation before entering `decoded_size`.
+        while self.compressed && !self.inflate_done && consumed < byte_budget {
+            let produced = self
+                .inflate_more(byte_budget.saturating_sub(consumed))
+                .map_err(|error| (error, consumed))?;
+            consumed += produced.max(1);
+            if produced == 0 && !self.inflate_done {
+                return Err((BifError::BADARG, consumed));
+            }
+        }
+        if self.compressed && !self.inflate_done {
             return Ok((None, consumed));
         }
-        while consumed < byte_budget.max(1) {
-            let before = self.reader.at;
-            let tags = if self.compressed && !self.inflate_done {
-                1
+        while consumed < byte_budget {
+            let before = (self.input_offset, self.plain_bytes().len());
+            let input_complete = !self.compressed || self.inflate_done;
+            let bytes = if self.compressed {
+                &self.plain[..]
             } else {
-                byte_budget.saturating_sub(consumed).max(1)
+                &self.input.bytes()[1..]
             };
-            match parse_step(
-                &mut self.reader,
-                &mut self.stack,
-                self.safe,
-                Some(ctx),
-                tags,
-                !self.compressed || self.inflate_done,
-            ) {
-                Ok(Some((term, checked))) => {
-                    consumed += self.reader.at - before;
-                    if self.compressed && !self.inflate_done {
-                        self.checked_root = Some(checked);
-                        self.decoded_root = Some(term);
-                        let produced = self
-                            .inflate_more(byte_budget.saturating_sub(consumed))
-                            .map_err(|error| (error, consumed))?;
-                        consumed += produced.max(1);
-                        continue;
-                    }
-                    if self.compressed && checked != self.reader.bytes.len() {
-                        return Err((BifError::BADARG, consumed));
-                    }
-                    let value = self
-                        .wrap_used(ctx, term, checked)
-                        .map_err(|error| (error, consumed))?;
-                    return Ok((Some(value), consumed));
+            let scanned = self
+                .sizing
+                .step(
+                    bytes,
+                    byte_budget.saturating_sub(consumed),
+                    input_complete,
+                    local_term_hash,
+                )
+                .map_err(|error| (decode_size_error(error), consumed))?;
+            consumed += scanned.1;
+            if let Some((words, checked)) = scanned.0 {
+                if self.compressed
+                    && (checked != self.expected_plain || checked != self.plain_bytes().len())
+                {
+                    return Err((BifError::BADARG, consumed));
                 }
-                Ok(None) => consumed += self.reader.at - before,
-                Err(BifError::Unsupported("incomplete ETF input")) => {
-                    self.reader.at = before;
-                    if !self.compressed || self.inflate_done {
-                        return Err((BifError::BADARG, consumed));
-                    }
-                    let produced = self
-                        .inflate_more(byte_budget.saturating_sub(consumed))
-                        .map_err(|error| (error, consumed))?;
-                    consumed += produced.max(1);
-                }
-                Err(error) => return Err((error, consumed + self.reader.at - before)),
+                self.heap_words = Some(words);
+                self.size_done = true;
+                return Ok((Some(checked), consumed));
+            }
+            if consumed >= byte_budget {
+                break;
+            }
+            if self.compressed && (self.input_offset, self.plain_bytes().len()) == before {
+                return Err((BifError::BADARG, consumed));
             }
         }
         Ok((None, consumed))
@@ -2765,7 +2992,7 @@ impl DecodeWalk {
     /// Decode the validated prefix into the current process heap.
     pub fn finish(&self, ctx: &mut Ctx<'_>, checked: usize) -> Result<Term, BifError> {
         let (term, _) =
-            parse(&self.reader.bytes[..checked], self.safe, Some(ctx)).map_err(decode_error)?;
+            parse(&self.plain_bytes()[..checked], self.safe, Some(ctx)).map_err(decode_error)?;
         self.wrap_used(ctx, term, checked)
     }
 
@@ -2789,6 +3016,10 @@ fn decode_error(error: BifError) -> BifError {
         BifError::Unsupported(_) => BifError::BADARG,
         other => other,
     }
+}
+
+fn decode_size_error(_: arinsal_etf::DecodeError) -> BifError {
+    BifError::BADARG
 }
 
 #[cfg(test)]

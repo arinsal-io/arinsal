@@ -3305,7 +3305,7 @@ fn binary_to_term(
     if let Some(state) = state {
         let state = Arc::clone(state);
         let decoder = state
-            .downcast_ref::<Mutex<arinsal_bifs::DecodeWalk>>()
+            .downcast_ref::<Mutex<arinsal_bifs::DecodeWalk<'static>>>()
             .ok_or(BifError::BADARG)?;
         let mut decoder = decoder.lock().map_err(|_| BifError::SystemLimit)?;
         let step = decode_step(process, &mut decoder, chunk_bytes);
@@ -3337,11 +3337,14 @@ fn binary_to_term(
 
     let mut decoder = arinsal_bifs::DecodeWalk::new(args)?;
     match decode_step(process, &mut decoder, chunk_bytes) {
-        Ok((None, consumed)) => Ok(HandlerResult::Yield {
-            continuation: BINARY_TO_TERM_CONTINUATION,
-            state: magic_binary_state(Mutex::new(decoder), ERTS_BINARY_TO_TERM_CONTEXT_SIZE),
-            reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
-        }),
+        Ok((None, consumed)) => {
+            let decoder = decoder.into_owned()?;
+            Ok(HandlerResult::Yield {
+                continuation: BINARY_TO_TERM_CONTINUATION,
+                state: magic_binary_state(Mutex::new(decoder), ERTS_BINARY_TO_TERM_CONTEXT_SIZE),
+                reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
+            })
+        }
         Ok((Some(value), consumed)) => {
             process.set_gc_enabled(restore_gc);
             Ok(HandlerResult::Done {
@@ -3361,7 +3364,7 @@ fn binary_to_term(
 
 fn decode_step(
     process: &mut Process,
-    decoder: &mut arinsal_bifs::DecodeWalk,
+    decoder: &mut arinsal_bifs::DecodeWalk<'_>,
     chunk_bytes: usize,
 ) -> Result<(Option<Term>, usize), (BifError, usize)> {
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);

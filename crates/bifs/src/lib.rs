@@ -151,6 +151,10 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
         }
     }
 
+    pub(crate) fn into_allocator(self) -> H {
+        self.heap
+    }
+
     /// Reductions left for this call. `usize::MAX` means do not trap.
     pub fn reduction_budget(&self) -> usize {
         self.fcalls.as_deref().map_or(self.budget, |fcalls| {
@@ -477,6 +481,9 @@ impl ProcessHeapCursor<'_, '_> {
 }
 
 impl HeapAlloc for ProcessHeapHandle<'_> {
+    fn allocator_identity(&self) -> usize {
+        self.0.allocator_identity()
+    }
     #[inline(always)]
     fn words_left(&self) -> Option<usize> {
         self.0.halloc_words_left()
