@@ -1759,6 +1759,45 @@ pub(crate) fn execute(
     args: [Term; 4],
     ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
 ) -> Option<Result<HandlerResult, VmError>> {
+    let resumes_here = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.bif_trap.as_ref())
+        .is_some_and(|pending| {
+            pending.caller_module == process.module
+                && pending.caller_ip == process.ip
+                && pending.import == import
+        });
+    if resumes_here
+        && let Some((module, function, continuation_arity)) = process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.bif_trap.as_ref())
+            .and_then(|pending| continuation_parts(pending.continuation))
+        && lookup_entry(module, function, continuation_arity).is_some()
+    {
+        let result = run_trapped_export(process, ctx)?;
+        if matches!(
+            &result,
+            Ok(ResumeResult::Handler(HandlerResult::Yield { .. }))
+        ) && let Some(pending) = process
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.bif_trap.as_mut())
+        {
+            // Port of erts/emulator/beam/beam_common.c (BIF_TRAP), OTP-29.1.1: a continuation
+            // that traps again returns to this gc_bif instruction before its result is stored.
+            // The continuation ran inside the interpreter at the original gc_bif site.
+            // Keep that site as the resume key across another continuation slice.
+            pending.import = import;
+            pending.caller_module = process.module;
+            pending.caller_ip = process.ip;
+        }
+        return Some(result.and_then(|result| match result {
+            ResumeResult::Handler(result) => Ok(result),
+            ResumeResult::Export(trap) => Err(VmError::TrapExport(trap)),
+        }));
+    }
     let import_info = vm.code.modules.get(process.module).and_then(|module| {
         module.imports.get(import).map(|import| {
             (

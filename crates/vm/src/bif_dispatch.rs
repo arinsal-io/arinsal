@@ -193,12 +193,12 @@ impl Vm {
         }
         let class = self.import_class(p.module, index)?;
         let args = &stored[..arity];
-        let (result, bif_reductions) = if class == ImportClass::Pure {
+        let (result, bif_reductions, deferred) = if class == ImportClass::Pure {
             let bif = self.code.modules[p.module].imports[index]
                 .bif_fn()
                 .ok_or_else(|| VmError::Unsupported("pure BIF".into()))?;
-            let (result, reductions) =
-                calls::call_bif_metered(&mut p.heap, &mut p.reductions, bif, args);
+            let (result, reductions, deferred) =
+                calls::call_bif_metered_deferred(&mut p.heap, &mut p.reductions, bif, args);
             let result = match result {
                 Ok(value) => Ok(value),
                 Err(error) => {
@@ -214,7 +214,7 @@ impl Vm {
                     ))
                 }
             };
-            (result, reductions)
+            (result, reductions, deferred)
         } else {
             let caller_module = Arc::clone(&self.code.modules[p.module]);
             let import = &caller_module.imports[index];
@@ -223,7 +223,7 @@ impl Vm {
             let bif = import.bif_fn();
             let bits = import.native_bits();
             let native = if matches!(class, ImportClass::Native | ImportClass::Dynamic) {
-                ctx.and_then(|run| {
+                ctx.as_deref_mut().and_then(|run| {
                     self.dispatch_native_args(
                         p,
                         run,
@@ -234,13 +234,14 @@ impl Vm {
                     )
                 })
             } else {
-                ctx.and_then(|run| signals::call(self, p, run, module_name, function_name, args))
+                ctx.as_deref_mut()
+                    .and_then(|run| signals::call(self, p, run, module_name, function_name, args))
             };
             if let Some(result) = native {
-                (result, 0)
+                (result, 0, None)
             } else if let Some(bif) = bif {
                 match calls::call_bif_catch(&mut p.heap, &mut p.reductions, bif, args) {
-                    Ok(Ok(value)) => (Ok(value), 0),
+                    Ok(Ok(value)) => (Ok(value), 0, None),
                     Ok(Err(error)) => (
                         Err(exceptions::bif_error_with_atoms(
                             p,
@@ -252,12 +253,14 @@ impl Vm {
                             error,
                         )),
                         0,
+                        None,
                     ),
                     Err(()) => (
                         Err(VmError::Unsupported(format!(
                             "BIF {module_name}:{function_name} panicked"
                         ))),
                         0,
+                        None,
                     ),
                 }
             } else {
@@ -266,6 +269,35 @@ impl Vm {
                 )));
             }
         };
+        if let Some(trap) = deferred {
+            p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
+            if let Some(run) = ctx {
+                run.consume(bif_reductions);
+            }
+            let import = &self.code.modules[p.module].imports[index];
+            // Port of erts/emulator/beam/erl_bif_guard.c:238 (erlang_length_trap),
+            // OTP-29.1.1: the gc_bif has not completed, so keep its ip until its destination is written.
+            crate::bif_traps::install_deferred_trap(
+                p,
+                index,
+                (import.module_atom, import.function_atom),
+                &import.function,
+                args,
+                trap,
+            )
+            .map_err(|_| {
+                exceptions::bif_error_with_atoms(
+                    p,
+                    &import.module,
+                    &import.function,
+                    import.module_atom,
+                    import.function_atom,
+                    args,
+                    arinsal_bifs::BifError::SystemLimit,
+                )
+            })?;
+            return Ok(BifOpOutcome::Yield);
+        }
         // Port of erts/emulator/beam/erl_arith.c:56-85, OTP-29.1.1.
         p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
         match result {
