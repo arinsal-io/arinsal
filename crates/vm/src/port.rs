@@ -207,13 +207,43 @@ struct BusyLimits {
     msgq_enabled: bool,
 }
 
-struct PortState {
+/// The output queue and the pending commands of a spawn or fd port (`prt->ioq` of the
+/// sys_drivers.c output path); other ports never allocate them.
+#[derive(Default)]
+struct SpawnQueues {
     outq: VecDeque<u8>,
+    pending: VecDeque<Vec<u8>>,
+}
+
+static NO_OUTQ: VecDeque<u8> = VecDeque::new();
+static NO_PENDING: VecDeque<Vec<u8>> = VecDeque::new();
+
+impl PortState {
+    fn outq(&self) -> &VecDeque<u8> {
+        self.queues.as_ref().map_or(&NO_OUTQ, |queues| &queues.outq)
+    }
+
+    fn outq_mut(&mut self) -> &mut VecDeque<u8> {
+        &mut self.queues.get_or_insert_with(Default::default).outq
+    }
+
+    fn pending(&self) -> &VecDeque<Vec<u8>> {
+        self.queues
+            .as_ref()
+            .map_or(&NO_PENDING, |queues| &queues.pending)
+    }
+
+    fn pending_mut(&mut self) -> &mut VecDeque<Vec<u8>> {
+        &mut self.queues.get_or_insert_with(Default::default).pending
+    }
+}
+
+struct PortState {
+    queues: Option<Box<SpawnQueues>>,
     bytes_in: u64,
     bytes_out: u64,
     /// Bytes scheduled ahead of the driver when `{parallelism, true}`.
     msgq: usize,
-    pending: VecDeque<Vec<u8>>,
     busy_port: bool,
     busy_msgq: bool,
     graceful_close: bool,
@@ -271,22 +301,49 @@ impl PidSet {
     }
 }
 
-/// State retained for a live child or fd port.
-pub(crate) struct PortHandle {
-    id: u64,
+/// What the spawn and fd drivers keep per port (`ErtsSysDriverData` of sys_drivers.c): the
+/// output descriptor, the wake pipe of the worker thread, packet framing and busy limits.
+pub(crate) struct SpawnData {
     out: Mutex<Option<OwnedFd>>,
     wake_r: Mutex<Option<OwnedFd>>,
-    /// `None` for loaded-driver ports: they have no worker thread to wake.
     wake_w: Option<OwnedFd>,
     wake_needed: AtomicBool,
     framing: Option<(u8, usize)>,
+    limits: BusyLimits,
+}
+
+/// Busy limits of a port that has none of its own.
+const NO_BUSY_LIMITS: BusyLimits = BusyLimits {
+    port_low: 0,
+    port_high: 0,
+    port_enabled: false,
+    msgq_low: 0,
+    msgq_high: 0,
+    msgq_enabled: false,
+};
+
+/// The spawn data of a port that has none.
+static NO_SPAWN: SpawnData = SpawnData {
+    out: Mutex::new(None),
+    wake_r: Mutex::new(None),
+    wake_w: None,
+    wake_needed: AtomicBool::new(false),
+    framing: None,
+    limits: NO_BUSY_LIMITS,
+};
+
+/// State retained for a live child or fd port.
+pub(crate) struct PortHandle {
+    id: u64,
+    /// The spawn/fd driver's own data (`prt->drv_data` of sys_drivers.c): set only for ports
+    /// with a worker thread.
+    spawn: Option<Box<SpawnData>>,
     owner: Mutex<Pid>,
     links: Mutex<PidSet>,
     monitors: Mutex<HashMap<u64, PortMonitor>>,
     os_pid: u32,
     name: String,
     parallelism: bool,
-    limits: BusyLimits,
     state: Mutex<PortState>,
     scheduler: Arc<Scheduler<Process>>,
     trace_scope: usize,
@@ -304,12 +361,11 @@ pub(crate) struct PortHandle {
     /// Set when the port is removed, before its name is erased.
     reg_closing: AtomicBool,
     halt_progress: Mutex<Option<HaltProgress>>,
-    /// `ram_file_drv` port data (`drv_data`), present from `rfile_start` until `rfile_stop`.
-    ram_file: Mutex<Option<Arc<crate::ram_file_drv::RamPort>>>,
+    /// The driver's own state (`prt->drv_data`): the tcp or udp socket, or the ram_file data
+    /// from `rfile_start` until `rfile_stop`.
+    drv_data: Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     /// Driver-owned state returned by the inet driver's start callback.
     runtime: OnceLock<Weak<crate::process::Runtime>>,
-    inet_tcp: Mutex<Option<Arc<crate::inet_drv::Sock>>>,
-    inet_udp: Mutex<Option<Arc<crate::inet_udp::Sock>>>,
 }
 
 /// Inspect or move the next local port id for `erts_debug` table tests.
@@ -511,6 +567,21 @@ fn release_port_name(runtime: &crate::process::Runtime, handle: &PortHandle) {
 }
 
 impl PortHandle {
+    /// The spawn driver's data; a port of any other driver has none (no worker thread).
+    fn spawn(&self) -> &SpawnData {
+        self.spawn.as_deref().unwrap_or(&NO_SPAWN)
+    }
+
+    fn framing(&self) -> Option<(u8, usize)> {
+        self.spawn.as_ref().and_then(|spawn| spawn.framing)
+    }
+
+    fn limits(&self) -> &BusyLimits {
+        self.spawn
+            .as_ref()
+            .map_or(&NO_BUSY_LIMITS, |spawn| &spawn.limits)
+    }
+
     /// The runtime this port belongs to.
     pub(crate) fn runtime(&self) -> Option<Arc<crate::process::Runtime>> {
         self.runtime.get()?.upgrade()
@@ -541,24 +612,39 @@ impl PortHandle {
         state.bytes_out = state.bytes_out.wrapping_add(count as u64);
     }
 
+    /// The driver data as `T` (`prt->drv_data`).
+    fn typed_drv_data<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        let data = Arc::clone(self.drv_data.lock().as_ref()?);
+        data.downcast::<T>().ok()
+    }
+
+    fn set_drv_data<T: std::any::Any + Send + Sync>(&self, data: Arc<T>) {
+        *self.drv_data.lock() = Some(data);
+    }
+
+    fn take_typed_drv_data<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        let data = self.drv_data.lock().take()?;
+        data.downcast::<T>().ok()
+    }
+
     pub(crate) fn tcp_driver_data(&self) -> Option<Arc<crate::inet_drv::Sock>> {
-        self.inet_tcp.lock().clone()
+        self.typed_drv_data()
     }
 
     pub(crate) fn set_tcp_driver_data(&self, data: Arc<crate::inet_drv::Sock>) {
-        *self.inet_tcp.lock() = Some(data);
+        self.set_drv_data(data);
     }
 
     pub(crate) fn take_tcp_driver_data(&self) -> Option<Arc<crate::inet_drv::Sock>> {
-        self.inet_tcp.lock().take()
+        self.take_typed_drv_data()
     }
 
     pub(crate) fn set_udp_driver_data(&self, data: Arc<crate::inet_udp::Sock>) {
-        *self.inet_udp.lock() = Some(data);
+        self.set_drv_data(data);
     }
 
     pub(crate) fn take_udp_driver_data(&self) -> Option<Arc<crate::inet_udp::Sock>> {
-        self.inet_udp.lock().take()
+        self.take_typed_drv_data()
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -1549,7 +1635,7 @@ fn start_driver(
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
-    *handle.ram_file.lock() = Some(crate::ram_file_drv::start(_binary));
+    handle.set_drv_data(crate::ram_file_drv::start(_binary));
     Ok(port)
 }
 
@@ -2706,26 +2792,30 @@ fn make_handle_with(
     if let Some(fd) = out.as_ref() {
         set_nonblock(fd.as_raw_fd());
     }
+    let out_fd = out;
     let handle = Arc::new(PortHandle {
         id,
-        out: Mutex::new(out),
-        wake_r: Mutex::new(wake_r),
-        wake_w,
-        wake_needed: AtomicBool::new(true),
-        framing,
+        spawn: (out_fd.is_some() || wake_w.is_some()).then(|| {
+            Box::new(SpawnData {
+                out: Mutex::new(out_fd),
+                wake_r: Mutex::new(wake_r),
+                wake_w,
+                wake_needed: AtomicBool::new(true),
+                framing,
+                limits,
+            })
+        }),
         owner: Mutex::new(owner),
         links: Mutex::new(PidSet::from_one(owner)),
         monitors: Mutex::new(HashMap::new()),
         os_pid,
         name,
         parallelism,
-        limits,
         state: Mutex::new(PortState {
-            outq: VecDeque::new(),
+            queues: None,
             bytes_in: 0,
             bytes_out: 0,
             msgq: 0,
-            pending: VecDeque::new(),
             busy_port: false,
             busy_msgq: false,
             graceful_close: false,
@@ -2746,10 +2836,8 @@ fn make_handle_with(
         reg_word: Arc::new(AtomicU32::new(crate::register::NO_REG_ATOM)),
         reg_closing: AtomicBool::new(false),
         halt_progress: Mutex::new(None),
-        ram_file: Mutex::new(None),
+        drv_data: Mutex::new(None),
         runtime: OnceLock::new(),
-        inet_tcp: Mutex::new(None),
-        inet_udp: Mutex::new(None),
     });
     Ok(handle)
 }
@@ -2815,6 +2903,7 @@ fn start_fd(
 
 fn output_fd(handle: &PortHandle) -> RawFd {
     handle
+        .spawn()
         .out
         .lock()
         .as_ref()
@@ -2844,8 +2933,8 @@ fn nb_write(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
 }
 
 fn poke(handle: &PortHandle) {
-    if handle.wake_needed.swap(false, Ordering::AcqRel) {
-        let Some(wake_w) = handle.wake_w.as_ref() else {
+    if handle.spawn().wake_needed.swap(false, Ordering::AcqRel) {
+        let Some(wake_w) = handle.spawn().wake_w.as_ref() else {
             return;
         };
         let fd = wake_w.as_raw_fd();
@@ -2917,7 +3006,7 @@ fn suspend_on_busy(
 
 fn refresh_busy(st: &mut PortState, limits: &BusyLimits) -> Vec<Pid> {
     // Port of erts/emulator/sys/unix/sys_drivers.c:1479 (ready_output low watermark), OTP-29.1.1.
-    if limits.port_enabled && st.busy_port && st.outq.len() < limits.port_low {
+    if limits.port_enabled && st.busy_port && st.outq().len() < limits.port_low {
         st.busy_port = false;
     }
     // Port of erts/emulator/beam/erl_port_task.c:706 (dequeued_proc2port_data), OTP-29.1.1.
@@ -2938,19 +3027,20 @@ fn accept_output(handle: &PortHandle, st: &mut PortState, data: &[u8]) -> Result
         return Err(());
     }
     // Port of erts/emulator/sys/unix/sys_drivers.c:1140 (output), OTP-29.1.1.
-    if st.outq.is_empty() {
+    if st.outq().is_empty() {
         match nb_write(output_fd(handle), data) {
             Ok(n) if n == data.len() => return Ok(()),
-            Ok(n) => st.outq.extend(data[n..].iter().copied()),
+            Ok(n) => st.outq_mut().extend(data[n..].iter().copied()),
             Err(_) => {
                 st.broken = true;
                 return Err(());
             }
         }
     } else {
-        st.outq.extend(data.iter().copied());
+        st.outq_mut().extend(data.iter().copied());
     }
-    if handle.limits.port_enabled && !st.busy_port && st.outq.len() >= handle.limits.port_high {
+    if handle.limits().port_enabled && !st.busy_port && st.outq().len() >= handle.limits().port_high
+    {
         st.busy_port = true;
     }
     Ok(())
@@ -2972,43 +3062,43 @@ fn flush_output(handle: &PortHandle) -> Vec<Pid> {
     let mut became_inactive = false;
     loop {
         let mut st = handle.state.lock();
-        if st.outq.is_empty() {
-            woken.extend(refresh_busy(&mut st, &handle.limits));
-            if st.pending.is_empty() && st.profile_active {
+        if st.outq().is_empty() {
+            woken.extend(refresh_busy(&mut st, handle.limits()));
+            if st.pending().is_empty() && st.profile_active {
                 st.profile_active = false;
                 became_inactive = true;
             }
             break;
         }
-        let n = st.outq.len().min(16 * 1024);
-        let chunk: Vec<u8> = st.outq.drain(..n).collect();
+        let n = st.outq().len().min(16 * 1024);
+        let chunk: Vec<u8> = st.outq_mut().drain(..n).collect();
         drop(st);
         match nb_write(output_fd(handle), &chunk) {
             Ok(0) => {
                 let mut st = handle.state.lock();
                 for byte in chunk.into_iter().rev() {
-                    st.outq.push_front(byte);
+                    st.outq_mut().push_front(byte);
                 }
                 break;
             }
             Ok(wrote) if wrote < chunk.len() => {
                 let mut st = handle.state.lock();
                 for byte in chunk[wrote..].iter().rev() {
-                    st.outq.push_front(*byte);
+                    st.outq_mut().push_front(*byte);
                 }
-                woken.extend(refresh_busy(&mut st, &handle.limits));
+                woken.extend(refresh_busy(&mut st, handle.limits()));
                 break;
             }
             Ok(_) => {
                 let mut st = handle.state.lock();
-                woken.extend(refresh_busy(&mut st, &handle.limits));
+                woken.extend(refresh_busy(&mut st, handle.limits()));
             }
             Err(_) => {
                 let mut st = handle.state.lock();
                 st.broken = true;
                 st.busy_port = false;
                 st.busy_msgq = false;
-                st.outq.clear();
+                st.outq_mut().clear();
                 became_inactive = std::mem::replace(&mut st.profile_active, false);
                 woken.extend(std::mem::take(&mut st.suspended));
                 break;
@@ -3034,7 +3124,7 @@ fn drain_pending(handle: &PortHandle) -> Vec<Pid> {
             if st.in_output {
                 return woken;
             }
-            let Some(data) = st.pending.pop_front() else {
+            let Some(data) = st.pending_mut().pop_front() else {
                 return woken;
             };
             st.msgq = st.msgq.saturating_sub(data.len());
@@ -3045,7 +3135,7 @@ fn drain_pending(handle: &PortHandle) -> Vec<Pid> {
             let mut st = handle.state.lock();
             let failed = accept_output(handle, &mut st, &next).is_err();
             st.in_output = false;
-            woken.extend(refresh_busy(&mut st, &handle.limits));
+            woken.extend(refresh_busy(&mut st, handle.limits()));
             failed
         };
         if failed {
@@ -3066,8 +3156,8 @@ fn command_bytes(handle: &PortHandle, data: &[u8]) -> Result<(), ()> {
         // Parallel commands that arrive while output is in progress join the
         // port task queue (busy_limits_msgq) instead of the driver queue.
         if handle.parallelism && st.in_output {
-            note_msgq(&mut st, &handle.limits, data.len());
-            st.pending.push_back(data.to_vec());
+            note_msgq(&mut st, handle.limits(), data.len());
+            st.pending_mut().push_back(data.to_vec());
         } else {
             st.in_output = true;
             let failed = accept_output(handle, &mut st, data).is_err();
@@ -3076,7 +3166,7 @@ fn command_bytes(handle: &PortHandle, data: &[u8]) -> Result<(), ()> {
                 return Err(());
             }
         }
-        let runnable = !st.outq.is_empty() || !st.pending.is_empty();
+        let runnable = !st.outq().is_empty() || !st.pending().is_empty();
         let became_active = runnable && !st.profile_active;
         st.profile_active |= runnable;
         became_active
@@ -3170,6 +3260,7 @@ fn worker(
     want_eof: bool,
 ) {
     let wake_r = handle
+        .spawn()
         .wake_r
         .lock()
         .take()
@@ -3210,8 +3301,8 @@ fn worker(
             }
         }
         let wants_out =
-            !handle.state.lock().outq.is_empty() || !handle.state.lock().pending.is_empty();
-        handle.wake_needed.store(true, Ordering::Release);
+            !handle.state.lock().outq().is_empty() || !handle.state.lock().pending().is_empty();
+        handle.spawn().wake_needed.store(true, Ordering::Release);
         let mut fds = Vec::with_capacity(3);
         if input_live && let Some(fd) = read_fd {
             fds.push((
@@ -3242,10 +3333,10 @@ fn worker(
             ));
         }
         if handle.state.lock().closed
-            || !handle.state.lock().outq.is_empty()
-            || !handle.state.lock().pending.is_empty()
+            || !handle.state.lock().outq().is_empty()
+            || !handle.state.lock().pending().is_empty()
         {
-            handle.wake_needed.store(false, Ordering::Release);
+            handle.spawn().wake_needed.store(false, Ordering::Release);
         }
         let mut input_ready = false;
         if !handle.state.lock().closed {
@@ -3271,7 +3362,7 @@ fn worker(
                 Err(_) => break,
             }
         }
-        handle.wake_needed.store(false, Ordering::Release);
+        handle.spawn().wake_needed.store(false, Ordering::Release);
         if wake_r >= 0 {
             let mut scratch = [0u8; 64];
             loop {
@@ -3293,10 +3384,10 @@ fn worker(
         if !input_closed {
             let should_close_input = {
                 let st = handle.state.lock();
-                st.graceful_close && st.outq.is_empty() && st.pending.is_empty()
+                st.graceful_close && st.outq().is_empty() && st.pending().is_empty()
             };
             if should_close_input {
-                handle.out.lock().take();
+                handle.spawn().out.lock().take();
                 input_closed = true;
             }
         }
@@ -3368,7 +3459,7 @@ fn worker(
             }
         }
         let st = handle.state.lock();
-        if input_closed && !input_live && st.outq.is_empty() && st.pending.is_empty() {
+        if input_closed && !input_live && st.outq().is_empty() && st.pending().is_empty() {
             break;
         }
         drop(st);
@@ -3384,7 +3475,7 @@ fn worker(
     // Port of erts/emulator/sys/unix/sys_drivers.c (`stop`), OTP-29.1.1.
     // The helper reaps children after their ports close and reports statuses by port id.
     if closed {
-        handle.out.lock().take();
+        handle.spawn().out.lock().take();
         handle.finish_halt();
     } else if want_status
         && !status_reported
@@ -3446,13 +3537,13 @@ fn eof_exit(
         st.broken = true;
         st.busy_port = false;
         st.busy_msgq = false;
-        st.outq.clear();
-        st.pending.clear();
+        st.outq_mut().clear();
+        st.pending_mut().clear();
         std::mem::take(&mut st.suspended)
     };
     wake_suspended(scheduler, woken);
     close_worker_fds(wake_r, read_fd);
-    handle.out.lock().take();
+    handle.spawn().out.lock().take();
     handle.state.lock().exit_complete = true;
     handle.finish_halt();
     if handle.state.lock().send_closed {
@@ -3935,7 +4026,7 @@ fn port_command(
     }
     let mut framed = iodata(data).ok_or_else(badarg)?;
     let bytes_out = framed.len();
-    let ram_file = handle.ram_file.lock().clone();
+    let ram_file = handle.typed_drv_data::<crate::ram_file_drv::RamPort>();
     if let Some(ram_file) = ram_file {
         let state = handle.state.lock();
         if state.closed || state.broken {
@@ -3949,7 +4040,7 @@ fn port_command(
         }
         return result.map(|()| atom("true")).map_err(|()| badarg());
     }
-    if let Some((2, hdr)) = handle.framing {
+    if let Some((2, hdr)) = handle.framing() {
         match hdr {
             1 => {
                 if framed.len() > u8::MAX as usize {
@@ -4162,7 +4253,7 @@ fn trace_port_receive_indexed_rt(
 // Closing a port releases its descriptors; the child may have detached from them.
 fn release_io(handle: &PortHandle) {
     // rfile_stop: release the ram_file_drv port data.
-    handle.ram_file.lock().take();
+    handle.take_typed_drv_data::<crate::ram_file_drv::RamPort>();
     // Port of erts/emulator/beam/io.c:3698 (terminate_port) for a dynamic driver.
     if let Some(drv_port) = handle.driver.get()
         && drv_port.terminate()
@@ -4177,14 +4268,22 @@ fn release_io(handle: &PortHandle) {
         st.busy_port = false;
         st.busy_msgq = false;
         // Driver and inet ports have no worker thread to finish the exit.
-        if handle.wake_w.is_none() {
+        if handle
+            .spawn
+            .as_ref()
+            .is_none_or(|spawn| spawn.wake_w.is_none())
+        {
             st.exit_complete = true;
         }
         std::mem::take(&mut st.suspended)
     };
     wake_suspended(&handle.scheduler, waiters);
     poke(handle);
-    if handle.wake_w.is_none() {
+    if handle
+        .spawn
+        .as_ref()
+        .is_none_or(|spawn| spawn.wake_w.is_none())
+    {
         handle.finish_halt();
     }
 }
@@ -4776,7 +4875,7 @@ fn output_command(
             None,
         );
     }
-    let ram_file = handle.ram_file.lock().clone();
+    let ram_file = handle.typed_drv_data::<crate::ram_file_drv::RamPort>();
     if let Some(ram_file) = ram_file {
         if crate::ram_file_drv::command(&ram_file, handle, &data).is_err() {
             signal_badsig(handle, id);
@@ -4785,7 +4884,7 @@ fn output_command(
         }
         return;
     }
-    if let Some((2, hdr)) = handle.framing {
+    if let Some((2, hdr)) = handle.framing() {
         match hdr {
             1 => {
                 if data.len() > u8::MAX as usize {
@@ -5242,7 +5341,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     let memory = 48 + monitored_pids.len() * 24;
     let (input_count, output_count, outq_size) = {
         let state = handle.state.lock();
-        (state.bytes_in, state.bytes_out, state.outq.len())
+        (state.bytes_in, state.bytes_out, state.outq().len())
     };
     let input = port_counter_term(&mut heap, input_count)?;
     let output = port_counter_term(&mut heap, output_count)?;
