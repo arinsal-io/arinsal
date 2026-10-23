@@ -96,10 +96,13 @@ pub(crate) fn child_range(header: u64, words: usize) -> std::ops::Range<usize> {
 pub(crate) struct PairIter {
     map: Term,
     flat_index: usize,
-    // Port of DEF_WSTACK_SIZE in global.h:493, OTP-29.1.1: eight node/index pairs use 16 words.
-    nodes: SmallVec<[(Term, usize); 8]>,
+    // Port of the sentinel/index/node words in hashmap_iterator_init/next,
+    // erts/emulator/beam/erl_map.c:2320-2376, OTP-29.1.1.
+    nodes: SmallVec<[u64; 16]>,
     mode: PairIterMode,
 }
+// OTP's release THE_NON_VALUE is TAG_PRIMARY_HEADER (zero).
+const PAIR_ITER_END: u64 = 0;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PairIterMode {
     Pairs,
@@ -115,7 +118,7 @@ impl PairIter {
             mode: PairIterMode::Pairs,
         };
         if map.is_hashmap() {
-            result.push_node(map);
+            result.push_root(map);
         }
         result
     }
@@ -126,17 +129,18 @@ impl PairIter {
             nodes: SmallVec::new(),
             mode: PairIterMode::RootChildren,
         };
-        result.push_node(map);
+        result.push_root(map);
         result
     }
-    fn push_node(&mut self, node: Term) {
+    fn push_root(&mut self, node: Term) {
         let header = node.header().unwrap();
-        let first = if header & 63 == MAP {
-            child_range(header, 0).start
-        } else {
-            1
-        };
-        self.nodes.push((node, first));
+        let first = iterator_child_start(header);
+        self.nodes.push(PAIR_ITER_END);
+        self.push_frame(node, first - 1);
+    }
+    fn push_frame(&mut self, node: Term, index: usize) {
+        self.nodes.push(index as u64);
+        self.nodes.push(node.bits());
     }
 }
 
@@ -165,28 +169,45 @@ impl Iterator for PairIter {
             return Some(pair);
         }
         loop {
-            let (node, next) = *self.nodes.last()?;
+            let node_word = *self.nodes.last()?;
+            if node_word == PAIR_ITER_END {
+                return None;
+            }
+            let index_slot = self.nodes.len() - 2;
+            let node = Term(node_word);
+            let index = self.nodes[index_slot] as usize;
             let header = node.header().unwrap();
             // SAFETY: node is a live HAMT branch or collision tuple.
             let ptr = unsafe { node.raw_ptr() };
             // SAFETY: the node header describes all initialized child slots.
             let end = unsafe { boxed_object_words(header, ptr) };
-            if next == end {
-                self.nodes.pop();
+            let next = index + 1;
+            if next >= end {
+                self.nodes.truncate(index_slot);
                 continue;
             }
-            self.nodes.last_mut().unwrap().1 += 1;
+            self.nodes[index_slot] = next as u64;
             // SAFETY: next is an initialized child slot below end.
             let child = Term(unsafe { *ptr.add(next) });
             if self.mode == PairIterMode::RootChildren && node == self.map {
                 return Some((child, Term::NIL));
             }
-            if child.classify() == TermKind::List {
+            if child.bits() & 3 == 1 {
                 // SAFETY: HAMT leaves are two-word cons cells.
                 return unsafe { child.cons_ref() };
             }
-            self.push_node(child);
+            let child_header = child.header().unwrap();
+            self.push_frame(child, iterator_child_start(child_header) - 1);
         }
+    }
+}
+
+#[inline]
+fn iterator_child_start(header: u64) -> usize {
+    if header & 63 == MAP {
+        child_range(header, 0).start
+    } else {
+        1
     }
 }
 
