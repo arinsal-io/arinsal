@@ -6,8 +6,8 @@ use std::io::Write;
 use std::sync::{Arc, OnceLock};
 
 use arinsal_term::{
-    ExportEntry, FunEntry, FunRef, HeapAlloc, Identity, Node, Term, TermBuilder, TermKind,
-    cmp_exact, global_atoms, writable_finalize, writable_resize_private,
+    Atom, ExportEntry, FunEntry, FunRef, HeapAlloc, Identity, Node, Term, TermBuilder, TermKind,
+    atoms, cmp_exact, global_atoms, writable_finalize, writable_resize_private,
 };
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use num_bigint::{BigInt, Sign};
@@ -167,6 +167,7 @@ fn atom_text(term: Term) -> Option<&'static str> {
     global_atoms().text(term.as_atom()?)
 }
 
+// Port of erts/emulator/beam/external.c:1480-1535 (parse_t2b_opts), OTP-29.1.1.
 fn options(term: Option<Term>) -> Result<EncodeOpts, BifError> {
     let mut opts = EncodeOpts {
         minor: 2,
@@ -179,22 +180,24 @@ fn options(term: Option<Term>) -> Result<EncodeOpts, BifError> {
         // SAFETY: BIF arguments remain on stable live heaps throughout this call.
         let (head, next) = unsafe { tail.cons_ref() }.ok_or(BifError::BADARG)?;
         tail = next;
-        match atom_text(head) {
-            Some("compressed") => opts.compressed = Some(6),
-            Some("deterministic") => opts.deterministic = true,
-            // Port of erts/emulator/beam/external.c:3305 (LOCAL_EXT), OTP-29.1.1.
-            Some("local") => opts.local = true,
+        match head.as_atom() {
+            Some(atoms::COMPRESSED) => opts.compressed = Some(6),
+            Some(atoms::DETERMINISTIC) => opts.deterministic = true,
+            Some(atoms::LOCAL) => opts.local = true,
             _ => {
                 // SAFETY: BIF arguments remain on stable live heaps throughout this call.
                 let tuple = unsafe { head.tuple_ref() }.ok_or(BifError::BADARG)?;
                 if tuple.len() != 2 {
                     return Err(BifError::BADARG);
                 }
-                let name = atom_text(tuple.get(0).unwrap()).ok_or(BifError::BADARG)?;
+                let name = tuple
+                    .get(0)
+                    .and_then(Term::as_atom)
+                    .ok_or(BifError::BADARG)?;
                 let value = tuple.get(1).unwrap().as_small().ok_or(BifError::BADARG)?;
                 match (name, value) {
-                    ("compressed", 0..=9) => opts.compressed = Some(value as u8),
-                    ("minor_version", 0..=2) => opts.minor = value as u8,
+                    (atoms::COMPRESSED, 0..=9) => opts.compressed = Some(value as u8),
+                    (atoms::MINOR_VERSION, 0..=2) => opts.minor = value as u8,
                     _ => return Err(BifError::BADARG),
                 }
             }
@@ -418,10 +421,22 @@ fn int_bytes(out: &mut impl ByteOutput, n: &BigInt) {
 }
 
 // Port of erts/emulator/beam/external.c:2877 (enc_atom), OTP-29.1.1.
-// Atom text is copied from the atom table into the output. No intermediate name buffer.
-fn atom_bytes(out: &mut impl ByteOutput, name: &str, minor: u8) {
-    if minor <= 1 && write_latin1_atom(out, name) {
-        return;
+fn atom_bytes(out: &mut impl ByteOutput, atom: Atom, minor: u8) -> Result<(), BifError> {
+    let table = global_atoms();
+    let name = table.text(atom).ok_or(BifError::BADARG)?;
+    if minor <= 1
+        && let Some(chars) = table.latin1_char_count(atom)
+    {
+        out.push(100);
+        out.extend_from_slice(&(chars as u16).to_be_bytes());
+        if chars == name.len() {
+            out.extend_from_slice(name.as_bytes());
+        } else {
+            for character in name.chars() {
+                out.push(character as u8);
+            }
+        }
+        return Ok(());
     }
     let bytes = name.as_bytes();
     if bytes.len() <= 255 {
@@ -432,39 +447,27 @@ fn atom_bytes(out: &mut impl ByteOutput, name: &str, minor: u8) {
         out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
     }
     out.extend_from_slice(bytes);
-}
-
-fn write_latin1_atom(out: &mut impl ByteOutput, name: &str) -> bool {
-    if name.chars().any(|c| (c as u32) > 255) {
-        return false;
-    }
-    let len = name.chars().count();
-    out.push(100);
-    out.extend_from_slice(&(len as u16).to_be_bytes());
-    if name.is_ascii() {
-        out.extend_from_slice(name.as_bytes());
-    } else {
-        for c in name.chars() {
-            out.push(c as u8);
-        }
-    }
-    true
-}
-
-fn atom_term(out: &mut impl ByteOutput, term: Term, minor: u8) -> Result<(), BifError> {
-    atom_bytes(out, atom_text(term).ok_or(BifError::BADARG)?, minor);
     Ok(())
 }
 
+fn atom_term(out: &mut impl ByteOutput, term: Term, minor: u8) -> Result<(), BifError> {
+    atom_bytes(out, term.as_atom().ok_or(BifError::BADARG)?, minor)
+}
+
 // Port of erts/emulator/beam/external.c:encode_atom_size, OTP-29.1.1.
-fn atom_size(name: &str, minor: u8) -> usize {
-    if minor <= 1 && name.chars().all(|character| character as u32 <= 255) {
-        3 + name.chars().count()
+fn atom_size(atom: Atom, minor: u8) -> Result<usize, BifError> {
+    let table = global_atoms();
+    let name = table.text(atom).ok_or(BifError::BADARG)?;
+    let size = if minor <= 1
+        && let Some(chars) = table.latin1_char_count(atom)
+    {
+        3 + chars
     } else if name.len() <= 255 {
         2 + name.len()
     } else {
         3 + name.len()
-    }
+    };
+    Ok(size)
 }
 
 // Port of erts/emulator/beam/external.c:encode_small_size, OTP-29.1.1.
@@ -607,35 +610,47 @@ enum Work {
     MapSort(MapSort),
 }
 
-// Keep the reverse iterator's inline HAMT stack in the size walk; boxing adds an allocation per map.
+struct MapEntries {
+    size: usize,
+    entries: MapEntryIter,
+}
+
+// Keeping the reverse iterator inline avoids one heap allocation per map.
 #[allow(clippy::large_enum_variant)]
-enum MapEntries {
-    Flat(Box<dyn Iterator<Item = (Term, Term)> + Send>),
+enum MapEntryIter {
+    Flat {
+        keys: arinsal_maps::FlatMapProjection,
+        values: arinsal_maps::FlatMapProjection,
+    },
     Hash(arinsal_term::MapReverseIter),
 }
 
 impl MapEntries {
+    // Port of erts/emulator/beam/external.c:3745-3822 (MAP_DEF), OTP-29.1.1.
     fn new(map: Term) -> Result<Self, BifError> {
         let checked = arinsal_maps::checked_map(map).map_err(|_| BifError::BADARG)?;
-        Ok(match checked.kind() {
-            arinsal_maps::CheckedMapKind::Flatmap(flat) => Self::Flat(Box::new(
-                arinsal_maps::flatmap_projection(flat, true)
-                    .zip(arinsal_maps::flatmap_projection(flat, false)),
-            )),
+        let size = checked.size();
+        let entries = match checked.kind() {
+            arinsal_maps::CheckedMapKind::Flatmap(flat) => MapEntryIter::Flat {
+                keys: arinsal_maps::flatmap_projection(flat, true),
+                values: arinsal_maps::flatmap_projection(flat, false),
+            },
             arinsal_maps::CheckedMapKind::Hashmap(_) => {
-                Self::Hash(arinsal_term::MapReverseIter::new(map).ok_or(BifError::BADARG)?)
+                MapEntryIter::Hash(arinsal_term::MapReverseIter::new(map).ok_or(BifError::BADARG)?)
             }
-        })
+        };
+        Ok(Self { size, entries })
     }
 }
 
 impl Iterator for MapEntries {
     type Item = (Term, Term);
 
+    // Port of erts/emulator/beam/external.c:3745-3822 (MAP_DEF), OTP-29.1.1.
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Flat(iter) => iter.next(),
-            Self::Hash(iter) => iter.next(),
+        match &mut self.entries {
+            MapEntryIter::Flat { keys, values } => Some((keys.next()?, values.next()?)),
+            MapEntryIter::Hash(iter) => iter.next(),
         }
     }
 }
@@ -883,9 +898,9 @@ impl EncodeWalk {
                     self.add_size(size)?;
                 }
                 TermKind::Atom => self.add_size(atom_size(
-                    atom_text(term).ok_or(BifError::BADARG)?,
+                    term.as_atom().ok_or(BifError::BADARG)?,
                     self.opts.minor,
-                ))?,
+                )?)?,
                 TermKind::Nil => self.add_size(1)?,
                 TermKind::List => {
                     *consumed += external_string_prefix(term).0 / 2;
@@ -907,10 +922,11 @@ impl EncodeWalk {
                     }
                 }
                 TermKind::Map => {
-                    let size = arinsal_maps::size(term).map_err(|_| BifError::BADARG)?;
+                    let entries = MapEntries::new(term)?;
+                    let size = entries.size;
                     self.add_size(5)?;
                     if size > 0 {
-                        self.size_work.push(SizeItem::Map(MapEntries::new(term)?));
+                        self.size_work.push(SizeItem::Map(entries));
                     }
                 }
                 TermKind::Bitstring => {
@@ -920,20 +936,19 @@ impl EncodeWalk {
                     self.add_size(header.checked_add(len).ok_or(BifError::SystemLimit)?)?;
                 }
                 TermKind::Pid | TermKind::Port | TermKind::Ref => {
+                    // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
                     let identity = term.identity().ok_or(BifError::BADARG)?;
                     let node_size = if self.opts.local {
                         1
                     } else {
                         atom_size(
-                            global_atoms()
-                                .text(match identity {
-                                    Identity::Pid { node, .. }
-                                    | Identity::Port { node, .. }
-                                    | Identity::Ref { node, .. } => node,
-                                })
-                                .ok_or(BifError::BADARG)?,
+                            match identity {
+                                Identity::Pid { node, .. }
+                                | Identity::Port { node, .. }
+                                | Identity::Ref { node, .. } => node,
+                            },
                             self.opts.minor,
-                        )
+                        )?
                     };
                     let size = match identity {
                         Identity::Pid { .. } => 1 + node_size + 12,
@@ -947,15 +962,9 @@ impl EncodeWalk {
                     match &fun {
                         FunRef::Export { entry } => {
                             self.add_size(
-                                1 + atom_size(
-                                    global_atoms().text(entry.module).ok_or(BifError::BADARG)?,
-                                    self.opts.minor,
-                                ) + atom_size(
-                                    global_atoms()
-                                        .text(entry.function)
-                                        .ok_or(BifError::BADARG)?,
-                                    self.opts.minor,
-                                ) + small_size(i64::from(entry.arity)),
+                                1 + atom_size(entry.module, self.opts.minor)?
+                                    + atom_size(entry.function, self.opts.minor)?
+                                    + small_size(i64::from(entry.arity)),
                             )?;
                         }
                         FunRef::Local { entry, .. } => {
@@ -965,12 +974,7 @@ impl EncodeWalk {
                                     + 16
                                     + 4
                                     + 4
-                                    + atom_size(
-                                        global_atoms()
-                                            .text(entry.module)
-                                            .ok_or(BifError::BADARG)?,
-                                        self.opts.minor,
-                                    )
+                                    + atom_size(entry.module, self.opts.minor)?
                                     + small_size(i64::from(entry.old_index))
                                     + small_size(i64::from(entry.old_uniq)),
                             )?;
@@ -987,25 +991,15 @@ impl EncodeWalk {
                     let mut size = 1
                         + 4
                         + 1
-                        + atom_size(
-                            global_atoms()
-                                .text(record.module())
-                                .ok_or(BifError::BADARG)?,
-                            self.opts.minor,
-                        )
-                        + atom_size(
-                            global_atoms().text(record.name()).ok_or(BifError::BADARG)?,
-                            self.opts.minor,
-                        );
+                        + atom_size(record.module(), self.opts.minor)?
+                        + atom_size(record.name(), self.opts.minor)?;
                     for index in (0..record.len()).rev() {
                         let sorted = record.sorted_index(index).ok_or(BifError::BADARG)?;
                         size = size
                             .checked_add(atom_size(
-                                global_atoms()
-                                    .text(record.key(sorted).ok_or(BifError::BADARG)?)
-                                    .ok_or(BifError::BADARG)?,
+                                record.key(sorted).ok_or(BifError::BADARG)?,
                                 self.opts.minor,
-                            ))
+                            )?)
                             .ok_or(BifError::SystemLimit)?;
                         self.size_work.push(SizeItem::Term(
                             record.value(sorted).ok_or(BifError::BADARG)?,
@@ -1413,20 +1407,20 @@ impl EncodeWalk {
                 }
                 TermKind::Map => {
                     out.push(116);
-                    let len = arinsal_maps::size(term).map_err(|_| BifError::BADARG)?;
+                    let entries = MapEntries::new(term)?;
+                    let len = entries.size;
                     out.extend_from_slice(
                         &u32::try_from(len)
                             .map_err(|_| BifError::SystemLimit)?
                             .to_be_bytes(),
                     );
                     if opts.deterministic {
-                        let entries = MapEntries::new(term)?;
                         work.push(Work::MapGather {
                             entries,
                             pairs: Vec::with_capacity(len),
                         });
                     } else {
-                        work.push(Work::MapEntries(MapEntries::new(term)?));
+                        work.push(Work::MapEntries(entries));
                     }
                 }
                 TermKind::Bitstring => {

@@ -274,6 +274,14 @@ impl AtomTable {
         Some(rec.latin1_chars as usize == rec.name.len())
     }
 
+    /// Number of Unicode scalar values in Latin-1 for this atom, or `None` if it is not.
+    ///
+    /// Port of erts/emulator/beam/atom.h (`Atom.latin1_chars`), OTP-29.1.1.
+    pub fn latin1_char_count(&self, atom: Atom) -> Option<usize> {
+        self.record(atom)
+            .and_then(|rec| usize::try_from(rec.latin1_chars).ok())
+    }
+
     /// Low 32 bits of the atom's bucket hash.
     ///
     /// `make_hash2` returns `slot.bucket.hvalue` as a `Uint32`, so this is the
