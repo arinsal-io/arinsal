@@ -11,7 +11,7 @@ export ERL_CRASH_DUMP="$TMP/erl_crash.dump"
 
 "$ROOT/tools/census/static.escript"
 erlc -W0 -o "$EBIN" "$ROOT/tools/census/census_hook.erl"
-erlc -W0 +export_all -o "$EBIN" "$ROOT/bench/bench.erl"
+erlc -W0 +export_all -o "$EBIN" "$ROOT/tools/bench/kernels/bench.erl"
 "$ROOT/tools/census/boot.escript" "$(erl -noshell -eval 'io:format("~s",[filename:join([code:root_dir(),"releases","29","start.script"])]),halt().')" "$BOOT"
 
 export CENSUS_ROOT="$ROOT"

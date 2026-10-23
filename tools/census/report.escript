@@ -16,7 +16,7 @@ main(_) ->
                "|---|---:|---:|---:|---:|---:|---:|\n",
                [summary_row(Name,D) || {Name,D} <- Data],"\n",
                "The `bench` run calls `fib(25)`, `trees(10)`, `nbody(1000)`, and `tasks(1000)` "
-               "from the current `bench/bench.erl`, compiled with `export_all` in `tmp/`. "
+               "from the current `tools/bench/kernels/bench.erl`, compiled with `export_all` in `tmp/`. "
                "Its `/proc` RSS read fails on macOS after task spawning; the failure is caught. "
                "The other scenarios use a generated boot script that starts tracing after "
                "`init_kernel_started`, before `application:start_boot(kernel)`. "

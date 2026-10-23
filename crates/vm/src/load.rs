@@ -751,7 +751,7 @@ impl Vm {
     ) -> Self {
         let mut paths: Vec<PathBuf> = paths.into_iter().collect();
         paths.push(PathBuf::from("."));
-        paths.push(PathBuf::from("bench/out/ebin"));
+        paths.push(PathBuf::from("tools/bench/out/ebin"));
         if let Ok(entries) = std::fs::read_dir(otp.join("lib")) {
             let mut dirs: Vec<_> = entries
                 .filter_map(Result::ok)

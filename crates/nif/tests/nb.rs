@@ -30,7 +30,7 @@ fn benchmark_nif_callbacks() {
             &["-shared"][..]
         })
         .arg(format!("-I{include}"))
-        .arg(root.join("bench/nif/nb.c"))
+        .arg(root.join("tools/bench/nif/nb.c"))
         .arg("-o")
         .arg(&output)
         .status()

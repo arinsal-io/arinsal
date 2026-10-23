@@ -10,7 +10,7 @@ MAX_RSS_MIB=210
 
 cd "$ROOT"
 cargo build --release
-timeout 1200 python3 bench/compare.py \
+timeout 1200 python3 tools/bench/compare.py \
   --runtimes arinsal --bench fanin --runs 3 --output "$OUTPUT"
 
 python3 - "$OUTPUT" "$MAX_RSS_MIB" "$MAX_KERNEL_MS" <<'PY'

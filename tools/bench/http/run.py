@@ -15,9 +15,10 @@ from datetime import datetime, timezone
 from urllib.error import URLError
 from urllib.request import urlopen
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
+OUT = ROOT / "tools/bench/out"
 SERVICES = {
-    "go": {"port": 8081, "build": ["go", "build", "-o", str(ROOT / "bench/out/http-go"), "."], "cwd": ROOT / "examples/http/go", "run": [str(ROOT / "bench/out/http-go")]},
+    "go": {"port": 8081, "build": ["go", "build", "-o", str(OUT / "http-go"), "."], "cwd": ROOT / "examples/http/go", "run": [str(OUT / "http-go")]},
     "rust": {"port": 8082, "build": ["cargo", "build", "--release", "--manifest-path", "examples/http/rust/Cargo.toml"], "cwd": ROOT, "run": [str(ROOT / "examples/http/rust/target/release/arinsal-http-rust")]},
     "elixir": {"port": 8083, "build": ["mix", "deps.get", "--only", "prod"], "cwd": ROOT / "examples/http/elixir_bandit", "run": ["mix", "run", "--no-halt"]},
     "arinsal": {"port": 8083, "build": ["mix", "deps.get", "--only", "prod"], "cwd": ROOT / "examples/http/elixir_bandit", "run": ["mix", "run", "--no-halt"]},
@@ -97,7 +98,7 @@ def measure(name, service, rates, duration, connections, workers, warmup):
         runtime_env["PATH"] = str(find_arinsal()) + os.pathsep + runtime_env.get("PATH", "")
     print(f"Building {name}...", flush=True)
     run(service["build"], cwd=service["cwd"], env=runtime_env)
-    log = ROOT / "bench/out" / f"{name}.log"
+    log = OUT / f"{name}.log"
     with log.open("w") as output:
         process = subprocess.Popen(service["run"], cwd=service["cwd"], env=runtime_env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         try:
@@ -176,7 +177,7 @@ def main():
         print("Skipping arinsal: target/release/arinsal-erl-shim/erl is unavailable.", file=sys.stderr)
         services.pop("arinsal")
     results = []
-    out_dir = ROOT / "bench/out"
+    out_dir = OUT
     out_dir.mkdir(parents=True, exist_ok=True)
     for name in args.implementations.split(","):
         if name not in services:

@@ -17,8 +17,11 @@ import sys
 import tempfile
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
-BENCH = ROOT / "bench"
+ROOT = Path(__file__).resolve().parents[2]
+BENCH = ROOT / "tools/bench"
+KERNELS = BENCH / "kernels"
+GO = BENCH / "vs-go"
+RUST = BENCH / "vs-rust"
 OUT = BENCH / "out"
 RUNTIMES = ("rust", "go", "erts", "arinsal")
 # The first six arguments preserve the original suite's workload sizes.
@@ -52,11 +55,11 @@ def build(runtimes):
     (OUT / "ebin").mkdir(exist_ok=True)
     steps = []
     if "go" in runtimes:
-        steps.append(["go", "build", "-o", str(OUT / "gob"), str(BENCH / "bench.go")])
+        steps.append(["go", "build", "-o", str(OUT / "gob"), str(GO / "bench.go")])
     if "rust" in runtimes:
-        steps.append(["cargo", "build", "--manifest-path", str(BENCH / "rust/Cargo.toml"), "--release"])
+        steps.append(["cargo", "build", "--manifest-path", str(RUST / "Cargo.toml"), "--release"])
     if "erts" in runtimes or "arinsal" in runtimes:
-        steps.append(["erlc", "-o", str(OUT / "ebin"), str(BENCH / "bench.erl")])
+        steps.append(["erlc", "-o", str(OUT / "ebin"), str(KERNELS / "bench.erl")])
     for command in steps:
         print("Building:", shlex.join(command), flush=True)
         result = call(command)
@@ -68,7 +71,7 @@ def command_for(runtime, name, arguments):
     fn = "tasks" if name.startswith("tasks_") else name
     suffix = [fn, *map(str, arguments)]
     if runtime == "rust":
-        return [str(BENCH / "rust/target/release/bench"), *suffix]
+        return [str(RUST / "target/release/bench"), *suffix]
     if runtime == "go":
         return [str(OUT / "gob"), *suffix]
     if runtime == "erts":

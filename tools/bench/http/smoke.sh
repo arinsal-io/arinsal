@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 TMP="$(mktemp -d)"
 PIDS=()
 cleanup() {
@@ -12,7 +12,7 @@ cleanup() {
 trap cleanup EXIT
 
 cd "$ROOT"
-mkdir -p bench/out
+mkdir -p tools/bench/out
 (cd examples/http/go && go build -o "$TMP/go" .)
 (cd examples/http/rust && cargo build --release)
 (cd examples/http/elixir_bandit && MIX_ENV=prod mix deps.get >/dev/null && MIX_ENV=prod mix compile)

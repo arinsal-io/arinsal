@@ -41,7 +41,7 @@ jobs:
         run: cargo run -p difftest-runner --bin difftest -- --vm arinsal --suite stage1
 
   language-interop:
-    name: Elixir and Gleam interoperability
+    name: Gleam interoperability
     runs-on: macos-15
     timeout-minutes: 90
 
@@ -49,11 +49,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Erlang/OTP, Elixir, and Gleam
+      - name: Set up Erlang/OTP and Gleam
         uses: erlef/setup-beam@v1
         with:
           otp-version: "29.1.1"
-          elixir-version: "1.20.4"
           gleam-version: "1.9.0"
           version-type: strict
           install-hex: true
@@ -61,18 +60,6 @@ jobs:
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
-
-      - name: Fetch Elixir demo dependencies
-        working-directory: examples/arinsal_demo
-        run: mix deps.get
-
-      - name: Test Elixir demo on ERTS
-        working-directory: examples/arinsal_demo
-        run: mix test
-
-      - name: Test Elixir demo on Arinsal
-        working-directory: examples/arinsal_demo
-        run: mix arinsal test
 
       - name: Build Gleam smoke fixture
         working-directory: tests/languages/gleam

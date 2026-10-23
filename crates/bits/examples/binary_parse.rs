@@ -1,5 +1,5 @@
 //! `cargo run -p arinsal-bits --release --example binary_parse`
-//! Mirrors `bench/bench.erl`'s 1024-byte frame payload and parsing steps.
+//! Mirrors `tools/bench/kernels/bench.erl`'s 1024-byte frame payload and parsing steps.
 use arinsal_bits::{MatchOps, SegFlags, start_match};
 use arinsal_term::{TermBuilder, VecHeap};
 use std::hint::black_box;
