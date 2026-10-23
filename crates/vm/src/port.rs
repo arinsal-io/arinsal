@@ -252,7 +252,7 @@ pub(crate) struct PortHandle {
     scheduler: Arc<Scheduler<Process>>,
     trace_scope: usize,
     /// `port_set_data/2` term. `undefined` until the first store.
-    data: Mutex<OwnedTerm>,
+    data: Mutex<PortData>,
     /// `tcp_inet` / `tcp_inet6` port. I/O is owned by `inet_drv`, not a stdio worker.
     /// Dynamically loaded (`erl_ddll`) driver port.
     driver: OnceLock<Arc<arinsal_drv::DriverPort>>,
@@ -2582,7 +2582,7 @@ fn make_handle_with(
         }),
         scheduler,
         trace_scope,
-        data: Mutex::new(OwnedTerm::Atom("undefined".into())),
+        data: Mutex::new(PortData::undefined()),
         driver: OnceLock::new(),
         drv_monitors: Mutex::new(HashMap::new()),
         async_open: Mutex::new(None),
@@ -3405,19 +3405,51 @@ pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> b
     handle.is_some_and(|handle| !handle.state.lock().unwrap().exit_complete)
 }
 
+/// The term of `port_set_data/2` in a heap block of its own (`ErtsPortDataHeap`: the term and
+/// the heap fragment it was copied into, with the off-heap list).
+// Port of erts/emulator/beam/erl_port.h (ErtsPortDataHeap), OTP-29.1.1.
+struct PortData {
+    term: Term,
+    _fragment: Option<ProcessHeap>,
+}
+
+impl PortData {
+    fn undefined() -> Self {
+        Self {
+            term: atom("undefined"),
+            _fragment: None,
+        }
+    }
+}
+
 // Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
 fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
     let handle = lookup_port(process, port)?;
-    let owned = handle.data.lock().unwrap().clone();
+    let data = handle.data.lock().unwrap();
+    let size = arinsal_term::size_object(data.term);
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    from_owned(&owned, &mut heap).map_err(|_| badarg())
+    arinsal_term::copy_struct(data.term, &mut heap, size).map_err(|_| badarg())
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:687 (port_set_data_2), OTP-29.1.1.
 fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmError> {
     let handle = lookup_port(process, port)?;
-    let owned = to_owned(data).map_err(|_| badarg())?;
-    *handle.data.lock().unwrap() = owned;
+    let size = arinsal_term::size_object(data);
+    let stored = if size == 0 {
+        PortData {
+            term: data,
+            _fragment: None,
+        }
+    } else {
+        let mut heap =
+            ProcessHeap::with_words_for_type(size, arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG);
+        let term = arinsal_term::copy_struct(data, &mut heap, size).map_err(|_| badarg())?;
+        PortData {
+            term,
+            _fragment: Some(heap),
+        }
+    };
+    *handle.data.lock().unwrap() = stored;
     Ok(atom("true"))
 }
 
