@@ -96,7 +96,8 @@ pub(crate) fn child_range(header: u64, words: usize) -> std::ops::Range<usize> {
 pub(crate) struct PairIter {
     map: Term,
     flat_index: usize,
-    nodes: SmallVec<[(Term, usize); 20]>,
+    // Port of DEF_WSTACK_SIZE in global.h:493, OTP-29.1.1: eight node/index pairs use 16 words.
+    nodes: SmallVec<[(Term, usize); 8]>,
     mode: PairIterMode,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
