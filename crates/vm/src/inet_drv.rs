@@ -12,7 +12,7 @@ use crate::VmError;
 use crate::port::PortHandle;
 use crate::process::{Message, MessageNode, Runtime};
 use arinsal_alloc::typed::ErtsAlcType;
-use arinsal_drv::{CommandPiece, ControlReply, DriverPort, NativeDriver};
+use arinsal_drv::{CommandPiece, ControlBytes, ControlReply, DriverPort, NativeDriver};
 use arinsal_packet::{
     HttpPacket, HttpUri, Packet, PacketOptions, PacketResult, PacketState, PacketType,
     parse_with_state,
@@ -383,7 +383,7 @@ fn tcp_inet_stop(sock: &Arc<Sock>) {
 }
 
 /// Port of erts/emulator/drivers/common/inet_drv.c (tcp_inet_ctl), OTP-29.1.1.
-fn control(sock: &Arc<Sock>, caller: Pid, op: u32, data: &[u8]) -> Vec<u8> {
+fn control(sock: &Arc<Sock>, caller: Pid, op: u32, data: &[u8]) -> ControlBytes {
     // Port of inet_drv.c:11956 (tcp_inet_ctl subtracts the magic), OTP-29.1.1.
     let cmd = i64::from(op).wrapping_sub(MAGIC);
     let reply = dispatch(sock, caller, cmd, data);
@@ -700,16 +700,16 @@ fn send_or_shutdown_failed(inner: &mut Inner, err: i32) -> SendOutcome {
     }
 }
 
-fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
+fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> ControlBytes {
     let mut accept_now: Option<(OwnedFd, u16)> = None;
     let mut sendfile_end: Option<SendfileEnd> = None;
     let mut setopts_action = SetoptsAction::None;
-    let reply = {
+    let reply: ControlBytes = {
         let mut inner = sock.inner.lock().unwrap();
         match cmd {
-            REQ_OPEN => open_socket(&mut inner, data),
-            REQ_FDOPEN => fdopen_socket(&mut inner, data),
-            REQ_GETFD => getfd(&inner),
+            REQ_OPEN => open_socket(&mut inner, data).into(),
+            REQ_FDOPEN => fdopen_socket(&mut inner, data).into(),
+            REQ_GETFD => getfd(&inner).into(),
             REQ_CLOSE => {
                 // inet_drv.c:11932 (tcp_desc_close) drops the fd. Write bytes
                 // already accepted by tcp_sendv first so FIN cannot overtake them.
@@ -725,43 +725,44 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
                 inner.fd.take();
                 inner.fd_external = None;
                 inner.phase = Phase::Closed;
-                ok_bytes(&[])
+                ok_small()
             }
-            REQ_BIND => bind_socket(&mut inner, data),
-            REQ_LISTEN => listen_socket(&mut inner, data),
-            REQ_CONNECT => connect_socket(sock, &mut inner, caller, data),
+            REQ_BIND => bind_socket(&mut inner, data).into(),
+            REQ_LISTEN => listen_socket(&mut inner, data).into(),
+            REQ_CONNECT => connect_socket(sock, &mut inner, caller, data).into(),
             REQ_ACCEPT => match accept_socket(sock, &mut inner, caller, data) {
-                Accept::Reply(bytes) => bytes,
+                Accept::Reply(bytes) => bytes.into(),
                 Accept::Now(fd, aref, bytes) => {
                     accept_now = Some((fd, aref));
-                    bytes
+                    bytes.into()
                 }
             },
-            REQ_NAME => sockname(&inner),
-            REQ_PEER => peername(&inner),
+            REQ_NAME => sockname(&inner).into(),
+            REQ_PEER => peername(&inner).into(),
             REQ_SETOPTS => {
                 let (reply, action) = setopts(&mut inner, data);
                 setopts_action = action;
                 reply
             }
-            REQ_GETOPTS => getopts(&inner, data),
-            REQ_GETSTAT => getstat(&inner, data),
+            REQ_GETOPTS => getopts(&inner, data).into(),
+            REQ_GETSTAT => getstat(&inner, data).into(),
             REQ_GETIFLIST | REQ_IFGET | REQ_GETIFADDRS => interface_control(
                 cmd,
                 data,
                 inner.phase != Phase::Closed && inner.fd.is_some(),
             )
-            .unwrap_or_else(|| err_bytes("exbadport")),
-            REQ_GETSERVBYNAME | REQ_GETSERVBYPORT => {
-                interface_control(cmd, data, true).unwrap_or_else(|| err_bytes("exbadport"))
-            }
-            REQ_SUBSCRIBE => subscribe(&mut inner, caller, data),
-            REQ_GETTYPE => gettype(&inner),
-            REQ_GETSTATUS => getstatus(&inner),
-            TCP_REQ_RECV => recv_req(&mut inner, caller, data),
-            TCP_REQ_SHUTDOWN => shutdown_sock(&mut inner, data),
-            TCP_REQ_SENDFILE => sendfile_req(&mut inner, data, &mut sendfile_end),
-            _ => err_bytes("exbadport"),
+            .unwrap_or_else(|| err_bytes("exbadport"))
+            .into(),
+            REQ_GETSERVBYNAME | REQ_GETSERVBYPORT => interface_control(cmd, data, true)
+                .unwrap_or_else(|| err_bytes("exbadport"))
+                .into(),
+            REQ_SUBSCRIBE => subscribe(&mut inner, caller, data).into(),
+            REQ_GETTYPE => gettype(&inner).into(),
+            REQ_GETSTATUS => getstatus(&inner).into(),
+            TCP_REQ_RECV => recv_req(&mut inner, caller, data).into(),
+            TCP_REQ_SHUTDOWN => shutdown_sock(&mut inner, data).into(),
+            TCP_REQ_SENDFILE => sendfile_req(&mut inner, data, &mut sendfile_end).into(),
+            _ => err_bytes("exbadport").into(),
         }
     };
     if let Some((fd, aref)) = accept_now {
@@ -1377,7 +1378,7 @@ enum SetoptsAction {
     Recv,
 }
 
-fn setopts(inner: &mut Inner, data: &[u8]) -> (Vec<u8>, SetoptsAction) {
+fn setopts(inner: &mut Inner, data: &[u8]) -> (ControlBytes, SetoptsAction) {
     // Port of inet_drv.c:6871, 7950-7980 (inet_set_opts), OTP-29.1.1.
     let old_active = inner.active_value;
     let old_was_active = active_is(&inner.active);
@@ -1387,12 +1388,12 @@ fn setopts(inner: &mut Inner, data: &[u8]) -> (Vec<u8>, SetoptsAction) {
         let code = data[i];
         i += 1;
         if i + 4 > data.len() {
-            return (err_bytes("einval"), SetoptsAction::None);
+            return (err_small("einval"), SetoptsAction::None);
         }
         let val = i32::from_be_bytes(data[i..i + 4].try_into().unwrap());
         i += 4;
         if !apply_opt(inner, code, val, data, &mut i) {
-            return (err_bytes("einval"), SetoptsAction::None);
+            return (err_small("einval"), SetoptsAction::None);
         }
     }
     let action = if inner.phase != Phase::Connected {
@@ -1410,7 +1411,7 @@ fn setopts(inner: &mut Inner, data: &[u8]) -> (Vec<u8>, SetoptsAction) {
     } else {
         SetoptsAction::None
     };
-    (ok_bytes(&[]), action)
+    (ok_small(), action)
 }
 
 fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) -> bool {
@@ -3666,6 +3667,19 @@ pub(crate) fn ok_bytes(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + data.len());
     out.push(1);
     out.extend_from_slice(data);
+    out
+}
+
+/// `ok_bytes(&[])` in the inline control reply buffer.
+pub(crate) fn ok_small() -> ControlBytes {
+    ControlBytes::from_slice(&[1])
+}
+
+/// `err_bytes` in the inline control reply buffer.
+fn err_small(reason: &str) -> ControlBytes {
+    let mut out = ControlBytes::new();
+    out.push(0);
+    out.extend_from_slice(reason.as_bytes());
     out
 }
 

@@ -553,10 +553,14 @@ pub enum ControlReply {
     /// NULL result buffer: `[]`.
     Nil,
     /// Byte list.
-    List(Vec<u8>),
+    List(ControlBytes),
     /// Binary (`PORT_CONTROL_FLAG_BINARY`).
-    Binary(Vec<u8>),
+    Binary(ControlBytes),
 }
+
+/// The reply bytes of a control call, inline up to `ERL_ONHEAP_BINARY_LIMIT` as erts keeps them
+/// in the preallocated `default_buf` of `erts_port_control`.
+pub type ControlBytes = smallvec::SmallVec<[u8; ERL_ONHEAP_BINARY_LIMIT]>;
 
 /// Message delivery and exit handling supplied by the VM for one port.
 pub trait PortHost: Send + Sync {
@@ -1095,20 +1099,24 @@ impl DriverPort {
         // Port of io.c:4100 (write_port_control_result).
         let reply = if self.control_flags() & PORT_CONTROL_FLAG_BINARY != 0 {
             if rbuf == pre {
-                ControlReply::Binary(resp_buf[..size.min(resp_buf.len())].to_vec())
+                ControlReply::Binary(ControlBytes::from_slice(
+                    &resp_buf[..size.min(resp_buf.len())],
+                ))
             } else {
                 let bin = rbuf.cast::<ErlDrvBinary>();
                 let bytes = binary::bytes(bin);
                 binary::free_binary(bin);
-                ControlReply::Binary(bytes)
+                ControlReply::Binary(bytes.into())
             }
         } else if rbuf == pre {
-            ControlReply::List(resp_buf[..size.min(resp_buf.len())].to_vec())
+            ControlReply::List(ControlBytes::from_slice(
+                &resp_buf[..size.min(resp_buf.len())],
+            ))
         } else {
             // SAFETY: the driver returned a driver_alloc buffer of at least cres bytes.
             let bytes = unsafe { std::slice::from_raw_parts(rbuf.cast::<u8>(), size) }.to_vec();
             binary::free(rbuf.cast());
-            ControlReply::List(bytes)
+            ControlReply::List(bytes.into())
         };
         Some(reply)
     }

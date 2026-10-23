@@ -767,6 +767,28 @@ fn walk_iodata(
     }
 }
 
+/// The control payload in an inline buffer (`erts_port_control` converts into a temp buffer
+/// of 8 KB first, so the common small payload allocates nothing).
+fn control_input(t: Term) -> Option<smallvec::SmallVec<[u8; 256]>> {
+    let mut out = smallvec::SmallVec::new();
+    walk_iodata(t, false, &mut |chunk| match chunk {
+        IoChunk::Byte(byte) => {
+            out.push(byte);
+            Some(())
+        }
+        IoChunk::Binary(term) => {
+            let bits = arinsal_bifs::bitstring_bit_len(term).ok()?;
+            if !bits.is_multiple_of(8) {
+                return None;
+            }
+            let start = out.len();
+            out.resize(start + bits / 8, 0);
+            arinsal_bifs::copy_binary_range(term, 0, &mut out[start..]).ok()
+        }
+    })?;
+    Some(out)
+}
+
 fn iodata(t: Term) -> Option<Vec<u8>> {
     // Port of erts/emulator/beam/erl_iolist.c (erts_iolist_size, erts_iolist_to_buf): size the
     // result first so the flat buffer is allocated once.
@@ -3726,7 +3748,7 @@ fn driver_control(
     };
     // Port of erts/emulator/beam/io.c:4268 (erts_port_control): the iolist is flattened into one
     // buffer sized by erts_iolist_size.
-    let Some(bytes) = iodata(data) else {
+    let Some(bytes) = control_input(data) else {
         return Ok(atom("badarg"));
     };
     drv_sig::control(process, ctx, caller, drv_port, opcode, bytes)
