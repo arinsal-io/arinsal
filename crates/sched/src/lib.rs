@@ -90,6 +90,60 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use timer::{CanceledTimer, LinkEvent, TimerCommand, TimerPayload, Wheel};
 
+/// The scheduler pollset of `erl_check_io.c` (`ERTS_POLL_USE_SCHEDULER_POLLING`): frequently
+/// re-enabled read descriptors are polled by the schedulers themselves.
+pub trait SchedPoll: Send + Sync + 'static {
+    /// `erts_sched_poll_enabled`.
+    fn enabled(&self) -> bool;
+    /// `erts_check_io(ssi->psi, timeout)` on the scheduler pollset: handle ready descriptors
+    /// (they schedule their port tasks), waiting up to `timeout` (`None` waits for an
+    /// interrupt or an event).
+    fn poll(&self, timeout: Option<Duration>);
+    /// `erts_check_io_interrupt`.
+    fn interrupt(&self);
+    /// `erts_port_task_have_outstanding_io_tasks`.
+    fn have_outstanding_io(&self) -> bool;
+}
+
+/// `ERTS_CONTEXT_REDS`.
+const CONTEXT_REDS_SYS: u32 = 4000;
+
+static SCHED_POLL: OnceLock<Arc<dyn SchedPoll>> = OnceLock::new();
+/// `doing_sys_schedule`: one scheduler at a time owns the scheduler pollset.
+static DOING_SYS_SCHEDULE: AtomicBool = AtomicBool::new(false);
+/// `function_calls`: reductions since the last system-level check.
+static FUNCTION_CALLS: AtomicU32 = AtomicU32::new(0);
+
+/// Install the scheduler pollset.
+pub fn set_sched_poll(poll: Arc<dyn SchedPoll>) {
+    let _ = SCHED_POLL.set(poll);
+}
+
+fn sched_poll() -> Option<&'static Arc<dyn SchedPoll>> {
+    SCHED_POLL.get().filter(|poll| poll.enabled())
+}
+
+/// Port of erts/emulator/beam/erl_process.c (prepare_for_sys_schedule, try_set_sys_scheduling),
+/// OTP-29.1.1: claim the scheduler pollset unless an I/O task already waits for a scheduler.
+fn prepare_for_sys_schedule(poll: &Arc<dyn SchedPoll>) -> bool {
+    while !poll.have_outstanding_io()
+        && DOING_SYS_SCHEDULE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        if !poll.have_outstanding_io() {
+            return true;
+        }
+        clear_sys_scheduling();
+    }
+    false
+}
+
+fn clear_sys_scheduling() {
+    FUNCTION_CALLS.store(0, Ordering::Release);
+    DOING_SYS_SCHEDULE.store(false, Ordering::SeqCst);
+}
+
 type ErasedTimerService = (usize, Box<dyn Any>);
 
 /// The timer service of each scheduler this thread owns, by scheduler set. A thread owns one
@@ -1630,6 +1684,8 @@ struct Inner<T: Task> {
     /// while the owner holds the run-queue lock in `schedule`.
     in_schedule: Vec<AtomicBool>,
     parked: Arc<[AtomicBool]>,
+    /// A scheduler asleep in the scheduler pollset instead of parked (`ERTS_SSI_FLG_POLL_SLEEPING`).
+    poll_sleeping: Vec<AtomicBool>,
     /// Port of erts/emulator/beam/erl_process.c:342 (`no_waiting_scheds`), OTP-29.1.1.
     waiting_schedulers: AtomicUsize,
     sleepers: Arc<[OnceLock<thread::Thread>]>,
@@ -1962,6 +2018,7 @@ impl<T: Task> Inner<T> {
             if let Some(thread) = self.sleepers.get(blocker).and_then(OnceLock::get) {
                 thread.unpark();
             }
+            self.interrupt_poll_sleeper(blocker);
         }
     }
 
@@ -2965,6 +3022,17 @@ impl<T: Task> Inner<T> {
         if let Some(thread) = self.sleepers[worker].get() {
             thread.unpark();
         }
+        self.interrupt_poll_sleeper(worker);
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c (ssi_wake: `erts_check_io_interrupt` for a
+    /// scheduler in ERTS_SSI_FLG_POLL_SLEEPING), OTP-29.1.1.
+    fn interrupt_poll_sleeper(&self, worker: usize) {
+        if self.poll_sleeping[worker].load(Ordering::SeqCst)
+            && let Some(poll) = SCHED_POLL.get()
+        {
+            poll.interrupt();
+        }
     }
 
     fn wake_all_workers(&self) {
@@ -2975,6 +3043,7 @@ impl<T: Task> Inner<T> {
             if let Some(thread) = sleeper.get() {
                 thread.unpark();
             }
+            self.interrupt_poll_sleeper(worker);
         }
     }
 
@@ -5677,6 +5746,7 @@ impl<T: Task> Scheduler<T> {
             work_epochs: (0..workers).map(|_| AtomicU64::new(0)).collect(),
             in_schedule: (0..workers).map(|_| AtomicBool::new(false)).collect(),
             parked: Arc::clone(&parked),
+            poll_sleeping: (0..workers).map(|_| AtomicBool::new(false)).collect(),
             waiting_schedulers: AtomicUsize::new(0),
             sleepers: Arc::clone(&sleepers),
             fanin_stats: std::env::var_os("ARINSAL_FANIN_STATS").is_some(),
@@ -7432,6 +7502,12 @@ fn run_slice<'a, T: Task>(
         // Dirty schedulers keep no reduction or normal run queue counters.
     } else if let Some(local) = local.as_deref_mut() {
         local.reductions += consumed;
+        if SCHED_POLL.get().is_some() {
+            FUNCTION_CALLS.fetch_add(
+                u32::try_from(consumed).unwrap_or(u32::MAX),
+                Ordering::Relaxed,
+            );
+        }
     } else {
         inner.worker_stats[worker_id]
             .reductions
@@ -8266,6 +8342,16 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         // Processes enqueued on this run queue from other threads join the local deques in
         // arrival order, so the local queue is this scheduler's whole run queue.
         inner.take_injected(local);
+        // Port of erts/emulator/beam/erl_process.c:9953 (schedule: "Schedule system-level
+        // activities" once the schedulers executed twice a context's reductions), OTP-29.1.1.
+        if FUNCTION_CALLS.load(Ordering::Relaxed) > 2 * CONTEXT_REDS_SYS
+            && let Some(poll) = sched_poll().filter(|poll| prepare_for_sys_schedule(poll))
+        {
+            local.set_msacc_state(MsaccState::CheckIo);
+            poll.poll(Some(Duration::ZERO));
+            local.set_msacc_state(MsaccState::Other);
+            clear_sys_scheduling();
+        }
         // Hold the run-queue lock across the wakeup check. A scheduler woken here
         // must not steal the process this scheduler is about to run.
         // Port of erts/emulator/beam/erl_process.c:4631 (trylock EBUSY), OTP-29.1.1.
@@ -8510,7 +8596,17 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             // Port of erts/emulator/beam/erl_process.c (scheduler_wait): the sleep state
             // wraps only the blocking wait, the spin above counts as `other`.
             local.set_msacc_state(MsaccState::Sleep);
-            if let Some(ns) = wait_ns {
+            if let Some(poll) = sched_poll().filter(|poll| prepare_for_sys_schedule(poll)) {
+                // Port of erts/emulator/beam/erl_process.c (scheduler_wait: "We sleep in
+                // check_io, only for normal schedulers"), OTP-29.1.1.
+                inner.poll_sleeping[id].store(true, Ordering::SeqCst);
+                if inner.parked[id].load(Ordering::SeqCst) && !inner.stopped.load(Ordering::Acquire)
+                {
+                    poll.poll(wait_ns.map(Duration::from_nanos));
+                }
+                inner.poll_sleeping[id].store(false, Ordering::SeqCst);
+                clear_sys_scheduling();
+            } else if let Some(ns) = wait_ns {
                 park_until(&inner, id, ns);
             } else {
                 // `Thread::park` can return spuriously. A real wake clears `parked`

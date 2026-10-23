@@ -52,7 +52,25 @@ struct PollControl {
     waker: Waker,
 }
 
-static POLL_CONTROL: OnceLock<PollControl> = OnceLock::new();
+/// Which poll set an operation addresses: the one the poll thread waits on, or the scheduler
+/// pollset the schedulers poll themselves.
+// Port of erts/emulator/sys/common/erl_check_io.c (pollsetv, sched_pollset), OTP-29.1.1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PollSetKind {
+    Main,
+    Scheduler,
+}
+
+impl PollSetKind {
+    fn index(self) -> usize {
+        match self {
+            Self::Main => 0,
+            Self::Scheduler => 1,
+        }
+    }
+}
+
+static POLL_CONTROL: [OnceLock<PollControl>; 2] = [OnceLock::new(), OnceLock::new()];
 const WAKE_TOKEN: usize = usize::MAX;
 const EVENT_CAPACITY: usize = 512;
 
@@ -70,11 +88,11 @@ pub(crate) fn erts_poll_max_fds() -> usize {
 
 /// Initialize the sole poll set and its out-of-band interrupt.
 // Port of erts/emulator/sys/common/erl_poll.c (erts_poll_init), OTP-29.1.1.
-pub(crate) fn erts_poll_init() -> io::Result<ErtsPollSet> {
+pub(crate) fn erts_poll_init(kind: PollSetKind) -> io::Result<ErtsPollSet> {
     let poll = Poll::new()?;
     let registry = poll.registry().try_clone()?;
     let waker = Waker::new(&registry, Token(WAKE_TOKEN))?;
-    POLL_CONTROL
+    POLL_CONTROL[kind.index()]
         .set(PollControl { registry, waker })
         .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "ERTS poll set initialized"))?;
     Ok(ErtsPollSet {
@@ -94,24 +112,33 @@ pub(crate) fn erts_poll_init() -> io::Result<ErtsPollSet> {
 /// `check_io`. Successful control changes interrupt the poll thread, matching
 /// the `wake_poller` path in ERTS.
 // Port of erts/emulator/sys/common/erl_poll.c (erts_poll_control), OTP-29.1.1.
-pub(crate) fn erts_poll_control(fd: RawFd, op: ErtsPollOp, events: u32) -> u32 {
-    match erts_poll_control_inner(fd, op, events) {
+pub(crate) fn erts_poll_control(kind: PollSetKind, fd: RawFd, op: ErtsPollOp, events: u32) -> u32 {
+    match erts_poll_control_inner(kind, fd, op, events) {
         Ok(()) => {
-            let _ = erts_poll_interrupt();
+            // kqueue and epoll take changes while a thread waits (`concurrent_updates`), so
+            // only the dedicated poll thread's set is interrupted, as before.
+            if kind == PollSetKind::Main {
+                let _ = erts_poll_interrupt(kind);
+            }
             ERTS_POLL_EV_NONE
         }
         Err(_) => ERTS_POLL_EV_NVAL,
     }
 }
 
-fn erts_poll_control_inner(fd: RawFd, op: ErtsPollOp, events: u32) -> io::Result<()> {
+fn erts_poll_control_inner(
+    kind: PollSetKind,
+    fd: RawFd,
+    op: ErtsPollOp,
+    events: u32,
+) -> io::Result<()> {
     if fd < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "negative descriptor",
         ));
     }
-    let control = POLL_CONTROL.get().ok_or_else(|| {
+    let control = POLL_CONTROL[kind.index()].get().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotConnected, "ERTS poll set not initialized")
     })?;
     let token = fd_token(fd)?;
@@ -201,9 +228,8 @@ pub(crate) fn erts_poll_wait(
 
 /// Interrupt a thread blocked in [`erts_poll_wait`].
 // Port of erts/emulator/sys/common/erl_poll.c (erts_poll_interrupt), OTP-29.1.1.
-#[allow(dead_code)] // ERTS exposes this for shutdown and scheduler coordination.
-pub(crate) fn erts_poll_interrupt() -> io::Result<()> {
-    POLL_CONTROL
+pub(crate) fn erts_poll_interrupt(kind: PollSetKind) -> io::Result<()> {
+    POLL_CONTROL[kind.index()]
         .get()
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "ERTS poll set not initialized")

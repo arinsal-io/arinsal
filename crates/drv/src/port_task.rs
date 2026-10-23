@@ -126,6 +126,24 @@ pub(crate) struct PortTask {
     kind: TaskKind,
 }
 
+/// I/O tasks scheduled and not yet freed (`erts_port_task_outstanding_io_tasks`).
+static OUTSTANDING_IO_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether an I/O task waits for a scheduler, so that scheduler polling can be skipped.
+// Port of erts/emulator/beam/erl_port_task.h (erts_port_task_have_outstanding_io_tasks),
+// OTP-29.1.1.
+pub fn have_outstanding_io_tasks() -> bool {
+    OUTSTANDING_IO_TASKS.load(Ordering::Acquire) != 0
+}
+
+impl Drop for PortTask {
+    fn drop(&mut self) {
+        if matches!(self.kind, TaskKind::Io { .. }) {
+            OUTSTANDING_IO_TASKS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 impl PortTask {
     fn caller(&self) -> u64 {
         match &self.kind {
@@ -496,6 +514,7 @@ impl DriverPort {
     /// `ERTS_PORT_TASK_OUTPUT`, erl_check_io.c:2102 iready/oready). `false` when the port
     /// accepts no more tasks.
     pub(crate) fn schedule_io(self: &Arc<Self>, fd: i32, dir: usize, reg: u64) -> bool {
+        OUTSTANDING_IO_TASKS.fetch_add(1, Ordering::AcqRel);
         let task = Arc::new(PortTask {
             state: AtomicU32::new(STATE_SCHEDULED),
             flags: 0,
