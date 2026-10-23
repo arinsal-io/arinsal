@@ -132,12 +132,14 @@ impl RefcBinary {
         Ok(Self { allocation })
     }
 
-    pub(crate) fn new_zeroed(size: usize) -> Result<Self, TermError> {
+    /// A binary of `size` bytes the caller fills before sharing it (`erts_bin_nrml_alloc`).
+    pub fn new_zeroed(size: usize) -> Result<Self, TermError> {
         let allocation = BinaryBlock::new(size, 0, size).map_err(|_| TermError::SystemLimit)?;
         Ok(Self { allocation })
     }
 
-    pub(crate) fn bytes_mut_unique(&mut self) -> Option<&mut [u8]> {
+    /// The payload, writable while no other reference to the Binary exists.
+    pub fn bytes_mut_unique(&mut self) -> Option<&mut [u8]> {
         self.allocation.bytes_mut_unique()
     }
 
@@ -148,6 +150,19 @@ impl RefcBinary {
     /// Length of the binary payload in bytes.
     pub fn len(&self) -> usize {
         self.allocation.size()
+    }
+
+    /// The payload bytes.
+    pub fn bytes(&self) -> &[u8] {
+        self.allocation
+            .view()
+            .bytes(self.allocation.size())
+            .unwrap_or_default()
+    }
+
+    /// Another reference to the Binary (`erts_refc_inc`), kept by a message term.
+    pub(crate) fn share(&self) -> Option<arinsal_alloc::raw::OwnedBinaryRef> {
+        arinsal_alloc::raw::OwnedBinaryRef::clone_from_view(self.allocation.view())
     }
 
     pub(crate) fn into_reference(self) -> arinsal_alloc::raw::OwnedBinaryRef {

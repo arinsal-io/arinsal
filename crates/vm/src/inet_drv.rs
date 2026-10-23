@@ -18,10 +18,11 @@ use arinsal_packet::{
 };
 use arinsal_sched::Pid;
 use arinsal_term::{HeapAlloc, Term, TermBuilder, global_atoms};
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 // Port of inet_drv.c ERTS_INET_DRV_CONTROL_MAGIC_NUMBER, OTP-29.1.1.
@@ -235,7 +236,7 @@ impl NativeDriver for TcpInet {
     // Port of inet_drv.c (tcp_inet_timeout).
     fn timeout(&self, port: &DriverPort) {
         if let Some((sock, _handle)) = sock_of(port) {
-            sock.inner.lock().unwrap().timer_at = None;
+            sock.inner.lock().timer_at = None;
             expire(&sock);
             settle(&sock);
         }
@@ -259,7 +260,7 @@ fn settle(sock: &Arc<Sock>) {
     };
     // One look at the socket state for all three, as the C callback reads its descriptor once.
     let (timer, busy) = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         select_locked(&port, &mut inner);
         (timer_change(&mut inner), busy_change(&mut inner))
     };
@@ -349,7 +350,7 @@ fn tcp_inet_stop(sock: &Arc<Sock>) {
         let _ = crate::dist::port_connection_closed(&runtime, id);
     }
     let pending = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         // Port of erts/emulator/drivers/common/inet_drv.c:12718-12725 (tcp_inet_flush)
         // and :11906-11918 (tcp_inet_stop), OTP-29.1.1: a port stopped during sendfile
         // discards its queue and closes the dup'ed file descriptor.
@@ -397,7 +398,7 @@ fn command(sock: &Arc<Sock>, caller: Pid, data: Vec<u8>) {
     };
     let start = data.len() - payload.len();
     let outcome = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         accept_send(&mut inner, caller, ids, SendData::Owned(data, start))
     };
     finish_command(sock, outcome, Some((caller, ids)));
@@ -414,7 +415,7 @@ fn command_pieces(sock: &Arc<Sock>, caller: Pid, pieces: Vec<CommandPiece>) {
     };
     let start = first.len() - payload.len();
     let outcome = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         accept_send(&mut inner, caller, ids, SendData::Pieces(pieces, start))
     };
     finish_command(sock, outcome, Some((caller, ids)));
@@ -452,7 +453,7 @@ fn finish_command(sock: &Arc<Sock>, outcome: SendOutcome, reply: Option<(Pid, [u
                     );
                 }
                 emit(sock, Out::TcpClosed { owner });
-                if sock.inner.lock().unwrap().exit_on_close {
+                if sock.inner.lock().exit_on_close {
                     driver_exit(sock);
                 }
             }
@@ -474,7 +475,7 @@ pub(crate) fn dist_output(sock: &Arc<Sock>, data: &[u8]) -> Result<bool, VmError
     };
     port.serialized(|| {
         let outcome = {
-            let mut inner = sock.inner.lock().unwrap();
+            let mut inner = sock.inner.lock();
             // Dummy caller/ids: dist never waits on inet_reply for these writes.
             accept_send(
                 &mut inner,
@@ -484,7 +485,7 @@ pub(crate) fn dist_output(sock: &Arc<Sock>, data: &[u8]) -> Result<bool, VmError
             )
         };
         finish_command(sock, outcome, None);
-        Ok(sock.inner.lock().unwrap().busy)
+        Ok(sock.inner.lock().busy)
     })
 }
 
@@ -704,7 +705,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> ControlByte
     let mut sendfile_end: Option<SendfileEnd> = None;
     let mut setopts_action = SetoptsAction::None;
     let reply: ControlBytes = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         match cmd {
             REQ_OPEN => open_socket(&mut inner, data).into(),
             REQ_FDOPEN => fdopen_socket(&mut inner, data).into(),
@@ -803,7 +804,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> ControlByte
         try_io(sock, false);
     }
     let passive = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         if inner.emit_passive {
             inner.emit_passive = false;
             true
@@ -1159,7 +1160,7 @@ fn accept_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8]) 
 // Port of inet_drv.c (tcp_inet_process_exit), OTP-29.1.1.
 fn acceptor_exited(sock: &Arc<Sock>, monitor: u64) {
     {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         let (gone, keep): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut inner.accept_q)
             .into_iter()
             .partition(|waiter| waiter.monitor == Some(monitor));
@@ -1218,7 +1219,7 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
         // Port of inet_drv.c:11795 (tcp_inet_copy), OTP-29.1.1.
         // `active` is not copied here; prim_inet:accept_opts sets it afterwards.
         let born = {
-            let inner = listen.inner.lock().unwrap();
+            let inner = listen.inner.lock();
             Inner {
                 fd: Some(SockFd::new(fd, Arc::downgrade(port))),
                 port: Arc::downgrade(port),
@@ -1991,7 +1992,7 @@ fn save_subscriber(subs: &mut Vec<Pid>, pid: Pid) {
 /// them. Call it where the queue has just drained or been discarded.
 fn send_empty_out_q_msgs(sock: &Sock) {
     let subs = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         if !inner.sendq.is_empty() {
             return;
         }
@@ -2759,7 +2760,7 @@ fn release_unbusy(inner: &mut Inner) {
 
 fn emit_ready(sock: &Sock) {
     let ready = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         std::mem::take(&mut inner.ready)
     };
     for wait in ready {
@@ -3029,7 +3030,7 @@ fn finish_sendfile(sock: &Arc<Sock>, end: SendfileEnd) {
                     );
                 }
                 emit(sock, Out::TcpClosed { owner });
-                if sock.inner.lock().unwrap().exit_on_close {
+                if sock.inner.lock().exit_on_close {
                     driver_exit(sock);
                 }
             }
@@ -3066,7 +3067,7 @@ pub(crate) struct Sock {
 impl Sock {
     /// `driver_sizeq` of the port's output queue, for `port_info(Port, queue_size)`.
     pub(crate) fn out_queue_size(&self) -> usize {
-        self.inner.lock().unwrap().sendq.size()
+        self.inner.lock().sendq.size()
     }
 
     fn new(
@@ -3258,6 +3259,9 @@ struct Inner {
     backlog: i32,
     op_ref: u16,
     rbuf: Vec<u8>,
+    /// The input buffer as a reference-counted binary (`i_buf`), when the packet is delivered
+    /// as a sub-binary of it; the bytes then live here and `rbuf` is empty.
+    rbin: Option<arinsal_term::RefcBinary>,
     /// A receive failure other than a reset (`tcp_recv_error`), reported at close.
     read_error: Option<&'static str>,
     rbuf_start: usize,
@@ -3348,6 +3352,7 @@ impl Default for Inner {
             backlog: 5,
             op_ref: 0,
             rbuf: Vec::new(),
+            rbin: None,
             read_error: None,
             rbuf_start: 0,
             rbuf_end: 0,
@@ -3866,7 +3871,7 @@ enum Out {
 fn output_list_len(sock: &Sock, out: &Out) -> usize {
     match out {
         Out::AsyncData { bytes, .. } | Out::Tcp { bytes, .. } | Out::PortData { bytes, .. } => {
-            let inner = sock.inner.lock().unwrap();
+            let inner = sock.inner.lock();
             output_list_len_from_options(bytes.len(), inner.binary, inner.header)
         }
         Out::Http { packet, binary, .. } | Out::AsyncHttp { packet, binary, .. } => {
@@ -3996,10 +4001,10 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
     match &out {
         Out::Tcp { owner, bytes } => {
             let (binary, header) = {
-                let inner = sock.inner.lock().unwrap();
+                let inner = sock.inner.lock();
                 (inner.binary, inner.header)
             };
-            if let Some(node) = tcp_node(*owner, port, bytes, binary, header) {
+            if let Some(node) = tcp_node(*owner, port, bytes, None, binary, header) {
                 return Some((*owner, node));
             }
         }
@@ -4025,16 +4030,16 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
     // Port of inet_drv.c:3987-4005 (tcp_message uses LOAD_STRING sized to the
     // complete packet), OTP-29.1.1. List-mode packets need two heap words per byte.
     let words = match out {
-        // Fixed-shape status messages: a tuple, a reference and a status tuple at most.
-        Out::AsyncError { .. }
-        | Out::AsyncOk { .. }
-        | Out::AsyncPort { .. }
-        | Out::InetReply { .. }
-        | Out::TcpClosed { .. }
-        | Out::TcpError { .. }
-        | Out::TcpPassive { .. }
-        | Out::EmptyOutQ { .. }
-        | Out::Sendfile { .. } => 32,
+        // Fixed-shape status messages, sized as the term specification of driver_deliver_term:
+        // {inet_async, Port, Ref, ok | {error, R} | {ok, Port}}, {inet_reply, Port, Status, Ref},
+        // {tcp_closed, Port}, {tcp_error, Port, R}, {tcp_passive, Port}, {empty_out_q, Port},
+        // {sendfile, Port, {ok, Lo, Hi} | {error, R}}.
+        Out::AsyncOk { .. } => 5,
+        Out::AsyncError { .. } | Out::AsyncPort { .. } => 8,
+        Out::InetReply { .. } => 11,
+        Out::TcpClosed { .. } | Out::TcpPassive { .. } | Out::EmptyOutQ { .. } => 3,
+        Out::TcpError { .. } => 4,
+        Out::Sendfile { .. } => 8,
         _ => 128usize.saturating_add(output_list_len(sock, &out).saturating_mul(2)),
     };
     // The term is built in the fragment that is queued, as driver_deliver_term does
@@ -4325,10 +4330,10 @@ fn bytes_term(heap: &mut (impl HeapAlloc + ?Sized), bytes: &[u8], binary: bool) 
 
 fn data_term(sock: &Sock, heap: &mut (impl HeapAlloc + ?Sized), bytes: &[u8]) -> Option<Term> {
     let (binary, hsz) = {
-        let inner = sock.inner.lock().unwrap();
+        let inner = sock.inner.lock();
         (inner.binary, inner.header)
     };
-    data_term_with_options(heap, bytes, binary, hsz)
+    data_term_with_options(heap, bytes, None, binary, hsz)
 }
 
 /// Words of the term `data_term_with_options` builds for `len` packet bytes.
@@ -4345,9 +4350,16 @@ fn data_words(len: usize, binary: bool, header: i32) -> usize {
 }
 
 /// `{tcp, Port, Data}` built in its own message node.
-fn tcp_node(to: Pid, port: Term, bytes: &[u8], binary: bool, header: i32) -> Option<MessageNode> {
+fn tcp_node(
+    to: Pid,
+    port: Term,
+    bytes: &[u8],
+    source: Option<(&arinsal_term::RefcBinary, usize)>,
+    binary: bool,
+    header: i32,
+) -> Option<MessageNode> {
     Message::node_built(4 + data_words(bytes.len(), binary, header), |heap| {
-        let data = data_term_with_options(heap, bytes, binary, header)?;
+        let data = data_term_with_options(heap, bytes, source, binary, header)?;
         TermBuilder::new(heap)
             .tuple(&[atom("tcp"), port, data])
             .ok()
@@ -4359,6 +4371,7 @@ fn tcp_node(to: Pid, port: Term, bytes: &[u8], binary: bool, header: i32) -> Opt
 fn data_term_with_options(
     heap: &mut (impl HeapAlloc + ?Sized),
     bytes: &[u8],
+    source: Option<(&arinsal_term::RefcBinary, usize)>,
     binary: bool,
     header: i32,
 ) -> Option<Term> {
@@ -4372,7 +4385,14 @@ fn data_term_with_options(
     if !binary || hsz > bytes.len() {
         return builder.bytes_to_list(bytes).ok();
     }
-    let mut tail = builder.binary(&bytes[hsz..]).ok()?;
+    let rest = bytes.len() - hsz;
+    let mut tail = match source {
+        // Port of io.c (driver_deliver_term, ERL_DRV_BINARY): a large binary is referenced.
+        Some((bin, offset)) if rest > arinsal_drv::ERL_ONHEAP_BINARY_LIMIT => {
+            builder.refc_slice(bin, offset + hsz, rest).ok()?
+        }
+        _ => builder.binary(&bytes[hsz..]).ok()?,
+    };
     for byte in bytes[..hsz].iter().rev() {
         tail = builder
             .cons(Term::small(i64::from(*byte)).unwrap(), tail)
@@ -4398,7 +4418,7 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     let eof = pull(sock);
     // `pull` flushes the output queue too: a sender released by that goes before the close.
     emit_ready(sock);
-    if sock.inner.lock().unwrap().sendfile.is_none() {
+    if sock.inner.lock().sendfile.is_none() {
         send_empty_out_q_msgs(sock);
     }
     satisfy(sock);
@@ -4406,7 +4426,7 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
         on_eof(sock);
     }
     let connect_done = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         if writable_ready && inner.phase == Phase::Connecting {
             poll_connect(&mut inner)
         } else {
@@ -4418,7 +4438,7 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     }
     // A zero timeout is "try once" (inet_drv.c TCP_REQ_RECV timeout == 0).
     let timed_out = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         if inner.recv_timeout_if_empty && inner.recv.is_some() {
             let recv = inner.recv.take().unwrap();
             inner.recv_timeout_if_empty = false;
@@ -4442,7 +4462,7 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     // Passive EOF is remembered; `{active, true}` must still emit `{tcp_closed,S}`.
     deliver_pending_close(sock);
     emit_ready(sock);
-    let busy = sock.inner.lock().unwrap().busy;
+    let busy = sock.inner.lock().busy;
     crate::dist::distribution_port_state_changed(&sock.runtime(), sock.id, busy);
 }
 
@@ -4459,7 +4479,7 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
 /// when the queue is empty).
 fn tcp_inet_output(sock: &Arc<Sock>) {
     let failure = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         // Port of erts/emulator/drivers/common/inet_drv.c:14291-14295, OTP-29.1.1: with
         // TCP_ADDF_SENDFILE set, output continues the file instead of the queue.
         if inner.phase == Phase::Connected && inner.sendfile.is_some() {
@@ -4526,7 +4546,7 @@ fn tcp_inet_output(sock: &Arc<Sock>) {
             );
         }
         emit(sock, Out::TcpClosed { owner });
-        if sock.inner.lock().unwrap().exit_on_close {
+        if sock.inner.lock().exit_on_close {
             driver_exit(sock);
         }
     }
@@ -4536,7 +4556,7 @@ fn tcp_inet_output(sock: &Arc<Sock>) {
 fn deliver_pending_close(sock: &Arc<Sock>) {
     // Port of inet_drv.c:7001 (inet_set_opts active while INET_STATE_CLOSED), OTP-29.1.1.
     let (owner, exit_on_close, delayed_reset) = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         if !inner.peer_closed || inner.closed_sent || !active_is(&inner.active) {
             return;
         }
@@ -4571,9 +4591,9 @@ fn deliver_pending_close(sock: &Arc<Sock>) {
 }
 
 fn satisfy(sock: &Arc<Sock>) {
-    let _io = sock.io.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _io = sock.io.lock();
     let (outs, abandon) = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         let mut outs = Outs::new();
         let port = Term::port(sock.id).unwrap();
         let abandon = take_packets(&sock.handle(), port, &mut inner, &mut outs);
@@ -4635,6 +4655,21 @@ fn take_packets(handle: &PortHandle, port: Term, inner: &mut Inner, outs: &mut O
             if rbuf_len(inner) == 0 {
                 break;
             }
+            if inner.rbin.is_some() && inner.deliver != DELIVER_PORT {
+                let range = inner.rbuf_start..inner.rbuf_end;
+                input_count(inner, range.len());
+                push_frame(
+                    inner,
+                    port,
+                    outs,
+                    DataWho::Active(owner),
+                    Frame::InputBytes(range),
+                );
+                rbuf_reset(inner);
+                note_active(inner, owner, outs);
+                continue;
+            }
+            rbuf_unstage(inner);
             let bytes = if inner.rbuf_start == 0 && inner.rbuf_end == inner.rbuf.len() {
                 std::mem::take(&mut inner.rbuf)
             } else {
@@ -4718,17 +4753,19 @@ fn push_frame(inner: &Inner, port: Term, outs: &mut Outs, who: DataWho, frame: F
     match frame {
         Frame::Bytes(bytes) => push_data(inner, outs, who, bytes),
         Frame::InputBytes(range) if inner.deliver != DELIVER_PORT => {
-            let bytes = &inner.rbuf[range];
+            let bytes = rbuf_slice(inner, range.clone());
             let (binary, header) = (inner.binary, inner.header);
+            // The packet leaves as a sub-binary of the input buffer when that is a binary.
+            let source = inner.rbin.as_ref().map(|bin| (bin, range.start));
             let message = match who {
                 DataWho::Active(owner) => {
-                    tcp_node(owner, port, bytes, binary, header).map(|node| (owner, node))
+                    tcp_node(owner, port, bytes, source, binary, header).map(|node| (owner, node))
                 }
                 DataWho::Async(caller, aref) => {
                     // {inet_async, Port, Ref, {ok, Data}}: a 5-word and a 3-word tuple.
                     let words = 8 + data_words(bytes.len(), binary, header);
                     Message::node_built(words, |heap| {
-                        let data = data_term_with_options(heap, bytes, binary, header)?;
+                        let data = data_term_with_options(heap, bytes, source, binary, header)?;
                         let status = TermBuilder::new(heap).tuple(&[atom("ok"), data]).ok()?;
                         message_async(heap, port, aref, status).map(|term| (caller, term))
                     })
@@ -4739,7 +4776,7 @@ fn push_frame(inner: &Inner, port: Term, outs: &mut Outs, who: DataWho, frame: F
             }
         }
         Frame::InputBytes(range) => {
-            push_data(inner, outs, who, inner.rbuf[range].to_vec());
+            push_data(inner, outs, who, rbuf_slice(inner, range).to_vec());
         }
         Frame::Http(packet) => match who {
             DataWho::Active(owner) if inner.deliver != DELIVER_PORT => {
@@ -4785,7 +4822,10 @@ fn next_frame(inner: &mut Inner) -> Read {
         line_delimiter: inner.delimiter,
     };
     let start = inner.rbuf_start;
-    let input = &inner.rbuf[start..inner.rbuf_end];
+    let input: &[u8] = match &inner.rbin {
+        Some(bin) => &bin.bytes()[start..inner.rbuf_end],
+        None => &inner.rbuf[start..inner.rbuf_end],
+    };
     let parsed = parse_with_state(ty, input, opts, &mut inner.http);
     match parsed {
         PacketResult::Ok { packet, rest } => {
@@ -4810,7 +4850,60 @@ fn next_frame(inner: &mut Inner) -> Read {
 
 // Port of erts/emulator/drivers/common/inet_drv.c:13042 (tcp_deliver), OTP-29.1.1.
 fn rbuf_bytes(inner: &Inner) -> &[u8] {
-    &inner.rbuf[inner.rbuf_start..inner.rbuf_end]
+    rbuf_slice(inner, inner.rbuf_start..inner.rbuf_end)
+}
+
+/// `range` of the input buffer, wherever it lives.
+fn rbuf_slice(inner: &Inner, range: Range<usize>) -> &[u8] {
+    match &inner.rbin {
+        Some(bin) => &bin.bytes()[range],
+        None => &inner.rbuf[range],
+    }
+}
+
+/// Move the buffered bytes of the binary input buffer into the plain one.
+fn rbuf_unstage(inner: &mut Inner) {
+    if let Some(bin) = inner.rbin.take() {
+        inner.rbuf = bin.bytes()[inner.rbuf_start..inner.rbuf_end].to_vec();
+        inner.rbuf_end -= inner.rbuf_start;
+        inner.rbuf_start = 0;
+    }
+}
+
+/// Make room for `extra` more bytes in a binary input buffer: allocate the binary of
+/// `tcp_expand_buffer` holding the buffered bytes and `extra` more.
+// Port of erts/emulator/drivers/common/inet_drv.c (tcp_expand_buffer, tcp_recv: `i_buf` is a
+// driver binary), OTP-29.1.1.
+fn rbuf_stage(inner: &mut Inner, extra: usize) -> bool {
+    let len = rbuf_len(inner);
+    let Some(total) = len.checked_add(extra) else {
+        return false;
+    };
+    if let Some(bin) = &inner.rbin
+        && inner.rbuf_end + extra <= bin.len()
+    {
+        // The Binary is shared once a packet was delivered from it; then it cannot be
+        // written and the buffered rest moves to a new one.
+        if inner
+            .rbin
+            .as_mut()
+            .is_some_and(|bin| bin.bytes_mut_unique().is_some())
+        {
+            return true;
+        }
+    }
+    let Ok(mut bin) = arinsal_term::RefcBinary::new_zeroed(total) else {
+        return false;
+    };
+    let Some(buf) = bin.bytes_mut_unique() else {
+        return false;
+    };
+    buf[..len].copy_from_slice(rbuf_bytes(inner));
+    inner.rbuf = Vec::new();
+    inner.rbin = Some(bin);
+    inner.rbuf_start = 0;
+    inner.rbuf_end = len;
+    true
 }
 
 // Port of inet_drv.c (`tcp_deliver`/`tcp_remain` valid range), OTP-29.1.1.
@@ -4825,6 +4918,7 @@ fn rbuf_reset(inner: &mut Inner) {
     inner.rbuf_start = 0;
     inner.rbuf_end = 0;
     inner.rbuf = Vec::new();
+    inner.rbin = None;
 }
 
 // Port of inet_drv.c (`tcp_deliver`), OTP-29.1.1.
@@ -4835,7 +4929,7 @@ fn rbuf_consume(inner: &mut Inner, len: usize) {
 // Port of inet_drv.c (`tcp_deliver`), OTP-29.1.1.
 fn rbuf_take(inner: &mut Inner, len: usize) -> Vec<u8> {
     let start = inner.rbuf_start;
-    let bytes = inner.rbuf[start..start + len].to_vec();
+    let bytes = rbuf_slice(inner, start..start + len).to_vec();
     rbuf_consume(inner, len);
     if inner.rbuf_start == inner.rbuf_end {
         rbuf_reset(inner);
@@ -4845,6 +4939,9 @@ fn rbuf_take(inner: &mut Inner, len: usize) -> Vec<u8> {
 
 // Port of inet_drv.c (`tcp_restart_input`), OTP-29.1.1.
 fn rbuf_compact(inner: &mut Inner) {
+    if inner.rbin.is_some() {
+        return;
+    }
     if inner.rbuf_start != 0 {
         let len = rbuf_len(inner);
         inner.rbuf.copy_within(inner.rbuf_start..inner.rbuf_end, 0);
@@ -5005,13 +5102,13 @@ fn tcp_input_ready(inner: &Inner) -> bool {
 
 // Port of erts/emulator/drivers/common/inet_drv.c:13130 (tcp_recv), OTP-29.1.1.
 fn pull(sock: &Arc<Sock>) -> bool {
-    let phase = sock.inner.lock().unwrap().phase;
+    let phase = sock.inner.lock().phase;
     if phase == Phase::Listening {
         pull_accept(sock);
         return false;
     }
     let (eof, bytes_read) = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         // Port of inet_drv.c:2819 (sock_select only while active or receiving).
         // A passive socket must leave the FIN unread so `{active, true}` still
         // observes it and emits `{tcp_closed, S}`.
@@ -5033,19 +5130,37 @@ fn pull(sock: &Arc<Sock>) -> bool {
             // announced remaining size once and is read in place; the reserved pages stay
             // untouched until data arrives, so a bogus 4 GiB header costs address space only.
             let read_size = tcp_read_size(&inner);
-            rbuf_compact(&mut inner);
+            // A packet that will not fit an on-heap binary is read into a binary of its own and
+            // delivered as a sub-binary of it (`i_buf` of tcp_recv is a driver binary).
+            let staged = inner.binary
+                && inner.deliver != DELIVER_PORT
+                && (inner.htype != 0 || active_is(&inner.active))
+                && rbuf_len(&inner).saturating_add(read_size)
+                    > arinsal_drv::ERL_ONHEAP_BINARY_LIMIT
+                && rbuf_stage(&mut inner, read_size);
+            if !staged {
+                rbuf_unstage(&mut inner);
+                rbuf_compact(&mut inner);
+            }
             let read_start = inner.rbuf_end;
-            inner.rbuf.truncate(read_start);
-            if inner.rbuf.try_reserve_exact(read_size).is_err() {
-                // tcp_expand_buffer failing is tcp_recv_error(ENOMEM).
-                inner.read_error = Some("enomem");
-                eof = true;
-                break;
+            if !staged {
+                inner.rbuf.truncate(read_start);
+                if inner.rbuf.try_reserve_exact(read_size).is_err() {
+                    // tcp_expand_buffer failing is tcp_recv_error(ENOMEM).
+                    inner.read_error = Some("enomem");
+                    eof = true;
+                    break;
+                }
             }
             let read = {
-                let Inner { fd, rbuf, .. } = &mut *inner;
+                let Inner { fd, rbuf, rbin, .. } = &mut *inner;
                 let fd = &fd.as_ref().unwrap().fd;
-                rustix::io::read(fd, rustix::buffer::spare_capacity(rbuf))
+                match rbin.as_mut().and_then(|bin| bin.bytes_mut_unique()) {
+                    Some(buf) if staged => {
+                        rustix::io::read(fd, &mut buf[read_start..read_start + read_size])
+                    }
+                    _ => rustix::io::read(fd, rustix::buffer::spare_capacity(rbuf)),
+                }
             };
             match read {
                 Ok(n) if n > 0 => {
@@ -5087,7 +5202,7 @@ fn pull(sock: &Arc<Sock>) -> bool {
 fn pull_accept(sock: &Arc<Sock>) {
     loop {
         let accepted = {
-            let inner = sock.inner.lock().unwrap();
+            let inner = sock.inner.lock();
             if inner.accept_q.is_empty() {
                 return;
             }
@@ -5096,7 +5211,7 @@ fn pull_accept(sock: &Arc<Sock>) {
         match accepted {
             Some(Ok(fd)) => {
                 let waiter = {
-                    let mut inner = sock.inner.lock().unwrap();
+                    let mut inner = sock.inner.lock();
                     inner.accept_q.pop_front().inspect(|waiter| {
                         drop_pending(&mut inner, waiter.caller, waiter.aref);
                         demonitor_waiter(&inner, waiter);
@@ -5108,7 +5223,7 @@ fn pull_accept(sock: &Arc<Sock>) {
             }
             Some(Err(err)) => {
                 let waiter = {
-                    let mut inner = sock.inner.lock().unwrap();
+                    let mut inner = sock.inner.lock();
                     inner.accept_q.pop_front().inspect(|waiter| {
                         drop_pending(&mut inner, waiter.caller, waiter.aref);
                         demonitor_waiter(&inner, waiter);
@@ -5135,7 +5250,7 @@ fn on_eof(sock: &Arc<Sock>) {
     // A sender blocked on the queue is released first: the queue is dropped, the port is no
     // longer busy and the sender gets `{error, closed}` (tcp_clear_output).
     let (blocked, reason) = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         if inner.peer_closed || !inner.busy {
             (Vec::new(), "closed")
         } else {
@@ -5156,7 +5271,7 @@ fn on_eof(sock: &Arc<Sock>) {
         );
     }
     let (active, exit_on_close, owner, reason) = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         if inner.peer_closed {
             return;
         }
@@ -5187,7 +5302,7 @@ fn on_eof(sock: &Arc<Sock>) {
                     result: Err(tcp_sendfile_aborted(err)),
                 },
             );
-            inner = sock.inner.lock().unwrap();
+            inner = sock.inner.lock();
         }
         if !active {
             if inner.exit_on_close {
@@ -5280,7 +5395,7 @@ fn sock_select(sock: &Arc<Sock>) {
     let Some(port) = sock.port() else {
         return;
     };
-    select_locked(&port, &mut sock.inner.lock().unwrap());
+    select_locked(&port, &mut sock.inner.lock());
 }
 
 fn select_locked(port: &DriverPort, inner: &mut Inner) {
@@ -5366,7 +5481,7 @@ fn set_port_timer(port: &Arc<DriverPort>, timer: Option<Option<Instant>>) {
 fn expire(sock: &Arc<Sock>) {
     let now = Instant::now();
     let (due, sends, close) = {
-        let mut inner = sock.inner.lock().unwrap();
+        let mut inner = sock.inner.lock();
         let mut due = Vec::new();
         let mut keep = VecDeque::new();
         while let Some(waiter) = inner.accept_q.pop_front() {

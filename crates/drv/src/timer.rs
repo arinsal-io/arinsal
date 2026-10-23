@@ -114,7 +114,7 @@ fn serve(service: &Service) {
 impl DriverPort {
     /// Port of erl_hl_timer.c:3031 (erts_set_port_timer). `tmo` in ms.
     pub fn set_timer(self: &Arc<Self>, tmo: i64) {
-        let mut timer = self.timer.lock().unwrap();
+        let mut timer = self.timer.lock();
         if let PortTimer::Armed {
             handle: Some(handle),
             ..
@@ -163,7 +163,7 @@ impl DriverPort {
     /// Port of erl_hl_timer.c:3063 (erts_cancel_port_timer): an expired timer whose task
     /// is still queued is aborted too.
     pub fn cancel_timer(&self) {
-        let previous = std::mem::replace(&mut *self.timer.lock().unwrap(), PortTimer::None);
+        let previous = std::mem::replace(&mut *self.timer.lock(), PortTimer::None);
         if let PortTimer::Armed {
             handle: Some(handle),
             ..
@@ -176,7 +176,7 @@ impl DriverPort {
     /// Port of erl_hl_timer.c:3082 (erts_read_port_timer) and io.c:6930
     /// (driver_read_timer): ms left, 0 without a timer.
     pub fn read_timer(&self) -> i64 {
-        match *self.timer.lock().unwrap() {
+        match *self.timer.lock() {
             PortTimer::None | PortTimer::TimedOut { .. } => 0,
             PortTimer::Armed { pos, .. } => {
                 // get_time_left
@@ -188,7 +188,7 @@ impl DriverPort {
 
     /// The timer service saw timer `epoch` expire (`port_timeout_callback`).
     fn timer_expired(self: &Arc<Self>, epoch: u64) {
-        let mut timer = self.timer.lock().unwrap();
+        let mut timer = self.timer.lock();
         if matches!(*timer, PortTimer::Armed { epoch: g, .. } if g == epoch) {
             *timer = PortTimer::TimedOut { epoch };
             drop(timer);
@@ -201,7 +201,7 @@ impl DriverPort {
     /// Returns the reductions of the task.
     pub(crate) fn run_timeout_task(&self, epoch: u64) -> i32 {
         {
-            let mut timer = self.timer.lock().unwrap();
+            let mut timer = self.timer.lock();
             if !matches!(*timer, PortTimer::TimedOut { epoch: g } if g == epoch) {
                 return 0; // cancelled or replaced while queued
             }

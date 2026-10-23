@@ -2926,6 +2926,28 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         self.install_refc_binary(binary, bit_len)
     }
 
+    /// A sub-binary of `len` bytes at `offset` of a refc binary the caller keeps, as the
+    /// driver delivers a slice of its input buffer without copying it
+    /// (`driver_deliver_term` with `ERL_DRV_BINARY`, io.c).
+    pub fn refc_slice(
+        &mut self,
+        binary: &RefcBinary,
+        offset: usize,
+        len: usize,
+    ) -> Result<Term, TermError> {
+        if offset.checked_add(len).is_none_or(|end| end > binary.len()) {
+            return Err(TermError::BadArg);
+        }
+        let owner = binary.share().ok_or(TermError::SystemLimit)?;
+        self.install_refc_owner(
+            owner,
+            binary.as_ptr() as usize & 3,
+            (binary.len() / 8) as u64,
+            offset * 8,
+            len * 8,
+        )
+    }
+
     fn install_refc_binary(
         &mut self,
         binary: RefcBinary,
@@ -2933,7 +2955,17 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     ) -> Result<Term, TermError> {
         let adjustment = binary.as_ptr() as usize & 3;
         let size_words = (binary.len() / 8) as u64;
-        let binary_owner = binary.into_reference();
+        self.install_refc_owner(binary.into_reference(), adjustment, size_words, 0, bit_len)
+    }
+
+    fn install_refc_owner(
+        &mut self,
+        binary_owner: arinsal_alloc::raw::OwnedBinaryRef,
+        adjustment: usize,
+        size_words: u64,
+        start_bit: usize,
+        bit_len: usize,
+    ) -> Result<Term, TermError> {
         let binary_header = binary_owner.header_ptr();
         let ref_ptr = self.words(8)?;
         // SAFETY: the same allocation reserves three BinRef and five SubBits words.
@@ -2944,8 +2976,8 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             *ref_ptr.add(1) = binary_header as u64;
             *sub_ptr = (4 << 6) | SUB_BITS;
             *sub_ptr.add(1) = binary_header.wrapping_add(4) as u64 & !3;
-            *sub_ptr.add(2) = (adjustment * 8) as u64;
-            *sub_ptr.add(3) = (bit_len + adjustment * 8) as u64;
+            *sub_ptr.add(2) = (adjustment * 8 + start_bit) as u64;
+            *sub_ptr.add(3) = (adjustment * 8 + start_bit + bit_len) as u64;
             *sub_ptr.add(4) = Term::from_ptr(ref_ptr, 2).bits();
         }
         self.heap

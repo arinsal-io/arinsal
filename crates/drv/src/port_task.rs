@@ -6,9 +6,10 @@
 //! the port; the port is put on its run queue and a normal scheduler runs its tasks with
 //! the port lock held (arinsal-sched executes [`RunPort`] entries between processes).
 
+use parking_lot::{Mutex, MutexGuard};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
 
 use arinsal_sched::{PortExecution, PortRunQueue, RunPort};
 
@@ -143,7 +144,7 @@ impl PortTask {
     fn take_callback(&self) -> Option<SigCallback> {
         match &self.kind {
             TaskKind::ProcSig { callback, .. } | TaskKind::DistCmd(callback) => {
-                callback.lock().unwrap().take()
+                callback.lock().take()
             }
             TaskKind::Timeout(_) | TaskKind::Io { .. } => None,
         }
@@ -257,11 +258,11 @@ impl PortSched {
     }
 
     fn inq(&self) -> MutexGuard<'_, InQueue> {
-        self.inq.lock().unwrap()
+        self.inq.lock()
     }
 
     fn local(&self) -> MutexGuard<'_, LocalQueue> {
-        self.local.lock().unwrap()
+        self.local.lock()
     }
 }
 
@@ -287,7 +288,7 @@ impl DriverPort {
     }
 
     fn bpq_enabled(&self) -> bool {
-        self.msgq_limits.lock().unwrap().enabled
+        self.msgq_limits.lock().enabled
     }
 
     // Port of erts/emulator/beam/erl_port_task.c:646 (check_unset_busy_port_q), OTP-29.1.1.
@@ -296,7 +297,7 @@ impl DriverPort {
         {
             let mut inq = self.sched.inq();
             let qsize = self.sched.bpq_size.load(Ordering::Acquire);
-            let low = self.msgq_limits.lock().unwrap().low;
+            let low = self.msgq_limits.lock().low;
             if qsize < low {
                 let old = self
                     .sched
@@ -330,7 +331,7 @@ impl DriverPort {
         if flags & (PTS_FLG_CHK_UNSET_BUSY_PORT_Q | PTS_FLG_BUSY_PORT_Q) != PTS_FLG_BUSY_PORT_Q {
             return;
         }
-        if qsz < self.msgq_limits.lock().unwrap().low {
+        if qsz < self.msgq_limits.lock().low {
             self.sched.or(PTS_FLG_CHK_UNSET_BUSY_PORT_Q);
         }
     }
@@ -349,7 +350,7 @@ impl DriverPort {
         if flags & PTS_FLG_BUSY_PORT_Q == 0 {
             return;
         }
-        if qsz < self.msgq_limits.lock().unwrap().low {
+        if qsz < self.msgq_limits.lock().low {
             self.check_unset_busy_port_q(flags);
         }
     }
@@ -360,7 +361,7 @@ impl DriverPort {
             return flags;
         }
         let qsz = self.sched.bpq_size.fetch_add(size, Ordering::AcqRel) + size;
-        let limits = *self.msgq_limits.lock().unwrap();
+        let limits = *self.msgq_limits.lock();
         if flags & PTS_FLG_BUSY_PORT_Q == 0 && qsz > limits.high {
             flags = self.sched.or(PTS_FLG_BUSY_PORT_Q) | PTS_FLG_BUSY_PORT_Q;
             if self.sched.bpq_size.load(Ordering::Acquire) < limits.low {

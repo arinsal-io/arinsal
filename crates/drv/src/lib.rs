@@ -47,11 +47,12 @@ mod errno_table {
     include!(concat!(env!("OUT_DIR"), "/errno.rs"));
 }
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::mem::offset_of;
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 pub use binary::ErlDrvBinary;
 pub use ext::{BUSY_MSGQ_DISABLED, ErlDrvMonitor, InitAck};
@@ -233,7 +234,7 @@ fn dl_errcodes() -> &'static Mutex<Vec<String>> {
 
 // Port of erts/emulator/sys/unix/erl_unix_sys_ddll.c:63 (find_errcode), OTP-29.1.1.
 fn find_errcode(text: &str) -> i32 {
-    let mut codes = dl_errcodes().lock().unwrap();
+    let mut codes = dl_errcodes().lock();
     let index = codes.iter().position(|s| s == text).unwrap_or_else(|| {
         codes.push(text.to_owned());
         codes.len() - 1
@@ -274,7 +275,6 @@ pub fn ddll_error(code: i32) -> String {
             let index = (ERL_DE_DYNAMIC_ERROR_OFFSET - code) as usize;
             dl_errcodes()
                 .lock()
-                .unwrap()
                 .get(index)
                 .cloned()
                 .unwrap_or_else(|| "Unknown dlload error".into())
@@ -391,7 +391,7 @@ impl Driver {
         if let Some(init) = entry.init {
             // SAFETY: the entry's init takes no arguments and runs once after loading.
             if unsafe { init() } != 0 {
-                *driver.library.lock().unwrap() = 0;
+                *driver.library.lock() = 0;
                 return fail(ERL_DE_LOAD_ERROR_FAILED_INIT);
             }
         }
@@ -457,7 +457,7 @@ impl Driver {
     /// Port of erl_bif_ddll.c:1569 (do_unload_driver_entry): `finish`, then `dlclose`.
     /// The caller guarantees no port of this driver is alive.
     pub fn unload(&self) {
-        let handle = std::mem::take(&mut *self.library.lock().unwrap());
+        let handle = std::mem::take(&mut *self.library.lock());
         if handle == 0 {
             return;
         }
@@ -712,7 +712,6 @@ fn registry() -> &'static Mutex<HashMap<usize, Weak<DriverPort>>> {
 pub(crate) fn port_of(handle: DrvPortPtr) -> Option<Arc<DriverPort>> {
     registry()
         .lock()
-        .unwrap()
         .get(&(handle as usize))
         .and_then(Weak::upgrade)
 }
@@ -721,7 +720,6 @@ pub(crate) fn port_of(handle: DrvPortPtr) -> Option<Arc<DriverPort>> {
 pub(crate) fn port_by_id(id: u64) -> Option<Arc<DriverPort>> {
     registry()
         .lock()
-        .unwrap()
         .values()
         .filter_map(Weak::upgrade)
         .find(|port| port.id == id)
@@ -758,7 +756,6 @@ impl DriverPort {
         });
         registry()
             .lock()
-            .unwrap()
             .insert(port.handle() as usize, Arc::downgrade(&port));
         port
     }
@@ -863,7 +860,7 @@ impl DriverPort {
     /// Port of io.c:542 (erts_open_driver, the `start` call). `command` is the
     /// whole `open_port` name; `caller` the raw pid term of the opening process.
     pub fn start(&self, command: &str, caller: u64) -> Result<(), StartError> {
-        *self.name.lock().unwrap() = command.to_owned();
+        *self.name.lock() = command.to_owned();
         let mut command = CString::new(command)
             .map_err(|_| StartError::Badarg)?
             .into_bytes_with_nul();
@@ -893,7 +890,7 @@ impl DriverPort {
     /// Drop a port whose `start` failed (io.c:747 error cleanup, no `stop`).
     pub fn abandon(&self) {
         self.state.fetch_or(SFLG_TERMINATING, Ordering::AcqRel);
-        registry().lock().unwrap().remove(&(self.handle() as usize));
+        registry().lock().remove(&(self.handle() as usize));
         self.release_resources();
     }
 
@@ -908,7 +905,7 @@ impl DriverPort {
         }
         if let Some(size) = line {
             flags |= SFLG_LINEBUF_IO;
-            *self.linebuf.lock().unwrap() = Some(LineBuf::new(size));
+            *self.linebuf.lock() = Some(LineBuf::new(size));
         }
         self.state.fetch_or(flags, Ordering::AcqRel);
     }
@@ -1187,7 +1184,7 @@ impl DriverPort {
             unsafe { stop(self.data()) };
             self.state.fetch_and(!SFLG_STOPPING, Ordering::AcqRel);
         }
-        registry().lock().unwrap().remove(&(self.handle() as usize));
+        registry().lock().remove(&(self.handle() as usize));
         self.release_resources();
         self.sched_free();
         true
@@ -1211,7 +1208,7 @@ impl DriverPort {
         let binary = state & SFLG_BINARY_IO != 0;
         if state & SFLG_LINEBUF_IO != 0 {
             // Port of io.c:3460 (deliver_linebuf_message).
-            let lines = match self.linebuf.lock().unwrap().as_mut() {
+            let lines = match self.linebuf.lock().as_mut() {
                 Some(linebuf) => linebuf.read(data.unwrap_or_default()),
                 None => Vec::new(),
             };
@@ -1230,7 +1227,7 @@ impl DriverPort {
         let state = self.state.load(Ordering::Acquire);
         if eof && state & SFLG_LINEBUF_IO != 0 {
             // Port of io.c:3478 (flush_linebuf_messages).
-            let lines = match self.linebuf.lock().unwrap().as_mut() {
+            let lines = match self.linebuf.lock().as_mut() {
                 Some(linebuf) => linebuf.flush(),
                 None => Vec::new(),
             };
