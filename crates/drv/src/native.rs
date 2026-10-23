@@ -27,6 +27,15 @@ pub trait NativeDriver: Send + Sync + 'static {
     fn output_owned(&self, port: &DriverPort, data: Vec<u8>) {
         self.output(port, &data);
     }
+    /// `outputv` with a command whose reference-counted binaries are referenced, not copied
+    /// (the `ErlIOVec` with `binv`). The default flattens it for `output_owned`.
+    fn outputv_owned(&self, port: &DriverPort, pieces: Vec<crate::CommandPiece>) {
+        let mut data = Vec::new();
+        for piece in &pieces {
+            data.extend_from_slice(piece.bytes());
+        }
+        self.output_owned(port, data);
+    }
     /// `control`; `None` is `badarg`.
     fn control(&self, _port: &DriverPort, _command: u32, _data: &[u8]) -> Option<ControlReply> {
         None

@@ -113,6 +113,8 @@ fn caller_data(pid: Pid) -> u64 {
 /// pieces of `erts_ioq_iolist_to_vec` (`true` marks a reference-counted binary).
 enum CommandData {
     Flat(Vec<u8>),
+    /// A native driver's vector with referenced refc binaries (`outputv`).
+    Iov(Vec<arinsal_drv::CommandPiece>),
     Pieces(Vec<(Vec<u8>, bool)>),
 }
 
@@ -120,6 +122,7 @@ impl CommandData {
     fn size(&self) -> usize {
         match self {
             CommandData::Flat(bytes) => bytes.len(),
+            CommandData::Iov(pieces) => pieces.iter().map(|piece| piece.bytes().len()).sum(),
             CommandData::Pieces(pieces) => pieces.iter().map(|(bytes, _)| bytes.len()).sum(),
         }
     }
@@ -155,6 +158,7 @@ fn call_driver_output(
     let size = data.size();
     let done = match data {
         CommandData::Flat(bytes) => drv.output_owned(bytes, caller_data(caller)),
+        CommandData::Iov(pieces) => drv.outputv_owned(pieces, caller_data(caller)),
         CommandData::Pieces(pieces) => drv.output(&io_views(&pieces), caller_data(caller)),
     };
     if done {
@@ -194,7 +198,10 @@ pub(crate) fn output(
     let try_call = sched_flags & (invalid_flags | PTS_FLGS_FORCE_SCHEDULE_OP) == 0;
     // A native driver has no `outputv`: its command data is one flat buffer.
     let command = if drv.driver().is_native() {
-        iodata(data).map(CommandData::Flat)
+        command_pieces(data).map(|mut pieces| match pieces.as_mut_slice() {
+            [arinsal_drv::CommandPiece::Bytes(bytes)] => CommandData::Flat(std::mem::take(bytes)),
+            _ => CommandData::Iov(pieces.into_vec()),
+        })
     } else {
         let mut pieces = Vec::new();
         io_pieces(data, &mut pieces).map(|()| CommandData::Pieces(pieces))
@@ -211,6 +218,15 @@ pub(crate) fn output(
     if crate::trace::tracing_enabled() {
         let views = match &command {
             CommandData::Flat(bytes) => vec![arinsal_drv::IoPiece::Copied(bytes)],
+            CommandData::Iov(pieces) => pieces
+                .iter()
+                .map(|piece| match piece {
+                    arinsal_drv::CommandPiece::Bytes(bytes) => arinsal_drv::IoPiece::Copied(bytes),
+                    arinsal_drv::CommandPiece::Refc(segment) => {
+                        arinsal_drv::IoPiece::Refc(segment.bytes())
+                    }
+                })
+                .collect(),
             CommandData::Pieces(pieces) => io_views(pieces),
         };
         let segments = drv.outputv_trace_segments(&views);
