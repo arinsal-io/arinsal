@@ -1444,6 +1444,11 @@ fn flatmap_key_cmp(a: &OwnedTerm, b: &OwnedTerm) -> Ordering {
 
 enum Work<'a> {
     Term(&'a OwnedTerm),
+    // Port of external.c (enc_term_int), OTP-29.1.1: a tuple array cursor.
+    Tuple {
+        elements: &'a [OwnedTerm],
+        next: usize,
+    },
     PatchFun(usize),
 }
 
@@ -1502,10 +1507,21 @@ fn encode_terms_into(
         opts.compressed.is_none_or(|n| n <= 9),
         "compression level must be 0..=9"
     );
-    let mut work = Vec::with_capacity(terms.len());
-    work.extend(terms.iter().rev().copied().map(Work::Term));
-    while let Some(item) = work.pop() {
+    let mut work = Vec::with_capacity(terms.len().saturating_sub(1));
+    work.extend(terms.iter().skip(1).rev().copied().map(Work::Term));
+    let mut current = terms.first().copied();
+    while let Some(item) = current.take().map(Work::Term).or_else(|| work.pop()) {
         let t = match item {
+            Work::Tuple { elements, next } => {
+                current = Some(&elements[next]);
+                if next + 1 < elements.len() {
+                    work.push(Work::Tuple {
+                        elements,
+                        next: next + 1,
+                    });
+                }
+                continue;
+            }
             Work::PatchFun(pos) => {
                 // Port of erts/emulator/beam/external.c:3350-3362, OTP-29.1.1.
                 // OTP measures from the size field, so the count includes itself.
@@ -1574,8 +1590,14 @@ fn encode_terms_into(
                     out.push(105);
                     out.extend_from_slice(&(v.len() as u32).to_be_bytes());
                 }
-                for e in v.iter().rev() {
-                    work.push(Work::Term(e));
+                if !v.is_empty() {
+                    current = Some(&v[0]);
+                    if v.len() > 1 {
+                        work.push(Work::Tuple {
+                            elements: v,
+                            next: 1,
+                        });
+                    }
                 }
             }
             OwnedTerm::Map(v) => {
