@@ -233,6 +233,7 @@ impl ThrProgress {
         self.parked[id].store(false, Ordering::SeqCst);
         if let Some(thread) = self.sleepers[id].get() {
             thread.unpark();
+            crate::interrupt_if_poll_sleeper(thread);
         }
     }
 

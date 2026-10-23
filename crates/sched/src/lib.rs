@@ -114,6 +114,22 @@ static DOING_SYS_SCHEDULE: AtomicBool = AtomicBool::new(false);
 /// `function_calls`: reductions since the last system-level check.
 static FUNCTION_CALLS: AtomicU32 = AtomicU32::new(0);
 
+/// The scheduler thread asleep in the scheduler pollset, for wakers that only know the thread
+/// (`ssi_wake` of a managed thread, thread progress).
+static POLL_SLEEPER: Mutex<Option<thread::ThreadId>> = Mutex::new(None);
+static POLL_SLEEPER_SET: AtomicBool = AtomicBool::new(false);
+
+/// Interrupt the scheduler pollset when `thread` is the scheduler sleeping in it.
+// Port of erts/emulator/beam/erl_process.c (ssi_wake: ERTS_SSI_FLG_POLL_SLEEPING), OTP-29.1.1.
+pub(crate) fn interrupt_if_poll_sleeper(thread: &thread::Thread) {
+    if POLL_SLEEPER_SET.load(Ordering::SeqCst)
+        && *POLL_SLEEPER.lock().unwrap() == Some(thread.id())
+        && let Some(poll) = SCHED_POLL.get()
+    {
+        poll.interrupt();
+    }
+}
+
 /// Install the scheduler pollset.
 pub fn set_sched_poll(poll: Arc<dyn SchedPoll>) {
     let _ = SCHED_POLL.set(poll);
@@ -7281,6 +7297,7 @@ impl<T: Task> Drop for Scheduler<T> {
                 flag.store(false, Ordering::SeqCst);
             }
             handle.thread().unpark();
+            interrupt_if_poll_sleeper(handle.thread());
         }
         // The last handle may drop on a worker (e.g. a process exiting while the owner already
         // released its handle); that worker cannot join itself and stops on its own.
@@ -7328,6 +7345,7 @@ impl<T: Task> Scheduler<T> {
                 flag.store(false, Ordering::SeqCst);
             }
             handle.thread().unpark();
+            interrupt_if_poll_sleeper(handle.thread());
         }
         self.inner.table.release_all();
     }
@@ -8600,10 +8618,13 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
                 // Port of erts/emulator/beam/erl_process.c (scheduler_wait: "We sleep in
                 // check_io, only for normal schedulers"), OTP-29.1.1.
                 inner.poll_sleeping[id].store(true, Ordering::SeqCst);
+                *POLL_SLEEPER.lock().unwrap() = Some(thread::current().id());
+                POLL_SLEEPER_SET.store(true, Ordering::SeqCst);
                 if inner.parked[id].load(Ordering::SeqCst) && !inner.stopped.load(Ordering::Acquire)
                 {
                     poll.poll(wait_ns.map(Duration::from_nanos));
                 }
+                POLL_SLEEPER_SET.store(false, Ordering::SeqCst);
                 inner.poll_sleeping[id].store(false, Ordering::SeqCst);
                 clear_sys_scheduling();
             } else if let Some(ns) = wait_ns {
