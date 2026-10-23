@@ -1578,7 +1578,10 @@ pub fn compile_parsed_module_with_options(
             continue;
         }
         let (name, arity, label) = function_identity(&ops, beam);
-        if function_allowlist.is_some_and(|list| !function_allowlist_contains(list, &name, arity)) {
+        if function_allowlist.is_some_and(|list| !function_allowlist_contains(list, &name, arity))
+            || std::env::var("ARINSAL_JIT_SKIPF")
+                .is_ok_and(|list| function_allowlist_contains(&list, &name, arity))
+        {
             unported.push(UnportedFunction {
                 name,
                 arity,
