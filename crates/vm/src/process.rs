@@ -829,6 +829,40 @@ impl Message {
         Ok(node)
     }
 
+    /// A node for a message built directly in its own inline heap fragment: the driver's
+    /// `erts_factory_message_create` takes `erts_alloc_message_heap(need)`, builds the term
+    /// there and keeps the combined node. `build` returns the term, or `None` when it cannot.
+    // Port of erts/emulator/beam/erl_message.c (erts_factory_message_create, erts_alloc_message_heap)
+    // and io.c (driver_deliver_term), OTP-29.1.1.
+    pub(crate) fn node_built(
+        from: Pid,
+        words: usize,
+        build: impl FnOnce(&mut arinsal_term::message::FragmentMut<'_>) -> Option<Term>,
+    ) -> Option<MessageNode> {
+        let mut message = Self::immediate(Term::NIL);
+        message.combined = words != 0;
+        let mut node = arinsal_sched::OwnedSignal::with_heap_fragment(
+            Event {
+                from,
+                payload: Payload::Message(message),
+            },
+            words,
+        );
+        let term = build(&mut node.heap_fragment()?)?;
+        if let Payload::Message(message) = &mut node.payload {
+            message.term = term;
+        }
+        Some(node)
+    }
+
+    /// This message in a signal node from `from`, as a send allocates one.
+    pub(crate) fn into_node(self, from: Pid) -> MessageNode {
+        arinsal_sched::OwnedSignal::new(Event {
+            from,
+            payload: Payload::Message(self),
+        })
+    }
+
     fn immediate(term: Term) -> Self {
         Self {
             term,

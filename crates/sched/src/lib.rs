@@ -5917,16 +5917,29 @@ impl<T: Task> Scheduler<T> {
         if messages.is_empty() {
             return Ok(());
         }
-        self.inner.publish_held_monitor_for(to, None);
-        let mut events = messages
-            .into_iter()
-            .map(|message| {
-                OwnedSignal::new(Event {
-                    from,
-                    payload: Payload::Message(message),
+        self.send_node_block(
+            to,
+            messages
+                .into_iter()
+                .map(|message| {
+                    OwnedSignal::new(Event {
+                        from,
+                        payload: Payload::Message(message),
+                    })
                 })
-            })
-            .collect();
+                .collect(),
+        )
+    }
+    /// [`Self::send_block`] of message nodes the sender allocated.
+    pub fn send_node_block(
+        &self,
+        to: Pid,
+        mut events: Vec<OwnedSignal<Event<T::Message>>>,
+    ) -> Result<(), Error> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.inner.publish_held_monitor_for(to, None);
         let process = self.inner.table.lookup(to).ok_or(Error::NoProcess)?;
         self.inner
             .deliver_block(&process, &mut events, None, true, false)

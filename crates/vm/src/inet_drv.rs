@@ -10,7 +10,7 @@
 
 use crate::VmError;
 use crate::port::PortHandle;
-use crate::process::{Message, Runtime};
+use crate::process::{Message, MessageNode, Runtime};
 use arinsal_alloc::typed::ErtsAlcType;
 use arinsal_drv::{ControlReply, DriverPort, NativeDriver};
 use arinsal_packet::{
@@ -18,7 +18,7 @@ use arinsal_packet::{
     parse_with_state,
 };
 use arinsal_sched::Pid;
-use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
+use arinsal_term::{HeapAlloc, ProcessHeap, Term, TermBuilder, global_atoms};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -3738,7 +3738,7 @@ enum Out {
     },
     TcpMessage {
         to: Pid,
-        message: Message,
+        message: MessageNode,
     },
     TcpClosed {
         owner: Pid,
@@ -3842,7 +3842,7 @@ fn emit(sock: &Sock, out: Out) {
     let Some((to, message)) = output_message(sock, out) else {
         return;
     };
-    let _ = sock.handle().scheduler().send(to, to, message);
+    let _ = sock.handle().scheduler().send_node(to, message);
 }
 
 /// Deliver the messages of one port task. Each receiver's ordered output is published as a
@@ -3858,7 +3858,7 @@ fn emit_block(sock: &Sock, mut outs: Outs) {
         }
         return;
     }
-    let mut pending: Vec<(Pid, Vec<Message>)> = Vec::new();
+    let mut pending: Vec<(Pid, Vec<MessageNode>)> = Vec::new();
     for out in outs {
         let Some((to, message)) = output_message(sock, out) else {
             continue;
@@ -3875,14 +3875,14 @@ fn emit_block(sock: &Sock, mut outs: Outs) {
     let sched = sock.handle().scheduler();
     for (to, mut messages) in pending {
         if messages.len() == 1 {
-            let _ = sched.send(to, to, messages.remove(0));
+            let _ = sched.send_node(to, messages.remove(0));
         } else {
-            let _ = sched.send_block(to, to, messages);
+            let _ = sched.send_node_block(to, messages);
         }
     }
 }
 
-fn output_message(sock: &Sock, out: Out) -> Option<(Pid, Message)> {
+fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
     // Distribution ports feed the emulator decoder, not the port owner.
     // Port of inet_drv.c + dist.c:2017 (erts_net_message), OTP-29.1.1.
     if let Out::PortData { bytes, .. } = &out
@@ -3902,6 +3902,36 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, Message)> {
         out => out,
     };
     let port = Term::port(sock.id).unwrap();
+    // The hot shapes are built in the node's own heap fragment, sized exactly as
+    // driver_deliver_term sizes its term specification (io.c erts_factory_message_create).
+    match &out {
+        Out::Tcp { owner, bytes } => {
+            let (binary, header) = {
+                let inner = sock.inner.lock().unwrap();
+                (inner.binary, inner.header)
+            };
+            if let Some(node) = tcp_node(*owner, port, bytes, binary, header) {
+                return Some((*owner, node));
+            }
+        }
+        Out::InetReply {
+            caller,
+            ids,
+            error: None,
+        } => {
+            // {inet_reply, Port, ok, Ref}: a 5-word tuple and a 3-word reference.
+            let node = Message::node_built(*caller, 8, |heap| {
+                let tag = TermBuilder::new(heap).local_ref(*ids).ok()?;
+                TermBuilder::new(heap)
+                    .tuple(&[atom("inet_reply"), port, atom("ok"), tag])
+                    .ok()
+            });
+            if let Some(node) = node {
+                return Some((*caller, node));
+            }
+        }
+        _ => {}
+    }
     // Port of inet_drv.c:3987-4005 (tcp_message uses LOAD_STRING sized to the
     // complete packet), OTP-29.1.1. List-mode packets need two heap words per byte.
     let words = match out {
@@ -4040,10 +4070,15 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, Message)> {
                 .map(|term| (*owner, term))
         }
     };
-    term.map(|(to, term)| (to, Message::from_heap(term, heap)))
+    term.map(|(to, term)| (to, Message::from_heap(term, heap).into_node(to)))
 }
 
-fn message_async(heap: &mut ProcessHeap, port: Term, aref: u16, status: Term) -> Option<Term> {
+fn message_async(
+    heap: &mut (impl HeapAlloc + ?Sized),
+    port: Term,
+    aref: u16,
+    status: Term,
+) -> Option<Term> {
     // Port of inet_drv.c:2493 (send_async_ok / send_async_error), OTP-29.1.1.
     TermBuilder::new(heap)
         .tuple(&[
@@ -4208,8 +4243,31 @@ fn data_term(sock: &Sock, heap: &mut ProcessHeap, bytes: &[u8]) -> Option<Term> 
     data_term_with_options(heap, bytes, binary, hsz)
 }
 
+/// Words of the term `data_term_with_options` builds for `len` packet bytes.
+// Port of erts/emulator/beam/io.c (driver_deliver_term sizing of LOAD_STRING / LOAD_BINARY and
+// the header list cells), OTP-29.1.1.
+fn data_words(len: usize, binary: bool, header: i32) -> usize {
+    let hsz = if header < 0 { len } else { header as usize };
+    if !binary || hsz > len {
+        return 2 * len;
+    }
+    let rest = len - hsz;
+    // A heap binary is two words and the payload; a larger one is a BinRef and a SubBits.
+    2 * hsz + if rest <= 64 { 2 + rest.div_ceil(8) } else { 8 }
+}
+
+/// `{tcp, Port, Data}` built in its own message node.
+fn tcp_node(to: Pid, port: Term, bytes: &[u8], binary: bool, header: i32) -> Option<MessageNode> {
+    Message::node_built(to, 4 + data_words(bytes.len(), binary, header), |heap| {
+        let data = data_term_with_options(heap, bytes, binary, header)?;
+        TermBuilder::new(heap)
+            .tuple(&[atom("tcp"), port, data])
+            .ok()
+    })
+}
+
 fn data_term_with_options(
-    heap: &mut ProcessHeap,
+    heap: &mut (impl HeapAlloc + ?Sized),
     bytes: &[u8],
     binary: bool,
     header: i32,
@@ -4571,27 +4629,24 @@ fn push_frame(inner: &Inner, port: Term, outs: &mut Outs, who: DataWho, frame: F
         Frame::Bytes(bytes) => push_data(inner, outs, who, bytes),
         Frame::InputBytes(range) if inner.deliver != DELIVER_PORT => {
             let bytes = &inner.rbuf[range];
-            let list_len = output_list_len_from_options(bytes.len(), inner.binary, inner.header);
-            let words = 128usize.saturating_add(list_len.saturating_mul(2));
-            let mut heap = ProcessHeap::with_words_for_type(words, ErtsAlcType::HEAP_FRAG);
-            let data = data_term_with_options(&mut heap, bytes, inner.binary, inner.header);
-            let message = data.and_then(|data| match who {
-                DataWho::Active(owner) => TermBuilder::new(&mut heap)
-                    .tuple(&[atom("tcp"), port, data])
-                    .ok()
-                    .map(|term| (owner, term)),
-                DataWho::Async(caller, aref) => {
-                    let status = TermBuilder::new(&mut heap)
-                        .tuple(&[atom("ok"), data])
-                        .ok()?;
-                    message_async(&mut heap, port, aref, status).map(|term| (caller, term))
+            let (binary, header) = (inner.binary, inner.header);
+            let message = match who {
+                DataWho::Active(owner) => {
+                    tcp_node(owner, port, bytes, binary, header).map(|node| (owner, node))
                 }
-            });
-            if let Some((to, term)) = message {
-                outs.push(Out::TcpMessage {
-                    to,
-                    message: Message::from_heap(term, heap),
-                });
+                DataWho::Async(caller, aref) => {
+                    // {inet_async, Port, Ref, {ok, Data}}: a 5-word and a 3-word tuple.
+                    let words = 8 + data_words(bytes.len(), binary, header);
+                    Message::node_built(caller, words, |heap| {
+                        let data = data_term_with_options(heap, bytes, binary, header)?;
+                        let status = TermBuilder::new(heap).tuple(&[atom("ok"), data]).ok()?;
+                        message_async(heap, port, aref, status)
+                    })
+                    .map(|node| (caller, node))
+                }
+            };
+            if let Some((to, message)) = message {
+                outs.push(Out::TcpMessage { to, message });
             }
         }
         Frame::InputBytes(range) => {
