@@ -164,6 +164,7 @@ struct EncodeOpts {
     deterministic: bool,
     /// `term_to_binary(Term, [local])`. Port of external.c LOCAL_EXT, OTP-29.1.1.
     local: bool,
+    local_node: Option<(arinsal_term::Atom, u32)>,
 }
 
 fn atom_text(term: Term) -> Option<&'static str> {
@@ -819,6 +820,11 @@ impl EncodeWalk {
         Ok(Self::start(args[0], opts))
     }
 
+    /// Use the running node identity when encoding locally tagged pids, ports, and refs.
+    pub fn set_local_node(&mut self, node: arinsal_term::Atom, creation: u32) {
+        self.opts.local_node = Some((node, creation));
+    }
+
     fn start(term: Term, opts: EncodeOpts) -> Self {
         let mut out = smallvec![131];
         let mut encoded_size = 1;
@@ -1044,6 +1050,7 @@ impl EncodeWalk {
                 TermKind::Pid | TermKind::Port | TermKind::Ref => {
                     // Port of erts/emulator/beam/external.c:5613-5636 (REF_DEF sizing), OTP-29.1.1.
                     let identity = term.identity().ok_or(BifError::BADARG)?;
+                    let identity = local_identity(identity, self.opts.local_node);
                     let node_size = if self.opts.local {
                         1
                     } else {
@@ -1669,7 +1676,10 @@ impl EncodeWalk {
                     }
                 }
                 TermKind::Pid | TermKind::Port | TermKind::Ref => {
-                    let identity = term.identity().ok_or(BifError::BADARG)?;
+                    let identity = local_identity(
+                        term.identity().ok_or(BifError::BADARG)?,
+                        self.opts.local_node,
+                    );
                     match identity {
                         Identity::Pid {
                             node,
@@ -1824,6 +1834,45 @@ fn encode_plain_with_splits(term: Term, opts: EncodeOpts) -> Result<EncodedWithS
     walk.step(usize::MAX)?;
     walk.patch_local_hash();
     Ok((walk.out.into_vec(), walk.splits.into_vec()))
+}
+
+// Port of erts/emulator/beam/external.c:3244 (enc_term, local pid/port/ref identity), OTP-29.1.1.
+fn local_identity(identity: Identity, local_node: Option<(arinsal_term::Atom, u32)>) -> Identity {
+    let Some((local_node, local_creation)) = local_node else {
+        return identity;
+    };
+    match identity {
+        Identity::Pid {
+            node,
+            creation: 0,
+            index,
+            serial,
+        } if global_atoms().text(node) == Some("nonode@nohost") => Identity::Pid {
+            node: local_node,
+            creation: local_creation,
+            index,
+            serial,
+        },
+        Identity::Port {
+            node,
+            creation: 0,
+            id,
+        } if global_atoms().text(node) == Some("nonode@nohost") => Identity::Port {
+            node: local_node,
+            creation: local_creation,
+            id,
+        },
+        Identity::Ref {
+            node,
+            creation: 0,
+            ids,
+        } if global_atoms().text(node) == Some("nonode@nohost") => Identity::Ref {
+            node: local_node,
+            creation: local_creation,
+            ids,
+        },
+        other => other,
+    }
 }
 
 // Port of erts/emulator/beam/external.c:3651 (NIL_EXT node when encoding local), OTP-29.1.1.
