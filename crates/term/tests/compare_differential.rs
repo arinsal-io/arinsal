@@ -45,6 +45,9 @@ fn compound_term_comparison_matches_erts() {
             {#{number_key => 1}, #{number_key => 1.0}},
             {maps:from_list([{#{x => 1}, a}, {#{y => 2}, b}]),
              maps:from_list([{#{x => 1}, a}, {#{y => 3}, b}])},
+            {#{#{nested_key => 1} => a}, #{#{nested_key => 1.0} => a}},
+            {#{outer_key => #{nested_key => 1}}, #{outer_key => #{nested_key => 1.0}}},
+            {#{1 => a, 1.0 => b}, #{1 => a, 1.0 => c}},
             {maps:from_list([{#{x => 1}, nested} |
                              [{N, N} || N <- lists:seq(1, 40)]]),
              maps:from_list([{#{x => 2}, nested} |
@@ -110,7 +113,7 @@ fn compound_term_comparison_matches_erts() {
         end, Pairs),
         halt().
     "#;
-    let output = match Command::new("erl")
+    let output = match Command::new("$HOME/.asdf/installs/erlang/29.1.1/bin/erl")
         .args(["-noshell", "-eval", expression])
         .output()
     {
@@ -153,5 +156,5 @@ fn compound_term_comparison_matches_erts() {
             "exact equality {index}"
         );
     }
-    similar_asserts::assert_eq!(stdout.lines().count(), 114);
+    similar_asserts::assert_eq!(stdout.lines().count(), 117);
 }

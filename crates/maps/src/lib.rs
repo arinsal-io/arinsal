@@ -9,7 +9,7 @@
 //! from 0 to 15 at each depth, independently of insertion order.
 
 use arinsal_term::{
-    HeapAlloc, Term, TermBuilder, TermError, TermKind, atoms, cmp, exact_eq, internal_hash,
+    HeapAlloc, Term, TermBuilder, TermError, TermKind, atoms, cmp_exact, exact_eq, internal_hash,
 };
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -181,61 +181,20 @@ fn key_cmp(a: Term, b: Term) -> Ordering {
         (false, true) if a.as_atom().is_some() => return Ordering::Greater,
         _ => {}
     }
-    exact_cmp(a, b, true)
+    cmp_exact(a, b)
 }
 
 /// Flatmap key order (atoms by atom index), as erts `CMP_TERM` for flatmap keys.
 pub fn flatmap_key_cmp(a: Term, b: Term) -> Ordering {
     key_cmp(a, b)
 }
+// Port of the exact-mode term path in erts/emulator/beam/utils.c:1658-2735
+// (erts_cmp_compound), OTP-29.1.1; cmp_exact keeps compounds on the shared work stack.
 fn exact_cmp(a: Term, b: Term, flat_atom: bool) -> Ordering {
-    if let (Some(a), Some(b)) = (a.as_atom(), b.as_atom())
-        && flat_atom
-    {
+    if flat_atom && let (Some(a), Some(b)) = (a.as_atom(), b.as_atom()) {
         return a.0.cmp(&b.0);
     }
-    if a.classify() == TermKind::Number && b.classify() == TermKind::Number {
-        let afloat = a.header().is_some_and(|h| h & 63 == 0x18);
-        let bfloat = b.header().is_some_and(|h| h & 63 == 0x18);
-        return match (afloat, bfloat) {
-            (false, true) => Ordering::Less,
-            (true, false) => Ordering::Greater,
-            (true, true) => {
-                // SAFETY: float headers identify live two-word float objects.
-                unsafe {
-                    a.float_ref()
-                        .unwrap()
-                        .get()
-                        .total_cmp(&b.float_ref().unwrap().get())
-                }
-            }
-            (false, false) => cmp(a, b),
-        };
-    }
-    match (a.classify(), b.classify()) {
-        (TermKind::Tuple, TermKind::Tuple) => {
-            // SAFETY: both tuple terms remain live throughout key comparison.
-            let (a, b) = unsafe { (a.tuple_ref().unwrap(), b.tuple_ref().unwrap()) };
-            let order = a.len().cmp(&b.len());
-            if order != Ordering::Equal {
-                return order;
-            }
-            for i in 0..a.len() {
-                let order = exact_cmp(a.get(i).unwrap(), b.get(i).unwrap(), false);
-                if order != Ordering::Equal {
-                    return order;
-                }
-            }
-            Ordering::Equal
-        }
-        (TermKind::List, TermKind::List) => {
-            // SAFETY: both list terms remain live throughout key comparison.
-            let ((ah, at), (bh, bt)) = unsafe { (a.cons_ref().unwrap(), b.cons_ref().unwrap()) };
-            exact_cmp(ah, bh, false).then_with(|| exact_cmp(at, bt, false))
-        }
-        (TermKind::Map, TermKind::Map) => cmp(a, b),
-        _ => cmp(a, b),
-    }
+    cmp_exact(a, b)
 }
 fn unique(pairs: &[(Term, Term)]) -> Vec<(Term, Term)> {
     let mut sorted: Vec<_> = pairs.iter().copied().enumerate().collect();
@@ -2218,6 +2177,7 @@ pub fn next_term<H: HeapAlloc + ?Sized>(iterator: Term, heap: &mut H) -> MapResu
 #[cfg(test)]
 mod key_order_tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn small_sorts_before_atom_like_erts_term_order() {
@@ -2226,5 +2186,48 @@ mod key_order_tests {
         assert_eq!(key_cmp(small, atom), Ordering::Less);
         assert_eq!(key_cmp(atom, small), Ordering::Greater);
         assert_eq!(key_cmp(small, Term::small(9).unwrap()), Ordering::Less);
+    }
+
+    #[test]
+    fn nested_map_keys_use_exact_iterative_order() {
+        let mut heap = arinsal_term::VecHeap::new();
+        let mut builder = TermBuilder::new(&mut heap);
+        let key = Term::atom(atoms::OK);
+        let integer_map = builder
+            .flatmap_from_pairs(&[(key, Term::small(1).unwrap())])
+            .unwrap();
+        let float = builder.float(1.0).unwrap();
+        let float_map = builder.flatmap_from_pairs(&[(key, float)]).unwrap();
+
+        let output = match Command::new("$HOME/.asdf/installs/erlang/29.1.1/bin/erl")
+            .args([
+                "-noshell",
+                "-eval",
+                "A=#{ok=>1}, B=#{ok=>1.0}, io:format(\"~B~n\", [erts_internal:cmp_term(A,B)]), halt().",
+            ])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => {
+                eprintln!("skipping: erl unavailable");
+                return;
+            }
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = String::from_utf8(output.stdout).unwrap();
+        similar_asserts::assert_eq!(expected.trim(), "-1");
+        similar_asserts::assert_eq!(cmp_exact(integer_map, float_map), Ordering::Less);
+        similar_asserts::assert_eq!(key_cmp(integer_map, float_map), Ordering::Less);
+
+        let integer_tuple = builder.tuple(&[integer_map]).unwrap();
+        let float_tuple = builder.tuple(&[float_map]).unwrap();
+        let integer_list = builder.list_from_iter([integer_tuple]).unwrap();
+        let float_list = builder.list_from_iter([float_tuple]).unwrap();
+        similar_asserts::assert_eq!(key_cmp(integer_tuple, float_tuple), Ordering::Less);
+        similar_asserts::assert_eq!(key_cmp(integer_list, float_list), Ordering::Less);
     }
 }
