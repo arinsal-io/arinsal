@@ -7689,8 +7689,7 @@ impl Process {
         let remote = !matches!(
             entry.as_ref().and_then(|entry| entry.state()),
             Some(crate::proc_create::OriginMonitor::Process(_))
-        )
-            && crate::dist::take_monitor(reference).is_some();
+        ) && crate::dist::take_monitor(reference).is_some();
         let active = entry.is_some() || remote;
         let priority = self
             .cold
