@@ -332,67 +332,36 @@ impl ByteOutput for OutputSlice<'_> {
     }
 
     fn push(&mut self, byte: u8) {
-        if let Some(slot) = self.bytes.get_mut(self.position) {
-            *slot = byte;
-        } else {
-            self.failed = true;
-        }
+        self.bytes[self.position] = byte;
         self.position = self.position.saturating_add(1);
     }
 
     fn extend_from_slice(&mut self, bytes: &[u8]) {
         let end = self.position.saturating_add(bytes.len());
-        if let Some(destination) = self.bytes.get_mut(self.position..end) {
-            destination.copy_from_slice(bytes);
-        } else {
-            self.failed = true;
-            if let Some(destination) = self.bytes.get_mut(self.position..) {
-                let copied = destination.len().min(bytes.len());
-                destination[..copied].copy_from_slice(&bytes[..copied]);
-            }
-        }
+        self.bytes[self.position..end].copy_from_slice(bytes);
         self.position = end;
     }
 
     fn extend_zeroed(&mut self, len: usize) {
         let end = self.position.saturating_add(len);
-        if let Some(destination) = self.bytes.get_mut(self.position..end) {
-            destination.fill(0);
-        } else {
-            self.failed = true;
-            if let Some(destination) = self.bytes.get_mut(self.position..) {
-                destination.fill(0);
-            }
-        }
+        self.bytes[self.position..end].fill(0);
         self.position = end;
     }
 
     fn patch(&mut self, at: usize, bytes: &[u8]) {
-        if let Some(destination) = self.bytes.get_mut(at..at.saturating_add(bytes.len())) {
-            destination.copy_from_slice(bytes);
-        } else {
-            self.failed = true;
-        }
+        self.bytes[at..at + bytes.len()].copy_from_slice(bytes);
     }
 
     fn mask_last(&mut self, mask: u8) {
-        if let Some(last) = self
-            .position
-            .checked_sub(1)
-            .and_then(|at| self.bytes.get_mut(at))
-        {
-            *last &= mask;
-        } else {
-            self.failed = true;
-        }
+        self.bytes[self.position - 1] &= mask;
     }
 
     fn slice(&self, range: std::ops::Range<usize>) -> &[u8] {
-        self.bytes.get(range).unwrap_or(&[])
+        &self.bytes[range]
     }
 
     fn slice_mut(&mut self, range: std::ops::Range<usize>) -> &mut [u8] {
-        self.bytes.get_mut(range).unwrap_or(&mut [])
+        &mut self.bytes[range]
     }
 
     fn failed(&self) -> bool {
@@ -591,6 +560,11 @@ fn exact_key_cmp(left: Term, right: Term) -> Ordering {
 
 enum Work {
     Term(Term),
+    Tuple {
+        term: Term,
+        next: usize,
+        arity: usize,
+    },
     PatchFun(usize),
     /// One cons of a `LIST_EXT`, length patched when the tail is not a list.
     /// Port of erts/emulator/beam/external.c:3328 (ENC_ONE_CONS), OTP-29.1.1.
@@ -605,7 +579,27 @@ enum Work {
         copied: usize,
         start: usize,
     },
+    FlatMapPairs {
+        keys: arinsal_maps::FlatMapProjection,
+        values: arinsal_maps::FlatMapProjection,
+        remaining: usize,
+    },
+    FlatMapPairValue {
+        keys: arinsal_maps::FlatMapProjection,
+        values: arinsal_maps::FlatMapProjection,
+        remaining: usize,
+        value: Term,
+    },
     MapEntries(MapEntries),
+    MapPairValue {
+        entries: MapEntries,
+        value: Term,
+    },
+    MapPairs(std::vec::IntoIter<(Term, Term)>),
+    MapSortedValue {
+        pairs: std::vec::IntoIter<(Term, Term)>,
+        value: Term,
+    },
     MapGather {
         entries: MapEntries,
         pairs: Vec<(Term, Term)>,
@@ -741,10 +735,7 @@ impl MapSort {
 }
 
 fn push_map_terms(work: &mut SmallVec<[Work; 4]>, pairs: Vec<(Term, Term)>) {
-    for (key, value) in pairs.into_iter().rev() {
-        work.push(Work::Term(value));
-        work.push(Work::Term(key));
-    }
+    work.push(Work::MapPairs(pairs.into_iter()));
 }
 
 type EncodedWithSplits = (Vec<u8>, Vec<(usize, usize)>);
@@ -755,7 +746,9 @@ pub struct EncodeWalk {
     out: SmallVec<[u8; 64]>,
     splits: SmallVec<[(usize, usize); 4]>,
     work: SmallVec<[Work; 4]>,
+    current_term: Option<Term>,
     size_work: SmallVec<[SizeItem; 4]>,
+    size_current: Option<Term>,
     encoded_size: usize,
     written: usize,
     direct_started: bool,
@@ -773,8 +766,28 @@ pub struct EncodeWalk {
 #[allow(clippy::large_enum_variant)]
 enum SizeItem {
     Term(Term),
+    Tuple {
+        term: Term,
+        next: usize,
+        arity: usize,
+    },
     Tail(Term),
+    FlatMapPairs {
+        keys: arinsal_maps::FlatMapProjection,
+        values: arinsal_maps::FlatMapProjection,
+        remaining: usize,
+    },
+    FlatMapPairValue {
+        keys: arinsal_maps::FlatMapProjection,
+        values: arinsal_maps::FlatMapProjection,
+        remaining: usize,
+        value: Term,
+    },
     Map(MapEntries),
+    MapValue {
+        entries: MapEntries,
+        value: Term,
+    },
 }
 
 impl EncodeWalk {
@@ -785,7 +798,9 @@ impl EncodeWalk {
             out: SmallVec::new(),
             splits: SmallVec::new(),
             work: SmallVec::new(),
+            current_term: None,
             size_work: SmallVec::new(),
+            size_current: None,
             encoded_size: 0,
             written: 0,
             direct_started: false,
@@ -816,8 +831,10 @@ impl EncodeWalk {
             opts,
             out,
             splits: SmallVec::new(),
-            work: smallvec![Work::Term(term)],
-            size_work: smallvec![SizeItem::Term(term)],
+            work: SmallVec::new(),
+            current_term: Some(term),
+            size_work: SmallVec::new(),
+            size_current: Some(term),
             encoded_size,
             written: 0,
             direct_started: false,
@@ -864,30 +881,98 @@ impl EncodeWalk {
     /// Count the yield counts of the size pass, at most `budget - 1` of them.
     // Port of erts/emulator/beam/external.c (encode_size_struct_int), OTP-29.1.1.
     fn size_step(&mut self, budget: usize, consumed: &mut usize) -> Result<bool, BifError> {
-        while let Some(item) = self.size_work.pop() {
+        while let Some(item) = self
+            .size_current
+            .take()
+            .map(SizeItem::Term)
+            .or_else(|| self.size_work.pop())
+        {
+            let item = match item {
+                SizeItem::Tuple { term, next, arity } => {
+                    // Port of external.c (encode_size_struct_int), OTP-29.1.1:
+                    // WSTACK retains the tuple array cursor while obj visits each element.
+                    self.size_current = Some(crate::pure::tuple_element(term, next)?);
+                    if next + 1 < arity {
+                        self.size_work.push(SizeItem::Tuple {
+                            term,
+                            next: next + 1,
+                            arity,
+                        });
+                    }
+                    continue;
+                }
+                SizeItem::Tail(tail) => {
+                    if tail.classify() == TermKind::List {
+                        let (head, rest) = crate::pure::iolist_cons(tail)?;
+                        self.size_work.push(SizeItem::Tail(rest));
+                        self.size_current = Some(head);
+                    } else {
+                        self.size_current = Some(tail);
+                    }
+                    continue;
+                }
+                SizeItem::FlatMapPairs {
+                    mut keys,
+                    mut values,
+                    remaining,
+                } => {
+                    if remaining > 0 {
+                        let key = keys.next().ok_or(BifError::BADARG)?;
+                        let value = values.next().ok_or(BifError::BADARG)?;
+                        self.size_work.push(SizeItem::FlatMapPairValue {
+                            keys,
+                            values,
+                            remaining: remaining - 1,
+                            value,
+                        });
+                        self.size_current = Some(key);
+                    }
+                    continue;
+                }
+                SizeItem::FlatMapPairValue {
+                    keys,
+                    values,
+                    remaining,
+                    value,
+                } => {
+                    self.size_work.push(SizeItem::FlatMapPairs {
+                        keys,
+                        values,
+                        remaining,
+                    });
+                    self.size_current = Some(value);
+                    continue;
+                }
+                SizeItem::Map(mut entries) => {
+                    if let Some((key, value)) = entries.next() {
+                        self.size_work.push(SizeItem::MapValue { entries, value });
+                        self.size_current = Some(key);
+                    }
+                    continue;
+                }
+                SizeItem::MapValue { entries, value } => {
+                    self.size_work.push(SizeItem::Map(entries));
+                    self.size_current = Some(value);
+                    continue;
+                }
+                item => item,
+            };
             if *consumed + 1 >= budget {
-                self.size_work.push(item);
+                match item {
+                    SizeItem::Term(term) => self.size_current = Some(term),
+                    other => self.size_work.push(other),
+                }
                 return Ok(false);
             }
             *consumed += 1;
             let term = match item {
                 SizeItem::Term(term) => term,
-                SizeItem::Tail(tail) => {
-                    if tail.classify() == TermKind::List {
-                        let (head, rest) = crate::pure::iolist_cons(tail)?;
-                        self.size_work.push(SizeItem::Tail(rest));
-                        head
-                    } else {
-                        tail
-                    }
-                }
-                SizeItem::Map(entries) => {
-                    for (key, value) in entries {
-                        self.size_work.push(SizeItem::Term(key));
-                        self.size_work.push(SizeItem::Term(value));
-                    }
-                    continue;
-                }
+                SizeItem::Tuple { .. }
+                | SizeItem::Tail(_)
+                | SizeItem::FlatMapPairs { .. }
+                | SizeItem::FlatMapPairValue { .. }
+                | SizeItem::Map(_)
+                | SizeItem::MapValue { .. } => continue,
             };
             match term.classify() {
                 TermKind::Number => {
@@ -913,15 +998,21 @@ impl EncodeWalk {
                         self.add_size(5)?;
                         let (head, rest) = crate::pure::iolist_cons(term)?;
                         self.size_work.push(SizeItem::Tail(rest));
-                        self.size_work.push(SizeItem::Term(head));
+                        self.size_current = Some(head);
                     }
                 }
                 TermKind::Tuple => {
                     let arity = crate::pure::tuple_arity(term)?;
                     self.add_size(if arity <= 255 { 2 } else { 5 })?;
-                    for index in (0..arity).rev() {
-                        self.size_work
-                            .push(SizeItem::Term(crate::pure::tuple_element(term, index)?));
+                    if arity > 0 {
+                        self.size_current = Some(crate::pure::tuple_element(term, 0)?);
+                        if arity > 1 {
+                            self.size_work.push(SizeItem::Tuple {
+                                term,
+                                next: 1,
+                                arity,
+                            });
+                        }
                     }
                 }
                 TermKind::Map => {
@@ -929,7 +1020,19 @@ impl EncodeWalk {
                     let size = entries.size;
                     self.add_size(5)?;
                     if size > 0 {
-                        self.size_work.push(SizeItem::Map(entries));
+                        match entries.entries {
+                            MapEntryIter::Flat { keys, values } => {
+                                self.size_work.push(SizeItem::FlatMapPairs {
+                                    keys,
+                                    values,
+                                    remaining: size,
+                                });
+                            }
+                            entries @ MapEntryIter::Hash(_) => {
+                                self.size_work
+                                    .push(SizeItem::Map(MapEntries { size, entries }));
+                            }
+                        }
                     }
                 }
                 TermKind::Bitstring => {
@@ -1046,6 +1149,9 @@ impl EncodeWalk {
         let (sized, size_work) = self.step_size(budget)?;
         if !sized {
             return Ok((false, budget));
+        }
+        if output.len() != self.encoded_size {
+            return Err(BifError::SystemLimit);
         }
         if !self.direct_started {
             let mut writer = OutputSlice::new(output, 0);
@@ -1232,12 +1338,32 @@ impl EncodeWalk {
         let iovec = self.iovec;
         let mut free_first = self.free_first;
         while consumed + 1 < budget
-            || (free_first && matches!(work.last(), Some(Work::Term(_) | Work::OneCons { .. })))
+            || (free_first
+                && (self.current_term.is_some()
+                    || matches!(work.last(), Some(Work::Term(_) | Work::OneCons { .. }))))
         {
-            let Some(item) = work.pop() else {
+            let Some(item) = self
+                .current_term
+                .take()
+                .map(Work::Term)
+                .or_else(|| work.pop())
+            else {
                 break;
             };
             let term = match item {
+                Work::Tuple { term, next, arity } => {
+                    // Port of external.c (enc_term_int), OTP-29.1.1: keep the first
+                    // tuple element in obj and retain only the remaining array cursor.
+                    self.current_term = Some(crate::pure::tuple_element(term, next)?);
+                    if next + 1 < arity {
+                        work.push(Work::Tuple {
+                            term,
+                            next: next + 1,
+                            arity,
+                        });
+                    }
+                    continue;
+                }
                 Work::PatchFun(at) => {
                     consumed += 1;
                     let size = u32::try_from(out.len() - at).map_err(|_| BifError::SystemLimit)?;
@@ -1300,6 +1426,38 @@ impl EncodeWalk {
                     }
                     continue;
                 }
+                Work::FlatMapPairs {
+                    mut keys,
+                    mut values,
+                    remaining,
+                } => {
+                    if remaining > 0 {
+                        let key = keys.next().ok_or(BifError::BADARG)?;
+                        let value = values.next().ok_or(BifError::BADARG)?;
+                        work.push(Work::FlatMapPairValue {
+                            keys,
+                            values,
+                            remaining: remaining - 1,
+                            value,
+                        });
+                        self.current_term = Some(key);
+                    }
+                    continue;
+                }
+                Work::FlatMapPairValue {
+                    keys,
+                    values,
+                    remaining,
+                    value,
+                } => {
+                    work.push(Work::FlatMapPairs {
+                        keys,
+                        values,
+                        remaining,
+                    });
+                    self.current_term = Some(value);
+                    continue;
+                }
                 Work::MapGather {
                     mut entries,
                     mut pairs,
@@ -1317,10 +1475,26 @@ impl EncodeWalk {
                 }
                 Work::MapEntries(mut entries) => {
                     if let Some((key, value)) = entries.next() {
-                        work.push(Work::MapEntries(entries));
-                        work.push(Work::Term(value));
-                        work.push(Work::Term(key));
+                        work.push(Work::MapPairValue { entries, value });
+                        self.current_term = Some(key);
                     }
+                    continue;
+                }
+                Work::MapPairValue { entries, value } => {
+                    work.push(Work::MapEntries(entries));
+                    self.current_term = Some(value);
+                    continue;
+                }
+                Work::MapPairs(mut pairs) => {
+                    if let Some((key, value)) = pairs.next() {
+                        work.push(Work::MapSortedValue { pairs, value });
+                        self.current_term = Some(key);
+                    }
+                    continue;
+                }
+                Work::MapSortedValue { pairs, value } => {
+                    work.push(Work::MapPairs(pairs));
+                    self.current_term = Some(value);
                     continue;
                 }
                 Work::MapSort(mut sorting) => {
@@ -1404,8 +1578,15 @@ impl EncodeWalk {
                         out.push(105);
                         out.extend_from_slice(&(arity as u32).to_be_bytes());
                     }
-                    for index in (0..arity).rev() {
-                        work.push(Work::Term(crate::pure::tuple_element(term, index)?));
+                    if arity > 0 {
+                        self.current_term = Some(crate::pure::tuple_element(term, 0)?);
+                        if arity > 1 {
+                            work.push(Work::Tuple {
+                                term,
+                                next: 1,
+                                arity,
+                            });
+                        }
                     }
                 }
                 TermKind::Map => {
@@ -1423,7 +1604,27 @@ impl EncodeWalk {
                             pairs: Vec::with_capacity(len),
                         });
                     } else {
-                        work.push(Work::MapEntries(entries));
+                        match entries.entries {
+                            MapEntryIter::Flat {
+                                mut keys,
+                                mut values,
+                            } => {
+                                if len > 0 {
+                                    let key = keys.next().ok_or(BifError::BADARG)?;
+                                    let value = values.next().ok_or(BifError::BADARG)?;
+                                    work.push(Work::FlatMapPairValue {
+                                        keys,
+                                        values,
+                                        remaining: len - 1,
+                                        value,
+                                    });
+                                    self.current_term = Some(key);
+                                }
+                            }
+                            entries @ MapEntryIter::Hash(_) => {
+                                work.push(Work::MapEntries(MapEntries { size: len, entries }));
+                            }
+                        }
                     }
                 }
                 TermKind::Bitstring => {
@@ -1557,7 +1758,7 @@ impl EncodeWalk {
                 _ => return Err(BifError::Unsupported("ETF representation")),
             }
         }
-        let done = work.is_empty();
+        let done = work.is_empty() && self.current_term.is_none();
         self.free_first = !done;
         if out.failed() || (done && !iovec && out.len() != self.encoded_size) {
             return Err(BifError::SystemLimit);
