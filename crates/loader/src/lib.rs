@@ -746,10 +746,10 @@ impl Module {
     // Port of erts/emulator/beam/jit/asm_load.c (beam_load_finalize_code) and
     // beam_load.c (beam_load_finalize: beam_load_prepared_free), OTP-29.1.1.
     pub fn release_decoded_code(&mut self) {
-        // The instruction array, the generic ops, select tables and operand lists stay: the
+        // The instruction array, the generic ops, select tables, operand lists and bit-syntax
+        // command tables (read by the bs_match helpers) stay: the
         // interpreter still runs on_load and fallback code of a compiled module, and NIF
         // binding, fun identities and the debugger address instructions by index.
-        self.bit_commands = Vec::new();
         self.types = Vec::new();
         self.unsupported = HashMap::new();
         self.unsupported_reasons = Vec::new();
