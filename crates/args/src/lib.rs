@@ -743,12 +743,15 @@ fn allocator_signed_prefix(value: &str) -> Option<i64> {
 /// option loop) and `erts/preloaded/src/init.erl` (`parse_boot_args`), OTP-29.1.1.
 pub fn parse<S: AsRef<str>>(argv: &[S], env: &impl Env) -> Result<Launch, ArgsError> {
     let argv: Vec<&str> = argv.iter().map(AsRef::as_ref).collect();
-    let root_override = env.get("ERL_ROOTDIR").filter(|root| !root.is_empty());
+    // An installed Arinsal release is self-contained. Only the explicit
+    // Arinsal override may take precedence over its adjacent OTP bundle.
+    let arinsal_override = env.get("ARINSAL_OTP_ROOT").filter(|root| !root.is_empty());
+    let bundled_root = bundled_otp_root().map(|root| root.to_string_lossy().into_owned());
+    let erl_root_override = env.get("ERL_ROOTDIR").filter(|root| !root.is_empty());
+    let root_override = arinsal_override.or(bundled_root).or(erl_root_override);
     let root_dir = root_override
         .clone()
         .or_else(|| env.get("ROOTDIR").filter(|root| !root.is_empty()))
-        .or_else(|| bundled_otp_root().map(|root| root.to_string_lossy().into_owned()))
-        .or_else(|| env.get("ARINSAL_OTP_ROOT"))
         .or_else(|| infer_root(argv.first().copied().unwrap_or("")))
         .or_else(|| discover_otp_root(env))
         .unwrap_or_default();
@@ -950,8 +953,9 @@ pub fn bundled_otp_root_for_executable(executable: &Path) -> Option<PathBuf> {
     }
     let prefix = bin.parent()?;
     let root = prefix.join("lib/arinsal/otp");
-    (root.join("lib/erts-17.1/ebin").is_dir() && root.join("lib/kernel-11.0.4/ebin").is_dir())
-        .then_some(root)
+    // `lib/arinsal` marks an installed release: a missing bundle inside it
+    // must fail loudly rather than fall back to a system Erlang.
+    prefix.join("lib/arinsal").is_dir().then_some(root)
 }
 
 /// Discover the OTP root through an `erl` executable other than this process.

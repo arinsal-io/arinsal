@@ -13,6 +13,14 @@ if [[ "$target" == */* || "$version" == */* || -z "$target" || -z "$version" ]];
     exit 2
 fi
 
+case "$target" in
+    aarch64-apple-darwin|aarch64-unknown-linux-gnu) ;;
+    *)
+        echo "package.sh: unsupported target: $target (supported: aarch64-apple-darwin, aarch64-unknown-linux-gnu)" >&2
+        exit 1
+        ;;
+esac
+
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 cd "$repo"
 
@@ -34,7 +42,7 @@ else
     otp_root=$(timeout 30 "$erl_bin" -noshell -eval 'io:format("~s",[code:root_dir()]), halt().')
 fi
 
-cargo build --release -p arinsal-cli --target "$target"
+ARINSAL_RELEASE_VERSION="$version" cargo build --release -p arinsal-cli --target "$target"
 build_root=${CARGO_TARGET_DIR:-"$repo/target"}
 case "$build_root" in
     /*) ;;
@@ -124,6 +132,15 @@ exec "$bin/arinsal" +B -noshell -boot "$root/releases/29/no_dot_erlang" \
 EOF
 chmod 755 "$prefix/bin/erl" "$prefix/bin/erlc" "$prefix/bin/escript"
 
+# erlexec puts both bundled directories ahead of the caller's PATH. These
+# relocatable entry points keep nested OTP tools from resolving a system erl.
+bundle="$prefix/lib/arinsal/otp"
+mkdir -p "$bundle/bin" "$bundle/erts-17.1/bin"
+for tool in erl erlc escript; do
+    ln -s "../../../../bin/$tool" "$bundle/bin/$tool"
+    ln -s "../../../../../bin/$tool" "$bundle/erts-17.1/bin/$tool"
+done
+
 case "$(uname -s)" in
     Darwin)
         dsymutil "$prefix/bin/arinsal" -o "$stage/arinsal.dSYM"
@@ -150,16 +167,24 @@ cp "$repo/LICENSE" "$repo/NOTICE" "$prefix/"
     esac
 done > SHA256SUMS)
 
-archive="arinsal-${version}-otp-29.1.1-${target}.tar.gz"
+archive="arinsal-${version}-${target}.tar.gz"
 debug_archive="arinsal-${version}-otp-29.1.1-${target}.debug.tar.gz"
 tar -czf "$dist/$archive" -C "$prefix" bin lib LICENSE NOTICE SHA256SUMS
 tar -czf "$dist/$debug_archive" -C "$stage" "${debug_item##*/}"
+(
+    cd "$dist"
+    case "$(uname -s)" in
+        Darwin) shasum -a 256 "$archive" > "$archive.sha256" ;;
+        Linux) sha256sum "$archive" > "$archive.sha256" ;;
+    esac
+)
 
 bin_size=$(du -sh "$prefix/bin" | awk '{print $1}')
 otp_size=$(du -sh "$prefix/lib/arinsal/otp/lib" | awk '{print $1}')
 tarball_size=$(du -sh "$dist/$archive" | awk '{print $1}')
 debug_size=$(du -sh "$dist/$debug_archive" | awk '{print $1}')
 printf 'Package: %s\n' "$dist/$archive"
+printf 'Checksum: %s\n' "$dist/$archive.sha256"
 printf 'Debug symbols: %s\n' "$dist/$debug_archive"
 printf 'Binary bytes: unstripped=%s stripped=%s removed=%s\n' \
     "$unstripped_binary_bytes" "$stripped_binary_bytes" \
