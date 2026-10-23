@@ -820,6 +820,13 @@ impl EncodeWalk {
         Ok(Self::start(args[0], opts))
     }
 
+    /// Begin a size-only walk for `external_size/1,2`, where compression is ignored.
+    pub fn new_external_size(args: &[Term]) -> Result<Self, BifError> {
+        let mut opts = options(args.get(1).copied())?;
+        opts.compressed = None;
+        Ok(Self::start(args[0], opts))
+    }
+
     /// Use the running node identity when encoding locally tagged pids, ports, and refs.
     pub fn set_local_node(&mut self, node: arinsal_term::Atom, creation: u32) {
         self.opts.local_node = Some((node, creation));
@@ -1979,9 +1986,7 @@ fn term_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 
 fn external_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut opts = options(args.get(1).copied())?;
-    opts.compressed = None;
-    let mut encoder = EncodeWalk::start(args[0], opts);
+    let mut encoder = EncodeWalk::new_external_size(args)?;
     encoder.step_size(usize::MAX)?;
     let size = encoder.encoded_size().ok_or(BifError::SystemLimit)?;
     // Port of erts/emulator/beam/external.c (external_size_1), OTP-29.1.1: the size
