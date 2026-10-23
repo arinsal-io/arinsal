@@ -2429,6 +2429,23 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             written: 0,
         })
     }
+    /// Reserve a tuple header and its element slots for an incremental decoder.
+    ///
+    /// Elements are written in decode order, so the block can stay in a parser
+    /// frame while nested terms allocate later heap words. Port of the tuple
+    /// reservation in `dec_term`, erts/emulator/beam/external.c, OTP-29.1.1.
+    pub fn reserve_tuple_block(&mut self, arity: usize) -> Result<HeapBlockBuilder, TermError> {
+        if arity == 0 {
+            return Err(TermError::BadArg);
+        }
+        if arity > (1 << 24) - 1 {
+            return Err(TermError::SystemLimit);
+        }
+        let words = arity.checked_add(1).ok_or(TermError::SystemLimit)?;
+        let mut block = self.reserve_boxed_words(words, 0)?;
+        block.write_header((arity as u64) << 6 | ARITY)?;
+        Ok(block)
+    }
     pub(crate) fn words(&mut self, words: usize) -> Result<*mut u64, TermError> {
         self.heap.alloc(words).ok_or(TermError::HeapFull)
     }
