@@ -10,7 +10,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use crate::lock::ReentrantLock;
 use crate::{Callbacks, ControlReply, Driver, DriverPort, ERL_DRV_FLAG_USE_PORT_LOCKING};

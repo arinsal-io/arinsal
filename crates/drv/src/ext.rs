@@ -1,8 +1,8 @@
 //! Driver-side port state used by the library API (`driver_enq`, process
 //! monitors, term output, busy flags, init acknowledgement).
 
+use parking_lot::MutexGuard;
 use std::ffi::c_int;
-use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arinsal_etf::OwnedTerm;
@@ -73,7 +73,7 @@ static NEXT_MONITOR: AtomicU64 = AtomicU64::new(1);
 impl DriverPort {
     /// The port's I/O queue (`prt->ioq`).
     pub(crate) fn queue(&self) -> MutexGuard<'_, IoQueue> {
-        self.queue.lock().unwrap()
+        self.queue.lock()
     }
 
     /// Bytes in the driver queue (`erts_ioq_size`), for `port_info(queue_size)`.
@@ -88,7 +88,7 @@ impl DriverPort {
 
     /// Process-table data of the processes this port monitors, for `port_info`.
     pub fn monitored(&self) -> Vec<u64> {
-        let mut pids: Vec<u64> = self.monitors.lock().unwrap().values().copied().collect();
+        let mut pids: Vec<u64> = self.monitors.lock().values().copied().collect();
         pids.sort_unstable();
         pids
     }
@@ -180,9 +180,9 @@ impl DriverPort {
         };
         let id = NEXT_MONITOR.fetch_add(1, Ordering::Relaxed);
         // Registered first so an exit racing with the call finds the monitor.
-        self.monitors.lock().unwrap().insert(id, pid);
+        self.monitors.lock().insert(id, pid);
         if !self.host.monitor_process(self, pid, id) {
-            self.monitors.lock().unwrap().remove(&id);
+            self.monitors.lock().remove(&id);
             return 1;
         }
         *monitor = ErlDrvMonitor::new(id);
@@ -191,13 +191,7 @@ impl DriverPort {
 
     /// Port of io.c:7059 (do_driver_demonitor_process): `1` for an unknown monitor.
     pub(crate) fn demonitor_process(&self, monitor: &ErlDrvMonitor) -> c_int {
-        if self
-            .monitors
-            .lock()
-            .unwrap()
-            .remove(&monitor.id())
-            .is_none()
-        {
+        if self.monitors.lock().remove(&monitor.id()).is_none() {
             return 1;
         }
         self.host.demonitor_process(self, monitor.id());
@@ -206,7 +200,7 @@ impl DriverPort {
 
     /// Port of io.c:7098 (do_driver_get_monitored_process): the pid word or NIL.
     pub(crate) fn monitored_word(&self, monitor: &ErlDrvMonitor) -> usize {
-        match self.monitors.lock().unwrap().get(&monitor.id()) {
+        match self.monitors.lock().get(&monitor.id()) {
             Some(pid) => termspec::mk_pid(*pid),
             None => termspec::NIL,
         }
@@ -218,28 +212,28 @@ impl DriverPort {
     pub fn process_exit(&self, monitor: u64) {
         let _guard = self.guard();
         if let Some(native) = &self.driver.native {
-            if self.monitors.lock().unwrap().contains_key(&monitor) && self.live() {
+            if self.monitors.lock().contains_key(&monitor) && self.live() {
                 native.process_exit(self, monitor);
-                self.monitors.lock().unwrap().remove(&monitor);
+                self.monitors.lock().remove(&monitor);
             }
             return;
         }
         let Some(callback) = self.driver.callbacks.process_exit else {
             return;
         };
-        if !self.monitors.lock().unwrap().contains_key(&monitor) || !self.live() {
+        if !self.monitors.lock().contains_key(&monitor) || !self.live() {
             return;
         }
         let mut drv_monitor = ErlDrvMonitor::new(monitor);
         callback(self.data(), &mut drv_monitor);
-        self.monitors.lock().unwrap().remove(&monitor);
+        self.monitors.lock().remove(&monitor);
     }
 
     /// Port of erl_port_task.c:772 (erl_drv_busy_msgq_limits). `low` and `high`
     /// are read-write: zero reads, other values write, `BUSY_MSGQ_DISABLED`
     /// disables the feature; the current limits come back in both.
     pub(crate) fn busy_msgq_limits(&self, low: Option<&mut usize>, high: Option<&mut usize>) {
-        let mut limits = self.msgq_limits.lock().unwrap();
+        let mut limits = self.msgq_limits.lock();
         let mut new_low = low.as_deref().copied().unwrap_or(BUSY_MSGQ_READ_ONLY);
         let mut new_high = high.as_deref().copied().unwrap_or(BUSY_MSGQ_READ_ONLY);
         let written = limits.enabled
@@ -352,6 +346,6 @@ impl DriverPort {
             threads::pdl_unlock(pdl);
             threads::pdl_dec(pdl);
         }
-        self.monitors.lock().unwrap().clear();
+        self.monitors.lock().clear();
     }
 }

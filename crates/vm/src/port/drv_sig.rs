@@ -736,7 +736,7 @@ pub(crate) fn exit_for_process_termination(
         if op == SigOp::Exec {
             // Port of erts/emulator/beam/io.c:2187 (`call_deliver_port_exit`),
             // OTP-29.1.1: the forced exit breaks the exiting process's port link.
-            handle.links.lock().unwrap().remove(&from);
+            handle.links.lock().remove(&from);
             let mut heap = ProcessHeap::with_words(64);
             let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
             deliver_exit(&runtime, &handle, false, from, reason, None);
@@ -776,11 +776,11 @@ pub(crate) fn connect(
             signal_badsig(handle, handle.id);
             return REDS_CONNECT;
         }
-        handle.links.lock().unwrap().insert(pid);
-        *handle.owner.lock().unwrap() = pid;
+        handle.links.lock().insert(pid);
+        *handle.owner.lock() = pid;
         if !runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS) {
-            handle.links.lock().unwrap().remove(&pid);
-            *handle.owner.lock().unwrap() = from;
+            handle.links.lock().remove(&pid);
+            *handle.owner.lock() = from;
             signal_badsig(handle, handle.id);
             return REDS_CONNECT;
         }
@@ -818,11 +818,11 @@ pub(crate) fn link(
             if linked {
                 // Port of erts/emulator/beam/io.c:2669 (port_sig_link), OTP-29.1.1.
                 if live {
-                    handle.links.lock().unwrap().insert(pid);
+                    handle.links.lock().insert(pid);
                     // erl_process.c:14084: the port link lives on the process, so exit
                     // must visit the port table.
                     if !task_runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS) {
-                        handle.links.lock().unwrap().remove(&pid);
+                        handle.links.lock().remove(&pid);
                     } else {
                         trace_link(&task_runtime, handle.id, pid, "getting_linked");
                     }
@@ -843,7 +843,7 @@ pub(crate) fn link(
             } else {
                 // Port of erts/emulator/beam/io.c:2507 (port_sig_unlink), OTP-29.1.1.
                 if live {
-                    handle.links.lock().unwrap().remove(&pid);
+                    handle.links.lock().remove(&pid);
                     trace_link(&task_runtime, handle.id, pid, "getting_unlinked");
                 }
                 REDS_UNLINK
@@ -865,7 +865,7 @@ pub(crate) fn demonitor(
     let task_handle = Arc::clone(handle);
     let _ = imm_or_schedule(drv, caller, true, "demonitor", move |op| {
         if op == SigOp::Exec {
-            task_handle.monitors.lock().unwrap().remove(&reference);
+            task_handle.monitors.lock().remove(&reference);
         }
         REDS_DEMONITOR
     });

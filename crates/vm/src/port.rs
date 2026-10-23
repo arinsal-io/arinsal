@@ -7,6 +7,7 @@ use arinsal_term::{
     HeapAlloc, ProcessHeap, Term, TermBuilder, TermKind, VecHeap, copy_term, from_owned,
     global_atoms, to_owned,
 };
+use parking_lot::Mutex;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -14,7 +15,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 mod drv_sig;
 
@@ -280,7 +281,7 @@ pub(crate) fn test_next_port_id(
     set: bool,
     next_id: u64,
 ) -> Option<u64> {
-    let _ports = runtime.ports.lock().unwrap();
+    let _ports = runtime.ports.lock();
     Some(
         runtime
             .port_ids
@@ -419,14 +420,14 @@ impl PortIdReservation<'_> {
 impl Drop for PortIdReservation<'_> {
     fn drop(&mut self) {
         if !self.committed {
-            let _ports = self.runtime.ports.lock().unwrap();
+            let _ports = self.runtime.ports.lock();
             self.runtime.port_ids.release(self.id);
         }
     }
 }
 
 fn reserve_port_id(runtime: &crate::process::Runtime) -> Result<PortIdReservation<'_>, VmError> {
-    let _ports = runtime.ports.lock().unwrap();
+    let _ports = runtime.ports.lock();
     // Port exhaustion is the `driver_create_port` failure mapped to `system_limit` in
     // erts/emulator/drivers/common/inet_drv.c:11834-11837, OTP-29.1.1.
     let id = runtime
@@ -441,7 +442,7 @@ fn reserve_port_id(runtime: &crate::process::Runtime) -> Result<PortIdReservatio
 }
 
 fn remove_port(runtime: &crate::process::Runtime, id: u64) -> Option<Arc<PortHandle>> {
-    let ports = runtime.ports.lock().unwrap();
+    let ports = runtime.ports.lock();
     let handle = runtime.ports.remove(id)?;
     runtime.port_ids.release(id);
     drop(ports);
@@ -483,7 +484,7 @@ impl PortHandle {
     }
 
     pub(crate) fn owner_pid(&self) -> Pid {
-        *self.owner.lock().unwrap()
+        *self.owner.lock()
     }
     pub(crate) fn scheduler(&self) -> Arc<Scheduler<Process>> {
         Arc::clone(&self.scheduler)
@@ -493,33 +494,33 @@ impl PortHandle {
     }
 
     fn add_bytes_in(&self, count: usize) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.bytes_in = state.bytes_in.wrapping_add(count as u64);
     }
 
     fn add_bytes_out(&self, count: usize) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.bytes_out = state.bytes_out.wrapping_add(count as u64);
     }
 
     pub(crate) fn tcp_driver_data(&self) -> Option<Arc<crate::inet_drv::Sock>> {
-        self.inet_tcp.lock().unwrap().clone()
+        self.inet_tcp.lock().clone()
     }
 
     pub(crate) fn set_tcp_driver_data(&self, data: Arc<crate::inet_drv::Sock>) {
-        *self.inet_tcp.lock().unwrap() = Some(data);
+        *self.inet_tcp.lock() = Some(data);
     }
 
     pub(crate) fn take_tcp_driver_data(&self) -> Option<Arc<crate::inet_drv::Sock>> {
-        self.inet_tcp.lock().unwrap().take()
+        self.inet_tcp.lock().take()
     }
 
     pub(crate) fn set_udp_driver_data(&self, data: Arc<crate::inet_udp::Sock>) {
-        *self.inet_udp.lock().unwrap() = Some(data);
+        *self.inet_udp.lock() = Some(data);
     }
 
     pub(crate) fn take_udp_driver_data(&self) -> Option<Arc<crate::inet_udp::Sock>> {
-        self.inet_udp.lock().unwrap().take()
+        self.inet_udp.lock().take()
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -556,13 +557,13 @@ impl PortHandle {
     }
 
     pub(crate) fn exit_complete(&self) -> bool {
-        self.state.lock().unwrap().exit_complete
+        self.state.lock().exit_complete
     }
 
     fn track_halt(&self, progress: HaltProgress) {
         progress.port_started();
-        let mut tracked = self.halt_progress.lock().unwrap();
-        if self.state.lock().unwrap().exit_complete {
+        let mut tracked = self.halt_progress.lock();
+        if self.state.lock().exit_complete {
             progress.port_finished();
         } else {
             *tracked = Some(progress);
@@ -570,7 +571,7 @@ impl PortHandle {
     }
 
     fn finish_halt(&self) {
-        if let Some(progress) = self.halt_progress.lock().unwrap().take() {
+        if let Some(progress) = self.halt_progress.lock().take() {
             progress.port_finished();
         }
     }
@@ -1510,7 +1511,7 @@ fn start_driver(
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
-    *handle.ram_file.lock().unwrap() = Some(crate::ram_file_drv::start(_binary));
+    *handle.ram_file.lock() = Some(crate::ram_file_drv::start(_binary));
     Ok(port)
 }
 
@@ -1622,7 +1623,7 @@ fn start_dyn_driver(
         // Port of erts/emulator/beam/erl_bif_port.c:102: the opener gets a
         // reference and the port, or the error, in `{Ref, Result}` from `erl_drv_init_ack`.
         let reference = runtime.next_ref();
-        *handle.async_open.lock().unwrap() = Some((reference, ctx.pid()));
+        *handle.async_open.lock() = Some((reference, ctx.pid()));
         drv_port.expect_init_ack();
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         return TermBuilder::new(&mut heap)
@@ -1778,7 +1779,7 @@ impl arinsal_drv::PortHost for DrvHost {
     fn unlink_connected(&self, port: &arinsal_drv::DriverPort) {
         if let Some(handle) = self.handle(port.id()) {
             let owner = handle.owner_pid();
-            handle.links.lock().unwrap().remove(&owner);
+            handle.links.lock().remove(&owner);
         }
     }
 
@@ -1965,7 +1966,7 @@ impl arinsal_drv::PortHost for DrvHost {
         let Some(handle) = self.handle(port.id()) else {
             return;
         };
-        handle.state.lock().unwrap().busy_port = on;
+        handle.state.lock().busy_port = on;
     }
 
     // Port of erts/emulator/beam/erl_port_task.c:107 (profile_runnable_port), OTP-29.1.1.
@@ -2046,7 +2047,7 @@ impl arinsal_drv::PortHost for DrvHost {
         if !handle.scheduler.lookup(target) {
             return false;
         }
-        handle.drv_monitors.lock().unwrap().insert(monitor, target);
+        handle.drv_monitors.lock().insert(monitor, target);
         if let Some(runtime) = self.runtime.upgrade() {
             let _ = runtime.publish_proc_flag(target, arinsal_sched::proc_flags::PORTS);
         }
@@ -2055,7 +2056,7 @@ impl arinsal_drv::PortHost for DrvHost {
 
     fn demonitor_process(&self, port: &arinsal_drv::DriverPort, monitor: u64) {
         if let Some(handle) = self.handle(port.id()) {
-            handle.drv_monitors.lock().unwrap().remove(&monitor);
+            handle.drv_monitors.lock().remove(&monitor);
         }
     }
 
@@ -2070,7 +2071,7 @@ impl arinsal_drv::PortHost for DrvHost {
         let Some(handle) = self.handle(port.id()) else {
             return;
         };
-        let Some((reference, opener)) = handle.async_open.lock().unwrap().take() else {
+        let Some((reference, opener)) = handle.async_open.lock().take() else {
             return;
         };
         let Some(port_term) = Term::port(port.id()) else {
@@ -2080,7 +2081,7 @@ impl arinsal_drv::PortHost for DrvHost {
             arinsal_drv::InitAck::Opened => port_term,
             arinsal_drv::InitAck::Failed(error) => {
                 // The opener is no longer linked to a port that failed to open.
-                handle.links.lock().unwrap().remove(&opener);
+                handle.links.lock().remove(&opener);
                 atom(&match error {
                     arinsal_drv::StartError::General => "einval".to_owned(),
                     arinsal_drv::StartError::Errno(errno) => arinsal_drv::errno_id(errno),
@@ -2193,7 +2194,7 @@ impl arinsal_drv::PollBackend for DrvPoll {
             },
             move |_, _| {
                 {
-                    let mut state = state[id as usize % POLL_SHARDS].lock().unwrap();
+                    let mut state = state[id as usize % POLL_SHARDS].lock();
                     if state.live.remove(&id).is_none() {
                         state.fired.insert(id);
                     }
@@ -2201,7 +2202,7 @@ impl arinsal_drv::PollBackend for DrvPoll {
                 ready();
             },
         )?;
-        let mut state = self.state[id as usize % POLL_SHARDS].lock().unwrap();
+        let mut state = self.state[id as usize % POLL_SHARDS].lock();
         if !state.fired.remove(&id) {
             state.live.insert(id, registration);
         }
@@ -2211,7 +2212,6 @@ impl arinsal_drv::PollBackend for DrvPoll {
     fn deregister(&self, id: u64) {
         let registration = self.state[id as usize % POLL_SHARDS]
             .lock()
-            .unwrap()
             .live
             .remove(&id);
         if let Some(registration) = registration {
@@ -2433,7 +2433,7 @@ fn notify_links_monitors(
     let Some(port) = Term::port(id) else {
         return;
     };
-    for linked in handle.links.lock().unwrap().iter().copied() {
+    for linked in handle.links.lock().iter().copied() {
         if skip_owner && linked == from {
             continue;
         }
@@ -2452,7 +2452,7 @@ fn notify_links_monitors(
     }
     // The lock is held while the DOWNs are queued so that a concurrent `demonitor` either
     // removes the monitor first or leaves a signal the origin discards.
-    let mut guard = handle.monitors.lock().unwrap();
+    let mut guard = handle.monitors.lock();
     let monitors = std::mem::take(&mut *guard);
     for (reference, monitor) in monitors {
         let mut heap = ProcessHeap::with_words(32);
@@ -2498,7 +2498,7 @@ fn signal_port_exit(handle: &PortHandle, id: u64, reason: Term) {
     let Some(port) = Term::port(id) else {
         return;
     };
-    let owner = *handle.owner.lock().unwrap();
+    let owner = *handle.owner.lock();
     if let (Ok(port), Ok(reason)) = (Message::copy_from(port), Message::copy_from(reason)) {
         let _ = handle.scheduler.signal(
             owner,
@@ -2778,7 +2778,6 @@ fn output_fd(handle: &PortHandle) -> RawFd {
     handle
         .out
         .lock()
-        .unwrap()
         .as_ref()
         .map(|fd| fd.as_raw_fd())
         .unwrap_or(-1)
@@ -2933,7 +2932,7 @@ fn flush_output(handle: &PortHandle) -> Vec<Pid> {
     let mut woken = Vec::new();
     let mut became_inactive = false;
     loop {
-        let mut st = handle.state.lock().unwrap();
+        let mut st = handle.state.lock();
         if st.outq.is_empty() {
             woken.extend(refresh_busy(&mut st, &handle.limits));
             if st.pending.is_empty() && st.profile_active {
@@ -2947,14 +2946,14 @@ fn flush_output(handle: &PortHandle) -> Vec<Pid> {
         drop(st);
         match nb_write(output_fd(handle), &chunk) {
             Ok(0) => {
-                let mut st = handle.state.lock().unwrap();
+                let mut st = handle.state.lock();
                 for byte in chunk.into_iter().rev() {
                     st.outq.push_front(byte);
                 }
                 break;
             }
             Ok(wrote) if wrote < chunk.len() => {
-                let mut st = handle.state.lock().unwrap();
+                let mut st = handle.state.lock();
                 for byte in chunk[wrote..].iter().rev() {
                     st.outq.push_front(*byte);
                 }
@@ -2962,11 +2961,11 @@ fn flush_output(handle: &PortHandle) -> Vec<Pid> {
                 break;
             }
             Ok(_) => {
-                let mut st = handle.state.lock().unwrap();
+                let mut st = handle.state.lock();
                 woken.extend(refresh_busy(&mut st, &handle.limits));
             }
             Err(_) => {
-                let mut st = handle.state.lock().unwrap();
+                let mut st = handle.state.lock();
                 st.broken = true;
                 st.busy_port = false;
                 st.busy_msgq = false;
@@ -2992,7 +2991,7 @@ fn drain_pending(handle: &PortHandle) -> Vec<Pid> {
     let mut woken = Vec::new();
     loop {
         let next = {
-            let mut st = handle.state.lock().unwrap();
+            let mut st = handle.state.lock();
             if st.in_output {
                 return woken;
             }
@@ -3004,14 +3003,14 @@ fn drain_pending(handle: &PortHandle) -> Vec<Pid> {
             data
         };
         let failed = {
-            let mut st = handle.state.lock().unwrap();
+            let mut st = handle.state.lock();
             let failed = accept_output(handle, &mut st, &next).is_err();
             st.in_output = false;
             woken.extend(refresh_busy(&mut st, &handle.limits));
             failed
         };
         if failed {
-            let mut st = handle.state.lock().unwrap();
+            let mut st = handle.state.lock();
             st.broken = true;
             woken.extend(std::mem::take(&mut st.suspended));
             return woken;
@@ -3021,7 +3020,7 @@ fn drain_pending(handle: &PortHandle) -> Vec<Pid> {
 
 fn command_bytes(handle: &PortHandle, data: &[u8]) -> Result<(), ()> {
     let became_active = {
-        let mut st = handle.state.lock().unwrap();
+        let mut st = handle.state.lock();
         if st.closed || st.broken {
             return Err(());
         }
@@ -3096,7 +3095,7 @@ fn end_of_input(
     child_running: bool,
     data: &mut Vec<u8>,
 ) -> InputEnd {
-    if handle.state.lock().unwrap().closed {
+    if handle.state.lock().closed {
         return InputEnd::Terminate;
     }
     if child_running {
@@ -3134,7 +3133,6 @@ fn worker(
     let wake_r = handle
         .wake_r
         .lock()
-        .unwrap()
         .take()
         .map(|fd| fd.into_raw_fd())
         .unwrap_or(-1);
@@ -3149,7 +3147,7 @@ fn worker(
     let mut eof_terminate = false;
     let mut input_closed = false;
     loop {
-        let closed = handle.state.lock().unwrap().closed;
+        let closed = handle.state.lock().closed;
         if closed {
             break;
         }
@@ -3172,8 +3170,8 @@ fn worker(
                 }
             }
         }
-        let wants_out = !handle.state.lock().unwrap().outq.is_empty()
-            || !handle.state.lock().unwrap().pending.is_empty();
+        let wants_out =
+            !handle.state.lock().outq.is_empty() || !handle.state.lock().pending.is_empty();
         handle.wake_needed.store(true, Ordering::Release);
         let mut fds = Vec::with_capacity(3);
         if input_live && let Some(fd) = read_fd {
@@ -3204,14 +3202,14 @@ fn worker(
                 },
             ));
         }
-        if handle.state.lock().unwrap().closed
-            || !handle.state.lock().unwrap().outq.is_empty()
-            || !handle.state.lock().unwrap().pending.is_empty()
+        if handle.state.lock().closed
+            || !handle.state.lock().outq.is_empty()
+            || !handle.state.lock().pending.is_empty()
         {
             handle.wake_needed.store(false, Ordering::Release);
         }
         let mut input_ready = false;
-        if !handle.state.lock().unwrap().closed {
+        if !handle.state.lock().closed {
             // Port of `erts_check_io` one-shot readiness delivery; every
             // operation is re-registered after this worker handles the event.
             let timeout = eof_waiting.then(|| std::time::Duration::from_millis(5));
@@ -3246,7 +3244,7 @@ fn worker(
                 break;
             }
         }
-        if handle.state.lock().unwrap().closed {
+        if handle.state.lock().closed {
             break;
         }
         let woken = drain_pending(&handle);
@@ -3255,11 +3253,11 @@ fn worker(
         wake_suspended(&scheduler, woken);
         if !input_closed {
             let should_close_input = {
-                let st = handle.state.lock().unwrap();
+                let st = handle.state.lock();
                 st.graceful_close && st.outq.is_empty() && st.pending.is_empty()
             };
             if should_close_input {
-                handle.out.lock().unwrap().take();
+                handle.out.lock().take();
                 input_closed = true;
             }
         }
@@ -3330,24 +3328,24 @@ fn worker(
                 }
             }
         }
-        let st = handle.state.lock().unwrap();
+        let st = handle.state.lock();
         if input_closed && !input_live && st.outq.is_empty() && st.pending.is_empty() {
             break;
         }
         drop(st);
     }
-    if eof_terminate && !handle.state.lock().unwrap().closed {
+    if eof_terminate && !handle.state.lock().closed {
         eof_exit(&handle, &scheduler, &runtime, owner, id, wake_r, read_fd);
         return;
     }
     let woken = flush_output(&handle);
     wake_suspended(&scheduler, woken);
     close_worker_fds(wake_r, read_fd);
-    let closed = handle.state.lock().unwrap().closed;
+    let closed = handle.state.lock().closed;
     // Port of erts/emulator/sys/unix/sys_drivers.c (`stop`), OTP-29.1.1.
     // The helper reaps children after their ports close and reports statuses by port id.
     if closed {
-        handle.out.lock().unwrap().take();
+        handle.out.lock().take();
         handle.finish_halt();
     } else if want_status
         && !status_reported
@@ -3355,9 +3353,9 @@ fn worker(
     {
         exit_status_message(&scheduler, owner, id, handle.trace_scope, code);
     }
-    handle.state.lock().unwrap().exit_complete = true;
+    handle.state.lock().exit_complete = true;
     handle.finish_halt();
-    if !closed && handle.state.lock().unwrap().send_closed {
+    if !closed && handle.state.lock().send_closed {
         event_message(&scheduler, owner, id, handle.trace_scope, atom("closed"));
     }
     if !closed {
@@ -3404,7 +3402,7 @@ fn eof_exit(
         }
     }
     let woken = {
-        let mut st = handle.state.lock().unwrap();
+        let mut st = handle.state.lock();
         st.closed = true;
         st.broken = true;
         st.busy_port = false;
@@ -3415,10 +3413,10 @@ fn eof_exit(
     };
     wake_suspended(scheduler, woken);
     close_worker_fds(wake_r, read_fd);
-    handle.out.lock().unwrap().take();
-    handle.state.lock().unwrap().exit_complete = true;
+    handle.out.lock().take();
+    handle.state.lock().exit_complete = true;
     handle.finish_halt();
-    if handle.state.lock().unwrap().send_closed {
+    if handle.state.lock().send_closed {
         event_message(scheduler, owner, id, handle.trace_scope, atom("closed"));
     }
     notify_closed(handle, id, scheduler, owner, false);
@@ -3520,7 +3518,7 @@ pub(crate) fn is_live(process: &Process, id: u64) -> bool {
 /// Whether local port `id` of `runtime` exists and has not finished exiting.
 pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> bool {
     let handle = runtime.ports.get(id);
-    handle.is_some_and(|handle| !handle.state.lock().unwrap().exit_complete)
+    handle.is_some_and(|handle| !handle.state.lock().exit_complete)
 }
 
 /// The term of `port_set_data/2` in a heap block of its own (`ErtsPortDataHeap`: the term and
@@ -3595,7 +3593,7 @@ pub(crate) fn port_close_light(
 // Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
 fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
     let handle = lookup_port(process, port)?;
-    let data = handle.data.lock().unwrap();
+    let data = handle.data.lock();
     let size = arinsal_term::size_object(data.term);
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     arinsal_term::copy_struct(data.term, &mut heap, size).map_err(|_| badarg())
@@ -3619,7 +3617,7 @@ fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmEr
             _fragment: Some(heap),
         }
     };
-    *handle.data.lock().unwrap() = stored;
+    *handle.data.lock() = stored;
     Ok(atom("true"))
 }
 
@@ -3896,9 +3894,9 @@ fn port_command(
     }
     let mut framed = iodata(data).ok_or_else(badarg)?;
     let bytes_out = framed.len();
-    let ram_file = handle.ram_file.lock().unwrap().clone();
+    let ram_file = handle.ram_file.lock().clone();
     if let Some(ram_file) = ram_file {
-        let state = handle.state.lock().unwrap();
+        let state = handle.state.lock();
         if state.closed || state.broken {
             return Err(badarg());
         }
@@ -3936,7 +3934,7 @@ fn port_command(
         }
     }
     {
-        let mut st = handle.state.lock().unwrap();
+        let mut st = handle.state.lock();
         if st.closed || st.broken {
             return Err(badarg());
         }
@@ -4123,7 +4121,7 @@ fn trace_port_receive_indexed_rt(
 // Closing a port releases its descriptors; the child may have detached from them.
 fn release_io(handle: &PortHandle) {
     // rfile_stop: release the ram_file_drv port data.
-    handle.ram_file.lock().unwrap().take();
+    handle.ram_file.lock().take();
     // Port of erts/emulator/beam/io.c:3698 (terminate_port) for a dynamic driver.
     if let Some(drv_port) = handle.driver.get()
         && drv_port.terminate()
@@ -4132,7 +4130,7 @@ fn release_io(handle: &PortHandle) {
         crate::ddll::port_closed(&handle.scheduler, drv_port.driver());
     }
     let waiters = {
-        let mut st = handle.state.lock().unwrap();
+        let mut st = handle.state.lock();
         st.closed = true;
         st.broken = true;
         st.busy_port = false;
@@ -4157,7 +4155,7 @@ fn remove_and_notify(
     from: Pid,
     reason: Term,
 ) -> Option<Arc<PortHandle>> {
-    let ports = runtime.ports.lock().unwrap();
+    let ports = runtime.ports.lock();
     let handle = runtime.ports.remove(id)?;
     runtime.port_ids.release(id);
     drop(ports);
@@ -4339,8 +4337,8 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
         return Err(badarg());
     }
     let old_owner = handle.owner_pid();
-    handle.links.lock().unwrap().insert(pid);
-    *handle.owner.lock().unwrap() = pid;
+    handle.links.lock().insert(pid);
+    *handle.owner.lock() = pid;
     let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS);
     if notify.is_none()
         && old_owner != pid
@@ -4404,7 +4402,7 @@ pub(crate) fn owner_exit(
     // Port of erts/emulator/beam/io.c:7143 (erts_fire_port_monitor): ports that
     // monitor the exiting process run their driver's `process_exit` callback.
     let fired: Vec<(Arc<arinsal_drv::DriverPort>, u64)> = {
-        let _ports = runtime.ports.lock().unwrap();
+        let _ports = runtime.ports.lock();
         runtime
             .ports
             .handles()
@@ -4413,7 +4411,7 @@ pub(crate) fn owner_exit(
                 let Some(drv_port) = handle.driver.get() else {
                     return Vec::new();
                 };
-                let mut monitors = handle.drv_monitors.lock().unwrap();
+                let mut monitors = handle.drv_monitors.lock();
                 let ids: Vec<u64> = monitors
                     .iter()
                     .filter(|(_, pid)| **pid == owner)
@@ -4433,24 +4431,23 @@ pub(crate) fn owner_exit(
     }
     let abnormal = reason != atom("normal");
     let affected = {
-        let _ports = runtime.ports.lock().unwrap();
+        let _ports = runtime.ports.lock();
         let handles = runtime.ports.handles();
         for handle in &handles {
             handle
                 .monitors
                 .lock()
-                .unwrap()
                 .retain(|_, monitor| monitor.pid != owner);
         }
         handles
             .iter()
             .filter_map(|handle| {
                 let id = handle.id;
-                let is_owner = *handle.owner.lock().unwrap() == owner;
+                let is_owner = *handle.owner.lock() == owner;
                 let linked = if handle.driver.get().is_some() {
-                    handle.links.lock().unwrap().contains(&owner)
+                    handle.links.lock().contains(&owner)
                 } else {
-                    handle.links.lock().unwrap().remove(&owner)
+                    handle.links.lock().remove(&owner)
                 };
                 (is_owner || (abnormal && linked)).then(|| (id, Arc::clone(handle)))
             })
@@ -4498,7 +4495,7 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
     if linked && !runtime.ports.contains(id) {
         return Ok(false);
     }
-    let mut links = handle.links.lock().unwrap();
+    let mut links = handle.links.lock();
     if linked {
         links.insert(pid);
     } else {
@@ -4509,7 +4506,7 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
     // A linked port is on the process link list. Exit scans ports only when that
     // list is non-empty (erl_process.c:14084, `erts_proc_exit_handle_link`).
     if linked && !runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS) {
-        handle.links.lock().unwrap().remove(&pid);
+        handle.links.lock().remove(&pid);
         return Ok(false);
     }
     if let Some(pid_term) = pid.to_term() {
@@ -4558,7 +4555,7 @@ fn register_monitor(
     name: Option<arinsal_term::Atom>,
     monitored: bool,
 ) -> Result<bool, VmError> {
-    if monitored && handle.state.lock().unwrap().exit_complete {
+    if monitored && handle.state.lock().exit_complete {
         return Ok(false);
     }
     // See `link`: same lock order as termination (table, then monitors).
@@ -4574,7 +4571,7 @@ fn register_monitor(
     {
         return Ok(false);
     }
-    let mut monitors = handle.monitors.lock().unwrap();
+    let mut monitors = handle.monitors.lock();
     if monitored {
         monitors.insert(reference, PortMonitor { pid, name });
         if let Some(runtime) = process.runtime.as_ref() {
@@ -4595,7 +4592,7 @@ pub(crate) fn linked_ports(process: &Process, pid: Pid) -> Vec<Term> {
         .ports
         .handles()
         .into_iter()
-        .filter(|handle| handle.links.lock().unwrap().contains(&pid))
+        .filter(|handle| handle.links.lock().contains(&pid))
         .map(|handle| handle.id)
         .collect();
     ids.sort_unstable();
@@ -4615,7 +4612,6 @@ pub(crate) fn driver_monitoring_ports(process: &Process, pid: Pid) -> Vec<Term> 
             handle
                 .drv_monitors
                 .lock()
-                .unwrap()
                 .values()
                 .any(|monitored| *monitored == pid)
         })
@@ -4638,7 +4634,6 @@ pub(crate) fn monitors_by(process: &Process, pid: Pid) -> Vec<OwnedTerm> {
             handle
                 .monitors
                 .lock()
-                .unwrap()
                 .values()
                 .filter(|monitor| monitor.pid == pid)
                 .map(|monitor| match monitor.name {
@@ -4679,7 +4674,7 @@ pub(crate) fn demonitor_port(process: &Process, caller: Pid, port_id: u64, refer
         drv_sig::demonitor(&handle, &drv, caller, reference);
         return;
     }
-    handle.monitors.lock().unwrap().remove(&reference);
+    handle.monitors.lock().remove(&reference);
 }
 
 /// Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `{command, Data}`; also
@@ -4740,7 +4735,7 @@ fn output_command(
             None,
         );
     }
-    let ram_file = handle.ram_file.lock().unwrap().clone();
+    let ram_file = handle.ram_file.lock().clone();
     if let Some(ram_file) = ram_file {
         if crate::ram_file_drv::command(&ram_file, handle, &data).is_err() {
             signal_badsig(handle, id);
@@ -4799,7 +4794,7 @@ pub(crate) fn nif_port_command(
     let Some(handle) = runtime.ports.get(id) else {
         return false;
     };
-    if handle.state.lock().unwrap().exit_complete {
+    if handle.state.lock().exit_complete {
         return false;
     }
     // Port of erts/emulator/beam/io.c:1603-1605 (erts_port_output_async): data that is not
@@ -4888,7 +4883,7 @@ fn send_message_inner(
         signal_badsig(&handle, id);
         return Ok(sent());
     };
-    let from_connected = *handle.owner.lock().unwrap() == from;
+    let from_connected = *handle.owner.lock() == from;
     let drv = handle.driver.get().cloned();
     if let Some(drv) = &drv
         && (parts[1] == atom("close")
@@ -4943,7 +4938,7 @@ fn send_message_inner(
             return Ok(sent());
         }
         let notify_now = {
-            let mut state = handle.state.lock().unwrap();
+            let mut state = handle.state.lock();
             if state.closed || state.graceful_close {
                 return Err(badarg());
             }
@@ -5001,7 +4996,7 @@ fn send_message_inner(
         // Port of erts/emulator/beam/io.c:1715-1754 (erts_port_output), OTP-29.1.1.
         // `SEND_YIELD` leaves an already-busy port command unsent and retries it after resume.
         if drv.is_none() {
-            let mut state = handle.state.lock().unwrap();
+            let mut state = handle.state.lock();
             if state.busy_port || state.busy_msgq {
                 if !nosuspend {
                     let pid = ctx.as_deref().map_or(from, |ctx| ctx.pid());
@@ -5178,21 +5173,13 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     let name = TermBuilder::new(&mut heap)
         .string_to_list(&handle.name)
         .map_err(|e| VmError::Unsupported(format!("port info name: {e:?}")))?;
-    let connected = handle.owner.lock().unwrap().to_term().ok_or_else(badarg)?;
+    let connected = handle.owner.lock().to_term().ok_or_else(badarg)?;
     let links = TermBuilder::new(&mut heap)
-        .list_from_iter(
-            handle
-                .links
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|pid| pid.to_term()),
-        )
+        .list_from_iter(handle.links.lock().iter().filter_map(|pid| pid.to_term()))
         .map_err(|e| VmError::Unsupported(format!("port info links: {e:?}")))?;
     let monitored_pids = handle
         .monitors
         .lock()
-        .unwrap()
         .values()
         .filter_map(|monitor| monitor.pid.to_term())
         .collect::<Vec<_>>();
@@ -5213,7 +5200,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         .map_err(|e| VmError::Unsupported(format!("port info monitors: {e:?}")))?;
     let memory = 48 + monitored_pids.len() * 24;
     let (input_count, output_count, outq_size) = {
-        let state = handle.state.lock().unwrap();
+        let state = handle.state.lock();
         (state.bytes_in, state.bytes_out, state.outq.len())
     };
     let input = port_counter_term(&mut heap, input_count)?;
