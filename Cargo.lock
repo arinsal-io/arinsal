@@ -171,6 +171,7 @@ dependencies = [
  "libc",
  "libloading",
  "num-bigint",
+ "smallvec",
 ]
 
 [[package]]
