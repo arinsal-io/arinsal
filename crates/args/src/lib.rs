@@ -253,6 +253,8 @@ pub struct EmulatorFlags {
     pub dirty_cpu_schedulers: Option<SchedulerCount>,
     /// `+SDio`.
     pub dirty_io_schedulers: Option<u32>,
+    /// `+IOs`: schedulers poll the descriptors that are re-enabled often (default true).
+    pub scheduler_polling: Option<bool>,
     /// `+P`.
     pub process_limit: Option<Limit>,
     /// `+Q`.
@@ -1345,6 +1347,19 @@ fn parse_emulator_flag(
             let v = require_plus_value(args, i, token, &mut consumed)?;
             out.dirty_cpu_schedulers = Some(dirty_cpu_schedulers(token, &v)?);
         }
+        "+IOs" => {
+            // Port of erts/emulator/sys/common/erl_check_io.c (parse_args +IOs), OTP-29.1.1.
+            let v = value(true, &mut consumed)?.unwrap();
+            out.scheduler_polling = Some(match v.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(scheduler_diagnostic(format!(
+                        "bad +IOs boolean argument: {v}"
+                    )));
+                }
+            });
+        }
         "+SDio" => {
             let v = value(true, &mut consumed)?.unwrap();
             out.dirty_io_schedulers = Some(positive_u32(token, &v)?);
@@ -1605,7 +1620,6 @@ fn ignored_kind(name: &str) -> Option<bool> {
         "+IOp",
         "+IOPt",
         "+IOPp",
-        "+IOs",
         "+pc",
         "+pad",
         "+rg",
