@@ -463,6 +463,7 @@ fn extended_x_fixtures_compile_with_beamasm() {
     for (file, module) in [
         ("jit_xmem.erl", "jit_xmem"),
         ("jit_xmem_asm.S", "jit_xmem_asm"),
+        ("jit_big_range.erl", "jit_big_range"),
     ] {
         let output = std::process::Command::new("erlc")
             .arg("-o")
