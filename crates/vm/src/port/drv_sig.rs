@@ -384,7 +384,7 @@ pub(crate) fn control(
     caller: Pid,
     drv: &Arc<DriverPort>,
     op: u32,
-    bytes: Vec<u8>,
+    bytes: smallvec::SmallVec<[u8; 256]>,
 ) -> Result<Term, VmError> {
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     let sched_flags = drv.sched_flags();

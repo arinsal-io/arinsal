@@ -145,7 +145,7 @@ impl NativeDriver for UdpInet {
         let cmd = i64::from(op).wrapping_sub(inet_drv::MAGIC);
         let reply = dispatch(&sock, Pid::from_data(port.caller()), cmd, data);
         settle(&sock);
-        Some(ControlReply::List(reply))
+        Some(ControlReply::List(reply.into()))
     }
 
     // Port of inet_drv.c (packet_inet_input).
