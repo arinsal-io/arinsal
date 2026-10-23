@@ -1124,6 +1124,19 @@ impl HashStorage {
         visit: impl FnOnce(HashIter<'_>) -> R,
     ) -> R {
         let hvalue = hval >> 1;
+        // Port of erts/emulator/beam/erl_db_hash.c (db_get_hash, RLOCK_HASH), OTP-29.1.1:
+        // without fine-grained locking, the caller's table lock keeps the hash directory
+        // stable, so lookup computes its slot once and reads the bucket without a stripe lock.
+        if matches!(self.stripes[0].buckets, StripeBuckets::Plain(_)) {
+            let slot = self.slot_index(hvalue);
+            let stripe = &self.stripes[self.stripe_index(slot)];
+            let StripeBuckets::Plain(buckets) = &stripe.buckets else {
+                unreachable!("all hash stripes use the same lock mode");
+            };
+            return visit(HashIter {
+                next: buckets[slot >> self.lock_shift].head.as_deref(),
+            });
+        }
         loop {
             let slot = self.slot_index(hvalue);
             let stripe = &self.stripes[self.stripe_index(slot)];

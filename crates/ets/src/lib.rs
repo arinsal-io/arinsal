@@ -5758,7 +5758,9 @@ struct NamedTableEntry {
 }
 
 struct NamedTableEntries {
-    data: Vec<NamedTableEntry>,
+    // Port of erts/emulator/beam/erl_db.c (meta_name_tab_bucket), OTP-29.1.1: one
+    // entry stays inline in the bucket snapshot; only collisions allocate overflow storage.
+    data: smallvec::SmallVec<[NamedTableEntry; 1]>,
 }
 
 /// Lock-free read index for named tables, matching OTP's `meta_name_tab` buckets.
@@ -5772,7 +5774,9 @@ pub struct NamedTableIndex {
 impl NamedTableIndex {
     /// Create an empty erts-sized name index.
     pub fn new() -> Self {
-        let empty = Arc::new(NamedTableEntries { data: Vec::new() });
+        let empty = Arc::new(NamedTableEntries {
+            data: smallvec::SmallVec::new(),
+        });
         Self {
             mask: META_NAME_TAB_BUCKET_COUNT - 1,
             buckets: (0..META_NAME_TAB_BUCKET_COUNT)
@@ -5822,9 +5826,11 @@ impl NamedTableIndex {
         }
 
         let size = current.data.len() + 1;
-        let old_capacity = current.data.capacity();
-        let capacity = old_capacity.max(named_entries_capacity(size));
-        let mut data = Vec::with_capacity(capacity);
+        let mut data = if size == 1 {
+            smallvec::SmallVec::new()
+        } else {
+            smallvec::SmallVec::with_capacity(size)
+        };
         data.extend(current.data.iter().cloned());
         data.push(NamedTableEntry { name, table });
         self.buckets[bucket_index].store(Arc::new(NamedTableEntries { data }));
@@ -5848,17 +5854,17 @@ impl NamedTableIndex {
         if size == 0 {
             self.buckets[bucket_index].store(Arc::clone(&self.empty));
         } else {
-            let mut data = Vec::with_capacity(named_entries_capacity(size));
+            let mut data = if size == 1 {
+                smallvec::SmallVec::new()
+            } else {
+                smallvec::SmallVec::with_capacity(size)
+            };
             data.extend(current.data[..index].iter().cloned());
             data.extend(current.data[index + 1..].iter().cloned());
             self.buckets[bucket_index].store(Arc::new(NamedTableEntries { data }));
         }
         true
     }
-}
-
-fn named_entries_capacity(size: usize) -> usize {
-    size.max(8).checked_next_power_of_two().unwrap_or(size)
 }
 
 impl Default for NamedTableIndex {

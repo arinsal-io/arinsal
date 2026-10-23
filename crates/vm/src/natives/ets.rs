@@ -757,9 +757,37 @@ fn direct_lookup(
     if args[0].is_magic_ref() {
         direct_lookup_cached(process, args)
             .or_else(|| direct_plain(process, args, module, function, lookup_args_member))
+    } else if args[0].as_atom().is_some() {
+        direct_lookup_named(process, args)
+            .or_else(|| direct_plain(process, args, module, function, lookup_args_member))
     } else {
         direct_plain(process, args, module, function, lookup_args_member)
     }
+}
+
+/// Successful `ets:lookup/2` for a named table, with the same lookup, lock, and copy steps as
+/// the BIF path. Errors decline to the scheduler path so it can build the proper exception.
+// Port of erts/emulator/beam/erl_db.c (ets_lookup_2, db_get_table_aux), OTP-29.1.1.
+fn direct_lookup_named(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let name = args[0].as_atom()?;
+    let pid = process.self_pid?;
+    let group = reader_group(process);
+    let rt = process.runtime.as_ref()?;
+    rt.named_ets
+        .with_table(name, |shared| {
+            let table = shared.read_at(group);
+            if table.is_detached()
+                || !table.options.named_table
+                || table.options.name != name
+                || table.is_busy()
+                || !read_allowed(&table, pid)
+            {
+                return None;
+            }
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            table.lookup_list_at(args[1], group, &mut heap).ok()
+        })
+        .flatten()
 }
 
 /// `lookup`/`member`/`insert`/`insert_new` through the registry, for named tables and
