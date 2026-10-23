@@ -1720,7 +1720,12 @@ fn type_matches_one(ty: char, value: &Operand) -> bool {
         'j' | 'L' | 'H' => matches!(value, Operand::Label(_) | Operand::U(_)),
         'a' => matches!(value, Operand::Atom(_)),
         'n' => matches!(value, Operand::Nil),
-        'i' => matches!(value, Operand::Int(_) | Operand::U(_) | Operand::Char(_)),
+        // Port of erts/emulator/beam/jit/arm/ops.tab (`i` is a small integer): OTP turns an
+        // integer outside SSMALL into a literal while reading the code, so it is no `i`.
+        'i' => {
+            matches!(value, Operand::Int(value) if is_small_integer(*value))
+                || matches!(value, Operand::U(_) | Operand::Char(_))
+        }
         'u' | 't' | 'I' | 'W' | 'A' | 'P' | 'Q' | 'b' | 'F' | 'e' | 'M' => {
             matches!(value, Operand::U(_) | Operand::Int(_))
         }
