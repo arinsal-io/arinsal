@@ -427,9 +427,17 @@ fn small_counter_ops(
         })
     };
     let single = operation.classify() == TermKind::Tuple;
-    let ops = update_list(operation, parse)
-        .into_iter()
-        .collect::<Option<smallvec::SmallVec<_>>>()?;
+    let mut ops = smallvec::SmallVec::new();
+    if single {
+        ops.push(parse(operation)?);
+    } else {
+        let mut rest = operation;
+        while rest != Term::NIL {
+            let (entry, tail) = list_next(rest)?;
+            ops.push(parse(entry)?);
+            rest = tail;
+        }
+    }
     Some((ops, single))
 }
 
@@ -442,7 +450,7 @@ fn counter_results<H: HeapAlloc>(
     if single {
         values.first().copied().ok_or_else(badarg)
     } else {
-        output_list(heap, values.to_vec())
+        output_list_slice(heap, values)
     }
 }
 
@@ -494,8 +502,14 @@ pub(crate) fn tuple_items(term: Term) -> Option<smallvec::SmallVec<[Term; 8]>> {
 }
 
 fn output_list<H: HeapAlloc>(heap: &mut H, items: Vec<Term>) -> Result<Term, VmError> {
+    output_list_slice(heap, &items)
+}
+
+// Port of erts/emulator/beam/erl_db.c:do_update_counter, OTP-29.1.1: reserve the result list
+// once, then fill it in result order while the BIF constructs its return value.
+fn output_list_slice<H: HeapAlloc>(heap: &mut H, items: &[Term]) -> Result<Term, VmError> {
     TermBuilder::new(heap)
-        .list_from_iter(items)
+        .list_from_slice(items)
         .map_err(|_| badarg())
 }
 
@@ -3396,7 +3410,10 @@ fn call_inner(
                 != WriteConcurrency::Disabled
             {
                 let table = registry.get_shared(tid).map_err(err)?;
-                if table.options.table_type == TableType::Set {
+                if matches!(
+                    table.options.table_type,
+                    TableType::Set | TableType::OrderedSet
+                ) {
                     if !allowed(&table, caller, true) {
                         return Err(badarg_cause("access"));
                     }
