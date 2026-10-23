@@ -8810,7 +8810,7 @@ impl Vm {
             code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
             breakpoints: Arc::new(crate::trace_bp::BpNode::new(self.code_scope)),
             debug_wait_active: AtomicBool::new(false),
-            system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
+            system_flags: Mutex::new(crate::natives::sys::SystemFlags::for_workers(workers)),
             gc_defaults: crate::natives::sys::GcDefaults::boot(),
             persistent_terms: arinsal_pterm::store_for(self.code_scope),
             multi_scheduling: Mutex::new(MultiScheduling::default()),
@@ -8835,7 +8835,7 @@ impl Vm {
         // `erts_no_schedulers` is what `system_info(schedulers)` reports; a run with fewer
         // worker threads than that keeps the layout of the reported scheduler count.
         arinsal_bifs::init_unique_scheduler_count(
-            config.workers.max(crate::natives::sys::schedulers_total()) as u32,
+            crate::natives::sys::scheduler_total_of(&runtime).max(config.workers) as u32,
             config.dirty_cpu_schedulers as u32,
             config.dirty_io_schedulers as u32,
         );
