@@ -1,17 +1,6 @@
-# Arinsal
+# Arinsal Mix package
 
-The `arinsal` Mix package lets Elixir projects run Mix commands using the
-Arinsal runtime. This package is currently intended for path-dependency use
-from inside the Arinsal repository; it builds the runtime from the repository's
-Cargo workspace.
-
-Add it to a Mix project in this repository:
-
-```elixir
-{:arinsal, path: "../../packages/arinsal"}
-```
-
-Then prefix a Mix command with `mix arinsal`:
+This package provides the `mix arinsal` task for projects that use Arinsal's source checkout. The task builds the CLI from the Arinsal Cargo workspace, creates an `erl` shim, and runs the requested Mix command with that shim first on `PATH`.
 
 ```sh
 mix arinsal compile
@@ -19,9 +8,6 @@ mix arinsal test
 mix arinsal run -e 'IO.puts(:hello)'
 ```
 
-The task builds the release runtime, creates `target/release/arinsal-erl-shim/erl`,
-and runs the requested Mix command with that shim first on `PATH`. Set
-`ARINSAL_PROFILE=debug` to use the faster debug build.
+Set `ARINSAL_PROFILE=debug` for a faster debug build. The standalone [arinsal-demo](https://github.com/arinsal-io/arinsal-demo) project installs a versioned runtime through the `arinsal-io/asdf-arinsal` plugin and does not depend on this in-tree Mix package.
 
-Requirements: the repository's Rust toolchain, Cargo, and an installed Erlang /
-Elixir toolchain for the initial Mix invocation.
+Requirements: the Arinsal repository checkout, its Rust toolchain and Cargo, and an installed Erlang / Elixir toolchain for the initial Mix invocation.

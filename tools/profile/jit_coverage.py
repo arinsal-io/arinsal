@@ -22,7 +22,7 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-DEMO = ROOT / "examples/arinsal_demo"
+DEMO = Path()
 OUT = ROOT / "tmp/jit-coverage"
 SUITES = [
     "pure",
@@ -208,10 +208,19 @@ def ensure_compare_baseline() -> None:
     env = os.environ.copy()
     env["MIX_ENV"] = "bench"
     print("shim + bench compile + erts check", flush=True)
-    build = run(["make", "shim"], DEMO, env, timeout=900)
+    build = run(["cargo", "build", "--release", "-p", "arinsal-cli"], ROOT, env, timeout=900)
     if build.returncode != 0:
         sys.stderr.write(build.stderr)
-        raise SystemExit(f"make shim failed: {build.returncode}")
+        raise SystemExit(f"Arinsal build failed: {build.returncode}")
+    shim = ROOT / "tmp/shim-release"
+    shim.mkdir(parents=True, exist_ok=True)
+    erl = shim / "erl"
+    erl.unlink(missing_ok=True)
+    erl.symlink_to(ROOT / "target/release/arinsal")
+    deps = run(["mix", "deps.get"], DEMO, env, timeout=600)
+    if deps.returncode != 0:
+        sys.stderr.write(deps.stderr[-2000:])
+        raise SystemExit(f"mix deps.get failed: {deps.returncode}")
     compile_env = env.copy()
     compiled = run(["mix", "compile"], DEMO, compile_env, timeout=600)
     if compiled.returncode != 0:
@@ -447,7 +456,15 @@ def main() -> None:
     parser.add_argument("--threshold", default="")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--reps", type=int, default=1)
+    parser.add_argument("--demo-dir", type=Path, default=os.environ.get("ARINSAL_DEMO_DIR"))
     args = parser.parse_args()
+    if args.command != "kernels" and args.demo_dir is None:
+        parser.error("set ARINSAL_DEMO_DIR or pass --demo-dir for demo-based commands")
+    if args.demo_dir is not None:
+        global DEMO
+        DEMO = args.demo_dir.expanduser().resolve()
+        if not DEMO.is_dir():
+            parser.error(f"demo directory does not exist: {DEMO}")
     extra: dict[str, str] = {"ARINSAL_JIT_STATS": "1"}
     if args.threshold:
         extra["ARINSAL_JIT_THRESHOLD"] = args.threshold

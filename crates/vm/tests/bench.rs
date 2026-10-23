@@ -19,7 +19,7 @@ fn benchmark_kernels_match_otp_small_cases() {
     let compiled = Command::new("erlc")
         .arg("-o")
         .arg(&dir)
-        .arg(root.join("bench/bench.erl"))
+        .arg(root.join("tools/bench/kernels/bench.erl"))
         .output();
     let Ok(compiled) = compiled else {
         eprintln!("erlc unavailable; skipping differential benchmark test");

@@ -43,7 +43,7 @@ constructions and 100,000 matches to OTP, plus widths 1..128, endianness,
 floats, UTF, bignums, binary slices, and error cases.
 
 `cargo run -p arinsal-bits --release --example binary_parse` performs the
-1024-byte frame parse from `bench/bench.erl` through this API. On the Apple M1
+1024-byte frame parse from `tools/bench/kernels/bench.erl` through this API. On the Apple M1
 Pro, 10,000 frames over 20 rounds measured 42.6 ns/frame in a release run after
 the term-backed context change. That figure excludes
 BEAM dispatch, GC, and list construction.
