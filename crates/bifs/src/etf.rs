@@ -1779,15 +1779,21 @@ fn decode_options(term: Option<Term>) -> Result<DecodeOpts, BifError> {
     };
     while tail != Term::NIL {
         // SAFETY: the option list remains live and stable during the BIF.
-        let (head, next) = unsafe { tail.cons_ref() }.ok_or(BifError::BADARG)?;
+        let (head, next) = unsafe { tail.cons_ref() }.ok_or_else(badopt)?;
         tail = next;
         match atom_text(head) {
             Some("safe") => opts.safe = true,
             Some("used") => opts.used = true,
-            _ => return Err(BifError::BADARG),
+            _ => return Err(badopt()),
         }
     }
     Ok(opts)
+}
+
+fn badopt() -> BifError {
+    BifError::Badarg {
+        cause: Some(Term::atom(arinsal_term::atoms::BADOPT)),
+    }
 }
 
 struct Reader {
@@ -1868,7 +1874,9 @@ enum FrameKind {
         hash: u32,
         term_start: usize,
     },
-    Tuple,
+    Tuple {
+        slots: Option<arinsal_term::HeapBlockBuilder>,
+    },
     List,
     Map,
     Export,
@@ -1896,20 +1904,59 @@ fn built<H: HeapAlloc>(
 ) -> Result<Term, BifError> {
     if let Some(ctx) = ctx.as_deref_mut() {
         let mut heap = Heap(&mut ctx.heap);
-        f(&mut TermBuilder::new(&mut heap)).map_err(|e| match e {
-            arinsal_term::TermError::SystemLimit => BifError::SystemLimit,
-            _ => BifError::BADARG,
-        })
+        f(&mut TermBuilder::new(&mut heap)).map_err(map_term_build_error)
     } else {
         Ok(Term::NIL)
     }
+}
+
+fn map_term_build_error(error: arinsal_term::TermError) -> BifError {
+    match error {
+        arinsal_term::TermError::SystemLimit => BifError::SystemLimit,
+        _ => BifError::BADARG,
+    }
+}
+
+// Port of erts/emulator/beam/external.c (dec_term, tuple_loop), OTP-29.1.1.
+fn reserve_tuple_slots<H: HeapAlloc>(
+    ctx: &mut Option<&mut Ctx<'_, H>>,
+    arity: usize,
+) -> Result<Option<arinsal_term::HeapBlockBuilder>, BifError> {
+    let Some(ctx) = ctx.as_deref_mut() else {
+        return Ok(None);
+    };
+    let mut heap = Heap(&mut ctx.heap);
+    TermBuilder::new(&mut heap)
+        .reserve_tuple_block(arity)
+        .map(Some)
+        .map_err(map_term_build_error)
+}
+
+// Port of erts/emulator/beam/external.c (dec_term, next child slot), OTP-29.1.1.
+fn accept_child(frame: &mut Frame, term: Term, shape: Shape) -> Result<(), BifError> {
+    if let FrameKind::Tuple { slots } = &mut frame.kind {
+        if let Some(slots) = slots {
+            slots.write_term(term).map_err(map_term_build_error)?;
+        }
+    } else {
+        frame.values.push(term);
+        frame.shapes.push(shape);
+    }
+    Ok(())
 }
 
 fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape), BifError> {
     let values = frame.values;
     match frame.kind {
         FrameKind::Local { .. } => Err(BifError::BADARG),
-        FrameKind::Tuple => Ok((built(ctx, |b| b.tuple(&values))?, Shape::Other)),
+        FrameKind::Tuple { slots } => {
+            let term = if let Some(slots) = slots {
+                slots.finish().map_err(map_term_build_error)?
+            } else {
+                Term::NIL
+            };
+            Ok((term, Shape::Other))
+        }
         FrameKind::List => {
             let mut it = values.into_iter().rev();
             let mut tail = it.next().ok_or(BifError::BADARG)?;
@@ -2146,11 +2193,12 @@ fn parse_step(
                 if n == 0 {
                     Some((built(&mut ctx, |b| b.tuple(&[]))?, Shape::Other))
                 } else {
+                    let slots = reserve_tuple_slots(&mut ctx, n)?;
                     stack.push(Frame {
-                        kind: FrameKind::Tuple,
+                        kind: FrameKind::Tuple { slots },
                         left: n,
-                        values: SmallVec::with_capacity(n.min(1024)),
-                        shapes: SmallVec::with_capacity(n.min(1024)),
+                        values: SmallVec::new(),
+                        shapes: SmallVec::new(),
                     });
                     None
                 }
@@ -2408,8 +2456,7 @@ fn parse_step(
                 let Some(frame) = stack.last_mut() else {
                     return Ok(Some((term, r.at)));
                 };
-                frame.values.push(term);
-                frame.shapes.push(shape);
+                accept_child(frame, term, shape)?;
                 frame.left -= 1;
                 if frame.left != 0 {
                     break;

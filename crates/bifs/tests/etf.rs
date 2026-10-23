@@ -1,6 +1,6 @@
 mod support;
 
-use arinsal_bifs::{Ctx, EncodeWalk, ProcessHeapHandle, lookup};
+use arinsal_bifs::{BifError, Ctx, EncodeWalk, ProcessHeapHandle, lookup};
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm as O};
 use arinsal_term::{
@@ -412,6 +412,34 @@ fn malformed_bytes_return_badarg() {
             equivalent(&ours, &otp),
             "input length {len}: {ours:?} != {otp:?}"
         );
+    }
+}
+
+#[test]
+fn invalid_binary_to_term_options_report_badopt_cause() {
+    let mut heap = ProcessHeap::with_words(128);
+    let mut allocator = ProcessHeapHandle(&mut heap);
+    let input = TermBuilder::new(&mut allocator)
+        .binary(&[131, 97, 1])
+        .unwrap();
+    let options = [
+        O::atom("bad"),
+        O::Int(1),
+        O::list(vec![O::atom("bad")]),
+        O::List {
+            elems: vec![O::atom("safe")],
+            tail: Box::new(O::atom("bad")),
+        },
+    ];
+    let decode = lookup("erlang", "binary_to_term", 2).unwrap();
+    for option in options {
+        let option = from_owned(&option, &mut allocator).unwrap();
+        let mut ctx = Ctx::new(&mut allocator);
+        let error = decode(&mut ctx, &[input, option]).unwrap_err();
+        let BifError::Badarg { cause: Some(cause) } = error else {
+            panic!("invalid option returned {error:?}");
+        };
+        assert_eq!(cause.as_atom(), Some(arinsal_term::atoms::BADOPT));
     }
 }
 
