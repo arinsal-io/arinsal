@@ -3540,6 +3540,58 @@ impl PortData {
     }
 }
 
+/// Errors of a port BIF as the exception a light BIF raises; any other failure declines.
+fn light_result(result: Result<Term, VmError>) -> Option<Result<Term, crate::exceptions::Trap>> {
+    match result {
+        Ok(term) => Some(Ok(term)),
+        Err(VmError::Trap(trap)) => Some(Err(trap)),
+        Err(_) => None,
+    }
+}
+
+/// `erts_internal:port_info/1,2` called from the generated code with `c_p` only.
+// Port of erts/emulator/beam/erl_bif_port.c (erts_internal_port_info_1/2), OTP-29.1.1.
+pub(crate) fn port_info_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    match args {
+        [port] => light_result(port_info(process, *port, None)),
+        [port, item] => light_result(port_info(process, *port, Some(*item))),
+        _ => None,
+    }
+}
+
+/// `erts_internal:port_connect/2` called from the generated code with `c_p` only.
+// Port of erts/emulator/beam/erl_bif_port.c (erts_internal_port_connect_2), OTP-29.1.1.
+pub(crate) fn port_connect_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [port, pid] = args else {
+        return None;
+    };
+    light_result(connect(process, *port, *pid, None))
+}
+
+/// `erts_internal:port_close/1` called from the generated code with `c_p` only: the close
+/// signal executes at once when the port is free, else it is scheduled and the caller gets the
+/// reference to wait for.
+// Port of erts/emulator/beam/erl_bif_port.c:405 (erts_internal_port_close_1), OTP-29.1.1.
+pub(crate) fn port_close_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [port] = args else {
+        return None;
+    };
+    if crate::trace::active() {
+        return None;
+    }
+    let caller = process.self_pid?;
+    light_result(port_close(process, None, caller, *port))
+}
+
 // Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
 fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
     let handle = lookup_port(process, port)?;
@@ -3589,7 +3641,10 @@ pub(crate) fn family(
         ("port_command", [port, data, _]) if module == "erts_internal" => {
             port_command(process, ctx, *port, *data, args)
         }
-        ("port_close", [port]) if module == "erts_internal" => port_close(process, ctx, *port),
+        ("port_close", [port]) if module == "erts_internal" => {
+            let caller = ctx.pid();
+            port_close(process, Some(ctx), caller, *port)
+        }
         ("port_connect", [port, pid]) if module == "erts_internal" => {
             connect(process, *port, *pid, None)
         }
@@ -4149,10 +4204,10 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
 // Port of erts/emulator/beam/erl_bif_port.c:233 (erts_internal_port_close_1), OTP-29.1.1.
 fn port_close(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: Option<&mut RunCtx<'_, Message>>,
+    caller: Pid,
     port: Term,
 ) -> Result<Term, VmError> {
-    let caller = ctx.pid();
     if let Some(id) = port_id(process, port)
         && let Some(handle) = process
             .runtime
@@ -4164,18 +4219,12 @@ fn port_close(
         // (drv_sig::exit, io.c:2196 call_deliver_port_exit).
         let normal = OwnedTerm::Atom("normal".into());
         return match drv_sig::exit(
-            process,
-            Some(ctx),
-            caller,
-            &handle,
-            &drv,
-            false,
-            caller,
-            normal,
-            true,
+            process, ctx, caller, &handle, &drv, false, caller, normal, true,
         ) {
             Ok(Some(reference)) => drv_sig::reference_term(process, reference),
             Ok(None) => Ok(atom("true")),
+            // The light BIF has no scheduler context to schedule the signal with.
+            Err(error @ VmError::Unsupported(_)) => Err(error),
             // erl_bif_port.c:405: a dropped close answers `badarg`.
             Err(_) => Ok(atom("badarg")),
         };

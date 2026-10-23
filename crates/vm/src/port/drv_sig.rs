@@ -653,6 +653,12 @@ pub(crate) fn exit(
         Err(ImmFail::InvalidPort) => return Err(badarg()),
         Err(_) => {}
     }
+    if want_ref && ctx.is_none() {
+        // The light BIF declines: nothing was done yet, the executor schedules the signal.
+        return Err(VmError::Unsupported(
+            "close needs the scheduler context".into(),
+        ));
+    }
     let (reply, reference) = if want_ref {
         let (reply, reference) = Reply::new(caller, runtime.scheduler_arc()?);
         (Some(reply), Some(reference))
@@ -660,9 +666,7 @@ pub(crate) fn exit(
         (None, None)
     };
     // Port of erts/emulator/beam/io.c:1203 (erts_schedule_proc2port_signal), OTP-29.1.1.
-    if want_ref {
-        // A reply reference is only created for a process caller, which always has a context.
-        let ctx = ctx.expect("a reply reference is created only for a process caller");
+    if let Some(ctx) = ctx.filter(|_| want_ref) {
         set_save_end(process, ctx);
     }
     let task_handle = Arc::clone(handle);
