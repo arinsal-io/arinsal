@@ -3,7 +3,7 @@
 use super::{EtsError, HeapAlloc, RangeSelection, StoredTerm, Term, TreeDbTerm, cmp};
 use crate::dbterm::DbTreeStack;
 use crate::rwmtx::{RwMtxLock, RwMtxReadGuard, RwMtxWriteGuard};
-use crate::tree::{Node, TreeRoot};
+use crate::tree::{InsertResult, Node, TreeRoot};
 use arc_swap::ArcSwap;
 use arinsal_term::{TermBuilder, VecHeap};
 use std::cmp::Ordering;
@@ -409,6 +409,49 @@ impl CATree {
             drop(root);
             self.adapt(base, stat);
             return result;
+        }
+    }
+
+    /// Run `db_update_counter` under one CA-tree route lock and tree descent.
+    // Port of erts/emulator/beam/erl_db_catree.c:db_lookup_dbterm_catree and
+    // db_finalize_dbterm_catree, OTP-29.1.1.
+    pub(crate) fn update_counter(
+        &self,
+        key: Term,
+        update: impl FnOnce(Option<&mut TreeDbTerm>) -> Result<(Option<TreeDbTerm>, isize), EtsError>,
+    ) -> Result<InsertResult, EtsError> {
+        let mut update = Some(update);
+        loop {
+            let routes = self.routes.load();
+            let base = routes.find_base(key);
+            let mut root = base.write();
+            if !base.is_valid.load(AtomicOrdering::Acquire) {
+                drop(root);
+                drop(routes);
+                std::thread::yield_now();
+                continue;
+            }
+            let mut memory_delta = 0;
+            let result = root.update_counter(key, self.keypos, |found| {
+                let (replacement, delta) = update
+                    .take()
+                    .expect("CA-tree counter update retained on retry")(
+                    found
+                )?;
+                memory_delta = delta;
+                Ok(replacement)
+            });
+            self.version.fetch_add(1, AtomicOrdering::Release);
+            let result = result?;
+            if matches!(result, InsertResult::Inserted) {
+                self.nitems.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.memory_words
+                .fetch_add(memory_delta, AtomicOrdering::Relaxed);
+            let stat = base.lock_statistics.load(AtomicOrdering::Relaxed);
+            drop(root);
+            self.adapt(base, stat);
+            return Ok(result);
         }
     }
 

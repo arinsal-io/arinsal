@@ -40,6 +40,22 @@ pub fn copy_struct<H: HeapAlloc + ?Sized>(
     copy_struct_x(root, size, dst, None)
 }
 
+/// Copy one ETS tuple element into its sized destination block.
+///
+/// Port of `copy_ets_element` in erts/emulator/beam/erl_db_util.c:3521, OTP-29.1.1.
+pub fn copy_ets_element<H: HeapAlloc + ?Sized>(
+    root: Term,
+    dst: &mut H,
+    size: usize,
+) -> Result<Term, TermError> {
+    if root.is_immed() || size == 0 {
+        return Ok(root);
+    }
+    validate_destination(root, dst)?;
+    let base = dst.alloc(size).ok_or(TermError::HeapFull)?;
+    copy_struct_into(root, base, size, dst, None, true)
+}
+
 /// Whether `block` is a self-contained heap block that [`copy_shallow`] can copy word by word:
 /// `root` is its first word, every pointer stays inside it (or is the empty tuple literal) and
 /// it holds no off-heap thing (binary references, sub-bitstrings, external or magic things),
@@ -264,7 +280,7 @@ fn copy_struct_x<H: HeapAlloc + ?Sized>(
         return Ok(root);
     }
     let base = dst.alloc(size).ok_or(TermError::HeapFull)?;
-    copy_struct_into(root, base, size, dst, litopt)
+    copy_struct_into(root, base, size, dst, litopt, false)
 }
 
 enum CopyAt {
@@ -279,13 +295,14 @@ fn copy_struct_into<H: HeapAlloc + ?Sized>(
     size: usize,
     dst: &mut H,
     litopt: Option<&LiteralAreas>,
+    ets_element: bool,
 ) -> Result<Term, TermError> {
     let hstart = base;
     let hsize = size * 8;
     let mut hp = base;
     let mut htop = base;
     // SAFETY: `base` addresses `size` reserved words; `hbot` is the end pointer.
-    let mut hbot = unsafe { base.add(size) };
+    let mut hbot = base.wrapping_add(size);
     let mut res = 0u64;
     let mut const_tuple: *mut u64 = std::ptr::null_mut();
     let mut at = match root.0 & 3 {
@@ -297,11 +314,36 @@ fn copy_struct_into<H: HeapAlloc + ?Sized>(
     // source pointer is a live cons or boxed object. Off-heap owners are
     // retained on `dst` the way copy_struct links them into `off_heap`.
     unsafe {
+        if ets_element && root.0 & 3 == 1 {
+            let source = root.raw_ptr();
+            let head = Term(*source);
+            if head.is_immed() {
+                if size < 2 {
+                    return Err(TermError::BadArg);
+                }
+                *base = head.0;
+                let tail = Term(*source.add(1));
+                let tail_size = size - 2;
+                let copied_tail = if tail.is_immed() || tail_size == 0 {
+                    tail
+                } else {
+                    copy_struct_into(tail, base.add(2), tail_size, dst, litopt, false)?
+                };
+                *base.add(1) = copied_tail.0;
+                let copied = Term::from_ptr(base, 1);
+                debug_assert_eq!(copied.0 & !7, base as u64);
+                return Ok(copied);
+            }
+        }
         loop {
             match at {
                 CopyAt::Scan => {
                     if hp == htop {
-                        debug_assert_eq!(htop, hbot, "copy_struct htop/hbot");
+                        debug_assert_eq!(
+                            htop, hbot,
+                            "copy_struct htop/hbot root={:#x} size={size}",
+                            root.0
+                        );
                         return Ok(Term(res));
                     }
                     let obj = Term(*hp);
@@ -973,5 +1015,49 @@ mod flat_tuple_tests {
         let empty = TermBuilder::new(&mut source).tuple(&[]).unwrap();
         assert!(copy_flat_tuple(empty, &mut dst).is_none());
         assert!(copy_flat_tuple(Term::small(1).unwrap(), &mut dst).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ets_element_tests {
+    use super::*;
+    use crate::{HeapAlloc, TermBuilder, VecHeap};
+
+    #[test]
+    fn immediate_head_list_starts_at_the_element_block() {
+        let mut source = VecHeap::new();
+        let tail = TermBuilder::new(&mut source)
+            .tuple(&[Term::small(2).unwrap()])
+            .unwrap();
+        let root = TermBuilder::new(&mut source)
+            .cons(Term::small(1).unwrap(), tail)
+            .unwrap();
+        let size = crate::size_object(root);
+
+        let mut destination = VecHeap::new();
+        let first = destination.alloc(1).unwrap();
+        let expected = (first.wrapping_add(1) as u64) | 1;
+        let copied = copy_ets_element(root, &mut destination, size).unwrap();
+
+        similar_asserts::assert_eq!(copied.tagged_word(), expected);
+        similar_asserts::assert_eq!(
+            crate::to_owned(copied).unwrap(),
+            crate::to_owned(root).unwrap()
+        );
+    }
+
+    #[test]
+    fn immediate_tail_uses_only_the_reserved_cons_cell() {
+        let mut source = VecHeap::new();
+        let root = TermBuilder::new(&mut source)
+            .cons(Term::small(1).unwrap(), Term::NIL)
+            .unwrap();
+        let mut destination = VecHeap::new();
+        let first = destination.alloc(1).unwrap();
+        let expected = (first.wrapping_add(1) as u64) | 1;
+        let copied = copy_ets_element(root, &mut destination, 2).unwrap();
+
+        similar_asserts::assert_eq!(copied.tagged_word(), expected);
+        similar_asserts::assert_eq!(destination.used_words(), 3);
     }
 }

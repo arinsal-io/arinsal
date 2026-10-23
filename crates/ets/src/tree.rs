@@ -139,6 +139,22 @@ impl TreeRoot {
         Ok((result, new_words))
     }
 
+    /// Update one key during the same tree descent used by `db_lookup_dbterm_tree`.
+    // Port of erts/emulator/beam/erl_db_tree.c (db_lookup_dbterm_tree_common), OTP-29.1.1.
+    pub(super) fn update_counter(
+        &mut self,
+        key: Term,
+        keypos: usize,
+        update: impl FnOnce(Option<&mut TreeDbTerm>) -> Result<Option<TreeDbTerm>, EtsError>,
+    ) -> Result<InsertResult, EtsError> {
+        self.version += 1;
+        let result = tree_put(&mut self.root, key, keypos, false, update)?;
+        if matches!(result, InsertResult::Inserted) {
+            self.nitems = self.nitems.wrapping_add(1);
+        }
+        Ok(result)
+    }
+
     /// Unlink the object with `key` and return it.
     // Port of erts/emulator/beam/erl_db_tree.c (linkout_tree), OTP-29.1.1.
     pub(super) fn linkout(&mut self, key: Term, keypos: usize) -> Option<TreeDbTerm> {

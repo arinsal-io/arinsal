@@ -40,8 +40,8 @@ pub use bits::{
     writable_gc_visit, writable_resize_private,
 };
 pub use copy::{
-    SharedCopyCache, copy_flat_tuple, copy_shallow, copy_shared, copy_struct, copy_struct_litopt,
-    copy_term, copy_term_litopt, copy_term_preserving_sharing,
+    SharedCopyCache, copy_ets_element, copy_flat_tuple, copy_shallow, copy_shared, copy_struct,
+    copy_struct_litopt, copy_term, copy_term_litopt, copy_term_preserving_sharing,
     copy_term_preserving_sharing_with_cache, shallow_copyable,
 };
 pub use fun::{

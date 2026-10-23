@@ -506,15 +506,18 @@ impl HashStorage {
     ) -> Result<bool, EtsError> {
         let hvalue = hash >> 1;
         let slot = self.slot_index(hvalue);
-        let order = self.next_order.fetch_add(1, Ordering::Relaxed);
-        let (accepted, added, memory_delta, _) = put_term_in_bucket(
-            self.segment_bucket_mut(slot),
-            term,
-            key,
-            hvalue,
-            options,
-            || order,
-        )?;
+        let stripe = self.stripe_index(slot);
+        let locks = self.nlocks;
+        let next_order = &self.next_order;
+        let bucket = self.stripes[stripe]
+            .buckets
+            .get_mut()
+            .get_mut(slot / locks)
+            .unwrap();
+        let (accepted, added, memory_delta, _) =
+            put_term_in_bucket(bucket, term, key, hvalue, options, || {
+                next_order.fetch_add(1, Ordering::Relaxed)
+            })?;
         self.add_object_memory(hvalue, memory_delta);
         if added {
             self.add_items(hash, 1);
@@ -743,6 +746,78 @@ impl HashStorage {
             self.grow_after_insert(hash, fixed);
         }
         Ok(changed)
+    }
+
+    /// `update_or_insert_shared` while the caller owns the table's exclusive lock.
+    // Port of erts/emulator/beam/erl_db_hash.c (db_lookup_dbterm_hash/db_finalize_dbterm_hash),
+    // OTP-29.1.1.
+    pub(super) fn update_or_insert_exclusive<E>(
+        &mut self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        fixed: bool,
+        update: impl FnOnce(Option<&mut HashDbTerm>) -> Result<StoreOutcome, E>,
+    ) -> Result<bool, E> {
+        let hvalue = hash >> 1;
+        let slot = self.slot_index(hvalue);
+        let stripe = self.stripe_index(slot);
+        let locks = self.nlocks;
+        let next_order = &self.next_order;
+        let mut link = &mut self.stripes[stripe]
+            .buckets
+            .get_mut()
+            .get_mut(slot / locks)
+            .unwrap()
+            .head;
+        while link
+            .as_ref()
+            .is_some_and(|node| node.prefix.hvalue != hvalue || !exact_key(node.key(keypos), key))
+        {
+            link = &mut link.as_mut().unwrap().prefix.next;
+        }
+        let found = link.as_mut().filter(|node| !node.prefix.pseudo_deleted);
+        let old_words = found.as_ref().map(|node| node.db_size_words);
+        let outcome = update(found)?;
+        let mut replacement = match outcome {
+            StoreOutcome::Nothing => return Ok(false),
+            StoreOutcome::InPlace => {
+                let node = link.as_ref().expect("an in-place update found a node");
+                let delta = node.db_size_words as isize
+                    - old_words.expect("an in-place update found a node") as isize;
+                self.add_object_memory(hvalue, delta);
+                return Ok(true);
+            }
+            StoreOutcome::New(replacement) => replacement,
+        };
+        replacement.prefix.hvalue = hvalue;
+        let (inserted, memory_delta) = if let Some(node) = link.as_mut() {
+            let revived = node.prefix.pseudo_deleted;
+            let memory_delta = replacement.db_size_words as isize
+                - if revived {
+                    0
+                } else {
+                    node.db_size_words as isize
+                };
+            replacement.prefix.order = node.prefix.order;
+            replacement.prefix.group_order = node.prefix.group_order;
+            replacement.prefix.next = node.prefix.next.take();
+            *link = Some(replacement);
+            (revived, memory_delta)
+        } else {
+            let memory_delta = replacement.db_size_words as isize;
+            replacement.prefix.order = next_order.fetch_add(1, Ordering::Relaxed);
+            replacement.prefix.group_order = replacement.prefix.order;
+            replacement.prefix.next = link.take();
+            *link = Some(replacement);
+            (true, memory_delta)
+        };
+        self.add_object_memory(hvalue, memory_delta);
+        if inserted {
+            self.add_items(hash, 1);
+            self.maybe_grow(fixed, keypos);
+        }
+        Ok(true)
     }
 
     pub(super) fn delete_object_shared(
