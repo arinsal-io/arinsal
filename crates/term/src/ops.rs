@@ -794,6 +794,13 @@ pub fn cmp(a: Term, b: Term) -> Ordering {
 ///
 /// This is the ordering used by `erts_internal:cmp_term/2` and map keys.
 pub fn cmp_exact(a: Term, b: Term) -> Ordering {
+    // Keep the same immediate path as cmp before constructing the compound work stack.
+    if let (Some(left), Some(right)) = (a.as_atom(), b.as_atom()) {
+        return global_atoms().cmp_atoms(left, right);
+    }
+    if let (Some(left), Some(right)) = (a.as_small(), b.as_small()) {
+        return left.cmp(&right);
+    }
     cmp_impl(a, b, true)
 }
 fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
@@ -1039,11 +1046,6 @@ struct CmpArrayPair<'a> {
     right: CmpArray<'a>,
 }
 
-enum CmpMapState {
-    Hashmap,
-    FlatmapAtomValues,
-}
-
 struct CmpHashmapState {
     left: crate::hamt::PairIter,
     right: crate::hamt::PairIter,
@@ -1070,6 +1072,14 @@ struct CmpFlatmapAtomValuesState {
     arrays_rollback: usize,
 }
 
+// Map frames are held in a Vec so this large iterator state stays off the hot comparison frame;
+// boxing the hashmap variant would add a second allocation to the existing hashmap path.
+#[allow(clippy::large_enum_variant)]
+enum CmpMapFrame {
+    Hashmap(CmpHashmapState),
+    FlatmapAtomValues(CmpFlatmapAtomValuesState),
+}
+
 enum CmpAction {
     Compare(Term, Term, bool),
     Return(Ordering),
@@ -1077,12 +1087,13 @@ enum CmpAction {
 
 // Port of the WSTACK work words in utils.c:1658-2735; typed array views are
 // referenced by LIFO indices so the work stack never stores or dereferences raw pointers.
+// Port of WSTACK_DECLARE(stack) and PSTACK_DECLARE(map_stack, 1) in
+// erts/emulator/beam/utils.c:1688-1701, OTP-29.1.1. Work words and the first array view
+// stay inline for the common shallow compound case; deeper map state grows only on demand.
 struct CmpStack<'a> {
     words: SmallVec<[u64; 16]>,
-    arrays: Vec<CmpArrayPair<'a>>,
-    maps: Vec<CmpMapState>,
-    hashmaps: Vec<CmpHashmapState>,
-    flatmap_atom_values: Vec<CmpFlatmapAtomValuesState>,
+    arrays: SmallVec<[CmpArrayPair<'a>; 2]>,
+    map_frames: Vec<CmpMapFrame>,
 }
 
 const WORK_OP_MASK: u64 = 0xF;
@@ -1104,11 +1115,41 @@ impl<'a> CmpStack<'a> {
     fn new() -> Self {
         Self {
             words: SmallVec::new(),
-            arrays: Vec::new(),
-            maps: Vec::new(),
-            hashmaps: Vec::new(),
-            flatmap_atom_values: Vec::new(),
+            arrays: SmallVec::new(),
+            map_frames: Vec::new(),
         }
+    }
+
+    #[inline]
+    fn hashmap_state(&self) -> &CmpHashmapState {
+        let Some(CmpMapFrame::Hashmap(state)) = self.map_frames.last() else {
+            unreachable!("hashmap state is present");
+        };
+        state
+    }
+
+    #[inline]
+    fn hashmap_state_mut(&mut self) -> &mut CmpHashmapState {
+        let Some(CmpMapFrame::Hashmap(state)) = self.map_frames.last_mut() else {
+            unreachable!("hashmap state is present");
+        };
+        state
+    }
+
+    #[inline]
+    fn flatmap_atom_values_state(&self) -> &CmpFlatmapAtomValuesState {
+        let Some(CmpMapFrame::FlatmapAtomValues(state)) = self.map_frames.last() else {
+            unreachable!("flatmap atom value state is present");
+        };
+        state
+    }
+
+    #[inline]
+    fn flatmap_atom_values_state_mut(&mut self) -> &mut CmpFlatmapAtomValuesState {
+        let Some(CmpMapFrame::FlatmapAtomValues(state)) = self.map_frames.last_mut() else {
+            unreachable!("flatmap atom value state is present");
+        };
+        state
     }
 
     #[inline(always)]
@@ -1197,17 +1238,16 @@ impl<'a> CmpStack<'a> {
         self.words.push(Self::op_word(operation, exact));
         let rollback = self.words.len();
         let arrays_rollback = self.arrays.len();
-        match self.maps.last().expect("map work state is present") {
-            CmpMapState::Hashmap => {
-                let state = self.hashmaps.last_mut().expect("hashmap state is present");
+        match self
+            .map_frames
+            .last_mut()
+            .expect("map work state is present")
+        {
+            CmpMapFrame::Hashmap(state) => {
                 state.rollback = rollback;
                 state.arrays_rollback = arrays_rollback;
             }
-            CmpMapState::FlatmapAtomValues => {
-                let state = self
-                    .flatmap_atom_values
-                    .last_mut()
-                    .expect("flatmap atom value state is present");
+            CmpMapFrame::FlatmapAtomValues(state) => {
                 state.rollback = rollback;
                 state.arrays_rollback = arrays_rollback;
             }
@@ -1223,7 +1263,7 @@ impl<'a> CmpStack<'a> {
         let (Some((left_key, _)), Some((right_key, _))) = (ap, bp) else {
             return CmpAction::Return(Ordering::Equal);
         };
-        self.hashmaps.push(CmpHashmapState {
+        self.map_frames.push(CmpMapFrame::Hashmap(CmpHashmapState {
             left,
             right,
             ap,
@@ -1233,8 +1273,7 @@ impl<'a> CmpStack<'a> {
             was_exact: exact,
             rollback: 0,
             arrays_rollback: self.arrays.len(),
-        });
-        self.maps.push(CmpMapState::Hashmap);
+        }));
         self.push_map_operation(CMP_HASHMAP_PHASE1_KEYS_OP, true);
         CmpAction::Compare(left_key, right_key, true)
     }
@@ -1333,19 +1372,12 @@ impl<'a> CmpStack<'a> {
     fn resume_result(&mut self, mut result: Ordering) -> CmpAction {
         loop {
             if result != Ordering::Equal {
-                let Some(state) = self.maps.last() else {
+                let Some(state) = self.map_frames.last() else {
                     return CmpAction::Return(result);
                 };
                 let (rollback, arrays_rollback) = match state {
-                    CmpMapState::Hashmap => {
-                        let state = self.hashmaps.last().expect("hashmap state is present");
-                        (state.rollback, state.arrays_rollback)
-                    }
-                    CmpMapState::FlatmapAtomValues => {
-                        let state = self
-                            .flatmap_atom_values
-                            .last()
-                            .expect("flatmap atom value state is present");
+                    CmpMapFrame::Hashmap(state) => (state.rollback, state.arrays_rollback),
+                    CmpMapFrame::FlatmapAtomValues(state) => {
                         (state.rollback, state.arrays_rollback)
                     }
                 };
@@ -1446,32 +1478,32 @@ impl<'a> CmpStack<'a> {
         let start = self.words.pop().expect("array start is present") as usize;
         let left_map = Term(self.words.pop().expect("left map is present"));
         let right_map = Term(self.words.pop().expect("right map is present"));
-        self.flatmap_atom_values.push(CmpFlatmapAtomValuesState {
-            left_map,
-            right_map,
-            start,
-            count,
-            next_index: start,
-            current_key: None,
-            min_key: None,
-            cmp_res: Ordering::Equal,
-            exact,
-            rollback: 0,
-            arrays_rollback: self.arrays.len(),
-        });
-        self.maps.push(CmpMapState::FlatmapAtomValues);
+        self.map_frames
+            .push(CmpMapFrame::FlatmapAtomValues(CmpFlatmapAtomValuesState {
+                left_map,
+                right_map,
+                start,
+                count,
+                next_index: start,
+                current_key: None,
+                min_key: None,
+                cmp_res: Ordering::Equal,
+                exact,
+                rollback: 0,
+                arrays_rollback: self.arrays.len(),
+            }));
         self.start_next_flatmap_atom_value()
     }
 
     fn resume_flatmap_atom_values(&mut self, result: Ordering) -> CmpAction {
         if result != Ordering::Equal {
-            if !matches!(self.maps.last(), Some(CmpMapState::FlatmapAtomValues)) {
+            if !matches!(
+                self.map_frames.last(),
+                Some(CmpMapFrame::FlatmapAtomValues(_))
+            ) {
                 unreachable!("flatmap atom value state is present");
             }
-            let state = self
-                .flatmap_atom_values
-                .last_mut()
-                .expect("flatmap atom value state is present");
+            let state = self.flatmap_atom_values_state_mut();
             state.min_key = state.current_key;
             state.cmp_res = result;
         }
@@ -1481,9 +1513,7 @@ impl<'a> CmpStack<'a> {
     // Port of FLATMAP_ATOM_VALUES in utils.c:2672-2717, OTP-29.1.1.
     fn start_next_flatmap_atom_value(&mut self) -> CmpAction {
         let (left_map, right_map, end, mut index, min_key, exact) = {
-            let Some(state) = self.flatmap_atom_values.last() else {
-                unreachable!("flatmap atom value state is present");
-            };
+            let state = self.flatmap_atom_values_state();
             (
                 state.left_map,
                 state.right_map,
@@ -1511,11 +1541,10 @@ impl<'a> CmpStack<'a> {
         })
         .expect("left map is a live flatmap");
         let Some((value_index, key)) = found else {
-            let Some(CmpMapState::FlatmapAtomValues) = self.maps.pop() else {
+            let Some(CmpMapFrame::FlatmapAtomValues(state)) = self.map_frames.pop() else {
                 unreachable!("flatmap atom value state is present");
             };
-            let cmp_res = self.flatmap_atom_values.pop().unwrap().cmp_res;
-            return CmpAction::Return(cmp_res);
+            return CmpAction::Return(state.cmp_res);
         };
         let (left_value, right_value) =
             crate::hamt::with_flatmap_arrays(left_map, |_, left_values| {
@@ -1528,10 +1557,7 @@ impl<'a> CmpStack<'a> {
                 .expect("right map is a live flatmap")
             })
             .expect("left map is a live flatmap");
-        let state = self
-            .flatmap_atom_values
-            .last_mut()
-            .expect("flatmap atom value state is present");
+        let state = self.flatmap_atom_values_state_mut();
         state.next_index = index;
         state.current_key = Some(key);
         self.push_map_operation(CMP_FLATMAP_ATOM_VALUES_RESULT_OP, exact);
@@ -1543,7 +1569,7 @@ impl<'a> CmpStack<'a> {
         match operation {
             CMP_HASHMAP_PHASE1_KEYS_OP => {
                 if result != Ordering::Equal {
-                    let state = self.hashmaps.last().expect("hashmap state is present");
+                    let state = self.hashmap_state();
                     let hash_order = hashmap_key_hash_order(
                         state.ap.map(|pair| pair.0),
                         state.bp.map(|pair| pair.0),
@@ -1553,7 +1579,7 @@ impl<'a> CmpStack<'a> {
                     } else {
                         hash_order
                     };
-                    let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                    let state = self.hashmap_state_mut();
                     if side == Ordering::Less {
                         state.min_key = state.ap.map(|pair| pair.0);
                         state.cmp_res = Ordering::Less;
@@ -1565,7 +1591,7 @@ impl<'a> CmpStack<'a> {
                     }
                     self.start_hashmap_phase2()
                 } else {
-                    let state = self.hashmaps.last().expect("hashmap state is present");
+                    let state = self.hashmap_state();
                     let candidate = (state.cmp_res != Ordering::Equal)
                         .then_some(state.min_key)
                         .flatten();
@@ -1594,18 +1620,18 @@ impl<'a> CmpStack<'a> {
             CMP_HASHMAP_PHASE1_VALUES_OP => {
                 if result != Ordering::Equal {
                     let left_key = self.hashmap_current_left_key();
-                    let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                    let state = self.hashmap_state_mut();
                     state.cmp_res = result;
                     state.min_key = Some(left_key);
                 }
-                let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                let state = self.hashmap_state_mut();
                 state.ap = state.left.next();
                 state.bp = state.right.next();
                 self.start_hashmap_phase1()
             }
             CMP_HASHMAP_PHASE2_KEYS_OP => {
                 if result == Ordering::Equal {
-                    let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                    let state = self.hashmap_state_mut();
                     state.ap = state.left.next();
                     state.bp = state.right.next();
                     self.start_hashmap_phase2()
@@ -1616,22 +1642,22 @@ impl<'a> CmpStack<'a> {
             CMP_HASHMAP_PHASE2_MIN_LEFT_OP => {
                 if result == Ordering::Less {
                     let left_key = self.hashmap_current_left_key();
-                    let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                    let state = self.hashmap_state_mut();
                     state.cmp_res = Ordering::Less;
                     state.min_key = Some(left_key);
                 }
-                let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                let state = self.hashmap_state_mut();
                 state.ap = state.left.next();
                 self.start_hashmap_phase2()
             }
             CMP_HASHMAP_PHASE2_MIN_RIGHT_OP => {
                 if result == Ordering::Less {
                     let right_key = self.hashmap_current_right_key();
-                    let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                    let state = self.hashmap_state_mut();
                     state.cmp_res = Ordering::Greater;
                     state.min_key = Some(right_key);
                 }
-                let state = self.hashmaps.last_mut().expect("hashmap state is present");
+                let state = self.hashmap_state_mut();
                 state.bp = state.right.next();
                 self.start_hashmap_phase2()
             }
@@ -1640,45 +1666,39 @@ impl<'a> CmpStack<'a> {
     }
 
     fn hashmap_current_left_key(&self) -> Term {
-        let Some(pair) = self.hashmaps.last().and_then(|state| state.ap) else {
+        let Some(pair) = self.hashmap_state().ap else {
             unreachable!("left hashmap entry is present");
         };
         pair.0
     }
 
     fn hashmap_current_right_key(&self) -> Term {
-        let Some(pair) = self.hashmaps.last().and_then(|state| state.bp) else {
+        let Some(pair) = self.hashmap_state().bp else {
             unreachable!("right hashmap entry is present");
         };
         pair.0
     }
 
     fn hashmap_current_values(&self) -> (Term, Term) {
-        let Some((left, right)) = self
-            .hashmaps
-            .last()
-            .and_then(|state| state.ap.zip(state.bp))
-        else {
+        let Some((left, right)) = self.hashmap_state().ap.zip(self.hashmap_state().bp) else {
             unreachable!("both hashmap entries are present");
         };
         (left.1, right.1)
     }
 
     fn hashmap_was_exact(&self) -> bool {
-        self.hashmaps
-            .last()
-            .expect("hashmap state is present")
-            .was_exact
+        self.hashmap_state().was_exact
     }
 
     fn start_hashmap_phase1(&mut self) -> CmpAction {
-        let state = self.hashmaps.last().expect("hashmap state is present");
+        let state = self.hashmap_state();
         let (left_key, right_key) = match (state.ap, state.bp) {
             (Some(left), Some(right)) => (left.0, right.0),
             (None, None) => {
                 let order = state.cmp_res;
-                self.hashmaps.pop();
-                assert!(matches!(self.maps.pop(), Some(CmpMapState::Hashmap)));
+                let Some(CmpMapFrame::Hashmap(_)) = self.map_frames.pop() else {
+                    unreachable!("hashmap state is present");
+                };
                 return CmpAction::Return(order);
             }
             _ => unreachable!("hashmap iterators advance together in phase one"),
@@ -1688,32 +1708,32 @@ impl<'a> CmpStack<'a> {
     }
 
     fn advance_hashmap_phase1(&mut self) -> CmpAction {
-        let state = self.hashmaps.last_mut().expect("hashmap state is present");
+        let state = self.hashmap_state_mut();
         state.ap = state.left.next();
         state.bp = state.right.next();
         self.start_hashmap_phase1()
     }
 
     fn start_hashmap_phase2(&mut self) -> CmpAction {
-        match self.hashmaps.last().unwrap() {
-            state if state.ap.zip(state.bp).is_some() => {
-                let (left, right) = state.ap.zip(state.bp).unwrap();
-                self.push_map_operation(CMP_HASHMAP_PHASE2_KEYS_OP, true);
-                CmpAction::Compare(left.0, right.0, true)
-            }
-            _ => self.hashmap_phase2_next(Ordering::Equal),
+        let pair = self.hashmap_state().ap.zip(self.hashmap_state().bp);
+        if let Some((left, right)) = pair {
+            self.push_map_operation(CMP_HASHMAP_PHASE2_KEYS_OP, true);
+            CmpAction::Compare(left.0, right.0, true)
+        } else {
+            self.hashmap_phase2_next(Ordering::Equal)
         }
     }
 
     fn hashmap_phase2_next(&mut self, key_order: Ordering) -> CmpAction {
         let (left_pair, right_pair, min_key) = {
-            let state = self.hashmaps.last().expect("hashmap state is present");
+            let state = self.hashmap_state();
             (state.ap, state.bp, state.min_key)
         };
         if left_pair.is_none() && right_pair.is_none() {
-            let cmp_res = self.hashmaps.pop().unwrap().cmp_res;
-            assert!(matches!(self.maps.pop(), Some(CmpMapState::Hashmap)));
-            return CmpAction::Return(cmp_res);
+            let Some(CmpMapFrame::Hashmap(state)) = self.map_frames.pop() else {
+                unreachable!("hashmap state is present");
+            };
+            return CmpAction::Return(state.cmp_res);
         }
         let hash_order =
             hashmap_key_hash_order(left_pair.map(|pair| pair.0), right_pair.map(|pair| pair.0));
