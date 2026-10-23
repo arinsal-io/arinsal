@@ -501,6 +501,52 @@ pub enum IoPiece<'a> {
     Refc(&'a [u8]),
 }
 
+/// A slice of a reference-counted binary that a command keeps by reference
+/// (`ErlIOVec` `iov[i]` with its `binv[i]`).
+pub struct RefcSegment {
+    owner: arinsal_alloc::raw::OwnedBinaryRef,
+    offset: usize,
+    len: usize,
+}
+
+impl RefcSegment {
+    /// Reference `len` bytes at `offset` of the binary `owner` holds.
+    pub fn new(
+        owner: arinsal_alloc::raw::OwnedBinaryRef,
+        offset: usize,
+        len: usize,
+    ) -> Option<Self> {
+        owner.payload(offset, len)?;
+        Some(Self { owner, offset, len })
+    }
+
+    /// The referenced bytes.
+    pub fn bytes(&self) -> &[u8] {
+        self.owner
+            .payload(self.offset, self.len)
+            .unwrap_or_default()
+    }
+}
+
+/// One element of a command vector: bytes copied out of the iolist, or a binary kept by
+/// reference.
+pub enum CommandPiece {
+    /// Bytes the command owns.
+    Bytes(Vec<u8>),
+    /// A reference-counted binary slice.
+    Refc(RefcSegment),
+}
+
+impl CommandPiece {
+    /// The bytes of this element.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Refc(segment) => segment.bytes(),
+        }
+    }
+}
+
 /// Result of a `control` callback (io.c:4100 write_port_control_result).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlReply {
@@ -909,6 +955,28 @@ impl DriverPort {
             // SAFETY: the buffer outlives the call; drv_data came from start.
             unsafe { output(self.data(), buf.as_mut_ptr().cast(), buf.len()) };
         } else {
+            self.output(&[IoPiece::Copied(&data)], caller);
+        }
+        self.clear_caller();
+        true
+    }
+
+    /// `output` for a native driver with a command vector it may keep.
+    ///
+    /// Port of erts/emulator/beam/io.c:1354 (call_driver_outputv), OTP-29.1.1.
+    pub fn outputv_owned(&self, pieces: Vec<CommandPiece>, caller: u64) -> bool {
+        let _guard = self.guard();
+        if !self.live() {
+            return false;
+        }
+        self.set_caller(caller);
+        if let Some(native) = &self.driver.native {
+            native.outputv_owned(self, pieces);
+        } else {
+            let mut data = Vec::new();
+            for piece in &pieces {
+                data.extend_from_slice(piece.bytes());
+            }
             self.output(&[IoPiece::Copied(&data)], caller);
         }
         self.clear_caller();

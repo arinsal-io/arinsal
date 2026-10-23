@@ -475,6 +475,24 @@ impl OwnedBinaryRef {
         })
     }
 
+    /// `len` payload bytes from `offset`, valid while this reference is held (the refcount
+    /// keeps the Binary allocated). `None` when the range lies outside the allocation.
+    // Port of erts/emulator/beam/erl_driver.h (ErlIOVec.iov of a refc binary in binv), OTP-29.1.1.
+    pub fn payload(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let all = self.view.bytes(offset.checked_add(len)?)?;
+        Some(&all[offset..])
+    }
+
+    /// Address of the first payload byte, to place a slice of the Binary inside it.
+    pub fn payload_ptr(&self) -> *const u8 {
+        self.view.bytes_ptr()
+    }
+
+    /// Whether the Binary is writable and so may be modified or reallocated.
+    pub fn is_writable(&self) -> bool {
+        self.may_reallocate
+    }
+
     /// Another retained reference to the same Binary (`erts_refc_inc`).
     pub fn try_clone(&self) -> Option<Self> {
         Self::clone_from_view(self.view)

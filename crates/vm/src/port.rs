@@ -653,31 +653,121 @@ fn filename_bytes(t: Term, allow_empty: bool, allow_atom: bool) -> Option<Vec<u8
     }
     Some(out.into_bytes())
 }
-fn iodata(t: Term) -> Option<Vec<u8>> {
-    fn append(mut term: Term, mut tail: bool, out: &mut Vec<u8>) -> Option<()> {
-        // The spine is walked in a loop: long lists must not recurse per cell.
-        while term.classify() == TermKind::List {
-            // SAFETY: The list is traversed before the caller's process heap can move.
-            let (head, rest) = unsafe { term.cons_ref()? };
-            append(head, false, out)?;
-            term = rest;
-            tail = true;
-        }
-        if term == Term::NIL {
-            Some(())
-        } else if term.classify() == TermKind::Bitstring {
-            append_binary(term, out)
-        } else if !tail {
-            let value = term.as_small()?;
-            if !(0..=255).contains(&value) {
-                return None;
-            }
-            out.push(value as u8);
-            Some(())
-        } else {
-            None
-        }
+/// An off-heap, non-writable binary of more than `ERL_ONHEAP_BINARY_LIMIT` bytes as a kept
+/// reference, instead of a copy of its bytes.
+// Port of erts/emulator/beam/erl_iolist.c (erts_ioq_iolist_to_vec: `binv` holds the Binary of
+// a refc binary and its `iov` entry points into it), OTP-29.1.1.
+fn refc_segment(term: Term) -> Option<arinsal_drv::RefcSegment> {
+    let bits = arinsal_bifs::bitstring_bit_len(term).ok()?;
+    let len = bits / 8;
+    if !bits.is_multiple_of(8) || len <= arinsal_drv::ERL_ONHEAP_BINARY_LIMIT {
+        return None;
     }
+    let (off_heap, base, start_bit) = arinsal_bifs::with_binary_bytes(term, |view| {
+        (
+            view.is_off_heap(),
+            view.bytes().as_ptr() as usize,
+            view.start_bit(),
+        )
+    })
+    .ok()?;
+    if !off_heap || !start_bit.is_multiple_of(8) {
+        return None;
+    }
+    let arinsal_term::BinaryOwner::Binary(owner) = arinsal_term::binary_owner(term)? else {
+        return None;
+    };
+    if owner.is_writable() {
+        return None;
+    }
+    let offset = (base + start_bit / 8).checked_sub(owner.payload_ptr() as usize)?;
+    arinsal_drv::RefcSegment::new(owner, offset, len)
+}
+
+/// The command iolist as a vector: bytes copied, refc binaries referenced. A command without
+/// a refc binary is one `Bytes` element, as `iodata` gives it.
+// Port of erts/emulator/beam/io.c:1715 (erts_port_output builds the ErlIOVec with
+// erts_ioq_iolist_to_vec), OTP-29.1.1.
+fn command_pieces(t: Term) -> Option<smallvec::SmallVec<[arinsal_drv::CommandPiece; 4]>> {
+    use arinsal_drv::CommandPiece;
+    // The bytes that will be copied, so the buffer is allocated once (erts_iolist_size);
+    // binaries over the on-heap limit may be referenced instead.
+    let mut copied = 0usize;
+    walk_iodata(t, false, &mut |chunk| {
+        copied += match chunk {
+            IoChunk::Byte(_) => 1,
+            IoChunk::Binary(term) => {
+                let len = arinsal_bifs::bitstring_bit_len(term).ok()? / 8;
+                if len <= arinsal_drv::ERL_ONHEAP_BINARY_LIMIT {
+                    len
+                } else {
+                    0
+                }
+            }
+        };
+        Some(())
+    })?;
+    let mut out = smallvec::SmallVec::new();
+    let mut current = Vec::with_capacity(copied);
+    walk_iodata(t, false, &mut |chunk| match chunk {
+        IoChunk::Byte(byte) => {
+            current.push(byte);
+            Some(())
+        }
+        IoChunk::Binary(term) => {
+            if let Some(segment) = refc_segment(term) {
+                if !current.is_empty() {
+                    out.push(CommandPiece::Bytes(std::mem::take(&mut current)));
+                }
+                out.push(CommandPiece::Refc(segment));
+                Some(())
+            } else {
+                append_binary(term, &mut current)
+            }
+        }
+    })?;
+    if !current.is_empty() || out.is_empty() {
+        out.push(CommandPiece::Bytes(current));
+    }
+    Some(out)
+}
+
+/// One leaf of an iolist.
+enum IoChunk {
+    Byte(u8),
+    Binary(Term),
+}
+
+/// Visit the leaves of an iolist in order. The spine is walked in a loop: long lists must
+/// not recurse per cell.
+fn walk_iodata(
+    mut term: Term,
+    mut tail: bool,
+    visit: &mut impl FnMut(IoChunk) -> Option<()>,
+) -> Option<()> {
+    while term.classify() == TermKind::List {
+        // SAFETY: The list is traversed before the caller's process heap can move.
+        let (head, rest) = unsafe { term.cons_ref()? };
+        walk_iodata(head, false, visit)?;
+        term = rest;
+        tail = true;
+    }
+    if term == Term::NIL {
+        Some(())
+    } else if term.classify() == TermKind::Bitstring {
+        visit(IoChunk::Binary(term))
+    } else if !tail {
+        let value = term.as_small()?;
+        if !(0..=255).contains(&value) {
+            return None;
+        }
+        visit(IoChunk::Byte(value as u8))
+    } else {
+        None
+    }
+}
+
+fn iodata(t: Term) -> Option<Vec<u8>> {
     // Port of erts/emulator/beam/erl_iolist.c (erts_iolist_size, erts_iolist_to_buf): size the
     // result first so the flat buffer is allocated once.
     fn size(mut term: Term, mut tail: bool) -> Option<usize> {
@@ -704,7 +794,13 @@ fn iodata(t: Term) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(size(t, false)?);
-    append(t, false, &mut out)?;
+    walk_iodata(t, false, &mut |chunk| match chunk {
+        IoChunk::Byte(byte) => {
+            out.push(byte);
+            Some(())
+        }
+        IoChunk::Binary(term) => append_binary(term, &mut out),
+    })?;
     Some(out)
 }
 fn tuple(t: Term) -> Option<Vec<Term>> {

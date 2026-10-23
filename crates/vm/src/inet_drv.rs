@@ -12,7 +12,7 @@ use crate::VmError;
 use crate::port::PortHandle;
 use crate::process::{Message, MessageNode, Runtime};
 use arinsal_alloc::typed::ErtsAlcType;
-use arinsal_drv::{ControlReply, DriverPort, NativeDriver};
+use arinsal_drv::{CommandPiece, ControlReply, DriverPort, NativeDriver};
 use arinsal_packet::{
     HttpPacket, HttpUri, Packet, PacketOptions, PacketResult, PacketState, PacketType,
     parse_with_state,
@@ -200,6 +200,13 @@ impl NativeDriver for TcpInet {
     fn output_owned(&self, port: &DriverPort, data: Vec<u8>) {
         if let Some((sock, _handle)) = sock_of(port) {
             command(&sock, Pid::from_data(port.caller()), data);
+        }
+    }
+
+    // Port of inet_drv.c (tcp_inet_commandv): refc binaries of the command stay referenced.
+    fn outputv_owned(&self, port: &DriverPort, pieces: Vec<CommandPiece>) {
+        if let Some((sock, _handle)) = sock_of(port) {
+            command_pieces(&sock, Pid::from_data(port.caller()), pieces);
         }
     }
 
@@ -397,6 +404,23 @@ fn command(sock: &Arc<Sock>, caller: Pid, data: Vec<u8>) {
     finish_command(sock, outcome, Some((caller, ids)));
 }
 
+/// `command` for a vector: the caller reference prefix is in the first element, the packet is
+/// everything after it, with refc binaries referenced (`tcp_sendv` over an `ErlIOVec`).
+fn command_pieces(sock: &Arc<Sock>, caller: Pid, pieces: Vec<CommandPiece>) {
+    let Some(CommandPiece::Bytes(first)) = pieces.first() else {
+        return;
+    };
+    let Some((ids, payload)) = split_caller(first) else {
+        return;
+    };
+    let start = first.len() - payload.len();
+    let outcome = {
+        let mut inner = sock.inner.lock().unwrap();
+        accept_send(&mut inner, caller, ids, SendData::Pieces(pieces, start))
+    };
+    finish_command(sock, outcome, Some((caller, ids)));
+}
+
 /// What a send does once `tcp_sendv` decided: reply, or fail the socket.
 fn finish_command(sock: &Arc<Sock>, outcome: SendOutcome, reply: Option<(Pid, [u32; 3])>) {
     match outcome {
@@ -476,21 +500,65 @@ enum SendOutcome {
 enum SendData<'a> {
     Owned(Vec<u8>, usize),
     Borrowed(&'a [u8]),
+    /// A command vector; the payload starts at the offset in its first element.
+    Pieces(Vec<CommandPiece>, usize),
 }
 
 impl SendData<'_> {
-    fn bytes(&self) -> &[u8] {
+    /// Payload length (`ErlIOVec.size` less the caller prefix).
+    fn len(&self) -> usize {
         match self {
-            SendData::Owned(buf, start) => &buf[*start..],
-            SendData::Borrowed(bytes) => bytes,
+            SendData::Owned(buf, start) => buf.len() - start,
+            SendData::Borrowed(bytes) => bytes.len(),
+            SendData::Pieces(pieces, start) => {
+                pieces
+                    .iter()
+                    .map(|piece| piece.bytes().len())
+                    .sum::<usize>()
+                    - start
+            }
         }
     }
 
-    /// Queue the payload from `skip` on. An owned buffer moves into the queue.
+    /// The payload as `iovec` entries, appended to `iov`.
+    fn push_iov(&self, iov: &mut smallvec::SmallVec<[libc::iovec; 4]>) {
+        let mut entry = |bytes: &[u8]| {
+            if !bytes.is_empty() {
+                iov.push(libc::iovec {
+                    iov_base: bytes.as_ptr() as *mut libc::c_void,
+                    iov_len: bytes.len(),
+                });
+            }
+        };
+        match self {
+            SendData::Owned(buf, start) => entry(&buf[*start..]),
+            SendData::Borrowed(bytes) => entry(bytes),
+            SendData::Pieces(pieces, start) => {
+                for (index, piece) in pieces.iter().enumerate() {
+                    entry(&piece.bytes()[if index == 0 { *start } else { 0 }..]);
+                }
+            }
+        }
+    }
+
+    /// Queue the payload from `skip` on. Owned buffers and referenced binaries move into
+    /// the queue (`driver_enqv`).
     fn enqueue(self, q: &mut IoQueue, skip: usize) {
         match self {
             SendData::Owned(buf, start) => q.enq_owned(buf, start + skip),
             SendData::Borrowed(bytes) => q.enq(&bytes[skip..]),
+            SendData::Pieces(pieces, start) => {
+                let mut skip = start + skip;
+                for piece in pieces {
+                    let len = piece.bytes().len();
+                    if skip >= len {
+                        skip -= len;
+                        continue;
+                    }
+                    q.enq_piece(piece, skip);
+                    skip = 0;
+                }
+            }
         }
     }
 }
@@ -514,7 +582,7 @@ fn accept_send(
     if inner.pending_shut != 0 {
         return send_or_shutdown_failed(inner, libc::EPIPE);
     }
-    let len = payload.bytes().len();
+    let len = payload.len();
     // inet_drv.c:13745-13761: TCP_PB_1/2/4 headers; htype 3 is TCP_PB_4.
     let mut hdr = [0u8; 4];
     let h_len = match inner.htype {
@@ -572,16 +640,14 @@ fn accept_send(
     };
     // inet_drv.c:13815-13844: one sock_sendv of header and payload, then queue
     // whatever was not written (driver_enqv with skip = bytes sent).
-    let iov = [
-        libc::iovec {
+    let mut iov = smallvec::SmallVec::<[libc::iovec; 4]>::new();
+    if h_len != 0 {
+        iov.push(libc::iovec {
             iov_base: hdr.as_ptr() as *mut libc::c_void,
             iov_len: h_len,
-        },
-        libc::iovec {
-            iov_base: payload.bytes().as_ptr() as *mut libc::c_void,
-            iov_len: len,
-        },
-    ];
+        });
+    }
+    payload.push_iov(&mut iov);
     let n = sock_sendv(fd, &iov);
     let n = if n < 0 {
         let err = last_errno();
@@ -2603,7 +2669,7 @@ fn max_vsize() -> usize {
 /// is never copied again: `deq` drops whole segments and advances into the first.
 #[derive(Default)]
 struct IoQueue {
-    segs: VecDeque<(Vec<u8>, usize)>,
+    segs: VecDeque<(CommandPiece, usize)>,
     size: usize,
 }
 
@@ -2621,7 +2687,8 @@ impl IoQueue {
     fn enq(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
             self.size += bytes.len();
-            self.segs.push_back((bytes.to_vec(), 0));
+            self.segs
+                .push_back((CommandPiece::Bytes(bytes.to_vec()), 0));
         }
     }
 
@@ -2629,13 +2696,22 @@ impl IoQueue {
     fn enq_owned(&mut self, buf: Vec<u8>, start: usize) {
         if start < buf.len() {
             self.size += buf.len() - start;
-            self.segs.push_back((buf, start));
+            self.segs.push_back((CommandPiece::Bytes(buf), start));
+        }
+    }
+
+    /// `driver_enqv` of one vector element, referenced binaries included.
+    fn enq_piece(&mut self, piece: CommandPiece, start: usize) {
+        let len = piece.bytes().len();
+        if start < len {
+            self.size += len - start;
+            self.segs.push_back((piece, start));
         }
     }
 
     /// First entry of `driver_peekq` (`iov[0]`): the unsent bytes of the head segment.
     fn head(&self) -> Option<&[u8]> {
-        self.segs.front().map(|(buf, start)| &buf[*start..])
+        self.segs.front().map(|(buf, start)| &buf.bytes()[*start..])
     }
 
     /// `driver_peekq`, limited to `max` entries.
@@ -2644,8 +2720,8 @@ impl IoQueue {
             .iter()
             .take(max)
             .map(|(buf, start)| libc::iovec {
-                iov_base: buf[*start..].as_ptr() as *mut libc::c_void,
-                iov_len: buf.len() - start,
+                iov_base: buf.bytes()[*start..].as_ptr() as *mut libc::c_void,
+                iov_len: buf.bytes().len() - start,
             })
             .collect()
     }
@@ -2657,7 +2733,7 @@ impl IoQueue {
             let Some((buf, start)) = self.segs.front_mut() else {
                 break;
             };
-            let len = buf.len() - *start;
+            let len = buf.bytes().len() - *start;
             if len <= n {
                 n -= len;
                 self.segs.pop_front();
