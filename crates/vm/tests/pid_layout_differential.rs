@@ -1,12 +1,13 @@
 //! Local pid identifiers against erl 29.1.1: process-table layout, printing,
 //! ordering, hashing, external format and `next_pid` wrap.
 
+use similar_asserts::assert_eq;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SOURCE: &str = r#"
 -module(pid_layout_diff).
--export([main/0]).
+-export([main/0, peer_start/0]).
 
 main() ->
     erts_debug:set_internal_state(available_internal_state, true),
@@ -39,6 +40,16 @@ main() ->
     show(map_order, maps:values(Map)),
     show(set_order, [index_of(K, Keys) || K <- sets:to_list(sets:from_list(Keys, [{version, 2}]))]),
     ok.
+
+peer_start() ->
+    {ok, Peer, Node} = peer:start_link(#{
+        name => peer_parent_child_test,
+        host => "127.0.0.1",
+        longnames => true,
+        args => ["-setcookie", "peer_parent_cookie", "-kernel", "inet_dist_use_interface", "{127,0,0,1}"]
+    }),
+    io:format("PL peer ~p~n", [Node]),
+    ok = peer:stop(Peer).
 
 spawn_batch(Tag, N) ->
     Ps = [spawn(fun() -> ok end) || _ <- lists:seq(1, N)],
@@ -122,9 +133,51 @@ fn check(flags: &[&str], name: &str) {
     assert_eq!(actual.lines().count(), expected.lines().count());
 }
 
+fn run_peer_parent(program: &Path, dir: &Path) -> String {
+    let output = Command::new("timeout")
+        .arg("45")
+        .arg(program)
+        .args([
+            "-name",
+            "peer_parent_regression@127.0.0.1",
+            "-setcookie",
+            "peer_parent_cookie",
+            "-kernel",
+            "inet_dist_use_interface",
+            "{127,0,0,1}",
+            "-noshell",
+            "-pa",
+        ])
+        .arg(dir)
+        .args(["-eval", "pid_layout_diff:peer_start(), halt()."])
+        .output()
+        .expect("run peer parent regression");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "{} failed: {}\n{stdout}",
+        program.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+        .lines()
+        .find(|line| line.starts_with("PL peer "))
+        .unwrap_or_else(|| panic!("peer startup output missing:\n{stdout}"))
+        .to_owned()
+}
+
 #[test]
 fn pid_layout_matches_erl_default_table() {
     check(&[], "pid_layout_default");
+}
+
+#[test]
+fn peer_start_from_named_parent_matches_erl() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("pid_layout_peer_parent");
+    assert!(compile(&dir), "erlc is required for this differential test");
+    let expected = run_peer_parent(Path::new("erl"), &dir);
+    let actual = run_peer_parent(&arinsal(), &dir);
+    assert_eq!(actual, expected);
 }
 
 #[test]

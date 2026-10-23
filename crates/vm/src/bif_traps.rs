@@ -3600,6 +3600,19 @@ fn term_to_iovec(
     term_encode(process, args, state, restore_gc, true)
 }
 
+fn new_term_encoder(args: &[Term]) -> Result<arinsal_bifs::EncodeWalk, BifError> {
+    let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
+    let (node_name, creation) = {
+        let tables = crate::node_tables::lock();
+        (tables.local_name.clone(), tables.local_creation)
+    };
+    let node = global_atoms()
+        .intern(&node_name)
+        .map_err(|_| BifError::SystemLimit)?;
+    encoder.set_local_node(node, creation);
+    Ok(encoder)
+}
+
 /// Saved state for `erts_term_to_binary_int`, including the result binary once allocated.
 // Port of erts/emulator/beam/external.c:2450-2567, OTP-29.1.1.
 struct TermEncodeState {
@@ -3643,7 +3656,7 @@ fn term_encode(
         }
     };
     if state.is_none() && !iovec {
-        let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
+        let mut encoder = new_term_encoder(args)?;
         let (sized, size_work) = encoder.step_size(chunk_work)?;
         if sized && encoder.finishes_simple() {
             let value = encoder
@@ -3677,7 +3690,7 @@ fn term_encode(
     let state = match state {
         Some(state) => Arc::clone(state),
         None => {
-            let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
+            let mut encoder = new_term_encoder(args)?;
             encoder.set_iovec(iovec);
             magic_binary_state(
                 Mutex::new(TermEncodeState {
