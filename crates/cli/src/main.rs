@@ -17,7 +17,10 @@ fn main() {
     arinsal_vm::install_crash_dump();
     arinsal_nif::ensure_exports();
     match args.first().map(String::as_str) {
-        Some("--version") => println!("arinsal {}", env!("CARGO_PKG_VERSION")),
+        Some("--version") => println!(
+            "arinsal {} (OTP 29.1.1, ERTS 17.1)",
+            option_env!("ARINSAL_RELEASE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+        ),
         Some("beam-info") => {
             let code = args.iter().any(|arg| arg == "--code");
             let files: Vec<_> = args[1..]

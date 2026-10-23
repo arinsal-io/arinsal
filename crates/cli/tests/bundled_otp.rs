@@ -142,10 +142,13 @@ fn release_bundle_boots_without_erl_and_matches_otp() {
         .args(["60", arinsal.to_str().unwrap(), "-noshell", "-eval"])
         .arg(&expression)
         .env("PATH", &no_erl_path)
-        .env("ARINSAL_OTP_ROOT", temp.0.join("deliberately-wrong-root"))
-        .env_remove("ERL_ROOTDIR")
-        .env_remove("ROOTDIR")
-        .env_remove("BINDIR")
+        .env("ERL_ROOTDIR", temp.0.join("deliberately-wrong-root"))
+        .env("ROOTDIR", temp.0.join("deliberately-wrong-root"))
+        .env(
+            "BINDIR",
+            temp.0.join("deliberately-wrong-root/erts-17.1/bin"),
+        )
+        .env_remove("ARINSAL_OTP_ROOT")
         .env_remove("ERL_FLAGS")
         .env_remove("ERL_AFLAGS")
         .env_remove("ERL_ZFLAGS")
@@ -164,10 +167,34 @@ fn release_bundle_boots_without_erl_and_matches_otp() {
         "{}",
         String::from_utf8_lossy(&actual.stderr)
     );
-    let normalized = String::from_utf8(expected.stdout).unwrap().replace(
+    let normalized = String::from_utf8(expected.stdout.clone()).unwrap().replace(
         source_root.to_str().unwrap(),
         prefix.join("lib/arinsal/otp").to_str().unwrap(),
     );
     assert_eq!(String::from_utf8(actual.stdout).unwrap(), normalized);
     assert_eq!(actual.stderr, expected.stderr);
+
+    let mut override_command = Command::new(timeout_program());
+    override_command
+        .args(["60", arinsal.to_str().unwrap(), "-noshell", "-eval"])
+        .arg(&expression)
+        .env("PATH", &no_erl_path)
+        .env("ARINSAL_OTP_ROOT", &source_root)
+        .env_remove("ERL_ROOTDIR")
+        .env_remove("ROOTDIR")
+        .env_remove("BINDIR")
+        .env_remove("ERL_FLAGS")
+        .env_remove("ERL_AFLAGS")
+        .env_remove("ERL_ZFLAGS")
+        .current_dir("/tmp");
+    let override_actual = override_command
+        .output()
+        .expect("run bundled arinsal with explicit OTP-root override under timeout");
+    assert!(
+        override_actual.status.success(),
+        "{}",
+        String::from_utf8_lossy(&override_actual.stderr)
+    );
+    assert_eq!(override_actual.stdout, expected.stdout);
+    assert_eq!(override_actual.stderr, expected.stderr);
 }

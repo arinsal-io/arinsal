@@ -39,5 +39,22 @@ fn bundled_root_is_resolved_relative_to_the_arinsal_executable() {
         Some(root.clone())
     );
 
+    let broken_prefix = prefix.join("broken-release");
+    let broken_bin = broken_prefix.join("bin");
+    std::fs::create_dir_all(&broken_bin).unwrap();
+    for launcher in ["erl", "erlc", "escript"] {
+        std::fs::write(broken_bin.join(launcher), "").unwrap();
+    }
+    // Launchers alone (e.g. a system Erlang in the same bin) are not a release.
+    assert_eq!(
+        arinsal_args::bundled_otp_root_for_executable(&broken_bin.join("arinsal")),
+        None
+    );
+    std::fs::create_dir_all(broken_prefix.join("lib/arinsal")).unwrap();
+    assert_eq!(
+        arinsal_args::bundled_otp_root_for_executable(&broken_bin.join("arinsal")),
+        Some(broken_prefix.join("lib/arinsal/otp"))
+    );
+
     std::fs::remove_dir_all(prefix).unwrap();
 }
