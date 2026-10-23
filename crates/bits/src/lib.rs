@@ -531,6 +531,32 @@ fn copy_bits(dst: &mut [u8], dst_pos: usize, src: &[u8], src_pos: usize, count: 
     }
 }
 
+/// Store the low `bits` of a machine word at a byte-aligned position without big-integer
+/// arithmetic; false when the segment needs the general path.
+// Port of erts/emulator/beam/erl_bits.c (erts_new_bs_put_integer, small-value byte stores), OTP-29.1.1.
+fn write_aligned_word(
+    dst: &mut [u8],
+    pos: usize,
+    bits: usize,
+    raw: u64,
+    segment: &Segment<'_>,
+) -> bool {
+    if bits == 0 || bits > 64 || !bits.is_multiple_of(8) || !pos.is_multiple_of(8) {
+        return false;
+    }
+    let count = bits / 8;
+    let at = pos / 8;
+    for i in 0..count {
+        let shift = if segment.flags.little() {
+            i * 8
+        } else {
+            (count - 1 - i) * 8
+        };
+        dst[at + i] = (raw >> shift) as u8;
+    }
+    true
+}
+
 fn write_int(dst: &mut [u8], pos: usize, bits: usize, value: &BigInt, little: bool) {
     // Port of erts/emulator/beam/erl_bits.c:926/1031 (put_integer_be/le), OTP-29.1.1.
     if bits == 0 {
@@ -837,6 +863,19 @@ pub fn create_bin<H: HeapAlloc>(segments: &[Segment<'_>], heap: &mut H) -> Resul
             first.ty == SegType::PrivateAppend,
         );
     }
+    if size.bits.is_multiple_of(8) {
+        // The segments are written straight into the new binary's storage, as erts writes
+        // through `erts_current_bin` into the binary `erts_bs_init_*` allocated.
+        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp (emit_i_bs_create_bin), OTP-29.1.1.
+        let mut failure = None;
+        let term = TermBuilder::new(heap)
+            .binary_from_fn(size.bits / 8, |destination| {
+                destination.fill(0);
+                failure = write_segments(segments, destination, 0).err();
+            })
+            .map_err(|e| term_error(e, segments.last().map_or(0, |s| s.index), size.heap_words))?;
+        return failure.map_or(Ok(term), Err);
+    }
     let mut bytes = vec![0u8; size.bits.div_ceil(8)];
     write_segments(segments, &mut bytes, 0)?;
     TermBuilder::new(heap)
@@ -878,13 +917,19 @@ fn write_segments(
     for segment in segments {
         let bits = size_of(segment)?;
         match segment.ty {
-            SegType::Integer => write_int(
-                bytes,
-                pos,
-                bits,
-                &as_integer(source(segment)?).unwrap(),
-                segment.flags.little(),
-            ),
+            SegType::Integer => {
+                let value = source(segment)?;
+                match value.as_small() {
+                    Some(small) if write_aligned_word(bytes, pos, bits, small as u64, segment) => {}
+                    _ => write_int(
+                        bytes,
+                        pos,
+                        bits,
+                        &as_integer(value).unwrap(),
+                        segment.flags.little(),
+                    ),
+                }
+            }
             SegType::Float => {
                 // Port of erts/emulator/beam/erl_bits.c:1341 (erts_bs_put_float), OTP-29.1.1.
                 let value = as_float(source(segment)?).unwrap();
@@ -894,7 +939,9 @@ fn write_segments(
                     64 => value.to_bits(),
                     _ => unreachable!(),
                 };
-                write_int(bytes, pos, bits, &BigInt::from(raw), segment.flags.little());
+                if !write_aligned_word(bytes, pos, bits, raw, segment) {
+                    write_int(bytes, pos, bits, &BigInt::from(raw), segment.flags.little());
+                }
             }
             SegType::Binary | SegType::Append | SegType::PrivateAppend => {
                 let term = source(segment)?;

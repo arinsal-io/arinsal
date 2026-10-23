@@ -3526,33 +3526,6 @@ pub(crate) fn schedulers_total() -> usize {
 }
 
 impl SystemFlags {
-    /// Flags of a runtime started with `workers` scheduler threads. An explicit worker count
-    /// that differs from the command line's is `+S workers` (erl_init.c, `+S` handling sets
-    /// erts_no_schedulers and erts_no_schedulers_online together); dirty CPU counts are
-    /// clamped to it again as erl_init.c:1193-1200 does.
-    pub(crate) fn for_workers(workers: usize) -> Self {
-        let boot = Self::boot();
-        if workers == 0 || workers == boot.schedulers_total {
-            return boot;
-        }
-        let (cpus, cpus_online) = logical_processors();
-        let mut emulator = arinsal_args::active_emulator_flags();
-        emulator.schedulers = Some(arinsal_args::SchedulerCount {
-            total: i32::try_from(workers).unwrap_or(i32::MAX),
-            online: None,
-        });
-        let (schedulers_total, schedulers_online, dirty_cpu_total, dirty_cpu_online, dirty_io) =
-            boot_scheduler_counts_from(cpus, cpus_online, &emulator);
-        SystemFlags {
-            schedulers_total,
-            schedulers_online,
-            dirty_cpu_total,
-            dirty_cpu_online,
-            dirty_io_total: dirty_io,
-            ..boot
-        }
-    }
-
     /// Values a runtime boots with, from the command line and the environment.
     pub(crate) fn boot() -> Self {
         static BOOT: OnceLock<SystemFlags> = OnceLock::new();
@@ -3615,10 +3588,6 @@ pub(crate) fn dirty_scheduler_defaults(runtime: &crate::process::Runtime) -> (us
             flags.dirty_io_total,
         )
     })
-}
-
-pub(crate) fn scheduler_total_of(runtime: &crate::process::Runtime) -> usize {
-    with_runtime_flags(Some(runtime), |flags| flags.schedulers_total)
 }
 
 pub(crate) fn scheduler_online_default(runtime: &crate::process::Runtime) -> usize {

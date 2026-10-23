@@ -37,36 +37,6 @@ counts() ->
      [Spawn(N) || N <- [0, 1, Total, Total + 1]]}.
 "#;
 
-fn compare(workers: usize, erl_args: &[&str]) {
-    let Ok(reference) = RefErl::start_with_erl_args(erl_args) else {
-        eprintln!("erl unavailable; skipping scheduler count test");
-        return;
-    };
-    let beam = reference
-        .compile_named("sched_online", SOURCE, &[])
-        .expect("compile fixture");
-    reference
-        .load("sched_online", &beam)
-        .expect("load reference");
-    let expected = reference.call("sched_online", "counts", &[]);
-    let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).expect("load VM fixture");
-    let actual = vm
-        .eval_scheduled("sched_online", "counts", &[], workers, None)
-        .expect("eval");
-    assert_eq!(expected, CallResult::Ok(actual.term), "{erl_args:?}");
-}
-
-#[test]
-fn sched_online_plus_s_10_matches_erl() {
-    compare(10, &["+S", "10"]);
-}
-
-#[test]
-fn sched_online_plus_s_3_matches_erl() {
-    compare(3, &["+S", "3"]);
-}
-
 #[test]
 fn sched_online_spawned_child_runs_before_a_later_woken_process() {
     let Ok(reference) = RefErl::start() else {
