@@ -4751,8 +4751,8 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     // Dead X registers below the staged segments must not become GC roots.
     process.x[live..base_slot].fill(Term::NIL);
     let all = crate::signals::atom("all");
-    let parse = |process: &crate::Process| -> Option<Vec<Segment<'static>>> {
-        let mut segments = Vec::with_capacity(count);
+    let parse = |process: &crate::Process| -> Option<smallvec::SmallVec<[Segment<'static>; 4]>> {
+        let mut segments = smallvec::SmallVec::with_capacity(count);
         for index in 0..count {
             let base = base_slot + index * 7;
             let small = |offset: usize| {
