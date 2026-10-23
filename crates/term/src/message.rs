@@ -13,9 +13,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::bits::{ExternalBinary, RefcBinary, WritableBinary};
-use crate::heap::{
-    HeapAlloc, LazyOwners, link_external_bin_ref, link_magic_thing, link_node_thing,
-};
+use crate::heap::{HeapAlloc, link_external_bin_ref, link_magic_thing, link_node_thing};
 use crate::{Node, Term, TermError};
 
 /// One signal (`ErtsSignalCommon`): the queue link, then the signal value. A message node may
@@ -34,7 +32,7 @@ pub struct SignalNode<T> {
 /// (`off_heap`), `alloc_size`, `used_size`, then the words (`mem`).
 #[repr(C)]
 pub(crate) struct HeapFragment {
-    pub(crate) owners: LazyOwners,
+    pub(crate) off_heap: crate::heap::OffHeapLists,
     pub(crate) bin_vheap: u64,
     alloc_size: usize,
     used_size: usize,
@@ -177,7 +175,7 @@ impl<T> OwnedSignal<T> {
                     .add(header_offset)
                     .cast::<HeapFragment>()
                     .write(HeapFragment {
-                        owners: LazyOwners::default(),
+                        off_heap: crate::heap::OffHeapLists::default(),
                         bin_vheap: 0,
                         alloc_size: words,
                         used_size: 0,
@@ -393,21 +391,21 @@ impl NodeFragment {
     }
 
     /// The off-heap owners and virtual binary heap words, taken over by a receiver.
-    pub(crate) fn take_owners(&mut self) -> (LazyOwners, u64) {
+    pub(crate) fn take_owners(&mut self) -> (crate::heap::OffHeapLists, u64) {
         // SAFETY: the fragment owns its header exclusively.
         unsafe {
             let header = &mut *self.header.as_ptr();
             (
-                std::mem::take(&mut header.owners),
+                std::mem::take(&mut header.off_heap),
                 std::mem::take(&mut header.bin_vheap),
             )
         }
     }
 
     /// The off-heap owners, for rebasing their chain after the words moved.
-    pub(crate) fn owners_mut(&mut self) -> &mut LazyOwners {
+    pub(crate) fn owners_mut(&mut self) -> &mut crate::heap::OffHeapLists {
         // SAFETY: the fragment owns its header exclusively.
-        unsafe { &mut (*self.header.as_ptr()).owners }
+        unsafe { &mut (*self.header.as_ptr()).off_heap }
     }
 }
 
@@ -464,7 +462,7 @@ impl HeapAlloc for FragmentMut<'_> {
         overhead_words: u64,
         owner: Option<arinsal_alloc::raw::OwnedBinaryRef>,
     ) -> Result<(), TermError> {
-        let owners = &mut *self.fragment().owners;
+        let owners = &mut self.fragment().off_heap;
         let head = if writable {
             &mut owners.wrt_bins
         } else {
@@ -528,7 +526,7 @@ impl HeapAlloc for FragmentMut<'_> {
         } else {
             0
         };
-        let owners = &mut *self.fragment().owners;
+        let owners = &mut self.fragment().off_heap;
         owners.overhead = owners.overhead.wrapping_add(increase);
     }
 
@@ -541,7 +539,11 @@ impl HeapAlloc for FragmentMut<'_> {
         bin_ref: *mut u64,
         binary: Arc<ExternalBinary>,
     ) -> Result<(), TermError> {
-        link_external_bin_ref(&mut self.fragment().owners.off_heap_first, bin_ref, binary);
+        link_external_bin_ref(
+            &mut self.fragment().off_heap.off_heap_first,
+            bin_ref,
+            binary,
+        );
         Ok(())
     }
 
@@ -550,7 +552,7 @@ impl HeapAlloc for FragmentMut<'_> {
     }
 
     fn link_node(&mut self, thing: *mut u64, node: Arc<Node>) {
-        link_node_thing(&mut self.fragment().owners.off_heap_first, thing, node);
+        link_node_thing(&mut self.fragment().off_heap.off_heap_first, thing, node);
     }
 
     fn link_magic_ref(
@@ -558,7 +560,7 @@ impl HeapAlloc for FragmentMut<'_> {
         thing: *mut u64,
         owner: Arc<crate::MagicRef>,
     ) -> Result<(), TermError> {
-        let owners = &mut *self.fragment().owners;
+        let owners = &mut self.fragment().off_heap;
         link_magic_thing(
             &mut owners.off_heap_first,
             &mut owners.overhead,
