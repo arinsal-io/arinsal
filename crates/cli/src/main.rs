@@ -7,7 +7,38 @@ mod disasm;
 mod eval;
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--arinsal-detached-stage1")
+    {
+        args.remove(0);
+        if let Err(error) = rustix::process::setsid() {
+            eprintln!("arinsal: cannot detach session: {error}");
+            std::process::exit(1);
+        }
+        let executable = std::env::current_exe().unwrap_or_else(|error| {
+            eprintln!("arinsal: cannot locate executable for detached startup: {error}");
+            std::process::exit(1);
+        });
+        let result = std::process::Command::new(executable)
+            .arg("--arinsal-detached-child")
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Err(error) = result {
+            eprintln!("arinsal: cannot start detached emulator: {error}");
+        }
+        std::process::exit(0);
+    }
+    let detached_child = args
+        .first()
+        .is_some_and(|arg| arg == "--arinsal-detached-child");
+    if detached_child {
+        args.remove(0);
+    }
     if args.first().is_some_and(|arg| arg == "--child-setup") {
         arinsal_vm::run_child_setup();
     }
@@ -61,12 +92,12 @@ fn main() {
                 }
             }
         }
-        _ if args.first().is_some_and(|arg| arg == "erl") => erl_launch(&args[1..]),
-        _ => erl_launch(&args),
+        _ if args.first().is_some_and(|arg| arg == "erl") => erl_launch(&args[1..], detached_child),
+        _ => erl_launch(&args, detached_child),
     }
 }
 
-fn erl_launch(args: &[String]) -> ! {
+fn erl_launch(args: &[String], detached_child: bool) -> ! {
     use arinsal_args::{Env, parse};
     use std::collections::BTreeMap;
     use std::io::Write;
@@ -166,10 +197,25 @@ fn erl_launch(args: &[String]) -> ! {
             u32::try_from(limit).unwrap_or(u32::MAX),
         ));
     }
-    if launch.detached {
-        // erlexec forks and calls setsid (erlexec.c:1199). Arinsal does not detach.
-        eprintln!("arinsal: -detached is not supported");
-        std::process::exit(1);
+    if launch.detached && !detached_child {
+        // Port of erts/etc/common/erlexec.c:start_emulator, OTP-29.1.1.
+        // Re-exec first so setsid runs in a fresh, non-process-leader process.
+        let executable = std::env::current_exe().unwrap_or_else(|error| {
+            eprintln!("arinsal: cannot locate executable for detached startup: {error}");
+            std::process::exit(1);
+        });
+        let mut command = std::process::Command::new(executable);
+        command
+            .arg("--arinsal-detached-stage1")
+            .args(argv.iter().skip(1))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Err(error) = command.spawn() {
+            eprintln!("arinsal: cannot start detached emulator: {error}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
     }
     // -sname/-name are delivered to init. Distribution is started later by
     // kernel's erl_distribution, which calls net_kernel:start_link/1

@@ -27,20 +27,45 @@ fn quiet(command: &mut Command) -> &mut Command {
 }
 
 #[test]
-fn detached_is_rejected() {
-    let output = quiet(
-        Command::new(env!("CARGO_BIN_EXE_arinsal"))
-            .arg("-detached")
-            .env("ERL_ROOTDIR", root()),
-    )
-    .output()
-    .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "arinsal: -detached is not supported\n"
-    );
-    assert!(output.stdout.is_empty());
+fn detached_starts_child_without_standard_streams() {
+    let root = root();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    for (label, executable, is_arinsal) in [
+        ("otp", "erl", false),
+        ("arinsal", env!("CARGO_BIN_EXE_arinsal"), true),
+    ] {
+        let file = std::env::temp_dir().join(format!(
+            "{label}-detached-{}-{unique}.txt",
+            std::process::id(),
+        ));
+        let eval = format!(
+            "io:format(\"hidden stdout\"), io:format(standard_error, \"hidden stderr\", []), file:write_file(\"{}\", \"started\"), halt().",
+            file.display()
+        );
+        let name = format!("{label}_detached_{}", std::process::id());
+        let mut command = Command::new(executable);
+        command.args(["-detached", "-sname", &name, "-eval", &eval]);
+        if is_arinsal {
+            command.env("ERL_ROOTDIR", &root);
+        }
+        let output = quiet(&mut command).output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{label}");
+        assert!(output.stdout.is_empty(), "{label}");
+        assert!(output.stderr.is_empty(), "{label}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "started",
+            "{label}"
+        );
+        std::fs::remove_file(file).unwrap();
+    }
 }
 
 #[test]
