@@ -11,14 +11,13 @@
 use crate::VmError;
 use crate::port::PortHandle;
 use crate::process::{Message, MessageNode, Runtime};
-use arinsal_alloc::typed::ErtsAlcType;
 use arinsal_drv::{CommandPiece, ControlBytes, ControlReply, DriverPort, NativeDriver};
 use arinsal_packet::{
     HttpPacket, HttpUri, Packet, PacketOptions, PacketResult, PacketState, PacketType,
     parse_with_state,
 };
 use arinsal_sched::Pid;
-use arinsal_term::{HeapAlloc, ProcessHeap, Term, TermBuilder, global_atoms};
+use arinsal_term::{HeapAlloc, Term, TermBuilder, global_atoms};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -4010,14 +4009,15 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
             error: None,
         } => {
             // {inet_reply, Port, ok, Ref}: a 5-word tuple and a 3-word reference.
-            let node = Message::node_built(*caller, 8, |heap| {
+            let node = Message::node_built(8, |heap| {
                 let tag = TermBuilder::new(heap).local_ref(*ids).ok()?;
                 TermBuilder::new(heap)
                     .tuple(&[atom("inet_reply"), port, atom("ok"), tag])
                     .ok()
+                    .map(|term| (*caller, term))
             });
-            if let Some(node) = node {
-                return Some((*caller, node));
+            if node.is_some() {
+                return node;
             }
         }
         _ => {}
@@ -4039,17 +4039,16 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
     };
     // The term is built in the fragment that is queued, as driver_deliver_term does
     // (io.c:5658), not copied out of a scratch heap.
-    let mut heap = ProcessHeap::with_words_for_type(words, ErtsAlcType::HEAP_FRAG);
-    let term = match &out {
+    Message::node_built(words, |heap| match &out {
         Out::AsyncError {
             caller,
             aref,
             reason,
-        } => error_tuple(&mut heap, reason)
-            .and_then(|status| message_async(&mut heap, port, *aref, status))
+        } => error_tuple(heap, reason)
+            .and_then(|status| message_async(heap, port, *aref, status))
             .map(|term| (*caller, term)),
         Out::AsyncOk { caller, aref } => {
-            message_async(&mut heap, port, *aref, atom("ok")).map(|term| (*caller, term))
+            message_async(heap, port, *aref, atom("ok")).map(|term| (*caller, term))
         }
         Out::AsyncPort {
             caller,
@@ -4057,9 +4056,9 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
             port: born,
         } => {
             let born = Term::port(*born).unwrap();
-            let status = TermBuilder::new(&mut heap).tuple(&[atom("ok"), born]).ok();
+            let status = TermBuilder::new(heap).tuple(&[atom("ok"), born]).ok();
             status.and_then(|status| {
-                message_async(&mut heap, port, *aref, status).map(|term| (*caller, term))
+                message_async(heap, port, *aref, status).map(|term| (*caller, term))
             })
         }
         Out::AsyncData {
@@ -4067,22 +4066,22 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
             aref,
             bytes,
         } => {
-            let data = data_term(sock, &mut heap, bytes);
+            let data = data_term(sock, heap, bytes);
             let status =
-                data.and_then(|data| TermBuilder::new(&mut heap).tuple(&[atom("ok"), data]).ok());
+                data.and_then(|data| TermBuilder::new(heap).tuple(&[atom("ok"), data]).ok());
             status.and_then(|status| {
-                message_async(&mut heap, port, *aref, status).map(|term| (*caller, term))
+                message_async(heap, port, *aref, status).map(|term| (*caller, term))
             })
         }
         Out::InetReply { caller, ids, error } => {
             let status = if let Some(reason) = error {
-                error_tuple(&mut heap, reason)
+                error_tuple(heap, reason)
             } else {
                 Some(atom("ok"))
             };
-            let tag = TermBuilder::new(&mut heap).local_ref(*ids).ok();
+            let tag = TermBuilder::new(heap).local_ref(*ids).ok();
             match (status, tag) {
-                (Some(status), Some(tag)) => TermBuilder::new(&mut heap)
+                (Some(status), Some(tag)) => TermBuilder::new(heap)
                     .tuple(&[atom("inet_reply"), port, status, tag])
                     .ok()
                     .map(|term| (*caller, term)),
@@ -4091,24 +4090,24 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
         }
         Out::Tcp { owner, bytes } => {
             // Port of inet_drv.c:3987 (tcp_message), OTP-29.1.1.
-            data_term(sock, &mut heap, bytes)
+            data_term(sock, heap, bytes)
                 .and_then(|data| {
-                    TermBuilder::new(&mut heap)
+                    TermBuilder::new(heap)
                         .tuple(&[atom("tcp"), port, data])
                         .ok()
                 })
                 .map(|term| (*owner, term))
         }
         Out::TcpMessage { .. } => unreachable!("TCP message was already dispatched"),
-        Out::TcpClosed { owner } => TermBuilder::new(&mut heap)
+        Out::TcpClosed { owner } => TermBuilder::new(heap)
             .tuple(&[atom("tcp_closed"), port])
             .ok()
             .map(|term| (*owner, term)),
-        Out::TcpError { owner, reason } => TermBuilder::new(&mut heap)
+        Out::TcpError { owner, reason } => TermBuilder::new(heap)
             .tuple(&[atom("tcp_error"), port, atom(reason)])
             .ok()
             .map(|term| (*owner, term)),
-        Out::TcpPassive { owner } => TermBuilder::new(&mut heap)
+        Out::TcpPassive { owner } => TermBuilder::new(heap)
             .tuple(&[atom("tcp_passive"), port])
             .ok()
             .map(|term| (*owner, term)),
@@ -4116,25 +4115,21 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
             owner,
             packet,
             binary,
-        } => http_message(&mut heap, port, packet, *binary).map(|term| (*owner, term)),
+        } => http_message(heap, port, packet, *binary).map(|term| (*owner, term)),
         Out::AsyncHttp {
             caller,
             aref,
             packet,
             binary,
-        } => http_value(&mut heap, packet, *binary)
-            .and_then(|value| TermBuilder::new(&mut heap).tuple(&[atom("ok"), value]).ok())
-            .and_then(|status| message_async(&mut heap, port, *aref, status))
+        } => http_value(heap, packet, *binary)
+            .and_then(|value| TermBuilder::new(heap).tuple(&[atom("ok"), value]).ok())
+            .and_then(|status| message_async(heap, port, *aref, status))
             .map(|term| (*caller, term)),
-        Out::PortData { owner, bytes } => data_term(sock, &mut heap, bytes)
-            .and_then(|data| {
-                TermBuilder::new(&mut heap)
-                    .tuple(&[atom("data"), data])
-                    .ok()
-            })
-            .and_then(|data| TermBuilder::new(&mut heap).tuple(&[port, data]).ok())
+        Out::PortData { owner, bytes } => data_term(sock, heap, bytes)
+            .and_then(|data| TermBuilder::new(heap).tuple(&[atom("data"), data]).ok())
+            .and_then(|data| TermBuilder::new(heap).tuple(&[port, data]).ok())
             .map(|term| (*owner, term)),
-        Out::EmptyOutQ { subscriber } => TermBuilder::new(&mut heap)
+        Out::EmptyOutQ { subscriber } => TermBuilder::new(heap)
             .tuple(&[atom("empty_out_q"), port])
             .ok()
             .map(|term| (*subscriber, term)),
@@ -4142,25 +4137,24 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
             // Port of inet_drv.c:14032-14043 ({sendfile, S, {ok, SentLow, SentHigh}}) and
             // :14055-14072 ({sendfile, S, {error, Reason}}), OTP-29.1.1.
             let status = match result {
-                Ok(bytes_sent) => TermBuilder::new(&mut heap)
+                Ok(bytes_sent) => TermBuilder::new(heap)
                     .tuple(&[
                         atom("ok"),
                         Term::small((bytes_sent & 0xFFFF_FFFF) as i64).unwrap(),
                         Term::small((bytes_sent >> 32) as i64).unwrap(),
                     ])
                     .ok(),
-                Err(reason) => error_tuple(&mut heap, reason),
+                Err(reason) => error_tuple(heap, reason),
             };
             status
                 .and_then(|status| {
-                    TermBuilder::new(&mut heap)
+                    TermBuilder::new(heap)
                         .tuple(&[atom("sendfile"), port, status])
                         .ok()
                 })
                 .map(|term| (*owner, term))
         }
-    };
-    term.map(|(to, term)| (to, Message::from_heap(term, heap).into_node(to)))
+    })
 }
 
 fn message_async(
@@ -4180,14 +4174,14 @@ fn message_async(
         .ok()
 }
 
-fn error_tuple(heap: &mut ProcessHeap, reason: &'static str) -> Option<Term> {
+fn error_tuple(heap: &mut (impl HeapAlloc + ?Sized), reason: &'static str) -> Option<Term> {
     TermBuilder::new(heap)
         .tuple(&[atom("error"), atom(reason)])
         .ok()
 }
 
 fn http_message(
-    heap: &mut ProcessHeap,
+    heap: &mut (impl HeapAlloc + ?Sized),
     port: Term,
     packet: &HttpPacket,
     binary: bool,
@@ -4199,7 +4193,11 @@ fn http_message(
         .ok()
 }
 
-fn http_value(heap: &mut ProcessHeap, packet: &HttpPacket, binary: bool) -> Option<Term> {
+fn http_value(
+    heap: &mut (impl HeapAlloc + ?Sized),
+    packet: &HttpPacket,
+    binary: bool,
+) -> Option<Term> {
     // Port of inet_drv.c:2811 (http_*_inetdrv), OTP-29.1.1.
     match packet {
         HttpPacket::Eoh => Some(atom("http_eoh")),
@@ -4281,7 +4279,7 @@ fn http_value(heap: &mut ProcessHeap, packet: &HttpPacket, binary: bool) -> Opti
     }
 }
 
-fn uri_term(heap: &mut ProcessHeap, uri: &HttpUri, binary: bool) -> Option<Term> {
+fn uri_term(heap: &mut (impl HeapAlloc + ?Sized), uri: &HttpUri, binary: bool) -> Option<Term> {
     // Port of inet_drv.c http_load_uri, OTP-29.1.1.
     match uri {
         HttpUri::Star => Some(atom("*")),
@@ -4316,7 +4314,7 @@ fn uri_term(heap: &mut ProcessHeap, uri: &HttpUri, binary: bool) -> Option<Term>
     }
 }
 
-fn bytes_term(heap: &mut ProcessHeap, bytes: &[u8], binary: bool) -> Option<Term> {
+fn bytes_term(heap: &mut (impl HeapAlloc + ?Sized), bytes: &[u8], binary: bool) -> Option<Term> {
     let mut builder = TermBuilder::new(heap);
     if binary {
         builder.binary(bytes).ok()
@@ -4325,7 +4323,7 @@ fn bytes_term(heap: &mut ProcessHeap, bytes: &[u8], binary: bool) -> Option<Term
     }
 }
 
-fn data_term(sock: &Sock, heap: &mut ProcessHeap, bytes: &[u8]) -> Option<Term> {
+fn data_term(sock: &Sock, heap: &mut (impl HeapAlloc + ?Sized), bytes: &[u8]) -> Option<Term> {
     let (binary, hsz) = {
         let inner = sock.inner.lock().unwrap();
         (inner.binary, inner.header)
@@ -4348,12 +4346,14 @@ fn data_words(len: usize, binary: bool, header: i32) -> usize {
 
 /// `{tcp, Port, Data}` built in its own message node.
 fn tcp_node(to: Pid, port: Term, bytes: &[u8], binary: bool, header: i32) -> Option<MessageNode> {
-    Message::node_built(to, 4 + data_words(bytes.len(), binary, header), |heap| {
+    Message::node_built(4 + data_words(bytes.len(), binary, header), |heap| {
         let data = data_term_with_options(heap, bytes, binary, header)?;
         TermBuilder::new(heap)
             .tuple(&[atom("tcp"), port, data])
             .ok()
+            .map(|term| (to, term))
     })
+    .map(|(_, node)| node)
 }
 
 fn data_term_with_options(
@@ -4727,12 +4727,11 @@ fn push_frame(inner: &Inner, port: Term, outs: &mut Outs, who: DataWho, frame: F
                 DataWho::Async(caller, aref) => {
                     // {inet_async, Port, Ref, {ok, Data}}: a 5-word and a 3-word tuple.
                     let words = 8 + data_words(bytes.len(), binary, header);
-                    Message::node_built(caller, words, |heap| {
+                    Message::node_built(words, |heap| {
                         let data = data_term_with_options(heap, bytes, binary, header)?;
                         let status = TermBuilder::new(heap).tuple(&[atom("ok"), data]).ok()?;
-                        message_async(heap, port, aref, status)
+                        message_async(heap, port, aref, status).map(|term| (caller, term))
                     })
-                    .map(|node| (caller, node))
                 }
             };
             if let Some((to, message)) = message {
