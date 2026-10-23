@@ -63,7 +63,7 @@ pub enum Identity {
     Ref {
         node: Atom,
         creation: u32,
-        ids: Vec<u32>,
+        ids: smallvec::SmallVec<[u32; 5]>,
     },
 }
 impl Term {
@@ -120,7 +120,8 @@ impl Term {
                 ids: self
                     .local_ref_numbers()
                     .or_else(|| self.magic_ref_numbers())?
-                    .to_vec(),
+                    .into_iter()
+                    .collect(),
             }),
             EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
                 // SAFETY: external thing stores a retained Node pointer at word one.
@@ -165,7 +166,7 @@ impl Term {
                         Some(Identity::Ref {
                             node: node.name,
                             creation: node.creation,
-                            ids,
+                            ids: ids.into(),
                         })
                     }
                 }

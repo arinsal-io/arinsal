@@ -347,7 +347,7 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
                                 .ok_or(TermError::BadArg)?
                                 .to_string(),
                             creation,
-                            ids,
+                            ids: ids.to_vec(),
                         }),
                     }
                 }

@@ -1307,7 +1307,7 @@ fn ref_to_list(term: Term) -> Result<String, VmError> {
     // Port of erts/emulator/beam/bif.c (ref_to_list_1), OTP-29.1.1.
     term.save_magic_ref();
     let magic = term.is_magic_ref();
-    let mut numbers: Vec<u32> = ids;
+    let mut numbers: Vec<u32> = ids.to_vec();
     if magic && numbers.last() == Some(&u32::MAX) {
         numbers.pop();
     }

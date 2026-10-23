@@ -1015,7 +1015,7 @@ impl MatchProgram {
     }
 
     pub(crate) fn matches_reference(&self, term: Term) -> bool {
-        matches!(term.identity(), Some(arinsal_term::Identity::Ref { ids, .. }) if ids == [0x4554_534d, self.id as u32, (self.id >> 32) as u32])
+        matches!(term.identity(), Some(arinsal_term::Identity::Ref { ids, .. }) if ids.as_slice() == [0x4554_534d, self.id as u32, (self.id >> 32) as u32])
     }
 
     /// Return the stable identifier carried by this compiled program's reference.
