@@ -335,6 +335,59 @@ impl ExportSlot {
     }
 }
 
+/// A per-instruction value stored as runs of equal neighbours, the shape of the line table in
+/// erts's `BeamCodeHeader` (offsets of the changes only).
+// Port of erts/emulator/beam/beam_load.c (line table in BeamCodeHeader), OTP-29.1.1.
+#[derive(Clone, Debug)]
+pub struct LineRuns<T> {
+    starts: Vec<u32>,
+    values: Vec<T>,
+    len: usize,
+}
+
+impl<T> Default for LineRuns<T> {
+    fn default() -> Self {
+        Self {
+            starts: Vec::new(),
+            values: Vec::new(),
+            len: 0,
+        }
+    }
+}
+
+impl<T: PartialEq> LineRuns<T> {
+    /// Runs of the per-instruction `slots`, in code order.
+    pub fn from_slots(slots: impl Iterator<Item = T>) -> Self {
+        let mut runs = Self::default();
+        for (index, value) in slots.enumerate() {
+            if runs.values.last() != Some(&value) {
+                runs.starts.push(index as u32);
+                runs.values.push(value);
+            }
+            runs.len = index + 1;
+        }
+        runs.starts.shrink_to_fit();
+        runs.values.shrink_to_fit();
+        runs
+    }
+}
+
+impl<T> LineRuns<T> {
+    /// The distinct runs' values, in code order.
+    pub fn values(&self) -> &[T] {
+        &self.values
+    }
+
+    /// The value at instruction `ip`, like `Vec::get`.
+    pub fn get(&self, ip: usize) -> Option<&T> {
+        if ip >= self.len {
+            return None;
+        }
+        let run = self.starts.partition_point(|start| *start as usize <= ip);
+        self.values.get(run.checked_sub(1)?)
+    }
+}
+
 /// Executable module and its out-of-line data.
 pub struct Module {
     /// Module atom text.
@@ -370,11 +423,11 @@ pub struct Module {
     /// Type metadata, indexed by code index and operand position.
     pub types: Vec<Vec<(usize, BeamType)>>,
     /// Source line for each instruction.
-    pub lines: Vec<Option<(String, u64)>>,
+    pub lines: LineRuns<Option<(String, u64)>>,
     /// Literal file-name lists indexed by source filename.
     pub line_file_terms: HashMap<String, Term>,
     /// Per-instruction cached filename terms for exception stack traces.
-    pub line_terms: Vec<Option<(Term, u64)>>,
+    pub line_terms: LineRuns<Option<(Term, u64)>>,
     /// Opcodes not yet executable, with occurrence counts.
     pub unsupported: HashMap<String, usize>,
     /// Reason for each explicit unsupported opcode.
@@ -661,9 +714,9 @@ impl Module {
         self.bit_commands = Vec::new();
         self.strings = Box::new([]);
         self.types = Vec::new();
-        self.lines = Vec::new();
+        self.lines = LineRuns::default();
         self.line_file_terms = HashMap::new();
-        self.line_terms = Vec::new();
+        self.line_terms = LineRuns::default();
         self.unsupported = HashMap::new();
         self.unsupported_reasons = Vec::new();
         self.functions = Vec::new();
@@ -685,6 +738,21 @@ impl Module {
         self.debug_breakpoint_import = 0;
         self.literal_terms = Arc::new(HashMap::new());
         self._literals = LiteralArea::empty();
+    }
+
+    /// Drop the decoded instruction streams of a module that BeamAsm compiled. erts keeps
+    /// only the code header (function table, line table, literal area) and the native code
+    /// after `beam_load_finalize`; the loader state and the decoded ops are freed.
+    // Port of erts/emulator/beam/jit/asm_load.c (beam_load_finalize_code) and
+    // beam_load.c (beam_load_finalize: beam_load_prepared_free), OTP-29.1.1.
+    pub fn release_decoded_code(&mut self) {
+        // The instruction array, the generic ops, select tables and operand lists stay: the
+        // interpreter still runs on_load and fallback code of a compiled module, and NIF
+        // binding, fun identities and the debugger address instructions by index.
+        self.bit_commands = Vec::new();
+        self.types = Vec::new();
+        self.unsupported = HashMap::new();
+        self.unsupported_reasons = Vec::new();
     }
 
     /// Retain this code version's literal heap for process root scanning.
@@ -1766,17 +1834,16 @@ pub fn load_with_instrumentations(
             line_file_terms.insert(file.clone(), term);
         }
     }
-    let line_terms = lines
-        .iter()
-        .map(|line| {
+    let line_terms: LineRuns<Option<(Term, u64)>> =
+        LineRuns::from_slots(lines.iter().map(|line| {
             line.as_ref().and_then(|(file, number)| {
                 line_file_terms
                     .get(file)
                     .copied()
                     .map(|term| (term, *number))
             })
-        })
-        .collect();
+        }));
+    let lines = LineRuns::from_slots(lines.into_iter());
     functions.shrink_to_fit();
     unsupported_reasons.shrink_to_fit();
     bit_commands.shrink_to_fit();

@@ -865,7 +865,7 @@ impl Vm {
     /// Compiles `module` with BeamAsm into `meta` when `bytes` are known.
     // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1), compile after the module
     // body and its exported entries are resolved.
-    fn compile_native(&self, module: &Module, meta: &mut CodeMeta, module_id: usize) {
+    fn compile_native(&self, module: &mut Module, meta: &mut CodeMeta, module_id: usize) {
         if !meta.has_beam_bytes {
             return;
         }
@@ -879,6 +879,12 @@ impl Vm {
         ) {
             native.publish(module);
             meta.beamasm = Some(native);
+            // Port of beam_load.c (beam_load_finalize): the decoded ops are freed once the
+            // code is in the code area. The interpreter still needs them.
+            if beamasm_integration::enabled() {
+                module.release_decoded_code();
+                meta.beam.release_decoded();
+            }
         }
     }
 
@@ -906,8 +912,9 @@ impl Vm {
         if let Some(native) = released {
             native.unpublish();
         }
+        let mut module = module;
+        self.compile_native(&mut module, &mut meta, module_id);
         let module = Arc::new(module);
-        self.compile_native(&module, &mut meta, module_id);
         let id = staging.with(|tables| {
             let id = tables.alloc(module, registers, Some(meta));
             if let Some(previous) = tables.make_current(&name, id) {
@@ -976,10 +983,10 @@ impl Vm {
             tables.intern_fun_entries(&mut module);
             tables.next_module_id()
         });
-        let module = Arc::new(module);
         if compile_native {
-            self.compile_native(&module, &mut meta, module_id);
+            self.compile_native(&mut module, &mut meta, module_id);
         }
+        let module = Arc::new(module);
         let name = module.name.clone();
         let id = staging.with(|tables| {
             let id = tables.alloc(module, registers, Some(meta));
@@ -1044,7 +1051,7 @@ impl Vm {
                 tables.intern_fun_entries(&mut module);
                 tables.next_module_id()
             });
-            self.compile_native(&module, &mut meta, module_id);
+            self.compile_native(&mut module, &mut meta, module_id);
             let module = Arc::new(module);
             ids.push(staging.with(|tables| {
                 let id = tables.alloc(module, registers, Some(meta));
