@@ -1115,6 +1115,20 @@ const ENTRIES: &[Entry] = &[
     },
     Entry {
         module: "erlang",
+        function: "external_size",
+        arity: 1,
+        continuation: "erlang:external_size/1",
+        handler: external_size,
+    },
+    Entry {
+        module: "erlang",
+        function: "external_size",
+        arity: 2,
+        continuation: "erlang:external_size/2",
+        handler: external_size,
+    },
+    Entry {
+        module: "erlang",
         function: "term_to_iovec",
         arity: 1,
         continuation: TERM_TO_BINARY_CONTINUATION,
@@ -3627,6 +3641,34 @@ fn term_to_binary(
     restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
     term_encode(process, args, state, restore_gc, false)
+}
+
+fn external_size(
+    process: &mut Process,
+    args: &[Term],
+    _state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _restore_gc: bool,
+) -> Result<HandlerResult, BifError> {
+    // Port of erts/emulator/beam/external.c (erts_encode_ext_size), OTP-29.1.1.
+    let mut encoder = arinsal_bifs::EncodeWalk::new_external_size(args)?;
+    let (node_name, creation) = {
+        let tables = crate::node_tables::lock();
+        (tables.local_name.clone(), tables.local_creation)
+    };
+    let node = global_atoms()
+        .intern(&node_name)
+        .map_err(|_| BifError::SystemLimit)?;
+    encoder.set_local_node(node, creation);
+    encoder.step_size(usize::MAX)?;
+    let size = encoder.encoded_size().ok_or(BifError::SystemLimit)?;
+    let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .int_from_u64(u64::try_from(size).map_err(|_| BifError::SystemLimit)?)
+        .map_err(|_| BifError::SystemLimit)?;
+    Ok(HandlerResult::Done {
+        value,
+        reductions: 0,
+    })
 }
 
 fn term_to_iovec(
