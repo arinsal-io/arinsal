@@ -705,28 +705,6 @@ impl Message {
         Self::copy_from(term)
     }
 
-    /// Queue a term built in a standalone message fragment without copying it again.
-    // Port of erts/emulator/beam/io.c:5658 (driver_deliver_term), OTP-29.1.1.
-    pub(crate) fn from_heap(term: Term, heap: ProcessHeap) -> Self {
-        if !term.is_pointer() {
-            return Self::immediate(term);
-        }
-        Self {
-            term,
-            fragment: Some(Box::new(MessageFragment {
-                heap: Some(arinsal_term::message::MessageHeap::Heap(heap)),
-                seq_token: None,
-            })),
-            priority: false,
-            timer_id: 0,
-            has_timer_id: false,
-            receive_traced: false,
-            seq_nil: false,
-            alias: 0,
-            combined: false,
-        }
-    }
-
     /// Copy the reachable object graph into an envelope owned by the receiver.
     pub fn copy_from(term: Term) -> Result<Self, VmError> {
         if !term.is_pointer() {
@@ -835,32 +813,24 @@ impl Message {
     // Port of erts/emulator/beam/erl_message.c (erts_factory_message_create, erts_alloc_message_heap)
     // and io.c (driver_deliver_term), OTP-29.1.1.
     pub(crate) fn node_built(
-        from: Pid,
         words: usize,
-        build: impl FnOnce(&mut arinsal_term::message::FragmentMut<'_>) -> Option<Term>,
-    ) -> Option<MessageNode> {
+        build: impl FnOnce(&mut arinsal_term::message::FragmentMut<'_>) -> Option<(Pid, Term)>,
+    ) -> Option<(Pid, MessageNode)> {
         let mut message = Self::immediate(Term::NIL);
         message.combined = words != 0;
         let mut node = arinsal_sched::OwnedSignal::with_heap_fragment(
             Event {
-                from,
+                from: Pid::from_data(0),
                 payload: Payload::Message(message),
             },
             words,
         );
-        let term = build(&mut node.heap_fragment()?)?;
+        let (to, term) = build(&mut node.heap_fragment()?)?;
+        node.from = to;
         if let Payload::Message(message) = &mut node.payload {
             message.term = term;
         }
-        Some(node)
-    }
-
-    /// This message in a signal node from `from`, as a send allocates one.
-    pub(crate) fn into_node(self, from: Pid) -> MessageNode {
-        arinsal_sched::OwnedSignal::new(Event {
-            from,
-            payload: Payload::Message(self),
-        })
+        Some((to, node))
     }
 
     fn immediate(term: Term) -> Self {
