@@ -1287,8 +1287,10 @@ impl ProcessHeap {
     /// Byte offset of `fragment_words` (`mbuf_sz`) in the heap, for the native GC-desired test.
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
     pub const FRAGMENT_WORDS_OFFSET: usize = std::mem::offset_of!(ProcessHeap, fragment_words);
-    /// Byte offset of `bin_vheap` (`off_heap.overhead`) in the heap.
-    pub const BIN_VHEAP_OFFSET: usize = std::mem::offset_of!(ProcessHeap, bin_vheap);
+    /// Byte offset of the optional boxed `HeapOwners` pointer in the heap.
+    pub const OWNERS_POINTER_OFFSET: usize = std::mem::offset_of!(ProcessHeap, owners);
+    /// Byte offset of `HeapOwners::overhead` from the boxed owners pointer.
+    pub const OWNERS_OVERHEAD_OFFSET: usize = std::mem::offset_of!(HeapOwners, overhead);
     /// Byte offset of `bin_vheap_size` (`bin_vheap_sz`) in the heap.
     pub const BIN_VHEAP_SIZE_OFFSET: usize = std::mem::offset_of!(ProcessHeap, bin_vheap_size);
     /// Byte offset of `gc_enabled` in the heap.

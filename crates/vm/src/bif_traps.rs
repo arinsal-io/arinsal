@@ -2323,6 +2323,9 @@ pub(crate) fn light_entry(module: &str, function: &str, arity: u8) -> Option<&'s
 /// trap_bif_entry`). The common run is a direct call; the trap state is built only when
 /// the run yields.
 pub(crate) trait TrapBody {
+    /// Fixed arity of a direct entry, if shared by the body type.
+    const ARITY: Option<usize> = None;
+
     /// The first run of the BIF. `restore_gc` is the process's collection state on entry.
     fn run(
         process: &mut Process,
@@ -2353,6 +2356,8 @@ pub(crate) struct IolistSize;
 pub(crate) struct IolistToIovec;
 
 impl TrapBody for MapsKeys {
+    const ARITY: Option<usize> = Some(1);
+
     fn run(
         process: &mut Process,
         args: &[Term],
@@ -2365,6 +2370,8 @@ impl TrapBody for MapsKeys {
 }
 
 impl TrapBody for MapsValues {
+    const ARITY: Option<usize> = Some(1);
+
     fn run(
         process: &mut Process,
         args: &[Term],
@@ -2377,6 +2384,8 @@ impl TrapBody for MapsValues {
 }
 
 impl TrapBody for MapsMerge {
+    const ARITY: Option<usize> = Some(2);
+
     fn run(
         process: &mut Process,
         args: &[Term],
@@ -2389,6 +2398,8 @@ impl TrapBody for MapsMerge {
 }
 
 impl TrapBody for MapsFromList {
+    const ARITY: Option<usize> = Some(1);
+
     fn run(
         process: &mut Process,
         args: &[Term],
@@ -2414,6 +2425,8 @@ impl<B: arinsal_bifs::BifBody> TrapBody for BinaryToList<B> {
 }
 
 impl TrapBody for ListToBinary {
+    const ARITY: Option<usize> = Some(1);
+
     fn run(
         process: &mut Process,
         args: &[Term],
@@ -2427,6 +2440,8 @@ impl TrapBody for ListToBinary {
 }
 
 impl TrapBody for IolistToBinary {
+    const ARITY: Option<usize> = Some(1);
+
     fn run(
         process: &mut Process,
         args: &[Term],
@@ -2440,6 +2455,8 @@ impl TrapBody for IolistToBinary {
 }
 
 impl TrapBody for IolistToIovec {
+    const ARITY: Option<usize> = Some(1);
+
     fn run(
         process: &mut Process,
         args: &[Term],
@@ -2452,6 +2469,8 @@ impl TrapBody for IolistToIovec {
 }
 
 impl TrapBody for IolistSize {
+    const ARITY: Option<usize> = Some(1);
+
     fn run(
         process: &mut Process,
         args: &[Term],

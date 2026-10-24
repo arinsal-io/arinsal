@@ -3,7 +3,7 @@
 use arinsal_maps::{self, MapError, MapResult};
 use arinsal_term::{Term, atoms};
 
-use crate::pure::{bool_term, integer, make_list_from_reverse_exact_iter};
+use crate::pure::{bool_term, integer};
 use crate::{BifError, Ctx};
 
 pub(super) fn lookup<V: crate::BifTableVisitor>(
@@ -143,11 +143,9 @@ impl MapsProjectionWalk {
                 // Port of erts/emulator/beam/erl_map.c:1207-1241 and :2262-2298,
                 // OTP-29.1.1. The exact-size flatmap array is consed into one HAlloc block.
                 if flat.size() == 0 {
-                    return Ok(ProjectionStart::Done(make_list_from_reverse_exact_iter(
-                        ctx,
-                        std::iter::empty(),
-                        Term::NIL,
-                    )));
+                    // Port of erts/emulator/beam/erl_map.c:1223, OTP-29.1.1:
+                    // an empty flatmap returns NIL without entering the list builder.
+                    return Ok(ProjectionStart::Done(Term::NIL));
                 }
                 let result = arinsal_maps::flatmap_projection_list(flat, keys, &mut ctx.heap);
                 Ok(ProjectionStart::Done(mapped(ctx, result)?))
