@@ -574,11 +574,6 @@ impl CodeTables {
         id
     }
 
-    /// Module slot that the next `alloc` will assign in this staging table.
-    pub(crate) fn next_module_id(&self) -> usize {
-        self.free_ids.last().copied().unwrap_or(self.modules.len())
-    }
-
     /// Makes instance `id` the current code of `name` and returns the instance it replaces.
     pub(crate) fn make_current(&mut self, name: &str, id: usize) -> Option<usize> {
         let previous = self.loaded.insert(name, id);
@@ -862,10 +857,18 @@ impl Vm {
         Ok(module)
     }
 
+    /// Gives prepared native code the node-canonical entries that the staged module will use.
+    // Port of erts/emulator/beam/jit/asm_load.c:1218 (erts_fun_entry_put), OTP-29.1.1.
+    pub(crate) fn intern_prepared_fun_entries(&self, module: &mut Module) {
+        for slot in &mut module.funs {
+            slot.entry = self.code_ix.intern_fun_entry(Arc::clone(&slot.entry));
+        }
+    }
+
     /// Compiles `module` with BeamAsm into `meta` when `bytes` are known.
     // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1), compile after the module
     // body and its exported entries are resolved.
-    fn compile_native(&self, module: &mut Module, meta: &mut CodeMeta, module_id: usize) {
+    pub(crate) fn compile_native(&self, module: &mut Module, meta: &mut CodeMeta) {
         if !meta.has_beam_bytes {
             return;
         }
@@ -874,10 +877,8 @@ impl Vm {
             &meta.beam,
             module,
             self.code_scope,
-            module_id,
             crate::trace_bp::line_breakpoints_instrumented(),
         ) {
-            native.publish(module);
             meta.beamasm = Some(native);
             // Port of beam_load.c (beam_load_finalize): the decoded ops are freed once the
             // code is in the code area. The interpreter still needs them.
@@ -885,6 +886,19 @@ impl Vm {
                 module.release_decoded_code();
                 meta.beam.release_decoded();
             }
+        }
+    }
+
+    // Port of erts/emulator/beam/beam_load.c:258 (install only during finish_loading), OTP-29.1.1.
+    pub(crate) fn install_native(&self, module: &Module, meta: &mut CodeMeta) -> bool {
+        let Some(native) = meta.beamasm.as_ref() else {
+            return true;
+        };
+        if native.install(module) {
+            true
+        } else {
+            meta.beamasm = None;
+            false
         }
     }
 
@@ -901,19 +915,19 @@ impl Vm {
         let mut meta = CodeMeta::from_beam(&beam, Some(bytes));
         let staging = self.code_ix.start_staging();
         let mut released = None;
-        let module_id = staging.with(|tables| {
+        staging.with(|tables| {
             if let Some(old_id) = tables.old.remove(&name) {
                 released = tables.release(old_id);
             }
             tables.intern_fun_entries(&mut module);
-            tables.next_module_id()
         });
         // The caller holds the staging permission, so this stages without waiting.
         if let Some(native) = released {
             native.unpublish();
         }
         let mut module = module;
-        self.compile_native(&mut module, &mut meta, module_id);
+        self.compile_native(&mut module, &mut meta);
+        let _ = self.install_native(&module, &mut meta);
         let module = Arc::new(module);
         let id = staging.with(|tables| {
             let id = tables.alloc(module, registers, Some(meta));
@@ -979,12 +993,12 @@ impl Vm {
             self.refresh_code();
             return Ok(id);
         }
-        let module_id = staging.with(|tables| {
+        staging.with(|tables| {
             tables.intern_fun_entries(&mut module);
-            tables.next_module_id()
         });
         if compile_native {
-            self.compile_native(&mut module, &mut meta, module_id);
+            self.compile_native(&mut module, &mut meta);
+            let _ = self.install_native(&module, &mut meta);
         }
         let module = Arc::new(module);
         let name = module.name.clone();
@@ -1047,11 +1061,10 @@ impl Vm {
         for (mut module, registers, mut meta) in prepared {
             let name = module.name.clone();
             let pending = meta.on_load.is_some();
-            let module_id = staging.with(|tables| {
+            staging.with(|tables| {
                 tables.intern_fun_entries(&mut module);
-                tables.next_module_id()
             });
-            self.compile_native(&mut module, &mut meta, module_id);
+            let _ = self.install_native(&module, &mut meta);
             let module = Arc::new(module);
             ids.push(staging.with(|tables| {
                 let id = tables.alloc(module, registers, Some(meta));

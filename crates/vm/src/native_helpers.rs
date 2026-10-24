@@ -4675,47 +4675,42 @@ pub extern "C" fn arinsal_beamasm_map_get_elements(
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let (Ok(module_id), Ok(table_index)) =
-        (usize::try_from(module_handle), usize::try_from(table_index))
-    else {
+    let Ok(table_index) = usize::try_from(table_index) else {
         return 0;
     };
-    let Some(runtime) = process.runtime.as_ref() else {
+    let Some(module) = crate::beamasm_integration::map_lookup_version(module_handle) else {
         return 0;
     };
     process
         .heap
         .set_stack_pointer(stack_pointer as usize as *mut u64);
-    let active_code_ix = registers.active_code_ix as usize;
     let heap = &mut process.heap;
     let x_registers = &mut registers.x_reg_array;
-    let found = runtime.with_beamasm_module(active_code_ix, module_id, |module| {
-        let Some(table) = module.map_lookups.get(table_index) else {
-            return false;
-        };
-        matches!(
-            arinsal_maps::get_map_elements_with(
-                crate::native_hooks::from_raw(map),
-                table.entries.len(),
-                |index| crate::native_hooks::from_raw(table.entries[index].key),
-                |index| table.entries[index].hash,
-                |index, value| match table.entries[index].destination {
-                    arinsal_beamasm::map::MapLookupDestination::X(register) => {
-                        let Some(destination) = x_registers.get_mut(register as usize) else {
-                            return false;
-                        };
-                        *destination = value;
-                        true
-                    }
-                    arinsal_beamasm::map::MapLookupDestination::Y(offset) => {
-                        heap.stack_set(offset as usize, value)
-                    }
-                },
-            ),
-            Ok(true)
-        )
-    });
-    if !matches!(found, Some(true)) {
+    let Some(table) = module.map_lookups.get(table_index) else {
+        return 0;
+    };
+    let found = matches!(
+        arinsal_maps::get_map_elements_with(
+            crate::native_hooks::from_raw(map),
+            table.entries.len(),
+            |index| crate::native_hooks::from_raw(table.entries[index].key),
+            |index| table.entries[index].hash,
+            |index, value| match table.entries[index].destination {
+                arinsal_beamasm::map::MapLookupDestination::X(register) => {
+                    let Some(destination) = x_registers.get_mut(register as usize) else {
+                        return false;
+                    };
+                    *destination = value;
+                    true
+                }
+                arinsal_beamasm::map::MapLookupDestination::Y(offset) => {
+                    heap.stack_set(offset as usize, value)
+                }
+            },
+        ),
+        Ok(true)
+    );
+    if !found {
         return 0;
     }
     process.sync_native_header();

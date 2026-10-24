@@ -1466,26 +1466,6 @@ impl Runtime {
         self.code.with_active_code(read)
     }
 
-    /// Runs a lookup against the BeamAsm version selected by a code index and module slot.
-    // Port of erts/emulator/beam/code_ix.c:51-79 (code-indexed module tables), OTP-29.1.1.
-    #[inline(always)]
-    pub(crate) fn with_beamasm_module<R>(
-        &self,
-        code_ix: usize,
-        module_id: usize,
-        use_module: impl FnOnce(&crate::beamasm_integration::CompiledVersion) -> R,
-    ) -> Option<R> {
-        self.code.with_tables_for_code_ix(code_ix, |tables| {
-            let module = tables
-                .code_meta
-                .get(module_id)?
-                .as_ref()?
-                .beamasm
-                .as_deref()?;
-            Some(use_module(module))
-        })?
-    }
-
     /// Catch table of this node's `erts_active_code_ix()`.
     // Port of erts/emulator/beam/code_ix.h:362 (`erts_active_code_ix` is one atomic, not
     // thread-local) and beam_catches.c:146 (`bccix[erts_active_code_ix()]`), OTP-29.1.1.
