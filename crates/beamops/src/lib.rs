@@ -150,58 +150,51 @@ fn transform_with_options(
     // 1934 modules of the OTP and Elixir corpus.)
     {
         let mut out = Vec::with_capacity(code.len());
-        let mut front: std::collections::VecDeque<Node> = std::collections::VecDeque::new();
+        // The stream the rules see: the nodes put back by a rewrite, then as many of the
+        // remaining ones as the current opcode's widest pattern needs. They move out of the
+        // code, nothing is copied.
+        let mut queue: std::collections::VecDeque<Node> = std::collections::VecDeque::new();
         let mut index = 0;
-        while !front.is_empty() || index < code.len() {
-            let window;
-            let (stream, at): (&[Node], usize) = if front.is_empty() {
-                (&code, index)
-            } else {
-                // Only the current opcode's rules can match, so the window is that
-                // pattern width (erts transform_engine), not the longest rule in the module.
-                let need = front
-                    .front()
-                    .and_then(|node| rules.get(node.name))
-                    .and_then(|rules| rules.iter().map(|rule| rule.patterns.len()).max())
-                    .unwrap_or(1);
-                let end = code.len().min(index + need.saturating_sub(front.len()));
-                window = front
-                    .iter()
-                    .chain(&code[index..end])
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (&window, 0)
-            };
+        loop {
+            if queue.is_empty() {
+                let Some(node) = code.get_mut(index) else {
+                    break;
+                };
+                queue.push_back(std::mem::replace(node, Node::empty()));
+                index += 1;
+            }
+            let need = rules
+                .get(queue[0].name)
+                .and_then(|rules| rules.iter().map(|rule| rule.patterns.len()).max())
+                .unwrap_or(1);
+            while queue.len() < need && index < code.len() {
+                queue.push_back(std::mem::replace(&mut code[index], Node::empty()));
+                index += 1;
+            }
+            let stream = queue.make_contiguous();
             let mut replacement = None;
-            for rule in rules.get(stream[at].name).into_iter().flatten() {
+            for rule in rules.get(stream[0].name).into_iter().flatten() {
                 if let Some((consumed, produced)) =
-                    apply_rule(rule, stream, at, beam, instrument_line_breakpoints)
+                    apply_rule(rule, stream, 0, beam, instrument_line_breakpoints)
                 {
                     replacement = Some((consumed, produced));
                     break;
                 }
             }
             let Some((consumed, produced)) = replacement else {
-                if front.is_empty() {
-                    out.push(std::mem::replace(&mut code[index], Node::empty()));
-                    index += 1;
-                } else {
-                    out.extend(front.pop_front());
-                }
+                out.extend(queue.pop_front());
                 continue;
             };
             let is_unchanged = consumed == produced.len()
-                && stream[at..at + consumed]
+                && stream[..consumed]
                     .iter()
                     .zip(&produced)
                     .all(|(old, new)| node_equal(old, new));
             let same_opcode = consumed == 1
                 && produced.len() == 1
-                && stream[at].name == produced[0].name
-                && stream[at].args.len() == produced[0].args.len();
-            let from_front = consumed.min(front.len());
-            front.drain(..from_front);
-            index += consumed - from_front;
+                && stream[0].name == produced[0].name
+                && stream[0].args.len() == produced[0].args.len();
+            queue.drain(..consumed);
             let mut produced = produced.into_iter();
             if (same_opcode || is_unchanged)
                 && let Some(first) = produced.next()
@@ -209,7 +202,7 @@ fn transform_with_options(
                 out.push(first);
             }
             for node in produced.rev() {
-                front.push_front(node);
+                queue.push_front(node);
             }
         }
         code = out;

@@ -509,7 +509,86 @@ fn map_fragments(
     get: arinsal_beamasm::map::MapGetHelper,
     update: arinsal_beamasm::map::MapUpdateHelper,
 ) -> &'static arinsal_beamasm::map::MapFragments {
-    Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(get, update).unwrap(),
-    ))
+    // One set per process, as the runtime keeps one: the emitters ask for it per instruction.
+    static FRAGMENTS: std::sync::OnceLock<arinsal_beamasm::map::MapFragments> =
+        std::sync::OnceLock::new();
+    FRAGMENTS.get_or_init(|| arinsal_beamasm::map::MapFragments::new(get, update).unwrap())
+}
+
+/// Per-module BeamAsm compile time over 200 Elixir modules (`--run-ignored all`, release).
+#[test]
+#[ignore = "benchmark"]
+fn beamasm_compile_time_per_module() {
+    let dir = std::env::var_os("ARINSAL_BENCH_BEAMS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            command_path("elixir", &["-e", "IO.write(:code.lib_dir(:elixir))"])
+                .expect("elixir on PATH")
+                .join("ebin")
+        });
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "beam"))
+        .collect();
+    files.sort();
+    files.truncate(200);
+    let mut samples = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut layout_hash = std::collections::hash_map::DefaultHasher::new();
+    let repeat: usize = std::env::var("ARINSAL_BENCH_REPEAT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    for path in files.iter().cycle().take(files.len() * repeat) {
+        let bytes = std::fs::read(path).unwrap();
+        total_bytes += bytes.len();
+        let beam = arinsal_beam::parse(&bytes).unwrap();
+        let loaded = arinsal_loader::load(&beam).unwrap();
+        let env = CorpusEnv::new(&loaded);
+        let start = std::time::Instant::now();
+        let compiled = compile_module_with_env(&bytes, &env);
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        // The layout must not change with a faster compiler: hash the entry offsets.
+        if let Ok(compiled) = compiled {
+            use std::hash::{Hash, Hasher};
+            let base = compiled
+                .native
+                .entries
+                .values()
+                .map(|ptr| *ptr as usize)
+                .min()
+                .unwrap_or(0);
+            let mut offsets: Vec<_> = compiled
+                .native
+                .entries
+                .iter()
+                .map(|(label, ptr)| (*label, *ptr as usize - base))
+                .collect();
+            offsets.sort();
+            offsets.hash(&mut layout_hash);
+            compiled.functions.len().hash(&mut layout_hash);
+            if std::env::var_os("ARINSAL_BENCH_PRINT").is_some() {
+                let mut one = std::collections::hash_map::DefaultHasher::new();
+                offsets.hash(&mut one);
+                println!(
+                    "MOD {} {:x} fns={} unported={}",
+                    compiled.name,
+                    one.finish(),
+                    compiled.functions.len(),
+                    compiled.unported.len()
+                );
+            }
+        }
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = samples.len();
+    println!("LAYOUT {:x}", std::hash::Hasher::finish(&layout_hash));
+    println!(
+        "BEAMASM modules={n} bytes={total_bytes} median={:.3} ms p95={:.3} ms mean={:.3} ms total={:.1} ms",
+        samples[n / 2],
+        samples[n * 95 / 100],
+        samples.iter().sum::<f64>() / n as f64,
+        samples.iter().sum::<f64>()
+    );
 }
