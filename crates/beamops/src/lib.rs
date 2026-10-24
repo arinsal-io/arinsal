@@ -163,17 +163,16 @@ fn transform_with_options(
                 queue.push_back(std::mem::replace(node, Node::empty()));
                 index += 1;
             }
-            let need = rules
-                .get(queue[0].name)
-                .and_then(|rules| rules.iter().map(|rule| rule.patterns.len()).max())
-                .unwrap_or(1);
+            // One lookup by generic opcode per step: its rules and the window they need.
+            let bucket = rules.get(queue[0].name);
+            let need = bucket.map_or(1, |bucket| bucket.width);
             while queue.len() < need && index < code.len() {
                 queue.push_back(std::mem::replace(&mut code[index], Node::empty()));
                 index += 1;
             }
             let stream = queue.make_contiguous();
             let mut replacement = None;
-            for rule in rules.get(stream[0].name).into_iter().flatten() {
+            for rule in bucket.into_iter().flat_map(|bucket| &bucket.rules) {
                 if let Some((consumed, produced)) =
                     apply_rule(rule, stream, 0, beam, instrument_line_breakpoints)
                 {
@@ -352,13 +351,49 @@ struct Output {
     function: bool,
 }
 
-fn rules() -> &'static HashMap<&'static str, Vec<Rule>> {
-    static RULES: OnceLock<HashMap<&'static str, Vec<Rule>>> = OnceLock::new();
+/// The rules whose first pattern is one generic opcode (erts `gen_transform` entry of that
+/// opcode), and the widest pattern among them.
+struct Bucket {
+    rules: Vec<Rule>,
+    width: usize,
+}
+
+/// FNV-1a over the opcode name: the table is read once per instruction, and SipHash costs more
+/// than the lookup is worth for a key of a dozen bytes.
+#[derive(Default, Clone, Copy)]
+struct OpcodeHasher(u64);
+
+impl std::hash::Hasher for OpcodeHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
+        for byte in bytes {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+}
+
+type OpcodeMap = HashMap<&'static str, Bucket, std::hash::BuildHasherDefault<OpcodeHasher>>;
+
+fn rules() -> &'static OpcodeMap {
+    static RULES: OnceLock<OpcodeMap> = OnceLock::new();
     RULES.get_or_init(|| {
         let parsed_rules = parse_rules();
-        let mut buckets: HashMap<&'static str, Vec<Rule>> = HashMap::new();
+        let mut buckets: OpcodeMap = HashMap::default();
         for rule in parsed_rules {
-            buckets.entry(rule.patterns[0].op).or_default().push(rule);
+            let bucket = buckets.entry(rule.patterns[0].op).or_insert(Bucket {
+                rules: Vec::new(),
+                width: 1,
+            });
+            bucket.width = bucket.width.max(rule.patterns.len());
+            bucket.rules.push(rule);
         }
         buckets
     })
