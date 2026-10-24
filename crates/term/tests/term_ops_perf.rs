@@ -1,6 +1,6 @@
 use arinsal_term::{
     ProcessHeap, Term, TermBuilder, VecHeap, build_hamt_from_unique, cmp_exact, copy_term,
-    exact_eq, size_object,
+    exact_eq, global_atoms, loose_eq, size_object,
 };
 use std::hint::black_box;
 use std::time::Instant;
@@ -125,6 +125,16 @@ fn equality_and_comparison_microbench_10m() {
         TermBuilder::new(heap).list_from_iter(values).unwrap()
     }
 
+    fn sequence_first(heap: &mut VecHeap, count: usize) -> Term {
+        TermBuilder::new(heap)
+            .list_from_iter(
+                (0..count).map(|index| {
+                    Term::small(if index == 0 { 0 } else { index as i64 + 1 }).unwrap()
+                }),
+            )
+            .unwrap()
+    }
+
     fn tuple(heap: &mut VecHeap, count: usize, last: Option<i64>) -> Term {
         let mut values = (1..=count)
             .map(|value| Term::small(value as i64).unwrap())
@@ -207,6 +217,35 @@ fn equality_and_comparison_microbench_10m() {
         .collect::<Vec<_>>();
     let hamt_different = build_hamt_from_unique(&hamt_different_pairs, &mut heap).unwrap();
     assert!(hamt.is_hashmap(), "the OTP 40-entry fixture is a HAMT");
+    let atom_a = Term::atom(global_atoms().intern("eq_cmp_bench_alpha").unwrap());
+    let atom_b = Term::atom(global_atoms().intern("eq_cmp_bench_beta").unwrap());
+    let tuple_atoms = [atom_a; 10];
+    let tuple_atoms_term = TermBuilder::new(&mut heap).tuple(&tuple_atoms).unwrap();
+    let tuple_atoms_equal = TermBuilder::new(&mut heap).tuple(&tuple_atoms).unwrap();
+    let tuple_atoms_different = TermBuilder::new(&mut heap)
+        .tuple(&[
+            atom_b, atom_a, atom_a, atom_a, atom_a, atom_a, atom_a, atom_a, atom_a, atom_a,
+        ])
+        .unwrap();
+    let list100 = sequence(&mut heap, 100, None);
+    let list100_equal = sequence(&mut heap, 100, None);
+    let list100_different_first = sequence_first(&mut heap, 100);
+    let map10 = maps(&mut heap, 10, None);
+    let map10_equal = maps(&mut heap, 10, None);
+    let map10_different_first = TermBuilder::new(&mut heap)
+        .flatmap_from_pairs(
+            &(1..=10)
+                .map(|key| {
+                    (
+                        Term::small(key).unwrap(),
+                        Term::small(if key == 1 { 0 } else { key }).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let atom_a_equal = Term::atom(global_atoms().intern("eq_cmp_bench_alpha").unwrap());
+    let atom_b_equal = Term::atom(global_atoms().intern("eq_cmp_bench_beta").unwrap());
     let selected_cases = std::env::var("EQ_STACK_BENCH_CASE")
         .expect("set EQ_STACK_BENCH_CASE to a comma-separated case list");
     let cases = vec![
@@ -240,6 +279,31 @@ fn equality_and_comparison_microbench_10m() {
             equal: (hamt, hamt_equal),
             compare: (hamt, hamt_different),
         },
+        Case {
+            name: "small_atoms",
+            equal: (atom_a, atom_a_equal),
+            compare: (atom_a, atom_b_equal),
+        },
+        Case {
+            name: "tuple10_atoms",
+            equal: (tuple_atoms_term, tuple_atoms_equal),
+            compare: (tuple_atoms_term, tuple_atoms_different),
+        },
+        Case {
+            name: "list100",
+            equal: (list100, list100_equal),
+            compare: (list100, list100_different_first),
+        },
+        Case {
+            name: "map10",
+            equal: (map10, map10_equal),
+            compare: (map10, map10_different_first),
+        },
+        Case {
+            name: "unequal_first",
+            equal: (list100, list100_equal),
+            compare: (list100, list100_different_first),
+        },
     ]
     .into_iter()
     .filter(|case| selected_cases.split(',').any(|name| name == case.name))
@@ -249,6 +313,24 @@ fn equality_and_comparison_microbench_10m() {
         selected_cases.split(',').count(),
         "unknown EQ_STACK_BENCH_CASE"
     );
+    for case in &cases {
+        assert!(
+            exact_eq(case.equal.0, case.equal.1),
+            "{} exact equality",
+            case.name
+        );
+        assert!(
+            loose_eq(case.equal.0, case.equal.1),
+            "{} loose equality",
+            case.name
+        );
+        similar_asserts::assert_eq!(
+            cmp_exact(case.compare.0, case.compare.1).is_eq(),
+            false,
+            "{} comparison pair must differ",
+            case.name
+        );
+    }
 
     fn rust_measure(left: Term, right: Term, operation: impl Fn(Term, Term) -> i32) -> f64 {
         let start = Instant::now();
@@ -276,13 +358,16 @@ fn equality_and_comparison_microbench_10m() {
         start.elapsed().as_secs_f64() * 1e9 / N as f64
     }
 
-    fn rust_round(cases: &[Case]) -> Vec<(f64, f64)> {
+    fn rust_round(cases: &[Case]) -> Vec<(f64, f64, f64)> {
         let empty = rust_empty_loop(cases[0].equal.0, cases[0].equal.1);
         cases
             .iter()
             .map(|case| {
                 let eq = rust_measure(case.equal.0, case.equal.1, |a, b| i32::from(exact_eq(a, b)))
                     - empty;
+                let loose =
+                    rust_measure(case.equal.0, case.equal.1, |a, b| i32::from(loose_eq(a, b)))
+                        - empty;
                 let order = rust_measure(case.compare.0, case.compare.1, |a, b| {
                     match cmp_exact(a, b) {
                         std::cmp::Ordering::Less => -1,
@@ -290,7 +375,7 @@ fn equality_and_comparison_microbench_10m() {
                         std::cmp::Ordering::Greater => 1,
                     }
                 }) - empty;
-                (eq, order)
+                (eq, loose, order)
             })
             .collect()
     }
@@ -312,6 +397,15 @@ run(Names) ->
     MapEqual = maps:from_list([{K, K} || K <- lists:seq(1, 8)]),
     MapDifferent = maps:from_list([{K, if K == 8 -> 0; true -> K end}
                                    || K <- lists:seq(1, 8)]),
+    SmallAtom = eq_cmp_bench_alpha,
+    SmallAtomOther = eq_cmp_bench_beta,
+    Tuple10Atoms = list_to_tuple(lists:duplicate(10, SmallAtom)),
+    Tuple10AtomsDifferent = list_to_tuple([SmallAtomOther | lists:duplicate(9, SmallAtom)]),
+    List100 = lists:seq(1, 100),
+    List100DifferentFirst = [0 | lists:seq(2, 100)],
+    Map10 = maps:from_list([{K, K} || K <- lists:seq(1, 10)]),
+    Map10DifferentFirst = maps:from_list([{K, if K == 1 -> 0; true -> K end}
+                                          || K <- lists:seq(1, 10)]),
     NestedKey = #{#{1 => 1} => 0},
     NestedKeyEqual = #{#{1 => 1} => 0},
     NestedKeyDifferent = #{#{1 => 2} => 0},
@@ -323,20 +417,29 @@ run(Names) ->
         run_case(Name, List, ListEqual, ListDifferent, Tuple, TupleEqual, TupleDifferent,
                  Deep, DeepEqual, DeepDifferent, Map, MapEqual, MapDifferent,
                  NestedKey, NestedKeyEqual, NestedKeyDifferent,
-                 Hamt40, Hamt40Equal, Hamt40Different)
+                 Hamt40, Hamt40Equal, Hamt40Different,
+                 SmallAtom, SmallAtomOther, Tuple10Atoms, Tuple10AtomsDifferent,
+                 List100, List100DifferentFirst, Map10, Map10DifferentFirst)
     end, Names),
     halt().
 run_case(Name, List, ListEqual, ListDifferent, Tuple, TupleEqual, TupleDifferent,
          Deep, DeepEqual, DeepDifferent, Map, MapEqual, MapDifferent,
          NestedKey, NestedKeyEqual, NestedKeyDifferent,
-         Hamt40, Hamt40Equal, Hamt40Different) ->
+         Hamt40, Hamt40Equal, Hamt40Different,
+         SmallAtom, SmallAtomOther, Tuple10Atoms, Tuple10AtomsDifferent,
+         List100, List100DifferentFirst, Map10, Map10DifferentFirst) ->
     {EqualLeft, EqualRight, CompareLeft, CompareRight} = case Name of
         "list" -> {List, ListEqual, List, ListDifferent};
         "tuple" -> {Tuple, TupleEqual, Tuple, TupleDifferent};
         "nested" -> {Deep, DeepEqual, Deep, DeepDifferent};
         "map" -> {Map, MapEqual, Map, MapDifferent};
         "nested_key" -> {NestedKey, NestedKeyEqual, NestedKey, NestedKeyDifferent};
-        "hamt40" -> {Hamt40, Hamt40Equal, Hamt40, Hamt40Different}
+        "hamt40" -> {Hamt40, Hamt40Equal, Hamt40, Hamt40Different};
+        "small_atoms" -> {SmallAtom, SmallAtom, SmallAtom, SmallAtomOther};
+        "tuple10_atoms" -> {Tuple10Atoms, Tuple10Atoms, Tuple10Atoms, Tuple10AtomsDifferent};
+        "list100" -> {List100, List100, List100, List100DifferentFirst};
+        "map10" -> {Map10, Map10, Map10, Map10DifferentFirst};
+        "unequal_first" -> {List100, List100, List100, List100DifferentFirst}
     end,
     N = 10000000,
     Base0 = erlang:monotonic_time(nanosecond),
@@ -345,10 +448,13 @@ run_case(Name, List, ListEqual, ListDifferent, Tuple, TupleEqual, TupleDifferent
     Eq0 = erlang:monotonic_time(nanosecond),
     _ = eq_even(N, EqualLeft, EqualRight, 0),
     EqTime = (erlang:monotonic_time(nanosecond) - Eq0 - EmptyTime) / N,
+    Loose0 = erlang:monotonic_time(nanosecond),
+    _ = loose_even(N, EqualLeft, EqualRight, 0),
+    LooseTime = (erlang:monotonic_time(nanosecond) - Loose0 - EmptyTime) / N,
     Cmp0 = erlang:monotonic_time(nanosecond),
     _ = cmp_even(N, CompareLeft, CompareRight, 0),
     CmpTime = (erlang:monotonic_time(nanosecond) - Cmp0 - EmptyTime) / N,
-    io:format("~s ~.2f ~.2f~n", [Name, EqTime, CmpTime]).
+    io:format("~s ~.2f ~.2f ~.2f~n", [Name, EqTime, LooseTime, CmpTime]).
 empty_even(0, _, _, Acc) -> Acc;
 empty_even(N, A, B, Acc) -> empty_odd(N - 1, A, B, Acc + 1).
 empty_odd(0, _, _, Acc) -> Acc;
@@ -361,6 +467,14 @@ eq_odd(0, _, _, Acc) -> Acc;
 eq_odd(N, A, B, Acc) ->
     V = if B =:= A -> 1; true -> 0 end,
     eq_even(N - 1, A, B, Acc + V).
+loose_even(0, _, _, Acc) -> Acc;
+loose_even(N, A, B, Acc) ->
+    V = if A == B -> 1; true -> 0 end,
+    loose_odd(N - 1, A, B, Acc + V).
+loose_odd(0, _, _, Acc) -> Acc;
+loose_odd(N, A, B, Acc) ->
+    V = if B == A -> 1; true -> 0 end,
+    loose_even(N - 1, A, B, Acc + V).
 cmp_even(0, _, _, Acc) -> Acc;
 cmp_even(N, A, B, Acc) ->
     Order = erts_internal:cmp_term(A, B),
@@ -389,7 +503,10 @@ cmp_odd(N, A, B, Acc) ->
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    fn reference_round(directory: &std::path::Path, cases: &[Case]) -> Vec<(String, f64, f64)> {
+    fn reference_round(
+        directory: &std::path::Path,
+        cases: &[Case],
+    ) -> Vec<(String, f64, f64, f64)> {
         let names = cases
             .iter()
             .map(|case| format!("\"{}\"", case.name))
@@ -416,6 +533,7 @@ cmp_odd(N, A, B, Acc) ->
                     fields.next().unwrap().to_owned(),
                     fields.next().unwrap().parse().unwrap(),
                     fields.next().unwrap().parse().unwrap(),
+                    fields.next().unwrap().parse().unwrap(),
                 )
             })
             .collect()
@@ -426,8 +544,8 @@ cmp_odd(N, A, B, Acc) ->
         values[values.len() / 2]
     }
 
-    let mut rust_samples = vec![vec![(0.0, 0.0); cases.len()]; ROUNDS];
-    let mut reference_samples = vec![vec![(String::new(), 0.0, 0.0); cases.len()]; ROUNDS];
+    let mut rust_samples = vec![vec![(0.0, 0.0, 0.0); cases.len()]; ROUNDS];
+    let mut reference_samples = vec![vec![(String::new(), 0.0, 0.0, 0.0); cases.len()]; ROUNDS];
     for round in 0..ROUNDS {
         if round & 1 == 0 {
             reference_samples[round] = reference_round(&reference_dir, &cases);
@@ -443,13 +561,18 @@ cmp_odd(N, A, B, Acc) ->
             .map(|sample| sample[index].1)
             .collect();
         let mut rust_eq: Vec<_> = rust_samples.iter().map(|sample| sample[index].0).collect();
-        let mut otp_cmp: Vec<_> = reference_samples
+        let mut otp_loose: Vec<_> = reference_samples
             .iter()
             .map(|sample| sample[index].2)
             .collect();
-        let mut rust_cmp: Vec<_> = rust_samples.iter().map(|sample| sample[index].1).collect();
+        let mut rust_loose: Vec<_> = rust_samples.iter().map(|sample| sample[index].1).collect();
+        let mut otp_cmp: Vec<_> = reference_samples
+            .iter()
+            .map(|sample| sample[index].3)
+            .collect();
+        let mut rust_cmp: Vec<_> = rust_samples.iter().map(|sample| sample[index].2).collect();
         eprintln!(
-            "{} eq OTP {:.2} [{:.2}–{:.2}] ns, Arinsal {:.2} [{:.2}–{:.2}] ns; cmp OTP {:.2} [{:.2}–{:.2}] ns, Arinsal {:.2} [{:.2}–{:.2}] ns",
+            "{} =:= OTP {:.2} [{:.2}–{:.2}] ns, Arinsal {:.2} [{:.2}–{:.2}] ns; == OTP {:.2} [{:.2}–{:.2}] ns, Arinsal {:.2} [{:.2}–{:.2}] ns; cmp (<) OTP {:.2} [{:.2}–{:.2}] ns, Arinsal {:.2} [{:.2}–{:.2}] ns",
             case.name,
             median(&mut otp_eq),
             otp_eq.iter().copied().fold(f64::INFINITY, f64::min),
@@ -457,6 +580,12 @@ cmp_odd(N, A, B, Acc) ->
             median(&mut rust_eq),
             rust_eq.iter().copied().fold(f64::INFINITY, f64::min),
             rust_eq.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            median(&mut otp_loose),
+            otp_loose.iter().copied().fold(f64::INFINITY, f64::min),
+            otp_loose.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            median(&mut rust_loose),
+            rust_loose.iter().copied().fold(f64::INFINITY, f64::min),
+            rust_loose.iter().copied().fold(f64::NEG_INFINITY, f64::max),
             median(&mut otp_cmp),
             otp_cmp.iter().copied().fold(f64::INFINITY, f64::min),
             otp_cmp.iter().copied().fold(f64::NEG_INFINITY, f64::max),
