@@ -1727,17 +1727,16 @@ fn eval_c_predicate(
             let Some(Operand::List(rest)) = get(&args[1]) else {
                 return false;
             };
+            // Port of erts/emulator/beam/predicates.tab (mixed_types): the keys are not all of one
+            // type; one pass against the first key's type, not every pair of keys.
             size >= 2
                 && size % 2 == 0
                 && usize::try_from(size).ok() == Some(rest.len())
-                && rest
-                    .chunks_exact(2)
-                    .map(|pair| operand_tag(&pair[0]))
-                    .any(|tag| {
-                        rest.chunks_exact(2)
-                            .map(|pair| operand_tag(&pair[0]))
-                            .any(|other| other != tag)
-                    })
+                && rest.first().is_some_and(|first| {
+                    let first = operand_tag(first);
+                    rest.chunks_exact(2)
+                        .any(|pair| operand_tag(&pair[0]) != first)
+                })
         }
         "is_heavy_bif" if args.len() == 1 => {
             imported(&args[0]).is_some_and(|(module, function, arity)| {
