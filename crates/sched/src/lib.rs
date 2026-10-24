@@ -6406,6 +6406,9 @@ impl<T: Task> Scheduler<T> {
                 .fill(None);
         }
         self.wake_all_workers();
+        for pool in &self.inner.dirty {
+            pool.wake_all();
+        }
     }
 
     /// Enable or disable worker microstate counters.
@@ -6426,6 +6429,7 @@ impl<T: Task> Scheduler<T> {
             for thread in &pool.threads {
                 thread.stats.lock().unwrap().set_msacc_enabled(enabled);
             }
+            pool.wake_all();
         }
         self.wake_all_workers();
     }
@@ -7196,6 +7200,26 @@ mod dirty_state_tests {
             .map(|thread| thread.wake.load(Ordering::SeqCst))
             .collect();
         assert_eq!(woken, vec![true, true, true, false]);
+    }
+
+    #[test]
+    fn dirty_busy_wait_thresholds_match_erts_spin_counts() {
+        let defaults = [None, None, None];
+        assert!(scheduler_spin_count(&defaults, 0, "medium") == 10_000);
+        assert!(scheduler_spin_count(&defaults, 1, "short") == 10_000);
+        assert!(scheduler_spin_count(&defaults, 2, "short") == 10_000);
+
+        for (threshold, expected) in [
+            ("none", 0),
+            ("very_short", 5_000),
+            ("short", 10_000),
+            ("medium", 10_000),
+            ("long", 20_000),
+            ("very_long", 40_000),
+        ] {
+            let configured = [None, Some(threshold.to_owned()), None];
+            assert!(scheduler_spin_count(&configured, 1, "short") == expected);
+        }
     }
 
     #[test]
@@ -8179,6 +8203,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     // data block per scheduler, owned by its thread for the scheduler's lifetime.
     let mut scheduler_data = T::SchedulerData::default();
     arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&scheduler_data).cast());
+    let spin_count = scheduler_spin_count(&inner.config.busy_wait_thresholds, 0, "medium");
     native_sender::install(Rc::new(WorkerSender {
         inner: Arc::clone(&inner),
         local: Rc::downgrade(&local_cell),
@@ -8303,7 +8328,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             thr_progress::scheduler_prepare_wait();
             // Port of erl_process.c:3065 (sched_spin_wait): a wake that lands in this
             // window clears `parked` and must not fall into a blocking park.
-            let mut spins = SCHED_TSE_SLEEP_SPINCOUNT;
+            let mut spins = spin_count;
             let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
             while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
                 std::hint::spin_loop();
@@ -8597,7 +8622,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         thr_progress::scheduler_prepare_wait();
         // Port of erts/emulator/beam/erl_process.c:3065 (sched_spin_wait), OTP-29.1.1: spin
         // before sleeping so a wakeup that comes soon costs no system call.
-        let mut spins = SCHED_TSE_SLEEP_SPINCOUNT;
+        let mut spins = spin_count;
         let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
         while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
             std::hint::spin_loop();
@@ -8715,7 +8740,6 @@ const PINNED_FLAGS_SHIFT: u32 = 8;
 
 // Port of erts/emulator/beam/erl_process.c:69,75,84 (medium busy-wait threshold), OTP-29.1.1.
 const SCHED_SPIN_UNTIL_YIELD: u32 = 100;
-const SCHED_TSE_SLEEP_SPINCOUNT: u32 = 10 * 1000;
 
 // Port of erts/emulator/beam/erl_process.c:5564-5577 (medium wakeup-other threshold), OTP-29.1.1.
 const CONTEXT_REDS: i64 = 4_000;
@@ -8765,6 +8789,14 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
     let pool = &inner.dirty[kind.index()];
     let thread = &pool.threads[index];
     let slot = pool.first_slot + index;
+    let spin_count = scheduler_spin_count(
+        &inner.config.busy_wait_thresholds,
+        match kind {
+            DirtyKind::Cpu => 1,
+            DirtyKind::Io => 2,
+        },
+        "short",
+    );
     let _ = thread.handle.set(thread::current());
     thread.stats.lock().unwrap().set_state(MsaccState::Other);
     loop {
@@ -8791,7 +8823,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                     queue.sleepers.push_back(index);
                 }
                 drop(queue);
-                let mut spins = SCHED_TSE_SLEEP_SPINCOUNT;
+                let mut spins = spin_count;
                 let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
                 while spins > 0 && !thread.wake.load(Ordering::Acquire) {
                     std::hint::spin_loop();
@@ -8803,10 +8835,15 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                     spins -= 1;
                 }
                 if !thread.wake.load(Ordering::SeqCst) {
-                    // Port of erts/emulator/beam/erl_process.c (scheduler_wait): `sleep`
-                    // wraps only the blocking wait; the spin above counts as `other`.
+                    // Port of erts/emulator/beam/erl_process.c (scheduler_wait): dirty
+                    // schedulers sleep on their TSE event after the configured spin threshold.
                     thread.stats.lock().unwrap().set_state(MsaccState::Sleep);
-                    thread::park_timeout(Duration::from_millis(100));
+                    while !thread.wake.load(Ordering::SeqCst)
+                        && !inner.stopped.load(Ordering::Acquire)
+                        && !inner.halt_requested.load(Ordering::Acquire)
+                    {
+                        thread::park();
+                    }
                     thread.stats.lock().unwrap().set_state(MsaccState::Other);
                 }
                 queue = pool.queue.lock().unwrap();
@@ -8833,6 +8870,21 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         // multi-scheduling a dirty scheduler executes one job, then switches back.
         inner.msb_dirty_done(kind);
     }
+}
+
+/// Return the erts spin count for `+sbwt`, `+sbwtdcpu`, or `+sbwtdio`.
+// Port of erts/emulator/beam/erl_process.c:75-86,5852-5887, OTP-29.1.1.
+fn scheduler_spin_count(thresholds: &[Option<String>; 3], index: usize, default: &str) -> u32 {
+    let threshold = thresholds[index].as_deref().unwrap_or(default);
+    let sys_sched = match threshold {
+        "very_long" => 40,
+        "long" => 20,
+        "medium" | "short" => 10,
+        "very_short" => 5,
+        "none" => 0,
+        _ => unreachable!("busy wait thresholds are validated at argument parsing"),
+    };
+    sys_sched * 1_000
 }
 
 fn profile_scheduler_transition<T: Task>(
