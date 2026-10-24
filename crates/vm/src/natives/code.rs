@@ -2287,9 +2287,12 @@ mod tests {
         let expected = reference.call("arinsal_hot_onload", "value", &[]);
         let actual = CallResult::Ok(value(&mut vm, "arinsal_hot_onload"));
         compare(&actual, &expected, CompareMode::Exact).unwrap();
-        let init = vm.eval("arinsal_hot_onload", "init", &[]).unwrap();
+        // The module has no interpreter form: a scheduler runs its native code.
+        let init = vm
+            .eval_scheduled("arinsal_hot_onload", "init", &[], 1, None)
+            .unwrap();
         compare(
-            &CallResult::Ok(to_owned(init.term).unwrap()),
+            &CallResult::Ok(init.term),
             &reference.call("arinsal_hot_onload", "init", &[]),
             CompareMode::Exact,
         )

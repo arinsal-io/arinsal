@@ -1836,8 +1836,10 @@ impl Vm {
         // A module whose functions all run natively has no interpreter form: a process left at
         // the entry of one of its functions (the return of an `-on_load` prelude, a call from
         // interpreted code) runs that function's native code, as erts jumps to its address.
-        if matches!(self.code.modules[module_id].code.get(p.ip), Some(Instr::CodeEnd))
-            && crate::beamasm_integration::enabled()
+        if matches!(
+            self.code.modules[module_id].code.get(p.ip),
+            Some(Instr::CodeEnd)
+        ) && crate::beamasm_integration::enabled()
         {
             let module = &self.code.modules[module_id];
             if let Some(native) = self.beamasm_targets.function_for_target(
