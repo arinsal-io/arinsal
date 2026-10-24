@@ -572,14 +572,6 @@ fn sync_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
     call(ctx, a, |a| {
         with_file(&a[0], |file| {
             let data_only = i32_number(&a[1])?;
-            // Port of erts/emulator/nifs/unix/unix_prim_file.c (efile_sync), OTP-29.1.1.
-            #[cfg(target_vendor = "apple")]
-            let _ = data_only;
-            #[cfg(target_vendor = "apple")]
-            let result = nix::fcntl::fcntl(file.as_raw_fd(), nix::fcntl::FcntlArg::F_BARRIERFSYNC)
-                .map(|_| ())
-                .map_err(|error| std::io::Error::from_raw_os_error(error as i32));
-            #[cfg(not(target_vendor = "apple"))]
             let result = if data_only == 0 {
                 file.sync_all()
             } else {

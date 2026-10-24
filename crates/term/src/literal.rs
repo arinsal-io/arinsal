@@ -132,37 +132,6 @@ impl LiteralChunk {
         range.fill(0);
         true
     }
-
-    pub(crate) fn write_words(&mut self, words: &[u64]) -> bool {
-        if words.len() > self.words {
-            return false;
-        }
-        let Some(from) = LITERAL_AREA_HEADER_WORDS.checked_mul(8) else {
-            return false;
-        };
-        let Some(bytes_len) = words.len().checked_mul(8) else {
-            return false;
-        };
-        let Some(to) = from.checked_add(bytes_len) else {
-            return false;
-        };
-        let Some(arena) = arena() else {
-            return false;
-        };
-        let mut arena = arena.lock().expect("literal arena poisoned");
-        let Ok(bytes) = arena.allocator.allocation_bytes_mut(self.allocation) else {
-            return false;
-        };
-        let Some(range) = bytes.get_mut(from..to) else {
-            return false;
-        };
-        let (chunks, remainder) = range.as_chunks_mut::<8>();
-        debug_assert!(remainder.is_empty());
-        for (chunk, word) in chunks.iter_mut().zip(words) {
-            chunk.copy_from_slice(&word.to_ne_bytes());
-        }
-        true
-    }
 }
 
 impl Drop for LiteralChunk {

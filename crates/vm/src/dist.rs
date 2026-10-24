@@ -93,20 +93,6 @@ fn dispatch(
 /// Port of erts/emulator/beam/dist.c:5543 (erts_internal_get_dflags_0), OTP-29.1.1.
 fn get_dflags(process: &mut Process) -> Result<Term, VmError> {
     let mask = !node_tables::test_remove_dflags(None);
-    if mask == u64::MAX {
-        return Ok(arinsal_term::global_dflags_record(
-            global_atoms()
-                .intern("erts_dflags")
-                .expect("distribution atom"),
-            [
-                integer(node_tables::DFLAG_DIST_DEFAULT),
-                integer(node_tables::DFLAG_DIST_MANDATORY),
-                integer(node_tables::DFLAG_DIST_ADDABLE),
-                integer(node_tables::DFLAG_DIST_REJECTABLE),
-                integer(node_tables::DFLAG_DIST_STRICT_ORDER),
-            ],
-        ));
-    }
     tuple(
         process,
         vec![
@@ -578,7 +564,6 @@ fn route_incoming(
                             .ok_or_else(badarg)?
                             .as_str(),
                         id,
-                        req.caller,
                         result.clone(),
                     )?;
                 }
@@ -669,22 +654,13 @@ pub(crate) fn remote_pid_term(process: &mut Process, proxy: Pid) -> Result<Optio
     if !may_be_proxy() {
         return Ok(None);
     }
-    let remote = {
-        let mut tables = node_tables::lock();
-        tables
-            .entries
-            .values()
-            .find_map(|entry| entry.dist.as_ref()?.proxy_to_remote.get(&proxy).cloned())
-            .or_else(|| tables.disconnected_monitor_pids.remove(&proxy))
-    };
+    let remote = node_tables::lock()
+        .entries
+        .values()
+        .find_map(|entry| entry.dist.as_ref()?.proxy_to_remote.get(&proxy).cloned());
     remote
         .map(|pid| from_owned(&pid, &mut process.heap).map_err(|_| badarg()))
         .transpose()
-}
-
-/// Discard a closed-connection proxy when its DOWN raced with demonitor or process exit.
-pub(crate) fn discard_disconnected_monitor_pid(proxy: Pid) {
-    node_tables::lock().disconnected_monitor_pids.remove(&proxy);
 }
 
 fn publish_remote_signal(
@@ -1049,13 +1025,10 @@ pub(crate) fn port_connection_closed(
     runtime: &crate::process::Runtime,
     port_id: u64,
 ) -> Result<(), VmError> {
-    if crate::debug_env::trace_dist() {
-        eprintln!("DIST_PORT_CLOSED port={port_id}");
-    }
     let Some(node) = node_tables::unregister_dist_port(port_id) else {
         return Ok(());
     };
-    let (watchers, node_events, monitor_downs) = {
+    let (watchers, node_events) = {
         let mut tables = node_tables::lock();
         let is_current_port = tables
             .entries
@@ -1072,7 +1045,6 @@ pub(crate) fn port_connection_closed(
             .map(|entry| entry.connection_id)
             .unwrap_or(u32::MAX);
         let visible = tables.entries.get(&node).is_some_and(|entry| entry.visible);
-        let monitor_downs = take_connection_monitors(&mut tables, &node);
         let watchers = tables.disconnect(&node);
         let events = tables.nodes_monitor_events(
             "nodedown",
@@ -1081,10 +1053,9 @@ pub(crate) fn port_connection_closed(
             visible,
             Some("connection_closed"),
         );
-        (watchers, events, monitor_downs)
+        (watchers, events)
     };
     notify_node_watchers(runtime, &node, watchers)?;
-    notify_connection_monitors(runtime, monitor_downs)?;
     send_nodes_monitor_events(runtime, node_events)
 }
 
@@ -1095,10 +1066,7 @@ pub(crate) fn kill_connection(
     node: &str,
     connection_id: u32,
 ) -> Result<bool, VmError> {
-    if crate::debug_env::trace_dist() {
-        eprintln!("DIST_KILL_CONNECTION node={node} connection_id={connection_id}");
-    }
-    let (watchers, node_events, monitor_downs) = {
+    let (watchers, node_events) = {
         let mut tables = node_tables::lock();
         let Some(entry) = tables.entries.get(node) else {
             return Ok(false);
@@ -1107,14 +1075,12 @@ pub(crate) fn kill_connection(
             return Ok(false);
         }
         let visible = entry.visible;
-        let monitor_downs = take_connection_monitors(&mut tables, node);
         let watchers = tables.disconnect(node);
         let events =
             tables.nodes_monitor_events("nodedown", node, connection_id, visible, Some("killed"));
-        (watchers, events, monitor_downs)
+        (watchers, events)
     };
     notify_node_watchers(runtime, node, watchers)?;
-    notify_connection_monitors(runtime, monitor_downs)?;
     send_nodes_monitor_events(runtime, node_events)?;
     Ok(true)
 }
@@ -1133,79 +1099,6 @@ fn notify_node_watchers(
             .map_err(|_| badarg())?;
         let message = Message::copy_from(term)?;
         let _ = sched.send(watcher.pid, watcher.pid, message);
-    }
-    Ok(())
-}
-
-struct ConnectionMonitorDown {
-    watcher: Pid,
-    proxy: Pid,
-    reference: u64,
-}
-
-/// Prepare one local monitor-down signal per remote monitor before dropping the connection tree.
-// Port of erts/emulator/beam/dist.c (`monitor_connection_down`), OTP-29.1.1.
-fn take_connection_monitors(
-    tables: &mut node_tables::NodeTables,
-    node: &str,
-) -> Vec<ConnectionMonitorDown> {
-    let local_creation = tables.local_creation;
-    let Some(entry) = tables.entries.get_mut(node) else {
-        return Vec::new();
-    };
-    let mut monitors = std::mem::take(&mut entry.pending_monitors);
-    if let Some(state) = entry.dist.as_mut() {
-        monitors.append(&mut state.remote_monitors);
-    }
-    if !monitors.is_empty() {
-        PROXIES_CREATED.store(true, Ordering::Release);
-    }
-    if crate::debug_env::trace_dist() {
-        eprintln!(
-            "DIST_MONITOR_CONNECTION_DOWN node={node} monitors={}",
-            monitors.len()
-        );
-    }
-    monitors
-        .into_iter()
-        .map(|(reference, monitor)| {
-            let proxy = Pid::new(
-                NEXT_REMOTE_PID.fetch_add(1, Ordering::Relaxed) & ((1 << 28) - 1),
-                local_creation,
-            );
-            tables
-                .disconnected_monitor_pids
-                .insert(proxy, monitor.target);
-            ConnectionMonitorDown {
-                watcher: monitor.watcher,
-                proxy,
-                reference,
-            }
-        })
-        .collect()
-}
-
-/// Deliver `noconnection` through the same monitor signal path used for remote process exits.
-fn notify_connection_monitors(
-    runtime: &crate::process::Runtime,
-    monitors: Vec<ConnectionMonitorDown>,
-) -> Result<(), VmError> {
-    let scheduler = runtime.scheduler()?;
-    for monitor in monitors {
-        let reason = Message::copy_from(atom("noconnection"))?;
-        if scheduler
-            .signal(
-                monitor.proxy,
-                monitor.watcher,
-                Signal::MonitorDown {
-                    reference: monitor.reference,
-                    reason,
-                },
-            )
-            .is_err()
-        {
-            discard_disconnected_monitor_pid(monitor.proxy);
-        }
     }
     Ok(())
 }
@@ -1440,7 +1333,7 @@ fn route_incoming_port(
                         .find(|e| e.dist.as_ref().is_some_and(|s| s.handle == handle))
                         .map(|e| e.name.clone())
                         .ok_or_else(badarg)?;
-                    remember_monitor(&node, id, req.caller, result.clone())?;
+                    remember_monitor(&node, id, result.clone())?;
                 }
                 if ok && flags & 1 != 0 {
                     // Port of erts/emulator/beam/dist.c:3017-3124 (DOP_SPAWN_REPLY), OTP-29.1.1.
@@ -2258,8 +2151,11 @@ pub(crate) fn native_signal(
         }
         "monitor" => {
             // Port of dist.c:1528 (erts_dsig_send_monitor), OTP-29.1.1.
-            let (tag, alias_mode, priority) = crate::signals::monitor_options(args)?;
-            let info = crate::signals::monitor_info_for(tag, None)?;
+            let (alias_mode, priority) = if args.len() == 3 {
+                monitor_alias_option(args[2])?
+            } else {
+                (None, false)
+            };
             let id = arinsal_bifs::next_ref_id();
             let reference = crate::signals::reference(process, id)?;
             if priority {
@@ -2289,16 +2185,16 @@ pub(crate) fn native_signal(
                 ),
                 None,
             )?;
-            remember_monitor(&node, id, ctx.pid(), target)?;
+            remember_monitor(&node, id, target)?;
             process.cold_mut().dist_monitors.insert(id);
-            let (origin, _) = crate::proc_create::create_monitor(
-                id,
-                ctx.pid().data(),
-                0,
-                info,
-                crate::proc_create::OriginMonitor::Distributed { alias_mode },
-            );
-            process.cold_mut().monitors.insert(origin);
+            process
+                .cold_mut()
+                .monitors
+                .insert(crate::proc_create::origin_monitor(
+                    id,
+                    0,
+                    crate::proc_create::OriginMonitor::Distributed { alias_mode },
+                ));
             Ok(reference)
         }
         "demonitor" => {
@@ -2341,6 +2237,44 @@ pub(crate) fn native_signal(
                 None,
             )?;
             Ok(atom("true"))
+        }
+        _ => Err(badarg()),
+    }
+}
+
+/// Parse the options used by remote `monitor/3`.
+/// Port of erts/emulator/beam/dist.c:1528 (`erts_dsig_send_monitor`), OTP-29.1.1.
+fn monitor_alias_option(
+    term: Term,
+) -> Result<(Option<crate::proc_create::AliasMode>, bool), VmError> {
+    let options = owned(term)?;
+    match &options {
+        OwnedTerm::Nil => Ok((None, false)),
+        OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => {
+            let mut alias_mode = None;
+            let mut priority = false;
+            for option in elems {
+                match option {
+                    OwnedTerm::Atom(name) if name == "priority" => priority = true,
+                    OwnedTerm::Tuple(parts)
+                        if parts.len() == 2
+                            && parts[0] == OwnedTerm::Atom("alias".into())
+                            && matches!(&parts[1], OwnedTerm::Atom(name) if matches!(name.as_str(), "demonitor" | "reply_demonitor" | "explicit_unalias")) =>
+                    {
+                        let OwnedTerm::Atom(name) = &parts[1] else {
+                            unreachable!();
+                        };
+                        alias_mode = Some(match name.as_str() {
+                            "explicit_unalias" => crate::proc_create::AliasMode::ExplicitUnalias,
+                            "demonitor" => crate::proc_create::AliasMode::Demonitor,
+                            "reply_demonitor" => crate::proc_create::AliasMode::ReplyDemonitor,
+                            _ => unreachable!(),
+                        });
+                    }
+                    _ => return Err(badarg()),
+                }
+            }
+            Ok((alias_mode, priority))
         }
         _ => Err(badarg()),
     }
@@ -2430,20 +2364,13 @@ fn remote_node(term: Term) -> Result<Option<String>, VmError> {
     Ok((node != local && node != "nonode@nohost").then_some(node))
 }
 
-fn remember_monitor(node: &str, id: u64, watcher: Pid, target: OwnedTerm) -> Result<(), VmError> {
+fn remember_monitor(node: &str, id: u64, target: OwnedTerm) -> Result<(), VmError> {
     let mut tables = node_tables::lock();
     let entry = tables.entries.get_mut(node).ok_or_else(badarg)?;
     if let Some(state) = entry.dist.as_mut() {
-        state
-            .remote_monitors
-            .insert(id, node_tables::RemoteMonitor { watcher, target });
+        state.remote_monitors.insert(id, target);
     } else {
-        entry
-            .pending_monitors
-            .insert(id, node_tables::RemoteMonitor { watcher, target });
-    }
-    if crate::debug_env::trace_dist() {
-        eprintln!("DIST_MONITOR_SET node={node} ref={id} watcher={watcher:?}");
+        entry.pending_monitors.insert(id, target);
     }
     Ok(())
 }
@@ -2451,13 +2378,13 @@ fn remember_monitor(node: &str, id: u64, watcher: Pid, target: OwnedTerm) -> Res
 pub(crate) fn take_monitor(id: u64) -> Option<(String, OwnedTerm)> {
     let mut tables = node_tables::lock();
     for (node, entry) in &mut tables.entries {
-        if let Some(monitor) = entry.pending_monitors.remove(&id) {
-            return Some((node.clone(), monitor.target));
+        if let Some(target) = entry.pending_monitors.remove(&id) {
+            return Some((node.clone(), target));
         }
         if let Some(state) = entry.dist.as_mut()
-            && let Some(monitor) = state.remote_monitors.remove(&id)
+            && let Some(target) = state.remote_monitors.remove(&id)
         {
-            return Some((node.clone(), monitor.target));
+            return Some((node.clone(), target));
         }
     }
     None
