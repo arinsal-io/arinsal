@@ -17,6 +17,113 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+/// The process root descriptors walked by garbage collection.
+// Port of erts/emulator/beam/erl_gc.c:112-119 (`Roots` / `Rootset`), OTP-29.1.1.
+pub struct GcRootSet<'a> {
+    inline: [Option<&'a mut [Term]>; 32],
+    inline_len: usize,
+    overflow: Vec<&'a mut [Term]>,
+}
+
+impl<'a> GcRootSet<'a> {
+    /// Uses the same 32-entry inline descriptor array as erts' default rootset.
+    pub fn new() -> Self {
+        Self {
+            inline: std::array::from_fn(|_| None),
+            inline_len: 0,
+            overflow: Vec::new(),
+        }
+    }
+
+    /// Adds a mutable term range without copying its values.
+    pub fn push(&mut self, terms: &'a mut [Term]) {
+        if let Some(slot) = self.inline.get_mut(self.inline_len) {
+            *slot = Some(terms);
+            self.inline_len += 1;
+        } else {
+            self.overflow.push(terms);
+        }
+    }
+
+    /// Adds a single mutable term slot.
+    pub fn push_term(&mut self, term: &'a mut Term) {
+        self.push(std::slice::from_mut(term));
+    }
+
+    // Port of erts/emulator/beam/erl_gc.c:1679-1720 (root ranges in do_minor), OTP-29.1.1.
+    #[inline(always)]
+    pub fn for_each_mut(&mut self, mut visit: impl FnMut(&mut Term)) {
+        for descriptor in &mut self.inline[..self.inline_len] {
+            if let Some(range) = descriptor.as_deref_mut() {
+                for term in range {
+                    visit(term);
+                }
+            }
+        }
+        for range in &mut self.overflow {
+            for term in range.iter_mut() {
+                visit(term);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn evacuate<const INTO_OLD: bool>(
+        &mut self,
+        copier: &mut Copier<'_>,
+        n_htop: &mut HeapTop,
+        old_htop: &mut HeapTop,
+    ) {
+        for descriptor in &mut self.inline[..self.inline_len] {
+            if let Some(range) = descriptor.as_deref_mut() {
+                for root in range {
+                    root.0 = copier.evacuate::<INTO_OLD>(root.0, n_htop, old_htop);
+                }
+            }
+        }
+        for range in &mut self.overflow {
+            for root in range.iter_mut() {
+                root.0 = copier.evacuate::<INTO_OLD>(root.0, n_htop, old_htop);
+            }
+        }
+    }
+}
+
+impl Default for GcRootSet<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A queued message's live terms and detached heap fragment during process collection.
+// Port of erts/emulator/beam/erl_gc.c `setup_rootset` / `move_msgs_to_heap`, OTP-29.1.1.
+pub struct GcMessageRoot<'a> {
+    term: &'a mut Term,
+    token: Option<&'a mut Term>,
+    heap: Option<crate::message::MessageHeap>,
+}
+
+impl<'a> GcMessageRoot<'a> {
+    /// Describes mutable message slots while retaining ownership of their detached heap.
+    pub fn new(
+        term: &'a mut Term,
+        token: Option<&'a mut Term>,
+        heap: Option<crate::message::MessageHeap>,
+    ) -> Self {
+        Self { term, token, heap }
+    }
+
+    /// The detached fragment, if this message carries one.
+    pub fn heap(&self) -> Option<&crate::message::MessageHeap> {
+        self.heap.as_ref()
+    }
+
+    /// Takes the detached fragment so its queue node can reclaim it after collection.
+    pub fn take_heap(&mut self) -> Option<crate::message::MessageHeap> {
+        self.heap.take()
+    }
+}
+
 /// `erts_system_monitor_long_gc`: the collector reads the clock only while this is set.
 // Port of erts/emulator/beam/erl_gc.c:803, OTP-29.1.1.
 static GC_CLOCK_LONG: AtomicBool = AtomicBool::new(false);
@@ -302,7 +409,6 @@ struct Copier<'a> {
     #[cfg(debug_assertions)]
     fragment_ranges: Vec<(usize, usize)>,
     sub_bits: Vec<Term>,
-    error: Option<TermError>,
 }
 
 impl Copier<'_> {
@@ -332,7 +438,12 @@ impl Copier<'_> {
     // Port of erts/emulator/beam/erl_gc.c:1688-1717 (do_minor root loop) and
     // erl_gc.h:42-94 (MOVE_CONS, MOVE_BOXED, move_cons, move_boxed), OTP-29.1.1.
     #[inline(always)]
-    fn evacuate<const INTO_OLD: bool>(&mut self, gval: u64) -> u64 {
+    fn evacuate<const INTO_OLD: bool>(
+        &mut self,
+        gval: u64,
+        n_htop: &mut HeapTop,
+        old_htop: &mut HeapTop,
+    ) -> u64 {
         let tag = gval & 3;
         if tag != 1 && tag != 2 {
             return gval;
@@ -363,18 +474,21 @@ impl Copier<'_> {
             } else {
                 return gval;
             };
-            let top = if promote {
-                &mut self.old_htop
-            } else {
-                &mut self.n_htop
-            };
             if tag == 1 {
-                if top.end - top.at < 16 {
-                    self.error = Some(TermError::HeapFull);
-                    return gval;
-                }
-                let destination = top.at as *mut u64;
-                top.at += 16;
+                // `minor_collection` and `major_collection` size to-space from the
+                // maximum source usage before the root scan. Like erts' move_cons, the
+                // copy path relies on that bound instead of checking capacity per object.
+                let destination = if promote {
+                    debug_assert!(old_htop.at <= old_htop.end && old_htop.end - old_htop.at >= 16);
+                    let destination = old_htop.at as *mut u64;
+                    old_htop.at += 16;
+                    destination
+                } else {
+                    debug_assert!(n_htop.at <= n_htop.end && n_htop.end - n_htop.at >= 16);
+                    let destination = n_htop.at as *mut u64;
+                    n_htop.at += 16;
+                    destination
+                };
                 *destination = val;
                 *destination.add(1) = *ptr.add(1);
                 let moved = destination as u64 | 1;
@@ -387,12 +501,21 @@ impl Copier<'_> {
             } else {
                 boxed_object_words(val, ptr)
             };
-            if (top.end - top.at) / 8 < words {
-                self.error = Some(TermError::HeapFull);
-                return gval;
-            }
-            let destination = top.at as *mut u64;
-            top.at += words * 8;
+            // Port of erts/emulator/beam/erl_gc.h (move_boxed), OTP-29.1.1: the
+            // collection sizing pass guarantees room for all reachable source words.
+            let destination = if promote {
+                debug_assert!(
+                    old_htop.at <= old_htop.end && (old_htop.end - old_htop.at) / 8 >= words
+                );
+                let destination = old_htop.at as *mut u64;
+                old_htop.at += words * 8;
+                destination
+            } else {
+                debug_assert!(n_htop.at <= n_htop.end && (n_htop.end - n_htop.at) / 8 >= words);
+                let destination = n_htop.at as *mut u64;
+                n_htop.at += words * 8;
+                destination
+            };
             *destination = val;
             for i in 1..words {
                 *destination.add(i) = *ptr.add(i);
@@ -414,22 +537,23 @@ impl Copier<'_> {
     // Port of erts/emulator/beam/erl_gc.c:1728-1813 (do_minor sweep) and
     // erl_gc.c:2281 (sweep), OTP-29.1.1.
     fn sweep<const INTO_OLD: bool>(&mut self, mut n_hp: usize) {
+        // Keep the moving heap tops local while this linear scan runs, as sweep_new_heap
+        // keeps n_htop in its local pointer and move_boxed/move_cons update it in place.
+        let mut n_htop = self.n_htop;
+        let mut old_htop = self.old_htop;
         loop {
-            let n_htop = if INTO_OLD {
-                self.old_htop.at
-            } else {
-                self.n_htop.at
-            };
-            if n_hp >= n_htop {
+            let scan_top = if INTO_OLD { old_htop.at } else { n_htop.at };
+            if n_hp == scan_top {
                 break;
             }
+            debug_assert!(n_hp < scan_top);
             let ptr = n_hp as *mut u64;
             // SAFETY: `n_hp` is below the destination top, so it addresses an initialized
             // word of a completely copied object; this collector alone writes to it.
             unsafe {
                 let gval = *ptr;
                 if gval & 3 != 0 {
-                    *ptr = self.evacuate::<INTO_OLD>(gval);
+                    *ptr = self.evacuate::<INTO_OLD>(gval, &mut n_htop, &mut old_htop);
                     #[cfg(debug_assertions)]
                     crate::validate::verify_copied_term_after_collection(self.to, Term(*ptr));
                     n_hp += 8;
@@ -445,7 +569,7 @@ impl Copier<'_> {
                     let object_words = range.end;
                     for offset in range {
                         let slot = ptr.add(offset);
-                        *slot = self.evacuate::<INTO_OLD>(*slot);
+                        *slot = self.evacuate::<INTO_OLD>(*slot, &mut n_htop, &mut old_htop);
                         #[cfg(debug_assertions)]
                         crate::validate::verify_copied_term_after_collection(self.to, Term(*slot));
                     }
@@ -464,13 +588,15 @@ impl Copier<'_> {
                 };
                 for offset in start..words {
                     let slot = ptr.add(offset);
-                    *slot = self.evacuate::<INTO_OLD>(*slot);
+                    *slot = self.evacuate::<INTO_OLD>(*slot, &mut n_htop, &mut old_htop);
                     #[cfg(debug_assertions)]
                     crate::validate::verify_copied_term_after_collection(self.to, Term(*slot));
                 }
                 n_hp += words * 8;
             }
         }
+        self.n_htop = n_htop;
+        self.old_htop = old_htop;
     }
 
     /// Debug check of the erts invariant behind the ownership rule: a moved pointer that is
@@ -1218,12 +1344,44 @@ impl ProcessHeap {
         min_free: usize,
         messages: &mut [(Term, Term, Option<crate::message::MessageHeap>)],
     ) -> Result<GcStats, TermError> {
+        let mut root_slots = GcRootSet::new();
+        root_slots.push(roots);
+        let mut extra_slots = GcRootSet::new();
+        extra_slots.push(extra);
+        let mut message_roots: Vec<_> = messages
+            .iter_mut()
+            .map(|(term, token, heap)| GcMessageRoot::new(term, Some(token), heap.take()))
+            .collect();
+        let result = self.collect_with_root_slots(
+            &mut root_slots,
+            &mut extra_slots,
+            min_free,
+            &mut message_roots,
+        );
+        let heaps: Vec<_> = message_roots
+            .into_iter()
+            .map(|mut message| message.take_heap())
+            .collect();
+        for ((_, _, heap), moved) in messages.iter_mut().zip(heaps) {
+            *heap = moved;
+        }
+        result
+    }
+
+    /// Collect using roots that remain in their owning structures while they are rewritten.
+    pub fn collect_with_root_slots<'a>(
+        &mut self,
+        roots: &mut GcRootSet<'a>,
+        extra: &mut GcRootSet<'a>,
+        min_free: usize,
+        messages: &mut [GcMessageRoot<'_>],
+    ) -> Result<GcStats, TermError> {
         // Port of erl_gc.c:803-804: the clock is read only for long_gc monitoring.
         // Microstate accounting uses the same sample (`ERTS_MSACC_IS_ENABLED`).
         let start = gc_clock_active().then(Instant::now);
         let message_words = messages
             .iter()
-            .filter_map(|(_, _, heap)| heap.as_ref())
+            .filter_map(|message| message.heap.as_ref())
             .map(crate::message::MessageHeap::message_data_size)
             .fold(0usize, usize::saturating_add);
         let abandoned = self.abandoned_heap();
@@ -1390,10 +1548,16 @@ impl ProcessHeap {
             #[cfg(debug_assertions)]
             fragment_ranges,
             sub_bits: Vec::new(),
-            error: None,
         };
-        for root in roots.iter_mut().chain(extra.iter_mut()) {
-            root.0 = copier.evacuate::<false>(root.0);
+        let mut n_htop = copier.n_htop;
+        let mut old_htop = copier.old_htop;
+        roots.evacuate::<false>(&mut copier, &mut n_htop, &mut old_htop);
+        extra.evacuate::<false>(&mut copier, &mut n_htop, &mut old_htop);
+        for message in messages.iter_mut().filter(|message| message.heap.is_none()) {
+            message.term.0 = copier.evacuate::<false>(message.term.0, &mut n_htop, &mut old_htop);
+            if let Some(token) = message.token.as_deref_mut() {
+                token.0 = copier.evacuate::<false>(token.0, &mut n_htop, &mut old_htop);
+            }
         }
         // Port of erts/emulator/beam/erl_gc.c:1679-1720 (do_minor root loop over the stack)
         // and erl_gc.c:520 (copy_erlang_stack), OTP-29.1.1: words with the header tag are
@@ -1406,7 +1570,7 @@ impl ProcessHeap {
             unsafe {
                 let raw = *((source + i * 8) as *const u64);
                 *((destination + i * 8) as *mut u64) = if raw & 3 != 0 {
-                    copier.evacuate::<false>(raw)
+                    copier.evacuate::<false>(raw, &mut n_htop, &mut old_htop)
                 } else if stack_move.old_start <= raw as usize
                     && (raw as usize) < stack_move.old_end
                 {
@@ -1416,6 +1580,8 @@ impl ProcessHeap {
                 };
             }
         }
+        copier.n_htop = n_htop;
+        copier.old_htop = old_htop;
         // Port of erts/emulator/beam/erl_gc.c:1728-1823 (do_minor), OTP-29.1.1: sweep the
         // new heap, then the tenured objects, whose young referents are tenured as well.
         copier.sweep::<false>(n_heap);
@@ -1425,7 +1591,6 @@ impl ProcessHeap {
         copier.sweep_off_heap();
         copier.finish_bits();
         copier.to.high_water = copier.to.htop;
-        let error = copier.error.take();
         let promoted = ((copier.old_htop.at - tenured_from) / 8) as u64;
         drop(copier);
         // ErlHeapFragment headers live inside the fragment block in erts; here the fragment
@@ -1440,24 +1605,12 @@ impl ProcessHeap {
             // An empty `Vec` owns no allocation: skip the drop glue call.
             std::mem::forget(spare);
         }
-        if let Some(error) = error {
-            return Err(error);
-        }
         let adjusted = if messages.is_empty() {
-            self.adjust_young_heap(major, min_free, roots, extra)?
+            self.adjust_young_heap(major, min_free, roots, extra, None)?
         } else {
             self.move_msgs_to_heap(messages)?;
             // erts resize_new_heap offsets the on-heap queue with the rest of the root set.
-            let mut moved = extra.to_vec();
-            moved.extend(messages.iter().flat_map(|(term, token, _)| [*term, *token]));
-            let adjusted = self.adjust_young_heap(major, min_free, roots, &mut moved)?;
-            extra.copy_from_slice(&moved[..extra.len()]);
-            let (updated_pairs, _) = moved[extra.len()..].as_chunks::<2>();
-            for ((term, token, _), updated) in messages.iter_mut().zip(updated_pairs) {
-                *term = updated[0];
-                *token = updated[1];
-            }
-            adjusted
+            self.adjust_young_heap(major, min_free, roots, extra, Some(messages))?
         };
         // erl_gc.c:1506/1952: `size_after` includes the moved message data.
         let copied = self.htop as u64;
@@ -1471,7 +1624,13 @@ impl ProcessHeap {
         }
         // Verify all roots after collection so stale pointers fail where they enter.
         #[cfg(debug_assertions)]
-        crate::validate::verify_roots_after_collection(self, roots, extra);
+        roots.for_each_mut(|root| {
+            crate::validate::verify_roots_after_collection(self, std::slice::from_ref(&*root), &[])
+        });
+        #[cfg(debug_assertions)]
+        extra.for_each_mut(|root| {
+            crate::validate::verify_roots_after_collection(self, std::slice::from_ref(&*root), &[])
+        });
         let stats = GcStats {
             collections: 1,
             minor_collections: u64::from(!major),
@@ -1587,8 +1746,21 @@ impl ProcessHeap {
         roots: &mut [Term],
         extra: &mut [Term],
     ) -> Result<GcStats, TermError> {
+        let mut root_slots = GcRootSet::new();
+        root_slots.push(roots);
+        let mut extra_slots = GcRootSet::new();
+        extra_slots.push(extra);
+        self.collect_hibernate_root_slots(&mut root_slots, &mut extra_slots)
+    }
+
+    /// Hibernate after collecting roots in their owning structures.
+    pub fn collect_hibernate_root_slots<'a>(
+        &mut self,
+        roots: &mut GcRootSet<'a>,
+        extra: &mut GcRootSet<'a>,
+    ) -> Result<GcStats, TermError> {
         self.request_full_sweep();
-        let stats = self.collect(roots, extra, 0)?;
+        let stats = self.collect_with_root_slots(roots, extra, 0, &mut [])?;
         self.fragments.clear();
         self.abandoned = false;
         self.fragment_words = 0;
@@ -1597,19 +1769,20 @@ impl ProcessHeap {
             .saturating_add(S_RESERVED)
             .saturating_add(self.stack_words());
         if exact != self.words.len() {
-            self.relocate_young(exact, roots, extra);
+            self.relocate_young(exact, roots, extra, None);
         }
         self.heap_grow = false;
         Ok(stats)
     }
 
     /// Apply the post-copy heap policy used by erts.
-    fn adjust_young_heap(
+    fn adjust_young_heap<'a>(
         &mut self,
         major: bool,
         min_free: usize,
-        roots: &mut [Term],
-        extra: &mut [Term],
+        roots: &mut GcRootSet<'a>,
+        extra: &mut GcRootSet<'a>,
+        messages: Option<&mut [GcMessageRoot<'_>]>,
     ) -> Result<bool, TermError> {
         let stack = self.stack_words();
         let need_after = self
@@ -1662,7 +1835,7 @@ impl ProcessHeap {
         if let Some(wanted) = wanted
             && wanted != capacity
         {
-            self.relocate_young(wanted, roots, extra);
+            self.relocate_young(wanted, roots, extra, messages);
             return Ok(true);
         }
         Ok(false)
@@ -1673,13 +1846,10 @@ impl ProcessHeap {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8851-8889 (move_msg_to_heap,
     // erts_proc_sig_move_msgs_to_heap), erl_gc.c:2514-2611 (erts_copy_one_frag) and
     // copy.c:2049 (erts_move_multi_frags), OTP-29.1.1.
-    fn move_msgs_to_heap(
-        &mut self,
-        messages: &mut [(Term, Term, Option<crate::message::MessageHeap>)],
-    ) -> Result<(), TermError> {
+    fn move_msgs_to_heap(&mut self, messages: &mut [GcMessageRoot<'_>]) -> Result<(), TermError> {
         let pre_overhead = self.bin_vheap;
-        for (term, token, slot) in messages.iter_mut() {
-            let Some(mut data) = slot.take() else {
+        for message in messages.iter_mut() {
+            let Some(mut data) = message.heap.take() else {
                 continue;
             };
             let mut blocks: Vec<&[u64]> = Vec::new();
@@ -1720,8 +1890,10 @@ impl ProcessHeap {
             // pointers of a multi-fragment message are rebased per source block.
             for range in &ranges {
                 offset_young_objects(base, words, range.old_start, range.old_end, range.new_start);
-                term.0 = offset_word(term.0, *range);
-                token.0 = offset_word(token.0, *range);
+                message.term.0 = offset_word(message.term.0, *range);
+                if let Some(token) = message.token.as_deref_mut() {
+                    token.0 = offset_word(token.0, *range);
+                }
             }
             // The message heap is released after this loop. Its BinRef nodes live in
             // the copied blocks too, so move both intrusive lists before adopting them.
@@ -1760,7 +1932,13 @@ impl ProcessHeap {
     /// the stack (which moved within the block) is adjusted; a moved block rebases
     /// every young pointer, the way `resize_new_heap` does.
     // Port of erts/emulator/beam/erl_gc.c:2794 (`resize_new_heap`), OTP-29.1.1.
-    fn relocate_young(&mut self, new_words: usize, roots: &mut [Term], extra: &mut [Term]) {
+    fn relocate_young<'a>(
+        &mut self,
+        new_words: usize,
+        roots: &mut GcRootSet<'a>,
+        extra: &mut GcRootSet<'a>,
+        messages: Option<&mut [GcMessageRoot<'_>]>,
+    ) {
         let stack = self.stack_words();
         debug_assert!(new_words >= self.htop.saturating_add(stack));
         let prev_len = self.words.len();
@@ -1822,8 +2000,15 @@ impl ProcessHeap {
                 heap_end,
                 new_heap,
             );
-            for term in roots.iter_mut().chain(extra.iter_mut()) {
-                term.0 = offset_word(term.0, heap_move);
+            roots.for_each_mut(|term| term.0 = offset_word(term.0, heap_move));
+            extra.for_each_mut(|term| term.0 = offset_word(term.0, heap_move));
+            if let Some(messages) = messages {
+                for message in messages {
+                    message.term.0 = offset_word(message.term.0, heap_move);
+                    if let Some(token) = message.token.as_deref_mut() {
+                        token.0 = offset_word(token.0, heap_move);
+                    }
+                }
             }
         }
         // Untagged stack words inside the old stack are frame pointers. Return

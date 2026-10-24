@@ -1230,11 +1230,13 @@ pub(crate) fn write_binary(
     // Port of erts/emulator/beam/erl_bits.c:2841-2858 (erts_new_bitstring_refc), OTP-29.1.1.
     const ONHEAP_BYTES: usize = 64;
     if byte_len <= ONHEAP_BYTES {
-        let mut bytes = [0_u8; ONHEAP_BYTES];
-        fill(&mut bytes[..byte_len])?;
-        return TermBuilder::new(&mut Heap(&mut ctx.heap))
-            .binary(&bytes[..byte_len])
-            .map_err(|_| BifError::SystemLimit);
+        // Port of `erts_new_binary` in erts/emulator/beam/erl_iolist.c (iolist_to_binary_1),
+        // OTP-29.1.1: fill the final HAlloc block instead of staging a second copy.
+        let mut failure = None;
+        let term = TermBuilder::new(&mut Heap(&mut ctx.heap))
+            .binary_from_fn(byte_len, |output| failure = fill(output).err())
+            .map_err(|_| BifError::SystemLimit)?;
+        return failure.map_or(Ok(term), Err);
     }
     if !ctx.heap.supports_writable_binary() {
         let mut bytes = vec![0; byte_len];

@@ -51,8 +51,8 @@ pub use fun::{
     set_fun_entry_stub_hook,
 };
 pub use gc::{
-    FragmentAlloc, FragmentIndex, GcStats, set_gc_clock_for_long_gc, set_gc_clock_for_msacc,
-    spawned_heap_words,
+    FragmentAlloc, FragmentIndex, GcMessageRoot, GcRootSet, GcStats, set_gc_clock_for_long_gc,
+    set_gc_clock_for_msacc, spawned_heap_words,
 };
 pub use hamt::{
     HxNode, alloc_terms, boxed_object_words, build_hamt_from_unique, flatmap_keys,

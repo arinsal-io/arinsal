@@ -2635,7 +2635,7 @@ fn light_trap_result(
     result: Result<Term, arinsal_bifs::BifError>,
 ) -> u64 {
     match result {
-        Ok(value) if !export_call => light_value_return(process, registers, entry_top, value),
+        Ok(value) if !export_call => light_value_return(process, entry_top, value),
         result => plain_bif_result(process, registers, export, arity, result),
     }
 }
@@ -2644,13 +2644,7 @@ fn light_trap_result(
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:518-523 (call_light_bif_shared returns X0
 // to the call site), OTP-29.1.1.
 #[inline(always)]
-fn light_value_return(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    entry_top: usize,
-    value: Term,
-) -> u64 {
-    registers.x_reg_array[0] = value;
+fn light_value_return(process: &mut crate::Process, entry_top: usize, value: Term) -> u64 {
     let top = process.heap.heap_top_index();
     if top != entry_top {
         process.header.htop = native_htop(process, top);
@@ -2828,7 +2822,7 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
             } else {
                 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:488-523, OTP-29.1.1:
                 // the native shared fragment performs its inline GC check on this return.
-                Some(light_value_return(process, registers, entry_top, value))
+                Some(light_value_return(process, entry_top, value))
             }
         }
         other => {
@@ -3325,15 +3319,19 @@ fn call_plain_bif_body(
         return install_deferred_bif_trap(process, identity, export, &args[..arity], trap);
     }
     let top = process.heap.heap_top_index();
-    // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back to XREG0, and the native
-    // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). Only the
-    // export trampoline, which has no such test, checks it here.
+    // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back in x0, and the native
+    // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). The
+    // fragment installs x0 in the cached X register, so the result need not also be
+    // copied to the scheduler register array. Only the export trampoline, which has no
+    // such test, checks collection here.
     if let Ok(value) = &result
         && (!export_call
             || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
-        registers.x_reg_array[0] = value;
+        if export_call {
+            registers.x_reg_array[0] = value;
+        }
         if top != entry_top {
             process.header.htop = native_htop(process, top);
         }
