@@ -7675,6 +7675,9 @@ impl Process {
             Some(crate::proc_create::OriginMonitor::Process(_))
         ) && crate::dist::take_monitor(reference).is_some();
         let active = entry.is_some() || remote;
+        if !active {
+            crate::dist::discard_disconnected_monitor_pid(from);
+        }
         let priority = self
             .cold
             .as_mut()
@@ -7683,9 +7686,10 @@ impl Process {
             return Ok(());
         }
         let (info, port_object) = match entry.as_ref().and_then(|entry| entry.state()) {
-            Some(crate::proc_create::OriginMonitor::Process(_)) => {
-                (entry.as_ref().map(|entry| entry.view().info()), None)
-            }
+            Some(
+                crate::proc_create::OriginMonitor::Process(_)
+                | crate::proc_create::OriginMonitor::Distributed { .. },
+            ) => (entry.as_ref().map(|entry| entry.view().info()), None),
             Some(crate::proc_create::OriginMonitor::Port { port_id, name, .. }) => {
                 (None, Some(PortObject::Local(*port_id, *name)))
             }
