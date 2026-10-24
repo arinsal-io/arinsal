@@ -4273,7 +4273,7 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
 
 /// Options of `monitor/3` and nested spawn monitors: `{tag, Tag}`, `{alias, Mode}` and `priority`.
 // Port of erts/emulator/beam/bif.c (erts_monitor_opts), OTP-29.1.1.
-pub(crate) fn monitor_options(
+fn monitor_options(
     args: &[Term],
 ) -> Result<(Term, Option<crate::proc_create::AliasMode>, bool), VmError> {
     if args.len() != 3 {
@@ -4367,7 +4367,7 @@ fn parse_alias_mode(term: Term) -> Option<crate::proc_create::AliasMode> {
 // Port of erts/emulator/beam/bif.c:790-823 (monitor: erts_proc_sig_send_monitor_down with
 // am_noproc), OTP-29.1.1.
 /// The shared part of a monitor with this DOWN tag and registered name (erts `ErtsMonitorData`).
-pub(crate) fn monitor_info_for(
+fn monitor_info_for(
     tag: Term,
     name: Option<&str>,
 ) -> Result<crate::proc_create::MonitorInfo, VmError> {

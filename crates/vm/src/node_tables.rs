@@ -37,7 +37,7 @@ pub(crate) struct NodeEntry {
     /// Signals queued while the connection is still pending (auto-connect).
     pub(crate) pending_out: VecDeque<(OwnedTerm, Option<OwnedTerm>)>,
     /// Remote monitors armed before the distribution channel exists.
-    pub(crate) pending_monitors: BTreeMap<u64, RemoteMonitor>,
+    pub(crate) pending_monitors: BTreeMap<u64, OwnedTerm>,
     /// Distributed spawn requests retained while auto-connect is pending.
     pub(crate) pending_spawn_requests: BTreeMap<u64, SpawnRequest>,
 }
@@ -76,17 +76,10 @@ pub(crate) struct DistState {
     pub(crate) remote_pids: HashMap<(u32, u32, u32), Pid>,
     /// Reverse map for local proxy pids created by [`Self::remote_pids`].
     pub(crate) proxy_to_remote: HashMap<Pid, OwnedTerm>,
-    pub(crate) remote_monitors: BTreeMap<u64, RemoteMonitor>,
+    pub(crate) remote_monitors: BTreeMap<u64, OwnedTerm>,
     /// Original ETF refs from remote monitor requests, preserving all reference words.
     pub(crate) remote_monitor_refs: BTreeMap<u64, OwnedTerm>,
     pub(crate) spawn_requests: BTreeMap<u64, SpawnRequest>,
-}
-
-/// A local origin monitor retained by a distribution connection.
-#[derive(Clone, Debug)]
-pub(crate) struct RemoteMonitor {
-    pub(crate) watcher: Pid,
-    pub(crate) target: OwnedTerm,
 }
 
 #[derive(Clone, Debug)]
@@ -355,8 +348,6 @@ pub(crate) struct NodeTables {
     pub(crate) monitors: Vec<NodeMonitor>,
     pending_delete: HashMap<String, Instant>,
     pub(crate) nodes_monitors: Vec<NodesMonitor>,
-    /// Remote target terms needed to build DOWN objects after a connection is removed.
-    pub(crate) disconnected_monitor_pids: HashMap<Pid, OwnedTerm>,
 }
 
 impl Default for NodeTables {
@@ -387,7 +378,6 @@ impl Default for NodeTables {
             monitors: Vec::new(),
             pending_delete: HashMap::new(),
             nodes_monitors: Vec::new(),
-            disconnected_monitor_pids: HashMap::new(),
         }
     }
 }
