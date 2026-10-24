@@ -1,11 +1,18 @@
 //! Runtime-wide node names, distribution entries, and node monitors.
 
+use arc_swap::{ArcSwap, Guard};
 use arinsal_etf::{AtomCache, DistributionPacket, OwnedTerm};
 use arinsal_sched::Pid;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
+
+/// Immutable identity of the running node, published like `erts_this_node`.
+pub(crate) struct NodeIdentity {
+    pub(crate) name: arinsal_term::Atom,
+    pub(crate) creation: u32,
+}
 
 pub(crate) const DFLAG_FRAGMENTS: u64 = 0x0080_0000;
 pub(crate) const DFLAG_EXIT_PAYLOAD: u64 = 0x0040_0000;
@@ -403,6 +410,7 @@ impl NodeTables {
 }
 
 static TABLES: OnceLock<Mutex<NodeTables>> = OnceLock::new();
+static THIS_NODE_IDENTITY: OnceLock<ArcSwap<NodeIdentity>> = OnceLock::new();
 static NEXT_ENTRY_REF: AtomicU64 = AtomicU64::new(1);
 static NODE_TAB_DELETE_DELAY_MS: AtomicI64 = AtomicI64::new(-1);
 static NEXT_CONN_SEED: AtomicU32 = AtomicU32::new(1);
@@ -425,6 +433,24 @@ fn node_atom_word(name: &str) -> u64 {
         .map_or(0, |atom| arinsal_term::Term::atom(atom).tagged_word())
 }
 
+fn this_node_identity_slot() -> &'static ArcSwap<NodeIdentity> {
+    THIS_NODE_IDENTITY.get_or_init(|| {
+        let (name, creation) = {
+            let tables = lock();
+            (tables.local_name.clone(), tables.local_creation)
+        };
+        let name = arinsal_term::global_atoms()
+            .intern(&name)
+            .expect("the local node name fits in an atom");
+        ArcSwap::from_pointee(NodeIdentity { name, creation })
+    })
+}
+
+/// Load the local node name and creation from one atomic identity snapshot.
+pub(crate) fn this_node_identity() -> Guard<Arc<NodeIdentity>> {
+    this_node_identity_slot().load()
+}
+
 /// The word holding the local node name atom; generated code reads it by address.
 pub(crate) fn this_node_sysname() -> &'static AtomicU64 {
     if THIS_NODE_SYSNAME.load(Ordering::Acquire) == 0 {
@@ -438,11 +464,21 @@ pub(crate) fn this_node_sysname() -> &'static AtomicU64 {
 /// native `node/0`.
 // Port of erts/emulator/beam/erl_node_tables.c:1042-1075 (erts_set_this_node), OTP-29.1.1.
 pub(crate) fn set_this_node(name: String, creation: u32) -> bool {
+    // Initialize before taking TABLES: first access to the identity slot reads its initial value
+    // under that lock.
+    let identity_slot = this_node_identity_slot();
     let mut tables = lock();
-    let word = node_atom_word(&name);
+    let Ok(name_atom) = arinsal_term::global_atoms().intern(&name) else {
+        return false;
+    };
+    let word = arinsal_term::Term::atom(name_atom).tagged_word();
     if !tables.set_local_node(name, creation) {
         return false;
     }
+    identity_slot.store(Arc::new(NodeIdentity {
+        name: name_atom,
+        creation: tables.local_creation,
+    }));
     THIS_NODE_SYSNAME.store(word, Ordering::Release);
     true
 }
