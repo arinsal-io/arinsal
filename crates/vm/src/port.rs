@@ -302,11 +302,11 @@ impl PidSet {
 }
 
 /// What the spawn and fd drivers keep per port (`ErtsSysDriverData` of sys_drivers.c): the
-/// output descriptor, the wake pipe of the worker thread, packet framing and busy limits.
+/// output descriptor, the wake-up of the worker thread, packet framing and busy limits.
 pub(crate) struct SpawnData {
     out: Mutex<Option<OwnedFd>>,
-    wake_r: Mutex<Option<OwnedFd>>,
-    wake_w: Option<OwnedFd>,
+    /// The worker thread's wake-up; none for a port without a worker thread.
+    waker: Option<Arc<crate::check_io::Waker>>,
     wake_needed: AtomicBool,
     framing: Option<(u8, usize)>,
     limits: BusyLimits,
@@ -325,8 +325,7 @@ const NO_BUSY_LIMITS: BusyLimits = BusyLimits {
 /// The spawn data of a port that has none.
 static NO_SPAWN: SpawnData = SpawnData {
     out: Mutex::new(None),
-    wake_r: Mutex::new(None),
-    wake_w: None,
+    waker: None,
     wake_needed: AtomicBool::new(false),
     framing: None,
     limits: NO_BUSY_LIMITS,
@@ -2687,35 +2686,6 @@ fn set_nonblock(fd: RawFd) {
     }
 }
 
-fn wake_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let fds = cloexec_publish(|| {
-        let mut fds = [0; 2];
-        // SAFETY: pipe initializes both slots with fresh descriptors on success; fcntl
-        // marks those owned descriptors close-on-exec before the publish lock is released.
-        let rc = unsafe {
-            let rc = libc::pipe(fds.as_mut_ptr());
-            if rc == 0
-                && (libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
-                    || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
-            {
-                let error = std::io::Error::last_os_error();
-                libc::close(fds[0]);
-                libc::close(fds[1]);
-                return Err(error);
-            }
-            rc
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(fds)
-    })?;
-    set_nonblock(fds[0]);
-    set_nonblock(fds[1]);
-    // SAFETY: both descriptors were just created by pipe and are not aliased.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn make_handle(
     id: u64,
@@ -2784,23 +2754,17 @@ fn make_handle_with(
     trace_scope: usize,
     wake: bool,
 ) -> Result<Arc<PortHandle>, VmError> {
-    let (wake_r, wake_w) = if wake {
-        let (r, w) = wake_pipe().map_err(|_| badarg())?;
-        (Some(r), Some(w))
-    } else {
-        (None, None)
-    };
+    let waker = wake.then(|| Arc::new(crate::check_io::Waker::default()));
     if let Some(fd) = out.as_ref() {
         set_nonblock(fd.as_raw_fd());
     }
     let out_fd = out;
     let handle = Arc::new(PortHandle {
         id,
-        spawn: (out_fd.is_some() || wake_w.is_some()).then(|| {
+        spawn: (out_fd.is_some() || waker.is_some()).then(|| {
             Box::new(SpawnData {
                 out: Mutex::new(out_fd),
-                wake_r: Mutex::new(wake_r),
-                wake_w,
+                waker,
                 wake_needed: AtomicBool::new(true),
                 framing,
                 limits,
@@ -2934,15 +2898,10 @@ fn nb_write(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
 }
 
 fn poke(handle: &PortHandle) {
-    if handle.spawn().wake_needed.swap(false, Ordering::AcqRel) {
-        let Some(wake_w) = handle.spawn().wake_w.as_ref() else {
-            return;
-        };
-        let fd = wake_w.as_raw_fd();
-        // SAFETY: the wake pipe write end stays open for the life of the handle.
-        unsafe {
-            libc::write(fd, (&1u8 as *const u8).cast(), 1);
-        }
+    if handle.spawn().wake_needed.swap(false, Ordering::AcqRel)
+        && let Some(waker) = handle.spawn().waker.as_ref()
+    {
+        waker.wake();
     }
 }
 
@@ -3260,13 +3219,12 @@ fn worker(
     want_status: bool,
     want_eof: bool,
 ) {
-    let wake_r = handle
-        .spawn()
-        .wake_r
-        .lock()
-        .take()
-        .map(|fd| fd.into_raw_fd())
-        .unwrap_or(-1);
+    let waker = handle.spawn().waker.clone();
+    // Stated once for the descriptor's life, not by the poller on every selection.
+    let input_fallback = read_fd.filter(|fd| crate::check_io::is_always_ready(*fd));
+    if let Some(fd) = input_fallback {
+        crate::check_io::mark_fallback(fd, true);
+    }
     let mut data = Vec::new();
     let mut buf = [0u8; 4096];
     // The input descriptor stays open until the port terminates; at end of input it only
@@ -3314,15 +3272,6 @@ fn worker(
                 },
             ));
         }
-        if wake_r >= 0 {
-            fds.push((
-                wake_r,
-                crate::check_io::InterestSet {
-                    readable: true,
-                    writable: false,
-                },
-            ));
-        }
         let write_fd = output_fd(&handle);
         if wants_out && write_fd >= 0 {
             fds.push((
@@ -3344,7 +3293,10 @@ fn worker(
             // Port of `erts_check_io` one-shot readiness delivery; every
             // operation is re-registered after this worker handles the event.
             let timeout = eof_waiting.then(|| std::time::Duration::from_millis(5));
-            let result = crate::check_io::wait_any_timeout_wake(&fds, timeout, wake_r);
+            let result = match waker.as_deref() {
+                Some(waker) => crate::check_io::wait_any_timeout_wake(&fds, timeout, waker),
+                None => crate::check_io::wait_any_timeout(&fds, timeout),
+            };
             match result {
                 Ok(Some((ready_fd, ready))) => {
                     input_ready = input_live
@@ -3364,17 +3316,6 @@ fn worker(
             }
         }
         handle.spawn().wake_needed.store(false, Ordering::Release);
-        if wake_r >= 0 {
-            let mut scratch = [0u8; 64];
-            loop {
-                // SAFETY: scratch is a live buffer and wake_r is the port's self-pipe.
-                let n = unsafe { libc::read(wake_r, scratch.as_mut_ptr().cast(), scratch.len()) };
-                if n > 0 {
-                    continue;
-                }
-                break;
-            }
-        }
         if handle.state.lock().closed {
             break;
         }
@@ -3466,12 +3407,15 @@ fn worker(
         drop(st);
     }
     if eof_terminate && !handle.state.lock().closed {
-        eof_exit(&handle, &scheduler, &runtime, owner, id, wake_r, read_fd);
+        eof_exit(&handle, &scheduler, &runtime, owner, id, read_fd);
         return;
     }
     let woken = flush_output(&handle);
     wake_suspended(&scheduler, woken);
-    close_worker_fds(wake_r, read_fd);
+    if let Some(fd) = input_fallback {
+        crate::check_io::mark_fallback(fd, false);
+    }
+    close_worker_fds(read_fd);
     let closed = handle.state.lock().closed;
     // Port of erts/emulator/sys/unix/sys_drivers.c (`stop`), OTP-29.1.1.
     // The helper reaps children after their ports close and reports statuses by port id.
@@ -3495,12 +3439,8 @@ fn worker(
     }
 }
 
-/// Close the wake read end and the duplicated input descriptor this worker thread owns.
-fn close_worker_fds(wake_r: RawFd, read_fd: Option<RawFd>) {
-    if wake_r >= 0 {
-        // SAFETY: this thread owns the wake read end taken from the handle.
-        unsafe { libc::close(wake_r) };
-    }
+/// Close the duplicated input descriptor this worker thread owns.
+fn close_worker_fds(read_fd: Option<RawFd>) {
     if let Some(fd) = read_fd {
         // SAFETY: the worker owns the duplicated input descriptor.
         unsafe { libc::close(fd) };
@@ -3516,7 +3456,6 @@ fn eof_exit(
     runtime: &Weak<crate::process::Runtime>,
     owner: Pid,
     id: u64,
-    wake_r: RawFd,
     read_fd: Option<RawFd>,
 ) {
     if let Some(runtime) = runtime.upgrade() {
@@ -3543,7 +3482,7 @@ fn eof_exit(
         std::mem::take(&mut st.suspended)
     };
     wake_suspended(scheduler, woken);
-    close_worker_fds(wake_r, read_fd);
+    close_worker_fds(read_fd);
     handle.spawn().out.lock().take();
     handle.state.lock().exit_complete = true;
     handle.finish_halt();
@@ -4272,7 +4211,7 @@ fn release_io(handle: &PortHandle) {
         if handle
             .spawn
             .as_ref()
-            .is_none_or(|spawn| spawn.wake_w.is_none())
+            .is_none_or(|spawn| spawn.waker.is_none())
         {
             st.exit_complete = true;
         }
@@ -4283,7 +4222,7 @@ fn release_io(handle: &PortHandle) {
     if handle
         .spawn
         .as_ref()
-        .is_none_or(|spawn| spawn.wake_w.is_none())
+        .is_none_or(|spawn| spawn.waker.is_none())
     {
         handle.finish_halt();
     }

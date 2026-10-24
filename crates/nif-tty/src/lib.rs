@@ -91,6 +91,9 @@ struct State {
 }
 
 struct Tty {
+    /// The input is a regular file, a block device or `/dev/null`: always ready under
+    /// `select`, stated once when the resource is created.
+    always_ready: bool,
     input: OwnedFd,
     output: OwnedFd,
     state: Mutex<State>,
@@ -363,6 +366,7 @@ pub fn create_with_fds(input: RawFd, output: RawFd) -> io::Result<O> {
     handles().lock().unwrap().insert(
         id,
         Arc::new(Tty {
+            always_ready: input_always_ready(input.as_raw_fd()),
             input,
             output,
             state: Mutex::new(State {
@@ -420,6 +424,24 @@ static ARM_HOOK: Mutex<Option<ArmHook>> = Mutex::new(None);
 /// Install the process-aware select callback. The last installer wins.
 pub fn set_arm_hook(hook: ArmHook) {
     *ARM_HOOK.lock().unwrap() = Some(hook);
+}
+
+fn input_always_ready(fd: RawFd) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(metadata) = std::fs::metadata(format!("/dev/fd/{fd}")) else {
+        return false;
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_file() || file_type.is_block_device() {
+        return true;
+    }
+    file_type.is_char_device()
+        && std::fs::metadata("/dev/null").is_ok_and(|null| null.rdev() == metadata.rdev())
+}
+
+/// Whether the input of `resource` is always ready for `select` (a regular file).
+pub fn input_is_always_ready(resource: &O) -> bool {
+    handle(resource).is_ok_and(|tty| tty.always_ready)
 }
 
 fn arm_hook() -> Option<ArmHook> {
