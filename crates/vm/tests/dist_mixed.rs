@@ -326,6 +326,37 @@ fn dist_mixed_connect_ping_and_reconnect() {
 }
 
 #[test]
+fn dist_mixed_get_dflags_matches_otp_peer() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    arinsal_eval(
+        &cookie,
+        &host,
+        &format!(
+            "N={n}, pong=net_adm:ping(N), Local=erts_internal:get_dflags(), Remote=rpc:call(N,erts_internal,get_dflags,[]), true=(Local=:=Remote), io:format(\"DIST_MIXED_OK dflags ~p~n\",[Local])"
+        ),
+    );
+}
+
+#[test]
+fn dist_mixed_get_dflags_named_arinsal_handshake() {
+    let _serial = serial_test();
+    let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
+    let cookie = format!("dm_cookie_{}_{id:04x}", std::process::id() % 100_000);
+    let host = short_hostname();
+    let (_server, node) = start_arinsal_server(&cookie, &host);
+    let n = node_literal(&node);
+    arinsal_eval(
+        &cookie,
+        &host,
+        &format!(
+            "N={n}, pong=net_adm:ping(N), Local=erts_internal:get_dflags(), Remote=rpc:call(N,erts_internal,get_dflags,[]), true=(Local=:=Remote), io:format(\"DIST_MIXED_OK arinsal_dflags ~p~n\",[Local])"
+        ),
+    );
+}
+
+#[test]
 fn dist_mixed_pid_name_alias_and_rich_payload() {
     let _serial = serial_test();
     let (_erl, node, cookie, host) = start_erl();
@@ -450,6 +481,34 @@ fn dist_mixed_spawn_and_monitor() {
         &host,
         &format!(
             "N={n}, pong=net_adm:ping(N), {{Pid,Ref}}=spawn_monitor(N,erlang,exit,[mixed_exit]), receive {{'DOWN',Ref,process,Pid,mixed_exit}} -> ok after 10000 -> exit(no_down) end, true=erlang:disconnect_node(N), ReconnectRef=erlang:spawn_request(N,erlang,exit,[reconnected_exit],[monitor]), ReconnectPid=receive {{spawn_reply,ReconnectRef,ok,RPid}} when is_pid(RPid) -> RPid after 10000 -> exit(no_reconnect_spawn_reply) end, receive {{'DOWN',ReconnectRef,process,ReconnectPid,reconnected_exit}} -> ok after 10000 -> exit(no_reconnect_spawn_down) end, process_flag(trap_exit,true), SpawnRef=erlang:spawn_request(N,erlang,exit,[linked_exit],[link,monitor]), LinkedPid=receive {{spawn_reply,SpawnRef,ok,LPid}} when is_pid(LPid) -> LPid after 10000 -> exit(no_spawn_reply) end, receive {{'EXIT',LinkedPid,linked_exit}} -> ok after 10000 -> exit(no_link_exit) end, io:format(\"DIST_MIXED_OK monitor~n\")"
+        ),
+    );
+}
+
+#[test]
+fn dist_mixed_remote_tagged_monitor_down() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    arinsal_eval(
+        &cookie,
+        &host,
+        &format!(
+            "N={n}, pong=net_adm:ping(N), RemotePid=rpc:call(N,erlang,spawn,[timer,sleep,[60000]]), Tag={{tagged,make_ref()}}, Ref=monitor(process,RemotePid,[{{tag,Tag}}]), rpc:call(N,erlang,exit,[RemotePid,tagged_done]), receive {{Tag,Ref,process,RemotePid,tagged_done}} -> io:format(\"DIST_MIXED_OK tagged_monitor~n\") after 10000 -> exit(no_tagged_down) end"
+        ),
+    );
+}
+
+#[test]
+fn dist_mixed_remote_tagged_monitor_connection_down() {
+    let _serial = serial_test();
+    let (_erl, node, cookie, host) = start_erl();
+    let n = node_literal(&node);
+    arinsal_eval(
+        &cookie,
+        &host,
+        &format!(
+            "N={n}, pong=net_adm:ping(N), RemotePid=rpc:call(N,erlang,spawn,[timer,sleep,[60000]]), Tag={{node_down,make_ref()}}, Ref=monitor(process,RemotePid,[{{tag,Tag}}]), true=erlang:disconnect_node(N), receive {{Tag,Ref,process,RemotePid,noconnection}} -> io:format(\"DIST_MIXED_OK tagged_noconnection~n\") after 10000 -> exit(no_tagged_noconnection) end"
         ),
     );
 }
