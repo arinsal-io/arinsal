@@ -59,6 +59,9 @@ struct PollControl {
 pub(crate) enum PollSetKind {
     Main,
     Scheduler,
+    /// The `select(2)` fallback set (`ps->fallback`): descriptors the kernel poller cannot
+    /// take, and fds 0-2.
+    Fallback,
 }
 
 impl PollSetKind {
@@ -66,6 +69,7 @@ impl PollSetKind {
         match self {
             Self::Main => 0,
             Self::Scheduler => 1,
+            Self::Fallback => unreachable!("the fallback set has no kernel poller"),
         }
     }
 }
@@ -132,6 +136,9 @@ fn erts_poll_control_inner(
     op: ErtsPollOp,
     events: u32,
 ) -> io::Result<()> {
+    if kind == PollSetKind::Fallback {
+        return fallback::control(fd, op, events);
+    }
     if fd < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -270,4 +277,155 @@ fn interest(events: u32) -> io::Result<Option<Interest>> {
             ));
         }
     })
+}
+
+/// Install the receiver of fallback events; the select thread starts with the first fd.
+pub(crate) fn erts_poll_fallback_sink(sink: fn(RawFd, u32)) {
+    fallback::SINK.get_or_init(|| sink);
+}
+
+/// The `select(2)` fallback poll set.
+///
+/// Port of erts/emulator/sys/common/erl_poll.c (the `ERTS_POLL_USE_FALLBACK` set, `ps->fallback`
+/// with `erts_poll_wait__fallback`), OTP-29.1.1: a regular file is always ready under
+/// `select`, which a kqueue read filter at end of file is not.
+mod fallback {
+    use super::{ERTS_POLL_EV_IN, ERTS_POLL_EV_OUT, ErtsPollOp};
+    use std::collections::HashMap;
+    use std::io;
+    use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
+    use std::sync::{Mutex, OnceLock};
+
+    pub(super) static SINK: OnceLock<fn(RawFd, u32)> = OnceLock::new();
+
+    struct Set {
+        fds: Mutex<HashMap<RawFd, u32>>,
+        wake_write: OwnedFd,
+    }
+
+    static SET: OnceLock<Set> = OnceLock::new();
+
+    fn set() -> io::Result<&'static Set> {
+        if let Some(set) = SET.get() {
+            return Ok(set);
+        }
+        let (read, write) = rustix::pipe::pipe()?;
+        rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
+        rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC)?;
+        let mut created = false;
+        let set = SET.get_or_init(|| {
+            created = true;
+            Set {
+                fds: Mutex::new(HashMap::new()),
+                wake_write: write,
+            }
+        });
+        if created {
+            let spawned = std::thread::Builder::new()
+                .name("arinsal-poll-fallback".into())
+                .spawn(move || run(set, read));
+            spawned?;
+        }
+        Ok(set)
+    }
+
+    pub(super) fn control(fd: RawFd, op: ErtsPollOp, events: u32) -> io::Result<()> {
+        if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let set = set()?;
+        {
+            let mut fds = set.fds.lock().unwrap();
+            match op {
+                ErtsPollOp::Add | ErtsPollOp::Mod
+                    if events & (ERTS_POLL_EV_IN | ERTS_POLL_EV_OUT) != 0 =>
+                {
+                    fds.insert(fd, events & (ERTS_POLL_EV_IN | ERTS_POLL_EV_OUT));
+                }
+                _ => {
+                    fds.remove(&fd);
+                }
+            }
+        }
+        // Wake the select thread so it sees the changed set (erts_poll_control wake_poller).
+        let _ = rustix::io::write(&set.wake_write, &[1]);
+        Ok(())
+    }
+
+    /// The selected descriptor for one `poll` call.
+    fn borrow(fd: RawFd) -> BorrowedFd<'static> {
+        // SAFETY: the owner keeps a selected descriptor open until it deselects it; a closed
+        // one makes poll report POLLNVAL, which is delivered as ready, and nothing is read.
+        unsafe { BorrowedFd::borrow_raw(fd) }
+    }
+
+    fn run(set: &'static Set, wake_read: OwnedFd) {
+        use rustix::event::{PollFd, PollFlags, poll};
+        loop {
+            let watched: Vec<(RawFd, u32)> = set
+                .fds
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(fd, events)| (*fd, *events))
+                .collect();
+            let borrowed: Vec<_> = watched.iter().map(|(fd, _)| borrow(*fd)).collect();
+            let mut fds = vec![PollFd::new(&wake_read, PollFlags::IN)];
+            for (borrowed, (_, events)) in borrowed.iter().zip(&watched) {
+                let mut flags = PollFlags::empty();
+                if events & ERTS_POLL_EV_IN != 0 {
+                    flags |= PollFlags::IN;
+                }
+                if events & ERTS_POLL_EV_OUT != 0 {
+                    flags |= PollFlags::OUT;
+                }
+                fds.push(PollFd::from_borrowed_fd(*borrowed, flags));
+            }
+            if poll(&mut fds, None).is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            }
+            if !fds[0].revents().is_empty() {
+                let mut buf = [0u8; 64];
+                let _ = rustix::io::read(&wake_read, &mut buf);
+            }
+            for (poll_fd, (fd, events)) in fds[1..].iter().zip(watched.iter()) {
+                let revents = poll_fd.revents();
+                if revents.is_empty() {
+                    continue;
+                }
+                let mut ready = 0;
+                if events & ERTS_POLL_EV_IN != 0
+                    && revents.intersects(
+                        PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL,
+                    )
+                {
+                    ready |= ERTS_POLL_EV_IN;
+                }
+                if events & ERTS_POLL_EV_OUT != 0
+                    && revents.intersects(
+                        PollFlags::OUT | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL,
+                    )
+                {
+                    ready |= ERTS_POLL_EV_OUT;
+                }
+                if ready == 0 {
+                    continue;
+                }
+                // One-shot: the interest is gone until the owner re-arms it.
+                {
+                    let mut fds = set.fds.lock().unwrap();
+                    if let Some(current) = fds.get_mut(fd) {
+                        *current &= !ready;
+                        if *current == 0 {
+                            fds.remove(fd);
+                        }
+                    }
+                }
+                if let Some(sink) = SINK.get() {
+                    sink(*fd, ready);
+                }
+            }
+        }
+    }
 }

@@ -138,6 +138,8 @@ struct FdState {
     sched: SetState,
     /// `ERTS_EV_FLAG_SCHEDULER`: the read interest has moved to the scheduler pollset.
     scheduler: bool,
+    /// The descriptor lives in the `select(2)` fallback set (`ERTS_EV_FLAG_FALLBACK`).
+    fallback: bool,
     /// `ErtsDrvEventState.count`: read interests registered, to decide the migration.
     count: u32,
 }
@@ -219,10 +221,25 @@ struct Poller {
 
 static POLLER: OnceLock<Poller> = OnceLock::new();
 
+/// A fallback-set descriptor became ready (erl_poll.c `erts_poll_wait__fallback` results go
+/// through the same `erts_check_io` event handling).
+fn fallback_event(fd: RawFd, events: u32) {
+    if let Some(poller) = POLLER.get() {
+        let event = ErtsPollEvent {
+            fd: Some(fd),
+            events,
+            closed: false,
+            error: false,
+        };
+        check_event(&poller.states, fd, event, PollSetKind::Main);
+    }
+}
+
 fn poller() -> &'static Poller {
     POLLER.get_or_init(|| {
         let poll = erts_poll_init(PollSetKind::Main).expect("create shared ERTS poll set");
 
+        crate::erl_poll::erts_poll_fallback_sink(fallback_event);
         let states = Arc::new(FdStateTable::default());
         let worker_states = Arc::clone(&states);
         thread::Builder::new()
@@ -306,22 +323,21 @@ pub(crate) fn wait_any(fds: &[(RawFd, InterestSet)]) -> io::Result<Option<(RawFd
     wait_any_timeout(fds, None)
 }
 
-#[cfg(test)]
 /// Wait with an optional deadline; timeout removes all registrations.
 pub(crate) fn wait_any_timeout(
     fds: &[(RawFd, InterestSet)],
     timeout: Option<Duration>,
 ) -> io::Result<Option<(RawFd, Ready)>> {
-    wait_any_timeout_kind(fds, timeout, RegistrationKind::Driver, None)
+    wait_any_timeout_kind(fds, timeout, RegistrationKind::Driver, None, None)
 }
 
-/// Like [`wait_any_timeout`], with `wake` the caller's own wake-up descriptor.
+/// Like [`wait_any_timeout`], returning [`WAKE_FD`] when `waker` is woken.
 pub(crate) fn wait_any_timeout_wake(
     fds: &[(RawFd, InterestSet)],
     timeout: Option<Duration>,
-    wake: RawFd,
+    waker: &Waker,
 ) -> io::Result<Option<(RawFd, Ready)>> {
-    wait_any_timeout_kind(fds, timeout, RegistrationKind::Driver, Some(wake))
+    wait_any_timeout_kind(fds, timeout, RegistrationKind::Driver, None, Some(waker))
 }
 
 /// Wait for a NIF selection while sharing the single ERTS poll thread.
@@ -330,7 +346,7 @@ pub(crate) fn wait_any_nif_timeout_wake(
     timeout: Option<Duration>,
     wake: RawFd,
 ) -> io::Result<Option<(RawFd, Ready)>> {
-    wait_any_timeout_kind(fds, timeout, RegistrationKind::Nif, Some(wake))
+    wait_any_timeout_kind(fds, timeout, RegistrationKind::Nif, Some(wake), None)
 }
 
 struct WaitResult {
@@ -338,19 +354,79 @@ struct WaitResult {
     changed: Condvar,
 }
 
+/// The `fd` a wake-up reports.
+pub(crate) const WAKE_FD: RawFd = -1;
+
+/// Wakes the one thread blocked in [`wait_any_timeout_wake`] on it, or the next wait.
+///
+/// The wake-up of a port's worker thread, in place of a pipe per port: erts wakes the
+/// scheduler running a port task (`erts_port_task_schedule`), not a thread per port, and a
+/// spawn port holds only its two pipe ends (sys_drivers.c `spawn_start`).
+#[derive(Default)]
+pub(crate) struct Waker {
+    state: Mutex<WakerState>,
+}
+
+#[derive(Default)]
+struct WakerState {
+    pending: bool,
+    waiter: Option<Arc<WaitResult>>,
+}
+
+impl Waker {
+    /// Wake the waiter; with none waiting, the next wait returns at once.
+    pub(crate) fn wake(&self) {
+        let mut state = self.state.lock().unwrap();
+        match state.waiter.as_ref() {
+            Some(waiter) => {
+                let mut value = waiter.value.lock().unwrap();
+                if value.is_none() {
+                    *value = Some((
+                        WAKE_FD,
+                        Ready {
+                            readable: true,
+                            writable: false,
+                            closed: false,
+                            error: false,
+                        },
+                    ));
+                    waiter.changed.notify_one();
+                }
+            }
+            None => state.pending = true,
+        }
+    }
+}
+
 fn wait_any_timeout_kind(
     fds: &[(RawFd, InterestSet)],
     timeout: Option<Duration>,
     kind: RegistrationKind,
     wake: Option<RawFd>,
+    waker: Option<&Waker>,
 ) -> io::Result<Option<(RawFd, Ready)>> {
-    if fds.is_empty() {
+    if fds.is_empty() && waker.is_none() {
         return Ok(None);
     }
     let result = Arc::new(WaitResult {
         value: Mutex::new(None),
         changed: Condvar::new(),
     });
+    if let Some(waker) = waker {
+        let mut state = waker.state.lock().unwrap();
+        if std::mem::take(&mut state.pending) {
+            return Ok(Some((
+                WAKE_FD,
+                Ready {
+                    readable: true,
+                    writable: false,
+                    closed: false,
+                    error: false,
+                },
+            )));
+        }
+        state.waiter = Some(Arc::clone(&result));
+    }
     let mut registrations = Vec::with_capacity(fds.len());
     for (fd, interests) in fds {
         let result_slot = Arc::clone(&result);
@@ -370,6 +446,9 @@ fn wait_any_timeout_kind(
             Err(error) => {
                 for registration in registrations {
                     deregister(registration);
+                }
+                if let Some(waker) = waker {
+                    waker.state.lock().unwrap().waiter = None;
                 }
                 return Err(error);
             }
@@ -404,6 +483,9 @@ fn wait_any_timeout_kind(
         }
     };
     drop(value);
+    if let Some(waker) = waker {
+        waker.state.lock().unwrap().waiter = None;
+    }
     for registration in registrations {
         deregister(registration);
     }
@@ -443,20 +525,14 @@ fn register_kind(
     let poller = poller();
     let id = poller.next_registration.fetch_add(1, Ordering::Relaxed);
     let registration = Registration { fd, id };
-    if always_ready_fd(fd) {
-        ready(
-            fd,
-            Ready {
-                readable: interests.readable,
-                writable: interests.writable,
-                closed: false,
-                error: false,
-            },
-        );
-        return Ok(registration);
-    }
     let (index, slots) = poller.states.lock_slots(fd)?;
     let mut state = slots[index].lock().unwrap();
+    // Port of erts/emulator/sys/common/erl_poll.c (concurrent_update_pollset: ADD of fds 0-2
+    // returns NVAL, so they live in the fallback set), OTP-29.1.1. A descriptor the owner
+    // marked (a regular file, always ready under `select`) goes there as well.
+    if fd <= 2 || fallback_marked(fd) {
+        state.fallback = true;
+    }
     state.watches.push(Watch {
         id,
         interests,
@@ -468,6 +544,7 @@ fn register_kind(
     if matches!(kind, RegistrationKind::Driver)
         && interests.readable
         && !state.scheduler
+        && !state.fallback
         && SCHED_POLLSET.get().is_some()
     {
         state.count += 1;
@@ -475,22 +552,16 @@ fn register_kind(
             state.scheduler = true;
         }
     }
-    match sync_pollset(fd, &mut state) {
+    let mut result = sync_pollset(fd, &mut state);
+    if result.is_err() && !state.fallback {
+        // Port of erl_poll.c (a kernel poller `ERTS_POLL_EV_NVAL` moves the descriptor to the
+        // fallback set), OTP-29.1.1.
+        state.fallback = true;
+        state.main = SetState::default();
+        result = sync_pollset(fd, &mut state);
+    }
+    match result {
         Ok(()) => Ok(registration),
-        Err(_error) if always_ready_fd(fd) => {
-            let watch = state.watches.pop().expect("newly added watch");
-            drop(state);
-            (watch.callback.expect("pending watch"))(
-                fd,
-                Ready {
-                    readable: interests.readable,
-                    writable: interests.writable,
-                    closed: false,
-                    error: false,
-                },
-            );
-            Ok(registration)
-        }
         Err(error) => {
             state.watches.retain(|watch| watch.id != id);
             Err(error)
@@ -610,7 +681,15 @@ fn sync_pollset(fd: RawFd, state: &mut FdState) -> io::Result<()> {
         readable: next.readable && !state.scheduler,
         writable: next.writable,
     };
-    sync_set(PollSetKind::Main, fd, main_want, selected, &mut state.main)?;
+    let main_kind = if state.fallback {
+        PollSetKind::Fallback
+    } else {
+        PollSetKind::Main
+    };
+    sync_set(main_kind, fd, main_want, selected, &mut state.main)?;
+    if state.watches.is_empty() && !state.main.registered && fd > 2 && !fallback_marked(fd) {
+        state.fallback = false;
+    }
     if state.scheduler || state.sched.registered {
         let sched_want = InterestSet {
             readable: next.readable && state.scheduler,
@@ -726,9 +805,28 @@ pub(crate) fn debug_info() -> DebugInfo {
     info
 }
 
-fn always_ready_fd(fd: RawFd) -> bool {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+static FALLBACK_FDS: std::sync::LazyLock<RwLock<std::collections::HashSet<RawFd>>> =
+    std::sync::LazyLock::new(|| RwLock::new(std::collections::HashSet::new()));
 
+fn fallback_marked(fd: RawFd) -> bool {
+    FALLBACK_FDS.read().unwrap().contains(&fd)
+}
+
+/// Put `fd` in the fallback set while `on`. The owner of a descriptor that `select` reports
+/// ready but the kernel poller does not (a regular file) states it once at open, instead of
+/// the poller classifying the descriptor on every selection.
+pub(crate) fn mark_fallback(fd: RawFd, on: bool) {
+    let mut marked = FALLBACK_FDS.write().unwrap();
+    if on {
+        marked.insert(fd);
+    } else {
+        marked.remove(&fd);
+    }
+}
+
+/// Whether `fd` is a regular file, a block device or `/dev/null`: always ready for `select`.
+pub(crate) fn is_always_ready(fd: RawFd) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let Ok(metadata) = std::fs::metadata(format!("/dev/fd/{fd}")) else {
         return false;
     };
@@ -802,6 +900,33 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(fd, reader.as_raw_fd());
         assert!(ready.readable);
+    }
+
+    #[test]
+    fn regular_file_at_end_of_file_is_ready_in_the_fallback_set() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // kqueue reports no read event for a regular file at end of file; select does.
+        let path = std::env::temp_dir().join(format!("arinsal-fallback-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        std::io::Read::read_to_end(&mut file, &mut Vec::new()).unwrap();
+        let fd = file.as_raw_fd();
+        assert!(is_always_ready(fd));
+        mark_fallback(fd, true);
+        let interest = InterestSet {
+            readable: true,
+            writable: false,
+        };
+        for _ in 0..2 {
+            let ready = wait_any_timeout(&[(fd, interest)], Some(Duration::from_secs(5)))
+                .unwrap()
+                .expect("a regular file is ready");
+            assert_eq!(ready.0, fd);
+        }
+        mark_fallback(fd, false);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

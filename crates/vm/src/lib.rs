@@ -292,6 +292,8 @@ fn cli_help_regular_file_is_ready_through_eof() {
     let path = std::env::temp_dir().join(format!("arinsal-cli-help-{}", std::process::id()));
     std::fs::write(&path, b"data").unwrap();
     let mut input = std::fs::File::open(&path).unwrap();
+    // Model the file-port open path, which identifies always-ready inputs once at open time.
+    check_io::mark_fallback(input.as_raw_fd(), true);
     let interest = check_io::InterestSet {
         readable: true,
         writable: false,
@@ -306,6 +308,7 @@ fn cli_help_regular_file_is_ready_through_eof() {
         let n = input.read(&mut bytes).unwrap();
         assert_eq!(&bytes[..n], expected);
     }
+    check_io::mark_fallback(input.as_raw_fd(), false);
     std::fs::remove_file(path).unwrap();
 }
 

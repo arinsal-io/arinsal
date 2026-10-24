@@ -287,6 +287,11 @@ fn arm_hook(token: usize, fd: RawFd, tty: OwnedTerm, reference: OwnedTerm) {
     let Some(target) = target else {
         return;
     };
+    // The input's kind was stated when the resource was created; the poller does not look at
+    // the descriptor on every arm.
+    if arinsal_nif_tty::input_is_always_ready(&tty) {
+        crate::check_io::mark_fallback(fd, true);
+    }
     let generation = {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -374,6 +379,7 @@ fn poll_loop(wake_read: RawFd) {
             fired
         };
         for watch in fired {
+            crate::check_io::mark_fallback(watch.fd, false);
             deliver(watch);
         }
     }
