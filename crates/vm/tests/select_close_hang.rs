@@ -158,7 +158,7 @@ static void pipe_stop(ErlNifEnv* env, void* obj, ErlNifEvent event, int is_direc
 }
 
 static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM info) {
-    ErlNifResourceTypeInit init = {pipe_dtor, pipe_stop, NULL};
+    ErlNifResourceTypeInit init = {pipe_dtor, pipe_stop, NULL, 3};
     pipe_type = enif_init_resource_type(env, "select_pipe", &init, ERL_NIF_RT_CREATE, NULL);
     return pipe_type == NULL;
 }

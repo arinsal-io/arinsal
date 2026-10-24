@@ -2546,7 +2546,7 @@ fn ioctl_ifname_term(name: &[libc::c_char; IFNAMSIZ]) -> O {
     O::list(
         name.iter()
             .take_while(|ch| **ch != 0)
-            .map(|ch| O::Int(i64::from(*ch as u8)))
+            .map(|ch| O::Int(i64::from(u8::from_ne_bytes((*ch).to_ne_bytes()))))
             .collect(),
     )
 }
@@ -2655,11 +2655,11 @@ fn ioctl_sockaddr_dl_term(bytes: &[u8]) -> Option<O> {
 }
 
 // Port of erts/emulator/nifs/unix/unix_socket_syncio.c:6287 (SIZEA), OTP-29.1.1.
-fn ioctl_ifconf_record_size(address: &[u8]) -> usize {
+fn ioctl_ifconf_record_size(_address: &[u8]) -> usize {
     #[cfg(target_os = "linux")]
     let address_size = std::mem::size_of::<libc::sockaddr>();
     #[cfg(target_os = "macos")]
-    let address_size = usize::from(address.first().copied().unwrap_or(0))
+    let address_size = usize::from(_address.first().copied().unwrap_or(0))
         .max(std::mem::size_of::<libc::sockaddr>());
     (IFNAMSIZ + address_size).max(std::mem::size_of::<IoctlIfReq>())
 }

@@ -3418,6 +3418,7 @@ fn worker(
 /// Close the duplicated input descriptor this worker thread owns.
 fn close_worker_fds(read_fd: Option<RawFd>) {
     if let Some(fd) = read_fd {
+        crate::check_io::deselect_fd(fd);
         // SAFETY: the worker owns the duplicated input descriptor.
         unsafe { libc::close(fd) };
     }

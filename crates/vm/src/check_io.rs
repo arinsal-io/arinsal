@@ -107,7 +107,7 @@ pub(crate) struct InterestSet {
     pub writable: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum RegistrationKind {
     Driver,
     Nif,
@@ -546,11 +546,9 @@ fn register_kind(
         && !state.scheduler
         && !state.fallback
         && SCHED_POLLSET.get().is_some()
+        && state.count > SCHEDULER_MIGRATION_COUNT
     {
-        state.count += 1;
-        if state.count > SCHEDULER_MIGRATION_COUNT {
-            state.scheduler = true;
-        }
+        state.scheduler = true;
     }
     let mut result = sync_pollset(fd, &mut state);
     if result.is_err() && !state.fallback {
@@ -578,6 +576,32 @@ pub(crate) fn deregister(registration: Registration) {
     let mut state = slots[index].lock().unwrap();
     state.watches.retain(|watch| watch.id != registration.id);
     let _ = sync_pollset(registration.fd, &mut state);
+}
+
+/// Clear the pollset state for a descriptor whose owning driver is stopping.
+///
+/// Port of erl_check_io.c (`deselect`), OTP-29.1.1.
+pub(crate) fn deselect_fd(fd: RawFd) {
+    let poller = poller();
+    let Ok((index, slots)) = poller.states.lock_slots(fd) else {
+        return;
+    };
+    let mut state = slots[index].lock().unwrap();
+    state.watches.clear();
+    if sync_pollset(fd, &mut state).is_err() {
+        let _ = erts_poll_control(PollSetKind::Main, fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE);
+        let _ = erts_poll_control(
+            PollSetKind::Scheduler,
+            fd,
+            ErtsPollOp::Del,
+            ERTS_POLL_EV_NONE,
+        );
+    }
+    state.main = SetState::default();
+    state.sched = SetState::default();
+    state.scheduler = false;
+    state.fallback = false;
+    state.count = 0;
 }
 
 fn poll_loop(mut poll: ErtsPollSet, states: Arc<FdStateTable>) {
@@ -617,12 +641,16 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent, from: Pol
     }
     let poll_error = event.events & (ERTS_POLL_EV_ERR | ERTS_POLL_EV_NVAL) != 0;
     let mut callbacks = Vec::new();
+    let mut triggered_driver_reads = 0u32;
     state.watches.retain_mut(|watch| {
         let fired = poll_error
             || (watch.interests.readable && seen.readable)
             || (watch.interests.writable && seen.writable);
         if fired {
             if let Some(callback) = watch.callback.take() {
+                if watch.kind == RegistrationKind::Driver && watch.interests.readable {
+                    triggered_driver_reads += 1;
+                }
                 callbacks.push((
                     callback,
                     Ready {
@@ -638,6 +666,7 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent, from: Pol
             true
         }
     });
+    state.count = state.count.saturating_add(triggered_driver_reads);
 
     if sync_pollset(fd, &mut state).is_err() {
         // A failed re-arm is reported as NVAL by erts_check_io. Trigger every
