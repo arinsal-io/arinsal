@@ -952,7 +952,7 @@ impl Decoder<'_> {
             },
             Operand::List(items) => {
                 let mut list = Vec::with_capacity(items.len());
-                for item in items {
+                for item in items.iter() {
                     list.push(self.arg(item, position)?);
                 }
                 let index = self.lists.len();

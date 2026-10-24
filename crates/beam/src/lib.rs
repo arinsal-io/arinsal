@@ -189,7 +189,7 @@ pub enum Operand {
     /// Signed integer fitting in i64.
     Int(i64),
     /// Integer outside the compact unsigned and signed 64-bit ranges.
-    BigInt(BigInt),
+    BigInt(Box<BigInt>),
     /// One-based atom index.
     Atom(u32),
     /// X register index.
@@ -203,9 +203,9 @@ pub enum Operand {
     /// Character code point.
     Char(u32),
     /// Extended list operand.
-    List(Vec<Operand>),
+    List(Box<Vec<Operand>>),
     /// Extended allocation list.
-    Alloc(Vec<Allocation>),
+    Alloc(Box<Vec<Allocation>>),
     /// Zero-based literal index.
     Literal(u32),
     TypedReg {
@@ -684,7 +684,7 @@ fn record_operand_to_owned(
             .map(|name| OwnedTerm::Atom(name.clone()))
             .ok_or_else(|| bad("Recs", offset, "default atom out of range")),
         Operand::Int(value) => Ok(OwnedTerm::Int(*value)),
-        Operand::BigInt(value) => Ok(OwnedTerm::BigInt(value.clone())),
+        Operand::BigInt(value) => Ok(OwnedTerm::BigInt((**value).clone())),
         Operand::Literal(index) => literals
             .get(*index as usize)
             .ok_or_else(|| bad("Recs", offset, "default literal out of range"))
@@ -882,10 +882,10 @@ fn operand(
     match tag {
         0 => Ok(u64::try_from(&value)
             .ok()
-            .map_or(Operand::BigInt(value), Operand::U)),
+            .map_or_else(|| Operand::BigInt(Box::new(value)), Operand::U)),
         1 => Ok(i64::try_from(&value)
             .ok()
-            .map_or_else(|| Operand::BigInt(value), Operand::Int)),
+            .map_or_else(|| Operand::BigInt(Box::new(value)), Operand::Int)),
         2 => {
             let n = u()?;
             if n == 0 {
@@ -922,7 +922,7 @@ fn operand(
                     for _ in 0..n {
                         items.push(operand(r, atoms, literals, types, depth + 1)?);
                     }
-                    Ok(Operand::List(items))
+                    Ok(Operand::List(Box::new(items)))
                 }
                 2 => Ok(Operand::FR(register(compact_u(r)?, r.context, r.pos)?)),
                 3 => {
@@ -943,7 +943,7 @@ fn operand(
                             count: compact_u(r)?,
                         });
                     }
-                    Ok(Operand::Alloc(items))
+                    Ok(Operand::Alloc(Box::new(items)))
                 }
                 4 => {
                     let index = compact_u(r)?;
@@ -1070,7 +1070,7 @@ fn validate_labels(arg: &Operand, count: u32, offset: usize) -> Result<(), BeamE
     match arg {
         Operand::Label(n) if *n >= count => Err(bad("Code", offset, "label index out of range")),
         Operand::List(items) => {
-            for item in items {
+            for item in items.iter() {
                 validate_labels(item, count, offset)?;
             }
             Ok(())

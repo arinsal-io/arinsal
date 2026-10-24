@@ -2421,6 +2421,9 @@ pub struct Table {
     btid: std::sync::OnceLock<std::sync::Weak<arinsal_term::MagicRef>>,
     /// Creation options and owner metadata.
     pub options: TableOptions,
+    /// Links in the owner's circular `DbTable.common.owned` list.
+    owned_prev: Option<Tid>,
+    owned_next: Option<Tid>,
     storage: Storage,
     fixed: usize,
     fixed_system_time: Option<PlainDbTerm>,
@@ -2507,6 +2510,8 @@ impl Table {
             tid,
             btid: std::sync::OnceLock::new(),
             options,
+            owned_prev: None,
+            owned_next: None,
             storage,
             fixed: 0,
             fixed_system_time: None,
@@ -5719,7 +5724,9 @@ pub struct Registry {
     free_slots: Vec<usize>,
     names: HashMap<Atom, Tid>,
     named_tables: Arc<NamedTableIndex>,
-    owned_tables: HashMap<Term, HashSet<Tid>>,
+    // Port of `ERTS_PSD_ETS_OWNED_TABLES` and the circular
+    // `DbTable.common.owned` list in erts/emulator/beam/erl_db.c, OTP-29.1.1.
+    owned_heads: HashMap<Term, Tid>,
     /// Tables each process has fixed (erts `ERTS_P_FIXED_TABLES`).
     fixed_tables: HashMap<Term, HashSet<Tid>>,
     match_programs: std::sync::RwLock<HashMap<u64, Arc<match_spec::MatchProgram>>>,
@@ -5993,7 +6000,7 @@ impl Registry {
             free_slots: Vec::new(),
             names: HashMap::new(),
             named_tables,
-            owned_tables: HashMap::new(),
+            owned_heads: HashMap::new(),
             fixed_tables: HashMap::new(),
             match_programs: std::sync::RwLock::new(HashMap::new()),
         }
@@ -6067,10 +6074,7 @@ impl Registry {
             options.read_concurrency || options.write_concurrency != WriteConcurrency::Disabled,
         ));
         self.tables[index].table = Some(shared.clone());
-        self.owned_tables
-            .entry(options.owner)
-            .or_default()
-            .insert(tid);
+        self.insert_owned_table(options.owner, tid)?;
         if options.named_table {
             if !self.named_tables.insert(options.name, shared.clone()) {
                 self.remove_owned_table(options.owner, tid);
@@ -6190,6 +6194,9 @@ impl Registry {
     /// Port of erts/emulator/beam/erl_db.c (ets_delete_1: DB_DELETE status, name removal,
     /// free_fixations_locked) up to the free_table_continue call, OTP-29.1.1.
     pub fn detach(&mut self, tid: Tid) -> Result<(Garbage, usize), EtsError> {
+        let shared = self.shared(tid)?.clone();
+        let owner = shared.read().options.owner;
+        self.remove_owned_table(owner, tid);
         let index = tid.slot().ok_or(EtsError::NoTable)?;
         let slot = self
             .tables
@@ -6201,7 +6208,6 @@ impl Registry {
         self.free_slots.push(index);
         let mut table = shared.write();
         table.detached = true;
-        self.remove_owned_table(table.options.owner, tid);
         if table.options.named_table {
             self.names.remove(&table.options.name);
             assert!(self.named_tables.remove(table.options.name, &shared));
@@ -6223,7 +6229,7 @@ impl Registry {
     /// Any table `owner` still owns (head of erts `ERTS_PSD_ETS_OWNED_TABLES`).
     // Port of erts/emulator/beam/erl_db.c (GET_OWNED_TABLE), OTP-29.1.1.
     pub fn first_owned(&self, owner: Term) -> Option<Tid> {
-        self.owned_tables.get(&owner)?.iter().next().copied()
+        self.owned_heads.get(&owner).copied()
     }
 
     /// Drop a stale ownership entry whose table no longer exists.
@@ -6234,19 +6240,66 @@ impl Registry {
     /// Return the tables owned by one process without inspecting unrelated tables.
     // Port of erts/emulator/beam/erl_db.c (owned table list), OTP-29.1.1.
     pub fn owned_by(&self, owner: Term) -> Vec<Tid> {
-        self.owned_tables
-            .get(&owner)
-            .map(|tables| tables.iter().copied().collect())
-            .unwrap_or_default()
+        let Some(head) = self.owned_heads.get(&owner).copied() else {
+            return Vec::new();
+        };
+        let mut owned = Vec::new();
+        let mut tid = head;
+        loop {
+            owned.push(tid);
+            let Some(next) = self.get(tid).ok().and_then(|table| table.owned_next) else {
+                break;
+            };
+            if next == head {
+                break;
+            }
+            tid = next;
+        }
+        owned
     }
 
     fn remove_owned_table(&mut self, owner: Term, tid: Tid) {
-        if let Some(tables) = self.owned_tables.get_mut(&owner) {
-            tables.remove(&tid);
-            if tables.is_empty() {
-                self.owned_tables.remove(&owner);
+        let links = self
+            .get(tid)
+            .ok()
+            .and_then(|table| Some((table.owned_prev?, table.owned_next?)));
+        let Some((prev, next)) = links else {
+            return;
+        };
+        if prev == tid {
+            self.owned_heads.remove(&owner);
+        } else {
+            if let Ok(mut table) = self.get_mut(prev) {
+                table.owned_next = Some(next);
+            }
+            if let Ok(mut table) = self.get_mut(next) {
+                table.owned_prev = Some(prev);
+            }
+            if self.owned_heads.get(&owner) == Some(&tid) {
+                self.owned_heads.insert(owner, next);
             }
         }
+        if let Ok(mut table) = self.get_mut(tid) {
+            table.owned_prev = None;
+            table.owned_next = None;
+        }
+    }
+
+    fn insert_owned_table(&mut self, owner: Term, tid: Tid) -> Result<(), EtsError> {
+        if let Some(head) = self.owned_heads.get(&owner).copied() {
+            let tail = self.get(head)?.owned_prev.ok_or(EtsError::NoTable)?;
+            self.get_mut(tail)?.owned_next = Some(tid);
+            self.get_mut(head)?.owned_prev = Some(tid);
+            let mut table = self.get_mut(tid)?;
+            table.owned_prev = Some(tail);
+            table.owned_next = Some(head);
+        } else {
+            self.owned_heads.insert(owner, tid);
+            let mut table = self.get_mut(tid)?;
+            table.owned_prev = Some(tid);
+            table.owned_next = Some(tid);
+        }
+        Ok(())
     }
 
     /// Rename a table, updating the named-table index.
@@ -6308,7 +6361,7 @@ impl Registry {
             return Ok(());
         }
         self.remove_owned_table(old_owner, tid);
-        self.owned_tables.entry(new_owner).or_default().insert(tid);
+        self.insert_owned_table(new_owner, tid)?;
         self.get_mut(tid)?.options.owner = new_owner;
         Ok(())
     }
@@ -6868,6 +6921,24 @@ mod registry_tests {
         }
         assert!(registry.tables.len() <= 2);
         assert!(matches!(registry.get(stale), Err(EtsError::NoTable)));
+    }
+
+    #[test]
+    fn owned_tables_are_visited_oldest_first() {
+        let owner = Term::small(7).unwrap();
+        let mut registry = Registry::new();
+        let first = registry
+            .create(TableOptions { owner, ..options() })
+            .unwrap();
+        let second = registry
+            .create(TableOptions { owner, ..options() })
+            .unwrap();
+
+        assert_eq!(registry.first_owned(owner), Some(first));
+        assert_eq!(registry.owned_by(owner), [first, second]);
+
+        registry.detach(first).unwrap();
+        assert_eq!(registry.first_owned(owner), Some(second));
     }
 
     #[test]

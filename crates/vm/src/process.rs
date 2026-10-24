@@ -4623,7 +4623,7 @@ pub(crate) fn register_requirements(beam: &BeamFile) -> (usize, usize) {
             Operand::X(index) => *x = (*x).max(*index as usize + 1),
             Operand::FR(index) => *fr = (*fr).max(*index as usize + 1),
             Operand::List(items) => {
-                for item in items {
+                for item in items.iter() {
                     scan(item, x, fr);
                 }
             }

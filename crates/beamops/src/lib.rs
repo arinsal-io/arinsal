@@ -8,6 +8,7 @@ use arinsal_beam::{BeamFile, Instr, Operand};
 use arinsal_etf::OwnedTerm;
 use arinsal_spec::BifKind;
 use rule_syntax::*;
+use smallvec::SmallVec;
 use std::{collections::HashMap, sync::OnceLock};
 
 /// A typed operand accepted by a BeamAsm-specific operation.
@@ -34,11 +35,11 @@ pub enum SpecificOperand {
     /// Nil operand.
     Nil,
     /// Integer outside `i64`, as decimal text; the loader turns it into a literal.
-    BigInt(String),
+    BigInt(Box<String>),
     /// Variable-length operand sequence.
-    List(Vec<SpecificOperand>),
+    List(Box<Vec<SpecificOperand>>),
     /// Allocation descriptor list.
-    Allocations(Vec<(u8, u64)>),
+    Allocations(Box<Vec<(u8, u64)>>),
     /// Operand forms without a specific BeamAsm representation yet.
     Other,
     /// A register operand with the compiler's `Type` chunk entry (`{tr, Reg, Type}`); only
@@ -281,7 +282,7 @@ fn map_fields_to_elements(instruction: &Node) -> SpecificOp {
 struct Node {
     /// Generic or specific opcode mnemonic. Static, as in the loader's opcode table.
     name: &'static str,
-    args: Vec<Operand>,
+    args: SmallVec<[Operand; 4]>,
     offset: usize,
 }
 
@@ -290,7 +291,7 @@ impl Node {
     fn empty() -> Self {
         Self {
             name: "",
-            args: Vec::new(),
+            args: SmallVec::new(),
             offset: 0,
         }
     }
@@ -474,7 +475,7 @@ fn inject_function_starts(raw: Vec<Node>) -> Vec<Node> {
             if let (Some(function), Some(entry)) = (current_function.take(), entry_label.take()) {
                 with_ends.push(Node {
                     name: "int_func_end",
-                    args: vec![function, entry],
+                    args: vec![function, entry].into(),
                     offset: node.offset,
                 });
             }
@@ -487,7 +488,7 @@ fn inject_function_starts(raw: Vec<Node>) -> Vec<Node> {
     if let (Some(function), Some(entry)) = (current_function, entry_label) {
         with_ends.push(Node {
             name: "int_func_end",
-            args: vec![function, entry],
+            args: vec![function, entry].into(),
             offset: with_ends.last().map_or(0, |node| node.offset),
         });
     }
@@ -684,7 +685,7 @@ impl<'a> Frame<'a> {
     fn rest_args(&self, slots: &mut SlotVec<'a>, slot: Option<usize>, fixed: usize) {
         let values = if self.expanded.len() == fixed + 1 {
             match &self.expanded[fixed] {
-                Operand::List(values) => values.clone(),
+                Operand::List(values) => (**values).clone(),
                 value => vec![value.clone()],
             }
         } else {
@@ -695,7 +696,7 @@ impl<'a> Frame<'a> {
         if let Some(slot) = slot
             && slots[slot].is_none()
         {
-            slots[slot] = Some(Bound::Owned(Operand::List(values)));
+            slots[slot] = Some(Bound::Owned(Operand::List(Box::new(values))));
         }
     }
 }
@@ -741,14 +742,14 @@ fn apply_rule(
     }
     let mut produced = Produced::new();
     for output in &rule.outputs {
-        let mut args = Vec::new();
+        let mut args = SmallVec::<[Operand; 4]>::new();
         for arg in &output.resolved {
             match arg {
                 OutArg::Slot(slot) => {
                     let value: &Operand = slots[*slot].as_deref()?;
                     if !output.function {
                         if let Operand::List(rest) = value {
-                            args.extend(rest.clone());
+                            args.extend(rest.iter().cloned());
                         } else {
                             args.push(value.clone());
                         }
@@ -776,7 +777,8 @@ fn apply_rule(
                         args[0].clone(),
                         args[2].clone(),
                         args[3].clone(),
-                    ],
+                    ]
+                    .into(),
                     offset: code[at].offset,
                 });
             }
@@ -786,7 +788,7 @@ fn apply_rule(
                 }
                 produced.push(Node {
                     name: "i_bs_skip_utf16",
-                    args: vec![args[1].clone(), args[0].clone(), args[2].clone()],
+                    args: vec![args[1].clone(), args[0].clone(), args[2].clone()].into(),
                     offset: code[at].offset,
                 });
             }
@@ -800,7 +802,7 @@ fn apply_rule(
                 let value = rest.first()?;
                 produced.push(Node {
                     name: "move",
-                    args: vec![Operand::Nil, value.clone()],
+                    args: vec![Operand::Nil, value.clone()].into(),
                     offset: code[at].offset,
                 });
             }
@@ -813,14 +815,14 @@ fn apply_rule(
                     return None;
                 };
                 let mut specific_args = vec![args[0].clone(), args[1].clone(), args[2].clone()];
-                specific_args.extend(rest.clone());
+                specific_args.extend(rest.iter().cloned());
                 produced.push(Node {
                     name: if pairs <= 10 {
                         "i_select_val_lins"
                     } else {
                         "i_select_val_bins"
                     },
-                    args: specific_args,
+                    args: specific_args.into(),
                     offset: code[at].offset,
                 });
             }
@@ -832,10 +834,10 @@ fn apply_rule(
                     return None;
                 };
                 let mut specific_args = vec![args[0].clone(), args[1].clone(), args[2].clone()];
-                specific_args.extend(rest.clone());
+                specific_args.extend(rest.iter().cloned());
                 produced.push(Node {
                     name: "i_select_tuple_arity",
-                    args: specific_args,
+                    args: specific_args.into(),
                     offset: code[at].offset,
                 });
             }
@@ -866,7 +868,7 @@ fn apply_rule(
                 }
                 produced.push(Node {
                     name: "i_jump_on_val",
-                    args: specific_args,
+                    args: specific_args.into(),
                     offset: code[at].offset,
                 });
             }
@@ -880,13 +882,13 @@ fn apply_rule(
                 for pair in rest.chunks_exact(2) {
                     produced.push(Node {
                         name: "is_ne_exact",
-                        args: vec![pair[1].clone(), args[0].clone(), pair[0].clone()],
+                        args: vec![pair[1].clone(), args[0].clone(), pair[0].clone()].into(),
                         offset: code[at].offset,
                     });
                 }
                 produced.push(Node {
                     name: "jump",
-                    args: vec![args[1].clone()],
+                    args: vec![args[1].clone()].into(),
                     offset: code[at].offset,
                 });
             }
@@ -916,7 +918,7 @@ fn apply_rule(
 
                 produced.push(Node {
                     name: "is_integer",
-                    args: vec![args[1].clone(), args[0].clone()],
+                    args: vec![args[1].clone(), args[0].clone()].into(),
                     offset: code[at].offset,
                 });
 
@@ -931,7 +933,7 @@ fn apply_rule(
                     } else {
                         "i_select_val_bins"
                     },
-                    args: small_args,
+                    args: small_args.into(),
                     offset: code[at].offset,
                 });
 
@@ -939,20 +941,20 @@ fn apply_rule(
                 if literal_count == 0 {
                     produced.push(Node {
                         name: "i_select_val_lins",
-                        args: vec![args[0].clone(), args[2].clone(), Operand::U(0)],
+                        args: vec![args[0].clone(), args[2].clone(), Operand::U(0)].into(),
                         offset: code[at].offset,
                     });
                 } else {
                     for pair in literal_values.chunks_exact(2) {
                         produced.push(Node {
                             name: "is_ne_exact",
-                            args: vec![pair[1].clone(), args[0].clone(), pair[0].clone()],
+                            args: vec![pair[1].clone(), args[0].clone(), pair[0].clone()].into(),
                             offset: code[at].offset,
                         });
                     }
                     produced.push(Node {
                         name: "jump",
-                        args: vec![args[2].clone()],
+                        args: vec![args[2].clone()].into(),
                         offset: code[at].offset,
                     });
                 }
@@ -965,10 +967,10 @@ fn apply_rule(
                     return None;
                 };
                 let mut specific_args = vec![args[0].clone(), args[1].clone()];
-                specific_args.extend(rest.clone());
+                specific_args.extend(rest.iter().cloned());
                 produced.push(Node {
                     name: "i_bs_match",
-                    args: specific_args,
+                    args: specific_args.into(),
                     offset: code[at].offset,
                 });
             }
@@ -980,10 +982,10 @@ fn apply_rule(
                     return None;
                 };
                 let mut specific_args = vec![args[0].clone(), args[1].clone(), args[2].clone()];
-                specific_args.extend(rest.clone());
+                specific_args.extend(rest.iter().cloned());
                 produced.push(Node {
                     name: "i_new_small_map_lit",
-                    args: specific_args,
+                    args: specific_args.into(),
                     offset: code[at].offset,
                 });
             }
@@ -1056,7 +1058,7 @@ fn apply_rule(
                 {
                     produced.push(Node {
                         name: "test_heap",
-                        args: vec![alloc.clone(), args[2].clone()],
+                        args: vec![alloc.clone(), args[2].clone()].into(),
                         offset: code[at].offset,
                     });
                     alloc = Operand::U(0);
@@ -1064,7 +1066,7 @@ fn apply_rule(
                 }
                 produced.push(Node {
                     name: "i_bs_create_bin",
-                    args: specific_args,
+                    args: specific_args.into(),
                     offset: code[at].offset,
                 });
             }
@@ -1090,13 +1092,14 @@ fn apply_rule(
                 ) {
                     produced.push(Node {
                         name: "i_get_map_element_hash",
-                        args: vec![args[0].clone(), args[1].clone(), key, Operand::U(0), dst],
+                        args: vec![args[0].clone(), args[1].clone(), key, Operand::U(0), dst]
+                            .into(),
                         offset: code[at].offset,
                     });
                 } else {
                     produced.push(Node {
                         name: "i_get_map_element",
-                        args: vec![args[0].clone(), args[1].clone(), key, dst],
+                        args: vec![args[0].clone(), args[1].clone(), key, dst].into(),
                         offset: code[at].offset,
                     });
                 }
@@ -1122,7 +1125,8 @@ fn apply_rule(
                             args[1].clone(),
                             rest[0].clone(),
                             rest[1].clone(),
-                        ],
+                        ]
+                        .into(),
                         offset: code[at].offset,
                     });
                     continue;
@@ -1140,7 +1144,7 @@ fn apply_rule(
                 }
                 produced.push(Node {
                     name: "i_get_map_elements",
-                    args: specific_args,
+                    args: specific_args.into(),
                     offset: code[at].offset,
                 });
             }
@@ -1163,7 +1167,8 @@ fn apply_rule(
                         dst.clone(),
                         live.clone(),
                         Operand::List(new.clone()),
-                    ],
+                    ]
+                    .into(),
                     offset: code[at].offset,
                 });
             }
@@ -1182,7 +1187,7 @@ fn apply_rule(
                 else {
                     produced.push(Node {
                         name: "i_lambda_error",
-                        args: vec![Operand::U(0)],
+                        args: vec![Operand::U(0)].into(),
                         offset: code[at].offset,
                     });
                     continue;
@@ -1190,7 +1195,7 @@ fn apply_rule(
                 if u64::from(lambda.num_free) != *num_free {
                     produced.push(Node {
                         name: "i_lambda_error",
-                        args: vec![Operand::U(0)],
+                        args: vec![Operand::U(0)].into(),
                         offset: code[at].offset,
                     });
                     continue;
@@ -1200,7 +1205,8 @@ fn apply_rule(
                         name: "i_move",
                         // Keep zero-capture fun references distinct from BEAM literal 0.
                         // The high index range is reserved for this internal bridge.
-                        args: vec![Operand::Literal(u32::MAX - lambda.index), args[1].clone()],
+                        args: vec![Operand::Literal(u32::MAX - lambda.index), args[1].clone()]
+                            .into(),
                         offset: code[at].offset,
                     });
                     continue;
@@ -1211,10 +1217,10 @@ fn apply_rule(
                 let mut specific_args = args[..3].to_vec();
                 specific_args[2] = Operand::U(u64::from(lambda.arity - lambda.num_free));
                 specific_args.push(Operand::U(env.len() as u64));
-                specific_args.extend(env.clone());
+                specific_args.extend(env.iter().cloned());
                 produced.push(Node {
                     name: "i_make_fun3",
-                    args: specific_args,
+                    args: specific_args.into(),
                     offset: code[at].offset,
                 });
             }
@@ -1236,7 +1242,8 @@ fn apply_rule(
                             Operand::U(u64::from(entry_label)),
                             Operand::U(u64::from(lambda.arity)),
                             Operand::U(u64::from(lambda.num_free)),
-                        ],
+                        ]
+                        .into(),
                         offset: code[at].offset,
                     });
                 }
@@ -1719,7 +1726,7 @@ fn operand_equal(a: &Operand, b: &Operand) -> bool {
         | (Operand::Char(a), Operand::Char(b))
         | (Operand::Literal(a), Operand::Literal(b)) => a == b,
         (Operand::List(a), Operand::List(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| operand_equal(x, y))
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| operand_equal(x, y))
         }
         (Operand::Alloc(a), Operand::Alloc(b)) => a
             .iter()
@@ -1772,10 +1779,12 @@ fn operand(value: &Operand) -> SpecificOperand {
             .map_or(SpecificOperand::Unsigned(*value), SpecificOperand::SmallInt),
         Operand::Nil => SpecificOperand::Nil,
         Operand::Char(value) => SpecificOperand::SmallInt(i64::from(*value)),
-        Operand::BigInt(value) => SpecificOperand::BigInt(value.to_string()),
+        Operand::BigInt(value) => SpecificOperand::BigInt(Box::new(value.to_string())),
         Operand::TypedReg { reg, .. } => operand(reg),
-        Operand::List(values) => SpecificOperand::List(values.iter().map(operand).collect()),
-        Operand::Alloc(values) => SpecificOperand::Allocations(
+        Operand::List(values) => {
+            SpecificOperand::List(Box::new(values.iter().map(operand).collect()))
+        }
+        Operand::Alloc(values) => SpecificOperand::Allocations(Box::new(
             values
                 .iter()
                 .map(|allocation| {
@@ -1787,12 +1796,12 @@ fn operand(value: &Operand) -> SpecificOperand {
                     (kind, allocation.count)
                 })
                 .collect(),
-        ),
+        )),
     }
 }
 
 fn make_op(name: &str, args: Vec<SpecificOperand>) -> SpecificOp {
-    SpecificOp::from_name(name, args)
+    SpecificOp::from_name(name, args.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -1801,16 +1810,22 @@ mod tests {
     use arinsal_spec::Opcode;
 
     #[test]
+    fn operand_enums_fit_two_machine_words() {
+        assert!(std::mem::size_of::<Operand>() <= 16);
+        assert!(std::mem::size_of::<SpecificOperand>() <= 16);
+    }
+
+    #[test]
     fn function_start_without_line_injects_nil_location() {
         let output = inject_function_starts(vec![
             Node {
                 name: "label",
-                args: vec![Operand::U(1)],
+                args: vec![Operand::U(1)].into(),
                 offset: 0,
             },
             Node {
                 name: "func_info",
-                args: vec![Operand::Atom(1), Operand::Atom(2), Operand::U(0)],
+                args: vec![Operand::Atom(1), Operand::Atom(2), Operand::U(0)].into(),
                 offset: 2,
             },
         ]);
@@ -1839,7 +1854,7 @@ mod tests {
         assert!(matches!(
             transform_function(&input).as_slice(),
             [SpecificOp::OpIMove(args)]
-                if args == &[SpecificOperand::Y(3), SpecificOperand::X(1)]
+                if args.as_slice() == [SpecificOperand::Y(3), SpecificOperand::X(1)]
         ));
     }
 
@@ -1851,7 +1866,7 @@ mod tests {
                 Operand::Label(9),
                 Operand::X(0),
                 Operand::U(2),
-                Operand::List(vec![Operand::Atom(4), Operand::Literal(7)]),
+                Operand::List(Box::new(vec![Operand::Atom(4), Operand::Literal(7)])),
             ],
             offset: 0,
         }];
@@ -1880,7 +1895,7 @@ mod tests {
                 Operand::Label(9),
                 Operand::X(0),
                 Operand::U(1),
-                Operand::List(vec![Operand::X(1)]),
+                Operand::List(Box::new(vec![Operand::X(1)])),
             ],
             offset: 0,
         }];
@@ -1916,7 +1931,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name(), "move_trim");
         assert!(
-            matches!(&result[0], SpecificOp::OpMoveTrim(args) if args == &[
+            matches!(&result[0], SpecificOp::OpMoveTrim(args) if args.as_slice() == [
                 SpecificOperand::X(2), SpecificOperand::Y(1), SpecificOperand::SmallInt(3),
             ])
         );
@@ -1954,10 +1969,10 @@ mod tests {
                 .any(|rule| rule.input == "move" && rule.output == "i_move")
         );
         assert!(
-            SpecificOp::from_name("i_bs_get_utf8", Vec::new())
+            SpecificOp::from_name("i_bs_get_utf8", SmallVec::new())
                 != SpecificOp::Unknown {
                     name: "i_bs_get_utf8".to_owned(),
-                    operands: Vec::new()
+                    operands: SmallVec::new()
                 }
         );
     }
@@ -2067,7 +2082,6 @@ mod tests {
 #[cfg(test)]
 mod type_bits_tests {
     use super::*;
-    use arinsal_beam::Allocation;
 
     #[test]
     fn type_bits_equal_the_per_letter_tests() {
@@ -2081,8 +2095,8 @@ mod type_bits_tests {
             Operand::Label(0),
             Operand::Label(9),
             Operand::Char(65),
-            Operand::List(vec![Operand::Nil]),
-            Operand::Alloc(Vec::<Allocation>::new()),
+            Operand::List(Box::new(vec![Operand::Nil])),
+            Operand::Alloc(Box::default()),
             Operand::Literal(2),
             Operand::Atom(4),
             Operand::Nil,
@@ -2092,7 +2106,7 @@ mod type_bits_tests {
             Operand::Int(1 << 58),
             Operand::Int(1 << 59),
             Operand::Int(i64::MIN),
-            Operand::BigInt(Default::default()),
+            Operand::BigInt(Box::default()),
             Operand::TypedReg {
                 reg: register(0),
                 type_index: 1,
