@@ -663,6 +663,11 @@ pub(crate) struct StagedLoad {
     on_load: Vec<String>,
 }
 
+/// Set by [`Vm::eval`], the interpreter entry point: modules loaded afterwards keep their
+/// interpreter form.
+pub(crate) static INTERPRETER_EVAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl Vm {
     /// Resolve a native record definition from the active module version.
     pub(crate) fn native_record_definition(
@@ -853,7 +858,10 @@ impl Vm {
     /// and the module is no special one. It still needs the interpreter form when BeamAsm
     /// leaves a function unported, which the caller checks after compiling.
     pub(crate) fn native_only(&self, beam: &BeamFile, meta: &CodeMeta) -> bool {
-        meta.has_beam_bytes
+        // `Vm::eval` interprets: once a process has used it, every module keeps its interpreter
+        // form, those it loads for its calls included.
+        !INTERPRETER_EVAL.load(std::sync::atomic::Ordering::Relaxed)
+            && meta.has_beam_bytes
             && beamasm_integration::enabled()
             && meta.on_load.is_none()
             && matches!(self.coverage_mode(), arinsal_loader::CoverageMode::None)
