@@ -2825,25 +2825,49 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
                 Some(light_value_return(process, entry_top, value))
             }
         }
-        other => {
-            let export = crate::beamasm_integration::export_from_info(descriptor)?;
-            let mut args = [Term::NIL; 3];
-            args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
-            let callee = (export.module_atom, export.function_atom);
-            match crate::bif_traps::finish_light(
-                process,
-                identity,
-                callee,
-                &args[..arity],
-                gc_was_enabled,
-                other,
-            ) {
-                crate::bif_traps::LightTrap::Returned(result) => Some(light_trap_result(
-                    process, registers, export, arity, entry_top, false, result,
-                )),
-                crate::bif_traps::LightTrap::Trapped => arm_light_trap(process),
-            }
-        }
+        other => trap_body_finish(
+            process,
+            registers,
+            identity,
+            descriptor,
+            arity,
+            entry_top,
+            gc_was_enabled,
+            other,
+        ),
+    }
+}
+
+/// The yield or error tail of [`trap_body_call`]: out of line, so the direct return stays small.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn trap_body_finish(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    identity: usize,
+    descriptor: u64,
+    arity: usize,
+    entry_top: usize,
+    gc_was_enabled: bool,
+    other: Result<crate::bif_traps::HandlerResult, arinsal_bifs::BifError>,
+) -> Option<u64> {
+    let export = crate::beamasm_integration::export_from_info(descriptor)?;
+    let mut args = [Term::NIL; 3];
+    args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
+    let callee = (export.module_atom, export.function_atom);
+    match crate::bif_traps::finish_light(
+        process,
+        identity,
+        callee,
+        &args[..arity],
+        gc_was_enabled,
+        other,
+    ) {
+        crate::bif_traps::LightTrap::Returned(result) => Some(light_trap_result(
+            process, registers, export, arity, entry_top, false, result,
+        )),
+        crate::bif_traps::LightTrap::Trapped => arm_light_trap(process),
     }
 }
 

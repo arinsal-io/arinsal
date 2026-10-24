@@ -1664,19 +1664,18 @@ fn maps_projection(
         });
     }
 
-    let start = {
+    // erts maps_keys_1 handles a flatmap before any yielding state exists.
+    let mut walk = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
-        arinsal_bifs::MapsProjectionWalk::start(&mut ctx, args[0], keys)?
-    };
-    let mut walk = match start {
-        arinsal_bifs::ProjectionStart::Done(value) => {
+        if let Some(value) = arinsal_bifs::MapsProjectionWalk::start_flat(&mut ctx, args[0], keys)?
+        {
             return Ok(HandlerResult::Done {
                 value,
                 reductions: 0,
             });
         }
-        arinsal_bifs::ProjectionStart::Walk(walk) => walk,
+        arinsal_bifs::MapsProjectionWalk::start_hashmap(&mut ctx, args[0], keys)?
     };
     let done = walk.step(&mut reds);
     let reductions = ycf_reductions(initial, reds, ITERATIONS_PER_RED);

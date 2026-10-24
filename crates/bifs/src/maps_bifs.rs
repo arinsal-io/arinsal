@@ -135,34 +135,50 @@ pub enum ProjectionStart {
 }
 
 impl MapsProjectionWalk {
-    /// Validate the map argument and start (`maps_keys_1_helper`, `maps_values_1_helper`).
-    pub fn start(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<ProjectionStart, BifError> {
+    /// The flatmap case of `maps_keys_1_helper`/`maps_values_1_helper`: erts builds the list
+    /// without yielding. `None` for a hashmap, which [`Self::start_hashmap`] walks.
+    // Port of erts/emulator/beam/erl_map.c:1207-1241 and :2262-2298, OTP-29.1.1.
+    #[inline]
+    pub fn start_flat(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<Option<Term>, BifError> {
         let checked = mapped(ctx, arinsal_maps::checked_map(map))?;
         match checked.kind() {
             arinsal_maps::CheckedMapKind::Flatmap(flat) => {
-                // Port of erts/emulator/beam/erl_map.c:1207-1241 and :2262-2298,
-                // OTP-29.1.1. The exact-size flatmap array is consed into one HAlloc block.
                 if flat.size() == 0 {
                     // Port of erts/emulator/beam/erl_map.c:1223, OTP-29.1.1:
                     // an empty flatmap returns NIL without entering the list builder.
-                    return Ok(ProjectionStart::Done(Term::NIL));
+                    return Ok(Some(Term::NIL));
                 }
                 let result = arinsal_maps::flatmap_projection_list(flat, keys, &mut ctx.heap);
-                Ok(ProjectionStart::Done(mapped(ctx, result)?))
+                Ok(Some(mapped(ctx, result)?))
             }
-            arinsal_maps::CheckedMapKind::Hashmap(_) => {
-                let iter = arinsal_term::MapReverseIter::new(map).expect("checked hashmap");
-                // Port of erl_map.c:2847 / :2888: reserve the entire CONS block before walking.
-                let output = arinsal_term::TermBuilder::new(&mut ctx.heap)
-                    .reserve_cons_list(checked.size())
-                    .expect("infallible BIF heap");
-                Ok(ProjectionStart::Walk(Self {
-                    iter,
-                    keys,
-                    remaining: checked.size(),
-                    output,
-                }))
-            }
+            arinsal_maps::CheckedMapKind::Hashmap(_) => Ok(None),
+        }
+    }
+
+    /// The hashmap case: reserve the whole list and return the walk to step. Kept out of line
+    /// so the flatmap path does not carry the walk's inline stack in its frame.
+    // Port of erts/emulator/beam/erl_map.c:2847 / :2888, OTP-29.1.1.
+    #[inline(never)]
+    pub fn start_hashmap(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<Self, BifError> {
+        let checked = mapped(ctx, arinsal_maps::checked_map(map))?;
+        let iter = arinsal_term::MapReverseIter::new(map).expect("checked hashmap");
+        // Port of erl_map.c:2847 / :2888: reserve the entire CONS block before walking.
+        let output = arinsal_term::TermBuilder::new(&mut ctx.heap)
+            .reserve_cons_list(checked.size())
+            .expect("infallible BIF heap");
+        Ok(Self {
+            iter,
+            keys,
+            remaining: checked.size(),
+            output,
+        })
+    }
+
+    /// Validate the map argument and start (`maps_keys_1_helper`, `maps_values_1_helper`).
+    pub fn start(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<ProjectionStart, BifError> {
+        match Self::start_flat(ctx, map, keys)? {
+            Some(value) => Ok(ProjectionStart::Done(value)),
+            None => Ok(ProjectionStart::Walk(Self::start_hashmap(ctx, map, keys)?)),
         }
     }
 
