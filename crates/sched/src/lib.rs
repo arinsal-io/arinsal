@@ -8336,7 +8336,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             let mut spins = spin_count;
             let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
             while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
-                std::hint::spin_loop();
+                scheduler_spin_body();
                 until_yield -= 1;
                 if until_yield == 0 {
                     until_yield = SCHED_SPIN_UNTIL_YIELD;
@@ -8630,7 +8630,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         let mut spins = spin_count;
         let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
         while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
-            std::hint::spin_loop();
+            scheduler_spin_body();
             until_yield -= 1;
             if until_yield == 0 {
                 until_yield = SCHED_SPIN_UNTIL_YIELD;
@@ -8746,6 +8746,13 @@ const PINNED_FLAGS_SHIFT: u32 = 8;
 // Port of erts/emulator/beam/erl_process.c:69,75,84 (medium busy-wait threshold), OTP-29.1.1.
 const SCHED_SPIN_UNTIL_YIELD: u32 = 100;
 
+#[inline(always)]
+fn scheduler_spin_body() {
+    // Port of erts/emulator/beam/erl_process.c (sched_spin_wait), OTP-29.1.1:
+    // ETHR_SPIN_BODY is a compiler barrier on AArch64, not a processor hint.
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
 // Port of erts/emulator/beam/erl_process.c:5564-5577 (medium wakeup-other threshold), OTP-29.1.1.
 const CONTEXT_REDS: i64 = 4_000;
 const WAKEUP_OTHER_LIMIT: i64 = 10 * CONTEXT_REDS;
@@ -8831,7 +8838,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                 let mut spins = spin_count;
                 let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
                 while spins > 0 && !thread.wake.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
+                    scheduler_spin_body();
                     until_yield -= 1;
                     if until_yield == 0 {
                         until_yield = SCHED_SPIN_UNTIL_YIELD;
