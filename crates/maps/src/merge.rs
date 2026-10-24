@@ -270,11 +270,12 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
     output[1].write(0);
     output[2].write(bits(boxed(output_ptr.wrapping_add(keys_tuple_start))));
     output[keys_tuple_start].write(0);
-    let (mut i1, mut i2, mut out, mut unused_size) = (0, 0, 0, 0);
+    let (mut i1, mut i2, mut unused_size) = (0, 0, 0);
     {
         let (before_keys, keys_region) = output.split_at_mut(keys_start);
         let keys_output = &mut keys_region[..capacity];
         let values_output = &mut before_keys[values_start..values_start + capacity];
+        let mut outputs = keys_output.iter_mut().zip(values_output.iter_mut());
         while i1 < n1 && i2 < n2 {
             let c = if ks1[i1] == ks2[i2] {
                 Ordering::Equal
@@ -283,37 +284,37 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
             };
             match c {
                 Ordering::Equal => {
-                    keys_output[out].write(ks2[i2]);
-                    values_output[out].write(vs2[i2]);
-                    out += 1;
+                    let (key_output, value_output) = outputs.next().expect("merge output capacity");
+                    key_output.write(ks2[i2]);
+                    value_output.write(vs2[i2]);
                     i1 += 1;
                     i2 += 1;
                     unused_size += 1;
                 }
                 Ordering::Less => {
-                    keys_output[out].write(ks1[i1]);
-                    values_output[out].write(vs1[i1]);
-                    out += 1;
+                    let (key_output, value_output) = outputs.next().expect("merge output capacity");
+                    key_output.write(ks1[i1]);
+                    value_output.write(vs1[i1]);
                     i1 += 1;
                 }
                 Ordering::Greater => {
-                    keys_output[out].write(ks2[i2]);
-                    values_output[out].write(vs2[i2]);
-                    out += 1;
+                    let (key_output, value_output) = outputs.next().expect("merge output capacity");
+                    key_output.write(ks2[i2]);
+                    value_output.write(vs2[i2]);
                     i2 += 1;
                 }
             }
         }
         while i1 < n1 {
-            keys_output[out].write(ks1[i1]);
-            values_output[out].write(vs1[i1]);
-            out += 1;
+            let (key_output, value_output) = outputs.next().expect("merge output capacity");
+            key_output.write(ks1[i1]);
+            value_output.write(vs1[i1]);
             i1 += 1;
         }
         while i2 < n2 {
-            keys_output[out].write(ks2[i2]);
-            values_output[out].write(vs2[i2]);
-            out += 1;
+            let (key_output, value_output) = outputs.next().expect("merge output capacity");
+            key_output.write(ks2[i2]);
+            value_output.write(vs2[i2]);
             i2 += 1;
         }
     }
