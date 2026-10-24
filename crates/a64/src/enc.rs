@@ -789,6 +789,15 @@ impl Emitter {
         } else {
             value
         };
+        // A 33 to 48 bit constant, which is what a code or data address is, always takes three
+        // instructions: how many halfwords of an address are zero changes from run to run, and
+        // the layout of a module must not (BeamAsm loads such addresses with a fixed sequence).
+        if w == Width::X64 && value >> 32 != 0 && value >> 48 == 0 {
+            self.emit(0xd280_0000 | (((value & 0xffff) as u32) << 5) | d);
+            self.emit(0xf280_0000 | (1 << 21) | ((((value >> 16) & 0xffff) as u32) << 5) | d);
+            self.emit(0xf280_0000 | (2 << 21) | ((((value >> 32) & 0xffff) as u32) << 5) | d);
+            return Ok(());
+        }
         let chunks: Vec<u16> = (0..halfs)
             .map(|i| ((value >> (i * 16)) & 0xffff) as u16)
             .collect();
