@@ -576,7 +576,7 @@ impl std::ops::Deref for Bound<'_> {
     }
 }
 
-type Bindings<'a> = Vec<(&'a str, Bound<'a>)>;
+type Bindings<'a> = smallvec::SmallVec<[(&'a str, Bound<'a>); 8]>;
 type SlotVec<'a> = smallvec::SmallVec<[Option<Bound<'a>>; 8]>;
 
 /// The match function of a rule: the generated straight-line form of its program.
@@ -702,6 +702,9 @@ impl<'a> Frame<'a> {
 
 include!(concat!(env!("OUT_DIR"), "/matchers.rs"));
 
+/// The instructions one rule application generates: one or two in nearly every rule.
+type Produced = smallvec::SmallVec<[Node; 2]>;
+
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn apply_rule(
     rule: &Rule,
@@ -709,7 +712,7 @@ fn apply_rule(
     at: usize,
     beam: Option<&BeamFile>,
     instrument_line_breakpoints: bool,
-) -> Option<(usize, Vec<Node>)> {
+) -> Option<(usize, Produced)> {
     if at + rule.patterns.len() > code.len() {
         return None;
     }
@@ -736,7 +739,7 @@ fn apply_rule(
             }
         }
     }
-    let mut produced = Vec::new();
+    let mut produced = Produced::new();
     for output in &rule.outputs {
         let mut args = Vec::new();
         for arg in &output.resolved {
