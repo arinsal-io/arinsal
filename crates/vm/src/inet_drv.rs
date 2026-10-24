@@ -4755,8 +4755,11 @@ fn push_frame(inner: &Inner, port: Term, outs: &mut Outs, who: DataWho, frame: F
         Frame::InputBytes(range) if inner.deliver != DELIVER_PORT => {
             let bytes = rbuf_slice(inner, range.clone());
             let (binary, header) = (inner.binary, inner.header);
-            // The packet leaves as a sub-binary of the input buffer when that is a binary.
-            let source = inner.rbin.as_ref().map(|bin| (bin, range.start));
+            // tcp_deliver shares i_buf only when the packet occupies at least 75% of
+            // its original allocation; smaller packets go through tcp_reply_data.
+            let source = inner.rbin.as_ref().and_then(|bin| {
+                (bytes.len() >= bin.len() - (bin.len() >> 2)).then_some((bin, range.start))
+            });
             let message = match who {
                 DataWho::Active(owner) => {
                     tcp_node(owner, port, bytes, source, binary, header).map(|node| (owner, node))
@@ -4879,20 +4882,24 @@ fn rbuf_stage(inner: &mut Inner, extra: usize) -> bool {
     let Some(total) = len.checked_add(extra) else {
         return false;
     };
-    if let Some(bin) = &inner.rbin
-        && inner.rbuf_end + extra <= bin.len()
+    if let Some(bin) = inner.rbin.as_mut()
+        && bin.bytes_mut_unique().is_some()
     {
-        // The Binary is shared once a packet was delivered from it; then it cannot be
-        // written and the buffered rest moves to a new one.
-        if inner
-            .rbin
-            .as_mut()
-            .is_some_and(|bin| bin.bytes_mut_unique().is_some())
-        {
-            return true;
-        }
+        // tcp_expand_buffer reallocates the unique driver binary in place. Once a
+        // delivered sub-binary shares it, buffered bytes move to a fresh allocation.
+        let Some(needed) = inner.rbuf_end.checked_add(extra) else {
+            return false;
+        };
+        return needed <= bin.len() || bin.realloc(needed).is_ok();
     }
-    let Ok(mut bin) = arinsal_term::RefcBinary::new_zeroed(total) else {
+    // tcp_recv starts with alloc_buffer(desc->inet.bufsz), then tcp_expand_buffer keeps
+    // the used prefix and grows that allocation when packet_parser knows the frame size.
+    let initial = if inner.htype != 0 && len == 0 && inner.rbuf_end == 0 {
+        (inner.buffer.max(1) as usize).max(total)
+    } else {
+        total
+    };
+    let Ok(mut bin) = arinsal_term::RefcBinary::new_zeroed(initial) else {
         return false;
     };
     let Some(buf) = bin.bytes_mut_unique() else {
@@ -5130,13 +5137,14 @@ fn pull(sock: &Arc<Sock>) -> bool {
             // announced remaining size once and is read in place; the reserved pages stay
             // untouched until data arrives, so a bogus 4 GiB header costs address space only.
             let read_size = tcp_read_size(&inner);
-            // A packet that will not fit an on-heap binary is read into a binary of its own and
-            // delivered as a sub-binary of it (`i_buf` of tcp_recv is a driver binary).
+            // Packet-mode binary input uses the driver-binary shape of tcp_recv's i_buf from
+            // its first header read; tcp_expand_buffer grows it when the frame length is known.
             let staged = inner.binary
                 && inner.deliver != DELIVER_PORT
                 && (inner.htype != 0 || active_is(&inner.active))
-                && rbuf_len(&inner).saturating_add(read_size)
-                    > arinsal_drv::ERL_ONHEAP_BINARY_LIMIT
+                && (inner.htype != 0
+                    || rbuf_len(&inner).saturating_add(read_size)
+                        > arinsal_drv::ERL_ONHEAP_BINARY_LIMIT)
                 && rbuf_stage(&mut inner, read_size);
             if !staged {
                 rbuf_unstage(&mut inner);

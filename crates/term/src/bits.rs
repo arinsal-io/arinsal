@@ -138,6 +138,15 @@ impl RefcBinary {
         Ok(Self { allocation })
     }
 
+    /// Resize a uniquely owned binary allocation while preserving its existing bytes.
+    pub fn realloc(&mut self, size: usize) -> Result<(), TermError> {
+        self.allocation
+            .realloc(size)
+            .map_err(|_| TermError::SystemLimit)?;
+        self.allocation.set_apparent_size(size);
+        Ok(())
+    }
+
     /// The payload, writable while no other reference to the Binary exists.
     pub fn bytes_mut_unique(&mut self) -> Option<&mut [u8]> {
         self.allocation.bytes_mut_unique()
