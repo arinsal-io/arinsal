@@ -197,7 +197,10 @@ static THIS_NODE: AtomicU64 = AtomicU64::new(0);
 /// Publish the local node identity, as `erts_set_this_node` does for `erts_this_node`.
 // Port of erts/emulator/beam/erl_node_tables.c (erts_set_this_node), OTP-29.1.1.
 pub fn set_this_node(name: Atom, creation: u32) {
-    THIS_NODE.store((u64::from(name.0) << 32) | u64::from(creation), Ordering::Release);
+    THIS_NODE.store(
+        (u64::from(name.0) << 32) | u64::from(creation),
+        Ordering::Release,
+    );
 }
 
 /// The local node name and creation; `nonode@nohost` and 0 until the node is named.
