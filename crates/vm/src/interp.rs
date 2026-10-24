@@ -1598,6 +1598,7 @@ impl Vm {
         function: &str,
         args: &[Term],
     ) -> Result<EvalResult, VmError> {
+        crate::load::INTERPRETER_EVAL.store(true, std::sync::atomic::Ordering::Relaxed);
         // ---- vm_funs ----
         if module == "erlang"
             && let Some(result) = self.eval_erlang_fun_builtin(function, args)
