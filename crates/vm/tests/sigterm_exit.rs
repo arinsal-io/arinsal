@@ -20,7 +20,7 @@ fn shim_dir() -> PathBuf {
     dir
 }
 
-fn run(shim: Option<&PathBuf>) -> (Option<i32>, f64) {
+fn run(shim: Option<&PathBuf>, expression: &str) -> (Option<i32>, f64) {
     let mut path = Vec::new();
     if let Some(dir) = shim {
         path.push(dir.clone());
@@ -38,7 +38,7 @@ fn run(shim: Option<&PathBuf>) -> (Option<i32>, f64) {
             "erl",
             "-noshell",
             "-eval",
-            "receive after infinity -> ok end",
+            expression,
         ])
         .env("PATH", std::env::join_paths(path).unwrap())
         .env_remove("ERL_ROOTDIR")
@@ -52,10 +52,31 @@ fn run(shim: Option<&PathBuf>) -> (Option<i32>, f64) {
 }
 
 #[test]
-fn sigterm_stops_a_blocked_node_with_the_status_of_erl() {
-    let (reference, _) = run(None);
+fn sigterm_matches_erts_when_the_vm_is_stalled() {
     let shim = shim_dir();
-    let (arinsal, elapsed) = run(Some(&shim));
-    assert_eq!(arinsal, reference, "exit status after SIGTERM");
-    assert!(elapsed < 8.0, "SIGTERM was ignored for {elapsed} s");
+    let cases = [
+        ("blocked receive", "receive after infinity -> ok end"),
+        (
+            "all schedulers busy",
+            "N=erlang:system_info(schedulers_online), [spawn(fun F()->F() end) || _ <- lists:seq(1,N)], receive after infinity -> ok end",
+        ),
+        (
+            "blocked code server",
+            "R=sys:suspend(code_server), receive after infinity -> {ok,R} end",
+        ),
+    ];
+
+    for (name, expression) in cases {
+        let (reference, reference_elapsed) = run(None, expression);
+        let (arinsal, arinsal_elapsed) = run(Some(&shim), expression);
+        similar_asserts::assert_eq!(arinsal, reference, "{name}: exit status after SIGTERM");
+        assert!(
+            (arinsal_elapsed - reference_elapsed).abs() < 2.0,
+            "{name}: Arinsal took {arinsal_elapsed:.2}s, erts took {reference_elapsed:.2}s"
+        );
+        assert!(
+            arinsal_elapsed < 8.0,
+            "{name}: SIGTERM was ignored for {arinsal_elapsed:.2}s"
+        );
+    }
 }

@@ -167,6 +167,7 @@ fn is_atom_bits(word: u64) -> bool {
 // Port of erts/emulator/beam/erl_utils.h:267-271 (erts_cmp_flatmap_keys), OTP-29.1.1:
 // two atoms compare by index; every other pair is `erts_cmp(..., exact=1)`, whose
 // small-integer path is a register compare.
+#[inline(always)]
 fn key_cmp(a: Term, b: Term) -> Ordering {
     if is_atom_bits(bits(a)) && is_atom_bits(bits(b)) {
         return bits(a).cmp(&bits(b));
