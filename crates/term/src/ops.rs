@@ -710,8 +710,47 @@ pub(crate) fn size_object_with_prior(
     }
     size
 }
+/// An internal pid, port or reference belongs to `erts_this_node`; `Term::identity` leaves its
+/// node unset, so comparisons against external identities substitute the local node first.
+// Port of erts/emulator/beam/utils.c:1749-1830 (erts_cmp_compound: anode = erts_this_node), OTP-29.1.1.
+fn localize_identity(identity: Identity) -> Identity {
+    let (name, creation) = crate::identity::this_node();
+    match identity {
+        Identity::Pid {
+            node,
+            creation: 0,
+            index,
+            serial,
+        } if node == crate::atoms::NONAME => Identity::Pid {
+            node: name,
+            creation,
+            index,
+            serial,
+        },
+        Identity::Port {
+            node,
+            creation: 0,
+            id,
+        } if node == crate::atoms::NONAME => Identity::Port {
+            node: name,
+            creation,
+            id,
+        },
+        Identity::Ref {
+            node,
+            creation: 0,
+            ids,
+        } if node == crate::atoms::NONAME => Identity::Ref {
+            node: name,
+            creation,
+            ids,
+        },
+        other => other,
+    }
+}
+
 fn identity_cmp(a: Identity, b: Identity) -> Ordering {
-    match (a, b) {
+    match (localize_identity(a), localize_identity(b)) {
         (
             Identity::Pid {
                 node: an,

@@ -444,6 +444,9 @@ pub(crate) fn set_this_node(name: String, creation: u32) -> bool {
         return false;
     }
     THIS_NODE_SYSNAME.store(word, Ordering::Release);
+    if let Ok(atom) = arinsal_term::global_atoms().intern(&tables.local_name) {
+        arinsal_term::set_this_node(atom, tables.local_creation);
+    }
     true
 }
 

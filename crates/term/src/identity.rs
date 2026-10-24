@@ -3,6 +3,7 @@ use crate::{
     Atom, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, REF, Term, TermError, atoms, global_atoms,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Immutable node-table entry retained by every referencing heap.
 #[derive(Debug)]
@@ -186,5 +187,23 @@ pub(crate) fn check_external_ref(ids: &[u32]) -> Result<(), TermError> {
         Ok(())
     } else {
         Err(TermError::BadArg)
+    }
+}
+
+/// `erts_this_node`: the name and creation that internal pids, ports and references compare
+/// with, packed as `name << 32 | creation`. Set by the node table when the node gets its name.
+static THIS_NODE: AtomicU64 = AtomicU64::new(0);
+
+/// Publish the local node identity, as `erts_set_this_node` does for `erts_this_node`.
+// Port of erts/emulator/beam/erl_node_tables.c (erts_set_this_node), OTP-29.1.1.
+pub fn set_this_node(name: Atom, creation: u32) {
+    THIS_NODE.store((u64::from(name.0) << 32) | u64::from(creation), Ordering::Release);
+}
+
+/// The local node name and creation; `nonode@nohost` and 0 until the node is named.
+pub(crate) fn this_node() -> (Atom, u32) {
+    match THIS_NODE.load(Ordering::Acquire) {
+        0 => (atoms::NONAME, 0),
+        packed => (Atom((packed >> 32) as u32), packed as u32),
     }
 }
