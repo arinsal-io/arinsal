@@ -371,7 +371,7 @@ fn result_error(process: &mut Process, reason: O) -> Result<Term, VmError> {
 fn stack_frames(process: &mut Process, pid_term: Term, max_size: Term) -> Result<Term, VmError> {
     let pid = inspect_pid(process, pid_term)?;
     let max_size = nonnegative(max_size)?;
-    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let Some(frames) = runtime.inspect_suspended(pid, |target, modules| {
         inspect_frames(target, modules, max_size, hibernation_arity(target))
     }) else {
@@ -398,7 +398,7 @@ fn peek_stack_frame_slot(
     let frame = nonnegative(frame_term)?;
     let slot = nonnegative(slot_term)?;
     let max_size = nonnegative(max_size_term)?;
-    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let Some(value) = runtime.inspect_suspended(pid, |target, modules| {
         inspect_frames(target, modules, max_size, hibernation_arity(target))
             .iter()
@@ -435,7 +435,7 @@ fn peek_xreg(
     let pid = inspect_pid(process, pid_term)?;
     let register = nonnegative(register_term)?;
     let max_size = nonnegative(max_size_term)?;
-    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let Some(value) = runtime.inspect_suspended(pid, |target, _| {
         (register < crate::process::switched_out_live(target))
             .then(|| target.x[register])

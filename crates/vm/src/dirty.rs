@@ -188,7 +188,7 @@ impl Process {
             let mut pending = *cold.nif_pending.take()?;
             // The job runs on this thread; NIF services find the process through the hub.
             crate::natives::nif::refresh_hub_native(self);
-            let runtime = self.runtime.clone();
+            let runtime = self.runtime;
             let pid = self.self_pid;
             let (module, function, arity) = pending.trace_mfa();
             let module = module.to_owned();

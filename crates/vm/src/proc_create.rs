@@ -386,7 +386,7 @@ pub struct Process {
     /// Final reason remains on the task until the scheduler reaps late monitors.
     pub(crate) final_exit_reason: Option<Term>,
     // ---- processes and messages ----
-    pub(crate) runtime: Option<std::sync::Arc<process::Runtime>>,
+    pub(crate) runtime: Option<&'static process::Runtime>,
     pub(crate) self_pid: Option<arinsal_sched::Pid>,
     /// Saved continuation data for the process's pending `erts_await_result` BIF.
     // Port of erts/emulator/beam/erl_bif_info.c:1480-1500, OTP-29.1.1.
@@ -1569,17 +1569,33 @@ impl Process {
 
     /// Attaches the process to its node and registers it with the node's persistent-term
     /// store (its literal-area collector handshake).
-    pub(crate) fn set_runtime(&mut self, runtime: Option<std::sync::Arc<crate::process::Runtime>>) {
-        let store = runtime.as_deref().map_or_else(
+    pub(crate) fn set_runtime(&mut self, runtime: Option<&'static crate::process::Runtime>) {
+        let min_bin_vheap_size = runtime.map(|runtime| {
+            crate::natives::sys::gc_spawn_defaults(Some(runtime)).min_bin_vheap_size as u64
+        });
+        self.set_runtime_inner(runtime, min_bin_vheap_size);
+    }
+
+    /// Attach runtime state after the spawn path has already read the GC defaults once.
+    pub(crate) fn set_runtime_with_min_bin_vheap_size(
+        &mut self,
+        runtime: Option<&'static crate::process::Runtime>,
+        min_bin_vheap_size: u64,
+    ) {
+        self.set_runtime_inner(runtime, Some(min_bin_vheap_size));
+    }
+
+    fn set_runtime_inner(
+        &mut self,
+        runtime: Option<&'static crate::process::Runtime>,
+        min_bin_vheap_size: Option<u64>,
+    ) {
+        let store = runtime.map_or_else(
             || arinsal_pterm::store_for(0),
             |runtime| runtime.persistent_terms,
         );
-        if let Some(runtime) = runtime.as_deref() {
-            // A new process takes `system_flag(min_bin_vheap_size)` of the runtime it joins;
-            // explicit spawn options are applied after this.
-            self.heap.set_min_bin_vheap_size(
-                crate::natives::sys::gc_spawn_defaults(Some(runtime)).min_bin_vheap_size as u64,
-            );
+        if let Some(min_bin_vheap_size) = min_bin_vheap_size {
+            self.heap.set_min_bin_vheap_size(min_bin_vheap_size);
         }
         self.runtime = runtime;
         self.persistent_terms = store;

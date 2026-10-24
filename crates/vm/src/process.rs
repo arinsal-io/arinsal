@@ -1304,8 +1304,8 @@ pub(crate) struct Runtime {
     pub(crate) literal_collector: Mutex<Option<Pid>>,
     paths: Vec<std::path::PathBuf>,
     // Set once when the scheduler starts; read without a lock like erts' scheduler data.
-    /// Held for the VM lifetime (erts reads its scheduler data through globals / `esdp`, no
-    /// refcount per call); the cycle through the processes is broken by `Scheduler::shutdown`.
+    /// Held for the VM lifetime (erts reads its scheduler data through globals / `esdp`, with no
+    /// per-process runtime refcount).
     scheduler: OnceLock<Arc<Scheduler<Process>>>,
     /// `process_reg` (`regtab_rwmtx`). Names are atom indexes, not strings.
     pub(crate) reg: crate::register::RegisterTable,
@@ -1326,7 +1326,7 @@ pub(crate) struct Runtime {
     /// `meta_name_tab`, read without taking the global ETS registry lock.
     pub(crate) named_ets: Arc<arinsal_ets::NamedTableIndex>,
     pub(crate) ets: std::sync::RwLock<arinsal_ets::Registry>,
-    result: mpsc::Sender<Result<ScheduledResult, VmError>>,
+    result: Mutex<mpsc::Sender<Result<ScheduledResult, VmError>>>,
     // g_proc_sched: suspend counts and the status other processes can observe.
     /// Asynchronous suspends of a running process that it has not yet acted on.
     // Port of erts/emulator/beam/erl_process.c:9013 (`erts_internal_suspend_process_2` pending suspend), OTP-29.1.1.
@@ -2740,7 +2740,7 @@ impl Executor {
                                             process.native_pc = None;
                                             process.native_continuation_resume = false;
                                             if hibernate_fetch_collect(process, ctx)? {
-                                                if let Some(runtime) = process.runtime.clone() {
+                                                if let Some(runtime) = process.runtime {
                                                     runtime.mark_hibernating(ctx.pid(), true);
                                                     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
                                                     process.cold_mut().hibernate_sched = true;
@@ -3474,7 +3474,7 @@ impl Executor {
                                                 process.native_pc = None;
                                                 process.native_continuation_resume = false;
                                                 if hibernate_fetch_collect(process, ctx)? {
-                                                    if let Some(runtime) = process.runtime.clone() {
+                                                    if let Some(runtime) = process.runtime {
                                                         runtime.mark_hibernating(ctx.pid(), true);
                                                         // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
                                                         process.cold_mut().hibernate_sched = true;
@@ -3673,7 +3673,7 @@ impl Executor {
                     }
                     if hibernate_stopped(process) {
                         if hibernate_fetch_collect(process, ctx)? {
-                            if let Some(runtime) = process.runtime.clone() {
+                            if let Some(runtime) = process.runtime {
                                 runtime.mark_hibernating(ctx.pid(), true);
                                 // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
                                 process.cold_mut().hibernate_sched = true;
@@ -3915,7 +3915,7 @@ impl Executor {
         {
             return Ok(None);
         }
-        let Some(runtime) = process.runtime.clone() else {
+        let Some(runtime) = process.runtime else {
             return Ok(None);
         };
         let pid = ctx.pid();
@@ -3968,7 +3968,6 @@ impl Executor {
         let pid = ctx.pid();
         let runtime = process
             .runtime
-            .clone()
             .ok_or_else(|| VmError::Unsupported("hibernate without a scheduler".into()))?;
         process
             .cold_mut()
@@ -4456,7 +4455,7 @@ fn report_max_heap(
         limit.kill,
         process.inbox.len()
     );
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         return;
     };
     let logger = runtime
@@ -4833,7 +4832,7 @@ impl Runtime {
     // monitor insertion), OTP-29.1.1: a spawn_request monitor lives in the child from creation,
     // so a child that exits at once still sends its own exit reason in the DOWN.
     pub(crate) fn spawn_mfa_unscheduled_watched(
-        self: &Arc<Self>,
+        &'static self,
         module: &str,
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
@@ -4845,7 +4844,7 @@ impl Runtime {
     }
 
     fn spawn_mfa_scheduled(
-        self: &Arc<Self>,
+        &'static self,
         module: &str,
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
@@ -4872,7 +4871,7 @@ impl Runtime {
         let mut child = Process::with_spawn_registers(args.len(), 0);
         child.module = module_id;
         child.ip = ip;
-        child.set_runtime(Some(Arc::clone(self)));
+        child.set_runtime(Some(self));
         child.cold_mut().group_leader = None;
         child.initial_mfa = mfa_atoms(module, function, args.len() as u8);
         // Port of erts/emulator/beam/erl_process.c:12756-12767 (erl_create_process p->parent),
@@ -5182,7 +5181,7 @@ impl Process {
         }
         // g_proc_sched: a terminating suspender releases every suspend it acquired.
         // g_port_fix: close owned ports synchronously on the termination path.
-        if let Some(runtime) = self.runtime.clone() {
+        if let Some(runtime) = self.runtime {
             // Node monitors live in the process monitor tree; the global table is
             // consulted only when this process registered one (dist.c:6732).
             if resources & proc_flags::NODE_MON != 0 {
@@ -5194,7 +5193,7 @@ impl Process {
             if let Ok(scheduler) = runtime.scheduler() {
                 // Ports are links on the process (erl_process.c:14084). No port list, no scan.
                 if resources & proc_flags::PORTS != 0 {
-                    crate::port::owner_exit(&runtime, scheduler, ctx.pid(), reason);
+                    crate::port::owner_exit(runtime, scheduler, ctx.pid(), reason);
                 }
                 // Port of erts/emulator/beam/erl_process.c:14415-14417 (F_USING_DDLL).
                 if resources & proc_flags::DDLL != 0 {
@@ -5218,7 +5217,7 @@ impl Process {
         if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::USING_DB == 0 {
             return true;
         }
-        let (Some(runtime), Some(owner)) = (self.runtime.clone(), ctx.pid().to_term()) else {
+        let (Some(runtime), Some(owner)) = (self.runtime, ctx.pid().to_term()) else {
             return true;
         };
         // FREE_OWNED_TABLE: finish the table whose release was interrupted.
@@ -6359,7 +6358,7 @@ impl Process {
         if alias == 0 {
             return Ok(true);
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(runtime) = self.runtime else {
             return Ok(true);
         };
         let Some((Some(_), priority)) = runtime.alias_lookup_prio(alias) else {
@@ -6819,7 +6818,7 @@ impl Process {
             if self.entry
                 && let Some(runtime) = self.runtime.as_ref()
             {
-                let _ = runtime.result.send(Err(error));
+                let _ = runtime.result.lock().unwrap().send(Err(error));
             }
             // `notify_exit` released the cold state; the process stays marked exited.
             self.cold_mut().dirty_exited = true;
@@ -7778,7 +7777,7 @@ fn down_message_on_sender(
 }
 
 fn report_process_error(process: &mut Process, ctx: &mut RunCtx<'_, Message>, reason: Term) {
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         return;
     };
     let destination = crate::natives::sys::system_logger(process);
@@ -7882,8 +7881,8 @@ thread_local! {
 /// [`Vm`] while the executor's own is borrowed (receive tracing runs inside signal handling,
 /// which has only the process). The replica is taken out while `f` runs, so a nested call
 /// simply builds another one.
-pub(crate) fn with_replica_vm<R>(runtime: &Arc<Runtime>, f: impl FnOnce(&mut Vm) -> R) -> R {
-    let key = Arc::as_ptr(runtime) as usize;
+pub(crate) fn with_replica_vm<R>(runtime: &'static Runtime, f: impl FnOnce(&mut Vm) -> R) -> R {
+    let key = runtime as *const Runtime as usize;
     let cached = TRACER_REPLICAS.with(|slot| {
         let mut slot = slot.borrow_mut();
         slot.iter()
@@ -7907,7 +7906,7 @@ pub(crate) fn with_replica_vm<R>(runtime: &Arc<Runtime>, f: impl FnOnce(&mut Vm)
 /// Run `f` on this scheduler's executor, creating it for `runtime` on first use.
 fn with_executor<R>(
     data: &mut SchedulerData,
-    runtime: &Arc<Runtime>,
+    runtime: &'static Runtime,
     f: impl FnOnce(&mut Executor) -> R,
 ) -> R {
     let executor = data.executor.get_or_insert_with(|| new_executor(runtime));
@@ -7920,7 +7919,7 @@ fn with_executor<R>(
 // `esdp->registers` once), OTP-29.1.1.
 #[cold]
 #[inline(never)]
-fn new_executor(runtime: &Arc<Runtime>) -> Box<Executor> {
+fn new_executor(runtime: &'static Runtime) -> Box<Executor> {
     arinsal_nif_zlib::set_scheduler_caller(crate::natives::nif::scheduler_caller);
     Box::new(Executor {
         current_process: Default::default(),
@@ -8269,7 +8268,7 @@ impl Process {
     /// Port of erts/emulator/beam/erl_process.c:14160 (erts_continue_exit_process), OTP-29.1.1.
     fn exit_with(
         &mut self,
-        runtime: &Arc<Runtime>,
+        runtime: &'static Runtime,
         ctx: &mut RunCtx<'_, Message>,
         data: &mut SchedulerData,
         reason: Term,
@@ -8294,7 +8293,7 @@ impl Process {
     /// reductions run out and finishes with `out_exited`.
     fn continue_exit(
         &mut self,
-        runtime: &Arc<Runtime>,
+        runtime: &'static Runtime,
         ctx: &mut RunCtx<'_, Message>,
         data: &mut SchedulerData,
         resumed: bool,
@@ -8349,7 +8348,7 @@ impl Process {
         if self.entry
             && let Some(result) = cont.entry_result
         {
-            let _ = runtime.result.send(result);
+            let _ = runtime.result.lock().unwrap().send(result);
         }
         RunOutcome::Exit(cont.code)
     }
@@ -8384,7 +8383,7 @@ impl Process {
             // Port of erts/emulator/beam/erl_process.c:10528 (in_exiting), OTP-29.1.1: an
             // exiting process only continues its exit when scheduled in.
             let runtime = self.runtime_handle();
-            return self.continue_exit(&runtime, ctx, data, true, *state);
+            return self.continue_exit(runtime, ctx, data, true, *state);
         }
         let result = self.run_executor(ctx, data, budget);
         if self.dirty_exiting() {
@@ -8398,12 +8397,8 @@ impl Process {
 
     /// The node runtime this process belongs to. A slice only needs a counted reference on
     /// the exit paths, so the scheduler takes it there, not on every turn.
-    fn runtime_handle(&self) -> Arc<Runtime> {
-        Arc::clone(
-            self.runtime
-                .as_ref()
-                .expect("a scheduled process has a runtime"),
-        )
+    fn runtime_handle(&self) -> &'static Runtime {
+        self.runtime.expect("a scheduled process has a runtime")
     }
 
     fn run_executor(
@@ -8428,7 +8423,7 @@ impl Process {
             Some(ref mut executor) => executor,
             None => {
                 let runtime = self.runtime_handle();
-                data.executor.insert(new_executor(&runtime))
+                data.executor.insert(new_executor(runtime))
             }
         };
         let mut result = executor.run(self, ctx, budget);
@@ -8489,7 +8484,7 @@ impl Process {
                 .then(|| Err(VmError::Unsupported("max_heap_size".into())));
             let runtime = self.runtime_handle();
             return self.exit_with(
-                &runtime,
+                runtime,
                 ctx,
                 data,
                 crate::signals::atom("killed"),
@@ -8577,7 +8572,7 @@ impl Process {
                 });
                 let runtime = self.runtime_handle();
                 self.exit_with(
-                    &runtime,
+                    runtime,
                     ctx,
                     data,
                     crate::signals::atom("normal"),
@@ -8603,7 +8598,7 @@ impl Process {
                 }
                 let entry_result = self.entry.then_some(Err(error));
                 let runtime = self.runtime_handle();
-                self.exit_with(&runtime, ctx, data, reason, entry_result, 1)
+                self.exit_with(runtime, ctx, data, reason, entry_result, 1)
             }
         }
     }
@@ -8613,7 +8608,7 @@ impl Vm {
     fn spawn_system_process(
         &mut self,
         scheduler: &Scheduler<Process>,
-        runtime: &Arc<Runtime>,
+        runtime: &'static Runtime,
         module: &str,
         function: &str,
     ) -> Result<Pid, VmError> {
@@ -8630,7 +8625,7 @@ impl Vm {
     fn spawn_system_process_priority(
         &mut self,
         scheduler: &Scheduler<Process>,
-        runtime: &Arc<Runtime>,
+        runtime: &'static Runtime,
         module: &str,
         function: &str,
         priority: arinsal_sched::Priority,
@@ -8643,7 +8638,7 @@ impl Vm {
         process.module = module_id;
         process.ip = ip;
         process.initial_call = Some((module_id, ip));
-        process.set_runtime(Some(Arc::clone(runtime)));
+        process.set_runtime(Some(runtime));
         process.initial_mfa = mfa_atoms(module, function, 0);
         if priority != arinsal_sched::Priority::Normal {
             let name = match priority {
@@ -8740,16 +8735,11 @@ impl Vm {
         if module != "erl_init" {
             initialize_feature_defaults(arinsal_pterm::store_for(self.code_scope))?;
         }
-        let child_setup = match &self.child_setup {
-            Some(child_setup) => Arc::clone(child_setup),
-            None => {
-                let child_setup = crate::child_setup::start().map_err(|error| {
-                    VmError::Load(format!("cannot start erl_child_setup: {error}"))
-                })?;
-                self.child_setup = Some(Arc::clone(&child_setup));
-                child_setup
-            }
-        };
+        if self.child_setup.is_none() {
+            self.child_setup = Some(crate::child_setup::start().map_err(|error| {
+                VmError::Load(format!("cannot start erl_child_setup: {error}"))
+            })?);
+        }
         let module_id = self.load_named(module)?;
         let ip = self.code.modules[module_id]
             .export(function, args.len() as u8)
@@ -8759,221 +8749,238 @@ impl Vm {
                 )))
             })?;
         let (sender, receiver) = mpsc::channel();
-        let code = Arc::clone(&self.code_ix);
-        let port_layout = arinsal_term::ptab::port_table_layout();
-        let port_ids = PtabIdRing::new(port_layout.max());
-        // erts creates its forker port first and keeps port id zero occupied.
-        assert_eq!(port_ids.reserve(), Some(0));
-        let named_ets = Arc::new(arinsal_ets::NamedTableIndex::new());
-        let runtime = Arc::new(Runtime {
-            statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
-            backtrace_depth: AtomicUsize::new(8),
-            code: Arc::clone(&code),
-            code_scope: self.code_scope,
-            system_processes: Mutex::new(std::collections::HashSet::new()),
-            otp_root: self.otp_root.clone(),
-            dirty_signal_handlers: Mutex::new(std::collections::HashSet::new()),
-            literal_collector: Mutex::new(None),
-            paths: self.paths.clone(),
-            scheduler: OnceLock::new(),
-            reg: crate::register::RegisterTable::new(),
-            aliases: AliasTable::new(),
-            next_trace_weak_id: AtomicU64::new(0),
-            ports: crate::port::PortTable::new(port_layout),
-            child_setup,
-            system_monitor: Mutex::new(None),
-            session_monitors: Mutex::new(Vec::new()),
-            system_monitor_flags: AtomicU8::new(0),
-            long_message_queues: Mutex::new(Vec::new()),
-            port_ids,
-            simulated: simulation_seed.is_some(),
-            virtual_ms: AtomicU64::new(0),
-            named_ets: Arc::clone(&named_ets),
-            ets: std::sync::RwLock::new(arinsal_ets::Registry::new_with_named_index(named_ets)),
-            result: sender,
-            code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
-            breakpoints: Arc::new(crate::trace_bp::BpNode::new(self.code_scope)),
-            debug_wait_active: AtomicBool::new(false),
-            system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
-            gc_defaults: crate::natives::sys::GcDefaults::boot(),
-            persistent_terms: arinsal_pterm::store_for(self.code_scope),
-            multi_scheduling: Mutex::new(MultiScheduling::default()),
-        });
-        let (dirty_cpu_schedulers, dirty_cpu_online, dirty_io_schedulers) =
-            crate::natives::sys::dirty_scheduler_defaults(&runtime);
-        let scheduler_options = arinsal_args::active_scheduler_options().0;
-        let config = Config {
-            workers,
-            reductions: reductions.max(1),
-            dirty_cpu_schedulers,
-            dirty_io_schedulers,
-            compact_load: scheduler_options.compact_load.unwrap_or(true),
-            utilization_balancing: scheduler_options.utilization_balancing.unwrap_or(false),
-            busy_wait_thresholds: scheduler_options.busy_wait,
-            wakeup_thresholds: scheduler_options.wakeup,
-            forced_wakeup_interval: scheduler_options.forced_wakeup_interval,
-            port_parallelism: scheduler_options.port_parallelism,
-            scheduler_bind_type: scheduler_options.bind_type,
-            max_processes: arinsal_term::ptab::process_table_layout().max(),
+        if let Some(runtime) = self.runtime
+            && runtime.simulated != simulation_seed.is_some()
+        {
+            return Err(VmError::Unsupported(
+                "a VM cannot change between real and simulated scheduling".into(),
+            ));
+        }
+        let runtime: &'static Runtime = if let Some(runtime) = self.runtime
+            && simulation_seed.is_none()
+        {
+            runtime
+        } else {
+            // A seeded scheduler run is an isolated simulation invocation: its seed and virtual
+            // process table belong to that run, as in the prior per-invocation scheduler scope.
+            if let Some(runtime) = self.runtime
+                && let Ok(scheduler) = runtime.scheduler()
+            {
+                scheduler.release();
+            }
+            let code = Arc::clone(&self.code_ix);
+            let port_layout = arinsal_term::ptab::port_table_layout();
+            let port_ids = PtabIdRing::new(port_layout.max());
+            // erts creates its forker port first and keeps port id zero occupied.
+            assert_eq!(port_ids.reserve(), Some(0));
+            let named_ets = Arc::new(arinsal_ets::NamedTableIndex::new());
+            let runtime: &'static Runtime = Box::leak(Box::new(Runtime {
+                statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
+                backtrace_depth: AtomicUsize::new(8),
+                code: Arc::clone(&code),
+                code_scope: self.code_scope,
+                system_processes: Mutex::new(std::collections::HashSet::new()),
+                otp_root: self.otp_root.clone(),
+                dirty_signal_handlers: Mutex::new(std::collections::HashSet::new()),
+                literal_collector: Mutex::new(None),
+                paths: self.paths.clone(),
+                scheduler: OnceLock::new(),
+                reg: crate::register::RegisterTable::new(),
+                aliases: AliasTable::new(),
+                next_trace_weak_id: AtomicU64::new(0),
+                ports: crate::port::PortTable::new(port_layout),
+                child_setup: Arc::clone(self.child_setup.as_ref().expect("child setup started")),
+                system_monitor: Mutex::new(None),
+                session_monitors: Mutex::new(Vec::new()),
+                system_monitor_flags: AtomicU8::new(0),
+                long_message_queues: Mutex::new(Vec::new()),
+                port_ids,
+                simulated: simulation_seed.is_some(),
+                virtual_ms: AtomicU64::new(0),
+                named_ets: Arc::clone(&named_ets),
+                ets: std::sync::RwLock::new(arinsal_ets::Registry::new_with_named_index(named_ets)),
+                result: Mutex::new(sender.clone()),
+                code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
+                breakpoints: Arc::new(crate::trace_bp::BpNode::new(self.code_scope)),
+                debug_wait_active: AtomicBool::new(false),
+                system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
+                gc_defaults: crate::natives::sys::GcDefaults::boot(),
+                persistent_terms: arinsal_pterm::store_for(self.code_scope),
+                multi_scheduling: Mutex::new(MultiScheduling::default()),
+            }));
+            self.runtime = Some(runtime);
+            runtime
         };
-        // `erts_no_schedulers` is what `system_info(schedulers)` reports; a run with fewer
-        // worker threads than that keeps the layout of the reported scheduler count.
-        arinsal_bifs::init_unique_scheduler_count(
-            config.workers.max(crate::natives::sys::schedulers_total()) as u32,
-            config.dirty_cpu_schedulers as u32,
-            config.dirty_io_schedulers as u32,
-        );
-        // Port of erts/emulator/beam/erl_cpu_topology.c:1705-1708 (max_main_threads) and
-        // ethr_mutex.c:151-166 (ethr_mutex_lib_late_init): the table locks' spin count grows with
-        // the number of main threads, the schedulers on configured CPUs.
-        arinsal_ets::rwmtx::set_main_threads(
-            config
-                .workers
-                .min(arinsal_alloc::cpuinfo::cpu_info().configured.max(1)),
-        );
-        let scheduler = Arc::new(match simulation_seed {
-            Some(seed) => Scheduler::simulation(config, seed),
-            None => Scheduler::new(config),
-        });
-        // The runtime owns the scheduler for the VM lifetime; stopping it here releases the
-        // processes' runtime references so the cycle is freed.
-        let _scheduler_shutdown = SchedulerShutdown(Arc::clone(&scheduler));
-        let online = crate::natives::sys::scheduler_online_default(&runtime);
-        let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
-        let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
-        runtime
-            .scheduler
-            .set(Arc::clone(&scheduler))
-            .map_err(|_| VmError::Unsupported("runtime scheduler already set".into()))?;
-        if module == "erl_init" && function == "start" && simulation_seed.is_none() {
-            crate::natives::env::install_boot_signals(&runtime)?;
+        *runtime.result.lock().unwrap() = sender;
+        if runtime.simulated != simulation_seed.is_some() {
+            return Err(VmError::Unsupported(
+                "a VM cannot change between real and simulated scheduling".into(),
+            ));
         }
-        let mut process = Process::with_spawn_registers(args.len(), 0);
-        process.module = module_id;
-        process.ip = ip;
-        // Port of erts/emulator/beam/erl_process.c (erl_create_process: copy_struct of the
-        // arguments into the new heap), OTP-29.1.1: the first process owns its arguments, so
-        // a collection never meets a term outside its heap and the literal areas.
-        let literals = arinsal_term::LiteralAreas::current();
-        for (register, &arg) in process.x.iter_mut().zip(args) {
-            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-            *register = arinsal_term::copy_term_litopt(arg, &mut heap, &literals)
-                .map_err(|error| VmError::Load(format!("first process arguments: {error:?}")))?;
-        }
-        process.set_runtime(Some(runtime.clone()));
-        process.initial_mfa = mfa_atoms(module, function, args.len() as u8);
-        process.entry = true;
-        // Port of erts/emulator/beam/beam_bif_load.c:793 (call_on_load_function_1), OTP-29.1.1.
-        // A direct `eval_scheduled` has no `code_server` to run `-on_load` before the call.
-        // The entry process runs that function first and continues only when it returns `ok`.
-        self.arm_entry_on_load(&mut process, module_id, ip, args.len())?;
-        // Port of erts/emulator/beam/erl_init.c:2540 (erl_first_process_otp), OTP-29.1.1:
-        // the first process gets the first pid; it runs once the system processes
-        // exist, as erts starts its schedulers only after spawning them.
-        let entry_pid: Pid = scheduler
-            .spawn_unscheduled(process)
-            .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-        if module == "erl_init" && function == "start" {
-            // Port of erts/emulator/beam/erl_init.c:2550 (erl_system_process_otp
-            // "erts_code_purger"), OTP-29.1.1. code_server:finish_on_load sends
-            // to this registered process; without it the send is badarg and
-            // code_server dies during ensure_loaded of an on_load module.
-            self.spawn_system_process_priority(
-                &scheduler,
-                &runtime,
-                "erts_code_purger",
-                "start",
-                arinsal_sched::Priority::High,
-            )?;
-        }
-        // Port of erts/emulator/beam/erl_init.c system-process startup: every
-        // runtime needs the preloaded owner of the literal-area release protocol.
-        let literal_collector = self.spawn_system_process_priority(
-            &scheduler,
-            &runtime,
-            "erts_literal_area_collector",
-            "start",
-            arinsal_sched::Priority::High,
-        )?;
-        // erl 29.1.1 does not register the collector; it is found by initial_call.
-        *runtime.literal_collector.lock().unwrap() = Some(literal_collector);
-        // Port of erts/emulator/beam/erl_init.c:2570-2597, OTP-29.1.1: normal, high and max
-        // priority dirty signal handlers exist even without dirty schedulers.
-        let mut handlers = Vec::with_capacity(3);
-        for priority in [
-            arinsal_sched::Priority::Normal,
-            arinsal_sched::Priority::High,
-            arinsal_sched::Priority::Max,
-        ] {
-            let pid = self.spawn_system_process_priority(
-                &scheduler,
-                &runtime,
-                "erts_dirty_process_signal_handler",
-                "start",
-                priority,
-            )?;
-            runtime.dirty_signal_handlers.lock().unwrap().insert(pid);
-            handlers.push(pid);
-        }
-        scheduler.set_dirty_signal_handlers(handlers[0], handlers[1], handlers[2], |pid| {
-            pid.to_term().and_then(|term| Message::copy_from(term).ok())
-        });
-        // Port of erts/emulator/beam/erl_init.c:2599 (erl_system_process_otp
-        // "erts_trace_cleaner"), OTP-29.1.1.
-        self.spawn_system_process(&scheduler, &runtime, "erts_trace_cleaner", "start")?;
-        scheduler
-            .schedule_unscheduled(entry_pid)
-            .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-        if simulation_seed.is_some() {
-            loop {
-                if let Ok(result) = receiver.try_recv() {
-                    while arinsal_pterm::store_for(self.code_scope).has_retired() {
-                        if !scheduler.step() {
-                            let now = runtime.virtual_ms.fetch_add(1, Ordering::Relaxed) + 1;
-                            scheduler.advance_ms(1).map_err(|error| {
-                                VmError::Unsupported(format!("simulation clock: {error}"))
-                            })?;
-                            if now > 60_000 {
-                                return Err(VmError::Unsupported(
+        let first_runtime = runtime.scheduler.get().is_none();
+        (|| -> Result<ScheduledResult, VmError> {
+            if first_runtime {
+                let (dirty_cpu_schedulers, dirty_cpu_online, dirty_io_schedulers) =
+                    crate::natives::sys::dirty_scheduler_defaults(runtime);
+                let scheduler_options = arinsal_args::active_scheduler_options().0;
+                let config = Config {
+                    workers,
+                    reductions: reductions.max(1),
+                    dirty_cpu_schedulers,
+                    dirty_io_schedulers,
+                    compact_load: scheduler_options.compact_load.unwrap_or(true),
+                    utilization_balancing: scheduler_options.utilization_balancing.unwrap_or(false),
+                    busy_wait_thresholds: scheduler_options.busy_wait,
+                    wakeup_thresholds: scheduler_options.wakeup,
+                    forced_wakeup_interval: scheduler_options.forced_wakeup_interval,
+                    port_parallelism: scheduler_options.port_parallelism,
+                    scheduler_bind_type: scheduler_options.bind_type,
+                    max_processes: arinsal_term::ptab::process_table_layout().max(),
+                };
+                // `erts_no_schedulers` is what `system_info(schedulers)` reports; a run with fewer
+                // worker threads than that keeps the layout of the reported scheduler count.
+                arinsal_bifs::init_unique_scheduler_count(
+                    config.workers.max(crate::natives::sys::schedulers_total()) as u32,
+                    config.dirty_cpu_schedulers as u32,
+                    config.dirty_io_schedulers as u32,
+                );
+                // Port of erts/emulator/beam/erl_cpu_topology.c:1705-1708 (max_main_threads) and
+                // ethr_mutex.c:151-166 (ethr_mutex_lib_late_init): the table locks' spin count grows with
+                // the number of main threads, the schedulers on configured CPUs.
+                arinsal_ets::rwmtx::set_main_threads(
+                    config
+                        .workers
+                        .min(arinsal_alloc::cpuinfo::cpu_info().configured.max(1)),
+                );
+                let scheduler = Arc::new(match simulation_seed {
+                    Some(seed) => Scheduler::simulation(config, seed),
+                    None => Scheduler::new(config),
+                });
+                let online = crate::natives::sys::scheduler_online_default(runtime);
+                let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
+                let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
+                runtime
+                    .scheduler
+                    .set(scheduler)
+                    .map_err(|_| VmError::Unsupported("runtime scheduler already set".into()))?;
+                if module == "erl_init" && function == "start" && simulation_seed.is_none() {
+                    crate::natives::env::install_boot_signals(runtime)?;
+                }
+            }
+            let scheduler = runtime.scheduler()?;
+            let mut process = Process::with_spawn_registers(args.len(), 0);
+            process.module = module_id;
+            process.ip = ip;
+            // Port of erts/emulator/beam/erl_process.c (erl_create_process: copy_struct of the
+            // arguments into the new heap), OTP-29.1.1: the first process owns its arguments, so
+            // a collection never meets a term outside its heap and the literal areas.
+            let literals = arinsal_term::LiteralAreas::current();
+            for (register, &arg) in process.x.iter_mut().zip(args) {
+                let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+                *register =
+                    arinsal_term::copy_term_litopt(arg, &mut heap, &literals).map_err(|error| {
+                        VmError::Load(format!("first process arguments: {error:?}"))
+                    })?;
+            }
+            process.set_runtime(Some(runtime));
+            process.initial_mfa = mfa_atoms(module, function, args.len() as u8);
+            process.entry = true;
+            // Port of erts/emulator/beam/beam_bif_load.c:793 (call_on_load_function_1), OTP-29.1.1.
+            // A direct `eval_scheduled` has no `code_server` to run `-on_load` before the call.
+            // The entry process runs that function first and continues only when it returns `ok`.
+            self.arm_entry_on_load(&mut process, module_id, ip, args.len())?;
+            // Port of erts/emulator/beam/erl_init.c:2540 (erl_first_process_otp), OTP-29.1.1:
+            // the first process gets the first pid; it runs once the system processes
+            // exist, as erts starts its schedulers only after spawning them.
+            let entry_pid: Pid = scheduler
+                .spawn_unscheduled(process)
+                .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
+            // Port of erts/emulator/beam/erl_init.c system-process startup: every
+            // VM needs the preloaded owner of the literal-area release protocol.
+            if first_runtime {
+                if module == "erl_init" && function == "start" {
+                    // Port of erts/emulator/beam/erl_process.c:12525-12531 (erl_create_process), OTP-29.1.1.
+                    self.spawn_system_process_priority(
+                        scheduler,
+                        runtime,
+                        "erts_code_purger",
+                        "start",
+                        arinsal_sched::Priority::High,
+                    )?;
+                }
+                let literal_collector = self.spawn_system_process_priority(
+                    scheduler,
+                    runtime,
+                    "erts_literal_area_collector",
+                    "start",
+                    arinsal_sched::Priority::High,
+                )?;
+                *runtime.literal_collector.lock().unwrap() = Some(literal_collector);
+                let mut handlers = Vec::with_capacity(3);
+                for priority in [
+                    arinsal_sched::Priority::Normal,
+                    arinsal_sched::Priority::High,
+                    arinsal_sched::Priority::Max,
+                ] {
+                    let pid = self.spawn_system_process_priority(
+                        scheduler,
+                        runtime,
+                        "erts_dirty_process_signal_handler",
+                        "start",
+                        priority,
+                    )?;
+                    runtime.dirty_signal_handlers.lock().unwrap().insert(pid);
+                    handlers.push(pid);
+                }
+                scheduler.set_dirty_signal_handlers(handlers[0], handlers[1], handlers[2], |pid| {
+                    pid.to_term().and_then(|term| Message::copy_from(term).ok())
+                });
+                self.spawn_system_process(scheduler, runtime, "erts_trace_cleaner", "start")?;
+            }
+            scheduler
+                .schedule_unscheduled(entry_pid)
+                .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
+            if simulation_seed.is_some() {
+                loop {
+                    if let Ok(result) = receiver.try_recv() {
+                        while arinsal_pterm::store_for(self.code_scope).has_retired() {
+                            if !scheduler.step() {
+                                let now = runtime.virtual_ms.fetch_add(1, Ordering::Relaxed) + 1;
+                                scheduler.advance_ms(1).map_err(|error| {
+                                    VmError::Unsupported(format!("simulation clock: {error}"))
+                                })?;
+                                if now > 60_000 {
+                                    return Err(VmError::Unsupported(
                                     "literal collector did not finish before simulation timeout"
                                         .into(),
                                 ));
+                                }
                             }
                         }
+                        return result;
                     }
-                    return result;
-                }
-                if !scheduler.step() {
-                    let now = runtime.virtual_ms.fetch_add(1, Ordering::Relaxed) + 1;
-                    scheduler.advance_ms(1).map_err(|error| {
-                        VmError::Unsupported(format!("simulation clock: {error}"))
-                    })?;
-                    if now > 60_000 {
-                        return Err(VmError::Unsupported(
-                            "simulation has no runnable process or timer".into(),
-                        ));
+                    if !scheduler.step() {
+                        let now = runtime.virtual_ms.fetch_add(1, Ordering::Relaxed) + 1;
+                        scheduler.advance_ms(1).map_err(|error| {
+                            VmError::Unsupported(format!("simulation clock: {error}"))
+                        })?;
+                        if now > 60_000 {
+                            return Err(VmError::Unsupported(
+                                "simulation has no runnable process or timer".into(),
+                            ));
+                        }
                     }
                 }
             }
-        }
-        let result = receiver
-            .recv()
-            .map_err(|_| VmError::Unsupported("entry process disappeared".into()))?;
-        while arinsal_pterm::store_for(self.code_scope).has_retired() {
-            std::thread::park_timeout(std::time::Duration::from_millis(1));
-        }
-        drop(code);
-        self.refresh_code();
-        result
-    }
-}
-
-/// Stops the scheduler when the VM run ends, on every exit path.
-struct SchedulerShutdown(Arc<Scheduler<Process>>);
-
-impl Drop for SchedulerShutdown {
-    fn drop(&mut self) {
-        self.0.release();
+            let result = receiver
+                .recv()
+                .map_err(|_| VmError::Unsupported("entry process disappeared".into()))?;
+            while arinsal_pterm::store_for(self.code_scope).has_retired() {
+                std::thread::park_timeout(std::time::Duration::from_millis(1));
+            }
+            self.refresh_code();
+            result
+        })()
     }
 }
 

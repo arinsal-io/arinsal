@@ -356,10 +356,10 @@ pub(crate) fn activate(process: &mut Process, pid: Pid, origin: Pid, shared: Sha
     cold.suspended_by.insert(origin, monitor);
     cold.suspend_count += 1;
     let first = cold.suspend_count == 1;
-    let runtime = process.runtime.clone();
+    let runtime = process.runtime;
     if let Some(runtime) = runtime {
         if first {
-            mirror_bit(&runtime, pid, true);
+            mirror_bit(runtime, pid, true);
         }
         runtime.erts_pause_proc_timer(process, pid);
     }
@@ -382,10 +382,10 @@ pub(crate) fn release(process: &mut Process, pid: Pid, origin: Pid, shared: Shar
     monitor.set_active(false);
     cold.suspend_count = cold.suspend_count.saturating_sub(1);
     let last = cold.suspend_count == 0;
-    let runtime = process.runtime.clone();
+    let runtime = process.runtime;
     if let Some(runtime) = runtime {
         if last {
-            mirror_bit(&runtime, pid, false);
+            mirror_bit(runtime, pid, false);
         }
         runtime.erts_resume_proc_timer(process, pid);
     }
@@ -397,8 +397,8 @@ pub(crate) fn suspend_self(process: &mut Process) {
     let cold = process.cold_mut();
     cold.suspend_count += 1;
     let first = cold.suspend_count == 1;
-    if let (Some(runtime), Some(pid), true) = (process.runtime.clone(), process.self_pid, first) {
-        mirror_bit(&runtime, pid, true);
+    if let (Some(runtime), Some(pid), true) = (process.runtime, process.self_pid, first) {
+        mirror_bit(runtime, pid, true);
     }
 }
 
@@ -417,12 +417,8 @@ pub(crate) fn resume_self(process: &mut Process) {
         return;
     }
     cold.suspend_count -= 1;
-    if let (0, Some(runtime), Some(pid)) = (
-        cold.suspend_count,
-        process.runtime.clone(),
-        process.self_pid,
-    ) {
-        mirror_bit(&runtime, pid, false);
+    if let (0, Some(runtime), Some(pid)) = (cold.suspend_count, process.runtime, process.self_pid) {
+        mirror_bit(runtime, pid, false);
     }
 }
 

@@ -364,7 +364,7 @@ pub(crate) struct PortHandle {
     /// from `rfile_start` until `rfile_stop`.
     drv_data: Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     /// Driver-owned state returned by the inet driver's start callback.
-    runtime: OnceLock<Weak<crate::process::Runtime>>,
+    runtime: OnceLock<&'static crate::process::Runtime>,
 }
 
 /// Inspect or move the next local port id for `erts_debug` table tests.
@@ -582,8 +582,8 @@ impl PortHandle {
     }
 
     /// The runtime this port belongs to.
-    pub(crate) fn runtime(&self) -> Option<Arc<crate::process::Runtime>> {
-        self.runtime.get()?.upgrade()
+    pub(crate) fn runtime(&self) -> Option<&'static crate::process::Runtime> {
+        self.runtime.get().copied()
     }
 
     /// The driver port of a port made by a driver (everything but ram_file and spawn ports).
@@ -1561,14 +1561,14 @@ fn start(
         parallelism,
         limits,
         Arc::clone(&scheduler),
-        Arc::as_ptr(runtime) as usize,
+        *runtime as *const crate::process::Runtime as usize,
     )?;
     runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     let owner = ctx.pid();
-    let runtime_weak = Arc::downgrade(runtime);
+    let runtime_ref = *runtime;
     std::thread::Builder::new()
         .name(format!("arinsal-port-{port_id}"))
         .spawn(move || {
@@ -1577,7 +1577,7 @@ fn start(
                 child_status,
                 read_fd,
                 scheduler,
-                runtime_weak,
+                runtime_ref,
                 owner,
                 port_id,
                 binary,
@@ -1629,7 +1629,7 @@ fn start_driver(
         name,
         false,
         scheduler,
-        Arc::as_ptr(runtime) as usize,
+        *runtime as *const crate::process::Runtime as usize,
     )?;
     runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
@@ -1663,10 +1663,10 @@ fn start_dyn_driver(
     name: String,
     io: DriverIoFlags,
 ) -> Result<Term, VmError> {
-    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
     install_hooks();
-    let reservation = reserve_port_id(&runtime)?;
+    let reservation = reserve_port_id(runtime)?;
     let port_id = reservation.id();
     let port = Term::port(port_id).ok_or_else(badarg)?;
     let handle = make_driver_handle(
@@ -1675,17 +1675,17 @@ fn start_dyn_driver(
         name.clone(),
         io.parallelism,
         Arc::clone(scheduler),
-        Arc::as_ptr(&runtime) as usize,
+        runtime as *const crate::process::Runtime as usize,
     )?;
     install_poll_backend();
     let host = DrvHost {
-        runtime: Arc::downgrade(&runtime),
+        runtime,
         own: Arc::downgrade(&handle),
     };
     let drv_port = arinsal_drv::DriverPort::new(Arc::clone(&driver), port_id, Box::new(host));
     drv_port.init_run_queue(scheduler.current_run_queue());
     let _ = handle.driver.set(Arc::clone(&drv_port));
-    let _ = handle.runtime.set(Arc::downgrade(&runtime));
+    let _ = handle.runtime.set(runtime);
     if let Some(handle_id) = handle_id {
         crate::ddll::port_opened(handle_id, &drv_port);
     }
@@ -1704,16 +1704,16 @@ fn start_dyn_driver(
         if driver.name() == "udp_inet" {
             crate::inet_udp::attach(&handle, &drv_port);
         } else {
-            crate::inet_drv::attach(&runtime, &handle, &drv_port);
+            crate::inet_drv::attach(runtime, &handle, &drv_port);
         }
     }
     runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
-    crate::trace::port_opened(&runtime, port_id);
+    crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     let caller = packed_pid(ctx.pid());
     if let Err(error) = drv_port.start(&name, caller) {
-        remove_port(&runtime, port_id);
+        remove_port(runtime, port_id);
         drv_port.abandon();
         release_io(&handle);
         if handle_id.is_some() {
@@ -1729,14 +1729,14 @@ fn start_dyn_driver(
     drv_port.set_io_flags(io.binary, io.eof, io.line);
     if let Some(caller) = ctx.pid().to_term() {
         crate::trace::emit_port_event(
-            &runtime,
+            runtime,
             port_id,
             crate::trace::PORTS,
             "open",
             &[caller, atom(&name)],
         );
         crate::trace::emit_port_event(
-            &runtime,
+            runtime,
             port_id,
             crate::trace::PORTS,
             "getting_linked",
@@ -1764,7 +1764,7 @@ fn packed_pid(pid: Pid) -> u64 {
 
 /// `PortHost` for a dynamically loaded driver port.
 struct DrvHost {
-    runtime: Weak<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     /// The port itself: `stop` still delivers output after the port left the table
     /// (io.c:3698 terminate_port runs after erts_deliver_port_exit unlinked it).
     own: Weak<PortHandle>,
@@ -1772,11 +1772,7 @@ struct DrvHost {
 
 impl DrvHost {
     fn handle(&self, id: u64) -> Option<Arc<PortHandle>> {
-        self.runtime
-            .upgrade()?
-            .ports
-            .get(id)
-            .or_else(|| self.own.upgrade())
+        self.runtime.ports.get(id).or_else(|| self.own.upgrade())
     }
 }
 
@@ -1791,12 +1787,10 @@ impl arinsal_drv::PortHost for DrvHost {
         if !crate::trace::tracing_enabled() {
             return;
         }
-        let Some(runtime) = self.runtime.upgrade() else {
-            return;
-        };
+        let runtime = self.runtime;
         let where_term = where_.map_or_else(|| Term::small(0).unwrap(), crate::signals::atom);
         crate::trace::emit_port_event(
-            &runtime,
+            runtime,
             port.id(),
             crate::trace::RUNNING_PORTS,
             if scheduled_in { "in" } else { "out" },
@@ -1805,10 +1799,8 @@ impl arinsal_drv::PortHost for DrvHost {
     }
 
     fn task_done(&self, port: &arinsal_drv::DriverPort, op: &str, elapsed_ns: u64) {
-        let Some(runtime) = self.runtime.upgrade() else {
-            return;
-        };
-        if !crate::natives::erts_debug::runtime_long_schedule_monitored(&runtime) {
+        let runtime = self.runtime;
+        if !crate::natives::erts_debug::runtime_long_schedule_monitored(runtime) {
             return;
         }
         let Some(handle) = runtime.ports.get(port.id()) else {
@@ -1816,7 +1808,7 @@ impl arinsal_drv::PortHost for DrvHost {
         };
         if let Some(term) = Term::port(port.id()) {
             crate::natives::erts_debug::after_port_task(
-                &runtime,
+                runtime,
                 term,
                 handle.owner_pid(),
                 op,
@@ -1886,10 +1878,7 @@ impl arinsal_drv::PortHost for DrvHost {
     }
 
     fn exit(&self, port: &arinsal_drv::DriverPort, reason: arinsal_drv::ExitReason) {
-        let Some(runtime) = self.runtime.upgrade() else {
-            port.terminate();
-            return;
-        };
+        let runtime = self.runtime;
         let reason = match reason {
             arinsal_drv::ExitReason::Normal => atom("normal"),
             arinsal_drv::ExitReason::Code(code) => {
@@ -1897,7 +1886,7 @@ impl arinsal_drv::PortHost for DrvHost {
             }
             arinsal_drv::ExitReason::Atom(name) => atom(&name),
         };
-        driver_port_exit(&runtime, port.id(), reason);
+        driver_port_exit(runtime, port.id(), reason);
     }
 
     fn unlink_connected(&self, port: &arinsal_drv::DriverPort) {
@@ -1910,10 +1899,7 @@ impl arinsal_drv::PortHost for DrvHost {
     // Port of erts/emulator/beam/utils.c:802 (do_send_logger_message) for
     // erts_send_error_to_logger_nogl: an `error_msg` event to the logger process.
     fn log_error(&self, text: &str) {
-        let Some(runtime) = self.runtime.upgrade() else {
-            eprint!("{text}");
-            return;
-        };
+        let runtime = self.runtime;
         let logger = runtime
             .reg
             .whereis_proc_str("logger")
@@ -1958,9 +1944,7 @@ impl arinsal_drv::PortHost for DrvHost {
     }
 
     fn ddll_dereference(&self, port: &arinsal_drv::DriverPort) {
-        if let Some(runtime) = self.runtime.upgrade()
-            && let Ok(scheduler) = runtime.scheduler()
-        {
+        if let Ok(scheduler) = self.runtime.scheduler() {
             crate::ddll::dereference_referenced(scheduler, port.driver());
         }
     }
@@ -2067,12 +2051,10 @@ impl arinsal_drv::PortHost for DrvHost {
     }
 
     fn trace_timeout(&self, port: &arinsal_drv::DriverPort) {
-        let Some(runtime) = self.runtime.upgrade() else {
-            return;
-        };
+        let runtime = self.runtime;
         // Port of erts/emulator/beam/erl_port_task.c:1770, OTP-29.1.1.
         crate::trace::emit_port_event(
-            &runtime,
+            runtime,
             port.id(),
             crate::trace::RECEIVE,
             "receive",
@@ -2111,9 +2093,8 @@ impl arinsal_drv::PortHost for DrvHost {
 
     // Port of erts/emulator/beam/erl_process.c:9413 (erts_resume_processes), OTP-29.1.1.
     fn schedule_async_ready(&self, sched_id: usize, ready: Box<dyn FnOnce() + Send>) {
-        let runtime = self.runtime.upgrade();
-        match runtime.as_ref().map(|runtime| runtime.scheduler()) {
-            Some(Ok(scheduler)) => scheduler.request_aux_work(sched_id, ready),
+        match self.runtime.scheduler() {
+            Ok(scheduler) => scheduler.request_aux_work(sched_id, ready),
             // Without schedulers the job is completed here so its data is released.
             _ => ready(),
         }
@@ -2121,7 +2102,7 @@ impl arinsal_drv::PortHost for DrvHost {
 
     // Port of erts/emulator/beam/erl_hl_timer.c:3031 (erts_set_port_timer), OTP-29.1.1.
     fn start_port_timer(&self, ms: u64, expired: Box<dyn FnOnce() + Send>) -> Option<u64> {
-        let runtime = self.runtime.upgrade()?;
+        let runtime = self.runtime;
         runtime
             .scheduler()
             .ok()?
@@ -2132,25 +2113,20 @@ impl arinsal_drv::PortHost for DrvHost {
 
     // Port of erts/emulator/beam/erl_hl_timer.c:3063 (erts_cancel_port_timer), OTP-29.1.1.
     fn cancel_port_timer(&self, handle: u64) {
-        let runtime = self.runtime.upgrade();
-        if let Some(Ok(scheduler)) = runtime.as_ref().map(|runtime| runtime.scheduler()) {
+        if let Ok(scheduler) = self.runtime.scheduler() {
             scheduler.cancel_port_timer(arinsal_sched::TimerRef::from_bits(handle));
         }
     }
 
     fn enqueue_port(&self, port: Arc<arinsal_drv::DriverPort>) {
-        let Some(runtime) = self.runtime.upgrade() else {
-            return;
-        };
+        let runtime = self.runtime;
         if let Ok(scheduler) = runtime.scheduler() {
             scheduler.enqueue_port(port);
         }
     }
 
     fn resume_processes(&self, _port: &arinsal_drv::DriverPort, pids: Vec<u64>) {
-        let Some(runtime) = self.runtime.upgrade() else {
-            return;
-        };
+        let runtime = self.runtime;
         let Ok(scheduler) = runtime.scheduler() else {
             return;
         };
@@ -2172,9 +2148,9 @@ impl arinsal_drv::PortHost for DrvHost {
             return false;
         }
         handle.drv_monitors.lock().insert(monitor, target);
-        if let Some(runtime) = self.runtime.upgrade() {
-            let _ = runtime.publish_proc_flag(target, arinsal_sched::proc_flags::PORTS);
-        }
+        let _ = self
+            .runtime
+            .publish_proc_flag(target, arinsal_sched::proc_flags::PORTS);
         true
     }
 
@@ -2232,13 +2208,13 @@ impl arinsal_drv::PortHost for DrvHost {
         name: &str,
         drv_data: usize,
     ) -> Option<Arc<arinsal_drv::DriverPort>> {
-        let runtime = self.runtime.upgrade()?;
+        let runtime = self.runtime;
         let scheduler = runtime.scheduler().ok()?;
         let owner = Pid::from_data(owner);
         if !scheduler.lookup(owner) {
             return None;
         }
-        let reservation = reserve_port_id(&runtime).ok()?;
+        let reservation = reserve_port_id(runtime).ok()?;
         let port_id = reservation.id();
         let handle = make_driver_handle(
             port_id,
@@ -2246,7 +2222,7 @@ impl arinsal_drv::PortHost for DrvHost {
             name.to_owned(),
             false,
             Arc::clone(scheduler),
-            Arc::as_ptr(&runtime) as usize,
+            runtime as *const crate::process::Runtime as usize,
         )
         .ok()?;
         let driver = Arc::clone(creator.driver());
@@ -2254,7 +2230,7 @@ impl arinsal_drv::PortHost for DrvHost {
             Arc::clone(&driver),
             port_id,
             Box::new(DrvHost {
-                runtime: self.runtime.clone(),
+                runtime: self.runtime,
                 own: Arc::downgrade(&handle),
             }),
         );
@@ -2266,7 +2242,7 @@ impl arinsal_drv::PortHost for DrvHost {
         // The owner has a port in its link list (erl_process.c:14084). Exit scans the
         // port table only when that list is non-NULL.
         let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
-        crate::trace::port_opened(&runtime, port_id);
+        crate::trace::port_opened(runtime, port_id);
         reservation.commit();
         Some(drv_port)
     }
@@ -2403,10 +2379,10 @@ pub(crate) fn install_poll_backend() {
 }
 
 /// `erts_send_error_to_logger_nogl` for `runtime`.
-pub(crate) fn log_error_for(runtime: &Weak<crate::process::Runtime>, text: &str) {
+pub(crate) fn log_error_for(runtime: &'static crate::process::Runtime, text: &str) {
     arinsal_drv::PortHost::log_error(
         &DrvHost {
-            runtime: runtime.clone(),
+            runtime,
             own: Weak::new(),
         },
         text,
@@ -2487,7 +2463,7 @@ pub(crate) enum InetPortAllocError {
 /// a port of the creator's driver owned by (and linked to) `owner`, on the run queue of
 /// the creating scheduler. `attach` installs the driver state before the port is visible.
 pub(crate) fn alloc_inet_port(
-    runtime: &Arc<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     owner: Pid,
     name: String,
     driver: Arc<arinsal_drv::Driver>,
@@ -2504,20 +2480,20 @@ pub(crate) fn alloc_inet_port(
         name,
         false,
         Arc::clone(scheduler),
-        Arc::as_ptr(runtime) as usize,
+        runtime as *const crate::process::Runtime as usize,
     )
     .map_err(|_| InetPortAllocError::NoMemory)?;
     let drv_port = arinsal_drv::DriverPort::new(
         driver,
         port_id,
         Box::new(DrvHost {
-            runtime: Arc::downgrade(runtime),
+            runtime,
             own: Arc::downgrade(&handle),
         }),
     );
     drv_port.init_run_queue(scheduler.current_run_queue());
     let _ = handle.driver.set(Arc::clone(&drv_port));
-    let _ = handle.runtime.set(Arc::downgrade(runtime));
+    let _ = handle.runtime.set(runtime);
     attach(&handle, &drv_port);
     runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
@@ -2832,7 +2808,7 @@ fn start_fd(
         opts.parallelism,
         opts.limits,
         Arc::clone(&scheduler),
-        Arc::as_ptr(runtime) as usize,
+        *runtime as *const crate::process::Runtime as usize,
     )?;
     runtime.ports.insert(id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
@@ -2840,7 +2816,7 @@ fn start_fd(
     reservation.commit();
     let owner = ctx.pid();
     let read_fd = reader.into_raw_fd();
-    let runtime_weak = Arc::downgrade(runtime);
+    let runtime_ref = *runtime;
     let binary = opts.binary;
     let framing = opts.framing;
     let want_eof = opts.eof;
@@ -2852,7 +2828,7 @@ fn start_fd(
                 None,
                 Some(read_fd),
                 scheduler,
-                runtime_weak,
+                runtime_ref,
                 owner,
                 id,
                 binary,
@@ -2949,7 +2925,7 @@ fn suspend_on_busy(
     drv: &arinsal_drv::DriverPort,
     pid: Pid,
 ) -> bool {
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         return false;
     };
     // Suspended before it is queued on the port, so a resume racing with this cannot be lost.
@@ -3211,7 +3187,7 @@ fn worker(
     child_status: Option<Receiver<i64>>,
     read_fd: Option<RawFd>,
     scheduler: Arc<Scheduler<Process>>,
-    runtime: Weak<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     owner: Pid,
     id: u64,
     binary: bool,
@@ -3407,7 +3383,7 @@ fn worker(
         drop(st);
     }
     if eof_terminate && !handle.state.lock().closed {
-        eof_exit(&handle, &scheduler, &runtime, owner, id, read_fd);
+        eof_exit(&handle, &scheduler, runtime, owner, id, read_fd);
         return;
     }
     let woken = flush_output(&handle);
@@ -3453,22 +3429,22 @@ fn close_worker_fds(read_fd: Option<RawFd>) {
 fn eof_exit(
     handle: &PortHandle,
     scheduler: &Scheduler<Process>,
-    runtime: &Weak<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     owner: Pid,
     id: u64,
     read_fd: Option<RawFd>,
 ) {
-    if let Some(runtime) = runtime.upgrade() {
+    {
         let listed = runtime.ports.contains(id);
         if listed {
             crate::trace::emit_port_event(
-                &runtime,
+                runtime,
                 id,
                 crate::trace::PORTS,
                 "closed",
                 &[atom("normal")],
             );
-            remove_port(&runtime, id);
+            remove_port(runtime, id);
         }
     }
     let woken = {
@@ -4370,7 +4346,7 @@ pub(crate) fn exit_port(
 /// Reap every live port during an orderly halt, leaving `heart_port` alive.
 ///
 /// Port of erts/emulator/beam/erl_process.c:2537-2581 (`handle_reap_ports`), OTP-29.1.1.
-pub(crate) fn halt_reap_ports(runtime: &Arc<crate::process::Runtime>, progress: HaltProgress) {
+pub(crate) fn halt_reap_ports(runtime: &'static crate::process::Runtime, progress: HaltProgress) {
     let heart = global_atoms().intern("heart_port").ok();
     let ports: Vec<_> = runtime.ports.handles();
     for handle in ports {
@@ -4380,7 +4356,7 @@ pub(crate) fn halt_reap_ports(runtime: &Arc<crate::process::Runtime>, progress: 
         handle.track_halt(progress.clone());
         if handle.driver.get().is_some() {
             drv_sig::exit_for_halt(
-                Arc::clone(runtime),
+                runtime,
                 Arc::clone(&handle),
                 handle.owner_pid(),
                 OwnedTerm::Atom("killed".into()),
@@ -4474,7 +4450,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
 ///
 /// Port of erts/emulator/beam/erl_process.c:14068 (erts_proc_exit_handle_link), OTP-29.1.1.
 pub(crate) fn owner_exit(
-    runtime: &Arc<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     scheduler: &Scheduler<Process>,
     owner: Pid,
     reason: Term,
@@ -4536,7 +4512,7 @@ pub(crate) fn owner_exit(
     for (port_id, handle) in affected {
         if handle.driver.get().is_some() {
             let exit_reason = to_owned(reason).unwrap_or_else(|_| OwnedTerm::Atom("normal".into()));
-            drv_sig::exit_for_process_termination(Arc::clone(runtime), handle, owner, exit_reason);
+            drv_sig::exit_for_process_termination(runtime, handle, owner, exit_reason);
             continue;
         }
         let Some(handle) = remove_and_notify(runtime, port_id, scheduler, owner, reason) else {

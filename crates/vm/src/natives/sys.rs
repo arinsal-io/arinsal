@@ -1128,7 +1128,7 @@ fn system_info(
             non_neg(process, flags.thread_pool_size as u64)
         })),
         Some("fullsweep_after") => {
-            let value = gc_defaults(process.runtime.as_deref()).max_gen_gcs();
+            let value = gc_defaults(process.runtime).max_gen_gcs();
             Some(tagged(process, "fullsweep_after", u64::from(value)))
         }
         // Port of erts/emulator/beam/erl_bif_info.c:2884-2885, OTP-29.1.1.
@@ -1136,15 +1136,15 @@ fn system_info(
             Some(Term::small(trace_control_word_value(process)).ok_or_else(badarg))
         }
         Some("min_heap_size") => {
-            let value = gc_defaults(process.runtime.as_deref()).min_heap_size();
+            let value = gc_defaults(process.runtime).min_heap_size();
             Some(tagged(process, "min_heap_size", value as u64))
         }
         Some("min_bin_vheap_size") => {
-            let value = gc_defaults(process.runtime.as_deref()).min_bin_vheap_size();
+            let value = gc_defaults(process.runtime).min_bin_vheap_size();
             Some(tagged(process, "min_bin_vheap_size", value as u64))
         }
         Some("max_heap_size") => {
-            let value = gc_defaults(process.runtime.as_deref()).max_heap();
+            let value = gc_defaults(process.runtime).max_heap();
             Some(max_heap_map(process, value))
         }
         Some("multi_scheduling") => Some(Ok(atom(multi_scheduling_state(process, |state| {
@@ -3558,7 +3558,7 @@ impl SystemFlags {
 /// erts keeps these flags in the emulator's globals; every runtime is a separate emulator
 /// here, and several runtimes can share one OS process.
 fn with_flags<T>(process: &Process, body: impl FnOnce(&mut SystemFlags) -> T) -> T {
-    with_runtime_flags(process.runtime.as_deref(), body)
+    with_runtime_flags(process.runtime, body)
 }
 
 /// A snapshot of the flags for code that allocates on `process` while reading them.
@@ -3699,7 +3699,7 @@ fn multi_scheduling(
     };
     let pid = ctx.pid();
     // An unscheduled evaluation has no runtime and no other scheduler to block.
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         let mut state = crate::process::MultiScheduling::default();
         state.change(pid, action);
         return Ok(atom(state.state()));
@@ -3812,7 +3812,7 @@ fn schedulers_online(
 fn fullsweep_after(process: &Process, value: Term) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
     let stored = u16::try_from(requested).unwrap_or(u16::MAX);
-    let previous = gc_defaults(process.runtime.as_deref())
+    let previous = gc_defaults(process.runtime)
         .max_gen_gcs
         .swap(u32::from(stored), Ordering::Relaxed);
     Ok(Term::small(i64::from(previous)).unwrap())
@@ -3821,7 +3821,7 @@ fn fullsweep_after(process: &Process, value: Term) -> Result<Term, VmError> {
 fn heap_minimum(process: &Process, value: Term, heap: bool) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
     let rounded = next_heap_size(requested);
-    let defaults = gc_defaults(process.runtime.as_deref());
+    let defaults = gc_defaults(process.runtime);
     let slot = if heap {
         &defaults.min_heap_size
     } else {
@@ -3882,7 +3882,7 @@ fn scheduling_statistics(value: Term) -> Result<Term, VmError> {
 
 fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
     let parsed = parse_system_max_heap(process, value)?;
-    let defaults = gc_defaults(process.runtime.as_deref());
+    let defaults = gc_defaults(process.runtime);
     if parsed.size < defaults.min_heap_size() as u64 && parsed.size != 0 {
         return Err(badarg());
     }
@@ -3905,7 +3905,7 @@ fn parse_system_max_heap(
 ) -> Result<crate::process::MaxHeap, VmError> {
     let mut limit = crate::process::MaxHeap {
         size: 0,
-        ..system_max_heap(process.runtime.as_deref())
+        ..system_max_heap(process.runtime)
     };
     if let Some(size) = value.as_small() {
         if size < 0 {

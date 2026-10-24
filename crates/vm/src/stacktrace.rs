@@ -2252,7 +2252,7 @@ pub(super) fn build_saved(
     let code_table = raw.code_table;
     let module_index = raw.module_index;
     let native_top = raw.native_top;
-    if let Some(runtime) = p.runtime.clone() {
+    if let Some(runtime) = p.runtime {
         runtime.with_active_code(|ranges, tables| {
             build_saved_active(
                 p,

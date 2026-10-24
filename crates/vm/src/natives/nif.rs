@@ -411,7 +411,7 @@ pub(crate) fn wait_for_halt_calls() {
 struct Hub {
     scheduler: Weak<Scheduler<Process>>,
     pid: Pid,
-    runtime: Weak<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     /// The scheduler's current-process slot, on the hub a scheduler thread installed for
     /// itself; copies handed out carry the resolved `pid` instead.
     current: Option<CurrentProcess>,
@@ -1465,7 +1465,7 @@ fn intern_load_atoms(module: &str) -> Result<(), VmError> {
 // Port of erts/emulator/beam/emu/bif_instrs.tab:i_load_nif: the load runs holding the code
 // modification permission; a caller that is not given it yields and retries the call.
 fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    let runtime = process.runtime.clone();
+    let runtime = process.runtime;
     let pid = process.self_pid;
     if let (Some(runtime), Some(pid)) = (&runtime, pid)
         && !crate::natives::code::try_seize_code_mod_permission(runtime, process, pid)
@@ -1865,7 +1865,7 @@ pub(crate) fn refresh_hub_native(process: &Process) {
     let runtime = process
         .runtime
         .as_ref()
-        .map_or(0, |rt| Arc::as_ptr(rt) as usize);
+        .map_or(0, |rt| *rt as *const crate::process::Runtime as usize);
     if HUB_RUNTIME.get() == runtime {
         // The scheduler thread already has this node's hub. Only the current
         // pid changes; erts does not republish a global process table for that.
@@ -1905,7 +1905,7 @@ fn install_hub_for(process: &Process, pid: Pid) {
     };
     // erts hands NIFs the calling process through the env; switching processes on a
     // scheduler thread registers nothing globally. Only the thread's caller changes.
-    let runtime_id = Arc::as_ptr(runtime) as usize;
+    let runtime_id = *runtime as *const crate::process::Runtime as usize;
     if HUB_RUNTIME.get() == runtime_id
         && HUB.with(|hub| {
             hub.borrow_mut()
@@ -1919,7 +1919,7 @@ fn install_hub_for(process: &Process, pid: Pid) {
     let hub = Hub {
         scheduler: Arc::downgrade(scheduler),
         pid,
-        runtime: Arc::downgrade(runtime),
+        runtime,
         current: None,
     };
     HUB.with(|current| *current.borrow_mut() = Some(hub.clone()));
@@ -1927,10 +1927,9 @@ fn install_hub_for(process: &Process, pid: Pid) {
     *GLOBAL_HUB.lock().unwrap() = Some(hub.clone());
     {
         let mut runtimes = RUNTIME_HUBS.lock().unwrap();
-        runtimes.retain(|known| known.runtime.strong_count() != 0);
         if !runtimes
             .iter()
-            .any(|known| Weak::ptr_eq(&known.runtime, &hub.runtime))
+            .any(|known| std::ptr::eq(known.runtime, hub.runtime))
         {
             runtimes.push(hub);
         }
@@ -2010,10 +2009,7 @@ fn nif_is_process_alive(caller: Term, target: Term) -> bool {
     hub.scheduler
         .upgrade()
         .is_some_and(|scheduler| scheduler.lookup(target))
-        && !hub
-            .runtime
-            .upgrade()
-            .is_some_and(|runtime| crate::signals::has_begun_exit(&runtime, target))
+        && !crate::signals::has_begun_exit(hub.runtime, target)
 }
 
 fn nif_send_hook(target: Term, message: Term) -> bool {
@@ -2032,13 +2028,10 @@ fn nif_send_hook(target: Term, message: Term) -> bool {
     };
     let deliverable = scheduler.lookup(pid);
     let dirty_scheduler = arinsal_sched::current_scheduler_type() != SchedulerType::Normal;
-    if deliverable
-        && dirty_scheduler
-        && let Some(runtime) = hub.runtime.upgrade()
-    {
+    if deliverable && dirty_scheduler {
         // Port of erts/emulator/beam/erl_nif.c:1005 (trace_send), OTP-29.1.1.
         let _ = with_dirty_trace_emission(|| {
-            crate::trace::emit_dirty_send(&runtime, hub.pid, target, trace_message)
+            crate::trace::emit_dirty_send(hub.runtime, hub.pid, target, trace_message)
         });
     }
     let sent = scheduler.send(hub.pid, pid, message).is_ok();
@@ -2051,7 +2044,7 @@ fn nif_send_hook(target: Term, message: Term) -> bool {
 /// A resource that an `enif_select` keeps selected in the check-io table.
 struct SelectedResource {
     data: usize,
-    runtime: Weak<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
 }
 
 impl arinsal_drv::NifSelectResource for SelectedResource {
@@ -2076,7 +2069,7 @@ impl arinsal_drv::NifSelectResource for SelectedResource {
     }
 
     fn log_error(&self, text: &str) {
-        crate::port::log_error_for(&self.runtime, text);
+        crate::port::log_error_for(self.runtime, text);
     }
 }
 
@@ -2112,7 +2105,7 @@ fn nif_select_hook(request: arinsal_nif::SelectRequest) -> i32 {
     crate::port::install_poll_backend();
     let resource = Arc::new(SelectedResource {
         data: request.resource,
-        runtime: hub.runtime.clone(),
+        runtime: hub.runtime,
     });
     let messages = request.messages.map(|message| {
         let message = message?;
@@ -2129,26 +2122,27 @@ fn nif_select_hook(request: arinsal_nif::SelectRequest) -> i32 {
 // Port of erts/emulator/beam/erl_nif.c:1149 (call_whereis): the process or port a name
 // is registered for; `enif_get_local_pid`/`enif_get_local_port` check the type.
 fn nif_whereis_pid_hook(name: Term) -> Option<Term> {
-    let runtime = current_hub()?.runtime.upgrade()?;
+    let runtime = current_hub()?.runtime;
     let pid = runtime.reg.whereis_proc(name.as_atom()?)?;
     pid.to_term()
 }
 
 fn nif_whereis_port_hook(name: Term) -> Option<Term> {
-    let runtime = current_hub()?.runtime.upgrade()?;
+    let runtime = current_hub()?.runtime;
     let id = runtime.reg.whereis_port(name.as_atom()?)?;
     Term::port(id)
 }
 
 // Port of erts/emulator/beam/erl_nif.c:2340 (enif_is_port_alive).
 fn nif_port_alive_hook(port: Term) -> bool {
-    let Some(runtime) = current_hub().and_then(|hub| hub.runtime.upgrade()) else {
+    let Some(hub) = current_hub() else {
         return false;
     };
+    let runtime = hub.runtime;
     let Some(id) = port.as_port() else {
         return false;
     };
-    crate::port::runtime_port_live(&runtime, id)
+    crate::port::runtime_port_live(runtime, id)
 }
 
 // Port of erts/emulator/beam/erl_nif.c:1097 (enif_port_command).
@@ -2156,11 +2150,9 @@ fn nif_port_command_hook(from: Option<Term>, port: Term, data: Term) -> bool {
     let Some(hub) = current_hub() else {
         return false;
     };
-    let Some(runtime) = hub.runtime.upgrade() else {
-        return false;
-    };
+    let runtime = hub.runtime;
     let from = from.and_then(Pid::from_term).unwrap_or(hub.pid);
-    crate::port::nif_port_command(&runtime, port, from, data)
+    crate::port::nif_port_command(runtime, port, from, data)
 }
 
 /// Scheduler-path natives in this family that always handle the MFA.

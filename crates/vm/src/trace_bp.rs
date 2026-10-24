@@ -536,7 +536,7 @@ impl Drop for BpNode {
 /// The breakpoint node of `process`; a process without a runtime has a node of its own kind.
 fn bp_node(process: &Process) -> &BpNode {
     static DETACHED: OnceLock<BpNode> = OnceLock::new();
-    match process.runtime.as_deref() {
+    match process.runtime {
         Some(runtime) => &runtime.breakpoints,
         None => DETACHED.get_or_init(|| BpNode::new(0)),
     }

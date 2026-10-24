@@ -433,12 +433,12 @@ pub(crate) fn control(
     op: u32,
     bytes: smallvec::SmallVec<[u8; 256]>,
 ) -> Result<Term, VmError> {
-    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let sched_flags = drv.sched_flags();
     if sched_flags & PTS_FLGS_FORCE_SCHEDULE_OP == 0 {
         match drv.try_imm_call(0, false, "control", (CONTEXT_REDS / 10) as u32) {
             Ok(imm) => {
-                let reply = call_driver_control(&runtime, drv, caller, op, &bytes);
+                let reply = call_driver_control(runtime, drv, caller, op, &bytes);
                 drop(imm);
                 let Some(reply) = reply else {
                     return Ok(atom("badarg"));
@@ -462,7 +462,7 @@ pub(crate) fn control(
         callback: Box::new(move |sig: SigOp| {
             // Port of erts/emulator/beam/io.c:4160 (port_sig_control), OTP-29.1.1.
             let result = match sig {
-                SigOp::Exec => call_driver_control(&runtime, &task_drv, caller, op, &bytes),
+                SigOp::Exec => call_driver_control(runtime, &task_drv, caller, op, &bytes),
                 _ => None,
             };
             // A list reply takes two words per byte, a binary its bytes.
@@ -502,7 +502,7 @@ pub(crate) fn control_light(
     let caller = process.self_pid?;
     let opcode = u32::try_from(op.as_small()?).ok()?;
     let id = port_id(process, *port)?;
-    let runtime = process.runtime.clone()?;
+    let runtime = process.runtime?;
     let drv = Arc::clone(runtime.ports.get(id)?.driver.get()?);
     if drv.sched_flags() & PTS_FLGS_FORCE_SCHEDULE_OP != 0 {
         return None;
@@ -511,7 +511,7 @@ pub(crate) fn control_light(
     let imm = drv
         .try_imm_call(0, false, "control", (CONTEXT_REDS / 10) as u32)
         .ok()?;
-    let reply = call_driver_control(&runtime, &drv, caller, opcode, &bytes);
+    let reply = call_driver_control(runtime, &drv, caller, opcode, &bytes);
     drop(imm);
     let Some(reply) = reply else {
         return Some(Ok(atom("badarg")));
@@ -521,7 +521,7 @@ pub(crate) fn control_light(
 }
 
 fn call_driver_control(
-    runtime: &Arc<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     drv: &DriverPort,
     caller: Pid,
     op: u32,
@@ -637,7 +637,7 @@ pub(crate) fn exit(
     reason: OwnedTerm,
     want_ref: bool,
 ) -> Result<Option<u64>, VmError> {
-    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let closed_to = bang.then_some(from);
     // port_close/1 traces `receive {Caller, close}` when the signal executes
     // (io.c:2196 call_deliver_port_exit).
@@ -645,11 +645,11 @@ pub(crate) fn exit(
     match drv.try_imm_call(0, !want_ref, "close", (CONTEXT_REDS / 10) as u32) {
         Ok(imm) => {
             if trace_close {
-                trace_close_receive(&runtime, handle.id, from);
+                trace_close_receive(runtime, handle.id, from);
             }
             let mut heap = ProcessHeap::with_words(64);
             let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
-            let done = deliver_exit(&runtime, handle, bang, from, reason, closed_to);
+            let done = deliver_exit(runtime, handle, bang, from, reason, closed_to);
             drop(imm);
             return if done { Ok(None) } else { Err(badarg()) };
         }
@@ -676,12 +676,12 @@ pub(crate) fn exit(
     schedule(drv, caller, move |op| {
         // Port of erts/emulator/beam/io.c:2212 (port_sig_exit), OTP-29.1.1.
         if trace_close && op == SigOp::Exec {
-            trace_close_receive(&runtime, task_handle.id, from);
+            trace_close_receive(runtime, task_handle.id, from);
         }
         let mut heap = ProcessHeap::with_words(64);
         let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
-        let ok = op == SigOp::Exec
-            && deliver_exit(&runtime, &task_handle, bang, from, reason, closed_to);
+        let ok =
+            op == SigOp::Exec && deliver_exit(runtime, &task_handle, bang, from, reason, closed_to);
         if let Some(reply) = reply {
             reply.atom(if ok { "true" } else { "badarg" });
         }
@@ -694,7 +694,7 @@ pub(crate) fn exit(
 ///
 /// Port of erts/emulator/beam/erl_process.c:2570-2576 and io.c:2164-2198, OTP-29.1.1.
 pub(crate) fn exit_for_halt(
-    runtime: Arc<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     handle: Arc<PortHandle>,
     from: Pid,
     reason: OwnedTerm,
@@ -706,7 +706,7 @@ pub(crate) fn exit_for_halt(
         Ok(imm) => {
             let mut heap = ProcessHeap::with_words(64);
             let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("killed"));
-            deliver_exit(&runtime, &handle, false, from, reason, None);
+            deliver_exit(runtime, &handle, false, from, reason, None);
             drop(imm);
         }
         Err(ImmFail::InvalidPort) => {}
@@ -715,7 +715,7 @@ pub(crate) fn exit_for_halt(
                 if op == SigOp::Exec {
                     let mut heap = ProcessHeap::with_words(64);
                     let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("killed"));
-                    deliver_exit(&runtime, &handle, false, from, reason, None);
+                    deliver_exit(runtime, &handle, false, from, reason, None);
                 }
                 REDS_EXIT
             });
@@ -727,7 +727,7 @@ pub(crate) fn exit_for_halt(
 /// Port of erts/emulator/beam/erl_process.c:14068 (`erts_proc_exit_handle_link`) and
 /// erts/emulator/beam/io.c:2212 (`port_sig_exit`), OTP-29.1.1.
 pub(crate) fn exit_for_process_termination(
-    runtime: Arc<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     handle: Arc<PortHandle>,
     from: Pid,
     reason: OwnedTerm,
@@ -742,7 +742,7 @@ pub(crate) fn exit_for_process_termination(
             handle.links.lock().remove(&from);
             let mut heap = ProcessHeap::with_words(64);
             let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
-            deliver_exit(&runtime, &handle, false, from, reason, None);
+            deliver_exit(runtime, &handle, false, from, reason, None);
         }
         REDS_EXIT
     });
@@ -758,7 +758,7 @@ pub(crate) fn connect(
     from: Pid,
     pid: Pid,
 ) {
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         return;
     };
     let task_handle = Arc::clone(handle);
@@ -788,7 +788,7 @@ pub(crate) fn connect(
             return REDS_CONNECT;
         }
         connected_message(
-            &runtime,
+            runtime,
             scheduler,
             from,
             handle.id,
@@ -802,13 +802,13 @@ pub(crate) fn connect(
 /// Port of erts/emulator/beam/io.c:2698 (erts_port_link) and io.c:2541 (erts_port_unlink)
 /// for a loaded driver. `false` when the port is gone (`ERTS_PORT_OP_BADARG`).
 pub(crate) fn link(
-    runtime: &Arc<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     handle: &Arc<PortHandle>,
     drv: &Arc<DriverPort>,
     pid: Pid,
     linked: bool,
 ) -> bool {
-    let task_runtime = Arc::clone(runtime);
+    let task_runtime = runtime;
     let task_handle = Arc::clone(handle);
     imm_or_schedule(
         drv,
@@ -827,7 +827,7 @@ pub(crate) fn link(
                     if !task_runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS) {
                         handle.links.lock().remove(&pid);
                     } else {
-                        trace_link(&task_runtime, handle.id, pid, "getting_linked");
+                        trace_link(task_runtime, handle.id, pid, "getting_linked");
                     }
                 } else if let (Some(port), Ok(reason)) =
                     (Term::port(handle.id), Message::copy_from(atom("noproc")))
@@ -847,7 +847,7 @@ pub(crate) fn link(
                 // Port of erts/emulator/beam/io.c:2507 (port_sig_unlink), OTP-29.1.1.
                 if live {
                     handle.links.lock().remove(&pid);
-                    trace_link(&task_runtime, handle.id, pid, "getting_unlinked");
+                    trace_link(task_runtime, handle.id, pid, "getting_unlinked");
                 }
                 REDS_UNLINK
             }
