@@ -3295,6 +3295,7 @@ impl Executor {
                                                     != (module_before, ip_before)
                                             {
                                                 process.tick();
+                                                self.vm.enter_native_at_jump(process);
                                                 continue;
                                             }
                                             result
@@ -8703,8 +8704,10 @@ impl Vm {
                 module: module_id,
                 ip: user_ip,
             }));
+        process.module = module_id;
         process.ip = on_ip;
         process.native_pc = None;
+        self.enter_native_at_jump(process);
         Ok(())
     }
 
