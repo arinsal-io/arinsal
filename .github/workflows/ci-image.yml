@@ -1,0 +1,38 @@
+name: CI image
+
+on:
+  pull_request:
+    paths:
+      - tools/docker/**
+      - .github/workflows/ci-image.yml
+  push:
+    branches: [main]
+    paths:
+      - tools/docker/**
+      - .github/workflows/ci-image.yml
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: tag
+        run: echo "value=otp29.1.1-$(sha256sum tools/docker/Dockerfile | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tools/docker/Dockerfile
+          platforms: linux/arm64
+          push: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+          tags: ghcr.io/arinsal-io/arinsal-ci:${{ steps.tag.outputs.value }}
