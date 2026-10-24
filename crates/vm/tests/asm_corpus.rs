@@ -568,6 +568,24 @@ fn beamasm_compile_time_per_module() {
             offsets.sort();
             offsets.hash(&mut layout_hash);
             compiled.functions.len().hash(&mut layout_hash);
+            if let Some(dump) = std::env::var_os("ARINSAL_BENCH_DUMP") {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dump)
+                    .unwrap();
+                writeln!(
+                    file,
+                    "MOD {} total={}",
+                    compiled.name,
+                    compiled.native.memory.capacity()
+                )
+                .unwrap();
+                for (label, offset) in &offsets {
+                    writeln!(file, "{label} {offset}").unwrap();
+                }
+            }
             if std::env::var_os("ARINSAL_BENCH_PRINT").is_some() {
                 let mut one = std::collections::hash_map::DefaultHasher::new();
                 offsets.hash(&mut one);
