@@ -4065,7 +4065,28 @@ impl Vm {
                             p.reductions = reds;
                             return Ok(RunState::Yield);
                         }
-                        ImportOutcome::Jump(target) => target,
+                        ImportOutcome::Jump(target) => {
+                            // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317,
+                            // OTP-29.1.1: a fun or apply jumps to the callee's code address,
+                            // which is native code when the callee module has some.
+                            // SAFETY: The jump target belongs to the active module code allocation.
+                            let target_ip = unsafe { target.offset_from(base) } as usize;
+                            if let Some(native) = self.beamasm_targets.function_for_target(
+                                module_id,
+                                &self.code.modules[module_id],
+                                crate::load::native_code_range(&self.code.code_meta, module_id),
+                                target_ip,
+                            ) {
+                                sync_cursor(p, htop, &mut heap_dirty);
+                                p.module = module_id;
+                                p.ip = target_ip;
+                                p.reductions = reds;
+                                p.native_pc = Some(native.start);
+                                p.cold_mut().native_transfer = true;
+                                return Ok(RunState::Yield);
+                            }
+                            target
+                        }
                         ImportOutcome::Advanced => {
                             // SAFETY: The handler advances to a valid code index.
                             unsafe { base.add(p.ip) }
@@ -4115,7 +4136,28 @@ impl Vm {
                             p.reductions = reds;
                             return Ok(RunState::Yield);
                         }
-                        ImportOutcome::Jump(target) => target,
+                        ImportOutcome::Jump(target) => {
+                            // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317,
+                            // OTP-29.1.1: a fun or apply jumps to the callee's code address,
+                            // which is native code when the callee module has some.
+                            // SAFETY: The jump target belongs to the active module code allocation.
+                            let target_ip = unsafe { target.offset_from(base) } as usize;
+                            if let Some(native) = self.beamasm_targets.function_for_target(
+                                module_id,
+                                &self.code.modules[module_id],
+                                crate::load::native_code_range(&self.code.code_meta, module_id),
+                                target_ip,
+                            ) {
+                                sync_cursor(p, htop, &mut heap_dirty);
+                                p.module = module_id;
+                                p.ip = target_ip;
+                                p.reductions = reds;
+                                p.native_pc = Some(native.start);
+                                p.cold_mut().native_transfer = true;
+                                return Ok(RunState::Yield);
+                            }
+                            target
+                        }
                         ImportOutcome::Advanced => {
                             // SAFETY: The handler advances to a valid code index.
                             unsafe { base.add(p.ip) }
