@@ -71,7 +71,7 @@ pub use heap::{
     HeapReservationState, LiteralArea, MfaLocation, ProcessHeap, S_REDZONE, S_RESERVED, StackWord,
     TermBuilder, Tuple3Chain, TupleBuilder, VecHeap, flat_key_cmp,
 };
-pub use identity::{Identity, Node};
+pub use identity::{Identity, Node, set_this_node};
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};
 pub use literal::{LiteralAreas, set_literal_purge_area};
 pub use magic::{MAGIC_BIN_DATA_OFFSET, MagicRef};
