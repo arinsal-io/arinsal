@@ -71,7 +71,7 @@ pub struct MapRuntime {
     /// Runtime multi-key lookup.
     pub get_elements: MapGetElementsHelper,
     /// Typed identity of the compiled module owning lookup operand tables.
-    pub lookup_module: u32,
+    pub lookup_module: u64,
     /// Runtime map construction.
     pub new_map: MapUpdateHelper,
     /// Runtime associative update.
@@ -712,7 +712,7 @@ impl BeamModuleAssembler {
         }
         self.code.bind(generic)?;
         self.code
-            .emit(|e| e.mov_const(Gpr::x(2), u64::from(runtime.lookup_module)))?;
+            .emit(|e| e.mov_const(Gpr::x(2), runtime.lookup_module))?;
         self.code
             .emit(|e| e.mov_const(Gpr::x(3), u64::from(index)))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(4), E))?;

@@ -1177,6 +1177,24 @@ static INTERP_NATIVE_STARTS: AtomicU64 = AtomicU64::new(0);
 static NATIVE_YIELDS: AtomicU64 = AtomicU64::new(0);
 static CALL_UNPORTED: AtomicU64 = AtomicU64::new(0);
 static PRINTED: AtomicBool = AtomicBool::new(false);
+static NEXT_MODULE_HANDLE: AtomicU64 = AtomicU64::new(1);
+static MODULE_HANDLES: OnceLock<RwLock<HashMap<u64, Weak<CompiledVersion>>>> = OnceLock::new();
+
+fn module_handles() -> &'static RwLock<HashMap<u64, Weak<CompiledVersion>>> {
+    MODULE_HANDLES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Resolves native code identity to the version-specific tables retained with its code header.
+// Port of erts/emulator/beam/jit/asm_load.c:1025-1026 and jit/asm_load.c:1149-1155,
+// OTP-29.1.1: emitted code is tied to its prepared BeamCodeHeader, not a code-table slot.
+pub(crate) fn map_lookup_version(handle: u64) -> Option<Arc<CompiledVersion>> {
+    let mut handles = module_handles().write().ok()?;
+    let version = handles.get(&handle).and_then(Weak::upgrade);
+    if version.is_none() {
+        handles.remove(&handle);
+    }
+    version
+}
 
 fn lifetime_trace_enabled() -> bool {
     crate::native_bridge::lifetime_trace_enabled()
@@ -1186,6 +1204,8 @@ fn lifetime_trace_enabled() -> bool {
 pub(crate) struct CompiledVersion {
     module: String,
     scope: u64,
+    module_handle: u64,
+    installed: AtomicBool,
     pub(crate) map_lookups: Box<[arinsal_beamasm::map::MapLookupTable]>,
     memory: std::sync::Mutex<arinsal_a64::exec::CodeMemory>,
     trace_breakpoints: Vec<((String, String, u8), usize, u32)>,
@@ -1209,8 +1229,11 @@ pub(crate) struct CompiledVersion {
     native_targets: Vec<(Mfa, usize)>,
     code_start: usize,
     code_end: usize,
-    catch_ids: Vec<u32>,
+    catch_base: u32,
+    catch_table: Vec<usize>,
+    catch_ids: std::sync::Mutex<Vec<u32>>,
     lambda_entries: Vec<Arc<arinsal_term::FunEntry>>,
+    lambda_targets: Vec<(Arc<arinsal_term::FunEntry>, usize)>,
 }
 
 /// Enable or remove native entry breakpoints for traced functions of one module.
@@ -1369,8 +1392,48 @@ impl CompiledVersion {
             .is_ok()
     }
 
-    pub(crate) fn publish(&self, module: &arinsal_loader::Module) {
+    // Port of erts/emulator/beam/beam_load.c:258 and jit/asm_load.c:1149-1218, OTP-29.1.1.
+    pub(crate) fn install(self: &Arc<Self>, module: &arinsal_loader::Module) -> bool {
+        let catch_ids = crate::native_bridge::register_native_catches(
+            self.scope,
+            self.catch_base,
+            &self
+                .catch_table
+                .iter()
+                .map(|address| *address as *const u8)
+                .collect::<Vec<_>>(),
+        );
+        *self.catch_ids.lock().unwrap() = catch_ids;
+        let mut registered = Vec::with_capacity(self.native_functions.len());
+        for function in &self.native_functions {
+            if crate::register_native_function(function.clone()).is_err() {
+                crate::native_bridge::unregister_native_functions(&registered);
+                let catch_ids = std::mem::take(
+                    &mut *self
+                        .catch_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                crate::native_bridge::unregister_native_catches(self.scope, &catch_ids);
+                return false;
+            }
+            registered.push(function.clone());
+        }
+        let code_index = crate::code_ix::for_scope(self.scope).staging();
+        for (entry, target) in &self.lambda_targets {
+            entry.set_fun_code(code_index, *target);
+        }
+        if let Ok(mut versions) = compiled_versions().write() {
+            versions.retain(|version| version.strong_count() != 0);
+            versions.push(Arc::downgrade(self));
+        }
+        if let Ok(mut handles) = module_handles().write() {
+            handles.retain(|_, version| version.strong_count() != 0);
+            handles.insert(self.module_handle, Arc::downgrade(self));
+        }
+        self.installed.store(true, Ordering::Release);
         publish_module(self.scope, module, &self.native_targets);
+        true
     }
     /// Sends native callers of this version's exports to the export trampoline and queues the
     /// version's literals for release. Run when the version is freed explicitly (purge
@@ -1437,9 +1500,17 @@ impl Drop for CompiledVersion {
                 }
             }
         }
-        self.retire_literals();
+        if self.installed.load(Ordering::Acquire) {
+            self.retire_literals();
+        }
         crate::native_bridge::unregister_native_functions(&self.native_functions);
-        crate::native_bridge::unregister_native_catches(self.scope, &self.catch_ids);
+        crate::native_bridge::unregister_native_catches(
+            self.scope,
+            &self
+                .catch_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         if lifetime_trace_enabled() {
             eprintln!(
                 "[beamasm-lifetime] CodeMemory drop module={} range={:#x}..{:#x}",
@@ -1501,8 +1572,8 @@ struct VmModuleEnv<'a> {
     module_name: String,
     functions: Vec<(String, u8)>,
     coverage: Option<arinsal_loader::Coverage>,
-    code_index: usize,
-    module_id: u32,
+    module_handle: u64,
+    lambda_targets: std::cell::RefCell<HashMap<u32, usize>>,
     // Call-NIF sites of functions a later load_nif may replace.
     dynamic_nifs:
         std::cell::RefCell<HashMap<(String, u8), Box<crate::native_helpers::NativeNifSite>>>,
@@ -1516,8 +1587,7 @@ impl<'a> VmModuleEnv<'a> {
         literal_heap: &'a mut VecHeap,
         export_entries: Vec<usize>,
         fragments: &DispatchFragments,
-        code_scope: u64,
-        module_id: u32,
+        module_handle: u64,
     ) -> Result<Self, String> {
         let mut literals = Vec::with_capacity(beam.literals.len());
         for index in 0..beam.literals.len() {
@@ -1604,8 +1674,8 @@ impl<'a> VmModuleEnv<'a> {
                 .map(|(_, function, arity)| (function.clone(), *arity))
                 .collect(),
             coverage: module.coverage.clone(),
-            code_index: crate::code_ix::for_scope(code_scope).staging(),
-            module_id,
+            module_handle,
+            lambda_targets: std::cell::RefCell::new(HashMap::new()),
             dynamic_nifs: std::cell::RefCell::new(HashMap::new()),
             _lifetime: std::marker::PhantomData,
         })
@@ -1833,12 +1903,12 @@ impl ModuleEnv for VmModuleEnv<'_> {
         index: u32,
         target: usize,
     ) -> Result<(), String> {
-        let entry = self
+        let _entry = self
             .lambda_entries
             .get(&index)
             .ok_or_else(|| format!("lambda {index} has no loaded fun entry"))?;
         // Port of erts/emulator/beam/erl_fun.c:48-53 (erts_set_fun_code), OTP-29.1.1.
-        entry.set_fun_code(self.code_index, target);
+        self.lambda_targets.borrow_mut().insert(index, target);
         Ok(())
     }
 
@@ -1940,7 +2010,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
         arinsal_beamasm::map::MapRuntime {
             get: crate::native_helpers::arinsal_beamasm_map_get,
             get_elements: crate::native_helpers::arinsal_beamasm_map_get_elements,
-            lookup_module: self.module_id,
+            lookup_module: self.module_handle,
             new_map: crate::native_helpers::arinsal_beamasm_map_new,
             update_assoc: crate::native_helpers::arinsal_beamasm_map_assoc,
             update_exact: crate::native_helpers::arinsal_beamasm_map_exact,
@@ -2049,11 +2119,11 @@ impl ModuleEnv for VmModuleEnv<'_> {
 }
 
 /// Compile a module and retain both its executable mapping and embedded literals.
+// Port of erts/emulator/beam/beam_load.c:125-230 and jit/asm_load.c:947-1155, OTP-29.1.1.
 pub(crate) fn compile(
     beam: &arinsal_beam::BeamFile,
     module: &arinsal_loader::Module,
     scope: u64,
-    module_id: usize,
     line_breakpoints: bool,
 ) -> Option<Arc<CompiledVersion>> {
     if !enabled() {
@@ -2081,7 +2151,11 @@ pub(crate) fn compile(
     let function_allowlist = crate::debug_env::beamasm_funcs();
     let fragments = fragments()?;
     let export_entries = import_entries(scope, module)?;
-    let module_id = u32::try_from(module_id).ok()?;
+    let module_handle = NEXT_MODULE_HANDLE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |handle| {
+            handle.checked_add(1)
+        })
+        .ok()?;
     // Literals no loaded instruction uses; a literal heap so literal checks see them as such.
     let mut literal_heap = Box::new(VecHeap::new_literal());
     let env = VmModuleEnv::new(
@@ -2090,8 +2164,7 @@ pub(crate) fn compile(
         &mut literal_heap,
         export_entries,
         fragments,
-        scope,
-        module_id,
+        module_handle,
     )
     .ok()?;
     let trace = crate::calls::trace_boot_enabled();
@@ -2148,6 +2221,17 @@ pub(crate) fn compile(
     }
     // Fun entries whose dispatch this version may publish; purging the version resets them.
     let lambda_entries = env.lambda_entries.values().cloned().collect::<Vec<_>>();
+    let lambda_targets = env
+        .lambda_targets
+        .borrow()
+        .iter()
+        .filter_map(|(index, target)| {
+            env.lambda_entries
+                .get(index)
+                .cloned()
+                .map(|entry| (entry, *target))
+        })
+        .collect();
     // Every site stays with the code: the code of a function whose compilation failed may
     // still hold the address of its site.
     let mut site_index = HashMap::new();
@@ -2319,14 +2403,11 @@ pub(crate) fn compile(
                 })
         })
         .collect();
-    let catch_ids = crate::native_bridge::register_native_catches(
-        scope,
-        compiled.native.catch_base,
-        &compiled.native.catch_table,
-    );
     let version = Arc::new(CompiledVersion {
         module: compiled.name.clone(),
         scope,
+        module_handle,
+        installed: AtomicBool::new(false),
         map_lookups: compiled.native.map_lookups,
         memory: std::sync::Mutex::new(compiled.native.memory),
         trace_breakpoints,
@@ -2346,19 +2427,17 @@ pub(crate) fn compile(
         native_targets,
         code_start,
         code_end,
-        catch_ids,
+        catch_base: compiled.native.catch_base,
+        catch_table: compiled
+            .native
+            .catch_table
+            .iter()
+            .map(|address| *address as usize)
+            .collect(),
+        catch_ids: std::sync::Mutex::new(Vec::new()),
         lambda_entries,
+        lambda_targets,
     });
-    for function in &version.native_functions {
-        if crate::register_native_function(function.clone()).is_err() {
-            return None;
-        }
-    }
-    version.publish(module);
-    if let Ok(mut versions) = compiled_versions().write() {
-        versions.retain(|version| version.strong_count() != 0);
-        versions.push(Arc::downgrade(&version));
-    }
     Some(version)
 }
 
