@@ -316,6 +316,9 @@ struct Pattern {
 struct PatArg {
     name: Option<String>,
     ty: Option<String>,
+    /// `ty` as a bit set over the type letters, tested against `type_bits` of the operand
+    /// (erts `TOP_is_type`: `((1 << tag) & mask)`); `None` when the argument has no type.
+    ty_mask: Option<u64>,
     restriction: Option<Restriction>,
     eq: Option<i64>,
     eq_atom: Option<String>,
@@ -591,6 +594,7 @@ fn parse_pat_arg(token: &str) -> Option<PatArg> {
         return Some(PatArg {
             name: Some("*".to_owned()),
             ty: None,
+            ty_mask: None,
             restriction: None,
             eq: None,
             eq_atom: None,
@@ -636,6 +640,7 @@ fn parse_pat_arg(token: &str) -> Option<PatArg> {
         return Some(PatArg {
             name: name.or_else(|| Some("*".to_owned())),
             ty: None,
+            ty_mask: None,
             restriction: None,
             eq: None,
             eq_atom: None,
@@ -677,6 +682,7 @@ fn parse_pat_arg(token: &str) -> Option<PatArg> {
     }
     Some(PatArg {
         name,
+        ty_mask: ty.as_deref().map(type_mask),
         ty,
         restriction,
         eq,
@@ -832,7 +838,7 @@ fn apply_rule(
             let exact_x0 = pat.ty.as_deref() == Some("x")
                 && pat.eq == Some(0)
                 && register_index(value) == Some(('x', 0));
-            if !(type_matches(pat.ty.as_deref(), value) || exact_x0)
+            if !(pat.ty_mask.is_none_or(|mask| type_bits(value) & mask != 0) || exact_x0)
                 || pat.eq.is_some_and(|n| operand_integer(value) != Some(n))
                 || pat
                     .eq_atom
@@ -1758,6 +1764,79 @@ fn is_literal_integer(value: &Operand) -> bool {
         || matches!(value, Operand::Int(value) if !is_small_integer(*value))
 }
 
+/// Bit of a type letter in a type set: `a`..`z` then `A`..`Z`.
+const fn type_bit(letter: u8) -> u64 {
+    match letter {
+        b'a'..=b'z' => 1 << (letter - b'a'),
+        b'A'..=b'Z' => 1 << (26 + letter - b'A'),
+        _ => 0,
+    }
+}
+
+const fn letters(set: &str) -> u64 {
+    let bytes = set.as_bytes();
+    let mut mask = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        mask |= type_bit(bytes[index]);
+        index += 1;
+    }
+    mask
+}
+
+/// The set of a pattern's type letters.
+fn type_mask(types: &str) -> u64 {
+    types
+        .bytes()
+        .fold(0, |mask, letter| mask | type_bit(letter))
+}
+
+/// Letters `type_matches_one` accepts for every operand (no test is defined for them).
+const ANY_OPERAND: u64 = !letters("rxyfjLHanuitIWAPQbFeMdSscqplho") & ((1 << 52) - 1);
+const REGISTER_X: u64 = letters("xSds");
+const REGISTER_Y: u64 = letters("ySds");
+const INTEGER_TYPES: u64 = letters("utIWAPQbFeM");
+const CONSTANT: u64 = letters("sc");
+
+/// The type letters `operand` satisfies, all at once: the tag test of erts' `TOP_is_type`
+/// (`beam_makeops` `is_type` mask against the operand's tag). Equal to `type_matches_one` per
+/// letter, which the unit test checks.
+fn type_bits(value: &Operand) -> u64 {
+    ANY_OPERAND
+        | match value {
+            Operand::X(0) => REGISTER_X | letters("r"),
+            Operand::X(_) => REGISTER_X,
+            Operand::Y(_) => REGISTER_Y,
+            Operand::TypedReg { reg, .. } => match register_index(reg) {
+                Some(('x', 0)) => REGISTER_X | letters("r"),
+                Some(('x', _)) => REGISTER_X,
+                Some(_) => REGISTER_Y,
+                None => letters("s"),
+            },
+            Operand::Int(value) => {
+                INTEGER_TYPES
+                    | CONSTANT
+                    | if is_small_integer(*value) {
+                        letters("i")
+                    } else {
+                        0
+                    }
+            }
+            Operand::U(_) => INTEGER_TYPES | CONSTANT | letters("ijLH"),
+            Operand::BigInt(_) => CONSTANT,
+            Operand::Literal(_) => CONSTANT | letters("q"),
+            Operand::Char(_) => CONSTANT | letters("ih"),
+            Operand::Atom(_) => CONSTANT | letters("a"),
+            Operand::Nil => CONSTANT | letters("n"),
+            Operand::Label(0) => letters("jLHp"),
+            Operand::Label(_) => letters("fjLH"),
+            Operand::FR(_) => letters("l"),
+            Operand::List(_) => letters("o"),
+            Operand::Alloc(_) => 0,
+        }
+}
+
+#[cfg(test)]
 fn type_matches(ty: Option<&str>, value: &Operand) -> bool {
     ty.is_none_or(|types| {
         (types.contains('x')
@@ -1767,6 +1846,7 @@ fn type_matches(ty: Option<&str>, value: &Operand) -> bool {
     })
 }
 
+#[cfg(test)]
 fn type_matches_one(ty: char, value: &Operand) -> bool {
     match ty {
         'x' => register_index(value).is_some_and(|(kind, _)| kind == 'x'),
@@ -2215,5 +2295,65 @@ mod tests {
             !other.iter().any(|name| name == "call_light_bif"),
             "non-bif became call_light_bif: {other:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod type_bits_tests {
+    use super::*;
+    use arinsal_beam::Allocation;
+
+    #[test]
+    fn type_bits_equal_the_per_letter_tests() {
+        let register = |index| Box::new(Operand::X(index));
+        let samples = [
+            Operand::X(0),
+            Operand::X(3),
+            Operand::Y(0),
+            Operand::Y(7),
+            Operand::FR(1),
+            Operand::Label(0),
+            Operand::Label(9),
+            Operand::Char(65),
+            Operand::List(vec![Operand::Nil]),
+            Operand::Alloc(Vec::<Allocation>::new()),
+            Operand::Literal(2),
+            Operand::Atom(4),
+            Operand::Nil,
+            Operand::U(0),
+            Operand::U(300),
+            Operand::Int(-1),
+            Operand::Int(1 << 58),
+            Operand::Int(1 << 59),
+            Operand::Int(i64::MIN),
+            Operand::BigInt(Default::default()),
+            Operand::TypedReg {
+                reg: register(0),
+                type_index: 1,
+            },
+            Operand::TypedReg {
+                reg: register(2),
+                type_index: 1,
+            },
+            Operand::TypedReg {
+                reg: Box::new(Operand::Y(1)),
+                type_index: 1,
+            },
+            Operand::TypedReg {
+                reg: Box::new(Operand::Nil),
+                type_index: 1,
+            },
+        ];
+        for value in &samples {
+            let bits = type_bits(value);
+            for letter in (b'a'..=b'z').chain(b'A'..=b'Z') {
+                assert_eq!(
+                    bits & type_bit(letter) != 0,
+                    type_matches_one(letter as char, value),
+                    "{value:?} / {}",
+                    letter as char
+                );
+            }
+        }
     }
 }
