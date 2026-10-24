@@ -497,17 +497,15 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
     heap: &mut H,
     mut value: Option<&mut Option<Term>>,
 ) -> MapResult<Term> {
-    const NONE: u8 = 0;
-    const LEAF: u8 = 1;
-    const BOXED: u8 = 2;
     let mut path = [(map, 0_u32, 0_u32); MAX_HAMT_DEPTH];
     let mut depth = 0;
     let mut node = map;
     let mut level = 0;
+    let mut reserve_words = 0;
     let hash = internal_hash(key);
 
     // SAFETY: the source map and every child remain live during traversal; the
-    // exact output size is computed from this bounded path before allocation.
+    // worst-case reservation is accumulated along the bounded path as erts does.
     unsafe {
         loop {
             if bits(node) & 3 == 1 {
@@ -536,6 +534,7 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
                 if let Some(output) = value.as_mut() {
                     **output = Some(term(*term(*source.add(1 + index)).raw_ptr().add(1)));
                 }
+                reserve_words += arity + 1;
                 path[depth] = (node, index as u32, 0);
                 depth += 1;
                 break;
@@ -544,6 +543,7 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
             let kind = ((h >> 6) & 3) as usize;
             let slot = slot(hash, level);
             if kind == 2 {
+                reserve_words += 18;
                 path[depth] = (node, slot as u32, slot as u32);
                 depth += 1;
                 node = term(*source.add(2 + slot));
@@ -555,6 +555,7 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
             if bitmap & bit == 0 {
                 return Ok(map);
             }
+            reserve_words += bitmap.count_ones() as usize + if kind == 3 { 2 } else { 1 };
             let index = (bitmap & (bit - 1)).count_ones() as usize;
             path[depth] = (node, index as u32, slot as u32);
             depth += 1;
@@ -565,7 +566,6 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
 
         // Port of erts/emulator/beam/erl_map.c (hashmap_delete), OTP-29.1.1.
         // erts flattens only after the deletion walk has already found the key.
-        // Port of hashmap_size(map) - 1 in erl_map.c:2984-2989, OTP-29.1.1.
         let new_size = map_size - 1;
         if new_size <= LIMIT {
             let words = 4 + 2 * new_size;
@@ -573,66 +573,9 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
                 .map_err(|_| MapError::HeapFull { need_words: words });
         }
 
-        let mut shape = NONE;
-        let mut need_words = 0;
-        for &(frame, compact_index, _meta) in path[..depth].iter().rev() {
-            let source = frame.raw_ptr();
-            let h = *source;
-            if h & 63 == 0 {
-                let arity = (h >> 6) as usize;
-                if arity == 2 {
-                    let other = 1 - compact_index as usize;
-                    let leaf = term(*source.add(1 + other));
-                    shape = if bits(leaf) & 3 == 1 { LEAF } else { BOXED };
-                } else {
-                    need_words += arity;
-                    shape = BOXED;
-                }
-                continue;
-            }
-
-            let kind = ((h >> 6) & 3) as usize;
-            if kind == 2 {
-                need_words += if shape == NONE { 17 } else { 18 };
-                shape = BOXED;
-                continue;
-            }
-
-            let bitmap = ((h >> 16) & 0xffff) as u16;
-            let count = bitmap.count_ones() as usize;
-            if kind == 3 {
-                need_words += if shape == NONE { 1 + count } else { 2 + count };
-                shape = BOXED;
-                continue;
-            }
-
-            if shape == NONE {
-                if count == 1 {
-                    continue;
-                }
-                if count == 2 {
-                    let sibling = term(*source.add(1 + (1 - compact_index as usize)));
-                    if bits(sibling) & 3 == 1 {
-                        shape = LEAF;
-                    } else {
-                        need_words += 2;
-                        shape = BOXED;
-                    }
-                    continue;
-                }
-                need_words += count;
-                shape = BOXED;
-            } else if shape == LEAF && count == 1 {
-                continue;
-            } else {
-                need_words += 1 + count;
-                shape = BOXED;
-            }
-        }
-
-        if need_words == 0 {
-            return Ok(map);
-        }
+        let need_words = reserve_words
+            .checked_sub(1)
+            .expect("a hashmap deletion path reserves at least one word");
         let mut cursor = heap
             .alloc(need_words)
             .ok_or(MapError::HeapFull { need_words })?;
@@ -768,7 +711,15 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(
                 cursor = cursor.add(1 + count);
             }
         }
-        debug_assert_eq!(cursor.offset_from(start) as usize, need_words);
+        let end = start.add(need_words);
+        debug_assert!(cursor <= end);
+        if cursor < end {
+            let unused = end.offset_from(cursor) as usize;
+            if heap.release_needs_filler(end, cursor) {
+                *cursor = ((unused as u64 - 1) << 6) | POS_BIG_SUBTAG;
+            }
+            heap.release(end, cursor);
+        }
         Ok(replacement.unwrap_or(map))
     }
 }
