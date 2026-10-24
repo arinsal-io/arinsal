@@ -8622,6 +8622,10 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        // Port of erts/emulator/beam/erl_process.c:suspend_scheduler_sleep, OTP-29.1.1:
+        // ERTS carries an absolute timeout across scheduler spin; subtract spin time from the
+        // pre-spin delay before converting it back into a poll/park timeout.
+        let wait_started = Instant::now();
 
         local.set_wall_enabled(false);
         inner.waiting_schedulers.fetch_add(1, Ordering::Relaxed);
@@ -8642,6 +8646,9 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             }
             spins -= 1;
         }
+        let wait_remaining_ns = wait_ns.map(|ns| {
+            ns.saturating_sub(u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        });
         if !inner.parked[id].load(Ordering::SeqCst) {
             // Woken while spinning.
         } else {
@@ -8656,12 +8663,12 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
                 POLL_SLEEPER_SET.store(true, Ordering::SeqCst);
                 if inner.parked[id].load(Ordering::SeqCst) && !inner.stopped.load(Ordering::Acquire)
                 {
-                    poll.poll(wait_ns.map(Duration::from_nanos));
+                    poll.poll(wait_remaining_ns.map(Duration::from_nanos));
                 }
                 POLL_SLEEPER_SET.store(false, Ordering::SeqCst);
                 inner.poll_sleeping[id].store(false, Ordering::SeqCst);
                 clear_sys_scheduling();
-            } else if let Some(ns) = wait_ns {
+            } else if let Some(ns) = wait_remaining_ns {
                 park_until(&inner, id, ns);
             } else {
                 // `Thread::park` can return spuriously. A real wake clears `parked`
