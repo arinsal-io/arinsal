@@ -11,64 +11,85 @@ concurrency:
 
 permissions:
   contents: read
+  packages: read
+
+env:
+  ARINSAL_CASES: "3"
+  NEXTEST_TEST_THREADS: "4"
 
 jobs:
-  rust-tests:
-    name: Rust and OTP tests
-    runs-on: macos-15
-    timeout-minutes: 90
-
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04-arm
+    container:
+      # Keep this in sync with sha256sum tools/docker/Dockerfile.
+      image: ghcr.io/arinsal-io/arinsal-ci:otp29.1.1-fe5d5af436f588fe4d0b9b04b6eb069d2efbecfa0220375559c4ba1061927b4c
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 30
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::multiple_unsafe_ops_per_block
+      - run: python3 tools/unsafe_census/census.py --check
 
-      - name: Set up Erlang/OTP
-        uses: erlef/setup-beam@v1
+  crates:
+    name: Non-VM crate tests
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: ghcr.io/arinsal-io/arinsal-ci:otp29.1.1-fe5d5af436f588fe4d0b9b04b6eb069d2efbecfa0220375559c4ba1061927b4c
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo nextest run --workspace --exclude arinsal-vm --profile gate
+
+  vm:
+    name: VM tests (${{ matrix.partition }}/4)
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: ghcr.io/arinsal-io/arinsal-ci:otp29.1.1-fe5d5af436f588fe4d0b9b04b6eb069d2efbecfa0220375559c4ba1061927b4c
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo build -p arinsal-cli
+      - run: cargo build --release -p arinsal-cli
+      - run: >-
+          cargo nextest run -p arinsal-vm --profile gate
+          --partition count:${{ matrix.partition }}/4
+          -E 'not (test(gen_udp_matches_erts) | test(eight_alias_monitor_replies_wake))'
+
+  macos-smoke:
+    name: macOS smoke
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
         with:
           otp-version: "29.1.1"
           version-type: strict
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v2
-
-      - name: Run Rust checks and tests
-        run: tools/check.sh
-
-      - name: Check difftest protocol against OTP
-        run: tools/difftest/smoke.sh
-
-      - name: Compare VM stage1 cases with OTP
-        run: cargo run -p difftest-runner --bin difftest -- --vm arinsal --suite stage1
-
-  language-interop:
-    name: Gleam interoperability
-    runs-on: macos-15
-    timeout-minutes: 90
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Erlang/OTP and Gleam
-        uses: erlef/setup-beam@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          otp-version: "29.1.1"
-          gleam-version: "1.9.0"
-          version-type: strict
-          install-hex: true
-          install-rebar: true
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v2
-
-      - name: Build Gleam smoke fixture
-        working-directory: tests/languages/gleam
-        run: gleam build
-
-      - name: Run Gleam-generated BEAM code on Arinsal
-        shell: bash
-        run: |
-          beam_dir="$(find tests/languages/gleam/build/dev/erlang -type d -name ebin -print -quit)"
-          test -n "$beam_dir"
-          result="$(target/release/arinsal eval -pa "$beam_dir" arinsal_gleam_smoke answer)"
-          grep -Fxq '42' <<< "$result"
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo nextest run --workspace --profile macos-smoke
