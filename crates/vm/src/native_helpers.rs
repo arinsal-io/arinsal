@@ -2688,18 +2688,25 @@ pub(crate) extern "C" fn trap_bif_entry<T: crate::bif_traps::TrapBody>(
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
-        return 0;
+    let arity = if let Some(arity) = T::ARITY {
+        Some(arity)
+    } else {
+        let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+            return 0;
+        };
+        if export.light_trap_bif.is_none() {
+            return park_executor(process, export, identity, false);
+        }
+        Some(usize::from(export.arity))
     };
-    if export.light_trap_bif.is_none() {
-        return park_executor(process, export, identity, false);
-    }
+    let Some(arity) = arity else { return 0 };
     trap_body_call::<T>(
         process,
         registers,
         identity as usize,
         instruction as usize,
-        export,
+        descriptor,
+        arity,
     )
     .unwrap_or(0)
 }
@@ -2788,10 +2795,10 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
     registers: &mut arinsal_beamasm::SchedulerRegisters,
     identity: usize,
     instruction: usize,
-    export: ExportDispatch,
+    descriptor: u64,
+    arity: usize,
 ) -> Option<u64> {
     process.reductions = process.header.fcalls;
-    let arity = usize::from(export.arity);
     let entry_top = process.heap.heap_top_index();
     let gc_was_enabled = process.heap.gc_enabled;
     let pid = process.self_pid;
@@ -2806,17 +2813,26 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
         Ok(crate::bif_traps::HandlerResult::Done { value, reductions }) => {
             process.set_gc_enabled(gc_was_enabled);
             crate::bif_traps::charge_light(process, reductions);
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:488-523
-            // (post-BIF heap-fragment check), OTP-29.1.1.
-            Some(plain_bif_result(
-                process,
-                registers,
-                export,
-                arity,
-                Ok(value),
-            ))
+            if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
+                // The save-calls entry branches through the export and does not return to the
+                // shared light-BIF fragment, so run that fragment's single epilogue here.
+                // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397 and :488-523,
+                // OTP-29.1.1.
+                Some(plain_bif_result(
+                    process,
+                    registers,
+                    crate::beamasm_integration::export_from_info(descriptor)?,
+                    arity,
+                    Ok(value),
+                ))
+            } else {
+                // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:488-523, OTP-29.1.1:
+                // the native shared fragment performs its inline GC check on this return.
+                Some(light_value_return(process, registers, entry_top, value))
+            }
         }
         other => {
+            let export = crate::beamasm_integration::export_from_info(descriptor)?;
             let mut args = [Term::NIL; 3];
             args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
             let callee = (export.module_atom, export.function_atom);

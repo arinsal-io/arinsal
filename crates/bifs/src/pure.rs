@@ -499,25 +499,6 @@ pub(super) fn make_list(
     result
 }
 
-// Port of erts/emulator/beam/erl_map.c:1207-1241 and :2262-2298, OTP-29.1.1.
-pub(super) fn make_list_from_reverse_exact_iter(
-    ctx: &mut Ctx<'_>,
-    items: impl DoubleEndedIterator<Item = Term> + ExactSizeIterator,
-    tail: Term,
-) -> Term {
-    let count = items.len();
-    if count == 0 {
-        return tail;
-    }
-    let mut heap = Heap(&mut ctx.heap);
-    let mut builder = TermBuilder::new(&mut heap);
-    let list = builder
-        .reserve_cons_list(count)
-        .expect("infallible BIF heap");
-    list.prepend_exact_with_tail(items.rev(), tail)
-        .expect("reserved list length")
-}
-
 pub(super) fn tuple_build(ctx: &mut Ctx<'_>, values: &[Term]) -> Term {
     TermBuilder::new(&mut Heap(&mut ctx.heap))
         .tuple(values)

@@ -2524,7 +2524,8 @@ fn light_gc_offsets() -> arinsal_beamasm::dispatch::LightGcOffsets {
     let heap = std::mem::offset_of!(crate::Process, heap);
     arinsal_beamasm::dispatch::LightGcOffsets {
         fragment_words: (heap + arinsal_term::ProcessHeap::FRAGMENT_WORDS_OFFSET) as u32,
-        bin_vheap: (heap + arinsal_term::ProcessHeap::BIN_VHEAP_OFFSET) as u32,
+        owners_pointer: (heap + arinsal_term::ProcessHeap::OWNERS_POINTER_OFFSET) as u32,
+        off_heap_overhead: arinsal_term::ProcessHeap::OWNERS_OVERHEAD_OFFSET as u32,
         bin_vheap_size: (heap + arinsal_term::ProcessHeap::BIN_VHEAP_SIZE_OFFSET) as u32,
         gc_enabled: (heap + arinsal_term::ProcessHeap::GC_ENABLED_OFFSET) as u32,
     }

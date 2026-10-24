@@ -73,8 +73,10 @@ pub struct LineBreakpointHelpers {
 pub struct LightGcOffsets {
     /// `Process.heap.fragment_words` (`mbuf_sz`), a 32-bit count of words.
     pub fragment_words: u32,
-    /// `Process.heap.bin_vheap` (`off_heap.overhead`).
-    pub bin_vheap: u32,
+    /// `Process.heap.owners`, an optional pointer to off-heap counters.
+    pub owners_pointer: u32,
+    /// Offset of `HeapOwners.overhead` from `owners_pointer`.
+    pub off_heap_overhead: u32,
     /// `Process.heap.bin_vheap_size` (`bin_vheap_sz`).
     pub bin_vheap_size: u32,
     /// `Process.gc_enabled` as a byte; clear means `F_DISABLE_GC`.
@@ -1181,10 +1183,20 @@ fn emit_call_light_bif_shared(
         // NZCV constants are erts' NZCV::kCF (C) and NZCV::kVF (V).
         const NZCV_CF: u8 = 0b0010;
         const NZCV_VF: u8 = 0b0001;
+        let owners_empty = code.new_label();
+        let owners_loaded = code.new_label();
         code.emit(|encoder| {
             encoder.ldrb_uoff(Gpr::w(9), Gpr::x(21), gc.gc_enabled as u16)?;
             encoder.cmp_imm(Gpr::w(9), 1, false)?;
-            encoder.ldr_uoff(Gpr::x(12), Gpr::x(21), gc.bin_vheap)?;
+            encoder.ldr_uoff(Gpr::x(12), Gpr::x(21), gc.owners_pointer)
+        })?;
+        code.cbz(Gpr::x(12), owners_empty)?;
+        code.emit(|encoder| encoder.ldr_uoff(Gpr::x(12), Gpr::x(12), gc.off_heap_overhead))?;
+        code.b(owners_loaded)?;
+        code.bind(owners_empty)?;
+        code.emit(|encoder| encoder.mov_reg(Gpr::x(12), Gpr::xzr()))?;
+        code.bind(owners_loaded)?;
+        code.emit(|encoder| {
             encoder.ldr_uoff(Gpr::x(13), Gpr::x(21), gc.bin_vheap_size)?;
             // Enabled: overhead against bin_vheap_sz. Disabled: C is set, so the next
             // condition fails and collection is taken.
