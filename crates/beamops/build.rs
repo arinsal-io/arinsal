@@ -74,7 +74,11 @@ fn main() {
     for name in &names {
         out.push_str(&format!("Self::{}(args) => args,\n", camel(name)));
     }
-    out.push_str("Self::Unknown { operands, .. } => operands,\n} } }\n/// All operation names declared in OTP's ARM64 ops table.\npub static SPECIFIC_OP_NAMES: &[&str] = &[\n");
+    out.push_str("Self::Unknown { operands, .. } => operands,\n} }\n/// The dense identity of the operation: its index in [`SPECIFIC_OP_NAMES`], `u16::MAX` for an unknown one.\npub fn id(&self) -> u16 { match self {\n");
+    for (index, name) in names.iter().enumerate() {
+        out.push_str(&format!("Self::{}(_) => {index},\n", camel(name)));
+    }
+    out.push_str("Self::Unknown { .. } => u16::MAX,\n} } }\n/// All operation names declared in OTP's ARM64 ops table.\npub static SPECIFIC_OP_NAMES: &[&str] = &[\n");
     for name in &names {
         out.push_str(&format!("{name:?},\n"));
     }

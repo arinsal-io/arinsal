@@ -1574,7 +1574,10 @@ pub fn compile_parsed_module_with_options(
 
     for ops in specialized {
         // Ops before the first function label (module preamble) are not a function.
-        if !ops.iter().any(|op| op.name() == "i_func_label") {
+        if !ops
+            .iter()
+            .any(|op| matches!(op, SpecificOp::OpIFuncLabel(_)))
+        {
             continue;
         }
         let (name, arity, label) = function_identity(&ops, beam);
@@ -1639,12 +1642,14 @@ pub fn compile_parsed_module_with_options(
         let native_labels = candidates
             .iter()
             .flat_map(|(_, _, label, ops)| {
-                std::iter::once(*label).chain(ops.iter().filter_map(|op| match op.name() {
-                    "label" | "aligned_label" => as_u32(op.operands().first()),
+                std::iter::once(*label).chain(ops.iter().filter_map(|op| match op {
+                    SpecificOp::OpLabel(args) | SpecificOp::OpAlignedLabel(args) => {
+                        as_u32(args.first())
+                    }
                     _ => None,
                 }))
             })
-            .collect::<BTreeSet<_>>();
+            .collect::<LabelSet>();
         let mut removed = false;
         let mut index = 0;
         while index < candidates.len() {
@@ -1734,7 +1739,7 @@ pub fn compile_parsed_module_with_options(
         });
         let has_nif_start = candidates
             .iter()
-            .any(|(_, _, _, ops)| ops.iter().any(|op| op.name() == "nif_start"));
+            .any(|(_, _, _, ops)| ops.iter().any(|op| matches!(op, SpecificOp::OpNifStart(_))));
         let mut failure_reason = None;
 
         for (index, (name, arity, label, ops)) in candidates.iter().enumerate() {
@@ -1745,7 +1750,7 @@ pub fn compile_parsed_module_with_options(
             // (may_load_nif, are_nifs), OTP-29.1.1: functions a load_nif can replace.
             let nif_candidate = native_body.is_none()
                 && may_load_nif
-                && (!has_nif_start || ops.iter().any(|op| op.name() == "nif_start"));
+                && (!has_nif_start || ops.iter().any(|op| matches!(op, SpecificOp::OpNifStart(_))));
             for op in ops {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:452, OTP-29.1.1.
                 if let Err(error) = assembler.check_pending_stubs() {
@@ -1758,7 +1763,7 @@ pub fn compile_parsed_module_with_options(
                 } else {
                     0
                 };
-                if op.name() == "nif_start"
+                if matches!(op, SpecificOp::OpNifStart(_))
                     && let Some((identity, helper)) = native_body
                 {
                     if let Err(error) =
@@ -1787,7 +1792,7 @@ pub fn compile_parsed_module_with_options(
                     break;
                 }
                 if nif_candidate
-                    && op.name() == "i_breakpoint_trampoline"
+                    && matches!(op, SpecificOp::OpIBreakpointTrampoline(_))
                     && let Some((identity, helper)) = env.dynamic_nif_body(name, *arity)
                     && let Err(error) =
                         assembler.emit_nif_patch_site(identity, helper, *arity as usize)
@@ -2041,16 +2046,44 @@ fn as_u32(value: Option<&SpecificOperand>) -> Option<u32> {
 }
 
 fn call_target(op: &SpecificOp) -> Option<u32> {
-    match op.name() {
-        "i_call" | "i_call_only" => as_u32(op.operands().first()),
-        "i_call_last" => as_u32(op.operands().first()),
-        "move_call_last" => as_u32(op.operands().get(2)),
+    match op {
+        SpecificOp::OpICall(args)
+        | SpecificOp::OpICallOnly(args)
+        | SpecificOp::OpICallLast(args) => as_u32(args.first()),
+        SpecificOp::OpMoveCallLast(args) => as_u32(args.get(2)),
         _ => None,
     }
 }
 
+/// A set of BEAM labels: dense `u32`s, so a bitmap indexed by label.
+#[derive(Default)]
+struct LabelSet(Vec<bool>);
+
+impl LabelSet {
+    fn contains(&self, label: &u32) -> bool {
+        self.0.get(*label as usize).copied().unwrap_or(false)
+    }
+}
+
+impl FromIterator<u32> for LabelSet {
+    fn from_iter<I: IntoIterator<Item = u32>>(labels: I) -> Self {
+        let mut set = Vec::new();
+        for label in labels {
+            let index = label as usize;
+            if set.len() <= index {
+                set.resize(index + 1, false);
+            }
+            set[index] = true;
+        }
+        Self(set)
+    }
+}
+
 fn lambda_call_target(op: &SpecificOp, beam: &BeamFile) -> Option<u32> {
-    if !matches!(op.name(), "i_call_fun2" | "i_call_fun2_last") {
+    if !matches!(
+        op,
+        SpecificOp::OpICallFun2(_) | SpecificOp::OpICallFun2Last(_)
+    ) {
         return None;
     }
     let FunCallTag::Lambda(index) = fun_call_tag(op.operands().first(), beam).ok()? else {
@@ -2452,7 +2485,7 @@ fn emit_op(
     // Guard-context arithmetic branches to its failure label instead of raising.
     assembler.set_arith_fail(0);
     if matches!(
-        ported(op.name()),
+        ported_op(op),
         Some(
             EmitterKind::Plus
                 | EmitterKind::Minus
@@ -2472,7 +2505,7 @@ fn emit_op(
     {
         assembler.set_arith_fail(fail);
     }
-    let result = match ported(op.name()).expect("dispatch only follows capability validation") {
+    let result = match ported_op(op).expect("dispatch only follows capability validation") {
         EmitterKind::Metadata => match op.name() {
             "i_flush_stubs" => {
                 count(0)?;
@@ -2627,7 +2660,7 @@ fn emit_op(
             assembler.swap(value(1)?, value(2)?)
         }
         EmitterKind::Swap3 | EmitterKind::Swap4 => {
-            let swaps = if matches!(ported(op.name()), Some(EmitterKind::Swap3)) {
+            let swaps = if matches!(ported_op(op), Some(EmitterKind::Swap3)) {
                 3
             } else {
                 4
@@ -4125,7 +4158,7 @@ fn emit_op(
                     op.name()
                 )));
             }
-            let is_tuple_arity = matches!(ported(op.name()), Some(EmitterKind::SelectTupleArity));
+            let is_tuple_arity = matches!(ported_op(op), Some(EmitterKind::SelectTupleArity));
             let payload = args[3..]
                 .iter()
                 .enumerate()
@@ -4148,7 +4181,7 @@ fn emit_op(
                 .map(|pair| pair[0])
                 .chain(payload.as_chunks::<2>().0.iter().map(|pair| pair[1]))
                 .collect::<Vec<_>>();
-            if matches!(ported(op.name()), Some(EmitterKind::SelectVal)) {
+            if matches!(ported_op(op), Some(EmitterKind::SelectVal)) {
                 let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
                 // Port of erts/emulator/beam/jit/arm/instr_select.cpp:107-190,
                 // OTP-29.1.1, and of gen.select_val in generators.tab, which
@@ -4171,7 +4204,7 @@ fn emit_op(
             count(6)?;
             let src = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
             let fail = value(1)?;
-            let is_tuple_arity = matches!(ported(op.name()), Some(EmitterKind::SelectTupleArity2));
+            let is_tuple_arity = matches!(ported_op(op), Some(EmitterKind::SelectTupleArity2));
             let first = if is_tuple_arity {
                 match args.get(2) {
                     Some(SpecificOperand::SmallInt(val)) => ArgVal::Immediate(*val as u64),
@@ -4192,7 +4225,7 @@ fn emit_op(
                 value(4)?
             };
             let second_label = value(5)?;
-            if matches!(ported(op.name()), Some(EmitterKind::SelectVal2)) {
+            if matches!(ported_op(op), Some(EmitterKind::SelectVal2)) {
                 assembler.emit_i_select_val2(src, fail, first, first_label, second, second_label)
             } else {
                 assembler.emit_i_select_tuple_arity2(
@@ -4560,6 +4593,22 @@ fn emit_op(
 
 fn ported(name: &str) -> Option<EmitterKind> {
     ported_index().get(name).copied()
+}
+
+/// The emitter of `op`, from a table indexed by the op's dense identity.
+fn ported_op(op: &SpecificOp) -> Option<EmitterKind> {
+    static TABLE: std::sync::OnceLock<Vec<Option<EmitterKind>>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        arinsal_beamops::SPECIFIC_OP_NAMES
+            .iter()
+            .map(|name| ported(name))
+            .collect()
+    });
+    match op.id() {
+        // An operation outside OTP's declared set is found by name.
+        u16::MAX => ported(op.name()),
+        id => table.get(usize::from(id)).copied().flatten(),
+    }
 }
 
 /// Error returned for invalid input files or module-wide emission failures.
