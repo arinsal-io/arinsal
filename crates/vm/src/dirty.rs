@@ -90,7 +90,7 @@ pub(crate) fn static_nif_job(
 
 /// The terms of a finished dirty job's result: a dirty BIF value, or a static NIF value or
 /// the terms of its exception.
-fn dirty_result_slots<'a>(
+pub(crate) fn dirty_result_slots<'a>(
     dirty_bif: Option<&'a mut DirtyBif>,
     static_nif_done: Option<&'a mut Result<Term, arinsal_bifs::BifError>>,
 ) -> Vec<&'a mut Term> {

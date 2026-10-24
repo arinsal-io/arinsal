@@ -131,10 +131,6 @@ struct MessageFragment {
 
 type RemovedMessage = (Term, crate::seq_trace::SeqState);
 
-/// A queued message whose data is still in its heap fragment, as an on-heap collection moves
-/// it: the term, the copy of its sequential trace token in the same fragment, and the fragment.
-pub(crate) type MovedMessage = (Term, Term, Option<arinsal_term::message::MessageHeap>);
-
 /// Which part of a queued message a collection root stands for.
 #[derive(Clone, Copy)]
 pub(crate) struct RootSlot {
@@ -459,8 +455,29 @@ impl MessageQueue {
     /// terms that live on the heap and, like erts' `ERL_MESSAGE_TOKEN` roots, the copies of
     /// sequential trace tokens that live there.
     pub(crate) fn gc_root_snapshot(&self) -> (Vec<RootSlot>, Vec<Term>) {
-        let mut slots = Vec::new();
         let mut roots = Vec::new();
+        let slots = self.gc_root_slots();
+        for slot in &slots {
+            let entry = queued(self.entries.get(slot.entry).expect("root index"));
+            roots.push(if slot.token {
+                entry
+                    .fragment
+                    .as_ref()
+                    .unwrap()
+                    .seq_token
+                    .as_ref()
+                    .unwrap()
+                    .heap_ref()
+            } else {
+                entry.term
+            });
+        }
+        (slots, roots)
+    }
+
+    /// Describe only message terms that already live on the process heap.
+    fn gc_root_slots(&self) -> Vec<RootSlot> {
+        let mut slots = Vec::new();
         for (index, entry) in self.entries.iter().map(queued).enumerate() {
             let on_heap = !entry.combined
                 && entry
@@ -475,7 +492,6 @@ impl MessageQueue {
                     entry: index,
                     token: false,
                 });
-                roots.push(entry.term);
             }
             if let Some(token) = entry
                 .fragment
@@ -487,10 +503,81 @@ impl MessageQueue {
                     entry: index,
                     token: true,
                 });
-                roots.push(token.heap_ref());
             }
         }
-        (slots, roots)
+        slots
+    }
+
+    /// Build root descriptors over live queue slots and detached fragments.
+    // Port of erts/emulator/beam/erl_gc.c:2616 (`setup_rootset`), OTP-29.1.1.
+    fn gc_root_slots_and_moved_messages<'a>(
+        &'a mut self,
+        moved_indices: &[usize],
+        moved_heaps: Vec<Option<arinsal_term::message::MessageHeap>>,
+        roots: &mut arinsal_term::GcRootSet<'a>,
+    ) -> Vec<arinsal_term::GcMessageRoot<'a>> {
+        let mut messages = Vec::with_capacity(moved_indices.len());
+        let mut moved = moved_indices.iter().copied().zip(moved_heaps).peekable();
+        for (index, event) in self.entries.iter_mut().enumerate() {
+            let entry = queued_mut(event);
+            if moved
+                .peek()
+                .is_some_and(|(moved_index, _)| *moved_index == index)
+            {
+                let (_, heap) = moved.next().expect("peeked moved message");
+                let token = entry
+                    .fragment
+                    .as_mut()
+                    .and_then(|fragment| fragment.seq_token.as_mut())
+                    .filter(|token| token.root().is_pointer())
+                    .map(|token| token.heap_ref_mut());
+                messages.push(arinsal_term::GcMessageRoot::new(
+                    &mut entry.term,
+                    token,
+                    heap,
+                ));
+                continue;
+            }
+            let on_heap = !entry.combined
+                && entry
+                    .fragment
+                    .as_ref()
+                    .is_none_or(|fragment| fragment.heap.is_none());
+            if on_heap {
+                let token = entry
+                    .fragment
+                    .as_mut()
+                    .and_then(|fragment| fragment.seq_token.as_mut())
+                    .filter(|token| token.root().is_pointer())
+                    .map(|token| token.heap_ref_mut());
+                if entry.term.is_pointer() {
+                    roots.push_term(&mut entry.term);
+                }
+                if let Some(token) = token {
+                    roots.push_term(token);
+                }
+            }
+        }
+        assert!(moved.next().is_none(), "all moved messages were found");
+        messages
+    }
+
+    /// Rewrite mailbox terms after an operation that explicitly snapshots and transforms them.
+    pub(crate) fn update_gc_roots(&mut self, slots: &[RootSlot], roots: &[Term]) {
+        for (slot, &term) in slots.iter().zip(roots) {
+            let entry = queued_mut(self.entries.get_mut(slot.entry).expect("root index"));
+            if slot.token {
+                if let Some(token) = entry
+                    .fragment
+                    .as_mut()
+                    .and_then(|fragment| fragment.seq_token.as_mut())
+                {
+                    *token.heap_ref_mut() = term;
+                }
+            } else {
+                entry.term = term;
+            }
+        }
     }
 
     /// Whether a message's data refers to the retiring `area`.
@@ -579,41 +666,36 @@ impl MessageQueue {
     /// the heap (on-heap message queue). Each entry carries the message term and the copy of
     /// its sequential trace token that sits in the same fragment.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8851-8880 (move_msg_to_heap), OTP-29.1.1.
-    pub(crate) fn take_message_fragments(&mut self) -> (Vec<usize>, Vec<MovedMessage>) {
+    pub(crate) fn take_message_fragments(
+        &mut self,
+    ) -> (Vec<usize>, Vec<Option<arinsal_term::message::MessageHeap>>) {
         let mut indices = Vec::new();
         let mut fragments = Vec::new();
         for index in 0..self.entries.len() {
             if let Some(fragment) = self.detach_inline_at(index) {
-                let term = queued(self.entries.get(index).expect("index within the queue")).term;
                 indices.push(index);
-                fragments.push((
-                    term,
-                    Term::NIL,
-                    Some(arinsal_term::message::MessageHeap::Node(fragment)),
-                ));
+                fragments.push(Some(arinsal_term::message::MessageHeap::Node(fragment)));
                 continue;
             }
             let entry = queued_mut(self.entries.get_mut(index).expect("index within the queue"));
-            let term = entry.term;
             if let Some(fragment) = entry.fragment.as_mut()
                 && let Some(heap) = fragment.heap.take()
             {
                 indices.push(index);
-                let token = fragment
-                    .seq_token
-                    .as_ref()
-                    .map_or(Term::NIL, |token| token.heap_ref());
-                fragments.push((term, token, Some(heap)));
+                fragments.push(Some(heap));
             }
         }
         (indices, fragments)
     }
 
-    /// Store the terms of messages moved onto the heap; their fragments are gone.
-    pub(crate) fn restore_moved_messages(&mut self, indices: &[usize], moved: Vec<MovedMessage>) {
-        for (&index, (term, token, heap)) in indices.iter().zip(moved) {
+    /// Restore detached message heaps; collection rewrote their term slots in place.
+    pub(crate) fn restore_moved_heaps(
+        &mut self,
+        indices: &[usize],
+        heaps: Vec<Option<arinsal_term::message::MessageHeap>>,
+    ) {
+        for (&index, heap) in indices.iter().zip(heaps) {
             let entry = queued_mut(self.entries.get_mut(index).expect("moved message index"));
-            entry.term = term;
             if entry.fragment.is_none() && heap.is_some() {
                 // A detached inline fragment the collection did not consume stays the
                 // message's data as a fragment of its own.
@@ -623,30 +705,10 @@ impl MessageQueue {
                 }));
             }
             if let Some(fragment) = entry.fragment.as_mut() {
-                if let Some(seq_token) = fragment.seq_token.as_mut() {
-                    *seq_token.heap_ref_mut() = token;
-                }
                 fragment.heap = heap;
                 if fragment.heap.is_none() && fragment.seq_token.is_none() {
                     entry.fragment = None;
                 }
-            }
-        }
-    }
-
-    pub(crate) fn update_gc_roots(&mut self, slots: &[RootSlot], roots: &[Term]) {
-        for (slot, &term) in slots.iter().zip(roots) {
-            let entry = queued_mut(self.entries.get_mut(slot.entry).expect("root index"));
-            if slot.token {
-                if let Some(token) = entry
-                    .fragment
-                    .as_mut()
-                    .and_then(|fragment| fragment.seq_token.as_mut())
-                {
-                    *token.heap_ref_mut() = term;
-                }
-            } else {
-                entry.term = term;
             }
         }
     }
@@ -678,22 +740,20 @@ impl Message {
 
     /// The copy of the sequential trace token that sits on the receiver's heap, a collection
     /// root like the message term.
-    fn heap_token_root(&self) -> Option<Term> {
-        let fragment = self.fragment.as_ref()?;
-        if fragment.heap.is_some() {
-            return None;
-        }
-        let token = fragment.seq_token.as_ref()?;
-        token.root().is_pointer().then_some(token.heap_ref())
-    }
-
-    fn set_heap_token_root(&mut self, root: Term) {
-        if let Some(token) = self
+    fn append_heap_roots_mut<'a>(&'a mut self, roots: &mut arinsal_term::GcRootSet<'a>) {
+        let heap_root = self.is_heap_root();
+        let token_root = self
             .fragment
             .as_mut()
+            .filter(|fragment| fragment.heap.is_none())
             .and_then(|fragment| fragment.seq_token.as_mut())
-        {
-            *token.heap_ref_mut() = root;
+            .filter(|token| token.root().is_pointer())
+            .map(|token| token.heap_ref_mut());
+        if heap_root {
+            roots.push_term(&mut self.term);
+        }
+        if let Some(token) = token_root {
+            roots.push_term(token);
         }
     }
 
@@ -7038,13 +7098,6 @@ impl Process {
         Ok(())
     }
 
-    fn sig_cont_message(payload: &Payload<Message>) -> Option<&Message> {
-        match payload {
-            Payload::Message(message) | Payload::TimerMessage { message, .. } => Some(message),
-            _ => None,
-        }
-    }
-
     fn sig_cont_message_mut(payload: &mut Payload<Message>) -> Option<&mut Message> {
         match payload {
             Payload::Message(message) | Payload::TimerMessage { message, .. } => Some(message),
@@ -7165,96 +7218,7 @@ impl Process {
         if self.max_heap_limited() {
             self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
         }
-        let (indices, mut roots) = self.inbox.gc_root_snapshot();
-        let mailbox_len = roots.len();
-        let continuation = self
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.persistent_get_all.as_ref())
-            .map(|state| state.result);
-        if let Some(result) = continuation {
-            roots.push(result);
-        }
-        roots.extend_from_slice(extra);
-        let extra_end = roots.len();
-        // The process dictionary is rooted on the process heap, like erts' ProcDict.
-        // Port of erts/emulator/beam/erl_process_dict.c (erts_dicts_mem_size / GC roots), OTP-29.1.1.
-        let dict_len = self
-            .dictionary
-            .as_ref()
-            .map_or(0, |dictionary| dictionary.len());
-        if let Some(dictionary) = self.dictionary.as_ref() {
-            for (key, value) in dictionary.entries() {
-                roots.push(key);
-                roots.push(value);
-            }
-        }
-        let dict_end = roots.len();
-        let inline_len = usize::from(self.apply_inline_len);
-        roots.extend_from_slice(&self.apply_inline[..inline_len]);
-        let mut nif_roots_len = 0;
-        let mut trap_roots_len = 0;
-        let mut bif_trap_state_root = None;
-        if let Some(cold) = self.cold.as_mut() {
-            roots.extend_from_slice(&cold.apply_roots);
-            if let Some(released) = cold.ext_last_released.as_ref() {
-                roots.extend_from_slice(&released.words);
-            }
-            if let Some(pending) = cold.nif_pending.as_mut() {
-                nif_roots_len = pending.roots_mut().len();
-                roots.extend_from_slice(pending.roots_mut());
-            }
-            // Port of erts/emulator/beam/bif.h (ERTS_BIF_PREP_TRAPn leaves the arguments in
-            // `reg`, the `c_p->arity` live registers of the process while it is trapped),
-            // OTP-29.1.1.
-            if let Some(trap) = cold.bif_trap.as_ref().filter(|trap| trap.args_are_roots()) {
-                trap_roots_len = trap.arity;
-                roots.extend_from_slice(&trap.args[..trap.arity]);
-            }
-            if let Some(term) = cold.bif_trap.as_ref().and_then(|trap| trap.state_term) {
-                bif_trap_state_root = Some(roots.len());
-                roots.push(term);
-            }
-        }
-        let ets_insert_root = self
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.ets_insert.as_deref())
-            .and_then(crate::proc_create::EtsInsert::cursor)
-            .map(|cursor| {
-                let index = roots.len();
-                roots.push(cursor);
-                index
-            });
-        // Port of erts/emulator/beam/erl_db_hash.c (select_chunk_on_trap: the partial result
-        // list is a term of the continuation), OTP-29.1.1: the results a trapped `select` has
-        // so far are roots until it resumes.
-        let ets_select_start = roots.len();
-        if let Some(state) = self.cold.as_ref().and_then(|cold| cold.ets_select.as_ref()) {
-            roots.extend_from_slice(state.saved.terms());
-        }
-        let ets_select_end = roots.len();
-        // A finished dirty job's result is in erts' argument registers until the call resumes.
-        let dirty_start = roots.len();
-        roots.extend(self.dirty_result_roots());
-        let dirty_end = roots.len();
-        // Port of erts/emulator/beam/erl_gc.c:2616 (setup_rootset walks the message queue and
-        // the middle signal queue, ERTS_FOREACH_SIG_PRIVQS), OTP-29.1.1: on-heap messages still
-        // waiting in the middle queue are roots too.
-        let cont_start = roots.len();
-        roots.extend(self.sig_cont.iter().filter_map(|event| {
-            Self::sig_cont_message(&event.payload)
-                .filter(|message| message.is_heap_root())
-                .map(|message| message.term)
-        }));
-        // Port of erts/emulator/beam/erl_gc.c:2616 (setup_rootset roots `p->seq_trace_token` and
-        // the token of each queued on-heap message), OTP-29.1.1.
         crate::seq_trace::sync_epoch(self);
-        let seq_start = roots.len();
-        roots.push(self.seq_token_root);
-        roots.extend(self.sig_cont.iter().filter_map(|event| {
-            Self::sig_cont_message(&event.payload).and_then(Message::heap_token_root)
-        }));
         // Port of erts/emulator/beam/erl_gc.c:832-901 (`trace_gc` around minor/major collections), OTP-29.1.1.
         let traced = self
             .self_pid
@@ -7291,7 +7255,7 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_gc.c:1500-1501 and 1947-1948, OTP-29.1.1: with an
         // on-heap message queue the collection moves queued message data onto the heap.
-        let (moved_indices, mut moved) =
+        let (moved_indices, moved_fragments) =
             if !hibernate && self.message_queue_data() == MessageQueueData::OnHeap {
                 self.inbox.take_message_fragments()
             } else {
@@ -7313,12 +7277,13 @@ impl Process {
             }) as u64;
             let checks = match self
                 .heap
-                .max_heap_collection_checks(min_free, moved.iter().map(|(_, _, heap)| heap))
+                .max_heap_collection_checks(min_free, moved_fragments.iter())
             {
                 Ok(checks) => checks,
                 Err(error) => {
                     if !moved_indices.is_empty() {
-                        self.inbox.restore_moved_messages(&moved_indices, moved);
+                        self.inbox
+                            .restore_moved_heaps(&moved_indices, moved_fragments);
                     }
                     return Err(VmError::Unsupported(format!("process GC: {error:?}")));
                 }
@@ -7331,21 +7296,86 @@ impl Process {
                 self.max_heap_peak = self.max_heap_peak.max(size);
                 if limit.kill {
                     if !moved_indices.is_empty() {
-                        self.inbox.restore_moved_messages(&moved_indices, moved);
+                        self.inbox
+                            .restore_moved_heaps(&moved_indices, moved_fragments);
                     }
                     return Err(VmError::Unsupported("max_heap_size".into()));
                 }
             }
         }
+        // Port of erts/emulator/beam/erl_gc.c:2616 (`setup_rootset`), OTP-29.1.1:
+        // descriptors refer to live term slots; collection rewrites those slots in place.
+        let mut roots = arinsal_term::GcRootSet::new();
+        roots.push(&mut self.x[..live_x]);
+        let mut moved = self.inbox.gc_root_slots_and_moved_messages(
+            &moved_indices,
+            moved_fragments,
+            &mut roots,
+        );
+        roots.push(extra);
+        if let Some(dictionary) = self.dictionary.as_mut() {
+            dictionary.append_gc_root_slots(&mut roots);
+        }
+        let inline_len = usize::from(self.apply_inline_len);
+        roots.push(&mut self.apply_inline[..inline_len]);
+        if let Some(cold) = self.cold.as_mut() {
+            if let Some(state) = cold.persistent_get_all.as_mut() {
+                roots.push_term(&mut state.result);
+            }
+            roots.push(&mut cold.apply_roots);
+            if let Some(released) = cold.ext_last_released.as_mut() {
+                roots.push(&mut released.words);
+            }
+            if let Some(pending) = cold.nif_pending.as_mut() {
+                roots.push(pending.roots_mut());
+            }
+            if let Some(trap) = cold.bif_trap.as_mut() {
+                if trap.args_are_roots() {
+                    roots.push(&mut trap.args[..trap.arity]);
+                }
+                if let Some(state) = trap.state_term.as_mut() {
+                    roots.push_term(state);
+                }
+            }
+            if let Some(cursor) = cold
+                .ets_insert
+                .as_deref_mut()
+                .and_then(crate::proc_create::EtsInsert::cursor_mut)
+            {
+                roots.push_term(cursor);
+            }
+            if let Some(state) = cold.ets_select.as_mut() {
+                roots.push(state.saved.roots_mut());
+            }
+            for root in crate::dirty::dirty_result_slots(
+                cold.dirty_bif.as_mut(),
+                cold.static_nif_done.as_mut(),
+            ) {
+                roots.push_term(root);
+            }
+        }
+        for event in &mut self.sig_cont {
+            if let Some(message) = Self::sig_cont_message_mut(&mut event.payload) {
+                message.append_heap_roots_mut(&mut roots);
+            }
+        }
+        roots.push_term(&mut self.seq_token_root);
+        let mut extra_rootset = arinsal_term::GcRootSet::new();
         let stats = if hibernate {
             self.heap
-                .collect_hibernate(&mut self.x[..live_x], &mut roots)
+                .collect_hibernate_root_slots(&mut roots, &mut extra_rootset)
         } else {
             self.heap
-                .collect_with_messages(&mut self.x[..live_x], &mut roots, min_free, &mut moved)
+                .collect_with_root_slots(&mut roots, &mut extra_rootset, min_free, &mut moved)
         };
+        drop((roots, extra_rootset));
         if !moved_indices.is_empty() {
-            self.inbox.restore_moved_messages(&moved_indices, moved);
+            let heaps = moved
+                .iter_mut()
+                .map(|message| message.take_heap())
+                .collect();
+            drop(moved);
+            self.inbox.restore_moved_heaps(&moved_indices, heaps);
         }
         let stats =
             stats.map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
@@ -7354,95 +7384,6 @@ impl Process {
         }
         self.stats.gc.collections += stats.collections;
         self.stats.gc.nanoseconds += stats.nanoseconds;
-        self.inbox.update_gc_roots(&indices, &roots[..mailbox_len]);
-        if continuation.is_some()
-            && let Some(state) = self
-                .cold
-                .as_mut()
-                .and_then(|cold| cold.persistent_get_all.as_mut())
-        {
-            state.result = roots[mailbox_len];
-        }
-        let extra_start = mailbox_len + usize::from(continuation.is_some());
-        extra.copy_from_slice(&roots[extra_start..extra_end]);
-        if let Some(dictionary) = self.dictionary.as_mut() {
-            let mut index = extra_end;
-            dictionary.for_each_mut(|key, value| {
-                *key = roots[index];
-                *value = roots[index + 1];
-                index += 2;
-            });
-            assert_eq!(index, extra_end + 2 * dict_len, "dictionary GC roots");
-        }
-        let inline_len = usize::from(self.apply_inline_len);
-        self.apply_inline[..inline_len].copy_from_slice(&roots[dict_end..dict_end + inline_len]);
-        if let Some(cold) = self.cold.as_mut() {
-            let apply_start = dict_end + inline_len;
-            let apply_end = apply_start + cold.apply_roots.len();
-            cold.apply_roots
-                .copy_from_slice(&roots[apply_start..apply_end]);
-            let released_end = apply_end
-                + cold
-                    .ext_last_released
-                    .as_ref()
-                    .map_or(0, |released| released.words.len());
-            if let Some(released) = cold.ext_last_released.as_mut() {
-                released
-                    .words
-                    .copy_from_slice(&roots[apply_end..released_end]);
-            }
-            if let Some(pending) = cold.nif_pending.as_mut() {
-                pending
-                    .roots_mut()
-                    .copy_from_slice(&roots[released_end..released_end + nif_roots_len]);
-            }
-            if trap_roots_len != 0
-                && let Some(trap) = cold.bif_trap.as_mut()
-            {
-                let start = released_end + nif_roots_len;
-                trap.args[..trap_roots_len].copy_from_slice(&roots[start..start + trap_roots_len]);
-            }
-            if let Some(index) = bif_trap_state_root
-                && let Some(trap) = cold.bif_trap.as_mut()
-            {
-                trap.state_term = Some(roots[index]);
-            }
-            if let Some(index) = ets_insert_root
-                && let Some(state) = cold.ets_insert.as_mut()
-            {
-                state.update_cursor(roots[index]);
-            }
-            if let Some(state) = cold.ets_select.as_mut() {
-                state
-                    .saved
-                    .roots_mut()
-                    .copy_from_slice(&roots[ets_select_start..ets_select_end]);
-            }
-        }
-        for (slot, &term) in self
-            .dirty_result_roots_mut()
-            .into_iter()
-            .zip(&roots[dirty_start..dirty_end])
-        {
-            *slot = term;
-        }
-        self.seq_token_root = roots[seq_start];
-        let mut token_roots = roots[seq_start + 1..].iter();
-        for event in &mut self.sig_cont {
-            if let Some(message) = Self::sig_cont_message_mut(&mut event.payload)
-                && message.heap_token_root().is_some()
-            {
-                message.set_heap_token_root(*token_roots.next().expect("middle queue token root"));
-            }
-        }
-        let mut cont_roots = roots[cont_start..seq_start].iter();
-        for event in &mut self.sig_cont {
-            if let Some(message) = Self::sig_cont_message_mut(&mut event.payload)
-                && message.is_heap_root()
-            {
-                message.term = *cont_roots.next().expect("middle queue GC root");
-            }
-        }
         if self.max_heap_peak != 0 || self.max_heap_limited() {
             self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
         }

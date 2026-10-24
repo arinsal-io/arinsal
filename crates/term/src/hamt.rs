@@ -19,6 +19,7 @@ use std::mem::MaybeUninit;
 ///
 /// # Safety
 /// `ptr` must address a live boxed object with its complete payload initialized.
+#[inline(always)]
 pub unsafe fn boxed_object_words(header: u64, ptr: *const u64) -> usize {
     // Port of erts/emulator/beam/erl_map.c:198-237, OTP-29.1.1.
     match header & 63 {

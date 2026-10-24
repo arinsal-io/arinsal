@@ -580,6 +580,25 @@ impl ProcDict {
         }
     }
 
+    // Port of erts/emulator/beam/erl_gc.c:2616 (`setup_rootset`, ProcDict range), OTP-29.1.1.
+    pub(crate) fn append_gc_root_slots<'a>(&'a mut self, roots: &mut arinsal_term::GcRootSet<'a>) {
+        let mut live = vec![false; self.nodes.len()];
+        for slot in 0..self.used_slots as usize {
+            let mut cur = self.heads[slot];
+            while cur != NIL_NODE {
+                live[cur as usize] = true;
+                cur = self.nodes[cur as usize].next;
+            }
+        }
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            if !live[index] {
+                continue;
+            }
+            roots.push_term(&mut node.key);
+            roots.push_term(&mut node.value);
+        }
+    }
+
     pub(crate) fn assign_entries(&mut self, pairs: &[(Term, Term)]) {
         let mut index = 0;
         self.for_each_mut(|key, value| {
@@ -2263,10 +2282,10 @@ impl EtsInsert {
         }
     }
 
-    pub(crate) fn update_cursor(&mut self, term: Term) {
+    pub(crate) fn cursor_mut(&mut self) -> Option<&mut Term> {
         match self {
-            Self::Check { cursor, .. } | Self::Copy { cursor, .. } => *cursor = term,
-            Self::Global(_) => unreachable!("global ETS insert has no list cursor"),
+            Self::Check { cursor, .. } | Self::Copy { cursor, .. } => Some(cursor),
+            Self::Global(_) => None,
         }
     }
 }
