@@ -1203,6 +1203,8 @@ fn lifetime_trace_enabled() -> bool {
 /// Owns a compiled module version and the heap that backs its embedded literals.
 pub(crate) struct CompiledVersion {
     module: String,
+    /// Functions of the module BeamAsm could not compile: they run in the interpreter.
+    pub(crate) unported_functions: usize,
     scope: u64,
     module_handle: u64,
     installed: AtomicBool,
@@ -2404,6 +2406,7 @@ pub(crate) fn compile(
         })
         .collect();
     let version = Arc::new(CompiledVersion {
+        unported_functions: compiled.unported.len(),
         module: compiled.name.clone(),
         scope,
         module_handle,

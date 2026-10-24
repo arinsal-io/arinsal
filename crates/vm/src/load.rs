@@ -845,10 +845,36 @@ impl Vm {
         beam: &BeamFile,
         bytes: Option<&[u8]>,
     ) -> Result<Module, VmError> {
-        let mut module = arinsal_loader::load_with_instrumentations(
+        self.prepare_module_with(beam, bytes, true)
+    }
+
+    /// Whether a module may be loaded without the interpreter form of its code: BeamAsm is
+    /// the engine, nothing patches the code at load (`-on_load`, coverage, debugger lines)
+    /// and the module is no special one. It still needs the interpreter form when BeamAsm
+    /// leaves a function unported, which the caller checks after compiling.
+    pub(crate) fn native_only(&self, beam: &BeamFile, meta: &CodeMeta) -> bool {
+        meta.has_beam_bytes
+            && beamasm_integration::enabled()
+            && meta.on_load.is_none()
+            && matches!(self.coverage_mode(), arinsal_loader::CoverageMode::None)
+            && !crate::trace_bp::line_breakpoints_instrumented()
+            && beam.module != "erts_internal"
+            && std::env::var_os("ARINSAL_FULL_SPECIALIZE").is_none()
+    }
+
+    /// [`prepare_module`](Self::prepare_module), optionally leaving the interpreter form of
+    /// the code out (`specialize == false`).
+    pub(crate) fn prepare_module_with(
+        &self,
+        beam: &BeamFile,
+        bytes: Option<&[u8]>,
+        specialize: bool,
+    ) -> Result<Module, VmError> {
+        let mut module = arinsal_loader::load_with_options(
             beam,
             self.coverage_mode(),
             crate::trace_bp::line_breakpoints_instrumented(),
+            specialize,
         )
         .map_err(|e| VmError::Load(e.to_string()))?;
         if let Some(bytes) = bytes {
@@ -984,9 +1010,15 @@ impl Vm {
         if let Some(&id) = self.code.loaded.get(&beam.module) {
             return Ok(id);
         }
-        let mut module = self.prepare_module(beam, bytes)?;
-        let registers = process::register_requirements(beam);
         let mut meta = CodeMeta::from_beam(beam, bytes);
+        // erts has no interpreter form of a module: its code goes from the transform straight
+        // to the emitter. Decode the instructions for the interpreter only when it may run
+        // them (the runtime's own loading of a module from the code path; `Vm::load_bytes` stays
+        // fully decoded for the interpreter entry points): a module with `-on_load`, coverage, debugger lines or the rules of the
+        // loader that patch its code at load, or one BeamAsm does not compile completely.
+        let native_only = compile_native && file.is_some() && self.native_only(beam, &meta);
+        let mut module = self.prepare_module_with(beam, bytes, !native_only)?;
+        let registers = process::register_requirements(beam);
         let staging = self.code_ix.start_staging();
         // Another scheduler may have loaded the module since this one looked.
         if let Some(id) = staging.with(|tables| tables.loaded.get(&beam.module).copied()) {
@@ -999,6 +1031,21 @@ impl Vm {
         });
         if compile_native {
             self.compile_native(&mut module, &mut meta);
+            let incomplete = native_only
+                && meta
+                    .beamasm
+                    .as_ref()
+                    .is_none_or(|native| native.unported_functions != 0);
+            if incomplete {
+                // Some function needs the interpreter: load the module again with its code
+                // decoded, and compile that.
+                module = self.prepare_module(beam, bytes)?;
+                meta = CodeMeta::from_beam(beam, bytes);
+                staging.with(|tables| {
+                    tables.intern_fun_entries(&mut module);
+                });
+                self.compile_native(&mut module, &mut meta);
+            }
             let _ = self.install_native(&module, &mut meta);
         }
         let module = Arc::new(module);
