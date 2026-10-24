@@ -7,6 +7,104 @@ use crate::{
 };
 use smallvec::SmallVec;
 use std::cmp::Ordering;
+use std::ops::{Index, IndexMut};
+
+// erts' WSTACK and PSTACK use an uninitialised inline array and allocate only
+// after it fills. ArrayVec provides the same initialized-prefix representation safely.
+struct WorkStack<T, const N: usize> {
+    inline: arrayvec::ArrayVec<T, N>,
+    overflow: Vec<T>,
+}
+
+impl<T, const N: usize> WorkStack<T, N> {
+    // Port of WSTACK_DECLARE/PSTACK_DECLARE in erts/emulator/beam/global.h:493-517,
+    // OTP-29.1.1. ArrayVec tracks the initialized prefix without clearing its backing array.
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            inline: arrayvec::ArrayVec::new(),
+            overflow: Vec::new(),
+        }
+    }
+
+    // Port of WSTACK_PUSH and PSTACK_PUSH in global.h:630-635, OTP-29.1.1.
+    #[inline(always)]
+    fn push(&mut self, value: T) {
+        if self.inline.len() < N && self.overflow.is_empty() {
+            self.inline.push(value);
+        } else {
+            self.overflow.push(value);
+        }
+    }
+
+    // Port of WSTACK_POP and PSTACK_POP in global.h:690, OTP-29.1.1.
+    #[inline(always)]
+    fn pop(&mut self) -> Option<T> {
+        self.overflow.pop().or_else(|| self.inline.pop())
+    }
+
+    // Port of WSTACK_COUNT in global.h:482-490, OTP-29.1.1.
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.inline.len() + self.overflow.len()
+    }
+
+    #[inline(always)]
+    fn get(&self, index: usize) -> Option<&T> {
+        if index < self.inline.len() {
+            self.inline.get(index)
+        } else {
+            self.overflow.get(index - self.inline.len())
+        }
+    }
+
+    #[inline(always)]
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        let inline_len = self.inline.len();
+        if index < inline_len {
+            self.inline.get_mut(index)
+        } else {
+            self.overflow.get_mut(index - inline_len)
+        }
+    }
+
+    #[inline(always)]
+    fn last(&self) -> Option<&T> {
+        self.overflow.last().or_else(|| self.inline.last())
+    }
+
+    #[inline(always)]
+    fn last_mut(&mut self) -> Option<&mut T> {
+        self.overflow.last_mut().or_else(|| self.inline.last_mut())
+    }
+
+    // Port of WSTACK_ROLLBACK in global.h:692-693, OTP-29.1.1. Overflow capacity is retained.
+    #[inline(always)]
+    fn truncate(&mut self, len: usize) {
+        if len >= N {
+            self.overflow.truncate(len - N);
+        } else {
+            self.overflow.clear();
+            self.inline.truncate(len);
+        }
+    }
+}
+
+impl<T, const N: usize> Index<usize> for WorkStack<T, N> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("stack index is in range")
+    }
+}
+
+impl<T, const N: usize> IndexMut<usize> for WorkStack<T, N> {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        self.get_mut(index).expect("stack index is in range")
+    }
+}
 
 /// Add two small integers, preserving their tag and detecting 60-bit overflow.
 #[inline]
@@ -248,6 +346,20 @@ fn integer_float_cmp(n: &Integer, f: f64) -> Ordering {
     }
 }
 fn number_cmp(a: Term, b: Term, exact: bool) -> Ordering {
+    // erts dispatches by the boxed numeric header before decoding either payload.
+    // Exact ordering can therefore resolve integer/float pairs without reading them.
+    // Port of erts/emulator/beam/utils.c:2110-2144 (erts_cmp_compound), OTP-29.1.1.
+    if exact {
+        let a_float = a.header().is_some_and(|header| header & 63 == FLOAT);
+        let b_float = b.header().is_some_and(|header| header & 63 == FLOAT);
+        if a_float != b_float {
+            return if a_float {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+    }
     match (number(a).unwrap(), number(b).unwrap()) {
         (Number::Integer(a), Number::Integer(b)) => integer_cmp(&a, &b),
         (Number::Float(a), Number::Float(b)) => {
@@ -1192,9 +1304,9 @@ enum CmpAction {
 // stay inline for the common shallow compound case; deeper map state grows only on demand.
 // Port of WSTACK_DECLARE/PSTACK_DECLARE in global.h:493-517, OTP-29.1.1.
 struct CmpStack<'a> {
-    words: SmallVec<[u64; 16]>,
-    arrays: SmallVec<[CmpArrayPair<'a>; 2]>,
-    map_frames: SmallVec<[CmpMapFrame; 1]>,
+    words: WorkStack<u64, 16>,
+    arrays: WorkStack<CmpArrayPair<'a>, 2>,
+    map_frames: WorkStack<CmpMapFrame, 1>,
 }
 
 const WORK_OP_MASK: u64 = 0xF;
@@ -1215,9 +1327,9 @@ const CMP_HASHMAP_PHASE2_MIN_RIGHT_OP: u64 = 13;
 impl<'a> CmpStack<'a> {
     fn new() -> Self {
         Self {
-            words: SmallVec::new(),
-            arrays: SmallVec::new(),
-            map_frames: SmallVec::new(),
+            words: WorkStack::new(),
+            arrays: WorkStack::new(),
+            map_frames: WorkStack::new(),
         }
     }
 
@@ -2215,50 +2327,11 @@ struct EqHashmapIterPair {
     right: crate::hamt::PairIter,
 }
 
-// Port of WSTACK's 16-word inline stack in erts/emulator/beam/global.h, OTP-29.1.1: the
-// first `N` entries live in a fixed array, the rest in a heap vector that is only allocated on
-// overflow. A `SmallVec` of the same shape zeroes its whole inline area on construction.
-struct InlineStack<T: Copy, const N: usize> {
-    inline: [T; N],
-    len: usize,
-    spill: Vec<T>,
-}
-
-impl<T: Copy, const N: usize> InlineStack<T, N> {
-    #[inline(always)]
-    fn new(empty: T) -> Self {
-        Self {
-            inline: [empty; N],
-            len: 0,
-            spill: Vec::new(),
-        }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, value: T) {
-        if self.len < N {
-            self.inline[self.len] = value;
-            self.len += 1;
-        } else {
-            self.spill.push(value);
-        }
-    }
-
-    #[inline(always)]
-    fn pop(&mut self) -> Option<T> {
-        if let Some(value) = self.spill.pop() {
-            return Some(value);
-        }
-        self.len = self.len.checked_sub(1)?;
-        Some(self.inline[self.len])
-    }
-}
-
 struct EqStack<'a> {
-    words: InlineStack<u64, 16>,
+    words: WorkStack<u64, 16>,
     // PSTACK of one entry in erts: a hashmap comparison is rare and walks a whole HAMT.
-    hashmaps: SmallVec<[EqHashmapIterPair; 1]>,
-    arrays: SmallVec<[EqArrayCont<'a>; 1]>,
+    hashmaps: WorkStack<EqHashmapIterPair, 1>,
+    arrays: WorkStack<EqArrayCont<'a>, 1>,
 }
 
 /// Where the elements of a `term_array` come from; the work words carry the owning terms and
@@ -2281,9 +2354,9 @@ impl<'a> EqStack<'a> {
     #[inline(always)]
     fn new() -> Self {
         Self {
-            words: InlineStack::new(0),
-            hashmaps: SmallVec::new(),
-            arrays: SmallVec::new(),
+            words: WorkStack::new(),
+            hashmaps: WorkStack::new(),
+            arrays: WorkStack::new(),
         }
     }
 

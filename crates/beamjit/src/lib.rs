@@ -2707,7 +2707,7 @@ fn emit_op(
                 Ok(assembler.init_yregs(n(0)?, n(1)?)?)
             } else if let [SpecificOperand::List(registers)] = args {
                 let mut indices = Vec::with_capacity(registers.len());
-                for register in registers {
+                for register in registers.iter() {
                     let SpecificOperand::Y(index) = register else {
                         return Err(EmitError::Operand(
                             "init_yregs list must contain Y registers".to_owned(),

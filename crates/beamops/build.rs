@@ -58,11 +58,11 @@ fn main() {
     );
     for name in &names {
         out.push_str(&format!(
-            "    /// `{name}` with typed decoded operands.\n    {}(Vec<SpecificOperand>),\n",
+            "    /// `{name}` with typed decoded operands.\n    {}(smallvec::SmallVec<[SpecificOperand; 4]>),\n",
             camel(name)
         ));
     }
-    out.push_str("    /// An opcode name absent from OTP's declaration set.\n    Unknown {\n        /// Original opcode name.\n        name: String,\n        /// Typed decoded operands.\n        operands: Vec<SpecificOperand>,\n    },\n}\nimpl SpecificOp { fn from_name(name: &str, args: Vec<SpecificOperand>) -> Self { match name {\n");
+    out.push_str("    /// An opcode name absent from OTP's declaration set.\n    Unknown {\n        /// Original opcode name.\n        name: String,\n        /// Typed decoded operands.\n        operands: smallvec::SmallVec<[SpecificOperand; 4]>,\n    },\n}\nimpl SpecificOp { fn from_name(name: &str, args: smallvec::SmallVec<[SpecificOperand; 4]>) -> Self { match name {\n");
     for name in &names {
         out.push_str(&format!("{name:?} => Self::{}(args),\n", camel(name)));
     }
