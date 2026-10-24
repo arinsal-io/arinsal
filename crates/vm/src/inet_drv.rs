@@ -11,6 +11,7 @@
 use crate::VmError;
 use crate::port::PortHandle;
 use crate::process::{Message, MessageNode, Runtime};
+use arinsal_drv::port_task::{PT_FLG_WAIT_BUSY, ProcSig, SigOp};
 use arinsal_drv::{CommandPiece, ControlBytes, ControlReply, DriverPort, NativeDriver};
 use arinsal_packet::{
     HttpPacket, HttpUri, Packet, PacketOptions, PacketResult, PacketState, PacketType,
@@ -259,25 +260,20 @@ fn settle(sock: &Arc<Sock>) {
         return;
     };
     // One look at the socket state for all three, as the C callback reads its descriptor once.
+    let task_deadline = port.next_task_deadline();
     let (timer, busy) = {
         let mut inner = sock.inner.lock();
         select_locked(&port, &mut inner);
-        (timer_change(&mut inner), busy_change(&mut inner))
+        let port_busy = port.sched_flags() & arinsal_drv::port_task::PTS_FLG_BUSY_PORT != 0;
+        (
+            timer_change(&mut inner, task_deadline),
+            (inner.busy != port_busy).then_some(inner.busy),
+        )
     };
     set_port_timer(&port, timer);
     if let Some(busy) = busy {
-        port.set_busy(busy);
+        port.set_busy_port(busy);
     }
-}
-
-/// `set_busy_port` follows the socket's busy state (inet_drv.c: `tcp_sendv` sets it at
-/// the high watermark, `tcp_inet_output` clears it at the low one). `Some` when it changed.
-fn busy_change(inner: &mut Inner) -> Option<bool> {
-    if inner.busy == inner.port_busy {
-        return None;
-    }
-    inner.port_busy = inner.busy;
-    Some(inner.busy)
 }
 
 /// `driver_exit(port, 0)`: the peer closed an `{exit_on_close, true}` socket.
@@ -365,8 +361,6 @@ fn tcp_inet_stop(sock: &Arc<Sock>) {
         inner.phase = Phase::Closed;
         // Port of inet_drv.c (tcp_inet_stop, tcp_clear_output): a sender blocked on the
         // queue is released by the port's exit, not by a reply.
-        inner.ready.clear();
-        inner.send_waits.clear();
         std::mem::take(&mut inner.pending)
     };
     send_empty_out_q_msgs(sock);
@@ -399,7 +393,7 @@ fn command(sock: &Arc<Sock>, caller: Pid, data: Vec<u8>) {
     let start = data.len() - payload.len();
     let outcome = {
         let mut inner = sock.inner.lock();
-        accept_send(&mut inner, caller, ids, SendData::Owned(data, start))
+        accept_send(&mut inner, SendData::Owned(data, start))
     };
     finish_command(sock, outcome, Some((caller, ids)));
 }
@@ -416,7 +410,7 @@ fn command_pieces(sock: &Arc<Sock>, caller: Pid, pieces: Vec<CommandPiece>) {
     let start = first.len() - payload.len();
     let outcome = {
         let mut inner = sock.inner.lock();
-        accept_send(&mut inner, caller, ids, SendData::Pieces(pieces, start))
+        accept_send(&mut inner, SendData::Pieces(pieces, start))
     };
     finish_command(sock, outcome, Some((caller, ids)));
 }
@@ -429,7 +423,32 @@ fn finish_command(sock: &Arc<Sock>, outcome: SendOutcome, reply: Option<(Pid, [u
                 emit(sock, Out::InetReply { caller, ids, error });
             }
         }
-        SendOutcome::Deferred => {}
+        SendOutcome::Deferred { deadline } => {
+            if let (Some((caller, ids)), Some(port)) = (reply, sock.port()) {
+                port.set_busy_port(true);
+                let weak = Arc::downgrade(sock);
+                let _ = port.schedule_signal(ProcSig {
+                    caller: caller.data(),
+                    flags: PT_FLG_WAIT_BUSY,
+                    size: 0,
+                    deadline,
+                    callback: Box::new(move |op| {
+                        if let Some(sock) = weak.upgrade() {
+                            let error = match op {
+                                SigOp::Exec => {
+                                    let inner = sock.inner.lock();
+                                    inner.peer_closed.then(|| close_atom(&inner))
+                                }
+                                SigOp::Abort => Some("timeout"),
+                                SigOp::AbortNosuspend | SigOp::AbortClosed => Some("closed"),
+                            };
+                            emit(&sock, Out::InetReply { caller, ids, error });
+                        }
+                        0
+                    }),
+                });
+            }
+        }
         SendOutcome::Failed { error, active } => {
             if let Some((caller, ids)) = reply {
                 emit(
@@ -460,7 +479,6 @@ fn finish_command(sock: &Arc<Sock>, outcome: SendOutcome, reply: Option<(Pid, [u
             send_empty_out_q_msgs(sock);
         }
     }
-    emit_ready(sock);
     settle(sock);
 }
 
@@ -477,12 +495,7 @@ pub(crate) fn dist_output(sock: &Arc<Sock>, data: &[u8]) -> Result<bool, VmError
         let outcome = {
             let mut inner = sock.inner.lock();
             // Dummy caller/ids: dist never waits on inet_reply for these writes.
-            accept_send(
-                &mut inner,
-                Pid::new(0, 0),
-                [0, 0, 0],
-                SendData::Borrowed(data),
-            )
+            accept_send(&mut inner, SendData::Borrowed(data))
         };
         finish_command(sock, outcome, None);
         Ok(sock.inner.lock().busy)
@@ -491,7 +504,7 @@ pub(crate) fn dist_output(sock: &Arc<Sock>, data: &[u8]) -> Result<bool, VmError
 
 enum SendOutcome {
     Reply(Option<&'static str>),
-    Deferred,
+    Deferred { deadline: Option<Instant> },
     Failed { error: &'static str, active: bool },
 }
 
@@ -563,12 +576,7 @@ impl SendData<'_> {
     }
 }
 
-fn accept_send(
-    inner: &mut Inner,
-    caller: Pid,
-    ids: [u32; 3],
-    payload: SendData<'_>,
-) -> SendOutcome {
+fn accept_send(inner: &mut Inner, payload: SendData<'_>) -> SendOutcome {
     // Port of erts/emulator/drivers/common/inet_drv.c:13736-13847 (tcp_sendv), OTP-29.1.1.
     // With `{exit_on_close, false}` an EOF only closes the read side (desc_close_read); the
     // socket stays connected for sending until the send fails or it is closed.
@@ -617,12 +625,7 @@ fn accept_send(
             } else {
                 Some(Instant::now() + Duration::from_millis(inner.send_timeout as u64))
             };
-            inner.send_waits.push(SendWait {
-                caller,
-                ids,
-                deadline,
-            });
-            return SendOutcome::Deferred;
+            return SendOutcome::Deferred { deadline };
         }
         return SendOutcome::Reply(None);
     }
@@ -688,7 +691,6 @@ fn send_or_shutdown_failed(inner: &mut Inner, err: i32) -> SendOutcome {
     inner.peer_closed = true;
     inner.sendq.clear();
     inner.busy = false;
-    inner.send_waits.clear();
     inner.fd.take();
     let active = active_is(&inner.active);
     if active {
@@ -704,6 +706,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> ControlByte
     let mut accept_now: Option<(OwnedFd, u16)> = None;
     let mut sendfile_end: Option<SendfileEnd> = None;
     let mut setopts_action = SetoptsAction::None;
+    let mut emit_passive = false;
     let reply: ControlBytes = {
         let mut inner = sock.inner.lock();
         match cmd {
@@ -740,8 +743,9 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> ControlByte
             REQ_NAME => sockname(&inner).into(),
             REQ_PEER => peername(&inner).into(),
             REQ_SETOPTS => {
-                let (reply, action) = setopts(&mut inner, data);
+                let (reply, action, passive) = setopts(&mut inner, data);
                 setopts_action = action;
+                emit_passive |= passive;
                 reply
             }
             REQ_GETOPTS => getopts(&inner, data).into(),
@@ -785,8 +789,8 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> ControlByte
             SetoptsAction::Recv => {
                 let eof = pull(sock);
                 satisfy(sock);
-                if eof {
-                    on_eof(sock);
+                if let Some(error) = eof {
+                    on_eof(sock, error);
                 }
                 sock_select(sock);
             }
@@ -803,16 +807,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> ControlByte
         sock_select(sock);
         try_io(sock, false);
     }
-    let passive = {
-        let mut inner = sock.inner.lock();
-        if inner.emit_passive {
-            inner.emit_passive = false;
-            true
-        } else {
-            false
-        }
-    };
-    if passive {
+    if emit_passive {
         emit(
             sock,
             Out::TcpPassive {
@@ -1378,22 +1373,23 @@ enum SetoptsAction {
     Recv,
 }
 
-fn setopts(inner: &mut Inner, data: &[u8]) -> (ControlBytes, SetoptsAction) {
+fn setopts(inner: &mut Inner, data: &[u8]) -> (ControlBytes, SetoptsAction, bool) {
     // Port of inet_drv.c:6871, 7950-7980 (inet_set_opts), OTP-29.1.1.
     let old_active = inner.active_value;
     let old_was_active = active_is(&inner.active);
     let old_htype = inner.htype;
+    let mut emit_passive = false;
     let mut i = 0;
     while i < data.len() {
         let code = data[i];
         i += 1;
         if i + 4 > data.len() {
-            return (err_small("einval"), SetoptsAction::None);
+            return (err_small("einval"), SetoptsAction::None, false);
         }
         let val = i32::from_be_bytes(data[i..i + 4].try_into().unwrap());
         i += 4;
-        if !apply_opt(inner, code, val, data, &mut i) {
-            return (err_small("einval"), SetoptsAction::None);
+        if !apply_opt(inner, code, val, data, &mut i, &mut emit_passive) {
+            return (err_small("einval"), SetoptsAction::None, false);
         }
     }
     let action = if inner.phase != Phase::Connected {
@@ -1411,10 +1407,17 @@ fn setopts(inner: &mut Inner, data: &[u8]) -> (ControlBytes, SetoptsAction) {
     } else {
         SetoptsAction::None
     };
-    (ok_small(), action)
+    (ok_small(), action, emit_passive)
 }
 
-fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) -> bool {
+fn apply_opt(
+    inner: &mut Inner,
+    code: u8,
+    val: i32,
+    data: &[u8],
+    i: &mut usize,
+    emit_passive: &mut bool,
+) -> bool {
     match code {
         OPT_REUSEADDR => {
             inner.reuseaddr = val != 0;
@@ -1516,7 +1519,7 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
                 if count == 0 {
                     inner.active = Active::Passive;
                     inner.active_value = 0;
-                    inner.emit_passive = true;
+                    *emit_passive = true;
                 } else {
                     inner.active = Active::Multi;
                 }
@@ -2754,24 +2757,6 @@ impl IoQueue {
 fn release_unbusy(inner: &mut Inner) {
     if inner.busy && inner.sendq.size() <= inner.low.max(0) as usize {
         inner.busy = false;
-        inner.ready.append(&mut inner.send_waits);
-    }
-}
-
-fn emit_ready(sock: &Sock) {
-    let ready = {
-        let mut inner = sock.inner.lock();
-        std::mem::take(&mut inner.ready)
-    };
-    for wait in ready {
-        emit(
-            sock,
-            Out::InetReply {
-                caller: wait.caller,
-                ids: wait.ids,
-                error: None,
-            },
-        );
     }
 }
 
@@ -2994,7 +2979,6 @@ fn finish_sendfile(sock: &Arc<Sock>, end: SendfileEnd) {
     match end {
         SendfileEnd::Completed { bytes_sent } => {
             // Port of inet_drv.c:14006-14021, OTP-29.1.1: the busy sender's reply first.
-            emit_ready(sock);
             send_empty_out_q_msgs(sock);
             emit(
                 sock,
@@ -3040,13 +3024,7 @@ fn finish_sendfile(sock: &Arc<Sock>, end: SendfileEnd) {
 }
 
 fn close_atom(inner: &Inner) -> &'static str {
-    if let Some(error) = inner.read_error {
-        error
-    } else if inner.reset {
-        "econnreset"
-    } else {
-        "closed"
-    }
+    if inner.reset { "econnreset" } else { "closed" }
 }
 
 pub(crate) struct Sock {
@@ -3199,12 +3177,6 @@ struct Recv {
     deadline: Option<Instant>,
 }
 
-struct SendWait {
-    caller: Pid,
-    ids: [u32; 3],
-    deadline: Option<Instant>,
-}
-
 struct Inner {
     fd: Option<SockFd>,
     fd_external: Option<RawFd>,
@@ -3212,8 +3184,6 @@ struct Inner {
     port: Weak<DriverPort>,
     /// The deadline the port timer is armed for (`driver_set_timer`).
     timer_at: Option<Instant>,
-    /// `set_busy_port` state last reported to the port.
-    port_busy: bool,
     domain: i32,
     family_code: u8,
     phase: Phase,
@@ -3263,7 +3233,6 @@ struct Inner {
     /// as a sub-binary of it; the bytes then live here and `rbuf` is empty.
     rbin: Option<arinsal_term::RefcBinary>,
     /// A receive failure other than a reset (`tcp_recv_error`), reported at close.
-    read_error: Option<&'static str>,
     rbuf_start: usize,
     // Port of inet_drv.c (`i_buf`, `i_ptr_start`, `i_ptr`, `i_bufsz`), OTP-29.1.1.
     rbuf_end: usize,
@@ -3275,10 +3244,7 @@ struct Inner {
     accept_q: VecDeque<Waiter>,
     connect: Option<Waiter>,
     pending: Vec<(Pid, u16)>,
-    send_waits: Vec<SendWait>,
-    ready: Vec<SendWait>,
     busy: bool,
-    emit_passive: bool,
     peer_closed: bool,
     /// `TCP_ADDF_PENDING_SHUT_WR` (1) / `TCP_ADDF_PENDING_SHUT_RDWR` (2): shutdown once the
     /// output queue has drained. The flag stays set afterwards, as in erts.
@@ -3308,7 +3274,6 @@ impl Default for Inner {
             fd_external: None,
             port: Weak::new(),
             timer_at: None,
-            port_busy: false,
             domain: libc::AF_INET,
             family_code: AF_INET_CODE,
             phase: Phase::Closed,
@@ -3353,7 +3318,6 @@ impl Default for Inner {
             op_ref: 0,
             rbuf: Vec::new(),
             rbin: None,
-            read_error: None,
             rbuf_start: 0,
             rbuf_end: 0,
             sendq: IoQueue::default(),
@@ -3363,10 +3327,7 @@ impl Default for Inner {
             accept_q: VecDeque::new(),
             connect: None,
             pending: Vec::new(),
-            send_waits: Vec::new(),
-            ready: Vec::new(),
             busy: false,
-            emit_passive: false,
             peer_closed: false,
             pending_shut: 0,
             shutdown_wr_done: false,
@@ -4412,18 +4373,16 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
         tcp_inet_output(sock);
         // The blocked sender's reply goes out when the queue drains (tcp_inet_output), ahead
         // of whatever the input side finds.
-        emit_ready(sock);
     }
     satisfy(sock);
     let eof = pull(sock);
     // `pull` flushes the output queue too: a sender released by that goes before the close.
-    emit_ready(sock);
     if sock.inner.lock().sendfile.is_none() {
         send_empty_out_q_msgs(sock);
     }
     satisfy(sock);
-    if eof {
-        on_eof(sock);
+    if let Some(error) = eof {
+        on_eof(sock, error);
     }
     let connect_done = {
         let mut inner = sock.inner.lock();
@@ -4461,7 +4420,6 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     }
     // Passive EOF is remembered; `{active, true}` must still emit `{tcp_closed,S}`.
     deliver_pending_close(sock);
-    emit_ready(sock);
     let busy = sock.inner.lock().busy;
     crate::dist::distribution_port_state_changed(&sock.runtime(), sock.id, busy);
 }
@@ -4471,7 +4429,7 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
 /// Port of erts/emulator/drivers/common/inet_drv.c:14289-14361, OTP-29.1.1
 /// (`tcp_inet_output`, connected branch): send from the driver queue until it is
 /// empty or the socket would block, and drop the busy state at the low watermark
-/// (`release_unbusy`; the deferred `inet_reply` goes out through `emit_ready`).
+/// (`release_unbusy`; deferred replies are queued as tasks on the busy port).
 /// The output callback runs whether or not the owner has a receive pending, so a
 /// passive socket whose owner is blocked in `gen_tcp:send/2` still drains. The
 /// write selection follows the queue: `sock_select` selects for write only while
@@ -4512,28 +4470,17 @@ fn tcp_inet_output(sock: &Arc<Sock>) {
         // Port of inet_drv.c:13690-13720 (tcp_send_error) and :13613-13688
         // (tcp_send_or_shutdown_error), OTP-29.1.1: the blocked senders get the
         // error reply; an active socket also gets `tcp_closed`.
-        let waits = std::mem::take(&mut inner.send_waits);
         let outcome = if shutdown_error {
             send_or_shutdown_failed(&mut inner, err)
         } else {
             send_failed(&mut inner, err)
         };
         match outcome {
-            SendOutcome::Failed { error, active } => (waits, error, active),
-            SendOutcome::Reply(_) | SendOutcome::Deferred => return,
+            SendOutcome::Failed { error, active } => (error, active),
+            SendOutcome::Reply(_) | SendOutcome::Deferred { .. } => return,
         }
     };
-    let (waits, error, active) = failure;
-    for wait in waits {
-        emit(
-            sock,
-            Out::InetReply {
-                caller: wait.caller,
-                ids: wait.ids,
-                error: Some(error),
-            },
-        );
-    }
+    let (error, active) = failure;
     if active {
         let owner = sock.handle().owner_pid();
         if error == "econnreset" {
@@ -5108,13 +5055,13 @@ fn tcp_input_ready(inner: &Inner) -> bool {
 }
 
 // Port of erts/emulator/drivers/common/inet_drv.c:13130 (tcp_recv), OTP-29.1.1.
-fn pull(sock: &Arc<Sock>) -> bool {
+fn pull(sock: &Arc<Sock>) -> Option<&'static str> {
     let phase = sock.inner.lock().phase;
     if phase == Phase::Listening {
         pull_accept(sock);
-        return false;
+        return None;
     }
-    let (eof, bytes_read) = {
+    let (eof, bytes_read, read_error) = {
         let mut inner = sock.inner.lock();
         // Port of inet_drv.c:2819 (sock_select only while active or receiving).
         // A passive socket must leave the FIN unread so `{active, true}` still
@@ -5124,9 +5071,10 @@ fn pull(sock: &Arc<Sock>) -> bool {
             && !inner.peer_closed
             && (active_is(&inner.active) || inner.recv.is_some());
         if !want_read {
-            return false;
+            return None;
         }
         let mut eof = false;
+        let mut read_error = None;
         let mut bytes_read = 0;
         loop {
             // tcp_recv checks buffered data before issuing another read.
@@ -5155,7 +5103,7 @@ fn pull(sock: &Arc<Sock>) -> bool {
                 inner.rbuf.truncate(read_start);
                 if inner.rbuf.try_reserve_exact(read_size).is_err() {
                     // tcp_expand_buffer failing is tcp_recv_error(ENOMEM).
-                    inner.read_error = Some("enomem");
+                    read_error = Some("enomem");
                     eof = true;
                     break;
                 }
@@ -5198,13 +5146,13 @@ fn pull(sock: &Arc<Sock>) -> bool {
             }
         }
         let _ = flush_send(&mut inner);
-        (eof, bytes_read)
+        (eof, bytes_read, read_error)
     };
     if bytes_read > 0 && crate::node_tables::is_dist_port(sock.id) && crate::debug_env::trace_dist()
     {
         eprintln!("DIST_SOCKET_READ port={} bytes={bytes_read}", sock.id);
     }
-    eof
+    read_error.or_else(|| eof.then_some("closed"))
 }
 
 fn pull_accept(sock: &Arc<Sock>) {
@@ -5253,30 +5201,16 @@ fn pull_accept(sock: &Arc<Sock>) {
     }
 }
 
-fn on_eof(sock: &Arc<Sock>) {
+fn on_eof(sock: &Arc<Sock>, read_error: &'static str) {
     // Port of inet_drv.c:12783 (tcp_recv_closed) and :12849 (tcp_recv_error), OTP-29.1.1.
     // A sender blocked on the queue is released first: the queue is dropped, the port is no
     // longer busy and the sender gets `{error, closed}` (tcp_clear_output).
-    let (blocked, reason) = {
+    {
         let mut inner = sock.inner.lock();
-        if inner.peer_closed || !inner.busy {
-            (Vec::new(), "closed")
-        } else {
+        if !inner.peer_closed && inner.busy {
             inner.sendq.clear();
             inner.busy = false;
-            let waits = std::mem::take(&mut inner.send_waits);
-            (waits, close_atom(&inner))
         }
-    };
-    for wait in blocked {
-        emit(
-            sock,
-            Out::InetReply {
-                caller: wait.caller,
-                ids: wait.ids,
-                error: Some(reason),
-            },
-        );
     }
     let (active, exit_on_close, owner, reason) = {
         let mut inner = sock.inner.lock();
@@ -5291,13 +5225,19 @@ fn on_eof(sock: &Arc<Sock>) {
             rbuf_reset(&mut inner);
         }
         let owner = sock.handle().owner_pid();
-        let reason = close_atom(&inner);
+        let reason = if read_error == "enomem" {
+            read_error
+        } else {
+            close_atom(&inner)
+        };
         // Port of erts/emulator/drivers/common/inet_drv.c:12805-12810 (tcp_recv_closed
         // aborts with ENOTCONN) and :12863-12867 (tcp_recv_error aborts with its err),
         // OTP-29.1.1, before any other close reporting. `pull` ends the stream on a
         // zero-byte read (closed) or ECONNRESET, which it records in `inner.reset`.
         if inner.sendfile.is_some() {
-            let err = if inner.reset {
+            let err = if read_error == "enomem" {
+                libc::ENOMEM
+            } else if inner.reset {
                 libc::ECONNRESET
             } else {
                 libc::ENOTCONN
@@ -5444,15 +5384,14 @@ fn select_locked(port: &DriverPort, inner: &mut Inner) {
 }
 
 /// The nearest accept, connect, receive or send deadline.
-fn next_deadline(inner: &Inner) -> Option<Instant> {
+fn next_deadline(inner: &Inner, task_deadline: Option<Instant>) -> Option<Instant> {
     let waiters = inner
         .accept_q
         .iter()
         .chain(inner.connect.iter())
         .filter_map(|waiter| waiter.deadline);
     let recv = inner.recv.as_ref().and_then(|recv| recv.deadline);
-    let sends = inner.send_waits.iter().filter_map(|wait| wait.deadline);
-    waiters.chain(recv).chain(sends).min()
+    waiters.chain(recv).chain(task_deadline).min()
 }
 
 /// Keep the port timer at the nearest deadline.
@@ -5461,8 +5400,8 @@ fn next_deadline(inner: &Inner) -> Option<Instant> {
 /// erts/emulator/drivers/common/inet_drv.c, OTP-29.1.1: the timer expires as a port
 /// timeout task (`tcp_inet_timeout`) that a scheduler executes.
 /// The new port timer deadline when it differs from the armed one.
-fn timer_change(inner: &mut Inner) -> Option<Option<Instant>> {
-    let next = next_deadline(inner);
+fn timer_change(inner: &mut Inner, task_deadline: Option<Instant>) -> Option<Option<Instant>> {
+    let next = next_deadline(inner, task_deadline);
     if next == inner.timer_at {
         return None;
     }
@@ -5488,7 +5427,12 @@ fn set_port_timer(port: &Arc<DriverPort>, timer: Option<Option<Instant>>) {
 /// Port of erts/emulator/drivers/common/inet_drv.c (tcp_inet_timeout), OTP-29.1.1.
 fn expire(sock: &Arc<Sock>) {
     let now = Instant::now();
-    let (due, sends, close) = {
+    let port = sock.port();
+    let expired_sends = port
+        .as_ref()
+        .map_or(0, |port| port.expire_task_deadlines(now));
+    let busy_waits_remain = port.as_ref().is_some_and(|port| port.has_busy_wait_tasks());
+    let (due, close) = {
         let mut inner = sock.inner.lock();
         let mut due = Vec::new();
         let mut keep = VecDeque::new();
@@ -5520,19 +5464,7 @@ fn expire(sock: &Arc<Sock>) {
             inner.phase = Phase::Closed;
             due.push((waiter.caller, waiter.aref));
         }
-        let mut sends = Vec::new();
-        inner.send_waits.retain(|wait| {
-            if wait.deadline.is_some_and(|at| at <= now) {
-                sends.push((wait.caller, wait.ids));
-                false
-            } else {
-                true
-            }
-        });
-        if !sends.is_empty() {
-            inner.busy = false;
-        }
-        let close = if !sends.is_empty() && inner.send_timeout_close {
+        let close = if expired_sends != 0 && inner.send_timeout_close {
             inner.fd.take();
             inner.peer_closed = true;
             let owner = sock.handle().owner_pid();
@@ -5544,7 +5476,10 @@ fn expire(sock: &Arc<Sock>) {
         } else {
             None
         };
-        (due, sends, close)
+        if expired_sends != 0 && (close.is_some() || !busy_waits_remain) {
+            inner.busy = false;
+        }
+        (due, close)
     };
     for (caller, aref) in due {
         emit(
@@ -5556,16 +5491,6 @@ fn expire(sock: &Arc<Sock>) {
             },
         );
     }
-    for (caller, ids) in sends {
-        emit(
-            sock,
-            Out::InetReply {
-                caller,
-                ids,
-                error: Some("timeout"),
-            },
-        );
-    }
     if let Some((owner, active, exit_on_close)) = close
         && active
     {
@@ -5573,5 +5498,13 @@ fn expire(sock: &Arc<Sock>) {
         if exit_on_close {
             driver_exit(sock);
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    #[test]
+    fn reports_tcp_socket_layout() {
+        eprintln!("Inner={}", std::mem::size_of::<super::Inner>());
     }
 }
