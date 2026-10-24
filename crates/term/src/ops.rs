@@ -944,8 +944,37 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
             }
             continue 'term;
         }
-        if b.bits() & 3 == 1 {
+        if b.bits() & 3 == 1 && !a.header().is_some_and(|header| header & 63 == ARITY) {
             resolve_order!(a.classify().cmp(&TermKind::List));
+        }
+        // Port of the TAG_PRIMARY_BOXED/ARITYVAL path in erts_cmp_compound,
+        // erts/emulator/beam/utils.c:1856-1877, OTP-29.1.1.
+        if let Some(header) = a.header()
+            && header & 63 == ARITY
+        {
+            if b.header().is_none_or(|other| other & 63 != ARITY) {
+                resolve_order!(TermKind::Tuple.cmp(&b.classify()));
+            }
+            // SAFETY: both tuple payloads remain live on their owning heaps.
+            let (av, bv) = unsafe { (a.tuple_ref().unwrap(), b.tuple_ref().unwrap()) };
+            // The arity word is the tuple length; erts compares it before walking elements.
+            let arity_order = av.len().cmp(&bv.len());
+            if arity_order != Ordering::Equal {
+                resolve_order!(arity_order);
+            }
+            match first_cmp_words(av.words(), bv.words(), 0) {
+                Err(order) => resolve_order!(order),
+                Ok(None) => resolve_order!(Ordering::Equal),
+                Ok(Some((index, left_term, right_term))) => {
+                    let next = index + 1;
+                    if next < av.len() {
+                        pending.push_array(CmpArray::Tuple(av), CmpArray::Tuple(bv), next, exact);
+                    }
+                    a = left_term;
+                    b = right_term;
+                    continue 'term;
+                }
+            }
         }
         let ak = a.classify();
         let bk = b.classify();
@@ -987,29 +1016,7 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
                 identity_cmp(a.identity().unwrap(), b.identity().unwrap())
             }
             TermKind::List => unreachable!("list terms use the primary-tag fast path"),
-            TermKind::Tuple => {
-                // SAFETY: both tuples remain on their owning heaps.
-                let (av, bv) = unsafe { (a.tuple_ref().unwrap(), b.tuple_ref().unwrap()) };
-                let c = av.len().cmp(&bv.len());
-                if c != Ordering::Equal {
-                    resolve_order!(c);
-                }
-                let left = CmpArray::Tuple(av);
-                let right = CmpArray::Tuple(bv);
-                match first_cmp_unequal(&left, &right, 0) {
-                    Err(order) => resolve_order!(order),
-                    Ok(None) => Ordering::Equal,
-                    Ok(Some((index, left_term, right_term))) => {
-                        let next = index + 1;
-                        if next < left.len() {
-                            pending.push_array(left, right, next, exact);
-                        }
-                        a = left_term;
-                        b = right_term;
-                        continue 'term;
-                    }
-                }
-            }
+            TermKind::Tuple => unreachable!("tuples use the primary-tag path"),
             TermKind::Bitstring => bits_cmp(a, b),
             TermKind::Record => {
                 // SAFETY: both record definitions and instances remain live.
@@ -1122,6 +1129,14 @@ impl CmpArray<'_> {
                 }
                 crate::hamt::with_flatmap_arrays(*map, |keys, _| Term(keys[*start + index]))
             }
+        }
+    }
+
+    fn words(&self) -> Option<&[u64]> {
+        match self {
+            Self::Tuple(tuple) => Some(tuple.words()),
+            Self::Words(words) => Some(words),
+            Self::FlatmapKeys { .. } => None,
         }
     }
 }
@@ -1892,6 +1907,9 @@ fn first_cmp_words_from_arrays(
     right: &CmpArray<'_>,
     start: usize,
 ) -> Result<Option<(usize, Term, Term)>, Ordering> {
+    if let (Some(left), Some(right)) = (left.words(), right.words()) {
+        return first_cmp_words(left, right, start);
+    }
     for index in start..left.len() {
         let a = left.get(index).expect("array index is in range");
         let b = right
@@ -1926,21 +1944,24 @@ fn first_cmp_words(
     right: &[u64],
     start: usize,
 ) -> Result<Option<(usize, Term, Term)>, Ordering> {
-    for index in start..left.len() {
-        let a = Term(left[index]);
-        let b = Term(right[index]);
+    for (offset, (&left_word, &right_word)) in
+        left[start..].iter().zip(right[start..].iter()).enumerate()
+    {
+        let index = start + offset;
+        let a = Term(left_word);
+        let b = Term(right_word);
         if a == b {
             continue;
         }
-        if let (Some(a), Some(b)) = (a.as_small(), b.as_small()) {
-            let order = a.cmp(&b);
+        if let (Some(a), Some(b)) = (a.as_atom(), b.as_atom()) {
+            let order = global_atoms().cmp_atoms(a, b);
             if order != Ordering::Equal {
                 return Err(order);
             }
             continue;
         }
-        if let (Some(a), Some(b)) = (a.as_atom(), b.as_atom()) {
-            let order = global_atoms().cmp_atoms(a, b);
+        if let (Some(a), Some(b)) = (a.as_small(), b.as_small()) {
+            let order = a.cmp(&b);
             if order != Ordering::Equal {
                 return Err(order);
             }
@@ -2186,52 +2207,83 @@ fn exact_eq_mixed_map_layouts(left: Term, right: Term) -> Option<Vec<(Term, Term
 }
 
 // Port of erts/emulator/beam/utils.c:1488-1523 (eq's term_array continuation), OTP-29.1.1.
-enum EqArray<'a> {
-    Tuple(crate::TupleRef<'a>),
-    Words(&'a [u64]),
-}
-
-impl EqArray<'_> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Tuple(tuple) => tuple.len(),
-            Self::Words(words) => words.len(),
-        }
-    }
-
-    fn get(&self, index: usize) -> Option<Term> {
-        match self {
-            Self::Tuple(tuple) => tuple.get(index),
-            Self::Words(words) => words.get(index).copied().map(Term),
-        }
-    }
-}
-
-struct EqArrayPair<'a> {
-    left: EqArray<'a>,
-    right: EqArray<'a>,
-}
-
+// erts pushes (remaining count, bb+1, aa+1|TAG_PRIMARY_HEADER) and tells the three words
+// from a term pair by the header tag. Here the remaining halves of both arrays are a typed
+// pair of slices and the work word is only the marker.
 struct EqHashmapIterPair {
     left: crate::hamt::PairIter,
     right: crate::hamt::PairIter,
 }
 
-// Port of WSTACK's 16-word and PSTACK's one-entry inline representations in
-// erts/emulator/beam/global.h, OTP-29.1.1. Borrowed views and iterators stay typed here;
-// their LIFO handles are words.
+// Port of WSTACK's 16-word inline stack in erts/emulator/beam/global.h, OTP-29.1.1: the
+// first `N` entries live in a fixed array, the rest in a heap vector that is only allocated on
+// overflow. A `SmallVec` of the same shape zeroes its whole inline area on construction.
+struct InlineStack<T: Copy, const N: usize> {
+    inline: [T; N],
+    len: usize,
+    spill: Vec<T>,
+}
+
+impl<T: Copy, const N: usize> InlineStack<T, N> {
+    #[inline(always)]
+    fn new(empty: T) -> Self {
+        Self {
+            inline: [empty; N],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, value: T) {
+        if self.len < N {
+            self.inline[self.len] = value;
+            self.len += 1;
+        } else {
+            self.spill.push(value);
+        }
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<T> {
+        if let Some(value) = self.spill.pop() {
+            return Some(value);
+        }
+        self.len = self.len.checked_sub(1)?;
+        Some(self.inline[self.len])
+    }
+}
+
 struct EqStack<'a> {
-    words: SmallVec<[u64; 16]>,
-    arrays: SmallVec<[EqArrayPair<'a>; 5]>,
+    words: InlineStack<u64, 16>,
+    // PSTACK of one entry in erts: a hashmap comparison is rare and walks a whole HAMT.
     hashmaps: SmallVec<[EqHashmapIterPair; 1]>,
+    arrays: SmallVec<[EqArrayCont<'a>; 1]>,
+}
+
+/// Where the elements of a `term_array` come from; the work words carry the owning terms and
+/// the position, as erts' carry the two element pointers.
+#[derive(Clone, Copy)]
+enum EqArrayCont<'a> {
+    Slices {
+        left: &'a [u64],
+        right: &'a [u64],
+        start: usize,
+    },
+    FlatmapValues {
+        left: Term,
+        right: Term,
+        start: usize,
+    },
 }
 
 impl<'a> EqStack<'a> {
+    #[inline(always)]
     fn new() -> Self {
         Self {
-            words: SmallVec::new(),
-            arrays: SmallVec::new(),
+            words: InlineStack::new(0),
             hashmaps: SmallVec::new(),
+            arrays: SmallVec::new(),
         }
     }
 
@@ -2242,26 +2294,11 @@ impl<'a> EqStack<'a> {
     }
 
     #[inline(always)]
-    fn push_array(&mut self, left: EqArray<'a>, right: EqArray<'a>, start: usize) {
+    fn push_array(&mut self, continuation: EqArrayCont<'a>) {
         let index = self.arrays.len();
-        self.arrays.push(EqArrayPair { left, right });
-        self.push_array_index(index, start);
-    }
-
-    #[inline(always)]
-    fn push_array_index(&mut self, index: usize, start: usize) {
+        self.arrays.push(continuation);
         self.words.push(index as u64);
-        self.words.push(start as u64);
-        self.words.push(eq_array_op());
-    }
-
-    #[inline(always)]
-    fn push_flatmap_values(&mut self, left: Term, right: Term, start: usize, end: usize) {
-        self.words.push(right.bits());
-        self.words.push(left.bits());
-        self.words.push(start as u64);
-        self.words.push(end as u64);
-        self.words.push(eq_flatmap_values_op());
+        self.words.push(EQ_TUPLE_OP << WORK_OP_SHIFT);
     }
 
     #[inline(always)]
@@ -2282,8 +2319,7 @@ impl<'a> EqStack<'a> {
 }
 
 const WORK_OP_SHIFT: u32 = 2;
-const EQ_ARRAY_OP: u64 = 1;
-const EQ_FLATMAP_VALUES_OP: u64 = 2;
+const EQ_TUPLE_OP: u64 = 1;
 const EQ_HASHMAP_OP: u64 = 3;
 
 // Port of `primary_tag` and boxed-header dispatch in utils.c:1133-1190,
@@ -2323,16 +2359,6 @@ fn eq_compound_kind(a: Term, b: Term) -> Option<TermKind> {
 
 // Port of the operation words tagged as TAG_PRIMARY_HEADER in utils.c:1488-1510.
 #[inline(always)]
-const fn eq_array_op() -> u64 {
-    EQ_ARRAY_OP << WORK_OP_SHIFT
-}
-
-#[inline(always)]
-const fn eq_flatmap_values_op() -> u64 {
-    EQ_FLATMAP_VALUES_OP << WORK_OP_SHIFT
-}
-
-#[inline(always)]
 const fn eq_hashmap_op() -> u64 {
     EQ_HASHMAP_OP << WORK_OP_SHIFT
 }
@@ -2342,21 +2368,39 @@ const fn is_work_op(word: u64) -> bool {
     word & 3 == 0
 }
 
-fn first_unequal(
-    left: &EqArray<'_>,
-    right: &EqArray<'_>,
-    start: usize,
-) -> Option<(usize, Term, Term)> {
-    for index in start..left.len() {
-        let a = left.get(index).expect("array index is in range");
-        let b = right
-            .get(index)
-            .expect("equal-length array index is in range");
-        if a != b {
-            return Some((index, a, b));
-        }
+/// What `term_array:` of `eq` decided about a pair of equally long arrays.
+enum EqScan {
+    /// Every element is the same word: `goto pop_next`.
+    Equal,
+    /// The first differing elements are both immediate: `goto not_equal`.
+    NotEqual,
+    /// Continue with this pair; the rest of the arrays is on the stack.
+    Next(Term, Term),
+}
+
+// Port of erts/emulator/beam/utils.c:1488-1523 (eq, label term_array), OTP-29.1.1.
+// `left` and `right` are the whole arrays of `owner_left` and `owner_right`; the scan starts at
+// `start`.
+#[inline(always)]
+fn eq_term_array(left: &[u64], right: &[u64], start: usize, mut push: impl FnMut(usize)) -> EqScan {
+    debug_assert_eq!(left.len(), right.len());
+    let Some((offset, (&x, &y))) = left[start..]
+        .iter()
+        .zip(right[start..].iter())
+        .enumerate()
+        .find(|(_, (x, y))| x != y)
+    else {
+        return EqScan::Equal;
+    };
+    let (x, y) = (Term(x), Term(y));
+    if both_immed(x, y) {
+        return EqScan::NotEqual;
     }
-    None
+    let next = start + offset + 1;
+    if next < left.len() {
+        push(next);
+    }
+    EqScan::Next(x, y)
 }
 
 /// Port of erts/emulator/beam/utils.c:1125-1530 (eq), OTP-29.1.1.
@@ -2364,73 +2408,272 @@ fn first_unequal(
 fn eq(a: Term, b: Term) -> bool {
     let mut pending = EqStack::new();
     let (mut a, mut b) = (a, b);
-    'term: loop {
-        if a == b {
+    // `tailrecur:` compares first; `tailrecur_ne:` is the top of the inner loop.
+    let mut unequal = a != b;
+    loop {
+        if unequal {
+            'ne: loop {
+                // Port of erts/emulator/beam/utils.c:1125-1190 (eq), OTP-29.1.1.
+                match a.0 & 3 {
+                    1 => {
+                        if b.0 & 3 != 1 {
+                            return false;
+                        }
+                        // Port of erts/emulator/beam/utils.c:1137-1161, OTP-29.1.1.
+                        // Equal list cells stay in this walk.
+                        loop {
+                            // SAFETY: the caller keeps both list cells live and stable.
+                            let (ah, at) = unsafe { a.cons_ref().unwrap() };
+                            // SAFETY: the caller keeps both list cells live and stable.
+                            let (bh, bt) = unsafe { b.cons_ref().unwrap() };
+                            if ah != bh {
+                                pending.push_terms(at, bt);
+                                a = ah;
+                                b = bh;
+                                continue 'ne;
+                            }
+                            if at == bt {
+                                break 'ne;
+                            }
+                            a = at;
+                            b = bt;
+                            if at.0 & 3 != 1 || bt.0 & 3 != 1 {
+                                continue 'ne;
+                            }
+                        }
+                    }
+                    2 => {}
+                    // Two different words, one of them immediate: atoms, smalls, nil and
+                    // pids and ports of this node are canonical words.
+                    _ => return false,
+                }
+                // Boxed `a`: erts switches on the header, tuples first.
+                if let Some(header) = a.header()
+                    && header & 63 == ARITY
+                {
+                    // Port of utils.c:1166-1176: the headers, so the arities, must be equal.
+                    if b.header() != Some(header) {
+                        return false;
+                    }
+                    // SAFETY: both tuple payloads remain live and stable.
+                    let (av, bv) = unsafe { (a.tuple_ref().unwrap(), b.tuple_ref().unwrap()) };
+                    match eq_term_array(av.words(), bv.words(), 0, |start| {
+                        pending.push_array(EqArrayCont::Slices {
+                            left: av.words(),
+                            right: bv.words(),
+                            start,
+                        })
+                    }) {
+                        EqScan::Equal => break 'ne,
+                        EqScan::NotEqual => return false,
+                        EqScan::Next(x, y) => {
+                            a = x;
+                            b = y;
+                            continue 'ne;
+                        }
+                    }
+                }
+                let Some(kind) = eq_compound_kind(a, b) else {
+                    return false;
+                };
+                match kind {
+                    TermKind::Number => {
+                        if !exact_number_eq(a, b) {
+                            return false;
+                        }
+                    }
+                    TermKind::Pid | TermKind::Port => {
+                        if identity_cmp(a.identity().unwrap(), b.identity().unwrap())
+                            != Ordering::Equal
+                        {
+                            return false;
+                        }
+                    }
+                    TermKind::Ref => {
+                        if !exact_ref_eq(a, b) {
+                            return false;
+                        }
+                    }
+                    TermKind::Bitstring => {
+                        if bits_cmp(a, b) != Ordering::Equal {
+                            return false;
+                        }
+                    }
+                    TermKind::Map => {
+                        let len = crate::hamt::len(a);
+                        if len != crate::hamt::len(b) {
+                            return false;
+                        }
+                        if a.is_hashmap() != b.is_hashmap() {
+                            let Some(values) = exact_eq_mixed_map_layouts(a, b) else {
+                                return false;
+                            };
+                            for (left_value, right_value) in values {
+                                pending.push_terms(left_value, right_value);
+                            }
+                            break 'ne;
+                        }
+                        if a.is_hashmap() {
+                            pending.push_hashmap(a, b);
+                            break 'ne;
+                        }
+                        // Port of utils.c:1452-1463: a flatmap is the array of its key tuple
+                        // followed by its values.
+                        let left_keys = a.flatmap_keys_tuple().expect("left map is a live flatmap");
+                        let right_keys =
+                            b.flatmap_keys_tuple().expect("right map is a live flatmap");
+                        if len != 0 {
+                            // SAFETY: both maps remain live and stable.
+                            let (left, right) =
+                                unsafe { (a.flatmap_ref().unwrap(), b.flatmap_ref().unwrap()) };
+                            let (_, left_values) = left.arrays();
+                            let (_, right_values) = right.arrays();
+                            pending.push_array(EqArrayCont::FlatmapValues {
+                                left: a,
+                                right: b,
+                                start: 0,
+                            });
+                            debug_assert_eq!(left_values.len(), right_values.len());
+                        }
+                        a = left_keys;
+                        b = right_keys;
+                        // Equal keys tuples (shared by maps of one shape) cost nothing.
+                        if a == b {
+                            break 'ne;
+                        }
+                        continue 'ne;
+                    }
+                    TermKind::Record => {
+                        // SAFETY: both record definitions and instances remain live.
+                        let (av, bv) =
+                            unsafe { (a.record_ref().unwrap(), b.record_ref().unwrap()) };
+                        if node_order(av.module(), bv.module()) != Ordering::Equal
+                            || node_order(av.name(), bv.name()) != Ordering::Equal
+                            || av.is_exported() != bv.is_exported()
+                            || av.len() != bv.len()
+                        {
+                            return false;
+                        }
+                        for i in 0..av.len() {
+                            let (ai, bi) =
+                                (av.sorted_index(i).unwrap(), bv.sorted_index(i).unwrap());
+                            if node_order(av.key(ai).unwrap(), bv.key(bi).unwrap())
+                                != Ordering::Equal
+                            {
+                                return false;
+                            }
+                            pending.push_terms(av.value(ai).unwrap(), bv.value(bi).unwrap());
+                        }
+                    }
+                    TermKind::Fun => {
+                        // SAFETY: both fun entries are retained by their owning heaps.
+                        let (av, bv) = unsafe { (a.fun_ref().unwrap(), b.fun_ref().unwrap()) };
+                        match (av, bv) {
+                            (
+                                FunRef::Local {
+                                    entry: ae,
+                                    free_vars: af,
+                                },
+                                FunRef::Local {
+                                    entry: be,
+                                    free_vars: bf,
+                                },
+                            ) => {
+                                if node_order(ae.module, be.module) != Ordering::Equal
+                                    || ae.index != be.index
+                                    || ae.old_uniq != be.old_uniq
+                                    || af.len() != bf.len()
+                                {
+                                    return false;
+                                }
+                                match eq_term_array(af, bf, 0, |start| {
+                                    pending.push_array(EqArrayCont::Slices {
+                                        left: af,
+                                        right: bf,
+                                        start,
+                                    })
+                                }) {
+                                    EqScan::Equal => {}
+                                    EqScan::NotEqual => return false,
+                                    EqScan::Next(x, y) => {
+                                        a = x;
+                                        b = y;
+                                        continue 'ne;
+                                    }
+                                }
+                            }
+                            (FunRef::Export { entry: ae }, FunRef::Export { entry: be }) => {
+                                if node_order(ae.module, be.module) != Ordering::Equal
+                                    || node_order(ae.function, be.function) != Ordering::Equal
+                                    || ae.arity != be.arity
+                                {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        }
+                    }
+                    _ => {
+                        if a.bits() != b.bits() {
+                            return false;
+                        }
+                    }
+                }
+                break 'ne;
+            }
+        }
+        // `pop_next:`
+        loop {
             let Some(word) = pending.words.pop() else {
                 return true;
             };
             if !is_work_op(word) {
                 a = Term(word);
                 b = Term(pending.words.pop().expect("term pair is complete"));
-                continue 'term;
+                if a == b {
+                    continue;
+                }
+                break;
             }
             match word >> WORK_OP_SHIFT {
-                EQ_ARRAY_OP => {
-                    let start = pending.words.pop().expect("array start is present") as usize;
-                    let array_index =
-                        pending.words.pop().expect("array handle is present") as usize;
-                    let (result, len) = {
-                        let pair = &pending.arrays[array_index];
-                        (
-                            first_unequal(&pair.left, &pair.right, start),
-                            pair.left.len(),
-                        )
-                    };
-                    let Some((index, next_a, next_b)) = result else {
-                        pending.arrays.truncate(array_index);
-                        continue 'term;
-                    };
-                    if both_immed(next_a, next_b) {
-                        return false;
-                    }
-                    let next = index + 1;
-                    if next < len {
-                        pending.push_array_index(array_index, next);
-                    } else {
-                        pending.arrays.truncate(array_index);
-                    }
-                    a = next_a;
-                    b = next_b;
-                    continue 'term;
-                }
-                EQ_FLATMAP_VALUES_OP => {
-                    let end = pending.words.pop().expect("value count is present") as usize;
-                    let start = pending.words.pop().expect("value index is present") as usize;
-                    let left_map = Term(pending.words.pop().expect("left map is present"));
-                    let right_map = Term(pending.words.pop().expect("right map is present"));
-                    let (result, len) =
-                        crate::hamt::with_flatmap_arrays(left_map, |_, left_values| {
-                            crate::hamt::with_flatmap_arrays(right_map, |_, right_values| {
-                                let left = EqArray::Words(&left_values[..end]);
-                                let right = EqArray::Words(&right_values[..end]);
-                                (first_unequal(&left, &right, start), left.len())
+                EQ_TUPLE_OP => {
+                    let index = pending.words.pop().expect("array continuation index") as usize;
+                    let continuation = pending.arrays[index];
+                    let result = match continuation {
+                        EqArrayCont::Slices { left, right, start } => {
+                            eq_term_array(left, right, start, |next| {
+                                pending.push_array(EqArrayCont::Slices {
+                                    left,
+                                    right,
+                                    start: next,
+                                })
                             })
-                            .expect("right map is a live flatmap")
-                        })
-                        .expect("left map is a live flatmap");
-                    let Some((index, next_a, next_b)) = result else {
-                        continue 'term;
+                        }
+                        EqArrayCont::FlatmapValues { left, right, start } => {
+                            crate::hamt::with_flatmap_arrays(left, |_, left_values| {
+                                crate::hamt::with_flatmap_arrays(right, |_, right_values| {
+                                    eq_term_array(left_values, right_values, start, |next| {
+                                        pending.push_array(EqArrayCont::FlatmapValues {
+                                            left,
+                                            right,
+                                            start: next,
+                                        })
+                                    })
+                                })
+                                .expect("right map is a live flatmap")
+                            })
+                            .expect("left map is a live flatmap")
+                        }
                     };
-                    if both_immed(next_a, next_b) {
-                        return false;
+                    match result {
+                        EqScan::Equal => continue,
+                        EqScan::NotEqual => return false,
+                        EqScan::Next(x, y) => {
+                            a = x;
+                            b = y;
+                            break;
+                        }
                     }
-                    let next = index + 1;
-                    if next < len {
-                        pending.push_flatmap_values(left_map, right_map, next, end);
-                    }
-                    a = next_a;
-                    b = next_b;
-                    continue 'term;
                 }
                 EQ_HASHMAP_OP => {
                     let index = pending
@@ -2445,13 +2688,11 @@ fn eq(a: Term, b: Term) -> bool {
                     match (left_pair, right_pair) {
                         (None, None) => {
                             pending.hashmaps.truncate(index);
-                            continue 'term;
                         }
                         (Some((left_key, left_value)), Some((right_key, right_value))) => {
                             pending.push_hashmap_index(index);
                             pending.push_terms(left_value, right_value);
                             pending.push_terms(left_key, right_key);
-                            continue 'term;
                         }
                         _ => return false,
                     }
@@ -2459,187 +2700,7 @@ fn eq(a: Term, b: Term) -> bool {
                 _ => unreachable!("invalid equality work word"),
             }
         }
-        // Port of erts/emulator/beam/utils.c:1125-1190 (eq), OTP-29.1.1.
-        let Some(kind) = eq_compound_kind(a, b) else {
-            return false;
-        };
-        match kind {
-            TermKind::Number => {
-                if !exact_number_eq(a, b) {
-                    return false;
-                }
-            }
-            TermKind::Atom => {
-                // Port of erts/emulator/beam/utils.c:1728-1737, OTP-29.1.1.
-                // Atom identities are canonical in the VM's global atom table.
-                if a.as_atom() != b.as_atom() {
-                    return false;
-                }
-            }
-            TermKind::Nil => {}
-            TermKind::Pid | TermKind::Port => {
-                if identity_cmp(a.identity().unwrap(), b.identity().unwrap()) != Ordering::Equal {
-                    return false;
-                }
-            }
-            TermKind::Ref => {
-                if !exact_ref_eq(a, b) {
-                    return false;
-                }
-            }
-            TermKind::List => {
-                // Port of erts/emulator/beam/utils.c:1137-1161, OTP-29.1.1.
-                // Keep equal list cells in the list walk instead of repeating term-tag dispatch.
-                loop {
-                    // SAFETY: the caller keeps both list cells live and stable.
-                    let (ah, at) = unsafe { a.cons_ref().unwrap() };
-                    // SAFETY: the caller keeps both list cells live and stable.
-                    let (bh, bt) = unsafe { b.cons_ref().unwrap() };
-                    if ah != bh {
-                        pending.push_terms(at, bt);
-                        a = ah;
-                        b = bh;
-                        continue 'term;
-                    }
-                    if at == bt {
-                        break;
-                    }
-                    if at.0 & 3 != 1 || bt.0 & 3 != 1 {
-                        a = at;
-                        b = bt;
-                        continue 'term;
-                    }
-                    a = at;
-                    b = bt;
-                }
-            }
-            TermKind::Tuple => {
-                // SAFETY: both tuple payloads remain live and stable.
-                let (av, bv) = unsafe { (a.tuple_ref().unwrap(), b.tuple_ref().unwrap()) };
-                if av.len() != bv.len() {
-                    return false;
-                }
-                let left = EqArray::Tuple(av);
-                let right = EqArray::Tuple(bv);
-                if let Some((index, x, y)) = first_unequal(&left, &right, 0) {
-                    if both_immed(x, y) {
-                        return false;
-                    }
-                    let next = index + 1;
-                    if next < left.len() {
-                        pending.push_array(left, right, next);
-                    }
-                    a = x;
-                    b = y;
-                    continue 'term;
-                }
-            }
-            TermKind::Bitstring => {
-                if bits_cmp(a, b) != Ordering::Equal {
-                    return false;
-                }
-            }
-            TermKind::Map => {
-                let len = crate::hamt::len(a);
-                if len != crate::hamt::len(b) {
-                    return false;
-                }
-                if a.is_hashmap() != b.is_hashmap() {
-                    let Some(values) = exact_eq_mixed_map_layouts(a, b) else {
-                        return false;
-                    };
-                    for (left_value, right_value) in values {
-                        pending.push_terms(left_value, right_value);
-                    }
-                    a = b;
-                    continue 'term;
-                }
-                if a.is_hashmap() {
-                    pending.push_hashmap(a, b);
-                    a = b;
-                    continue 'term;
-                }
-                let left_keys = a.flatmap_keys_tuple().expect("left map is a live flatmap");
-                let right_keys = b.flatmap_keys_tuple().expect("right map is a live flatmap");
-                if len != 0 {
-                    pending.push_flatmap_values(a, b, 0, len);
-                }
-                a = left_keys;
-                b = right_keys;
-                continue 'term;
-            }
-            TermKind::Record => {
-                // SAFETY: both record definitions and instances remain live.
-                let (av, bv) = unsafe { (a.record_ref().unwrap(), b.record_ref().unwrap()) };
-                if node_order(av.module(), bv.module()) != Ordering::Equal
-                    || node_order(av.name(), bv.name()) != Ordering::Equal
-                    || av.is_exported() != bv.is_exported()
-                    || av.len() != bv.len()
-                {
-                    return false;
-                }
-                for i in 0..av.len() {
-                    let (ai, bi) = (av.sorted_index(i).unwrap(), bv.sorted_index(i).unwrap());
-                    if node_order(av.key(ai).unwrap(), bv.key(bi).unwrap()) != Ordering::Equal {
-                        return false;
-                    }
-                    pending.push_terms(av.value(ai).unwrap(), bv.value(bi).unwrap());
-                }
-            }
-            TermKind::Fun => {
-                // SAFETY: both fun entries are retained by their owning heaps.
-                let (av, bv) = unsafe { (a.fun_ref().unwrap(), b.fun_ref().unwrap()) };
-                match (av, bv) {
-                    (
-                        FunRef::Local {
-                            entry: ae,
-                            free_vars: af,
-                        },
-                        FunRef::Local {
-                            entry: be,
-                            free_vars: bf,
-                        },
-                    ) => {
-                        if node_order(ae.module, be.module) != Ordering::Equal
-                            || ae.index != be.index
-                            || ae.old_uniq != be.old_uniq
-                            || af.len() != bf.len()
-                        {
-                            return false;
-                        }
-                        let left = EqArray::Words(af);
-                        let right = EqArray::Words(bf);
-                        if let Some((index, x, y)) = first_unequal(&left, &right, 0) {
-                            if both_immed(x, y) {
-                                return false;
-                            }
-                            let next = index + 1;
-                            if next < left.len() {
-                                pending.push_array(left, right, next);
-                            }
-                            a = x;
-                            b = y;
-                            continue 'term;
-                        }
-                    }
-                    (FunRef::Export { entry: ae }, FunRef::Export { entry: be }) => {
-                        if node_order(ae.module, be.module) != Ordering::Equal
-                            || node_order(ae.function, be.function) != Ordering::Equal
-                            || ae.arity != be.arity
-                        {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
-            }
-            _ => {
-                if a.bits() != b.bits() {
-                    return false;
-                }
-            }
-        }
-        b = a;
+        unequal = true;
     }
 }
 /// Erlang `==` for implemented types.

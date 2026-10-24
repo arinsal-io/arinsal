@@ -82,6 +82,13 @@ pub struct FlatMapRef<'a> {
     keys: &'a [u64],
     values: &'a [u64],
 }
+impl<'a> FlatMapRef<'a> {
+    /// The key and value arrays, for scans that borrow past this view.
+    #[inline]
+    pub(crate) fn arrays(&self) -> (&'a [u64], &'a [u64]) {
+        (self.keys, self.values)
+    }
+}
 impl FlatMapRef<'_> {
     /// Entry count.
     pub fn len(&self) -> usize {
