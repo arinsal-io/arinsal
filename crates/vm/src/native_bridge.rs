@@ -1,9 +1,68 @@
 //! Native execution bridge and registered code metadata.
 
 use super::*;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+fn perf_map_file() -> &'static Mutex<Option<File>> {
+    static FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+    FILE.get_or_init(|| Mutex::new(open_perf_map()))
+}
+
+// Port of erts/emulator/beam/jit/beam_jit_metadata.cpp:470-501 (JitPerfMap), OTP-29.1.1.
+fn open_perf_map() -> Option<File> {
+    let flags = arinsal_args::active_emulator_flags();
+    let mut enabled = false;
+    let mut directory = PathBuf::from("/tmp");
+    for flag in &flags.ignored {
+        match (flag.name.as_str(), flag.value.as_deref()) {
+            ("+JPperf", Some("true" | "map")) => enabled = true,
+            ("+JPperf", Some("false")) => enabled = false,
+            ("+JPperfdirectory", Some(path)) => directory = PathBuf::from(path),
+            _ => {}
+        }
+    }
+    if !enabled {
+        return None;
+    }
+    let path = std::env::var_os("ERL_SYM_MAP_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| directory.join(format!("perf-{}.map", std::process::id())));
+    match OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+    {
+        Ok(file) => Some(file),
+        Err(error) => {
+            eprintln!("perf: Failed to open {} ({error})", path.display());
+            None
+        }
+    }
+}
+
+// Port of erts/emulator/beam/jit/beam_jit_metadata.cpp:535-552 (JitPerfSupport::update), OTP-29.1.1.
+fn update_perf_map(info: &NativeFunction) {
+    let mut file = perf_map_file()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(file) = file.as_mut() {
+        let symbol = format!("${}:{}/{}", info.module, info.function, info.arity);
+        let _ = writeln!(
+            file,
+            "{:#x} {:x} {symbol}",
+            info.start,
+            info.end - info.start
+        );
+        let _ = file.flush();
+    }
+}
 
 /// Symbolic information attached to one executable native code range.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -730,6 +789,7 @@ pub fn register_native_function(info: NativeFunction) -> Result<(), &'static str
     if overlaps_previous || overlaps_next {
         return Err("native function ranges must not overlap");
     }
+    update_perf_map(&info);
     functions.insert(index, info);
     publish_function_range(&functions[index]);
     if crate::native_bridge::lifetime_trace_enabled() {
