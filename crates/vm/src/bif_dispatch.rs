@@ -181,6 +181,9 @@ impl Vm {
                     unreachable!("failed trapping BIFs become VM exceptions")
                 }
                 crate::bif_traps::HandlerResult::Yield { .. } => Ok(BifOpOutcome::Yield),
+                crate::bif_traps::HandlerResult::Export(_) => {
+                    unreachable!("execute_named converts export traps to VM transfers")
+                }
             };
         }
         if arity == 2 && fast != FastBif::None {
