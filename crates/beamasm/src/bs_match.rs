@@ -276,15 +276,21 @@ impl BeamModuleAssembler {
             e.cmp_imm(Gpr::x(10), (4 << 6) | 0x24 | 1, false)
         })?;
         self.code.b_cond(Cond::Eq, hit)?;
-        // A plain sub-bitstring becomes a match context with five stores. Heap bits and
-        // writable binaries still go through erts_bs_start_match_3.
+        // Plain sub-bitstrings and heap bitstrings become five-word match contexts inline.
+        // Writable binaries still go through erts_bs_start_match_3.
         // Port of erts/emulator/beam/erl_bits.c:81-104 (erts_bs_start_match_3), OTP-29.1.1.
+        let sub_bits = self.code.new_label();
+        let heap_bits = self.code.new_label();
         let plain = self.code.new_label();
         self.code.emit(|e| {
             e.and_imm(Gpr::x(9), Gpr::x(10), 63)?;
             e.cmp_imm(Gpr::x(9), 0x24, false)
         })?;
-        self.code.b_cond(Cond::Ne, plain)?;
+        self.code.b_cond(Cond::Eq, sub_bits)?;
+        self.code.emit(|e| e.cmp_imm(Gpr::x(9), 0x20, false))?;
+        self.code.b_cond(Cond::Eq, heap_bits)?;
+        self.code.b(plain)?;
+        self.code.bind(sub_bits)?;
         self.code.emit(|e| e.tst_imm(Gpr::x(12), 3))?;
         self.code.b_cond(Cond::Ne, plain)?;
         self.emit_gc_test_preserve(ERL_SUB_BITS_SIZE, live, src, gc_hook)?;
@@ -304,6 +310,30 @@ impl BeamModuleAssembler {
             e.orr_imm(Gpr::x(8), Gpr::x(8), 2)
         })?;
         self.store_register(dst, Gpr::x(8))?;
+        self.code.b(next)?;
+        self.code.bind(heap_bits)?;
+        // Heap bitstrings already hold their data and bit length in the first object. Pin
+        // those fields in a SUB_BITS context directly, after reserving its five words.
+        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:134-190 and
+        // erts/emulator/beam/erl_bits.c:81-104 (erts_bs_start_match_3), OTP-29.1.1.
+        self.emit_gc_test_preserve(ERL_SUB_BITS_SIZE, live, src, gc_hook)?;
+        let src_reg = self.source_reg_into(src, Gpr::x(8))?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(8), src_reg)?;
+            e.and_imm(CTX, Gpr::x(8), !7)?;
+            e.ldr_uoff(END, CTX, 8)?;
+            e.add_imm(Gpr::x(12), CTX, 16, false)?;
+            e.orr_imm(Gpr::x(12), Gpr::x(12), 1)?;
+            e.mov_const(Gpr::x(10), 0x124)?;
+            e.mov_reg(Gpr::x(9), Gpr::x(23))?;
+            e.stp(Gpr::x(10), Gpr::x(12), Gpr::x(9), 0)?;
+            e.mov_const(START, 0)?;
+            e.stp(START, END, Gpr::x(9), 16)?;
+            e.str_uoff(Gpr::x(8), Gpr::x(9), 32)?;
+            e.add_imm(Gpr::x(23), Gpr::x(9), 40, false)?;
+            e.orr_imm(Gpr::x(9), Gpr::x(9), 2)
+        })?;
+        self.store_register(dst, Gpr::x(9))?;
         self.code.b(next)?;
         self.code.bind(plain)?;
         // OTP ensures space before entering the heap-only runtime call.
