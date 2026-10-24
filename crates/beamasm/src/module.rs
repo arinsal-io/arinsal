@@ -1,5 +1,6 @@
 //! Module-local BeamAsm code generation for calls, frames, and register moves.
 
+use arinsal_a64::buf::IdMap;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -163,11 +164,11 @@ pub struct BeamModuleAssembler {
     pub(super) arith_fail: u32,
     /// Compiler types of the next arithmetic instruction's operands, consumed by its emitter.
     pub(super) arith_types: Option<[crate::types::ArgType; 4]>,
-    labels: HashMap<u32, Label>,
-    defined: HashMap<u32, ()>,
-    lambda_labels: HashMap<u32, Label>,
-    lambda_specs: HashMap<u32, (u32, u8, u8)>,
-    pub(super) defined_lambdas: HashMap<u32, ()>,
+    labels: IdMap<Label>,
+    defined: IdMap<()>,
+    lambda_labels: IdMap<Label>,
+    lambda_specs: IdMap<(u32, u8, u8)>,
+    pub(super) defined_lambdas: IdMap<()>,
     pub(crate) yield_label: Label,
     /// Arity of the function being emitted: the live X registers at its `i_test_yield`.
     function_arity: u8,
@@ -283,11 +284,11 @@ impl BeamModuleAssembler {
             code,
             reg_cache: crate::regcache::RegCache::default(),
             map_lookups: Vec::new(),
-            labels: HashMap::new(),
-            defined: HashMap::new(),
-            lambda_labels: HashMap::new(),
-            lambda_specs: HashMap::new(),
-            defined_lambdas: HashMap::new(),
+            labels: IdMap::default(),
+            defined: IdMap::default(),
+            lambda_labels: IdMap::default(),
+            lambda_specs: IdMap::default(),
+            defined_lambdas: IdMap::default(),
             yield_label,
             function_arity: 0,
             coverage_lse: has_lse_at_runtime(),

@@ -31,6 +31,9 @@ impl Hasher for LabelHasher {
     }
 }
 
+/// A map keyed by a dense `u32` id (a BEAM label or lambda index).
+pub type IdMap<V> = HashMap<u32, V, BuildHasherDefault<LabelHasher>>;
+
 /// A map keyed by label.
 pub type LabelMap<V> = HashMap<Label, V, BuildHasherDefault<LabelHasher>>;
 
