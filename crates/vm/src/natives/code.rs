@@ -656,14 +656,33 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     // a malformed module is `{error, badfile}` before finish_loading.
     // Static NIF bodies and import classes are bound here, like erts' loader does for the
     // static NIF table (erl_nif.c erts_load_static_nif at load_nif time).
-    let Ok(mut module) = vm.prepare_module(&beam, Some(&bytes)) else {
+    let mut meta = CodeMeta::from_beam(&beam, Some(&bytes));
+    // As erts has no interpreter form of a module, decode the instructions for the interpreter
+    // only when it may run them.
+    let native_only = vm.native_only(&beam, &meta);
+    let Ok(mut module) = vm.prepare_module_with(&beam, Some(&bytes), !native_only) else {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     };
     vm.intern_prepared_fun_entries(&mut module);
-    let mut meta = CodeMeta::from_beam(&beam, Some(&bytes));
     let registers = crate::process::register_requirements(&beam);
     vm.compile_native(&mut module, &mut meta);
+    if native_only
+        && meta
+            .beamasm
+            .as_ref()
+            .is_none_or(|native| native.unported_functions != 0)
+    {
+        // Some function needs the interpreter: load the module again with its code decoded.
+        let Ok(mut full) = vm.prepare_module(&beam, Some(&bytes)) else {
+            let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+            return Ok(error);
+        };
+        vm.intern_prepared_fun_entries(&mut full);
+        meta = CodeMeta::from_beam(&beam, Some(&bytes));
+        vm.compile_native(&mut full, &mut meta);
+        module = full;
+    }
     let prepared = Prepared {
         has_on_load: has_on_load_opcode(&beam),
         registers,
@@ -1825,8 +1844,11 @@ mod tests {
     }
 
     fn value(vm: &mut Vm, module: &str) -> OwnedTerm {
-        let result = vm.eval(module, "value", &[]).unwrap();
-        to_owned(result.term).unwrap()
+        // Through a scheduler, which runs the module's native code: a module loaded by
+        // `prepare_loading` has no interpreter form to run.
+        vm.eval_scheduled(module, "value", &[], 1, None)
+            .unwrap()
+            .term
     }
 
     #[test]
