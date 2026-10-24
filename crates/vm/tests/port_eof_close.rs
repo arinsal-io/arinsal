@@ -1,6 +1,8 @@
 //! End of input on spawn and fd ports: messages, exit status and descriptor release
 //! against the reference emulator.
 use arinsal_difftest::{CallOptions, CallResult, RefErl};
+use arinsal_etf::OwnedTerm;
+use arinsal_term::{ProcessHeap, from_owned};
 use arinsal_vm::Vm;
 use std::sync::Mutex;
 
@@ -9,7 +11,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 const SOURCE: &str = r#"
 -module(port_eof_close_diff).
--export([messages/0, fd_growth_eof/0, fd_growth_exit/0, fd_cycle/2]).
+-export([messages/0, fd_growth_eof/0, fd_growth_exit/0, fd_cycle/2, fd_cycles/1]).
 
 sh(Opts, Script) ->
     open_port({spawn_executable, "/bin/sh"}, [{args, ["-c", Script]} | Opts]).
@@ -90,6 +92,11 @@ fd_cycle(ReadFd, WriteFd) ->
     receive {P, eof} -> ok after 10000 -> error(no_eof) end,
     true = port_close(P),
     ok.
+
+fd_cycles([]) -> ok;
+fd_cycles([{ReadFd, WriteFd} | Rest]) ->
+    ok = fd_cycle(ReadFd, WriteFd),
+    fd_cycles(Rest).
 "#;
 
 fn compare(function: &str) {
@@ -165,25 +172,30 @@ fn fd_port_releases_the_input_descriptor_at_eof() {
         .unwrap();
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
-    let cycle = |vm: &mut Vm| {
+    let before = open_fds();
+    let mut cycle_args = Vec::with_capacity(1000);
+    let mut descriptors = Vec::with_capacity(3000);
+    for _ in 0..1000 {
         let (input_read, input_write) = pipe();
         let (output_read, output_write) = pipe();
         close(input_write);
-        let args = [
-            arinsal_term::Term::small(i64::from(input_read)).unwrap(),
-            arinsal_term::Term::small(i64::from(output_write)).unwrap(),
-        ];
-        let result = vm.eval_scheduled("port_eof_close_diff", "fd_cycle", &args, 1, None);
-        close(input_read);
-        close(output_read);
-        close(output_write);
-        result.expect("fd port cycle");
-    };
-    cycle(&mut vm);
-    let before = open_fds();
-    for _ in 0..1000 {
-        cycle(&mut vm);
+        cycle_args.push(OwnedTerm::Tuple(vec![
+            OwnedTerm::Int(i64::from(input_read)),
+            OwnedTerm::Int(i64::from(output_write)),
+        ]));
+        descriptors.extend([input_read, output_read, output_write]);
     }
+    let input = OwnedTerm::List {
+        elems: cycle_args,
+        tail: Box::new(OwnedTerm::Nil),
+    };
+    let mut heap = ProcessHeap::with_words(10_000);
+    let argument = from_owned(&input, &mut heap).expect("build fd cycles");
+    let result = vm.eval_scheduled("port_eof_close_diff", "fd_cycles", &[argument], 1, None);
+    for fd in descriptors {
+        close(fd);
+    }
+    result.expect("fd port cycles");
     let mut after = open_fds();
     for _ in 0..50 {
         if after <= before + 8 {

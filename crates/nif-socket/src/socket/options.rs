@@ -11,6 +11,8 @@ enum OptKind {
     Linger,
     /// Readable only, `SO_TYPE`.
     SocketType,
+    /// Linux's readable-only `SO_DOMAIN` option.
+    SocketDomain,
     /// `IP_TOS`: an integer, a TOS or DSCP name, or a precedence and TOS map.
     IpTos,
     Other,
@@ -34,6 +36,8 @@ fn option_kind(level: i32, opt: i32) -> OptKind {
         ) => OptKind::Int,
         (libc::SOL_SOCKET, libc::SO_LINGER) => OptKind::Linger,
         (libc::SOL_SOCKET, libc::SO_TYPE) => OptKind::SocketType,
+        #[cfg(target_os = "linux")]
+        (libc::SOL_SOCKET, libc::SO_DOMAIN) => OptKind::SocketDomain,
         (libc::IPPROTO_TCP, libc::TCP_NODELAY) => OptKind::Bool,
         (libc::IPPROTO_TCP, libc::TCP_KEEPCNT | libc::TCP_KEEPINTVL) => OptKind::Int,
         (libc::IPPROTO_IP, libc::IP_RECVTOS | libc::IP_RECVTTL | libc::IP_MULTICAST_LOOP) => {
@@ -481,6 +485,7 @@ fn setopt(h: &Handle, level: i32, opt: i32, value: &O, native: bool) -> Result<O
     }
     let bytes = match (option_kind(level, opt), value) {
         (OptKind::SocketType, _) => return Ok(invalid("socket_option")),
+        (OptKind::SocketDomain, _) => return Ok(invalid("socket_option")),
         (OptKind::IpTos, other) => match decode_ip_tos(other) {
             Some(tos) => tos.to_ne_bytes().to_vec(),
             None => return Ok(invalid_value()),
@@ -575,6 +580,12 @@ fn getopt(h: &Handle, level: i32, opt: i32, args: &[O]) -> Result<O, BifError> {
             libc::SOCK_DGRAM => atom("dgram"),
             libc::SOCK_RAW => atom("raw"),
             libc::SOCK_SEQPACKET => atom("seqpacket"),
+            other => O::Int(other.into()),
+        }),
+        OptKind::SocketDomain => ok(match int(0) {
+            libc::AF_INET => atom("inet"),
+            libc::AF_INET6 => atom("inet6"),
+            libc::AF_UNIX => atom("local"),
             other => O::Int(other.into()),
         }),
         _ => ok(O::Int(int(0).into())),

@@ -225,7 +225,10 @@ pub(crate) fn pairs(map: Term) -> Vec<(Term, Term)> {
         // SAFETY: the caller keeps the source heap live during traversal.
         return unsafe { map.flatmap_ref().unwrap() }.iter().collect();
     }
-    let mut result = Vec::with_capacity(len(map));
+    // Child HAMT nodes are map terms too, but only the head stores the map's
+    // entry count in word 1. Grow from the iterator so internal nodes do not
+    // interpret their first child term as a capacity.
+    let mut result = Vec::new();
     result.extend(PairIter::new(map));
     result
 }

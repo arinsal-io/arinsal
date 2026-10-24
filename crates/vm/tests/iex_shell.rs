@@ -164,9 +164,14 @@ fn iex_shell_pty_banner_and_prompts_match_otp() {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     fn pty(path: String) -> Output {
+        let script = if cfg!(target_os = "linux") {
+            "ulimit -u 1200; exec timeout 120 script -q -c iex /dev/null"
+        } else {
+            "ulimit -u 1200; exec timeout 120 script -q /dev/null iex"
+        };
         let mut child = Command::new("/bin/sh")
             .arg("-c")
-            .arg("ulimit -u 1200; exec timeout 120 script -q /dev/null iex")
+            .arg(script)
             .env("PATH", path)
             .env_remove("ERL_ROOTDIR")
             .env_remove("ARINSAL_OTP_ROOT")
