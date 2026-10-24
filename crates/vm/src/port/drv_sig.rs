@@ -316,6 +316,7 @@ pub(crate) fn output(
         caller: caller_data(caller),
         flags: task_flags,
         size,
+        deadline: None,
         callback,
     }) else {
         return PortOp::Scheduled(reference);
@@ -394,6 +395,7 @@ fn schedule(drv: &Arc<DriverPort>, caller: Pid, op: impl FnOnce(SigOp) -> i32 + 
         caller: caller_data(caller),
         flags: 0,
         size: 0,
+        deadline: None,
         callback: Box::new(op),
     });
 }
@@ -456,6 +458,7 @@ pub(crate) fn control(
         caller: caller_data(caller),
         flags: 0,
         size: 0,
+        deadline: None,
         callback: Box::new(move |sig: SigOp| {
             // Port of erts/emulator/beam/io.c:4160 (port_sig_control), OTP-29.1.1.
             let result = match sig {

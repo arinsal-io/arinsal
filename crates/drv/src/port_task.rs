@@ -7,13 +7,16 @@
 //! the port lock held (arinsal-sched executes [`RunPort`] entries between processes).
 
 use parking_lot::{Mutex, MutexGuard};
-use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use arinsal_sched::{PortExecution, PortRunQueue, RunPort};
 
 use crate::{CALLBACK_VREDS, CONTEXT_REDS, DriverPort, REDS_EXECUTE};
+
+mod intrusive;
+use intrusive::{BusyCallerTable, Link, Queue};
 
 // Port of erts/emulator/beam/erl_port_task.h:77-82 (ERTS_PT_FLG_*), OTP-29.1.1.
 /// The task waits while the port is busy (`ERTS_PT_FLG_WAIT_BUSY`).
@@ -96,6 +99,8 @@ pub struct ProcSig {
     /// Command data bytes for the busy port message queue
     /// (`erts_proc2port_sig_command_data_size`).
     pub size: usize,
+    /// Optional deadline for a task queued while the port is busy.
+    pub deadline: Option<Instant>,
     /// The operation.
     pub callback: SigCallback,
 }
@@ -112,6 +117,7 @@ enum TaskKind {
     ProcSig {
         caller: u64,
         size: usize,
+        deadline: Option<Instant>,
         callback: Mutex<Option<SigCallback>>,
     },
     /// `ERTS_PORT_TASK_DIST_CMD`: the port drains the distribution output queue of its
@@ -124,6 +130,8 @@ pub(crate) struct PortTask {
     state: AtomicU32,
     flags: u32,
     kind: TaskKind,
+    queue_link: Link<PortTask>,
+    nosuspend_link: Link<PortTask>,
 }
 
 /// I/O tasks scheduled and not yet freed (`erts_port_task_outstanding_io_tasks`).
@@ -156,6 +164,13 @@ impl PortTask {
         match &self.kind {
             TaskKind::ProcSig { size, .. } => *size,
             TaskKind::Timeout(_) | TaskKind::Io { .. } | TaskKind::DistCmd(_) => 0,
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        match &self.kind {
+            TaskKind::ProcSig { deadline, .. } => *deadline,
+            _ => None,
         }
     }
 
@@ -233,19 +248,15 @@ impl ImmCall<'_> {
 }
 
 #[derive(Default)]
-struct InQueue {
-    tasks: VecDeque<Arc<PortTask>>,
-    nosuspend: Vec<Arc<PortTask>>,
+struct PortTaskQueues {
+    incoming: Queue<PortTask>,
+    nosuspend: Queue<PortTask>,
+    exec: Queue<PortTask>,
+    busy: Queue<PortTask>,
     /// `prt->suspended`: processes suspended on the busy port.
     suspended: Vec<u64>,
-}
-
-#[derive(Default)]
-struct LocalQueue {
-    exec: VecDeque<Arc<PortTask>>,
-    busy: VecDeque<Arc<PortTask>>,
     /// The busy caller table: tasks per caller in the busy queue.
-    callers: HashMap<u64, usize>,
+    callers: Option<Box<BusyCallerTable<PortTask>>>,
     processing_busy: bool,
 }
 
@@ -253,11 +264,8 @@ struct LocalQueue {
 #[derive(Default)]
 pub(crate) struct PortSched {
     flags: AtomicU32,
-    /// `taskq.in` plus the nosuspend handles and suspended processes, under the
-    /// port scheduler lock (`sched.mtx`).
-    inq: Mutex<InQueue>,
-    /// `taskq.local`: only the thread executing the port touches it.
-    local: Mutex<LocalQueue>,
+    /// `taskq.in`, `taskq.local`, and `prt->suspended`, under `sched.mtx`.
+    queues: Mutex<PortTaskQueues>,
     /// `bpq->size`.
     bpq_size: AtomicUsize,
 }
@@ -275,12 +283,8 @@ impl PortSched {
         self.flags.fetch_and(!bits, Ordering::AcqRel)
     }
 
-    fn inq(&self) -> MutexGuard<'_, InQueue> {
-        self.inq.lock()
-    }
-
-    fn local(&self) -> MutexGuard<'_, LocalQueue> {
-        self.local.lock()
+    fn queues(&self) -> MutexGuard<'_, PortTaskQueues> {
+        self.queues.lock()
     }
 }
 
@@ -313,7 +317,7 @@ impl DriverPort {
     fn check_unset_busy_port_q(&self, mut flags: u32) -> u32 {
         let mut resume = Vec::new();
         {
-            let mut inq = self.sched.inq();
+            let mut inq = self.sched.queues();
             let qsize = self.sched.bpq_size.load(Ordering::Acquire);
             let low = self.msgq_limits.lock().low;
             if qsize < low {
@@ -393,7 +397,7 @@ impl DriverPort {
     /// Busy port message queue limits were written: re-evaluate `BUSY_PORT_Q`
     /// (the tail of erl_port_task.c:772 erl_drv_busy_msgq_limits).
     pub(crate) fn bpq_limits_written(&self, low: usize, high: usize) {
-        let _inq = self.sched.inq();
+        let _inq = self.sched.queues();
         let size = self.sched.bpq_size.load(Ordering::Acquire);
         if size > high {
             self.sched.or(PTS_FLG_BUSY_PORT_Q);
@@ -405,7 +409,7 @@ impl DriverPort {
     /// The busy port message queue was disabled (erl_port_task.c:791).
     pub(crate) fn bpq_disabled(&self) {
         let resume = {
-            let mut inq = self.sched.inq();
+            let mut inq = self.sched.queues();
             let old = self
                 .sched
                 .and_not(PTS_FLG_BUSY_PORT_Q | PTS_FLG_CHK_UNSET_BUSY_PORT_Q);
@@ -435,16 +439,16 @@ impl DriverPort {
         if nosuspend {
             fail |= PTS_FLG_BUSY_PORT;
         }
-        let mut inq = self.sched.inq();
+        let mut inq = self.sched.queues();
         let flags = self.sched.flags();
         if flags & fail != 0 {
             return Err(flags);
         }
         if nosuspend {
-            inq.nosuspend.push(Arc::clone(task));
+            inq.nosuspend.push_back(task, &task.nosuspend_link);
             self.sched.or(PTS_FLG_HAVE_NS_TASKS);
         }
-        inq.tasks.push_back(Arc::clone(task));
+        inq.incoming.push_back(task, &task.queue_link);
         Ok(self.enqueue_proc2port_data(task.size(), flags))
     }
 
@@ -458,8 +462,11 @@ impl DriverPort {
             kind: TaskKind::ProcSig {
                 caller: sig.caller,
                 size: sig.size,
+                deadline: sig.deadline,
                 callback: Mutex::new(Some(sig.callback)),
             },
+            queue_link: Link::default(),
+            nosuspend_link: Link::default(),
         });
         let nosuspend = task.flags & PT_FLG_NOSUSPEND != 0;
         match self.enqueue_task(&task, nosuspend) {
@@ -480,6 +487,74 @@ impl DriverPort {
         }
     }
 
+    /// The earliest deadline among queued port tasks.
+    pub fn next_task_deadline(&self) -> Option<Instant> {
+        let queues = self.sched.queues();
+        let mut next = None;
+        for queue in [&queues.incoming, &queues.exec, &queues.busy] {
+            queue.for_each(|task| {
+                if let Some(deadline) = task.deadline() {
+                    next = Some(next.map_or(deadline, |current: Instant| current.min(deadline)));
+                }
+            });
+        }
+        next
+    }
+
+    /// Whether a task that waits for the port to become unbusy remains queued.
+    pub fn has_busy_wait_tasks(&self) -> bool {
+        let queues = self.sched.queues();
+        let mut found = false;
+        for queue in [&queues.incoming, &queues.exec, &queues.busy] {
+            queue.for_each(|task| found |= task.flags & PT_FLG_WAIT_BUSY != 0);
+        }
+        found
+    }
+
+    /// Abort timed tasks whose deadline passed, preserving order in both scheduler queues.
+    pub fn expire_task_deadlines(&self, now: Instant) -> usize {
+        let mut expired = Vec::new();
+        {
+            let mut queues = self.sched.queues();
+            expired.extend(queues.incoming.take_matching(
+                |task| &task.queue_link,
+                |task| task.deadline().is_some_and(|deadline| deadline <= now),
+            ));
+            let busy_expired = queues.busy.take_matching(
+                |task| &task.queue_link,
+                |task| task.deadline().is_some_and(|deadline| deadline <= now),
+            );
+            let PortTaskQueues {
+                busy,
+                callers: caller_table,
+                ..
+            } = &mut *queues;
+            if let Some(callers) = caller_table.as_mut() {
+                for task in &busy_expired {
+                    callers.remove(task.caller());
+                }
+                busy.for_each(|task| callers.set_last(task.caller(), &task.queue_link));
+            }
+            expired.extend(busy_expired);
+            if queues.busy.is_empty() {
+                debug_assert!(queues.callers.as_ref().is_none_or(|table| table.is_empty()));
+                queues.callers = None;
+                self.sched.and_not(PTS_FLG_HAVE_BUSY_TASKS);
+            }
+            if queues.incoming.is_empty() && queues.exec.is_empty() {
+                self.sched.and_not(PTS_FLG_HAVE_TASKS);
+            }
+        }
+        let count = expired.len();
+        let bpq = self.bpq_enabled();
+        for task in expired {
+            if task.claim(STATE_ABORTED) {
+                self.abort_signal_task(&task, SigOp::Abort, bpq);
+            }
+        }
+        count
+    }
+
     /// Queue a distribution command task (`ERTS_PORT_TASK_DIST_CMD`, dist.c
     /// erts_schedule_dist_command). The callback runs with the port locked on a scheduler;
     /// it is called in an abort mode when the port closes first.
@@ -488,6 +563,8 @@ impl DriverPort {
             state: AtomicU32::new(STATE_SCHEDULED),
             flags: 0,
             kind: TaskKind::DistCmd(Mutex::new(Some(callback))),
+            queue_link: Link::default(),
+            nosuspend_link: Link::default(),
         });
         match self.enqueue_task(&task, false) {
             Ok(act) => self.activate(act),
@@ -504,6 +581,8 @@ impl DriverPort {
             state: AtomicU32::new(STATE_SCHEDULED),
             flags: 0,
             kind: TaskKind::Timeout(epoch),
+            queue_link: Link::default(),
+            nosuspend_link: Link::default(),
         });
         if let Ok(act) = self.enqueue_task(&task, false) {
             self.activate(act);
@@ -519,6 +598,8 @@ impl DriverPort {
             state: AtomicU32::new(STATE_SCHEDULED),
             flags: 0,
             kind: TaskKind::Io { fd, dir, reg },
+            queue_link: Link::default(),
+            nosuspend_link: Link::default(),
         });
         match self.enqueue_task(&task, false) {
             Ok(act) => {
@@ -585,13 +666,13 @@ impl DriverPort {
     // Port of erts/emulator/beam/erl_port_task.c:1375 (erts_port_task_abort_nosuspend_tasks),
     // OTP-29.1.1.
     fn abort_nosuspend_tasks(&self) {
-        let list = {
-            let mut inq = self.sched.inq();
+        let mut list = {
+            let mut inq = self.sched.queues();
             self.sched.and_not(PTS_FLG_HAVE_NS_TASKS);
             std::mem::take(&mut inq.nosuspend)
         };
         let bpq = self.bpq_enabled();
-        for task in list {
+        while let Some(task) = list.pop_front() {
             if task.claim(STATE_ABORTED) {
                 self.abort_signal_task(&task, SigOp::AbortNosuspend, bpq);
             }
@@ -599,7 +680,7 @@ impl DriverPort {
     }
 
     /// Port of erts/emulator/beam/io.c:5203 (set_busy_port).
-    pub(crate) fn set_busy_port(&self, on: bool) {
+    pub fn set_busy_port(&self, on: bool) {
         if on {
             let flags = self.sched.or(PTS_FLG_BUSY_PORT);
             if flags & PTS_FLG_BUSY_PORT != 0 {
@@ -623,7 +704,7 @@ impl DriverPort {
 
     /// Port of erts/emulator/beam/io.c:5261 (erts_port_resume_procs).
     fn resume_procs(&self) {
-        let list = std::mem::take(&mut self.sched.inq().suspended);
+        let list = std::mem::take(&mut self.sched.queues().suspended);
         if !list.is_empty() {
             self.host.resume_processes(self, list);
         }
@@ -632,7 +713,7 @@ impl DriverPort {
     /// Port of erts/emulator/beam/io.c:519 (erts_save_suspend_process_on_port): queue
     /// process `pid` for resumption; `false` when the port is no longer busy.
     pub fn save_suspend_process(&self, pid: u64) -> bool {
-        let mut inq = self.sched.inq();
+        let mut inq = self.sched.queues();
         let flags = self.sched.flags();
         let saved = flags & PTS_FLGS_BUSY != 0 && flags & PTS_FLG_EXIT == 0;
         if saved {
@@ -700,7 +781,7 @@ impl DriverPort {
     /// port terminated; abort its tasks unless a scheduler executing the port does that.
     pub(crate) fn sched_free(&self) {
         let flags = {
-            let _inq = self.sched.inq();
+            let _inq = self.sched.queues();
             self.sched.or(PTS_FLG_EXIT)
         };
         if flags & (PTS_FLG_IN_RUNQ | PTS_FLG_EXEC) == 0 {
@@ -712,30 +793,34 @@ impl DriverPort {
     fn begin_port_cleanup(&self) {
         let mut tasks: Vec<Arc<PortTask>> = Vec::new();
         {
-            let mut local = self.sched.local();
+            let mut local = self.sched.queues();
             // Busy queue, local queue, in queue: signal order.
-            tasks.extend(local.busy.drain(..));
-            tasks.extend(local.exec.drain(..));
-            local.callers.clear();
+            while let Some(task) = local.busy.pop_front() {
+                tasks.push(task);
+            }
+            while let Some(task) = local.exec.pop_front() {
+                tasks.push(task);
+            }
+            while let Some(task) = local.incoming.pop_front() {
+                tasks.push(task);
+            }
+            local.callers = None;
             local.processing_busy = false;
+            local
+                .nosuspend
+                .retain(|task| &task.nosuspend_link, |_| false);
         }
-        tasks.extend(self.sched.inq().tasks.drain(..));
         let bpq = self.bpq_enabled();
         for task in &tasks {
-            if !task.claim(STATE_EXECUTING) {
-                continue;
-            }
-            if let TaskKind::ProcSig { .. } | TaskKind::DistCmd(_) = task.kind {
+            if task.claim(STATE_EXECUTING)
+                && matches!(task.kind, TaskKind::ProcSig { .. } | TaskKind::DistCmd(_))
+            {
                 self.abort_signal_task(task, SigOp::AbortClosed, bpq);
             }
         }
         self.sched
             .and_not(PTS_FLG_HAVE_BUSY_TASKS | PTS_FLG_HAVE_TASKS | PTS_FLGS_BUSY);
-        let suspended = {
-            let mut inq = self.sched.inq();
-            inq.nosuspend.clear();
-            std::mem::take(&mut inq.suspended)
-        };
+        let suspended = std::mem::take(&mut self.sched.queues().suspended);
         if !suspended.is_empty() {
             self.host.resume_processes(self, suspended);
         }
@@ -743,72 +828,79 @@ impl DriverPort {
 }
 
 // Port of erts/emulator/beam/erl_port_task.c:258 (popped_from_busy_queue), OTP-29.1.1.
-fn popped_from_busy_queue(port: &DriverPort, local: &mut LocalQueue, task: &PortTask) {
+fn popped_from_busy_queue(port: &DriverPort, local: &mut PortTaskQueues, task: &PortTask) {
     let caller = task.caller();
-    if let Some(count) = local.callers.get_mut(&caller) {
-        *count -= 1;
-        if *count == 0 {
-            local.callers.remove(&caller);
-        }
-    }
+    local
+        .callers
+        .as_mut()
+        .expect("busy caller table")
+        .remove(caller);
     if local.busy.is_empty() {
-        local.callers.clear();
+        debug_assert!(local.callers.as_ref().is_none_or(|table| table.is_empty()));
+        local.callers = None;
         port.sched.and_not(PTS_FLG_HAVE_BUSY_TASKS);
     }
 }
 
 // Port of erts/emulator/beam/erl_port_task.c:308 (busy_wait_move_to_busy_queue), OTP-29.1.1.
-fn busy_wait_move_to_busy_queue(port: &DriverPort, local: &mut LocalQueue, task: Arc<PortTask>) {
+fn busy_wait_move_to_busy_queue(
+    port: &DriverPort,
+    local: &mut PortTaskQueues,
+    task: Arc<PortTask>,
+) {
     if local.busy.is_empty() {
         port.sched.or(PTS_FLG_HAVE_BUSY_TASKS);
+        local.callers = Some(Box::default());
     }
-    *local.callers.entry(task.caller()).or_insert(0) += 1;
-    local.busy.push_back(task);
+    local
+        .callers
+        .as_mut()
+        .expect("busy caller table")
+        .add(task.caller(), &task.queue_link);
+    local.busy.push_back_owned(task, |task| &task.queue_link);
 }
 
 // Port of erts/emulator/beam/erl_port_task.c:376 (check_sig_dep_move_to_busy_queue): the
 // task follows the caller's last task in the busy queue. `Err` gives the task back.
 fn check_sig_dep_move_to_busy_queue(
-    local: &mut LocalQueue,
+    local: &mut PortTaskQueues,
     task: Arc<PortTask>,
 ) -> Result<(), Arc<PortTask>> {
     let caller = task.caller();
-    let Some(count) = local.callers.get_mut(&caller) else {
+    let Some(previous) = local
+        .callers
+        .as_ref()
+        .and_then(|callers| callers.last_link(caller))
+    else {
         return Err(task);
     };
-    *count += 1;
-    let last = local
+    local
+        .callers
+        .as_mut()
+        .expect("busy caller table")
+        .add(caller, &task.queue_link);
+    local
         .busy
-        .iter()
-        .rposition(|queued| queued.caller() == caller)
-        .map_or(local.busy.len(), |at| at + 1);
-    local.busy.insert(last, task);
+        .insert_after_link(task, |task| &task.queue_link, previous);
     Ok(())
 }
 
 // Port of erts/emulator/beam/erl_port_task.c:423 (no_sig_dep_move_from_busyq), OTP-29.1.1.
-fn no_sig_dep_move_from_busyq(port: &DriverPort, local: &mut LocalQueue) {
-    let mut moved = Vec::new();
-    while let Some(task) = local.busy.front() {
-        if task.flags & PT_FLG_WAIT_BUSY != 0 {
-            break;
-        }
-        let task = local.busy.pop_front().expect("front task");
-        let caller = task.caller();
-        if let Some(count) = local.callers.get_mut(&caller) {
-            *count -= 1;
-            if *count == 0 {
-                local.callers.remove(&caller);
-            }
-        }
-        moved.push(task);
-    }
-    if local.busy.is_empty() {
-        local.callers.clear();
+fn no_sig_dep_move_from_busyq(port: &DriverPort, local: &mut PortTaskQueues) {
+    let (busy, exec, callers) = (&mut local.busy, &mut local.exec, &mut local.callers);
+    busy.move_prefix_to_front(
+        exec,
+        |task| task.flags & PT_FLG_WAIT_BUSY == 0,
+        |task| {
+            callers
+                .as_mut()
+                .expect("busy caller table")
+                .remove(task.caller())
+        },
+    );
+    if busy.is_empty() {
+        *callers = None;
         port.sched.and_not(PTS_FLG_HAVE_BUSY_TASKS);
-    }
-    for task in moved.into_iter().rev() {
-        local.exec.push_front(task);
     }
 }
 
@@ -816,7 +908,7 @@ fn no_sig_dep_move_from_busyq(port: &DriverPort, local: &mut LocalQueue) {
 fn prepare_exec(port: &DriverPort) {
     let act = port.sched.flags();
     {
-        let mut local = port.sched.local();
+        let mut local = port.sched.queues();
         local.processing_busy = !(local.busy.is_empty() || act & PTS_FLG_BUSY_PORT != 0);
     }
     let mut act = act;
@@ -862,17 +954,12 @@ fn finalize_exec(port: &DriverPort) -> bool {
 }
 
 // Port of erts/emulator/beam/erl_port_task.c:1126 (select_queue_for_exec), OTP-29.1.1.
-fn select_queue_for_exec(port: &DriverPort, local: &mut LocalQueue) -> u32 {
-    let mut flags = port.sched.flags();
-    if flags & PTS_FLG_CHK_UNSET_BUSY_PORT_Q != 0 {
-        flags = port.check_unset_busy_port_q(flags);
-    }
+fn select_queue_for_exec(port: &DriverPort, local: &mut PortTaskQueues, flags: u32) -> u32 {
     if flags & PTS_FLG_BUSY_PORT != 0 {
         if local.processing_busy {
             if local
                 .busy
-                .front()
-                .is_some_and(|task| task.flags & PT_FLG_WAIT_BUSY == 0)
+                .front_matches(|task| task.flags & PT_FLG_WAIT_BUSY == 0)
             {
                 no_sig_dep_move_from_busyq(port, local);
             }
@@ -891,7 +978,7 @@ fn select_queue_for_exec(port: &DriverPort, local: &mut LocalQueue) -> u32 {
 fn check_task_for_exec(
     port: &DriverPort,
     flags: u32,
-    local: &mut LocalQueue,
+    local: &mut PortTaskQueues,
     task: Arc<PortTask>,
 ) -> Option<Arc<PortTask>> {
     if !local.processing_busy {
@@ -912,17 +999,18 @@ fn check_task_for_exec(
 }
 
 // Port of erts/emulator/beam/erl_port_task.c:1225 (fetch_in_queue), OTP-29.1.1.
-fn fetch_in_queue(port: &DriverPort, local: &mut LocalQueue) -> Option<Arc<PortTask>> {
-    let mut inq = port.sched.inq();
-    let task = inq.tasks.pop_front();
+fn fetch_in_queue(port: &DriverPort, local: &mut PortTaskQueues) -> Option<Arc<PortTask>> {
+    let task = local.incoming.pop_front();
     if task.is_some() {
-        local.exec.extend(inq.tasks.drain(..));
+        local.incoming.append_to(&mut local.exec);
     } else {
         port.sched.and_not(PTS_FLG_HAVE_TASKS);
     }
-    if !inq.nosuspend.is_empty() {
-        inq.nosuspend.retain(|task| task.is_scheduled());
-        if inq.nosuspend.is_empty() {
+    if !local.nosuspend.is_empty() {
+        local
+            .nosuspend
+            .retain(|task| &task.nosuspend_link, |task| task.is_scheduled());
+        if local.nosuspend.is_empty() {
             port.sched.and_not(PTS_FLG_HAVE_NS_TASKS);
         }
     }
@@ -931,8 +1019,12 @@ fn fetch_in_queue(port: &DriverPort, local: &mut LocalQueue) -> Option<Arc<PortT
 
 // Port of erts/emulator/beam/erl_port_task.c:1254 (select_task_for_exec), OTP-29.1.1.
 fn select_task_for_exec(port: &DriverPort) -> Option<Arc<PortTask>> {
-    let mut local = port.sched.local();
-    let flags = select_queue_for_exec(port, &mut local);
+    let mut flags = port.sched.flags();
+    if flags & PTS_FLG_CHK_UNSET_BUSY_PORT_Q != 0 {
+        flags = port.check_unset_busy_port_q(flags);
+    }
+    let mut local = port.sched.queues();
+    let flags = select_queue_for_exec(port, &mut local, flags);
     loop {
         let next = if local.processing_busy {
             local.busy.pop_front()
@@ -1021,4 +1113,16 @@ fn execute(port: &DriverPort) -> PortExecution {
     let reds = port.reds.load(Ordering::Acquire) - vreds;
     drop(guard);
     PortExecution { active, reds }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    #[test]
+    fn reports_port_task_layout() {
+        eprintln!(
+            "PortSched={} PortTaskQueues={}",
+            std::mem::size_of::<super::PortSched>(),
+            std::mem::size_of::<super::PortTaskQueues>(),
+        );
+    }
 }
