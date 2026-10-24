@@ -742,6 +742,25 @@ fn restriction_matches(
     }
 }
 
+/// An operand a rule pattern bound: the instruction's own operand when it is borrowed from the
+/// code, else a copy (a rest list gathered from several operands).
+enum Bound<'a> {
+    Ref(&'a Operand),
+    Owned(Operand),
+}
+
+impl std::ops::Deref for Bound<'_> {
+    type Target = Operand;
+    fn deref(&self) -> &Operand {
+        match self {
+            Bound::Ref(operand) => operand,
+            Bound::Owned(operand) => operand,
+        }
+    }
+}
+
+type Bindings<'a> = Vec<(&'a str, Bound<'a>)>;
+
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn apply_rule(
     rule: &Rule,
@@ -753,7 +772,7 @@ fn apply_rule(
     if at + rule.patterns.len() > code.len() {
         return None;
     }
-    let mut bindings: Vec<(String, Operand)> = Vec::new();
+    let mut bindings: Bindings<'_> = Vec::new();
     for (pattern, instruction) in rule.patterns.iter().zip(&code[at..]) {
         if pattern.op != instruction.name {
             return None;
@@ -775,7 +794,13 @@ fn apply_rule(
         if expanded_args.len() < fixed || (!rest && expanded_args.len() != fixed) {
             return None;
         }
-        for (pat, value) in pattern.args.iter().take(fixed).zip(expanded_args.iter()) {
+        for (index, (pat, value)) in pattern
+            .args
+            .iter()
+            .take(fixed)
+            .zip(expanded_args.iter())
+            .enumerate()
+        {
             let exact_x0 = pat.ty.as_deref() == Some("x")
                 && pat.eq == Some(0)
                 && register_index(value) == Some(('x', 0));
@@ -793,12 +818,19 @@ fn apply_rule(
                 return None;
             }
             if let Some(name) = &pat.name {
-                if let Some((_, previous)) = bindings.iter().find(|(key, _)| key == name) {
+                if let Some((_, previous)) = bindings.iter().find(|(key, _)| *key == name.as_str())
+                {
                     if !operand_equal(previous, value) {
                         return None;
                     }
                 } else {
-                    bindings.push((name.clone(), value.clone()));
+                    bindings.push((
+                        name.as_str(),
+                        match &expanded_args {
+                            std::borrow::Cow::Borrowed(args) => Bound::Ref(&args[index]),
+                            std::borrow::Cow::Owned(_) => Bound::Owned(value.clone()),
+                        },
+                    ));
                 }
             }
         }
@@ -814,9 +846,9 @@ fn apply_rule(
             let name = pattern
                 .args
                 .last()
-                .and_then(|arg| arg.name.clone())
-                .unwrap_or_else(|| "*".to_owned());
-            bindings.push((name, Operand::List(values)));
+                .and_then(|arg| arg.name.as_deref())
+                .unwrap_or("*");
+            bindings.push((name, Bound::Owned(Operand::List(values))));
         }
     }
     for pred in &rule.predicates {
@@ -829,6 +861,7 @@ fn apply_rule(
         let mut args = Vec::new();
         for token in &output.args {
             if let Some((_, value)) = bindings.iter().find(|(name, _)| name == token) {
+                let value: &Operand = value;
                 if !output.function {
                     if let Operand::List(rest) = value {
                         args.extend(rest.clone());
@@ -839,8 +872,8 @@ fn apply_rule(
                     args.push(value.clone());
                 }
             } else if token == "*" {
-                if let Some((_, Operand::List(rest))) =
-                    bindings.iter().find(|(name, _)| name == "*")
+                if let Some((_, Bound::Owned(Operand::List(rest)))) =
+                    bindings.iter().find(|(name, _)| *name == "*")
                 {
                     if output.function {
                         args.push(Operand::List(rest.clone()));
@@ -1367,15 +1400,15 @@ fn output_constant(token: &str) -> Option<Operand> {
 
 fn eval_predicate(
     pred: &Predicate,
-    bindings: &[(String, Operand)],
+    bindings: &[(&str, Bound<'_>)],
     beam: Option<&BeamFile>,
     instrument_line_breakpoints: bool,
 ) -> bool {
     let get = |name: &str| {
         bindings
             .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value)
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| &**value)
     };
     match pred {
         Predicate::Equal(a, b) => get(a).zip(get(b)).is_some_and(|(x, y)| operand_equal(x, y)),
@@ -1406,7 +1439,7 @@ fn eval_predicate(
 fn eval_c_predicate(
     name: &str,
     args: &[String],
-    bindings: &[(String, Operand)],
+    bindings: &[(&str, Bound<'_>)],
     beam: Option<&BeamFile>,
     instrument_line_breakpoints: bool,
 ) -> bool {
@@ -1416,8 +1449,8 @@ fn eval_c_predicate(
     let get = |arg: &str| {
         bindings
             .iter()
-            .find(|(key, _)| key == arg)
-            .map(|(_, value)| value)
+            .find(|(key, _)| *key == arg)
+            .map(|(_, value)| &**value)
     };
     let integer = |arg: &str| {
         arg.parse::<i64>()
