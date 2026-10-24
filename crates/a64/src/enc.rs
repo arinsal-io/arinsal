@@ -2380,6 +2380,11 @@ pub fn is_logical_immediate(value: u64, bits: u8) -> bool {
 }
 
 /// Produces `(N, immr, imms)` for an AArch64 logical-immediate bitmask.
+///
+/// Constant time: find the smallest replicating element, then read the run of ones and its
+/// rotation from the element's leading and trailing bits, as the assembler of the
+/// architecture reference does (`DecodeBitMasks` inverted), instead of trying every element
+/// size, run length and rotation.
 pub fn encode_logical_immediate(value: u64, bits: u8) -> Option<(u32, u32, u32)> {
     if bits != 32 && bits != 64 {
         return None;
@@ -2393,28 +2398,51 @@ pub fn encode_logical_immediate(value: u64, bits: u8) -> Option<(u32, u32, u32)>
     if value == 0 || value == mask {
         return None;
     }
-    for esize in [2u8, 4, 8, 16, 32, 64].into_iter().filter(|&s| s <= bits) {
-        let emask = if esize == 64 {
-            u64::MAX
-        } else {
-            (1u64 << esize) - 1
-        };
-        let pattern = value & emask;
-        if replicate(pattern, esize, bits) != value {
-            continue;
+    // Smallest element size whose repetition is the value.
+    let mut size = u32::from(bits);
+    while size > 2 {
+        let half = size / 2;
+        let half_mask = (1u64 << half) - 1;
+        if (value & half_mask) != ((value >> half) & half_mask) {
+            break;
         }
-        for ones in 1..esize {
-            let run = (1u64 << ones) - 1;
-            for r in 0..esize {
-                if rotate_right(run, r, esize) == pattern {
-                    let n = if esize == 64 { 1 } else { 0 };
-                    let imms = (!(2 * esize as u32 - 1) & 0x3f) | ((ones as u32 - 1) & 0x3f);
-                    return Some((n, (r as u32) & 0x3f, imms));
-                }
-            }
-        }
+        size = half;
     }
-    None
+    let element_mask = if size == 64 {
+        u64::MAX
+    } else {
+        (1u64 << size) - 1
+    };
+    let element = value & element_mask;
+    // The element must be a rotated run of ones: a shifted mask, or the complement of one.
+    let (rotation_base, ones) = if is_shifted_mask(element) {
+        (
+            element.trailing_zeros(),
+            (element >> element.trailing_zeros()).trailing_ones(),
+        )
+    } else {
+        let inverted = !element & element_mask;
+        if !is_shifted_mask(inverted) {
+            return None;
+        }
+        // Ones wrap around the top: the run starts after the zeros.
+        let zeros = inverted.count_ones();
+        (
+            size - (inverted.leading_zeros() - (64 - size)),
+            size - zeros,
+        )
+    };
+    let immr = (size - rotation_base) & (size - 1);
+    let n_imms = (!(size - 1) << 1) | (ones - 1);
+    let n = ((n_imms >> 6) & 1) ^ 1;
+    Some((n, immr, n_imms & 0x3f))
+}
+
+fn is_shifted_mask(value: u64) -> bool {
+    value != 0 && {
+        let shifted = value >> value.trailing_zeros();
+        shifted & (shifted + 1) == 0
+    }
 }
 fn expand_fp_imm8(imm8: u8) -> u64 {
     let sign = ((imm8 >> 7) as u64) << 63;
@@ -2423,6 +2451,7 @@ fn expand_fp_imm8(imm8: u8) -> u64 {
     let fraction = ((imm8 & 0x0f) as u64) << 48;
     sign | (exponent << 52) | fraction
 }
+#[cfg(test)]
 fn replicate(pattern: u64, esize: u8, bits: u8) -> u64 {
     let mut out = 0;
     for i in (0..bits).step_by(esize as usize) {
@@ -2430,6 +2459,7 @@ fn replicate(pattern: u64, esize: u8, bits: u8) -> u64 {
     }
     if esize == 64 { pattern } else { out }
 }
+#[cfg(test)]
 fn rotate_right(value: u64, amount: u8, bits: u8) -> u64 {
     let mask = if bits == 64 {
         u64::MAX
@@ -2453,5 +2483,100 @@ mod logical_tests {
         assert!(!is_logical_immediate(0, 64));
         assert!(!is_logical_immediate(u64::MAX, 64));
         assert!(!is_logical_immediate(0x1234, 64));
+    }
+}
+
+#[cfg(test)]
+mod logical_reference_tests {
+    use super::*;
+
+    fn encode_logical_immediate_reference(value: u64, bits: u8) -> Option<(u32, u32, u32)> {
+        if bits != 32 && bits != 64 {
+            return None;
+        }
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            u32::MAX as u64
+        };
+        let value = value & mask;
+        if value == 0 || value == mask {
+            return None;
+        }
+        for esize in [2u8, 4, 8, 16, 32, 64].into_iter().filter(|&s| s <= bits) {
+            let emask = if esize == 64 {
+                u64::MAX
+            } else {
+                (1u64 << esize) - 1
+            };
+            let pattern = value & emask;
+            if replicate(pattern, esize, bits) != value {
+                continue;
+            }
+            for ones in 1..esize {
+                let run = (1u64 << ones) - 1;
+                for r in 0..esize {
+                    if rotate_right(run, r, esize) == pattern {
+                        let n = if esize == 64 { 1 } else { 0 };
+                        let imms = (!(2 * esize as u32 - 1) & 0x3f) | ((ones as u32 - 1) & 0x3f);
+                        return Some((n, (r as u32) & 0x3f, imms));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn constant_time_encoder_matches_the_search() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for bits in [32u8, 64] {
+            // Every rotated run of every element size.
+            for esize in [2u32, 4, 8, 16, 32, 64] {
+                if esize > u32::from(bits) {
+                    continue;
+                }
+                for ones in 1..esize {
+                    for rotation in 0..esize {
+                        let emask = if esize == 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << esize) - 1
+                        };
+                        let run = (1u64 << ones) - 1;
+                        let element = if rotation == 0 {
+                            run
+                        } else {
+                            ((run >> rotation) | (run << (esize - rotation))) & emask
+                        };
+                        let mut value = 0u64;
+                        let mut at = 0;
+                        while at < u32::from(bits) {
+                            value |= element << at;
+                            at += esize;
+                        }
+                        assert_eq!(
+                            encode_logical_immediate(value, bits),
+                            encode_logical_immediate_reference(value, bits),
+                            "{value:#x} / {bits}"
+                        );
+                    }
+                }
+            }
+            for _ in 0..200_000 {
+                let value = next() >> (next() % 64);
+                assert_eq!(
+                    encode_logical_immediate(value, bits),
+                    encode_logical_immediate_reference(value, bits),
+                    "{value:#x} / {bits}"
+                );
+            }
+        }
     }
 }
