@@ -1,7 +1,6 @@
 //! Module-local BeamAsm code generation for calls, frames, and register moves.
 
 use arinsal_a64::buf::IdMap;
-use std::collections::HashMap;
 use std::path::Path;
 
 use crate::rt::arinsal_enter_native_return;
@@ -97,10 +96,10 @@ pub struct FinalizedModule {
     /// Static operand tables referenced by emitted `i_get_map_elements` instructions.
     pub map_lookups: Box<[crate::map::MapLookupTable]>,
     /// Native entry address by BEAM label number.
-    pub entries: HashMap<u32, *const u8>,
-    entry_offsets: HashMap<u32, usize>,
+    pub entries: IdMap<*const u8>,
+    entry_offsets: IdMap<usize>,
     /// Native trampoline by zero-based BEAM lambda-table index.
-    pub lambda_entries: HashMap<u32, *const u8>,
+    pub lambda_entries: IdMap<*const u8>,
     /// Native catch handler addresses in this module's `make_catch` order.
     pub catch_table: Vec<*const u8>,
     /// First globally unique catch index assigned to this module.
@@ -108,7 +107,7 @@ pub struct FinalizedModule {
     /// Native code addresses associated with the nearest source line marker.
     pub line_table: Vec<ModuleLine>,
     /// Patch sites for per-function tracing breakpoints: label to entry word and skip branch.
-    pub trace_breakpoints: HashMap<u32, (usize, u32)>,
+    pub trace_breakpoints: IdMap<(usize, u32)>,
     /// Patch sites of line breakpoints: source line, offset of the `b next` word and its
     /// original encoding (restored when the breakpoint is disabled).
     pub line_breakpoints: Vec<(u32, usize, u32)>,
@@ -117,7 +116,7 @@ pub struct FinalizedModule {
     pub line_breakpoint_returns: Vec<(usize, usize)>,
     /// NIF load patch sites: function label to the word that skips the call-NIF body
     /// until `load_nif` replaces it with a NOP.
-    pub nif_patches: HashMap<u32, usize>,
+    pub nif_patches: IdMap<usize>,
 }
 
 /// Source location attached to a native `line` instruction address.
@@ -224,12 +223,12 @@ pub struct BeamModuleAssembler {
     last_error_offset: usize,
     /// Location index of the latest line-table entry.
     last_line_location: Option<u64>,
-    trace_breakpoints: HashMap<u32, (usize, Label)>,
+    trace_breakpoints: IdMap<(usize, Label)>,
     /// Line, live count and word offset recorded by `i_debug_line` until its trampoline.
     pending_debug_line: Option<(u32, u16)>,
     line_breakpoints: Vec<(u32, usize, Label)>,
     line_breakpoint_returns: Vec<(usize, usize)>,
-    nif_patches: HashMap<u32, usize>,
+    nif_patches: IdMap<usize>,
     current_function_label: Option<u32>,
     next_fresh_label: u32,
     dump_module: Option<String>,
@@ -316,11 +315,11 @@ impl BeamModuleAssembler {
             last_line_location: None,
             arith_fail: 0,
             arith_types: None,
-            trace_breakpoints: HashMap::new(),
+            trace_breakpoints: IdMap::default(),
             pending_debug_line: None,
             line_breakpoints: Vec::new(),
             line_breakpoint_returns: Vec::new(),
-            nif_patches: HashMap::new(),
+            nif_patches: IdMap::default(),
             current_function_label: None,
             next_fresh_label: 0x7000_0000,
             dump_module: None,
@@ -2324,7 +2323,7 @@ impl BeamModuleAssembler {
                 let branch = 0x1400_0000 | (immediate & 0x03ff_ffff);
                 Some((function, (offset, branch)))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<IdMap<_>>();
         let line_breakpoints = self
             .line_breakpoints
             .iter()
@@ -2369,7 +2368,7 @@ impl BeamModuleAssembler {
                 format!("{:x}\n", memory.ptr_at(offset) as usize),
             );
         }
-        let entry_offsets: HashMap<_, _> = self
+        let entry_offsets: IdMap<_> = self
             .labels
             .into_iter()
             .filter_map(|(id, label)| labels.get(&label).map(|&off| (id, offset + off)))
