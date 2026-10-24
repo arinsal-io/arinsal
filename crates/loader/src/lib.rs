@@ -1054,6 +1054,19 @@ pub fn load_with_instrumentations(
     requested_mode: CoverageMode,
     debugger_lines: bool,
 ) -> Result<Module, LoadError> {
+    load_with_options(file, requested_mode, debugger_lines, true)
+}
+
+/// Like [`load_with_instrumentations`]; without `specialize` the module has all its tables
+/// (functions, exports, imports, lines, literals, NIF stubs) but its instructions are not
+/// decoded into interpreter form: each stays a `CodeEnd` placeholder at its index. For a
+/// module whose functions all run natively, as erts has no interpreter form of a module.
+pub fn load_with_options(
+    file: &BeamFile,
+    requested_mode: CoverageMode,
+    debugger_lines: bool,
+    specialize: bool,
+) -> Result<Module, LoadError> {
     // Port of erts/emulator/beam/beam_file.c:242-291, OTP-29.1.1.
     // OTP interns the complete Atom chunk in index order before resolving code.
     for atom in &file.atoms {
@@ -1523,6 +1536,14 @@ pub fn load_with_instrumentations(
             let reason = u32::try_from(unsupported_reasons.len()).map_err(|_| LoadError::Limit)?;
             unsupported_reasons.push(format!("opcode {}", instruction.op.name()));
             code.push(Instr::Unsupported(reason));
+            types.push(Vec::new());
+            lines.push(current_line.clone());
+            source_ip += 1;
+            continue;
+        }
+        if !specialize && instruction.op != Opcode::FuncInfo && instruction.op != Opcode::DebugLine
+        {
+            code.push(Instr::CodeEnd);
             types.push(Vec::new());
             lines.push(current_line.clone());
             source_ip += 1;
