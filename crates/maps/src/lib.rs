@@ -791,14 +791,6 @@ pub fn get(map: Term, key: Term) -> MapResult<Option<Term>> {
     Ok(lookup_header(map, key, header))
 }
 
-/// Looks up a key using the hash already computed by a native caller.
-// Port of erts/emulator/beam/beam_common.c:1775-1799 (get_map_element), OTP-29.1.1.
-#[inline]
-pub fn get_with_hash(map: Term, key: Term, hash: u64) -> MapResult<Option<Term>> {
-    let header = checked_header(map)?;
-    Ok(lookup_header_with_hash(map, key, header, hash))
-}
-
 /// Fetches BEAM's staged `{key, destination, hash}` map-element triplets.
 // Port of beam_jit_get_map_elements (beam_jit_common.cpp:706-760), OTP-29.1.1.
 pub fn get_map_elements(map: Term, staged: &mut [Term], count: usize) -> MapResult<bool> {
@@ -892,14 +884,7 @@ fn lookup_header(map: Term, key: Term, h: u64) -> Option<Term> {
     if h & 0xc0 == 0 {
         return flatmap_get(map, key);
     }
-    lookup_hash(map, key, internal_hash(key))
-}
-
-#[inline(always)]
-fn lookup_header_with_hash(map: Term, key: Term, h: u64, hash: u64) -> Option<Term> {
-    if h & 0xc0 == 0 {
-        return flatmap_get(map, key);
-    }
+    let hash = internal_hash(key);
     lookup_hash(map, key, hash)
 }
 

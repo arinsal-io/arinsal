@@ -3447,8 +3447,14 @@ fn binary_to_term(
     }
 
     let mut decoder = arinsal_bifs::DecodeWalk::new(args)?;
-    let identity = crate::node_tables::this_node_identity();
-    decoder.set_local_node(identity.name, identity.creation);
+    let (node_name, creation) = {
+        let tables = crate::node_tables::lock();
+        (tables.local_name.clone(), tables.local_creation)
+    };
+    let node = global_atoms()
+        .intern(&node_name)
+        .map_err(|_| BifError::SystemLimit)?;
+    decoder.set_local_node(node, creation);
     match decode_step(process, &mut decoder, chunk_bytes) {
         Ok((None, consumed)) => {
             let decoder = decoder.into_owned()?;
@@ -3673,8 +3679,14 @@ fn external_size(
 ) -> Result<HandlerResult, BifError> {
     // Port of erts/emulator/beam/external.c (erts_encode_ext_size), OTP-29.1.1.
     let mut encoder = arinsal_bifs::EncodeWalk::new_external_size(args)?;
-    let identity = crate::node_tables::this_node_identity();
-    encoder.set_local_node(identity.name, identity.creation);
+    let (node_name, creation) = {
+        let tables = crate::node_tables::lock();
+        (tables.local_name.clone(), tables.local_creation)
+    };
+    let node = global_atoms()
+        .intern(&node_name)
+        .map_err(|_| BifError::SystemLimit)?;
+    encoder.set_local_node(node, creation);
     encoder.step_size(usize::MAX)?;
     let size = encoder.encoded_size().ok_or(BifError::SystemLimit)?;
     let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
@@ -3698,8 +3710,14 @@ fn term_to_iovec(
 
 fn new_term_encoder(args: &[Term]) -> Result<arinsal_bifs::EncodeWalk, BifError> {
     let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
-    let identity = crate::node_tables::this_node_identity();
-    encoder.set_local_node(identity.name, identity.creation);
+    let (node_name, creation) = {
+        let tables = crate::node_tables::lock();
+        (tables.local_name.clone(), tables.local_creation)
+    };
+    let node = global_atoms()
+        .intern(&node_name)
+        .map_err(|_| BifError::SystemLimit)?;
+    encoder.set_local_node(node, creation);
     Ok(encoder)
 }
 
@@ -3755,53 +3773,6 @@ fn term_encode(
             return Ok(HandlerResult::Done {
                 value,
                 reductions: 1,
-            });
-        }
-        if sized && !encoder.uses_compression() {
-            // Port of erts/emulator/beam/external.c (erts_term_to_binary_int, TTBSize ->
-            // TTBEncode), OTP-29.1.1: export a magic context only if encoding traps.
-            let size = encoder.encoded_size().ok_or(BifError::SystemLimit)?;
-            let output = arinsal_bifs::allocate_iolist_binary(
-                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-                size,
-            )?;
-            let encode_budget = chunk_work.saturating_sub(size_work);
-            let encoded = arinsal_bifs::with_iolist_binary_output(output, |destination| {
-                encoder.step_into(destination, encode_budget)
-            });
-            let (done, encode_work) = match encoded {
-                Ok(progress) => progress,
-                Err(error) => {
-                    arinsal_bifs::finish_iolist_binary_output(output);
-                    process.set_gc_enabled(restore_gc);
-                    return Err(error);
-                }
-            };
-            let work = size_work.saturating_add(encode_work);
-            if done {
-                arinsal_bifs::finish_iolist_binary_output(output);
-                let reductions = charge(&encoder, work);
-                process.set_gc_enabled(restore_gc);
-                return Ok(HandlerResult::Done {
-                    value: output,
-                    reductions,
-                });
-            }
-            let context = magic_binary_state(
-                Mutex::new(TermEncodeState {
-                    encoder,
-                    pending_work: work,
-                    output: Some(output),
-                    source: None,
-                    compressing: false,
-                    iovec: false,
-                }),
-                ERTS_TERM_TO_BINARY_CONTEXT_SIZE,
-            );
-            return Ok(HandlerResult::Yield {
-                continuation: TERM_TO_BINARY_CONTINUATION,
-                state: context,
-                reductions: (work / TERM_TO_BINARY_LOOP_FACTOR) as u32,
             });
         }
         let context = magic_binary_state(

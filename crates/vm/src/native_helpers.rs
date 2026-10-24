@@ -4651,23 +4651,19 @@ fn map_result(
 }
 
 /// Generic fallback lookup for non-flatmap keys.
-// Port of erts/emulator/beam/beam_common.c:1775-1800 (get_map_element), OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_map_get(
     header: *mut ProcessHeader,
     map: u64,
     key: u64,
-    hash: u64,
+    _hash: u64,
 ) -> u64 {
     let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let map = crate::native_hooks::from_raw(map);
-    let key = crate::native_hooks::from_raw(key);
-    let result = if hash == 0 {
-        arinsal_maps::get(map, key)
-    } else {
-        arinsal_maps::get_with_hash(map, key, hash)
-    };
+    let result = arinsal_maps::get(
+        crate::native_hooks::from_raw(map),
+        crate::native_hooks::from_raw(key),
+    );
     process.sync_native_header();
     match result {
         Ok(Some(value)) => crate::native_hooks::raw(value),
