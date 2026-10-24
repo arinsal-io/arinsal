@@ -93,4 +93,12 @@ fn from_list_colliding_paths_duplicates_lookup_and_put_vs_erl() {
     assert_eq!(actual, expected);
     assert_eq!(get(map, small(update_key)), Ok(Some(small(update_key * 3))));
     assert_eq!(get(updated, small(update_key)), Ok(Some(small(123_456))));
+    assert_eq!(
+        arinsal_maps::get_with_hash(map, small(update_key), internal_hash(small(update_key))),
+        Ok(Some(small(update_key * 3)))
+    );
+    assert_eq!(
+        arinsal_maps::get_with_hash(updated, small(update_key), internal_hash(small(update_key))),
+        Ok(Some(small(123_456)))
+    );
 }
