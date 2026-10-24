@@ -1854,7 +1854,7 @@ fn local_identity(identity: Identity, local_node: Option<(arinsal_term::Atom, u3
             creation: 0,
             index,
             serial,
-        } if global_atoms().text(node) == Some("nonode@nohost") => Identity::Pid {
+        } if node == atoms::NONAME => Identity::Pid {
             node: local_node,
             creation: local_creation,
             index,
@@ -1864,7 +1864,7 @@ fn local_identity(identity: Identity, local_node: Option<(arinsal_term::Atom, u3
             node,
             creation: 0,
             id,
-        } if global_atoms().text(node) == Some("nonode@nohost") => Identity::Port {
+        } if node == atoms::NONAME => Identity::Port {
             node: local_node,
             creation: local_creation,
             id,
@@ -1873,7 +1873,7 @@ fn local_identity(identity: Identity, local_node: Option<(arinsal_term::Atom, u3
             node,
             creation: 0,
             ids,
-        } if global_atoms().text(node) == Some("nonode@nohost") => Identity::Ref {
+        } if node == atoms::NONAME => Identity::Ref {
             node: local_node,
             creation: local_creation,
             ids,
@@ -1939,7 +1939,9 @@ fn term_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let size = encoder.encoded_size().ok_or(BifError::SystemLimit)?;
     if encoder.finishes_simple() {
         let binary = encoder.encode_simple_binary(&mut ctx.heap)?;
-        ctx.charge_reductions(size);
+        // Port of erts/emulator/beam/external.c (TTBSize simple path), OTP-29.1.1:
+        // erts_term_to_binary_simple charges exactly one reduction, independent of size.
+        ctx.charge_reductions(1);
         return Ok(binary);
     }
     let mut heap = Heap(&mut ctx.heap);
