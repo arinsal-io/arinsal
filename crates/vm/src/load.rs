@@ -863,7 +863,6 @@ impl Vm {
         !INTERPRETER_EVAL.load(std::sync::atomic::Ordering::Relaxed)
             && meta.has_beam_bytes
             && beamasm_integration::enabled()
-            && meta.on_load.is_none()
             && matches!(self.coverage_mode(), arinsal_loader::CoverageMode::None)
             && !crate::trace_bp::line_breakpoints_instrumented()
             && beam.module != "erts_internal"

@@ -1833,6 +1833,24 @@ impl Vm {
                 .is_some();
             crate::beamasm_integration::count_interp_slice(at_native_entry);
         }
+        // A module whose functions all run natively has no interpreter form: a process left at
+        // the entry of one of its functions (the return of an `-on_load` prelude, a call from
+        // interpreted code) runs that function's native code, as erts jumps to its address.
+        if matches!(self.code.modules[module_id].code.get(p.ip), Some(Instr::CodeEnd))
+            && crate::beamasm_integration::enabled()
+        {
+            let module = &self.code.modules[module_id];
+            if let Some(native) = self.beamasm_targets.function_for_target(
+                module_id,
+                module,
+                crate::load::native_code_range(&self.code.code_meta, module_id),
+                p.ip,
+            ) {
+                p.native_pc = Some(native.start);
+                p.cold_mut().native_transfer = true;
+                return Ok(RunState::Yield);
+            }
+        }
         let mut base = self.code.modules[module_id].code.as_ptr();
         let mut ip = {
             // SAFETY: Export indices are resolved to this code allocation by the loader.
