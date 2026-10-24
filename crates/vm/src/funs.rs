@@ -574,6 +574,35 @@ impl Vm {
                 trap.args.len()
             )));
         }
+        let module_atom = global_atoms().get(module);
+        let function_atom = global_atoms().get(function);
+        if !crate::trace_bp::any_pattern()
+            && !crate::trace::saves_calls(p)
+            && let (Some(module_atom), Some(function_atom)) = (module_atom, function_atom)
+            && !self.unloaded_on_load(p, module)
+            && let Some(&module_id) = self.code.loaded.get(&module_atom)
+            && let Some(target) = self.code.modules[module_id]
+                .export_slot_atom(function_atom, arity as u8)
+                .map(arinsal_loader::ExportSlot::target)
+        {
+            // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*: set `c_p->i`
+            // to the already-resolved export and leave its arguments in X), OTP-29.1.1.
+            p.gc_live = arity;
+            p.x.ensure_x(arity);
+            p.x[..arity].copy_from_slice(&trap.args);
+            if !tail {
+                calls::push_continuation(p, p.module, p.ip + 1, arity)?;
+            }
+            p.module = module_id;
+            p.ip = target;
+            p.tick();
+            return Ok(ImportOutcome::Jump(
+                self.code.modules[module_id]
+                    .code
+                    .as_ptr()
+                    .wrapping_add(target),
+            ));
+        }
         let module_atom = global_atoms()
             .intern(module)
             .map_err(|error| VmError::Unsupported(format!("trap module atom: {error:?}")))?;
@@ -828,6 +857,9 @@ impl Vm {
                     unreachable!("failed trapping BIFs become VM exceptions")
                 }
                 crate::bif_traps::HandlerResult::Yield { .. } => Ok(ImportOutcome::Yield),
+                crate::bif_traps::HandlerResult::Export(_) => {
+                    unreachable!("execute_named converts export traps to VM transfers")
+                }
             };
         }
         // `!` is an export alias for the process-aware `send/2` BIF.

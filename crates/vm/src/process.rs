@@ -3012,6 +3012,11 @@ impl Executor {
                                                 "failed trapping BIF without exception".into(),
                                             ));
                                         }
+                                        Some(Ok(crate::bif_traps::ResumeResult::Handler(
+                                            crate::bif_traps::HandlerResult::Export(_),
+                                        ))) => unreachable!(
+                                            "resumed BIF handlers cannot install first-call exports"
+                                        ),
                                         // The continuation export raised. It is the same BIF
                                         // failure erts reports with ERTS_BIF_ERROR_TRAPPED:
                                         // catch sees it, and the process does not exit.
@@ -3232,6 +3237,9 @@ impl Executor {
                                                 }) => Some(Err(VmError::Unsupported(
                                                     "failed trapping BIF without exception".into(),
                                                 ))),
+                                                Ok(crate::bif_traps::HandlerResult::Export(_)) => {
+                                                    unreachable!("resumed BIF handler export")
+                                                }
                                                 Err(error) => Some(Err(error)),
                                             };
                                             if let (Some((module, function, args)), Some(result)) =

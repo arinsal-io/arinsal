@@ -21,6 +21,8 @@ pub(crate) enum HandlerResult {
         state: Arc<MagicRef>,
         reductions: u32,
     },
+    /// Transfer directly to the BIF's export continuation without scheduling out.
+    Export(crate::ExportTrap),
 }
 
 impl HandlerResult {
@@ -30,6 +32,7 @@ impl HandlerResult {
             Self::Done { reductions, .. }
             | Self::Failed { reductions, .. }
             | Self::Yield { reductions, .. } => *reductions,
+            Self::Export(_) => 0,
         }
     }
 }
@@ -1360,26 +1363,26 @@ fn re_run_trap(
             // Port of erts/emulator/beam/erl_bif_re.c:1530-1533 and :1590-1597 (urun_trap_exportp),
             // OTP-29.1.1.
             process.x.ensure_x(3);
-            process.x[..3].copy_from_slice(&args[..3]);
+            process.x[..3].copy_from_slice(&[
+                args[0],
+                args[1],
+                args.get(2).copied().unwrap_or(Term::NIL),
+            ]);
             process.gc_live = 3;
-            HandlerResult::Yield {
+            HandlerResult::Export(crate::ExportTrap {
                 continuation: RE_URUN_CONTINUATION,
-                state: argument_trap_state(Mutex::new(())),
-                reductions: 0,
-            }
+                args: vec![args[0], args[1], args.get(2).copied().unwrap_or(Term::NIL)],
+            })
         }
         arinsal_re::RunDispatch::Global(arinsal_re::GlobalRun::Trap { pattern, options }) => {
             // Port of erts/emulator/beam/erl_bif_re.c:1557-1603 (grun_trap_exportp), OTP-29.1.1.
             process.x.ensure_x(3);
-            process.x[0] = args[0];
-            process.x[1] = pattern;
-            process.x[2] = options;
+            process.x[..3].copy_from_slice(&[args[0], pattern, options]);
             process.gc_live = 3;
-            HandlerResult::Yield {
+            HandlerResult::Export(crate::ExportTrap {
                 continuation: RE_GRUN_CONTINUATION,
-                state: argument_trap_state(Mutex::new(())),
-                reductions: 0,
-            }
+                args: vec![args[0], pattern, options],
+            })
         }
     })
 }
@@ -2303,6 +2306,13 @@ pub(crate) fn execute_named(
                 reductions,
             })
         }
+        Ok(HandlerResult::Export(trap)) => {
+            process.cold_mut().bif_trap = None;
+            clear_export_trap(process);
+            process.set_gc_enabled(gc_was_enabled);
+            charge(process, ctx, 0);
+            return Some(Err(VmError::TrapExport(trap)));
+        }
     })
 }
 
@@ -2612,6 +2622,30 @@ pub(crate) fn finish_light(
                 args: saved,
             });
             charge_light(process, reductions);
+            return LightTrap::Trapped;
+        }
+        Ok(HandlerResult::Export(trap)) => {
+            let state = argument_trap_state(Mutex::new(()));
+            let Ok(state_term) = trap_state_term(process, &state) else {
+                return LightTrap::Returned(Err(BifError::SystemLimit));
+            };
+            let mut saved = [Term::NIL; 3];
+            let kept = trap.args.len().min(saved.len());
+            saved[..kept].copy_from_slice(&trap.args[..kept]);
+            process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
+                caller_module: process.module,
+                caller_ip: process.ip,
+                schedule_out: false,
+                import,
+                continuation: trap.continuation,
+                state,
+                state_term,
+                gc_was_enabled,
+                arity: kept,
+                callee,
+                args: saved,
+            });
+            charge_light(process, 0);
             return LightTrap::Trapped;
         }
     };
