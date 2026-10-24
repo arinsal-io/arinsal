@@ -1,6 +1,11 @@
 use std::{collections::BTreeSet, env, fs, path::PathBuf};
 
+#[path = "src/rule_syntax.rs"]
+mod rule_syntax;
+use rule_syntax::{Restriction, Top};
+
 fn main() {
+    generate_matchers();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let ops = fs::read_to_string(root.join("tab/ops.tab")).expect("ops.tab");
     let _predicates = fs::read_to_string(root.join("tab/predicates.tab")).expect("predicates.tab");
@@ -143,4 +148,96 @@ fn camel(name: &str) -> String {
             })
             .collect::<String>()
     )
+}
+
+/// The match program of every rule of `ops.tab` as straight-line Rust, one function per rule,
+/// the way `beam_makeops` prints the cases of `erts_transform_engine`: no program is
+/// interpreted at run time. `MATCHERS[i]` belongs to the `i`-th rule of `parse_rules`.
+fn generate_matchers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("tab/ops.tab")).expect("ops.tab");
+    let source: &'static str = Box::leak(source.into_boxed_str());
+    let rules = rule_syntax::parse_rules(source);
+    let mut out = String::from(
+        "// Generated from OTP-29.1.1 ops.tab by build.rs: the match programs of the transform rules.\n",
+    );
+    let mut table = String::new();
+    for (index, rule) in rules.iter().enumerate() {
+        let mut restrictions = String::new();
+        let mut body = String::new();
+        for top in &rule.program {
+            match top {
+                Top::NextInstr { op, fixed, rest } => body.push_str(&format!(
+                    "    if !f.next_instr({op:?}, {fixed}, {rest}) {{\n        return false;\n    }}\n"
+                )),
+                Top::IsType { mask, exact_x0 } => {
+                    let mask = match mask {
+                        Some(mask) => format!("Some({mask:#x})"),
+                        None => "None".to_owned(),
+                    };
+                    body.push_str(&format!(
+                        "    if !f.is_type({mask}, {exact_x0}) {{\n        return false;\n    }}\n"
+                    ));
+                }
+                Top::IsEq(n) => body.push_str(&format!(
+                    "    if !f.is_eq({n}) {{\n        return false;\n    }}\n"
+                )),
+                Top::IsAtom(atom) => body.push_str(&format!(
+                    "    if !f.is_atom(beam, {atom:?}) {{\n        return false;\n    }}\n"
+                )),
+                Top::Restriction(restriction) => {
+                    let name = format!("R{index}_{}", restrictions.matches("static").count());
+                    let value = match restriction {
+                        Restriction::IsBif => "Restriction::IsBif".to_owned(),
+                        Restriction::IsNotBif => "Restriction::IsNotBif".to_owned(),
+                        Restriction::Mfa {
+                            module,
+                            function,
+                            arity,
+                        } => format!(
+                            "Restriction::Mfa {{ module: {module:?}.to_owned(), function: {function:?}.to_owned(), arity: {arity} }}"
+                        ),
+                        Restriction::Bif {
+                            module,
+                            function,
+                            arity,
+                        } => format!(
+                            "Restriction::Bif {{ module: {module:?}.to_owned(), function: {function:?}.to_owned(), arity: {arity} }}"
+                        ),
+                    };
+                    restrictions.push_str(&format!(
+                        "    static {name}: std::sync::LazyLock<Restriction> = std::sync::LazyLock::new(|| {value});\n"
+                    ));
+                    body.push_str(&format!(
+                        "    if !f.restriction(beam, &{name}) {{\n        return false;\n    }}\n"
+                    ));
+                }
+                Top::SetVar(slot) => body.push_str(&format!(
+                    "    if !f.set_var(slots, {slot}) {{\n        return false;\n    }}\n"
+                )),
+                Top::NextArg => body.push_str("    f.next_arg();\n"),
+                Top::RestArgs { slot, fixed } => {
+                    let slot = match slot {
+                        Some(slot) => format!("Some({slot})"),
+                        None => "None".to_owned(),
+                    };
+                    body.push_str(&format!("    f.rest_args(slots, {slot}, {fixed});\n"));
+                }
+            }
+        }
+        out.push_str(&format!(
+            "#[allow(unused_variables, unused_mut)]\nfn rule_{index}<'a>(\n    code: &'a [Node],\n    at: usize,\n    beam: Option<&BeamFile>,\n    slots: &mut SlotVec<'a>,\n) -> bool {{\n{restrictions}    let mut f = Frame::new(code, at);\n{body}    true\n}}\n\n"
+        ));
+        table.push_str(&format!("    rule_{index},\n"));
+    }
+    out.push_str(&format!(
+        "/// The match function of each rule, in the order of `ops.tab`.\nstatic MATCHERS: [MatchFn; {}] = [\n{table}];\n",
+        rules.len()
+    ));
+    fs::write(
+        PathBuf::from(env::var("OUT_DIR").unwrap()).join("matchers.rs"),
+        out,
+    )
+    .unwrap();
+    println!("cargo:rerun-if-changed=src/rule_syntax.rs");
 }
