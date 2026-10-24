@@ -4428,6 +4428,8 @@ pub struct RunCtx<'a, M: SignalMessage> {
     active: &'a AtomicBool,
     /// [`proc_flags`] of the running process. Exit tests this before any global table.
     exit_flags: &'a AtomicU32,
+    /// The running process state word, accessed directly at exit like erts' `Process *p`.
+    run_state: RunStateWord<'a>,
     sys_task_run: bool,
     /// A dirty signal handler acts for a process whose dirty job is executing.
     dirty_running: bool,
@@ -4542,6 +4544,7 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// Port of erts/emulator/beam/erl_process.c:14438-14456
     /// (`erts_ptab_delete_element` at `ERTS_CONTINUE_EXIT_FREE`), OTP-29.1.1.
     pub fn begin_exit(&mut self) {
+        self.run_state.store(EXITED, Ordering::SeqCst);
         self.inner.mark_exited(self.pid);
     }
     /// Cancel pending BIF timers aimed at a terminating process.
@@ -5141,6 +5144,7 @@ impl<T: Task> Runner<'_, T> {
             sys_priority: &process.sys_priority,
             active: &process.active,
             exit_flags: &process.exit_flags,
+            run_state: process.run_state(),
             sys_task_run: false,
             dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
             dirty_queued: process.dirty.load(Ordering::SeqCst) != 0
@@ -5533,10 +5537,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         // (`erts_ptab_delete_element` while this process is still current), OTP-29.1.1.
         // One delete: the free-id ring hands the slot to the next spawn, and a second
         // delete of the same pix would destroy that process.
-        if let Some(process) = self.inner.table.lookup(pid) {
-            process.run_state().store(EXITED, Ordering::SeqCst);
-            self.inner.table.remove(pid);
-        }
+        self.inner.table.remove(pid);
     }
     fn start_timer(
         &mut self,
@@ -6964,6 +6965,7 @@ mod msgq_stage_microbench {
         let sys_priority = AtomicU8::new(NO_SYS_PRIORITY);
         let active = AtomicBool::new(true);
         let exit_flags = AtomicU32::new(0);
+        let run_state = AtomicU32::new(0);
         let mut context = RunCtx {
             inner: &mut receive_runner,
             pid: process,
@@ -6982,6 +6984,7 @@ mod msgq_stage_microbench {
             sys_priority: &sys_priority,
             active: &active,
             exit_flags: &exit_flags,
+            run_state: RunStateWord(&run_state),
             sys_task_run: false,
             dirty_running: false,
             dirty_queued: false,
@@ -7504,6 +7507,7 @@ fn run_slice<'a, T: Task>(
                 sys_priority: &process.sys_priority,
                 active: &process.active,
                 exit_flags: &process.exit_flags,
+                run_state: process.run_state(),
                 sys_task_run,
                 dirty_running: false,
                 dirty_queued: false,
