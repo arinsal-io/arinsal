@@ -124,6 +124,32 @@ pub(crate) static EMPTY_TUPLE: u64 = 0;
 pub fn global_empty_tuple() -> Term {
     Term::from_ptr(std::ptr::from_ref(&EMPTY_TUPLE).cast_mut(), 2)
 }
+
+/// Return the process independent distribution flag record, backed by static literal words.
+///
+/// Port of erts/emulator/beam/dist.c (`init_dist`), OTP-29.1.1.
+pub fn global_dflags_record(tag: Atom, flags: [Term; 5]) -> Term {
+    static RECORD: std::sync::OnceLock<literal::LiteralChunk> = std::sync::OnceLock::new();
+    let chunk = RECORD.get_or_init(|| {
+        let mut chunk = literal::allocate_chunk(7).expect("global dflags literal area");
+        let words = [
+            (6 << 6) | ARITY,
+            Term::atom(tag).bits(),
+            flags[0].bits(),
+            flags[1].bits(),
+            flags[2].bits(),
+            flags[3].bits(),
+            flags[4].bits(),
+        ];
+        assert!(
+            chunk.write_words(&words),
+            "global dflags literal allocation"
+        );
+        chunk
+    });
+    Term::from_ptr(chunk.as_ptr(), 2)
+}
+
 pub(crate) const POS_BIG: u64 = 0x08;
 pub(crate) const NEG_BIG: u64 = 0x0c;
 pub(crate) const REF: u64 = 0x10;

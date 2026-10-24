@@ -274,6 +274,7 @@ dependencies = [
  "arinsal-etf",
  "arinsal-term",
  "libc",
+ "nix",
  "num-traits",
  "rustix",
  "similar-asserts",
