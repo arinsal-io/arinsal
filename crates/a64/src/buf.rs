@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::enc::{Cond, Emitter, EncodeError, Gpr, Shift};
 
@@ -10,6 +11,28 @@ pub const STUB_CHECK_INTERVAL: usize = 4 << 10;
 const TB_RANGE: i64 = 1 << 15;
 const COND_RANGE: i64 = 1 << 20;
 const BRANCH_RANGE: i64 = 1 << 27;
+
+/// Hasher for label ids: a label is a dense `u32`, and SipHash costs more than the lookups it
+/// guards (every branch and every bind looks one up).
+#[derive(Default, Clone, Copy)]
+pub struct LabelHasher(u64);
+
+impl Hasher for LabelHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    fn write_u32(&mut self, value: u32) {
+        self.0 = u64::from(value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+/// A map keyed by label.
+pub type LabelMap<V> = HashMap<Label, V, BuildHasherDefault<LabelHasher>>;
 
 /// Opaque label allocated by [`CodeBuffer`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -91,12 +114,12 @@ struct Literal {
 pub struct CodeBuffer {
     emitter: Emitter,
     next_label: u32,
-    labels: HashMap<Label, usize>,
+    labels: LabelMap<usize>,
     /// Unresolved branches in emission order; a resolved one stays until the next flush as a
     /// tombstone so the indices of `waiting` hold.
     fixups: Vec<Fixup>,
     /// Indices into `fixups` of the unresolved branches to each label, in emission order.
-    waiting: HashMap<Label, Vec<usize>>,
+    waiting: LabelMap<Vec<usize>>,
     literals: Vec<Literal>,
     literal_sites: HashMap<u64, Vec<usize>>,
     unreachable: bool,
@@ -128,7 +151,7 @@ impl CodeBuffer {
         self.labels.get(&label).copied()
     }
     /// Returns all currently bound labels and their byte offsets.
-    pub fn label_offsets(&self) -> &HashMap<Label, usize> {
+    pub fn label_offsets(&self) -> &LabelMap<usize> {
         &self.labels
     }
 
@@ -445,7 +468,7 @@ impl CodeBuffer {
     }
 
     /// Finalizes the buffer and returns both words and the label offset map.
-    pub fn finish_with_labels(mut self) -> Result<(Vec<u32>, HashMap<Label, usize>), BufferError> {
+    pub fn finish_with_labels(mut self) -> Result<(Vec<u32>, LabelMap<usize>), BufferError> {
         self.flush_pending_stubs(usize::MAX / 2)?;
         if let Some(fixup) = self.fixups.iter().find(|fixup| !fixup.resolved) {
             return Err(BufferError::UnboundLabel(fixup.label));
