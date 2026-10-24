@@ -191,7 +191,9 @@ pub struct BeamModuleAssembler {
     /// Shared garbage-collection fragments of heap and stack checks, keyed by hook address.
     gc_fragments: Vec<(usize, Label)>,
     /// Module-local dispatch stubs for process-wide executable fragments.
-    dispatch_fragments: HashMap<usize, Label>,
+    /// Shared fragment call targets in first-use order: the stubs are emitted in that order, so
+    /// the layout does not depend on hash order.
+    dispatch_fragments: Vec<(usize, Label)>,
     /// Address of the process-wide `arith_compare_shared` fragment (0: not installed).
     pub(crate) arith_compare_shared: usize,
     /// Address of the process-wide `bif_element_guard_shared` fragment (0: not installed).
@@ -296,7 +298,7 @@ impl BeamModuleAssembler {
             func_clause_stub: None,
             call_fun_error_stub: None,
             arith_fragments: Vec::new(),
-            dispatch_fragments: HashMap::new(),
+            dispatch_fragments: Vec::new(),
             gc_fragments: Vec::new(),
             yield_stubs: Vec::new(),
             yield_fragments: None,
@@ -555,11 +557,15 @@ impl BeamModuleAssembler {
         cond: Cond,
         target: usize,
     ) -> Result<(), ModuleError> {
-        let label = match self.dispatch_fragments.get(&target) {
-            Some(&label) => label,
+        let label = match self
+            .dispatch_fragments
+            .iter()
+            .find(|(known, _)| *known == target)
+        {
+            Some(&(_, label)) => label,
             None => {
                 let label = self.code.new_label();
-                self.dispatch_fragments.insert(target, label);
+                self.dispatch_fragments.push((target, label));
                 label
             }
         };
@@ -1681,11 +1687,15 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1440-1454 and
     // beam_asm_module.cpp:596-603,724-732 (fragment_call / resolve_fragment), OTP-29.1.1.
     pub(super) fn fragment_call(&mut self, target: usize) -> Result<(), ModuleError> {
-        let label = match self.dispatch_fragments.get(&target) {
-            Some(&label) => label,
+        let label = match self
+            .dispatch_fragments
+            .iter()
+            .find(|(known, _)| *known == target)
+        {
+            Some(&(_, label)) => label,
             None => {
                 let label = self.code.new_label();
-                self.dispatch_fragments.insert(target, label);
+                self.dispatch_fragments.push((target, label));
                 label
             }
         };
