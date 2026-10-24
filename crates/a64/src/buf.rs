@@ -77,6 +77,7 @@ struct Fixup {
     label: Label,
     kind: BranchKind,
     veneer: Option<usize>,
+    resolved: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -91,7 +92,11 @@ pub struct CodeBuffer {
     emitter: Emitter,
     next_label: u32,
     labels: HashMap<Label, usize>,
+    /// Unresolved branches in emission order; a resolved one stays until the next flush as a
+    /// tombstone so the indices of `waiting` hold.
     fixups: Vec<Fixup>,
+    /// Indices into `fixups` of the unresolved branches to each label, in emission order.
+    waiting: HashMap<Label, Vec<usize>>,
     literals: Vec<Literal>,
     literal_sites: HashMap<u64, Vec<usize>>,
     unreachable: bool,
@@ -139,15 +144,13 @@ impl CodeBuffer {
         let offset = self.offset();
         self.binds += 1;
         self.labels.insert(label, offset);
-        let mut i = 0;
-        while i < self.fixups.len() {
-            if self.fixups[i].label == label {
-                let fixup = self.fixups.remove(i);
-                let destination = fixup.veneer.unwrap_or(offset);
-                self.patch(fixup.site, fixup.kind, destination)?;
-            } else {
-                i += 1;
-            }
+        // Only the branches waiting for this label: scanning every pending branch per bind is
+        // quadratic in the size of a module.
+        for index in self.waiting.remove(&label).unwrap_or_default() {
+            let fixup = &mut self.fixups[index];
+            fixup.resolved = true;
+            let (site, kind, veneer) = (fixup.site, fixup.kind, fixup.veneer);
+            self.patch(site, kind, veneer.unwrap_or(offset))?;
         }
         Ok(())
     }
@@ -182,11 +185,16 @@ impl CodeBuffer {
                 self.patch(site, kind, target)?;
             }
         } else {
+            self.waiting
+                .entry(label)
+                .or_default()
+                .push(self.fixups.len());
             self.fixups.push(Fixup {
                 site,
                 label,
                 kind,
                 veneer: None,
+                resolved: false,
             });
         }
         Ok(())
@@ -290,6 +298,14 @@ impl CodeBuffer {
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:816-900, OTP-29.1.1
     pub fn flush_pending_stubs(&mut self, range: usize) -> Result<(), BufferError> {
         let now = self.offset();
+        // Drop the resolved branches and renumber the waiting lists.
+        if self.fixups.iter().any(|fixup| fixup.resolved) {
+            self.fixups.retain(|fixup| !fixup.resolved);
+            self.waiting.clear();
+            for (index, fixup) in self.fixups.iter().enumerate() {
+                self.waiting.entry(fixup.label).or_default().push(index);
+            }
+        }
         let due_fixups: Vec<usize> = self
             .fixups
             .iter()
@@ -431,7 +447,7 @@ impl CodeBuffer {
     /// Finalizes the buffer and returns both words and the label offset map.
     pub fn finish_with_labels(mut self) -> Result<(Vec<u32>, HashMap<Label, usize>), BufferError> {
         self.flush_pending_stubs(usize::MAX / 2)?;
-        if let Some(fixup) = self.fixups.first() {
+        if let Some(fixup) = self.fixups.iter().find(|fixup| !fixup.resolved) {
             return Err(BufferError::UnboundLabel(fixup.label));
         }
         Ok((self.emitter.words, self.labels))
