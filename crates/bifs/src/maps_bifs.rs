@@ -297,8 +297,20 @@ impl MapsBuildWalk {
                 // erts/emulator/beam/erl_map.c:279-366, OTP-29.1.1.
                 // Keep its steady-state list walk in one loop; ValidateBody is only needed
                 // when YCF yields after consuming a reduction and before the loop body.
-                loop {
-                    if self.cursor.tagged_word() & 3 == 1 {
+                if self.fill.is_some() {
+                    // Port of `maps_from_keys_2_helper`: count cells without inspecting heads.
+                    while self.cursor.tagged_word() & 3 == 1 {
+                        *reds -= 1;
+                        if *reds <= 0 {
+                            self.phase = BuildPhase::ValidateBody;
+                            return Ok(None);
+                        }
+                        let (_, tail) = Self::cell(self.cursor)?;
+                        self.size += 1;
+                        self.cursor = tail;
+                    }
+                } else {
+                    while self.cursor.tagged_word() & 3 == 1 {
                         *reds -= 1;
                         if *reds <= 0 {
                             self.phase = BuildPhase::ValidateBody;
@@ -308,37 +320,39 @@ impl MapsBuildWalk {
                         self.element(head)?;
                         self.size += 1;
                         self.cursor = tail;
-                        continue;
                     }
-                    if self.cursor != Term::NIL {
-                        return Err(BifError::BADARG);
-                    }
-                    if self.size <= MAP_SMALL_MAP_LIMIT {
-                        // No yielding while constructing a flatmap: the list is short. The
-                        // list was validated above, so every cell is a well-formed element.
-                        let fill = self.fill;
-                        let mut cursor = self.list;
-                        let pairs = std::iter::from_fn(|| {
-                            let (head, tail) = Self::cell(cursor).ok()?;
-                            cursor = tail;
-                            Self::element_of(fill, head, false).ok()
-                        });
-                        let result =
-                            arinsal_maps::from_small_pairs(self.size, pairs, &mut ctx.heap);
-                        return mapped(ctx, result).map(Some);
-                    }
-                    self.cursor = self.list;
-                    let build = arinsal_maps::HashmapFromPairs::new(self.size, &mut ctx.heap);
-                    self.build = Some(mapped(ctx, build)?);
-                    self.phase = BuildPhase::Leaves;
-                    break;
                 }
+                if self.cursor != Term::NIL {
+                    return Err(BifError::BADARG);
+                }
+                if self.size <= MAP_SMALL_MAP_LIMIT {
+                    // No yielding while constructing a flatmap: the list is short. The
+                    // list was validated above, so every cell is a well-formed element.
+                    let fill = self.fill;
+                    let mut cursor = self.list;
+                    let pairs = std::iter::from_fn(|| {
+                        let (head, tail) = Self::cell(cursor).ok()?;
+                        cursor = tail;
+                        Self::element_of(fill, head, false).ok()
+                    });
+                    let result = arinsal_maps::from_small_pairs(self.size, pairs, &mut ctx.heap);
+                    return mapped(ctx, result).map(Some);
+                }
+                self.cursor = self.list;
+                let build = arinsal_maps::HashmapFromPairs::new(self.size, &mut ctx.heap);
+                self.build = Some(mapped(ctx, build)?);
+                self.phase = BuildPhase::Leaves;
             }
             match self.phase {
                 BuildPhase::Validate => unreachable!("validation loop handles this phase"),
                 BuildPhase::ValidateBody => {
-                    let (head, tail) = Self::cell(self.cursor)?;
-                    self.element(head)?;
+                    let tail = if self.fill.is_some() {
+                        Self::cell(self.cursor)?.1
+                    } else {
+                        let (head, tail) = Self::cell(self.cursor)?;
+                        self.element(head)?;
+                        tail
+                    };
                     self.size += 1;
                     self.cursor = tail;
                     self.phase = BuildPhase::Validate;
