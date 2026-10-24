@@ -3447,6 +3447,14 @@ fn binary_to_term(
     }
 
     let mut decoder = arinsal_bifs::DecodeWalk::new(args)?;
+    let (node_name, creation) = {
+        let tables = crate::node_tables::lock();
+        (tables.local_name.clone(), tables.local_creation)
+    };
+    let node = global_atoms()
+        .intern(&node_name)
+        .map_err(|_| BifError::SystemLimit)?;
+    decoder.set_local_node(node, creation);
     match decode_step(process, &mut decoder, chunk_bytes) {
         Ok((None, consumed)) => {
             let decoder = decoder.into_owned()?;

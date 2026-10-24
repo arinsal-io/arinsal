@@ -2411,6 +2411,7 @@ fn parse_step<H: HeapAlloc>(
     r: &mut Reader,
     stack: &mut SmallVec<[Frame; 4]>,
     safe: bool,
+    local_node: Option<(arinsal_term::Atom, u32)>,
     mut ctx: Option<&mut Ctx<'_, H>>,
     budget: usize,
     input_complete: bool,
@@ -2654,10 +2655,15 @@ fn parse_step<H: HeapAlloc>(
                     (0, 0, creation, count)
                 };
                 let (id, serial, creation, ids_len) = identity;
+                // Port of erts/emulator/beam/external.c (dec_is_this_node, dec_pid, dec_term),
+                // OTP-29.1.1: local identities use the current node entry and become internal terms.
+                let is_this_node = local_node.is_some_and(|(local_name, local_creation)| {
+                    node == local_name && creation == local_creation
+                });
                 let t = if ctx.is_none() {
                     Term::NIL
                 } else if tag == 103 || tag == 88 {
-                    if node == arinsal_term::atoms::NONAME && creation == 0 {
+                    if (node == arinsal_term::atoms::NONAME && creation == 0) || is_this_node {
                         Term::pid(id as u32, serial).ok_or(BifError::BADARG)?
                     } else {
                         built(&mut ctx, |b| {
@@ -2665,12 +2671,12 @@ fn parse_step<H: HeapAlloc>(
                         })?
                     }
                 } else if matches!(tag, 102 | 89 | 120) {
-                    if node == arinsal_term::atoms::NONAME && creation == 0 {
+                    if (node == arinsal_term::atoms::NONAME && creation == 0) || is_this_node {
                         Term::port(id).ok_or(BifError::BADARG)?
                     } else {
                         built(&mut ctx, |b| b.external_port(Node::new(node, creation), id))?
                     }
-                } else if node == arinsal_term::atoms::NONAME && creation == 0 {
+                } else if (node == arinsal_term::atoms::NONAME && creation == 0) || is_this_node {
                     // Port of erts/emulator/beam/external.c (dec_term, NEWER_REFERENCE_EXT),
                     // OTP-29.1.1: numbers of a saved magic reference give that reference.
                     let mut local = [0; 3];
@@ -2794,7 +2800,7 @@ fn parse_step<H: HeapAlloc>(
 fn parse(bytes: &[u8], safe: bool, ctx: Option<&mut Ctx<'_>>) -> Result<(Term, usize), BifError> {
     let mut reader = Reader { bytes, at: 0 };
     let mut stack = SmallVec::new();
-    match parse_step(&mut reader, &mut stack, safe, ctx, usize::MAX, true)? {
+    match parse_step(&mut reader, &mut stack, safe, None, ctx, usize::MAX, true)? {
         Some(value) => Ok(value),
         None => Err(BifError::BADARG),
     }
@@ -2808,6 +2814,7 @@ pub struct DecodeWalk<'a> {
     decode_at: usize,
     stack: SmallVec<[Frame; 4]>,
     safe: bool,
+    local_node: Option<(arinsal_term::Atom, u32)>,
     used: bool,
     compressed: bool,
     used_prefix: usize,
@@ -2870,6 +2877,7 @@ impl<'a> DecodeWalk<'a> {
             decode_at: 0,
             stack: SmallVec::new(),
             safe: opts.safe,
+            local_node: None,
             used: opts.used,
             compressed,
             used_prefix,
@@ -2887,6 +2895,11 @@ impl<'a> DecodeWalk<'a> {
         })
     }
 
+    /// Configure this node's identity for external pid, port, and reference terms.
+    pub fn set_local_node(&mut self, node: arinsal_term::Atom, creation: u32) {
+        self.local_node = Some((node, creation));
+    }
+
     /// Retain the refc input only when the decoder is moved into a trap context.
     pub fn into_owned(self) -> Result<DecodeWalk<'static>, BifError> {
         let Self {
@@ -2896,6 +2909,7 @@ impl<'a> DecodeWalk<'a> {
             decode_at,
             stack,
             safe,
+            local_node,
             used,
             compressed,
             used_prefix,
@@ -2931,6 +2945,7 @@ impl<'a> DecodeWalk<'a> {
             decode_at,
             stack,
             safe,
+            local_node,
             used,
             compressed,
             used_prefix,
@@ -3038,6 +3053,7 @@ impl<'a> DecodeWalk<'a> {
                     &mut reader,
                     &mut self.stack,
                     self.safe,
+                    None,
                     None::<&mut Ctx<'_, crate::ProcessHeapHandle<'_>>>,
                     tags,
                     !self.compressed || self.inflate_done,
@@ -3130,6 +3146,7 @@ impl<'a> DecodeWalk<'a> {
                     &mut reader,
                     &mut self.stack,
                     self.safe,
+                    self.local_node,
                     Some(&mut decode_ctx),
                     budget.saturating_sub(decoded).max(1),
                     true,

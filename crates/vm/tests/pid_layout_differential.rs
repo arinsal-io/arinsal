@@ -7,7 +7,7 @@ use std::process::Command;
 
 const SOURCE: &str = r#"
 -module(pid_layout_diff).
--export([main/0, peer_start/0]).
+-export([main/0, peer_start/0, named_roundtrip/0, peer_roundtrip/0]).
 
 main() ->
     erts_debug:set_internal_state(available_internal_state, true),
@@ -50,6 +50,38 @@ peer_start() ->
     }),
     io:format("PL peer ~p~n", [Node]),
     ok = peer:stop(Peer).
+
+named_roundtrip() ->
+    R = make_ref(), P = self(), Port = open_port({spawn, "cat"}, []),
+    ZeroCreation = fun(Bin) ->
+        Size = byte_size(Bin) - 4,
+        <<Prefix:Size/binary, _Creation:32>> = Bin,
+        <<Prefix/binary, 0:32>>
+    end,
+    Result = {binary_to_term(term_to_binary(R)) =:= R,
+              binary_to_term(term_to_binary(P)) =:= P,
+              binary_to_term(term_to_binary(Port)) =:= Port,
+              binary_to_term(ZeroCreation(term_to_binary(R))) =:= R,
+              binary_to_term(ZeroCreation(term_to_binary(P))) =:= P,
+              binary_to_term(ZeroCreation(term_to_binary(Port))) =:= Port},
+    true = port_close(Port),
+    Result.
+
+peer_roundtrip() ->
+    {ok, Peer, Node} = peer:start_link(#{name => refs_roundtrip_peer,
+        host => "127.0.0.1", longnames => true,
+        args => ["-setcookie", "refs_roundtrip_cookie", "-kernel",
+                 "inet_dist_use_interface", "{127,0,0,1}"]}),
+    R = make_ref(), P = self(), Port = open_port({spawn, "cat"}, []),
+    {R2, P2, Port2} = erpc:call(Node, erlang, binary_to_term, [term_to_binary({R, P, Port})]),
+    RemoteRef = erpc:call(Node, erlang, make_ref, []),
+    RemoteLocal = binary_to_term(term_to_binary(RemoteRef)) =:= RemoteRef,
+    RemoteBack = erpc:call(Node, erlang, binary_to_term, [term_to_binary(RemoteRef)]),
+    Result = {R2 =:= R, P2 =:= P, Port2 =:= Port,
+              RemoteLocal, RemoteBack =:= RemoteRef},
+    true = port_close(Port),
+    ok = peer:stop(Peer),
+    Result.
 
 spawn_batch(Tag, N) ->
     Ps = [spawn(fun() -> ok end) || _ <- lists:seq(1, N)],
@@ -178,6 +210,58 @@ fn peer_start_from_named_parent_matches_erl() {
     let expected = run_peer_parent(Path::new("erl"), &dir);
     let actual = run_peer_parent(&arinsal(), &dir);
     assert_eq!(actual, expected);
+}
+
+fn check_named_roundtrip(function: &str, name: &str) {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    assert!(compile(&dir), "erlc is required for this differential test");
+    let node_name = format!("{name}@127.0.0.1");
+    let flags = [
+        "-name",
+        node_name.as_str(),
+        "-setcookie",
+        "refs_roundtrip_cookie",
+        "-kernel",
+        "inet_dist_use_interface",
+        "{127,0,0,1}",
+        "-noshell",
+        "-pa",
+    ];
+    let eval = format!("io:format(\"RF ~w~n\", [pid_layout_diff:{function}()]), halt().");
+    let run = |program: &Path| {
+        let output = Command::new("timeout")
+            .arg("120")
+            .arg(program)
+            .args(flags)
+            .arg(&dir)
+            .arg("-eval")
+            .arg(&eval)
+            .output()
+            .unwrap_or_else(|error| panic!("run {}: {error}", program.display()));
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{} failed: {}\n{stdout}",
+            program.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+            .lines()
+            .find(|line| line.starts_with("RF "))
+            .unwrap_or_else(|| panic!("round-trip output missing:\n{stdout}"))
+            .to_owned()
+    };
+    assert_eq!(run(&arinsal()), run(Path::new("erl")), "{function}");
+}
+
+#[test]
+fn named_node_local_pid_port_ref_etf_round_trips_match_erl() {
+    check_named_roundtrip("named_roundtrip", "named_local_etf_roundtrip");
+}
+
+#[test]
+fn named_node_peer_etf_round_trips_match_erl() {
+    check_named_roundtrip("peer_roundtrip", "named_peer_etf_roundtrip");
 }
 
 #[test]
