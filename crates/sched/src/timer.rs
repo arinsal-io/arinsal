@@ -1,6 +1,5 @@
 //! Scheduler-local timer wheel and long timer index.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -8,6 +7,9 @@ use crate::Pid;
 
 const SOON_BITS: u32 = 14;
 const SOON_SIZE: usize = 1 << SOON_BITS;
+const SCNT_BITS: usize = 9;
+const SCNT_RANGES_PER_WHEEL: usize = SOON_SIZE >> SCNT_BITS;
+const SCNT_SIZE: usize = SCNT_RANGES_PER_WHEEL * 2;
 const SOON_MASK: u64 = (SOON_SIZE - 1) as u64;
 const LATER_SHIFT: u32 = SOON_BITS - 1;
 const LATER_SLOT_SIZE: u64 = 1 << LATER_SHIFT;
@@ -22,14 +24,28 @@ const TIMER_PENDING: u8 = 0;
 const TIMER_CANCELED: u8 = 1;
 const TIMER_FIRED: u8 = 2;
 
+#[derive(Clone, Copy)]
+enum FastForwardPhase {
+    HighLevel,
+    AtOnce,
+    Soon,
+    Later,
+}
+
+#[derive(Clone, Copy)]
+struct FastForward {
+    phase: FastForwardPhase,
+    slot: usize,
+}
+
 struct TreeNode {
     key: u64,
     parent: u32,
     left: u32,
     right: u32,
     red: bool,
-    head: u64,
-    tail: u64,
+    head: u32,
+    tail: u32,
 }
 
 /// Safe arena-backed form of OTP's intrusive red-black tree.
@@ -118,8 +134,8 @@ impl TimerTree {
             left: NIL,
             right: NIL,
             red: true,
-            head: 0,
-            tail: 0,
+            head: NIL,
+            tail: NIL,
         });
         if parent == NIL {
             self.root = index;
@@ -385,26 +401,18 @@ impl TimerTree {
         let first = self.minimum(self.root);
         (self.node(first).key <= limit).then_some(first)
     }
-}
 
-/// A map keyed by timer id: one multiply, no SipHash. Timer ids are counters and reference
-/// keys, not adversarial input.
-type IdMap<V> = HashMap<u64, V, std::hash::BuildHasherDefault<IdHasher>>;
-
-#[derive(Default)]
-struct IdHasher(u64);
-
-impl std::hash::Hasher for IdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 = (self.0 << 8) ^ u64::from(byte);
+    fn find(&self, key: u64) -> Option<u32> {
+        let mut cursor = self.root;
+        while cursor != NIL {
+            let node = self.node(cursor);
+            match key.cmp(&node.key) {
+                std::cmp::Ordering::Less => cursor = node.left,
+                std::cmp::Ordering::Greater => cursor = node.right,
+                std::cmp::Ordering::Equal => return Some(cursor),
+            }
         }
-    }
-    fn write_u64(&mut self, value: u64) {
-        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        None
     }
 }
 
@@ -549,18 +557,40 @@ enum WheelKind {
     Later,
     AtOnce,
     HighLevel,
-    Pending,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Yielded {
+    Slot {
+        kind: WheelKind,
+        slot: usize,
+        last: u32,
+    },
+    HighLevel,
+}
+
+#[derive(Clone, Copy)]
+struct Bucket {
+    head: u32,
+}
+
+impl Bucket {
+    fn empty() -> Self {
+        Self { head: NIL }
+    }
 }
 
 struct Entry<M> {
+    id: u64,
     deadline: u64,
-    order: u64,
     kind: WheelKind,
     slot: usize,
-    position: usize,
+    in_sentinel: bool,
+    prev: u32,
+    next: u32,
     tree_node: u32,
-    tree_prev: u64,
-    tree_next: u64,
+    tree_prev: u32,
+    tree_next: u32,
     state: AtomicU8,
     payload: TimerPayload<M>,
 }
@@ -569,15 +599,19 @@ struct Entry<M> {
 /// that cross worker boundaries; this structure itself has no locking.
 pub(crate) struct Wheel<M> {
     now: u64,
-    next_order: u64,
-    soon: Vec<Vec<u64>>,
-    later: Vec<Vec<u64>>,
-    at_once: Vec<u64>,
-    pending: Vec<u64>,
-    bump_pending: Vec<u64>,
-    bump_cursor: usize,
+    soon: Vec<Bucket>,
+    later: Vec<Bucket>,
+    at_once: Bucket,
+    sentinel: Bucket,
+    /// Port of `ErtsTimerWheel.scnt`: occupied 512-slot ranges across both wheels.
+    scnt: [usize; SCNT_SIZE],
+    fast_forward: Option<FastForward>,
+    yielded: Option<Yielded>,
     high_level: TimerTree,
-    entries: IdMap<Entry<M>>,
+    id_index: TimerTree,
+    entries: Vec<Option<Entry<M>>>,
+    free_entries: Vec<u32>,
+    entry_count: usize,
     /// Link and unlink events for the receivers' bif-timer trees, applied by the scheduler
     /// after each wheel operation (the wheel itself does not see processes).
     link_events: std::collections::VecDeque<LinkEvent<M>>,
@@ -592,15 +626,18 @@ impl<M> Wheel<M> {
     pub(crate) fn new(now: u64) -> Self {
         Self {
             now,
-            next_order: 0,
-            soon: (0..SOON_SIZE).map(|_| Vec::new()).collect(),
-            later: (0..SOON_SIZE).map(|_| Vec::new()).collect(),
-            at_once: Vec::new(),
-            pending: Vec::new(),
-            bump_pending: Vec::new(),
-            bump_cursor: 0,
+            soon: vec![Bucket::empty(); SOON_SIZE],
+            later: vec![Bucket::empty(); SOON_SIZE],
+            at_once: Bucket::empty(),
+            sentinel: Bucket::empty(),
+            scnt: [0; SCNT_SIZE],
+            fast_forward: None,
+            yielded: None,
             high_level: TimerTree::new(),
-            entries: IdMap::default(),
+            id_index: TimerTree::new(),
+            entries: Vec::new(),
+            free_entries: Vec::new(),
+            entry_count: 0,
             link_events: std::collections::VecDeque::new(),
             worker: 0,
             next_timeout: None,
@@ -617,144 +654,274 @@ impl<M> Wheel<M> {
         ((deadline >> LATER_SHIFT) as usize) & (SOON_SIZE - 1)
     }
 
-    // Port of erts/emulator/beam/time.c:1256-1291, OTP-29.1.1.
-    fn insert_slot(&mut self, id: u64, mut entry: Entry<M>, kind: WheelKind, slot: usize) {
-        self.next_timeout = None;
-        let bucket = match kind {
-            WheelKind::Soon => &mut self.soon[slot],
-            WheelKind::Later => &mut self.later[slot],
-            WheelKind::AtOnce => &mut self.at_once,
-            WheelKind::HighLevel | WheelKind::Pending => unreachable!(),
-        };
-        entry.kind = kind;
-        entry.slot = slot;
-        entry.position = bucket.len();
-        bucket.push(id);
-        self.entries.insert(id, entry);
+    fn entry(&self, index: u32) -> &Entry<M> {
+        self.entries[index as usize]
+            .as_ref()
+            .expect("live timer slab entry")
     }
 
-    // Port of erts/emulator/beam/time.c:1256-1291, OTP-29.1.1.
-    fn place(&mut self, id: u64, entry: Entry<M>) {
-        let deadline = entry.deadline;
-        if deadline <= self.now {
-            self.insert_slot(id, entry, WheelKind::AtOnce, SLOT_AT_ONCE);
-        } else if deadline - self.now < SOON_SIZE as u64 {
-            // Port of erts/emulator/beam/time.c:1274-1280, OTP-29.1.1.
-            self.insert_slot(id, entry, WheelKind::Soon, Self::soon_slot(deadline));
-        } else if deadline - self.now < LATER_REVOLUTION {
-            // Port of erts/emulator/beam/time.c:1281-1291, OTP-29.1.1.
-            self.insert_slot(id, entry, WheelKind::Later, Self::later_slot(deadline));
-        } else {
-            self.insert_long(id, entry);
-        }
+    fn entry_mut(&mut self, index: u32) -> &mut Entry<M> {
+        self.entries[index as usize]
+            .as_mut()
+            .expect("live timer slab entry")
     }
 
-    // Port of erts/emulator/beam/erl_hl_timer.c:1219-1323, OTP-29.1.1.
-    fn insert_long(&mut self, id: u64, mut entry: Entry<M>) {
-        self.next_timeout = None;
-        let node = self.high_level.insert_node(entry.deadline);
-        let tail = self.high_level.node(node).tail;
-        entry.kind = WheelKind::HighLevel;
-        entry.slot = 0;
-        entry.tree_node = node;
-        entry.tree_prev = tail;
-        entry.tree_next = 0;
-        if tail == 0 {
-            self.high_level.node_mut(node).head = id;
-        } else {
-            self.entries
-                .get_mut(&tail)
-                .expect("tree tail has entry")
-                .tree_next = id;
-        }
-        self.high_level.node_mut(node).tail = id;
-        self.entries.insert(id, entry);
+    fn index_for_id(&self, id: u64) -> Option<u32> {
+        let node = self.id_index.find(id)?;
+        Some(self.id_index.node(node).head)
     }
 
-    // Port of erts/emulator/beam/erl_hl_timer.c:2661-2695, OTP-29.1.1.
-    pub(crate) fn insert(&mut self, id: u64, deadline: u64, payload: TimerPayload<M>) {
-        let order = self.next_order;
-        self.next_order = self.next_order.wrapping_add(1);
-        if let TimerPayload::Message(target, _, _) = &payload {
-            self.link_events.push_back(LinkEvent::Link(*target, id));
-        }
-        let entry = Entry {
-            deadline,
-            order,
-            kind: WheelKind::AtOnce,
-            slot: SLOT_AT_ONCE,
-            position: 0,
-            tree_node: NIL,
-            tree_prev: 0,
-            tree_next: 0,
-            state: AtomicU8::new(TIMER_PENDING),
-            payload,
-        };
-        self.place(id, entry);
+    fn entry_for_id(&self, id: u64) -> Option<&Entry<M>> {
+        self.index_for_id(id).map(|index| self.entry(index))
     }
 
-    // Port of erts/emulator/beam/time.c:705-738, OTP-29.1.1.
-    fn bucket_mut(&mut self, kind: WheelKind, slot: usize) -> Option<&mut Vec<u64>> {
+    fn bucket(&self, kind: WheelKind, slot: usize) -> Option<&Bucket> {
         match kind {
-            WheelKind::Soon => Some(&mut self.soon[slot]),
-            WheelKind::Later => Some(&mut self.later[slot]),
-            WheelKind::AtOnce => Some(&mut self.at_once),
-            WheelKind::Pending => Some(&mut self.pending),
+            WheelKind::Soon => Some(&self.soon[slot]),
+            WheelKind::Later => Some(&self.later[slot]),
+            WheelKind::AtOnce => Some(&self.at_once),
             WheelKind::HighLevel => None,
         }
     }
 
-    // Port of erts/emulator/beam/time.c:705-738, OTP-29.1.1.
-    fn remove_slot_entry(&mut self, entry: &Entry<M>, id: u64) {
-        if let Some(bucket) = self.bucket_mut(entry.kind, entry.slot) {
-            let removed = bucket.swap_remove(entry.position);
-            debug_assert_eq!(removed, id);
-            if let Some(&moved) = bucket.get(entry.position) {
-                self.entries
-                    .get_mut(&moved)
-                    .expect("bucket id has entry")
-                    .position = entry.position;
+    fn bucket_mut(&mut self, kind: WheelKind, slot: usize) -> Option<&mut Bucket> {
+        match kind {
+            WheelKind::Soon => Some(&mut self.soon[slot]),
+            WheelKind::Later => Some(&mut self.later[slot]),
+            WheelKind::AtOnce => Some(&mut self.at_once),
+            WheelKind::HighLevel => None,
+        }
+    }
+
+    // Port of erts/emulator/beam/time.c:647-685, OTP-29.1.1. The slot is a circular intrusive
+    // list; slab indices replace C object pointers without changing the link layout semantics.
+    fn link_slot(&mut self, index: u32, kind: WheelKind, slot: usize) {
+        let bucket = self.bucket(kind, slot).expect("wheel bucket");
+        let head = bucket.head;
+        self.entry_mut(index).kind = kind;
+        self.entry_mut(index).slot = slot;
+        self.entry_mut(index).in_sentinel = false;
+        if matches!(kind, WheelKind::Soon | WheelKind::Later) {
+            self.scnt[Self::scnt_index(kind, slot)] += 1;
+        }
+        if head == NIL {
+            self.entry_mut(index).prev = index;
+            self.entry_mut(index).next = index;
+            self.bucket_mut(kind, slot).unwrap().head = index;
+        } else {
+            let tail = self.entry(head).prev;
+            self.entry_mut(index).prev = tail;
+            self.entry_mut(index).next = head;
+            self.entry_mut(tail).next = index;
+            self.entry_mut(head).prev = index;
+        }
+    }
+
+    // Port of erts/emulator/beam/time.c:689-748, OTP-29.1.1.
+    fn unlink_slot(&mut self, index: u32) {
+        let (kind, slot, prev, next) = {
+            let entry = self.entry(index);
+            (entry.kind, entry.slot, entry.prev, entry.next)
+        };
+        let head = if self.entry(index).in_sentinel {
+            self.sentinel.head
+        } else {
+            self.bucket(kind, slot).expect("wheel bucket").head
+        };
+        if matches!(kind, WheelKind::Soon | WheelKind::Later) {
+            self.scnt[Self::scnt_index(kind, slot)] -= 1;
+        }
+        if next == index {
+            debug_assert_eq!(prev, index);
+            if self.entry(index).in_sentinel {
+                self.sentinel.head = NIL;
+            } else {
+                self.bucket_mut(kind, slot).unwrap().head = NIL;
+            }
+        } else {
+            self.entry_mut(prev).next = next;
+            self.entry_mut(next).prev = prev;
+            if head == index {
+                if self.entry(index).in_sentinel {
+                    self.sentinel.head = next;
+                } else {
+                    self.bucket_mut(kind, slot).unwrap().head = next;
+                }
+            }
+        }
+        self.entry_mut(index).in_sentinel = false;
+        self.entry_mut(index).prev = NIL;
+        self.entry_mut(index).next = NIL;
+    }
+
+    // Port of erts/emulator/beam/time.c:956-970 (move slot ring to the firing sentinel), OTP-29.1.1.
+    fn move_slot_to_sentinel(&mut self, kind: WheelKind, slot: usize) {
+        debug_assert_eq!(self.sentinel.head, NIL);
+        let head = self.bucket(kind, slot).expect("wheel bucket").head;
+        if head == NIL {
+            return;
+        }
+        self.bucket_mut(kind, slot).unwrap().head = NIL;
+        self.sentinel.head = head;
+        let mut index = head;
+        loop {
+            self.entry_mut(index).in_sentinel = true;
+            index = self.entry(index).next;
+            if index == head {
+                break;
             }
         }
     }
 
-    // Port of erts/emulator/beam/erl_hl_timer.c:3340-3362, OTP-29.1.1.
-    fn remove_long_entry(&mut self, entry: &Entry<M>, id: u64) {
-        let node = entry.tree_node;
-        debug_assert_ne!(node, NIL);
-        if entry.tree_prev == 0 {
-            self.high_level.node_mut(node).head = entry.tree_next;
+    fn scnt_index(kind: WheelKind, slot: usize) -> usize {
+        ((if kind == WheelKind::Later {
+            SOON_SIZE
         } else {
-            self.entries
-                .get_mut(&entry.tree_prev)
-                .expect("tree predecessor exists")
-                .tree_next = entry.tree_next;
-        }
-        if entry.tree_next == 0 {
-            self.high_level.node_mut(node).tail = entry.tree_prev;
-        } else {
-            self.entries
-                .get_mut(&entry.tree_next)
-                .expect("tree successor exists")
-                .tree_prev = entry.tree_prev;
-        }
-        if self.high_level.node(node).head == 0 {
-            debug_assert_eq!(self.high_level.node(node).tail, 0);
-            self.high_level.delete(node);
-        }
-        let _ = id;
+            0
+        }) + slot)
+            >> SCNT_BITS
     }
 
-    // Port of erts/emulator/beam/time.c:705-738 and erl_hl_timer.c:3340-3362, OTP-29.1.1.
-    fn detach(&mut self, id: u64) -> Option<Entry<M>> {
-        self.next_timeout = None;
-        let entry = self.entries.remove(&id)?;
-        if entry.kind == WheelKind::HighLevel {
-            self.remove_long_entry(&entry, id);
-        } else {
-            self.remove_slot_entry(&entry, id);
+    // Port of erts/emulator/beam/time.c:377-418 (scnt_wheel_next), OTP-29.1.1.
+    fn scnt_wheel_next(&self, slot: &mut usize, left: &mut isize, first: usize, end: usize) {
+        *left -= 1;
+        *slot += 1;
+        if *slot == end {
+            *slot = first;
         }
-        Some(entry)
+        let mut range = *slot >> SCNT_BITS;
+        while self.scnt[range] == 0 && *left > 0 {
+            let old_slot = *slot;
+            range += 1;
+            *slot = range << SCNT_BITS;
+            let diff = *slot - old_slot;
+            if *left < diff as isize {
+                *slot = old_slot + *left as usize;
+                *left = 0;
+            } else if *slot < end {
+                *left -= diff as isize;
+            } else {
+                *left -= (end - old_slot) as isize;
+                *slot = first;
+                range = first >> SCNT_BITS;
+            }
+        }
+    }
+
+    // Port of erts/emulator/beam/time.c:1256-1291, OTP-29.1.1.
+    fn place(&mut self, index: u32) {
+        let deadline = self.entry(index).deadline;
+        self.next_timeout = None;
+        if deadline <= self.now {
+            self.link_slot(index, WheelKind::AtOnce, SLOT_AT_ONCE);
+        } else if deadline - self.now < SOON_SIZE as u64 {
+            self.link_slot(index, WheelKind::Soon, Self::soon_slot(deadline));
+        } else if deadline - self.now < LATER_REVOLUTION {
+            self.link_slot(index, WheelKind::Later, Self::later_slot(deadline));
+        } else {
+            self.insert_long(index);
+        }
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c:1219-1323, OTP-29.1.1.
+    fn insert_long(&mut self, index: u32) {
+        let deadline = self.entry(index).deadline;
+        let node = self.high_level.insert_node(deadline);
+        let tail = self.high_level.node(node).tail;
+        let entry = self.entry_mut(index);
+        entry.kind = WheelKind::HighLevel;
+        entry.tree_node = node;
+        entry.tree_prev = tail;
+        entry.tree_next = NIL;
+        if tail == NIL {
+            self.high_level.node_mut(node).head = index;
+        } else {
+            self.entry_mut(tail).tree_next = index;
+        }
+        self.high_level.node_mut(node).tail = index;
+    }
+
+    fn unlink_long(&mut self, index: u32) {
+        let (node, prev, next) = {
+            let entry = self.entry(index);
+            (entry.tree_node, entry.tree_prev, entry.tree_next)
+        };
+        if prev == NIL {
+            self.high_level.node_mut(node).head = next;
+        } else {
+            self.entry_mut(prev).tree_next = next;
+        }
+        if next == NIL {
+            self.high_level.node_mut(node).tail = prev;
+        } else {
+            self.entry_mut(next).tree_prev = prev;
+        }
+        if self.high_level.node(node).head == NIL {
+            self.high_level.delete(node);
+        }
+        let entry = self.entry_mut(index);
+        entry.tree_node = NIL;
+        entry.tree_prev = NIL;
+        entry.tree_next = NIL;
+    }
+
+    fn unlink(&mut self, index: u32) {
+        self.next_timeout = None;
+        if self.entry(index).kind == WheelKind::HighLevel {
+            self.unlink_long(index);
+        } else {
+            self.unlink_slot(index);
+        }
+    }
+
+    fn take_unlinked(&mut self, index: u32) -> Entry<M> {
+        let entry = self.entries[index as usize]
+            .take()
+            .expect("live timer slab entry");
+        let tree = self.id_index.find(entry.id).expect("timer id index");
+        self.id_index.delete(tree);
+        self.free_entries.push(index);
+        self.entry_count -= 1;
+        entry
+    }
+
+    fn detach(&mut self, id: u64) -> Option<Entry<M>> {
+        let index = self.index_for_id(id)?;
+        self.unlink(index);
+        Some(self.take_unlinked(index))
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c:2661-2695, OTP-29.1.1.
+    pub(crate) fn insert(&mut self, id: u64, deadline: u64, payload: TimerPayload<M>) {
+        if let TimerPayload::Message(target, _, _) = &payload {
+            self.link_events.push_back(LinkEvent::Link(*target, id));
+        }
+        let entry = Entry {
+            id,
+            deadline,
+            kind: WheelKind::AtOnce,
+            slot: SLOT_AT_ONCE,
+            in_sentinel: false,
+            prev: NIL,
+            next: NIL,
+            tree_node: NIL,
+            tree_prev: NIL,
+            tree_next: NIL,
+            state: AtomicU8::new(TIMER_PENDING),
+            payload,
+        };
+        let index = self.free_entries.pop().unwrap_or_else(|| {
+            let index = u32::try_from(self.entries.len()).expect("timer slab index overflow");
+            self.entries.push(None);
+            index
+        });
+        self.entries[index as usize] = Some(entry);
+        let id_node = self.id_index.insert_node(id);
+        assert_eq!(self.id_index.node(id_node).head, NIL, "duplicate timer id");
+        self.id_index.node_mut(id_node).head = index;
+        self.id_index.node_mut(id_node).tail = index;
+        self.entry_count += 1;
+        self.place(index);
     }
 
     // Port of erts/emulator/beam/erl_hl_timer.c:2210-2248, OTP-29.1.1.
@@ -806,8 +973,9 @@ impl<M> Wheel<M> {
         let live = self
             .entries
             .iter()
-            .filter(|(id, _)| **id & REF_KEY_TIMER_BIT != 0)
-            .filter_map(|(_, entry)| payload_message(&entry.payload));
+            .filter_map(Option::as_ref)
+            .filter(|entry| entry.id & REF_KEY_TIMER_BIT != 0)
+            .filter_map(|entry| payload_message(&entry.payload));
         live.collect()
     }
 
@@ -840,8 +1008,7 @@ impl<M> Wheel<M> {
 
     pub(crate) fn remaining_at(&self, id: u64, now: u64) -> Option<u64> {
         // Port of erts/emulator/beam/erl_hl_timer.c:2013-2042, OTP-29.1.1.
-        self.entries
-            .get(&id)
+        self.entry_for_id(id)
             .map(|entry| entry.deadline.saturating_sub(now))
     }
 
@@ -852,13 +1019,10 @@ impl<M> Wheel<M> {
     /// Port of erts/emulator/beam/time.c:477 (find_next_timeout), OTP-29.1.1: the soon wheel
     /// gives an exact timeout; the later wheel and the high-level tree give a pre-timeout.
     pub(crate) fn next_timeout(&mut self) -> Option<u64> {
-        if self.entries.is_empty() {
+        if self.entry_count == 0 {
             return None;
         }
-        if !self.at_once.is_empty()
-            || !self.pending.is_empty()
-            || self.bump_cursor < self.bump_pending.len()
-        {
+        if self.yielded.is_some() || self.at_once.head != NIL || self.fast_forward.is_some() {
             return Some(self.now);
         }
         // Removed timers only make the cached position early, never late.
@@ -866,15 +1030,24 @@ impl<M> Wheel<M> {
             return Some(cached);
         }
         let mut next = u64::MAX;
-        for offset in 1..SOON_SIZE as u64 {
-            let bucket = &self.soon[Self::soon_slot(self.now + offset)];
-            if !bucket.is_empty() {
-                next = bucket
-                    .iter()
-                    .filter_map(|id| self.entries.get(id))
-                    .map(|entry| entry.deadline)
-                    .min()
-                    .unwrap_or(self.now + offset);
+        let mut slot = Self::soon_slot(self.now);
+        let mut slots = (SOON_SIZE - 1) as isize;
+        while slots > 0 {
+            self.scnt_wheel_next(&mut slot, &mut slots, 0, SOON_SIZE);
+            let bucket = self.soon[slot];
+            if bucket.head != NIL {
+                let mut index = bucket.head;
+                loop {
+                    next = next.min(self.entry(index).deadline);
+                    index = self.entry(index).next;
+                    if index == bucket.head {
+                        break;
+                    }
+                }
+                if next == u64::MAX {
+                    let distance = (slot + SOON_SIZE - Self::soon_slot(self.now)) & (SOON_SIZE - 1);
+                    next = self.now + distance as u64;
+                }
                 break;
             }
         }
@@ -887,7 +1060,7 @@ impl<M> Wheel<M> {
                 break;
             }
             let slot = (Self::later_slot(boundary) + 1) & (SOON_SIZE - 1);
-            if !self.later[slot].is_empty() {
+            if self.later[slot].head != NIL {
                 next = boundary;
                 break;
             }
@@ -920,9 +1093,9 @@ impl<M> Wheel<M> {
     #[inline]
     pub(crate) fn quiet_at(&self, now: u64) -> bool {
         self.link_events.is_empty()
-            && self.at_once.is_empty()
-            && self.pending.is_empty()
-            && self.bump_cursor >= self.bump_pending.len()
+            && self.at_once.head == NIL
+            && self.yielded.is_none()
+            && self.fast_forward.is_none()
             && self
                 .next_timeout
                 .is_some_and(|next| next > now && next > self.now)
@@ -930,7 +1103,7 @@ impl<M> Wheel<M> {
 
     // Port of erts/emulator/beam/time.c:1270-1291, OTP-29.1.1.
     pub(crate) fn has_timers(&self) -> bool {
-        !self.entries.is_empty()
+        self.entry_count != 0
     }
 
     // Port of erts/emulator/beam/erl_hl_timer.c:1219-1323, OTP-29.1.1.
@@ -939,15 +1112,16 @@ impl<M> Wheel<M> {
         while *work < BUMP_YIELD_LIMIT
             && let Some(node) = self.high_level.first_at_or_before(limit)
         {
-            let id = self.high_level.node(node).head;
-            if id == 0 {
+            let index = self.high_level.node(node).head;
+            if index == NIL {
                 break;
             }
-            if let Some(mut entry) = self.detach(id) {
-                *work += COST_SLOT_MOVE;
-                entry.kind = WheelKind::AtOnce;
-                self.place(id, entry);
-            }
+            self.unlink(index);
+            *work += COST_SLOT_MOVE;
+            self.place(index);
+        }
+        if *work >= BUMP_YIELD_LIMIT && self.high_level.first_at_or_before(limit).is_some() {
+            self.yielded = Some(Yielded::HighLevel);
         }
     }
 
@@ -956,29 +1130,29 @@ impl<M> Wheel<M> {
         &mut self,
         kind: WheelKind,
         slot: usize,
-        due: &mut Vec<(u64, u64, u64, TimerPayload<M>)>,
+        resume_at: Option<u32>,
+        fire: &mut impl FnMut(u64, TimerPayload<M>),
         work: &mut usize,
     ) {
-        let ids = match kind {
-            WheelKind::Soon => std::mem::take(&mut self.soon[slot]),
-            WheelKind::Later => std::mem::take(&mut self.later[slot]),
-            WheelKind::AtOnce => std::mem::take(&mut self.at_once),
-            WheelKind::Pending => std::mem::take(&mut self.pending),
-            WheelKind::HighLevel => unreachable!(),
-        };
-        let mut ids = ids.into_iter();
-        while let Some(id) = ids.next() {
+        if self.sentinel.head == NIL {
+            self.move_slot_to_sentinel(kind, slot);
+        }
+        let first = self.sentinel.head;
+        if first == NIL {
+            return;
+        }
+        let last = resume_at.unwrap_or_else(|| self.entry(first).prev);
+        let mut index = first;
+        loop {
             if *work >= BUMP_YIELD_LIMIT {
-                self.queue_pending(id);
-                for pending in ids {
-                    self.queue_pending(pending);
-                }
+                self.yielded = Some(Yielded::Slot { kind, slot, last });
                 break;
             }
-            let Some(mut entry) = self.entries.remove(&id) else {
-                continue;
-            };
-            if entry.deadline <= self.now {
+            let next = self.entry(index).next;
+            let id = self.entry(index).id;
+            if self.entry(index).deadline <= self.now {
+                self.unlink(index);
+                let entry = self.take_unlinked(index);
                 *work += COST_TIMEOUT;
                 if entry
                     .state
@@ -991,46 +1165,45 @@ impl<M> Wheel<M> {
                     .is_ok()
                 {
                     self.remove_target_entry(id, &entry.payload);
-                    due.push((entry.deadline, entry.order, id, entry.payload));
+                    fire(id, entry.payload);
                 }
             } else {
+                self.unlink(index);
                 *work += COST_SLOT_MOVE;
-                entry.kind = WheelKind::AtOnce;
-                self.place(id, entry);
+                self.place(index);
             }
-            if *work >= BUMP_YIELD_LIMIT {
-                for pending in ids {
-                    self.queue_pending(pending);
-                }
+            if index == last {
                 break;
             }
+            index = next;
         }
     }
 
-    // Port of erts/emulator/beam/time.c:916-1000, OTP-29.1.1.
-    fn queue_pending(&mut self, id: u64) {
-        let position = self.pending.len();
-        self.pending.push(id);
-        if let Some(entry) = self.entries.get_mut(&id) {
-            entry.kind = WheelKind::Pending;
-            entry.position = position;
-        }
-    }
-
-    // Port of erts/emulator/beam/time.c:784-1000, OTP-29.1.1.
-    fn drain_fast_forward(
+    fn drain_fast_forward_slot(
         &mut self,
-        to: u64,
-        due: &mut Vec<(u64, u64, u64, TimerPayload<M>)>,
+        kind: WheelKind,
+        slot: usize,
+        fire: &mut impl FnMut(u64, TimerPayload<M>),
         work: &mut usize,
-    ) {
-        while self.bump_cursor < self.bump_pending.len() && *work < BUMP_YIELD_LIMIT {
-            let id = self.bump_pending[self.bump_cursor];
-            self.bump_cursor += 1;
-            let Some(entry) = self.detach(id) else {
-                continue;
-            };
-            if entry.deadline <= to {
+    ) -> bool {
+        if self.sentinel.head == NIL {
+            self.move_slot_to_sentinel(kind, slot);
+        }
+        let first = self.sentinel.head;
+        if first == NIL {
+            return true;
+        }
+        let last = self.entry(first).prev;
+        let mut index = first;
+        loop {
+            let next = self.entry(index).next;
+            if self.entry(index).deadline <= self.now {
+                if *work >= BUMP_YIELD_LIMIT {
+                    return false;
+                }
+                let id = self.entry(index).id;
+                self.unlink(index);
+                let entry = self.take_unlinked(index);
                 *work += COST_TIMEOUT;
                 if entry
                     .state
@@ -1043,83 +1216,158 @@ impl<M> Wheel<M> {
                     .is_ok()
                 {
                     self.remove_target_entry(id, &entry.payload);
-                    due.push((entry.deadline, entry.order, id, entry.payload));
+                    fire(id, entry.payload);
                 }
             } else {
-                *work += COST_SLOT_MOVE;
-                self.place(id, entry);
+                self.unlink(index);
+                self.place(index);
             }
+            if index == last {
+                return true;
+            }
+            index = next;
         }
-        if self.bump_cursor == self.bump_pending.len() {
-            self.bump_pending.clear();
-            self.bump_cursor = 0;
+    }
+
+    // Port of erts/emulator/beam/time.c:784-1000, OTP-29.1.1. The cursor resumes the current
+    // wheel phase and slot after a yield; timers remain linked in their original slots.
+    fn fast_forward_step(&mut self, fire: &mut impl FnMut(u64, TimerPayload<M>), work: &mut usize) {
+        while *work < BUMP_YIELD_LIMIT {
+            let Some(mut state) = self.fast_forward else {
+                return;
+            };
+            match state.phase {
+                FastForwardPhase::HighLevel => {
+                    self.cascade_high_level(work);
+                    if self.yielded.is_some() {
+                        self.fast_forward = Some(state);
+                        return;
+                    }
+                    state.phase = FastForwardPhase::AtOnce;
+                    state.slot = 0;
+                }
+                FastForwardPhase::AtOnce => {
+                    if self.at_once.head != NIL {
+                        self.drain_slot(WheelKind::AtOnce, SLOT_AT_ONCE, None, fire, work);
+                        if self.yielded.is_some() {
+                            self.fast_forward = Some(state);
+                            return;
+                        }
+                    }
+                    state.phase = FastForwardPhase::Soon;
+                    state.slot = 0;
+                }
+                FastForwardPhase::Soon | FastForwardPhase::Later => {
+                    let kind = if matches!(state.phase, FastForwardPhase::Soon) {
+                        WheelKind::Soon
+                    } else {
+                        WheelKind::Later
+                    };
+                    while state.slot < SOON_SIZE {
+                        if self.sentinel.head != NIL {
+                            if !self.drain_fast_forward_slot(kind, state.slot, fire, work) {
+                                self.fast_forward = Some(state);
+                                return;
+                            }
+                        } else if self.bucket(kind, state.slot).unwrap().head != NIL {
+                            *work += COST_SLOT;
+                            if !self.drain_fast_forward_slot(kind, state.slot, fire, work) {
+                                self.fast_forward = Some(state);
+                                return;
+                            }
+                        } else if self.scnt[Self::scnt_index(kind, state.slot)] == 0 {
+                            state.slot = ((state.slot >> SCNT_BITS) + 1) << SCNT_BITS;
+                            state.slot = state.slot.min(SOON_SIZE);
+                            continue;
+                        }
+                        state.slot += 1;
+                        if *work >= BUMP_YIELD_LIMIT {
+                            self.fast_forward = Some(state);
+                            return;
+                        }
+                    }
+                    if kind == WheelKind::Soon {
+                        state.phase = FastForwardPhase::Later;
+                        state.slot = 0;
+                    } else {
+                        self.fast_forward = None;
+                        return;
+                    }
+                }
+            }
+            self.fast_forward = Some(state);
         }
     }
 
     // Port of erts/emulator/beam/time.c:784-1000, OTP-29.1.1.
     pub(crate) fn advance(&mut self, to: u64) -> Vec<(u64, TimerPayload<M>)> {
         let mut due = Vec::new();
+        self.advance_with(to, |id, payload| due.push((id, payload)));
+        due
+    }
+
+    // Port of erts/emulator/beam/time.c:784-1000, OTP-29.1.1: fire each timeout while the
+    // bump is traversing the active slot, before moving to the next timer or wheel slot.
+    pub(crate) fn advance_with(&mut self, to: u64, mut fire: impl FnMut(u64, TimerPayload<M>)) {
         let mut work = 0;
-        if !self.pending.is_empty() && work < BUMP_YIELD_LIMIT {
-            self.drain_slot(WheelKind::Pending, 0, &mut due, &mut work);
+        if let Some(yielded) = self.yielded.take() {
+            match yielded {
+                Yielded::HighLevel => self.cascade_high_level(&mut work),
+                Yielded::Slot { kind, slot, last } => {
+                    self.drain_slot(kind, slot, Some(last), &mut fire, &mut work)
+                }
+            }
         }
-        if work >= BUMP_YIELD_LIMIT {
-            due.sort_unstable_by_key(|(deadline, order, _, _)| (*deadline, *order));
-            return due
-                .into_iter()
-                .map(|(_, _, id, payload)| (id, payload))
-                .collect();
+        if work >= BUMP_YIELD_LIMIT || self.yielded.is_some() {
+            return;
         }
-        if !self.at_once.is_empty() {
-            self.drain_slot(WheelKind::AtOnce, SLOT_AT_ONCE, &mut due, &mut work);
+        if self.fast_forward.is_some() {
+            self.fast_forward_step(&mut fire, &mut work);
+            return;
         }
-        if !self.bump_pending.is_empty() {
-            self.drain_fast_forward(self.now, &mut due, &mut work);
-            if !self.bump_pending.is_empty() {
-                due.sort_unstable_by_key(|(deadline, order, _, _)| (*deadline, *order));
-                return due
-                    .into_iter()
-                    .map(|(_, _, id, payload)| (id, payload))
-                    .collect();
+        if self.at_once.head != NIL {
+            self.drain_slot(WheelKind::AtOnce, SLOT_AT_ONCE, None, &mut fire, &mut work);
+            if self.yielded.is_some() {
+                return;
             }
         }
         if to.saturating_sub(self.now) > SOON_SIZE as u64 {
             self.now = to;
-            let mut timers: Vec<(u64, u64, u64)> = self
-                .entries
-                .iter()
-                .map(|(&id, entry)| (entry.deadline, entry.order, id))
-                .collect();
-            timers.sort_unstable();
-            self.bump_pending = timers.into_iter().map(|(_, _, id)| id).collect();
-            self.bump_cursor = 0;
-            self.drain_fast_forward(to, &mut due, &mut work);
-            due.sort_unstable_by_key(|(deadline, order, _, _)| (*deadline, *order));
-            return due
-                .into_iter()
-                .map(|(_, _, id, payload)| (id, payload))
-                .collect();
+            self.fast_forward = Some(FastForward {
+                phase: FastForwardPhase::HighLevel,
+                slot: 0,
+            });
+            self.fast_forward_step(&mut fire, &mut work);
+            return;
         }
         self.cascade_high_level(&mut work);
+        if self.yielded.is_some() {
+            return;
+        }
         while self.now < to && work < BUMP_YIELD_LIMIT {
             self.now += 1;
             if self.now.is_multiple_of(LATER_SLOT_SIZE) {
                 work += COST_SLOT;
                 // `later.pos` is one slot ahead of the current clock position.
                 let slot = (Self::later_slot(self.now) + 1) & (SOON_SIZE - 1);
-                self.drain_slot(WheelKind::Later, slot, &mut due, &mut work);
+                self.drain_slot(WheelKind::Later, slot, None, &mut fire, &mut work);
+                if self.yielded.is_some() {
+                    break;
+                }
             }
             work += COST_SLOT;
             let slot = Self::soon_slot(self.now);
-            self.drain_slot(WheelKind::Soon, slot, &mut due, &mut work);
+            self.drain_slot(WheelKind::Soon, slot, None, &mut fire, &mut work);
+            if self.yielded.is_some() {
+                break;
+            }
             if self.now.is_multiple_of(LATER_SLOT_SIZE) {
                 self.cascade_high_level(&mut work);
+                if self.yielded.is_some() {
+                    break;
+                }
             }
         }
-        due.sort_unstable_by_key(|(deadline, order, _, _)| (*deadline, *order));
-        due.into_iter()
-            .map(|(_, _, id, payload)| (id, payload))
-            .collect()
     }
 }
 
@@ -1154,6 +1402,143 @@ mod tests {
             assert_eq!(tree.node(tree.root).parent, NIL);
         }
         walk(tree, tree.root, None, None);
+    }
+
+    fn validate_wheel<M>(wheel: &Wheel<M>) {
+        fn check_bucket<M>(
+            wheel: &Wheel<M>,
+            bucket: &Bucket,
+            kind: WheelKind,
+            slot: usize,
+            seen: &mut [bool],
+            expected_scnt: &mut [usize; SCNT_SIZE],
+        ) {
+            if bucket.head == NIL {
+                return;
+            }
+            let mut index = bucket.head;
+            loop {
+                let entry = wheel.entry(index);
+                assert_eq!(entry.kind, kind);
+                assert_eq!(entry.slot, slot);
+                assert!(!entry.in_sentinel);
+                assert!(!seen[index as usize]);
+                seen[index as usize] = true;
+                assert_eq!(wheel.entry(entry.prev).next, index);
+                assert_eq!(wheel.entry(entry.next).prev, index);
+                if matches!(kind, WheelKind::Soon | WheelKind::Later) {
+                    expected_scnt[Wheel::<M>::scnt_index(kind, slot)] += 1;
+                }
+                index = entry.next;
+                if index == bucket.head {
+                    break;
+                }
+            }
+        }
+        validate_tree(&wheel.id_index);
+        validate_tree(&wheel.high_level);
+        let mut seen = vec![false; wheel.entries.len()];
+        let mut expected_scnt = [0; SCNT_SIZE];
+        for (slot, bucket) in wheel.soon.iter().enumerate() {
+            check_bucket(
+                wheel,
+                bucket,
+                WheelKind::Soon,
+                slot,
+                &mut seen,
+                &mut expected_scnt,
+            );
+        }
+        for (slot, bucket) in wheel.later.iter().enumerate() {
+            check_bucket(
+                wheel,
+                bucket,
+                WheelKind::Later,
+                slot,
+                &mut seen,
+                &mut expected_scnt,
+            );
+        }
+        if wheel.sentinel.head != NIL {
+            let mut index = wheel.sentinel.head;
+            loop {
+                let entry = wheel.entry(index);
+                assert!(entry.in_sentinel);
+                assert!(!seen[index as usize]);
+                seen[index as usize] = true;
+                assert_eq!(wheel.entry(entry.prev).next, index);
+                assert_eq!(wheel.entry(entry.next).prev, index);
+                if matches!(entry.kind, WheelKind::Soon | WheelKind::Later) {
+                    expected_scnt[Wheel::<M>::scnt_index(entry.kind, entry.slot)] += 1;
+                }
+                index = entry.next;
+                if index == wheel.sentinel.head {
+                    break;
+                }
+            }
+        }
+        check_bucket(
+            wheel,
+            &wheel.at_once,
+            WheelKind::AtOnce,
+            SLOT_AT_ONCE,
+            &mut seen,
+            &mut expected_scnt,
+        );
+        assert_eq!(wheel.scnt, expected_scnt);
+        for (tree_index, node) in wheel.high_level.nodes.iter().enumerate() {
+            let Some(node) = node else { continue };
+            let mut index = node.head;
+            let mut previous = NIL;
+            while index != NIL {
+                let entry = wheel.entry(index);
+                assert_eq!(entry.kind, WheelKind::HighLevel);
+                assert_eq!(entry.tree_node, tree_index as u32);
+                assert_eq!(entry.deadline, node.key);
+                assert_eq!(entry.tree_prev, previous);
+                assert!(!seen[index as usize]);
+                seen[index as usize] = true;
+                previous = index;
+                index = entry.tree_next;
+            }
+            assert_eq!(previous, node.tail);
+        }
+        for (index, entry) in wheel.entries.iter().enumerate() {
+            if let Some(entry) = entry {
+                assert!(seen[index]);
+                let node = wheel.id_index.find(entry.id).expect("id-index node");
+                assert_eq!(wheel.id_index.node(node).head, index as u32);
+            } else {
+                assert!(!seen[index]);
+            }
+        }
+        assert_eq!(wheel.entry_count, seen.iter().filter(|seen| **seen).count());
+    }
+
+    #[test]
+    fn intrusive_slots_and_id_slab_survive_cancel_cascade_and_reuse() {
+        let pid = Pid::new(7, 1);
+        let mut wheel = Wheel::<u8>::new(0);
+        let long = LATER_REVOLUTION + 100;
+        wheel.insert(1, 1, TimerPayload::Message(pid, 1, true));
+        wheel.insert(2, 257, TimerPayload::Message(pid, 2, true));
+        wheel.insert(3, 17_000, TimerPayload::Message(pid, 3, true));
+        wheel.insert(4, long, TimerPayload::Message(pid, 4, true));
+        validate_wheel(&wheel);
+
+        assert_eq!(wheel.cancel(2).map(|timer| timer.0), Some(257));
+        validate_wheel(&wheel);
+        assert!(wheel.advance(1).iter().any(|(id, _)| *id == 1));
+        validate_wheel(&wheel);
+        assert!(wheel.advance(16_384).is_empty());
+        validate_wheel(&wheel);
+        assert_eq!(wheel.entry_for_id(3).unwrap().kind, WheelKind::Soon);
+        assert!(wheel.advance(17_000).iter().any(|(id, _)| *id == 3));
+        validate_wheel(&wheel);
+        wheel.insert(5, long, TimerPayload::Message(pid, 5, true));
+        validate_wheel(&wheel);
+        assert!(wheel.advance(long).iter().any(|(id, _)| *id == 4));
+        validate_wheel(&wheel);
     }
 
     #[test]
@@ -1239,9 +1624,9 @@ mod tests {
         let mut wheel = Wheel::<u8>::new(0);
         let deadline = 17_000;
         wheel.insert(1, deadline, TimerPayload::Message(pid, 1, true));
-        assert_eq!(wheel.entries.get(&1).unwrap().kind, WheelKind::Later);
+        assert_eq!(wheel.entry_for_id(1).unwrap().kind, WheelKind::Later);
         assert!(wheel.advance(LATER_SLOT_SIZE).is_empty());
-        assert_eq!(wheel.entries.get(&1).unwrap().kind, WheelKind::Soon);
+        assert_eq!(wheel.entry_for_id(1).unwrap().kind, WheelKind::Soon);
     }
 
     #[test]
@@ -1267,5 +1652,22 @@ mod tests {
         assert_eq!(total, 20_050);
         assert_eq!(last.len(), 50);
         assert_eq!(last.last().map(|timer| timer.0), Some(20_050));
+    }
+
+    #[test]
+    fn fast_forward_keeps_future_timer_nodes_in_their_wheel_slots() {
+        let pid = Pid::new(0, 0);
+        let mut wheel = Wheel::<u8>::new(0);
+        wheel.insert(1, 10_000, TimerPayload::Message(pid, 1, true));
+        wheel.insert(2, 100_000, TimerPayload::Message(pid, 2, true));
+
+        let due = wheel.advance(20_000);
+        assert_eq!(due.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [1]);
+        assert_eq!(wheel.remaining(2), Some(80_000));
+        validate_wheel(&wheel);
+
+        let due = wheel.advance(100_000);
+        assert_eq!(due.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [2]);
+        validate_wheel(&wheel);
     }
 }
