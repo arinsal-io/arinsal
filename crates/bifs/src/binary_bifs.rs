@@ -8,8 +8,8 @@ use arinsal_term::{
     writable_bytes_mut, writable_extend_private, writable_finalize,
 };
 
-use crate::binary_mod::{SearchPattern, SearchWalk};
-use crate::lists::DeferredTrap;
+use crate::binary_mod::{SearchPattern, SearchPatternHandle, SearchWalk};
+use crate::lists::{DeferredTrap, cons_cell};
 use crate::{BifError, Ctx};
 
 use super::*;
@@ -1549,7 +1549,7 @@ fn compile_search_pattern(term: Term) -> Result<SearchPattern, BifError> {
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1004-1113, 1230-1270 (pattern extraction), OTP-29.1.1.
-fn pattern(term: Term) -> Result<Arc<SearchPattern>, BifError> {
+fn pattern(term: Term) -> Result<SearchPatternHandle, BifError> {
     if tuple_arity(term).ok() == Some(2) {
         let tag = atom_name(tuple_element(term, 0)?).filter(|tag| matches!(*tag, "bm" | "ac"));
         if let Some(tag) = tag {
@@ -1559,10 +1559,10 @@ fn pattern(term: Term) -> Result<Arc<SearchPattern>, BifError> {
                 .downcast_ref::<Arc<SearchPattern>>()
                 .filter(|compiled| compiled.tag() == tag)
                 .ok_or(BADARG)?;
-            return Ok(Arc::clone(compiled));
+            return Ok(SearchPatternHandle::Shared(Arc::clone(compiled)));
         }
     }
-    Ok(Arc::new(compile_search_pattern(term)?))
+    Ok(SearchPatternHandle::Owned(compile_search_pattern(term)?))
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1004-1113 (binary_compile_pattern_1), OTP-29.1.1.
@@ -1835,7 +1835,12 @@ fn split_options(
     let mut trim = false;
     let mut trim_all = false;
     let mut scope = (0, len);
-    for option in list(options)? {
+    let mut rest = options;
+    while rest != Term::NIL {
+        let Some((option, tail)) = cons_cell(rest) else {
+            return Err(BADARG);
+        };
+        rest = tail;
         match atom_name(option) {
             Some("global") => global = true,
             Some("trim") => trim = true,

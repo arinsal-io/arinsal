@@ -1,5 +1,6 @@
 //! Boyer–Moore and Aho–Corasick search used by the `binary` BIFs.
 
+use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::BifError;
@@ -12,6 +13,23 @@ const MC_LOOP_FACTOR: usize = 8;
 pub(super) enum SearchPattern {
     BoyerMoore(BoyerMoore),
     AhoCorasick(AhoCorasick),
+}
+
+/// Temporary search data belongs to one BIF call; compiled patterns retain their magic owner.
+pub(super) enum SearchPatternHandle {
+    Owned(SearchPattern),
+    Shared(Arc<SearchPattern>),
+}
+
+impl Deref for SearchPatternHandle {
+    type Target = SearchPattern;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(pattern) => pattern,
+            Self::Shared(pattern) => pattern,
+        }
+    }
 }
 
 impl SearchPattern {
@@ -315,7 +333,7 @@ enum SearchState {
 pub(super) struct SearchWalk {
     len: usize,
     scope: (usize, usize),
-    pattern: Arc<SearchPattern>,
+    pattern: SearchPatternHandle,
     state: SearchState,
 }
 
@@ -325,15 +343,15 @@ impl SearchWalk {
     // 892-900 (search-state initialization), OTP-29.1.1.
     pub(super) fn new(
         len: usize,
-        pattern: Arc<SearchPattern>,
+        pattern: SearchPatternHandle,
         scope: (usize, usize),
         first_only: bool,
     ) -> Self {
-        let too_short = match pattern.as_ref() {
+        let too_short = match &*pattern {
             SearchPattern::BoyerMoore(bm) => bm.width > scope.1 - scope.0,
             SearchPattern::AhoCorasick(_) => false,
         };
-        let state = match (pattern.as_ref(), first_only) {
+        let state = match (&*pattern, first_only) {
             (SearchPattern::BoyerMoore(_), true) => SearchState::BoyerMooreFirst {
                 position: scope.0,
                 found: None,
@@ -372,7 +390,7 @@ impl SearchWalk {
         if budget == 0 {
             return (self.is_done(), 0);
         }
-        match self.pattern.as_ref() {
+        match &*self.pattern {
             SearchPattern::BoyerMoore(pattern) => {
                 Self::step_boyer_moore(pattern, bytes, self.scope.1, budget, &mut self.state)
             }
@@ -413,7 +431,7 @@ impl SearchWalk {
                     return None;
                 }
                 let (node, start) = (*candidate)?;
-                let SearchPattern::AhoCorasick(pattern) = self.pattern.as_ref() else {
+                let SearchPattern::AhoCorasick(pattern) = &*self.pattern else {
                     unreachable!("Aho–Corasick state uses an Aho–Corasick pattern")
                 };
                 Some((start, pattern.nodes[node].depth as usize))
@@ -713,7 +731,8 @@ mod tests {
         scope: (usize, usize),
         first_only: bool,
     ) -> Vec<(usize, usize)> {
-        let pattern = Arc::new(SearchPattern::compile(vec![needle.to_vec()]).unwrap());
+        let pattern =
+            SearchPatternHandle::Owned(SearchPattern::compile(vec![needle.to_vec()]).unwrap());
         let mut walk = SearchWalk::new(bytes.len(), pattern, scope, first_only);
         let mut steps = 0;
         while !walk.step(bytes, 1).0 {
