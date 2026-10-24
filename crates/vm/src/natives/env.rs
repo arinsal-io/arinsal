@@ -7,7 +7,7 @@ use arinsal_sched::RunCtx;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, TermKind, global_atoms};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 pub(crate) type Environment = Vec<(OsString, OsString)>;
 static ENVIRONMENT: OnceLock<RwLock<Environment>> = OnceLock::new();
@@ -255,7 +255,7 @@ fn unsetenv(_process: &mut Process, name: Term) -> Result<Term, VmError> {
 /// Runtime that receives a handled signal; the server pid is resolved per delivery.
 #[derive(Clone)]
 struct SignalTarget {
-    runtime: Weak<Runtime>,
+    runtime: &'static Runtime,
 }
 
 static SIGNAL_TARGETS: OnceLock<Mutex<HashMap<i32, SignalTarget>>> = OnceLock::new();
@@ -267,15 +267,13 @@ fn targets() -> &'static Mutex<HashMap<i32, SignalTarget>> {
 
 /// Port of erts/emulator/sys/unix/sys.c:815 (erts_sys_unix_later_init), OTP-29.1.1: SIGTERM and
 /// SIGUSR1 are handled from boot and reported to `erl_signal_server`.
-pub(crate) fn install_boot_signals(runtime: &Arc<Runtime>) -> Result<(), VmError> {
+pub(crate) fn install_boot_signals(runtime: &'static Runtime) -> Result<(), VmError> {
     ensure_signal_reader()?;
     for signal_num in [libc::SIGTERM, libc::SIGUSR1] {
-        targets().lock().unwrap().insert(
-            signal_num,
-            SignalTarget {
-                runtime: Arc::downgrade(runtime),
-            },
-        );
+        targets()
+            .lock()
+            .unwrap()
+            .insert(signal_num, SignalTarget { runtime });
         install_disposition(
             signal_num,
             signal_handler as *const () as libc::sighandler_t,
@@ -311,9 +309,7 @@ fn set_signal(
         _ => return Err(badarg()),
     };
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let server = SignalTarget {
-        runtime: Arc::downgrade(runtime),
-    };
+    let server = SignalTarget { runtime };
     if action == atom("handle") {
         // POSIX cannot catch SIGSTOP; erts accepts the request and the kernel keeps stopping.
         // Port of erts/emulator/sys/unix/sys.c:754 (erts_set_signal), OTP-29.1.1.
@@ -469,9 +465,7 @@ fn deliver_signal(target: SignalTarget, signal: i32) {
     };
     // Port of erts/emulator/sys/unix/sys.c:594 (signal_notify_requested), OTP-29.1.1: the
     // server is looked up per signal and a missing one drops it.
-    let Some(runtime) = target.runtime.upgrade() else {
-        return;
-    };
+    let runtime = target.runtime;
     let Some(pid) = runtime.reg.whereis_proc_str("erl_signal_server") else {
         return;
     };

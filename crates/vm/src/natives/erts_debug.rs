@@ -56,7 +56,7 @@ pub(crate) enum MonitorOption {
 // Port of erts/emulator/beam/erl_process.c:14397-14400 (erts_continue_exit_process:
 // erts_system_monitor_clear), OTP-29.1.1.
 pub(crate) fn monitor_process_exited(process: &Process, pid: arinsal_sched::Pid) {
-    let Some(runtime) = process.runtime.as_ref() else {
+    let Some(runtime) = process.runtime else {
         return;
     };
     let Some(owned) = pid.to_term().and_then(|term| to_owned(term).ok()) else {
@@ -182,8 +182,7 @@ pub(crate) fn after_collection(process: &mut Process, elapsed_nanoseconds: u64) 
     if runtime.system_monitor_flags.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let runtime = runtime.clone();
-    for state in monitor_states(&runtime) {
+    for state in monitor_states(runtime) {
         after_collection_one(process, elapsed_nanoseconds, &state);
     }
 }
@@ -193,7 +192,7 @@ fn after_collection_one(
     elapsed_nanoseconds: u64,
     state: &SystemMonitorState,
 ) {
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         return;
     };
     let flags = runtime.system_monitor_flags.load(Ordering::Relaxed);
@@ -267,7 +266,7 @@ fn after_collection_one(
         ));
     }
     for (kind, values) in events {
-        send_system_monitor_event(process, &runtime, pid, receiver, kind, values);
+        send_system_monitor_event(process, runtime, pid, receiver, kind, values);
     }
 }
 
@@ -325,15 +324,15 @@ pub(crate) fn long_schedule_monitored(process: &Process) -> bool {
 }
 
 pub(crate) fn after_schedule(process: &mut Process, elapsed_nanoseconds: u64) {
-    if let Some(runtime) = process.runtime.clone() {
-        for state in monitor_states(&runtime) {
+    if let Some(runtime) = process.runtime {
+        for state in monitor_states(runtime) {
             after_schedule_one(process, elapsed_nanoseconds, &state);
         }
     }
 }
 
 fn after_schedule_one(process: &mut Process, elapsed_nanoseconds: u64, state: &SystemMonitorState) {
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         return;
     };
     let flags = runtime.system_monitor_flags.load(Ordering::Relaxed);
@@ -464,15 +463,15 @@ pub(crate) fn after_message_queue_change(process: &mut Process) {
     }) {
         return;
     }
-    if let Some(runtime) = process.runtime.clone() {
-        for state in monitor_states(&runtime) {
+    if let Some(runtime) = process.runtime {
+        for state in monitor_states(runtime) {
             after_message_queue_change_one(process, &state);
         }
     }
 }
 
 fn after_message_queue_change_one(process: &mut Process, state: &SystemMonitorState) {
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         return;
     };
     let flags = runtime.system_monitor_flags.load(Ordering::Relaxed);
@@ -548,8 +547,8 @@ fn after_message_queue_change_one(process: &mut Process, state: &SystemMonitorSt
 /// Emit the event when a sender is suspended on a busy local port.
 // Port of erts/emulator/beam/erl_process.c:9396-9397 and erl_trace.c:1928-1937, OTP-29.1.1.
 pub(crate) fn notify_busy_port(process: &Process, sender: arinsal_sched::Pid, port_id: u64) {
-    if let Some(runtime) = process.runtime.clone() {
-        for state in monitor_states(&runtime) {
+    if let Some(runtime) = process.runtime {
+        for state in monitor_states(runtime) {
             notify_busy_port_one(process, sender, port_id, &state);
         }
     }
@@ -608,8 +607,8 @@ fn notify_busy_port_one(
 /// Emit the event when a sender is suspended on a busy distribution port.
 // Port of erts/emulator/beam/erl_trace.c:1942-1948, OTP-29.1.1.
 pub(crate) fn notify_busy_dist_port(process: &Process, sender: arinsal_sched::Pid, port_id: u64) {
-    if let Some(runtime) = process.runtime.clone() {
-        for state in monitor_states(&runtime) {
+    if let Some(runtime) = process.runtime {
+        for state in monitor_states(runtime) {
             notify_busy_dist_port_one(process, sender, port_id, &state);
         }
     }
@@ -2279,7 +2278,7 @@ fn internal_state_get(
 /// waiter. For `deallocations` every scheduler drains the delayed frees of its own allocator
 /// instance in each round, and the waiter drains the instances no scheduler owns. Each phase needs every scheduler to reach its aux-work point, so a phase is one round.
 fn debug_wait_round(
-    owner: std::sync::Weak<crate::process::Runtime>,
+    owner: &'static crate::process::Runtime,
     schedulers: usize,
     pid: arinsal_sched::Pid,
     completion: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2295,16 +2294,14 @@ fn debug_wait_round(
         if remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
-        let Some(runtime) = owner.upgrade() else {
-            return;
-        };
+        let runtime = owner;
         let Ok(scheduler) = runtime.scheduler() else {
             return;
         };
         if rounds_left > 1 {
             let next = scheduler.clone();
             debug_wait_round(
-                owner.clone(),
+                owner,
                 schedulers,
                 pid,
                 completion.clone(),
@@ -2372,7 +2369,7 @@ fn internal_state_set(
         if drain_owned {
             arinsal_alloc::typed::drain_shared_deallocations();
         }
-        let runtime = process.runtime.as_ref().ok_or_else(badarg)?.clone();
+        let runtime = process.runtime.ok_or_else(badarg)?;
         // Port of erts/emulator/beam/erl_process.c (erts_debug_wait_completed), OTP-29.1.1:
         // erts yields and returns `ok` once, without re-running the BIF. A latch left by a
         // finished wait therefore belongs to that earlier call, not to this one; reusing it
@@ -2397,7 +2394,7 @@ fn internal_state_set(
         process.cold_mut().debug_wait_completion = Some(completion.clone());
         let rounds = if kind == "aux_work" { 1 } else { 4 };
         debug_wait_round(
-            std::sync::Arc::downgrade(&runtime),
+            runtime,
             ctx.scheduler_count(),
             ctx.pid(),
             completion,
@@ -2855,7 +2852,7 @@ fn system_check(selector: Term) -> Result<Term, VmError> {
 
 /// Port of erts/emulator/beam/erl_bif_trace.c:3276-3388, OTP-29.1.1.
 fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmError> {
-    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let state = if session == atom("legacy") {
         runtime.system_monitor.lock().unwrap().clone()
     } else {
@@ -2996,7 +2993,7 @@ fn system_monitor_set(
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     // `None` is the legacy (global) monitor, `Some` the monitor of a dynamic trace session.
     let key = if args[0] == atom("legacy") {
         None
@@ -3027,7 +3024,7 @@ fn system_monitor_set(
             }
         }
         runtime.long_message_queues.lock().unwrap().clear();
-        refresh_system_monitor_flags(&runtime);
+        refresh_system_monitor_flags(runtime);
     };
     let prev = match &key {
         None => runtime.system_monitor.lock().unwrap().clone(),

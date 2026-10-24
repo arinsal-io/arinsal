@@ -2824,16 +2824,16 @@ fn code_permission(
     let pid = pid.ok_or(BifError::Unsupported(
         "code_mod_permission requires a scheduler",
     ))?;
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         return Err(BifError::Unsupported(
             "code_mod_permission requires a runtime",
         ));
     };
     // Port of erts/emulator/beam/erl_bif_info.c:5385-5400, OTP-29.1.1.
     if !acquire {
-        crate::natives::code::release_code_mod_permission(&runtime);
+        crate::natives::code::release_code_mod_permission(runtime);
     }
-    if !acquire || crate::natives::code::try_seize_code_mod_permission(&runtime, process, pid) {
+    if !acquire || crate::natives::code::try_seize_code_mod_permission(runtime, process, pid) {
         return Ok(HandlerResult::Done {
             value: Term::atom(global_atoms().intern("true").unwrap()),
             reductions: 1,

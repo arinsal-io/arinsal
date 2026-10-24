@@ -702,7 +702,7 @@ fn queue_remote_control(
         state.written = state.written.saturating_add(1);
         enqueue_port_output_no_suspend_locked(state, packets);
         drop(tables);
-        let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+        let runtime = process.runtime.ok_or_else(badarg)?;
         return flush_port_output(runtime, port_id);
     }
     state.queue_term(control, None).map_err(|_| badarg())?;
@@ -899,7 +899,7 @@ fn notify_auto_connect(
 ///
 /// Port of erts/emulator/beam/dist.c:2017 (erts_net_message), OTP-29.1.1.
 pub(crate) fn ingest_port_data(
-    runtime: &std::sync::Arc<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     port_id: u64,
     bytes: &[u8],
 ) -> Result<(), VmError> {
@@ -1120,7 +1120,7 @@ fn send_nodes_monitor_events(
 }
 
 fn route_incoming_port(
-    runtime: &std::sync::Arc<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     handle: u64,
     local: &str,
     mut terms: Vec<OwnedTerm>,
@@ -1704,7 +1704,7 @@ fn spawn_opts_want_link(options: &OwnedTerm) -> bool {
 
 /// Port DistCtrlr path for DOP_SPAWN_REQUEST (no Vm/Process context).
 fn handle_spawn_request_port(
-    runtime: &std::sync::Arc<crate::process::Runtime>,
+    runtime: &'static crate::process::Runtime,
     handle: u64,
     local: &str,
     parts: &[OwnedTerm],
@@ -2875,7 +2875,7 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
     };
     drv.schedule_dist_cmd(Box::new(move |op| {
         if op == arinsal_drv::port_task::SigOp::Exec {
-            dist_cmd(&task_runtime, port_id)
+            dist_cmd(task_runtime, port_id)
         } else {
             dist_cmd_done(port_id);
             0
@@ -2903,7 +2903,7 @@ const DIST_CMD_PACKETS: usize = 64;
 /// Port of erts/emulator/beam/dist.c (erts_dist_command, dist_port_commandv) and dist.c:4161-4178
 /// (drain queue and resume senders), OTP-29.1.1. Runs in the connection port's task with the
 /// port locked; returns its reductions.
-fn dist_cmd(runtime: &std::sync::Arc<crate::process::Runtime>, port_id: u64) -> i32 {
+fn dist_cmd(runtime: &crate::process::Runtime, port_id: u64) -> i32 {
     let mut written = 0usize;
     loop {
         if written >= DIST_CMD_PACKETS {
@@ -3014,7 +3014,7 @@ fn resume_dist_senders(runtime: &crate::process::Runtime, senders: Vec<Pid>) {
 /// Reconcile the inet port's busy state with the dist entry queue and resume senders.
 // Port of erts/emulator/beam/dist.c:4161-4178 (dist_port_command queue drain), OTP-29.1.1.
 pub(crate) fn distribution_port_state_changed(
-    runtime: &std::sync::Arc<crate::process::Runtime>,
+    runtime: &crate::process::Runtime,
     port_id: u64,
     port_busy: bool,
 ) {

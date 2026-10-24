@@ -793,10 +793,9 @@ fn event_patterns() -> &'static EventPatterns {
 }
 
 fn scope(process: &Process) -> usize {
-    process
-        .runtime
-        .as_ref()
-        .map_or(0, |runtime| std::sync::Arc::as_ptr(runtime) as usize)
+    process.runtime.as_ref().map_or(0, |runtime| {
+        *runtime as *const crate::process::Runtime as usize
+    })
 }
 
 fn scope_runtime(runtime: &crate::process::Runtime) -> usize {
@@ -3898,8 +3897,8 @@ fn emit_filtered_without_ctx(
             };
             if let Some(vm) = vm.as_deref_mut() {
                 emit_module(vm, process, None, module, state, event);
-            } else if let Some(runtime) = process.runtime.clone() {
-                crate::process::with_replica_vm(&runtime, |vm| {
+            } else if let Some(runtime) = process.runtime {
+                crate::process::with_replica_vm(runtime, |vm| {
                     emit_module(vm, process, None, module, state, event);
                 });
             }
@@ -4217,9 +4216,9 @@ fn deliver(
         };
         if let Some(vm) = vm {
             emit_module(vm, process, Some(ctx), module, state, event);
-        } else if let Some(runtime) = process.runtime.clone() {
+        } else if let Some(runtime) = process.runtime {
             // Receive tracing runs inside signal handling, which has no Vm of its own.
-            crate::process::with_replica_vm(&runtime, |vm| {
+            crate::process::with_replica_vm(runtime, |vm| {
                 emit_module(vm, process, Some(ctx), module, state, event);
             });
         }

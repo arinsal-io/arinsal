@@ -76,13 +76,12 @@ fn system_limit() -> VmError {
 }
 
 fn rt_ref(process: &Process) -> Option<&Runtime> {
-    process.runtime.as_deref()
+    process.runtime
 }
 
 fn runtime(process: &Process) -> Result<&Runtime, VmError> {
     process
         .runtime
-        .as_deref()
         .ok_or_else(|| VmError::Unsupported("process BIF requires a scheduler".into()))
 }
 
@@ -126,7 +125,7 @@ pub(crate) extern "C" fn whereis_light(
     let Some(name) = arg.as_atom() else {
         return whereis_not_atom(process, arg);
     };
-    let Some(rt) = process.runtime.as_deref() else {
+    let Some(rt) = process.runtime else {
         return whereis_no_runtime(process, arg);
     };
     let term = match rt.reg.whereis(name) {
@@ -801,10 +800,7 @@ pub(crate) fn start_timer_bif(
     } else {
         None
     };
-    let rt = process
-        .runtime
-        .as_deref()
-        .ok_or_else(|| badarg("timer/3"))?;
+    let rt = process.runtime.ok_or_else(|| badarg("timer/3"))?;
     // A dead pid gets a ref but no timer entry; an unresolved name can become registered
     // before its timer expires.
     let id = rt.next_ref();
@@ -819,7 +815,7 @@ pub(crate) fn start_timer_bif(
     let timer = if let Some(pid) = pid {
         sink.schedule_timer(pid, ms, message, wrapped)
     } else {
-        let runtime = process.runtime.clone().ok_or_else(|| badarg("timer/3"))?;
+        let runtime = process.runtime.ok_or_else(|| badarg("timer/3"))?;
         let name = registered_name.expect("resolved timer name");
         sink.schedule_resolved_timer(
             ms,
@@ -956,16 +952,6 @@ pub(crate) struct CreatedProcess {
     pub monitor: Option<u64>,
 }
 
-fn spawn_scheduler(
-    parent: &Process,
-) -> Result<&std::sync::Arc<arinsal_sched::Scheduler<Process>>, VmError> {
-    parent
-        .runtime
-        .as_deref()
-        .ok_or_else(|| VmError::Unsupported("spawn requires a scheduler".into()))?
-        .scheduler()
-}
-
 // Port of erts/emulator/beam/erl_process.c:12437 (erl_create_process), OTP-29.1.1. Every spawn
 // variant comes through here: the child starts at erlang:apply/3 with `mod`, `func` and `args`
 // in X0..X2, its links and monitors exist before it is inserted, and it is scheduled last.
@@ -985,17 +971,17 @@ pub(crate) fn erl_create_process(
     if arity > 1024 {
         return Err(badarg("erlang:spawn/3"));
     }
-    // The runtime is borrowed from the parent at each use: a clone is a refcount write on a
-    // line every scheduler shares.
-    spawn_scheduler(parent)?;
-    let defaults = crate::natives::sys::gc_spawn_defaults(parent.runtime.as_deref());
+    // Port of erts/emulator/beam/erl_process.c (erl_create_process: erts_get_runq), OTP-29.1.1:
+    // resolve the parent's run queue once and keep its non-owning runtime borrow through enqueue.
+    let runtime = parent
+        .runtime
+        .ok_or_else(|| VmError::Unsupported("spawn requires a scheduler".into()))?;
+    let scheduler = runtime.scheduler()?;
+    let defaults = crate::natives::sys::gc_spawn_defaults(Some(runtime));
     // Port of erts/emulator/beam/erl_process.c (erl_create_process: min_heap_size rounded up by
     // erts_next_heap_size), OTP-29.1.1.
-    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
-        parent.runtime.as_deref(),
-        so.min_heap,
-        false,
-    );
+    let min_heap =
+        crate::natives::sys::normalize_spawn_heap_minimum(Some(runtime), so.min_heap, false);
     // Port of erts/emulator/beam/erl_process.c (erl_create_process), OTP-29.1.1: the initial
     // heap holds the copied arguments and the reserved words, rounded up to a heap size, is
     // never smaller than the process's minimum heap, and is allocated once.
@@ -1020,11 +1006,7 @@ pub(crate) fn erl_create_process(
         if so.min_bin_vheap.is_some() && so.min_heap.is_none() && so.max_heap.is_none() {
             defaults.min_bin_vheap_size as usize
         } else {
-            crate::natives::sys::normalize_spawn_heap_minimum(
-                parent.runtime.as_deref(),
-                so.min_bin_vheap,
-                true,
-            )
+            crate::natives::sys::normalize_spawn_heap_minimum(Some(runtime), so.min_bin_vheap, true)
         };
     let group_leader = parent.group_leader_pid(ctx.pid());
     let parent_pid = ctx.pid();
@@ -1050,12 +1032,11 @@ pub(crate) fn erl_create_process(
         monitor_target = Some(target);
         monitor_origin = Some(origin);
     }
-    let runtime = parent.runtime.clone();
     // Port of erts/emulator/beam/erl_process.c (erl_create_process), OTP-29.1.1: alloc_process
     // takes the process struct and its table entry first, and the fields are then initialized
     // in place.
     let init_child = |child: &mut Process| -> Result<(), VmError> {
-        child.set_runtime(runtime);
+        child.set_runtime_with_min_bin_vheap_size(Some(runtime), min_bin_vheap as u64);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process initializes both
         // active and user priority from so->priority), OTP-29.1.1. The scheduler entry already
         // receives this priority; keep process_info/process_flag's process-side value aligned.
@@ -1072,7 +1053,6 @@ pub(crate) fn erl_create_process(
                 }),
             );
         }
-        child.heap.set_min_bin_vheap_size(min_bin_vheap as u64);
         let fullsweep_after = so.fullsweep.unwrap_or(defaults.fullsweep_after);
         child.heap.set_fullsweep_after(fullsweep_after);
         let max_heap = so.max_heap.unwrap_or(defaults.max_heap_size);
@@ -1129,7 +1109,7 @@ pub(crate) fn erl_create_process(
         }
         Ok(())
     };
-    let spawned = spawn_scheduler(parent)?
+    let spawned = scheduler
         .spawn_unscheduled_init(
             |slot: &mut std::mem::MaybeUninit<Process>| {
                 Process::write_spawn_registers_heap(slot, 3, 0, heap)
@@ -1222,7 +1202,7 @@ pub(crate) fn erl_create_process(
             parent.cold_mut().prio_monitors.insert(id);
         }
         if monitor.alias.is_some()
-            && let Some(rt) = parent.runtime.as_deref()
+            && let Some(rt) = parent.runtime
         {
             rt.alias_bind(id, Some(parent_pid));
         }
@@ -1244,7 +1224,7 @@ pub(crate) fn erl_create_process(
         if let Some(token) = seq_reply_token.take() {
             envelope.attach_seq_token(Box::new(token));
         }
-        spawn_scheduler(parent)?
+        scheduler
             .send(pid, parent_pid, envelope)
             .map_err(|error| VmError::Unsupported(format!("spawn_reply: {error}")))?;
     }
@@ -2818,7 +2798,7 @@ fn monitor_port(
     tag: Term,
     alias_mode: Option<crate::proc_create::AliasMode>,
 ) -> Result<Term, VmError> {
-    let runtime = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
+    let runtime = process.runtime.ok_or_else(|| badarg("monitor/2"))?;
     let reference_id = runtime.next_ref();
     let reference_term = reference(process, reference_id)?;
     if alias_mode.is_some() {
@@ -2949,7 +2929,7 @@ fn call_resolved(
             None,
         ),
         (SignalBif::SpawnOpt4, [module, function, args, options]) => {
-            spawn_options(process.runtime.as_deref(), *options).and_then(|opts| {
+            spawn_options(process.runtime, *options).and_then(|opts| {
                 opts.tuning.around(|| {
                     spawn_mfa_with_priority(
                         vm,
@@ -2973,12 +2953,7 @@ fn call_resolved(
             if name == arinsal_term::atoms::UNDEFINED {
                 return Err(badarg("register/2"));
             }
-            let rt = std::sync::Arc::clone(
-                process
-                    .runtime
-                    .as_ref()
-                    .ok_or_else(|| badarg("register/2"))?,
-            );
+            let rt = process.runtime.ok_or_else(|| badarg("register/2"))?;
             let scheduler = rt.scheduler()?;
             if let Some(pid) = Pid::from_term(*id) {
                 let mut table = rt.reg.write();
@@ -3024,7 +2999,7 @@ fn call_resolved(
                 handle.set_registered_atom(name);
                 drop(table);
                 crate::trace::emit_port_event(
-                    &rt,
+                    rt,
                     port_id,
                     crate::trace::PORTS,
                     "register",
@@ -3037,12 +3012,7 @@ fn call_resolved(
         }
         (SignalBif::Unregister1, [name]) => {
             let name = name.as_atom().ok_or_else(|| badarg("unregister/1"))?;
-            let rt = std::sync::Arc::clone(
-                process
-                    .runtime
-                    .as_ref()
-                    .ok_or_else(|| badarg("unregister/1"))?,
-            );
+            let rt = process.runtime.ok_or_else(|| badarg("unregister/1"))?;
             let mut table = rt.reg.write();
             match table.erase(name) {
                 Some(crate::register::RegId::Proc(pid)) => {
@@ -3065,7 +3035,7 @@ fn call_resolved(
                 Some(crate::register::RegId::Port(port_id)) => {
                     drop(table);
                     crate::trace::emit_port_event(
-                        &rt,
+                        rt,
                         port_id,
                         crate::trace::PORTS,
                         "unregister",
@@ -3140,7 +3110,7 @@ fn call_resolved(
             if *kind == atom("process") =>
         {
             let (tag, alias_mode, priority) = monitor_options(args)?;
-            let rt = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
+            let rt = process.runtime.ok_or_else(|| badarg("monitor/2"))?;
             // boot_loop1: code_server:call/1 monitors its registered name.
             // Port of erts/emulator/beam/bif.c:1100 (erts_internal_monitor? monitor_2/3
             // local arm), OTP-29.1.1: `Name` and `{Name, node()}` both monitor by name.
@@ -3231,7 +3201,7 @@ fn call_resolved(
             if *target != atom("clock_service") {
                 return Err(badarg("monitor/2"));
             }
-            let runtime = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
+            let runtime = process.runtime.ok_or_else(|| badarg("monitor/2"))?;
             let id = runtime.next_ref();
             reference(process, id)
         }
@@ -3638,7 +3608,7 @@ fn scope(process: &Process) -> usize {
     process
         .runtime
         .as_ref()
-        .map(|runtime| std::sync::Arc::as_ptr(runtime) as usize)
+        .map(|runtime| *runtime as *const crate::process::Runtime as usize)
         .unwrap_or(0)
 }
 
@@ -3646,7 +3616,7 @@ fn scope(process: &Process) -> usize {
 // Port of erts/emulator/beam/erl_nif.c:2323 (enif_is_process_alive: erts_proc_lookup),
 // OTP-29.1.1: erts removes an exiting process from the process table while its dirty NIF
 // still runs; this scheduler keeps the entry until the NIF returns, so exit start decides.
-pub(crate) fn has_begun_exit(runtime: &std::sync::Arc<crate::process::Runtime>, pid: Pid) -> bool {
+pub(crate) fn has_begun_exit(runtime: &crate::process::Runtime, pid: Pid) -> bool {
     proc_is_exiting_runtime(runtime, pid)
 }
 
@@ -4399,7 +4369,7 @@ fn send_noproc_down(
     // A named target is reported by name; the signal sender is then irrelevant.
     let from = target_pid.or_else(|| name.map(|_| ctx.pid()));
     if let Some(from) = from
-        && let Some(runtime) = process.runtime.clone()
+        && let Some(runtime) = process.runtime
     {
         let info = monitor_info_for(tag, name)?;
         let (origin, _target) = crate::proc_create::create_monitor(

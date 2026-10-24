@@ -245,6 +245,8 @@ pub struct Vm {
     paths: Vec<PathBuf>,
     /// The node's `erl_child_setup` process, started when scheduled execution begins.
     pub(crate) child_setup: Option<Arc<crate::child_setup::ChildSetup>>,
+    /// The node runtime has VM lifetime, like erts' process, port, and scheduler tables.
+    pub(crate) runtime: Option<&'static crate::process::Runtime>,
     pub(crate) statistics_origins: crate::natives::sys::StatisticsOrigins,
     pub(crate) otp_root: Option<PathBuf>,
     /// The code tables of `erts_active_code_ix()` this VM reads (see [`Vm::refresh_code`]).
@@ -339,6 +341,13 @@ fn cli_help_non_pollable_registration_fires_once() {
 impl Drop for Vm {
     fn drop(&mut self) {
         beamasm_integration::print_stats();
+        // Port of erts/emulator/beam/erl_init.c (erts_exit), OTP-29.1.1.
+        if !self.replica
+            && let Some(runtime) = self.runtime
+            && let Ok(scheduler) = runtime.scheduler()
+        {
+            scheduler.release();
+        }
         // Scheduler replicas share their node's scope; the node's own VM owns it.
         if !self.replica {
             beamasm_integration::release_code_scope(self.code_scope);

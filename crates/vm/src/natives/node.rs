@@ -480,7 +480,7 @@ fn halt(
         status,
         timeout,
         super::nif::notify_halt,
-        move |progress| crate::port::halt_reap_ports(&runtime, progress),
+        move |progress| crate::port::halt_reap_ports(runtime, progress),
         move |status| {
             super::nif::execute_late_on_halt();
             arinsal_drv::flush_async_exit();

@@ -333,7 +333,7 @@ fn resume_pending_lambda_callers(
     ctx: &mut RunCtx<'_, crate::process::Message>,
     pids: Vec<Pid>,
 ) {
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         return;
     };
     for pid in pids {
@@ -692,9 +692,9 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
 // OTP-29.1.1. Arinsal has only the code modification permission: no operation needs the
 // staging permission alone while another process holds the modification permission.
 fn seize_code_load_permission(process: &mut Process, pid: Option<Pid>) -> Result<(), VmError> {
-    let runtime = process.runtime.clone();
+    let runtime = process.runtime;
     match (runtime, pid) {
-        (Some(runtime), Some(pid)) if !try_seize_code_mod_permission(&runtime, process, pid) => {
+        (Some(runtime), Some(pid)) if !try_seize_code_mod_permission(runtime, process, pid) => {
             Err(VmError::Yield)
         }
         _ => Ok(()),
@@ -808,7 +808,7 @@ fn finish_stage(
                 prepared.release();
             }
             let mut staged = staged;
-            if let (Some(runtime), Some(pid), Some(ctx)) = (process.runtime.clone(), pid, ctx) {
+            if let (Some(runtime), Some(pid), Some(ctx)) = (process.runtime, pid, ctx) {
                 let ended = staged.ended.take();
                 let barrier_passed = Arc::new(AtomicBool::new(false));
                 staged.barrier_passed = Some(Arc::clone(&barrier_passed));
@@ -819,8 +819,8 @@ fn finish_stage(
                         ended.commit();
                     }
                     barrier_passed.store(true, Ordering::Release);
-                    release_code_mod_permission(&runtime);
-                    resume_suspended(&runtime, pid);
+                    release_code_mod_permission(runtime);
+                    resume_suspended(runtime, pid);
                 });
             } else {
                 process.cold_mut().finish_loading_commit = Some(Box::new(staged));
@@ -1617,14 +1617,14 @@ fn call_values(
             seize_code_load_permission(process, Some(ctx.pid()))?;
             match delete(vm, process, &name) {
                 Ok((result, Some(ended))) => {
-                    if let Some(runtime) = process.runtime.clone() {
+                    if let Some(runtime) = process.runtime {
                         let pid = ctx.pid();
                         process.cold_mut().delete_module_result = Some(result);
                         crate::suspend::suspend_self(process);
                         ctx.thread_progress_later(move || {
                             ended.commit();
-                            release_code_mod_permission(&runtime);
-                            resume_suspended(&runtime, pid);
+                            release_code_mod_permission(runtime);
+                            resume_suspended(runtime, pid);
                         });
                         Err(VmError::Yield)
                     } else {

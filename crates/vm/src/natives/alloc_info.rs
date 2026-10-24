@@ -123,7 +123,7 @@ fn request_allocators(
         };
         super::freeze_memory_sample(value("atom"), value("atom_used"), value("processes"));
     }
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?.clone();
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let target = ctx.pid();
     let names = names
         .iter()

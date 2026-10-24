@@ -772,6 +772,7 @@ impl Vm {
         Self {
             paths,
             child_setup: None,
+            runtime: None,
             statistics_origins: if replica {
                 crate::natives::sys::StatisticsOrigins::now()
             } else {

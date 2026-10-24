@@ -40,6 +40,7 @@ pub(crate) struct ChildSetup {
     control: Mutex<UnixStream>,
     pending: Arc<Mutex<Pending>>,
     helper: Mutex<Option<Child>>,
+    response_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Default)]
@@ -90,17 +91,28 @@ pub(crate) fn start() -> io::Result<Arc<ChildSetup>> {
     let helper = command.spawn()?;
     let pending = Arc::new(Mutex::new(Pending::default()));
     let response_pending = Arc::clone(&pending);
-    std::thread::Builder::new()
+    let response_thread = std::thread::Builder::new()
         .name("arinsal-child-setup-io".to_owned())
         .spawn(move || response_loop(read_stream, response_pending))?;
     Ok(Arc::new(ChildSetup {
         control: Mutex::new(parent),
         pending,
         helper: Mutex::new(Some(helper)),
+        response_thread: Mutex::new(Some(response_thread)),
     }))
 }
 
 impl ChildSetup {
+    pub(crate) fn shutdown(&self) {
+        let _ = self.control.lock().unwrap().shutdown(Shutdown::Write);
+        if let Some(mut helper) = self.helper.lock().unwrap().take() {
+            let _ = helper.wait();
+        }
+        if let Some(response_thread) = self.response_thread.lock().unwrap().take() {
+            let _ = response_thread.join();
+        }
+    }
+
     /// Launch a child through the persistent helper and complete the `Go`/`Ack` handshake.
     // Port of erts/emulator/sys/unix/sys_drivers.c (`spawn_start`), OTP-29.1.1.
     #[allow(clippy::too_many_arguments)]
@@ -231,14 +243,7 @@ impl ChildSetup {
 
 impl Drop for ChildSetup {
     fn drop(&mut self) {
-        if let Ok(control) = self.control.get_mut() {
-            let _ = control.shutdown(Shutdown::Write);
-        }
-        if let Ok(helper) = self.helper.get_mut()
-            && let Some(mut helper) = helper.take()
-        {
-            let _ = helper.wait();
-        }
+        self.shutdown();
     }
 }
 

@@ -1360,7 +1360,7 @@ fn insert_list(
     objects: Term,
 ) -> Result<Term, VmError> {
     const ITERATIONS_PER_RED: isize = 8;
-    let rt = process.runtime.clone().ok_or_else(badarg)?;
+    let rt = process.runtime.ok_or_else(badarg)?;
     let mut state = process
         .cold
         .as_mut()
@@ -1773,7 +1773,7 @@ fn help_busy_table(
             _ => return Ok(()),
         }
     };
-    let rt = process.runtime.clone().ok_or_else(badarg)?;
+    let rt = process.runtime.ok_or_else(badarg)?;
     let initial = ctx.remaining() as isize;
     let mut reds = initial;
     {
@@ -1815,7 +1815,7 @@ fn delete_or_clear(
     args: &[Term],
     caller: Term,
 ) -> Result<Term, VmError> {
-    let rt = process.runtime.clone().ok_or_else(badarg)?;
+    let rt = process.runtime.ok_or_else(badarg)?;
     let initial = ctx.remaining() as isize;
     let mut reds = initial;
     let mut state = process.cold.as_mut().and_then(|cold| cold.ets_free.take());
@@ -2096,7 +2096,7 @@ fn hash_select(
 ) -> Result<Option<Term>, VmError> {
     use arinsal_ets::{IterSafety, ScanPosition};
     let caller = caller_pid.to_term().ok_or_else(badarg)?;
-    let rt = process.runtime.clone().ok_or_else(badarg)?;
+    let rt = process.runtime.ok_or_else(badarg)?;
     let count = function == EtsBif::SelectCount;
     if ctx.is_none()
         && process
@@ -2318,7 +2318,7 @@ fn hash_select(
         Ok(cycle) => cycle,
         Err(error) => {
             if was_resumed && safety != IterSafety::Safe {
-                unfix_table(&rt, tid, caller);
+                unfix_table(rt, tid, caller);
             }
             return Err(err(error));
         }
@@ -2445,7 +2445,7 @@ fn hash_select(
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     if count {
         if unfix {
-            unfix_table(&rt, tid, caller);
+            unfix_table(rt, tid, caller);
         }
         return TermBuilder::new(&mut heap)
             .int_from_i128((got + cycle.counted) as i128)
@@ -2479,7 +2479,7 @@ fn hash_select(
         )?
     };
     if unfix {
-        unfix_table(&rt, tid, caller);
+        unfix_table(rt, tid, caller);
     }
     Ok(Some(result))
 }

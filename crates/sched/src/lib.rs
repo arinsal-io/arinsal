@@ -1357,37 +1357,42 @@ impl<T: Task> ProcessTable<T> {
             .ok_or(SpawnInitError::Table(Error::Capacity))?;
         let pid = Pid::from_data(data);
         let pix = self.ids.layout().data2pix(data) as usize;
-        let process = ProcRef::new_with(|| Process {
-            pid,
-            // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
-            // erts_current_interval_nob), OTP-29.1.1.
-            started_interval: self.interval.load(Ordering::Relaxed),
-            user_priority: AtomicU8::new(priority.index() as u8),
-            active: AtomicBool::new(true),
-            sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
-            run_epoch: AtomicU64::new(0),
-            bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
-            scheduler_id: AtomicUsize::new(0),
-            wait_epoch: AtomicU64::new(0),
-            timer_epoch_used: AtomicBool::new(false),
-            bif_timer_wheels: AtomicU64::new(0),
-            btm: parking_lot::Mutex::new(ProcBtm {
-                tree: std::collections::BTreeMap::new(),
-                paused: None,
-            }),
-            exit_flags: AtomicU32::new(0),
-            reg_atom: AtomicU32::new(u32::MAX),
-            wait_timer: AtomicU64::new(0),
-            input: Incoming::default(),
-            wait_timer_worker: AtomicUsize::new(0),
-            dirty: AtomicU8::new(0),
-            dirty_runner: AtomicUsize::new(0),
-            queued_prio: AtomicU8::new(0),
-            cell: parking_lot::Mutex::new(TaskCell::uninit()),
-        });
-        // alloc_process: the task is written straight into the allocated struct.
-        process.cell.lock().init_with(make);
-        let initialized = init(process.cell.lock().task_mut());
+        let (process, initialized) = ProcRef::new_with(
+            || Process {
+                pid,
+                // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
+                // erts_current_interval_nob), OTP-29.1.1.
+                started_interval: self.interval.load(Ordering::Relaxed),
+                user_priority: AtomicU8::new(priority.index() as u8),
+                active: AtomicBool::new(true),
+                sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
+                run_epoch: AtomicU64::new(0),
+                bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
+                scheduler_id: AtomicUsize::new(0),
+                wait_epoch: AtomicU64::new(0),
+                timer_epoch_used: AtomicBool::new(false),
+                bif_timer_wheels: AtomicU64::new(0),
+                btm: parking_lot::Mutex::new(ProcBtm {
+                    tree: std::collections::BTreeMap::new(),
+                    paused: None,
+                }),
+                exit_flags: AtomicU32::new(0),
+                reg_atom: AtomicU32::new(u32::MAX),
+                wait_timer: AtomicU64::new(0),
+                input: Incoming::default(),
+                wait_timer_worker: AtomicUsize::new(0),
+                dirty: AtomicU8::new(0),
+                dirty_runner: AtomicUsize::new(0),
+                queued_prio: AtomicU8::new(0),
+                cell: parking_lot::Mutex::new(TaskCell::uninit()),
+            },
+            |process| {
+                // alloc_process: the task is written straight into the allocated struct.
+                let cell = process.cell.get_mut();
+                cell.init_with(make);
+                init(cell.task_mut())
+            },
+        );
         if let Err(error) = initialized {
             drop(process);
             self.ids.release(data);

@@ -324,7 +324,7 @@ pub(crate) fn set_nosigpipe(fd: RawFd) {
 
 /// Install the driver state of a `tcp_inet` port (`tcp_inet_start` /
 /// `tcp_inet_copy` for `driver_create_port`).
-pub(crate) fn attach(runtime: &Arc<Runtime>, handle: &Arc<PortHandle>, port: &Arc<DriverPort>) {
+pub(crate) fn attach(runtime: &'static Runtime, handle: &Arc<PortHandle>, port: &Arc<DriverPort>) {
     let sock = Arc::new(Sock::new(handle.id(), runtime, handle, port));
     handle.set_tcp_driver_data(Arc::clone(&sock));
     port.start_native(sock);
@@ -340,10 +340,8 @@ fn tcp_inet_stop(sock: &Arc<Sock>) {
     // The port closed while owning a dist connection (its controller exited, e.g. through
     // `net_kernel:disconnect/1`): tear the connection down and deliver nodedown.
     // Port of erts/emulator/beam/dist.c (erts_do_net_exits via the dist port's exit), OTP-29.1.1.
-    if crate::node_tables::is_dist_port(id)
-        && let Some(runtime) = sock.runtime.upgrade()
-    {
-        let _ = crate::dist::port_connection_closed(&runtime, id);
+    if crate::node_tables::is_dist_port(id) {
+        let _ = crate::dist::port_connection_closed(sock.runtime, id);
     }
     let pending = {
         let mut inner = sock.inner.lock();
@@ -1209,7 +1207,7 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
     let name = listen.handle().port_name();
     let mut fd = Some(fd);
     // Port of erts/emulator/drivers/common/inet_drv.c:11829-11839 (tcp_inet_copy), OTP-29.1.1.
-    let created = crate::port::alloc_inet_port(&runtime, caller, name, driver(), |handle, port| {
+    let created = crate::port::alloc_inet_port(runtime, caller, name, driver(), |handle, port| {
         let fd = fd.take().expect("accepted descriptor");
         // Port of inet_drv.c:11795 (tcp_inet_copy), OTP-29.1.1.
         // `active` is not copied here; prim_inet:accept_opts sets it afterwards.
@@ -1240,7 +1238,7 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
                 ..Inner::default()
             }
         };
-        let sock = Arc::new(Sock::with_inner(handle.id(), &runtime, handle, born));
+        let sock = Arc::new(Sock::with_inner(handle.id(), runtime, handle, born));
         handle.set_tcp_driver_data(Arc::clone(&sock));
         port.start_native(sock);
     });
@@ -3029,7 +3027,7 @@ fn close_atom(inner: &Inner) -> &'static str {
 
 pub(crate) struct Sock {
     id: u64,
-    runtime: Weak<Runtime>,
+    runtime: &'static Runtime,
     handle: Weak<PortHandle>,
     port: Weak<DriverPort>,
     inner: Mutex<Inner>,
@@ -3050,7 +3048,7 @@ impl Sock {
 
     fn new(
         id: u64,
-        runtime: &Arc<Runtime>,
+        runtime: &'static Runtime,
         handle: &Arc<PortHandle>,
         port: &Arc<DriverPort>,
     ) -> Self {
@@ -3065,10 +3063,15 @@ impl Sock {
         )
     }
 
-    fn with_inner(id: u64, runtime: &Arc<Runtime>, handle: &Arc<PortHandle>, inner: Inner) -> Self {
+    fn with_inner(
+        id: u64,
+        runtime: &'static Runtime,
+        handle: &Arc<PortHandle>,
+        inner: Inner,
+    ) -> Self {
         Self {
             id,
-            runtime: Arc::downgrade(runtime),
+            runtime,
             handle: Arc::downgrade(handle),
             port: inner.port.clone(),
             inner: Mutex::new(inner),
@@ -3076,8 +3079,8 @@ impl Sock {
         }
     }
 
-    fn runtime(&self) -> Arc<Runtime> {
-        self.runtime.upgrade().expect("live inet port runtime")
+    fn runtime(&self) -> &'static Runtime {
+        self.runtime
     }
 
     fn handle(&self) -> Arc<PortHandle> {
@@ -3943,13 +3946,13 @@ fn output_message(sock: &Sock, out: Out) -> Option<(Pid, MessageNode)> {
     if let Out::PortData { bytes, .. } = &out
         && crate::node_tables::is_dist_port(sock.id)
     {
-        let _ = crate::dist::ingest_port_data(&sock.runtime(), sock.id, bytes);
+        let _ = crate::dist::ingest_port_data(sock.runtime(), sock.id, bytes);
         return None;
     }
     if let Out::TcpClosed { .. } = &out
         && crate::node_tables::is_dist_port(sock.id)
     {
-        let _ = crate::dist::port_connection_closed(&sock.runtime(), sock.id);
+        let _ = crate::dist::port_connection_closed(sock.runtime(), sock.id);
         // Still deliver tcp_closed to the connection ticker so it shuts down.
     }
     let out = match out {
@@ -4421,7 +4424,7 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     // Passive EOF is remembered; `{active, true}` must still emit `{tcp_closed,S}`.
     deliver_pending_close(sock);
     let busy = sock.inner.lock().busy;
-    crate::dist::distribution_port_state_changed(&sock.runtime(), sock.id, busy);
+    crate::dist::distribution_port_state_changed(sock.runtime(), sock.id, busy);
 }
 
 /// Write queued output once the poll set reports the connected socket writable.

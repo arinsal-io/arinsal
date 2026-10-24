@@ -276,7 +276,7 @@ fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError>
                 "fullsweep_after" => n.min(u16::MAX as i64),
                 "min_heap_size" => n.max(233),
                 "min_bin_vheap_size" => crate::natives::sys::normalize_spawn_heap_minimum(
-                    process.runtime.as_deref(),
+                    process.runtime,
                     Some(n as usize),
                     true,
                 ) as i64,
@@ -1773,7 +1773,7 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         let (function, arity) = module.function_at(process.ip).unwrap_or(("undefined", 0));
         return Ok((module.name.clone(), function.to_owned(), arity));
     }
-    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     runtime
         .with_modules(|modules| {
             let module = modules.get(process.module)?;
@@ -1822,7 +1822,7 @@ fn backtrace_text(vm: Option<&Vm>, process: &mut Process) -> Result<Vec<u8>, VmE
     match vm {
         Some(vm) => Ok(backtrace_with(&vm.code.modules, process)),
         None => {
-            let runtime = process.runtime.clone().ok_or_else(badarg)?;
+            let runtime = process.runtime.ok_or_else(badarg)?;
             Ok(runtime.with_modules(|modules| backtrace_with(modules, process)))
         }
     }
@@ -1978,7 +1978,7 @@ fn current_stacktrace(vm: Option<&Vm>, process: &mut Process) -> Result<Term, Vm
     if let Some(vm) = vm {
         return crate::stacktrace::build(&vm.code.modules, process, None, depth);
     }
-    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     runtime.with_modules(|modules| crate::stacktrace::build(modules, process, None, depth))
 }
 
@@ -3247,7 +3247,6 @@ fn hibernate(
     }
     let runtime = process
         .runtime
-        .clone()
         .ok_or_else(|| VmError::Unsupported("hibernate requires a scheduler".into()))?;
     // Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the
     // arguments stay in the argument registers (arity 3) as the only roots and the stack
@@ -3280,7 +3279,6 @@ fn hibernate_zero(
 ) -> Result<Term, VmError> {
     let runtime = process
         .runtime
-        .clone()
         .ok_or_else(|| VmError::Unsupported("hibernate requires a scheduler".into()))?;
     let pid = ctx.pid();
     if process
@@ -3518,12 +3516,11 @@ fn spawn_request(
     if module.as_atom().is_none() || function.as_atom().is_none() || list(args).is_none() {
         return Ok(atom("badarg"));
     }
-    let Some(parsed) = parse_spawn_options(process.runtime.as_deref(), options) else {
+    let Some(parsed) = parse_spawn_options(process.runtime, options) else {
         return Ok(atom("badopt"));
     };
     let runtime = process
         .runtime
-        .clone()
         .ok_or_else(|| VmError::Unsupported("spawn_request requires a scheduler".into()))?;
     let id = runtime.next_ref();
     let reference = crate::signals::reference(process, id)?;
@@ -3633,7 +3630,6 @@ fn dist_spawn_request(
     }
     let runtime = process
         .runtime
-        .clone()
         .ok_or_else(|| VmError::Unsupported("spawn_request requires a scheduler".into()))?;
     let id = runtime.next_ref();
     let reference = crate::signals::reference(process, id)?;
@@ -5223,7 +5219,7 @@ fn with_code_mod_permission(
     body: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, Message>) -> Result<Term, VmError>,
 ) -> Result<Term, VmError> {
     let pid = ctx.pid();
-    let runtime = process.runtime.clone();
+    let runtime = process.runtime;
     if let Some(finish) = process
         .cold
         .as_mut()
@@ -5271,13 +5267,13 @@ fn with_code_mod_permission(
 // suspended like erl_bif_trace.c:509-516 (trace_pattern) and resumed like :575-581
 // (smp_bp_finisher), OTP-29.1.1.
 fn suspend_for_code_barrier(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> bool {
-    let Some(runtime) = process.runtime.clone() else {
+    let Some(runtime) = process.runtime else {
         ctx.block_thread_progress(std::time::Duration::ZERO);
         return false;
     };
     let pid = ctx.pid();
     crate::suspend::suspend_self(process);
-    ctx.thread_progress_later(move || crate::natives::code::resume_suspended(&runtime, pid));
+    ctx.thread_progress_later(move || crate::natives::code::resume_suspended(runtime, pid));
     true
 }
 
