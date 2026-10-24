@@ -2483,6 +2483,38 @@ impl TrapBody for IolistSize {
     }
 }
 
+/// `term_to_binary/1,2` entered directly from the light-BIF fragment.
+pub(crate) struct TermToBinary;
+
+impl TrapBody for TermToBinary {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        _instruction: usize,
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        // Port of erts/emulator/beam/external.c:2450-2567 (`erts_term_to_binary_int`), OTP-29.1.1.
+        term_to_binary(process, args, None, pid, restore_gc)
+    }
+}
+
+/// `binary_to_term/1,2` entered directly from the light-BIF fragment.
+pub(crate) struct BinaryToTerm;
+
+impl TrapBody for BinaryToTerm {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        _instruction: usize,
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        // Port of erts/emulator/beam/external.c:1948-2156 (`binary_to_term_int`), OTP-29.1.1.
+        binary_to_term(process, args, None, pid, restore_gc)
+    }
+}
+
 /// Outcome of a trapping BIF run from a light BIF call.
 pub(crate) enum LightTrap {
     /// The BIF finished: its value or its error, like any light BIF's result.

@@ -1,5 +1,5 @@
-use arinsal_bifs::{Ctx, ProcessHeapHandle, lookup};
-use arinsal_term::{ProcessHeap, Term, TermBuilder};
+use arinsal_bifs::{Ctx, EncodeWalk, ProcessHeapHandle, lookup};
+use arinsal_term::{ProcessHeap, Term, TermBuilder, atoms, global_atoms};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -92,17 +92,27 @@ fn requested_scalar_cases() {
         ),
         ("1 KiB binary", binary, "binary:copy(<<16#5a>>,1024)"),
         ("local ref", local_ref, "make_ref()"),
+        ("local pid", Term::pid(1, 2).unwrap(), "self()"),
+        (
+            "local port",
+            Term::port(1).unwrap(),
+            "open_port({spawn, \"cat\"}, [])",
+        ),
         ("list of 100 ints", list, "lists:seq(0,99)"),
         ("nested tuple", nested_tuple, "{9,{0,{1,2}}}"),
     ];
     let encode = lookup("erlang", "term_to_binary", 1).unwrap();
+    let decode = lookup("erlang", "binary_to_term", 1).unwrap();
     let rounds = 100_000;
     for (label, term, otp_term) in cases {
+        if matches!(label, "local ref" | "local pid" | "local port") {
+            encoder_phases(label, term, rounds);
+        }
         let erlang_eval = format!(
-            "T={otp_term}, L=fun F(_,0)->ok; F(X,N)->term_to_binary(X),F(X,N-1) end, S=[begin A=erlang:monotonic_time(nanosecond),L(T,{rounds}),erlang:monotonic_time(nanosecond)-A end || _ <- lists:seq(1,5)], N=lists:sort([X/{rounds} || X <- S]), io:format(\"OTP ETF {label}: median ~.2f ns/op, min-max ~.2f-~.2f ns/op~n\", [lists:nth(3,N),hd(N),lists:last(N)]), halt()."
+            "T={otp_term}, B=term_to_binary(T), L=fun F(_,0)->ok; F(X,N)->term_to_binary(X),F(X,N-1) end, D=fun F(_,0)->ok; F(X,N)->binary_to_term(X),F(X,N-1) end, E=fun F(_,0)->ok; F(X,N)->F(X,N-1) end, L(T,{rounds}),D(B,{rounds}), S=[begin A=erlang:monotonic_time(nanosecond),L(T,{rounds}),erlang:monotonic_time(nanosecond)-A end || _ <- lists:seq(1,5)], ES=[begin A=erlang:monotonic_time(nanosecond),E(T,{rounds}),erlang:monotonic_time(nanosecond)-A end || _ <- lists:seq(1,5)], EN=lists:sort([X/{rounds} || X <- ES]), N=lists:sort([max(X/{rounds}-lists:nth(3,EN),0.0) || X <- S]), io:format(\"OTP ETF encode {label}: median ~.2f ns/op, min-max ~.2f-~.2f ns/op\", [lists:nth(3,N),hd(N),lists:last(N)]), S2=[begin A=erlang:monotonic_time(nanosecond),D(B,{rounds}),erlang:monotonic_time(nanosecond)-A end || _ <- lists:seq(1,5)], ES2=[begin A=erlang:monotonic_time(nanosecond),E(B,{rounds}),erlang:monotonic_time(nanosecond)-A end || _ <- lists:seq(1,5)], EN2=lists:sort([X/{rounds} || X <- ES2]), N2=lists:sort([max(X/{rounds}-lists:nth(3,EN2),0.0) || X <- S2]), io:format(\"~nOTP ETF decode {label}: median ~.2f ns/op, min-max ~.2f-~.2f ns/op~n\", [lists:nth(3,N2),hd(N2),lists:last(N2)]), halt()."
         );
         let otp = std::process::Command::new("timeout")
-            .args(["60", "erl", "-noshell", "-eval", &erlang_eval])
+            .args(["60", "erl", "+S", "1:1", "-noshell", "-eval", &erlang_eval])
             .output()
             .expect("run one-shot OTP benchmark");
         assert!(
@@ -127,9 +137,93 @@ fn requested_scalar_cases() {
             samples.push(started.elapsed().as_nanos() as f64 / rounds as f64);
         }
         samples.sort_by(f64::total_cmp);
+        let empty_started = Instant::now();
+        for _ in 0..rounds {
+            black_box(term);
+        }
+        let empty_ns = empty_started.elapsed().as_nanos() as f64 / rounds as f64;
         eprintln!(
             "ETF {label}: median {:.2} ns/op, min-max {:.2}-{:.2} ns/op ({rounds} rounds/sample)",
-            samples[2], samples[0], samples[4]
+            samples[2] - empty_ns,
+            samples[0] - empty_ns,
+            samples[4] - empty_ns
+        );
+        let mut encoded_heap = ProcessHeap::with_words(256);
+        let mut encoded_alloc = ProcessHeapHandle(&mut encoded_heap);
+        let encoded = encode(&mut Ctx::new(&mut encoded_alloc), &[term]).unwrap();
+        for _ in 0..10_000 {
+            let mut heap = ProcessHeap::with_words(256);
+            let mut alloc = ProcessHeapHandle(&mut heap);
+            black_box(decode(&mut Ctx::new(&mut alloc), &[encoded]).unwrap());
+        }
+        let mut samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let started = Instant::now();
+            for _ in 0..rounds {
+                let mut heap = ProcessHeap::with_words(256);
+                let mut alloc = ProcessHeapHandle(&mut heap);
+                black_box(decode(&mut Ctx::new(&mut alloc), &[encoded]).unwrap());
+            }
+            samples.push(started.elapsed().as_nanos() as f64 / rounds as f64);
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "ETF decode {label}: median {:.2} ns/op, min-max {:.2}-{:.2} ns/op ({rounds} rounds/sample)",
+            samples[2] - empty_ns,
+            samples[0] - empty_ns,
+            samples[4] - empty_ns
         );
     }
+}
+
+fn encoder_phases(label: &str, term: Term, rounds: usize) {
+    let node = global_atoms().get("nonode@nohost").unwrap_or(atoms::NONAME);
+    let setup = measure(rounds, || {
+        let mut encoder = EncodeWalk::new(&[term]).unwrap();
+        encoder.set_local_node(node, 0);
+        black_box(encoder);
+    });
+    let setup_size = measure(rounds, || {
+        let mut encoder = EncodeWalk::new(&[term]).unwrap();
+        encoder.set_local_node(node, 0);
+        encoder.step_size(usize::MAX).unwrap();
+        black_box(encoder);
+    });
+    let size = EncodeWalk::new(&[term]).unwrap();
+    let mut sized = size;
+    sized.set_local_node(node, 0);
+    sized.step_size(usize::MAX).unwrap();
+    let encoded_size = sized.encoded_size().unwrap();
+    let allocation = measure(rounds, || {
+        black_box(vec![0; encoded_size]);
+    });
+    let write_all = measure(rounds, || {
+        let mut encoder = EncodeWalk::new(&[term]).unwrap();
+        encoder.set_local_node(node, 0);
+        encoder.step_size(usize::MAX).unwrap();
+        let mut bytes = vec![0; encoded_size];
+        encoder.step_into(&mut bytes, usize::MAX).unwrap();
+        black_box(bytes);
+    });
+    eprintln!(
+        "ETF phases {label}: setup {setup:.2} ns/op, size+setup {:.2} ns/op (increment {:.2}), buffer alloc {allocation:.2}, encode+setup+size+alloc {write_all:.2}",
+        setup_size,
+        setup_size - setup
+    );
+}
+
+fn measure(rounds: usize, mut operation: impl FnMut()) -> f64 {
+    for _ in 0..10_000 {
+        operation();
+    }
+    let started = Instant::now();
+    for _ in 0..rounds {
+        operation();
+    }
+    let empty_started = Instant::now();
+    for _ in 0..rounds {
+        black_box(());
+    }
+    started.elapsed().as_nanos() as f64 / rounds as f64
+        - empty_started.elapsed().as_nanos() as f64 / rounds as f64
 }
