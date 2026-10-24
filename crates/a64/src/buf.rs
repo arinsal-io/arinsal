@@ -128,6 +128,10 @@ pub struct CodeBuffer {
     unreachable: bool,
     last_check: usize,
     binds: u64,
+    /// Lower bound of `site + reach` over the pending control branches without a veneer.
+    min_stub_deadline: Option<usize>,
+    /// Lower bound of the sites of the pending literal loads.
+    min_literal_site: Option<usize>,
 }
 
 impl CodeBuffer {
@@ -215,6 +219,11 @@ impl CodeBuffer {
                 .entry(label)
                 .or_default()
                 .push(self.fixups.len());
+            if kind.is_control() {
+                let deadline = site.saturating_add(kind.reach() as usize);
+                self.min_stub_deadline =
+                    Some(self.min_stub_deadline.map_or(deadline, |m| m.min(deadline)));
+            }
             self.fixups.push(Fixup {
                 site,
                 label,
@@ -279,7 +288,10 @@ impl CodeBuffer {
                 .find(|&&p| (p as i64 - site as i64).abs() < COND_RANGE - 16)
         }) {
             self.patch(site, BranchKind::Literal(reg), offset)?;
-        } else if let Some(pending) = self.literals.iter_mut().find(|l| l.value == value) {
+            return Ok(());
+        }
+        self.min_literal_site = Some(self.min_literal_site.map_or(site, |m| m.min(site)));
+        if let Some(pending) = self.literals.iter_mut().find(|l| l.value == value) {
             pending.sites.push((site, reg));
         } else {
             self.literals.push(Literal {
@@ -324,6 +336,19 @@ impl CodeBuffer {
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:816-900, OTP-29.1.1
     pub fn flush_pending_stubs(&mut self, range: usize) -> Result<(), BufferError> {
         let now = self.offset();
+        // Nothing is due while even the earliest deadline is out of reach (erts keeps the stubs
+        // ordered by deadline and looks at the first one).
+        let stub_due = self
+            .min_stub_deadline
+            .is_some_and(|deadline| deadline.saturating_sub(range) <= now);
+        let literal_due = self.min_literal_site.is_some_and(|site| {
+            site.saturating_add(COND_RANGE as usize)
+                .saturating_sub(range)
+                <= now
+        });
+        if !stub_due && !literal_due {
+            return Ok(());
+        }
         // Drop the resolved branches and renumber the waiting lists.
         if self.fixups.iter().any(|fixup| fixup.resolved) {
             self.fixups.retain(|fixup| !fixup.resolved);
@@ -352,6 +377,7 @@ impl CodeBuffer {
             })
         });
         if due_fixups.is_empty() && !due_literals {
+            self.recompute_stub_bounds();
             return Ok(());
         }
 
@@ -382,10 +408,27 @@ impl CodeBuffer {
                 .or_default()
                 .push(offset);
         }
+        self.recompute_stub_bounds();
         self.bind(after)?;
         let _ = jump_site;
         self.unreachable = false;
         Ok(())
+    }
+
+    /// Recomputes the lower bounds the early exit of [`flush_pending_stubs`](Self::flush_pending_stubs)
+    /// relies on from the pending branches and literals.
+    fn recompute_stub_bounds(&mut self) {
+        self.min_stub_deadline = self
+            .fixups
+            .iter()
+            .filter(|f| f.kind.is_control() && f.veneer.is_none() && !f.resolved)
+            .map(|f| f.site.saturating_add(f.kind.reach() as usize))
+            .min();
+        self.min_literal_site = self
+            .literals
+            .iter()
+            .flat_map(|l| l.sites.iter().map(|(site, _)| *site))
+            .min();
     }
 
     fn emit_veneer(&mut self, target: Label) -> Result<(), BufferError> {
