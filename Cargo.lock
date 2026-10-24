@@ -92,6 +92,7 @@ dependencies = [
  "arinsal-beam",
  "arinsal-etf",
  "arinsal-spec",
+ "smallvec",
 ]
 
 [[package]]

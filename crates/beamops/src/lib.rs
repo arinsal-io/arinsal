@@ -305,6 +305,9 @@ struct Rule {
     patterns: Vec<Pattern>,
     predicates: Vec<Predicate>,
     outputs: Vec<Output>,
+    /// The variables of the left-hand side in order of first binding: the variable slots of
+    /// the rule's program (erts `v0..vN` of the generated engine).
+    slot_names: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -319,6 +322,8 @@ struct PatArg {
     /// `ty` as a bit set over the type letters, tested against `type_bits` of the operand
     /// (erts `TOP_is_type`: `((1 << tag) & mask)`); `None` when the argument has no type.
     ty_mask: Option<u64>,
+    /// The slot of the variable this argument binds or compares with.
+    slot: Option<usize>,
     restriction: Option<Restriction>,
     eq: Option<i64>,
     eq_atom: Option<String>,
@@ -352,6 +357,21 @@ struct Output {
     op: &'static str,
     args: Vec<String>,
     function: bool,
+    /// `args` resolved against the slots of the rule, once.
+    resolved: Vec<OutArg>,
+}
+
+/// An argument of a generated instruction (erts `store_var`, `store_val`, `store_rest_args`).
+#[derive(Clone, Debug)]
+enum OutArg {
+    /// The value of a variable of the left-hand side.
+    Slot(usize),
+    /// A constant of the right-hand side.
+    Const(Operand),
+    /// `*` with no rest variable bound: the argument list gets nothing.
+    Nothing,
+    /// A token that is no variable and no constant: the rule cannot produce its output.
+    Invalid,
 }
 
 /// The rules whose first pattern is one generic opcode (erts `gen_transform` entry of that
@@ -574,15 +594,49 @@ fn parse_rule(lhs: &'static str, rhs: &'static str) -> Option<Rule> {
                 false,
             )
         };
-        outputs.push(Output { op, args, function });
+        outputs.push(Output {
+            op,
+            args,
+            function,
+            resolved: Vec::new(),
+        });
     }
     if patterns.is_empty() {
         return None;
+    }
+    // Compile the variables to slots (the numbering of `set_var`/`store_var` in the engine).
+    let mut slot_names: Vec<String> = Vec::new();
+    for pattern in &mut patterns {
+        for arg in &mut pattern.args {
+            if let Some(name) = &arg.name {
+                arg.slot = Some(match slot_names.iter().position(|known| known == name) {
+                    Some(slot) => slot,
+                    None => {
+                        slot_names.push(name.clone());
+                        slot_names.len() - 1
+                    }
+                });
+            }
+        }
+    }
+    for output in &mut outputs {
+        output.resolved = output
+            .args
+            .iter()
+            .map(
+                |token| match slot_names.iter().position(|name| name == token) {
+                    Some(slot) => OutArg::Slot(slot),
+                    None if token == "*" => OutArg::Nothing,
+                    None => output_constant(token).map_or(OutArg::Invalid, OutArg::Const),
+                },
+            )
+            .collect();
     }
     Some(Rule {
         patterns,
         predicates,
         outputs,
+        slot_names,
     })
 }
 
@@ -595,6 +649,7 @@ fn parse_pat_arg(token: &str) -> Option<PatArg> {
             name: Some("*".to_owned()),
             ty: None,
             ty_mask: None,
+            slot: None,
             restriction: None,
             eq: None,
             eq_atom: None,
@@ -641,6 +696,7 @@ fn parse_pat_arg(token: &str) -> Option<PatArg> {
             name: name.or_else(|| Some("*".to_owned())),
             ty: None,
             ty_mask: None,
+            slot: None,
             restriction: None,
             eq: None,
             eq_atom: None,
@@ -683,6 +739,7 @@ fn parse_pat_arg(token: &str) -> Option<PatArg> {
     Some(PatArg {
         name,
         ty_mask: ty.as_deref().map(type_mask),
+        slot: None,
         ty,
         restriction,
         eq,
@@ -794,6 +851,7 @@ impl std::ops::Deref for Bound<'_> {
 }
 
 type Bindings<'a> = Vec<(&'a str, Bound<'a>)>;
+type SlotVec<'a> = smallvec::SmallVec<[Option<Bound<'a>>; 8]>;
 
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn apply_rule(
@@ -806,7 +864,7 @@ fn apply_rule(
     if at + rule.patterns.len() > code.len() {
         return None;
     }
-    let mut bindings: Bindings<'_> = Vec::new();
+    let mut slots: SlotVec<'_> = (0..rule.slot_names.len()).map(|_| None).collect();
     for (pattern, instruction) in rule.patterns.iter().zip(&code[at..]) {
         if pattern.op != instruction.name {
             return None;
@@ -851,20 +909,19 @@ fn apply_rule(
             {
                 return None;
             }
-            if let Some(name) = &pat.name {
-                if let Some((_, previous)) = bindings.iter().find(|(key, _)| *key == name.as_str())
-                {
-                    if !operand_equal(previous, value) {
-                        return None;
+            if let Some(slot) = pat.slot {
+                match &slots[slot] {
+                    Some(previous) => {
+                        if !operand_equal(previous, value) {
+                            return None;
+                        }
                     }
-                } else {
-                    bindings.push((
-                        name.as_str(),
-                        match &expanded_args {
+                    None => {
+                        slots[slot] = Some(match &expanded_args {
                             std::borrow::Cow::Borrowed(args) => Bound::Ref(&args[index]),
                             std::borrow::Cow::Owned(_) => Bound::Owned(value.clone()),
-                        },
-                    ));
+                        });
+                    }
                 }
             }
         }
@@ -877,46 +934,54 @@ fn apply_rule(
             } else {
                 expanded_args[fixed..].to_vec()
             };
-            let name = pattern
-                .args
-                .last()
-                .and_then(|arg| arg.name.as_deref())
-                .unwrap_or("*");
-            bindings.push((name, Bound::Owned(Operand::List(values))));
+            // A rest variable named like an earlier one is shadowed by it, as the first
+            // binding of a name wins.
+            if let Some(slot) = pattern.args.last().and_then(|arg| arg.slot)
+                && slots[slot].is_none()
+            {
+                slots[slot] = Some(Bound::Owned(Operand::List(values)));
+            }
         }
     }
-    for pred in &rule.predicates {
-        if !eval_predicate(pred, &bindings, beam, instrument_line_breakpoints) {
-            return None;
+    if !rule.predicates.is_empty() {
+        let bindings: Bindings<'_> = rule
+            .slot_names
+            .iter()
+            .zip(&slots)
+            .filter_map(|(name, bound)| {
+                let bound = match bound.as_ref()? {
+                    Bound::Ref(operand) => Bound::Ref(operand),
+                    Bound::Owned(operand) => Bound::Owned(operand.clone()),
+                };
+                Some((name.as_str(), bound))
+            })
+            .collect();
+        for pred in &rule.predicates {
+            if !eval_predicate(pred, &bindings, beam, instrument_line_breakpoints) {
+                return None;
+            }
         }
     }
     let mut produced = Vec::new();
     for output in &rule.outputs {
         let mut args = Vec::new();
-        for token in &output.args {
-            if let Some((_, value)) = bindings.iter().find(|(name, _)| name == token) {
-                let value: &Operand = value;
-                if !output.function {
-                    if let Operand::List(rest) = value {
-                        args.extend(rest.clone());
+        for arg in &output.resolved {
+            match arg {
+                OutArg::Slot(slot) => {
+                    let value: &Operand = slots[*slot].as_deref()?;
+                    if !output.function {
+                        if let Operand::List(rest) = value {
+                            args.extend(rest.clone());
+                        } else {
+                            args.push(value.clone());
+                        }
                     } else {
                         args.push(value.clone());
                     }
-                } else {
-                    args.push(value.clone());
                 }
-            } else if token == "*" {
-                if let Some((_, Bound::Owned(Operand::List(rest)))) =
-                    bindings.iter().find(|(name, _)| *name == "*")
-                {
-                    if output.function {
-                        args.push(Operand::List(rest.clone()));
-                    } else {
-                        args.extend(rest.clone());
-                    }
-                }
-            } else {
-                args.push(output_constant(token)?);
+                OutArg::Const(value) => args.push(value.clone()),
+                OutArg::Nothing => {}
+                OutArg::Invalid => return None,
             }
         }
         // Ports of OTP-29.1.1 loader generators: beam/generators.tab:87,128,176,202
