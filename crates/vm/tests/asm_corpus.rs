@@ -532,7 +532,9 @@ fn beamasm_compile_time_per_module() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "beam"))
         .collect();
     files.sort();
-    files.truncate(200);
+    if std::env::var_os("ARINSAL_BENCH_ALL").is_none() {
+        files.truncate(200);
+    }
     let mut samples = Vec::new();
     let mut total_bytes = 0usize;
     let mut layout_hash = std::collections::hash_map::DefaultHasher::new();
