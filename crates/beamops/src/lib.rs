@@ -308,6 +308,36 @@ struct Rule {
     /// The variables of the left-hand side in order of first binding: the variable slots of
     /// the rule's program (erts `v0..vN` of the generated engine).
     slot_names: Vec<String>,
+    /// The left-hand side as a flat program, as `beam_makeops` compiles it (`gen_transform`).
+    program: Vec<Top>,
+}
+
+/// One step of a rule's match program: the `TOP_*` instructions of `beam_makeops`.
+#[derive(Clone, Debug)]
+enum Top {
+    /// `next_instr`: the next instruction must have this generic opcode and the arity the
+    /// pattern states (`fixed` operands, plus a rest list when `rest`); argument pointer back
+    /// to the first operand.
+    NextInstr {
+        op: &'static str,
+        fixed: usize,
+        rest: bool,
+    },
+    /// `is_type`: the operand's type bits meet the mask; `exact_x0` accepts x(0) for a pattern
+    /// `x=0`.
+    IsType { mask: Option<u64>, exact_x0: bool },
+    /// `is_eq`: the operand equals this integer.
+    IsEq(i64),
+    /// The operand is this atom.
+    IsAtom(String),
+    /// `is_bif`, `is_not_bif`, `is_func`: a restriction on an import operand.
+    Restriction(Restriction),
+    /// `set_var`: bind the operand to a slot, or compare it with the value already there.
+    SetVar(usize),
+    /// `next_arg`.
+    NextArg,
+    /// `rest_args`: bind the remaining operands as a list to a slot.
+    RestArgs { slot: Option<usize>, fixed: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -632,11 +662,47 @@ fn parse_rule(lhs: &'static str, rhs: &'static str) -> Option<Rule> {
             )
             .collect();
     }
+    let mut program = Vec::new();
+    for pattern in &patterns {
+        let rest = pattern.args.last().is_some_and(|arg| arg.rest);
+        let fixed = pattern.args.len() - usize::from(rest);
+        program.push(Top::NextInstr {
+            op: pattern.op,
+            fixed,
+            rest,
+        });
+        for arg in pattern.args.iter().take(fixed) {
+            program.push(Top::IsType {
+                mask: arg.ty_mask,
+                exact_x0: arg.ty.as_deref() == Some("x") && arg.eq == Some(0),
+            });
+            if let Some(n) = arg.eq {
+                program.push(Top::IsEq(n));
+            }
+            if let Some(atom) = &arg.eq_atom {
+                program.push(Top::IsAtom(atom.clone()));
+            }
+            if let Some(restriction) = &arg.restriction {
+                program.push(Top::Restriction(restriction.clone()));
+            }
+            if let Some(slot) = arg.slot {
+                program.push(Top::SetVar(slot));
+            }
+            program.push(Top::NextArg);
+        }
+        if rest {
+            program.push(Top::RestArgs {
+                slot: pattern.args.last().and_then(|arg| arg.slot),
+                fixed,
+            });
+        }
+    }
     Some(Rule {
         patterns,
         predicates,
         outputs,
         slot_names,
+        program,
     })
 }
 
@@ -853,6 +919,106 @@ impl std::ops::Deref for Bound<'_> {
 type Bindings<'a> = Vec<(&'a str, Bound<'a>)>;
 type SlotVec<'a> = smallvec::SmallVec<[Option<Bound<'a>>; 8]>;
 
+/// The transform engine for one rule: runs its match program over the instructions at `at`.
+// Port of the loop `beam_makeops` prints as `erts_transform_engine` (utils/beam_makeops
+// `gen_te_instr`), OTP-29.1.1: `next` is its `instr` advance, `ap` its argument pointer.
+fn run_program<'a>(
+    rule: &Rule,
+    code: &'a [Node],
+    at: usize,
+    beam: Option<&BeamFile>,
+    slots: &mut SlotVec<'a>,
+) -> bool {
+    use std::borrow::Cow;
+    let mut next = at;
+    let mut expanded: Cow<'a, [Operand]> = Cow::Borrowed(&[]);
+    let mut borrowed: Option<&'a [Operand]> = None;
+    let mut ap = 0;
+    for top in &rule.program {
+        match top {
+            Top::NextInstr { op, fixed, rest } => {
+                let instr = &code[next];
+                next += 1;
+                if *op != instr.name {
+                    return false;
+                }
+                // Most patterns match the operands as they are; only a rest list without its
+                // length operand needs a rewritten copy.
+                borrowed = Some(instr.args.as_slice());
+                expanded = Cow::Borrowed(instr.args.as_slice());
+                let expected = fixed + usize::from(*rest);
+                if expected == expanded.len() + 1
+                    && *rest
+                    && let Some(Operand::List(items)) = expanded.last()
+                {
+                    let length = Operand::U(items.len() as u64);
+                    let rest_index = expanded.len() - 1;
+                    expanded.to_mut().insert(rest_index, length);
+                    borrowed = None;
+                }
+                if expanded.len() < *fixed || (!*rest && expanded.len() != *fixed) {
+                    return false;
+                }
+                ap = 0;
+            }
+            Top::IsType { mask, exact_x0 } => {
+                let value = &expanded[ap];
+                let exact = *exact_x0 && register_index(value) == Some(('x', 0));
+                if !(mask.is_none_or(|mask| type_bits(value) & mask != 0) || exact) {
+                    return false;
+                }
+            }
+            Top::IsEq(n) => {
+                if operand_integer(&expanded[ap]) != Some(*n) {
+                    return false;
+                }
+            }
+            Top::IsAtom(atom) => {
+                if !operand_is_atom(&expanded[ap], atom, beam) {
+                    return false;
+                }
+            }
+            Top::Restriction(restriction) => {
+                if !restriction_matches(restriction, &expanded[ap], beam) {
+                    return false;
+                }
+            }
+            Top::SetVar(slot) => match &slots[*slot] {
+                Some(previous) => {
+                    if !operand_equal(previous, &expanded[ap]) {
+                        return false;
+                    }
+                }
+                None => {
+                    slots[*slot] = Some(match borrowed {
+                        Some(args) => Bound::Ref(&args[ap]),
+                        None => Bound::Owned(expanded[ap].clone()),
+                    });
+                }
+            },
+            Top::NextArg => ap += 1,
+            Top::RestArgs { slot, fixed } => {
+                let values = if expanded.len() == fixed + 1 {
+                    match &expanded[*fixed] {
+                        Operand::List(values) => values.clone(),
+                        value => vec![value.clone()],
+                    }
+                } else {
+                    expanded[*fixed..].to_vec()
+                };
+                // A rest variable named like an earlier one is shadowed by it, as the first
+                // binding of a name wins.
+                if let Some(slot) = slot
+                    && slots[*slot].is_none()
+                {
+                    slots[*slot] = Some(Bound::Owned(Operand::List(values)));
+                }
+            }
+        }
+    }
+    true
+}
+
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn apply_rule(
     rule: &Rule,
@@ -865,83 +1031,8 @@ fn apply_rule(
         return None;
     }
     let mut slots: SlotVec<'_> = (0..rule.slot_names.len()).map(|_| None).collect();
-    for (pattern, instruction) in rule.patterns.iter().zip(&code[at..]) {
-        if pattern.op != instruction.name {
-            return None;
-        }
-        // Most patterns match the operands as they are; only a rest list without its
-        // length operand needs a rewritten copy.
-        let mut expanded_args = std::borrow::Cow::Borrowed(instruction.args.as_slice());
-        let expected = pattern.args.len();
-        if expected == expanded_args.len() + 1
-            && pattern.args.last().is_some_and(|arg| arg.rest)
-            && let Some(Operand::List(rest)) = expanded_args.last()
-        {
-            let length = Operand::U(rest.len() as u64);
-            let rest_index = expanded_args.len() - 1;
-            expanded_args.to_mut().insert(rest_index, length);
-        }
-        let rest = pattern.args.last().is_some_and(|arg| arg.rest);
-        let fixed = pattern.args.len() - usize::from(rest);
-        if expanded_args.len() < fixed || (!rest && expanded_args.len() != fixed) {
-            return None;
-        }
-        for (index, (pat, value)) in pattern
-            .args
-            .iter()
-            .take(fixed)
-            .zip(expanded_args.iter())
-            .enumerate()
-        {
-            let exact_x0 = pat.ty.as_deref() == Some("x")
-                && pat.eq == Some(0)
-                && register_index(value) == Some(('x', 0));
-            if !(pat.ty_mask.is_none_or(|mask| type_bits(value) & mask != 0) || exact_x0)
-                || pat.eq.is_some_and(|n| operand_integer(value) != Some(n))
-                || pat
-                    .eq_atom
-                    .as_ref()
-                    .is_some_and(|atom| !operand_is_atom(value, atom, beam))
-                || pat
-                    .restriction
-                    .as_ref()
-                    .is_some_and(|restriction| !restriction_matches(restriction, value, beam))
-            {
-                return None;
-            }
-            if let Some(slot) = pat.slot {
-                match &slots[slot] {
-                    Some(previous) => {
-                        if !operand_equal(previous, value) {
-                            return None;
-                        }
-                    }
-                    None => {
-                        slots[slot] = Some(match &expanded_args {
-                            std::borrow::Cow::Borrowed(args) => Bound::Ref(&args[index]),
-                            std::borrow::Cow::Owned(_) => Bound::Owned(value.clone()),
-                        });
-                    }
-                }
-            }
-        }
-        if rest {
-            let values = if expanded_args.len() == fixed + 1 {
-                match &expanded_args[fixed] {
-                    Operand::List(values) => values.clone(),
-                    value => vec![value.clone()],
-                }
-            } else {
-                expanded_args[fixed..].to_vec()
-            };
-            // A rest variable named like an earlier one is shadowed by it, as the first
-            // binding of a name wins.
-            if let Some(slot) = pattern.args.last().and_then(|arg| arg.slot)
-                && slots[slot].is_none()
-            {
-                slots[slot] = Some(Bound::Owned(Operand::List(values)));
-            }
-        }
+    if !run_program(rule, code, at, beam, &mut slots) {
+        return None;
     }
     if !rule.predicates.is_empty() {
         let bindings: Bindings<'_> = rule
@@ -1899,16 +1990,6 @@ fn type_bits(value: &Operand) -> u64 {
             Operand::List(_) => letters("o"),
             Operand::Alloc(_) => 0,
         }
-}
-
-#[cfg(test)]
-fn type_matches(ty: Option<&str>, value: &Operand) -> bool {
-    ty.is_none_or(|types| {
-        (types.contains('x')
-            && types.contains('y')
-            && matches!(register_index(value), Some(('x' | 'y', _))))
-            || types.chars().any(|ty| type_matches_one(ty, value))
-    })
 }
 
 #[cfg(test)]
