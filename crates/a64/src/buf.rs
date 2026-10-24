@@ -26,6 +26,11 @@ impl Hasher for LabelHasher {
             self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
+    fn write_u64(&mut self, value: u64) {
+        // Literal values are addresses and constants with low zero bits: fold the high half down.
+        let hash = value.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = hash ^ (hash >> 32);
+    }
     fn write_u32(&mut self, value: u32) {
         self.0 = u64::from(value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
@@ -124,7 +129,7 @@ pub struct CodeBuffer {
     /// Indices into `fixups` of the unresolved branches to each label, in emission order.
     waiting: LabelMap<Vec<usize>>,
     literals: Vec<Literal>,
-    literal_sites: HashMap<u64, Vec<usize>>,
+    literal_sites: HashMap<u64, Vec<usize>, BuildHasherDefault<LabelHasher>>,
     unreachable: bool,
     last_check: usize,
     binds: u64,
