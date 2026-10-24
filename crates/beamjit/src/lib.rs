@@ -1871,9 +1871,36 @@ fn function_allowlist_contains(list: &str, name: &str, arity: u8) -> bool {
     })
 }
 
-fn ported_index() -> &'static std::collections::HashMap<&'static str, EmitterKind> {
-    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, EmitterKind>> =
-        std::sync::OnceLock::new();
+/// FNV-1a over an operation name: the index is read once per instruction, and SipHash costs more
+/// than the lookup is worth for a key of a dozen bytes.
+#[derive(Default, Clone, Copy)]
+struct OpNameHasher(u64);
+
+impl std::hash::Hasher for OpNameHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
+        for byte in bytes {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+}
+
+type PortedIndex = std::collections::HashMap<
+    &'static str,
+    EmitterKind,
+    std::hash::BuildHasherDefault<OpNameHasher>,
+>;
+
+fn ported_index() -> &'static PortedIndex {
+    static INDEX: std::sync::OnceLock<PortedIndex> = std::sync::OnceLock::new();
     INDEX.get_or_init(|| PORTED_OPS.iter().map(|op| (op.name, op.emitter)).collect())
 }
 
@@ -1883,8 +1910,9 @@ pub fn missing_ops(ops: &[SpecificOp]) -> Vec<String> {
     let mut missing = BTreeSet::new();
     let mut ordered = Vec::new();
     for op in ops {
-        if !known.contains_key(op.name()) && missing.insert(op.name().to_owned()) {
-            ordered.push(op.name().to_owned());
+        let name = op.name();
+        if !known.contains_key(name) && missing.insert(name) {
+            ordered.push(name.to_owned());
         }
     }
     ordered
