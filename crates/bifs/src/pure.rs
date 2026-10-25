@@ -505,6 +505,7 @@ pub(super) fn tuple_build(ctx: &mut Ctx<'_>, values: &[Term]) -> Term {
         .expect("infallible BIF heap")
 }
 
+#[inline(always)]
 fn hd(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/bif.c:2918-2930 (hd_1), OTP-29.1.1.
     // SAFETY: The input heap is live and stable.
@@ -513,6 +514,7 @@ fn hd(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
         None => ctx.badarg(),
     }
 }
+#[inline(always)]
 fn tl(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/bif.c:2931-2943 (tl_1), OTP-29.1.1.
     // SAFETY: The input heap is live and stable.
@@ -521,6 +523,7 @@ fn tl(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
         None => ctx.badarg(),
     }
 }
+#[inline(always)]
 fn element(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/bif.c:2944-2963 (element_2), OTP-29.1.1.
     let Some(index) = args[0].as_small().filter(|index| *index >= 1) else {
@@ -534,6 +537,7 @@ fn element(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
         None => ctx.badarg(),
     }
 }
+#[inline(always)]
 fn setelement(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/bif.c:2976-3003 (setelement_3), OTP-29.1.1:
     // one `HAlloc` of `arity + 1` words, `sys_memcpy` of the tuple, then the
@@ -853,6 +857,7 @@ fn time_unit(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     Ok(Term::small(1_000_000_000).expect("small time unit"))
 }
 
+#[inline(always)]
 fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/bif.c:3762-3777 (tuple_to_list_1), OTP-29.1.1.
     let Ok(values) = tuple_view(&args[0]) else {
