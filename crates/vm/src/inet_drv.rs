@@ -1157,10 +1157,12 @@ fn accept_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8]) 
 fn acceptor_exited(sock: &Arc<Sock>, monitor: u64) {
     {
         let mut inner = sock.inner.lock();
-        let (gone, keep): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut inner.accept_q)
+        let (gone, keep): (VecDeque<_>, VecDeque<_>) = inner
+            .accept_q
+            .take_all()
             .into_iter()
             .partition(|waiter| waiter.monitor == Some(monitor));
-        inner.accept_q = keep;
+        inner.accept_q = keep.into();
         for waiter in &gone {
             drop_pending(&mut inner, waiter.caller, waiter.aref);
         }
@@ -1976,7 +1978,10 @@ fn subscribe(inner: &mut Inner, caller: Pid, data: &[u8]) -> Vec<u8> {
         out.push(1);
         let queued = inner.sendq.size();
         if queued > 0 {
-            save_subscriber(&mut inner.empty_out_q_subs, caller);
+            save_subscriber(
+                inner.empty_out_q_subs.get_or_insert_with(Default::default),
+                caller,
+            );
         }
         put_u32(&mut out, queued as u32);
     }
@@ -2000,7 +2005,11 @@ fn send_empty_out_q_msgs(sock: &Sock) {
         if !inner.sendq.is_empty() {
             return;
         }
-        std::mem::take(&mut inner.empty_out_q_subs)
+        inner
+            .empty_out_q_subs
+            .take()
+            .map(|subs| *subs)
+            .unwrap_or_default()
     };
     for subscriber in subs {
         emit(sock, Out::EmptyOutQ { subscriber });
@@ -3169,6 +3178,43 @@ struct Recv {
     deadline: Option<Instant>,
 }
 
+/// The acceptors waiting on a listening socket: allocated by the first one, so a connected
+/// socket carries only the pointer (erts keeps `tcp_descriptor.inet.acceptor` as a list head).
+// Boxed on purpose: an empty `VecDeque` is 32 bytes of every connected socket, the pointer is 8.
+#[allow(clippy::box_collection)]
+#[derive(Default)]
+struct WaiterQueue(Option<Box<VecDeque<Waiter>>>);
+
+impl WaiterQueue {
+    fn push_back(&mut self, waiter: Waiter) {
+        self.0
+            .get_or_insert_with(Default::default)
+            .push_back(waiter);
+    }
+
+    fn pop_front(&mut self) -> Option<Waiter> {
+        self.0.as_mut()?.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.as_ref().is_none_or(|queue| queue.is_empty())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Waiter> {
+        self.0.iter().flat_map(|queue| queue.iter())
+    }
+
+    fn take_all(&mut self) -> VecDeque<Waiter> {
+        self.0.take().map(|queue| *queue).unwrap_or_default()
+    }
+}
+
+impl From<VecDeque<Waiter>> for WaiterQueue {
+    fn from(queue: VecDeque<Waiter>) -> Self {
+        Self((!queue.is_empty()).then(|| Box::new(queue)))
+    }
+}
+
 struct Inner {
     fd: Option<SockFd>,
     fd_external: Option<RawFd>,
@@ -3229,11 +3275,13 @@ struct Inner {
     // Port of inet_drv.c (`i_buf`, `i_ptr_start`, `i_ptr`, `i_bufsz`), OTP-29.1.1.
     rbuf_end: usize,
     sendq: IoQueue,
-    empty_out_q_subs: Vec<Pid>,
+    // Boxed on purpose: the pointer is 8 bytes where an empty `Vec` is 24.
+    #[allow(clippy::box_collection)]
+    empty_out_q_subs: Option<Box<Vec<Pid>>>,
     /// `Some` while TCP_ADDF_SENDFILE is set.
     sendfile: Option<Box<Sendfile>>,
     recv: Option<Recv>,
-    accept_q: VecDeque<Waiter>,
+    accept_q: WaiterQueue,
     connect: Option<Box<Waiter>>,
     pending: Vec<(Pid, u16)>,
     busy: bool,
@@ -3325,10 +3373,10 @@ impl Default for Inner {
             rbuf_start: 0,
             rbuf_end: 0,
             sendq: IoQueue::default(),
-            empty_out_q_subs: Vec::new(),
+            empty_out_q_subs: None,
             sendfile: None,
             recv: None,
-            accept_q: VecDeque::new(),
+            accept_q: WaiterQueue::default(),
             connect: None,
             pending: Vec::new(),
             busy: false,
@@ -5449,7 +5497,7 @@ fn expire(sock: &Arc<Sock>) {
                 keep.push_back(waiter);
             }
         }
-        inner.accept_q = keep;
+        inner.accept_q = keep.into();
         if let Some(recv) = inner.recv.as_ref()
             && recv.deadline.is_some_and(|at| at <= now)
         {

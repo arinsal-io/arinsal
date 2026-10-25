@@ -310,7 +310,7 @@ impl DriverPort {
     }
 
     fn bpq_enabled(&self) -> bool {
-        self.msgq_limits.lock().enabled
+        self.msgq_limits().enabled
     }
 
     // Port of erts/emulator/beam/erl_port_task.c:646 (check_unset_busy_port_q), OTP-29.1.1.
@@ -319,7 +319,7 @@ impl DriverPort {
         {
             let mut inq = self.sched.queues();
             let qsize = self.sched.bpq_size.load(Ordering::Acquire);
-            let low = self.msgq_limits.lock().low;
+            let low = self.msgq_limits().low;
             if qsize < low {
                 let old = self
                     .sched
@@ -353,7 +353,7 @@ impl DriverPort {
         if flags & (PTS_FLG_CHK_UNSET_BUSY_PORT_Q | PTS_FLG_BUSY_PORT_Q) != PTS_FLG_BUSY_PORT_Q {
             return;
         }
-        if qsz < self.msgq_limits.lock().low {
+        if qsz < self.msgq_limits().low {
             self.sched.or(PTS_FLG_CHK_UNSET_BUSY_PORT_Q);
         }
     }
@@ -372,7 +372,7 @@ impl DriverPort {
         if flags & PTS_FLG_BUSY_PORT_Q == 0 {
             return;
         }
-        if qsz < self.msgq_limits.lock().low {
+        if qsz < self.msgq_limits().low {
             self.check_unset_busy_port_q(flags);
         }
     }
@@ -383,7 +383,7 @@ impl DriverPort {
             return flags;
         }
         let qsz = self.sched.bpq_size.fetch_add(size, Ordering::AcqRel) + size;
-        let limits = *self.msgq_limits.lock();
+        let limits = self.msgq_limits();
         if flags & PTS_FLG_BUSY_PORT_Q == 0 && qsz > limits.high {
             flags = self.sched.or(PTS_FLG_BUSY_PORT_Q) | PTS_FLG_BUSY_PORT_Q;
             if self.sched.bpq_size.load(Ordering::Acquire) < limits.low {
