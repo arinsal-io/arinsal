@@ -38,8 +38,12 @@ pub enum SpecificOperand {
     BigInt(Box<String>),
     /// Variable-length operand sequence.
     List(Box<Vec<SpecificOperand>>),
+    /// A variable-length operand sequence stored in a transform arena.
+    ArenaList(ArenaSlice),
     /// Allocation descriptor list.
     Allocations(Box<Vec<(u8, u64)>>),
+    /// Allocation descriptors stored in a transform arena.
+    ArenaAllocations(ArenaSlice),
     /// Operand forms without a specific BeamAsm representation yet.
     Other,
     /// A register operand with the compiler's `Type` chunk entry (`{tr, Reg, Type}`); only
@@ -50,6 +54,173 @@ pub enum SpecificOperand {
         /// Index into the module's `Type` chunk.
         type_index: u32,
     },
+}
+
+/// Range into an arena-owned operand slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaSlice {
+    /// First item in the owning arena's list storage.
+    pub start: u32,
+    /// Number of items in this list.
+    pub len: u32,
+}
+
+impl ArenaSlice {
+    fn from_range(start: usize, len: usize) -> Self {
+        Self {
+            start: u32::try_from(start).expect("BEAM operand arena index exceeds u32"),
+            len: u32::try_from(len).expect("BEAM operand list exceeds u32 items"),
+        }
+    }
+}
+
+/// Range of transformed operations belonging to one function or module preamble.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FunctionOps {
+    /// First operation in the arena's flat operation buffer.
+    pub start: usize,
+    /// Number of operations in this range.
+    pub len: usize,
+}
+
+/// Reusable storage for generic ops, transformed operations, and variable operands.
+///
+/// Keep one arena for a compile stream so released generic nodes can be reused by later
+/// rewrites and modules without allocating one object per operation.
+#[derive(Default)]
+pub struct TransformArena {
+    node_blocks: Vec<Box<[NodeSlot; 32]>>,
+    node_count: usize,
+    free_head: Option<usize>,
+    specific_ops: Vec<SpecificOp>,
+    lists: Vec<SpecificOperand>,
+    allocations: Vec<(u8, u64)>,
+    functions: Vec<FunctionOps>,
+}
+
+impl TransformArena {
+    /// Creates an empty reusable transformation arena.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a function's specific operations without copying its operation vector.
+    pub fn ops(&self, function: FunctionOps) -> &[SpecificOp] {
+        &self.specific_ops[function.start..function.start + function.len]
+    }
+
+    /// Returns the number of function ranges in the most recently transformed module.
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
+    }
+
+    /// Returns one function's range in the most recently transformed module.
+    pub fn function_range(&self, index: usize) -> FunctionOps {
+        self.functions[index]
+    }
+
+    /// Resolves a list operand stored in this arena.
+    pub fn list(&self, slice: ArenaSlice) -> &[SpecificOperand] {
+        let start = slice.start as usize;
+        &self.lists[start..start + slice.len as usize]
+    }
+
+    /// Resolves allocation descriptors stored in this arena.
+    pub fn allocation_list(&self, slice: ArenaSlice) -> &[(u8, u64)] {
+        let start = slice.start as usize;
+        &self.allocations[start..start + slice.len as usize]
+    }
+
+    fn reset(&mut self) {
+        self.specific_ops.clear();
+        self.lists.clear();
+        self.allocations.clear();
+        self.functions.clear();
+        self.free_head = None;
+        for index in (0..self.node_count).rev() {
+            let next_free = self.free_head;
+            let slot = self.slot_mut(index);
+            slot.node = None;
+            slot.next = next_free;
+            self.free_head = Some(index);
+        }
+    }
+
+    // Port of erts/emulator/beam/beam_file.c:beamopallocator_expand__, OTP-29.1.1.
+    fn expand(&mut self) {
+        let block_index = self.node_blocks.len();
+        let mut block = Box::new(std::array::from_fn(|_| NodeSlot {
+            node: None,
+            next: None,
+        }));
+        let first = self.node_count;
+        for slot_index in (0..32).rev() {
+            let index = first + slot_index;
+            block[slot_index].next = if slot_index == 31 {
+                self.free_head
+            } else {
+                Some(index + 1)
+            };
+        }
+        self.free_head = Some(first);
+        self.node_count += 32;
+        self.node_blocks.push(block);
+        debug_assert_eq!(block_index + 1, self.node_blocks.len());
+    }
+
+    fn slot(&self, index: usize) -> &NodeSlot {
+        &self.node_blocks[index / 32][index % 32]
+    }
+
+    fn slot_mut(&mut self, index: usize) -> &mut NodeSlot {
+        &mut self.node_blocks[index / 32][index % 32]
+    }
+
+    // Port of erts/emulator/beam/beam_file.h:beamopallocator_new_op, OTP-29.1.1.
+    fn allocate(&mut self, node: Node, next: Option<usize>) -> usize {
+        if self.free_head.is_none() {
+            self.expand();
+        }
+        if let Some(index) = self.free_head {
+            self.free_head = self.next(index);
+            let slot = self.slot_mut(index);
+            slot.node = Some(node);
+            slot.next = next;
+            index
+        } else {
+            unreachable!("expansion supplies free GenOp nodes")
+        }
+    }
+
+    // Port of erts/emulator/beam/beam_file.h:beamopallocator_free_op, OTP-29.1.1.
+    fn release(&mut self, index: usize) {
+        let next_free = self.free_head;
+        let slot = self.slot_mut(index);
+        slot.node = None;
+        slot.next = next_free;
+        self.free_head = Some(index);
+    }
+
+    fn node(&self, index: usize) -> &Node {
+        self.slot(index).node.as_ref().expect("live GenOp node")
+    }
+
+    fn node_mut(&mut self, index: usize) -> &mut Node {
+        self.slot_mut(index).node.as_mut().expect("live GenOp node")
+    }
+
+    fn next(&self, index: usize) -> Option<usize> {
+        self.slot(index).next
+    }
+
+    fn set_next(&mut self, index: usize, next: Option<usize>) {
+        self.slot_mut(index).next = next;
+    }
+}
+
+struct NodeSlot {
+    node: Option<Node>,
+    next: Option<usize>,
 }
 
 /// Operations whose operands keep their `Type` chunk entry in the typed transform.
@@ -94,12 +265,7 @@ pub fn transform_module_with_line_breakpoints(
     beam: &BeamFile,
     instrument_line_breakpoints: bool,
 ) -> Vec<Vec<SpecificOp>> {
-    split_functions(transform_with_options(
-        &beam.code.instructions,
-        Some(beam),
-        instrument_line_breakpoints,
-        false,
-    ))
+    materialize_module(beam, instrument_line_breakpoints, false)
 }
 
 /// Like [`transform_module_with_line_breakpoints`], but arithmetic operations keep the
@@ -108,27 +274,24 @@ pub fn transform_module_typed(
     beam: &BeamFile,
     instrument_line_breakpoints: bool,
 ) -> Vec<Vec<SpecificOp>> {
-    split_functions(transform_with_options(
+    materialize_module(beam, instrument_line_breakpoints, true)
+}
+
+/// Rewrites a module into reusable arena storage and returns its flat function ranges.
+// Port of erts/emulator/beam/beam_load.c:load_code and utils/beam_makeops:erts_transform_engine,
+// OTP-29.1.1.
+pub fn transform_module_typed_in_arena(
+    beam: &BeamFile,
+    instrument_line_breakpoints: bool,
+    arena: &mut TransformArena,
+) {
+    transform_into_arena(
         &beam.code.instructions,
         Some(beam),
         instrument_line_breakpoints,
         true,
-    ))
-}
-
-fn split_functions(transformed: Vec<SpecificOp>) -> Vec<Vec<SpecificOp>> {
-    let mut functions = Vec::new();
-    let mut current = Vec::new();
-    for op in transformed {
-        if op.name() == "i_func_label" && !current.is_empty() {
-            functions.push(std::mem::take(&mut current));
-        }
-        current.push(op);
-    }
-    if !current.is_empty() {
-        functions.push(current);
-    }
-    functions
+        arena,
+    );
 }
 
 fn transform_with_options(
@@ -137,104 +300,195 @@ fn transform_with_options(
     instrument_line_breakpoints: bool,
     typed: bool,
 ) -> Vec<SpecificOp> {
-    let rules = rules();
-    let raw = instructions
+    let mut arena = TransformArena::new();
+    transform_into_arena(
+        instructions,
+        beam,
+        instrument_line_breakpoints,
+        typed,
+        &mut arena,
+    );
+    arena
+        .specific_ops
         .iter()
-        .map(|instruction| Node {
-            name: instruction.op.name(),
-            args: instruction.args.iter().map(allocation_as_words).collect(),
-            offset: instruction.offset,
-        })
-        .collect::<Vec<_>>();
-    let mut code = inject_function_starts(raw);
-    // OTP rules are ordered, greedy peephole rewrites. Like erts' loader (beam_load.c,
-    // transform_engine), generated instructions are put back in front of the remaining
-    // stream and retried, so a rewrite costs only its own instructions and one pass over the
-    // code is the whole transformation. (A second pass found nothing to rewrite in any of the
-    // 1934 modules of the OTP and Elixir corpus.)
-    {
-        let mut out = Vec::with_capacity(code.len());
-        // The stream the rules see: the nodes put back by a rewrite, then as many of the
-        // remaining ones as the current opcode's widest pattern needs. They move out of the
-        // code, nothing is copied.
-        let mut queue: std::collections::VecDeque<Node> = std::collections::VecDeque::new();
-        let mut index = 0;
-        loop {
-            if queue.is_empty() {
-                let Some(node) = code.get_mut(index) else {
-                    break;
-                };
-                queue.push_back(std::mem::replace(node, Node::empty()));
-                index += 1;
-            }
-            // One lookup by generic opcode per step: its rules and the window they need.
-            let bucket = rules.get(queue[0].name);
-            let need = bucket.map_or(1, |bucket| bucket.width);
-            while queue.len() < need && index < code.len() {
-                queue.push_back(std::mem::replace(&mut code[index], Node::empty()));
-                index += 1;
-            }
-            let stream = queue.make_contiguous();
-            let mut replacement = None;
-            for rule in bucket.into_iter().flat_map(|bucket| &bucket.rules) {
-                if let Some((consumed, produced)) =
-                    apply_rule(rule, stream, 0, beam, instrument_line_breakpoints)
-                {
-                    replacement = Some((consumed, produced));
-                    break;
-                }
-            }
-            let Some((consumed, produced)) = replacement else {
-                out.extend(queue.pop_front());
-                continue;
-            };
-            let is_unchanged = consumed == produced.len()
-                && stream[..consumed]
-                    .iter()
-                    .zip(&produced)
-                    .all(|(old, new)| node_equal(old, new));
-            let same_opcode = consumed == 1
-                && produced.len() == 1
-                && stream[0].name == produced[0].name
-                && stream[0].args.len() == produced[0].args.len();
-            queue.drain(..consumed);
-            let mut produced = produced.into_iter();
-            if (same_opcode || is_unchanged)
-                && let Some(first) = produced.next()
-            {
-                out.push(first);
-            }
-            for node in produced.rev() {
-                queue.push_front(node);
-            }
-        }
-        code = out;
-    }
-    code.iter()
-        .map(|instruction| {
-            if instruction.name == "has_map_fields" {
-                map_fields_to_elements(instruction)
-            } else {
-                let convert = if typed && TYPED_OPS.contains(&instruction.name) {
-                    typed_operand
-                } else {
-                    operand
-                };
-                make_op(
-                    instruction.name,
-                    instruction.args.iter().map(convert).collect(),
-                )
-            }
+        .map(|op| materialize_op(&arena, op))
+        .collect()
+}
+
+fn materialize_module(
+    beam: &BeamFile,
+    instrument_line_breakpoints: bool,
+    typed: bool,
+) -> Vec<Vec<SpecificOp>> {
+    let mut arena = TransformArena::new();
+    transform_into_arena(
+        &beam.code.instructions,
+        Some(beam),
+        instrument_line_breakpoints,
+        typed,
+        &mut arena,
+    );
+    arena
+        .functions
+        .iter()
+        .map(|range| {
+            arena
+                .ops(*range)
+                .iter()
+                .map(|op| materialize_op(&arena, op))
+                .collect()
         })
         .collect()
 }
 
+fn materialize_op(arena: &TransformArena, op: &SpecificOp) -> SpecificOp {
+    let args = op
+        .operands()
+        .iter()
+        .map(|operand| materialize_operand(arena, operand))
+        .collect();
+    SpecificOp::from_name(op.name(), args)
+}
+
+fn materialize_operand(arena: &TransformArena, value: &SpecificOperand) -> SpecificOperand {
+    match value {
+        SpecificOperand::ArenaList(slice) => SpecificOperand::List(Box::new(
+            arena
+                .list(*slice)
+                .iter()
+                .map(|value| materialize_operand(arena, value))
+                .collect(),
+        )),
+        SpecificOperand::ArenaAllocations(slice) => {
+            SpecificOperand::Allocations(Box::new(arena.allocation_list(*slice).to_vec()))
+        }
+        SpecificOperand::Typed { reg, type_index } => SpecificOperand::Typed {
+            reg: Box::new(materialize_operand(arena, reg)),
+            type_index: *type_index,
+        },
+        _ => value.clone(),
+    }
+}
+
+// Port of erts/emulator/beam/beam_load.c:load_code and
+// erts/emulator/utils/beam_makeops:erts_transform_engine, OTP-29.1.1.
+fn transform_into_arena(
+    instructions: &[Instr],
+    beam: Option<&BeamFile>,
+    instrument_line_breakpoints: bool,
+    typed: bool,
+    arena: &mut TransformArena,
+) {
+    arena.reset();
+    let mut head = None;
+    let mut tail = None;
+    for instruction in instructions {
+        let node = Node {
+            name: instruction.op.name(),
+            args: instruction.args.iter().map(allocation_as_words).collect(),
+            offset: instruction.offset,
+        };
+        let index = arena.allocate(node, None);
+        if let Some(previous) = tail {
+            arena.set_next(previous, Some(index));
+        } else {
+            head = Some(index);
+        }
+        tail = Some(index);
+    }
+    head = inject_function_starts(arena, head);
+    add_function_end_nodes(arena, &mut head);
+    let mut cursor = head;
+    let mut previous = None;
+    let rules = rules();
+    while let Some(index) = cursor {
+        let bucket = rules.get(arena.node(index).name);
+        let width = bucket.map_or(1, |bucket| bucket.width);
+        let mut ids = SmallVec::<[usize; 8]>::new();
+        let mut scan = Some(index);
+        while ids.len() < width {
+            let Some(id) = scan else { break };
+            ids.push(id);
+            scan = arena.next(id);
+        }
+        let window = ids
+            .iter()
+            .map(|id| arena.node(*id))
+            .collect::<SmallVec<[&Node; 8]>>();
+        let mut replacement = None;
+        for rule in bucket.into_iter().flat_map(|bucket| &bucket.rules) {
+            if let Some((consumed, produced)) =
+                apply_rule(rule, &window, 0, beam, instrument_line_breakpoints)
+            {
+                replacement = Some((consumed, produced));
+                break;
+            }
+        }
+        let Some((consumed, produced)) = replacement else {
+            previous = Some(index);
+            cursor = arena.next(index);
+            continue;
+        };
+        let consumed_ids = &ids[..consumed];
+        let after = arena.next(*consumed_ids.last().expect("a rule consumes an op"));
+        let unchanged = consumed == produced.len()
+            && window[..consumed]
+                .iter()
+                .zip(&produced)
+                .all(|(old, new)| node_equal(old, new));
+        let same_opcode = consumed == 1
+            && produced.len() == 1
+            && window[0].name == produced[0].name
+            && window[0].args.len() == produced[0].args.len();
+        drop(window);
+        let stable_first = same_opcode || unchanged;
+        let output_len = produced.len();
+        let mut output_ids = SmallVec::<[usize; 8]>::new();
+        let mut produced = produced.into_iter();
+        for id in consumed_ids.iter().take(output_len) {
+            let node = produced.next().expect("output count matches iterator");
+            arena.slot_mut(*id).node = Some(node);
+            output_ids.push(*id);
+        }
+        for node in produced {
+            let id = arena.allocate(node, None);
+            output_ids.push(id);
+        }
+        for id in consumed_ids.iter().skip(output_len) {
+            arena.release(*id);
+        }
+        for pair in output_ids.windows(2) {
+            arena.set_next(pair[0], Some(pair[1]));
+        }
+        if let Some(last) = output_ids.last() {
+            arena.set_next(*last, after);
+        }
+        let replacement_head = output_ids.first().copied().or(after);
+        if let Some(previous) = previous {
+            arena.set_next(previous, replacement_head);
+        } else {
+            head = replacement_head;
+        }
+        if stable_first && !output_ids.is_empty() {
+            previous = Some(output_ids[0]);
+            cursor = arena.next(output_ids[0]);
+        } else {
+            cursor = output_ids.first().copied().or(after);
+        }
+    }
+    collect_specific_ops(arena, head, typed);
+}
+
 // Port of erts/emulator/beam/generators.tab:230-254, OTP-29.1.1.
-fn map_fields_to_elements(instruction: &Node) -> SpecificOp {
+fn map_fields_to_elements(instruction: &Node, arena: &mut TransformArena) -> SpecificOp {
     let [fail, source, size, rest @ ..] = instruction.args.as_slice() else {
-        return make_op(
+        return SpecificOp::from_name(
             instruction.name,
-            instruction.args.iter().map(operand).collect(),
+            instruction
+                .args
+                .iter()
+                .map(|value| operand_in_arena(arena, value, false))
+                .collect(),
         );
     };
     let keys = match rest {
@@ -242,59 +496,56 @@ fn map_fields_to_elements(instruction: &Node) -> SpecificOp {
         keys => keys,
     };
     let Some(count) = operand_integer(size).and_then(|count| usize::try_from(count).ok()) else {
-        return make_op(
+        return SpecificOp::from_name(
             instruction.name,
-            instruction.args.iter().map(operand).collect(),
+            instruction
+                .args
+                .iter()
+                .map(|value| operand_in_arena(arena, value, false))
+                .collect(),
         );
     };
     if keys.len() != count {
-        return make_op(
+        return SpecificOp::from_name(
             instruction.name,
-            instruction.args.iter().map(operand).collect(),
+            instruction
+                .args
+                .iter()
+                .map(|value| operand_in_arena(arena, value, false))
+                .collect(),
         );
     }
     if keys.len() == 1 && matches!(keys[0], Operand::X(_) | Operand::Y(_)) {
         // Port of erts/emulator/beam/jit/arm/ops.tab:1188-1190 and
         // erts/emulator/beam/jit/arm/generators.tab:176-198 (one-key lookup),
         // OTP-29.1.1. The ignored destination makes this the guard `is_map_key/2` path.
-        return make_op(
-            "i_get_map_element",
-            vec![
-                operand(fail),
-                operand(source),
-                operand(&keys[0]),
-                SpecificOperand::X(1023),
-            ],
-        );
+        let mut args = SmallVec::<[SpecificOperand; 4]>::new();
+        args.push(operand_in_arena(arena, fail, false));
+        args.push(operand_in_arena(arena, source, false));
+        args.push(operand_in_arena(arena, &keys[0], false));
+        args.push(SpecificOperand::X(1023));
+        return SpecificOp::from_name("i_get_map_element", args);
     }
-    let mut args = Vec::with_capacity(3 + count * 2);
-    args.push(operand(fail));
-    args.push(operand(source));
+    let mut args = SmallVec::<[SpecificOperand; 4]>::new();
+    args.reserve(3 + count * 2);
+    args.push(operand_in_arena(arena, fail, false));
+    args.push(operand_in_arena(arena, source, false));
     args.push(SpecificOperand::Unsigned((count * 2) as u64));
     for key in keys {
-        args.push(operand(key));
+        args.push(operand_in_arena(arena, key, false));
         args.push(SpecificOperand::X(1023));
     }
-    make_op("get_map_elements", args)
+    SpecificOp::from_name("get_map_elements", args)
 }
 
 #[derive(Clone, Debug)]
 struct Node {
     /// Generic or specific opcode mnemonic. Static, as in the loader's opcode table.
     name: &'static str,
-    args: SmallVec<[Operand; 4]>,
+    // Port of BeamOp::def_args[ERTS_BEAM_MAX_OPARGS], beam_file.h:268; generated ops with
+    // more than eight operands spill into a growable buffer like BeamOp::a.
+    args: SmallVec<[Operand; 8]>,
     offset: usize,
-}
-
-impl Node {
-    // A moved-out stream slot.
-    fn empty() -> Self {
-        Self {
-            name: "",
-            args: SmallVec::new(),
-            offset: 0,
-        }
-    }
 }
 
 fn node_equal(a: &Node, b: &Node) -> bool {
@@ -429,70 +680,100 @@ fn rules() -> &'static OpcodeMap {
 }
 
 // Port of erts/emulator/beam/beam_file.c:2493-2580 (beamcodereader_next), OTP-29.1.1.
-fn inject_function_starts(raw: Vec<Node>) -> Vec<Node> {
-    let mut code = Vec::with_capacity(raw.len() + raw.len() / 20);
-    let mut index = 0;
-    while index < raw.len() {
-        let line_index = index + 1;
-        let func_info_index = if raw.get(line_index).is_some_and(|node| node.name == "line") {
-            line_index + 1
-        } else {
-            line_index
-        };
-        if raw.get(index).is_some_and(|node| node.name == "label")
-            && raw
-                .get(func_info_index)
-                .is_some_and(|node| node.name == "func_info")
-            && raw[index].args.len() == 1
-            && raw
-                .get(line_index)
-                .is_none_or(|node| node.name != "line" || node.args.len() == 1)
-            && raw[func_info_index].args.len() == 3
-        {
-            let mut args = raw[index].args.clone();
-            if func_info_index == line_index {
-                args.push(Operand::Nil);
+fn inject_function_starts(arena: &mut TransformArena, head: Option<usize>) -> Option<usize> {
+    let mut cursor = head;
+    while let Some(index) = cursor {
+        let line = arena.next(index);
+        let function_info = line
+            .filter(|id| arena.node(*id).name == "line")
+            .map_or(line, |id| arena.next(id));
+        let matches = arena.node(index).name == "label"
+            && function_info.is_some_and(|id| arena.node(id).name == "func_info")
+            && arena.node(index).args.len() == 1
+            && line
+                .is_none_or(|id| arena.node(id).name != "line" || arena.node(id).args.len() == 1)
+            && function_info.is_some_and(|id| arena.node(id).args.len() == 3);
+        if matches {
+            let info = function_info.expect("matched func_info");
+            let has_line = line.is_some_and(|id| arena.node(id).name == "line");
+            let next = arena.next(info);
+            let offset = arena.node(index).offset;
+            let mut args = std::mem::take(&mut arena.node_mut(index).args);
+            if has_line {
+                args.extend(std::mem::take(&mut arena.node_mut(line.unwrap()).args));
             } else {
-                args.extend(raw[line_index].args.clone());
+                args.push(Operand::Nil);
             }
-            args.extend(raw[func_info_index].args.clone());
-            code.push(Node {
-                name: "int_func_start",
-                args,
-                offset: raw[index].offset,
-            });
-            index = func_info_index + 1;
+            args.extend(std::mem::take(&mut arena.node_mut(info).args));
+            let node = arena.node_mut(index);
+            node.name = "int_func_start";
+            node.args = args;
+            node.offset = offset;
+            arena.set_next(index, next);
+            if has_line {
+                arena.release(line.unwrap());
+            }
+            arena.release(info);
+            cursor = next;
         } else {
-            code.push(raw[index].clone());
-            index += 1;
+            cursor = arena.next(index);
         }
     }
-    let mut with_ends = Vec::with_capacity(code.len() + code.len() / 20);
+    head
+}
+
+// Port of erts/emulator/beam/beam_load.c:load_code, OTP-29.1.1.
+fn add_function_end_nodes(arena: &mut TransformArena, head: &mut Option<usize>) {
+    let mut previous = None;
+    let mut cursor = *head;
     let mut current_function = None;
     let mut entry_label = None;
-    for node in code {
-        if node.name == "int_func_start" {
+    while let Some(index) = cursor {
+        let is_start = arena.node(index).name == "int_func_start";
+        if is_start {
             if let (Some(function), Some(entry)) = (current_function.take(), entry_label.take()) {
-                with_ends.push(Node {
-                    name: "int_func_end",
-                    args: vec![function, entry].into(),
-                    offset: node.offset,
-                });
+                let offset = arena.node(index).offset;
+                let end = arena.allocate(
+                    Node {
+                        name: "int_func_end",
+                        args: smallvec::smallvec![function, entry],
+                        offset,
+                    },
+                    Some(index),
+                );
+                if let Some(previous) = previous {
+                    arena.set_next(previous, Some(end));
+                } else {
+                    *head = Some(end);
+                }
             }
-            current_function = node.args.first().cloned();
-        } else if current_function.is_some() && entry_label.is_none() && node.name == "label" {
-            entry_label = node.args.first().cloned();
+            current_function = arena.node(index).args.first().cloned();
+            entry_label = None;
+        } else if current_function.is_some()
+            && entry_label.is_none()
+            && arena.node(index).name == "label"
+        {
+            entry_label = arena.node(index).args.first().cloned();
         }
-        with_ends.push(node);
+        previous = Some(index);
+        cursor = arena.next(index);
     }
     if let (Some(function), Some(entry)) = (current_function, entry_label) {
-        with_ends.push(Node {
-            name: "int_func_end",
-            args: vec![function, entry].into(),
-            offset: with_ends.last().map_or(0, |node| node.offset),
-        });
+        let offset = previous.map_or(0, |index| arena.node(index).offset);
+        let end = arena.allocate(
+            Node {
+                name: "int_func_end",
+                args: smallvec::smallvec![function, entry],
+                offset,
+            },
+            None,
+        );
+        if let Some(previous) = previous {
+            arena.set_next(previous, Some(end));
+        } else {
+            *head = Some(end);
+        }
     }
-    with_ends
 }
 
 fn import_mfa<'a>(value: &Operand, beam: &'a BeamFile) -> Option<(&'a str, &'a str, u32)> {
@@ -581,14 +862,14 @@ type Bindings<'a> = smallvec::SmallVec<[(&'a str, Bound<'a>); 8]>;
 type SlotVec<'a> = smallvec::SmallVec<[Option<Bound<'a>>; 8]>;
 
 /// The match function of a rule: the generated straight-line form of its program.
-type MatchFn = for<'a> fn(&'a [Node], usize, Option<&BeamFile>, &mut SlotVec<'a>) -> bool;
+type MatchFn = for<'a> fn(&'a [&'a Node], usize, Option<&BeamFile>, &mut SlotVec<'a>) -> bool;
 
 /// Match state of the generated engine: `instr` and the argument pointer of
 /// `erts_transform_engine`, one method per `TOP_*` step.
 // Port of the code `beam_makeops` prints for each step (utils/beam_makeops `gen_te_instr`),
 // OTP-29.1.1.
 struct Frame<'a> {
-    code: &'a [Node],
+    code: &'a [&'a Node],
     next: usize,
     expanded: std::borrow::Cow<'a, [Operand]>,
     borrowed: Option<&'a [Operand]>,
@@ -597,7 +878,7 @@ struct Frame<'a> {
 
 impl<'a> Frame<'a> {
     #[inline(always)]
-    fn new(code: &'a [Node], at: usize) -> Self {
+    fn new(code: &'a [&'a Node], at: usize) -> Self {
         Frame {
             code,
             next: at,
@@ -704,12 +985,12 @@ impl<'a> Frame<'a> {
 include!(concat!(env!("OUT_DIR"), "/matchers.rs"));
 
 /// The instructions one rule application generates: one or two in nearly every rule.
-type Produced = smallvec::SmallVec<[Node; 2]>;
+type Produced = smallvec::SmallVec<[Node; 8]>;
 
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn apply_rule(
     rule: &Rule,
-    code: &[Node],
+    code: &[&Node],
     at: usize,
     beam: Option<&BeamFile>,
     instrument_line_breakpoints: bool,
@@ -742,7 +1023,7 @@ fn apply_rule(
     }
     let mut produced = Produced::new();
     for output in &rule.outputs {
-        let mut args = SmallVec::<[Operand; 4]>::new();
+        let mut args = SmallVec::<[Operand; 8]>::new();
         for arg in &output.resolved {
             match arg {
                 OutArg::Slot(slot) => {
@@ -772,13 +1053,12 @@ fn apply_rule(
                 }
                 produced.push(Node {
                     name: "i_bs_get_utf16",
-                    args: vec![
+                    args: smallvec::smallvec![
                         args[1].clone(),
                         args[0].clone(),
                         args[2].clone(),
                         args[3].clone(),
-                    ]
-                    .into(),
+                    ],
                     offset: code[at].offset,
                 });
             }
@@ -788,7 +1068,7 @@ fn apply_rule(
                 }
                 produced.push(Node {
                     name: "i_bs_skip_utf16",
-                    args: vec![args[1].clone(), args[0].clone(), args[2].clone()].into(),
+                    args: smallvec::smallvec![args[1].clone(), args[0].clone(), args[2].clone()],
                     offset: code[at].offset,
                 });
             }
@@ -802,7 +1082,7 @@ fn apply_rule(
                 let value = rest.first()?;
                 produced.push(Node {
                     name: "move",
-                    args: vec![Operand::Nil, value.clone()].into(),
+                    args: smallvec::smallvec![Operand::Nil, value.clone()],
                     offset: code[at].offset,
                 });
             }
@@ -814,7 +1094,8 @@ fn apply_rule(
                 let Operand::List(rest) = &args[3] else {
                     return None;
                 };
-                let mut specific_args = vec![args[0].clone(), args[1].clone(), args[2].clone()];
+                let mut specific_args =
+                    smallvec::smallvec![args[0].clone(), args[1].clone(), args[2].clone(),];
                 specific_args.extend(rest.iter().cloned());
                 produced.push(Node {
                     name: if pairs <= 10 {
@@ -822,7 +1103,7 @@ fn apply_rule(
                     } else {
                         "i_select_val_bins"
                     },
-                    args: specific_args.into(),
+                    args: specific_args,
                     offset: code[at].offset,
                 });
             }
@@ -833,11 +1114,12 @@ fn apply_rule(
                 let Operand::List(rest) = &args[3] else {
                     return None;
                 };
-                let mut specific_args = vec![args[0].clone(), args[1].clone(), args[2].clone()];
+                let mut specific_args =
+                    smallvec::smallvec![args[0].clone(), args[1].clone(), args[2].clone(),];
                 specific_args.extend(rest.iter().cloned());
                 produced.push(Node {
                     name: "i_select_tuple_arity",
-                    args: specific_args.into(),
+                    args: specific_args,
                     offset: code[at].offset,
                 });
             }
@@ -851,7 +1133,7 @@ fn apply_rule(
                 let min = rest.iter().step_by(2).filter_map(operand_integer).min()?;
                 let max = rest.iter().step_by(2).filter_map(operand_integer).max()?;
                 let table_size = usize::try_from(max.checked_sub(min)?.checked_add(1)?).ok()?;
-                let mut specific_args = vec![
+                let mut specific_args = smallvec::smallvec![
                     args[0].clone(),
                     args[1].clone(),
                     Operand::U(min as u64),
@@ -868,7 +1150,7 @@ fn apply_rule(
                 }
                 produced.push(Node {
                     name: "i_jump_on_val",
-                    args: specific_args.into(),
+                    args: specific_args,
                     offset: code[at].offset,
                 });
             }
@@ -882,13 +1164,17 @@ fn apply_rule(
                 for pair in rest.chunks_exact(2) {
                     produced.push(Node {
                         name: "is_ne_exact",
-                        args: vec![pair[1].clone(), args[0].clone(), pair[0].clone()].into(),
+                        args: smallvec::smallvec![
+                            pair[1].clone(),
+                            args[0].clone(),
+                            pair[0].clone()
+                        ],
                         offset: code[at].offset,
                     });
                 }
                 produced.push(Node {
                     name: "jump",
-                    args: vec![args[1].clone()].into(),
+                    args: smallvec::smallvec![args[1].clone()],
                     offset: code[at].offset,
                 });
             }
@@ -905,27 +1191,30 @@ fn apply_rule(
                 if size < 2 || size % 2 != 0 || rest.len() != size {
                     return None;
                 }
-                let mut small_values = Vec::new();
-                let mut literal_values = Vec::new();
+                let mut small_values = SmallVec::<[Operand; 8]>::new();
+                let mut literal_values = SmallVec::<[Operand; 8]>::new();
                 for pair in rest.chunks_exact(2) {
                     let values = if is_literal_integer(&pair[0]) {
                         &mut literal_values
                     } else {
                         &mut small_values
                     };
-                    values.extend_from_slice(pair);
+                    values.extend(pair.iter().cloned());
                 }
 
                 produced.push(Node {
                     name: "is_integer",
-                    args: vec![args[1].clone(), args[0].clone()].into(),
+                    args: smallvec::smallvec![args[1].clone(), args[0].clone()],
                     offset: code[at].offset,
                 });
 
                 let small_size = small_values.len();
                 let small_count = small_size / 2;
-                let mut small_args =
-                    vec![args[0].clone(), Operand::Nil, Operand::U(small_size as u64)];
+                let mut small_args = smallvec::smallvec![
+                    args[0].clone(),
+                    Operand::Nil,
+                    Operand::U(small_size as u64),
+                ];
                 small_args.extend(small_values);
                 produced.push(Node {
                     name: if small_count <= 10 {
@@ -933,7 +1222,7 @@ fn apply_rule(
                     } else {
                         "i_select_val_bins"
                     },
-                    args: small_args.into(),
+                    args: small_args,
                     offset: code[at].offset,
                 });
 
@@ -941,20 +1230,24 @@ fn apply_rule(
                 if literal_count == 0 {
                     produced.push(Node {
                         name: "i_select_val_lins",
-                        args: vec![args[0].clone(), args[2].clone(), Operand::U(0)].into(),
+                        args: smallvec::smallvec![args[0].clone(), args[2].clone(), Operand::U(0)],
                         offset: code[at].offset,
                     });
                 } else {
                     for pair in literal_values.chunks_exact(2) {
                         produced.push(Node {
                             name: "is_ne_exact",
-                            args: vec![pair[1].clone(), args[0].clone(), pair[0].clone()].into(),
+                            args: smallvec::smallvec![
+                                pair[1].clone(),
+                                args[0].clone(),
+                                pair[0].clone()
+                            ],
                             offset: code[at].offset,
                         });
                     }
                     produced.push(Node {
                         name: "jump",
-                        args: vec![args[2].clone()].into(),
+                        args: smallvec::smallvec![args[2].clone()],
                         offset: code[at].offset,
                     });
                 }
@@ -966,11 +1259,11 @@ fn apply_rule(
                 let Operand::List(rest) = &args[3] else {
                     return None;
                 };
-                let mut specific_args = vec![args[0].clone(), args[1].clone()];
+                let mut specific_args = smallvec::smallvec![args[0].clone(), args[1].clone()];
                 specific_args.extend(rest.iter().cloned());
                 produced.push(Node {
                     name: "i_bs_match",
-                    args: specific_args.into(),
+                    args: specific_args,
                     offset: code[at].offset,
                 });
             }
@@ -981,11 +1274,12 @@ fn apply_rule(
                 let Operand::List(rest) = &args[3] else {
                     return None;
                 };
-                let mut specific_args = vec![args[0].clone(), args[1].clone(), args[2].clone()];
+                let mut specific_args =
+                    smallvec::smallvec![args[0].clone(), args[1].clone(), args[2].clone()];
                 specific_args.extend(rest.iter().cloned());
                 produced.push(Node {
                     name: "i_new_small_map_lit",
-                    args: specific_args.into(),
+                    args: specific_args,
                     offset: code[at].offset,
                 });
             }
@@ -1006,14 +1300,14 @@ fn apply_rule(
                         .and_then(|position| u32::try_from(position + 1).ok())
                 };
                 let mut alloc = args[1].clone();
-                let mut specific_args = vec![
+                let mut specific_args = smallvec::smallvec![
                     args[0].clone(),
                     args[1].clone(),
                     args[2].clone(),
                     args[4].clone(),
                 ];
                 for segment in segments.chunks_exact(6) {
-                    let mut segment = segment.to_vec();
+                    let mut segment = segment.iter().cloned().collect::<SmallVec<[Operand; 8]>>();
                     // Translate the flags list to the BSF_* bit mask (ARM is little endian).
                     let mut flags = 0u64;
                     if let Operand::Literal(index) = &segment[3]
@@ -1058,7 +1352,7 @@ fn apply_rule(
                 {
                     produced.push(Node {
                         name: "test_heap",
-                        args: vec![alloc.clone(), args[2].clone()].into(),
+                        args: smallvec::smallvec![alloc.clone(), args[2].clone()],
                         offset: code[at].offset,
                     });
                     alloc = Operand::U(0);
@@ -1066,7 +1360,7 @@ fn apply_rule(
                 }
                 produced.push(Node {
                     name: "i_bs_create_bin",
-                    args: specific_args.into(),
+                    args: specific_args,
                     offset: code[at].offset,
                 });
             }
@@ -1092,14 +1386,19 @@ fn apply_rule(
                 ) {
                     produced.push(Node {
                         name: "i_get_map_element_hash",
-                        args: vec![args[0].clone(), args[1].clone(), key, Operand::U(0), dst]
-                            .into(),
+                        args: smallvec::smallvec![
+                            args[0].clone(),
+                            args[1].clone(),
+                            key,
+                            Operand::U(0),
+                            dst
+                        ],
                         offset: code[at].offset,
                     });
                 } else {
                     produced.push(Node {
                         name: "i_get_map_element",
-                        args: vec![args[0].clone(), args[1].clone(), key, dst].into(),
+                        args: smallvec::smallvec![args[0].clone(), args[1].clone(), key, dst],
                         offset: code[at].offset,
                     });
                 }
@@ -1120,18 +1419,17 @@ fn apply_rule(
                     // OTP-29.1.1. Guard `is_map_key/2` uses a scratch destination.
                     produced.push(Node {
                         name: "i_get_map_element",
-                        args: vec![
+                        args: smallvec::smallvec![
                             args[0].clone(),
                             args[1].clone(),
                             rest[0].clone(),
                             rest[1].clone(),
-                        ]
-                        .into(),
+                        ],
                         offset: code[at].offset,
                     });
                     continue;
                 }
-                let mut specific_args = vec![
+                let mut specific_args = smallvec::smallvec![
                     args[0].clone(),
                     args[1].clone(),
                     // Port of erts/emulator/beam/generators.tab:202-227 (gen.get_map_elements).
@@ -1144,7 +1442,7 @@ fn apply_rule(
                 }
                 produced.push(Node {
                     name: "i_get_map_elements",
-                    args: specific_args.into(),
+                    args: specific_args,
                     offset: code[at].offset,
                 });
             }
@@ -1162,13 +1460,12 @@ fn apply_rule(
                 let literal = u32::try_from(beam.literals.len() + position).ok()?;
                 produced.push(Node {
                     name: "create_local_native_record",
-                    args: vec![
+                    args: smallvec::smallvec![
                         Operand::Literal(literal),
                         dst.clone(),
                         live.clone(),
                         Operand::List(new.clone()),
-                    ]
-                    .into(),
+                    ],
                     offset: code[at].offset,
                 });
             }
@@ -1187,7 +1484,7 @@ fn apply_rule(
                 else {
                     produced.push(Node {
                         name: "i_lambda_error",
-                        args: vec![Operand::U(0)].into(),
+                        args: smallvec::smallvec![Operand::U(0)],
                         offset: code[at].offset,
                     });
                     continue;
@@ -1195,7 +1492,7 @@ fn apply_rule(
                 if u64::from(lambda.num_free) != *num_free {
                     produced.push(Node {
                         name: "i_lambda_error",
-                        args: vec![Operand::U(0)].into(),
+                        args: smallvec::smallvec![Operand::U(0)],
                         offset: code[at].offset,
                     });
                     continue;
@@ -1205,8 +1502,10 @@ fn apply_rule(
                         name: "i_move",
                         // Keep zero-capture fun references distinct from BEAM literal 0.
                         // The high index range is reserved for this internal bridge.
-                        args: vec![Operand::Literal(u32::MAX - lambda.index), args[1].clone()]
-                            .into(),
+                        args: smallvec::smallvec![
+                            Operand::Literal(u32::MAX - lambda.index),
+                            args[1].clone(),
+                        ],
                         offset: code[at].offset,
                     });
                     continue;
@@ -1214,13 +1513,16 @@ fn apply_rule(
                 let Operand::List(env) = &args[3] else {
                     return None;
                 };
-                let mut specific_args = args[..3].to_vec();
+                let mut specific_args = args[..3]
+                    .iter()
+                    .cloned()
+                    .collect::<SmallVec<[Operand; 8]>>();
                 specific_args[2] = Operand::U(u64::from(lambda.arity - lambda.num_free));
                 specific_args.push(Operand::U(env.len() as u64));
                 specific_args.extend(env.iter().cloned());
                 produced.push(Node {
                     name: "i_make_fun3",
-                    args: specific_args.into(),
+                    args: specific_args,
                     offset: code[at].offset,
                 });
             }
@@ -1237,13 +1539,12 @@ fn apply_rule(
                 {
                     produced.push(Node {
                         name: "i_lambda_trampoline",
-                        args: vec![
+                        args: smallvec::smallvec![
                             Operand::U(u64::from(lambda.index)),
                             Operand::U(u64::from(entry_label)),
                             Operand::U(u64::from(lambda.arity)),
                             Operand::U(u64::from(lambda.num_free)),
-                        ]
-                        .into(),
+                        ],
                         offset: code[at].offset,
                     });
                 }
@@ -1756,18 +2057,78 @@ fn allocation_as_words(value: &Operand) -> Operand {
     Operand::U(words)
 }
 
-fn typed_operand(value: &Operand) -> SpecificOperand {
-    match value {
-        Operand::TypedReg { reg, type_index } if *type_index != 0 => SpecificOperand::Typed {
-            reg: Box::new(operand(reg)),
-            type_index: *type_index,
-        },
-        other => operand(other),
+// Port of erts/emulator/beam/beam_load.c:load_code, OTP-29.1.1.
+fn collect_specific_ops(arena: &mut TransformArena, mut cursor: Option<usize>, typed: bool) {
+    let mut function_start = 0;
+    while let Some(index) = cursor {
+        let next = arena.next(index);
+        let node = arena.slot_mut(index).node.take().expect("live GenOp node");
+        if node.name == "i_func_label" && arena.specific_ops.len() != function_start {
+            arena.functions.push(FunctionOps {
+                start: function_start,
+                len: arena.specific_ops.len() - function_start,
+            });
+            function_start = arena.specific_ops.len();
+        }
+        let op = if node.name == "has_map_fields" {
+            map_fields_to_elements(&node, arena)
+        } else {
+            let use_types = typed && TYPED_OPS.contains(&node.name);
+            let args = node
+                .args
+                .iter()
+                .map(|operand| operand_in_arena(arena, operand, use_types))
+                .collect::<SmallVec<[SpecificOperand; 4]>>();
+            SpecificOp::from_name(node.name, args)
+        };
+        arena.specific_ops.push(op);
+        arena.release(index);
+        cursor = next;
+    }
+    if arena.specific_ops.len() != function_start {
+        arena.functions.push(FunctionOps {
+            start: function_start,
+            len: arena.specific_ops.len() - function_start,
+        });
     }
 }
 
-fn operand(value: &Operand) -> SpecificOperand {
+// Port of erts/emulator/beam/jit/asm_load.c:beam_load_emit_op, OTP-29.1.1.
+fn operand_in_arena(
+    arena: &mut TransformArena,
+    value: &Operand,
+    keep_type: bool,
+) -> SpecificOperand {
     match value {
+        Operand::TypedReg { reg, type_index } if keep_type && *type_index != 0 => {
+            SpecificOperand::Typed {
+                reg: Box::new(operand_in_arena(arena, reg, false)),
+                type_index: *type_index,
+            }
+        }
+        Operand::List(values) => {
+            let start = arena.lists.len();
+            arena
+                .lists
+                .resize(start + values.len(), SpecificOperand::Other);
+            for (index, item) in values.iter().enumerate() {
+                let item = operand_in_arena(arena, item, false);
+                arena.lists[start + index] = item;
+            }
+            SpecificOperand::ArenaList(ArenaSlice::from_range(start, values.len()))
+        }
+        Operand::Alloc(values) => {
+            let start = arena.allocations.len();
+            arena.allocations.extend(values.iter().map(|allocation| {
+                let kind = match allocation.kind {
+                    arinsal_beam::AllocKind::Words => 0,
+                    arinsal_beam::AllocKind::Floats => 1,
+                    arinsal_beam::AllocKind::Funs => 2,
+                };
+                (kind, allocation.count)
+            }));
+            SpecificOperand::ArenaAllocations(ArenaSlice::from_range(start, values.len()))
+        }
         Operand::X(value) => SpecificOperand::X(*value),
         Operand::Y(value) => SpecificOperand::Y(*value),
         Operand::FR(value) => SpecificOperand::FloatRegister(*value),
@@ -1780,34 +2141,15 @@ fn operand(value: &Operand) -> SpecificOperand {
         Operand::Nil => SpecificOperand::Nil,
         Operand::Char(value) => SpecificOperand::SmallInt(i64::from(*value)),
         Operand::BigInt(value) => SpecificOperand::BigInt(Box::new(value.to_string())),
-        Operand::TypedReg { reg, .. } => operand(reg),
-        Operand::List(values) => {
-            SpecificOperand::List(Box::new(values.iter().map(operand).collect()))
-        }
-        Operand::Alloc(values) => SpecificOperand::Allocations(Box::new(
-            values
-                .iter()
-                .map(|allocation| {
-                    let kind = match allocation.kind {
-                        arinsal_beam::AllocKind::Words => 0,
-                        arinsal_beam::AllocKind::Floats => 1,
-                        arinsal_beam::AllocKind::Funs => 2,
-                    };
-                    (kind, allocation.count)
-                })
-                .collect(),
-        )),
+        Operand::TypedReg { reg, .. } => operand_in_arena(arena, reg, false),
     }
-}
-
-fn make_op(name: &str, args: Vec<SpecificOperand>) -> SpecificOp {
-    SpecificOp::from_name(name, args.into_iter().collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use arinsal_spec::Opcode;
+    use similar_asserts::assert_eq;
 
     #[test]
     fn operand_enums_fit_two_machine_words() {
@@ -1817,23 +2159,29 @@ mod tests {
 
     #[test]
     fn function_start_without_line_injects_nil_location() {
-        let output = inject_function_starts(vec![
+        let mut arena = TransformArena::new();
+        let first = arena.allocate(
             Node {
                 name: "label",
                 args: vec![Operand::U(1)].into(),
                 offset: 0,
             },
+            None,
+        );
+        let second = arena.allocate(
             Node {
                 name: "func_info",
                 args: vec![Operand::Atom(1), Operand::Atom(2), Operand::U(0)].into(),
                 offset: 2,
             },
-        ]);
+            None,
+        );
+        arena.set_next(first, Some(second));
+        let output = inject_function_starts(&mut arena, Some(first)).unwrap();
 
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].name, "int_func_start");
+        assert_eq!(arena.node(output).name, "int_func_start");
         assert!(matches!(
-            output[0].args.as_slice(),
+            arena.node(output).args.as_slice(),
             [
                 Operand::U(1),
                 Operand::Nil,

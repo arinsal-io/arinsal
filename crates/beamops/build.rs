@@ -230,7 +230,7 @@ fn generate_matchers() {
             }
         }
         out.push_str(&format!(
-            "#[allow(unused_variables, unused_mut)]\nfn rule_{index}<'a>(\n    code: &'a [Node],\n    at: usize,\n    beam: Option<&BeamFile>,\n    slots: &mut SlotVec<'a>,\n) -> bool {{\n{restrictions}    let mut f = Frame::new(code, at);\n{body}    true\n}}\n\n"
+            "#[allow(unused_variables, unused_mut)]\nfn rule_{index}<'a>(\n    code: &'a [&'a Node],\n    at: usize,\n    beam: Option<&BeamFile>,\n    slots: &mut SlotVec<'a>,\n) -> bool {{\n{restrictions}    let mut f = Frame::new(code, at);\n{body}    true\n}}\n\n"
         ));
         table.push_str(&format!("    rule_{index},\n"));
     }
