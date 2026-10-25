@@ -241,12 +241,7 @@ impl BeamModuleAssembler {
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
         let start = self.code.offset();
-        self.emit_runtime_hook_with(
-            hooks.take_receive_lock as usize,
-            &[],
-            0,
-            crate::Update::NONE,
-        )?;
+        self.emit_receive_runtime_call(hooks.take_receive_lock as usize, &[])?;
         self.emit_wait_timeout_at(timeout, dest, hooks, start)
     }
 
@@ -262,6 +257,7 @@ impl BeamModuleAssembler {
         self.emit_wait_timeout_at(timeout, dest, hooks, start)
     }
 
+    // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:312-334, OTP-29.1.1.
     fn emit_wait_timeout_at(
         &mut self,
         timeout: ArgVal,
@@ -273,17 +269,12 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.mov_reg(Gpr::x(9), timeout))?;
         let next = self.code.new_label();
         self.code.adr(Gpr::x(10), next)?;
-        self.emit_runtime_hook_with(
-            hooks.wait_timeout as usize,
-            &[Gpr::x(9), Gpr::x(10)],
-            0,
-            crate::Update::NONE,
-        )?;
+        self.emit_receive_runtime_call(hooks.wait_timeout as usize, &[Gpr::x(9), Gpr::x(10)])?;
         let wait = self.code.new_label();
         self.code.emit(|e| e.cmp_imm(Gpr::x(0), 1, false))?;
         self.code.b_cond(Cond::Eq, wait)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
-        self.code.b_cond(Cond::Eq, next)?;
+        // RET_next < RET_wait < RET_badarg, so one compare distinguishes all three.
+        self.code.b_cond(Cond::Lt, next)?;
         self.branch_error()?;
         self.code.bind(wait)?;
         self.emit_wait(hooks.wait_locked_shared, dest, start)?;
@@ -294,12 +285,33 @@ impl BeamModuleAssembler {
     /// Clears a timeout while the receive lock is held.
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:245-254, OTP-29.1.1
     pub fn emit_timeout_locked(&mut self, hooks: ReceiveHooks) -> Result<(), ModuleError> {
-        self.emit_runtime_hook_with(hooks.timeout_locked as usize, &[], 0, crate::Update::NONE)
+        self.emit_receive_runtime_call(hooks.timeout_locked as usize, &[])
     }
 
     /// Clears a receive timeout.
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:256-265, OTP-29.1.1
     pub fn emit_timeout(&mut self, hooks: ReceiveHooks) -> Result<(), ModuleError> {
-        self.emit_runtime_hook_with(hooks.timeout as usize, &[], 0, crate::Update::NONE)
+        self.emit_receive_runtime_call(hooks.timeout as usize, &[])
+    }
+
+    /// Calls a receive helper with the same runtime frame as the direct JIT calls: no
+    /// post-call process error check is needed because the opcode interprets its return value.
+    // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:200-265, OTP-29.1.1.
+    fn emit_receive_runtime_call(
+        &mut self,
+        helper: usize,
+        args: &[Gpr],
+    ) -> Result<(), ModuleError> {
+        crate::emit_enter_runtime(&mut self.code, 0, crate::Update::NONE)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            for (index, arg) in args.iter().copied().enumerate() {
+                e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
+            }
+            Ok(())
+        })?;
+        self.fragment_call(helper)?;
+        crate::emit_leave_runtime(&mut self.code, 0, crate::Update::NONE)?;
+        Ok(())
     }
 }

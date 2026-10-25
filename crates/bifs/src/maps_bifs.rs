@@ -13,21 +13,21 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     v: &mut V,
 ) -> Option<V::Output> {
     let f = match (module, name, arity) {
-        ("erlang", "map_size", 1) => v.entry::<bodies::map_size>(),
-        ("erlang", "map_get", 2) => v.entry::<bodies::map_get>(),
-        ("erlang", "is_map_key", 2) => v.entry::<bodies::is_map_key>(),
-        ("maps", "find", 2) => v.entry::<bodies::find>(),
-        ("maps", "get", 2) => v.entry::<bodies::get>(),
-        ("maps", "is_key", 2) => v.entry::<bodies::is_key>(),
-        ("maps", "from_list", 1) => v.entry::<bodies::from_list>(),
-        ("maps", "from_keys", 2) => v.entry::<bodies::from_keys>(),
-        ("maps", "keys", 1) => v.entry::<bodies::keys>(),
-        ("maps", "values", 1) => v.entry::<bodies::values>(),
+        ("erlang", "map_size", 1) => v.entry::<word_bodies::map_size>(),
+        ("erlang", "map_get", 2) => v.entry::<word_bodies::map_get>(),
+        ("erlang", "is_map_key", 2) => v.entry::<word_bodies::is_map_key>(),
+        ("maps", "find", 2) => v.entry::<word_bodies::find>(),
+        ("maps", "get", 2) => v.entry::<word_bodies::get>(),
+        ("maps", "is_key", 2) => v.entry::<word_bodies::is_key>(),
+        ("maps", "from_list", 1) => v.entry::<word_bodies::from_list>(),
+        ("maps", "from_keys", 2) => v.entry::<word_bodies::from_keys>(),
+        ("maps", "keys", 1) => v.entry::<word_bodies::keys>(),
+        ("maps", "values", 1) => v.entry::<word_bodies::values>(),
         ("maps", "merge", 2) => v.entry::<bodies::merge>(),
-        ("maps", "put", 3) => v.entry::<bodies::put>(),
-        ("maps", "remove", 2) => v.entry::<bodies::remove>(),
-        ("maps", "update", 3) => v.entry::<bodies::update>(),
-        ("maps", "take", 2) => v.entry::<bodies::take>(),
+        ("maps", "put", 3) => v.entry::<word_bodies::put>(),
+        ("maps", "remove", 2) => v.entry::<word_bodies::remove>(),
+        ("maps", "update", 3) => v.entry::<word_bodies::update>(),
+        ("maps", "take", 2) => v.entry::<word_bodies::take>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -57,47 +57,70 @@ fn mapped<T>(ctx: &mut Ctx<'_>, result: MapResult<T>) -> Result<T, BifError> {
     result.map_err(|error| map_error(ctx, error))
 }
 
-fn map_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let size = mapped(ctx, arinsal_maps::size(args[0]))?;
-    integer(ctx, size)
-}
-fn map_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    mapped(ctx, arinsal_maps::get(args[1], args[0]))?
-        .ok_or_else(|| map_error(ctx, MapError::Badkey(args[0])))
-}
-fn is_map_key(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(bool_term(mapped(
-        ctx,
-        arinsal_maps::is_key(args[1], args[0]),
-    )?))
-}
-fn get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    map_get(ctx, args)
-}
-fn is_key(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    is_map_key(ctx, args)
-}
-fn find(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    match mapped(ctx, arinsal_maps::find(args[1], args[0]))? {
-        Some(value) => Ok(tuple2(ctx, Term::atom(atoms::OK), value)),
-        None => Ok(Term::atom(atoms::ERROR)),
+fn map_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match mapped(ctx, arinsal_maps::size(args[0])).and_then(|size| integer(ctx, size)) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
     }
 }
-fn from_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn map_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match mapped(ctx, arinsal_maps::get(args[1], args[0])) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            let error = map_error(ctx, MapError::Badkey(args[0]));
+            ctx.fail(error)
+        }
+        Err(error) => ctx.fail(error),
+    }
+}
+fn is_map_key(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match mapped(ctx, arinsal_maps::is_key(args[1], args[0])) {
+        Ok(value) => bool_term(value),
+        Err(error) => ctx.fail(error),
+    }
+}
+fn get(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    map_get(ctx, args)
+}
+fn is_key(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    is_map_key(ctx, args)
+}
+fn find(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match mapped(ctx, arinsal_maps::find(args[1], args[0])) {
+        Ok(Some(value)) => tuple2(ctx, Term::atom(atoms::OK), value),
+        Ok(None) => Term::atom(atoms::ERROR),
+        Err(error) => ctx.fail(error),
+    }
+}
+fn from_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     let mut walk = MapsBuildWalk::from_list(args[0]);
     let mut reds = i64::MAX;
-    walk.step(ctx, &mut reds)?.ok_or(BifError::BADARG)
+    match walk.step(ctx, &mut reds) {
+        Ok(Some(value)) => value,
+        Ok(None) => ctx.badarg(),
+        Err(error) => ctx.fail(error),
+    }
 }
-fn from_keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn from_keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     let mut walk = MapsBuildWalk::from_keys(args[0], args[1]);
     let mut reds = i64::MAX;
-    walk.step(ctx, &mut reds)?.ok_or(BifError::BADARG)
+    match walk.step(ctx, &mut reds) {
+        Ok(Some(value)) => value,
+        Ok(None) => ctx.badarg(),
+        Err(error) => ctx.fail(error),
+    }
 }
-fn keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    projection(ctx, args[0], true)
+fn keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match projection(ctx, args[0], true) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
 }
-fn values(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    projection(ctx, args[0], false)
+fn values(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match projection(ctx, args[0], false) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
 }
 
 fn projection(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<Term, BifError> {
@@ -465,28 +488,39 @@ pub fn maps_merge_start_on_process_heap(
     }
 }
 
-fn put(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn put(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     let result = arinsal_maps::put(args[2], args[0], args[1], &mut ctx.heap);
-    mapped(ctx, result)
+    match mapped(ctx, result) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
 }
-fn remove(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn remove(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     let result = arinsal_maps::remove(args[1], args[0], &mut ctx.heap);
-    mapped(ctx, result)
+    match mapped(ctx, result) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
 }
-fn update(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn update(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     let result = arinsal_maps::update(args[2], args[0], args[1], &mut ctx.heap);
-    mapped(ctx, result)
+    match mapped(ctx, result) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
 }
-fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/erl_map.c:1910-1925 (maps_take_2), OTP-29.1.1.
     let result = arinsal_maps::take(args[1], args[0], &mut ctx.heap);
-    match mapped(ctx, result)? {
-        Some((value, map)) => Ok(tuple2(ctx, value, map)),
-        None => Ok(Term::atom(atoms::ERROR)),
+    match mapped(ctx, result) {
+        Ok(Some((value, map))) => tuple2(ctx, value, map),
+        Ok(None) => Term::atom(atoms::ERROR),
+        Err(error) => ctx.fail(error),
     }
 }
 
-crate::process_bif_bodies!(
-    map_size, map_get, is_map_key, find, get, is_key, from_list, from_keys, keys, values, merge,
+crate::word_bif_bodies_in!(word_bodies;
+    map_size, map_get, is_map_key, find, get, is_key, from_list, from_keys, keys, values,
     put, remove, update, take,
 );
+crate::process_bif_bodies!(merge);

@@ -352,8 +352,11 @@ pub extern "C" fn arinsal_beamasm_wait_timeout(
     timeout: u64,
     _next: usize,
 ) -> i32 {
-    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
-        return -1;
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1208-1222
+    // (beam_jit_wait_timeout), OTP-29.1.1: timeout setup updates process wait state but does
+    // not access the process heap or stack cursors.
+    let Some((process, _registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
+        return 2;
     };
     match process.wait_timeout(crate::native_hooks::from_raw(timeout)) {
         Ok(Some(0)) => 0,
@@ -363,14 +366,17 @@ pub extern "C" fn arinsal_beamasm_wait_timeout(
         }
         Err(_) => {
             crate::native_hooks::set_error(process, "timeout_value");
-            -1
+            // RET_badarg (RET_next=0, RET_wait=1, RET_badarg=2), as in instr_msg.cpp.
+            2
         }
     }
 }
 
 /// Clears the receive timeout state (`timeout`, `timeout_locked`).
 pub extern "C" fn arinsal_beamasm_timeout(header: *mut ProcessHeader) {
-    if let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) {
+    // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1242-1251
+    // (beam_jit_timeout), OTP-29.1.1: timeout cleanup does not access heap or stack cursors.
+    if let Some((process, _registers)) = crate::native_hooks::enter_runtime_no_cursors(header) {
         process.timeout();
         // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1246-1248 (beam_jit_timeout),
         // OTP-29.1.1.
