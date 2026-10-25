@@ -327,7 +327,11 @@ impl BeamModuleAssembler {
     pub fn emit_raw_raise(&mut self, resolver: ExceptionResolver) -> Result<(), ModuleError> {
         let raise = self.code.new_label();
         let next = self.code.new_label();
-        for (class, code) in [("error", 1_u64), ("exit", 2), ("throw", 3)] {
+        for (class, code) in [
+            ("error", crate::exc::EXTAG_ERROR),
+            ("exit", crate::exc::EXTAG_EXIT),
+            ("throw", crate::exc::EXTAG_THROWN),
+        ] {
             let word = atom_word(class);
             self.code.emit(|e| {
                 e.mov_const(Gpr::x(8), word)?;

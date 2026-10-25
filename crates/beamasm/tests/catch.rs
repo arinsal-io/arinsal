@@ -367,7 +367,10 @@ fn native_raw_raise() {
     asm.emit_raw_raise(uncaught).unwrap();
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
-    assert_eq!(header.exc.freason, arinsal_beamasm::catch::RAW_RAISE | 2);
+    assert_eq!(
+        header.exc.freason,
+        arinsal_beamasm::catch::RAW_RAISE | arinsal_beamasm::exc::EXTAG_EXIT
+    );
     assert_eq!(header.exc.fvalue, 12);
     assert_eq!(header.exc.ftrace, 0x3b);
 }

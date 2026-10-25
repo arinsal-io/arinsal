@@ -4330,9 +4330,11 @@ fn failure_top(
 /// A fresh generic exception: `EXC_ERROR`, `EXC_EXIT` or `EXC_THROWN` with no index and no
 /// re-raise flag.
 pub(crate) fn is_primary_freason(freason: u64) -> bool {
-    use arinsal_beamasm::catch::{RAW_RAISE, RERAISE};
-    use arinsal_beamasm::exc::{EXC_INDEXBITS, EXF_SAVETRACE};
-    freason & (EXC_INDEXBITS | RAW_RAISE | RERAISE | EXF_SAVETRACE) == EXF_SAVETRACE
+    use arinsal_beamasm::exc::{EXC_ERROR, EXC_EXIT, EXC_THROWN, EXF_ARGLIST};
+    // The whole word must be one of the generic codes: generated code also leaves a class
+    // *atom* in `freason` when it hands a re-raise to the resolver, and an atom word must
+    // never read as a fresh exception.
+    matches!(freason & !EXF_ARGLIST, EXC_ERROR | EXC_EXIT | EXC_THROWN)
 }
 
 /// Port of erts/emulator/beam/beam_common.c:742 (`expand_error_value`), OTP-29.1.1.
