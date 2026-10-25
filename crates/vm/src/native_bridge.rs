@@ -713,6 +713,7 @@ pub(crate) fn commit_catch(
     // metadata must not survive this transfer.
     process.header.exc.freason = 0;
     process.header.exc.fvalue = Term::NIL.tagged_word();
+    process.header.exc.ftrace = 0;
     if let Some(cold) = process.cold.as_mut() {
         cold.native_bif_error = None;
         cold.native_trap = None;

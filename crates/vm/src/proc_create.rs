@@ -1192,7 +1192,7 @@ pub(crate) struct ProcessCold {
     pub(crate) native_resume_after_call: Option<usize>,
     /// The BIF failure behind the current native exception, so the scheduler can name the BIF
     /// and its arguments as the top frame (erts passes the MFA to `raise_exception`).
-    pub(crate) native_bif_error: Option<Box<NativeBifError>>,
+    pub(crate) native_bif_error: Option<NativeBifError>,
     /// A table BIF failure raised from the direct path with its BIF frame already built, as
     /// erts' BIF returns THE_NON_VALUE with `freason`/`fvalue` set; the call is not redone.
     pub(crate) native_trap: Option<Box<NativeTrap>>,
