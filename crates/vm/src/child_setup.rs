@@ -122,7 +122,6 @@ pub(crate) fn start() -> io::Result<Arc<ChildSetup>> {
         .stdin(Stdio::from(helper_fd))
         .stdout(Stdio::from(std::fs::File::from(vm_stdin)))
         .stderr(Stdio::from(std::fs::File::from(vm_stdout)))
-        .process_group(0)
         .env_clear();
     let helper = command.spawn()?;
     let pending = Arc::new(Mutex::new(Pending::default()));
@@ -255,9 +254,21 @@ impl Drop for ChildSetup {
     }
 }
 
+// Port of erts/emulator/sys/unix/sys_drivers.c (forker_start and forker_ready_input), OTP-29.1.1.
 fn response_loop(mut stream: UnixStream, pending: Arc<Mutex<Pending>>) {
     let mut frame = [0u8; FRAME_LEN];
     loop {
+        let fd = stream.as_raw_fd();
+        let interest = crate::check_io::InterestSet {
+            readable: true,
+            writable: false,
+        };
+        match crate::check_io::wait_any_timeout(&[(fd, interest)], None) {
+            Ok(Some((_, ready))) if ready.readable || ready.closed || ready.error => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
         if stream.read_exact(&mut frame).is_err() {
             break;
         }
@@ -277,6 +288,8 @@ fn response_loop(mut stream: UnixStream, pending: Arc<Mutex<Pending>>) {
 /// This is a public entry point only so the CLI binary can dispatch the helper mode.
 // Port of erts/emulator/sys/unix/erl_child_setup.c (`main`), OTP-29.1.1.
 pub fn run_child_setup() -> ! {
+    // Port of erts/emulator/sys/unix/sys_drivers.c:1657 (`forker_start`), OTP-29.1.1.
+    let _ = nix::unistd::setsid();
     if let Err(error) = forker_loop() {
         eprintln!("erl_child_setup: {error}");
         std::process::exit(1);
@@ -409,7 +422,6 @@ fn spawn_setup_child(
         .stdin(Stdio::from(input))
         .stdout(Stdio::from(output))
         .stderr(Stdio::from(stderr))
-        .process_group(0)
         .env_clear()
         .env("ARINSAL_CHILD_VM_STDIN", vm_stdin.to_string())
         .env("ARINSAL_CHILD_VM_STDOUT", vm_stdout.to_string());
@@ -634,6 +646,10 @@ fn child_setup_exec() -> io::Result<()> {
         }
     }
     close_child_descriptors(&kept)?;
+
+    // Port of erts/emulator/sys/unix/erl_child_setup.c:352 (`start_new_child`), OTP-29.1.1.
+    // Keep each port child in its own session, so it outlives the port and runtime terminal.
+    let _ = nix::unistd::setsid();
 
     let mut command = if let Some(args) = config.args {
         let mut command = Command::new(OsString::from_vec(config.program));

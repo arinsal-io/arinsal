@@ -58,8 +58,8 @@ pub use time::{
     time_offset_nanos_value,
 };
 pub use unicode::{
-    UnicodeCont, UnicodeStage, UnicodeStep, set_locale_utf8 as unicode_set_locale_utf8,
-    unicode_resume, unicode_utf8_binary_fast_path,
+    UnicodeCont, UnicodeStage, UnicodeStep, native_filename_list_bytes,
+    set_locale_utf8 as unicode_set_locale_utf8, unicode_resume, unicode_utf8_binary_fast_path,
 };
 pub use unique::{
     SchedulerRefState, UniqueInt, bind_scheduler_ref_state, debug_make_unique_integer,
