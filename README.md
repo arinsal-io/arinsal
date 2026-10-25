@@ -43,7 +43,7 @@ The executable is named `arinsal`. For example, to print its version:
 cargo run -p arinsal-cli -- --version
 ```
 
-See [`examples/arinsal_demo`](examples/arinsal_demo/README.md) for an Elixir
+See [`arinsal-io/arinsal-demo`](https://github.com/arinsal-io/arinsal-demo) for an Elixir
 application used to compare workloads on Arinsal and ERTS.
 
 ## Tests
