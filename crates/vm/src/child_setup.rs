@@ -48,12 +48,48 @@ struct Pending {
     status: HashMap<u64, Sender<i64>>,
 }
 
-/// Parent endpoints and status stream for a spawned port process.
+/// Parent endpoints and status stream for a spawned port process. The forker's `Go` frame
+/// (OS pid or errno) arrives later on `output`; the port reads it as input.
 pub(crate) struct SpawnedChild {
-    pub(crate) os_pid: u32,
-    pub(crate) input: Option<OwnedFd>,
-    pub(crate) output: Option<OwnedFd>,
+    pub(crate) input: OwnedFd,
+    pub(crate) output: OwnedFd,
+    /// Setup payload bytes the pipe did not take yet.
+    pub(crate) setup_rest: Vec<u8>,
     pub(crate) status: Option<Receiver<i64>>,
+}
+
+/// Length of a forker protocol frame (`ErtsSysForkerProto`).
+pub(crate) const FORKER_FRAME_LEN: usize = FRAME_LEN;
+
+/// A parsed `Go` frame: the child's OS pid, or the errno of a failed fork.
+pub(crate) enum Go {
+    Pid(u32),
+    Errno(i32),
+}
+
+/// Decode the forker's reply to a start request.
+// Port of erts/emulator/sys/unix/sys_drivers.c (`ready_input`, `dd->pid == 0` branch), OTP-29.1.1.
+pub(crate) fn parse_go(frame: &[u8; FRAME_LEN]) -> io::Result<Go> {
+    if u32::from_ne_bytes(frame[0..4].try_into().unwrap()) != GO {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid forker response",
+        ));
+    }
+    let os_pid = i32::from_ne_bytes(frame[8..12].try_into().unwrap());
+    let errno = i32::from_ne_bytes(frame[12..16].try_into().unwrap());
+    Ok(if os_pid < 0 {
+        Go::Errno(errno.max(1))
+    } else {
+        Go::Pid(os_pid as u32)
+    })
+}
+
+/// The acknowledgement frame the port sends after `Go` (`ErtsSysForkerProtoAction_Ack`).
+pub(crate) fn ack_frame() -> [u8; FRAME_LEN] {
+    let mut ack = [0u8; FRAME_LEN];
+    ack[0..4].copy_from_slice(&ACK.to_ne_bytes());
+    ack
 }
 
 /// Start the persistent forker before the runtime begins running BEAM code.
@@ -113,7 +149,7 @@ impl ChildSetup {
         }
     }
 
-    /// Launch a child through the persistent helper and complete the `Go`/`Ack` handshake.
+    /// Queue a start request for the persistent helper; the `Go`/`Ack` handshake is the port's.
     // Port of erts/emulator/sys/unix/sys_drivers.c (`spawn_start`), OTP-29.1.1.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
@@ -122,7 +158,7 @@ impl ChildSetup {
         setup: &[u8],
         status_wanted: bool,
         _use_stdio: bool,
-        read_write: u8,
+        _read_write: u8,
         stderr_to_stdout: bool,
     ) -> io::Result<SpawnedChild> {
         let (parent_output, child_output) = pipe().map_err(to_io_error)?;
@@ -156,6 +192,20 @@ impl ChildSetup {
                 pending.status.insert(port_id, status_tx);
             }
         }
+        // Port of sys_drivers.c (`spawn_start`): the setup payload goes into the pipe before the
+        // request reaches the forker, and what the pipe does not take is queued for the port.
+        fcntl_setfl(&parent_input, OFlags::NONBLOCK).map_err(to_io_error)?;
+        fcntl_setfl(&parent_output, OFlags::NONBLOCK).map_err(to_io_error)?;
+        let mut written = 0;
+        while written < setup.len() {
+            match write(&parent_input, &setup[written..]) {
+                Ok(n) => written += n,
+                Err(error) if error == rustix::io::Errno::INTR => continue,
+                Err(error) if error == rustix::io::Errno::AGAIN => break,
+                Err(error) => return Err(to_io_error(error)),
+            }
+        }
+        let setup_rest = setup[written..].to_vec();
         let mut frame = [0u8; FRAME_LEN];
         frame[0..4].copy_from_slice(&START.to_ne_bytes());
         frame[8..16]
@@ -170,52 +220,10 @@ impl ChildSetup {
         }
         drop(child_input);
         drop(child_output);
-
-        let mut go = [0u8; FRAME_LEN];
-        if let Err(error) = read_exact_fd(&parent_output, &mut go) {
-            self.pending.lock().unwrap().status.remove(&port_id);
-            return Err(error);
-        }
-        if u32::from_ne_bytes(go[0..4].try_into().unwrap()) != GO {
-            self.pending.lock().unwrap().status.remove(&port_id);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid forker response",
-            ));
-        }
-        let os_pid = i32::from_ne_bytes(go[8..12].try_into().unwrap());
-        let errno = i32::from_ne_bytes(go[12..16].try_into().unwrap());
-        if os_pid < 0 {
-            self.pending.lock().unwrap().status.remove(&port_id);
-            return Err(io::Error::from_raw_os_error(errno.max(1)));
-        }
-        if let Err(error) = write_all_fd(&parent_input, setup) {
-            self.pending.lock().unwrap().status.remove(&port_id);
-            return Err(error);
-        }
-        let mut ack = [0u8; FRAME_LEN];
-        ack[0..4].copy_from_slice(&ACK.to_ne_bytes());
-        if let Err(error) = write_all_fd(&parent_input, &ack) {
-            self.pending.lock().unwrap().status.remove(&port_id);
-            return Err(error);
-        }
-
-        let input = if read_write & 2 != 0 {
-            fcntl_setfl(&parent_input, OFlags::NONBLOCK).map_err(to_io_error)?;
-            Some(parent_input)
-        } else {
-            None
-        };
-        let output = if read_write & 1 != 0 {
-            fcntl_setfl(&parent_output, OFlags::NONBLOCK).map_err(to_io_error)?;
-            Some(parent_output)
-        } else {
-            None
-        };
         Ok(SpawnedChild {
-            os_pid: os_pid as u32,
-            input,
-            output,
+            input: parent_input,
+            output: parent_output,
+            setup_rest,
             status: status_wanted.then_some(status_rx),
         })
     }

@@ -254,6 +254,9 @@ struct PortState {
     broken: bool,
     in_output: bool,
     profile_active: bool,
+    /// Spawn ports: bytes owed to the child before user data may follow (the rest of the setup
+    /// payload, then the `Ack` frame once `Go` arrived). `None` once the handshake is done.
+    handshake: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -331,6 +334,18 @@ static NO_SPAWN: SpawnData = SpawnData {
     limits: NO_BUSY_LIMITS,
 };
 
+/// `PortHandle::os_pid` of a spawn port that has not yet received the forker's `Go`.
+const OS_PID_PENDING: u32 = u32::MAX;
+
+/// What the worker needs for the `Go`/`Ack` handshake of a spawn port.
+#[derive(Clone, Copy)]
+struct SpawnStart {
+    /// The child's stdout is the port's input (`DO_READ`).
+    read_wanted: bool,
+    /// The port writes to the child's stdin (`DO_WRITE`).
+    keep_input: bool,
+}
+
 /// State retained for a live child or fd port.
 pub(crate) struct PortHandle {
     id: u64,
@@ -340,7 +355,8 @@ pub(crate) struct PortHandle {
     owner: Mutex<Pid>,
     links: Mutex<PidSet>,
     monitors: Mutex<HashMap<u64, PortMonitor>>,
-    os_pid: u32,
+    /// OS pid of the child: `OS_PID_PENDING` until the forker's `Go`, 0 for ports without one.
+    os_pid: AtomicU32,
     name: String,
     parallelism: bool,
     state: Mutex<PortState>,
@@ -1546,23 +1562,37 @@ fn start(
             return Err(badarg());
         }
     };
-    let os_pid = spawned.os_pid;
-    let out = spawned.input;
-    let read_fd = spawned.output.map(IntoRawFd::into_raw_fd);
-    let child_status = spawned.status;
+    let crate::child_setup::SpawnedChild {
+        input,
+        output,
+        setup_rest,
+        status: child_status,
+    } = spawned;
+    // Port of sys_drivers.c (`spawn_start`): the port exists at once; the OS pid arrives with
+    // the forker's `Go` frame as port input.
+    let read_fd = Some(output.into_raw_fd());
+    let start = SpawnStart {
+        read_wanted: rw & 1 != 0,
+        keep_input: rw & 2 != 0,
+    };
     let port = Term::port(port_id).ok_or_else(badarg)?;
     let handle = make_handle(
         port_id,
-        out,
+        Some(input),
         framing,
         ctx.pid(),
-        os_pid,
+        OS_PID_PENDING,
         name,
         parallelism,
         limits,
         Arc::clone(&scheduler),
         *runtime as *const crate::process::Runtime as usize,
     )?;
+    handle.state.lock().handshake = Some(setup_rest);
+    // erl_bif_port.c:102: the spawn driver uses ERL_DRV_FLAG_USE_INIT_ACK, so the opener gets a
+    // reference now and `{Ref, Port | Errno}` once the forker's `Go` arrived.
+    let reference = runtime.next_ref();
+    *handle.async_open.lock() = Some((reference, ctx.pid()));
     runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
@@ -1584,11 +1614,15 @@ fn start(
                 framing,
                 want_status,
                 want_eof,
+                Some(start),
             );
         })
         .map_err(|_| badarg())?;
-    let _ = vm;
-    Ok(port)
+    let _ = (vm, port);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    TermBuilder::new(&mut heap)
+        .local_ref(arinsal_bifs::ordinary_ref_words(reference))
+        .map_err(|_| badarg())
 }
 
 // Port of erts/emulator/drivers/common/inet_drv.c:1361 (tcp_inet driver entry), OTP-29.1.1.
@@ -2171,33 +2205,15 @@ impl arinsal_drv::PortHost for DrvHost {
         let Some(handle) = self.handle(port.id()) else {
             return;
         };
-        let Some((reference, opener)) = handle.async_open.lock().take() else {
-            return;
-        };
-        let Some(port_term) = Term::port(port.id()) else {
-            return;
-        };
         let result = match reply {
-            arinsal_drv::InitAck::Opened => port_term,
-            arinsal_drv::InitAck::Failed(error) => {
-                // The opener is no longer linked to a port that failed to open.
-                handle.links.lock().remove(&opener);
-                atom(&match error {
-                    arinsal_drv::StartError::General => "einval".to_owned(),
-                    arinsal_drv::StartError::Errno(errno) => arinsal_drv::errno_id(errno),
-                    arinsal_drv::StartError::Badarg => "badarg".to_owned(),
-                })
-            }
+            arinsal_drv::InitAck::Opened => Ok(()),
+            arinsal_drv::InitAck::Failed(error) => Err(atom(&match error {
+                arinsal_drv::StartError::General => "einval".to_owned(),
+                arinsal_drv::StartError::Errno(errno) => arinsal_drv::errno_id(errno),
+                arinsal_drv::StartError::Badarg => "badarg".to_owned(),
+            })),
         };
-        let mut heap = ProcessHeap::with_words(16);
-        let Ok(reference) =
-            TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(reference))
-        else {
-            return;
-        };
-        if let Ok(message) = TermBuilder::new(&mut heap).tuple(&[reference, result]) {
-            publish(&handle.scheduler, opener, port_term, message);
-        }
+        send_open_reply(&handle, result);
     }
 
     // Port of erts/emulator/beam/io.c:781 (driver_create_port), OTP-29.1.1.
@@ -2245,6 +2261,34 @@ impl arinsal_drv::PortHost for DrvHost {
         crate::trace::port_opened(runtime, port_id);
         reservation.commit();
         Some(drv_port)
+    }
+}
+
+/// Answer the `open_port` waiting for `erl_drv_init_ack`: `{Ref, Port}` on success, `{Ref, Errno}`
+/// on failure (the opener is no longer linked to a port that failed to open).
+// Port of erts/emulator/beam/io.c:2912 (init_ack_send_reply), OTP-29.1.1.
+fn send_open_reply(handle: &PortHandle, result: Result<(), Term>) {
+    let Some((reference, opener)) = handle.async_open.lock().take() else {
+        return;
+    };
+    let Some(port_term) = Term::port(handle.id) else {
+        return;
+    };
+    let result = match result {
+        Ok(()) => port_term,
+        Err(errno) => {
+            handle.links.lock().remove(&opener);
+            errno
+        }
+    };
+    let mut heap = ProcessHeap::with_words(16);
+    let Ok(reference) =
+        TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(reference))
+    else {
+        return;
+    };
+    if let Ok(message) = TermBuilder::new(&mut heap).tuple(&[reference, result]) {
+        publish(&handle.scheduler, opener, port_term, message);
     }
 }
 
@@ -2749,7 +2793,7 @@ fn make_handle_with(
         owner: Mutex::new(owner),
         links: Mutex::new(PidSet::from_one(owner)),
         monitors: Mutex::new(HashMap::new()),
-        os_pid,
+        os_pid: AtomicU32::new(os_pid),
         name,
         parallelism,
         state: Mutex::new(PortState {
@@ -2767,6 +2811,7 @@ fn make_handle_with(
             broken: false,
             in_output: false,
             profile_active: false,
+            handshake: None,
         }),
         scheduler,
         trace_scope,
@@ -2835,6 +2880,7 @@ fn start_fd(
                 framing,
                 false,
                 want_eof,
+                None,
             );
         })
         .map_err(|_| badarg())?;
@@ -2962,8 +3008,9 @@ fn accept_output(handle: &PortHandle, st: &mut PortState, data: &[u8]) -> Result
     if st.closed || st.broken {
         return Err(());
     }
-    // Port of erts/emulator/sys/unix/sys_drivers.c:1140 (output), OTP-29.1.1.
-    if st.outq().is_empty() {
+    // Port of erts/emulator/sys/unix/sys_drivers.c:1140 (output), OTP-29.1.1. Data written
+    // before the child's `Go`/`Ack` handshake finished queues behind it.
+    if st.outq().is_empty() && st.handshake.is_none() {
         match nb_write(output_fd(handle), data) {
             Ok(n) if n == data.len() => return Ok(()),
             Ok(n) => st.outq_mut().extend(data[n..].iter().copied()),
@@ -2993,8 +3040,51 @@ fn note_msgq(st: &mut PortState, limits: &BusyLimits, extra: usize) {
     }
 }
 
+/// Write the bytes a spawn port owes its child before user data (setup payload rest, `Ack`).
+/// Once `go_done` and nothing is left, the handshake ends and user data may follow; a port
+/// without `DO_WRITE` then closes its end of the child's stdin.
+// Port of erts/emulator/sys/unix/sys_drivers.c (`ready_input` Go branch and `ready_output`),
+// OTP-29.1.1.
+fn flush_handshake(handle: &PortHandle, go_done: bool, close_input: bool) {
+    loop {
+        let mut st = handle.state.lock();
+        let Some(rest) = st.handshake.as_ref() else {
+            return;
+        };
+        if rest.is_empty() {
+            if go_done {
+                st.handshake = None;
+                drop(st);
+                if close_input {
+                    handle.spawn().out.lock().take();
+                }
+            }
+            return;
+        }
+        let chunk = rest.clone();
+        drop(st);
+        match nb_write(output_fd(handle), &chunk) {
+            Ok(0) => return,
+            Ok(wrote) => {
+                if let Some(rest) = handle.state.lock().handshake.as_mut() {
+                    rest.drain(..wrote);
+                }
+            }
+            Err(_) => {
+                let mut st = handle.state.lock();
+                st.handshake = None;
+                st.broken = true;
+                return;
+            }
+        }
+    }
+}
+
 fn flush_output(handle: &PortHandle) -> Vec<Pid> {
     let mut woken = Vec::new();
+    if handle.state.lock().handshake.is_some() {
+        return woken;
+    }
     let mut became_inactive = false;
     loop {
         let mut st = handle.state.lock();
@@ -3194,7 +3284,11 @@ fn worker(
     framing: Option<(u8, usize)>,
     want_status: bool,
     want_eof: bool,
+    start: Option<SpawnStart>,
 ) {
+    let mut read_fd = read_fd;
+    // Spawn ports: the forker's `Go` frame is the first input (sys_drivers.c `ready_input`).
+    let mut go_buf: Option<Vec<u8>> = start.map(|_| Vec::new());
     let waker = handle.spawn().waker.clone();
     // Stated once for the descriptor's life, not by the poller on every selection.
     let input_fallback = read_fd.filter(|fd| crate::check_io::is_always_ready(*fd));
@@ -3235,8 +3329,14 @@ fn worker(
                 }
             }
         }
-        let wants_out =
-            !handle.state.lock().outq().is_empty() || !handle.state.lock().pending().is_empty();
+        let wants_out = !handle.state.lock().outq().is_empty()
+            || !handle.state.lock().pending().is_empty()
+            || handle
+                .state
+                .lock()
+                .handshake
+                .as_ref()
+                .is_some_and(|rest| !rest.is_empty());
         handle.spawn().wake_needed.store(true, Ordering::Release);
         let mut fds = Vec::with_capacity(3);
         if input_live && let Some(fd) = read_fd {
@@ -3297,6 +3397,13 @@ fn worker(
         }
         let woken = drain_pending(&handle);
         wake_suspended(&scheduler, woken);
+        if start.is_some() {
+            flush_handshake(
+                &handle,
+                go_buf.is_none(),
+                start.is_some_and(|s| !s.keep_input),
+            );
+        }
         let woken = flush_output(&handle);
         wake_suspended(&scheduler, woken);
         if !input_closed {
@@ -3309,7 +3416,68 @@ fn worker(
                 input_closed = true;
             }
         }
-        if input_ready && let Some(fd) = read_fd {
+        if input_ready
+            && let Some(fd) = read_fd
+            && let Some(frame) = go_buf.as_mut()
+        {
+            // Port of sys_drivers.c (`ready_input`, `dd->pid == 0`): the forker's reply is
+            // the first input of a spawn port; a failed fork or a closed pipe fails the port.
+            let mut chunk = [0u8; crate::child_setup::FORKER_FRAME_LEN];
+            let need = chunk.len() - frame.len();
+            // SAFETY: `chunk` is a live buffer of at least `need` bytes; `fd` is the port's input.
+            let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), need) };
+            let failure = if n < 0 {
+                let err = std::io::Error::last_os_error();
+                match err.kind() {
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock => None,
+                    _ => Some(err.raw_os_error().unwrap_or(libc::EIO)),
+                }
+            } else if n == 0 {
+                Some(libc::EPIPE)
+            } else {
+                frame.extend_from_slice(&chunk[..n as usize]);
+                None
+            };
+            let mut failure = failure;
+            if failure.is_none() && frame.len() == chunk.len() {
+                let whole: [u8; crate::child_setup::FORKER_FRAME_LEN] =
+                    frame.as_slice().try_into().expect("whole frame");
+                match crate::child_setup::parse_go(&whole) {
+                    Ok(crate::child_setup::Go::Pid(pid)) => {
+                        handle.os_pid.store(pid, Ordering::Release);
+                        if let Some(rest) = handle.state.lock().handshake.as_mut() {
+                            rest.extend_from_slice(&crate::child_setup::ack_frame());
+                        }
+                        send_open_reply(&handle, Ok(()));
+                        go_buf = None;
+                        if start.is_some_and(|s| !s.read_wanted) {
+                            // Without `DO_READ` the descriptor leaves the poll set after Go.
+                            close_worker_fds(read_fd);
+                            read_fd = None;
+                            input_live = false;
+                        }
+                    }
+                    Ok(crate::child_setup::Go::Errno(errno)) => failure = Some(errno),
+                    Err(error) => failure = Some(error.raw_os_error().unwrap_or(libc::EPROTO)),
+                }
+            }
+            if let Some(errno) = failure {
+                let reason = atom(&arinsal_drv::errno_id(errno));
+                send_open_reply(&handle, Err(reason));
+                crate::trace::emit_port_event(
+                    runtime,
+                    id,
+                    crate::trace::PORTS,
+                    "closed",
+                    &[reason],
+                );
+                if let Some(removed) = remove_and_notify(runtime, id, &scheduler, owner, reason) {
+                    crate::trace::port_closed(runtime, id);
+                    release_io(&removed);
+                }
+                break;
+            }
+        } else if input_ready && let Some(fd) = read_fd {
             // SAFETY: `buf` is a live buffer and `fd` is the port's input descriptor.
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n < 0 {
@@ -4980,7 +5148,7 @@ fn send_message_inner(
             return Ok(sent());
         }
         trace_port_receive_term(process, from, id, parts[1]);
-        if handle.os_pid == 0 {
+        if handle.os_pid.load(Ordering::Acquire) == 0 {
             // A port that terminated meanwhile drops the signal.
             event_message(
                 &handle.scheduler,
@@ -5271,7 +5439,10 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     let os_pid = match drv_port.map(|drv| drv.os_pid()) {
         Some(pid) if pid < 0 => atom("undefined"),
         Some(pid) => Term::small(pid).unwrap(),
-        None => Term::small(handle.os_pid as i64).unwrap(),
+        None => match handle.os_pid.load(Ordering::Acquire) {
+            OS_PID_PENDING => atom("undefined"),
+            pid => Term::small(i64::from(pid)).unwrap(),
+        },
     };
     let monitored_by = TermBuilder::new(&mut heap)
         .list_from_iter(monitored_pids)
