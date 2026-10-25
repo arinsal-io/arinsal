@@ -21,6 +21,8 @@ use crate::pure::{Heap, integer, make_list, tuple_build};
 use crate::{BifError, Ctx};
 
 static LOCAL_NODE_HASH: OnceLock<u32> = OnceLock::new();
+// Port of erts/emulator/beam/external.c:1768-1769, OTP-29.1.1.
+const B2T_MAX_DIRECT_UNCOMPRESSED_SIZE: usize = 32 * 1024 * 1024;
 
 // Port of erts/emulator/beam/external.c:134-194, OTP-29.1.1.
 fn local_node_hash() -> u32 {
@@ -2867,6 +2869,14 @@ impl<'a> DecodeWalk<'a> {
                     return Err(BifError::BADARG);
                 }
                 let size = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
+                // Port of erts/emulator/beam/external.c:1770-1779 (binary2term_prepare),
+                // OTP-29.1.1. ERTS validates oversized length claims by counting output in
+                // 64 KiB chunks before allocating the uncompressed external term.
+                if size > B2T_MAX_DIRECT_UNCOMPRESSED_SIZE
+                    && compressed_uncompressed_size(&bytes[6..])? != size
+                {
+                    return Err(BifError::BADARG);
+                }
                 (SmallVec::new(), 6, true, size, Some(Decompress::new(true)))
             } else {
                 (SmallVec::new(), 1, false, 0, None)
@@ -3273,6 +3283,29 @@ impl<'a> DecodeWalk<'a> {
     /// Return the original ETF byte length for reduction accounting.
     pub fn input_size(&self) -> usize {
         self.input_size
+    }
+}
+
+// Port of erts/emulator/beam/external.c:1719-1741 (binary2term_uncomp_size), OTP-29.1.1.
+fn compressed_uncompressed_size(input: &[u8]) -> Result<usize, BifError> {
+    let mut decompressor = Decompress::new(true);
+    let mut output = [0; 64 * 1024];
+    loop {
+        let consumed = usize::try_from(decompressor.total_in()).map_err(|_| BifError::BADARG)?;
+        let before_out = decompressor.total_out();
+        let status = decompressor
+            .decompress(
+                input.get(consumed..).ok_or(BifError::BADARG)?,
+                &mut output,
+                FlushDecompress::Finish,
+            )
+            .map_err(|_| BifError::BADARG)?;
+        if status == Status::StreamEnd {
+            return usize::try_from(decompressor.total_out()).map_err(|_| BifError::BADARG);
+        }
+        if decompressor.total_in() == consumed as u64 && decompressor.total_out() == before_out {
+            return Err(BifError::BADARG);
+        }
     }
 }
 

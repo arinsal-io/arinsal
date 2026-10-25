@@ -567,6 +567,15 @@ fn canonical(term: &O) -> O {
 #[test]
 fn ten_thousand_malformed_inputs_match_otp_errors() {
     let reference = RefErl::shared().expect("OTP 29 reference");
+    let oversized_claim = [131, 80, 0xff, 0xff, 0xff, 0xff, 0];
+    let args = [O::Binary(oversized_claim.to_vec())];
+    let ours = call("erlang", "binary_to_term", &args);
+    let otp = reference.call("erlang", "binary_to_term", &args);
+    assert!(
+        equivalent(&ours, &otp),
+        "oversized compressed length: {ours:?} != {otp:?}"
+    );
+
     let mut state = 0x7fc2_9198_3e5a_0011_u64;
     for case in 0..10_000 {
         let len = (case * 37 % 151) as usize;
