@@ -230,6 +230,7 @@ impl MessageQueue {
         self.refresh_save_term();
     }
 
+    #[inline(always)]
     fn refresh_save_term(&mut self) {
         self.save_term = self
             .entries
