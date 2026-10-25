@@ -547,11 +547,6 @@ impl CommandPiece {
     }
 }
 
-/// Inline command pieces matching `io.c`'s 16-entry stack vector, less its driver header slot.
-///
-/// Port of erts/emulator/beam/io.c:1778-1818 (`erts_port_output`), OTP-29.1.1.
-pub type CommandVector = smallvec::SmallVec<[CommandPiece; 15]>;
-
 /// Result of a `control` callback (io.c:4100 write_port_control_result).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlReply {
@@ -970,7 +965,7 @@ impl DriverPort {
     /// `output` for a native driver with a command vector it may keep.
     ///
     /// Port of erts/emulator/beam/io.c:1354 (call_driver_outputv), OTP-29.1.1.
-    pub fn outputv_owned(&self, pieces: CommandVector, caller: u64) -> bool {
+    pub fn outputv_owned(&self, pieces: Vec<CommandPiece>, caller: u64) -> bool {
         let _guard = self.guard();
         if !self.live() {
             return false;

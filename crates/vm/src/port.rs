@@ -828,7 +828,7 @@ fn refc_segment(term: Term) -> Option<arinsal_drv::RefcSegment> {
 /// a refc binary is one `Bytes` element, as `iodata` gives it.
 // Port of erts/emulator/beam/io.c:1715 (erts_port_output builds the ErlIOVec with
 // erts_ioq_iolist_to_vec), OTP-29.1.1.
-fn command_pieces(t: Term) -> Option<arinsal_drv::CommandVector> {
+fn command_pieces(t: Term) -> Option<smallvec::SmallVec<[arinsal_drv::CommandPiece; 4]>> {
     use arinsal_drv::CommandPiece;
     // The bytes that will be copied, so the buffer is allocated once (erts_iolist_size);
     // binaries over the on-heap limit may be referenced instead.

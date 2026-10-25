@@ -12,8 +12,6 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
-
 use crate::bits::{ExternalBinary, RefcBinary, WritableBinary};
 use crate::heap::{HeapAlloc, link_external_bin_ref, link_magic_thing, link_node_thing};
 use crate::{Node, Term, TermError};
@@ -26,8 +24,6 @@ pub struct SignalNode<T> {
     pub next: Option<NonNull<SignalNode<T>>>,
     /// Words of the inline heap fragment (`hfrag.alloc_size`), 0 for a node without one.
     fragment_words: usize,
-    /// The message allocator block containing this node; embedded nodes have no allocation.
-    allocation: Option<AllocBlock>,
     /// The signal.
     pub value: T,
 }
@@ -102,7 +98,6 @@ impl<T> EmbeddedSignal<T> {
             node.write(SignalNode {
                 next: None,
                 fragment_words: EMBEDDED,
-                allocation: None,
                 value,
             });
         }
@@ -161,23 +156,8 @@ impl<T> OwnedSignal<T> {
     /// &hp)`), empty until [`OwnedSignal::heap_fragment`] allocates in it.
     pub fn with_heap_fragment(value: T, words: usize) -> Self {
         let (layout, header_offset) = node_layout::<T>(words);
-        // Port of erts/emulator/beam/erl_message.c (erts_alloc_message): use the message
-        // allocator for the combined signal node and inline heap fragment.
-        let mut allocation = if layout.align() <= std::mem::align_of::<u64>() {
-            Some(
-                AllocBlock::new(ErtsAlcType::MSG, layout.size().div_ceil(8))
-                    .unwrap_or_else(|_| std::alloc::handle_alloc_error(layout)),
-            )
-        } else {
-            None
-        };
-        let raw = match allocation.as_mut() {
-            Some(block) => block.as_mut_ptr().cast::<SignalNode<T>>(),
-            None => {
-                // SAFETY: the layout has a nonzero size and is used for the node below.
-                unsafe { std::alloc::alloc(layout) }.cast::<SignalNode<T>>()
-            }
-        };
+        // SAFETY: the layout has a nonzero size (it holds at least the `next` link).
+        let raw = unsafe { std::alloc::alloc(layout) }.cast::<SignalNode<T>>();
         let Some(node) = NonNull::new(raw) else {
             std::alloc::handle_alloc_error(layout);
         };
@@ -187,7 +167,6 @@ impl<T> OwnedSignal<T> {
             node.as_ptr().write(SignalNode {
                 next: None,
                 fragment_words: words,
-                allocation,
                 value,
             });
             if words != 0 {
@@ -292,24 +271,17 @@ impl<T> OwnedSignal<T> {
             let value = std::ptr::addr_of!((*node.as_ptr()).value).read();
             let words = (*node.as_ptr()).fragment_words;
             let (layout, _) = node_layout::<T>(words);
-            let allocation =
-                NonNull::new_unchecked(std::ptr::addr_of_mut!((*node.as_ptr()).allocation));
             match header {
                 Some(header) => (
                     value,
                     Some(NodeFragment {
                         memory: node.cast(),
                         layout,
-                        allocation,
                         header,
                     }),
                 ),
                 None => {
-                    if let Some(block) = allocation.as_ptr().read() {
-                        drop(block);
-                    } else {
-                        std::alloc::dealloc(node.as_ptr().cast(), layout);
-                    }
+                    std::alloc::dealloc(node.as_ptr().cast(), layout);
                     (value, None)
                 }
             }
@@ -372,17 +344,12 @@ impl<T> Drop for OwnedSignal<T> {
             std::ptr::drop_in_place(std::ptr::addr_of_mut!((*self.node.as_ptr()).value));
             let words = (*self.node.as_ptr()).fragment_words;
             let (layout, _) = node_layout::<T>(words);
-            let allocation =
-                NonNull::new_unchecked(std::ptr::addr_of_mut!((*self.node.as_ptr()).allocation));
             if let Some(header) = header {
                 drop(NodeFragment {
                     memory: self.node.cast(),
                     layout,
-                    allocation,
                     header,
                 });
-            } else if let Some(block) = allocation.as_ptr().read() {
-                drop(block);
             } else {
                 std::alloc::dealloc(self.node.as_ptr().cast(), layout);
             }
@@ -395,7 +362,6 @@ impl<T> Drop for OwnedSignal<T> {
 pub struct NodeFragment {
     memory: NonNull<u8>,
     layout: Layout,
-    allocation: NonNull<Option<AllocBlock>>,
     header: NonNull<HeapFragment>,
 }
 
@@ -445,15 +411,10 @@ impl NodeFragment {
 
 impl Drop for NodeFragment {
     fn drop(&mut self) {
-        // SAFETY: the fragment owns the header and node. The allocation handle is read once;
-        // dropping it releases the typed block after no further access to the node is needed.
+        // SAFETY: the fragment owns the header and the node memory, laid out by `layout`.
         unsafe {
             std::ptr::drop_in_place(self.header.as_ptr());
-            if let Some(block) = self.allocation.as_ptr().read() {
-                drop(block);
-            } else {
-                std::alloc::dealloc(self.memory.as_ptr(), self.layout);
-            }
+            std::alloc::dealloc(self.memory.as_ptr(), self.layout);
         }
     }
 }

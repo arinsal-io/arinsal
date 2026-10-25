@@ -11,6 +11,9 @@ pub const STUB_CHECK_INTERVAL: usize = 4 << 10;
 const TB_RANGE: i64 = 1 << 15;
 const COND_RANGE: i64 = 1 << 20;
 const BRANCH_RANGE: i64 = 1 << 27;
+// Port of erts/emulator/asmjit/core/codeholder.cpp (CodeHolder::grow_buffer), OTP-29.1.1.
+// Its first allocation is 16 KiB minus three 32-byte allocator overheads.
+const CODE_BUFFER_INITIAL_BYTES: usize = (16 << 10) - 3 * 32;
 
 /// Hasher for label ids: a label is a dense `u32`, and SipHash costs more than the lookups it
 /// guards (every branch and every bind looks one up).
@@ -118,7 +121,7 @@ struct Literal {
 }
 
 /// AArch64 code builder. Offsets returned by [`label_offset`](Self::label_offset) are bytes.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CodeBuffer {
     emitter: Emitter,
     next_label: u32,
@@ -152,6 +155,7 @@ impl CodeBuffer {
     pub fn bind_count(&self) -> u64 {
         self.binds
     }
+
     /// Allocates a new unbound label.
     pub fn new_label(&mut self) -> Label {
         let label = Label(self.next_label);
@@ -525,6 +529,25 @@ impl CodeBuffer {
             return Err(BufferError::UnboundLabel(fixup.label));
         }
         Ok((self.emitter.words, self.labels))
+    }
+}
+
+impl Default for CodeBuffer {
+    fn default() -> Self {
+        Self {
+            emitter: Emitter::with_capacity(CODE_BUFFER_INITIAL_BYTES / 4),
+            next_label: 0,
+            labels: LabelMap::default(),
+            fixups: Vec::new(),
+            waiting: LabelMap::default(),
+            literals: Vec::new(),
+            literal_sites: HashMap::default(),
+            unreachable: false,
+            last_check: 0,
+            binds: 0,
+            min_stub_deadline: None,
+            min_literal_site: None,
+        }
     }
 }
 

@@ -111,12 +111,10 @@ fn caller_data(pid: Pid) -> u64 {
 
 /// The data of one `command` signal: a native driver takes one flat buffer, a loaded driver the
 /// pieces of `erts_ioq_iolist_to_vec` (`true` marks a reference-counted binary).
-// OTP keeps the command's small I/O vector in the erts_port_output stack frame.
-#[allow(clippy::large_enum_variant)]
 enum CommandData {
     Flat(Vec<u8>),
     /// A native driver's vector with referenced refc binaries (`outputv`).
-    Iov(arinsal_drv::CommandVector),
+    Iov(Vec<arinsal_drv::CommandPiece>),
     Pieces(Vec<(Vec<u8>, bool)>),
 }
 
@@ -198,19 +196,11 @@ pub(crate) fn output(
     }
     let async_nosuspend = asynchronous && flags.nosuspend && !flags.force;
     let try_call = sched_flags & (invalid_flags | PTS_FLGS_FORCE_SCHEDULE_OP) == 0;
-    // A driver with outputv receives the iovec directly, as erts_port_output does.
+    // A native driver has no `outputv`: its command data is one flat buffer.
     let command = if drv.driver().is_native() {
-        command_pieces(data).map(|mut pieces| {
-            if drv.driver().has_outputv() {
-                CommandData::Iov(pieces)
-            } else {
-                match pieces.as_mut_slice() {
-                    [arinsal_drv::CommandPiece::Bytes(bytes)] => {
-                        CommandData::Flat(std::mem::take(bytes))
-                    }
-                    _ => CommandData::Iov(pieces),
-                }
-            }
+        command_pieces(data).map(|mut pieces| match pieces.as_mut_slice() {
+            [arinsal_drv::CommandPiece::Bytes(bytes)] => CommandData::Flat(std::mem::take(bytes)),
+            _ => CommandData::Iov(pieces.into_vec()),
         })
     } else {
         let mut pieces = Vec::new();
@@ -370,17 +360,9 @@ pub(crate) fn command_light(
     {
         return None;
     }
-    let command = command_pieces(*data).map(|mut pieces| {
-        if drv.driver().has_outputv() {
-            CommandData::Iov(pieces)
-        } else {
-            match pieces.as_mut_slice() {
-                [arinsal_drv::CommandPiece::Bytes(bytes)] => {
-                    CommandData::Flat(std::mem::take(bytes))
-                }
-                _ => CommandData::Iov(pieces),
-            }
-        }
+    let command = command_pieces(*data).map(|mut pieces| match pieces.as_mut_slice() {
+        [arinsal_drv::CommandPiece::Bytes(bytes)] => CommandData::Flat(std::mem::take(bytes)),
+        _ => CommandData::Iov(pieces.into_vec()),
     })?;
     let imm = drv
         .try_imm_call(PTS_FLGS_BUSY, false, "command", (CONTEXT_REDS / 10) as u32)
