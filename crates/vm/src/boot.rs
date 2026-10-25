@@ -105,7 +105,8 @@ pub fn run_with_debugger_flags(
         global_atoms()
             .intern(module)
             .map_err(|error| VmError::Load(format!("cannot intern {module}: {error:?}")))?;
-        vm.load_file(&path)?;
+        let bytes = std::fs::read(&path).map_err(|e| VmError::Load(e.to_string()))?;
+        vm.load_bytes(&preload_strip(&bytes))?;
     }
 
     let mut input_heap = VecHeap::new();
@@ -157,6 +158,45 @@ fn user_lib_dirs() -> Vec<PathBuf> {
         paths.extend(found);
     }
     paths
+}
+
+/// The beam a preloaded module is compiled into: only the chunks the loader needs, in chunk-id
+/// order. Line, debug and attribute chunks are dropped, so frames of preloaded modules have no
+/// file or line (`init:start_it/1` is `{init,start_it,1,[]}`), as in erl.
+// Port of erts/emulator/utils/make_preload (beam_strip), OTP-29.1.1.
+fn preload_strip(beam: &[u8]) -> Vec<u8> {
+    const NEEDED: [&[u8; 4]; 8] = [
+        b"Code", b"AtU8", b"ImpT", b"ExpT", b"StrT", b"FunT", b"LitT", b"Type",
+    ];
+    // A compressed module is not an IFF form: make_preload leaves it as it is.
+    if beam.len() < 12 || &beam[..4] != b"FOR1" || &beam[8..12] != b"BEAM" {
+        return beam.to_vec();
+    }
+    let mut chunks = std::collections::BTreeMap::new();
+    let mut rest = &beam[12..];
+    while rest.len() >= 8 {
+        let id: [u8; 4] = rest[..4].try_into().expect("four bytes");
+        let size = u32::from_be_bytes(rest[4..8].try_into().expect("four bytes")) as usize;
+        let padded = size.div_ceil(4) * 4;
+        let end = (8 + padded).min(rest.len());
+        chunks.insert(id, &rest[..end]);
+        rest = &rest[end..];
+    }
+    let body: Vec<u8> = chunks
+        .iter()
+        .filter(|(id, _)| NEEDED.contains(id))
+        .flat_map(|(_, chunk)| chunk.iter().copied())
+        .collect();
+    let mut out = Vec::with_capacity(body.len() + 12);
+    out.extend_from_slice(b"FOR1");
+    out.extend_from_slice(
+        &u32::try_from(body.len() + 4)
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(b"BEAM");
+    out.extend_from_slice(&body);
+    out
 }
 
 /// Preloaded modules in the order of `PRELOAD_BEAM`.
