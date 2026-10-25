@@ -46,13 +46,13 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
 ) -> Option<V::Output> {
     let f = match (module, name, arity) {
         ("erlang", "length", 1) => v.entry::<word_bodies::length>(),
-        ("erlang", "++" | "append", 2) => v.entry::<bodies::append>(),
-        ("erlang", "--" | "subtract", 2) => v.entry::<bodies::subtract>(),
-        ("lists", "reverse", 2) => v.entry::<bodies::reverse>(),
-        ("lists", "member", 2) => v.entry::<bodies::member>(),
-        ("lists", "keyfind", 3) => v.entry::<bodies::keyfind>(),
-        ("lists", "keymember", 3) => v.entry::<bodies::keymember>(),
-        ("lists", "keysearch", 3) => v.entry::<bodies::keysearch>(),
+        ("erlang", "++" | "append", 2) => v.entry::<word_bodies::append>(),
+        ("erlang", "--" | "subtract", 2) => v.entry::<word_bodies::subtract>(),
+        ("lists", "reverse", 2) => v.entry::<word_bodies::reverse>(),
+        ("lists", "member", 2) => v.entry::<word_bodies::member>(),
+        ("lists", "keyfind", 3) => v.entry::<word_bodies::keyfind>(),
+        ("lists", "keymember", 3) => v.entry::<word_bodies::keymember>(),
+        ("lists", "keysearch", 3) => v.entry::<word_bodies::keysearch>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -528,10 +528,11 @@ fn append_empty_rhs(
     Ok(AppendStep::More(AppendCont { iterator, ..state }))
 }
 
-fn append(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn append(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    // Port of `append` in erts/emulator/beam/erl_bif_lists.c, OTP-29.1.1.
     // The VM trap passes a finite budget. A direct call finishes the list.
     if args[0] == Term::NIL {
-        return Ok(args[1]);
+        return args[1];
     }
     let budget = ctx.reduction_budget();
     if budget != usize::MAX {
@@ -544,38 +545,45 @@ fn append(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
                 budget.saturating_mul(APPEND_ALLOC_PER_RED),
             )
         };
-        return match lists_append(ctx, state, onheap, alloc)? {
-            AppendStep::Done(value) => Ok(value),
-            AppendStep::More(cont) => {
-                // Trap state is built only when this slice's counter runs out.
-                ctx.defer_trap(DeferredTrap::Append(cont));
-                Ok(Term::NIL)
-            }
+        return match lists_append(ctx, state, onheap, alloc) {
+            Ok(AppendStep::Done(value)) => value,
+            Ok(AppendStep::More(cont)) => ctx.trap(DeferredTrap::Append(cont)),
+            Err(error) => ctx.fail(error),
         };
     }
     let mut state = AppendCont::start(args[0], args[1]);
     loop {
-        match lists_append(ctx, state, usize::MAX, usize::MAX)? {
-            AppendStep::Done(value) => return Ok(value),
-            AppendStep::More(next) => state = next,
+        match lists_append(ctx, state, usize::MAX, usize::MAX) {
+            Ok(AppendStep::Done(value)) => return value,
+            Ok(AppendStep::More(next)) => state = next,
+            Err(error) => return ctx.fail(error),
         }
     }
 }
 
-fn subtract(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn subtract(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    // Port of `subtract` in erts/emulator/beam/erl_bif_lists.c, OTP-29.1.1.
     // Port of erts/emulator/beam/erl_bif_lists.c:367-1020 (subtract stages),
     // OTP-29.1.1. A finite budget is one slice of `SubtractWalk`; the walk is
     // boxed only when that slice traps. An unbounded call is the direct BIF.
     if ctx.reduction_budget() != usize::MAX {
-        let mut walk = SubtractWalk::new(args[0], args[1])?;
-        return match walk.step(ctx, ctx.reduction_budget())? {
-            Some(value) => Ok(value),
-            None => {
-                ctx.defer_trap(DeferredTrap::Subtract(walk));
-                Ok(Term::NIL)
-            }
+        let mut walk = match SubtractWalk::new(args[0], args[1]) {
+            Ok(walk) => walk,
+            Err(error) => return ctx.fail(error),
+        };
+        return match walk.step(ctx, ctx.reduction_budget()) {
+            Ok(Some(value)) => value,
+            Ok(None) => ctx.trap(DeferredTrap::Subtract(walk)),
+            Err(error) => ctx.fail(error),
         };
     }
+    match subtract_unbounded(ctx, args) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+fn subtract_unbounded(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if !matches!(
         args[0].classify(),
         arinsal_term::TermKind::List | arinsal_term::TermKind::Nil
@@ -1327,16 +1335,15 @@ pub fn lists_reverse(
     }
 }
 
-fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    // Port of `lists_reverse_2` in erts/emulator/beam/erl_bif_lists.c, OTP-29.1.1.
     let &[list, tail] = args else {
-        return Err(BADARG);
+        return ctx.badarg();
     };
-    match lists_reverse(ctx, list, tail, usize::MAX)? {
-        ReverseStep::Done(value) => Ok(value),
-        ReverseStep::Trap(cont) => {
-            ctx.defer_trap(DeferredTrap::Reverse(cont));
-            Ok(Term::NIL)
-        }
+    match lists_reverse(ctx, list, tail, usize::MAX) {
+        Ok(ReverseStep::Done(value)) => value,
+        Ok(ReverseStep::Trap(cont)) => ctx.trap(DeferredTrap::Reverse(cont)),
+        Err(error) => ctx.fail(error),
     }
 }
 
@@ -1415,8 +1422,21 @@ pub fn lists_member(
     }
 }
 
-fn member(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    lists_member_bif(ctx, args)
+fn member(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    // Port of `lists_member_2` in erts/emulator/beam/erl_bif_lists.c, OTP-29.1.1.
+    let &[term, list] = args else {
+        return ctx.badarg();
+    };
+    match lists_member(
+        ctx,
+        term,
+        list,
+        ctx.reduction_budget().saturating_mul(MEMBER_PER_RED),
+    ) {
+        Ok(MemberStep::Done(found)) => bool_term(found),
+        Ok(MemberStep::More(cont)) => ctx.trap(DeferredTrap::Member(cont)),
+        Err(error) => ctx.fail(error),
+    }
 }
 
 /// Run the process BIF body for `lists:member/2` with its live FCALLS context.
@@ -1581,36 +1601,33 @@ pub fn lists_key(
     }
 }
 
-fn keyfind(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    match key_search(args, KEYFIND_MAX_ITER)? {
-        KeyfindStep::Done(found) => Ok(found.unwrap_or(bool_term(false))),
-        KeyfindStep::More(cont) => {
-            ctx.defer_trap(DeferredTrap::Key(cont));
-            Ok(Term::NIL)
-        }
+fn keyfind(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    // Port of `keyfind`/`lists_keyfind_3` in erl_bif_lists.c, OTP-29.1.1.
+    match key_search(args, KEYFIND_MAX_ITER) {
+        Ok(KeyfindStep::Done(found)) => found.unwrap_or(bool_term(false)),
+        Ok(KeyfindStep::More(cont)) => ctx.trap(DeferredTrap::Key(cont)),
+        Err(error) => ctx.fail(error),
     }
 }
 
-fn keymember(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    match key_search(args, KEYFIND_MAX_ITER)? {
-        KeyfindStep::Done(found) => Ok(bool_term(found.is_some())),
-        KeyfindStep::More(cont) => {
-            ctx.defer_trap(DeferredTrap::Key(cont));
-            Ok(Term::NIL)
-        }
+fn keymember(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    // Port of `keyfind`/`lists_keymember_3` in erl_bif_lists.c, OTP-29.1.1.
+    match key_search(args, KEYFIND_MAX_ITER) {
+        Ok(KeyfindStep::Done(found)) => bool_term(found.is_some()),
+        Ok(KeyfindStep::More(cont)) => ctx.trap(DeferredTrap::Key(cont)),
+        Err(error) => ctx.fail(error),
     }
 }
 
-fn keysearch(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    match key_search(args, KEYFIND_MAX_ITER)? {
-        KeyfindStep::Done(found) => Ok(match found {
+fn keysearch(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    // Port of `keyfind`/`lists_keysearch_3` in erl_bif_lists.c, OTP-29.1.1.
+    match key_search(args, KEYFIND_MAX_ITER) {
+        Ok(KeyfindStep::Done(found)) => match found {
             Some(tuple) => keysearch_result(ctx, tuple),
             None => bool_term(false),
-        }),
-        KeyfindStep::More(cont) => {
-            ctx.defer_trap(DeferredTrap::Key(cont));
-            Ok(Term::NIL)
-        }
+        },
+        Ok(KeyfindStep::More(cont)) => ctx.trap(DeferredTrap::Key(cont)),
+        Err(error) => ctx.fail(error),
     }
 }
 
@@ -2058,7 +2075,4 @@ mod trap_budget_tests {
     }
 }
 
-crate::word_bif_bodies_in!(word_bodies; length);
-crate::process_bif_bodies!(
-    append, subtract, reverse, member, keyfind, keymember, keysearch,
-);
+crate::word_bif_bodies_in!(word_bodies; length, append, subtract, reverse, member, keyfind, keymember, keysearch);

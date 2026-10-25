@@ -2668,6 +2668,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             written: 0,
             head: Term::NIL,
             first_cdr: None,
+            last_cdr: None,
         })
     }
     /// Reserve a boxed heap object and fill its header and terms in allocation order.
@@ -3180,13 +3181,16 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         if count <= 64 {
             return self.heap_bitstring_from_parts(bytes, &[], bit_len);
         }
-        let mut data = bytes[..count].to_vec();
+        // Port of erts/emulator/beam/external.c (`dec_term`, BINARY_EXT / BIT_BINARY_EXT),
+        // OTP-29.1.1: allocate the final refc binary and copy the payload once.
+        let mut binary = RefcBinary::new_zeroed(count)?;
+        let data = binary.bytes_mut_unique().ok_or(TermError::BadArg)?;
+        data.copy_from_slice(&bytes[..count]);
         if !bit_len.is_multiple_of(8)
             && let Some(last) = data.last_mut()
         {
             *last &= 0xff << (8 - bit_len % 8);
         }
-        let binary = RefcBinary::new(data)?;
         self.install_refc_binary(binary, bit_len)
     }
 
@@ -3856,6 +3860,7 @@ pub struct ConsListBuilder {
     written: usize,
     head: Term,
     first_cdr: Option<usize>,
+    last_cdr: Option<usize>,
 }
 
 impl ConsListBuilder {
@@ -3985,6 +3990,28 @@ impl ConsListBuilder {
         Ok(())
     }
 
+    /// Append one decoded list head in input order, linking it after the previous cell.
+    /// Port of the forward `dec_term` LIST_EXT cell writes in external.c, OTP-29.1.1.
+    #[inline(always)]
+    pub fn append(&mut self, value: Term) -> Result<(), TermError> {
+        if self.written == self.len {
+            return Err(TermError::BadArg);
+        }
+        let cell = (self.start as *mut u64).wrapping_add(2 * self.written);
+        store(cell, value.bits());
+        store(cell.wrapping_add(1), Term::NIL.bits());
+        let term = Term::from_ptr(cell, 1);
+        if let Some(last_cdr) = self.last_cdr {
+            store(last_cdr as *mut u64, term.bits());
+        } else {
+            self.head = term;
+            self.first_cdr = Some(cell.wrapping_add(1) as usize);
+        }
+        self.last_cdr = Some(cell.wrapping_add(1) as usize);
+        self.written += 1;
+        Ok(())
+    }
+
     /// Prepend a bounded run using the caller's exact count, checking capacity once per chunk.
     ///
     /// This keeps a resumable map projection's inner loop to the `CONS` stores and pointer
@@ -4033,7 +4060,9 @@ impl ConsListBuilder {
             return Ok(tail);
         }
         store(
-            self.first_cdr.expect("nonempty list has first cell") as *mut u64,
+            self.last_cdr
+                .or(self.first_cdr)
+                .expect("nonempty list has a cdr slot") as *mut u64,
             tail.bits(),
         );
         Ok(self.head)
