@@ -247,6 +247,22 @@ impl ImmCall<'_> {
     }
 }
 
+/// Processes suspended on the busy port: none until the port is busy.
+// Boxed on purpose: the pointer is 8 bytes where an empty `Vec` is 24.
+#[allow(clippy::box_collection)]
+#[derive(Default)]
+struct Suspended(Option<Box<Vec<u64>>>);
+
+impl Suspended {
+    fn push(&mut self, pid: u64) {
+        self.0.get_or_insert_with(Default::default).push(pid);
+    }
+
+    fn take(&mut self) -> Vec<u64> {
+        self.0.take().map(|pids| *pids).unwrap_or_default()
+    }
+}
+
 #[derive(Default)]
 struct PortTaskQueues {
     incoming: Queue<PortTask>,
@@ -254,7 +270,7 @@ struct PortTaskQueues {
     exec: Queue<PortTask>,
     busy: Queue<PortTask>,
     /// `prt->suspended`: processes suspended on the busy port.
-    suspended: Vec<u64>,
+    suspended: Suspended,
     /// The busy caller table: tasks per caller in the busy queue.
     callers: Option<Box<BusyCallerTable<PortTask>>>,
     processing_busy: bool,
@@ -326,7 +342,7 @@ impl DriverPort {
                     .and_not(PTS_FLG_CHK_UNSET_BUSY_PORT_Q | PTS_FLG_BUSY_PORT_Q);
                 flags = old & !(PTS_FLG_CHK_UNSET_BUSY_PORT_Q | PTS_FLG_BUSY_PORT_Q);
                 if old & PTS_FLGS_BUSY == PTS_FLG_BUSY_PORT_Q {
-                    resume = std::mem::take(&mut inq.suspended);
+                    resume = inq.suspended.take();
                 }
             } else if flags & PTS_FLG_CHK_UNSET_BUSY_PORT_Q != 0 {
                 flags = self.sched.and_not(PTS_FLG_CHK_UNSET_BUSY_PORT_Q)
@@ -414,7 +430,7 @@ impl DriverPort {
                 .sched
                 .and_not(PTS_FLG_BUSY_PORT_Q | PTS_FLG_CHK_UNSET_BUSY_PORT_Q);
             if old & PTS_FLGS_BUSY == PTS_FLG_BUSY_PORT_Q {
-                std::mem::take(&mut inq.suspended)
+                inq.suspended.take()
             } else {
                 Vec::new()
             }
@@ -704,7 +720,7 @@ impl DriverPort {
 
     /// Port of erts/emulator/beam/io.c:5261 (erts_port_resume_procs).
     fn resume_procs(&self) {
-        let list = std::mem::take(&mut self.sched.queues().suspended);
+        let list = self.sched.queues().suspended.take();
         if !list.is_empty() {
             self.host.resume_processes(self, list);
         }
@@ -820,7 +836,7 @@ impl DriverPort {
         }
         self.sched
             .and_not(PTS_FLG_HAVE_BUSY_TASKS | PTS_FLG_HAVE_TASKS | PTS_FLGS_BUSY);
-        let suspended = std::mem::take(&mut self.sched.queues().suspended);
+        let suspended = self.sched.queues().suspended.take();
         if !suspended.is_empty() {
             self.host.resume_processes(self, suspended);
         }

@@ -188,7 +188,7 @@ fn deselect(table: &mut HashMap<i32, FdState>, fd: i32, mode: c_int) {
 /// Port of io.c:5463 (print_driver_name), without the port id: the port and driver names
 /// with a trailing space.
 fn name_part(port: &DriverPort) -> String {
-    let name = port.name.lock().clone();
+    let name = port.command_name();
     let driver = port.driver.name();
     if name.is_empty() || name == driver {
         format!("{driver} ")
@@ -228,7 +228,7 @@ fn report_stale(owner: &DriverPort, mode: c_int) {
         READ => "Input",
         _ => "",
     };
-    let name = owner.name.lock().clone();
+    let name = owner.command_name();
     let name = if name.is_empty() { "<unknown>" } else { &name };
     owner.host.log_error(&format!(
         "#Port<0.{}>: {name}: {kind} driver gone away without deselecting!\n",
@@ -811,11 +811,11 @@ impl DriverPort {
                     self.id,
                     self.driver.name(),
                     {
-                        let name = self.name.lock();
-                        if *name == self.driver.name() || name.is_empty() {
+                        let name = self.command_name();
+                        if name == self.driver.name() || name.is_empty() {
                             String::new()
                         } else {
-                            format!("({}) ", *name)
+                            format!("({name}) ")
                         }
                     },
                 ));

@@ -620,7 +620,7 @@ fn accept_send(inner: &mut Inner, payload: SendData<'_>) -> SendOutcome {
         // Port of inet_drv.c:13773-13793, OTP-29.1.1: queue behind pending output, and
         // behind the file while a sendfile (TCP_ADDF_SENDFILE) is in progress; busy at `high`.
         inner.sendq.enq(&hdr[..h_len]);
-        payload.enqueue(&mut inner.sendq, 0);
+        payload.enqueue(inner.sendq.queue(), 0);
         if sz + len + h_len >= inner.high.max(0) as usize {
             if inner.send_timeout == 0 {
                 return SendOutcome::Reply(Some("timeout"));
@@ -641,7 +641,7 @@ fn accept_send(inner: &mut Inner, payload: SendData<'_>) -> SendOutcome {
     if inner.delay_send {
         // inet_drv.c:13810-13814: queue; output runs on the next write event.
         inner.sendq.enq(&hdr[..h_len]);
-        payload.enqueue(&mut inner.sendq, 0);
+        payload.enqueue(inner.sendq.queue(), 0);
         return SendOutcome::Reply(None);
     }
     let Some(fd) = inner.fd.as_ref().map(AsRawFd::as_raw_fd) else {
@@ -672,9 +672,9 @@ fn accept_send(inner: &mut Inner, payload: SendData<'_>) -> SendOutcome {
     }
     if n < h_len {
         inner.sendq.enq(&hdr[n..h_len]);
-        payload.enqueue(&mut inner.sendq, 0);
+        payload.enqueue(inner.sendq.queue(), 0);
     } else {
-        payload.enqueue(&mut inner.sendq, n - h_len);
+        payload.enqueue(inner.sendq.queue(), n - h_len);
     }
     SendOutcome::Reply(None)
 }
@@ -2702,10 +2702,6 @@ impl IoQueue {
         self.size
     }
 
-    fn is_empty(&self) -> bool {
-        self.size == 0
-    }
-
     /// `driver_enq`: copy `bytes` into a new segment; zero-length items are dropped.
     fn enq(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
@@ -2770,6 +2766,54 @@ impl IoQueue {
     fn clear(&mut self) {
         self.segs.clear();
         self.size = 0;
+    }
+}
+
+/// The send queue of a socket, allocated by the first byte that cannot be written at once: an
+/// idle connection holds only the pointer (erts embeds `prt->ioq`, which is empty until then).
+#[derive(Default)]
+struct SendQueue(Option<Box<IoQueue>>);
+
+impl SendQueue {
+    /// The queue, allocated first when the socket has none.
+    fn queue(&mut self) -> &mut IoQueue {
+        self.0.get_or_insert_with(Default::default)
+    }
+
+    fn size(&self) -> usize {
+        self.0.as_ref().map_or(0, |queue| queue.size())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.size() == 0
+    }
+
+    fn enq(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.queue().enq(bytes);
+        }
+    }
+
+    fn head(&self) -> Option<&[u8]> {
+        self.0.as_ref()?.head()
+    }
+
+    fn peekq(&self, max: usize) -> Vec<libc::iovec> {
+        self.0
+            .as_ref()
+            .map_or_else(Vec::new, |queue| queue.peekq(max))
+    }
+
+    fn deq(&mut self, n: usize) {
+        if let Some(queue) = self.0.as_mut() {
+            queue.deq(n);
+        }
+    }
+
+    fn clear(&mut self) {
+        if let Some(queue) = self.0.as_mut() {
+            queue.clear();
+        }
     }
 }
 
@@ -3046,6 +3090,9 @@ fn close_atom(inner: &Inner) -> &'static str {
     if inner.reset { "econnreset" } else { "closed" }
 }
 
+// An `Arc<Sock>` should stay within the 384-byte size class of the system allocator.
+const _: () = assert!(std::mem::size_of::<Sock>() <= 368);
+
 pub(crate) struct Sock {
     id: u64,
     runtime: &'static Runtime,
@@ -3285,7 +3332,7 @@ struct Inner {
     /// The input buffer (`i_buf`, `i_ptr_start`, `i_ptr`): allocated by the first receive, null
     /// before, as in erts.
     rx: Option<Box<RxBuf>>,
-    sendq: IoQueue,
+    sendq: SendQueue,
     // Boxed on purpose: the pointer is 8 bytes where an empty `Vec` is 24.
     #[allow(clippy::box_collection)]
     empty_out_q_subs: Option<Box<Vec<Pid>>>,
@@ -3414,7 +3461,7 @@ impl Default for Inner {
             backlog: 5,
             op_ref: 0,
             rx: None,
-            sendq: IoQueue::default(),
+            sendq: SendQueue::default(),
             empty_out_q_subs: None,
             sendfile: None,
             recv: None,
