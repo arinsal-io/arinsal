@@ -9,12 +9,12 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::task::call1;
-use crate::{DriverPort, REDS_TIMEOUT};
+use crate::{DriverPort, REDS_TIMEOUT, WeakPortRef};
 
 /// `c_p->common.timer` of a port (`ERTS_PTMR_NONE`, a timer, `ERTS_PTMR_TIMEDOUT`).
 #[derive(Clone, Copy, Default)]
@@ -24,7 +24,8 @@ pub(crate) enum PortTimer {
     /// Armed for tick `pos` since the service origin.
     Armed {
         epoch: u64,
-        pos: i128,
+        // Ticks of 1 ms fit an i64; a 128-bit field would align the whole enum to 16 bytes.
+        pos: i64,
         /// The host's scheduler timer, when the host has one.
         handle: Option<u64>,
     },
@@ -48,7 +49,7 @@ fn ticks_before(ns: i128) -> i128 {
 
 struct Entry {
     at: Instant,
-    port: Weak<DriverPort>,
+    port: WeakPortRef,
     epoch: u64,
 }
 
@@ -113,7 +114,7 @@ fn serve(service: &Service) {
 
 impl DriverPort {
     /// Port of erl_hl_timer.c:3031 (erts_set_port_timer). `tmo` in ms.
-    pub fn set_timer(self: &Arc<Self>, tmo: i64) {
+    pub fn set_timer(&self, tmo: i64) {
         let mut timer = self.timer.lock();
         if let PortTimer::Armed {
             handle: Some(handle),
@@ -135,8 +136,9 @@ impl DriverPort {
         } else {
             ticks_before(now_ns()) + i128::from(tmo) + 1
         };
+        let pos = i64::try_from(pos).unwrap_or(i64::MAX);
         // erl_hl_timer.c:3031: the timer lives on a scheduler's timer wheel.
-        let weak = Arc::downgrade(self);
+        let weak = self.me.clone();
         let handle = self.host.start_port_timer(
             tmo.max(1) as u64,
             Box::new(move || {
@@ -154,7 +156,7 @@ impl DriverPort {
         let service = service();
         service.heap.lock().unwrap().push(Reverse(Entry {
             at,
-            port: Arc::downgrade(self),
+            port: self.me.clone(),
             epoch,
         }));
         service.wake.notify_one();
@@ -181,13 +183,13 @@ impl DriverPort {
             PortTimer::Armed { pos, .. } => {
                 // get_time_left
                 let now = ticks_before(now_ns()) + 1;
-                i64::try_from((pos - now).max(0)).unwrap_or(i64::MAX)
+                i64::try_from((i128::from(pos) - now).max(0)).unwrap_or(i64::MAX)
             }
         }
     }
 
     /// The timer service saw timer `epoch` expire (`port_timeout_callback`).
-    fn timer_expired(self: &Arc<Self>, epoch: u64) {
+    fn timer_expired(&self, epoch: u64) {
         let mut timer = self.timer.lock();
         if matches!(*timer, PortTimer::Armed { epoch: g, .. } if g == epoch) {
             *timer = PortTimer::TimedOut { epoch };

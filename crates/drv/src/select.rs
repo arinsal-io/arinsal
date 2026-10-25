@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 
 use crate::task::{call2, event_of};
-use crate::{DriverPort, REDS_INPUT, layout, poll};
+use crate::{DriverPort, PortRef, REDS_INPUT, layout, poll};
 
 /// `ERL_DRV_READ`.
 pub const READ: c_int = layout::ERL_DRV_READ as c_int;
@@ -31,7 +31,7 @@ const DIRS: [c_int; 2] = [READ, WRITE];
 #[derive(Default)]
 struct Dir {
     /// Port that selected this direction (`select->inport`/`outport`).
-    owner: Option<Arc<DriverPort>>,
+    owner: Option<PortRef>,
     /// Registration in the poll set (`active_events`).
     reg: Option<u64>,
     /// The ready task running or queued (`is_iotask_active`); the event is re-armed after it.
@@ -75,8 +75,9 @@ struct NifSel {
 /// `ErtsDrvEventState` of type `ERTS_EV_TYPE_DRV_SEL` or `ERTS_EV_TYPE_NIF`.
 #[derive(Default)]
 struct FdState {
-    /// `state->driver.nif` while the type is `ERTS_EV_TYPE_NIF`.
-    nif: Option<NifSel>,
+    /// `state->driver.nif` while the type is `ERTS_EV_TYPE_NIF`; a pointer, as erts keeps it in
+    /// the union of the descriptor state.
+    nif: Option<Box<NifSel>>,
     /// `state->events`: `READ | WRITE`.
     events: c_int,
     /// `ERTS_EV_FLAG_USED`: `ERL_DRV_USE` was given when the events were set.
@@ -298,7 +299,7 @@ fn steal(table: &mut HashMap<i32, FdState>, fd: i32, port: &DriverPort, mode: c_
 
 /// Port of erl_check_io.c:988 (driver_select). `fd` is the descriptor behind the
 /// `ErlDrvEvent`.
-pub(crate) fn driver_select(port: &Arc<DriverPort>, fd: i32, mode: c_int, on: bool) -> c_int {
+pub(crate) fn driver_select(port: &DriverPort, fd: i32, mode: c_int, on: bool) -> c_int {
     if fd < 0 {
         return -1;
     }
@@ -343,7 +344,7 @@ pub(crate) fn driver_select(port: &Arc<DriverPort>, fd: i32, mode: c_int, on: bo
         state.events |= ctl;
         for (dir, bit) in DIRS.iter().enumerate() {
             if ctl & bit != 0 {
-                state.dirs[dir].owner = Some(Arc::clone(port));
+                state.dirs[dir].owner = Some(port.arc());
                 arm(fd, state, dir);
             }
         }
@@ -535,10 +536,10 @@ pub fn nif_select(
         ctl &= !old_events;
         state.events |= ctl;
         if state.nif.is_none() && ctl != 0 {
-            state.nif = Some(NifSel {
+            state.nif = Some(Box::new(NifSel {
                 resource: Arc::clone(&resource),
                 messages: [None, None],
-            });
+            }));
             resource.keep();
         }
         for (dir, bit) in DIRS.iter().enumerate() {
@@ -769,7 +770,7 @@ impl DriverPort {
     /// Port of erl_port_task.c:1776 (ERTS_PORT_TASK_INPUT/OUTPUT) with the default
     /// callbacks of io.c:7517 (no_ready_input_callback/no_ready_output_callback).
     /// `true` when a callback (or the missing-callback report) ran.
-    pub(crate) fn run_io(self: &Arc<Self>, dir: usize, fd: i32, reg: u64) -> bool {
+    pub(crate) fn run_io(&self, dir: usize, fd: i32, reg: u64) -> bool {
         let _guard = self.guard();
         if !self.live() || !begin_io_task(self, fd, dir, reg) {
             return false;

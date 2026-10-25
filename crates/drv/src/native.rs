@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::PortRef;
 use crate::lock::ReentrantLock;
 use crate::{Callbacks, ControlReply, Driver, DriverPort, ERL_DRV_FLAG_USE_PORT_LOCKING};
 
@@ -103,7 +104,7 @@ impl DriverPort {
     }
 
     /// This port as an `Arc`, for APIs that keep a reference (`driver_select`, timers).
-    pub fn arc(&self) -> Arc<DriverPort> {
+    pub fn arc(&self) -> PortRef {
         self.me.upgrade().expect("a live port is owned by an Arc")
     }
 }

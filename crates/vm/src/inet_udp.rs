@@ -175,18 +175,14 @@ fn settle(sock: &Arc<Sock>) {
 }
 
 /// Install the driver state of a `udp_inet` port.
-pub(crate) fn attach(handle: &Arc<PortHandle>, port: &Arc<DriverPort>) {
+pub(crate) fn attach(handle: &Arc<PortHandle>, port: &DriverPort) {
     let sock = Arc::new(Sock::new(handle.id(), handle, port));
-    handle.set_udp_driver_data(Arc::clone(&sock));
     port.start_native(sock);
 }
 
 /// Port of inet_drv.c (packet_inet_stop): drop the datagram socket. A waiting `recv`
 /// sees `{error, closed}`.
 fn udp_inet_stop(sock: &Arc<Sock>) {
-    if let Some(handle) = sock.handle.upgrade() {
-        handle.take_udp_driver_data();
-    }
     let (fd, pending) = {
         let mut inner = sock.inner.lock().unwrap();
         let fd = inner.fd.take();
@@ -1937,18 +1933,16 @@ fn anc_term(heap: &mut ProcessHeap, anc: &[Anc]) -> Option<Term> {
 pub(crate) struct Sock {
     id: u64,
     handle: Weak<PortHandle>,
-    port: Weak<DriverPort>,
     inner: Mutex<Inner>,
 }
 
 impl Sock {
-    fn new(id: u64, handle: &Arc<PortHandle>, port: &Arc<DriverPort>) -> Self {
+    fn new(id: u64, handle: &Arc<PortHandle>, port: &DriverPort) -> Self {
         Self {
             id,
             handle: Arc::downgrade(handle),
-            port: Arc::downgrade(port),
             inner: Mutex::new(Inner {
-                port: Arc::downgrade(port),
+                port: Some(port.weak()),
                 ..Inner::default()
             }),
         }
@@ -1958,8 +1952,8 @@ impl Sock {
         self.handle.upgrade().expect("live udp inet port handle")
     }
 
-    fn port(&self) -> Option<Arc<DriverPort>> {
-        self.port.upgrade()
+    fn port(&self) -> Option<arinsal_drv::PortRef> {
+        self.handle.upgrade()?.drv_port()
     }
 }
 
@@ -1982,7 +1976,7 @@ struct Inner {
     /// `{udp_passive, S}` is due after `setopts` (the `{active,N}` count reached zero).
     emit_passive: bool,
     /// The `DriverPort` of this socket (`desc->inet.port`).
-    port: Weak<DriverPort>,
+    port: Option<arinsal_drv::WeakPortRef>,
     /// The deadline the port timer is armed for.
     timer_at: Option<Instant>,
     fd: Option<UdpFd>,
@@ -2031,7 +2025,7 @@ impl Default for Inner {
     fn default() -> Self {
         // Port of inet_drv.c:10891 (inet_start) and :14508 (read_packets), OTP-29.1.1.
         Self {
-            port: Weak::new(),
+            port: None,
             timer_at: None,
             fd: None,
             fd_external: None,
@@ -2114,13 +2108,13 @@ struct UdpFd {
     fd: OwnedFd,
     /// The descriptor number given to `driver_select` (the caller's one for `{fd, Fd}`).
     select_fd: RawFd,
-    port: Weak<DriverPort>,
+    port: Option<arinsal_drv::WeakPortRef>,
     /// FD_READ is selected through `driver_select`.
     selected: bool,
 }
 
 impl UdpFd {
-    fn new(fd: OwnedFd, port: Weak<DriverPort>) -> Self {
+    fn new(fd: OwnedFd, port: Option<arinsal_drv::WeakPortRef>) -> Self {
         Self {
             select_fd: fd.as_raw_fd(),
             fd,
@@ -2138,7 +2132,7 @@ impl AsRawFd for UdpFd {
 
 impl Drop for UdpFd {
     fn drop(&mut self) {
-        if let Some(port) = self.port.upgrade() {
+        if let Some(port) = self.port.as_ref().and_then(|port| port.upgrade()) {
             use arinsal_drv::{SELECT_READ, SELECT_USE, SELECT_WRITE};
             port.select(
                 self.select_fd,

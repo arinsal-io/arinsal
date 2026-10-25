@@ -23,6 +23,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -328,18 +329,15 @@ pub(crate) fn set_nosigpipe(fd: RawFd) {
 
 /// Install the driver state of a `tcp_inet` port (`tcp_inet_start` /
 /// `tcp_inet_copy` for `driver_create_port`).
-pub(crate) fn attach(runtime: &'static Runtime, handle: &Arc<PortHandle>, port: &Arc<DriverPort>) {
+pub(crate) fn attach(runtime: &'static Runtime, handle: &Arc<PortHandle>, port: &DriverPort) {
     let sock = Arc::new(Sock::new(handle.id(), runtime, handle, port));
-    handle.set_tcp_driver_data(Arc::clone(&sock));
     port.start_native(sock);
 }
 
 /// Port of erts/emulator/drivers/common/inet_drv.c (tcp_inet_stop and tcp_desc_close),
 /// OTP-29.1.1: the port terminates; waiters receive `{error, closed}`.
 fn tcp_inet_stop(sock: &Arc<Sock>) {
-    if let Some(handle) = sock.handle.upgrade() {
-        handle.take_tcp_driver_data();
-    }
+    sock.stopped.store(true, Ordering::Release);
     let id = sock.id;
     // The port closed while owning a dist connection (its controller exited, e.g. through
     // `net_kernel:disconnect/1`): tear the connection down and deliver nodedown.
@@ -363,7 +361,11 @@ fn tcp_inet_stop(sock: &Arc<Sock>) {
         inner.phase = Phase::Closed;
         // Port of inet_drv.c (tcp_inet_stop, tcp_clear_output): a sender blocked on the
         // queue is released by the port's exit, not by a reply.
-        std::mem::take(&mut inner.pending)
+        inner
+            .pending
+            .take()
+            .map(|pending| *pending)
+            .unwrap_or_default()
     };
     send_empty_out_q_msgs(sock);
     for (caller, aref) in pending {
@@ -730,7 +732,6 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> ControlByte
                     inner.sendq.clear();
                 }
                 inner.take_fd();
-                inner.fd_external = None;
                 inner.phase = Phase::Closed;
                 ok_small()
             }
@@ -926,7 +927,6 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     inner.fd = Some(SockFd::new(unsafe { OwnedFd::from_raw_fd(fd) }));
     inner.domain = domain;
     inner.family_code = data[0];
-    inner.fd_external = None;
     inner.phase = Phase::Open;
     apply_saved(inner);
     ok_bytes(&[])
@@ -973,7 +973,6 @@ fn fdopen_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     if let Some(fd) = inner.fd.as_mut() {
         fd.select_fd = raw_fd;
     }
-    inner.fd_external = Some(raw_fd);
     inner.domain = domain;
     inner.family_code = data[0];
     inner.phase = if connected {
@@ -989,7 +988,8 @@ fn getfd(inner: &Inner) -> Vec<u8> {
     let Some(fd) = inner.fd.as_ref() else {
         return err_bytes("einval");
     };
-    let raw = inner.fd_external.unwrap_or_else(|| fd.as_raw_fd());
+    // `select_fd` is the number the socket was opened with: the caller's for `{fd, Fd}`.
+    let raw = fd.select_fd;
     ok_bytes(&(raw as u32).to_be_bytes())
 }
 
@@ -1098,7 +1098,10 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
                 aref,
                 deadline: deadline(timeout),
             }));
-            inner.pending.push((caller, aref));
+            inner
+                .pending
+                .get_or_insert_with(Default::default)
+                .push((caller, aref));
         }
         return ok_bytes(&aref.to_be_bytes());
     }
@@ -1137,7 +1140,8 @@ fn accept_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8]) 
                 // Port of inet_drv.c (INET_REQ_ACCEPT: driver_monitor_process on the caller).
                 let monitor = inner
                     .port
-                    .upgrade()
+                    .as_ref()
+                    .and_then(|port| port.upgrade())
                     .and_then(|port| port.monitor(caller.data()));
                 inner.accept_q.push_back(Waiter {
                     caller,
@@ -1145,7 +1149,10 @@ fn accept_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8]) 
                     deadline: deadline(timeout),
                     monitor,
                 });
-                inner.pending.push((caller, aref));
+                inner
+                    .pending
+                    .get_or_insert_with(Default::default)
+                    .push((caller, aref));
             }
             Accept::Reply(ok_bytes(&aref.to_be_bytes()))
         }
@@ -1220,7 +1227,7 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
             let inner = listen.inner.lock();
             Inner {
                 fd: Some(SockFd::new(fd)),
-                port: Arc::downgrade(port),
+                port: Some(port.weak()),
                 domain: inner.domain,
                 family_code: inner.family_code,
                 phase: Phase::Connected,
@@ -1244,7 +1251,6 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
             }
         };
         let sock = Arc::new(Sock::with_inner(handle.id(), runtime, handle, born));
-        handle.set_tcp_driver_data(Arc::clone(&sock));
         port.start_native(sock);
     });
     let (id, handle, port) = match created {
@@ -2497,7 +2503,10 @@ fn recv_req(inner: &mut Inner, caller: Pid, data: &[u8]) -> Vec<u8> {
         length: length as u32,
         deadline: deadline(timeout),
     });
-    inner.pending.push((caller, aref));
+    inner
+        .pending
+        .get_or_insert_with(Default::default)
+        .push((caller, aref));
     if timeout == 0 {
         inner.recv_timeout_if_empty = true;
     }
@@ -3041,7 +3050,8 @@ pub(crate) struct Sock {
     id: u64,
     runtime: &'static Runtime,
     handle: Weak<PortHandle>,
-    port: Weak<DriverPort>,
+    /// `tcp_inet_stop` ran: the port no longer has socket data.
+    stopped: AtomicBool,
     inner: Mutex<Inner>,
     /// Serializes taking packets from the receive buffer with emitting them, which happens
     /// after `inner` is released.
@@ -3062,14 +3072,14 @@ impl Sock {
         id: u64,
         runtime: &'static Runtime,
         handle: &Arc<PortHandle>,
-        port: &Arc<DriverPort>,
+        port: &DriverPort,
     ) -> Self {
         Self::with_inner(
             id,
             runtime,
             handle,
             Inner {
-                port: Arc::downgrade(port),
+                port: Some(port.weak()),
                 ..Inner::default()
             },
         )
@@ -3085,7 +3095,7 @@ impl Sock {
             id,
             runtime,
             handle: Arc::downgrade(handle),
-            port: inner.port.clone(),
+            stopped: AtomicBool::new(false),
             inner: Mutex::new(inner),
             io: Mutex::new(()),
         }
@@ -3095,13 +3105,17 @@ impl Sock {
         self.runtime
     }
 
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
     fn handle(&self) -> Arc<PortHandle> {
         self.handle.upgrade().expect("live inet port handle")
     }
 
     /// The `DriverPort` this socket is the driver data of.
-    fn port(&self) -> Option<Arc<DriverPort>> {
-        self.port.upgrade()
+    fn port(&self) -> Option<arinsal_drv::PortRef> {
+        self.handle.upgrade()?.drv_port()
     }
 }
 
@@ -3166,7 +3180,10 @@ struct Waiter {
 
 /// `driver_demonitor_process` once an accept no longer waits.
 fn demonitor_waiter(inner: &Inner, waiter: &Waiter) {
-    if let (Some(monitor), Some(port)) = (waiter.monitor, inner.port.upgrade()) {
+    if let (Some(monitor), Some(port)) = (
+        waiter.monitor,
+        inner.port.as_ref().and_then(|port| port.upgrade()),
+    ) {
         port.demonitor(monitor);
     }
 }
@@ -3217,9 +3234,8 @@ impl From<VecDeque<Waiter>> for WaiterQueue {
 
 struct Inner {
     fd: Option<SockFd>,
-    fd_external: Option<RawFd>,
     /// The `DriverPort` of this socket (`desc->inet.port`).
-    port: Weak<DriverPort>,
+    port: Option<arinsal_drv::WeakPortRef>,
     /// The deadline the port timer is armed for (`driver_set_timer`).
     timer_at: Option<Instant>,
     domain: i32,
@@ -3266,14 +3282,9 @@ struct Inner {
     linger_secs: i32,
     backlog: i32,
     op_ref: u16,
-    rbuf: Vec<u8>,
-    /// The input buffer as a reference-counted binary (`i_buf`), when the packet is delivered
-    /// as a sub-binary of it; the bytes then live here and `rbuf` is empty.
-    rbin: Option<arinsal_term::RefcBinary>,
-    /// A receive failure other than a reset (`tcp_recv_error`), reported at close.
-    rbuf_start: usize,
-    // Port of inet_drv.c (`i_buf`, `i_ptr_start`, `i_ptr`, `i_bufsz`), OTP-29.1.1.
-    rbuf_end: usize,
+    /// The input buffer (`i_buf`, `i_ptr_start`, `i_ptr`): allocated by the first receive, null
+    /// before, as in erts.
+    rx: Option<Box<RxBuf>>,
     sendq: IoQueue,
     // Boxed on purpose: the pointer is 8 bytes where an empty `Vec` is 24.
     #[allow(clippy::box_collection)]
@@ -3283,7 +3294,9 @@ struct Inner {
     recv: Option<Recv>,
     accept_q: WaiterQueue,
     connect: Option<Box<Waiter>>,
-    pending: Vec<(Pid, u16)>,
+    // Boxed on purpose: the pointer is 8 bytes where an empty `Vec` is 24.
+    #[allow(clippy::box_collection)]
+    pending: Option<Box<Vec<(Pid, u16)>>>,
     busy: bool,
     peer_closed: bool,
     /// `TCP_ADDF_PENDING_SHUT_WR` (1) / `TCP_ADDF_PENDING_SHUT_RDWR` (2): shutdown once the
@@ -3307,11 +3320,44 @@ struct Inner {
     send_oct: u64,
 }
 
+/// The input buffer of a socket: a plain vector, or a reference-counted binary (`i_buf`) when
+/// the packet is delivered as a sub-binary of it, in which case the bytes live there and `buf`
+/// is empty.
+// Port of inet_drv.c (`i_buf`, `i_ptr_start`, `i_ptr`, `i_bufsz`), OTP-29.1.1.
+#[derive(Default)]
+struct RxBuf {
+    buf: Vec<u8>,
+    bin: Option<arinsal_term::RefcBinary>,
+    start: usize,
+    end: usize,
+}
+
 impl Inner {
+    fn rx_start(&self) -> usize {
+        self.rx.as_ref().map_or(0, |rx| rx.start)
+    }
+
+    fn rx_end(&self) -> usize {
+        self.rx.as_ref().map_or(0, |rx| rx.end)
+    }
+
+    fn rx_bin(&self) -> Option<&arinsal_term::RefcBinary> {
+        self.rx.as_ref()?.bin.as_ref()
+    }
+
+    fn rx_buf(&self) -> &[u8] {
+        self.rx.as_ref().map_or(&[], |rx| rx.buf.as_slice())
+    }
+
+    /// The input buffer, allocated first when the socket has none.
+    fn rx_mut(&mut self) -> &mut RxBuf {
+        self.rx.get_or_insert_with(Default::default)
+    }
+
     // Port of erts/emulator/drivers/common/inet_drv.c:11473 (tcp_desc_close), OTP-29.1.1.
     fn take_fd(&mut self) -> Option<SockFd> {
         let fd = self.fd.take()?;
-        if let Some(port) = self.port.upgrade() {
+        if let Some(port) = self.port.as_ref().and_then(|port| port.upgrade()) {
             use arinsal_drv::{SELECT_READ, SELECT_USE, SELECT_WRITE};
             port.select(fd.select_fd, SELECT_READ | SELECT_WRITE | SELECT_USE, false);
         }
@@ -3323,8 +3369,7 @@ impl Default for Inner {
     fn default() -> Self {
         Self {
             fd: None,
-            fd_external: None,
-            port: Weak::new(),
+            port: None,
             timer_at: None,
             domain: libc::AF_INET,
             family_code: AF_INET_CODE,
@@ -3368,17 +3413,14 @@ impl Default for Inner {
             linger_secs: 0,
             backlog: 5,
             op_ref: 0,
-            rbuf: Vec::new(),
-            rbin: None,
-            rbuf_start: 0,
-            rbuf_end: 0,
+            rx: None,
             sendq: IoQueue::default(),
             empty_out_q_subs: None,
             sendfile: None,
             recv: None,
             accept_q: WaiterQueue::default(),
             connect: None,
-            pending: Vec::new(),
+            pending: None,
             busy: false,
             peer_closed: false,
             pending_shut: 0,
@@ -4415,7 +4457,9 @@ fn data_term_with_options(
 }
 
 fn drop_pending(inner: &mut Inner, caller: Pid, aref: u16) {
-    inner.pending.retain(|(c, r)| *c != caller || *r != aref);
+    if let Some(pending) = inner.pending.as_mut() {
+        pending.retain(|(c, r)| *c != caller || *r != aref);
+    }
 }
 
 fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
@@ -4654,8 +4698,8 @@ fn take_packets(handle: &PortHandle, port: Term, inner: &mut Inner, outs: &mut O
             if rbuf_len(inner) == 0 {
                 break;
             }
-            if inner.rbin.is_some() && inner.deliver != DELIVER_PORT {
-                let range = inner.rbuf_start..inner.rbuf_end;
+            if inner.rx_bin().is_some() && inner.deliver != DELIVER_PORT {
+                let range = inner.rx_start()..inner.rx_end();
                 input_count(inner, range.len());
                 push_frame(
                     inner,
@@ -4669,14 +4713,15 @@ fn take_packets(handle: &PortHandle, port: Term, inner: &mut Inner, outs: &mut O
                 continue;
             }
             rbuf_unstage(inner);
-            let bytes = if inner.rbuf_start == 0 && inner.rbuf_end == inner.rbuf.len() {
-                std::mem::take(&mut inner.rbuf)
+            let bytes = if inner.rx_start() == 0 && inner.rx_end() == inner.rx_buf().len() {
+                std::mem::take(&mut inner.rx_mut().buf)
             } else {
                 let len = rbuf_len(inner);
                 rbuf_take(inner, len)
             };
-            inner.rbuf_start = 0;
-            inner.rbuf_end = 0;
+            let rx = inner.rx_mut();
+            rx.start = 0;
+            rx.end = 0;
             input_count(inner, bytes.len());
             push_data(inner, outs, DataWho::Active(owner), bytes);
         } else {
@@ -4691,7 +4736,7 @@ fn take_packets(handle: &PortHandle, port: Term, inner: &mut Inner, outs: &mut O
         }
         note_active(inner, owner, outs);
     }
-    if inner.rbuf_start == inner.rbuf_end {
+    if inner.rx_start() == inner.rx_end() {
         rbuf_reset(inner);
     }
     false
@@ -4756,7 +4801,7 @@ fn push_frame(inner: &Inner, port: Term, outs: &mut Outs, who: DataWho, frame: F
             let (binary, header) = (inner.binary, inner.header);
             // tcp_deliver shares i_buf only when the packet occupies at least 75% of
             // its original allocation; smaller packets go through tcp_reply_data.
-            let source = inner.rbin.as_ref().and_then(|bin| {
+            let source = inner.rx_bin().and_then(|bin| {
                 (bytes.len() >= bin.len() - (bin.len() >> 2)).then_some((bin, range.start))
             });
             let message = match who {
@@ -4823,12 +4868,14 @@ fn next_frame(inner: &mut Inner) -> Read {
         line_length: 0,
         line_delimiter: inner.delimiter,
     };
-    let start = inner.rbuf_start;
-    let input: &[u8] = match &inner.rbin {
-        Some(bin) => &bin.bytes()[start..inner.rbuf_end],
-        None => &inner.rbuf[start..inner.rbuf_end],
+    let (start, end) = (inner.rx_start(), inner.rx_end());
+    let Inner { rx, http, .. } = &mut *inner;
+    let input: &[u8] = match rx.as_deref() {
+        Some(RxBuf { bin: Some(bin), .. }) => &bin.bytes()[start..end],
+        Some(rx) => &rx.buf[start..end],
+        None => &[],
     };
-    let parsed = parse_with_state(ty, input, opts, &mut inner.http);
+    let parsed = parse_with_state(ty, input, opts, http);
     match parsed {
         PacketResult::Ok { packet, rest } => {
             let used = input.len() - rest.len();
@@ -4852,23 +4899,25 @@ fn next_frame(inner: &mut Inner) -> Read {
 
 // Port of erts/emulator/drivers/common/inet_drv.c:13042 (tcp_deliver), OTP-29.1.1.
 fn rbuf_bytes(inner: &Inner) -> &[u8] {
-    rbuf_slice(inner, inner.rbuf_start..inner.rbuf_end)
+    rbuf_slice(inner, inner.rx_start()..inner.rx_end())
 }
 
 /// `range` of the input buffer, wherever it lives.
 fn rbuf_slice(inner: &Inner, range: Range<usize>) -> &[u8] {
-    match &inner.rbin {
+    match inner.rx_bin() {
         Some(bin) => &bin.bytes()[range],
-        None => &inner.rbuf[range],
+        None => &inner.rx_buf()[range],
     }
 }
 
 /// Move the buffered bytes of the binary input buffer into the plain one.
 fn rbuf_unstage(inner: &mut Inner) {
-    if let Some(bin) = inner.rbin.take() {
-        inner.rbuf = bin.bytes()[inner.rbuf_start..inner.rbuf_end].to_vec();
-        inner.rbuf_end -= inner.rbuf_start;
-        inner.rbuf_start = 0;
+    if let Some(rx) = inner.rx.as_mut()
+        && let Some(bin) = rx.bin.take()
+    {
+        rx.buf = bin.bytes()[rx.start..rx.end].to_vec();
+        rx.end -= rx.start;
+        rx.start = 0;
     }
 }
 
@@ -4881,19 +4930,20 @@ fn rbuf_stage(inner: &mut Inner, extra: usize) -> bool {
     let Some(total) = len.checked_add(extra) else {
         return false;
     };
-    if let Some(bin) = inner.rbin.as_mut()
+    let end = inner.rx_end();
+    if let Some(bin) = inner.rx.as_mut().and_then(|rx| rx.bin.as_mut())
         && bin.bytes_mut_unique().is_some()
     {
         // tcp_expand_buffer reallocates the unique driver binary in place. Once a
         // delivered sub-binary shares it, buffered bytes move to a fresh allocation.
-        let Some(needed) = inner.rbuf_end.checked_add(extra) else {
+        let Some(needed) = end.checked_add(extra) else {
             return false;
         };
         return needed <= bin.len() || bin.realloc(needed).is_ok();
     }
     // tcp_recv starts with alloc_buffer(desc->inet.bufsz), then tcp_expand_buffer keeps
     // the used prefix and grows that allocation when packet_parser knows the frame size.
-    let initial = if inner.htype != 0 && len == 0 && inner.rbuf_end == 0 {
+    let initial = if inner.htype != 0 && len == 0 && end == 0 {
         (inner.buffer.max(1) as usize).max(total)
     } else {
         total
@@ -4905,39 +4955,42 @@ fn rbuf_stage(inner: &mut Inner, extra: usize) -> bool {
         return false;
     };
     buf[..len].copy_from_slice(rbuf_bytes(inner));
-    inner.rbuf = Vec::new();
-    inner.rbin = Some(bin);
-    inner.rbuf_start = 0;
-    inner.rbuf_end = len;
+    let rx = inner.rx_mut();
+    rx.buf = Vec::new();
+    rx.bin = Some(bin);
+    rx.start = 0;
+    rx.end = len;
     true
 }
 
 // Port of inet_drv.c (`tcp_deliver`/`tcp_remain` valid range), OTP-29.1.1.
 fn rbuf_len(inner: &Inner) -> usize {
-    inner.rbuf_end - inner.rbuf_start
+    inner.rx_end() - inner.rx_start()
 }
 
 // Port of inet_drv.c (`tcp_clear_input` logical pointer reset), OTP-29.1.1.
 // Port of inet_drv.c (`tcp_clear_input`): a consumed input buffer is freed, so an idle
 // connection holds none.
 fn rbuf_reset(inner: &mut Inner) {
-    inner.rbuf_start = 0;
-    inner.rbuf_end = 0;
-    inner.rbuf = Vec::new();
-    inner.rbin = None;
+    if let Some(rx) = inner.rx.as_mut() {
+        rx.start = 0;
+        rx.end = 0;
+        rx.buf = Vec::new();
+        rx.bin = None;
+    }
 }
 
 // Port of inet_drv.c (`tcp_deliver`), OTP-29.1.1.
 fn rbuf_consume(inner: &mut Inner, len: usize) {
-    inner.rbuf_start += len;
+    inner.rx_mut().start += len;
 }
 
 // Port of inet_drv.c (`tcp_deliver`), OTP-29.1.1.
 fn rbuf_take(inner: &mut Inner, len: usize) -> Vec<u8> {
-    let start = inner.rbuf_start;
+    let start = inner.rx_start();
     let bytes = rbuf_slice(inner, start..start + len).to_vec();
     rbuf_consume(inner, len);
-    if inner.rbuf_start == inner.rbuf_end {
+    if inner.rx_start() == inner.rx_end() {
         rbuf_reset(inner);
     }
     bytes
@@ -4945,15 +4998,16 @@ fn rbuf_take(inner: &mut Inner, len: usize) -> Vec<u8> {
 
 // Port of inet_drv.c (`tcp_restart_input`), OTP-29.1.1.
 fn rbuf_compact(inner: &mut Inner) {
-    if inner.rbin.is_some() {
+    if inner.rx_bin().is_some() {
         return;
     }
-    if inner.rbuf_start != 0 {
+    if inner.rx_start() != 0 {
         let len = rbuf_len(inner);
-        inner.rbuf.copy_within(inner.rbuf_start..inner.rbuf_end, 0);
-        inner.rbuf_start = 0;
-        inner.rbuf_end = len;
-        inner.rbuf.truncate(len);
+        let rx = inner.rx_mut();
+        rx.buf.copy_within(rx.start..rx.end, 0);
+        rx.start = 0;
+        rx.end = len;
+        rx.buf.truncate(len);
     }
 }
 
@@ -5150,10 +5204,11 @@ fn pull(sock: &Arc<Sock>) -> Option<&'static str> {
                 rbuf_unstage(&mut inner);
                 rbuf_compact(&mut inner);
             }
-            let read_start = inner.rbuf_end;
+            let read_start = inner.rx_end();
             if !staged {
-                inner.rbuf.truncate(read_start);
-                if inner.rbuf.try_reserve_exact(read_size).is_err() {
+                let rx = inner.rx_mut();
+                rx.buf.truncate(read_start);
+                if rx.buf.try_reserve_exact(read_size).is_err() {
                     // tcp_expand_buffer failing is tcp_recv_error(ENOMEM).
                     read_error = Some("enomem");
                     eof = true;
@@ -5161,19 +5216,20 @@ fn pull(sock: &Arc<Sock>) -> Option<&'static str> {
                 }
             }
             let read = {
-                let Inner { fd, rbuf, rbin, .. } = &mut *inner;
+                let Inner { fd, rx, .. } = &mut *inner;
+                let rx = rx.get_or_insert_with(Default::default);
                 let fd = &fd.as_ref().unwrap().fd;
-                match rbin.as_mut().and_then(|bin| bin.bytes_mut_unique()) {
+                match rx.bin.as_mut().and_then(|bin| bin.bytes_mut_unique()) {
                     Some(buf) if staged => {
                         rustix::io::read(fd, &mut buf[read_start..read_start + read_size])
                     }
-                    _ => rustix::io::read(fd, rustix::buffer::spare_capacity(rbuf)),
+                    _ => rustix::io::read(fd, rustix::buffer::spare_capacity(&mut rx.buf)),
                 }
             };
             match read {
                 Ok(n) if n > 0 => {
                     bytes_read += n;
-                    inner.rbuf_end = read_start + n;
+                    inner.rx_mut().end = read_start + n;
                     // Port of inet_drv.c (tcp_recv): return to tcp_deliver as soon as a
                     // complete message is buffered. In active_once mode, reading the next
                     // chunk here can observe EOF and discard the remaining buffered frames.
@@ -5461,7 +5517,7 @@ fn timer_change(inner: &mut Inner, task_deadline: Option<Instant>) -> Option<Opt
     Some(next)
 }
 
-fn set_port_timer(port: &Arc<DriverPort>, timer: Option<Option<Instant>>) {
+fn set_port_timer(port: &DriverPort, timer: Option<Option<Instant>>) {
     match timer {
         None => {}
         Some(Some(at)) => {
@@ -5564,6 +5620,17 @@ mod layout_tests {
             std::mem::size_of::<super::SockFd>(),
             std::mem::size_of::<crate::port::PortHandle>(),
             std::mem::size_of::<arinsal_drv::DriverPort>(),
+        );
+        eprintln!(
+            "PacketState={} Option<Recv>={} IoQueue={} Option<SockFd>={} Option<RefcBinary>={} \
+             {} Mutex<Inner>={}",
+            std::mem::size_of::<super::PacketState>(),
+            std::mem::size_of::<Option<super::Recv>>(),
+            std::mem::size_of::<super::IoQueue>(),
+            std::mem::size_of::<Option<super::SockFd>>(),
+            std::mem::size_of::<Option<arinsal_term::RefcBinary>>(),
+            crate::port::layout_sizes().join(" "),
+            std::mem::size_of::<parking_lot::Mutex<super::Inner>>(),
         );
     }
 }

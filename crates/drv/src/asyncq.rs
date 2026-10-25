@@ -9,13 +9,13 @@
 use std::ffi::{c_long, c_uint, c_void};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
 
 use crate::task::{call1, call2};
 use crate::threads;
-use crate::{DriverPort, DrvFn1, REDS_INPUT};
+use crate::{DrvFn1, PortRef, REDS_INPUT};
 
 /// Default `+A` of OTP 29: one async thread.
 const DEFAULT_ASYNC_THREADS: usize = 1;
@@ -32,7 +32,7 @@ pub fn set_async_threads(threads: usize) {
 
 /// A queued `driver_async` request (`ErtsAsync`).
 pub(crate) struct Job {
-    port: Arc<DriverPort>,
+    port: PortRef,
     invoke: DrvFn1,
     data: usize,
     free: Option<DrvFn1>,
@@ -69,7 +69,7 @@ fn pool() -> &'static Pool {
                         call1(job.invoke, job.data as *mut c_void);
                         // Port of erl_async.c:227 (async_reply): the issuing
                         // scheduler runs ready_async as aux work.
-                        let port = Arc::clone(&job.port);
+                        let port = job.port.clone();
                         port.host
                             .schedule_async_ready(job.sched_id, Box::new(move || job.ready()));
                     }
@@ -170,7 +170,7 @@ impl Job {
 /// Port of erl_async.c:541 (driver_async). Returns the job id, or 0 when the job ran
 /// synchronously because there are no async threads.
 pub(crate) fn driver_async(
-    port: Arc<DriverPort>,
+    port: PortRef,
     key: Option<&mut c_uint>,
     invoke: DrvFn1,
     data: *mut c_void,
@@ -178,7 +178,7 @@ pub(crate) fn driver_async(
 ) -> c_long {
     let threads = CONFIGURED.load(Ordering::Relaxed);
     let mut job = Job {
-        port: Arc::clone(&port),
+        port: port.clone(),
         invoke,
         data: data as usize,
         free,
