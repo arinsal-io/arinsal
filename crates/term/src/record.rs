@@ -179,23 +179,38 @@ impl Term {
 
 /// Copy the elements of a proper list or tuple while its heap remains live.
 pub fn term_sequence(term: Term) -> Option<Vec<Term>> {
+    sequence_into(term)
+}
+
+/// [`term_sequence`] into inline storage: a stacktrace or an `error_info` pair has at most a
+/// handful of fields, so reading one does not allocate.
+pub fn term_sequence_small(term: Term) -> Option<smallvec::SmallVec<[Term; 4]>> {
+    sequence_into(term)
+}
+
+fn sequence_into<C: Default + Extend<Term>>(term: Term) -> Option<C> {
     // SAFETY: the caller holds all source heaps live during the synchronous copy.
     unsafe {
         match term.classify() {
-            TermKind::Tuple => Some(term.tuple_ref()?.iter().collect()),
+            TermKind::Tuple => {
+                let mut values = C::default();
+                values.extend(term.tuple_ref()?.iter());
+                Some(values)
+            }
             TermKind::Record => {
                 let record = term.record_ref()?;
-                let mut values = Vec::with_capacity(record.len() + 1);
-                values.push(Term::atom(record.name()));
+                let mut values = C::default();
+                values.extend([Term::atom(record.name())]);
                 for index in 0..record.len() {
-                    values.push(record.value(record.sorted_index(index)?)?);
+                    values.extend([record.value(record.sorted_index(index)?)?]);
                 }
                 Some(values)
             }
-            TermKind::Nil => Some(Vec::new()),
+            TermKind::Nil => Some(C::default()),
             TermKind::List => {
                 let mut iter = ListIter::new(term);
-                let values: Vec<_> = iter.by_ref().collect();
+                let mut values = C::default();
+                values.extend(iter.by_ref());
                 (iter.tail() == Term::NIL).then_some(values)
             }
             _ => None,
