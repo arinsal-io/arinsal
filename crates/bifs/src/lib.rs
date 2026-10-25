@@ -139,6 +139,10 @@ pub struct ProcessBif<'a, H: HeapAlloc = ProcessHeapHandle<'a>> {
     deferred: Option<Box<lists::DeferredTrap>>,
     /// The failure of a body that returned [`arinsal_term::THE_NON_VALUE`].
     error: Option<BifError>,
+    /// The failure words of the running process (`c_p->freason`, `fvalue`, `ftrace`), when
+    /// this context belongs to one. A body that returns [`Term::NON_VALUE`] leaves its failure
+    /// here, as an erts BIF does; other contexts keep it in `error`.
+    exc: Option<&'a mut arinsal_term::exc::ExcFields>,
 }
 
 impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
@@ -151,6 +155,7 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
             budget: usize::MAX,
             deferred: None,
             error: None,
+            exc: None,
         }
     }
 
@@ -173,6 +178,61 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
     /// Remember a continuation. The VM installs it only after this call returns.
     pub fn defer_trap(&mut self, trap: lists::DeferredTrap) {
         self.deferred = Some(Box::new(trap));
+    }
+
+    /// Fail the call: leave `error` in the process' failure words (or in the context when it
+    /// has none) and return the non-value.
+    // Port of erts/emulator/beam/bif.h (BIF_ERROR sets c_p->freason and returns
+    // THE_NON_VALUE), OTP-29.1.1.
+    #[inline]
+    pub fn fail(&mut self, error: BifError) -> Term {
+        match self.exc.as_deref_mut() {
+            Some(exc) => encode_failure(exc, error),
+            None => self.error = Some(error),
+        }
+        Term::NON_VALUE
+    }
+
+    /// `BIF_ERROR(p, BADARG)`.
+    #[inline]
+    pub fn badarg(&mut self) -> Term {
+        self.fail(BifError::BADARG)
+    }
+
+    /// `BIF_ERROR(p, SYSTEM_LIMIT)`.
+    #[inline]
+    pub fn system_limit(&mut self) -> Term {
+        self.fail(BifError::SystemLimit)
+    }
+
+    /// `BIF_ERROR(p, EXC_ERROR)` with `reason` in `fvalue` (`error:Reason`).
+    #[inline]
+    pub fn error_reason(&mut self, reason: Term) -> Term {
+        self.fail(BifError::Error(reason))
+    }
+
+    /// Defer the continuation `trap` and return the non-value: `BIF_TRAP`.
+    // Port of erts/emulator/beam/bif.h (BIF_TRAP sets c_p->freason = TRAP), OTP-29.1.1.
+    #[inline]
+    pub fn trap(&mut self, trap: lists::DeferredTrap) -> Term {
+        self.defer_trap(trap);
+        if let Some(exc) = self.exc.as_deref_mut() {
+            exc.freason = arinsal_term::exc::TRAP;
+        }
+        Term::NON_VALUE
+    }
+
+    /// The failure of a body that returned the non-value, for a context without process
+    /// failure words.
+    #[inline]
+    pub fn take_context_failure(&mut self) -> Option<BifError> {
+        self.error.take()
+    }
+
+    /// Whether a continuation was deferred.
+    #[inline]
+    pub fn has_deferred(&self) -> bool {
+        self.deferred.is_some()
     }
 
     /// Record why the body returned the non-value.
@@ -243,7 +303,20 @@ impl<'heap> ProcessBif<'_, ProcessHeapHandle<'heap>> {
             budget: usize::MAX,
             deferred: None,
             error: None,
+            exc: None,
         }
+    }
+
+    /// A context that charges `fcalls` and leaves failures in the process' `exc` words.
+    #[inline]
+    pub fn with_failure<'a>(
+        heap: &'a mut ProcessHeapHandle<'heap>,
+        fcalls: &'a mut i32,
+        exc: &'a mut arinsal_term::exc::ExcFields,
+    ) -> Ctx<'a> {
+        let mut ctx = Ctx::with_fcalls(heap, fcalls);
+        ctx.exc = Some(exc);
+        ctx
     }
 
     /// Construct a process BIF context that charges the process FCALLS directly.
@@ -258,6 +331,7 @@ impl<'heap> ProcessBif<'_, ProcessHeapHandle<'heap>> {
             budget: usize::MAX,
             deferred: None,
             error: None,
+            exc: None,
         }
     }
 }
@@ -273,6 +347,52 @@ pub type BifFn = fn(&mut Ctx<'_>, &[Term]) -> Result<Term, BifError>;
 
 /// Native process-shaped BIF entry, including the incoming Beam instruction.
 pub type ProcessBifFn = fn(&mut ProcessBif<'_>, &[Term], usize) -> Result<Term, BifError>;
+
+/// Leaves `error` in the failure words of a process, as erts leaves `freason`, `fvalue` and
+/// `ftrace`. `Unsupported` raises `undef` without its message, and `Dirty` is a `TRAP` whose
+/// `ftrace` names the scheduler class (deviations from erts, which has neither).
+fn encode_failure(exc: &mut arinsal_term::exc::ExcFields, error: BifError) {
+    use arinsal_term::exc::*;
+    let class_code = |class: Class| match class {
+        Class::Error => EXC_ERROR,
+        Class::Exit => EXC_EXIT,
+        Class::Throw => EXC_THROWN,
+    };
+    exc.ftrace = 0;
+    match error {
+        BifError::Badarg { cause: None } => exc.freason = EXC_BADARG,
+        BifError::Badarg { cause: Some(cause) } => {
+            exc.freason = EXC_BADARG | EXF_HAS_EXT_INFO;
+            exc.ftrace = cause.word();
+        }
+        BifError::Badarith => exc.freason = EXC_BADARITH,
+        BifError::SystemLimit => exc.freason = EXC_SYSTEM_LIMIT,
+        BifError::Error(reason) => {
+            exc.freason = EXC_ERROR;
+            exc.fvalue = reason.word();
+        }
+        BifError::Raise {
+            class,
+            reason,
+            stacktrace,
+        } => {
+            // `EXF_ARGLIST` marks a raise (with or without a stacktrace in `ftrace`) and so
+            // tells it apart from a plain `error:Reason` failure.
+            exc.freason = class_code(class) | EXF_ARGLIST;
+            exc.fvalue = reason.word();
+            exc.ftrace = stacktrace.map_or(0, Term::word);
+        }
+        BifError::Unsupported(_) => exc.freason = EXC_UNDEF,
+        BifError::Dirty(class) => {
+            exc.freason = TRAP;
+            exc.ftrace = match class {
+                SchedulerClass::Normal => 1,
+                SchedulerClass::DirtyCpu => 2,
+                SchedulerClass::DirtyIo => 3,
+            };
+        }
+    }
+}
 
 /// A BIF body known when its table entry is compiled.
 ///
@@ -419,6 +539,44 @@ macro_rules! process_bif_bodies_in {
     };
 }
 pub(crate) use process_bif_bodies_in;
+
+/// Bodies that return a term or [`arinsal_term::Term::NON_VALUE`] (erts' BIF shape), in their
+/// own table module. `call_word` is the body itself; `call` adapts it for callers that want a
+/// `Result`: a deferred continuation is `Ok(NIL)` with the trap in the context, as before.
+macro_rules! word_bif_bodies_in {
+    ($module:ident; $($bif:ident),* $(,)?) => {
+        #[allow(non_camel_case_types)]
+        mod $module {
+            $(
+                pub(super) struct $bif;
+                impl $crate::BifBody for $bif {
+                    #[inline(always)]
+                    fn call(ctx: &mut $crate::Ctx<'_>, args: &[arinsal_term::Term])
+                        -> Result<arinsal_term::Term, $crate::BifError>
+                    {
+                        let value = super::$bif(ctx, args);
+                        if !value.is_non_value() {
+                            Ok(value)
+                        } else if ctx.has_deferred() {
+                            Ok(arinsal_term::Term::NIL)
+                        } else {
+                            Err(ctx.take_context_failure().unwrap_or($crate::BifError::BADARG))
+                        }
+                    }
+                    #[inline(always)]
+                    fn call_word(
+                        ctx: &mut $crate::ProcessBif<'_>,
+                        args: &[arinsal_term::Term],
+                        _instruction: usize,
+                    ) -> u64 {
+                        super::$bif(ctx, args).word()
+                    }
+                }
+            )*
+        }
+    };
+}
+pub(crate) use word_bif_bodies_in;
 
 /// Find the implementation of `module:name/arity`.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {

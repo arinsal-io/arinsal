@@ -369,7 +369,7 @@ fn native_raw_raise() {
     let (_, header, _, _) = execute(asm, 1);
     assert_eq!(header.exc.freason, arinsal_beamasm::catch::RAW_RAISE | 2);
     assert_eq!(header.exc.fvalue, 12);
-    assert_eq!(header.exc.ftrace as u64, 0x3b);
+    assert_eq!(header.exc.ftrace, 0x3b);
 }
 
 // Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise): an invalid class leaves

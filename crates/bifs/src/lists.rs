@@ -45,7 +45,7 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     v: &mut V,
 ) -> Option<V::Output> {
     let f = match (module, name, arity) {
-        ("erlang", "length", 1) => v.entry::<bodies::length>(),
+        ("erlang", "length", 1) => v.entry::<word_bodies::length>(),
         ("erlang", "++" | "append", 2) => v.entry::<bodies::append>(),
         ("erlang", "--" | "subtract", 2) => v.entry::<bodies::subtract>(),
         ("lists", "reverse", 2) => v.entry::<bodies::reverse>(),
@@ -128,17 +128,15 @@ pub fn length_slice(ctx: &mut Ctx<'_>, mut list: Term, acc: usize) -> Result<Len
     Ok(LengthStep::Done(integer(ctx, count)?))
 }
 
-fn length(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn length(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/erl_bif_guard.c:210-224 (length_1), OTP-29.1.1.
     let &[list] = args else {
-        return Err(BADARG);
+        return ctx.badarg();
     };
-    match length_slice(ctx, list, 0)? {
-        LengthStep::Done(value) => Ok(value),
-        LengthStep::More(cont) => {
-            ctx.defer_trap(DeferredTrap::Length(cont));
-            Ok(Term::NIL)
-        }
+    match length_slice(ctx, list, 0) {
+        Ok(LengthStep::Done(value)) => value,
+        Ok(LengthStep::More(cont)) => ctx.trap(DeferredTrap::Length(cont)),
+        Err(error) => ctx.fail(error),
     }
 }
 
@@ -2060,6 +2058,7 @@ mod trap_budget_tests {
     }
 }
 
+crate::word_bif_bodies_in!(word_bodies; length);
 crate::process_bif_bodies!(
-    length, append, subtract, reverse, member, keyfind, keymember, keysearch,
+    append, subtract, reverse, member, keyfind, keymember, keysearch,
 );
