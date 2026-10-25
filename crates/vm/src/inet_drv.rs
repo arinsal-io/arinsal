@@ -1092,12 +1092,12 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
             );
         } else {
             inner.phase = Phase::Connecting;
-            inner.connect = Some(Waiter {
+            inner.connect = Some(Box::new(Waiter {
                 monitor: None,
                 caller,
                 aref,
                 deadline: deadline(timeout),
-            });
+            }));
             inner.pending.push((caller, aref));
         }
         return ok_bytes(&aref.to_be_bytes());
@@ -2807,13 +2807,13 @@ fn sendfile_req(inner: &mut Inner, data: &[u8], end: &mut Option<SendfileEnd>) -
     };
     let offset = u64::from_be_bytes(data[4..12].try_into().unwrap());
     let length = u64::from_be_bytes(data[12..20].try_into().unwrap());
-    inner.sendfile = Some(Sendfile {
+    inner.sendfile = Some(Box::new(Sendfile {
         ioq_skip: inner.sendq.size(),
         dup_file_fd,
         bytes_sent: 0,
         offset,
         length,
-    });
+    }));
     // See if we can finish sending without selecting & rescheduling. An unfinished
     // file keeps the socket selected for write in `io_loop`.
     *end = tcp_inet_sendfile(inner);
@@ -3231,10 +3231,10 @@ struct Inner {
     sendq: IoQueue,
     empty_out_q_subs: Vec<Pid>,
     /// `Some` while TCP_ADDF_SENDFILE is set.
-    sendfile: Option<Sendfile>,
+    sendfile: Option<Box<Sendfile>>,
     recv: Option<Recv>,
     accept_q: VecDeque<Waiter>,
-    connect: Option<Waiter>,
+    connect: Option<Box<Waiter>>,
     pending: Vec<(Pid, u16)>,
     busy: bool,
     peer_closed: bool,
@@ -5392,7 +5392,7 @@ fn next_deadline(inner: &Inner, task_deadline: Option<Instant>) -> Option<Instan
     let waiters = inner
         .accept_q
         .iter()
-        .chain(inner.connect.iter())
+        .chain(inner.connect.as_deref())
         .filter_map(|waiter| waiter.deadline);
     let recv = inner.recv.as_ref().and_then(|recv| recv.deadline);
     waiters.chain(recv).chain(task_deadline).min()
