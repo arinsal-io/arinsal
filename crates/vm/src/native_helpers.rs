@@ -3434,11 +3434,38 @@ fn plain_bif_word_slow(
     deferred: Option<Box<arinsal_bifs::DeferredTrap>>,
     error: Option<arinsal_bifs::BifError>,
 ) -> u64 {
+    // A migrated body left its failure in the process' exit words; an adapted `Result` body
+    // left it in the context. Decoding clears the words, which are rewritten below.
+    let error = if word == arinsal_term::THE_NON_VALUE {
+        error.or_else(|| decode_failure(&mut process.header.exc))
+    } else {
+        error
+    };
+    // `raise/3` with an immediate stacktrace (`throw/1` compiles to it) is complete in the
+    // failure words: set them and return the non-value, as erts' `raise_3` does.
+    if let Some(arinsal_bifs::BifError::Raise {
+        class,
+        reason,
+        stacktrace: Some(trace),
+    }) = &error
+        && deferred.is_none()
+        && word == arinsal_term::THE_NON_VALUE
+        && trace.is_immed()
+        && !process.heap.gc_after_bif_desired()
+    {
+        crate::stacktrace::clear_pending_top(process);
+        process.reductions = process.header.fcalls;
+        process.header.exc.ftrace = trace.word();
+        process.header.exc.freason =
+            crate::stacktrace::class_to_freason(Some(*class)) | arinsal_beamasm::exc::EXF_ARGLIST;
+        process.header.exc.fvalue = crate::native_hooks::raw(*reason);
+        if let Some(cold) = process.cold.as_mut() {
+            cold.explicit_raise = None;
+        }
+        process.sync_native_header();
+        return 0;
+    }
     let result = if word == arinsal_term::THE_NON_VALUE {
-        // A migrated body left its failure in the process' exit words; an adapted `Result`
-        // body left it in the context. The words are rewritten from the decoded error by
-        // `set_light_bif_error`, so decoding clears them.
-        let error = error.or_else(|| decode_failure(&mut process.header.exc));
         Err(error.unwrap_or(arinsal_bifs::BifError::BADARG))
     } else {
         Ok(crate::native_hooks::from_raw(word))
