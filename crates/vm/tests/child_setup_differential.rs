@@ -129,3 +129,50 @@ fn concurrent_port_spawns_all_complete_like_otp() {
         .expect("run concurrent child-setup differential");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
+
+const START_SOURCE: &str = r#"
+-module(child_setup_start_diff).
+-export([run/0]).
+
+run() ->
+    Sh = open_port({spawn_executable, "/bin/sh"}, [{args, ["-c", "echo hi"]}, in, binary, eof]),
+    Cmd = receive {Sh, {data, SD}} -> SD after 5000 -> timeout end,
+    Cat = open_port({spawn, "cat"}, [binary]),
+    Cat ! {self(), {command, <<"x\n">>}},
+    Echo = receive {Cat, {data, D}} -> D after 5000 -> timeout end,
+    true = port_close(Cat),
+    {'EXIT', {MissingReason, _}} = (catch open_port({spawn_executable, "/nonexistent/prog"}, [])),
+    NoRead = open_port({spawn, "cat"}, [binary, in]),
+    Info = erlang:port_info(NoRead, os_pid),
+    true = port_close(NoRead),
+    {Cmd, Echo, MissingReason, element(1, Info)}.
+"#;
+
+/// The spawn driver answers `open_port` through `erl_drv_init_ack` once the forker's `Go`
+/// arrived: the first command, a failed launch and `port_info(os_pid)` behave as in erts.
+#[test]
+fn port_start_results_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping port start differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named("child_setup_start_diff", START_SOURCE, &[])
+        .expect("compile port start differential");
+    reference
+        .load("child_setup_start_diff", &beam)
+        .expect("load port start differential");
+    let options = CallOptions {
+        timeout_ms: Some(60_000),
+        ..CallOptions::default()
+    };
+    let expected = reference
+        .call_opts("child_setup_start_diff", "run", &[], &options)
+        .result;
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).expect("load port start differential");
+    let actual = vm
+        .eval_scheduled("child_setup_start_diff", "run", &[], 2, None)
+        .expect("run port start differential");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+}
