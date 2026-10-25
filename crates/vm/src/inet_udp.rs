@@ -1953,7 +1953,9 @@ impl Sock {
     }
 
     fn port(&self) -> Option<arinsal_drv::PortRef> {
-        self.handle.upgrade()?.drv_port()
+        let handle = self.handle.upgrade()?;
+        handle.drv_port_state()?;
+        Some(arinsal_drv::PortRef::new(handle))
     }
 }
 

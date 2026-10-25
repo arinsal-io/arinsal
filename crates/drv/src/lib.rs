@@ -726,6 +726,11 @@ pub trait PortOwner: arinsal_sched::RunPort {
 pub struct PortRef(Arc<dyn PortOwner>);
 
 impl PortRef {
+    /// A reference from the counted owner of a port.
+    pub fn new(owner: Arc<dyn PortOwner>) -> Self {
+        Self(owner)
+    }
+
     /// The port record behind the reference.
     pub fn owner(&self) -> &dyn PortOwner {
         &*self.0

@@ -812,6 +812,11 @@ impl PortHandle {
         self.driver.as_ref().map(arinsal_drv::DriverPort::arc)
     }
 
+    /// The embedded driver state, when this port has one.
+    pub(crate) fn drv_port_state(&self) -> Option<&arinsal_drv::DriverPort> {
+        self.driver.as_ref()
+    }
+
     pub(crate) fn owner_pid(&self) -> Pid {
         self.owner.get()
     }
