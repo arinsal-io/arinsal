@@ -183,10 +183,6 @@ fn sock_of(port: &DriverPort) -> Option<(Arc<Sock>, Arc<PortHandle>)> {
 }
 
 impl NativeDriver for TcpInet {
-    fn has_outputv(&self) -> bool {
-        true
-    }
-
     // Port of inet_drv.c (tcp_inet_stop).
     fn stop(&self, port: &DriverPort) {
         if let Some((sock, _handle)) = sock_of(port) {
@@ -209,7 +205,7 @@ impl NativeDriver for TcpInet {
     }
 
     // Port of inet_drv.c (tcp_inet_commandv): refc binaries of the command stay referenced.
-    fn outputv_owned(&self, port: &DriverPort, pieces: arinsal_drv::CommandVector) {
+    fn outputv_owned(&self, port: &DriverPort, pieces: Vec<CommandPiece>) {
         if let Some((sock, _handle)) = sock_of(port) {
             command_pieces(&sock, Pid::from_data(port.caller()), pieces);
         }
@@ -402,7 +398,7 @@ fn command(sock: &Arc<Sock>, caller: Pid, data: Vec<u8>) {
 
 /// `command` for a vector: the caller reference prefix is in the first element, the packet is
 /// everything after it, with refc binaries referenced (`tcp_sendv` over an `ErlIOVec`).
-fn command_pieces(sock: &Arc<Sock>, caller: Pid, pieces: arinsal_drv::CommandVector) {
+fn command_pieces(sock: &Arc<Sock>, caller: Pid, pieces: Vec<CommandPiece>) {
     let Some(CommandPiece::Bytes(first)) = pieces.first() else {
         return;
     };
@@ -512,13 +508,11 @@ enum SendOutcome {
 
 /// Bytes handed to `tcp_sendv`: the port command keeps its flattened buffer (the
 /// payload starts at the offset), distribution borrows its packet.
-// OTP passes an inline ErlIOVec through tcp_inet_commandv and tcp_sendv.
-#[allow(clippy::large_enum_variant)]
 enum SendData<'a> {
     Owned(Vec<u8>, usize),
     Borrowed(&'a [u8]),
     /// A command vector; the payload starts at the offset in its first element.
-    Pieces(arinsal_drv::CommandVector, usize),
+    Pieces(Vec<CommandPiece>, usize),
 }
 
 impl SendData<'_> {
@@ -538,7 +532,7 @@ impl SendData<'_> {
     }
 
     /// The payload as `iovec` entries, appended to `iov`.
-    fn push_iov(&self, iov: &mut smallvec::SmallVec<[libc::iovec; 16]>) {
+    fn push_iov(&self, iov: &mut smallvec::SmallVec<[libc::iovec; 4]>) {
         let mut entry = |bytes: &[u8]| {
             if !bytes.is_empty() {
                 iov.push(libc::iovec {
@@ -647,7 +641,7 @@ fn accept_send(inner: &mut Inner, payload: SendData<'_>) -> SendOutcome {
     };
     // inet_drv.c:13815-13844: one sock_sendv of header and payload, then queue
     // whatever was not written (driver_enqv with skip = bytes sent).
-    let mut iov = smallvec::SmallVec::<[libc::iovec; 16]>::new();
+    let mut iov = smallvec::SmallVec::<[libc::iovec; 4]>::new();
     if h_len != 0 {
         iov.push(libc::iovec {
             iov_base: hdr.as_ptr() as *mut libc::c_void,
