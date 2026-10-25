@@ -15,11 +15,6 @@ fail-fast = false
 # A hung test is killed after 5 minutes in the landing gate.
 slow-timeout = { period = "60s", terminate-after = 5 }
 
-[profile.macos-smoke]
-default-filter = "test(check_io_) | test(erl_poll_control_reports_invalid_fds_as_nval) | test(regular_file_at_end_of_file_is_ready_in_the_fallback_set) | test(check_io_info_matches_otp) | test(cli_help_dev_null_is_ready_once) | test(cli_help_regular_file_is_ready_through_eof) | test(cli_help_non_pollable_registration_fires_once) | binary(cli_help) | binary(tty) | test(handle_io_and_sparse_offsets) | binary(spawn_fds) | package(arinsal-cli)"
-fail-fast = false
-slow-timeout = { period = "60s", terminate-after = 5 }
-
 # Tests that share an OS resource (PTYs, epmd, fixed ports, the terminal) run one at a time.
 [test-groups]
 pty = { max-threads = 1 }
