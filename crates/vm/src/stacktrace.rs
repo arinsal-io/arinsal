@@ -1814,10 +1814,12 @@ pub(super) fn build(
 /// `FunctionInfo` scratch storage from `global.h`: MFA, needed, loc and filename pointer.
 const FRAME_INFO_WORDS: usize = 4;
 
+/// The frame lookups of one trace (`ERTS_ALC_T_TMP` in erts): inline for the default
+/// backtrace depth, so building a trace does not allocate for them. The caller owns it, so the
+/// prepared result stays small and is not copied between the builders.
+type FrameScratch = smallvec::SmallVec<[u64; 40]>;
+
 struct PreparedFrames {
-    /// The frame lookups of one trace (`ERTS_ALC_T_TMP` in erts): inline for the default
-    /// backtrace depth, so building a trace does not allocate for them.
-    block: smallvec::SmallVec<[u64; 40]>,
     frames: usize,
     words: usize,
     bif: Option<PreparedBif>,
@@ -1831,9 +1833,6 @@ struct PreparedBif {
     error_info: Option<Term>,
 }
 
-// The frame lookups stay inline: boxing them would be the allocation they replace, and the
-// value is moved once, straight into `cons_prepared`.
-#[allow(clippy::large_enum_variant)]
 enum FramePrep {
     /// Explicit traces and unsupported interpreter module tables still use `build_saved`.
     Fallback,
@@ -1866,22 +1865,31 @@ pub(super) fn build_direct(p: &mut Process, term: Term) -> Option<Result<Term, V
     if bif_top && !matches!(fields[1].classify(), TermKind::List | TermKind::Nil) {
         return None;
     }
+    let mut scratch = FrameScratch::new();
     let prepared = match p.runtime.as_ref() {
         Some(runtime) => runtime.with_active_code(|ranges, tables| {
             stack_trace.with_bignum_digits_mut(|digits| {
                 if bif_top {
-                    prepare_bif_frames(digits, Some(ranges), Some(tables), fields[1], error_info)
+                    prepare_bif_frames(
+                        digits,
+                        Some(ranges),
+                        Some(tables),
+                        fields[1],
+                        error_info,
+                        &mut scratch,
+                    )
                 } else {
-                    prepare_frames(digits, Some(ranges), Some(tables))
+                    prepare_frames(digits, Some(ranges), Some(tables), &mut scratch)
                 }
             })
         }),
         None if bif_top => None,
-        None => stack_trace.with_bignum_digits_mut(|digits| prepare_frames(digits, None, None)),
+        None => stack_trace
+            .with_bignum_digits_mut(|digits| prepare_frames(digits, None, None, &mut scratch)),
     }?;
     match prepared {
         Ok(FramePrep::Fallback) => None,
-        Ok(FramePrep::Ready(ready)) => Some(cons_prepared(p, ready)),
+        Ok(FramePrep::Ready(ready)) => Some(cons_prepared(p, ready, &scratch)),
         Err(error) => Some(Err(error)),
     }
 }
@@ -1890,6 +1898,7 @@ fn prepare_frames(
     digits: &[u64],
     ranges: Option<&[crate::native_bridge::ModuleRange]>,
     tables: Option<&crate::load::CodeTables>,
+    block: &mut FrameScratch,
 ) -> Result<FramePrep, VmError> {
     if digits.len() < 5 {
         return Ok(FramePrep::Fallback);
@@ -1915,7 +1924,8 @@ fn prepare_frames(
     let mut frames = 0usize;
     let mut words = 0usize;
     let capacity = (1 + count).min(depth);
-    let mut block = smallvec::SmallVec::<[u64; 40]>::from_elem(0, capacity * FRAME_INFO_WORDS);
+    block.clear();
+    block.resize(capacity * FRAME_INFO_WORDS, 0);
     let slots = &mut block[..];
     let frame = if pc & (1 << 63) != 0 {
         let payload = pc & !(1 << 63);
@@ -2002,7 +2012,6 @@ fn prepare_frames(
         frames += 1;
     }
     Ok(FramePrep::Ready(PreparedFrames {
-        block,
         frames,
         words,
         bif: None,
@@ -2017,6 +2026,7 @@ fn prepare_bif_frames(
     tables: Option<&crate::load::CodeTables>,
     args: Term,
     error_info: Option<Term>,
+    block: &mut FrameScratch,
 ) -> Result<FramePrep, VmError> {
     const CURRENT_IS_FUNCTION: u64 = 1 << 63;
     if digits.len() < 5 {
@@ -2037,7 +2047,8 @@ fn prepare_bif_frames(
     if module.0 == 0 || function.0 == 0 {
         return Ok(FramePrep::Fallback);
     }
-    let mut block = smallvec::SmallVec::<[u64; 40]>::from_elem(0, count.max(1) * FRAME_INFO_WORDS);
+    block.clear();
+    block.resize(count.max(1) * FRAME_INFO_WORDS, 0);
     let slots = &mut block[..];
     let mut frames = 0usize;
     let mut words = 0usize;
@@ -2118,7 +2129,6 @@ fn prepare_bif_frames(
         frames += 1;
     }
     Ok(FramePrep::Ready(PreparedFrames {
-        block,
         frames,
         words,
         bif: Some(PreparedBif {
@@ -2167,7 +2177,7 @@ fn read_frame(slots: &[u64], index: usize) -> (Atom, Atom, u8, Option<(Term, u64
     )
 }
 
-fn cons_prepared(p: &mut Process, ready: PreparedFrames) -> Result<Term, VmError> {
+fn cons_prepared(p: &mut Process, ready: PreparedFrames, block: &[u64]) -> Result<Term, VmError> {
     let bif_words = ready
         .bif
         .map_or(0, |bif| if bif.error_info.is_some() { 12 } else { 7 });
@@ -2181,7 +2191,7 @@ fn cons_prepared(p: &mut Process, ready: PreparedFrames) -> Result<Term, VmError
     {
         let mut builder = TermBuilder::new(&mut heap);
         for index in (0..ready.frames).rev() {
-            let (module, function, arity, location) = read_frame(ready.block.as_slice(), index);
+            let (module, function, arity, location) = read_frame(block, index);
             let location = location.map(|(file, number)| arinsal_term::MfaLocation {
                 file_atom,
                 file,
