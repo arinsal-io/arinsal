@@ -18,6 +18,12 @@ use crate::{Callbacks, ControlReply, Driver, DriverPort, ERL_DRV_FLAG_USE_PORT_L
 /// The callbacks of a native driver. Every method runs with the port lock held, like
 /// the C callbacks of `erts_driver_t`.
 pub trait NativeDriver: Send + Sync + 'static {
+    /// Whether this driver supplies `outputv` in its `ErlDrvEntry`.
+    ///
+    /// Port of erts/emulator/beam/io.c:7554 (`init_driver`), OTP-29.1.1.
+    fn has_outputv(&self) -> bool {
+        false
+    }
     /// `stop`: the port terminates.
     fn stop(&self, _port: &DriverPort) {}
     /// `output`/`outputv` with the flattened command data.
@@ -29,7 +35,7 @@ pub trait NativeDriver: Send + Sync + 'static {
     }
     /// `outputv` with a command whose reference-counted binaries are referenced, not copied
     /// (the `ErlIOVec` with `binv`). The default flattens it for `output_owned`.
-    fn outputv_owned(&self, port: &DriverPort, pieces: Vec<crate::CommandPiece>) {
+    fn outputv_owned(&self, port: &DriverPort, pieces: crate::CommandVector) {
         let mut data = Vec::new();
         for piece in &pieces {
             data.extend_from_slice(piece.bytes());
@@ -70,6 +76,15 @@ impl Driver {
     /// Whether this is a [`NativeDriver`] (it has no `ErlDrvEntry`).
     pub fn is_native(&self) -> bool {
         self.native.is_some()
+    }
+
+    /// Whether this driver has an `outputv` callback, as `erts_driver_t.outputv`.
+    pub fn has_outputv(&self) -> bool {
+        self.native
+            .as_ref()
+            .map_or(self.callbacks.outputv.is_some(), |native| {
+                native.has_outputv()
+            })
     }
 }
 
