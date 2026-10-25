@@ -376,7 +376,7 @@ pub extern "C" fn arinsal_beamasm_wait_timeout(
 pub extern "C" fn arinsal_beamasm_timeout(header: *mut ProcessHeader) {
     // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1242-1251
     // (beam_jit_timeout), OTP-29.1.1: timeout cleanup does not access heap or stack cursors.
-    if let Some((process, _registers)) = crate::native_hooks::enter_runtime_no_cursors(header) {
+    if let Some(process) = crate::native_hooks::process_from_header(header) {
         process.timeout();
         // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1246-1248 (beam_jit_timeout),
         // OTP-29.1.1.

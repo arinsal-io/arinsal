@@ -679,8 +679,8 @@ impl Process {
         Ok(())
     }
 
+    #[inline(always)]
     pub(crate) fn timeout(&mut self) {
-        self.delay_gc = false;
         // `timeout` leaves the current receive and prepares the next one.
         // Port of erts/emulator/beam/emu/msg_instrs.tab (`timeout`) and
         // erl_proc_sig_queue.h:2331 (`erts_msgq_set_save_first`), OTP-29.1.1.
