@@ -4065,9 +4065,7 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     let raising_pc = registers.tmp_mem[6] as usize;
     // A function_clause list of the current function's arguments and an inline guard BIF's
     // top frame (`tmp_mem[7]`) are built by the scheduler's native exit; leave them there.
-    if process.header.exc.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE
-        || registers.tmp_mem[7] != 0
-    {
+    if process.header.exc.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
         process.sync_native_header();
         return 0;
     }
@@ -4098,28 +4096,34 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // Port of beam_common.c (`save_stacktrace`), OTP-29.1.1: retain the raw raising PC;
     // `build_stacktrace` resolves it against the active code ranges when the trace is requested.
     let native_pc = (raising_pc != 0).then_some(raising_pc);
-    let top = process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.native_trap.as_ref())
-        .filter(|native_trap| {
-            native_trap.freason == process.header.exc.freason
-                && native_trap.fvalue == process.header.exc.fvalue
-        })
-        .and_then(|native_trap| match native_trap.trap.top.as_ref() {
-            Some(crate::stacktrace::TopFrame::BifRegisters {
-                module,
-                function,
-                arity,
-                info,
-            }) => Some(crate::stacktrace::TopFrame::BifRegisters {
-                module: *module,
-                function: *function,
-                arity: *arity,
-                info: *info,
-            }),
-            _ => None,
-        });
+    // An inline guard BIF (`element/2`, `hd/1`, ...) names itself as the top frame, with its
+    // arguments in X0.. Port of beam_asm_global.cpp (emit_raise_badarg passes the BIF's
+    // `ErtsCodeMFA` to `raise_exception`), OTP-29.1.1.
+    let inline_top = inline_bif_top(registers.tmp_mem[7]);
+    let top = inline_top.or_else(|| {
+        process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.native_trap.as_ref())
+            .filter(|native_trap| {
+                native_trap.freason == process.header.exc.freason
+                    && native_trap.fvalue == process.header.exc.fvalue
+            })
+            .and_then(|native_trap| match native_trap.trap.top.as_ref() {
+                Some(crate::stacktrace::TopFrame::BifRegisters {
+                    module,
+                    function,
+                    arity,
+                    info,
+                }) => Some(crate::stacktrace::TopFrame::BifRegisters {
+                    module: *module,
+                    function: *function,
+                    arity: *arity,
+                    info: *info,
+                }),
+                _ => None,
+            })
+    });
     // A failing BIF in the argument registers is the top frame, with its arguments read
     // from the registers (erts `save_stacktrace` reads them from `reg`), no copies.
     let top = top.or_else(|| failure_top(process, &registers.x_reg_array));
@@ -4161,6 +4165,7 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         };
         trace
     };
+    registers.tmp_mem[7] = 0;
     let handler = match crate::native_bridge::commit_catch(process, found, class, reason, trace) {
         crate::native_bridge::CatchHandler::Native(handler) => handler,
         crate::native_bridge::CatchHandler::Interpreted => {
@@ -4176,6 +4181,34 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // the next native exit as a continuation resume.
     process.native_continuation_resume = false;
     handler
+}
+
+/// The top frame of an inline guard BIF failure, from `tmp_mem[7]` (`index + 1` into
+/// `BADARG_MFAS`), or `None` when no inline BIF failed.
+fn inline_bif_top(slot: u64) -> Option<crate::stacktrace::TopFrame> {
+    static ATOMS: std::sync::OnceLock<Vec<(arinsal_term::Atom, arinsal_term::Atom, usize)>> =
+        std::sync::OnceLock::new();
+    let index = usize::try_from(slot).ok()?.checked_sub(1)?;
+    let atoms = ATOMS.get_or_init(|| {
+        let table = arinsal_term::global_atoms();
+        arinsal_beamasm::guard::BADARG_MFAS
+            .iter()
+            .filter_map(|(module, function, arity)| {
+                Some((
+                    table.intern(module).ok()?,
+                    table.intern(function).ok()?,
+                    usize::from(*arity),
+                ))
+            })
+            .collect()
+    });
+    let (module, function, arity) = *atoms.get(index)?;
+    Some(crate::stacktrace::TopFrame::BifRegisters {
+        module,
+        function,
+        arity,
+        info: crate::stacktrace::BifErrorInfo::Plain,
+    })
 }
 
 /// A failure whose BIF has no export entry keeps its frame in the owned record; park it as
