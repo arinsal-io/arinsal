@@ -1,6 +1,6 @@
 # Arinsal
 
-**Arinsal is an alternative BEAM runtime for Erlang, Elixir, and Gleam.** It is
+Arinsal is an alternative BEAM runtime for Erlang and Elixir. It is
 written in Rust and is being developed as an independent implementation of the
 runtime that runs BEAM bytecode and powers the Erlang ecosystem.
 
@@ -18,7 +18,7 @@ Not supported yet: x86-64 (any OS), Windows.
 
 ## The name
 
-ERTS is the **Erlang Run-Time System**. **Erts** is also a village in Andorra,
+ERTS is the Erlang Run-Time System. Erts is also a village in Andorra,
 right next to Arinsal. The village of Arinsal is bigger and sits higher up the
 mountain—so this runtime takes its name from the neighbor next door.
 
