@@ -2144,13 +2144,12 @@ pub(crate) extern "C" fn plain_bif_entry<B: arinsal_bifs::BifBody>(
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
-    call_plain_bif_body(
+    call_plain_bif_word(
         process,
         registers,
         identity as usize,
         export,
-        |process, args| B::call_process(process, args, instruction as usize),
-        false,
+        |process, args| B::call_word(process, args, instruction as usize),
     )
 }
 
@@ -3384,6 +3383,43 @@ fn plain_bif_slow(
     }
     process.reductions = process.header.fcalls;
     plain_bif_result(process, registers, export, arity, result)
+}
+
+/// [`call_plain_bif_body`] for a BIF function that returns one word, a term or the
+/// non-value with its failure in the context. The word is the value path's whole result, so
+/// it is tested once; failures and deferred continuations take [`plain_bif_slow`].
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-523 (call_light_bif_shared tests the
+// returned word against THE_NON_VALUE), OTP-29.1.1.
+#[inline(always)]
+fn call_plain_bif_word(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    identity: usize,
+    export: ExportDispatch,
+    bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> u64,
+) -> u64 {
+    let arity = usize::from(export.arity);
+    let entry_top = process.heap.heap_top_index();
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header.fcalls);
+    let word = bif(&mut ctx, &registers.x_reg_array[..arity]);
+    let deferred = ctx.take_deferred();
+    if deferred.is_none() && word != arinsal_term::THE_NON_VALUE {
+        drop(ctx);
+        let top = process.heap.heap_top_index();
+        if top != entry_top {
+            process.header.htop = native_htop(process, top);
+        }
+        return word;
+    }
+    let error = ctx.take_error();
+    drop(ctx);
+    let result = if word == arinsal_term::THE_NON_VALUE {
+        Err(error.unwrap_or(arinsal_bifs::BifError::BADARG))
+    } else {
+        Ok(crate::native_hooks::from_raw(word))
+    };
+    plain_bif_slow(process, registers, identity, export, result, deferred)
 }
 
 /// Installs a BIF continuation after its process-bound context has returned.

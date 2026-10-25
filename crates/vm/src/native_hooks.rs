@@ -128,7 +128,8 @@ pub(crate) fn enter_runtime<'a>(
 pub(crate) fn scheduler_registers(
     process: &mut Process,
 ) -> Option<(&mut Process, &mut SchedulerRegisters)> {
-    let registers = process.header.ftrace.cast::<SchedulerRegisters>();
+    // `esdp->registers`: the scheduler's register file the process is attached to.
+    let registers = process.x.scheduler_registers();
     if registers.is_null() {
         return None;
     }

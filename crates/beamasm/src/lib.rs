@@ -78,6 +78,7 @@ pub struct ProcessHeader {
 }
 
 const _: () = assert!(std::mem::offset_of!(ProcessHeader, high_water) == 0x70);
+const _: () = assert!(std::mem::offset_of!(SchedulerRegisters, x_reg_array) == 0);
 
 /// Register backing storage addressed by BeamAsm's x19.
 #[repr(C)]

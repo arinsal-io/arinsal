@@ -108,6 +108,9 @@ use std::fmt;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Term(pub(crate) u64);
 
+/// A BIF's failure return: no term has this word (erts `THE_NON_VALUE`, erl_term.h).
+pub const THE_NON_VALUE: u64 = 0;
+
 /// Small integer lower bound (60-bit signed payload).
 pub const MIN_SMALL: i64 = -(1_i64 << 59);
 /// Small integer upper bound (60-bit signed payload).
@@ -284,6 +287,12 @@ impl Term {
     /// Return the tagged bits inside this crate.
     #[inline]
     pub(crate) const fn bits(self) -> u64 {
+        self.0
+    }
+    /// The tagged word of this term. Reading the bits is safe; only rebuilding a term from
+    /// them needs [`Term::from_raw_bits`].
+    #[inline]
+    pub const fn word(self) -> u64 {
         self.0
     }
     /// Return the tagged word as an opaque integer.
