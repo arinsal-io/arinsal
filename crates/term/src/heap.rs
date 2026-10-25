@@ -1092,6 +1092,8 @@ pub struct ProcessHeap {
     // Drop token owners before the heap words referenced by BinRef.val/next.
     pub(crate) owners: LazyOwners,
     pub(crate) words: WordBlock,
+    /// `HTOP` and `E`: addresses inside `words`, as erts keeps them in `Process`. A block change
+    /// (collection, resize) must set both again from their indexes taken beforehand.
     pub(crate) htop: usize,
     pub(crate) stop: usize,
     pub(crate) old_words: WordBlock,
@@ -1311,10 +1313,12 @@ impl ProcessHeap {
     }
 
     fn with_words_for_type_at(words: usize, allocation_type: ErtsAlcType, alloc_ix: u16) -> Self {
+        let block = WordBlock::new_for(words, allocation_type, alloc_ix);
+        let base = block.as_ptr() as usize;
         Self {
-            words: WordBlock::new_for(words, allocation_type, alloc_ix),
-            htop: 0,
-            stop: words,
+            words: block,
+            htop: base,
+            stop: base + words * 8,
             old_words: WordBlock::default(),
             old_htop: 0,
             high_water: 0,
@@ -1445,30 +1449,36 @@ impl ProcessHeap {
     // Port of erts/emulator/beam/erl_vm.h:150-162 (HAllocX), OTP-29.1.1.
     #[inline(always)]
     pub fn alloc_halloc(&mut self, words: usize) -> Option<*mut u64> {
+        // `HAlloc`: one test of `HEAP_LIMIT - HTOP >= n` against the cursors, which are
+        // addresses. `end + REDZONE <= stop + hidden` is that test without the saturating
+        // subtraction and the `max(htop)` clamp of `heap_limit_words`; the words are small, so
+        // the products cannot wrap, and a detached heap or a request that fails the test takes
+        // the full computation out of line.
+        let top = self.htop;
+        let end = top.wrapping_add(words << 3);
+        if !self.detached
+            && words < (1 << 40)
+            && end.wrapping_add(crate::S_REDZONE << 3) <= self.stop + (self.bif_hidden_words << 3)
+        {
+            self.htop = end;
+            return Some(top as *mut u64);
+        }
+        self.alloc_halloc_slow(words)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_halloc_slow(&mut self, words: usize) -> Option<*mut u64> {
         if self.detached {
             return self.owners.detached.as_deref_mut()?.alloc(words);
         }
-        let top = self.htop_index();
-        let end = top.checked_add(words)?;
-        // `end <= stop + hidden - REDZONE` without the saturating subtraction and the
-        // `max(htop)` clamp of `heap_limit_words`: `HAlloc` tests `HEAP_LIMIT - HTOP >= n`
-        // against one precomputed pointer. A request that fails this test takes the full
-        // clamped computation, so every accepted request is accepted by it too.
-        let fits = match end.checked_add(crate::S_REDZONE) {
-            Some(guarded) => guarded <= self.stop_index() + self.bif_hidden_words,
-            None => false,
-        };
-        if !fits && end > self.heap_limit_words() {
+        let top = self.htop;
+        let end = top.checked_add(words.checked_mul(8)?)?;
+        if end > self.words.as_ptr() as usize + (self.heap_limit_words() << 3) {
             return None;
         }
-        let ptr = self
-            .words
-            .as_ptr()
-            .wrapping_add(top)
-            .cast::<u64>()
-            .cast_mut();
-        self.set_htop_index(end);
-        Some(ptr)
+        self.htop = end;
+        Some(top as *mut u64)
     }
     /// Whether generated code is running on this heap (set by the native bridge).
     pub fn native_active(&self) -> bool {
@@ -1511,11 +1521,7 @@ impl ProcessHeap {
     /// Return the current heap top and stack boundary for a VM-local bump cursor.
     /// The pointers remain valid until this heap collects or grows.
     pub fn heap_cursor(&self) -> (*mut u64, *mut u64) {
-        // SAFETY: Both indices are within or one past the fixed allocation.
-        unsafe {
-            let base = self.words.as_ptr().cast::<u64>().cast_mut();
-            (base.add(self.htop_index()), base.add(self.stop_index()))
-        }
+        (self.htop as *mut u64, self.stop as *mut u64)
     }
     /// Return the start and end of the young heap allocation.
     pub fn heap_bounds(&self) -> (*mut u64, *mut u64) {
@@ -1551,7 +1557,7 @@ impl ProcessHeap {
     /// index stay one bump apart from the last sync.
     #[inline(always)]
     pub fn note_native_alloc(&mut self, words: usize) {
-        self.set_htop_index(self.htop_index() + (words));
+        self.htop += words << 3;
     }
 
     #[inline(always)]
@@ -1573,34 +1579,40 @@ impl ProcessHeap {
 
     #[inline(always)]
     fn commit_native_cursors(&mut self, base: usize, htop: *mut u64, stop: *mut u64) {
-        let top = (htop as usize).wrapping_sub(base) >> 3;
-        let stack = (stop as usize).wrapping_sub(base) >> 3;
+        // `HTOP` and `E` are stored as they are: the cursors are addresses, as in `Process`.
         debug_assert!(
-            top <= stack && stack <= self.words.len(),
+            htop as usize >= base
+                && htop as usize <= stop as usize
+                && (stop as usize) <= base + self.words.len() * 8,
             "native cursors outside the heap: htop={htop:p} stop={stop:p} base={base:#x}"
         );
-        self.set_htop_index(top);
-        self.set_stop_index(stack);
+        self.htop = htop as usize;
+        self.stop = stop as usize;
     }
     /// The young heap top as a word index from the heap base.
     #[inline(always)]
     pub(crate) fn htop_index(&self) -> usize {
-        self.htop
+        self.htop.wrapping_sub(self.words.as_ptr() as usize) >> 3
     }
     /// Sets the young heap top from a word index.
     #[inline(always)]
     pub(crate) fn set_htop_index(&mut self, index: usize) {
-        self.htop = index;
+        self.htop = (self.words.as_ptr() as usize).wrapping_add(index << 3);
     }
     /// The stack pointer as a word index from the heap base.
     #[inline(always)]
     pub(crate) fn stop_index(&self) -> usize {
-        self.stop
+        self.stop.wrapping_sub(self.words.as_ptr() as usize) >> 3
     }
     /// Sets the stack pointer from a word index.
     #[inline(always)]
     pub(crate) fn set_stop_index(&mut self, index: usize) {
-        self.stop = index;
+        self.stop = (self.words.as_ptr() as usize).wrapping_add(index << 3);
+    }
+    /// The young heap top as an address, `c_p->htop`.
+    #[inline(always)]
+    pub fn heap_top_addr(&self) -> usize {
+        self.htop
     }
     /// Young heap top as a word index.
     #[inline]
@@ -1715,6 +1727,9 @@ impl ProcessHeap {
         // Port of erts/emulator/beam/erl_message.h:72-78 (ErlHeapFragment `used_size`), OTP-29.1.1.
         let used = source.htop_index();
         let block = std::mem::take(&mut source.words).into_alloc_block();
+        // The block is gone: its cursors point nowhere.
+        source.htop = 0;
+        source.stop = 0;
         let used = used.min(block.len());
         self.fragments.push(Fragment::Block {
             memory: block,

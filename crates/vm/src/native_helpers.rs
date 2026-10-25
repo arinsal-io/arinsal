@@ -3411,7 +3411,7 @@ fn call_plain_bif_word(
     bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> u64,
 ) -> u64 {
     let arity = usize::from(export.arity);
-    let entry_top = process.heap.heap_top_index();
+    let entry_top = process.heap.heap_top_addr();
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut ctx = arinsal_bifs::Ctx::with_failure(
         &mut fragment,
@@ -3422,9 +3422,9 @@ fn call_plain_bif_word(
     let deferred = ctx.take_deferred();
     if deferred.is_none() && word != arinsal_term::THE_NON_VALUE {
         drop(ctx);
-        let top = process.heap.heap_top_index();
+        let top = process.heap.heap_top_addr();
         if top != entry_top {
-            process.header.htop = native_htop(process, top);
+            process.header.htop = top as *mut u64;
         }
         return word;
     }
