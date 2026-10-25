@@ -3057,6 +3057,28 @@ impl<T: Task> Inner<T> {
         false
     }
 
+    /// One pass of the run queue supervisor.
+    // Port of erts/emulator/beam/erl_process.c:5761 (runq_supervisor) and :5719
+    // (no_runqs_to_supervise), OTP-29.1.1: when some used run queue is empty while another
+    // one is not, wake a scheduler on an empty run queue for every non-empty one, so it
+    // steals; this covers a scheduler stuck in a call that never yields.
+    fn runq_supervise(&self) {
+        let (_, used) = self.balance.no_runqs();
+        let used = used
+            .min(self.online_schedulers.load(Ordering::Acquire))
+            .clamp(1, self.parked.len());
+        let nonempty = |ix: usize| !self.run_queues[ix].iter().all(SegQueue::is_empty);
+        let empty = (0..used).filter(|&ix| !nonempty(ix)).count();
+        if empty == 0 || empty >= used {
+            return;
+        }
+        for ix in 0..used {
+            if nonempty(ix) {
+                self.wake_scheduler_on_empty_runq(ix);
+            }
+        }
+    }
+
     fn wake_worker(&self, worker: usize) {
         // Port of erts/emulator/beam/erl_process.c:3691 (ssi_wake), OTP-29.1.1: clearing the
         // waiting flag ends a spinning wait without a system call.
@@ -5832,6 +5854,19 @@ impl<T: Task> Scheduler<T> {
                     threads.push(handle);
                 }
             }
+        }
+        // Port of erts/emulator/beam/erl_process.c:8921 (erts_start_schedulers, runq_supervisor
+        // thread): only when `+sfwi` (`erts_runq_supervision_interval`) is non-zero.
+        if !simulated
+            && let Some(interval) = inner.config.forced_wakeup_interval.filter(|&ms| ms > 0)
+        {
+            let inner = inner.clone();
+            threads.push(
+                thread::Builder::new()
+                    .name("runq_supervisor".to_owned())
+                    .spawn(move || runq_supervisor(inner, interval))
+                    .expect("spawn run queue supervisor thread"),
+            );
         }
         Self {
             inner,
@@ -8793,6 +8828,18 @@ const WAKEUP_OTHER_FIXED_INC: i64 = CONTEXT_REDS / 10;
 ///
 /// Port of erts/emulator/beam/erl_process.c:5610 (wakeup_other_check), OTP-29.1.1, with the
 /// default medium threshold (decrement shift 0, full mask).
+/// Body of the run queue supervisor thread.
+// Port of erts/emulator/beam/erl_process.c:5761 (runq_supervisor), OTP-29.1.1.
+fn runq_supervisor<T: Task>(inner: Arc<Inner<T>>, interval_ms: u64) {
+    while !inner.stopped.load(Ordering::Acquire) {
+        thread::park_timeout(Duration::from_millis(interval_ms));
+        if inner.stopped.load(Ordering::Acquire) {
+            break;
+        }
+        inner.runq_supervise();
+    }
+}
+
 fn wakeup_other_check<T: Task>(inner: &Inner<T>, local: &mut Local<T>) {
     let wo_reds = local.wakeup_other_reds;
     if wo_reds == 0 {
