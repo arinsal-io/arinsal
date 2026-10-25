@@ -104,13 +104,19 @@ fn next_registration() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ArmError {
+    Rejected,
+    InvalidFd,
+}
+
 /// Arm direction `dir` of `fd` if it is selected, not armed and not running
 /// (`state->active_events |= ...` plus `erts_io_control`). `false` when the poller
 /// rejected the descriptor (`ERTS_POLL_EV_NVAL`).
-fn arm_dir(fd: i32, state: &mut FdState, dir: usize) -> bool {
+fn arm_dir(fd: i32, state: &mut FdState, dir: usize) -> Result<(), ArmError> {
     let slot = &mut state.dirs[dir];
     if state.events & DIRS[dir] == 0 || slot.reg.is_some() || slot.running.is_some() {
-        return true;
+        return Ok(());
     }
     let id = next_registration();
     slot.reg = Some(id);
@@ -118,28 +124,42 @@ fn arm_dir(fd: i32, state: &mut FdState, dir: usize) -> bool {
     // (erl_check_io.c:2102 iready/oready); everything that needs the descriptor table
     // goes through the notifier, since the poller must not take the table lock.
     let owner = state.nif.is_none().then(|| slot.owner.clone()).flatten();
-    let ready: Box<dyn FnOnce() + Send> = match owner {
-        Some(owner) => Box::new(move || {
-            if !owner.schedule_io(fd, dir, id) {
-                fired(fd, dir, id);
+    let ready: Box<dyn FnOnce(bool) + Send> = match owner {
+        Some(owner) => Box::new(move |invalid| {
+            if invalid || !owner.schedule_io(fd, dir, id) {
+                fired(fd, dir, id, invalid);
             }
         }),
-        None => Box::new(move || fired(fd, dir, id)),
+        None => Box::new(move |invalid| fired(fd, dir, id, invalid)),
     };
-    let notified = match poll::backend() {
-        Some(backend) => backend.register(id, fd, dir == 1, ready).is_ok(),
-        None => false,
+    let result = match poll::backend() {
+        Some(backend) => backend.register(id, fd, dir == 1, ready),
+        None => Err(std::io::Error::other("poll backend is not installed")),
     };
-    if !notified {
-        state.dirs[dir].reg = None;
+    match result {
+        Ok(()) => Ok(()),
+        Err(_error) => {
+            state.dirs[dir].reg = None;
+            #[cfg(target_os = "linux")]
+            if _error.raw_os_error() == Some(libc::EBADF)
+                || _error.kind() == std::io::ErrorKind::InvalidInput
+            {
+                // Port of erl_check_io.c:1146-1152: poll-control NVAL schedules the driver
+                // event, which the port task reports through bad_fd_in_pollset.
+                return Err(ArmError::InvalidFd);
+            }
+            Err(ArmError::Rejected)
+        }
     }
-    notified
 }
 
 /// `arm_dir` for a driver: a rejected descriptor is reported ready at once
 /// (`new_events & (ERR|NVAL)` in driver_select) and the driver finds the error.
-fn arm(fd: i32, state: &mut FdState, dir: usize) {
-    if !arm_dir(fd, state, dir) {
+fn arm(fd: i32, state: &mut FdState, dir: usize) -> Result<(), ArmError> {
+    if let Err(error) = arm_dir(fd, state, dir) {
+        if error == ArmError::InvalidFd {
+            return Err(error);
+        }
         let id = next_registration();
         state.dirs[dir].reg = Some(id);
         let scheduled = state.dirs[dir]
@@ -147,9 +167,10 @@ fn arm(fd: i32, state: &mut FdState, dir: usize) {
             .as_ref()
             .is_some_and(|owner| owner.schedule_io(fd, dir, id));
         if !scheduled {
-            notify(fd, dir, id);
+            notify(fd, dir, id, false);
         }
     }
+    Ok(())
 }
 
 fn disarm(state: &mut FdState, dir: usize) {
@@ -341,14 +362,19 @@ pub(crate) fn driver_select(port: &Arc<DriverPort>, fd: i32, mode: c_int, on: bo
     if on {
         let ctl = ctl & !state.events;
         state.events |= ctl;
+        let mut invalid_fd = false;
         for (dir, bit) in DIRS.iter().enumerate() {
             if ctl & bit != 0 {
                 state.dirs[dir].owner = Some(Arc::clone(port));
-                arm(fd, state, dir);
+                invalid_fd |= matches!(arm(fd, state, dir), Err(ArmError::InvalidFd));
             }
         }
         if ctl != 0 && mode & USE != 0 {
             state.used = true;
+        }
+        if invalid_fd {
+            report_bad_fd(port, fd, ctl);
+            deselect(&mut table, fd, 0);
         }
     } else {
         let ctl = ctl & state.events;
@@ -381,6 +407,22 @@ pub(crate) fn driver_select(port: &Arc<DriverPort>, fd: i32, mode: c_int, on: bo
         port.stop_select(fd);
     }
     0
+}
+
+/// Port of erl_check_io.c:2274 (`bad_fd_in_pollset`) for an invalid driver descriptor.
+fn report_bad_fd(port: &DriverPort, fd: i32, mode: c_int) {
+    let direction = match mode & (READ | WRITE) {
+        value if value == READ | WRITE => "input/output",
+        value if value == WRITE => "output",
+        _ => "input",
+    };
+    let name = port.name.lock().clone();
+    let name = if name.is_empty() { "<unknown>" } else { &name };
+    let driver = port.driver.name();
+    port.host.log_error(&format!(
+        "Bad {direction} fd in erts_poll()! fd={fd}, port=#Port<0.{id}>, driver={driver}, name={name}\n",
+        id = port.id
+    ));
 }
 
 /// Port of erl_check_io.c:878 (deselect) for `ERTS_EV_TYPE_NIF` with mode 0: drop the
@@ -542,7 +584,7 @@ pub fn nif_select(
             resource.keep();
         }
         for (dir, bit) in DIRS.iter().enumerate() {
-            if ctl & bit != 0 && !arm_dir(fd, state, dir) {
+            if ctl & bit != 0 && arm_dir(fd, state, dir).is_err() {
                 failed = true;
             }
         }
@@ -619,40 +661,48 @@ fn nif_mode_text(mode: c_int) -> String {
 }
 
 /// Hand a fired registration that needs the descriptor table to the notifier thread.
-fn notify(fd: i32, dir: usize, reg: u64) {
-    static NOTIFIER: OnceLock<Mutex<mpsc::Sender<(i32, usize, u64)>>> = OnceLock::new();
+type FiredRegistration = (i32, usize, u64, bool);
+
+fn notify(fd: i32, dir: usize, reg: u64, invalid: bool) {
+    static NOTIFIER: OnceLock<Mutex<mpsc::Sender<FiredRegistration>>> = OnceLock::new();
     let sender = NOTIFIER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<(i32, usize, u64)>();
+        let (tx, rx) = mpsc::channel::<FiredRegistration>();
         std::thread::Builder::new()
             .name("arinsal-drv-select".into())
             .spawn(move || {
-                for (fd, dir, reg) in rx {
-                    fired_locked(table(fd), fd, dir, reg);
+                for (fd, dir, reg, invalid) in rx {
+                    fired_locked(table(fd), fd, dir, reg, invalid);
                 }
             })
             .expect("start select notifier");
         Mutex::new(tx)
     });
-    let _ = sender.lock().unwrap().send((fd, dir, reg));
+    let _ = sender.lock().unwrap().send((fd, dir, reg, invalid));
 }
 
 /// A poll registration fired (erl_check_io.c:2102, erts_check_io) and could not become a
 /// port task directly: a NIF selection sends its message; a driver selection becomes an
 /// input or output task of the owning port, or is reported stale.
-fn fired(fd: i32, dir: usize, reg: u64) {
+fn fired(fd: i32, dir: usize, reg: u64, invalid: bool) {
     // The poller thread handles the event itself (erl_check_io.c iready/oready run in the
     // thread that polled). A callback that fires inside `driver_select` on a thread that
     // holds the shard cannot take it again: that one goes to the notifier.
     match shard(fd).try_lock() {
-        Ok(guard) => fired_locked(guard, fd, dir, reg),
+        Ok(guard) => fired_locked(guard, fd, dir, reg, invalid),
         Err(std::sync::TryLockError::Poisoned(poison)) => {
-            fired_locked(poison.into_inner(), fd, dir, reg)
+            fired_locked(poison.into_inner(), fd, dir, reg, invalid)
         }
-        Err(std::sync::TryLockError::WouldBlock) => notify(fd, dir, reg),
+        Err(std::sync::TryLockError::WouldBlock) => notify(fd, dir, reg, invalid),
     }
 }
 
-fn fired_locked(held: MutexGuard<'static, HashMap<i32, FdState>>, fd: i32, dir: usize, reg: u64) {
+fn fired_locked(
+    held: MutexGuard<'static, HashMap<i32, FdState>>,
+    fd: i32,
+    dir: usize,
+    reg: u64,
+    invalid: bool,
+) {
     let owner = {
         let mut table = held;
         let Some(state) = table.get_mut(&fd) else {
@@ -682,6 +732,11 @@ fn fired_locked(held: MutexGuard<'static, HashMap<i32, FdState>>, fd: i32, dir: 
             state.dirs[dir].reg = None;
             report_stale(&owner, DIRS[dir]);
             deselect(&mut table, fd, DIRS[dir]);
+            return;
+        }
+        if invalid {
+            report_bad_fd(&owner, fd, DIRS[dir]);
+            deselect(&mut table, fd, 0);
             return;
         }
         owner
@@ -736,7 +791,11 @@ pub(crate) fn ready(port: &DriverPort, fd: i32, dir: usize, reg: u64) -> i32 {
     {
         state.dirs[dir].running = None;
         state.dirs[dir].executing = false;
-        arm(fd, state, dir);
+        if matches!(arm(fd, state, dir), Err(ArmError::InvalidFd)) {
+            report_bad_fd(port, fd, DIRS[dir]);
+            deselect(&mut table, fd, 0);
+            return 0;
+        }
     }
     // ERTS_PORT_REDS_INPUT and ERTS_PORT_REDS_OUTPUT are equal (erl_port.h:365-366).
     if ran { REDS_INPUT } else { 0 }

@@ -330,7 +330,13 @@ send_timeout() ->
     {R1, R2}.
 
 connect_timeout() ->
-    gen_tcp:connect({192,0,2,1}, 1, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}}, {active, false}], 200).
+    {ok, L} = listen([{backlog, 1}]),
+    {ok, Port} = inet:port(L),
+    {ok, Filler} = gen_tcp:connect({127,0,0,1}, Port, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}}, {active, false}], 1000),
+    Result = gen_tcp:connect({127,0,0,1}, Port, [{tcp_module, inet_tcp}, {ip, {127,0,0,1}}, {active, false}], 0),
+    gen_tcp:close(Filler),
+    gen_tcp:close(L),
+    Result.
 
 refused() ->
     gen_tcp:connect({127,0,0,1}, 1, [{tcp_module, inet_tcp}, {active, false}], 400).

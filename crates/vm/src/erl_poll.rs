@@ -395,6 +395,9 @@ mod fallback {
                     continue;
                 }
                 let mut ready = 0;
+                if revents.contains(PollFlags::NVAL) {
+                    ready |= super::ERTS_POLL_EV_NVAL;
+                }
                 if events & ERTS_POLL_EV_IN != 0
                     && revents.intersects(
                         PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL,
@@ -417,7 +420,7 @@ mod fallback {
                     let mut fds = set.fds.lock().unwrap();
                     if let Some(current) = fds.get_mut(fd) {
                         *current &= !ready;
-                        if *current == 0 {
+                        if ready & super::ERTS_POLL_EV_NVAL != 0 || *current == 0 {
                             fds.remove(fd);
                         }
                     }

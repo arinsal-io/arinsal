@@ -55,11 +55,35 @@ fn spawn_executable_filename_terms_match_otp() {
         "atom_path",
         "spawn_args_invalid",
     ] {
-        let CallResult::Ok(expected) = reference.call(MODULE, function, &[]) else {
-            panic!("OTP open_port failed in {function}");
-        };
-        let actual = vm.eval_scheduled(MODULE, function, &[], 1, None).unwrap();
-        assert_eq!(expected, actual.term, "open_port {function}");
+        match reference.call(MODULE, function, &[]) {
+            CallResult::Ok(expected) => {
+                let actual = vm.eval_scheduled(MODULE, function, &[], 1, None).unwrap();
+                assert_eq!(expected, actual.term, "open_port {function}");
+            }
+            CallResult::Exception {
+                class,
+                reason: expected,
+                ..
+            } => {
+                let actual = match vm.eval_scheduled(MODULE, function, &[], 1, None) {
+                    Ok(_) => {
+                        panic!("Arinsal accepted open_port {function} arguments that OTP rejected")
+                    }
+                    Err(error) => error,
+                };
+                let arinsal_vm::VmError::Raised(actual) = actual else {
+                    panic!("unexpected Arinsal error for open_port {function}: {actual:?}");
+                };
+                assert_eq!(class, "error", "open_port {function}");
+                assert_eq!(
+                    actual.class,
+                    arinsal_bifs::Class::Error,
+                    "open_port {function}"
+                );
+                assert_eq!(expected, actual.reason, "open_port {function}");
+            }
+            other => panic!("unexpected OTP result for open_port {function}: {other:?}"),
+        }
     }
 }
 

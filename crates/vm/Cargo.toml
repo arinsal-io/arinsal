@@ -52,7 +52,7 @@ libc = "0.2"
 rustix = { version = "1.1.5", features = ["event", "fs", "net", "pipe", "process", "stdio"] }
 mio = { version = "1", features = ["os-poll", "os-ext"] }
 signal-hook-mio = { version = "0.2.5", features = ["support-v1_0"] }
-nix = { version = "0.29.0", features = ["fs", "net"] }
+nix = { version = "0.29.0", features = ["fs", "net", "process"] }
 arc-swap = "1.9.2"
 parking_lot = "0.12.5"
 

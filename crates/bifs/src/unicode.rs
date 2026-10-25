@@ -1307,6 +1307,13 @@ fn filename_list_bytes(root: Term, encoding: FilenameEncoding) -> Result<Vec<u8>
     Ok(result)
 }
 
+/// Convert an Erlang filename list using the runtime's native filename encoding.
+///
+/// Port of erts/emulator/beam/erl_unicode.c (erts_convert_filename_to_native), OTP-29.1.1.
+pub fn native_filename_list_bytes(root: Term) -> Option<Vec<u8>> {
+    filename_list_bytes(root, filename_encoding()).ok()
+}
+
 // Port of erts/emulator/beam/erl_unicode.c:2629 (prim_file_internal_name2native_1), OTP-29.1.1.
 fn internal_name2native(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let mut data = if args[0].classify() == TermKind::Bitstring {
