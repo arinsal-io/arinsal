@@ -1,7 +1,6 @@
 //! Symbolic stack traces from BEAM continuations.
 
 use crate::{Process, VmError};
-use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
 use arinsal_bifs::{Class, ProcessHeapHandle};
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::Module;
@@ -1264,7 +1263,7 @@ pub(crate) fn class_from_freason(value: u64) -> Option<Class> {
 }
 
 fn ftrace_raw(term: Term) -> Option<RawTrace> {
-    let fields = arinsal_term::term_sequence(term)?;
+    let fields = arinsal_term::term_sequence_small(term)?;
     if fields.len() != 3 {
         return None;
     }
@@ -1376,11 +1375,11 @@ fn raw_from_stacktrace_digits(digits: &[u64], args: Term, error_info: Term) -> O
 }
 
 fn term_error_info_map(value: Term) -> Option<Term> {
-    let entries = arinsal_term::term_sequence(value)?;
+    let entries = arinsal_term::term_sequence_small(value)?;
     if entries.len() != 1 || value.classify() != TermKind::List {
         return None;
     }
-    let pair = arinsal_term::term_sequence(entries[0])?;
+    let pair = arinsal_term::term_sequence_small(entries[0])?;
     (pair.len() == 2 && pair[0] == Term::atom(trace_atoms().error_info)).then_some(pair[1])
 }
 
@@ -1408,7 +1407,7 @@ pub(super) fn raw_class(_p: &Process, term: Term) -> Option<Class> {
 
 /// Args carried by the negative StackTrace used for an explicit `raise/3` trace.
 pub(super) fn raised_args(term: Term) -> Option<Term> {
-    let fields = arinsal_term::term_sequence(term)?;
+    let fields = arinsal_term::term_sequence_small(term)?;
     (fields.len() == 3 && fields[0].is_negative_bignum()).then(|| fields[1])
 }
 
@@ -1820,7 +1819,9 @@ pub(super) fn build(
 const FRAME_INFO_WORDS: usize = 4;
 
 struct PreparedFrames {
-    block: AllocBlock,
+    /// The frame lookups of one trace (`ERTS_ALC_T_TMP` in erts): inline for the default
+    /// backtrace depth, so building a trace does not allocate for them.
+    block: smallvec::SmallVec<[u64; 40]>,
     frames: usize,
     words: usize,
     bif: Option<PreparedBif>,
@@ -1834,6 +1835,9 @@ struct PreparedBif {
     error_info: Option<Term>,
 }
 
+// The frame lookups stay inline: boxing them would be the allocation they replace, and the
+// value is moved once, straight into `cons_prepared`.
+#[allow(clippy::large_enum_variant)]
 enum FramePrep {
     /// Explicit traces and unsupported interpreter module tables still use `build_saved`.
     Fallback,
@@ -1845,7 +1849,7 @@ enum FramePrep {
 /// Lookups land in one `ERTS_ALC_T_TMP` array. The symbolic list is one `HAlloc`.
 /// `None` means the saved frame metadata needs the general builder.
 pub(super) fn build_direct(p: &mut Process, term: Term) -> Option<Result<Term, VmError>> {
-    let fields = arinsal_term::term_sequence(term)?;
+    let fields = arinsal_term::term_sequence_small(term)?;
     if fields.len() != 3 || fields[0].is_negative_bignum() {
         return None;
     }
@@ -1915,9 +1919,8 @@ fn prepare_frames(
     let mut frames = 0usize;
     let mut words = 0usize;
     let capacity = (1 + count).min(depth);
-    let mut block = AllocBlock::new(ErtsAlcType::TMP, capacity * FRAME_INFO_WORDS)
-        .map_err(|error| VmError::Unsupported(format!("stacktrace temp {error:?}")))?;
-    let slots = block.as_mut_slice();
+    let mut block = smallvec::SmallVec::<[u64; 40]>::from_elem(0, capacity * FRAME_INFO_WORDS);
+    let slots = &mut block[..];
     let frame = if pc & (1 << 63) != 0 {
         let payload = pc & !(1 << 63);
         let module = tables.and_then(|tables| tables.modules.get((payload >> 32) as usize));
@@ -2038,9 +2041,8 @@ fn prepare_bif_frames(
     if module.0 == 0 || function.0 == 0 {
         return Ok(FramePrep::Fallback);
     }
-    let mut block = AllocBlock::new(ErtsAlcType::TMP, count.max(1) * FRAME_INFO_WORDS)
-        .map_err(|error| VmError::Unsupported(format!("stacktrace temp {error:?}")))?;
-    let slots = block.as_mut_slice();
+    let mut block = smallvec::SmallVec::<[u64; 40]>::from_elem(0, count.max(1) * FRAME_INFO_WORDS);
+    let slots = &mut block[..];
     let mut frames = 0usize;
     let mut words = 0usize;
     let mut first_continuation = 5;
