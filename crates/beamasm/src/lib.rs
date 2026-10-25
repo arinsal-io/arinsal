@@ -13,6 +13,7 @@ mod compare;
 pub mod construct;
 pub mod dispatch;
 mod dump;
+pub mod exc;
 pub mod float;
 pub mod fun;
 pub mod guard;
@@ -38,6 +39,30 @@ use core::ffi::c_void;
 
 pub use dump::{DumpError, write_global_note};
 
+/// The failure state of a process: `freason` (error.h `EXC_*` code or `TRAP`), `fvalue` (the
+/// reason, or the thrown or exit term) and `ftrace` (a saved stacktrace). Three adjacent words
+/// at offsets 0x28, 0x30 and 0x38, like the `Process` fields of the same names.
+#[repr(C)]
+#[derive(Debug)]
+pub struct ExcFields {
+    /// Exit code with class bits and `EXF_*` flags; zero is no exception.
+    pub freason: u64,
+    /// Exception value term.
+    pub fvalue: u64,
+    /// Saved stacktrace term word.
+    pub ftrace: *mut c_void,
+}
+
+impl Default for ExcFields {
+    fn default() -> Self {
+        Self {
+            freason: 0,
+            fvalue: 0,
+            ftrace: core::ptr::null_mut(),
+        }
+    }
+}
+
 /// C-layout prefix consumed directly by BeamAsm generated code.
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -53,12 +78,8 @@ pub struct ProcessHeader {
     /// Reductions remaining in the current slice.
     pub fcalls: i32,
     pub _fcalls_pad: u32,
-    /// Exception reason term.
-    pub freason: u64,
-    /// Exception value term.
-    pub fvalue: u64,
-    /// Exception trace pointer.
-    pub ftrace: *mut c_void,
+    /// `c_p->freason`, `fvalue` and `ftrace`, adjacent as in erts.
+    pub exc: ExcFields,
     /// Number of active catch tags in the process stack.
     pub catches: usize,
     /// Next instruction or native code pointer.
@@ -472,9 +493,9 @@ const _: () = {
     assert!(core::mem::offset_of!(ProcessHeader, heap) == 0x10);
     assert!(core::mem::offset_of!(ProcessHeader, hend) == 0x18);
     assert!(core::mem::offset_of!(ProcessHeader, fcalls) == 0x20);
-    assert!(core::mem::offset_of!(ProcessHeader, freason) == 0x28);
-    assert!(core::mem::offset_of!(ProcessHeader, fvalue) == 0x30);
-    assert!(core::mem::offset_of!(ProcessHeader, ftrace) == 0x38);
+    assert!(core::mem::offset_of!(ProcessHeader, exc.freason) == 0x28);
+    assert!(core::mem::offset_of!(ProcessHeader, exc.fvalue) == 0x30);
+    assert!(core::mem::offset_of!(ProcessHeader, exc.ftrace) == 0x38);
     assert!(core::mem::offset_of!(ProcessHeader, catches) == 0x40);
     assert!(core::mem::offset_of!(ProcessHeader, i) == 0x48);
     assert!(core::mem::offset_of!(ProcessHeader, arity) == 0x50);

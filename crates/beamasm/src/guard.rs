@@ -84,11 +84,11 @@ pub const BADARG_MFAS: [(&str, &str, u8); 8] = [
 pub const MAP_SIZE_MFA_INDEX: u8 = 5;
 /// Index of `erlang:map_get/2` in [`BADARG_MFAS`].
 pub const MAP_GET_MFA_INDEX: u8 = 7;
-/// `freason` of an inline `map_size/1` failure: `{badmap, Value}` (erts `EXC_BADMAP`).
-pub const EXC_BADMAP: u64 = (18 << 10) | 0x50;
 /// `freason` of a missing key in exact map update: `{badkey, Key}` (erts `EXC_BADKEY`).
 // Port of erts/emulator/beam/error.h:168, OTP-29.1.1.
-pub const EXC_BADKEY: u64 = (19 << 10) | 0x50;
+pub use crate::exc::EXC_BADKEY;
+/// `freason` of an inline `map_size/1` failure: `{badmap, Value}` (erts `EXC_BADMAP`).
+pub use crate::exc::EXC_BADMAP;
 const BADARG_MFA_SLOT: u32 = 16_440;
 
 /// Target mode accepted by the function arity guard adapter.

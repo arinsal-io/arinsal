@@ -711,8 +711,8 @@ pub(crate) fn commit_catch(
     // Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1.
     // The catch registers own the expanded reason and raw trace now, so stale native error
     // metadata must not survive this transfer.
-    process.header.freason = 0;
-    process.header.fvalue = Term::NIL.tagged_word();
+    process.header.exc.freason = 0;
+    process.header.exc.fvalue = Term::NIL.tagged_word();
     if let Some(cold) = process.cold.as_mut() {
         cold.native_bif_error = None;
         cold.native_trap = None;
@@ -867,8 +867,13 @@ pub unsafe extern "C" fn arinsal_native_raise(header: *mut ProcessHeader, class:
     }
     // SAFETY: Native code passes the active ProcessHeader in x21 for this hook.
     let header = unsafe { &mut *header };
-    header.freason = class;
-    header.fvalue = reason;
+    // The hook's class numbers are its own ABI; the process holds the erts exit code.
+    header.exc.freason = match class {
+        1 => arinsal_beamasm::exc::EXC_ERROR,
+        2 => arinsal_beamasm::exc::EXC_EXIT,
+        _ => arinsal_beamasm::exc::EXC_THROWN,
+    };
+    header.exc.fvalue = reason;
 }
 
 /// Find metadata for a native instruction or continuation address.
@@ -1098,7 +1103,7 @@ pub fn run_native(
             function.function,
             function.arity,
             process.x[0].tagged_word(),
-            process.header.freason
+            process.header.exc.freason
         );
     }
     process.sync_header();
@@ -1128,7 +1133,7 @@ pub fn run_native(
     let exit =
         unsafe { arinsal_beamasm::enter_native_raw(&mut process.header, registers, code_ptr) };
     process.heap.set_native_allocation(false);
-    let native_ftrace = process.header.ftrace as u64;
+    let native_ftrace = process.header.exc.ftrace as u64;
     if exception_trace {
         let (base, end) = process.heap.heap_bounds();
         let (_, current_stop) = process.heap.heap_cursor();
@@ -1160,14 +1165,14 @@ pub fn run_native(
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:533-540, OTP-29.1.1.
     // A VM-backed light BIF leaves TRAP for the scheduler when it exits native code.
     // A call handed to the scheduler keeps its call site too, for a BIF that raises there.
-    if process.header.freason != 0 || matches!(exit, ExitReason::CallUnported { .. }) {
+    if process.header.exc.freason != 0 || matches!(exit, ExitReason::CallUnported { .. }) {
         process.native_error_pc = registers.tmp_mem[6] as usize;
     }
-    if process.header.freason != 0 && process.header.freason != 1 << 10 && exception_trace {
+    if process.header.exc.freason != 0 && process.header.exc.freason != 1 << 10 && exception_trace {
         eprintln!(
             "native exception freason={:#x} fvalue={:?} at {:?}",
-            process.header.freason,
-            arinsal_term::to_owned(crate::native_hooks::from_raw(process.header.fvalue))
+            process.header.exc.freason,
+            arinsal_term::to_owned(crate::native_hooks::from_raw(process.header.exc.fvalue))
                 .map(|term| format!("{term}").chars().take(200).collect::<String>()),
             native_function_at(registers.tmp_mem[6] as usize).map(|function| format!(
                 "{}:{}/{} +{:#x}",
@@ -1181,13 +1186,13 @@ pub fn run_native(
     // Port of erts/emulator/beam/beam_common.c (handle_error), OTP-29.1.1:
     // save the raw trace before reducing the failure state to its primary class or clearing it.
     let trapped_bif =
-        process.header.freason == 1 << 10 && matches!(exit, ExitReason::CallUnported { .. });
+        process.header.exc.freason == 1 << 10 && matches!(exit, ExitReason::CallUnported { .. });
     if trapped_bif {
-        process.header.freason = 0;
-    } else if process.header.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
+        process.header.exc.freason = 0;
+    } else if process.header.exc.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
         // Port of erts/emulator/beam/beam_common.c (save_stacktrace, EXC_FUNCTION_CLAUSE):
         // the top frame carries the current function's arguments.
-        process.header.freason = 0;
+        process.header.exc.freason = 0;
         let arity = native_function_at(registers.tmp_mem[6] as usize)
             .map_or(0, |function| usize::from(function.arity));
         let args = process.x[..arity].to_vec();
@@ -1204,25 +1209,26 @@ pub fn run_native(
         let args = arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
             .list_from_iter(args)
             .map_err(|error| VmError::Unsupported(format!("function_clause args {error:?}")))?;
-        let mut trap = exceptions::native_trap(1, process.header.fvalue)?;
+        let mut trap =
+            exceptions::native_trap(arinsal_beamasm::exc::EXC_ERROR, process.header.exc.fvalue)?;
         trap.top = Some(crate::stacktrace::TopFrame::CurrentArgs(args));
         return Err(VmError::Trap(trap));
-    } else if process.header.freason != 0
+    } else if process.header.exc.freason != 0
         && let Some(raised) = process
             .cold
             .as_mut()
             .and_then(|cold| cold.native_trap.take())
-        && raised.freason == process.header.freason
-        && raised.fvalue == process.header.fvalue
+        && raised.freason == process.header.exc.freason
+        && raised.fvalue == process.header.exc.fvalue
     {
         return Err(VmError::Trap(raised.trap));
-    } else if process.header.freason != 0
+    } else if process.header.exc.freason != 0
         && let Some(failure) = process
             .cold
             .as_mut()
             .and_then(|cold| cold.native_bif_error.take())
-        && failure.freason == process.header.freason
-        && failure.fvalue == process.header.fvalue
+        && failure.freason == process.header.exc.freason
+        && failure.fvalue == process.header.exc.fvalue
     {
         // `save_raw` also matches the pending BIF frame against this reason/value pair.
         let error = match failure.call {
@@ -1255,19 +1261,19 @@ pub fn run_native(
             } => exceptions::bif_error(process, &module, &function, &args, failure.error),
         };
         return Err(error);
-    } else if process.header.freason != 0 && registers.tmp_mem[7] != 0 {
+    } else if process.header.exc.freason != 0 && registers.tmp_mem[7] != 0 {
         // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp (emit_raise_badarg): an inline
         // BIF failure names the BIF, with its arguments from X0.., as the top frame.
         let slot = std::mem::take(&mut registers.tmp_mem[7]) as usize;
         let (module, function, arity) = arinsal_beamasm::guard::BADARG_MFAS[slot - 1];
         let args = process.x[..usize::from(arity)].to_vec();
-        let tag = match process.header.freason {
+        let tag = match process.header.exc.freason {
             arinsal_beamasm::guard::EXC_BADMAP => Some("badmap"),
             arinsal_beamasm::guard::EXC_BADKEY => Some("badkey"),
             _ => None,
         };
         let error = if let Some(tag) = tag {
-            let value = crate::native_hooks::from_raw(process.header.fvalue);
+            let value = crate::native_hooks::from_raw(process.header.exc.fvalue);
             let reason =
                 arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
                     .tuple(&[crate::signals::atom(tag), value])
@@ -1276,23 +1282,20 @@ pub fn run_native(
         } else {
             arinsal_bifs::BifError::BADARG
         };
-        process.header.freason = 0;
+        process.header.exc.freason = 0;
         return Err(exceptions::bif_error(
             process, module, function, &args, error,
         ));
-    } else if process.header.freason
+    } else if process.header.exc.freason
         & (arinsal_beamasm::catch::RAW_RAISE | arinsal_beamasm::catch::RERAISE)
         != 0
     {
         // Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise) and the i_raise
         // instruction, OTP-29.1.1: both re-raise the stacktrace in `c_p->ftrace`.
-        let raw_rethrow = process.header.freason & arinsal_beamasm::catch::RAW_RAISE != 0;
-        let class = match process.header.freason & 3 {
-            1 => arinsal_bifs::Class::Error,
-            2 => arinsal_bifs::Class::Exit,
-            _ => arinsal_bifs::Class::Throw,
-        };
-        process.header.freason = 0;
+        let raw_rethrow = process.header.exc.freason & arinsal_beamasm::catch::RAW_RAISE != 0;
+        let class = crate::stacktrace::class_from_freason(process.header.exc.freason)
+            .unwrap_or(arinsal_bifs::Class::Error);
+        process.header.exc.freason = 0;
         let trace = crate::native_hooks::from_raw(native_ftrace);
         if raw_rethrow {
             // raw_raise stores the new class in the stacktrace too, so a later i_raise of
@@ -1301,45 +1304,28 @@ pub fn run_native(
         }
         return Err(VmError::Trap(exceptions::Trap {
             class,
-            reason: crate::native_hooks::from_raw(process.header.fvalue),
+            reason: crate::native_hooks::from_raw(process.header.exc.fvalue),
             trace: Some(trace),
             top: None,
             raw_rethrow,
             untrappable: false,
         }));
-    } else if process.header.freason > 3 && process.header.freason & 0x3ff == 0x50 {
+    } else if process.header.exc.freason > 3 && process.header.exc.freason & 0x3ff == 0x50 {
         // Port of erts/emulator/beam/beam_common.c:742-775 (expand_error_value), OTP-29.1.1.
-        let index = process.header.freason >> 10;
-        process.header.freason = 0;
-        let value = crate::native_hooks::from_raw(process.header.fvalue);
-        let tag = match index {
-            5 => "badmatch",
-            7 => "case_clause",
-            8 => "if_clause",
-            16 => "try_clause",
-            19 => "badkey",
-            20 => "badrecord",
-            _ => {
-                return Err(VmError::Unsupported(format!(
-                    "native exception index {index}"
-                )));
-            }
+        let index = process.header.exc.freason >> 10;
+        let Some(reason) = crate::native_helpers::expand_error_value(process) else {
+            return Err(VmError::Unsupported(format!(
+                "native exception index {index}"
+            )));
         };
-        let tag = crate::signals::atom(tag);
-        let reason = if index == 8 {
-            tag
-        } else {
-            arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
-                .tuple(&[tag, value])
-                .map_err(|error| VmError::Unsupported(format!("error value {error:?}")))?
-        };
+        process.header.exc.freason = 0;
         return Err(VmError::Trap(exceptions::native_trap(
-            1,
+            arinsal_beamasm::exc::EXC_ERROR,
             crate::native_hooks::raw(reason),
         )?));
-    } else if process.header.freason != 0 {
-        let class = process.header.freason;
-        let reason = process.header.fvalue;
+    } else if process.header.exc.freason != 0 {
+        let class = process.header.exc.freason;
+        let reason = process.header.exc.fvalue;
         let mut trap = exceptions::native_trap(class, reason)?;
         if let Some(info) = process
             .cold

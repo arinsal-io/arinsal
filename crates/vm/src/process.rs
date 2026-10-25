@@ -36,8 +36,8 @@ fn raise_undefined_call(
         other => return Err(other),
     };
     let resumed = crate::exceptions::resume(vm, process, Some(ctx), trap)?;
-    process.header.freason = 0;
-    process.header.fvalue = 0;
+    process.header.exc.freason = 0;
+    process.header.exc.fvalue = 0;
     Ok(resumed)
 }
 
@@ -2197,12 +2197,12 @@ impl Executor {
                                         Some(ctx),
                                         trap,
                                     )? {
-                                        process.header.freason = 0;
-                                        process.header.fvalue = 0;
+                                        process.header.exc.freason = 0;
+                                        process.header.exc.fvalue = 0;
                                         break Err(error);
                                     }
-                                    process.header.freason = 0;
-                                    process.header.fvalue = 0;
+                                    process.header.exc.freason = 0;
+                                    process.header.exc.fvalue = 0;
                                     if let Some(cold) = process.cold.as_mut() {
                                         cold.exit_reason = None;
                                     }
@@ -2855,12 +2855,12 @@ impl Executor {
                                         Some(ctx),
                                         trap,
                                     )? {
-                                        process.header.freason = 0;
-                                        process.header.fvalue = 0;
+                                        process.header.exc.freason = 0;
+                                        process.header.exc.fvalue = 0;
                                         break Err(error);
                                     }
-                                    process.header.freason = 0;
-                                    process.header.fvalue = 0;
+                                    process.header.exc.freason = 0;
+                                    process.header.exc.fvalue = 0;
                                     if let Some(cold) = process.cold.as_mut() {
                                         cold.exit_reason = None;
                                     }
@@ -3035,8 +3035,8 @@ impl Executor {
                                             )? {
                                                 break Err(error);
                                             }
-                                            process.header.freason = 0;
-                                            process.header.fvalue = 0;
+                                            process.header.exc.freason = 0;
+                                            process.header.exc.fvalue = 0;
                                             continue;
                                         }
                                         Some(Err(error)) => return Err(error),
@@ -3473,8 +3473,8 @@ impl Executor {
                                                 )? {
                                                     break Err(error);
                                                 }
-                                                process.header.freason = 0;
-                                                process.header.fvalue = 0;
+                                                process.header.exc.freason = 0;
+                                                process.header.exc.fvalue = 0;
                                                 continue;
                                             }
                                             Err(VmError::Unsupported(message))

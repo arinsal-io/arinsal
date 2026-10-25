@@ -22,7 +22,7 @@ extern "C" fn resolve_tail(process: *mut ProcessHeader, fun: u64, arity: u32) ->
 
 extern "C" fn resolve_export(process: *mut ProcessHeader, fun: u64, arity: u32) -> usize {
     let (expected, target) = arinsal_beamasm::rt::process_header_mut(process, |header| {
-        (header.fvalue, header.self_pid as usize)
+        (header.exc.fvalue, header.self_pid as usize)
     });
     if arity == 1 && fun == expected {
         target
@@ -343,7 +343,10 @@ fn native_i_call_fun2_exported_fun_m_f_1() {
 
     let mut header = ProcessHeader {
         self_pid: module.entries[&2] as usize as u64,
-        fvalue: export_bits,
+        exc: arinsal_beamasm::ExcFields {
+            fvalue: export_bits,
+            ..Default::default()
+        },
         ..ProcessHeader::default()
     };
     let mut regs = SchedulerRegisters::default();
@@ -420,14 +423,21 @@ fn native_call_fun_errors_badfun_and_badarity() {
     regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(15);
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(header.freason, 1, "badfun");
+    assert_eq!(
+        header.exc.freason,
+        arinsal_beamasm::exc::EXC_ERROR,
+        "badfun"
+    );
 
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_i_call_fun(2, resolve_badfun).unwrap();
     let module = asm.finalize().unwrap();
     header = ProcessHeader {
-        fvalue: 2,
+        exc: arinsal_beamasm::ExcFields {
+            fvalue: 2,
+            ..Default::default()
+        },
         ..ProcessHeader::default()
     };
     regs = SchedulerRegisters::default();
@@ -437,22 +447,27 @@ fn native_call_fun_errors_badfun_and_badarity() {
         arinsal_beamasm::rt::fixture_term(local_fun_words(&mut thing, &mut dispatch, 0, 1));
     stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(header.freason, 2, "badarity");
+    assert_eq!(
+        header.exc.freason,
+        arinsal_beamasm::exc::EXC_EXIT,
+        "badarity"
+    );
 }
 
 extern "C" fn resolve_badfun(process: *mut ProcessHeader, fun: u64, arity: u32) -> usize {
     if fun & 7 != 2 {
         arinsal_beamasm::rt::process_header_mut(process, |header| {
-            header.freason = 1;
-            header.fvalue = fun;
+            header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+            header.exc.fvalue = fun;
         });
         return 0;
     }
-    let badarity = arinsal_beamasm::rt::process_header_mut(process, |header| header.fvalue == 2);
+    let badarity =
+        arinsal_beamasm::rt::process_header_mut(process, |header| header.exc.fvalue == 2);
     if arity != 1 || badarity {
         arinsal_beamasm::rt::process_header_mut(process, |header| {
-            header.freason = 2;
-            header.fvalue = fun;
+            header.exc.freason = arinsal_beamasm::exc::EXC_EXIT;
+            header.exc.fvalue = fun;
         });
         return 0;
     }

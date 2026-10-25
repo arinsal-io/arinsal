@@ -628,14 +628,10 @@ fn finish_direct(
     match bif_register_frame(module, function, args.len(), result) {
         Ok(value) => Some(value),
         Err(VmError::Trap(trap)) => {
-            let class = match trap.class {
-                arinsal_bifs::Class::Error => 1,
-                arinsal_bifs::Class::Exit => 2,
-                arinsal_bifs::Class::Throw => 3,
-            };
+            let class = crate::stacktrace::class_to_freason(Some(trap.class));
             let fvalue = crate::native_hooks::raw(trap.reason);
-            process.header.freason = class;
-            process.header.fvalue = fvalue;
+            process.header.exc.freason = class;
+            process.header.exc.fvalue = fvalue;
             process.cold_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
                 trap,
                 freason: class,

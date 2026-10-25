@@ -1150,7 +1150,7 @@ fn emit_update_map_single_exact_body_shared(
     let tmp_mem2 = tmp_mem1 + 8;
     let native_error_pc = tmp_mem1 + 6 * 8;
     let native_return = tmp_mem1 + 4 * 8;
-    let freason = std::mem::offset_of!(crate::ProcessHeader, freason) as u32;
+    let freason = std::mem::offset_of!(crate::ProcessHeader, exc.freason) as u32;
 
     code.emit(|e| e.str_uoff(Gpr::x(1), Gpr::x(19), tmp_mem2))?;
     code.emit(|e| {

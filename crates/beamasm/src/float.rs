@@ -64,8 +64,8 @@ impl BeamModuleAssembler {
     }
 
     fn badarith(&mut self) -> Result<(), ModuleError> {
-        // The VM's native exception convention: `freason = 1` (error) and the reason atom in
-        // `fvalue`, as `set_error` publishes it.
+        // Port of erts BADARITH: `freason = EXC_BADARITH`; the reason atom also goes in
+        // `fvalue`, which the stacktrace saver matches the failure by.
         let badarith = arinsal_term::Term::atom(
             arinsal_term::global_atoms()
                 .intern("badarith")
@@ -73,7 +73,7 @@ impl BeamModuleAssembler {
         )
         .tagged_word();
         self.code.emit(|e| {
-            e.mov_const(Gpr::x(9), 1)?;
+            e.mov_const(Gpr::x(9), crate::exc::EXC_BADARITH)?;
             e.str_uoff(Gpr::x(9), C_P, 40)?;
             e.mov_const(Gpr::x(9), badarith)?;
             e.str_uoff(Gpr::x(9), C_P, 48)?;

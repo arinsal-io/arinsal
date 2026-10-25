@@ -316,8 +316,8 @@ fn native_try_case_end() {
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
     // erts EXC_TRY_CLAUSE: the runtime wraps the value as {try_clause, 42}.
-    assert_eq!(header.freason, (16 << 10) | 0x50);
-    assert_eq!(header.fvalue, 42);
+    assert_eq!(header.exc.freason, (16 << 10) | 0x50);
+    assert_eq!(header.exc.fvalue, 42);
 }
 
 #[test]
@@ -333,7 +333,7 @@ fn native_i_raise() {
     .unwrap();
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
-    assert_eq!(header.freason, 0x5b);
+    assert_eq!(header.exc.freason, 0x5b);
 }
 
 #[test]
@@ -349,7 +349,7 @@ fn native_raise() {
     .unwrap();
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
-    assert_eq!(header.freason, 0x5b);
+    assert_eq!(header.exc.freason, 0x5b);
 }
 
 fn atom_word(name: &str) -> u64 {
@@ -367,9 +367,9 @@ fn native_raw_raise() {
     asm.emit_raw_raise(uncaught).unwrap();
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
-    assert_eq!(header.freason, arinsal_beamasm::catch::RAW_RAISE | 2);
-    assert_eq!(header.fvalue, 12);
-    assert_eq!(header.ftrace as u64, 0x3b);
+    assert_eq!(header.exc.freason, arinsal_beamasm::catch::RAW_RAISE | 2);
+    assert_eq!(header.exc.fvalue, 12);
+    assert_eq!(header.exc.ftrace as u64, 0x3b);
 }
 
 // Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise): an invalid class leaves
@@ -383,7 +383,7 @@ fn native_raw_raise_invalid_class_continues_with_badarg() {
     asm.emit_raw_raise(uncaught).unwrap();
     finish(&mut asm);
     let (_, header, regs, _) = execute(asm, 1);
-    assert_eq!(header.freason, 0);
+    assert_eq!(header.exc.freason, 0);
     assert_eq!(
         regs.x_reg_array[0],
         arinsal_beamasm::rt::fixture_term(atom_word("badarg"))
@@ -446,7 +446,7 @@ fn error_test(
     emit(&mut asm).unwrap();
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
-    assert_ne!(header.freason, 0);
+    assert_ne!(header.exc.freason, 0);
 }
 
 // Compile-time use also pins the resolver ABI for fixtures that catch errors in a caller.

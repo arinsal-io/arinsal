@@ -15,7 +15,7 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 extern "C" fn trap_bif(header: *mut ProcessHeader, _: u64) -> u64 {
     arinsal_beamasm::rt::process_header_mut(header, |header| {
-        header.freason = TRAP_REASON;
+        header.exc.freason = TRAP_REASON;
         header.i = TARGET.load(Ordering::Acquire) as *const u8 as *const _;
         header.arity = 2;
     });
@@ -24,8 +24,8 @@ extern "C" fn trap_bif(header: *mut ProcessHeader, _: u64) -> u64 {
 
 extern "C" fn error_bif(header: *mut ProcessHeader, _: u64) -> u64 {
     arinsal_beamasm::rt::process_header_mut(header, |header| {
-        header.freason = 0x55;
-        header.fvalue = 0xfeed;
+        header.exc.freason = 0x55;
+        header.exc.fvalue = 0xfeed;
     });
     0 // THE_NON_VALUE in OTP's non-debug build.
 }
@@ -123,7 +123,7 @@ fn light_bif_trap_exits_to_target_with_saved_continuation_and_arguments() {
     assert_ne!(resume_pc, 0);
     assert_eq!(header.stop, stack.as_mut_ptr().wrapping_add(63));
     assert_eq!(stack[63], resume_pc as u64);
-    assert_eq!(header.freason, 0);
+    assert_eq!(header.exc.freason, 0);
     assert_eq!(header.arity, 2);
     assert_eq!(
         arinsal_beamasm::rt::fixture_words(&registers.x_reg_array[..2]),
@@ -139,8 +139,8 @@ fn light_bif_non_trap_error_keeps_master_return_behavior() {
     let address = target.ptr_at(0) as usize;
     let (outcome, header, _, _) = run(error_bif as *const () as usize, address);
     assert_eq!(outcome, ExitReason::Returned);
-    assert_eq!(header.freason, 0x55);
-    assert_eq!(header.fvalue, 0xfeed);
+    assert_eq!(header.exc.freason, 0x55);
+    assert_eq!(header.exc.fvalue, 0xfeed);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -151,7 +151,7 @@ fn light_bif_normal_return_uses_caller_continuation() {
     let address = target.ptr_at(0) as usize;
     let (outcome, header, _, _) = run(normal_bif as *const () as usize, address);
     assert_eq!(outcome, ExitReason::Returned);
-    assert_eq!(header.freason, 0);
+    assert_eq!(header.exc.freason, 0);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -181,5 +181,5 @@ fn scheduler_entry_restores_xreg0_into_native_x0() {
         enter_native(&mut header, &mut registers, &entry),
         ExitReason::Returned
     );
-    assert_eq!(header.fvalue, expected);
+    assert_eq!(header.exc.fvalue, expected);
 }

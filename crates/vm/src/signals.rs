@@ -177,14 +177,10 @@ fn whereis_light_error(process: &mut Process, arg: Term, error: VmError) -> u64 
             info: crate::stacktrace::BifErrorInfo::Plain,
         });
     }
-    let freason = match trap.class {
-        arinsal_bifs::Class::Error => 1,
-        arinsal_bifs::Class::Exit => 2,
-        arinsal_bifs::Class::Throw => 3,
-    };
+    let freason = crate::stacktrace::class_to_freason(Some(trap.class));
     let fvalue = crate::native_hooks::raw(trap.reason);
-    process.header.freason = freason;
-    process.header.fvalue = fvalue;
+    process.header.exc.freason = freason;
+    process.header.exc.fvalue = fvalue;
     process.cold_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
         trap,
         freason,
@@ -253,7 +249,7 @@ fn alive_fast(process: &Process, arg: Term) -> Option<arinsal_term::Atom> {
 fn alive_trap(process: &mut Process, identity: u64) -> u64 {
     process.header.i = identity as *const _;
     process.header.arity = 1;
-    process.header.freason = 1 << 10;
+    process.header.exc.freason = 1 << 10;
     0
 }
 

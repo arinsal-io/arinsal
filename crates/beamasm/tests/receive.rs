@@ -47,7 +47,7 @@ extern "C" fn reserve(process: *mut ProcessHeader) -> u64 {
 
 extern "C" fn bind(process: *mut ProcessHeader, marker: u64, reference: u64) {
     process_header_mut(process, |header| {
-        header.fvalue = marker;
+        header.exc.fvalue = marker;
         header.current = reference as usize as *const c_void;
     });
 }
@@ -74,7 +74,7 @@ extern "C" fn peek(process: *mut ProcessHeader) -> u64 {
 
 extern "C" fn remove(process: *mut ProcessHeader, reductions: i32, _code_ix: usize) -> i32 {
     process_header_mut(process, |header| {
-        header.fvalue = u64::from(header.arity);
+        header.exc.fvalue = u64::from(header.arity);
         reductions - 1
     })
 }
@@ -136,7 +136,7 @@ fn native_first_message() {
         ..ProcessHeader::default()
     };
     assert_eq!(run(&module, 1, &mut header), ExitReason::Returned);
-    assert_eq!(header.fvalue, 0);
+    assert_eq!(header.exc.fvalue, 0);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -167,7 +167,7 @@ fn native_skip_then_match() {
     };
     assert_eq!(run(&module, 10, &mut header), ExitReason::Returned);
     assert_eq!(header.arity, 1);
-    assert_eq!(header.fvalue, 1);
+    assert_eq!(header.exc.fvalue, 1);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -196,7 +196,7 @@ fn native_wait_suspends_and_resumes() {
     assert_eq!(header.i, module.entries[&20].cast());
     header.arity = 1;
     assert_eq!(run(&module, 20, &mut header), ExitReason::Returned);
-    assert_eq!(header.fvalue, 1);
+    assert_eq!(header.exc.fvalue, 1);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -250,7 +250,7 @@ fn native_recv_marker() {
         ..ProcessHeader::default()
     };
     assert_eq!(run(&module, 40, &mut header), ExitReason::Returned);
-    assert_eq!(header.fvalue, 0x551);
+    assert_eq!(header.exc.fvalue, 0x551);
     assert_eq!(header.arity, 4);
     assert_eq!(header.current, 7usize as *const c_void);
 }

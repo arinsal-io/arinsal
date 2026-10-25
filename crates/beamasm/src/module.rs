@@ -248,7 +248,7 @@ const TRAP_RETURN_SLOT: u32 = crate::TRAP_RETURN_OFFSET as u32;
 pub const RETURN_SITE_TAG: usize = 1;
 
 /// erts `EXC_FUNCTION_CLAUSE` (error.h: `(6 << EXC_OFFSET) | EXC_ERROR`), OTP-29.1.1.
-pub const EXC_FUNCTION_CLAUSE: u64 = (6 << 10) | 0x50;
+pub use crate::exc::EXC_FUNCTION_CLAUSE;
 
 impl Default for BeamModuleAssembler {
     fn default() -> Self {
@@ -1769,7 +1769,7 @@ impl BeamModuleAssembler {
         )
         .tagged_word();
         self.code.emit(|e| {
-            e.mov_const(Gpr::x(9), 1)?;
+            e.mov_const(Gpr::x(9), crate::exc::EXC_BADARG)?;
             e.str_uoff(Gpr::x(9), C_P, 40)?;
             e.mov_const(Gpr::x(9), badarg)?;
             e.str_uoff(Gpr::x(9), C_P, 48)

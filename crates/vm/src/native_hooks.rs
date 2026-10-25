@@ -209,8 +209,8 @@ pub(crate) fn set_error(process: &mut Process, name: &str) {
     // `am_badarg` and the other built-in error atoms. Interning the reason on
     // every `persistent_term:get/1` miss took the atom-table lock.
     let term = crate::signals::atom(name);
-    process.header.freason = 1;
-    process.header.fvalue = term.tagged_word();
+    process.header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+    process.header.exc.fvalue = term.tagged_word();
 }
 
 pub(crate) fn raw(term: Term) -> u64 {
@@ -678,8 +678,8 @@ pub const QUIET_GUARD: u32 = 0x100;
 fn set_light_error(process: &mut Process, error: &BifError) {
     match error {
         BifError::Error(reason) => {
-            process.header.freason = 1;
-            process.header.fvalue = raw(*reason);
+            process.header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+            process.header.exc.fvalue = raw(*reason);
         }
         BifError::SystemLimit => set_error(process, "system_limit"),
         BifError::Badarith => set_error(process, "badarith"),
