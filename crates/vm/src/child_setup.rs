@@ -309,7 +309,10 @@ fn forker_loop() -> io::Result<()> {
                 _ => {}
             }
         }
-        if got_control {
+        // mio registers the descriptor edge-triggered, while erl_child_setup.c polls it level-
+        // triggered: serve every queued request, or a start frame that arrived with its
+        // predecessor is never seen and its spawner waits for `Go` forever.
+        while got_control {
             match recv_start(&control)? {
                 Some((frame, fds)) => {
                     if u32::from_ne_bytes(frame[0..4].try_into().unwrap()) != START {
@@ -339,6 +342,7 @@ fn forker_loop() -> io::Result<()> {
                 }
                 None => return Ok(()),
             }
+            got_control = control_readable(&control)?;
         }
         if got_sigchld {
             let _ = signals.pending().count();
@@ -350,6 +354,25 @@ fn forker_loop() -> io::Result<()> {
 struct TrackedChild {
     child: Child,
     port_id: Option<u64>,
+}
+
+/// Whether the control socket has another queued request (a zero-timeout level check).
+fn control_readable(control: &impl AsFd) -> io::Result<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut fds = [PollFd::new(control, PollFlags::IN)];
+    loop {
+        match poll(
+            &mut fds,
+            Some(&Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }),
+        ) {
+            Ok(ready) => return Ok(ready > 0),
+            Err(error) if error == rustix::io::Errno::INTR => continue,
+            Err(error) => return Err(to_io_error(error)),
+        }
+    }
 }
 
 fn inheritable_dup(fd: &impl AsFd) -> io::Result<OwnedFd> {
