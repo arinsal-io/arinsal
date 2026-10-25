@@ -1133,7 +1133,7 @@ pub fn run_native(
     let exit =
         unsafe { arinsal_beamasm::enter_native_raw(&mut process.header, registers, code_ptr) };
     process.heap.set_native_allocation(false);
-    let native_ftrace = process.header.exc.ftrace as u64;
+    let native_ftrace = process.header.exc.ftrace;
     if exception_trace {
         let (base, end) = process.heap.heap_bounds();
         let (_, current_stop) = process.heap.heap_cursor();

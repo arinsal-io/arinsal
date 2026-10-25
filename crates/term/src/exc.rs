@@ -88,3 +88,18 @@ pub const TRAP: u64 = 1 << EXC_OFFSET;
 pub const fn exc_class(freason: u64) -> u64 {
     freason & EXC_CLASSBITS
 }
+
+/// The failure state of a process: `freason` (an `EXC_*` code or `TRAP`), `fvalue` (the reason,
+/// or the exit or thrown term) and `ftrace` (a saved stacktrace). Three adjacent words, like
+/// the `Process` fields of the same names, at offsets 0x28, 0x30 and 0x38 of the BeamAsm
+/// process header.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct ExcFields {
+    /// Exit code with class bits and `EXF_*` flags; zero is no exception.
+    pub freason: u64,
+    /// Exception value term.
+    pub fvalue: u64,
+    /// Saved stacktrace term word.
+    pub ftrace: u64,
+}

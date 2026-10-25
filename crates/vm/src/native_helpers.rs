@@ -3401,7 +3401,11 @@ fn call_plain_bif_word(
     let arity = usize::from(export.arity);
     let entry_top = process.heap.heap_top_index();
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header.fcalls);
+    let mut ctx = arinsal_bifs::Ctx::with_failure(
+        &mut fragment,
+        &mut process.header.fcalls,
+        &mut process.header.exc,
+    );
     let word = bif(&mut ctx, &registers.x_reg_array[..arity]);
     let deferred = ctx.take_deferred();
     if deferred.is_none() && word != arinsal_term::THE_NON_VALUE {
@@ -3414,12 +3418,74 @@ fn call_plain_bif_word(
     }
     let error = ctx.take_error();
     drop(ctx);
+    plain_bif_word_slow(process, registers, identity, export, word, deferred, error)
+}
+
+/// The tail of [`call_plain_bif_word`] for a failure, a trap or a due collection, out of line
+/// like [`plain_bif_slow`].
+#[cold]
+#[inline(never)]
+fn plain_bif_word_slow(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    identity: usize,
+    export: ExportDispatch,
+    word: u64,
+    deferred: Option<Box<arinsal_bifs::DeferredTrap>>,
+    error: Option<arinsal_bifs::BifError>,
+) -> u64 {
     let result = if word == arinsal_term::THE_NON_VALUE {
+        // A migrated body left its failure in the process' exit words; an adapted `Result`
+        // body left it in the context. The words are rewritten from the decoded error by
+        // `set_light_bif_error`, so decoding clears them.
+        let error = error.or_else(|| decode_failure(&mut process.header.exc));
         Err(error.unwrap_or(arinsal_bifs::BifError::BADARG))
     } else {
         Ok(crate::native_hooks::from_raw(word))
     };
     plain_bif_slow(process, registers, identity, export, result, deferred)
+}
+
+/// The `BifError` a word-returning body left in the process' failure words, which are then
+/// cleared. `None` when no failure is recorded or it is a `TRAP`.
+// Inverse of `arinsal_bifs`'s `encode_failure`; port of the class and index decoding of
+// erts/emulator/beam/error.h (GET_EXC_CLASS, GET_EXC_INDEX), OTP-29.1.1.
+fn decode_failure(exc: &mut arinsal_term::exc::ExcFields) -> Option<arinsal_bifs::BifError> {
+    use arinsal_bifs::BifError;
+    use arinsal_term::exc::{EXF_ARGLIST, EXF_HAS_EXT_INFO, TRAP, exc_index};
+    let freason = std::mem::take(&mut exc.freason);
+    if freason == 0 {
+        return None;
+    }
+    let (fvalue, ftrace) = (
+        crate::native_hooks::from_raw(exc.fvalue),
+        crate::native_hooks::from_raw(std::mem::take(&mut exc.ftrace)),
+    );
+    if freason == TRAP {
+        let class = match ftrace.word() {
+            1 => arinsal_bifs::SchedulerClass::Normal,
+            2 => arinsal_bifs::SchedulerClass::DirtyCpu,
+            3 => arinsal_bifs::SchedulerClass::DirtyIo,
+            _ => return None,
+        };
+        return Some(BifError::Dirty(class));
+    }
+    let class = crate::stacktrace::class_from_freason(freason)?;
+    Some(match exc_index(freason) {
+        3 => BifError::Badarg {
+            cause: (freason & EXF_HAS_EXT_INFO != 0).then_some(ftrace),
+        },
+        4 => BifError::Badarith,
+        15 => BifError::SystemLimit,
+        9 => BifError::Unsupported("undef"),
+        0 if freason & EXF_ARGLIST != 0 => BifError::Raise {
+            class,
+            reason: fvalue,
+            stacktrace: (!ftrace.is_non_value()).then_some(ftrace),
+        },
+        0 => BifError::Error(fvalue),
+        _ => BifError::BADARG,
+    })
 }
 
 /// Installs a BIF continuation after its process-bound context has returned.

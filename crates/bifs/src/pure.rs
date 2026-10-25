@@ -247,10 +247,10 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "round", 1) => v.entry::<bodies::round>(),
         ("erlang", "ceil", 1) => v.entry::<bodies::ceil>(),
         ("erlang", "floor", 1) => v.entry::<bodies::floor>(),
-        ("erlang", "hd", 1) => v.entry::<process_bodies::hd>(),
-        ("erlang", "tl", 1) => v.entry::<process_bodies::tl>(),
-        ("erlang", "element", 2) => v.entry::<process_bodies::element>(),
-        ("erlang", "setelement", 3) => v.entry::<process_bodies::setelement>(),
+        ("erlang", "hd", 1) => v.entry::<word_bodies::hd>(),
+        ("erlang", "tl", 1) => v.entry::<word_bodies::tl>(),
+        ("erlang", "element", 2) => v.entry::<word_bodies::element>(),
+        ("erlang", "setelement", 3) => v.entry::<word_bodies::setelement>(),
         ("erlang", "tuple_size", 1) => v.entry::<process_bodies::tuple_size>(),
         ("erlang", "size", 1) => v.entry::<bodies::size>(),
         ("erlang", "node", 0 | 1) => v.entry::<bodies::node>(),
@@ -275,7 +275,7 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
         ("erlang", "unique_integer", 0 | 1) => v.entry::<bodies::unique_integer>(),
         ("erlang" | "os", "system_time", 0 | 1) => v.entry::<bodies::system_time>(),
         ("erts_internal", "time_unit" | "perf_counter_unit", 0) => v.entry::<bodies::time_unit>(),
-        ("erlang", "tuple_to_list", 1) => v.entry::<process_bodies::tuple_to_list>(),
+        ("erlang", "tuple_to_list", 1) => v.entry::<word_bodies::tuple_to_list>(),
         ("erlang", "list_to_tuple", 1) => v.entry::<process_bodies::list_to_tuple>(),
         ("erlang", "make_tuple", 2 | 3) => v.entry::<process_bodies::make_tuple>(),
         ("erlang", "append_element", 2) => v.entry::<process_bodies::append_element>(),
@@ -505,55 +505,63 @@ pub(super) fn tuple_build(ctx: &mut Ctx<'_>, values: &[Term]) -> Term {
         .expect("infallible BIF heap")
 }
 
-fn hd(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn hd(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/bif.c:2918-2930 (hd_1), OTP-29.1.1.
     // SAFETY: The input heap is live and stable.
-    unsafe { args[0].cons_ref() }
-        .map(|(head, _)| head)
-        .ok_or(BADARG)
+    match unsafe { args[0].cons_ref() } {
+        Some((head, _)) => head,
+        None => ctx.badarg(),
+    }
 }
-fn tl(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn tl(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/bif.c:2931-2943 (tl_1), OTP-29.1.1.
     // SAFETY: The input heap is live and stable.
-    unsafe { args[0].cons_ref() }
-        .map(|(_, tail)| tail)
-        .ok_or(BADARG)
-}
-fn element(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let index = args[0].as_small().ok_or(BADARG)?;
-    if index < 1 {
-        return Err(BADARG);
+    match unsafe { args[0].cons_ref() } {
+        Some((_, tail)) => tail,
+        None => ctx.badarg(),
     }
-    // Port of erts/emulator/beam/bif.c:2944-2963 (element_2), OTP-29.1.1.
-    tuple_view(&args[1])?
-        .element(index as usize - 1)
-        .ok_or(BADARG)
 }
-fn setelement(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn element(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    // Port of erts/emulator/beam/bif.c:2944-2963 (element_2), OTP-29.1.1.
+    let Some(index) = args[0].as_small().filter(|index| *index >= 1) else {
+        return ctx.badarg();
+    };
+    match tuple_view(&args[1])
+        .ok()
+        .and_then(|tuple| tuple.element(index as usize - 1))
+    {
+        Some(value) => value,
+        None => ctx.badarg(),
+    }
+}
+fn setelement(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/bif.c:2976-3003 (setelement_3), OTP-29.1.1:
     // one `HAlloc` of `arity + 1` words, `sys_memcpy` of the tuple, then the
     // replaced element. No per-element closure.
-    let index = args[0].as_small().ok_or(BADARG)?;
-    if index < 1 {
-        return Err(BADARG);
-    }
-    let source = tuple_view(&args[1])?;
+    let Some(index) = args[0].as_small().filter(|index| *index >= 1) else {
+        return ctx.badarg();
+    };
+    let Ok(source) = tuple_view(&args[1]) else {
+        return ctx.badarg();
+    };
     let arity = source.len();
     if index as usize > arity {
-        return Err(BADARG);
+        return ctx.badarg();
     }
     let replacement = args[2];
-    TermBuilder::new(&mut Heap(&mut ctx.heap))
-        .tuple_from_fn(arity, |slot, _| {
-            if slot + 1 == index as usize {
-                replacement
-            } else {
-                source
-                    .element(slot)
-                    .expect("tuple arity was read from source")
-            }
-        })
-        .map_err(|_| BifError::SystemLimit)
+    let built = TermBuilder::new(&mut Heap(&mut ctx.heap)).tuple_from_fn(arity, |slot, _| {
+        if slot + 1 == index as usize {
+            replacement
+        } else {
+            source
+                .element(slot)
+                .expect("tuple arity was read from source")
+        }
+    });
+    match built {
+        Ok(tuple) => tuple,
+        Err(_) => ctx.system_limit(),
+    }
 }
 fn tuple_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:2963-2973 (tuple_size_1), OTP-29.1.1.
@@ -845,20 +853,24 @@ fn time_unit(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     Ok(Term::small(1_000_000_000).expect("small time unit"))
 }
 
-fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/bif.c:3762-3777 (tuple_to_list_1), OTP-29.1.1.
-    let values = tuple_view(&args[0])?;
+    let Ok(values) = tuple_view(&args[0]) else {
+        return ctx.badarg();
+    };
     let len = values.len();
     if len == 0 {
-        return Ok(Term::NIL);
+        return Term::NIL;
     }
-    let mut heap = Heap(&mut ctx.heap);
     // The element words are copied straight into the cons cells, last to first, like the
     // `CONS(hp, tup[n], res)` loop of tuple_to_list_1, with no per-element bounds check.
-    TermBuilder::new(&mut heap)
+    let built = TermBuilder::new(&mut Heap(&mut ctx.heap))
         .reserve_cons_list(len)
-        .and_then(|list| list.prepend_exact_words_with_tail(values.words(), Term::NIL))
-        .map_err(|_| BifError::SystemLimit)
+        .and_then(|list| list.prepend_exact_words_with_tail(values.words(), Term::NIL));
+    match built {
+        Ok(list) => list,
+        Err(_) => ctx.system_limit(),
+    }
 }
 fn list_to_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3789-3808 (list_to_tuple_1), OTP-29.1.1.
@@ -2219,8 +2231,9 @@ crate::bif_bodies!(
     math_fmod,
 );
 
+crate::word_bif_bodies_in!(word_bodies; hd, tl, element, setelement, tuple_to_list);
 crate::process_bif_bodies_in!(process_bodies;
-    hd, tl, element, setelement, tuple_size, tuple_to_list, list_to_tuple, make_tuple,
+    tuple_size, list_to_tuple, make_tuple,
     append_element, delete_element, insert_element, atom_to_list, list_to_atom,
     list_to_existing_atom,
 );

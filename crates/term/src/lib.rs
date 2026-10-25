@@ -2,6 +2,7 @@
 mod atom;
 mod bits;
 mod copy;
+pub mod exc;
 mod fun;
 mod gc;
 mod hamt;
@@ -288,6 +289,14 @@ impl Term {
     #[inline]
     pub(crate) const fn bits(self) -> u64 {
         self.0
+    }
+    /// `THE_NON_VALUE`: what a BIF returns when it failed or trapped (erl_term.h). No Erlang
+    /// term has this word, so it cannot be mistaken for a value.
+    pub const NON_VALUE: Self = Self(THE_NON_VALUE);
+    /// Whether this is [`Term::NON_VALUE`].
+    #[inline]
+    pub const fn is_non_value(self) -> bool {
+        self.0 == THE_NON_VALUE
     }
     /// The tagged word of this term. Reading the bits is safe; only rebuilding a term from
     /// them needs [`Term::from_raw_bits`].

@@ -13,7 +13,8 @@ mod compare;
 pub mod construct;
 pub mod dispatch;
 mod dump;
-pub mod exc;
+pub use arinsal_term::exc;
+pub use arinsal_term::exc::ExcFields;
 pub mod float;
 pub mod fun;
 pub mod guard;
@@ -38,30 +39,6 @@ use arinsal_a64::{
 use core::ffi::c_void;
 
 pub use dump::{DumpError, write_global_note};
-
-/// The failure state of a process: `freason` (error.h `EXC_*` code or `TRAP`), `fvalue` (the
-/// reason, or the thrown or exit term) and `ftrace` (a saved stacktrace). Three adjacent words
-/// at offsets 0x28, 0x30 and 0x38, like the `Process` fields of the same names.
-#[repr(C)]
-#[derive(Debug)]
-pub struct ExcFields {
-    /// Exit code with class bits and `EXF_*` flags; zero is no exception.
-    pub freason: u64,
-    /// Exception value term.
-    pub fvalue: u64,
-    /// Saved stacktrace term word.
-    pub ftrace: *mut c_void,
-}
-
-impl Default for ExcFields {
-    fn default() -> Self {
-        Self {
-            freason: 0,
-            fvalue: 0,
-            ftrace: core::ptr::null_mut(),
-        }
-    }
-}
 
 /// C-layout prefix consumed directly by BeamAsm generated code.
 #[repr(C)]
