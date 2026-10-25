@@ -1112,8 +1112,6 @@ pub fn run_native(
         cold.native_bif_error = None;
         cold.native_trap = None;
     }
-    let saved_ftrace = process.header.ftrace;
-    process.header.ftrace = (registers as *mut SchedulerRegisters).cast();
     registers.tmp_mem[3] = 0;
     process.heap.set_native_allocation(true);
     // The scheduler set `esdp->current_process` when it scheduled the process in
@@ -1131,7 +1129,6 @@ pub fn run_native(
         unsafe { arinsal_beamasm::enter_native_raw(&mut process.header, registers, code_ptr) };
     process.heap.set_native_allocation(false);
     let native_ftrace = process.header.ftrace as u64;
-    process.header.ftrace = saved_ftrace;
     if exception_trace {
         let (base, end) = process.heap.heap_bounds();
         let (_, current_stop) = process.heap.heap_cursor();

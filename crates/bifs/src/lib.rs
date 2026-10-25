@@ -137,6 +137,8 @@ pub struct ProcessBif<'a, H: HeapAlloc = ProcessHeapHandle<'a>> {
     /// slice; the BIF records [`lists::DeferredTrap`] only when that slice runs out.
     budget: usize,
     deferred: Option<Box<lists::DeferredTrap>>,
+    /// The failure of a body that returned [`arinsal_term::THE_NON_VALUE`].
+    error: Option<BifError>,
 }
 
 impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
@@ -148,6 +150,7 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
             fallback_reductions: 0,
             budget: usize::MAX,
             deferred: None,
+            error: None,
         }
     }
 
@@ -170,6 +173,18 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
     /// Remember a continuation. The VM installs it only after this call returns.
     pub fn defer_trap(&mut self, trap: lists::DeferredTrap) {
         self.deferred = Some(Box::new(trap));
+    }
+
+    /// Record why the body returned the non-value.
+    #[inline]
+    pub fn set_error(&mut self, error: BifError) {
+        self.error = Some(error);
+    }
+
+    /// The failure recorded by [`ProcessBif::set_error`].
+    #[inline]
+    pub fn take_error(&mut self) -> Option<BifError> {
+        self.error.take()
     }
 
     /// Take a continuation the BIF deferred, if the slice ran out.
@@ -227,6 +242,7 @@ impl<'heap> ProcessBif<'_, ProcessHeapHandle<'heap>> {
             fallback_reductions: 0,
             budget: usize::MAX,
             deferred: None,
+            error: None,
         }
     }
 
@@ -241,6 +257,7 @@ impl<'heap> ProcessBif<'_, ProcessHeapHandle<'heap>> {
             fallback_reductions: 0,
             budget: usize::MAX,
             deferred: None,
+            error: None,
         }
     }
 }
@@ -272,6 +289,20 @@ pub trait BifBody {
         _instruction: usize,
     ) -> Result<Term, BifError> {
         Self::call(process, args)
+    }
+
+    /// The body as erts' BIF function: one word, a term or [`arinsal_term::THE_NON_VALUE`]
+    /// with the failure in the context. Bodies that still return a `Result` are adapted here.
+    // Port of erts/emulator/beam/bif.h (BIF_ERROR returns THE_NON_VALUE), OTP-29.1.1.
+    #[inline(always)]
+    fn call_word(process: &mut ProcessBif<'_>, args: &[Term], instruction: usize) -> u64 {
+        match Self::call_process(process, args, instruction) {
+            Ok(value) => value.word(),
+            Err(error) => {
+                process.set_error(error);
+                arinsal_term::THE_NON_VALUE
+            }
+        }
     }
 }
 

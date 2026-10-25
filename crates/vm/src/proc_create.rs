@@ -201,6 +201,14 @@ impl ArgRegs {
         self.f_attached = 0;
     }
 
+    /// The scheduler register file the X array belongs to while attached, null otherwise.
+    /// `x_reg_array` is the first field of the `repr(C)` struct, so its address is the
+    /// struct's. Port of `esdp->registers` (erts reaches it through `esdp`, not `c_p`).
+    #[inline]
+    pub fn scheduler_registers(&self) -> *mut arinsal_beamasm::SchedulerRegisters {
+        self.attached as *mut arinsal_beamasm::SchedulerRegisters
+    }
+
     /// The scheduler's float register array while attached (`f_reg_array`, 1024 long), or
     /// null.
     #[inline]
@@ -1292,8 +1300,7 @@ pub(crate) struct ProcessCold {
     /// Stack list from `erlang:raise/3`, keyed by that failure's `freason` and `fvalue`.
     ///
     /// Port of erts/emulator/beam/bif.c:1641-1688 (`raise_3` stores the caller's list
-    /// in `c_p->ftrace`), OTP-29.1.1. Native code keeps the register file in
-    /// `header.ftrace`, so the list stays here until the catch reads it.
+    /// in `c_p->ftrace`), OTP-29.1.1. The list stays here until the catch reads it.
     pub(crate) explicit_raise: Option<Box<(u64, u64, arinsal_etf::OwnedTerm)>>,
 }
 
