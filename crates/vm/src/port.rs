@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -349,7 +349,6 @@ struct SpawnStart {
 /// State retained for a live child or fd port.
 pub(crate) struct PortHandle {
     id: u64,
-    started_interval: AtomicU64,
     /// The spawn/fd driver's own data (`prt->drv_data` of sys_drivers.c): set only for ports
     /// with a worker thread.
     spawn: Option<Box<SpawnData>>,
@@ -414,8 +413,6 @@ type PortSlot = arc_swap::ArcSwapOption<PortHandle>;
 pub(crate) struct PortTable {
     list: std::sync::RwLock<()>,
     pages: Vec<OnceLock<Box<[PortSlot]>>>,
-    interval: std::sync::atomic::AtomicU64,
-    list_deleted: Mutex<arinsal_sched::PtabListLog<u64>>,
 }
 
 impl Default for PortTable {
@@ -430,8 +427,6 @@ impl PortTable {
         Self {
             list: std::sync::RwLock::new(()),
             pages: (0..pages).map(|_| OnceLock::new()).collect(),
-            interval: std::sync::atomic::AtomicU64::new(0),
-            list_deleted: Mutex::new(arinsal_sched::PtabListLog::default()),
         }
     }
 
@@ -476,8 +471,6 @@ impl PortTable {
     /// Publish a new port in its slot (`erts_ptab_new_element`, under the table lock).
     pub(crate) fn insert(&self, id: u64, handle: Arc<PortHandle>) {
         let _list = self.list.write().unwrap();
-        let started = self.interval.load(Ordering::Acquire);
-        handle.started_interval.store(started, Ordering::Release);
         let pix = arinsal_term::ptab::port_table_layout().data2pix(id) as usize;
         let page = self.pages[pix / PORT_PAGE_SIZE].get_or_init(|| {
             (0..PORT_PAGE_SIZE)
@@ -492,18 +485,7 @@ impl PortTable {
         let slot = self.slot(id)?;
         // The caller holds the table lock, so the slot cannot change between the check and the swap.
         if slot.load().as_ref().is_some_and(|handle| handle.id == id) {
-            let removed = slot.swap(None)?;
-            let started_interval = removed.started_interval.load(Ordering::Acquire);
-            let deleted_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-            let index = arinsal_term::ptab::port_table_layout().data2pix(id);
-            let entry = arinsal_sched::PtabListDeleted {
-                index,
-                id,
-                started_interval,
-                deleted_interval,
-            };
-            self.list_deleted.lock().record(entry);
-            Some(removed)
+            slot.swap(None)
         } else {
             None
         }
@@ -522,78 +504,6 @@ impl PortTable {
             .flat_map(|page| page.iter())
             .filter_map(|slot| slot.load_full())
             .collect()
-    }
-
-    // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list), OTP-29.1.1.
-    pub(crate) fn begin_ptab_list(&'static self) -> PortPtabListSnapshot {
-        let _list = self.list.write().unwrap();
-        let invocation_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        let marker = self.list_deleted.lock().begin(invocation_interval);
-        PortPtabListSnapshot {
-            table: self,
-            marker,
-            invocation_interval,
-            active: true,
-        }
-    }
-}
-
-/// State shared by one trapping `ports/0` table scan.
-pub(crate) struct PortPtabListSnapshot {
-    table: &'static PortTable,
-    marker: usize,
-    invocation_interval: u64,
-    active: bool,
-}
-
-impl PortPtabListSnapshot {
-    // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
-    pub(crate) fn scan_chunk(&self, first: u32, limit: u32) -> (Vec<u64>, u64) {
-        let _list = self.table.list.write().unwrap();
-        let chunk_interval = self
-            .table
-            .interval
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        let mut ids = Vec::new();
-        let layout = arinsal_term::ptab::port_table_layout();
-        for index in first..limit.min(layout.max()) {
-            let page_index = index as usize / PORT_PAGE_SIZE;
-            let Some(page) = self.table.pages[page_index].get() else {
-                continue;
-            };
-            let Some(handle) = page[index as usize % PORT_PAGE_SIZE].load_full() else {
-                continue;
-            };
-            if handle.started_interval.load(Ordering::Acquire) < self.invocation_interval {
-                ids.push(handle.id);
-            }
-        }
-        (ids, chunk_interval)
-    }
-
-    pub(crate) fn inspect_deleted(
-        &mut self,
-        chunk_intervals: &[u64],
-        max_reds: u32,
-    ) -> (Vec<u64>, u32, bool) {
-        let _list = self.table.list.write().unwrap();
-        let result = self.table.list_deleted.lock().inspect(
-            self.marker,
-            self.invocation_interval,
-            chunk_intervals,
-            max_reds,
-        );
-        self.active = !result.2;
-        result
-    }
-}
-
-impl Drop for PortPtabListSnapshot {
-    fn drop(&mut self) {
-        if self.active {
-            self.table.list_deleted.lock().cancel(self.marker);
-        }
     }
 }
 
@@ -2871,7 +2781,6 @@ fn make_handle_with(
     let out_fd = out;
     let handle = Arc::new(PortHandle {
         id,
-        started_interval: AtomicU64::new(0),
         spawn: (out_fd.is_some() || waker.is_some()).then(|| {
             Box::new(SpawnData {
                 out: Mutex::new(out_fd),
