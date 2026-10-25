@@ -3886,7 +3886,7 @@ pub(crate) fn set_native_bif_error(
 ) {
     set_light_bif_error(process, &error);
     let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
-    process.cold_mut().native_bif_error = Some(Box::new(crate::proc_create::NativeBifError {
+    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Owned {
             module: module.to_owned(),
             function: function.to_owned(),
@@ -3895,7 +3895,7 @@ pub(crate) fn set_native_bif_error(
         error,
         freason,
         fvalue,
-    }));
+    });
 }
 
 /// Records a BIF failure whose arguments are in the live scheduler registers.
@@ -3909,7 +3909,7 @@ pub(crate) fn set_native_bif_register_error(
 ) {
     set_light_bif_error(process, &error);
     let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
-    process.cold_mut().native_bif_error = Some(Box::new(crate::proc_create::NativeBifError {
+    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Registers {
             module,
             function,
@@ -3918,7 +3918,7 @@ pub(crate) fn set_native_bif_register_error(
         error,
         freason,
         fvalue,
-    }));
+    });
 }
 
 /// Retains the export entry; its descriptor owns the BIF MFA while X registers own the arguments.
@@ -3929,12 +3929,12 @@ fn set_native_bif_export_error(
 ) {
     set_light_bif_error(process, &error);
     let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
-    process.cold_mut().native_bif_error = Some(Box::new(crate::proc_create::NativeBifError {
+    process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Export(export),
         error,
         freason,
         fvalue,
-    }));
+    });
 }
 
 fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifError) {
@@ -3943,7 +3943,18 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
     crate::stacktrace::clear_pending_top(process);
     // `raise/3`'s list is copied off-heap before `freason` changes, so a later
     // collection cannot move the words the catch still has to return.
+    process.header.exc.ftrace = 0;
+    let mut in_ftrace = false;
     let explicit = match error {
+        // An immediate list (`[]`) needs no copy: a collection cannot move it.
+        BifError::Raise {
+            stacktrace: Some(trace),
+            ..
+        } if trace.is_immed() => {
+            process.header.exc.ftrace = trace.word();
+            in_ftrace = true;
+            None
+        }
         BifError::Raise {
             stacktrace: Some(trace),
             ..
@@ -3966,7 +3977,12 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
         BifError::Unsupported(_) => (exc::EXC_UNDEF, crate::signals::atom("undef")),
         BifError::Dirty(_) => (exc::EXC_NOTSUP, crate::signals::atom("notsup")),
     };
-    process.header.exc.freason = freason;
+    // `EXF_ARGLIST`: `ftrace` holds the stacktrace of a `raise/3`.
+    process.header.exc.freason = if in_ftrace {
+        freason | exc::EXF_ARGLIST
+    } else {
+        freason
+    };
     process.header.exc.fvalue = crate::native_hooks::raw(reason);
     let freason = process.header.exc.freason;
     let fvalue = process.header.exc.fvalue;
@@ -3979,6 +3995,13 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
 /// list is already a stacktrace), OTP-29.1.1. The catch's `build_stacktrace`
 /// then returns that list instead of walking native frames.
 fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
+    if process.header.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
+        && process.header.exc.ftrace != 0
+    {
+        let trace = crate::native_hooks::from_raw(process.header.exc.ftrace);
+        process.header.exc.ftrace = 0;
+        return Some(trace);
+    }
     let owned = {
         let cold = process.cold.as_mut()?;
         let matches = cold
