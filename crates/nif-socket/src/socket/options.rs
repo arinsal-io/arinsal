@@ -12,6 +12,7 @@ enum OptKind {
     /// Readable only, `SO_TYPE`.
     SocketType,
     /// Linux's readable-only `SO_DOMAIN` option.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     SocketDomain,
     /// `IP_TOS`: an integer, a TOS or DSCP name, or a precedence and TOS map.
     IpTos,
