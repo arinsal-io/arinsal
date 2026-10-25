@@ -1374,13 +1374,13 @@ impl ProcessHeap {
     }
     /// Number of words consumed by heap objects.
     pub fn used_words(&self) -> usize {
-        self.htop
+        self.htop_index()
     }
     /// Write one allocated raw word for the `erts_debug:inconsistent_heap` test hook.
     ///
     /// This debug-only API deliberately permits invalid term headers and sentinels.
     pub fn debug_write_heap_word(&mut self, index: usize, word: u64) -> bool {
-        let Some(cell) = self.words.get(index).filter(|_| index < self.htop) else {
+        let Some(cell) = self.words.get(index).filter(|_| index < self.htop_index()) else {
             return false;
         };
         // SAFETY: The index is within the allocated young heap, owned exclusively here.
@@ -1402,21 +1402,21 @@ impl ProcessHeap {
         let limit = if self.native_allocation || self.native_redzone {
             self.heap_limit_words()
         } else {
-            self.stop
+            self.stop_index()
         };
-        limit.saturating_sub(self.htop)
+        limit.saturating_sub(self.htop_index())
     }
     /// Number of words between the heap and stack pointers.
     #[inline(always)]
     pub fn free_words(&self) -> usize {
-        self.stop - self.htop
+        self.stop_index() - self.htop_index()
     }
     /// Runtime heap allocation boundary, leaving the stack redzone unused.
     // Port of erts/emulator/beam/erl_process.h:990-998, OTP-29.1.1.
     #[inline(always)]
     pub fn heap_limit_words(&self) -> usize {
-        self.htop.max(
-            self.stop
+        self.htop_index().max(
+            self.stop_index()
                 .saturating_add(self.bif_hidden_words)
                 .saturating_sub(crate::S_REDZONE),
         )
@@ -1426,7 +1426,7 @@ impl ProcessHeap {
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared computes
     // `E - HTOP` after the BIF returns, before any return address is pushed), OTP-29.1.1.
     pub fn bif_free_words(&self) -> usize {
-        (self.stop + self.bif_hidden_words).saturating_sub(self.htop)
+        (self.stop_index() + self.bif_hidden_words).saturating_sub(self.htop_index())
     }
     /// Run a native BIF body as erts runs it: the `words` the executor already pushed for the
     /// caller's return are not part of the stack the body allocates against. Pass 0 to end it.
@@ -1439,7 +1439,7 @@ impl ProcessHeap {
     /// Young-heap words available to `HAlloc` before it uses a fragment.
     // Port of erts/emulator/beam/erl_vm.h:150-175 (HAllocX/HeapWordsLeft), OTP-29.1.1.
     pub fn halloc_words_left(&self) -> Option<usize> {
-        (!self.detached).then(|| self.heap_limit_words().saturating_sub(self.htop))
+        (!self.detached).then(|| self.heap_limit_words().saturating_sub(self.htop_index()))
     }
     /// Allocate on the young heap only when `HAlloc` stays below `HEAP_LIMIT`.
     // Port of erts/emulator/beam/erl_vm.h:150-162 (HAllocX), OTP-29.1.1.
@@ -1448,14 +1448,14 @@ impl ProcessHeap {
         if self.detached {
             return self.owners.detached.as_deref_mut()?.alloc(words);
         }
-        let top = self.htop;
+        let top = self.htop_index();
         let end = top.checked_add(words)?;
         // `end <= stop + hidden - REDZONE` without the saturating subtraction and the
         // `max(htop)` clamp of `heap_limit_words`: `HAlloc` tests `HEAP_LIMIT - HTOP >= n`
         // against one precomputed pointer. A request that fails this test takes the full
         // clamped computation, so every accepted request is accepted by it too.
         let fits = match end.checked_add(crate::S_REDZONE) {
-            Some(guarded) => guarded <= self.stop + self.bif_hidden_words,
+            Some(guarded) => guarded <= self.stop_index() + self.bif_hidden_words,
             None => false,
         };
         if !fits && end > self.heap_limit_words() {
@@ -1467,7 +1467,7 @@ impl ProcessHeap {
             .wrapping_add(top)
             .cast::<u64>()
             .cast_mut();
-        self.htop = end;
+        self.set_htop_index(end);
         Some(ptr)
     }
     /// Whether generated code is running on this heap (set by the native bridge).
@@ -1514,7 +1514,7 @@ impl ProcessHeap {
         // SAFETY: Both indices are within or one past the fixed allocation.
         unsafe {
             let base = self.words.as_ptr().cast::<u64>().cast_mut();
-            (base.add(self.htop), base.add(self.stop))
+            (base.add(self.htop_index()), base.add(self.stop_index()))
         }
     }
     /// Return the start and end of the young heap allocation.
@@ -1535,13 +1535,13 @@ impl ProcessHeap {
         let base = self.words.as_ptr() as usize;
         let address = top as usize;
         assert!(
-            address >= base && address <= base + self.stop * 8,
+            address >= base && address <= base + self.stop_index() * 8,
             "heap top={address:#x} base={base:#x} stop={:#x} end={:#x}",
-            base + self.stop * 8,
+            base + self.stop_index() * 8,
             base + self.words.len() * 8,
         );
         assert_eq!((address - base) % 8, 0);
-        self.htop = (address - base) / 8;
+        self.set_htop_index((address - base) / 8);
     }
     /// Commit both native cursors at once when native code enters the runtime.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-537 (emit_enter_runtime stores HTOP
@@ -1551,7 +1551,7 @@ impl ProcessHeap {
     /// index stay one bump apart from the last sync.
     #[inline(always)]
     pub fn note_native_alloc(&mut self, words: usize) {
-        self.htop += words;
+        self.set_htop_index(self.htop_index() + (words));
     }
 
     #[inline(always)]
@@ -1579,18 +1579,38 @@ impl ProcessHeap {
             top <= stack && stack <= self.words.len(),
             "native cursors outside the heap: htop={htop:p} stop={stop:p} base={base:#x}"
         );
-        self.htop = top;
-        self.stop = stack;
+        self.set_htop_index(top);
+        self.set_stop_index(stack);
+    }
+    /// The young heap top as a word index from the heap base.
+    #[inline(always)]
+    pub(crate) fn htop_index(&self) -> usize {
+        self.htop
+    }
+    /// Sets the young heap top from a word index.
+    #[inline(always)]
+    pub(crate) fn set_htop_index(&mut self, index: usize) {
+        self.htop = index;
+    }
+    /// The stack pointer as a word index from the heap base.
+    #[inline(always)]
+    pub(crate) fn stop_index(&self) -> usize {
+        self.stop
+    }
+    /// Sets the stack pointer from a word index.
+    #[inline(always)]
+    pub(crate) fn set_stop_index(&mut self, index: usize) {
+        self.stop = index;
     }
     /// Young heap top as a word index.
     #[inline]
     pub fn heap_top_index(&self) -> usize {
-        self.htop
+        self.htop_index()
     }
     /// Stack pointer as a word index.
     #[inline]
     pub fn stack_index(&self) -> usize {
-        self.stop
+        self.stop_index()
     }
     /// Capacity of the heap fragments in words (`mbuf_sz`), as [`ProcessHeap::gc_desired`]
     /// compares it.
@@ -1610,15 +1630,15 @@ impl ProcessHeap {
         assert!(address >= base && address <= base + self.words.len() * 8);
         assert_eq!((address - base) % 8, 0);
         let index = (address - base) / 8;
-        assert!(index >= self.htop);
-        self.stop = index;
+        assert!(index >= self.htop_index());
+        self.set_stop_index(index);
     }
     /// Reserve stack words from the high end.
     pub fn reserve_stack(&mut self, words: usize) -> bool {
         if words > self.free_words() {
             return false;
         }
-        self.stop -= words;
+        self.set_stop_index(self.stop_index() - (words));
         true
     }
     /// Allocate a side fragment when a BIF cannot collect at this point.
@@ -1674,7 +1694,9 @@ impl ProcessHeap {
     /// The source must have no live stack or old generation. Terms allocated in
     /// it remain valid until this process next collects its fragments.
     pub fn adopt_message_fragment(&mut self, mut source: ProcessHeap) -> Result<(), AdoptError> {
-        if source.stop != source.words.len() || source.old_htop != 0 || !source.old_words.is_empty()
+        if source.stop_index() != source.words.len()
+            || source.old_htop != 0
+            || !source.old_words.is_empty()
         {
             return Err(AdoptError::NotStandalone);
         }
@@ -1683,13 +1705,15 @@ impl ProcessHeap {
         // Port of erts/emulator/beam/erl_nfunc_sched.h (erts_flush_dirty_shadow_proc) and
         // erts/emulator/beam/utils.c (erts_heap_alloc, MBUF_SIZE adds the requested words only),
         // OTP-29.1.1.
-        let adopted_words = source.htop.saturating_add(source.fragment_words as usize);
+        let adopted_words = source
+            .htop_index()
+            .saturating_add(source.fragment_words as usize);
         self.fragment_words = self
             .fragment_words
             .saturating_add(u32::try_from(adopted_words).unwrap_or(u32::MAX));
         // Only the words below the heap top hold objects; the rest of the block is not cleared.
         // Port of erts/emulator/beam/erl_message.h:72-78 (ErlHeapFragment `used_size`), OTP-29.1.1.
-        let used = source.htop;
+        let used = source.htop_index();
         let block = std::mem::take(&mut source.words).into_alloc_block();
         let used = used.min(block.len());
         self.fragments.push(Fragment::Block {
@@ -1744,11 +1768,13 @@ impl ProcessHeap {
         mut source: ProcessHeap,
         roots: &mut [&mut Term],
     ) -> Result<(), AdoptError> {
-        if source.stop != source.words.len() || source.old_htop != 0 || !source.old_words.is_empty()
+        if source.stop_index() != source.words.len()
+            || source.old_htop != 0
+            || !source.old_words.is_empty()
         {
             return Err(AdoptError::NotStandalone);
         }
-        let used = source.htop;
+        let used = source.htop_index();
         let fits = !self.detached
             && source.fragments.is_empty()
             && source.fragment_words == 0
@@ -1763,7 +1789,7 @@ impl ProcessHeap {
             return self.adopt_message_fragment(source);
         }
         let from = source.words.as_ptr() as usize;
-        let to = self.words.as_ptr() as usize + self.htop * 8;
+        let to = self.words.as_ptr() as usize + self.htop_index() * 8;
         let delta = to.wrapping_sub(from) as u64;
         let range = from..from + used * 8;
         let rebase = |word: u64| {
@@ -1774,7 +1800,7 @@ impl ProcessHeap {
             }
         };
         {
-            let htop = self.htop;
+            let htop = self.htop_index();
             let target = &mut self.words.words_mut()[htop..htop + used];
             target.copy_from_slice(&source.words.words()[..used]);
             let mut index = 0;
@@ -1812,7 +1838,7 @@ impl ProcessHeap {
                 }
             }
         }
-        self.htop += used;
+        self.set_htop_index(self.htop_index() + (used));
         self.absorb_fragment_owners(&mut source);
         Ok(())
     }
@@ -1862,7 +1888,7 @@ impl ProcessHeap {
                 Fragment::Node(fragment) => Some(fragment.len()),
                 Fragment::Abandoned { .. } => None,
             })
-            .fold(self.htop, usize::saturating_add)
+            .fold(self.htop_index(), usize::saturating_add)
     }
 
     /// Link the off-heap objects of a message fragment into this process's off-heap list
@@ -2069,7 +2095,7 @@ impl HeapAlloc for ProcessHeap {
             return start != end;
         }
         let base = self.words.as_ptr() as usize;
-        let top = base + self.htop * 8;
+        let top = base + self.htop_index() * 8;
         let address = start as usize;
         !(address >= base && address < top && end as usize == top)
     }
@@ -2081,10 +2107,10 @@ impl HeapAlloc for ProcessHeap {
             return;
         }
         let base = self.words.as_ptr() as usize;
-        let top = base + self.htop * 8;
+        let top = base + self.htop_index() * 8;
         let address = start as usize;
         if address >= base && address < top && end as usize == top {
-            self.htop = (address - base) / 8;
+            self.set_htop_index((address - base) / 8);
             return;
         }
         let Some(Fragment::Block { memory, used }) = self.fragments.last_mut() else {
@@ -2112,15 +2138,21 @@ impl HeapAlloc for ProcessHeap {
         let limit = if self.native_allocation || self.native_redzone {
             self.heap_limit_words()
         } else {
-            self.stop
+            self.stop_index()
         };
-        let available = limit.saturating_sub(self.htop);
+        let available = limit.saturating_sub(self.htop_index());
         if words > available {
             return None;
         }
         // SAFETY: htop is within the fixed boxed slice and capacity is checked.
-        let ptr = unsafe { self.words.as_ptr().add(self.htop).cast::<u64>().cast_mut() };
-        self.htop += words;
+        let ptr = unsafe {
+            self.words
+                .as_ptr()
+                .add(self.htop_index())
+                .cast::<u64>()
+                .cast_mut()
+        };
+        self.set_htop_index(self.htop_index() + (words));
         Some(ptr)
     }
     fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {

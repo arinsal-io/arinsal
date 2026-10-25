@@ -288,8 +288,8 @@ fn describe(heap: &ProcessHeap) -> String {
     let young = describe_block(
         heap.words.as_ptr() as usize,
         heap.words.len(),
-        heap.htop,
-        heap.stop,
+        heap.htop_index(),
+        heap.stop_index(),
     );
     let old = if heap.old_words.is_empty() {
         "<empty>".to_owned()
@@ -372,7 +372,7 @@ pub fn check_roots_if_active(heap: &ProcessHeap, roots: &[Term], extra: &[Term])
         }
     }
     for index in 0..heap.stack_words() {
-        let Some(word) = heap.words.get(heap.stop + index) else {
+        let Some(word) = heap.words.get(heap.stop_index() + index) else {
             continue;
         };
         // SAFETY: `stack_words` counts the live suffix; the collector initialized it.

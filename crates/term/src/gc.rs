@@ -761,7 +761,7 @@ impl ProcessHeap {
     /// Maximum heap, stack, and fragment words inspected by literal GC checks.
     // Port of erts/emulator/beam/beam_bif_load.c:976 (`erts_check_copy_literals_gc_need_max_reds`), OTP-29.1.1.
     pub fn literal_scan_words(&self) -> usize {
-        self.htop
+        self.htop_index()
             .saturating_add(self.stack_words())
             .saturating_add(self.old_htop)
             .saturating_add(self.fragments.iter().map(|f| f.len()).sum::<usize>())
@@ -773,7 +773,7 @@ impl ProcessHeap {
         let young = Self::any_heap_reference_words(
             self.words.as_ptr().cast::<u64>(),
             0,
-            self.htop,
+            self.htop_index(),
             true,
             &mut is_area_pointer,
         );
@@ -782,8 +782,8 @@ impl ProcessHeap {
         }
         let stack = Self::any_heap_reference_words(
             self.words.as_ptr().cast::<u64>(),
-            self.stop,
-            self.words.len() - self.stop,
+            self.stop_index(),
+            self.words.len() - self.stop_index(),
             false,
             &mut is_area_pointer,
         );
@@ -895,7 +895,7 @@ impl ProcessHeap {
             return false;
         }
         let address = (term.bits() & !7) as usize;
-        self.words.contains_initialized(address, self.htop)
+        self.words.contains_initialized(address, self.htop_index())
             || self.old_words.contains_initialized(address, self.old_htop)
             || self.fragments.iter().any(|fragment| {
                 let start = fragment.as_ptr() as usize;
@@ -911,7 +911,7 @@ impl ProcessHeap {
             return false;
         }
         let address = (term.bits() & !7) as usize;
-        if self.words.contains_initialized(address, self.htop)
+        if self.words.contains_initialized(address, self.htop_index())
             || self.old_words.contains_initialized(address, self.old_htop)
         {
             return true;
@@ -970,7 +970,7 @@ impl ProcessHeap {
 
     /// Words allocated on the active heap since the high-water mark (`p->htop - p->high_water`).
     pub fn words_since_high_water(&self) -> usize {
-        self.htop.saturating_sub(self.high_water)
+        self.htop_index().saturating_sub(self.high_water)
     }
 
     /// Whether a delayed collection left a young heap behind (erts `p->abandoned_heap != NULL`).
@@ -1010,7 +1010,7 @@ impl ProcessHeap {
     // Port of erts/emulator/beam/erl_gc.c:606-644 (young_gen_usage), OTP-29.1.1.
     pub fn young_gen_usage(&self) -> usize {
         let abandoned = self.abandoned_heap().map_or(0, |abandoned| abandoned.used);
-        self.htop
+        self.htop_index()
             .saturating_add(self.fragment_words as usize)
             .saturating_add(abandoned)
     }
@@ -1031,7 +1031,7 @@ impl ProcessHeap {
             crate::heap::WordBlock::new(words, arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG);
         let next_stop = words - stack;
         let stack_move = MoveRange {
-            old_start: self.words.as_ptr() as usize + self.stop * 8,
+            old_start: self.words.as_ptr() as usize + self.stop_index() * 8,
             old_end: self.words.as_ptr() as usize + self.words.len() * 8,
             new_start: next.as_ptr() as usize + next_stop * 8,
         };
@@ -1042,7 +1042,7 @@ impl ProcessHeap {
         // Port of erl_gc.c:520 (copy_erlang_stack): frame pointers move with the stack.
         for (destination, &word) in next.words_mut()[next_stop..]
             .iter_mut()
-            .zip(&self.words.words()[self.stop..])
+            .zip(&self.words.words()[self.stop_index()..])
         {
             *destination = match classify_stack_word(word, stack_move, code_ranges) {
                 StackWord::FramePtr(address) => rebase_address(address, stack_move) as u64,
@@ -1051,7 +1051,7 @@ impl ProcessHeap {
         }
         // erl_gc.c:563-566: the hole above htop is one heap filler (erts_write_heap_filler), not
         // a clear of every word. A scan of the abandoned heap steps over it in O(1).
-        let used = self.htop;
+        let used = self.htop_index();
         let hole = self.words.len().saturating_sub(used);
         if hole > 0 {
             self.words.words_mut()[used] = ((hole as u64 - 1) << 6) | crate::POS_BIG;
@@ -1075,8 +1075,8 @@ impl ProcessHeap {
                 high_water: self.high_water,
             });
         }
-        self.htop = 0;
-        self.stop = next_stop;
+        self.set_htop_index(0);
+        self.set_stop_index(next_stop);
         // Port of erl_gc.c:578-581: the high-water mark points into the current heap.
         self.high_water = 0;
     }
@@ -1110,9 +1110,9 @@ impl ProcessHeap {
                 .map(|fragment| fragment.len())
                 .sum(),
             recent_size: abandoned.map_or(self.high_water, |abandoned| abandoned.high_water),
-            stack_size: self.words.len() - self.stop,
+            stack_size: self.words.len() - self.stop_index(),
             old_heap_size: self.old_htop,
-            heap_size: abandoned.map_or(self.htop, |abandoned| abandoned.used),
+            heap_size: abandoned.map_or(self.htop_index(), |abandoned| abandoned.used),
         }
     }
 
@@ -1217,7 +1217,7 @@ impl ProcessHeap {
     /// Check that every old-generation term field avoids the young heap and fragments.
     pub fn old_generation_is_closed(&self) -> bool {
         let young_start = self.words.as_ptr() as usize;
-        let young_end = young_start + self.htop * 8;
+        let young_end = young_start + self.htop_index() * 8;
         let mut index = 0;
         while index < self.old_htop {
             // SAFETY: The scan index is inside the initialized old heap.
@@ -1264,19 +1264,22 @@ impl ProcessHeap {
 
     /// Number of live stack words.
     pub fn stack_words(&self) -> usize {
-        self.words.len() - self.stop
+        self.words.len() - self.stop_index()
     }
 
     /// The live stack words in stack order, as raw words.
     #[inline]
     pub fn stack_raw_words(&self) -> &[u64] {
-        &self.words.words()[self.stop..]
+        &self.words.words()[self.stop_index()..]
     }
 
     /// Iterate over live stack words in stack order without an indexed bounds check per word.
     #[inline]
     pub fn stack_terms(&self) -> impl ExactSizeIterator<Item = Term> + '_ {
-        self.words.words()[self.stop..].iter().copied().map(Term)
+        self.words.words()[self.stop_index()..]
+            .iter()
+            .copied()
+            .map(Term)
     }
 
     /// Make the next collection sweep both generations.
@@ -1287,7 +1290,7 @@ impl ProcessHeap {
     /// Read a stack word relative to the current stack pointer.
     #[inline]
     pub fn stack_get(&self, index: usize) -> Option<Term> {
-        self.words.get(self.stop + index).map(|word| {
+        self.words.get(self.stop_index() + index).map(|word| {
             // SAFETY: A live stack slot is initialized before collection.
             let term = Term(unsafe { *word.get() });
             // g_asan
@@ -1299,7 +1302,7 @@ impl ProcessHeap {
 
     /// Replace a live stack word.
     pub fn stack_set(&mut self, index: usize, value: Term) -> bool {
-        if let Some(word) = self.words.get(self.stop + index) {
+        if let Some(word) = self.words.get(self.stop_index() + index) {
             // SAFETY: Exclusive process access permits writing this live slot.
             unsafe { *word.get() = value.0 };
             true
@@ -1313,7 +1316,7 @@ impl ProcessHeap {
         if words > self.stack_words() {
             return false;
         }
-        self.stop += words;
+        self.set_stop_index(self.stop_index() + (words));
         true
     }
 
@@ -1455,8 +1458,8 @@ impl ProcessHeap {
         let to_words = self.new_block(capacity, arinsal_alloc::typed::ErtsAlcType::HEAP);
         let mut from = FromSpace {
             words: std::mem::replace(&mut self.words, to_words),
-            htop: self.htop,
-            stop: self.stop,
+            htop: self.htop_index(),
+            stop: self.stop_index(),
             old_words: if major {
                 std::mem::take(&mut self.old_words)
             } else {
@@ -1466,8 +1469,8 @@ impl ProcessHeap {
             owners: std::mem::take(&mut self.owners),
             fragments: std::mem::take(&mut self.fragments),
         };
-        self.htop = 0;
-        self.stop = capacity - stack;
+        self.set_htop_index(0);
+        self.set_stop_index(capacity - stack);
         self.high_water = 0;
         if major {
             self.old_htop = 0;
@@ -1490,7 +1493,7 @@ impl ProcessHeap {
         let stack_move = MoveRange {
             old_start: from.words.as_ptr() as usize + from.stop * 8,
             old_end: from.words.as_ptr() as usize + from.words.len() * 8,
-            new_start: self.words.as_ptr() as usize + self.stop * 8,
+            new_start: self.words.as_ptr() as usize + self.stop_index() * 8,
         };
         let young_start = from.words.as_ptr() as usize;
         let young = Area {
@@ -1529,7 +1532,7 @@ impl ProcessHeap {
         let mut copier = Copier {
             n_htop: HeapTop {
                 at: n_heap,
-                end: n_heap + self.stop * 8,
+                end: n_heap + self.stop_index() * 8,
             },
             old_htop: HeapTop {
                 at: tenured_from,
@@ -1563,7 +1566,7 @@ impl ProcessHeap {
         // and erl_gc.c:520 (copy_erlang_stack), OTP-29.1.1: words with the header tag are
         // continuation pointers or frame pointers; only frame pointers into the stack move.
         let source = copier.from.words.as_ptr() as usize + copier.from.stop * 8;
-        let destination = copier.to.words.as_ptr() as usize + copier.to.stop * 8;
+        let destination = copier.to.words.as_ptr() as usize + copier.to.stop_index() * 8;
         for i in 0..stack {
             // SAFETY: The live source and reserved destination stack slots are distinct
             // words of two live heap blocks, `stack` words each.
@@ -1586,11 +1589,11 @@ impl ProcessHeap {
         // new heap, then the tenured objects, whose young referents are tenured as well.
         copier.sweep::<false>(n_heap);
         copier.sweep::<true>(tenured_from);
-        copier.to.htop = (copier.n_htop.at - n_heap) / 8;
+        copier.to.set_htop_index((copier.n_htop.at - n_heap) / 8);
         copier.to.old_htop = (copier.old_htop.at - old_heap) / 8;
         copier.sweep_off_heap();
         copier.finish_bits();
-        copier.to.high_water = copier.to.htop;
+        copier.to.high_water = copier.to.htop_index();
         let promoted = ((copier.old_htop.at - tenured_from) / 8) as u64;
         drop(copier);
         // ErlHeapFragment headers live inside the fragment block in erts; here the fragment
@@ -1613,7 +1616,7 @@ impl ProcessHeap {
             self.adjust_young_heap(major, min_free, roots, extra, Some(messages))?
         };
         // erl_gc.c:1506/1952: `size_after` includes the moved message data.
-        let copied = self.htop as u64;
+        let copied = self.htop_index() as u64;
         #[cfg(debug_assertions)]
         {
             let code_ranges = crate::native_code::native_code_ranges();
@@ -1681,7 +1684,7 @@ impl ProcessHeap {
             .young_gen_usage()
             .checked_add(message_words)
             .ok_or(TermError::SystemLimit)?;
-        let young_free = self.stop.saturating_sub(self.htop);
+        let young_free = self.stop_index().saturating_sub(self.htop_index());
         if self.collection_is_major() {
             return Ok((self.major_max_heap_size(source_words)?, None));
         }
@@ -1733,7 +1736,7 @@ impl ProcessHeap {
         };
         size_before
             .checked_add(self.old_words.len().saturating_sub(self.old_htop))
-            .and_then(|size| size.checked_add(self.stop.saturating_sub(self.htop)))
+            .and_then(|size| size.checked_add(self.stop_index().saturating_sub(self.htop_index())))
             .and_then(|size| size.checked_add(capacity))
             .ok_or(TermError::SystemLimit)
     }
@@ -1855,7 +1858,7 @@ impl ProcessHeap {
             let mut blocks: Vec<&[u64]> = Vec::new();
             match &data {
                 crate::message::MessageHeap::Heap(fragment) => {
-                    blocks.push(&fragment.words.words()[..fragment.htop]);
+                    blocks.push(&fragment.words.words()[..fragment.htop_index()]);
                     for block in &fragment.fragments {
                         if let crate::heap::Fragment::Block { memory, used } = block {
                             blocks.push(&memory.as_slice()[..*used]);
@@ -1865,20 +1868,20 @@ impl ProcessHeap {
                 crate::message::MessageHeap::Node(fragment) => blocks.push(fragment.words()),
             }
             let words = blocks.iter().map(|block| block.len()).sum::<usize>();
-            if self.htop.saturating_add(words) > self.stop {
+            if self.htop_index().saturating_add(words) > self.stop_index() {
                 return Err(TermError::SystemLimit);
             }
-            let start = self.htop;
+            let start = self.htop_index();
             let mut ranges = Vec::with_capacity(blocks.len());
             for block in blocks {
-                let at = self.htop;
+                let at = self.htop_index();
                 self.words.words_mut()[at..at + block.len()].copy_from_slice(block);
                 ranges.push(MoveRange {
                     old_start: block.as_ptr() as usize,
                     old_end: block.as_ptr() as usize + block.len() * 8,
                     new_start: self.words.as_ptr() as usize + at * 8,
                 });
-                self.htop += block.len();
+                self.set_htop_index(self.htop_index() + (block.len()));
             }
             let base = self
                 .words
@@ -1940,7 +1943,7 @@ impl ProcessHeap {
         messages: Option<&mut [GcMessageRoot<'_>]>,
     ) {
         let stack = self.stack_words();
-        debug_assert!(new_words >= self.htop.saturating_add(stack));
+        debug_assert!(new_words >= self.htop_index().saturating_add(stack));
         let prev_len = self.words.len();
         if new_words == prev_len {
             return;
@@ -1950,10 +1953,10 @@ impl ProcessHeap {
         if self.owners.wrt_bins != 0 {
             binref_nodes.extend(binref_chain_nodes(self.owners.wrt_bins));
         }
-        let prev_stop = self.stop;
+        let prev_stop = self.stop_index();
         let prev_stack = prev_heap + prev_stop * 8;
         let prev_stack_end = prev_heap + prev_len * 8;
-        let heap_end = prev_heap + self.htop * 8;
+        let heap_end = prev_heap + self.htop_index() * 8;
         // Shrinking discards the tail, so the stack has to sit inside the kept prefix first.
         if new_words < prev_len {
             let new_stop = new_words - stack;
@@ -1980,7 +1983,7 @@ impl ProcessHeap {
                 .words_mut()
                 .copy_within(old_index..old_index + stack, new_stop);
         }
-        self.stop = new_stop;
+        self.set_stop_index(new_stop);
         let new_stack = new_heap + new_stop * 8;
         let heap_move = MoveRange {
             old_start: prev_heap,
@@ -1995,7 +1998,7 @@ impl ProcessHeap {
         if new_heap != prev_heap {
             offset_young_objects(
                 self.words.as_ptr().cast::<u64>().cast_mut(),
-                self.htop,
+                self.htop_index(),
                 prev_heap,
                 heap_end,
                 new_heap,
@@ -2038,7 +2041,7 @@ impl ProcessHeap {
     #[cfg(debug_assertions)]
     fn verify_stack_words(&self, code_ranges: &[(usize, usize)]) {
         let base = self.words.as_ptr() as usize;
-        let stack_start = base + self.stop * 8;
+        let stack_start = base + self.stop_index() * 8;
         let stack_end = base + self.words.len() * 8;
         let stack_range = MoveRange {
             old_start: stack_start,
@@ -2389,7 +2392,7 @@ mod tests {
         assert_eq!(heap.fragment_words, 136);
 
         let mut dirty_shadow = ProcessHeap::with_words(256);
-        dirty_shadow.htop = 9;
+        dirty_shadow.set_htop_index(9);
         dirty_shadow.gc_fragment(5);
         heap.adopt_message_fragment(dirty_shadow).unwrap();
         assert_eq!(heap.fragment_words, 150);
@@ -2410,7 +2413,7 @@ mod tests {
         // The message heap block is not cleared; words above its heap top are not objects, so a
         // literal-area scan must not walk them (heap fragment `used_size`).
         let mut message_heap = ProcessHeap::with_words(256);
-        message_heap.htop = 3;
+        message_heap.set_htop_index(3);
         let mut heap = ProcessHeap::with_words(64);
         heap.adopt_message_fragment(message_heap).unwrap();
         assert_eq!(heap.fragments.len(), 1);
