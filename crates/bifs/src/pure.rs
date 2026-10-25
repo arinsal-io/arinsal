@@ -1976,18 +1976,23 @@ fn throw_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         stacktrace: None,
     })
 }
-fn raise_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let invalid = || Term::atom(global_atoms().intern("badarg").expect("atom"));
-    let class = match atom_name(args[0]) {
-        Some("error") => Class::Error,
-        Some("exit") => Class::Exit,
-        Some("throw") => Class::Throw,
-        _ => return Ok(invalid()),
+/// `erlang:raise/3`.
+// Port of erts/emulator/beam/bif.c (raise_3), OTP-29.1.1: the class is one of three atoms, an
+// invalid class or stacktrace returns `badarg` as a value, and the exception leaves the
+// reason in `fvalue` and the stacktrace in `ftrace`.
+fn raise(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    use arinsal_term::atoms;
+    let badarg = Term::atom(atoms::BADARG);
+    let class = match args[0].as_atom() {
+        Some(atom) if atom == atoms::ERROR => Class::Error,
+        Some(atom) if atom == atoms::EXIT => Class::Exit,
+        Some(atom) if atom == atoms::THROW => Class::Throw,
+        _ => return badarg,
     };
     if !valid_raise_stacktrace(args[2]) {
-        return Ok(invalid());
+        return badarg;
     }
-    Err(BifError::Raise {
+    ctx.fail(BifError::Raise {
         class,
         reason: args[1],
         stacktrace: Some(args[2]),
@@ -2238,7 +2243,6 @@ word_adapter!(is_builtin, is_builtin_result);
 word_adapter!(error, error_result);
 word_adapter!(exit, exit_result);
 word_adapter!(throw, throw_result);
-word_adapter!(raise, raise_result);
 word_adapter!(cmp_term, cmp_term_result);
 word_adapter!(debug_copy_shared, debug_copy_shared_result);
 word_adapter!(debug_flat_size, debug_flat_size_result);
