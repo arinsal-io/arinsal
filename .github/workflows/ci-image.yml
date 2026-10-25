@@ -1,6 +1,7 @@
 name: CI image
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - tools/docker/**
@@ -33,6 +34,5 @@ jobs:
         with:
           context: .
           file: tools/docker/Dockerfile
-          platforms: linux/arm64
-          push: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+          push: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
           tags: ghcr.io/arinsal-io/arinsal-ci:${{ steps.tag.outputs.value }}

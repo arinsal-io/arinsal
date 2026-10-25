@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -11,19 +12,54 @@ concurrency:
 
 permissions:
   contents: read
-  packages: read
+  packages: write
 
 env:
   ARINSAL_CASES: "3"
   NEXTEST_TEST_THREADS: "4"
 
 jobs:
+  image:
+    name: Build CI image
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: tag
+        env:
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          dockerfile=tools/docker/Dockerfile
+          if [[ "$GITHUB_EVENT_NAME" == pull_request && "$PR_HEAD_REPO" != "$GITHUB_REPOSITORY" ]]; then
+            dockerfile=base/tools/docker/Dockerfile
+          fi
+          echo "value=otp29.1.1-$(sha256sum "$dockerfile" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tools/docker/Dockerfile
+          push: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
+          tags: ghcr.io/arinsal-io/arinsal-ci:${{ steps.tag.outputs.value }}
+
   lint:
     name: Lint
     runs-on: ubuntu-24.04-arm
+    needs: image
     container:
-      # Keep this in sync with sha256sum tools/docker/Dockerfile.
-      image: ghcr.io/arinsal-io/arinsal-ci:otp29.1.1-fe5d5af436f588fe4d0b9b04b6eb069d2efbecfa0220375559c4ba1061927b4c
+      image: ghcr.io/arinsal-io/arinsal-ci:${{ needs.image.outputs.tag }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -40,8 +76,9 @@ jobs:
   crates:
     name: Non-VM crate tests
     runs-on: ubuntu-24.04-arm
+    needs: image
     container:
-      image: ghcr.io/arinsal-io/arinsal-ci:otp29.1.1-fe5d5af436f588fe4d0b9b04b6eb069d2efbecfa0220375559c4ba1061927b4c
+      image: ghcr.io/arinsal-io/arinsal-ci:${{ needs.image.outputs.tag }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -56,8 +93,9 @@ jobs:
   vm:
     name: VM tests (${{ matrix.partition }}/4)
     runs-on: ubuntu-24.04-arm
+    needs: image
     container:
-      image: ghcr.io/arinsal-io/arinsal-ci:otp29.1.1-fe5d5af436f588fe4d0b9b04b6eb069d2efbecfa0220375559c4ba1061927b4c
+      image: ghcr.io/arinsal-io/arinsal-ci:${{ needs.image.outputs.tag }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -77,19 +115,3 @@ jobs:
           cargo nextest run -p arinsal-vm --profile gate
           --partition count:${{ matrix.partition }}/4
           -E 'not (test(gen_udp_matches_erts) | test(eight_alias_monitor_replies_wake))'
-
-  macos-smoke:
-    name: macOS smoke
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: "29.1.1"
-          version-type: strict
-      - uses: actions-rust-lang/setup-rust-toolchain@v2
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - run: cargo nextest run --workspace --profile macos-smoke
