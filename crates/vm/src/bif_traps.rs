@@ -2335,6 +2335,13 @@ pub(crate) trait TrapBody {
     /// Fixed arity of a direct entry, if shared by the body type.
     const ARITY: Option<usize> = None;
 
+    /// The value of a call that needs no trap state, no reduction charge and no collection
+    /// change, or `None` to take [`TrapBody::run`]. Nothing may be allocated before `None`.
+    #[inline(always)]
+    fn direct(_process: &mut Process, _args: &[Term]) -> Option<Term> {
+        None
+    }
+
     /// The first run of the BIF. `restore_gc` is the process's collection state on entry.
     fn run(
         process: &mut Process,
@@ -2394,6 +2401,12 @@ impl TrapBody for MapsValues {
 
 impl TrapBody for MapsMerge {
     const ARITY: Option<usize> = Some(2);
+
+    #[inline(always)]
+    fn direct(process: &mut Process, args: &[Term]) -> Option<Term> {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        arinsal_maps::merge_flatmaps(args[0], args[1], &mut heap)
+    }
 
     fn run(
         process: &mut Process,
