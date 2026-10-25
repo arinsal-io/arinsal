@@ -48,7 +48,6 @@ mod errno_table {
 }
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::mem::offset_of;
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -675,10 +674,11 @@ pub struct DriverPort {
     drv_data: AtomicUsize,
     control_flags: AtomicI32,
     state: AtomicU32,
-    linebuf: Mutex<Option<LineBuf>>,
+    /// `prt->linebuf`: allocated by the first line-mode setup, null before.
+    linebuf: Mutex<Option<Box<LineBuf>>>,
     /// Caller during a callback (`prt->caller`): the pid data with [`CALLER_SET`], else zero.
     caller: AtomicU64,
-    lock: Option<ReentrantLock>,
+    lock: Option<Box<ReentrantLock>>,
     /// `open_port` name (`prt->name`), set by [`DriverPort::start`].
     name: Mutex<String>,
     /// `prt->reds`: reductions used by the running task (`erl_drv_consume_timeslice`).
@@ -690,7 +690,7 @@ pub struct DriverPort {
     /// `prt->port_data_lock` (a `threads::PortDataLock`), zero when none.
     pdl: AtomicUsize,
     /// Process monitors held by this port: monitor id to process-table data.
-    monitors: Mutex<HashMap<u64, u64>>,
+    monitors: Mutex<ext::PidMonitors>,
     msgq_limits: Mutex<ext::MsgqLimits>,
     os_pid: AtomicI64,
     /// An `open_port` is waiting for `erl_drv_init_ack`.
@@ -701,6 +701,8 @@ pub struct DriverPort {
     run_queue: arinsal_sched::PortRunQueue,
     /// The port as an `Arc` (`Arc::new_cyclic`).
     me: Weak<DriverPort>,
+    /// Registry slot plus one ([`DriverPort::handle`]).
+    slot: AtomicUsize,
     /// State of a [`NativeDriver`] port.
     native_data: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
 }
@@ -708,24 +710,55 @@ pub struct DriverPort {
 /// Set in `DriverPort::caller` while a callback has a caller (pid data 0 is a valid pid).
 const CALLER_SET: u64 = 1 << 63;
 
-fn registry() -> &'static Mutex<HashMap<usize, Weak<DriverPort>>> {
-    static PORTS: OnceLock<Mutex<HashMap<usize, Weak<DriverPort>>>> = OnceLock::new();
-    PORTS.get_or_init(|| Mutex::new(HashMap::new()))
+/// The ports a driver can name by handle: `ErlDrvPort` is the table index of the port plus one
+/// (`erts_drvport2port` takes the port table index), so a lookup is one array access.
+#[derive(Default)]
+struct PortSlab {
+    entries: Vec<Weak<DriverPort>>,
+    free: Vec<usize>,
+}
+
+impl PortSlab {
+    fn insert(&mut self, port: Weak<DriverPort>) -> usize {
+        match self.free.pop() {
+            Some(slot) => {
+                self.entries[slot] = port;
+                slot
+            }
+            None => {
+                self.entries.push(port);
+                self.entries.len() - 1
+            }
+        }
+    }
+
+    fn remove(&mut self, slot: usize, port: *const DriverPort) {
+        if let Some(entry) = self.entries.get_mut(slot)
+            && std::ptr::eq(entry.as_ptr(), port)
+        {
+            *entry = Weak::new();
+            self.free.push(slot);
+        }
+    }
+}
+
+fn registry() -> &'static Mutex<PortSlab> {
+    static PORTS: OnceLock<Mutex<PortSlab>> = OnceLock::new();
+    PORTS.get_or_init(|| Mutex::new(PortSlab::default()))
 }
 
 /// Live port for a driver-side handle (`erts_drvport2port`).
 pub(crate) fn port_of(handle: DrvPortPtr) -> Option<Arc<DriverPort>> {
-    registry()
-        .lock()
-        .get(&(handle as usize))
-        .and_then(Weak::upgrade)
+    let slot = (handle as usize).checked_sub(1)?;
+    registry().lock().entries.get(slot)?.upgrade()
 }
 
 /// Live port by VM port number (`erts_port_lookup_raw`).
 pub(crate) fn port_by_id(id: u64) -> Option<Arc<DriverPort>> {
     registry()
         .lock()
-        .values()
+        .entries
+        .iter()
         .filter_map(Weak::upgrade)
         .find(|port| port.id == id)
 }
@@ -733,7 +766,7 @@ pub(crate) fn port_by_id(id: u64) -> Option<Arc<DriverPort>> {
 impl DriverPort {
     /// A port of `driver` with VM port id `id`; [`DriverPort::start`] runs the driver.
     pub fn new(driver: Arc<Driver>, id: u64, host: Box<dyn PortHost>) -> Arc<DriverPort> {
-        let lock = driver.lock.is_none().then(ReentrantLock::default);
+        let lock = driver.lock.is_none().then(Box::<ReentrantLock>::default);
         let port = Arc::new_cyclic(|me| DriverPort {
             driver,
             id,
@@ -750,18 +783,18 @@ impl DriverPort {
             timer_epoch: AtomicU64::new(0),
             queue: Mutex::new(queue::IoQueue::default()),
             pdl: AtomicUsize::new(0),
-            monitors: Mutex::new(HashMap::new()),
+            monitors: Mutex::new(ext::PidMonitors::default()),
             msgq_limits: Mutex::new(ext::MSGQ_LIMITS_DEFAULT),
             os_pid: AtomicI64::new(-1),
             async_open: std::sync::atomic::AtomicBool::new(false),
             sched: port_task::PortSched::default(),
             run_queue: arinsal_sched::PortRunQueue::default(),
             me: me.clone(),
+            slot: AtomicUsize::new(0),
             native_data: OnceLock::new(),
         });
-        registry()
-            .lock()
-            .insert(port.handle() as usize, Arc::downgrade(&port));
+        let slot = registry().lock().insert(Arc::downgrade(&port));
+        port.slot.store(slot + 1, Ordering::Release);
         port
     }
 
@@ -810,8 +843,13 @@ impl DriverPort {
         self.control_flags.load(Ordering::Acquire)
     }
 
+    /// `ErlDrvPort`: the registry slot plus one, zero before the port is registered.
     pub(crate) fn handle(&self) -> DrvPortPtr {
-        std::ptr::from_ref(self).cast_mut().cast()
+        self.slot.load(Ordering::Acquire) as DrvPortPtr
+    }
+
+    fn slot(&self) -> usize {
+        self.slot.load(Ordering::Acquire).wrapping_sub(1)
     }
 
     fn data(&self) -> DrvData {
@@ -827,7 +865,7 @@ impl DriverPort {
 
     fn guard(&self) -> ReentrantGuard<'_> {
         self.lock
-            .as_ref()
+            .as_deref()
             .or(self.driver.lock.as_ref())
             .expect("port or driver lock")
             .lock()
@@ -895,7 +933,7 @@ impl DriverPort {
     /// Drop a port whose `start` failed (io.c:747 error cleanup, no `stop`).
     pub fn abandon(&self) {
         self.state.fetch_or(SFLG_TERMINATING, Ordering::AcqRel);
-        registry().lock().remove(&(self.handle() as usize));
+        registry().lock().remove(self.slot(), self);
         self.release_resources();
     }
 
@@ -910,7 +948,7 @@ impl DriverPort {
         }
         if let Some(size) = line {
             flags |= SFLG_LINEBUF_IO;
-            *self.linebuf.lock() = Some(LineBuf::new(size));
+            *self.linebuf.lock() = Some(Box::new(LineBuf::new(size)));
         }
         self.state.fetch_or(flags, Ordering::AcqRel);
     }
@@ -1189,7 +1227,7 @@ impl DriverPort {
             unsafe { stop(self.data()) };
             self.state.fetch_and(!SFLG_STOPPING, Ordering::AcqRel);
         }
-        registry().lock().remove(&(self.handle() as usize));
+        registry().lock().remove(self.slot(), self);
         self.release_resources();
         self.sched_free();
         true

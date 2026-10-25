@@ -738,7 +738,7 @@ impl DriverPort {
         }
         let lock = self
             .lock
-            .as_ref()
+            .as_deref()
             .or(self.driver.lock.as_ref())
             .expect("port or driver lock");
         let Some(guard) = lock.try_lock() else {

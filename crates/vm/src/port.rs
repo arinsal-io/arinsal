@@ -266,6 +266,55 @@ struct PortMonitor {
     name: Option<arinsal_term::Atom>,
 }
 
+/// A few `u64`-keyed entries in one vector that allocates on the first insert, in place of a
+/// hash table: a port has no monitors until one is made (`prt->common.monitors` is a null tree
+/// in erts until then).
+pub(crate) struct SmallMap<V>(Vec<(u64, V)>);
+
+impl<V> Default for SmallMap<V> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<V> SmallMap<V> {
+    pub(crate) fn insert(&mut self, key: u64, value: V) -> Option<V> {
+        match self.0.iter_mut().find(|entry| entry.0 == key) {
+            Some(entry) => Some(std::mem::replace(&mut entry.1, value)),
+            None => {
+                self.0.push((key, value));
+                None
+            }
+        }
+    }
+
+    pub(crate) fn remove(&mut self, key: &u64) -> Option<V> {
+        let index = self.0.iter().position(|entry| entry.0 == *key)?;
+        Some(self.0.swap_remove(index).1)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&u64, &V)> {
+        self.0.iter().map(|entry| (&entry.0, &entry.1))
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
+        self.0.iter().map(|entry| &entry.1)
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&u64, &mut V) -> bool) {
+        self.0.retain_mut(|entry| keep(&entry.0, &mut entry.1));
+    }
+}
+
+impl<V> IntoIterator for SmallMap<V> {
+    type Item = (u64, V);
+    type IntoIter = std::vec::IntoIter<(u64, V)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 /// The processes linked to a port: the owner and a few more, kept without a table
 /// (`ErtsLink` tree of the port, one node per link).
 #[derive(Default)]
@@ -355,7 +404,7 @@ pub(crate) struct PortHandle {
     spawn: Option<Box<SpawnData>>,
     owner: Mutex<Pid>,
     links: Mutex<PidSet>,
-    monitors: Mutex<HashMap<u64, PortMonitor>>,
+    monitors: Mutex<SmallMap<PortMonitor>>,
     /// OS pid of the child: `OS_PID_PENDING` until the forker's `Go`, 0 for ports without one.
     os_pid: AtomicU32,
     name: String,
@@ -369,7 +418,7 @@ pub(crate) struct PortHandle {
     /// Dynamically loaded (`erl_ddll`) driver port.
     driver: OnceLock<Arc<arinsal_drv::DriverPort>>,
     /// Processes this driver port monitors (`driver_monitor_process`): monitor id to pid.
-    drv_monitors: Mutex<HashMap<u64, Pid>>,
+    drv_monitors: Mutex<SmallMap<Pid>>,
     /// The `open_port` waiting for `erl_drv_init_ack`: reference id and opener.
     async_open: Mutex<Option<(u64, Pid)>>,
     /// `port->common.u.alive.reg->name`, shared with the register table entry.
@@ -2883,7 +2932,7 @@ fn make_handle_with(
         }),
         owner: Mutex::new(owner),
         links: Mutex::new(PidSet::from_one(owner)),
-        monitors: Mutex::new(HashMap::new()),
+        monitors: Mutex::new(SmallMap::default()),
         os_pid: AtomicU32::new(os_pid),
         name,
         parallelism,
@@ -2908,7 +2957,7 @@ fn make_handle_with(
         trace_scope,
         data: Mutex::new(PortData::undefined()),
         driver: OnceLock::new(),
-        drv_monitors: Mutex::new(HashMap::new()),
+        drv_monitors: Mutex::new(SmallMap::default()),
         async_open: Mutex::new(None),
         reg_word: Arc::new(AtomicU32::new(crate::register::NO_REG_ATOM)),
         reg_closing: AtomicBool::new(false),

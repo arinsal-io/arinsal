@@ -49,6 +49,42 @@ pub enum InitAck {
     Failed(StartError),
 }
 
+/// The process monitors of a port, monitor id to process-table data. Ports hold few, so they
+/// are a plain vector that allocates on the first monitor (`prt->common.monitors` is a null tree
+/// until then in erts).
+#[derive(Default)]
+pub(crate) struct PidMonitors(Vec<(u64, u64)>);
+
+impl PidMonitors {
+    pub(crate) fn insert(&mut self, id: u64, pid: u64) {
+        match self.0.iter_mut().find(|(key, _)| *key == id) {
+            Some(entry) => entry.1 = pid,
+            None => self.0.push((id, pid)),
+        }
+    }
+
+    pub(crate) fn remove(&mut self, id: &u64) -> Option<u64> {
+        let index = self.0.iter().position(|(key, _)| key == id)?;
+        Some(self.0.swap_remove(index).1)
+    }
+
+    pub(crate) fn get(&self, id: &u64) -> Option<&u64> {
+        self.0.iter().find(|(key, _)| key == id).map(|(_, pid)| pid)
+    }
+
+    pub(crate) fn contains_key(&self, id: &u64) -> bool {
+        self.0.iter().any(|(key, _)| key == id)
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &u64> {
+        self.0.iter().map(|(_, pid)| pid)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0 = Vec::new();
+    }
+}
+
 /// Busy-port message queue limits of `erl_drv_busy_msgq_limits`.
 #[derive(Clone, Copy)]
 pub(crate) struct MsgqLimits {
@@ -147,7 +183,7 @@ impl DriverPort {
         self.caller_data().is_some()
             && self
                 .lock
-                .as_ref()
+                .as_deref()
                 .or(self.driver.lock.as_ref())
                 .is_some_and(lock::ReentrantLock::held_here)
     }
