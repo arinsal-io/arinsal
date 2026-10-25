@@ -6,8 +6,8 @@
 //! allocated once and freed once. This module holds the only raw allocation of the crate's
 //! stored objects; everything else reaches the words through the safe slice field.
 
-use super::{EtsError, OffHeap};
-use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
+use super::{Compressed, EtsError, OffHeap};
+use arinsal_alloc::typed::{ets_alloc_words, ets_free_words, ets_realloc_words};
 use arinsal_term::{
     ExternalBinary, HeapAlloc, MagicRef, Node as TermNode, Term, TermError, WritableBinary, cmp,
 };
@@ -15,68 +15,256 @@ use std::cmp::Ordering;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use super::Compressed;
+const PSEUDO_DELETED_BIT: u64 = 1 << 63;
 
-/// The `DbTerm` of erts (erl_db_util.h): the bookkeeping of one stored object and, after it, the
-/// words of the term. `W = [u64]` is the unsized form every table works with.
+const TERM_WORDS_BITS: u32 = 48;
+const TERM_WORDS_MASK: u64 = (1 << TERM_WORDS_BITS) - 1;
+const PREFIX_WORDS_SHIFT: u32 = 48;
+const PREFIX_WORDS_MASK: u64 = 0x7 << PREFIX_WORDS_SHIFT;
+const SHALLOW_BIT: u64 = 1 << 62;
+const ROOT_AT_BASE_BIT: u64 = 1 << 63;
+
+/// Cold metadata for rows that retain off-heap objects, compressed ETF elements, or a non-tuple
+/// root (`PlainDbTerm`). Ordinary uncompressed ETS rows keep `extra: None` (a single null word,
+/// matching `DbTerm.first_oh == NULL` in `erl_db_util.h:69`).
+#[derive(Default)]
+pub(crate) struct DbTermExtra {
+    pub(crate) off_heap: Option<OffHeap>,
+    pub(crate) compressed: Option<Compressed>,
+    pub(crate) alt_term: Option<Term>,
+    pub(crate) alloc_words: Option<usize>,
+    pub(crate) db_size_words_override: Option<usize>,
+}
+
+/// The `DbTerm` of erts (`erl_db_util.h:68-82`): two header words (`first_oh`/extra pointer +
+/// `size`/flags word), followed immediately in the same `ets_alloc` block by `tpl[]` (`words`),
+/// where the top tuple always starts at word 0 for uncompressed ETS objects.
 // Port of erts/emulator/beam/erl_db_util.h (DbTerm), OTP-29.1.1.
-#[repr(C)]
-pub(crate) struct DbData<W: ?Sized> {
-    /// The stored tuple, a pointer into `words`.
-    pub(crate) term: Term,
-    /// `DbTerm.size`-based memory accounting, in words (`ets:info(T, memory)`).
-    pub(crate) db_size_words: usize,
-    /// Words `copy_struct` needs to copy the stored term out.
-    pub(crate) term_size_words: usize,
-    /// `DbTerm.first_oh` owners.
-    pub(crate) off_heap: Option<Box<OffHeap>>,
-    // ETS compressed tables retain only ETF bytes for non-key boxed elements. The tuple
-    // contains NIL sentinels in those positions and never keeps the original values alive.
-    pub(crate) compressed: Option<Box<Compressed>>,
-    /// The stored block can be copied out word by word (`copy_shallow`).
-    pub(crate) shallow: bool,
-    /// The heap words of the term.
-    pub(crate) words: W,
+#[repr(C, align(8))]
+pub(crate) struct StoredTerm {
+    extra: Option<Box<DbTermExtra>>,
+    meta: u64,
 }
 
-/// A stored object of any size, as the table-independent code sees it (`DbTerm *`).
-pub(crate) type StoredTerm = DbData<[u64]>;
-
-/// A table's block: the table-specific prefix (`HashDbTerm` / `TreeDbTerm` fields before
-/// `dbterm`) and the `DbTerm`.
-#[repr(C)]
-pub(crate) struct Node<P, W: ?Sized> {
-    pub(crate) prefix: P,
-    pub(crate) data: DbData<W>,
-}
-
-impl<P, W: ?Sized> std::ops::Deref for Node<P, W> {
-    type Target = DbData<W>;
+impl StoredTerm {
+    #[inline]
+    fn words_mut_ptr(&mut self) -> *mut u64 {
+        std::ptr::from_mut(self).wrapping_add(1).cast::<u64>()
+    }
 
     #[inline]
-    fn deref(&self) -> &DbData<W> {
+    pub(crate) fn term_size_words(&self) -> usize {
+        (self.meta & TERM_WORDS_MASK) as usize
+    }
+
+    #[inline]
+    pub(crate) fn prefix_words(&self) -> usize {
+        ((self.meta & PREFIX_WORDS_MASK) >> PREFIX_WORDS_SHIFT) as usize
+    }
+
+    #[inline]
+    pub(crate) fn alloc_words(&self) -> usize {
+        if self.meta & ROOT_AT_BASE_BIT != 0 {
+            return self.term_size_words();
+        }
+        self.extra
+            .as_ref()
+            .and_then(|extra| extra.alloc_words)
+            .unwrap_or_else(|| self.term_size_words())
+    }
+
+    #[inline]
+    pub(crate) fn db_size_words(&self) -> usize {
+        if self.meta & ROOT_AT_BASE_BIT == 0
+            && let Some(words) = self.extra.as_ref().and_then(|e| e.db_size_words_override)
+        {
+            return words;
+        }
+        self.prefix_words() + 2 + self.term_size_words()
+    }
+
+    #[inline]
+    pub(crate) fn shallow(&self) -> bool {
+        self.meta & SHALLOW_BIT != 0
+    }
+
+    #[inline]
+    fn raw_words_and_root(&self) -> (&[u64], Term) {
+        let ptr = std::ptr::from_ref(self).wrapping_add(1).cast::<u64>();
+        let len = self.alloc_words();
+        // SAFETY: every `StoredTerm` is followed in its `ets_alloc` block by `alloc_words`
+        // initialized `u64` words; when `ROOT_AT_BASE_BIT` is set, `ptr` addresses a valid boxed
+        // tuple header in those words.
+        unsafe {
+            let slice = std::slice::from_raw_parts(ptr, len);
+            let term = if self.meta & ROOT_AT_BASE_BIT != 0 {
+                Term::from_raw_bits((ptr as u64) | 2)
+            } else {
+                self.extra
+                    .as_ref()
+                    .and_then(|extra| extra.alt_term)
+                    .unwrap_or(Term::NIL)
+            };
+            (slice, term)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn words(&self) -> &[u64] {
+        self.raw_words_and_root().0
+    }
+
+    #[inline]
+    pub(crate) fn words_mut(&mut self) -> &mut [u64] {
+        let len = self.alloc_words();
+        let ptr = self.words_mut_ptr();
+        // SAFETY: as in `raw_words_and_root`, with exclusive `&mut self` access.
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+    }
+
+    #[inline]
+    pub(crate) fn term(&self) -> Term {
+        self.raw_words_and_root().1
+    }
+
+    #[inline]
+    pub(crate) fn off_heap(&self) -> Option<&OffHeap> {
+        self.extra.as_ref()?.off_heap.as_ref()
+    }
+
+    #[inline]
+    pub(crate) fn compressed(&self) -> Option<&Compressed> {
+        self.extra.as_ref()?.compressed.as_ref()
+    }
+
+    fn extra_mut(&mut self) -> &mut DbTermExtra {
+        self.extra
+            .get_or_insert_with(|| Box::new(DbTermExtra::default()))
+    }
+
+    fn clear_payload(&mut self, current_alloc_words: usize) {
+        self.extra = None;
+        self.meta = current_alloc_words as u64;
+    }
+
+    #[inline]
+    pub(crate) fn set_uncompressed_meta(
+        &mut self,
+        prefix_words: usize,
+        term_size_words: usize,
+        shallow: bool,
+    ) {
+        debug_assert!(term_size_words < (1usize << TERM_WORDS_BITS));
+        debug_assert!(prefix_words <= 7);
+        let root_bit = self.meta & ROOT_AT_BASE_BIT;
+        self.meta = (term_size_words as u64)
+            | ((prefix_words as u64) << PREFIX_WORDS_SHIFT)
+            | if shallow { SHALLOW_BIT } else { 0 }
+            | root_bit;
+    }
+
+    pub(crate) fn set_copied_meta(
+        &mut self,
+        prefix_words: usize,
+        term_size_words: usize,
+        db_size_words: usize,
+        shallow: bool,
+    ) {
+        self.set_uncompressed_meta(prefix_words, term_size_words, shallow);
+        if db_size_words != prefix_words + 2 + term_size_words {
+            self.meta &= !ROOT_AT_BASE_BIT;
+            let term = self.term();
+            let extra = self.extra_mut();
+            if extra.alt_term.is_none() {
+                extra.alt_term = Some(term);
+            }
+            extra.db_size_words_override = Some(db_size_words);
+        }
+    }
+
+    pub(crate) fn set_compressed_meta(
+        &mut self,
+        term_size_words: usize,
+        alloc_words: usize,
+        db_size_words: usize,
+        shallow: bool,
+        compressed: Compressed,
+    ) {
+        let term = self.term();
+        debug_assert!(term_size_words < (1usize << TERM_WORDS_BITS));
+        self.meta = (term_size_words as u64) | if shallow { SHALLOW_BIT } else { 0 };
+        let extra = self.extra_mut();
+        extra.alt_term = Some(term);
+        extra.alloc_words = Some(alloc_words);
+        extra.db_size_words_override = Some(db_size_words);
+        extra.compressed = Some(compressed);
+    }
+}
+
+/// A table's block: the table-specific prefix (`HashDbTerm` / `TreeDbTerm` fields before
+/// `dbterm`) and the `DbTerm` header, followed immediately in memory by `tpl[]`.
+#[repr(C)]
+pub(crate) struct Node<P> {
+    pub(crate) prefix: P,
+    pub(crate) data: StoredTerm,
+}
+
+impl<P> std::ops::Deref for Node<P> {
+    type Target = StoredTerm;
+
+    #[inline]
+    fn deref(&self) -> &StoredTerm {
         &self.data
     }
 }
 
-impl<P, W: ?Sized> std::ops::DerefMut for Node<P, W> {
+impl<P> std::ops::DerefMut for Node<P> {
     #[inline]
-    fn deref_mut(&mut self) -> &mut DbData<W> {
+    fn deref_mut(&mut self) -> &mut StoredTerm {
         &mut self.data
     }
 }
 
-/// `HashDbTerm` before the `dbterm` field (erl_db_hash.h). `order` and `group_order` are the
-/// hash bucket insertion ranks arinsal keeps for its bucket-order emulation.
+/// `HashDbTerm` before the `dbterm` field (`erl_db_hash.h:41-49`), OTP-29.1.1:
+/// `next` bucket pointer plus 63-bit `hvalue` and 1-bit `pseudo_deleted` packed in one word.
+// Port of erts/emulator/beam/erl_db_hash.h:41-49 (HashDbTerm), OTP-29.1.1.
+#[repr(C)]
 pub(crate) struct HashPrefix {
     pub(crate) next: Option<HashDbTerm>,
-    pub(crate) hvalue: u64,
-    pub(crate) pseudo_deleted: bool,
-    pub(crate) order: u64,
-    pub(crate) group_order: u64,
+    hvalue_and_flg: u64,
 }
 
-/// `TreeDbTerm` before the `dbterm` field (erl_db_tree_util.h).
+impl HashPrefix {
+    #[inline]
+    pub(crate) fn hvalue(&self) -> u64 {
+        self.hvalue_and_flg & !PSEUDO_DELETED_BIT
+    }
+
+    #[inline]
+    pub(crate) fn set_hvalue(&mut self, hvalue: u64) {
+        debug_assert!(hvalue & PSEUDO_DELETED_BIT == 0);
+        self.hvalue_and_flg =
+            (self.hvalue_and_flg & PSEUDO_DELETED_BIT) | (hvalue & !PSEUDO_DELETED_BIT);
+    }
+
+    #[inline]
+    pub(crate) fn pseudo_deleted(&self) -> bool {
+        self.hvalue_and_flg & PSEUDO_DELETED_BIT != 0
+    }
+
+    #[inline]
+    pub(crate) fn set_pseudo_deleted(&mut self, deleted: bool) {
+        if deleted {
+            self.hvalue_and_flg |= PSEUDO_DELETED_BIT;
+        } else {
+            self.hvalue_and_flg &= !PSEUDO_DELETED_BIT;
+        }
+    }
+}
+
+/// `TreeDbTerm` before the `dbterm` field (`erl_db_tree.h:28-32`), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_db_tree.h:28-32 (TreeDbTerm), OTP-29.1.1.
+#[repr(C)]
 pub(crate) struct TreePrefix {
     pub(crate) left: Option<TreeDbTerm>,
     pub(crate) right: Option<TreeDbTerm>,
@@ -96,10 +284,7 @@ impl Prefix for HashPrefix {
     fn empty() -> Self {
         Self {
             next: None,
-            hvalue: 0,
-            pseudo_deleted: false,
-            order: 0,
-            group_order: 0,
+            hvalue_and_flg: 0,
         }
     }
 }
@@ -114,10 +299,12 @@ impl Prefix for TreePrefix {
     }
 }
 
-/// The owner of a stored block, as erts' `DbTerm *` / `HashDbTerm *` / `TreeDbTerm *`: one
-/// `ERTS_ALC_T_DB_TERM` allocation holding the prefix, the `DbTerm` and the words of the term.
+/// The owner of a stored block, as erts' `DbTerm *` / `HashDbTerm *` / `TreeDbTerm *`: one thin
+/// non-null pointer to an `ERTS_ALC_T_DB_TERM` allocation holding the prefix, the `DbTerm` header
+/// and the words of the term.
+#[repr(transparent)]
 pub(crate) struct DbTerm<P> {
-    ptr: NonNull<Node<P, [u64]>>,
+    ptr: NonNull<Node<P>>,
 }
 
 pub(crate) type HashDbTerm = DbTerm<HashPrefix>;
@@ -125,7 +312,19 @@ pub(crate) type TreeDbTerm = DbTerm<TreePrefix>;
 /// A block with no table prefix (`offset` 0).
 pub(crate) type PlainDbTerm = DbTerm<()>;
 /// The block of a tree node as the tree code sees it.
-pub(crate) type TreeNode = Node<TreePrefix, [u64]>;
+pub(crate) type TreeNode = Node<TreePrefix>;
+
+const _: () = {
+    assert!(std::mem::size_of::<StoredTerm>() == 16);
+    assert!(std::mem::size_of::<HashPrefix>() == 16);
+    assert!(std::mem::size_of::<TreePrefix>() == 24);
+    assert!(std::mem::size_of::<Node<HashPrefix>>() == 32);
+    assert!(std::mem::size_of::<Node<TreePrefix>>() == 40);
+    assert!(std::mem::size_of::<HashDbTerm>() == 8);
+    assert!(std::mem::size_of::<Option<HashDbTerm>>() == 8);
+    assert!(std::mem::size_of::<TreeDbTerm>() == 8);
+    assert!(std::mem::size_of::<Option<TreeDbTerm>>() == 8);
+};
 
 // SAFETY: a `DbTerm` owns its block exclusively, like a `Box`, and its contents are `Send + Sync`.
 unsafe impl<P: Send> Send for DbTerm<P> {}
@@ -133,7 +332,7 @@ unsafe impl<P: Send> Send for DbTerm<P> {}
 unsafe impl<P: Sync> Sync for DbTerm<P> {}
 
 impl<P> std::ops::Deref for DbTerm<P> {
-    type Target = Node<P, [u64]>;
+    type Target = Node<P>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -154,44 +353,44 @@ impl<P> Drop for DbTerm<P> {
     // Port of erts/emulator/beam/erl_db_util.c (db_free_term), OTP-29.1.1.
     fn drop(&mut self) {
         let base = self.ptr.as_ptr();
+        let total_words = std::mem::size_of::<Node<P>>() / 8 + self.data.alloc_words();
         // SAFETY: the block is live and owned; its fields are dropped once, then its memory is
-        // returned to the allocator that made it.
+        // returned to `ets_alloc`.
         unsafe { std::ptr::drop_in_place(base) };
-        AllocBlock::free_detached_heap(base.cast::<u64>());
+        ets_free_words(base.cast::<u64>(), total_words);
     }
 }
 
 impl<P: Prefix> DbTerm<P> {
-    const HEAD_WORDS: usize = std::mem::size_of::<Node<P, [u64; 0]>>() / 8;
+    const HEAD_WORDS: usize = {
+        assert!(
+            std::mem::size_of::<Node<P>>()
+                == std::mem::offset_of!(Node<P>, data) + std::mem::size_of::<StoredTerm>()
+        );
+        std::mem::size_of::<Node<P>>() / 8
+    };
 
-    fn into_ptr(self) -> NonNull<Node<P, [u64]>> {
-        let ptr = self.ptr;
-        std::mem::forget(self);
-        ptr
-    }
-
-    fn from_user(user: *mut u64, nwords: usize) -> Self {
-        let fat = std::ptr::slice_from_raw_parts_mut(user, nwords) as *mut Node<P, [u64]>;
+    fn from_user(user: *mut u64) -> Self {
         Self {
-            // SAFETY: `user` comes from a successful allocation, so it is not null.
-            ptr: unsafe { NonNull::new_unchecked(fat) },
+            ptr: NonNull::new(user.cast::<Node<P>>()).expect("ets_alloc returned null"),
         }
     }
 
     /// Make the block hold `nwords` words of term data, keeping the header; the words are
     /// cleared. `erts_db_realloc` when the size changes.
     // Port of erts/emulator/beam/erl_db_util.c (db_realloc_term), OTP-29.1.1.
-    fn resize(&mut self, nwords: usize) {
-        if self.data.words.len() != nwords {
-            let user = AllocBlock::realloc_detached_heap(
+    fn resize(&mut self, old_nwords: usize, nwords: usize) {
+        if old_nwords != nwords {
+            let user = ets_realloc_words(
                 self.ptr.as_ptr().cast::<u64>(),
+                Self::HEAD_WORDS + old_nwords,
                 Self::HEAD_WORDS + nwords,
             )
             .expect("ets_alloc out of memory");
-            // The old block is gone (reallocated); only the pointer changes hands.
-            self.ptr = Self::from_user(user, nwords).into_ptr();
+            self.ptr = NonNull::new(user.cast::<Node<P>>()).expect("ets_realloc returned null");
         }
-        self.data.words.fill(0);
+        self.data.meta = nwords as u64;
+        self.data.words_mut().fill(0);
     }
 }
 
@@ -199,27 +398,22 @@ impl<P: Prefix> DbTerm<P> {
 // Port of erts/emulator/beam/erl_db_util.c (db_store_term allocation:
 // erts_db_alloc(ERTS_ALC_T_DB_TERM)), OTP-29.1.1.
 pub(crate) fn new_block<P: Prefix>(nwords: usize) -> DbTerm<P> {
+    debug_assert!(nwords < (1usize << TERM_WORDS_BITS));
     let head_words = DbTerm::<P>::HEAD_WORDS;
-    let user = AllocBlock::detach_heap(ErtsAlcType::DB_TERM, head_words + nwords)
-        .expect("ets_alloc out of memory");
+    let user = ets_alloc_words(head_words + nwords).expect("ets_alloc out of memory");
     // SAFETY: `user` addresses `head_words + nwords` fresh words, 8-aligned: room for the
     // header, and the term words after it are zeroed here.
     unsafe {
-        user.cast::<Node<P, [u64; 0]>>().write(Node {
+        user.cast::<Node<P>>().write(Node {
             prefix: P::empty(),
-            data: DbData {
-                term: Term::NIL,
-                db_size_words: 0,
-                term_size_words: 0,
-                off_heap: None,
-                compressed: None,
-                shallow: false,
-                words: [],
+            data: StoredTerm {
+                extra: None,
+                meta: nwords as u64,
             },
         });
         std::ptr::write_bytes(user.add(head_words), 0, nwords);
     }
-    DbTerm::from_user(user, nwords)
+    DbTerm::from_user(user)
 }
 
 /// Allocate a block of `nwords` words and let `fill` copy the term into it; `fill` returns the
@@ -242,11 +436,10 @@ pub(crate) fn rebuild_block<P: Prefix>(
     nwords: usize,
     fill: impl FnOnce(&mut BlockHeap) -> Result<Term, EtsError>,
 ) -> Result<(), EtsError> {
+    let old_nwords = old.data.alloc_words();
     // erts_cleanup_offheap_list(old->first_oh)
-    old.data.off_heap = None;
-    old.data.compressed = None;
-    old.data.term = Term::NIL;
-    old.resize(nwords);
+    old.data.clear_payload(old_nwords);
+    old.resize(old_nwords, nwords);
     fill_block(old, fill)
 }
 
@@ -254,17 +447,31 @@ fn fill_block<P: Prefix>(
     block: &mut DbTerm<P>,
     fill: impl FnOnce(&mut BlockHeap) -> Result<Term, EtsError>,
 ) -> Result<(), EtsError> {
-    let nwords = block.data.words.len();
+    let nwords = block.data.alloc_words();
+    let base = block.data.words_mut_ptr();
     let mut heap = BlockHeap {
-        base: block.data.words.as_mut_ptr(),
+        base,
         cap: nwords,
         used: 0,
         off_heap: None,
     };
     let term = fill(&mut heap)?;
     debug_assert!(heap.used <= nwords, "object copy overran its block");
-    block.data.term = term;
-    block.data.off_heap = heap.off_heap.take();
+    let root_at_base = nwords > 0 && term.tagged_word() == (base as u64) | 2;
+    if root_at_base {
+        block.data.meta = (nwords as u64) | ROOT_AT_BASE_BIT;
+        if let Some(off_heap) = heap.off_heap.take() {
+            block.data.extra_mut().off_heap = Some(*off_heap);
+        }
+    } else {
+        block.data.meta = nwords as u64;
+        let extra = block.data.extra_mut();
+        extra.alt_term = Some(term);
+        extra.alloc_words = Some(nwords);
+        if let Some(off_heap) = heap.off_heap.take() {
+            extra.off_heap = Some(*off_heap);
+        }
+    }
     Ok(())
 }
 
@@ -734,7 +941,7 @@ pub(crate) fn tree_put(
             }
             Ordering::Equal if !key_clash_fail => {
                 let old = node(slot);
-                let words = old.db_size_words;
+                let words = old.db_size_words();
                 make(Some(old))?;
                 return Ok(InsertResult::Replaced(words));
             }

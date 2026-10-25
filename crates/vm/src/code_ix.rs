@@ -209,6 +209,50 @@ impl CodeIndexes {
         }
     }
 
+    /// Copies active module ranges to the staging code index before a code load.
+    // Port of erts/emulator/beam/beam_ranges.c:118-137 (erts_start_staging_ranges), OTP-29.1.1.
+    fn stage_code_ranges(&self) {
+        let active = self.ranges[self.active()].load_full();
+        self.ranges[self.staging()].store(Arc::new(active.as_ref().clone()));
+    }
+
+    /// Adds a compiled module range to the index being staged by the code loader.
+    // Port of erts/emulator/beam/beam_ranges.c:194-219 (erts_update_ranges), OTP-29.1.1.
+    pub(crate) fn add_staging_code_range(&self, range: crate::native_bridge::ModuleRange) {
+        let index = self.staging();
+        let mut ranges = self.ranges[index].load_full().as_ref().clone();
+        let at = ranges.partition_point(|entry| entry.start() < range.start());
+        assert!(
+            at == 0 || ranges[at - 1].end() <= range.start(),
+            "staged native module ranges overlap"
+        );
+        assert!(
+            at == ranges.len() || range.end() <= ranges[at].start(),
+            "staged native module ranges overlap"
+        );
+        ranges.insert(at, range);
+        self.ranges[index].store(Arc::new(ranges));
+    }
+
+    /// Removes a purged module range from every index that can still be read.
+    // Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
+    pub(crate) fn remove_code_range(&self, start: usize, end: usize) {
+        for slot in &self.ranges {
+            let mut ranges = slot.load_full().as_ref().clone();
+            ranges.retain(|range| range.start() != start || range.end() != end);
+            slot.store(Arc::new(ranges));
+        }
+    }
+
+    // Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
+    pub(crate) fn remove_code_ranges_scope(&self, scope: u64) {
+        for slot in &self.ranges {
+            let mut ranges = slot.load_full().as_ref().clone();
+            ranges.retain(|range| range.scope() != scope);
+            slot.store(Arc::new(ranges));
+        }
+    }
+
     /// Copies the active catch table into the staging code index.
     // Port of erts/emulator/beam/beam_catches.c:89-99 (beam_catches_start_staging), OTP-29.1.1.
     fn stage_catches(&self) {
@@ -339,6 +383,7 @@ impl CodeIndexes {
             copy.stage_fun_entries(self.active(), self.staging());
             self.lock_permission().work = Some(copy);
             crate::beamasm_integration::stage_dispatch(self.scope);
+            self.stage_code_ranges();
             // Port of erts/emulator/beam/beam_catches.c:89-99 (beam_catches_start_staging),
             // OTP-29.1.1: the staging code index starts as a copy of the active pool.
             self.stage_catches();

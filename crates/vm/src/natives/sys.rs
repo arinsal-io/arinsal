@@ -2400,22 +2400,18 @@ fn code_bytes(vm: &Vm) -> u64 {
         .sum()
 }
 
+// Port of erts/emulator/beam/erl_bif_info.c (erts_memory: ERTS_ALC_A_ETS) and
+// erl_alloc.c:2509 (alcu_size), OTP-29.1.1: sums live `ets_alloc` object blocks
+// (`DbTerm`s including allocator block headers) plus table/segment structures.
 fn ets_bytes(process: &Process) -> u64 {
     let Some(runtime) = &process.runtime else {
         return 0;
     };
+    let schedulers = runtime.scheduler().map_or(1, |s| s.scheduler_count());
     let registry = runtime.ets.read().expect("ets registry");
-    let words: usize = registry
-        .all()
-        .into_iter()
-        .map(|id| {
-            registry
-                .get(id)
-                .map(|table| table.memory_words())
-                .unwrap_or(0)
-        })
-        .sum();
-    words as u64 * std::mem::size_of::<usize>() as u64
+    let structure_words = registry.total_structure_memory_words(schedulers);
+    arinsal_alloc::typed::ets_allocation_bytes()
+        .saturating_add(structure_words as u64 * std::mem::size_of::<usize>() as u64)
 }
 
 fn atom_bytes() -> (u64, u64) {

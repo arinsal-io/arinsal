@@ -1092,7 +1092,7 @@ impl StoredTerm {
         let original = (0..values.len())
             .map(|index| old.tuple_element(index).ok_or(EtsError::BadArg))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut nwords = old.term_size_words;
+        let mut nwords = old.term_size_words();
         for (previous, next) in original.iter().zip(values) {
             if previous.tagged_word() != next.tagged_word() {
                 nwords = nwords
@@ -1127,10 +1127,9 @@ impl StoredTerm {
             }
             Ok(tuple)
         })?;
-        replacement.term_size_words = nwords;
-        replacement.db_size_words = prefix_words + 2 + nwords;
-        replacement.shallow = replacement.off_heap.is_none()
-            && arinsal_term::shallow_copyable(replacement.term, &replacement.words);
+        let shallow = replacement.off_heap().is_none()
+            && arinsal_term::shallow_copyable(replacement.term(), replacement.words());
+        replacement.set_uncompressed_meta(prefix_words, nwords, shallow);
         std::mem::swap(&mut old.prefix, &mut replacement.prefix);
         std::mem::swap(old, &mut replacement);
         Ok(())
@@ -1175,9 +1174,7 @@ impl StoredTerm {
                         .unwrap_or(Err(TermError::BadArg))
                         .map_err(EtsError::from)
                 })?;
-                block.db_size_words = prefix_words + 2 + size;
-                block.term_size_words = size;
-                block.shallow = true;
+                block.set_uncompressed_meta(prefix_words, size, true);
                 return Ok(());
             }
             // The object is sized once; the same size serves the accounting and the copy.
@@ -1185,10 +1182,9 @@ impl StoredTerm {
             let block = store(old, fresh, size, |heap| {
                 arinsal_term::copy_struct(term, heap, size).map_err(EtsError::from)
             })?;
-            block.db_size_words = prefix_words + 2 + size;
-            block.term_size_words = size;
-            block.shallow = block.off_heap.is_none()
-                && arinsal_term::shallow_copyable(block.term, &block.words);
+            let shallow = block.off_heap().is_none()
+                && arinsal_term::shallow_copyable(block.term(), block.words());
+            block.set_uncompressed_meta(prefix_words, size, shallow);
             return Ok(());
         }
         // Port of erts/emulator/beam/erl_db_util.c (copy_to_comp), OTP-29.1.1. Everything that
@@ -1268,18 +1264,23 @@ impl StoredTerm {
         })?;
         // A compressed object stores a placeholder tuple; its copy size is that of the stored
         // term, not of the uncompressed source.
-        let term_size_words = arinsal_term::size_object(block.term);
-        block.shallow = block.off_heap.is_none()
+        let term_size_words = arinsal_term::size_object(block.term());
+        let shallow = block.off_heap().is_none()
             && nwords == term_size_words
-            && arinsal_term::shallow_copyable(block.term, &block.words);
-        block.term_size_words = term_size_words;
-        block.db_size_words =
+            && arinsal_term::shallow_copyable(block.term(), block.words());
+        let db_size_words =
             Self::accounted_words(object, keypos, true, prefix_words, compressed_bytes);
-        block.compressed = Some(Box::new(Compressed {
-            elements: compressed_elements,
-            magic_refs: compressed_magic_refs,
-            bytes: compressed_bytes,
-        }));
+        block.set_compressed_meta(
+            term_size_words,
+            nwords,
+            db_size_words,
+            shallow,
+            Compressed {
+                elements: compressed_elements,
+                magic_refs: compressed_magic_refs,
+                bytes: compressed_bytes,
+            },
+        );
         Ok(())
     }
 
@@ -1289,25 +1290,32 @@ impl StoredTerm {
 
     pub(crate) fn copy_stored<P: Prefix>(&self) -> Result<DbTerm<P>, EtsError> {
         if self.compressed_elements().iter().any(Option::is_some) {
-            let mut copy = Self::copy_heap(self.term)?;
-            copy.compressed = self.compressed.as_ref().map(|c| {
-                Box::new(Compressed {
-                    elements: c.elements.clone(),
-                    magic_refs: c.magic_refs.clone(),
-                    bytes: c.bytes,
-                })
-            });
-            copy.db_size_words = self.db_size_words;
+            let mut copy = Self::copy_heap::<P>(self.term())?;
+            if let Some(c) = self.compressed() {
+                let alloc_words = copy.alloc_words();
+                let term_size_words = copy.term_size_words();
+                let shallow = copy.shallow();
+                copy.set_compressed_meta(
+                    term_size_words,
+                    alloc_words,
+                    self.db_size_words(),
+                    shallow,
+                    Compressed {
+                        elements: c.elements.clone(),
+                        magic_refs: c.magic_refs.clone(),
+                        bytes: c.bytes,
+                    },
+                );
+            }
             return Ok(copy);
         }
-        let size = self.term_size_words;
-        let mut copy = dbterm::build_block(size, |heap| {
-            arinsal_term::copy_struct(self.term, heap, size).map_err(EtsError::from)
+        let size = self.term_size_words();
+        let mut copy = dbterm::build_block::<P>(size, |heap| {
+            arinsal_term::copy_struct(self.term(), heap, size).map_err(EtsError::from)
         })?;
-        copy.shallow =
-            copy.off_heap.is_none() && arinsal_term::shallow_copyable(copy.term, &copy.words);
-        copy.db_size_words = self.db_size_words;
-        copy.term_size_words = size;
+        let shallow =
+            copy.off_heap().is_none() && arinsal_term::shallow_copyable(copy.term(), copy.words());
+        copy.set_copied_meta(self.prefix_words(), size, self.db_size_words(), shallow);
         Ok(copy)
     }
 
@@ -1319,25 +1327,25 @@ impl StoredTerm {
         if self.compressed_elements().iter().any(Option::is_some) {
             None
         } else {
-            Some(self.term)
+            Some(self.term())
         }
     }
 
     fn arity(&self) -> usize {
-        term_sequence(self.term).map_or(0, |tuple| tuple.len())
+        term_sequence(self.term()).map_or(0, |tuple| tuple.len())
     }
 
     pub(crate) fn compressed_elements(&self) -> &[Option<Vec<u8>>] {
-        self.compressed.as_ref().map_or(&[], |c| &c.elements)
+        self.compressed().map_or(&[], |c| &c.elements)
     }
 
     fn compressed_magic_refs(&self) -> &[Option<Arc<MagicRef>>] {
-        self.compressed.as_ref().map_or(&[], |c| &c.magic_refs)
+        self.compressed().map_or(&[], |c| &c.magic_refs)
     }
 
     pub(crate) fn key(&self, keypos: usize) -> Term {
-        // SAFETY: this object retains the heap containing its tuple.
-        unsafe { self.term.tuple_ref().unwrap().get(keypos - 1).unwrap() }
+        self.tuple_element(keypos - 1)
+            .expect("validated key position")
     }
 
     /// Overwrite the immediate element at zero-based `index` with another immediate, as
@@ -1349,16 +1357,16 @@ impl StoredTerm {
         if value.is_pointer() || self.tuple_element(index).is_none_or(Term::is_pointer) {
             return false;
         }
-        if !self.compressed_elements().is_empty() || !self.term.is_pointer() {
+        let term = self.term();
+        if !self.compressed_elements().is_empty() || !term.is_pointer() {
             return false;
         }
+        let words = self.words_mut();
         // The tuple heads this object's own block, so element `index` is word `index + 1`.
-        if self.term.tagged_word() & !7 != self.words.as_ptr() as u64
-            || index + 1 >= self.words.len()
-        {
+        if term.tagged_word() & !7 != words.as_ptr() as u64 || index + 1 >= words.len() {
             return false;
         }
-        self.words[index + 1] = value.tagged_word();
+        words[index + 1] = value.tagged_word();
         true
     }
 
@@ -1376,7 +1384,8 @@ impl StoredTerm {
             return false;
         }
         let address = (old.tagged_word() & !7) as usize;
-        let base = self.words.as_ptr() as usize;
+        let words = self.words_mut();
+        let base = words.as_ptr() as usize;
         let Some(offset) = address
             .checked_sub(base)
             .filter(|offset| offset % 8 == 0)
@@ -1384,7 +1393,7 @@ impl StoredTerm {
         else {
             return false;
         };
-        let Some(destination) = self.words.get_mut(offset..offset + value.len()) else {
+        let Some(destination) = words.get_mut(offset..offset + value.len()) else {
             return false;
         };
         destination.copy_from_slice(value);
@@ -1393,7 +1402,7 @@ impl StoredTerm {
 
     fn tuple_element(&self, index: usize) -> Option<Term> {
         // SAFETY: this object retains the heap containing its tuple.
-        unsafe { self.term.tuple_ref() }.and_then(|tuple| tuple.get(index))
+        unsafe { self.term().tuple_ref() }.and_then(|tuple| tuple.get(index))
     }
 
     pub(crate) fn copy_element_out<H: HeapAlloc>(
@@ -1428,7 +1437,7 @@ impl StoredTerm {
 
     fn exact_eq_term(&self, other: Term) -> bool {
         // SAFETY: `self` owns the tuple heap for the duration of this comparison.
-        let Some(left) = term_sequence(self.term) else {
+        let Some(left) = term_sequence(self.term()) else {
             return false;
         };
         let Some(right) = term_sequence(other) else {
@@ -1473,15 +1482,15 @@ impl StoredTerm {
             return self.compressed_elements() == other.compressed_elements()
                 && self.copy_equal_uncompressed(other);
         }
-        exact_eq(self.term, other.term)
+        exact_eq(self.term(), other.term())
     }
 
     fn copy_equal_uncompressed(&self, other: &StoredTerm) -> bool {
         // SAFETY: each StoredTerm owns the heap containing its tuple.
-        let Some(left) = term_sequence(self.term) else {
+        let Some(left) = term_sequence(self.term()) else {
             return false;
         };
-        let Some(right) = term_sequence(other.term) else {
+        let Some(right) = term_sequence(other.term()) else {
             return false;
         };
         left.len() == right.len()
@@ -1505,22 +1514,22 @@ impl StoredTerm {
     }
 
     fn copy_out<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
-        if self.shallow && !self.compressed_elements().iter().any(Option::is_some) {
+        if self.shallow() && !self.compressed_elements().iter().any(Option::is_some) {
             // Port of erts/emulator/beam/erl_db_util.h (db_copy_object_from_ets): the stored
             // block is copied word by word with the pointers offset.
-            return Ok(arinsal_term::copy_shallow(self.term, &self.words, dst)?);
+            return Ok(arinsal_term::copy_shallow(self.term(), self.words(), dst)?);
         }
         if !self.compressed_elements().iter().any(Option::is_some) {
             // Port of erts/emulator/beam/erl_db_util.h:425 (db_copy_object_from_ets):
             // DbTerm.size is already known, so do not size the object again before copying it.
             return Ok(arinsal_term::copy_struct(
-                self.term,
+                self.term(),
                 dst,
-                self.term_size_words,
+                self.term_size_words(),
             )?);
         }
         // SAFETY: this object owns the heap containing its tuple.
-        let tuple = term_sequence(self.term).ok_or(EtsError::BadArg)?;
+        let tuple = term_sequence(self.term()).ok_or(EtsError::BadArg)?;
         let mut elements = Vec::with_capacity(tuple.len());
         for (index, element) in tuple.into_iter().enumerate() {
             if let Some(bytes) = self
@@ -1557,8 +1566,8 @@ impl StoredTerm {
     // Port of erts/emulator/beam/erl_db_hash.c (db_get_hash/build_term_list) and
     // erl_db_util.h (db_copy_object_from_ets), OTP-29.1.1.
     fn copy_cons<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
-        if self.shallow && !self.compressed_elements().iter().any(Option::is_some) {
-            let mut heap = ObjectAndListHeap::new(dst, self.words.len());
+        if self.shallow() && !self.compressed_elements().iter().any(Option::is_some) {
+            let mut heap = ObjectAndListHeap::new(dst, self.words().len());
             let copied = self.copy_out(&mut heap)?;
             return Ok(TermBuilder::new(&mut heap).cons(copied, Term::NIL)?);
         }
@@ -1587,7 +1596,7 @@ impl StoredTerm {
     pub(crate) fn refc_binaries<H: HeapAlloc>(&self, dst: &mut H) -> Result<Vec<Term>, EtsError> {
         // Port of erts/emulator/beam/erl_bif_info.c (`erts_bld_bin_list`),
         // OTP-29.1.1: report each BinRef from this DbTerm's first_oh chain.
-        let Some(off_heap) = self.off_heap.as_ref() else {
+        let Some(off_heap) = self.off_heap() else {
             return Ok(Vec::new());
         };
         let mut terms = Vec::with_capacity(off_heap.binary_refs.len());
@@ -1616,10 +1625,10 @@ impl StoredTerm {
     ) -> Result<(Term, Option<match_spec::KnownObject<'_>>), EtsError> {
         if !self.compressed_elements().iter().any(Option::is_some) {
             return Ok((
-                self.term,
+                self.term(),
                 Some(match_spec::KnownObject {
-                    size: self.term_size_words,
-                    block: self.shallow.then(|| &self.words[..]),
+                    size: self.term_size_words(),
+                    block: self.shallow().then(|| self.words()),
                 }),
             ));
         }
@@ -1820,6 +1829,7 @@ fn db_element_size<P: Prefix>(object: &DbTerm<P>, tuple: &[Term], index: usize) 
     if !element.is_pointer() || element.is_literal() {
         return 0;
     }
+    let words = object.words();
     let start = (element.tagged_word() & !7) as usize;
     let end = tuple
         .iter()
@@ -1827,7 +1837,7 @@ fn db_element_size<P: Prefix>(object: &DbTerm<P>, tuple: &[Term], index: usize) 
         .filter(|next| next.is_pointer() && !next.is_literal())
         .map(|next| (next.tagged_word() & !7) as usize)
         .next()
-        .unwrap_or_else(|| object.words.as_ptr() as usize + object.words.len() * 8);
+        .unwrap_or_else(|| words.as_ptr() as usize + words.len() * 8);
     debug_assert!(end >= start);
     (end - start) / 8
 }
@@ -2611,10 +2621,8 @@ impl Table {
         self.memory_words_for_schedulers(1)
     }
 
-    /// Return the OTP table allocation total for the runtime's scheduler count.
-    // `sizeof(DbTable)` depends on the platform's pthread mutex size, see
-    // `TABLE_HEADER_SHRINK` / `CATREE_BASE_SHRINK`; the constants below are the macOS values.
-    pub fn memory_words_for_schedulers(&self, schedulers: usize) -> usize {
+    /// Return the OTP table header, segment, and lock words excluding stored row blocks.
+    pub fn structure_memory_words_for_schedulers(&self, schedulers: usize) -> usize {
         // Port of erl_db_hash.c and erl_db_tree.c, OTP-29.1.1.
         // OTP's frequent-read rwlocks reserve one cache line per reader group plus
         // two bookkeeping lines. Its decentralized counter array reserves one
@@ -2623,19 +2631,12 @@ impl Table {
         let concurrent = schedulers > 1 && self.options.protection != Protection::Private;
         let rwlock_words = 8 * (schedulers + 2);
         match &self.storage {
-            Storage::Ordered(root) => {
-                let mut objects = Vec::new();
-                Node::walk(root, &mut objects);
-                let table = (146 - TABLE_HEADER_SHRINK)
-                    + usize::from(concurrent && self.options.read_concurrency) * rwlock_words;
-                table
-                    + objects
-                        .iter()
-                        .map(|object| object.db_size_words)
-                        .sum::<usize>()
+            Storage::Ordered(_) => {
+                (146 - TABLE_HEADER_SHRINK)
+                    + usize::from(concurrent && self.options.read_concurrency) * rwlock_words
             }
-            Storage::CATree(tree) => {
-                let table = if concurrent {
+            Storage::CATree(_) => {
+                if concurrent {
                     // Port of erl_db_catree.c and erl_flxctr.c,
                     // OTP-29.1.1. This includes the initial base node, its lock,
                     // and (when enabled) the decentralized counter allocation.
@@ -2649,8 +2650,7 @@ impl Table {
                         + usize::from(self.options.read_concurrency) * rwlock_words
                 } else {
                     146 - TABLE_HEADER_SHRINK
-                };
-                table + tree.object_memory_words().max(0) as usize
+                }
             }
             Storage::Hash(storage) => {
                 // The empty hash table reports 312 words on OTP 29.1.1/M1;
@@ -2720,9 +2720,20 @@ impl Table {
                     + fine_locks
                     + read_lock
                     + decentralized
-                    + storage.object_memory_words().max(0) as usize
             }
         }
+    }
+
+    /// Return the OTP table allocation total for the runtime's scheduler count.
+    // `sizeof(DbTable)` depends on the platform's pthread mutex size, see
+    // `TABLE_HEADER_SHRINK` / `CATREE_BASE_SHRINK`; the constants below are the macOS values.
+    pub fn memory_words_for_schedulers(&self, schedulers: usize) -> usize {
+        let object_words = match &self.storage {
+            Storage::Ordered(root) => root.object_memory_words().max(0) as usize,
+            Storage::CATree(tree) => tree.object_memory_words().max(0) as usize,
+            Storage::Hash(storage) => storage.object_memory_words().max(0) as usize,
+        };
+        self.structure_memory_words_for_schedulers(schedulers) + object_words
     }
 
     /// Return one `ets:info/2` value. `node` comes from the owning VM.
@@ -3102,7 +3113,7 @@ impl Table {
             let mut results = None;
             tree.update_counter(key, |found| {
                 if let Some(existing) = found {
-                    let old_words = existing.db_size_words;
+                    let old_words = existing.db_size_words();
                     let mut heap = ObjectHeap::new();
                     let returned = if !compressed && existing.compressed_elements().is_empty() {
                         let mut plan =
@@ -3123,7 +3134,7 @@ impl Table {
                         StoredTerm::overwrite_from_input(existing, updated, compressed, keypos, 3)?;
                         returned
                     };
-                    let delta = existing.db_size_words as isize - old_words as isize;
+                    let delta = existing.db_size_words() as isize - old_words as isize;
                     results = Some(returned);
                     Ok((None, delta))
                 } else {
@@ -3137,7 +3148,7 @@ impl Table {
                     let updated = TermBuilder::new(&mut heap).tuple(&values)?;
                     let stored =
                         StoredTerm::copy_for_table::<TreePrefix>(updated, compressed, keypos, 3)?;
-                    let delta = stored.db_size_words as isize;
+                    let delta = stored.db_size_words() as isize;
                     results = Some(returned);
                     Ok((Some(stored), delta))
                 }
@@ -3162,9 +3173,7 @@ impl Table {
                 Some(existing) if compressed || !existing.compressed_elements().is_empty() => {
                     let mut heap = ObjectHeap::new();
                     let current = existing.term_for_filter(&mut heap)?;
-                    // SAFETY: `current` is owned by `heap` through replacement construction.
-                    let tuple = unsafe { current.tuple_ref() }.ok_or(EtsError::BadArg)?;
-                    let mut values = tuple.iter().collect::<Vec<_>>();
+                    let mut values = term_sequence(current).ok_or(EtsError::BadArg)?;
                     let returned =
                         update_counter_values(&mut values, keypos, operations, &mut heap, dst)?;
                     let updated = TermBuilder::new(&mut heap).tuple(&values)?;
@@ -3563,7 +3572,7 @@ impl Table {
                 let hash = ets_hash(key);
                 storage.with_objects_hash(hash, |objects| {
                     for node in objects {
-                        if node.prefix.hvalue == (hash >> 1)
+                        if node.prefix.hvalue() == (hash >> 1)
                             && exact_eq(node.key(self.options.keypos), key)
                         {
                             visit(node)?;
@@ -3601,7 +3610,7 @@ impl Table {
                 let hash = ets_hash(key);
                 storage.with_objects_hash(hash, |objects| {
                     if let Some(node) = objects.into_iter().find(|node| {
-                        node.prefix.hvalue == (hash >> 1)
+                        node.prefix.hvalue() == (hash >> 1)
                             && exact_eq(node.key(self.options.keypos), key)
                     }) {
                         visit(node)?;
@@ -3664,7 +3673,7 @@ impl Table {
                 if self.options.table_type == TableType::Set {
                     return storage.with_objects_hash_at(hash, group, |mut objects| match objects
                         .find(|object| {
-                            object.prefix.hvalue == (hash >> 1)
+                            object.prefix.hvalue() == (hash >> 1)
                                 && exact_eq(object.key(self.options.keypos), key)
                         }) {
                         Some(object) => object.copy_cons(dst),
@@ -3674,7 +3683,7 @@ impl Table {
                 storage.with_objects_hash_at(hash, group, |objects| {
                     let mut list = Term::NIL;
                     for object in objects {
-                        if object.prefix.hvalue == (hash >> 1)
+                        if object.prefix.hvalue() == (hash >> 1)
                             && exact_eq(object.key(self.options.keypos), key)
                         {
                             let copied = object.copy_out(dst)?;
@@ -3715,7 +3724,7 @@ impl Table {
                 storage.with_objects_hash_at(hash, group, |mut objects| {
                     objects
                         .find(|object| {
-                            object.prefix.hvalue == (hash >> 1)
+                            object.prefix.hvalue() == (hash >> 1)
                                 && exact_eq(object.key(self.options.keypos), key)
                         })
                         .map(|object| object.copy_out(dst))
@@ -3754,7 +3763,7 @@ impl Table {
                 let first = objects.len();
                 storage.with_objects_hash(hash, |bucket| {
                     for object in bucket {
-                        if object.prefix.hvalue == (hash >> 1)
+                        if object.prefix.hvalue() == (hash >> 1)
                             && exact_eq(object.key(self.options.keypos), key)
                         {
                             objects.push(object.copy_out(dst)?);
@@ -3783,7 +3792,7 @@ impl Table {
             Storage::Ordered(root) => Node::get(root, key, self.options.keypos).is_some(),
             Storage::Hash(storage) => storage.with_objects_hash_at(hash, group, |objects| {
                 objects.into_iter().any(|object| {
-                    object.prefix.hvalue == (hash >> 1)
+                    object.prefix.hvalue() == (hash >> 1)
                         && exact_eq(object.key(self.options.keypos), key)
                 })
             }),
@@ -3853,7 +3862,7 @@ impl Table {
         let mut found = false;
         storage.with_objects_hash_at(hash, group, |objects| {
             for object in objects {
-                if object.prefix.hvalue == (hash >> 1)
+                if object.prefix.hvalue() == (hash >> 1)
                     && exact_eq(object.key(self.options.keypos), key)
                 {
                     found = true;
@@ -3900,7 +3909,7 @@ impl Table {
                 storage.with_objects_hash_at(hash, group, |mut objects| {
                     objects
                         .find(|object| {
-                            object.prefix.hvalue == hash >> 1
+                            object.prefix.hvalue() == hash >> 1
                                 && exact_eq(object.key(self.options.keypos), key)
                         })
                         .ok_or(EtsError::BadArgCause("badkey"))?
@@ -4052,7 +4061,7 @@ impl Table {
         }
         if let Some(mut heir) = heir {
             let data = StoredTerm::copy(heir.data)?;
-            heir.data = data.term;
+            heir.data = data.term();
             self._heir_data = Some(data);
             self.options.heir = Some(heir);
         }
@@ -4103,7 +4112,7 @@ impl Table {
                 let hash = ets_hash(key);
                 storage.with_raw_objects_hash(hash, |objects| {
                     for object in objects {
-                        if object.prefix.hvalue == hash >> 1
+                        if object.prefix.hvalue() == hash >> 1
                             && exact_eq(object.key(self.options.keypos), key)
                         {
                             binaries.extend(object.refc_binaries(dst)?);
@@ -4474,7 +4483,7 @@ impl Table {
         let mut heap = VecHeap::new();
         let mut stored_values = None;
         self.try_matching_first(key, |found| {
-            let tuple_len = term_sequence(found.term).ok_or(EtsError::BadArg)?.len();
+            let tuple_len = term_sequence(found.term()).ok_or(EtsError::BadArg)?.len();
             stored_values = Some(
                 (0..tuple_len)
                     .map(|index| found.copy_element_out(index, &mut heap))
@@ -4833,7 +4842,7 @@ impl Table {
                     let mut results = None;
                     tree.update_counter(key, |found| {
                         if let Some(existing) = found {
-                            let old_words = existing.db_size_words;
+                            let old_words = existing.db_size_words();
                             let result_heap =
                                 counter_results.get_or_insert_with(|| Box::new(VecHeap::new()));
                             let mut heap = ObjectHeap::new();
@@ -4870,7 +4879,7 @@ impl Table {
                                 )?;
                                 returned
                             };
-                            let delta = existing.db_size_words as isize - old_words as isize;
+                            let delta = existing.db_size_words() as isize - old_words as isize;
                             results = Some(returned);
                             Ok((None, delta))
                         } else {
@@ -4893,7 +4902,7 @@ impl Table {
                             let stored = StoredTerm::copy_for_table::<TreePrefix>(
                                 updated, compressed, keypos, 3,
                             )?;
-                            let delta = stored.db_size_words as isize;
+                            let delta = stored.db_size_words() as isize;
                             results = Some(returned);
                             Ok((Some(stored), delta))
                         }
@@ -6014,6 +6023,19 @@ impl Registry {
             .count()
     }
 
+    /// Return the sum of OTP table/segment/lock header words across all live tables.
+    pub fn total_structure_memory_words(&self, schedulers: usize) -> usize {
+        self.tables
+            .iter()
+            .filter_map(|slot| slot.table.as_ref())
+            .map(|table| {
+                table
+                    .read()
+                    .structure_memory_words_for_schedulers(schedulers)
+            })
+            .sum()
+    }
+
     /// Count external pid, port, and reference terms retained by all table objects.
     pub fn external_identity_counts(&self) -> HashMap<(Atom, u32), usize> {
         let mut counts = HashMap::new();
@@ -7076,7 +7098,7 @@ mod stored_size_tests {
             .unwrap());
         for (name, object, shallow) in cases {
             let stored = StoredTerm::copy_for_table::<()>(object, false, 1, 1).unwrap();
-            assert_eq!(stored.shallow, shallow, "{name}: shallow flag");
+            assert_eq!(stored.shallow(), shallow, "{name}: shallow flag");
             let mut out = VecHeap::new();
             let copy = stored.copy_out(&mut out).unwrap();
             assert_eq!(
@@ -7089,8 +7111,45 @@ mod stored_size_tests {
                 let mut reserved = ObjectHeap::new();
                 stored.copy_out(&mut reserved).unwrap();
                 let words: usize = reserved.words.iter().map(|w| w.len()).sum();
-                assert_eq!(words, stored.term_size_words, "{name}: reserved words");
+                assert_eq!(words, stored.term_size_words(), "{name}: reserved words");
             }
         }
+    }
+
+    #[test]
+    fn dbterm_layout_matches_erts_word_sizes() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<StoredTerm>(), 16);
+        assert_eq!(size_of::<HashPrefix>(), 16);
+        assert_eq!(size_of::<TreePrefix>(), 24);
+        assert_eq!(size_of::<dbterm::Node<HashPrefix>>(), 32);
+        assert_eq!(size_of::<dbterm::Node<TreePrefix>>(), 40);
+        assert_eq!(size_of::<Option<HashDbTerm>>(), 8);
+        assert_eq!(size_of::<Option<TreeDbTerm>>(), 8);
+
+        let mut prefix = <HashPrefix as dbterm::Prefix>::empty();
+        assert_eq!(prefix.hvalue(), 0);
+        assert!(!prefix.pseudo_deleted());
+        prefix.set_hvalue((1u64 << 63) - 1);
+        prefix.set_pseudo_deleted(true);
+        assert_eq!(prefix.hvalue(), (1u64 << 63) - 1);
+        assert!(prefix.pseudo_deleted());
+        prefix.set_pseudo_deleted(false);
+        assert_eq!(prefix.hvalue(), (1u64 << 63) - 1);
+        assert!(!prefix.pseudo_deleted());
+
+        let mut heap = VecHeap::new();
+        let pair = TermBuilder::new(&mut heap)
+            .tuple(&[Term::small(1).unwrap(), Term::small(2).unwrap()])
+            .unwrap();
+        let before = arinsal_alloc::typed::ets_allocation_bytes();
+        let hash_row = StoredTerm::copy_for_table::<HashPrefix>(pair, false, 1, 2).unwrap();
+        let after_hash = arinsal_alloc::typed::ets_allocation_bytes();
+        assert_eq!(after_hash - before, 72);
+        let tree_row = StoredTerm::copy_for_table::<TreePrefix>(pair, false, 1, 3).unwrap();
+        let after_tree = arinsal_alloc::typed::ets_allocation_bytes();
+        assert_eq!(after_tree - after_hash, 80);
+        drop((hash_row, tree_row));
+        assert_eq!(arinsal_alloc::typed::ets_allocation_bytes(), before);
     }
 }

@@ -35,6 +35,7 @@ impl<T> TreeStack<T> {
 pub(super) struct TreeRoot {
     root: Link,
     nitems: usize,
+    memory_words: isize,
     /// Bumped by every change of the tree; the stack is only valid for the version it was made at.
     version: u64,
     stack: parking_lot::Mutex<DbTreeStack>,
@@ -55,6 +56,7 @@ impl TreeRoot {
         Self {
             root,
             nitems,
+            memory_words: 0,
             version: 0,
             stack: parking_lot::Mutex::new(DbTreeStack::new()),
         }
@@ -70,9 +72,15 @@ impl TreeRoot {
         self.nitems
     }
 
+    /// `ERTS_DB_TABLE_MEM_COUNTER_ID` of a plain tree table (`erl_db.h:167`).
+    pub(super) fn object_memory_words(&self) -> isize {
+        self.memory_words
+    }
+
     /// Detach the whole tree.
     pub(super) fn take(&mut self) -> (Link, usize) {
         self.version += 1;
+        self.memory_words = 0;
         (self.root.take(), std::mem::take(&mut self.nitems))
     }
 
@@ -93,9 +101,17 @@ impl TreeRoot {
         key_clash_fail: bool,
     ) -> InsertResult {
         self.version += 1;
+        let new_words = object.db_size_words() as isize;
         let result = tree_insert(&mut self.root, object, key, keypos, key_clash_fail);
-        if matches!(result, InsertResult::Inserted) {
-            self.nitems = self.nitems.wrapping_add(1);
+        match result {
+            InsertResult::Inserted => {
+                self.nitems = self.nitems.wrapping_add(1);
+                self.memory_words += new_words;
+            }
+            InsertResult::Replaced(old_words) => {
+                self.memory_words += new_words - old_words as isize;
+            }
+            InsertResult::Exists => {}
         }
         result
     }
@@ -123,18 +139,25 @@ impl TreeRoot {
             |old| match old {
                 Some(old) => {
                     StoredTerm::overwrite_from_input(old, term, compressed, keypos, PREFIX_WORDS)?;
-                    new_words = old.db_size_words;
+                    new_words = old.db_size_words();
                     Ok(None)
                 }
                 None => {
                     let new = StoredTerm::copy_for_table(term, compressed, keypos, PREFIX_WORDS)?;
-                    new_words = new.db_size_words;
+                    new_words = new.db_size_words();
                     Ok(Some(new))
                 }
             },
         )?;
-        if matches!(result, InsertResult::Inserted) {
-            self.nitems = self.nitems.wrapping_add(1);
+        match result {
+            InsertResult::Inserted => {
+                self.nitems = self.nitems.wrapping_add(1);
+                self.memory_words += new_words as isize;
+            }
+            InsertResult::Replaced(old_words) => {
+                self.memory_words += new_words as isize - old_words as isize;
+            }
+            InsertResult::Exists => {}
         }
         Ok((result, new_words))
     }
@@ -148,9 +171,30 @@ impl TreeRoot {
         update: impl FnOnce(Option<&mut TreeDbTerm>) -> Result<Option<TreeDbTerm>, EtsError>,
     ) -> Result<InsertResult, EtsError> {
         self.version += 1;
-        let result = tree_put(&mut self.root, key, keypos, false, update)?;
-        if matches!(result, InsertResult::Inserted) {
-            self.nitems = self.nitems.wrapping_add(1);
+        let mut new_words = 0isize;
+        let result = tree_put(&mut self.root, key, keypos, false, |found| match found {
+            Some(old) => {
+                let res = update(Some(old))?;
+                new_words = old.db_size_words() as isize;
+                Ok(res)
+            }
+            None => {
+                let res = update(None)?;
+                if let Some(ref created) = res {
+                    new_words = created.db_size_words() as isize;
+                }
+                Ok(res)
+            }
+        })?;
+        match result {
+            InsertResult::Inserted => {
+                self.nitems = self.nitems.wrapping_add(1);
+                self.memory_words += new_words;
+            }
+            InsertResult::Replaced(old_words) => {
+                self.memory_words += new_words - old_words as isize;
+            }
+            InsertResult::Exists => {}
         }
         Ok(result)
     }
@@ -173,6 +217,7 @@ impl TreeRoot {
         let removed = tree_linkout(&mut self.root, key, keypos, &mut matches)?;
         self.version += 1;
         self.nitems = self.nitems.wrapping_sub(1);
+        self.memory_words -= removed.db_size_words() as isize;
         Some(removed)
     }
 
@@ -184,7 +229,7 @@ impl TreeRoot {
         matches: impl FnMut(&StoredTerm) -> bool,
     ) -> Option<usize> {
         self.linkout_matching(key, keypos, matches)
-            .map(|removed| removed.db_size_words)
+            .map(|removed| removed.db_size_words())
     }
 
     /// The object at `key`, for an update in place.
