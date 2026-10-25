@@ -853,16 +853,12 @@ fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         return Ok(Term::NIL);
     }
     let mut heap = Heap(&mut ctx.heap);
-    let list = TermBuilder::new(&mut heap)
+    // The element words are copied straight into the cons cells, last to first, like the
+    // `CONS(hp, tup[n], res)` loop of tuple_to_list_1, with no per-element bounds check.
+    TermBuilder::new(&mut heap)
         .reserve_cons_list(len)
-        .map_err(|_| BifError::SystemLimit)?;
-    list.prepend_exact_with_tail(
-        (0..len)
-            .rev()
-            .map(|index| values.get(index).expect("tuple index")),
-        Term::NIL,
-    )
-    .map_err(|_| BifError::SystemLimit)
+        .and_then(|list| list.prepend_exact_words_with_tail(values.words(), Term::NIL))
+        .map_err(|_| BifError::SystemLimit)
 }
 fn list_to_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3789-3808 (list_to_tuple_1), OTP-29.1.1.

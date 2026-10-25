@@ -3337,18 +3337,14 @@ fn call_plain_bif_body(
     let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
     let deferred = ctx.take_deferred();
     drop(ctx);
-    if let Some(trap) = deferred {
-        let mut args = [Term::NIL; 3];
-        args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
-        return install_deferred_bif_trap(process, identity, export, &args[..arity], trap);
-    }
     let top = process.heap.heap_top_index();
     // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back in x0, and the native
     // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). The
     // fragment installs x0 in the cached X register, so the result need not also be
     // copied to the scheduler register array. Only the export trampoline, which has no
     // such test, checks collection here.
-    if let Ok(value) = &result
+    if deferred.is_none()
+        && let Ok(value) = &result
         && (!export_call
             || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
     {
@@ -3360,6 +3356,31 @@ fn call_plain_bif_body(
             process.header.htop = native_htop(process, top);
         }
         return crate::native_hooks::raw(value);
+    }
+    plain_bif_slow(process, registers, identity, export, result, deferred)
+}
+
+/// Everything after a light BIF that did not just return a value: a continuation the body
+/// deferred, an error, or a collection that is due. Out of line so the value path keeps few
+/// live registers, as erts keeps these cases in the shared fragment behind one
+/// `THE_NON_VALUE` test.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-523 (call_light_bif_shared error and
+// trap tails), OTP-29.1.1.
+#[cold]
+#[inline(never)]
+fn plain_bif_slow(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    identity: usize,
+    export: ExportDispatch,
+    result: Result<Term, arinsal_bifs::BifError>,
+    deferred: Option<Box<arinsal_bifs::DeferredTrap>>,
+) -> u64 {
+    let arity = usize::from(export.arity);
+    if let Some(trap) = deferred {
+        let mut args = [Term::NIL; 3];
+        args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
+        return install_deferred_bif_trap(process, identity, export, &args[..arity], trap);
     }
     process.reductions = process.header.fcalls;
     plain_bif_result(process, registers, export, arity, result)

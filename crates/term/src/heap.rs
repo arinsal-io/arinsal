@@ -1449,9 +1449,16 @@ impl ProcessHeap {
             return self.owners.detached.as_deref_mut()?.alloc(words);
         }
         let top = self.htop;
-        let limit = self.heap_limit_words();
         let end = top.checked_add(words)?;
-        if end > limit {
+        // `end <= stop + hidden - REDZONE` without the saturating subtraction and the
+        // `max(htop)` clamp of `heap_limit_words`: `HAlloc` tests `HEAP_LIMIT - HTOP >= n`
+        // against one precomputed pointer. A request that fails this test takes the full
+        // clamped computation, so every accepted request is accepted by it too.
+        let fits = match end.checked_add(crate::S_REDZONE) {
+            Some(guarded) => guarded <= self.stop + self.bif_hidden_words,
+            None => false,
+        };
+        if !fits && end > self.heap_limit_words() {
             return None;
         }
         let ptr = self
