@@ -290,8 +290,8 @@ impl PortSched {
 
 // Port of erts/emulator/beam/erl_port_task.c:1576-1598 (enqueue port on run-queue),
 // OTP-29.1.1.
-fn enqueue_port(port: &Arc<DriverPort>) {
-    port.host.enqueue_port(Arc::clone(port));
+fn enqueue_port(port: &DriverPort) {
+    port.host.enqueue_port(port.arc());
 }
 
 impl DriverPort {
@@ -455,7 +455,7 @@ impl DriverPort {
     /// Port of erts/emulator/beam/erl_port_task.c:1451 (erts_port_task_schedule) for a
     /// process to port signal. `None` when the port did not accept it; the callback has
     /// then run in abort mode.
-    pub fn schedule_signal(self: &Arc<Self>, sig: ProcSig) -> Option<TaskHandle> {
+    pub fn schedule_signal(&self, sig: ProcSig) -> Option<TaskHandle> {
         let task = Arc::new(PortTask {
             state: AtomicU32::new(STATE_SCHEDULED),
             flags: PT_FLG_SIG_DEP | sig.flags,
@@ -558,7 +558,7 @@ impl DriverPort {
     /// Queue a distribution command task (`ERTS_PORT_TASK_DIST_CMD`, dist.c
     /// erts_schedule_dist_command). The callback runs with the port locked on a scheduler;
     /// it is called in an abort mode when the port closes first.
-    pub fn schedule_dist_cmd(self: &Arc<Self>, callback: SigCallback) {
+    pub fn schedule_dist_cmd(&self, callback: SigCallback) {
         let task = Arc::new(PortTask {
             state: AtomicU32::new(STATE_SCHEDULED),
             flags: 0,
@@ -576,7 +576,7 @@ impl DriverPort {
     }
 
     /// Queue a timeout task (`ERTS_PORT_TASK_TIMEOUT`).
-    pub(crate) fn schedule_timeout(self: &Arc<Self>, epoch: u64) {
+    pub(crate) fn schedule_timeout(&self, epoch: u64) {
         let task = Arc::new(PortTask {
             state: AtomicU32::new(STATE_SCHEDULED),
             flags: 0,
@@ -592,7 +592,7 @@ impl DriverPort {
     /// Queue an I/O task for a fired poll registration (`ERTS_PORT_TASK_INPUT` or
     /// `ERTS_PORT_TASK_OUTPUT`, erl_check_io.c:2102 iready/oready). `false` when the port
     /// accepts no more tasks.
-    pub(crate) fn schedule_io(self: &Arc<Self>, fd: i32, dir: usize, reg: u64) -> bool {
+    pub(crate) fn schedule_io(&self, fd: i32, dir: usize, reg: u64) -> bool {
         OUTSTANDING_IO_TASKS.fetch_add(1, Ordering::AcqRel);
         let task = Arc::new(PortTask {
             state: AtomicU32::new(STATE_SCHEDULED),
@@ -612,7 +612,7 @@ impl DriverPort {
 
     // erl_port_task.c:1561-1609: mark the port as having tasks and put it in the run
     // queue unless it is queued or executing already.
-    fn activate(self: &Arc<Self>, mut act: u32) {
+    fn activate(&self, mut act: u32) {
         let add = PTS_FLG_HAVE_TASKS;
         loop {
             if act & add == add && act & (PTS_FLG_IN_RUNQ | PTS_FLG_EXEC) != 0 {

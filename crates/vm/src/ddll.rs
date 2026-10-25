@@ -7,7 +7,7 @@
 //! counts, and the deferred `ddll_no_more_references` operation.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arinsal_drv::{Driver, DriverPort};
 use arinsal_etf::OwnedTerm as O;
@@ -62,7 +62,7 @@ struct DeHandle {
     full_path: String,
     flags: u32,
     reload: Option<(String, String, u32)>,
-    ports: Vec<Weak<DriverPort>>,
+    ports: Vec<arinsal_drv::WeakPortRef>,
 }
 
 /// `erts_driver_t` in `driver_list`.
@@ -496,13 +496,13 @@ fn deliver(scheduler: &Scheduler<Process>, notices: Vec<Notice>) {
 }
 
 /// Port of erl_bif_ddll.c:123 (kill_ports_driver_unloaded).
-fn kill_ports(ports: Vec<Weak<DriverPort>>) {
-    for port in ports.iter().filter_map(Weak::upgrade) {
+fn kill_ports(ports: Vec<arinsal_drv::WeakPortRef>) {
+    for port in ports.iter().filter_map(arinsal_drv::WeakPortRef::upgrade) {
         port.fail_atom("driver_unloaded");
     }
 }
 
-fn live_ports(handle: &DeHandle) -> Vec<Weak<DriverPort>> {
+fn live_ports(handle: &DeHandle) -> Vec<arinsal_drv::WeakPortRef> {
     handle.ports.clone()
 }
 
@@ -632,7 +632,7 @@ fn try_load_locked(
     reload: u8,
     monitor: &mut u8,
     notices: &mut Vec<Notice>,
-    to_kill: &mut Vec<Weak<DriverPort>>,
+    to_kill: &mut Vec<arinsal_drv::WeakPortRef>,
 ) -> Result<(u64, O), O> {
     let soft = |tag: &str| O::Atom(tag.into());
     let Some(index) = lookup(table, name) else {
@@ -1254,7 +1254,7 @@ pub(crate) fn dereference_referenced(scheduler: &Scheduler<Process>, driver: &Ar
 }
 
 /// Port of io.c:646-648 (erts_ddll_increment_port_count, erts_ddll_reference_driver).
-pub(crate) fn port_opened(id: u64, port: &Arc<DriverPort>) {
+pub(crate) fn port_opened(id: u64, port: &DriverPort) {
     let mut table = table().lock().unwrap();
     if table.handles.contains_key(&id) {
         reference_driver(&mut table, id);
@@ -1264,13 +1264,13 @@ pub(crate) fn port_opened(id: u64, port: &Arc<DriverPort>) {
         if handle.ports.len().is_power_of_two() {
             handle.ports.retain(|port| port.strong_count() > 0);
         }
-        handle.ports.push(Arc::downgrade(port));
+        handle.ports.push(port.weak());
     }
 }
 
 /// Port of io.c:781 (driver_create_port, erts_ddll_increment_port_count) for a port made by
 /// `driver_create_port`: found through its driver instead of a handle id.
-pub(crate) fn port_opened_for(driver: &Arc<Driver>, port: &Arc<DriverPort>) {
+pub(crate) fn port_opened_for(driver: &Arc<Driver>, port: &DriverPort) {
     let id = {
         let table = table().lock().unwrap();
         table.handles.iter().find_map(|(id, handle)| {

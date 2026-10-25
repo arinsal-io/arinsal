@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arinsal_etf::OwnedTerm;
 
+use crate::PortRef;
 use crate::queue::IoQueue;
 use crate::{
     DriverPort, ExitReason, SFLG_BINARY_IO, SFLG_LINEBUF_IO, SFLG_STARTED, SFLG_TERMINATING,
@@ -107,14 +108,22 @@ const BUSY_MSGQ_READ_ONLY: usize = 0;
 static NEXT_MONITOR: AtomicU64 = AtomicU64::new(1);
 
 impl DriverPort {
-    /// The port's I/O queue (`prt->ioq`).
-    pub(crate) fn queue(&self) -> MutexGuard<'_, IoQueue> {
-        self.queue.lock()
+    /// The port's I/O queue (`prt->ioq`), allocated by the first use: a port whose driver never
+    /// queues (tcp_inet keeps its own send queue) carries only the pointer.
+    pub(crate) fn queue(&self) -> parking_lot::MappedMutexGuard<'_, IoQueue> {
+        MutexGuard::map(self.queue.lock(), |queue| {
+            &mut **queue.get_or_insert_with(Default::default)
+        })
+    }
+
+    /// Bytes in the queue without allocating it (`erts_ioq_size`).
+    pub(crate) fn queue_len(&self) -> usize {
+        self.queue.lock().as_ref().map_or(0, |queue| queue.size())
     }
 
     /// Bytes in the driver queue (`erts_ioq_size`), for `port_info(queue_size)`.
     pub fn queue_size(&self) -> usize {
-        self.queue().size()
+        self.queue_len()
     }
 
     /// `prt->os_pid` as set by `erl_drv_set_os_pid`, `-1` when unset.
@@ -289,8 +298,13 @@ impl DriverPort {
     /// are read-write: zero reads, other values write, `BUSY_MSGQ_DISABLED`
     /// disables the feature; the current limits come back in both.
     pub(crate) fn busy_msgq_limits(&self, low: Option<&mut usize>, high: Option<&mut usize>) {
-        let mut cold = self.cold.lock();
-        let limits = &mut cold.get_or_insert_with(Default::default).msgq_limits;
+        let mut stored = self.msgq.lock();
+        let mut local = MsgqLimits {
+            low: stored.0,
+            high: stored.1,
+            enabled: !self.bpq_off.load(Ordering::Acquire),
+        };
+        let limits = &mut local;
         let mut new_low = low.as_deref().copied().unwrap_or(BUSY_MSGQ_READ_ONLY);
         let mut new_high = high.as_deref().copied().unwrap_or(BUSY_MSGQ_READ_ONLY);
         let written = limits.enabled
@@ -324,7 +338,13 @@ impl DriverPort {
             }
         }
         let (cur_low, cur_high) = (limits.low, limits.high);
-        drop(cold);
+        if disabled {
+            // erts frees `prt->bpq`; nothing is kept for a port without a busy queue.
+            self.bpq_off.store(true, Ordering::Release);
+        } else if written {
+            *stored = (local.low, local.high);
+        }
+        drop(stored);
         if disabled {
             self.bpq_disabled();
         } else if written {
@@ -376,12 +396,7 @@ impl DriverPort {
     }
 
     /// Port of io.c:781 (driver_create_port) after the VM made the port.
-    pub(crate) fn create_port(
-        &self,
-        owner: u64,
-        name: &str,
-        drv_data: usize,
-    ) -> Option<std::sync::Arc<DriverPort>> {
+    pub(crate) fn create_port(&self, owner: u64, name: &str, drv_data: usize) -> Option<PortRef> {
         self.host.create_port(self, owner, name, drv_data)
     }
 
@@ -395,7 +410,9 @@ impl DriverPort {
     /// Release the queue and the port data lock when the port goes away
     /// (io.c:489 port free, stopq).
     pub(crate) fn release_resources(&self) {
-        self.queue().clear();
+        if let Some(queue) = self.queue.lock().as_mut() {
+            queue.clear();
+        }
         let pdl = self.pdl.swap(0, Ordering::AcqRel) as *mut threads::PortDataLock;
         if !pdl.is_null() {
             // Port of io.c:507-514: lock, unlock, then drop the port's reference.

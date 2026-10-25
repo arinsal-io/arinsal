@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Whether `port` names a live port, for functions that return a default.
-fn port_id_of(word: usize) -> Option<std::sync::Arc<crate::DriverPort>> {
+fn port_id_of(word: usize) -> Option<crate::PortRef> {
     crate::port_by_id(termspec::port_id(word)?)
 }
 
@@ -443,7 +443,7 @@ export! {
 
     /// Port of io.c:6821 (driver_sizeq).
     fn driver_sizeq(port: *mut c_void) -> usize {
-        port_of(port).map_or(usize::MAX, |port| port.queue().size())
+        port_of(port).map_or(usize::MAX, |port| port.queue_len())
     }
 
     /// Port of io.c:6834 (driver_enq_bin).

@@ -629,7 +629,7 @@ pub trait PortHost: Send + Sync {
     fn resume_processes(&self, port: &DriverPort, pids: Vec<u64>);
     /// Put the port, which has scheduled tasks now, on its run queue so a normal
     /// scheduler executes it (erl_port_task.c:1576-1598, erts_port_task_schedule).
-    fn enqueue_port(&self, port: Arc<DriverPort>);
+    fn enqueue_port(&self, port: PortRef);
     /// Run `ready` (an async job's `ready_async`) as auxiliary work of normal scheduler
     /// `sched_id` (erl_async.c:227 async_reply, `ERTS_SSI_AUX_WORK_ASYNC_READY`).
     fn schedule_async_ready(&self, sched_id: usize, ready: Box<dyn FnOnce() + Send>);
@@ -655,7 +655,7 @@ pub trait PortHost: Send + Sync {
         owner: u64,
         name: &str,
         drv_data: usize,
-    ) -> Option<Arc<DriverPort>>;
+    ) -> Option<PortRef>;
 }
 
 const SFLG_BINARY_IO: u32 = 1;
@@ -684,7 +684,7 @@ pub struct DriverPort {
     timer: Mutex<timer::PortTimer>,
     timer_epoch: AtomicU64,
     /// `prt->ioq`.
-    queue: Mutex<queue::IoQueue>,
+    queue: Mutex<Option<Box<queue::IoQueue>>>,
     /// `prt->port_data_lock` (a `threads::PortDataLock`), zero when none.
     pdl: AtomicUsize,
     /// Process monitors held by this port: monitor id to process-table data.
@@ -696,31 +696,88 @@ pub struct DriverPort {
     async_open: std::sync::atomic::AtomicBool,
     /// `prt->sched`: the port's task queues and scheduling flags.
     sched: port_task::PortSched,
+    /// `bpq->low` and `bpq->high`: erts allocates the busy queue with the port itself.
+    msgq: Mutex<(usize, usize)>,
+    /// The busy message queue is disabled (`prt->bpq` is NULL).
+    bpq_off: std::sync::atomic::AtomicBool,
     /// `prt->run_queue`; the VM sets it at creation ([`DriverPort::init_run_queue`]).
     run_queue: arinsal_sched::PortRunQueue,
-    /// The port as an `Arc` (`Arc::new_cyclic`).
-    me: Weak<DriverPort>,
+    /// The port record this state is embedded in.
+    me: WeakPortRef,
     /// Registry slot plus one ([`DriverPort::handle`]).
     slot: AtomicUsize,
     /// State of a [`NativeDriver`] port.
     native_data: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
-/// The parts of a [`DriverPort`] most ports never use.
-struct DrvCold {
-    monitors: ext::PidMonitors,
-    msgq_limits: ext::MsgqLimits,
-    linebuf: Option<Box<LineBuf>>,
+/// The allocation a [`DriverPort`] lives in. erts embeds the driver state in the one `Port`
+/// struct; here the VM's port record owns the `DriverPort` by value and implements this so
+/// the driver side can hold the whole port as a counted reference ([`PortRef`]).
+pub trait PortOwner: arinsal_sched::RunPort {
+    /// The driver state embedded in this port.
+    fn driver_port(&self) -> &DriverPort;
+    /// The concrete port record, for the VM to get back to its own state.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
-impl Default for DrvCold {
-    fn default() -> Self {
-        Self {
-            monitors: ext::PidMonitors::default(),
-            msgq_limits: ext::MSGQ_LIMITS_DEFAULT,
-            linebuf: None,
-        }
+/// A counted reference to a port (the `Arc` of its [`PortOwner`]).
+#[derive(Clone)]
+pub struct PortRef(Arc<dyn PortOwner>);
+
+impl PortRef {
+    /// The port record behind the reference.
+    pub fn owner(&self) -> &dyn PortOwner {
+        &*self.0
     }
+
+    /// The reference as a run-queue entry (`erts_port_task_schedule`).
+    pub fn into_run(self) -> Arc<dyn arinsal_sched::RunPort> {
+        self.0
+    }
+
+    /// A reference that does not keep the port alive.
+    pub fn downgrade(&self) -> WeakPortRef {
+        WeakPortRef(Arc::downgrade(&self.0))
+    }
+}
+
+impl std::ops::Deref for PortRef {
+    type Target = DriverPort;
+    fn deref(&self) -> &DriverPort {
+        self.0.driver_port()
+    }
+}
+
+/// A [`PortRef`] that does not keep the port alive.
+#[derive(Clone)]
+pub struct WeakPortRef(Weak<dyn PortOwner>);
+
+impl WeakPortRef {
+    /// Wrap the weak reference of a port's owner.
+    pub fn new(owner: Weak<dyn PortOwner>) -> Self {
+        Self(owner)
+    }
+
+    /// The port when it is still alive.
+    pub fn upgrade(&self) -> Option<PortRef> {
+        self.0.upgrade().map(PortRef)
+    }
+
+    /// Live references to the port.
+    pub fn strong_count(&self) -> usize {
+        self.0.strong_count()
+    }
+
+    fn same_port(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0.as_ptr().cast::<()>(), other.0.as_ptr().cast::<()>())
+    }
+}
+
+/// The parts of a [`DriverPort`] most ports never use.
+#[derive(Default)]
+struct DrvCold {
+    monitors: ext::PidMonitors,
+    linebuf: Option<Box<LineBuf>>,
 }
 
 impl DriverPort {
@@ -731,10 +788,12 @@ impl DriverPort {
 
     /// The busy message queue limits (`prt->bpq` limits): the defaults until set.
     fn msgq_limits(&self) -> ext::MsgqLimits {
-        self.cold
-            .lock()
-            .as_ref()
-            .map_or(ext::MSGQ_LIMITS_DEFAULT, |cold| cold.msgq_limits)
+        let (low, high) = *self.msgq.lock();
+        ext::MsgqLimits {
+            low,
+            high,
+            enabled: !self.bpq_off.load(Ordering::Acquire),
+        }
     }
 }
 
@@ -745,29 +804,29 @@ const CALLER_SET: u64 = 1 << 63;
 /// (`erts_drvport2port` takes the port table index), so a lookup is one array access.
 #[derive(Default)]
 struct PortSlab {
-    entries: Vec<Weak<DriverPort>>,
+    entries: Vec<Option<WeakPortRef>>,
     free: Vec<usize>,
 }
 
 impl PortSlab {
-    fn insert(&mut self, port: Weak<DriverPort>) -> usize {
+    fn insert(&mut self, port: WeakPortRef) -> usize {
         match self.free.pop() {
             Some(slot) => {
-                self.entries[slot] = port;
+                self.entries[slot] = Some(port);
                 slot
             }
             None => {
-                self.entries.push(port);
+                self.entries.push(Some(port));
                 self.entries.len() - 1
             }
         }
     }
 
-    fn remove(&mut self, slot: usize, port: *const DriverPort) {
+    fn remove(&mut self, slot: usize, port: &WeakPortRef) {
         if let Some(entry) = self.entries.get_mut(slot)
-            && std::ptr::eq(entry.as_ptr(), port)
+            && entry.as_ref().is_some_and(|e| e.same_port(port))
         {
-            *entry = Weak::new();
+            *entry = None;
             self.free.push(slot);
         }
     }
@@ -779,26 +838,28 @@ fn registry() -> &'static Mutex<PortSlab> {
 }
 
 /// Live port for a driver-side handle (`erts_drvport2port`).
-pub(crate) fn port_of(handle: DrvPortPtr) -> Option<Arc<DriverPort>> {
+pub(crate) fn port_of(handle: DrvPortPtr) -> Option<PortRef> {
     let slot = (handle as usize).checked_sub(1)?;
-    registry().lock().entries.get(slot)?.upgrade()
+    registry().lock().entries.get(slot)?.as_ref()?.upgrade()
 }
 
 /// Live port by VM port number (`erts_port_lookup_raw`).
-pub(crate) fn port_by_id(id: u64) -> Option<Arc<DriverPort>> {
+pub(crate) fn port_by_id(id: u64) -> Option<PortRef> {
     registry()
         .lock()
         .entries
         .iter()
-        .filter_map(Weak::upgrade)
+        .filter_map(|entry| entry.as_ref()?.upgrade())
         .find(|port| port.id == id)
 }
 
 impl DriverPort {
-    /// A port of `driver` with VM port id `id`; [`DriverPort::start`] runs the driver.
-    pub fn new(driver: Arc<Driver>, id: u64, host: Box<dyn PortHost>) -> Arc<DriverPort> {
+    /// The driver state of a port of `driver` with VM port id `id`, to be embedded in the
+    /// record `me` points to; [`DriverPort::start`] runs the driver.
+    pub fn new(driver: Arc<Driver>, id: u64, host: Box<dyn PortHost>, me: WeakPortRef) -> Self {
         let lock = driver.lock.is_none().then(Box::<ReentrantLock>::default);
-        let port = Arc::new_cyclic(|me| DriverPort {
+        let slot = registry().lock().insert(me.clone());
+        DriverPort {
             driver,
             id,
             host,
@@ -811,26 +872,30 @@ impl DriverPort {
             reds: AtomicI32::new(0),
             timer: Mutex::new(timer::PortTimer::None),
             timer_epoch: AtomicU64::new(0),
-            queue: Mutex::new(queue::IoQueue::default()),
+            queue: Mutex::new(None),
             pdl: AtomicUsize::new(0),
             cold: Mutex::new(None),
             os_pid: AtomicI64::new(-1),
             async_open: std::sync::atomic::AtomicBool::new(false),
+            msgq: Mutex::new((ext::MSGQ_LIMITS_DEFAULT.low, ext::MSGQ_LIMITS_DEFAULT.high)),
+            bpq_off: std::sync::atomic::AtomicBool::new(false),
             sched: port_task::PortSched::default(),
             run_queue: arinsal_sched::PortRunQueue::default(),
-            me: me.clone(),
-            slot: AtomicUsize::new(0),
+            me,
+            slot: AtomicUsize::new(slot + 1),
             native_data: OnceLock::new(),
-        });
-        let slot = registry().lock().insert(Arc::downgrade(&port));
-        port.slot.store(slot + 1, Ordering::Release);
-        port
+        }
     }
 
     /// Port of erts/emulator/beam/erl_port.h:210 (erts_init_runq_port), OTP-29.1.1: the
     /// run queue of the scheduler that creates the port (io.c:352 create_port).
     pub fn init_run_queue(&self, ix: usize) {
         self.run_queue.set(ix);
+    }
+
+    /// A reference to this port that does not keep it alive.
+    pub fn weak(&self) -> WeakPortRef {
+        self.me.clone()
     }
 
     /// VM port id.
@@ -962,7 +1027,7 @@ impl DriverPort {
     /// Drop a port whose `start` failed (io.c:747 error cleanup, no `stop`).
     pub fn abandon(&self) {
         self.state.fetch_or(SFLG_TERMINATING, Ordering::AcqRel);
-        registry().lock().remove(self.slot(), self);
+        registry().lock().remove(self.slot(), &self.me);
         self.release_resources();
     }
 
@@ -1256,7 +1321,7 @@ impl DriverPort {
             unsafe { stop(self.data()) };
             self.state.fetch_and(!SFLG_STOPPING, Ordering::AcqRel);
         }
-        registry().lock().remove(self.slot(), self);
+        registry().lock().remove(self.slot(), &self.me);
         self.release_resources();
         self.sched_free();
         true
@@ -1404,4 +1469,27 @@ pub fn errno_id(eno: i32) -> String {
 /// Keep the C driver API in the final executable.
 pub fn ensure_exports() {
     exports::retain_exports();
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn reports_driver_port_layout() {
+        use std::mem::size_of;
+        eprintln!(
+            "DriverPort={} Mutex<String>={} Mutex<PortTimer>={} Mutex<Option<Box<IoQueue>>>={} Mutex<Option<Box<DrvCold>>>={} \
+             PortSched={} WeakPortRef={} OnceLock<Arc<dyn Any>>={} Box<dyn PortHost>={}",
+            size_of::<DriverPort>(),
+            size_of::<Mutex<String>>(),
+            size_of::<Mutex<timer::PortTimer>>(),
+            size_of::<Mutex<Option<Box<queue::IoQueue>>>>(),
+            size_of::<Mutex<Option<Box<DrvCold>>>>(),
+            size_of::<port_task::PortSched>(),
+            size_of::<WeakPortRef>(),
+            size_of::<OnceLock<Arc<dyn std::any::Any + Send + Sync>>>(),
+            size_of::<Box<dyn PortHost>>(),
+        );
+    }
 }

@@ -176,7 +176,7 @@ pub(crate) fn output(
     ctx: Option<&mut RunCtx<'_, Message>>,
     caller: Pid,
     handle: &Arc<PortHandle>,
-    drv: &Arc<DriverPort>,
+    drv: &DriverPort,
     from: Pid,
     data: Term,
     flags: OutputFlags,
@@ -305,7 +305,7 @@ pub(crate) fn output(
     }
     let size = command.size();
     let task_handle = Arc::clone(handle);
-    let task_drv = Arc::clone(drv);
+    let task_drv = drv.arc();
     let bang = flags.bang;
     let callback = Box::new(move |op: SigOp| {
         // Port of erts/emulator/beam/io.c:1531 (port_sig_output), OTP-29.1.1.
@@ -408,7 +408,7 @@ fn trace_immediate_process(process: &Process, pid: Pid, name: &str) {
 }
 
 /// Queue `op` as a port task (`erts_schedule_proc2port_signal`).
-fn schedule(drv: &Arc<DriverPort>, caller: Pid, op: impl FnOnce(SigOp) -> i32 + Send + 'static) {
+fn schedule(drv: &DriverPort, caller: Pid, op: impl FnOnce(SigOp) -> i32 + Send + 'static) {
     let _ = drv.schedule_signal(ProcSig {
         caller: caller_data(caller),
         flags: 0,
@@ -421,7 +421,7 @@ fn schedule(drv: &Arc<DriverPort>, caller: Pid, op: impl FnOnce(SigOp) -> i32 + 
 /// Run `op` now when the port is free (`try_imm_drv_call`), else as a port task whose
 /// callback gets the abort reason. `Err` is `ERTS_PORT_OP_DROPPED`/`BADARG`.
 fn imm_or_schedule(
-    drv: &Arc<DriverPort>,
+    drv: &DriverPort,
     caller: Pid,
     asynchronous: bool,
     where_: &'static str,
@@ -447,7 +447,7 @@ pub(crate) fn control(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     caller: Pid,
-    drv: &Arc<DriverPort>,
+    drv: &DriverPort,
     op: u32,
     bytes: smallvec::SmallVec<[u8; 256]>,
 ) -> Result<Term, VmError> {
@@ -471,7 +471,7 @@ pub(crate) fn control(
     let (reply, reference) = Reply::new(caller, runtime.scheduler_arc()?);
     // Port of erts/emulator/beam/io.c:1203 (erts_schedule_proc2port_signal), OTP-29.1.1.
     set_save_end(process, ctx);
-    let task_drv = Arc::clone(drv);
+    let task_drv = drv.arc();
     let _ = drv.schedule_signal(ProcSig {
         caller: caller_data(caller),
         flags: 0,
@@ -521,7 +521,7 @@ pub(crate) fn control_light(
     let opcode = u32::try_from(op.as_small()?).ok()?;
     let id = port_id(process, *port)?;
     let runtime = process.runtime?;
-    let drv = Arc::clone(runtime.ports.get(id)?.driver.get()?);
+    let drv = runtime.ports.get(id)?.drv_port()?;
     if drv.sched_flags() & PTS_FLGS_FORCE_SCHEDULE_OP != 0 {
         return None;
     }
@@ -649,7 +649,7 @@ pub(crate) fn exit(
     ctx: Option<&mut RunCtx<'_, Message>>,
     caller: Pid,
     handle: &Arc<PortHandle>,
-    drv: &Arc<DriverPort>,
+    drv: &DriverPort,
     bang: bool,
     from: Pid,
     reason: OwnedTerm,
@@ -717,7 +717,7 @@ pub(crate) fn exit_for_halt(
     from: Pid,
     reason: OwnedTerm,
 ) {
-    let Some(drv) = handle.driver.get().cloned() else {
+    let Some(drv) = handle.drv_port() else {
         return;
     };
     match drv.try_imm_call(0, true, "close", REDS_EXIT as u32) {
@@ -750,7 +750,7 @@ pub(crate) fn exit_for_process_termination(
     from: Pid,
     reason: OwnedTerm,
 ) {
-    let Some(drv) = handle.driver.get().cloned() else {
+    let Some(drv) = handle.drv_port() else {
         return;
     };
     schedule(&drv, from, move |op| {
@@ -772,7 +772,7 @@ pub(crate) fn connect(
     process: &Process,
     caller: Pid,
     handle: &Arc<PortHandle>,
-    drv: &Arc<DriverPort>,
+    drv: &DriverPort,
     from: Pid,
     pid: Pid,
 ) {
@@ -822,7 +822,7 @@ pub(crate) fn connect(
 pub(crate) fn link(
     runtime: &'static crate::process::Runtime,
     handle: &Arc<PortHandle>,
-    drv: &Arc<DriverPort>,
+    drv: &DriverPort,
     pid: Pid,
     linked: bool,
 ) -> bool {
@@ -877,12 +877,7 @@ pub(crate) fn link(
 /// Port of erts/emulator/beam/io.c:2850 (`erts_port_demonitor`) and :2836
 /// (`port_sig_demonitor`), OTP-29.1.1. The origin monitor is already gone; this
 /// deletes the target half on the port, or drops it when the signal is aborted.
-pub(crate) fn demonitor(
-    handle: &Arc<PortHandle>,
-    drv: &Arc<DriverPort>,
-    caller: Pid,
-    reference: u64,
-) {
+pub(crate) fn demonitor(handle: &Arc<PortHandle>, drv: &DriverPort, caller: Pid, reference: u64) {
     let task_handle = Arc::clone(handle);
     let _ = imm_or_schedule(drv, caller, true, "demonitor", move |op| {
         if op == SigOp::Exec {
