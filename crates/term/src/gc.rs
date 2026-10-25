@@ -1413,7 +1413,7 @@ impl ProcessHeap {
         let major = self.collection_is_major() || self.minor_attempt_fails(mature_words);
         let stack = self.stack_words();
         let source_words = self
-            .htop
+            .htop_index()
             .checked_add(fragments)
             .ok_or(TermError::SystemLimit)?;
         // Port of erl_gc.c:642 (`young_gen_usage` heap top) and erl_gc.c:1875
@@ -1456,10 +1456,12 @@ impl ProcessHeap {
                 self.new_block(old_capacity, arinsal_alloc::typed::ErtsAlcType::OLD_HEAP);
         }
         let to_words = self.new_block(capacity, arinsal_alloc::typed::ErtsAlcType::HEAP);
+        // The cursors are addresses in the block that is about to move out: read them first.
+        let (from_htop, from_stop) = (self.htop_index(), self.stop_index());
         let mut from = FromSpace {
             words: std::mem::replace(&mut self.words, to_words),
-            htop: self.htop_index(),
-            stop: self.stop_index(),
+            htop: from_htop,
+            stop: from_stop,
             old_words: if major {
                 std::mem::take(&mut self.old_words)
             } else {
@@ -1768,7 +1770,7 @@ impl ProcessHeap {
         self.abandoned = false;
         self.fragment_words = 0;
         let exact = self
-            .htop
+            .htop_index()
             .saturating_add(S_RESERVED)
             .saturating_add(self.stack_words());
         if exact != self.words.len() {
@@ -1789,7 +1791,7 @@ impl ProcessHeap {
     ) -> Result<bool, TermError> {
         let stack = self.stack_words();
         let need_after = self
-            .htop
+            .htop_index()
             .saturating_add(min_free)
             .saturating_add(stack)
             .saturating_add(S_RESERVED);
@@ -1943,7 +1945,8 @@ impl ProcessHeap {
         messages: Option<&mut [GcMessageRoot<'_>]>,
     ) {
         let stack = self.stack_words();
-        debug_assert!(new_words >= self.htop_index().saturating_add(stack));
+        let htop_index = self.htop_index();
+        debug_assert!(new_words >= htop_index.saturating_add(stack));
         let prev_len = self.words.len();
         if new_words == prev_len {
             return;
@@ -1956,7 +1959,7 @@ impl ProcessHeap {
         let prev_stop = self.stop_index();
         let prev_stack = prev_heap + prev_stop * 8;
         let prev_stack_end = prev_heap + prev_len * 8;
-        let heap_end = prev_heap + self.htop_index() * 8;
+        let heap_end = prev_heap + htop_index * 8;
         // Shrinking discards the tail, so the stack has to sit inside the kept prefix first.
         if new_words < prev_len {
             let new_stop = new_words - stack;
@@ -1966,6 +1969,8 @@ impl ProcessHeap {
         }
         self.words.realloc(new_words);
         let new_heap = self.words.as_ptr() as usize;
+        // The block may have moved: the cursors are addresses, so set them again from indexes.
+        self.set_htop_index(htop_index);
         if new_heap != prev_heap {
             rebase_binref_chains(
                 self,
@@ -1998,7 +2003,7 @@ impl ProcessHeap {
         if new_heap != prev_heap {
             offset_young_objects(
                 self.words.as_ptr().cast::<u64>().cast_mut(),
-                self.htop_index(),
+                htop_index,
                 prev_heap,
                 heap_end,
                 new_heap,
