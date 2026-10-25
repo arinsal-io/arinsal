@@ -229,6 +229,13 @@ impl Emitter {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Creates an emitter with a reserved instruction buffer.
+    pub fn with_capacity(words: usize) -> Self {
+        Self {
+            words: Vec::with_capacity(words),
+        }
+    }
     /// Returns the current instruction count.
     pub fn len(&self) -> usize {
         self.words.len()

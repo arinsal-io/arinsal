@@ -169,7 +169,6 @@ impl MapFragments {
         let mut memory = CodeMemory::new(bytes.len().max(4))?;
         let offset = memory.alloc(bytes.len().max(4))?;
         memory.write_bytes(offset, &bytes)?;
-        memory.flush_all()?;
         Ok(Self {
             memory,
             get_element_offset: labels[&get_element],

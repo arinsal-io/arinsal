@@ -4,6 +4,11 @@
 //! macOS single-mapping path (task 3 of `docs/arch/beamasm-port.md`).
 
 use core::fmt;
+use std::sync::{Arc, Mutex, OnceLock};
+
+const JIT_BLOCK_SIZE: usize = DEFAULT_CAPACITY;
+type JitPool = Arc<Mutex<Vec<Option<CodeMemory>>>>;
+static JIT_BLOCKS: OnceLock<JitPool> = OnceLock::new();
 
 unsafe extern "C" {
     #[cfg(target_os = "macos")]
@@ -119,16 +124,20 @@ pub struct CodeMemory {
     capacity: usize,
     used: usize,
     blocks: Vec<CodeBlock>,
+    base_offset: usize,
+    backing_index: usize,
+    backing: Option<JitPool>,
+    free_ranges: Vec<CodeBlock>,
 }
 
-// SAFETY: The mapping is uniquely owned, and moving its owner does not change the mapping.
+// SAFETY: Moving the handle preserves its stable mapping; shared-region access is serialized by its mutex.
 unsafe impl Send for CodeMemory {}
 
-// SAFETY: Shared access only reads metadata or invokes immutable code; mutation requires `&mut self`.
+// SAFETY: Shared metadata is immutable, and the backing mapping is never unmapped while a handle exists.
 unsafe impl Sync for CodeMemory {}
 
 impl CodeMemory {
-    /// Reserves a new region of executable memory with at least `capacity` bytes.
+    /// Reserves a code span of at least `capacity` bytes from the process JIT allocator.
     ///
     /// The actual capacity is rounded up to the system page size.
     pub fn new(capacity: usize) -> Result<Self, ExecError> {
@@ -136,6 +145,58 @@ impl CodeMemory {
             return Err(ExecError::InvalidSize("capacity must be non-zero"));
         }
 
+        let page_size = get_page_size();
+        let mapped_size = (capacity + (page_size - 1)) & !(page_size - 1);
+        let pools = JIT_BLOCKS
+            .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+            .clone();
+        let mut blocks = pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (index, backing) in blocks.iter_mut().enumerate() {
+            let Some(backing) = backing else {
+                continue;
+            };
+            let block = backing.allocate(mapped_size);
+            match block {
+                Ok(block) => {
+                    let ptr = backing.ptr.wrapping_add(block.offset);
+                    return Ok(Self::from_shared(pools.clone(), index, block, ptr));
+                }
+                Err(ExecError::OutOfMemory { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        // Port of erts/emulator/beam/jit/beam_jit_main.cpp:216 and
+        // erts/emulator/asmjit/core/jitallocator.cpp (JitAllocator_new_block), OTP-29.1.1.
+        let index = if let Some(index) = blocks.iter().position(Option::is_none) {
+            blocks[index] = Some(Self::new_mapping(JIT_BLOCK_SIZE.max(mapped_size))?);
+            index
+        } else {
+            blocks.push(Some(Self::new_mapping(JIT_BLOCK_SIZE.max(mapped_size))?));
+            blocks.len() - 1
+        };
+        let region = blocks[index].as_mut().expect("new JIT block was inserted");
+        let block = region.allocate(mapped_size)?;
+        let ptr = region.ptr.wrapping_add(block.offset);
+        Ok(Self::from_shared(pools.clone(), index, block, ptr))
+    }
+
+    fn from_shared(backing: JitPool, backing_index: usize, block: CodeBlock, ptr: *mut u8) -> Self {
+        Self {
+            ptr,
+            capacity: block.size,
+            used: 0,
+            blocks: Vec::new(),
+            base_offset: block.offset,
+            backing_index,
+            backing: Some(backing),
+            free_ranges: Vec::new(),
+        }
+    }
+
+    fn new_mapping(capacity: usize) -> Result<Self, ExecError> {
         let page_size = get_page_size();
         let mapped_size = (capacity + (page_size - 1)) & !(page_size - 1);
 
@@ -180,6 +241,10 @@ impl CodeMemory {
             capacity: mapped_size,
             used: 0,
             blocks: Vec::new(),
+            base_offset: 0,
+            backing_index: 0,
+            backing: None,
+            free_ranges: Vec::new(),
         })
     }
 
@@ -189,10 +254,29 @@ impl CodeMemory {
         Ok(block.offset)
     }
 
-    /// Bump-allocates a code block with 16-byte alignment, returning a `CodeBlock`.
+    /// Allocates a code block with 16-byte alignment, reusing released spans when available.
+    // Port of erts/emulator/asmjit/core/jitallocator.cpp:888-1009 (JitAllocator::alloc/release), OTP-29.1.1.
     pub fn allocate(&mut self, size: usize) -> Result<CodeBlock, ExecError> {
         if size == 0 {
             return Err(ExecError::InvalidSize("block size must be non-zero"));
+        }
+
+        let reusable = self.free_ranges.iter().position(|range| range.size >= size);
+        if let Some(index) = reusable {
+            let range = self.free_ranges.remove(index);
+            let block = CodeBlock {
+                offset: range.offset,
+                size,
+            };
+            let remainder = range.size - size;
+            if remainder != 0 {
+                self.free_ranges.push(CodeBlock {
+                    offset: range.offset + size,
+                    size: remainder,
+                });
+            }
+            self.blocks.push(block);
+            return Ok(block);
         }
 
         let aligned_offset = (self.used + (CODE_ALIGNMENT - 1)) & !(CODE_ALIGNMENT - 1);
@@ -214,6 +298,30 @@ impl CodeMemory {
         };
         self.blocks.push(block);
         Ok(block)
+    }
+
+    fn release(&mut self, offset: usize, size: usize) {
+        self.blocks
+            .retain(|block| block.offset != offset || block.size != size);
+        self.free_ranges.push(CodeBlock { offset, size });
+        self.free_ranges.sort_unstable_by_key(|range| range.offset);
+        let mut merged: Vec<CodeBlock> = Vec::with_capacity(self.free_ranges.len());
+        for range in self.free_ranges.drain(..) {
+            if let Some(last) = merged.last_mut()
+                && last.offset + last.size == range.offset
+            {
+                last.size += range.size;
+            } else {
+                merged.push(range);
+            }
+        }
+        self.free_ranges = merged;
+        while let Some(last) = self.free_ranges.last()
+            && last.offset + last.size == self.used
+        {
+            self.used = last.offset;
+            self.free_ranges.pop();
+        }
     }
 
     /// Modifies code memory in the range `[offset, offset + len)` using closure `f`.
@@ -389,7 +497,7 @@ impl CodeMemory {
             self.capacity
         );
         // SAFETY: offset is within capacity.
-        self.ptr.wrapping_add(offset)
+        self.as_ptr().wrapping_add(offset)
     }
 }
 
@@ -407,7 +515,7 @@ impl<F: Copy> Entry<'_, F> {
     pub fn get(&self) -> F {
         // SAFETY: The entry is within an allocated mapped block; lifetime remains tied to memory.
         unsafe {
-            let ptr = self.memory.ptr.add(self.offset);
+            let ptr = self.memory.ptr_at(self.offset);
             core::mem::transmute_copy(&ptr)
         }
     }
@@ -415,7 +523,21 @@ impl<F: Copy> Entry<'_, F> {
 
 impl Drop for CodeMemory {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
+        if let Some(backing) = &self.backing {
+            let mut blocks = backing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(region) = blocks[self.backing_index].as_mut() {
+                region.release(self.base_offset, self.capacity);
+            }
+            let empty_count = blocks
+                .iter()
+                .filter(|region| region.as_ref().is_some_and(|region| region.used == 0))
+                .count();
+            if empty_count > 1 && blocks[self.backing_index].is_some() {
+                blocks[self.backing_index] = None;
+            }
+        } else if !self.ptr.is_null() {
             // SAFETY: self.ptr was returned by mmap with capacity self.capacity and has not been unmapped.
             unsafe {
                 libc::munmap(self.ptr.cast(), self.capacity);

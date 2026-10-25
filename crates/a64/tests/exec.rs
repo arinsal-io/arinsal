@@ -2,6 +2,17 @@
 
 use arinsal_a64::exec::{CODE_ALIGNMENT, CodeMemory, ExecError};
 
+#[test]
+fn code_memory_spans_share_allocator_block() {
+    let first = CodeMemory::new(4096).expect("allocate first code span");
+    let second = CodeMemory::new(4096).expect("allocate second code span");
+    let first_ptr = first.as_ptr() as usize;
+    let second_ptr = second.as_ptr() as usize;
+
+    assert_ne!(first_ptr, second_ptr);
+    assert!(first_ptr.abs_diff(second_ptr) < 32 * 1024 * 1024);
+}
+
 /// The primary acceptance test required for Task p3_exec:
 /// 1. Write the 2-instruction function `add x0, x0, x1; ret` (words `0x8b010000`, `0xd65f03c0`) into a block.
 /// 2. Call it as `extern "C" fn(u64, u64) -> u64`, check 2+3=5.
