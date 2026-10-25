@@ -240,7 +240,7 @@ pub(super) fn parse_class(term: Term) -> Option<Class> {
     }
 }
 
-fn empty_trace_handle(class: Class) -> Term {
+pub(crate) fn empty_trace_handle(class: Class) -> Term {
     let class = match class {
         Class::Error => 0,
         Class::Exit => 1,
@@ -271,6 +271,30 @@ pub(super) fn bif_error(
         return VmError::Unsupported(format!("exception function atom {function}"));
     };
     bif_error_with_atoms(p, module, function, module_atom, function_atom, args, error)
+}
+
+/// The exception of a `raise/3` whose stacktrace is already in `ftrace`.
+// Port of erts/emulator/beam/bif.c (raise_3 stores the stacktrace in `c_p->ftrace`), OTP-29.1.1.
+pub(crate) fn raise_from_ftrace(
+    p: &mut Process,
+    class: Class,
+    reason: Term,
+    trace: Term,
+) -> VmError {
+    if let Some(cold) = p.cold.as_mut() {
+        cold.nif_pending = None;
+    }
+    if let Some(pending) = p.cold_mut().bif_trap.take() {
+        p.set_gc_enabled(pending.gc_was_enabled);
+    }
+    VmError::Trap(Trap {
+        class,
+        reason,
+        trace: Some(trace),
+        top: None,
+        raw_rethrow: false,
+        untrappable: false,
+    })
 }
 
 pub(super) fn bif_error_with_atoms(

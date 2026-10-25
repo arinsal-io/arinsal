@@ -1223,6 +1223,17 @@ pub fn run_native(
         && raised.fvalue == process.header.exc.fvalue
     {
         return Err(VmError::Trap(raised.trap));
+    } else if process.header.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
+        && process.header.exc.ftrace != 0
+    {
+        // `raise/3` with an immediate stacktrace left everything in the failure words.
+        let freason = process.header.exc.freason;
+        let reason = crate::native_hooks::from_raw(process.header.exc.fvalue);
+        let trace = crate::native_hooks::from_raw(process.header.exc.ftrace);
+        process.header.exc.ftrace = 0;
+        let class =
+            crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
+        return Err(exceptions::raise_from_ftrace(process, class, reason, trace));
     } else if process.header.exc.freason != 0
         && let Some(failure) = process
             .cold

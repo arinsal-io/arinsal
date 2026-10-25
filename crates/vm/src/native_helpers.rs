@@ -3928,6 +3928,13 @@ fn set_native_bif_export_error(
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
+    // A `raise/3` with an immediate stacktrace is complete in `freason`, `fvalue` and `ftrace`,
+    // as in erts: no record of the failing call is kept for it.
+    if process.header.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
+        && process.header.exc.ftrace != 0
+    {
+        return;
+    }
     let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
     process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Export(export),
@@ -4096,62 +4103,74 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     // Port of beam_common.c (`save_stacktrace`), OTP-29.1.1: retain the raw raising PC;
     // `build_stacktrace` resolves it against the active code ranges when the trace is requested.
     let native_pc = (raising_pc != 0).then_some(raising_pc);
-    // An inline guard BIF (`element/2`, `hd/1`, ...) names itself as the top frame, with its
-    // arguments in X0.. Port of beam_asm_global.cpp (emit_raise_badarg passes the BIF's
-    // `ErtsCodeMFA` to `raise_exception`), OTP-29.1.1.
-    let inline_top = inline_bif_top(registers.tmp_mem[7]);
-    let top = inline_top.or_else(|| {
-        process
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.native_trap.as_ref())
-            .filter(|native_trap| {
-                native_trap.freason == process.header.exc.freason
-                    && native_trap.fvalue == process.header.exc.fvalue
-            })
-            .and_then(|native_trap| match native_trap.trap.top.as_ref() {
-                Some(crate::stacktrace::TopFrame::BifRegisters {
-                    module,
-                    function,
-                    arity,
-                    info,
-                }) => Some(crate::stacktrace::TopFrame::BifRegisters {
-                    module: *module,
-                    function: *function,
-                    arity: *arity,
-                    info: *info,
-                }),
-                _ => None,
-            })
-    });
-    // A failing BIF in the argument registers is the top frame, with its arguments read
-    // from the registers (erts `save_stacktrace` reads them from `reg`), no copies.
-    let top = top.or_else(|| failure_top(process, &registers.x_reg_array));
-    // A failure carrying only error_info (bit syntax) names the raising function, as the
-    // scheduler's native exit does for the same failure.
-    let top = top.or_else(|| {
-        let info = process
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.native_error_info.as_deref().cloned())?;
-        let arity =
-            crate::native_function_at(raising_pc).map_or(0, |function| i64::from(function.arity));
-        Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
-            Term::small(arity),
-            Box::new(info),
-        ))
-    });
-    if top.is_none() {
-        note_owned_failure(process);
-    }
+    // A `raise/3` carries the trace the catch must see, so no top frame is looked for.
+    let explicit = take_explicit_raise(process);
+    let top = if explicit.is_some() {
+        None
+    } else {
+        // An inline guard BIF (`element/2`, `hd/1`, ...) names itself as the top frame, with its
+        // arguments in X0.. Port of beam_asm_global.cpp (emit_raise_badarg passes the BIF's
+        // `ErtsCodeMFA` to `raise_exception`), OTP-29.1.1.
+        let inline_top = inline_bif_top(registers.tmp_mem[7]);
+        let top = inline_top.or_else(|| {
+            process
+                .cold
+                .as_ref()
+                .and_then(|cold| cold.native_trap.as_ref())
+                .filter(|native_trap| {
+                    native_trap.freason == process.header.exc.freason
+                        && native_trap.fvalue == process.header.exc.fvalue
+                })
+                .and_then(|native_trap| match native_trap.trap.top.as_ref() {
+                    Some(crate::stacktrace::TopFrame::BifRegisters {
+                        module,
+                        function,
+                        arity,
+                        info,
+                    }) => Some(crate::stacktrace::TopFrame::BifRegisters {
+                        module: *module,
+                        function: *function,
+                        arity: *arity,
+                        info: *info,
+                    }),
+                    _ => None,
+                })
+        });
+        // A failing BIF in the argument registers is the top frame, with its arguments read
+        // from the registers (erts `save_stacktrace` reads them from `reg`), no copies.
+        let top = top.or_else(|| failure_top(process, &registers.x_reg_array));
+        // A failure carrying only error_info (bit syntax) names the raising function, as the
+        // scheduler's native exit does for the same failure.
+        let top = top.or_else(|| {
+            let info = process
+                .cold
+                .as_ref()
+                .and_then(|cold| cold.native_error_info.as_deref().cloned())?;
+            let arity = crate::native_function_at(raising_pc)
+                .map_or(0, |function| i64::from(function.arity));
+            Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
+                Term::small(arity),
+                Box::new(info),
+            ))
+        });
+        if top.is_none() {
+            note_owned_failure(process);
+        }
+        top
+    };
     // `erlang:raise/3` already built the list the catch must see (`bif.c:1643`).
     // A native walk would name `eval_external_handler` instead of that list.
-    let trace = if let Some(trace) = take_explicit_raise(process) {
-        let Ok(trace) = crate::stacktrace::save_explicit(process, class, trace, 8) else {
+    let trace = if let Some(trace) = explicit {
+        if trace == Term::NIL {
+            // `raise(Class, Reason, [])`, which is what `throw/1` compiles to: the empty
+            // trace of that class, with nothing saved.
+            crate::exceptions::empty_trace_handle(class)
+        } else if let Ok(trace) = crate::stacktrace::save_explicit(process, class, trace, 8) {
+            trace
+        } else {
             process.sync_native_header();
             return 0;
-        };
-        trace
+        }
     } else {
         let Ok(trace) = crate::stacktrace::save_lazy(
             process,
