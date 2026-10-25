@@ -1413,11 +1413,7 @@ pub(super) fn raised_args(term: Term) -> Option<Term> {
 
 /// Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise).
 pub(super) fn set_raw_class(_p: &mut Process, term: Term, class: Class) -> bool {
-    let code = match class {
-        Class::Error => 1,
-        Class::Exit => 2,
-        Class::Throw => 3,
-    };
+    let code = class_to_freason(Some(class));
     if let Some(fields) = arinsal_term::term_sequence(term)
         && fields.len() == 3
         && fields[0]
@@ -2566,7 +2562,7 @@ mod tests {
         let trace = StackTrace::allocate(
             &mut heap,
             StackTraceFields {
-                freason: 1,
+                freason: arinsal_beamasm::exc::EXC_ERROR,
                 pc: 0x1000,
                 current: 0,
                 depth: 1,
@@ -2577,7 +2573,8 @@ mod tests {
         .unwrap();
         let mut layout_matches = false;
         trace.with_bignum_digits_mut(|digits| {
-            layout_matches = digits == [1, 0x1000, 0, 1, 2, 0x2000, 0];
+            layout_matches =
+                digits == [arinsal_beamasm::exc::EXC_ERROR, 0x1000, 0, 1, 2, 0x2000, 0];
         });
         assert!(layout_matches);
 
