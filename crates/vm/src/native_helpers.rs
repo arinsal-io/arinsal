@@ -3440,6 +3440,24 @@ fn plain_bif_word_slow(
     deferred: Option<Box<arinsal_bifs::DeferredTrap>>,
     error: Option<arinsal_bifs::BifError>,
 ) -> u64 {
+    // `raise/3` from a word body: the failure words are complete (class code, `EXF_ARGLIST`,
+    // an immediate stacktrace in `ftrace`), so nothing is decoded or written again.
+    if word == arinsal_term::THE_NON_VALUE
+        && deferred.is_none()
+        && error.is_none()
+        && process.header.exc.freason & arinsal_beamasm::exc::EXF_ARGLIST != 0
+        && process.header.exc.ftrace != 0
+        && crate::native_hooks::from_raw(process.header.exc.ftrace).is_immed()
+        && !process.heap.gc_after_bif_desired()
+    {
+        crate::stacktrace::clear_pending_top(process);
+        process.reductions = process.header.fcalls;
+        if let Some(cold) = process.cold.as_mut() {
+            cold.explicit_raise = None;
+        }
+        process.sync_native_header();
+        return 0;
+    }
     // A migrated body left its failure in the process' exit words; an adapted `Result` body
     // left it in the context. Decoding clears the words, which are rewritten below.
     let error = if word == arinsal_term::THE_NON_VALUE {
