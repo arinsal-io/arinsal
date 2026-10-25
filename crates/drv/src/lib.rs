@@ -678,7 +678,7 @@ pub struct DriverPort {
     caller: AtomicU64,
     lock: Option<Box<ReentrantLock>>,
     /// `open_port` name (`prt->name`), set by [`DriverPort::start`].
-    name: Mutex<String>,
+    name: Mutex<Option<Box<str>>>,
     /// `prt->reds`: reductions used by the running task (`erl_drv_consume_timeslice`).
     reds: AtomicI32,
     timer: Mutex<timer::PortTimer>,
@@ -697,7 +697,8 @@ pub struct DriverPort {
     /// `prt->sched`: the port's task queues and scheduling flags.
     sched: port_task::PortSched,
     /// `bpq->low` and `bpq->high`: erts allocates the busy queue with the port itself.
-    msgq: Mutex<(usize, usize)>,
+    msgq_low: AtomicUsize,
+    msgq_high: AtomicUsize,
     /// The busy message queue is disabled (`prt->bpq` is NULL).
     bpq_off: std::sync::atomic::AtomicBool,
     /// `prt->run_queue`; the VM sets it at creation ([`DriverPort::init_run_queue`]).
@@ -788,10 +789,9 @@ impl DriverPort {
 
     /// The busy message queue limits (`prt->bpq` limits): the defaults until set.
     fn msgq_limits(&self) -> ext::MsgqLimits {
-        let (low, high) = *self.msgq.lock();
         ext::MsgqLimits {
-            low,
-            high,
+            low: self.msgq_low.load(Ordering::Acquire),
+            high: self.msgq_high.load(Ordering::Acquire),
             enabled: !self.bpq_off.load(Ordering::Acquire),
         }
     }
@@ -868,7 +868,7 @@ impl DriverPort {
             state: AtomicU32::new(0),
             caller: AtomicU64::new(0),
             lock,
-            name: Mutex::new(String::new()),
+            name: Mutex::new(None),
             reds: AtomicI32::new(0),
             timer: Mutex::new(timer::PortTimer::None),
             timer_epoch: AtomicU64::new(0),
@@ -877,7 +877,8 @@ impl DriverPort {
             cold: Mutex::new(None),
             os_pid: AtomicI64::new(-1),
             async_open: std::sync::atomic::AtomicBool::new(false),
-            msgq: Mutex::new((ext::MSGQ_LIMITS_DEFAULT.low, ext::MSGQ_LIMITS_DEFAULT.high)),
+            msgq_low: AtomicUsize::new(ext::MSGQ_LIMITS_DEFAULT.low),
+            msgq_high: AtomicUsize::new(ext::MSGQ_LIMITS_DEFAULT.high),
             bpq_off: std::sync::atomic::AtomicBool::new(false),
             sched: port_task::PortSched::default(),
             run_queue: arinsal_sched::PortRunQueue::default(),
@@ -896,6 +897,11 @@ impl DriverPort {
     /// A reference to this port that does not keep it alive.
     pub fn weak(&self) -> WeakPortRef {
         self.me.clone()
+    }
+
+    /// The `open_port` name (`prt->name`), empty before `start`.
+    pub(crate) fn command_name(&self) -> String {
+        self.name.lock().as_deref().unwrap_or_default().to_owned()
     }
 
     /// VM port id.
@@ -997,7 +1003,7 @@ impl DriverPort {
     /// Port of io.c:542 (erts_open_driver, the `start` call). `command` is the
     /// whole `open_port` name; `caller` the raw pid term of the opening process.
     pub fn start(&self, command: &str, caller: u64) -> Result<(), StartError> {
-        *self.name.lock() = command.to_owned();
+        *self.name.lock() = Some(command.into());
         let mut command = CString::new(command)
             .map_err(|_| StartError::Badarg)?
             .into_bytes_with_nul();
@@ -1479,10 +1485,10 @@ mod layout_tests {
     fn reports_driver_port_layout() {
         use std::mem::size_of;
         eprintln!(
-            "DriverPort={} Mutex<String>={} Mutex<PortTimer>={} Mutex<Option<Box<IoQueue>>>={} Mutex<Option<Box<DrvCold>>>={} \
+            "DriverPort={} Mutex<Option<Box<str>>>={} Mutex<PortTimer>={} Mutex<Option<Box<IoQueue>>>={} Mutex<Option<Box<DrvCold>>>={} \
              PortSched={} WeakPortRef={} OnceLock<Arc<dyn Any>>={} Box<dyn PortHost>={}",
             size_of::<DriverPort>(),
-            size_of::<Mutex<String>>(),
+            size_of::<Mutex<Option<Box<str>>>>(),
             size_of::<Mutex<timer::PortTimer>>(),
             size_of::<Mutex<Option<Box<queue::IoQueue>>>>(),
             size_of::<Mutex<Option<Box<DrvCold>>>>(),

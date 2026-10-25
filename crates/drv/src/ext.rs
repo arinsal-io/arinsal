@@ -298,10 +298,11 @@ impl DriverPort {
     /// are read-write: zero reads, other values write, `BUSY_MSGQ_DISABLED`
     /// disables the feature; the current limits come back in both.
     pub(crate) fn busy_msgq_limits(&self, low: Option<&mut usize>, high: Option<&mut usize>) {
-        let mut stored = self.msgq.lock();
+        // The cold lock orders writers; readers load the two words.
+        let stored = self.cold.lock();
         let mut local = MsgqLimits {
-            low: stored.0,
-            high: stored.1,
+            low: self.msgq_low.load(Ordering::Acquire),
+            high: self.msgq_high.load(Ordering::Acquire),
             enabled: !self.bpq_off.load(Ordering::Acquire),
         };
         let limits = &mut local;
@@ -342,7 +343,8 @@ impl DriverPort {
             // erts frees `prt->bpq`; nothing is kept for a port without a busy queue.
             self.bpq_off.store(true, Ordering::Release);
         } else if written {
-            *stored = (local.low, local.high);
+            self.msgq_low.store(local.low, Ordering::Release);
+            self.msgq_high.store(local.high, Ordering::Release);
         }
         drop(stored);
         if disabled {

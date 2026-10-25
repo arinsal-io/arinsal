@@ -249,7 +249,7 @@ struct PortState {
     graceful_close: bool,
     send_closed: bool,
     exit_complete: bool,
-    suspended: Vec<Pid>,
+    suspended: Suspended,
     closed: bool,
     broken: bool,
     in_output: bool,
@@ -258,6 +258,22 @@ struct PortState {
     /// payload, then the `Ack` frame once `Go` arrived). `None` once the handshake is done.
     #[allow(clippy::box_collection)]
     handshake: Option<Box<Vec<u8>>>,
+}
+
+/// Processes suspended on a busy port: none until the port is busy.
+// Boxed on purpose: the pointer is 8 bytes where an empty `Vec` is 24.
+#[allow(clippy::box_collection)]
+#[derive(Default)]
+struct Suspended(Option<Box<Vec<Pid>>>);
+
+impl Suspended {
+    fn push(&mut self, pid: Pid) {
+        self.0.get_or_insert_with(Default::default).push(pid);
+    }
+
+    fn take(&mut self) -> Vec<Pid> {
+        self.0.take().map(|pids| *pids).unwrap_or_default()
+    }
 }
 
 #[derive(Clone)]
@@ -416,6 +432,39 @@ struct SpawnStart {
     keep_input: bool,
 }
 
+// An `Arc<PortHandle>` (16 bytes of counts plus the handle) should stay within the 640-byte size
+// class of the system allocator; the next class up is 768 bytes for every port.
+const _: () = assert!(std::mem::size_of::<PortHandle>() <= 624);
+
+/// The connected process of a port (`prt->connected`), one word.
+struct OwnerCell(AtomicU64);
+
+impl OwnerCell {
+    fn new(pid: Pid) -> Self {
+        Self(AtomicU64::new(pid.data()))
+    }
+
+    fn get(&self) -> Pid {
+        Pid::from_data(self.0.load(Ordering::Acquire))
+    }
+
+    fn set(&self, pid: Pid) {
+        self.0.store(pid.data(), Ordering::Release);
+    }
+}
+
+/// The rarely used parts of a [`PortHandle`].
+#[derive(Default)]
+struct HandleCold {
+    /// Processes this driver port monitors (`driver_monitor_process`): monitor id to pid.
+    drv_monitors: SmallMap<Pid>,
+    /// The `open_port` waiting for `erl_drv_init_ack`: reference id and opener.
+    async_open: Option<(u64, Pid)>,
+    /// `port->common.u.alive.reg->name`, shared with the register table entry.
+    reg_word: Option<Arc<AtomicU32>>,
+    halt_progress: Option<HaltProgress>,
+}
+
 /// State retained for a live child or fd port.
 pub(crate) struct PortHandle {
     id: u64,
@@ -423,7 +472,7 @@ pub(crate) struct PortHandle {
     /// The spawn/fd driver's own data (`prt->drv_data` of sys_drivers.c): set only for ports
     /// with a worker thread.
     spawn: Option<Box<SpawnData>>,
-    owner: Mutex<Pid>,
+    owner: OwnerCell,
     links: Mutex<PidSet>,
     monitors: Mutex<SmallMap<PortMonitor>>,
     /// OS pid of the child: `OS_PID_PENDING` until the forker's `Go`, 0 for ports without one.
@@ -437,16 +486,12 @@ pub(crate) struct PortHandle {
     data: Mutex<PortData>,
     /// `tcp_inet` / `tcp_inet6` port. I/O is owned by `inet_drv`, not a stdio worker.
     /// Dynamically loaded (`erl_ddll`) driver port.
-    driver: OnceLock<arinsal_drv::DriverPort>,
-    /// Processes this driver port monitors (`driver_monitor_process`): monitor id to pid.
-    drv_monitors: Mutex<SmallMap<Pid>>,
-    /// The `open_port` waiting for `erl_drv_init_ack`: reference id and opener.
-    async_open: Mutex<Option<Box<(u64, Pid)>>>,
-    /// `port->common.u.alive.reg->name`, shared with the register table entry.
-    reg_word: OnceLock<Arc<AtomicU32>>,
+    driver: Option<arinsal_drv::DriverPort>,
+    /// State most ports never need, allocated on first use (erts keeps these as null pointers
+    /// in the port or its common part).
+    cold: Mutex<Option<Box<HandleCold>>>,
     /// Set when the port is removed, before its name is erased.
     reg_closing: AtomicBool,
-    halt_progress: Mutex<Option<HaltProgress>>,
     /// The driver's own state (`prt->drv_data`): the tcp or udp socket, or the ram_file data
     /// from `rfile_start` until `rfile_stop`.
     drv_data: Mutex<Option<Arc<crate::ram_file_drv::RamPort>>>,
@@ -764,11 +809,11 @@ impl PortHandle {
 
     /// The driver port of a port made by a driver (everything but ram_file and spawn ports).
     pub(crate) fn drv_port(&self) -> Option<arinsal_drv::PortRef> {
-        self.driver.get().map(arinsal_drv::DriverPort::arc)
+        self.driver.as_ref().map(arinsal_drv::DriverPort::arc)
     }
 
     pub(crate) fn owner_pid(&self) -> Pid {
-        *self.owner.lock()
+        self.owner.get()
     }
     pub(crate) fn scheduler(&self) -> Arc<Scheduler<Process>> {
         Arc::clone(&self.scheduler)
@@ -804,7 +849,7 @@ impl PortHandle {
     /// state) until `tcp_inet_stop`.
     pub(crate) fn tcp_driver_data(&self) -> Option<Arc<crate::inet_drv::Sock>> {
         self.driver
-            .get()?
+            .as_ref()?
             .native_data::<crate::inet_drv::Sock>()
             .filter(|sock| !sock.stopped())
     }
@@ -816,10 +861,22 @@ impl PortHandle {
     /// The word shared with the register table entry, allocated by the first registration
     /// (`port->common.u.alive.reg` is NULL until then).
     pub(crate) fn reg_word(&self) -> Arc<AtomicU32> {
-        Arc::clone(
-            self.reg_word
-                .get_or_init(|| Arc::new(AtomicU32::new(crate::register::NO_REG_ATOM))),
-        )
+        self.with_cold(|cold| {
+            Arc::clone(
+                cold.reg_word
+                    .get_or_insert_with(|| Arc::new(AtomicU32::new(crate::register::NO_REG_ATOM))),
+            )
+        })
+    }
+
+    /// Runs `f` on the cold state, allocating it first.
+    fn with_cold<R>(&self, f: impl FnOnce(&mut HandleCold) -> R) -> R {
+        f(self.cold.lock().get_or_insert_with(Default::default))
+    }
+
+    /// Runs `f` on the cold state when it exists.
+    fn peek_cold<R>(&self, f: impl FnOnce(&mut HandleCold) -> R) -> Option<R> {
+        self.cold.lock().as_deref_mut().map(f)
     }
 
     pub(crate) fn reg_closing(&self) -> bool {
@@ -832,7 +889,11 @@ impl PortHandle {
     }
 
     pub(crate) fn registered_atom(&self) -> Option<arinsal_term::Atom> {
-        let index = self.reg_word.get()?.load(Ordering::Acquire);
+        let index = self.peek_cold(|cold| {
+            cold.reg_word
+                .as_ref()
+                .map(|word| word.load(Ordering::Acquire))
+        })??;
         (index != crate::register::NO_REG_ATOM).then_some(arinsal_term::Atom(index))
     }
 
@@ -841,10 +902,11 @@ impl PortHandle {
     }
 
     pub(crate) fn take_registered_atom(&self) -> Option<arinsal_term::Atom> {
-        let index = self
-            .reg_word
-            .get()?
-            .swap(crate::register::NO_REG_ATOM, Ordering::AcqRel);
+        let index = self.peek_cold(|cold| {
+            cold.reg_word
+                .as_ref()
+                .map(|word| word.swap(crate::register::NO_REG_ATOM, Ordering::AcqRel))
+        })??;
         (index != crate::register::NO_REG_ATOM).then_some(arinsal_term::Atom(index))
     }
 
@@ -854,16 +916,16 @@ impl PortHandle {
 
     fn track_halt(&self, progress: HaltProgress) {
         progress.port_started();
-        let mut tracked = self.halt_progress.lock();
+        let mut cold = self.cold.lock();
         if self.state.lock().exit_complete {
             progress.port_finished();
         } else {
-            *tracked = Some(progress);
+            cold.get_or_insert_with(Default::default).halt_progress = Some(progress);
         }
     }
 
     fn finish_halt(&self) {
-        if let Some(progress) = self.halt_progress.lock().take() {
+        if let Some(progress) = self.peek_cold(|cold| cold.halt_progress.take()).flatten() {
             progress.port_finished();
         }
     }
@@ -1745,7 +1807,7 @@ fn start(
     // erl_bif_port.c:102: the spawn driver uses ERL_DRV_FLAG_USE_INIT_ACK, so the opener gets a
     // reference now and `{Ref, Port | Errno}` once the forker's `Go` arrived.
     let reference = runtime.next_ref();
-    *handle.async_open.lock() = Some(Box::new((reference, ctx.pid())));
+    handle.with_cold(|cold| cold.async_open = Some((reference, ctx.pid())));
     runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
@@ -1817,6 +1879,7 @@ fn start_driver(
         false,
         scheduler,
         *runtime as *const crate::process::Runtime as usize,
+        None,
     )?;
     runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
@@ -1863,9 +1926,10 @@ fn start_dyn_driver(
         io.parallelism,
         Arc::clone(scheduler),
         runtime as *const crate::process::Runtime as usize,
+        Some((Arc::clone(&driver), runtime)),
     )?;
     install_poll_backend();
-    let drv_port = install_driver(&handle, runtime, Arc::clone(&driver));
+    let drv_port = handle.drv_port().expect("driver state embedded");
     drv_port.init_run_queue(scheduler.current_run_queue());
     let _ = handle.runtime.set(runtime);
     if let Some(handle_id) = handle_id {
@@ -1929,7 +1993,7 @@ fn start_dyn_driver(
         // Port of erts/emulator/beam/erl_bif_port.c:102: the opener gets a
         // reference and the port, or the error, in `{Ref, Result}` from `erl_drv_init_ack`.
         let reference = runtime.next_ref();
-        *handle.async_open.lock() = Some(Box::new((reference, ctx.pid())));
+        handle.with_cold(|cold| cold.async_open = Some((reference, ctx.pid())));
         drv_port.expect_init_ack();
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         return TermBuilder::new(&mut heap)
@@ -2329,7 +2393,7 @@ impl arinsal_drv::PortHost for DrvHost {
         if !handle.scheduler.lookup(target) {
             return false;
         }
-        handle.drv_monitors.lock().insert(monitor, target);
+        handle.with_cold(|cold| cold.drv_monitors.insert(monitor, target));
         let _ = self
             .runtime
             .publish_proc_flag(target, arinsal_sched::proc_flags::PORTS);
@@ -2338,7 +2402,7 @@ impl arinsal_drv::PortHost for DrvHost {
 
     fn demonitor_process(&self, port: &arinsal_drv::DriverPort, monitor: u64) {
         if let Some(handle) = self.handle(port.id()) {
-            handle.drv_monitors.lock().remove(&monitor);
+            handle.peek_cold(|cold| cold.drv_monitors.remove(&monitor));
         }
     }
 
@@ -2387,10 +2451,11 @@ impl arinsal_drv::PortHost for DrvHost {
             false,
             Arc::clone(scheduler),
             runtime as *const crate::process::Runtime as usize,
+            Some((Arc::clone(creator.driver()), runtime)),
         )
         .ok()?;
         let driver = Arc::clone(creator.driver());
-        let drv_port = install_driver(&handle, runtime, Arc::clone(&driver));
+        let drv_port = handle.drv_port().expect("driver state embedded");
         drv_port.init_run_queue(scheduler.current_run_queue());
         drv_port.adopt(drv_data);
         crate::ddll::port_opened_for(&driver, &drv_port);
@@ -2408,7 +2473,8 @@ impl arinsal_drv::PortHost for DrvHost {
 /// on failure (the opener is no longer linked to a port that failed to open).
 // Port of erts/emulator/beam/io.c:2912 (init_ack_send_reply), OTP-29.1.1.
 fn send_open_reply(handle: &PortHandle, result: Result<(), Term>) {
-    let Some((reference, opener)) = handle.async_open.lock().take().map(|open| *open) else {
+    let Some((reference, opener)) = handle.peek_cold(|cold| cold.async_open.take()).flatten()
+    else {
         return;
     };
     let Some(port_term) = Term::port(handle.id) else {
@@ -2665,9 +2731,10 @@ pub(crate) fn alloc_inet_port(
         false,
         Arc::clone(scheduler),
         runtime as *const crate::process::Runtime as usize,
+        Some((driver, runtime)),
     )
     .map_err(|_| InetPortAllocError::NoMemory)?;
-    let drv_port = install_driver(&handle, runtime, driver);
+    let drv_port = handle.drv_port().expect("driver state embedded");
     drv_port.init_run_queue(scheduler.current_run_queue());
     let _ = handle.runtime.set(runtime);
     attach(&handle, &drv_port);
@@ -2775,7 +2842,7 @@ fn signal_port_exit(handle: &PortHandle, id: u64, reason: Term) {
     let Some(port) = Term::port(id) else {
         return;
     };
-    let owner = *handle.owner.lock();
+    let owner = handle.owner.get();
     if let (Ok(port), Ok(reason)) = (Message::copy_from(port), Message::copy_from(reason)) {
         let _ = handle.scheduler.signal(
             owner,
@@ -2863,50 +2930,31 @@ fn make_handle(
         scheduler,
         trace_scope,
         true,
+        None,
     )
-}
-
-/// Port handle of a loaded driver: no wake pipe, so a full port table does not need two
-/// descriptors per port.
-#[allow(clippy::too_many_arguments)]
-/// Embed the driver state of `driver` in `handle` (the one `Port` struct of erl_port.h).
-fn install_driver(
-    handle: &Arc<PortHandle>,
-    runtime: &'static crate::process::Runtime,
-    driver: Arc<arinsal_drv::Driver>,
-) -> arinsal_drv::PortRef {
-    let me: std::sync::Weak<PortHandle> = Arc::downgrade(handle);
-    let me: std::sync::Weak<dyn arinsal_drv::PortOwner> = me;
-    let host = DrvHost {
-        runtime,
-        own: Arc::downgrade(handle),
-    };
-    let _ = handle.driver.set(arinsal_drv::DriverPort::new(
-        driver,
-        handle.id,
-        Box::new(host),
-        arinsal_drv::WeakPortRef::new(me),
-    ));
-    handle.drv_port().expect("driver state just installed")
 }
 
 impl arinsal_sched::RunPort for PortHandle {
     fn run_queue(&self) -> &arinsal_sched::PortRunQueue {
         arinsal_sched::RunPort::run_queue(
-            self.driver.get().expect("only driver ports are run-queued"),
+            self.driver
+                .as_ref()
+                .expect("only driver ports are run-queued"),
         )
     }
 
     fn execute(&self) -> arinsal_sched::PortExecution {
         arinsal_sched::RunPort::execute(
-            self.driver.get().expect("only driver ports are run-queued"),
+            self.driver
+                .as_ref()
+                .expect("only driver ports are run-queued"),
         )
     }
 }
 
 impl arinsal_drv::PortOwner for PortHandle {
     fn driver_port(&self) -> &arinsal_drv::DriverPort {
-        self.driver.get().expect("a PortOwner has driver state")
+        self.driver.as_ref().expect("a PortOwner has driver state")
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -2914,6 +2962,9 @@ impl arinsal_drv::PortOwner for PortHandle {
     }
 }
 
+/// Port handle of a loaded driver, with the driver state embedded (the one `Port` struct of
+/// erl_port.h): no wake pipe, so a full port table does not need two descriptors per port.
+#[allow(clippy::too_many_arguments)]
 fn make_driver_handle(
     id: u64,
     owner: Pid,
@@ -2921,6 +2972,7 @@ fn make_driver_handle(
     parallelism: bool,
     scheduler: Arc<Scheduler<Process>>,
     trace_scope: usize,
+    driver: Option<(Arc<arinsal_drv::Driver>, &'static crate::process::Runtime)>,
 ) -> Result<Arc<PortHandle>, VmError> {
     make_handle_with(
         id,
@@ -2934,6 +2986,7 @@ fn make_driver_handle(
         scheduler,
         trace_scope,
         false,
+        driver,
     )
 }
 
@@ -2950,13 +3003,14 @@ fn make_handle_with(
     scheduler: Arc<Scheduler<Process>>,
     trace_scope: usize,
     wake: bool,
+    driver: Option<(Arc<arinsal_drv::Driver>, &'static crate::process::Runtime)>,
 ) -> Result<Arc<PortHandle>, VmError> {
     let waker = wake.then(|| Arc::new(crate::check_io::Waker::default()));
     if let Some(fd) = out.as_ref() {
         set_nonblock(fd.as_raw_fd());
     }
     let out_fd = out;
-    let handle = Arc::new(PortHandle {
+    let handle = Arc::new_cyclic(|me: &std::sync::Weak<PortHandle>| PortHandle {
         id,
         started_interval: AtomicU64::new(0),
         spawn: (out_fd.is_some() || waker.is_some()).then(|| {
@@ -2968,7 +3022,7 @@ fn make_handle_with(
                 limits,
             })
         }),
-        owner: Mutex::new(owner),
+        owner: OwnerCell::new(owner),
         links: Mutex::new(PidSet::from_one(owner)),
         monitors: Mutex::new(SmallMap::default()),
         os_pid: AtomicU32::new(os_pid),
@@ -2984,7 +3038,7 @@ fn make_handle_with(
             graceful_close: false,
             send_closed: false,
             exit_complete: false,
-            suspended: Vec::new(),
+            suspended: Suspended::default(),
             closed: false,
             broken: false,
             in_output: false,
@@ -2994,12 +3048,20 @@ fn make_handle_with(
         scheduler,
         trace_scope,
         data: Mutex::new(PortData::undefined()),
-        driver: OnceLock::new(),
-        drv_monitors: Mutex::new(SmallMap::default()),
-        async_open: Mutex::new(None),
-        reg_word: OnceLock::new(),
+        driver: driver.map(|(driver, runtime)| {
+            let owner_ref: std::sync::Weak<dyn arinsal_drv::PortOwner> = me.clone();
+            arinsal_drv::DriverPort::new(
+                driver,
+                id,
+                Box::new(DrvHost {
+                    runtime,
+                    own: me.clone(),
+                }),
+                arinsal_drv::WeakPortRef::new(owner_ref),
+            )
+        }),
+        cold: Mutex::new(None),
         reg_closing: AtomicBool::new(false),
-        halt_progress: Mutex::new(None),
         drv_data: Mutex::new(None),
         runtime: OnceLock::new(),
     });
@@ -3174,7 +3236,7 @@ fn refresh_busy(st: &mut PortState, limits: &BusyLimits) -> Vec<Pid> {
         st.busy_msgq = false;
     }
     if !st.busy_port && !st.busy_msgq {
-        std::mem::take(&mut st.suspended)
+        st.suspended.take()
     } else {
         Vec::new()
     }
@@ -3304,7 +3366,7 @@ fn flush_output(handle: &PortHandle) -> Vec<Pid> {
                 st.busy_msgq = false;
                 st.outq_mut().clear();
                 became_inactive = std::mem::replace(&mut st.profile_active, false);
-                woken.extend(std::mem::take(&mut st.suspended));
+                woken.extend(st.suspended.take());
                 break;
             }
         }
@@ -3345,7 +3407,7 @@ fn drain_pending(handle: &PortHandle) -> Vec<Pid> {
         if failed {
             let mut st = handle.state.lock();
             st.broken = true;
-            woken.extend(std::mem::take(&mut st.suspended));
+            woken.extend(st.suspended.take());
             return woken;
         }
     }
@@ -3805,7 +3867,7 @@ fn eof_exit(
         st.busy_msgq = false;
         st.outq_mut().clear();
         st.pending_mut().clear();
-        std::mem::take(&mut st.suspended)
+        st.suspended.take()
     };
     wake_suspended(scheduler, woken);
     close_worker_fds(read_fd);
@@ -4090,7 +4152,7 @@ fn port_control(
     else {
         return Ok(atom("badarg"));
     };
-    if let Some(drv_port) = handle.driver.get() {
+    if let Some(drv_port) = handle.driver.as_ref() {
         return driver_control(process, ctx, caller, drv_port, op, data);
     }
     Ok(atom("badarg"))
@@ -4120,7 +4182,7 @@ fn port_call(
     let Some(op) = op.as_small().and_then(|n| u32::try_from(n).ok()) else {
         return Ok(atom("badarg"));
     };
-    if let Some(drv_port) = handle.driver.get() {
+    if let Some(drv_port) = handle.driver.as_ref() {
         // Port of erts/emulator/beam/io.c:4618 (erts_port_call).
         let Ok(owned) = to_owned(data) else {
             return Ok(atom("badarg"));
@@ -4242,7 +4304,7 @@ fn port_command(
                 // spawn/fd drivers do not, so `force` is `notsup` there.
                 let soft_busy = handle
                     .driver
-                    .get()
+                    .as_ref()
                     .is_some_and(|d| d.driver().flags() & ERL_DRV_FLAG_SOFT_BUSY != 0);
                 if !soft_busy {
                     return Err(notsup());
@@ -4522,7 +4584,7 @@ fn release_io(handle: &PortHandle) {
     // rfile_stop: release the ram_file_drv port data.
     handle.take_ram_file_data();
     // Port of erts/emulator/beam/io.c:3698 (terminate_port) for a dynamic driver.
-    if let Some(drv_port) = handle.driver.get()
+    if let Some(drv_port) = handle.driver.as_ref()
         && drv_port.terminate()
         && !drv_port.driver().is_native()
     {
@@ -4542,7 +4604,7 @@ fn release_io(handle: &PortHandle) {
         {
             st.exit_complete = true;
         }
-        std::mem::take(&mut st.suspended)
+        st.suspended.take()
     };
     wake_suspended(&handle.scheduler, waiters);
     poke(handle);
@@ -4705,7 +4767,7 @@ pub(crate) fn halt_reap_ports(runtime: &'static crate::process::Runtime, progres
             continue;
         }
         handle.track_halt(progress.clone());
-        if handle.driver.get().is_some() {
+        if handle.driver.as_ref().is_some() {
             drv_sig::exit_for_halt(
                 runtime,
                 Arc::clone(&handle),
@@ -4745,7 +4807,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
     }
     let old_owner = handle.owner_pid();
     handle.links.lock().insert(pid);
-    *handle.owner.lock() = pid;
+    handle.owner.set(pid);
     let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS);
     if notify.is_none()
         && old_owner != pid
@@ -4815,18 +4877,23 @@ pub(crate) fn owner_exit(
             .handles()
             .into_iter()
             .flat_map(|handle| {
-                let Some(drv_port) = handle.driver.get() else {
+                let Some(drv_port) = handle.driver.as_ref() else {
                     return Vec::new();
                 };
-                let mut monitors = handle.drv_monitors.lock();
-                let ids: Vec<u64> = monitors
-                    .iter()
-                    .filter(|(_, pid)| **pid == owner)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in &ids {
-                    monitors.remove(id);
-                }
+                let ids: Vec<u64> = handle
+                    .peek_cold(|cold| {
+                        let ids: Vec<u64> = cold
+                            .drv_monitors
+                            .iter()
+                            .filter(|(_, pid)| **pid == owner)
+                            .map(|(id, _)| *id)
+                            .collect();
+                        for id in &ids {
+                            cold.drv_monitors.remove(id);
+                        }
+                        ids
+                    })
+                    .unwrap_or_default();
                 ids.into_iter().map(|id| (drv_port.arc(), id)).collect()
             })
             .collect()
@@ -4848,8 +4915,8 @@ pub(crate) fn owner_exit(
             .iter()
             .filter_map(|handle| {
                 let id = handle.id;
-                let is_owner = *handle.owner.lock() == owner;
-                let linked = if handle.driver.get().is_some() {
+                let is_owner = handle.owner.get() == owner;
+                let linked = if handle.driver.as_ref().is_some() {
                     handle.links.lock().contains(&owner)
                 } else {
                     handle.links.lock().remove(&owner)
@@ -4859,7 +4926,7 @@ pub(crate) fn owner_exit(
             .collect::<Vec<_>>()
     };
     for (port_id, handle) in affected {
-        if handle.driver.get().is_some() {
+        if handle.driver.as_ref().is_some() {
             let exit_reason = to_owned(reason).unwrap_or_else(|_| OwnedTerm::Atom("normal".into()));
             drv_sig::exit_for_process_termination(runtime, handle, owner, exit_reason);
             continue;
@@ -4942,7 +5009,7 @@ pub(crate) fn monitor(
     name: Option<arinsal_term::Atom>,
     monitored: bool,
 ) -> Result<bool, VmError> {
-    if monitored && let Some(drv_port) = handle.driver.get() {
+    if monitored && let Some(drv_port) = handle.driver.as_ref() {
         // Port of erts/emulator/beam/io.c:6787 (erts_port_monitor): the request is a port
         // signal, handled once the callback holding the port lock has returned.
         return drv_port
@@ -5015,10 +5082,12 @@ pub(crate) fn driver_monitoring_ports(process: &Process, pid: Pid) -> Vec<Term> 
         .into_iter()
         .filter(|handle| {
             handle
-                .drv_monitors
-                .lock()
-                .values()
-                .any(|monitored| *monitored == pid)
+                .peek_cold(|cold| {
+                    cold.drv_monitors
+                        .values()
+                        .any(|monitored| *monitored == pid)
+                })
+                .unwrap_or(false)
         })
         .map(|handle| handle.id)
         .collect();
@@ -5092,7 +5161,7 @@ fn output_command(
     data: Term,
     tracer: Option<&Process>,
 ) {
-    if let Some(drv_port) = handle.driver.get() {
+    if let Some(drv_port) = handle.driver.as_ref() {
         // Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `Port ! {Pid, {command, D}}`.
         let mut pieces = Vec::new();
         if io_pieces(data, &mut pieces).is_none() {
@@ -5288,7 +5357,7 @@ fn send_message_inner(
         signal_badsig(&handle, id);
         return Ok(sent());
     };
-    let from_connected = *handle.owner.lock() == from;
+    let from_connected = handle.owner.get() == from;
     let drv = handle.drv_port();
     if let Some(drv) = &drv
         && (parts[1] == atom("close")
@@ -5578,7 +5647,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     let name = TermBuilder::new(&mut heap)
         .string_to_list(&handle.name)
         .map_err(|e| VmError::Unsupported(format!("port info name: {e:?}")))?;
-    let connected = handle.owner.lock().to_term().ok_or_else(badarg)?;
+    let connected = handle.owner.get().to_term().ok_or_else(badarg)?;
     let links = TermBuilder::new(&mut heap)
         .list_from_iter(handle.links.lock().iter().filter_map(|pid| pid.to_term()))
         .map_err(|e| VmError::Unsupported(format!("port info links: {e:?}")))?;
@@ -5588,7 +5657,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         .values()
         .filter_map(|monitor| monitor.pid.to_term())
         .collect::<Vec<_>>();
-    let drv_port = handle.driver.get();
+    let drv_port = handle.driver.as_ref();
     let process_monitors = drv_port
         .map(|drv| drv.monitored())
         .unwrap_or_default()

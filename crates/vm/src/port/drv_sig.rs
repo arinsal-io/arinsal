@@ -364,7 +364,7 @@ pub(crate) fn command_light(
     let caller = process.self_pid?;
     let id = port_id(process, *port)?;
     let handle = process.runtime.as_ref()?.ports.get(id)?;
-    let drv = handle.driver.get()?;
+    let drv = handle.driver.as_ref()?;
     if !drv.driver().is_native()
         || drv.sched_flags() & (PTS_FLGS_BUSY | PTS_FLG_EXIT | PTS_FLGS_FORCE_SCHEDULE_OP) != 0
     {
@@ -798,10 +798,10 @@ pub(crate) fn connect(
             return REDS_CONNECT;
         }
         handle.links.lock().insert(pid);
-        *handle.owner.lock() = pid;
+        handle.owner.set(pid);
         if !runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS) {
             handle.links.lock().remove(&pid);
-            *handle.owner.lock() = from;
+            handle.owner.set(from);
             signal_badsig(handle, handle.id);
             return REDS_CONNECT;
         }
