@@ -3,7 +3,6 @@
 use super::*;
 use arinsal_bifs::BifError;
 use arinsal_term::{MagicRef, global_atoms};
-use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -73,7 +72,7 @@ const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
 const BINARY_TO_LIST_CONTINUATION: &str = "erlang:binary_to_list/1";
 const TERM_TO_BINARY_CONTINUATION: &str = "erts_internal:term_to_binary_trap/1";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
-const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
+pub(crate) const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
 const MAPS_MERGE_CONTINUATION: &str = "maps:merge_trap/1";
 const MAPS_KEYS_CONTINUATION: &str = "maps:keys/1";
 const MAPS_VALUES_CONTINUATION: &str = "maps:values/1";
@@ -1001,6 +1000,13 @@ const ENTRIES: &[Entry] = &[
         arity: 0,
         continuation: PTAB_LIST_CONTINUATION,
         handler: processes,
+    },
+    Entry {
+        module: "erlang",
+        function: "ports",
+        arity: 0,
+        continuation: PTAB_LIST_CONTINUATION,
+        handler: ports,
     },
     Entry {
         module: "erts_debug",
@@ -2258,7 +2264,11 @@ pub(crate) fn execute_named(
                     ),
                     // BIF_TRAP keeps at most three arguments (bif.h:316-326); a four-argument
                     // BIF such as re:internal_run/4 traps to a three-argument export.
-                    arity.min(3),
+                    if continuation == PTAB_LIST_CONTINUATION {
+                        1
+                    } else {
+                        arity.min(3)
+                    },
                 )
             };
             let reverse_args = (continuation == REVERSE_CONTINUATION)
@@ -2277,6 +2287,8 @@ pub(crate) fn execute_named(
                 callee,
                 args: if let Some(trap_args) = reverse_args {
                     [trap_args[0], trap_args[1], Term::NIL]
+                } else if continuation == PTAB_LIST_CONTINUATION {
+                    [process.x[0], Term::NIL, Term::NIL]
                 } else if resumed {
                     [args[0], args[1], args[2]]
                 } else {
@@ -4088,10 +4100,16 @@ fn finish_term_encode(
 
 /// Progress of one `erlang:processes/0` call.
 struct PtabListState {
-    /// Consistent snapshot of the table taken when the BIF started.
-    pids: SmallVec<[arinsal_sched::Pid; 16]>,
+    /// Process-table listing and its invocation marker in the shared deletion list.
+    snapshot: Option<arinsal_sched::PtabListSnapshot<Process>>,
+    scheduler: Arc<arinsal_sched::Scheduler<Process>>,
+    /// Process identifiers to cons onto the caller heap after the scan.
+    pids: Vec<Term>,
+    /// Per-chunk table intervals used to reconcile deleted records.
+    chunk_intervals: Vec<u64>,
     /// Next table index to inspect.
     next_index: u32,
+    deleted_done: bool,
 }
 
 // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list) and :1281 (ptab_list_continue),
@@ -4099,7 +4117,7 @@ struct PtabListState {
 // reduction scanned in chunks of 1000, 75 result conses per reduction.
 fn processes(
     process: &mut Process,
-    _args: &[Term],
+    args: &[Term],
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     _restore_gc: bool,
@@ -4112,88 +4130,393 @@ fn processes(
     if let Some(state) = state {
         let state = Arc::clone(state);
         let list = state
-            .downcast_ref::<Mutex<PtabListState>>()
+            .downcast_ref::<Mutex<PtabListContinuation>>()
             .ok_or(BifError::BADARG)?;
         let mut list = list.lock().map_err(|_| BifError::SystemLimit)?;
-        let (done, spent) = scan_process_table(&mut list, table_max, reds_left);
-        if !done {
-            drop(list);
-            return Ok(HandlerResult::Yield {
-                continuation: PTAB_LIST_CONTINUATION,
-                state,
-                reductions: spent,
-            });
-        }
-        let pid_terms = list
-            .pids
-            .iter()
-            .filter_map(|pid| pid.to_term())
-            .collect::<Vec<_>>();
-        drop(list);
-        return finish_processes(process, pid_terms, spent);
+        let accumulator = args.first().copied().unwrap_or(Term::NIL);
+        set_ptab_accumulator(process, accumulator)?;
+        return match &mut *list {
+            PtabListContinuation::Processes(list) => resume_processes(
+                process,
+                list,
+                table_max,
+                reds_left,
+                Arc::clone(&state),
+                accumulator,
+            ),
+            PtabListContinuation::Ports(list) => resume_ports(
+                process,
+                list,
+                table_max,
+                reds_left,
+                Arc::clone(&state),
+                accumulator,
+            ),
+        };
     }
 
-    let mut list = {
-        let runtime = process.runtime.as_ref().ok_or(BifError::BADARG)?;
-        let mut pids = SmallVec::<[arinsal_sched::Pid; 16]>::from(runtime.process_pids());
-        pids.sort_by_key(|pid| crate::process::pid_table_index(*pid));
-        PtabListState {
-            pids,
-            next_index: 0,
-        }
+    let runtime = process.runtime.as_ref().ok_or(BifError::BADARG)?;
+    let scheduler = runtime.scheduler_arc().map_err(|_| BifError::SystemLimit)?;
+    let list = PtabListState {
+        snapshot: None,
+        scheduler,
+        pids: Vec::new(),
+        chunk_intervals: Vec::new(),
+        next_index: 0,
+        deleted_done: false,
     };
+    set_ptab_accumulator(process, Term::NIL)?;
+    let state = magic_binary_state(
+        Mutex::new(PtabListContinuation::Processes(list)),
+        ERTS_PTAB_LIST_STATE_SIZE,
+    );
+    let list_cell = state
+        .downcast_ref::<Mutex<PtabListContinuation>>()
+        .ok_or(BifError::BADARG)?;
+    let mut list = list_cell.lock().map_err(|_| BifError::SystemLimit)?;
     if reds_left < MIN_START_REDS {
         return Ok(HandlerResult::Yield {
             continuation: PTAB_LIST_CONTINUATION,
-            state: magic_binary_state(Mutex::new(list), ERTS_PTAB_LIST_STATE_SIZE),
+            state: Arc::clone(&state),
             reductions: 1,
         });
     }
-    let (done, spent) = scan_process_table(&mut list, table_max, reds_left);
-    if !done {
-        return Ok(HandlerResult::Yield {
-            continuation: PTAB_LIST_CONTINUATION,
-            state: magic_binary_state(Mutex::new(list), ERTS_PTAB_LIST_STATE_SIZE),
-            reductions: spent,
-        });
+    match &mut *list {
+        PtabListContinuation::Processes(list) => run_process_list(
+            process,
+            list,
+            table_max,
+            reds_left,
+            Arc::clone(&state),
+            Term::NIL,
+        ),
+        PtabListContinuation::Ports(_) => unreachable!(),
     }
-    let pid_terms = list
-        .pids
-        .iter()
-        .filter_map(|pid| pid.to_term())
-        .collect::<Vec<_>>();
-    finish_processes(process, pid_terms, spent)
 }
 
+// Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
 fn scan_process_table(list: &mut PtabListState, table_max: u32, reds_left: u32) -> (bool, u32) {
     const CHUNK_SIZE: u32 = 1000;
-    const MIN_START_REDS: u32 = CHUNK_SIZE / 25;
-    const CONSES_PER_RED: usize = 75;
-    let mut spent = 0_u32;
-    while list.next_index < table_max && spent < reds_left {
-        list.next_index = (list.next_index + CHUNK_SIZE).min(table_max);
-        spent += MIN_START_REDS;
+    if list.snapshot.is_none() {
+        list.snapshot = Some(list.scheduler.begin_ptab_list());
     }
-    if list.next_index >= table_max {
-        spent = spent.max(list.pids.len().div_ceil(CONSES_PER_RED) as u32);
-        (true, spent)
+    let mut spent = 0_u32;
+    let mut first_chunk = true;
+    while list.next_index < table_max {
+        let first = list.next_index;
+        let end = (first + CHUNK_SIZE).min(table_max);
+        let chunk_reds = (end - first) / 25;
+        if !first_chunk && (spent >= reds_left || chunk_reds > reds_left - spent) {
+            break;
+        }
+        let (pids, interval) = list.snapshot.as_ref().unwrap().scan_chunk(first, end);
+        list.pids
+            .extend(pids.into_iter().filter_map(|pid| pid.to_term()));
+        list.chunk_intervals.push(interval);
+        let indices = end - first;
+        list.next_index = end;
+        spent += indices / 25;
+        first_chunk = false;
+    }
+    (list.next_index >= table_max, spent)
+}
+
+// Port of erts/emulator/beam/erl_ptab.c:1281 (ptab_list_continue), OTP-29.1.1.
+fn run_process_list(
+    process: &mut Process,
+    list: &mut PtabListState,
+    table_max: u32,
+    reds_left: u32,
+    state: Arc<MagicRef>,
+    accumulator: Term,
+) -> Result<HandlerResult, BifError> {
+    let (table_done, mut spent) = scan_process_table(list, table_max, reds_left);
+    if !table_done {
+        return ptab_yield(process, state, accumulator, spent);
+    }
+    if !list.deleted_done {
+        let max_deleted_reds = reds_left.saturating_sub(spent).min(40);
+        let (deleted, deleted_reds, done) = list
+            .snapshot
+            .as_mut()
+            .expect("table scan initialized its snapshot")
+            .inspect_deleted(&list.chunk_intervals, max_deleted_reds);
+        list.pids
+            .extend(deleted.into_iter().filter_map(|pid| pid.to_term()));
+        list.deleted_done = done;
+        spent += deleted_reds;
+        if !done {
+            return ptab_yield(process, state, accumulator, spent);
+        }
+    }
+    build_ptab_result(
+        process,
+        &mut list.pids,
+        accumulator,
+        reds_left.saturating_sub(spent),
+        spent,
+        state,
+    )
+}
+
+fn resume_processes(
+    process: &mut Process,
+    list: &mut PtabListState,
+    table_max: u32,
+    reds_left: u32,
+    state: Arc<MagicRef>,
+    accumulator: Term,
+) -> Result<HandlerResult, BifError> {
+    run_process_list(process, list, table_max, reds_left, state, accumulator)
+}
+
+// Port of erts/emulator/beam/erl_ptab.c:1210 (BUILDING_RESULT), OTP-29.1.1.
+fn build_ptab_result(
+    process: &mut Process,
+    terms: &mut Vec<Term>,
+    accumulator: Term,
+    reds_left: u32,
+    spent: u32,
+    state: Arc<MagicRef>,
+) -> Result<HandlerResult, BifError> {
+    const CONSES_PER_RED: usize = 75;
+    let conses = terms
+        .len()
+        .min((reds_left as usize).saturating_mul(CONSES_PER_RED));
+    if conses == 0 {
+        if terms.is_empty() {
+            return Ok(HandlerResult::Done {
+                value: accumulator,
+                reductions: spent,
+            });
+        }
+        return ptab_yield(process, state, accumulator, spent);
+    }
+    set_ptab_accumulator(process, accumulator)?;
+    process
+        .ensure(conses.saturating_mul(2), 1)
+        .map_err(|_| BifError::SystemLimit)?;
+    let accumulator = process.x[0];
+    let start = terms.len() - conses;
+    let built = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+        .reserve_cons_list(conses)
+        .and_then(|builder| {
+            builder.prepend_exact_with_tail(terms[start..].iter().rev().copied(), accumulator)
+        })
+        .map_err(|_| BifError::SystemLimit)?;
+    terms.truncate(start);
+    set_ptab_accumulator(process, built)?;
+    let spent = spent + (conses / CONSES_PER_RED) as u32;
+    if terms.is_empty() {
+        Ok(HandlerResult::Done {
+            value: built,
+            reductions: spent,
+        })
     } else {
-        (false, spent)
+        ptab_yield(process, state, built, spent)
     }
 }
 
-fn finish_processes(
+fn set_ptab_accumulator(process: &mut Process, accumulator: Term) -> Result<(), BifError> {
+    let slot = process.x.get_mut(0).ok_or(BifError::SystemLimit)?;
+    *slot = accumulator;
+    Ok(())
+}
+
+fn ptab_yield(
     process: &mut Process,
-    pid_terms: Vec<Term>,
-    spent: u32,
+    state: Arc<MagicRef>,
+    accumulator: Term,
+    reductions: u32,
 ) -> Result<HandlerResult, BifError> {
-    let value = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
-        .list_from_iter(pid_terms)
-        .map_err(|_| BifError::SystemLimit)?;
-    Ok(HandlerResult::Done {
-        value,
-        reductions: spent,
+    set_ptab_accumulator(process, accumulator)?;
+    Ok(HandlerResult::Yield {
+        continuation: PTAB_LIST_CONTINUATION,
+        state,
+        reductions,
     })
+}
+
+struct PortPtabListState {
+    snapshot: Option<crate::port::PortPtabListSnapshot>,
+    runtime: &'static crate::process::Runtime,
+    ids: Vec<Term>,
+    chunk_intervals: Vec<u64>,
+    next_index: u32,
+    deleted_done: bool,
+}
+
+enum PtabListContinuation {
+    Processes(PtabListState),
+    Ports(PortPtabListState),
+}
+
+// Port of erts/emulator/beam/erl_ptab.c (erts_ptab_list, ptab_list_bif_engine,
+// ptab_list_continue), OTP-29.1.1. The standard I/O port is the first table element.
+fn ports(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _restore_gc: bool,
+) -> Result<HandlerResult, BifError> {
+    const CHUNK_SIZE: u32 = 1000;
+    const INDICES_PER_RED: u32 = 25;
+    const MIN_START_REDS: u32 = CHUNK_SIZE / INDICES_PER_RED;
+    let table_max = arinsal_term::ptab::port_table_layout().max();
+    let reds_left = process.reductions.max(0) as u32;
+    let Some(state) = state else {
+        if process.runtime.is_none() {
+            let port = Term::port(0).ok_or(BifError::SystemLimit)?;
+            return Ok(HandlerResult::Done {
+                value: TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                    .list_from_iter([port])
+                    .map_err(|_| BifError::SystemLimit)?,
+                reductions: 1,
+            });
+        }
+        let runtime = process.runtime.as_ref().ok_or(BifError::BADARG)?;
+        let list = PortPtabListState {
+            snapshot: None,
+            runtime,
+            ids: vec![Term::port(0).ok_or(BifError::SystemLimit)?],
+            chunk_intervals: Vec::new(),
+            next_index: 0,
+            deleted_done: false,
+        };
+        set_ptab_accumulator(process, Term::NIL)?;
+        let state = magic_binary_state(
+            Mutex::new(PtabListContinuation::Ports(list)),
+            ERTS_PTAB_LIST_STATE_SIZE,
+        );
+        let list_cell = state
+            .downcast_ref::<Mutex<PtabListContinuation>>()
+            .ok_or(BifError::BADARG)?;
+        let mut list = list_cell.lock().map_err(|_| BifError::SystemLimit)?;
+        if reds_left < MIN_START_REDS {
+            return Ok(HandlerResult::Yield {
+                continuation: PTAB_LIST_CONTINUATION,
+                state: Arc::clone(&state),
+                reductions: 1,
+            });
+        }
+        return match &mut *list {
+            PtabListContinuation::Ports(list) => run_port_list(
+                process,
+                list,
+                table_max,
+                reds_left,
+                Arc::clone(&state),
+                Term::NIL,
+            ),
+            PtabListContinuation::Processes(_) => unreachable!(),
+        };
+    };
+    let state = Arc::clone(state);
+    let list = state
+        .downcast_ref::<Mutex<PtabListContinuation>>()
+        .ok_or(BifError::BADARG)?;
+    let mut list = list.lock().map_err(|_| BifError::SystemLimit)?;
+    let accumulator = args.first().copied().unwrap_or(Term::NIL);
+    set_ptab_accumulator(process, accumulator)?;
+    match &mut *list {
+        PtabListContinuation::Ports(list) => resume_ports(
+            process,
+            list,
+            table_max,
+            reds_left,
+            Arc::clone(&state),
+            accumulator,
+        ),
+        PtabListContinuation::Processes(list) => resume_processes(
+            process,
+            list,
+            table_max,
+            reds_left,
+            Arc::clone(&state),
+            accumulator,
+        ),
+    }
+}
+
+// Port of erts/emulator/beam/erl_ptab.c:1281 (ptab_list_continue), OTP-29.1.1.
+fn resume_ports(
+    process: &mut Process,
+    list: &mut PortPtabListState,
+    table_max: u32,
+    reds_left: u32,
+    state: Arc<MagicRef>,
+    accumulator: Term,
+) -> Result<HandlerResult, BifError> {
+    run_port_list(process, list, table_max, reds_left, state, accumulator)
+}
+
+// Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
+fn run_port_list(
+    process: &mut Process,
+    list: &mut PortPtabListState,
+    table_max: u32,
+    reds_left: u32,
+    state: Arc<MagicRef>,
+    accumulator: Term,
+) -> Result<HandlerResult, BifError> {
+    let (table_done, mut spent) = scan_port_table(list, table_max, reds_left);
+    if !table_done {
+        return ptab_yield(process, state, accumulator, spent);
+    }
+    if !list.deleted_done {
+        let max_deleted_reds = reds_left.saturating_sub(spent).min(40);
+        let (deleted, deleted_reds, done) = list
+            .snapshot
+            .as_mut()
+            .expect("table scan initialized its snapshot")
+            .inspect_deleted(&list.chunk_intervals, max_deleted_reds);
+        list.ids.extend(
+            deleted
+                .into_iter()
+                .filter(|id| *id != 0)
+                .filter_map(Term::port),
+        );
+        list.deleted_done = done;
+        spent += deleted_reds;
+        if !done {
+            return ptab_yield(process, state, accumulator, spent);
+        }
+    }
+    build_ptab_result(
+        process,
+        &mut list.ids,
+        accumulator,
+        reds_left.saturating_sub(spent),
+        spent,
+        state,
+    )
+}
+
+// Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
+fn scan_port_table(list: &mut PortPtabListState, table_max: u32, reds_left: u32) -> (bool, u32) {
+    const CHUNK_SIZE: u32 = 1000;
+    if list.snapshot.is_none() {
+        list.snapshot = Some(list.runtime.ports.begin_ptab_list());
+    }
+    let mut spent = 0_u32;
+    let mut first_chunk = true;
+    while list.next_index < table_max {
+        let first = list.next_index;
+        let end = (first + CHUNK_SIZE).min(table_max);
+        let chunk_reds = (end - first) / 25;
+        if !first_chunk && (spent >= reds_left || chunk_reds > reds_left - spent) {
+            break;
+        }
+        let (ids, interval) = list.snapshot.as_ref().unwrap().scan_chunk(first, end);
+        list.ids
+            .extend(ids.into_iter().filter(|id| *id != 0).filter_map(Term::port));
+        list.chunk_intervals.push(interval);
+        list.next_index = end;
+        spent += (end - first) / 25;
+        first_chunk = false;
+    }
+    (list.next_index >= table_max, spent)
 }
 
 #[cfg(test)]
