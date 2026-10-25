@@ -11,12 +11,17 @@ use arinsal_beamasm::{
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     types::{ArgType, TypedArg},
 };
-use arinsal_beamops::{self as beamops, SpecificOp, SpecificOperand};
+use arinsal_beamops::{self as beamops, FunctionOps, SpecificOp, SpecificOperand, TransformArena};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
 };
+
+thread_local! {
+    static COMPILE_ARENA: RefCell<TransformArena> = RefCell::new(TransformArena::new());
+}
 
 mod eq_literal;
 use eq_literal::classify_eq_literal;
@@ -1568,11 +1573,31 @@ pub fn compile_parsed_module_with_options(
     function_allowlist: Option<&str>,
     line_breakpoints: bool,
 ) -> Result<CompiledModule, CompileError> {
-    let specialized = beamops::transform_module_typed(beam, line_breakpoints);
-    let mut candidates = Vec::new();
+    COMPILE_ARENA.with(|arena| {
+        compile_parsed_module_with_options_in_arena(
+            beam,
+            env,
+            function_allowlist,
+            line_breakpoints,
+            &mut arena.borrow_mut(),
+        )
+    })
+}
+
+fn compile_parsed_module_with_options_in_arena(
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+    function_allowlist: Option<&str>,
+    line_breakpoints: bool,
+    transform_arena: &mut TransformArena,
+) -> Result<CompiledModule, CompileError> {
+    beamops::transform_module_typed_in_arena(beam, line_breakpoints, transform_arena);
+    let mut candidates: Vec<(String, u8, u32, FunctionOps)> = Vec::new();
     let mut unported = Vec::new();
 
-    for ops in specialized {
+    for index in 0..transform_arena.function_count() {
+        let range = transform_arena.function_range(index);
+        let ops = transform_arena.ops(range);
         // Ops before the first function label (module preamble) are not a function.
         if !ops
             .iter()
@@ -1580,7 +1605,7 @@ pub fn compile_parsed_module_with_options(
         {
             continue;
         }
-        let (name, arity, label) = function_identity(&ops, beam);
+        let (name, arity, label) = function_identity(ops, beam);
         if function_allowlist.is_some_and(|list| !function_allowlist_contains(list, &name, arity))
             || std::env::var("ARINSAL_JIT_SKIPF")
                 .is_ok_and(|list| function_allowlist_contains(&list, &name, arity))
@@ -1594,7 +1619,7 @@ pub fn compile_parsed_module_with_options(
             });
             continue;
         }
-        let blockers = missing_ops(&ops);
+        let blockers = missing_ops(ops);
         if !blockers.is_empty() {
             unported.push(UnportedFunction {
                 name,
@@ -1605,7 +1630,7 @@ pub fn compile_parsed_module_with_options(
             });
             continue;
         }
-        candidates.push((name, arity, label, ops));
+        candidates.push((name, arity, label, range));
     }
 
     // Probe the NIF bodies before laying out the module.
@@ -1641,24 +1666,29 @@ pub fn compile_parsed_module_with_options(
     loop {
         let native_labels = candidates
             .iter()
-            .flat_map(|(_, _, label, ops)| {
-                std::iter::once(*label).chain(ops.iter().filter_map(|op| match op {
-                    SpecificOp::OpLabel(args) | SpecificOp::OpAlignedLabel(args) => {
-                        as_u32(args.first())
+            .flat_map(|(_, _, label, range)| {
+                std::iter::once(*label).chain(transform_arena.ops(*range).iter().filter_map(|op| {
+                    match op {
+                        SpecificOp::OpLabel(args) | SpecificOp::OpAlignedLabel(args) => {
+                            as_u32(args.first())
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 }))
             })
             .collect::<LabelSet>();
         let mut removed = false;
         let mut index = 0;
         while index < candidates.len() {
-            let blocked_call = candidates[index].3.iter().find_map(|op| {
-                call_target(op)
-                    .or_else(|| lambda_call_target(op, beam))
-                    .filter(|target| !native_labels.contains(target))
-                    .map(|target| (op.name().to_owned(), target))
-            });
+            let blocked_call = transform_arena
+                .ops(candidates[index].3)
+                .iter()
+                .find_map(|op| {
+                    call_target(op)
+                        .or_else(|| lambda_call_target(op, beam))
+                        .filter(|target| !native_labels.contains(target))
+                        .map(|target| (op.name().to_owned(), target))
+                });
             if let Some((op, target)) = blocked_call {
                 let (name, arity, label, _) = candidates.remove(index);
                 unported.push(UnportedFunction {
@@ -1737,12 +1767,16 @@ pub fn compile_parsed_module_with_options(
                 && beam.atom(import.module_atom) == Some("erlang")
                 && beam.atom(import.function_atom) == Some("load_nif")
         });
-        let has_nif_start = candidates
-            .iter()
-            .any(|(_, _, _, ops)| ops.iter().any(|op| matches!(op, SpecificOp::OpNifStart(_))));
+        let has_nif_start = candidates.iter().any(|(_, _, _, range)| {
+            transform_arena
+                .ops(*range)
+                .iter()
+                .any(|op| matches!(op, SpecificOp::OpNifStart(_)))
+        });
         let mut failure_reason = None;
 
-        for (index, (name, arity, label, ops)) in candidates.iter().enumerate() {
+        for (index, (name, arity, label, range)) in candidates.iter().enumerate() {
+            let ops = transform_arena.ops(*range);
             assembler.begin_dump_function(name, *arity);
             let dump_enabled = assembler.dump_enabled();
             let native_body = env.native_body(name, *arity);
@@ -1783,7 +1817,9 @@ pub fn compile_parsed_module_with_options(
                     }
                     break;
                 }
-                if let Err(error) = emit_op(&mut assembler, op, beam, env, name, *arity) {
+                if let Err(error) =
+                    emit_op(&mut assembler, op, beam, env, name, *arity, transform_arena)
+                {
                     failure_index = Some(index);
                     failure_reason = Some((
                         op.name().to_owned(),
@@ -2167,6 +2203,17 @@ fn arg(
     }
 }
 
+fn list_operand<'a>(
+    value: Option<&'a SpecificOperand>,
+    arena: &'a TransformArena,
+) -> Option<&'a [SpecificOperand]> {
+    match value? {
+        SpecificOperand::List(values) => Some(values),
+        SpecificOperand::ArenaList(slice) => Some(arena.list(*slice)),
+        _ => None,
+    }
+}
+
 /// The compile-time shape of an `=:=` / `=/=` right operand that is a literal; any other operand
 /// is `Generic`.
 fn eq_literal_operand(
@@ -2338,10 +2385,18 @@ fn count_at_least(args: &[SpecificOperand], minimum: usize, name: &str) -> Resul
     }
 }
 
-fn allocation_words(value: Option<&SpecificOperand>) -> Result<u32, String> {
-    let Some(SpecificOperand::Allocations(items)) = value else {
-        return Err("expected allocation descriptor".to_owned());
+fn allocation_words(
+    value: Option<&SpecificOperand>,
+    arena: &TransformArena,
+) -> Result<u32, String> {
+    let items = match value {
+        Some(SpecificOperand::Allocations(items)) => items.as_slice(),
+        Some(SpecificOperand::ArenaAllocations(slice)) => arena.allocation_list(*slice),
+        _ => return Err("expected allocation descriptor".to_owned()),
     };
+    if items.is_empty() && value.is_none() {
+        return Err("expected allocation descriptor".to_owned());
+    }
     items
         .iter()
         .try_fold(0_u32, |total, (kind, count)| {
@@ -2356,9 +2411,15 @@ fn allocation_words(value: Option<&SpecificOperand>) -> Result<u32, String> {
         .ok_or_else(|| "allocation descriptor size overflow".to_owned())
 }
 
-fn count_or_allocation_words(value: Option<&SpecificOperand>) -> Result<u32, String> {
-    if matches!(value, Some(SpecificOperand::Allocations(_))) {
-        allocation_words(value)
+fn count_or_allocation_words(
+    value: Option<&SpecificOperand>,
+    arena: &TransformArena,
+) -> Result<u32, String> {
+    if matches!(
+        value,
+        Some(SpecificOperand::Allocations(_) | SpecificOperand::ArenaAllocations(_))
+    ) {
+        allocation_words(value, arena)
     } else {
         number(value)
     }
@@ -2390,6 +2451,7 @@ fn emit_op(
     env: &impl ModuleEnv,
     function: &str,
     arity: u8,
+    arena: &TransformArena,
 ) -> Result<(), EmitError> {
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:452 (BeamModuleAssembler::emit),
     // OTP-29.1.1: `tbz`/`tbnz` reach only ±32KB, so each instruction flushes a veneer before a
@@ -2705,7 +2767,12 @@ fn emit_op(
         EmitterKind::InitYregs => {
             if args.len() == 2 {
                 Ok(assembler.init_yregs(n(0)?, n(1)?)?)
-            } else if let [SpecificOperand::List(registers)] = args {
+            } else if let Some(registers) = list_operand(args.first(), arena) {
+                if args.len() != 1 {
+                    return Err(EmitError::Operand(
+                        "init_yregs expects two counts or a Y-register list".to_owned(),
+                    ));
+                }
                 let mut indices = Vec::with_capacity(registers.len());
                 for register in registers.iter() {
                     let SpecificOperand::Y(index) = register else {
@@ -3772,8 +3839,8 @@ fn emit_op(
             }
             "put_tuple2" => {
                 count(2)?;
-                let elements = match args.get(1) {
-                    Some(SpecificOperand::List(values)) => values
+                let elements = match list_operand(args.get(1), arena) {
+                    Some(values) => values
                         .iter()
                         .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                         .collect::<Result<Vec<_>, _>>()?,
@@ -3823,8 +3890,8 @@ fn emit_op(
             "update_record" => {
                 count(5)?;
                 let arity = n(1)?;
-                let updates = match args.get(4) {
-                    Some(SpecificOperand::List(values)) if values.len() % 2 == 0 => values
+                let updates = match list_operand(args.get(4), arena) {
+                    Some(values) if values.len() % 2 == 0 => values
                         .chunks(2)
                         .map(|pair| Ok((number(pair.first())?, arg(pair.get(1), beam, env)?)))
                         .collect::<Result<Vec<_>, String>>()?,
@@ -3861,29 +3928,33 @@ fn emit_op(
             match op.name() {
                 "test_heap" => {
                     count(2)?;
-                    let (words, live) =
-                        if matches!(args.first(), Some(SpecificOperand::Allocations(_))) {
-                            (allocation_words(args.first())?, number(args.get(1))?)
-                        } else {
-                            (number(args.first())?, number(args.get(1))?)
-                        };
+                    let (words, live) = if matches!(
+                        args.first(),
+                        Some(
+                            SpecificOperand::Allocations(_) | SpecificOperand::ArenaAllocations(_)
+                        )
+                    ) {
+                        (allocation_words(args.first(), arena)?, number(args.get(1))?)
+                    } else {
+                        (number(args.first())?, number(args.get(1))?)
+                    };
                     assembler.emit_test_heap(words, live, hook)
                 }
                 "allocate_heap" => {
                     count(3)?;
                     assembler.emit_allocate_heap(
-                        count_or_allocation_words(args.first())?,
-                        count_or_allocation_words(args.get(1))?,
-                        count_or_allocation_words(args.get(2))?,
+                        count_or_allocation_words(args.first(), arena)?,
+                        count_or_allocation_words(args.get(1), arena)?,
+                        count_or_allocation_words(args.get(2), arena)?,
                         hook,
                     )
                 }
                 "allocate_heap_zero" => {
                     count(3)?;
                     assembler.emit_allocate_heap_zero(
-                        count_or_allocation_words(args.first())?,
-                        count_or_allocation_words(args.get(1))?,
-                        count_or_allocation_words(args.get(2))?,
+                        count_or_allocation_words(args.first(), arena)?,
+                        count_or_allocation_words(args.get(1), arena)?,
+                        count_or_allocation_words(args.get(2), arena)?,
                         hook,
                     )
                 }
@@ -4331,7 +4402,8 @@ fn emit_op(
                     if op.name() == "i_bs_match_test_heap" {
                         count_at_least(args, 4, op.name())?;
                         need = u64::from(
-                            count_or_allocation_words(args.get(2)).map_err(EmitError::Operand)?,
+                            count_or_allocation_words(args.get(2), arena)
+                                .map_err(EmitError::Operand)?,
                         );
                         live = n(3)?;
                         at = 4;

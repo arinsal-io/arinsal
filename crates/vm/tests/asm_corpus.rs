@@ -7,6 +7,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(feature = "bench-alloc-count")]
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+#[cfg(feature = "bench-alloc-count")]
+use std::alloc::System;
+
+#[cfg(feature = "bench-alloc-count")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+
 struct CorpusEnv {
     literal_heap: RefCell<VecHeap>,
     lambda_entries: HashMap<u32, Arc<FunEntry>>,
@@ -536,7 +545,11 @@ fn beamasm_compile_time_per_module() {
         files.truncate(200);
     }
     let mut samples = Vec::new();
+    #[cfg(feature = "bench-alloc-count")]
+    let mut allocation_samples = Vec::new();
     let mut total_bytes = 0usize;
+    #[cfg(feature = "bench-alloc-count")]
+    let mut total_raw_ops = 0usize;
     let mut layout_hash = std::collections::hash_map::DefaultHasher::new();
     let repeat: usize = std::env::var("ARINSAL_BENCH_REPEAT")
         .ok()
@@ -546,11 +559,22 @@ fn beamasm_compile_time_per_module() {
         let bytes = std::fs::read(path).unwrap();
         total_bytes += bytes.len();
         let beam = arinsal_beam::parse(&bytes).unwrap();
+        #[cfg(feature = "bench-alloc-count")]
+        {
+            total_raw_ops += beam.code.instructions.len();
+        }
         let loaded = arinsal_loader::load(&beam).unwrap();
         let env = CorpusEnv::new(&loaded);
+        #[cfg(feature = "bench-alloc-count")]
+        let allocation_region = Region::new(GLOBAL_ALLOCATOR);
         let start = std::time::Instant::now();
         let compiled = compile_module_with_env(&bytes, &env);
         samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        #[cfg(feature = "bench-alloc-count")]
+        {
+            let allocation_stats = allocation_region.change();
+            allocation_samples.push(allocation_stats.allocations + allocation_stats.reallocations);
+        }
         // The layout must not change with a faster compiler: hash the entry offsets.
         if let Ok(compiled) = compiled {
             use std::hash::{Hash, Hasher};
@@ -611,4 +635,15 @@ fn beamasm_compile_time_per_module() {
         samples.iter().sum::<f64>() / n as f64,
         samples.iter().sum::<f64>()
     );
+    #[cfg(feature = "bench-alloc-count")]
+    {
+        allocation_samples.sort_unstable();
+        println!(
+            "ALLOCATIONS modules={n} median={} p95={} mean={:.1} events/module raw_ops={total_raw_ops} mean={:.3} events/raw_op (alloc + realloc)",
+            allocation_samples[n / 2],
+            allocation_samples[n * 95 / 100],
+            allocation_samples.iter().sum::<usize>() as f64 / n as f64,
+            allocation_samples.iter().sum::<usize>() as f64 / total_raw_ops as f64,
+        );
+    }
 }
