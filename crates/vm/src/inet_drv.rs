@@ -355,7 +355,7 @@ fn tcp_inet_stop(sock: &Arc<Sock>) {
             flush_send(&mut inner);
             inner.sendq.clear();
         }
-        inner.fd.take();
+        inner.take_fd();
         inner.phase = Phase::Closed;
         // Port of inet_drv.c (tcp_inet_stop, tcp_clear_output): a sender blocked on the
         // queue is released by the port's exit, not by a reply.
@@ -689,7 +689,7 @@ fn send_or_shutdown_failed(inner: &mut Inner, err: i32) -> SendOutcome {
     inner.peer_closed = true;
     inner.sendq.clear();
     inner.busy = false;
-    inner.fd.take();
+    inner.take_fd();
     let active = active_is(&inner.active);
     if active {
         inner.closed_sent = true;
@@ -723,7 +723,7 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> ControlByte
                     let _ = flush_send(&mut inner);
                     inner.sendq.clear();
                 }
-                inner.fd.take();
+                inner.take_fd();
                 inner.fd_external = None;
                 inner.phase = Phase::Closed;
                 ok_small()
@@ -917,10 +917,7 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     set_nonblock(fd);
     set_nosigpipe(fd);
     // SAFETY: fd was just created and is moved into OwnedFd.
-    inner.fd = Some(SockFd::new(
-        unsafe { OwnedFd::from_raw_fd(fd) },
-        inner.port.clone(),
-    ));
+    inner.fd = Some(SockFd::new(unsafe { OwnedFd::from_raw_fd(fd) }));
     inner.domain = domain;
     inner.family_code = data[0];
     inner.fd_external = None;
@@ -964,7 +961,7 @@ fn fdopen_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     let connected = rustix::net::getpeername(&fd).is_ok();
     set_nonblock(fd.as_raw_fd());
     set_nosigpipe(fd.as_raw_fd());
-    inner.fd = Some(SockFd::new(fd, inner.port.clone()));
+    inner.fd = Some(SockFd::new(fd));
     // Port of inet_drv.c:5269 (inet_fdopen, `prebound`): the port selects on the descriptor
     // number it was given, so a later port on it steals the selection from the earlier one.
     if let Some(fd) = inner.fd.as_mut() {
@@ -1077,7 +1074,7 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
         if timeout == 0 {
             // A zero timer is already due. erts closes the socket
             // (tcp_inet_timeout) and replies `{error, timeout}`.
-            inner.fd.take();
+            inner.take_fd();
             inner.phase = Phase::Closed;
             emit(
                 sock,
@@ -1214,7 +1211,7 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
         let born = {
             let inner = listen.inner.lock();
             Inner {
-                fd: Some(SockFd::new(fd, Arc::downgrade(port))),
+                fd: Some(SockFd::new(fd)),
                 port: Arc::downgrade(port),
                 domain: inner.domain,
                 family_code: inner.family_code,
@@ -3093,28 +3090,27 @@ impl Sock {
     }
 }
 
-/// The socket of a `tcp_inet` port with its poll-set selection.
-///
-/// Dropping it deselects the descriptor before closing it, as `tcp_desc_close`
-/// does with `sock_select(desc, FD_READ|FD_WRITE|FD_CLOSE|ERL_DRV_USE_NO_CALLBACK, 0)`
-/// (erts/emulator/drivers/common/inet_drv.c:11473), OTP-29.1.1; `inet_stop_select` then
-/// closes the descriptor.
+impl Drop for Sock {
+    fn drop(&mut self) {
+        drop(self.inner.get_mut().take_fd());
+    }
+}
+
+/// The socket descriptor and poll-set state stored in `tcp_descriptor`.
 struct SockFd {
     fd: OwnedFd,
     /// The descriptor number given to `driver_select` (the caller's one for `{fd, Fd}`).
     select_fd: RawFd,
-    port: Weak<DriverPort>,
     /// Events selected through `driver_select` (`FD_READ`, `FD_WRITE`).
     readable: bool,
     writable: bool,
 }
 
 impl SockFd {
-    fn new(fd: OwnedFd, port: Weak<DriverPort>) -> Self {
+    fn new(fd: OwnedFd) -> Self {
         Self {
             select_fd: fd.as_raw_fd(),
             fd,
-            port,
             readable: false,
             writable: false,
         }
@@ -3124,19 +3120,6 @@ impl SockFd {
 impl AsRawFd for SockFd {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
-    }
-}
-
-impl Drop for SockFd {
-    fn drop(&mut self) {
-        if let Some(port) = self.port.upgrade() {
-            use arinsal_drv::{SELECT_READ, SELECT_USE, SELECT_WRITE};
-            port.select(
-                self.select_fd,
-                SELECT_READ | SELECT_WRITE | SELECT_USE,
-                false,
-            );
-        }
     }
 }
 
@@ -3268,6 +3251,18 @@ struct Inner {
     send_avg: f64,
     recv_oct: u64,
     send_oct: u64,
+}
+
+impl Inner {
+    // Port of erts/emulator/drivers/common/inet_drv.c:11473 (tcp_desc_close), OTP-29.1.1.
+    fn take_fd(&mut self) -> Option<SockFd> {
+        let fd = self.fd.take()?;
+        if let Some(port) = self.port.upgrade() {
+            use arinsal_drv::{SELECT_READ, SELECT_USE, SELECT_WRITE};
+            port.select(fd.select_fd, SELECT_READ | SELECT_WRITE | SELECT_USE, false);
+        }
+        Some(fd)
+    }
 }
 
 impl Default for Inner {
@@ -4659,7 +4654,7 @@ fn packet_error(handle: &PortHandle, inner: &mut Inner, outs: &mut Outs) -> bool
         });
     }
     rbuf_reset(inner);
-    inner.fd.take();
+    inner.take_fd();
     inner.phase = Phase::Closed;
     let active = active_is(&inner.active) && !inner.closed_sent;
     if active {
@@ -5257,7 +5252,7 @@ fn on_eof(sock: &Arc<Sock>, read_error: &'static str) {
         }
         if !active {
             if inner.exit_on_close {
-                inner.fd.take();
+                inner.take_fd();
             }
             let recv = inner.recv.take();
             if let Some(recv) = recv {
@@ -5463,12 +5458,12 @@ fn expire(sock: &Arc<Sock>) {
             // timer closes the socket, then replies `{error, timeout}`.
             let waiter = inner.connect.take().unwrap();
             drop_pending(&mut inner, waiter.caller, waiter.aref);
-            inner.fd.take();
+            inner.take_fd();
             inner.phase = Phase::Closed;
             due.push((waiter.caller, waiter.aref));
         }
         let close = if expired_sends != 0 && inner.send_timeout_close {
-            inner.fd.take();
+            inner.take_fd();
             inner.peer_closed = true;
             let owner = sock.handle().owner_pid();
             let active = active_is(&inner.active) && !inner.closed_sent;
@@ -5508,6 +5503,13 @@ fn expire(sock: &Arc<Sock>) {
 mod layout_tests {
     #[test]
     fn reports_tcp_socket_layout() {
-        eprintln!("Inner={}", std::mem::size_of::<super::Inner>());
+        eprintln!(
+            "Sock={} Inner={} SockFd={} PortHandle={} DriverPort={}",
+            std::mem::size_of::<super::Sock>(),
+            std::mem::size_of::<super::Inner>(),
+            std::mem::size_of::<super::SockFd>(),
+            std::mem::size_of::<crate::port::PortHandle>(),
+            std::mem::size_of::<arinsal_drv::DriverPort>(),
+        );
     }
 }

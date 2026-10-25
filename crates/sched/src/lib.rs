@@ -942,6 +942,13 @@ pub trait Clock: Send + Sync {
         }
     }
 
+    /// The current wheel position and deadline for one relative timer.
+    // Port of erts/emulator/beam/erl_hl_timer.c:670-679 (get_timeout_pos): the BIF
+    // computes its wheel position once, then carries it through timer creation.
+    fn timer_position(&self, ms: u64) -> (u64, u64) {
+        (self.now_ms(), self.timeout_pos(ms))
+    }
+
     /// The erts clock position used to report a timer's remaining milliseconds.
     fn time_left_now_ms(&self) -> u64 {
         self.now_ms()
@@ -1004,6 +1011,20 @@ impl Clock for RealClock {
         let nanos = self.0.elapsed().as_nanos();
         let ticks = nanos.saturating_sub(1) / 1_000_000 + u128::from(nanos != 0);
         u64::try_from(ticks).unwrap_or(u64::MAX)
+    }
+
+    fn timer_position(&self, ms: u64) -> (u64, u64) {
+        let nanos = self.0.elapsed().as_nanos();
+        let now_ms = u64::try_from(nanos / 1_000_000).unwrap_or(u64::MAX);
+        let deadline = if ms == 0 {
+            now_ms
+        } else {
+            u64::try_from(nanos.saturating_sub(1) / 1_000_000)
+                .unwrap_or(u64::MAX)
+                .saturating_add(ms)
+                .saturating_add(1)
+        };
+        (now_ms, deadline)
     }
 }
 
@@ -3921,8 +3942,7 @@ impl<T: Task> Inner<T> {
         local: Option<&mut Local<T>>,
         ms: u64,
     ) -> Result<TimerRef, Error> {
-        let now = self.clock.now_ms();
-        let deadline = self.clock.timeout_pos(ms);
+        let (now, deadline) = self.clock.timer_position(ms);
         if let Some(local) = local.filter(|local| local.worker_id == worker) {
             let mut service = local.timer_service.borrow_mut();
             if !service.wheel.has_timers() {

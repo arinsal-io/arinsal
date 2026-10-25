@@ -567,14 +567,14 @@ fn setelement(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
         Err(_) => ctx.system_limit(),
     }
 }
-fn tuple_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn tuple_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:2963-2973 (tuple_size_1), OTP-29.1.1.
     let arity = tuple_view(&args[0])?.len();
     integer(ctx, arity)
 }
-fn size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     match args[0].classify() {
-        TermKind::Tuple | TermKind::Record => tuple_size(ctx, args),
+        TermKind::Tuple | TermKind::Record => tuple_size_result(ctx, args),
         TermKind::Bitstring => {
             // SAFETY: The source binary and owner remain live for this call.
             let view = unsafe { args[0].binary_ref() }.ok_or(BADARG)?;
@@ -583,7 +583,7 @@ fn size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         _ => Err(BADARG),
     }
 }
-fn node(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn node_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if args.is_empty() {
         return Ok(Term::atom(atoms::NONAME));
     }
@@ -595,51 +595,51 @@ fn node(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     };
     Ok(Term::atom(name))
 }
-fn self_bif(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn self_bif_result(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     Err(BifError::Unsupported("self requires the calling process"))
 }
-fn min(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn min_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(if cmp(args[0], args[1]) == Ordering::Greater {
         args[1]
     } else {
         args[0]
     })
 }
-fn max(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn max_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(if cmp(args[0], args[1]) == Ordering::Less {
         args[1]
     } else {
         args[0]
     })
 }
-fn not(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn not_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(bool_term(!bool_value(args[0])?))
 }
-fn and(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn and_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(bool_term(bool_value(args[0])? & bool_value(args[1])?))
 }
-fn or(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn or_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(bool_term(bool_value(args[0])? | bool_value(args[1])?))
 }
-fn xor(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn xor_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(bool_term(bool_value(args[0])? ^ bool_value(args[1])?))
 }
 
 macro_rules! compare {
-    ($name:ident, $body:expr) => {
-        fn $name(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    ($name:ident, $result:ident, $body:expr) => {
+        fn $result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             Ok(bool_term($body(args[0], args[1])))
         }
     };
 }
-compare!(eq, loose_eq);
-compare!(exact_eq_bif, exact_eq);
-compare!(ne, |a, b| !loose_eq(a, b));
-compare!(exact_ne, |a, b| !exact_eq(a, b));
-compare!(lt, |a, b| cmp(a, b) == Ordering::Less);
-compare!(le, |a, b| cmp(a, b) != Ordering::Greater);
-compare!(gt, |a, b| cmp(a, b) == Ordering::Greater);
-compare!(ge, |a, b| cmp(a, b) != Ordering::Less);
+compare!(eq, eq_result, loose_eq);
+compare!(exact_eq_bif, exact_eq_bif_result, exact_eq);
+compare!(ne, ne_result, |a, b| !loose_eq(a, b));
+compare!(exact_ne, exact_ne_result, |a, b| !exact_eq(a, b));
+compare!(lt, lt_result, |a, b| cmp(a, b) == Ordering::Less);
+compare!(le, le_result, |a, b| cmp(a, b) != Ordering::Greater);
+compare!(gt, gt_result, |a, b| cmp(a, b) == Ordering::Greater);
+compare!(ge, ge_result, |a, b| cmp(a, b) != Ordering::Less);
 
 /// Resume state of `erlang:phash2/1,2`.
 ///
@@ -729,7 +729,7 @@ pub fn phash2_start(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Phash2Step, BifE
     })
 }
 
-fn phash2_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn phash2_bif_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c (phash2_1, phash2_2) over `trapping_make_hash2`: a term
     // that hashes without a work stack never builds the resumable state.
     let range = match args.get(1) {
@@ -752,12 +752,12 @@ fn phash2_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         }
     }
 }
-fn phash_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn phash_bif_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let range = args[1].as_small().ok_or(BADARG)?;
     let value = phash(args[0], range.try_into().map_err(|_| BADARG)?).ok_or(BADARG)?;
     integer(ctx, value as usize)
 }
-pub fn make_ref(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn make_ref_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_unique.c:821-833 (make_ref_0), OTP-29.1.1.
     // `erts_sched_make_ref_in_buffer` writes the three words straight into the
     // heap buffer; the id is not packed and unpacked on the way.
@@ -812,7 +812,7 @@ fn unique_flag_atom(name: &'static str) -> arinsal_term::Atom {
     *slot.get_or_init(|| global_atoms().intern(name).expect("unique_integer flag"))
 }
 
-pub fn unique_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn unique_integer_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_unique.c:835-871 (unique_integer_0/1), OTP-29.1.1.
     match eval_unique_integer(args)? {
         crate::unique::UniqueInt::Small(value) => {
@@ -823,7 +823,7 @@ pub fn unique_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
             .map_err(|_| BifError::SystemLimit),
     }
 }
-fn system_time(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn system_time_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let units_per_second = if let Some(unit) = args.first() {
         if let Some(name) = atom_name(*unit) {
             // Port of erts/emulator/beam/erl_time_sup.c:2277 (time_unit_conversion), OTP-29.1.1.
@@ -853,7 +853,7 @@ fn system_time(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         .int_from_bigint(&value)
         .map_err(|_| BifError::SystemLimit)
 }
-fn time_unit(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn time_unit_result(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     Ok(Term::small(1_000_000_000).expect("small time unit"))
 }
 
@@ -877,7 +877,7 @@ fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
         Err(_) => ctx.system_limit(),
     }
 }
-fn list_to_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn list_to_tuple_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3789-3808 (list_to_tuple_1), OTP-29.1.1.
     let len = proper_list_length(args[0])?;
     check_tuple_arity(len)?;
@@ -896,7 +896,7 @@ fn list_to_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         })
         .map_err(|_| BifError::SystemLimit)
 }
-fn make_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn make_tuple_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3006-3076 (make_tuple_2/3), OTP-29.1.1.
     let n = args[0].as_small().ok_or(BADARG)?;
     if n < 0 || check_tuple_arity(n as usize).is_err() {
@@ -941,7 +941,7 @@ fn make_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     }
     Ok(tuple.finish())
 }
-fn append_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn append_element_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3083 (append_element_2), OTP-29.1.1.
     let source = tuple_view(&args[0])?;
     TermBuilder::new(&mut Heap(&mut ctx.heap))
@@ -951,7 +951,7 @@ fn append_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             _ => BifError::SystemLimit,
         })
 }
-fn delete_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn delete_element_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3144-3178 (delete_element_2), OTP-29.1.1.
     let index = args[0].as_small().ok_or(BADARG)?;
     if index < 1 {
@@ -974,7 +974,7 @@ fn delete_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         })
         .map_err(|_| BifError::SystemLimit)
 }
-fn insert_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn insert_element_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3110-3141 (insert_element_3), OTP-29.1.1.
     let index = args[0].as_small().ok_or(BADARG)?;
     if index < 1 {
@@ -1016,7 +1016,7 @@ mod tuple_limit_tests {
 pub(super) fn atom_name(term: Term) -> Option<&'static str> {
     global_atoms().text(term.as_atom()?)
 }
-fn atom_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn atom_to_list_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3186-3210 (atom_to_list_1), OTP-29.1.1.
     atom_to_list_term(&mut ctx.heap, args[0])
 }
@@ -1058,7 +1058,7 @@ fn cons_units<H: HeapAlloc + ?Sized>(
     }
     Ok(result)
 }
-fn list_to_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn list_to_atom_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3217 (list_to_atom_1) and
     // erts/emulator/beam/utils.c:2862 (erts_unicode_list_to_buf),
     // OTP-29.1.1. The bytes land in a fixed buffer, then erts_atom_put.
@@ -1072,7 +1072,7 @@ fn list_to_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         })?;
     Ok(Term::atom(atom))
 }
-fn list_to_existing_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn list_to_existing_atom_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of bif.c:3239. Every conversion failure, including a too-long list, is badarg.
     let mut buf = [0u8; MAX_ATOM_SZ_LIMIT];
     let Ok(written) = unicode_list_to_buf(args[0], &mut buf) else {
@@ -1162,7 +1162,7 @@ fn encoding(term: Term) -> Result<&'static str, BifError> {
         _ => Err(BADARG),
     }
 }
-fn atom_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn atom_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let atom = args[0].as_atom().ok_or(BADARG)?;
     let table = global_atoms();
     match encoding(args[1])? {
@@ -1473,10 +1473,10 @@ fn binary_to_atom_inner(args: &[Term], existing: bool) -> Result<Term, BifError>
         Ok(Term::atom(atom))
     })
 }
-fn binary_to_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn binary_to_atom_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     binary_to_atom_inner(args, false)
 }
-fn binary_to_existing_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn binary_to_existing_atom_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     binary_to_atom_inner(args, true)
 }
 fn float_opts(args: &[Term]) -> Result<arinsal_float::FloatFormatOpts, BifError> {
@@ -1514,7 +1514,7 @@ fn formatted_float(args: &[Term]) -> Result<String, BifError> {
     let value = unsafe { args[0].float_ref() }.ok_or(BADARG)?.get();
     arinsal_float::float_to_list(value, &float_opts(args)?).map_err(|_| BADARG)
 }
-fn float_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn float_to_list_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let text = formatted_float(args)?;
     Ok(make_list(
         ctx,
@@ -1522,13 +1522,13 @@ fn float_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         Term::NIL,
     ))
 }
-fn float_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn float_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let text = formatted_float(args)?;
     Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
         .binary(text.as_bytes())
         .expect("infallible BIF heap"))
 }
-fn list_to_float(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn list_to_float_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let bytes = list(args[0])?
         .into_iter()
         .map(|t| {
@@ -1542,7 +1542,7 @@ fn list_to_float(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         .float(value)
         .expect("infallible BIF heap"))
 }
-fn binary_to_float(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn binary_to_float_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     binary_bifs::with_binary_input(args[0], |bytes| {
         let value = arinsal_float::list_to_float(bytes).map_err(|_| BADARG)?;
         Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
@@ -1561,7 +1561,7 @@ fn integer_text(args: &[Term]) -> Result<String, BifError> {
     }
     Ok(bigint(args[0])?.to_str_radix(base as u32).to_uppercase())
 }
-fn integer_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn integer_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let text = integer_text(args)?;
     Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
         .binary(text.as_bytes())
@@ -1760,47 +1760,59 @@ pub(super) fn bigint(term: Term) -> Result<BigInt, BifError> {
         .ok_or(BADARG)
 }
 macro_rules! predicate {
-    ($name:ident, $body:expr) => {
-        fn $name(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    ($name:ident, $result:ident, $body:expr) => {
+        fn $result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             Ok(bool_term($body(args[0])))
         }
     };
 }
-predicate!(is_atom, |t: Term| t.classify() == TermKind::Atom);
-predicate!(is_list, |t: Term| matches!(
+predicate!(is_atom, is_atom_result, |t: Term| t.classify()
+    == TermKind::Atom);
+predicate!(is_list, is_list_result, |t: Term| matches!(
     t.classify(),
     TermKind::List | TermKind::Nil
 ));
-predicate!(is_tuple, |t: Term| matches!(
+predicate!(is_tuple, is_tuple_result, |t: Term| matches!(
     t.classify(),
     TermKind::Tuple | TermKind::Record
 ));
-predicate!(is_float, |t: Term| t.classify() == TermKind::Number
+predicate!(is_float, is_float_result, |t: Term| t.classify()
+    == TermKind::Number
     && t.as_small().is_none()
     && {
         // SAFETY: A live boxed number can be queried through its typed view.
         unsafe { t.float_ref() }.is_some()
     });
-predicate!(is_integer, |t: Term| t.as_small().is_some() || {
-    // SAFETY: A live boxed number can be queried through its typed view.
-    unsafe { t.big_ref() }.is_some()
-});
-predicate!(is_number, |t: Term| t.classify() == TermKind::Number);
-predicate!(is_pid, |t: Term| t.classify() == TermKind::Pid);
-predicate!(is_port, |t: Term| t.classify() == TermKind::Port);
-predicate!(is_reference, |t: Term| t.classify() == TermKind::Ref);
-predicate!(is_bitstring, |t: Term| t.classify() == TermKind::Bitstring);
-predicate!(is_binary, |t: Term| {
+predicate!(is_integer, is_integer_result, |t: Term| t
+    .as_small()
+    .is_some()
+    || {
+        // SAFETY: A live boxed number can be queried through its typed view.
+        unsafe { t.big_ref() }.is_some()
+    });
+predicate!(is_number, is_number_result, |t: Term| t.classify()
+    == TermKind::Number);
+predicate!(is_pid, is_pid_result, |t: Term| t.classify()
+    == TermKind::Pid);
+predicate!(is_port, is_port_result, |t: Term| t.classify()
+    == TermKind::Port);
+predicate!(is_reference, is_reference_result, |t: Term| t.classify()
+    == TermKind::Ref);
+predicate!(is_bitstring, is_bitstring_result, |t: Term| t.classify()
+    == TermKind::Bitstring);
+predicate!(is_binary, is_binary_result, |t: Term| {
     // SAFETY: The source heap and binary owner remain live.
     unsafe { t.binary_ref() }.is_some_and(|b| b.bit_len() % 8 == 0)
 });
 predicate!(
     is_boolean,
+    is_boolean_result,
     |t: Term| matches!(t.as_atom(), Some(a) if a == atoms::TRUE || a == atoms::FALSE)
 );
-predicate!(is_map, |t: Term| t.classify() == TermKind::Map);
+predicate!(is_map, is_map_result, |t: Term| t.classify()
+    == TermKind::Map);
 
-fn is_integer_range(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn is_integer_range_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_guard.c:337 (is_integer_3), OTP-29.1.1.
     let lower = bigint(args[1])?;
     let upper = bigint(args[2])?;
@@ -1808,7 +1820,7 @@ fn is_integer_range(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         bigint(args[0]).is_ok_and(|value| lower <= value && value <= upper),
     ))
 }
-fn is_function(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn is_function_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if args.len() == 1 {
         return Ok(bool_term(args[0].classify() == TermKind::Fun));
     }
@@ -1827,7 +1839,7 @@ fn is_function(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     };
     Ok(bool_term(actual as i64 == arity))
 }
-fn is_record(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn is_record_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if args.len() == 1 {
         return Ok(bool_term(args[0].classify() == TermKind::Record));
     }
@@ -1852,7 +1864,7 @@ fn is_record(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         arity.is_none_or(|n| n == Some(tuple_size as i64)),
     ))
 }
-fn cmp_term(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn cmp_term_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:5417-5427 and erl_utils.h:122, OTP-29.1.1.
     let order = arinsal_term::cmp_exact(args[0], args[1]);
     let n = match order {
@@ -1863,7 +1875,7 @@ fn cmp_term(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(Term::small(n).expect("small comparison"))
 }
 /// Port of erts/emulator/beam/beam_debug.c:170-193 (erts_debug_copy_shared_2), OTP-29.1.1.
-fn debug_copy_shared(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn debug_copy_shared_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if args[1] != Term::atom(global_atoms().intern("true").expect("built-in atom"))
         && args[1] != Term::atom(global_atoms().intern("false").expect("built-in atom"))
     {
@@ -1871,13 +1883,13 @@ fn debug_copy_shared(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
     }
     copy_term(args[0], &mut ctx.heap).map_err(|_| BifError::SystemLimit)
 }
-fn debug_flat_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn debug_flat_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, flat_size(args[0]))
 }
-fn debug_same(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn debug_same_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(bool_term(args[0] == args[1]))
 }
-fn bin_is_7bit(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn bin_is_7bit_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(bool_term(
         binary_bifs::with_binary_input(args[0], |bytes| Ok(bytes.iter().all(u8::is_ascii)))
             .is_ok_and(|is_ascii| is_ascii),
@@ -1899,18 +1911,18 @@ fn map_entries(ctx: &mut Ctx<'_>, term: Term) -> Result<Vec<(Term, Term)>, BifEr
         .map(|map| map.iter().collect())
         .ok_or(BADARG)
 }
-fn map_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn map_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let len = map_entries(ctx, args[0])?.len();
     integer(ctx, len)
 }
-fn is_map_key(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn is_map_key_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(bool_term(
         map_entries(ctx, args[1])?
             .iter()
             .any(|(k, _)| exact_eq(*k, args[0])),
     ))
 }
-fn map_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn map_get_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     match map_entries(ctx, args[1])?
         .into_iter()
         .find(|(k, _)| exact_eq(*k, args[0]))
@@ -1925,7 +1937,7 @@ fn map_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         ))),
     }
 }
-fn is_builtin(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn is_builtin_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let module = atom_name(args[0]).ok_or(BADARG)?;
     let name = atom_name(args[1]).ok_or(BADARG)?;
     let arity = args[2].as_small().ok_or(BADARG)?;
@@ -1943,28 +1955,28 @@ fn is_builtin(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
                 .is_some(),
     ))
 }
-fn error(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn error_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Err(BifError::Raise {
         class: Class::Error,
         reason: args[0],
         stacktrace: None,
     })
 }
-fn exit(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn exit_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Err(BifError::Raise {
         class: Class::Exit,
         reason: args[0],
         stacktrace: None,
     })
 }
-fn throw(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn throw_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Err(BifError::Raise {
         class: Class::Throw,
         reason: args[0],
         stacktrace: None,
     })
 }
-fn raise(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn raise_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let invalid = || Term::atom(global_atoms().intern("badarg").expect("atom"));
     let class = match atom_name(args[0]) {
         Some("error") => Class::Error,
@@ -2022,7 +2034,7 @@ fn numeric_float(term: Term) -> Result<f64, BifError> {
     }
     Err(BADARG)
 }
-fn abs(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn abs_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // SAFETY: The source float heap remains live during this call.
     if let Some(view) = unsafe { args[0].float_ref() } {
         return Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
@@ -2039,7 +2051,7 @@ fn abs(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         .int_from_bigint(&positive)
         .map_err(|_| BifError::SystemLimit)
 }
-fn to_float(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn to_float_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // SAFETY: The source float heap remains live during this call.
     if unsafe { args[0].float_ref() }.is_some() {
         return Ok(args[0]);
@@ -2060,16 +2072,16 @@ fn float_integer(ctx: &mut Ctx<'_>, term: Term, op: fn(f64) -> f64) -> Result<Te
         .int_from_bigint(&value)
         .map_err(|_| BifError::SystemLimit)
 }
-fn trunc(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn trunc_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     float_integer(ctx, args[0], f64::trunc)
 }
-fn round(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn round_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     float_integer(ctx, args[0], f64::round)
 }
-fn ceil(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn ceil_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     float_integer(ctx, args[0], f64::ceil)
 }
-fn floor(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn floor_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     float_integer(ctx, args[0], f64::floor)
 }
 fn math_result(ctx: &mut Ctx<'_>, result: f64) -> Result<Term, BifError> {
@@ -2081,8 +2093,8 @@ fn math_result(ctx: &mut Ctx<'_>, result: f64) -> Result<Term, BifError> {
         .expect("infallible BIF heap"))
 }
 macro_rules! math_unary {
-    ($($name:ident => $method:expr),* $(,)?) => {$(
-        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    ($($name:ident => $result:ident => $method:expr),* $(,)?) => {$(
+        fn $result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             math_result(ctx, $method(numeric_float(args[0])?))
         }
     )*};
@@ -2108,137 +2120,185 @@ fn c_erfc(x: f64) -> f64 {
     unsafe { erfc(x) }
 }
 math_unary!(
-    math_cos => f64::cos,
-    math_cosh => f64::cosh,
-    math_sin => f64::sin,
-    math_sinh => f64::sinh,
-    math_tan => f64::tan,
-    math_tanh => f64::tanh,
-    math_acos => f64::acos,
-    math_acosh => f64::acosh,
-    math_asin => f64::asin,
-    math_asinh => f64::asinh,
-    math_atan => f64::atan,
-    math_atanh => c_atanh,
-    math_erf => c_erf,
-    math_erfc => c_erfc,
-    math_exp => f64::exp,
-    math_log => f64::ln,
-    math_log2 => f64::log2,
-    math_log10 => f64::log10,
-    math_sqrt => f64::sqrt,
-    math_floor => f64::floor,
-    math_ceil => f64::ceil,
+    math_cos => math_cos_result => f64::cos,
+    math_cosh => math_cosh_result => f64::cosh,
+    math_sin => math_sin_result => f64::sin,
+    math_sinh => math_sinh_result => f64::sinh,
+    math_tan => math_tan_result => f64::tan,
+    math_tanh => math_tanh_result => f64::tanh,
+    math_acos => math_acos_result => f64::acos,
+    math_acosh => math_acosh_result => f64::acosh,
+    math_asin => math_asin_result => f64::asin,
+    math_asinh => math_asinh_result => f64::asinh,
+    math_atan => math_atan_result => f64::atan,
+    math_atanh => math_atanh_result => c_atanh,
+    math_erf => math_erf_result => c_erf,
+    math_erfc => math_erfc_result => c_erfc,
+    math_exp => math_exp_result => f64::exp,
+    math_log => math_log_result => f64::ln,
+    math_log2 => math_log2_result => f64::log2,
+    math_log10 => math_log10_result => f64::log10,
+    math_sqrt => math_sqrt_result => f64::sqrt,
+    math_floor => math_floor_result => f64::floor,
+    math_ceil => math_ceil_result => f64::ceil,
 );
 macro_rules! math_binary {
-    ($($name:ident => $method:expr),* $(,)?) => {$(
-        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    ($($name:ident => $result:ident => $method:expr),* $(,)?) => {$(
+        fn $result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             math_result(ctx, $method(numeric_float(args[0])?, numeric_float(args[1])?))
         }
     )*};
 }
 math_binary!(
-    math_atan2 => f64::atan2,
-    math_pow => f64::powf,
-    math_fmod => |x: f64, y: f64| x % y,
+    math_atan2 => math_atan2_result => f64::atan2,
+    math_pow => math_pow_result => f64::powf,
+    math_fmod => math_fmod_result => |x: f64, y: f64| x % y,
 );
 
-crate::bif_bodies!(
-    abs,
-    to_float,
-    trunc,
-    round,
-    ceil,
-    floor,
-    size,
-    node,
-    self_bif,
-    min,
-    max,
-    not,
-    and,
-    or,
-    xor,
-    eq,
-    ne,
-    exact_eq_bif,
-    exact_ne,
-    lt,
-    le,
-    gt,
-    ge,
-    phash2_bif,
-    phash_bif,
-    make_ref,
-    unique_integer,
-    system_time,
-    time_unit,
-    atom_to_binary,
-    binary_to_atom,
-    binary_to_existing_atom,
-    float_to_list,
-    float_to_binary,
-    list_to_float,
-    binary_to_float,
-    integer_to_binary,
-    is_atom,
-    is_list,
-    is_tuple,
-    is_float,
-    is_integer,
-    is_integer_range,
-    is_number,
-    is_pid,
-    is_port,
-    is_reference,
-    is_binary,
-    is_bitstring,
-    is_function,
-    is_record,
-    is_boolean,
-    is_map,
-    is_map_key,
-    map_get,
-    map_size,
-    is_builtin,
-    error,
-    exit,
-    throw,
-    raise,
-    cmp_term,
-    debug_copy_shared,
-    debug_flat_size,
-    debug_same,
-    bin_is_7bit,
-    math_cos,
-    math_cosh,
-    math_sin,
-    math_sinh,
-    math_tan,
-    math_tanh,
-    math_acos,
-    math_acosh,
-    math_asin,
-    math_asinh,
-    math_atan,
-    math_atanh,
-    math_erf,
-    math_erfc,
-    math_exp,
-    math_log,
-    math_log2,
-    math_log10,
-    math_sqrt,
-    math_floor,
-    math_ceil,
-    math_atan2,
-    math_pow,
-    math_fmod,
-);
+macro_rules! word_adapter {
+    ($name:ident, $result:ident) => {
+        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+            match $result(ctx, args) {
+                Ok(value) if ctx.has_deferred() => match ctx.take_deferred() {
+                    Some(trap) => ctx.trap(*trap),
+                    None => value,
+                },
+                Ok(value) => value,
+                Err(error) => ctx.fail(error),
+            }
+        }
+    };
+}
 
-crate::word_bif_bodies_in!(word_bodies; hd, tl, element, setelement, tuple_to_list);
-crate::process_bif_bodies_in!(process_bodies;
-    tuple_size, list_to_tuple, make_tuple,
+word_adapter!(abs, abs_result);
+word_adapter!(to_float, to_float_result);
+word_adapter!(trunc, trunc_result);
+word_adapter!(round, round_result);
+word_adapter!(ceil, ceil_result);
+word_adapter!(floor, floor_result);
+word_adapter!(size, size_result);
+word_adapter!(tuple_size, tuple_size_result);
+word_adapter!(node, node_result);
+word_adapter!(self_bif, self_bif_result);
+word_adapter!(min, min_result);
+word_adapter!(max, max_result);
+word_adapter!(not, not_result);
+word_adapter!(and, and_result);
+word_adapter!(or, or_result);
+word_adapter!(xor, xor_result);
+word_adapter!(eq, eq_result);
+word_adapter!(ne, ne_result);
+word_adapter!(exact_eq_bif, exact_eq_bif_result);
+word_adapter!(exact_ne, exact_ne_result);
+word_adapter!(lt, lt_result);
+word_adapter!(le, le_result);
+word_adapter!(gt, gt_result);
+word_adapter!(ge, ge_result);
+word_adapter!(phash_bif, phash_bif_result);
+word_adapter!(make_ref, make_ref_result);
+word_adapter!(unique_integer, unique_integer_result);
+word_adapter!(system_time, system_time_result);
+word_adapter!(time_unit, time_unit_result);
+word_adapter!(list_to_tuple, list_to_tuple_result);
+word_adapter!(make_tuple, make_tuple_result);
+word_adapter!(append_element, append_element_result);
+word_adapter!(delete_element, delete_element_result);
+word_adapter!(insert_element, insert_element_result);
+word_adapter!(atom_to_list, atom_to_list_result);
+word_adapter!(list_to_atom, list_to_atom_result);
+word_adapter!(list_to_existing_atom, list_to_existing_atom_result);
+word_adapter!(atom_to_binary, atom_to_binary_result);
+word_adapter!(binary_to_atom, binary_to_atom_result);
+word_adapter!(binary_to_existing_atom, binary_to_existing_atom_result);
+word_adapter!(float_to_list, float_to_list_result);
+word_adapter!(float_to_binary, float_to_binary_result);
+word_adapter!(list_to_float, list_to_float_result);
+word_adapter!(binary_to_float, binary_to_float_result);
+word_adapter!(integer_to_binary, integer_to_binary_result);
+word_adapter!(is_atom, is_atom_result);
+word_adapter!(is_list, is_list_result);
+word_adapter!(is_tuple, is_tuple_result);
+word_adapter!(is_float, is_float_result);
+word_adapter!(is_integer, is_integer_result);
+word_adapter!(is_integer_range, is_integer_range_result);
+word_adapter!(is_number, is_number_result);
+word_adapter!(is_pid, is_pid_result);
+word_adapter!(is_port, is_port_result);
+word_adapter!(is_reference, is_reference_result);
+word_adapter!(is_binary, is_binary_result);
+word_adapter!(is_bitstring, is_bitstring_result);
+word_adapter!(is_function, is_function_result);
+word_adapter!(is_record, is_record_result);
+word_adapter!(is_boolean, is_boolean_result);
+word_adapter!(is_map, is_map_result);
+word_adapter!(is_map_key, is_map_key_result);
+word_adapter!(map_get, map_get_result);
+word_adapter!(map_size, map_size_result);
+word_adapter!(is_builtin, is_builtin_result);
+word_adapter!(error, error_result);
+word_adapter!(exit, exit_result);
+word_adapter!(throw, throw_result);
+word_adapter!(raise, raise_result);
+word_adapter!(cmp_term, cmp_term_result);
+word_adapter!(debug_copy_shared, debug_copy_shared_result);
+word_adapter!(debug_flat_size, debug_flat_size_result);
+word_adapter!(debug_same, debug_same_result);
+word_adapter!(bin_is_7bit, bin_is_7bit_result);
+word_adapter!(math_cos, math_cos_result);
+word_adapter!(math_cosh, math_cosh_result);
+word_adapter!(math_sin, math_sin_result);
+word_adapter!(math_sinh, math_sinh_result);
+word_adapter!(math_tan, math_tan_result);
+word_adapter!(math_tanh, math_tanh_result);
+word_adapter!(math_acos, math_acos_result);
+word_adapter!(math_acosh, math_acosh_result);
+word_adapter!(math_asin, math_asin_result);
+word_adapter!(math_asinh, math_asinh_result);
+word_adapter!(math_atan, math_atan_result);
+word_adapter!(math_atanh, math_atanh_result);
+word_adapter!(math_erf, math_erf_result);
+word_adapter!(math_erfc, math_erfc_result);
+word_adapter!(math_exp, math_exp_result);
+word_adapter!(math_log, math_log_result);
+word_adapter!(math_log2, math_log2_result);
+word_adapter!(math_log10, math_log10_result);
+word_adapter!(math_sqrt, math_sqrt_result);
+word_adapter!(math_floor, math_floor_result);
+word_adapter!(math_ceil, math_ceil_result);
+word_adapter!(math_atan2, math_atan2_result);
+word_adapter!(math_pow, math_pow_result);
+word_adapter!(math_fmod, math_fmod_result);
+
+fn phash2_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match phash2_bif_result(ctx, args) {
+        Ok(value) if ctx.has_deferred() => {
+            ctx.take_deferred().map_or(value, |trap| ctx.trap(*trap))
+        }
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+crate::word_bif_bodies_in!(word_bodies;
+    abs, to_float, trunc, round, ceil, floor, size, tuple_size, node, self_bif,
+    min, max, not, and, or, xor, eq, ne, exact_eq_bif, exact_ne, lt, le, gt, ge,
+    phash2_bif, phash_bif, make_ref, unique_integer, system_time, time_unit,
+    atom_to_binary, binary_to_atom, binary_to_existing_atom, float_to_list,
+    float_to_binary, list_to_float, binary_to_float, integer_to_binary,
+    is_atom, is_list, is_tuple, is_float, is_integer, is_integer_range, is_number,
+    is_pid, is_port, is_reference, is_binary, is_bitstring, is_function, is_record,
+    is_boolean, is_map, is_map_key, map_get, map_size, is_builtin, error, exit,
+    throw, raise, cmp_term, debug_copy_shared, debug_flat_size, debug_same,
+    bin_is_7bit, math_cos, math_cosh, math_sin, math_sinh, math_tan, math_tanh,
+    math_acos, math_acosh, math_asin, math_asinh, math_atan, math_atanh, math_erf,
+    math_erfc, math_exp, math_log, math_log2, math_log10, math_sqrt, math_floor,
+    math_ceil, math_atan2, math_pow, math_fmod, list_to_tuple, make_tuple,
     append_element, delete_element, insert_element, atom_to_list, list_to_atom,
-    list_to_existing_atom,
+    list_to_existing_atom, hd, tl, element, setelement, tuple_to_list
 );
+mod bodies {
+    pub(super) use super::word_bodies::*;
+}
+mod process_bodies {
+    pub(super) use super::word_bodies::*;
+}

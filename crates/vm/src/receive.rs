@@ -704,6 +704,16 @@ impl Process {
     pub(crate) fn wait_timeout(&mut self, value: Term) -> Result<Option<u64>, VmError> {
         // Port of erts/emulator/beam/emu/msg_instrs.tab:231 (F_DELAY_GC cleared), OTP-29.1.1.
         self.delay_gc = false;
+        // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1214-1218
+        // (beam_jit_wait_timeout), OTP-29.1.1: with no installed receive timer, literal zero
+        // immediately selects RET_next without consulting scheduler time.
+        if !self.receive_infinity
+            && self.receive_deadline.is_none()
+            && self.receive_deadline_ms.is_none()
+            && value.as_small() == Some(0)
+        {
+            return Ok(Some(0));
+        }
         // Port of erts/emulator/beam/emu/msg_instrs.tab:329-334 (wait.src), OTP-29.1.1:
         // once the timer is set (F_TIMO), a re-executed wait_timeout must not read
         // its operand again; no X register is live across the wait.
