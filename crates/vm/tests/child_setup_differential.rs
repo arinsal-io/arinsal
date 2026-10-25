@@ -70,3 +70,62 @@ fn port_child_sigchld_notifications_match_otp() {
         .expect("run child-setup differential");
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
+
+const CONCURRENT_SOURCE: &str = r#"
+-module(child_setup_concurrent_diff).
+-export([run/2]).
+
+run(Spawners, Rounds) ->
+    Me = self(),
+    Pids = [spawn(fun() -> Me ! {self(), spawner(Rounds)} end) || _ <- lists:seq(1, Spawners)],
+    [receive {P, R} -> R after 30000 -> timeout end || P <- Pids].
+
+spawner(0) -> ok;
+spawner(N) ->
+    Port = open_port({spawn_executable, "/usr/bin/true"}, [exit_status, hide]),
+    receive
+        {Port, {exit_status, 0}} -> spawner(N - 1)
+    after 30000 -> timeout
+    end.
+"#;
+
+/// Start requests that reach the child-setup helper together must all be served: the helper's
+/// poll registration is edge-triggered, so a request queued behind another one used to stay
+/// unread and its spawner waited for the `Go` frame forever.
+#[test]
+fn concurrent_port_spawns_all_complete_like_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping concurrent child-setup differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named("child_setup_concurrent_diff", CONCURRENT_SOURCE, &[])
+        .expect("compile concurrent child-setup differential");
+    reference
+        .load("child_setup_concurrent_diff", &beam)
+        .expect("load concurrent child-setup differential");
+    let args = [
+        arinsal_etf::OwnedTerm::Int(16),
+        arinsal_etf::OwnedTerm::Int(25),
+    ];
+    let options = CallOptions {
+        timeout_ms: Some(60_000),
+        ..CallOptions::default()
+    };
+    let expected = reference
+        .call_opts("child_setup_concurrent_diff", "run", &args, &options)
+        .result;
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam)
+        .expect("load concurrent child-setup differential");
+    let mut heap = arinsal_term::VecHeap::new();
+    let terms: Vec<_> = args
+        .iter()
+        .map(|arg| arinsal_term::from_owned(arg, &mut heap).unwrap())
+        .collect();
+    let actual = vm
+        .eval_scheduled("child_setup_concurrent_diff", "run", &terms, 4, None)
+        .expect("run concurrent child-setup differential");
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+}
