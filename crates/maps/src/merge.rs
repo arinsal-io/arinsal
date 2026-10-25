@@ -844,6 +844,26 @@ fn map_merge_mixed<H: HeapAlloc + ?Sized>(
     )))
 }
 
+/// `maps:merge/2` of two flatmaps, the one case that never yields and cannot fail on the
+/// arguments: `None` for anything else (a hashmap, a non-map), with nothing allocated.
+// Port of erts/emulator/beam/erl_map.c:1257-1284 (maps_merge_2: the is_flatmap pair is
+// `flatmap_merge`), OTP-29.1.1.
+#[inline]
+pub fn merge_flatmaps<H: HeapAlloc + ?Sized>(
+    left: Term,
+    right: Term,
+    heap: &mut H,
+) -> Option<Term> {
+    let flat = |map: Term| matches!(map.header(), Some(header) if header & 63 == MAP && header & 0xc0 == 0);
+    if !flat(left) || !flat(right) {
+        return None;
+    }
+    if left == right {
+        return Some(left);
+    }
+    flatmap_merge(left, right, heap).ok()
+}
+
 /// `maps:merge/2` without yielding; right values win.
 pub fn merge<H: HeapAlloc + ?Sized>(left: Term, right: Term, heap: &mut H) -> MapResult<Term> {
     match merge_start(left, right, heap)? {

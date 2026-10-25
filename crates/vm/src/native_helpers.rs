@@ -2799,6 +2799,12 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
 ) -> Option<u64> {
     process.reductions = process.header.fcalls;
     let entry_top = process.heap.heap_top_index();
+    // A call that needs no trap state returns its value at once.
+    if registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
+        && let Some(value) = T::direct(process, &registers.x_reg_array[..arity])
+    {
+        return Some(light_value_return(process, entry_top, value));
+    }
     let gc_was_enabled = process.heap.gc_enabled;
     let pid = process.self_pid;
     // The body reads its arguments in place; a copy is taken only when a trap must keep them.
