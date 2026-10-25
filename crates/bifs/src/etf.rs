@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 
 use arinsal_etf::DecodedSizeWalk;
 use arinsal_term::{
-    Atom, BinaryOwner, ExportEntry, FunEntry, FunRef, HeapAlloc, HeapReservation,
+    Atom, BinaryOwner, ConsListBuilder, ExportEntry, FunEntry, FunRef, HeapAlloc, HeapReservation,
     HeapReservationState, Identity, Node, OwnedBinaryRef, Term, TermBuilder, TermKind, atoms,
     binary_owner, cmp_exact, flat_key_cmp, global_atoms, hashmap_from_ks_and_vs_extra,
     writable_finalize, writable_resize_private,
@@ -2160,7 +2160,9 @@ enum FrameKind {
     Tuple {
         slots: Option<arinsal_term::HeapBlockBuilder>,
     },
-    List,
+    List {
+        slots: Option<ConsListBuilder>,
+    },
     Map {
         keys: SmallVec<[Term; 4]>,
         map_values: SmallVec<[Term; 4]>,
@@ -2233,6 +2235,9 @@ fn accept_child(frame: &mut Frame, term: Term, shape: Shape) -> Result<(), BifEr
                 map_values.push(term);
             }
         }
+        FrameKind::List { slots: Some(slots) } if frame.left > 1 => {
+            slots.append(term).map_err(map_term_build_error)?;
+        }
         _ => {
             frame.values.push(term);
             frame.shapes.push(shape);
@@ -2256,7 +2261,12 @@ fn finish<H: HeapAlloc>(
             };
             Ok((term, Shape::Other))
         }
-        FrameKind::List => {
+        FrameKind::List { slots: Some(slots) } => {
+            let tail = values.into_iter().next().ok_or(BifError::BADARG)?;
+            let term = slots.finish(tail).map_err(map_term_build_error)?;
+            Ok((term, Shape::Other))
+        }
+        FrameKind::List { slots: None } => {
             let mut it = values.into_iter().rev();
             let mut tail = it.next().ok_or(BifError::BADARG)?;
             if ctx.is_some() {
@@ -2557,7 +2567,16 @@ fn parse_step<H: HeapAlloc>(
                 } else {
                     stack.push(Frame {
                         kind: if tag == 108 {
-                            FrameKind::List
+                            let slots = if let Some(context) = ctx.as_deref_mut() {
+                                Some(
+                                    TermBuilder::new(&mut context.heap)
+                                        .reserve_cons_list(n)
+                                        .map_err(map_term_build_error)?,
+                                )
+                            } else {
+                                None
+                            };
+                            FrameKind::List { slots }
                         } else {
                             FrameKind::Map {
                                 keys: SmallVec::with_capacity(n.min(1024)),

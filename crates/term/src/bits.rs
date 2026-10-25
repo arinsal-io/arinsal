@@ -121,17 +121,6 @@ pub struct RefcBinary {
 }
 
 impl RefcBinary {
-    // Port of erts/emulator/beam/erl_binary.h:287 (erts_bin_nrml_alloc_fnf), OTP-29.1.1.
-    pub(crate) fn new(bytes: Vec<u8>) -> Result<Self, TermError> {
-        let mut allocation =
-            BinaryBlock::new(bytes.len(), 0, bytes.len()).map_err(|_| TermError::SystemLimit)?;
-        allocation
-            .bytes_mut_unique()
-            .ok_or(TermError::BadArg)?
-            .copy_from_slice(&bytes);
-        Ok(Self { allocation })
-    }
-
     /// A binary of `size` bytes the caller fills before sharing it (`erts_bin_nrml_alloc`).
     pub fn new_zeroed(size: usize) -> Result<Self, TermError> {
         let allocation = BinaryBlock::new(size, 0, size).map_err(|_| TermError::SystemLimit)?;

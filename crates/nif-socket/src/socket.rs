@@ -3481,6 +3481,7 @@ mod tests {
             atom("ok")
         );
     }
+    #[cfg(target_os = "macos")]
     fn normalized_term(value: &O) -> String {
         match value {
             O::Map(entries) => {
@@ -3514,6 +3515,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn eval_otp_term(expression: &str, path: &std::path::Path) -> Option<O> {
         let output = match Command::new("timeout")
             .args(["30", "erl", "-noshell", "-eval", expression])
