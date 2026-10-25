@@ -3788,13 +3788,13 @@ fn term_to_iovec(
 
 fn new_term_encoder(args: &[Term]) -> Result<arinsal_bifs::EncodeWalk, BifError> {
     let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
-    let (node_name, creation) = {
+    let (node, creation) = {
         let tables = crate::node_tables::lock();
-        (tables.local_name.clone(), tables.local_creation)
+        let node = global_atoms()
+            .intern(&tables.local_name)
+            .map_err(|_| BifError::SystemLimit)?;
+        (node, tables.local_creation)
     };
-    let node = global_atoms()
-        .intern(&node_name)
-        .map_err(|_| BifError::SystemLimit)?;
     encoder.set_local_node(node, creation);
     Ok(encoder)
 }
