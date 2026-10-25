@@ -499,7 +499,7 @@ pub struct TupleRef<'a> {
 impl<'a> TupleRef<'a> {
     /// The element words, for scans that borrow past this view.
     #[inline]
-    pub(crate) fn words(&self) -> &'a [u64] {
+    pub fn words(&self) -> &'a [u64] {
         self.elements
     }
 }
