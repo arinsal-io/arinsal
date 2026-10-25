@@ -1396,6 +1396,16 @@ impl CompiledVersion {
 
     // Port of erts/emulator/beam/beam_load.c:258 and jit/asm_load.c:1149-1218, OTP-29.1.1.
     pub(crate) fn install(self: &Arc<Self>, module: &arinsal_loader::Module) -> bool {
+        if !self.native_functions.is_empty()
+            && crate::native_bridge::register_native_module(
+                &self.native_functions,
+                self.code_start,
+                self.code_end,
+            )
+            .is_err()
+        {
+            return false;
+        }
         let catch_ids = crate::native_bridge::register_native_catches(
             self.scope,
             self.catch_base,
@@ -1406,21 +1416,6 @@ impl CompiledVersion {
                 .collect::<Vec<_>>(),
         );
         *self.catch_ids.lock().unwrap() = catch_ids;
-        let mut registered = Vec::with_capacity(self.native_functions.len());
-        for function in &self.native_functions {
-            if crate::register_native_function(function.clone()).is_err() {
-                crate::native_bridge::unregister_native_functions(&registered);
-                let catch_ids = std::mem::take(
-                    &mut *self
-                        .catch_ids
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                );
-                crate::native_bridge::unregister_native_catches(self.scope, &catch_ids);
-                return false;
-            }
-            registered.push(function.clone());
-        }
         let code_index = crate::code_ix::for_scope(self.scope).staging();
         for (entry, target) in &self.lambda_targets {
             entry.set_fun_code(code_index, *target);
@@ -1505,7 +1500,14 @@ impl Drop for CompiledVersion {
         if self.installed.load(Ordering::Acquire) {
             self.retire_literals();
         }
-        crate::native_bridge::unregister_native_functions(&self.native_functions);
+        if self.installed.load(Ordering::Acquire) && !self.native_functions.is_empty() {
+            crate::native_bridge::unregister_native_module(
+                &self.native_functions,
+                self.code_start,
+                self.code_end,
+                self.scope,
+            );
+        }
         crate::native_bridge::unregister_native_catches(
             self.scope,
             &self

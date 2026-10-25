@@ -134,6 +134,7 @@ pub(crate) struct NativeStackFrame {
 /// One native function inside a module range. The line table is shared, not cloned per frame.
 #[derive(Clone)]
 pub(crate) struct FunctionRange {
+    scope: u64,
     start: usize,
     end: usize,
     module_atom: arinsal_term::Atom,
@@ -160,6 +161,7 @@ struct LineLoc {
 /// OTP-29.1.1. `find_range` binary-searches the module, then the function inside it.
 #[derive(Clone)]
 pub(crate) struct ModuleRange {
+    scope: u64,
     start: usize,
     end: usize,
     module_atom: arinsal_term::Atom,
@@ -167,6 +169,20 @@ pub(crate) struct ModuleRange {
     /// `functions[i].start`. `erts_lookup_function_info` binary-searches an array of
     /// code pointers, not the function records (beam_ranges.c:262-278), OTP-29.1.1.
     fn_starts: Arc<[usize]>,
+}
+
+impl ModuleRange {
+    pub(crate) fn scope(&self) -> u64 {
+        self.scope
+    }
+
+    pub(crate) fn start(&self) -> usize {
+        self.start
+    }
+
+    pub(crate) fn end(&self) -> usize {
+        self.end
+    }
 }
 
 fn scope0_ranges() -> &'static arc_swap::ArcSwap<Vec<ModuleRange>> {
@@ -191,6 +207,7 @@ fn function_range(info: &NativeFunction) -> FunctionRange {
         })
         .collect();
     FunctionRange {
+        scope: info.scope,
         start: info.start,
         end: info.end,
         module_atom: info.module_atom,
@@ -208,12 +225,68 @@ fn module_range(
     functions: Vec<FunctionRange>,
 ) -> ModuleRange {
     let fn_starts: Arc<[usize]> = functions.iter().map(|function| function.start).collect();
+    let scope = functions.first().map_or(0, |function| function.scope);
     ModuleRange {
+        scope,
         start,
         end,
         module_atom,
         functions: Arc::from(functions),
         fn_starts,
+    }
+}
+
+// Port of erts/emulator/beam/beam_ranges.c:33-66 and :245-278, OTP-29.1.1.
+fn native_module_range(
+    start: usize,
+    end: usize,
+    module_atom: arinsal_term::Atom,
+    functions: &[NativeFunction],
+) -> ModuleRange {
+    let mut function_ranges = functions.iter().map(function_range).collect::<Vec<_>>();
+    function_ranges.sort_unstable_by_key(|function| function.start);
+    module_range(start, end, module_atom, function_ranges)
+}
+
+// Port of erts/emulator/beam/beam_ranges.c:137-180 (erts_end_staging_ranges), OTP-29.1.1.
+fn insert_module_range(ranges: &mut Vec<ModuleRange>, range: ModuleRange) {
+    let at = ranges.partition_point(|entry| entry.start < range.start);
+    assert!(
+        at == 0 || ranges[at - 1].end <= range.start,
+        "native module ranges overlap"
+    );
+    assert!(
+        at == ranges.len() || range.end <= ranges[at].start,
+        "native module ranges overlap"
+    );
+    ranges.insert(at, range);
+}
+
+// Port of erts/emulator/beam/beam_ranges.c:194-219 (erts_update_ranges), OTP-29.1.1.
+fn publish_native_module_range(scope: u64, range: ModuleRange) {
+    if scope != 0 {
+        crate::code_ix::for_scope(scope).add_staging_code_range(range);
+        return;
+    }
+    let mut seed = scope0_ranges().load_full().as_ref().clone();
+    insert_module_range(&mut seed, range.clone());
+    scope0_ranges().store(Arc::new(seed));
+    crate::code_ix::with_all_scopes(|indexes| {
+        let mut ranges = indexes.code_ranges().as_ref().clone();
+        insert_module_range(&mut ranges, range.clone());
+        indexes.store_code_ranges(Arc::new(ranges));
+    });
+}
+
+// Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
+fn unpublish_native_module_range(scope: u64, start: usize, end: usize) {
+    if scope == 0 {
+        let mut seed = scope0_ranges().load_full().as_ref().clone();
+        seed.retain(|range| range.start != start || range.end != end);
+        scope0_ranges().store(Arc::new(seed));
+        crate::code_ix::with_all_scopes(|indexes| indexes.remove_code_range(start, end));
+    } else if let Some(indexes) = crate::code_ix::existing_scope(scope) {
+        indexes.remove_code_range(start, end);
     }
 }
 
@@ -807,7 +880,79 @@ pub fn register_native_function(info: NativeFunction) -> Result<(), &'static str
     Ok(())
 }
 
+/// Installs one compiled module's native functions with one registry write and one staged
+/// module-range update, matching `erts_update_ranges`' per-module code-index entry.
+// Port of erts/emulator/beam/beam_ranges.c:194-219 (erts_update_ranges), OTP-29.1.1.
+pub(crate) fn register_native_module(
+    functions: &[NativeFunction],
+    code_start: usize,
+    code_end: usize,
+) -> Result<(), &'static str> {
+    if code_start >= code_end || functions.is_empty() {
+        return Err("native module range must be non-empty");
+    }
+    let first = &functions[0];
+    if functions.iter().any(|function| {
+        function.scope != first.scope
+            || function.module_atom != first.module_atom
+            || function.start < code_start
+            || function.end > code_end
+            || function.start >= function.end
+    }) {
+        return Err("native functions must belong to one module code range");
+    }
+    let mut ordered = functions.to_vec();
+    ordered.sort_unstable_by_key(|function| function.start);
+    if ordered.windows(2).any(|pair| pair[0].end > pair[1].start) {
+        return Err("native function ranges must not overlap");
+    }
+    arinsal_term::register_native_code_range(code_start, code_end)?;
+    let mut registered = native_functions().write();
+    for function in &ordered {
+        let index = registered.partition_point(|entry| entry.start < function.start);
+        let overlaps_previous = index
+            .checked_sub(1)
+            .and_then(|previous| registered.get(previous))
+            .is_some_and(|previous| function.start < previous.end);
+        let overlaps_next = registered
+            .get(index)
+            .is_some_and(|next| next.start < function.end);
+        if overlaps_previous || overlaps_next {
+            drop(registered);
+            arinsal_term::unregister_native_code_range(code_start, code_end);
+            return Err("native function ranges must not overlap");
+        }
+    }
+    for function in &ordered {
+        update_perf_map(function);
+    }
+    registered.extend(ordered.iter().cloned());
+    registered.sort_unstable_by_key(|function| function.start);
+    drop(registered);
+    let range = native_module_range(code_start, code_end, first.module_atom, &ordered);
+    publish_native_module_range(first.scope, range);
+    native_generation().fetch_add(1, Ordering::Release);
+    Ok(())
+}
+
+/// Removes a purged module's native metadata and its per-index code range.
+// Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
+pub(crate) fn unregister_native_module(
+    functions_to_remove: &[NativeFunction],
+    code_start: usize,
+    code_end: usize,
+    scope: u64,
+) {
+    let mut functions = native_functions().write();
+    functions.retain(|registered| !functions_to_remove.contains(registered));
+    drop(functions);
+    arinsal_term::unregister_native_code_range(code_start, code_end);
+    unpublish_native_module_range(scope, code_start, code_end);
+    native_generation().fetch_add(1, Ordering::Release);
+}
+
 /// Unregisters native function entries when their owning module version is purged.
+#[cfg(test)]
 pub(crate) fn unregister_native_functions(entries: &[NativeFunction]) {
     let mut functions = native_functions().write();
     let before = functions.len();
@@ -837,6 +982,16 @@ pub(crate) fn unregister_native_scope(scope: u64) {
         return;
     }
     let mut functions = native_functions().write();
+    let module_ranges = crate::code_ix::existing_scope(scope)
+        .map(|indexes| indexes.code_ranges())
+        .map(|ranges| {
+            ranges
+                .iter()
+                .filter(|range| range.scope == scope)
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut removed = Vec::new();
     functions.retain(|function| {
         if function.scope == scope {
@@ -849,6 +1004,12 @@ pub(crate) fn unregister_native_scope(scope: u64) {
     for function in &removed {
         arinsal_term::unregister_native_code_range(function.start, function.end);
         unpublish_function_range(function);
+    }
+    if let Some(indexes) = crate::code_ix::existing_scope(scope) {
+        indexes.remove_code_ranges_scope(scope);
+    }
+    for (start, end) in module_ranges {
+        arinsal_term::unregister_native_code_range(start, end);
     }
     native_generation().fetch_add(1, Ordering::Release);
 }

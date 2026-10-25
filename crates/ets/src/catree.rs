@@ -284,7 +284,7 @@ impl CATree {
                 std::thread::yield_now();
                 continue;
             }
-            let new_words = object.as_ref().unwrap().db_size_words as isize;
+            let new_words = object.as_ref().unwrap().db_size_words() as isize;
             let result = root.insert_with_key(object.take().unwrap(), key, self.keypos, false);
             self.version.fetch_add(1, AtomicOrdering::Release);
             let old_words = match result {
@@ -368,7 +368,7 @@ impl CATree {
             let stored = object
                 .take()
                 .expect("CA-tree insert object retained on retry");
-            let words = stored.db_size_words as isize;
+            let words = stored.db_size_words() as isize;
             let result = root.insert_with_key(stored, key, self.keypos, true);
             self.version.fetch_add(1, AtomicOrdering::Release);
             let inserted = matches!(result, crate::tree::InsertResult::Inserted);

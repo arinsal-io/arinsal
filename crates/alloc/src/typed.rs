@@ -952,6 +952,80 @@ pub fn driver_free(ptr: *mut u8) {
     }
 }
 
+/// Words in `alloc_util::BlockLayout` ahead of the user payload (`bhdr` + `carrier`).
+/// While a block is allocated (`!IS_FREE_BLK`), `alloc_util` leaves the second word
+/// (`base - 8`, `BlockLayout.carrier`) untouched, so `ets_alloc` stores the owning allocator
+/// instance there with zero extra prefix words (standing in for `BLK_TO_MBC(blk)->allctr` in
+/// `erts/emulator/beam/erl_alloc_util.h:376,441`, OTP-29.1.1).
+const ETS_BLOCK_HEADER_WORDS: usize = 2;
+
+#[inline]
+fn ets_handle(user: *mut u64, words: usize) -> Result<InstanceAllocation, AllocError> {
+    let bytes = words
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(AllocError::OutOfBounds)?;
+    let instance = crate::raw::words_at(user.wrapping_sub(1), 1)[0] as usize;
+    let id = (user as usize - ETS_BLOCK_HEADER_WORDS * std::mem::size_of::<u64>()) as u64;
+    Ok(InstanceAllocation::from_parts(instance, id, bytes))
+}
+
+#[inline]
+fn ets_publish(handle: InstanceAllocation, base: *mut u64) -> *mut u64 {
+    crate::raw::words_at_mut(base.wrapping_sub(1), 1)[0] = handle.instance() as u64;
+    base
+}
+
+/// Allocate `words` machine words in `ets_alloc` (`ERTS_ALC_T_DB_TERM`) without a heap prefix.
+// Port of erts/emulator/beam/erl_db.h:191 (`erts_db_alloc`), OTP-29.1.1.
+pub fn ets_alloc_words(words: usize) -> Result<*mut u64, AllocError> {
+    if words == 0 {
+        return Ok(std::ptr::null_mut());
+    }
+    let bytes = words
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(AllocError::OutOfBounds)?;
+    let allocators = allocator_for(ErtsAlcType::DB_TERM)?;
+    let (handle, base) =
+        allocators.alloc_with_ptr_at(crate::instances::thread_alloc_ix(), bytes)?;
+    Ok(ets_publish(handle, base))
+}
+
+/// Resize an `ets_alloc` block from `old_words` to `new_words` machine words.
+// Port of erts/emulator/beam/erl_db.h:248 (`erts_db_realloc`), OTP-29.1.1.
+pub fn ets_realloc_words(
+    user: *mut u64,
+    old_words: usize,
+    new_words: usize,
+) -> Result<*mut u64, AllocError> {
+    if user.is_null() {
+        return ets_alloc_words(new_words);
+    }
+    if new_words == 0 {
+        ets_free_words(user, old_words);
+        return Ok(std::ptr::null_mut());
+    }
+    let new_bytes = new_words
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(AllocError::OutOfBounds)?;
+    let allocators = allocator_for(ErtsAlcType::DB_TERM)?;
+    let handle = ets_handle(user, old_words)?;
+    let (new_handle, new_base) = allocators.realloc_with_ptr(handle, new_bytes)?;
+    Ok(ets_publish(new_handle, new_base))
+}
+
+/// Free an `ets_alloc` block of `words` machine words; null is ignored.
+// Port of erts/emulator/beam/erl_db.h:290 (`erts_db_free`), OTP-29.1.1.
+pub fn ets_free_words(user: *mut u64, words: usize) {
+    if user.is_null() {
+        return;
+    }
+    if let (Ok(allocators), Ok(handle)) =
+        (allocator_for(ErtsAlcType::DB_TERM), ets_handle(user, words))
+    {
+        let _ = allocators.free_at(crate::instances::thread_alloc_ix(), handle);
+    }
+}
+
 /// Apply the queued cross-thread frees of the instances no scheduler owns.
 ///
 /// Port of `handle_delayed_dealloc` (erl_process.c) and
@@ -1021,6 +1095,14 @@ pub fn process_allocation_bytes() -> u64 {
 pub fn binary_allocation_bytes() -> u64 {
     allocator_for(ErtsAlcType::BINARY)
         .expect("the BINARY allocator is configured")
+        .current_blocks_size() as u64
+}
+
+/// Current allocated bytes belonging to the erts `ets_alloc` allocator (`ERTS_ALC_A_ETS`).
+// Port of erts/emulator/beam/erl_alloc.c:2509 (alcu_size(ERTS_ALC_A_ETS)), OTP-29.1.1.
+pub fn ets_allocation_bytes() -> u64 {
+    allocator_for(ErtsAlcType::DB_TERM)
+        .expect("the ETS allocator is configured")
         .current_blocks_size() as u64
 }
 
