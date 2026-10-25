@@ -3886,7 +3886,9 @@ struct PortData(Option<Box<PortDataBlock>>);
 
 struct PortDataBlock {
     term: Term,
-    _fragment: Option<ProcessHeap>,
+    /// The words `term` points into, when it is not an immediate (erts keeps them in the same
+    /// allocation, `ErtsPortDataHeap`).
+    _fragment: Option<Box<arinsal_term::VecHeap>>,
 }
 
 impl PortData {
@@ -3969,9 +3971,8 @@ fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmEr
             _fragment: None,
         })))
     } else {
-        let mut heap =
-            ProcessHeap::with_words_for_type(size, arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG);
-        let term = arinsal_term::copy_struct(data, &mut heap, size).map_err(|_| badarg())?;
+        let mut heap = Box::new(arinsal_term::VecHeap::with_initial_chunk_words(size));
+        let term = arinsal_term::copy_struct(data, &mut *heap, size).map_err(|_| badarg())?;
         PortData(Some(Box::new(PortDataBlock {
             term,
             _fragment: Some(heap),

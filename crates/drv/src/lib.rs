@@ -674,8 +674,6 @@ pub struct DriverPort {
     drv_data: AtomicUsize,
     control_flags: AtomicI32,
     state: AtomicU32,
-    /// `prt->linebuf`: allocated by the first line-mode setup, null before.
-    linebuf: Mutex<Option<Box<LineBuf>>>,
     /// Caller during a callback (`prt->caller`): the pid data with [`CALLER_SET`], else zero.
     caller: AtomicU64,
     lock: Option<Box<ReentrantLock>>,
@@ -690,8 +688,9 @@ pub struct DriverPort {
     /// `prt->port_data_lock` (a `threads::PortDataLock`), zero when none.
     pdl: AtomicUsize,
     /// Process monitors held by this port: monitor id to process-table data.
-    monitors: Mutex<ext::PidMonitors>,
-    msgq_limits: Mutex<ext::MsgqLimits>,
+    /// Rarely used state, allocated on first use (erts keeps `prt->linebuf`, the monitor tree and the
+    /// busy message queue limits as null pointers until they are set).
+    cold: Mutex<Option<Box<DrvCold>>>,
     os_pid: AtomicI64,
     /// An `open_port` is waiting for `erl_drv_init_ack`.
     async_open: std::sync::atomic::AtomicBool,
@@ -705,6 +704,38 @@ pub struct DriverPort {
     slot: AtomicUsize,
     /// State of a [`NativeDriver`] port.
     native_data: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// The parts of a [`DriverPort`] most ports never use.
+struct DrvCold {
+    monitors: ext::PidMonitors,
+    msgq_limits: ext::MsgqLimits,
+    linebuf: Option<Box<LineBuf>>,
+}
+
+impl Default for DrvCold {
+    fn default() -> Self {
+        Self {
+            monitors: ext::PidMonitors::default(),
+            msgq_limits: ext::MSGQ_LIMITS_DEFAULT,
+            linebuf: None,
+        }
+    }
+}
+
+impl DriverPort {
+    /// Runs `f` on the cold state, allocating it first.
+    fn with_cold<R>(&self, f: impl FnOnce(&mut DrvCold) -> R) -> R {
+        f(self.cold.lock().get_or_insert_with(Default::default))
+    }
+
+    /// The busy message queue limits (`prt->bpq` limits): the defaults until set.
+    fn msgq_limits(&self) -> ext::MsgqLimits {
+        self.cold
+            .lock()
+            .as_ref()
+            .map_or(ext::MSGQ_LIMITS_DEFAULT, |cold| cold.msgq_limits)
+    }
 }
 
 /// Set in `DriverPort::caller` while a callback has a caller (pid data 0 is a valid pid).
@@ -774,7 +805,6 @@ impl DriverPort {
             drv_data: AtomicUsize::new(0),
             control_flags: AtomicI32::new(0),
             state: AtomicU32::new(0),
-            linebuf: Mutex::new(None),
             caller: AtomicU64::new(0),
             lock,
             name: Mutex::new(String::new()),
@@ -783,8 +813,7 @@ impl DriverPort {
             timer_epoch: AtomicU64::new(0),
             queue: Mutex::new(queue::IoQueue::default()),
             pdl: AtomicUsize::new(0),
-            monitors: Mutex::new(ext::PidMonitors::default()),
-            msgq_limits: Mutex::new(ext::MSGQ_LIMITS_DEFAULT),
+            cold: Mutex::new(None),
             os_pid: AtomicI64::new(-1),
             async_open: std::sync::atomic::AtomicBool::new(false),
             sched: port_task::PortSched::default(),
@@ -948,7 +977,7 @@ impl DriverPort {
         }
         if let Some(size) = line {
             flags |= SFLG_LINEBUF_IO;
-            *self.linebuf.lock() = Some(Box::new(LineBuf::new(size)));
+            self.with_cold(|cold| cold.linebuf = Some(Box::new(LineBuf::new(size))));
         }
         self.state.fetch_or(flags, Ordering::AcqRel);
     }
@@ -1251,7 +1280,12 @@ impl DriverPort {
         let binary = state & SFLG_BINARY_IO != 0;
         if state & SFLG_LINEBUF_IO != 0 {
             // Port of io.c:3460 (deliver_linebuf_message).
-            let lines = match self.linebuf.lock().as_mut() {
+            let lines = match self
+                .cold
+                .lock()
+                .as_mut()
+                .and_then(|cold| cold.linebuf.as_mut())
+            {
                 Some(linebuf) => linebuf.read(data.unwrap_or_default()),
                 None => Vec::new(),
             };
@@ -1270,7 +1304,12 @@ impl DriverPort {
         let state = self.state.load(Ordering::Acquire);
         if eof && state & SFLG_LINEBUF_IO != 0 {
             // Port of io.c:3478 (flush_linebuf_messages).
-            let lines = match self.linebuf.lock().as_mut() {
+            let lines = match self
+                .cold
+                .lock()
+                .as_mut()
+                .and_then(|cold| cold.linebuf.as_mut())
+            {
                 Some(linebuf) => linebuf.flush(),
                 None => Vec::new(),
             };
