@@ -162,17 +162,9 @@ impl Trap {
 pub(super) fn native_trap(class: u64, reason: u64) -> Result<Trap, VmError> {
     // SAFETY: The native hook accepts only tagged BEAM terms supplied by generated code.
     let reason = unsafe { Term::from_raw_bits(reason) };
-    // BeamAsm emitters store either the compact class tags used by `set_error`
-    // (1/2/3) or OTP-style freason codes / the module assembler's `0x1b` error
-    // sentinel from `emit_error`. All of those are Error-class exits unless the
-    // compact Exit/Throw tags are used.
-    let class = match class {
-        1 | 0x1b => Class::Error,
-        2 => Class::Exit,
-        3 => Class::Throw,
-        other if other != 0 => Class::Error,
-        _ => return Err(VmError::Unsupported("native exception class".into())),
-    };
+    // `class` is a `freason` (error.h `EXC_*`): the class is its low bits.
+    let class = stacktrace::class_from_freason(class)
+        .ok_or_else(|| VmError::Unsupported("native exception class".into()))?;
     Ok(Trap {
         class,
         reason,
@@ -907,14 +899,10 @@ fn save_raw(
         stacktrace::StackTraceSave {
             class,
             depth,
-            freason: if p.header.freason != 0 {
-                p.header.freason
+            freason: if p.header.exc.freason != 0 {
+                p.header.exc.freason
             } else {
-                match class {
-                    Class::Error => 1,
-                    Class::Exit => 2,
-                    Class::Throw => 3,
-                }
+                stacktrace::class_to_freason(Some(class))
             },
             native_pc,
             top: save_top,

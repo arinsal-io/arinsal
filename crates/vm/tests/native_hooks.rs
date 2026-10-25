@@ -106,10 +106,13 @@ fn badarith_caught_by_interpreted_try() {
         }),
         ExitReason::Returned
     );
-    assert_eq!(process.native_header().freason, 1);
+    assert_eq!(
+        process.native_header().exc.freason,
+        arinsal_beamasm::exc::EXC_BADARITH
+    );
     let badarith = arinsal_term::global_atoms().intern("badarith").unwrap();
     assert_eq!(
-        from_bits(process.native_header().fvalue).as_atom(),
+        from_bits(process.native_header().exc.fvalue).as_atom(),
         Some(badarith)
     );
 

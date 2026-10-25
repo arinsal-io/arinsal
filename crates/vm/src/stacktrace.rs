@@ -702,8 +702,8 @@ pub(crate) fn note_caught_bif_frame(
                         StoredTopFrame::CurrentArgs(args_term)
                     }
                 };
-                let freason = p.header.freason;
-                let fvalue = p.header.fvalue;
+                let freason = p.header.exc.freason;
+                let fvalue = p.header.exc.fvalue;
                 p.cold_mut().pending_trace_top = Some(Box::new(PendingTop {
                     freason,
                     fvalue,
@@ -719,8 +719,8 @@ pub(crate) fn note_caught_bif_frame(
     let Some(top) = bif_pending_top(module, function, args, info) else {
         return;
     };
-    let freason = p.header.freason;
-    let fvalue = p.header.fvalue;
+    let freason = p.header.exc.freason;
+    let fvalue = p.header.exc.fvalue;
     p.cold_mut().pending_trace_top = Some(Box::new(PendingTop {
         freason,
         fvalue,
@@ -747,14 +747,14 @@ fn bif_pending_top(
 
 fn clone_matching_pending(p: &Process) -> Option<StoredTopFrame> {
     let pending = p.cold.as_ref()?.pending_trace_top.as_ref()?;
-    (pending.freason == p.header.freason && pending.fvalue == p.header.fvalue)
+    (pending.freason == p.header.exc.freason && pending.fvalue == p.header.exc.fvalue)
         .then(|| pending.top.clone())
 }
 
 pub(super) fn take_matching_pending_top(p: &mut Process) -> Option<StoredTopFrame> {
     let cold = p.cold.as_mut()?;
     let matches = cold.pending_trace_top.as_ref().is_some_and(|pending| {
-        pending.freason == p.header.freason && pending.fvalue == p.header.fvalue
+        pending.freason == p.header.exc.freason && pending.fvalue == p.header.exc.fvalue
     });
     matches
         .then(|| cold.pending_trace_top.take().map(|pending| pending.top))
@@ -1002,8 +1002,8 @@ fn runtime_backtrace_depth(p: &Process, fallback: usize) -> usize {
 }
 
 fn process_freason(p: &Process, class: Class) -> u64 {
-    if p.header.freason != 0 {
-        p.header.freason
+    if p.header.exc.freason != 0 {
+        p.header.exc.freason
     } else {
         class_to_freason(Some(class))
     }
@@ -1238,23 +1238,29 @@ fn pack_indexed(module: usize, ip: usize) -> Option<u64> {
     Some((1 << 63) | (module << 32) | ip)
 }
 
-fn class_to_freason(class: Option<Class>) -> u64 {
+/// The generic exit code of a class (`EXC_ERROR`, `EXC_EXIT`, `EXC_THROWN`), zero for none.
+// Port of erts/emulator/beam/error.h (EXC_ERROR, EXC_EXIT, EXC_THROWN), OTP-29.1.1.
+pub(crate) fn class_to_freason(class: Option<Class>) -> u64 {
+    use arinsal_beamasm::exc::{EXC_ERROR, EXC_EXIT, EXC_THROWN};
     match class {
         None => 0,
-        Some(Class::Error) => 1,
-        Some(Class::Exit) => 2,
-        Some(Class::Throw) => 3,
+        Some(Class::Error) => EXC_ERROR,
+        Some(Class::Exit) => EXC_EXIT,
+        Some(Class::Throw) => EXC_THROWN,
     }
 }
 
-fn class_from_freason(value: u64) -> Option<Class> {
-    match value {
-        1 => Some(Class::Error),
-        2 => Some(Class::Exit),
-        3 => Some(Class::Throw),
-        0 => None,
-        _ => Some(Class::Error),
+/// The class of an exit code (`GET_EXC_CLASS`), `None` for no exception.
+pub(crate) fn class_from_freason(value: u64) -> Option<Class> {
+    use arinsal_beamasm::exc::{EXTAG_EXIT, EXTAG_THROWN, exc_class};
+    if value == 0 {
+        return None;
     }
+    Some(match exc_class(value) {
+        EXTAG_EXIT => Class::Exit,
+        EXTAG_THROWN => Class::Throw,
+        _ => Class::Error,
+    })
 }
 
 fn ftrace_raw(term: Term) -> Option<RawTrace> {

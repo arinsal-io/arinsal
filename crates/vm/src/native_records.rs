@@ -76,8 +76,8 @@ fn report(process: &mut Process, failure: Failure) {
         .and_then(|value| crate::exceptions::tuple(process, &[crate::signals::atom(tag), value]))
     {
         Ok(reason) => {
-            process.header.freason = 1;
-            process.header.fvalue = native_hooks::raw(reason);
+            process.header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+            process.header.exc.fvalue = native_hooks::raw(reason);
         }
         Err(_) => native_hooks::set_error(process, "system_limit"),
     }

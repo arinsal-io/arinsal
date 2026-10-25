@@ -12,7 +12,7 @@ extern "C" fn light_bif_hook(_: *mut ProcessHeader, identity: u64) -> u64 {
 }
 
 extern "C" fn apply_hook(process: *mut ProcessHeader, arity: u32) -> usize {
-    arinsal_beamasm::rt::process_header_mut(process, |header| header.fvalue = u64::from(arity));
+    arinsal_beamasm::rt::process_header_mut(process, |header| header.exc.fvalue = u64::from(arity));
     arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize)
 }
 
@@ -104,7 +104,7 @@ fn native_apply() {
         regs.x_reg_array[0],
         arinsal_beamasm::rt::fixture_term(0xabc)
     );
-    assert_eq!(header.fvalue, 1);
+    assert_eq!(header.exc.fvalue, 1);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -151,7 +151,7 @@ fn native_bs_set_position() {
 }
 
 extern "C" fn apply_fun_hook(process: *mut ProcessHeader, _fun: u64, arity: u32) -> usize {
-    arinsal_beamasm::rt::process_header_mut(process, |header| header.fvalue = u64::from(arity));
+    arinsal_beamasm::rt::process_header_mut(process, |header| header.exc.fvalue = u64::from(arity));
     arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize)
 }
 
@@ -205,7 +205,7 @@ fn native_apply_fun_unpacks_arguments() {
     std::hint::black_box(&cells);
     let (header, regs, outcome) = execute(&module, header, [tagged(1), base | 1, 0]);
     assert_eq!(outcome, ExitReason::Returned);
-    assert_eq!(header.fvalue, 3);
+    assert_eq!(header.exc.fvalue, 3);
     for (index, value) in [7, 8, 9].into_iter().enumerate() {
         assert_eq!(
             regs.x_reg_array[index],

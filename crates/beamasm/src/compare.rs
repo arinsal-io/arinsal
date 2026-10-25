@@ -475,7 +475,7 @@ impl BeamModuleAssembler {
         })?;
         self.set_badarg_mfa(0)?;
         self.code.emit(|e| {
-            e.mov_const(TMP2, 1)?;
+            e.mov_const(TMP2, crate::exc::EXC_BADARG)?;
             e.str_uoff(TMP2, Gpr::x(21), 40)?;
             e.mov_const(TMP2, badarg)?;
             e.str_uoff(TMP2, Gpr::x(21), 48)

@@ -9,7 +9,7 @@ use std::process::Command;
 const HEADER_FLONUM: u64 = (1 << 6) | 0x18;
 const HEADER_POS_BIG: u64 = (1 << 6) | 0x08;
 /// `freason` of an `error` exception; the reason atom travels in `fvalue`.
-const BADARITH: u64 = 1;
+const BADARITH: u64 = arinsal_beamasm::exc::EXC_BADARITH;
 
 extern "C" fn big_to_float(_: *mut ProcessHeader, _: u64) -> u64 {
     1_152_921_504_606_846_976.0_f64.to_bits()
@@ -142,7 +142,7 @@ fn native_fconv_bad_number() {
     emit_fconv(&mut asm, ArgVal::X(0), 0, big_to_float).unwrap();
     finish(&mut asm);
     let (header, _, _, _) = execute(asm, [11, 0], [0.0; 8]);
-    assert_eq!(header.freason, BADARITH);
+    assert_eq!(header.exc.freason, BADARITH);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -154,7 +154,7 @@ fn native_fdiv_zero_badarith() {
     asm.emit_i_fdiv(0, 1, 2).unwrap();
     finish(&mut asm);
     let (header, _, _, _) = execute(asm, [0, 0], [3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-    assert_eq!(header.freason, BADARITH);
+    assert_eq!(header.exc.freason, BADARITH);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -166,7 +166,7 @@ fn native_fmul_overflow_badarith() {
     asm.emit_i_fmul(0, 1, 2).unwrap();
     finish(&mut asm);
     let (header, _, _, _) = execute(asm, [0, 0], [f64::MAX, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-    assert_eq!(header.freason, BADARITH);
+    assert_eq!(header.exc.freason, BADARITH);
 }
 
 #[cfg(target_arch = "aarch64")]

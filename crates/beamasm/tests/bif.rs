@@ -30,7 +30,7 @@ extern "C" fn add_bif(_: *mut ProcessHeader, left: u64, right: u64, third: u64, 
 }
 
 extern "C" fn error_bif(process: *mut ProcessHeader, _: u64, _: u64, _: u64, _: u32) -> u64 {
-    arinsal_beamasm::rt::process_header_mut(process, |header| header.freason = 0x55);
+    arinsal_beamasm::rt::process_header_mut(process, |header| header.exc.freason = 0x55);
     tagged(9)
 }
 
@@ -127,7 +127,7 @@ fn execute(
     (
         registers.x_reg_array[0].tagged_word(),
         header.stop as usize as u64,
-        header.freason,
+        header.exc.freason,
     )
 }
 

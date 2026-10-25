@@ -25,17 +25,12 @@ const TMP2: Gpr = Gpr::x(10);
 const TMP3: Gpr = Gpr::x(11);
 
 // Port of erts/emulator/beam/error.h:111-170, OTP-29.1.1: `(index << EXC_OFFSET) | EXC_ERROR`.
-const EXC_BADMATCH: u64 = (5 << 10) | 0x50;
-const EXC_CASE_CLAUSE: u64 = (7 << 10) | 0x50;
-const EXC_IF_CLAUSE: u64 = (8 << 10) | 0x50;
-const EXC_TRY_CLAUSE: u64 = (16 << 10) | 0x50;
-const EXC_BADRECORD: u64 = (20 << 10) | 0x50;
-/// `freason` flag of a native `raw_raise`: the low bits are the class (1 error, 2 exit,
-/// 3 throw) and `c_p->ftrace` holds the stacktrace being re-raised.
-pub const RAW_RAISE: u64 = 1 << 9;
+use crate::exc::{EXC_BADMATCH, EXC_BADRECORD, EXC_CASE_CLAUSE, EXC_IF_CLAUSE, EXC_TRY_CLAUSE};
+/// `freason` flag of a native `raw_raise`: the low bits are the class (`EXTAG_*`) and `c_p->ftrace` holds the stacktrace being re-raised.
+pub const RAW_RAISE: u64 = crate::exc::EXF_HAS_EXT_INFO;
 /// `freason` flag of a native `raise/2` (`i_raise`) whose stacktrace in `c_p->ftrace` is valid:
 /// the exception keeps that stacktrace but is not a raw rethrow.
-pub const RERAISE: u64 = 1 << 8;
+pub const RERAISE: u64 = crate::exc::EXF_RESTORE_NFUNC;
 const NIL: u64 = 0x3b;
 const TAG_IMMED2_CATCH: u64 = 0x1b;
 /// Stands in for `THE_NON_VALUE` in X0 while a native handler runs: a catch immediate is

@@ -34,12 +34,12 @@ pub extern "C" fn arinsal_beamasm_raise_class(
     // stacktrace is re-raised as is.
     let reraise = arinsal_beamasm::catch::RERAISE;
     match class {
-        Some(arinsal_bifs::Class::Error) => reraise | 1,
-        Some(arinsal_bifs::Class::Exit) => reraise | 2,
-        Some(arinsal_bifs::Class::Throw) => reraise | 3,
+        Some(arinsal_bifs::Class::Error) => reraise | arinsal_beamasm::exc::EXTAG_ERROR,
+        Some(arinsal_bifs::Class::Exit) => reraise | arinsal_beamasm::exc::EXTAG_EXIT,
+        Some(arinsal_bifs::Class::Throw) => reraise | arinsal_beamasm::exc::EXTAG_THROWN,
         None => {
-            process.header.fvalue = crate::native_hooks::raw(crate::signals::atom("badarg"));
-            1
+            process.header.exc.fvalue = crate::native_hooks::raw(crate::signals::atom("badarg"));
+            arinsal_beamasm::exc::EXC_ERROR
         }
     }
 }
@@ -753,7 +753,7 @@ fn trap_to_dirty_nif(
     process.gc_live = usize::from(arity);
     process.header.i =
         arinsal_beamasm::dispatch::DIRTY_NIF_DISPATCH_IDENTITY as *const u8 as *const _;
-    process.header.freason = 1 << 10;
+    process.header.exc.freason = 1 << 10;
     process.sync_native_header();
     0
 }
@@ -1146,7 +1146,7 @@ fn dispatch_native_send(
             process.header.arity = 2;
             process.header.i =
                 arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY as *const u8 as *const _;
-            process.header.freason = 1 << 10;
+            process.header.exc.freason = 1 << 10;
             process.sync_native_header();
             None
         }
@@ -1513,7 +1513,7 @@ fn park_executor(
     process.header.arity = export.arity;
     process.reductions = process.header.fcalls;
     process.header.i = identity as *const u8 as *const _;
-    process.header.freason = 1 << 10;
+    process.header.exc.freason = 1 << 10;
     process.sync_native_header();
     0
 }
@@ -2232,7 +2232,7 @@ pub(crate) extern "C" fn list_member_entry(
         }
         debug_assert_native_heap(process);
         crate::bif_traps::arm_export_trap(process);
-        process.header.freason = 1 << 10;
+        process.header.exc.freason = 1 << 10;
         process.sync_native_header();
         return 0;
     }
@@ -2390,7 +2390,7 @@ pub(crate) extern "C" fn direct_bif_light(
     }
     process.header.arity = export.arity;
     process.header.i = identity as *const u8 as *const _;
-    process.header.freason = 1 << 10;
+    process.header.exc.freason = 1 << 10;
     process.sync_native_header();
     0
 }
@@ -2662,7 +2662,7 @@ fn arm_light_trap(process: &mut crate::Process) -> Option<u64> {
     // BIF_TRAP sets c_p->i to beam_bif_export_trap. The fragment loads that
     // address and context-switches; schedule-in calls the continuation export.
     crate::bif_traps::arm_export_trap(process);
-    process.header.freason = 1 << 10;
+    process.header.exc.freason = 1 << 10;
     process.sync_native_header();
     None
 }
@@ -2945,7 +2945,7 @@ fn invoke_dispatch_bif_slow(
     if identity == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY {
         // The breakpoint traps like a BIF so the executor delivers its trace events.
         process.header.i = identity as *const u8 as *const _;
-        process.header.freason = 1 << 10;
+        process.header.exc.freason = 1 << 10;
         process.sync_native_header();
         return None;
     }
@@ -2979,7 +2979,7 @@ fn invoke_dispatch_bif_slow(
         }
         process.header.arity = export.arity;
         process.header.i = identity as *const u8 as *const _;
-        process.header.freason = 1 << 10;
+        process.header.exc.freason = 1 << 10;
         process.cold_mut().native_light_bif_call = !export_call;
         process.sync_native_header();
         return None;
@@ -3029,7 +3029,7 @@ fn call_direct_bif(
     }
     // A direct BIF that failed has parked its exception (freason/fvalue set, as an erts
     // BIF returns THE_NON_VALUE); the call is not redone.
-    if process.header.freason != 0 {
+    if process.header.exc.freason != 0 {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (call_light_bif_shared) and erl_gc.c
         // (erts_gc_after_bif_call_lhf), OTP-29.1.1: the GC-desired test runs before the result
         // is looked at, so a failed BIF collects too, with its arguments live.
@@ -3080,7 +3080,7 @@ fn direct_bif_error_gc(process: &mut crate::Process, arity: usize) -> bool {
     let collected =
         crate::calls::gc_after_native_parts(process, &mut args, None, Some(&mut parked.trap));
     parked.fvalue = crate::native_hooks::raw(parked.trap.reason);
-    process.header.fvalue = parked.fvalue;
+    process.header.exc.fvalue = parked.fvalue;
     process.cold_mut().native_trap = Some(parked);
     if collected.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
@@ -3274,7 +3274,7 @@ fn call_list_slice_bif(
         }
         debug_assert_native_heap(process);
         crate::bif_traps::arm_export_trap(process);
-        process.header.freason = 1 << 10;
+        process.header.exc.freason = 1 << 10;
         process.sync_native_header();
         return None;
     }
@@ -3447,7 +3447,7 @@ fn install_deferred_bif_trap(
     }
     debug_assert_native_heap(process);
     crate::bif_traps::arm_export_trap(process);
-    process.header.freason = 1 << 10;
+    process.header.exc.freason = 1 << 10;
     process.sync_native_header();
     0
 }
@@ -3591,14 +3591,10 @@ fn process_bif_error(
             info: crate::stacktrace::BifErrorInfo::Plain,
         });
     }
-    let freason = match trap.class {
-        arinsal_bifs::Class::Error => 1,
-        arinsal_bifs::Class::Exit => 2,
-        arinsal_bifs::Class::Throw => 3,
-    };
+    let freason = crate::stacktrace::class_to_freason(Some(trap.class));
     let fvalue = crate::native_hooks::raw(trap.reason);
-    process.header.freason = freason;
-    process.header.fvalue = fvalue;
+    process.header.exc.freason = freason;
+    process.header.exc.fvalue = fvalue;
     process.cold_mut().native_trap = Some(Box::new(crate::proc_create::NativeTrap {
         trap,
         freason,
@@ -3785,8 +3781,8 @@ fn set_tagged_error(process: &mut crate::Process, tag: &str, value: Term) {
         .tuple(&[crate::signals::atom(tag), value]);
     match tuple {
         Ok(reason) => {
-            process.header.freason = 1;
-            process.header.fvalue = crate::native_hooks::raw(reason);
+            process.header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+            process.header.exc.fvalue = crate::native_hooks::raw(reason);
         }
         Err(_) => crate::native_hooks::set_error(process, "system_limit"),
     }
@@ -3807,8 +3803,8 @@ fn set_call_fun_error(process: &mut crate::Process, fun: Term, arity: u32) {
     process.x[arity] = fun;
     match crate::funs::call_error_reason(process, fun, arity) {
         Ok(reason) => {
-            process.header.freason = 1;
-            process.header.fvalue = crate::native_hooks::raw(reason);
+            process.header.exc.freason = arinsal_beamasm::exc::EXC_ERROR;
+            process.header.exc.fvalue = crate::native_hooks::raw(reason);
         }
         Err(_) => crate::native_hooks::set_error(process, "system_limit"),
     }
@@ -3823,7 +3819,7 @@ pub(crate) fn set_native_bif_error(
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
-    let (freason, fvalue) = (process.header.freason, process.header.fvalue);
+    let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
     process.cold_mut().native_bif_error = Some(Box::new(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Owned {
             module: module.to_owned(),
@@ -3846,7 +3842,7 @@ pub(crate) fn set_native_bif_register_error(
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
-    let (freason, fvalue) = (process.header.freason, process.header.fvalue);
+    let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
     process.cold_mut().native_bif_error = Some(Box::new(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Registers {
             module,
@@ -3866,7 +3862,7 @@ fn set_native_bif_export_error(
     error: arinsal_bifs::BifError,
 ) {
     set_light_bif_error(process, &error);
-    let (freason, fvalue) = (process.header.freason, process.header.fvalue);
+    let (freason, fvalue) = (process.header.exc.freason, process.header.exc.fvalue);
     process.cold_mut().native_bif_error = Some(Box::new(crate::proc_create::NativeBifError {
         call: crate::proc_create::NativeBifCall::Export(export),
         error,
@@ -3876,7 +3872,7 @@ fn set_native_bif_export_error(
 }
 
 fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifError) {
-    use arinsal_bifs::{BifError, Class};
+    use arinsal_bifs::BifError;
     // A new failure replaces any BIF frame left by the previous one.
     crate::stacktrace::clear_pending_top(process);
     // `raise/3`'s list is copied off-heap before `freason` changes, so a later
@@ -3888,27 +3884,26 @@ fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifEr
         } => arinsal_term::to_owned(*trace).ok(),
         _ => None,
     };
-    let (class, reason) = match error {
-        BifError::Badarg { .. } => (1, crate::signals::atom("badarg")),
-        BifError::Badarith => (1, crate::signals::atom("badarith")),
-        BifError::SystemLimit => (1, crate::signals::atom("system_limit")),
-        BifError::Error(reason) => (1, *reason),
-        BifError::Raise { class, reason, .. } => (
-            match *class {
-                Class::Error => 1,
-                Class::Exit => 2,
-                Class::Throw => 3,
-            },
-            *reason,
-        ),
-        BifError::Unsupported(_) => (1, crate::signals::atom("undef")),
-        // NIF bodies trap to the executor before reaching here (`trap_to_dirty_nif`).
-        BifError::Dirty(_) => (1, crate::signals::atom("notsup")),
+    use arinsal_beamasm::exc;
+    // `fvalue` also carries the reason for the coded failures: erts rebuilds it from the
+    // code, and the stacktrace saver matches the pending BIF frame by the pair.
+    // Deviation: `Unsupported` raises `undef` (`EXC_UNDEF`) and `Dirty`, which NIF bodies
+    // turn into a trap to the dirty export before reaching here, is `EXC_NOTSUP`.
+    let (freason, reason) = match error {
+        BifError::Badarg { .. } => (exc::EXC_BADARG, crate::signals::atom("badarg")),
+        BifError::Badarith => (exc::EXC_BADARITH, crate::signals::atom("badarith")),
+        BifError::SystemLimit => (exc::EXC_SYSTEM_LIMIT, crate::signals::atom("system_limit")),
+        BifError::Error(reason) => (exc::EXC_ERROR, *reason),
+        BifError::Raise { class, reason, .. } => {
+            (crate::stacktrace::class_to_freason(Some(*class)), *reason)
+        }
+        BifError::Unsupported(_) => (exc::EXC_UNDEF, crate::signals::atom("undef")),
+        BifError::Dirty(_) => (exc::EXC_NOTSUP, crate::signals::atom("notsup")),
     };
-    process.header.freason = class;
-    process.header.fvalue = crate::native_hooks::raw(reason);
-    let freason = process.header.freason;
-    let fvalue = process.header.fvalue;
+    process.header.exc.freason = freason;
+    process.header.exc.fvalue = crate::native_hooks::raw(reason);
+    let freason = process.header.exc.freason;
+    let fvalue = process.header.exc.fvalue;
     process.cold_mut().explicit_raise = explicit.map(|trace| Box::new((freason, fvalue, trace)));
 }
 
@@ -3924,7 +3919,7 @@ fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
             .explicit_raise
             .as_deref()
             .is_some_and(|(freason, fvalue, _)| {
-                *freason == process.header.freason && *fvalue == process.header.fvalue
+                *freason == process.header.exc.freason && *fvalue == process.header.exc.fvalue
             });
         if !matches {
             return None;
@@ -3953,11 +3948,11 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
     };
-    let (freason, catches) = (process.header.freason, process.header.catches);
-    // TRAP and raw re-raises stay on the scheduler. Primary classes are 1, 2, 3.
-    // Expanded errors (`badmatch`, `function_clause`, `case_clause`, …) use erts'
-    // `(index << 10) | EXC_ERROR`.
-    let primary = matches!(freason, 1..=3);
+    let (freason, catches) = (process.header.exc.freason, process.header.catches);
+    // TRAP and raw re-raises stay on the scheduler. Primary exceptions are `EXC_ERROR`,
+    // `EXC_EXIT` and `EXC_THROWN`; expanded errors (`badmatch`, `function_clause`,
+    // `case_clause`, ...) use erts' `(index << 10) | EXC_ERROR`.
+    let primary = is_primary_freason(freason);
     let expanded = freason > 3 && freason & 0x3ff == 0x50 && freason & 4 == 0;
     if catches == 0 || (!primary && !expanded) {
         return 0;
@@ -3981,7 +3976,7 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
     let raising_pc = registers.tmp_mem[6] as usize;
     // A function_clause list of the current function's arguments and an inline guard BIF's
     // top frame (`tmp_mem[7]`) are built by the scheduler's native exit; leave them there.
-    if process.header.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE
+    if process.header.exc.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE
         || registers.tmp_mem[7] != 0
     {
         process.sync_native_header();
@@ -3993,12 +3988,12 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         return 0;
     };
     let (class, reason) = if primary {
-        let class = match freason {
-            1 => arinsal_bifs::Class::Error,
-            2 => arinsal_bifs::Class::Exit,
-            _ => arinsal_bifs::Class::Throw,
-        };
-        (class, crate::native_hooks::from_raw(process.header.fvalue))
+        let class =
+            crate::stacktrace::class_from_freason(freason).unwrap_or(arinsal_bifs::Class::Error);
+        (
+            class,
+            crate::native_hooks::from_raw(process.header.exc.fvalue),
+        )
     } else {
         match expand_error_value(process) {
             Some(reason) => (arinsal_bifs::Class::Error, reason),
@@ -4019,8 +4014,8 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         .as_ref()
         .and_then(|cold| cold.native_trap.as_ref())
         .filter(|native_trap| {
-            native_trap.freason == process.header.freason
-                && native_trap.fvalue == process.header.fvalue
+            native_trap.freason == process.header.exc.freason
+                && native_trap.fvalue == process.header.exc.fvalue
         })
         .and_then(|native_trap| match native_trap.trap.top.as_ref() {
             Some(crate::stacktrace::TopFrame::BifRegisters {
@@ -4102,8 +4097,8 @@ fn note_owned_failure(process: &mut crate::Process) {
     // Only an owned record needs the move below; the record of an export failure stays put.
     if !process.cold.as_ref().is_some_and(|cold| {
         cold.native_bif_error.as_ref().is_some_and(|failure| {
-            failure.freason == process.header.freason
-                && failure.fvalue == process.header.fvalue
+            failure.freason == process.header.exc.freason
+                && failure.fvalue == process.header.exc.fvalue
                 && matches!(
                     failure.call,
                     crate::proc_create::NativeBifCall::Owned { .. }
@@ -4119,8 +4114,8 @@ fn note_owned_failure(process: &mut crate::Process) {
     else {
         return;
     };
-    if failure.freason == process.header.freason
-        && failure.fvalue == process.header.fvalue
+    if failure.freason == process.header.exc.freason
+        && failure.fvalue == process.header.exc.fvalue
         && let crate::proc_create::NativeBifCall::Owned {
             module,
             function,
@@ -4144,7 +4139,8 @@ fn failure_top(
     use crate::stacktrace::{BifErrorInfo, TopFrame};
     let cold = process.cold.as_ref()?;
     let failure = cold.native_bif_error.as_ref()?;
-    if failure.freason != process.header.freason || failure.fvalue != process.header.fvalue {
+    if failure.freason != process.header.exc.freason || failure.fvalue != process.header.exc.fvalue
+    {
         return None;
     }
     match &failure.call {
@@ -4209,10 +4205,18 @@ fn failure_top(
     }
 }
 
+/// A fresh generic exception: `EXC_ERROR`, `EXC_EXIT` or `EXC_THROWN` with no index and no
+/// re-raise flag.
+pub(crate) fn is_primary_freason(freason: u64) -> bool {
+    use arinsal_beamasm::catch::{RAW_RAISE, RERAISE};
+    use arinsal_beamasm::exc::{EXC_INDEXBITS, EXF_SAVETRACE};
+    freason & (EXC_INDEXBITS | RAW_RAISE | RERAISE | EXF_SAVETRACE) == EXF_SAVETRACE
+}
+
 /// Port of erts/emulator/beam/beam_common.c:742 (`expand_error_value`), OTP-29.1.1.
-fn expand_error_value(process: &mut crate::Process) -> Option<arinsal_term::Term> {
-    let index = process.header.freason >> 10;
-    let value = crate::native_hooks::from_raw(process.header.fvalue);
+pub(crate) fn expand_error_value(process: &mut crate::Process) -> Option<arinsal_term::Term> {
+    let index = process.header.exc.freason >> 10;
+    let value = crate::native_hooks::from_raw(process.header.exc.fvalue);
     if index == 0 {
         return Some(value);
     }
