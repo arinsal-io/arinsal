@@ -360,6 +360,8 @@ struct FromSpace {
     htop: usize,
     stop: usize,
     old_words: crate::heap::WordBlock,
+    /// Only the debug ownership check reads it.
+    #[cfg(debug_assertions)]
     old_htop: usize,
     owners: crate::heap::LazyOwners,
     fragments: Vec<crate::heap::Fragment>,
@@ -1467,6 +1469,7 @@ impl ProcessHeap {
             } else {
                 crate::heap::WordBlock::default()
             },
+            #[cfg(debug_assertions)]
             old_htop: self.old_htop,
             owners: std::mem::take(&mut self.owners),
             fragments: std::mem::take(&mut self.fragments),
