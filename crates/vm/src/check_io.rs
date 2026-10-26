@@ -132,6 +132,9 @@ struct Watch {
 #[derive(Default)]
 struct FdState {
     watches: Vec<Watch>,
+    /// The `driver_select` / `enif_select` state of the descriptor (`ErtsDrvEventState`): what the
+    /// drivers armed is polled together with `watches`.
+    sel: arinsal_drv::SelSlot,
     /// What the poll thread's set holds for this descriptor.
     main: SetState,
     /// What the scheduler pollset holds (the read interest once `scheduler` is set).
@@ -506,13 +509,52 @@ pub(crate) fn register(
     register_kind(fd, interests, RegistrationKind::Nif, ready)
 }
 
-/// Add an asynchronous one-shot driver event to the shared poll set.
-pub(crate) fn register_driver(
-    fd: RawFd,
-    interests: InterestSet,
-    ready: impl FnOnce(RawFd, Ready) + Send + 'static,
-) -> io::Result<Registration> {
-    register_kind(fd, interests, RegistrationKind::Driver, ready)
+/// Run `f` on the `driver_select` state of `fd` under the descriptor lock, then bring the poll
+/// set in line with the directions the drivers armed (`erts_io_control`). The result is the mask
+/// of directions the poller rejected (`ERTS_POLL_EV_NVAL`).
+pub(crate) fn with_sel(fd: RawFd, f: &mut dyn FnMut(&mut arinsal_drv::SelSlot)) -> i32 {
+    let poller = poller();
+    let Ok((index, slots)) = poller.states.lock_slots(fd) else {
+        // A descriptor the table cannot hold is never polled.
+        let mut slot = None;
+        f(&mut slot);
+        return arinsal_drv::rejected(&mut slot);
+    };
+    let mut state = slots[index].lock();
+    f(&mut state.sel);
+    let (read, write) = arinsal_drv::wanted(&state.sel);
+    if read || write {
+        // Port of erts/emulator/sys/common/erl_poll.c (concurrent_update_pollset: ADD of fds
+        // 0-2 returns NVAL, so they live in the fallback set), OTP-29.1.1.
+        if fd <= 2 || fallback_marked(fd) {
+            state.fallback = true;
+        }
+        // Port of erl_check_io.c (erts_io_notify_port_task_executed): the read descriptor of a
+        // driver that was re-enabled often moves to the scheduler pollset.
+        if read
+            && arinsal_drv::is_driver_selection(&state.sel)
+            && !state.scheduler
+            && !state.fallback
+            && SCHED_POLLSET.get().is_some()
+            && state.count > SCHEDULER_MIGRATION_COUNT
+        {
+            state.scheduler = true;
+        }
+    }
+    let mut result = sync_pollset(fd, &mut state);
+    if result.is_err() && !state.fallback {
+        // Port of erl_poll.c (a kernel poller `ERTS_POLL_EV_NVAL` moves the descriptor to the
+        // fallback set), OTP-29.1.1.
+        state.fallback = true;
+        state.main = SetState::default();
+        result = sync_pollset(fd, &mut state);
+    }
+    if result.is_err() {
+        let mask = arinsal_drv::rejected(&mut state.sel);
+        let _ = sync_pollset(fd, &mut state);
+        return mask;
+    }
+    0
 }
 
 fn register_kind(
@@ -676,12 +718,16 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent, from: Pol
         }
     });
     state.count = state.count.saturating_add(triggered_driver_reads);
+    let (mut actions, driver_reads) =
+        arinsal_drv::poll_event(&mut state.sel, fd, seen.readable, seen.writable, poll_error);
+    state.count = state.count.saturating_add(driver_reads);
 
     if sync_pollset(fd, &mut state).is_err() {
         // A failed re-arm is reported as NVAL by erts_check_io. Trigger every
         // remaining watch after removing the descriptor from the poll set.
         state.main = SetState::default();
         state.sched = SetState::default();
+        actions.extend(arinsal_drv::poll_event(&mut state.sel, fd, true, true, true).0);
         let _ = erts_poll_control(PollSetKind::Main, fd, ErtsPollOp::Del, ERTS_POLL_EV_NONE);
         let _ = erts_poll_control(
             PollSetKind::Scheduler,
@@ -707,11 +753,21 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent, from: Pol
     for (callback, watch_ready) in callbacks {
         callback(fd, watch_ready);
     }
+    for action in actions {
+        action();
+    }
 }
 
 fn sync_pollset(fd: RawFd, state: &mut FdState) -> io::Result<()> {
-    let next = watch_interests(&state.watches);
-    let selected = !state.watches.is_empty();
+    let (sel_read, sel_write) = arinsal_drv::wanted(&state.sel);
+    let next = union(
+        watch_interests(&state.watches),
+        InterestSet {
+            readable: sel_read,
+            writable: sel_write,
+        },
+    );
+    let selected = !state.watches.is_empty() || sel_read || sel_write;
     // Port of erts/emulator/sys/common/erl_check_io.c (erts_io_control_wakeup): a descriptor
     // that migrated keeps only its output interest in the poll thread's set; its read
     // interest lives in the scheduler pollset.
@@ -825,13 +881,17 @@ pub(crate) fn debug_info() -> DebugInfo {
         let state = state.lock();
         // Port of erts/emulator/sys/common/erl_check_io.c (doit_erts_check_io_debug), OTP-29.1.1:
         // internal wake registrations do not contribute to the used-fd counter.
-        if state
-            .watches
-            .iter()
-            .any(|watch| !matches!(watch.kind, RegistrationKind::Internal))
+        let (driver_dirs, nif_dirs) = arinsal_drv::selection_counts(&state.sel);
+        if driver_dirs + nif_dirs > 0
+            || state
+                .watches
+                .iter()
+                .any(|watch| !matches!(watch.kind, RegistrationKind::Internal))
         {
             info.used_fds += 1;
         }
+        info.driver_selects += driver_dirs;
+        info.nif_selects += nif_dirs;
         for watch in &state.watches {
             match watch.kind {
                 RegistrationKind::Driver => info.driver_selects += 1,
