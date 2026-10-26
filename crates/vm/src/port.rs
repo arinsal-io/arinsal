@@ -481,7 +481,8 @@ pub(crate) struct PortHandle {
     parallelism: bool,
     state: Mutex<PortState>,
     scheduler: Arc<Scheduler<Process>>,
-    trace_scope: usize,
+    /// The runtime the port belongs to (`ERTS_...` trace scope is its address).
+    runtime: &'static crate::process::Runtime,
     /// `port_set_data/2` term. `undefined` until the first store.
     data: Mutex<PortData>,
     /// `tcp_inet` / `tcp_inet6` port. I/O is owned by `inet_drv`, not a stdio worker.
@@ -495,8 +496,6 @@ pub(crate) struct PortHandle {
     /// The driver's own state (`prt->drv_data`): the tcp or udp socket, or the ram_file data
     /// from `rfile_start` until `rfile_stop`.
     drv_data: Mutex<Option<Arc<crate::ram_file_drv::RamPort>>>,
-    /// Driver-owned state returned by the inet driver's start callback.
-    runtime: OnceLock<&'static crate::process::Runtime>,
 }
 
 /// Inspect or move the next local port id for `erts_debug` table tests.
@@ -804,7 +803,12 @@ impl PortHandle {
 
     /// The runtime this port belongs to.
     pub(crate) fn runtime(&self) -> Option<&'static crate::process::Runtime> {
-        self.runtime.get().copied()
+        Some(self.runtime)
+    }
+
+    /// The trace scope of port messages: the address of the runtime.
+    fn trace_scope(&self) -> usize {
+        self.runtime as *const crate::process::Runtime as usize
     }
 
     /// The driver port of a port made by a driver (everything but ram_file and spawn ports).
@@ -1414,7 +1418,7 @@ pub(crate) fn static_driver_output(handle: &PortHandle, bytes: &[u8]) {
         handle.id,
         bytes,
         false,
-        handle.trace_scope,
+        handle.trace_scope(),
     );
 }
 
@@ -1449,7 +1453,7 @@ pub(crate) fn static_driver_output_binary(
     if let Ok(message) = build(&mut heap) {
         trace_port_send(
             &handle.scheduler,
-            handle.trace_scope,
+            handle.trace_scope(),
             handle.id,
             handle.owner_pid(),
             message,
@@ -1806,7 +1810,7 @@ fn start(
         parallelism,
         limits,
         Arc::clone(&scheduler),
-        *runtime as *const crate::process::Runtime as usize,
+        runtime,
     )?;
     handle.state.lock().handshake = Some(Box::new(setup_rest));
     // erl_bif_port.c:102: the spawn driver uses ERL_DRV_FLAG_USE_INIT_ACK, so the opener gets a
@@ -1877,15 +1881,7 @@ fn start_driver(
     let reservation = reserve_port_id(runtime)?;
     let port_id = reservation.id();
     let port = Term::port(port_id).ok_or_else(badarg)?;
-    let handle = make_driver_handle(
-        port_id,
-        ctx.pid(),
-        name,
-        false,
-        scheduler,
-        *runtime as *const crate::process::Runtime as usize,
-        None,
-    )?;
+    let handle = make_driver_handle(port_id, ctx.pid(), name, false, scheduler, runtime, None)?;
     runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
@@ -1930,13 +1926,12 @@ fn start_dyn_driver(
         name.clone(),
         io.parallelism,
         Arc::clone(scheduler),
-        runtime as *const crate::process::Runtime as usize,
+        runtime,
         Some((Arc::clone(&driver), runtime)),
     )?;
     install_poll_backend();
     let drv_port = handle.drv_port().expect("driver state embedded");
     drv_port.init_run_queue(scheduler.current_run_queue());
-    let _ = handle.runtime.set(runtime);
     if let Some(handle_id) = handle_id {
         crate::ddll::port_opened(handle_id, &drv_port);
     }
@@ -2107,7 +2102,7 @@ impl arinsal_drv::PortHost for DrvHost {
         if let Ok(message) = build(&mut heap) {
             trace_port_send(
                 &handle.scheduler,
-                handle.trace_scope,
+                handle.trace_scope(),
                 port.id(),
                 owner,
                 message,
@@ -2122,7 +2117,7 @@ impl arinsal_drv::PortHost for DrvHost {
                 &handle.scheduler,
                 handle.owner_pid(),
                 port.id(),
-                handle.trace_scope,
+                handle.trace_scope(),
                 atom("eof"),
             );
         }
@@ -2252,7 +2247,7 @@ impl arinsal_drv::PortHost for DrvHost {
             let owner = handle.owner_pid();
             trace_port_send(
                 &handle.scheduler,
-                handle.trace_scope,
+                handle.trace_scope(),
                 port.id(),
                 owner,
                 message,
@@ -2280,7 +2275,7 @@ impl arinsal_drv::PortHost for DrvHost {
         let exists = handle.scheduler.lookup(target);
         if trace && let Some(receiver) = target.to_term() {
             crate::trace::emit_port_event_scoped(
-                handle.trace_scope,
+                handle.trace_scope(),
                 &handle.scheduler,
                 port.id(),
                 crate::trace::SEND,
@@ -2455,7 +2450,7 @@ impl arinsal_drv::PortHost for DrvHost {
             name.to_owned(),
             false,
             Arc::clone(scheduler),
-            runtime as *const crate::process::Runtime as usize,
+            runtime,
             Some((Arc::clone(creator.driver()), runtime)),
         )
         .ok()?;
@@ -2735,13 +2730,12 @@ pub(crate) fn alloc_inet_port(
         name,
         false,
         Arc::clone(scheduler),
-        runtime as *const crate::process::Runtime as usize,
+        runtime,
         Some((driver, runtime)),
     )
     .map_err(|_| InetPortAllocError::NoMemory)?;
     let drv_port = handle.drv_port().expect("driver state embedded");
     drv_port.init_run_queue(scheduler.current_run_queue());
-    let _ = handle.runtime.set(runtime);
     attach(&handle, &drv_port);
     runtime.ports.insert(port_id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
@@ -2921,7 +2915,7 @@ fn make_handle(
     parallelism: bool,
     limits: BusyLimits,
     scheduler: Arc<Scheduler<Process>>,
-    trace_scope: usize,
+    runtime: &'static crate::process::Runtime,
 ) -> Result<Arc<PortHandle>, VmError> {
     make_handle_with(
         id,
@@ -2933,7 +2927,7 @@ fn make_handle(
         parallelism,
         limits,
         scheduler,
-        trace_scope,
+        runtime,
         true,
         None,
     )
@@ -2976,7 +2970,7 @@ fn make_driver_handle(
     name: String,
     parallelism: bool,
     scheduler: Arc<Scheduler<Process>>,
-    trace_scope: usize,
+    runtime: &'static crate::process::Runtime,
     driver: Option<(Arc<arinsal_drv::Driver>, &'static crate::process::Runtime)>,
 ) -> Result<Arc<PortHandle>, VmError> {
     make_handle_with(
@@ -2989,7 +2983,7 @@ fn make_driver_handle(
         parallelism,
         default_limits(),
         scheduler,
-        trace_scope,
+        runtime,
         false,
         driver,
     )
@@ -3006,7 +3000,7 @@ fn make_handle_with(
     parallelism: bool,
     limits: BusyLimits,
     scheduler: Arc<Scheduler<Process>>,
-    trace_scope: usize,
+    runtime: &'static crate::process::Runtime,
     wake: bool,
     driver: Option<(Arc<arinsal_drv::Driver>, &'static crate::process::Runtime)>,
 ) -> Result<Arc<PortHandle>, VmError> {
@@ -3051,7 +3045,7 @@ fn make_handle_with(
             handshake: None,
         }),
         scheduler,
-        trace_scope,
+        runtime,
         data: Mutex::new(PortData::undefined()),
         driver: driver.map(|(driver, runtime)| {
             let owner_ref: std::sync::Weak<dyn arinsal_drv::PortOwner> = me.clone();
@@ -3068,7 +3062,6 @@ fn make_handle_with(
         cold: Mutex::new(None),
         reg_closing: AtomicBool::new(false),
         drv_data: Mutex::new(None),
-        runtime: OnceLock::new(),
     });
     Ok(handle)
 }
@@ -3098,7 +3091,7 @@ fn start_fd(
         opts.parallelism,
         opts.limits,
         Arc::clone(&scheduler),
-        *runtime as *const crate::process::Runtime as usize,
+        runtime,
     )?;
     runtime.ports.insert(id, Arc::clone(&handle));
     let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
@@ -3502,14 +3495,14 @@ fn end_of_input(
         return InputEnd::WaitForExit;
     }
     if let Some(code) = exit_code {
-        exit_status_message(scheduler, owner, id, handle.trace_scope, code);
+        exit_status_message(scheduler, owner, id, handle.trace_scope(), code);
     }
     if framing.is_some_and(|(mode, _)| mode == 1) && !data.is_empty() {
         line_message(scheduler, owner, id, data, binary, false);
         data.clear();
     }
     if want_eof {
-        event_message(scheduler, owner, id, handle.trace_scope, atom("eof"));
+        event_message(scheduler, owner, id, handle.trace_scope(), atom("eof"));
         InputEnd::Reported
     } else {
         InputEnd::Terminate
@@ -3777,7 +3770,14 @@ fn worker(
                 let n = n as usize;
                 handle.add_bytes_in(n);
                 if framing.is_none() {
-                    output_message(&scheduler, owner, id, &buf[..n], binary, handle.trace_scope);
+                    output_message(
+                        &scheduler,
+                        owner,
+                        id,
+                        &buf[..n],
+                        binary,
+                        handle.trace_scope(),
+                    );
                 } else {
                     data.extend_from_slice(&buf[..n]);
                     decode_frames(
@@ -3787,7 +3787,7 @@ fn worker(
                         &mut data,
                         binary,
                         framing,
-                        handle.trace_scope,
+                        handle.trace_scope(),
                     );
                 }
             }
@@ -3818,12 +3818,12 @@ fn worker(
         && !status_reported
         && let Some(code) = child_status_code(&child_status)
     {
-        exit_status_message(&scheduler, owner, id, handle.trace_scope, code);
+        exit_status_message(&scheduler, owner, id, handle.trace_scope(), code);
     }
     handle.state.lock().exit_complete = true;
     handle.finish_halt();
     if !closed && handle.state.lock().send_closed {
-        event_message(&scheduler, owner, id, handle.trace_scope, atom("closed"));
+        event_message(&scheduler, owner, id, handle.trace_scope(), atom("closed"));
     }
     if !closed {
         // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
@@ -3880,7 +3880,7 @@ fn eof_exit(
     handle.state.lock().exit_complete = true;
     handle.finish_halt();
     if handle.state.lock().send_closed {
-        event_message(scheduler, owner, id, handle.trace_scope, atom("closed"));
+        event_message(scheduler, owner, id, handle.trace_scope(), atom("closed"));
     }
     notify_closed(handle, id, scheduler, owner, false);
 }
@@ -4203,7 +4203,7 @@ fn port_call(
                 && let Ok(call) = TermBuilder::new(&mut trace_heap).tuple(&[atom("call"), binary])
                 && let Ok(message) = TermBuilder::new(&mut trace_heap).tuple(&[port, call])
             {
-                trace_port_send(&handle.scheduler, handle.trace_scope, id, caller, message);
+                trace_port_send(&handle.scheduler, handle.trace_scope(), id, caller, message);
             }
         }
         let Ok((term, _)) = arinsal_etf::decode_prefix(&reply) else {
@@ -4845,7 +4845,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
             scheduler,
             from,
             id,
-            handle.trace_scope,
+            handle.trace_scope(),
             notify.is_some(),
         );
     }
@@ -5408,7 +5408,7 @@ fn send_message_inner(
                 &handle.scheduler,
                 from,
                 id,
-                handle.trace_scope,
+                handle.trace_scope(),
                 atom("closed"),
             );
             if close_inner(process, port, false).is_err() {
@@ -5431,7 +5431,7 @@ fn send_message_inner(
                 &handle.scheduler,
                 from,
                 id,
-                handle.trace_scope,
+                handle.trace_scope(),
                 atom("closed"),
             );
         } else {

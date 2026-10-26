@@ -577,7 +577,7 @@ fn call_driver_control(
             && let Ok(control) = TermBuilder::new(&mut trace_heap).tuple(&[atom("control"), binary])
             && let Ok(message) = TermBuilder::new(&mut trace_heap).tuple(&[port, control])
         {
-            trace_port_send(&handle.scheduler, handle.trace_scope, id, caller, message);
+            trace_port_send(&handle.scheduler, handle.trace_scope(), id, caller, message);
         }
     }
     Some(reply)
@@ -622,7 +622,7 @@ fn deliver_exit(
     }
     release_io(handle);
     if let Some(to) = closed_to {
-        event_message(scheduler, to, id, handle.trace_scope, atom("closed"));
+        event_message(scheduler, to, id, handle.trace_scope(), atom("closed"));
     }
     // The port's trace state goes last: `{Port, closed}` above is still traced.
     crate::trace::port_closed(runtime, id);
@@ -810,7 +810,7 @@ pub(crate) fn connect(
             scheduler,
             from,
             handle.id,
-            handle.trace_scope,
+            handle.trace_scope(),
             true,
         );
         REDS_CONNECT
