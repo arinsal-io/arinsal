@@ -990,8 +990,9 @@ fn system_info(
         match (name.as_str(), kind.as_str()) {
             ("wordsize", "internal" | "external") => return Some(Ok(Term::small(8).unwrap())),
             ("wordsize", _) => return Some(Err(badarg())),
-            ("cpu_topology", "detected") => return Some(Ok(atom("undefined"))),
-            ("cpu_topology", "defined" | "used") => return Some(cpu_topology_info(process)),
+            ("cpu_topology", "detected") => return Some(detected_cpu_topology_info(process)),
+            ("cpu_topology", "defined") => return Some(defined_cpu_topology_info(process)),
+            ("cpu_topology", "used") => return Some(cpu_topology_info(process)),
             ("cpu_topology", _) => return Some(Err(badarg())),
             // Other two-atom selectors ({allocator, A}, ...) are handled below.
             _ => {}
@@ -1169,24 +1170,38 @@ fn system_info(
         // Port of erts/emulator/beam/erl_bif_info.c:3251 and
         // erts/emulator/beam/erl_cpu_topology.c:662-692, OTP-29.1.1.
         Some("scheduler_bind_type") => {
-            let bind_type = arinsal_args::active_scheduler_options()
-                .0
-                .bind_type
+            let bind_type = runtime_state(process)
+                .cpu_bind_order
+                .lock()
+                .expect("CPU bind order")
+                .clone()
+                .or_else(|| arinsal_args::active_scheduler_options().0.bind_type)
                 .unwrap_or_else(|| "u".to_owned());
             let atom_name = match bind_type.as_str() {
-                "s" => "spread",
-                "ps" => "processor_spread",
-                "ts" => "thread_spread",
-                "tnnps" => "thread_no_node_processor_spread",
-                "nnps" => "no_node_processor_spread",
-                "nnts" => "no_node_thread_spread",
-                "ns" => "no_spread",
+                "default_bind" => "thread_no_node_processor_spread",
+                "spread" | "s" => "spread",
+                "processor_spread" | "ps" => "processor_spread",
+                "thread_spread" | "ts" => "thread_spread",
+                "thread_no_node_processor_spread" | "tnnps" => "thread_no_node_processor_spread",
+                "no_node_processor_spread" | "nnps" => "no_node_processor_spread",
+                "no_node_thread_spread" | "nnts" => "no_node_thread_spread",
+                "no_spread" | "ns" => "no_spread",
                 _ => "unbound",
             };
             Some(Ok(atom(atom_name)))
         }
         Some("scheduler_bindings") => Some(read_flags(process, |process, flags| {
-            tuple(process, &vec![atom("unbound"); flags.schedulers_total])
+            let bindings = process
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.scheduler().ok())
+                .map(|scheduler| scheduler.cpu_bindings())
+                .unwrap_or_else(|| vec![None; flags.schedulers_total]);
+            let values = bindings
+                .into_iter()
+                .map(|cpu| cpu.map_or_else(|| atom("unbound"), |cpu| small(cpu as i64)))
+                .collect::<Vec<_>>();
+            tuple(process, &values)
         })),
         // Port of erts/emulator/beam/erl_bif_info.c:3352-3353, OTP-29.1.1.
         Some("port_parallelism") => Some(Ok(atom(
@@ -2557,11 +2572,7 @@ fn system_flag(
             // Port of erts/emulator/beam/bif.c:5284 and
             // erts/emulator/beam/erl_cpu_topology.c:714, OTP-29.1.1.
             warn_deprecated_scheduler_bind(process, ctx);
-            if args[1] == atom("unbound") {
-                Ok(atom("unbound"))
-            } else {
-                Err(bif_error(process, "system_flag", args, "notsup"))
-            }
+            set_scheduler_bind_type(process, args)
         }
         "cpu_topology" => {
             // Port of erts/emulator/beam/bif.c:5276 and
@@ -2593,8 +2604,105 @@ fn cpu_topology_info(process: &mut Process) -> Result<Term, VmError> {
             &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .map_err(|_| badarg()),
+        None => detected_cpu_topology_info(process),
+    }
+}
+
+fn defined_cpu_topology_info(process: &mut Process) -> Result<Term, VmError> {
+    let current = runtime_state(process)
+        .cpu_topology
+        .lock()
+        .expect("CPU topology state")
+        .clone();
+    match current {
+        Some(topology) => arinsal_term::from_owned(
+            &topology,
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+        )
+        .map_err(|_| badarg()),
         None => Ok(atom("undefined")),
     }
+}
+
+// Port of erts/emulator/beam/erl_cpu_topology.c (bld_topology_term) and
+// erts/preloaded/src/erlang.erl (format_cpu_topology/cput_i2e), OTP-29.1.1.
+fn detected_cpu_topology_info(process: &mut Process) -> Result<Term, VmError> {
+    use arinsal_etf::OwnedTerm as O;
+    let entries = arinsal_alloc::cpuinfo::cpu_topology();
+    if entries.is_empty() {
+        return Ok(atom("undefined"));
+    }
+    fn level(entry: &arinsal_alloc::cpuinfo::CpuTopologyEntry, depth: usize) -> i32 {
+        match depth {
+            0 => entry.node,
+            1 => entry.processor,
+            2 => entry.processor_node,
+            3 => entry.core,
+            4 => entry.thread,
+            _ => entry.logical,
+        }
+    }
+    fn format(
+        entries: &[arinsal_alloc::cpuinfo::CpuTopologyEntry],
+        depth: usize,
+        first: bool,
+    ) -> Vec<O> {
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        if depth == 5 {
+            return vec![O::Tuple(vec![
+                O::Atom("logical".to_owned()),
+                O::Int(i64::from(entries[0].logical)),
+            ])];
+        }
+        let mut output = Vec::new();
+        let mut start = 0;
+        while start < entries.len() {
+            let value = level(&entries[start], depth);
+            let mut end = start + 1;
+            while end < entries.len() && level(&entries[end], depth) == value {
+                end += 1;
+            }
+            let group = &entries[start..end];
+            if start == 0 && end == entries.len() && value == -1 {
+                return format(group, depth + 1, true);
+            }
+            if start == 0 && end == entries.len() && first && depth != 1 && depth != 2 {
+                return format(group, depth + 1, true);
+            }
+            let children = format(group, depth + 1, true);
+            let tag = match depth {
+                0 | 2 => "node",
+                1 => "processor",
+                3 => "core",
+                _ => "thread",
+            };
+            if depth == 0 && value == -1 {
+                output.extend(children);
+            } else {
+                let children = match children.as_slice() {
+                    [only] => only.clone(),
+                    _ => O::List {
+                        elems: children,
+                        tail: Box::new(O::Nil),
+                    },
+                };
+                output.push(O::Tuple(vec![O::Atom(tag.to_owned()), children]));
+            }
+            start = end;
+        }
+        output
+    }
+    let owned = O::List {
+        elems: format(entries, 0, true),
+        tail: Box::new(O::Nil),
+    };
+    arinsal_term::from_owned(
+        &owned,
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+    )
+    .map_err(|_| badarg())
 }
 
 fn set_cpu_topology(
@@ -2602,6 +2710,7 @@ fn set_cpu_topology(
     value: Term,
     error_function: &str,
 ) -> Result<Term, VmError> {
+    let previous = cpu_topology_info(process)?;
     let new = if value == atom("undefined") {
         None
     } else {
@@ -2616,20 +2725,169 @@ fn set_cpu_topology(
         .cpu_topology
         .lock()
         .expect("CPU topology state");
-    let previous = current.clone();
     *current = new;
-    drop(current);
-    match previous {
-        Some(topology) => {
-            let term = arinsal_term::from_owned(
-                &topology,
-                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
-            )
-            .map_err(|_| badarg())?;
-            Ok(term)
+    Ok(previous)
+}
+
+// Port of erts/emulator/beam/erl_cpu_topology.c:714 (`erts_bind_schedulers`), OTP-29.1.1.
+fn set_scheduler_bind_type(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+    let value = args[1];
+    #[cfg(target_os = "linux")]
+    {
+        let names = [
+            "default_bind",
+            "spread",
+            "processor_spread",
+            "thread_spread",
+            "thread_no_node_processor_spread",
+            "no_node_processor_spread",
+            "no_node_thread_spread",
+            "no_spread",
+            "unbound",
+        ];
+        let Some(name) = atom_name(value).filter(|name| names.contains(name)) else {
+            return Err(bif_error(process, "system_flag", args, "badarg"));
+        };
+        let available = arinsal_alloc::cpuinfo::available_cpu_ids();
+        let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+        let scheduler = runtime.scheduler().map_err(|_| badarg())?;
+        let old = runtime_state(process)
+            .cpu_bind_order
+            .lock()
+            .expect("CPU bind order")
+            .clone()
+            .unwrap_or_else(|| "unbound".to_owned());
+        let bindings = if name == "unbound" {
+            vec![None; scheduler.worker_count()]
+        } else {
+            let defined = runtime_state(process)
+                .cpu_topology
+                .lock()
+                .expect("CPU topology state")
+                .clone();
+            let entries = defined
+                .as_ref()
+                .map(topology_bind_entries)
+                .unwrap_or_else(|| arinsal_alloc::cpuinfo::cpu_topology().to_vec());
+            let Some(topology) = arinsal_alloc::cpuinfo::cpu_bind_ordered_entries(&entries, name)
+            else {
+                return Err(bif_error(process, "system_flag", args, "badarg"));
+            };
+            let cpus = topology
+                .into_iter()
+                .filter(|entry| {
+                    usize::try_from(entry.logical)
+                        .ok()
+                        .is_some_and(|cpu| available.contains(&cpu))
+                })
+                .map(|entry| Some(entry.logical as usize))
+                .collect::<Vec<_>>();
+            if cpus.is_empty() {
+                return Err(bif_error(process, "system_flag", args, "badarg"));
+            }
+            (0..scheduler.worker_count())
+                .map(|index| cpus.get(index).copied().flatten())
+                .collect()
+        };
+        if !scheduler.set_cpu_bindings(&bindings) {
+            return Err(bif_error(process, "system_flag", args, "badarg"));
         }
-        None => Ok(atom("undefined")),
+        let stored_name = if name == "default_bind" {
+            "thread_no_node_processor_spread"
+        } else {
+            name
+        };
+        *runtime_state(process)
+            .cpu_bind_order
+            .lock()
+            .expect("CPU bind order") = Some(stored_name.to_owned());
+        Ok(atom(&old))
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = value;
+        if value == atom("unbound") {
+            Ok(atom("unbound"))
+        } else {
+            Err(bif_error(process, "system_flag", args, "notsup"))
+        }
+    }
+}
+
+// Port of erts/emulator/beam/erl_cpu_topology.c (erts_set_cpu_topology,
+// create_tmp_cpu_topology_copy), OTP-29.1.1.
+#[cfg(target_os = "linux")]
+fn topology_bind_entries(
+    topology: &arinsal_etf::OwnedTerm,
+) -> Vec<arinsal_alloc::cpuinfo::CpuTopologyEntry> {
+    use arinsal_alloc::cpuinfo::CpuTopologyEntry;
+    use arinsal_etf::OwnedTerm as O;
+
+    fn children(term: &O) -> Vec<&O> {
+        match term {
+            O::List { elems, tail } if matches!(tail.as_ref(), O::Nil) => elems.iter().collect(),
+            term => vec![term],
+        }
+    }
+
+    fn append(
+        siblings: &[&O],
+        parent: &str,
+        inherited: CpuTopologyEntry,
+        entries: &mut Vec<CpuTopologyEntry>,
+    ) {
+        for (index, term) in siblings.iter().enumerate() {
+            let O::Tuple(fields) = term else { continue };
+            let (Some(O::Atom(tag)), Some(child)) = (fields.first(), fields.last()) else {
+                continue;
+            };
+            let mut entry = inherited;
+            let Ok(id) = i32::try_from(index) else {
+                continue;
+            };
+            match tag.as_str() {
+                "node" if parent == "processor" => entry.processor_node = id,
+                "node" => entry.node = id,
+                "processor" => entry.processor = id,
+                "core" => entry.core = id,
+                "thread" => entry.thread = id,
+                "logical" => {
+                    let O::Int(logical) = child else { continue };
+                    let Ok(logical) = i32::try_from(*logical) else {
+                        continue;
+                    };
+                    entry.logical = logical;
+                    entries.push(entry);
+                    continue;
+                }
+                _ => continue,
+            }
+            append(&children(child), tag, entry, entries);
+        }
+    }
+
+    let O::List { elems, tail } = topology else {
+        return Vec::new();
+    };
+    if !matches!(tail.as_ref(), O::Nil) {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    let empty = CpuTopologyEntry {
+        node: -1,
+        processor: -1,
+        processor_node: -1,
+        core: -1,
+        thread: -1,
+        logical: -1,
+    };
+    append(
+        &elems.iter().collect::<Vec<_>>(),
+        "root",
+        empty,
+        &mut entries,
+    );
+    entries
 }
 
 // The Erlang wrapper accepts the historical {Tag, [], Children} spelling and
@@ -3326,6 +3584,7 @@ pub(crate) struct StatisticsState {
     wall_origin: Instant,
     microstate: AtomicBool,
     cpu_topology: Mutex<Option<arinsal_etf::OwnedTerm>>,
+    cpu_bind_order: Mutex<Option<String>>,
     sched_wall: Mutex<Option<SchedBase>>,
     microstate_base: Mutex<Option<MicrostateBaseline>>,
     system_logger: Mutex<Term>,
@@ -3358,6 +3617,7 @@ impl StatisticsState {
             wall_origin: origins.wall,
             microstate: AtomicBool::new(false),
             cpu_topology: Mutex::new(None),
+            cpu_bind_order: Mutex::new(None),
             sched_wall: Mutex::new(None),
             microstate_base: Mutex::new(None),
             system_logger: Mutex::new(atom("logger")),

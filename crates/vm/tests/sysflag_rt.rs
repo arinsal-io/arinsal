@@ -8,6 +8,7 @@ const SOURCE: &str = r#"
 -module(sysflag_rt).
 -export([online/0, heap_defaults/0, control_flags/0,
          topology/0, bind_type/0, allocator/0, invalid_topology/0,
+         bind_default/0, bind_orderings/0, bind_defined_orderings/0,
          topology_round_trip/0, topology_legacy_form/0, topology_root_levels/0,
          blocked_scheduler_run_queue/0,
          microstate_after_disable/0, blocker_exit/0, change_flags/0,
@@ -113,6 +114,31 @@ bind_type() ->
      outcome(fun() -> erlang:system_flag(scheduler_bind_type, invalid) end),
      outcome(fun() -> erlang:system_flag(scheduler_bind_type, spread) end)}.
 
+bind_default() ->
+    outcome(fun() -> erlang:system_flag(scheduler_bind_type, default_bind) end).
+
+bind_orderings() ->
+    Types = [default_bind, thread_spread, processor_spread, spread, no_spread,
+             thread_no_node_processor_spread, no_node_processor_spread,
+             no_node_thread_spread],
+    Results = [begin
+                   Old = outcome(fun() -> erlang:system_flag(scheduler_bind_type, Type) end),
+                   timer:sleep(10),
+                   {Type, Old,
+                    outcome(fun() -> erlang:system_info(scheduler_bind_type) end),
+                    outcome(fun() -> erlang:system_info(scheduler_bindings) end)}
+               end || Type <- Types],
+    erlang:system_flag(scheduler_bind_type, unbound),
+    Results.
+
+bind_defined_orderings() ->
+    Topology = [{processor, [{core, {logical, 0}}, {core, {logical, 1}}]},
+                {processor, [{core, {logical, 2}}, {core, {logical, 3}}]}],
+    Previous = erlang:system_flag(cpu_topology, Topology),
+    Results = bind_orderings(),
+    erlang:system_flag(cpu_topology, undefined),
+    {Previous, Results}.
+
 allocator() ->
     Allocators = [temp_alloc, sl_alloc, std_alloc, ll_alloc, eheap_alloc,
                   ets_alloc, fix_alloc, literal_alloc, binary_alloc,
@@ -211,9 +237,15 @@ fn compare(function: &str) {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).expect("load VM fixture");
     let actual = vm
-        .eval_scheduled("sysflag_rt", function, &[], 1, None)
-        .unwrap_or_else(|error| panic!("{function}: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
+        .eval_scheduled(
+            "sysflag_rt",
+            function,
+            &[],
+            arinsal_alloc::cpuinfo::default_schedulers().0,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{function}: {error:?}"));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }
 
 #[test]
@@ -244,6 +276,21 @@ fn sysflag_rt_cpu_topology_and_system_info_match_otp() {
 #[test]
 fn sysflag_rt_scheduler_bind_type_matches_otp() {
     compare("bind_type");
+}
+
+#[test]
+fn sysflag_rt_scheduler_bind_default_matches_otp() {
+    compare("bind_default");
+}
+
+#[test]
+fn sysflag_rt_scheduler_bind_orderings_match_otp() {
+    compare("bind_orderings");
+}
+
+#[test]
+fn sysflag_rt_scheduler_bind_defined_orderings_match_otp() {
+    compare("bind_defined_orderings");
 }
 
 #[test]
@@ -299,11 +346,11 @@ fn sysflag_rt_flags_are_per_runtime() {
     let changed = first
         .eval_scheduled("sysflag_rt", "change_flags", &[], 1, None)
         .unwrap_or_else(|error| panic!("change_flags: {error}"));
-    assert_eq!(changed.term, arinsal_etf::OwnedTerm::Atom("ok".into()));
+    similar_asserts::assert_eq!(changed.term, arinsal_etf::OwnedTerm::Atom("ok".into()));
     let mut second = Vm::new([]);
     second.load_bytes(&beam).expect("load second VM");
     let actual = second
         .eval_scheduled("sysflag_rt", "runtime_defaults", &[], 1, None)
         .unwrap_or_else(|error| panic!("runtime_defaults: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }

@@ -15,6 +15,9 @@ libc = "0.2"
 parking_lot = "0.12.5"
 rustix = { version = "1.1.5", features = ["process", "thread"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+sysctl = "0.7.1"
+
 [dev-dependencies]
 proptest.workspace = true
 similar-asserts = "2"

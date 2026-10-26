@@ -85,7 +85,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use timer::{CanceledTimer, LinkEvent, TimerCommand, TimerPayload, Wheel};
@@ -1306,7 +1306,247 @@ struct ProcessTable<T: Task> {
     /// The thread progress that releases the table's references (erts_ptab_delete_element
     /// schedules the release as a later operation).
     progress: Arc<thr_progress::ThrProgress>,
+    /// One shared ordered list of invocation markers and deleted elements.
+    list_deleted: parking_lot::Mutex<PtabListLog<Pid>>,
     _process: std::marker::PhantomData<ProcRef<T>>,
+}
+
+/// An element removed while a table-list BIF is scanning table chunks.
+#[derive(Clone, Copy, Debug)]
+pub struct PtabListDeleted<T: Copy> {
+    /// Table index occupied by the deleted process.
+    pub index: u32,
+    /// Deleted identifier.
+    pub id: T,
+    /// Table interval when this incarnation was inserted.
+    pub started_interval: u64,
+    /// Table interval when it was deleted.
+    pub deleted_interval: u64,
+}
+
+#[derive(Clone, Copy)]
+enum PtabListEntry<T: Copy> {
+    Invocation { interval: u64 },
+    Deleted(PtabListDeleted<T>),
+}
+
+struct PtabListNode<T: Copy> {
+    prev: Option<usize>,
+    next: Option<usize>,
+    entry: PtabListEntry<T>,
+}
+
+/// Shared invocation and deletion list used by process and port table-list BIFs.
+// Port of erts/emulator/beam/erl_ptab.h (ErtsPTabListBifData list nodes), OTP-29.1.1.
+pub struct PtabListLog<T: Copy> {
+    nodes: Vec<Option<PtabListNode<T>>>,
+    free: Vec<usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    active_markers: usize,
+}
+
+impl<T: Copy> Default for PtabListLog<T> {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            free: Vec::new(),
+            head: None,
+            tail: None,
+            active_markers: 0,
+        }
+    }
+}
+
+impl<T: Copy> PtabListLog<T> {
+    // Port of erts/emulator/beam/erl_ptab.c (ptab_list_deleted_el list append), OTP-29.1.1.
+    fn allocate(&mut self, entry: PtabListEntry<T>) -> usize {
+        let node = PtabListNode {
+            prev: self.tail,
+            next: None,
+            entry,
+        };
+        let index = self.free.pop().unwrap_or_else(|| {
+            self.nodes.push(None);
+            self.nodes.len() - 1
+        });
+        self.nodes[index] = Some(node);
+        if let Some(tail) = self.tail {
+            self.nodes[tail].as_mut().unwrap().next = Some(index);
+        } else {
+            self.head = Some(index);
+        }
+        self.tail = Some(index);
+        index
+    }
+
+    /// Append the invocation marker that brackets one table-list scan.
+    // Port of erts/emulator/beam/erl_ptab.c:746-951 (erts_ptab_list / INITIALIZING), OTP-29.1.1.
+    pub fn begin(&mut self, interval: u64) -> usize {
+        self.active_markers += 1;
+        self.allocate(PtabListEntry::Invocation { interval })
+    }
+
+    /// Whether a listing invocation still owns a marker in the shared list.
+    pub fn has_invocations(&self) -> bool {
+        self.active_markers != 0
+    }
+
+    /// Remove an invocation marker when its trapping BIF is abandoned.
+    // Port of erts/emulator/beam/erl_ptab.c:780-875 (cleanup_ptab_list_bif_data), OTP-29.1.1.
+    pub fn cancel(&mut self, marker: usize) {
+        if self.nodes.get(marker).is_some_and(Option::is_some)
+            && matches!(
+                self.nodes[marker].as_ref().unwrap().entry,
+                PtabListEntry::Invocation { .. }
+            )
+        {
+            self.unlink(marker);
+            let _ = self.prune_before_first_marker();
+        }
+    }
+
+    /// Append a deletion record when at least one invocation marker is active.
+    // Port of erts/emulator/beam/erl_ptab.c:675 (erts_ptab_delete_element), OTP-29.1.1.
+    pub fn record(&mut self, deleted: PtabListDeleted<T>) {
+        if self.has_invocations() {
+            self.allocate(PtabListEntry::Deleted(deleted));
+        }
+    }
+
+    /// Inspect at most ten deletion records per reduction and move/remove the invocation marker.
+    // Port of erts/emulator/beam/erl_ptab.c:1068-1184 (INSPECTING_DELETED), OTP-29.1.1.
+    pub fn inspect(
+        &mut self,
+        marker: usize,
+        invocation_interval: u64,
+        chunk_intervals: &[u64],
+        max_reds: u32,
+    ) -> (Vec<T>, u32, bool) {
+        const DELETED_PER_RED: u32 = 10;
+        debug_assert!(matches!(
+            self.nodes[marker].as_ref().unwrap().entry,
+            PtabListEntry::Invocation { interval } if interval == invocation_interval
+        ));
+        let marker_was_head = self.head == Some(marker);
+        let mut cursor = self.nodes[marker].as_ref().and_then(|node| node.next);
+        self.detach(marker);
+        let mut ids = Vec::new();
+        let mut free_deleted = marker_was_head
+            && cursor.is_some_and(|index| {
+                matches!(
+                    self.nodes[index].as_ref().unwrap().entry,
+                    PtabListEntry::Deleted(_)
+                )
+            });
+        let mut inspected = 0_usize;
+        let mut freed = 0_u32;
+        while let Some(index) = cursor {
+            let (entry, next) = {
+                let node = self.nodes[index].as_ref().unwrap();
+                (node.entry, node.next)
+            };
+            if (inspected as u32 / DELETED_PER_RED).saturating_add(freed) >= max_reds {
+                break;
+            }
+            cursor = next;
+            match entry {
+                PtabListEntry::Invocation { .. } => free_deleted = false,
+                PtabListEntry::Deleted(deleted) => {
+                    let chunk = deleted.index as usize / 1000;
+                    if deleted.started_interval < invocation_interval
+                        && chunk_intervals
+                            .get(chunk)
+                            .is_some_and(|interval| deleted.deleted_interval < *interval)
+                    {
+                        ids.push(deleted.id);
+                    }
+                    inspected += 1;
+                    if free_deleted {
+                        self.unlink(index);
+                        freed += 1;
+                    }
+                    if inspected.is_multiple_of(DELETED_PER_RED as usize)
+                        && (inspected as u32 / DELETED_PER_RED).saturating_add(freed) >= max_reds
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let done = cursor.is_none();
+        if done {
+            self.free_detached(marker);
+        } else if let Some(next) = cursor {
+            self.insert_before(next, marker);
+        }
+        (ids, inspected as u32 / DELETED_PER_RED + freed, done)
+    }
+
+    fn unlink(&mut self, index: usize) {
+        let entry = self.nodes[index].as_ref().unwrap().entry;
+        self.detach(index);
+        self.free_detached_entry(index, entry);
+    }
+
+    fn free_detached(&mut self, index: usize) {
+        let entry = self.nodes[index].as_ref().unwrap().entry;
+        self.free_detached_entry(index, entry);
+    }
+
+    fn free_detached_entry(&mut self, index: usize, entry: PtabListEntry<T>) {
+        self.nodes[index] = None;
+        if matches!(entry, PtabListEntry::Invocation { .. }) {
+            self.active_markers -= 1;
+        }
+        self.free.push(index);
+    }
+
+    fn detach(&mut self, index: usize) {
+        let node = self.nodes[index].as_ref().unwrap();
+        let prev = node.prev;
+        let next = node.next;
+        if let Some(prev) = prev {
+            self.nodes[prev].as_mut().unwrap().next = next;
+        } else {
+            self.head = next;
+        }
+        if let Some(next) = next {
+            self.nodes[next].as_mut().unwrap().prev = prev;
+        } else {
+            self.tail = prev;
+        }
+    }
+
+    fn insert_before(&mut self, next: usize, index: usize) {
+        let prev = self.nodes[next].as_ref().unwrap().prev;
+        let node = self.nodes[index].as_mut().unwrap();
+        node.prev = prev;
+        node.next = Some(next);
+        if let Some(prev) = prev {
+            self.nodes[prev].as_mut().unwrap().next = Some(index);
+        } else {
+            self.head = Some(index);
+        }
+        self.nodes[next].as_mut().unwrap().prev = Some(index);
+    }
+
+    fn prune_before_first_marker(&mut self) -> u32 {
+        let mut cursor = self.head;
+        let mut freed = 0;
+        while let Some(index) = cursor {
+            let node = self.nodes[index].as_ref().unwrap();
+            if matches!(node.entry, PtabListEntry::Invocation { .. }) {
+                break;
+            }
+            if matches!(node.entry, PtabListEntry::Deleted(_)) {
+                freed += 1;
+            }
+            cursor = node.next;
+            self.unlink(index);
+        }
+        freed
+    }
 }
 
 impl<T: Task> ProcessTable<T> {
@@ -1321,6 +1561,7 @@ impl<T: Task> ProcessTable<T> {
             interval: AtomicU64::new(0),
             slots,
             progress,
+            list_deleted: parking_lot::Mutex::new(PtabListLog::default()),
             _process: std::marker::PhantomData,
         }
     }
@@ -1430,17 +1671,68 @@ impl<T: Task> ProcessTable<T> {
     /// Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw and the
     /// erts_thr_progress_unmanaged_delay of erts_proc_lookup_inc_refc), OTP-29.1.1.
     fn with_slot<R>(&self, pix: u32, f: impl FnOnce(&ProcRef<T>) -> R) -> Option<R> {
-        let slot = self.slot(pix)?;
-        let delay = thr_progress::unmanaged_delay(&self.progress);
-        let raw = slot.load(Ordering::Acquire);
-        let result = (!raw.is_null()).then(|| {
-            let _lookup = thr_progress::LookupScope::enter();
-            // SAFETY: `raw` was in the slot while this thread delays thread progress, and the
-            // slot's reference is released only by a later operation after thread progress.
-            unsafe { ProcRef::with_borrowed(raw, f) }
+        let mut result = None;
+        let mut f = Some(f);
+        self.with_slot_range(pix, pix.saturating_add(1), |process| {
+            result = Some(f.take().expect("one slot callback is called once")(process));
         });
-        thr_progress::unmanaged_continue(&self.progress, delay);
         result
+    }
+
+    /// Scan one range while delaying thread progress once for the whole chunk.
+    // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
+    fn with_slot_range(&self, first: u32, limit: u32, mut f: impl FnMut(&ProcRef<T>)) {
+        let delay = thr_progress::unmanaged_delay(&self.progress);
+        let limit = limit.min(self.slots.len() as u32);
+        for pix in first.min(limit)..limit {
+            let raw = self.slots[pix as usize].load(Ordering::Acquire);
+            if !raw.is_null() {
+                let _lookup = thr_progress::LookupScope::enter();
+                // SAFETY: `raw` remains table-owned during the delay, and a later operation
+                // cannot release it until thread progress has passed this chunk.
+                unsafe { ProcRef::with_borrowed(raw, &mut f) }
+            }
+        }
+        thr_progress::unmanaged_continue(&self.progress, delay);
+    }
+
+    // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list), OTP-29.1.1.
+    fn begin_ptab_list(&self) -> (usize, u64) {
+        let _exclusive = self.lock.write();
+        let interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        let marker = self.list_deleted.lock().begin(interval);
+        (marker, interval)
+    }
+
+    // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
+    fn scan_ptab_list_chunk(
+        &self,
+        first: u32,
+        limit: u32,
+        invocation_interval: u64,
+    ) -> (Vec<Pid>, u64) {
+        let _exclusive = self.lock.write();
+        let chunk_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        let mut pids = Vec::new();
+        self.with_slot_range(first, limit, |process| {
+            if process.started_interval < invocation_interval {
+                pids.push(process.pid);
+            }
+        });
+        (pids, chunk_interval)
+    }
+
+    fn inspect_ptab_list_deleted(
+        &self,
+        marker: usize,
+        invocation_interval: u64,
+        chunk_intervals: &[u64],
+        max_reds: u32,
+    ) -> (Vec<Pid>, u32, bool) {
+        let _exclusive = self.lock.write();
+        self.list_deleted
+            .lock()
+            .inspect(marker, invocation_interval, chunk_intervals, max_reds)
     }
 
     fn load_slot(&self, pix: u32) -> Option<ProcRef<T>> {
@@ -1464,11 +1756,35 @@ impl<T: Task> ProcessTable<T> {
 
     fn remove(&self, pid: Pid) {
         // Port of erts/emulator/beam/erl_ptab.c:675 (erts_ptab_delete_element), OTP-29.1.1.
-        let _shared = self.lock.read();
+        let shared = self.lock.read();
+        let log_active = self.list_deleted.lock().has_invocations();
+        if log_active {
+            drop(shared);
+            let _exclusive = self.lock.write();
+            self.remove_locked(pid, true);
+        } else {
+            self.remove_locked(pid, false);
+        }
+    }
+
+    fn remove_locked(&self, pid: Pid, log_active: bool) {
         let slot = self.slot(self.index(pid)).expect("a live pid has a slot");
+        let removed = log_active
+            .then(|| self.load_slot(self.index(pid)))
+            .flatten();
         let old = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if old.is_null() {
             return;
+        }
+        let deleted_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        if let Some(process) = removed {
+            let entry = PtabListDeleted {
+                index: self.index(pid),
+                id: pid,
+                started_interval: process.started_interval,
+                deleted_interval,
+            };
+            self.list_deleted.lock().record(entry);
         }
         self.ids.release(pid.data());
         // erts_schedule_thr_prgr_later_cleanup_op(release_process, ...): a lookup that loaded
@@ -1697,6 +2013,9 @@ struct Inner<T: Task> {
     sim: Option<Mutex<SimState<T>>>,
     /// Scheduler data of the simulated scheduler, which runs on the stepping thread.
     sim_data: Mutex<T::SchedulerData>,
+    /// Requested and applied CPU ids for normal scheduler threads.
+    cpu_bind_targets: RwLock<Vec<Option<usize>>>,
+    cpu_bind_actual: RwLock<Vec<Option<usize>>>,
     stopped: AtomicBool,
     halt_started: AtomicBool,
     halt_requested: AtomicBool,
@@ -5637,6 +5956,61 @@ pub struct Scheduler<T: Task> {
     virtual_clock: Option<Arc<VirtualClock>>,
 }
 
+/// A table-list invocation that reconciles removals between 1000-slot scan chunks.
+pub struct PtabListSnapshot<T: Task> {
+    scheduler: Arc<Scheduler<T>>,
+    marker: usize,
+    invocation_interval: u64,
+    active: bool,
+}
+
+impl<T: Task> PtabListSnapshot<T> {
+    // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
+    /// Read one table chunk and return live identifiers plus qualifying deletions.
+    pub fn scan_chunk(&self, first: u32, limit: u32) -> (Vec<Pid>, u64) {
+        self.scheduler
+            .inner
+            .table
+            .scan_ptab_list_chunk(first, limit, self.invocation_interval)
+    }
+
+    /// Inspect the shared deletion list and advance this invocation marker.
+    // Port of erts/emulator/beam/erl_ptab.c:1070 (ptab_list_bif_engine), OTP-29.1.1.
+    pub fn inspect_deleted(
+        &mut self,
+        chunk_intervals: &[u64],
+        max_reds: u32,
+    ) -> (Vec<Pid>, u32, bool) {
+        let result = self.scheduler.inner.table.inspect_ptab_list_deleted(
+            self.marker,
+            self.invocation_interval,
+            chunk_intervals,
+            max_reds,
+        );
+        self.active = !result.2;
+        result
+    }
+
+    /// Interval at which this listing began.
+    // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list), OTP-29.1.1.
+    pub fn invocation_interval(&self) -> u64 {
+        self.invocation_interval
+    }
+}
+
+impl<T: Task> Drop for PtabListSnapshot<T> {
+    fn drop(&mut self) {
+        if self.active {
+            self.scheduler
+                .inner
+                .table
+                .list_deleted
+                .lock()
+                .cancel(self.marker);
+        }
+    }
+}
+
 /// A point-in-time snapshot of scheduler work and execution counters.
 #[derive(Clone, Debug)]
 pub struct SchedulerStats {
@@ -5772,6 +6146,8 @@ impl<T: Task> Scheduler<T> {
             next_timer: AtomicU64::new(1),
             clock,
             sim_data: Mutex::new(T::SchedulerData::default()),
+            cpu_bind_targets: RwLock::new(vec![None; workers]),
+            cpu_bind_actual: RwLock::new(vec![None; workers]),
             sim: rng.map(|rng| {
                 Mutex::new(SimState {
                     queue: VecDeque::new(),
@@ -6543,6 +6919,33 @@ impl<T: Task> Scheduler<T> {
         self.inner.parked.len()
     }
 
+    /// Request CPU affinity for each normal scheduler; `None` restores its inherited mask.
+    // Port of erts/emulator/beam/erl_cpu_topology.c (erts_bind_schedulers,
+    // write_schedulers_bind_change), OTP-29.1.1.
+    pub fn set_cpu_bindings(&self, bindings: &[Option<usize>]) -> bool {
+        if bindings.len() != self.worker_count() {
+            return false;
+        }
+        *self
+            .inner
+            .cpu_bind_targets
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = bindings.to_vec();
+        for worker in 0..bindings.len() {
+            self.inner.wake_worker(worker);
+        }
+        true
+    }
+
+    /// Return the CPU ids successfully applied to normal scheduler threads.
+    pub fn cpu_bindings(&self) -> Vec<Option<usize>> {
+        self.inner
+            .cpu_bind_actual
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     /// Return the configured number of normal scheduler workers.
     pub fn scheduler_count(&self) -> usize {
         self.inner.config.workers
@@ -6615,6 +7018,18 @@ impl<T: Task> Scheduler<T> {
     /// after the last one inspected (`erts_ptab_processes_next`).
     pub fn pids_in_table_range(&self, first: u32, limit: u32, max: usize) -> (Vec<Pid>, u32) {
         self.inner.table.pids_in_range(first, limit, max)
+    }
+
+    /// Begin an OTP-style process table listing, with per-chunk deletion reconciliation.
+    // Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list), OTP-29.1.1.
+    pub fn begin_ptab_list(self: &Arc<Self>) -> PtabListSnapshot<T> {
+        let (marker, invocation_interval) = self.inner.table.begin_ptab_list();
+        PtabListSnapshot {
+            scheduler: Arc::clone(self),
+            marker,
+            invocation_interval,
+            active: true,
+        }
     }
 
     /// Process-table size (`erlang:system_info(process_limit)`).
@@ -8276,7 +8691,18 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     // Until then an empty queue sleeps, matching a scheduler that reached
     // scheduler_wait at boot before any user process existed.
     let mut steal_armed = false;
+    #[cfg(target_os = "linux")]
+    let inherited_affinity = rustix::thread::sched_getaffinity(None).ok();
+    #[cfg(target_os = "linux")]
+    let mut applied_binding = None;
     while !inner.stopped.load(Ordering::Acquire) {
+        #[cfg(target_os = "linux")]
+        apply_scheduler_cpu_binding(
+            &inner,
+            id,
+            &mut applied_binding,
+            inherited_affinity.as_ref(),
+        );
         let mut local_guard = local_cell.borrow_mut();
         let local = &mut *local_guard;
         // Port of erts/emulator/beam/erl_process.c:9857-9866 (schedule: the progress point
@@ -8750,6 +9176,50 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     OWNER_TIMER_SERVICES.with(|services| {
         services.borrow_mut().remove(&inner_id);
     });
+}
+
+// Port of erts/emulator/beam/erl_cpu_topology.c (erts_sched_check_cpu_bind), OTP-29.1.1.
+#[cfg(target_os = "linux")]
+fn apply_scheduler_cpu_binding<T: Task>(
+    inner: &Inner<T>,
+    id: usize,
+    applied: &mut Option<Option<usize>>,
+    inherited: Option<&rustix::thread::CpuSet>,
+) {
+    let requested = inner
+        .cpu_bind_targets
+        .read()
+        .unwrap_or_else(|error| error.into_inner())[id];
+    let target = if id < inner.online_schedulers.load(Ordering::Acquire) {
+        requested
+    } else {
+        None
+    };
+    if *applied == Some(target) {
+        return;
+    }
+    let Some(inherited) = inherited else {
+        return;
+    };
+    let mut mask = rustix::thread::CpuSet::new();
+    match target {
+        Some(cpu) if cpu < rustix::thread::CpuSet::MAX_CPU => mask.set(cpu),
+        Some(_) => return,
+        None => mask = *inherited,
+    }
+    if rustix::thread::sched_setaffinity(None, &mask).is_ok() {
+        inner
+            .cpu_bind_actual
+            .write()
+            .unwrap_or_else(|error| error.into_inner())[id] = target;
+        *applied = Some(target);
+    } else if target.is_some() && rustix::thread::sched_setaffinity(None, inherited).is_ok() {
+        inner
+            .cpu_bind_actual
+            .write()
+            .unwrap_or_else(|error| error.into_inner())[id] = None;
+        *applied = Some(None);
+    }
 }
 
 /// The timed sleep of an idle scheduler.

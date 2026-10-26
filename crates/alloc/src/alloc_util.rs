@@ -216,6 +216,14 @@ impl Allocation {
         Self { id, size }
     }
 
+    pub(crate) fn from_payload(payload: *mut u64, size: usize) -> Self {
+        // Port of erts/emulator/beam/erl_alloc_util.h:432 (ABLK_TO_MBC), OTP-29.1.1.
+        Self {
+            id: (payload as usize).wrapping_sub(BLOCK_HEADER) as u64,
+            size,
+        }
+    }
+
     pub(crate) fn id(self) -> u64 {
         self.id
     }
