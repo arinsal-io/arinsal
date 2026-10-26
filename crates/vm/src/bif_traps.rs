@@ -3912,13 +3912,8 @@ fn term_to_iovec(
 
 fn new_term_encoder(args: &[Term]) -> Result<arinsal_bifs::EncodeWalk, BifError> {
     let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
-    let (node, creation) = {
-        let tables = crate::node_tables::lock();
-        let node = global_atoms()
-            .intern(&tables.local_name)
-            .map_err(|_| BifError::SystemLimit)?;
-        (node, tables.local_creation)
-    };
+    // `erts_this_node` is read without any lock.
+    let (node, creation) = arinsal_term::this_node();
     encoder.set_local_node(node, creation);
     Ok(encoder)
 }

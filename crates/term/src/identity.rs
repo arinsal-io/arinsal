@@ -204,7 +204,7 @@ pub fn set_this_node(name: Atom, creation: u32) {
 }
 
 /// The local node name and creation; `nonode@nohost` and 0 until the node is named.
-pub(crate) fn this_node() -> (Atom, u32) {
+pub fn this_node() -> (Atom, u32) {
     match THIS_NODE.load(Ordering::Acquire) {
         0 => (atoms::NONAME, 0),
         packed => (Atom((packed >> 32) as u32), packed as u32),
