@@ -1548,10 +1548,13 @@ pub(crate) fn owns_native_address(address: usize) -> bool {
 
 pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
-        let enabled = beamasm_enabled(
-            std::env::var_os("ARINSAL_INTERP"),
-            std::env::var_os("ARINSAL_BEAMASM"),
-        );
+        // `-emu_flavor emu` is the start flag; `ARINSAL_INTERP=1` is an alias of it.
+        let flavor_emu = arinsal_args::active_emulator_flags().interpreter;
+        let enabled = !flavor_emu
+            && beamasm_enabled(
+                std::env::var_os("ARINSAL_INTERP"),
+                std::env::var_os("ARINSAL_BEAMASM"),
+            );
         arinsal_bifs::set_emu_flavor_jit(enabled);
         enabled
     })
