@@ -1567,9 +1567,6 @@ fn integer_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, Bi
         .binary(text.as_bytes())
         .expect("infallible BIF heap"))
 }
-pub(super) fn iolist_bytes(root: Term) -> Result<Vec<u8>, BifError> {
-    binary_bifs::iolist_bytes(root)
-}
 
 /// Return the sole bitstring in a singleton list when its length satisfies `unit`.
 // Port of erts/emulator/beam/erl_iolist.c:865-879, OTP-29.1.1.

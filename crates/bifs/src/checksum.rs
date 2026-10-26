@@ -4,7 +4,7 @@ use arinsal_term::{Term, TermBuilder, TermKind};
 use num_traits::ToPrimitive;
 
 use crate::lists::{DeferredTrap, cons_cell};
-use crate::pure::{Heap, bigint, binary_bytes, copy_binary_range, iolist_bytes, with_binary_bytes};
+use crate::pure::{Heap, bigint, binary_bytes, copy_binary_range, with_binary_bytes};
 use crate::{BifError, Ctx};
 
 /// Bytes of a checksum charged as one reduction.
@@ -25,14 +25,14 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     v: &mut V,
 ) -> Option<V::Output> {
     let f = match (module, name, arity) {
-        ("erlang", "crc32", 1 | 2) => v.entry::<bodies::crc32>(),
-        ("erlang", "adler32", 1 | 2) => v.entry::<bodies::adler32>(),
-        ("erlang", "crc32_combine", 3) => v.entry::<bodies::crc32_combine>(),
-        ("erlang", "adler32_combine", 3) => v.entry::<bodies::adler32_combine>(),
-        ("erlang", "md5", 1) => v.entry::<bodies::md5>(),
-        ("erlang", "md5_init", 0) => v.entry::<bodies::md5_init>(),
-        ("erlang", "md5_update", 2) => v.entry::<bodies::md5_update>(),
-        ("erlang", "md5_final", 1) => v.entry::<bodies::md5_final>(),
+        ("erlang", "crc32", 1 | 2) => v.entry::<word_bodies::crc32>(),
+        ("erlang", "adler32", 1 | 2) => v.entry::<word_bodies::adler32>(),
+        ("erlang", "crc32_combine", 3) => v.entry::<word_bodies::crc32_combine>(),
+        ("erlang", "adler32_combine", 3) => v.entry::<word_bodies::adler32_combine>(),
+        ("erlang", "md5", 1) => v.entry::<word_bodies::md5>(),
+        ("erlang", "md5_init", 0) => v.entry::<word_bodies::md5_init>(),
+        ("erlang", "md5_update", 2) => v.entry::<word_bodies::md5_update>(),
+        ("erlang", "md5_final", 1) => v.entry::<word_bodies::md5_final>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -53,6 +53,14 @@ pub enum ChksumKind {
     Adler32,
     /// `erlang:md5/1`.
     Md5,
+    /// `erlang:md5_update/2` and its continuation.
+    Md5Update,
+}
+
+#[derive(Clone, Copy)]
+enum ChksumTarget {
+    Checksum,
+    Md5Update,
 }
 
 #[derive(Clone)]
@@ -68,6 +76,7 @@ enum ChksumSum {
 #[derive(Clone)]
 pub struct ChksumCont {
     kind: ChksumKind,
+    target: ChksumTarget,
     sum: ChksumSum,
     rest: Term,
 }
@@ -78,7 +87,10 @@ impl ChksumCont {
         match self.kind {
             ChksumKind::Crc32 => "erlang:crc32/2",
             ChksumKind::Adler32 => "erlang:adler32/2",
-            ChksumKind::Md5 => "erlang:md5_trap/2",
+            ChksumKind::Md5 | ChksumKind::Md5Update => match self.target {
+                ChksumTarget::Checksum => "erlang:md5_trap/2",
+                ChksumTarget::Md5Update => "erlang:md5_update/2",
+            },
         }
     }
 
@@ -255,7 +267,7 @@ fn chksum_left(ctx: &Ctx<'_>, kind: ChksumKind) -> usize {
     match kind {
         // Calibrated so that each reduction does one round of MD5 (4 bytes), rounded down to
         // whole 64 byte blocks.
-        ChksumKind::Md5 => budget.saturating_mul(4) & !0x3f,
+        ChksumKind::Md5 | ChksumKind::Md5Update => budget.saturating_mul(4) & !0x3f,
         _ => CHUNK_PER_SCHEDULE,
     }
 }
@@ -268,6 +280,7 @@ fn chksum_left(ctx: &Ctx<'_>, kind: ChksumKind) -> usize {
 fn chksum_slice(
     ctx: &mut Ctx<'_>,
     kind: ChksumKind,
+    target: ChksumTarget,
     mut sum: ChksumSum,
     input: Term,
 ) -> Result<ChksumStep, BifError> {
@@ -294,7 +307,7 @@ fn chksum_slice(
         Ok(done) => done,
         Err(res) => {
             ctx.charge_reductions(match kind {
-                ChksumKind::Md5 => res,
+                ChksumKind::Md5 | ChksumKind::Md5Update => res,
                 _ => res / BYTES_PER_REDUCTION,
             });
             return Err(BifError::BADARG);
@@ -310,64 +323,81 @@ fn chksum_slice(
                 ctx.bump_all_reds();
                 return Ok(ChksumStep::More(ChksumCont {
                     kind,
+                    target,
                     sum: ChksumSum::Zlib(value),
                     rest,
                 }));
             }
             Ok(ChksumStep::Done(result(value as u32)))
         }
-        ChksumKind::Md5 => {
+        ChksumKind::Md5 | ChksumKind::Md5Update => {
             if rest != Term::NIL && ctx.reduction_budget() != usize::MAX {
                 ctx.bump_all_reds();
-                return Ok(ChksumStep::More(ChksumCont { kind, sum, rest }));
+                return Ok(ChksumStep::More(ChksumCont {
+                    kind,
+                    target,
+                    sum,
+                    rest,
+                }));
             }
             ctx.charge_reductions(res);
             let ChksumSum::Md5(state) = sum else {
                 unreachable!("md5 carries an md5 state")
             };
-            Ok(ChksumStep::Done(binary(ctx, &state.final_digest())?))
+            let bytes = match target {
+                ChksumTarget::Checksum => state.final_digest().to_vec(),
+                ChksumTarget::Md5Update => state.bytes().to_vec(),
+            };
+            Ok(ChksumStep::Done(binary(ctx, &bytes)?))
         }
     }
 }
 
 /// The first slice of `crc32/1,2`, `adler32/1,2` or `md5/1`, or of `crc32/2` and `adler32/2`
-/// called directly.
+/// called directly. `Md5Update` starts from the supplied serialized context.
 pub fn chksum_start(
     ctx: &mut Ctx<'_>,
     kind: ChksumKind,
     args: &[Term],
 ) -> Result<ChksumStep, BifError> {
-    let (seed, data) = if args.len() == 1 {
-        (if kind == ChksumKind::Adler32 { 1 } else { 0 }, args[0])
+    let (data, sum, target) = if kind == ChksumKind::Md5Update {
+        (
+            args[1],
+            ChksumSum::Md5(Md5State::from_bytes(&binary_bytes(args[0])?)?),
+            ChksumTarget::Md5Update,
+        )
     } else {
-        (u32_arg(args[0])?, args[1])
+        let (seed, data) = if args.len() == 1 {
+            (if kind == ChksumKind::Adler32 { 1 } else { 0 }, args[0])
+        } else {
+            (u32_arg(args[0])?, args[1])
+        };
+        let sum = if kind == ChksumKind::Md5 {
+            ChksumSum::Md5(Md5State::new())
+        } else {
+            ChksumSum::Zlib(seed as std::ffi::c_ulong)
+        };
+        (data, sum, ChksumTarget::Checksum)
     };
-    let sum = if kind == ChksumKind::Md5 {
-        ChksumSum::Md5(Md5State::new())
-    } else {
-        ChksumSum::Zlib(seed as std::ffi::c_ulong)
-    };
-    chksum_slice(ctx, kind, sum, data)
+    chksum_slice(ctx, kind, target, sum, data)
 }
 
 /// Run the slice that follows a trap.
 pub fn chksum_resume(ctx: &mut Ctx<'_>, cont: &ChksumCont) -> Result<ChksumStep, BifError> {
-    chksum_slice(ctx, cont.kind, cont.sum.clone(), cont.rest)
+    chksum_slice(ctx, cont.kind, cont.target, cont.sum.clone(), cont.rest)
 }
 
-fn run_chksum(ctx: &mut Ctx<'_>, kind: ChksumKind, args: &[Term]) -> Result<Term, BifError> {
-    match chksum_start(ctx, kind, args)? {
-        ChksumStep::Done(value) => Ok(value),
-        ChksumStep::More(cont) => {
-            ctx.defer_trap(DeferredTrap::Chksum(cont));
-            Ok(Term::NIL)
-        }
+fn run_chksum(ctx: &mut Ctx<'_>, kind: ChksumKind, args: &[Term]) -> Term {
+    match chksum_start(ctx, kind, args) {
+        Ok(ChksumStep::Done(value)) => value,
+        Ok(ChksumStep::More(cont)) => ctx.trap(DeferredTrap::Chksum(cont)),
+        Err(error) => ctx.fail(error),
     }
 }
-fn crc32(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn crc32(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     run_chksum(ctx, ChksumKind::Crc32, args)
 }
-fn adler32(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn adler32(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     run_chksum(ctx, ChksumKind::Adler32, args)
 }
 fn combine(args: &[Term], adler: bool) -> Result<Term, BifError> {
@@ -388,10 +418,10 @@ fn combine(args: &[Term], adler: bool) -> Result<Term, BifError> {
     };
     Ok(result(value as u32))
 }
-fn crc32_combine(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn crc32_combine_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     combine(args, false)
 }
-fn adler32_combine(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn adler32_combine_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     combine(args, true)
 }
 
@@ -400,7 +430,7 @@ fn binary(ctx: &mut Ctx<'_>, bytes: &[u8]) -> Result<Term, BifError> {
         .binary(bytes)
         .map_err(|_| BifError::SystemLimit)
 }
-fn md5(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn md5(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     run_chksum(ctx, ChksumKind::Md5, args)
 }
 
@@ -536,26 +566,30 @@ fn compress(words: &mut [u32; 4], block: &[u8]) {
         *word = word.wrapping_add(value);
     }
 }
-fn md5_init(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn md5_init_result(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     binary(ctx, &Md5State::new().bytes())
 }
-fn md5_update(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut state = Md5State::from_bytes(&binary_bytes(args[0])?)?;
-    state.update(&iolist_bytes(args[1])?);
-    binary(ctx, &state.bytes())
+fn md5_update(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match chksum_start(ctx, ChksumKind::Md5Update, args) {
+        Ok(ChksumStep::Done(value)) => value,
+        Ok(ChksumStep::More(cont)) => ctx.trap(DeferredTrap::Chksum(cont)),
+        Err(error) => ctx.fail(error),
+    }
 }
-fn md5_final(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn md5_final_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let state = Md5State::from_bytes(&binary_bytes(args[0])?)?;
     binary(ctx, &state.final_digest())
 }
 
-crate::bif_bodies!(
-    crc32,
-    adler32,
-    crc32_combine,
-    adler32_combine,
-    md5,
-    md5_init,
-    md5_update,
-    md5_final,
-);
+macro_rules! word_adapters {
+    ($($word:ident => $body:ident),+ $(,)?) => {
+        $(#[inline(always)]
+        fn $word(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+            match $body(ctx, args) { Ok(value) => value, Err(error) => ctx.fail(error) }
+        })+
+    };
+}
+word_adapters!(crc32_combine => crc32_combine_result, adler32_combine => adler32_combine_result,
+    md5_init => md5_init_result, md5_final => md5_final_result);
+crate::word_bif_bodies_in!(word_bodies; crc32, adler32, crc32_combine, adler32_combine, md5,
+    md5_init, md5_update, md5_final);

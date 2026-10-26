@@ -50,19 +50,19 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     v: &mut V,
 ) -> Option<V::Output> {
     let function = match (module, name, arity) {
-        ("erts_internal", "atomics_new", 2) => v.entry::<bodies::atomics_new>(),
-        ("atomics", "get", 2) => v.entry::<bodies::atomics_get>(),
-        ("atomics", "put", 3) => v.entry::<bodies::atomics_put>(),
-        ("atomics", "add", 3) => v.entry::<bodies::atomics_add>(),
-        ("atomics", "add_get", 3) => v.entry::<bodies::atomics_add_get>(),
-        ("atomics", "exchange", 3) => v.entry::<bodies::atomics_exchange>(),
-        ("atomics", "compare_exchange", 4) => v.entry::<bodies::atomics_compare_exchange>(),
-        ("atomics", "info", 1) => v.entry::<bodies::atomics_info>(),
-        ("erts_internal", "counters_new", 1) => v.entry::<bodies::counters_new>(),
-        ("erts_internal", "counters_get", 2) => v.entry::<bodies::counters_get>(),
-        ("erts_internal", "counters_add", 3) => v.entry::<bodies::counters_add>(),
-        ("erts_internal", "counters_put", 3) => v.entry::<bodies::counters_put>(),
-        ("erts_internal", "counters_info", 1) => v.entry::<bodies::counters_info>(),
+        ("erts_internal", "atomics_new", 2) => v.entry::<word_bodies::atomics_new>(),
+        ("atomics", "get", 2) => v.entry::<word_bodies::atomics_get>(),
+        ("atomics", "put", 3) => v.entry::<word_bodies::atomics_put>(),
+        ("atomics", "add", 3) => v.entry::<word_bodies::atomics_add>(),
+        ("atomics", "add_get", 3) => v.entry::<word_bodies::atomics_add_get>(),
+        ("atomics", "exchange", 3) => v.entry::<word_bodies::atomics_exchange>(),
+        ("atomics", "compare_exchange", 4) => v.entry::<word_bodies::atomics_compare_exchange>(),
+        ("atomics", "info", 1) => v.entry::<word_bodies::atomics_info>(),
+        ("erts_internal", "counters_new", 1) => v.entry::<word_bodies::counters_new>(),
+        ("erts_internal", "counters_get", 2) => v.entry::<word_bodies::counters_get>(),
+        ("erts_internal", "counters_add", 3) => v.entry::<word_bodies::counters_add>(),
+        ("erts_internal", "counters_put", 3) => v.entry::<word_bodies::counters_put>(),
+        ("erts_internal", "counters_info", 1) => v.entry::<word_bodies::counters_info>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| function)
@@ -180,7 +180,7 @@ fn output(ctx: &mut Ctx<'_>, array: &Array, value: i64) -> Result<Term, BifError
         .map_err(|_| BifError::SystemLimit)
 }
 
-fn atomics_new(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn atomics_new_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let count = array_size(args[0])?;
     if count == 0 {
         return Err(BADARG);
@@ -203,7 +203,7 @@ fn atomics_new(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     )
 }
 
-fn atomics_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn atomics_get_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let array = resolve(&args[0])?;
     let i = index(array, args[1])?;
     let value = match &array.cells {
@@ -214,7 +214,7 @@ fn atomics_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     output(ctx, array, value)
 }
 
-fn atomics_put(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn atomics_put_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let array = resolve(&args[0])?;
     let i = index(array, args[1])?;
     match &array.cells {
@@ -253,14 +253,14 @@ fn atomics_add_common(
     }
 }
 
-fn atomics_add(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn atomics_add_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     atomics_add_common(ctx, args, false, false)
 }
-fn atomics_add_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn atomics_add_get_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     atomics_add_common(ctx, args, true, false)
 }
 
-fn atomics_exchange(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn atomics_exchange_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let array = resolve(&args[0])?;
     let i = index(array, args[1])?;
     let was = match &array.cells {
@@ -271,7 +271,7 @@ fn atomics_exchange(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> 
     output(ctx, array, was)
 }
 
-fn atomics_compare_exchange(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn atomics_compare_exchange_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let array = resolve(&args[0])?;
     let i = index(array, args[1])?;
     match &array.cells {
@@ -297,7 +297,7 @@ fn atomics_compare_exchange(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, Bi
     }
 }
 
-fn atomics_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn atomics_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let array = resolve(&args[0])?;
     let maximum = if array.signed {
         i64::MAX as u64
@@ -334,7 +334,7 @@ fn int_term(ctx: &mut Ctx<'_>, value: BigInt) -> Result<Term, BifError> {
 
 thread_local! { static THREAD_SLOT: Cell<usize> = Cell::new(NEXT_SLOT.fetch_add(1, Ordering::Relaxed) as usize % COUNTER_SHARDS); }
 
-fn counters_new(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn counters_new_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let count = array_size(args[0])?;
     if count == 0 {
         return Err(BADARG);
@@ -363,7 +363,7 @@ fn counters_new(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     )
 }
 
-fn counters_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn counters_get_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let array = resolve(&args[0])?;
     let i = index(array, args[1])?;
     let Cells::Sharded(cells) = &array.cells else {
@@ -375,7 +375,7 @@ fn counters_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     output(ctx, array, sum)
 }
 
-fn counters_add(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn counters_add_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let array = resolve(&args[0])?;
     let i = index(array, args[1])?;
     let value = arithmetic_value(args[2])?;
@@ -388,7 +388,7 @@ fn counters_add(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(Term::atom(atoms::OK))
 }
 
-fn counters_put(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn counters_put_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let array = resolve(&args[0])?;
     let i = index(array, args[1])?;
     let value = signed_value(args[2])?;
@@ -402,7 +402,7 @@ fn counters_put(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(Term::atom(atoms::OK))
 }
 
-fn counters_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn counters_info_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let array = resolve(&args[0])?;
     let Cells::Sharded(cells) = &array.cells else {
         return Err(BADARG);
@@ -447,18 +447,21 @@ mod tests {
     }
 }
 
-crate::bif_bodies!(
-    atomics_new,
-    atomics_get,
-    atomics_put,
-    atomics_add,
-    atomics_add_get,
-    atomics_exchange,
-    atomics_compare_exchange,
-    atomics_info,
-    counters_new,
-    counters_get,
-    counters_add,
-    counters_put,
-    counters_info,
-);
+macro_rules! word_adapters {
+    ($($word:ident => $body:ident),+ $(,)?) => {
+        $(#[inline(always)]
+        fn $word(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+            match $body(ctx, args) { Ok(value) => value, Err(error) => ctx.fail(error) }
+        })+
+    };
+}
+word_adapters!(atomics_new => atomics_new_result, atomics_get => atomics_get_result,
+    atomics_put => atomics_put_result, atomics_add => atomics_add_result,
+    atomics_add_get => atomics_add_get_result, atomics_exchange => atomics_exchange_result,
+    atomics_compare_exchange => atomics_compare_exchange_result,
+    atomics_info => atomics_info_result, counters_new => counters_new_result,
+    counters_get => counters_get_result, counters_add => counters_add_result,
+    counters_put => counters_put_result, counters_info => counters_info_result);
+crate::word_bif_bodies_in!(word_bodies; atomics_new, atomics_get, atomics_put, atomics_add,
+    atomics_add_get, atomics_exchange, atomics_compare_exchange, atomics_info, counters_new,
+    counters_get, counters_add, counters_put, counters_info);

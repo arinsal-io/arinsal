@@ -22,30 +22,30 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     v: &mut V,
 ) -> Option<V::Output> {
     let f = match (module, name, arity) {
-        ("erlang", "+", 2) => v.entry::<bodies::add>(),
-        ("erlang", "-", 2) => v.entry::<bodies::sub>(),
-        ("erlang", "*", 2) => v.entry::<bodies::mul>(),
-        ("erlang", "/", 2) => v.entry::<bodies::fdiv>(),
-        ("erlang", "div", 2) => v.entry::<bodies::int_div>(),
-        ("erlang", "rem", 2) => v.entry::<bodies::rem>(),
-        ("erlang", "band", 2) => v.entry::<bodies::band>(),
-        ("erlang", "bor", 2) => v.entry::<bodies::bor>(),
-        ("erlang", "bxor", 2) => v.entry::<bodies::bxor>(),
-        ("erlang", "bsl", 2) => v.entry::<bodies::bsl>(),
-        ("erlang", "bsr", 2) => v.entry::<bodies::bsr>(),
-        ("erlang", "bnot", 1) => v.entry::<bodies::bnot>(),
-        ("erlang", "-", 1) => v.entry::<bodies::neg>(),
-        ("erlang", "+", 1) => v.entry::<bodies::plus>(),
-        ("erlang", "abs", 1) => v.entry::<bodies::abs>(),
-        ("erlang", "float", 1) => v.entry::<bodies::to_float>(),
-        ("erlang", "trunc", 1) => v.entry::<bodies::trunc>(),
-        ("erlang", "round", 1) => v.entry::<bodies::round>(),
-        ("erlang", "ceil", 1) => v.entry::<bodies::ceil>(),
-        ("erlang", "floor", 1) => v.entry::<bodies::floor>(),
+        ("erlang", "+", 2) => v.entry::<word_bodies::add>(),
+        ("erlang", "-", 2) => v.entry::<word_bodies::sub>(),
+        ("erlang", "*", 2) => v.entry::<word_bodies::mul>(),
+        ("erlang", "/", 2) => v.entry::<word_bodies::fdiv>(),
+        ("erlang", "div", 2) => v.entry::<word_bodies::int_div>(),
+        ("erlang", "rem", 2) => v.entry::<word_bodies::rem>(),
+        ("erlang", "band", 2) => v.entry::<word_bodies::band>(),
+        ("erlang", "bor", 2) => v.entry::<word_bodies::bor>(),
+        ("erlang", "bxor", 2) => v.entry::<word_bodies::bxor>(),
+        ("erlang", "bsl", 2) => v.entry::<word_bodies::bsl>(),
+        ("erlang", "bsr", 2) => v.entry::<word_bodies::bsr>(),
+        ("erlang", "bnot", 1) => v.entry::<word_bodies::bnot>(),
+        ("erlang", "-", 1) => v.entry::<word_bodies::neg>(),
+        ("erlang", "+", 1) => v.entry::<word_bodies::plus>(),
+        ("erlang", "abs", 1) => v.entry::<word_bodies::abs>(),
+        ("erlang", "float", 1) => v.entry::<word_bodies::to_float>(),
+        ("erlang", "trunc", 1) => v.entry::<word_bodies::trunc>(),
+        ("erlang", "round", 1) => v.entry::<word_bodies::round>(),
+        ("erlang", "ceil", 1) => v.entry::<word_bodies::ceil>(),
+        ("erlang", "floor", 1) => v.entry::<word_bodies::floor>(),
         ("erlang", "integer_to_list", 1 | 2) => v.entry::<process_bodies::integer_to_list>(),
-        ("erlang", "integer_to_binary", 1 | 2) => v.entry::<bodies::integer_to_binary>(),
-        ("erts_internal", "list_to_integer", 2) => v.entry::<bodies::list_to_integer>(),
-        ("erts_internal", "binary_to_integer", 2) => v.entry::<bodies::binary_to_integer>(),
+        ("erlang", "integer_to_binary", 1 | 2) => v.entry::<word_bodies::integer_to_binary>(),
+        ("erts_internal", "list_to_integer", 2) => v.entry::<word_bodies::list_to_integer>(),
+        ("erts_internal", "binary_to_integer", 2) => v.entry::<word_bodies::binary_to_integer>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -62,11 +62,12 @@ fn map_error(error: ArithError) -> BifError {
 
 macro_rules! binary {
     ($($name:ident => $op:literal),+ $(,)?) => {$ (
-        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+        #[inline(always)]
+        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
             let charge = arinsal_arith::reduction_charge($op, args);
             let result = arinsal_arith::$name(args[0], args[1], &mut ctx.heap).map_err(map_error);
             ctx.charge_reductions(charge as usize);
-            result
+            match result { Ok(value) => value, Err(error) => ctx.fail(error) }
         }
     )+ };
 }
@@ -74,11 +75,12 @@ binary!(add => "+", sub => "-", mul => "*", fdiv => "/", int_div => "div", rem =
 
 macro_rules! unary {
     ($($name:ident => $op:literal),+ $(,)?) => {$ (
-        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+        #[inline(always)]
+        fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
             let charge = arinsal_arith::reduction_charge($op, args);
             let result = arinsal_arith::$name(args[0], &mut ctx.heap).map_err(map_error);
             ctx.charge_reductions(charge as usize);
-            result
+            match result { Ok(value) => value, Err(error) => ctx.fail(error) }
         }
     )+ };
 }
@@ -93,25 +95,30 @@ fn integer_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     })
     .map_err(map_error)
 }
-fn integer_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    (if args.len() == 1 {
+#[inline(always)]
+fn integer_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    let result = if args.len() == 1 {
         arinsal_arith::integer_to_binary_decimal(args[0], &mut ctx.heap)
     } else {
         arinsal_arith::integer_to_binary(args[0], args[1], &mut ctx.heap)
-    })
-    .map_err(map_error)
+    }
+    .map_err(map_error);
+    match result {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
 }
-fn list_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn list_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/big.c:4258 (erts_internal_list_to_integer_2), OTP-29.1.1.
     let mut cursor = args[0];
     if cursor == Term::NIL {
-        return Ok(status!("no_integer"));
+        return status!("no_integer");
     }
     if cons(cursor).is_none() {
-        return Ok(status!("not_a_list"));
+        return status!("not_a_list");
     }
     let Some(base) = valid_base(args[1]) else {
-        return Ok(status!("badarg"));
+        return status!("badarg");
     };
     let (first, _) = cons(cursor).unwrap();
     let negative = first.as_small() == Some(45);
@@ -141,24 +148,24 @@ fn list_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         cursor = tail;
     }
     if digits > limit {
-        return Ok(status!("big"));
+        return status!("big");
     }
     if digits == 0 && zeros == 0 {
-        return Ok(status!("no_integer"));
+        return status!("no_integer");
     }
     let result = Term::small(if negative { -value } else { value }).expect("small parser limit");
-    Ok(crate::pure::tuple_build(ctx, &[result, cursor]))
+    crate::pure::tuple_build(ctx, &[result, cursor])
 }
-fn binary_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn binary_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     // Port of erts/emulator/beam/big.c:4231 (erts_internal_binary_to_integer_2), OTP-29.1.1.
     let Some(base) = valid_base(args[1]) else {
-        return Ok(status!("badarg"));
+        return status!("badarg");
     };
     let Ok(bytes) = crate::pure::binary_bytes(args[0]) else {
-        return Ok(status!("badarg"));
+        return status!("badarg");
     };
     if bytes.is_empty() {
-        return Ok(status!("badarg"));
+        return status!("badarg");
     }
     let (negative, mut text) = match bytes[0] {
         b'-' => (true, &bytes[1..]),
@@ -166,27 +173,27 @@ fn binary_to_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
         _ => (false, bytes.as_slice()),
     };
     if text.is_empty() {
-        return Ok(status!("badarg"));
+        return status!("badarg");
     }
     while text.first() == Some(&b'0') {
         text = &text[1..];
     }
     if text.is_empty() {
-        return Ok(Term::small(0).unwrap());
+        return Term::small(0).unwrap();
     }
     if text.len() > DIGITS_PER_SMALL[(base - 2) as usize] {
-        return Ok(status!("big"));
+        return status!("big");
     }
     let mut value = 0_i64;
     for &byte in text {
         let Some(d) = digit(byte as i64, base) else {
-            return Ok(status!("badarg"));
+            return status!("badarg");
         };
         value = value * base as i64 + d as i64;
     }
     let value = if negative { -value } else { value };
     let _ = ctx;
-    Ok(Term::small(value).expect("small parser limit"))
+    Term::small(value).expect("small parser limit")
 }
 
 const DIGITS_PER_SMALL: [usize; 35] = [
@@ -212,30 +219,8 @@ fn cons(term: Term) -> Option<(Term, Term)> {
     unsafe { term.cons_ref() }
 }
 
-crate::bif_bodies!(
-    add,
-    sub,
-    mul,
-    fdiv,
-    int_div,
-    rem,
-    band,
-    bor,
-    bxor,
-    bsl,
-    bsr,
-    bnot,
-    neg,
-    plus,
-    abs,
-    to_float,
-    trunc,
-    round,
-    ceil,
-    floor,
-    integer_to_binary,
-    list_to_integer,
-    binary_to_integer,
-);
+crate::word_bif_bodies_in!(word_bodies; add, sub, mul, fdiv, int_div, rem, band, bor, bxor,
+    bsl, bsr, bnot, neg, plus, abs, to_float, trunc, round, ceil, floor, integer_to_binary,
+    list_to_integer, binary_to_integer);
 
 crate::process_bif_bodies_in!(process_bodies; integer_to_list);
