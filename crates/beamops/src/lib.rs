@@ -2628,3 +2628,9 @@ mod type_bits_tests {
         }
     }
 }
+
+/// The compiled transformation programs as text (see `tests/erts_programs.rs`).
+#[doc(hidden)]
+pub fn erts_programs_dump() -> &'static str {
+    include_str!(concat!(env!("OUT_DIR"), "/erts_programs.txt"))
+}

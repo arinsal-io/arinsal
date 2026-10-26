@@ -5,8 +5,12 @@ mod rule_syntax;
 use rule_syntax::{Restriction, Top};
 #[path = "build/emit.rs"]
 mod emit;
+#[path = "build/engine_emit.rs"]
+mod engine_emit;
 #[path = "build/makeops.rs"]
 mod makeops;
+#[path = "build/transform.rs"]
+mod transform;
 
 fn main() {
     generate_matchers();
@@ -284,6 +288,19 @@ fn generate_erts_tables() {
         tables.emit_tables(),
     )
     .unwrap();
+    let programs = tables.tr_gen();
+    fs::write(
+        PathBuf::from(env::var("OUT_DIR").unwrap()).join("erts_programs.txt"),
+        makeops::Makeops::dump_programs(&programs),
+    )
+    .unwrap();
     println!("cargo:rerun-if-changed=build/makeops.rs");
     println!("cargo:rerun-if-changed=build/emit.rs");
+    fs::write(
+        PathBuf::from(env::var("OUT_DIR").unwrap()).join("erts_transform_engine.rs"),
+        tables.emit_engine(&programs),
+    )
+    .unwrap();
+    println!("cargo:rerun-if-changed=build/transform.rs");
+    println!("cargo:rerun-if-changed=build/engine_emit.rs");
 }

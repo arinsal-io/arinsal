@@ -1,0 +1,4710 @@
+KEY aligned_label/2
+RULE first=aligned_label/2 second=wait_timeout/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 26
+  set_var 2
+  next_arg 
+  set_var 3
+  pred smp_already_locked v0
+  commit_new_instr 240
+  store_var 3
+  next_arg 
+  store_var 2
+  new_instr 192
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=aligned_label/2 second=wait/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 25
+  set_var 2
+  pred smp_already_locked v0
+  commit_new_instr 237
+  store_var 2
+  new_instr 192
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=aligned_label/2 second=timeout/0 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 22
+  pred smp_already_locked v0
+  commit_new_instr 235
+  new_instr 192
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+KEY bad_bs_match/1
+RULE first=bad_bs_match/1 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  pred never
+  commit 
+  end 
+KEY bif0/2
+RULE first=bif0/2 second=undef cannot_fail=0
+  try_me_else 
+  is_bif BIF_self_0
+  next_arg 
+  is_type 24
+  set_var 0
+  commit_new_instr 286
+  store_var 0
+  end 
+RULE first=bif0/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_bif BIF_node_0
+  next_arg 
+  is_type 24
+  set_var 0
+  commit_new_instr 287
+  store_var 0
+  end 
+KEY bif1/4
+RULE first=bif1/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_bif BIF_hd_1
+  nop 
+  next_arg 
+  is_type 24
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 162
+  store_var 2
+  next_arg 
+  store_var 3
+  new_instr 56
+  store_var 0
+  next_arg 
+  store_var 2
+  end 
+RULE first=bif1/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 512
+  nop 
+  next_arg 
+  is_bif BIF_hd_1
+  nop 
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 270
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=bif1/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_bif BIF_tl_1
+  nop 
+  next_arg 
+  is_type 24
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 163
+  store_var 2
+  next_arg 
+  store_var 3
+  new_instr 56
+  store_var 0
+  next_arg 
+  store_var 2
+  end 
+RULE first=bif1/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 512
+  nop 
+  next_arg 
+  is_bif BIF_tl_1
+  nop 
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 271
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=bif1/4 second=undef cannot_fail=0
+  try_me_else 
+  nop 
+  next_arg 
+  is_bif BIF_get_1
+  nop 
+  next_arg 
+  is_type 8478
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  call get v2 v3
+  end 
+RULE first=bif1/4 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_bif BIF_not_1
+  nop 
+  next_arg 
+  is_type 24
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  commit_new_instr 275
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=bif1/4 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_bif BIF_node_1
+  nop 
+  next_arg 
+  is_type 24
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  commit_new_instr 276
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=bif1/4 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_bif BIF_tuple_size_1
+  nop 
+  next_arg 
+  is_type 24
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  commit_new_instr 279
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=bif1/4 second=undef cannot_fail=0
+  try_me_else 
+  nop 
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  pred never_fails v1
+  commit_new_instr 288
+  store_var 2
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  end 
+RULE first=bif1/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 290
+  store_var 2
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  end 
+KEY bif2/5
+RULE first=bif2/5 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_bif BIF_element_2
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 272
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=bif2/5 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_bif BIF_and_2
+  nop 
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  commit_new_instr 273
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=bif2/5 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_bif BIF_or_2
+  nop 
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  commit_new_instr 274
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=bif2/5 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_bif BIF_map_get_2
+  nop 
+  next_arg 
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  commit_new_instr 280
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=bif2/5 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_bif BIF_is_map_key_2
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  commit_new_instr 281
+  store_var 1
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=bif2/5 second=undef cannot_fail=0
+  try_me_else 
+  nop 
+  next_arg 
+  is_bif BIF_max_2
+  nop 
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 282
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=bif2/5 second=undef cannot_fail=0
+  try_me_else 
+  nop 
+  next_arg 
+  is_bif BIF_min_2
+  nop 
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 283
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=bif2/5 second=undef cannot_fail=0
+  try_me_else 
+  nop 
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  pred never_fails v1
+  commit_new_instr 289
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 4
+  end 
+RULE first=bif2/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 291
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 4
+  end 
+KEY bif3/6
+RULE first=bif3/6 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_arg 
+  set_var 5
+  commit_new_instr 292
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 5
+  end 
+KEY bs_create_bin/6
+RULE first=bs_create_bin/6 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 544
+  set_var 0
+  next_arg 
+  is_type 1
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  is_type 1
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  next_arg 
+  is_type 1
+  set_var 5
+  next_arg 
+  rest_args 6
+  call create_bin v0 v1 v2 v3 v4 v5 rest_args
+  end 
+KEY bs_get_binary2/7
+RULE first=bs_get_binary2/7 second=bs_get_tail/3 cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  next_arg 
+  is_type 1
+  set_var 4
+  next_arg 
+  is_type 1
+  nop 
+  next_arg 
+  is_type 24
+  set_var 6
+  next_instr 165
+  is_type 24
+  set_var 7
+  next_arg 
+  set_var 8
+  next_arg 
+  set_var 9
+  pred equal v1 v7
+  pred equal v2 v9
+  commit_new_instr 322
+  store_var 1
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 6
+  next_arg 
+  store_var 8
+  end 
+RULE first=bs_get_binary2/7 second=undef cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  is_type 4
+  is_eq am_all
+  nop 
+  next_arg 
+  is_type 1
+  set_var 4
+  next_arg 
+  is_type 1
+  nop 
+  next_arg 
+  is_type 24
+  set_var 6
+  commit_new_instr 324
+  store_var 1
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 6
+  end 
+RULE first=bs_get_binary2/7 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  is_type 8478
+  set_var 3
+  next_arg 
+  is_type 1
+  set_var 4
+  next_arg 
+  is_type 1
+  nop 
+  next_arg 
+  is_type 24
+  set_var 6
+  commit_new_instr 323
+  store_var 1
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 6
+  end 
+KEY bs_get_float2/7
+RULE first=bs_get_float2/7 second=undef cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  is_type 8478
+  set_var 3
+  next_arg 
+  is_type 1
+  set_var 4
+  next_arg 
+  is_type 1
+  set_var 5
+  next_arg 
+  is_type 24
+  set_var 6
+  call get_float2 v0 v1 v2 v3 v4 v5 v6
+  end 
+RULE first=bs_get_float2/7 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 8
+  nop 
+  next_arg 
+  is_type 1
+  nop 
+  next_arg 
+  is_type 8192
+  nop 
+  next_arg 
+  is_type 1
+  nop 
+  next_arg 
+  is_type 1
+  nop 
+  next_arg 
+  is_type 24
+  nop 
+  commit_new_instr 61
+  store_var 0
+  end 
+KEY bs_get_position/3
+RULE first=bs_get_position/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  nop 
+  commit_new_instr 328
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+KEY bs_get_utf16/5
+RULE first=bs_get_utf16/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  call get_utf16 v0 v1 v2 v3
+  end 
+KEY bs_get_utf32/5
+RULE first=bs_get_utf32/5 second=undef cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  is_type 1
+  set_var 3
+  next_arg 
+  set_var 4
+  pred equal v1 v4
+  commit_new_instr 64
+  store_val TAG_x 1023
+  next_arg 
+  store_var 4
+  new_instr 333
+  store_var 0
+  next_arg 
+  store_val TAG_x 1023
+  next_arg 
+  store_var 1
+  new_instr 117
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_val TAG_i 32
+  next_arg 
+  store_val TAG_u 1
+  next_arg 
+  store_var 3
+  next_arg 
+  store_val TAG_x 1023
+  end 
+RULE first=bs_get_utf32/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  is_type 1
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  commit_new_instr 333
+  store_var 0
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 1
+  new_instr 117
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_val TAG_i 32
+  next_arg 
+  store_val TAG_u 1
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+KEY bs_get_utf8/5
+RULE first=bs_get_utf8/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  next_arg 
+  is_type 1
+  next_arg 
+  is_type 24
+  set_var 2
+  commit_new_instr 329
+  store_var 1
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  end 
+KEY bs_match/3
+RULE first=bs_match/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  rest_args 3
+  call bs_match v0 v1 v2 rest_args
+  end 
+KEY bs_match_string/4
+RULE first=bs_match_string/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 321
+  store_var 1
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+KEY bs_skip_bits2/5
+RULE first=bs_skip_bits2/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  is_type 1
+  set_var 3
+  next_arg 
+  is_type 1
+  nop 
+  commit_new_instr 326
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 3
+  end 
+KEY bs_skip_utf16/4
+RULE first=bs_skip_utf16/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  next_arg 
+  is_type 1
+  set_var 2
+  call skip_utf16 v0 v1 v2
+  end 
+KEY bs_skip_utf32/4
+RULE first=bs_skip_utf32/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  is_type 1
+  set_var 3
+  commit_new_instr 333
+  store_var 0
+  next_arg 
+  store_val TAG_x 1023
+  next_arg 
+  store_var 1
+  new_instr 117
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_val TAG_i 32
+  next_arg 
+  store_val TAG_u 1
+  next_arg 
+  store_var 3
+  next_arg 
+  store_val TAG_x 1023
+  end 
+KEY bs_skip_utf8/4
+RULE first=bs_skip_utf8/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  next_arg 
+  is_type 1
+  commit_new_instr 330
+  store_var 1
+  next_arg 
+  store_var 0
+  end 
+KEY bs_start_match3/4
+RULE first=bs_start_match3/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 544
+  set_var 0
+  next_arg 
+  is_type 8454
+  next_arg 
+  nop 
+  next_arg 
+  nop 
+  commit_new_instr 61
+  store_var 0
+  end 
+RULE first=bs_start_match3/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 327
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 3
+  end 
+KEY bs_start_match4/4
+RULE first=bs_start_match4/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 4
+  is_eq am_no_fail
+  next_arg 
+  is_type 1
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 24
+  set_var 2
+  commit_new_instr 166
+  store_val TAG_p 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  end 
+RULE first=bs_start_match4/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 1
+  set_var 1
+  next_arg 
+  is_type 24
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  commit_new_instr 166
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  end 
+RULE first=bs_start_match4/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 4
+  is_eq am_resume
+  next_arg 
+  nop 
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  pred equal v1 v2
+  commit 
+  end 
+RULE first=bs_start_match4/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 4
+  is_eq am_resume
+  next_arg 
+  nop 
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  commit_new_instr 64
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+KEY bs_test_tail2/3
+RULE first=bs_test_tail2/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  nop 
+  next_arg 
+  is_type 16384
+  commit_new_instr 61
+  store_var 0
+  end 
+KEY call/2
+RULE first=call/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  next_arg 
+  set_var 1
+  commit_new_instr 299
+  store_var 1
+  end 
+KEY call_ext/2
+RULE first=call_ext/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 2
+  next_arg 
+  is_func am_erlang am_load_nif 2
+  rename 257
+RULE first=call_ext/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 1
+  next_arg 
+  is_func am_erlang am_call_on_load_function 1
+  rename 258
+RULE first=call_ext/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 2
+  next_arg 
+  is_func am_erlang am_apply 2
+  rename 264
+RULE first=call_ext/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 3
+  next_arg 
+  is_func am_erlang am_apply 3
+  rename 261
+RULE first=call_ext/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 0
+  next_arg 
+  is_func am_erlang am_yield 0
+  rename 200
+RULE first=call_ext/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 0
+  next_arg 
+  is_func am_erlang am_hibernate 0
+  rename 268
+RULE first=call_ext/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 0
+  next_arg 
+  is_func am_os am_perf_counter 0
+  rename 269
+RULE first=call_ext/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  next_arg 
+  is_bif -1
+  set_var 0
+  pred is_heavy_bif v0
+  commit_new_instr 302
+  store_var 0
+  end 
+RULE first=call_ext/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  next_arg 
+  is_bif -1
+  set_var 0
+  commit_new_instr 256
+  store_var 0
+  end 
+RULE first=call_ext/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  next_arg 
+  set_var 1
+  commit_new_instr 302
+  store_var 1
+  end 
+KEY call_ext_last/3
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 2
+  next_arg 
+  is_func am_erlang am_load_nif 2
+  next_arg 
+  set_var 0
+  commit_new_instr 19
+  new_instr 18
+  store_var 0
+  new_instr 257
+  end 
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 1
+  next_arg 
+  is_func am_erlang am_call_on_load_function 1
+  next_arg 
+  set_var 0
+  commit_new_instr 19
+  new_instr 18
+  store_var 0
+  new_instr 258
+  end 
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 2
+  next_arg 
+  is_func am_erlang am_apply 2
+  next_arg 
+  set_var 0
+  commit_new_instr 265
+  store_var 0
+  end 
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 3
+  next_arg 
+  is_func am_erlang am_apply 3
+  next_arg 
+  set_var 0
+  commit_new_instr 262
+  store_var 0
+  end 
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 0
+  next_arg 
+  is_func am_erlang am_yield 0
+  next_arg 
+  set_var 0
+  commit_new_instr 19
+  new_instr 18
+  store_var 0
+  new_instr 200
+  end 
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 0
+  next_arg 
+  is_func am_erlang am_hibernate 0
+  next_arg 
+  set_var 0
+  commit_new_instr 19
+  new_instr 18
+  store_var 0
+  new_instr 268
+  end 
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 0
+  next_arg 
+  is_func am_os am_perf_counter 0
+  next_arg 
+  set_var 0
+  commit_new_instr 19
+  new_instr 18
+  store_var 0
+  new_instr 269
+  end 
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  next_arg 
+  is_bif -1
+  set_var 0
+  next_arg 
+  set_var 1
+  pred is_heavy_bif v0
+  commit_new_instr 19
+  new_instr 18
+  store_var 1
+  new_instr 302
+  store_var 0
+  end 
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  next_arg 
+  set_var 0
+  next_arg 
+  is_type 1
+  pred is_exit_bif v0
+  commit_new_instr 259
+  new_instr 256
+  store_var 0
+  end 
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  next_arg 
+  is_bif -1
+  set_var 0
+  next_arg 
+  set_var 1
+  commit_new_instr 19
+  new_instr 18
+  store_var 1
+  new_instr 256
+  store_var 0
+  end 
+RULE first=call_ext_last/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  commit_new_instr 303
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+KEY call_ext_only/2
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 2
+  next_arg 
+  is_func am_erlang am_load_nif 2
+  commit_new_instr 19
+  new_instr 257
+  end 
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 1
+  next_arg 
+  is_func am_erlang am_call_on_load_function 1
+  commit_new_instr 19
+  new_instr 258
+  end 
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 2
+  next_arg 
+  is_func am_erlang am_apply 2
+  rename 266
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 3
+  next_arg 
+  is_func am_erlang am_apply 3
+  rename 263
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 0
+  next_arg 
+  is_func am_erlang am_yield 0
+  commit_new_instr 19
+  new_instr 200
+  end 
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 0
+  next_arg 
+  is_func am_erlang am_hibernate 0
+  commit_new_instr 19
+  new_instr 268
+  end 
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  is_eq 0
+  next_arg 
+  is_func am_os am_perf_counter 0
+  commit_new_instr 19
+  new_instr 269
+  end 
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  set_var 0
+  next_arg 
+  is_bif -1
+  set_var 1
+  pred is_heavy_bif v1
+  commit_new_instr 19
+  new_instr 18
+  store_val TAG_u 0
+  new_instr 302
+  store_var 1
+  new_instr 12
+  store_val TAG_u 0
+  next_arg 
+  store_var 0
+  end 
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  set_var 0
+  next_arg 
+  set_var 1
+  pred is_exit_bif v1
+  commit_new_instr 259
+  new_instr 256
+  store_var 1
+  new_instr 12
+  store_val TAG_u 0
+  next_arg 
+  store_var 0
+  end 
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 1
+  set_var 0
+  next_arg 
+  is_bif -1
+  set_var 1
+  commit_new_instr 19
+  new_instr 18
+  store_val TAG_u 0
+  new_instr 256
+  store_var 1
+  new_instr 12
+  store_val TAG_u 0
+  next_arg 
+  store_var 0
+  end 
+RULE first=call_ext_only/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  next_arg 
+  set_var 1
+  commit_new_instr 304
+  store_var 1
+  end 
+KEY call_fun/1
+RULE first=call_fun/1 second=deallocate/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_instr 18
+  set_var 1
+  next_instr 19
+  commit_new_instr 306
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=call_fun/1 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  commit_new_instr 305
+  store_var 0
+  end 
+KEY call_fun2/3
+RULE first=call_fun2/3 second=deallocate/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 18
+  set_var 3
+  next_instr 19
+  commit_new_instr 308
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=call_fun2/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  commit_new_instr 307
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+KEY call_last/3
+RULE first=call_last/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  commit_new_instr 300
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+KEY call_light_bif/1
+RULE first=call_light_bif/1 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  commit_new_instr 267
+  store_var 0
+  next_arg 
+  store_var 0
+  end 
+KEY call_only/2
+RULE first=call_only/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  next_arg 
+  set_var 1
+  commit_new_instr 301
+  store_var 1
+  end 
+KEY create_local_native_record/4
+RULE first=create_local_native_record/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 8192
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  rest_args 4
+  pred map_key_sort v3 rest_args
+  commit 
+  new_instr 374
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_rest_args 
+  end 
+KEY current_tuple/1
+RULE first=current_tuple/1 second=get_tuple_element/3 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_instr 66
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  pred equal v0 v1
+  commit_new_instr 212
+  store_var 0
+  new_instr 221
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=current_tuple/1 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  commit 
+  end 
+KEY current_tuple/2
+RULE first=current_tuple/2 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  pred equal v0 v1
+  commit 
+  end 
+RULE first=current_tuple/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  nop 
+  commit_new_instr 212
+  store_var 0
+  end 
+KEY debug_line/4
+RULE first=debug_line/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 4
+  is_eq am_entry
+  next_arg 
+  is_type 1
+  next_arg 
+  is_type 1
+  next_arg 
+  is_type 1
+  commit 
+  end 
+RULE first=debug_line/4 second=undef cannot_fail=0
+  try_me_else 
+  nop 
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  pred instrumenting_line_breakpoints
+  commit_new_instr 204
+  new_instr 203
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=debug_line/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  next_arg 
+  nop 
+  next_arg 
+  nop 
+  next_arg 
+  nop 
+  commit 
+  end 
+KEY delete_me/0
+RULE first=delete_me/0 second=undef cannot_fail=0
+  try_me_else_fail 
+  commit 
+  end 
+KEY fadd/4
+RULE first=fadd/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 512
+  next_arg 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  commit_new_instr 337
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+KEY fdiv/4
+RULE first=fdiv/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 512
+  next_arg 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  commit_new_instr 340
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+KEY fmove/2
+RULE first=fmove/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 4096
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  commit_new_instr 335
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=fmove/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 8216
+  set_var 0
+  next_arg 
+  is_type 4096
+  set_var 1
+  commit_new_instr 336
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+KEY fmul/4
+RULE first=fmul/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 512
+  next_arg 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  commit_new_instr 339
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+KEY fnegate/3
+RULE first=fnegate/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 512
+  next_arg 
+  set_var 0
+  next_arg 
+  set_var 1
+  commit_new_instr 341
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+KEY fsub/4
+RULE first=fsub/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 512
+  next_arg 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  commit_new_instr 338
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+KEY func_info/3
+RULE first=func_info/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 4
+  next_arg 
+  is_type 4
+  next_arg 
+  is_type 1
+  pred never
+  commit 
+  end 
+KEY func_line/1
+RULE first=func_line/1 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 256
+  rename 201
+KEY gc_bif1/5
+RULE first=gc_bif1/5 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_bit_size_1
+  nop 
+  next_arg 
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  commit_new_instr 277
+  store_var 0
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif1/5 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_byte_size_1
+  nop 
+  next_arg 
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  commit_new_instr 278
+  store_var 0
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif1/5 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_sminus_1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 354
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=gc_bif1/5 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_bnot_1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 364
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=gc_bif1/5 second=undef cannot_fail=0
+  try_me_else 
+  is_type 544
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_length_1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 368
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  new_instr 367
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+RULE first=gc_bif1/5 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_map_size_1
+  nop 
+  next_arg 
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  commit_new_instr 369
+  store_var 0
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif1/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  nop 
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 290
+  store_var 3
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 4
+  end 
+KEY gc_bif2/6
+RULE first= second= cannot_fail=1
+  skip_unless 125 2
+RULE first=gc_bif2/6 second=gc_bif2/6 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_stimes_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_instr 125
+  set_var 5
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_splus_2
+  next_arg 
+  set_var 7
+  next_arg 
+  set_var 8
+  next_arg 
+  set_var 9
+  pred equal v4 v7
+  pred equal v4 v9
+  pred equal v0 v5
+  pred distinct v7 v8
+  commit_new_instr 352
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 7
+  next_arg 
+  store_var 8
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=gc_bif2/6 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_stimes_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_instr 125
+  set_var 5
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_splus_2
+  next_arg 
+  set_var 7
+  next_arg 
+  set_var 8
+  next_arg 
+  set_var 9
+  pred equal v4 v8
+  pred equal v4 v9
+  pred equal v0 v5
+  pred distinct v7 v8
+  commit_new_instr 352
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 8
+  next_arg 
+  store_var 7
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_stimes_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 352
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_val TAG_i 0
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_splus_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 353
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_sminus_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 355
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_div_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 356
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first= second= cannot_fail=1
+  skip_unless 125 2
+RULE first=gc_bif2/6 second=gc_bif2/6 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_intdiv_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_instr 125
+  nop 
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_rem_2
+  next_arg 
+  set_var 7
+  next_arg 
+  set_var 8
+  next_arg 
+  set_var 9
+  pred equal v2 v7
+  pred equal v3 v8
+  pred distinct v2 v4
+  pred distinct v3 v4
+  commit_new_instr 358
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 9
+  end 
+RULE first=gc_bif2/6 second=gc_bif2/6 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_rem_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_instr 125
+  nop 
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_intdiv_2
+  next_arg 
+  set_var 7
+  next_arg 
+  set_var 8
+  next_arg 
+  set_var 9
+  pred equal v2 v7
+  pred equal v3 v8
+  pred distinct v2 v4
+  pred distinct v3 v4
+  commit_new_instr 357
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 9
+  end 
+RULE first=gc_bif2/6 second=line/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_rem_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_instr 153
+  nop 
+  next_instr 125
+  nop 
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_intdiv_2
+  next_arg 
+  set_var 8
+  next_arg 
+  set_var 9
+  next_arg 
+  set_var 10
+  pred equal v2 v8
+  pred equal v3 v9
+  pred distinct v2 v4
+  pred distinct v3 v4
+  commit_new_instr 357
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 10
+  end 
+RULE first=gc_bif2/6 second=line/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_intdiv_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_instr 153
+  nop 
+  next_instr 125
+  nop 
+  next_arg 
+  nop 
+  next_arg 
+  is_bif BIF_rem_2
+  next_arg 
+  set_var 8
+  next_arg 
+  set_var 9
+  next_arg 
+  set_var 10
+  pred equal v2 v8
+  pred equal v3 v9
+  pred distinct v2 v4
+  pred distinct v3 v4
+  commit_new_instr 358
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 10
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_intdiv_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 359
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_rem_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 360
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_band_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 361
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_bor_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 362
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_bxor_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 363
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_bsr_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 365
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_bif BIF_bsl_2
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 366
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=gc_bif2/6 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  nop 
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_arg 
+  set_var 5
+  commit_new_instr 291
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 5
+  end 
+KEY gc_bif3/7
+RULE first=gc_bif3/7 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  nop 
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_arg 
+  set_var 5
+  next_arg 
+  set_var 6
+  commit_new_instr 292
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 5
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 6
+  end 
+KEY get_map_elements/3
+RULE first=get_map_elements/3 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  is_type 1
+  is_eq 2
+  set_var 2
+  next_arg 
+  rest_args 3
+  call get_map_element v0 v1 v2 rest_args
+  end 
+RULE first=get_map_elements/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  rest_args 3
+  pred map_key_sort v2 rest_args
+  call get_map_elements v0 v1 v2 rest_args
+  end 
+KEY get_record_elements/3
+RULE first=get_record_elements/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  rest_args 3
+  pred map_key_sort v2 rest_args
+  commit 
+  new_instr 375
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_rest_args 
+  end 
+KEY get_record_field/5
+RULE first=get_record_field/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  is_type 8454
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 191
+  store_var 0
+  next_arg 
+  store_val TAG_x 1023
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  new_instr 64
+  store_var 1
+  next_arg 
+  store_val TAG_x 1023
+  end 
+KEY get_tuple_element/3
+RULE first=get_tuple_element/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  commit_new_instr 212
+  store_var 0
+  new_instr 221
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  new_instr 220
+  store_var 0
+  end 
+KEY has_map_fields/3
+RULE first=has_map_fields/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  rest_args 3
+  call has_map_fields v0 v1 v2 rest_args
+  end 
+KEY i_bs_match/2
+RULE first=i_bs_match/2 second=test_heap/2 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  rest_args 2
+  next_instr 16
+  set_var 2
+  next_arg 
+  set_var 3
+  commit 
+  new_instr 319
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_rest_args 
+  end 
+KEY i_get_map_element/4
+RULE first=i_get_map_element/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  is_type 8454
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 351
+  store_var 0
+  next_arg 
+  store_val TAG_x 1023
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  new_instr 64
+  store_var 1
+  next_arg 
+  store_val TAG_x 1023
+  end 
+KEY i_get_map_element_hash/5
+RULE first=i_get_map_element_hash/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  is_type 8454
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 350
+  store_var 0
+  next_arg 
+  store_val TAG_x 1023
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  new_instr 64
+  store_var 1
+  next_arg 
+  store_val TAG_x 1023
+  end 
+KEY i_get_tuple_element/3
+RULE first= second= cannot_fail=1
+  skip_unless 212 3
+RULE first=i_get_tuple_element/3 second=current_tuple/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 212
+  set_var 3
+  pred equal v0 v2
+  pred equal v0 v3
+  commit_new_instr 221
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 0
+  end 
+RULE first=i_get_tuple_element/3 second=current_tuple/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 212
+  is_type 24
+  next_instr 169
+  nop 
+  next_arg 
+  nop 
+  keep 
+  new_instr 221
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+RULE first=i_get_tuple_element/3 second=current_tuple/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 212
+  set_var 3
+  next_instr 66
+  set_var 4
+  next_arg 
+  set_var 5
+  next_arg 
+  set_var 6
+  pred equal v0 v3
+  pred equal v0 v4
+  pred consecutive_words v1 v5
+  pred distinct v2 v6
+  commit_new_instr 213
+  store_var 0
+  next_arg 
+  store_var 6
+  new_instr 222
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 6
+  end 
+RULE first=i_get_tuple_element/3 second=swap/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 169
+  set_var 3
+  next_arg 
+  set_var 4
+  pred equal v2 v3
+  commit_new_instr 223
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 4
+  end 
+RULE first=i_get_tuple_element/3 second=swap/2 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 169
+  set_var 3
+  next_arg 
+  set_var 4
+  pred equal v2 v4
+  commit_new_instr 223
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+KEY i_move/2
+RULE first=i_move/2 second=call_last/3 cannot_fail=0
+  try_me_else 
+  is_type 16
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 5
+  nop 
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 297
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=i_move/2 second=call_ext_last/3 cannot_fail=0
+  try_me_else_fail 
+  is_type 16
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 8
+  nop 
+  next_arg 
+  is_not_bif -1
+  set_var 3
+  next_arg 
+  set_var 4
+  commit_new_instr 298
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+KEY i_put_map_assoc/4
+RULE first=i_put_map_assoc/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  rest_args 4
+  pred map_key_sort v3 rest_args
+  commit 
+  new_instr 343
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_rest_args 
+  end 
+KEY init_yregs/1
+RULE first=init_yregs/1 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 1
+  is_eq 1
+  set_var 0
+  next_arg 
+  rest_args 1
+  call init_yregs_move v0 rest_args
+  end 
+KEY int_func_end/2
+RULE first=int_func_end/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  call func_end v0 v1
+  end 
+KEY int_func_start/5
+RULE first= second= cannot_fail=1
+  skip_unless 1 2
+RULE first=int_func_start/5 second=label/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_instr 1
+  set_var 5
+  next_instr 153
+  set_var 6
+  commit_new_instr 313
+  store_var 5
+  next_arg 
+  store_var 6
+  new_instr 311
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=int_func_start/5 second=label/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_instr 1
+  set_var 5
+  commit_new_instr 313
+  store_var 5
+  next_arg 
+  store_val TAG_n 0
+  new_instr 311
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=int_func_start/5 second=func_prologue/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_instr 313
+  set_var 5
+  next_arg 
+  set_var 6
+  pred is_mfa_bif v2 v3 v4
+  commit_new_instr 251
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  new_instr 153
+  store_var 6
+  new_instr 317
+  new_instr 192
+  store_var 5
+  next_arg 
+  store_val TAG_u 4
+  new_instr 194
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  new_instr 202
+  store_var 1
+  new_instr 193
+  store_var 0
+  new_instr 316
+  end 
+RULE first=int_func_start/5 second=func_prologue/2 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_instr 313
+  set_var 5
+  next_arg 
+  set_var 6
+  commit_new_instr 314
+  new_instr 153
+  store_var 6
+  new_instr 317
+  new_instr 192
+  store_var 5
+  next_arg 
+  store_val TAG_u 4
+  new_instr 194
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  new_instr 202
+  store_var 1
+  new_instr 193
+  store_var 0
+  new_instr 316
+  end 
+KEY is_atom/2
+RULE first=is_atom/2 second=select_val/3 cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_instr 59
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  is_type 1
+  set_var 4
+  next_arg 
+  rest_args 3
+  pred equal v0 v3
+  pred equal v1 v2
+  pred fixed_size_values v4 rest_args
+  call select_val v1 v0 v4 rest_args
+  end 
+KEY is_bitstr/2
+RULE first=is_bitstr/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  commit_new_instr 255
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+KEY is_eq/3
+RULE first=is_eq/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 8454
+  set_var 1
+  next_arg 
+  is_type 24
+  set_var 2
+  commit_new_instr 41
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 1
+  end 
+KEY is_eq_exact/3
+RULE first=is_eq_exact/3 second=undef cannot_fail=0
+  try_me_else 
+  nop 
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  pred equal v1 v2
+  commit 
+  end 
+RULE first=is_eq_exact/3 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 8454
+  set_var 1
+  next_arg 
+  is_type 24
+  set_var 2
+  commit_new_instr 43
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 1
+  end 
+RULE first=is_eq_exact/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 256
+  commit_new_instr 52
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+KEY is_function/2
+RULE first=is_function/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 8454
+  commit_new_instr 61
+  store_var 0
+  end 
+KEY is_ge/3
+RULE first= second= cannot_fail=1
+  skip_unless 40 3
+RULE first=is_ge/3 second=is_ge/3 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 2
+  set_var 2
+  next_instr 40
+  set_var 3
+  next_arg 
+  is_type 2
+  set_var 4
+  next_arg 
+  is_type 24
+  set_var 5
+  pred equal v1 v5
+  commit_new_instr 243
+  store_var 0
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 4
+  end 
+RULE first=is_ge/3 second=is_ge/3 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 2
+  set_var 2
+  next_instr 40
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  next_arg 
+  is_type 2
+  set_var 5
+  pred equal v1 v4
+  commit_new_instr 245
+  store_var 0
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 5
+  end 
+RULE first=is_ge/3 second=is_ge/3 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 2
+  set_var 1
+  next_arg 
+  is_type 24
+  set_var 2
+  next_instr 40
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  next_arg 
+  is_type 2
+  set_var 5
+  pred equal v4 v2
+  commit_new_instr 243
+  store_var 3
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 5
+  next_arg 
+  store_var 1
+  end 
+RULE first=is_ge/3 second=is_lt/3 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 2
+  set_var 2
+  next_instr 39
+  set_var 3
+  next_arg 
+  is_type 2
+  set_var 4
+  next_arg 
+  is_type 24
+  set_var 5
+  pred equal v1 v5
+  commit_new_instr 244
+  store_var 0
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 4
+  end 
+KEY is_integer/2
+RULE first= second= cannot_fail=1
+  skip_unless 59 3
+RULE first=is_integer/2 second=select_val/3 cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 8478
+  set_var 1
+  next_instr 59
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  is_type 1
+  set_var 4
+  next_arg 
+  rest_args 3
+  pred equal v0 v3
+  pred equal v1 v2
+  pred use_jump_tab v4 rest_args 6
+  call jump_tab v1 v0 v4 rest_args
+  end 
+RULE first=is_integer/2 second=select_val/3 cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 8478
+  set_var 1
+  next_instr 59
+  set_var 2
+  next_arg 
+  is_type 288
+  set_var 3
+  next_arg 
+  is_type 1
+  set_var 4
+  next_arg 
+  rest_args 3
+  pred equal v1 v2
+  pred mixed_types v4 rest_args
+  call split_values v1 v0 v3 v4 rest_args
+  end 
+RULE first=is_integer/2 second=select_val/3 cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_instr 59
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  is_type 1
+  set_var 4
+  next_arg 
+  rest_args 3
+  pred equal v0 v3
+  pred equal v1 v2
+  pred fixed_size_values v4 rest_args
+  call select_val v1 v0 v4 rest_args
+  end 
+RULE first=is_integer/2 second=is_ge/3 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 40
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  next_arg 
+  is_type 2
+  set_var 4
+  next_instr 40
+  set_var 5
+  next_arg 
+  is_type 2
+  set_var 6
+  next_arg 
+  is_type 24
+  set_var 7
+  pred equal v1 v3
+  pred equal v3 v7
+  pred equal v0 v2
+  pred equal v2 v5
+  commit_new_instr 241
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 6
+  end 
+RULE first= second= cannot_fail=1
+  skip_unless 40 2
+RULE first=is_integer/2 second=is_ge/3 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 40
+  set_var 2
+  next_arg 
+  is_type 2
+  set_var 3
+  next_arg 
+  is_type 24
+  set_var 4
+  next_instr 40
+  set_var 5
+  next_arg 
+  is_type 24
+  set_var 6
+  next_arg 
+  is_type 2
+  set_var 7
+  pred equal v1 v6
+  pred equal v6 v4
+  pred equal v0 v5
+  pred equal v5 v2
+  commit_new_instr 241
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 7
+  next_arg 
+  store_var 3
+  end 
+RULE first=is_integer/2 second=is_ge/3 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 40
+  set_var 2
+  next_arg 
+  is_type 24
+  set_var 3
+  next_arg 
+  is_type 2
+  set_var 4
+  pred equal v1 v3
+  pred equal v0 v2
+  commit_new_instr 242
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 4
+  end 
+RULE first= second= cannot_fail=0
+  fail 
+KEY is_ne/3
+RULE first=is_ne/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 8454
+  set_var 1
+  next_arg 
+  is_type 24
+  set_var 2
+  commit_new_instr 42
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 1
+  end 
+KEY is_ne_exact/3
+RULE first=is_ne_exact/3 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  pred equal v1 v2
+  commit_new_instr 61
+  store_var 0
+  end 
+RULE first=is_ne_exact/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  is_type 8454
+  set_var 1
+  next_arg 
+  is_type 24
+  set_var 2
+  commit_new_instr 44
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 1
+  end 
+KEY is_nil/2
+RULE first=is_nil/2 second=undef cannot_fail=0
+  try_me_else 
+  is_type 32
+  nop 
+  next_arg 
+  is_type 256
+  commit 
+  end 
+RULE first=is_nil/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 8198
+  commit_new_instr 61
+  store_var 0
+  end 
+KEY is_nonempty_list/2
+RULE first=is_nonempty_list/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  is_type 8454
+  commit_new_instr 61
+  store_var 0
+  end 
+KEY is_tagged_tuple/4
+RULE first=is_tagged_tuple/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  commit_new_instr 212
+  store_var 1
+  new_instr 217
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+KEY is_tuple/2
+RULE first=is_tuple/2 second=select_tuple_arity/3 cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_instr 60
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  is_type 1
+  set_var 4
+  next_arg 
+  rest_args 3
+  pred equal v0 v3
+  pred equal v1 v2
+  call select_tuple_arity v1 v0 v4 rest_args
+  end 
+RULE first= second= cannot_fail=1
+  skip_unless 58 2
+RULE first=is_tuple/2 second=test_arity/3 cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 58
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  pred equal v0 v2
+  pred equal v1 v3
+  commit_new_instr 212
+  store_var 1
+  new_instr 214
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 4
+  end 
+RULE first=is_tuple/2 second=test_arity/3 cannot_fail=0
+  try_me_else 
+  is_type 32
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 58
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  pred equal v1 v3
+  commit_new_instr 212
+  store_var 1
+  new_instr 215
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 4
+  end 
+RULE first=is_tuple/2 second=is_tagged_tuple/4 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 159
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_arg 
+  set_var 5
+  pred equal v1 v3
+  commit_new_instr 212
+  store_var 1
+  new_instr 218
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 4
+  next_arg 
+  store_var 5
+  end 
+RULE first=is_tuple/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  next_arg 
+  set_var 1
+  commit_new_instr 212
+  store_var 1
+  new_instr 219
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+KEY label/1
+RULE first=label/1 second=loop_rec/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_instr 23
+  nop 
+  next_arg 
+  nop 
+  keep 
+  new_instr 192
+  store_var 0
+  next_arg 
+  store_val TAG_u 4
+  end 
+RULE first=label/1 second=wait_timeout/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_instr 26
+  nop 
+  next_arg 
+  nop 
+  keep 
+  new_instr 192
+  store_var 0
+  next_arg 
+  store_val TAG_u 4
+  end 
+RULE first=label/1 second=wait/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_instr 25
+  nop 
+  keep 
+  new_instr 192
+  store_var 0
+  next_arg 
+  store_val TAG_u 4
+  end 
+RULE first=label/1 second=timeout/0 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_instr 22
+  keep 
+  new_instr 192
+  store_var 0
+  next_arg 
+  store_val TAG_u 4
+  end 
+KEY line/1
+RULE first=line/1 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 256
+  commit 
+  end 
+KEY loop_rec/2
+RULE first=loop_rec/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  is_type 8
+  is_eq 0
+  pred smp_mark_target_label v0
+  commit_new_instr 236
+  store_var 0
+  end 
+KEY make_fun3/3
+RULE first=make_fun3/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 1
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  rest_args 3
+  call make_fun3 v0 v1 v2 rest_args
+  end 
+KEY move/2
+RULE first= second= cannot_fail=1
+  skip_unless 153 4
+RULE first=move/2 second=line/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 8
+  is_eq 0
+  set_var 1
+  next_instr 153
+  nop 
+  next_instr 8
+  nop 
+  next_arg 
+  is_not_bif -1
+  nop 
+  next_arg 
+  nop 
+  keep 
+  new_instr 64
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=move/2 second=line/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 8
+  is_eq 0
+  set_var 1
+  next_instr 153
+  nop 
+  next_instr 78
+  nop 
+  next_arg 
+  is_not_bif -1
+  nop 
+  keep 
+  new_instr 64
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=move/2 second=line/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 8
+  is_eq 0
+  set_var 1
+  next_instr 153
+  nop 
+  next_instr 5
+  nop 
+  next_arg 
+  nop 
+  next_arg 
+  nop 
+  keep 
+  new_instr 64
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=move/2 second=line/1 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 8
+  is_eq 0
+  set_var 1
+  next_instr 153
+  nop 
+  next_instr 6
+  nop 
+  next_arg 
+  nop 
+  keep 
+  new_instr 64
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=move/2 second=deallocate/1 cannot_fail=0
+  try_me_else 
+  is_type 16
+  is_eq 0
+  next_arg 
+  is_type 8
+  is_eq 0
+  next_instr 18
+  is_type 1
+  is_eq 1
+  next_instr 19
+  commit_new_instr 211
+  end 
+RULE first= second= cannot_fail=1
+  skip_unless 64 11
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 64
+  set_var 2
+  next_arg 
+  set_var 3
+  pred equal v1 v2
+  commit_new_instr 64
+  store_var 1
+  next_arg 
+  store_var 3
+  new_instr 229
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  is_type 16
+  set_var 0
+  next_arg 
+  is_type 8
+  set_var 1
+  next_instr 64
+  is_type 16
+  set_var 2
+  next_arg 
+  is_type 8
+  set_var 3
+  pred consecutive_words v0 v2
+  pred distinct v1 v3
+  commit_new_instr 231
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  is_type 8
+  set_var 0
+  next_arg 
+  is_type 8
+  set_var 1
+  next_instr 64
+  is_type 8
+  set_var 2
+  next_arg 
+  is_type 8
+  set_var 3
+  pred consecutive_xregs v0 v2
+  pred distinct v1 v3
+  commit_new_instr 231
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  is_type 16
+  set_var 0
+  next_arg 
+  is_type 8
+  set_var 1
+  next_instr 64
+  is_type 16
+  set_var 2
+  next_arg 
+  is_type 8
+  set_var 3
+  pred consecutive_words v2 v0
+  pred distinct v1 v2
+  pred distinct v1 v3
+  commit_new_instr 231
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  is_type 8
+  set_var 0
+  next_arg 
+  is_type 8
+  set_var 1
+  next_instr 64
+  is_type 8
+  set_var 2
+  next_arg 
+  is_type 8
+  set_var 3
+  pred consecutive_xregs v2 v0
+  pred distinct v1 v2
+  pred distinct v1 v3
+  commit_new_instr 231
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 16
+  set_var 1
+  next_instr 64
+  set_var 2
+  next_arg 
+  is_type 16
+  set_var 3
+  pred consecutive_words v1 v3
+  pred distinct v1 v2
+  commit_new_instr 230
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 16
+  set_var 1
+  next_instr 64
+  set_var 2
+  next_arg 
+  is_type 16
+  set_var 3
+  pred consecutive_words v3 v1
+  pred distinct v1 v2
+  commit_new_instr 230
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  is_type 16
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 64
+  is_type 16
+  set_var 2
+  next_arg 
+  set_var 3
+  pred consecutive_words v0 v2
+  next_instr 136
+  set_var 4
+  next_arg 
+  is_type 1
+  commit_new_instr 227
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  is_type 16
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 64
+  is_type 16
+  set_var 2
+  next_arg 
+  set_var 3
+  pred consecutive_words v2 v0
+  next_instr 136
+  set_var 4
+  next_arg 
+  is_type 1
+  commit_new_instr 227
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 4
+  end 
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 8
+  set_var 1
+  next_instr 64
+  set_var 2
+  next_arg 
+  is_type 8
+  set_var 3
+  pred consecutive_xregs v1 v3
+  pred distinct v1 v2
+  commit_new_instr 230
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first=move/2 second=move/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 8
+  set_var 1
+  next_instr 64
+  set_var 2
+  next_arg 
+  is_type 8
+  set_var 3
+  pred consecutive_xregs v3 v1
+  pred distinct v1 v2
+  commit_new_instr 230
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+RULE first=move/2 second=trim/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 136
+  set_var 2
+  next_arg 
+  is_type 1
+  commit_new_instr 228
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+RULE first=move/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  commit_new_instr 229
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+KEY new_map/3
+RULE first=new_map/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  rest_args 3
+  pred is_small_map_literal_keys v2 rest_args
+  call new_small_map_lit v0 v1 v2 rest_args
+  end 
+KEY nofail_bif2/4
+RULE first=nofail_bif2/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 24
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  pred is_eq_exact_bif v2
+  commit_new_instr 293
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  end 
+RULE first=nofail_bif2/4 second=undef cannot_fail=0
+  try_me_else 
+  is_type 24
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  pred is_ne_exact_bif v2
+  commit_new_instr 294
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  end 
+RULE first=nofail_bif2/4 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  pred is_ge_bif v2
+  commit_new_instr 295
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  end 
+RULE first=nofail_bif2/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  pred is_lt_bif v2
+  commit_new_instr 296
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  end 
+KEY put_list/3
+RULE first=put_list/3 second=put_list/3 cannot_fail=0
+  try_me_else 
+  is_type 16
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 69
+  is_type 16
+  set_var 3
+  next_arg 
+  set_var 4
+  next_arg 
+  set_var 5
+  pred equal v2 v4
+  pred equal v2 v5
+  pred consecutive_words v0 v3
+  commit_new_instr 247
+  store_var 0
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+RULE first=put_list/3 second=deallocate/1 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 18
+  set_var 3
+  commit_new_instr 246
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+KEY put_map_assoc/5
+RULE first=put_map_assoc/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_arg 
+  rest_args 5
+  commit 
+  new_instr 342
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_rest_args 
+  end 
+KEY put_map_exact/5
+RULE first=put_map_exact/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_arg 
+  rest_args 5
+  pred map_key_sort v4 rest_args
+  commit 
+  new_instr 344
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_rest_args 
+  end 
+KEY put_record/6
+RULE first=put_record/6 second=undef cannot_fail=0
+  try_me_else 
+  is_type 512
+  next_arg 
+  is_type 4
+  set_var 0
+  next_arg 
+  is_type 256
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  rest_args 6
+  call create_local_record v0 v1 v2 v3 rest_args
+  end 
+RULE first=put_record/6 second=undef cannot_fail=0
+  try_me_else 
+  is_type 512
+  next_arg 
+  set_var 0
+  next_arg 
+  is_type 256
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  rest_args 6
+  pred map_key_sort v3 rest_args
+  commit 
+  new_instr 376
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_rest_args 
+  end 
+RULE first=put_record/6 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 512
+  next_arg 
+  nop 
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_arg 
+  rest_args 6
+  pred map_key_sort v4 rest_args
+  commit 
+  new_instr 377
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_rest_args 
+  end 
+KEY select_tuple_arity/3
+RULE first=select_tuple_arity/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 24
+  set_var 0
+  next_arg 
+  is_type 32
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  rest_args 3
+  call select_tuple_arity v0 v1 v2 rest_args
+  end 
+KEY select_val/3
+RULE first=select_val/3 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 288
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  rest_args 3
+  pred use_jump_tab v2 rest_args 6
+  call jump_tab v0 v1 v2 rest_args
+  end 
+RULE first=select_val/3 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 288
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  rest_args 3
+  pred mixed_types v2 rest_args
+  call split_values v0 v1 v1 v2 rest_args
+  end 
+RULE first=select_val/3 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  is_type 288
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  rest_args 3
+  pred floats_or_bignums v2 rest_args
+  call select_literals v0 v1 v2 rest_args
+  end 
+RULE first=select_val/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  is_type 288
+  set_var 1
+  next_arg 
+  is_type 1
+  set_var 2
+  next_arg 
+  rest_args 3
+  pred fixed_size_values v2 rest_args
+  call select_val v0 v1 v2 rest_args
+  end 
+KEY sorted_put_map_assoc/4
+RULE first=sorted_put_map_assoc/4 second=undef cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  rest_args 4
+  pred is_empty_map v0
+  commit 
+  new_instr 345
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_rest_args 
+  end 
+RULE first=sorted_put_map_assoc/4 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 8478
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  rest_args 4
+  commit 
+  new_instr 347
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_rest_args 
+  end 
+KEY sorted_put_map_exact/5
+RULE first=sorted_put_map_exact/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  set_var 4
+  next_arg 
+  rest_args 5
+  commit 
+  new_instr 348
+  store_var 1
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  next_arg 
+  store_rest_args 
+  end 
+KEY swap/2
+RULE first= second= cannot_fail=1
+  skip_unless 169 4
+RULE first=swap/2 second=swap/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 169
+  set_var 2
+  next_arg 
+  set_var 3
+  pred equal v1 v2
+  commit_new_instr 232
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 3
+  end 
+RULE first=swap/2 second=swap/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 169
+  set_var 2
+  next_arg 
+  set_var 3
+  pred equal v0 v2
+  commit_new_instr 232
+  store_var 1
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 3
+  end 
+RULE first=swap/2 second=swap/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 169
+  set_var 2
+  next_arg 
+  set_var 3
+  pred equal v0 v3
+  commit_new_instr 232
+  store_var 1
+  next_arg 
+  store_var 0
+  next_arg 
+  store_var 2
+  end 
+RULE first=swap/2 second=swap/2 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_instr 169
+  set_var 2
+  next_arg 
+  set_var 3
+  pred equal v1 v3
+  commit_new_instr 232
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+RULE first= second= cannot_fail=0
+  fail 
+KEY swap2/3
+RULE first= second= cannot_fail=1
+  skip_unless 169 2
+RULE first=swap2/3 second=swap/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 169
+  set_var 3
+  next_arg 
+  set_var 4
+  pred equal v2 v3
+  commit_new_instr 233
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 4
+  end 
+RULE first=swap2/3 second=swap/2 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 169
+  set_var 3
+  next_arg 
+  set_var 4
+  pred equal v2 v4
+  commit_new_instr 233
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+RULE first= second= cannot_fail=0
+  fail 
+KEY swap3/4
+RULE first= second= cannot_fail=1
+  skip_unless 169 2
+RULE first=swap3/4 second=swap/2 cannot_fail=0
+  try_me_else 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_instr 169
+  set_var 4
+  next_arg 
+  set_var 5
+  pred equal v3 v4
+  commit_new_instr 234
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 5
+  end 
+RULE first=swap3/4 second=swap/2 cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_instr 169
+  set_var 4
+  next_arg 
+  set_var 5
+  pred equal v3 v5
+  commit_new_instr 234
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_var 4
+  end 
+RULE first= second= cannot_fail=0
+  fail 
+KEY system_limit/1
+RULE first=system_limit/1 second=undef cannot_fail=0
+  try_me_else 
+  is_type 512
+  rename 226
+RULE first=system_limit/1 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 32
+  set_var 0
+  commit_new_instr 61
+  store_var 0
+  end 
+KEY test_arity/3
+RULE first=test_arity/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  next_arg 
+  set_var 2
+  commit_new_instr 212
+  store_var 1
+  new_instr 216
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  end 
+KEY try/2
+RULE first=try/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  commit_new_instr 62
+  store_var 0
+  next_arg 
+  store_var 1
+  end 
+KEY try_end/1
+RULE first=try_end/1 second=deallocate/1 cannot_fail=0
+  try_me_else 
+  nop 
+  next_instr 18
+  set_var 1
+  commit_new_instr 209
+  store_var 1
+  end 
+RULE first=try_end/1 second=move/2 cannot_fail=0
+  try_me_else_fail 
+  nop 
+  next_instr 64
+  set_var 1
+  next_arg 
+  set_var 2
+  next_instr 18
+  set_var 3
+  commit_new_instr 210
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  end 
+KEY unsupported_guard_bif/3
+RULE first=unsupported_guard_bif/3 second=undef cannot_fail=0
+  try_me_else_fail 
+  nop 
+  next_arg 
+  nop 
+  next_arg 
+  nop 
+  pred never
+  commit 
+  end 
+KEY update_record/5
+RULE first=update_record/5 second=undef cannot_fail=0
+  try_me_else_fail 
+  is_type 4
+  is_eq am_inplace
+  next_arg 
+  set_var 0
+  next_arg 
+  is_type 24
+  set_var 1
+  next_arg 
+  set_var 2
+  next_arg 
+  set_var 3
+  next_arg 
+  rest_args 5
+  commit 
+  new_instr 372
+  store_var 0
+  next_arg 
+  store_var 1
+  next_arg 
+  store_var 2
+  next_arg 
+  store_var 3
+  next_arg 
+  store_rest_args 
+  end 
+KEY wait/1
+RULE first=wait/1 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  commit_new_instr 238
+  store_var 0
+  end 
+KEY wait_timeout/2
+RULE first=wait_timeout/2 second=undef cannot_fail=0
+  try_me_else_fail 
+  set_var 0
+  next_arg 
+  set_var 1
+  commit_new_instr 239
+  store_var 1
+  next_arg 
+  store_var 0
+  end 
