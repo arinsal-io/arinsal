@@ -1034,7 +1034,7 @@ fn beamfile_module_md5(process: &mut Process, binary: Term) -> Result<Term, VmEr
     let OwnedTerm::Binary(bytes) = &owned else {
         return Err(badarg());
     };
-    if arinsal_beam::parse(bytes).is_err() {
+    if arinsal_beam::read(bytes).is_err() {
         return Ok(atom("undefined"));
     }
     let md5 = arinsal_loader::module_uniq(bytes).map_err(|_| badarg())?;

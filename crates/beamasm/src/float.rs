@@ -30,16 +30,64 @@ pub enum FloatOp {
     Div,
 }
 
-fn freg(index: u8) -> Result<VecReg, ModuleError> {
-    if index >= 8 {
-        return Err(ModuleError::InvalidOperand(
-            "float register index must be below 8",
-        ));
+const SCHEDULER_REGS: Gpr = Gpr::x(19);
+/// The float registers kept in d8-d15 (`num_register_backed_fregs`).
+const REGISTER_BACKED_FREGS: u32 = 8;
+
+/// Where a BEAM float register lives: d8-d15 for the first eight, `f_reg_array` of the
+/// scheduler registers for the rest.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:190 (register_backed_fregs) and :245
+// (getFRef), OTP-29.1.1.
+#[derive(Clone, Copy)]
+enum FloatLoc {
+    Reg(VecReg),
+    Mem(u32),
+}
+
+fn freg(index: u32) -> Result<FloatLoc, ModuleError> {
+    if index < REGISTER_BACKED_FREGS {
+        Ok(FloatLoc::Reg(VecReg(index as u8 + 8)))
+    } else if index < 1024 {
+        let base = std::mem::offset_of!(crate::SchedulerRegisters, f_reg_array) as u32;
+        Ok(FloatLoc::Mem(base + 8 * index))
+    } else {
+        Err(ModuleError::InvalidOperand(
+            "float register index must be below 1024",
+        ))
     }
-    Ok(VecReg(index + 8))
 }
 
 impl BeamModuleAssembler {
+    /// The register holding float register `loc`: itself when register backed, else `tmp`
+    /// loaded from memory.
+    fn float_source(&mut self, loc: FloatLoc, tmp: VecReg) -> Result<VecReg, ModuleError> {
+        match loc {
+            FloatLoc::Reg(reg) => Ok(reg),
+            FloatLoc::Mem(offset) => {
+                self.code
+                    .emit(|e| e.ldr_d_uoff(tmp, SCHEDULER_REGS, offset))?;
+                Ok(tmp)
+            }
+        }
+    }
+
+    /// The register to compute float register `loc` in: itself, or `tmp` until it is flushed.
+    fn float_target(loc: FloatLoc, tmp: VecReg) -> VecReg {
+        match loc {
+            FloatLoc::Reg(reg) => reg,
+            FloatLoc::Mem(_) => tmp,
+        }
+    }
+
+    /// Stores `value` to a memory-backed float register.
+    fn float_flush(&mut self, loc: FloatLoc, value: VecReg) -> Result<(), ModuleError> {
+        if let FloatLoc::Mem(offset) = loc {
+            self.code
+                .emit(|e| e.str_d_uoff(value, SCHEDULER_REGS, offset))?;
+        }
+        Ok(())
+    }
+
     fn emit_float_runtime_hook(&mut self, helper: usize, args: &[Gpr]) -> Result<(), ModuleError> {
         if args.len() > 5 {
             return Err(ModuleError::InvalidOperand(
@@ -103,25 +151,27 @@ impl BeamModuleAssembler {
     pub fn emit_fload_native(
         &mut self,
         source: ArgVal,
-        destination: u8,
+        destination: u32,
     ) -> Result<(), ModuleError> {
-        let dst = freg(destination)?;
+        let loc = freg(destination)?;
+        let dst = Self::float_target(loc, VecReg(0));
         let source = self.source_reg(source)?;
         self.code.emit(|e| {
             e.and_imm(Gpr::x(9), source, !7)?;
             e.ldur_d(dst, Gpr::x(9), 8)
         })?;
-        Ok(())
+        self.float_flush(loc, dst)
     }
 
     /// Boxes a d8-d15 value in the process young heap and stores its term.
     // Port of erts/emulator/beam/jit/arm/instr_float.cpp:81-94, OTP-29.1.1
     pub fn emit_fstore_native(
         &mut self,
-        source: u8,
+        source: u32,
         destination: ArgVal,
     ) -> Result<(), ModuleError> {
-        let src = freg(source)?;
+        let loc = freg(source)?;
+        let src = self.float_source(loc, VecReg(0))?;
         let boxed = match destination {
             ArgVal::X(index) if index < 6 => {
                 Gpr::x(if index < 4 { 25 + index } else { 11 + index })
@@ -157,10 +207,11 @@ impl BeamModuleAssembler {
     pub fn emit_fconv_native(
         &mut self,
         source: ArgVal,
-        destination: u8,
+        destination: u32,
         big_to_float: BigToFloat,
     ) -> Result<(), ModuleError> {
-        let dst = freg(destination)?;
+        let loc = freg(destination)?;
+        let dst = Self::float_target(loc, VecReg(1));
         let source = self.source_reg(source)?;
         let small = self.code.new_label();
         let done = self.code.new_label();
@@ -208,7 +259,7 @@ impl BeamModuleAssembler {
         self.emit_float_runtime_hook(big_to_float as usize, &[source])?;
         self.code.emit(|e| e.fmov_d_from_x(dst, Gpr::x(0)))?;
         self.code.bind(done)?;
-        Ok(())
+        self.float_flush(loc, dst)
     }
 
     /// Emits one native float arithmetic instruction, rejecting non-finite results.
@@ -216,13 +267,14 @@ impl BeamModuleAssembler {
     pub fn emit_float_instr(
         &mut self,
         op: FloatOp,
-        lhs: u8,
-        rhs: u8,
-        destination: u8,
+        lhs: u32,
+        rhs: u32,
+        destination: u32,
     ) -> Result<(), ModuleError> {
-        let left = freg(lhs)?;
-        let right = freg(rhs)?;
-        let dst = freg(destination)?;
+        let left = self.float_source(freg(lhs)?, VecReg(1))?;
+        let right = self.float_source(freg(rhs)?, VecReg(2))?;
+        let loc = freg(destination)?;
+        let dst = Self::float_target(loc, VecReg(0));
         self.code.emit(|e| match op {
             FloatOp::Add => e.fadd(VecReg(0), left, right),
             FloatOp::Sub => e.fsub(VecReg(0), left, right),
@@ -230,44 +282,46 @@ impl BeamModuleAssembler {
             FloatOp::Div => e.fdiv(VecReg(0), left, right),
         })?;
         self.emit_finite_check()?;
-        self.code.emit(|e| e.fmov_d(dst, VecReg(0)))?;
-        Ok(())
+        if dst != VecReg(0) {
+            self.code.emit(|e| e.fmov_d(dst, VecReg(0)))?;
+        }
+        self.float_flush(loc, VecReg(0))
     }
 
     /// Emits floating point addition (`i_fadd`).
     // Port of erts/emulator/beam/jit/arm/instr_float.cpp:198-202, OTP-29.1.1
-    pub fn emit_i_fadd(&mut self, lhs: u8, rhs: u8, dst: u8) -> Result<(), ModuleError> {
+    pub fn emit_i_fadd(&mut self, lhs: u32, rhs: u32, dst: u32) -> Result<(), ModuleError> {
         self.emit_float_instr(FloatOp::Add, lhs, rhs, dst)
     }
 
     /// Emits floating point subtraction (`i_fsub`).
     // Port of erts/emulator/beam/jit/arm/instr_float.cpp:204-208, OTP-29.1.1
-    pub fn emit_i_fsub(&mut self, lhs: u8, rhs: u8, dst: u8) -> Result<(), ModuleError> {
+    pub fn emit_i_fsub(&mut self, lhs: u32, rhs: u32, dst: u32) -> Result<(), ModuleError> {
         self.emit_float_instr(FloatOp::Sub, lhs, rhs, dst)
     }
 
     /// Emits floating point multiplication (`i_fmul`).
     // Port of erts/emulator/beam/jit/arm/instr_float.cpp:210-214, OTP-29.1.1
-    pub fn emit_i_fmul(&mut self, lhs: u8, rhs: u8, dst: u8) -> Result<(), ModuleError> {
+    pub fn emit_i_fmul(&mut self, lhs: u32, rhs: u32, dst: u32) -> Result<(), ModuleError> {
         self.emit_float_instr(FloatOp::Mul, lhs, rhs, dst)
     }
 
     /// Emits floating point division (`i_fdiv`).
     // Port of erts/emulator/beam/jit/arm/instr_float.cpp:216-220, OTP-29.1.1
-    pub fn emit_i_fdiv(&mut self, lhs: u8, rhs: u8, dst: u8) -> Result<(), ModuleError> {
+    pub fn emit_i_fdiv(&mut self, lhs: u32, rhs: u32, dst: u32) -> Result<(), ModuleError> {
         self.emit_float_instr(FloatOp::Div, lhs, rhs, dst)
     }
 
     /// Negates a finite floating point register without an arithmetic error check.
     // Port of erts/emulator/beam/jit/arm/instr_float.cpp:222-232, OTP-29.1.1
-    pub fn emit_i_fnegate(&mut self, source: u8, destination: u8) -> Result<(), ModuleError> {
-        let src = freg(source)?;
-        let dst = freg(destination)?;
-        self.code.emit(|e| {
-            e.fneg(VecReg(0), src)?;
-            e.fmov_d(dst, VecReg(0))
-        })?;
-        Ok(())
+    pub fn emit_i_fnegate(&mut self, source: u32, destination: u32) -> Result<(), ModuleError> {
+        let src = self.float_source(freg(source)?, VecReg(1))?;
+        let loc = freg(destination)?;
+        self.code.emit(|e| e.fneg(VecReg(0), src))?;
+        if let FloatLoc::Reg(dst) = loc {
+            self.code.emit(|e| e.fmov_d(dst, VecReg(0)))?;
+        }
+        self.float_flush(loc, VecReg(0))
     }
 }
 
@@ -276,7 +330,7 @@ impl BeamModuleAssembler {
 pub fn emit_fload(
     assembler: &mut BeamModuleAssembler,
     source: ArgVal,
-    destination: u8,
+    destination: u32,
 ) -> Result<(), ModuleError> {
     assembler.emit_fload_native(source, destination)
 }
@@ -285,7 +339,7 @@ pub fn emit_fload(
 // Port of erts/emulator/beam/jit/arm/instr_float.cpp:81-94, OTP-29.1.1
 pub fn emit_fstore(
     assembler: &mut BeamModuleAssembler,
-    source: u8,
+    source: u32,
     destination: ArgVal,
 ) -> Result<(), ModuleError> {
     assembler.emit_fstore_native(source, destination)
@@ -296,7 +350,7 @@ pub fn emit_fstore(
 pub fn emit_fconv(
     assembler: &mut BeamModuleAssembler,
     source: ArgVal,
-    destination: u8,
+    destination: u32,
     big_to_float: BigToFloat,
 ) -> Result<(), ModuleError> {
     assembler.emit_fconv_native(source, destination, big_to_float)
