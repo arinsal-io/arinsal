@@ -35,9 +35,17 @@ impl<'a> Delay<'a> {
             );
             None
         } else {
-            Some(thr_progress::unmanaged_delay(progress))
+            Some(Self::delay(progress))
         };
         Self { progress, handle }
+    }
+
+    /// The unmanaged side stays out of line: it reads the thread's own state, which a managed
+    /// reader never does.
+    #[cold]
+    #[inline(never)]
+    fn delay(progress: &ThrProgress) -> DelayHandle {
+        thr_progress::unmanaged_delay(progress)
     }
 }
 
@@ -96,14 +104,23 @@ impl<T: Send + Sync + 'static> ProgressSlot<T> {
         f: impl FnOnce(&T) -> R,
     ) -> Option<R> {
         let _delay = Delay::begin(&progress.0, managed);
+        // This thread passes no progress point (managed) or delays progress (`_delay`) until
+        // `f` returns, which is what `with_managed` relies on.
+        self.with_managed(f)
+    }
+
+    /// [`ProgressSlot::with`] for a managed thread: a bare load of the slot, which needs no
+    /// progress domain (`erts_ptab_pix2intptr_ddrb` is a load and nothing else).
+    pub fn with_managed<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
         let raw = self.0.load(Ordering::Acquire);
         if raw.is_null() {
             return None;
         }
         // SAFETY: `raw` came from `Arc::into_raw` and the slot owns that reference. Dropping it
         // is deferred by `schedule_release` until every managed thread passed a progress point
-        // after the slot was cleared; this thread passes none (managed) or delays progress
-        // (`_delay`) until `f` returns, so the element outlives the borrow.
+        // after the slot was cleared; the caller is a managed thread that passes none, or an
+        // unmanaged one that delays progress (`with`), until `f` returns, so the element
+        // outlives the borrow.
         Some(f(unsafe { &*raw }))
     }
 
