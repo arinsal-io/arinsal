@@ -782,11 +782,6 @@ fn filename_bytes(t: Term, allow_empty: bool, allow_atom: bool) -> Option<Vec<u8
         append_binary(t, &mut out)?;
         return Some(out);
     }
-    #[cfg(target_os = "linux")]
-    if t == Term::NIL || t.classify() == TermKind::List {
-        let out = arinsal_bifs::native_filename_list_bytes(t)?;
-        return (allow_empty || !out.is_empty()).then_some(out);
-    }
     let characters = list(t)?;
     if characters.is_empty() && !allow_empty {
         return None;
@@ -2332,7 +2327,7 @@ impl arinsal_drv::PollBackend for DrvPoll {
         id: u64,
         fd: i32,
         write: bool,
-        ready: Box<dyn FnOnce(bool) + Send>,
+        ready: Box<dyn FnOnce() + Send>,
     ) -> std::io::Result<()> {
         let state = Arc::clone(&self.state);
         let registration = crate::check_io::register_driver(
@@ -2341,14 +2336,14 @@ impl arinsal_drv::PollBackend for DrvPoll {
                 readable: !write,
                 writable: write,
             },
-            move |_, readiness| {
+            move |_, _| {
                 {
                     let mut state = state[id as usize % POLL_SHARDS].lock();
                     if state.live.remove(&id).is_none() {
                         state.fired.insert(id);
                     }
                 }
-                ready(readiness.invalid);
+                ready();
             },
         )?;
         let mut state = self.state[id as usize % POLL_SHARDS].lock();
@@ -3453,9 +3448,6 @@ fn worker(
                         if let Some(rest) = handle.state.lock().handshake.as_mut() {
                             rest.extend_from_slice(&crate::child_setup::ack_frame());
                         }
-                        // Port of erts/emulator/sys/unix/sys_drivers.c:1307-1332
-                        // (`ready_input`): write or queue Ack before init_ack wakes the opener.
-                        flush_handshake(&handle, true, start.is_some_and(|s| !s.keep_input));
                         send_open_reply(&handle, Ok(()));
                         go_buf = None;
                         if start.is_some_and(|s| !s.read_wanted) {

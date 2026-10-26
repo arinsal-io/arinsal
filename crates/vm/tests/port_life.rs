@@ -1,6 +1,5 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_vm::Vm;
-use similar_asserts::assert_eq;
 
 #[test]
 fn port_lifecycle_matches_otp() {
@@ -112,18 +111,10 @@ detached_child_survives() ->
     P = open_port({spawn_executable, "/bin/sh"},
                   [{args, ["-c", "sleep 0.2; /usr/bin/touch " ++ Path]}]),
     true = port_close(P),
-    Exists = await_file(Path, 250),
+    timer:sleep(500),
+    Exists = port_exit_status("test -f " ++ Path) =:= 0,
     0 = port_exit_status("rm -f " ++ Path),
-    true = Exists,
-    true.
-await_file(Path, Retries) ->
-    case port_exit_status("test -f " ++ Path) of
-        0 -> true;
-        _ when Retries =< 1 -> false;
-        _ ->
-            timer:sleep(20),
-            await_file(Path, Retries - 1)
-    end.
+    Exists.
 port_exit_status(Command) ->
     P = open_port({spawn_executable, "/bin/sh"},
                   [{args, ["-c", Command]}, exit_status]),
