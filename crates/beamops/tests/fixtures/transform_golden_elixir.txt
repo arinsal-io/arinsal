@@ -205,7 +205,7 @@ Elixir.String.Chars.Time 7d44ea53488f58f7 7d44ea53488f58f7
 Elixir.String.Chars.URI b88609ea281d812a b88609ea281d812a
 Elixir.String.Chars.Version 7dcb5061d11d75c2 7dcb5061d11d75c2
 Elixir.String.Chars.Version.Requirement b2d70b280fec268b b2d70b280fec268b
-Elixir.String.Tokenizer aa594b0008da796c e420a3f2b5b687c6
+Elixir.String.Tokenizer 118e5d99e8d41aa5 07d0868b59978957
 Elixir.String.Tokenizer.ScriptSet 39659bca74f14abd c653a83ed14ffc6c
 Elixir.String.Tokenizer.Security 353067f889f1853e 353067f889f1853e
 Elixir.String.Unicode 8937c441df523c03 a87945c529989a66
