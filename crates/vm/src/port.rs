@@ -512,7 +512,7 @@ pub(crate) fn test_next_port_id(
 /// Slots per lazily materialized page of the port table.
 const PORT_PAGE_SIZE: usize = 1024;
 
-type PortSlot = arc_swap::ArcSwapOption<PortHandle>;
+type PortSlot = arinsal_sched::ProgressSlot<PortHandle>;
 
 /// The port table (`erts_port` ptab): an array indexed by the port id's table index bits
 /// (`erts_ptab_data2pix`), so a lookup is a shift, a mask and a slot load without hashing.
@@ -524,6 +524,9 @@ type PortSlot = arc_swap::ArcSwapOption<PortHandle>;
 pub(crate) struct PortTable {
     list: std::sync::RwLock<()>,
     pages: Vec<OnceLock<Box<[PortSlot]>>>,
+    /// The thread progress domain that frees removed elements, attached when the scheduler
+    /// exists (`erts_schedule_thr_prgr_later_cleanup_op` in `erts_ptab_delete_element`).
+    progress: OnceLock<arinsal_sched::Progress>,
     interval: std::sync::atomic::AtomicU64,
     list_deleted: Mutex<arinsal_sched::PtabListLog<u64>>,
 }
@@ -540,6 +543,7 @@ impl PortTable {
         Self {
             list: std::sync::RwLock::new(()),
             pages: (0..pages).map(|_| OnceLock::new()).collect(),
+            progress: OnceLock::new(),
             interval: std::sync::atomic::AtomicU64::new(0),
             list_deleted: Mutex::new(arinsal_sched::PtabListLog::default()),
         }
@@ -562,24 +566,45 @@ impl PortTable {
         Some(&page[pix % PORT_PAGE_SIZE])
     }
 
+    /// Attach the scheduler's thread progress domain: removed ports are freed after it.
+    pub(crate) fn attach(&self, progress: arinsal_sched::Progress) {
+        let _ = self.progress.set(progress);
+    }
+
     /// `erts_port_lookup_raw`: the handle of the live port `id`.
     pub(crate) fn get(&self, id: u64) -> Option<Arc<PortHandle>> {
-        let slot = self.slot(id)?.load();
-        slot.as_ref().filter(|handle| handle.id == id).cloned()
+        self.get_from(id, false)
+    }
+
+    /// [`PortTable::get`] for a caller that is a managed scheduler thread (`managed`): the
+    /// lookup then delays nothing.
+    pub(crate) fn get_from(&self, id: u64, managed: bool) -> Option<Arc<PortHandle>> {
+        self.slot(id)?
+            .load_arc_if(self.progress.get()?, managed, |handle| handle.id == id)
     }
 
     /// Run `f` on the live port `id` without taking a counted reference to it.
     pub(crate) fn with<R>(&self, id: u64, f: impl FnOnce(&PortHandle) -> R) -> Option<R> {
-        let slot = self.slot(id)?.load();
-        slot.as_ref()
-            .filter(|handle| handle.id == id)
-            .map(|handle| f(handle))
+        self.with_from(id, false, f)
+    }
+
+    /// [`PortTable::with`] for a caller that is a managed scheduler thread (`managed`).
+    pub(crate) fn with_from<R>(
+        &self,
+        id: u64,
+        managed: bool,
+        f: impl FnOnce(&PortHandle) -> R,
+    ) -> Option<R> {
+        self.slot(id)?
+            .with(self.progress.get()?, managed, |handle| {
+                (handle.id == id).then(|| f(handle))
+            })
+            .flatten()
     }
 
     /// Whether port `id` is live.
     pub(crate) fn contains(&self, id: u64) -> bool {
-        self.slot(id)
-            .is_some_and(|slot| slot.load().as_ref().is_some_and(|handle| handle.id == id))
+        self.with(id, |_| ()).is_some()
     }
 
     /// Whether any live port occupies table index `pix`.
@@ -588,7 +613,7 @@ impl PortTable {
         self.pages
             .get(pix / PORT_PAGE_SIZE)
             .and_then(OnceLock::get)
-            .is_some_and(|page| page[pix % PORT_PAGE_SIZE].load().is_some())
+            .is_some_and(|page| page[pix % PORT_PAGE_SIZE].is_occupied())
     }
 
     /// Publish a new port in its slot (`erts_ptab_new_element`, under the table lock).
@@ -599,18 +624,22 @@ impl PortTable {
         let pix = arinsal_term::ptab::port_table_layout().data2pix(id) as usize;
         let page = self.pages[pix / PORT_PAGE_SIZE].get_or_init(|| {
             (0..PORT_PAGE_SIZE)
-                .map(|_| arc_swap::ArcSwapOption::empty())
+                .map(|_| arinsal_sched::ProgressSlot::new())
                 .collect()
         });
-        page[pix % PORT_PAGE_SIZE].store(Some(handle));
+        page[pix % PORT_PAGE_SIZE].store(handle, self.progress.get());
     }
 
     /// Clear the slot of port `id` and return its handle.
     pub(crate) fn remove(&self, id: u64) -> Option<Arc<PortHandle>> {
         let slot = self.slot(id)?;
+        let progress = self.progress.get()?;
         // The caller holds the table lock, so the slot cannot change between the check and the swap.
-        if slot.load().as_ref().is_some_and(|handle| handle.id == id) {
-            let removed = slot.swap(None)?;
+        if slot
+            .with(progress, false, |handle| handle.id == id)
+            .unwrap_or(false)
+        {
+            let removed = slot.take(progress)?;
             let started_interval = removed.started_interval.load(Ordering::Acquire);
             let deleted_interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
             let index = arinsal_term::ptab::port_table_layout().data2pix(id);
@@ -634,11 +663,14 @@ impl PortTable {
 
     /// Live ports in table order (`erts_ptab_processes` scan order).
     pub(crate) fn handles(&self) -> Vec<Arc<PortHandle>> {
+        let Some(progress) = self.progress.get() else {
+            return Vec::new();
+        };
         self.pages
             .iter()
             .filter_map(OnceLock::get)
             .flat_map(|page| page.iter())
-            .filter_map(|slot| slot.load_full())
+            .filter_map(|slot| slot.load_arc(progress, false))
             .collect()
     }
 
@@ -680,7 +712,11 @@ impl PortPtabListSnapshot {
             let Some(page) = self.table.pages[page_index].get() else {
                 continue;
             };
-            let Some(handle) = page[index as usize % PORT_PAGE_SIZE].load_full() else {
+            let Some(progress) = self.table.progress.get() else {
+                continue;
+            };
+            let Some(handle) = page[index as usize % PORT_PAGE_SIZE].load_arc(progress, false)
+            else {
                 continue;
             };
             if handle.started_interval.load(Ordering::Acquire) < self.invocation_interval {
@@ -3903,7 +3939,7 @@ fn lookup_port(process: &Process, term: Term) -> Result<Arc<PortHandle>, VmError
     process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.get(id))
+        .and_then(|runtime| runtime.ports.get_from(id, process.on_managed))
         .ok_or_else(badarg)
 }
 
@@ -4020,6 +4056,16 @@ impl crate::natives::ThinProcessBif for PortGetData {
 
     #[inline(always)]
     fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<crate::exceptions::Trap>> {
+        // The data word of a live port holds an atom or a small integer (`inet_db` stores the
+        // module atom): one lookup and one load, as `erts_port_data_read` does.
+        if let Some(id) = args[0].as_port()
+            && let Some(runtime) = process.runtime.as_ref()
+            && let Some(Some(term)) = runtime.ports.with_from(id, process.on_managed, |handle| {
+                port_data_term(handle.data.load(Ordering::Acquire))
+            })
+        {
+            return Ok(term);
+        }
         port_get_data(process, args[0]).map_err(thin_failure)
     }
 }
@@ -4073,10 +4119,11 @@ pub(crate) fn port_set_data_light(
 fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
     let id = port_id(process, port).ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let managed = process.on_managed;
     let heap = &mut process.heap;
     runtime
         .ports
-        .with(id, |handle| {
+        .with_from(id, managed, |handle| {
             loop {
                 if let Some(term) = port_data_term(handle.data.load(Ordering::Acquire)) {
                     return Ok(term);
@@ -5079,10 +5126,12 @@ fn register_monitor(
         .as_ref()
         .map(|runtime| runtime.ports.read().unwrap());
     if monitored
-        && !process
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.ports.contains(id))
+        && !process.runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .ports
+                .with_from(id, process.on_managed, |_| ())
+                .is_some()
+        })
     {
         return Ok(false);
     }
@@ -5185,11 +5234,13 @@ pub(crate) fn demonitor_port(process: &Process, caller: Pid, port_id: u64, refer
     // The common case runs on the borrowed handle; a port that is busy takes a counted one.
     let free = runtime
         .ports
-        .with(port_id, |handle| match handle.driver.as_ref() {
-            Some(drv) => drv_sig::demonitor_now(handle, drv, reference),
-            None => {
-                handle.monitors.lock().remove(&reference);
-                true
+        .with_from(port_id, process.on_managed, |handle| {
+            match handle.driver.as_ref() {
+                Some(drv) => drv_sig::demonitor_now(handle, drv, reference),
+                None => {
+                    handle.monitors.lock().remove(&reference);
+                    true
+                }
             }
         });
     // `erts_port_lookup` failed: `ERTS_PORT_OP_DROPPED`, origin already released.

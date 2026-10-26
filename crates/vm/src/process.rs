@@ -8031,6 +8031,7 @@ impl Task for Process {
             .alloc_ix
             .get_or_insert_with(arinsal_alloc::thread_alloc_ix);
         self.heap.set_alloc_ix(Some(alloc_ix));
+        self.on_managed = !ctx.scheduler_type().is_dirty() && !ctx.simulated();
         let outcome = abort_on_worker_panic(|| self.run_task(ctx, data, budget));
         self.heap.set_alloc_ix(None);
         if matches!(outcome, RunOutcome::Exit(_)) {
@@ -8817,6 +8818,7 @@ impl Vm {
                 let online = crate::natives::sys::scheduler_online_default(runtime);
                 let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
                 let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
+                runtime.ports.attach(scheduler.progress());
                 runtime
                     .scheduler
                     .set(scheduler)
