@@ -1630,6 +1630,7 @@ impl IolistSizeWalk {
     /// Returns whether the walk finished and the yield counts used; a walk that ran out of
     /// budget reports all of it.
     // Port of erts/emulator/beam/erl_iolist.c (generic_iolist_size), OTP-29.1.1.
+    #[inline]
     pub fn step(&mut self, budget: usize) -> Result<(bool, usize), (BifError, usize)> {
         let mut consumed = 0;
         loop {
@@ -1639,6 +1640,19 @@ impl IolistSizeWalk {
                 }
                 consumed += 1;
                 let (head, tail) = iolist_cons(self.current).map_err(|error| (error, consumed))?;
+                // Port of erts/emulator/beam/erl_iolist.c:158-165
+                // (generic_iolist_size): test bytes before boxed terms and sublists.
+                if let Some(byte) = head.as_small() {
+                    if !(0..=255).contains(&byte) {
+                        return Err((BADARG, consumed));
+                    }
+                    self.size = self
+                        .size
+                        .checked_add(8)
+                        .ok_or((BifError::SystemLimit, consumed))?;
+                    self.current = tail;
+                    continue;
+                }
                 if head.classify() == TermKind::List {
                     self.tails.push(tail);
                     self.current = head;

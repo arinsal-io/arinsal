@@ -810,6 +810,7 @@ impl IolistCopyWalk {
     }
 
     /// Copy at most `yield_count` ERTS iolist units into `output`.
+    #[inline]
     pub fn step(
         &mut self,
         output: &mut [u8],
@@ -867,6 +868,24 @@ impl IolistCopyWalk {
                 remaining -= 1;
                 let (head, tail) = iolist_cons(self.current)
                     .map_err(|error| (error, yield_count.saturating_sub(remaining)))?;
+                // Port of erts/emulator/beam/erl_iolist.c:479-514
+                // (generic_iolist_copy): the byte case precedes boxed terms and sublists.
+                if let Some(number) = head.as_small() {
+                    let byte = u8::try_from(number)
+                        .map_err(|_| (BifError::BADARG, yield_count - remaining))?;
+                    if self.bit_mode {
+                        or_bits_at(output, self.to_bit, &[byte], 8)
+                            .map_err(|error| (error, yield_count - remaining))?;
+                        self.to_bit += 8;
+                    } else {
+                        *output
+                            .get_mut(self.offset)
+                            .ok_or((BifError::SystemLimit, yield_count - remaining))? = byte;
+                        self.offset += 1;
+                    }
+                    self.current = tail;
+                    continue;
+                }
                 if head.classify() == TermKind::List {
                     self.tails.push(tail);
                     self.current = head;

@@ -2,6 +2,37 @@ use arinsal_difftest::{CallResult, RefErl};
 use arinsal_vm::Vm;
 
 #[test]
+fn small_iolists_match_otp_at_heap_binary_and_walk_boundaries() {
+    let reference = RefErl::start().expect("OTP 29 reference");
+    let source = r#"
+-module(small_iolist_fill).
+-export([run/0]).
+convert(F, X) -> try F(X) catch error:R -> {error, R} end.
+run() ->
+    Inputs = lists:append([[lists:duplicate(N, 173),
+        [<<1,2,3>>, [lists:duplicate(N, 97)], <<255>>],
+        [lists:duplicate(N, 97) | <<3,4,5>>],
+        [lists:duplicate(N, 97), bad],
+        [lists:duplicate(N, 97), <<1:3>>]] || N <- lists:seq(0, 70)]),
+    [{convert(fun erlang:iolist_to_binary/1, X),
+      convert(fun erlang:list_to_binary/1, X),
+      convert(fun binary:list_to_bin/1, X)} || X <-
+        [[], <<>>, <<1:3>>, [<<1,2,3>>], [256], [-1], [0|1] | Inputs]].
+"#;
+    let beam = reference
+        .compile_named("small_iolist_fill", source, &[])
+        .unwrap();
+    reference.load("small_iolist_fill", &beam).unwrap();
+    let expected = reference.call("small_iolist_fill", "run", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("small_iolist_fill", "run", &[], 1, None)
+        .unwrap();
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
+}
+
+#[test]
 fn large_iolist_conversion_and_size_match_otp_after_yields() {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping large iolist differential test");

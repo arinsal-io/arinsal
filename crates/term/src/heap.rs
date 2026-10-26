@@ -845,17 +845,7 @@ impl HeapBinaryWriter {
         if end > self.bytes {
             return Err(TermError::BadArg);
         }
-        let reservation = HeapReservation::resume(
-            heap,
-            std::mem::replace(
-                &mut self.reservation,
-                HeapReservationState {
-                    cur: 0,
-                    end: 0,
-                    allocator: 0,
-                },
-            ),
-        );
+        assert_eq!(heap.allocator_identity(), self.reservation.allocator);
         let start = (self.term.0 & !7) as *mut u64;
         let mut input = 0;
         while input < chunk.len() {
@@ -869,17 +859,13 @@ impl HeapBinaryWriter {
                     .expect("eight bytes remain in the chunk");
                 store(word, u64::from_le_bytes(bytes));
             } else {
-                let mut value = load(word);
-                for (index, byte) in chunk[input..input + count].iter().copied().enumerate() {
-                    let shift = (in_word + index) * 8;
-                    value = (value & !(0xff_u64 << shift)) | (u64::from(byte) << shift);
-                }
-                store(word, value);
+                let mut bytes = load(word).to_le_bytes();
+                bytes[in_word..in_word + count].copy_from_slice(&chunk[input..input + count]);
+                store(word, u64::from_le_bytes(bytes));
             }
             input += count;
         }
         self.written = end;
-        self.reservation = reservation.suspend();
         Ok(())
     }
 
