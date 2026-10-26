@@ -1290,6 +1290,15 @@ struct CmpArrayPair<'a> {
     right: CmpArray<'a>,
 }
 
+enum CmpWork<'a> {
+    Word(u64),
+    Array {
+        pair: CmpArrayPair<'a>,
+        start: usize,
+        exact: bool,
+    },
+}
+
 struct CmpHashmapState {
     left: crate::hamt::PairIter,
     right: crate::hamt::PairIter,
@@ -1299,7 +1308,6 @@ struct CmpHashmapState {
     min_key: Option<Term>,
     was_exact: bool,
     rollback: usize,
-    arrays_rollback: usize,
 }
 
 struct CmpFlatmapAtomValuesState {
@@ -1313,7 +1321,6 @@ struct CmpFlatmapAtomValuesState {
     cmp_res: Ordering,
     exact: bool,
     rollback: usize,
-    arrays_rollback: usize,
 }
 
 // Map frames are held in a Vec so this large iterator state stays off the hot comparison frame;
@@ -1329,22 +1336,18 @@ enum CmpAction {
     Return(Ordering),
 }
 
-// Port of the WSTACK work words in utils.c:1658-2735; typed array views are
-// referenced by LIFO indices so the work stack never stores or dereferences raw pointers.
 // Port of WSTACK_DECLARE(stack) and PSTACK_DECLARE(map_stack, 1) in
-// erts/emulator/beam/utils.c:1688-1701, OTP-29.1.1. Work words and the first array view
-// stay inline for the common shallow compound case; deeper map state grows only on demand.
+// erts/emulator/beam/utils.c:1688-1701, OTP-29.1.1. Tagged continuation entries and terms share
+// one WSTACK; map iterator frames stay in the separate PSTACK.
 // Port of WSTACK_DECLARE/PSTACK_DECLARE in global.h:493-517, OTP-29.1.1.
 struct CmpStack<'a> {
-    words: WorkStack<u64, 16>,
-    arrays: WorkStack<CmpArrayPair<'a>, 2>,
+    work: WorkStack<CmpWork<'a>, 16>,
     map_frames: WorkStack<CmpMapFrame, 1>,
 }
 
 const WORK_OP_MASK: u64 = 0xF;
 const CMP_EXACT_BIT: u64 = 1 << 6;
 const CMP_TERM_OP: u64 = 2;
-const CMP_ARRAY_OP: u64 = 3;
 const CMP_FLATMAP_VALUES_OP: u64 = 4;
 const CMP_FLATMAP_ATOM_KEYS_OP: u64 = 5;
 const CMP_FLATMAP_ATOM_VALUES_START_OP: u64 = 6;
@@ -1359,8 +1362,7 @@ const CMP_HASHMAP_PHASE2_MIN_RIGHT_OP: u64 = 13;
 impl<'a> CmpStack<'a> {
     fn new() -> Self {
         Self {
-            words: WorkStack::new(),
-            arrays: WorkStack::new(),
+            work: WorkStack::new(),
             map_frames: WorkStack::new(),
         }
     }
@@ -1404,23 +1406,19 @@ impl<'a> CmpStack<'a> {
 
     #[inline(always)]
     fn push_terms(&mut self, left: Term, right: Term, exact: bool) {
-        self.words.push(right.bits());
-        self.words.push(left.bits());
-        self.words.push(Self::op_word(CMP_TERM_OP, exact));
+        self.work.push(CmpWork::Word(right.bits()));
+        self.work.push(CmpWork::Word(left.bits()));
+        self.work
+            .push(CmpWork::Word(Self::op_word(CMP_TERM_OP, exact)));
     }
 
     #[inline(always)]
     fn push_array(&mut self, left: CmpArray<'a>, right: CmpArray<'a>, start: usize, exact: bool) {
-        let index = self.arrays.len();
-        self.arrays.push(CmpArrayPair { left, right });
-        self.push_array_index(index, start, exact);
-    }
-
-    #[inline(always)]
-    fn push_array_index(&mut self, index: usize, start: usize, exact: bool) {
-        self.words.push(index as u64);
-        self.words.push(start as u64);
-        self.words.push(Self::op_word(CMP_ARRAY_OP, exact));
+        self.work.push(CmpWork::Array {
+            pair: CmpArrayPair { left, right },
+            start,
+            exact,
+        });
     }
 
     #[inline(always)]
@@ -1432,11 +1430,12 @@ impl<'a> CmpStack<'a> {
         end: usize,
         exact: bool,
     ) {
-        self.words.push(right_map.bits());
-        self.words.push(left_map.bits());
-        self.words.push(start as u64);
-        self.words.push(end as u64);
-        self.words.push(Self::op_word(CMP_FLATMAP_VALUES_OP, exact));
+        self.work.push(CmpWork::Word(right_map.bits()));
+        self.work.push(CmpWork::Word(left_map.bits()));
+        self.work.push(CmpWork::Word(start as u64));
+        self.work.push(CmpWork::Word(end as u64));
+        self.work
+            .push(CmpWork::Word(Self::op_word(CMP_FLATMAP_VALUES_OP, exact)));
     }
 
     #[inline(always)]
@@ -1451,12 +1450,14 @@ impl<'a> CmpStack<'a> {
         if remaining == 0 {
             return;
         }
-        self.words.push(right_map.bits());
-        self.words.push(left_map.bits());
-        self.words.push(start as u64);
-        self.words.push(remaining as u64);
-        self.words
-            .push(Self::op_word(CMP_FLATMAP_ATOM_VALUES_START_OP, exact));
+        self.work.push(CmpWork::Word(right_map.bits()));
+        self.work.push(CmpWork::Word(left_map.bits()));
+        self.work.push(CmpWork::Word(start as u64));
+        self.work.push(CmpWork::Word(remaining as u64));
+        self.work.push(CmpWork::Word(Self::op_word(
+            CMP_FLATMAP_ATOM_VALUES_START_OP,
+            exact,
+        )));
     }
 
     #[inline(always)]
@@ -1470,19 +1471,19 @@ impl<'a> CmpStack<'a> {
         if count == 0 {
             return;
         }
-        self.words.push(right_map.bits());
-        self.words.push(left_map.bits());
-        self.words.push(start as u64);
-        self.words.push(count as u64);
-        self.words
-            .push(Self::op_word(CMP_FLATMAP_ATOM_KEYS_OP, true));
+        self.work.push(CmpWork::Word(right_map.bits()));
+        self.work.push(CmpWork::Word(left_map.bits()));
+        self.work.push(CmpWork::Word(start as u64));
+        self.work.push(CmpWork::Word(count as u64));
+        self.work
+            .push(CmpWork::Word(Self::op_word(CMP_FLATMAP_ATOM_KEYS_OP, true)));
     }
 
     #[inline(always)]
     fn push_map_operation(&mut self, operation: u64, exact: bool) {
-        self.words.push(Self::op_word(operation, exact));
-        let rollback = self.words.len();
-        let arrays_rollback = self.arrays.len();
+        self.work
+            .push(CmpWork::Word(Self::op_word(operation, exact)));
+        let rollback = self.work.len();
         match self
             .map_frames
             .last_mut()
@@ -1490,11 +1491,9 @@ impl<'a> CmpStack<'a> {
         {
             CmpMapFrame::Hashmap(state) => {
                 state.rollback = rollback;
-                state.arrays_rollback = arrays_rollback;
             }
             CmpMapFrame::FlatmapAtomValues(state) => {
                 state.rollback = rollback;
-                state.arrays_rollback = arrays_rollback;
             }
         }
     }
@@ -1517,7 +1516,6 @@ impl<'a> CmpStack<'a> {
             min_key: None,
             was_exact: exact,
             rollback: 0,
-            arrays_rollback: self.arrays.len(),
         }));
         self.push_map_operation(CMP_HASHMAP_PHASE1_KEYS_OP, true);
         CmpAction::Compare(left_key, right_key, true)
@@ -1620,28 +1618,39 @@ impl<'a> CmpStack<'a> {
                 let Some(state) = self.map_frames.last() else {
                     return CmpAction::Return(result);
                 };
-                let (rollback, arrays_rollback) = match state {
-                    CmpMapFrame::Hashmap(state) => (state.rollback, state.arrays_rollback),
-                    CmpMapFrame::FlatmapAtomValues(state) => {
-                        (state.rollback, state.arrays_rollback)
-                    }
+                let rollback = match state {
+                    CmpMapFrame::Hashmap(state) => state.rollback,
+                    CmpMapFrame::FlatmapAtomValues(state) => state.rollback,
                 };
-                self.words.truncate(rollback);
-                self.arrays.truncate(arrays_rollback);
+                self.work.truncate(rollback);
             }
 
-            let Some(word) = self.words.pop() else {
+            let Some(entry) = self.work.pop() else {
                 return CmpAction::Return(result);
+            };
+            let word = match entry {
+                CmpWork::Array { pair, start, exact } => {
+                    let action = self.resume_array(pair, start, exact);
+                    match action {
+                        CmpAction::Compare(left, right, next_exact) => {
+                            return CmpAction::Compare(left, right, next_exact);
+                        }
+                        CmpAction::Return(next_result) => {
+                            result = next_result;
+                            continue;
+                        }
+                    }
+                }
+                CmpWork::Word(word) => word,
             };
             let operation = (word >> WORK_OP_SHIFT) & WORK_OP_MASK;
             let exact = word & CMP_EXACT_BIT != 0;
             let action = match operation {
                 CMP_TERM_OP => {
-                    let left = Term(self.words.pop().expect("left term is present"));
-                    let right = Term(self.words.pop().expect("right term is present"));
+                    let left = Term(self.pop_word());
+                    let right = Term(self.pop_word());
                     return CmpAction::Compare(left, right, exact);
                 }
-                CMP_ARRAY_OP => self.resume_array(exact),
                 CMP_FLATMAP_VALUES_OP => self.resume_flatmap_values(exact),
                 CMP_FLATMAP_ATOM_KEYS_OP => self.resume_flatmap_atom_keys(),
                 CMP_FLATMAP_ATOM_VALUES_START_OP => self.start_flatmap_atom_values(exact),
@@ -1663,28 +1672,23 @@ impl<'a> CmpStack<'a> {
         }
     }
 
-    fn resume_array(&mut self, exact: bool) -> CmpAction {
-        let start = self.words.pop().expect("array start is present") as usize;
-        let array_index = self.words.pop().expect("array handle is present") as usize;
-        let (result, len) = {
-            let pair = &self.arrays[array_index];
-            (
-                first_cmp_unequal(&pair.left, &pair.right, start),
-                pair.left.len(),
-            )
-        };
+    fn pop_word(&mut self) -> u64 {
+        match self.work.pop().expect("comparison work word is present") {
+            CmpWork::Word(word) => word,
+            CmpWork::Array { .. } => unreachable!("array continuation is a work entry"),
+        }
+    }
+
+    fn resume_array(&mut self, pair: CmpArrayPair<'a>, start: usize, exact: bool) -> CmpAction {
+        let len = pair.left.len();
+        let result = first_cmp_unequal(&pair.left, &pair.right, start);
         match result {
             Err(order) => CmpAction::Return(order),
-            Ok(None) => {
-                self.arrays.truncate(array_index);
-                CmpAction::Return(Ordering::Equal)
-            }
+            Ok(None) => CmpAction::Return(Ordering::Equal),
             Ok(Some((index, left, right))) => {
                 let next = index + 1;
                 if next < len {
-                    self.push_array_index(array_index, next, exact);
-                } else {
-                    self.arrays.truncate(array_index);
+                    self.push_array(pair.left, pair.right, next, exact);
                 }
                 CmpAction::Compare(left, right, exact)
             }
@@ -1692,10 +1696,10 @@ impl<'a> CmpStack<'a> {
     }
 
     fn resume_flatmap_values(&mut self, exact: bool) -> CmpAction {
-        let end = self.words.pop().expect("array end is present") as usize;
-        let start = self.words.pop().expect("array start is present") as usize;
-        let left_map = Term(self.words.pop().expect("left map is present"));
-        let right_map = Term(self.words.pop().expect("right map is present"));
+        let end = self.pop_word() as usize;
+        let start = self.pop_word() as usize;
+        let left_map = Term(self.pop_word());
+        let right_map = Term(self.pop_word());
         match first_cmp_flatmap_values(left_map, right_map, start, end, exact, self) {
             Err(order) => CmpAction::Return(order),
             Ok(None) => CmpAction::Return(Ordering::Equal),
@@ -1704,10 +1708,10 @@ impl<'a> CmpStack<'a> {
     }
 
     fn resume_flatmap_atom_keys(&mut self) -> CmpAction {
-        let count = self.words.pop().expect("atom count is present") as usize;
-        let start = self.words.pop().expect("array start is present") as usize;
-        let left_map = Term(self.words.pop().expect("left map is present"));
-        let right_map = Term(self.words.pop().expect("right map is present"));
+        let count = self.pop_word() as usize;
+        let start = self.pop_word() as usize;
+        let left_map = Term(self.pop_word());
+        let right_map = Term(self.pop_word());
         let order = crate::hamt::with_flatmap_arrays(left_map, |left_keys, _| {
             crate::hamt::with_flatmap_arrays(right_map, |right_keys, _| {
                 flatmap_atom_key_cmp(left_keys, right_keys, start, count)
@@ -1719,10 +1723,10 @@ impl<'a> CmpStack<'a> {
     }
 
     fn start_flatmap_atom_values(&mut self, exact: bool) -> CmpAction {
-        let count = self.words.pop().expect("atom count is present") as usize;
-        let start = self.words.pop().expect("array start is present") as usize;
-        let left_map = Term(self.words.pop().expect("left map is present"));
-        let right_map = Term(self.words.pop().expect("right map is present"));
+        let count = self.pop_word() as usize;
+        let start = self.pop_word() as usize;
+        let left_map = Term(self.pop_word());
+        let right_map = Term(self.pop_word());
         self.map_frames
             .push(CmpMapFrame::FlatmapAtomValues(CmpFlatmapAtomValuesState {
                 left_map,
@@ -1735,7 +1739,6 @@ impl<'a> CmpStack<'a> {
                 cmp_res: Ordering::Equal,
                 exact,
                 rollback: 0,
-                arrays_rollback: self.arrays.len(),
             }));
         self.start_next_flatmap_atom_value()
     }
@@ -2350,24 +2353,26 @@ fn exact_eq_mixed_map_layouts(left: Term, right: Term) -> Option<Vec<(Term, Term
     Some(values)
 }
 
-// Port of erts/emulator/beam/utils.c:1488-1523 (eq's term_array continuation), OTP-29.1.1.
-// erts pushes (remaining count, bb+1, aa+1|TAG_PRIMARY_HEADER) and tells the three words
-// from a term pair by the header tag. Here the remaining halves of both arrays are a typed
-// pair of slices and the work word is only the marker.
+// Port of erts/emulator/beam/utils.c:1125-1523 (eq), OTP-29.1.1. Array continuation entries
+// share one WSTACK with tagged terms; hashmap iterators remain on their separate PSTACK.
 struct EqHashmapIterPair {
     left: crate::hamt::PairIter,
     right: crate::hamt::PairIter,
 }
 
 struct EqStack<'a> {
-    words: WorkStack<u64, 16>,
+    work: WorkStack<EqWork<'a>, 16>,
     // PSTACK of one entry in erts: a hashmap comparison is rare and walks a whole HAMT.
     hashmaps: WorkStack<EqHashmapIterPair, 1>,
-    arrays: WorkStack<EqArrayCont<'a>, 1>,
 }
 
-/// Where the elements of a `term_array` come from; the work words carry the owning terms and
-/// the position, as erts' carry the two element pointers.
+enum EqWork<'a> {
+    Word(u64),
+    Array(EqArrayCont<'a>),
+}
+
+/// Where the elements of a `term_array` come from; this is the safe tagged equivalent of erts'
+/// `aa+1|TAG_PRIMARY_HEADER` continuation word and its two following stack words.
 #[derive(Clone, Copy)]
 enum EqArrayCont<'a> {
     Slices {
@@ -2386,24 +2391,20 @@ impl<'a> EqStack<'a> {
     #[inline(always)]
     fn new() -> Self {
         Self {
-            words: WorkStack::new(),
+            work: WorkStack::new(),
             hashmaps: WorkStack::new(),
-            arrays: WorkStack::new(),
         }
     }
 
     #[inline(always)]
     fn push_terms(&mut self, left: Term, right: Term) {
-        self.words.push(right.bits());
-        self.words.push(left.bits());
+        self.work.push(EqWork::Word(right.bits()));
+        self.work.push(EqWork::Word(left.bits()));
     }
 
     #[inline(always)]
     fn push_array(&mut self, continuation: EqArrayCont<'a>) {
-        let index = self.arrays.len();
-        self.arrays.push(continuation);
-        self.words.push(index as u64);
-        self.words.push(EQ_TUPLE_OP << WORK_OP_SHIFT);
+        self.work.push(EqWork::Array(continuation));
     }
 
     #[inline(always)]
@@ -2418,13 +2419,12 @@ impl<'a> EqStack<'a> {
 
     #[inline(always)]
     fn push_hashmap_index(&mut self, index: usize) {
-        self.words.push(index as u64);
-        self.words.push(eq_hashmap_op());
+        self.work.push(EqWork::Word(index as u64));
+        self.work.push(EqWork::Word(eq_hashmap_op()));
     }
 }
 
 const WORK_OP_SHIFT: u32 = 2;
-const EQ_TUPLE_OP: u64 = 1;
 const EQ_HASHMAP_OP: u64 = 3;
 
 // Port of `primary_tag` and boxed-header dispatch in utils.c:1133-1190,
@@ -2729,63 +2729,70 @@ fn eq(a: Term, b: Term) -> bool {
         }
         // `pop_next:`
         loop {
-            let Some(word) = pending.words.pop() else {
+            let Some(entry) = pending.work.pop() else {
                 return true;
+            };
+            if let EqWork::Array(continuation) = entry {
+                let result = match continuation {
+                    EqArrayCont::Slices { left, right, start } => {
+                        eq_term_array(left, right, start, |next| {
+                            pending.push_array(EqArrayCont::Slices {
+                                left,
+                                right,
+                                start: next,
+                            })
+                        })
+                    }
+                    EqArrayCont::FlatmapValues { left, right, start } => {
+                        crate::hamt::with_flatmap_arrays(left, |_, left_values| {
+                            crate::hamt::with_flatmap_arrays(right, |_, right_values| {
+                                eq_term_array(left_values, right_values, start, |next| {
+                                    pending.push_array(EqArrayCont::FlatmapValues {
+                                        left,
+                                        right,
+                                        start: next,
+                                    })
+                                })
+                            })
+                            .expect("right map is a live flatmap")
+                        })
+                        .expect("left map is a live flatmap")
+                    }
+                };
+                match result {
+                    EqScan::Equal => continue,
+                    EqScan::NotEqual => return false,
+                    EqScan::Next(x, y) => {
+                        a = x;
+                        b = y;
+                        break;
+                    }
+                }
+            }
+            let EqWork::Word(word) = entry else {
+                unreachable!("array continuation was handled above")
             };
             if !is_work_op(word) {
                 a = Term(word);
-                b = Term(pending.words.pop().expect("term pair is complete"));
+                let EqWork::Word(right) = pending.work.pop().expect("term pair is complete") else {
+                    unreachable!("term pair consists of words")
+                };
+                b = Term(right);
                 if a == b {
                     continue;
                 }
                 break;
             }
             match word >> WORK_OP_SHIFT {
-                EQ_TUPLE_OP => {
-                    let index = pending.words.pop().expect("array continuation index") as usize;
-                    let continuation = pending.arrays[index];
-                    let result = match continuation {
-                        EqArrayCont::Slices { left, right, start } => {
-                            eq_term_array(left, right, start, |next| {
-                                pending.push_array(EqArrayCont::Slices {
-                                    left,
-                                    right,
-                                    start: next,
-                                })
-                            })
-                        }
-                        EqArrayCont::FlatmapValues { left, right, start } => {
-                            crate::hamt::with_flatmap_arrays(left, |_, left_values| {
-                                crate::hamt::with_flatmap_arrays(right, |_, right_values| {
-                                    eq_term_array(left_values, right_values, start, |next| {
-                                        pending.push_array(EqArrayCont::FlatmapValues {
-                                            left,
-                                            right,
-                                            start: next,
-                                        })
-                                    })
-                                })
-                                .expect("right map is a live flatmap")
-                            })
-                            .expect("left map is a live flatmap")
-                        }
-                    };
-                    match result {
-                        EqScan::Equal => continue,
-                        EqScan::NotEqual => return false,
-                        EqScan::Next(x, y) => {
-                            a = x;
-                            b = y;
-                            break;
-                        }
-                    }
-                }
                 EQ_HASHMAP_OP => {
-                    let index = pending
-                        .words
+                    let EqWork::Word(index) = pending
+                        .work
                         .pop()
                         .expect("hashmap iterator handle is present")
-                        as usize;
+                    else {
+                        unreachable!("hashmap iterator handle is a word")
+                    };
+                    let index = index as usize;
                     let (left_pair, right_pair) = {
                         let iterators = &mut pending.hashmaps[index];
                         (iterators.left.next(), iterators.right.next())
