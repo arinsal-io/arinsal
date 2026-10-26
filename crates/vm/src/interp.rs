@@ -2277,6 +2277,21 @@ impl Vm {
                                 depth = p.heap.stack_words();
                                 heap_dirty = false;
                             }
+                            // A module without an interpreter form runs the traced function
+                            // natively, as the export's breakpoint stub jumps to its code in erts.
+                            if matches!(module.code.get(target), Some(Instr::CodeEnd))
+                                && let Some(native) = self.beamasm_targets.function_for_target(
+                                    module_id,
+                                    &self.code.modules[module_id],
+                                    crate::load::native_code_range(&self.code.code_meta, module_id),
+                                    target,
+                                )
+                            {
+                                sync_cursor(p, htop, &mut heap_dirty);
+                                p.native_pc = Some(native.start);
+                                p.cold_mut().native_transfer = true;
+                                return Ok(RunState::Yield);
+                            }
                             let Some(target) = module.code.get(target) else {
                                 return Err(VmError::Unsupported("export trace target".into()));
                             };
