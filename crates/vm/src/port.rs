@@ -315,11 +315,8 @@ impl<V> SmallMap<V> {
     pub(crate) fn remove(&mut self, key: &u64) -> Option<V> {
         let entries = self.0.as_mut()?;
         let index = entries.iter().position(|entry| entry.0 == *key)?;
-        let removed = entries.swap_remove(index).1;
-        if entries.is_empty() {
-            self.0 = None;
-        }
-        Some(removed)
+        // The emptied vector is kept: a port that is monitored once is monitored again.
+        Some(entries.swap_remove(index).1)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&u64, &V)> {
@@ -333,9 +330,6 @@ impl<V> SmallMap<V> {
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&u64, &mut V) -> bool) {
         if let Some(entries) = self.0.as_mut() {
             entries.retain_mut(|entry| keep(&entry.0, &mut entry.1));
-            if entries.is_empty() {
-                self.0 = None;
-            }
         }
     }
 }
@@ -940,7 +934,11 @@ impl PortHandle {
     }
 }
 
-fn atom(s: &str) -> Term {
+fn atom(s: &'static str) -> Term {
+    crate::atom_cache::atom(s)
+}
+
+fn atom_dyn(s: &str) -> Term {
     Term::atom(global_atoms().intern(s).expect("built-in atom"))
 }
 fn badarg() -> VmError {
@@ -1751,7 +1749,7 @@ fn start(
     if executable
         && let Err(error) = rustix::fs::access(&child_program, rustix::fs::Access::EXEC_OK)
     {
-        return Ok(atom(&arinsal_drv::errno_id(error.raw_os_error())));
+        return Ok(atom_dyn(&arinsal_drv::errno_id(error.raw_os_error())));
     }
     let setup = child_setup_payload(
         executable,
@@ -1781,7 +1779,7 @@ fn start(
                 // erts/emulator/sys/unix/sys_drivers.c:471-501 (spawn_start), OTP-29.1.1.
                 // OS launch failures return their errno atom; badarg is reserved for invalid
                 // open_port arguments. In particular, a full descriptor table is `emfile`.
-                return Ok(atom(&arinsal_drv::errno_id(errno)));
+                return Ok(atom_dyn(&arinsal_drv::errno_id(errno)));
             }
             return Err(badarg());
         }
@@ -1968,7 +1966,7 @@ fn start_dyn_driver(
         // Port of erts/emulator/beam/erl_bif_port.c:69-89 (open_port error atoms).
         return Ok(match error {
             arinsal_drv::StartError::General => atom("einval"),
-            arinsal_drv::StartError::Errno(errno) => atom(&arinsal_drv::errno_id(errno)),
+            arinsal_drv::StartError::Errno(errno) => atom_dyn(&arinsal_drv::errno_id(errno)),
             arinsal_drv::StartError::Badarg => atom("badarg"),
         });
     }
@@ -1979,7 +1977,7 @@ fn start_dyn_driver(
             port_id,
             crate::trace::PORTS,
             "open",
-            &[caller, atom(&name)],
+            &[caller, atom_dyn(&name)],
         );
         crate::trace::emit_port_event(
             runtime,
@@ -2130,7 +2128,7 @@ impl arinsal_drv::PortHost for DrvHost {
             arinsal_drv::ExitReason::Code(code) => {
                 Term::small(i64::from(code)).unwrap_or_else(|| atom("normal"))
             }
-            arinsal_drv::ExitReason::Atom(name) => atom(&name),
+            arinsal_drv::ExitReason::Atom(name) => atom_dyn(&name),
         };
         driver_port_exit(runtime, port.id(), reason);
     }
@@ -2419,7 +2417,7 @@ impl arinsal_drv::PortHost for DrvHost {
         };
         let result = match reply {
             arinsal_drv::InitAck::Opened => Ok(()),
-            arinsal_drv::InitAck::Failed(error) => Err(atom(&match error {
+            arinsal_drv::InitAck::Failed(error) => Err(atom_dyn(&match error {
                 arinsal_drv::StartError::General => "einval".to_owned(),
                 arinsal_drv::StartError::Errno(errno) => arinsal_drv::errno_id(errno),
                 arinsal_drv::StartError::Badarg => "badarg".to_owned(),
@@ -3640,7 +3638,7 @@ fn worker(
                 }
             }
             if let Some(errno) = failure {
-                let reason = atom(&arinsal_drv::errno_id(errno));
+                let reason = atom_dyn(&arinsal_drv::errno_id(errno));
                 send_open_reply(&handle, Err(reason));
                 crate::trace::emit_port_event(
                     runtime,
@@ -3989,6 +3987,30 @@ pub(crate) fn port_close_light(
     }
     let caller = process.self_pid?;
     light_result(port_close(process, None, caller, *port))
+}
+
+/// `erlang:port_get_data/1` called from the generated code with `c_p` only.
+// Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
+pub(crate) fn port_get_data_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [port] = args else {
+        return None;
+    };
+    light_result(port_get_data(process, *port))
+}
+
+/// `erlang:port_set_data/2` called from the generated code with `c_p` only.
+// Port of erts/emulator/beam/erl_bif_port.c:687 (port_set_data_2), OTP-29.1.1.
+pub(crate) fn port_set_data_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [port, data] = args else {
+        return None;
+    };
+    light_result(port_set_data(process, *port, *data))
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
@@ -4511,7 +4533,7 @@ fn trace_port_receive_indexed_rt(
     else {
         return;
     };
-    let Ok(message) = TermBuilder::new(&mut heap).tuple(&[atom(name), arg]) else {
+    let Ok(message) = TermBuilder::new(&mut heap).tuple(&[atom_dyn(name), arg]) else {
         return;
     };
     let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, message]) else {
