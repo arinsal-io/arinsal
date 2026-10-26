@@ -528,6 +528,45 @@ impl CodeIndexes {
         result
     }
 
+    /// [`intern_fun_entry`](Self::intern_fun_entry) for every lambda slot of a module with one
+    /// copy of the fun table, as `erts_fun_entry_put` puts all of a module's funs into the
+    /// staged table.
+    pub(crate) fn intern_module_fun_entries(&self, module: &mut arinsal_loader::Module) {
+        if module.funs.is_empty() {
+            return;
+        }
+        let nested = self.seize(true);
+        let (work, ended) = {
+            let mut permission = self.lock_permission();
+            let ended = permission.ended.is_some();
+            (
+                (nested || ended).then(|| permission.work.take()).flatten(),
+                ended,
+            )
+        };
+        match work {
+            Some(mut work) if !ended => {
+                work.intern_fun_entries(module);
+                self.lock_permission().work = Some(work);
+            }
+            mut work => {
+                if let Some(staging) = work.as_mut() {
+                    staging.intern_fun_entries(module);
+                }
+                let mut tables = CodeTables::clone(&self.tables[self.active()].load());
+                tables.intern_fun_entries(module);
+                self.tables[self.active()].store(Arc::new(tables));
+                if let Some(mut staging) = work {
+                    for slot in &module.funs {
+                        staging.intern_fun_entry(Arc::clone(&slot.entry));
+                    }
+                    self.lock_permission().work = Some(staging);
+                }
+            }
+        }
+        self.release();
+    }
+
     /// Applies a change of code memory, which every code index shares (breakpoints and NIF
     /// bodies are patched in place in erts), to the active tables and an open staging area.
     pub(crate) fn patch_all(&self, mut change: impl FnMut(&mut CodeTables)) {

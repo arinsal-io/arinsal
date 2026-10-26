@@ -885,9 +885,7 @@ impl Vm {
     /// Gives prepared native code the node-canonical entries that the staged module will use.
     // Port of erts/emulator/beam/jit/asm_load.c:1218 (erts_fun_entry_put), OTP-29.1.1.
     pub(crate) fn intern_prepared_fun_entries(&self, module: &mut Module) {
-        for slot in &mut module.funs {
-            slot.entry = self.code_ix.intern_fun_entry(Arc::clone(&slot.entry));
-        }
+        self.code_ix.intern_module_fun_entries(module);
     }
 
     /// Compiles `module` with BeamAsm into `meta` when `bytes` are known.
