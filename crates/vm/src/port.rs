@@ -502,9 +502,6 @@ pub(crate) fn test_next_port_id(
     )
 }
 
-/// Slots per lazily materialized page of the port table.
-const PORT_PAGE_SIZE: usize = 1024;
-
 type PortSlot = arinsal_sched::ProgressSlot<PortHandle>;
 
 /// The port table (`erts_port` ptab): an array indexed by the port id's table index bits
@@ -516,7 +513,8 @@ type PortSlot = arinsal_sched::ProgressSlot<PortHandle>;
 /// erts_ptab_delete_element), OTP-29.1.1.
 pub(crate) struct PortTable {
     list: std::sync::RwLock<()>,
-    pages: Vec<OnceLock<Box<[PortSlot]>>>,
+    /// One slot per table index, allocated once (`erts_ptab_init_table`).
+    slots: Box<[PortSlot]>,
     /// `ptab->r.o.pix_mask`.
     pix_mask: usize,
     /// The thread progress domain that frees removed elements, attached when the scheduler
@@ -534,10 +532,12 @@ impl Default for PortTable {
 
 impl PortTable {
     pub(crate) fn new(layout: arinsal_term::ptab::PtabLayout) -> Self {
-        let pages = (layout.max() as usize).div_ceil(PORT_PAGE_SIZE);
+        let slots = (0..layout.max() as usize)
+            .map(|_| arinsal_sched::ProgressSlot::new())
+            .collect();
         Self {
             list: std::sync::RwLock::new(()),
-            pages: (0..pages).map(|_| OnceLock::new()).collect(),
+            slots,
             pix_mask: layout.max() as usize - 1,
             progress: OnceLock::new(),
             interval: std::sync::atomic::AtomicU64::new(0),
@@ -562,8 +562,7 @@ impl PortTable {
     }
 
     fn slot_at(&self, pix: usize) -> Option<&PortSlot> {
-        let page = self.pages.get(pix / PORT_PAGE_SIZE)?.get()?;
-        Some(&page[pix % PORT_PAGE_SIZE])
+        self.slots.get(pix)
     }
 
     /// `erts_port_lookup_raw`'s slot: `internal_port_index(id)` is the mask of the identifier's
@@ -649,12 +648,7 @@ impl PortTable {
         let started = self.interval.load(Ordering::Acquire);
         handle.started_interval.store(started, Ordering::Release);
         let pix = arinsal_term::ptab::port_table_layout().data2pix(id) as usize;
-        let page = self.pages[pix / PORT_PAGE_SIZE].get_or_init(|| {
-            (0..PORT_PAGE_SIZE)
-                .map(|_| arinsal_sched::ProgressSlot::new())
-                .collect()
-        });
-        page[pix % PORT_PAGE_SIZE].store(handle, self.progress.get());
+        self.slots[pix].store(handle, self.progress.get());
     }
 
     /// Clear the slot of port `id` and return its handle.
@@ -693,10 +687,10 @@ impl PortTable {
         let Some(progress) = self.progress.get() else {
             return Vec::new();
         };
-        self.pages
+        // erts_ptab_list reads every index and skips the empty ones after the one load.
+        self.slots
             .iter()
-            .filter_map(OnceLock::get)
-            .flat_map(|page| page.iter())
+            .filter(|slot| slot.is_occupied())
             .filter_map(|slot| slot.load_arc(progress, false))
             .collect()
     }
@@ -741,6 +735,7 @@ impl PortPtabListSnapshot {
             let Some(handle) = self
                 .table
                 .slot_at(index as usize)
+                .filter(|slot| slot.is_occupied())
                 .and_then(|slot| slot.load_arc(progress, false))
             else {
                 continue;
