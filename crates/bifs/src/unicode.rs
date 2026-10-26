@@ -144,6 +144,7 @@ fn binary_need(term: Term, encoding: Encoding) -> Result<usize, BifError> {
     }
 }
 
+// Port of erts/emulator/beam/erl_unicode.c:342-506 (utf8_need), OTP-29.1.1.
 fn check_structure(root: Term, encoding: Encoding) -> Result<Utf8Need, BifError> {
     if root != Term::NIL && !matches!(root.classify(), TermKind::List | TermKind::Bitstring) {
         return Err(BifError::BADARG);
@@ -152,65 +153,84 @@ fn check_structure(root: Term, encoding: Encoding) -> Result<Utf8Need, BifError>
     let mut cost = 0;
     let mut stack = SmallVec::<[Term; 8]>::new();
     let mut current = root;
+    let mut next_cell = None;
     loop {
-        match current.classify() {
-            TermKind::Nil => {
-                if let Some(next) = stack.pop() {
-                    current = next;
-                } else {
+        let (head, tail) = if let Some(cell) = next_cell.take() {
+            cell
+        } else if let Some(cell) = crate::lists::cons_cell(current) {
+            cell
+        } else {
+            match current.classify() {
+                TermKind::Nil => {
+                    if let Some(next) = stack.pop() {
+                        current = next;
+                        continue;
+                    }
                     break;
                 }
-            }
-            TermKind::List => {
-                // SAFETY: The argument heap is live for this BIF call.
-                let (head, tail) = unsafe { current.cons_ref() }.ok_or(BifError::BADARG)?;
-                match head.classify() {
-                    TermKind::Nil => current = tail,
-                    TermKind::List => {
-                        stack.push(tail);
-                        current = head;
-                    }
-                    TermKind::Bitstring => {
-                        let amount = binary_need(head, encoding)?;
-                        need += amount;
-                        cost += if encoding == Encoding::Latin1 {
-                            amount
-                        } else {
-                            1
-                        };
-                        current = tail;
-                    }
-                    TermKind::Number if head.as_small().is_some() => {
-                        let cp = head.as_small().unwrap() as u64;
-                        cost += 1;
-                        need += if cp < 0x80 {
-                            1
-                        } else if cp < 0x800 {
-                            2
-                        } else if cp < 0x10000 {
-                            3
-                        } else {
-                            4
-                        };
-                        current = tail;
-                    }
-                    TermKind::Number => match arinsal_term::to_owned(head) {
-                        Ok(OwnedTerm::BigInt(_)) => return Ok(Utf8Need { bytes: need, cost }),
-                        _ => return Err(BifError::BADARG),
-                    },
-                    _ => return Err(BifError::BADARG),
+                TermKind::Bitstring => {
+                    let amount = binary_need(current, encoding)?;
+                    need += amount;
+                    cost += if encoding == Encoding::Latin1 {
+                        amount
+                    } else {
+                        1
+                    };
+                    current = Term::NIL;
+                    continue;
                 }
+                _ => return Err(BifError::BADARG),
+            }
+        };
+
+        if let Some(mut cp) = head.as_small() {
+            let mut rest = tail;
+            loop {
+                let codepoint = cp as u64;
+                cost += 1;
+                need += if codepoint < 0x80 {
+                    1
+                } else if codepoint < 0x800 {
+                    2
+                } else if codepoint < 0x10000 {
+                    3
+                } else {
+                    4
+                };
+                current = rest;
+                let Some((next_head, next_tail)) = crate::lists::cons_cell(rest) else {
+                    break;
+                };
+                let Some(next_cp) = next_head.as_small() else {
+                    next_cell = Some((next_head, next_tail));
+                    break;
+                };
+                cp = next_cp;
+                rest = next_tail;
+            }
+            continue;
+        }
+
+        match head.classify() {
+            TermKind::Nil => current = tail,
+            TermKind::List => {
+                stack.push(tail);
+                current = head;
             }
             TermKind::Bitstring => {
-                let amount = binary_need(current, encoding)?;
+                let amount = binary_need(head, encoding)?;
                 need += amount;
                 cost += if encoding == Encoding::Latin1 {
                     amount
                 } else {
                     1
                 };
-                current = Term::NIL;
+                current = tail;
             }
+            TermKind::Number => match arinsal_term::to_owned(head) {
+                Ok(OwnedTerm::BigInt(_)) => return Ok(Utf8Need { bytes: need, cost }),
+                _ => return Err(BifError::BADARG),
+            },
             _ => return Err(BifError::BADARG),
         }
     }
@@ -855,30 +875,76 @@ impl BinaryBuild {
         self.pos += bytes.len();
     }
 
+    // Port of erts/emulator/beam/erl_unicode.c:558-603 (small integer branch), OTP-29.1.1.
+    #[inline(always)]
+    fn append_scalar(&mut self, output: &mut [u8], cp: u32) -> bool {
+        if self.encoding == Encoding::Latin1 && cp > 255 {
+            self.error = true;
+            return false;
+        }
+        if cp < 0x80 {
+            output[self.pos] = cp as u8;
+            self.pos += 1;
+        } else if cp < 0x800 {
+            output[self.pos] = ((cp >> 6) as u8) | 0xc0;
+            output[self.pos + 1] = ((cp & 0x3f) as u8) | 0x80;
+            self.pos += 2;
+        } else if cp < 0x10000 {
+            if (0xd800..=0xdfff).contains(&cp) {
+                self.error = true;
+                return false;
+            }
+            output[self.pos] = ((cp >> 12) as u8) | 0xe0;
+            output[self.pos + 1] = (((cp >> 6) as u8) & 0x3f) | 0x80;
+            output[self.pos + 2] = ((cp as u8) & 0x3f) | 0x80;
+            self.pos += 3;
+        } else if cp < 0x110000 {
+            output[self.pos] = ((cp >> 18) as u8) | 0xf0;
+            output[self.pos + 1] = (((cp >> 12) as u8) & 0x3f) | 0x80;
+            output[self.pos + 2] = (((cp >> 6) as u8) & 0x3f) | 0x80;
+            output[self.pos + 3] = ((cp as u8) & 0x3f) | 0x80;
+            self.pos += 4;
+        } else {
+            self.error = true;
+            return false;
+        }
+        true
+    }
+
     // Port of erts/emulator/beam/erl_unicode.c:508-750 (do_build_utf8), OTP-29.1.1.
     fn fill(&mut self, output: &mut [u8], left: &mut i64) {
+        let mut next_cell = None;
         while *left > 0 && !self.error {
-            if let Some((head, tail)) = crate::lists::cons_cell(self.current) {
+            if let Some((head, tail)) = next_cell
+                .take()
+                .or_else(|| crate::lists::cons_cell(self.current))
+            {
                 if let Some(number) = head.as_small() {
-                    let cp = number as u64;
-                    if !self.leftover.is_empty()
-                        || cp >= 0x110000
-                        || (0xd800..=0xdfff).contains(&cp)
-                        || self.encoding == Encoding::Latin1 && cp > 255
-                    {
+                    if !self.leftover.is_empty() {
                         self.error = true;
                         return;
                     }
-                    let mut encoded = [0; 4];
-                    self.append(
-                        output,
-                        char::from_u32(cp as u32)
-                            .unwrap()
-                            .encode_utf8(&mut encoded)
-                            .as_bytes(),
-                    );
-                    *left -= 1;
-                    self.current = tail;
+                    let mut cp = number as u32;
+                    let mut rest = tail;
+                    loop {
+                        if !self.append_scalar(output, cp) {
+                            return;
+                        }
+                        *left -= 1;
+                        self.current = rest;
+                        if *left == 0 {
+                            break;
+                        }
+                        let Some((next_head, next_tail)) = crate::lists::cons_cell(rest) else {
+                            break;
+                        };
+                        let Some(next_number) = next_head.as_small() else {
+                            next_cell = Some((next_head, next_tail));
+                            break;
+                        };
+                        cp = next_number as u32;
+                        rest = next_tail;
+                    }
                 } else if head == Term::NIL {
                     self.current = tail;
                 } else if head.classify() == TermKind::List {
