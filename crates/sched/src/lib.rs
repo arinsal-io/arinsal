@@ -1078,6 +1078,14 @@ impl<M: SignalMessage> SignalProbe<M> {
         self.input().has_pending()
     }
 
+    /// Whether the process is not exiting and has no signal waiting: the state word has none of
+    /// `ERTS_PSFLG_EXITING | SIG_Q | MSG_SIG_IN_Q | NMSG_SIG_IN_Q`, read without a table lookup
+    /// (`ERTS_PROC_HAS_INCOMING_SIGNALS(c_p)`).
+    pub fn is_quiet(&self) -> bool {
+        self.flags().load(Ordering::Acquire) & proc_flags::EXITING == 0
+            && self.input().state().load(Ordering::Acquire) & (psflg::SIG_Q | psflg::SIG_IN_Q) == 0
+    }
+
     /// The process's state flags ([`proc_flags`]), read without a table lookup.
     pub fn proc_flags(&self) -> &AtomicU32 {
         self.flags()
@@ -1216,6 +1224,8 @@ pub mod proc_flags {
 
 struct Process<T: Task> {
     pid: Pid,
+    /// `common.id`: the tagged pid, which a lookup by identifier word compares.
+    word: u64,
     /// Creation order of this incarnation, so a reused pid is distinguishable.
     /// Port of erts/emulator/beam/erl_ptab.c:530 (`u.alive.started_interval`), OTP-29.1.1.
     started_interval: u64,
@@ -1317,6 +1327,8 @@ struct ProcessTable<T: Task> {
     /// `ptab->r.o.tab`: one slot per table index, allocated with the table as
     /// erts_ptab_init_table does. A slot holds the table's reference to its process.
     slots: Box<[AtomicPtr<()>]>,
+    /// `ptab->r.o.pix_mask`.
+    pix_mask: usize,
     /// The thread progress that releases the table's references (erts_ptab_delete_element
     /// schedules the release as a later operation).
     progress: Arc<thr_progress::ThrProgress>,
@@ -1574,6 +1586,7 @@ impl<T: Task> ProcessTable<T> {
             .map(|_| AtomicPtr::new(std::ptr::null_mut()))
             .collect();
         Self {
+            pix_mask: ids.layout().max() as usize - 1,
             ids,
             lock: arinsal_term::FrequentReadRwLock::new(()),
             interval: AtomicU64::new(0),
@@ -1646,6 +1659,10 @@ impl<T: Task> ProcessTable<T> {
             },
             |context| Process {
                 pid: context.pid,
+                word: context
+                    .pid
+                    .to_term()
+                    .map_or(0, arinsal_term::Term::tagged_word),
                 // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
                 // erts_current_interval_nob), OTP-29.1.1.
                 started_interval: context.started_interval,
@@ -1811,6 +1828,20 @@ impl<T: Task> ProcessTable<T> {
             (process.pid == pid).then(|| f(process))
         })
         .flatten()
+    }
+
+    /// [`ProcessTable::with_live_managed`] by the tagged pid word: `internal_pid_index` is the
+    /// mask of the payload (`erts_ptab_id2pix`) and the element's `common.id` is compared with
+    /// the word, as `erts_proc_lookup_raw` does.
+    // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1.
+    fn with_live_managed_word<R>(&self, word: u64, f: impl FnOnce(&ProcRef<T>) -> R) -> Option<R> {
+        debug_assert!(
+            thr_progress::is_managed_thread_of(&self.progress),
+            "a managed lookup runs on a managed thread"
+        );
+        let slot = self.slots.get((word >> 4) as usize & self.pix_mask)?;
+        ProcRef::with_slot_managed(slot, |process| (process.word == word).then(|| f(process)))
+            .flatten()
     }
 
     fn remove(&self, pid: Pid) {
@@ -6344,6 +6375,15 @@ impl<T: Task> Scheduler<T> {
         } else {
             self.inner.table.with_live(pid, check)
         }
+    }
+    /// [`Scheduler::is_quiet_from`] of a managed caller, by the tagged pid word
+    /// (`erts_proc_lookup_raw(pid)` followed by the state test of `is_process_alive_1`).
+    pub fn is_quiet_word(&self, word: u64) -> Option<bool> {
+        self.inner.table.with_live_managed_word(word, |process| {
+            process.exit_flags.load(Ordering::Acquire) & proc_flags::EXITING == 0
+                && process.input.state().load(Ordering::Acquire) & (psflg::SIG_Q | psflg::SIG_IN_Q)
+                    == 0
+        })
     }
     /// The thread progress domain of this scheduler, for tables whose elements are freed after
     /// thread progress ([`ProgressSlot`]).

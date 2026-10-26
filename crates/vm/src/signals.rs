@@ -197,24 +197,17 @@ fn whereis_light_error(process: &mut Process, arg: Term, error: VmError) -> u64 
 /// `BIF_TRAP1` into the executor, which already runs the alive request.
 pub(crate) extern "C" fn is_process_alive_light(
     header: *mut arinsal_beamasm::ProcessHeader,
-    regs: *mut u64,
+    _regs: *mut u64,
     _i: u64,
     _entry: u64,
     identity: u64,
 ) -> u64 {
-    if regs.is_null() {
-        return 0;
-    }
-    // `self_pid` is `BIF_P->common.id`. reg[0] is BIF_ARG_1, the same word in the
-    // scheduler file. The export entry stays in x4.
-    let Some(process) = crate::native_hooks::process_from_header(header) else {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
         return 0;
     };
-    let self_pid = process.header.self_pid;
-    let Some(arg) = process.x.first().copied() else {
-        return 0;
-    };
-    if self_pid != 0 && arg.tagged_word() == self_pid {
+    let arg = registers.x_reg_array[0]; // BIF_ARG_1
+    // erts: `if (BIF_ARG_1 == BIF_P->common.id) BIF_RET(am_true)`, before any table access.
+    if arg.is_pid() && arg.tagged_word() == process.header.self_pid {
         return crate::native_hooks::raw(Term::atom(arinsal_term::atoms::TRUE));
     }
     match alive_fast(process, arg) {
@@ -228,18 +221,35 @@ pub(crate) extern "C" fn is_process_alive_light(
 // Port of erts/emulator/beam/erl_bif_info.c (is_process_alive_1), OTP-29.1.1. Where erts
 // traps out (`is_process_alive_trap`, `ERTS_BIF_HANDLE_SIGNALS_FROM_RETURN`) this returns `None`
 // and the executor runs the alive request, which orders strictly more than erts does.
+#[inline(always)]
 fn alive_fast(process: &Process, arg: Term) -> Option<arinsal_term::Atom> {
-    let pid = Pid::from_term(arg)?;
-    let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
-    let own = process.self_pid?;
-    if scheduler.is_quiet_from(own, process.on_managed) != Some(true) {
+    // erts: `if (is_internal_pid(BIF_ARG_1))`; other arguments take the generic path.
+    if !arg.is_pid() {
         return None;
     }
-    match scheduler.is_quiet_from(pid, process.on_managed) {
-        None => Some(arinsal_term::atoms::FALSE),
-        Some(true) => Some(arinsal_term::atoms::TRUE),
-        Some(false) => None,
-    }
+    let scheduler = process.runtime.as_ref()?.scheduler_if_started()?;
+    // erts: `rp = erts_proc_lookup_raw(pid)`; missing is false, an idle state is true, any
+    // signal state traps to `is_process_alive_trap`.
+    let found = if process.on_managed {
+        scheduler.is_quiet_word(arg.tagged_word())
+    } else {
+        scheduler.is_quiet_from(Pid::from_term(arg)?, false)
+    };
+    let result = match found {
+        None => arinsal_term::atoms::FALSE,
+        Some(true) => arinsal_term::atoms::TRUE,
+        Some(false) => return None,
+    };
+    // erts: `if (ERTS_PROC_HAS_INCOMING_SIGNALS(BIF_P))` reads `c_p->state` after the result.
+    let own_quiet = match process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.signal_probe.as_ref())
+    {
+        Some(probe) => probe.is_quiet(),
+        None => scheduler.is_quiet_from(process.self_pid?, process.on_managed) == Some(true),
+    };
+    own_quiet.then_some(result)
 }
 
 /// `BIF_TRAP1(is_process_alive_trap, ...)`: the fragment context-switches to

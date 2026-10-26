@@ -4696,6 +4696,12 @@ impl Runtime {
         self.aliases.load(id)
     }
 
+    /// The scheduler once it exists; unlike [`Runtime::scheduler`] a missing one builds no error.
+    #[inline]
+    pub(crate) fn scheduler_if_started(&self) -> Option<&Arc<Scheduler<Process>>> {
+        self.scheduler.get()
+    }
+
     pub(crate) fn scheduler(&self) -> Result<&Arc<Scheduler<Process>>, VmError> {
         self.scheduler
             .get()

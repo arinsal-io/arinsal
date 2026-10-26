@@ -329,6 +329,26 @@ impl Term {
     pub const unsafe fn from_raw_bits(bits: u64) -> Self {
         Self(bits)
     }
+    /// Whether this is a local pid (`is_internal_pid`).
+    #[inline]
+    pub const fn is_pid(self) -> bool {
+        self.0 & 15 == 3
+    }
+    /// Whether this is a local port identifier (`is_internal_port`).
+    #[inline]
+    pub const fn is_port(self) -> bool {
+        self.0 & 15 == 7
+    }
+    /// An immediate term from its tagged word, when `bits` is one (primary tag 3). Immediates
+    /// hold no address, so no storage has to outlive the term.
+    #[inline]
+    pub const fn from_immed_word(bits: u64) -> Option<Self> {
+        if bits & 3 == 3 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
     /// Extract a small integer.
     #[inline]
     pub const fn as_small(self) -> Option<i64> {

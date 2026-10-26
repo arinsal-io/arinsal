@@ -464,6 +464,8 @@ struct HandleCold {
 /// State retained for a live child or fd port.
 pub(crate) struct PortHandle {
     id: u64,
+    /// `prt->common.id`: the tagged port identifier, compared by lookups.
+    word: u64,
     started_interval: AtomicU64,
     /// The spawn/fd driver's own data (`prt->drv_data` of sys_drivers.c): set only for ports
     /// with a worker thread.
@@ -524,6 +526,8 @@ type PortSlot = arinsal_sched::ProgressSlot<PortHandle>;
 pub(crate) struct PortTable {
     list: std::sync::RwLock<()>,
     pages: Vec<OnceLock<Box<[PortSlot]>>>,
+    /// `ptab->r.o.pix_mask`.
+    pix_mask: usize,
     /// The thread progress domain that frees removed elements, attached when the scheduler
     /// exists (`erts_schedule_thr_prgr_later_cleanup_op` in `erts_ptab_delete_element`).
     progress: OnceLock<arinsal_sched::Progress>,
@@ -543,6 +547,7 @@ impl PortTable {
         Self {
             list: std::sync::RwLock::new(()),
             pages: (0..pages).map(|_| OnceLock::new()).collect(),
+            pix_mask: layout.max() as usize - 1,
             progress: OnceLock::new(),
             interval: std::sync::atomic::AtomicU64::new(0),
             list_deleted: Mutex::new(arinsal_sched::PtabListLog::default()),
@@ -562,8 +567,42 @@ impl PortTable {
 
     fn slot(&self, id: u64) -> Option<&PortSlot> {
         let pix = arinsal_term::ptab::port_table_layout().data2pix(id) as usize;
+        self.slot_at(pix)
+    }
+
+    fn slot_at(&self, pix: usize) -> Option<&PortSlot> {
         let page = self.pages.get(pix / PORT_PAGE_SIZE)?.get()?;
         Some(&page[pix % PORT_PAGE_SIZE])
+    }
+
+    /// `erts_port_lookup_raw`'s slot: `internal_port_index(id)` is the mask of the identifier's
+    /// payload (`erts_ptab_id2pix`).
+    fn slot_of_word(&self, word: u64) -> Option<&PortSlot> {
+        self.slot_at((word >> 4) as usize & self.pix_mask)
+    }
+
+    /// Run `f` on the live port with the tagged identifier `word`, a managed caller or not
+    /// (`erts_port_lookup_raw`: load the slot, compare `common.id`).
+    pub(crate) fn with_word<R>(
+        &self,
+        word: u64,
+        managed: bool,
+        f: impl FnOnce(&PortHandle) -> R,
+    ) -> Option<R> {
+        let slot = self.slot_of_word(word)?;
+        let found = |handle: &PortHandle| (handle.word == word).then(|| f(handle));
+        if managed {
+            slot.with_managed(found)
+        } else {
+            slot.with(self.progress.get()?, false, found)
+        }
+        .flatten()
+    }
+
+    /// A counted reference to the live port with the tagged identifier `word`.
+    pub(crate) fn get_word(&self, word: u64, managed: bool) -> Option<Arc<PortHandle>> {
+        self.slot_of_word(word)?
+            .load_arc_if(self.progress.get()?, managed, |handle| handle.word == word)
     }
 
     /// Attach the scheduler's thread progress domain: removed ports are freed after it.
@@ -610,10 +649,7 @@ impl PortTable {
     /// Whether any live port occupies table index `pix`.
     fn occupied(&self, pix: u32) -> bool {
         let pix = pix as usize;
-        self.pages
-            .get(pix / PORT_PAGE_SIZE)
-            .and_then(OnceLock::get)
-            .is_some_and(|page| page[pix % PORT_PAGE_SIZE].is_occupied())
+        self.slot_at(pix).is_some_and(PortSlot::is_occupied)
     }
 
     /// Publish a new port in its slot (`erts_ptab_new_element`, under the table lock).
@@ -708,14 +744,13 @@ impl PortPtabListSnapshot {
         let mut ids = Vec::new();
         let layout = arinsal_term::ptab::port_table_layout();
         for index in first..limit.min(layout.max()) {
-            let page_index = index as usize / PORT_PAGE_SIZE;
-            let Some(page) = self.table.pages[page_index].get() else {
-                continue;
-            };
             let Some(progress) = self.table.progress.get() else {
                 continue;
             };
-            let Some(handle) = page[index as usize % PORT_PAGE_SIZE].load_arc(progress, false)
+            let Some(handle) = self
+                .table
+                .slot_at(index as usize)
+                .and_then(|slot| slot.load_arc(progress, false))
             else {
                 continue;
             };
@@ -2992,6 +3027,7 @@ fn make_handle_with(
     let out_fd = out;
     let handle = Arc::new_cyclic(|me: &std::sync::Weak<PortHandle>| PortHandle {
         id,
+        word: Term::port(id).map_or(0, Term::tagged_word),
         started_interval: AtomicU64::new(0),
         spawn: (out_fd.is_some() || waker.is_some()).then(|| {
             Box::new(SpawnData {
@@ -3935,6 +3971,14 @@ fn decode_frames(
 }
 
 fn lookup_port(process: &Process, term: Term) -> Result<Arc<PortHandle>, VmError> {
+    if term.is_port()
+        && let Some(runtime) = process.runtime.as_ref()
+    {
+        return runtime
+            .ports
+            .get_word(term.tagged_word(), process.on_managed)
+            .ok_or_else(badarg);
+    }
     let id = port_id(process, term).ok_or_else(badarg)?;
     process
         .runtime
@@ -3965,24 +4009,23 @@ pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> b
     handle.is_some_and(|handle| !handle.state.lock().exit_complete)
 }
 
-/// `prt->data` (erl_port.h): an atom or a small integer lives in the word itself, as an
-/// immediate does in erts, so `port_get_data/1` is one atomic load. Layout: zero means the data
-/// is in the cold block; `index << 2 | 1` is an atom, `value << 2 | 2` a small integer.
+/// `prt->data` (erl_port.h): an immediate term is stored as its own word, so `port_get_data/1`
+/// is one atomic load. A word with a zero tag is the block of a non-immediate term, which
+/// lives in the cold part of the handle (`ErtsPortDataHeap`).
 const PORT_DATA_BLOCK: u64 = 0;
-const PORT_DATA_UNDEFINED: u64 = ((arinsal_term::atoms::UNDEFINED.0 as u64) << 2) | 1;
+const PORT_DATA_UNDEFINED: u64 = Term::atom(arinsal_term::atoms::UNDEFINED).tagged_word();
 
+/// The word `port_set_data_2` stores for an immediate `data`.
 fn port_data_word(term: Term) -> Option<u64> {
-    if let Some(atom) = term.as_atom() {
-        return Some((u64::from(atom.0) << 2) | 1);
-    }
-    term.as_small().map(|value| ((value as u64) << 2) | 2)
+    term.is_immed().then(|| term.tagged_word())
 }
 
+/// `if ((data & 0x3) != 0) res = data` of `port_get_data_1`.
 fn port_data_term(word: u64) -> Option<Term> {
-    match word & 3 {
-        1 => Some(Term::atom(arinsal_term::Atom((word >> 2) as u32))),
-        2 => Term::small((word as i64) >> 2),
-        _ => None,
+    if word & 3 != 0 {
+        Term::from_immed_word(word)
+    } else {
+        None
     }
 }
 
@@ -4058,11 +4101,15 @@ impl crate::natives::ThinProcessBif for PortGetData {
     fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<crate::exceptions::Trap>> {
         // The data word of a live port holds an atom or a small integer (`inet_db` stores the
         // module atom): one lookup and one load, as `erts_port_data_read` does.
-        if let Some(id) = args[0].as_port()
+        if args[0].is_port()
             && let Some(runtime) = process.runtime.as_ref()
-            && let Some(Some(term)) = runtime.ports.with_from(id, process.on_managed, |handle| {
-                port_data_term(handle.data.load(Ordering::Acquire))
-            })
+            && let Some(data) =
+                runtime
+                    .ports
+                    .with_word(args[0].tagged_word(), process.on_managed, |handle| {
+                        handle.data.load(Ordering::Acquire)
+                    })
+            && let Some(term) = port_data_term(data)
         {
             return Ok(term);
         }
