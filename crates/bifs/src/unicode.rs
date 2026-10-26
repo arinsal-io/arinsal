@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Term, TermBuilder, TermKind, global_atoms};
+use smallvec::SmallVec;
 
 use crate::lists::DeferredTrap;
 use crate::pure::{Heap, bool_term, tuple_build};
@@ -48,8 +49,8 @@ fn atom_name(term: Term) -> Option<String> {
 }
 
 fn encoding(term: Term) -> Result<Encoding, BifError> {
-    if let Some(name) = atom_name(term) {
-        return match name.as_str() {
+    if let Some(name) = term.as_atom().and_then(|atom| global_atoms().text(atom)) {
+        return match name {
             "latin1" => Ok(Encoding::Latin1),
             "unicode" | "utf8" => Ok(Encoding::Utf8),
             "utf16" => Ok(Encoding::Utf16Be),
@@ -121,12 +122,35 @@ fn atom(name: &str) -> Term {
 // Port of erts/emulator/beam/erl_unicode.c:342 (utf8_need), OTP-29.1.1.
 // The size pass rejects malformed structure before the conversion pass. A big
 // integer stops this pass so the converter can return an error tuple for it.
-fn check_structure(root: Term, encoding: Encoding) -> Result<usize, BifError> {
+struct Utf8Need {
+    bytes: usize,
+    cost: usize,
+}
+
+// Port of erts/emulator/beam/erl_unicode.c:313-340
+// (latin1_binary_need, aligned_binary_size), OTP-29.1.1.
+fn binary_need(term: Term, encoding: Encoding) -> Result<usize, BifError> {
+    if encoding == Encoding::Latin1 {
+        Ok(bytes(term)?
+            .iter()
+            .map(|b| if *b < 128 { 1 } else { 2 })
+            .sum())
+    } else {
+        let bits = crate::bitstring_bit_len(term)?;
+        if !bits.is_multiple_of(8) {
+            return Err(BifError::BADARG);
+        }
+        Ok(bits / 8)
+    }
+}
+
+fn check_structure(root: Term, encoding: Encoding) -> Result<Utf8Need, BifError> {
     if root != Term::NIL && !matches!(root.classify(), TermKind::List | TermKind::Bitstring) {
         return Err(BifError::BADARG);
     }
     let mut need = 0_usize;
-    let mut stack = Vec::new();
+    let mut cost = 0;
+    let mut stack = SmallVec::<[Term; 8]>::new();
     let mut current = root;
     loop {
         match current.classify() {
@@ -147,18 +171,18 @@ fn check_structure(root: Term, encoding: Encoding) -> Result<usize, BifError> {
                         current = head;
                     }
                     TermKind::Bitstring => {
-                        let data = bytes(head)?;
-                        need += if encoding == Encoding::Latin1 {
-                            data.iter()
-                                .map(|b| if *b < 128 { 1 } else { 2 })
-                                .sum::<usize>()
+                        let amount = binary_need(head, encoding)?;
+                        need += amount;
+                        cost += if encoding == Encoding::Latin1 {
+                            amount
                         } else {
-                            data.len()
+                            1
                         };
                         current = tail;
                     }
                     TermKind::Number if head.as_small().is_some() => {
                         let cp = head.as_small().unwrap() as u64;
+                        cost += 1;
                         need += if cp < 0x80 {
                             1
                         } else if cp < 0x800 {
@@ -171,27 +195,26 @@ fn check_structure(root: Term, encoding: Encoding) -> Result<usize, BifError> {
                         current = tail;
                     }
                     TermKind::Number => match arinsal_term::to_owned(head) {
-                        Ok(OwnedTerm::BigInt(_)) => return Ok(need),
+                        Ok(OwnedTerm::BigInt(_)) => return Ok(Utf8Need { bytes: need, cost }),
                         _ => return Err(BifError::BADARG),
                     },
                     _ => return Err(BifError::BADARG),
                 }
             }
             TermKind::Bitstring => {
-                let data = bytes(current)?;
-                need += if encoding == Encoding::Latin1 {
-                    data.iter()
-                        .map(|b| if *b < 128 { 1 } else { 2 })
-                        .sum::<usize>()
+                let amount = binary_need(current, encoding)?;
+                need += amount;
+                cost += if encoding == Encoding::Latin1 {
+                    amount
                 } else {
-                    data.len()
+                    1
                 };
                 current = Term::NIL;
             }
             _ => return Err(BifError::BADARG),
         }
     }
-    Ok(need)
+    Ok(Utf8Need { bytes: need, cost })
 }
 
 #[derive(Clone, Copy)]
@@ -610,7 +633,7 @@ fn convert(ctx: &mut Ctx<'_>, args: &[Term], list_output: bool) -> Result<Term, 
                 root = head;
             }
         }
-        check_structure(root, encoding)?
+        check_structure(root, encoding)?.bytes
     };
     let mut output = if list_output {
         Output::List(Vec::with_capacity(need))
@@ -794,7 +817,307 @@ fn characters_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term,
     if let Some(binary) = unicode_utf8_binary_fast_path(args)? {
         return Ok(binary);
     }
+    let encoding = encoding(args[1])?;
+    if matches!(encoding, Encoding::Latin1 | Encoding::Utf8) {
+        return characters_to_utf8(ctx, args[0], encoding);
+    }
     convert_charged(ctx, args, false)
+}
+
+/// The local estack and cursors of one `do_build_utf8` invocation.
+struct BinaryBuild {
+    current: Term,
+    ancestors: SmallVec<[Term; 8]>,
+    source_rest: Option<(Term, usize, Option<Term>)>,
+    leftover: SmallVec<[u8; 4]>,
+    pos: usize,
+    encoding: Encoding,
+    error: bool,
+}
+
+impl BinaryBuild {
+    fn new(root: Term, pos: usize, encoding: Encoding) -> Self {
+        Self {
+            current: root,
+            ancestors: SmallVec::new(),
+            source_rest: None,
+            leftover: SmallVec::new(),
+            pos,
+            encoding,
+            error: false,
+        }
+    }
+
+    fn append(&mut self, output: &mut [u8], bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        output[self.pos..self.pos + bytes.len()].copy_from_slice(bytes);
+        self.pos += bytes.len();
+    }
+
+    // Port of erts/emulator/beam/erl_unicode.c:508-750 (do_build_utf8), OTP-29.1.1.
+    fn fill(&mut self, output: &mut [u8], left: &mut i64) {
+        while *left > 0 && !self.error {
+            if let Some((head, tail)) = crate::lists::cons_cell(self.current) {
+                if let Some(number) = head.as_small() {
+                    let cp = number as u64;
+                    if !self.leftover.is_empty()
+                        || cp >= 0x110000
+                        || (0xd800..=0xdfff).contains(&cp)
+                        || self.encoding == Encoding::Latin1 && cp > 255
+                    {
+                        self.error = true;
+                        return;
+                    }
+                    let mut encoded = [0; 4];
+                    self.append(
+                        output,
+                        char::from_u32(cp as u32)
+                            .unwrap()
+                            .encode_utf8(&mut encoded)
+                            .as_bytes(),
+                    );
+                    *left -= 1;
+                    self.current = tail;
+                } else if head == Term::NIL {
+                    self.current = tail;
+                } else if head.classify() == TermKind::List {
+                    self.ancestors.push(tail);
+                    self.current = head;
+                } else if head.classify() == TermKind::Bitstring {
+                    self.fill_binary(head, Some(tail), output, left);
+                } else {
+                    self.error = true;
+                }
+            } else if self.current == Term::NIL {
+                if let Some(tail) = self.ancestors.pop() {
+                    self.current = tail;
+                } else {
+                    return;
+                }
+            } else if self.current.classify() == TermKind::Bitstring {
+                self.fill_binary(self.current, None, output, left);
+            } else {
+                self.error = true;
+            }
+            if self.source_rest.is_some() {
+                return;
+            }
+        }
+    }
+
+    // Port of erts/emulator/beam/erl_unicode.c:508-605 (do_build_utf8 binary branch)
+    // and :181-297 (copy_utf8_bin), OTP-29.1.1.
+    fn fill_binary(&mut self, term: Term, tail: Option<Term>, output: &mut [u8], left: &mut i64) {
+        let data = bytes(term).expect("utf8_need checked the binary alignment");
+        let mut size = data.len().min(*left as usize);
+        if self.encoding == Encoding::Utf8 {
+            while size < data.len() && data[size] & 0xc0 == 0x80 {
+                size += 1;
+            }
+        }
+        let mut offset = 0;
+        if self.encoding == Encoding::Latin1 {
+            for byte in &data[..size] {
+                if *byte < 128 {
+                    self.append(output, &[*byte]);
+                } else {
+                    self.append(output, &[0xc0 | (*byte >> 6), 0x80 | (*byte & 0x3f)]);
+                }
+            }
+        } else {
+            if !self.leftover.is_empty() {
+                let width = match self.leftover[0] {
+                    0xc0..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    _ => 4,
+                };
+                let previous = self.leftover.len();
+                let take = (width - previous).min(size);
+                self.leftover.extend_from_slice(&data[..take]);
+                if self.leftover.len() == width {
+                    if matches!(decode(&self.leftover, Encoding::Utf8), Decode::Scalar(..)) {
+                        let mut complete = [0; 4];
+                        complete[..width].copy_from_slice(&self.leftover);
+                        self.append(output, &complete[..width]);
+                        self.leftover.clear();
+                        offset = take;
+                    } else {
+                        self.leftover.truncate(previous);
+                        self.source_rest = Some((term, 0, tail));
+                        self.error = true;
+                        return;
+                    }
+                } else {
+                    offset = size;
+                }
+            }
+            let start = offset;
+            while offset < size {
+                match decode(&data[offset..size], Encoding::Utf8) {
+                    Decode::Scalar(_, count) => offset += count,
+                    Decode::Need => {
+                        self.leftover.extend_from_slice(&data[offset..size]);
+                        break;
+                    }
+                    Decode::Invalid => {
+                        self.append(output, &data[start..offset]);
+                        self.source_rest = Some((term, offset, tail));
+                        self.error = true;
+                        return;
+                    }
+                }
+            }
+            self.append(output, &data[start..offset]);
+        }
+        *left -= size as i64;
+        if size < data.len() {
+            self.source_rest = Some((term, size, tail));
+        } else {
+            self.current = tail.unwrap_or(Term::NIL);
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.error
+            || self.source_rest.is_none() && self.current == Term::NIL && self.ancestors.is_empty()
+    }
+
+    // Port of erts/emulator/beam/erl_unicode.c:733-749 (do_build_utf8 done), OTP-29.1.1.
+    fn rest(&self, ctx: &mut Ctx<'_>) -> Term {
+        let rest = if let Some((term, offset, tail)) = self.source_rest {
+            let suffix = if offset == 0 {
+                term
+            } else {
+                let len = crate::bitstring_bit_len(term).expect("validated binary") / 8;
+                TermBuilder::new(&mut Heap(&mut ctx.heap))
+                    .sub_binary(term, offset * 8, (len - offset) * 8)
+                    .expect("binary suffix remains in bounds")
+            };
+            tail.map_or(suffix, |tail| cons(ctx, suffix, tail))
+        } else {
+            self.current
+        };
+        wrap(ctx, rest, &self.ancestors)
+    }
+}
+
+// Port of erts/emulator/beam/erl_unicode.c:787-851 (build_utf8_return), OTP-29.1.1.
+fn binary_build_return(ctx: &mut Ctx<'_>, output: Term, build: BinaryBuild) -> UnicodeStep {
+    if !build.done() {
+        let mut rest = build.rest(ctx);
+        if !build.leftover.is_empty() {
+            let leftover = binary(ctx, &build.leftover);
+            rest = cons(ctx, leftover, rest);
+        }
+        return trap(
+            ctx,
+            UnicodeCont {
+                stage: UnicodeStage::ToBinary,
+                result: output,
+                work: build.pos,
+                chars: 0,
+                rest,
+                latin1: build.encoding == Encoding::Latin1,
+            },
+        );
+    }
+    if !build.error && build.leftover.is_empty() {
+        return UnicodeStep::Done(output);
+    }
+    let (tag, rest) = if build.error {
+        let mut rest = build.rest(ctx);
+        if !build.leftover.is_empty() {
+            let leftover = binary(ctx, &build.leftover);
+            rest = cons(ctx, rest, Term::NIL);
+            rest = cons(ctx, leftover, rest);
+        }
+        ("error", rest)
+    } else {
+        let tag = if valid_incomplete_utf8(&build.leftover) {
+            "incomplete"
+        } else {
+            "error"
+        };
+        (tag, binary(ctx, &build.leftover))
+    };
+    UnicodeStep::Done(tuple_build(ctx, &[atom(tag), output, rest]))
+}
+
+// Port of erts/emulator/beam/erl_unicode.c:931-1021
+// (unicode_characters_to_binary_2), OTP-29.1.1.
+fn characters_to_utf8(
+    ctx: &mut Ctx<'_>,
+    mut root: Term,
+    encoding: Encoding,
+) -> Result<Term, BifError> {
+    if let Some((head, tail)) = crate::lists::cons_cell(root)
+        && tail == Term::NIL
+        && head.classify() == TermKind::Bitstring
+    {
+        root = head;
+    }
+    let need = check_structure(root, encoding)?;
+    if encoding == Encoding::Latin1
+        && root.classify() == TermKind::Bitstring
+        && crate::bitstring_bit_len(root)? / 8 == need.bytes
+    {
+        cost_to_proc(ctx, need.cost / (LOOP_FACTOR_SIMPLE / LOOP_FACTOR));
+        return Ok(root);
+    }
+    let unlimited = ctx.reduction_budget() == usize::MAX;
+    let simple = need.cost / (LOOP_FACTOR_SIMPLE / LOOP_FACTOR);
+    cost_to_proc(ctx, simple);
+    let mut left = if unlimited {
+        i64::MAX
+    } else {
+        (allowed_iterations(ctx) - simple as i64).max(ERL_ONHEAP_BINARY_LIMIT)
+    };
+    let initial = left;
+    let mut build = BinaryBuild::new(root, 0, encoding);
+    let output = if unlimited || need.bytes <= 64 {
+        TermBuilder::new(&mut Heap(&mut ctx.heap))
+            .binary_from_fn_with_len(need.bytes, |output| {
+                build.fill(output, &mut left);
+                Ok(build.pos)
+            })
+            .map_err(|_| BifError::SystemLimit)?
+    } else {
+        let output = crate::allocate_iolist_binary(&mut ctx.heap, need.bytes)?;
+        fill_utf8_binary(output, &mut build, &mut left);
+        output
+    };
+    cost_to_proc(ctx, (initial - left) as usize);
+    match binary_build_return(ctx, output, build) {
+        UnicodeStep::Done(value) => Ok(value),
+        UnicodeStep::More(cont) => {
+            ctx.defer_trap(DeferredTrap::Unicode(cont));
+            Ok(Term::NIL)
+        }
+    }
+}
+
+fn fill_utf8_binary(output: Term, build: &mut BinaryBuild, left: &mut i64) {
+    if crate::bitstring_bit_len(output).expect("conversion retains its binary") <= 64 * 8 {
+        // do_build_utf8 may yield with only empty tails or an invalid integer left
+        // after consuming exactly 64 units. utf8_need bounds all valid output by
+        // 64 bytes, so a resumed heap binary has no payload writes left to perform.
+        build.fill(&mut [], left);
+        return;
+    }
+    crate::with_iolist_binary_output(output, |bytes| {
+        build.fill(bytes, left);
+        Ok(())
+    })
+    .expect("conversion retains its private binary writer");
+    if build.done() {
+        assert!(
+            arinsal_term::writable_resize_private(output, build.pos * 8)
+                .expect("conversion only shrinks its private binary")
+        );
+        crate::finish_iolist_binary_output(output);
+    }
 }
 
 /// Return the original subject when it is already a valid UTF-8 binary.
@@ -940,15 +1263,17 @@ pub enum UnicodeStage {
 /// Resume state of a trapped `unicode:characters_to_binary/2` or `characters_to_list/2`.
 ///
 /// Port of the restart arguments and `RestartContext` that `BIF_TRAP*` passes in
-/// erts/emulator/beam/erl_unicode.c, OTP-29.1.1. The converted value is built when the call
-/// starts and the loop counters that erts keeps in the continuation run down one slice at a
-/// time, so the reductions and scheduling points are those of erts.
+/// erts/emulator/beam/erl_unicode.c, OTP-29.1.1. Binary conversion retains the output,
+/// write position, remaining chardata and encoding. List conversion retains its result
+/// and the counters of its buffer-build and list-finalization stages.
 #[derive(Clone)]
 pub struct UnicodeCont {
     stage: UnicodeStage,
     result: Term,
     work: usize,
     chars: usize,
+    rest: Term,
+    latin1: bool,
 }
 
 impl UnicodeCont {
@@ -977,16 +1302,11 @@ pub enum UnicodeStep {
 struct Measure {
     cost: usize,
     units: usize,
-    ascii: bool,
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:342 (utf8_need), OTP-29.1.1, for its cost.
 fn measure(root: Term, latin1: bool) -> Measure {
-    let mut measure = Measure {
-        cost: 0,
-        units: 0,
-        ascii: true,
-    };
+    let mut measure = Measure { cost: 0, units: 0 };
     let mut stack = vec![root];
     let binary_work = |measure: &mut Measure, term: Term| -> bool {
         let Ok(data) = bytes(term) else {
@@ -1001,7 +1321,6 @@ fn measure(root: Term, latin1: bool) -> Measure {
         } else {
             measure.cost += 1;
         }
-        measure.ascii &= data.iter().all(|byte| *byte < 128);
         true
     };
     while let Some(mut current) = stack.pop() {
@@ -1080,25 +1399,6 @@ fn trap(ctx: &mut Ctx<'_>, cont: UnicodeCont) -> UnicodeStep {
     UnicodeStep::More(cont)
 }
 
-/// `characters_to_binary/2` after `do_build_utf8` ran `left` iterations.
-// Port of erts/emulator/beam/erl_unicode.c:787 (build_utf8_return), OTP-29.1.1.
-fn to_binary_slice(ctx: &mut Ctx<'_>, result: Term, work: usize, left: i64) -> UnicodeStep {
-    let consumed = work.min(left.max(0) as usize);
-    cost_to_proc(ctx, consumed);
-    if consumed < work {
-        return trap(
-            ctx,
-            UnicodeCont {
-                stage: UnicodeStage::ToBinary,
-                result,
-                work: work - consumed,
-                chars: 0,
-            },
-        );
-    }
-    UnicodeStep::Done(result)
-}
-
 /// The list is built from the UTF-8 buffer `left` characters at a time.
 // Port of erts/emulator/beam/erl_unicode.c:1637 (finalize_list_to_list) and
 // :1342 (do_utf8_to_list), OTP-29.1.1.
@@ -1126,6 +1426,8 @@ fn list_build_slice(
                 result,
                 work: 0,
                 chars: chars - built,
+                rest: Term::NIL,
+                latin1: false,
             },
         );
     }
@@ -1151,6 +1453,8 @@ fn list_build_slice_after_buffer(
                 result,
                 work: work - consumed,
                 chars,
+                rest: Term::NIL,
+                latin1: false,
             },
         );
     }
@@ -1189,6 +1493,8 @@ fn list_analyze_slice(
                 result,
                 work: analyzed + count,
                 chars,
+                rest: Term::NIL,
+                latin1: false,
             },
         );
     }
@@ -1199,8 +1505,19 @@ fn list_analyze_slice(
 pub fn unicode_resume(ctx: &mut Ctx<'_>, cont: &UnicodeCont) -> UnicodeStep {
     match cont.stage {
         UnicodeStage::ToBinary => {
-            let left = allowed_iterations_resumed(ctx);
-            to_binary_slice(ctx, cont.result, cont.work, left)
+            // Port of erts/emulator/beam/erl_unicode.c:853-888
+            // (characters_to_utf8_trap), OTP-29.1.1.
+            let mut left = allowed_iterations_resumed(ctx);
+            let initial = left;
+            let encoding = if cont.latin1 {
+                Encoding::Latin1
+            } else {
+                Encoding::Utf8
+            };
+            let mut build = BinaryBuild::new(cont.rest, cont.work, encoding);
+            fill_utf8_binary(cont.result, &mut build, &mut left);
+            cost_to_proc(ctx, (initial - left) as usize);
+            binary_build_return(ctx, cont.result, build)
         }
         UnicodeStage::ListBuild => {
             let left = allowed_iterations_resumed(ctx);
@@ -1230,40 +1547,19 @@ fn convert_charged(ctx: &mut Ctx<'_>, args: &[Term], list_output: bool) -> Resul
         return Ok(result);
     }
     let latin1 = encoding == Encoding::Latin1;
-    let mut subject = args[0];
-    if !list_output
-        && let Some((head, tail)) = crate::lists::cons_cell(subject)
-        && tail == Term::NIL
-        && head.classify() == TermKind::Bitstring
-    {
-        subject = head;
-    }
-    let step = if list_output && subject.classify() == TermKind::Bitstring && !latin1 {
+    let subject = args[0];
+    let step = if subject.classify() == TermKind::Bitstring && !latin1 {
         let chars = converted_chars(result);
         list_analyze_slice(ctx, result, 0, chars, false)
     } else {
         let work = measure(subject, latin1);
         let simple = work.cost / (LOOP_FACTOR_SIMPLE / LOOP_FACTOR);
-        if !list_output
-            && subject.classify() == TermKind::Bitstring
-            && (latin1 && work.ascii || !latin1 && result.classify() == TermKind::Bitstring)
-        {
-            cost_to_proc(ctx, simple);
-            return Ok(result);
-        }
         cost_to_proc(ctx, simple);
         let mut left = allowed_iterations(ctx) - simple as i64;
-        if list_output {
-            if left <= 0 {
-                left = 1;
-            }
-            list_build_slice_after_buffer(ctx, result, work.units, converted_chars(result), left)
-        } else {
-            if left <= ERL_ONHEAP_BINARY_LIMIT {
-                left = ERL_ONHEAP_BINARY_LIMIT;
-            }
-            to_binary_slice(ctx, result, work.units, left)
+        if left <= 0 {
+            left = 1;
         }
+        list_build_slice_after_buffer(ctx, result, work.units, converted_chars(result), left)
     };
     match step {
         UnicodeStep::Done(value) => Ok(value),

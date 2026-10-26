@@ -2485,6 +2485,10 @@ impl<B: arinsal_bifs::BifBody> TrapBody for BinaryToList<B> {
 impl TrapBody for ListToBinary {
     const ARITY: Option<usize> = Some(1);
 
+    fn direct(process: &mut Process, args: &[Term]) -> Option<Term> {
+        iolist_binary_direct(process, args[0], false)
+    }
+
     fn run(
         process: &mut Process,
         args: &[Term],
@@ -2499,6 +2503,10 @@ impl TrapBody for ListToBinary {
 
 impl TrapBody for IolistToBinary {
     const ARITY: Option<usize> = Some(1);
+
+    fn direct(process: &mut Process, args: &[Term]) -> Option<Term> {
+        iolist_binary_direct(process, args[0], true)
+    }
 
     fn run(
         process: &mut Process,
@@ -3054,10 +3062,69 @@ fn list_to_binary(
     if let Some(value) = arinsal_bifs::singleton_bitstring(root, 8)? {
         return Ok(HandlerResult::Done {
             value,
-            reductions: 1,
+            reductions: 0,
         });
     }
     iolist_binary_conversion(process, root, state, false, gc_changed)
+}
+
+// Port of erts/emulator/beam/erl_iolist.c:718-762,857-927
+// (list_to_bitstring_engine, list_to_bitstring_bif, iolist_to_binary_1), OTP-29.1.1.
+// The size and copy passes run on the stack; only a yielding call needs saved state.
+fn iolist_binary_direct(process: &mut Process, root: Term, allow_binary: bool) -> Option<Term> {
+    if allow_binary && root.classify() == TermKind::Bitstring {
+        arinsal_bifs::bitstring_bit_len(root)
+            .ok()?
+            .is_multiple_of(8)
+            .then_some(())?;
+        return Some(root);
+    }
+    if !matches!(root.classify(), TermKind::List | TermKind::Nil) {
+        return None;
+    }
+    if let Some(value) = arinsal_bifs::singleton_bitstring(root, 8).ok()? {
+        return Some(value);
+    }
+    if root == Term::NIL {
+        return Some(
+            TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                .binary(&[])
+                .expect("process HAlloc supplies the empty binary"),
+        );
+    }
+    let available = process.reductions.max(0) as usize;
+    let mut size = arinsal_bifs::IolistSizeWalk::new(root);
+    let (done, work) = size.step(available.saturating_mul(8).min(64)).ok()?;
+    if !done {
+        return None;
+    }
+    let bytes = size.take_size();
+    if bytes > 64 {
+        return None;
+    }
+    let size_reds = work.div_ceil(8);
+    let copy_budget = available.saturating_sub(size_reds).saturating_mul(8);
+    // Copy charges the same list cells, plus one unit per 32 binary bytes. The
+    // decrement before each cell must still leave a positive yield counter.
+    if bytes != 0 && work + bytes / 32 >= copy_budget {
+        return None;
+    }
+    let mut copy_work = 0;
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let value = TermBuilder::new(&mut heap)
+        .binary_from_fn(bytes, |output| {
+            if bytes != 0 {
+                let mut copy = arinsal_bifs::IolistCopyWalk::new(root);
+                let (done, work) = copy
+                    .step(output, copy_budget)
+                    .expect("size pass validated iolist");
+                assert!(done);
+                copy_work = work;
+            }
+        })
+        .expect("process HAlloc supplies the measured small binary");
+    charge_light(process, (size_reds + copy_work.div_ceil(8)) as u32);
+    Some(value)
 }
 
 fn iolist_to_binary(
@@ -3074,7 +3141,13 @@ fn iolist_to_binary(
         }
         return Ok(HandlerResult::Done {
             value: root,
-            reductions: 1,
+            reductions: 0,
+        });
+    }
+    if let Some(value) = arinsal_bifs::singleton_bitstring(root, 8)? {
+        return Ok(HandlerResult::Done {
+            value,
+            reductions: 0,
         });
     }
     iolist_binary_conversion(process, root, state, false, gc_changed)
@@ -3358,6 +3431,16 @@ fn iolist_binary_conversion(
     bitstring: bool,
     _restore_gc: bool,
 ) -> Result<HandlerResult, BifError> {
+    if root == Term::NIL && state.is_none() {
+        let value = arinsal_bifs::allocate_iolist_binary(
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            0,
+        )?;
+        return Ok(HandlerResult::Done {
+            value,
+            reductions: 0,
+        });
+    }
     let Some(state) = state else {
         let mut phase = IolistBinaryPhase::Size(if bitstring {
             arinsal_bifs::IolistSizeWalk::new_bits(root)
@@ -3368,14 +3451,14 @@ fn iolist_binary_conversion(
             IolistStep::Finished(result) => result,
             IolistStep::Yield(reductions) => HandlerResult::Yield {
                 continuation: IOLIST_CONTINUATION,
-                state: magic_binary_state(Mutex::new(phase), ERTS_L2B_STATE_SIZE),
+                state: magic_binary_state(Mutex::new(Box::new(phase)), ERTS_L2B_STATE_SIZE),
                 reductions,
             },
         });
     };
     let state = Arc::clone(state);
     let phase = state
-        .downcast_ref::<Mutex<IolistBinaryPhase>>()
+        .downcast_ref::<Mutex<Box<IolistBinaryPhase>>>()
         .ok_or(BifError::BADARG)?;
     let mut phase = phase.lock().map_err(|_| BifError::SystemLimit)?;
     let step = iolist_binary_step(process, root, &mut phase)?;
