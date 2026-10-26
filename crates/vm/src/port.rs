@@ -3448,6 +3448,9 @@ fn worker(
                         if let Some(rest) = handle.state.lock().handshake.as_mut() {
                             rest.extend_from_slice(&crate::child_setup::ack_frame());
                         }
+                        // Port of erts/emulator/sys/unix/sys_drivers.c:1307-1332
+                        // (`ready_input`): write or queue Ack before init_ack wakes the opener.
+                        flush_handshake(&handle, true, start.is_some_and(|s| !s.keep_input));
                         send_open_reply(&handle, Ok(()));
                         go_buf = None;
                         if start.is_some_and(|s| !s.read_wanted) {
