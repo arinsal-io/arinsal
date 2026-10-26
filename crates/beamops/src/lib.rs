@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod erts_tables;
 #[path = "rule_syntax.rs"]
 mod rule_syntax;
 use arinsal_beam::{BeamFile, Instr, Operand};
@@ -10,6 +11,12 @@ use arinsal_spec::BifKind;
 use rule_syntax::*;
 use smallvec::SmallVec;
 use std::{collections::HashMap, sync::OnceLock};
+
+/// The opcode tables of the erts build, as text (for comparison with a real erts's tables).
+#[doc(hidden)]
+pub fn erts_tables_dump() -> String {
+    erts_tables::dump()
+}
 
 /// A typed operand accepted by a BeamAsm-specific operation.
 #[derive(Clone, Debug, PartialEq, Eq)]

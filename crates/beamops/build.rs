@@ -3,9 +3,14 @@ use std::{collections::BTreeSet, env, fs, path::PathBuf};
 #[path = "src/rule_syntax.rs"]
 mod rule_syntax;
 use rule_syntax::{Restriction, Top};
+#[path = "build/emit.rs"]
+mod emit;
+#[path = "build/makeops.rs"]
+mod makeops;
 
 fn main() {
     generate_matchers();
+    generate_erts_tables();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let ops = fs::read_to_string(root.join("tab/ops.tab")).expect("ops.tab");
     let _predicates = fs::read_to_string(root.join("tab/predicates.tab")).expect("predicates.tab");
@@ -244,4 +249,41 @@ fn generate_matchers() {
     )
     .unwrap();
     println!("cargo:rerun-if-changed=src/rule_syntax.rs");
+}
+
+/// The generic and specific instruction tables of `beam_makeops` (`gen_opc[]`, `opc[]`,
+/// `genop_*`), built from the tables in the order the OTP build gives them to the script:
+/// genop.tab, the shared predicates and generators, then the arm64 ops, predicates and generators.
+fn generate_erts_tables() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let names = [
+        "genop.tab",
+        "common_predicates.tab",
+        "common_generators.tab",
+        "ops.tab",
+        "predicates.tab",
+        "generators.tab",
+    ];
+    let texts: Vec<String> = names
+        .iter()
+        .map(|name| fs::read_to_string(root.join("tab").join(name)).expect("tab file"))
+        .collect();
+    let files: Vec<(&str, &str)> = names
+        .iter()
+        .zip(&texts)
+        .map(|(name, text)| (*name, text.as_str()))
+        .collect();
+    // The definitions of the OTP build: 64-bit, no VM probes.
+    let defs = [("ARCH_32", 0), ("ARCH_64", 1), ("USE_VM_PROBES", 0)]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect();
+    let tables = makeops::Makeops::parse(&files, &defs);
+    fs::write(
+        PathBuf::from(env::var("OUT_DIR").unwrap()).join("erts_tables.rs"),
+        tables.emit_tables(),
+    )
+    .unwrap();
+    println!("cargo:rerun-if-changed=build/makeops.rs");
+    println!("cargo:rerun-if-changed=build/emit.rs");
 }
