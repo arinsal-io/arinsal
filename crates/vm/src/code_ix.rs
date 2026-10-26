@@ -213,7 +213,22 @@ impl CodeIndexes {
     // Port of erts/emulator/beam/beam_ranges.c:118-137 (erts_start_staging_ranges), OTP-29.1.1.
     fn stage_code_ranges(&self) {
         let active = self.ranges[self.active()].load_full();
-        self.ranges[self.staging()].store(Arc::new(active.as_ref().clone()));
+        self.ranges[self.staging()].store(Arc::new(
+            active
+                .iter()
+                .filter(|range| range.end() > range.start())
+                .cloned()
+                .collect(),
+        ));
+    }
+
+    /// Drops ranges retired while the code index was being staged.
+    // Port of erts/emulator/beam/beam_ranges.c:137-180 (erts_end_staging_ranges), OTP-29.1.1.
+    fn end_staging_code_ranges(&self) {
+        let index = self.staging();
+        let mut ranges = self.ranges[index].load_full().as_ref().clone();
+        ranges.retain(|range| range.end() > range.start());
+        self.ranges[index].store(Arc::new(ranges));
     }
 
     /// Adds a compiled module range to the index being staged by the code loader.
@@ -221,6 +236,7 @@ impl CodeIndexes {
     pub(crate) fn add_staging_code_range(&self, range: crate::native_bridge::ModuleRange) {
         let index = self.staging();
         let mut ranges = self.ranges[index].load_full().as_ref().clone();
+        ranges.retain(|entry| entry.end() > entry.start());
         let at = ranges.partition_point(|entry| entry.start() < range.start());
         assert!(
             at == 0 || ranges[at - 1].end() <= range.start(),
@@ -238,18 +254,22 @@ impl CodeIndexes {
     // Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
     pub(crate) fn remove_code_range(&self, start: usize, end: usize) {
         for slot in &self.ranges {
-            let mut ranges = slot.load_full().as_ref().clone();
-            ranges.retain(|range| range.start() != start || range.end() != end);
-            slot.store(Arc::new(ranges));
+            for range in slot.load().iter() {
+                if range.start() == start && range.end() == end {
+                    range.retire();
+                }
+            }
         }
     }
 
     // Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
     pub(crate) fn remove_code_ranges_scope(&self, scope: u64) {
         for slot in &self.ranges {
-            let mut ranges = slot.load_full().as_ref().clone();
-            ranges.retain(|range| range.scope() != scope);
-            slot.store(Arc::new(ranges));
+            for range in slot.load().iter() {
+                if range.scope() == scope {
+                    range.retire();
+                }
+            }
         }
     }
 
@@ -423,6 +443,7 @@ impl CodeIndexes {
     /// Publishes `tables` as the staging code index's tables and makes that index active.
     // Port of erts/emulator/beam/code_ix.c:142-171 (erts_commit_staging_code_ix), OTP-29.1.1.
     fn commit_tables(&self, mut tables: CodeTables, code_barrier_pending: bool) {
+        self.end_staging_code_ranges();
         tables.generation = next_generation();
         let tables = Arc::new(tables);
         self.store_slot(self.staging(), Arc::clone(&tables));

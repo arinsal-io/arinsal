@@ -1902,12 +1902,15 @@ fn raise_stacktrace_block_tail_is_walkable_by_purge_scan() {
             "nifdyn_filler_run",
             "-module(nifdyn_filler_run).\n-export([run/0]).\n\
              run() ->\n\
+                 {_, Beam, File} = code:get_object_code(nifdyn_filler_raiser),\n\
                  [begin\n\
                       try nifdyn_filler_raiser:f(trace_status, self(), {#{}, self(), []})\n\
                       catch C:_ -> C end,\n\
                       code:purge(nifdyn_filler_raiser),\n\
                       code:delete(nifdyn_filler_raiser),\n\
-                      code:purge(nifdyn_filler_raiser)\n\
+                      code:purge(nifdyn_filler_raiser),\n\
+                      {module, nifdyn_filler_raiser} =\n\
+                          code:load_binary(nifdyn_filler_raiser, File, Beam)\n\
                   end || _ <- lists:seq(1, 300)],\n\
                  ok.\n",
         ),
@@ -1922,7 +1925,7 @@ fn raise_stacktrace_block_tail_is_walkable_by_purge_scan() {
             .expect("erlc");
         assert!(status.success(), "erlc {module}");
     }
-    assert_eq!(
+    similar_asserts::assert_eq!(
         scheduled_cli(&dir, "nifdyn_filler_run"),
         OwnedTerm::atom("ok")
     );

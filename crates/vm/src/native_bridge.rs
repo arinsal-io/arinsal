@@ -163,7 +163,8 @@ struct LineLoc {
 pub(crate) struct ModuleRange {
     scope: u64,
     start: usize,
-    end: usize,
+    /// Shared across code-index snapshots so purge invalidates copies made during staging.
+    end: Arc<AtomicUsize>,
     module_atom: arinsal_term::Atom,
     functions: Arc<[FunctionRange]>,
     /// `functions[i].start`. `erts_lookup_function_info` binary-searches an array of
@@ -181,7 +182,13 @@ impl ModuleRange {
     }
 
     pub(crate) fn end(&self) -> usize {
-        self.end
+        self.end.load(Ordering::Acquire)
+    }
+
+    /// Marks a purged range dead before its executable span can be reused.
+    // Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
+    pub(crate) fn retire(&self) {
+        self.end.store(self.start, Ordering::Release);
     }
 }
 
@@ -229,7 +236,7 @@ fn module_range(
     ModuleRange {
         scope,
         start,
-        end,
+        end: Arc::new(AtomicUsize::new(end)),
         module_atom,
         functions: Arc::from(functions),
         fn_starts,
@@ -250,13 +257,14 @@ fn native_module_range(
 
 // Port of erts/emulator/beam/beam_ranges.c:137-180 (erts_end_staging_ranges), OTP-29.1.1.
 fn insert_module_range(ranges: &mut Vec<ModuleRange>, range: ModuleRange) {
+    ranges.retain(|entry| entry.end() > entry.start());
     let at = ranges.partition_point(|entry| entry.start < range.start);
     assert!(
-        at == 0 || ranges[at - 1].end <= range.start,
+        at == 0 || ranges[at - 1].end() <= range.start,
         "native module ranges overlap"
     );
     assert!(
-        at == ranges.len() || range.end <= ranges[at].start,
+        at == ranges.len() || range.end() <= ranges[at].start,
         "native module ranges overlap"
     );
     ranges.insert(at, range);
@@ -281,9 +289,11 @@ fn publish_native_module_range(scope: u64, range: ModuleRange) {
 // Port of erts/emulator/beam/beam_ranges.c:221-227 (erts_remove_from_ranges), OTP-29.1.1.
 fn unpublish_native_module_range(scope: u64, start: usize, end: usize) {
     if scope == 0 {
-        let mut seed = scope0_ranges().load_full().as_ref().clone();
-        seed.retain(|range| range.start != start || range.end != end);
-        scope0_ranges().store(Arc::new(seed));
+        for range in scope0_ranges().load().iter() {
+            if range.start == start && range.end() == end {
+                range.retire();
+            }
+        }
         crate::code_ix::with_all_scopes(|indexes| indexes.remove_code_range(start, end));
     } else if let Some(indexes) = crate::code_ix::existing_scope(scope) {
         indexes.remove_code_range(start, end);
@@ -303,13 +313,16 @@ fn insert_function_range(ranges: &mut Vec<ModuleRange>, fun: FunctionRange) {
     }
     let module = fun.module_atom;
     if let Some(index) = ranges.iter().position(|range| {
-        range.module_atom == module && fun.start <= range.end && range.start <= fun.end
+        range.module_atom == module
+            && range.end() > range.start
+            && fun.start <= range.end()
+            && range.start <= fun.end
     }) {
         let range = &ranges[index];
         let mut functions = range.functions.to_vec();
         let at = functions.partition_point(|function| function.start < fun.start);
         let start = range.start.min(fun.start);
-        let end = range.end.max(fun.end);
+        let end = range.end().max(fun.end);
         functions.insert(at, fun);
         ranges[index] = module_range(start, end, module, functions);
         ranges.sort_by_key(|range| range.start);
@@ -325,7 +338,7 @@ fn insert_function_range(ranges: &mut Vec<ModuleRange>, fun: FunctionRange) {
 fn remove_function_range(ranges: &mut Vec<ModuleRange>, start: usize) {
     let Some(index) = ranges
         .iter()
-        .position(|range| range.start <= start && start < range.end)
+        .position(|range| range.end() > range.start && range.start <= start && start < range.end())
     else {
         return;
     };
@@ -410,13 +423,13 @@ fn find_range(ranges: &[ModuleRange], address: usize) -> Option<&ModuleRange> {
     }
     let cached = RANGE_MID.load(Ordering::Relaxed).min(len - 1);
     let mid = &ranges[cached];
-    if address >= mid.start && address < mid.end {
+    if address >= mid.start && address < mid.end() {
         return Some(mid);
     }
     let index = ranges.partition_point(|range| range.start <= address);
     let found = index.checked_sub(1)?;
     let range = ranges.get(found)?;
-    if address >= range.end {
+    if address >= range.end() {
         return None;
     }
     RANGE_MID.store(found, Ordering::Relaxed);
@@ -987,8 +1000,8 @@ pub(crate) fn unregister_native_scope(scope: u64) {
         .map(|ranges| {
             ranges
                 .iter()
-                .filter(|range| range.scope == scope)
-                .map(|range| (range.start, range.end))
+                .filter(|range| range.scope == scope && range.end() > range.start)
+                .map(|range| (range.start, range.end()))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -1836,9 +1849,57 @@ mod version_selection_tests {
         register_native_function(current.clone()).expect("register current version");
         let key = ("spin".to_owned(), 0);
         let selected = native_functions_of(7, module, Some((base, base + 64)));
-        assert_eq!(selected.get(&key), Some(&current));
+        similar_asserts::assert_eq!(selected.get(&key), Some(&current));
         let selected = native_functions_of(7, module, Some((base + 128, base + 192)));
-        assert_eq!(selected.get(&key), Some(&old));
+        similar_asserts::assert_eq!(selected.get(&key), Some(&old));
         unregister_native_functions(&[old, current]);
+    }
+
+    // A load can snapshot the active range while purge retires that version. The next load
+    // may then reuse the same executable span; it must replace the retired staging entry.
+    #[test]
+    fn purge_reload_replaces_ranges_after_a_staging_snapshot() {
+        let scope = crate::beamasm_integration::new_code_scope();
+        let indexes = crate::code_ix::for_scope(scope);
+        let atoms = arinsal_term::global_atoms();
+        let module_atom = atoms
+            .intern("native_bridge_purge_reload")
+            .expect("module atom");
+        let function_atom = atoms.intern("f").expect("function atom");
+        let start = 0x1000;
+        let end = 0x1100;
+        let function = NativeFunction {
+            scope,
+            start,
+            end,
+            module: "native_bridge_purge_reload".to_owned(),
+            module_atom,
+            function: "f".to_owned(),
+            function_atom,
+            arity: 0,
+            line: None,
+            file: None,
+            file_term: None,
+            line_table: Vec::new(),
+        };
+        let range =
+            || native_module_range(start, end, module_atom, std::slice::from_ref(&function));
+        indexes.store_code_ranges(Arc::new(vec![range()]));
+
+        for _ in 0..32 {
+            // Starting a new code load snapshots the old module's range into staging.
+            let staging = indexes.start_staging();
+            // Purge removes it before executable memory can be returned to the allocator.
+            indexes.remove_code_range(start, end);
+            // The allocator reuses that span for a reload before this staging commit.
+            indexes.add_staging_code_range(range());
+            drop(staging);
+
+            let ranges = indexes.code_ranges();
+            similar_asserts::assert_eq!(ranges.len(), 1);
+            similar_asserts::assert_eq!((ranges[0].start(), ranges[0].end()), (start, end));
+        }
+
+        crate::beamasm_integration::release_code_scope(scope);
     }
 }
