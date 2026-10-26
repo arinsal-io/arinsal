@@ -37,6 +37,21 @@ pub(crate) fn load_code(
     typed: bool,
     arena: &mut TransformArena,
 ) -> Result<(), LoadCodeError> {
+    // Port of erts/emulator/beam/beam_load.c:erts_prepare_loading (the `max_opcode` checks),
+    // OTP-29.1.1.
+    if beam.code.max_opcode as usize > MAX_GENERIC_OPCODE {
+        return Err(error(format!(
+            "This BEAM file was compiled for a later version of the runtime system than the \
+             current (Erlang/OTP 29).\n  To fix this, please recompile this module with an OTP \
+             29 compiler.\n  (Use of opcode {}; this emulator supports only up to {}.)",
+            beam.code.max_opcode, MAX_GENERIC_OPCODE
+        )));
+    } else if (beam.code.max_opcode as i32) < GENOP_SWAP_2 {
+        return Err(error(
+            "This BEAM file was compiled for an old version of the runtime system.\n  To fix \
+             this, please re-compile this module with Erlang/OTP 25 or later.\n",
+        ));
+    }
     arena.reset();
     let ops = std::mem::take(&mut arena.beam_ops);
     let debugger_flags = if instrument_line_breakpoints {

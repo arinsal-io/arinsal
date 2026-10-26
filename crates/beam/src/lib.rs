@@ -238,8 +238,11 @@ pub struct CodeChunk {
     pub label_count: u32,
     /// Number of functions.
     pub function_count: u32,
-    /// Generic instruction sequence including final int_code_end.
+    /// Generic instruction sequence including final int_code_end. Empty for a file from
+    /// [`read`] until [`BeamFile::decode_code`] fills it.
     pub instructions: Vec<Instr>,
+    /// The instructions as the file stores them: the Code chunk after its header.
+    pub bytes: Vec<u8>,
 }
 /// A decoded BEAM file. `atoms[0]` is atom index 1; index 0 denotes nil only in operands.
 #[derive(Clone, Debug)]
@@ -296,6 +299,7 @@ impl BeamFile {
     /// `beam_load_finalize` and keeps `module_info` data in the code header).
     pub fn release_decoded(&mut self) {
         self.code.instructions = Vec::new();
+        self.code.bytes = Vec::new();
         self.imports = Vec::new();
         self.exports = Vec::new();
         self.locals = Vec::new();
@@ -324,8 +328,41 @@ impl BeamFile {
     }
 }
 
-/// Parse a whole BEAM file, including gzip-wrapped files accepted by `beam_lib`.
+/// Parse a whole BEAM file, including gzip-wrapped files accepted by `beam_lib`, and decode
+/// its instructions.
 pub fn parse(bytes: &[u8]) -> Result<BeamFile, BeamError> {
+    let mut file = read(bytes)?;
+    file.decode_code()?;
+    Ok(file)
+}
+
+impl BeamFile {
+    /// Decode the instructions of the Code chunk into [`Instr`]s (`read` leaves them as bytes).
+    pub fn decode_code(&mut self) -> Result<(), BeamError> {
+        if !self.code.instructions.is_empty() {
+            return Ok(());
+        }
+        let bytes = std::mem::take(&mut self.code.bytes);
+        let result = decode_instructions(
+            &bytes,
+            self.code.max_opcode,
+            self.code.label_count,
+            self.code.function_count,
+            self.atoms.len(),
+            self.literals.len(),
+            self.types.as_ref(),
+        );
+        self.code.bytes = bytes;
+        self.code.instructions = result?;
+        Ok(())
+    }
+}
+
+/// Read a BEAM file's chunks into tables: the part of erts's `beamfile_read` (beam_file.c) that
+/// does not touch the instructions. The Code chunk is validated at its header and kept as
+/// bytes; [`BeamFile::decode_code`] decodes it for consumers that want [`Instr`]s, the loader's
+/// code reader reads the bytes itself.
+pub fn read(bytes: &[u8]) -> Result<BeamFile, BeamError> {
     let inflated;
     let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
         let mut decoder = GzDecoder::new(bytes);
@@ -346,11 +383,11 @@ pub fn parse(bytes: &[u8]) -> Result<BeamFile, BeamError> {
         return Err(bad("IFF", 8, "expected BEAM"));
     }
     let mut chunks = Vec::new();
-    let mut map: HashMap<ChunkId, Vec<u8>> = HashMap::new();
+    let mut map: HashMap<ChunkId, &[u8]> = HashMap::with_capacity(16);
     while r.pos < bytes.len() {
         let id: ChunkId = r.take(4)?.try_into().unwrap();
         let size = r.u32()? as usize;
-        let data = r.take(size)?.to_vec();
+        let data = r.take(size)?;
         let padding = (4 - size % 4) % 4;
         r.take(padding)?;
         chunks.push((id, size));
@@ -394,12 +431,7 @@ pub fn parse(bytes: &[u8]) -> Result<BeamFile, BeamError> {
         .unwrap_or_default();
     let lines = map.get(b"Line").map(|v| parse_lines(v)).transpose()?;
     let types = map.get(b"Type").map(|v| parse_types(v)).transpose()?;
-    let code = parse_code(
-        required(&map, *b"Code")?,
-        atoms.len(),
-        literals.len(),
-        types.as_ref(),
-    )?;
+    let code = parse_code_header(required(&map, *b"Code")?)?;
     for lambda in &lambdas {
         if lambda.label == 0 || lambda.label >= code.label_count {
             return Err(bad("FunT", 0, "lambda label out of range"));
@@ -413,7 +445,7 @@ pub fn parse(bytes: &[u8]) -> Result<BeamFile, BeamError> {
     let other_chunks = chunks
         .iter()
         .filter(|(id, _)| !known.contains(id))
-        .map(|(id, _)| (*id, map[id].clone()))
+        .map(|(id, _)| (*id, map[id].to_vec()))
         .collect();
     Ok(BeamFile {
         module,
@@ -427,17 +459,17 @@ pub fn parse(bytes: &[u8]) -> Result<BeamFile, BeamError> {
         strings,
         lines,
         types,
-        attributes: map.get(b"Attr").cloned(),
-        compile_info: map.get(b"CInf").cloned(),
-        meta: map.get(b"Meta").cloned(),
+        attributes: map.get(b"Attr").map(|chunk| chunk.to_vec()),
+        compile_info: map.get(b"CInf").map(|chunk| chunk.to_vec()),
+        meta: map.get(b"Meta").map(|chunk| chunk.to_vec()),
         records,
         chunks,
         other_chunks,
     })
 }
 
-fn required(map: &HashMap<ChunkId, Vec<u8>>, id: ChunkId) -> Result<&[u8], BeamError> {
-    map.get(&id).map(Vec::as_slice).ok_or_else(|| {
+fn required<'a>(map: &HashMap<ChunkId, &'a [u8]>, id: ChunkId) -> Result<&'a [u8], BeamError> {
+    map.get(&id).copied().ok_or_else(|| {
         bad(
             "IFF",
             0,
@@ -977,13 +1009,9 @@ fn operand(
         _ => unreachable!(),
     }
 }
-// Port of erts/emulator/beam/beam_file.c:1511 (parse_code_chunk), OTP-29.1.1.
-fn parse_code(
-    data: &[u8],
-    atoms: usize,
-    literals: usize,
-    types: Option<&TypeTable>,
-) -> Result<CodeChunk, BeamError> {
+// Port of erts/emulator/beam/beam_file.c:1511 (parse_code_chunk), OTP-29.1.1: the header; the
+// instructions stay bytes.
+fn parse_code_header(data: &[u8]) -> Result<CodeChunk, BeamError> {
     let mut r = Reader::new(data, "Code");
     let header_size = r.u32()?;
     let header_end = 4usize
@@ -1007,7 +1035,28 @@ fn parse_code(
     if max_opcode > Opcode::COUNT as u32 {
         return Err(bad("Code", r.pos, "unsupported max opcode"));
     }
-    r.pos = header_end;
+    Ok(CodeChunk {
+        header_size,
+        instruction_set,
+        max_opcode,
+        label_count,
+        function_count,
+        instructions: Vec::new(),
+        bytes: data[header_end..].to_vec(),
+    })
+}
+
+/// The instruction sequence of a Code chunk body (the bytes after its header).
+fn decode_instructions(
+    data: &[u8],
+    max_opcode: u32,
+    label_count: u32,
+    function_count: u32,
+    atoms: usize,
+    literals: usize,
+    types: Option<&TypeTable>,
+) -> Result<Vec<Instr>, BeamError> {
+    let mut r = Reader::new(data, "Code");
     let mut instructions = Vec::new();
     while r.pos < data.len() {
         let offset = r.pos;
@@ -1056,14 +1105,7 @@ fn parse_code(
             validate_labels(arg, label_count, instr.offset)?;
         }
     }
-    Ok(CodeChunk {
-        header_size,
-        instruction_set,
-        max_opcode,
-        label_count,
-        function_count,
-        instructions,
-    })
+    Ok(instructions)
 }
 
 fn validate_labels(arg: &Operand, count: u32, offset: usize) -> Result<(), BeamError> {
@@ -1116,7 +1158,8 @@ mod tests {
             code.extend(word.to_be_bytes());
         }
         code.push(Opcode::AllocateZero as u8);
-        let error = parse_code(&code, 0, 0, None).unwrap_err();
+        let header = parse_code_header(&code).unwrap();
+        let error = decode_instructions(&header.bytes, 191, 1, 0, 0, 0, None).unwrap_err();
         assert!(
             error
                 .to_string()
