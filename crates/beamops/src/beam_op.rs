@@ -2,15 +2,13 @@
 //! reader of beam_file.c (`beamcodereader_read_next`, `beamcodereader_next`,
 //! `synthesize_func_end`), OTP-29.1.1.
 //!
-//! The reader differs from erts' in its input only: erts decodes the operand bytes of the Code
-//! chunk, while `arinsal_beam::parse` has already decoded the whole chunk into [`Instr`]s for
-//! every consumer of the module, so each instruction is converted here from its decoded operands.
+//! The reader works on the bytes of the Code chunk, as erts does (`beamreader_read_tagged`).
 
 use crate::erts_tables::{
     GEN_OPC, GENOP_INT_FUNC_END_2, GENOP_INT_FUNC_START_5, MAX_GENERIC_OPCODE,
 };
 use crate::erts_tables::{GENOP_FUNC_INFO_3, GENOP_INT_CODE_END_0, GENOP_LABEL_1, GENOP_LINE_1};
-use arinsal_beam::{AllocKind, BeamFile, Instr, Operand};
+use arinsal_beam::BeamFile;
 use arinsal_term::Atom;
 
 /// `ERTS_BEAM_MAX_OPARGS`: the arguments `def_args` holds without a separate allocation.
@@ -199,10 +197,19 @@ impl BeamOpAllocator {
 #[derive(Debug)]
 pub(crate) struct ReadError(pub &'static str);
 
+/// `TaggedNumber` (beam_file.c): a tagged value of the code stream. `big` is the
+/// two's complement payload (`ptr_value` with `size`) of an integer that does not fit a word.
+struct Tagged<'a> {
+    tag: u8,
+    value: u64,
+    big: Option<&'a [u8]>,
+}
+
 /// `BeamCodeReader`.
 pub(crate) struct BeamCodeReader<'a> {
     file: &'a BeamFile,
-    instrs: &'a [Instr],
+    /// The Code chunk's instruction bytes (`beamreader` head and end).
+    data: &'a [u8],
     position: usize,
     /// The global atoms of the module's atom table: `atoms->entries[]`.
     atoms: Vec<Atom>,
@@ -223,7 +230,7 @@ impl<'a> BeamCodeReader<'a> {
     pub(crate) fn with_atoms(file: &'a BeamFile, atoms: Vec<Atom>) -> Self {
         Self {
             file,
-            instrs: &file.code.instructions,
+            data: &file.code.bytes,
             position: 0,
             atoms,
             pending: None,
@@ -235,19 +242,146 @@ impl<'a> BeamCodeReader<'a> {
         }
     }
 
+    /// `beamreader_read_u8`.
+    fn read_u8(&mut self) -> Result<u8, ReadError> {
+        let byte = *self
+            .data
+            .get(self.position)
+            .ok_or(ReadError("truncated code"))?;
+        self.position += 1;
+        Ok(byte)
+    }
+
+    /// `beamreader_read_bytes`.
+    fn read_bytes(&mut self, count: usize) -> Result<&'a [u8], ReadError> {
+        let end = self
+            .position
+            .checked_add(count)
+            .filter(|end| *end <= self.data.len())
+            .ok_or(ReadError("truncated code"))?;
+        let bytes = &self.data[self.position..end];
+        self.position = end;
+        Ok(bytes)
+    }
+
+    /// `beamreader_read_tagged`.
+    fn read_tagged(&mut self) -> Result<Tagged<'a>, ReadError> {
+        let mut len_code = self.read_u8()?;
+        let mut tag = len_code & 0x07;
+        if len_code & 0x08 == 0 {
+            return Ok(Tagged {
+                tag,
+                value: u64::from(len_code >> 4),
+                big: None,
+            });
+        }
+        if len_code & 0x10 == 0 {
+            let extra = self.read_u8()?;
+            return Ok(Tagged {
+                tag,
+                value: (u64::from(len_code >> 5) << 8) | u64::from(extra),
+                big: None,
+            });
+        }
+        len_code >>= 5;
+        let count = if len_code < 7 {
+            usize::from(len_code) + 2
+        } else {
+            let prefix = self.read_tagged()?;
+            if prefix.tag != TAG_U || prefix.big.is_some() {
+                return Err(ReadError("bad size prefix"));
+            }
+            // LoadAssert(unpacked_size < (ERTS_SINT32_MAX - size_base))
+            if prefix.value >= (i32::MAX as u64) - 9 {
+                return Err(ReadError("size prefix too large"));
+            }
+            prefix.value as usize + 9
+        };
+        let data = self.read_bytes(count)?;
+        // Try to unpack the value into a word if possible.
+        if count <= 8 {
+            let word = data
+                .iter()
+                .fold(0u64, |word, byte| (word << 8) | u64::from(*byte));
+            if tag == TAG_I {
+                let shift = 8 * (8 - count as u32);
+                let extended = ((word << shift) as i64) >> shift;
+                if (-(1_i64 << 59)..(1_i64 << 59)).contains(&extended) {
+                    return Ok(Tagged {
+                        tag,
+                        value: extended as u64,
+                        big: None,
+                    });
+                }
+            } else if (word as i64) >= 0 {
+                return Ok(Tagged {
+                    tag,
+                    value: word,
+                    big: None,
+                });
+            }
+        }
+        // Integers (TAG_i) are the only values allowed to be negative or larger than a word.
+        // Indicate overflow by changing the tag to TAG_o.
+        if tag != TAG_I {
+            tag = TAG_O;
+        }
+        Ok(Tagged {
+            tag,
+            value: 0,
+            big: Some(data),
+        })
+    }
+
+    /// `marshal_integer` for the sized form: a bignum literal, or `TAG_o` when it cannot be one.
+    fn marshal_big(&mut self, data: &[u8]) -> BeamOpArg {
+        // `bytes_to_big` gives up above BIG_ARITY_MAX words.
+        const BIG_ARITY_MAX: usize = (1 << 26) - 1;
+        if data.len() > BIG_ARITY_MAX * 8 {
+            return BeamOpArg::new(TAG_O, 0);
+        }
+        let value = num_bigint::BigInt::from_signed_bytes_be(data);
+        let index = self.literal_base + self.bignum_literals.len();
+        self.bignum_literals.push(value.to_string());
+        BeamOpArg::new(TAG_Q, index as u64)
+    }
+
+    /// `marshal_allocation_list`: the size of the allocation list in words.
+    fn marshal_allocation_list(&mut self) -> Result<u64, ReadError> {
+        let count = self.read_tagged()?;
+        if count.tag != TAG_U || count.big.is_some() || count.value > 3 {
+            return Err(ReadError("bad allocation list"));
+        }
+        let mut sum: u64 = 0;
+        for _ in 0..count.value {
+            let kind = self.read_tagged()?;
+            if kind.tag != TAG_U || kind.big.is_some() || kind.value > i32::MAX as u64 {
+                return Err(ReadError("bad allocation list"));
+            }
+            let number = self.read_tagged()?;
+            if number.tag != TAG_U || number.big.is_some() || number.value > (i32::MAX as u64) / 3 {
+                return Err(ReadError("bad allocation list"));
+            }
+            sum += match kind.value {
+                0 => number.value,
+                1 | 2 => 2 * number.value,
+                _ => return Err(ReadError("Invalid allocation tag")),
+            };
+            if sum > i32::MAX as u64 {
+                return Err(ReadError("allocation list too large"));
+            }
+        }
+        Ok(sum)
+    }
+
     /// `beamcodereader_read_next`: the instruction at the reader's position as a `BeamOp`.
     fn read_next(&mut self, alloc: &mut BeamOpAllocator) -> Result<OpId, ReadError> {
-        let instr = self
-            .instrs
-            .get(self.position)
-            .ok_or(ReadError("invalid opcode"))?;
-        self.position += 1;
-        let opcode = instr.op as usize;
         // LoadAssert(opcode > 0 && opcode <= MAX_GENERIC_OPCODE);
+        let opcode = usize::from(self.read_u8()?);
         if opcode == 0 || opcode > MAX_GENERIC_OPCODE {
             return Err(ReadError("invalid opcode"));
         }
-        let arity = GEN_OPC[opcode].arity;
+        let mut arity = GEN_OPC[opcode].arity;
         debug_assert!(arity <= ERTS_BEAM_MAX_OPARGS);
         let id = alloc.new_op();
         {
@@ -255,120 +389,125 @@ impl<'a> BeamCodeReader<'a> {
             op.op = opcode as i32;
             op.arity = arity;
         }
-        let mut arity = arity;
         let mut i = 0;
-        for operand in &instr.args {
-            let mut raw = self.read_operand(operand)?;
-            if let Operand::List(items) = operand {
-                // Lists may only be the last argument.
-                if i + 1 != arity {
-                    return Err(ReadError("a list that is not the last operand"));
+        while i < arity {
+            let mut raw = self.read_tagged()?;
+            let mut arg = BeamOpArg::new(raw.tag, raw.value);
+            match raw.tag {
+                TAG_U | TAG_Q | TAG_O => {}
+                TAG_A => {
+                    if raw.value == 0 {
+                        arg = BeamOpArg::new(TAG_N, NIL);
+                    } else {
+                        let atom = self
+                            .atoms
+                            .get(raw.value as usize - 1)
+                            .ok_or(ReadError("atom index out of range"))?;
+                        arg = BeamOpArg::new(TAG_A, u64::from(atom.0));
+                    }
                 }
-                // The count of the list is the argument; its elements follow.
-                arity += items.len();
-                let op = alloc.op_mut(id);
-                op.arity = arity;
-                // Expand the argument array if necessary.
-                if arity > ERTS_BEAM_MAX_OPARGS {
-                    debug_assert!(op.uses_def_args());
-                    op.spill(arity, i);
+                TAG_F => {
+                    if raw.value == 0 {
+                        arg = BeamOpArg::new(TAG_P, 0);
+                    } else if raw.value >= u64::from(self.file.code.label_count) {
+                        return Err(ReadError("label index out of range"));
+                    }
                 }
-                raw = BeamOpArg::new(TAG_U, items.len() as u64);
-                alloc.op_mut(id).set_a(i, raw);
-                i += 1;
-                for item in items.iter() {
-                    let element = self.read_operand(item)?;
-                    alloc.op_mut(id).set_a(i, element);
-                    i += 1;
+                TAG_I => {
+                    if let Some(data) = raw.big {
+                        arg = self.marshal_big(data);
+                    }
                 }
-                continue;
+                TAG_X | TAG_Y => {
+                    if raw.value >= MAX_REG {
+                        return Err(ReadError("register out of range"));
+                    }
+                }
+                // Extended tags.
+                TAG_Z => match raw.value {
+                    // Floating point number superseded in OTP R16B.
+                    0 => return Err(ReadError("Floating point number superseded in OTP R16B")),
+                    // Argument list.
+                    1 => {
+                        // Lists may only be the last argument.
+                        if i + 1 != arity {
+                            return Err(ReadError("a list that is not the last operand"));
+                        }
+                        let extra = self.read_tagged()?;
+                        if extra.tag != TAG_U || extra.big.is_some() {
+                            return Err(ReadError("bad list count"));
+                        }
+                        // Every element takes at least a byte.
+                        if extra.value as usize > self.data.len() - self.position {
+                            return Err(ReadError("list count exceeds code"));
+                        }
+                        arity += extra.value as usize;
+                        let op = alloc.op_mut(id);
+                        op.arity = arity;
+                        // Expand the argument array if necessary.
+                        if arity > ERTS_BEAM_MAX_OPARGS && op.uses_def_args() {
+                            op.spill(arity, i);
+                        }
+                        arg = BeamOpArg::new(TAG_U, extra.value);
+                    }
+                    // Float register.
+                    2 => {
+                        let index = self.read_tagged()?;
+                        if index.tag != TAG_U || index.big.is_some() || index.value >= MAX_REG {
+                            return Err(ReadError("register out of range"));
+                        }
+                        arg = BeamOpArg::new(TAG_L, index.value);
+                    }
+                    // Allocation list.
+                    3 => arg = BeamOpArg::new(TAG_U, self.marshal_allocation_list()?),
+                    // Literal.
+                    4 => {
+                        let index = self.read_tagged()?;
+                        // The referenced literal must be defined in the file, it must not have
+                        // been created at runtime.
+                        if index.tag != TAG_U
+                            || index.big.is_some()
+                            || index.value >= self.file.literals.len() as u64
+                        {
+                            return Err(ReadError("literal index out of range"));
+                        }
+                        arg = BeamOpArg::new(TAG_Q, index.value);
+                    }
+                    // Register with type hint.
+                    5 => {
+                        raw = self.read_tagged()?;
+                        if (raw.tag != TAG_X && raw.tag != TAG_Y) || raw.big.is_some() {
+                            return Err(ReadError("a type hint on a non-register"));
+                        }
+                        if raw.value >= MAX_REG {
+                            return Err(ReadError("register out of range"));
+                        }
+                        let index = self.read_tagged()?;
+                        if index.tag != TAG_U || index.big.is_some() {
+                            return Err(ReadError("bad type index"));
+                        }
+                        arg = BeamOpArg::new(raw.tag, raw.value);
+                        // A module whose type table was stripped treats these as ordinary
+                        // registers.
+                        if let Some(types) = &self.file.types {
+                            if index.value >= types.entries.len() as u64 {
+                                return Err(ReadError("type index out of range"));
+                            }
+                            arg.val |= index.value << REG_TYPE_SHIFT;
+                        }
+                    }
+                    _ => return Err(ReadError("Unrecognized extended tag")),
+                },
+                _ => return Err(ReadError("Unrecognized tag")),
             }
-            alloc.op_mut(id).set_a(i, raw);
+            // All arguments must be words except for TAG_o, which is valueless.
+            if raw.big.is_some() && arg.ty != TAG_O && arg.ty != TAG_Q {
+                return Err(ReadError("operand wider than a word"));
+            }
+            alloc.op_mut(id).set_a(i, arg);
             i += 1;
         }
-        if i != arity {
-            return Err(ReadError("wrong operand count"));
-        }
         Ok(id)
-    }
-
-    /// The tagged-number switch of `beamcodereader_read_next` for one operand.
-    fn read_operand(&mut self, operand: &Operand) -> Result<BeamOpArg, ReadError> {
-        Ok(match operand {
-            Operand::U(value) => BeamOpArg::new(TAG_U, *value),
-            // `marshal_integer`: a small integer stays `TAG_i`; one the beam file stores in the
-            // sized form but that does not fit a small integer is a bignum literal.
-            Operand::Int(value) if (-(1_i64 << 59)..(1_i64 << 59)).contains(value) => {
-                BeamOpArg::new(TAG_I, *value as u64)
-            }
-            Operand::Int(value) => {
-                let index = self.literal_base + self.bignum_literals.len();
-                self.bignum_literals.push(value.to_string());
-                BeamOpArg::new(TAG_Q, index as u64)
-            }
-            // `marshal_integer`: a bignum becomes a literal.
-            Operand::BigInt(value) => {
-                let index = self.literal_base + self.bignum_literals.len();
-                self.bignum_literals.push(value.to_string());
-                BeamOpArg::new(TAG_Q, index as u64)
-            }
-            Operand::Atom(0) => BeamOpArg::new(TAG_N, NIL),
-            Operand::Atom(index) => {
-                let atom = *self
-                    .atoms
-                    .get(*index as usize - 1)
-                    .ok_or(ReadError("atom index out of range"))?;
-                BeamOpArg::new(TAG_A, u64::from(atom.0))
-            }
-            Operand::Nil => BeamOpArg::new(TAG_N, NIL),
-            Operand::Label(0) => BeamOpArg::new(TAG_P, 0),
-            Operand::Label(label) => BeamOpArg::new(TAG_F, u64::from(*label)),
-            Operand::X(register) | Operand::Y(register) => {
-                if u64::from(*register) >= MAX_REG {
-                    return Err(ReadError("register out of range"));
-                }
-                let tag = if matches!(operand, Operand::X(_)) {
-                    TAG_X
-                } else {
-                    TAG_Y
-                };
-                BeamOpArg::new(tag, u64::from(*register))
-            }
-            // The float register of the extended tag 2.
-            Operand::FR(register) => {
-                if u64::from(*register) >= MAX_REG {
-                    return Err(ReadError("register out of range"));
-                }
-                BeamOpArg::new(TAG_L, u64::from(*register))
-            }
-            // The allocation list of the extended tag 3: its size in words.
-            Operand::Alloc(items) => {
-                let words = items.iter().fold(0_u64, |total, item| {
-                    total.saturating_add(match item.kind {
-                        AllocKind::Words => item.count,
-                        AllocKind::Floats | AllocKind::Funs => item.count.saturating_mul(2),
-                    })
-                });
-                BeamOpArg::new(TAG_U, words)
-            }
-            Operand::Literal(index) => BeamOpArg::new(TAG_Q, u64::from(*index)),
-            // The register with type hint of the extended tag 5.
-            Operand::TypedReg { reg, type_index } => {
-                let mut register = self.read_operand(reg)?;
-                if register.ty != TAG_X && register.ty != TAG_Y {
-                    return Err(ReadError("a type hint on a non-register"));
-                }
-                // A module whose type table was stripped treats these as ordinary registers.
-                if self.file.types.is_some() {
-                    register.val |= u64::from(*type_index) << REG_TYPE_SHIFT;
-                }
-                register
-            }
-            // The compiler never emits a character operand; erts rejects the tag.
-            Operand::Char(_) => return Err(ReadError("Unrecognized tag")),
-            // The list is handled by the caller.
-            Operand::List(_) => BeamOpArg::new(TAG_U, 0),
-        })
     }
 
     /// `synthesize_func_end`.
@@ -562,5 +701,120 @@ mod tests {
         let reused = alloc.new_op();
         assert_eq!(reused, id);
         assert!(alloc.op(reused).uses_def_args());
+    }
+
+    use arinsal_beam::{AllocKind, Instr, Operand, parse};
+
+    /// What the operand of a decoded instruction must become: the `beamcodereader_read_next`
+    /// switch applied to `arinsal_beam`'s decoding, which is an independent decoder of the same
+    /// bytes.
+    fn expected(
+        file: &BeamFile,
+        atoms: &[Atom],
+        operand: &Operand,
+        bignums: &mut Vec<String>,
+    ) -> BeamOpArg {
+        let big = |bignums: &mut Vec<String>, text: String| {
+            let index = file.literals.len() + bignums.len();
+            bignums.push(text);
+            BeamOpArg::new(TAG_Q, index as u64)
+        };
+        match operand {
+            Operand::U(value) => BeamOpArg::new(TAG_U, *value),
+            Operand::Int(value) if (-(1_i64 << 59)..(1_i64 << 59)).contains(value) => {
+                BeamOpArg::new(TAG_I, *value as u64)
+            }
+            Operand::Int(value) => big(bignums, value.to_string()),
+            Operand::BigInt(value) => big(bignums, value.to_string()),
+            Operand::Atom(0) | Operand::Nil => BeamOpArg::new(TAG_N, NIL),
+            Operand::Atom(index) => BeamOpArg::new(TAG_A, u64::from(atoms[*index as usize - 1].0)),
+            Operand::Label(0) => BeamOpArg::new(TAG_P, 0),
+            Operand::Label(label) => BeamOpArg::new(TAG_F, u64::from(*label)),
+            Operand::X(register) => BeamOpArg::new(TAG_X, u64::from(*register)),
+            Operand::Y(register) => BeamOpArg::new(TAG_Y, u64::from(*register)),
+            Operand::FR(register) => BeamOpArg::new(TAG_L, u64::from(*register)),
+            Operand::Alloc(items) => BeamOpArg::new(
+                TAG_U,
+                items
+                    .iter()
+                    .map(|item| match item.kind {
+                        AllocKind::Words => item.count,
+                        AllocKind::Floats | AllocKind::Funs => 2 * item.count,
+                    })
+                    .sum(),
+            ),
+            Operand::Literal(index) => BeamOpArg::new(TAG_Q, u64::from(*index)),
+            Operand::TypedReg { reg, type_index } => {
+                let mut arg = expected(file, atoms, reg, bignums);
+                if file.types.is_some() {
+                    arg.val |= u64::from(*type_index) << REG_TYPE_SHIFT;
+                }
+                arg
+            }
+            Operand::Char(_) | Operand::List(_) => unreachable!(),
+        }
+    }
+
+    fn check_module(path: &std::path::Path) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let Ok(file) = parse(&bytes) else { return };
+        let atoms: Vec<Atom> = file
+            .atoms
+            .iter()
+            .map(|name| arinsal_term::global_atoms().intern(name).unwrap())
+            .collect();
+        let mut alloc = BeamOpAllocator::new();
+        let mut reader = BeamCodeReader::with_atoms(&file, atoms.clone());
+        let mut bignums = Vec::new();
+        for instr in &file.code.instructions {
+            let Instr { op, args, .. } = instr;
+            let id = reader.read_next(&mut alloc).unwrap();
+            let got = alloc.op(id);
+            assert_eq!(got.op, *op as i32, "{}", path.display());
+            let mut want: Vec<BeamOpArg> = Vec::new();
+            for operand in args {
+                if let Operand::List(items) = operand {
+                    want.push(BeamOpArg::new(TAG_U, items.len() as u64));
+                    for item in items.iter() {
+                        want.push(expected(&file, &atoms, item, &mut bignums));
+                    }
+                } else {
+                    want.push(expected(&file, &atoms, operand, &mut bignums));
+                }
+            }
+            assert_eq!(got.args(), want.as_slice(), "{} {:?}", path.display(), op);
+        }
+        assert_eq!(reader.bignum_literals, bignums, "{}", path.display());
+    }
+
+    #[test]
+    fn the_byte_reader_equals_the_decoded_instruction_stream() {
+        let Ok(output) = std::process::Command::new("erl")
+            .args([
+                "-noshell",
+                "-eval",
+                "io:format(\"~s\", [string:join([P || P <- code:get_path(), P =/= \".\"], \"\\n\")]), halt().",
+            ])
+            .output()
+        else {
+            eprintln!("erl unavailable; skipping");
+            return;
+        };
+        let dirs = String::from_utf8(output.stdout).unwrap();
+        let mut checked = 0;
+        for dir in dirs.lines().take(12) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.path().extension().is_some_and(|e| e == "beam") {
+                    check_module(&entry.path());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "{checked}");
     }
 }
