@@ -97,10 +97,12 @@ fn otp29_jit_specific_op_names_and_argument_types() {
             "{module}: parsed {} instructions",
             beam.code.instructions.len()
         );
-        let ours_ops = transform_module(&beam)
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let transformed = if std::env::var_os("BEAMOPS_LEGACY").is_some() {
+            transform_module(&beam)
+        } else {
+            arinsal_beamops::try_transform_module(&beam, false, false).unwrap()
+        };
+        let ours_ops = transformed.into_iter().flatten().collect::<Vec<_>>();
         let dump = fs::read_to_string(dir.join(format!("{module}.asm"))).unwrap();
         let expected_ops = dump
             .lines()

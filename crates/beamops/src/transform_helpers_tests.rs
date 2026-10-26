@@ -80,7 +80,7 @@ fn select_val_sorts_the_values_and_splits_the_labels() {
         eprintln!("erl unavailable; skipping");
         return;
     };
-    let mut st = LoaderState::new(&beam, None, 0).unwrap();
+    let mut st = LoaderState::new(&beam, BeamOpAllocator::new(), None, 0).unwrap();
     let rest = op_with(&mut st, &pairs(&[(5, 50), (3, 30), (9, 90)]));
     let op =
         generators::select_val(&mut st, arg(TAG_X, 0), arg(TAG_F, 1), arg(TAG_U, 6), rest).unwrap();
@@ -109,7 +109,7 @@ fn jump_tab_fills_gaps_with_the_failure_label() {
         eprintln!("erl unavailable; skipping");
         return;
     };
-    let mut st = LoaderState::new(&beam, None, 0).unwrap();
+    let mut st = LoaderState::new(&beam, BeamOpAllocator::new(), None, 0).unwrap();
     let rest = op_with(&mut st, &pairs(&[(10, 1), (12, 2), (13, 3)]));
     assert!(predicates::use_jump_tab(&mut st, arg(TAG_U, 6), rest, 3));
     let op =
@@ -127,7 +127,7 @@ fn map_key_sort_orders_keys_like_a_flatmap() {
         eprintln!("erl unavailable; skipping");
         return;
     };
-    let mut st = LoaderState::new(&beam, None, 0).unwrap();
+    let mut st = LoaderState::new(&beam, BeamOpAllocator::new(), None, 0).unwrap();
     let rest = op_with(
         &mut st,
         &[
@@ -164,7 +164,7 @@ fn registers_compare_without_their_type_index() {
         eprintln!("erl unavailable; skipping");
         return;
     };
-    let mut st = LoaderState::new(&beam, None, 0).unwrap();
+    let mut st = LoaderState::new(&beam, BeamOpAllocator::new(), None, 0).unwrap();
     let typed = arg(TAG_X, 3 | (5 << 10));
     assert!(predicates::equal(&mut st, typed, arg(TAG_X, 3)));
     assert!(!predicates::distinct(&mut st, typed, arg(TAG_X, 3)));
@@ -187,7 +187,7 @@ fn bs_match_with_an_unknown_command_becomes_bad_bs_match() {
         eprintln!("erl unavailable; skipping");
         return;
     };
-    let mut st = LoaderState::new(&beam, None, 0).unwrap();
+    let mut st = LoaderState::new(&beam, BeamOpAllocator::new(), None, 0).unwrap();
     let unknown = arg(TAG_A, am("hibernate"));
     let rest = op_with(&mut st, &[unknown]);
     let op =

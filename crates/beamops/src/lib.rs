@@ -5,8 +5,10 @@
 #[allow(dead_code)]
 mod beam_op;
 mod erts_tables;
+mod load_code;
 #[allow(dead_code)]
 mod loader_state;
+pub use load_code::LoadCodeError;
 #[path = "rule_syntax.rs"]
 mod rule_syntax;
 #[allow(dead_code)]
@@ -245,6 +247,9 @@ pub struct TransformArena {
     lists: Vec<SpecificOperand>,
     allocations: Vec<(u8, u64)>,
     functions: Vec<FunctionOps>,
+    /// The operation allocator of the engine that follows erts (`op_allocator`), kept between
+    /// modules so freed operations are reused.
+    beam_ops: beam_op::BeamOpAllocator,
 }
 
 impl TransformArena {
@@ -2639,4 +2644,38 @@ mod type_bits_tests {
 #[doc(hidden)]
 pub fn erts_programs_dump() -> &'static str {
     include_str!(concat!(env!("OUT_DIR"), "/erts_programs.txt"))
+}
+
+/// Transforms a module with the engine that follows erts (`load_code`), into reusable arena
+/// storage; `Err` is a module erts refuses to load.
+#[doc(hidden)]
+pub fn try_transform_module_in_arena(
+    beam: &BeamFile,
+    instrument_line_breakpoints: bool,
+    typed: bool,
+    arena: &mut TransformArena,
+) -> Result<(), LoadCodeError> {
+    load_code::load_code(beam, instrument_line_breakpoints, typed, arena)
+}
+
+/// The module as `load_code` loads it, one list of operations per function.
+#[doc(hidden)]
+pub fn try_transform_module(
+    beam: &BeamFile,
+    instrument_line_breakpoints: bool,
+    typed: bool,
+) -> Result<Vec<Vec<SpecificOp>>, LoadCodeError> {
+    let mut arena = TransformArena::new();
+    load_code::load_code(beam, instrument_line_breakpoints, typed, &mut arena)?;
+    Ok(arena
+        .functions
+        .iter()
+        .map(|range| {
+            arena
+                .ops(*range)
+                .iter()
+                .map(|op| materialize_op(&arena, op))
+                .collect()
+        })
+        .collect())
 }
