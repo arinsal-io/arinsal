@@ -9,7 +9,7 @@ use arinsal_term::{
 };
 use parking_lot::Mutex;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -2498,75 +2498,12 @@ fn send_open_reply(handle: &PortHandle, result: Result<(), Term>) {
     }
 }
 
-/// Registrations of the shared poller that `driver_select` holds.
-#[derive(Default)]
-struct DrvPollState {
-    live: HashMap<u64, crate::check_io::Registration>,
-    /// Fired before `register` returned its handle.
-    fired: HashSet<u64>,
-}
+/// The shared descriptor table as the `driver_select` state of each descriptor.
+struct VmFdTable;
 
-/// Registration bookkeeping shards: ports arm and fire their events concurrently, so the
-/// table is split by registration id.
-const POLL_SHARDS: usize = 64;
-
-/// The shared poller as the `driver_select` poll set.
-struct DrvPoll {
-    state: Arc<Vec<Mutex<DrvPollState>>>,
-}
-
-impl DrvPoll {
-    fn new() -> Self {
-        Self {
-            state: Arc::new(
-                (0..POLL_SHARDS)
-                    .map(|_| Mutex::new(DrvPollState::default()))
-                    .collect(),
-            ),
-        }
-    }
-}
-
-impl arinsal_drv::PollBackend for DrvPoll {
-    fn register(
-        &self,
-        id: u64,
-        fd: i32,
-        write: bool,
-        ready: Box<dyn FnOnce() + Send>,
-    ) -> std::io::Result<()> {
-        let state = Arc::clone(&self.state);
-        let registration = crate::check_io::register_driver(
-            fd,
-            crate::check_io::InterestSet {
-                readable: !write,
-                writable: write,
-            },
-            move |_, _| {
-                {
-                    let mut state = state[id as usize % POLL_SHARDS].lock();
-                    if state.live.remove(&id).is_none() {
-                        state.fired.insert(id);
-                    }
-                }
-                ready();
-            },
-        )?;
-        let mut state = self.state[id as usize % POLL_SHARDS].lock();
-        if !state.fired.remove(&id) {
-            state.live.insert(id, registration);
-        }
-        Ok(())
-    }
-
-    fn deregister(&self, id: u64) {
-        let registration = self.state[id as usize % POLL_SHARDS]
-            .lock()
-            .live
-            .remove(&id);
-        if let Some(registration) = registration {
-            crate::check_io::deregister(registration);
-        }
+impl arinsal_drv::FdTable for VmFdTable {
+    fn with_slot(&self, fd: i32, f: &mut dyn FnMut(&mut arinsal_drv::SelSlot)) -> i32 {
+        crate::check_io::with_sel(fd, f)
     }
 }
 
@@ -2623,7 +2560,7 @@ impl arinsal_drv::SystemHooks for VmHooks {
 pub(crate) fn install_poll_backend() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
-        arinsal_drv::set_poll_backend(Arc::new(DrvPoll::new()));
+        arinsal_drv::set_fd_table(Arc::new(VmFdTable));
         crate::check_io::install_scheduler_polling();
     });
 }

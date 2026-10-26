@@ -21,7 +21,6 @@ mod hooks;
 mod linebuf;
 mod lock;
 mod native;
-mod poll;
 pub mod port_task;
 mod select;
 mod task;
@@ -32,7 +31,6 @@ pub use asyncq::set_async_threads;
 pub fn flush_async_exit() {
     asyncq::flush_exit();
 }
-pub use poll::{PollBackend, set_poll_backend};
 mod mem;
 mod queue;
 mod termspec;
@@ -59,7 +57,10 @@ pub use hooks::{SystemHooks, set_system_hooks};
 use linebuf::LineBuf;
 use lock::{ReentrantGuard, ReentrantLock};
 pub use native::{NativeDriver, SELECT_READ, SELECT_USE, SELECT_WRITE};
-pub use select::{NifSelectMessage, NifSelectResource, nif_select};
+pub use select::{
+    Action, FdSel, FdTable, NifSelectMessage, NifSelectResource, SelSlot, is_driver_selection,
+    nif_select, poll_event, rejected, selection_counts, set_fd_table, wanted,
+};
 
 // Port of erts/emulator/beam/global.h:172-181 (ERL_DE_* load error codes), OTP-29.1.1.
 /// No error.
