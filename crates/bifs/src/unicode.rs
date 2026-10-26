@@ -801,7 +801,6 @@ fn process_binary(
     Ok(None)
 }
 
-#[inline(always)]
 fn characters_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match characters_to_binary_result(ctx, args) {
         Ok(_) if ctx.has_deferred() => match *ctx.take_deferred().expect("deferred Unicode trap") {
@@ -1204,7 +1203,8 @@ mod tests {
             .cons(binary, Term::NIL)
             .unwrap();
         let utf8 = Term::atom(global_atoms().intern("utf8").unwrap());
-        let mut ctx = Ctx::new(&mut allocator);
+        let mut state = crate::BifState::default();
+        let mut ctx = Ctx::new(&mut allocator, &mut state);
 
         similar_asserts::assert_eq!(
             characters_to_binary_result(&mut ctx, &[binary, utf8]).unwrap(),
@@ -1217,7 +1217,6 @@ mod tests {
     }
 }
 
-#[inline(always)]
 fn characters_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match convert_charged(ctx, args, true) {
         Ok(_value) if ctx.has_deferred() => {
@@ -1628,7 +1627,6 @@ fn filename_list_bytes(root: Term, encoding: FilenameEncoding) -> Result<Vec<u8>
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2629 (prim_file_internal_name2native_1), OTP-29.1.1.
-#[inline(always)]
 fn internal_name2native(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match internal_name2native_result(ctx, args) {
         Ok(value) => value,
@@ -1655,7 +1653,6 @@ fn codepoint_list(ctx: &mut Ctx<'_>, points: impl IntoIterator<Item = u32>) -> T
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2735 (prim_file_internal_native2name_1), OTP-29.1.1.
-#[inline(always)]
 fn internal_native2name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match internal_native2name_result(ctx, args) {
         Ok(value) => value,
@@ -1687,7 +1684,6 @@ fn internal_native2name_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term,
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2826 (prim_file_internal_normalize_utf8_1), OTP-29.1.1.
-#[inline(always)]
 fn internal_normalize_utf8(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match internal_normalize_utf8_result(ctx, args) {
         Ok(value) => value,
@@ -1703,7 +1699,6 @@ fn internal_normalize_utf8_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Te
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2855 (prim_file_is_translatable_1), OTP-29.1.1.
-#[inline(always)]
 fn is_translatable(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match is_translatable_result(ctx, args) {
         Ok(value) => value,
@@ -1761,7 +1756,6 @@ fn filename_encoding() -> FilenameEncoding {
 }
 
 // Port of erts/emulator/beam/erl_unicode.c (file_native_name_encoding_0), OTP-29.1.1.
-#[inline(always)]
 fn native_name_encoding(_: &mut Ctx<'_>, _: &[Term]) -> Term {
     atom(match filename_encoding() {
         FilenameEncoding::Latin1 => "latin1",
@@ -1770,7 +1764,6 @@ fn native_name_encoding(_: &mut Ctx<'_>, _: &[Term]) -> Term {
 }
 
 // OTP 29.1.1 defaults without the +pc emulator flag.
-#[inline(always)]
 fn printable_range(_: &mut Ctx<'_>, _: &[Term]) -> Term {
     atom("latin1")
 }

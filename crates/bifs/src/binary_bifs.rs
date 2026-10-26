@@ -54,14 +54,12 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
 }
 
 // Port of erts/emulator/beam/erl_bif_guard.c:376 (byte_size_1), OTP-29.1.1.
-#[inline(always)]
 fn byte_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let bits = bitstring_bit_len(args[0])?;
     integer(ctx, bits.div_ceil(8))
 }
 
 // Port of erts/emulator/beam/erl_bif_guard.c:354 (bit_size_1), OTP-29.1.1.
-#[inline(always)]
 fn bit_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, bitstring_bit_len(args[0])?)
 }
@@ -1299,7 +1297,6 @@ fn list_to_bitstring(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:1954-2038 (erts_binary_part), OTP-29.1.1.
-#[inline(always)]
 fn binary_part_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let (mut position, mut length) = if args.len() == 2 {
         if tuple_arity(args[1])? != 2 {
@@ -1351,7 +1348,6 @@ pub fn binary_part_2(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
 }
 
 // Port of erts/emulator/beam/binary.c:476-513 (split_binary_2), OTP-29.1.1.
-#[inline(always)]
 fn split_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let bits = bitstring_bit_len(args[0])?;
     let at = args[1].as_small().ok_or(BADARG)?;
@@ -1373,7 +1369,6 @@ fn split_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifErro
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2286-2313 (binary_first_1), OTP-29.1.1.
-#[inline(always)]
 fn binary_first_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     with_binary_input(args[0], |bytes| {
         let byte = bytes.first().ok_or(BADARG)?;
@@ -1382,7 +1377,6 @@ fn binary_first_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifErro
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2316-2343 (binary_last_1), OTP-29.1.1.
-#[inline(always)]
 fn binary_last_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     with_binary_input(args[0], |bytes| {
         let byte = bytes.last().ok_or(BADARG)?;
@@ -1391,7 +1385,6 @@ fn binary_last_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2335-2368 (binary_at_2), OTP-29.1.1.
-#[inline(always)]
 fn binary_at_result(_ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     with_binary_bytes(args[0], |view| {
         if !view.bit_len().is_multiple_of(8) {
@@ -1452,7 +1445,6 @@ fn binary_copy_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2515-2555 (binary_referenced_byte_size_1), OTP-29.1.1.
-#[inline(always)]
 fn referenced_byte_size_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let bytes = with_binary_bytes(args[0], |view| view.referenced_size())?;
     integer(ctx, bytes)
@@ -1855,7 +1847,6 @@ fn byte_order(args: &[Term]) -> Result<bool, BifError> {
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2572-2647, 2818-2826 (encode_unsigned), OTP-29.1.1.
-#[inline(always)]
 fn encode_unsigned_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let value = bigint(args[0])?;
     if value.sign() == Sign::Minus {
@@ -1874,7 +1865,6 @@ fn encode_unsigned_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifE
 }
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2649-2683, 2828-2835 (decode_unsigned), OTP-29.1.1.
-#[inline(always)]
 fn decode_unsigned_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let little_endian = byte_order(args)?;
     with_binary_input(args[0], |bytes| {
@@ -1891,7 +1881,6 @@ fn decode_unsigned_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifE
 
 macro_rules! word_result_body {
     ($name:ident, $result:ident) => {
-        #[inline(always)]
         fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
             match $result(ctx, args) {
                 Ok(value) => value,

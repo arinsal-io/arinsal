@@ -19,7 +19,9 @@ fn one_megabyte_mixed_term() {
     let decode = lookup("erlang", "binary_to_term", 1).unwrap();
     let mut output_heap = ProcessHeap::with_words(256);
     let mut output_alloc = ProcessHeapHandle(&mut output_heap);
-    let binary = encode(&mut Ctx::new(&mut output_alloc), &[term]).unwrap();
+    let mut output_state = arinsal_bifs::BifState::default();
+    let mut output_ctx = Ctx::new(&mut output_alloc, &mut output_state);
+    let binary = encode(&mut output_ctx, &[term]).unwrap();
     // SAFETY: the output heap retains the binary and does not move during the benchmark.
     let size = unsafe { binary.binary_ref() }.unwrap().bit_len() / 8;
     assert!((1_000_000..1_100_000).contains(&size), "{size}");
@@ -27,25 +29,33 @@ fn one_megabyte_mixed_term() {
     for _ in 0..10 {
         let mut heap = ProcessHeap::with_words(256);
         let mut alloc = ProcessHeapHandle(&mut heap);
-        black_box(encode(&mut Ctx::new(&mut alloc), &[term]).unwrap());
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut state);
+        black_box(encode(&mut ctx, &[term]).unwrap());
     }
     let started = Instant::now();
     for _ in 0..rounds {
         let mut heap = ProcessHeap::with_words(256);
         let mut alloc = ProcessHeapHandle(&mut heap);
-        black_box(encode(&mut Ctx::new(&mut alloc), &[term]).unwrap());
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut state);
+        black_box(encode(&mut ctx, &[term]).unwrap());
     }
     let encode_us = started.elapsed().as_micros() as f64 / rounds as f64;
     for _ in 0..10 {
         let mut heap = ProcessHeap::with_words(16_000);
         let mut alloc = ProcessHeapHandle(&mut heap);
-        black_box(decode(&mut Ctx::new(&mut alloc), &[binary]).unwrap());
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut state);
+        black_box(decode(&mut ctx, &[binary]).unwrap());
     }
     let started = Instant::now();
     for _ in 0..rounds {
         let mut heap = ProcessHeap::with_words(16_000);
         let mut alloc = ProcessHeapHandle(&mut heap);
-        black_box(decode(&mut Ctx::new(&mut alloc), &[binary]).unwrap());
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut state);
+        black_box(decode(&mut ctx, &[binary]).unwrap());
     }
     let decode_us = started.elapsed().as_micros() as f64 / rounds as f64;
     eprintln!(
@@ -59,7 +69,9 @@ fn requested_scalar_cases() {
     let make_ref = lookup("erlang", "make_ref", 0).unwrap();
     let mut ref_heap = ProcessHeap::with_words(256);
     let mut ref_alloc = ProcessHeapHandle(&mut ref_heap);
-    let local_ref = make_ref(&mut Ctx::new(&mut ref_alloc), &[]).unwrap();
+    let mut ref_state = arinsal_bifs::BifState::default();
+    let mut ref_ctx = Ctx::new(&mut ref_alloc, &mut ref_state);
+    let local_ref = make_ref(&mut ref_ctx, &[]).unwrap();
 
     let mut source_heap = ProcessHeap::with_words(4096);
     let mut builder = TermBuilder::new(&mut source_heap);
@@ -124,7 +136,9 @@ fn requested_scalar_cases() {
         for _ in 0..10_000 {
             let mut heap = ProcessHeap::with_words(256);
             let mut alloc = ProcessHeapHandle(&mut heap);
-            black_box(encode(&mut Ctx::new(&mut alloc), &[black_box(term)]).unwrap());
+            let mut state = arinsal_bifs::BifState::default();
+            let mut ctx = Ctx::new(&mut alloc, &mut state);
+            black_box(encode(&mut ctx, &[black_box(term)]).unwrap());
         }
         let mut samples = Vec::with_capacity(5);
         for _ in 0..5 {
@@ -132,7 +146,9 @@ fn requested_scalar_cases() {
             for _ in 0..rounds {
                 let mut heap = ProcessHeap::with_words(256);
                 let mut alloc = ProcessHeapHandle(&mut heap);
-                black_box(encode(&mut Ctx::new(&mut alloc), &[black_box(term)]).unwrap());
+                let mut state = arinsal_bifs::BifState::default();
+                let mut ctx = Ctx::new(&mut alloc, &mut state);
+                black_box(encode(&mut ctx, &[black_box(term)]).unwrap());
             }
             samples.push(started.elapsed().as_nanos() as f64 / rounds as f64);
         }
@@ -150,11 +166,15 @@ fn requested_scalar_cases() {
         );
         let mut encoded_heap = ProcessHeap::with_words(256);
         let mut encoded_alloc = ProcessHeapHandle(&mut encoded_heap);
-        let encoded = encode(&mut Ctx::new(&mut encoded_alloc), &[term]).unwrap();
+        let mut encoded_state = arinsal_bifs::BifState::default();
+        let mut encoded_ctx = Ctx::new(&mut encoded_alloc, &mut encoded_state);
+        let encoded = encode(&mut encoded_ctx, &[term]).unwrap();
         for _ in 0..10_000 {
             let mut heap = ProcessHeap::with_words(256);
             let mut alloc = ProcessHeapHandle(&mut heap);
-            black_box(decode(&mut Ctx::new(&mut alloc), &[encoded]).unwrap());
+            let mut state = arinsal_bifs::BifState::default();
+            let mut ctx = Ctx::new(&mut alloc, &mut state);
+            black_box(decode(&mut ctx, &[encoded]).unwrap());
         }
         let mut samples = Vec::with_capacity(5);
         for _ in 0..5 {
@@ -162,7 +182,9 @@ fn requested_scalar_cases() {
             for _ in 0..rounds {
                 let mut heap = ProcessHeap::with_words(256);
                 let mut alloc = ProcessHeapHandle(&mut heap);
-                black_box(decode(&mut Ctx::new(&mut alloc), &[encoded]).unwrap());
+                let mut state = arinsal_bifs::BifState::default();
+                let mut ctx = Ctx::new(&mut alloc, &mut state);
+                black_box(decode(&mut ctx, &[encoded]).unwrap());
             }
             samples.push(started.elapsed().as_nanos() as f64 / rounds as f64);
         }

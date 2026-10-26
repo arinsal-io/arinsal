@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use arinsal_bifs::{Ctx, ProcessHeapHandle, lookup};
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
+use similar_asserts::assert_eq;
 
 #[test]
 #[ignore = "manual 10 MiB throughput check"]
@@ -13,7 +14,8 @@ fn ten_mib_utf8_to_list_and_back() {
     let utf8 = Term::atom(global_atoms().intern("utf8").unwrap());
     let to_list = lookup("unicode", "characters_to_list", 2).unwrap();
     let to_binary = lookup("unicode", "characters_to_binary", 2).unwrap();
-    let mut ctx = Ctx::new(&mut alloc);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut alloc, &mut state);
 
     let start = Instant::now();
     let list = to_list(&mut ctx, &[input, utf8]).unwrap();

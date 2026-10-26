@@ -110,6 +110,7 @@ fn from_keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
         Err(error) => ctx.fail(error),
     }
 }
+#[inline]
 fn keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     match projection(ctx, args[0], true) {
         Ok(value) => value,
@@ -123,6 +124,7 @@ fn values(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
     }
 }
 
+#[inline]
 fn projection(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<Term, BifError> {
     match MapsProjectionWalk::start(ctx, map, keys)? {
         ProjectionStart::Done(value) => Ok(value),
@@ -482,7 +484,8 @@ pub fn maps_merge_start_on_process_heap(
     match arinsal_maps::merge_start(left, right, heap) {
         Ok(result) => Ok(result),
         Err(error) => {
-            let mut ctx = Ctx::new(heap);
+            let mut state = crate::BifState::default();
+            let mut ctx = Ctx::new(heap, &mut state);
             Err(map_error(&mut ctx, error))
         }
     }

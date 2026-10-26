@@ -122,41 +122,196 @@ impl BifError {
     pub const BADARG: BifError = BifError::Badarg { cause: None };
 }
 
-/// Process-shaped execution handle handed to native BIF bodies.
+/// Process header state used directly by native BIF bodies.
 ///
-/// More fields (the calling process, scheduler services) are added by later
-/// stages; construct it only through [`Ctx::new`].
-pub struct ProcessBif<'a, H: HeapAlloc = ProcessHeapHandle<'a>> {
-    /// Concrete process heap handle; its HAlloc path is monomorphized.
-    pub heap: H,
-    /// The process' live FCALLS value (`BUMP_REDS` mutates this directly).
-    fcalls: Option<&'a mut i32>,
-    initial_fcalls: i32,
-    fallback_reductions: u32,
-    /// `usize::MAX` runs the BIF to completion. A finite budget is one scheduler
-    /// slice; the BIF records [`lists::DeferredTrap`] only when that slice runs out.
-    budget: usize,
-    deferred: Option<Box<lists::DeferredTrap>>,
-    /// The failure of a body that returned [`arinsal_term::THE_NON_VALUE`].
-    error: Option<BifError>,
-    /// The failure words of the running process (`c_p->freason`, `fvalue`, `ftrace`), when
-    /// this context belongs to one. A body that returns [`Term::NON_VALUE`] leaves its failure
-    /// here, as an erts BIF does; other contexts keep it in `error`.
-    exc: Option<&'a mut arinsal_term::exc::ExcFields>,
+/// The ABI fields stay first and in erts order. Context-only state follows the frozen header
+/// prefix, so constructing a BIF context only needs a heap handle and this state pointer.
+#[repr(C)]
+pub struct BifState {
+    /// Current young heap allocation pointer.
+    pub htop: *mut u64,
+    /// Erlang stack pointer, growing toward lower addresses.
+    pub stop: *mut u64,
+    /// Young heap start.
+    pub heap: *mut u64,
+    /// Young heap end.
+    pub hend: *mut u64,
+    /// Reductions remaining in the current scheduler slice.
+    pub fcalls: i32,
+    pub _fcalls_pad: u32,
+    /// `c_p->freason`, `fvalue` and `ftrace`, adjacent as in erts.
+    pub exc: arinsal_term::exc::ExcFields,
+    /// Number of active catch tags in the process stack.
+    pub catches: usize,
+    /// Next instruction or native code pointer.
+    pub i: *const core::ffi::c_void,
+    /// Current function arity.
+    pub arity: u8,
+    pub _arity_pad: [u8; 7],
+    /// Current function metadata pointer.
+    pub current: *const core::ffi::c_void,
+    /// Process flags.
+    pub flags: u64,
+    /// Current process identifier consumed by the inline `self/0` emitter.
+    pub self_pid: u64,
+    /// First heap address safe for destructive tuple updates.
+    pub high_water: *mut u64,
+    /// Reduction count at context entry, used to report this call's charge.
+    pub initial_fcalls: i32,
+    /// Explicit reduction charge for contexts without process FCALLS.
+    pub fallback_reductions: u32,
+    /// `usize::MAX` runs the BIF to completion. A finite budget is one scheduler slice.
+    pub budget: usize,
+    /// Deferred continuation installed by the VM after the BIF body returns.
+    pub deferred: Option<Box<lists::DeferredTrap>>,
+    /// Context-local failure when this state is not attached to a process exception record.
+    pub error: Option<BifError>,
+    /// Whether reductions are charged against `fcalls`.
+    pub has_fcalls: bool,
+    /// Whether failures are written to the ABI exception words.
+    pub uses_process_exc: bool,
 }
 
-impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
-    pub fn with_allocator(heap: H) -> Self {
-        Ctx {
-            heap,
-            fcalls: None,
+impl Default for BifState {
+    fn default() -> Self {
+        Self {
+            htop: core::ptr::null_mut(),
+            stop: core::ptr::null_mut(),
+            heap: core::ptr::null_mut(),
+            hend: core::ptr::null_mut(),
+            fcalls: 0,
+            _fcalls_pad: 0,
+            exc: arinsal_term::exc::ExcFields::default(),
+            catches: 0,
+            i: core::ptr::null(),
+            arity: 0,
+            _arity_pad: [0; 7],
+            current: core::ptr::null(),
+            flags: 0,
+            self_pid: 0,
+            high_water: core::ptr::null_mut(),
             initial_fcalls: 0,
             fallback_reductions: 0,
             budget: usize::MAX,
             deferred: None,
             error: None,
-            exc: None,
+            has_fcalls: false,
+            uses_process_exc: false,
         }
+    }
+}
+
+impl core::fmt::Debug for BifState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BifState")
+            .field("htop", &self.htop)
+            .field("stop", &self.stop)
+            .field("heap", &self.heap)
+            .field("hend", &self.hend)
+            .field("fcalls", &self.fcalls)
+            .field("exc", &self.exc)
+            .field("catches", &self.catches)
+            .field("i", &self.i)
+            .field("arity", &self.arity)
+            .field("current", &self.current)
+            .field("flags", &self.flags)
+            .field("self_pid", &self.self_pid)
+            .field("high_water", &self.high_water)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BifState {
+    /// Create BIF state initialized with a caller-owned reduction count.
+    pub fn from_fcalls(fcalls: i32) -> Self {
+        Self {
+            fcalls,
+            ..Self::default()
+        }
+    }
+
+    /// Initialize slice accounting for a context that charges `fcalls`.
+    pub fn begin_fcalls(&mut self) {
+        self.initial_fcalls = self.fcalls;
+        self.fallback_reductions = 0;
+        self.budget = usize::MAX;
+        self.deferred = None;
+        self.error = None;
+        self.has_fcalls = true;
+        self.uses_process_exc = false;
+    }
+
+    /// Initialize a process BIF context that writes failures to the ABI exception words.
+    pub fn begin_process_call(&mut self) {
+        // A process BIF consumes deferred work and context errors before returning. Keep
+        // those cold fields untouched on the value path; clearing an `Option<Box<_>>`
+        // here makes construction drop glue for every ordinary BIF call.
+        self.initial_fcalls = self.fcalls;
+        self.budget = usize::MAX;
+        self.has_fcalls = true;
+        self.uses_process_exc = true;
+    }
+
+    /// Initialize a context that tracks reductions only when it explicitly charges them.
+    pub fn begin_allocator_call(&mut self) {
+        self.initial_fcalls = 0;
+        self.fallback_reductions = 0;
+        self.budget = usize::MAX;
+        self.deferred = None;
+        self.error = None;
+        self.has_fcalls = false;
+        self.uses_process_exc = false;
+    }
+}
+
+/// Temporary process state for callers that expose reductions separately from the header.
+pub struct BifStateGuard<'a> {
+    state: BifState,
+    fcalls: &'a mut i32,
+}
+
+impl<'a> BifStateGuard<'a> {
+    /// Build a state view that writes the updated count back when the call scope ends.
+    pub fn new(fcalls: &'a mut i32) -> Self {
+        Self {
+            state: BifState::from_fcalls(*fcalls),
+            fcalls,
+        }
+    }
+}
+
+impl core::ops::Deref for BifStateGuard<'_> {
+    type Target = BifState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl core::ops::DerefMut for BifStateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl Drop for BifStateGuard<'_> {
+    fn drop(&mut self) {
+        *self.fcalls = self.state.fcalls;
+    }
+}
+
+/// Process-shaped execution handle handed to native BIF bodies.
+pub struct ProcessBif<'a, H: HeapAlloc = ProcessHeapHandle<'a>> {
+    /// Concrete process heap handle; its HAlloc path is monomorphized.
+    pub heap: H,
+    state: &'a mut BifState,
+}
+
+impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
+    /// Construct an allocator-only context over caller-owned BIF state.
+    pub fn with_allocator(heap: H, state: &'a mut BifState) -> Self {
+        state.begin_allocator_call();
+        Self { heap, state }
     }
 
     pub(crate) fn into_allocator(self) -> H {
@@ -165,19 +320,22 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
 
     /// Reductions left for this call. `usize::MAX` means do not trap.
     pub fn reduction_budget(&self) -> usize {
-        self.fcalls.as_deref().map_or(self.budget, |fcalls| {
-            self.budget.min((*fcalls).max(0) as usize)
-        })
+        let budget = self.state.budget;
+        if self.state.has_fcalls {
+            budget.min(self.state.fcalls.max(0) as usize)
+        } else {
+            budget
+        }
     }
 
     /// One scheduler slice, from `ERTS_BIF_REDS_LEFT`.
     pub fn set_reduction_budget(&mut self, budget: usize) {
-        self.budget = budget;
+        self.state.budget = budget;
     }
 
     /// Remember a continuation. The VM installs it only after this call returns.
     pub fn defer_trap(&mut self, trap: lists::DeferredTrap) {
-        self.deferred = Some(Box::new(trap));
+        self.state.deferred = Some(Box::new(trap));
     }
 
     /// Fail the call: leave `error` in the process' failure words (or in the context when it
@@ -186,9 +344,10 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
     // THE_NON_VALUE), OTP-29.1.1.
     #[inline]
     pub fn fail(&mut self, error: BifError) -> Term {
-        match self.exc.as_deref_mut() {
-            Some(exc) => encode_failure(exc, error),
-            None => self.error = Some(error),
+        if self.state.uses_process_exc {
+            encode_failure(&mut self.state.exc, error);
+        } else {
+            self.state.error = Some(error);
         }
         Term::NON_VALUE
     }
@@ -216,50 +375,59 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
     #[inline]
     pub fn trap(&mut self, trap: lists::DeferredTrap) -> Term {
         self.defer_trap(trap);
-        if let Some(exc) = self.exc.as_deref_mut() {
-            exc.freason = arinsal_term::exc::TRAP;
-        }
+        self.mark_pending_trap();
         Term::NON_VALUE
+    }
+
+    /// Mark a deferred process BIF as a trap while preserving its continuation.
+    // Port of BIF_TRAP in erts/emulator/beam/bif.h, OTP-29.1.1.
+    pub(crate) fn mark_pending_trap(&mut self) {
+        if self.state.uses_process_exc {
+            self.state.exc.freason = arinsal_term::exc::TRAP;
+        }
     }
 
     /// The failure of a body that returned the non-value, for a context without process
     /// failure words.
     #[inline]
     pub fn take_context_failure(&mut self) -> Option<BifError> {
-        self.error.take()
+        self.state.error.take()
     }
 
     /// Whether a continuation was deferred.
     #[inline]
     pub fn has_deferred(&self) -> bool {
-        self.deferred.is_some()
+        self.state.deferred.is_some()
     }
 
     /// Record why the body returned the non-value.
     #[inline]
     pub fn set_error(&mut self, error: BifError) {
-        self.error = Some(error);
+        self.state.error = Some(error);
     }
 
     /// The failure recorded by [`ProcessBif::set_error`].
     #[inline]
     pub fn take_error(&mut self) -> Option<BifError> {
-        self.error.take()
+        self.state.error.take()
     }
 
     /// Take a continuation the BIF deferred, if the slice ran out.
     pub fn take_deferred(&mut self) -> Option<Box<lists::DeferredTrap>> {
-        self.deferred.take()
+        self.state.deferred.take()
     }
 
     /// Charge work performed by this BIF so the VM can schedule large calls.
     pub fn charge_reductions(&mut self, amount: usize) {
-        if let Some(fcalls) = &mut self.fcalls {
-            **fcalls = (**fcalls)
+        if self.state.has_fcalls {
+            self.state.fcalls = self
+                .state
+                .fcalls
                 .saturating_sub(i32::try_from(amount).unwrap_or(i32::MAX))
                 .max(0);
         } else {
-            self.fallback_reductions = self
+            self.state.fallback_reductions = self
+                .state
                 .fallback_reductions
                 .saturating_add(amount.min(u32::MAX as usize) as u32);
         }
@@ -269,41 +437,39 @@ impl<'a, H: HeapAlloc> ProcessBif<'a, H> {
     ///
     /// Port of `BUMP_ALL_REDS` in `erts/emulator/beam/bif.h:80-82`, OTP-29.1.1.
     pub fn bump_all_reds(&mut self) {
-        if let Some(fcalls) = &mut self.fcalls {
-            **fcalls = 0;
-        } else if self.budget != usize::MAX {
-            self.charge_reductions(self.budget);
+        if self.state.has_fcalls {
+            self.state.fcalls = 0;
+        } else if self.state.budget != usize::MAX {
+            self.charge_reductions(self.state.budget);
         }
     }
 
     /// Whether this context is attached to the process' live FCALLS value.
     pub fn has_fcalls(&self) -> bool {
-        self.fcalls.is_some()
+        self.state.has_fcalls
     }
 
     /// Return the work charge accumulated during this BIF call.
     pub fn reductions(&self) -> u32 {
-        self.fcalls
-            .as_deref()
-            .map_or(self.fallback_reductions, |fcalls| {
-                self.initial_fcalls.saturating_sub(*fcalls).max(0) as u32
-            })
+        if self.state.has_fcalls {
+            self.state
+                .initial_fcalls
+                .saturating_sub(self.state.fcalls)
+                .max(0) as u32
+        } else {
+            self.state.fallback_reductions
+        }
     }
 }
 
 impl<'heap> ProcessBif<'_, ProcessHeapHandle<'heap>> {
     /// Construct a process BIF context by reborrowing the process heap handle.
     #[inline]
-    pub fn new<'a>(heap: &'a mut ProcessHeapHandle<'heap>) -> Ctx<'a> {
+    pub fn new<'a>(heap: &'a mut ProcessHeapHandle<'heap>, state: &'a mut BifState) -> Ctx<'a> {
+        state.begin_allocator_call();
         Ctx {
             heap: ProcessHeapHandle(&mut *heap.0),
-            fcalls: None,
-            initial_fcalls: 0,
-            fallback_reductions: 0,
-            budget: usize::MAX,
-            deferred: None,
-            error: None,
-            exc: None,
+            state,
         }
     }
 
@@ -311,27 +477,25 @@ impl<'heap> ProcessBif<'_, ProcessHeapHandle<'heap>> {
     #[inline]
     pub fn with_failure<'a>(
         heap: &'a mut ProcessHeapHandle<'heap>,
-        fcalls: &'a mut i32,
-        exc: &'a mut arinsal_term::exc::ExcFields,
+        state: &'a mut BifState,
     ) -> Ctx<'a> {
-        let mut ctx = Ctx::with_fcalls(heap, fcalls);
-        ctx.exc = Some(exc);
-        ctx
+        state.begin_process_call();
+        Ctx {
+            heap: ProcessHeapHandle(&mut *heap.0),
+            state,
+        }
     }
 
     /// Construct a process BIF context that charges the process FCALLS directly.
     #[inline]
-    pub fn with_fcalls<'a>(heap: &'a mut ProcessHeapHandle<'heap>, fcalls: &'a mut i32) -> Ctx<'a> {
-        let process_heap = ProcessHeapHandle(&mut *heap.0);
+    pub fn with_fcalls<'a>(
+        heap: &'a mut ProcessHeapHandle<'heap>,
+        state: &'a mut BifState,
+    ) -> Ctx<'a> {
+        state.begin_fcalls();
         Ctx {
-            heap: process_heap,
-            initial_fcalls: *fcalls,
-            fcalls: Some(fcalls),
-            fallback_reductions: 0,
-            budget: usize::MAX,
-            deferred: None,
-            error: None,
-            exc: None,
+            heap: ProcessHeapHandle(&mut *heap.0),
+            state,
         }
     }
 }
@@ -341,6 +505,12 @@ impl<'heap> ProcessBif<'_, ProcessHeapHandle<'heap>> {
 /// Generic allocator callers use the same body through this alias and the
 /// body-table adapter; process dispatch uses [`ProcessBif`] directly.
 pub type Ctx<'a, H = ProcessHeapHandle<'a>> = ProcessBif<'a, H>;
+
+const _: () = assert!(std::mem::size_of::<Ctx<'static>>() == 2 * std::mem::size_of::<usize>());
+const _: () = assert!(std::mem::offset_of!(BifState, fcalls) == 0x20);
+const _: () = assert!(std::mem::offset_of!(BifState, exc) == 0x28);
+const _: () = assert!(std::mem::offset_of!(BifState, catches) == 0x40);
+const _: () = assert!(std::mem::offset_of!(BifState, high_water) == 0x70);
 
 /// Signature shared by all BIFs.
 pub type BifFn = fn(&mut Ctx<'_>, &[Term]) -> Result<Term, BifError>;
@@ -402,7 +572,6 @@ pub trait BifBody {
     fn call(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>;
 
     /// Process entry used by the VM's `bif_table` dispatch.
-    #[inline(always)]
     fn call_process(
         process: &mut ProcessBif<'_>,
         args: &[Term],
@@ -414,9 +583,12 @@ pub trait BifBody {
     /// The body as erts' BIF function: one word, a term or [`arinsal_term::THE_NON_VALUE`]
     /// with the failure in the context. Bodies that still return a `Result` are adapted here.
     // Port of erts/emulator/beam/bif.h (BIF_ERROR returns THE_NON_VALUE), OTP-29.1.1.
-    #[inline(always)]
     fn call_word(process: &mut ProcessBif<'_>, args: &[Term], instruction: usize) -> u64 {
         match Self::call_process(process, args, instruction) {
+            Ok(_value) if process.has_deferred() => {
+                process.mark_pending_trap();
+                arinsal_term::THE_NON_VALUE
+            }
             Ok(value) => value.word(),
             Err(error) => {
                 process.set_error(error);
@@ -490,7 +662,6 @@ macro_rules! bif_bodies {
             $(
                 pub(super) struct $bif;
                 impl $crate::BifBody for $bif {
-                    #[inline(always)]
                     fn call(
                         ctx: &mut $crate::Ctx<'_>,
                         args: &[arinsal_term::Term],
@@ -520,13 +691,11 @@ macro_rules! process_bif_bodies_in {
             $(
                 pub(super) struct $bif;
                 impl $crate::BifBody for $bif {
-                    #[inline(always)]
                     fn call(ctx: &mut $crate::Ctx<'_>, args: &[arinsal_term::Term])
                         -> Result<arinsal_term::Term, $crate::BifError>
                     {
                         <Self as $crate::BifBody>::call_process(ctx, args, 0)
                     }
-                    #[inline(always)]
                     fn call_process(process: &mut $crate::ProcessBif<'_>, args: &[arinsal_term::Term], instruction: usize)
                         -> Result<arinsal_term::Term, $crate::BifError>
                     {
@@ -550,7 +719,6 @@ macro_rules! word_bif_bodies_in {
             $(
                 pub(super) struct $bif;
                 impl $crate::BifBody for $bif {
-                    #[inline(always)]
                     fn call(ctx: &mut $crate::Ctx<'_>, args: &[arinsal_term::Term])
                         -> Result<arinsal_term::Term, $crate::BifError>
                     {
@@ -563,13 +731,19 @@ macro_rules! word_bif_bodies_in {
                             Err(ctx.take_context_failure().unwrap_or($crate::BifError::BADARG))
                         }
                     }
-                    #[inline(always)]
+                    #[inline]
                     fn call_word(
                         ctx: &mut $crate::ProcessBif<'_>,
                         args: &[arinsal_term::Term],
                         _instruction: usize,
                     ) -> u64 {
-                        super::$bif(ctx, args).word()
+                        let value = super::$bif(ctx, args);
+                        if ctx.has_deferred() {
+                            ctx.mark_pending_trap();
+                            arinsal_term::THE_NON_VALUE
+                        } else {
+                            value.word()
+                        }
                     }
                 }
             )*

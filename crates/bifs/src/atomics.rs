@@ -435,7 +435,8 @@ mod tests {
                 dropped: Some(dropped.clone()),
             };
             let mut allocator = crate::ProcessHeapHandle(&mut heap);
-            let mut ctx = Ctx::new(&mut allocator);
+            let mut state = crate::BifState::default();
+            let mut ctx = Ctx::new(&mut allocator, &mut state);
             let reference = new_ref(&mut ctx, array).unwrap();
             assert!(reference.is_magic_ref());
         }

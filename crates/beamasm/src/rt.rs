@@ -155,6 +155,8 @@ pub unsafe fn enter_native_raw(
 }
 
 #[cfg(target_arch = "aarch64")]
+// The pointer exposes the fixed C-layout prefix; trailing BIF bookkeeping is Rust-only.
+#[allow(improper_ctypes)]
 unsafe extern "C" {
     pub fn arinsal_enter_native_return();
     pub fn arinsal_enter_native_trace_return();

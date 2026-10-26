@@ -5574,7 +5574,8 @@ pub(crate) fn trace_command(process: &mut Process, port: Term, event: Term) -> R
         .ok_or_else(badarg)?;
     let encoded = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
+        let mut state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut state);
         let encode = arinsal_bifs::lookup("erlang", "term_to_binary", 1).ok_or_else(badarg)?;
         encode(&mut ctx, &[event]).map_err(|_| badarg())?
     };

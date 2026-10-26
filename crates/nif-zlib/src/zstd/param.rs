@@ -215,7 +215,8 @@ mod tests {
     fn with_ctx<R>(body: impl FnOnce(&mut Ctx<'_>) -> R) -> R {
         let mut heap = ProcessHeap::with_words(1 << 16);
         let mut alloc = ProcessHeapHandle(&mut heap);
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut state);
         body(&mut ctx)
     }
 

@@ -61,7 +61,8 @@ fn benchmark_nif_callbacks() {
         ("bsum", vec![binary], 6),
         ("lsum", vec![list], 6),
     ] {
-        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap));
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap), &mut state);
         assert_eq!(
             lib.lookup(name, args.len())
                 .unwrap()

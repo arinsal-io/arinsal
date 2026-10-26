@@ -296,7 +296,8 @@ impl NifBinding {
             return Err(BifError::BADARG);
         }
         let mut fragment = ProcessHeapHandle(heap);
-        let mut ctx = Ctx::with_fcalls(&mut fragment, fcalls);
+        let mut state = arinsal_bifs::BifStateGuard::new(fcalls);
+        let mut ctx = Ctx::with_fcalls(&mut fragment, &mut state);
         if self.flags != 0 {
             let trap = arinsal_nif::NifTrap {
                 fptr: self.fptr,
@@ -964,7 +965,8 @@ impl PendingNif {
         let pid = thread_hub().and_then(|hub| hub.pid.to_term());
         let mut fragment = ProcessHeapHandle(heap);
         let mut fcalls = 4_000;
-        let mut ctx = Ctx::with_fcalls(&mut fragment, &mut fcalls);
+        let mut state = arinsal_bifs::BifStateGuard::new(&mut fcalls);
+        let mut ctx = Ctx::with_fcalls(&mut fragment, &mut state);
         let (lib, index, trap) = (&self.lib, self.index, &self.trap);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             lib.function(index)?
@@ -1076,7 +1078,8 @@ pub(crate) fn resume_pending(
     pending: PendingNif,
 ) -> Result<Term, BifError> {
     let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
-    let mut ctx = Ctx::with_fcalls(&mut fragment, fcalls);
+    let mut state = arinsal_bifs::BifStateGuard::new(fcalls);
+    let mut ctx = Ctx::with_fcalls(&mut fragment, &mut state);
     run_nif(&mut ctx, pending)
 }
 

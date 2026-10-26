@@ -46,7 +46,8 @@ fn call_values(
     arinsal_re::lookup(module, function, arity)?;
     let result = {
         let mut heap = ProcessHeapHandle(&mut process.heap);
-        let mut ctx = Ctx::with_fcalls(&mut heap, &mut process.reductions);
+        let mut state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
+        let mut ctx = Ctx::with_fcalls(&mut heap, &mut state);
         arinsal_re::invoke(&mut ctx, function, args)
     };
     Some(result.map_err(|error| exceptions::bif_error(process, module, function, args, error)))

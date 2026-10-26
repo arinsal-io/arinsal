@@ -4293,8 +4293,9 @@ fn timestamp_term(process: &mut Process, flags: u64) -> Option<Term> {
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     if flags & TIMESTAMP != 0 {
         let now = arinsal_bifs::lookup("erlang", "now", 0)?;
+        let mut state = arinsal_bifs::BifStateGuard::new(&mut process.reductions);
         return now(
-            &mut arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions),
+            &mut arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut state),
             &[],
         )
         .ok();

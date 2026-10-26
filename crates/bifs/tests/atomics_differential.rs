@@ -3,6 +3,7 @@ use arinsal_difftest::RefErl;
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, Term, from_owned, to_owned};
 use num_bigint::BigInt;
+use similar_asserts::assert_eq;
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -75,7 +76,8 @@ fn rust_sequence(ops: &[Op], signed: bool) -> Vec<O> {
         Term::small(if signed { 1 } else { 0 }).unwrap(),
     ];
     let reference = {
-        let mut ctx = Ctx::new(&mut allocator);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut allocator, &mut state);
         new(&mut ctx, &args).unwrap()
     };
     ops.iter()
@@ -101,7 +103,8 @@ fn rust_sequence(ops: &[Op], signed: bool) -> Vec<O> {
                     .map(|value| from_owned(value, &mut allocator).unwrap()),
             );
             let result = {
-                let mut ctx = Ctx::new(&mut allocator);
+                let mut state = arinsal_bifs::BifState::default();
+                let mut ctx = Ctx::new(&mut allocator, &mut state);
                 match bif(&mut ctx, &call_args) {
                     Ok(term) => to_owned(term).unwrap(),
                     Err(BifError::Badarg { .. }) => {
@@ -166,7 +169,8 @@ fn atomics_and_counters_array_length_overflow_matches_otp() {
         } else {
             vec![huge, Term::small(0).unwrap()]
         };
-        let mut ctx = Ctx::new(&mut allocator);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut allocator, &mut state);
         assert!(matches!(
             lookup(module, name, arity).unwrap()(&mut ctx, &args),
             Err(BifError::SystemLimit)

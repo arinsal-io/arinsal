@@ -13,7 +13,8 @@ pub fn call(module: &str, name: &str, args: &[OwnedTerm]) -> CallResult {
         .iter()
         .map(|value| from_owned(value, &mut allocator).expect("test argument"))
         .collect::<Vec<_>>();
-    let mut ctx = Ctx::new(&mut allocator);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut allocator, &mut state);
     match bif(&mut ctx, &terms) {
         Ok(value) => CallResult::Ok(to_owned(value).expect("BIF result")),
         Err(error) => {

@@ -35,7 +35,8 @@ mod zstd {
                 .map(|pid| from_owned(pid, &mut alloc).unwrap());
             let entry = crate::zstd::lookup(name, args.len() as u8).expect("zstd NIF entry");
             crate::set_caller(pid);
-            let mut ctx = Ctx::new(&mut alloc);
+            let mut state = arinsal_bifs::BifState::default();
+            let mut ctx = Ctx::new(&mut alloc, &mut state);
             let result = entry(&mut ctx, &terms);
             crate::set_caller(None);
             match result {
@@ -1045,7 +1046,8 @@ fn public_dispatch_and_pid_api() {
             .map(|v| from_owned(v, &mut alloc).unwrap())
             .collect::<Vec<_>>();
         let caller = pid.map(|v| from_owned(&v, &mut alloc).unwrap());
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut state);
         match super::call_with_pid(&mut ctx, "zlib", name, &terms, caller) {
             Ok(term) => Ok(to_owned(term).unwrap()),
             Err(BifError::Error(reason)) => Err(to_owned(reason).unwrap()),
@@ -1272,7 +1274,8 @@ fn context_is_freed_with_the_heap_that_holds_its_reference() {
     let mut heap = ProcessHeap::with_words(1024);
     let owner = {
         let mut alloc = ProcessHeapHandle(&mut heap);
-        let mut ctx = Ctx::new(&mut alloc);
+        let mut state = arinsal_bifs::BifState::default();
+        let mut ctx = Ctx::new(&mut alloc, &mut state);
         let entry = super::zstd::lookup("init_compress_nif", 0).unwrap();
         let resource = entry(&mut ctx, &[]).unwrap();
         std::sync::Arc::downgrade(&resource.magic_owner().unwrap())

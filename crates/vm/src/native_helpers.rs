@@ -1713,7 +1713,7 @@ fn binary_guard_apply(
             }
             let (result, reductions) = {
                 let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-                let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
+                let mut ctx = arinsal_bifs::Ctx::new(&mut fragment, &mut process.header);
                 let result = arinsal_bifs::binary_part_2(&mut ctx, args);
                 (result, ctx.reductions())
             };
@@ -2212,7 +2212,7 @@ pub(crate) extern "C" fn list_member_entry(
     let args = [registers.x_reg_array[0], registers.x_reg_array[1]];
     let (result, deferred) = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.header.fcalls);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.header);
         let result = arinsal_bifs::lists_member_bif(&mut ctx, &args);
         (result, ctx.take_deferred())
     };
@@ -2270,7 +2270,7 @@ fn nonalloc_list_fast(
     let arity = usize::from(export.arity);
     let value = {
         let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header.fcalls);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header);
         let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
         if ctx.take_deferred().is_some() {
             return None;
@@ -2739,7 +2739,7 @@ pub(crate) extern "C" fn list_reverse_entry(
     let args = [registers.x_reg_array[0], registers.x_reg_array[1]];
     let step = {
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.header.fcalls);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.header);
         arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells)
     };
     let result = match step {
@@ -3263,10 +3263,9 @@ fn call_list_slice_bif(
     let arity = usize::from(export.arity);
     let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header.fcalls);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header);
     let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
     if let Some(trap) = ctx.take_deferred() {
-        drop(ctx);
         process.reductions = process.header.fcalls;
         let mut args = [Term::NIL; 3];
         args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
@@ -3290,7 +3289,6 @@ fn call_list_slice_bif(
         process.sync_native_header();
         return None;
     }
-    drop(ctx);
     let top = process.heap.heap_top_index();
     if let Ok(value) = &result
         && (!export_call
@@ -3344,10 +3342,9 @@ fn call_plain_bif_body(
     // The result is matched where the BIF wrote it: moving it first would read it back with
     // wider loads than the BIF's stores.
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header.fcalls);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header);
     let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
     let deferred = ctx.take_deferred();
-    drop(ctx);
     let top = process.heap.heap_top_index();
     // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back in x0, and the native
     // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). The
@@ -3413,23 +3410,17 @@ fn call_plain_bif_word(
     let arity = usize::from(export.arity);
     let entry_top = process.heap.heap_top_addr();
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::with_failure(
-        &mut fragment,
-        &mut process.header.fcalls,
-        &mut process.header.exc,
-    );
+    let mut ctx = arinsal_bifs::Ctx::with_failure(&mut fragment, &mut process.header);
     let word = bif(&mut ctx, &registers.x_reg_array[..arity]);
-    let deferred = ctx.take_deferred();
-    if deferred.is_none() && word != arinsal_term::THE_NON_VALUE {
-        drop(ctx);
+    if word != arinsal_term::THE_NON_VALUE {
         let top = process.heap.heap_top_addr();
         if top != entry_top {
             process.header.htop = top as *mut u64;
         }
         return word;
     }
+    let deferred = ctx.take_deferred();
     let error = ctx.take_error();
-    drop(ctx);
     plain_bif_word_slow(process, registers, identity, export, word, deferred, error)
 }
 
@@ -3871,9 +3862,8 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
     let entry_top = process.heap.heap_top_index();
     // Matched where the BIF wrote it, like the light BIF path.
     let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header.fcalls);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.header);
     let result = bif(&mut ctx, args);
-    drop(ctx);
     let top = process.heap.heap_top_index();
     if top != entry_top {
         process.header.htop = process.heap.word_address(top);

@@ -28,7 +28,8 @@ fn call(f: &str, args: &[O]) -> Result<O, BifError> {
         .iter()
         .map(|a| from_owned(a, &mut alloc).unwrap())
         .collect::<Vec<_>>();
-    let mut ctx = Ctx::new(&mut alloc);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut alloc, &mut state);
     let nif = arinsal_nif_file::lookup("prim_file", f, args.len() as u8).unwrap();
     nif(&mut ctx, &terms).map(|value| to_owned(value).unwrap())
 }

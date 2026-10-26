@@ -26,7 +26,8 @@ fn call(name: &str, args: &[O]) -> Result<O, BifError> {
         .iter()
         .map(|a| from_owned(a, &mut alloc).unwrap())
         .collect::<Vec<_>>();
-    let mut ctx = Ctx::new(&mut alloc);
+    let mut state = arinsal_bifs::BifState::default();
+    let mut ctx = Ctx::new(&mut alloc, &mut state);
     let nif = arinsal_nif_tty::lookup("prim_tty", name, args.len() as u8).unwrap();
     nif(&mut ctx, &terms).map(|term| to_owned(term).unwrap())
 }
