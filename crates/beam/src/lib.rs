@@ -4,9 +4,12 @@
 
 use arinsal_etf::{DecodeError, OwnedTerm, decode};
 use arinsal_spec::{BEAM_FORMAT_NUMBER, Opcode};
+
+mod summary;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use num_bigint::BigInt;
 use std::{collections::HashMap, io::Read};
+pub use summary::{CodeSummary, FunctionSummary};
 
 /// A four-byte IFF chunk identifier.
 pub type ChunkId = [u8; 4];
@@ -253,6 +256,9 @@ pub struct BeamFile {
     pub atoms: Vec<String>,
     /// Code chunk.
     pub code: CodeChunk,
+    /// The functions, register needs and `-on_load` function of the code, from one pass over
+    /// its bytes.
+    pub summary: CodeSummary,
     /// Import table.
     pub imports: Vec<Import>,
     /// Export table.
@@ -300,6 +306,7 @@ impl BeamFile {
     pub fn release_decoded(&mut self) {
         self.code.instructions = Vec::new();
         self.code.bytes = Vec::new();
+        self.summary = CodeSummary::default();
         self.imports = Vec::new();
         self.exports = Vec::new();
         self.locals = Vec::new();
@@ -432,6 +439,7 @@ pub fn read(bytes: &[u8]) -> Result<BeamFile, BeamError> {
     let lines = map.get(b"Line").map(|v| parse_lines(v)).transpose()?;
     let types = map.get(b"Type").map(|v| parse_types(v)).transpose()?;
     let code = parse_code_header(required(&map, *b"Code")?)?;
+    let summary = summary::summarize(&code.bytes, code.max_opcode, code.function_count)?;
     for lambda in &lambdas {
         if lambda.label == 0 || lambda.label >= code.label_count {
             return Err(bad("FunT", 0, "lambda label out of range"));
@@ -451,6 +459,7 @@ pub fn read(bytes: &[u8]) -> Result<BeamFile, BeamError> {
         module,
         atoms,
         code,
+        summary,
         imports,
         exports,
         locals,

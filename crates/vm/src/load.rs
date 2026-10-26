@@ -280,34 +280,21 @@ pub(crate) fn native_code_contains(
     })
 }
 impl CodeMeta {
-    pub(crate) fn from_beam(beam: &BeamFile, bytes: Option<&[u8]>) -> Self {
-        // OTP encodes -on_load as a Code instruction following that function's label.
-        let mut function = None;
-        let mut on_load = None;
-        for instruction in &beam.code.instructions {
-            if instruction.op == arinsal_spec::Opcode::FuncInfo {
-                function = match (instruction.args.get(1), instruction.args.get(2)) {
-                    (
-                        Some(arinsal_beam::Operand::Atom(name)),
-                        Some(arinsal_beam::Operand::U(arity)),
-                    ) => beam.atom(*name).and_then(|name| {
-                        u8::try_from(*arity)
-                            .ok()
-                            .map(|arity| (name.to_owned(), arity))
-                    }),
-                    _ => None,
-                };
-            } else if instruction.op == arinsal_spec::Opcode::OnLoad {
-                on_load = function.clone();
-                break;
-            }
-        }
+    /// The metadata of a module that takes over its parsed file.
+    pub(crate) fn from_beam_owned(beam: BeamFile, bytes: Option<&[u8]>) -> Self {
+        // OTP encodes -on_load as a Code instruction following that function's label; the code
+        // summary found the function it follows.
+        let on_load = beam.summary.on_load.and_then(|index| {
+            let function = beam.summary.functions.get(index)?;
+            let name = beam.atom(function.function_atom)?.to_owned();
+            Some((name, u8::try_from(function.arity).ok()?))
+        });
         Self {
-            beam: beam.clone(),
             md5: bytes.and_then(|bytes| arinsal_loader::module_uniq(bytes).ok()),
             on_load,
             has_beam_bytes: bytes.is_some(),
             beamasm: None,
+            beam,
         }
     }
 }
@@ -877,12 +864,16 @@ impl Vm {
         bytes: Option<&[u8]>,
         specialize: bool,
     ) -> Result<Module, VmError> {
-        let mut module = arinsal_loader::load_with_options(
-            beam,
-            self.coverage_mode(),
-            crate::trace_bp::line_breakpoints_instrumented(),
-            specialize,
-        )
+        let mut module = if specialize {
+            arinsal_loader::load_with_options(
+                beam,
+                self.coverage_mode(),
+                crate::trace_bp::line_breakpoints_instrumented(),
+                true,
+            )
+        } else {
+            arinsal_loader::load_native(beam)
+        }
         .map_err(|e| VmError::Load(e.to_string()))?;
         if let Some(bytes) = bytes {
             funs::set_module_uniq(&mut module, bytes)?;
@@ -914,12 +905,15 @@ impl Vm {
             crate::trace_bp::line_breakpoints_instrumented(),
         ) {
             meta.beamasm = Some(native);
-            // Port of beam_load.c (beam_load_finalize): the decoded ops are freed once the
-            // code is in the code area. The interpreter still needs them.
-            if beamasm_integration::enabled() {
-                module.release_decoded_code();
-                meta.beam.release_decoded();
-            }
+        }
+    }
+
+    /// Port of beam_load.c (beam_load_finalize): the decoded ops and tables are freed once the
+    /// code is in the code area. The interpreter still needs them.
+    pub(crate) fn release_loaded_tables(&self, module: &mut Module, meta: &mut CodeMeta) {
+        if meta.beamasm.is_some() && beamasm_integration::enabled() {
+            module.release_decoded_code();
+            meta.beam.release_decoded();
         }
     }
 
@@ -945,8 +939,8 @@ impl Vm {
         let beam = arinsal_beam::parse(bytes).map_err(|e| VmError::Load(e.to_string()))?;
         let mut module = self.prepare_module(&beam, Some(bytes))?;
         let name = module.name.clone();
-        let registers = process::register_requirements(&beam);
-        let mut meta = CodeMeta::from_beam(&beam, Some(bytes));
+        let registers = (beam.summary.x_registers, beam.summary.float_registers);
+        let mut meta = CodeMeta::from_beam_owned(beam, Some(bytes));
         let staging = self.code_ix.start_staging();
         let mut released = None;
         staging.with(|tables| {
@@ -961,6 +955,7 @@ impl Vm {
         }
         let mut module = module;
         self.compile_native(&mut module, &mut meta);
+        self.release_loaded_tables(&mut module, &mut meta);
         let _ = self.install_native(&module, &mut meta);
         let module = Arc::new(module);
         let id = staging.with(|tables| {
@@ -997,18 +992,18 @@ impl Vm {
         compile_native: bool,
     ) -> Result<usize, VmError> {
         let beam = arinsal_beam::parse(bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        self.load_current(&beam, Some(bytes), compile_native, None)
+        self.load_current(beam, Some(bytes), compile_native, None)
     }
     /// Load a parsed module.
     pub fn load_beam(&mut self, beam: &BeamFile) -> Result<usize, VmError> {
-        self.load_current(beam, None, false, None)
+        self.load_current(beam.clone(), None, false, None)
     }
 
     /// Loads `beam` as the current code of its module unless it already has current code,
     /// staging it and committing the staging code index.
     fn load_current(
         &mut self,
-        beam: &BeamFile,
+        beam: BeamFile,
         bytes: Option<&[u8]>,
         compile_native: bool,
         file: Option<(&str, &Path)>,
@@ -1017,18 +1012,28 @@ impl Vm {
         if let Some(&id) = self.code.loaded.get(&beam.module) {
             return Ok(id);
         }
-        let mut meta = CodeMeta::from_beam(beam, bytes);
+        let module_name = beam.module.clone();
+        let mut meta = CodeMeta::from_beam_owned(beam, bytes);
         // erts has no interpreter form of a module: its code goes from the transform straight
         // to the emitter. Decode the instructions for the interpreter only when it may run
         // them (the runtime's own loading of a module from the code path; `Vm::load_bytes` stays
-        // fully decoded for the interpreter entry points): a module with `-on_load`, coverage, debugger lines or the rules of the
-        // loader that patch its code at load, or one BeamAsm does not compile completely.
-        let native_only = compile_native && file.is_some() && self.native_only(beam, &meta);
-        let mut module = self.prepare_module_with(beam, bytes, !native_only)?;
-        let registers = process::register_requirements(beam);
+        // fully decoded for the interpreter entry points): a module with `-on_load`, coverage,
+        // debugger lines or the rules of the loader that patch its code at load, or one BeamAsm
+        // does not compile completely.
+        let native_only = compile_native && file.is_some() && self.native_only(&meta.beam, &meta);
+        if !native_only {
+            meta.beam
+                .decode_code()
+                .map_err(|e| VmError::Load(e.to_string()))?;
+        }
+        let mut module = self.prepare_module_with(&meta.beam, bytes, !native_only)?;
+        let registers = (
+            meta.beam.summary.x_registers,
+            meta.beam.summary.float_registers,
+        );
         let staging = self.code_ix.start_staging();
         // Another scheduler may have loaded the module since this one looked.
-        if let Some(id) = staging.with(|tables| tables.loaded.get(&beam.module).copied()) {
+        if let Some(id) = staging.with(|tables| tables.loaded.get(&module_name).copied()) {
             staging.abort();
             self.refresh_code();
             return Ok(id);
@@ -1046,13 +1051,17 @@ impl Vm {
             if incomplete {
                 // Some function needs the interpreter: load the module again with its code
                 // decoded, and compile that.
-                module = self.prepare_module(beam, bytes)?;
-                meta = CodeMeta::from_beam(beam, bytes);
+                meta.beam
+                    .decode_code()
+                    .map_err(|e| VmError::Load(e.to_string()))?;
+                module = self.prepare_module(&meta.beam, bytes)?;
+                meta.beamasm = None;
                 staging.with(|tables| {
                     tables.intern_fun_entries(&mut module);
                 });
                 self.compile_native(&mut module, &mut meta);
             }
+            self.release_loaded_tables(&mut module, &mut meta);
             let _ = self.install_native(&module, &mut meta);
         }
         let module = Arc::new(module);
@@ -1489,8 +1498,10 @@ impl Vm {
             eprintln!("arinsal boot: load {}", path.display());
         }
         let bytes = std::fs::read(&path).map_err(|e| VmError::Load(e.to_string()))?;
-        let beam = arinsal_beam::parse(&bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        self.load_current(&beam, Some(&bytes), true, Some((name, &path)))?;
+        // Port of erts/emulator/beam/beam_file.c:beamfile_read: the tables, not the instructions,
+        // which a module that runs natively never needs decoded.
+        let beam = arinsal_beam::read(&bytes).map_err(|e| VmError::Load(e.to_string()))?;
+        self.load_current(beam, Some(&bytes), true, Some((name, &path)))?;
         self.code
             .loaded
             .get(name)

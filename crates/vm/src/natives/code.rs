@@ -8,7 +8,6 @@ use arinsal_etf::OwnedTerm;
 use arinsal_loader::CoverageMode;
 use arinsal_sched::Pid;
 use arinsal_sched::{LiteralCopyHow, RunCtx, Signal};
-use arinsal_spec::Opcode;
 use arinsal_term::{MagicRef, Term, TermBuilder, atoms, from_owned, global_atoms, to_owned};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -350,10 +349,6 @@ fn resume_pending_lambda_callers(
 const LOADER_STATE_MAGIC_ORIG_SIZE: usize = 24 + 568;
 
 struct Prepared {
-    /// Parsed file, cleared once `finish_loading` has copied it. The magic ref stays
-    /// reachable until the caller's next fullsweep; keeping every boot module's parse
-    /// tree there made that sweep pay to drop them all.
-    beam: Mutex<Option<BeamFile>>,
     bytes: Mutex<Vec<u8>>,
     has_on_load: bool,
     registers: (usize, usize),
@@ -366,17 +361,13 @@ struct Prepared {
 impl Prepared {
     /// Drop the loader state `finish_loading` has already copied into the staged module.
     fn release(&self) {
-        *self.beam.lock().unwrap() = None;
         *self.bytes.lock().unwrap() = Vec::new();
     }
 }
 
 // boot_loop1: preserve the on_load decision made by OTP's loader attributes.
 fn has_on_load_opcode(beam: &BeamFile) -> bool {
-    beam.code
-        .instructions
-        .iter()
-        .any(|instruction| instruction.op == Opcode::OnLoad)
+    beam.summary.on_load.is_some()
 }
 
 fn has_prepared_code_on_load(term: Term) -> Result<Term, VmError> {
@@ -628,16 +619,12 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         return Err(badarg());
     };
     let bytes = std::mem::take(bytes_slot);
-    let Ok(beam) = arinsal_beam::parse(&bytes) else {
+    // Port of erts/emulator/beam/beam_file.c:beamfile_read: the tables; the instructions stay bytes.
+    let Ok(beam) = arinsal_beam::read(&bytes) else {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     };
     if beam.module != name {
-        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
-        return Ok(error);
-    }
-    // Port of erts/emulator/beam/beam_load.c:625-636 (bad_bs_match_1), OTP-29.1.1.
-    if arinsal_loader::validate_bit_matches(&beam).is_err() {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     }
@@ -656,16 +643,27 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     // a malformed module is `{error, badfile}` before finish_loading.
     // Static NIF bodies and import classes are bound here, like erts' loader does for the
     // static NIF table (erl_nif.c erts_load_static_nif at load_nif time).
-    let mut meta = CodeMeta::from_beam(&beam, Some(&bytes));
+    let has_on_load = has_on_load_opcode(&beam);
+    let registers = (beam.summary.x_registers, beam.summary.float_registers);
+    let mut meta = CodeMeta::from_beam_owned(beam, Some(&bytes));
     // As erts has no interpreter form of a module, decode the instructions for the interpreter
     // only when it may run them.
-    let native_only = vm.native_only(&beam, &meta);
-    let Ok(mut module) = vm.prepare_module_with(&beam, Some(&bytes), !native_only) else {
+    let native_only = vm.native_only(&meta.beam, &meta);
+    if !native_only {
+        // Port of erts/emulator/beam/beam_load.c:625-636 (bad_bs_match_1), OTP-29.1.1: the
+        // generic engine rejects these through its generator; the interpreter form checks here.
+        if meta.beam.decode_code().is_err()
+            || arinsal_loader::validate_bit_matches(&meta.beam).is_err()
+        {
+            let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+            return Ok(error);
+        }
+    }
+    let Ok(mut module) = vm.prepare_module_with(&meta.beam, Some(&bytes), !native_only) else {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     };
     vm.intern_prepared_fun_entries(&mut module);
-    let registers = crate::process::register_requirements(&beam);
     vm.compile_native(&mut module, &mut meta);
     if native_only
         && meta
@@ -674,19 +672,23 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
             .is_none_or(|native| native.unported_functions != 0)
     {
         // Some function needs the interpreter: load the module again with its code decoded.
-        let Ok(mut full) = vm.prepare_module(&beam, Some(&bytes)) else {
+        if meta.beam.decode_code().is_err() {
+            let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+            return Ok(error);
+        }
+        let Ok(mut full) = vm.prepare_module(&meta.beam, Some(&bytes)) else {
             let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
             return Ok(error);
         };
         vm.intern_prepared_fun_entries(&mut full);
-        meta = CodeMeta::from_beam(&beam, Some(&bytes));
+        meta.beamasm = None;
         vm.compile_native(&mut full, &mut meta);
         module = full;
     }
+    vm.release_loaded_tables(&mut module, &mut meta);
     let prepared = Prepared {
-        has_on_load: has_on_load_opcode(&beam),
+        has_on_load,
         registers,
-        beam: Mutex::new(Some(beam)),
         bytes: Mutex::new(bytes),
         module: Mutex::new(Some(module)),
         meta: Mutex::new(Some(meta)),
@@ -785,28 +787,15 @@ fn finish_stage(
         let prepared = unsafe { code.magic_ref() }
             .and_then(|reference| reference.downcast_ref::<Prepared>())
             .ok_or_else(badarg)?;
-        let beam_slot = prepared.beam.lock().unwrap();
-        let Some(beam) = beam_slot.as_ref() else {
+        // Port of erts/emulator/beam/beam_bif_load.c (finish_loading_1): a prepared load that
+        // has been finished already is `badarg`.
+        let Some(module) = prepared.module.lock().unwrap().take() else {
             return Err(badarg());
         };
-        let bytes = prepared.bytes.lock().unwrap();
-        let staged = prepared.module.lock().unwrap().take();
-        let module = match staged {
-            Some(module) => module,
-            None => match vm.prepare_module(beam, Some(&bytes)) {
-                Ok(module) => module,
-                Err(_) => return make_tuple(process, &[atom("error"), atom("badfile")]),
-            },
+        let Some(meta) = prepared.meta.lock().unwrap().take() else {
+            return Err(badarg());
         };
         let registers = prepared.registers;
-        let meta = prepared
-            .meta
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap_or_else(|| CodeMeta::from_beam(beam, Some(&bytes)));
-        drop(bytes);
-        drop(beam_slot);
         prepared_refs.push(prepared);
         prepared_modules.push((module, registers, meta));
     }
