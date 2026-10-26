@@ -2490,6 +2490,7 @@ impl Executor {
                                         process,
                                         ctx,
                                         &function,
+                                        true,
                                     )?;
                                     crate::trace::push_native_trace_frame(
                                         process, resume_pc, &actions, arity,
@@ -3603,6 +3604,57 @@ impl Executor {
                                         }
                                     }
                                 };
+                                // Port of erts/emulator/beam/beam_bp.c (erts_generic_breakpoint
+                                // through the export's breakpoint trampoline), OTP-29.1.1: a
+                                // call through an export with a global call breakpoint reports
+                                // the call, then enters the function's code; a traced return
+                                // leaves through the native trace stub.
+                                if crate::beamasm_integration::is_global_breakpoint(
+                                    self.vm.code_scope,
+                                    &export.module,
+                                    &export.function,
+                                    export.arity,
+                                ) {
+                                    let module = Arc::clone(&self.vm.code.modules[module_id]);
+                                    let function = module
+                                        .exports
+                                        .iter()
+                                        .position(|slot| {
+                                            slot.function == export.function
+                                                && slot.arity == export.arity
+                                        })
+                                        .and_then(|index| module.export_entry_targets.get(index))
+                                        .and_then(|&entry| {
+                                            self.vm.beamasm_targets.function_for_target(
+                                                module_id,
+                                                &module,
+                                                crate::load::native_code_range(
+                                                    &self.vm.code.code_meta,
+                                                    module_id,
+                                                ),
+                                                entry,
+                                            )
+                                        });
+                                    if let Some(function) = function {
+                                        let actions = crate::trace::executor_native_call_event(
+                                            &mut self.vm,
+                                            process,
+                                            ctx,
+                                            &function,
+                                            false,
+                                        )?;
+                                        crate::trace::push_native_trace_frame(
+                                            process,
+                                            function.start,
+                                            &actions,
+                                            usize::from(function.arity),
+                                        )?;
+                                        process.gc_live = usize::from(export.arity);
+                                        process.native_pc = Some(function.start);
+                                        process.tick();
+                                        continue;
+                                    }
+                                }
                                 let target_ip = crate::beamasm_integration::interpreted_target(
                                     self.vm.code_scope,
                                     &export.module,

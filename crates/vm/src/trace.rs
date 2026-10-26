@@ -2947,6 +2947,7 @@ pub(crate) fn executor_native_call_event(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     function: &crate::NativeFunction,
+    local: bool,
 ) -> Result<Vec<NativeTraceAction>, VmError> {
     let args = process.x[..usize::from(function.arity)].to_vec();
     let actions = call_event(
@@ -2956,7 +2957,7 @@ pub(crate) fn executor_native_call_event(
         &function.module,
         &function.function,
         &args,
-        true,
+        local,
     )?;
     let actions = dedupe_return_frames(vm, process, actions, StackScan::Top);
     Ok(actions
