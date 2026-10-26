@@ -639,6 +639,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
     let trampoline = fragments()?.export_trampoline();
     let save_calls = fragments()?.save_calls_export();
     let mut identities = Vec::with_capacity(module.imports.len());
+    let mut bindings = Vec::with_capacity(module.imports.len());
     for import in &module.imports {
         let mfa = (import.module_atom, import.function_atom, import.arity);
         let entry = dispatch_entry(scope, mfa, || {
@@ -686,11 +687,16 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
                 light_trap_bif: None,
             })
         })?;
-        crate::code_ix::for_scope(scope).update_active(|tables| {
-            tables.exports.bind_dispatch(mfa, entry.export_entry());
-        });
+        bindings.push((mfa, entry.export_entry()));
         identities.push(Arc::as_ptr(entry.slot) as usize);
     }
+    // Port of erts/emulator/beam/jit/asm_load.c (beam_load_finalize_code): the exports of all
+    // imports are put into the staged export table together, under one code-index update.
+    crate::code_ix::for_scope(scope).update_active(|tables| {
+        for (mfa, dispatch) in &bindings {
+            tables.exports.bind_dispatch(*mfa, dispatch);
+        }
+    });
     Some(identities)
 }
 
@@ -2202,10 +2208,25 @@ pub(crate) fn compile(
             return None;
         }
     };
+    let native_body_functions = module
+        .functions
+        .iter()
+        .filter(|(entry, _, _)| {
+            module
+                .code
+                .get(entry.saturating_add(1))
+                .is_some_and(|instruction| {
+                    matches!(instruction, arinsal_loader::Instr::NativeBody { .. })
+                })
+        })
+        .map(|(_, name, arity)| (name.as_str(), *arity))
+        .collect::<std::collections::HashSet<_>>();
     let runtime_functions = compiled
         .functions
         .iter()
-        .filter(|function| !is_loader_native_body(module, function))
+        .filter(|function| {
+            !native_body_functions.contains(&(function.name.as_str(), function.arity))
+        })
         .collect::<Vec<_>>();
     if let Some(directory) = crate::debug_env::beamasm_dump()
         && let Err(error) = arinsal_beamasm::write_global_note(std::path::Path::new(directory))
@@ -2316,9 +2337,9 @@ pub(crate) fn compile(
             if arinsal_spec::bif_lookup(&compiled.name, &function.name, function.arity).is_some() {
                 return None;
             }
-            module.export_slot(&function.name, function.arity)?;
-            let entry = compiled.native.entries.get(&function.label)?;
             let name = global_atoms().intern(&function.name).ok()?;
+            module.export_slot_atom(name, function.arity)?;
+            let entry = compiled.native.entries.get(&function.label)?;
             Some((
                 (module.name_atom, name, function.arity),
                 *entry as usize + arinsal_beamasm::module::FUNC_INFO_BYTES,
@@ -2326,6 +2347,13 @@ pub(crate) fn compile(
         })
         .collect::<Vec<_>>();
     let mut native_functions = Vec::with_capacity(compiled.functions.len());
+    let mut line_entries = compiled
+        .native
+        .line_table
+        .iter()
+        .map(|entry| (code_start + entry.offset, entry))
+        .collect::<Vec<_>>();
+    line_entries.sort_by_key(|(address, _)| *address);
     for function in &compiled.functions {
         let Some(start) = compiled
             .native
@@ -2342,9 +2370,8 @@ pub(crate) fn compile(
             return None;
         };
         let end = function_starts
-            .iter()
+            .get(function_starts.partition_point(|entry| *entry <= start))
             .copied()
-            .find(|entry| *entry > start)
             .unwrap_or(code_end);
         native_functions.push(crate::NativeFunction {
             scope,
@@ -2360,20 +2387,12 @@ pub(crate) fn compile(
             // A `line` instruction before the function's `func_info` still names its first
             // instructions, so the nearest preceding entry belongs to the function.
             line_table: {
-                let mut entries = compiled
-                    .native
-                    .line_table
-                    .iter()
-                    .map(|entry| (code_start + entry.offset, entry))
-                    .collect::<Vec<_>>();
-                entries.sort_by_key(|(address, _)| *address);
-                let before = entries.partition_point(|(address, _)| *address <= start);
+                let before = line_entries.partition_point(|(address, _)| *address <= start);
                 let first = before.saturating_sub(1);
-                entries
-                    .into_iter()
-                    .skip(first)
+                line_entries[first..]
+                    .iter()
                     .take_while(|(address, _)| *address < end)
-                    .map(|(address, entry)| crate::NativeLine {
+                    .map(|&(address, entry)| crate::NativeLine {
                         address: address.max(start),
                         file: Arc::from(entry.file.as_str()),
                         file_term: module.line_file_terms.get(&entry.file).copied(),
@@ -2456,19 +2475,6 @@ pub(crate) fn compile(
         lambda_targets,
     });
     Some(version)
-}
-
-// Port of erts/emulator/beam/jit/arm/asm_load.c:651, OTP-29.1.1.
-fn is_loader_native_body(
-    module: &arinsal_loader::Module,
-    function: &arinsal_beamjit::CompiledFunction,
-) -> bool {
-    module
-        .functions
-        .iter()
-        .find(|(_, name, arity)| name == &function.name && *arity == function.arity)
-        .and_then(|(entry, _, _)| module.code.get(entry.saturating_add(1)))
-        .is_some_and(|instruction| matches!(instruction, arinsal_loader::Instr::NativeBody { .. }))
 }
 
 fn raw_word(term: Term) -> u64 {
