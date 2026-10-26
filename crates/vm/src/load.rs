@@ -1582,7 +1582,7 @@ mod purge_free_tests {
         };
         let mut vm = Vm::new([]);
         let id = vm.load_bytes(&beam).unwrap();
-        assert!(!vm.code.modules[id].code.is_empty());
+        assert!(!vm.code.modules[id].functions.is_empty());
         assert!(!vm.code.modules[id].exports.is_empty());
         assert!(!vm.code.modules[id].funs.is_empty());
         let export_count = vm.code.exports.order.len();

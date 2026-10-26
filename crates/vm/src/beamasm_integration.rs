@@ -1012,6 +1012,19 @@ pub(crate) fn set_bif_traced(module: &str, function: &str, arity: u8, traced: bo
     }
 }
 
+/// Whether `module:function/arity` has a global call breakpoint in code scope `scope`.
+pub(crate) fn is_global_breakpoint(scope: u64, module: &str, function: &str, arity: u8) -> bool {
+    let Some(mfa) = existing_mfa(module, function, arity) else {
+        return false;
+    };
+    dispatch_registry().read().is_ok_and(|registry| {
+        registry
+            .scopes
+            .get(&scope)
+            .is_some_and(|exports| exports.global_breakpoints.contains(&mfa))
+    })
+}
+
 /// Routes native callers of an export through its interpreted entry, `target`, while a
 /// global call breakpoint is set on it.
 pub(crate) fn set_global_breakpoint(
