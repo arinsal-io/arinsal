@@ -245,12 +245,12 @@ impl Makeops {
                 continue;
             }
             // Handle %unused.
-            if let Some(rest) = line.strip_prefix("%unused") {
-                if rest.starts_with(char::is_whitespace) {
-                    self.intentionally_unused
-                        .insert(word(rest.trim_start()).to_owned());
-                    continue;
-                }
+            if let Some(rest) = line.strip_prefix("%unused")
+                && rest.starts_with(char::is_whitespace)
+            {
+                self.intentionally_unused
+                    .insert(word(rest.trim_start()).to_owned());
+                continue;
             }
             if line.starts_with('%') {
                 error(&format!(
@@ -282,18 +282,19 @@ impl Makeops {
             // Parse off the number of the operation.
             let mut op_num: Option<usize> = None;
             let mut rest = line.as_str();
-            if let Some(colon) = rest.find(':') {
-                if colon > 0 && rest[..colon].bytes().all(|b| b.is_ascii_digit()) {
-                    let number: usize = rest[..colon].parse().unwrap();
-                    if number == 0 {
-                        error("Opcode 0 invalid");
-                    }
-                    if self.gen_opname.get(number).is_some_and(Option::is_some) {
-                        error(&format!("Opcode {number} already defined"));
-                    }
-                    op_num = Some(number);
-                    rest = rest[colon + 1..].trim_start();
+            if let Some(colon) = rest.find(':')
+                && colon > 0
+                && rest[..colon].bytes().all(|b| b.is_ascii_digit())
+            {
+                let number: usize = rest[..colon].parse().unwrap();
+                if number == 0 {
+                    error("Opcode 0 invalid");
                 }
+                if self.gen_opname.get(number).is_some_and(Option::is_some) {
+                    error(&format!("Opcode {number} already defined"));
+                }
+                op_num = Some(number);
+                rest = rest[colon + 1..].trim_start();
             }
             // Parse: Name/Arity (generic instruction): m@^(-)?(\w+)/(\d)\s*$@
             if let Some((obsolete, name, arity)) = generic_op(rest) {
@@ -362,10 +363,11 @@ impl Makeops {
         {
             error(&format!("Bad opcode name '{name}'"));
         }
-        for i in 0..arity {
+        let operands = arity;
+        for i in 0..operands {
             let arg = args[i].clone();
             if arg == "*" {
-                if i != arity - 1 {
+                if i != operands - 1 {
                     error("'*' must be the last operand");
                 }
                 args.pop();
@@ -386,10 +388,10 @@ impl Makeops {
                 }
             }
         }
-        if let Some(num) = self.gen_opnum.get(&(name.clone(), arity)) {
-            if self.obsolete[*num] {
-                error("specific instructions may not be specified for obsolete instructions");
-            }
+        if let Some(num) = self.gen_opnum.get(&(name.clone(), arity))
+            && self.obsolete[*num]
+        {
+            error("specific instructions may not be specified for obsolete instructions");
         }
         // Expand operands with multiple types to multiple instructions.
         let mut res: Vec<Vec<String>> = vec![Vec::new()];
@@ -412,12 +414,12 @@ impl Makeops {
         let key = format!("{name}/{arity}");
         for specific_args in res {
             let arity = specific_args.len();
-            if let Some((prev_arity, prev_loc)) = self.specific_op_arity.get(&name) {
-                if arity != *prev_arity {
-                    error(&format!(
-                        "{name} defined with arity {arity}, but previously defined with arity {prev_arity} at {prev_loc}"
-                    ));
-                }
+            if let Some((prev_arity, prev_loc)) = self.specific_op_arity.get(&name)
+                && arity != *prev_arity
+            {
+                error(&format!(
+                    "{name} defined with arity {arity}, but previously defined with arity {prev_arity} at {prev_loc}"
+                ));
             }
             self.specific_op_arity
                 .insert(name.clone(), (arity, loc.to_owned()));
@@ -521,10 +523,10 @@ impl Makeops {
             }
             parsed.push(list);
         }
-        if let Some(num) = self.gen_opnum.get(&(name.to_owned(), arity)) {
-            if self.obsolete.get(*num).copied().unwrap_or(false) {
-                error("obsolete function must not be used in transformations");
-            }
+        if let Some(num) = self.gen_opnum.get(&(name.to_owned(), arity))
+            && self.obsolete.get(*num).copied().unwrap_or(false)
+        {
+            error("obsolete function must not be used in transformations");
         }
         if src {
             self.is_transformed.insert((name.to_owned(), arity));
