@@ -3346,10 +3346,9 @@ fn emit_op(
         }
         EmitterKind::Float => {
             // Port of erts/emulator/beam/jit/arm/instr_float.cpp:55-232, OTP-29.1.1.
-            let fr = |index: usize| -> Result<u8, EmitError> {
+            let fr = |index: usize| -> Result<u32, EmitError> {
                 match args.get(index) {
-                    Some(SpecificOperand::FloatRegister(register)) => u8::try_from(*register)
-                        .map_err(|_| EmitError::Operand("float register out of range".to_owned())),
+                    Some(SpecificOperand::FloatRegister(register)) => Ok(*register),
                     _ => Err(EmitError::Operand("expected a float register".to_owned())),
                 }
             };

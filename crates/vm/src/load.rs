@@ -805,7 +805,7 @@ impl Vm {
     /// Replaying `lists:reverse(erlang:loaded())` this way reproduces
     /// `module_info(exports)` on a booted node.
     pub fn note_beam_exports(&mut self, bytes: &[u8]) -> Result<(), VmError> {
-        let beam = arinsal_beam::parse(bytes).map_err(|e| VmError::Load(e.to_string()))?;
+        let beam = arinsal_beam::read(bytes).map_err(|e| VmError::Load(e.to_string()))?;
         let staging = self.code_ix.start_staging();
         staging.with(|tables| tables.exports.note_beam(&beam));
         drop(staging);
@@ -1001,7 +1001,9 @@ impl Vm {
         bytes: &[u8],
         compile_native: bool,
     ) -> Result<usize, VmError> {
-        let beam = arinsal_beam::parse(bytes).map_err(|e| VmError::Load(e.to_string()))?;
+        // Port of erts/emulator/beam/beam_file.c (beamfile_read): the tables; the instructions
+        // are decoded below only for a module the interpreter may run.
+        let beam = arinsal_beam::read(bytes).map_err(|e| VmError::Load(e.to_string()))?;
         self.load_current(beam, Some(bytes), compile_native, None)
     }
     /// Load a parsed module.
@@ -1026,11 +1028,10 @@ impl Vm {
         let mut meta = CodeMeta::from_beam_owned(beam, bytes);
         // erts has no interpreter form of a module: its code goes from the transform straight
         // to the emitter. Decode the instructions for the interpreter only when it may run
-        // them (the runtime's own loading of a module from the code path; `Vm::load_bytes` stays
-        // fully decoded for the interpreter entry points): a module with `-on_load`, coverage,
+        // them: a module with `-on_load`, coverage,
         // debugger lines or the rules of the loader that patch its code at load, or one BeamAsm
         // does not compile completely.
-        let native_only = compile_native && file.is_some() && self.native_only(&meta.beam, &meta);
+        let native_only = compile_native && self.native_only(&meta.beam, &meta);
         if !native_only {
             meta.beam
                 .decode_code()
@@ -1429,14 +1430,10 @@ impl Vm {
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            let Ok(beam) = arinsal_beam::parse(&bytes) else {
+            let Ok(beam) = arinsal_beam::read(&bytes) else {
                 continue;
             };
-            return beam
-                .code
-                .instructions
-                .iter()
-                .any(|instruction| instruction.op == arinsal_spec::Opcode::OnLoad);
+            return beam.summary.on_load.is_some();
         }
         false
     }

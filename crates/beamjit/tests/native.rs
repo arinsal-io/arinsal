@@ -61,6 +61,19 @@ impl ModuleEnv for TestEnv {
             .ok_or_else(|| format!("import index {index} is out of range"))
     }
 
+    fn lambda_fun_entry(&self, beam: &BeamFile, index: u32) -> Result<(usize, u8), String> {
+        // The module is compiled for its own functions only; its funs are never created.
+        beam.lambdas
+            .iter()
+            .find(|lambda| lambda.index == index)
+            .map(|lambda| (0x2000 + 64 * index as usize, lambda.arity as u8))
+            .ok_or_else(|| format!("lambda {index} is missing"))
+    }
+
+    fn zero_capture_fun(&self, _beam: &BeamFile, lambda: u32) -> Result<u64, String> {
+        Ok(0x1000 + 16 * u64::from(lambda))
+    }
+
     fn export_entry(&self, _beam: &BeamFile, index: u32) -> Result<usize, String> {
         // The module is compiled for its own functions only; its external calls are never run.
         Ok(0x1000 + 8 * index as usize)
