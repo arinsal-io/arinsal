@@ -11,7 +11,10 @@ use arinsal_beamasm::{
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     types::{ArgType, TypedArg},
 };
-use arinsal_beamops::{self as beamops, FunctionOps, SpecificOp, SpecificOperand, TransformArena};
+use arinsal_beamops::{
+    self as beamops, FunctionOps, LiteralElement, NewLiteral, SpecificOp, SpecificOperand,
+    TransformArena,
+};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
@@ -28,10 +31,15 @@ use eq_literal::classify_eq_literal;
 
 /// Runtime values and helper entry points needed while compiling a module.
 pub trait ModuleEnv {
-    /// Resolve a one-based BEAM atom index to an OTP tagged atom word.
+    /// Resolve a global atom index to an OTP tagged atom word.
     fn atom(&self, beam: &BeamFile, index: u32) -> Result<u64, String>;
     /// Resolve a zero-based literal index to an OTP tagged term word.
     fn literal(&self, beam: &BeamFile, index: u32) -> Result<u64, String>;
+    /// Register the word of the literal at `index`, one that the load added after the literals
+    /// of the file (`beamfile_add_literal`); `literal` then resolves it.
+    fn add_literal(&self, _index: u32, _word: u64) -> Result<(), String> {
+        Err("module environment cannot hold literals added by the load".into())
+    }
     /// Resolve an import table index to a code/export value.
     fn import(&self, beam: &BeamFile, index: u32) -> Result<u32, String>;
     /// Return the stable VM-owned dispatch slot for an external import.
@@ -516,6 +524,10 @@ pub static PORTED_OPS: &[PortedOp] = &[
     },
     PortedOp {
         name: "i_flush_stubs",
+        emitter: EmitterKind::Metadata,
+    },
+    PortedOp {
+        name: "i_nif_padding",
         emitter: EmitterKind::Metadata,
     },
     PortedOp {
@@ -1584,6 +1596,46 @@ pub fn compile_parsed_module_with_options(
     })
 }
 
+/// The words of the literals the load added after the file's own (`beamfile_add_literal`):
+/// key tuples, bignums and the funs of lambdas without free variables. The environment holds
+/// them under their literal index, like the literals of the file.
+fn resolve_new_literals(
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+    arena: &TransformArena,
+) -> Result<(), CompileError> {
+    let fail = |error: String| CompileError::Assemble(format!("{}: {error}", beam.module));
+    let first = u32::try_from(beam.literals.len())
+        .map_err(|_| fail("literal table too large".to_owned()))?;
+    let mut index = first;
+    while let Some(literal) = arena.new_literal(index) {
+        let word = match literal {
+            // The environment has the record definitions after the literals of the file.
+            NewLiteral::Record { .. } => {
+                index += 1;
+                continue;
+            }
+            NewLiteral::Bignum(text) => env.bigint_literal(text),
+            // The fun entry of a lambda without free variables is created with the module.
+            NewLiteral::FunPlaceholder { lambda } => env.literal(beam, u32::MAX - lambda),
+            NewLiteral::Tuple(elements) => elements
+                .iter()
+                .map(|element| match element {
+                    LiteralElement::Atom(atom) => env.atom(beam, *atom),
+                    LiteralElement::Small(value) => Ok(((*value as u64) << 4) | 0xf),
+                    LiteralElement::Nil => Ok(0x3b),
+                    LiteralElement::Literal(literal) => env.literal(beam, *literal),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|words| env.tuple_literal(&words)),
+        }
+        .map_err(fail)?;
+        env.add_literal(index, word).map_err(fail)?;
+        index += 1;
+    }
+    Ok(())
+}
+
 fn compile_parsed_module_with_options_in_arena(
     beam: &BeamFile,
     env: &impl ModuleEnv,
@@ -1591,7 +1643,9 @@ fn compile_parsed_module_with_options_in_arena(
     line_breakpoints: bool,
     transform_arena: &mut TransformArena,
 ) -> Result<CompiledModule, CompileError> {
-    beamops::transform_module_typed_in_arena(beam, line_breakpoints, transform_arena);
+    beamops::transform_module_typed_in_arena(beam, line_breakpoints, transform_arena)
+        .map_err(|error| CompileError::Assemble(format!("{}: {error}", beam.module)))?;
+    resolve_new_literals(beam, env, transform_arena)?;
     let mut candidates: Vec<(String, u8, u32, FunctionOps)> = Vec::new();
     let mut unported = Vec::new();
 
@@ -1605,7 +1659,7 @@ fn compile_parsed_module_with_options_in_arena(
         {
             continue;
         }
-        let (name, arity, label) = function_identity(ops, beam);
+        let (name, arity, label) = function_identity(ops);
         if function_allowlist.is_some_and(|list| !function_allowlist_contains(list, &name, arity))
             || std::env::var("ARINSAL_JIT_SKIPF")
                 .is_ok_and(|list| function_allowlist_contains(&list, &name, arity))
@@ -1817,9 +1871,7 @@ fn compile_parsed_module_with_options_in_arena(
                     }
                     break;
                 }
-                if let Err(error) =
-                    emit_op(&mut assembler, op, beam, env, name, *arity, transform_arena)
-                {
+                if let Err(error) = emit_op(&mut assembler, op, beam, env, name, *arity) {
                     failure_index = Some(index);
                     failure_reason = Some((
                         op.name().to_owned(),
@@ -1974,12 +2026,13 @@ pub fn coverage(directories: &[String]) -> Result<(), CompileError> {
         let bytes = fs::read(&path)
             .map_err(|error| CompileError::Io(path.display().to_string(), error.to_string()))?;
         let beam = beam::parse(&bytes).map_err(|error| CompileError::Parse(error.to_string()))?;
-        let specialized = beamops::transform_module(&beam);
+        let specialized = beamops::transform_module(&beam)
+            .map_err(|error| CompileError::Assemble(format!("{}: {error}", beam.module)))?;
         module_count += 1;
         let mut labels = BTreeSet::new();
         let mut candidates = Vec::new();
         for ops in specialized {
-            let (name, arity, label) = function_identity(&ops, &beam);
+            let (name, arity, label) = function_identity(&ops);
             labels.extend(ops.iter().filter_map(|op| match op.name() {
                 "i_func_label" | "label" | "aligned_label" => as_u32(op.operands().first()),
                 _ => None,
@@ -2050,7 +2103,7 @@ fn collect_beams(path: &Path, result: &mut Vec<std::path::PathBuf>) -> Result<()
     Ok(())
 }
 
-fn function_identity(ops: &[SpecificOp], beam: &BeamFile) -> (String, u8, u32) {
+fn function_identity(ops: &[SpecificOp]) -> (String, u8, u32) {
     let mut label = 0;
     let mut name = "<unknown>".to_owned();
     let mut arity = 0;
@@ -2059,7 +2112,7 @@ fn function_identity(ops: &[SpecificOp], beam: &BeamFile) -> (String, u8, u32) {
             "i_func_label" => label = as_u32(op.operands().first()).unwrap_or(label),
             "i_func_info" if op.operands().len() >= 4 => {
                 if let Some(index) = as_u32(op.operands().get(2)) {
-                    name = beam.atom(index).unwrap_or("<unknown>").to_owned();
+                    name = beamops::atom_name(index).unwrap_or("<unknown>").to_owned();
                 }
                 arity = as_u32(op.operands().get(3)).unwrap_or(0).min(255) as u8;
             }
@@ -2122,7 +2175,7 @@ fn lambda_call_target(op: &SpecificOp, beam: &BeamFile) -> Option<u32> {
     ) {
         return None;
     }
-    let FunCallTag::Lambda(index) = fun_call_tag(op.operands().first(), beam).ok()? else {
+    let FunCallTag::Lambda(index) = fun_call_tag(op.operands().first()).ok()? else {
         return None;
     };
     beam.lambdas
@@ -2133,11 +2186,10 @@ fn lambda_call_target(op: &SpecificOp, beam: &BeamFile) -> Option<u32> {
 
 /// Maps `i_call_fun2` Safe operand: atom → Dynamic, lambda index → Lambda(id).
 // Port of erts/emulator/beam/jit/arm/ops.tab:879-880 (`aF`) and instr_fun.cpp:402-423, OTP-29.1.1.
-fn fun_call_tag(value: Option<&SpecificOperand>, beam: &BeamFile) -> Result<FunCallTag, EmitError> {
+fn fun_call_tag(value: Option<&SpecificOperand>) -> Result<FunCallTag, EmitError> {
     match value.ok_or_else(|| EmitError::Operand("missing call_fun2 tag".to_owned()))? {
         SpecificOperand::Atom(index) => {
-            let name = beam
-                .atom(*index)
+            let name = beamops::atom_name(*index)
                 .ok_or_else(|| EmitError::Operand(format!("unknown call_fun2 atom {index}")))?;
             if name == "safe" {
                 Ok(FunCallTag::DynamicSafe)
@@ -2200,17 +2252,6 @@ fn arg(
         SpecificOperand::Nil => Ok(ArgVal::Immediate(0x3b)),
         SpecificOperand::BigInt(decimal) => env.bigint_literal(decimal).map(ArgVal::Literal),
         _ => Err("operand form is not accepted by the module assembler".to_owned()),
-    }
-}
-
-fn list_operand<'a>(
-    value: Option<&'a SpecificOperand>,
-    arena: &'a TransformArena,
-) -> Option<&'a [SpecificOperand]> {
-    match value? {
-        SpecificOperand::List(values) => Some(values),
-        SpecificOperand::ArenaList(slice) => Some(arena.list(*slice)),
-        _ => None,
     }
 }
 
@@ -2300,27 +2341,6 @@ fn literal_type_union(etf: &[u8]) -> u16 {
 /// Orders a map instruction's key/value vector by flatmap key order.
 // Port of erts/emulator/beam/beam_transform_helpers.c:54-110 (beam_load_map_key_sort),
 // OTP-29.1.1: a single pair is already sorted; several pairs need literal keys.
-fn map_key_sort(args: Vec<ArgVal>, env: &impl ModuleEnv) -> Result<Vec<ArgVal>, EmitError> {
-    if args.len() <= 2 {
-        return Ok(args);
-    }
-    let keys = args
-        .iter()
-        .step_by(2)
-        .map(|key| match key {
-            ArgVal::Immediate(word) | ArgVal::Literal(word) => Ok(*word),
-            _ => Err(EmitError::Operand(
-                "only a single variable key is allowed in a map instruction".to_owned(),
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let order = env.sort_map_keys(&keys).map_err(EmitError::Operand)?;
-    Ok(order
-        .into_iter()
-        .flat_map(|index| [args[2 * index], args[2 * index + 1]])
-        .collect())
-}
-
 /// `Live` of a bit-syntax match command: `nil` when the command cannot allocate.
 fn number(value: Option<&SpecificOperand>) -> Result<u32, String> {
     as_u32(value).ok_or_else(|| "expected nonnegative integer operand".to_owned())
@@ -2385,46 +2405,6 @@ fn count_at_least(args: &[SpecificOperand], minimum: usize, name: &str) -> Resul
     }
 }
 
-fn allocation_words(
-    value: Option<&SpecificOperand>,
-    arena: &TransformArena,
-) -> Result<u32, String> {
-    let items = match value {
-        Some(SpecificOperand::Allocations(items)) => items.as_slice(),
-        Some(SpecificOperand::ArenaAllocations(slice)) => arena.allocation_list(*slice),
-        _ => return Err("expected allocation descriptor".to_owned()),
-    };
-    if items.is_empty() && value.is_none() {
-        return Err("expected allocation descriptor".to_owned());
-    }
-    items
-        .iter()
-        .try_fold(0_u32, |total, (kind, count)| {
-            let words = match kind {
-                0 => *count,
-                // FLOAT_SIZE_OBJECT and ERL_FUN_SIZE are both two words.
-                1 | 2 => count.saturating_mul(2),
-                _ => return None,
-            };
-            total.checked_add(u32::try_from(words).ok()?)
-        })
-        .ok_or_else(|| "allocation descriptor size overflow".to_owned())
-}
-
-fn count_or_allocation_words(
-    value: Option<&SpecificOperand>,
-    arena: &TransformArena,
-) -> Result<u32, String> {
-    if matches!(
-        value,
-        Some(SpecificOperand::Allocations(_) | SpecificOperand::ArenaAllocations(_))
-    ) {
-        allocation_words(value, arena)
-    } else {
-        number(value)
-    }
-}
-
 fn tuple_byte_offset(value: Option<&SpecificOperand>) -> Result<u32, String> {
     // ARM tuple loads use zero-based positions after the tuple header word.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:378-389, OTP-29.1.1.
@@ -2451,7 +2431,6 @@ fn emit_op(
     env: &impl ModuleEnv,
     function: &str,
     arity: u8,
-    arena: &TransformArena,
 ) -> Result<(), EmitError> {
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:452 (BeamModuleAssembler::emit),
     // OTP-29.1.1: `tbz`/`tbnz` reach only ±32KB, so each instruction flushes a veneer before a
@@ -2472,47 +2451,6 @@ fn emit_op(
     };
     let n = |index| number(args.get(index)).map_err(EmitError::Operand);
     let helper = env.arithmetic_helper();
-    if op.name() == "get_map_elements" {
-        // Port of erts/emulator/beam/generators.tab:230-254 (gen.has_map_fields) followed by
-        // gen.get_map_elements (generators.tab:202-227), then beam/ops.tab:1190-1195:
-        // sort the lookup keys and build their load-time internal hashes.
-        count_at_least(args, 3, op.name())?;
-        let size = usize::try_from(n(2)?)
-            .map_err(|_| EmitError::Operand("map element size overflows usize".to_owned()))?;
-        if !size.is_multiple_of(2) || args.len() != 3 + size {
-            return Err(EmitError::Operand(
-                "get_map_elements expects key/destination pairs".to_owned(),
-            ));
-        }
-        let pairs = args[3..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| {
-                Ok::<_, EmitError>([
-                    arg(Some(&pair[0]), beam, env).map_err(EmitError::Operand)?,
-                    arg(Some(&pair[1]), beam, env).map_err(EmitError::Operand)?,
-                ])
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-        let pairs = map_key_sort(pairs, env)?;
-        if size == 2 {
-            return assembler
-                .emit_i_get_map_element(n(0)?, value(1)?, pairs[0], pairs[1], env.map_runtime())
-                .map_err(|error| EmitError::Assembler(format!("{error:?}")));
-        }
-        let mut triples = Vec::with_capacity(size / 2 * 3);
-        for pair in pairs.as_chunks::<2>().0 {
-            let key = pair[0];
-            triples.extend([key, pair[1], ArgVal::Immediate(env.map_key_hash(key))]);
-        }
-        let result =
-            assembler.emit_i_get_map_elements(n(0)?, value(1)?, &triples, env.map_runtime());
-        return result.map_err(|error| EmitError::Assembler(format!("{error:?}")));
-    }
     if op.name() == "i_get_map_elements" {
         count_at_least(args, 3, op.name())?;
         let size = usize::try_from(n(2)?)
@@ -2524,22 +2462,10 @@ fn emit_op(
         }
         // Port of beam/ops.tab:1190-1195 and erts/emulator/beam/jit/arm/instr_map.cpp:391-490,
         // OTP-29.1.1. The loader-sorted key triplets carry their internal hashes.
-        let encoded = args[3..]
+        let triples = args[3..]
             .iter()
             .map(|operand| arg(Some(operand), beam, env).map_err(EmitError::Operand))
             .collect::<Result<Vec<_>, _>>()?;
-        let pairs = encoded
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .flat_map(|triplet| [triplet[0], triplet[1]])
-            .collect();
-        let pairs = map_key_sort(pairs, env)?;
-        let mut triples = Vec::with_capacity(encoded.len());
-        for pair in pairs.as_chunks::<2>().0 {
-            let key = pair[0];
-            triples.extend([key, pair[1], ArgVal::Immediate(env.map_key_hash(key))]);
-        }
         let result =
             assembler.emit_i_get_map_elements(n(0)?, value(1)?, &triples, env.map_runtime());
         return result.map_err(|error| EmitError::Assembler(format!("{error:?}")));
@@ -2572,6 +2498,14 @@ fn emit_op(
             "i_flush_stubs" => {
                 count(0)?;
                 assembler.flush_yield_stubs()
+            }
+            "i_nif_padding" => {
+                count(0)?;
+                // erts pads the end of a function that a later `load_nif` can replace
+                // (beam_asm_module.cpp:163, emit_i_nif_padding). This assembler reserves the
+                // call-NIF patch site after the function's breakpoint trampoline instead (see
+                // `emit_nif_patch_site` in the function loop), so there is nothing to pad.
+                Ok(())
             }
             "i_func_label" => {
                 count(1)?;
@@ -2765,30 +2699,25 @@ fn emit_op(
             assembler.trim(n(0)?, n(1)?)
         }
         EmitterKind::InitYregs => {
-            if args.len() == 2 {
-                Ok(assembler.init_yregs(n(0)?, n(1)?)?)
-            } else if let Some(registers) = list_operand(args.first(), arena) {
-                if args.len() != 1 {
-                    return Err(EmitError::Operand(
-                        "init_yregs expects two counts or a Y-register list".to_owned(),
-                    ));
-                }
-                let mut indices = Vec::with_capacity(registers.len());
-                for register in registers.iter() {
-                    let SpecificOperand::Y(index) = register else {
-                        return Err(EmitError::Operand(
-                            "init_yregs list must contain Y registers".to_owned(),
-                        ));
-                    };
-                    indices.push(*index);
-                }
-                assembler.init_yregs_list(&indices)?;
-                Ok(())
-            } else {
-                Err(arinsal_beamasm::module::ModuleError::InvalidOperand(
-                    "init_yregs expects two counts or a Y-register list",
-                ))
+            // `init_yregs I *`: the count, then the registers.
+            count_at_least(args, 1, op.name())?;
+            let registers = n(0)? as usize;
+            if args.len() != 1 + registers {
+                return Err(EmitError::Operand(
+                    "init_yregs expects a count and that many Y registers".to_owned(),
+                ));
             }
+            let mut indices = Vec::with_capacity(registers);
+            for register in &args[1..] {
+                let SpecificOperand::Y(index) = register else {
+                    return Err(EmitError::Operand(
+                        "init_yregs list must contain Y registers".to_owned(),
+                    ));
+                };
+                indices.push(*index);
+            }
+            assembler.init_yregs_list(&indices)?;
+            Ok(())
         }
         EmitterKind::Return => {
             count(0)?;
@@ -3053,18 +2982,11 @@ fn emit_op(
                         count(3)?;
                         let external = matches!(
                             args.get(2),
-                            Some(SpecificOperand::Atom(index)) if beam.atom(*index) == Some("external")
+                            Some(SpecificOperand::Atom(index)) if beamops::atom_name(*index) == Some("external")
                         );
-                        let module = beam
-                            .atoms
-                            .iter()
-                            .position(|atom| *atom == beam.module)
-                            .and_then(|position| u32::try_from(position + 1).ok())
-                            .ok_or_else(|| {
-                                EmitError::Operand(
-                                    "module name is not in the atom table".to_owned(),
-                                )
-                            })?;
+                        let module = beamops::global_atom_index(&beam.module).ok_or_else(|| {
+                            EmitError::Operand("module name is not an atom".to_owned())
+                        })?;
                         let module = env.atom(beam, module).map_err(EmitError::Operand)?;
                         assembler.emit_is_record_accessible(
                             fail,
@@ -3175,15 +3097,12 @@ fn emit_op(
             let runtime = env.map_runtime();
             if op.name() == "i_get_map_element_hash" {
                 count(5)?;
-                // Atom indices are only known at load time, so the key hash is computed here
-                // rather than by the BEAM operation lowering.
-                let key = value(2)?;
-                let hash = arinsal_beamasm::map::literal_key_hash(key);
+                // The hash is the loader's `hashmap_make_hash` of the key (gen.get_map_element).
                 assembler.emit_i_get_map_element_hash(
                     n(0)?,
                     value(1)?,
-                    key,
-                    ArgVal::Immediate(hash),
+                    value(2)?,
+                    value(3)?,
                     value(4)?,
                     runtime,
                 )?;
@@ -3213,7 +3132,6 @@ fn emit_op(
                     .iter()
                     .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                     .collect::<Result<Vec<_>, _>>()?;
-                let updates = map_key_sort(updates, env)?;
                 assembler.emit_update_map_assoc(value(0)?, value(1)?, n(2)?, &updates, runtime)
             } else {
                 count_at_least(args, 5, op.name())?;
@@ -3226,7 +3144,6 @@ fn emit_op(
                     .iter()
                     .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                     .collect::<Result<Vec<_>, _>>()?;
-                let updates = map_key_sort(updates, env)?;
                 assembler.emit_update_map_exact(
                     value(0)?,
                     n(1)?,
@@ -3249,43 +3166,26 @@ fn emit_op(
                 .iter()
                 .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                 .collect::<Result<Vec<_>, _>>()?;
-            let pairs = map_key_sort(pairs, env)?;
             assembler.emit_new_map(value(0)?, n(1)?, &pairs, env.map_runtime())
         }
         EmitterKind::MapCreate => {
             // Port of erts/emulator/beam/jit/arm/generators.tab:250-300 (gen.new_small_map_lit)
-            // and instr_map.cpp:258-305, OTP-29.1.1: the sorted literal keys move into one
-            // tuple literal; only the values stay operands.
-            count_at_least(args, 3, op.name())?;
-            let size = usize::try_from(n(2)?)
+            // and instr_map.cpp:258-305, OTP-29.1.1: the sorted literal keys are one tuple
+            // literal; only the values are operands.
+            count_at_least(args, 4, op.name())?;
+            let size = usize::try_from(n(3)?)
                 .map_err(|_| EmitError::Operand("map literal size overflow".to_owned()))?;
-            if size % 2 != 0 || args.len() != 3 + size {
+            if args.len() != 4 + size {
                 return Err(EmitError::Operand("map literal size mismatch".to_owned()));
             }
-            let mut keys = Vec::with_capacity(size / 2);
-            let mut values = Vec::with_capacity(size / 2);
-            for pair in args[3..].as_chunks::<2>().0 {
-                match arg(Some(&pair[0]), beam, env).map_err(EmitError::Operand)? {
-                    ArgVal::Immediate(word) | ArgVal::Literal(word) => keys.push(word),
-                    _ => {
-                        return Err(EmitError::Operand(
-                            "small map keys must be literals".to_owned(),
-                        ));
-                    }
-                }
-                values.push(arg(Some(&pair[1]), beam, env).map_err(EmitError::Operand)?);
-            }
-            // Port of erts/emulator/beam/beam_transform_helpers.c:54-110
-            // (beam_load_map_key_sort), OTP-29.1.1: the loader sorts the pairs in flatmap key
-            // order before new_small_map_lit, and atom order depends on runtime atom indices.
-            let order = env.sort_map_keys(&keys).map_err(EmitError::Operand)?;
-            let keys = order.iter().map(|&index| keys[index]).collect::<Vec<_>>();
-            let values = order.iter().map(|&index| values[index]).collect::<Vec<_>>();
-            let keys = env.tuple_literal(&keys).map_err(EmitError::Operand)?;
+            let values = args[4..]
+                .iter()
+                .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
+                .collect::<Result<Vec<_>, _>>()?;
             let words = u32::try_from(values.len() + 3)
                 .map_err(|_| EmitError::Operand("map literal size overflow".to_owned()))?;
             assembler.emit_test_heap(words, n(1)?, env.gc_hook())?;
-            assembler.emit_i_new_small_map_lit(value(0)?, ArgVal::Literal(keys), &values)
+            assembler.emit_i_new_small_map_lit(value(0)?, value(2)?, &values)
         }
         EmitterKind::BsConstruct if op.name() == "bs_init_writable" => {
             count(0)?;
@@ -3306,7 +3206,7 @@ fn emit_op(
             let mut segments = Vec::with_capacity(tail.len() / 6);
             for fields in tail.as_chunks::<6>().0 {
                 let name = match fields.first() {
-                    Some(SpecificOperand::Atom(index)) => beam.atom(*index),
+                    Some(SpecificOperand::Atom(index)) => beamops::atom_name(*index),
                     _ => None,
                 }
                 .ok_or_else(|| {
@@ -3756,7 +3656,7 @@ fn emit_op(
             "i_call_fun2" => {
                 count(3)?;
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:402-423, OTP-29.1.1.
-                let tag = fun_call_tag(args.first(), beam)?;
+                let tag = fun_call_tag(args.first())?;
                 let arity = n(1)?.min(u8::MAX as u32) as u8;
                 let func = arg(args.get(2), beam, env).map_err(EmitError::Operand)?;
                 assembler.emit_i_call_fun2(tag, arity, func, env.fun_resolver())
@@ -3764,7 +3664,7 @@ fn emit_op(
             "i_call_fun2_last" => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:425-455, OTP-29.1.1.
-                let tag = fun_call_tag(args.first(), beam)?;
+                let tag = fun_call_tag(args.first())?;
                 let arity = n(1)?.min(u8::MAX as u32) as u8;
                 let func = arg(args.get(2), beam, env).map_err(EmitError::Operand)?;
                 assembler.emit_i_call_fun2_last(tag, arity, func, n(3)?, env.fun_resolver())
@@ -3784,7 +3684,7 @@ fn emit_op(
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:819-839, OTP-29.1.1:
             // the stub body tail-calls the BIF through the shared BIF call path.
             let name = |at: usize| match args.get(at) {
-                Some(SpecificOperand::Atom(index)) => beam.atom(*index),
+                Some(SpecificOperand::Atom(index)) => beamops::atom_name(*index),
                 _ => None,
             };
             if let (Some(module), Some(function)) = (name(0), name(1))
@@ -3838,18 +3738,17 @@ fn emit_op(
                 assembler.emit_put_list2(value(0)?, value(1)?, value(2)?, value(3)?)
             }
             "put_tuple2" => {
-                count(2)?;
-                let elements = match list_operand(args.get(1), arena) {
-                    Some(values) => values
-                        .iter()
-                        .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    _ => {
-                        return Err(EmitError::Operand(
-                            "put_tuple2 expects a variable operand list".to_owned(),
-                        ));
-                    }
-                };
+                // `put_tuple2 S A *`: the destination, the element count, the elements.
+                count_at_least(args, 2, op.name())?;
+                if args.len() != 2 + n(1)? as usize {
+                    return Err(EmitError::Operand(
+                        "put_tuple2 expects its element count operands".to_owned(),
+                    ));
+                }
+                let elements = args[2..]
+                    .iter()
+                    .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
+                    .collect::<Result<Vec<_>, _>>()?;
                 assembler.emit_put_tuple2(value(0)?, &elements)
             }
             "get_list" => {
@@ -3888,22 +3787,21 @@ fn emit_op(
                 )
             }
             "update_record" => {
-                count(5)?;
+                count_at_least(args, 5, op.name())?;
                 let arity = n(1)?;
-                let updates = match list_operand(args.get(4), arena) {
-                    Some(values) if values.len() % 2 == 0 => values
-                        .chunks(2)
-                        .map(|pair| Ok((number(pair.first())?, arg(pair.get(1), beam, env)?)))
-                        .collect::<Result<Vec<_>, String>>()?,
-                    _ => {
-                        return Err(EmitError::Operand(
-                            "update_record expects index/value pairs".to_owned(),
-                        ));
-                    }
-                };
+                let pairs = &args[5..];
+                if pairs.len() != n(4)? as usize || !pairs.len().is_multiple_of(2) {
+                    return Err(EmitError::Operand(
+                        "update_record expects index/value pairs".to_owned(),
+                    ));
+                }
+                let updates = pairs
+                    .chunks(2)
+                    .map(|pair| Ok((number(pair.first())?, arg(pair.get(1), beam, env)?)))
+                    .collect::<Result<Vec<_>, String>>()?;
                 let reuse = matches!(
                     args.first(),
-                    Some(SpecificOperand::Atom(index)) if beam.atom(*index) == Some("reuse")
+                    Some(SpecificOperand::Atom(index)) if beamops::atom_name(*index) == Some("reuse")
                 );
                 assembler.emit_update_record(reuse, value(2)?, value(3)?, arity, &updates)
             }
@@ -3928,33 +3826,24 @@ fn emit_op(
             match op.name() {
                 "test_heap" => {
                     count(2)?;
-                    let (words, live) = if matches!(
-                        args.first(),
-                        Some(
-                            SpecificOperand::Allocations(_) | SpecificOperand::ArenaAllocations(_)
-                        )
-                    ) {
-                        (allocation_words(args.first(), arena)?, number(args.get(1))?)
-                    } else {
-                        (number(args.first())?, number(args.get(1))?)
-                    };
+                    let (words, live) = (number(args.first())?, number(args.get(1))?);
                     assembler.emit_test_heap(words, live, hook)
                 }
                 "allocate_heap" => {
                     count(3)?;
                     assembler.emit_allocate_heap(
-                        count_or_allocation_words(args.first(), arena)?,
-                        count_or_allocation_words(args.get(1), arena)?,
-                        count_or_allocation_words(args.get(2), arena)?,
+                        number(args.first())?,
+                        number(args.get(1))?,
+                        number(args.get(2))?,
                         hook,
                     )
                 }
                 "allocate_heap_zero" => {
                     count(3)?;
                     assembler.emit_allocate_heap_zero(
-                        count_or_allocation_words(args.first(), arena)?,
-                        count_or_allocation_words(args.get(1), arena)?,
-                        count_or_allocation_words(args.get(2), arena)?,
+                        number(args.first())?,
+                        number(args.get(1))?,
+                        number(args.get(2))?,
                         hook,
                     )
                 }
@@ -4234,7 +4123,7 @@ fn emit_op(
                 .iter()
                 .enumerate()
                 .map(|(i, item)| {
-                    if is_tuple_arity && i % 2 == 0 {
+                    if is_tuple_arity && i < size / 2 {
                         match item {
                             SpecificOperand::SmallInt(val) => Ok(ArgVal::Immediate(*val as u64)),
                             SpecificOperand::Unsigned(val) => Ok(ArgVal::Immediate(*val)),
@@ -4245,22 +4134,13 @@ fn emit_op(
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut pairs = payload
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| pair[0])
-                .chain(payload.as_chunks::<2>().0.iter().map(|pair| pair[1]))
-                .collect::<Vec<_>>();
+            // The loader's gen.select_val and gen.select_tuple_arity (generators.tab) already
+            // sorted the values (beam_load_sort_select_vals) and laid the operands out as the
+            // emitter takes them: all values, then all labels.
+            let pairs = payload;
             if matches!(ported_op(op), Some(EmitterKind::SelectVal)) {
                 let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
-                // Port of erts/emulator/beam/jit/arm/instr_select.cpp:107-190,
-                // OTP-29.1.1, and of gen.select_val in generators.tab, which
-                // sorts the pairs for the linear and the binary search alike
-                // (beam_load_sort_select_vals; see sorted_select_val_pairs). Atom words are process-local
-                // here, so order the pairs by the words the emitted comparison
-                // sees.
-                pairs = sorted_select_val_pairs(&pairs);
+                // Port of erts/emulator/beam/jit/arm/instr_select.cpp:107-190, OTP-29.1.1.
                 if op.name() == "i_select_val_lins" {
                     assembler.emit_i_select_val_lins(source, value(1)?, size, &pairs)
                 } else {
@@ -4401,10 +4281,7 @@ fn emit_op(
                     let (mut need, mut live) = (0u64, 0u32);
                     if op.name() == "i_bs_match_test_heap" {
                         count_at_least(args, 4, op.name())?;
-                        need = u64::from(
-                            count_or_allocation_words(args.get(2), arena)
-                                .map_err(EmitError::Operand)?,
-                        );
+                        need = u64::from(number(args.get(2)).map_err(EmitError::Operand)?);
                         live = n(3)?;
                         at = 4;
                     }
@@ -4440,11 +4317,7 @@ fn emit_op(
                                 "bitstring match expects command atoms".to_owned(),
                             ));
                         };
-                        let Some(name) = index
-                            .checked_sub(1)
-                            .and_then(|index| beam.atoms.get(index as usize))
-                            .map(String::as_str)
-                        else {
+                        let Some(name) = beamops::atom_name(*index) else {
                             return Err(EmitError::Operand(
                                 "bitstring match command atom is out of range".to_owned(),
                             ));
@@ -4739,23 +4612,6 @@ pub fn emitter_for(name: &str) -> bool {
 
 /// Orders a `select_val` pair list (all values, then all labels) by the raw word each value
 /// compares as, for the linear and the binary search alike.
-// Port of gen.select_val in erts/emulator/beam/jit/arm/generators.tab
-// (beam_load_sort_select_vals), OTP-29.1.1. Atom words are process-local here, so the order
-// is taken from the words the emitted comparison sees.
-fn sorted_select_val_pairs(pairs: &[ArgVal]) -> Vec<ArgVal> {
-    let count = pairs.len() / 2;
-    let mut order = (0..count).collect::<Vec<_>>();
-    order.sort_by_key(|&index| match pairs[index] {
-        ArgVal::Immediate(value) | ArgVal::Literal(value) => value,
-        _ => 0,
-    });
-    order
-        .iter()
-        .map(|&index| pairs[index])
-        .chain(order.iter().map(|&index| pairs[index + count]))
-        .collect()
-}
-
 #[cfg(test)]
 mod function_allowlist_tests {
     use super::function_allowlist_contains;
@@ -4770,33 +4626,5 @@ mod function_allowlist_tests {
         assert!(!function_allowlist_contains("with/2", "with", 1));
         assert!(!function_allowlist_contains("with/2", "with_1", 2));
         assert!(!function_allowlist_contains("broken,with/nope", "with", 2));
-    }
-}
-
-#[cfg(test)]
-mod select_val_order_tests {
-    use super::{ArgVal, sorted_select_val_pairs};
-
-    #[test]
-    fn pairs_are_ordered_by_raw_value_for_short_lists() {
-        let pairs = [
-            ArgVal::Immediate(0x38b),
-            ArgVal::Immediate(0xa18b),
-            ArgVal::Immediate(0x38b - 0x40),
-            ArgVal::Label(1),
-            ArgVal::Label(2),
-            ArgVal::Label(3),
-        ];
-        assert_eq!(
-            sorted_select_val_pairs(&pairs),
-            [
-                ArgVal::Immediate(0x38b - 0x40),
-                ArgVal::Immediate(0x38b),
-                ArgVal::Immediate(0xa18b),
-                ArgVal::Label(3),
-                ArgVal::Label(1),
-                ArgVal::Label(2),
-            ]
-        );
     }
 }

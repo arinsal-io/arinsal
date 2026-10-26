@@ -48,11 +48,13 @@ fn debugger_line_breakpoint_rewrite_obeys_load_flag() {
     );
 
     let disabled = transform_module(&beam)
+        .unwrap()
         .iter()
         .flatten()
         .map(|op| op.name().to_owned())
         .collect::<Vec<_>>();
     let enabled = transform_module_with_line_breakpoints(&beam, true)
+        .unwrap()
         .iter()
         .flatten()
         .map(|op| op.name().to_owned())

@@ -23,10 +23,13 @@ pub(crate) const TAG_A: u8 = 2;
 pub(crate) const TAG_X: u8 = 3;
 pub(crate) const TAG_Y: u8 = 4;
 pub(crate) const TAG_F: u8 = 5;
+#[allow(dead_code)]
 pub(crate) const TAG_H: u8 = 6;
+#[allow(dead_code)]
 pub(crate) const TAG_Z: u8 = 7;
 pub(crate) const TAG_N: u8 = 8;
 pub(crate) const TAG_P: u8 = 9;
+#[allow(dead_code)]
 pub(crate) const TAG_R: u8 = 10;
 pub(crate) const TAG_V: u8 = 11;
 pub(crate) const TAG_L: u8 = 12;
@@ -92,6 +95,7 @@ impl BeamOp {
     }
 
     /// `a[0..arity]`.
+    #[cfg(test)]
     pub(crate) fn args(&self) -> &[BeamOpArg] {
         match &self.spilled {
             Some(args) => &args[..self.arity],
@@ -141,6 +145,7 @@ pub(crate) struct BeamOpAllocator {
 }
 
 impl BeamOpAllocator {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -214,21 +219,7 @@ pub(crate) struct BeamCodeReader<'a> {
 }
 
 impl<'a> BeamCodeReader<'a> {
-    /// `beamfile_get_code`.
-    pub(crate) fn new(file: &'a BeamFile) -> Self {
-        let atoms = file
-            .atoms
-            .iter()
-            .map(|name| {
-                arinsal_term::global_atoms()
-                    .intern(name)
-                    .expect("an atom of a module being loaded")
-            })
-            .collect();
-        Self::with_atoms(file, atoms)
-    }
-
-    /// `beamfile_get_code` with the module's atoms already in the table.
+    /// `beamfile_get_code`: the reader over a module whose atoms are already in the table.
     pub(crate) fn with_atoms(file: &'a BeamFile, atoms: Vec<Atom>) -> Self {
         Self {
             file,

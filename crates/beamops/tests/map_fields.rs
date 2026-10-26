@@ -40,7 +40,7 @@ fn loaded_stdlib_map_patterns_have_no_has_map_fields_specific_op() {
     for (module, path) in beams {
         let beam: BeamFile = parse(&fs::read(path).expect("read OTP module BEAM"))
             .unwrap_or_else(|error| panic!("parse {module}: {error}"));
-        let transformed = transform_module(&beam);
+        let transformed = transform_module(&beam).unwrap();
         assert!(
             transformed
                 .iter()

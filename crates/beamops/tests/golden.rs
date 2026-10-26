@@ -17,6 +17,30 @@ fn fnv(hash: &mut u64, text: &str) {
     }
 }
 
+/// The text of an operation that does not depend on the order in which this process created its
+/// atoms: atoms by name, and the key hashes (functions of the atom indexes) left out.
+fn stable_text(op: &arinsal_beamops::SpecificOp) -> String {
+    use arinsal_beamops::SpecificOperand;
+    let hash_at = |index: usize| match op.name() {
+        "i_get_hash" => index == 1,
+        "i_get_map_element_hash" => index == 3,
+        "i_get_map_elements" => index >= 3 && (index - 3) % 3 == 2,
+        _ => false,
+    };
+    let mut text = format!("{}(", op.name());
+    for (index, operand) in op.operands().iter().enumerate() {
+        match operand {
+            SpecificOperand::Atom(atom) => {
+                text.push_str(&format!("Atom({:?}), ", arinsal_beamops::atom_name(*atom)));
+            }
+            _ if hash_at(index) => text.push_str("Hash, "),
+            other => text.push_str(&format!("{other:?}, ")),
+        }
+    }
+    text.push(')');
+    text
+}
+
 fn hash_module(bytes: &[u8]) -> Option<(u64, u64)> {
     let beam = parse(bytes).ok()?;
     let digest = |functions: Vec<Vec<arinsal_beamops::SpecificOp>>| {
@@ -24,14 +48,14 @@ fn hash_module(bytes: &[u8]) -> Option<(u64, u64)> {
         for function in functions {
             fnv(&mut hash, "|function|");
             for op in function {
-                fnv(&mut hash, &format!("{op:?}"));
+                fnv(&mut hash, &stable_text(&op));
             }
         }
         hash
     };
     Some((
-        digest(transform_module_typed(&beam, false)),
-        digest(transform_module_with_line_breakpoints(&beam, false)),
+        digest(transform_module_typed(&beam, false).ok()?),
+        digest(transform_module_with_line_breakpoints(&beam, false).ok()?),
     ))
 }
 
@@ -51,8 +75,9 @@ fn module_hashes(ebin: &Path, hashes: &mut BTreeMap<String, (u64, u64)>) {
     let Ok(entries) = std::fs::read_dir(ebin) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let mut paths: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+    for path in paths {
         if path.extension().is_none_or(|extension| extension != "beam") {
             continue;
         }
@@ -109,7 +134,14 @@ fn check(fixture_name: &str, hashes: &BTreeMap<String, (u64, u64)>) {
     );
 }
 
+/// One test, so the process creates its atoms in one fixed order: erts sorts select values and map
+/// keys by atom, so the output depends on the order of the atoms, and the digests with it.
 #[test]
+fn modules_transform_as_recorded() {
+    otp_modules_transform_as_recorded();
+    elixir_modules_transform_as_recorded();
+}
+
 fn otp_modules_transform_as_recorded() {
     let Some(dirs) = erl_output(
         "io:format(\"~s\", [string:join([P || P <- code:get_path(), P =/= \".\"], \"\\n\")]), halt().",
@@ -125,7 +157,6 @@ fn otp_modules_transform_as_recorded() {
     check("transform_golden_otp.txt", &hashes);
 }
 
-#[test]
 fn elixir_modules_transform_as_recorded() {
     let Some(dir) = erl_output("io:format(\"~s\", [filename:dirname(code:which(lists))]), halt().")
         .and_then(|_| {

@@ -80,14 +80,16 @@ impl ModuleEnv for CorpusEnv {
         Ok((0..keys.len()).collect())
     }
 
-    fn atom(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
-        let name = beam
-            .atom(index)
+    fn atom(&self, _beam: &BeamFile, index: u32) -> Result<u64, String> {
+        let atom = arinsal_term::Atom(index);
+        global_atoms()
+            .text(atom)
             .ok_or_else(|| format!("atom index {index} is out of range"))?;
-        let atom = global_atoms()
-            .intern(name)
-            .map_err(|error| format!("atom {name}: {error:?}"))?;
         Ok(Term::atom(atom).tagged_word())
+    }
+
+    fn add_literal(&self, _index: u32, _word: u64) -> Result<(), String> {
+        Ok(())
     }
 
     fn literal(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
@@ -99,6 +101,10 @@ impl ModuleEnv for CorpusEnv {
                 .local_fun(entry, &[])
                 .map(Term::tagged_word)
                 .map_err(|error| format!("zero-capture fun {lambda_index}: {error:?}"));
+        }
+        if index as usize >= beam.literals.len() {
+            // A literal the load added (a record definition, a key tuple, a bignum).
+            return Ok(Term::NIL.tagged_word());
         }
         let value = beam.literal(index).map_err(|error| error.to_string())?;
         from_owned(&value, &mut *heap)
