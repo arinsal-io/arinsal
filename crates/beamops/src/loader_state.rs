@@ -6,6 +6,7 @@ use arinsal_beam::BeamFile;
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{Atom, Term, TermBuilder, VecHeap, from_owned, global_atoms};
 use num_bigint::BigInt;
+use std::collections::HashMap;
 
 /// `TE_OK`, `TE_FAIL` and `TE_SHORT_WINDOW`: what `erts_transform_engine` returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,79 +65,88 @@ pub(crate) enum ExtraLiteral {
     FunPlaceholder { lambda: usize },
 }
 
-/// The module's literals: `beam.literals` and the terms the loader adds.
-pub(crate) struct Literals {
+/// The module's literals: `beam.literals` and the terms the loader adds. The file's literals
+/// are decoded when a predicate or generator asks for them: erts decodes them all in
+/// `beamfile_read`, and the loader of this runtime does so for the module it builds.
+pub(crate) struct Literals<'a> {
+    beam: &'a BeamFile,
     /// The literal area.
     pub heap: VecHeap,
-    owned: Vec<OwnedTerm>,
-    terms: Vec<Term>,
+    owned: Vec<Option<OwnedTerm>>,
+    terms: Vec<Option<Term>>,
     pub extra: Vec<ExtraLiteral>,
     extra_terms: Vec<Option<Term>>,
     /// `BeamFile_Record.def_literal` of each record: the literal index.
     pub record_defs: Vec<u64>,
 }
 
-impl Literals {
-    /// Port of erts/emulator/beam/beam_file.c (parse_decompressed_literals, parse_record_chunk),
-    /// OTP-29.1.1: the literal chunk is decoded in index order, then the records.
-    pub(crate) fn new(beam: &BeamFile) -> Option<Self> {
-        let mut heap = VecHeap::new_literal();
-        let mut owned = Vec::with_capacity(beam.literals.len());
-        let mut terms = Vec::with_capacity(beam.literals.len());
-        for index in 0..beam.literals.len() {
-            let value = beam.literal(index as u32).ok()?;
-            terms.push(from_owned(&value, &mut heap).ok()?);
-            owned.push(value);
-        }
-        let module = global_atoms().intern(&beam.module).ok()?;
-        let mut definitions = Vec::with_capacity(beam.records.len());
-        for record in &beam.records {
-            let name = global_atoms().intern(&record.name).ok()?;
-            let mut fields = Vec::with_capacity(record.fields.len());
-            for (field, default) in &record.fields {
-                let field = global_atoms().intern(field).ok()?;
-                let default = match default {
-                    Some(default) => Some(from_owned(default, &mut heap).ok()?),
-                    None => None,
-                };
-                fields.push((field, default));
-            }
-            definitions.push(
-                TermBuilder::new(&mut heap)
-                    .native_record_literal(module, name, record.is_exported, &fields)
-                    .ok()?,
-            );
-        }
+impl<'a> Literals<'a> {
+    /// Port of erts/emulator/beam/beam_file.c (parse_record_chunk), OTP-29.1.1: the records'
+    /// definitions are literals appended after the literal chunk.
+    pub(crate) fn new(beam: &'a BeamFile) -> Option<Self> {
         let mut literals = Self {
-            heap,
-            owned,
-            terms,
+            beam,
+            heap: VecHeap::new_literal(),
+            owned: vec![None; beam.literals.len()],
+            terms: vec![None; beam.literals.len()],
             extra: Vec::new(),
             extra_terms: Vec::new(),
             record_defs: Vec::new(),
         };
-        // `def_literal` of each record is the index `beamfile_add_literal` returned.
-        for definition in definitions {
-            let index = literals.add(ExtraLiteral::Term(definition));
-            literals.record_defs.push(index);
+        if !beam.records.is_empty() {
+            let module = global_atoms().intern(&beam.module).ok()?;
+            for record in &beam.records {
+                let name = global_atoms().intern(&record.name).ok()?;
+                let mut fields = Vec::with_capacity(record.fields.len());
+                for (field, default) in &record.fields {
+                    let field = global_atoms().intern(field).ok()?;
+                    let default = match default {
+                        Some(default) => Some(from_owned(default, &mut literals.heap).ok()?),
+                        None => None,
+                    };
+                    fields.push((field, default));
+                }
+                let definition = TermBuilder::new(&mut literals.heap)
+                    .native_record_literal(module, name, record.is_exported, &fields)
+                    .ok()?;
+                // `def_literal` is the index `beamfile_add_literal` returned.
+                let index = literals.add(ExtraLiteral::Term(definition));
+                literals.record_defs.push(index);
+            }
         }
         Some(literals)
+    }
+
+    /// The number of literals: `beam.literals.count`.
+    pub(crate) fn len(&self) -> usize {
+        self.terms.len() + self.extra.len()
     }
 
     /// `beamfile_get_literal` as a structure: the heap-independent value of a file literal.
     /// `None` for the literals the loader added: none of them is a float, a map or a list of
     /// flags.
-    pub(crate) fn owned(&self, index: u64) -> Option<&OwnedTerm> {
-        self.owned.get(index as usize)
+    pub(crate) fn owned(&mut self, index: u64) -> Option<&OwnedTerm> {
+        let slot = self.owned.get_mut(index as usize)?;
+        if slot.is_none() {
+            *slot = Some(self.beam.literal(index as u32).ok()?);
+        }
+        slot.as_ref()
     }
 
     /// `beamfile_get_literal`.
     pub(crate) fn term(&mut self, index: u64) -> Option<Term> {
         let index = index as usize;
-        if let Some(term) = self.terms.get(index) {
-            return Some(*term);
+        if index < self.terms.len() {
+            if let Some(term) = self.terms[index] {
+                return Some(term);
+            }
+            self.owned(index as u64)?;
+            let value = self.owned[index].as_ref()?;
+            let term = from_owned(value, &mut self.heap).ok()?;
+            self.terms[index] = Some(term);
+            return Some(term);
         }
-        let at = index.checked_sub(self.terms.len())?;
+        let at = index - self.terms.len();
         if let Some(Some(term)) = self.extra_terms.get(at) {
             return Some(*term);
         }
@@ -177,7 +187,7 @@ pub(crate) struct LoaderState<'a> {
     /// `lambda_literals`.
     pub lambda_literals: Vec<Option<u64>>,
     /// `beam.literals` and what generators add.
-    pub literals: Literals,
+    pub literals: Literals<'a>,
     /// `may_load_nif`.
     pub may_load_nif: bool,
     /// `load_hdr->are_nifs`.
@@ -186,6 +196,10 @@ pub(crate) struct LoaderState<'a> {
     pub function_number: usize,
     /// `load_hdr->debugger_flags`.
     pub debugger_flags: u64,
+    /// `beam.atoms`: the global atom of each atom table entry.
+    pub atoms: Vec<Atom>,
+    /// The position (one-based) in the atom table of a global atom, for the output.
+    pub local_atom: HashMap<u32, u32>,
 }
 
 /// `ERTS_DEBUGGER_ENABLED` and `ERTS_DEBUGGER_LINE_BREAKPOINTS` (erl_debugger.h).
@@ -198,9 +212,17 @@ impl<'a> LoaderState<'a> {
     /// reports a load error) or a literal cannot be built.
     pub(crate) fn new(
         beam: &'a BeamFile,
+        ops: BeamOpAllocator,
         are_nifs: Option<Vec<bool>>,
         debugger_flags: u64,
     ) -> Option<Self> {
+        let mut atoms = Vec::with_capacity(beam.atoms.len());
+        let mut local_atom = HashMap::with_capacity(beam.atoms.len());
+        for (position, name) in beam.atoms.iter().enumerate() {
+            let atom = global_atoms().intern(name).ok()?;
+            local_atom.entry(atom.0).or_insert(position as u32 + 1);
+            atoms.push(atom);
+        }
         let literals = Literals::new(beam)?;
         let mut labels = vec![
             Label {
@@ -229,8 +251,8 @@ impl<'a> LoaderState<'a> {
                 .atoms
                 .get(import.function_atom.checked_sub(1)? as usize)?;
             imports.push(ImportEntry {
-                module: u64::from(global_atoms().intern(module).ok()?.0),
-                function: u64::from(global_atoms().intern(function).ok()?.0),
+                module: u64::from(atoms[import.module_atom as usize - 1].0),
+                function: u64::from(atoms[import.function_atom as usize - 1].0),
                 arity: import.arity,
             });
             let bif = u8::try_from(import.arity)
@@ -247,7 +269,7 @@ impl<'a> LoaderState<'a> {
         }
         Some(Self {
             genop: None,
-            ops: BeamOpAllocator::new(),
+            ops,
             beam,
             imports,
             bif_imports,
@@ -258,6 +280,8 @@ impl<'a> LoaderState<'a> {
             are_nifs,
             function_number: 0,
             debugger_flags,
+            atoms,
+            local_atom,
         })
     }
 

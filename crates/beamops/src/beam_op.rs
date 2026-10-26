@@ -42,9 +42,9 @@ pub(crate) const TAG_TO_LETTER: [char; 15] = [
 const NIL: u64 = 0;
 
 /// `MAX_REG`: the number of X and Y registers.
-const MAX_REG: u64 = 1024;
+pub(crate) const MAX_REG: u64 = 1024;
 /// `REG_MASK` is below `1 << 10`: the type table index of a typed register is stored above it.
-const REG_TYPE_SHIFT: u32 = 10;
+pub(crate) const REG_TYPE_SHIFT: u32 = 10;
 
 /// `BeamOpArg`: an operand with its tag. An atom operand holds its global atom index, as erts
 /// holds the atom term.
@@ -208,6 +208,9 @@ pub(crate) struct BeamCodeReader<'a> {
     /// Integers too large for a word, which `marshal_integer` adds to the literal table
     /// (`beamfile_add_literal`): `TAG_q` with `beam.literals.len() + index`.
     pub(crate) bignum_literals: Vec<String>,
+    /// The number of literals before `bignum_literals` (`beam.literals.count`, which grows with
+    /// every literal the loader adds).
+    pub(crate) literal_base: usize,
 }
 
 impl<'a> BeamCodeReader<'a> {
@@ -222,6 +225,11 @@ impl<'a> BeamCodeReader<'a> {
                     .expect("an atom of a module being loaded")
             })
             .collect();
+        Self::with_atoms(file, atoms)
+    }
+
+    /// `beamfile_get_code` with the module's atoms already in the table.
+    pub(crate) fn with_atoms(file: &'a BeamFile, atoms: Vec<Atom>) -> Self {
         Self {
             file,
             instrs: &file.code.instructions,
@@ -232,6 +240,7 @@ impl<'a> BeamCodeReader<'a> {
             current_entry_label: BeamOpArg::default(),
             first: true,
             bignum_literals: Vec::new(),
+            literal_base: file.literals.len(),
         }
     }
 
@@ -300,7 +309,7 @@ impl<'a> BeamCodeReader<'a> {
             Operand::Int(value) => BeamOpArg::new(TAG_I, *value as u64),
             // `marshal_integer`: a bignum becomes a literal.
             Operand::BigInt(value) => {
-                let index = self.file.literals.len() + self.bignum_literals.len();
+                let index = self.literal_base + self.bignum_literals.len();
                 self.bignum_literals.push(value.to_string());
                 BeamOpArg::new(TAG_Q, index as u64)
             }
