@@ -7,12 +7,11 @@
 
 use crate::beam_op::*;
 use crate::erts_tables::*;
-use crate::loader_state::{ExtraLiteral, LoaderState, RestArgs, am};
+use crate::loader_state::{LoaderState, RestArgs, am};
+use crate::{LiteralElement, NewLiteral};
 use arinsal_etf::OwnedTerm;
 use arinsal_spec::BifKind;
-use arinsal_term::{
-    Atom, Term, TermBuilder, flat_key_cmp, global_atoms, global_empty_tuple, internal_hash,
-};
+use arinsal_term::{Atom, Term, flat_key_cmp, global_atoms, internal_hash};
 
 /// `MAP_SMALL_MAP_LIMIT` (erl_map.h).
 const MAP_SMALL_MAP_LIMIT: u64 = 32;
@@ -913,8 +912,8 @@ pub(crate) mod generators {
                     let literal = match st.lambda_literals[idx.val as usize] {
                         Some(literal) => literal,
                         None => {
-                            let literal = st.literals.add(ExtraLiteral::FunPlaceholder {
-                                lambda: idx.val as usize,
+                            let literal = st.literals.add(NewLiteral::FunPlaceholder {
+                                lambda: idx.val as u32,
                             });
                             st.lambda_literals[idx.val as usize] = Some(literal);
                             literal
@@ -968,28 +967,25 @@ pub(crate) mod generators {
         debug_assert!(st.ops.op(op).uses_def_args());
         st.ops.op_mut(op).spill(4 + size / 2, 0);
 
-        let mut elements: Vec<Term> = Vec::with_capacity(size / 2);
+        // The key tuple: erts builds it in a temporary heap and adds it as a literal; here the
+        // literal is the recipe of the tuple (`NewLiteral::Tuple`), which the consumer builds in
+        // the module's literal area.
+        let mut elements: Vec<LiteralElement> = Vec::with_capacity(size / 2);
         let mut i = 0;
         while i < size {
             let key = rest.get(st, i);
             match key.ty {
-                TAG_A | TAG_I | TAG_N | TAG_Q => {
-                    elements.push(st.get_term(key)?);
-                }
+                TAG_A => elements.push(LiteralElement::Atom(key.val as u32)),
+                TAG_I => elements.push(LiteralElement::Small(key.val as i64)),
+                TAG_N => elements.push(LiteralElement::Nil),
+                TAG_Q => elements.push(LiteralElement::Literal(key.val as u32)),
                 _ => {}
             }
             let value = rest.get(st, i + 1);
             st.ops.op_mut(op).set_a(4 + i / 2, value);
             i += 2;
         }
-        let keys = if size == 0 {
-            global_empty_tuple()
-        } else {
-            TermBuilder::new(&mut st.literals.heap)
-                .tuple(&elements)
-                .ok()?
-        };
-        let lit = st.literals.add(ExtraLiteral::Term(keys));
+        let lit = st.literals.add(NewLiteral::Tuple(elements));
 
         let o = st.ops.op_mut(op);
         o.set_a(0, dst);

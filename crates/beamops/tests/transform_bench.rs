@@ -62,12 +62,7 @@ fn transform_modules() {
     let started = Instant::now();
     for _ in 0..rounds {
         for beam in &beams {
-            if std::env::var_os("BEAMOPS_ERTS").is_some() {
-                arinsal_beamops::try_transform_module_in_arena(beam, false, true, &mut arena)
-                    .unwrap();
-            } else {
-                transform_module_typed_in_arena(beam, false, &mut arena);
-            }
+            transform_module_typed_in_arena(beam, false, &mut arena).unwrap();
         }
     }
     let elapsed = started.elapsed();

@@ -37,13 +37,18 @@ impl ModuleEnv for TestEnv {
         Some(build_stacktrace_for_compile)
     }
 
-    fn atom(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
-        beam.atom(index)
-            .map(|_| (u64::from(index) << 6) | 0x0b)
-            .ok_or_else(|| format!("atom index {index} is out of range"))
+    fn atom(&self, _beam: &BeamFile, index: u32) -> Result<u64, String> {
+        Ok((u64::from(index) << 6) | 0x0b)
+    }
+
+    fn add_literal(&self, _index: u32, _word: u64) -> Result<(), String> {
+        Ok(())
     }
 
     fn literal(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
+        if index as usize >= beam.literals.len() {
+            return Ok(0);
+        }
         beam.literal(index)
             .map(|_| 0)
             .map_err(|error| error.to_string())
@@ -524,14 +529,9 @@ fn otp_logger_reply_return_returns_the_reply_map() {
         .expect("erl must be installed for the OTP BeamAsm regression test");
     assert!(path.status.success());
     let bytes = fs::read(String::from_utf8(path.stdout).unwrap()).unwrap();
-    let beam = arinsal_beam::parse(&bytes).unwrap();
+    // The atoms of the transformed code are global atom indexes.
     let atom = |name: &str| {
-        let index = beam
-            .atoms
-            .iter()
-            .position(|candidate| candidate == name)
-            .unwrap() as u32
-            + 1;
+        let index = arinsal_beamops::global_atom_index(name).unwrap();
         (u64::from(index) << 6) | 0x0b
     };
     let module =
@@ -628,12 +628,12 @@ fn extended_x_ops(bytes: &[u8]) -> std::collections::BTreeSet<String> {
     fn extended(operand: &arinsal_beamops::SpecificOperand) -> bool {
         match operand {
             arinsal_beamops::SpecificOperand::X(index) => *index >= 6,
-            arinsal_beamops::SpecificOperand::List(items) => items.iter().any(extended),
             _ => false,
         }
     }
     let beam = arinsal_beam::parse(bytes).unwrap();
     arinsal_beamops::transform_module(&beam)
+        .unwrap()
         .iter()
         .flatten()
         .filter(|op| op.operands().iter().any(extended))

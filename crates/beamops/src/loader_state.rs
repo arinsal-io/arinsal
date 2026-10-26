@@ -1,12 +1,12 @@
 //! The part of `LoaderState` (erts/emulator/beam/beam_load.h, jit/asm_load.c) that the transform
 //! engine and its predicates and generators use, and the generated engine itself.
 
+use crate::NewLiteral;
 use crate::beam_op::*;
 use arinsal_beam::BeamFile;
 use arinsal_etf::OwnedTerm;
-use arinsal_term::{Atom, Term, TermBuilder, VecHeap, from_owned, global_atoms};
+use arinsal_term::{Atom, Term, VecHeap, from_owned, global_atoms};
 use num_bigint::BigInt;
-use std::collections::HashMap;
 
 /// `TE_OK`, `TE_FAIL` and `TE_SHORT_WINDOW`: what `erts_transform_engine` returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,18 +53,6 @@ pub(crate) struct Label {
     pub lambda_index: Option<usize>,
 }
 
-/// A literal that `beamfile_add_literal` appended to the module's table.
-pub(crate) enum ExtraLiteral {
-    /// An integer too large for a word: the decimal text (`marshal_integer`).
-    Bignum(String),
-    /// A term built by a generator (the key tuple of `new_small_map_lit`).
-    Term(Term),
-    /// The fun of a lambda without free variables, whose entry the loader sets at the end
-    /// (`stp->lambda_literals`, asm_load.c `beam_load_finalize`); a fun thing with a null entry
-    /// cannot be built in safe code.
-    FunPlaceholder { lambda: usize },
-}
-
 /// The module's literals: `beam.literals` and the terms the loader adds. The file's literals
 /// are decoded when a predicate or generator asks for them: erts decodes them all in
 /// `beamfile_read`, and the loader of this runtime does so for the module it builds.
@@ -74,7 +62,7 @@ pub(crate) struct Literals<'a> {
     pub heap: VecHeap,
     owned: Vec<Option<OwnedTerm>>,
     terms: Vec<Option<Term>>,
-    pub extra: Vec<ExtraLiteral>,
+    pub extra: Vec<NewLiteral>,
     extra_terms: Vec<Option<Term>>,
     /// `BeamFile_Record.def_literal` of each record: the literal index.
     pub record_defs: Vec<u64>,
@@ -93,26 +81,12 @@ impl<'a> Literals<'a> {
             extra_terms: Vec::new(),
             record_defs: Vec::new(),
         };
-        if !beam.records.is_empty() {
-            let module = global_atoms().intern(&beam.module).ok()?;
-            for record in &beam.records {
-                let name = global_atoms().intern(&record.name).ok()?;
-                let mut fields = Vec::with_capacity(record.fields.len());
-                for (field, default) in &record.fields {
-                    let field = global_atoms().intern(field).ok()?;
-                    let default = match default {
-                        Some(default) => Some(from_owned(default, &mut literals.heap).ok()?),
-                        None => None,
-                    };
-                    fields.push((field, default));
-                }
-                let definition = TermBuilder::new(&mut literals.heap)
-                    .native_record_literal(module, name, record.is_exported, &fields)
-                    .ok()?;
-                // `def_literal` is the index `beamfile_add_literal` returned.
-                let index = literals.add(ExtraLiteral::Term(definition));
-                literals.record_defs.push(index);
-            }
+        for index in 0..beam.records.len() {
+            // `def_literal` is the index `beamfile_add_literal` returned.
+            let literal = literals.add(NewLiteral::Record {
+                index: index as u32,
+            });
+            literals.record_defs.push(literal);
         }
         Some(literals)
     }
@@ -151,19 +125,18 @@ impl<'a> Literals<'a> {
             return Some(*term);
         }
         let term = match self.extra.get(at)? {
-            ExtraLiteral::Term(term) => *term,
-            ExtraLiteral::Bignum(text) => {
+            NewLiteral::Bignum(text) => {
                 let value = OwnedTerm::BigInt(text.parse::<BigInt>().ok()?);
                 from_owned(&value, &mut self.heap).ok()?
             }
-            ExtraLiteral::FunPlaceholder { .. } => return None,
+            _ => return None,
         };
         self.extra_terms[at] = Some(term);
         Some(term)
     }
 
     /// `beamfile_add_literal`: the index of the new literal.
-    pub(crate) fn add(&mut self, literal: ExtraLiteral) -> u64 {
+    pub(crate) fn add(&mut self, literal: NewLiteral) -> u64 {
         self.extra.push(literal);
         self.extra_terms.push(None);
         (self.terms.len() + self.extra.len() - 1) as u64
@@ -198,8 +171,6 @@ pub(crate) struct LoaderState<'a> {
     pub debugger_flags: u64,
     /// `beam.atoms`: the global atom of each atom table entry.
     pub atoms: Vec<Atom>,
-    /// The position (one-based) in the atom table of a global atom, for the output.
-    pub local_atom: HashMap<u32, u32>,
 }
 
 /// `ERTS_DEBUGGER_ENABLED` and `ERTS_DEBUGGER_LINE_BREAKPOINTS` (erl_debugger.h).
@@ -217,10 +188,8 @@ impl<'a> LoaderState<'a> {
         debugger_flags: u64,
     ) -> Option<Self> {
         let mut atoms = Vec::with_capacity(beam.atoms.len());
-        let mut local_atom = HashMap::with_capacity(beam.atoms.len());
-        for (position, name) in beam.atoms.iter().enumerate() {
+        for name in &beam.atoms {
             let atom = global_atoms().intern(name).ok()?;
-            local_atom.entry(atom.0).or_insert(position as u32 + 1);
             atoms.push(atom);
         }
         let literals = Literals::new(beam)?;
@@ -281,7 +250,6 @@ impl<'a> LoaderState<'a> {
             function_number: 0,
             debugger_flags,
             atoms,
-            local_atom,
         })
     }
 

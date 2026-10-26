@@ -49,7 +49,7 @@ fn no_line_info_functions_receive_nil_function_lines() {
         "erlc +no_line_info should place func_info directly after each function label"
     );
 
-    let functions = transform_module(&beam);
+    let functions = transform_module(&beam).unwrap();
     let starts = functions
         .iter()
         .flatten()

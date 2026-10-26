@@ -1563,6 +1563,8 @@ struct VmModuleEnv<'a> {
     literal_heap: std::cell::RefCell<&'a mut VecHeap>,
     dynamic_integer_literals: std::cell::RefCell<HashMap<BigInt, u64>>,
     literals: Vec<u64>,
+    /// The literals the load added after those of the file, by literal index.
+    added_literals: std::cell::RefCell<HashMap<u32, u64>>,
     zero_capture_funs: HashMap<u32, u64>,
     lambda_entries: HashMap<u32, Arc<arinsal_term::FunEntry>>,
     export_entries: Vec<usize>,
@@ -1661,6 +1663,7 @@ impl<'a> VmModuleEnv<'a> {
             literal_heap: std::cell::RefCell::new(literal_heap),
             dynamic_integer_literals: std::cell::RefCell::new(HashMap::new()),
             literals,
+            added_literals: std::cell::RefCell::new(HashMap::new()),
             zero_capture_funs,
             lambda_entries,
             export_entries,
@@ -1801,17 +1804,24 @@ impl ModuleEnv for VmModuleEnv<'_> {
         }
     }
 
-    fn atom(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
-        let name = beam
-            .atom(index)
+    fn atom(&self, _beam: &BeamFile, index: u32) -> Result<u64, String> {
+        // The atoms of the transformed code are global atom indexes.
+        let atom = arinsal_term::Atom(index);
+        global_atoms()
+            .text(atom)
             .ok_or_else(|| format!("atom index {index} is out of range"))?;
-        let atom = global_atoms()
-            .intern(name)
-            .map_err(|error| format!("atom {name}: {error:?}"))?;
         Ok(raw_word(Term::atom(atom)))
     }
 
+    fn add_literal(&self, index: u32, word: u64) -> Result<(), String> {
+        self.added_literals.borrow_mut().insert(index, word);
+        Ok(())
+    }
+
     fn literal(&self, _beam: &BeamFile, index: u32) -> Result<u64, String> {
+        if let Some(word) = self.added_literals.borrow().get(&index) {
+            return Ok(*word);
+        }
         if let Some(lambda_index) = u32::MAX.checked_sub(index)
             && let Some(fun) = self.zero_capture_funs.get(&lambda_index)
         {

@@ -97,11 +97,7 @@ fn otp29_jit_specific_op_names_and_argument_types() {
             "{module}: parsed {} instructions",
             beam.code.instructions.len()
         );
-        let transformed = if std::env::var_os("BEAMOPS_LEGACY").is_some() {
-            transform_module(&beam)
-        } else {
-            arinsal_beamops::try_transform_module(&beam, false, false).unwrap()
-        };
+        let transformed = transform_module(&beam).unwrap();
         let ours_ops = transformed.into_iter().flatten().collect::<Vec<_>>();
         let dump = fs::read_to_string(dir.join(format!("{module}.asm"))).unwrap();
         let expected_ops = dump
@@ -284,11 +280,7 @@ fn operand_type(operand: &SpecificOperand) -> char {
         SpecificOperand::SmallInt(_) => 'i',
         SpecificOperand::Unsigned(_) => 'u',
         SpecificOperand::Nil => 'n',
-        SpecificOperand::List(_) | SpecificOperand::ArenaList(_) => 'o',
-        SpecificOperand::Allocations(_)
-        | SpecificOperand::ArenaAllocations(_)
-        | SpecificOperand::BigInt(_)
-        | SpecificOperand::Other => '?',
+        SpecificOperand::BigInt(_) => '?',
     }
 }
 

@@ -3,9 +3,10 @@
 //! runs the transformation engine on the window at the head of the chain, selects the specific
 //! instruction and emits it. Emitting appends the instruction to the arena of the caller.
 
+use crate::NewLiteral;
 use crate::beam_op::*;
 use crate::erts_tables::*;
-use crate::loader_state::{ExtraLiteral, LoaderState, TeResult, erts_transform_engine};
+use crate::loader_state::{LoaderState, TeResult, erts_transform_engine};
 use crate::{SpecificOp, SpecificOperand, TYPED_OPS, TransformArena};
 use arinsal_beam::BeamFile;
 use smallvec::SmallVec;
@@ -47,6 +48,8 @@ pub(crate) fn load_code(
         return Err(error("the module's tables cannot be loaded"));
     };
     let result = run(&mut st, typed, arena);
+    arena.file_literals = beam.literals.len();
+    arena.new_literals = std::mem::take(&mut st.literals.extra);
     arena.beam_ops = std::mem::take(&mut st.ops);
     result
 }
@@ -65,7 +68,7 @@ fn run(st: &mut LoaderState, typed: bool, arena: &mut TransformArena) -> Result<
             .next(&mut st.ops)
             .map_err(|ReadError(message)| error(message))?;
         for text in std::mem::take(&mut reader.bignum_literals) {
-            st.literals.add(ExtraLiteral::Bignum(text));
+            st.literals.add(NewLiteral::Bignum(text));
         }
 
         // Create a new generic operation and put it last in the chain.
@@ -286,16 +289,12 @@ fn operand(
         }
     };
     Ok(match arg.ty {
-        TAG_U => i64::try_from(arg.val).map_or(
-            SpecificOperand::Unsigned(arg.val),
-            SpecificOperand::SmallInt,
-        ),
+        // An untagged word: counts, indexes, hashes. Only values that fit a small integer are
+        // `SmallInt`; a hash is a raw word whatever its value.
+        TAG_U if arg.val < (1 << 59) => SpecificOperand::SmallInt(arg.val as i64),
+        TAG_U => SpecificOperand::Unsigned(arg.val),
         TAG_I => SpecificOperand::SmallInt(arg.val as i64),
-        TAG_A => SpecificOperand::Atom(
-            *st.local_atom
-                .get(&(arg.val as u32))
-                .ok_or_else(|| error("an atom that is not in the atom table"))?,
-        ),
+        TAG_A => SpecificOperand::Atom(arg.val as u32),
         TAG_X | TAG_Y => register(arg.ty, arg.val),
         TAG_F => SpecificOperand::Label(arg.val as u32),
         TAG_P => SpecificOperand::Label(0),
@@ -307,7 +306,7 @@ fn operand(
             .extra
             .get((arg.val as usize).wrapping_sub(st.beam.literals.len()))
         {
-            Some(ExtraLiteral::Bignum(text)) => SpecificOperand::BigInt(Box::new(text.clone())),
+            Some(NewLiteral::Bignum(text)) => SpecificOperand::BigInt(Box::new(text.clone())),
             _ => SpecificOperand::Literal(arg.val as u32),
         },
         // The arity header of `select_tuple_arity`.
