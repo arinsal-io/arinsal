@@ -91,6 +91,16 @@ fn compound_term_comparison_matches_erts() {
         ]),
         NumberPairs = [
             {(1 bsl 130) + 17, (1 bsl 130) + 17},
+            {{large_integer, (1 bsl 130) + 17},
+             {large_integer, (1 bsl 130) + 17}},
+            {{large_integer, (1 bsl 130) + 17},
+             {large_integer, (1 bsl 130) + 18}},
+            {{large_integer, -(1 bsl 130) - 18},
+             {large_integer, -(1 bsl 130) - 17}},
+            {{large_integer, -(1 bsl 130) - 1},
+             {large_integer, (1 bsl 130) + 1}},
+            {{large_integer, 1 bsl 192},
+             {large_integer, (1 bsl 130) + 1}},
             {9007199254740993, 9007199254740992.0},
             {9007199254740992, 9007199254740992.0},
             {(1 bsl 128) + 17, float(1 bsl 128)},
@@ -156,5 +166,5 @@ fn compound_term_comparison_matches_erts() {
             "exact equality {index}"
         );
     }
-    similar_asserts::assert_eq!(stdout.lines().count(), 117);
+    similar_asserts::assert_eq!(stdout.lines().count(), 122);
 }
