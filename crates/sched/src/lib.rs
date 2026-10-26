@@ -1316,6 +1316,10 @@ struct ProcessTable<T: Task> {
     progress: Arc<thr_progress::ThrProgress>,
     /// One shared ordered list of invocation markers and deleted elements.
     list_deleted: parking_lot::Mutex<PtabListLog<Pid>>,
+    /// `ptab->list.data.deleted.end != NULL`: a table-list BIF owns a marker in the list.
+    /// Changed only under the write lock, so a remover holding it shared reads it without
+    /// taking the list's mutex.
+    list_active: AtomicBool,
     _process: std::marker::PhantomData<ProcRef<T>>,
 }
 
@@ -1570,6 +1574,7 @@ impl<T: Task> ProcessTable<T> {
             slots,
             progress,
             list_deleted: parking_lot::Mutex::new(PtabListLog::default()),
+            list_active: AtomicBool::new(false),
             _process: std::marker::PhantomData,
         }
     }
@@ -1716,7 +1721,11 @@ impl<T: Task> ProcessTable<T> {
     fn begin_ptab_list(&self) -> (usize, u64) {
         let _exclusive = self.lock.write();
         let interval = self.interval.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        let marker = self.list_deleted.lock().begin(interval);
+        let mut log = self.list_deleted.lock();
+        let marker = log.begin(interval);
+        self.list_active
+            .store(log.has_invocations(), Ordering::Release);
+        drop(log);
         (marker, interval)
     }
 
@@ -1746,9 +1755,22 @@ impl<T: Task> ProcessTable<T> {
         max_reds: u32,
     ) -> (Vec<Pid>, u32, bool) {
         let _exclusive = self.lock.write();
-        self.list_deleted
-            .lock()
-            .inspect(marker, invocation_interval, chunk_intervals, max_reds)
+        let mut log = self.list_deleted.lock();
+        let result = log.inspect(marker, invocation_interval, chunk_intervals, max_reds);
+        self.list_active
+            .store(log.has_invocations(), Ordering::Release);
+        result
+    }
+
+    /// Drops the marker of an abandoned listing.
+    // Port of erts/emulator/beam/erl_ptab.c:780-875 (cleanup_ptab_list_bif_data), OTP-29.1.1:
+    // the write lock is held while the list changes.
+    fn cancel_ptab_list(&self, marker: usize) {
+        let _exclusive = self.lock.write();
+        let mut log = self.list_deleted.lock();
+        log.cancel(marker);
+        self.list_active
+            .store(log.has_invocations(), Ordering::Release);
     }
 
     fn load_slot(&self, pix: u32) -> Option<ProcRef<T>> {
@@ -1773,7 +1795,7 @@ impl<T: Task> ProcessTable<T> {
     fn remove(&self, pid: Pid) {
         // Port of erts/emulator/beam/erl_ptab.c:675 (erts_ptab_delete_element), OTP-29.1.1.
         let shared = self.lock.read();
-        let log_active = self.list_deleted.lock().has_invocations();
+        let log_active = self.list_active.load(Ordering::Acquire);
         if log_active {
             drop(shared);
             let _exclusive = self.lock.write();
@@ -6017,12 +6039,7 @@ impl<T: Task> PtabListSnapshot<T> {
 impl<T: Task> Drop for PtabListSnapshot<T> {
     fn drop(&mut self) {
         if self.active {
-            self.scheduler
-                .inner
-                .table
-                .list_deleted
-                .lock()
-                .cancel(self.marker);
+            self.scheduler.inner.table.cancel_ptab_list(self.marker);
         }
     }
 }
