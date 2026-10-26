@@ -1,5 +1,7 @@
 //! An interpreted busy loop whose entry carries a local call-trace breakpoint must still be
-//! switched out when its reductions run out, so `exit(Pid, kill)` reaches it.
+//! switched out when its reductions run out, so `exit(Pid, kill)` reaches it. A test of the
+//! interpreter flavor: it re-runs itself in a child started with `-emu_flavor emu` (its
+//! `ARINSAL_INTERP` alias).
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_vm::Vm;
@@ -22,6 +24,24 @@ spin() -> spin().
 
 #[test]
 fn traced_interpreted_loop_is_preempted() {
+    if std::env::var_os("ARINSAL_INTERP").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "traced_interpreted_loop_is_preempted",
+                "--nocapture",
+            ])
+            .env("ARINSAL_INTERP", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "interpreter flavor child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping traced loop preemption test");
         return;
@@ -34,9 +54,8 @@ fn traced_interpreted_loop_is_preempted() {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut vm = Vm::new([]);
-        // Interpreted on purpose: the breakpoint instruction itself is the loop's only
-        // switch-out point.
-        vm.load_bytes_interpreted(&spin).expect("load VM spin");
+        // The breakpoint instruction itself is the loop's only switch-out point.
+        vm.load_bytes(&spin).expect("load VM spin");
         let actual = vm
             .eval_scheduled("tlp_spin", "run", &[], 1, None)
             .map(|value| value.term)
