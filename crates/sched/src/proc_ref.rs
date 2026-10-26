@@ -107,6 +107,24 @@ impl<T: Task> ProcRef<T> {
         }
     }
 
+    /// Run `f` on the process in `slot` for a caller that is a managed thread: the slot's
+    /// reference is released only once every managed thread passed a progress point, and the
+    /// caller passes none while `f` runs, so the block outlives the call. `None` for an empty
+    /// slot.
+    // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1.
+    pub(crate) fn with_slot_managed<R>(
+        slot: &std::sync::atomic::AtomicPtr<()>,
+        f: impl FnOnce(&Self) -> R,
+    ) -> Option<R> {
+        let raw = slot.load(Ordering::Acquire);
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` is the address a table slot held; per the contract above the slot's
+        // reference outlives this call for a managed thread.
+        Some(unsafe { Self::with_borrowed(raw, f) })
+    }
+
     /// Run `f` on the process whose reference a table slot holds, without taking a reference.
     ///
     /// # Safety

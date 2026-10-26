@@ -396,6 +396,9 @@ pub struct Process {
     // ---- processes and messages ----
     pub(crate) runtime: Option<&'static process::Runtime>,
     pub(crate) self_pid: Option<arinsal_sched::Pid>,
+    /// The running turn is on a managed (normal) scheduler thread, so table lookups need no
+    /// thread-progress delay. Set at the start of every run.
+    pub(crate) on_managed: bool,
     /// Saved continuation data for the process's pending `erts_await_result` BIF.
     // Port of erts/emulator/beam/erl_bif_info.c:1480-1500, OTP-29.1.1.
     pub(crate) pending_signal_waiter: Option<crate::signals::Waiter>,
@@ -1893,6 +1896,7 @@ impl Process {
             final_exit_reason: None,
             runtime: None,
             self_pid: None,
+            on_managed: false,
             pending_signal_waiter: None,
             scheduler_id: 0,
             scheduler_ref_state: None,

@@ -232,10 +232,10 @@ fn alive_fast(process: &Process, arg: Term) -> Option<arinsal_term::Atom> {
     let pid = Pid::from_term(arg)?;
     let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
     let own = process.self_pid?;
-    if scheduler.is_quiet(own) != Some(true) {
+    if scheduler.is_quiet_from(own, process.on_managed) != Some(true) {
         return None;
     }
-    match scheduler.is_quiet(pid) {
+    match scheduler.is_quiet_from(pid, process.on_managed) {
         None => Some(arinsal_term::atoms::FALSE),
         Some(true) => Some(arinsal_term::atoms::TRUE),
         Some(false) => None,
@@ -2854,7 +2854,7 @@ fn monitor_port(
             },
         ));
     let registered = port_id.and_then(|id| {
-        runtime.ports.with(id, |handle| {
+        runtime.ports.with_from(id, process.on_managed, |handle| {
             if tag != atom("DOWN") {
                 // Port monitors carry no tag yet (typed gap, see report).
                 return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));

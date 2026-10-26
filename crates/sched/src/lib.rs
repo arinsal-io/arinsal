@@ -62,12 +62,14 @@ mod balance;
 mod mailbox;
 mod ports;
 mod proc_ref;
+mod ptab_slot;
 mod sig_queue;
 mod thr_progress;
 mod timer;
 
 pub use mailbox::{InSignal, Incoming, psflg};
 pub use ports::{PortExecution, PortRunQueue, RunPort};
+pub use ptab_slot::{Progress, ProgressSlot};
 pub use sig_queue::{MessageQueueList, OwnedSignal, SignalQueue};
 pub use timer::{TimerId, TimerRef};
 
@@ -1791,6 +1793,21 @@ impl<T: Task> ProcessTable<T> {
     // progress keeps the process struct alive during the lookup.
     fn with_live<R>(&self, pid: Pid, f: impl FnOnce(&ProcRef<T>) -> R) -> Option<R> {
         self.with_slot(self.index(pid), |process| {
+            (process.pid == pid).then(|| f(process))
+        })
+        .flatten()
+    }
+
+    /// [`ProcessTable::with_live`] for a caller that is a managed thread of this scheduler (a
+    /// process running on a normal scheduler): it passes no progress point during `f`, so
+    /// the lookup delays nothing and reads no thread-local, as `erts_proc_lookup_raw` does.
+    // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1.
+    fn with_live_managed<R>(&self, pid: Pid, f: impl FnOnce(&ProcRef<T>) -> R) -> Option<R> {
+        debug_assert!(
+            thr_progress::is_managed_thread_of(&self.progress),
+            "a managed lookup runs on a managed thread"
+        );
+        ProcRef::with_slot_managed(self.slot(self.index(pid))?, |process| {
             (process.pid == pid).then(|| f(process))
         })
         .flatten()
@@ -6312,11 +6329,26 @@ impl<T: Task> Scheduler<T> {
     // Port of erts/emulator/beam/erl_bif_info.c (is_process_alive_1: the state test before BIF_TRAP1),
     // OTP-29.1.1.
     pub fn is_quiet(&self, pid: Pid) -> Option<bool> {
-        self.inner.table.with_live(pid, |process| {
+        self.is_quiet_from(pid, false)
+    }
+    /// [`Scheduler::is_quiet`] for a caller running on a managed (normal) scheduler thread of
+    /// this scheduler: `managed` skips the thread-progress delay.
+    pub fn is_quiet_from(&self, pid: Pid, managed: bool) -> Option<bool> {
+        let check = |process: &ProcRef<T>| {
             process.exit_flags.load(Ordering::Acquire) & proc_flags::EXITING == 0
                 && process.input.state().load(Ordering::Acquire) & (psflg::SIG_Q | psflg::SIG_IN_Q)
                     == 0
-        })
+        };
+        if managed {
+            self.inner.table.with_live_managed(pid, check)
+        } else {
+            self.inner.table.with_live(pid, check)
+        }
+    }
+    /// The thread progress domain of this scheduler, for tables whose elements are freed after
+    /// thread progress ([`ProgressSlot`]).
+    pub fn progress(&self) -> Progress {
+        Progress(Arc::clone(&self.inner.table.progress))
     }
     /// Spawn a normal-priority task.
     pub fn spawn(&self, task: T) -> Result<Pid, Error> {

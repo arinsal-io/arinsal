@@ -839,3 +839,52 @@ fn thread_progress_later_waits_for_running_slices_without_blocking() {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+
+struct Idle;
+impl Task for Idle {
+    type Message = ();
+    type SchedulerData = ();
+    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
+        while ctx.receive().is_some() {}
+        RunOutcome::Wait { timeout_ms: None }
+    }
+}
+
+/// A removed element is freed only after thread progress: readers see it until `take`, a
+/// reference taken by `take` keeps it alive, and the slot's own reference is released later.
+#[test]
+fn progress_slot_releases_after_thread_progress() {
+    use arinsal_sched::ProgressSlot;
+    let sched = Scheduler::<Idle>::new(Config {
+        workers: 2,
+        max_processes: 16,
+        ..Config::default()
+    });
+    let progress = sched.progress();
+    let slot = ProgressSlot::<u32>::new();
+    assert!(slot.with(&progress, false, |value| *value).is_none());
+    let value = Arc::new(7u32);
+    slot.store(Arc::clone(&value), Some(&progress));
+    assert_eq!(slot.with(&progress, false, |value| *value), Some(7));
+    assert_eq!(*slot.load_arc(&progress, false).unwrap(), 7);
+    assert!(
+        slot.load_arc_if(&progress, false, |value| *value == 8)
+            .is_none()
+    );
+    assert_eq!(Arc::strong_count(&value), 2);
+    let taken = slot.take(&progress).unwrap();
+    assert_eq!(*taken, 7);
+    assert!(!slot.is_occupied());
+    assert!(slot.with(&progress, false, |value| *value).is_none());
+    drop(taken);
+    // The slot's reference is dropped by a later operation once every managed thread passed a
+    // progress point; idle schedulers get there on their own.
+    // An unmanaged thread's later operation runs when a scheduler next runs: keep one busy.
+    let pid = sched.spawn(Idle).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&value) != 1 && Instant::now() < deadline {
+        sched.send(pid, pid, ()).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(Arc::strong_count(&value), 1);
+}
