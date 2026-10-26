@@ -1822,15 +1822,17 @@ impl ModuleEnv for VmModuleEnv<'_> {
         if let Some(word) = self.added_literals.borrow().get(&index) {
             return Ok(*word);
         }
-        if let Some(lambda_index) = u32::MAX.checked_sub(index)
-            && let Some(fun) = self.zero_capture_funs.get(&lambda_index)
-        {
-            return Ok(*fun);
-        }
         self.literals
             .get(index as usize)
             .copied()
             .ok_or_else(|| format!("literal index {index} is out of range"))
+    }
+
+    fn zero_capture_fun(&self, _beam: &BeamFile, lambda: u32) -> Result<u64, String> {
+        self.zero_capture_funs
+            .get(&lambda)
+            .copied()
+            .ok_or_else(|| format!("lambda {lambda} has no fun without free variables"))
     }
 
     fn import(&self, beam: &BeamFile, index: u32) -> Result<u32, String> {

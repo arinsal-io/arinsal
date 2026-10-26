@@ -55,31 +55,8 @@ fn main() {
         }
     }
     let mut out = String::from(
-        "// The operation names declared in OTP-29.1.1 ops.tab.\n/// A BeamAsm operation declared by OTP 29.1.1.\n#[derive(Clone, Debug, PartialEq, Eq)]\npub enum SpecificOp {\n",
+        "// The operation names declared in OTP-29.1.1 ops.tab.\n/// All operation names declared in OTP's ARM64 ops table.\npub static SPECIFIC_OP_NAMES: &[&str] = &[\n",
     );
-    for name in &names {
-        out.push_str(&format!(
-            "    /// `{name}` with typed decoded operands.\n    {}(smallvec::SmallVec<[SpecificOperand; 4]>),\n",
-            camel(name)
-        ));
-    }
-    out.push_str("    /// An opcode name absent from OTP's declaration set.\n    Unknown {\n        /// Original opcode name.\n        name: String,\n        /// Typed decoded operands.\n        operands: smallvec::SmallVec<[SpecificOperand; 4]>,\n    },\n}\nimpl SpecificOp { fn from_name(name: &str, args: smallvec::SmallVec<[SpecificOperand; 4]>) -> Self { match name {\n");
-    for name in &names {
-        out.push_str(&format!("{name:?} => Self::{}(args),\n", camel(name)));
-    }
-    out.push_str("_ => Self::Unknown { name: name.to_owned(), operands: args },\n} } /// Returns the OTP operation name.\npub fn name(&self) -> &str { match self {\n");
-    for name in &names {
-        out.push_str(&format!("Self::{}(_) => {:?},\n", camel(name), name));
-    }
-    out.push_str("Self::Unknown { name, .. } => name,\n} } /// Returns the decoded operands.\npub fn operands(&self) -> &[SpecificOperand] { match self {\n");
-    for name in &names {
-        out.push_str(&format!("Self::{}(args) => args,\n", camel(name)));
-    }
-    out.push_str("Self::Unknown { operands, .. } => operands,\n} }\n/// The dense identity of the operation: its index in [`SPECIFIC_OP_NAMES`], `u16::MAX` for an unknown one.\npub fn id(&self) -> u16 { match self {\n");
-    for (index, name) in names.iter().enumerate() {
-        out.push_str(&format!("Self::{}(_) => {index},\n", camel(name)));
-    }
-    out.push_str("Self::Unknown { .. } => u16::MAX,\n} } }\n/// All operation names declared in OTP's ARM64 ops table.\npub static SPECIFIC_OP_NAMES: &[&str] = &[\n");
     for name in &names {
         out.push_str(&format!("{name:?},\n"));
     }
@@ -89,21 +66,6 @@ fn main() {
         out,
     )
     .unwrap();
-}
-
-fn camel(name: &str) -> String {
-    format!(
-        "Op{}",
-        name.split('_')
-            .map(|part| {
-                let mut chars = part.chars();
-                chars
-                    .next()
-                    .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
-                    .unwrap_or_default()
-            })
-            .collect::<String>()
-    )
 }
 
 /// The generic and specific instruction tables of `beam_makeops` (`gen_opc[]`, `opc[]`,
