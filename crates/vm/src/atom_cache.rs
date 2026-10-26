@@ -1,46 +1,43 @@
-//! Per-thread cache of the atoms the port drivers name by literal.
+//! Cache of the atoms the port drivers name by literal.
 //!
 //! erts keeps these as compile-time atom indices (`am_tcp`, `am_inet_reply`, ...); here each
-//! literal is interned once per thread and found again by the address of its text.
+//! literal is interned once and found again by the address of its text in a small direct-mapped
+//! table, so a lookup is two atomic loads with no thread-local access.
 
-use arinsal_term::{Term, global_atoms};
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
+use arinsal_term::{Atom, Term, global_atoms};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Hashes the (address, length) pair of a literal: already well spread, nothing to mix.
-#[derive(Default)]
-struct PtrHasher(u64);
+const SLOTS: usize = 1024;
 
-impl Hasher for PtrHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 = self.0.rotate_left(8) ^ u64::from(*byte);
-        }
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        self.0 = (self.0 ^ value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
+/// `key` is the address of the literal's text (zero when empty), `value` the atom index plus one.
+struct Slot {
+    key: AtomicU64,
+    value: AtomicU64,
 }
 
-type Cache = HashMap<(usize, usize), Term, BuildHasherDefault<PtrHasher>>;
-
-thread_local! {
-    static CACHE: RefCell<Cache> = RefCell::new(Cache::default());
-}
+static CACHE: [Slot; SLOTS] = [const {
+    Slot {
+        key: AtomicU64::new(0),
+        value: AtomicU64::new(0),
+    }
+}; SLOTS];
 
 /// The atom named by the literal `name`.
 pub(crate) fn atom(name: &'static str) -> Term {
-    let key = (name.as_ptr() as usize, name.len());
-    CACHE.with(|cache| {
-        *cache
-            .borrow_mut()
-            .entry(key)
-            .or_insert_with(|| Term::atom(global_atoms().intern(name).expect("port atom")))
-    })
+    // Addresses are 48 bits; the length (an atom has at most 255 characters) goes above them.
+    let key = (name.as_ptr() as u64 & 0xFFFF_FFFF_FFFF) | ((name.len() as u64) << 48);
+    let slot = &CACHE[((key >> 3) ^ (key >> 13) ^ (key >> 48)) as usize % SLOTS];
+    if slot.key.load(Ordering::Acquire) == key {
+        let value = slot.value.load(Ordering::Relaxed);
+        // A writer clears `key` before it changes `value`, so an unchanged key means the value
+        // belongs to it.
+        if slot.key.load(Ordering::Acquire) == key && value != 0 {
+            return Term::atom(Atom((value - 1) as u32));
+        }
+    }
+    let atom = global_atoms().intern(name).expect("port atom");
+    slot.key.store(0, Ordering::Release);
+    slot.value.store(u64::from(atom.0) + 1, Ordering::Relaxed);
+    slot.key.store(key, Ordering::Release);
+    Term::atom(atom)
 }

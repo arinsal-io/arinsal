@@ -878,13 +878,30 @@ pub(crate) fn link(
 /// (`port_sig_demonitor`), OTP-29.1.1. The origin monitor is already gone; this
 /// deletes the target half on the port, or drops it when the signal is aborted.
 pub(crate) fn demonitor(handle: &Arc<PortHandle>, drv: &DriverPort, caller: Pid, reference: u64) {
+    if demonitor_now(handle, drv, reference) {
+        return;
+    }
     let task_handle = Arc::clone(handle);
-    let _ = imm_or_schedule(drv, caller, true, "demonitor", move |op| {
+    schedule(drv, caller, move |op| {
         if op == SigOp::Exec {
             task_handle.monitors.lock().remove(&reference);
         }
         REDS_DEMONITOR
     });
+}
+
+/// `erts_port_demonitor` when the port is free (`try_imm_drv_call`): `false` when the signal
+/// has to be scheduled as a port task.
+pub(crate) fn demonitor_now(handle: &PortHandle, drv: &DriverPort, reference: u64) -> bool {
+    match drv.try_imm_call(0, true, "demonitor", (CONTEXT_REDS / 10) as u32) {
+        Ok(imm) => {
+            handle.monitors.lock().remove(&reference);
+            drop(imm);
+            true
+        }
+        Err(ImmFail::InvalidPort) => true,
+        Err(_) => false,
+    }
 }
 
 /// `trace_port(prt, am_getting_linked | am_getting_unlinked, Pid, F_TRACE_PORTS)`.

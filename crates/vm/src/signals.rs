@@ -2853,12 +2853,17 @@ fn monitor_port(
                 name,
             },
         ));
-    if let Some((id, handle)) = port_id.and_then(|id| Some((id, runtime.ports.get(id)?))) {
-        if tag != atom("DOWN") {
-            // Port monitors carry no tag yet (typed gap, see report).
-            return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));
-        }
-        if !crate::port::monitor(process, id, &handle, reference_id, me, name, true)? {
+    let registered = port_id.and_then(|id| {
+        runtime.ports.with(id, |handle| {
+            if tag != atom("DOWN") {
+                // Port monitors carry no tag yet (typed gap, see report).
+                return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));
+            }
+            crate::port::monitor(process, id, handle, reference_id, me, name, true)
+        })
+    });
+    if let Some(registered) = registered {
+        if !registered? {
             let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let object = port_monitor_object(&mut heap, port_id, name)?;
             let down = TermBuilder::new(&mut heap)

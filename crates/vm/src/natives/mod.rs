@@ -376,6 +376,23 @@ pub(crate) trait ThinProcessBif {
 /// The light-BIF call site entry for `module:function/arity` when it is a [`ThinProcessBif`].
 /// The export still has its [`process_bif`] for the export-entry call and the executor.
 pub(crate) fn thin_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
+    if module == "erlang" {
+        match (function, arity) {
+            ("port_get_data", 1) => {
+                return Some(
+                    crate::native_helpers::thin_bif_light::<crate::port::PortGetData> as *const ()
+                        as usize,
+                );
+            }
+            ("port_set_data", 2) => {
+                return Some(
+                    crate::native_helpers::thin_bif_light::<crate::port::PortSetData> as *const ()
+                        as usize,
+                );
+            }
+            _ => {}
+        }
+    }
     maps::thin_entry(module, function, arity)
 }
 
