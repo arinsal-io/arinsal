@@ -268,9 +268,8 @@ fn signature_for(types: &[&str], operands: &[SpecificOperand]) -> Option<String>
 
 fn operand_type(operand: &SpecificOperand) -> char {
     match operand {
-        SpecificOperand::Typed { reg, .. } => operand_type(reg),
-        SpecificOperand::X(_) => 'x',
-        SpecificOperand::Y(_) => 'y',
+        SpecificOperand::X(_) | SpecificOperand::TypedX { .. } => 'x',
+        SpecificOperand::Y(_) | SpecificOperand::TypedY { .. } => 'y',
         SpecificOperand::FloatRegister(_) => 'l',
         SpecificOperand::Label(0) => 'p',
         SpecificOperand::Label(_) => 'f',
@@ -280,7 +279,6 @@ fn operand_type(operand: &SpecificOperand) -> char {
         SpecificOperand::SmallInt(_) => 'i',
         SpecificOperand::Unsigned(_) => 'u',
         SpecificOperand::Nil => 'n',
-        SpecificOperand::BigInt(_) => '?',
     }
 }
 

@@ -2,8 +2,21 @@
 //! of the boot modules: `cargo test --release -p arinsal-beamops --test transform_bench --
 //! --ignored --nocapture`.
 
-use arinsal_beamops::{TransformArena, transform_module_typed_in_arena};
+use arinsal_beamops::{NewLiteral, OpSink, SpecificOperand, TransformArena, load_code};
 use std::time::Instant;
+
+/// Takes the operations and drops them: what the transform costs without an assembler.
+struct Null;
+
+impl OpSink for Null {
+    fn new_literal(&mut self, _index: u32, _literal: &NewLiteral) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn emit(&mut self, _op: u16, _operands: &[SpecificOperand]) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 const MODULES: &[(&str, &str)] = &[
     ("stdlib", "erl_parse"),
@@ -62,7 +75,7 @@ fn transform_modules() {
     let started = Instant::now();
     for _ in 0..rounds {
         for beam in &beams {
-            transform_module_typed_in_arena(beam, false, &mut arena).unwrap();
+            load_code(beam, false, true, &mut arena, &mut Null).unwrap();
         }
     }
     let elapsed = started.elapsed();

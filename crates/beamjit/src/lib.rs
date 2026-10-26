@@ -12,8 +12,8 @@ use arinsal_beamasm::{
     types::{ArgType, TypedArg},
 };
 use arinsal_beamops::{
-    self as beamops, FunctionOps, LiteralElement, NewLiteral, SpecificOp, SpecificOperand,
-    TransformArena,
+    self as beamops, LiteralElement, NewLiteral, OpSink, SpecificOp, SpecificOperand,
+    TransformArena, erts_tables,
 };
 use std::{
     cell::RefCell,
@@ -49,6 +49,11 @@ pub trait ModuleEnv {
     /// Build a bignum literal for an integer outside the small range.
     fn integer_literal(&self, _value: i64) -> Result<u64, String> {
         Err("module environment cannot build integer literals".into())
+    }
+    /// The fun of the lambda at `lambda` in the lambda table when it has no free variables
+    /// (`erts_fun_entry_put` of the module's fun entry); created with the module.
+    fn zero_capture_fun(&self, _beam: &BeamFile, _lambda: u32) -> Result<u64, String> {
+        Err("module environment has no fun entries".into())
     }
     /// Build a bignum literal from decimal text (integers outside `i64`).
     fn bigint_literal(&self, _decimal: &str) -> Result<u64, String> {
@@ -1504,28 +1509,15 @@ pub struct UnportedFunction {
     pub arity: u8,
     /// Function entry label.
     pub label: u32,
-    /// Unique missing specific-op names in bytecode order.
+    /// What kept the function out, for logs.
     pub missing_ops: Vec<String>,
-    /// Why BeamAsm could not compile this function.
+    /// Why the function is not native.
     pub reason: FallbackReason,
 }
 
-/// Compilation outcome that caused a function to remain interpreted.
+/// Why a function was left out of the native code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FallbackReason {
-    /// One or more specific ops lack a complete native emitter.
-    UnsupportedInstructions,
-    /// An implemented emitter rejected these operands or its assembler operation failed.
-    EmitterError {
-        instruction: String,
-        details: String,
-    },
-    /// A local native call points to a function that was not itself emitted.
-    MissingNativeTarget { instruction: String, target: u32 },
-    /// The native function entry table did not contain the function's label.
-    MissingEntry,
-    /// This function requires a continuation behavior not yet available to BeamAsm.
-    RuntimeBridge,
     /// The caller intentionally excluded this function from native compilation.
     Excluded,
 }
@@ -1596,44 +1588,223 @@ pub fn compile_parsed_module_with_options(
     })
 }
 
-/// The words of the literals the load added after the file's own (`beamfile_add_literal`):
-/// key tuples, bignums and the funs of lambdas without free variables. The environment holds
-/// them under their literal index, like the literals of the file.
-fn resolve_new_literals(
+/// The words of a literal the load added after the file's own (`beamfile_add_literal`): key
+/// tuples, bignums and the funs of lambdas without free variables. The environment holds them
+/// under their literal index, like the literals of the file.
+fn resolve_new_literal(
     beam: &BeamFile,
     env: &impl ModuleEnv,
-    arena: &TransformArena,
-) -> Result<(), CompileError> {
-    let fail = |error: String| CompileError::Assemble(format!("{}: {error}", beam.module));
-    let first = u32::try_from(beam.literals.len())
-        .map_err(|_| fail("literal table too large".to_owned()))?;
-    let mut index = first;
-    while let Some(literal) = arena.new_literal(index) {
-        let word = match literal {
-            // The environment has the record definitions after the literals of the file.
-            NewLiteral::Record { .. } => {
-                index += 1;
-                continue;
-            }
-            NewLiteral::Bignum(text) => env.bigint_literal(text),
-            // The fun entry of a lambda without free variables is created with the module.
-            NewLiteral::FunPlaceholder { lambda } => env.literal(beam, u32::MAX - lambda),
-            NewLiteral::Tuple(elements) => elements
-                .iter()
-                .map(|element| match element {
-                    LiteralElement::Atom(atom) => env.atom(beam, *atom),
-                    LiteralElement::Small(value) => Ok(((*value as u64) << 4) | 0xf),
-                    LiteralElement::Nil => Ok(0x3b),
-                    LiteralElement::Literal(literal) => env.literal(beam, *literal),
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .and_then(|words| env.tuple_literal(&words)),
-        }
-        .map_err(fail)?;
-        env.add_literal(index, word).map_err(fail)?;
-        index += 1;
+    index: u32,
+    literal: &NewLiteral,
+) -> Result<(), String> {
+    let word = match literal {
+        // The environment has the record definitions after the literals of the file.
+        NewLiteral::Record { .. } => return Ok(()),
+        NewLiteral::Bignum(text) => env.bigint_literal(text),
+        // The fun entry of a lambda without free variables is created with the module.
+        NewLiteral::FunPlaceholder { lambda } => env.zero_capture_fun(beam, *lambda),
+        NewLiteral::Tuple(elements) => elements
+            .iter()
+            .map(|element| match element {
+                LiteralElement::Atom(atom) => env.atom(beam, *atom),
+                LiteralElement::Small(value) => Ok(((*value as u64) << 4) | 0xf),
+                LiteralElement::Nil => Ok(0x3b),
+                LiteralElement::Literal(literal) => env.literal(beam, *literal),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(|words| env.tuple_literal(&words)),
+    }?;
+    env.add_literal(index, word)
+}
+
+/// The operation of `beamasm_emit`: a generic operation number with its operands.
+struct OpView<'a> {
+    id: u16,
+    operands: &'a [SpecificOperand],
+}
+
+impl OpView<'_> {
+    fn name(&self) -> &'static str {
+        beamops::generic_op_name(self.id)
     }
-    Ok(())
+
+    fn operands(&self) -> &[SpecificOperand] {
+        self.operands
+    }
+}
+
+/// The function being emitted.
+struct CurrentFunction {
+    name: String,
+    arity: u8,
+    /// Its operations are not emitted: it is excluded, or its body is a native stub.
+    skip: bool,
+    native_body: Option<(usize, usize)>,
+    /// A `load_nif` can replace it (`may_load_nif` and `are_nifs` of erts).
+    nif_candidate: bool,
+}
+
+/// The module assembler as the receiver of `load_code`: the functions are emitted one after
+/// the other as the operations arrive (`beamasm_emit` of erts), with no pass over them first.
+struct ModuleCompiler<'a, E: ModuleEnv> {
+    beam: &'a BeamFile,
+    env: &'a E,
+    assembler: BeamModuleAssembler,
+    /// Index in the code summary of the next function to start.
+    next_function: usize,
+    current: Option<CurrentFunction>,
+    compiled: Vec<CompiledFunction>,
+    unported: Vec<UnportedFunction>,
+    function_allowlist: Option<&'a str>,
+    skip_functions: Option<String>,
+    may_load_nif: bool,
+    has_nif_start: bool,
+}
+
+impl<E: ModuleEnv> ModuleCompiler<'_, E> {
+    fn excluded(&self, name: &str, arity: u8) -> bool {
+        self.function_allowlist
+            .is_some_and(|list| !function_allowlist_contains(list, name, arity))
+            || self
+                .skip_functions
+                .as_deref()
+                .is_some_and(|list| function_allowlist_contains(list, name, arity))
+    }
+
+    /// `i_func_label` starts the next function of the code summary.
+    fn begin_function(&mut self, label: u32) -> Result<(), String> {
+        let function = self
+            .beam
+            .summary
+            .functions
+            .get(self.next_function)
+            .ok_or_else(|| format!("function label {label} has no function in the Code chunk"))?;
+        self.next_function += 1;
+        let name = self
+            .beam
+            .atom(function.function_atom)
+            .unwrap_or("<unknown>")
+            .to_owned();
+        let arity = function.arity.min(255) as u8;
+        let nif_stub = function.nif_stub;
+        if self.excluded(&name, arity) {
+            self.unported.push(UnportedFunction {
+                name: name.clone(),
+                arity,
+                label,
+                missing_ops: vec!["excluded by ARINSAL_BEAMASM_FUNCS".to_owned()],
+                reason: FallbackReason::Excluded,
+            });
+            self.current = Some(CurrentFunction {
+                name,
+                arity,
+                skip: true,
+                native_body: None,
+                nif_candidate: false,
+            });
+            return Ok(());
+        }
+        self.assembler.begin_dump_function(&name, arity);
+        self.compiled.push(CompiledFunction {
+            name: name.clone(),
+            arity,
+            label,
+        });
+        let native_body = self.env.native_body(&name, arity);
+        // Port of erts/emulator/beam/jit/arm/generators.tab:403-412 and asm_load.c:185-190
+        // (may_load_nif, are_nifs), OTP-29.1.1: functions a load_nif can replace.
+        let nif_candidate =
+            native_body.is_none() && self.may_load_nif && (!self.has_nif_start || nif_stub);
+        self.current = Some(CurrentFunction {
+            name,
+            arity,
+            skip: false,
+            native_body,
+            nif_candidate,
+        });
+        Ok(())
+    }
+}
+
+impl<E: ModuleEnv> OpSink for ModuleCompiler<'_, E> {
+    fn new_literal(&mut self, index: u32, literal: &NewLiteral) -> Result<(), String> {
+        resolve_new_literal(self.beam, self.env, index, literal)
+    }
+
+    fn emit(&mut self, op: u16, operands: &[SpecificOperand]) -> Result<(), String> {
+        let id = i32::from(op);
+        let view = OpView { id: op, operands };
+        if id == erts_tables::GENOP_I_FUNC_LABEL_1 {
+            let label = as_u32(operands.first()).ok_or("i_func_label without a label")?;
+            self.begin_function(label)?;
+        }
+        // Veneers are flushed before every function, whether it is emitted or not, so they
+        // never land in a prologue (ops.tab: i_flush_stubs).
+        let flush = id == erts_tables::GENOP_I_FLUSH_STUBS_0;
+        let Self {
+            assembler,
+            current,
+            beam,
+            env,
+            ..
+        } = self;
+        let (name, arity, native_body, nif_candidate) = match current.as_ref() {
+            Some(function) if function.skip && !flush => return Ok(()),
+            Some(function) => (
+                function.name.as_str(),
+                function.arity,
+                function.native_body,
+                function.nif_candidate,
+            ),
+            None => ("<module>", 0, None, false),
+        };
+        let dump_enabled = assembler.dump_enabled();
+        let start = if dump_enabled {
+            assembler.code_offset()
+        } else {
+            0
+        };
+        let mut ends_function = false;
+        // A statically known NIF function ends with its call-NIF body (instr_bif.cpp:863).
+        if let Some((identity, helper)) =
+            native_body.filter(|_| id == erts_tables::GENOP_NIF_START_0)
+        {
+            assembler
+                .check_pending_stubs()
+                .map_err(|e| format!("{e:?}"))?;
+            assembler
+                .emit_native_body(identity, helper, usize::from(arity))
+                .map_err(|error| format!("{name}/{arity}: nif_start: {error:?}"))?;
+            ends_function = true;
+        } else {
+            emit_op(assembler, &view, beam, *env, name, arity)
+                .map_err(|error| describe(&view, &error))?;
+            if nif_candidate
+                && id == erts_tables::GENOP_I_BREAKPOINT_TRAMPOLINE_0
+                && let Some((identity, helper)) = env.dynamic_nif_body(name, arity)
+            {
+                assembler
+                    .emit_nif_patch_site(identity, helper, usize::from(arity))
+                    .map_err(|error| format!("{name}/{arity}: i_nif_padding: {error:?}"))?;
+            }
+        }
+        if dump_enabled {
+            let end = assembler.code_offset();
+            assembler.record_dump_instruction(
+                format!("{} {:?}", view.name(), view.operands()),
+                start,
+                end,
+            );
+        }
+        if ends_function && let Some(function) = current.as_mut() {
+            function.skip = true;
+        }
+        Ok(())
+    }
+}
+
+fn describe(op: &OpView<'_>, error: &EmitError) -> String {
+    format!("{}: {error}; operands {:?}", op.name(), op.operands())
 }
 
 fn compile_parsed_module_with_options_in_arena(
@@ -1643,309 +1814,106 @@ fn compile_parsed_module_with_options_in_arena(
     line_breakpoints: bool,
     transform_arena: &mut TransformArena,
 ) -> Result<CompiledModule, CompileError> {
-    beamops::transform_module_typed_in_arena(beam, line_breakpoints, transform_arena)
-        .map_err(|error| CompileError::Assemble(format!("{}: {error}", beam.module)))?;
-    resolve_new_literals(beam, env, transform_arena)?;
-    let mut candidates: Vec<(String, u8, u32, FunctionOps)> = Vec::new();
-    let mut unported = Vec::new();
-
-    for index in 0..transform_arena.function_count() {
-        let range = transform_arena.function_range(index);
-        let ops = transform_arena.ops(range);
-        // Ops before the first function label (module preamble) are not a function.
-        if !ops
-            .iter()
-            .any(|op| matches!(op, SpecificOp::OpIFuncLabel(_)))
-        {
-            continue;
-        }
-        let (name, arity, label) = function_identity(ops);
-        if function_allowlist.is_some_and(|list| !function_allowlist_contains(list, &name, arity))
-            || std::env::var("ARINSAL_JIT_SKIPF")
-                .is_ok_and(|list| function_allowlist_contains(&list, &name, arity))
-        {
-            unported.push(UnportedFunction {
-                name,
-                arity,
-                label,
-                missing_ops: vec!["excluded by ARINSAL_BEAMASM_FUNCS".to_owned()],
-                reason: FallbackReason::Excluded,
-            });
-            continue;
-        }
-        let blockers = missing_ops(ops);
-        if !blockers.is_empty() {
-            unported.push(UnportedFunction {
-                name,
-                arity,
-                label,
-                missing_ops: blockers,
-                reason: FallbackReason::UnsupportedInstructions,
-            });
-            continue;
-        }
-        candidates.push((name, arity, label, range));
+    let fail = |error: String| CompileError::Assemble(format!("{}: {error}", beam.module));
+    let summary = &beam.summary;
+    let skip_functions = std::env::var("ARINSAL_JIT_SKIPF").ok();
+    let mut assembler = BeamModuleAssembler::new();
+    assembler.set_exception_resolver(env.exception_resolver() as usize);
+    if let Some((dispatch_return, test_yield, context_switch)) = env.yield_fragments() {
+        assembler.set_yield_fragments(dispatch_return, test_yield, context_switch);
     }
-
-    // Probe the NIF bodies before laying out the module.
-    let mut emit_failures = Vec::new();
-    candidates.retain(|(name, arity, label, _ops)| {
-        if let Some((identity, helper)) = env.native_body(name, *arity) {
-            let mut probe = BeamModuleAssembler::new();
-            if let Err(error) = probe.emit_native_body(identity, helper, *arity as usize) {
-                emit_failures.push(UnportedFunction {
-                    name: name.clone(),
-                    arity: *arity,
-                    label: *label,
-                    missing_ops: vec!["nif_start".to_owned()],
-                    reason: FallbackReason::EmitterError {
-                        instruction: "nif_start".to_owned(),
-                        details: format!("{error:?}"),
-                    },
-                });
-                return false;
-            }
-            return true;
-        }
-        // Every other emitter error is rare once a module's instructions are ported; the
-        // layout loop below drops such a function and restarts, instead of emitting every
-        // function twice up front.
-        true
+    let shared = env.compare_shared();
+    if shared.arith != 0 {
+        assembler.set_arith_compare_shared(shared.arith);
+    }
+    if shared.element_guard != 0 {
+        assembler.set_element_guard_shared(shared.element_guard);
+    }
+    if let Some((raise_shared, raise_exception)) = env.raise_fragments() {
+        assembler.set_raise_fragments(raise_shared, raise_exception);
+    }
+    if let Some((badmap, badkey, size_error)) = env.map_error_fragments() {
+        assembler.set_map_error_fragments(badmap, badkey, size_error);
+    }
+    assembler.enable_dump(&beam.module);
+    let may_load_nif = beam.imports.iter().any(|import| {
+        import.arity == 2
+            && beam.atom(import.module_atom) == Some("erlang")
+            && beam.atom(import.function_atom) == Some("load_nif")
     });
-    unported.extend(emit_failures);
-
-    let mut assembler;
-    let mut compiled = Vec::new();
-
-    loop {
-        let native_labels = candidates
-            .iter()
-            .flat_map(|(_, _, label, range)| {
-                std::iter::once(*label).chain(transform_arena.ops(*range).iter().filter_map(|op| {
-                    match op {
-                        SpecificOp::OpLabel(args) | SpecificOp::OpAlignedLabel(args) => {
-                            as_u32(args.first())
-                        }
-                        _ => None,
-                    }
-                }))
-            })
-            .collect::<LabelSet>();
-        let mut removed = false;
-        let mut index = 0;
-        while index < candidates.len() {
-            let blocked_call = transform_arena
-                .ops(candidates[index].3)
-                .iter()
-                .find_map(|op| {
-                    call_target(op)
-                        .or_else(|| lambda_call_target(op, beam))
-                        .filter(|target| !native_labels.contains(target))
-                        .map(|target| (op.name().to_owned(), target))
-                });
-            if let Some((op, target)) = blocked_call {
-                let (name, arity, label, _) = candidates.remove(index);
-                unported.push(UnportedFunction {
-                    name,
-                    arity,
-                    label,
-                    missing_ops: vec![op.clone()],
-                    reason: FallbackReason::MissingNativeTarget {
-                        instruction: op,
-                        target,
-                    },
-                });
-                removed = true;
-            } else {
-                index += 1;
-            }
-        }
-        if removed {
+    let mut compiler = ModuleCompiler {
+        beam,
+        env,
+        assembler,
+        next_function: 0,
+        current: None,
+        compiled: Vec::new(),
+        unported: Vec::new(),
+        function_allowlist,
+        skip_functions,
+        may_load_nif,
+        has_nif_start: summary.functions.iter().any(|function| function.nif_stub),
+    };
+    // The lambdas of functions that are emitted get their table entries first, so the
+    // `make_fun` and `call_fun` operations find them.
+    let excluded_labels = summary
+        .functions
+        .iter()
+        .filter(|function| {
+            let name = beam.atom(function.function_atom).unwrap_or("<unknown>");
+            compiler.excluded(name, function.arity.min(255) as u8)
+        })
+        .map(|function| function.entry_label)
+        .collect::<LabelSet>();
+    for lambda in &beam.lambdas {
+        if excluded_labels.contains(&lambda.label) {
             continue;
         }
-
-        // Fun creators stay native even when a lambda body is still interpreted:
-        // make_fun3_entry stores the shared FunEntry, and unpublished
-        // dispatch_target slots enter beam_unloaded_fun (OTP's unloaded/dispatchable
-        // path). Whole-module fallback is
-        // reserved for hard assemble failures below, not for missing trampolines.
-
-        assembler = BeamModuleAssembler::new();
-        assembler.set_exception_resolver(env.exception_resolver() as usize);
-        if let Some((dispatch_return, test_yield, context_switch)) = env.yield_fragments() {
-            assembler.set_yield_fragments(dispatch_return, test_yield, context_switch);
-        }
-        let shared = env.compare_shared();
-        if shared.arith != 0 {
-            assembler.set_arith_compare_shared(shared.arith);
-        }
-        if shared.element_guard != 0 {
-            assembler.set_element_guard_shared(shared.element_guard);
-        }
-        if let Some((raise_shared, raise_exception)) = env.raise_fragments() {
-            assembler.set_raise_fragments(raise_shared, raise_exception);
-        }
-        if let Some((badmap, badkey, size_error)) = env.map_error_fragments() {
-            assembler.set_map_error_fragments(badmap, badkey, size_error);
-        }
-        assembler.enable_dump(&beam.module);
-        for lambda in &beam.lambdas {
-            if !native_labels.contains(&lambda.label) {
-                continue;
-            }
-            let total_arity = u8::try_from(lambda.arity).map_err(|_| {
-                CompileError::Assemble(format!(
-                    "{} lambda {} has invalid total arity {}",
-                    beam.module, lambda.index, lambda.arity
-                ))
-            })?;
-            let num_free = u8::try_from(lambda.num_free).map_err(|_| {
-                CompileError::Assemble(format!(
-                    "{} lambda {} has invalid free variable count {}",
-                    beam.module, lambda.index, lambda.num_free
-                ))
-            })?;
-            assembler
-                .register_lambda(lambda.index, lambda.label, total_arity, num_free)
-                .map_err(|error| {
-                    CompileError::Assemble(format!(
-                        "{} lambda {}: {error:?}",
-                        beam.module, lambda.index
-                    ))
-                })?;
-        }
-        compiled.clear();
-        let mut failure_index = None;
-        let may_load_nif = beam.imports.iter().any(|import| {
-            import.arity == 2
-                && beam.atom(import.module_atom) == Some("erlang")
-                && beam.atom(import.function_atom) == Some("load_nif")
-        });
-        let has_nif_start = candidates.iter().any(|(_, _, _, range)| {
-            transform_arena
-                .ops(*range)
-                .iter()
-                .any(|op| matches!(op, SpecificOp::OpNifStart(_)))
-        });
-        let mut failure_reason = None;
-
-        for (index, (name, arity, label, range)) in candidates.iter().enumerate() {
-            let ops = transform_arena.ops(*range);
-            assembler.begin_dump_function(name, *arity);
-            let dump_enabled = assembler.dump_enabled();
-            let native_body = env.native_body(name, *arity);
-            // Port of erts/emulator/beam/jit/arm/generators.tab:403-412 and asm_load.c:185-190
-            // (may_load_nif, are_nifs), OTP-29.1.1: functions a load_nif can replace.
-            let nif_candidate = native_body.is_none()
-                && may_load_nif
-                && (!has_nif_start || ops.iter().any(|op| matches!(op, SpecificOp::OpNifStart(_))));
-            for op in ops {
-                // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:452, OTP-29.1.1.
-                if let Err(error) = assembler.check_pending_stubs() {
-                    failure_index = Some(index);
-                    failure_reason = Some((op.name().to_owned(), format!("{error:?}")));
-                    break;
-                }
-                let start = if dump_enabled {
-                    assembler.code_offset()
-                } else {
-                    0
-                };
-                if matches!(op, SpecificOp::OpNifStart(_))
-                    && let Some((identity, helper)) = native_body
-                {
-                    if let Err(error) =
-                        assembler.emit_native_body(identity, helper, *arity as usize)
-                    {
-                        failure_index = Some(index);
-                        failure_reason = Some(("nif_start".to_owned(), format!("{error:?}")));
-                        break;
-                    }
-                    if dump_enabled {
-                        let end = assembler.code_offset();
-                        assembler.record_dump_instruction(
-                            format!("{} {:?}", op.name(), op.operands()),
-                            start,
-                            end,
-                        );
-                    }
-                    break;
-                }
-                if let Err(error) = emit_op(&mut assembler, op, beam, env, name, *arity) {
-                    failure_index = Some(index);
-                    failure_reason = Some((
-                        op.name().to_owned(),
-                        format!("{error}; operands {:?}", op.operands()),
-                    ));
-                    break;
-                }
-                if nif_candidate
-                    && matches!(op, SpecificOp::OpIBreakpointTrampoline(_))
-                    && let Some((identity, helper)) = env.dynamic_nif_body(name, *arity)
-                    && let Err(error) =
-                        assembler.emit_nif_patch_site(identity, helper, *arity as usize)
-                {
-                    failure_index = Some(index);
-                    failure_reason = Some(("i_nif_padding".to_owned(), format!("{error:?}")));
-                    break;
-                }
-                if dump_enabled {
-                    let end = assembler.code_offset();
-                    assembler.record_dump_instruction(
-                        format!("{} {:?}", op.name(), op.operands()),
-                        start,
-                        end,
-                    );
-                }
-            }
-            if failure_index.is_some() {
-                break;
-            }
-            compiled.push((name.clone(), *arity, *label));
-        }
-
-        if let Some(index) = failure_index {
-            let (op, details) = failure_reason.unwrap();
-            let (name, arity, label, _) = candidates.remove(index);
-            unported.push(UnportedFunction {
-                name,
-                arity,
-                label,
-                missing_ops: vec![op.clone()],
-                reason: FallbackReason::EmitterError {
-                    instruction: op,
-                    details,
-                },
-            });
-            continue;
-        }
-        assembler
-            .emit_missing_lambda_trampolines()
-            .map_err(|error| CompileError::Assemble(format!("{}: {error:?}", beam.module)))?;
-        break;
+        let total_arity = u8::try_from(lambda.arity).map_err(|_| {
+            fail(format!(
+                "lambda {} has invalid total arity {}",
+                lambda.index, lambda.arity
+            ))
+        })?;
+        let num_free = u8::try_from(lambda.num_free).map_err(|_| {
+            fail(format!(
+                "lambda {} has invalid free variable count {}",
+                lambda.index, lambda.num_free
+            ))
+        })?;
+        compiler
+            .assembler
+            .register_lambda(lambda.index, lambda.label, total_arity, num_free)
+            .map_err(|error| fail(format!("lambda {}: {error:?}", lambda.index)))?;
     }
+    beamops::load_code(beam, line_breakpoints, true, transform_arena, &mut compiler)
+        .map_err(|error| fail(error.to_string()))?;
 
+    let ModuleCompiler {
+        mut assembler,
+        compiled,
+        unported,
+        ..
+    } = compiler;
+    assembler
+        .emit_missing_lambda_trampolines()
+        .map_err(|error| fail(format!("{error:?}")))?;
     let native = assembler
         .finalize()
-        .map_err(|error| CompileError::Assemble(format!("{}: {error:?}", beam.module)))?;
+        .map_err(|error| fail(format!("{error:?}")))?;
     for (&index, &target) in &native.lambda_entries {
         env.publish_lambda_target(beam, index, target as usize)
-            .map_err(|error| CompileError::Assemble(format!("{}: {error}", beam.module)))?;
+            .map_err(&fail)?;
     }
-    let mut functions = Vec::with_capacity(compiled.len());
-    for (name, arity, label) in compiled {
-        if native.entries.contains_key(&label) {
-            functions.push(CompiledFunction { name, arity, label });
-        } else {
-            unported.push(UnportedFunction {
-                name,
-                arity,
-                label,
-                missing_ops: vec!["i_func_label".to_owned()],
-                reason: FallbackReason::MissingEntry,
-            });
+    for function in &compiled {
+        if !native.entries.contains_key(&function.label) {
+            return Err(fail(format!(
+                "function {}/{} has no native entry",
+                function.name, function.arity
+            )));
         }
     }
+    let functions = compiled;
     Ok(CompiledModule {
         name: beam.module.clone(),
         functions,
@@ -2135,11 +2103,9 @@ fn as_u32(value: Option<&SpecificOperand>) -> Option<u32> {
 }
 
 fn call_target(op: &SpecificOp) -> Option<u32> {
-    match op {
-        SpecificOp::OpICall(args)
-        | SpecificOp::OpICallOnly(args)
-        | SpecificOp::OpICallLast(args) => as_u32(args.first()),
-        SpecificOp::OpMoveCallLast(args) => as_u32(args.get(2)),
+    match op.name() {
+        "i_call" | "i_call_only" | "i_call_last" => as_u32(op.operands().first()),
+        "move_call_last" => as_u32(op.operands().get(2)),
         _ => None,
     }
 }
@@ -2166,22 +2132,6 @@ impl FromIterator<u32> for LabelSet {
         }
         Self(set)
     }
-}
-
-fn lambda_call_target(op: &SpecificOp, beam: &BeamFile) -> Option<u32> {
-    if !matches!(
-        op,
-        SpecificOp::OpICallFun2(_) | SpecificOp::OpICallFun2Last(_)
-    ) {
-        return None;
-    }
-    let FunCallTag::Lambda(index) = fun_call_tag(op.operands().first()).ok()? else {
-        return None;
-    };
-    beam.lambdas
-        .iter()
-        .find(|lambda| lambda.index == index)
-        .map(|lambda| lambda.label)
 }
 
 /// Maps `i_call_fun2` Safe operand: atom → Dynamic, lambda index → Lambda(id).
@@ -2235,9 +2185,8 @@ fn arg(
     env: &impl ModuleEnv,
 ) -> Result<ArgVal, String> {
     match value.ok_or_else(|| "missing operand".to_owned())? {
-        SpecificOperand::Typed { reg, .. } => arg(Some(reg), beam, env),
-        SpecificOperand::X(index) => x_register(*index),
-        SpecificOperand::Y(index) => Ok(ArgVal::Y(*index)),
+        SpecificOperand::X(index) | SpecificOperand::TypedX { index, .. } => x_register(*index),
+        SpecificOperand::Y(index) | SpecificOperand::TypedY { index, .. } => Ok(ArgVal::Y(*index)),
         SpecificOperand::Label(index) => Ok(ArgVal::Label(*index)),
         SpecificOperand::Atom(index) => env.atom(beam, *index).map(ArgVal::Immediate),
         SpecificOperand::Export(index) => env.import(beam, *index).map(ArgVal::Export),
@@ -2250,7 +2199,6 @@ fn arg(
         SpecificOperand::SmallInt(value) => env.integer_literal(*value).map(ArgVal::Literal),
         SpecificOperand::Unsigned(value) => Ok(ArgVal::Immediate(*value)),
         SpecificOperand::Nil => Ok(ArgVal::Immediate(0x3b)),
-        SpecificOperand::BigInt(decimal) => env.bigint_literal(decimal).map(ArgVal::Literal),
         _ => Err("operand form is not accepted by the module assembler".to_owned()),
     }
 }
@@ -2263,8 +2211,10 @@ fn eq_literal_operand(
     env: &impl ModuleEnv,
 ) -> Result<EqLiteral, String> {
     match value {
-        Some(SpecificOperand::Typed { reg, .. }) => eq_literal_operand(Some(reg), beam, env),
-        Some(SpecificOperand::Literal(index)) => env.eq_literal(beam, *index),
+        // A literal the load added (a bignum) compares like any boxed term.
+        Some(SpecificOperand::Literal(index)) if (*index as usize) < beam.literals.len() => {
+            env.eq_literal(beam, *index)
+        }
         _ => Ok(EqLiteral::Generic),
     }
 }
@@ -2286,7 +2236,9 @@ fn typed_arg(
 // OTP-29.1.1.
 fn operand_type(value: Option<&SpecificOperand>, beam: &BeamFile) -> ArgType {
     match value {
-        Some(SpecificOperand::Typed { type_index, .. }) => beam
+        Some(
+            SpecificOperand::TypedX { type_index, .. } | SpecificOperand::TypedY { type_index, .. },
+        ) => beam
             .types
             .as_ref()
             .and_then(|table| table.entries.get(*type_index as usize))
@@ -2426,7 +2378,7 @@ fn erlang_get_import(beam: &BeamFile, index: u32) -> bool {
 
 fn emit_op(
     assembler: &mut BeamModuleAssembler,
-    op: &SpecificOp,
+    op: &OpView<'_>,
     beam: &BeamFile,
     env: &impl ModuleEnv,
     function: &str,
@@ -2493,7 +2445,13 @@ fn emit_op(
     {
         assembler.set_arith_fail(fail);
     }
-    let result = match ported_op(op).expect("dispatch only follows capability validation") {
+    let Some(emitter) = ported_op(op) else {
+        return Err(EmitError::Operand(format!(
+            "no emitter for operation {}",
+            op.name()
+        )));
+    };
+    let result = match emitter {
         EmitterKind::Metadata => match op.name() {
             "i_flush_stubs" => {
                 count(0)?;
@@ -4540,20 +4498,15 @@ fn ported(name: &str) -> Option<EmitterKind> {
     ported_index().get(name).copied()
 }
 
-/// The emitter of `op`, from a table indexed by the op's dense identity.
-fn ported_op(op: &SpecificOp) -> Option<EmitterKind> {
+/// The emitter of `op`, from a table indexed by the generic operation number.
+fn ported_op(op: &OpView<'_>) -> Option<EmitterKind> {
     static TABLE: std::sync::OnceLock<Vec<Option<EmitterKind>>> = std::sync::OnceLock::new();
     let table = TABLE.get_or_init(|| {
-        arinsal_beamops::SPECIFIC_OP_NAMES
-            .iter()
-            .map(|name| ported(name))
+        (0..beamops::NUM_GENERIC_OPS)
+            .map(|id| ported(beamops::generic_op_name(id as u16)))
             .collect()
     });
-    match op.id() {
-        // An operation outside OTP's declared set is found by name.
-        u16::MAX => ported(op.name()),
-        id => table.get(usize::from(id)).copied().flatten(),
-    }
+    table.get(usize::from(op.id)).copied().flatten()
 }
 
 /// Error returned for invalid input files or module-wide emission failures.

@@ -116,7 +116,7 @@ impl Makeops {
         for (i, name) in self.gen_opname.iter().enumerate() {
             if let Some(name) = name {
                 out.push_str(&format!(
-                    "#[allow(dead_code)]\npub(crate) const GENOP_{}_{}: i32 = {i};\n",
+                    "#[allow(dead_code)]\npub const GENOP_{}_{}: i32 = {i};\n",
                     name.to_uppercase(),
                     self.gen_arity[i]
                 ));

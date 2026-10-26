@@ -1,12 +1,14 @@
 //! The BeamAsm loader's instruction pipeline: the generic instructions of a BEAM file go through
 //! the transformation engine and the specific-instruction selection of erts (`load_code`), a
-//! port of beam_load.c, beam_file.c and the code `beam_makeops` generates, and come out as the
-//! specific operations the module assembler emits.
+//! port of beam_load.c, beam_file.c and the code `beam_makeops` generates, and come out one by
+//! one as the specific operations the module assembler emits (`beam_load_emit_op` handing each
+//! to `beamasm_emit`).
 
 #![forbid(unsafe_code)]
 
 mod beam_op;
-mod erts_tables;
+#[doc(hidden)]
+pub mod erts_tables;
 mod load_code;
 mod loader_state;
 pub use load_code::LoadCodeError;
@@ -55,8 +57,9 @@ pub enum LiteralElement {
     Literal(u32),
 }
 
-/// A typed operand accepted by a BeamAsm-specific operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// An operand of a specific operation: what `beam_load_emit_op` leaves in the operand array
+/// that `beamasm_emit` takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpecificOperand {
     /// X register index.
     X(u32),
@@ -70,7 +73,7 @@ pub enum SpecificOperand {
     Atom(u32),
     /// Export-table entry index.
     Export(u32),
-    /// Literal table index.
+    /// Literal table index: a literal of the file, or one the load added ([`NewLiteral`]).
     Literal(u32),
     /// Small signed immediate.
     SmallInt(i64),
@@ -78,41 +81,74 @@ pub enum SpecificOperand {
     Unsigned(u64),
     /// Nil operand.
     Nil,
-    /// Integer outside `i64`, as decimal text; the loader turns it into a literal.
-    BigInt(Box<String>),
-    /// A register operand with the compiler's `Type` chunk entry (`{tr, Reg, Type}`); only
-    /// produced by the typed transform, for operations that use operand types.
-    Typed {
-        /// The register operand.
-        reg: Box<SpecificOperand>,
+    /// An X register with the compiler's `Type` chunk entry (`{tr, Reg, Type}`); only produced
+    /// by the typed transform, for operations that use operand types.
+    TypedX {
+        /// The register index.
+        index: u32,
+        /// Index into the module's `Type` chunk.
+        type_index: u32,
+    },
+    /// A Y register with the compiler's `Type` chunk entry.
+    TypedY {
+        /// The register index.
+        index: u32,
         /// Index into the module's `Type` chunk.
         type_index: u32,
     },
 }
 
-/// Range of transformed operations belonging to one function or module preamble.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FunctionOps {
-    /// First operation in the arena's flat operation buffer.
-    pub start: usize,
-    /// Number of operations in this range.
-    pub len: usize,
+/// What the loader hands the module assembler: the receiver of `beamasm_emit`.
+pub trait OpSink {
+    /// A literal the load added is used from now on (`beamfile_add_literal`); `index` is its
+    /// literal index, which operands name. Called once per literal, before the first operation
+    /// that could use it.
+    fn new_literal(&mut self, index: u32, literal: &NewLiteral) -> Result<(), String>;
+    /// `beamasm_emit`: one specific operation, by the number of its generic operation
+    /// ([`erts_tables::GENOP_I_FUNC_LABEL_1`] and its siblings), with its operands.
+    fn emit(&mut self, op: u16, operands: &[SpecificOperand]) -> Result<(), String>;
 }
 
-/// Reusable storage for the transformed operations of a module and what they refer to.
-///
-/// Keep one arena for a compile stream so the operation allocator of the loader, with its freed
-/// operations, is reused by later modules.
+/// The name of a generic operation, which is the name of its specific operation.
+pub fn generic_op_name(op: u16) -> &'static str {
+    erts_tables::GEN_OPC[usize::from(op)].name
+}
+
+/// The number of generic operations (the length of the table `generic_op_name` indexes).
+pub const NUM_GENERIC_OPS: usize = erts_tables::NUM_GENERIC_OPS;
+
+/// A specific operation, owned: what a tool that collects the output of the loader gets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpecificOp {
+    op: u16,
+    operands: Vec<SpecificOperand>,
+}
+
+impl SpecificOp {
+    /// The generic operation number.
+    pub fn id(&self) -> u16 {
+        self.op
+    }
+
+    /// The OTP operation name.
+    pub fn name(&self) -> &'static str {
+        generic_op_name(self.op)
+    }
+
+    /// The operands.
+    pub fn operands(&self) -> &[SpecificOperand] {
+        &self.operands
+    }
+}
+
+/// Reusable storage of the loader: its operation allocator, kept between modules so freed
+/// operations are reused by later modules.
 #[derive(Default)]
 pub struct TransformArena {
-    specific_ops: Vec<SpecificOp>,
-    functions: Vec<FunctionOps>,
-    /// The operation allocator of the loader (`op_allocator`), kept between modules.
+    /// The operation allocator of the loader (`op_allocator`).
     beam_ops: beam_op::BeamOpAllocator,
-    /// The literals the load added after the file's (`beamfile_add_literal`).
-    new_literals: Vec<NewLiteral>,
-    /// The number of literals in the file: the index of the first new one.
-    file_literals: usize,
+    /// The operand array of the operation being emitted.
+    operands: Vec<SpecificOperand>,
 }
 
 impl TransformArena {
@@ -120,55 +156,50 @@ impl TransformArena {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Returns a function's specific operations without copying its operation vector.
-    pub fn ops(&self, function: FunctionOps) -> &[SpecificOp] {
-        &self.specific_ops[function.start..function.start + function.len]
-    }
-
-    /// The number of functions (and the module preamble) of the last transformed module.
-    pub fn function_count(&self) -> usize {
-        self.functions.len()
-    }
-
-    /// The operation range of function `index`.
-    pub fn function_range(&self, index: usize) -> FunctionOps {
-        self.functions[index]
-    }
-
-    /// The literal a `Literal(index)` operand names when it is beyond the file's literal table.
-    pub fn new_literal(&self, index: u32) -> Option<&NewLiteral> {
-        self.new_literals
-            .get((index as usize).checked_sub(self.file_literals)?)
-    }
-
-    fn reset(&mut self) {
-        self.specific_ops.clear();
-        self.functions.clear();
-        self.new_literals.clear();
-    }
 }
 
-/// Operations whose operands keep their `Type` chunk entry in the typed transform.
-// Port of erts/emulator/beam/jit/arm/instr_arith.cpp and instr_guard_bifs.cpp, OTP-29.1.1.
-const TYPED_OPS: &[&str] = &[
-    "is_map",
-    "bif_is_map_key",
-    "bif_map_size",
-    "i_plus",
-    "i_minus",
-    "i_band",
-    "i_bor",
-    "i_bxor",
-    "i_bsl",
-    "i_bsr",
-    "i_rem",
-    "i_int_div",
-    "bif_map_get",
-    "bif_is_map_key",
-];
-
 include!(concat!(env!("OUT_DIR"), "/specific_ops.rs"));
+
+/// Loads the code of a module like `load_code` of erts: the operations go to `sink` one by one,
+/// as the engine produces them.
+// Port of erts/emulator/beam/beam_load.c:load_code, OTP-29.1.1.
+pub fn load_code<S: OpSink>(
+    beam: &BeamFile,
+    instrument_line_breakpoints: bool,
+    typed: bool,
+    arena: &mut TransformArena,
+    sink: &mut S,
+) -> Result<(), LoadCodeError> {
+    load_code::load_code(beam, instrument_line_breakpoints, typed, arena, sink)
+}
+
+/// Collects the operations of a module per function; a function starts at its
+/// `i_func_label`, and the operations before the first one form the first range.
+struct Collect {
+    functions: Vec<Vec<SpecificOp>>,
+}
+
+impl OpSink for Collect {
+    fn new_literal(&mut self, _index: u32, _literal: &NewLiteral) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn emit(&mut self, op: u16, operands: &[SpecificOperand]) -> Result<(), String> {
+        if i32::from(op) == erts_tables::GENOP_I_FUNC_LABEL_1
+            && self.functions.last().is_some_and(|range| !range.is_empty())
+        {
+            self.functions.push(Vec::new());
+        }
+        self.functions
+            .last_mut()
+            .expect("a first range")
+            .push(SpecificOp {
+                op,
+                operands: operands.to_vec(),
+            });
+        Ok(())
+    }
+}
 
 /// Transforms a module like `load_code` of erts and returns its operations per function; the
 /// operations before the first function label (the module preamble) form the first range.
@@ -182,40 +213,36 @@ pub fn transform_module_with_line_breakpoints(
     beam: &BeamFile,
     instrument_line_breakpoints: bool,
 ) -> Result<Vec<Vec<SpecificOp>>, LoadCodeError> {
-    materialize_module(beam, instrument_line_breakpoints, false)
+    collect_module(beam, instrument_line_breakpoints, false)
 }
 
 /// Like [`transform_module_with_line_breakpoints`], but arithmetic operations keep the `Type`
-/// chunk entry of their register operands as [`SpecificOperand::Typed`].
+/// chunk entry of their register operands as [`SpecificOperand::TypedX`] and `TypedY`.
 pub fn transform_module_typed(
     beam: &BeamFile,
     instrument_line_breakpoints: bool,
 ) -> Result<Vec<Vec<SpecificOp>>, LoadCodeError> {
-    materialize_module(beam, instrument_line_breakpoints, true)
+    collect_module(beam, instrument_line_breakpoints, true)
 }
 
-/// Transforms a module into reusable arena storage and leaves its function ranges there.
-// Port of erts/emulator/beam/beam_load.c:load_code, OTP-29.1.1.
-pub fn transform_module_typed_in_arena(
-    beam: &BeamFile,
-    instrument_line_breakpoints: bool,
-    arena: &mut TransformArena,
-) -> Result<(), LoadCodeError> {
-    load_code::load_code(beam, instrument_line_breakpoints, true, arena)
-}
-
-fn materialize_module(
+fn collect_module(
     beam: &BeamFile,
     instrument_line_breakpoints: bool,
     typed: bool,
 ) -> Result<Vec<Vec<SpecificOp>>, LoadCodeError> {
     let mut arena = TransformArena::new();
-    load_code::load_code(beam, instrument_line_breakpoints, typed, &mut arena)?;
-    Ok(arena
-        .functions
-        .iter()
-        .map(|range| arena.ops(*range).to_vec())
-        .collect())
+    let mut sink = Collect {
+        functions: vec![Vec::new()],
+    };
+    load_code::load_code(
+        beam,
+        instrument_line_breakpoints,
+        typed,
+        &mut arena,
+        &mut sink,
+    )?;
+    sink.functions.retain(|range| !range.is_empty());
+    Ok(sink.functions)
 }
 
 /// The compiled transformation programs as text (see `tests/erts_programs.rs`).

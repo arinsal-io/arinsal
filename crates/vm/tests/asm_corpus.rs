@@ -92,16 +92,20 @@ impl ModuleEnv for CorpusEnv {
         Ok(())
     }
 
+    fn zero_capture_fun(&self, _beam: &BeamFile, lambda: u32) -> Result<u64, String> {
+        let entry = self
+            .lambda_entries
+            .get(&lambda)
+            .ok_or_else(|| format!("lambda {lambda} is missing"))?;
+        let mut heap = self.literal_heap.borrow_mut();
+        TermBuilder::new(&mut *heap)
+            .local_fun(entry, &[])
+            .map(Term::tagged_word)
+            .map_err(|error| format!("zero-capture fun {lambda}: {error:?}"))
+    }
+
     fn literal(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
         let mut heap = self.literal_heap.borrow_mut();
-        if let Some(lambda_index) = u32::MAX.checked_sub(index)
-            && let Some(entry) = self.lambda_entries.get(&lambda_index)
-        {
-            return TermBuilder::new(&mut *heap)
-                .local_fun(entry, &[])
-                .map(Term::tagged_word)
-                .map_err(|error| format!("zero-capture fun {lambda_index}: {error:?}"));
-        }
         if index as usize >= beam.literals.len() {
             // A literal the load added (a record definition, a key tuple, a bignum).
             return Ok(Term::NIL.tagged_word());
@@ -383,43 +387,12 @@ fn otp_and_elixir_corpus_compiles_with_beamasm() {
             Ok(compiled) => {
                 native_count += compiled.functions.len();
                 for function in compiled.unported {
-                    let category = match &function.reason {
-                        FallbackReason::UnsupportedInstructions => "unsupported instruction",
-                        FallbackReason::EmitterError { .. } => "emitter error",
-                        FallbackReason::MissingNativeTarget { .. } => "missing native call target",
-                        FallbackReason::MissingEntry => "missing native entry",
-                        FallbackReason::RuntimeBridge => "runtime bridge",
-                        FallbackReason::Excluded => "explicit exclusion",
-                    };
-                    *category_counts.entry(category.to_owned()).or_default() += 1;
-                    match &function.reason {
-                        FallbackReason::EmitterError {
-                            instruction,
-                            details,
-                        } => {
-                            *reason_counts
-                                .entry(format!("emitter {instruction}: {details}"))
-                                .or_default() += 1;
-                        }
-                        FallbackReason::MissingNativeTarget { instruction, .. } => {
-                            *reason_counts
-                                .entry(format!("call target unavailable via {instruction}"))
-                                .or_default() += 1;
-                        }
-                        FallbackReason::UnsupportedInstructions => {
-                            for reason in &function.missing_ops {
-                                *reason_counts
-                                    .entry(format!("unsupported {reason}"))
-                                    .or_default() += 1;
-                            }
-                        }
-                        FallbackReason::MissingEntry
-                        | FallbackReason::RuntimeBridge
-                        | FallbackReason::Excluded => {
-                            for reason in &function.missing_ops {
-                                *reason_counts.entry(reason.clone()).or_default() += 1;
-                            }
-                        }
+                    let FallbackReason::Excluded = &function.reason;
+                    *category_counts
+                        .entry("explicit exclusion".to_owned())
+                        .or_default() += 1;
+                    for reason in &function.missing_ops {
+                        *reason_counts.entry(reason.clone()).or_default() += 1;
                     }
                     issues.push(format!(
                         "{}:{}/{}: {:?} ({})",

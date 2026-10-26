@@ -48,6 +48,8 @@ pub(crate) struct ImportEntry {
 /// `Label`: what the loader remembers per label.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Label {
+    /// `value`: the label has been defined by an emitted `label` instruction.
+    pub defined: bool,
     pub looprec_targeted: bool,
     /// `lambda_index`, `None` for `INVALID_LAMBDA_INDEX`.
     pub lambda_index: Option<usize>,
@@ -195,6 +197,7 @@ impl<'a> LoaderState<'a> {
         let literals = Literals::new(beam)?;
         let mut labels = vec![
             Label {
+                defined: false,
                 looprec_targeted: false,
                 lambda_index: None,
             };

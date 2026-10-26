@@ -61,6 +61,11 @@ impl ModuleEnv for TestEnv {
             .ok_or_else(|| format!("import index {index} is out of range"))
     }
 
+    fn export_entry(&self, _beam: &BeamFile, index: u32) -> Result<usize, String> {
+        // The module is compiled for its own functions only; its external calls are never run.
+        Ok(0x1000 + 8 * index as usize)
+    }
+
     fn arithmetic_helper(&self) -> arinsal_beamasm::arith::ArithHelper {
         arithmetic_helper
     }
