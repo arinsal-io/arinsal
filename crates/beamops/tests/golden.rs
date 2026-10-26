@@ -85,7 +85,8 @@ fn check(fixture_name: &str, hashes: &BTreeMap<String, (u64, u64)>) {
         std::fs::write(&path, actual).unwrap();
         return;
     }
-    let expected = std::fs::read_to_string(&path).expect("fixture (BEAMOPS_GOLDEN_WRITE=1 makes it)");
+    let expected =
+        std::fs::read_to_string(&path).expect("fixture (BEAMOPS_GOLDEN_WRITE=1 makes it)");
     let expected_lines: BTreeMap<_, _> = expected
         .lines()
         .filter_map(|line| line.split_once(' '))
