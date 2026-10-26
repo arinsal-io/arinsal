@@ -73,7 +73,7 @@ fn local_funs_survive_same_code_reload_and_keep_equality_hash() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let old_vm = vm
-        .eval(module, "make", &[Term::small(17).unwrap()])
+        .eval_exported(module, "make", &[Term::small(17).unwrap()])
         .unwrap();
 
     reference.load(module, &beam).unwrap();
@@ -83,7 +83,7 @@ fn local_funs_survive_same_code_reload_and_keep_equality_hash() {
         other => panic!("make after reload failed: {other:?}"),
     };
     let new_vm = vm
-        .eval(module, "make", &[Term::small(17).unwrap()])
+        .eval_exported(module, "make", &[Term::small(17).unwrap()])
         .unwrap();
 
     let expected = reference.call(module, "compare", &[old_ref.clone(), new_ref]);
@@ -156,10 +156,10 @@ fn local_fun_from_purged_old_code_raises_badfun() {
 
     let mut vm = Vm::new([]);
     vm.load_bytes(&old_beam).unwrap();
-    let old_vm = vm.eval(module, "make", &[]).unwrap();
+    let old_vm = vm.eval_exported(module, "make", &[]).unwrap();
     let mut input_heap = VecHeap::new();
     let encoded = from_owned(&old_external, &mut input_heap).unwrap();
-    let decoded_vm = vm.eval(module, "decode", &[encoded]).unwrap();
+    let decoded_vm = vm.eval_exported(module, "decode", &[encoded]).unwrap();
     vm.load_next_version(&new_beam).unwrap();
     vm.load_bytes(&purge_beam).unwrap();
     let purge_actual = vm.call(purge_module, "run", &[]);

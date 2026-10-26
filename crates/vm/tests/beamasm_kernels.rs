@@ -38,7 +38,7 @@ fn beam_asm_kernels_match_erts() {
     for (function, n) in cases {
         let started = Instant::now();
         let interpreted = vm
-            .eval("kernels", function, &[Term::small(n).unwrap()])
+            .eval_exported("kernels", function, &[Term::small(n).unwrap()])
             .unwrap();
         let interpreter_ns = started.elapsed().as_nanos();
         let interpreted_term = arinsal_term::to_owned(interpreted.term).unwrap();

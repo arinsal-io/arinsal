@@ -9,7 +9,7 @@ fn compare_call(vm: &mut Vm, reference: &RefErl, name: &str, arg: i64) {
     let mut heap = VecHeap::new();
     let term = from_owned(&input, &mut heap).unwrap();
     let actual = vm
-        .eval("vm_maps_bits_diff", name, &[term])
+        .eval_exported("vm_maps_bits_diff", name, &[term])
         .map(|outcome| to_owned(outcome.term).unwrap());
     match (expected, actual) {
         (CallResult::Ok(expected), Ok(actual)) => assert_eq!(actual, expected, "{name}({arg})"),
@@ -100,7 +100,7 @@ fn one_hundred_thousand_binary_appends_match_otp() {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval("vm_maps_bits_loop", "run", &[Term::small(100_000).unwrap()])
+        .eval_exported("vm_maps_bits_loop", "run", &[Term::small(100_000).unwrap()])
         .map(|outcome| to_owned(outcome.term).unwrap());
     match (expected, actual) {
         (CallResult::Ok(expected), Ok(actual)) => assert_eq!(actual, expected),
@@ -145,7 +145,10 @@ fn map_and_bit_error_reasons_match_otp_for_immediate_terms() {
         );
         let mut arg_heap = VecHeap::new();
         let arg = from_owned(&input, &mut arg_heap).unwrap();
-        let error = vm.eval("vm_maps_bits_errors", name, &[arg]).err().unwrap();
+        let error = vm
+            .eval_exported("vm_maps_bits_errors", name, &[arg])
+            .err()
+            .unwrap();
         // The structured reason must equal erts' reason term exactly.
         let VmError::Raised(raised) = error else {
             panic!("expected a raised exception: {error:?}");
@@ -157,7 +160,7 @@ fn map_and_bit_error_reasons_match_otp_for_immediate_terms() {
         matches!(expected, CallResult::Exception { reason: OwnedTerm::Atom(ref reason), .. } if reason == "badarg")
     );
     let error = vm
-        .eval(
+        .eval_exported(
             "vm_maps_bits_errors",
             "bad_size",
             &[Term::small(-1).unwrap()],

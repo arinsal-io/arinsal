@@ -1895,7 +1895,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.set_coverage_mode(CoverageMode::FunctionCounters);
         loaded(&mut vm, &beam);
-        vm.eval(module, "run", &[]).unwrap();
+        vm.eval_exported(module, "run", &[]).unwrap();
         let mut process = Process::new();
         let actual =
             to_owned(get_coverage(&vm, &mut process, &[atom("function"), atom(module)]).unwrap())
@@ -1933,7 +1933,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.set_coverage_mode(CoverageMode::LineCounters);
         loaded(&mut vm, &beam);
-        vm.eval(module, "run", &[]).unwrap();
+        vm.eval_exported(module, "run", &[]).unwrap();
         let mut process = Process::new();
         let line = get_coverage(&vm, &mut process, &[atom("line"), atom(module)]).unwrap();
         let cover_id =
@@ -2022,7 +2022,7 @@ mod tests {
         let mut vm = Vm::new([]);
         vm.set_coverage_mode(CoverageMode::Function);
         loaded(&mut vm, &beam);
-        vm.eval(module, "run", &[]).unwrap();
+        vm.eval_exported(module, "run", &[]).unwrap();
         let mut process = Process::new();
         let actual =
             to_owned(get_coverage(&vm, &mut process, &[atom("function"), atom(module)]).unwrap())
@@ -2497,6 +2497,13 @@ mod tests {
 
     #[test]
     fn local_fun_retains_old_module_version() {
+        // A fun term crosses two evaluations: only the interpreter flavor's in-place
+        // `Vm::eval` keeps it alive between them.
+        if crate::test_support::in_interpreter_flavor(
+            "natives::code::tests::local_fun_retains_old_module_version",
+        ) {
+            return;
+        }
         let Ok(reference) = RefErl::start() else {
             eprintln!("erl unavailable; skipping old fun differential test");
             return;

@@ -51,7 +51,7 @@ fn vm_call(vm: &mut Vm, function: &str, args: &[OwnedTerm]) -> CallResult {
         .iter()
         .map(|arg| from_owned(arg, &mut heap).expect("test argument"))
         .collect::<Vec<Term>>();
-    match vm.eval("raise_stacktrace_differential", function, &args) {
+    match vm.eval_exported("raise_stacktrace_differential", function, &args) {
         Ok(outcome) => CallResult::Ok(to_owned(outcome.term).expect("test result")),
         Err(error) => CallResult::TransportError(error.to_string()),
     }

@@ -8662,6 +8662,39 @@ impl Vm {
         self.eval_scheduled_reductions(module, function, args, workers, simulation_seed, 4_000)
     }
 
+    /// Executes one exported function in a fresh process of the running flavor: the interpreter
+    /// flavor evaluates it in place ([`Vm::eval`]), the JIT flavor runs it natively under the
+    /// scheduler. The result term lives in a process heap the result retains.
+    pub fn eval_exported(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: &[Term],
+    ) -> Result<crate::EvalResult, VmError> {
+        let direct = arinsal_bifs::lookup(module, function, args.len() as u8).is_some()
+            || crate::natives::static_nif_lookup(module, function, args.len() as u8).is_some()
+            || module == "erlang"
+                && matches!(
+                    (function, args.len()),
+                    ("apply", 2 | 3) | ("make_fun", 3) | ("fun_info", 1 | 2)
+                );
+        if !crate::beamasm_integration::enabled() || direct {
+            return self.eval(module, function, args);
+        }
+        let scheduled = self.eval_scheduled(module, function, args, 1, None)?;
+        let mut process = Process::new();
+        let term = {
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            arinsal_term::from_owned(&scheduled.term, &mut heap)
+                .map_err(|error| VmError::Unsupported(format!("eval result: {error:?}")))?
+        };
+        Ok(crate::EvalResult {
+            term,
+            stats: scheduled.stats,
+            _process: process,
+        })
+    }
+
     /// [`Vm::eval_scheduled`] with an explicit reduction quantum.
     ///
     /// A quantum of 1 yields on `wait` after `loop_rec` has observed an empty

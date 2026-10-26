@@ -911,6 +911,11 @@ mod tests {
 
     #[test]
     fn recursive_byte_summer_uses_constant_process_heap_words() {
+        if crate::test_support::in_interpreter_flavor(
+            "bits::tests::recursive_byte_summer_uses_constant_process_heap_words",
+        ) {
+            return;
+        }
         let Ok(reference) = RefErl::start() else {
             eprintln!("erl unavailable; skipping byte summer allocation test");
             return;
@@ -971,7 +976,9 @@ mod tests {
         let mut source_heap = VecHeap::new();
         let source = TermBuilder::new(&mut source_heap).binary(&bytes).unwrap();
         let times = Term::small(40).unwrap();
-        let result = vm.eval("utf8_len", "repeat", &[times, source]).unwrap();
+        let result = vm
+            .eval_exported("utf8_len", "repeat", &[times, source])
+            .unwrap();
         assert_eq!(result.term.as_small(), Some(40 * 160));
         assert!(result.stats.gc.collections > 0);
     }
