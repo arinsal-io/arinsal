@@ -425,6 +425,12 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erts_internal" && function == "port_close" && arity == 1 {
         return Some(crate::port::port_close_light);
     }
+    if module == "erlang" && function == "port_get_data" && arity == 1 {
+        return Some(crate::port::port_get_data_light);
+    }
+    if module == "erlang" && function == "port_set_data" && arity == 2 {
+        return Some(crate::port::port_set_data_light);
+    }
     if module == "erts_internal" && function == "port_command" && arity == 3 {
         return Some(crate::port::port_command_light);
     }

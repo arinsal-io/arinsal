@@ -3910,6 +3910,7 @@ fn term_to_iovec(
     term_encode(process, args, state, restore_gc, true)
 }
 
+#[inline(always)]
 fn new_term_encoder(args: &[Term]) -> Result<arinsal_bifs::EncodeWalk, BifError> {
     let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
     // `erts_this_node` is read without any lock.

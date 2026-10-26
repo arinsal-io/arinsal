@@ -583,13 +583,13 @@ enum Work {
         start: usize,
     },
     FlatMapPairs {
-        keys: arinsal_maps::FlatMapProjection,
-        values: arinsal_maps::FlatMapProjection,
+        keys: Box<arinsal_maps::FlatMapProjection>,
+        values: Box<arinsal_maps::FlatMapProjection>,
         remaining: usize,
     },
     FlatMapPairValue {
-        keys: arinsal_maps::FlatMapProjection,
-        values: arinsal_maps::FlatMapProjection,
+        keys: Box<arinsal_maps::FlatMapProjection>,
+        values: Box<arinsal_maps::FlatMapProjection>,
         remaining: usize,
         value: Term,
     },
@@ -607,20 +607,20 @@ enum Work {
         entries: MapEntries,
         pairs: Vec<(Term, Term)>,
     },
-    MapSort(MapSort),
+    MapSort(Box<MapSort>),
 }
 
 struct MapEntries {
     size: usize,
-    entries: MapEntryIter,
+    entries: Box<MapEntryIter>,
 }
 
 // Keeping the reverse iterator inline avoids one heap allocation per map.
 #[allow(clippy::large_enum_variant)]
 enum MapEntryIter {
     Flat {
-        keys: arinsal_maps::FlatMapProjection,
-        values: arinsal_maps::FlatMapProjection,
+        keys: Box<arinsal_maps::FlatMapProjection>,
+        values: Box<arinsal_maps::FlatMapProjection>,
     },
     Hash(arinsal_term::MapReverseIter),
 }
@@ -632,14 +632,17 @@ impl MapEntries {
         let size = checked.size();
         let entries = match checked.kind() {
             arinsal_maps::CheckedMapKind::Flatmap(flat) => MapEntryIter::Flat {
-                keys: arinsal_maps::flatmap_projection(flat, true),
-                values: arinsal_maps::flatmap_projection(flat, false),
+                keys: Box::new(arinsal_maps::flatmap_projection(flat, true)),
+                values: Box::new(arinsal_maps::flatmap_projection(flat, false)),
             },
             arinsal_maps::CheckedMapKind::Hashmap(_) => {
                 MapEntryIter::Hash(arinsal_term::MapReverseIter::new(map).ok_or(BifError::BADARG)?)
             }
         };
-        Ok(Self { size, entries })
+        Ok(Self {
+            size,
+            entries: Box::new(entries),
+        })
     }
 }
 
@@ -648,7 +651,7 @@ impl Iterator for MapEntries {
 
     // Port of erts/emulator/beam/external.c:3745-3822 (MAP_DEF), OTP-29.1.1.
     fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.entries {
+        match &mut *self.entries {
             MapEntryIter::Flat { keys, values } => Some((keys.next()?, values.next()?)),
             MapEntryIter::Hash(iter) => iter.next(),
         }
@@ -737,7 +740,7 @@ impl MapSort {
     }
 }
 
-fn push_map_terms(work: &mut SmallVec<[Work; 4]>, pairs: Vec<(Term, Term)>) {
+fn push_map_terms(work: &mut SmallVec<[Work; 2]>, pairs: Vec<(Term, Term)>) {
     work.push(Work::MapPairs(pairs.into_iter()));
 }
 
@@ -747,10 +750,10 @@ type EncodedWithSplits = (Vec<u8>, Vec<(usize, usize)>);
 pub struct EncodeWalk {
     opts: EncodeOpts,
     out: SmallVec<[u8; 64]>,
-    splits: SmallVec<[(usize, usize); 4]>,
-    work: SmallVec<[Work; 4]>,
+    splits: SmallVec<[(usize, usize); 1]>,
+    work: SmallVec<[Work; 2]>,
     current_term: Option<Term>,
-    size_work: SmallVec<[SizeItem; 4]>,
+    size_work: SmallVec<[SizeItem; 2]>,
     size_current: Option<Term>,
     encoded_size: usize,
     written: usize,
@@ -776,13 +779,13 @@ enum SizeItem {
     },
     Tail(Term),
     FlatMapPairs {
-        keys: arinsal_maps::FlatMapProjection,
-        values: arinsal_maps::FlatMapProjection,
+        keys: Box<arinsal_maps::FlatMapProjection>,
+        values: Box<arinsal_maps::FlatMapProjection>,
         remaining: usize,
     },
     FlatMapPairValue {
-        keys: arinsal_maps::FlatMapProjection,
-        values: arinsal_maps::FlatMapProjection,
+        keys: Box<arinsal_maps::FlatMapProjection>,
+        values: Box<arinsal_maps::FlatMapProjection>,
         remaining: usize,
         value: Term,
     },
@@ -817,6 +820,7 @@ impl EncodeWalk {
     }
 
     /// Begin encoding a `term_to_binary/1,2` argument vector.
+    #[inline]
     pub fn new(args: &[Term]) -> Result<Self, BifError> {
         let opts = options(args.get(1).copied())?;
         Ok(Self::start(args[0], opts))
@@ -1035,7 +1039,7 @@ impl EncodeWalk {
                     let size = entries.size;
                     self.add_size(5)?;
                     if size > 0 {
-                        match entries.entries {
+                        match *entries.entries {
                             MapEntryIter::Flat { keys, values } => {
                                 self.size_work.push(SizeItem::FlatMapPairs {
                                     keys,
@@ -1044,8 +1048,10 @@ impl EncodeWalk {
                                 });
                             }
                             entries @ MapEntryIter::Hash(_) => {
-                                self.size_work
-                                    .push(SizeItem::Map(MapEntries { size, entries }));
+                                self.size_work.push(SizeItem::Map(MapEntries {
+                                    size,
+                                    entries: Box::new(entries),
+                                }));
                             }
                         }
                     }
@@ -1483,7 +1489,7 @@ impl EncodeWalk {
                         pairs.push(pair);
                         work.push(Work::MapGather { entries, pairs });
                     } else if opts.deterministic {
-                        work.push(Work::MapSort(MapSort::new(pairs)));
+                        work.push(Work::MapSort(Box::new(MapSort::new(pairs))));
                     } else {
                         push_map_terms(work, pairs);
                     }
@@ -1620,7 +1626,7 @@ impl EncodeWalk {
                             pairs: Vec::with_capacity(len),
                         });
                     } else {
-                        match entries.entries {
+                        match *entries.entries {
                             MapEntryIter::Flat {
                                 mut keys,
                                 mut values,
@@ -1638,7 +1644,10 @@ impl EncodeWalk {
                                 }
                             }
                             entries @ MapEntryIter::Hash(_) => {
-                                work.push(Work::MapEntries(MapEntries { size: len, entries }));
+                                work.push(Work::MapEntries(MapEntries {
+                                    size: len,
+                                    entries: Box::new(entries),
+                                }));
                             }
                         }
                     }
@@ -3382,6 +3391,24 @@ fn decode_size_error(_: arinsal_etf::DecodeError) -> BifError {
 
 #[cfg(test)]
 mod map_sort_tests {
+    #[test]
+    fn reports_encode_walk_layout() {
+        use super::*;
+        eprintln!(
+            "EncodeWalk={} Work={} SizeItem={} BlockHashWalk={} EncodeOpts={} Compress={} out={} splits={} work={} size_work={}",
+            std::mem::size_of::<EncodeWalk>(),
+            std::mem::size_of::<Work>(),
+            std::mem::size_of::<SizeItem>(),
+            std::mem::size_of::<BlockHashWalk>(),
+            std::mem::size_of::<EncodeOpts>(),
+            std::mem::size_of::<Option<Compress>>(),
+            std::mem::size_of::<SmallVec<[u8; 64]>>(),
+            std::mem::size_of::<SmallVec<[(usize, usize); 1]>>(),
+            std::mem::size_of::<SmallVec<[Work; 2]>>(),
+            std::mem::size_of::<SmallVec<[SizeItem; 2]>>(),
+        );
+    }
+
     use super::MapSort;
     use arinsal_term::Term;
 
