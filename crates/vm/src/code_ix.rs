@@ -631,9 +631,9 @@ impl CodeIndexes {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         let functions = Arc::make_mut(&mut table);
-        for instruction in &module.code {
-            if let arinsal_loader::Instr::NativeBody { index } = instruction
-                && let Some(function) = functions.get_mut(*index as usize)
+        for ordinal in 0..module.nif_bodies.len() {
+            if let Some(index) = module.nif_body(ordinal)
+                && let Some(function) = functions.get_mut(index as usize)
             {
                 *function = None;
             }

@@ -493,13 +493,8 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                     key.strip_prefix(&module.name)
                         .is_some_and(|tail| tail.starts_with('#'))
                 });
-                for (entry, function, arity) in module.functions.iter().rev() {
-                    if loaded
-                        && matches!(
-                            module.code.get(entry.saturating_add(1)),
-                            Some(arinsal_loader::Instr::NativeBody { .. })
-                        )
-                    {
+                for (ordinal, (_, function, arity)) in module.functions.iter().enumerate().rev() {
+                    if loaded && module.nif_body(ordinal).is_some() {
                         nifs.push(make_tuple(
                             process,
                             &[atom(function), Term::small(i64::from(*arity)).unwrap()],

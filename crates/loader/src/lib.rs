@@ -7,7 +7,7 @@ use arinsal_term::{Atom, Term, TermBuilder, VecHeap, from_owned, global_atoms};
 use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 mod specialize;
 // ---- vm_maps_bits ----
@@ -440,6 +440,12 @@ pub struct Module {
     /// `None` when the module has no `nif_start` at all, in which case any function may.
     // Port of erts `BeamCodeHeader.are_nifs` (erts/emulator/beam/beam_code.h:127), OTP-29.1.1.
     pub nif_stubs: Option<Vec<(String, u8)>>,
+    /// The NIF body bound to each function of `functions` (an index into the node's native
+    /// function table), or [`NO_NIF_BODY`]. Written by the loader for static NIFs and by
+    /// `load_nif`; `Instr::NativeBody` mirrors it for the interpreter flavor.
+    // Port of erts/emulator/beam/erl_nif.c (the call_nif code `load_nif_1st_finisher` patches
+    // behind a NIF function's prologue), OTP-29.1.1.
+    pub nif_bodies: Box<[AtomicU32]>,
     /// Owning function for `JitHook::on_entry`, or `u32::MAX` when none applies.
     ///
     /// Slot `ip` holds the last function whose `func_info` offset is strictly
@@ -479,6 +485,13 @@ pub struct Module {
     /// of the module refers to these same terms, like erts' single literal area per module.
     literal_terms: Arc<HashMap<u32, Term>>,
 }
+/// The value of a [`Module::nif_bodies`] slot with no NIF body.
+pub const NO_NIF_BODY: u32 = u32::MAX;
+
+fn unbound_nif_bodies(count: usize) -> Box<[AtomicU32]> {
+    (0..count).map(|_| AtomicU32::new(NO_NIF_BODY)).collect()
+}
+
 impl Clone for Module {
     fn clone(&self) -> Self {
         Self {
@@ -505,6 +518,11 @@ impl Clone for Module {
             functions: self.functions.clone(),
             function_atoms: self.function_atoms.clone(),
             nif_stubs: self.nif_stubs.clone(),
+            nif_bodies: self
+                .nif_bodies
+                .iter()
+                .map(|body| AtomicU32::new(body.load(Ordering::Acquire)))
+                .collect(),
             on_entry_fn: self.on_entry_fn.clone(),
             entry_arity: self.entry_arity.clone(),
             breakpoint_originals: self.breakpoint_originals.clone(),
@@ -722,6 +740,7 @@ impl Module {
         self.functions = Vec::new();
         self.function_atoms = Vec::new();
         self.nif_stubs = None;
+        self.nif_bodies = Box::new([]);
         self.on_entry_fn = Box::new([]);
         self.entry_arity = Box::new([]);
         self.breakpoint_originals = HashMap::new();
@@ -856,6 +875,24 @@ impl Module {
             .rev()
             .find(|(start, _, _)| *start <= ip)
             .map(|(_, name, arity)| (name.as_str(), *arity))
+    }
+    /// The ordinal in `functions` of the function whose entry is code offset `entry`.
+    pub fn function_by_entry(&self, entry: usize) -> Option<usize> {
+        let index = self
+            .functions
+            .partition_point(|(start, _, _)| start.saturating_add(1) < entry);
+        (self.functions.get(index)?.0.saturating_add(1) == entry).then_some(index)
+    }
+    /// The NIF body bound to function `ordinal`, if any.
+    pub fn nif_body(&self, ordinal: usize) -> Option<u32> {
+        let body = self.nif_bodies.get(ordinal)?.load(Ordering::Acquire);
+        (body != NO_NIF_BODY).then_some(body)
+    }
+    /// Binds NIF body `index` to function `ordinal`.
+    pub fn set_nif_body(&self, ordinal: usize, index: u32) {
+        if let Some(slot) = self.nif_bodies.get(ordinal) {
+            slot.store(index, Ordering::Release);
+        }
     }
     /// Atom and arity of the function containing a code offset.
     pub fn function_atom_at(&self, ip: usize) -> Option<(Atom, u8)> {
@@ -1768,6 +1805,7 @@ pub fn load_with_options(
     // Port of erts/emulator/beam/beam_file.c:1100-1310 (parse_record_chunk): the definition
     // and default values of every record live in the module's literal area.
     let record_defs = build_record_defs(file, name_atom, &mut literals)?;
+    let function_count = functions.len();
     Ok(Module {
         name: file.module.clone(),
         name_atom,
@@ -1793,6 +1831,7 @@ pub fn load_with_options(
         functions,
         function_atoms,
         nif_stubs,
+        nif_bodies: unbound_nif_bodies(function_count),
         on_entry_fn,
         entry_arity,
         breakpoint_originals,
@@ -1932,6 +1971,7 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
         export.bind_code(code.as_ptr(), code.len());
     }
     let record_defs = build_record_defs(file, name_atom, &mut literals)?;
+    let function_count = functions.len();
     Ok(Module {
         name: file.module.clone(),
         name_atom,
@@ -1956,6 +1996,7 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
         functions,
         function_atoms,
         nif_stubs,
+        nif_bodies: unbound_nif_bodies(function_count),
         on_entry_fn: on_entry_fn.into_boxed_slice(),
         entry_arity: entry_arity.into_boxed_slice(),
         breakpoint_originals: HashMap::new(),
