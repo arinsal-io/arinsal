@@ -281,3 +281,32 @@ fn flag_family_rejections_match_erl() {
         }
     }
 }
+
+/// `-emu_flavor emu` selects the interpreter flavor of this one-binary runtime; the default
+/// flavor stays the JIT, and an unknown flavor is rejected as `erlexec` does.
+#[test]
+fn emu_flavor_emu_selects_the_interpreter() {
+    if !erl_available() {
+        eprintln!("skipping emu_flavor_emu_selects_the_interpreter: erl is unavailable");
+        return;
+    }
+    let env = setup_env();
+    let launch = |flags: &[&str]| {
+        let mut argv = vec!["erl".to_owned()];
+        argv.extend(flags.iter().map(|flag| (*flag).to_owned()));
+        parse(&argv, &env)
+    };
+    assert!(
+        launch(&["-noshell", "-emu_flavor", "emu"])
+            .expect("emu flavor")
+            .emulator
+            .interpreter
+    );
+    assert!(
+        !launch(&["-noshell"])
+            .expect("default flavor")
+            .emulator
+            .interpreter
+    );
+    assert!(launch(&["-emu_flavor", "nosuch"]).is_err());
+}
