@@ -19,7 +19,7 @@ fn direct_bif_raise_preserves_class_and_reason() {
             ]),
         ),
     ] {
-        let Err(VmError::Raised(raised)) = vm.eval("erlang", function, &[value]) else {
+        let Err(VmError::Raised(raised)) = vm.eval_exported("erlang", function, &[value]) else {
             panic!("{function}/1 did not raise a structured exception");
         };
         assert_eq!(format!("{:?}", raised.class), class);
@@ -33,7 +33,7 @@ fn vm_call(vm: &mut Vm, function: &str, args: &[OwnedTerm], module: &str) -> Cal
         .iter()
         .map(|arg| from_owned(arg, &mut heap).expect("test argument"))
         .collect::<Vec<_>>();
-    match vm.eval(module, function, &inputs) {
+    match vm.eval_exported(module, function, &inputs) {
         Ok(outcome) => CallResult::Ok(to_owned(outcome.term).expect("test result")),
         Err(VmError::Raised(raised)) => CallResult::Exception {
             class: format!("{:?}", raised.class).to_lowercase(),

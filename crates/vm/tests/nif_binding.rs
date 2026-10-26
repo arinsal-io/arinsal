@@ -16,7 +16,7 @@ fn prim_file_local_nif_entry_reads_existing_file() {
     let mut heap = VecHeap::new();
     let mut vm = Vm::new([]);
     let result = vm
-        .eval("prim_file", "read_file", &[term(&path_term, &mut heap)])
+        .eval_exported("prim_file", "read_file", &[term(&path_term, &mut heap)])
         .expect("prim_file:read_file/1");
     assert_eq!(
         to_owned(result.term).unwrap(),
@@ -40,7 +40,7 @@ fn prim_file_missing_file_matches_erts() {
     let mut heap = VecHeap::new();
     let mut vm = Vm::new([]);
     let actual = vm
-        .eval("prim_file", "read_file", &[term(&path_term, &mut heap)])
+        .eval_exported("prim_file", "read_file", &[term(&path_term, &mut heap)])
         .expect("prim_file:read_file/1");
     let arinsal_difftest::CallResult::Ok(expected) = expected else {
         panic!("reference prim_file:read_file/1 failed: {expected:?}");
@@ -68,7 +68,7 @@ fn iolist_to_iovec_matches_erts() {
         let expected = reference.call("erlang", "iolist_to_iovec", std::slice::from_ref(&input));
         let mut heap = VecHeap::new();
         let actual = vm
-            .eval("erlang", "iolist_to_iovec", &[term(&input, &mut heap)])
+            .eval_exported("erlang", "iolist_to_iovec", &[term(&input, &mut heap)])
             .expect("iolist_to_iovec/1");
         let arinsal_difftest::CallResult::Ok(expected) = expected else {
             panic!("reference iolist_to_iovec/1 failed: {expected:?}");

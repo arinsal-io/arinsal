@@ -35,7 +35,7 @@ fn atom_key_single_exact_updates_match_otp() {
     let input = OwnedTerm::Int(100_000);
     let expected = reference.call(MODULE, "run", std::slice::from_ref(&input));
     let actual = vm
-        .eval(MODULE, "run", &[Term::small(100_000).unwrap()])
+        .eval_exported(MODULE, "run", &[Term::small(100_000).unwrap()])
         .map(|outcome| arinsal_term::to_owned(outcome.term).unwrap());
 
     match (expected, actual) {
@@ -48,7 +48,7 @@ fn atom_key_single_exact_updates_match_otp() {
         let size_arg = OwnedTerm::Int(size);
         let expected = reference.call(MODULE, "run_size", &[iterations.clone(), size_arg]);
         let actual = vm
-            .eval(
+            .eval_exported(
                 MODULE,
                 "run_size",
                 &[Term::small(100).unwrap(), Term::small(size).unwrap()],
@@ -63,7 +63,7 @@ fn atom_key_single_exact_updates_match_otp() {
     }
 
     let expected = reference.call(MODULE, "missing", &[]);
-    let actual = vm.eval(MODULE, "missing", &[]);
+    let actual = vm.eval_exported(MODULE, "missing", &[]);
     let CallResult::Exception { reason, .. } = expected else {
         panic!("missing-key update unexpectedly succeeded in OTP: {expected:?}");
     };

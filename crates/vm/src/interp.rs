@@ -1591,14 +1591,18 @@ fn trace_breakpoint_call(
 }
 
 impl Vm {
-    /// Execute one exported function in a fresh process.
+    /// Execute one exported function in a fresh process, in the interpreter. The JIT flavor
+    /// has no interpreter: it evaluates only BIFs and the `erlang` fun builtins here, and
+    /// [`Vm::eval_exported`] runs the rest natively.
     pub fn eval(
         &mut self,
         module: &str,
         function: &str,
         args: &[Term],
     ) -> Result<EvalResult, VmError> {
-        crate::load::INTERPRETER_EVAL.store(true, std::sync::atomic::Ordering::Relaxed);
+        if !crate::beamasm_integration::enabled() {
+            crate::load::INTERPRETER_EVAL.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         // ---- vm_funs ----
         if module == "erlang"
             && let Some(result) = self.eval_erlang_fun_builtin(function, args)
@@ -1637,6 +1641,11 @@ impl Vm {
         }
         if arinsal_spec::bif_lookup(module, function, args.len() as u8).is_some() {
             return Err(VmError::Unsupported(format!("BIF {frame}")));
+        }
+        if crate::beamasm_integration::enabled() {
+            return Err(VmError::Unsupported(format!(
+                "Vm::eval cannot run {frame} in the JIT flavor; use Vm::eval_exported, or start the interpreter flavor (-emu_flavor emu)"
+            )));
         }
         let module_id = self.load_named(module)?;
         let ip = self.code.modules[module_id]

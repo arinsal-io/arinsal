@@ -355,11 +355,11 @@ fn closures_and_dynamic_calls_match_otp() {
         let CallResult::Exception { reason, .. } = expected else {
             panic!("expected badfun from erl: {expected:?}");
         };
-        let actual = vm.eval("vm_funs_cases", "bad_fun", &[Term::small(value).unwrap()]);
+        let actual = vm.eval_exported("vm_funs_cases", "bad_fun", &[Term::small(value).unwrap()]);
         let actual = vm_reason(actual).expect("expected badfun from VM");
         assert_eq!(actual, pretty(&reason));
     }
-    let actual = vm.eval("vm_funs_cases", "bad_arity", &[Term::small(4).unwrap()]);
+    let actual = vm.eval_exported("vm_funs_cases", "bad_arity", &[Term::small(4).unwrap()]);
     let reason = vm_reason(actual).expect("expected badarity from VM");
     assert!(reason.starts_with("{badarity,{"), "{reason}");
     assert!(reason.contains("[4]"), "{reason}");
@@ -372,7 +372,7 @@ fn closures_and_dynamic_calls_match_otp() {
         let CallResult::Exception { reason, .. } = expected else {
             panic!("expected badarity from erl: {expected:?}");
         };
-        let actual = vm.eval(
+        let actual = vm.eval_exported(
             "vm_funs_cases",
             "bad_arity_export",
             &[Term::small(value).unwrap()],
@@ -380,7 +380,7 @@ fn closures_and_dynamic_calls_match_otp() {
         let actual = vm_reason(actual).expect("expected badarity from VM");
         assert_eq!(actual, pretty(&reason));
     }
-    let direct = vm.eval("erlang", "apply", &[Term::small(7).unwrap(), Term::NIL]);
+    let direct = vm.eval_exported("erlang", "apply", &[Term::small(7).unwrap(), Term::NIL]);
     let reason = vm_reason(direct).expect("expected direct erlang:apply/2 badfun");
     assert_eq!(reason, "{badfun,7}");
 }

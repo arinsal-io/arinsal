@@ -91,7 +91,7 @@ fn benchmark_kernels_match_otp_small_cases() {
         );
         let expected = String::from_utf8(otp.stdout).unwrap();
         let result = vm
-            .eval("bench", function, &[Term::small(n).unwrap()])
+            .eval_exported("bench", function, &[Term::small(n).unwrap()])
             .unwrap();
         let actual = if let Some(n) = result.term.as_small() {
             n.to_string()
@@ -166,7 +166,7 @@ fn select_tables_match_otp() {
                 .unwrap();
             assert!(otp.status.success());
             let actual = vm
-                .eval("select_fast", function, &[Term::small(n).unwrap()])
+                .eval_exported("select_fast", function, &[Term::small(n).unwrap()])
                 .unwrap();
             assert_eq!(
                 actual.term.to_string(),
@@ -214,7 +214,7 @@ fn continuations_survive_stack_collection() {
     assert!(otp.status.success());
     let mut vm = Vm::new([dir.clone()]);
     let result = vm
-        .eval("stack_gc", "f", &[Term::small(1000).unwrap()])
+        .eval_exported("stack_gc", "f", &[Term::small(1000).unwrap()])
         .unwrap();
     assert_eq!(
         result.term.to_string(),

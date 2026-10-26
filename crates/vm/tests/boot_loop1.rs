@@ -18,7 +18,7 @@ fn re_native_binding_matches_otp() {
     let expected = reference.call("boot_loop1_re", "run", &[]);
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
-    let actual = vm.eval("boot_loop1_re", "run", &[]).unwrap();
+    let actual = vm.eval_exported("boot_loop1_re", "run", &[]).unwrap();
     assert_eq!(expected, CallResult::Ok(to_owned(actual.term).unwrap()));
 }
 
@@ -137,7 +137,7 @@ fn tuple_arity_selection_matches_otp() {
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
         let actual = vm
-            .eval("boot_loop1_select", "choose", &[arg])
+            .eval_exported("boot_loop1_select", "choose", &[arg])
             .map(|result| to_owned(result.term).unwrap());
         match (expected, actual) {
             (CallResult::Ok(expected), Ok(actual)) => assert_eq!(actual, expected),
@@ -166,7 +166,7 @@ fn is_pid_instruction_matches_otp() {
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
         let actual = vm
-            .eval("boot_loop1_pid", "choose", &[arg])
+            .eval_exported("boot_loop1_pid", "choose", &[arg])
             .map(|result| to_owned(result.term).unwrap());
         match (expected, actual) {
             (CallResult::Ok(expected), Ok(actual)) => assert_eq!(actual, expected),
@@ -217,7 +217,7 @@ fn update_record_instruction_matches_otp() {
             from_owned(&value, &mut heap).unwrap(),
         ];
         let actual = vm
-            .eval("boot_loop1_record", "change", &args)
+            .eval_exported("boot_loop1_record", "change", &args)
             .map(|result| to_owned(result.term).unwrap());
         match (expected, actual) {
             (CallResult::Ok(expected), Ok(actual)) => assert_eq!(actual, expected),
@@ -383,7 +383,7 @@ fn is_boolean_instruction_matches_otp() {
         let mut heap = VecHeap::new();
         let arg = from_owned(&input, &mut heap).unwrap();
         let actual = vm
-            .eval("boot_loop1_boolean", "choose", &[arg])
+            .eval_exported("boot_loop1_boolean", "choose", &[arg])
             .map(|result| to_owned(result.term).unwrap());
         match (expected, actual) {
             (CallResult::Ok(expected), Ok(actual)) => assert_eq!(actual, expected),

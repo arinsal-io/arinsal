@@ -71,6 +71,8 @@ pub use natives::implemented_natives;
 #[doc(hidden)]
 pub use natives::tty::registered_callers as tty_registered_callers;
 mod stacktrace;
+#[cfg(test)]
+mod test_support;
 mod tuples;
 
 use arinsal_beam::BeamFile;
