@@ -1080,15 +1080,7 @@ pub fn load_with_options(
     // Port of erts/emulator/beam/beam_file.c:1373 (parse_decompressed_literals),
     // OTP-29.1.1: the literal chunk is decoded in index order right after the
     // atom chunk, so atoms first seen in literals get erts' table indices.
-    let mut literals = VecHeap::new_literal();
-    let mut literal_terms = HashMap::new();
-    for index in 0..file.literals.len() {
-        let Ok(owned) = file.literal(index as u32) else {
-            continue;
-        };
-        let term = from_owned(&owned, &mut literals).map_err(|_| LoadError::Limit)?;
-        literal_terms.insert(index as u32, term);
-    }
+    let (mut literals, mut literal_terms) = decode_literals(file)?;
     // Port of erts/emulator/beam/jit/asm_load.c:79-95, OTP-29.1.1.
     let coverage_mode = match (file.lines.as_ref(), requested_mode) {
         (Some(lines), _) if lines.flags & 2 != 0 => CoverageMode::LineCounters,
@@ -1262,74 +1254,7 @@ pub fn load_with_options(
     }
     // ---- vm_funs ----
     let funs = funs::load_funs(file, &labels)?;
-    let mut imports = file
-        .imports
-        .iter()
-        .map(|item| {
-            let module = file
-                .atom(item.module_atom)
-                .ok_or(LoadError::Index("atom", item.module_atom))?
-                .to_owned();
-            let function = file
-                .atom(item.function_atom)
-                .ok_or(LoadError::Index("atom", item.function_atom))?
-                .to_owned();
-            Ok(Import {
-                bif: arinsal_bifs::lookup(&module, &function, item.arity as u8),
-                module_atom: global_atoms()
-                    .get(&module)
-                    .ok_or_else(|| LoadError::Atom(module.clone()))?,
-                function_atom: global_atoms()
-                    .get(&function)
-                    .ok_or_else(|| LoadError::Atom(function.clone()))?,
-                fast: match (module.as_str(), function.as_str(), item.arity) {
-                    ("erlang", "+", 2) => FastBif::Add,
-                    ("erlang", "-", 2) => FastBif::Sub,
-                    ("erlang", "*", 2) => FastBif::Mul,
-                    ("erlang", "band", 2) => FastBif::Band,
-                    ("erlang", "bor", 2) => FastBif::Bor,
-                    ("erlang", "bxor", 2) => FastBif::Bxor,
-                    ("erlang", "bsl", 2) => FastBif::Bsl,
-                    ("erlang", "bsr", 2) => FastBif::Bsr,
-                    _ => FastBif::None,
-                },
-                fast_op: match (module.as_str(), function.as_str(), item.arity) {
-                    ("erlang", "element", 2) => ImportFastOp::Element,
-                    ("erlang", "setelement", 3) => ImportFastOp::SetElement,
-                    ("erlang", "rem", 2) => ImportFastOp::Rem,
-                    ("erlang", "is_integer", 1) => ImportFastOp::IsInteger,
-                    ("erlang", "is_float", 1) => ImportFastOp::IsFloat,
-                    ("erlang", "is_number", 1) => ImportFastOp::IsNumber,
-                    ("erlang", "is_atom", 1) => ImportFastOp::IsAtom,
-                    ("erlang", "is_tuple", 1) => ImportFastOp::IsTuple,
-                    ("erlang", "is_list", 1) => ImportFastOp::IsList,
-                    ("erlang", "is_map", 1) => ImportFastOp::IsMap,
-                    ("erlang", "is_function", 1) => ImportFastOp::IsFunction,
-                    ("erlang", "tuple_size", 1) => ImportFastOp::TupleSize,
-                    ("erlang", "<", 2) => ImportFastOp::Less,
-                    ("erlang", "=<", 2) => ImportFastOp::LessEqual,
-                    ("erlang", ">", 2) => ImportFastOp::Greater,
-                    ("erlang", ">=", 2) => ImportFastOp::GreaterEqual,
-                    ("erlang", "==", 2) => ImportFastOp::Equal,
-                    ("erlang", "/=", 2) => ImportFastOp::NotEqual,
-                    ("erlang", "=:=", 2) => ImportFastOp::ExactEqual,
-                    ("erlang", "=/=", 2) => ImportFastOp::ExactNotEqual,
-                    _ => ImportFastOp::None,
-                },
-                module,
-                function,
-                arity: item.arity as u8,
-                class: AtomicU8::new(ImportClass::Fresh as u8),
-                native: AtomicUsize::new(0),
-                extra_bif: AtomicUsize::new(0),
-                export: AtomicPtr::new(std::ptr::null_mut()),
-                target_module: AtomicUsize::new(0),
-                resolved_epoch: AtomicU64::new(0),
-                resolved_target: AtomicUsize::new(0),
-                resolved_code: AtomicPtr::new(std::ptr::null_mut()),
-            })
-        })
-        .collect::<Result<Vec<_>, LoadError>>()?;
+    let mut imports = build_imports(file)?;
     let has_debug_line = debugger_lines
         && file
             .code
@@ -1364,59 +1289,8 @@ pub fn load_with_options(
     } else {
         None
     };
-    let debug_breakpoint_import = u32::try_from(imports.len()).map_err(|_| LoadError::Limit)?;
-    imports.push(Import {
-        bif: None,
-        fast: FastBif::None,
-        fast_op: ImportFastOp::None,
-        module: "error_handler".into(),
-        function: "breakpoint".into(),
-        module_atom: global_atoms()
-            .intern("error_handler")
-            .map_err(|_| LoadError::Atom("error_handler".into()))?,
-        function_atom: global_atoms()
-            .intern("breakpoint")
-            .map_err(|_| LoadError::Atom("breakpoint".into()))?,
-        arity: 3,
-        class: AtomicU8::new(ImportClass::Fresh as u8),
-        native: AtomicUsize::new(0),
-        extra_bif: AtomicUsize::new(0),
-        export: AtomicPtr::new(std::ptr::null_mut()),
-        target_module: AtomicUsize::new(0),
-        resolved_epoch: AtomicU64::new(0),
-        resolved_target: AtomicUsize::new(0),
-        resolved_code: AtomicPtr::new(std::ptr::null_mut()),
-    });
-    let exports = file
-        .exports
-        .iter()
-        .map(|item| {
-            let function = file
-                .atom(item.function_atom)
-                .ok_or(LoadError::Index("atom", item.function_atom))?
-                .to_owned();
-            let target = *labels
-                .get(&item.label)
-                .ok_or(LoadError::Index("label", item.label))?;
-            let module_atom = global_atoms()
-                .intern(&file.module)
-                .map_err(|_| LoadError::Atom(file.module.clone()))?;
-            let function_atom = global_atoms()
-                .intern(&function)
-                .map_err(|_| LoadError::Atom(function.clone()))?;
-            Ok(Arc::new(ExportSlot {
-                module: file.module.clone(),
-                function,
-                arity: item.arity as u8,
-                module_atom,
-                function_atom,
-                target_index: AtomicUsize::new(target),
-                code_len: AtomicUsize::new(0),
-                code_base: AtomicPtr::new(std::ptr::null_mut()),
-                target: AtomicPtr::new(std::ptr::null_mut()),
-            }))
-        })
-        .collect::<Result<Vec<_>, LoadError>>()?;
+    let debug_breakpoint_import = push_breakpoint_import(&mut imports)?;
+    let exports = build_exports(file, &labels)?;
     let export_atoms = exports
         .iter()
         .enumerate()
@@ -1893,26 +1767,7 @@ pub fn load_with_options(
     }
     // Port of erts/emulator/beam/beam_file.c:1100-1310 (parse_record_chunk): the definition
     // and default values of every record live in the module's literal area.
-    let mut record_defs = Vec::with_capacity(file.records.len());
-    for record in &file.records {
-        let name = global_atoms()
-            .intern(&record.name)
-            .map_err(|_| LoadError::Limit)?;
-        let mut fields = Vec::with_capacity(record.fields.len());
-        for (field, default) in &record.fields {
-            let field = global_atoms().intern(field).map_err(|_| LoadError::Limit)?;
-            let default = default
-                .as_ref()
-                .map(|default| from_owned(default, &mut literals))
-                .transpose()
-                .map_err(|_| LoadError::Limit)?;
-            fields.push((field, default));
-        }
-        let cons = TermBuilder::new(&mut literals)
-            .native_record_literal(name_atom, name, record.is_exported, &fields)
-            .map_err(|_| LoadError::Limit)?;
-        record_defs.push(cons);
-    }
+    let record_defs = build_record_defs(file, name_atom, &mut literals)?;
     Ok(Module {
         name: file.module.clone(),
         name_atom,
@@ -1957,6 +1812,348 @@ pub fn load_with_options(
         _literals: LiteralArea::new(literals),
         literal_terms: Arc::new(literal_terms),
     })
+}
+
+/// The module of a function-only form, for code that runs natively: all its tables (functions,
+/// exports, imports, lines, literals, NIF stubs), taken from the chunk tables and the code
+/// summary, with two placeholder instructions per function (its `func_info` and its entry) in
+/// place of its instructions, which the loader never decodes. erts has no other form of a
+/// module: its code goes from `beamfile_read` through the transform engine to the emitter.
+pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
+    // Port of erts/emulator/beam/beam_file.c:242-291, OTP-29.1.1.
+    for atom in &file.atoms {
+        global_atoms()
+            .intern(atom)
+            .map_err(|_| LoadError::Atom(atom.clone()))?;
+    }
+    let name_atom = global_atoms()
+        .get(&file.module)
+        .ok_or_else(|| LoadError::Atom(file.module.clone()))?;
+    let (mut literals, literal_terms) = decode_literals(file)?;
+    let summary = &file.summary.functions;
+    let mut labels = HashMap::with_capacity(summary.len());
+    let mut functions = Vec::with_capacity(summary.len());
+    let mut function_atoms = Vec::with_capacity(summary.len());
+    let mut nif_stubs: Option<Vec<(String, u8)>> = None;
+    let mut code = Vec::with_capacity(2 * summary.len() + 4);
+    for function in summary {
+        let name = file
+            .atom(function.function_atom)
+            .ok_or(LoadError::Index("atom", function.function_atom))?;
+        let atom = global_atoms()
+            .intern(name)
+            .map_err(|_| LoadError::Atom(name.into()))?;
+        let arity = u8::try_from(function.arity).map_err(|_| LoadError::Limit)?;
+        functions.push((code.len(), name.to_owned(), arity));
+        function_atoms.push(atom);
+        if function.nif_stub {
+            nif_stubs
+                .get_or_insert_with(Vec::new)
+                .push((name.to_owned(), arity));
+        }
+        // The entry label is the label after the `func_info`: it names the instruction after
+        // the function's `func_info` slot.
+        labels.insert(function.entry_label, code.len() + 1);
+        code.push(Instr::CodeEnd);
+        code.push(Instr::CodeEnd);
+    }
+    if code.len() > u32::MAX as usize {
+        return Err(LoadError::Limit);
+    }
+    let funs = funs::load_funs(file, &labels)?;
+    let mut imports = build_imports(file)?;
+    let debug_breakpoint_import = push_breakpoint_import(&mut imports)?;
+    let exports = build_exports(file, &labels)?;
+    let export_atoms = exports
+        .iter()
+        .enumerate()
+        .map(|(index, export)| ((export.function_atom, export.arity), index))
+        .collect();
+    // A trailing sentinel, and the continuations tracing uses.
+    code.push(Instr::CodeEnd);
+    let return_trace_ip = code.len();
+    code.push(Instr::ReturnTrace);
+    let return_call_acc_trace_ip = code.len();
+    code.push(Instr::ReturnCallAccTrace);
+    let return_to_trace_ip = code.len();
+    code.push(Instr::ReturnToTrace);
+    let export_entry_targets = exports
+        .iter()
+        .map(|export| export.target())
+        .collect::<Vec<_>>();
+    let export_breakpoint_base = code.len();
+    for index in 0..exports.len() {
+        code.push(Instr::ExportBreakpoint {
+            index: u32::try_from(index).map_err(|_| LoadError::Limit)?,
+        });
+    }
+    // The file names of the line table, as the terms stack traces carry.
+    let mut line_file_terms = HashMap::new();
+    if let Some(table) = &file.lines {
+        let default = format!("{}.erl", file.module);
+        let names = std::iter::once(default.as_str()).chain(
+            table
+                .names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !name.is_empty()),
+        );
+        for name in names {
+            if !line_file_terms.contains_key(name) {
+                let term = TermBuilder::new(&mut literals)
+                    .string_to_list(name)
+                    .map_err(|_| LoadError::Limit)?;
+                line_file_terms.insert(name.to_owned(), term);
+            }
+        }
+    }
+    let types = vec![Vec::new(); code.len()];
+    let lines = LineRuns::from_slots(std::iter::repeat_n(None, code.len()));
+    let line_terms = LineRuns::from_slots(std::iter::repeat_n(None, code.len()));
+    let mut on_entry_fn = vec![u32::MAX; code.len()];
+    let mut entry_arity = vec![0_u16; code.len()];
+    let mut owner = u32::MAX;
+    let mut next_fn = 0_usize;
+    for (ip, slot) in on_entry_fn.iter_mut().enumerate() {
+        while next_fn < functions.len() && functions[next_fn].0 < ip {
+            owner = next_fn as u32;
+            next_fn += 1;
+        }
+        *slot = owner;
+    }
+    for (start, _, arity) in &functions {
+        let entry = start.saturating_add(1);
+        if entry < entry_arity.len() {
+            entry_arity[entry] = u16::from(*arity).saturating_add(1);
+        }
+    }
+    let code = code.into_boxed_slice();
+    for export in &exports {
+        export.bind_code(code.as_ptr(), code.len());
+    }
+    let record_defs = build_record_defs(file, name_atom, &mut literals)?;
+    Ok(Module {
+        name: file.module.clone(),
+        name_atom,
+        records: file.records.clone(),
+        record_defs,
+        code,
+        generic: Vec::new(),
+        selects: Vec::new(),
+        imports,
+        exports,
+        export_atoms,
+        tails: Vec::new(),
+        lists: Vec::new(),
+        bit_commands: Vec::new(),
+        strings: file.strings.clone().into_boxed_slice(),
+        types,
+        lines,
+        line_file_terms,
+        line_terms,
+        unsupported: HashMap::new(),
+        unsupported_reasons: Vec::new(),
+        functions,
+        function_atoms,
+        nif_stubs,
+        on_entry_fn: on_entry_fn.into_boxed_slice(),
+        entry_arity: entry_arity.into_boxed_slice(),
+        breakpoint_originals: HashMap::new(),
+        return_trace_ip,
+        return_call_acc_trace_ip,
+        return_to_trace_ip,
+        export_breakpoint_base,
+        export_entry_targets: export_entry_targets.into_boxed_slice(),
+        coverage: None,
+        coverage_probes: Vec::new(),
+        line_breakpoints_supported: false,
+        debug_line_points: Vec::new(),
+        debug_line_items: Vec::new(),
+        debug_breakpoint_import,
+        funs,
+        _literals: LiteralArea::new(literals),
+        literal_terms: Arc::new(literal_terms),
+    })
+}
+
+/// Port of erts/emulator/beam/beam_file.c:1373 (parse_decompressed_literals), OTP-29.1.1: the
+/// literal chunk is decoded in index order right after the atom chunk, so atoms first seen in
+/// literals get erts' table indices.
+pub(crate) fn decode_literals(file: &BeamFile) -> Result<(VecHeap, HashMap<u32, Term>), LoadError> {
+    let mut literals = VecHeap::new_literal();
+    let mut literal_terms = HashMap::new();
+    for index in 0..file.literals.len() {
+        let Ok(owned) = file.literal(index as u32) else {
+            continue;
+        };
+        let term = from_owned(&owned, &mut literals).map_err(|_| LoadError::Limit)?;
+        literal_terms.insert(index as u32, term);
+    }
+    Ok((literals, literal_terms))
+}
+
+/// The import table of a module.
+pub(crate) fn build_imports(file: &BeamFile) -> Result<Vec<Import>, LoadError> {
+    file.imports
+        .iter()
+        .map(|item| {
+            let module = file
+                .atom(item.module_atom)
+                .ok_or(LoadError::Index("atom", item.module_atom))?
+                .to_owned();
+            let function = file
+                .atom(item.function_atom)
+                .ok_or(LoadError::Index("atom", item.function_atom))?
+                .to_owned();
+            Ok(Import {
+                bif: arinsal_bifs::lookup(&module, &function, item.arity as u8),
+                module_atom: global_atoms()
+                    .get(&module)
+                    .ok_or_else(|| LoadError::Atom(module.clone()))?,
+                function_atom: global_atoms()
+                    .get(&function)
+                    .ok_or_else(|| LoadError::Atom(function.clone()))?,
+                fast: match (module.as_str(), function.as_str(), item.arity) {
+                    ("erlang", "+", 2) => FastBif::Add,
+                    ("erlang", "-", 2) => FastBif::Sub,
+                    ("erlang", "*", 2) => FastBif::Mul,
+                    ("erlang", "band", 2) => FastBif::Band,
+                    ("erlang", "bor", 2) => FastBif::Bor,
+                    ("erlang", "bxor", 2) => FastBif::Bxor,
+                    ("erlang", "bsl", 2) => FastBif::Bsl,
+                    ("erlang", "bsr", 2) => FastBif::Bsr,
+                    _ => FastBif::None,
+                },
+                fast_op: match (module.as_str(), function.as_str(), item.arity) {
+                    ("erlang", "element", 2) => ImportFastOp::Element,
+                    ("erlang", "setelement", 3) => ImportFastOp::SetElement,
+                    ("erlang", "rem", 2) => ImportFastOp::Rem,
+                    ("erlang", "is_integer", 1) => ImportFastOp::IsInteger,
+                    ("erlang", "is_float", 1) => ImportFastOp::IsFloat,
+                    ("erlang", "is_number", 1) => ImportFastOp::IsNumber,
+                    ("erlang", "is_atom", 1) => ImportFastOp::IsAtom,
+                    ("erlang", "is_tuple", 1) => ImportFastOp::IsTuple,
+                    ("erlang", "is_list", 1) => ImportFastOp::IsList,
+                    ("erlang", "is_map", 1) => ImportFastOp::IsMap,
+                    ("erlang", "is_function", 1) => ImportFastOp::IsFunction,
+                    ("erlang", "tuple_size", 1) => ImportFastOp::TupleSize,
+                    ("erlang", "<", 2) => ImportFastOp::Less,
+                    ("erlang", "=<", 2) => ImportFastOp::LessEqual,
+                    ("erlang", ">", 2) => ImportFastOp::Greater,
+                    ("erlang", ">=", 2) => ImportFastOp::GreaterEqual,
+                    ("erlang", "==", 2) => ImportFastOp::Equal,
+                    ("erlang", "/=", 2) => ImportFastOp::NotEqual,
+                    ("erlang", "=:=", 2) => ImportFastOp::ExactEqual,
+                    ("erlang", "=/=", 2) => ImportFastOp::ExactNotEqual,
+                    _ => ImportFastOp::None,
+                },
+                module,
+                function,
+                arity: item.arity as u8,
+                class: AtomicU8::new(ImportClass::Fresh as u8),
+                native: AtomicUsize::new(0),
+                extra_bif: AtomicUsize::new(0),
+                export: AtomicPtr::new(std::ptr::null_mut()),
+                target_module: AtomicUsize::new(0),
+                resolved_epoch: AtomicU64::new(0),
+                resolved_target: AtomicUsize::new(0),
+                resolved_code: AtomicPtr::new(std::ptr::null_mut()),
+            })
+        })
+        .collect::<Result<Vec<_>, LoadError>>()
+}
+
+/// The import every module gets for `error_handler:breakpoint/3`.
+pub(crate) fn push_breakpoint_import(imports: &mut Vec<Import>) -> Result<u32, LoadError> {
+    let index = u32::try_from(imports.len()).map_err(|_| LoadError::Limit)?;
+    imports.push(Import {
+        bif: None,
+        fast: FastBif::None,
+        fast_op: ImportFastOp::None,
+        module: "error_handler".into(),
+        function: "breakpoint".into(),
+        module_atom: global_atoms()
+            .intern("error_handler")
+            .map_err(|_| LoadError::Atom("error_handler".into()))?,
+        function_atom: global_atoms()
+            .intern("breakpoint")
+            .map_err(|_| LoadError::Atom("breakpoint".into()))?,
+        arity: 3,
+        class: AtomicU8::new(ImportClass::Fresh as u8),
+        native: AtomicUsize::new(0),
+        extra_bif: AtomicUsize::new(0),
+        export: AtomicPtr::new(std::ptr::null_mut()),
+        target_module: AtomicUsize::new(0),
+        resolved_epoch: AtomicU64::new(0),
+        resolved_target: AtomicUsize::new(0),
+        resolved_code: AtomicPtr::new(std::ptr::null_mut()),
+    });
+    Ok(index)
+}
+
+/// The export slots of a module; `labels` maps an entry label to its code index.
+pub(crate) fn build_exports(
+    file: &BeamFile,
+    labels: &HashMap<u32, usize>,
+) -> Result<Vec<Arc<ExportSlot>>, LoadError> {
+    file.exports
+        .iter()
+        .map(|item| {
+            let function = file
+                .atom(item.function_atom)
+                .ok_or(LoadError::Index("atom", item.function_atom))?
+                .to_owned();
+            let target = *labels
+                .get(&item.label)
+                .ok_or(LoadError::Index("label", item.label))?;
+            let module_atom = global_atoms()
+                .intern(&file.module)
+                .map_err(|_| LoadError::Atom(file.module.clone()))?;
+            let function_atom = global_atoms()
+                .intern(&function)
+                .map_err(|_| LoadError::Atom(function.clone()))?;
+            Ok(Arc::new(ExportSlot {
+                module: file.module.clone(),
+                function,
+                arity: item.arity as u8,
+                module_atom,
+                function_atom,
+                target_index: AtomicUsize::new(target),
+                code_len: AtomicUsize::new(0),
+                code_base: AtomicPtr::new(std::ptr::null_mut()),
+                target: AtomicPtr::new(std::ptr::null_mut()),
+            }))
+        })
+        .collect::<Result<Vec<_>, LoadError>>()
+}
+
+/// The definition and default values of every record live in the module's literal area.
+pub(crate) fn build_record_defs(
+    file: &BeamFile,
+    name_atom: Atom,
+    literals: &mut VecHeap,
+) -> Result<Vec<Term>, LoadError> {
+    let mut record_defs = Vec::with_capacity(file.records.len());
+    for record in &file.records {
+        let name = global_atoms()
+            .intern(&record.name)
+            .map_err(|_| LoadError::Limit)?;
+        let mut fields = Vec::with_capacity(record.fields.len());
+        for (field, default) in &record.fields {
+            let field = global_atoms().intern(field).map_err(|_| LoadError::Limit)?;
+            let default = default
+                .as_ref()
+                .map(|default| from_owned(default, &mut *literals))
+                .transpose()
+                .map_err(|_| LoadError::Limit)?;
+            fields.push((field, default));
+        }
+        let cons = TermBuilder::new(&mut *literals)
+            .native_record_literal(name_atom, name, record.is_exported, &fields)
+            .map_err(|_| LoadError::Limit)?;
+        record_defs.push(cons);
+    }
+    Ok(record_defs)
 }
 
 // Port of erts/emulator/beam/beam_code.h:32-38 (MAKE_LOCATION), OTP-29.1.1.

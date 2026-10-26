@@ -1,13 +1,11 @@
 //! Scheduler adapter and message envelopes for BEAM processes.
 
 use crate::{Process, RunState, Vm, VmError};
-use arinsal_beam::{BeamFile, Operand};
 use arinsal_beamasm::SchedulerRegisters;
 use arinsal_pterm::RetiredArea;
 use arinsal_sched::{
     Config, Event, Payload, Pid, RunCtx, RunOutcome, Scheduler, Signal, Task, proc_flags,
 };
-use arinsal_spec::Opcode;
 use arinsal_term::ptab::PtabIdRing;
 use arinsal_term::{
     Atom, ProcessHeap, SharedCopyCache, Term, TermBuilder, VecHeap, copy_struct_litopt, copy_term,
@@ -4616,44 +4614,6 @@ pub struct ScheduledResult {
     pub term: arinsal_etf::OwnedTerm,
     /// Counters collected by the entry process.
     pub stats: crate::Stats,
-}
-
-pub(crate) fn register_requirements(beam: &BeamFile) -> (usize, usize) {
-    fn scan(operand: &Operand, x: &mut usize, fr: &mut usize) {
-        match operand {
-            Operand::X(index) => *x = (*x).max(*index as usize + 1),
-            Operand::FR(index) => *fr = (*fr).max(*index as usize + 1),
-            Operand::List(items) => {
-                for item in items.iter() {
-                    scan(item, x, fr);
-                }
-            }
-            Operand::TypedReg { reg, .. } => scan(reg, x, fr),
-            _ => {}
-        }
-    }
-    let mut x = 2;
-    let mut fr = 1;
-    for instruction in &beam.code.instructions {
-        for operand in &instruction.args {
-            scan(operand, &mut x, &mut fr);
-        }
-        let arity = match instruction.op {
-            Opcode::FuncInfo => instruction.args.get(2),
-            Opcode::Call
-            | Opcode::CallLast
-            | Opcode::CallOnly
-            | Opcode::CallExt
-            | Opcode::CallExtLast
-            | Opcode::CallExtOnly => instruction.args.first(),
-            Opcode::CallFun2 => instruction.args.get(1),
-            _ => None,
-        };
-        if let Some(Operand::U(count)) = arity {
-            x = x.max(*count as usize + 1);
-        }
-    }
-    (x.min(1024), fr.min(1024))
 }
 
 impl Runtime {
