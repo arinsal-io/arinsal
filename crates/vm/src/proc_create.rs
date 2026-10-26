@@ -1042,6 +1042,9 @@ pub(crate) enum OriginMonitor {
         mode: AliasMode,
         priority: bool,
     },
+    /// `ERTS_MON_TYPE_PORT` with a port as the origin (`driver_monitor_process`): the process
+    /// holds the target half.
+    PortOrigin,
 }
 
 impl OriginMonitor {
@@ -1051,7 +1054,7 @@ impl OriginMonitor {
         match self {
             Self::Process(_) => node_type::MONITOR_PROC,
             Self::Distributed { .. } => node_type::MONITOR_DIST_PROC,
-            Self::Port { .. } => node_type::MONITOR_PORT,
+            Self::Port { .. } | Self::PortOrigin => node_type::MONITOR_PORT,
             Self::DistPort { .. } => node_type::MONITOR_DIST_PORT,
             Self::Alias { .. } => node_type::MONITOR_ALIAS,
         }
@@ -1064,6 +1067,7 @@ impl OriginMonitor {
             | Self::Port { alias_mode, .. }
             | Self::DistPort { alias_mode, .. } => *alias_mode,
             Self::Alias { mode, .. } => Some(*mode),
+            Self::PortOrigin => None,
         }
     }
 
@@ -1084,6 +1088,29 @@ pub(crate) fn process_link(pid: arinsal_sched::Pid, priority: bool) -> crate::mo
         0
     };
     crate::monitor_link::Link::create(crate::monitor_link::node_type::LINK_PROC, pid.data(), flags)
+}
+
+/// Bit that keeps the keys of port links apart from the pid data keys in one link tree: both are
+/// at most 60 bits, and erts keys the two kinds by differently tagged terms.
+const PORT_LINK_KEY_BIT: u64 = 1 << 63;
+
+/// Key of the link to port `id` in a process link tree.
+pub(crate) fn port_link_key(id: u64) -> u64 {
+    id | PORT_LINK_KEY_BIT
+}
+
+/// The port number a port link key stands for.
+pub(crate) fn port_of_link_key(key: u64) -> u64 {
+    key & !PORT_LINK_KEY_BIT
+}
+
+/// A new link to port `id` (`erts_link_internal_create(ERTS_LNK_TYPE_PORT, ...)`).
+pub(crate) fn port_link(id: u64) -> crate::monitor_link::Link {
+    crate::monitor_link::Link::create(
+        crate::monitor_link::node_type::LINK_PORT,
+        port_link_key(id),
+        0,
+    )
 }
 
 /// Origin state of a local process monitor; the target is the half's `other` and the shared

@@ -950,18 +950,27 @@ fn process_info_item_links(process: &mut Process, pid: Pid) -> Result<Term, VmEr
                 // Port of erts/emulator/beam/erl_bif_info.c (collect_one_link, OTP-29.1.1):
                 // process_info/2 omits links while their unlink is pending, and conses each
                 // link onto the result in tree foreach order.
+                let kind_port = crate::monitor_link::node_type::LINK_PORT;
                 let mut links = cold
                     .links
                     .iter()
-                    .filter(|node| node.unlinking() == 0)
+                    .filter(|node| node.unlinking() == 0 && node.kind() != kind_port)
                     .filter_map(|node| Pid::from_data(node.other()).to_term())
                     .collect::<Vec<_>>();
                 links.reverse();
+                // The links to ports of the same tree, in port order.
+                let mut ports = cold
+                    .links
+                    .iter()
+                    .filter(|node| node.kind() == kind_port)
+                    .map(|node| crate::proc_create::port_of_link_key(node.other()))
+                    .collect::<Vec<_>>();
+                ports.sort_unstable();
+                links.extend(ports.into_iter().filter_map(Term::port));
                 links
             })
             .unwrap_or_default();
-        let mut links = links;
-        links.extend(crate::port::linked_ports(process, pid));
+        let _ = pid;
         make_list(process, links)?
     })
 }
@@ -993,7 +1002,40 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
             .into_iter()
             .map(|p| make_tuple(process, &[atom("process"), p]))
             .collect::<Result<Vec<_>, _>>()?;
-        let port_monitors = crate::port::monitors_by(process, pid);
+        let _ = pid;
+        // The origin entries of the monitors of ports (`ERTS_MON_TYPE_PORT`): the port, or
+        // `{Name, Node}` for a monitor made by registered name.
+        let port_monitors = process
+            .cold
+            .as_ref()
+            .map(|cold| {
+                let mut objects = cold
+                    .monitors
+                    .iter()
+                    .filter_map(|monitor| match monitor.origin_state() {
+                        Some(crate::proc_create::OriginMonitor::Port {
+                            name: Some(name), ..
+                        }) => Some(arinsal_etf::OwnedTerm::Tuple(vec![
+                            arinsal_etf::OwnedTerm::Atom(
+                                global_atoms()
+                                    .text(*name)
+                                    .map(|text| text.to_string())
+                                    .unwrap_or_default(),
+                            ),
+                            arinsal_etf::OwnedTerm::Atom(
+                                crate::node_tables::lock().local_name.clone(),
+                            ),
+                        ])),
+                        Some(crate::proc_create::OriginMonitor::Port {
+                            port_id: Some(id), ..
+                        }) => Term::port(*id).and_then(|port| arinsal_term::to_owned(port).ok()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                objects.reverse();
+                objects
+            })
+            .unwrap_or_default();
         let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let vals = vals
             .into_iter()
@@ -1011,29 +1053,32 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
 #[inline(never)]
 fn process_info_item_monitored_by(process: &mut Process, pid: Pid) -> Result<Term, VmError> {
     Ok({
-        let vals = process
+        let mut vals = process
             .cold
             .as_ref()
             .map(|cold| {
                 // Port of erts/emulator/beam/erl_bif_info.c (process_info_aux,
                 // ERTS_PI_IX_MONITORED_BY): the local target list, then the target halves of
                 // remote origins in the tree, each item consed onto the result.
-                let local = cold.lt_monitors.iter().map(|monitor| monitor.other());
+                let local = cold.lt_monitors.iter().map(|monitor| {
+                    // A port origin (`driver_monitor_process`) is a port id.
+                    if monitor.kind() == crate::monitor_link::node_type::MONITOR_PORT {
+                        Term::port(monitor.other())
+                    } else {
+                        Pid::from_data(monitor.other()).to_term()
+                    }
+                });
                 let remote = cold
                     .monitors
                     .iter()
                     .filter(|monitor| monitor.is_target())
-                    .map(|monitor| monitor.other());
-                let mut origins = local
-                    .chain(remote)
-                    .filter_map(|origin| Pid::from_data(origin).to_term())
-                    .collect::<Vec<_>>();
+                    .map(|monitor| Pid::from_data(monitor.other()).to_term());
+                let mut origins = local.chain(remote).flatten().collect::<Vec<_>>();
                 origins.reverse();
                 origins
             })
             .unwrap_or_default();
-        let mut vals = vals;
-        vals.extend(crate::port::driver_monitoring_ports(process, pid));
+        let _ = pid;
         // Resource monitors are in the same monitor tree (ERTS_MON_TYPE_RESOURCE).
         let resources = process
             .cold

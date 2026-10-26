@@ -503,6 +503,15 @@ pub enum Signal<M> {
     /// Port exit signal preserving the port term used as the signal origin.
     /// Boxed: the signal is rare and would otherwise widen every queued event.
     PortExit(Box<PortExitSignal<M>>),
+    /// A port links the receiver: the receiver inserts its half of the link, keyed by the port
+    /// data. A port has no pid to send `Link` from.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_LINK with a port origin),
+    // OTP-29.1.1.
+    PortLink(u64),
+    /// A port drops its link to the receiver: the receiver removes its half.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (ERTS_SIG_Q_OP_UNLINK with a port origin),
+    // OTP-29.1.1.
+    PortUnlink(u64),
     /// Monitor DOWN signal carrying an opaque reason envelope.
     MonitorDown { reference: u64, reason: M },
     /// Monitor DOWN message the sender already built (a non-immediate reason, erl_proc_sig_queue.c:2836-2900).
@@ -5425,6 +5434,8 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
             Signal::UnlinkAck(id) => *id != 0,
             Signal::UnlinkAckSignal(_) => true,
             Signal::Link
+            | Signal::PortLink(_)
+            | Signal::PortUnlink(_)
             | Signal::Unlink(_)
             | Signal::Monitor { .. }
             | Signal::Demonitor(_)

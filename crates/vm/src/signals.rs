@@ -2297,7 +2297,7 @@ pub(crate) fn unalias_origin(process: &mut Process, id: u64) -> bool {
                 crate::proc_create::OriginMonitor::Port { alias_mode, .. }
                 | crate::proc_create::OriginMonitor::DistPort { alias_mode, .. },
             ) => alias_mode.take().is_some(),
-            None => false,
+            Some(crate::proc_create::OriginMonitor::PortOrigin) | None => false,
         }
     } else {
         false

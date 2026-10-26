@@ -319,18 +319,8 @@ impl<V> SmallMap<V> {
         Some(entries.swap_remove(index).1)
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&u64, &V)> {
-        self.entries().iter().map(|entry| (&entry.0, &entry.1))
-    }
-
     pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
         self.entries().iter().map(|entry| &entry.1)
-    }
-
-    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&u64, &mut V) -> bool) {
-        if let Some(entries) = self.0.as_mut() {
-            entries.retain_mut(|entry| keep(&entry.0, &mut entry.1));
-        }
     }
 }
 
@@ -450,8 +440,9 @@ impl OwnerCell {
 /// The rarely used parts of a [`PortHandle`].
 #[derive(Default)]
 struct HandleCold {
-    /// Processes this driver port monitors (`driver_monitor_process`): monitor id to pid.
-    drv_monitors: SmallMap<Pid>,
+    /// Processes this driver port monitors (`driver_monitor_process`): monitor id to the pid and
+    /// the origin half (`ERTS_P_MONITORS` of the port); the process holds the target half.
+    drv_monitors: SmallMap<(Pid, crate::proc_create::ProcessMonitor)>,
     /// The `open_port` waiting for `erl_drv_init_ack`: reference id and opener.
     async_open: Option<(u64, Pid)>,
     /// `port->common.u.alive.reg->name`, shared with the register table entry.
@@ -1823,7 +1814,7 @@ fn start(
             ));
         }
     }
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let scheduler = runtime.scheduler_arc()?;
     let reservation = reserve_port_id(runtime)?;
     let port_id = reservation.id();
@@ -1897,11 +1888,11 @@ fn start(
     let reference = runtime.next_ref();
     handle.with_cold(|cold| cold.async_open = Some((reference, ctx.pid())));
     runtime.ports.insert(port_id, Arc::clone(&handle));
-    let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
+    link_opener(process, port_id);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     let owner = ctx.pid();
-    let runtime_ref = *runtime;
+    let runtime_ref = runtime;
     std::thread::Builder::new()
         .name(format!("arinsal-port-{port_id}"))
         .spawn(move || {
@@ -1955,14 +1946,14 @@ fn start_driver(
         };
         return start_dyn_driver(process, ctx, None, driver, name, io);
     }
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let scheduler = runtime.scheduler_arc()?;
     let reservation = reserve_port_id(runtime)?;
     let port_id = reservation.id();
     let port = Term::port(port_id).ok_or_else(badarg)?;
     let handle = make_driver_handle(port_id, ctx.pid(), name, false, scheduler, runtime, None)?;
     runtime.ports.insert(port_id, Arc::clone(&handle));
-    let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
+    link_opener(process, port_id);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     handle.set_ram_file_data(crate::ram_file_drv::start(_binary));
@@ -2033,7 +2024,6 @@ fn start_dyn_driver(
         }
     }
     runtime.ports.insert(port_id, Arc::clone(&handle));
-    let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     let caller = packed_pid(ctx.pid());
@@ -2051,6 +2041,7 @@ fn start_dyn_driver(
             arinsal_drv::StartError::Badarg => atom("badarg"),
         });
     }
+    link_opener(process, port_id);
     drv_port.set_io_flags(io.binary, io.eof, io.line);
     if let Some(caller) = ctx.pid().to_term() {
         crate::trace::emit_port_event(
@@ -2218,6 +2209,10 @@ impl arinsal_drv::PortHost for DrvHost {
         if let Some(handle) = self.handle(port.id()) {
             let owner = handle.owner_pid();
             handle.links.lock().remove(&owner);
+            let _ =
+                handle
+                    .scheduler
+                    .signal(owner, owner, arinsal_sched::Signal::PortUnlink(handle.id));
         }
     }
 
@@ -2472,16 +2467,47 @@ impl arinsal_drv::PortHost for DrvHost {
         if !handle.scheduler.lookup(target) {
             return false;
         }
-        handle.with_cold(|cold| cold.drv_monitors.insert(monitor, target));
-        let _ = self
-            .runtime
-            .publish_proc_flag(target, arinsal_sched::proc_flags::PORTS);
+        // erts_monitor_create(ERTS_MON_TYPE_PORT): the port keeps the origin half, the target
+        // process gets the other one in a monitor signal.
+        let (origin, target_half) = crate::proc_create::create_monitor(
+            monitor,
+            port.id(),
+            pid,
+            crate::proc_create::MonitorInfo::default(),
+            crate::proc_create::OriginMonitor::PortOrigin,
+        );
+        handle.with_cold(|cold| cold.drv_monitors.insert(monitor, (target, origin)));
+        let owner = handle.owner_pid();
+        let sent = handle.scheduler.signal(
+            owner,
+            target,
+            arinsal_sched::Signal::Monitor {
+                reference: monitor,
+                shared: arinsal_sched::SharedPayload(target_half.into_shared()),
+            },
+        );
+        if sent.is_err() {
+            handle.peek_cold(|cold| cold.drv_monitors.remove(&monitor));
+            return false;
+        }
         true
     }
 
     fn demonitor_process(&self, port: &arinsal_drv::DriverPort, monitor: u64) {
         if let Some(handle) = self.handle(port.id()) {
-            handle.peek_cold(|cold| cold.drv_monitors.remove(&monitor));
+            // erts_proc_sig_send_demonitor: the origin half goes to the target, which drops
+            // its half.
+            if let Some(Some((pid, origin))) =
+                handle.peek_cold(|cold| cold.drv_monitors.remove(&monitor))
+            {
+                let _ = handle.scheduler.signal(
+                    handle.owner_pid(),
+                    pid,
+                    arinsal_sched::Signal::DemonitorOrigin(arinsal_sched::SharedPayload(
+                        origin.into_shared(),
+                    )),
+                );
+            }
         }
     }
 
@@ -2539,9 +2565,9 @@ impl arinsal_drv::PortHost for DrvHost {
         drv_port.adopt(drv_data);
         crate::ddll::port_opened_for(&driver, &drv_port);
         runtime.ports.insert(port_id, handle);
-        // The owner has a port in its link list (erl_process.c:14084). Exit scans the
-        // port table only when that list is non-NULL.
-        let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
+        // The owner holds its half of the link to the new port (`erts_port_link` of the
+        // creator's owner): inserted when the signal is handled.
+        let _ = scheduler.signal(owner, owner, arinsal_sched::Signal::PortLink(port_id));
         crate::trace::port_opened(runtime, port_id);
         reservation.commit();
         Some(drv_port)
@@ -2563,6 +2589,11 @@ fn send_open_reply(handle: &PortHandle, result: Result<(), Term>) {
         Ok(()) => port_term,
         Err(errno) => {
             handle.links.lock().remove(&opener);
+            let _ = handle.scheduler.signal(
+                opener,
+                opener,
+                arinsal_sched::Signal::PortUnlink(handle.id),
+            );
             errno
         }
     };
@@ -2754,7 +2785,7 @@ pub(crate) fn alloc_inet_port(
     drv_port.init_run_queue(scheduler.current_run_queue());
     attach(&handle, &drv_port);
     runtime.ports.insert(port_id, Arc::clone(&handle));
-    let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
+    let _ = scheduler.signal(owner, owner, arinsal_sched::Signal::PortLink(port_id));
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     Ok((port_id, handle, drv_port))
@@ -3085,7 +3116,7 @@ fn make_handle_with(
 
 fn start_fd(
     vm: &mut Vm,
-    process: &Process,
+    process: &mut Process,
     ctx: &RunCtx<'_, Message>,
     input_fd: RawFd,
     output_fd: RawFd,
@@ -3093,7 +3124,7 @@ fn start_fd(
 ) -> Result<Term, VmError> {
     let reader = duplicate_fd(input_fd).map_err(|_| badarg())?;
     let writer = duplicate_fd(output_fd).map_err(|_| badarg())?;
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let runtime = process.runtime.ok_or_else(badarg)?;
     let scheduler = runtime.scheduler_arc()?;
     let reservation = reserve_port_id(runtime)?;
     let id = reservation.id();
@@ -3111,12 +3142,12 @@ fn start_fd(
         runtime,
     )?;
     runtime.ports.insert(id, Arc::clone(&handle));
-    let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
+    link_opener(process, id);
     crate::trace::port_opened(runtime, id);
     reservation.commit();
     let owner = ctx.pid();
     let read_fd = reader.into_raw_fd();
-    let runtime_ref = *runtime;
+    let runtime_ref = runtime;
     let binary = opts.binary;
     let framing = opts.framing;
     let want_eof = opts.eof;
@@ -4945,7 +4976,9 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
     let old_owner = handle.owner_pid();
     handle.links.lock().insert(pid);
     handle.owner.set(pid);
-    let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS);
+    let _ = runtime
+        .scheduler()?
+        .signal(pid, pid, arinsal_sched::Signal::PortLink(id));
     if notify.is_none()
         && old_owner != pid
         && let Some(pid_term) = pid.to_term()
@@ -4996,69 +5029,32 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
     Ok(atom("true"))
 }
 
-/// Exit ports linked to a process when its scheduler task terminates.
+/// Exit the ports linked to a process when it terminates: the process walks its own links and
+/// hands each port one exit signal.
 ///
-/// Port of erts/emulator/beam/erl_process.c:14068 (erts_proc_exit_handle_link), OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_process.c:14068 (erts_proc_exit_handle_link), ERTS_LNK_TYPE_PORT
+/// case, OTP-29.1.1.
 pub(crate) fn owner_exit(
     runtime: &'static crate::process::Runtime,
     scheduler: &Scheduler<Process>,
     owner: Pid,
     reason: Term,
+    port_links: &[u64],
 ) {
-    // Port of erts/emulator/beam/io.c:7143 (erts_fire_port_monitor): ports that
-    // monitor the exiting process run their driver's `process_exit` callback.
-    let fired: Vec<(arinsal_drv::PortRef, u64)> = {
-        let _ports = runtime.ports.lock();
-        runtime
-            .ports
-            .handles()
-            .into_iter()
-            .flat_map(|handle| {
-                let Some(drv_port) = handle.driver.as_ref() else {
-                    return Vec::new();
-                };
-                let ids: Vec<u64> = handle
-                    .peek_cold(|cold| {
-                        let ids: Vec<u64> = cold
-                            .drv_monitors
-                            .iter()
-                            .filter(|(_, pid)| **pid == owner)
-                            .map(|(id, _)| *id)
-                            .collect();
-                        for id in &ids {
-                            cold.drv_monitors.remove(id);
-                        }
-                        ids
-                    })
-                    .unwrap_or_default();
-                ids.into_iter().map(|id| (drv_port.arc(), id)).collect()
-            })
-            .collect()
-    };
-    for (drv_port, monitor) in fired {
-        drv_port.process_exit(monitor);
-    }
     let abnormal = reason != atom("normal");
     let affected = {
         let _ports = runtime.ports.lock();
-        let handles = runtime.ports.handles();
-        for handle in &handles {
-            handle
-                .monitors
-                .lock()
-                .retain(|_, monitor| monitor.pid != owner);
-        }
-        handles
+        port_links
             .iter()
-            .filter_map(|handle| {
-                let id = handle.id;
+            .filter_map(|id| {
+                let handle = runtime.ports.get(*id)?;
                 let is_owner = handle.owner.get() == owner;
                 let linked = if handle.driver.as_ref().is_some() {
                     handle.links.lock().contains(&owner)
                 } else {
                     handle.links.lock().remove(&owner)
                 };
-                (is_owner || (abnormal && linked)).then(|| (id, Arc::clone(handle)))
+                (is_owner || (abnormal && linked)).then_some((*id, handle))
             })
             .collect::<Vec<_>>()
     };
@@ -5077,8 +5073,45 @@ pub(crate) fn owner_exit(
     }
 }
 
+/// A process that a driver port monitors exited: the port runs its `process_exit` callback and
+/// drops its origin half.
+// Port of erts/emulator/beam/io.c:7143 (erts_fire_port_monitor), OTP-29.1.1.
+pub(crate) fn fire_port_monitor(runtime: &crate::process::Runtime, port_id: u64, monitor: u64) {
+    let Some(handle) = runtime.ports.get(port_id) else {
+        return;
+    };
+    let Some(drv_port) = handle.driver.as_ref() else {
+        return;
+    };
+    if handle
+        .peek_cold(|cold| cold.drv_monitors.remove(&monitor))
+        .flatten()
+        .is_some()
+    {
+        drv_port.arc().process_exit(monitor);
+    }
+}
+
+/// The opener's half of its link to a port it just created: the opening process is the caller,
+/// so the half goes straight into its link tree (`erts_open_driver` links the port to the
+/// connected process).
+fn link_opener(process: &mut Process, id: u64) {
+    let _ = process
+        .cold_mut()
+        .links
+        .lookup_insert(crate::proc_create::port_link(id));
+}
+
 /// Add or remove a process from a port's link set.
-pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Result<bool, VmError> {
+///
+/// Port of erts/emulator/beam/bif.c (link_1/unlink_1 for a port): the calling process updates
+/// its own link tree first, then the port gets the signal.
+pub(crate) fn link(
+    process: &mut Process,
+    port: Term,
+    pid: Pid,
+    linked: bool,
+) -> Result<bool, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let Some(handle) = runtime.ports.get(id) else {
@@ -5093,15 +5126,34 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
             "unlink",
             &[port],
         );
+        process
+            .cold_mut()
+            .links
+            .remove(crate::proc_create::port_link_key(id));
+    } else {
+        link_opener(process, id);
     }
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     if let Some(drv) = handle.drv_port() {
-        return Ok(drv_sig::link(runtime, &handle, &drv, pid, linked) || !linked);
+        let done = drv_sig::link(runtime, &handle, &drv, pid, linked);
+        if linked && !done {
+            process
+                .cold_mut()
+                .links
+                .remove(crate::proc_create::port_link_key(id));
+        }
+        return Ok(done || !linked);
     }
     // Termination removes the port from the table and drains `links` in one critical section
     // of the table lock (`remove_and_notify`); taking the locks in the same order makes this
     // registration either visible to it or refused.
     let ports = runtime.ports.read().unwrap();
     if linked && !runtime.ports.contains(id) {
+        drop(ports);
+        process
+            .cold_mut()
+            .links
+            .remove(crate::proc_create::port_link_key(id));
         return Ok(false);
     }
     let mut links = handle.links.lock();
@@ -5112,12 +5164,6 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
     }
     drop(links);
     drop(ports);
-    // A linked port is on the process link list. Exit scans ports only when that
-    // list is non-empty (erl_process.c:14084, `erts_proc_exit_handle_link`).
-    if linked && !runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS) {
-        handle.links.lock().remove(&pid);
-        return Ok(false);
-    }
     if let Some(pid_term) = pid.to_term() {
         crate::trace::emit_port_event(
             runtime,
@@ -5185,87 +5231,10 @@ fn register_monitor(
     let mut monitors = handle.monitors.lock();
     if monitored {
         monitors.insert(reference, PortMonitor { pid, name });
-        if let Some(runtime) = process.runtime.as_ref() {
-            let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS);
-        }
     } else {
         monitors.remove(&reference);
     }
     Ok(true)
-}
-
-/// Ports linked to `pid`, in id order, for `process_info(Pid, links)`.
-pub(crate) fn linked_ports(process: &Process, pid: Pid) -> Vec<Term> {
-    let Some(runtime) = process.runtime.as_ref() else {
-        return Vec::new();
-    };
-    let mut ids: Vec<u64> = runtime
-        .ports
-        .handles()
-        .into_iter()
-        .filter(|handle| handle.links.lock().contains(&pid))
-        .map(|handle| handle.id)
-        .collect();
-    ids.sort_unstable();
-    ids.into_iter().filter_map(Term::port).collect()
-}
-
-/// Ports monitoring `pid` through `driver_monitor_process`, for `process_info(Pid, monitored_by)`.
-pub(crate) fn driver_monitoring_ports(process: &Process, pid: Pid) -> Vec<Term> {
-    let Some(runtime) = process.runtime.as_ref() else {
-        return Vec::new();
-    };
-    let mut ids: Vec<u64> = runtime
-        .ports
-        .handles()
-        .into_iter()
-        .filter(|handle| {
-            handle
-                .peek_cold(|cold| {
-                    cold.drv_monitors
-                        .values()
-                        .any(|monitored| *monitored == pid)
-                })
-                .unwrap_or(false)
-        })
-        .map(|handle| handle.id)
-        .collect();
-    ids.sort_unstable();
-    ids.into_iter().filter_map(Term::port).collect()
-}
-
-/// Monitor targets reported by `process_info/2` for one process.
-pub(crate) fn monitors_by(process: &Process, pid: Pid) -> Vec<OwnedTerm> {
-    let Some(runtime) = process.runtime.as_ref() else {
-        return Vec::new();
-    };
-    runtime
-        .ports
-        .handles()
-        .into_iter()
-        .flat_map(|handle| {
-            handle
-                .monitors
-                .lock()
-                .values()
-                .filter(|monitor| monitor.pid == pid)
-                .map(|monitor| match monitor.name {
-                    Some(name) => OwnedTerm::Tuple(vec![
-                        OwnedTerm::Atom(
-                            global_atoms()
-                                .text(name)
-                                .map(|text| text.to_string())
-                                .unwrap_or_default(),
-                        ),
-                        OwnedTerm::Atom(crate::node_tables::lock().local_name.clone()),
-                    ]),
-                    None => Term::port(handle.id)
-                        .and_then(|port| to_owned(port).ok())
-                        .unwrap_or(OwnedTerm::Nil),
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
 }
 
 /// Demonitor one port. The caller already removed the origin from its monitor tree.

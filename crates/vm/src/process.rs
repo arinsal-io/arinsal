@@ -5044,10 +5044,28 @@ impl Process {
                 },
             };
             match payload {
-                Payload::Signal(Signal::Monitor { reference, .. }) => {
+                Payload::Signal(Signal::Monitor { reference, shared }) => {
                     // Port of erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
                     // OTP-29.1.1: a monitor arriving after exit has begun is answered as noproc.
-                    let _ = ctx.signal(from, Signal::MonitorNoproc(reference));
+                    // A driver port's monitor (`ERTS_MON_TYPE_PORT`) fires at once instead
+                    // (erts_proc_exit_handle_monitor).
+                    let port_origin = shared
+                        .0
+                        .downcast::<crate::proc_create::ProcessMonitorData>()
+                        .ok()
+                        .and_then(|data| {
+                            crate::proc_create::ProcessMonitorData::take_half(data, true)
+                        })
+                        .filter(|half| {
+                            half.view().kind() == crate::monitor_link::node_type::MONITOR_PORT
+                        });
+                    if let Some(half) = port_origin {
+                        if let Some(runtime) = self.runtime.as_ref() {
+                            crate::port::fire_port_monitor(runtime, half.view().other(), reference);
+                        }
+                    } else {
+                        let _ = ctx.signal(from, Signal::MonitorNoproc(reference));
+                    }
                 }
                 Payload::Signal(Signal::Demonitor(reference)) => {
                     self.remove_target_monitor(reference);
@@ -5227,9 +5245,21 @@ impl Process {
             crate::suspend::release_on_exit(self, ctx);
             crate::suspend::down_on_exit(self, ctx);
             if let Ok(scheduler) = runtime.scheduler() {
-                // Ports are links on the process (erl_process.c:14084). No port list, no scan.
-                if resources & proc_flags::PORTS != 0 {
-                    crate::port::owner_exit(runtime, scheduler, ctx.pid(), reason);
+                // Port of erts/emulator/beam/erl_process.c:14068 (erts_proc_exit_handle_link): the
+                // exit walks the process's own links, the port ones go to `erts_port_exit`.
+                let port_links: Vec<u64> = self
+                    .cold
+                    .as_ref()
+                    .map(|cold| {
+                        cold.links
+                            .iter()
+                            .filter(|link| link.kind() == crate::monitor_link::node_type::LINK_PORT)
+                            .map(|link| crate::proc_create::port_of_link_key(link.other()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !port_links.is_empty() {
+                    crate::port::owner_exit(runtime, scheduler, ctx.pid(), reason, &port_links);
                 }
                 // Port of erts/emulator/beam/erl_process.c:14415-14417 (F_USING_DDLL).
                 if resources & proc_flags::DDLL != 0 {
@@ -5418,7 +5448,9 @@ impl Process {
             }
         }
         for node in cold.links.drain() {
-            if node.view().unlinking() != 0 {
+            if node.view().unlinking() != 0
+                || node.view().kind() == crate::monitor_link::node_type::LINK_PORT
+            {
                 continue;
             }
             let pid = Pid::from_data(node.view().other());
@@ -5470,6 +5502,15 @@ impl Process {
         for target in targets {
             let half = target.view();
             let reference = half.reference();
+            // Port of erts/emulator/beam/erl_process.c (erts_proc_exit_handle_monitor, target
+            // ERTS_MON_TYPE_PORT): a port that monitors the exiting process runs its driver's
+            // `process_exit` callback.
+            if half.kind() == crate::monitor_link::node_type::MONITOR_PORT {
+                if let Some(runtime) = self.runtime.as_ref() {
+                    crate::port::fire_port_monitor(runtime, half.other(), reference);
+                }
+                continue;
+            }
             let pid = Pid::from_data(half.other());
             if let Some(runtime) = self.runtime.as_ref()
                 && crate::dist::forward_monitor_down_if_proxy(
@@ -6433,6 +6474,7 @@ impl Process {
                 }
                 Some(
                     crate::proc_create::OriginMonitor::Port { .. }
+                    | crate::proc_create::OriginMonitor::PortOrigin
                     | crate::proc_create::OriginMonitor::DistPort { .. },
                 )
                 | None => {}
@@ -6546,6 +6588,22 @@ impl Process {
                     drop(duplicate);
                 } else {
                     self.trace_getting_linked(ctx, from);
+                }
+                0
+            }
+            // Port of erts/emulator/beam/erl_proc_sig_queue.c:6636-6646 (ERTS_SIG_Q_OP_LINK) for a
+            // link whose origin is a port.
+            arinsal_sched::Signal::PortLink(id) => {
+                let _ = self
+                    .cold_mut()
+                    .links
+                    .lookup_insert(crate::proc_create::port_link(id));
+                0
+            }
+            // Port of erl_proc_sig_queue.c:6693-6713 (ERTS_SIG_Q_OP_UNLINK) for a port origin.
+            arinsal_sched::Signal::PortUnlink(id) => {
+                if let Some(cold) = self.cold.as_mut() {
+                    cold.links.remove(crate::proc_create::port_link_key(id));
                 }
                 0
             }
@@ -6682,6 +6740,10 @@ impl Process {
                 let arinsal_sched::PortExitSignal { port, reason } = *exit;
                 let port = port.into_receiver(self)?;
                 let reason = reason.into_receiver(self)?;
+                // erts_proc_sig_handle_exit: the link to the exiting port is deleted.
+                if let (Some(id), Some(cold)) = (port.as_port(), self.cold.as_mut()) {
+                    cold.links.remove(crate::proc_create::port_link_key(id));
+                }
                 if reason == crate::signals::atom("kill") {
                     return Err(VmError::Trap(crate::exceptions::Trap::killed()));
                 }
