@@ -147,8 +147,9 @@ fn equality_and_comparison_microbench_10m() {
 
     fn nest(heap: &mut VecHeap, mut term: Term, depth: usize) -> Term {
         let tag = Term::small(1).unwrap();
+        let tail = Term::small(2).unwrap();
         for _ in 0..depth {
-            term = TermBuilder::new(heap).tuple(&[tag, term]).unwrap();
+            term = TermBuilder::new(heap).tuple(&[tag, term, tail]).unwrap();
         }
         term
     }
@@ -390,9 +391,9 @@ run(Names) ->
     Tuple = list_to_tuple(List),
     TupleEqual = list_to_tuple(List),
     TupleDifferent = list_to_tuple(lists:seq(1, 7) ++ [0]),
-    Deep = lists:foldl(fun(_, Acc) -> {1, Acc} end, List, lists:seq(1, 6)),
-    DeepEqual = lists:foldl(fun(_, Acc) -> {1, Acc} end, ListEqual, lists:seq(1, 6)),
-    DeepDifferent = lists:foldl(fun(_, Acc) -> {1, Acc} end, ListDifferent, lists:seq(1, 6)),
+    Deep = lists:foldl(fun(_, Acc) -> {1, Acc, 2} end, List, lists:seq(1, 6)),
+    DeepEqual = lists:foldl(fun(_, Acc) -> {1, Acc, 2} end, ListEqual, lists:seq(1, 6)),
+    DeepDifferent = lists:foldl(fun(_, Acc) -> {1, Acc, 2} end, ListDifferent, lists:seq(1, 6)),
     Map = maps:from_list([{K, K} || K <- lists:seq(1, 8)]),
     MapEqual = maps:from_list([{K, K} || K <- lists:seq(1, 8)]),
     MapDifferent = maps:from_list([{K, if K == 8 -> 0; true -> K end}
