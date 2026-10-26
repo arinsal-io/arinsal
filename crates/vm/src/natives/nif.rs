@@ -88,21 +88,15 @@ fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Opt
     {
         let native_fns = vm.code_ix.native_fns();
         for &(name, expected_arity) in TRACER_FUNCTIONS {
-            let Some(entry) = module
-                .functions
-                .iter()
-                .find_map(|(entry, found, found_arity)| {
-                    (found == name && *found_arity == expected_arity).then_some(*entry)
-                })
-            else {
+            let Some(ordinal) = module.functions.iter().position(|(_, found, found_arity)| {
+                found == name && *found_arity == expected_arity
+            }) else {
                 continue;
             };
-            let Some(Instr::NativeBody { index }) =
-                entry.checked_add(1).and_then(|body| module.code.get(body))
-            else {
+            let Some(index) = module.nif_body(ordinal) else {
                 continue;
             };
-            if let Some(callback) = native_fns.get(*index as usize).cloned().flatten() {
+            if let Some(callback) = native_fns.get(index as usize).cloned().flatten() {
                 callbacks.insert((name.to_owned(), expected_arity), callback);
             }
         }
@@ -1116,16 +1110,20 @@ fn publish(vm: &mut Vm, key: &str) {
 
 fn patch_native(module: &arinsal_loader::Module, entry: usize, index: u32) -> Result<(), VmError> {
     let slot = entry.saturating_add(1);
-    if slot >= module.code.len() {
+    let Some(ordinal) = module.function_by_entry(slot) else {
         return Err(VmError::Unsupported("nif entry".into()));
-    }
-    let ptr = module.code.as_ptr().cast_mut();
-    // SAFETY: `code` is a boxed slice shared by every `Arc<Module>` clone.
-    // `load_nif` overwrites the Erlang stub with `NativeBody`, matching
-    // `patch_call_nif_early` in erts. `Instr` is `Copy`. This scheduler is
-    // inside `load_nif`, not inside the patched function.
-    unsafe {
-        ptr.add(slot).write(Instr::NativeBody { index });
+    };
+    module.set_nif_body(ordinal, index);
+    // The interpreter flavor runs the stub from its instruction stream.
+    if slot < module.code.len() {
+        let ptr = module.code.as_ptr().cast_mut();
+        // SAFETY: `code` is a boxed slice shared by every `Arc<Module>` clone.
+        // `load_nif` overwrites the Erlang stub with `NativeBody`, matching
+        // `patch_call_nif_early` in erts. `Instr` is `Copy`. This scheduler is
+        // inside `load_nif`, not inside the patched function.
+        unsafe {
+            ptr.add(slot).write(Instr::NativeBody { index });
+        }
     }
     Ok(())
 }

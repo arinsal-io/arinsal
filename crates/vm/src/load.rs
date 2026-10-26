@@ -219,7 +219,7 @@ fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) 
         arinsal_loader::specialize_bif_calls(module);
         return;
     }
-    for (entry, function, arity) in &module.functions {
+    for (ordinal, (entry, function, arity)) in module.functions.iter().enumerate() {
         let Some(native) =
             natives::static_nif_lookup(&module.name, function, *arity).or_else(|| {
                 (module.name == "erts_debug")
@@ -232,6 +232,7 @@ fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) 
         let Some(index) = code_ix.push_native_fn(crate::natives::nif::NativeFn::Bif(native)) else {
             continue;
         };
+        module.set_nif_body(ordinal, index);
         if let Some(body) = module.code.get_mut(entry.saturating_add(1)) {
             *body = Instr::NativeBody { index };
         }

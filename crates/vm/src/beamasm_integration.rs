@@ -1640,14 +1640,8 @@ impl<'a> VmModuleEnv<'a> {
         // Port of erts/emulator/beam/jit/arm/asm_load.c:651, OTP-29.1.1: loader-patched static
         // NIF bodies call their Rust body through the shared runtime helper.
         let mut native_bodies = HashMap::new();
-        for (entry, function, arity) in &module.functions {
-            let patched = module
-                .code
-                .get(entry.saturating_add(1))
-                .is_some_and(|instruction| {
-                    matches!(instruction, arinsal_loader::Instr::NativeBody { .. })
-                });
-            if !patched {
+        for (ordinal, (_, function, arity)) in module.functions.iter().enumerate() {
+            if module.nif_body(ordinal).is_none() {
                 continue;
             }
             if let Some(nif) = crate::natives::static_nif_lookup(&module.name, function, *arity) {
@@ -2193,15 +2187,9 @@ pub(crate) fn compile(
     let native_body_functions = module
         .functions
         .iter()
-        .filter(|(entry, _, _)| {
-            module
-                .code
-                .get(entry.saturating_add(1))
-                .is_some_and(|instruction| {
-                    matches!(instruction, arinsal_loader::Instr::NativeBody { .. })
-                })
-        })
-        .map(|(_, name, arity)| (name.as_str(), *arity))
+        .enumerate()
+        .filter(|(ordinal, _)| module.nif_body(*ordinal).is_some())
+        .map(|(_, (_, name, arity))| (name.as_str(), *arity))
         .collect::<std::collections::HashSet<_>>();
     let runtime_functions = compiled
         .functions
