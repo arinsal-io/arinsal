@@ -1779,10 +1779,8 @@ impl Vm {
     // address), OTP-29.1.1.
     pub(crate) fn native_entry_address(&self, module_id: usize, ip: usize) -> Option<usize> {
         let module = self.code.modules.get(module_id)?;
-        let (function, arity) = module.function_at(ip)?;
-        if module.entry_arity.get(ip).copied().unwrap_or(0) == 0 {
-            return None;
-        }
+        let (_, function, arity) = module.functions.get(module.function_by_entry(ip)?)?;
+        let (function, arity) = (function.as_str(), *arity);
         // The entry belongs to the module instance the process was spawned in; another
         // loaded version of the same module (old or current) has its own code. A module
         // loaded for the interpreter only may have native functions registered separately.
@@ -1905,11 +1903,7 @@ impl Vm {
         // A module whose functions all run natively has no interpreter form: a process left at
         // the entry of one of its functions (the return of an `-on_load` prelude, a call from
         // interpreted code) runs that function's native code, as erts jumps to its address.
-        if matches!(
-            self.code.modules[module_id].code.get(p.ip()),
-            Some(Instr::CodeEnd)
-        ) && crate::beamasm_integration::enabled()
-        {
+        if crate::beamasm_integration::enabled() {
             let module = &self.code.modules[module_id];
             if let Some(native) = self.beamasm_targets.function_for_target(
                 module_id,
@@ -1921,6 +1915,13 @@ impl Vm {
                 p.cold_mut().native_transfer = true;
                 return Ok(RunState::Yield);
             }
+        }
+        if self.code.modules[module_id].code.is_empty() {
+            return Err(VmError::Unsupported(format!(
+                "process position {} of {} is not a function entry of its native code",
+                p.ip(),
+                self.code.modules[module_id].name
+            )));
         }
         let mut base = self.code.modules[module_id].code.as_ptr();
         let mut ip = {

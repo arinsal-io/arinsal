@@ -829,6 +829,11 @@ impl Module {
 
     /// Redirect one exported entry through its generic breakpoint trampoline.
     pub fn set_global_trace_breakpoint(&self, index: usize, enabled: bool) {
+        // A native-only module has no interpreter entry to redirect: its breakpoints are in
+        // the native code.
+        if self.code.is_empty() {
+            return;
+        }
         if let Some(export) = self.exports.get(index) {
             let target = if enabled {
                 self.export_breakpoint_base + index
@@ -1874,7 +1879,6 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
     let mut functions = Vec::with_capacity(summary.len());
     let mut function_atoms = Vec::with_capacity(summary.len());
     let mut nif_stubs: Option<Vec<(String, u8)>> = None;
-    let mut code = Vec::with_capacity(2 * summary.len() + 4);
     for function in summary {
         let name = file
             .atom(function.function_atom)
@@ -1883,7 +1887,10 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
             .intern(name)
             .map_err(|_| LoadError::Atom(name.into()))?;
         let arity = u8::try_from(function.arity).map_err(|_| LoadError::Limit)?;
-        functions.push((code.len(), name.to_owned(), arity));
+        // A native-only module has no instruction stream; a function is named by the virtual
+        // offset of its `func_info` slot, two per function, and its entry is the one after.
+        let start = 2 * functions.len();
+        functions.push((start, name.to_owned(), arity));
         function_atoms.push(atom);
         if function.nif_stub {
             nif_stubs
@@ -1892,11 +1899,9 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
         }
         // The entry label is the label after the `func_info`: it names the instruction after
         // the function's `func_info` slot.
-        labels.insert(function.entry_label, code.len() + 1);
-        code.push(Instr::CodeEnd);
-        code.push(Instr::CodeEnd);
+        labels.insert(function.entry_label, start + 1);
     }
-    if code.len() > u32::MAX as usize {
+    if 2 * functions.len() > u32::MAX as usize {
         return Err(LoadError::Limit);
     }
     let funs = funs::load_funs(file, &labels)?;
@@ -1908,24 +1913,10 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
         .enumerate()
         .map(|(index, export)| ((export.function_atom, export.arity), index))
         .collect();
-    // A trailing sentinel, and the continuations tracing uses.
-    code.push(Instr::CodeEnd);
-    let return_trace_ip = code.len();
-    code.push(Instr::ReturnTrace);
-    let return_call_acc_trace_ip = code.len();
-    code.push(Instr::ReturnCallAccTrace);
-    let return_to_trace_ip = code.len();
-    code.push(Instr::ReturnToTrace);
     let export_entry_targets = exports
         .iter()
         .map(|export| export.target())
         .collect::<Vec<_>>();
-    let export_breakpoint_base = code.len();
-    for index in 0..exports.len() {
-        code.push(Instr::ExportBreakpoint {
-            index: u32::try_from(index).map_err(|_| LoadError::Limit)?,
-        });
-    }
     // The file names of the line table, as the terms stack traces carry.
     let mut line_file_terms = HashMap::new();
     if let Some(table) = &file.lines {
@@ -1946,27 +1937,7 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
             }
         }
     }
-    let types = vec![Vec::new(); code.len()];
-    let lines = LineRuns::from_slots(std::iter::repeat_n(None, code.len()));
-    let line_terms = LineRuns::from_slots(std::iter::repeat_n(None, code.len()));
-    let mut on_entry_fn = vec![u32::MAX; code.len()];
-    let mut entry_arity = vec![0_u16; code.len()];
-    let mut owner = u32::MAX;
-    let mut next_fn = 0_usize;
-    for (ip, slot) in on_entry_fn.iter_mut().enumerate() {
-        while next_fn < functions.len() && functions[next_fn].0 < ip {
-            owner = next_fn as u32;
-            next_fn += 1;
-        }
-        *slot = owner;
-    }
-    for (start, _, arity) in &functions {
-        let entry = start.saturating_add(1);
-        if entry < entry_arity.len() {
-            entry_arity[entry] = u16::from(*arity).saturating_add(1);
-        }
-    }
-    let code = code.into_boxed_slice();
+    let code: Box<[Instr]> = Box::new([]);
     for export in &exports {
         export.bind_code(code.as_ptr(), code.len());
     }
@@ -1987,23 +1958,23 @@ pub fn load_native(file: &BeamFile) -> Result<Module, LoadError> {
         lists: Vec::new(),
         bit_commands: Vec::new(),
         strings: file.strings.clone().into_boxed_slice(),
-        types,
-        lines,
+        types: Vec::new(),
+        lines: LineRuns::default(),
         line_file_terms,
-        line_terms,
+        line_terms: LineRuns::default(),
         unsupported: HashMap::new(),
         unsupported_reasons: Vec::new(),
         functions,
         function_atoms,
         nif_stubs,
         nif_bodies: unbound_nif_bodies(function_count),
-        on_entry_fn: on_entry_fn.into_boxed_slice(),
-        entry_arity: entry_arity.into_boxed_slice(),
+        on_entry_fn: Box::new([]),
+        entry_arity: Box::new([]),
         breakpoint_originals: HashMap::new(),
-        return_trace_ip,
-        return_call_acc_trace_ip,
-        return_to_trace_ip,
-        export_breakpoint_base,
+        return_trace_ip: 0,
+        return_call_acc_trace_ip: 0,
+        return_to_trace_ip: 0,
+        export_breakpoint_base: 0,
         export_entry_targets: export_entry_targets.into_boxed_slice(),
         coverage: None,
         coverage_probes: Vec::new(),
