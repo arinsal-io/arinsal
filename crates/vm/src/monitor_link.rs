@@ -1303,6 +1303,11 @@ impl LinkRef<'_> {
         node_other(self.node)
     }
 
+    /// The link type (`ERTS_LNK_TYPE_*`).
+    pub(crate) fn kind(self) -> u32 {
+        node_flags(self.node) & node_flag::TYPE_MASK
+    }
+
     /// `ERTS_ML_FLG_PRIO_ML`: exit signals from the other end are priority messages.
     pub(crate) fn is_priority(self) -> bool {
         node_flags(self.node) & node_flag::PRIO_ML != 0
