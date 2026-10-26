@@ -19,7 +19,7 @@ pub trait PollBackend: Send + Sync {
         id: u64,
         fd: i32,
         write: bool,
-        ready: Box<dyn FnOnce(bool) + Send>,
+        ready: Box<dyn FnOnce() + Send>,
     ) -> io::Result<()>;
     /// Remove registration `id`; when this returns `ready` will not run any more.
     fn deregister(&self, id: u64);

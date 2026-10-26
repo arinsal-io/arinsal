@@ -1619,17 +1619,7 @@ fn apply_opt(
                 return false;
             }
         }
-        #[cfg(target_os = "linux")]
-        OPT_NETNS => {
-            // Port of inet_drv.c:7151 (inet_set_opts, INET_LOPT_NETNS), OTP-29.1.1.
-            if val < 0 || *i + val as usize > data.len() {
-                return false;
-            }
-            inner.netns = Some(data[*i..*i + val as usize].to_vec());
-            *i += val as usize;
-        }
         // HAVE_SETNS is absent on macOS, so netns falls through to EINVAL.
-        #[cfg(not(target_os = "linux"))]
         OPT_NETNS => return false,
         #[cfg(have_so_bindtodevice)]
         OPT_BIND_TO_DEVICE => {
@@ -1906,16 +1896,6 @@ fn push_opt(inner: &Inner, code: u8, data: &[u8], i: &mut usize, out: &mut Vec<u
                 out.extend_from_slice(&name);
             }
         }
-        #[cfg(target_os = "linux")]
-        OPT_NETNS => {
-            // Port of inet_drv.c:9278-9288 (inet_fill_opts, INET_LOPT_NETNS), OTP-29.1.1.
-            if let Some(name) = &inner.netns {
-                out.push(code);
-                put_i32(out, name.len() as i32);
-                out.extend_from_slice(name);
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
         OPT_NETNS => return false,
         _ => return false,
     }
@@ -3230,8 +3210,6 @@ struct Inner {
     recvttl: bool,
     show_econnreset: bool,
     debug: bool,
-    #[cfg(target_os = "linux")]
-    netns: Option<Vec<u8>>,
     high: i32,
     low: i32,
     msgq_high: i32,
@@ -3332,8 +3310,6 @@ impl Default for Inner {
             recvttl: false,
             show_econnreset: false,
             debug: false,
-            #[cfg(target_os = "linux")]
-            netns: None,
             high: 8 * 1024,
             low: 4 * 1024,
             msgq_high: 8 * 1024,

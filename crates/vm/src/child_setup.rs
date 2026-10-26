@@ -254,21 +254,9 @@ impl Drop for ChildSetup {
     }
 }
 
-// Port of erts/emulator/sys/unix/sys_drivers.c (forker_start and forker_ready_input), OTP-29.1.1.
 fn response_loop(mut stream: UnixStream, pending: Arc<Mutex<Pending>>) {
     let mut frame = [0u8; FRAME_LEN];
     loop {
-        let fd = stream.as_raw_fd();
-        let interest = crate::check_io::InterestSet {
-            readable: true,
-            writable: false,
-        };
-        match crate::check_io::wait_any_timeout(&[(fd, interest)], None) {
-            Ok(Some((_, ready))) if ready.readable || ready.closed || ready.error => {}
-            Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        }
         if stream.read_exact(&mut frame).is_err() {
             break;
         }

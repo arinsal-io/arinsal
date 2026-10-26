@@ -99,7 +99,6 @@ pub(crate) struct Ready {
     pub writable: bool,
     pub closed: bool,
     pub error: bool,
-    pub invalid: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -389,7 +388,6 @@ impl Waker {
                             writable: false,
                             closed: false,
                             error: false,
-                            invalid: false,
                         },
                     ));
                     waiter.changed.notify_one();
@@ -424,7 +422,6 @@ fn wait_any_timeout_kind(
                     writable: false,
                     closed: false,
                     error: false,
-                    invalid: false,
                 },
             )));
         }
@@ -661,7 +658,6 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent, from: Pol
                         writable: watch.interests.writable && (seen.writable || poll_error),
                         closed: event.closed,
                         error: event.error || poll_error,
-                        invalid: event.events & ERTS_POLL_EV_NVAL != 0,
                     },
                 ));
             }
@@ -693,7 +689,6 @@ fn check_event(states: &FdStateTable, fd: RawFd, event: ErtsPollEvent, from: Pol
                         writable: watch.interests.writable,
                         closed: false,
                         error: true,
-                        invalid: false,
                     },
                 )
             })

@@ -164,16 +164,10 @@ accept_timeout() ->
 refused() ->
     gen_tcp:connect({127,0,0,1}, 1, tcp([{active, false}]), 400).
 
-%% The first connection fills the local listener's backlog, leaving the next
-%% non-blocking connect pending so the zero timer fires on both runtimes.
+%% 192.0.2.1 is TEST-NET-1 (RFC 5737): the SYN is not answered, so the
+%% connect timer fires. erts closes the socket and returns `{error, timeout}`.
 connect_timeout() ->
-    {ok, L} = gen_tcp:listen(0, tcp([{backlog, 1}, {active, false}])),
-    {ok, {_, Port}} = inet:sockname(L),
-    {ok, Filler} = gen_tcp:connect({127,0,0,1}, Port, tcp([{active, false}]), 1000),
-    Result = gen_tcp:connect({127,0,0,1}, Port, tcp([{active, false}]), 0),
-    gen_tcp:close(Filler),
-    gen_tcp:close(L),
-    Result.
+    gen_tcp:connect({192,0,2,1}, 1, tcp([{active, false}]), 200).
 
 names() ->
     {ok, L} = gen_tcp:listen(0, tcp([{ip, {127,0,0,1}}, {active, false}])),
