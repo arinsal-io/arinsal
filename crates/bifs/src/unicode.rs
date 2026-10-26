@@ -26,14 +26,16 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
     v: &mut V,
 ) -> Option<V::Output> {
     let f = match (module, name, arity) {
-        ("unicode", "characters_to_binary", 2) => v.entry::<bodies::characters_to_binary>(),
-        ("unicode", "characters_to_list", 2) => v.entry::<bodies::characters_to_list>(),
-        ("prim_file", "internal_name2native", 1) => v.entry::<bodies::internal_name2native>(),
-        ("prim_file", "internal_native2name", 1) => v.entry::<bodies::internal_native2name>(),
-        ("prim_file", "internal_normalize_utf8", 1) => v.entry::<bodies::internal_normalize_utf8>(),
-        ("prim_file", "is_translatable", 1) => v.entry::<bodies::is_translatable>(),
-        ("file", "native_name_encoding", 0) => v.entry::<bodies::native_name_encoding>(),
-        ("io", "printable_range", 0) => v.entry::<bodies::printable_range>(),
+        ("unicode", "characters_to_binary", 2) => v.entry::<word_bodies::characters_to_binary>(),
+        ("unicode", "characters_to_list", 2) => v.entry::<word_bodies::characters_to_list>(),
+        ("prim_file", "internal_name2native", 1) => v.entry::<word_bodies::internal_name2native>(),
+        ("prim_file", "internal_native2name", 1) => v.entry::<word_bodies::internal_native2name>(),
+        ("prim_file", "internal_normalize_utf8", 1) => {
+            v.entry::<word_bodies::internal_normalize_utf8>()
+        }
+        ("prim_file", "is_translatable", 1) => v.entry::<word_bodies::is_translatable>(),
+        ("file", "native_name_encoding", 0) => v.entry::<word_bodies::native_name_encoding>(),
+        ("io", "printable_range", 0) => v.entry::<word_bodies::printable_range>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -776,7 +778,19 @@ fn process_binary(
     Ok(None)
 }
 
-fn characters_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+#[inline(always)]
+fn characters_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match characters_to_binary_result(ctx, args) {
+        Ok(_) if ctx.has_deferred() => match *ctx.take_deferred().expect("deferred Unicode trap") {
+            DeferredTrap::Unicode(cont) => ctx.trap(DeferredTrap::Unicode(cont)),
+            _ => unreachable!("Unicode conversion only defers Unicode traps"),
+        },
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+fn characters_to_binary_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if let Some(binary) = unicode_utf8_binary_fast_path(args)? {
         return Ok(binary);
     }
@@ -870,18 +884,28 @@ mod tests {
         let mut ctx = Ctx::new(&mut allocator);
 
         similar_asserts::assert_eq!(
-            characters_to_binary(&mut ctx, &[binary, utf8]).unwrap(),
+            characters_to_binary_result(&mut ctx, &[binary, utf8]).unwrap(),
             binary
         );
         similar_asserts::assert_eq!(
-            characters_to_binary(&mut ctx, &[singleton, utf8]).unwrap(),
+            characters_to_binary_result(&mut ctx, &[singleton, utf8]).unwrap(),
             binary
         );
     }
 }
 
-fn characters_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    convert_charged(ctx, args, true)
+#[inline(always)]
+fn characters_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match convert_charged(ctx, args, true) {
+        Ok(_value) if ctx.has_deferred() => {
+            match *ctx.take_deferred().expect("deferred Unicode trap") {
+                DeferredTrap::Unicode(cont) => ctx.trap(DeferredTrap::Unicode(cont)),
+                _ => unreachable!("Unicode conversion only defers Unicode traps"),
+            }
+        }
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
 }
 
 /// Iterations of the conversion loops that make up one reduction.
@@ -1308,7 +1332,15 @@ fn filename_list_bytes(root: Term, encoding: FilenameEncoding) -> Result<Vec<u8>
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2629 (prim_file_internal_name2native_1), OTP-29.1.1.
-fn internal_name2native(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+#[inline(always)]
+fn internal_name2native(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match internal_name2native_result(ctx, args) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+fn internal_name2native_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let mut data = if args[0].classify() == TermKind::Bitstring {
         let data = bytes(args[0])?;
         if data.contains(&0) {
@@ -1327,7 +1359,15 @@ fn codepoint_list(ctx: &mut Ctx<'_>, points: impl IntoIterator<Item = u32>) -> T
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2735 (prim_file_internal_native2name_1), OTP-29.1.1.
-fn internal_native2name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+#[inline(always)]
+fn internal_native2name(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match internal_native2name_result(ctx, args) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+fn internal_native2name_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let data = bytes(args[0])?;
     if data.is_empty() {
         return Ok(Term::NIL);
@@ -1351,7 +1391,15 @@ fn internal_native2name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifErr
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2826 (prim_file_internal_normalize_utf8_1), OTP-29.1.1.
-fn internal_normalize_utf8(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+#[inline(always)]
+fn internal_normalize_utf8(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match internal_normalize_utf8_result(ctx, args) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+fn internal_normalize_utf8_result(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let data = bytes(args[0])?;
     let text = std::str::from_utf8(&data).map_err(|_| BifError::BADARG)?;
     let points = text.chars().map(|c| c as u32).collect::<Vec<_>>();
@@ -1359,7 +1407,15 @@ fn internal_normalize_utf8(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, Bif
 }
 
 // Port of erts/emulator/beam/erl_unicode.c:2855 (prim_file_is_translatable_1), OTP-29.1.1.
-fn is_translatable(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+#[inline(always)]
+fn is_translatable(ctx: &mut Ctx<'_>, args: &[Term]) -> Term {
+    match is_translatable_result(ctx, args) {
+        Ok(value) => value,
+        Err(error) => ctx.fail(error),
+    }
+}
+
+fn is_translatable_result(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let data = bytes(args[0])?;
     Ok(bool_term(
         data.is_empty()
@@ -1409,16 +1465,18 @@ fn filename_encoding() -> FilenameEncoding {
 }
 
 // Port of erts/emulator/beam/erl_unicode.c (file_native_name_encoding_0), OTP-29.1.1.
-fn native_name_encoding(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
-    Ok(atom(match filename_encoding() {
+#[inline(always)]
+fn native_name_encoding(_: &mut Ctx<'_>, _: &[Term]) -> Term {
+    atom(match filename_encoding() {
         FilenameEncoding::Latin1 => "latin1",
         FilenameEncoding::Utf8 | FilenameEncoding::Utf8Mac => "utf8",
-    }))
+    })
 }
 
 // OTP 29.1.1 defaults without the +pc emulator flag.
-fn printable_range(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
-    Ok(atom("latin1"))
+#[inline(always)]
+fn printable_range(_: &mut Ctx<'_>, _: &[Term]) -> Term {
+    atom("latin1")
 }
 
 enum Translation {
@@ -2468,7 +2526,7 @@ const COMPOSITIONS: &[([u16; 4], u8, u16)] = &[
     ([12442, 12507, 0, 0], 2, 12509),
 ];
 
-crate::bif_bodies!(
+crate::word_bif_bodies_in!(word_bodies;
     characters_to_binary,
     characters_to_list,
     internal_name2native,

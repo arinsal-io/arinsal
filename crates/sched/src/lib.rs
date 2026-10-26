@@ -1290,6 +1290,14 @@ impl<T: Task> Process<T> {
 ///
 /// Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element,
 /// erts_ptab_delete_element, erts_ptab_test_next_id), OTP-29.1.1.
+struct ProcessReservation<'a> {
+    _shared: arinsal_term::FrequentReadGuard<'a, ()>,
+    data: u64,
+    pid: Pid,
+    pix: usize,
+    started_interval: u64,
+}
+
 struct ProcessTable<T: Task> {
     ids: PtabIdRing,
     /// `ptab->list.data.rwmtx`: test_next_id excludes concurrent inserts and removals.
@@ -1611,20 +1619,25 @@ impl<T: Task> ProcessTable<T> {
         priority: Priority,
         bound_worker: Option<usize>,
     ) -> Result<ProcRef<T>, SpawnInitError<E>> {
-        // Port of erts/emulator/beam/erl_ptab.c:500 (erts_ptab_new_element), OTP-29.1.1.
-        let _shared = self.lock.read();
-        let data = self
-            .ids
-            .reserve()
-            .ok_or(SpawnInitError::Table(Error::Capacity))?;
-        let pid = Pid::from_data(data);
-        let pix = self.ids.layout().data2pix(data) as usize;
-        let (process, initialized) = ProcRef::new_with(
-            || Process {
-                pid,
+        // Port of erts/emulator/beam/erl_process.c (alloc_process), OTP-29.1.1: allocate the
+        // Process block before erts_ptab_new_element takes the table lock.
+        let Some((process, initialized, context)) = ProcRef::new_with(
+            || {
+                // Port of erts/emulator/beam/erl_ptab.c:500 (erts_ptab_new_element), OTP-29.1.1.
+                let shared = self.lock.read();
+                self.ids.reserve().map(|data| ProcessReservation {
+                    _shared: shared,
+                    data,
+                    pid: Pid::from_data(data),
+                    pix: self.ids.layout().data2pix(data) as usize,
+                    started_interval: self.interval.load(Ordering::Relaxed),
+                })
+            },
+            |context| Process {
+                pid: context.pid,
                 // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element:
                 // erts_current_interval_nob), OTP-29.1.1.
-                started_interval: self.interval.load(Ordering::Relaxed),
+                started_interval: context.started_interval,
                 user_priority: AtomicU8::new(priority.index() as u8),
                 active: AtomicBool::new(true),
                 sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
@@ -1648,20 +1661,23 @@ impl<T: Task> ProcessTable<T> {
                 queued_prio: AtomicU8::new(0),
                 cell: parking_lot::Mutex::new(TaskCell::uninit()),
             },
-            |process| {
+            |process, _context| {
                 // alloc_process: the task is written straight into the allocated struct.
                 let cell = process.cell.get_mut();
                 cell.init_with(make);
                 init(cell.task_mut())
             },
-        );
+        ) else {
+            return Err(SpawnInitError::Table(Error::Capacity));
+        };
         if let Err(error) = initialized {
             drop(process);
-            self.ids.release(data);
+            self.ids.release(context.data);
             return Err(SpawnInitError::Init(error));
         }
         // The table's reference (erts `refc` 1 at erts_ptab_new_element).
-        self.slots[pix].store(process.clone().into_raw(), Ordering::Release);
+        self.slots[context.pix].store(process.clone().into_raw(), Ordering::Release);
+        drop(context);
         Ok(process)
     }
 
