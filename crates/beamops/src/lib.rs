@@ -5,8 +5,14 @@
 #[allow(dead_code)]
 mod beam_op;
 mod erts_tables;
+#[allow(dead_code)]
+mod loader_state;
 #[path = "rule_syntax.rs"]
 mod rule_syntax;
+#[allow(dead_code)]
+mod transform_helpers;
+#[cfg(test)]
+mod transform_helpers_tests;
 use arinsal_beam::{BeamFile, Instr, Operand};
 use arinsal_etf::OwnedTerm;
 use arinsal_spec::BifKind;

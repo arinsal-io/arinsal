@@ -10,6 +10,7 @@ impl Makeops {
     /// The engine function and the atom constants it compares with.
     pub fn emit_engine(&self, programs: &Programs) -> String {
         let mut atoms: BTreeSet<String> = BTreeSet::new();
+        let mut bifs: BTreeSet<String> = BTreeSet::new();
         let mut body = String::new();
         let mut label = 0usize;
 
@@ -65,7 +66,7 @@ impl Makeops {
                         }
                         _ => {}
                     }
-                    self.gen_te_instr(&mut body, &mut atoms, ap, ip, &fail_action, step);
+                    self.gen_te_instr(&mut body, &mut atoms, &mut bifs, ap, ip, &fail_action, step);
                 }
             }
             body.push_str("        }\n");
@@ -81,14 +82,21 @@ impl Makeops {
                 atom
             ));
         }
+        for bif in &bifs {
+            out.push_str(&format!(
+                "const {}: u16 = bif_id({:?});\n",
+                bif.to_uppercase(),
+                bif.strip_prefix("BIF_").unwrap()
+            ));
+        }
         out.push_str(
-            "\n#[allow(unreachable_code, unused_labels, unused_assignments, unused_mut, unused_variables, clippy::all)]\npub(crate) fn erts_transform_engine_body(st: &mut LoaderState, rest_args: &mut Vec<BeamOpArg>) -> TeResult {\n",
+            "\n#[allow(unreachable_code, unused_labels, unused_assignments, unused_mut, unused_variables, clippy::all)]\npub(crate) fn erts_transform_engine_body(st: &mut LoaderState) -> TeResult {\n",
         );
         for n in 0..programs.te_max_vars {
             out.push_str(&format!("    let mut v{n} = BeamOpArg::default();\n"));
         }
         out.push_str(
-            "    let first: OpId = st.genop.expect(\"the engine runs on a non-empty window\");\n    let mut instr: Option<OpId> = Some(first);\n    let mut keep: Option<OpId> = None;\n    let mut num_rest_args: usize = 0;\n    match st.ops.op(first).op {\n",
+            "    let first: OpId = st.genop.expect(\"the engine runs on a non-empty window\");\n    let mut instr: Option<OpId> = Some(first);\n    let mut keep: Option<OpId> = None;\n    let mut rest_args = RestArgs { op: first, start: 0, len: 0 };\n    let mut num_rest_args: usize = 0;\n    match st.ops.op(first).op {\n",
         );
         out.push_str(&body);
         out.push_str(
@@ -97,10 +105,12 @@ impl Makeops {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn gen_te_instr(
         &self,
         out: &mut String,
         atoms: &mut BTreeSet<String>,
+        bifs: &mut BTreeSet<String>,
         ap: usize,
         ip: isize,
         fail: &str,
@@ -130,7 +140,11 @@ impl Makeops {
                 let specific = if number == "-1" {
                     String::new()
                 } else {
-                    format!("if entry != Some(bif_ids::{number}) {{ {fail}; }}\n")
+                    bifs.insert(number.clone());
+                    format!(
+                        "if entry != Some({}) {{ {fail}; }}\n",
+                        number.to_uppercase()
+                    )
                 };
                 out.push_str(&format!(
                     "// Is {comment} a BIF?\n{{\nlet a = st.ops.op(instr.unwrap()).a({ap});\ndebug_assert!(a.ty == TAG_U);\nif a.ty != TAG_U {{ {fail}; }}\nlet i = a.val as usize;\ndebug_assert!(i < st.imports.len());\nif i >= st.imports.len() {{ {fail}; }}\nlet entry = st.bif_imports[i];\nif entry.is_none() {{ {fail}; }}\n{specific}}}\n"
@@ -176,19 +190,19 @@ impl Makeops {
             "call" => {
                 let call = call_args(&args[1..]);
                 out.push_str(&format!(
-                    "// Call generator {0}()\n{{\nlet Some(new_instr) = gen::{0}(st{call}) else {{ {fail}; }};\nkeep = st.ops.op(instr.unwrap()).next; // The next_instr was optimized away.\nlet mut tail = new_instr;\nwhile let Some(next) = st.ops.op(tail).next {{ tail = next; }}\nst.ops.op_mut(tail).next = keep;\ninstr = Some(new_instr);\n}}\n",
+                    "// Call generator {0}()\n{{\nlet Some(new_instr) = generators::{0}(st{call}) else {{ {fail}; }};\nkeep = st.ops.op(instr.unwrap()).next; // The next_instr was optimized away.\nlet mut tail = new_instr;\nwhile let Some(next) = st.ops.op(tail).next {{ tail = next; }}\nst.ops.op_mut(tail).next = keep;\ninstr = Some(new_instr);\n}}\n",
                     args[0]
                 ));
             }
             "pred" => {
                 let call = call_args(&args[1..]);
                 out.push_str(&format!(
-                    "// Call predicate {0}()\nif !pred::{0}(st{call}) {{\n    {fail};\n}}\n",
+                    "// Call predicate {0}()\nif !predicates::{0}(st{call}) {{\n    {fail};\n}}\n",
                     args[0]
                 ));
             }
             "rest_args" => out.push_str(&format!(
-                "// Store dynamic arguments ({comment})\nrest_args.clear();\nrest_args.extend_from_slice(&st.ops.op(instr.unwrap()).args()[{}..]);\nnum_rest_args = rest_args.len();\n",
+                "// Store dynamic arguments ({comment})\nrest_args = RestArgs {{ op: instr.unwrap(), start: {0}, len: st.ops.op(instr.unwrap()).arity - {0} }};\nnum_rest_args = rest_args.len;\n",
                 args[0]
             )),
             "commit" => out.push_str(&format!(
@@ -226,7 +240,7 @@ impl Makeops {
                 args[1]
             )),
             "store_rest_args" => out.push_str(&format!(
-                "// Store dynamic arguments ({comment})\ndebug_assert!(st.ops.op(instr.unwrap()).uses_def_args());\n{{\nlet o = st.ops.op_mut(instr.unwrap());\nlet arity = o.arity + num_rest_args;\no.spill(arity, {ap});\nfor (k, arg) in rest_args.iter().enumerate() {{ o.set_a({ap} + k, *arg); }}\n}}\n"
+                "// Store dynamic arguments ({comment})\ndebug_assert!(st.ops.op(instr.unwrap()).uses_def_args());\n{{\nlet o = st.ops.op_mut(instr.unwrap());\nlet arity = o.arity + num_rest_args;\no.spill(arity, {ap});\n}}\nfor k in 0..num_rest_args {{\nlet v = st.ops.op(rest_args.op).a(rest_args.start + k);\nst.ops.op_mut(instr.unwrap()).set_a({ap} + k, v);\n}}\n"
             )),
             "end" => out.push_str(
                 "// End of transformation\nst.genop = instr;\nlet mut f = Some(first);\nwhile f != keep {\n    let id = f.expect(\"keep is on the chain\");\n    f = st.ops.op(id).next;\n    st.ops.free_op(id);\n}\nreturn TeResult::Ok;\n",
@@ -252,7 +266,7 @@ fn call_args(args: &[String]) -> String {
     args.iter()
         .map(|a| {
             if a == "rest_args" {
-                ", &rest_args[..]".to_owned()
+                ", rest_args".to_owned()
             } else {
                 format!(", {a}")
             }
