@@ -126,7 +126,7 @@ pub(super) fn execute_compact(
         }
         _ => unreachable!(),
     }
-    p.ip += 1;
+    p.set_ip(p.ip() + 1);
     Ok(())
 }
 
@@ -198,7 +198,7 @@ impl<F: Fn() -> String> FrameName for F {
 #[inline]
 fn branch(p: &mut Process, fail: Arg, frame: &(impl FrameName + ?Sized)) -> Result<(), VmError> {
     if fail.kind() == Arg::LABEL && fail.value() != u32::MAX as u64 {
-        p.ip = fail.value() as usize;
+        p.set_ip(fail.value() as usize);
         Ok(())
     } else {
         Err(VmError::Exception {
@@ -538,7 +538,7 @@ fn match_commands(
         offset += width;
         command_index += 1;
     }
-    p.ip += 1;
+    p.set_ip(p.ip() + 1);
     Ok(())
 }
 
@@ -585,7 +585,7 @@ pub(super) fn execute(
                     frame,
                 )?;
                 p.write(module.arg(op, 4), value)?;
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 return Ok(());
             }
             let initial = match segments(p, module, args) {
@@ -625,7 +625,7 @@ pub(super) fn execute(
                 .reductions
                 .saturating_sub(bit_copy_cost.min(i32::MAX as usize) as i32);
             p.write(module.arg(op, 4), value)?;
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             Ok(())
         }
         Opcode::BsMatch => match_commands(p, module, op, frame),
@@ -657,7 +657,7 @@ pub(super) fn execute(
             };
             if let Some(value) = result {
                 p.write(module.arg(op, 3), value)?;
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 Ok(())
             } else {
                 branch(p, a, frame)
@@ -675,7 +675,7 @@ pub(super) fn execute(
                 frame,
             )?;
             p.write(b, value)?;
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             Ok(())
         }
         Opcode::BsGetPosition => {
@@ -691,7 +691,7 @@ pub(super) fn execute(
                 frame,
             )?;
             p.write(b, value)?;
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             Ok(())
         }
         Opcode::BsSetPosition => {
@@ -701,18 +701,18 @@ pub(super) fn execute(
                     frame: frame.to_frame_string(),
                 });
             }
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             Ok(())
         }
         Opcode::BsInitWritable => {
             let value = allocated(p, 0, |p| init_writable(&mut p.heap), frame)?;
             p.x[0] = value;
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             Ok(())
         }
         Opcode::IsBitstr => {
             if p.read(b)?.classify() == TermKind::Bitstring {
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 Ok(())
             } else {
                 branch(p, a, frame)
@@ -724,7 +724,7 @@ pub(super) fn execute(
             let is_binary =
                 unsafe { term.binary_ref() }.is_some_and(|view| view.bit_len().is_multiple_of(8));
             if is_binary {
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 Ok(())
             } else {
                 branch(p, a, frame)
@@ -739,7 +739,7 @@ pub(super) fn execute(
                 ctx.test_unit(n)
             };
             if ok {
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 Ok(())
             } else {
                 branch(p, a, frame)
@@ -750,7 +750,7 @@ pub(super) fn execute(
                 return branch(p, a, frame);
             };
             if p.read(b)?.skip(bits) {
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 Ok(())
             } else {
                 branch(p, a, frame)
@@ -778,7 +778,7 @@ pub(super) fn execute(
             )?;
             if let Some(value) = result {
                 p.write(module.arg(op, 6), value)?;
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 Ok(())
             } else {
                 branch(p, a, frame)
@@ -808,7 +808,7 @@ pub(super) fn execute(
                 ) {
                     p.write(module.arg(op, 4), value)?;
                 }
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 Ok(())
             } else {
                 branch(p, a, frame)
@@ -824,7 +824,7 @@ pub(super) fn execute(
                 .ok_or_else(|| VmError::Unsupported("string table range".into()))?;
             let context = p.read(b)?;
             if context.match_string(expected, bits) {
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 Ok(())
             } else {
                 branch(p, a, frame)

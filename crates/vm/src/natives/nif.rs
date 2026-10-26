@@ -1632,7 +1632,7 @@ fn call_on_load(vm: &mut Vm, process: &mut Process, module: Term) -> Result<Term
         })
         .ok_or_else(badarg)?;
     let caller = process.module;
-    let return_ip = process.ip.saturating_add(1);
+    let return_ip = process.ip().saturating_add(1);
     push_continuation(process, caller, return_ip)?;
     // `call_import` advances `ip` by one. The BEAM `on_load` opcode is only a
     // marker; skip that unsupported instruction and land on the real body.
@@ -1646,7 +1646,7 @@ fn call_on_load(vm: &mut Vm, process: &mut Process, module: Term) -> Result<Term
         landing = entry + 1;
     }
     process.module = id;
-    process.ip = landing;
+    process.set_ip(landing);
     Ok(atom("ok"))
 }
 

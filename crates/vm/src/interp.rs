@@ -35,7 +35,7 @@ fn record_field_value(
 }
 
 fn record_branch(p: &mut Process, fail: Arg) {
-    p.ip = fail.value() as usize;
+    p.set_ip(fail.value() as usize);
 }
 
 fn has_label(fail: Arg) -> bool {
@@ -111,7 +111,7 @@ fn execute_put_record(
             .update_native_record(&snapshot, &pairs)
             .map_err(|_| VmError::Unsupported("native record update".into()))?;
         p.write(destination, record)?;
-        p.ip += 1;
+        p.set_ip(p.ip() + 1);
         return Ok(());
     }
     // Local records name the record by an atom; external ones by `{Module, Name}`.
@@ -198,7 +198,7 @@ fn execute_put_record(
         .native_record(module_atom, name_atom, definition.is_exported, &fields)
         .map_err(|_| VmError::Unsupported("native record allocation".into()))?;
     p.write(destination, record)?;
-    p.ip += 1;
+    p.set_ip(p.ip() + 1);
     Ok(())
 }
 
@@ -226,7 +226,7 @@ fn execute_record_test(p: &mut Process, module: &Module, op: &GenericOp) -> Resu
         }
     };
     if passed {
-        p.ip += 1;
+        p.set_ip(p.ip() + 1);
     } else {
         record_branch(p, fail);
     }
@@ -279,7 +279,7 @@ fn execute_get_record_elements(
     for (destination, value) in found {
         p.write(destination, value)?;
     }
-    p.ip += 1;
+    p.set_ip(p.ip() + 1);
     Ok(())
 }
 
@@ -352,7 +352,7 @@ fn execute_get_record_field(
     match outcome {
         Outcome::Value(value) => {
             p.write(destination, value)?;
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
         }
         _ if has_label(fail) => record_branch(p, fail),
         Outcome::BadRecord => return Err(record_trap(p, "badrecord", source)),
@@ -446,7 +446,7 @@ fn execute_get_map_elements(
             Err(_) => return maps::execute(p, module, op, ""),
         }
     }
-    p.ip += 1;
+    p.set_ip(p.ip() + 1);
     Ok(())
 }
 
@@ -454,7 +454,7 @@ fn branch_map_failure(p: &mut Process, fail: Arg) -> Result<(), VmError> {
     if fail.kind() != Arg::LABEL || fail.value() == u32::MAX as u64 {
         return Err(VmError::Unsupported("map failure label zero".into()));
     }
-    p.ip = fail.value() as usize;
+    p.set_ip(fail.value() as usize);
     Ok(())
 }
 
@@ -527,12 +527,12 @@ fn execute_tuple_bif(
     };
     if let Some(value) = result {
         write_fast_x(p, dst, value)?;
-        p.ip += 1;
+        p.set_ip(p.ip() + 1);
         return Ok(true);
     }
 
     if fail.kind() == Arg::LABEL && fail.value() != u32::MAX as u64 {
-        p.ip = fail.value() as usize;
+        p.set_ip(fail.value() as usize);
         return Ok(true);
     }
     let function = if is_element { "element" } else { "setelement" };
@@ -632,7 +632,7 @@ fn execute_small_bif(
     };
     p.gc_live = live;
     write_fast_x(p, dst, result)?;
-    p.ip += 1;
+    p.set_ip(p.ip() + 1);
     Ok(true)
 }
 
@@ -684,9 +684,9 @@ fn execute_guard_bif(
             });
         if let Ok(value) = result {
             write_fast_x(p, dst, value)?;
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
         } else {
-            p.ip = fail.value() as usize;
+            p.set_ip(fail.value() as usize);
         }
         return Ok(true);
     }
@@ -744,11 +744,11 @@ fn execute_guard_bif(
     if let Some(value) = value {
         p.gc_live = live;
         write_fast_x(p, dst, value)?;
-        p.ip += 1;
+        p.set_ip(p.ip() + 1);
         return Ok(true);
     }
     if fail.kind() == Arg::LABEL && fail.value() != u32::MAX as u64 {
-        p.ip = fail.value() as usize;
+        p.set_ip(fail.value() as usize);
         return Ok(true);
     }
     let function = match import.fast_op {
@@ -1646,7 +1646,7 @@ impl Vm {
                 frame: format!("{module}:{function}/{}", args.len()),
             })?;
         process.module = module_id;
-        process.ip = ip;
+        process.set_ip(ip);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: copy_struct of the
         // arguments), OTP-29.1.1: the process owns its arguments, so a collection never
         // meets a term outside its heap and the literal areas.
@@ -1674,7 +1674,7 @@ impl Vm {
                 Err(VmError::ExceptionInfo { reason, info, .. }) => {
                     let mut trap = exceptions::from_legacy(&reason)?;
                     let arity = self.code.modules[process.module]
-                        .function_at(process.ip)
+                        .function_at(process.ip())
                         .map(|(_, arity)| arity)
                         .unwrap_or(0);
                     trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
@@ -1697,7 +1697,7 @@ impl Vm {
     }
     pub(crate) fn frame_name(&self, p: &Process) -> String {
         let module = &self.code.modules[p.module];
-        let (name, arity) = module.function_at(p.ip).unwrap_or(("?", 0));
+        let (name, arity) = module.function_at(p.ip()).unwrap_or(("?", 0));
         format!("{}:{name}/{arity}", module.name)
     }
     pub(crate) fn exception(&self, p: &Process, reason: impl Into<String>) -> VmError {
@@ -1742,11 +1742,70 @@ impl Vm {
         Ok(process.inbox.save() >= process.inbox.len())
     }
 
+    /// Puts the process at function entry `target` of module `module_id`: at the function's
+    /// code address in the JIT flavor (as erts jumps to the export's code address), at its
+    /// interpreter position otherwise.
+    // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
+    pub(crate) fn set_position(&mut self, p: &mut Process, module_id: usize, target: usize) {
+        if crate::beamasm_integration::enabled()
+            && let Some(module) = self.code.modules.get(module_id)
+            && let Some(native) = self.beamasm_targets.function_for_target(
+                module_id,
+                module,
+                crate::load::native_code_range(&self.code.code_meta, module_id),
+                target,
+            )
+        {
+            p.native_pc = Some(native.start);
+            return;
+        }
+        p.module = module_id;
+        p.set_ip(target);
+    }
+
+    /// The code address a process spawned at function entry `ip` of module `module_id` starts at:
+    /// the function's export address when it belongs to that module instance, else the
+    /// function's own code.
+    // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process: I is the export's
+    // address), OTP-29.1.1.
+    pub(crate) fn native_entry_address(&self, module_id: usize, ip: usize) -> Option<usize> {
+        let module = self.code.modules.get(module_id)?;
+        let (function, arity) = module.function_at(ip)?;
+        if module.entry_arity.get(ip).copied().unwrap_or(0) == 0 {
+            return None;
+        }
+        // The entry belongs to the module instance the process was spawned in; another
+        // loaded version of the same module (old or current) has its own code. A module
+        // loaded for the interpreter only may have native functions registered separately.
+        match self
+            .code
+            .code_meta
+            .get(module_id)
+            .and_then(|meta| meta.as_ref())
+            .and_then(|meta| meta.beamasm.as_ref())
+        {
+            Some(version) => module
+                .function_atom_at(ip)
+                .and_then(|(function, arity)| {
+                    crate::beamasm_integration::export_native_target(
+                        self.code_scope,
+                        module.name_atom,
+                        function,
+                        arity,
+                    )
+                })
+                .filter(|&address| version.contains_code(address))
+                .or_else(|| version.native_function_start(function, arity)),
+            None => crate::native_function_for(self.code_scope, &module.name, function, arity)
+                .map(|native| native.start),
+        }
+    }
+
     /// After an apply left the process at an interpreted jump target, enter that function's
     /// native code if it has any, as erts jumps to the export's code address.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
     pub(crate) fn enter_native_at_jump(&mut self, p: &mut Process) {
-        if !crate::beamasm_integration::enabled() {
+        if !crate::beamasm_integration::enabled() || p.native_pc.is_some() {
             return;
         }
         let Some(module) = self.code.modules.get(p.module) else {
@@ -1756,7 +1815,7 @@ impl Vm {
             p.module,
             module,
             crate::load::native_code_range(&self.code.code_meta, p.module),
-            p.ip,
+            p.ip(),
         ) {
             p.native_pc = Some(native.start);
         }
@@ -1773,10 +1832,10 @@ impl Vm {
             let Some(module) = self.code.modules.get(p.module) else {
                 return error;
             };
-            let Some(&instr) = module.code.get(p.ip) else {
+            let Some(&instr) = module.code.get(p.ip()) else {
                 return error;
             };
-            let (function, arity) = module.function_at(p.ip).unwrap_or(("?", 0));
+            let (function, arity) = module.function_at(p.ip()).unwrap_or(("?", 0));
             let opcode = match instr {
                 Instr::Generic(index) => module.generic[index as usize].opcode().name(),
                 _ => instr_name(instr),
@@ -1829,7 +1888,7 @@ impl Vm {
                     module_id,
                     module,
                     crate::load::native_code_range(&self.code.code_meta, module_id),
-                    p.ip,
+                    p.ip(),
                 )
                 .is_some();
             crate::beamasm_integration::count_interp_slice(at_native_entry);
@@ -1838,7 +1897,7 @@ impl Vm {
         // the entry of one of its functions (the return of an `-on_load` prelude, a call from
         // interpreted code) runs that function's native code, as erts jumps to its address.
         if matches!(
-            self.code.modules[module_id].code.get(p.ip),
+            self.code.modules[module_id].code.get(p.ip()),
             Some(Instr::CodeEnd)
         ) && crate::beamasm_integration::enabled()
         {
@@ -1847,7 +1906,7 @@ impl Vm {
                 module_id,
                 module,
                 crate::load::native_code_range(&self.code.code_meta, module_id),
-                p.ip,
+                p.ip(),
             ) {
                 p.native_pc = Some(native.start);
                 p.cold_mut().native_transfer = true;
@@ -1857,7 +1916,7 @@ impl Vm {
         let mut base = self.code.modules[module_id].code.as_ptr();
         let mut ip = {
             // SAFETY: Export indices are resolved to this code allocation by the loader.
-            unsafe { base.add(p.ip) }
+            unsafe { base.add(p.ip()) }
         };
         let mut x = p.x.as_mut_ptr();
         let mut fr = p.fr_ptr();
@@ -2110,7 +2169,7 @@ impl Vm {
                 p.gc_live = live;
                 sync_cursor(p, htop, &mut heap_dirty);
                 p.module = module_id;
-                p.ip = offset;
+                p.set_ip(offset);
                 p.reductions = reds;
                 return Ok(RunState::Yield);
             }
@@ -2126,7 +2185,7 @@ impl Vm {
                 p.reductions_used = p.reductions_used.saturating_add(1);
             }
             p.module = module_id;
-            p.ip = offset;
+            p.set_ip(offset);
             let module = module_handle.as_ref();
             let instr = fetched;
             #[cfg(feature = "instr-count")]
@@ -2208,7 +2267,7 @@ impl Vm {
                                 p.x[2] = argument_list;
                                 p.gc_live = 3;
                                 p.module = module_id;
-                                p.ip = entry_ip;
+                                p.set_ip(entry_ip);
                                 p.reductions = reds;
                                 let breakpoint_import = module.debug_breakpoint_import as usize;
                                 let outcome = self.call_import(
@@ -2433,7 +2492,7 @@ impl Vm {
                         reds -= 1;
                         if reds <= 0 {
                             p.module = module_id;
-                            p.ip = offset;
+                            p.set_ip(offset);
                             p.reductions = reds;
                             return Ok(RunState::Yield);
                         }
@@ -2701,7 +2760,7 @@ impl Vm {
                     p.x[3] = Term::small(i64::from(line)).expect("line is a small integer");
                     p.gc_live = 4;
                     p.module = module_id;
-                    p.ip = offset;
+                    p.set_ip(offset);
                     p.reductions = reds;
                     let outcome = self.call_import(
                         p,
@@ -2741,7 +2800,7 @@ impl Vm {
                             ip = target;
                         }
                         ImportOutcome::Advanced => {
-                            ip = base.wrapping_add(p.ip);
+                            ip = base.wrapping_add(p.ip());
                         }
                     }
                     continue;
@@ -2783,7 +2842,7 @@ impl Vm {
                     // Port of erts/emulator/beam/emu/instrs.tab (`call_bif`), OTP-29.1.1.
                     // Exception capture reads the active call site from the process.
                     p.module = module_id;
-                    p.ip = instruction_offset(base, ip);
+                    p.set_ip(instruction_offset(base, ip));
                     p.reductions = reds;
                     let (result, bif_reductions) =
                         if let Some(result) = call_fast_tuple_bif(p, fast_op, arity as usize) {
@@ -2873,7 +2932,7 @@ impl Vm {
                         // Port of erts/emulator/beam/emu/instrs.tab (`call_ext`), OTP-29.1.1.
                         // Keep the raising BIF's call site available to stack capture.
                         p.module = module_id;
-                        p.ip = instruction_offset(base, ip);
+                        p.set_ip(instruction_offset(base, ip));
                         // Native entry takes its reduction counter from the
                         // process, not the interpreter's cached `reds`.
                         p.reductions = reds;
@@ -2946,7 +3005,7 @@ impl Vm {
                         None
                     };
                     p.module = module_id;
-                    p.ip = offset;
+                    p.set_ip(offset);
                     p.reductions = reds;
                     let outcome = match self.call_import(
                         p,
@@ -3033,7 +3092,7 @@ impl Vm {
                         ImportOutcome::Jump(target) => target,
                         ImportOutcome::Advanced => {
                             // SAFETY: The continuation uses a resolved code index.
-                            unsafe { base.add(p.ip) }
+                            unsafe { base.add(p.ip()) }
                         }
                     };
                     // Port of erts/emulator/beam/emu/trace_instrs.tab:110 (i_yield), OTP-29.1.1.
@@ -3059,7 +3118,7 @@ impl Vm {
                         ) {
                             sync_cursor(p, htop, &mut heap_dirty);
                             p.module = module_id;
-                            p.ip = target_ip;
+                            p.set_ip(target_ip);
                             p.reductions = reds;
                             p.native_pc = Some(native.start);
                             p.cold_mut().native_transfer = true;
@@ -3103,7 +3162,7 @@ impl Vm {
                         // callee returns to the exit bridge, which resumes it with XREG0.
                         sync_cursor(p, htop, &mut heap_dirty);
                         p.module = module_id;
-                        p.ip = target as usize;
+                        p.set_ip(target as usize);
                         p.reductions = reds;
                         p.native_pc = Some(native.start);
                         p.cold_mut().native_transfer = true;
@@ -3137,7 +3196,7 @@ impl Vm {
                         // resumed through the exit bridge the callee returns to.
                         sync_cursor(p, htop, &mut heap_dirty);
                         p.module = module_id;
-                        p.ip = target as usize;
+                        p.set_ip(target as usize);
                         p.reductions = reds;
                         p.native_pc = Some(native.start);
                         p.cold_mut().native_transfer = true;
@@ -3301,7 +3360,7 @@ impl Vm {
                     let tuple = unsafe { *x.add(src as usize) };
                     let value = tuples::element(tuple, index as usize).ok_or_else(|| {
                         p.module = module_id;
-                        p.ip = offset;
+                        p.set_ip(offset);
                         bad_get_tuple_element(p, tuple, index)
                     })?;
                     // SAFETY: Specialization validates the destination X index below 1024.
@@ -3317,7 +3376,7 @@ impl Vm {
                     let tuple = unsafe { *x.add(src as usize) };
                     let value = tuples::element(tuple, index as usize).ok_or_else(|| {
                         // SAFETY: `ip` and `base` belong to the current module.
-                        p.ip = unsafe { ip.offset_from(base) } as usize;
+                        p.set_ip(unsafe { ip.offset_from(base) } as usize);
                         p.module = module_id;
                         self.exception(p, "badarg")
                     })?;
@@ -3473,7 +3532,7 @@ impl Vm {
                         value
                     } else {
                         p.module = module_id;
-                        p.ip = offset;
+                        p.set_ip(offset);
                         let bif = module.imports[import as usize]
                             .bif
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
@@ -3541,7 +3600,7 @@ impl Vm {
                         // SAFETY: `ip` and `base` belong to the current module.
                         let offset = unsafe { ip.offset_from(base) } as usize;
                         p.module = module_id;
-                        p.ip = offset;
+                        p.set_ip(offset);
                         let bif = module.imports[import as usize]
                             .bif
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
@@ -3604,7 +3663,7 @@ impl Vm {
                         result
                     } else {
                         p.module = module_id;
-                        p.ip = offset;
+                        p.set_ip(offset);
                         let bif = module.imports[import as usize]
                             .bif
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
@@ -3667,7 +3726,7 @@ impl Vm {
                         // SAFETY: `ip` and `base` belong to the current module.
                         let offset = unsafe { ip.offset_from(base) } as usize;
                         p.module = module_id;
-                        p.ip = offset;
+                        p.set_ip(offset);
                         let bif = module.imports[import as usize]
                             .bif
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
@@ -3897,7 +3956,7 @@ impl Vm {
                     }
                     sync_cursor(p, htop, &mut heap_dirty);
                     // SAFETY: The current instruction is within this module.
-                    p.ip = unsafe { ip.offset_from(base) } as usize;
+                    p.set_ip(unsafe { ip.offset_from(base) } as usize);
                     p.module = module_id;
                     p.reductions = reds;
                     let value = match ctx.as_deref_mut() {
@@ -3976,7 +4035,7 @@ impl Vm {
                         continue;
                     }
                     p.module = module_id;
-                    p.ip = target as usize;
+                    p.set_ip(target as usize);
                     p.reductions = reds;
                     p.gc_live = 0;
                     return Ok(RunState::Wait { timeout_ms: None });
@@ -3990,7 +4049,7 @@ impl Vm {
                     let wait_ip = unsafe { ip.offset_from(base) } as usize;
                     let timeout_only = target as usize == wait_ip;
                     // SAFETY: The current instruction is within this module.
-                    p.ip = wait_ip;
+                    p.set_ip(wait_ip);
                     p.module = module_id;
                     // Same yield window as `wait`: a message drained before this
                     // instruction runs must be matched, not timed out. Port of
@@ -4015,7 +4074,7 @@ impl Vm {
                         continue;
                     }
                     p.module = module_id;
-                    p.ip = target as usize;
+                    p.set_ip(target as usize);
                     p.reductions = reds;
                     p.gc_live = 0;
                     return Ok(RunState::Wait {
@@ -4071,7 +4130,7 @@ impl Vm {
                     // SAFETY: `ip` and `base` point into this module's code.
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     p.module = module_id;
-                    p.ip = offset;
+                    p.set_ip(offset);
                     p.reductions = reds;
                     let fun = p.read(src)?;
                     let site_module = module_id;
@@ -4094,7 +4153,7 @@ impl Vm {
                         ImportOutcome::Yield => {
                             if tail
                                 && p.module == site_module
-                                && p.ip == offset
+                                && p.ip() == offset
                                 && let Some(release) = release.take()
                             {
                                 // erts releases the frame of a fun call in tail position
@@ -4119,7 +4178,7 @@ impl Vm {
                             ) {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.module = module_id;
-                                p.ip = target_ip;
+                                p.set_ip(target_ip);
                                 p.reductions = reds;
                                 p.native_pc = Some(native.start);
                                 p.cold_mut().native_transfer = true;
@@ -4129,7 +4188,7 @@ impl Vm {
                         }
                         ImportOutcome::Advanced => {
                             // SAFETY: The handler advances to a valid code index.
-                            unsafe { base.add(p.ip) }
+                            unsafe { base.add(p.ip()) }
                         }
                     };
                     continue;
@@ -4143,7 +4202,7 @@ impl Vm {
                     // SAFETY: `ip` and `base` point into this module's code.
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     p.module = module_id;
-                    p.ip = offset;
+                    p.set_ip(offset);
                     p.reductions = reds;
                     let site_module = module_id;
                     let mut release = if dealloc > 0 {
@@ -4167,7 +4226,7 @@ impl Vm {
                         ImportOutcome::Returned(value) => return Ok(RunState::Done(value)),
                         ImportOutcome::Yield => {
                             if p.module == site_module
-                                && p.ip == offset
+                                && p.ip() == offset
                                 && let Some(release) = release.take()
                             {
                                 p.note_tail_yield(site_module, offset, release, true);
@@ -4190,7 +4249,7 @@ impl Vm {
                             ) {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.module = module_id;
-                                p.ip = target_ip;
+                                p.set_ip(target_ip);
                                 p.reductions = reds;
                                 p.native_pc = Some(native.start);
                                 p.cold_mut().native_transfer = true;
@@ -4200,7 +4259,7 @@ impl Vm {
                         }
                         ImportOutcome::Advanced => {
                             // SAFETY: The handler advances to a valid code index.
-                            unsafe { base.add(p.ip) }
+                            unsafe { base.add(p.ip()) }
                         }
                     };
                     continue;
@@ -4209,7 +4268,7 @@ impl Vm {
                 Instr::Exc { op, a, b } => {
                     sync_cursor(p, htop, &mut heap_dirty);
                     // SAFETY: The current instruction belongs to this module allocation.
-                    p.ip = unsafe { ip.offset_from(base) } as usize;
+                    p.set_ip(unsafe { ip.offset_from(base) } as usize);
                     p.module = module_id;
                     p.reductions = reds;
                     exceptions::execute(self, p, op, a, b)?;
@@ -4219,7 +4278,7 @@ impl Vm {
                     depth = p.heap.stack_words();
                     reds = p.reductions;
                     // SAFETY: The handler sets a resolved instruction index.
-                    ip = unsafe { base.add(p.ip) };
+                    ip = unsafe { base.add(p.ip()) };
                     continue;
                 }
                 Instr::RecvMarkerReserve { dst } => {
@@ -4312,7 +4371,7 @@ impl Vm {
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     p.reductions = reds;
                     p.module = module_id;
-                    p.ip = offset;
+                    p.set_ip(offset);
                     let op = module.generic[fallback as usize];
                     let frame = || {
                         let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
@@ -4323,7 +4382,7 @@ impl Vm {
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: The handler sets a resolved code index.
-                    ip = unsafe { base.add(p.ip) };
+                    ip = unsafe { base.add(p.ip()) };
                     continue;
                 }
                 // bits_cursor: a private one-byte append extends the existing writer.
@@ -4352,7 +4411,7 @@ impl Vm {
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     p.reductions = reds;
                     p.module = module_id;
-                    p.ip = offset;
+                    p.set_ip(offset);
                     let op = module.generic[fallback as usize];
                     let frame = || {
                         let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
@@ -4363,7 +4422,7 @@ impl Vm {
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: The handler sets a resolved instruction index.
-                    ip = unsafe { base.add(p.ip) };
+                    ip = unsafe { base.add(p.ip()) };
                     continue;
                 }
                 // vm_binparse2: bound checks and fixed integer reads need no heap sync.
@@ -4462,7 +4521,7 @@ impl Vm {
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     p.reductions = reds;
                     p.module = module_id;
-                    p.ip = offset;
+                    p.set_ip(offset);
                     bits::execute_compact(p, instr, || {
                         let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
                         format!("{}:{name}/{arity}", module.name)
@@ -4471,7 +4530,7 @@ impl Vm {
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: The handler sets a resolved code index.
-                    ip = unsafe { base.add(p.ip) };
+                    ip = unsafe { base.add(p.ip()) };
                     continue;
                 }
                 // vm_binparse2: allocating bit commands retain their generic handlers.
@@ -4485,7 +4544,7 @@ impl Vm {
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     p.reductions = reds;
                     p.module = module_id;
-                    p.ip = offset;
+                    p.set_ip(offset);
                     bits::execute_compact(p, instr, || {
                         let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
                         format!("{}:{name}/{arity}", module.name)
@@ -4494,7 +4553,7 @@ impl Vm {
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: The handler sets a resolved code index.
-                    ip = unsafe { base.add(p.ip) };
+                    ip = unsafe { base.add(p.ip()) };
                     continue;
                 }
                 Instr::MapsBits(index) => {
@@ -4503,7 +4562,7 @@ impl Vm {
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     p.reductions = reds;
                     p.module = module_id;
-                    p.ip = offset;
+                    p.set_ip(offset);
                     let op = module.generic[index as usize];
                     let frame = || {
                         let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
@@ -4527,7 +4586,7 @@ impl Vm {
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: Feature handlers set a resolved code index.
-                    ip = unsafe { base.add(p.ip) };
+                    ip = unsafe { base.add(p.ip()) };
                     continue;
                 }
                 Instr::Generic(index) => {
@@ -4536,7 +4595,7 @@ impl Vm {
                     let offset = unsafe { ip.offset_from(base) } as usize;
                     p.reductions = reds;
                     p.module = module_id;
-                    p.ip = offset;
+                    p.set_ip(offset);
                     let op: GenericOp = module.generic[index as usize];
                     let opcode = op.opcode();
                     let [a, b, c] = op.args;
@@ -4554,7 +4613,7 @@ impl Vm {
                         Opcode::OnLoad => {
                             // The opcode marks the module's on_load entry for the loader;
                             // code metadata retains that entry while execution advances past it.
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::IntCodeEnd => {
                             return Err(VmError::Unsupported("int_code_end".into()));
@@ -4562,14 +4621,14 @@ impl Vm {
                         Opcode::Move => {
                             let value = p.read(a)?;
                             p.write(b, value)?;
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::Swap => {
                             let av = p.read(a)?;
                             let bv = p.read(b)?;
                             p.write(a, bv)?;
                             p.write(b, av)?;
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::Return => {
                             if let Some(value) = Self::ret(p) {
@@ -4585,17 +4644,17 @@ impl Vm {
                                 calls::push_continuation(
                                     p,
                                     p.module,
-                                    p.ip + 1,
+                                    p.ip() + 1,
                                     a.value() as usize,
                                 )?;
                             }
-                            p.ip = b.value() as usize;
-                            native_target = Some((p.module, p.ip));
+                            p.set_ip(b.value() as usize);
+                            native_target = Some((p.module, p.ip()));
                             p.tick();
                         }
                         Opcode::CallExt | Opcode::CallExtLast | Opcode::CallExtOnly => {
                             let tail = opcode != Opcode::CallExt;
-                            let (site_module, site_ip) = (p.module, p.ip);
+                            let (site_module, site_ip) = (p.module, p.ip());
                             let mut release = if opcode == Opcode::CallExtLast {
                                 // A yielded BIF re-executes this instruction: the frame is
                                 // already gone then.
@@ -4648,7 +4707,7 @@ impl Vm {
                                     return Ok(RunState::Yield);
                                 }
                                 ImportOutcome::Jump(_) => {
-                                    native_target = Some((p.module, p.ip));
+                                    native_target = Some((p.module, p.ip()));
                                 }
                                 ImportOutcome::Advanced => {}
                             }
@@ -4672,35 +4731,35 @@ impl Vm {
                             if !p.heap.reserve_stack(n) {
                                 return Err(VmError::Unsupported("stack allocation".into()));
                             }
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::Deallocate => {
                             if !p.heap.release_stack(a.value() as usize) {
                                 return Err(VmError::Unsupported("stack underflow".into()));
                             }
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::Trim => {
                             if !p.heap.release_stack(a.value() as usize) {
                                 return Err(VmError::Unsupported("trim underflow".into()));
                             }
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::TestHeap => {
                             p.gc_live = b.value() as usize;
                             if p.heap.free_words() < a.value() as usize {
                                 p.ensure(a.value() as usize, b.value() as usize)?;
                             }
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::InitYregs => {
                             for reg in &module.lists[a.value() as usize] {
                                 p.write(*reg, Term::NIL)?;
                             }
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::Jump => {
-                            p.ip = a.value() as usize;
+                            p.set_ip(a.value() as usize);
                         }
                         Opcode::IsLt
                         | Opcode::IsGe
@@ -4720,28 +4779,28 @@ impl Vm {
                                 _ => unreachable!(),
                             };
                             if ok {
-                                p.ip += 1;
+                                p.set_ip(p.ip() + 1);
                             } else {
                                 Self::branch(p, a)?;
                             }
                         }
                         Opcode::IsPort => {
                             if p.read(b)?.classify() == TermKind::Port {
-                                p.ip += 1;
+                                p.set_ip(p.ip() + 1);
                             } else {
                                 Self::branch(p, a)?;
                             }
                         }
                         Opcode::IsPid => {
                             if p.read(b)?.classify() == TermKind::Pid {
-                                p.ip += 1;
+                                p.set_ip(p.ip() + 1);
                             } else {
                                 Self::branch(p, a)?;
                             }
                         }
                         Opcode::IsReference => {
                             if p.read(b)?.classify() == TermKind::Ref {
-                                p.ip += 1;
+                                p.set_ip(p.ip() + 1);
                             } else {
                                 Self::branch(p, a)?;
                             }
@@ -4749,7 +4808,7 @@ impl Vm {
                         Opcode::IsAnyNativeRecord => {
                             // Port of erts/emulator/beam/erl_record.c:214, OTP-29.1.1.
                             if p.read(b)?.classify() == TermKind::Record {
-                                p.ip += 1;
+                                p.set_ip(p.ip() + 1);
                             } else {
                                 Self::branch(p, a)?;
                             }
@@ -4794,7 +4853,7 @@ impl Vm {
                                 _ => false,
                             };
                             if ok {
-                                p.ip += 1;
+                                p.set_ip(p.ip() + 1);
                             } else {
                                 Self::branch(p, a)?;
                             }
@@ -4803,7 +4862,7 @@ impl Vm {
                             // SAFETY: The term's heap remains live for this instruction.
                             let len = unsafe { p.read(b)?.tuple_ref() }.map(|v| v.len());
                             if len == Some(c.value() as usize) {
-                                p.ip += 1;
+                                p.set_ip(p.ip() + 1);
                             } else {
                                 Self::branch(p, a)?;
                             }
@@ -4815,7 +4874,7 @@ impl Vm {
                                 .and_then(|v| v.get(b.value() as usize))
                                 .ok_or_else(|| self.exception(p, "badarg"))?;
                             p.write(c, value)?;
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::PutTuple2 => {
                             // Port of erts/emulator/beam/jit/arm/instr_common.cpp:794, OTP-29.1.1.
@@ -4850,7 +4909,7 @@ impl Vm {
                                     })?
                             };
                             p.write(a, tuple)?;
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::PutList => {
                             if p.heap.free_words() < 2 {
@@ -4865,7 +4924,7 @@ impl Vm {
                                         VmError::Unsupported(format!("list allocation {e:?}"))
                                     })?;
                             p.write(c, value)?;
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::GetList | Opcode::GetHd | Opcode::GetTl => {
                             // SAFETY: The source list remains in a live process or literal heap.
@@ -4880,7 +4939,7 @@ impl Vm {
                                 Opcode::GetTl => p.write(b, tail)?,
                                 _ => unreachable!(),
                             }
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::GcBif1
                         | Opcode::GcBif2
@@ -4911,7 +4970,7 @@ impl Vm {
                         Opcode::Fmove | Opcode::Fconv => {
                             let value = p.float(a)?;
                             p.set_float(b, value)?;
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::Fadd | Opcode::Fsub | Opcode::Fmul | Opcode::Fdiv => {
                             let x = p.float(b)?;
@@ -4924,12 +4983,12 @@ impl Vm {
                                 _ => unreachable!(),
                             };
                             p.set_float(module.arg(&op, 3), result)?;
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::Fnegate => {
                             let value = -p.float(b)?;
                             p.set_float(c, value)?;
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::SelectVal | Opcode::SelectTupleArity => {
                             let value = p.read(a)?;
@@ -5053,7 +5112,7 @@ impl Vm {
                                     })?
                             };
                             p.write(module.arg(&op, 3), tuple)?;
-                            p.ip += 1;
+                            p.set_ip(p.ip() + 1);
                         }
                         Opcode::Badmatch => {
                             return Err(self.exception(p, format!("{{badmatch,{}}}", p.read(a)?)));
@@ -5064,13 +5123,13 @@ impl Vm {
                             );
                         }
                         Opcode::IfEnd => return Err(self.exception(p, "if_clause")),
-                        Opcode::ExecutableLine | Opcode::DebugLine => p.ip += 1,
+                        Opcode::ExecutableLine | Opcode::DebugLine => p.set_ip(p.ip() + 1),
                         _ => {
                             return Err(VmError::Unsupported(format!(
                                 "opcode {} in {} at {}",
                                 opcode.name(),
                                 module.name,
-                                p.ip
+                                p.ip()
                             )));
                         }
                     }
@@ -5080,7 +5139,7 @@ impl Vm {
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
                     // SAFETY: Generic handlers set a resolved code index before dispatch.
-                    ip = unsafe { base.add(p.ip) };
+                    ip = unsafe { base.add(p.ip()) };
                     if matches!(
                         opcode,
                         Opcode::CallExt | Opcode::CallExtLast | Opcode::CallExtOnly
@@ -5109,7 +5168,7 @@ impl Vm {
                             )
                         {
                             p.module = target_module;
-                            p.ip = target_ip;
+                            p.set_ip(target_ip);
                             p.reductions = reds;
                             p.native_pc = Some(native.start);
                             p.cold_mut().native_transfer = true;

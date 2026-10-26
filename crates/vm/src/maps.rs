@@ -15,7 +15,7 @@ fn failure(p: &mut Process, label: Arg) -> Result<(), VmError> {
     if label.kind() != Arg::LABEL || label.value() == u32::MAX as u64 {
         return Err(VmError::Unsupported("map failure label zero".into()));
     }
-    p.ip = label.value() as usize;
+    p.set_ip(label.value() as usize);
     Ok(())
 }
 
@@ -117,7 +117,7 @@ pub(super) fn execute(
             match result {
                 Ok(value) => {
                     p.write(destination, value)?;
-                    p.ip += 1;
+                    p.set_ip(p.ip() + 1);
                     Ok(())
                 }
                 Err(MapError::Badkey(_)) if exact && has_label(fail) => failure(p, fail),
@@ -141,7 +141,7 @@ pub(super) fn execute(
             for (dst, value) in values {
                 p.write(dst, value)?;
             }
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             Ok(())
         }
         Opcode::HasMapFields => {
@@ -156,7 +156,7 @@ pub(super) fn execute(
                     Err(error) => return Err(exception(p, error)),
                 }
             }
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             Ok(())
         }
         _ => Err(VmError::Unsupported(format!(

@@ -4145,7 +4145,7 @@ pub extern "C" fn arinsal_beamasm_exception_resolver(
         }
     };
     // The light-BIF fragment and `error_label` spill the raising pc at `tmp_mem[6]`
-    // (erts' `pc` argument to `save_stacktrace`). `p.ip` is the last interpreter
+    // (erts' `pc` argument to `save_stacktrace`). `p.ip()` is the last interpreter
     // instruction and names the wrong function while native code is running.
     // Port of beam_common.c (`save_stacktrace`), OTP-29.1.1: retain the raw raising PC;
     // `build_stacktrace` resolves it against the active code ranges when the trace is requested.

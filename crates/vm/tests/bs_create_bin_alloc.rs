@@ -99,7 +99,6 @@ fn bs_create_bin_helpers_reserve_the_alloc_words() {
         ])
         .env(CHILD, &path)
         .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", MODULE)
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
         .output()
         .unwrap();

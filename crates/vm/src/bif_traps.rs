@@ -180,11 +180,11 @@ pub(crate) fn note_export_trap(process: &mut Process) {
             .as_ref()
             .and_then(|cold| cold.ext_last_released.as_ref())
             .is_some_and(|released| {
-                !released.kept && released.module == process.module && released.ip == process.ip
+                !released.kept && released.module == process.module && released.ip == process.ip()
             });
         (!released_by_call).then(|| crate::proc_create::TrapReturn {
             module: process.module,
-            ip: process.ip + 1,
+            ip: process.ip() + 1,
         })
     } else {
         None
@@ -1836,8 +1836,7 @@ pub(crate) fn execute(
         .as_ref()
         .and_then(|cold| cold.bif_trap.as_ref())
         .is_some_and(|pending| {
-            pending.caller_module == process.module
-                && pending.caller_ip == process.ip
+            (pending.caller_module, pending.caller_ip) == process.trap_site()
                 && pending.import == import
         });
     if resumes_here
@@ -1849,6 +1848,7 @@ pub(crate) fn execute(
         && lookup_entry(module, function, continuation_arity).is_some()
     {
         let result = run_trapped_export(process, ctx)?;
+        let trap_site = process.trap_site();
         if matches!(
             &result,
             Ok(ResumeResult::Handler(HandlerResult::Yield { .. }))
@@ -1862,8 +1862,7 @@ pub(crate) fn execute(
             // The continuation ran inside the interpreter at the original gc_bif site.
             // Keep that site as the resume key across another continuation slice.
             pending.import = import;
-            pending.caller_module = process.module;
-            pending.caller_ip = process.ip;
+            (pending.caller_module, pending.caller_ip) = trap_site;
         }
         return Some(result.and_then(|result| match result {
             ResumeResult::Handler(result) => Ok(result),
@@ -2016,8 +2015,8 @@ pub(crate) fn install_export_trap(
     process.gc_live = arity;
     let gc_was_enabled = process.heap.gc_enabled;
     process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
-        caller_module: process.module,
-        caller_ip: process.ip,
+        caller_module: process.trap_site().0,
+        caller_ip: process.trap_site().1,
         schedule_out: true,
         import,
         continuation: trap.continuation,
@@ -2095,7 +2094,7 @@ pub(crate) fn execute_named(
         .and_then(|cold| cold.bif_trap.as_ref())
         .map(|pending| {
             (
-                pending.caller_module == process.module && pending.caller_ip == process.ip,
+                (pending.caller_module, pending.caller_ip) == process.trap_site(),
                 pending.import == import,
             )
         });
@@ -2321,8 +2320,8 @@ pub(crate) fn execute_named(
                 .then(|| reverse_trap_args(&state))
                 .flatten();
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
-                caller_module: process.module,
-                caller_ip: process.ip,
+                caller_module: process.trap_site().0,
+                caller_ip: process.trap_site().1,
                 schedule_out: false,
                 import,
                 continuation,
@@ -2692,8 +2691,8 @@ pub(crate) fn finish_light(
             };
             // The scheduler binds the trap to its call site when it context-switches.
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
-                caller_module: process.module,
-                caller_ip: process.ip,
+                caller_module: process.trap_site().0,
+                caller_ip: process.trap_site().1,
                 schedule_out: true,
                 import,
                 continuation,
@@ -2716,8 +2715,8 @@ pub(crate) fn finish_light(
             let kept = trap.args.len().min(saved.len());
             saved[..kept].copy_from_slice(&trap.args[..kept]);
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
-                caller_module: process.module,
-                caller_ip: process.ip,
+                caller_module: process.trap_site().0,
+                caller_ip: process.trap_site().1,
                 schedule_out: false,
                 import,
                 continuation: trap.continuation,
@@ -2813,8 +2812,8 @@ pub(crate) fn install_deferred_trap(
         saved[..2].copy_from_slice(&trap_args);
     }
     process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
-        caller_module: process.module,
-        caller_ip: process.ip,
+        caller_module: process.trap_site().0,
+        caller_ip: process.trap_site().1,
         schedule_out: true,
         import,
         continuation,

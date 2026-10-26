@@ -522,7 +522,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
             let tag = stacktrace::handler_tag(p.module, b.value() as usize)?;
             p.write(a, tag)?;
             p.header.catches = p.header.catches.saturating_add(1);
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
         }
         Opcode::TryEnd | Opcode::TryCase => {
             p.write(a, Term::NIL)?;
@@ -530,7 +530,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
             if op == Opcode::TryCase {
                 p.x[0] = p.x[3];
             }
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
         }
         Opcode::CatchEnd => {
             p.write(a, Term::NIL)?;
@@ -549,7 +549,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
                     None => return Err(VmError::Unsupported("exception class".into())),
                 };
             }
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
         }
         Opcode::Badmatch | Opcode::CaseEnd | Opcode::TryCaseEnd | Opcode::Badrecord => {
             let key = match op {
@@ -566,7 +566,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
         Opcode::IfEnd => return Err(VmError::Trap(Trap::error(atom("if_clause")?))),
         Opcode::FuncInfo => {
             let module: &Module = &vm.code.modules[p.module];
-            let (_, arity) = module.function_at(p.ip).unwrap_or(("?", 0));
+            let (_, arity) = module.function_at(p.ip()).unwrap_or(("?", 0));
             let args = p.x[..usize::from(arity)].to_vec();
             let args = list(p, &args)?;
             return Err(VmError::Trap(Trap {
@@ -602,7 +602,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
             let Some(class) = class else {
                 p.x[0] = atom("badarg")?;
                 if op == Opcode::RawRaise {
-                    p.ip += 1;
+                    p.set_ip(p.ip() + 1);
                     return Ok(());
                 }
                 return Err(VmError::Trap(Trap::error(atom("badarg")?)));
@@ -611,7 +611,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
                 let trace = p.x[2];
                 if !stacktrace::set_raw_class(p, trace, class) {
                     p.x[0] = atom("badarg")?;
-                    p.ip += 1;
+                    p.set_ip(p.ip() + 1);
                     return Ok(());
                 }
             }
@@ -632,7 +632,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
         Opcode::BuildStacktrace => {
             // Port of erts/emulator/beam/beam_common.c:1205 (build_stacktrace), OTP-29.1.1.
             p.x[0] = materialize(Some(vm), p, p.x[0])?;
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
         }
         _ => {
             return Err(VmError::Unsupported(format!(
@@ -759,7 +759,7 @@ pub(super) fn resume(
                 }
                 crate::native_bridge::CatchHandler::Interpreted => {
                     vm.code.modules.get(p.module).and_then(|module| {
-                        module.function_at(p.ip).map(|(function, arity)| {
+                        module.function_at(p.ip()).map(|(function, arity)| {
                             (module.name.clone(), function.to_owned(), arity)
                         })
                     })
@@ -849,7 +849,7 @@ pub(super) fn resume(
         }
         p.heap.stack_set(index - frame_start, Term::NIL);
         p.module = module;
-        p.ip = ip;
+        p.set_ip(ip);
         p.x.ensure_x(4);
         p.x[0] = Term::catch(0);
         p.x[1] = trap.reason;

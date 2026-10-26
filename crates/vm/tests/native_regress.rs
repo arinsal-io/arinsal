@@ -339,14 +339,8 @@ fn run_child_case() -> bool {
 }
 
 /// Compares `module:run/0` under BeamAsm, under the interpreter and under OTP 29.1.1.
-fn assert_native_matches(
-    test: &str,
-    module: &str,
-    source: &str,
-    native: &str,
-    env: &[(&str, &str)],
-) {
-    assert_native_matches_with(test, module, source, native, env, true);
+fn assert_native_matches(test: &str, module: &str, source: &str, env: &[(&str, &str)]) {
+    assert_native_matches_with(test, module, source, env, true);
 }
 
 /// Like [`assert_native_matches`]; `compare_interpreter` is false where the interpreter still
@@ -355,7 +349,6 @@ fn assert_native_matches_with(
     test: &str,
     module: &str,
     source: &str,
-    native: &str,
     env: &[(&str, &str)],
     compare_interpreter: bool,
 ) {
@@ -377,7 +370,6 @@ fn assert_native_matches_with(
             .env(CHILD, &beam_path)
             .env(CHILD_MODULE, module)
             .env("ARINSAL_BEAMASM", if beamasm { "1" } else { "0" })
-            .env("ARINSAL_BEAMASM_MODULES", native)
             .envs(env.iter().copied())
             .output()
             .unwrap();
@@ -420,7 +412,6 @@ fn native_regressions_match_interpreter_and_otp() {
         "native_regressions_match_interpreter_and_otp",
         MODULE,
         SOURCE,
-        &format!("{MODULE},io_lib_format,re"),
         &[],
     );
 }
@@ -435,7 +426,6 @@ fn native_comparison_bifs_match_otp() {
         "native_comparison_bifs_match_otp",
         COMPARE_MODULE,
         COMPARE_SOURCE,
-        COMPARE_MODULE,
         &[],
     );
 }
@@ -450,7 +440,6 @@ fn native_bit_syntax_survives_gc_stress() {
         "native_bit_syntax_survives_gc_stress",
         GC_MODULE,
         GC_SOURCE,
-        GC_MODULE,
         &[("ARINSAL_GC_STRESS", "1")],
     );
 }
@@ -465,7 +454,6 @@ fn native_bif_error_frames_match_otp() {
         "native_bif_error_frames_match_otp",
         FRAMES_MODULE,
         FRAMES_SOURCE,
-        FRAMES_MODULE,
         &[],
         false,
     );
@@ -481,7 +469,6 @@ fn native_lazy_debug_bif_frames_match_otp() {
         "native_lazy_debug_bif_frames_match_otp",
         BIF_FRAMES_MODULE,
         BIF_FRAMES_SOURCE,
-        BIF_FRAMES_MODULE,
         &[],
     );
 }
@@ -496,7 +483,6 @@ fn native_list_field_loads_match_otp() {
         "native_list_field_loads_match_otp",
         "native_list_fields",
         LIST_FIELDS_SOURCE,
-        "native_list_fields",
         &[],
     );
 }

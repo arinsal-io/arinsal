@@ -1772,7 +1772,7 @@ impl Executor {
                 Some((start, _)) => {
                     let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
                     process.module = module_id;
-                    process.ip = entry;
+                    process.set_entry_ip(entry);
                     process.native_pc = Some(start);
                 }
                 None => {
@@ -1783,40 +1783,9 @@ impl Executor {
         let first_run = !std::mem::replace(&mut process.entry_started, true);
         if first_run
             && process.native_pc.is_none()
-            && let Some(module) = self.vm.code.modules.get(process.module)
-            && let Some((function, arity)) = module.function_at(process.ip)
-            && module.entry_arity.get(process.ip).copied().unwrap_or(0) != 0
-            // The entry belongs to the module instance the process was spawned in; another
-            // loaded version of the same module (old or current) has its own code. A module
-            // loaded for the interpreter only may have native functions registered separately.
-            && let Some(start) = match self
+            && let Some(start) = self
                 .vm
-                .code
-                .code_meta
-                .get(process.module)
-                .and_then(|meta| meta.as_ref())
-                .and_then(|meta| meta.beamasm.as_ref())
-            {
-                // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process: I is the
-                // export's address), OTP-29.1.1: an exported entry starts at its export's
-                // native address when that address belongs to the spawned module instance.
-                Some(version) => module
-                    .function_atom_at(process.ip)
-                    .and_then(|(function, arity)| {
-                        crate::beamasm_integration::export_native_target(
-                            self.vm.code_scope,
-                            module.name_atom,
-                            function,
-                            arity,
-                        )
-                    })
-                    .filter(|&address| version.contains_code(address))
-                    .or_else(|| version.native_function_start(function, arity)),
-                None => {
-                    crate::native_function_for(self.vm.code_scope, &module.name, function, arity)
-                        .map(|native| native.start)
-                }
-            }
+                .native_entry_address(process.module, process.entry_ip())
         {
             process.native_pc = Some(start);
         }
@@ -2875,14 +2844,14 @@ impl Executor {
                                         .and_then(|cold| cold.bif_trap.as_ref())
                                         .is_some_and(|pending| pending.schedule_out);
                                     if schedule_out {
+                                        let trap_site = process.trap_site();
                                         if let Some(pending) = process
                                             .cold
                                             .as_mut()
                                             .and_then(|cold| cold.bif_trap.as_mut())
                                         {
                                             pending.schedule_out = false;
-                                            pending.caller_module = process.module;
-                                            pending.caller_ip = process.ip;
+                                            (pending.caller_module, pending.caller_ip) = trap_site;
                                         }
                                         crate::bif_traps::arm_export_trap(process);
                                         process.cold_mut().native_retry = Some(target_pc);
@@ -3049,13 +3018,6 @@ impl Executor {
                                 let Some(export) =
                                     crate::beamasm_integration::export_dispatch(target_pc)
                                 else {
-                                    if let Some(m) = self.vm.code.modules.get(process.module)
-                                        && target_pc < m.code.len()
-                                    {
-                                        process.ip = target_pc;
-                                        process.tick();
-                                        continue;
-                                    }
                                     return Err(VmError::Unsupported(format!(
                                         "unknown native export entry {target_pc:#x}"
                                     )));
@@ -3142,6 +3104,7 @@ impl Executor {
                                         // (context_switch_simplified), OTP-29.1.1: a light BIF
                                         // call that trapped context-switches; the process
                                         // resumes in the continuation when it next runs.
+                                        let trap_site = process.trap_site();
                                         if let Some(pending) = process
                                             .cold
                                             .as_mut()
@@ -3151,8 +3114,7 @@ impl Executor {
                                             })
                                         {
                                             pending.schedule_out = false;
-                                            pending.caller_module = process.module;
-                                            pending.caller_ip = process.ip;
+                                            (pending.caller_module, pending.caller_ip) = trap_site;
                                             process.cold_mut().native_retry = Some(target_pc);
                                             process.native_pc = Some(code_ptr);
                                             crate::native_helpers::debug_assert_native_heap(
@@ -3282,8 +3244,8 @@ impl Executor {
                                             outcome
                                         } else {
                                             // The BIF runs at the native call site (erts c_p->i).
-                                            let (module_before, ip_before) =
-                                                (process.module, process.ip);
+                                            let (module_before, position_before) =
+                                                (process.module, process.position_marker());
                                             process.cold_mut().native_call_pc = call_site_pc;
                                             let traced = self.vm.trace_native_call_named(
                                                 process,
@@ -3358,8 +3320,8 @@ impl Executor {
                                             if export.module == "erlang"
                                                 && export.function == "call_on_load_function"
                                                 && matches!(result, Some(Ok(_)))
-                                                && (process.module, process.ip)
-                                                    != (module_before, ip_before)
+                                                && (process.module, process.position_marker())
+                                                    != (module_before, position_before)
                                             {
                                                 process.tick();
                                                 self.vm.enter_native_at_jump(process);
@@ -3654,8 +3616,7 @@ impl Executor {
                                 });
                                 if let Some(target_ip) = target_ip {
                                     process.gc_live = usize::from(export.arity);
-                                    process.module = module_id;
-                                    process.ip = target_ip;
+                                    self.vm.set_position(process, module_id, target_ip);
                                     process.tick();
                                     self.vm.enter_native_at_jump(process);
                                 } else {
@@ -3810,7 +3771,7 @@ impl Executor {
                             }
                             let mut trap = crate::exceptions::from_legacy(&reason)?;
                             let arity = self.vm.code.modules[process.module]
-                                .function_at(process.ip)
+                                .function_at(process.ip())
                                 .map(|(_, arity)| arity)
                                 .unwrap_or(0);
                             trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
@@ -3826,9 +3787,9 @@ impl Executor {
                             "arinsal boot: process {:?} trap in {} at ip {} line {:?} instruction {:?}: {:?} reason {:?}",
                             ctx.pid(),
                             self.vm.frame_name(process),
-                            process.ip,
-                            self.vm.code.modules[process.module].lines.get(process.ip),
-                            self.vm.code.modules[process.module].code.get(process.ip),
+                            process.ip(),
+                            self.vm.code.modules[process.module].lines.get(process.ip()),
+                            self.vm.code.modules[process.module].code.get(process.ip()),
                             trap.class,
                             arinsal_term::to_owned(trap.reason)
                         );
@@ -4050,8 +4011,7 @@ impl Executor {
             return Err(VmError::Unsupported("hibernate registers".into()));
         }
         let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
-        process.module = module_id;
-        process.ip = entry;
+        self.vm.set_position(process, module_id, entry);
         process.inbox.set_save(0);
         process.receive_deadline = None;
         process.receive_deadline_ms = None;
@@ -4198,7 +4158,7 @@ fn resume_after_native_return(process: &mut Process) -> bool {
         }
         process.heap.release_stack(1);
         process.module = module;
-        process.ip = ip;
+        process.set_ip(ip);
         return true;
     }
 }
@@ -4247,7 +4207,7 @@ impl Vm {
                 }
             };
         process.module = module_id;
-        process.ip = ip;
+        process.set_ip(ip);
         process.initial_call = Some((module_id, ip));
         Ok(apply_operands)
     }
@@ -4906,7 +4866,7 @@ impl Runtime {
         };
         let mut child = Process::with_spawn_registers(args.len(), 0);
         child.module = module_id;
-        child.ip = ip;
+        child.set_entry_ip(ip);
         child.set_runtime(Some(self));
         child.cold_mut().group_leader = None;
         child.initial_mfa = mfa_atoms(module, function, args.len() as u8);
@@ -8521,7 +8481,7 @@ impl Process {
                         "arinsal boot: process {:?} done module={} ip={} value={term:?} {:?}",
                         ctx.pid(),
                         self.module,
-                        self.ip,
+                        self.ip(),
                         arinsal_term::to_owned(term).ok()
                     );
                 }
@@ -8621,7 +8581,7 @@ impl Vm {
             .ok_or_else(|| VmError::Load(format!("{module}:{function}/0 is not exported")))?;
         let mut process = Process::with_spawn_registers(0, 0);
         process.module = module_id;
-        process.ip = ip;
+        process.set_entry_ip(ip);
         process.initial_call = Some((module_id, ip));
         process.set_runtime(Some(runtime));
         process.initial_mfa = mfa_atoms(module, function, 0);
@@ -8684,9 +8644,8 @@ impl Vm {
                 module: module_id,
                 ip: user_ip,
             }));
-        process.module = module_id;
-        process.ip = on_ip;
         process.native_pc = None;
+        self.set_position(process, module_id, on_ip);
         self.enter_native_at_jump(process);
         Ok(())
     }
@@ -8858,7 +8817,7 @@ impl Vm {
             let scheduler = runtime.scheduler()?;
             let mut process = Process::with_spawn_registers(args.len(), 0);
             process.module = module_id;
-            process.ip = ip;
+            process.set_entry_ip(ip);
             // Port of erts/emulator/beam/erl_process.c (erl_create_process: copy_struct of the
             // arguments into the new heap), OTP-29.1.1: the first process owns its arguments, so
             // a collection never meets a term outside its heap and the literal areas.

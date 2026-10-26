@@ -45,7 +45,7 @@ fn trapping_gc_bifs_preserve_destinations() {
     std::fs::write(&path, beam).unwrap();
     for (mode, env) in [
         ("interp", ("ARINSAL_INTERP", "1")),
-        ("jit_skipped", ("ARINSAL_JIT_SKIPF", "run/0")),
+        ("jit", ("ARINSAL_BEAMASM", "1")),
     ] {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([

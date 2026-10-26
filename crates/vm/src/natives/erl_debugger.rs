@@ -535,7 +535,7 @@ fn inspect_frames(
         Some(address) => FramePc::Native(address),
         None => FramePc::Interpreted {
             module: process.module,
-            ip: process.ip,
+            ip: process.ip(),
         },
     };
     // Only the top frame, the current pc, is not a return address.

@@ -1188,11 +1188,11 @@ fn process_info_item_current_location(
                         let module = modules.get(process.module)?;
                         module
                             .lines
-                            .get(process.ip)
+                            .get(process.ip())
                             .and_then(Option::as_ref)
                             .or_else(|| {
                                 process
-                                    .ip
+                                    .ip()
                                     .checked_sub(1)
                                     .and_then(|ip| module.lines.get(ip))
                                     .and_then(Option::as_ref)
@@ -1815,14 +1815,14 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
     }
     if let Some(vm) = vm {
         let module = vm.code.modules.get(process.module).ok_or_else(badarg)?;
-        let (function, arity) = module.function_at(process.ip).unwrap_or(("undefined", 0));
+        let (function, arity) = module.function_at(process.ip()).unwrap_or(("undefined", 0));
         return Ok((module.name.clone(), function.to_owned(), arity));
     }
     let runtime = process.runtime.ok_or_else(badarg)?;
     runtime
         .with_modules(|modules| {
             let module = modules.get(process.module)?;
-            let (function, arity) = module.function_at(process.ip).unwrap_or(("undefined", 0));
+            let (function, arity) = module.function_at(process.ip()).unwrap_or(("undefined", 0));
             Some((module.name.clone(), function.to_owned(), arity))
         })
         .ok_or_else(badarg)
@@ -1895,7 +1895,7 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
         });
     let (address, description) = match native_pc {
         Some(pc) => (pc, pc_description(modules, Term::NIL, true)),
-        None => (process.ip, String::new()),
+        None => (process.ip(), String::new()),
     };
     let description = if native_pc.is_some() {
         let function = crate::native_bridge::native_function_at(address);
@@ -1916,13 +1916,13 @@ fn backtrace_with(modules: &[std::sync::Arc<crate::Module>], process: &Process) 
                     .functions
                     .iter()
                     .rev()
-                    .find(|(s, _, _)| *s <= process.ip)?;
+                    .find(|(s, _, _)| *s <= process.ip())?;
                 Some(format!(
                     "{}:{}/{} + {}",
                     code.name,
                     name,
                     arity,
-                    process.ip - start
+                    process.ip() - start
                 ))
             })
             .unwrap_or_else(|| "invalid".into())
@@ -5908,7 +5908,7 @@ pub(crate) fn process_dump(
     let _ = writeln!(
         text,
         "Program counter: {:#018x} ({})",
-        process.ip,
+        process.ip(),
         mfa(values.get("current_function"))
     );
     let _ = writeln!(text);

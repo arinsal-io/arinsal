@@ -19,20 +19,6 @@ const MODULES: &[&str] = &[
     "beamasm_exceptions",
 ];
 
-/// OTP modules compiled natively alongside a fixture, for fixtures that exercise them.
-fn native_modules(module: &str) -> String {
-    match module {
-        // epp's state record is updated with update_record_in_place.
-        "beamasm_epp" => format!("{module},epp"),
-        // The group leader handles the io request while multi-scheduling is blocked.
-        "beamasm_sched" => format!("{module},group"),
-        "beamasm_map_elements" => format!("{module},beamasm_map_callee"),
-        // list_to_integer/1 reaches error_with_info/2 in the preloaded erlang module.
-        "beamasm_exceptions" => format!("{module},erlang"),
-        _ => module.to_owned(),
-    }
-}
-
 fn compile_fixtures() -> Option<PathBuf> {
     if !cfg!(target_arch = "aarch64") {
         eprintln!("skipped: BeamAsm generates AArch64 code");
@@ -82,7 +68,6 @@ fn native(dir: &Path, module: &str) -> Output {
         .arg(dir)
         .args(["-eval", &format!("{module}:run(), halt().")])
         .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", native_modules(module))
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap()
@@ -94,7 +79,6 @@ fn interpreted(dir: &Path, module: &str) -> Output {
         .arg(dir)
         .args(["-eval", &format!("{module}:run(), halt().")])
         .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", module)
         .env("ARINSAL_INTERP", "1")
         .stdin(std::process::Stdio::null())
         .output()

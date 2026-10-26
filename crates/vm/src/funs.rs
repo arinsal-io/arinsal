@@ -244,9 +244,11 @@ impl Vm {
                     Err(error) => return Some(Err(error)),
                 };
                 p.module = module_id;
-                p.ip = self.code.modules[module_id]
-                    .export(function, arity as u8)
-                    .unwrap_or(0);
+                p.set_ip(
+                    self.code.modules[module_id]
+                        .export(function, arity as u8)
+                        .unwrap_or(0),
+                );
                 p.x[..arity].copy_from_slice(args);
                 p.gc_live = arity;
                 let value = match function {
@@ -325,7 +327,7 @@ impl Vm {
                 None => ImportOutcome::Advanced,
             }));
         }
-        p.ip += 1;
+        p.set_ip(p.ip() + 1);
         Ok(Some(ImportOutcome::Advanced))
     }
 
@@ -400,10 +402,9 @@ impl Vm {
                 }
                 p.gc_live = arity + free_vars.len();
                 if !tail {
-                    calls::push_continuation(p, p.module, p.ip + 1, p.gc_live)?;
+                    calls::push_continuation(p, p.module, p.ip() + 1, p.gc_live)?;
                 }
-                p.module = module_id;
-                p.ip = target;
+                self.set_position(p, module_id, target);
                 p.tick();
                 Ok(ImportOutcome::Jump(
                     (code as *const Instr).wrapping_add(target),
@@ -591,10 +592,9 @@ impl Vm {
             p.x.ensure_x(arity);
             p.x[..arity].copy_from_slice(&trap.args);
             if !tail {
-                calls::push_continuation(p, p.module, p.ip + 1, arity)?;
+                calls::push_continuation(p, p.module, p.ip() + 1, arity)?;
             }
-            p.module = module_id;
-            p.ip = target;
+            self.set_position(p, module_id, target);
             p.tick();
             return Ok(ImportOutcome::Jump(
                 self.code.modules[module_id]
@@ -665,7 +665,7 @@ impl Vm {
                     && crate::trace_bp::any_pattern()
                     && arinsal_spec::bif_lookup(module, function, arity as u8).is_some() =>
             {
-                let site = (usize::MAX - 1, p.ip);
+                let site = (usize::MAX - 1, p.ip());
                 self.trace_native_call_named(
                     p,
                     run,
@@ -750,7 +750,7 @@ impl Vm {
                 None => ImportOutcome::Advanced,
             });
         }
-        p.ip += 1;
+        p.set_ip(p.ip() + 1);
         if exhausted {
             p.reductions = 4000;
             return Ok(ImportOutcome::Yield);
@@ -796,7 +796,7 @@ impl Vm {
                             None => crate::calls::after_dirty(ImportOutcome::Advanced),
                         });
                     }
-                    p.ip += 1;
+                    p.set_ip(p.ip() + 1);
                     return Ok(crate::calls::after_dirty(ImportOutcome::Advanced));
                 }
             }
@@ -850,7 +850,7 @@ impl Vm {
                             None => ImportOutcome::Advanced,
                         })
                     } else {
-                        p.ip += 1;
+                        p.set_ip(p.ip() + 1);
                         Ok(ImportOutcome::Advanced)
                     }
                 }
@@ -923,7 +923,7 @@ impl Vm {
                     None => crate::calls::after_dirty(ImportOutcome::Advanced),
                 });
             }
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             return Ok(crate::calls::after_dirty(ImportOutcome::Advanced));
         }
         // elixir_loop1: apply/3 reaches this path without an import slot.
@@ -937,7 +937,7 @@ impl Vm {
                     None => ImportOutcome::Advanced,
                 });
             }
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             return Ok(ImportOutcome::Advanced);
         }
         if module == "erlang" && function == "fun_info" && (arity == 1 || arity == 2) {
@@ -948,7 +948,7 @@ impl Vm {
                     None => ImportOutcome::Advanced,
                 });
             }
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             return Ok(ImportOutcome::Advanced);
         }
         if module == "erlang" && function == "fun_info_mfa" && arity == 1 {
@@ -959,7 +959,7 @@ impl Vm {
                     None => ImportOutcome::Advanced,
                 });
             }
-            p.ip += 1;
+            p.set_ip(p.ip() + 1);
             return Ok(ImportOutcome::Advanced);
         }
         // elixir_loop1: dynamic apply must see static NIFs such as re:import/1.
@@ -1009,10 +1009,9 @@ impl Vm {
             });
         };
         if !tail {
-            calls::push_continuation(p, p.module, p.ip + 1, arity)?;
+            calls::push_continuation(p, p.module, p.ip() + 1, arity)?;
         }
-        p.module = module_id;
-        p.ip = target;
+        self.set_position(p, module_id, target);
         p.tick();
         Ok(ImportOutcome::Jump(
             self.code.modules[module_id]
@@ -1170,7 +1169,7 @@ impl Vm {
         tail_dealloc: usize,
         ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<ImportOutcome, VmError> {
-        let original_ip = p.ip;
+        let original_position = p.position_marker();
         let original_gc_live = p.gc_live;
         let original_operands = [p.x[0], p.x[1], p.x[2]];
         let (module_term, function_term, arguments_term, target) = if arity == 2 {
@@ -1241,9 +1240,10 @@ impl Vm {
         let native_caller = p.cold.as_ref().is_some_and(|cold| cold.native_apply);
         if tail && tail_applies_exception_bif && !native_caller {
             // Port of erts/emulator/beam/beam_common.c:1350-1427 (apply_bif_error_adjustment), OTP-29.1.1.
-            let return_ip =
-                p.ip.checked_add(1)
-                    .ok_or_else(|| VmError::Unsupported("apply continuation".into()))?;
+            let return_ip = p
+                .ip()
+                .checked_add(1)
+                .ok_or_else(|| VmError::Unsupported("apply continuation".into()))?;
             // `apply_last` has already deallocated its frame. ERTS restores
             // the complete stack offset before letting the error BIF unwind.
             push_apply_error_continuation(p, return_ip, tail_dealloc)?;
@@ -1302,7 +1302,8 @@ impl Vm {
             cold.apply_roots.truncate(roots_base);
             len
         };
-        let reexec_apply = matches!(&result, Ok(ImportOutcome::Yield)) && p.ip == original_ip;
+        let reexec_apply =
+            matches!(&result, Ok(ImportOutcome::Yield)) && p.position_marker() == original_position;
         if matches!(
             &result,
             Err(VmError::Unsupported(message)) if crate::signals::is_await_message(message)

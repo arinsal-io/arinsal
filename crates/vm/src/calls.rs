@@ -339,7 +339,7 @@ pub(super) fn return_to(p: &mut Process) -> Option<Term> {
         return Some(p.x[0]);
     }
     p.module = module;
-    p.ip = ip;
+    p.set_ip(ip);
     p.heap.release_stack(1);
     None
 }
@@ -624,7 +624,7 @@ impl Vm {
         if label.kind() != Arg::LABEL || label.value() == u32::MAX as u64 {
             return Err(VmError::Unsupported("failure label zero".into()));
         }
-        p.ip = label.value() as usize;
+        p.set_ip(label.value() as usize);
         Ok(())
     }
     pub(crate) fn import_class(&self, module: usize, index: usize) -> Result<ImportClass, VmError> {
@@ -736,10 +736,9 @@ impl Vm {
         if !tail {
             // A native export returns to the exit bridge, which resumes this
             // interpreter CP with XREG0 copied back to the process register file.
-            calls::push_continuation(p, p.module, p.ip + 1, arity)?;
+            calls::push_continuation(p, p.module, p.ip() + 1, arity)?;
         }
-        p.module = module;
-        p.ip = ip;
+        self.set_position(p, module, ip);
         p.tick();
         Ok(ImportOutcome::Jump(code))
     }
@@ -767,7 +766,7 @@ impl Vm {
                 }
             });
         }
-        p.ip += 1;
+        p.set_ip(p.ip() + 1);
         Ok(ImportOutcome::Advanced)
     }
     pub(crate) fn finish_bif(
@@ -844,7 +843,7 @@ impl Vm {
             .is_some_and(|import| import.fast_op == ImportFastOp::Trapping);
         let traced = match ctx.as_deref_mut() {
             Some(run) if trapping => {
-                let (caller, site) = (p.module, p.ip);
+                let (caller, site) = (p.module, p.ip());
                 self.trace_native_call(p, run, caller, site, index, arity)
             }
             _ => None,
@@ -935,7 +934,7 @@ impl Vm {
                 .ok_or_else(|| VmError::Unsupported(format!("import {index}")))?,
         );
         let caller_module_id = p.module;
-        let caller_ip = p.ip;
+        let caller_ip = p.ip();
         let import = caller_module
             .imports
             .get(index)
@@ -1011,7 +1010,7 @@ impl Vm {
                         .code
                         .modules
                         .get(p.module)
-                        .and_then(|module| module.code.get(p.ip))
+                        .and_then(|module| module.code.get(p.ip()))
                         .map(|instruction| instruction as *const Instr)
                         .ok_or_else(|| VmError::Unsupported("on_load entry".into()))?;
                     p.tick();

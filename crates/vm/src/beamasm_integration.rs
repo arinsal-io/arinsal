@@ -1176,7 +1176,6 @@ pub(crate) fn interpreted_target(
 static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static MODULES: AtomicU64 = AtomicU64::new(0);
 static NATIVE: AtomicU64 = AtomicU64::new(0);
-static UNPORTED: AtomicU64 = AtomicU64::new(0);
 static NATIVE_CALLS: AtomicU64 = AtomicU64::new(0);
 static INTERP_SLICES: AtomicU64 = AtomicU64::new(0);
 static INTERP_NATIVE_STARTS: AtomicU64 = AtomicU64::new(0);
@@ -1210,7 +1209,6 @@ fn lifetime_trace_enabled() -> bool {
 pub(crate) struct CompiledVersion {
     module: String,
     /// Functions of the module BeamAsm could not compile: they run in the interpreter.
-    pub(crate) unported_functions: usize,
     scope: u64,
     module_handle: u64,
     installed: AtomicBool,
@@ -2154,26 +2152,12 @@ pub(crate) fn compile(
     if !enabled() {
         return None;
     }
-    if let Some(allowlist) = crate::debug_env::beamasm_modules()
-        && !allowlist
-            .split(',')
-            .map(str::trim)
-            .any(|name| name == module.name)
-    {
-        return None;
-    }
-    if crate::debug_env::beamasm_skip()
-        .is_some_and(|skip| skip.split(',').any(|name| name == module.name))
-    {
-        return None;
-    }
     if lifetime_trace_enabled() {
         eprintln!(
             "[beamasm-lifetime] compile module={} module_ptr={:p}",
             module.name, module
         );
     }
-    let function_allowlist = crate::debug_env::beamasm_funcs();
     let fragments = fragments()?;
     let export_entries = import_entries(scope, module)?;
     let module_handle = NEXT_MODULE_HANDLE
@@ -2196,12 +2180,7 @@ pub(crate) fn compile(
     if trace {
         eprintln!("arinsal boot: beamasm compiling {}", beam.module);
     }
-    let compiled = match compile_parsed_module_with_options(
-        beam,
-        &env,
-        function_allowlist,
-        line_breakpoints,
-    ) {
+    let compiled = match compile_parsed_module_with_options(beam, &env, line_breakpoints) {
         Ok(compiled) => compiled,
         Err(error) => {
             eprintln!(
@@ -2238,24 +2217,14 @@ pub(crate) fn compile(
     }
     if trace {
         eprintln!(
-            "arinsal boot: beamasm compiled {} native={} unported={}",
+            "arinsal boot: beamasm compiled {} native={}",
             compiled.name,
-            runtime_functions.len(),
-            compiled.unported.len()
+            runtime_functions.len()
         );
         for function in &runtime_functions {
             eprintln!(
                 "arinsal boot: beamasm native function {}/{}",
                 function.name, function.arity
-            );
-        }
-        for function in &compiled.unported {
-            eprintln!(
-                "arinsal boot: beamasm unported function {}/{}: {} ({:?})",
-                function.name,
-                function.arity,
-                function.missing_ops.join(","),
-                function.reason
             );
         }
     }
@@ -2296,7 +2265,6 @@ pub(crate) fn compile(
     drop(env);
     MODULES.fetch_add(1, Ordering::Relaxed);
     NATIVE.fetch_add(runtime_functions.len() as u64, Ordering::Relaxed);
-    UNPORTED.fetch_add(compiled.unported.len() as u64, Ordering::Relaxed);
     // Loader-patched NIF bodies stay out of the export targets (exports run them through the
     // interpreter's NativeBody), but native local calls still enter their compiled code, so
     // their ranges must be registered for return addresses, yields and stack walks.
@@ -2442,7 +2410,6 @@ pub(crate) fn compile(
         })
         .collect();
     let version = Arc::new(CompiledVersion {
-        unported_functions: compiled.unported.len(),
         module: compiled.name.clone(),
         scope,
         module_handle,
@@ -2530,10 +2497,9 @@ pub(crate) fn print_stats() {
         return;
     }
     eprintln!(
-        "ARINSAL_BEAMASM_STATS modules={} native_functions={} unported_functions={} native_calls={} interp_slices={} interp_native_starts={} native_yields={} call_unported={}",
+        "ARINSAL_BEAMASM_STATS modules={} native_functions={} native_calls={} interp_slices={} interp_native_starts={} native_yields={} call_unported={}",
         MODULES.load(Ordering::Relaxed),
         NATIVE.load(Ordering::Relaxed),
-        UNPORTED.load(Ordering::Relaxed),
         NATIVE_CALLS.load(Ordering::Relaxed),
         INTERP_SLICES.load(Ordering::Relaxed),
         INTERP_NATIVE_STARTS.load(Ordering::Relaxed),

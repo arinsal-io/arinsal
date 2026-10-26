@@ -3,7 +3,7 @@ use arinsal_beam::BeamFile;
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, module::BeamModuleAssembler, rt::read_heap_word,
 };
-use arinsal_beamjit::{ModuleEnv, compile_module_with_env, compile_module_with_env_and_funcs};
+use arinsal_beamjit::{ModuleEnv, compile_module_with_env};
 use std::{
     fs,
     process::Command,
@@ -276,12 +276,7 @@ fn erlc_add_function_runs_through_native_bridge() {
         .functions
         .iter()
         .find(|function| function.name == "add")
-        .unwrap_or_else(|| {
-            panic!(
-                "add/2 did not compile natively; unported: {:?}",
-                module.unported
-            )
-        });
+        .unwrap_or_else(|| panic!("add/2 did not compile natively",));
 
     let mut stack = [0_u64; 64];
     let mut heap = [0_u64; 64];
@@ -338,12 +333,12 @@ fn erlc_list_tuple_guards_run_natively() {
         .functions
         .iter()
         .find(|function| function.name == "tuple_list")
-        .unwrap_or_else(|| panic!("tuple_list/2 not native: {:?}", module.unported));
+        .unwrap_or_else(|| panic!("tuple_list/2 not native"));
     let first_integer = module
         .functions
         .iter()
         .find(|function| function.name == "first_integer")
-        .unwrap_or_else(|| panic!("first_integer/2 not native: {:?}", module.unported));
+        .unwrap_or_else(|| panic!("first_integer/2 not native"));
 
     let mut stack = [0_u64; 64];
     let mut heap = [0_u64; 64];
@@ -421,12 +416,12 @@ fn recursive_sum_and_fib_run_natively() {
         .functions
         .iter()
         .find(|function| function.name == "sum")
-        .unwrap_or_else(|| panic!("sum/2 did not compile natively: {:?}", module.unported));
+        .unwrap_or_else(|| panic!("sum/2 did not compile natively"));
     let fib = module
         .functions
         .iter()
         .find(|function| function.name == "fib")
-        .unwrap_or_else(|| panic!("fib/1 did not compile natively: {:?}", module.unported));
+        .unwrap_or_else(|| panic!("fib/1 did not compile natively"));
 
     let expected = Command::new("erl")
         .args([
@@ -539,13 +534,12 @@ fn otp_logger_reply_return_returns_the_reply_map() {
         let index = arinsal_beamops::global_atom_index(name).unwrap();
         (u64::from(index) << 6) | 0x0b
     };
-    let module =
-        compile_module_with_env_and_funcs(&bytes, &TestEnv, Some("reply_return/2")).unwrap();
+    let module = compile_module_with_env(&bytes, &TestEnv).unwrap();
     let function = module
         .functions
         .iter()
         .find(|function| function.name == "reply_return" && function.arity == 2)
-        .unwrap_or_else(|| panic!("reply_return/2 was not compiled: {:?}", module.unported));
+        .unwrap_or_else(|| panic!("reply_return/2 was not compiled"));
 
     let mut heap = [0_u64; 128];
     let heap_start = heap.as_mut_ptr();

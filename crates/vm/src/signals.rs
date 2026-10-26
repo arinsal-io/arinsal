@@ -1074,7 +1074,7 @@ pub(crate) fn erl_create_process(
         // starts at the apply_only sentinel; its first run applies X0..X2
         // (Vm::resolve_run_process).
         child.module = crate::process::RUN_PROCESS;
-        child.ip = 0;
+        child.set_entry_ip(0);
         child.initial_mfa = Some((m, f, arity as u8));
         if initial_bif.is_some() {
             child.cold_mut().initial_bif = initial_bif.clone();

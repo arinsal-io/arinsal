@@ -1,9 +1,8 @@
 //! An interpreted frame keeps its Y registers when a BIF it calls traps.
 //!
-//! `walk/4` is left interpreted (`ARINSAL_JIT_SKIPF`) and is called from native code. Its
-//! `erlang:iolist_size/1` call traps when the slice is out of reductions. The native-to-interpreter call used to
-//! leave its call site behind, so the trap pushed a native return address into the
-//! interpreted frame and shifted every Y register (`Count` read as `[]`).
+//! Runs under the interpreter flavor (`-emu_flavor emu`, here its `ARINSAL_INTERP` alias).
+//! `walk/4`'s `erlang:iolist_size/1` call traps when the slice is out of reductions; the trap
+//! must keep the frame's Y registers (`Count` once read as `[]`).
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
@@ -74,7 +73,7 @@ fn trap_in_interpreted_frame_keeps_y_registers() {
             "--test-threads=1",
         ])
         .env(CHILD, &path)
-        .env("ARINSAL_JIT_SKIPF", "walk/4")
+        .env("ARINSAL_INTERP", "1")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
