@@ -92,14 +92,7 @@ impl NativeTargetCache {
     ) -> Option<crate::NativeFunction> {
         // Only a function entry enters native code at the function's start; any other
         // target (an export breakpoint stub, a label inside a function) stays interpreted.
-        if module.entry_arity.get(target).copied().unwrap_or(0) == 0 {
-            return None;
-        }
-        let index = *module.on_entry_fn.get(target)?;
-        if index == u32::MAX {
-            return None;
-        }
-        let index = index as usize;
+        let index = module.function_by_entry(target)?;
         let identity = std::ptr::from_ref(module) as usize;
         if self.module_identities.get(module_id).copied() != Some(identity) {
             self.register_module(module_id, module);
