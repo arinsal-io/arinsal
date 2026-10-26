@@ -457,6 +457,8 @@ struct HandleCold {
     /// `port->common.u.alive.reg->name`, shared with the register table entry.
     reg_word: Option<Arc<AtomicU32>>,
     halt_progress: Option<HaltProgress>,
+    /// `port_set_data/2` data that is not an atom or a small integer.
+    data_block: Option<Box<PortDataBlock>>,
 }
 
 /// State retained for a live child or fd port.
@@ -478,7 +480,7 @@ pub(crate) struct PortHandle {
     /// The runtime the port belongs to (`ERTS_...` trace scope is its address).
     runtime: &'static crate::process::Runtime,
     /// `port_set_data/2` term. `undefined` until the first store.
-    data: Mutex<PortData>,
+    data: AtomicU64,
     /// `tcp_inet` / `tcp_inet6` port. I/O is owned by `inet_drv`, not a stdio worker.
     /// Dynamically loaded (`erl_ddll`) driver port.
     driver: Option<arinsal_drv::DriverPort>,
@@ -564,6 +566,14 @@ impl PortTable {
     pub(crate) fn get(&self, id: u64) -> Option<Arc<PortHandle>> {
         let slot = self.slot(id)?.load();
         slot.as_ref().filter(|handle| handle.id == id).cloned()
+    }
+
+    /// Run `f` on the live port `id` without taking a counted reference to it.
+    pub(crate) fn with<R>(&self, id: u64, f: impl FnOnce(&PortHandle) -> R) -> Option<R> {
+        let slot = self.slot(id)?.load();
+        slot.as_ref()
+            .filter(|handle| handle.id == id)
+            .map(|handle| f(handle))
     }
 
     /// Whether port `id` is live.
@@ -2981,7 +2991,7 @@ fn make_handle_with(
         }),
         scheduler,
         runtime,
-        data: Mutex::new(PortData::undefined()),
+        data: AtomicU64::new(PORT_DATA_UNDEFINED),
         driver: driver.map(|(driver, runtime)| {
             let owner_ref: std::sync::Weak<dyn arinsal_drv::PortOwner> = me.clone();
             arinsal_drv::DriverPort::new(
@@ -3919,22 +3929,35 @@ pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> b
     handle.is_some_and(|handle| !handle.state.lock().exit_complete)
 }
 
+/// `prt->data` (erl_port.h): an atom or a small integer lives in the word itself, as an
+/// immediate does in erts, so `port_get_data/1` is one atomic load. Layout: zero means the data
+/// is in the cold block; `index << 2 | 1` is an atom, `value << 2 | 2` a small integer.
+const PORT_DATA_BLOCK: u64 = 0;
+const PORT_DATA_UNDEFINED: u64 = ((arinsal_term::atoms::UNDEFINED.0 as u64) << 2) | 1;
+
+fn port_data_word(term: Term) -> Option<u64> {
+    if let Some(atom) = term.as_atom() {
+        return Some((u64::from(atom.0) << 2) | 1);
+    }
+    term.as_small().map(|value| ((value as u64) << 2) | 2)
+}
+
+fn port_data_term(word: u64) -> Option<Term> {
+    match word & 3 {
+        1 => Some(Term::atom(arinsal_term::Atom((word >> 2) as u32))),
+        2 => Term::small((word as i64) >> 2),
+        _ => None,
+    }
+}
+
 /// The term of `port_set_data/2` in a heap block of its own (`ErtsPortDataHeap`: the term and
 /// the heap fragment it was copied into, with the off-heap list).
 // Port of erts/emulator/beam/erl_port.h (ErtsPortDataHeap), OTP-29.1.1.
-struct PortData(Option<Box<PortDataBlock>>);
-
 struct PortDataBlock {
     term: Term,
     /// The words `term` points into, when it is not an immediate (erts keeps them in the same
     /// allocation, `ErtsPortDataHeap`).
     _fragment: Option<Box<arinsal_term::VecHeap>>,
-}
-
-impl PortData {
-    fn undefined() -> Self {
-        Self(None)
-    }
 }
 
 /// Errors of a port BIF as the exception a light BIF raises; any other failure declines.
@@ -3989,6 +4012,39 @@ pub(crate) fn port_close_light(
     light_result(port_close(process, None, caller, *port))
 }
 
+/// `erlang:port_get_data/1` for the thin light-BIF call site.
+pub(crate) struct PortGetData;
+
+impl crate::natives::ThinProcessBif for PortGetData {
+    const ARITY: usize = 1;
+
+    #[inline(always)]
+    fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<crate::exceptions::Trap>> {
+        port_get_data(process, args[0]).map_err(thin_failure)
+    }
+}
+
+/// `erlang:port_set_data/2` for the thin light-BIF call site.
+pub(crate) struct PortSetData;
+
+impl crate::natives::ThinProcessBif for PortSetData {
+    const ARITY: usize = 2;
+
+    #[inline(always)]
+    fn call(process: &mut Process, args: &[Term]) -> Result<Term, Box<crate::exceptions::Trap>> {
+        port_set_data(process, args[0], args[1]).map_err(thin_failure)
+    }
+}
+
+/// The exception of a port BIF that cannot decline.
+#[cold]
+fn thin_failure(error: VmError) -> Box<crate::exceptions::Trap> {
+    match error {
+        VmError::Trap(trap) => Box::new(trap),
+        _ => Box::new(crate::exceptions::Trap::error(atom("badarg"))),
+    }
+}
+
 /// `erlang:port_get_data/1` called from the generated code with `c_p` only.
 // Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
 pub(crate) fn port_get_data_light(
@@ -4015,34 +4071,57 @@ pub(crate) fn port_set_data_light(
 
 // Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
 fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
-    let handle = lookup_port(process, port)?;
-    let data = handle.data.lock();
-    let Some(block) = data.0.as_ref() else {
-        return Ok(atom("undefined"));
-    };
-    let size = arinsal_term::size_object(block.term);
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    arinsal_term::copy_struct(block.term, &mut heap, size).map_err(|_| badarg())
+    let id = port_id(process, port).ok_or_else(badarg)?;
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let heap = &mut process.heap;
+    runtime
+        .ports
+        .with(id, |handle| {
+            loop {
+                if let Some(term) = port_data_term(handle.data.load(Ordering::Acquire)) {
+                    return Ok(term);
+                }
+                let cold = handle.cold.lock();
+                let Some(block) = cold.as_ref().and_then(|cold| cold.data_block.as_ref()) else {
+                    // `port_set_data` replaced the block by an immediate meanwhile.
+                    continue;
+                };
+                if block._fragment.is_none() {
+                    return Ok(block.term);
+                }
+                let size = arinsal_term::size_object(block.term);
+                let mut heap = arinsal_bifs::ProcessHeapHandle(heap);
+                return arinsal_term::copy_struct(block.term, &mut heap, size)
+                    .map_err(|_| badarg());
+            }
+        })
+        .ok_or_else(badarg)?
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:687 (port_set_data_2), OTP-29.1.1.
 fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmError> {
     let handle = lookup_port(process, port)?;
+    if let Some(word) = port_data_word(data) {
+        handle.data.store(word, Ordering::Release);
+        handle.peek_cold(|cold| cold.data_block = None);
+        return Ok(atom("true"));
+    }
     let size = arinsal_term::size_object(data);
-    let stored = if size == 0 {
-        PortData(Some(Box::new(PortDataBlock {
+    let block = if size == 0 {
+        PortDataBlock {
             term: data,
             _fragment: None,
-        })))
+        }
     } else {
         let mut heap = Box::new(arinsal_term::VecHeap::with_initial_chunk_words(size));
         let term = arinsal_term::copy_struct(data, &mut *heap, size).map_err(|_| badarg())?;
-        PortData(Some(Box::new(PortDataBlock {
+        PortDataBlock {
             term,
             _fragment: Some(heap),
-        })))
+        }
     };
-    *handle.data.lock() = stored;
+    handle.with_cold(|cold| cold.data_block = Some(Box::new(block)));
+    handle.data.store(PORT_DATA_BLOCK, Ordering::Release);
     Ok(atom("true"))
 }
 
@@ -4967,7 +5046,7 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
 pub(crate) fn monitor(
     process: &Process,
     id: u64,
-    handle: &Arc<PortHandle>,
+    handle: &PortHandle,
     reference: u64,
     pid: Pid,
     name: Option<arinsal_term::Atom>,
@@ -4985,7 +5064,7 @@ pub(crate) fn monitor(
 fn register_monitor(
     process: &Process,
     id: u64,
-    handle: &Arc<PortHandle>,
+    handle: &PortHandle,
     reference: u64,
     pid: Pid,
     name: Option<arinsal_term::Atom>,
@@ -5103,16 +5182,25 @@ pub(crate) fn demonitor_port(process: &Process, caller: Pid, port_id: u64, refer
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
-    let handle = runtime.ports.get(port_id);
-    let Some(handle) = handle else {
-        // `erts_port_lookup` failed: `ERTS_PORT_OP_DROPPED`, origin already released.
-        return;
-    };
-    if let Some(drv) = handle.drv_port() {
-        drv_sig::demonitor(&handle, &drv, caller, reference);
+    // The common case runs on the borrowed handle; a port that is busy takes a counted one.
+    let free = runtime
+        .ports
+        .with(port_id, |handle| match handle.driver.as_ref() {
+            Some(drv) => drv_sig::demonitor_now(handle, drv, reference),
+            None => {
+                handle.monitors.lock().remove(&reference);
+                true
+            }
+        });
+    // `erts_port_lookup` failed: `ERTS_PORT_OP_DROPPED`, origin already released.
+    if free != Some(false) {
         return;
     }
-    handle.monitors.lock().remove(&reference);
+    if let Some(handle) = runtime.ports.get(port_id)
+        && let Some(drv) = handle.drv_port()
+    {
+        drv_sig::demonitor(&handle, &drv, caller, reference);
+    }
 }
 
 /// Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `{command, Data}`; also
@@ -5723,7 +5811,6 @@ pub(crate) fn layout_sizes() -> Vec<String> {
         format!("PortState={}", size_of::<PortState>()),
         format!("PidSet={}", size_of::<PidSet>()),
         format!("SmallMap={}", size_of::<SmallMap<PortMonitor>>()),
-        format!("PortData={}", size_of::<PortData>()),
         format!("Option<HaltProgress>={}", size_of::<Option<HaltProgress>>()),
         format!("Option<SpawnData>={}", size_of::<Option<Box<SpawnData>>>()),
     ]

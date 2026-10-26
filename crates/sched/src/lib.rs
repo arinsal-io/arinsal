@@ -1204,6 +1204,10 @@ pub mod proc_flags {
     /// Record that this process now has `bit`. False means exit already finished it.
     pub fn publish(flags: &AtomicU32, bit: u32) -> bool {
         let done = bit << DONE_SHIFT;
+        let current = flags.load(Ordering::Acquire);
+        if current & bit != 0 {
+            return current & done == 0;
+        }
         flags.fetch_or(bit, Ordering::AcqRel) & done == 0
     }
 }
