@@ -115,7 +115,7 @@ pub struct AllocBlock {
     allocators: &'static ThreadSpecificAllocators,
 }
 
-/// One erts `Binary` allocation with its allocator handle stored in a private prefix.
+/// One erts `Binary` allocation with its allocator instance stored in a private prefix.
 /// Cloning adjusts the binary header's reference count; no Rust control block is allocated.
 pub struct BinaryBlock {
     memory: WordView,
@@ -124,33 +124,21 @@ pub struct BinaryBlock {
 }
 
 impl BinaryBlock {
-    const PREFIX_WORDS: usize = 4;
+    const PREFIX_WORDS: usize = 1;
     const HEADER_WORDS: usize = 4;
 
     /// Allocate one binary header and byte payload from the `BINARY` allocator.
+    // Port of erts/emulator/beam/erl_binary.h:287 (`erts_bin_nrml_alloc_fnf`), OTP-29.1.1.
     pub fn new(size: usize, flags: u64, apparent_size: usize) -> Result<Self, AllocError> {
         let payload_words = size.div_ceil(std::mem::size_of::<u64>());
         let words = Self::PREFIX_WORDS
             .checked_add(Self::HEADER_WORDS)
             .and_then(|header| header.checked_add(payload_words))
             .ok_or(AllocError::OutOfBounds)?;
-        let bytes = words
-            .checked_mul(std::mem::size_of::<u64>())
-            .ok_or(AllocError::OutOfBounds)?;
         let mut allocation = AllocBlock::new(ErtsAlcType::BINARY, words)?;
         let handle = allocation.handle.ok_or(AllocError::InvalidAllocation)?;
         let memory = &mut allocation.memory;
-        for (index, value) in [
-            handle.instance() as u64,
-            handle.allocation_id(),
-            bytes as u64,
-            words as u64,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            memory.write_word(index, value);
-        }
+        memory.write_word(0, handle.instance() as u64);
         for (index, value) in [flags, apparent_size as u64, 1, size as u64]
             .into_iter()
             .enumerate()
@@ -348,6 +336,7 @@ impl BinaryBlock {
     }
 
     /// Resize the single allocation while this is its unique owner.
+    // Port of erts/emulator/beam/erl_binary.h:321 (`erts_bin_realloc_fnf`), OTP-29.1.1.
     pub fn realloc(&mut self, size: usize) -> Result<(), AllocError> {
         if self.reference_count() != 1 {
             return Err(AllocError::Corrupt);
@@ -359,17 +348,14 @@ impl BinaryBlock {
         let bytes = words
             .checked_mul(std::mem::size_of::<u64>())
             .ok_or(AllocError::OutOfBounds)?;
-        let old = InstanceAllocation::from_parts(
+        let old = InstanceAllocation::from_payload(
             self.memory.read_word(0).ok_or(AllocError::Corrupt)? as usize,
-            self.memory.read_word(1).ok_or(AllocError::Corrupt)?,
-            self.memory.read_word(2).ok_or(AllocError::Corrupt)? as usize,
+            self.memory.as_mut_ptr(),
+            self.memory.len() * std::mem::size_of::<u64>(),
         );
         let (handle, ptr) = self.allocators.realloc_with_ptr(old, bytes)?;
         self.memory.reset(ptr, words);
         self.memory.write_word(0, handle.instance() as u64);
-        self.memory.write_word(1, handle.allocation_id());
-        self.memory.write_word(2, bytes as u64);
-        self.memory.write_word(3, words as u64);
         self.memory
             .atomic_store(Self::PREFIX_WORDS + 3, size as u64, Ordering::Relaxed);
         Ok(())
@@ -405,10 +391,10 @@ impl Drop for BinaryBlock {
         if previous != 1 {
             return;
         }
-        let handle = InstanceAllocation::from_parts(
+        let handle = InstanceAllocation::from_payload(
             self.memory.read_word(0).unwrap() as usize,
-            self.memory.read_word(1).unwrap(),
-            self.memory.read_word(2).unwrap() as usize,
+            self.memory.as_mut_ptr(),
+            self.memory.len() * std::mem::size_of::<u64>(),
         );
         let _ = self.allocators.free(handle);
     }

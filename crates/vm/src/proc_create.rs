@@ -1390,6 +1390,17 @@ impl BifTrapPending {
     // OTP-29.1.1.
     pub(crate) fn args_are_roots(&self) -> bool {
         self.continuation == crate::bif_traps::REVERSE_CONTINUATION
+            || self.continuation == crate::bif_traps::PTAB_LIST_CONTINUATION
+    }
+
+    pub(crate) fn root_args_len(&self) -> usize {
+        if self.continuation == crate::bif_traps::PTAB_LIST_CONTINUATION {
+            1
+        } else if self.continuation == crate::bif_traps::REVERSE_CONTINUATION {
+            self.arity
+        } else {
+            0
+        }
     }
 }
 

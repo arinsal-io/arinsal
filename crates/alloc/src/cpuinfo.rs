@@ -6,6 +6,353 @@
 
 use std::sync::OnceLock;
 
+/// One row from `erts_cpu_topology_t`, in the order used by ERTS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuTopologyEntry {
+    /// NUMA node id, or -1 when the operating system does not expose one.
+    pub node: i32,
+    /// Processor package id.
+    pub processor: i32,
+    /// NUMA node local to a package, or -1 when it is not needed.
+    pub processor_node: i32,
+    /// Core id within the package.
+    pub core: i32,
+    /// Hardware thread id within the core.
+    pub thread: i32,
+    /// Logical processor id used by the OS affinity API.
+    pub logical: i32,
+}
+
+/// Detected hardware topology, sorted like `erts_get_cpu_topology` returns it.
+// Port of erts/lib_src/common/erl_misc_utils.c (erts_get_cpu_topology), OTP-29.1.1.
+pub fn cpu_topology() -> &'static [CpuTopologyEntry] {
+    static TOPOLOGY: OnceLock<Vec<CpuTopologyEntry>> = OnceLock::new();
+    TOPOLOGY.get_or_init(read_cpu_topology)
+}
+
+// Port of erts/lib_src/common/erl_misc_utils.c (erts_cpu_info_update), OTP-29.1.1.
+fn read_cpu_topology() -> Vec<CpuTopologyEntry> {
+    #[cfg(target_os = "linux")]
+    {
+        read_linux_cpu_topology()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+// Port of erts/lib_src/common/erl_misc_utils.c (read_topology), OTP-29.1.1.
+#[cfg(target_os = "linux")]
+fn read_linux_cpu_topology() -> Vec<CpuTopologyEntry> {
+    let info = cpu_info();
+    if info.configured == 0 {
+        return Vec::new();
+    }
+    let node_root = std::fs::canonicalize("/sys/devices/system/node").ok();
+    let node_dirs = node_root.as_ref().and_then(|root| {
+        let mut dirs = std::fs::read_dir(root)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                Some((
+                    name.strip_prefix("node")?.parse::<i32>().ok()?,
+                    entry.path(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        dirs.sort_by_key(|(id, _)| *id);
+        Some(dirs)
+    });
+    let nodes_available = node_dirs.as_ref().is_some_and(|dirs| !dirs.is_empty());
+    let sources = if nodes_available {
+        node_dirs.unwrap_or_default()
+    } else {
+        vec![(-1, std::path::PathBuf::from("/sys/devices/system/cpu"))]
+    };
+    let mut entries = Vec::new();
+    for (node, source) in sources {
+        let Ok(cpus) = std::fs::read_dir(source) else {
+            return Vec::new();
+        };
+        for entry in cpus.filter_map(Result::ok) {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Some(logical) = name
+                .strip_prefix("cpu")
+                .filter(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|number| number.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let topology = entry.path().join("topology");
+            let Some(processor) = read_i32(topology.join("physical_package_id")) else {
+                continue;
+            };
+            let Some(core) = read_i32(topology.join("core_id")) else {
+                continue;
+            };
+            entries.push(CpuTopologyEntry {
+                node,
+                processor,
+                processor_node: -1,
+                core,
+                thread: 0,
+                logical,
+            });
+            if entries.len() > info.configured {
+                return Vec::new();
+            }
+        }
+    }
+    if entries.len() < info.online || entries.is_empty() {
+        return Vec::new();
+    }
+
+    // Port of adjust_processor_nodes: move NUMA ids into processor_node when a package
+    // spans multiple NUMA nodes.
+    if nodes_available {
+        let mut package_nodes =
+            std::collections::BTreeMap::<i32, std::collections::BTreeSet<i32>>::new();
+        for entry in &entries {
+            package_nodes
+                .entry(entry.processor)
+                .or_default()
+                .insert(entry.node);
+        }
+        for entry in &mut entries {
+            if package_nodes[&entry.processor].len() > 1 {
+                entry.processor_node = entry.node;
+                entry.node = -1;
+            }
+        }
+    }
+    entries.sort_by_key(topology_cpu_key);
+    let mut prior: Option<CpuTopologyEntry> = None;
+    let mut thread = 0;
+    for entry in &mut entries {
+        let same_core = prior.is_some_and(|last| {
+            (last.node, last.processor, last.processor_node, last.core)
+                == (
+                    entry.node,
+                    entry.processor,
+                    entry.processor_node,
+                    entry.core,
+                )
+        });
+        thread = if same_core { thread + 1 } else { 0 };
+        entry.thread = thread;
+        prior = Some(*entry);
+    }
+    entries
+}
+
+#[cfg(target_os = "linux")]
+fn read_i32(path: std::path::PathBuf) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// `cpu_cmp` in `erl_misc_utils.c`.
+pub fn topology_cpu_key(entry: &CpuTopologyEntry) -> (i32, i32, i32, i32, i32, i32) {
+    (
+        entry.node,
+        entry.processor,
+        entry.processor_node,
+        entry.core,
+        entry.thread,
+        entry.logical,
+    )
+}
+
+/// Sort topology records using OTP's scheduler bind order.
+// Port of erts/emulator/beam/erl_cpu_topology.c (cpu_bind_order_sort,
+// make_cpudata_id_seq), OTP-29.1.1.
+pub fn cpu_bind_ordered_topology(order: &str) -> Option<Vec<CpuTopologyEntry>> {
+    cpu_bind_ordered_entries(cpu_topology(), order)
+}
+
+/// Sort a defined topology using OTP's scheduler bind order.
+// Port of erts/emulator/beam/erl_cpu_topology.c (cpu_bind_order_sort,
+// make_cpudata_id_seq), OTP-29.1.1.
+pub fn cpu_bind_ordered_entries(
+    topology: &[CpuTopologyEntry],
+    order: &str,
+) -> Option<Vec<CpuTopologyEntry>> {
+    let mut entries = topology.to_vec();
+    let no_node = matches!(
+        order,
+        "default_bind"
+            | "thread_no_node_processor_spread"
+            | "no_node_processor_spread"
+            | "no_node_thread_spread"
+    );
+    if !matches!(
+        order,
+        "default_bind"
+            | "spread"
+            | "processor_spread"
+            | "thread_spread"
+            | "thread_no_node_processor_spread"
+            | "no_node_processor_spread"
+            | "no_node_thread_spread"
+            | "no_spread"
+    ) {
+        return None;
+    }
+    if entries.len() > 1 {
+        make_topology_id_seq(&mut entries, no_node);
+        entries.sort_by_key(|entry| match order {
+            "spread" => (
+                entry.thread,
+                entry.core,
+                entry.processor_node,
+                entry.processor,
+                entry.node,
+                0,
+            ),
+            "processor_spread" => (
+                entry.thread,
+                entry.processor_node,
+                entry.core,
+                entry.node,
+                entry.processor,
+                0,
+            ),
+            "thread_spread" => (
+                entry.thread,
+                entry.node,
+                entry.processor,
+                entry.processor_node,
+                entry.core,
+                0,
+            ),
+            "default_bind" | "thread_no_node_processor_spread" => {
+                (entry.thread, entry.node, entry.core, entry.processor, 0, 0)
+            }
+            "no_node_processor_spread" => {
+                (entry.node, entry.thread, entry.core, entry.processor, 0, 0)
+            }
+            "no_node_thread_spread" => {
+                (entry.node, entry.thread, entry.processor, entry.core, 0, 0)
+            }
+            _ => (
+                entry.node,
+                entry.processor,
+                entry.processor_node,
+                entry.core,
+                entry.thread,
+                0,
+            ),
+        });
+    }
+    Some(entries)
+}
+
+// Port of erts/emulator/beam/erl_cpu_topology.c (make_cpudata_id_seq), OTP-29.1.1.
+fn make_topology_id_seq(entries: &mut [CpuTopologyEntry], no_node: bool) {
+    let mut node = -1;
+    let mut processor = -1;
+    let mut processor_node = -1;
+    let mut processor_node_node = -1;
+    let mut core = -1;
+    let mut thread = -1;
+    let mut old_node = -1;
+    let mut old_processor = -1;
+    let mut old_processor_node = -1;
+    let mut old_core = -1;
+    let mut old_thread = -1;
+    for entry in entries {
+        if !no_node || entry.node >= 0 {
+            if old_node == entry.node {
+                entry.node = node;
+            } else {
+                old_node = entry.node;
+                old_processor = -1;
+                processor = -1;
+                if !no_node {
+                    old_processor_node = -1;
+                    processor_node = -1;
+                }
+                old_core = -1;
+                core = -1;
+                old_thread = -1;
+                thread = -1;
+                if no_node || entry.node >= 0 {
+                    node += 1;
+                    entry.node = node;
+                }
+            }
+        }
+        if old_processor == entry.processor {
+            entry.processor = processor;
+        } else {
+            old_processor = entry.processor;
+            processor = processor.saturating_add(1);
+            if !no_node {
+                processor_node_node = -1;
+                old_processor_node = -1;
+                processor_node = -1;
+            }
+            old_core = -1;
+            core = -1;
+            old_thread = -1;
+            thread = -1;
+            entry.processor = processor;
+        }
+        if no_node && entry.processor_node < 0 {
+            old_processor_node = -1;
+        } else if old_processor_node == entry.processor_node {
+            if no_node {
+                entry.node = node;
+                entry.processor_node = node;
+            } else {
+                if processor_node_node >= 0 {
+                    entry.node = processor_node_node;
+                }
+                entry.processor_node = processor_node;
+            }
+        } else {
+            old_processor_node = entry.processor_node;
+            old_core = -1;
+            core = -1;
+            old_thread = -1;
+            thread = -1;
+            if no_node {
+                node += 1;
+                entry.node = node;
+                entry.processor_node = node;
+            } else {
+                node += 1;
+                processor_node += 1;
+                processor_node_node = node;
+                entry.node = node;
+                entry.processor_node = processor_node;
+            }
+        }
+        if !no_node && entry.processor_node < 0 {
+            entry.processor_node = 0;
+        }
+        if old_core == entry.core {
+            entry.core = core;
+        } else {
+            old_core = entry.core;
+            old_thread = -1;
+            thread = -1;
+            core += 1;
+            entry.core = core;
+        }
+        if old_thread == entry.thread {
+            entry.thread = thread;
+        } else {
+            old_thread = entry.thread;
+            thread += 1;
+            entry.thread = thread;
+        }
+    }
+}
+
 /// Processor counts as erts reports them through `erts_get_logical_processors`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuInfo {
@@ -118,8 +465,29 @@ fn count_cpu_list(list: &str) -> Option<usize> {
     (count > 0).then_some(count)
 }
 
-/// macOS has no separate configured/online data: `hw.ncpu` for both.
-#[cfg(not(target_os = "linux"))]
+/// Port of erts/lib_src/common/erl_misc_utils.c (erts_cpu_info_update): sysctl HW_NCPU
+/// and HW_AVAILCPU are the configured and online counts on macOS.
+#[cfg(target_os = "macos")]
+fn configured_and_online() -> (usize, usize) {
+    fn sysctl(name: &str) -> Option<usize> {
+        use sysctl::Sysctl;
+
+        if !matches!(name, "hw.ncpu" | "hw.availcpu") {
+            return None;
+        }
+        sysctl::Ctl::Name(name.to_owned(), sysctl::CtlType::Int, "I".to_owned())
+            .value()
+            .ok()?
+            .as_int()
+            .and_then(|value| usize::try_from(*value).ok())
+    }
+    let configured = sysctl("hw.ncpu").unwrap_or(0);
+    let online = sysctl("hw.availcpu").unwrap_or(configured);
+    (configured, online.min(configured))
+}
+
+/// Fallback for operating systems without an ERTS CPU count implementation.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn configured_and_online() -> (usize, usize) {
     let count = std::thread::available_parallelism().map_or(1, usize::from);
     (count, count)
@@ -128,12 +496,33 @@ fn configured_and_online() -> (usize, usize) {
 /// Processors in the affinity mask of this process; 0 where the platform has none (macOS).
 #[cfg(target_os = "linux")]
 fn affinity_count() -> usize {
-    rustix::thread::sched_getaffinity(None).map_or(0, |set| set.count() as usize)
+    available_cpu_ids().len()
 }
 
 #[cfg(not(target_os = "linux"))]
 fn affinity_count() -> usize {
     0
+}
+
+/// CPU ids in the process affinity mask captured during CPU info initialization.
+#[cfg(target_os = "linux")]
+pub fn available_cpu_ids() -> &'static [usize] {
+    static IDS: OnceLock<Vec<usize>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        rustix::thread::sched_getaffinity(None)
+            .map(|set| {
+                (0..rustix::thread::CpuSet::MAX_CPU)
+                    .filter(|cpu| set.is_set(*cpu))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// CPU ids are unavailable on platforms without a process affinity mask.
+#[cfg(not(target_os = "linux"))]
+pub fn available_cpu_ids() -> &'static [usize] {
+    &[]
 }
 
 #[cfg(not(target_os = "linux"))]

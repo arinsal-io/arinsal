@@ -7339,8 +7339,9 @@ impl Process {
                 roots.push(pending.roots_mut());
             }
             if let Some(trap) = cold.bif_trap.as_mut() {
-                if trap.args_are_roots() {
-                    roots.push(&mut trap.args[..trap.arity]);
+                let root_args = trap.root_args_len();
+                if root_args != 0 {
+                    roots.push(&mut trap.args[..root_args]);
                 }
                 if let Some(state) = trap.state_term.as_mut() {
                     roots.push_term(state);
