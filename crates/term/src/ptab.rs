@@ -8,7 +8,7 @@
 //! one process table and the one port table of this OS process is global, as
 //! `erts_proc` and `erts_port` are in erts.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, Ordering};
 
 /// Bits of identifier data in a local pid or port word.
 // Port of erts/emulator/beam/erl_ptab.h:171 (ERTS_PTAB_ID_DATA_SIZE), OTP-29.1.1.
@@ -30,6 +30,10 @@ pub const MAX_INTERNAL_PID_NUMBER: u32 = (1 << PID_NUM_SIZE) - 1;
 const IX_PER_CACHE_LINE: u32 = 8;
 /// Smallest table whose erts index permutation is a bijection.
 const MIN_BITS: u32 = 4;
+
+/// Eight table words share each 64-byte allocation cache line, as in `erts_alloc_permanent_cache_aligned`.
+#[repr(align(64))]
+struct PtabCacheLine([AtomicPtr<()>; IX_PER_CACHE_LINE as usize]);
 
 /// Geometry of a process or port table (`ErtsPTab.r.o` index masks).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,7 +221,9 @@ pub struct PtabIdRing {
     count: AtomicU32,
     aid_ix: AtomicU32,
     fid_ix: AtomicU32,
-    free_id_data: Box<[AtomicU64]>,
+    words: Box<[PtabCacheLine]>,
+    ring_offset: u32,
+    has_process_slots: bool,
     invalid_pix: Option<u32>,
 }
 
@@ -227,12 +233,26 @@ impl PtabIdRing {
     ///
     /// Port of erts/emulator/beam/erl_ptab.c:359 (erts_ptab_init_table), OTP-29.1.1.
     pub fn new(capacity: u32) -> Self {
+        Self::with_process_slots(capacity, false)
+    }
+
+    /// Allocate the `tab` and `free_id_data` arrays in the single aligned block used by
+    /// `erts_ptab_init_table` for a non-legacy process table.
+    ///
+    /// Port of erts/emulator/beam/erl_ptab.c:359 (erts_ptab_init_table), OTP-29.1.1.
+    pub fn new_process_table(capacity: u32) -> Self {
+        Self::with_process_slots(capacity, true)
+    }
+
+    fn with_process_slots(capacity: u32, has_process_slots: bool) -> Self {
         let layout = PtabLayout::new(capacity);
+        let ring_offset = if has_process_slots { layout.max() } else { 0 };
+        let word_count = layout.max() as usize * if has_process_slots { 2 } else { 1 };
         // A full-size table parks the invalid element in its slot so only
         // ERTS_PTAB_MAX_SIZE-1 identifiers are ever handed out (erl_ptab.c:470).
         let invalid_pix =
             (layout.max() == PTAB_MAX_SIZE).then(|| layout.data2pix(PTAB_INVALID_DATA));
-        Self {
+        let ring = Self {
             layout,
             limit: capacity.clamp(1, layout.max()),
             count: AtomicU32::new(u32::from(invalid_pix.is_some())),
@@ -240,11 +260,21 @@ impl PtabIdRing {
             fid_ix: AtomicU32::new(u32::MAX),
             // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_init_table: free_id_data),
             // OTP-29.1.1.
-            free_id_data: (0..layout.max())
-                .map(|dix| AtomicU64::new(layout.initial_free_id_data(dix)))
+            words: (0..word_count / IX_PER_CACHE_LINE as usize)
+                .map(|_| {
+                    PtabCacheLine(std::array::from_fn(
+                        |_| AtomicPtr::new(std::ptr::null_mut()),
+                    ))
+                })
                 .collect(),
+            ring_offset,
+            has_process_slots,
             invalid_pix,
+        };
+        for dix in 0..layout.max() {
+            ring.store_ring_word(dix, layout.initial_free_id_data(dix), Ordering::Relaxed);
         }
+        ring
     }
 
     /// Number of live elements.
@@ -270,8 +300,75 @@ impl PtabIdRing {
         self.invalid_pix
     }
 
-    fn slot(&self, dix: u32) -> &AtomicU64 {
-        &self.free_id_data[dix as usize]
+    fn word(&self, index: u32) -> &AtomicPtr<()> {
+        let index = index as usize;
+        &self.words[index / IX_PER_CACHE_LINE as usize].0[index % IX_PER_CACHE_LINE as usize]
+    }
+
+    fn slot(&self, dix: u32) -> &AtomicPtr<()> {
+        self.word(self.ring_offset + dix)
+    }
+
+    fn store_ring_word(&self, dix: u32, value: u64, ordering: Ordering) {
+        self.slot(dix).store(value as usize as *mut (), ordering);
+    }
+
+    fn swap_ring_word(&self, dix: u32, value: u64, ordering: Ordering) -> u64 {
+        self.slot(dix).swap(value as usize as *mut (), ordering) as usize as u64
+    }
+
+    fn load_ring_word(&self, dix: u32, ordering: Ordering) -> u64 {
+        self.slot(dix).load(ordering) as usize as u64
+    }
+
+    fn compare_exchange_ring_word(
+        &self,
+        dix: u32,
+        current: u64,
+        new: u64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u64, u64> {
+        self.slot(dix)
+            .compare_exchange(
+                current as usize as *mut (),
+                new as usize as *mut (),
+                success,
+                failure,
+            )
+            .map(|value| value as usize as u64)
+            .map_err(|value| value as usize as u64)
+    }
+
+    /// Number of process-table slots in a combined `tab`/`free_id_data` allocation.
+    pub fn process_slot_count(&self) -> u32 {
+        if self.has_process_slots {
+            self.layout.max()
+        } else {
+            0
+        }
+    }
+
+    /// Read a process pointer word from the `tab` array.
+    pub fn process_slot_load(&self, pix: u32, ordering: Ordering) -> Option<*mut ()> {
+        self.process_slot(pix).map(|slot| slot.load(ordering))
+    }
+
+    /// Atomic `tab` entry for process-table operations that need compare, swap, or a borrowed slot.
+    pub fn process_slot(&self, pix: u32) -> Option<&AtomicPtr<()>> {
+        (pix < self.process_slot_count()).then(|| self.word(pix))
+    }
+
+    /// Write a process pointer word to the `tab` array.
+    pub fn process_slot_store(&self, pix: u32, value: *mut (), ordering: Ordering) {
+        assert!(pix < self.process_slot_count());
+        self.word(pix).store(value, ordering);
+    }
+
+    /// Clear and return a process pointer word from the `tab` array.
+    pub fn process_slot_swap(&self, pix: u32, value: *mut (), ordering: Ordering) -> *mut () {
+        assert!(pix < self.process_slot_count());
+        self.word(pix).swap(value, ordering)
     }
 
     /// Reserve an element and take the next free identifier data; `None` when the
@@ -299,7 +396,7 @@ impl PtabIdRing {
         loop {
             let ix = self.aid_ix.fetch_add(1, Ordering::Acquire).wrapping_add(1);
             let dix = self.layout.ix_to_free_id_data_ix(ix);
-            let data = self.slot(dix).swap(PTAB_INVALID_DATA, Ordering::Relaxed);
+            let data = self.swap_ring_word(dix, PTAB_INVALID_DATA, Ordering::Relaxed);
             if data != PTAB_INVALID_DATA {
                 return Some(data);
             }
@@ -320,8 +417,8 @@ impl PtabIdRing {
             let ix = self.fid_ix.fetch_add(1, Ordering::Release).wrapping_add(1);
             let dix = self.layout.ix_to_free_id_data_ix(ix);
             if self
-                .slot(dix)
-                .compare_exchange(
+                .compare_exchange_ring_word(
+                    dix,
                     PTAB_INVALID_DATA,
                     data,
                     Ordering::Relaxed,
@@ -355,7 +452,7 @@ impl PtabIdRing {
                 if self.invalid_pix != Some(pix) && !occupied(pix) {
                     id_ix = id_ix.wrapping_add(1);
                     let dix = self.layout.ix_to_free_id_data_ix(id_ix);
-                    self.slot(dix).store(num, Ordering::Relaxed);
+                    self.store_ring_word(dix, num, Ordering::Relaxed);
                 }
             }
             self.fid_ix.store(id_ix, Ordering::Relaxed);
@@ -367,18 +464,35 @@ impl PtabIdRing {
                     break;
                 }
                 let dix = self.layout.ix_to_free_id_data_ix(id_ix);
-                self.slot(dix).store(PTAB_INVALID_DATA, Ordering::Relaxed);
+                self.store_ring_word(dix, PTAB_INVALID_DATA, Ordering::Relaxed);
             }
         }
         let id_ix = self.aid_ix.load(Ordering::Relaxed).wrapping_add(1);
-        self.slot(self.layout.ix_to_free_id_data_ix(id_ix))
-            .load(Ordering::Relaxed)
+        self.load_ring_word(self.layout.ix_to_free_id_data_ix(id_ix), Ordering::Relaxed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_words_match_erts_aligned_allocation_sizes() {
+        let process = PtabIdRing::new_process_table(1 << 20);
+        let port = PtabIdRing::new(1 << 20);
+        assert_eq!(
+            process.words.len() * std::mem::size_of::<PtabCacheLine>(),
+            16 << 20
+        );
+        assert_eq!(
+            port.words.len() * std::mem::size_of::<PtabCacheLine>(),
+            8 << 20
+        );
+        assert_eq!(process.process_slot_count(), 1 << 20);
+        assert_eq!(port.process_slot_count(), 0);
+        assert_eq!((process.words.as_ptr() as usize) % 64, 0);
+        assert_eq!((port.words.as_ptr() as usize) % 64, 0);
+    }
 
     #[test]
     fn permutation_round_trips() {

@@ -1324,9 +1324,6 @@ struct ProcessTable<T: Task> {
     /// `ptab->list.data.interval`: read into each new element's `started_interval` and
     /// stepped only when a later interval is needed.
     interval: AtomicU64,
-    /// `ptab->r.o.tab`: one slot per table index, allocated with the table as
-    /// erts_ptab_init_table does. A slot holds the table's reference to its process.
-    slots: Box<[AtomicPtr<()>]>,
     /// `ptab->r.o.pix_mask`.
     pix_mask: usize,
     /// The thread progress that releases the table's references (erts_ptab_delete_element
@@ -1581,16 +1578,12 @@ impl<T: Copy> PtabListLog<T> {
 
 impl<T: Task> ProcessTable<T> {
     fn new(capacity: u32, progress: Arc<thr_progress::ThrProgress>) -> Self {
-        let ids = PtabIdRing::new(capacity);
-        let slots = (0..ids.layout().max())
-            .map(|_| AtomicPtr::new(std::ptr::null_mut()))
-            .collect();
+        let ids = PtabIdRing::new_process_table(capacity);
         Self {
             pix_mask: ids.layout().max() as usize - 1,
             ids,
             lock: arinsal_term::FrequentReadRwLock::new(()),
             interval: AtomicU64::new(0),
-            slots,
             progress,
             list_deleted: parking_lot::Mutex::new(PtabListLog::default()),
             list_active: AtomicBool::new(false),
@@ -1599,7 +1592,7 @@ impl<T: Task> ProcessTable<T> {
     }
 
     fn slot(&self, pix: u32) -> Option<&AtomicPtr<()>> {
-        self.slots.get(pix as usize)
+        self.ids.process_slot(pix)
     }
 
     fn slot_occupied(&self, pix: u32) -> bool {
@@ -1704,7 +1697,11 @@ impl<T: Task> ProcessTable<T> {
             return Err(SpawnInitError::Init(error));
         }
         // The table's reference (erts `refc` 1 at erts_ptab_new_element).
-        self.slots[context.pix].store(process.clone().into_raw(), Ordering::Release);
+        self.ids.process_slot_store(
+            context.pix as u32,
+            process.clone().into_raw(),
+            Ordering::Release,
+        );
         drop(context);
         Ok(process)
     }
@@ -1727,9 +1724,12 @@ impl<T: Task> ProcessTable<T> {
     // Port of erts/emulator/beam/erl_ptab.c:888 (ptab_list_bif_engine), OTP-29.1.1.
     fn with_slot_range(&self, first: u32, limit: u32, mut f: impl FnMut(&ProcRef<T>)) {
         let delay = thr_progress::unmanaged_delay(&self.progress);
-        let limit = limit.min(self.slots.len() as u32);
+        let limit = limit.min(self.ids.process_slot_count());
         for pix in first.min(limit)..limit {
-            let raw = self.slots[pix as usize].load(Ordering::Acquire);
+            let raw = self
+                .slot(pix)
+                .expect("process-table slot is in range")
+                .load(Ordering::Acquire);
             if !raw.is_null() {
                 let _lookup = thr_progress::LookupScope::enter();
                 // SAFETY: `raw` remains table-owned during the delay, and a later operation
@@ -1797,6 +1797,9 @@ impl<T: Task> ProcessTable<T> {
     }
 
     fn load_slot(&self, pix: u32) -> Option<ProcRef<T>> {
+        if pix >= self.ids.process_slot_count() {
+            return None;
+        }
         self.with_slot(pix, ProcRef::clone)
     }
 
@@ -1839,7 +1842,7 @@ impl<T: Task> ProcessTable<T> {
             thr_progress::is_managed_thread_of(&self.progress),
             "a managed lookup runs on a managed thread"
         );
-        let slot = self.slots.get((word >> 4) as usize & self.pix_mask)?;
+        let slot = self.slot((word >> 4) as usize as u32 & self.pix_mask as u32)?;
         ProcRef::with_slot_managed(slot, |process| (process.word == word).then(|| f(process)))
             .flatten()
     }
@@ -1858,11 +1861,13 @@ impl<T: Task> ProcessTable<T> {
     }
 
     fn remove_locked(&self, pid: Pid, log_active: bool) {
-        let slot = self.slot(self.index(pid)).expect("a live pid has a slot");
+        let pix = self.index(pid);
         let removed = log_active
             .then(|| self.load_slot(self.index(pid)))
             .flatten();
-        let old = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let old = self
+            .ids
+            .process_slot_swap(pix, std::ptr::null_mut(), Ordering::AcqRel);
         if old.is_null() {
             return;
         }
@@ -1905,9 +1910,12 @@ impl<T: Task> ProcessTable<T> {
     }
 
     fn live_count(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|slot| !slot.load(Ordering::Acquire).is_null())
+        (0..self.ids.process_slot_count())
+            .filter(|&pix| {
+                self.ids
+                    .process_slot_load(pix, Ordering::Acquire)
+                    .is_some_and(|slot| !slot.is_null())
+            })
             .count()
     }
 
@@ -1918,7 +1926,7 @@ impl<T: Task> ProcessTable<T> {
     fn pids_in_range(&self, first: u32, limit: u32, max: usize) -> (Vec<Pid>, u32) {
         let mut pids = Vec::new();
         let mut pix = first;
-        let limit = limit.min(self.slots.len() as u32);
+        let limit = limit.min(self.ids.process_slot_count());
         while pix < limit && pids.len() < max {
             if let Some(process) = self.load_slot(pix) {
                 pids.push(process.pid);
