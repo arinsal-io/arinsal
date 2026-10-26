@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+#[allow(dead_code)]
+mod beam_op;
 mod erts_tables;
 #[path = "rule_syntax.rs"]
 mod rule_syntax;
@@ -11,6 +13,140 @@ use arinsal_spec::BifKind;
 use rule_syntax::*;
 use smallvec::SmallVec;
 use std::{collections::HashMap, sync::OnceLock};
+
+/// The generic instructions the module's code reader produces, as text, one per line: the name,
+/// then every operand as `<tag letter>:<value>` (atoms by name). For tests of the reader.
+#[doc(hidden)]
+pub fn reader_dump(beam: &BeamFile) -> Vec<String> {
+    let mut alloc = beam_op::BeamOpAllocator::new();
+    let mut reader = beam_op::BeamCodeReader::new(beam);
+    let mut lines = Vec::new();
+    loop {
+        let id = reader.next(&mut alloc).expect("a readable instruction");
+        let op = alloc.op(id);
+        let entry = &erts_tables::GEN_OPC[op.op as usize];
+        let mut line = format!("{}/{}", entry.name, op.arity);
+        for arg in op.args() {
+            let letter = beam_op::TAG_TO_LETTER[usize::from(arg.ty)];
+            match arg.ty {
+                beam_op::TAG_A => {
+                    let name = arinsal_term::global_atoms()
+                        .text(arinsal_term::Atom(arg.val as u32))
+                        .expect("an interned atom");
+                    line.push_str(&format!(" a:{name}"));
+                }
+                beam_op::TAG_Q if arg.val as usize >= beam.literals.len() => {
+                    let big = &reader.bignum_literals[arg.val as usize - beam.literals.len()];
+                    line.push_str(&format!(" q:big{big}"));
+                }
+                _ => line.push_str(&format!(" {letter}:{}", arg.val)),
+            }
+        }
+        let end = entry.name == "int_code_end";
+        lines.push(line);
+        if end {
+            return lines;
+        }
+    }
+}
+
+/// What the transform engine starts from today (the generic nodes after the function boundary
+/// passes), in the format of [`reader_dump`]. For tests of the reader.
+#[doc(hidden)]
+pub fn legacy_generic_ops_dump(beam: &BeamFile) -> Vec<String> {
+    let mut arena = TransformArena::new();
+    arena.reset();
+    let mut head = None;
+    let mut tail = None;
+    for instruction in &beam.code.instructions {
+        let node = Node {
+            name: instruction.op.name(),
+            args: instruction.args.iter().map(allocation_as_words).collect(),
+            offset: instruction.offset,
+        };
+        let index = arena.allocate(node, None);
+        if let Some(previous) = tail {
+            arena.set_next(previous, Some(index));
+        } else {
+            head = Some(index);
+        }
+        tail = Some(index);
+    }
+    head = inject_function_starts(&mut arena, head);
+    add_function_end_nodes(&mut arena, &mut head);
+    let mut lines = Vec::new();
+    let mut cursor = head;
+    while let Some(index) = cursor {
+        let node = arena.node(index);
+        let mut flat: Vec<String> = Vec::new();
+        for operand in &node.args {
+            legacy_operand_text(beam, operand, &mut flat);
+        }
+        // `synthesize_func_end` tags both labels `TAG_f`; the node of the current engine has `u`.
+        if node.name == "int_func_end" {
+            for text in &mut flat {
+                *text = text.replacen("u:", "f:", 1);
+            }
+        }
+        lines.push(
+            format!("{}/{} {}", node.name, flat.len(), flat.join(" "))
+                .trim_end()
+                .to_owned(),
+        );
+        cursor = arena.next(index);
+    }
+    // `beamcodereader_next` puts the last `int_func_end/2` before `int_code_end/0`; the current
+    // engine appends it after.
+    let count = lines.len();
+    if count >= 2
+        && lines[count - 2] == "int_code_end/0"
+        && lines[count - 1].starts_with("int_func_end/2")
+    {
+        lines.swap(count - 2, count - 1);
+    }
+    lines
+}
+
+fn legacy_operand_text(beam: &BeamFile, operand: &Operand, out: &mut Vec<String>) {
+    match operand {
+        Operand::U(value) => out.push(format!("u:{value}")),
+        Operand::Int(value) => out.push(format!("i:{}", *value as u64)),
+        Operand::BigInt(value) => out.push(format!("q:big{value}")),
+        Operand::Atom(0) | Operand::Nil => out.push("n:0".to_owned()),
+        Operand::Atom(index) => out.push(format!("a:{}", beam.atoms[*index as usize - 1])),
+        Operand::X(register) => out.push(format!("x:{register}")),
+        Operand::Y(register) => out.push(format!("y:{register}")),
+        Operand::FR(register) => out.push(format!("l:{register}")),
+        Operand::Label(0) => out.push("p:0".to_owned()),
+        Operand::Label(label) => out.push(format!("f:{label}")),
+        Operand::Char(value) => out.push(format!("h:{value}")),
+        Operand::Literal(index) => out.push(format!("q:{index}")),
+        Operand::List(items) => {
+            out.push(format!("u:{}", items.len()));
+            for item in items.iter() {
+                legacy_operand_text(beam, item, out);
+            }
+        }
+        Operand::Alloc(_) => {
+            if let Operand::U(words) = allocation_as_words(operand) {
+                out.push(format!("u:{words}"));
+            }
+        }
+        Operand::TypedReg { reg, type_index } => {
+            let (letter, register) = match **reg {
+                Operand::X(r) => ('x', r),
+                Operand::Y(r) => ('y', r),
+                _ => ('?', 0),
+            };
+            let value = if beam.types.is_some() {
+                u64::from(register) | (u64::from(*type_index) << 10)
+            } else {
+                u64::from(register)
+            };
+            out.push(format!("{letter}:{value}"));
+        }
+    }
+}
 
 /// The opcode tables of the erts build, as text (for comparison with a real erts's tables).
 #[doc(hidden)]
