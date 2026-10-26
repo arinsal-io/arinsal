@@ -349,6 +349,13 @@ fn number_cmp(a: Term, b: Term, exact: bool) -> Ordering {
     // erts dispatches by the boxed numeric header before decoding either payload.
     // Exact ordering can therefore resolve integer/float pairs without reading them.
     // Port of erts/emulator/beam/utils.c:2110-2144 (erts_cmp_compound), OTP-29.1.1.
+    if let (Some(a_header), Some(b_header)) = (a.header(), b.header()) {
+        let (a_tag, b_tag) = (a_header & 63, b_header & 63);
+        if matches!(a_tag, POS_BIG | NEG_BIG) && matches!(b_tag, POS_BIG | NEG_BIG) {
+            return bignum_cmp(a, b, a_tag == NEG_BIG, b_tag == NEG_BIG)
+                .expect("both terms have bignum headers");
+        }
+    }
     if exact {
         let a_float = a.header().is_some_and(|header| header & 63 == FLOAT);
         let b_float = b.header().is_some_and(|header| header & 63 == FLOAT);
@@ -382,6 +389,31 @@ fn number_cmp(a: Term, b: Term, exact: bool) -> Ordering {
         }
     }
 }
+
+// Port of erts/emulator/beam/big.c:3375-3391 (big_comp), OTP-29.1.1.
+// Compare the heap digits in place; materializing BigInt limbs adds two copies.
+fn bignum_cmp(a: Term, b: Term, a_negative: bool, b_negative: bool) -> Option<Ordering> {
+    if a_negative != b_negative {
+        return Some(if a_negative {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let magnitude = a.with_bignum_digits_mut(|left| {
+        b.with_bignum_digits_mut(|right| {
+            left.len()
+                .cmp(&right.len())
+                .then_with(|| left.iter().rev().cmp(right.iter().rev()))
+        })
+    })??;
+    Some(if a_negative {
+        magnitude.reverse()
+    } else {
+        magnitude
+    })
+}
+
 fn bits_cmp(a: Term, b: Term) -> Ordering {
     // Port of erts/emulator/beam/erl_bits.h:560 and erl_bits.c:2293-2372,
     // OTP-29.1.1. The offsets belong to the compared bitstrings, including
