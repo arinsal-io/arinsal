@@ -2764,12 +2764,12 @@ fn caller_info(
     target_function: &str,
 ) -> Result<(Option<Term>, Option<Term>), VmError> {
     let direct_caller = if let Some(module) = vm.code.modules.get(process.module)
-        && let Some((function, arity)) = module.function_at(process.ip)
+        && let Some((function, arity)) = module.function_at(process.ip())
         && (module.name != target_module || function != target_function)
         && !function.starts_with('-')
-        && module.line_term_at(process.ip).is_some()
+        && module.line_term_at(process.ip()).is_some()
     {
-        Some((module, function.to_owned(), arity, process.ip))
+        Some((module, function.to_owned(), arity, process.ip()))
     } else {
         None
     };
@@ -3401,7 +3401,7 @@ fn caller_mfa_name(
         // An interpreted `apply` names its instruction in the running module.
         Some((id, ip)) if id == usize::MAX - 1 => (process.module, ip),
         Some(site) => site,
-        None => (process.module, process.ip),
+        None => (process.module, process.ip()),
     };
     if module_id == usize::MAX {
         // A native call site: the pc names the caller's native function.
@@ -4046,7 +4046,7 @@ pub(crate) fn running_mfa(
         let Some(module) = vm.code.modules.get(process.module) else {
             return Ok(None);
         };
-        let Some((function, arity)) = module.function_at(process.ip) else {
+        let Some((function, arity)) = module.function_at(process.ip()) else {
             return Ok(None);
         };
         (&*module.name, function, arity)

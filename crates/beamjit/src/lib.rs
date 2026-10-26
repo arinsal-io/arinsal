@@ -1500,36 +1500,12 @@ pub struct CompiledFunction {
     pub label: u32,
 }
 
-/// A function retained for interpreter execution, with the opcode blockers.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnportedFunction {
-    /// Function name when metadata was available.
-    pub name: String,
-    /// Function arity when metadata was available.
-    pub arity: u8,
-    /// Function entry label.
-    pub label: u32,
-    /// What kept the function out, for logs.
-    pub missing_ops: Vec<String>,
-    /// Why the function is not native.
-    pub reason: FallbackReason,
-}
-
-/// Why a function was left out of the native code.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FallbackReason {
-    /// The caller intentionally excluded this function from native compilation.
-    Excluded,
-}
-
-/// Parsed module, native function entries, and function-level interpreter fallback list.
+/// Parsed module and its native function entries.
 pub struct CompiledModule {
     /// Module name.
     pub name: String,
     /// Native functions that can be entered while this object is alive.
     pub functions: Vec<CompiledFunction>,
-    /// Functions with one or more operations outside this emitter slice.
-    pub unported: Vec<UnportedFunction>,
     /// Owns the executable mapping containing `functions` entries.
     pub native: FinalizedModule,
 }
@@ -1541,47 +1517,33 @@ impl CompiledModule {
     }
 }
 
-/// Parse, specialize, and emit every function whose operations have emitters.
+/// Parse a module and emit all its functions.
 pub fn compile_module_with_env(
     beam_bytes: &[u8],
     env: &impl ModuleEnv,
 ) -> Result<CompiledModule, CompileError> {
-    compile_module_with_env_and_funcs(beam_bytes, env, None)
-}
-
-/// Parse, specialize, and emit selected functions whose operations have emitters.
-///
-/// When `function_allowlist` is present, only exact `name/arity` entries are compiled.
-pub fn compile_module_with_env_and_funcs(
-    beam_bytes: &[u8],
-    env: &impl ModuleEnv,
-    function_allowlist: Option<&str>,
-) -> Result<CompiledModule, CompileError> {
     let beam = beam::parse(beam_bytes).map_err(|error| CompileError::Parse(error.to_string()))?;
-    compile_parsed_module_with_env_and_funcs(&beam, env, function_allowlist)
+    compile_parsed_module_with_env(&beam, env)
 }
 
-/// [`compile_module_with_env_and_funcs`] for a module the caller has already parsed.
-pub fn compile_parsed_module_with_env_and_funcs(
+/// [`compile_module_with_env`] for a module the caller has already parsed.
+pub fn compile_parsed_module_with_env(
     beam: &BeamFile,
     env: &impl ModuleEnv,
-    function_allowlist: Option<&str>,
 ) -> Result<CompiledModule, CompileError> {
-    compile_parsed_module_with_options(beam, env, function_allowlist, false)
+    compile_parsed_module_with_options(beam, env, false)
 }
 
 /// Compile a parsed module with the OTP line-breakpoint rewrite enabled when requested.
 pub fn compile_parsed_module_with_options(
     beam: &BeamFile,
     env: &impl ModuleEnv,
-    function_allowlist: Option<&str>,
     line_breakpoints: bool,
 ) -> Result<CompiledModule, CompileError> {
     COMPILE_ARENA.with(|arena| {
         compile_parsed_module_with_options_in_arena(
             beam,
             env,
-            function_allowlist,
             line_breakpoints,
             &mut arena.borrow_mut(),
         )
@@ -1641,7 +1603,7 @@ impl OpView<'_> {
 struct CurrentFunction {
     name: String,
     arity: u8,
-    /// Its operations are not emitted: it is excluded, or its body is a native stub.
+    /// Its body is a native stub: the rest of its operations are not emitted.
     skip: bool,
     native_body: Option<(usize, usize)>,
     /// A `load_nif` can replace it (`may_load_nif` and `are_nifs` of erts).
@@ -1658,23 +1620,11 @@ struct ModuleCompiler<'a, E: ModuleEnv> {
     next_function: usize,
     current: Option<CurrentFunction>,
     compiled: Vec<CompiledFunction>,
-    unported: Vec<UnportedFunction>,
-    function_allowlist: Option<&'a str>,
-    skip_functions: Option<String>,
     may_load_nif: bool,
     has_nif_start: bool,
 }
 
 impl<E: ModuleEnv> ModuleCompiler<'_, E> {
-    fn excluded(&self, name: &str, arity: u8) -> bool {
-        self.function_allowlist
-            .is_some_and(|list| !function_allowlist_contains(list, name, arity))
-            || self
-                .skip_functions
-                .as_deref()
-                .is_some_and(|list| function_allowlist_contains(list, name, arity))
-    }
-
     /// `i_func_label` starts the next function of the code summary.
     fn begin_function(&mut self, label: u32) -> Result<(), String> {
         let function = self
@@ -1691,23 +1641,6 @@ impl<E: ModuleEnv> ModuleCompiler<'_, E> {
             .to_owned();
         let arity = function.arity.min(255) as u8;
         let nif_stub = function.nif_stub;
-        if self.excluded(&name, arity) {
-            self.unported.push(UnportedFunction {
-                name: name.clone(),
-                arity,
-                label,
-                missing_ops: vec!["excluded by ARINSAL_BEAMASM_FUNCS".to_owned()],
-                reason: FallbackReason::Excluded,
-            });
-            self.current = Some(CurrentFunction {
-                name,
-                arity,
-                skip: true,
-                native_body: None,
-                nif_candidate: false,
-            });
-            return Ok(());
-        }
         self.assembler.begin_dump_function(&name, arity);
         self.compiled.push(CompiledFunction {
             name: name.clone(),
@@ -1814,13 +1747,11 @@ fn describe(op: &OpView<'_>, error: &EmitError) -> String {
 fn compile_parsed_module_with_options_in_arena(
     beam: &BeamFile,
     env: &impl ModuleEnv,
-    function_allowlist: Option<&str>,
     line_breakpoints: bool,
     transform_arena: &mut TransformArena,
 ) -> Result<CompiledModule, CompileError> {
     let fail = |error: String| CompileError::Assemble(format!("{}: {error}", beam.module));
     let summary = &beam.summary;
-    let skip_functions = std::env::var("ARINSAL_JIT_SKIPF").ok();
     let mut assembler = BeamModuleAssembler::new();
     assembler.set_exception_resolver(env.exception_resolver() as usize);
     if let Some((dispatch_return, test_yield, context_switch)) = env.yield_fragments() {
@@ -1852,27 +1783,12 @@ fn compile_parsed_module_with_options_in_arena(
         next_function: 0,
         current: None,
         compiled: Vec::new(),
-        unported: Vec::new(),
-        function_allowlist,
-        skip_functions,
         may_load_nif,
         has_nif_start: summary.functions.iter().any(|function| function.nif_stub),
     };
     // The lambdas of functions that are emitted get their table entries first, so the
     // `make_fun` and `call_fun` operations find them.
-    let excluded_labels = summary
-        .functions
-        .iter()
-        .filter(|function| {
-            let name = beam.atom(function.function_atom).unwrap_or("<unknown>");
-            compiler.excluded(name, function.arity.min(255) as u8)
-        })
-        .map(|function| function.entry_label)
-        .collect::<LabelSet>();
     for lambda in &beam.lambdas {
-        if excluded_labels.contains(&lambda.label) {
-            continue;
-        }
         let total_arity = u8::try_from(lambda.arity).map_err(|_| {
             fail(format!(
                 "lambda {} has invalid total arity {}",
@@ -1896,7 +1812,6 @@ fn compile_parsed_module_with_options_in_arena(
     let ModuleCompiler {
         mut assembler,
         compiled,
-        unported,
         ..
     } = compiler;
     assembler
@@ -1921,18 +1836,7 @@ fn compile_parsed_module_with_options_in_arena(
     Ok(CompiledModule {
         name: beam.module.clone(),
         functions,
-        unported,
         native,
-    })
-}
-
-fn function_allowlist_contains(list: &str, name: &str, arity: u8) -> bool {
-    list.split(',').map(str::trim).any(|entry| {
-        entry
-            .rsplit_once('/')
-            .is_some_and(|(allowed_name, allowed_arity)| {
-                allowed_name == name && allowed_arity.parse::<u8>().ok() == Some(arity)
-            })
     })
 }
 
@@ -2111,30 +2015,6 @@ fn call_target(op: &SpecificOp) -> Option<u32> {
         "i_call" | "i_call_only" | "i_call_last" => as_u32(op.operands().first()),
         "move_call_last" => as_u32(op.operands().get(2)),
         _ => None,
-    }
-}
-
-/// A set of BEAM labels: dense `u32`s, so a bitmap indexed by label.
-#[derive(Default)]
-struct LabelSet(Vec<bool>);
-
-impl LabelSet {
-    fn contains(&self, label: &u32) -> bool {
-        self.0.get(*label as usize).copied().unwrap_or(false)
-    }
-}
-
-impl FromIterator<u32> for LabelSet {
-    fn from_iter<I: IntoIterator<Item = u32>>(labels: I) -> Self {
-        let mut set = Vec::new();
-        for label in labels {
-            let index = label as usize;
-            if set.len() <= index {
-                set.resize(index + 1, false);
-            }
-            set[index] = true;
-        }
-        Self(set)
     }
 }
 
@@ -4589,23 +4469,4 @@ pub fn enter_native(
 /// Operation-to-emitter lookup used by coverage consumers.
 pub fn emitter_for(name: &str) -> bool {
     ported(name).is_some()
-}
-
-/// Orders a `select_val` pair list (all values, then all labels) by the raw word each value
-/// compares as, for the linear and the binary search alike.
-#[cfg(test)]
-mod function_allowlist_tests {
-    use super::function_allowlist_contains;
-
-    #[test]
-    fn matches_exact_name_and_arity_entries() {
-        assert!(function_allowlist_contains(
-            "with/2,fix_file_opts/1",
-            "with",
-            2
-        ));
-        assert!(!function_allowlist_contains("with/2", "with", 1));
-        assert!(!function_allowlist_contains("with/2", "with_1", 2));
-        assert!(!function_allowlist_contains("broken,with/nope", "with", 2));
-    }
 }

@@ -41,7 +41,7 @@ JIT_SAMPLE="$SAMPLES_DIR/jit_tail.sample"
 INTERP_SAMPLE="$SAMPLES_DIR/interp_tail.sample"
 
 echo "=== Profiling JIT run (tail, N=400,000,000, >= 5s) ==="
-env ARINSAL_BEAMASM=1 ARINSAL_BEAMASM_MODULES=kernels "$ARINSAL_BIN" eval +S 1 -pa "$WORK_DIR" kernels tail 400000000 &
+env ARINSAL_BEAMASM=1 "$ARINSAL_BIN" eval +S 1 -pa "$WORK_DIR" kernels tail 400000000 &
 JIT_PID=$!
 sleep 0.5
 /usr/bin/sample "$JIT_PID" 5 -file "$JIT_SAMPLE"

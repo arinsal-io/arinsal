@@ -11,10 +11,6 @@ fn presence(cell: &'static OnceLock<bool>, name: &str) -> bool {
     *cell.get_or_init(|| std::env::var_os(name).is_some())
 }
 
-fn cached_string(cell: &'static OnceLock<Option<String>>, name: &str) -> Option<&'static str> {
-    cell.get_or_init(|| std::env::var(name).ok()).as_deref()
-}
-
 /// `ARINSAL_TRACE_DIST`: log distribution send and receive.
 pub(crate) fn trace_dist() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -32,24 +28,6 @@ pub(crate) fn literal_trace() -> bool {
 pub(crate) fn difftest_unscheduled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     presence(&FLAG, "ARINSAL_DIFFTEST_UNSCHEDULED")
-}
-
-/// `ARINSAL_BEAMASM_MODULES`: comma-separated modules allowed to compile.
-pub(crate) fn beamasm_modules() -> Option<&'static str> {
-    static VALUE: OnceLock<Option<String>> = OnceLock::new();
-    cached_string(&VALUE, "ARINSAL_BEAMASM_MODULES")
-}
-
-/// `ARINSAL_BEAMASM_SKIP`: comma-separated modules left interpreted.
-pub(crate) fn beamasm_skip() -> Option<&'static str> {
-    static VALUE: OnceLock<Option<String>> = OnceLock::new();
-    cached_string(&VALUE, "ARINSAL_BEAMASM_SKIP")
-}
-
-/// `ARINSAL_BEAMASM_FUNCS`: comma-separated functions allowed to compile.
-pub(crate) fn beamasm_funcs() -> Option<&'static str> {
-    static VALUE: OnceLock<Option<String>> = OnceLock::new();
-    cached_string(&VALUE, "ARINSAL_BEAMASM_FUNCS")
 }
 
 /// `ARINSAL_BEAMASM_DUMP`: directory for native assembly dumps.

@@ -5,7 +5,7 @@ use arinsal_beamasm::{ExitReason, SchedulerRegisters};
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm, decode, encode};
 use arinsal_term::{Term, TermBuilder, is_native_code_pointer};
-use arinsal_vm::{NativeFunction, Process, Vm, register_native_function, run_native};
+use arinsal_vm::{NativeFunction, Process, Vm, run_native};
 use similar_asserts::assert_eq;
 use std::process::Command;
 use std::sync::Mutex;
@@ -64,7 +64,6 @@ fn no_line_info_module_compiles_fully_native_and_matches_otp() {
         ])
         .env(CHILD, &beam_path)
         .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", MODULE)
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
@@ -77,7 +76,7 @@ fn no_line_info_module_compiles_fully_native_and_matches_otp() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("native_functions=") && stderr.contains("unported_functions=0"),
+        stderr.contains("native_functions=") && stderr.contains("interp_slices=0 "),
         "module did not compile all functions natively: {stderr}"
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -139,7 +138,6 @@ fn native_try_end_keeps_success_value_for_fun_call() {
         ])
         .env(CHILD, &path)
         .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", MODULE)
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
@@ -151,8 +149,8 @@ fn native_try_end_keeps_success_value_for_fun_call() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("native_functions=4"),
-        "try-end module did not compile natively: {}",
+        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
+        "the JIT flavor must not run the interpreter: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -177,7 +175,6 @@ fn native_external_return_preserves_tuple_for_native_guards() {
             ])
             .env(CHILD, "1")
             .env("ARINSAL_BEAMASM", "1")
-            .env("ARINSAL_BEAMASM_MODULES", "native_tail_ext_test")
             .status()
             .unwrap();
         assert!(
@@ -310,8 +307,6 @@ fn native_tail_export_transitions_preserve_cp_only_frames() {
             "--nocapture",
         ])
         .env(CHILD, &dir)
-        .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", "native_cp_transition_native")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
         .unwrap();
@@ -321,8 +316,8 @@ fn native_tail_export_transitions_preserve_cp_only_frames() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("native_functions=4"),
-        "BeamAsm must compile both native callers: {}",
+        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
+        "the JIT flavor must not run the interpreter: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -415,7 +410,6 @@ fn native_tail_fun_returns_preserve_recursive_y_frames() {
         ])
         .env(CHILD, &dir)
         .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", MODULE)
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
         .unwrap();
@@ -428,8 +422,8 @@ fn native_tail_fun_returns_preserve_recursive_y_frames() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("native_functions=7"),
-        "BeamAsm must compile the seven supported reproducer functions: {}",
+        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
+        "the JIT flavor must not run the interpreter: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let actual = stdout
@@ -544,7 +538,6 @@ fn forced_jit_gc_large_append_keeps_native_stack() {
             ])
             .env(CHILD, "1")
             .env("ARINSAL_BEAMASM", "1")
-            .env("ARINSAL_BEAMASM_MODULES", "beamasm_gc_append_vm_test")
             .env("ARINSAL_BEAMASM_STATS", "1")
             .env("ARINSAL_BEAMASM_LIFETIME", "1")
             .status()
@@ -600,7 +593,6 @@ fn native_vm_bif_trap_returns_into_continuation() {
             ])
             .env(CHILD, "1")
             .env("ARINSAL_BEAMASM", "1")
-            .env("ARINSAL_BEAMASM_MODULES", "native_vm_bif_trap_test")
             .status()
             .unwrap();
         assert!(
@@ -683,7 +675,6 @@ fn native_boolean_bifs_keep_tagged_comparison_results() {
         ])
         .env(CHILD, &beam_path)
         .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", MODULE)
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
         .unwrap();
@@ -693,8 +684,8 @@ fn native_boolean_bifs_keep_tagged_comparison_results() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("modules=1"),
-        "BeamAsm must compile the tested module: {}",
+        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
+        "the JIT flavor must not run the interpreter: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -776,9 +767,6 @@ fn inet_udp_open_trace_matches_otp_with_native_open() {
             "--nocapture",
         ])
         .env(CHILD, &dir)
-        .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", "inet_udp")
-        .env("ARINSAL_BEAMASM_FUNCS", "open/2")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
         .unwrap();
@@ -788,8 +776,8 @@ fn inet_udp_open_trace_matches_otp_with_native_open() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("modules=1"),
-        "BeamAsm must compile inet_udp:open/2: {}",
+        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
+        "the JIT flavor must not run the interpreter: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -867,7 +855,6 @@ fn unaligned_binary_order_matches_interpreter_and_beamasm() {
             ])
             .env(CHILD, &beam_path)
             .env("ARINSAL_BEAMASM", if native { "1" } else { "0" })
-            .env("ARINSAL_BEAMASM_MODULES", MODULE)
             .env("ARINSAL_BEAMASM_STATS", "1")
             .output()
             .unwrap();
@@ -885,8 +872,8 @@ fn unaligned_binary_order_matches_interpreter_and_beamasm() {
         if native {
             let stats = String::from_utf8_lossy(&output.stderr);
             assert!(
-                stats.contains("modules=1"),
-                "BeamAsm did not compile the module: {stats}"
+                stats.contains("interp_slices=0 "),
+                "the JIT flavor must not run the interpreter: {stats}"
             );
             assert!(
                 !stats.contains("native_functions=0"),
@@ -1432,7 +1419,6 @@ fn native_send_matches_interpreter_for_names_ports_and_tracing() {
             ])
             .env(CHILD, &beam_path)
             .env("ARINSAL_BEAMASM", if native { "1" } else { "0" })
-            .env("ARINSAL_BEAMASM_MODULES", MODULE)
             .env("ARINSAL_BEAMASM_STATS", "1")
             .output()
             .unwrap();
@@ -1446,7 +1432,7 @@ fn native_send_matches_interpreter_for_names_ports_and_tracing() {
         );
         if native {
             assert!(
-                String::from_utf8_lossy(&output.stderr).contains("modules=1"),
+                String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
                 "native child must compile the tested module with BeamAsm: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -1513,7 +1499,6 @@ fn native_node_instruction_matches_interpreter_and_otp() {
             ])
             .env(CHILD, &beam_path)
             .env("ARINSAL_BEAMASM", if native { "1" } else { "0" })
-            .env("ARINSAL_BEAMASM_MODULES", MODULE)
             .env("ARINSAL_BEAMASM_STATS", "1")
             .output()
             .unwrap();
@@ -1527,8 +1512,8 @@ fn native_node_instruction_matches_interpreter_and_otp() {
         );
         if native {
             assert!(
-                String::from_utf8_lossy(&output.stderr).contains("modules=1"),
-                "BeamAsm must compile the tested module: {}",
+                String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
+                "the JIT flavor must not run the interpreter: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -1596,7 +1581,6 @@ fn native_build_stacktrace_matches_interpreter_and_otp() {
             ])
             .env(CHILD, &beam_path)
             .env("ARINSAL_BEAMASM", if native { "1" } else { "0" })
-            .env("ARINSAL_BEAMASM_MODULES", MODULE)
             .env("ARINSAL_BEAMASM_STATS", "1")
             .output()
             .unwrap();
@@ -1610,8 +1594,8 @@ fn native_build_stacktrace_matches_interpreter_and_otp() {
         );
         if native {
             assert!(
-                String::from_utf8_lossy(&output.stderr).contains("modules=1"),
-                "BeamAsm must compile the tested module: {}",
+                String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
+                "the JIT flavor must not run the interpreter: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -1685,7 +1669,6 @@ fn native_spawn_entry_catch_preserves_arguments_after_throw() {
         ])
         .env(CHILD, &beam_path)
         .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", MODULE)
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
         .unwrap();
@@ -1697,8 +1680,8 @@ fn native_spawn_entry_catch_preserves_arguments_after_throw() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("modules=1"),
-        "BeamAsm must compile the tested module: {}",
+        String::from_utf8_lossy(&output.stderr).contains("interp_slices=0 "),
+        "the JIT flavor must not run the interpreter: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -1763,7 +1746,6 @@ fn native_body_recursion_grows_a_minimum_heap_before_stack_collision() {
         ])
         .env(CHILD, &beam_path)
         .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", MODULE)
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
@@ -1777,8 +1759,8 @@ fn native_body_recursion_grows_a_minimum_heap_before_stack_collision() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("modules=1"),
-        "module was not compiled: {stderr}"
+        stderr.contains("interp_slices=0 "),
+        "the JIT flavor must not run the interpreter: {stderr}"
     );
     assert!(
         stderr
@@ -1844,7 +1826,6 @@ fn native_large_bif_result_keeps_the_heap_redzone_before_a_fun_call() {
         ])
         .env(CHILD, &beam_path)
         .env("ARINSAL_BEAMASM", "1")
-        .env("ARINSAL_BEAMASM_MODULES", MODULE)
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
@@ -1858,7 +1839,7 @@ fn native_large_bif_result_keeps_the_heap_redzone_before_a_fun_call() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("modules=1"),
+        stderr.contains("interp_slices=0 "),
         "native heap-redzone module was not compiled: {stderr}"
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -1868,251 +1849,4 @@ fn native_large_bif_result_keeps_the_heap_redzone_before_a_fun_call() {
         .expect("child prints the large-BIF result");
     assert_eq!(actual, expected);
     let _ = std::fs::remove_dir_all(dir);
-}
-
-fn compile_module(reference: &RefErl, module: &str, source: &str) -> (Vec<u8>, usize) {
-    let beam = reference.compile_named(module, source, &[]).unwrap();
-    let parsed = arinsal_beam::parse(&beam).unwrap();
-    let loaded = arinsal_loader::load(&parsed).unwrap();
-    let helper = loaded.export("helper", 0).unwrap();
-    (beam, helper)
-}
-
-fn executable(code: CodeBuffer) -> (CodeMemory, usize, usize) {
-    let bytes: Vec<u8> = code
-        .finish()
-        .unwrap()
-        .into_iter()
-        .flat_map(u32::to_le_bytes)
-        .collect();
-    let mut memory = CodeMemory::new(4096).unwrap();
-    let offset = memory.alloc(bytes.len()).unwrap();
-    memory.write_bytes(offset, &bytes).unwrap();
-    let entry = memory.ptr_at(offset) as usize;
-    (memory, entry, bytes.len())
-}
-
-fn register_native(
-    module: &str,
-    function: &str,
-    arity: u8,
-    memory: CodeMemory,
-    entry: usize,
-    len: usize,
-    line: u32,
-) {
-    register_native_function(NativeFunction {
-        scope: 0,
-        start: entry,
-        end: entry + len,
-        module: module.into(),
-        module_atom: arinsal_term::global_atoms().intern(module).unwrap(),
-        function: function.into(),
-        function_atom: arinsal_term::global_atoms().intern(function).unwrap(),
-        arity,
-        line: Some(line),
-        file: Some(format!("{module}.erl").into()),
-        line_table: vec![arinsal_vm::NativeLine {
-            address: entry,
-            file: format!("{module}.erl").into(),
-            file_term: None,
-            line,
-        }],
-        file_term: None,
-    })
-    .unwrap();
-    let _ = Box::leak(Box::new(memory));
-}
-
-fn mixed_native(helper: usize, preserve_y: bool) -> CodeBuffer {
-    let mut code = CodeBuffer::new();
-    let resume = code.new_label();
-    code.emit(|e| {
-        e.sub_imm(Gpr::x(20), Gpr::x(20), 8, false)?;
-        e.str_uoff(Gpr::x(25), Gpr::x(20), 0)?;
-        Ok(())
-    })
-    .unwrap();
-    code.adr(Gpr::x(14), resume).unwrap();
-    code.emit(|e| {
-        e.sub_imm(Gpr::x(20), Gpr::x(20), 8, false)?;
-        e.str_uoff(Gpr::x(14), Gpr::x(20), 0)?;
-        e.mov_const(Gpr::x(1), helper as u64)?;
-        e.mov_const(Gpr::x(0), 2)?;
-        e.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
-        e.ret(Gpr::x(30))
-    })
-    .unwrap();
-    code.bind(resume).unwrap();
-    code.emit(|e| {
-        if preserve_y {
-            e.ldr_uoff(Gpr::x(25), Gpr::x(20), 0)?;
-        } else {
-            // Erlang small integers share the same low tag, so adding the shifted
-            // payload adds 35 to the helper's returned small integer.
-            e.add_imm(Gpr::x(25), Gpr::x(25), 35 << 4, false)?;
-        }
-        e.add_imm(Gpr::x(20), Gpr::x(20), 8, false)?;
-        e.mov_const(Gpr::x(0), 0)?;
-        e.ret(Gpr::x(30))
-    })
-    .unwrap();
-    code
-}
-
-#[test]
-#[cfg(target_arch = "aarch64")]
-fn mixed_call_unported_roundtrip() {
-    let _serial = NATIVE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let reference = RefErl::start().unwrap();
-    let module = "native_mixed_roundtrip";
-    let (beam, helper) = compile_module(
-        &reference,
-        module,
-        "-module(native_mixed_roundtrip). -export([bridge/0, native_caller/1, helper/0]).\nbridge() -> native_caller(12) + 0.\nnative_caller(Value) -> Value.\nhelper() -> 7.",
-    );
-    reference.load(module, &beam).unwrap();
-    let (memory, entry, len) = executable(mixed_native(helper, false));
-    register_native(module, "native_caller", 1, memory, entry, len, 3);
-    let mut vm = Vm::new([]);
-    vm.load_bytes_interpreted(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, "bridge", &[], 1, None).unwrap();
-    assert_eq!(actual.term, OwnedTerm::Int(42));
-}
-
-#[test]
-#[cfg(target_arch = "aarch64")]
-fn gc_during_mixed_frame() {
-    let _serial = NATIVE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let reference = RefErl::start().unwrap();
-    let module = "native_mixed_gc";
-    let (beam, helper) = compile_module(
-        &reference,
-        module,
-        "-module(native_mixed_gc). -export([bridge/0, native_caller/1, helper/0]).\nbridge() -> element(1, native_caller({saved,[1,2,3]})).\nnative_caller(Value) -> Value.\nhelper() -> make(180), 7.\nmake(0) -> []; make(N) -> [N|make(N-1)].",
-    );
-    let (memory, entry, len) = executable(mixed_native(helper, true));
-    register_native(module, "native_caller", 1, memory, entry, len, 3);
-    let mut vm = Vm::new([]);
-    vm.load_bytes_interpreted(&beam).unwrap();
-    let actual = vm.eval_scheduled(module, "bridge", &[], 1, None).unwrap();
-    assert_eq!(actual.term, OwnedTerm::Atom("saved".into()));
-}
-
-#[test]
-#[cfg(target_arch = "aarch64")]
-fn native_frame_in_stacktrace() {
-    let _serial = NATIVE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let reference = RefErl::start().unwrap();
-    let module = "native_mixed_trace";
-    let native_source = "-module(native_mixed_trace). -export([bridge/0, native_caller/1, helper/0]).\nbridge() -> native_caller(1) + 0.\nnative_caller(Value) -> Value.\nhelper() -> erlang:error(boom).";
-    let interpreted_source = "-module(native_mixed_trace). -export([interpreted/0, native_caller/1, helper/0]).\ninterpreted() -> try {wrapped, native_caller(1)} catch error:boom:Stack -> Stack end.\nnative_caller(Value) -> Result = helper(), {Result, Value}.\nhelper() -> erlang:error(boom).";
-    let beam = reference.compile_named(module, native_source, &[]).unwrap();
-    let interpreted_beam = reference
-        .compile_named(module, interpreted_source, &[])
-        .unwrap();
-    reference.load(module, &interpreted_beam).unwrap();
-    let parsed = arinsal_beam::parse(&beam).unwrap();
-    let helper = arinsal_loader::load(&parsed)
-        .unwrap()
-        .export("helper", 0)
-        .unwrap();
-    let (memory, entry, len) = executable(mixed_native(helper, false));
-    register_native(module, "native_caller", 1, memory, entry, len, 3);
-    let mut vm = Vm::new([]);
-    vm.load_bytes_interpreted(&beam).unwrap();
-    let error = match vm.eval_scheduled(module, "bridge", &[], 1, None) {
-        Ok(_) => panic!("expected helper exception"),
-        Err(error) => error,
-    };
-    let arinsal_vm::VmError::Raised(actual) = error else {
-        panic!("expected a raised Erlang exception, got {error}");
-    };
-    let reference_trace = match reference.call(module, "interpreted", &[]) {
-        arinsal_difftest::CallResult::Ok(trace) => trace,
-        result => panic!("expected interpreted OTP trace, got {result:?}"),
-    };
-    let OwnedTerm::List {
-        elems: actual_frames,
-        ..
-    } = &actual.stack
-    else {
-        panic!("expected Arinsal stack trace list");
-    };
-    let OwnedTerm::List {
-        elems: expected_frames,
-        ..
-    } = &reference_trace
-    else {
-        panic!("expected OTP stack trace list");
-    };
-    fn native_frame<'a>(frames: &'a [OwnedTerm], module: &str) -> Option<&'a OwnedTerm> {
-        frames.iter().find(|frame| {
-            matches!(frame, OwnedTerm::Tuple(parts) if parts.len() == 4 && parts[0] == OwnedTerm::Atom(module.into()) && parts[1] == OwnedTerm::Atom("native_caller".into()))
-        })
-    }
-    let Some(OwnedTerm::Tuple(native_parts)) = native_frame(actual_frames, module) else {
-        panic!("native caller frame missing: {actual_frames:?}");
-    };
-    assert_eq!(native_parts[0], OwnedTerm::Atom(module.into()));
-    assert_eq!(native_parts[1], OwnedTerm::Atom("native_caller".into()));
-    assert_eq!(native_parts[2], OwnedTerm::Int(1));
-    let Some(OwnedTerm::List {
-        elems: location, ..
-    }) = native_parts.get(3)
-    else {
-        panic!("native caller location missing: {native_parts:?}");
-    };
-    assert!(location.iter().any(|entry| {
-        matches!(entry, OwnedTerm::Tuple(pair) if pair.len() == 2 && pair[0] == OwnedTerm::Atom("line".into()) && pair[1] == OwnedTerm::Int(3))
-    }));
-    assert!(expected_frames.iter().any(|frame| {
-        matches!(frame, OwnedTerm::Tuple(parts) if parts.len() == 4 && parts[1] == OwnedTerm::Atom("helper".into()))
-    }));
-}
-
-#[test]
-#[cfg(target_arch = "aarch64")]
-fn native_exception_unwinds_to_interpreted_catch() {
-    let _serial = NATIVE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let reference = RefErl::start().unwrap();
-    let module = "native_mixed_exception";
-    let source = "-module(native_mixed_exception). -export([bridge/0, native_raise/0]).\nbridge() -> try native_raise() catch C:R -> {C,R} end.\nnative_raise() -> ok.";
-    let beam = reference.compile_named(module, source, &[]).unwrap();
-    let mut code = CodeBuffer::new();
-    let reason = arinsal_term::global_atoms().intern("badarith").unwrap();
-    // SAFETY: The reason atom is an immediate atom term.
-    let reason = unsafe { Term::atom(reason).raw_bits() };
-    let hook = arinsal_vm::arinsal_native_raise as *const () as usize;
-    code.emit(|e| {
-        e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        e.mov_const(Gpr::x(1), 1)?;
-        e.mov_const(Gpr::x(2), reason)?;
-        e.mov_const(Gpr::x(16), hook as u64)?;
-        e.mov_reg(Gpr::x(14), Gpr::x(30))?;
-        e.blr(Gpr::x(16))?;
-        e.mov_reg(Gpr::x(30), Gpr::x(14))?;
-        e.ret(Gpr::x(30))
-    })
-    .unwrap();
-    let (memory, entry, len) = executable(code);
-    register_native(module, "native_raise", 0, memory, entry, len, 3);
-    let mut vm = Vm::new([]);
-    vm.load_bytes_interpreted(&beam).unwrap();
-    let result = vm.eval_scheduled(module, "bridge", &[], 1, None).unwrap();
-    assert_eq!(
-        result.term,
-        OwnedTerm::Tuple(vec![
-            OwnedTerm::Atom("error".into()),
-            OwnedTerm::Atom("badarith".into())
-        ])
-    );
 }

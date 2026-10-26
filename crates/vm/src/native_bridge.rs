@@ -815,7 +815,7 @@ pub(crate) fn commit_catch(
         }
         CatchTarget::Interpreted { module, ip } => {
             process.module = module;
-            process.ip = ip;
+            process.set_ip(ip);
             CatchHandler::Interpreted
         }
     }
@@ -1185,7 +1185,7 @@ pub(crate) fn native_function_for(
 
 /// Enter one native function and commit its ABI state before returning to the scheduler.
 ///
-/// `CallUnported` returns to the scheduler with the interpreter target in `process.ip`;
+/// `CallUnported` returns to the scheduler with the interpreter target in `process.ip()`;
 /// a later native continuation is resumed by calling this function at its saved PC.
 // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1
 pub fn run_native(

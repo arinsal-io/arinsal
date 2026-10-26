@@ -665,25 +665,11 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     };
     vm.intern_prepared_fun_entries(&mut module);
     vm.compile_native(&mut module, &mut meta);
-    if native_only
-        && meta
-            .beamasm
-            .as_ref()
-            .is_none_or(|native| native.unported_functions != 0)
-    {
-        // Some function needs the interpreter: load the module again with its code decoded.
-        if meta.beam.decode_code().is_err() {
-            let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
-            return Ok(error);
-        }
-        let Ok(mut full) = vm.prepare_module(&meta.beam, Some(&bytes)) else {
-            let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
-            return Ok(error);
-        };
-        vm.intern_prepared_fun_entries(&mut full);
-        meta.beamasm = None;
-        vm.compile_native(&mut full, &mut meta);
-        module = full;
+    if vm.native_required(&meta) && meta.beamasm.is_none() {
+        // Port of erts/emulator/beam/beam_load.c:417 (load_code failing): the JIT flavor has
+        // no other way to run the module.
+        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+        return Ok(error);
     }
     vm.release_loaded_tables(&mut module, &mut meta);
     let prepared = Prepared {
@@ -1739,8 +1725,7 @@ fn call_values(
             // Port of erts/emulator/beam/beam_bif_load.c:793
             // (call_on_load_function_1), OTP-29.1.1. The call dispatcher
             // installs the ordinary continuation and transfers to this entry.
-            process.module = id;
-            process.ip = target;
+            vm.set_position(process, id, target);
             Some(Ok(atom("ok")))
         }
         ("erts_literal_area_collector", "release_area_switch", 0) => {

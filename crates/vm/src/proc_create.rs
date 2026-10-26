@@ -363,7 +363,8 @@ pub struct Process {
     /// erl_process.c:12960-12965 happens when it first runs.
     pub(crate) seq_trace_spawn_pending: bool,
     pub(crate) module: usize,
-    pub(crate) ip: usize,
+    /// The interpreter's position in `module`: only the interpreter flavor uses it.
+    ip_raw: usize,
     pub(crate) initial_call: Option<(usize, usize)>,
     /// `p->u.initial` (erl_process.c:12693): the MFA the process was spawned with, as atoms.
     pub(crate) initial_mfa: Option<(arinsal_term::Atom, arinsal_term::Atom, u8)>,
@@ -1434,7 +1435,76 @@ impl BifTrapPending {
     }
 }
 
+/// Reports (`ARINSAL_IP_TRACE=1`) every use of the interpreter position by the JIT flavor,
+/// which has none: the JIT flavor's positions are code addresses.
+#[track_caller]
+#[inline]
+fn interpreter_position_used() {
+    static STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    use std::sync::atomic::Ordering;
+    let state = match STATE.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var_os("ARINSAL_IP_TRACE").is_some() as u8 + 1;
+            STATE.store(on, Ordering::Relaxed);
+            on
+        }
+        state => state,
+    };
+    if state == 2 && crate::beamasm_integration::enabled() {
+        let at = std::panic::Location::caller();
+        eprintln!("IPUSE {}:{}", at.file(), at.line());
+    }
+}
+
 impl Process {
+    /// The interpreter position (`p->i` of the emu flavor).
+    #[track_caller]
+    #[inline]
+    pub(crate) fn ip(&self) -> usize {
+        interpreter_position_used();
+        self.ip_raw
+    }
+
+    /// The call site a pending BIF trap belongs to: the interpreter's position. The JIT flavor
+    /// has no such position (its native code never keeps one), so every site is the same one
+    /// and the trapped import alone names the call.
+    #[inline]
+    pub(crate) fn trap_site(&self) -> (usize, usize) {
+        if crate::beamasm_integration::enabled() {
+            (0, 0)
+        } else {
+            (self.module, self.ip_raw)
+        }
+    }
+
+    /// Where the process stands, to tell whether a call moved it: its interpreter position and
+    /// its code address.
+    #[inline]
+    pub(crate) fn position_marker(&self) -> (usize, Option<usize>) {
+        (self.ip_raw, self.native_pc)
+    }
+
+    /// The function entry (an index in the module's code) a process that has not run yet starts
+    /// at. This names a function, not an interpreter position.
+    #[inline]
+    pub(crate) fn entry_ip(&self) -> usize {
+        self.ip_raw
+    }
+
+    /// Sets the function entry a process starts at.
+    #[inline]
+    pub(crate) fn set_entry_ip(&mut self, ip: usize) {
+        self.ip_raw = ip;
+    }
+
+    /// Sets the interpreter position.
+    #[track_caller]
+    #[inline]
+    pub(crate) fn set_ip(&mut self, ip: usize) {
+        interpreter_position_used();
+        self.ip_raw = ip;
+    }
+
     /// Enter a tail apply whose caller frame is already deallocated (see `apply_frame_released`).
     /// Returns whether this call set the flag, for `end_tail_apply`.
     pub(crate) fn begin_tail_apply(&mut self, tail: bool, kind: u8) -> bool {
@@ -1904,7 +1974,7 @@ impl Process {
             seq_trace_epoch: crate::seq_trace::current_epoch(),
             seq_trace_spawn_pending: false,
             module: 0,
-            ip: 0,
+            ip_raw: 0,
             initial_call: None,
             initial_mfa: None,
             native_pc: None,

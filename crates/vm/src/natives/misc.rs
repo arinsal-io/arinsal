@@ -355,7 +355,7 @@ pub(crate) fn profile_process_event(
         .and_then(|runtime| {
             runtime.with_modules(|modules| {
                 modules.get(process.module).and_then(|module| {
-                    module.function_at(process.ip).map(|(function, arity)| {
+                    module.function_at(process.ip()).map(|(function, arity)| {
                         O::Tuple(vec![
                             O::Atom(module.name.clone()),
                             O::Atom(function.to_owned()),

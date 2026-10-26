@@ -1,6 +1,6 @@
 use arinsal_beam::BeamFile;
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
-use arinsal_beamjit::{FallbackReason, ModuleEnv, compile_module_with_env};
+use arinsal_beamjit::{ModuleEnv, compile_module_with_env};
 use arinsal_term::{FunEntry, Term, TermBuilder, VecHeap, from_owned, global_atoms};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -373,7 +373,6 @@ fn otp_and_elixir_corpus_compiles_with_beamasm() {
 
     let mut issues = Vec::new();
     let mut reason_counts = std::collections::BTreeMap::<String, usize>::new();
-    let mut category_counts = std::collections::BTreeMap::<String, usize>::new();
     let mut native_count = 0usize;
     for path in &paths {
         let bytes =
@@ -386,23 +385,6 @@ fn otp_and_elixir_corpus_compiles_with_beamasm() {
         match compile_module_with_env(&bytes, &env) {
             Ok(compiled) => {
                 native_count += compiled.functions.len();
-                for function in compiled.unported {
-                    let FallbackReason::Excluded = &function.reason;
-                    *category_counts
-                        .entry("explicit exclusion".to_owned())
-                        .or_default() += 1;
-                    for reason in &function.missing_ops {
-                        *reason_counts.entry(reason.clone()).or_default() += 1;
-                    }
-                    issues.push(format!(
-                        "{}:{}/{}: {:?} ({})",
-                        beam.module,
-                        function.name,
-                        function.arity,
-                        function.reason,
-                        function.missing_ops.join(",")
-                    ));
-                }
             }
             Err(error) => {
                 *reason_counts
@@ -418,9 +400,6 @@ fn otp_and_elixir_corpus_compiles_with_beamasm() {
         paths.len(),
         issues.len()
     );
-    for (category, count) in category_counts {
-        eprintln!("  fallback {count}: {category}");
-    }
     let mut reason_counts = reason_counts.into_iter().collect::<Vec<_>>();
     reason_counts.sort_by(|(left_reason, left_count), (right_reason, right_count)| {
         right_count
@@ -469,23 +448,6 @@ fn extended_x_fixtures_compile_with_beamasm() {
         let loaded = arinsal_loader::load(&beam).unwrap();
         let env = CorpusEnv::new(&loaded);
         let compiled = compile_module_with_env(&bytes, &env).unwrap();
-        let unported = compiled
-            .unported
-            .iter()
-            .map(|function| {
-                format!(
-                    "{}/{}: {:?} ({})",
-                    function.name,
-                    function.arity,
-                    function.reason,
-                    function.missing_ops.join(",")
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            unported.is_empty(),
-            "{file}: interpreter fallbacks {unported:#?}"
-        );
         assert!(
             !compiled.functions.is_empty(),
             "{file}: no native functions"
@@ -595,11 +557,10 @@ fn beamasm_compile_time_per_module() {
                 let mut one = std::collections::hash_map::DefaultHasher::new();
                 offsets.hash(&mut one);
                 println!(
-                    "MOD {} {:x} fns={} unported={}",
+                    "MOD {} {:x} fns={}",
                     compiled.name,
                     one.finish(),
-                    compiled.functions.len(),
-                    compiled.unported.len()
+                    compiled.functions.len()
                 );
             }
         }

@@ -174,7 +174,7 @@ impl Vm {
                 crate::bif_traps::HandlerResult::Done { value, .. } => {
                     let value = p.gc_after_bif(value)?;
                     p.write(dst, value)?;
-                    p.ip += 1;
+                    p.set_ip(p.ip() + 1);
                     Ok(BifOpOutcome::Done(0))
                 }
                 crate::bif_traps::HandlerResult::Failed { .. } => {
@@ -190,7 +190,7 @@ impl Vm {
             let result = arith::small(fast, stored[0], stored[1]);
             if let Some(result) = result {
                 p.write(dst, result)?;
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 return Ok(BifOpOutcome::Done(0));
             }
         }
@@ -306,11 +306,11 @@ impl Vm {
         match result {
             Ok(value) => {
                 p.write(dst, value)?;
-                p.ip += 1;
+                p.set_ip(p.ip() + 1);
                 Ok(BifOpOutcome::Done(bif_reductions))
             }
             Err(_) if a.kind() == Arg::LABEL && a.value() != u32::MAX as u64 => {
-                p.ip = a.value() as usize;
+                p.set_ip(a.value() as usize);
                 Ok(BifOpOutcome::Done(bif_reductions))
             }
             Err(error) => Err(error),

@@ -821,13 +821,21 @@ pub(super) fn save_direct(
     let frame_released = released != 0;
     // A tail fun call has no apply-site adjustment: the raising BIF's pc is the continuation on
     // top of the stack, so the failing instruction is that continuation's call site.
+    // Native code has no interpreter position: its raise site is the native pc.
+    let interpreter_position = |p: &Process| {
+        if native_pc.is_some() {
+            (p.module, 0)
+        } else {
+            (p.module, p.ip())
+        }
+    };
     let site = if released == crate::proc_create::TAIL_FUN_CALL
         && native_pc.is_none()
         && !top.is_some_and(SaveTop::is_bif)
     {
-        top_continuation(p).unwrap_or((p.module, p.ip))
+        top_continuation(p).unwrap_or_else(|| interpreter_position(p))
     } else {
-        (p.module, p.ip)
+        interpreter_position(p)
     };
     let (native_top, previous_native, previous) = match native_pc {
         Some(pc) if pc & arinsal_beamasm::module::RETURN_SITE_TAG != 0 => {
@@ -861,7 +869,7 @@ pub(super) fn save_direct(
         .transpose()
         .map_err(|_| VmError::Unsupported("stacktrace pc".into()))?;
     let interpreter_caller = (bif_top && native_top_word.is_none() && !frame_released)
-        .then(|| pack_indexed(p.module, p.ip.saturating_add(1)))
+        .then(|| pack_indexed(p.module, p.ip().saturating_add(1)))
         .flatten();
     // Port of erts/emulator/beam/beam_common.c (`save_stacktrace`), OTP-29.1.1: the trace, its
     // argument list, the `error_info` map and the ftrace tuple are carved from one block that is
@@ -1783,7 +1791,7 @@ pub(super) fn build(
     } else if native_pc != 0 && crate::native_bridge::is_native_function_at(native_pc) {
         Some(native_pc)
     } else {
-        // A process suspended inside native code: `p.module`/`p.ip` still hold the last
+        // A process suspended inside native code: `p.module`/`p.ip()` still hold the last
         // interpreter position, so the current function comes from its native resume pc.
         p.native_pc
             .or_else(|| Some(p.header.i as usize).filter(|&pc| pc != 0))
@@ -1797,7 +1805,7 @@ pub(super) fn build(
         modules,
         Current {
             module: p.module,
-            ip: p.ip,
+            ip: p.ip(),
             native_pc,
             registers: &p.x,
             trapped,

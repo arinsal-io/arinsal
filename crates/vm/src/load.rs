@@ -888,6 +888,11 @@ impl Vm {
         self.code_ix.intern_module_fun_entries(module);
     }
 
+    /// Whether a module with `meta` must have native code: the JIT flavor runs nothing else.
+    pub(crate) fn native_required(&self, meta: &CodeMeta) -> bool {
+        meta.has_beam_bytes && beamasm_integration::enabled()
+    }
+
     /// Compiles `module` with BeamAsm into `meta` when `bytes` are known.
     // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1), compile after the module
     // body and its exported entries are resolved.
@@ -953,6 +958,12 @@ impl Vm {
         }
         let mut module = module;
         self.compile_native(&mut module, &mut meta);
+        if self.native_required(&meta) && meta.beamasm.is_none() {
+            staging.abort();
+            return Err(VmError::Load(format!(
+                "{name}: native code generation failed"
+            )));
+        }
         self.release_loaded_tables(&mut module, &mut meta);
         let _ = self.install_native(&module, &mut meta);
         let module = Arc::new(module);
@@ -1041,23 +1052,13 @@ impl Vm {
         });
         if compile_native {
             self.compile_native(&mut module, &mut meta);
-            let incomplete = native_only
-                && meta
-                    .beamasm
-                    .as_ref()
-                    .is_none_or(|native| native.unported_functions != 0);
-            if incomplete {
-                // Some function needs the interpreter: load the module again with its code
-                // decoded, and compile that.
-                meta.beam
-                    .decode_code()
-                    .map_err(|e| VmError::Load(e.to_string()))?;
-                module = self.prepare_module(&meta.beam, bytes)?;
-                meta.beamasm = None;
-                staging.with(|tables| {
-                    tables.intern_fun_entries(&mut module);
-                });
-                self.compile_native(&mut module, &mut meta);
+            if self.native_required(&meta) && meta.beamasm.is_none() {
+                // Port of erts/emulator/beam/beam_load.c:417 (load_code failing): the JIT
+                // flavor has no other way to run the module.
+                staging.abort();
+                return Err(VmError::Load(format!(
+                    "{module_name}: native code generation failed"
+                )));
             }
             self.release_loaded_tables(&mut module, &mut meta);
             let _ = self.install_native(&module, &mut meta);
